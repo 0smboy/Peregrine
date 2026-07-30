@@ -273,7 +273,36 @@ pub async fn locate(
 ) -> Result<Located, String> {
     let p = policy(state, index).await?;
     let path = ring_path(state, &p);
-    let mut argv: Vec<&str> = vec![&state.cfg.getnodes_bin, "--json", &path, account];
+    located_from_ring(state, &path, index, account, container, object).await
+}
+
+/// Locate a container on the *container* ring (not an object policy ring), so a
+/// caller can reach the container server that actually owns it. Used by the
+/// Tombstone Museum's policy-lookup fallback.
+pub async fn locate_container(
+    state: &Arc<AppState>,
+    account: &str,
+    container: &str,
+) -> Result<Located, String> {
+    let path = format!(
+        "{}/container.ring.gz",
+        state.cfg.swift_dir.trim_end_matches('/')
+    );
+    located_from_ring(state, &path, 0, account, Some(container), None).await
+}
+
+/// Run `swift-get-nodes --json <ring> <account> [container] [object]` and parse
+/// the placement. Shared by the object-policy and container-ring locates.
+#[allow(clippy::too_many_arguments)]
+async fn located_from_ring(
+    state: &Arc<AppState>,
+    ring_path: &str,
+    policy: u32,
+    account: &str,
+    container: Option<&str>,
+    object: Option<&str>,
+) -> Result<Located, String> {
+    let mut argv: Vec<&str> = vec![&state.cfg.getnodes_bin, "--json", ring_path, account];
     if let Some(c) = container {
         argv.push(c);
     }
@@ -304,7 +333,7 @@ pub async fn locate(
         }
     }
     Ok(Located {
-        policy: index,
+        policy,
         partition: v.get("partition").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
         hash: v.get("hash").and_then(|x| x.as_str()).unwrap_or("").to_string(),
         primaries,

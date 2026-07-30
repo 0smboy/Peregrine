@@ -443,6 +443,21 @@ pub fn t(l: &str, key: &'static str) -> &'static str {
              status, headers, ETag, metadata, listings and convergence — building a \
              compatibility corpus as it goes."
         },
+        "lab.tool.nodes.title" => if zh { "节点宕机演练" } else { "Node HA Drill" },
+        "lab.tool.nodes.blurb" => if zh {
+            "让整台存储节点宕机，观察集群在少一节点时的读写与自愈；到期自动重启。"
+        } else {
+            "Take a whole storage node down and watch the cluster serve and heal with one node gone; auto-restarts on TTL."
+        },
+        "nodes.disabled" => if zh {
+            "节点宕机需要在配置中开启 lab_mutations。"
+        } else {
+            "Node down/up requires lab_mutations to be enabled in the config."
+        },
+        "nodes.col.node" => if zh { "节点" } else { "Node" },
+        "nodes.col.state" => if zh { "状态" } else { "State" },
+        "nodes.col.services" => if zh { "服务" } else { "Services" },
+        "nodes.col.action" => if zh { "操作" } else { "Action" },
         "lab.tool.chaos.title" => if zh { "故障街机" } else { "Chaos Arcade" },
         "lab.tool.chaos.blurb" => if zh {
             "选一种故障、先预测结果，再让集群真的跑一遍，然后回放修复过程。每个故障都自带撤销。"

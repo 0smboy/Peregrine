@@ -76,6 +76,13 @@ pub const TOOLS: &[LabTool] = &[
         ready: true,
     },
     LabTool {
+        id: "nodes",
+        title: "lab.tool.nodes.title",
+        href: "/lab/nodes",
+        blurb: "lab.tool.nodes.blurb",
+        ready: true,
+    },
+    LabTool {
         id: "warehouse",
         title: "lab.tool.warehouse.title",
         href: "/lab/warehouse",

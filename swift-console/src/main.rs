@@ -12,6 +12,7 @@ mod files_api;
 mod i18n;
 mod lab;
 mod monitor;
+mod nodeops;
 mod nodes;
 mod pages;
 mod policyapi;
@@ -343,6 +344,12 @@ async fn main() {
         .route("/test/api/run", post(testing::start))
         .route("/test/api/export.csv", get(testing::export))
         .route("/lab", get(pages::lab_index))
+        // Node down/up — the HA drill (stops a whole node's swift services with
+        // a journaled, TTL-auto-restart undo). Never touches the console itself.
+        .route("/lab/nodes", get(nodeops::page))
+        .route("/lab/api/node/status", get(nodeops::status))
+        .route("/lab/api/node/down", post(nodeops::down))
+        .route("/lab/api/node/up", post(nodeops::up))
         .route("/lab/ring", get(pages::lab_ring))
         .route("/lab/policy", get(pages::lab_policy))
         .route("/lab/api/policy/defaults", get(policyapi::defaults))
