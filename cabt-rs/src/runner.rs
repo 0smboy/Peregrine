@@ -195,8 +195,14 @@ async fn run_via_cosbench_rs(
         ),
         Creds::Swift(c) => (
             StorageConfig::Swift {
-                // empty endpoint: use the X-Storage-Url the auth returns
-                endpoint: String::new(),
+                // Empty endpoint uses the X-Storage-Url the auth returns.
+                // ST_ENDPOINT (full storage base, e.g. a specific HAProxy
+                // http://10.42.30.11:8085/v1/AUTH_x) overrides it — required
+                // when the bench runs on an Internal-LB backend-pool host that
+                // cannot hairpin to the ILB VIP the cluster hands back.
+                endpoint: std::env::var("ST_ENDPOINT")
+                    .or_else(|_| std::env::var("st_endpoint"))
+                    .unwrap_or_default(),
                 timeout_ms: 120_000,
                 token: None,
             },

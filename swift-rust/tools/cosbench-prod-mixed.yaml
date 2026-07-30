@@ -1,0 +1,71 @@
+name: prod-mixed-64k
+description: Production mixed read/write against the fixed 4-node cluster via haproxy (.11:8085, avoids the ILB hairpin). 4 containers, 2000-object corpus, 90s sustained 80/20 at 64 workers.
+auth:
+  type: temp_auth
+  url: http://10.42.30.11:8085/auth/v1.0
+  user: test:tester
+  key: azure-swift-2026.bench
+storage:
+  type: swift
+  # explicit endpoint (a specific HAProxy), NOT the .10 ILB VIP, since this runs
+  # on a backend-pool node and the ILB cannot hairpin to the origin.
+  endpoint: http://10.42.30.11:8085/v1/AUTH_test
+  timeout_ms: 120000
+stages:
+  - name: init
+    kind: init
+    workers: 4
+    total_ops: 4
+    sequential: true
+    operations:
+      - type: create_container
+        ratio: 100
+    objects:
+      cprefix: cbrs-
+      containers: { start: 1, end: 4 }
+      oprefix: o
+      objects: { start: 1, end: 1 }
+      size: 1
+  - name: prepare
+    kind: prepare
+    workers: 32
+    total_ops: 2000
+    sequential: true
+    operations:
+      - type: write
+        ratio: 100
+    objects:
+      cprefix: cbrs-
+      containers: { start: 1, end: 4 }
+      oprefix: o
+      objects: { start: 1, end: 500 }
+      size: 65536
+  - name: main
+    kind: main
+    workers: 64
+    runtime_secs: 90
+    operations:
+      - type: read
+        ratio: 80
+      - type: write
+        ratio: 20
+    objects:
+      cprefix: cbrs-
+      containers: { start: 1, end: 4 }
+      oprefix: o
+      objects: { start: 1, end: 500 }
+      size: 65536
+  - name: cleanup
+    kind: cleanup
+    workers: 32
+    total_ops: 2000
+    sequential: true
+    operations:
+      - type: delete
+        ratio: 100
+    objects:
+      cprefix: cbrs-
+      containers: { start: 1, end: 4 }
+      oprefix: o
+      objects: { start: 1, end: 500 }
+      size: 1
