@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="ui-token" content="__UI_TOKEN__">
+    <title>Swift 集群部署工作区</title>
+    <link rel="stylesheet" href="/app.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <main class="console">
+      <header class="masthead">
+        <div class="brand-block">
+          <p class="product-mark">SWIFT / DEPLOY</p>
+          <h1 data-i18n="title">Swift 集群部署工作区</h1>
+          <p class="lead" data-i18n="lead">用于初始集群部署：先配置节点、网络、磁盘和认证，再生成 inventory、实机预检并执行。扩容、加盘、升级和缩容尚未开放。</p>
+        </div>
+        <div class="masthead-meta">
+          <span class="loopback-state"><span class="status-dot good" aria-hidden="true"></span><span data-i18n="loopback">仅本机回环访问</span></span>
+          <div class="language" aria-label="Language">
+            <button type="button" data-language="zh">中文</button>
+            <span aria-hidden="true">/</span>
+            <button type="button" data-language="en">EN</button>
+          </div>
+        </div>
+      </header>
+
+      <section class="readiness-band" aria-label="配置概览">
+        <div>
+          <span data-i18n="readiness">配置完整度</span>
+          <strong id="completion-percent">0%</strong>
+        </div>
+        <div>
+          <span data-i18n="nodeCount">部署节点</span>
+          <strong id="header-node-count">1</strong>
+        </div>
+        <div>
+          <span data-i18n="diskCount">数据磁盘</span>
+          <strong id="header-disk-count">0</strong>
+        </div>
+        <div class="readiness-missing">
+          <span data-i18n="currentMissing">当前缺项</span>
+          <strong id="header-missing-count">--</strong>
+          <span id="header-next-gap" class="quiet">正在检查配置…</span>
+        </div>
+      </section>
+
+      <div id="request-error" class="request-error" role="alert" hidden></div>
+      <div id="request-success" class="request-success" role="status" hidden></div>
+
+      <div class="workspace-shell">
+        <nav class="step-rail" aria-label="配置步骤">
+          <p data-i18n="sixSteps">六步完成配置</p>
+          <ol>
+            <li><a href="#step-foundation" data-step-link="1"><span>01</span><b data-i18n="step1Short">部署基础</b><i></i></a></li>
+            <li><a href="#step-nodes" data-step-link="2"><span>02</span><b data-i18n="step2Short">节点角色</b><i></i></a></li>
+            <li><a href="#step-network" data-step-link="3"><span>03</span><b data-i18n="step3Short">网络与磁盘</b><i></i></a></li>
+            <li><a href="#step-ring" data-step-link="4"><span>04</span><b data-i18n="step4Short">Ring / 策略</b><i></i></a></li>
+            <li><a href="#step-access" data-step-link="5"><span>05</span><b data-i18n="step5Short">认证 / 入口</b><i></i></a></li>
+            <li><a href="#step-review" data-step-link="6"><span>06</span><b data-i18n="step6Short">审核 / 执行</b><i></i></a></li>
+          </ol>
+          <p class="rail-note" data-i18n="railNote">红色表示必须补齐，黄色表示需要确认。</p>
+        </nav>
+
+        <form id="workspace-form" class="workspace-form" novalidate>
+          <section id="step-foundation" class="workspace-step" data-step="1" aria-labelledby="step-foundation-title">
+            <header class="step-heading">
+              <span>01</span>
+              <div>
+                <h2 id="step-foundation-title" data-i18n="step1Title">部署方式与基础设施</h2>
+                <p data-i18n="step1Desc">决定这是生产集群还是 SAIO 测试环境，并提供部署机连接集群所需的基础参数。</p>
+              </div>
+              <output class="step-status" data-step-status="1"></output>
+            </header>
+
+            <div class="field-grid three">
+              <label class="field" for="project-name">
+                <span><b data-i18n="projectName">项目名称</b><em data-i18n="required">必填</em></span>
+                <input id="project-name" value="swift-prod" autocomplete="off" placeholder="swift-prod">
+                <small data-i18n="projectHelp">用于生成独立配置目录，只能使用字母、数字、点、短横线和下划线。</small>
+              </label>
+              <label class="field" for="deploy-stack">
+                <span><b data-i18n="deployStack">部署栈</b><em data-i18n="required">必填</em></span>
+                <select id="deploy-stack">
+                  <option value="python-v3" data-i18n="stackPython">Python Swift v3</option>
+                  <option value="rust" data-i18n="stackRust">Rust Swift（TempAuth）</option>
+                </select>
+                <small data-i18n="deployStackHelp">rust 栈部署 Rust 版 Swift：TempAuth 认证、可选 EC 策略，需将 bundle 指向 bundle-rust。</small>
+              </label>
+              <label class="field" for="deployment-mode">
+                <span><b data-i18n="deploymentMode">部署模式</b><em data-i18n="required">必填</em></span>
+                <select id="deployment-mode">
+                  <option value="production" data-i18n="production">生产 production</option>
+                  <option value="development" data-i18n="development">测试 development</option>
+                </select>
+                <small data-i18n="modeHelp">development 会强制 rebalance，禁止用于生产集群。</small>
+              </label>
+              <label class="field" for="timezone">
+                <span><b data-i18n="timezone">时区</b><em data-i18n="required">必填</em></span>
+                <input id="timezone" value="Asia/Shanghai" autocomplete="off" placeholder="Asia/Shanghai">
+                <small data-i18n="timezoneHelp">写入所有 Swift 节点。</small>
+              </label>
+            </div>
+
+            <div class="choice-row">
+              <label class="choice" for="saio"><input id="saio" type="checkbox"><span><b>SAIO</b><small data-i18n="saioHelp">单节点全功能测试环境；必须配合 development。</small></span></label>
+              <label class="choice locked-choice" for="use-wwid"><input id="use-wwid" type="checkbox" disabled><span><b data-i18n="wwidLocked">USE_WWID（锁定关闭）</b><small data-i18n="wwidHelp">当前逐盘 custom_disks 合同与上游 v3 的 WWID 路径冲突；请使用重启后稳定的 /dev/disk/by-id 路径并由实机预检核对。</small></span></label>
+              <label class="choice" for="hostname-modifiable"><input id="hostname-modifiable" type="checkbox"><span><b data-i18n="changeHostname">修改 hostname</b><small data-i18n="hostnameHelp">只有节点 hostname 没有其他用途时才开启。</small></span></label>
+            </div>
+
+            <div class="field-grid two">
+              <label class="field" for="hostname-prefix">
+                <span><b data-i18n="hostnamePrefix">主机名前缀</b></span>
+                <input id="hostname-prefix" value="ostorage" autocomplete="off" placeholder="ostorage">
+                <small data-i18n="hostnamePrefixHelp">开启修改 hostname 后，生成 ostorage_51 这类名称。</small>
+              </label>
+              <label class="field" for="ntp-internet-server">
+                <span><b data-i18n="ntpServer">互联网 NTP</b><em data-i18n="required">必填</em></span>
+                <input id="ntp-internet-server" value="time.pool.aliyun.com" autocomplete="off" placeholder="time.pool.aliyun.com">
+                <small data-i18n="ntpHelp">首台 ntp_server 节点会向此上游同步。</small>
+              </label>
+              <label class="field critical python-only" for="local-repo-address">
+                <span><b data-i18n="repoAddress">本地软件源地址</b><em data-i18n="required">必填</em></span>
+                <input id="local-repo-address" inputmode="decimal" autocomplete="off" placeholder="10.0.10.9">
+                <small data-i18n="repoHelp">只填仓库 IPv4，不带 http://、端口或路径；目标节点必须能访问 http://该IP/yum/、/pip/、/component/。</small>
+              </label>
+              <label class="field" for="admin-ips">
+                <span><b data-i18n="adminIps">管理端白名单 IP</b><em data-i18n="required">必填</em></span>
+                <textarea id="admin-ips" rows="2" placeholder="10.0.10.20, 10.0.10.21"></textarea>
+                <small data-i18n="adminIpsHelp">用于防火墙白名单，多个地址用逗号或换行分隔；包括当前部署机。</small>
+              </label>
+              <label class="field" for="ssh-bind-port">
+                <span><b data-i18n="targetSshPort">部署后的 SSH 服务端口</b><em data-i18n="required">必填</em></span>
+                <input id="ssh-bind-port" type="number" min="1" max="65535" value="2222">
+                <small data-i18n="targetSshHelp">这是 security role 最终写入的 sshd 端口，不是首次连接端口。</small>
+              </label>
+            </div>
+          </section>
+
+          <section id="step-nodes" class="workspace-step" data-step="2" aria-labelledby="step-nodes-title">
+            <header class="step-heading">
+              <span>02</span>
+              <div>
+                <h2 id="step-nodes-title" data-i18n="step2Title">节点与角色</h2>
+                <p data-i18n="step2Desc">每台必填节点名、SSH 地址、首次端口、root 私钥和至少一个角色。生产集群还必须覆盖 proxy、account、container、object 和时间同步。</p>
+              </div>
+              <output class="step-status" data-step-status="2"></output>
+            </header>
+            <div class="role-key" aria-label="角色说明">
+              <span><b>proxy</b><small data-i18n="proxyRole">API 入口</small></span>
+              <span><b>account / container / object</b><small data-i18n="storageRole">Swift 元数据与对象存储</small></span>
+              <span><b>keystone / mariadb</b><small data-i18n="authRole">本地认证服务</small></span>
+              <span><b>haproxy / keepalived</b><small data-i18n="haRole">高可用入口</small></span>
+            </div>
+            <div id="node-list" class="node-list"></div>
+            <button id="add-node" class="secondary-action add-node" type="button" data-i18n="addNode">添加节点</button>
+          </section>
+
+          <section id="step-network" class="workspace-step" data-step="3" aria-labelledby="step-network-title">
+            <header class="step-heading">
+              <span>03</span>
+              <div>
+                <h2 id="step-network-title" data-i18n="step3Title">网络、故障域与磁盘</h2>
+                <p data-i18n="step3Desc">每台必填管理、存储和业务 IP；存储节点再填真实故障域、系统盘和全部数据盘。Region/Zone 必须对应真实机房、机架或电源边界，不能为通过校验随意编号。</p>
+              </div>
+              <output class="step-status" data-step-status="3"></output>
+            </header>
+            <div class="network-legend">
+              <div><b data-i18n="managementNet">管理网</b><span data-i18n="managementNetHelp">SSH、软件源、NTP</span></div>
+              <div><b data-i18n="storageNet">存储网</b><span data-i18n="storageNetHelp">读写、复制与 rsync</span></div>
+              <div><b data-i18n="replicationNet">复制地址</b><span data-i18n="replicationNetHelp">v3 锁定为存储 IP</span></div>
+              <div><b data-i18n="businessNet">业务网</b><span data-i18n="businessNetHelp">Proxy / VIP 对外入口</span></div>
+            </div>
+            <div id="node-storage-list" class="node-storage-list"></div>
+          </section>
+
+          <section id="step-ring" class="workspace-step" data-step="4" aria-labelledby="step-ring-title">
+            <header class="step-heading">
+              <span>04</span>
+              <div>
+                <h2 id="step-ring-title" data-i18n="step4Title">Ring 与存储策略</h2>
+                <p data-i18n="step4Desc">Account、Container 与默认 Object Ring 使用同一组基础参数，设备来自上一步明确列出的数据盘。</p>
+              </div>
+              <output class="step-status" data-step-status="4"></output>
+            </header>
+            <div class="field-grid four">
+              <label class="field" for="partition-power"><span><b data-i18n="partitionPower">Partition power</b><em data-i18n="required">必填</em></span><input id="partition-power" type="number" min="8" max="32" value="10"><small id="partition-count">2^10 = 1,024 partitions</small><small class="critical-copy" data-i18n="partitionPowerHelp">10 是小型实验默认值；生产必须先按目标容量与扩容周期评估，不能直接照抄。</small></label>
+              <label class="field" for="replicas"><span><b data-i18n="replicas">副本数</b><em data-i18n="required">必填</em></span><input id="replicas" type="number" min="1" max="100" step="1" value="3"><small data-i18n="replicasHelp">不能高于可用设备与故障域能力。</small></label>
+              <label class="field" for="minimum-time"><span><b data-i18n="minimumTime">最小迁移间隔（小时）</b><em data-i18n="required">必填</em></span><input id="minimum-time" type="number" min="1" value="1"><small data-i18n="minimumTimeHelp">控制同一 partition 再次移动前的等待时间。</small></label>
+              <label class="field" for="device-weight"><span><b data-i18n="deviceWeight">设备权重</b><em data-i18n="required">必填</em></span><input id="device-weight" type="number" min="1" value="100"><small data-i18n="weightHelp">同规格磁盘通常保持 100。</small></label>
+            </div>
+            <div class="policy-band">
+              <label class="field" for="policy-name"><span><b data-i18n="policyName">Object policy 名称</b><em data-i18n="required">必填</em></span><input id="policy-name" value="Policy-0" autocomplete="off"><small data-i18n="policyNameHelp">必须唯一，不能包含下划线；默认策略对应 object.builder。</small></label>
+              <label class="field locked-field" for="policy-type"><span><b data-i18n="policyType">策略类型</b><em data-i18n="required">必填</em></span><select id="policy-type" disabled><option value="replication" data-i18n="replication">Replication 副本</option><option value="erasure_coding" data-i18n="erasureCoding">Erasure Coding 纠删码</option></select><small data-i18n="policyTypeHelp">python-v3 只允许 Replication；rust 栈可另加一个 EC 策略（默认策略仍为 Replication）。</small></label>
+              <label class="field rust-only ec-only" for="ec-data-fragments"><span><b data-i18n="ecData">EC 数据分片</b></span><input id="ec-data-fragments" type="number" min="1" value="4"><small data-i18n="ecDataHelp">object 节点设备总数必须 ≥ 数据+校验分片数；无盘节点按 1 个目录设备计。</small></label>
+              <label class="field rust-only ec-only" for="ec-parity-fragments"><span><b data-i18n="ecParity">EC 校验分片</b></span><input id="ec-parity-fragments" type="number" min="1" value="2"></label>
+              <label class="field rust-only ec-only" for="ec-segment-size"><span><b data-i18n="ecSegment">EC 分段大小（字节）</b></span><input id="ec-segment-size" type="number" min="1" value="1048576"></label>
+            </div>
+            <label class="choice decision-confirmation" for="ring-capacity-confirmed"><input id="ring-capacity-confirmed" type="checkbox"><span><b data-i18n="ringCapacityConfirmed">生产 Ring 容量与真实故障域已确认</b><small data-i18n="ringCapacityHelp">production 必须确认 partition power 来自容量规划，Region/Zone 来自现场故障域映射；不是为了通过校验填写的数字。</small></span></label>
+          </section>
+
+          <section id="step-access" class="workspace-step" data-step="5" aria-labelledby="step-access-title">
+            <header class="step-heading">
+              <span>05</span>
+              <div>
+                <h2 id="step-access-title" data-i18n="step5Title">Keystone 认证与访问入口</h2>
+                <p data-i18n="step5Desc">浏览器不保存密码；生成配置后，密码会写入部署机 0700 工作区内的 0600 group_vars 文件，刷新页面不会删除该工作区。</p>
+              </div>
+              <output class="step-status" data-step-status="5"></output>
+            </header>
+            <div class="access-split">
+              <fieldset>
+                <legend data-i18n="authConfig">认证配置</legend>
+                <p id="password-contract" class="contract-note" data-i18n="passwordContract">所有认证密码至少 12 位，只能使用英文字母、数字和 . _ ~ -，不能含空格或其他符号。</p>
+                <div class="field-grid two">
+                  <label class="field locked-field" for="auth-method"><span><b data-i18n="authMethod">认证方式</b><em data-i18n="currentContract">当前合同</em></span><select id="auth-method" disabled><option value="keystone">Keystone</option><option value="tempauth">TempAuth</option></select><small data-i18n="authMethodHelp">认证方式由部署栈决定：python-v3 使用 Keystone，rust 使用 TempAuth。</small></label>
+                  <label class="field locked-field" for="swift-interface"><span><b data-i18n="interface">访问接口</b><em data-i18n="currentContract">当前合同</em></span><select id="swift-interface" disabled><option value="swift">Swift API</option></select><small data-i18n="interfaceHelp">S3 需要单独生成 EC2 access/secret 凭据，当前 UI 未开放。</small></label>
+                  <label class="field python-only" for="account-name"><span><b data-i18n="accountName">初始账号 / Project</b><em data-i18n="required">必填</em></span><input id="account-name" value="ostorage" autocomplete="off"></label>
+                  <label class="field python-only" for="admin-user"><span><b data-i18n="adminUser">Swift 管理用户</b><em data-i18n="required">必填</em></span><input id="admin-user" value="reseller_admin" autocomplete="off"><small data-i18n="adminUserHelp">不能命名为 swift 或 admin。</small></label>
+                  <label class="field python-only" for="admin-password"><span><b data-i18n="adminPassword">Swift 管理用户密码</b><em data-i18n="required">必填</em></span><input id="admin-password" type="password" minlength="12" pattern="[A-Za-z0-9._~-]{12,}" autocomplete="new-password" aria-describedby="password-contract" data-secret="true"></label>
+                  <label class="field rust-only" for="tempauth-account"><span><b data-i18n="tempauthAccount">TempAuth 账户</b><em data-i18n="required">必填</em></span><input id="tempauth-account" value="test" autocomplete="off"><small data-i18n="tempauthAccountHelp">首个账户是管理账户，写入 swift_tempauth_users。</small></label>
+                  <label class="field rust-only" for="tempauth-user"><span><b data-i18n="tempauthUser">TempAuth 用户</b><em data-i18n="required">必填</em></span><input id="tempauth-user" value="tester" autocomplete="off"></label>
+                  <label class="field rust-only" for="tempauth-key"><span><b data-i18n="tempauthKey">TempAuth 密钥</b><em data-i18n="required">必填</em></span><input id="tempauth-key" type="password" minlength="12" pattern="[A-Za-z0-9._~-]{12,}" autocomplete="new-password" aria-describedby="password-contract" data-secret="true"></label>
+                  <label class="field keystone-only" for="mariadb-root-password"><span><b>MariaDB root password</b><em data-i18n="required">必填</em></span><input id="mariadb-root-password" type="password" minlength="12" pattern="[A-Za-z0-9._~-]{12,}" autocomplete="new-password" aria-describedby="password-contract" data-secret="true"></label>
+                  <label class="field keystone-only" for="mariadb-keystone-password"><span><b>MariaDB Keystone password</b><em data-i18n="required">必填</em></span><input id="mariadb-keystone-password" type="password" minlength="12" pattern="[A-Za-z0-9._~-]{12,}" autocomplete="new-password" aria-describedby="password-contract" data-secret="true"></label>
+                  <label class="field keystone-only" for="mariadb-clustercheck-password"><span><b>MariaDB clustercheck password</b><em data-i18n="required">必填</em></span><input id="mariadb-clustercheck-password" type="password" minlength="12" pattern="[A-Za-z0-9._~-]{12,}" autocomplete="new-password" aria-describedby="password-contract" data-secret="true"><small data-i18n="clustercheckHelp">替换上游固定的 clustercheckpassword，用于 Galera 健康检查。</small></label>
+                  <label class="field keystone-only" for="keystone-admin-password"><span><b>Keystone admin password</b><em data-i18n="required">必填</em></span><input id="keystone-admin-password" type="password" minlength="12" pattern="[A-Za-z0-9._~-]{12,}" autocomplete="new-password" aria-describedby="password-contract" data-secret="true"></label>
+                  <label class="field keystone-only" for="keystone-swift-password"><span><b>Keystone Swift service password</b><em data-i18n="required">必填</em></span><input id="keystone-swift-password" type="password" minlength="12" pattern="[A-Za-z0-9._~-]{12,}" autocomplete="new-password" aria-describedby="password-contract" data-secret="true"></label>
+                  <label class="field keystone-only full" for="keystone-controller"><span><b data-i18n="controllerHostname">Keystone controller hostname</b><em data-i18n="required">必填</em></span><input id="keystone-controller" value="controller" autocomplete="off"></label>
+                  <label class="field" for="haproxy-stats-user"><span><b data-i18n="haproxyStatsUser">HAProxy stats 用户</b><em data-i18n="required">必填</em></span><input id="haproxy-stats-user" value="haproxy_observer" autocomplete="off"><small data-i18n="haproxyStatsUserHelp">替换上游固定的 admin；不能继续使用 admin。</small></label>
+                  <label class="field" for="haproxy-stats-password"><span><b data-i18n="haproxyStatsPassword">HAProxy stats 密码</b><em data-i18n="required">必填</em></span><input id="haproxy-stats-password" type="password" minlength="12" pattern="[A-Za-z0-9._~-]{12,}" autocomplete="new-password" aria-describedby="password-contract" data-secret="true"><small data-i18n="haproxyStatsPasswordHelp">替换上游固定的 admin/admin。</small></label>
+                </div>
+              </fieldset>
+              <fieldset>
+                <legend data-i18n="ingressConfig">入口与高可用</legend>
+                <div class="field-grid two">
+                  <label class="field" for="ingress-mode"><span><b data-i18n="ingressMode">入口模式</b><em data-i18n="required">必填</em></span><select id="ingress-mode"><option value="haproxy" selected>HAProxy</option><option value="keepalived">Keepalived VIP</option><option value="direct" disabled data-i18n="directDisabled">Direct（Keystone 不支持）</option></select><small data-i18n="ingressModeHelp">HAProxy 至少一台；Keepalived 至少两台同时承担 HAProxy。UI 不能证明同一 L2、VIP 无外部占用或网络已放行 VRRP 协议 112，必须现场验收。</small></label>
+                  <label class="field locked-field" for="http-mode"><span><b data-i18n="protocol">协议</b><em data-i18n="currentContract">当前合同</em></span><select id="http-mode" disabled><option value="http">HTTP</option></select><small data-i18n="protocolHelp">上游 v3 的 Keystone 和 Proxy 路径硬编码 HTTP，HTTPS 已禁用。</small></label>
+                  <label class="field full" for="auth-url-ip"><span><b data-i18n="authUrlIp">用户访问 IP / VIP</b><em data-i18n="required">必填</em></span><input id="auth-url-ip" autocomplete="off" placeholder="10.0.40.100"><small data-i18n="authUrlHelp">HAProxy 模式填一台 haproxy 节点的业务网 IP；Keepalived 模式填尚未分配给节点的独立 VIP。</small></label>
+                  <label class="field" for="swift-port"><span><b data-i18n="swiftPort">Swift 入口端口</b><em data-i18n="required">必填</em></span><input id="swift-port" type="number" min="1" max="65535" value="5050"><small data-i18n="swiftPortHelp">可以修改；生成器会把此值同步到 Swift LB 与 HAProxy 监听配置，防火墙也必须放行同一端口。</small></label>
+                  <label class="field ha-only" for="vip-prefix"><span><b data-i18n="vipPrefix">VIP 前缀长度</b></span><input id="vip-prefix" type="number" min="1" max="32" value="24"></label>
+                  <label class="field ha-only" for="virtual-router-id"><span><b>VRRP virtual_router_id</b></span><input id="virtual-router-id" type="number" min="1" max="255" value="50"></label>
+                  <label class="field ha-only" for="vrrp-auth-pass"><span><b>VRRP auth_pass</b></span><input id="vrrp-auth-pass" type="password" minlength="5" maxlength="8" pattern="[A-Za-z0-9._~-]{5,8}" autocomplete="new-password" data-secret="true"><small data-i18n="vrrpHelp">5-8 位，只允许英文字母、数字和 . _ ~ -。</small></label>
+                </div>
+              </fieldset>
+            </div>
+            <p class="contract-note" data-i18n="transportSecurityBoundary">当前 v3 合同没有端到端 TLS，且对象静态加密被关闭。只能部署在可信隔离网络，或在外部可信入口终止 TLS；不能把 HTTP 端口直接暴露到不可信网络。</p>
+          </section>
+
+          <section id="step-review" class="workspace-step review-step" data-step="6" aria-labelledby="step-review-title">
+            <header class="step-heading">
+              <span>06</span>
+              <div>
+                <h2 id="step-review-title" data-i18n="step6Title">审核、生成、实机预检与执行</h2>
+                <p data-i18n="step6Desc">先预览配置并生成密封计划；Apply 前必须通过 Rocky 9、网络、离线源、SSH 与数据盘身份的只读实机预检。</p>
+              </div>
+              <output class="step-status" data-step-status="6"></output>
+            </header>
+
+            <div class="review-actions">
+              <button id="preview-workspace" class="secondary-action" type="button" data-i18n="previewConfig">1. 预览生成配置</button>
+              <button id="generate-workspace" class="primary-action" type="button" data-i18n="generateAndPlan">2. 生成并建立计划</button>
+              <button id="preflight-action" class="secondary-action" type="button" data-i18n="preflightHosts">3. 运行实机预检</button>
+              <p id="workspace-action-note" class="quiet" data-i18n="previewFirst">先补齐右侧必填项，再运行预览。</p>
+            </div>
+
+            <div id="workspace-result" class="workspace-result" aria-live="polite">
+              <div class="empty-result">
+                <b data-i18n="nothingGenerated">尚未生成配置</b>
+                <span data-i18n="nothingGeneratedHelp">预览后这里会展示主机组、Ring、入口和经过脱敏的目标文件。</span>
+              </div>
+            </div>
+
+            <details class="advanced" open>
+              <summary><b data-i18n="advancedTitle">高级：生成文件与执行路径</b><span data-i18n="advancedHelp">一般无需手改；用于导入既有 inventory 或排障。</span></summary>
+              <div class="field-grid two advanced-grid">
+                <label class="field" for="bundle-path"><span><b>bundle</b></span><input id="bundle-path" autocomplete="off" spellcheck="false"></label>
+                <label class="field" for="inventory-path"><span><b>inventory</b></span><input id="inventory-path" autocomplete="off" spellcheck="false"></label>
+                <label class="field" for="playbook-path"><span><b>playbook</b></span><input id="playbook-path" autocomplete="off" spellcheck="false"></label>
+                <label class="field" for="plan-path"><span><b>plan output</b></span><input id="plan-path" autocomplete="off" spellcheck="false"></label>
+                <label class="field full" for="known-hosts-path"><span><b>known_hosts</b></span><input id="known-hosts-path" autocomplete="off" spellcheck="false" placeholder="/root/.ssh/known_hosts"></label>
+              </div>
+              <div class="legacy-actions">
+                <button id="audit-action" class="secondary-action" type="button" data-i18n="auditBundle">审计 bundle</button>
+                <button id="validate-action" class="secondary-action" type="button" data-i18n="validateInventory">校验 inventory</button>
+                <button id="plan-action" class="secondary-action" type="button" data-i18n="buildPlan">生成计划</button>
+              </div>
+            </details>
+
+            <div id="pipeline-readout" class="pipeline-readout">
+              <div><span id="source-dot" class="status-dot idle"></span><b>Bundle</b><small id="audit-result" data-i18n="notRun">未运行</small></div>
+              <div><span id="inventory-dot" class="status-dot idle"></span><b>Inventory</b><small id="inventory-result" data-i18n="notRun">未运行</small></div>
+              <div><span id="plan-dot" class="status-dot idle"></span><b>Plan</b><small id="plan-result" data-i18n="notRun">未运行</small></div>
+              <div><span id="preflight-dot" class="status-dot idle"></span><b>Preflight</b><small id="preflight-result" data-i18n="notRun">未运行</small></div>
+            </div>
+            <div id="preflight-details" class="preflight-details" hidden></div>
+
+            <section class="execution-zone" aria-labelledby="apply-title">
+              <div class="execution-heading">
+                <div>
+                  <h3 id="apply-title" data-i18n="applyTitle">执行前最终确认</h3>
+                  <p data-i18n="applyDesc">以下主机和数据盘将被计划触达。磁盘格式化不可逆，必须逐项授权。</p>
+                </div>
+                <span id="apply-dot" class="status-dot idle" aria-hidden="true"></span>
+              </div>
+              <div class="host-impact-warning" role="note">
+                <b data-i18n="productionOnlyTitle">仅用于专用、全新安装的 Rocky 9 主机</b>
+                <p data-i18n="productionOnlyDesc">Apply 前必须为每台节点创建快照或镜像，并安排维护窗口。这个计划会改主机基线，不只是安装 Swift。</p>
+                <ul>
+                  <li data-i18n="impactRepos">替换已启用的 yum 软件源，并执行完整 yum upgrade</li>
+                  <li data-i18n="impactSystem">修改 hostname、时区、locale、SELinux、systemd unit、系统用户和 cron</li>
+                  <li data-i18n="impactServices">安装软件包，并启用、停止或重启主机服务与 Swift 服务</li>
+                </ul>
+              </div>
+              <div id="apply-targets" class="apply-targets"></div>
+              <div id="seal" class="seal" hidden>
+                <div><span>SHA-256 PLAN DIGEST</span><code id="plan-digest"></code></div>
+                <button id="copy-digest" class="text-action" type="button" data-i18n="copyDigest">复制摘要</button>
+              </div>
+              <div id="risk-readout" class="risk-readout"></div>
+              <fieldset class="risk-gates">
+                <legend data-i18n="riskCapabilities">独立风险授权</legend>
+                <label><input id="allow-disk-wipe" type="checkbox"><span><b>disk wipe</b><small data-i18n="diskRisk">允许格式化上方列出的数据盘</small></span></label>
+                <label><input id="allow-firewall" type="checkbox"><span><b>firewall</b><small data-i18n="firewallRisk">允许写入防火墙白名单与端口</small></span></label>
+                <label><input id="allow-ssh" type="checkbox"><span><b>ssh reconfigure</b><small data-i18n="sshRisk">允许把 SSH 服务切换至配置端口</small></span></label>
+                <label><input id="allow-host-reconfigure" type="checkbox"><span><b>host reconfigure</b><small data-i18n="hostRisk">允许替换 yum 源、全量升级、修改 OS 基线、服务和 cron</small></span></label>
+              </fieldset>
+              <div class="confirmation-grid">
+                <label class="field" for="confirm-digest"><span><b data-i18n="pasteDigest">粘贴完整 plan digest</b></span><input id="confirm-digest" autocomplete="off" spellcheck="false"></label>
+                <label class="field" for="approval-phrase"><span><b data-i18n="typeApply">输入大写 APPLY</b></span><input id="approval-phrase" autocomplete="off" spellcheck="false"></label>
+              </div>
+              <div class="apply-row">
+                <p id="apply-guard" class="guard quiet" data-i18n="applyLocked">Apply 已锁定：先生成配置和计划。</p>
+                <button id="apply-action" class="danger-action" type="button" disabled data-i18n="applyAction">执行密封计划</button>
+              </div>
+              <div id="execution-result" class="execution-result" hidden></div>
+            </section>
+          </section>
+
+          <section class="activity" aria-labelledby="activity-title">
+            <header><h2 id="activity-title" data-i18n="activity">最近活动</h2><span id="job-state" class="quiet" data-i18n="idle">空闲</span></header>
+            <ol id="activity-log" aria-live="polite"><li class="quiet">—</li></ol>
+          </section>
+        </form>
+
+        <aside class="readiness-rail" aria-labelledby="readiness-title">
+          <div class="readiness-head">
+            <span id="readiness-score">0%</span>
+            <div><h2 id="readiness-title" data-i18n="readinessTitle">部署准备情况</h2><p id="readiness-summary" data-i18n="checking">正在检查…</p></div>
+          </div>
+          <div class="progress-track" aria-hidden="true"><i id="progress-fill"></i></div>
+          <ol id="missing-list" class="missing-list"></ol>
+          <div id="warning-list" class="warning-list"></div>
+          <button id="rail-preview" class="primary-action" type="button" data-i18n="previewConfig">预览生成配置</button>
+          <p class="security-note" data-i18n="secretNote">浏览器不保存密码；生成后的 0600 工作区文件会保留在部署机。</p>
+        </aside>
+      </div>
+
+      <footer>
+        <span>swift-deploy 0.1.0 · Rust</span>
+        <span data-i18n="footerSafety">仅回环访问 · 严格主机密钥 · 密封计划后才可执行</span>
+      </footer>
+    </main>
+    <noscript>Swift Deploy UI requires JavaScript. The Rust CLI remains available.</noscript>
+  </body>
+</html>

@@ -1,0 +1,34 @@
+---
+keystone_conf:
+  DEFAULT:
+    max_project_tree_depth: 3
+  cache:
+    backend: dogpile.cache.memcached
+    enabled: true
+    memcache_servers: "{{ keystone_storage_network_addresses|join(':11211,') }}:11211"
+  catalog:
+    caching: true
+  database:
+    connection: mysql+pymysql://keystone:{{ mariadb_keystone_pass }}@{{ keystone_endpoint_controller_hostname }}:{{ keystone_used_mariadb_port }}/keystone
+  domain_config:
+    caching: true
+  federation:
+    caching: true
+  fernet_receipts:
+    max_active_keys: 1
+  identity:
+    caching: true
+    cache_time: 600
+    max_password_length: 1024
+    password_hash_algorithm: bcrypt
+    password_hash_rounds: 6
+  receipt:
+    cache_on_issue: true
+  revoke:
+    caching: true
+    cache_time: 3600
+  role:
+    caching: true
+  token:
+    provider: fernet
+    caching: true

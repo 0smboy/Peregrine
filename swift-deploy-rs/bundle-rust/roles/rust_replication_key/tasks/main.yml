@@ -1,0 +1,73 @@
+---
+# One ed25519 keypair for rsync-over-ssh replication: generated once on the
+# first storage node, staged on the controller, installed on every storage
+# node (private key 0600, public key appended to /root/.ssh/authorized_keys).
+# The key is only exercised by the replicators when the cluster has more than
+# one storage node, but installing it is harmless on a single node.
+
+- name: generate the replication keypair on the first storage node
+  command: ssh-keygen -t ed25519 -N '' -C swift-replication -f /etc/swift/replication_key
+  args:
+    creates: /etc/swift/replication_key
+  delegate_to: "{{ groups['storage_nodes'][0] }}"
+  run_once: true
+
+- name: ensure the controller staging directory exists
+  file:
+    path: "{{ ring_fetch_dir }}"
+    state: directory
+    mode: "0700"
+  changed_when: false
+  delegate_to: localhost
+  run_once: true
+
+- name: fetch the private key to the controller
+  fetch:
+    src: /etc/swift/replication_key
+    dest: "{{ ring_fetch_dir }}/replication_key"
+    flat: yes
+  delegate_to: "{{ groups['storage_nodes'][0] }}"
+  run_once: true
+  changed_when: false
+
+- name: fetch the public key to the controller
+  fetch:
+    src: /etc/swift/replication_key.pub
+    dest: "{{ ring_fetch_dir }}/replication_key.pub"
+    flat: yes
+  delegate_to: "{{ groups['storage_nodes'][0] }}"
+  run_once: true
+  changed_when: false
+
+- name: install the private key on every storage node
+  copy:
+    src: "{{ ring_fetch_dir }}/replication_key"
+    dest: /etc/swift/replication_key
+    mode: "0600"
+
+- name: install the public key on every storage node
+  copy:
+    src: "{{ ring_fetch_dir }}/replication_key.pub"
+    dest: /etc/swift/replication_key.pub
+    mode: "0644"
+
+- name: read the public key
+  command: cat /etc/swift/replication_key.pub
+  register: rust_replication_pub
+  changed_when: false
+  delegate_to: "{{ groups['storage_nodes'][0] }}"
+  run_once: true
+
+- name: ensure /root/.ssh exists
+  file:
+    path: /root/.ssh
+    state: directory
+    mode: "0700"
+  changed_when: false
+
+- name: authorize the replication key on every storage node
+  lineinfile:
+    path: /root/.ssh/authorized_keys
+    line: "{{ rust_replication_pub.stdout.strip() }}"
+    create: yes
+    mode: "0600"

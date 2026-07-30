@@ -1,0 +1,10 @@
+[Unit]
+Description=Galera Cluster node check socket
+
+[Service]
+Environment="MYSQL_USERNAME={{ mariadb_clustercheck_user }}"
+Environment="MYSQL_PASSWORD={{ mariadb_clustercheck_password }}"
+ExecStart=-/usr/bin/clustercheck     # the binary to start
+User=root
+Group=root
+StandardInput=socket

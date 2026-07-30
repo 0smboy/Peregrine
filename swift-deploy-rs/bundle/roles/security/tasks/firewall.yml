@@ -1,0 +1,30 @@
+---
+- name: Check firewall type
+  fail:
+    msg: "firewall_type only support iptables and none, got {{ firewall_type }}"
+  when: firewall_type != "none" and firewall_type != "iptables"
+
+- name: Disable iptables and firewalld
+  service: name={{ item }} state=stopped enabled=no
+  with_items:
+    - iptables
+    - firewalld
+
+- name: Start iptables service
+  service: name=iptables state=started enabled=yes
+
+- block:
+    - name: Backup iptables.save1
+      shell: "cp /etc/sysconfig/iptables.save /etc/sysconfig/iptables.save.backup.$(uuidgen)"
+      ignore_errors: yes
+    - name: Copy iptables template
+      template:
+        src: templates/iptables.j2
+        dest: /opt/ostorage_default.iptables
+    - name: Import iptables rules
+      shell: "iptables-restore < /opt/ostorage_default.iptables"
+    - name: Save iptables rules
+      shell: "service iptables save"
+    - name: Backup iptables.save2
+      shell: "cp /etc/sysconfig/iptables.save /etc/sysconfig/iptables.save.backup.$(uuidgen)"
+      ignore_errors: yes

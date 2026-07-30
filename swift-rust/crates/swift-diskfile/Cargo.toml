@@ -1,0 +1,15 @@
+[package]
+name = "swift-diskfile"
+description = "Object on-disk layout for the Rust implementation of OpenStack Swift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+swift-core = { path = "../swift-core" }
+md-5 = "0.10"
+xattr = "1"
+
+[dev-dependencies]
+serde_json = "1"

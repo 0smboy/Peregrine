@@ -1,0 +1,41 @@
+---
+- name: Delete old dir.
+  file:
+    path: "/tmp/swift_builder"
+    state: absent
+
+- name: Create tmp dir to store ring.
+  file: 
+    path: "/tmp/swift_builder"
+    state: directory
+  tags: create_builder
+
+- name: Create object-{{ add_object_ring.index }}.builder
+  command: 'swift-ring-builder object-{{ add_object_ring.index }}.builder create {{ add_object_ring.object_swift_partition_power }} {{ add_object_ring.object_swift_replicas }} {{ add_object_ring.object_swift_minimum_time }}'
+  args:
+    chdir: "/tmp/swift_builder"
+    creates: '/tmp/swift_builder/object-{{ add_object_ring.index }}.builder'
+  tags: create_builder
+
+- include: object_node.yml builder_name=object-{{ add_object_ring.index }} region={{ object_node.region }} zone={{ object_node.zone }} storage_ip={{ object_node.storage_ip }} replication_ip={{ object_node.replication_ip }} port={{ object_node.port }} device={{ object_node.device }} weight={{ object_node.weight }} tmp_dir="/tmp/swift_builder"
+  with_items: '{{ add_object_ring.nodes }}'
+  loop_control:
+      loop_var: object_node
+  tags: add_devices
+
+- name: Rebalance object-{{ add_object_ring.index }}.builder ring
+  command: 'swift-ring-builder object-{{ add_object_ring.index }}.builder rebalance -f'
+  ignore_errors: yes
+  args:
+    chdir: "/tmp/swift_builder"
+  tags: rebalance
+
+- name: Get ring builder info.
+  command: "swift-ring-builder /tmp/swift_builder/object-{{ add_object_ring.index }}.builder"
+  register: builder_info
+  tags: [rebalance, show_ring]
+
+- name: Print ring builder info.
+  debug:
+    msg: "{{ builder_info }}"
+  tags: [rebalance, show_ring]

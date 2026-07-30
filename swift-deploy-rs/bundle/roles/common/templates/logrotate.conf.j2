@@ -1,0 +1,26 @@
+/var/log/swift/proxy*.log
+/var/log/swift/account*.log
+/var/log/swift/container*.log
+/var/log/swift/object*.log
+{
+    daily
+    rotate 30
+    missingok
+    compress
+    sharedscripts
+    postrotate
+        /bin/kill -HUP `cat /var/run/syslogd.pid 2>/dev/null` 2>/dev/null || true
+    endscript
+}
+
+/var/log/swift/swift-error.log
+{
+    daily
+    rotate 60
+    missingok
+    compress
+    sharedscripts
+    postrotate
+        /bin/kill -HUP `cat /var/run/syslogd.pid 2>/dev/null` 2>/dev/null || true
+    endscript
+}

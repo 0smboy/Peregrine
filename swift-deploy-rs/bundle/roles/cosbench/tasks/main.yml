@@ -1,0 +1,80 @@
+---
+- block:
+  - name: Clear old cabt files
+    file:
+      path: "{{ item }}"
+      state: absent
+    with_items:
+      - /opt/cabt_package/cabt_lib
+      - /usr/local/bin/cabt
+    ignore_errors: yes
+  - name: Create cabt package folder
+    file:
+      path: /opt/cabt_package
+      state: directory
+      recurse: yes
+  - name: Check cabt package folder existed
+    shell: "/usr/local/bin/cabt --help"
+    register: result
+    ignore_errors: yes
+  - name: Download cabt package
+    unarchive:
+      src: http://{{ local_repo_address }}/component/cabt_package.tar.gz
+      dest: /opt/cabt_package
+      remote_src: True
+    when: result is failed
+  - name: Copy cabt lib
+    shell: 'cp -r /opt/cabt_package/cabt_lib /root/.cabt'
+    when: result is failed
+  - name: Copy cabt program
+    shell: 'cp /opt/cabt_package/cabt /usr/local/bin/cabt && chmod +x /usr/local/bin/cabt'
+    when: result is failed
+
+- block: 
+  - name: Get cosbench docker image
+    get_url:
+      url: "http://{{ local_repo_address }}/component/docker/images/cosbench-centos7-{{ cosbench_version }}.tar"
+      dest: "/tmp/cosbench-centos7-{{ cosbench_version }}.tar"
+  - name: Load cosbench docker image
+    shell: "docker load -i /tmp/cosbench-centos7-{{ cosbench_version }}.tar"
+  - name: Create cosbench docker folders
+    file:
+      path: "{{ cosbench_path }}/{{ cosbench_version }}/{{item}}"
+      state: directory
+    with_items:
+      - log
+      - archive
+      - conf
+
+- block:
+  - name: Configuring cosbench driver configuration file-localhost
+    template:
+      src: driver_1_localhost.conf.j2
+      dest: "{{ cosbench_path }}/{{ cosbench_version }}/conf/driver_1.conf"
+    when: inventory_hostname in groups['cosbench-controller']
+  - name: Configuring cosbench driver configuration file
+    template:
+      src: driver_1.conf.j2
+      dest: "{{ cosbench_path }}/{{ cosbench_version }}/conf/driver_1.conf"
+    when: inventory_hostname not in groups['cosbench-controller']
+  - name: Configuring controller configuration file
+    template: 
+      src: controller.conf.j2
+      dest: "{{ cosbench_path }}/{{ cosbench_version }}/conf/controller.conf"
+
+
+- name: Start cosbench container
+  shell: |
+    docker run -d \
+    -p 127.0.0.1:19088:19088 \
+    -p {{ inventory_hostname }}:19088:19088 \
+    -p {{ inventory_hostname }}:18088:18088 \
+    -v /root/.cabt:/root/.cabt \
+    -v /usr/local/bin/cabt:/usr/local/bin/cabt \
+    -v {{ cosbench_path }}/{{ cosbench_version }}/conf/controller.conf:/cosbench/{{ cosbench_version }}/conf/controller.conf \
+    -v {{ cosbench_path }}/{{ cosbench_version }}/conf/driver_1.conf:/cosbench/{{ cosbench_version }}/conf/driver_1.conf \
+    -v {{ cosbench_path }}/{{ cosbench_version }}/conf/log:/cosbench/{{ cosbench_version }}/log \
+    -v {{ cosbench_path }}/{{ cosbench_version }}/conf/archive:/cosbench/{{ cosbench_version }}/archive \
+    --network "{{ docker_bridge_net }}" \
+    --ip "{{ '.'.join(docker_monitornet_ip_range.split('.')[:-1]) }}.5" \
+    --name cosbench cosbench-centos7:{{ cosbench_version }}

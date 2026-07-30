@@ -1,0 +1,13 @@
+---
+- include: mariadb_client.yml
+  tags: config remote mariadb
+  when: not use_local_mariadbs
+
+- include: install.yml
+  tags: install keystone package
+
+- include: config.yml
+  tags: config keystone
+
+- include: deploy_server.yml
+  tags: deploy keystone server

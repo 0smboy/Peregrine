@@ -1,0 +1,11 @@
+[package]
+name = "swift-ec"
+description = "Erasure-coding codec for the Rust implementation of OpenStack Swift (liberasurecode FFI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[build-dependencies]

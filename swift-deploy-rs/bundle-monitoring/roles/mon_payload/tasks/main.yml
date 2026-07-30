@@ -1,0 +1,29 @@
+---
+# Install the prebuilt monitoring agent binaries. The payload lives INSIDE
+# the bundle (sealed by the bundle fingerprint) at roles/mon_payload/files/bin
+# — see PAYLOAD.md for how it is populated from /root/monitoring-payload on
+# the control machine. copy compares content, so re-applies converge with
+# changed=0; the registers drive the immediate restarts in mon_systemd when
+# a binary was upgraded (writes are atomic temp+rename, so overwriting a
+# running agent is safe).
+
+- name: install node_exporter
+  copy:
+    src: bin/node_exporter
+    dest: /usr/local/bin/node_exporter
+    mode: "0755"
+  register: mon_bin_node_exporter
+
+- name: install statsd_exporter
+  copy:
+    src: bin/statsd_exporter
+    dest: /usr/local/bin/statsd_exporter
+    mode: "0755"
+  register: mon_bin_statsd_exporter
+
+- name: install alloy
+  copy:
+    src: bin/alloy
+    dest: /usr/local/bin/alloy
+    mode: "0755"
+  register: mon_bin_alloy

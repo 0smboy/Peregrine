@@ -1,0 +1,303 @@
+---
+- name: Check haproxy and proxy mode
+  script: files/check_haproxy_proxy.sh  {{ proxy_mode }} {{ use_lb }}
+  when: inventory_hostname in groups['proxy_servers']
+- name: Resolve the generated Keystone controller name on every node
+  lineinfile:
+    dest: /etc/hosts
+    line: "{{ keystone_endpoint_ip }} {{ keystone_endpoint_controller_hostname }}"
+    state: present
+  when: auth_method == "keystone"
+- name: reinstall swift_cluster
+  script: files/kill_all_swift_services.sh
+  when: REINSTALL
+- name: Setup hostname
+  command: hostnamectl set-hostname {{ item }}
+  with_items:
+  - "{{ hostname_prefix }}{{ inventory_hostname.split('.')[-1] }}"
+  when: hostname_modifiable
+
+- name: Set timezone to {{ timezone }}
+  timezone: name={{ timezone }}
+- name: Restart crond
+  service: name=crond
+           state=restarted
+
+- block:
+  - name: Disable sshd accept locale configs
+    lineinfile: dest=/etc/ssh/sshd_config
+                state=absent
+                regexp="^AcceptEnv.*"
+  - name: Restart sshd
+    service: name=sshd
+             state=restarted
+             enabled=yes
+  - name: Change all locale related configs into /etc/profile
+    blockinfile:
+      dest: /etc/profile
+      content: |
+        export LANG="en_US.UTF-8"
+        export LC_CTYPE="en_US.UTF-8"
+        export LC_NUMERIC="en_US.UTF-8"
+        export LC_TIME="en_US.UTF-8"
+        export LC_COLLATE="en_US.UTF-8"
+        export LC_MONETARY="en_US.UTF-8"
+        export LC_MESSAGES="en_US.UTF-8"
+        export LC_PAPER="en_US.UTF-8"
+        export LC_NAME="en_US.UTF-8"
+        export LC_ADDRESS="en_US.UTF-8"
+        export LC_TELEPHONE="en_US.UTF-8"
+        export LC_MEASUREMENT="en_US.UTF-8"
+        export LC_IDENTIFICATION="en_US.UTF-8"
+        export LC_ALL="en_US.UTF-8"
+  - name: Change all locale related configs into /etc/bashrc
+    blockinfile:
+      dest: /etc/bashrc
+      content: |
+        export LANG="en_US.UTF-8"
+        export LC_CTYPE="en_US.UTF-8"
+        export LC_NUMERIC="en_US.UTF-8"
+        export LC_TIME="en_US.UTF-8"
+        export LC_COLLATE="en_US.UTF-8"
+        export LC_MONETARY="en_US.UTF-8"
+        export LC_MESSAGES="en_US.UTF-8"
+        export LC_PAPER="en_US.UTF-8"
+        export LC_NAME="en_US.UTF-8"
+        export LC_ADDRESS="en_US.UTF-8"
+        export LC_TELEPHONE="en_US.UTF-8"
+        export LC_MEASUREMENT="en_US.UTF-8"
+        export LC_IDENTIFICATION="en_US.UTF-8"
+        export LC_ALL="en_US.UTF-8"
+
+- block:
+  - name: Make pip conf dir
+    file: path=/root/.pip
+          state=directory
+  - name: Deliver pip.conf
+    template: src=templates/pip.conf.j2
+              dest=/root/.pip/pip.conf
+    become: True
+
+- include: prepare_local_yum_repo.yml
+
+- name: Yum Upgrade
+  command: yum upgrade --best --allowerasing -y --disableplugin=fastestmirror
+  become: True
+
+- include: prepare_local_yum_repo.yml
+
+- name: Install common pkgs
+  yum: name={{ item }} state=present
+  with_items:
+  - chrony
+  - rsync
+  - rsync-daemon
+  - sqlite
+  - xfsprogs
+  - git-core
+  - liberasurecode-devel
+  - python3-setuptools
+  - python3-coverage
+  - python3-devel
+  - python3-nose
+  - python3-pyxattr
+  - python3-eventlet
+  - python3-greenlet
+  - python3-paste-deploy
+  - python3-netifaces
+  - python3-pip
+  - python3-dns
+  - python3-mock
+  - iptables-services
+  - python3-keystonemiddleware
+  - python3-openstackclient
+
+- name: Deliver rsyslog conf
+  template: src=templates/rsyslog.conf.j2
+            dest=/etc/rsyslog.d/openstack-swift.conf
+
+- name: Deliver ha rsyslog conf
+  template: src=templates/ha_rsyslog.conf.j2
+            dest=/etc/rsyslog.d/ha.conf
+
+- name: Deliver logrotate conf
+  template: src=templates/logrotate.conf.j2
+            dest=/etc/logrotate.d/openstack-swift
+            force=yes
+
+- name: Deliver rsyncd logrotate conf
+  template: src=templates/rsyncd_logrotate.conf.j2
+            dest=/etc/logrotate.d/rsyncd
+            force=yes
+
+- block:
+  - name: Check existance of haproxy logrotate conf
+    stat:
+      path: /etc/logrotate.d/haproxy
+    register: haproxy_logrotate
+  
+  - name: Check existance of keepalived logrotate conf
+    stat:
+      path: /etc/logrotate.d/keepalived
+    register: keepalived_logrotate
+  
+  - name: Change haproxy rotate day if config exists
+    lineinfile:
+      path: /etc/logrotate.d/haproxy
+      regexp: '^    rotate'
+      line: '    rotate 30'
+    when: haproxy_logrotate.stat.exists == true
+
+  - name: Copy if haproxy rotate config not exists
+    template:
+      src: templates/haproxy_logrotate.conf.j2
+      dest: /etc/logrotate.d/haproxy
+    when: haproxy_logrotate.stat.exists != true
+
+  - name: Change keepalived rotate day if config not exists
+    lineinfile:
+      path: /etc/logrotate.d/keepalived
+      regexp: '^    rotate'
+      line: '    rotate 30'
+    when: keepalived_logrotate.stat.exists == true
+
+  - name: Copy if keepalived rotate config not exists
+    template:
+      src: templates/keepalived_logrotate.conf.j2
+      dest: /etc/logrotate.d/keepalived
+    when: keepalived_logrotate.stat.exists != true
+
+- block:
+  - name: Remove rsyslog log rate limit
+    blockinfile:
+      dest: /etc/rsyslog.conf
+      content: |
+        $imjournalRatelimitInterval 0
+        $imjournalRatelimitBurst 0
+  - name: Set rsyslog udp reception
+    blockinfile:
+      dest: /etc/rsyslog.conf
+      insertafter: "# Provides UDP syslog reception"
+      marker: "# OSTORAGE RSYSLOG UDP SETTINGS {mark}"
+      content: |
+        $ModLoad imudp
+        $UDPServerRun 514
+  - name: Remove systemd log rate limit
+    ini_file: dest=/etc/systemd/journald.conf
+              no_extra_spaces=yes
+              section=Journal
+              option={{ item.key }}
+              value={{ item.value }}
+    with_dict:
+        "RateLimitInterval": 0
+        "RateLimitBurst": 0
+
+- block:
+  - name: Create /etc/swift/ directory
+    file: path=/etc/swift
+          state=directory
+  - name: Create swift user
+    user: name=swift
+          shell=/usr/sbin/nologin
+          createhome=no
+
+- block:
+  - name: Download python-swiftclient  pkgs
+    unarchive:
+      src: http://{{ local_repo_address }}/component/python-swiftclient.tar.gz
+      dest: /root
+      remote_src: True
+  - name: Rename python-swiftclient folder
+    shell: "mv /root/python-swiftclient-{{python_swiftclient_version}} /root/python-swiftclient"
+  - name: Install python-swiftclient
+    shell: "cd python-swiftclient; pip install -r requirements.txt && python setup.py install"
+
+- block:
+  - name: Download swift pkgs
+    unarchive:
+      src: http://{{ local_repo_address }}/component/swift.tar.gz
+      dest: /root
+      remote_src: True
+  - name: Rename swift folder
+    shell: "mv /root/swift-{{swift_version}} /root/swift"
+  - name: Install swift
+    shell: "cd swift; pip install -r requirements.txt && python setup.py install"
+
+- block:
+  - name: Create go path
+    file:
+      path: "{{go_path}}/bin"
+      state: directory
+
+  - name: Get proxyfs middlewares
+    unarchive:
+      src: 'http://{{ local_repo_address }}/component/proxyfs_middlewares{{proxyfs_middlewares_version}}.tar.gz'
+      dest: "{{go_path}}"
+      remote_src: yes
+
+  - name: Install proxyfs middlewares
+    shell: 'python setup.py install'
+    args: 
+      chdir: "{{go_path}}/proxyfs_middlewares{{proxyfs_middlewares_version}}/{{item}}"
+    with_items:
+      - pfs_middleware
+      - meta_middleware
+  
+  when: install_proxyfs
+
+- block:
+  - name: Copy swift systemd unit files
+    copy:
+      src: files/swift_systemd_units/{{ item }}
+      dest: /usr/lib/systemd/system/{{ item }}
+      owner: root
+      group: root
+      mode: 0644
+    with_items:
+    - openstack-swift-account-auditor.service
+    - openstack-swift-account-auditor@.service
+    - openstack-swift-account-reaper.service
+    - openstack-swift-account-reaper@.service
+    - openstack-swift-account-replicator.service
+    - openstack-swift-account-replicator@.service
+    - openstack-swift-account.service
+    - openstack-swift-account@.service
+    - openstack-swift-container-auditor.service
+    - openstack-swift-container-auditor@.service
+    - openstack-swift-container-reconciler.service
+    - openstack-swift-container-replicator.service
+    - openstack-swift-container-replicator@.service
+    - openstack-swift-container-updater.service
+    - openstack-swift-container-updater@.service
+    - openstack-swift-container.service
+    - openstack-swift-container@.service
+    - openstack-swift-object-auditor.service
+    - openstack-swift-object-auditor@.service
+    - openstack-swift-object-expirer.service
+    - openstack-swift-object-reconstructor.service
+    - openstack-swift-object-reconstructor@.service
+    - openstack-swift-object-replicator.service
+    - openstack-swift-object-replicator@.service
+    - openstack-swift-object-updater.service
+    - openstack-swift-object-updater@.service
+    - openstack-swift-object.service
+    - openstack-swift-object@.service
+    - openstack-swift-proxy.service
+    - openstack-swift-proxy-noauth.service
+  - name: Reload  systemctl
+    shell: "systemctl daemon-reload"
+
+- name: Cleanup python-swiftclient and swift directory
+  file: path=/root/{{ item }}
+        state=absent
+  with_items:
+  - python-swiftclient
+  - swift
+
+- block:
+  - name: Pip install s3cmd
+    pip: name=s3cmd
+  - include: copy_s3cfg.yml
+    with_items: "{{ ec2_credentials }}"
+    loop_control:
+      loop_var: credential_info

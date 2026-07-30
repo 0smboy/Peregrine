@@ -1,0 +1,369 @@
+{
+ "hash_prefix": "",
+ "hash_suffix": "changeme",
+ "rings": {
+  "v1.ring.gz": {
+   "assigned_device_count": 8,
+   "builder_version": 9,
+   "dev_id_bytes": 2,
+   "device_count": 8,
+   "gets": [
+    {
+     "account": "a",
+     "container": null,
+     "node_ids": [
+      7,
+      1,
+      5
+     ],
+     "node_indexes": [
+      0,
+      1,
+      2
+     ],
+     "obj": null,
+     "part": 46
+    },
+    {
+     "account": "a",
+     "container": "c",
+     "node_ids": [
+      2,
+      6,
+      0
+     ],
+     "node_indexes": [
+      0,
+      1,
+      2
+     ],
+     "obj": null,
+     "part": 58
+    },
+    {
+     "account": "a",
+     "container": "c",
+     "node_ids": [
+      3,
+      7,
+      1
+     ],
+     "node_indexes": [
+      0,
+      1,
+      2
+     ],
+     "obj": "o",
+     "part": 11
+    },
+    {
+     "account": "AUTH_test",
+     "container": "container",
+     "node_ids": [
+      2,
+      6,
+      0
+     ],
+     "node_indexes": [
+      0,
+      1,
+      2
+     ],
+     "obj": "some/obj/with/slashes",
+     "part": 42
+    },
+    {
+     "account": "AUTH_test",
+     "container": "\u2603",
+     "node_ids": [
+      3,
+      7,
+      1
+     ],
+     "node_indexes": [
+      0,
+      1,
+      2
+     ],
+     "obj": "\ud83d\udca9",
+     "part": 35
+    }
+   ],
+   "more_nodes": {
+    "0": [
+     5,
+     2,
+     6,
+     1,
+     8
+    ],
+    "17": [
+     2,
+     6,
+     3,
+     0,
+     7
+    ],
+    "42": [
+     7,
+     3,
+     5,
+     1,
+     8
+    ],
+    "63": [
+     0,
+     3,
+     5,
+     7,
+     1
+    ]
+   },
+   "next_part_power": null,
+   "part_shift": 26,
+   "partition_count": 64,
+   "replica_count": 3.0,
+   "weighted_device_count": 7
+  },
+  "v2.ring.gz": {
+   "assigned_device_count": 8,
+   "builder_version": 9,
+   "dev_id_bytes": 2,
+   "device_count": 8,
+   "gets": [
+    {
+     "account": "a",
+     "container": null,
+     "node_ids": [
+      7,
+      1,
+      5
+     ],
+     "node_indexes": [
+      0,
+      1,
+      2
+     ],
+     "obj": null,
+     "part": 46
+    },
+    {
+     "account": "a",
+     "container": "c",
+     "node_ids": [
+      2,
+      6,
+      0
+     ],
+     "node_indexes": [
+      0,
+      1,
+      2
+     ],
+     "obj": null,
+     "part": 58
+    },
+    {
+     "account": "a",
+     "container": "c",
+     "node_ids": [
+      3,
+      7,
+      1
+     ],
+     "node_indexes": [
+      0,
+      1,
+      2
+     ],
+     "obj": "o",
+     "part": 11
+    },
+    {
+     "account": "AUTH_test",
+     "container": "container",
+     "node_ids": [
+      2,
+      6,
+      0
+     ],
+     "node_indexes": [
+      0,
+      1,
+      2
+     ],
+     "obj": "some/obj/with/slashes",
+     "part": 42
+    },
+    {
+     "account": "AUTH_test",
+     "container": "\u2603",
+     "node_ids": [
+      3,
+      7,
+      1
+     ],
+     "node_indexes": [
+      0,
+      1,
+      2
+     ],
+     "obj": "\ud83d\udca9",
+     "part": 35
+    }
+   ],
+   "more_nodes": {
+    "0": [
+     5,
+     2,
+     6,
+     1,
+     8
+    ],
+    "17": [
+     2,
+     6,
+     3,
+     0,
+     7
+    ],
+    "42": [
+     7,
+     3,
+     5,
+     1,
+     8
+    ],
+    "63": [
+     0,
+     3,
+     5,
+     7,
+     1
+    ]
+   },
+   "next_part_power": null,
+   "part_shift": 26,
+   "partition_count": 64,
+   "replica_count": 3.0,
+   "weighted_device_count": 7
+  },
+  "v2_frac.ring.gz": {
+   "assigned_device_count": 8,
+   "builder_version": 10,
+   "dev_id_bytes": 2,
+   "device_count": 8,
+   "gets": [
+    {
+     "account": "a",
+     "container": null,
+     "node_ids": [
+      7,
+      1
+     ],
+     "node_indexes": [
+      0,
+      1
+     ],
+     "obj": null,
+     "part": 46
+    },
+    {
+     "account": "a",
+     "container": "c",
+     "node_ids": [
+      2,
+      6
+     ],
+     "node_indexes": [
+      0,
+      1
+     ],
+     "obj": null,
+     "part": 58
+    },
+    {
+     "account": "a",
+     "container": "c",
+     "node_ids": [
+      3,
+      7,
+      1
+     ],
+     "node_indexes": [
+      0,
+      1,
+      2
+     ],
+     "obj": "o",
+     "part": 11
+    },
+    {
+     "account": "AUTH_test",
+     "container": "container",
+     "node_ids": [
+      2,
+      6
+     ],
+     "node_indexes": [
+      0,
+      1
+     ],
+     "obj": "some/obj/with/slashes",
+     "part": 42
+    },
+    {
+     "account": "AUTH_test",
+     "container": "\u2603",
+     "node_ids": [
+      3,
+      7
+     ],
+     "node_indexes": [
+      0,
+      1
+     ],
+     "obj": "\ud83d\udca9",
+     "part": 35
+    }
+   ],
+   "more_nodes": {
+    "0": [
+     5,
+     6,
+     2,
+     8,
+     1
+    ],
+    "17": [
+     2,
+     6,
+     3,
+     0,
+     7
+    ],
+    "42": [
+     0,
+     7,
+     3,
+     5,
+     1,
+     8
+    ],
+    "63": [
+     0,
+     5,
+     3,
+     6,
+     7,
+     1
+    ]
+   },
+   "next_part_power": 7,
+   "part_shift": 26,
+   "partition_count": 64,
+   "replica_count": 2.5,
+   "weighted_device_count": 7
+  }
+ }
+}

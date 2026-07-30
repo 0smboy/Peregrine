@@ -1,0 +1,13 @@
+---
+- include: bootstrap.yml
+  tags: keystone boostrap
+
+- include: set_openstack_args.yml
+  tags: set openstack args
+
+- include: create_swift_service.yml
+  tags: create swift service
+  when: inventory_hostname == groups['mariadb_servers'][0]
+
+- include: deliver_credentials.yml
+  tags: deliver credentials

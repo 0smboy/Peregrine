@@ -1,0 +1,4 @@
+---
+object_replicator_concurrency: 1
+object_pipeline: healthcheck recon backend_ratelimit object-server
+recon_lock_path: /var/lock

@@ -1,0 +1,41 @@
+---
+- name: Check if {{ object_ring.name }}.builder exist
+  stat: path=/etc/swift/{{ object_ring.name }}.builder
+  register: builder_exist
+  when: REINSTALL
+
+- name: Remove {{ object_ring.name}} ring files
+  file: path=/etc/swift/{{ item }}
+        state=absent
+  with_items:
+    -  '{{ object_ring.name }}.builder'
+    -  '{{ object_ring.name }}.ring.gz'
+  when: REINSTALL and builder_exist is defined and builder_exist.stat.exists == True 
+
+- name: Create {{ object_ring.name }}.builder
+  command: 'swift-ring-builder {{ object_ring.name }}.builder create {{ object_ring.object_swift_partition_power }} {{ object_ring.object_swift_replicas }} {{ object_ring.object_swift_minimum_time }}'
+  args:
+    chdir: /etc/swift
+    creates: '/etc/swift/{{ object_ring.name }}.builder'
+
+- include: object_node.yml builder_name={{ object_ring.name }} region={{ object_node.region }} zone={{ object_node.zone }} storage_ip={{ object_node.storage_ip }} replication_ip={{ object_node.replication_ip }} port={{ object_node.port }} device={{ object_node.device }} weight={{ object_node.weight }}
+  with_items: '{{ object_ring.nodes }}'
+  loop_control:
+      loop_var: object_node
+
+- block:
+  - name: Set rebalance mode for debug
+    set_fact:
+      rebalance_mode: '-f'
+    when: INSTALL_MODE == "development"
+  - name: Set rebalance mode for production
+    set_fact:
+      rebalance_mode: ''
+    when: INSTALL_MODE != "development"
+
+- name: Rebalance {{ object_ring.name }} ring
+  command: 'swift-ring-builder {{ object_ring.name }}.builder rebalance {{ rebalance_mode }}'
+  ignore_errors: yes
+  args:
+    chdir: /etc/swift
+

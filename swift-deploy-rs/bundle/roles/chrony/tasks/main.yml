@@ -1,0 +1,10 @@
+---
+- name: Configure NTP server
+  template: src=templates/chrony_server.conf.j2 dest=/etc/chrony.conf
+  notify: Restart chrony service
+  when: inventory_hostname in groups['ntp_server']
+
+- name: Configure NTP clients
+  template: src=templates/chrony_clients.conf.j2 dest=/etc/chrony.conf
+  notify: Restart chrony service
+  when: inventory_hostname in groups['ntp_clients']

@@ -1,0 +1,11 @@
+---
+# 定义keepalived 主备服务器组信息
+vip_prefix: 24
+keepalived_vrrp_script: {name: chk_http_port, interval: 1, weight: -10}
+# keepalived_mode: 允许一个priority比较低的节点作为master，即使有priority更高的节点启动，该值可以不配置，表示抢占模式；该值还可以配置为nopreempt，表示非抢占模式
+keepalived_mode: nopreempt
+# advert_int: 两次MASTER角色选举的时间间隔
+# virtual_router_id: 取值在0-255之间,用来区分多个instance的VRRP组播
+keepalived_servers: {
+  vrrp_instance: {virtual_router_id: 50, advert_int: 1, auth_pass: 11111}
+}

@@ -1,0 +1,70 @@
+name: mock-mixed
+description: In-memory dry run with sequential prepare + mixed main + cleanup
+storage:
+  type: mock
+  latency_us: 50
+stages:
+  - name: init
+    kind: init
+    workers: 1
+    total_ops: 1
+    sequential: true
+    operations:
+      - type: create_container
+        ratio: 100
+    objects:
+      cprefix: bucket
+      containers: { start: 1, end: 1 }
+      oprefix: obj-
+      objects: { start: 1, end: 1 }
+      size: 1
+
+  - name: prepare
+    kind: prepare
+    workers: 4
+    total_ops: 100
+    sequential: true
+    operations:
+      - type: write
+        ratio: 100
+    objects:
+      cprefix: bucket
+      containers: { start: 1, end: 1 }
+      oprefix: obj-
+      objects: { start: 1, end: 100 }
+      size: 4096
+      hash_check: true
+
+  - name: main
+    kind: main
+    workers: 8
+    runtime_secs: 3
+    operations:
+      - type: read
+        ratio: 70
+      - type: write
+        ratio: 20
+      - type: list
+        ratio: 10
+    objects:
+      cprefix: bucket
+      containers: { start: 1, end: 1 }
+      oprefix: obj-
+      objects: { start: 1, end: 100 }
+      size: 4096
+      hash_check: true
+
+  - name: cleanup
+    kind: cleanup
+    workers: 4
+    total_ops: 100
+    sequential: true
+    operations:
+      - type: delete
+        ratio: 100
+    objects:
+      cprefix: bucket
+      containers: { start: 1, end: 1 }
+      oprefix: obj-
+      objects: { start: 1, end: 100 }
+      size: 1

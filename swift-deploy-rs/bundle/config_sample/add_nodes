@@ -1,0 +1,48 @@
+192.168.2.53 ansible_user=root ansible_port=22 ansible_ssh_private_key_file=/path/to/id_ed25519
+
+[ntp_server]
+
+[ntp_clients]
+192.168.2.53
+
+# 每个 proxy server 可以配置为不同的接口模式(http/https)
+# ex: 192.168.2.51 proxy_mode=https
+#     192.168.2.52 proxy_mode=http
+[proxy_servers]
+192.168.2.53 proxy_mode=http
+
+[account_servers]
+192.168.2.53
+
+[container_servers]
+192.168.2.53
+
+[object_servers]
+192.168.2.53
+
+[storage_nodes:children]
+account_servers
+container_servers
+object_servers
+
+[format_disk_servers]
+192.168.2.53
+
+# 没有则为空
+[haproxy_servers]
+
+
+# keepalived_interface: 将虚拟IP绑在哪一块网卡上(网卡设备名)
+# keepalived_priority: 权重优先级,值的范围0-255,主节点需要比被节点的值大
+#
+# 参考配置如下
+#
+# 请注意配置足够数量的keepalived servers和haproxy servers
+# 用以保证任意两个节点宕机不会导致服务不可用
+#
+# 192.168.2.16 keepalived_interface=eno16777984 keepalived_priority=92
+# 192.168.2.17 keepalived_interface=eno16777984 keepalived_priority=94
+# 192.168.2.18 keepalived_interface=eno16777984 keepalived_priority=96
+# 192.168.2.19 keepalived_interface=eno16777984 keepalived_priority=98
+# 没有则为空
+[keepalived_servers]

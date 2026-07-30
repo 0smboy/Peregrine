@@ -1,0 +1,151 @@
+# {{ ansible_managed }}
+# statsd_exporter mapping: translates the Rust Swift daemons' dot-metrics
+# into labeled Prometheus metrics. Verified against the emitting source
+# (rust/crates/*): with log_statsd_metric_prefix left empty, the wire shapes
+# are exactly:
+#
+#   proxy-server.<METHOD>.<status>        counter
+#   proxy-server.timing                   timer, whole request, no method
+#   <svc>-server.<METHOD>.<status>        counter  (object/account/container)
+#   <svc>-server.<METHOD>.timing          timer
+#   object-replicator.{suffix_syncs,reverts,failures}     counters
+#   object-reconstructor.{suffix_syncs,reverts,failures}  counters
+#   object-updater.{successes,failures,unlinks}           counters
+#   account-replicator.{successes,failures}               counters
+#   container-replicator.{successes,failures}             counters
+#
+# statsd_exporter observes statsd timers (|ms) in SECONDS — that is fixed
+# exporter behavior — so the duration metrics are named _seconds with
+# seconds buckets rather than the draft's _ms name; values stay honest and
+# no version-dependent scaling is needed.
+# The 2s bucket boundary matches the ProxyP99High alert threshold.
+
+defaults:
+  observer_type: histogram
+  histogram_options:
+    buckets: [0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10]
+
+mappings:
+  # ---- request timers -> swift_request_duration_seconds{service,method} ----
+  # The whole-request proxy timer carries no method component; label it "all".
+  - match: "proxy-server.timing"
+    match_metric_type: observer
+    name: "swift_request_duration_seconds"
+    labels:
+      service: "proxy-server"
+      method: "all"
+
+  - match: "proxy-server.*.timing"
+    match_metric_type: observer
+    name: "swift_request_duration_seconds"
+    labels:
+      service: "proxy-server"
+      method: "$1"
+
+  - match: "object-server.*.timing"
+    match_metric_type: observer
+    name: "swift_request_duration_seconds"
+    labels:
+      service: "object-server"
+      method: "$1"
+
+  - match: "account-server.*.timing"
+    match_metric_type: observer
+    name: "swift_request_duration_seconds"
+    labels:
+      service: "account-server"
+      method: "$1"
+
+  - match: "container-server.*.timing"
+    match_metric_type: observer
+    name: "swift_request_duration_seconds"
+    labels:
+      service: "container-server"
+      method: "$1"
+
+  # ---- request counters -> swift_request_total{service,method,status} ----
+  # These come after the .timing rules, so the literal "timing" third
+  # component can never be misread as a status.
+  - match: "proxy-server.*.*"
+    match_metric_type: counter
+    name: "swift_request_total"
+    labels:
+      service: "proxy-server"
+      method: "$1"
+      status: "$2"
+
+  - match: "object-server.*.*"
+    match_metric_type: counter
+    name: "swift_request_total"
+    labels:
+      service: "object-server"
+      method: "$1"
+      status: "$2"
+
+  - match: "account-server.*.*"
+    match_metric_type: counter
+    name: "swift_request_total"
+    labels:
+      service: "account-server"
+      method: "$1"
+      status: "$2"
+
+  - match: "container-server.*.*"
+    match_metric_type: counter
+    name: "swift_request_total"
+    labels:
+      service: "container-server"
+      method: "$1"
+      status: "$2"
+
+  # ---- consistency daemons -> swift_replicator_total{service,kind} ----
+  # partition.update.timing is reserved by the daemons' statsd client; map
+  # it first so it cannot fall into the counter rules below.
+  - match: "*.partition.update.timing"
+    match_metric_type: observer
+    name: "swift_replicator_duration_seconds"
+    labels:
+      service: "$1"
+      kind: "partition_update"
+
+  - match: "object-replicator.*"
+    match_metric_type: counter
+    name: "swift_replicator_total"
+    labels:
+      service: "object-replicator"
+      kind: "$1"
+
+  - match: "object-reconstructor.*"
+    match_metric_type: counter
+    name: "swift_replicator_total"
+    labels:
+      service: "object-reconstructor"
+      kind: "$1"
+
+  - match: "object-updater.*"
+    match_metric_type: counter
+    name: "swift_replicator_total"
+    labels:
+      service: "object-updater"
+      kind: "$1"
+
+  - match: "account-replicator.*"
+    match_metric_type: counter
+    name: "swift_replicator_total"
+    labels:
+      service: "account-replicator"
+      kind: "$1"
+
+  - match: "container-replicator.*"
+    match_metric_type: counter
+    name: "swift_replicator_total"
+    labels:
+      service: "container-replicator"
+      kind: "$1"
+
+  # ---- catch-all: drop anything unrecognized so the exporter namespace
+  # stays exactly the swift_* families above ----
+  - match: "."
+    match_type: regex
+    action: drop
+    name: "dropped"

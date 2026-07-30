@@ -1,0 +1,23 @@
+# swift-deploy-rs monitoring sample group_vars — structure example only.
+#
+# Every monitoring variable this bundle references also carries an
+# in-template `| default(...)` with the SAME value, so the bundle can be
+# applied against an existing rust workspace config that predates monitoring
+# without editing that workspace's group_vars. The values here are the
+# overridable knobs, and this file documents all of them.
+
+# ---- observability hub (all hub components live on this WireGuard address) ----
+monitoring_hub_address: 172.18.1.2
+
+# Where Alloy pushes journald logs (Loki on the hub). Keep in sync with
+# monitoring_hub_address — group_vars values are plain YAML, not templated.
+loki_push_url: http://172.18.1.2:3100/loki/api/v1/push
+
+# ---- node-agent listeners ----
+# Web listeners bind the per-host storage_network_address (WireGuard plane,
+# scraped by the hub's Prometheus); the statsd ingest socket and Alloy's own
+# HTTP server bind loopback only. Nothing binds 0.0.0.0.
+node_exporter_port: 9100
+statsd_exporter_web_port: 9102
+statsd_udp_port: 9125
+alloy_http_port: 12345

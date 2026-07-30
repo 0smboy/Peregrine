@@ -1,0 +1,19 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Grafana Alloy (journald to Loki, swift monitoring)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=monitor
+Group=monitor
+# Journal read access; also granted at user creation, kept here so a
+# pre-existing monitor user without the group still reads the journal.
+SupplementaryGroups=systemd-journal
+ExecStart=/usr/local/bin/alloy run --server.http.listen-addr=127.0.0.1:{{ alloy_http_port | default(12345) }} --storage.path=/var/lib/alloy --disable-reporting /etc/alloy/config.alloy
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

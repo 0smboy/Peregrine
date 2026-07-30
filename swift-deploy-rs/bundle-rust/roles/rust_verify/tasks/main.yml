@@ -1,0 +1,47 @@
+---
+# Fail-closed end-to-end verification, run on every proxy node.
+# The wait loop is a shell loop because until/retries is not supported at
+# runtime; the assertions themselves use uri where possible.
+
+- name: wait for the local proxy to come up
+  shell: |
+    for _ in $(seq 30); do
+      code=$(curl -s -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:{{ proxy_bind_port }}/healthcheck || true)
+      if [ "$code" = "200" ]; then
+        echo UP
+        exit 0
+      fi
+      sleep 1
+    done
+    echo "proxy did not answer /healthcheck within 30s" >&2
+    exit 1
+  changed_when: false
+
+- name: proxy healthcheck answers 200
+  uri:
+    url: "http://127.0.0.1:{{ proxy_bind_port }}/healthcheck"
+    status_code: 200
+
+- name: tempauth issues a token for the first account
+  uri:
+    url: "http://127.0.0.1:{{ proxy_bind_port }}/auth/v1.0"
+    headers:
+      X-Auth-User: "{{ swift_tempauth_users[0].account }}:{{ swift_tempauth_users[0].user }}"
+      X-Auth-Key: "{{ swift_tempauth_users[0].key }}"
+    status_code: 200
+
+- name: container PUT/GET round trip
+  shell: |
+    set -e
+    resp=$(curl -sf -m 10 -D - -o /dev/null http://127.0.0.1:{{ proxy_bind_port }}/auth/v1.0 \
+      -H 'X-Auth-User: {{ swift_tempauth_users[0].account }}:{{ swift_tempauth_users[0].user }}' \
+      -H 'X-Auth-Key: {{ swift_tempauth_users[0].key }}')
+    token=$(printf '%s' "$resp" | tr -d '\r' | awk 'tolower($1)=="x-auth-token:" {print $2}')
+    url=$(printf '%s' "$resp" | tr -d '\r' | awk 'tolower($1)=="x-storage-url:" {print $2}')
+    test -n "$token"
+    test -n "$url"
+    curl -sf -m 10 -X PUT "$url/swift-deploy-verify" -H "X-Auth-Token: $token" -o /dev/null
+    curl -sf -m 10 "$url?format=plain" -H "X-Auth-Token: $token" | grep -q '^swift-deploy-verify$'
+    echo ROUND-TRIP-OK
+  run_once: true
+  changed_when: false

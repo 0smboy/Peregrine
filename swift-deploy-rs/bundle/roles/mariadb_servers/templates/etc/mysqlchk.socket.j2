@@ -1,0 +1,9 @@
+[Unit]
+Description=Galera Cluster node check socket
+
+[Socket]
+ListenStream={{ mariadb_check_bind_port  }}
+Accept=yes
+
+[Install]
+WantedBy=sockets.target

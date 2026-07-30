@@ -1,0 +1,62 @@
+name: s3-write-read
+description: |
+  S3-compatible endpoints (AWS, MinIO, Ceph RGW).
+  Multipart kicks in at multipart_threshold (default 8MiB).
+storage:
+  type: s3
+  endpoint: http://127.0.0.1:9000
+  region: us-east-1
+  access_key: minioadmin
+  secret_key: minioadmin
+  path_style: true
+  timeout_ms: 60000
+  multipart_threshold: 8388608
+  multipart_part_size: 8388608
+stages:
+  - name: init
+    kind: init
+    workers: 1
+    total_ops: 1
+    sequential: true
+    operations:
+      - type: create_container
+        ratio: 100
+    objects:
+      cprefix: cosbench-rs-
+      containers: { start: 1, end: 1 }
+      oprefix: o
+      objects: { start: 1, end: 1 }
+      size: 1
+
+  - name: prepare
+    kind: prepare
+    workers: 8
+    total_ops: 200
+    sequential: true
+    operations:
+      - type: write
+        ratio: 100
+    objects:
+      cprefix: cosbench-rs-
+      containers: { start: 1, end: 1 }
+      oprefix: o
+      objects: { start: 1, end: 200 }
+      size: 65536
+
+  - name: main
+    kind: main
+    workers: 16
+    runtime_secs: 30
+    operations:
+      - type: read
+        ratio: 80
+      - type: write
+        ratio: 15
+      - type: list
+        ratio: 5
+    objects:
+      cprefix: cosbench-rs-
+      containers: { start: 1, end: 1 }
+      oprefix: o
+      objects: { start: 1, end: 200 }
+      size: 65536

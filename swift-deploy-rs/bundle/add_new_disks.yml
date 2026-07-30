@@ -1,0 +1,16 @@
+---
+- hosts: add_new_disk_servers
+  roles:
+  - format_new_disks
+
+- hosts: all
+  roles:
+  - ring_builder
+
+- hosts: all
+  roles:
+  - ring_utils
+
+- hosts: all
+  roles:
+  - finalize_installation

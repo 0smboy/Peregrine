@@ -1,0 +1,48 @@
+---
+- name: Installing uwsgi
+  pip: name=uwsgi
+
+- name: Creating uwsgi directory
+  file: path=/etc/uwsgi state=directory
+
+- name: Delivering uwsgi keystone-admin ini
+  template: src=templates/keystone-admin.j2
+            dest=/etc/uwsgi/keystone-admin.ini
+
+- name: Delivering uwsgi keystone-public ini
+  template: src=templates/keystone-public.j2
+            dest=/etc/uwsgi/keystone-public.ini
+
+- name: Installing supervisor
+  pip: name=supervisor
+
+- name: Creating supervisor directory
+  file: path="{{item}}" state=directory
+  with_items:
+  - /etc/supervisord.d
+  - /var/log/supervisor
+  - /var/run/supervisor
+
+- name: Delivering supervisor conf
+  copy: src=supervisord.conf
+        dest=/etc/supervisord.conf
+
+- name: Delivering supervisor-keystone ini
+  template: src=templates/supervisor-keystone.j2
+            dest=/etc/supervisord.d/keystone.ini
+
+- name: Delivering supervisor-unit ini
+  template: src=templates/supervisor-unit.j2
+            dest=/lib/systemd/system/supervisord.service
+
+- name: Enabling and starting supervisord service 
+  service:
+    name=supervisord
+    state=started
+    daemon_reload=yes
+    enabled=yes
+
+- name: Supervisor log rotate
+  template:
+    src: templates/supervisor_logrotate.conf.j2
+    dest: /etc/logrotate.d/supervisor.conf

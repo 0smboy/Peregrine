@@ -1,0 +1,10 @@
+[Unit]
+Description=Swift ProxyFS service
+
+[Service]
+Environment=GOTRACEBACK=crash
+LimitCORE=infinity
+ExecStart={{go_path}}/bin/proxyfsd /etc/proxyfsd.conf
+ExecReload=/usr/bin/kill -HUP \$MAINPID
+Restart=no
+KillMode=process

@@ -1,0 +1,3 @@
+max_connections: 30
+read_only: False
+lock_file: /var/lock/object.lock

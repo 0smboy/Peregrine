@@ -1,0 +1,75 @@
+---
+# Build every ring once on the first proxy node, stage the *.ring.gz on the
+# controller, then distribute to every node's /etc/swift/.
+#
+# The build script guards itself with a content stamp: it rebuilds every
+# ring whenever the rendered plan changed (or a ring is missing) and skips
+# otherwise, so stale rings from unrelated deployments never survive and
+# re-applies still converge. Topology changes re-render the script, which
+# changes the stamp and triggers a full rebuild.
+
+- name: render the ring build script on the first proxy node
+  template:
+    src: build_rings.sh.j2
+    dest: /etc/swift/build_rings.sh
+    mode: "0755"
+  delegate_to: "{{ groups['proxy_servers'][0] }}"
+  run_once: true
+
+- name: build the rings on the first proxy node
+  command: bash /etc/swift/build_rings.sh
+  register: rust_ring_build
+  changed_when: rust_ring_build.stdout.find('RINGS-REBUILT') != -1
+  delegate_to: "{{ groups['proxy_servers'][0] }}"
+  run_once: true
+
+- name: ensure the controller staging directory exists
+  file:
+    path: "{{ ring_fetch_dir }}"
+    state: directory
+    mode: "0700"
+  changed_when: false
+  delegate_to: localhost
+  run_once: true
+
+- name: fetch the base rings to the controller
+  fetch:
+    src: "/etc/swift/{{ item }}.ring.gz"
+    dest: "{{ ring_fetch_dir }}/{{ item }}.ring.gz"
+    flat: yes
+  delegate_to: "{{ groups['proxy_servers'][0] }}"
+  run_once: true
+  changed_when: false
+  with_items:
+    - account
+    - container
+    - object
+
+- name: fetch the extra policy rings to the controller
+  fetch:
+    src: "/etc/swift/object-{{ item.index }}.ring.gz"
+    dest: "{{ ring_fetch_dir }}/object-{{ item.index }}.ring.gz"
+    flat: yes
+  delegate_to: "{{ groups['proxy_servers'][0] }}"
+  run_once: true
+  changed_when: false
+  with_items: "{{ swift_policies }}"
+  when: item.index != 0
+
+- name: distribute the base rings to every node
+  copy:
+    src: "{{ ring_fetch_dir }}/{{ item }}.ring.gz"
+    dest: "/etc/swift/{{ item }}.ring.gz"
+    mode: "0644"
+  with_items:
+    - account
+    - container
+    - object
+
+- name: distribute the extra policy rings to every node
+  copy:
+    src: "{{ ring_fetch_dir }}/object-{{ item.index }}.ring.gz"
+    dest: "/etc/swift/object-{{ item.index }}.ring.gz"
+    mode: "0644"
+  with_items: "{{ swift_policies }}"
+  when: item.index != 0

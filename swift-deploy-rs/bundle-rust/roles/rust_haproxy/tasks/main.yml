@@ -1,0 +1,59 @@
+---
+# HTTP load balancer in front of the swift proxies (only reached when the
+# play's role-level `when: use_lb` holds). TLS is a stated v1 non-goal:
+# the frontend is plain http whatever lb_mode says.
+
+- name: probe for haproxy
+  shell: command -v haproxy >/dev/null 2>&1 && echo PRESENT || echo ABSENT
+  register: rust_haproxy_probe
+  changed_when: false
+
+- name: install haproxy
+  package:
+    name: haproxy
+    state: present
+  when: rust_haproxy_probe.stdout.find('PRESENT') == -1
+
+- name: allow haproxy to connect to any port under SELinux
+  shell: |
+    if command -v getsebool >/dev/null 2>&1 && getsebool haproxy_connect_any 2>/dev/null | grep -q ' off$'; then
+      setsebool -P haproxy_connect_any 1
+      echo TOGGLED
+    else
+      echo UNCHANGED
+    fi
+  register: rust_haproxy_sebool
+  changed_when: rust_haproxy_sebool.stdout.find('TOGGLED') != -1
+
+- name: render haproxy.cfg
+  template:
+    src: haproxy.cfg.j2
+    dest: /etc/haproxy/haproxy.cfg
+    mode: "0644"
+  register: rust_haproxy_cfg
+
+# an immediate restart, not a notify handler: handlers fire at end-of-run,
+# which is AFTER the verify play that exercises the LB
+- name: restart haproxy on configuration change
+  systemd:
+    name: haproxy
+    state: restarted
+  when: rust_haproxy_cfg.changed
+
+- name: probe the haproxy unit state
+  shell: |
+    if systemctl is-enabled haproxy >/dev/null 2>&1 && systemctl is-active haproxy >/dev/null 2>&1; then
+      echo RUNNING
+    else
+      echo STOPPED
+    fi
+  register: rust_haproxy_state
+  changed_when: false
+
+- name: enable and start haproxy
+  systemd:
+    name: haproxy
+    daemon_reload: yes
+    enabled: yes
+    state: started
+  when: rust_haproxy_state.stdout.find('RUNNING') == -1

@@ -1,0 +1,34 @@
+// {{ ansible_managed }}
+// Grafana Alloy: journald -> Loki. Keeps only the Swift services and
+// haproxy, labels every line with the systemd unit and this node's storage
+// (WireGuard) address, and pushes to the hub's Loki. Alloy's own HTTP
+// server is bound to loopback by the systemd unit; this file opens no
+// listener.
+
+loki.relabel "journal" {
+  forward_to = []
+
+  rule {
+    source_labels = ["__journal__systemd_unit"]
+    regex         = "(swift-.*|haproxy)\\.service"
+    action        = "keep"
+  }
+
+  rule {
+    source_labels = ["__journal__systemd_unit"]
+    target_label  = "unit"
+  }
+}
+
+loki.source.journal "swift" {
+  forward_to    = [loki.write.hub.receiver]
+  relabel_rules = loki.relabel.journal.rules
+  max_age       = "12h"
+  labels        = {host = "{{ storage_network_address }}"}
+}
+
+loki.write "hub" {
+  endpoint {
+    url = "{{ loki_push_url | default('http://172.18.1.2:3100/loki/api/v1/push') }}"
+  }
+}

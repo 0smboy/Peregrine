@@ -1,0 +1,22 @@
+---
+- name: Install keepalived pkgs
+  yum: name=keepalived state=present
+- name: Deliver keepalived.conf
+  template: src=templates/keepalived.conf.j2 dest=/etc/keepalived/keepalived.conf
+- name: Deliver check haproxy server status shell files
+  copy: src=files/check_haproxy.sh dest=/etc/keepalived/check_haproxy.sh mode=0755
+  when: use_lb
+- name: Deliver check swift proxy server status shell files
+  copy: src=files/check_swift.sh dest=/etc/keepalived/check_swift.sh mode=0755
+  when: not use_lb
+
+- name: Set log facility
+  blockinfile:
+    path: /etc/sysconfig/keepalived
+    marker: "# OSTORAGE_SWIFT_ANSIBLE_keepalived_config {mark}"
+    block: |
+      KEEPALIVED_OPTIONS="-D --log-facility=1"
+    insertafter: EOF
+
+- name: Startup keepalived
+  service: name=keepalived state=started enabled=yes

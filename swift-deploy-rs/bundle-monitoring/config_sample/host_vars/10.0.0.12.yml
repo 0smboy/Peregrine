@@ -1,0 +1,8 @@
+# Sample node addresses (v3/rust host_vars shape). This bundle uses only
+# storage_network_address (the WireGuard address the agent web listeners
+# bind); the rest document the standard per-host shape a rust workspace
+# emits.
+management_network_address: 10.0.0.12
+storage_network_address: 10.0.0.12
+replication_network_address: 10.0.0.12
+business_network_address: 10.0.0.12

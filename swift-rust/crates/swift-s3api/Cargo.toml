@@ -1,0 +1,11 @@
+[package]
+name = "swift-s3api"
+description = "S3 API translation core (request parsing, AWS Signature V4, S3 XML) for the Rust implementation of OpenStack Swift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+swift-http = { path = "../swift-http" }
+sha2 = "0.10"

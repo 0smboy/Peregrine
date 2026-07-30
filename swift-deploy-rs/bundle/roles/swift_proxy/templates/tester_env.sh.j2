@@ -1,0 +1,24 @@
+export ST_USER=test:tester
+export ST_KEY=testing
+{% if not use_lb and proxy_mode == "http" %}
+# 不使用负载均衡, proxy server为http模式
+export ST_AUTH=http://{{ auth_url_ip }}:{{ proxy_server_bind_port }}/auth/v1.0
+{% endif %}
+
+{% if not use_lb and proxy_mode == "https" %}
+# 不使用负载均衡, proxy server为https模式
+export ST_AUTH=https://{{ auth_url_ip }}:{{ proxy_server_bind_port }}/auth/v1.0
+export OS_CACERT=/etc/swift/proxy.crt
+{% endif %}
+
+{% if use_lb and lb_mode == "http" %}
+# 使用负载均衡,负载均衡为http模式
+export ST_AUTH=http://{{ auth_url_ip }}:{{ swift_lb_port }}/auth/v1.0
+{% endif %}
+
+{% if use_lb and lb_mode == "https" %}
+# 使用负载均衡,负载均衡为https模式
+export ST_AUTH=https://{{ auth_url_ip }}:{{ swift_lb_port }}/auth/v1.0
+export OS_CACERT=/etc/haproxy/haproxy.crt
+{% endif %}
+echo -e  "\e[5;31;43mUser:test v1.0 export complete!\e[0m"

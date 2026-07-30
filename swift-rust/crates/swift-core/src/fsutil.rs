@@ -1,0 +1,69 @@
+// Copyright (c) 2026 OpenStack Foundation
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Filesystem capacity helpers, the Rust counterpart of the
+//! `os.statvfs` usage in `swift.common.utils.fs_has_free_space`.
+
+use std::mem::MaybeUninit;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
+
+/// Bytes available to unprivileged callers on the filesystem holding
+/// `path`: `statvfs.f_bavail * statvfs.f_frsize`, exactly what Python's
+/// `fs_has_free_space` compares against.
+pub fn free_bytes(path: &Path) -> std::io::Result<u64> {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains an interior NUL byte",
+        )
+    })?;
+    let mut stats = MaybeUninit::<libc::statvfs>::uninit();
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stats = unsafe { stats.assume_init() };
+    #[allow(clippy::unnecessary_cast)] // types differ per libc target
+    Ok((stats.f_bavail as u64) * (stats.f_frsize as u64))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temp_dir_reports_free_space() {
+        let free = free_bytes(&std::env::temp_dir()).unwrap();
+        assert!(free > 0, "temp dir should have free space, got {free}");
+    }
+
+    #[test]
+    fn missing_path_is_an_error() {
+        let missing = std::env::temp_dir().join(format!(
+            "swift-fsutil-missing-{}-does-not-exist",
+            std::process::id()
+        ));
+        assert!(free_bytes(&missing).is_err());
+    }
+
+    #[test]
+    fn interior_nul_is_invalid_input() {
+        use std::ffi::OsStr;
+        let path = Path::new(OsStr::from_bytes(b"/tmp/bad\0path"));
+        let error = free_bytes(path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+}

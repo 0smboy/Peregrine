@@ -1,0 +1,21 @@
+[default]
+{% if not use_lb and proxy_mode == "http" %}
+host_base = {{ auth_url_ip }}:{{ proxy_server_bind_port }}
+host_bucket = {{ auth_url_ip }}:{{ proxy_server_bind_port }}
+use_https = False
+{% endif %}
+{% if not use_lb and proxy_mode == "https" %}
+host_base = {{ auth_url_ip }}:{{ proxy_server_bind_port }}
+host_bucket = {{ auth_url_ip }}:{{ proxy_server_bind_port }}
+{% endif %}
+{% if use_lb and lb_mode == "http" %}
+host_base = {{ auth_url_ip }}:{{ swift_lb_port }}
+host_bucket = {{ auth_url_ip }}:{{ swift_lb_port }}
+use_https = False
+{% endif %}
+{% if use_lb and lb_mode == "https" %}
+host_base = {{ auth_url_ip }}:{{ swift_lb_port }}
+host_bucket = {{ auth_url_ip }}:{{ swift_lb_port }}
+{% endif %}
+signature_v2 = True
+preserve_attrs = False

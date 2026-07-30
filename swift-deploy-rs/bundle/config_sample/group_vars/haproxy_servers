@@ -1,0 +1,9 @@
+---
+
+# 定义haproxy管理的后端服务器组信息
+back_apps:
+  name_prefix: proxy_
+  nodes: [
+    {proxy_server_ip: 192.168.2.51, port: "{{ proxy_server_bind_port }}", weight: 100, maxconn: 6000},
+    {proxy_server_ip: 192.168.2.52, port: "{{ proxy_server_bind_port }}", weight: 100, maxconn: 6000}
+  ]

@@ -1,0 +1,16 @@
+---
+- name: Disabling remote access for root
+  mysql_user:
+    name: root
+    host: "{{ item }}"
+    password: "{{ mariadb_root_password }}"
+  with_items:
+    - 'localhost'
+    - '127.0.0.1'
+  when: inventory_hostname == groups['mariadb_servers'][0]
+
+- name: Disabling anonymous access
+  mysql_user:
+    name: ""
+    state: absent
+  when: inventory_hostname == groups['mariadb_servers'][0]

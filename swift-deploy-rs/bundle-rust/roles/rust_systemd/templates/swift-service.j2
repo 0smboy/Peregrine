@@ -1,0 +1,15 @@
+# {{ ansible_managed }}
+[Unit]
+Description={{ svc_description }}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=SWIFT_DIR=/etc/swift
+ExecStart=/usr/local/bin/{{ svc_bin }}{% if svc_args %} {{ svc_args }}{% endif %} /etc/swift/{{ svc_conf }}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+---
+# Based on below environments:
+#
+# CentOS-7-x86_64-DVD-1511
+# ansible 2.1.2.0(yum install)
+
+- hosts: system_tuning
+  roles:
+  - system_tuning

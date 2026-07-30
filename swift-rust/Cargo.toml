@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/swift-account-server",
+    "crates/swift-cli",
+    "crates/swift-container-server",
+    "crates/swift-core",
+    "crates/swift-crypto",
+    "crates/swift-db",
+    "crates/swift-diskfile",
+    "crates/swift-ec",
+    "crates/swift-http",
+    "crates/swift-memcache",
+    "crates/swift-middleware",
+    "crates/swift-object-server",
+    "crates/swift-proxy-server",
+    "crates/swift-ring",
+    "crates/swift-s3api",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["OpenStack Swift contributors"]

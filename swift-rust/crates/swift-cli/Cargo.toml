@@ -1,0 +1,72 @@
+[package]
+name = "swift-cli"
+description = "CLI and ops tooling for the Rust implementation of OpenStack Swift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+swift-core = { path = "../swift-core" }
+swift-http = { path = "../swift-http" }
+swift-ring = { path = "../swift-ring" }
+swift-db = { path = "../swift-db" }
+swift-diskfile = { path = "../swift-diskfile" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+md-5 = "0.10"
+
+[dev-dependencies]
+serde_json = "1"
+
+[[bin]]
+name = "swift-get-nodes"
+path = "src/bin/get_nodes.rs"
+
+[[bin]]
+name = "swift-ring-info"
+path = "src/bin/ring_info.rs"
+
+[[bin]]
+name = "swift-container-info"
+path = "src/bin/container_info.rs"
+
+[[bin]]
+name = "swift-account-info"
+path = "src/bin/account_info.rs"
+
+[[bin]]
+name = "swift-object-info"
+path = "src/bin/object_info.rs"
+
+[[bin]]
+name = "swift-ring-sim"
+path = "src/bin/ring_sim.rs"
+
+[[bin]]
+name = "swift-ring-builder"
+path = "src/bin/ring_builder.rs"
+
+[[bin]]
+name = "swift-object-auditor"
+path = "src/bin/object_auditor.rs"
+
+[[bin]]
+name = "swift-db-auditor"
+path = "src/bin/db_auditor.rs"
+
+[[bin]]
+name = "swift-recon"
+path = "src/bin/recon.rs"
+
+[[bin]]
+name = "swift-drive-audit"
+path = "src/bin/drive_audit.rs"
+
+[[bin]]
+name = "swift-manage-shard-ranges"
+path = "src/bin/manage_shard_ranges.rs"
+
+[[bin]]
+name = "swift-db-replicator"
+path = "src/bin/db_replicator.rs"

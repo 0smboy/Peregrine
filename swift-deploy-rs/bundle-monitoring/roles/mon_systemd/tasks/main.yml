@@ -1,0 +1,43 @@
+---
+# One systemd unit per agent, rendered per host (the web listeners bind this
+# node's storage_network_address; nothing binds 0.0.0.0). agent.yml mirrors
+# bundle-rust's rust_systemd/unit.yml: enable+start when stopped, restart
+# immediately when the unit file drifted, so a steady-state re-apply
+# converges with changed=0.
+#
+# Config and binary drift restart the affected agent IMMEDIATELY below via
+# register + when (handlers fire end-of-run, too late to guarantee the
+# agents run the applied config within this play).
+
+- name: node exporter unit
+  include_tasks:
+    file: agent.yml
+    unit_name: node_exporter
+
+- name: statsd exporter unit
+  include_tasks:
+    file: agent.yml
+    unit_name: statsd_exporter
+
+- name: alloy unit
+  include_tasks:
+    file: agent.yml
+    unit_name: alloy
+
+- name: restart node_exporter after a binary change
+  systemd:
+    name: node_exporter
+    state: restarted
+  when: mon_bin_node_exporter.changed
+
+- name: restart statsd_exporter after a mapping or binary change
+  systemd:
+    name: statsd_exporter
+    state: restarted
+  when: mon_statsd_mapping.changed or mon_bin_statsd_exporter.changed
+
+- name: restart alloy after a config or binary change
+  systemd:
+    name: alloy
+    state: restarted
+  when: mon_alloy_config.changed or mon_bin_alloy.changed

@@ -1,0 +1,7 @@
+target/
+bundle-rust/roles/rust_payload/files/bin/*
+bundle-rust/roles/rust_payload/files/lib/*
+!bundle-rust/roles/rust_payload/files/bin/.keep
+!bundle-rust/roles/rust_payload/files/lib/.keep
+bundle-monitoring/roles/mon_payload/files/bin/*
+!bundle-monitoring/roles/mon_payload/files/bin/.keep

@@ -1,0 +1,57 @@
+---
+# Baseline for every node: timezone, the swift directory skeleton, runtime
+# dependencies (rsync for the replicators), and removal of the conflicting
+# single-host SAIO supervisor installed by deploy/bootstrap.sh.
+
+- name: probe the current timezone
+  shell: timedatectl show -p Timezone --value 2>/dev/null || echo unknown
+  register: rust_tz_probe
+  changed_when: false
+
+- name: set the timezone
+  timezone:
+    name: "{{ timezone }}"
+  when: rust_tz_probe.stdout.find(timezone) == -1
+
+- name: create the swift configuration and state directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  changed_when: false
+  with_items:
+    - /etc/swift
+    - "{{ srv_node_root }}"
+    - /var/cache/swift
+    - /var/log/swift
+    - /usr/local/bin
+    - /usr/local/libexec
+
+- name: probe for rsync
+  shell: command -v rsync >/dev/null 2>&1 && echo PRESENT || echo ABSENT
+  register: rust_rsync_probe
+  changed_when: false
+  when: "'storage_nodes' in group_names"
+
+- name: install rsync for the replicators
+  package:
+    name: rsync
+    state: present
+  when:
+    - "'storage_nodes' in group_names"
+    - rust_rsync_probe.stdout.find('PRESENT') == -1
+
+- name: disable conflicting legacy swift services if present
+  shell: |
+    OUT=ABSENT
+    # known legacy names from earlier hand deployments on these hosts:
+    # the SAIO supervisor and the transient systemd-run swiftd-* units
+    for unit in swift-rust-saio swiftd-proxy swiftd-account swiftd-container swiftd-object; do
+      if systemctl is-active "$unit" >/dev/null 2>&1 || systemctl is-enabled "$unit" >/dev/null 2>&1; then
+        systemctl disable --now "$unit" >/dev/null 2>&1 || systemctl stop "$unit" >/dev/null 2>&1 || true
+        OUT=DISABLED
+      fi
+    done
+    echo "$OUT"
+  register: rust_saio_stop
+  changed_when: rust_saio_stop.stdout.find('DISABLED') != -1

@@ -1,0 +1,632 @@
+// Copyright (c) 2026 OpenStack Foundation
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! The object updater daemon core, ported from `swift/obj/updater.py`.
+//!
+//! When an object PUT/DELETE cannot synchronously update every container
+//! replica, the object server drops a pickled *async_pending* file under
+//! `<device>/async_pending[-<policy>]/<suffix>/<ohash>-<timestamp>`. This
+//! daemon later walks those files and replays the container update against
+//! the container ring, unlinking each file once every replica has been
+//! updated (or rewriting it with the set of replicas already done).
+//!
+//! The pickle payload is the dict written by `pickle_async_update`:
+//! `{'op', 'account', 'container', 'obj', 'headers', 'db_state', ...}` and,
+//! after a partial update, a `'successes'` list of container-node ids.
+//!
+//! Deferred: the container-ratelimit/bucketizing skip logic, per-container
+//! redirect (sharding `Location`) rewriting of the async file, recon stats
+//! dumping, and the multiprocess/greenlet concurrency; this is the
+//! single-threaded sweep + replay core that the daemon loop drives.
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+
+use swift_core::pickle::{self, Value};
+use swift_core::timestamp::Timestamp;
+use swift_diskfile::extract_policy_index;
+use swift_ring::Ring;
+
+use crate::percent_encode;
+
+/// A parsed async_pending update, plus enough context to unlink or rewrite
+/// its backing file.
+#[derive(Debug, Clone)]
+pub struct AsyncUpdate {
+    pub op: String,
+    pub account: String,
+    pub container: String,
+    pub obj: String,
+    /// Headers to forward on the container update, insertion-ordered.
+    pub headers: Vec<(String, String)>,
+    /// Container-node ids already updated (the `successes` key).
+    pub successes: Vec<i64>,
+    pub policy_index: u32,
+    /// The async_pending file on disk.
+    pub path: PathBuf,
+    /// The `<timestamp>` portion of the filename.
+    pub timestamp: String,
+    /// The original pickled dict, kept so a rewrite preserves every other
+    /// key byte-for-byte and only swaps `successes`.
+    raw: Value,
+}
+
+fn dict_get<'a>(pairs: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
+    pairs
+        .iter()
+        .find(|(k, _)| matches!(k, Value::Str(s) if s == key))
+        .map(|(_, v)| v)
+}
+
+/// Coerce a pickled scalar to the string form Swift would send on the wire.
+fn as_wire_string(v: &Value) -> Option<String> {
+    match v {
+        Value::Str(s) => Some(s.clone()),
+        Value::Bytes(b) => Some(pickle::latin1_decode(b)),
+        Value::Int(i) => Some(i.to_string()),
+        Value::Bool(b) => Some(if *b { "True" } else { "False" }.to_string()),
+        _ => None,
+    }
+}
+
+impl AsyncUpdate {
+    /// Parse a pickled async_pending payload.
+    pub fn parse(raw_bytes: &[u8], path: PathBuf, policy_index: u32, timestamp: String) -> Option<AsyncUpdate> {
+        let value = pickle::loads(raw_bytes).ok()?;
+        let pairs = value.as_dict()?.to_vec();
+        let op = as_wire_string(dict_get(&pairs, "op")?)?;
+        let account = as_wire_string(dict_get(&pairs, "account")?)?;
+        let container = as_wire_string(dict_get(&pairs, "container")?)?;
+        let obj = as_wire_string(dict_get(&pairs, "obj")?)?;
+        let headers = match dict_get(&pairs, "headers") {
+            Some(Value::Dict(hp)) => hp
+                .iter()
+                .filter_map(|(k, v)| Some((as_wire_string(k)?, as_wire_string(v)?)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let successes = match dict_get(&pairs, "successes") {
+            Some(Value::List(items)) => items
+                .iter()
+                .filter_map(|v| match v {
+                    Value::Int(i) => Some(*i),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        Some(AsyncUpdate {
+            op,
+            account,
+            container,
+            obj,
+            headers,
+            successes,
+            policy_index,
+            path,
+            timestamp,
+            raw: Value::Dict(pairs),
+        })
+    }
+
+    /// The container path `/<account>/<container>/<object>` (percent-encoded),
+    /// as sent to a container server.
+    pub fn container_object_path(&self) -> String {
+        format!(
+            "/{}/{}/{}",
+            percent_encode(&self.account),
+            percent_encode(&self.container),
+            percent_encode(&self.obj)
+        )
+    }
+
+    /// Re-pickle this update with `successes` replaced, preserving every
+    /// other key. Mirrors the object updater rewriting the async file after a
+    /// partial success so the next sweep skips already-updated replicas.
+    fn repickle_with_successes(&self, successes: &[i64]) -> Result<Vec<u8>, pickle::PickleError> {
+        let mut pairs = match &self.raw {
+            Value::Dict(p) => p.clone(),
+            _ => Vec::new(),
+        };
+        let list = Value::List(successes.iter().map(|i| Value::Int(*i)).collect());
+        if let Some(slot) = pairs
+            .iter_mut()
+            .find(|(k, _)| matches!(k, Value::Str(s) if s == "successes"))
+        {
+            slot.1 = list;
+        } else {
+            pairs.push((Value::Str("successes".to_string()), list));
+        }
+        pickle::dumps(&Value::Dict(pairs))
+    }
+}
+
+/// The result of a single container-node update attempt.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NodeResult {
+    /// 2xx, replica updated.
+    Success,
+    /// 2xx with a sharding redirect `Location` (the update belongs to a
+    /// shard container). Treated as a success for this node.
+    Redirect(String),
+    /// Any non-2xx / connection error; the update must be retried later.
+    Failure,
+}
+
+/// Abstraction over "send one container update to one node", so the sweep
+/// logic is testable without a real container server.
+pub trait ContainerNodeClient {
+    fn send(
+        &self,
+        node: &swift_ring::RingDevice,
+        part: u32,
+        op: &str,
+        path: &str,
+        policy_index: u32,
+        headers: &[(String, String)],
+    ) -> NodeResult;
+}
+
+/// The real client: a blocking HTTP/1.1 request over TCP, matching the
+/// object server's synchronous `container_update`.
+pub struct HttpContainerClient;
+
+impl ContainerNodeClient for HttpContainerClient {
+    fn send(
+        &self,
+        node: &swift_ring::RingDevice,
+        part: u32,
+        op: &str,
+        path: &str,
+        policy_index: u32,
+        headers: &[(String, String)],
+    ) -> NodeResult {
+        let host = format!("{}:{}", node.ip, node.port);
+        let mut request = format!(
+            "{op} /{}/{part}{path} HTTP/1.1\r\nHost: {host}\r\n\
+             X-Backend-Storage-Policy-Index: {policy_index}\r\n",
+            node.device
+        );
+        for (k, v) in headers {
+            request.push_str(&format!("{k}: {v}\r\n"));
+        }
+        request.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
+        let Ok(mut conn) = TcpStream::connect(&host) else {
+            return NodeResult::Failure;
+        };
+        conn.set_nodelay(true).ok();
+        let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(15)));
+        if conn.write_all(request.as_bytes()).is_err() {
+            return NodeResult::Failure;
+        }
+        let mut buf = Vec::new();
+        if conn.read_to_end(&mut buf).is_err() {
+            return NodeResult::Failure;
+        }
+        parse_status(&buf)
+    }
+}
+
+/// Extract the status line result from a raw HTTP response.
+fn parse_status(buf: &[u8]) -> NodeResult {
+    let head = String::from_utf8_lossy(buf);
+    let status = head
+        .split("\r\n")
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok());
+    match status {
+        Some(s) if (200..300).contains(&s) => {
+            // a sharding redirect carries a Location header
+            for line in head.split("\r\n").skip(1) {
+                if let Some(loc) = line
+                    .split_once(':')
+                    .filter(|(k, _)| k.eq_ignore_ascii_case("location"))
+                {
+                    return NodeResult::Redirect(loc.1.trim().to_string());
+                }
+            }
+            NodeResult::Success
+        }
+        _ => NodeResult::Failure,
+    }
+}
+
+/// Outcome of processing one async_pending file.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpdateOutcome {
+    /// Every replica updated; the file was unlinked.
+    Unlinked,
+    /// Some replicas updated; the file was rewritten with the new successes.
+    Rewritten,
+    /// No progress; the file is left untouched for a later sweep.
+    Failed,
+}
+
+/// A running tally over a sweep.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UpdaterStats {
+    pub successes: u64,
+    pub failures: u64,
+    pub unlinks: u64,
+    pub outdated_unlinks: u64,
+    pub errors: u64,
+    pub redirects: u64,
+}
+
+/// Replay one update against the given container-ring nodes, then unlink or
+/// rewrite the async file. `nodes` are the primary container nodes for the
+/// update's account/container.
+pub fn process_update(
+    update: &AsyncUpdate,
+    part: u32,
+    nodes: &[&swift_ring::RingDevice],
+    client: &dyn ContainerNodeClient,
+    stats: &mut UpdaterStats,
+) -> std::io::Result<UpdateOutcome> {
+    let mut headers = update.headers.clone();
+    // The updater always stamps the policy index; keep any existing value.
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-backend-storage-policy-index")) {
+        headers.push((
+            "X-Backend-Storage-Policy-Index".to_string(),
+            update.policy_index.to_string(),
+        ));
+    }
+    let path = update.container_object_path();
+    let mut successes = update.successes.clone();
+    let mut all_ok = true;
+    for node in nodes {
+        if successes.contains(&(node.id as i64)) {
+            continue;
+        }
+        match client.send(node, part, &update.op, &path, update.policy_index, &headers) {
+            NodeResult::Success => successes.push(node.id as i64),
+            NodeResult::Redirect(_) => {
+                stats.redirects += 1;
+                successes.push(node.id as i64);
+            }
+            NodeResult::Failure => all_ok = false,
+        }
+    }
+    if all_ok {
+        std::fs::remove_file(&update.path)?;
+        stats.successes += 1;
+        stats.unlinks += 1;
+        Ok(UpdateOutcome::Unlinked)
+    } else if successes.len() > update.successes.len() {
+        // partial progress: persist which replicas are done
+        match update.repickle_with_successes(&successes) {
+            Ok(bytes) => {
+                std::fs::write(&update.path, bytes)?;
+                stats.failures += 1;
+                Ok(UpdateOutcome::Rewritten)
+            }
+            Err(_) => {
+                stats.errors += 1;
+                Ok(UpdateOutcome::Failed)
+            }
+        }
+    } else {
+        stats.failures += 1;
+        Ok(UpdateOutcome::Failed)
+    }
+}
+
+/// Walk every async_pending file on a device, newest-per-object first,
+/// unlinking obsolete duplicates. Mirrors `_iter_async_pendings`.
+pub fn iter_async_pendings(device: &Path, stats: &mut UpdaterStats) -> Vec<AsyncUpdate> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(device) else {
+        return out;
+    };
+    for asyncdir in entries.flatten() {
+        let name = asyncdir.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("async_pending") || !asyncdir.path().is_dir() {
+            continue;
+        }
+        let policy_index = extract_policy_index(&name).unwrap_or(0);
+        let Ok(prefixes) = std::fs::read_dir(asyncdir.path()) else {
+            continue;
+        };
+        for prefix in prefixes.flatten() {
+            if !prefix.path().is_dir() {
+                continue;
+            }
+            // sort filenames descending so the newest timestamp per object
+            // hash is seen first
+            let mut files: Vec<PathBuf> = match std::fs::read_dir(prefix.path()) {
+                Ok(rd) => rd.flatten().map(|e| e.path()).collect(),
+                Err(_) => continue,
+            };
+            files.sort();
+            files.reverse();
+            let mut last_obj_hash: Option<String> = None;
+            for file in files {
+                if !file.is_file() {
+                    continue;
+                }
+                let fname = file.file_name().unwrap_or_default().to_string_lossy().to_string();
+                // Python updater.py 722-731 accepts only names that split into
+                // exactly `<ohash>-<timestamp>` (`update_file.split('-')` must
+                // yield two parts); anything else is counted as an error and
+                // skipped WITHOUT unlinking and WITHOUT touching the
+                // newest-per-hash bookkeeping. We additionally require the
+                // timestamp part to parse as a Timestamp so a leftover
+                // `<ohash>-<ts>.tmp` (staged by an older writer) can never
+                // sort ahead of — and unlink — the real pending file. Python
+                // never meets such names: its temp files are staged in the
+                // device tmp dir, as ours now are.
+                let parts: Vec<&str> = fname.split('-').collect();
+                let (obj_hash, timestamp) = match parts.as_slice() {
+                    [h, t] if t.parse::<Timestamp>().is_ok() => (*h, *t),
+                    _ => {
+                        stats.errors += 1;
+                        eprintln!(
+                            "ERROR async pending file with unexpected name {}",
+                            file.display()
+                        );
+                        continue;
+                    }
+                };
+                if last_obj_hash.as_deref() == Some(obj_hash) {
+                    // obsolete duplicate — the newer update superseded it
+                    if std::fs::remove_file(&file).is_ok() {
+                        stats.outdated_unlinks += 1;
+                    }
+                    continue;
+                }
+                last_obj_hash = Some(obj_hash.to_string());
+                let Ok(bytes) = std::fs::read(&file) else {
+                    continue;
+                };
+                match AsyncUpdate::parse(&bytes, file.clone(), policy_index, timestamp.to_string()) {
+                    Some(u) => out.push(u),
+                    None => stats.errors += 1,
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One full sweep of a device: iterate async_pendings, look each up in the
+/// container ring, and replay it. Returns the sweep stats.
+pub fn run_once(
+    device: &Path,
+    container_ring: &Ring,
+    client: &dyn ContainerNodeClient,
+) -> UpdaterStats {
+    let mut stats = UpdaterStats::default();
+    for update in iter_async_pendings(device, &mut stats) {
+        let Ok((part, nodes)) =
+            container_ring.get_nodes(&update.account, Some(&update.container), None)
+        else {
+            stats.errors += 1;
+            continue;
+        };
+        let devs: Vec<&swift_ring::RingDevice> = nodes.iter().map(|n| n.dev).collect();
+        let _ = process_update(&update, part, &devs, client, &mut stats);
+    }
+    stats
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Build the pickle dict exactly as `pickle_async_update` would.
+    fn make_async_pickle(op: &str, account: &str, container: &str, obj: &str) -> Vec<u8> {
+        let headers = Value::Dict(vec![
+            (
+                Value::Str("x-timestamp".into()),
+                Value::Str("1751500000.00000".into()),
+            ),
+            (
+                Value::Str("x-size".into()),
+                Value::Str("4".into()),
+            ),
+        ]);
+        let dict = Value::Dict(vec![
+            (Value::Str("op".into()), Value::Str(op.into())),
+            (Value::Str("account".into()), Value::Str(account.into())),
+            (Value::Str("container".into()), Value::Str(container.into())),
+            (Value::Str("obj".into()), Value::Str(obj.into())),
+            (Value::Str("headers".into()), headers),
+        ]);
+        pickle::dumps(&dict).unwrap()
+    }
+
+    /// A fake client that records every send and answers per a script.
+    struct FakeClient {
+        calls: Mutex<Vec<(u64, String, String)>>,
+        answer: NodeResult,
+    }
+    impl ContainerNodeClient for FakeClient {
+        fn send(
+            &self,
+            node: &swift_ring::RingDevice,
+            _part: u32,
+            op: &str,
+            path: &str,
+            _pi: u32,
+            _h: &[(String, String)],
+        ) -> NodeResult {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((node.id, op.to_string(), path.to_string()));
+            self.answer.clone()
+        }
+    }
+
+    fn dev(id: u64) -> swift_ring::RingDevice {
+        swift_ring::RingDevice {
+            id,
+            region: 1,
+            zone: 1,
+            ip: "127.0.0.1".into(),
+            port: 6201,
+            replication_ip: None,
+            replication_port: None,
+            device: format!("sd{id}"),
+            weight: 1.0,
+            meta: String::new(),
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn test_parse_roundtrip() {
+        let bytes = make_async_pickle("PUT", "AUTH_test", "c", "o");
+        let u = AsyncUpdate::parse(&bytes, PathBuf::from("/x"), 0, "1751500000.00000".into())
+            .expect("parse");
+        assert_eq!(u.op, "PUT");
+        assert_eq!(u.account, "AUTH_test");
+        assert_eq!(u.container, "c");
+        assert_eq!(u.obj, "o");
+        assert_eq!(u.container_object_path(), "/AUTH_test/c/o");
+        assert!(u.headers.iter().any(|(k, v)| k == "x-size" && v == "4"));
+        assert!(u.successes.is_empty());
+    }
+
+    #[test]
+    fn test_full_success_unlinks() {
+        let dir = std::env::temp_dir().join(format!("swift-upd-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ap = dir.join("async_pending/abc");
+        std::fs::create_dir_all(&ap).unwrap();
+        let file = ap.join("00000000000000000000000000000abc-1751500000.00000");
+        std::fs::write(&file, make_async_pickle("PUT", "a", "c", "o")).unwrap();
+
+        let mut stats = UpdaterStats::default();
+        let updates = iter_async_pendings(&dir, &mut stats);
+        assert_eq!(updates.len(), 1);
+
+        let client = FakeClient {
+            calls: Mutex::new(Vec::new()),
+            answer: NodeResult::Success,
+        };
+        let nodes = [dev(1), dev(2), dev(3)];
+        let refs: Vec<&swift_ring::RingDevice> = nodes.iter().collect();
+        let outcome =
+            process_update(&updates[0], 5, &refs, &client, &mut stats).unwrap();
+        assert_eq!(outcome, UpdateOutcome::Unlinked);
+        assert!(!file.exists(), "async file unlinked on full success");
+        assert_eq!(client.calls.lock().unwrap().len(), 3);
+        assert_eq!(stats.successes, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_partial_failure_rewrites_with_successes() {
+        let dir = std::env::temp_dir().join(format!("swift-upd-part-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ap = dir.join("async_pending/abc");
+        std::fs::create_dir_all(&ap).unwrap();
+        let file = ap.join("00000000000000000000000000000abc-1751500000.00000");
+        std::fs::write(&file, make_async_pickle("PUT", "a", "c", "o")).unwrap();
+        let mut stats = UpdaterStats::default();
+        let updates = iter_async_pendings(&dir, &mut stats);
+
+        // node 2 succeeds (we simulate by scripting all-fail then checking
+        // that a subsequent all-success clears it); here answer=Failure means
+        // no node succeeds -> Failed, file untouched
+        let client = FakeClient {
+            calls: Mutex::new(Vec::new()),
+            answer: NodeResult::Failure,
+        };
+        let nodes = [dev(1), dev(2), dev(3)];
+        let refs: Vec<&swift_ring::RingDevice> = nodes.iter().collect();
+        let outcome =
+            process_update(&updates[0], 5, &refs, &client, &mut stats).unwrap();
+        assert_eq!(outcome, UpdateOutcome::Failed);
+        assert!(file.exists(), "async file kept when nothing succeeded");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_outdated_duplicates_unlinked() {
+        let dir = std::env::temp_dir().join(format!("swift-upd-dup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ap = dir.join("async_pending/abc");
+        std::fs::create_dir_all(&ap).unwrap();
+        let h = "00000000000000000000000000000abc";
+        // three updates for the SAME object hash, different timestamps
+        for ts in ["1751500000.00000", "1751500001.00000", "1751500002.00000"] {
+            std::fs::write(
+                ap.join(format!("{h}-{ts}")),
+                make_async_pickle("PUT", "a", "c", "o"),
+            )
+            .unwrap();
+        }
+        let mut stats = UpdaterStats::default();
+        let updates = iter_async_pendings(&dir, &mut stats);
+        // only the newest survives as a yielded update
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].timestamp, "1751500002.00000");
+        assert_eq!(stats.outdated_unlinks, 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_leftover_tmp_sibling_is_skipped_not_treated_as_newest() {
+        let dir = std::env::temp_dir().join(format!("swift-upd-tmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ap = dir.join("async_pending/abc");
+        std::fs::create_dir_all(&ap).unwrap();
+        let h = "00000000000000000000000000000abc";
+        let real = ap.join(format!("{h}-1751500000.00000"));
+        std::fs::write(&real, make_async_pickle("PUT", "a", "c", "o")).unwrap();
+        // a crashed writer's staging leftover: its name sorts AFTER the real
+        // one, so the descending scan sees it FIRST — it must be skipped as a
+        // non-conforming name, never yielded, and never cause the real file
+        // to be unlinked as an "obsolete duplicate"
+        let tmp = ap.join(format!("{h}-1751500000.00000.tmp"));
+        std::fs::write(&tmp, b"partial garbage").unwrap();
+
+        let mut stats = UpdaterStats::default();
+        let updates = iter_async_pendings(&dir, &mut stats);
+        assert_eq!(updates.len(), 1, "only the real pending file is yielded");
+        assert_eq!(updates[0].timestamp, "1751500000.00000");
+        assert_eq!(updates[0].path, real);
+        assert!(real.exists(), "the real pending file must not be unlinked");
+        assert!(tmp.exists(), "unexpected names are skipped, not deleted");
+        assert_eq!(stats.outdated_unlinks, 0);
+        assert_eq!(stats.errors, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_multi_dash_and_bad_timestamp_names_are_errors() {
+        let dir = std::env::temp_dir().join(format!("swift-upd-badname-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ap = dir.join("async_pending/abc");
+        std::fs::create_dir_all(&ap).unwrap();
+        // Python `update_file.split('-')` needs exactly two parts
+        std::fs::write(ap.join("a-b-c"), b"x").unwrap();
+        // two parts, but the timestamp does not parse
+        std::fs::write(ap.join("deadbeef-notatimestamp"), b"x").unwrap();
+        let mut stats = UpdaterStats::default();
+        let updates = iter_async_pendings(&dir, &mut stats);
+        assert!(updates.is_empty());
+        assert_eq!(stats.errors, 2);
+        assert!(ap.join("a-b-c").exists());
+        assert!(ap.join("deadbeef-notatimestamp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

@@ -1,0 +1,4 @@
+---
+# vars file for cosbench
+cosbench_version: 0.4.2.c4
+cosbench_path: /root/cosbench

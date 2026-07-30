@@ -1,0 +1,53 @@
+---
+# Node-agent configuration: the dedicated `monitor` system user, the
+# statsd_exporter mapping and the Alloy journald->Loki pipeline. Config
+# drift restarts the agents IMMEDIATELY in mon_systemd (register + when —
+# handlers fire end-of-run, which is the wrong contract for agents that
+# later verification may depend on).
+
+- name: probe for the monitor user
+  shell: id monitor >/dev/null 2>&1 && echo PRESENT || echo ABSENT
+  register: mon_user_probe
+  changed_when: false
+
+# The agents run as this unprivileged user. systemd-journal membership gives
+# Alloy read access to the journal on Debian and Rocky/Alma alike; the alloy
+# unit also declares it as a supplementary group, so a pre-existing monitor
+# user without the group still works.
+- name: create the monitor system user
+  user:
+    name: monitor
+    shell: /usr/sbin/nologin
+    home: /var/lib/alloy
+    groups: systemd-journal
+  when: mon_user_probe.stdout.find('PRESENT') == -1
+
+- name: create the alloy configuration directory
+  file:
+    path: /etc/alloy
+    state: directory
+    mode: "0755"
+  changed_when: false
+
+- name: create the alloy state directory
+  file:
+    path: /var/lib/alloy
+    state: directory
+    mode: "0750"
+    owner: monitor
+    group: monitor
+  changed_when: false
+
+- name: render the statsd_exporter mapping
+  template:
+    src: statsd-mapping.yml.j2
+    dest: /etc/statsd-mapping.yml
+    mode: "0644"
+  register: mon_statsd_mapping
+
+- name: render the alloy configuration
+  template:
+    src: config.alloy.j2
+    dest: /etc/alloy/config.alloy
+    mode: "0644"
+  register: mon_alloy_config

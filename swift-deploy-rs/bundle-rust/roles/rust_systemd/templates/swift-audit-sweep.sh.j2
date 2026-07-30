@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+# Nightly auditor sweep. The rust auditors are one-shot per-device tools:
+#   swift-object-auditor <device_path> [policy_index]
+#   swift-db-auditor <device_path> <account|container>
+# so this script walks every local device and runs the auditors that match
+# this node's roles. Errors on one device never stop the sweep.
+set -u
+BIN=/usr/local/bin
+ROOT={{ srv_node_root }}
+
+for dev in "$ROOT"/*/; do
+  dev="${dev%/}"
+  [ -d "$dev" ] || continue
+{% if 'object_servers' in group_names %}
+{% for policy in swift_policies %}
+  "$BIN/swift-object-auditor" "$dev" {{ policy.index }} || true
+{% endfor %}
+{% endif %}
+{% if 'account_servers' in group_names %}
+  "$BIN/swift-db-auditor" "$dev" account || true
+{% endif %}
+{% if 'container_servers' in group_names %}
+  "$BIN/swift-db-auditor" "$dev" container || true
+{% endif %}
+done
+echo "audit sweep finished: $(date -Is)"

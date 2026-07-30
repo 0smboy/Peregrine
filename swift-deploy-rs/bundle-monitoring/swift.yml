@@ -1,0 +1,16 @@
+---
+# swift-deploy-rs monitoring-agents playbook.
+#
+# Installs the per-node observability agents for the Rust Swift stack:
+# node_exporter (host metrics), statsd_exporter (Swift statsd -> Prometheus)
+# and Grafana Alloy (journald -> Loki). Plays are roles-only: the planner
+# reads `hosts:` + `roles:`. The bundle is applied over the SAME inventory a
+# rust workspace emits; `storage_nodes` is the children group of
+# account/container/object servers, which on the target clusters covers
+# every node.
+
+- hosts: storage_nodes
+  roles:
+    - mon_payload
+    - mon_config
+    - mon_systemd

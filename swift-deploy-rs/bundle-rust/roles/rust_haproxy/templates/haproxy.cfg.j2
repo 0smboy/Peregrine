@@ -1,0 +1,45 @@
+# {{ ansible_managed }}
+global
+    log         /dev/log local0
+    chroot      /var/lib/haproxy
+    pidfile     /var/run/haproxy.pid
+    maxconn     {{ haproxy_max_conn | default(4000) }}
+    user        haproxy
+    group       haproxy
+    daemon
+    stats socket /var/lib/haproxy/stats
+
+defaults
+    mode                    http
+    log                     global
+    option                  httplog
+    option                  dontlognull
+    option                  redispatch
+    retries                 3
+    timeout connect         5s
+    timeout client          60s
+    timeout server          60s
+    timeout http-request    30s
+
+frontend swift_proxy_front
+    bind *:{{ swift_lb_port }}
+    default_backend swift_proxy_back
+
+backend swift_proxy_back
+    # source affinity, not roundrobin: tempauth tokens live in each proxy's
+    # in-process cache (the rust stand-in for Python's shared memcache), so a
+    # token minted by one proxy is unknown to the others. Affinity pins a
+    # client to one proxy; on failover the client re-auths once. A shared /
+    # self-validating token scheme is the v2 path to true roundrobin.
+    balance source
+    option httpchk GET /healthcheck
+{% for host in groups['proxy_servers'] %}
+    server proxy{{ loop.index }} {{ hostvars[host].business_network_address }}:{{ proxy_bind_port }} check inter 5s fall 3 rise 2
+{% endfor %}
+
+listen stats
+    bind *:{{ haproxy_monitor_port | default(1080) }}
+    stats enable
+    stats hide-version
+    stats uri /haproxy?stats
+    stats auth {{ haproxy_stats_user }}:{{ haproxy_stats_password }}

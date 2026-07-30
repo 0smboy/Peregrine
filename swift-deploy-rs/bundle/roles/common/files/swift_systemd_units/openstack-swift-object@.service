@@ -1,0 +1,13 @@
+[Unit]
+Description=OpenStack Object Storage (swift) - Object Server instance %I
+Wants=network-online.target
+After=syslog.target network-online.target
+
+[Service]
+Type=simple
+User=swift
+ExecStart=/usr/local/bin/swift-object-server /etc/swift/object-server/%i.conf
+ExecReload=/bin/kill -SIGUSR1 $MAINPID
+
+[Install]
+WantedBy=multi-user.target

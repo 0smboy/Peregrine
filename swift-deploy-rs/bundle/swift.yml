@@ -1,0 +1,100 @@
+---
+# Based on below environments:
+#
+# Rocky-9.1-x86_64-minimal
+# ansible 2.13.3(yum install)
+
+- hosts: all
+  any_errors_fatal: true
+  roles:
+  - check
+
+- hosts: all
+  any_errors_fatal: true
+  roles:
+  - common
+
+- hosts: performance_tuning
+  roles:
+  - performance_tuning
+
+- hosts: ntp_server
+  roles:
+  - chrony
+
+- hosts: ntp_clients
+  roles:
+  - chrony
+
+- hosts: haproxy_servers
+  roles:
+  - haproxy_servers
+  tags: haproxy_servers
+
+- hosts: keepalived_servers
+  roles:
+  - keepalived_servers
+
+- hosts: proxy_servers
+  roles:
+  - swift_proxy
+
+- hosts: storage_nodes
+  roles:
+  - storage_nodes_common
+
+- hosts: format_disk_servers
+  any_errors_fatal: true
+  roles:
+  - format_disks
+
+- hosts: account_servers
+  roles:
+  - swift_account
+
+- hosts: container_servers
+  roles:
+  - swift_container
+
+- hosts: object_servers
+  roles:
+  - swift_object
+
+- hosts: all
+  roles:
+  - ring_builder
+  tags: ring_builder
+
+- hosts: all
+  any_errors_fatal: true
+  roles:
+  - ring_utils
+  tags: distribute_ring_builder
+
+- hosts: all
+  roles:
+  - finalize_installation
+
+- hosts: mariadb_servers
+  roles:
+  - { role: mariadb_servers, when: use_local_mariadbs }
+  tags: mariadb_servers
+
+- hosts: keystones
+  roles:
+  - { role: keystone_install, when: "auth_method == 'keystone'" }
+  tags: keystones_install
+
+- hosts: keystones
+  roles:
+  - { role: keystones, when: "auth_method == 'keystone'" }
+  tags: keystones_setup
+
+- hosts: proxyfs[0]
+  roles:
+  - { role: proxyfs, when: install_proxyfs }
+  tags: proxyfs
+
+- hosts: all
+  roles:
+  - security

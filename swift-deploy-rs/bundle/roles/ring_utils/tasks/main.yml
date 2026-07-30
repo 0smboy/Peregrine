@@ -1,0 +1,61 @@
+---
+- block:
+  - name: Generate uniq dir name for distribute
+    shell: uuidgen
+    register: uniq_dir
+  - name: Make uniq_dir
+    shell: "mkdir /tmp/{{ uniq_dir.stdout }}"
+  - name: Set uniq_dir fact
+    set_fact:
+      uniq_dir: "{{ uniq_dir.stdout }}"
+  run_once: yes
+  delegate_to: localhost
+
+- block:
+  - name: Fetch generated ac_ring file
+    fetch: src=/{{ swift_dir }}/{{ item }}
+           dest=/tmp/{{ uniq_dir }}
+    with_items:
+    - account.ring.gz
+    - container.ring.gz
+    - swift.conf
+  - name: Fetch generated object_ring builder file
+    fetch: src=/{{ swift_dir }}/{{ item.name }}.builder
+           dest=/tmp/{{ uniq_dir }}
+    with_items:
+    - "{{ object_rings }}"
+  - name: Fetch generated object_ring ring.gz file
+    fetch: src=/{{ swift_dir }}/{{ item.name }}.ring.gz
+           dest=/tmp/{{ uniq_dir }}
+    with_items:
+    - "{{ object_rings }}"
+  when: inventory_hostname == groups['proxy_servers'][0]
+
+- name: Distribute ac_ring files to all hosts
+  copy: src=/tmp/{{ uniq_dir }}/{{ groups['proxy_servers'][0] }}/{{ swift_dir }}/{{ item }}
+        dest=/etc/swift
+        force=yes
+  with_items:
+  - account.ring.gz
+  - container.ring.gz
+  - swift.conf
+
+- name: Distribute object_ring builder to proxy_servers[0]
+  when: inventory_hostname == groups['proxy_servers'][0]
+  copy: src=/tmp/{{ uniq_dir }}/{{ groups['proxy_servers'][0] }}/{{ swift_dir }}/{{ item.name }}.builder
+        dest=/etc/swift
+        force=yes
+  with_items:
+  - "{{ object_rings }}"
+- name: Distribute object_ring ring.gz to all hosts
+  copy: src=/tmp/{{ uniq_dir }}/{{ groups['proxy_servers'][0] }}/{{ swift_dir }}/{{ item.name }}.ring.gz
+        dest=/etc/swift
+        force=yes
+  with_items:
+  - "{{ object_rings }}"
+
+- name: Clean uniq_dir
+  file: path=/tmp/{{ uniq_dir }}
+        state=absent
+  run_once: yes
+  delegate_to: localhost

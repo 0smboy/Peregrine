@@ -1,0 +1,491 @@
+//! Native Monitor surface.
+//!
+//! The console queries the metrics and log backends **server-side** and returns
+//! neutral JSON. The browser only ever talks to `/monitor/api/*` on this origin
+//! and never learns what powers the dashboards — no third-party product names,
+//! backend URLs, query language, or configuration reach the client. This is the
+//! production requirement: users must not be able to tell what the monitor is
+//! built on. Only a curated set of dashboards is exposed; there is no datasource
+//! picker, no explore, no settings.
+
+use crate::session;
+use crate::AppState;
+use axum::extract::{Query, State};
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+// ------------------------------------------------------------- panel registry
+
+#[derive(Clone, Copy, PartialEq)]
+enum Src {
+    /// instant scalar/vector from the metrics backend
+    Instant,
+    /// range matrix from the metrics backend
+    Range,
+    /// range matrix (metric query) from the logs backend
+    LogRange,
+    /// raw log lines from the logs backend
+    Logs,
+}
+
+#[derive(Clone, Copy)]
+enum Unit {
+    ReqS,
+    PerS,
+    Sec,
+    Ratio,
+    Pct,
+    BytesS,
+    Num,
+}
+
+impl Unit {
+    fn tag(self) -> &'static str {
+        match self {
+            Unit::ReqS => "reqs",
+            Unit::PerS => "pers",
+            Unit::Sec => "sec",
+            Unit::Ratio => "ratio",
+            Unit::Pct => "pct",
+            Unit::BytesS => "bytess",
+            Unit::Num => "num",
+        }
+    }
+}
+
+/// One drawn tile. `series` pairs a series-name spec with a query; a spec
+/// beginning with `@` splits the returned matrix by that label (one line per
+/// label value), anything else is a fixed single-series name.
+///
+/// `title` is an i18n key, not display text: the catalogue is data the browser
+/// renders verbatim, so it has to leave the server already in the reader's
+/// language.
+struct Panel {
+    id: &'static str,
+    title: &'static str,
+    src: Src,
+    unit: Unit,
+    /// stat tiles and small charts take one column; wide charts take two.
+    wide: bool,
+    series: &'static [(&'static str, &'static str)],
+}
+
+struct Dash {
+    id: &'static str,
+    title: &'static str,
+    panels: &'static [&'static str],
+}
+
+// `{iv}` is replaced with a range-appropriate rate interval before querying.
+const PANELS: &[Panel] = &[
+    // ---- cluster overview ----
+    Panel { id: "nodes_up", title: "mon.p.nodes_up", src: Src::Instant, unit: Unit::Num, wide: false,
+        series: &[("", "count(up{job=\"node\"} == 1) OR on() vector(0)")] },
+    Panel { id: "reqs", title: "mon.p.reqs", src: Src::Instant, unit: Unit::ReqS, wide: false,
+        series: &[("", "sum(rate(swift_request_total{service=\"proxy-server\"}[{iv}]))")] },
+    Panel { id: "err5xx", title: "mon.p.err5xx", src: Src::Instant, unit: Unit::Ratio, wide: false,
+        series: &[("", "(sum(rate(swift_request_total{service=\"proxy-server\",status=~\"5..\"}[{iv}])) or on() vector(0)) / clamp_min(sum(rate(swift_request_total{service=\"proxy-server\"}[{iv}])), 0.001)")] },
+    Panel { id: "p99", title: "mon.p.p99", src: Src::Instant, unit: Unit::Sec, wide: false,
+        series: &[("", "histogram_quantile(0.99, sum by (le) (rate(swift_request_duration_seconds_bucket{service=\"proxy-server\"}[{iv}])))")] },
+    Panel { id: "reqs_method", title: "mon.p.reqs_method", src: Src::Range, unit: Unit::ReqS, wide: true,
+        series: &[("@method", "sum by (method) (rate(swift_request_total{service=\"proxy-server\"}[{iv}]))")] },
+    Panel { id: "latency", title: "mon.p.latency", src: Src::Range, unit: Unit::Sec, wide: true,
+        series: &[
+            ("P50", "histogram_quantile(0.50, sum by (le) (rate(swift_request_duration_seconds_bucket{service=\"proxy-server\"}[{iv}])))"),
+            ("P95", "histogram_quantile(0.95, sum by (le) (rate(swift_request_duration_seconds_bucket{service=\"proxy-server\"}[{iv}])))"),
+            ("P99", "histogram_quantile(0.99, sum by (le) (rate(swift_request_duration_seconds_bucket{service=\"proxy-server\"}[{iv}])))"),
+        ] },
+    Panel { id: "err_ratio", title: "mon.p.err_ratio", src: Src::Range, unit: Unit::Ratio, wide: true,
+        series: &[
+            ("5xx", "(sum(rate(swift_request_total{service=\"proxy-server\",status=~\"5..\"}[{iv}])) or on() vector(0)) / clamp_min(sum(rate(swift_request_total{service=\"proxy-server\"}[{iv}])), 0.001)"),
+            ("4xx", "(sum(rate(swift_request_total{service=\"proxy-server\",status=~\"4..\"}[{iv}])) or on() vector(0)) / clamp_min(sum(rate(swift_request_total{service=\"proxy-server\"}[{iv}])), 0.001)"),
+        ] },
+
+    // ---- storage nodes ----
+    Panel { id: "fs_used", title: "mon.p.fs_used", src: Src::Range, unit: Unit::Pct, wide: true,
+        series: &[("@instance", "max by (instance) (1 - node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|overlay|squashfs|iso9660\"} / node_filesystem_size_bytes{job=\"node\",fstype!~\"tmpfs|overlay|squashfs|iso9660\"})")] },
+    Panel { id: "cpu", title: "mon.p.cpu", src: Src::Range, unit: Unit::Pct, wide: true,
+        series: &[("@instance", "1 - avg by (instance) (rate(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}[{iv}]))")] },
+    // Network panels select by the semantic `plane` label applied at scrape
+    // time, not by interface name: NIC naming differs per host and per
+    // environment, so hard-coded device names silently render empty panels.
+    Panel { id: "net_storage", title: "mon.p.net_storage", src: Src::Range, unit: Unit::BytesS, wide: true,
+        series: &[
+            ("rx", "sum(rate(node_network_receive_bytes_total{job=\"node\",plane=\"storage\"}[{iv}]))"),
+            ("tx", "sum(rate(node_network_transmit_bytes_total{job=\"node\",plane=\"storage\"}[{iv}]))"),
+        ] },
+    Panel { id: "net_repl", title: "mon.p.net_repl", src: Src::Range, unit: Unit::BytesS, wide: true,
+        series: &[
+            ("rx", "sum(rate(node_network_receive_bytes_total{job=\"node\",plane=\"replication\"}[{iv}]))"),
+            ("tx", "sum(rate(node_network_transmit_bytes_total{job=\"node\",plane=\"replication\"}[{iv}]))"),
+        ] },
+    Panel { id: "net_public", title: "mon.p.net_public", src: Src::Range, unit: Unit::BytesS, wide: true,
+        series: &[
+            ("rx", "sum(rate(node_network_receive_bytes_total{job=\"node\",plane=\"public\"}[{iv}]))"),
+            ("tx", "sum(rate(node_network_transmit_bytes_total{job=\"node\",plane=\"public\"}[{iv}]))"),
+        ] },
+    Panel { id: "load", title: "mon.p.load", src: Src::Range, unit: Unit::Num, wide: true,
+        series: &[("@instance", "node_load1{job=\"node\"}")] },
+
+    // ---- replication ----
+    Panel { id: "repl_kind", title: "mon.p.repl_kind", src: Src::Range, unit: Unit::PerS, wide: true,
+        series: &[("@kind", "sum by (kind) (rate(swift_replicator_total[{iv}]))")] },
+    Panel { id: "repl_sf", title: "mon.p.repl_sf", src: Src::Range, unit: Unit::PerS, wide: true,
+        series: &[("@kind", "sum by (kind) (rate(swift_replicator_total{kind=~\"successes|failures\"}[{iv}]))")] },
+    Panel { id: "repl_fail_node", title: "mon.p.repl_fail_node", src: Src::Range, unit: Unit::PerS, wide: true,
+        series: &[("@instance", "sum by (instance) (rate(swift_replicator_total{kind=\"failures\"}[{iv}]))")] },
+
+    // ---- logs ----
+    Panel { id: "log_vol", title: "mon.p.log_vol", src: Src::LogRange, unit: Unit::PerS, wide: true,
+        series: &[("@unit", "sum by (unit) (count_over_time({unit=~\"swift-.+|haproxy.service\"} [{iv}]))")] },
+    // Match genuine error events, not benign "errors=0"/"failures=0" stat lines
+    // (so "error:" and "error " qualify but "errors=0" does not).
+    Panel { id: "log_err", title: "mon.p.log_err", src: Src::Logs, unit: Unit::Num, wide: true,
+        series: &[("", "{unit=~\"swift-.+\"} |~ `(?i)(error[: ]|traceback|critical|panic|exception)`")] },
+];
+
+const DASHES: &[Dash] = &[
+    Dash { id: "overview", title: "mon.d.overview",
+        panels: &["nodes_up", "reqs", "err5xx", "p99", "reqs_method", "latency", "err_ratio"] },
+    Dash { id: "nodes", title: "mon.d.nodes",
+        panels: &["fs_used", "cpu", "net_storage", "net_repl", "net_public", "load"] },
+    Dash { id: "replication", title: "mon.d.replication",
+        panels: &["repl_kind", "repl_sf", "repl_fail_node"] },
+    Dash { id: "logs", title: "mon.d.logs",
+        panels: &["log_vol", "log_err"] },
+];
+
+fn panel(id: &str) -> Option<&'static Panel> {
+    PANELS.iter().find(|p| p.id == id)
+}
+
+// ------------------------------------------------------------- time + intervals
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// step and rate-interval derived from the requested window (seconds).
+fn grid(range_s: i64) -> (i64, String) {
+    let step = (range_s / 150).clamp(15, 3600);
+    let iv = (step * 4).clamp(60, 900);
+    (step, format!("{iv}s"))
+}
+
+// ------------------------------------------------------------- backend queries
+
+fn finite(v: f64) -> Option<f64> {
+    if v.is_finite() {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+fn series_name(spec: &str, metric: &Value) -> String {
+    if let Some(key) = spec.strip_prefix('@') {
+        let raw = metric
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        // Node targets carry an exporter port; drop it for a clean legend.
+        match raw.split_once(':') {
+            Some((host, _port)) if key == "instance" => host.to_string(),
+            _ if raw.is_empty() => "value".to_string(),
+            _ => raw,
+        }
+    } else {
+        spec.to_string()
+    }
+}
+
+pub(crate) fn parse_matrix(spec: &str, data: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    let empty = Vec::new();
+    let results = data
+        .get("data")
+        .and_then(|d| d.get("result"))
+        .and_then(|r| r.as_array())
+        .unwrap_or(&empty);
+    for r in results {
+        let name = series_name(spec, r.get("metric").unwrap_or(&Value::Null));
+        let mut points = Vec::new();
+        if let Some(vals) = r.get("values").and_then(|v| v.as_array()) {
+            for pair in vals {
+                if let Some(p) = pair.as_array() {
+                    let t = p.first().and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    let v = p
+                        .get(1)
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| s.parse::<f64>().ok());
+                    match v.and_then(finite) {
+                        Some(v) => points.push(json!([t, v])),
+                        None => points.push(json!([t, Value::Null])),
+                    }
+                }
+            }
+        }
+        out.push(json!({"name": name, "points": points}));
+    }
+    out
+}
+
+pub(crate) fn parse_instant(data: &Value) -> Option<f64> {
+    let results = data.get("data")?.get("result")?.as_array()?;
+    let first = results.first()?;
+    let v = first.get("value")?.as_array()?;
+    v.get(1)?.as_str()?.parse::<f64>().ok().and_then(finite)
+}
+
+pub(crate) async fn q_instant(state: &Arc<AppState>, promql: &str) -> Result<Value, String> {
+    let url = format!("{}/api/v1/query", state.cfg.metrics_url);
+    let t = now_secs().to_string();
+    state
+        .http
+        .get(&url)
+        .query(&[("query", promql), ("time", &t)])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json::<Value>()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn q_range(
+    state: &Arc<AppState>,
+    promql: &str,
+    start: i64,
+    end: i64,
+    step: i64,
+) -> Result<Value, String> {
+    let url = format!("{}/api/v1/query_range", state.cfg.metrics_url);
+    state
+        .http
+        .get(&url)
+        .query(&[
+            ("query", promql),
+            ("start", &start.to_string()),
+            ("end", &end.to_string()),
+            ("step", &step.to_string()),
+        ])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json::<Value>()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn q_log_range(
+    state: &Arc<AppState>,
+    logql: &str,
+    start: i64,
+    end: i64,
+    step: i64,
+) -> Result<Value, String> {
+    let url = format!("{}/loki/api/v1/query_range", state.cfg.logs_url);
+    let (sns, ens) = ((start as i128 * 1_000_000_000).to_string(), (end as i128 * 1_000_000_000).to_string());
+    state
+        .http
+        .get(&url)
+        .query(&[
+            ("query", logql),
+            ("start", &sns),
+            ("end", &ens),
+            ("step", &format!("{step}s")),
+        ])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json::<Value>()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn q_logs(
+    state: &Arc<AppState>,
+    logql: &str,
+    start: i64,
+    end: i64,
+    limit: u32,
+) -> Result<Vec<Value>, String> {
+    let url = format!("{}/loki/api/v1/query_range", state.cfg.logs_url);
+    let (sns, ens) = ((start as i128 * 1_000_000_000).to_string(), (end as i128 * 1_000_000_000).to_string());
+    let data: Value = state
+        .http
+        .get(&url)
+        .query(&[
+            ("query", logql),
+            ("start", &sns),
+            ("end", &ens),
+            ("limit", &limit.to_string()),
+            ("direction", &"backward".to_string()),
+        ])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut lines = Vec::new();
+    if let Some(streams) = data.get("data").and_then(|d| d.get("result")).and_then(|r| r.as_array()) {
+        for s in streams {
+            let unit = s
+                .get("stream")
+                .and_then(|st| st.get("unit"))
+                .and_then(|u| u.as_str())
+                .unwrap_or("")
+                .to_string();
+            // Which machine emitted the line. The Logs panel does not use it,
+            // but Tombstone Museum has to attribute every line to a node, and
+            // the label is only available here where the stream is still whole.
+            let host = s
+                .get("stream")
+                .and_then(|st| st.get("host"))
+                .and_then(|u| u.as_str())
+                .unwrap_or("")
+                .to_string();
+            if let Some(vals) = s.get("values").and_then(|v| v.as_array()) {
+                for pair in vals {
+                    if let Some(p) = pair.as_array() {
+                        let ts = p
+                            .first()
+                            .and_then(|x| x.as_str())
+                            .and_then(|s| s.parse::<i128>().ok())
+                            .map(|ns| (ns / 1_000_000_000) as i64)
+                            .unwrap_or(0);
+                        let line = p.get(1).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                        lines.push(json!({"t": ts, "unit": unit, "host": host, "line": line}));
+                    }
+                }
+            }
+        }
+    }
+    // newest first, capped
+    lines.sort_by(|a, b| b["t"].as_i64().unwrap_or(0).cmp(&a["t"].as_i64().unwrap_or(0)));
+    lines.truncate(limit as usize);
+    Ok(lines)
+}
+
+// ------------------------------------------------------------- handlers
+
+fn require_session(state: &Arc<AppState>, headers: &HeaderMap) -> bool {
+    session::from_headers(&state.sessions, headers).is_some()
+}
+
+/// Dashboard/panel catalogue (titles, kind, unit, layout). Carries **no**
+/// queries or backend hints — those never leave the server.
+pub async fn dash_catalog(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !require_session(&state, &headers) {
+        return unauth();
+    }
+    let lang = crate::i18n::lang(&headers);
+    let dashes: Vec<Value> = DASHES
+        .iter()
+        .map(|d| {
+            let panels: Vec<Value> = d
+                .panels
+                .iter()
+                .filter_map(|pid| panel(pid))
+                .map(|p| {
+                    let kind = match p.src {
+                        Src::Instant => "stat",
+                        Src::Logs => "logs",
+                        _ => "series",
+                    };
+                    let title = crate::i18n::t(lang, p.title);
+                    json!({"id": p.id, "title": title, "kind": kind, "unit": p.unit.tag(), "wide": p.wide})
+                })
+                .collect();
+            json!({"id": d.id, "title": crate::i18n::t(lang, d.title), "panels": panels})
+        })
+        .collect();
+    Json(json!({"dashboards": dashes})).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct PanelQuery {
+    id: String,
+    #[serde(default = "def_range")]
+    range: i64,
+}
+fn def_range() -> i64 {
+    3600
+}
+
+/// Run one panel's queries server-side and return neutral data.
+pub async fn panel_data(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<PanelQuery>,
+) -> Response {
+    if !require_session(&state, &headers) {
+        return unauth();
+    }
+    let p = match panel(&q.id) {
+        Some(p) => p,
+        None => return Json(json!({"error": "unknown panel"})).into_response(),
+    };
+    let range_s = q.range.clamp(900, 86400 * 7);
+    let end = now_secs();
+    let start = end - range_s;
+    let (step, iv) = grid(range_s);
+
+    match p.src {
+        Src::Instant => {
+            let sub = p.series[0].1.replace("{iv}", &iv);
+            let val = match q_instant(&state, &sub).await {
+                Ok(d) => parse_instant(&d),
+                Err(e) => return err_json(&e),
+            };
+            Json(json!({"id": p.id, "kind": "stat", "unit": p.unit.tag(), "value": val}))
+                .into_response()
+        }
+        Src::Logs => {
+            let sub = p.series[0].1.to_string();
+            match q_logs(&state, &sub, start, end, 60).await {
+                Ok(lines) => Json(json!({"id": p.id, "kind": "logs", "lines": lines}))
+                    .into_response(),
+                Err(e) => err_json(&e),
+            }
+        }
+        Src::Range | Src::LogRange => {
+            let mut all = Vec::new();
+            for (spec, ql) in p.series {
+                let sub = ql.replace("{iv}", &iv);
+                let data = if p.src == Src::Range {
+                    q_range(&state, &sub, start, end, step).await
+                } else {
+                    q_log_range(&state, &sub, start, end, step).await
+                };
+                match data {
+                    Ok(d) => all.extend(parse_matrix(spec, &d)),
+                    Err(e) => return err_json(&e),
+                }
+            }
+            Json(json!({"id": p.id, "kind": "series", "unit": p.unit.tag(), "series": all}))
+                .into_response()
+        }
+    }
+}
+
+fn unauth() -> Response {
+    (axum::http::StatusCode::UNAUTHORIZED, Json(json!({"error": "session required"})))
+        .into_response()
+}
+
+fn err_json(e: &str) -> Response {
+    // Never surface backend identity in an error; keep it generic.
+    let _ = e;
+    Json(json!({"error": "metrics temporarily unavailable"})).into_response()
+}

@@ -1,0 +1,18 @@
+---
+# auth_method可配置为 tempauth, keystone
+auth_method: keystone
+tempauth_pipeline: "catch_errors gatekeeper healthcheck proxy-logging cache cname_lookup domain_remap listing_formats container_sync bulk tempurl list-endpoints ratelimit formpost tempauth read_only staticweb container-quotas account-quotas slo dlo versioned_writes proxy-logging proxy-server"
+keystone_pipeline: "catch_errors gatekeeper healthcheck proxy-logging cache cname_lookup domain_remap listing_formats container_sync bulk tempurl list-endpoints ratelimit formpost authtoken keystoneauth read_only copy staticweb container-quotas account-quotas slo dlo versioned_writes proxy-logging proxy-server"
+account_autocreate: "true"  # 此处为字符串true,并非布尔值true
+
+# data_encryption可配置为true/false,true表示加密
+# encryption_root_secret采用openssl rand -base64 64 生成
+# 加密功能需要newton及以上版本支持
+data_encryption: false
+encryption_root_secret: "QVBJcB2uQ64DEXHR/7W26NDO4J0GaKCtFnsNX/pN2K24BUpz1KSibx7LfT4A+JA34zAQRj/1VbjspMniuAf7lg=="
+tempauth_encryption_pipeline: "catch_errors gatekeeper healthcheck proxy-logging cache cname_lookup domain_remap listing_formats container_sync bulk tempurl list-endpoints ratelimit formpost tempauth read_only staticweb container-quotas account-quotas slo dlo versioned_writes keymaster encryption proxy-logging proxy-server"
+keystone_encryption_pipeline: "catch_errors gatekeeper healthcheck proxy-logging cache cname_lookup domain_remap listing_formats container_sync bulk tempurl list-endpoints ratelimit formpost authtoken keystoneauth read_only copy staticweb container-quotas account-quotas slo dlo versioned_writes proxy-logging proxy-server"
+
+# 存储系统接口类型 swift/s3
+INTERFACE: s3
+

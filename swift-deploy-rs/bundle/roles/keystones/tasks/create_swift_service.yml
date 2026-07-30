@@ -1,0 +1,68 @@
+---
+- name: Create keystone swift user
+  command: openstack user create --domain default --password {{ keystone_swift_password }} swift {{ openstack_admin_args }}
+
+- name: Create service project
+  command: openstack project create --domain default --description "Service Project" service {{ openstack_admin_args }}
+
+- name: Create ResellerAdmin role
+  command: openstack role create ResellerAdmin {{ openstack_admin_args }}
+
+- name: Create swiftoperator role
+  command: openstack role create swiftoperator {{ openstack_admin_args }}
+
+- name: Create swiftmember role
+  command: openstack role create swiftmember {{ openstack_admin_args }}
+
+- name: Set swift as admin role
+  command: openstack role add --project service --user swift admin {{ openstack_admin_args }}
+
+- name: Create object-store service
+  command: openstack service create --name swift --description "OpenStack Object Storage" object-store {{ openstack_admin_args }}
+
+- name: Set public swift endpoint
+  command: openstack endpoint create --region RegionOne object-store public http://{{ auth_url_ip }}:{{ auth_url_port }}/v1/AUTH_%\(project_id\)s {{ openstack_admin_args }}
+
+- name: Set internal swift endpoint
+  command: openstack endpoint create --region RegionOne object-store internal http://{{ auth_url_ip }}:{{ auth_url_port }}/v1/AUTH_%\(project_id\)s {{ openstack_admin_args }}
+  
+- name: Set admin swift endpoint
+  command: openstack endpoint create --region RegionOne object-store admin http://{{ auth_url_ip }}:{{ auth_url_port }}/v1 {{ openstack_admin_args }}
+
+- include: create_keystone_users.yml
+  with_items: "{{ swift_cluster_accounts }}"
+  loop_control:
+    loop_var: account_info
+
+- include: create_keystone_users.yml
+  with_items: "{{ proxyfs_swift_accounts }}"
+  loop_control:
+    loop_var: account_info
+  when: install_proxyfs
+
+- name: Save proxyfs account id
+  command: 'openstack project create {{ proxyfs_swift_accounts[0].account_name }} {{ openstack_admin_args }} --or-show -c id -f value'
+  register: proxyfs_swift_account_id
+  when: install_proxyfs
+
+- name: Remove proxyfs account id tmp file
+  file:
+    path: /tmp/ostorage_proxyfs_account
+    state: absent
+  when: install_proxyfs
+  delegate_to: "{{item}}"
+  with_items: "{{groups['proxyfs']}}"
+
+- name: Save proxyfs account id to tmp file
+  lineinfile:
+    path: /tmp/ostorage_proxyfs_account
+    line: "{{proxyfs_swift_account_id.stdout_lines[0]}}"
+    create: yes
+  when: install_proxyfs
+  delegate_to: "{{item}}"
+  with_items: "{{groups['proxyfs']}}"
+
+- include: create_ec2_credentials.yml
+  with_items: "{{ ec2_credentials }}"
+  loop_control:
+    loop_var: credential_info

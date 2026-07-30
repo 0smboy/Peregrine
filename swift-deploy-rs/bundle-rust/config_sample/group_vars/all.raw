@@ -1,0 +1,68 @@
+# swift-deploy-rs rust-stack sample group_vars — structure example only.
+# Every variable referenced by any bundle-rust template or task exists here;
+# workspace.rs renders the real file for a project from the same contract.
+
+# ---- stack marker (preflight and the UI branch on this) ----
+deploy_stack: rust
+
+# ---- v3-shared basics ----
+INSTALL_MODE: production
+SAIO: false
+timezone: Asia/Shanghai
+ntp_internet_server_address: time.pool.aliyun.com
+ntp_local_server_address: 10.0.0.11
+admin_ips:
+  - 10.0.0.1
+ssh_bind_port: 22
+
+# ---- cluster identity (sample values, obviously not production secrets) ----
+swift_hash_path_prefix: SAMPLEPREFIX-REPLACE-ME
+swift_hash_path_suffix: SAMPLESUFFIX-REPLACE-ME
+
+# ---- auth ----
+auth_method: tempauth
+# First entry is the admin/benchmark account.
+swift_tempauth_users:
+  - { account: "test", user: "tester", key: "SAMPLE-KEY-REPLACE-ME-0000", admin: true }
+
+# ---- ports and layout ----
+proxy_bind_port: 8080
+account_bind_port: 6202
+container_bind_port: 6201
+object_bind_port: 6200
+srv_node_root: /srv/node
+object_workers: 0
+swift_device_weight: 100
+
+# ---- account/container ring parameters (v3 names) ----
+account_swift_partition_power: 10
+account_swift_replicas: 3
+account_swift_minimum_time: 1
+container_swift_partition_power: 10
+container_swift_replicas: 3
+container_swift_minimum_time: 1
+
+# ---- storage policies (index 0 replication policy is always present).
+# The sample EC policy is 2+1 so the sample topology (3 disks on .11 plus
+# d1 on .12 = 4 devices) actually satisfies data+parity <= devices. ----
+swift_policies:
+  - { index: 0, name: "Policy-0", type: "replication",
+      partition_power: 10, replicas: 3, min_part_hours: 1, default: true }
+  - { index: 1, name: "EC-2-1", type: "erasure_coding",
+      partition_power: 10, replicas: 3, min_part_hours: 1,
+      ec_type: "liberasurecode_rs_vand", ec_data: 2, ec_parity: 1,
+      ec_segment_size: 1048576 }
+
+# ---- ingress / load balancing ----
+use_lb: false
+lb_mode: http
+auth_url_ip: 10.0.0.11
+swift_lb_port: 8080
+haproxy_stats_user: admin
+haproxy_stats_password: SAMPLE-STATS-REPLACE-ME
+haproxy_monitor_port: 1080
+haproxy_max_conn: 4000
+
+# ---- controller-side staging directory for fetched rings + replication
+# keys (flat files; per-project path avoids cross-project clobbering) ----
+ring_fetch_dir: /var/lib/swift-deploy/rings/sample-rust-cluster

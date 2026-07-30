@@ -1,0 +1,6 @@
+---
+- name: system  tuning
+  include:  files_section.yml
+  with_items: "{{ system_tuning_files }}"
+  loop_control:
+       loop_var: system_tuning_file

@@ -1,0 +1,4 @@
+# The agent binaries are payload, repopulated per PAYLOAD.md; only the
+# placeholder is tracked.
+bin/*
+!bin/.keep

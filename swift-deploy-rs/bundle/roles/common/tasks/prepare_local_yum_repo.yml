@@ -1,0 +1,22 @@
+---
+- name: Backup repo files
+  script: files/backup_repo.sh
+- name: Turn off rpm gpgcheck
+  ini_file: dest=/etc/yum.conf
+            section=main
+            option=gpgcheck
+            value=0
+- name: Copy template repo file
+  template: src=templates/local.repo.j2
+            dest=/etc/yum.repos.d/local.repo
+- name: Remove yum lockfile
+  file: 
+    path: /var/run/yum.pid
+    state: absent
+- name: Yum clean all
+  shell: yum clean all
+- name: Show yum repo list
+  command: yum repolist
+  register: repolist
+- name: Echo repolist
+  debug: msg={{ repolist.stdout_lines }}

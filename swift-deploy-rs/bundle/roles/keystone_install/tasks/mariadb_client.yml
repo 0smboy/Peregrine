@@ -1,0 +1,12 @@
+---
+- name: Preparing mariadb client
+  yum: 
+    name: MariaDB-client
+    state: present
+- name: Creating `/root/.my.cnf`
+  template:
+    src: my.cnf.j2
+    dest: /root/.my.cnf
+    owner: root
+    mode: 0600
+  become: yes

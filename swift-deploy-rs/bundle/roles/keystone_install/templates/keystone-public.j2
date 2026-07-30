@@ -1,0 +1,11 @@
+[uwsgi]
+http = :{{ uwsgi_keystone_public_service_port}}
+enable-threads = true
+processes = 8
+master = true
+threads = 4
+listen = 65535
+wsgi-file = /usr/bin/keystone-wsgi-public
+thunder-lock = true
+lazy-apps = true
+pidfile = /var/run/keystone-public.pid

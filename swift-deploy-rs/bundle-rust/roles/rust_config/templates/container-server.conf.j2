@@ -1,0 +1,28 @@
+# {{ ansible_managed }}
+# Parsed by swift-container-server ([app:container-server]) and by
+# swift-db-replicator container ([container-replicator]).
+
+[app:container-server]
+bind_ip = 0.0.0.0
+bind_port = {{ container_bind_port }}
+devices = {{ srv_node_root }}
+mount_check = {{ 'true' if custom_disks | length > 0 else 'false' }}
+# statsd -> local statsd_exporter (bundle-monitoring). Each daemon prefixes
+# metrics with its log_name (container-server / container-replicator); a
+# non-empty log_statsd_metric_prefix would be PREPENDED to that, so it stays
+# empty to keep the spec shapes (container-server.<METHOD>.<status>).
+log_statsd_host = 127.0.0.1
+log_statsd_port = 9125
+log_statsd_metric_prefix =
+
+[container-replicator]
+interval = 30
+{% if groups['object_servers'] | length > 1 %}
+rsync_ssh_opts = ssh -i /etc/swift/replication_key -o StrictHostKeyChecking=accept-new
+rsync_devices_root = {{ srv_node_root }}
+{% else %}
+peer_map = {{ container_bind_port }}:{{ srv_node_root }}
+{% endif %}
+log_statsd_host = 127.0.0.1
+log_statsd_port = 9125
+log_statsd_metric_prefix =

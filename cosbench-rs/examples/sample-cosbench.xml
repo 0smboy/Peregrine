@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<workload name="s3-sample" description="imported sample">
+  <storage type="s3" config="endpoint=http://127.0.0.1:9000;accesskey=minioadmin;secretkey=minioadmin;path_style_access=true" />
+  <workflow>
+    <workstage name="main">
+      <work name="main" workers="8" runtime="30">
+        <operation type="write" ratio="50" config="containers=c(1);objects=c(1,200);sizes=64KB" />
+        <operation type="read" ratio="50" config="containers=c(1);objects=c(1,200)" />
+      </work>
+    </workstage>
+  </workflow>
+</workload>

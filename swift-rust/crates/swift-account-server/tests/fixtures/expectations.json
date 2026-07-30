@@ -1,0 +1,511 @@
+{
+ "hash_suffix": "changeme",
+ "requests": [
+  {
+   "body": "",
+   "headers": {
+    "X-Timestamp": "1751500000.00000"
+   },
+   "label": "put-account",
+   "method": "PUT",
+   "path": "/sda1/0/AUTH_test",
+   "query": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 201
+  },
+  {
+   "body": "<html><h1>Accepted</h1><p>The request is accepted for processing.</p></html>",
+   "headers": {
+    "X-Timestamp": "1751500000.00000"
+   },
+   "label": "put-account-again",
+   "method": "PUT",
+   "path": "/sda1/0/AUTH_test",
+   "query": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 202
+  },
+  {
+   "body": "Missing X-Timestamp header",
+   "headers": {},
+   "label": "put-account-no-ts",
+   "method": "PUT",
+   "path": "/sda1/0/AUTH_ts",
+   "query": "",
+   "response_headers": {
+    "Content-Type": "text/plain"
+   },
+   "status": 400
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Account-Meta-Color": "blue",
+    "X-Account-Sysmeta-S": "sv",
+    "X-Timestamp": "1751500001.00000"
+   },
+   "label": "post-meta",
+   "method": "POST",
+   "path": "/sda1/0/AUTH_test",
+   "query": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 204
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "head-empty",
+   "method": "HEAD",
+   "path": "/sda1/0/AUTH_test",
+   "query": "",
+   "response_headers": {
+    "Content-Type": "text/plain; charset=utf-8",
+    "X-Account-Bytes-Used": "0",
+    "X-Account-Container-Count": "0",
+    "X-Account-Meta-Color": "blue",
+    "X-Account-Object-Count": "0",
+    "X-Account-Sysmeta-S": "sv",
+    "X-Put-Timestamp": "1751500000.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 204
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "get-empty-plain",
+   "method": "GET",
+   "path": "/sda1/0/AUTH_test",
+   "query": "",
+   "response_headers": {
+    "Content-Type": "text/plain; charset=utf-8",
+    "X-Account-Bytes-Used": "0",
+    "X-Account-Container-Count": "0",
+    "X-Account-Meta-Color": "blue",
+    "X-Account-Object-Count": "0",
+    "X-Account-Sysmeta-S": "sv",
+    "X-Put-Timestamp": "1751500000.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 204
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Backend-Storage-Policy-Index": "0",
+    "X-Bytes-Used": "42",
+    "X-Delete-Timestamp": "0",
+    "X-Object-Count": "3",
+    "X-Put-Timestamp": "1751500001.00000"
+   },
+   "label": "put-container-c1",
+   "method": "PUT",
+   "path": "/sda1/0/AUTH_test/c1",
+   "query": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 201
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Bytes-Used": "0",
+    "X-Delete-Timestamp": "0",
+    "X-Object-Count": "0",
+    "X-Put-Timestamp": "1751500002.00000"
+   },
+   "label": "put-container-unicode",
+   "method": "PUT",
+   "path": "/sda1/0/AUTH_test/%E4%B8%AD%E6%96%87%E5%AD%90",
+   "query": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 201
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Bytes-Used": "0",
+    "X-Delete-Timestamp": "1751500002.00000",
+    "X-Object-Count": "0",
+    "X-Put-Timestamp": "1751500001.00000"
+   },
+   "label": "put-container-deleted",
+   "method": "PUT",
+   "path": "/sda1/0/AUTH_test/gone",
+   "query": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 204
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "head-after",
+   "method": "HEAD",
+   "path": "/sda1/0/AUTH_test",
+   "query": "",
+   "response_headers": {
+    "Content-Type": "text/plain; charset=utf-8",
+    "X-Account-Bytes-Used": "42",
+    "X-Account-Container-Count": "2",
+    "X-Account-Meta-Color": "blue",
+    "X-Account-Object-Count": "3",
+    "X-Account-Storage-Policy-Policy-0-Bytes-Used": "42",
+    "X-Account-Storage-Policy-Policy-0-Container-Count": "2",
+    "X-Account-Storage-Policy-Policy-0-Object-Count": "3",
+    "X-Account-Sysmeta-S": "sv",
+    "X-Put-Timestamp": "1751500000.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 204
+  },
+  {
+   "body": "[{\"name\": \"c1\", \"count\": 3, \"bytes\": 42, \"last_modified\": \"2025-07-02T23:46:41.000000\", \"storage_policy\": \"Policy-0\"}, {\"name\": \"\\u4e2d\\u6587\\u5b50\", \"count\": 0, \"bytes\": 0, \"last_modified\": \"2025-07-02T23:46:42.000000\", \"storage_policy\": \"Policy-0\"}]",
+   "headers": {},
+   "label": "get-json",
+   "method": "GET",
+   "path": "/sda1/0/AUTH_test",
+   "query": "format=json",
+   "response_headers": {
+    "Content-Type": "application/json; charset=utf-8",
+    "X-Account-Bytes-Used": "42",
+    "X-Account-Container-Count": "2",
+    "X-Account-Meta-Color": "blue",
+    "X-Account-Object-Count": "3",
+    "X-Account-Storage-Policy-Policy-0-Bytes-Used": "42",
+    "X-Account-Storage-Policy-Policy-0-Container-Count": "2",
+    "X-Account-Storage-Policy-Policy-0-Object-Count": "3",
+    "X-Account-Sysmeta-S": "sv",
+    "X-Put-Timestamp": "1751500000.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "c1\n\u4e2d\u6587\u5b50\n",
+   "headers": {},
+   "label": "get-plain",
+   "method": "GET",
+   "path": "/sda1/0/AUTH_test",
+   "query": "",
+   "response_headers": {
+    "Content-Type": "text/plain; charset=utf-8",
+    "X-Account-Bytes-Used": "42",
+    "X-Account-Container-Count": "2",
+    "X-Account-Meta-Color": "blue",
+    "X-Account-Object-Count": "3",
+    "X-Account-Storage-Policy-Policy-0-Bytes-Used": "42",
+    "X-Account-Storage-Policy-Policy-0-Container-Count": "2",
+    "X-Account-Storage-Policy-Policy-0-Object-Count": "3",
+    "X-Account-Sysmeta-S": "sv",
+    "X-Put-Timestamp": "1751500000.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<account name=\"AUTH_test\">\n<container><name>c1</name><count>3</count><bytes>42</bytes><last_modified>2025-07-02T23:46:41.000000</last_modified><storage_policy>Policy-0</storage_policy></container>\n<container><name>\u4e2d\u6587\u5b50</name><count>0</count><bytes>0</bytes><last_modified>2025-07-02T23:46:42.000000</last_modified><storage_policy>Policy-0</storage_policy></container>\n</account>",
+   "headers": {},
+   "label": "get-xml",
+   "method": "GET",
+   "path": "/sda1/0/AUTH_test",
+   "query": "format=xml",
+   "response_headers": {
+    "Content-Type": "application/xml; charset=utf-8",
+    "X-Account-Bytes-Used": "42",
+    "X-Account-Container-Count": "2",
+    "X-Account-Meta-Color": "blue",
+    "X-Account-Object-Count": "3",
+    "X-Account-Storage-Policy-Policy-0-Bytes-Used": "42",
+    "X-Account-Storage-Policy-Policy-0-Container-Count": "2",
+    "X-Account-Storage-Policy-Policy-0-Object-Count": "3",
+    "X-Account-Sysmeta-S": "sv",
+    "X-Put-Timestamp": "1751500000.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "[{\"name\": \"c1\", \"count\": 3, \"bytes\": 42, \"last_modified\": \"2025-07-02T23:46:41.000000\", \"storage_policy\": \"Policy-0\"}, {\"name\": \"\\u4e2d\\u6587\\u5b50\", \"count\": 0, \"bytes\": 0, \"last_modified\": \"2025-07-02T23:46:42.000000\", \"storage_policy\": \"Policy-0\"}]",
+   "headers": {
+    "Accept": "application/json"
+   },
+   "label": "get-accept-json",
+   "method": "GET",
+   "path": "/sda1/0/AUTH_test",
+   "query": "",
+   "response_headers": {
+    "Content-Type": "application/json; charset=utf-8",
+    "X-Account-Bytes-Used": "42",
+    "X-Account-Container-Count": "2",
+    "X-Account-Meta-Color": "blue",
+    "X-Account-Object-Count": "3",
+    "X-Account-Storage-Policy-Policy-0-Bytes-Used": "42",
+    "X-Account-Storage-Policy-Policy-0-Container-Count": "2",
+    "X-Account-Storage-Policy-Policy-0-Object-Count": "3",
+    "X-Account-Sysmeta-S": "sv",
+    "X-Put-Timestamp": "1751500000.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "[{\"name\": \"c1\", \"count\": 3, \"bytes\": 42, \"last_modified\": \"2025-07-02T23:46:41.000000\", \"storage_policy\": \"Policy-0\"}]",
+   "headers": {},
+   "label": "get-limit-1",
+   "method": "GET",
+   "path": "/sda1/0/AUTH_test",
+   "query": "format=json&limit=1",
+   "response_headers": {
+    "Content-Type": "application/json; charset=utf-8",
+    "X-Account-Bytes-Used": "42",
+    "X-Account-Container-Count": "2",
+    "X-Account-Meta-Color": "blue",
+    "X-Account-Object-Count": "3",
+    "X-Account-Storage-Policy-Policy-0-Bytes-Used": "42",
+    "X-Account-Storage-Policy-Policy-0-Container-Count": "2",
+    "X-Account-Storage-Policy-Policy-0-Object-Count": "3",
+    "X-Account-Sysmeta-S": "sv",
+    "X-Put-Timestamp": "1751500000.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "Maximum limit is 10000",
+   "headers": {},
+   "label": "get-limit-too-big",
+   "method": "GET",
+   "path": "/sda1/0/AUTH_test",
+   "query": "limit=10001",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 412
+  },
+  {
+   "body": "[{\"name\": \"\\u4e2d\\u6587\\u5b50\", \"count\": 0, \"bytes\": 0, \"last_modified\": \"2025-07-02T23:46:42.000000\", \"storage_policy\": \"Policy-0\"}]",
+   "headers": {},
+   "label": "get-marker",
+   "method": "GET",
+   "path": "/sda1/0/AUTH_test",
+   "query": "format=json&marker=c1",
+   "response_headers": {
+    "Content-Type": "application/json; charset=utf-8",
+    "X-Account-Bytes-Used": "42",
+    "X-Account-Container-Count": "2",
+    "X-Account-Meta-Color": "blue",
+    "X-Account-Object-Count": "3",
+    "X-Account-Storage-Policy-Policy-0-Bytes-Used": "42",
+    "X-Account-Storage-Policy-Policy-0-Container-Count": "2",
+    "X-Account-Storage-Policy-Policy-0-Object-Count": "3",
+    "X-Account-Sysmeta-S": "sv",
+    "X-Put-Timestamp": "1751500000.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "[{\"name\": \"\\u4e2d\\u6587\\u5b50\", \"count\": 0, \"bytes\": 0, \"last_modified\": \"2025-07-02T23:46:42.000000\", \"storage_policy\": \"Policy-0\"}]",
+   "headers": {},
+   "label": "get-prefix-delim",
+   "method": "GET",
+   "path": "/sda1/0/AUTH_test",
+   "query": "format=json&prefix=%E4%B8%AD%E6%96%87&delimiter=/",
+   "response_headers": {
+    "Content-Type": "application/json; charset=utf-8",
+    "X-Account-Bytes-Used": "42",
+    "X-Account-Container-Count": "2",
+    "X-Account-Meta-Color": "blue",
+    "X-Account-Object-Count": "3",
+    "X-Account-Storage-Policy-Policy-0-Bytes-Used": "42",
+    "X-Account-Storage-Policy-Policy-0-Container-Count": "2",
+    "X-Account-Storage-Policy-Policy-0-Object-Count": "3",
+    "X-Account-Sysmeta-S": "sv",
+    "X-Put-Timestamp": "1751500000.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "[{\"name\": \"c1\", \"count\": 3, \"bytes\": 42, \"last_modified\": \"2025-07-02T23:46:41.000000\", \"storage_policy\": \"Policy-0\"}, {\"name\": \"\\u4e2d\\u6587\\u5b50\", \"count\": 0, \"bytes\": 0, \"last_modified\": \"2025-07-02T23:46:42.000000\", \"storage_policy\": \"Policy-0\"}]",
+   "headers": {},
+   "label": "get-delim-only",
+   "method": "GET",
+   "path": "/sda1/0/AUTH_test",
+   "query": "format=json&delimiter=/",
+   "response_headers": {
+    "Content-Type": "application/json; charset=utf-8",
+    "X-Account-Bytes-Used": "42",
+    "X-Account-Container-Count": "2",
+    "X-Account-Meta-Color": "blue",
+    "X-Account-Object-Count": "3",
+    "X-Account-Storage-Policy-Policy-0-Bytes-Used": "42",
+    "X-Account-Storage-Policy-Policy-0-Container-Count": "2",
+    "X-Account-Storage-Policy-Policy-0-Object-Count": "3",
+    "X-Account-Sysmeta-S": "sv",
+    "X-Put-Timestamp": "1751500000.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "[{\"name\": \"\\u4e2d\\u6587\\u5b50\", \"count\": 0, \"bytes\": 0, \"last_modified\": \"2025-07-02T23:46:42.000000\", \"storage_policy\": \"Policy-0\"}, {\"name\": \"c1\", \"count\": 3, \"bytes\": 42, \"last_modified\": \"2025-07-02T23:46:41.000000\", \"storage_policy\": \"Policy-0\"}]",
+   "headers": {},
+   "label": "get-reverse",
+   "method": "GET",
+   "path": "/sda1/0/AUTH_test",
+   "query": "format=json&reverse=true",
+   "response_headers": {
+    "Content-Type": "application/json; charset=utf-8",
+    "X-Account-Bytes-Used": "42",
+    "X-Account-Container-Count": "2",
+    "X-Account-Meta-Color": "blue",
+    "X-Account-Object-Count": "3",
+    "X-Account-Storage-Policy-Policy-0-Bytes-Used": "42",
+    "X-Account-Storage-Policy-Policy-0-Container-Count": "2",
+    "X-Account-Storage-Policy-Policy-0-Object-Count": "3",
+    "X-Account-Sysmeta-S": "sv",
+    "X-Put-Timestamp": "1751500000.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Bytes-Used": "0",
+    "X-Delete-Timestamp": "0",
+    "X-Object-Count": "0",
+    "X-Put-Timestamp": "1751500003.00000",
+    "X-Timestamp": "1751500003.00000"
+   },
+   "label": "put-container-autocreate",
+   "method": "PUT",
+   "path": "/sda1/0/.shards_AUTH_test/rows",
+   "query": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 201
+  },
+  {
+   "body": "<html><h1>Not Found</h1><p>The resource could not be found.</p></html>",
+   "headers": {
+    "X-Bytes-Used": "0",
+    "X-Delete-Timestamp": "0",
+    "X-Object-Count": "0",
+    "X-Put-Timestamp": "1751500003.00000"
+   },
+   "label": "put-container-no-account",
+   "method": "PUT",
+   "path": "/sda1/0/AUTH_missing/c",
+   "query": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 404
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Timestamp": "1751500004.00000"
+   },
+   "label": "delete-account",
+   "method": "DELETE",
+   "path": "/sda1/0/AUTH_test",
+   "query": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=utf-8",
+    "X-Account-Status": "Deleted"
+   },
+   "status": 204
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "get-after-delete",
+   "method": "GET",
+   "path": "/sda1/0/AUTH_test",
+   "query": "format=json",
+   "response_headers": {
+    "Content-Type": "text/html; charset=utf-8",
+    "X-Account-Status": "Deleted"
+   },
+   "status": 404
+  },
+  {
+   "body": "Recently deleted",
+   "headers": {
+    "X-Timestamp": "1751500005.00000"
+   },
+   "label": "put-after-delete",
+   "method": "PUT",
+   "path": "/sda1/0/AUTH_test",
+   "query": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=utf-8",
+    "X-Account-Status": "Deleted"
+   },
+   "status": 403
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "head-missing",
+   "method": "HEAD",
+   "path": "/sda1/0/AUTH_nope",
+   "query": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=utf-8"
+   },
+   "status": 404
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "bad-method",
+   "method": "OPTIONS",
+   "path": "/sda1/0/AUTH_test",
+   "query": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 200
+  },
+  {
+   "body": "<html><h1>Insufficient Storage</h1><p>There was not enough space to save the resource. Drive: nodrive</p></html>",
+   "headers": {},
+   "label": "bad-drive",
+   "method": "GET",
+   "path": "/nodrive/0/AUTH_test",
+   "query": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 507
+  },
+  {
+   "body": "Invalid path: /sda1/0",
+   "headers": {},
+   "label": "bad-path",
+   "method": "GET",
+   "path": "/sda1/0",
+   "query": "",
+   "response_headers": {
+    "Content-Type": "text/plain"
+   },
+   "status": 400
+  }
+ ]
+}

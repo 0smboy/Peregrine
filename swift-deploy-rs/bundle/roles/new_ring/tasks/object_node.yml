@@ -1,0 +1,15 @@
+---
+- name: Check if object node already exist in the ring
+  command: 'swift-ring-builder {{ builder_name }}.builder search --region {{ region }} --zone {{ zone }} --ip {{ storage_ip }} --replication-ip {{ replication_ip }} --port {{ port }} --device {{ device }} --weight {{ weight }}'
+  ignore_errors: yes
+  register: node_existence_check
+  changed_when: no
+  failed_when: node_existence_check is failed and 'No matching devices found' not in node_existence_check.stdout
+  args:
+    chdir: "{{ tmp_dir }}"
+
+- name: Add node to {{ builder_name }}.builder
+  command: 'swift-ring-builder {{ builder_name }}.builder add --region {{ object_node.region }} --zone {{ object_node.zone }} --ip {{ object_node.storage_ip }} --replication-ip {{ object_node.replication_ip }} --port {{ object_node.port }} --device {{ object_node.device }} --weight {{ object_node.weight }}'
+  args:
+    chdir: "{{ tmp_dir }}"
+  when: '{{ storage_ip not in node_existence_check.stdout }}'

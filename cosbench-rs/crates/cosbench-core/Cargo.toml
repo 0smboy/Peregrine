@@ -1,0 +1,35 @@
+[package]
+name = "cosbench-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures.workspace = true
+hdrhistogram.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+aws-config = { version = "1", optional = true, features = ["behavior-version-latest"] }
+aws-sdk-s3 = { version = "1", optional = true }
+aws-credential-types = { version = "1", optional = true }
+
+[features]
+default = ["s3"]
+s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:aws-credential-types"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

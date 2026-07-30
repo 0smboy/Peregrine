@@ -1,0 +1,39 @@
+---
+- name: Check if {{ ac_ring.name }}.builder exist
+  stat: path=/etc/swift/{{ ac_ring.name }}.builder
+  register: builder_exist
+  when: REINSTALL
+
+- name: Remove the {{ ac_ring.name }} ring file 
+  file: path=/etc/swift/{{ item }}
+        state=absent
+  with_items: 
+    - '{{ ac_ring.name }}.builder'
+    - '{{ ac_ring.name }}.ring.gz'
+  when: REINSTALL and builder_exist is defined and builder_exist.stat.exists == True
+
+- name: Create {{ ac_ring.name }}.builder
+  command: 'swift-ring-builder {{ ac_ring.name }}.builder create {{ ac_ring.swift_partition_power }} {{ ac_ring.swift_replicas }} {{ ac_ring.swift_minimum_time }}'
+  args:
+    chdir: /etc/swift
+    creates: '/etc/swift/{{ ac_ring.name }}.builder'
+
+- include: ac_node.yml builder_name={{ ac_ring.name }} region={{ item.region }} zone={{ item.zone }} storage_ip={{ item.storage_ip }} replication_ip={{ item.replication_ip }} port={{ item.port }} device={{ item.device }} weight={{ item.weight }}
+  with_items: '{{ ac_ring.nodes }}'
+
+- block:
+  - name: Set rebalance mode for debug
+    set_fact:
+      rebalance_mode: '-f'
+    when: INSTALL_MODE == "development"
+  - name: Set rebalance mode for production
+    set_fact:
+      rebalance_mode: ''
+    when: INSTALL_MODE != "development"
+
+- name: Rebalance {{ ac_ring.name }} ring
+  command: 'swift-ring-builder {{ ac_ring.name }}.builder rebalance {{ rebalance_mode }}'
+  ignore_errors: yes
+  args:
+    chdir: /etc/swift
+

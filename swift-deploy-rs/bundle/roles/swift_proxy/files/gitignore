@@ -1,0 +1,13 @@
+*.builder
+*.ring.gz
+account-server/*
+account-server.conf
+backups/*
+container-reconciler.conf
+container-server/*
+container-server.conf
+object-expirer.conf
+object-server/*
+object-server.conf
+proxy-server/*
+swift.conf

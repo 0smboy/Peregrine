@@ -1,0 +1,25 @@
+[package]
+name = "swift-container-server"
+description = "Container server for the Rust implementation of OpenStack Swift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+swift-core = { path = "../swift-core" }
+swift-db = { path = "../swift-db" }
+swift-http = { path = "../swift-http" }
+swift-ring = { path = "../swift-ring" }
+serde_json = "1"
+hmac = "0.12"
+sha1 = "0.10"
+
+# The server binary (src/main.rs) is auto-detected as `swift-container-server`.
+[[bin]]
+name = "swift-container-updater"
+path = "src/bin/container_updater.rs"
+
+[dev-dependencies]
+swift-db = { path = "../swift-db" }
+swift-account-server = { path = "../swift-account-server" }

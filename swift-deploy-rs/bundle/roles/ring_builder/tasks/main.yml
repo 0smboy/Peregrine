@@ -1,0 +1,54 @@
+---
+- block:
+  - block:
+    - name: Generate uniq dir name for distribute
+      shell: uuidgen
+      register: uniq_dir
+    - name: Make uniq_dir
+      shell: "mkdir /tmp/{{ uniq_dir.stdout }}"
+    - name: Set uniq_dir fact
+      set_fact:
+        uniq_dir: "{{ uniq_dir.stdout }}"
+    run_once: yes
+    delegate_to: localhost
+
+  - block:
+    - name: Fetch swift.conf
+      fetch: src=/{{ swift_dir }}/swift.conf
+             dest=/tmp/{{ uniq_dir }}
+      when: inventory_hostname == groups['proxy_servers'][0]
+
+    - name: Distribute swift.conf files to all hosts
+      copy: src=/tmp/{{ uniq_dir }}/{{ groups['proxy_servers'][0] }}/{{ swift_dir }}/swift.conf
+            dest=/etc/swift
+            force=yes
+  when: ADD_NODES
+
+- name: Deliver swift.conf
+  template: src=templates/swift.conf.j2
+            dest=/etc/swift/swift.conf
+  when: not ADD_NODES
+
+- include: ac_ring.yml
+  with_items:
+  - name: account
+    port: "{{ account_server_bind_port }}"
+    nodes: "{{ account_ring }}"
+    swift_partition_power: "{{ account_swift_partition_power }}"
+    swift_replicas: "{{ account_swift_replicas }}"
+    swift_minimum_time: "{{ account_swift_minimum_time }}"
+  - name: container
+    port: "{{ container_server_bind_port }}"
+    nodes: "{{ container_ring }}"
+    swift_partition_power: "{{ container_swift_partition_power }}"
+    swift_replicas: "{{ container_swift_replicas }}"
+    swift_minimum_time: "{{ container_swift_minimum_time }}"
+  loop_control:
+      loop_var: ac_ring
+  when: inventory_hostname == groups['proxy_servers'][0]
+
+- include: object_ring.yml
+  with_items: "{{ object_rings }}"
+  loop_control:
+      loop_var: object_ring
+  when: inventory_hostname == groups['proxy_servers'][0]

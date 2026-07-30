@@ -1,0 +1,20 @@
+[Unit]
+Description=Swift Deploy Rust control console
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/swift-deploy
+StateDirectory=swift-deploy
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/swift-deploy ui --bind 127.0.0.1 --port 8788 --bundle /opt/swift-deploy/bundle --inventory /opt/swift-deploy/bundle/config_sample/swift_hosts --playbook /opt/swift-deploy/bundle/swift.yml --plan /var/lib/swift-deploy/swift-plan.json --auth-token-file /etc/swift-deploy/ui-token
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

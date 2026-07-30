@@ -1,0 +1,44 @@
+name: swift-keystone
+description: Swift with Keystone v3 (set real endpoints)
+auth:
+  type: keystone_v3
+  url: http://keystone.example:5000/v3
+  username: demo
+  password: secret
+  project_name: demo
+  user_domain_name: Default
+  project_domain_name: Default
+storage:
+  type: swift
+  # empty endpoint uses catalog storage_url from keystone when available
+  endpoint: ""
+  timeout_ms: 60000
+stages:
+  - name: init
+    kind: init
+    workers: 1
+    total_ops: 1
+    sequential: true
+    operations:
+      - type: create_container
+        ratio: 100
+    objects:
+      cprefix: cbrs-
+      containers: { start: 1, end: 1 }
+      oprefix: o
+      objects: { start: 1, end: 1 }
+      size: 1
+  - name: prepare
+    kind: prepare
+    workers: 4
+    total_ops: 50
+    sequential: true
+    operations:
+      - type: write
+        ratio: 100
+    objects:
+      cprefix: cbrs-
+      containers: { start: 1, end: 1 }
+      oprefix: o
+      objects: { start: 1, end: 50 }
+      size: 65536

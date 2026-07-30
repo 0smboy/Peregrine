@@ -1,0 +1,125 @@
+#---------------------------------------------------------------------
+# Example configuration for a possible web application.  See the
+# full configuration options online.
+#
+#   http://haproxy.1wt.eu/download/1.4/doc/configuration.txt
+#
+#---------------------------------------------------------------------
+
+#---------------------------------------------------------------------
+# Global settings
+#---------------------------------------------------------------------
+global
+    # to have these messages end up in /var/log/haproxy.log you will
+    # need to:
+    #
+    # 1) configure syslog to accept network log events.  This is done
+    #    by adding the '-r' option to the SYSLOGD_OPTIONS in
+    #    /etc/sysconfig/syslog
+    #
+    # 2) configure local2 events to go to the /var/log/haproxy.log
+    #   file. A line like the following can be added to
+    #   /etc/sysconfig/syslog
+    #
+    #    local2.*                       /var/log/haproxy.log
+    #
+    log         127.0.0.1 local2
+
+    chroot      /var/lib/haproxy
+    pidfile     /var/run/haproxy.pid
+    maxconn     {{ haproxy_max_conn }}
+    nbproc      {{ haproxy_process_num }}
+{% for i in range(0, haproxy_process_num) %}
+    cpu-map     {{ i + 1 }} {{ i }}
+{% endfor %}
+    user        haproxy
+    group       haproxy
+    daemon
+
+    # turn on stats unix socket
+    stats socket /var/lib/haproxy/stats
+
+#---------------------------------------------------------------------
+# common defaults that all the 'listen' and 'backend' sections will
+# use if not designated in their block
+#---------------------------------------------------------------------
+defaults
+    mode                    http
+    log                     global
+    option                  httplog
+    option                  dontlognull
+    option http-server-close
+    option forwardfor       except 127.0.0.0/8
+    option                  redispatch
+    retries                 3
+    timeout http-request    10s
+    timeout queue           1m
+    timeout connect         10s
+    timeout client          1m
+    timeout server          1m
+    timeout http-keep-alive 10s
+    timeout check           10s
+    maxconn                 30000
+
+#---------------------------------------------------------------------
+# main frontend which proxys to the backends
+#---------------------------------------------------------------------
+frontend   main
+{% if lb_mode == "http" %}
+    bind *:{{ haproxy_storage_port }}
+{% elif lb_mode == "https" %}
+    bind *:{{ haproxy_storage_port }}  ssl crt  /etc/haproxy/haproxyCA.pem
+{% endif %}
+    default_backend             proxy_app
+#---------------------------------------------------------------------
+# haproxy monitor web
+#---------------------------------------------------------------------
+listen mariadb_cluster 
+    bind 0.0.0.0:{{ haproxy_mariadb_port }}
+## MariaDB balance leastconn - the cluster listening on port 3030.
+    mode tcp
+    balance leastconn
+    option httpchk
+{% for item in mariadb_storage_network_addresses %}
+    server  {{ hostname_prefix }}{{ item.split('.')[-1] }}  {{item}}:{{ mariadb_bind_port }} check port {{ mariadb_check_bind_port }}
+{% endfor %}
+
+# keystone_admin_internal_api服务
+listen keystone_admin_cluster
+    bind *:35357
+    balance roundrobin
+    option  tcpka
+    # option  httpchk
+    option  tcplog
+{% for item in keystone_storage_network_addresses %}
+    server {{ hostname_prefix }}{{ item.split('.')[-1] }}  {{item}}:{{ uwsgi_keystone_admin_service_port }} check inter 2000 rise 2 fall 5
+{% endfor %}
+
+# keystone_public _api服务
+listen keystone_public_cluster
+    bind *:5000
+    balance roundrobin
+    option  tcpka
+    # option  httpchk
+    option  tcplog
+{% for item in keystone_storage_network_addresses %}
+    server  {{ hostname_prefix }}{{ item.split('.')[-1] }}  {{item}}:{{ uwsgi_keystone_public_service_port }} check inter 2000 rise 2 fall 5
+{% endfor %}
+
+listen stats
+    mode http
+    bind *:{{ haproxy_monitor_port }}
+    stats enable
+    stats hide-version
+    stats uri     /haproxyadmin?stats
+    stats realm   Haproxy\ Statistics
+    stats auth    {{ haproxy_stats_user }}:{{ haproxy_stats_password }}
+    stats admin if TRUE
+#---------------------------------------------------------------------
+# round robin balancing between the various backends
+#---------------------------------------------------------------------
+backend proxy_app
+    balance     roundrobin
+{% for node in back_apps.nodes %}
+    server  {{ back_apps.name_prefix }}{{ loop.index }}  {{ node.proxy_server_ip }}:{{ node.port }}  maxconn  {{node.maxconn }} check  weight {{ node.weight }}
+{% endfor %}

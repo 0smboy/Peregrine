@@ -1,0 +1,70 @@
+---
+# Install the prebuilt Rust Swift binaries and the liberasurecode shared
+# library family. The payload lives INSIDE the bundle (sealed by the bundle
+# fingerprint) at roles/rust_payload/files/{bin,lib} — see PAYLOAD.md for how
+# it is populated from /root/swift-rust-bundle on the control machine.
+# copy compares content, so re-applies converge with changed=0.
+
+- name: install the swift binaries
+  copy:
+    src: "bin/{{ item }}"
+    dest: "/usr/local/bin/{{ item }}"
+    mode: "0755"
+  with_items:
+    - swift-account-info
+    - swift-account-server
+    - swift-container-info
+    - swift-container-server
+    - swift-db-auditor
+    - swift-db-replicator
+    - swift-drive-audit
+    - swift-get-nodes
+    - swift-manage-shard-ranges
+    - swift-object-auditor
+    - swift-object-info
+    - swift-object-reconstructor
+    - swift-object-replicator
+    - swift-object-server
+    - swift-object-updater
+    - swift-proxy-server
+    - swift-recon
+    - swift-ring-builder
+    - swift-ring-info
+
+# /usr/local/lib + an explicit ld.so.conf.d entry works identically on
+# Rocky/Alma AND Debian (where /usr/lib64 is not in the loader path)
+- name: register /usr/local/lib with the dynamic loader
+  copy:
+    content: "/usr/local/lib\n"
+    dest: /etc/ld.so.conf.d/swift-rust.conf
+    mode: "0644"
+
+- name: install the erasure-coding shared libraries
+  copy:
+    src: "lib/{{ item }}"
+    dest: "/usr/local/lib/{{ item }}"
+    mode: "0755"
+  register: rust_libs_copy
+  with_items:
+    - liberasurecode.so.1.8.0
+    - liberasurecode.so.1
+    - liberasurecode.so
+    - liberasurecode_rs_vand.so.1.0.1
+    - liberasurecode_rs_vand.so.1
+    - liberasurecode_rs_vand.so
+    - libnullcode.so.1.0.1
+    - libnullcode.so.1
+    - libnullcode.so
+    - libXorcode.so.1.0.1
+    - libXorcode.so.1
+    - libXorcode.so
+
+- name: refresh the shared library cache
+  command: ldconfig
+  changed_when: false
+
+- name: verify liberasurecode is resolvable
+  shell: ldconfig -p | grep -q liberasurecode && echo OK
+  register: rust_ldconfig_check
+  changed_when: false
+  failed_when: rust_ldconfig_check.stdout.find('OK') == -1

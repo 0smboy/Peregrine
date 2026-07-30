@@ -1,0 +1,131 @@
+// Copyright (c) 2026 OpenStack Foundation
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! The account/container DB auditor core, ported from the audit path of
+//! `swift/{account,container}/auditor.py`: walk a device's DB tree, open
+//! each broker, and confirm `get_info` succeeds (a broken DB fails to
+//! open or query). Reports a tally; quarantining of corrupt DBs is left
+//! to the daemon (we only classify).
+//!
+//! Deferred: the daemon loop, per-row consistency checks, and the
+//! actual quarantine move.
+
+use std::path::{Path, PathBuf};
+
+use crate::{AccountBroker, ContainerBroker};
+
+/// Result of a DB audit pass.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DbAuditReport {
+    pub passed: u64,
+    pub failed: u64,
+    pub failed_paths: Vec<PathBuf>,
+}
+
+/// Find every `<hash>.db` under `<device>/<datadir>/<part>/<suffix>/<hash>/`.
+pub fn db_locations(device_path: &Path, datadir: &str) -> Vec<PathBuf> {
+    let root = device_path.join(datadir);
+    let mut out = Vec::new();
+    let Ok(parts) = std::fs::read_dir(&root) else {
+        return out;
+    };
+    for part in parts.flatten() {
+        let Ok(suffixes) = std::fs::read_dir(part.path()) else {
+            continue;
+        };
+        for suffix in suffixes.flatten() {
+            if suffix.file_name().to_string_lossy().len() != 3 {
+                continue;
+            }
+            let Ok(hashes) = std::fs::read_dir(suffix.path()) else {
+                continue;
+            };
+            for hash in hashes.flatten() {
+                let Ok(files) = std::fs::read_dir(hash.path()) else {
+                    continue;
+                };
+                for f in files.flatten() {
+                    let name = f.file_name();
+                    if name.to_string_lossy().ends_with(".db") {
+                        out.push(f.path());
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Audit every container DB on a device.
+pub fn audit_container_dbs(device_path: &Path) -> DbAuditReport {
+    let mut report = DbAuditReport::default();
+    for db in db_locations(device_path, "containers") {
+        let mut broker = ContainerBroker::new(&db, "", "");
+        match broker.get_info() {
+            Ok(_) => report.passed += 1,
+            Err(_) => {
+                report.failed += 1;
+                report.failed_paths.push(db);
+            }
+        }
+    }
+    report
+}
+
+/// Audit every account DB on a device.
+pub fn audit_account_dbs(device_path: &Path) -> DbAuditReport {
+    let mut report = DbAuditReport::default();
+    for db in db_locations(device_path, "accounts") {
+        let mut broker = AccountBroker::new(&db, "");
+        match broker.get_info() {
+            Ok(_) => report.passed += 1,
+            Err(_) => {
+                report.failed += 1;
+                report.failed_paths.push(db);
+            }
+        }
+    }
+    report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_container_db_audit() {
+        let dir = std::env::temp_dir().join(format!("swift-dbaudit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("sda1");
+        // a healthy DB at a hash path
+        let hd = device.join("containers/0/abc/00000000000000000000000000000abc");
+        std::fs::create_dir_all(&hd).unwrap();
+        let good = hd.join("00000000000000000000000000000abc.db");
+        let mut b = ContainerBroker::new(&good, "a", "c");
+        b.initialize("1751500000.00000", 0, "1751500000.00000", "id").unwrap();
+        b.get_info().unwrap();
+
+        // a corrupt DB
+        let hd2 = device.join("containers/0/def/00000000000000000000000000000def");
+        std::fs::create_dir_all(&hd2).unwrap();
+        std::fs::write(hd2.join("00000000000000000000000000000def.db"), b"not a db").unwrap();
+
+        let report = audit_container_dbs(&device);
+        assert_eq!(report.passed, 1, "{report:?}");
+        assert_eq!(report.failed, 1, "{report:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

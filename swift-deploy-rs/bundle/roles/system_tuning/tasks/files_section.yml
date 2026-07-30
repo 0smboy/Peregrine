@@ -1,0 +1,57 @@
+---
+- include:  keys_values.yml  file_path={{ system_tuning_file.file_path }}
+  with_items: "{{ system_tuning_file.sections }}"
+  loop_control:
+     loop_var: file_sections
+  register: result
+
+- name: Load sysctl.conf config
+  shell: 'sysctl -p'
+  when: "result and {{ system_tuning_file.file_path.find('sysctl') != -1 }}"
+- name: Set services to restart
+  set_fact:
+     service_objects:
+         - haproxy
+  when: "result and {{ system_tuning_file.file_path.find('haproxy') != -1 }}"
+- name: Set services to restart
+  set_fact:
+     service_objects:
+         - keepalived
+  when: "result and {{ system_tuning_file.file_path.find('keepalived') != -1 }}"
+- name: Set services to restart
+  set_fact:
+     service_objects:
+         - openstack-swift-proxy
+  when: "result and {{ system_tuning_file.file_path.find('haproxy') == -1 }} and {{ system_tuning_file.file_path.find('proxy') != -1 }}"
+- name: Set services to restart
+  set_fact:
+     service_objects:
+         - openstack-swift-account
+         - openstack-swift-account-auditor
+         - openstack-swift-account-reaper
+         - openstack-swift-account-replicator
+  when: "result and {{ system_tuning_file.file_path.find('account') != -1 }}"
+- name: Set services to restart
+  set_fact:
+     service_objects:
+         - openstack-swift-container
+         - openstack-swift-container-auditor
+         - openstack-swift-container-replicator
+         - openstack-swift-container-updater
+         - openstack-swift-container-reconciler
+  when: "result and {{ system_tuning_file.file_path.find('container') != -1 }}"
+- name: Set services to restart
+  set_fact:
+     service_objects:
+         - openstack-swift-object
+         - openstack-swift-object-auditor
+         - openstack-swift-object-replicator
+         - openstack-swift-object-reconstructor
+         - openstack-swift-object-expirer
+         - openstack-swift-container-updater
+  when: "result and {{ system_tuning_file.file_path.find('object') != -1 }}"
+
+- name: Restart services
+  service: name={{ item }} enabled=yes state=restarted
+  with_items: "{{ service_objects | default([]) }}"
+  when: "result"

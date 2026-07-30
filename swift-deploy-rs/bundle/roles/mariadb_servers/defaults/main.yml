@@ -1,0 +1,10 @@
+---
+# defaults for galera-cluster
+mariadb_clustercheck_user: clustercheckuser
+# No default password: generated workspaces must provide a unique value.
+mariadb_cluster_name: mariadb_cluster
+mariadb_retry_autocommit: 10
+mariadb_slave_threads: 8
+mariadb_gcache_page_size: 1G
+mariadb_gcache_size: 1G
+mariadb_gcache_recover: yes

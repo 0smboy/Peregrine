@@ -1,0 +1,48 @@
+---
+# file: roles/galera/tasks/config.yml
+- name: Enabling mariadb service
+  service: name=mariadb
+    enabled=yes
+
+- name: Creating /etc/my.cnf
+  template: src=etc/my.cnf.j2
+    dest=/etc/my.cnf
+  become: yes
+
+- name: Creating `/root/.my.cnf`  with root password credentials
+  template:
+    src: .my.cnf.j2
+    dest: /root/.my.cnf
+    owner: root
+    mode: 0600
+  become: yes
+
+- name: Startting Mariadb
+  service: name=mysqld
+    state=started
+  when: inventory_hostname == groups['mariadb_servers'][0]
+
+- name: Setting root password for localhost
+  command: mysql -u root --execute="alter user 'root'@'localhost' identified by '{{ mariadb_root_password }}';"
+  when: inventory_hostname == groups['mariadb_servers'][0]
+
+- name: Configuring mariadb cluster
+  template: src=etc/my.cnf.d/server.cnf.j2
+    dest=/etc/my.cnf.d/server.cnf
+
+- name: Removing wap-wsp* services from /etc/services
+  lineinfile: dest=/etc/services
+    state=absent
+    regexp="^wap-wsp         9200"
+
+- name: Adding mysqlchk /etc/services
+  lineinfile: dest=/etc/services
+    state=present
+    regexp="^mysqlchk"
+    insertafter="sun-as-jpda     9191/udp"
+    line="mysqlchk        {{ mariadb_check_bind_port }}/tcp                {{ '#' }} Mariadb Clustercheck"
+
+- name: Setting mariadb cluster hosts
+  lineinfile: dest=/etc/hosts
+    line="{{item}} {{ hostname_prefix }}{{ item.split('.')[-1] }}"
+  with_items: "{{ groups['mariadb_servers'] }}"

@@ -1,0 +1,10 @@
+---
+- name: Stoping mariadb service
+  command: systemctl stop mariadb
+
+- name: Starting mariadb service on mariadb master node
+  command: galera_new_cluster
+  when: inventory_hostname == groups['mariadb_servers'][0]
+
+- name: Syncing other nodes to the mariadb master node
+  command: systemctl start mariadb

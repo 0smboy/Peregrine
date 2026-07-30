@@ -1,0 +1,37 @@
+---
+# Shared per-unit steps. Parameters (set by the including task):
+#   unit_name, svc_description, svc_bin, svc_args, svc_conf
+
+- name: install the unit file
+  template:
+    src: swift-service.j2
+    dest: "/etc/systemd/system/{{ unit_name }}.service"
+    mode: "0644"
+  register: rust_unit_file
+
+- name: probe the unit state
+  shell: |
+    if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then
+      echo RUNNING
+    else
+      echo STOPPED
+    fi
+  register: rust_unit_probe
+  changed_when: false
+
+- name: enable and start the unit
+  systemd:
+    name: "{{ unit_name }}"
+    daemon_reload: yes
+    enabled: yes
+    state: started
+  when: rust_unit_probe.stdout.find('RUNNING') == -1
+
+- name: restart the unit after a unit-file change
+  systemd:
+    name: "{{ unit_name }}"
+    daemon_reload: yes
+    state: restarted
+  when:
+    - rust_unit_file.changed
+    - rust_unit_probe.stdout.find('RUNNING') != -1

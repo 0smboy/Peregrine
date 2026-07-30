@@ -1,0 +1,12 @@
+---
+- name: Install MariaDB
+  hosts: mariadb_servers
+  tags: install_standalone_mariadb
+  roles:
+  - mariadb_servers
+
+- name: Install Keystone
+  hosts: keystones
+  tags: install_standalone_keystone
+  roles:
+  - keystone_install

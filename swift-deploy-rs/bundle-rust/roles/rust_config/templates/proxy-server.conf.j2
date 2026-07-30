@@ -1,0 +1,31 @@
+# {{ ansible_managed }}
+# Parsed by swift-proxy-server ([app:proxy-server] + [filter:tempauth]).
+# storage_url is what tempauth hands back as X-Storage-Url: the load
+# balancer entry point when use_lb, otherwise this node's business address.
+
+[app:proxy-server]
+bind_ip = 0.0.0.0
+bind_port = {{ proxy_bind_port }}
+account_autocreate = true
+{% if use_lb %}
+storage_url = http://{{ auth_url_ip }}:{{ swift_lb_port }}
+{% else %}
+storage_url = http://{{ business_network_address }}:{{ proxy_bind_port }}
+{% endif %}
+# statsd -> local statsd_exporter (bundle-monitoring). The proxy uses
+# log_statsd_metric_prefix VERBATIM and already embeds "proxy-server" in the
+# metric names it emits, so the prefix stays empty; metrics arrive as
+# proxy-server.<METHOD>.<status> / proxy-server.timing.
+log_statsd_host = 127.0.0.1
+log_statsd_port = 9125
+log_statsd_metric_prefix =
+# native OTLP/HTTP trace export: one span per client request. Empty
+# endpoint disables tracing entirely (zero overhead).
+trace_endpoint = {{ trace_endpoint | default('') }}
+trace_sample_ratio = {{ trace_sample_ratio | default('1.0') }}
+
+[filter:tempauth]
+{% for entry in swift_tempauth_users %}
+user_{{ entry.account }}_{{ entry.user }} = {{ entry.key }}{% if entry.get('admin', false) %} .admin{% endif %}
+
+{% endfor %}

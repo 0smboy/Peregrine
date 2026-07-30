@@ -1,0 +1,12 @@
+---
+- block:
+  - name: Checking mariadb cluster size
+    command: mysql -u root -p{{ mariadb_root_password }} -e "SHOW STATUS LIKE 'wsrep_cluster_size'"
+    register: wsrep_cluster_size
+  - debug: msg="{{ wsrep_cluster_size.stdout_lines | replace("\\t", ":> ") | replace(">", "")}}"
+  
+  - name: Checking mariadb cluster health status
+    command: /usr/bin/clustercheck
+    register: clustercheck
+  - debug: msg='{{ clustercheck.stdout_lines}}'
+  when: inventory_hostname==groups['mariadb_servers'][0]

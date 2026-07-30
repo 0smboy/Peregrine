@@ -1,0 +1,32 @@
+---
+# swift-deploy-rs "rust" stack playbook.
+#
+# Deploys the Rust-version OpenStack Swift (tempauth, replication + optional
+# EC policy). Plays are roles-only: the planner reads `hosts:` + `roles:`.
+# Conditional roles use role-level `when:` (play-level keys other than
+# hosts/roles are not interpreted by the executor's planner).
+
+- hosts: all
+  roles:
+    - rust_common
+    - rust_payload
+
+- hosts: storage_nodes
+  roles:
+    - rust_disks
+    - rust_replication_key
+
+- hosts: all
+  roles:
+    - rust_config
+    - rust_rings
+    - rust_systemd
+
+- hosts: haproxy_servers
+  roles:
+    - role: rust_haproxy
+      when: use_lb
+
+- hosts: proxy_servers
+  roles:
+    - rust_verify

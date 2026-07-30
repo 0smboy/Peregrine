@@ -1,0 +1,348 @@
+{
+ "body": "hello swift world",
+ "etag": "ad8c2f597e09bcffe1c74c74a8308607",
+ "hash_suffix": "changeme",
+ "requests": [
+  {
+   "body": "hello swift world",
+   "headers": {
+    "Content-Length": "17",
+    "Content-Type": "text/plain",
+    "X-Object-Meta-Color": "blue",
+    "X-Timestamp": "1751500001.00000"
+   },
+   "label": "put",
+   "method": "PUT",
+   "path": "/sda1/0/a/c/o",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8",
+    "Etag": "\"ad8c2f597e09bcffe1c74c74a8308607\""
+   },
+   "status": 201
+  },
+  {
+   "body": "hello swift world",
+   "headers": {
+    "Content-Length": "17",
+    "Content-Type": "text/plain",
+    "ETag": "deadbeef",
+    "X-Timestamp": "1751500001.00000"
+   },
+   "label": "put-bad-etag",
+   "method": "PUT",
+   "path": "/sda1/0/a/c/o2",
+   "response_body": "<html><h1>Unprocessable Entity</h1><p>Unable to process the contained instructions</p></html>",
+   "response_headers": {
+    "Content-Length": "93",
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 422
+  },
+  {
+   "body": "abc",
+   "headers": {
+    "Content-Length": "3",
+    "X-Timestamp": "1751500001.00000"
+   },
+   "label": "put-no-ctype",
+   "method": "PUT",
+   "path": "/sda1/0/a/c/o3",
+   "response_body": "No content type",
+   "response_headers": {
+    "Content-Length": "15",
+    "Content-Type": "text/plain"
+   },
+   "status": 400
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "head",
+   "method": "HEAD",
+   "path": "/sda1/0/a/c/o",
+   "response_body": "",
+   "response_headers": {
+    "Content-Length": "17",
+    "Content-Type": "text/plain",
+    "Etag": "\"ad8c2f597e09bcffe1c74c74a8308607\"",
+    "X-Backend-Data-Timestamp": "1751500001.00000",
+    "X-Backend-Timestamp": "1751500001.00000",
+    "X-Object-Meta-Color": "blue",
+    "X-Timestamp": "1751500001.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "get",
+   "method": "GET",
+   "path": "/sda1/0/a/c/o",
+   "response_body": "hello swift world",
+   "response_headers": {
+    "Content-Length": "17",
+    "Content-Type": "text/plain",
+    "Etag": "\"ad8c2f597e09bcffe1c74c74a8308607\"",
+    "X-Backend-Data-Timestamp": "1751500001.00000",
+    "X-Backend-Timestamp": "1751500001.00000",
+    "X-Object-Meta-Color": "blue",
+    "X-Timestamp": "1751500001.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "",
+   "headers": {
+    "Range": "bytes=0-4"
+   },
+   "label": "get-range",
+   "method": "GET",
+   "path": "/sda1/0/a/c/o",
+   "response_body": "hello",
+   "response_headers": {
+    "Content-Length": "5",
+    "Content-Range": "bytes 0-4/17",
+    "Content-Type": "text/plain",
+    "Etag": "\"ad8c2f597e09bcffe1c74c74a8308607\"",
+    "X-Backend-Data-Timestamp": "1751500001.00000",
+    "X-Backend-Timestamp": "1751500001.00000",
+    "X-Object-Meta-Color": "blue",
+    "X-Timestamp": "1751500001.00000"
+   },
+   "status": 206
+  },
+  {
+   "body": "",
+   "headers": {
+    "Range": "bytes=-5"
+   },
+   "label": "get-suffix-range",
+   "method": "GET",
+   "path": "/sda1/0/a/c/o",
+   "response_body": "world",
+   "response_headers": {
+    "Content-Length": "5",
+    "Content-Range": "bytes 12-16/17",
+    "Content-Type": "text/plain",
+    "Etag": "\"ad8c2f597e09bcffe1c74c74a8308607\"",
+    "X-Backend-Data-Timestamp": "1751500001.00000",
+    "X-Backend-Timestamp": "1751500001.00000",
+    "X-Object-Meta-Color": "blue",
+    "X-Timestamp": "1751500001.00000"
+   },
+   "status": 206
+  },
+  {
+   "body": "",
+   "headers": {
+    "Range": "bytes=100-200"
+   },
+   "label": "get-unsat-range",
+   "method": "GET",
+   "path": "/sda1/0/a/c/o",
+   "response_body": "<html><h1>Requested Range Not Satisfiable</h1><p>The Range requested is not available.</p></html>",
+   "response_headers": {
+    "Content-Length": "97",
+    "Content-Range": "bytes */17",
+    "Content-Type": "text/plain",
+    "Etag": "\"ad8c2f597e09bcffe1c74c74a8308607\"",
+    "X-Backend-Data-Timestamp": "1751500001.00000",
+    "X-Backend-Timestamp": "1751500001.00000",
+    "X-Object-Meta-Color": "blue",
+    "X-Timestamp": "1751500001.00000"
+   },
+   "status": 416
+  },
+  {
+   "body": "",
+   "headers": {
+    "Content-Type": "text/html",
+    "X-Object-Meta-Color": "red",
+    "X-Timestamp": "1751500002.00000"
+   },
+   "label": "post",
+   "method": "POST",
+   "path": "/sda1/0/a/c/o",
+   "response_body": "<html><h1>Accepted</h1><p>The request is accepted for processing.</p></html>",
+   "response_headers": {
+    "Content-Length": "76",
+    "Content-Type": "text/html; charset=UTF-8",
+    "X-Backend-Content-Type": "text/html"
+   },
+   "status": 202
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "head-after-post",
+   "method": "HEAD",
+   "path": "/sda1/0/a/c/o",
+   "response_body": "",
+   "response_headers": {
+    "Content-Length": "17",
+    "Content-Type": "text/html",
+    "Etag": "\"ad8c2f597e09bcffe1c74c74a8308607\"",
+    "X-Backend-Data-Timestamp": "1751500001.00000",
+    "X-Backend-Timestamp": "1751500002.00000",
+    "X-Object-Meta-Color": "red",
+    "X-Timestamp": "1751500002.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Timestamp": "1751500000.00000"
+   },
+   "label": "post-stale",
+   "method": "POST",
+   "path": "/sda1/0/a/c/o",
+   "response_body": "<html><h1>Conflict</h1><p>There was a conflict when trying to complete your request.</p></html>",
+   "response_headers": {
+    "Content-Length": "95",
+    "Content-Type": "text/html; charset=UTF-8",
+    "X-Backend-Timestamp": "1751500002.00000"
+   },
+   "status": 409
+  },
+  {
+   "body": "hi",
+   "headers": {
+    "Content-Length": "2",
+    "Content-Type": "text/plain",
+    "X-Timestamp": "1751500005.00000"
+   },
+   "label": "put-newer",
+   "method": "PUT",
+   "path": "/sda1/0/a/c/o",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8",
+    "Etag": "\"49f68a5c8493ec2c0bf489821c21fc3b\""
+   },
+   "status": 201
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "get-after-newer",
+   "method": "GET",
+   "path": "/sda1/0/a/c/o",
+   "response_body": "hi",
+   "response_headers": {
+    "Content-Length": "2",
+    "Content-Type": "text/plain",
+    "Etag": "\"49f68a5c8493ec2c0bf489821c21fc3b\"",
+    "X-Backend-Data-Timestamp": "1751500005.00000",
+    "X-Backend-Timestamp": "1751500005.00000",
+    "X-Timestamp": "1751500005.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Timestamp": "1751500003.00000"
+   },
+   "label": "delete-stale",
+   "method": "DELETE",
+   "path": "/sda1/0/a/c/o",
+   "response_body": "<html><h1>Conflict</h1><p>There was a conflict when trying to complete your request.</p></html>",
+   "response_headers": {
+    "Content-Length": "95",
+    "Content-Type": "text/html; charset=UTF-8",
+    "X-Backend-Content-Type": "text/plain",
+    "X-Backend-Timestamp": "1751500005.00000"
+   },
+   "status": 409
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Timestamp": "1751500006.00000"
+   },
+   "label": "delete",
+   "method": "DELETE",
+   "path": "/sda1/0/a/c/o",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8",
+    "X-Backend-Content-Type": "text/plain",
+    "X-Backend-Timestamp": "1751500006.00000"
+   },
+   "status": 204
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "get-after-delete",
+   "method": "GET",
+   "path": "/sda1/0/a/c/o",
+   "response_body": "<html><h1>Not Found</h1><p>The resource could not be found.</p></html>",
+   "response_headers": {
+    "Content-Length": "70",
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 404
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "head-missing",
+   "method": "HEAD",
+   "path": "/sda1/0/a/c/nope",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 404
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Timestamp": "1751500006.00000"
+   },
+   "label": "delete-missing",
+   "method": "DELETE",
+   "path": "/sda1/0/a/c/nope",
+   "response_body": "<html><h1>Not Found</h1><p>The resource could not be found.</p></html>",
+   "response_headers": {
+    "Content-Length": "70",
+    "Content-Type": "text/html; charset=UTF-8",
+    "X-Backend-Content-Type": "",
+    "X-Backend-Timestamp": "1751500006.00000"
+   },
+   "status": 404
+  },
+  {
+   "body": "",
+   "headers": {
+    "Content-Length": "0",
+    "Content-Type": "t"
+   },
+   "label": "put-no-ts",
+   "method": "PUT",
+   "path": "/sda1/0/a/c/o5",
+   "response_body": "Missing X-Timestamp header",
+   "response_headers": {
+    "Content-Length": "26",
+    "Content-Type": "text/plain"
+   },
+   "status": 400
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "bad-method",
+   "method": "PATCH",
+   "path": "/sda1/0/a/c/o",
+   "response_body": "<html><h1>Method Not Allowed</h1><p>The method is not allowed for this resource.</p></html>",
+   "response_headers": {
+    "Content-Length": "91",
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 405
+  }
+ ]
+}

@@ -1,0 +1,23 @@
+---
+- hosts: all
+  roles:
+  - ring_builder
+  tags: ring_builder
+
+- hosts: all
+  any_errors_fatal: true
+  roles:
+  - ring_utils
+  tags: distribute_ring_builder
+
+- hosts: haproxy_servers
+  roles:
+  - haproxy_servers
+
+- hosts: keepalived_servers
+  roles:
+  - keepalived_servers
+
+- hosts: all
+  roles:
+  - finalize_installation

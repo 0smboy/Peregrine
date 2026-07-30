@@ -1,0 +1,20 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Prometheus statsd exporter (swift metrics)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=monitor
+Group=monitor
+ExecStart=/usr/local/bin/statsd_exporter \
+  --statsd.listen-udp=127.0.0.1:{{ statsd_udp_port | default(9125) }} \
+  --statsd.listen-tcp=127.0.0.1:{{ statsd_udp_port | default(9125) }} \
+  --statsd.mapping-config=/etc/statsd-mapping.yml \
+  --web.listen-address={{ storage_network_address }}:{{ statsd_exporter_web_port | default(9102) }}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

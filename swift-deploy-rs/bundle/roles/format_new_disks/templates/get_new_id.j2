@@ -1,0 +1,28 @@
+#!/bin/bash
+lsblk | awk '{print $NF}' | grep "/srv/node" | awk -F "/" '{print $NF}'  > /tmp/test
+a=`cat /tmp/test`
+for i in $a
+do
+(echo $i | grep "hdd") &&  (echo $i | awk -F hdd '{print $NF}' >> /tmp/hdd) || (echo $i | awk -F ssd '{print $NF}' >> /tmp/ssd)
+x=`sort -n /tmp/ssd | awk 'END{print}'`
+y=`sort -n /tmp/hdd | awk 'END{print}'`
+done
+x=$[x+1]
+y=$[y+1]
+
+for j in {{ new_disks_to_format | join(' ') }}
+do
+new_disks_id=`ls -al /dev/disk/by-id/ | grep -E 'ata|scsi|sas' | grep $j | awk '{print $9}'`
+echo $new_disks_id >> /tmp/new_disks_id
+new_disk_hs_type=`cat /sys/block/$j/queue/rotational`
+dingchangx=`printf "%03d\n" $x`
+dingchangy=`printf "%03d\n" $y`
+if [ $new_disk_hs_type == 0 ]
+then
+echo ssd$dingchangx >> /tmp/new_disks_type
+x=$[x+1]
+else
+echo hdd$dingchangy >> /tmp/new_disks_type
+y=$[y+1]
+fi
+done

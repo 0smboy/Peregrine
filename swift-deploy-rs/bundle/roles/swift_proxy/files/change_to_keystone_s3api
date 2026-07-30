@@ -1,0 +1,4 @@
+#!/bin/bash
+cd /etc/swift/ && git checkout keystone_s3api 2> /dev/null
+chown root.swift /etc/swift/proxy-server.conf
+systemctl restart openstack-swift-proxy

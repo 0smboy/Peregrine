@@ -1,0 +1,64 @@
+// Copyright (c) 2026 OpenStack Foundation
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Account/container database backends, ported from `swift/common/db.py`
+//! and `swift/container/backend.py`.
+//!
+//! Everything here is a compatibility contract: the SQLite schemas
+//! (including trigger and view SQL, byte-for-byte), the `chexor` rolling
+//! hash, the `.pending` file format (`:`-separated base64 pickles) and
+//! the `merge_items` newest-wins semantics must match the Python
+//! implementation exactly, so Rust and Python brokers can share and
+//! replicate the same database files.
+//!
+//! This increment covers the container broker's core write/read path.
+//! Deferred: account backend, `db_replicator` protocol, sharding state
+//! machine, metadata column handling, reclaim.
+
+mod account;
+mod auditor;
+mod broker;
+mod container;
+mod repl_loop;
+mod replicator;
+mod shard;
+mod util;
+
+pub use account::{zero_like, AccountBroker, ContainerRecord, ListContainersArgs};
+pub use auditor::{audit_account_dbs, audit_container_dbs, db_locations, DbAuditReport};
+pub use broker::{py_json_dumps_metadata, py_json_parse_metadata, BrokerMetadata};
+pub use repl_loop::{
+    iter_db_partitions, repl_peers, run_once as replicator_run_once, DbPartition,
+    DbReplicateClient, ReplLoopStats,
+};
+pub use replicator::{
+    replicate_account_db, replicate_completion_rpc, replicate_container_db, rsync_db,
+    ReplicateOutcome, RsyncTransport,
+};
+pub use shard::{
+    merge_shards, resolve_shard_range_states, sift_shard_ranges, state as shard_state, ShardRange,
+    SHARD_RANGE_KEYS, SHARD_UPDATE_STATES,
+};
+pub use container::{
+    get_db_files, hash_container_name, make_db_file_path, make_shard_name, parse_db_filename,
+    shards_account_name, ContainerBroker, DbState, DbValue, FoundShardRange, GetShardRangesArgs,
+    ListObjectsArgs, ObjectRecord,
+};
+pub use util::{chexor, is_corruption_error, quarantine_db, renamer, DbError};
+
+/// Max size of a `.pending` file before puts are applied directly
+/// (`swift.common.db.PENDING_CAP`).
+pub const PENDING_CAP: u64 = 131072;
+pub const PICKLE_PROTOCOL: u8 = 2;

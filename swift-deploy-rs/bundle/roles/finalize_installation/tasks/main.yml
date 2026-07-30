@@ -1,0 +1,99 @@
+---
+- block:
+  - name: Create backup_dir
+    file: dest=/etc/.ostorage
+          state=directory
+    delegate_to: localhost
+  - name: Check  ring build file on ansible control node
+    find: paths="/etc/swift" recurse=no patterns="*.builder"
+    register: files_to_copy
+    when: inventory_hostname == groups['proxy_servers'][0]
+  - name: Ensure proper ownership on storage nodes
+    command: "{{ item }}"
+    with_items:
+    - mkdir -p /var/cache/swift
+    - chown -R swift:swift /srv/node
+    - chown -R root:swift /var/cache/swift
+    - chmod -R 775 /var/cache/swift
+    - restorecon -R /srv/node
+  - name: Ensure service state on storage nodes
+    service: name={{ item }} enabled=yes state=restarted
+    with_items:
+    - crond
+    - rsyncd
+    - chronyd
+    - rsyslog
+    - startup_automount
+  - name: Distribute monitor srv_node script
+    copy: src=files/monitor_node
+          dest=/usr/bin
+          mode=0755
+  - name: Set execute monitor_node script every 3 minutes
+    cron: name="check node permission"
+          minute="*/3"
+          state=present
+          job="/usr/bin/monitor_node"
+  when: inventory_hostname in groups['storage_nodes']
+  become: True
+
+- name: Ensure proper permission on all nodes
+  command: "{{ item }}"
+  ignore_errors: yes
+  with_items:
+  - chown -R root:swift /etc/swift
+  - chmod a+r /etc/swift/swift.conf
+  - setenforce 0
+  become: True
+
+- name: Disable selinux
+  lineinfile: dest=/etc/selinux/config
+              state=present
+              regexp="^SELINUX=.*"
+              line="SELINUX=disabled"
+
+- name: Ensure service state on proxy servers
+  when: inventory_hostname in groups['proxy_servers']
+  service: name={{ item }} enabled=yes state=restarted
+  with_items:
+  - openstack-swift-proxy
+  - memcached
+  - chronyd
+
+- name: Ensure service state on account servers
+  when: inventory_hostname in groups['account_servers']
+  service: name={{ item }} enabled=yes state=restarted
+  with_items:
+  - openstack-swift-account
+  - openstack-swift-account-auditor
+  - openstack-swift-account-reaper
+  - openstack-swift-account-replicator
+
+- name: Ensure service state on container servers
+  when: inventory_hostname in groups['container_servers']
+  service: name={{ item }} enabled=yes state=restarted
+  with_items:
+  - openstack-swift-container
+  - openstack-swift-container-auditor
+  - openstack-swift-container-replicator
+  - openstack-swift-container-updater
+  - openstack-swift-container-reconciler
+
+- name: Ensure service state on object servers
+  when: inventory_hostname in groups['object_servers']
+  service: name={{ item }} enabled=yes state=restarted
+  with_items:
+  - openstack-swift-object
+  - openstack-swift-object-auditor
+  - openstack-swift-object-replicator
+  - openstack-swift-object-reconstructor
+  - openstack-swift-object-expirer
+  - openstack-swift-object-updater
+
+- name: Ensure service state on haproxy servers
+  when: inventory_hostname in groups['haproxy_servers']
+  service: name=haproxy enabled=yes state=restarted
+
+- name: Ensure service state on keepalived servers
+  when: inventory_hostname in groups['keepalived_servers']
+  service: name=keepalived enabled=yes state=restarted
+

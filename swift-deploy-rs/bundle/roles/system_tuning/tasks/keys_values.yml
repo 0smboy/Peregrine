@@ -1,0 +1,56 @@
+---
+- name: Add values to {{ file_path }}
+  ini_file:
+      dest: '{{ file_path }}'
+      section: '{{ file_sections.name }}'
+      option: '{{ item.key }}'
+      value: '{{ item.value }}'
+      backup: no
+  with_dict: '{{ file_sections.add | default({}) }}'
+  when: "{{ file_sections.name !='no_ini_type_conf' and file_sections.name !='ini_type_cfg' }}"
+- name: Delete values to {{ file_path }}
+  ini_file:
+      dest: '{{ file_path }}'
+      section: '{{ file_sections.name }}'
+      option: '{{ item.key }}'
+      backup: no
+      state: absent
+  with_dict: '{{ file_sections.delete | default({}) }}'
+  when: "{{ file_sections.name != 'no_ini_type_conf' and file_sections.name !='ini_type_cfg' }}"
+- name: Add values to {{ file_path }}
+  lineinfile:
+      dest: '{{ file_path }}'
+      regexp: '^{{ item.key }}'
+      line: '{{ item.key }}={{ item.value }}'
+      state: present
+  with_dict: '{{ file_sections.add | default({}) }}'
+  when: "{{ file_sections.name == 'no_ini_type_conf' }}"
+- name: Delete values to {{ file_path }}
+  lineinfile:
+      dest: '{{ file_path }}'
+      regexp: '^{{ item.key }}'
+      line: '{{ item.key }}={{ item.value }}'
+      state: absent
+  with_dict: '{{ file_sections.delete | default({}) }}'
+  when: "{{ file_sections.name == 'no_ini_type_conf' }}"
+
+#  一下部分，有待扩展
+#- name: add values to {{ file_path }}
+#  lineinfile:
+#      dest: '{{ file_path }}'
+#      regexp: '^{{ item.line }}'
+#      insertafter: '{{ item.insertafter | default("") }}'
+#      line: '{{ item.line }}'
+#      state: '{{ item.state }}'
+#  with_dict: "{{ file_sections.add }}"
+#  when: "{{ file_sections.name == 'ini_type_cfg' }}"
+#- name: delete values to {{ file_path }}
+#  lineinfile:
+#      dest: '{{ file_path }}'
+#      regexp: '^{{ item.line }}'
+#      insertafter: '{{ item.insertafter | default("") }}'
+#      line: '{{ item.line }}'
+#      state: '{{ item.state }}'
+#  with_dict: "{{ file_sections.keys_values }}"
+#  when: "{{ file_sections.name == 'ini_type_cfg' }}"
+#

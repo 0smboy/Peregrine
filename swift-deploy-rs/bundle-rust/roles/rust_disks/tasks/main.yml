@@ -1,0 +1,18 @@
+---
+# Device preparation on storage nodes.
+#
+# rust stack v1 deploys DIRECTORY devices only: one device `d1` under
+# {{ srv_node_root }} on the node's root filesystem (the server confs set
+# mount_check = false). Block-device formatting/mounting is deliberately
+# excluded — it is destructive, was untestable in this environment, and
+# would force every rust plan to carry the disk_wipe capability. Prepare
+# and mount real disks out-of-band; a v2 role can add the managed path.
+# Workspace validation rejects custom_disks for the rust stack, so
+# custom_disks is always [] here.
+
+- name: create the directory device
+  file:
+    path: "{{ srv_node_root }}/d1"
+    state: directory
+    mode: "0755"
+  changed_when: false

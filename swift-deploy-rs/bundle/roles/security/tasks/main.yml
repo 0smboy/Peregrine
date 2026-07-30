@@ -1,0 +1,25 @@
+---
+- block:
+    - name: Clear SSH service bind settings
+      lineinfile:
+        dest: /etc/ssh/sshd_config
+        state: absent
+        regexp: "^{{ item }}.*"
+      with_items:
+        - "Port"
+        - "ListenAddress"
+    - name: Change SSH service bind settings
+      lineinfile:
+        dest: /etc/ssh/sshd_config
+        line: "{{ item }}"
+        insertafter: EOF
+      with_items:
+        - "Port {{ ssh_bind_port }}"
+        - "ListenAddress {{ management_network_address }}"
+
+- include: firewall.yml
+
+- name: Restart SSH service
+  service:
+    name: sshd
+    state: restarted

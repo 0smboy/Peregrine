@@ -1,0 +1,58 @@
+# swift-deploy-rs monitoring sample topology — a STRUCTURE EXAMPLE, never
+# deployable: applies from a config_sample path are permanently refused.
+#
+# The monitoring bundle targets `storage_nodes`, the same children group a
+# rust workspace emits, so a real apply reuses the rust project's inventory
+# unchanged. The other groups are kept (possibly empty) so shared validation
+# that expects the v3 group shapes keeps working.
+#
+# inventory_hostname is the management IP; ansible_user must be root.
+10.0.0.11 ansible_user=root ansible_port=22 ansible_ssh_private_key_file=/path/to/id_ed25519
+10.0.0.12 ansible_user=root ansible_port=22 ansible_ssh_private_key_file=/path/to/id_ed25519
+
+[ntp_server]
+10.0.0.11
+
+[ntp_clients]
+10.0.0.12
+
+[proxy_servers]
+10.0.0.11
+10.0.0.12
+
+[account_servers]
+10.0.0.11
+10.0.0.12
+
+[container_servers]
+10.0.0.11
+10.0.0.12
+
+[object_servers]
+10.0.0.11
+10.0.0.12
+
+[swift_nodes:children]
+proxy_servers
+account_servers
+container_servers
+object_servers
+
+[storage_nodes:children]
+account_servers
+container_servers
+object_servers
+
+[haproxy_servers]
+
+[keepalived_servers]
+
+[mariadb_servers]
+
+[keystones]
+
+[format_disk_servers]
+
+[performance_tuning]
+
+[proxyfs]

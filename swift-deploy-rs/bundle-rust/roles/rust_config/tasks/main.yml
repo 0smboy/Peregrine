@@ -1,0 +1,45 @@
+---
+# Render the swift configuration. swift.conf goes everywhere (servers,
+# replicators and CLI tools all read it); per-server confs only where the
+# host holds the matching role. Config drift restarts the swift units via
+# the handler (units are installed later by rust_systemd; on first deploy
+# the handler is a no-op because nothing is running yet).
+
+- name: render swift.conf
+  template:
+    src: swift.conf.j2
+    dest: /etc/swift/swift.conf
+    mode: "0644"
+  notify: restart swift services
+
+- name: render proxy-server.conf
+  template:
+    src: proxy-server.conf.j2
+    dest: /etc/swift/proxy-server.conf
+    mode: "0600"
+  when: "'proxy_servers' in group_names"
+  notify: restart swift services
+
+- name: render account-server.conf
+  template:
+    src: account-server.conf.j2
+    dest: /etc/swift/account-server.conf
+    mode: "0644"
+  when: "'account_servers' in group_names"
+  notify: restart swift services
+
+- name: render container-server.conf
+  template:
+    src: container-server.conf.j2
+    dest: /etc/swift/container-server.conf
+    mode: "0644"
+  when: "'container_servers' in group_names"
+  notify: restart swift services
+
+- name: render object-server.conf
+  template:
+    src: object-server.conf.j2
+    dest: /etc/swift/object-server.conf
+    mode: "0644"
+  when: "'object_servers' in group_names"
+  notify: restart swift services

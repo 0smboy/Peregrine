@@ -1,0 +1,53 @@
+*filter
+:INPUT DROP [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+
+# loopback: allow all
+-A INPUT -i lo -j ACCEPT
+# state RELATED,ESTABLISHED: allow all
+-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+# icmp: allow all
+-A INPUT -p icmp -j ACCEPT
+# vrrp: allow all
+-A INPUT -p vrrp -j ACCEPT
+
+# SET PRIVATE PORTS
+#
+# storage network
+-A INPUT -p tcp -m tcp --match multiport --dports {{ storage_network_ports|join(',') }} -s {{  storage_network_addresses|join(',') }} -j ACCEPT
+# management network
+-A INPUT -p tcp -m tcp --match multiport --dports {{ management_network_private_ports|join(',') }} -s {{  management_network_addresses|join(',') }} -j ACCEPT
+-A INPUT -p udp -m udp --match multiport --dports {{ chronyd_ports|join(',') }} -s {{  management_network_addresses|join(',') }} -j ACCEPT
+# business network
+-A INPUT -p tcp -m tcp --match multiport --dports {{ business_network_private_ports|join(',') }} -s {{  business_network_addresses|join(',') }} -j ACCEPT
+
+
+# SET PUBLIC PORTS
+#
+# business service ports: allow all
+-A INPUT -p tcp -m tcp --match multiport --dports {{ business_network_public_ports|join(',') }} -j ACCEPT
+# management service port: allow internal nodes
+-A INPUT -p tcp -m tcp --match multiport --dports {{ management_network_public_ports|join(',') }} -s {{  management_network_addresses|join(',') }} -j ACCEPT
+# management service port: allow administrators
+-A INPUT -p tcp -m tcp --match multiport --dports {{ management_network_public_ports|join(',') }} -s {{  admin_ips|join(',') }} -j ACCEPT
+
+
+
+# Samba: only allow samba clients
+# -A INPUT -p udp -m udp --match multiport --dports 137,138 --src-range 192.168.1.1-192.168.1.5 -j ACCEPT
+# -A INPUT -p udp -m udp --match multiport --dports 137,138 -s 8.8.8.8,223.5.5.5 -j ACCEPT
+# -A INPUT -p tcp -m tcp --match multiport --dports 139,445 --src-range 192.168.1.1-192.168.1.5 -j ACCEPT
+# -A INPUT -p tcp -m tcp --match multiport --dports 139,445 -s 8.8.8.8,223.5.5.5 -j ACCEPT
+
+# NFS: only allow nfs clients
+# -A INPUT -p udp -m udp --match multiport --dports 111,2049 --src-range 192.168.1.1-192.168.1.5 -j ACCEPT
+# -A INPUT -p udp -m udp --match multiport --dports 111,2049 -s 8.8.8.8,223.5.5.5 -j ACCEPT
+# -A INPUT -p tcp -m tcp --match multiport --dports 111,2049,12345 --src-range 192.168.1.1-192.168.1.5 -j ACCEPT
+# -A INPUT -p tcp -m tcp --match multiport --dports 111,2049,12345 -s 8.8.8.8,223.5.5.5 -j ACCEPT
+
+
+-A FORWARD -j DROP
+-A INPUT -j DROP
+-A OUTPUT -j ACCEPT
+COMMIT

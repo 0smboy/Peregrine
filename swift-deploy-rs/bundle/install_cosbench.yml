@@ -1,0 +1,11 @@
+---
+- name: Install docker
+  hosts: docker
+  roles:
+    - docker
+
+- name: Configuring cosbench
+  hosts: cosbench 
+  tags: cosbench 
+  roles: 
+    - cosbench

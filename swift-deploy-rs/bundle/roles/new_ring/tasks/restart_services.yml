@@ -1,0 +1,49 @@
+---
+- name: Check whether policy settings exist in swift.conf.
+  shell: grep '^\\[storage-policy:{{ add_object_ring.index }}\\]' /etc/swift/swift.conf | cat
+  register: match
+
+- name: debug 3
+  debug:
+    msg: "match: {{ match.stdout }}"
+
+- name: Fail if section of storage policy exists in swift.conf
+  fail:
+    msg: "There has been a \"[storage-policy:{{ add_object_ring.index }}]\" section exists in /etc/swift/swift.conf"
+  when: match.stdout != ''
+
+- name: Add policy config to the end of swift.conf
+  lineinfile:
+    dest: /etc/swift/swift.conf
+    insertafter: EOF
+    line: "{{ policy_section }}"
+    backup: yes
+
+- name: Change owner of ring file.
+  command: chown root:swift /etc/swift/object-{{ add_object_ring.index }}.ring.gz
+
+- name: Restart all openstack-swift services
+  service:
+    name: "{{ item }}"
+    state: restarted
+  with_items:
+    - openstack-swift-proxy
+    - openstack-swift-account
+    - openstack-swift-account-auditor
+    - openstack-swift-account-reaper
+    - openstack-swift-account-replicator
+    - openstack-swift-container
+    - openstack-swift-container-auditor
+    - openstack-swift-container-replicator
+    - openstack-swift-container-updater
+    - openstack-swift-container-reconciler
+    - openstack-swift-object
+    - openstack-swift-object-auditor
+    - openstack-swift-object-replicator
+    - openstack-swift-object-reconstructor
+    - openstack-swift-object-expirer
+    - openstack-swift-object-updater
+
+- name: Restart proxy noauth service
+  when: inventory_hostname in groups['proxyfs'] and install_proxyfs
+  service: name=openstack-swift-proxy-noauth enabled=yes state=restarted

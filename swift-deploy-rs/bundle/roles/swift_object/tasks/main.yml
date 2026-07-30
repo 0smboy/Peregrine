@@ -1,0 +1,17 @@
+---
+- name: Deliver object-server.conf
+  template: src=templates/object-server.conf.j2
+            dest=/etc/swift/object-server.conf
+- name: Deliver object-expirer.conf
+  template: src=templates/object-expirer.conf.j2
+            dest=/etc/swift/object-expirer.conf
+- name: Set rsyncd.conf
+  ini_file: dest=/etc/rsyncd.conf
+            section=object
+            option={{ item.key }}
+            value={{ item.value }}
+  with_dict:
+      "max connections": "{{ max_connections }}"
+      path: /srv/node
+      "read only": "{{ read_only }}"
+      "lock file": "{{ lock_file }}"

@@ -1,0 +1,16 @@
+---
+- name: Copy s3cfg files
+  template:
+    src: s3cfg.j2
+    dest: "/root/.s3cfg_{{ item.key }}"
+  with_dict: "{{ credential_info.ak_sk | default({}) }}"
+
+- name: Set ak sk in s3cfg
+  blockinfile:
+    path: "/root/.s3cfg_{{ item.key }}"
+    insertafter: EOF
+    marker: "# OSTORAGE s3cfg ak sk {mark}"
+    block: |
+      access_key = {{ item.key }}
+      secret_key = {{ item.value }}
+  with_dict: "{{ credential_info.ak_sk | default({}) }}"

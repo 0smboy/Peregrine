@@ -1,0 +1,94 @@
+---
+- name: Install swift proxy related pkgs
+  yum: name={{ item }} state=present
+  with_items:
+  - memcached
+
+- name: Distribute memcached configuration
+  template: src=templates/memcached.j2
+            dest=/etc/sysconfig/memcached
+            mode=0644
+
+- block:
+  - name: Create crt file and key file
+    vars:
+         ssl_certs_fields: "/CN={{ auth_url_ip }}"
+         ssl_certs_cert_path: /etc/swift/proxy.crt
+         ssl_certs_privatekey_path: /etc/swift/proxy.key
+    command:
+        openssl req -new -x509 -nodes -days '{{ ssl_certs_days }}' -subj '{{ ssl_certs_fields }}'  -out '{{ ssl_certs_cert_path }}'  -keyout '{{ ssl_certs_privatekey_path }}'
+
+  - block:
+    - name: Generate uniq dir name for distribute
+      shell: uuidgen
+      register: ssl_uniq_dir
+    - name: Make ssl_uniq_dir
+      shell: "mkdir /tmp/{{ ssl_uniq_dir.stdout }}"
+    - name: Set ssl_uniq_dir fact
+      set_fact:
+        ssl_uniq_dir: "{{ ssl_uniq_dir.stdout }}"
+    run_once: yes
+    delegate_to: localhost
+
+  - name: Fetch  proxy.crt proxy.key
+    fetch: src=/{{ swift_dir }}/{{ item }}
+           dest=/tmp/{{ ssl_uniq_dir }}
+    with_items:
+    - proxy.key
+    - proxy.crt
+  when: proxy_mode == "https" and inventory_hostname == groups['proxy_servers'][0]
+
+- block: 
+  - name: Distribute proxy.crt proxy.key files to all hosts
+    copy: src=/tmp/{{ ssl_uniq_dir }}/{{ groups['proxy_servers'][0] }}/{{ swift_dir }}/{{ item }}
+          dest=/etc/swift
+          force=yes
+    with_items:
+    - proxy.key
+    - proxy.crt
+
+  - name: Clean ssl_uniq_dir
+    file: path=/tmp/{{ ssl_uniq_dir }}
+          state=absent
+    run_once: yes
+    delegate_to: localhost
+
+  - name: Trust https certs
+    script: files/trust_certs.sh "/etc/swift/proxy.crt"
+  when: proxy_mode == "https"
+
+- name: Deliver proxy-server.conf
+  template: src=templates/proxy-server.conf.j2
+            dest=/etc/swift/proxy-server.conf
+
+- name: Deliver proxy-server-noauth.conf
+  template: src=templates/proxy-server-noauth.conf.j2
+            dest=/etc/swift/proxy-server-noauth.conf
+
+- name: Ensure proxy noauth state
+  systemd: name=openstack-swift-proxy-noauth enabled=yes state=restarted daemon_reload=yes
+  when: inventory_hostname in groups['proxyfs'] and install_proxyfs
+
+- name: Deliver .gitignore
+  copy: src=files/gitignore
+        dest=/etc/swift/.gitignore
+
+- name: Create different branch
+  script: files/modify_proxy.sh
+
+- block:
+  - name: Deliver change_to_swift
+    copy: 
+      src=files/change_to_swift
+      dest=/usr/bin/change_to_swift
+      mode=0755
+  - name: Deliver change_to_keystone_s3api
+    copy: 
+      src=files/change_to_keystone_s3api
+      dest=/usr/bin/change_to_keystone_s3api
+      mode=0755
+
+- name: Change interface to keystone s3api if default interface is s3 and auth type is keystone
+  shell: change_to_keystone_s3api
+  when: INTERFACE == "s3" and auth_method == "keystone"
+

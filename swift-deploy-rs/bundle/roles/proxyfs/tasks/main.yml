@@ -1,0 +1,157 @@
+---
+- name: Check proxy noauth state again
+  systemd:
+    name: openstack-swift-proxy-noauth
+    enabled: yes
+    state: restarted
+
+- name: Install proxyfs yum packages
+  yum:
+    state: present
+    name:
+      - attr
+      - fuse
+      - nfs-utils
+
+- name: Create proxyfs logs dir
+  file:
+    path: /var/log/proxyfsd
+    state: directory
+    mode: '0755'
+
+- name: Create proxyfs log file
+  file: 
+    path: /var/log/proxyfsd/proxyfsd.log
+    state: touch
+    mode: '0600'
+
+- name: Install golang
+  unarchive:
+    src: 'http://{{ local_repo_address }}/component/go{{ golang_version }}.{{platform}}.tar.gz'
+    dest: '/usr/local'
+    remote_src: yes
+
+- name: Check go path again
+  file:
+    path: "{{go_path}}/bin"
+    state: directory
+
+- name: Get proxyfs executables
+  unarchive:
+    src: 'http://{{ local_repo_address }}/component/proxyfs_executables{{proxyfs_middlewares_version}}.{{platform}}.tar.gz'
+    dest: "{{go_path}}/bin"
+    remote_src: yes
+
+- name: Copy proxyfsd config file
+  template:
+    src: templates/proxyfsd.conf.j2
+    dest: /etc/proxyfsd.conf
+    mode: '0640'
+
+- name: Touch temp file ostorage_proxyfs_account 
+  file:
+    path: /tmp/ostorage_proxyfs_account
+    state: touch
+
+- name: Get proxyfs account id
+  shell: 'cat /tmp/ostorage_proxyfs_account'
+  register: proxyfs_account_id
+
+- name: Abort when cannnot get account id
+  fail: 
+    msg: "Cannot get proxyfs account id"
+  when: (proxyfs_account_id.stdout_lines | default([])) | length == 0
+
+- name: Change proxyfs account id
+  lineinfile:
+    path: /etc/proxyfsd.conf
+    regexp: '^AccountName'
+    line: 'AccountName:                              AUTH_{{proxyfs_account_id.stdout_lines[0]}}'
+
+- name: Copy proxyfsd service config
+  template:
+    src: templates/proxyfsd.service.j2
+    dest: /usr/lib/systemd/system/proxyfsd.service
+    mode: '0644'
+    group: root
+    owner: root
+
+- name: Noauth proxy healthcheck
+  uri:
+    url: 'http://{{proxy_noauth_ip}}:{{proxy_noauth_port}}/healthcheck'
+    method: HEAD
+    status_code: 200
+  any_errors_fatal: yes
+
+- name: Create proxyfs account
+  uri:
+    url: 'http://{{proxy_noauth_ip}}:{{proxy_noauth_port}}/v1/AUTH_{{proxyfs_account_id.stdout_lines[0]}}'
+    method: POST
+    status_code: 204
+  when: inventory_hostname == groups['proxyfs'][0]
+
+- name: HEAD proxyfs account
+  uri:
+    url: 'http://{{proxy_noauth_ip}}:{{proxy_noauth_port}}/v1/AUTH_{{proxyfs_account_id.stdout_lines[0]}}'
+    method: HEAD
+    status_code: 204
+  when: inventory_hostname == groups['proxyfs'][0]
+
+- name: Create mount point dirs
+  file:
+    path: "{{item}}"
+    state: directory
+    mode: 0777
+  with_items:
+    - "{{fuse_mount_point}}"
+
+- name: Umount fuse
+  shell: "umount {{fuse_mount_point}}"
+  register: result
+  failed_when: result is failed and 'not mounted' not in result.stderr
+
+- name: Check if mount piont empty
+  find:
+    path: "{{fuse_mount_point}}"
+    file_type: any
+    recurse: no
+  register: fuse_mount_point_files
+
+- name: Fail when is not empty
+  fail:
+    msg: "Mount point must be empty"
+  when: fuse_mount_point_files.matched > 0
+
+- name: Create a proxyfs volume
+  shell: '{{go_path}}/bin/mkproxyfs -I {{fuse_volume_name}} /etc/proxyfsd.conf'
+  when: inventory_hostname == groups['proxyfs'][0]
+
+- name: Enable and start proxyfs service
+  systemd:
+    name: proxyfsd
+    enabled: yes
+    state: started
+    daemon_reload: yes
+
+- name: Start nfs-server
+  systemd:
+    name: nfs-server
+    enabled: yes
+    state: started
+
+- name: Add export lines
+  lineinfile:
+    path: /etc/exports
+    line: "{{fuse_mount_point}} *(rw,sync,fsid=1,no_subtree_check,no_root_squash,insecure)"
+    insertafter: EOF
+
+- name: Export nfs filesystem
+  shell: 'exportfs -a'
+
+- name: Set GOPATH and PATH env
+  blockinfile:
+    path: /etc/profile
+    insertafter: EOF
+    block: |
+      GOPATH={{go_path}}
+      PATH=$PATH:/usr/local/go/bin:{{go_path}}/bin

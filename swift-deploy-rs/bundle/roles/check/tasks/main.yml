@@ -1,0 +1,5 @@
+---
+- name: Check SAIO mode
+  fail:
+    msg: "To install in SAIO mode, set SAIO to TRUE and INSTALL_MODE to development"
+  when: inventory_hostname==groups['mariadb_servers'][0] and SAIO and INSTALL_MODE != "development"

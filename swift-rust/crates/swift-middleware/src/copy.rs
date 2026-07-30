@@ -1,0 +1,384 @@
+// Copyright (c) 2026 OpenStack Foundation
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! `copy`: server-side object copy, ported from
+//! `swift/common/middleware/copy.py`.
+//!
+//! Two entry points, both resolved into a GET of the source object followed
+//! by a PUT of the destination, all as backend subrequests:
+//!
+//! * `COPY /v1/a/c/o` with a `Destination: /dstc/dsto` header, and
+//! * `PUT /v1/a/dstc/dsto` with an `X-Copy-From: /c/o` header.
+//!
+//! The source account defaults to the request account and may be overridden
+//! with `X-Copy-From-Account` (or `Destination-Account` on a COPY). On a copy
+//! the destination object inherits the source's `Content-Type` and other
+//! object metadata unless `X-Fresh-Metadata: true` is set, in which case only
+//! the request's own metadata is used.
+//!
+//! Deferred: SLO/DLO manifest-aware copy (`multipart-manifest=get` raw copy),
+//! `Range` partial copy, and container/account sync-key propagation.
+
+use swift_http::{split_path, Body, HeaderKeyDict, Request, Response};
+
+use crate::{Middleware, NextFn};
+
+/// The `copy` middleware.
+#[derive(Default)]
+pub struct Copy;
+
+impl Copy {
+    pub fn new() -> Self {
+        Copy
+    }
+}
+
+/// Parse a `/<container>/<object>` header value into its two parts.
+fn parse_container_object(value: &str) -> Option<(String, String)> {
+    let v = value.strip_prefix('/').unwrap_or(value);
+    let (container, object) = v.split_once('/')?;
+    if container.is_empty() || object.is_empty() {
+        return None;
+    }
+    Some((container.to_string(), object.to_string()))
+}
+
+/// Object metadata headers copied from the source when metadata is preserved.
+fn is_copied_source_header(name: &str) -> bool {
+    let lname = name.to_ascii_lowercase();
+    lname == "content-type"
+        || lname == "content-encoding"
+        || lname == "content-disposition"
+        || lname.starts_with("x-object-meta-")
+        || lname.starts_with("x-object-sysmeta-")
+}
+
+impl Copy {
+    /// Run the GET-source / PUT-dest sequence for a request already shaped as
+    /// a PUT carrying `X-Copy-From` (+ optional `X-Copy-From-Account`).
+    fn do_copy(&self, mut req: Request, next: &NextFn) -> Response {
+        let parts = match split_path(&req.path, 4, 4, true) {
+            Ok(p) => p,
+            Err(_) => return Response::error(412, "Invalid destination path"),
+        };
+        let version = parts[0].clone().unwrap_or_default();
+        let dst_account = parts[1].clone().unwrap_or_default();
+
+        let copy_from = req.headers.get("X-Copy-From").unwrap_or("").to_string();
+        let Some((src_container, src_object)) = parse_container_object(&copy_from) else {
+            return Response::error(412, "X-Copy-From header must be of the form /container/object");
+        };
+        let src_account = req
+            .headers
+            .get("X-Copy-From-Account")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| dst_account.clone());
+        let fresh_metadata = req
+            .headers
+            .get("X-Fresh-Metadata")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        // 1) GET the source object.
+        let mut get_req = Request {
+            method: "GET".to_string(),
+            path: format!("/{version}/{src_account}/{src_container}/{src_object}"),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        get_req.headers.set("X-Newest", "true");
+        // Carry the authenticated identity onto the source GET so it is
+        // authorized as the same user (the proxy authorizes every subrequest
+        // via the unspoofable X-Backend-Remote-User); without this a copy from
+        // a private container would be denied.
+        if let Some(ru) = req.headers.get("X-Backend-Remote-User") {
+            get_req.headers.set("X-Backend-Remote-User", ru.to_string());
+        }
+        if let Some(rf) = req.headers.get("Referer") {
+            get_req.headers.set("Referer", rf.to_string());
+        }
+        // Python's `_get_source_object` does `req.copy_get()`, preserving the
+        // client's conditional headers on the source GET. In particular a
+        // `Range` (or `If-*`) header must reach the source so a PUT+Range or
+        // COPY+Range makes a partial copy.
+        for cond in [
+            "Range",
+            "If-Match",
+            "If-None-Match",
+            "If-Modified-Since",
+            "If-Unmodified-Since",
+        ] {
+            if let Some(v) = req.headers.get(cond) {
+                get_req.headers.set(cond, v.to_string());
+            }
+        }
+        let source = next(get_req);
+        if !(200..300).contains(&source.status) {
+            // propagate the source failure (e.g. 404) to the client
+            return source;
+        }
+
+        // 2) build the destination PUT: source body, merged headers.
+        let mut put_headers = HeaderKeyDict::new();
+        if !fresh_metadata {
+            for (k, v) in source.headers.iter() {
+                if is_copied_source_header(k) {
+                    put_headers.set(k, v);
+                }
+            }
+        }
+        // the request's own metadata wins over the source's
+        for (k, v) in req.headers.iter() {
+            let lk = k.to_ascii_lowercase();
+            if lk == "x-copy-from"
+                || lk == "x-copy-from-account"
+                || lk == "x-fresh-metadata"
+                || lk == "content-length"
+            {
+                continue;
+            }
+            put_headers.set(k, v);
+        }
+        // The source body is plumbed straight through to the destination PUT
+        // as a stream — an object copy never materializes the object.
+        let (source_reader, source_len) = source.body.into_reader();
+        if let Some(len) = source_len {
+            put_headers.set("Content-Length", len.to_string());
+        }
+        put_headers.set("X-Copied-From", format!("{src_container}/{src_object}"));
+        put_headers.set("X-Copied-From-Account", src_account.clone());
+
+        req.method = "PUT".to_string();
+        req.headers = put_headers;
+        req.body = Body::from_reader(source_reader, source_len);
+        let mut resp = next(req);
+        // surface the copy provenance on the response, as Python does
+        resp.headers
+            .set("X-Copied-From", format!("{src_container}/{src_object}"));
+        resp.headers
+            .set("X-Copied-From-Account", src_account.clone());
+        resp
+    }
+}
+
+impl Middleware for Copy {
+    fn handle(&self, mut req: Request, next: &NextFn) -> Response {
+        // Only object requests (4 path segments) are candidates.
+        let parts = match split_path(&req.path, 4, 4, true) {
+            Ok(p) => p,
+            Err(_) => return next(req),
+        };
+
+        if req.method == "PUT" && req.headers.get("X-Copy-From").is_some() {
+            return self.do_copy(req, next);
+        }
+
+        if req.method == "COPY" {
+            let version = parts[0].clone().unwrap_or_default();
+            let account = parts[1].clone().unwrap_or_default();
+            let container = parts[2].clone().unwrap_or_default();
+            let object = parts[3].clone().unwrap_or_default();
+
+            let Some(dest) = req.headers.get("Destination").map(|s| s.to_string()) else {
+                return Response::error(412, "Destination header required");
+            };
+            let Some((dst_container, dst_object)) = parse_container_object(&dest) else {
+                return Response::error(
+                    412,
+                    "Destination header must be of the form /container/object",
+                );
+            };
+            let dst_account = req
+                .headers
+                .get("Destination-Account")
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| account.clone());
+
+            // rewrite as a PUT-with-X-Copy-From to the destination
+            req.method = "PUT".to_string();
+            req.path = format!("/{version}/{dst_account}/{dst_container}/{dst_object}");
+            req.headers.set("X-Copy-From", format!("/{container}/{object}"));
+            req.headers.set("X-Copy-From-Account", account.clone());
+            req.headers.remove("Destination");
+            req.headers.remove("Destination-Account");
+            return self.do_copy(req, next);
+        }
+
+        next(req)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn req(method: &str, path: &str, headers: &[(&str, &str)]) -> Request {
+        let mut h = HeaderKeyDict::new();
+        for (k, v) in headers {
+            h.set(k, v);
+        }
+        Request {
+            method: method.to_string(),
+            path: path.to_string(),
+            query_string: String::new(),
+            headers: h,
+            body: Body::empty(),
+        }
+    }
+
+    /// A fake backend that answers a scripted source GET and records the PUT
+    /// (with its body drained into a buffered copy for the assertions).
+    fn backend(
+        source_body: &'static [u8],
+        source_ct: &'static str,
+    ) -> (Arc<Mutex<Vec<Request>>>, NextFn) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let app: NextFn = Arc::new(move |mut r: Request| {
+            let is_get = r.method == "GET";
+            r.body.materialize(u64::MAX).unwrap();
+            log2.lock().unwrap().push(r);
+            if is_get {
+                let mut resp = Response::with_body(200, source_body.to_vec());
+                resp.headers.set("Content-Type", source_ct);
+                resp.headers.set("X-Object-Meta-Color", "red");
+                resp
+            } else {
+                Response::new(201)
+            }
+        });
+        (log, app)
+    }
+
+    #[test]
+    fn test_put_x_copy_from_copies_body_and_metadata() {
+        let (log, app) = backend(b"hello", "text/plain");
+        let c = Copy::new();
+        let r = req(
+            "PUT",
+            "/v1/AUTH_test/dstc/dsto",
+            &[("X-Copy-From", "/srcc/srco")],
+        );
+        let resp = c.handle(r, &app);
+        assert_eq!(resp.status, 201);
+        let mut calls = log.lock().unwrap();
+        assert_eq!(calls.len(), 2, "GET source then PUT dest");
+        assert_eq!(calls[0].method, "GET");
+        assert_eq!(calls[0].path, "/v1/AUTH_test/srcc/srco");
+        let put = &mut calls[1];
+        assert_eq!(put.method, "PUT");
+        assert_eq!(put.path, "/v1/AUTH_test/dstc/dsto");
+        assert_eq!(put.body.materialize(u64::MAX).unwrap(), b"hello");
+        // source content-type + meta preserved
+        assert_eq!(put.headers.get("Content-Type"), Some("text/plain"));
+        assert_eq!(put.headers.get("X-Object-Meta-Color"), Some("red"));
+        assert_eq!(put.headers.get("Content-Length"), Some("5"));
+        assert_eq!(resp.headers.get("X-Copied-From"), Some("srcc/srco"));
+    }
+
+    #[test]
+    fn test_copy_method_uses_destination() {
+        let (log, app) = backend(b"data", "application/json");
+        let c = Copy::new();
+        let r = req(
+            "COPY",
+            "/v1/AUTH_test/srcc/srco",
+            &[("Destination", "/dstc/dsto")],
+        );
+        let resp = c.handle(r, &app);
+        assert_eq!(resp.status, 201);
+        let calls = log.lock().unwrap();
+        assert_eq!(calls[0].path, "/v1/AUTH_test/srcc/srco", "GET the source");
+        assert_eq!(calls[1].path, "/v1/AUTH_test/dstc/dsto", "PUT the destination");
+    }
+
+    #[test]
+    fn test_fresh_metadata_drops_source_meta() {
+        let (log, app) = backend(b"x", "text/plain");
+        let c = Copy::new();
+        let r = req(
+            "PUT",
+            "/v1/AUTH_test/dstc/dsto",
+            &[
+                ("X-Copy-From", "/srcc/srco"),
+                ("X-Fresh-Metadata", "true"),
+                ("Content-Type", "image/png"),
+            ],
+        );
+        let resp = c.handle(r, &app);
+        assert_eq!(resp.status, 201);
+        let calls = log.lock().unwrap();
+        let put = &calls[1];
+        // source meta NOT carried; request's own content-type wins
+        assert_eq!(put.headers.get("X-Object-Meta-Color"), None);
+        assert_eq!(put.headers.get("Content-Type"), Some("image/png"));
+    }
+
+    #[test]
+    fn test_missing_destination_is_412() {
+        let c = Copy::new();
+        let app: NextFn = Arc::new(|_r: Request| Response::new(201));
+        let r = req("COPY", "/v1/AUTH_test/srcc/srco", &[]);
+        let resp = c.handle(r, &app);
+        assert_eq!(resp.status, 412);
+    }
+
+    #[test]
+    fn test_source_404_propagates() {
+        let app: NextFn = Arc::new(|r: Request| {
+            if r.method == "GET" {
+                Response::new(404)
+            } else {
+                Response::new(201)
+            }
+        });
+        let c = Copy::new();
+        let r = req(
+            "PUT",
+            "/v1/AUTH_test/dstc/dsto",
+            &[("X-Copy-From", "/srcc/missing")],
+        );
+        let resp = c.handle(r, &app);
+        assert_eq!(resp.status, 404, "source failure surfaces, no PUT");
+    }
+
+    #[test]
+    fn test_range_header_forwarded_to_source_get() {
+        // A COPY (or PUT+X-Copy-From) carrying a Range must make a partial
+        // copy: the Range header has to reach the source GET.
+        let (log, app) = backend(b"test", "text/plain");
+        let c = Copy::new();
+        let r = req(
+            "COPY",
+            "/v1/AUTH_test/srcc/srco",
+            &[("Destination", "/dstc/dsto"), ("Range", "bytes=1-2")],
+        );
+        let resp = c.handle(r, &app);
+        assert_eq!(resp.status, 201);
+        let calls = log.lock().unwrap();
+        assert_eq!(calls[0].method, "GET");
+        assert_eq!(calls[0].headers.get("Range"), Some("bytes=1-2"));
+    }
+
+    #[test]
+    fn test_non_object_passes_through() {
+        let c = Copy::new();
+        let app: NextFn = Arc::new(|_r: Request| Response::new(204));
+        let r = req("PUT", "/v1/AUTH_test/c", &[("X-Copy-From", "/x/y")]);
+        assert_eq!(c.handle(r, &app).status, 204);
+    }
+}

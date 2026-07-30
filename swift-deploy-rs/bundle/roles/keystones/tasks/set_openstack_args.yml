@@ -1,0 +1,13 @@
+---
+- name: Set openstack args
+  set_fact:
+    openstack_admin_args: --os-username=admin --os-password={{ keystone_admin_password }} --os-project-name=admin --os-user-domain-name=Default --os-project-domain-name=Default --os-auth-url=http://{{keystone_endpoint_controller_hostname}}:{{haproxy_keystone_public_service_port}}/v3 --os-identity-api-version=3
+
+- name: Register auth url port 1
+  set_fact:
+    auth_url_port: "{{ proxy_server_bind_port }}"
+
+- name: Register auth url port 2
+  set_fact:
+    auth_url_port: "{{ swift_lb_port }}"
+  when: use_lb

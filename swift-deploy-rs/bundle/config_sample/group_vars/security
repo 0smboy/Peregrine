@@ -1,0 +1,46 @@
+---
+# 业务网络对外端口
+business_network_public_ports:
+  keystone:
+    - {{ haproxy_keystone_public_service_port }}
+    - {{ haproxy_keystone_admin_service_port }}
+  swift:
+    - {{ haproxy_storage_port }}
+    - 443
+
+# 业务网络不对外端口
+business_network_private_ports:
+  proxy_server: {{ proxy_server_bind_port }}
+  mariadb: {{ haproxy_mariadb_port }}
+
+# 存储网络端口
+storage_network_ports:
+  account_server: {{ account_server_bind_port}}
+  container_server: {{ container_server_bind_port }}
+  object_server: {{ object_server_bind_port }}
+  rsync: {{ rsync_bind_port }}
+  memcache: {{ memcached_bind_port }}
+  mariadb: [3306, 9600, 4444, 4567, 4568]
+  keystone:
+    - {{ uwsgi_keystone_admin_service_port }}
+    - {{ uwsgi_keystone_public_service_port }}
+
+# 管理网络对外端口
+management_network_public_ports:
+  haproxy_monitor: {{ haproxy_monitor_port }}
+  sshd:
+    - {{ ssh_bind_port }}
+    - 22  # the default port
+  kibana: 5601
+  grafana: 3000
+  cosbench: {{ cosbench_controller_bind_port }}
+
+# 管理网络不对外端口
+management_network_private_ports:
+  httpd: 80  # Zabbix or Yum repo
+  rsyslogd: 514
+  chronyd: {{ chronyd_ports }}
+  elasticsearsh: 9200
+  logstash: 5044
+  zabbix: [10050, 10051]
+  cosbench: {{ cosbench_driver_bind_port }}

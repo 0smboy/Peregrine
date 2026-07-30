@@ -1,0 +1,28 @@
+---
+- name: Set per user max open file limits
+  copy: src=files/limits-10-swift.conf
+        dest=/etc/security/limits.d/10-swift.conf
+        mode=0644
+
+- name: Config sysctl
+  copy: src=files/sysctl-10-swift.conf
+        dest=/etc/sysctl.d/10-swift.conf
+        mode=0644
+
+- block:
+  - name: Get nic device names
+    shell: "ip a| grep 'inet ' | awk '{ print $NF }' | grep -v lo"
+    register: nic_names
+
+  - name: Load sysctl 1
+    shell: 'sysctl -p /etc/sysctl.d/10-swift.conf'
+
+  - name: Set rp_filter
+    lineinfile: insertafter=EOF
+                dest=/etc/sysctl.d/10-swift.conf
+                line="net.ipv4.conf.{{item}}.rp_filter=1"
+    with_items: "{{ nic_names.stdout_lines }}"
+
+  - name: Load sysctl 2
+    shell: 'sysctl -p /etc/sysctl.d/10-swift.conf'
+    ignore_errors: true

@@ -1,0 +1,228 @@
+---
+# 安装模式
+#    生产环境: production
+#    测试环境: development
+#    测试环境下会强制 rebalance ring
+#    !!! 请不要在生产环境上使用 development mode
+INSTALL_MODE: production
+
+# SAIO 安装
+#     安装单节点 Swift 全功能测试环境 (Swift All in One)
+#     需要同时将配置 INSTALL_MODE 为 development 和 SAIO 为 true
+SAIO: false
+
+# 设置是否打开重新初始化部署功能:true/false
+# 若需要重新初始化部署一个已经安装好的swift集群，需要打开该选项
+REINSTALL: false
+
+# 设置是否使用/dev/disk/by-id/下链接进行盘的挂载:true/false
+# 在生产环境中需要开启此功能
+# 因为在虚拟机上不能获取wwid，所以建议虚拟环境关闭此功能
+USE_WWID: false
+
+# 设置是否添加节点操作: true/false
+# 在添加节点时，会把原有集群的swift.conf拷贝到其他节点，而不是重新把模板文件拷贝到各个节点
+ADD_NODES: false
+
+# 使用自定义盘符（适用于非 /dev/sdx 开头的磁盘）
+# USE_WWID 暂不可用
+use_custom_disks: false
+allowed_disk_types: ['hdd', 'ssd']
+
+# 安装 proxyfs 文件系统
+install_proxyfs: false
+# 如果只需要在内网访问 proxyfs，可以把
+# public 和 private ip 地址都设为内网存储网络地址
+proxyfs_public_ip_addr: 45.30.16.x
+proxyfs_private_ip_addr: 192.168.101.x
+proxyfs_port: 12345
+proxy_noauth_ip: 127.0.0.1
+proxy_noauth_port: 8090
+# proxyfs swift account and user
+proxyfs_swift_accounts:
+- account_name: pfsaccount
+  privileged_users:
+    pfsuser: xxxxx
+
+# 其他 proxyfs 和 go 相关设置
+go_path: /opt/go
+platform: linux-amd64
+golang_version: 1.15.5
+proxyfs_middlewares_version: 1.19.1
+
+proxyfs_storage_policy: Policy-0
+proxyfs_container_prefix: Replicated3Way
+fuse_volume_name: CommonVolume
+fuse_mount_point: /mnt/CommonMountPoint
+
+# 时间同步相关配置
+# ntp_internet_server_address: time.pool.aliyun.com  # 互联网时间服务器
+# ntp_local_server_address: 192.168.2.51  # 集群内时间服务器地址
+# local_repo_address: 192.168.2.9  # 本地yum源地址
+# timezone: Asia/Shanghai  # 所有机器时区
+ntp_internet_server_address: time.pool.aliyun.com
+ntp_local_server_address: 192.168.2.51  # 管理网络
+local_repo_address: 192.168.2.9         # 管理网络
+timezone: Asia/Shanghai
+
+# Docker 相关
+docker_bridge_net: monitor-net
+docker_monitornet_subnet: 172.20.0.0/16  # be careful of ip conlict
+docker_monitornet_ip_range: 172.20.240.0/20  # this ip range should include x.x.x.1-5
+
+# hostname 是否可修改
+# 某些环境中 hostname 是已经设置好的且有其他用途, 则不可修改
+# 如果配置为 true 可修改, 则会依次按照 hostname_prefix + 下划线 + inventory_hostname ip 后两位进行配置
+hostname_modifiable: true
+hostname_prefix: ostorage
+
+# proxy-server.conf, account-server.conf, container-server.conf, object-server.conf通用配置
+user: swift
+swift_dir: /etc/swift
+devices: /srv/node
+mount_check: "true"  # 此处为字符串true,并非布尔值true
+recon_cache_path: /var/cache/swift
+
+# 设置存储服务域名，不需要请留空
+storage_domain:
+
+# swift.conf中swift hash前缀,后缀
+#
+# 生成方法: openssl rand -base64 12
+#
+swift_hash_path_suffix: 0xutdpkC2TnNvPI5
+swift_hash_path_prefix: caQp5m9zHNEk0QyU
+
+
+#------------------------ 3 防火墙和服务端口配置 ------------------------
+#
+#
+#
+# 3.1 选择防火墙服务
+#     目前策略为添加白名单策略,根据配置的允许端口进行iptables配置文件生成
+#     有的服务需要开放多个端口,使用列表列出
+#     允许值: iptables, none
+#     目前仅支持 iptables 服务, firewalld 待支持, none 表示关闭防火墙
+firewall_type: iptables  
+#
+#
+#
+# 3.2 默认绑定端口
+#     以下端口为服务的默认绑定端口
+#     一般情况下不需要做修改
+#---- swift ----
+haproxy_storage_port: 5050
+proxy_server_bind_port: 8080
+account_server_bind_port: 6002
+container_server_bind_port: 6001
+object_server_bind_port: 6000
+rsync_bind_port: 873
+memcached_bind_port: 11211
+#---- mariadb ----
+haproxy_mariadb_port: 3030
+mariadb_bind_port: 3306
+mariadb_check_bind_port: 9600
+#---- keystone ----
+haproxy_keystone_public_service_port: 5000
+haproxy_keystone_admin_service_port: 35357
+uwsgi_keystone_admin_service_port: 35358
+uwsgi_keystone_public_service_port: 5001
+#---- other ----
+ssh_bind_port: 2222
+haproxy_monitor_port: 1080
+cosbench_driver_bind_port: 18088
+cosbench_controller_bind_port: 19088
+chronyd_ports: [123, 323]
+
+# 设置管理员 PC IP 地址和跳板机 IP 地址
+# 包括当前登录的机器
+admin_ips:
+- 192.168.2.189
+
+# haproxy 设置
+# 生产环境上要调高下面两个数值
+haproxy_max_conn: 4000
+haproxy_process_num: 1
+
+# mariadb cluster 设置
+use_local_mariadbs: true   # 是否使用本地的mariadb集群, true/false
+mariadb_host: localhost
+mariadb_user: root
+mariadb_root_password: enter mariadb root password
+# xinetd cluster check 参数
+# 生产环境下需调整下面参数
+xinetd_check_instance_max_conn: 50
+xinetd_check_wait_sec: 10
+xinetd_check_instance: 10
+# performance setting
+# xinetd_check_instance_max_conn: 1000
+# xinetd_check_wait_sec: 10
+# xinetd_check_instance: UNLIMITED
+
+# memcache 设置
+# 生产环境上要调高下面两个数值
+memcached_max_conn: 1024
+memcached_cache_size_in_mb: 64
+
+# keystone 设置
+keystone_endpoint_ip: enter keystone endpoint ip
+keystone_public_interface: enter keystone endpoint ip interface
+mariadb_keystone_pass: enter mariadb keystone password
+keystone_endpoint_controller_hostname: controller
+# change to 3030 in production
+keystone_used_mariadb_port: 3306
+keystone_admin_password: enter keystone admin password
+keystone_swift_password: enter keystone swift password
+
+# ssl 模块配置信息, 用于支持https
+#
+ssl_certs_days: 3650  # 证书过期时间
+
+# LoadBalance 相关配置信息
+#
+use_lb: false  # 是否使用负载均衡(硬件、软件), true/false
+lb_mode: http  # 可配置为http或https
+# auth_url_ip: 集群认证信息入口ip,同时也是用户的公共访问的存储ip
+# 如果使用haproxy
+#   若只有一台haproxy的话(没有keepalived), 设置为该haproxy所要代理的物理ip;
+#   若有两台haproxy时, 设置为keepalived提供的vip
+# 如果使用硬件负载均衡, 则配置为硬件负载均衡ip
+# 如果不使用负载均衡，则配置为集群中指定的一台proxy server的ip
+auth_url_ip: your auth url ip
+# haproxy port或硬件负载均衡port， 默认为 5000
+swift_lb_port: "{{ haproxy_storage_port }}"
+
+# 初始化集群中的账号
+# account_name  配置账号名
+# super_users 配置具有访问集群所有容器和对象的权限的用户名:密码
+# 对应 keystone 角色为 admin（同时具有 ResellerAdmin 角色）
+#
+# privileged_users 配置为具有容器和对象操作权限的用户名:密码
+# 对应 keystone 角色为 swiftoperator
+#
+# regular_users 配置一般权限的用户名:密码
+# 对应 keystone 角色为 swiftmember
+#
+# !!! 用户名不能为 swift 或者 admin
+#
+swift_cluster_accounts:
+- account_name: ostorage
+  super_users:
+     reseller_admin: please set your reseller_admin user password
+
+- account_name: test
+  privileged_users:
+      tester: testing
+  regular_users:
+      tester1: testing1
+
+- account_name: os_test
+  privileged_users:
+     os_tester: testing
+
+ec2_credentials:
+- account_name: test
+  user_name: tester
+  ak_sk:
+    - testak: 33774a2e8567
+    - 6c3c3fba: d347c28c7b3c

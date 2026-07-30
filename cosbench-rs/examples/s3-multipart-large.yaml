@@ -1,0 +1,41 @@
+name: s3-multipart-large
+description: Force multipart path with 12MiB objects and 5MiB threshold
+storage:
+  type: s3
+  endpoint: http://127.0.0.1:9000
+  region: us-east-1
+  access_key: minioadmin
+  secret_key: minioadmin
+  path_style: true
+  timeout_ms: 120000
+  multipart_threshold: 5242880
+  multipart_part_size: 5242880
+stages:
+  - name: init
+    kind: init
+    workers: 1
+    total_ops: 1
+    sequential: true
+    operations:
+      - type: create_container
+        ratio: 100
+    objects:
+      cprefix: cosbench-rs-mp-
+      containers: { start: 1, end: 1 }
+      oprefix: big-
+      objects: { start: 1, end: 1 }
+      size: 1
+  - name: prepare
+    kind: prepare
+    workers: 2
+    total_ops: 4
+    sequential: true
+    operations:
+      - type: write
+        ratio: 100
+    objects:
+      cprefix: cosbench-rs-mp-
+      containers: { start: 1, end: 1 }
+      oprefix: big-
+      objects: { start: 1, end: 4 }
+      size: 12582912

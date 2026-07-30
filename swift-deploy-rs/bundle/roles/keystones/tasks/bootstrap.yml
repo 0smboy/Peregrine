@@ -1,0 +1,68 @@
+---
+- block:
+  - name: Sync keystone database
+    command: keystone-manage db_sync
+    become_user: keystone
+    become_flags: '-s /bin/sh'
+
+  - name: Keystone fernet setup
+    command: keystone-manage fernet_setup --keystone-user keystone --keystone-group keystone
+
+  - name: Keystone credential setup
+    command: keystone-manage credential_setup --keystone-user keystone --keystone-group keystone
+
+  - name: Keystone bootstrap
+    command: keystone-manage bootstrap --bootstrap-password {{ keystone_admin_password }} --bootstrap-admin-url http://{{ keystone_endpoint_controller_hostname }}:{{ haproxy_keystone_admin_service_port }}/v3/ --bootstrap-internal-url http://{{ keystone_endpoint_controller_hostname }}:{{ haproxy_keystone_public_service_port }}/v3/ --bootstrap-public-url http://{{ keystone_endpoint_controller_hostname }}:{{ haproxy_keystone_public_service_port }}/v3/ --bootstrap-region-id RegionOne
+    register: keystone_bootstrap
+
+  - name: Archive Keystone bootstrap keys on the controller
+    shell: tar -C /etc/keystone -czf /tmp/swift-deploy-keystone-bootstrap-keys.tar.gz fernet-keys credential-keys && chmod 0600 /tmp/swift-deploy-keystone-bootstrap-keys.tar.gz
+
+  - name: Fetch Keystone bootstrap keys to the control node
+    fetch:
+      src: /tmp/swift-deploy-keystone-bootstrap-keys.tar.gz
+      dest: /tmp/swift-deploy-control-keystone-bootstrap-keys.tar.gz
+      flat: true
+
+  - name: Restrict the control-node Keystone bootstrap archive
+    file:
+      path: /tmp/swift-deploy-control-keystone-bootstrap-keys.tar.gz
+      state: file
+      mode: '0600'
+    delegate_to: localhost
+  when: inventory_hostname == groups['mariadb_servers'][0]
+
+- name: Stage the Keystone bootstrap archive on every Keystone node
+  copy:
+    src: /tmp/swift-deploy-control-keystone-bootstrap-keys.tar.gz
+    dest: /tmp/swift-deploy-node-keystone-bootstrap-keys.tar.gz
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: Distribute Keystone bootstrap keys to every Keystone node
+  unarchive:
+    src: /tmp/swift-deploy-node-keystone-bootstrap-keys.tar.gz
+    dest: /etc/keystone
+    remote_src: true
+
+- name: Secure distributed Keystone bootstrap keys
+  shell: chown -R keystone:keystone /etc/keystone/fernet-keys /etc/keystone/credential-keys && find /etc/keystone/fernet-keys /etc/keystone/credential-keys -type d -exec chmod 0700 '{}' + && find /etc/keystone/fernet-keys /etc/keystone/credential-keys -type f -exec chmod 0600 '{}' +
+
+- name: Remove the node-side Keystone bootstrap archive
+  file:
+    path: /tmp/swift-deploy-node-keystone-bootstrap-keys.tar.gz
+    state: absent
+
+- name: Remove the controller-side Keystone bootstrap archive
+  file:
+    path: /tmp/swift-deploy-keystone-bootstrap-keys.tar.gz
+    state: absent
+  when: inventory_hostname == groups['mariadb_servers'][0]
+
+- name: Remove the control-node Keystone bootstrap archive
+  file:
+    path: /tmp/swift-deploy-control-keystone-bootstrap-keys.tar.gz
+    state: absent
+  run_once: true
+  delegate_to: localhost

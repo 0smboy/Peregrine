@@ -1,0 +1,5 @@
+PORT="{{ memcached_bind_port }}"
+USER="memcached"
+MAXCONN="{{ memcached_max_conn }}"
+CACHESIZE="{{ memcached_cache_size_in_mb }}"
+OPTIONS="-l 127.0.0.1 -l {{ storage_network_address }}"

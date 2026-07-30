@@ -1,0 +1,23 @@
+[package]
+name = "swift-console"
+version = "0.1.0"
+edition = "2021"
+description = "Swift Console: unified Files / Deploy / Monitor management UI for the rust Swift cluster"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+bytes = "1"
+rand = "0.8"
+hex = "0.4"
+hmac = "0.12"
+sha1 = "0.10"
+md-5 = "0.10"
+
+[profile.release]
+opt-level = 2

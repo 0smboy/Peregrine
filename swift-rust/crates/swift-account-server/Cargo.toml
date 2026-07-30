@@ -1,0 +1,16 @@
+[package]
+name = "swift-account-server"
+description = "Account server for the Rust implementation of OpenStack Swift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+swift-core = { path = "../swift-core" }
+swift-db = { path = "../swift-db" }
+swift-http = { path = "../swift-http" }
+serde_json = "1"
+
+[dev-dependencies]
+serde_json = "1"

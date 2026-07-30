@@ -1,0 +1,68 @@
+---
+- name: Deliver get_new_id.j2
+  template: src=templates/get_new_id.j2
+            dest=/usr/bin/get_new_id
+            mode=0755
+- name: Remove possibly exist disks_id
+  file: path=/tmp/new_disks_id
+        state=absent
+- name: Remove possibly exist disks_type
+  file: path=/tmp/new_disks_type
+        state=absent
+- name: Print disks_id and disks_type
+  shell: /usr/bin/get_new_id
+- name: Get disks_id
+  shell: cat /tmp/new_disks_id
+  register: new_disks_id
+- name: Get disks_type
+  shell: cat /tmp/new_disks_type
+  register: new_disks_type
+- name: Change disks partition table to mbr before DD
+  shell: parted /dev/{{ item }} -s mklabel msdos
+  with_items:
+  - "{{ new_disks_to_format }}"
+- name: DD before mkfs
+  shell: dd if=/dev/zero of=/dev/{{ item }} bs=512 count=4
+  become: True
+  with_items:
+  - "{{ new_disks_to_format }}"
+- name: Umount disks
+  shell: umount -f /dev/{{ item }}
+  register: result
+  failed_when: result is failed and 'not mounted' not in result.stderr
+  with_items:
+  - "{{ new_disks_to_format }}"
+- name: Format all storage nodes disks
+  shell: mkfs.xfs -K -f /dev/{{ item }}
+  with_items:
+  - "{{ new_disks_to_format }}"
+- name: Create mount point directory
+  shell: mkdir -p /srv/node/{{ item }}
+  with_items:
+  - "{{ new_disks_type.stdout_lines }}"
+- name: Remove 'exit 0' from start_automount
+  lineinfile: dest=/usr/bin/startup_automount
+              state=absent
+              regexp=^exit
+- name: Append new disks to mount
+  lineinfile: insertafter=EOF
+              dest=/usr/bin/startup_automount
+              line="mount -t xfs -o noatime,nodiratime,logbufs=8 /dev/disk/by-id/{{ item.0 }} /srv/node/{{ item.1 }}"
+  with_together:
+  - "{{ new_disks_id.stdout_lines }}"
+  - "{{ new_disks_type.stdout_lines }}"
+  when: USE_WWID
+- name: Append new disks to mount
+  lineinfile: insertafter=EOF
+              dest=/usr/bin/startup_automount
+              line="mount -t xfs -o noatime,nodiratime,logbufs=8 /dev/{{ item.0 }} /srv/node/{{ item.1 }}"
+  with_together:
+  - "{{ new_disks_to_format }}"
+  - "{{ new_disks_type.stdout_lines }}"
+  when: not USE_WWID
+- name: Append exit 0
+  lineinfile: insertafter=EOF
+              dest=/usr/bin/startup_automount
+              line="exit 0"
+- name: Mount newdisk
+  command: sh /usr/bin/startup_automount

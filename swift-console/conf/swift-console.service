@@ -1,0 +1,14 @@
+[Unit]
+Description=Swift Console (unified Files / Deploy / Monitor UI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/swift-console /etc/swift-console/config.json
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

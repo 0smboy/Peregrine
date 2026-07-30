@@ -1,0 +1,30 @@
+---
+- include: install.yml
+  tags: mariadb_cluster-install
+
+- include: config.yml
+  tags: mariadb_cluster-config
+
+- include: secure.yml
+  tags: mariadb_cluster-secure
+
+- include: bootstrap.yml
+  tags: mariadb_cluster-bootstrap
+  when: not SAIO
+
+- include: pacemaker.yml
+  tags: mariadb_cluster-pacemaker
+  when: not SAIO
+
+- include: check.yml
+  tags: mariadb_cluster-check
+  when: not SAIO
+
+- name: Set skip-name-resolve
+  ini_file:
+    path: /etc/my.cnf
+    section: mysqld
+    option: skip-name-resolve
+    value: '1'
+  become: true
+

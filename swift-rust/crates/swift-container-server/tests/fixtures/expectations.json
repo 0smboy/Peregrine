@@ -1,0 +1,811 @@
+{
+ "hash_suffix": "changeme",
+ "replicate": {
+  "account": "a",
+  "container": "repl",
+  "hash": "107e7d0355b47eb3aff53b3e9d921101",
+  "merge_items": {
+   "incoming_sync": [
+    [
+     "remote-node-1",
+     2
+    ]
+   ],
+   "op": [
+    "merge_items",
+    [
+     {
+      "ROWID": 1,
+      "content_type": "text/r",
+      "created_at": "1751500002.00000",
+      "data_timestamp": "1751500002.00000",
+      "deleted": 0,
+      "etag": "er1",
+      "name": "ri1",
+      "size": 3,
+      "storage_policy_index": 0
+     },
+     {
+      "ROWID": 2,
+      "content_type": "application/deleted",
+      "created_at": "1751500003.00000",
+      "data_timestamp": "1751500003.00000",
+      "deleted": 1,
+      "etag": "noetag",
+      "name": "ri2",
+      "size": 0,
+      "storage_policy_index": 0
+     }
+    ],
+    "remote-node-1"
+   ],
+   "rows": [
+    [
+     1,
+     "ri1",
+     "1751500002.00000",
+     3,
+     "text/r",
+     "er1",
+     0,
+     0
+    ],
+    [
+     2,
+     "ri2",
+     "1751500003.00000",
+     0,
+     "application/deleted",
+     "noetag",
+     1,
+     0
+    ]
+   ],
+   "status": 202
+  },
+  "merge_syncs": {
+   "incoming_sync": [
+    [
+     "peer-2",
+     42
+    ],
+    [
+     "remote-node-1",
+     2
+    ]
+   ],
+   "status": 202
+  },
+  "partition": "7"
+ },
+ "requests": [
+  {
+   "body": "",
+   "headers": {
+    "X-Timestamp": "1751500000.00000"
+   },
+   "label": "put-container",
+   "method": "PUT",
+   "path": "/sda1/0/a/c",
+   "query": "",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8",
+    "X-Backend-Storage-Policy-Index": "0"
+   },
+   "status": 201
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Timestamp": "1751500000.00000"
+   },
+   "label": "put-container-again",
+   "method": "PUT",
+   "path": "/sda1/0/a/c",
+   "query": "",
+   "response_body": "<html><h1>Accepted</h1><p>The request is accepted for processing.</p></html>",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8",
+    "X-Backend-Storage-Policy-Index": "0"
+   },
+   "status": 202
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Backend-Storage-Policy-Index": "5",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "label": "put-bad-policy",
+   "method": "PUT",
+   "path": "/sda1/0/a/c",
+   "query": "",
+   "response_body": "Invalid X-Backend-Storage-Policy-Index 5",
+   "response_headers": {
+    "Content-Type": "text/plain"
+   },
+   "status": 400
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Container-Meta-Color": "blue",
+    "X-Container-Read": ".r:*",
+    "X-Timestamp": "1751500001.00000"
+   },
+   "label": "post-meta",
+   "method": "POST",
+   "path": "/sda1/0/a/c",
+   "query": "",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 204
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Content-Type": "text/plain",
+    "X-Etag": "e1",
+    "X-Size": "5",
+    "X-Timestamp": "1751500002.00000"
+   },
+   "label": "put-obj-o1",
+   "method": "PUT",
+   "path": "/sda1/0/a/c/o1",
+   "query": "",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 201
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Content-Type": "app/slo;swift_bytes=99",
+    "X-Etag": "e2",
+    "X-Size": "11",
+    "X-Timestamp": "1751500002.00000"
+   },
+   "label": "put-obj-unicode",
+   "method": "PUT",
+   "path": "/sda1/0/a/c/%E4%B8%AD%E6%96%87%20obj",
+   "query": "",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 201
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Content-Type": "text/x",
+    "X-Etag": "e3",
+    "X-Size": "1",
+    "X-Timestamp": "1751500002.00000"
+   },
+   "label": "put-obj-photos-x",
+   "method": "PUT",
+   "path": "/sda1/0/a/c/photos/x",
+   "query": "",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 201
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Content-Type": "text/y",
+    "X-Etag": "e4",
+    "X-Size": "2",
+    "X-Timestamp": "1751500002.00000"
+   },
+   "label": "put-obj-photos-y",
+   "method": "PUT",
+   "path": "/sda1/0/a/c/photos/y",
+   "query": "",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 201
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Content-Type": "text/g",
+    "X-Etag": "e5",
+    "X-Size": "3",
+    "X-Timestamp": "1751500002.00000"
+   },
+   "label": "put-obj-gonezo",
+   "method": "PUT",
+   "path": "/sda1/0/a/c/gonezo",
+   "query": "",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 201
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Timestamp": "1751500003.00000"
+   },
+   "label": "delete-obj-gonezo",
+   "method": "DELETE",
+   "path": "/sda1/0/a/c/gonezo",
+   "query": "",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 204
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "head-container",
+   "method": "HEAD",
+   "path": "/sda1/0/a/c",
+   "query": "",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Last-Modified": "Wed, 02 Jul 2025 23:46:41 GMT",
+    "X-Backend-Delete-Timestamp": "0000000000.00000",
+    "X-Backend-Put-Timestamp": "1751500001.00000",
+    "X-Backend-Sharding-State": "unsharded",
+    "X-Backend-Status-Changed-At": "1751500000.00000",
+    "X-Backend-Storage-Policy-Index": "0",
+    "X-Backend-Timestamp": "1751500000.00000",
+    "X-Container-Bytes-Used": "19",
+    "X-Container-Meta-Color": "blue",
+    "X-Container-Object-Count": "4",
+    "X-Container-Read": ".r:*",
+    "X-Put-Timestamp": "1751500001.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 204
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "get-json",
+   "method": "GET",
+   "path": "/sda1/0/a/c",
+   "query": "format=json",
+   "response_body": "[{\"bytes\": 5, \"hash\": \"e1\", \"name\": \"o1\", \"content_type\": \"text/plain\", \"last_modified\": \"2025-07-02T23:46:42.000000\"}, {\"bytes\": 1, \"hash\": \"e3\", \"name\": \"photos/x\", \"content_type\": \"text/x\", \"last_modified\": \"2025-07-02T23:46:42.000000\"}, {\"bytes\": 2, \"hash\": \"e4\", \"name\": \"photos/y\", \"content_type\": \"text/y\", \"last_modified\": \"2025-07-02T23:46:42.000000\"}, {\"bytes\": 99, \"hash\": \"e2\", \"name\": \"\\u4e2d\\u6587 obj\", \"content_type\": \"app/slo\", \"last_modified\": \"2025-07-02T23:46:42.000000\"}]",
+   "response_headers": {
+    "Content-Type": "application/json; charset=utf-8",
+    "Last-Modified": "Wed, 02 Jul 2025 23:46:41 GMT",
+    "X-Backend-Delete-Timestamp": "0000000000.00000",
+    "X-Backend-Put-Timestamp": "1751500001.00000",
+    "X-Backend-Record-Storage-Policy-Index": "0",
+    "X-Backend-Record-Type": "object",
+    "X-Backend-Sharding-State": "unsharded",
+    "X-Backend-Status-Changed-At": "1751500000.00000",
+    "X-Backend-Storage-Policy-Index": "0",
+    "X-Backend-Timestamp": "1751500000.00000",
+    "X-Container-Bytes-Used": "19",
+    "X-Container-Meta-Color": "blue",
+    "X-Container-Object-Count": "4",
+    "X-Container-Read": ".r:*",
+    "X-Put-Timestamp": "1751500001.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "get-plain",
+   "method": "GET",
+   "path": "/sda1/0/a/c",
+   "query": "",
+   "response_body": "o1\nphotos/x\nphotos/y\n\u4e2d\u6587 obj\n",
+   "response_headers": {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Last-Modified": "Wed, 02 Jul 2025 23:46:41 GMT",
+    "X-Backend-Delete-Timestamp": "0000000000.00000",
+    "X-Backend-Put-Timestamp": "1751500001.00000",
+    "X-Backend-Record-Storage-Policy-Index": "0",
+    "X-Backend-Record-Type": "object",
+    "X-Backend-Sharding-State": "unsharded",
+    "X-Backend-Status-Changed-At": "1751500000.00000",
+    "X-Backend-Storage-Policy-Index": "0",
+    "X-Backend-Timestamp": "1751500000.00000",
+    "X-Container-Bytes-Used": "19",
+    "X-Container-Meta-Color": "blue",
+    "X-Container-Object-Count": "4",
+    "X-Container-Read": ".r:*",
+    "X-Put-Timestamp": "1751500001.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "get-xml",
+   "method": "GET",
+   "path": "/sda1/0/a/c",
+   "query": "format=xml",
+   "response_body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<container name=\"c\"><object><name>o1</name><hash>e1</hash><bytes>5</bytes><content_type>text/plain</content_type><last_modified>2025-07-02T23:46:42.000000</last_modified></object><object><name>photos/x</name><hash>e3</hash><bytes>1</bytes><content_type>text/x</content_type><last_modified>2025-07-02T23:46:42.000000</last_modified></object><object><name>photos/y</name><hash>e4</hash><bytes>2</bytes><content_type>text/y</content_type><last_modified>2025-07-02T23:46:42.000000</last_modified></object><object><name>\u4e2d\u6587 obj</name><hash>e2</hash><bytes>99</bytes><content_type>app/slo</content_type><last_modified>2025-07-02T23:46:42.000000</last_modified></object></container>",
+   "response_headers": {
+    "Content-Type": "application/xml; charset=utf-8",
+    "Last-Modified": "Wed, 02 Jul 2025 23:46:41 GMT",
+    "X-Backend-Delete-Timestamp": "0000000000.00000",
+    "X-Backend-Put-Timestamp": "1751500001.00000",
+    "X-Backend-Record-Storage-Policy-Index": "0",
+    "X-Backend-Record-Type": "object",
+    "X-Backend-Sharding-State": "unsharded",
+    "X-Backend-Status-Changed-At": "1751500000.00000",
+    "X-Backend-Storage-Policy-Index": "0",
+    "X-Backend-Timestamp": "1751500000.00000",
+    "X-Container-Bytes-Used": "19",
+    "X-Container-Meta-Color": "blue",
+    "X-Container-Object-Count": "4",
+    "X-Container-Read": ".r:*",
+    "X-Put-Timestamp": "1751500001.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "get-prefix-delim",
+   "method": "GET",
+   "path": "/sda1/0/a/c",
+   "query": "format=json&prefix=photos/&delimiter=/",
+   "response_body": "[{\"bytes\": 1, \"hash\": \"e3\", \"name\": \"photos/x\", \"content_type\": \"text/x\", \"last_modified\": \"2025-07-02T23:46:42.000000\"}, {\"bytes\": 2, \"hash\": \"e4\", \"name\": \"photos/y\", \"content_type\": \"text/y\", \"last_modified\": \"2025-07-02T23:46:42.000000\"}]",
+   "response_headers": {
+    "Content-Type": "application/json; charset=utf-8",
+    "Last-Modified": "Wed, 02 Jul 2025 23:46:41 GMT",
+    "X-Backend-Delete-Timestamp": "0000000000.00000",
+    "X-Backend-Put-Timestamp": "1751500001.00000",
+    "X-Backend-Record-Storage-Policy-Index": "0",
+    "X-Backend-Record-Type": "object",
+    "X-Backend-Sharding-State": "unsharded",
+    "X-Backend-Status-Changed-At": "1751500000.00000",
+    "X-Backend-Storage-Policy-Index": "0",
+    "X-Backend-Timestamp": "1751500000.00000",
+    "X-Container-Bytes-Used": "19",
+    "X-Container-Meta-Color": "blue",
+    "X-Container-Object-Count": "4",
+    "X-Container-Read": ".r:*",
+    "X-Put-Timestamp": "1751500001.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "get-delim-only",
+   "method": "GET",
+   "path": "/sda1/0/a/c",
+   "query": "format=json&delimiter=/",
+   "response_body": "[{\"bytes\": 5, \"hash\": \"e1\", \"name\": \"o1\", \"content_type\": \"text/plain\", \"last_modified\": \"2025-07-02T23:46:42.000000\"}, {\"subdir\": \"photos/\"}, {\"bytes\": 99, \"hash\": \"e2\", \"name\": \"\\u4e2d\\u6587 obj\", \"content_type\": \"app/slo\", \"last_modified\": \"2025-07-02T23:46:42.000000\"}]",
+   "response_headers": {
+    "Content-Type": "application/json; charset=utf-8",
+    "Last-Modified": "Wed, 02 Jul 2025 23:46:41 GMT",
+    "X-Backend-Delete-Timestamp": "0000000000.00000",
+    "X-Backend-Put-Timestamp": "1751500001.00000",
+    "X-Backend-Record-Storage-Policy-Index": "0",
+    "X-Backend-Record-Type": "object",
+    "X-Backend-Sharding-State": "unsharded",
+    "X-Backend-Status-Changed-At": "1751500000.00000",
+    "X-Backend-Storage-Policy-Index": "0",
+    "X-Backend-Timestamp": "1751500000.00000",
+    "X-Container-Bytes-Used": "19",
+    "X-Container-Meta-Color": "blue",
+    "X-Container-Object-Count": "4",
+    "X-Container-Read": ".r:*",
+    "X-Put-Timestamp": "1751500001.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "get-path",
+   "method": "GET",
+   "path": "/sda1/0/a/c",
+   "query": "format=json&path=photos",
+   "response_body": "[{\"bytes\": 1, \"hash\": \"e3\", \"name\": \"photos/x\", \"content_type\": \"text/x\", \"last_modified\": \"2025-07-02T23:46:42.000000\"}, {\"bytes\": 2, \"hash\": \"e4\", \"name\": \"photos/y\", \"content_type\": \"text/y\", \"last_modified\": \"2025-07-02T23:46:42.000000\"}]",
+   "response_headers": {
+    "Content-Type": "application/json; charset=utf-8",
+    "Last-Modified": "Wed, 02 Jul 2025 23:46:41 GMT",
+    "X-Backend-Delete-Timestamp": "0000000000.00000",
+    "X-Backend-Put-Timestamp": "1751500001.00000",
+    "X-Backend-Record-Storage-Policy-Index": "0",
+    "X-Backend-Record-Type": "object",
+    "X-Backend-Sharding-State": "unsharded",
+    "X-Backend-Status-Changed-At": "1751500000.00000",
+    "X-Backend-Storage-Policy-Index": "0",
+    "X-Backend-Timestamp": "1751500000.00000",
+    "X-Container-Bytes-Used": "19",
+    "X-Container-Meta-Color": "blue",
+    "X-Container-Object-Count": "4",
+    "X-Container-Read": ".r:*",
+    "X-Put-Timestamp": "1751500001.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "get-marker",
+   "method": "GET",
+   "path": "/sda1/0/a/c",
+   "query": "format=json&marker=o1",
+   "response_body": "[{\"bytes\": 1, \"hash\": \"e3\", \"name\": \"photos/x\", \"content_type\": \"text/x\", \"last_modified\": \"2025-07-02T23:46:42.000000\"}, {\"bytes\": 2, \"hash\": \"e4\", \"name\": \"photos/y\", \"content_type\": \"text/y\", \"last_modified\": \"2025-07-02T23:46:42.000000\"}, {\"bytes\": 99, \"hash\": \"e2\", \"name\": \"\\u4e2d\\u6587 obj\", \"content_type\": \"app/slo\", \"last_modified\": \"2025-07-02T23:46:42.000000\"}]",
+   "response_headers": {
+    "Content-Type": "application/json; charset=utf-8",
+    "Last-Modified": "Wed, 02 Jul 2025 23:46:41 GMT",
+    "X-Backend-Delete-Timestamp": "0000000000.00000",
+    "X-Backend-Put-Timestamp": "1751500001.00000",
+    "X-Backend-Record-Storage-Policy-Index": "0",
+    "X-Backend-Record-Type": "object",
+    "X-Backend-Sharding-State": "unsharded",
+    "X-Backend-Status-Changed-At": "1751500000.00000",
+    "X-Backend-Storage-Policy-Index": "0",
+    "X-Backend-Timestamp": "1751500000.00000",
+    "X-Container-Bytes-Used": "19",
+    "X-Container-Meta-Color": "blue",
+    "X-Container-Object-Count": "4",
+    "X-Container-Read": ".r:*",
+    "X-Put-Timestamp": "1751500001.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "get-reverse",
+   "method": "GET",
+   "path": "/sda1/0/a/c",
+   "query": "format=json&reverse=true",
+   "response_body": "[{\"bytes\": 99, \"hash\": \"e2\", \"name\": \"\\u4e2d\\u6587 obj\", \"content_type\": \"app/slo\", \"last_modified\": \"2025-07-02T23:46:42.000000\"}, {\"bytes\": 2, \"hash\": \"e4\", \"name\": \"photos/y\", \"content_type\": \"text/y\", \"last_modified\": \"2025-07-02T23:46:42.000000\"}, {\"bytes\": 1, \"hash\": \"e3\", \"name\": \"photos/x\", \"content_type\": \"text/x\", \"last_modified\": \"2025-07-02T23:46:42.000000\"}, {\"bytes\": 5, \"hash\": \"e1\", \"name\": \"o1\", \"content_type\": \"text/plain\", \"last_modified\": \"2025-07-02T23:46:42.000000\"}]",
+   "response_headers": {
+    "Content-Type": "application/json; charset=utf-8",
+    "Last-Modified": "Wed, 02 Jul 2025 23:46:41 GMT",
+    "X-Backend-Delete-Timestamp": "0000000000.00000",
+    "X-Backend-Put-Timestamp": "1751500001.00000",
+    "X-Backend-Record-Storage-Policy-Index": "0",
+    "X-Backend-Record-Type": "object",
+    "X-Backend-Sharding-State": "unsharded",
+    "X-Backend-Status-Changed-At": "1751500000.00000",
+    "X-Backend-Storage-Policy-Index": "0",
+    "X-Backend-Timestamp": "1751500000.00000",
+    "X-Container-Bytes-Used": "19",
+    "X-Container-Meta-Color": "blue",
+    "X-Container-Object-Count": "4",
+    "X-Container-Read": ".r:*",
+    "X-Put-Timestamp": "1751500001.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "get-limit-too-big",
+   "method": "GET",
+   "path": "/sda1/0/a/c",
+   "query": "limit=10001",
+   "response_body": "Maximum limit is 10000",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 412
+  },
+  {
+   "body": "[{\"name\": \"upd1\", \"created_at\": \"1751500003.00000\", \"size\": 7, \"content_type\": \"text/up\", \"etag\": \"eu\", \"deleted\": 0, \"storage_policy_index\": 0}, {\"name\": \"o1\", \"created_at\": \"1751500003.00000\", \"size\": 9, \"content_type\": \"text/newer\", \"etag\": \"e1b\", \"deleted\": 0, \"storage_policy_index\": 0}]",
+   "headers": {
+    "X-Timestamp": "1751500003.00000"
+   },
+   "label": "update-verb",
+   "method": "UPDATE",
+   "path": "/sda1/0/a/c",
+   "query": "",
+   "response_body": "<html><h1>Accepted</h1><p>The request is accepted for processing.</p></html>",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 202
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "get-after-update",
+   "method": "GET",
+   "path": "/sda1/0/a/c",
+   "query": "format=json",
+   "response_body": "[{\"bytes\": 9, \"hash\": \"e1b\", \"name\": \"o1\", \"content_type\": \"text/newer\", \"last_modified\": \"2025-07-02T23:46:43.000000\"}, {\"bytes\": 1, \"hash\": \"e3\", \"name\": \"photos/x\", \"content_type\": \"text/x\", \"last_modified\": \"2025-07-02T23:46:42.000000\"}, {\"bytes\": 2, \"hash\": \"e4\", \"name\": \"photos/y\", \"content_type\": \"text/y\", \"last_modified\": \"2025-07-02T23:46:42.000000\"}, {\"bytes\": 7, \"hash\": \"eu\", \"name\": \"upd1\", \"content_type\": \"text/up\", \"last_modified\": \"2025-07-02T23:46:43.000000\"}, {\"bytes\": 99, \"hash\": \"e2\", \"name\": \"\\u4e2d\\u6587 obj\", \"content_type\": \"app/slo\", \"last_modified\": \"2025-07-02T23:46:42.000000\"}]",
+   "response_headers": {
+    "Content-Type": "application/json; charset=utf-8",
+    "Last-Modified": "Wed, 02 Jul 2025 23:46:41 GMT",
+    "X-Backend-Delete-Timestamp": "0000000000.00000",
+    "X-Backend-Put-Timestamp": "1751500001.00000",
+    "X-Backend-Record-Storage-Policy-Index": "0",
+    "X-Backend-Record-Type": "object",
+    "X-Backend-Sharding-State": "unsharded",
+    "X-Backend-Status-Changed-At": "1751500000.00000",
+    "X-Backend-Storage-Policy-Index": "0",
+    "X-Backend-Timestamp": "1751500000.00000",
+    "X-Container-Bytes-Used": "30",
+    "X-Container-Meta-Color": "blue",
+    "X-Container-Object-Count": "5",
+    "X-Container-Read": ".r:*",
+    "X-Put-Timestamp": "1751500001.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 200
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Timestamp": "1751500004.00000"
+   },
+   "label": "delete-container-conflict",
+   "method": "DELETE",
+   "path": "/sda1/0/a/c",
+   "query": "",
+   "response_body": "<html><h1>Conflict</h1><p>There was a conflict when trying to complete your request.</p></html>",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 409
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Timestamp": "1751500004.00000"
+   },
+   "label": "delete-obj-o1",
+   "method": "DELETE",
+   "path": "/sda1/0/a/c/o1",
+   "query": "",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 204
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Timestamp": "1751500004.00000"
+   },
+   "label": "delete-obj-unicode",
+   "method": "DELETE",
+   "path": "/sda1/0/a/c/%E4%B8%AD%E6%96%87%20obj",
+   "query": "",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 204
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Timestamp": "1751500004.00000"
+   },
+   "label": "delete-obj-photos-x",
+   "method": "DELETE",
+   "path": "/sda1/0/a/c/photos/x",
+   "query": "",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 204
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Timestamp": "1751500004.00000"
+   },
+   "label": "delete-obj-photos-y",
+   "method": "DELETE",
+   "path": "/sda1/0/a/c/photos/y",
+   "query": "",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 204
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Timestamp": "1751500004.00000"
+   },
+   "label": "delete-obj-upd1",
+   "method": "DELETE",
+   "path": "/sda1/0/a/c/upd1",
+   "query": "",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 204
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Timestamp": "1751500005.00000"
+   },
+   "label": "delete-container",
+   "method": "DELETE",
+   "path": "/sda1/0/a/c",
+   "query": "",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 204
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "get-after-delete",
+   "method": "GET",
+   "path": "/sda1/0/a/c",
+   "query": "format=json",
+   "response_body": "<html><h1>Not Found</h1><p>The resource could not be found.</p></html>",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8",
+    "X-Backend-Delete-Timestamp": "1751500005.00000",
+    "X-Backend-Put-Timestamp": "1751500001.00000",
+    "X-Backend-Status-Changed-At": "1751500005.00000",
+    "X-Backend-Storage-Policy-Index": "0",
+    "X-Backend-Timestamp": "1751500000.00000"
+   },
+   "status": 404
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Timestamp": "1751500006.00000"
+   },
+   "label": "put-recreate",
+   "method": "PUT",
+   "path": "/sda1/0/a/c",
+   "query": "",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8",
+    "X-Backend-Storage-Policy-Index": "0"
+   },
+   "status": 201
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "head-recreated",
+   "method": "HEAD",
+   "path": "/sda1/0/a/c",
+   "query": "",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Last-Modified": "Wed, 02 Jul 2025 23:46:46 GMT",
+    "X-Backend-Delete-Timestamp": "1751500005.00000",
+    "X-Backend-Put-Timestamp": "1751500006.00000",
+    "X-Backend-Sharding-State": "unsharded",
+    "X-Backend-Status-Changed-At": "1751500006.00000",
+    "X-Backend-Storage-Policy-Index": "0",
+    "X-Backend-Timestamp": "1751500000.00000",
+    "X-Container-Bytes-Used": "0",
+    "X-Container-Object-Count": "0",
+    "X-Put-Timestamp": "1751500006.00000",
+    "X-Timestamp": "1751500000.00000"
+   },
+   "status": 204
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "head-missing",
+   "method": "HEAD",
+   "path": "/sda1/0/a/nope",
+   "query": "",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8",
+    "X-Backend-Delete-Timestamp": "0000000000.00000",
+    "X-Backend-Put-Timestamp": "0000000000.00000",
+    "X-Backend-Status-Changed-At": "0000000000.00000",
+    "X-Backend-Storage-Policy-Index": "0",
+    "X-Backend-Timestamp": "0000000000.00000"
+   },
+   "status": 404
+  },
+  {
+   "body": "",
+   "headers": {
+    "X-Backend-Storage-Policy-Index": "0",
+    "X-Content-Type": "text/q",
+    "X-Etag": "eq",
+    "X-Size": "0",
+    "X-Timestamp": "1751500002.00000"
+   },
+   "label": "put-obj-autocreate",
+   "method": "PUT",
+   "path": "/sda1/0/.expiring_objects/queue/o",
+   "query": "",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 201
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "options",
+   "method": "OPTIONS",
+   "path": "/sda1/0/a/c",
+   "query": "",
+   "response_body": "",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 200
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "bad-method",
+   "method": "PATCH",
+   "path": "/sda1/0/a/c",
+   "query": "",
+   "response_body": "<html><h1>Method Not Allowed</h1><p>The method is not allowed for this resource.</p></html>",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 405
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "bad-drive",
+   "method": "GET",
+   "path": "/nodrive/0/a/c",
+   "query": "",
+   "response_body": "<html><h1>Insufficient Storage</h1><p>There was not enough space to save the resource. Drive: nodrive</p></html>",
+   "response_headers": {
+    "Content-Type": "text/html; charset=UTF-8"
+   },
+   "status": 507
+  },
+  {
+   "body": "",
+   "headers": {},
+   "label": "no-timestamp",
+   "method": "PUT",
+   "path": "/sda1/0/a/c2",
+   "query": "",
+   "response_body": "Missing X-Timestamp header",
+   "response_headers": {
+    "Content-Type": "text/plain"
+   },
+   "status": 400
+  }
+ ]
+}

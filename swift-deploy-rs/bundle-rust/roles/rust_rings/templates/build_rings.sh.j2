@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+# Ring build plan for the whole cluster; runs once on the first proxy node.
+# swift-ring-builder argv (verified against crates/swift-cli/src/bin/ring_builder.rs):
+#   <ring.gz> create <part_power> <replicas> [<min_part_hours> is accepted and ignored]
+#   <ring.gz> add r<R>z<Z>-<ip>:<port>/<device> <weight>
+#   <ring.gz> rebalance
+# Zones are assigned per node (z1..zN, group order). Every node has the
+# single directory device d1 (rust stack v1 — no managed block devices).
+set -euo pipefail
+SWIFT_DIR=/etc/swift
+RB=/usr/local/bin/swift-ring-builder
+cd "$SWIFT_DIR"
+
+# Rebuild everything whenever this rendered plan changes (the script content
+# is deterministic from the inventory). A stale ring left by anything else
+# never survives: only a stamp written by THIS plan skips the rebuild.
+STAMP="$SWIFT_DIR/.rings.built"
+SELF_SHA=$(sha256sum "$0" | awk '{print $1}')
+if [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$SELF_SHA" ]; then
+  MISSING=0
+  for f in account.ring.gz container.ring.gz {% for policy in swift_policies %}{{ 'object.ring.gz' if policy.index == 0 else 'object-' ~ policy.index ~ '.ring.gz' }} {% endfor %}; do
+    [ -f "$f" ] || MISSING=1
+  done
+  if [ "$MISSING" = 0 ]; then
+    echo "RINGS-CURRENT"
+    exit 0
+  fi
+fi
+
+# ---- account ring ----
+rm -f account.ring.gz account.ring.gz.builder.json
+  "$RB" account.ring.gz create {{ account_swift_partition_power }} {{ account_swift_replicas }} {{ account_swift_minimum_time }}
+{% for host in groups['account_servers'] %}
+{% set zone = loop.index %}
+{% set hv = hostvars[host] %}
+  "$RB" account.ring.gz add r1z{{ zone }}-{{ hv.storage_network_address }}:{{ account_bind_port }}R{{ hv.replication_network_address }}:{{ account_bind_port }}/d1 {{ swift_device_weight }}
+{% endfor %}
+"$RB" account.ring.gz rebalance
+
+# ---- container ring ----
+rm -f container.ring.gz container.ring.gz.builder.json
+  "$RB" container.ring.gz create {{ container_swift_partition_power }} {{ container_swift_replicas }} {{ container_swift_minimum_time }}
+{% for host in groups['container_servers'] %}
+{% set zone = loop.index %}
+{% set hv = hostvars[host] %}
+  "$RB" container.ring.gz add r1z{{ zone }}-{{ hv.storage_network_address }}:{{ container_bind_port }}R{{ hv.replication_network_address }}:{{ container_bind_port }}/d1 {{ swift_device_weight }}
+{% endfor %}
+"$RB" container.ring.gz rebalance
+
+# ---- object rings, one per storage policy ----
+{% for policy in swift_policies %}
+{% set ring_file = 'object.ring.gz' if policy.index == 0 else 'object-' ~ policy.index ~ '.ring.gz' %}
+rm -f {{ ring_file }} {{ ring_file }}.builder.json
+  "$RB" {{ ring_file }} create {{ policy.partition_power }} {{ policy.replicas }} {{ policy.min_part_hours }}
+{% for host in groups['object_servers'] %}
+{% set zone = loop.index %}
+{% set hv = hostvars[host] %}
+  "$RB" {{ ring_file }} add r1z{{ zone }}-{{ hv.storage_network_address }}:{{ object_bind_port }}R{{ hv.replication_network_address }}:{{ object_bind_port }}/d1 {{ swift_device_weight }}
+{% endfor %}
+"$RB" {{ ring_file }} rebalance
+{% endfor %}
+
+echo "$SELF_SHA" > "$STAMP"
+ls -l "$SWIFT_DIR"/*.ring.gz
+echo "RINGS-REBUILT"

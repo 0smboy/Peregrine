@@ -1,0 +1,10 @@
+#!/bin/bash
+device=$(ls -ld  /srv/node/* |awk '{print $NF}')
+for i in $device
+do
+device_owner=$(ls  -ld $i | awk '{print $3":"$4}')
+if [ $device_owner != "swift:swift" ]
+then
+chown -R swift.swift $i
+fi
+done

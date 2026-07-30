@@ -1,0 +1,182 @@
+---
+account_ring:
+    create_ring_info:
+        account_swift_partition_power: 10
+        account_swift_replicas: 3
+        account_swift_minimum_time: 1
+    ring_content:
+        # 节点盘数量与名称对称,配置格式如下
+        - region: 1
+          zone: 1
+          # 非整段的 IP 可以通过`,`分隔写多个段，或者单独一个 IP
+          # 例如 192.168.2.51-192.168.2.53,192.168.2.100-192.168.2.105,192.168.2.201
+          storage_ips:     192.168.2.51-192.168.2.53
+          replication_ips: 192.168.2.51-192.168.2.53
+          common_disk_info:
+              # 格式: 端口号_{"hdd":hdd序号,"ssd":ssd序号}_权重
+              # 注意: 盘符要加双引号,下划线为连接符,不能有空格
+              - 6002_{"hdd":"001-010","ssd":""}_100
+          # 节点盘数量不对称,配置指定机器额外盘的格式如下,对称则为空
+          dedicated_disk_info:
+              # 格式: 存储网络ip_复制网络ip_端口号_{"hdd":hdd序号,"ssd":ssd序号}_权重
+              # 注意: 盘符要加双引号,下划线为连接符,不能有空格
+              # - 192.168.2.51_192.168.2.51_6002_{"hdd":"","ssd":"001-002"}_100
+        # 配置多个region/zone时,配置不同的region/zone的格式如下，如果只需一个zone，则可把下面13行注释：
+        - region: 1
+          zone: 2
+          storage_ips:     192.168.2.54-192.168.2.54
+          replication_ips: 192.168.2.54-192.168.2.54
+          common_disk_info:
+              # 格式: 端口号_{"hdd":hdd序号,"ssd":ssd序号}_权重
+              # 注意: 盘符要加双引号,下划线为连接符,不能有空格
+              - 6002_{"hdd":"001-010","ssd":""}_100
+          # 节点盘数量不对称,配置指定机器额外盘的格式如下,对称则为空
+          dedicated_disk_info:
+              # 格式: 存储网络ip_复制网络ip_端口号_{"hdd":hdd序号,"ssd":ssd序号}_权重
+              # 注意: 盘符要加双引号,下划线为连接符,不能有空格
+              # - 192.168.2.54_192.168.2.54_6002_{"hdd":"","ssd":"001-002"}_100
+
+
+container_ring:
+    create_ring_info:
+        container_swift_partition_power: 10
+        container_swift_replicas: 3
+        container_swift_minimum_time: 1
+    ring_content:
+        # 节点盘数量与名称对称,配置格式如下
+        - region: 1
+          zone: 1
+          storage_ips:     192.168.2.51-192.168.2.53
+          replication_ips: 192.168.2.51-192.168.2.53
+          common_disk_info:
+              # 格式: 端口号_{"hdd":hdd序号,"ssd":ssd序号}_权重
+              # 注意: 盘符要加双引号,下划线为连接符,不能有空格
+              - 6001_{"hdd":"001-010","ssd":""}_100
+          # 节点盘数量不对称,配置指定机器额外盘的格式如下,对称则为空
+          dedicated_disk_info:
+              # 格式: 存储网络ip_复制网络ip_端口号_{"hdd":hdd序号,"ssd":ssd序号}_权重
+              # 注意: 盘符要加双引号,下划线为连接符,不能有空格
+              # - 192.168.2.51_192.168.2.51_6001_{"hdd":"","ssd":"001-002"}_100
+        # 配置多个region/zone时,配置不同的region/zone的格式如下，如果只需一个zone，则可把下面13行注释：
+        - region: 1
+          zone: 2
+          storage_ips:     192.168.2.54-192.168.2.54
+          replication_ips: 192.168.2.54-192.168.2.54
+          common_disk_info:
+              # 格式: 端口号_{"hdd":hdd序号,"ssd":ssd序号}_权重
+              # 注意: 盘符要加双引号,下划线为连接符,不能有空格
+              - 6001_{"hdd":"001-010","ssd":""}_100
+          # 节点盘数量不对称,配置指定机器额外盘的格式如下,对称则为空
+          dedicated_disk_info:
+              # 格式: 存储网络ip_复制网络ip_端口号_{"hdd":hdd序号,"ssd":ssd序号}_权重
+              # 注意: 盘符要加双引号,下划线为连接符,不能有空格
+              # - 192.168.2.54_192.168.2.54_6001_{"hdd":"","ssd":"001-002"}_100
+
+
+object_rings:
+    - create_ring_info:
+          builder_name: object  # 将会生成object.builder
+          object_swift_partition_power: 10
+          # 如果该object ring对应的策略为纠删码策略
+          # object_swift_replicas = 数据片数量 + 校验片数量
+          object_swift_replicas: 3
+          object_swift_minimum_time: 1
+      # ************注意事项************
+      # 只有一个policy允许设置default属性
+      # name需要唯一,name中不能够有下划线
+      # policy顺序和group_vars/all中object_rings的name有对应关系
+      # 纠删码数据片数量+校验片数量不小于对应object ring中添加的盘数总数
+      #
+      # 如果使用纠删码策略的话,
+      # ec_num_data_fragments + ec_num_parity_fragments
+      # 必须等于对应object builder的object_swift_replicas
+      # ********************************
+      policy:
+          name: Policy-0
+          aliases: 'yellow, orange'
+          default: yes
+          policy_type: replication
+      ring_content:
+          # 节点盘数量与名称对称,配置格式如下
+          - region: 1
+            zone: 1
+            storage_ips:     192.168.2.51-192.168.2.53
+            replication_ips: 192.168.2.51-192.168.2.53
+            common_disk_info:
+                # 格式: 端口号_{"hdd":hdd序号,"ssd":ssd序号}_权重
+                # 注意: 盘符要加双引号,下划线为连接符,不能有空格
+                - 6000_{"hdd":"001-010","ssd":""}_100
+            # 节点盘数量不对称,配置指定机器额外盘的格式如下,对称则为空
+            dedicated_disk_info:
+                # 格式: 存储网络ip_复制网络ip_端口号_{"hdd":hdd序号,"ssd":ssd序号}_权重
+                # 注意: 盘符要加双引号,下划线为连接符,不能有空格
+                # - 192.168.2.51_192.168.2.51_6000_{"hdd":"","ssd":"001-002"}_100
+          # 配置多个region/zone时,配置不同的region/zone的格式如下，如果只需一个zone，则可把下面13行注释：
+          - region: 1
+            zone: 2
+            storage_ips:     192.168.2.54-192.168.2.54
+            replication_ips: 192.168.2.54-192.168.2.54
+            common_disk_info:
+                # 格式: 端口号_{"hdd":hdd序号,"ssd":ssd序号}_权重
+                # 注意: 盘符要加双引号,下划线为连接符,不能有空格
+                - 6000_{"hdd":"001-010","ssd":""}_100
+            # 节点盘数量不对称,配置指定机器额外盘的格式如下,对称则为空
+            dedicated_disk_info:
+                # 格式: 存储网络ip_复制网络ip_端口号_{"hdd":hdd序号,"ssd":ssd序号}_权重
+                # 注意: 盘符要加双引号,下划线为连接符,不能有空格
+                # - 192.168.2.54_192.168.2.54_6000_{"hdd":"","ssd":"001-002"}_100
+
+    - create_ring_info:
+          builder_name: object-1  # 将会生成object-1.builder
+          object_swift_partition_power: 10
+          # 如果该object ring对应的策略为纠删码策略
+          # object_swift_replicas = 数据片数量 + 校验片数量
+          object_swift_replicas: 3
+          object_swift_minimum_time: 1
+      # ************注意事项************
+      # 只有一个policy允许设置default属性
+      # name需要唯一,name中不能够有下划线
+      # policy顺序和group_vars/all中object_rings的name有对应关系
+      # 纠删码数据片数量+校验片数量不小于对应object ring中添加的盘数总数
+      #
+      # 如果使用纠删码策略的话,
+      # ec_num_data_fragments + ec_num_parity_fragments
+      # 必须等于对应object builder的object_swift_replicas
+      # ********************************
+      policy:
+          name: ec
+          aliases: ec
+          policy_type: erasure_coding
+          ec_type: liberasurecode_rs_vand
+          ec_num_data_fragments: 2
+          ec_num_parity_fragments: 1
+          ec_object_segment_size: 1048576
+      ring_content:
+          # 节点盘数量与名称对称,配置格式如下
+          - region: 1
+            zone: 1
+            storage_ips:     192.168.2.51-192.168.2.53
+            replication_ips: 192.168.2.51-192.168.2.53
+            common_disk_info:
+                # 格式: 端口号_{"hdd":hdd序号,"ssd":ssd序号}_权重
+                # 注意: 盘符要加双引号,下划线为连接符,不能有空格
+                - 6000_{"hdd":"001-010","ssd":""}_100
+            # 节点盘数量不对称,配置指定机器额外盘的格式如下,对称则为空
+            dedicated_disk_info:
+                # 格式: 存储网络ip_复制网络ip_端口号_{"hdd":hdd序号,"ssd":ssd序号}_权重
+                # 注意: 盘符要加双引号,下划线为连接符,不能有空格
+                # - 192.168.2.51_192.168.2.51_6000_{"hdd":"","ssd":"001-002"}_100
+          # 配置多个region/zone时,配置不同的region/zone的格式如下，如果只需一个zone，则可把下面13行注释：
+          - region: 1
+            zone: 2
+            storage_ips:     192.168.2.54-192.168.2.54
+            replication_ips: 192.168.2.54-192.168.2.54
+            common_disk_info:
+                # 格式: 端口号_{"hdd":hdd序号,"ssd":ssd序号}_权重
+                # 注意: 盘符要加双引号,下划线为连接符,不能有空格
+                - 6000_{"hdd":"001-010","ssd":""}_100
+            # 节点盘数量不对称,配置指定机器额外盘的格式如下,对称则为空
+            dedicated_disk_info:
+                # 格式: 存储网络ip_复制网络ip_端口号_{"hdd":hdd序号,"ssd":ssd序号}_权重
+                # 注意: 盘符要加双引号,下划线为连接符,不能有空格
+                # - 192.168.2.54_192.168.2.54_6000_{"hdd":"","ssd":"001-002"}_100

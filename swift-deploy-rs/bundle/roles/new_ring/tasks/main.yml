@@ -1,0 +1,35 @@
+---
+- name: test
+  debug:
+    msg: "{{ policy_section }}"
+  when: inventory_hostname == groups['proxy_servers'][0]
+  tags: test
+
+- name: Create builder and ring file.
+  include: add_object_ring.yml
+  when: inventory_hostname == groups['proxy_servers'][0]
+  tags: create_ring
+
+- block:
+  - name: Generate uniq dir name for distribute
+    shell: uuidgen
+    register: uniq_dir
+  - name: Make uniq_dir
+    shell: "mkdir /tmp/{{ uniq_dir.stdout }}"
+  - name: Set uniq_dir fact
+    set_fact:
+      uniq_dir: "{{ uniq_dir.stdout }}"
+  - name: debug
+    debug:
+      msg: "tmp dir: {{ uniq_dir }}"
+  run_once: true
+  delegate_to: localhost
+  tags: distribute_ring
+
+- name: Distribute builder and ring file.
+  include: distribute_ring.yml uniq_dir={{ uniq_dir }}
+  tags: distribute_ring
+
+- name: Add policy config to swift.conf and restart services
+  include: restart_services.yml
+  tags: restart_services

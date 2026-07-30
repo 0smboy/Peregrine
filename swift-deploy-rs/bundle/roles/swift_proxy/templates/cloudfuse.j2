@@ -1,0 +1,16 @@
+username=test:tester
+api_key=testing
+{% if not use_lb and proxy_mode == "http" %}
+authurl=http://{{ auth_url_ip }}:{{ proxy_server_bind_port }}/auth/v1.0
+{% endif %}
+{% if not use_lb and proxy_mode == "https" %}
+authurl=https://{{ auth_url_ip }}:{{ proxy_server_bind_port }}/auth/v1.0
+verify_ssl = True
+{% endif %}
+{% if use_lb and lb_mode == "http" %}
+authurl=http://{{ auth_url_ip }}:{{ swift_lb_port }}/auth/v1.0
+{% endif %}
+{% if use_lb and lb_mode == "https" %}
+authurl=https://{{ auth_url_ip }}:{{ swift_lb_port }}/auth/v1.0
+verify_ssl = True
+{% endif %}

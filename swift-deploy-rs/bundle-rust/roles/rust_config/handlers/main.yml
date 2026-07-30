@@ -1,0 +1,8 @@
+---
+- name: restart swift services
+  shell: |
+    units=$(systemctl list-units --type=service --state=running --no-legend --plain 'swift-*' 2>/dev/null | awk '{print $1}')
+    for unit in $units; do
+      systemctl try-restart "$unit"
+    done
+    echo "restarted: $units"

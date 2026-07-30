@@ -1,0 +1,70 @@
+name: swift-tempauth
+description: Swift with v1 auth (tempauth) — full write/read/cleanup round trip
+auth:
+  type: temp_auth
+  url: http://127.0.0.1:8080/auth/v1.0
+  user: test:tester
+  key: testing
+storage:
+  type: swift
+  # empty endpoint: use the X-Storage-Url returned by auth
+  endpoint: ""
+  timeout_ms: 60000
+stages:
+  - name: init
+    kind: init
+    workers: 1
+    total_ops: 2
+    sequential: true
+    operations:
+      - type: create_container
+        ratio: 100
+    objects:
+      cprefix: cbrs-
+      containers: { start: 1, end: 2 }
+      oprefix: o
+      objects: { start: 1, end: 1 }
+      size: 1
+  - name: prepare
+    kind: prepare
+    workers: 4
+    total_ops: 100
+    sequential: true
+    operations:
+      - type: write
+        ratio: 100
+    objects:
+      cprefix: cbrs-
+      containers: { start: 1, end: 2 }
+      oprefix: o
+      objects: { start: 1, end: 50 }
+      size: 65536
+  - name: main
+    kind: main
+    workers: 8
+    runtime_secs: 10
+    operations:
+      - type: read
+        ratio: 70
+      - type: write
+        ratio: 30
+    objects:
+      cprefix: cbrs-
+      containers: { start: 1, end: 2 }
+      oprefix: o
+      objects: { start: 1, end: 50 }
+      size: 65536
+  - name: cleanup
+    kind: cleanup
+    workers: 4
+    total_ops: 100
+    sequential: true
+    operations:
+      - type: delete
+        ratio: 100
+    objects:
+      cprefix: cbrs-
+      containers: { start: 1, end: 2 }
+      oprefix: o
+      objects: { start: 1, end: 50 }
+      size: 1

@@ -1,0 +1,40 @@
+! Configuration File for keepalived
+
+global_defs {
+    smtp_server 127.0.0.1
+    smtp_connect_timeout 30
+    router_id LVS_1
+}
+# OStorage_vrrp_script BEGIN
+vrrp_script {{ keepalived_vrrp_script.name }} {
+{% if use_lb %}
+     script   "/etc/keepalived/check_haproxy.sh"
+{% else %}
+     script   "/etc/keepalived/check_swift.sh"
+{% endif %}
+    interval {{ keepalived_vrrp_script.interval }}
+    weight {{ keepalived_vrrp_script.weight }}
+}
+# OStorage_vrrp_script END
+
+# OStorage_vrrp_intance BEGIN
+vrrp_instance swift {
+    state   BACKUP
+    interface {{ keepalived_interface }}
+    virtual_router_id  {{ keepalived_servers.vrrp_instance.virtual_router_id }}
+    priority   {{ keepalived_priority }}
+    advert_int {{ keepalived_servers.vrrp_instance.advert_int }}
+    {{ keepalived_mode }}
+    authentication {
+        auth_type PASS
+        auth_pass {{ keepalived_servers.vrrp_instance.auth_pass }}
+    }
+    virtual_ipaddress {
+        {{ auth_url_ip }}/{{ vip_prefix }}
+    }
+
+    track_script {
+       {{ keepalived_vrrp_script.name }}
+    }
+}
+# OStorage_vrrp_intance END

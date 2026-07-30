@@ -1,0 +1,29 @@
+---
+- name: Check if object-{{ add_object_ring.index }}.builder exist
+  stat: path=/etc/swift/object-{{ add_object_ring.index }}.builder
+  register: builder_exist
+
+- name: Check if object-{{ add_object_ring.index }}.ring.gz exist
+  stat: path=/etc/swift/object-{{ add_object_ring.index }}.ring.gz
+  register: ring_exist
+  tags: create_builder
+
+- name: Fail if builder or ring file exists
+  fail:
+    msg: '/etc/swift/object-{{ add_object_ring.index }}.builder or /etc/swift/object-{{ add_object_ring.index }}.ring.gz exists'
+  when: builder_exist.stat.exists == true or ring_exist.stat.exists == true
+
+- name: Fetch generated new builder and ring file
+  fetch: src=/tmp/swift_builder/{{ item }}
+         dest=/tmp/{{ uniq_dir }}/
+  with_items:
+    - "object-{{ add_object_ring.index }}.builder"
+    - "object-{{ add_object_ring.index }}.ring.gz"
+  when: inventory_hostname == groups['proxy_servers'][0]
+
+- name: Distribute builder and ring to all server
+  copy: src=/tmp/{{ uniq_dir }}/{{ groups['proxy_servers'][0] }}/tmp/swift_builder/{{ item }}
+        dest=/etc/swift
+  with_items:
+    - "object-{{ add_object_ring.index }}.builder"
+    - "object-{{ add_object_ring.index }}.ring.gz"

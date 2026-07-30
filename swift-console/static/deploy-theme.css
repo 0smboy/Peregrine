@@ -1,0 +1,175 @@
+/* Swift Console — Deploy surface theme override.
+   The embedded Deploy workspace is fully CSS-variable driven: every colour
+   lives in its :root and is referenced through var(). This block is appended
+   AFTER the deploy UI's own app.css, so re-pointing :root here re-themes the
+   whole surface to the console palette. No selectors beyond :root are needed.
+
+   Duplicated light/dark blocks rather than light-dark(): the deploy UI nests
+   these tokens inside color-mix(), and the console injects `data-theme` into
+   the proxied HTML anyway, so the duplication costs nothing here.
+
+   The dark values are the console's own surfaces, NOT the deploy UI's native
+   #080a08 — an iframe edge is exactly where a hard colour seam would show. */
+
+:root {
+  color-scheme: light;
+  --bg: #f7f9f8;
+  --surface: #ffffff;
+  --surface-2: #f2f6f3;
+  --surface-3: #eef3ef;
+  --input: #ffffff;
+  --edge: #dfe5e0;
+  --edge-soft: #e9eeea;
+  --text: #212723;
+  --quiet: #5f6a63;
+  --faint: #8a948c;
+  /* accent (was copper) -> console green, dark enough to read as text */
+  --copper: #1d7a50;
+  --copper-soft: #227a4f;
+  --green: #1d7a50;
+  --amber: #8a5a12;
+  --red: #b3362b;
+  --blue: #2f6f8f;
+}
+
+/* No explicit choice: follow the OS, matching the parent console. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #171b18;
+    --surface: #1d221e;
+    --surface-2: #252c27;
+    --surface-3: #2b332d;
+    --input: #0f1310;
+    --edge: #2f372f;
+    --edge-soft: #262d27;
+    --text: #e2e7e3;
+    --quiet: #9ba69f;
+    --faint: #848f88;
+    --copper: #5cd6a1;
+    --copper-soft: #7ee2b8;
+    --green: #5cd6a1;
+    --amber: #d3ad6a;
+    --red: #e58e84;
+    --blue: #74a8cf;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #171b18;
+  --surface: #1d221e;
+  --surface-2: #252c27;
+  --surface-3: #2b332d;
+  --input: #0f1310;
+  --edge: #2f372f;
+  --edge-soft: #262d27;
+  --text: #e2e7e3;
+  --quiet: #9ba69f;
+  --faint: #848f88;
+  --copper: #5cd6a1;
+  --copper-soft: #7ee2b8;
+  --green: #5cd6a1;
+  --amber: #d3ad6a;
+  --red: #e58e84;
+  --blue: #74a8cf;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f7f9f8;
+  --surface: #ffffff;
+  --surface-2: #f2f6f3;
+  --surface-3: #eef3ef;
+  --input: #ffffff;
+  --edge: #dfe5e0;
+  --edge-soft: #e9eeea;
+  --text: #212723;
+  --quiet: #5f6a63;
+  --faint: #8a948c;
+  --copper: #1d7a50;
+  --copper-soft: #227a4f;
+  --green: #1d7a50;
+  --amber: #8a5a12;
+  --red: #b3362b;
+  --blue: #2f6f8f;
+}
+
+/* ---------------------------------------------------------------- layout
+
+   The Deploy workspace was designed as a standalone product: a wide centred
+   page, a large display masthead, its own product mark and its own language
+   switch. Inside the console it is one surface among five, so it adopts the
+   console's density and type scale — same page padding, same 17px page title,
+   same quiet controls — and drops the chrome the console already provides.
+
+   Structure and behaviour are untouched; this is presentation only. */
+
+.console {
+  width: 100%;
+  margin: 0;
+  padding: 22px 28px 16px;
+}
+
+/* The console's sidebar already says which product this is. */
+.product-mark { display: none; }
+
+/* A page title, not a hero. */
+.masthead {
+  align-items: baseline;
+  gap: 16px;
+  padding: 0 0 6px;
+  flex-wrap: wrap;
+}
+.masthead h1 {
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: 0;
+  margin: 0;
+  line-height: 1.3;
+}
+.lead {
+  font-size: 12.5px;
+  max-width: 720px;
+  line-height: 1.55;
+}
+.brand-block { display: flex; flex-direction: column; gap: 4px; }
+.masthead-meta { display: flex; align-items: center; gap: 12px; font-size: 12px; }
+
+/* Language belongs to the console, not to this pane. */
+.language { display: none !important; }
+
+/* Match the console's bordered-panel look rather than inset shadows. */
+.readiness-band {
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  box-shadow: none;
+  margin-bottom: 16px;
+  font-size: 12.5px;
+}
+/* The "current gaps" cell holds a label, a count and a sentence. Upstream lays
+   it out as a grid whose third column is a fixed 48px, so the sentence wraps
+   one word per line — visible in the standalone UI too. Matching the upstream
+   selector's specificity (and coming later) lets a simple row win. */
+.readiness-band > div { padding: 10px 14px; }
+.readiness-band .readiness-missing {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: nowrap;
+}
+.readiness-band .readiness-missing > span:first-child { flex: 0 0 auto; }
+.readiness-band .readiness-missing .quiet {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.workspace-shell { gap: 16px; }
+.step-rail {
+  padding: 12px 0;
+  border-top: 1px solid var(--edge);
+  border-bottom: 1px solid var(--edge-soft);
+  font-size: 12.5px;
+}

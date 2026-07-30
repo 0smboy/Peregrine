@@ -1,0 +1,29 @@
+---
+- name: Create keystone projects
+  command: openstack project create {{ account_info.account_name }} {{ openstack_admin_args }}
+  
+- name: Create keystone users
+  command: openstack user create {{ item.key }} --password {{ item.value }} {{ openstack_admin_args }}
+  with_dict: 
+    - "{{ account_info.regular_users | default({}) }}"
+    - "{{ account_info.privileged_users | default({}) }}"
+    - "{{ account_info.super_users | default({}) }}"
+
+- name: Set swiftmember role
+  command: openstack role add --project {{ account_info.account_name }} --user {{ item.key }} swiftmember {{ openstack_admin_args }}
+  with_dict: "{{ account_info.regular_users | default({}) }}"
+
+- name: Set swiftoperator role
+  command: openstack role add --project {{ account_info.account_name }} --user {{ item.key }} swiftoperator {{ openstack_admin_args }}
+  with_dict: "{{ account_info.privileged_users | default({}) }}"
+
+- name: Set admin roles
+  command: openstack role add --project {{ account_info.account_name }} --user {{ item.key }} admin {{ openstack_admin_args }}
+  with_dict: "{{ account_info.super_users | default({}) }}"
+
+- name: Set ResellerAdmin roles
+  command: openstack role add --project {{ account_info.account_name }} --user {{ item.key }} ResellerAdmin {{ openstack_admin_args }}
+  with_dict: "{{ account_info.super_users | default({}) }}"
+
+- name: Set ResellerAdmin roles to admin user on admin project
+  command: openstack role add --project admin --user admin ResellerAdmin {{ openstack_admin_args }}

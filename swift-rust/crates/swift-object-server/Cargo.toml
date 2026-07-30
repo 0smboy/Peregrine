@@ -1,0 +1,38 @@
+[package]
+name = "swift-object-server"
+description = "Object server for the Rust implementation of OpenStack Swift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+swift-core = { path = "../swift-core" }
+swift-diskfile = { path = "../swift-diskfile" }
+swift-http = { path = "../swift-http" }
+swift-ring = { path = "../swift-ring" }
+libc = "0.2"
+md-5 = "0.10"
+serde_json = "1"
+# The EC reconstructor links liberasurecode (Linux-only), so it is opt-in; the
+# default build (and macOS) is unaffected.
+swift-ec = { path = "../swift-ec", optional = true }
+
+[features]
+ec = ["dep:swift-ec"]
+
+# The server binary (src/main.rs) is auto-detected as `swift-object-server`.
+[[bin]]
+name = "swift-object-updater"
+path = "src/bin/object_updater.rs"
+
+[[bin]]
+name = "swift-object-replicator"
+path = "src/bin/object_replicator.rs"
+
+[[bin]]
+name = "swift-object-reconstructor"
+path = "src/bin/object_reconstructor.rs"
+
+[dev-dependencies]
+swift-container-server = { path = "../swift-container-server" }

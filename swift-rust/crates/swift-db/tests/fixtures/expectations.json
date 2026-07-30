@@ -1,0 +1,1904 @@
+{
+ "account": {
+  "created_at": "1751500000.00000",
+  "db_id": "fixed-db-id-0002",
+  "listings": {
+   "cases": [
+    {
+     "call": {
+      "delimiter": null,
+      "end_marker": "",
+      "limit": 100,
+      "marker": "",
+      "prefix": null
+     },
+     "rows": [
+      [
+       "apple",
+       3,
+       30,
+       "1751500001.00000",
+       0,
+       0
+      ],
+      [
+       "apple/pie",
+       1,
+       10,
+       "1751500001.00000",
+       0,
+       0
+      ],
+      [
+       "apple/tart",
+       2,
+       20,
+       "1751500002.00000",
+       1,
+       0
+      ],
+      [
+       "banana",
+       0,
+       0,
+       "1751500002.00000",
+       0,
+       0
+      ],
+      [
+       "cherry/tart",
+       5,
+       50,
+       "1751500002.00000",
+       0,
+       0
+      ],
+      [
+       "\u4e2d\u6587",
+       1,
+       1,
+       "1751500002.00000",
+       0,
+       0
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": null,
+      "end_marker": "",
+      "limit": 2,
+      "marker": "",
+      "prefix": null
+     },
+     "rows": [
+      [
+       "apple",
+       3,
+       30,
+       "1751500001.00000",
+       0,
+       0
+      ],
+      [
+       "apple/pie",
+       1,
+       10,
+       "1751500001.00000",
+       0,
+       0
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": null,
+      "end_marker": "",
+      "limit": 100,
+      "marker": "apple",
+      "prefix": null
+     },
+     "rows": [
+      [
+       "apple/pie",
+       1,
+       10,
+       "1751500001.00000",
+       0,
+       0
+      ],
+      [
+       "apple/tart",
+       2,
+       20,
+       "1751500002.00000",
+       1,
+       0
+      ],
+      [
+       "banana",
+       0,
+       0,
+       "1751500002.00000",
+       0,
+       0
+      ],
+      [
+       "cherry/tart",
+       5,
+       50,
+       "1751500002.00000",
+       0,
+       0
+      ],
+      [
+       "\u4e2d\u6587",
+       1,
+       1,
+       "1751500002.00000",
+       0,
+       0
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": null,
+      "end_marker": "cherry",
+      "limit": 100,
+      "marker": "",
+      "prefix": null
+     },
+     "rows": [
+      [
+       "apple",
+       3,
+       30,
+       "1751500001.00000",
+       0,
+       0
+      ],
+      [
+       "apple/pie",
+       1,
+       10,
+       "1751500001.00000",
+       0,
+       0
+      ],
+      [
+       "apple/tart",
+       2,
+       20,
+       "1751500002.00000",
+       1,
+       0
+      ],
+      [
+       "banana",
+       0,
+       0,
+       "1751500002.00000",
+       0,
+       0
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": "/",
+      "end_marker": "",
+      "limit": 100,
+      "marker": "",
+      "prefix": "apple"
+     },
+     "rows": [
+      [
+       "apple",
+       3,
+       30,
+       "1751500001.00000",
+       0,
+       0
+      ],
+      [
+       "apple/",
+       0,
+       0,
+       "0",
+       -1,
+       1
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": "/",
+      "end_marker": "",
+      "limit": 100,
+      "marker": "",
+      "prefix": ""
+     },
+     "rows": [
+      [
+       "apple",
+       3,
+       30,
+       "1751500001.00000",
+       0,
+       0
+      ],
+      [
+       "apple/",
+       0,
+       0,
+       "0",
+       -1,
+       1
+      ],
+      [
+       "banana",
+       0,
+       0,
+       "1751500002.00000",
+       0,
+       0
+      ],
+      [
+       "cherry/",
+       0,
+       0,
+       "0",
+       -1,
+       1
+      ],
+      [
+       "\u4e2d\u6587",
+       1,
+       1,
+       "1751500002.00000",
+       0,
+       0
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": null,
+      "end_marker": "",
+      "limit": 100,
+      "marker": "",
+      "prefix": null,
+      "reverse": true
+     },
+     "rows": [
+      [
+       "\u4e2d\u6587",
+       1,
+       1,
+       "1751500002.00000",
+       0,
+       0
+      ],
+      [
+       "cherry/tart",
+       5,
+       50,
+       "1751500002.00000",
+       0,
+       0
+      ],
+      [
+       "banana",
+       0,
+       0,
+       "1751500002.00000",
+       0,
+       0
+      ],
+      [
+       "apple/tart",
+       2,
+       20,
+       "1751500002.00000",
+       1,
+       0
+      ],
+      [
+       "apple/pie",
+       1,
+       10,
+       "1751500001.00000",
+       0,
+       0
+      ],
+      [
+       "apple",
+       3,
+       30,
+       "1751500001.00000",
+       0,
+       0
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": "/",
+      "end_marker": "",
+      "limit": 100,
+      "marker": "",
+      "prefix": "cherry/"
+     },
+     "rows": [
+      [
+       "cherry/tart",
+       5,
+       50,
+       "1751500002.00000",
+       0,
+       0
+      ]
+     ]
+    }
+   ],
+   "containers": [
+    [
+     "apple",
+     "1751500001.00000",
+     "0",
+     3,
+     30,
+     0
+    ],
+    [
+     "apple/pie",
+     "1751500001.00000",
+     "0",
+     1,
+     10,
+     0
+    ],
+    [
+     "apple/tart",
+     "1751500002.00000",
+     "0",
+     2,
+     20,
+     1
+    ],
+    [
+     "banana",
+     "1751500002.00000",
+     "0",
+     0,
+     0,
+     0
+    ],
+    [
+     "cherry/tart",
+     "1751500002.00000",
+     "0",
+     5,
+     50,
+     0
+    ],
+    [
+     "\u4e2d\u6587",
+     "1751500002.00000",
+     "0",
+     1,
+     1,
+     0
+    ],
+    [
+     "gone",
+     "1751500001.00000",
+     "1751500003.00000",
+     0,
+     0,
+     0
+    ]
+   ]
+  },
+  "metadata": {
+   "is_deleted": true,
+   "post_delete_info": {
+    "account": "AUTH_test",
+    "bytes_used": 0,
+    "container_count": 0,
+    "created_at": "1751500000.00000",
+    "delete_timestamp": "1751500004.00000",
+    "hash": "00000000000000000000000000000000",
+    "id": "fixed-db-id-0002",
+    "object_count": 0,
+    "put_timestamp": "1751500000.00000",
+    "status_changed_at": "1751500004.00000"
+   },
+   "post_delete_metadata": "{\"X-Account-Meta-Temp\": [\"\", \"1751500004.00000\"]}",
+   "raw_after": "{\"X-Account-Meta-Temp\": [\"1\", \"1751500001.00000\"]}",
+   "raw_before": "{\"X-Account-Meta-Temp\": [\"1\", \"1751500001.00000\"], \"X-Account-Meta-Gone\": [\"\", \"1000000000.00000\"]}"
+  },
+  "put_timestamp": "1751500000.00000",
+  "scenarios": [
+   {
+    "containers": [],
+    "desc": "a-init-only",
+    "info": {
+     "account": "AUTH_test",
+     "bytes_used": 0,
+     "container_count": 0,
+     "created_at": "1751500000.00000",
+     "delete_timestamp": "0",
+     "hash": "00000000000000000000000000000000",
+     "id": "fixed-db-id-0002",
+     "object_count": 0,
+     "put_timestamp": "1751500000.00000",
+     "status_changed_at": "1751500000.00000"
+    },
+    "policy_stat": [],
+    "schema": [
+     [
+      "account_stat",
+      "CREATE TABLE account_stat (\n                account TEXT,\n                created_at TEXT,\n                put_timestamp TEXT DEFAULT '0',\n                delete_timestamp TEXT DEFAULT '0',\n                container_count INTEGER,\n                object_count INTEGER DEFAULT 0,\n                bytes_used INTEGER DEFAULT 0,\n                hash TEXT default '00000000000000000000000000000000',\n                id TEXT,\n                status TEXT DEFAULT '',\n                status_changed_at TEXT DEFAULT '0',\n                metadata TEXT DEFAULT ''\n            )"
+     ],
+     [
+      "container",
+      "CREATE TABLE container (\n                ROWID INTEGER PRIMARY KEY AUTOINCREMENT,\n                name TEXT,\n                put_timestamp TEXT,\n                delete_timestamp TEXT,\n                object_count INTEGER,\n                bytes_used INTEGER,\n                deleted INTEGER DEFAULT 0,\n                storage_policy_index INTEGER DEFAULT 0\n            )"
+     ],
+     [
+      "container_delete",
+      "CREATE TRIGGER container_delete AFTER DELETE ON container\n            BEGIN\n                UPDATE account_stat\n                SET container_count = container_count - (1 - old.deleted),\n                    object_count = object_count - old.object_count,\n                    bytes_used = bytes_used - old.bytes_used,\n                    hash = chexor(hash, old.name,\n                                  old.put_timestamp || '-' ||\n                                    old.delete_timestamp || '-' ||\n                                    old.object_count || '-' || old.bytes_used);\n            END"
+     ],
+     [
+      "container_delete_ps",
+      "CREATE TRIGGER container_delete_ps AFTER DELETE ON container\n    BEGIN\n        UPDATE policy_stat\n        SET container_count = container_count - (1 - old.deleted),\n            object_count = object_count - old.object_count,\n            bytes_used = bytes_used - old.bytes_used\n        WHERE storage_policy_index = old.storage_policy_index;\n    END"
+     ],
+     [
+      "container_insert",
+      "CREATE TRIGGER container_insert AFTER INSERT ON container\n            BEGIN\n                UPDATE account_stat\n                SET container_count = container_count + (1 - new.deleted),\n                    object_count = object_count + new.object_count,\n                    bytes_used = bytes_used + new.bytes_used,\n                    hash = chexor(hash, new.name,\n                                  new.put_timestamp || '-' ||\n                                    new.delete_timestamp || '-' ||\n                                    new.object_count || '-' || new.bytes_used);\n            END"
+     ],
+     [
+      "container_insert_ps",
+      "CREATE TRIGGER container_insert_ps AFTER INSERT ON container\n    BEGIN\n        INSERT OR IGNORE INTO policy_stat\n            (storage_policy_index, container_count, object_count, bytes_used)\n            VALUES (new.storage_policy_index, 0, 0, 0);\n        UPDATE policy_stat\n        SET container_count = container_count + (1 - new.deleted),\n            object_count = object_count + new.object_count,\n            bytes_used = bytes_used + new.bytes_used\n        WHERE storage_policy_index = new.storage_policy_index;\n    END"
+     ],
+     [
+      "container_update",
+      "CREATE TRIGGER container_update BEFORE UPDATE ON container\n            BEGIN\n                SELECT RAISE(FAIL, 'UPDATE not allowed; DELETE and INSERT');\n            END"
+     ],
+     [
+      "incoming_sync",
+      "CREATE TABLE incoming_sync (\n                remote_id TEXT UNIQUE,\n                sync_point INTEGER,\n                updated_at TEXT DEFAULT 0\n            )"
+     ],
+     [
+      "incoming_sync_insert",
+      "CREATE TRIGGER incoming_sync_insert AFTER INSERT ON incoming_sync\n            BEGIN\n                UPDATE incoming_sync\n                SET updated_at = STRFTIME('%s', 'NOW')\n                WHERE ROWID = new.ROWID;\n            END"
+     ],
+     [
+      "incoming_sync_update",
+      "CREATE TRIGGER incoming_sync_update AFTER UPDATE ON incoming_sync\n            BEGIN\n                UPDATE incoming_sync\n                SET updated_at = STRFTIME('%s', 'NOW')\n                WHERE ROWID = new.ROWID;\n            END"
+     ],
+     [
+      "ix_container_deleted_name",
+      "CREATE INDEX ix_container_deleted_name ON\n                container (deleted, name)"
+     ],
+     [
+      "outgoing_sync",
+      "CREATE TABLE outgoing_sync (\n                remote_id TEXT UNIQUE,\n                sync_point INTEGER,\n                updated_at TEXT DEFAULT 0\n            )"
+     ],
+     [
+      "outgoing_sync_insert",
+      "CREATE TRIGGER outgoing_sync_insert AFTER INSERT ON outgoing_sync\n            BEGIN\n                UPDATE outgoing_sync\n                SET updated_at = STRFTIME('%s', 'NOW')\n                WHERE ROWID = new.ROWID;\n            END"
+     ],
+     [
+      "outgoing_sync_update",
+      "CREATE TRIGGER outgoing_sync_update AFTER UPDATE ON outgoing_sync\n            BEGIN\n                UPDATE outgoing_sync\n                SET updated_at = STRFTIME('%s', 'NOW')\n                WHERE ROWID = new.ROWID;\n            END"
+     ],
+     [
+      "policy_stat",
+      "CREATE TABLE policy_stat (\n                storage_policy_index INTEGER PRIMARY KEY,\n                container_count INTEGER DEFAULT 0,\n                object_count INTEGER DEFAULT 0,\n                bytes_used INTEGER DEFAULT 0\n            )"
+     ],
+     [
+      "sqlite_autoindex_incoming_sync_1",
+      null
+     ],
+     [
+      "sqlite_autoindex_outgoing_sync_1",
+      null
+     ],
+     [
+      "sqlite_sequence",
+      "CREATE TABLE sqlite_sequence(name,seq)"
+     ]
+    ]
+   },
+   {
+    "containers": [
+     [
+      1,
+      "c1",
+      "1751500001.00000",
+      "0",
+      0,
+      0,
+      0,
+      0
+     ],
+     [
+      2,
+      "\u4e2d\u6587\u5bb9\u5668",
+      "1751500002.00000",
+      "0",
+      3,
+      42,
+      0,
+      1
+     ],
+     [
+      3,
+      "c-del",
+      "1751500001.00000",
+      "1751500003.00000",
+      0,
+      0,
+      1,
+      0
+     ]
+    ],
+    "desc": "a-puts-and-merge",
+    "info": {
+     "account": "AUTH_test",
+     "bytes_used": 42,
+     "container_count": 2,
+     "created_at": "1751500000.00000",
+     "delete_timestamp": "0",
+     "hash": "e21767773abf9e93bc56ddc5f2900237",
+     "id": "fixed-db-id-0002",
+     "object_count": 3,
+     "put_timestamp": "1751500000.00000",
+     "status_changed_at": "1751500000.00000"
+    },
+    "pending_hex": "3a6741496f574149414141426a4d58454157424141414141784e7a55784e5441774d4441784c6a41774d444177635146594151414141444278416d674361414a4c41457341644845444c673d3d3a6741496f574177414141446b754b336d6c6f666c72726e6c6d61687841466751414141414d5463314d5455774d4441774d6934774d4441774d484542574145414141417763514a4c413073715377424c415852784179343d3a6741496f574155414141426a4c57526c6248454157424141414141784e7a55784e5441774d4441784c6a41774d4441776351465945414141414445334e5445314d4441774d444d754d4441774d444278416b73415377424c41557341644845444c673d3d",
+    "policy_stat": [
+     [
+      0,
+      1,
+      0,
+      0
+     ],
+     [
+      1,
+      1,
+      3,
+      42
+     ]
+    ],
+    "puts": [
+     [
+      "c1",
+      "1751500001.00000",
+      "0",
+      "0",
+      "0",
+      0
+     ],
+     [
+      "\u4e2d\u6587\u5bb9\u5668",
+      "1751500002.00000",
+      "0",
+      3,
+      42,
+      1
+     ],
+     [
+      "c-del",
+      "1751500001.00000",
+      "1751500003.00000",
+      0,
+      0,
+      0
+     ]
+    ]
+   },
+   {
+    "containers": [
+     [
+      3,
+      "c",
+      "1751500003.00000",
+      "1751500002.00000",
+      7,
+      70,
+      0,
+      0
+     ]
+    ],
+    "desc": "a-merge-semantics",
+    "info": {
+     "account": "AUTH_test",
+     "bytes_used": 70,
+     "container_count": 1,
+     "created_at": "1751500000.00000",
+     "delete_timestamp": "0",
+     "hash": "a6828a1a9106faa99efab02771be37a3",
+     "id": "fixed-db-id-0002",
+     "object_count": 7,
+     "put_timestamp": "1751500000.00000",
+     "status_changed_at": "1751500000.00000"
+    },
+    "policy_stat": [
+     [
+      0,
+      1,
+      7,
+      70
+     ]
+    ]
+   }
+  ]
+ },
+ "container": {
+  "created_at": "1751500000.00000",
+  "db_id": "fixed-db-id-0001",
+  "listings": {
+   "cases": [
+    {
+     "call": {
+      "delimiter": null,
+      "end_marker": "",
+      "limit": 100,
+      "marker": "",
+      "prefix": null
+     },
+     "rows": [
+      [
+       "a/1",
+       "1751500001.00000",
+       1,
+       "text/a",
+       "e1"
+      ],
+      [
+       "a/2",
+       "1751500001.00000",
+       2,
+       "text/a",
+       "e2"
+      ],
+      [
+       "b",
+       "1751500002.00000",
+       3,
+       "text/b",
+       "e3"
+      ],
+      [
+       "b/",
+       "1751500002.00000",
+       4,
+       "text/b",
+       "e4"
+      ],
+      [
+       "b/x",
+       "1751500002.00000",
+       5,
+       "text/b",
+       "e5"
+      ],
+      [
+       "c",
+       "1751500001.00000",
+       6,
+       "text/c",
+       "e6"
+      ],
+      [
+       "photos",
+       "1751500001.00000",
+       10,
+       "app/dir",
+       "e10"
+      ],
+      [
+       "photos/animals/cat.jpg",
+       "1751500002.00000",
+       7,
+       "image/jpeg",
+       "e7"
+      ],
+      [
+       "photos/animals/dog.jpg",
+       "1751500003.00000",
+       8,
+       "image/jpeg",
+       "e8"
+      ],
+      [
+       "photos/plants/rose.jpg",
+       "1751500003.00000",
+       9,
+       "image/jpeg",
+       "e9"
+      ],
+      [
+       "zz",
+       "1751500001.00000",
+       12,
+       "text/z",
+       "e12"
+      ],
+      [
+       "\u4e2d/\u6587",
+       "1751500002.00000",
+       11,
+       "text/zh",
+       "e11"
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": null,
+      "end_marker": "",
+      "limit": 3,
+      "marker": "",
+      "prefix": null
+     },
+     "rows": [
+      [
+       "a/1",
+       "1751500001.00000",
+       1,
+       "text/a",
+       "e1"
+      ],
+      [
+       "a/2",
+       "1751500001.00000",
+       2,
+       "text/a",
+       "e2"
+      ],
+      [
+       "b",
+       "1751500002.00000",
+       3,
+       "text/b",
+       "e3"
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": null,
+      "end_marker": "",
+      "limit": 100,
+      "marker": "b",
+      "prefix": null
+     },
+     "rows": [
+      [
+       "b/",
+       "1751500002.00000",
+       4,
+       "text/b",
+       "e4"
+      ],
+      [
+       "b/x",
+       "1751500002.00000",
+       5,
+       "text/b",
+       "e5"
+      ],
+      [
+       "c",
+       "1751500001.00000",
+       6,
+       "text/c",
+       "e6"
+      ],
+      [
+       "photos",
+       "1751500001.00000",
+       10,
+       "app/dir",
+       "e10"
+      ],
+      [
+       "photos/animals/cat.jpg",
+       "1751500002.00000",
+       7,
+       "image/jpeg",
+       "e7"
+      ],
+      [
+       "photos/animals/dog.jpg",
+       "1751500003.00000",
+       8,
+       "image/jpeg",
+       "e8"
+      ],
+      [
+       "photos/plants/rose.jpg",
+       "1751500003.00000",
+       9,
+       "image/jpeg",
+       "e9"
+      ],
+      [
+       "zz",
+       "1751500001.00000",
+       12,
+       "text/z",
+       "e12"
+      ],
+      [
+       "\u4e2d/\u6587",
+       "1751500002.00000",
+       11,
+       "text/zh",
+       "e11"
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": null,
+      "end_marker": "c",
+      "limit": 100,
+      "marker": "",
+      "prefix": null
+     },
+     "rows": [
+      [
+       "a/1",
+       "1751500001.00000",
+       1,
+       "text/a",
+       "e1"
+      ],
+      [
+       "a/2",
+       "1751500001.00000",
+       2,
+       "text/a",
+       "e2"
+      ],
+      [
+       "b",
+       "1751500002.00000",
+       3,
+       "text/b",
+       "e3"
+      ],
+      [
+       "b/",
+       "1751500002.00000",
+       4,
+       "text/b",
+       "e4"
+      ],
+      [
+       "b/x",
+       "1751500002.00000",
+       5,
+       "text/b",
+       "e5"
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": null,
+      "end_marker": "",
+      "limit": 100,
+      "marker": "",
+      "prefix": "photos/"
+     },
+     "rows": [
+      [
+       "photos/animals/cat.jpg",
+       "1751500002.00000",
+       7,
+       "image/jpeg",
+       "e7"
+      ],
+      [
+       "photos/animals/dog.jpg",
+       "1751500003.00000",
+       8,
+       "image/jpeg",
+       "e8"
+      ],
+      [
+       "photos/plants/rose.jpg",
+       "1751500003.00000",
+       9,
+       "image/jpeg",
+       "e9"
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": "/",
+      "end_marker": "",
+      "limit": 100,
+      "marker": "",
+      "prefix": "photos/"
+     },
+     "rows": [
+      [
+       "photos/animals/",
+       "0",
+       0,
+       null,
+       ""
+      ],
+      [
+       "photos/plants/",
+       "0",
+       0,
+       null,
+       ""
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": "/",
+      "end_marker": "",
+      "limit": 100,
+      "marker": "",
+      "prefix": ""
+     },
+     "rows": [
+      [
+       "a/",
+       "0",
+       0,
+       null,
+       ""
+      ],
+      [
+       "b",
+       "1751500002.00000",
+       3,
+       "text/b",
+       "e3"
+      ],
+      [
+       "b/",
+       "0",
+       0,
+       null,
+       ""
+      ],
+      [
+       "c",
+       "1751500001.00000",
+       6,
+       "text/c",
+       "e6"
+      ],
+      [
+       "photos",
+       "1751500001.00000",
+       10,
+       "app/dir",
+       "e10"
+      ],
+      [
+       "photos/",
+       "0",
+       0,
+       null,
+       ""
+      ],
+      [
+       "zz",
+       "1751500001.00000",
+       12,
+       "text/z",
+       "e12"
+      ],
+      [
+       "\u4e2d/",
+       "0",
+       0,
+       null,
+       ""
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": "/",
+      "end_marker": "",
+      "limit": 100,
+      "marker": "",
+      "prefix": null
+     },
+     "rows": [
+      [
+       "a/",
+       "0",
+       0,
+       null,
+       ""
+      ],
+      [
+       "b",
+       "1751500002.00000",
+       3,
+       "text/b",
+       "e3"
+      ],
+      [
+       "b/",
+       "0",
+       0,
+       null,
+       ""
+      ],
+      [
+       "c",
+       "1751500001.00000",
+       6,
+       "text/c",
+       "e6"
+      ],
+      [
+       "photos",
+       "1751500001.00000",
+       10,
+       "app/dir",
+       "e10"
+      ],
+      [
+       "photos/",
+       "0",
+       0,
+       null,
+       ""
+      ],
+      [
+       "zz",
+       "1751500001.00000",
+       12,
+       "text/z",
+       "e12"
+      ],
+      [
+       "\u4e2d/",
+       "0",
+       0,
+       null,
+       ""
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": "/",
+      "end_marker": "",
+      "limit": 100,
+      "marker": "photos/animals/",
+      "prefix": "photos/"
+     },
+     "rows": [
+      [
+       "photos/plants/",
+       "0",
+       0,
+       null,
+       ""
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": null,
+      "end_marker": "",
+      "limit": 100,
+      "marker": "",
+      "prefix": null,
+      "reverse": true
+     },
+     "rows": [
+      [
+       "\u4e2d/\u6587",
+       "1751500002.00000",
+       11,
+       "text/zh",
+       "e11"
+      ],
+      [
+       "zz",
+       "1751500001.00000",
+       12,
+       "text/z",
+       "e12"
+      ],
+      [
+       "photos/plants/rose.jpg",
+       "1751500003.00000",
+       9,
+       "image/jpeg",
+       "e9"
+      ],
+      [
+       "photos/animals/dog.jpg",
+       "1751500003.00000",
+       8,
+       "image/jpeg",
+       "e8"
+      ],
+      [
+       "photos/animals/cat.jpg",
+       "1751500002.00000",
+       7,
+       "image/jpeg",
+       "e7"
+      ],
+      [
+       "photos",
+       "1751500001.00000",
+       10,
+       "app/dir",
+       "e10"
+      ],
+      [
+       "c",
+       "1751500001.00000",
+       6,
+       "text/c",
+       "e6"
+      ],
+      [
+       "b/x",
+       "1751500002.00000",
+       5,
+       "text/b",
+       "e5"
+      ],
+      [
+       "b/",
+       "1751500002.00000",
+       4,
+       "text/b",
+       "e4"
+      ],
+      [
+       "b",
+       "1751500002.00000",
+       3,
+       "text/b",
+       "e3"
+      ],
+      [
+       "a/2",
+       "1751500001.00000",
+       2,
+       "text/a",
+       "e2"
+      ],
+      [
+       "a/1",
+       "1751500001.00000",
+       1,
+       "text/a",
+       "e1"
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": "/",
+      "end_marker": "",
+      "limit": 2,
+      "marker": "",
+      "prefix": "photos/",
+      "reverse": true
+     },
+     "rows": [
+      [
+       "photos/plants/",
+       "0",
+       0,
+       null,
+       ""
+      ],
+      [
+       "photos/animals/",
+       "0",
+       0,
+       null,
+       ""
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": null,
+      "end_marker": "",
+      "limit": 100,
+      "marker": "",
+      "path": "photos",
+      "prefix": null
+     },
+     "rows": []
+    },
+    {
+     "call": {
+      "delimiter": null,
+      "end_marker": "",
+      "limit": 100,
+      "marker": "",
+      "path": "",
+      "prefix": null
+     },
+     "rows": [
+      [
+       "b",
+       "1751500002.00000",
+       3,
+       "text/b",
+       "e3"
+      ],
+      [
+       "b/",
+       "1751500002.00000",
+       4,
+       "text/b",
+       "e4"
+      ],
+      [
+       "c",
+       "1751500001.00000",
+       6,
+       "text/c",
+       "e6"
+      ],
+      [
+       "photos",
+       "1751500001.00000",
+       10,
+       "app/dir",
+       "e10"
+      ],
+      [
+       "zz",
+       "1751500001.00000",
+       12,
+       "text/z",
+       "e12"
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": null,
+      "end_marker": "",
+      "include_deleted": true,
+      "limit": 100,
+      "marker": "",
+      "prefix": null
+     },
+     "rows": [
+      [
+       "deleted-obj",
+       "1751500002.00000",
+       0,
+       "application/deleted",
+       "noetag"
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": null,
+      "end_marker": "\u4e2d/\u65872",
+      "limit": 100,
+      "marker": "a/",
+      "prefix": null
+     },
+     "rows": [
+      [
+       "a/1",
+       "1751500001.00000",
+       1,
+       "text/a",
+       "e1"
+      ],
+      [
+       "a/2",
+       "1751500001.00000",
+       2,
+       "text/a",
+       "e2"
+      ],
+      [
+       "b",
+       "1751500002.00000",
+       3,
+       "text/b",
+       "e3"
+      ],
+      [
+       "b/",
+       "1751500002.00000",
+       4,
+       "text/b",
+       "e4"
+      ],
+      [
+       "b/x",
+       "1751500002.00000",
+       5,
+       "text/b",
+       "e5"
+      ],
+      [
+       "c",
+       "1751500001.00000",
+       6,
+       "text/c",
+       "e6"
+      ],
+      [
+       "photos",
+       "1751500001.00000",
+       10,
+       "app/dir",
+       "e10"
+      ],
+      [
+       "photos/animals/cat.jpg",
+       "1751500002.00000",
+       7,
+       "image/jpeg",
+       "e7"
+      ],
+      [
+       "photos/animals/dog.jpg",
+       "1751500003.00000",
+       8,
+       "image/jpeg",
+       "e8"
+      ],
+      [
+       "photos/plants/rose.jpg",
+       "1751500003.00000",
+       9,
+       "image/jpeg",
+       "e9"
+      ],
+      [
+       "zz",
+       "1751500001.00000",
+       12,
+       "text/z",
+       "e12"
+      ],
+      [
+       "\u4e2d/\u6587",
+       "1751500002.00000",
+       11,
+       "text/zh",
+       "e11"
+      ]
+     ]
+    },
+    {
+     "call": {
+      "delimiter": "/",
+      "end_marker": "",
+      "limit": 100,
+      "marker": "",
+      "prefix": "b"
+     },
+     "rows": [
+      [
+       "b",
+       "1751500002.00000",
+       3,
+       "text/b",
+       "e3"
+      ],
+      [
+       "b/",
+       "0",
+       0,
+       null,
+       ""
+      ]
+     ]
+    }
+   ],
+   "objects": [
+    [
+     "a/1",
+     "1751500001.00000",
+     1,
+     "text/a",
+     "e1",
+     0
+    ],
+    [
+     "a/2",
+     "1751500001.00000",
+     2,
+     "text/a",
+     "e2",
+     0
+    ],
+    [
+     "b",
+     "1751500002.00000",
+     3,
+     "text/b",
+     "e3",
+     0
+    ],
+    [
+     "b/",
+     "1751500002.00000",
+     4,
+     "text/b",
+     "e4",
+     0
+    ],
+    [
+     "b/x",
+     "1751500002.00000",
+     5,
+     "text/b",
+     "e5",
+     0
+    ],
+    [
+     "c",
+     "1751500001.00000",
+     6,
+     "text/c",
+     "e6",
+     0
+    ],
+    [
+     "photos/animals/cat.jpg",
+     "1751500002.00000",
+     7,
+     "image/jpeg",
+     "e7",
+     0
+    ],
+    [
+     "photos/animals/dog.jpg",
+     "1751500003.00000",
+     8,
+     "image/jpeg",
+     "e8",
+     0
+    ],
+    [
+     "photos/plants/rose.jpg",
+     "1751500003.00000",
+     9,
+     "image/jpeg",
+     "e9",
+     0
+    ],
+    [
+     "photos",
+     "1751500001.00000",
+     10,
+     "app/dir",
+     "e10",
+     0
+    ],
+    [
+     "\u4e2d/\u6587",
+     "1751500002.00000",
+     11,
+     "text/zh",
+     "e11",
+     0
+    ],
+    [
+     "zz",
+     "1751500001.00000",
+     12,
+     "text/z",
+     "e12",
+     0
+    ],
+    [
+     "deleted-obj",
+     "1751500002.00000",
+     0,
+     "application/deleted",
+     "noetag",
+     1
+    ]
+   ]
+  },
+  "metadata": {
+   "is_deleted": false,
+   "post_delete_info": {
+    "account": "a",
+    "bytes_used": 5,
+    "container": "c",
+    "created_at": "1751500000.00000",
+    "db_state": "unsharded",
+    "delete_timestamp": "1751500004.00000",
+    "hash": "36e77ca36e9023754fa22351bf5cb20f",
+    "id": "fixed-db-id-0001",
+    "object_count": 1,
+    "put_timestamp": "1751500000.00000",
+    "reported_bytes_used": 0,
+    "reported_delete_timestamp": "0",
+    "reported_object_count": 0,
+    "reported_put_timestamp": "0",
+    "status": "DELETED",
+    "status_changed_at": "1751500004.00000",
+    "storage_policy_index": 0,
+    "x_container_sync_point1": -1,
+    "x_container_sync_point2": -1
+   },
+   "post_delete_metadata": "{\"X-Container-Meta-Color\": [\"\", \"1751500004.00000\"], \"X-Container-Sysmeta-S\": [\"\", \"1751500004.00000\"], \"X-Container-Meta-\\u4e2d\\u6587\": [\"\", \"1751500004.00000\"]}",
+   "post_reclaim_names": [
+    "live",
+    "new-tomb"
+   ],
+   "reclaim_age_timestamp": 1500000000.5,
+   "reclaimed": 1,
+   "steps": [
+    [
+     "set-color",
+     "{\"X-Container-Meta-Color\": [\"blue\", \"1751500001.00000\"]}"
+    ],
+    [
+     "newer-and-more",
+     "{\"X-Container-Meta-Color\": [\"red\", \"1751500003.00000\"], \"X-Container-Sysmeta-S\": [\"sv\", \"1751500001.00000\"], \"X-Container-Meta-\\u4e2d\\u6587\": [\"\\u503c\\u0001\\\"x\\\"\", \"1751500001.00000\"]}"
+    ],
+    [
+     "older-ignored",
+     "{\"X-Container-Meta-Color\": [\"red\", \"1751500003.00000\"], \"X-Container-Sysmeta-S\": [\"sv\", \"1751500001.00000\"], \"X-Container-Meta-\\u4e2d\\u6587\": [\"\\u503c\\u0001\\\"x\\\"\", \"1751500001.00000\"]}"
+    ],
+    [
+     "delete-key",
+     "{\"X-Container-Meta-Color\": [\"red\", \"1751500003.00000\"], \"X-Container-Sysmeta-S\": [\"sv\", \"1751500001.00000\"], \"X-Container-Meta-\\u4e2d\\u6587\": [\"\", \"1751500002.00000\"]}"
+    ],
+    [
+     "post-reclaim-metadata",
+     "{\"X-Container-Meta-Color\": [\"red\", \"1751500003.00000\"], \"X-Container-Sysmeta-S\": [\"sv\", \"1751500001.00000\"], \"X-Container-Meta-\\u4e2d\\u6587\": [\"\", \"1751500002.00000\"]}"
+    ]
+   ]
+  },
+  "put_timestamp": "1751500000.00000",
+  "scenarios": [
+   {
+    "desc": "init-only",
+    "info": {
+     "account": "a",
+     "bytes_used": 0,
+     "container": "c",
+     "created_at": "1751500000.00000",
+     "db_state": "unsharded",
+     "delete_timestamp": "0",
+     "hash": "00000000000000000000000000000000",
+     "id": "fixed-db-id-0001",
+     "object_count": 0,
+     "put_timestamp": "1751500000.00000",
+     "reported_bytes_used": 0,
+     "reported_delete_timestamp": "0",
+     "reported_object_count": 0,
+     "reported_put_timestamp": "0",
+     "status": "",
+     "status_changed_at": "1751500000.00000",
+     "storage_policy_index": 0,
+     "x_container_sync_point1": -1,
+     "x_container_sync_point2": -1
+    },
+    "objects": [],
+    "schema": [
+     [
+      "container_info",
+      "CREATE TABLE container_info (\n        account TEXT,\n        container TEXT,\n        created_at TEXT,\n        put_timestamp TEXT DEFAULT '0',\n        delete_timestamp TEXT DEFAULT '0',\n        reported_put_timestamp TEXT DEFAULT '0',\n        reported_delete_timestamp TEXT DEFAULT '0',\n        reported_object_count INTEGER DEFAULT 0,\n        reported_bytes_used INTEGER DEFAULT 0,\n        hash TEXT default '00000000000000000000000000000000',\n        id TEXT,\n        status TEXT DEFAULT '',\n        status_changed_at TEXT DEFAULT '0',\n        metadata TEXT DEFAULT '',\n        x_container_sync_point1 INTEGER DEFAULT -1,\n        x_container_sync_point2 INTEGER DEFAULT -1,\n        storage_policy_index INTEGER DEFAULT 0,\n        reconciler_sync_point INTEGER DEFAULT -1\n    )"
+     ],
+     [
+      "container_stat",
+      "CREATE VIEW container_stat\n    AS SELECT ci.account, ci.container, ci.created_at,\n        ci.put_timestamp, ci.delete_timestamp,\n        ci.reported_put_timestamp, ci.reported_delete_timestamp,\n        ci.reported_object_count, ci.reported_bytes_used, ci.hash,\n        ci.id, ci.status, ci.status_changed_at, ci.metadata,\n        ci.x_container_sync_point1, ci.x_container_sync_point2,\n        ci.reconciler_sync_point,\n        ci.storage_policy_index,\n        coalesce(ps.object_count, 0) AS object_count,\n        coalesce(ps.bytes_used, 0) AS bytes_used\n    FROM container_info ci LEFT JOIN policy_stat ps\n    ON ci.storage_policy_index = ps.storage_policy_index"
+     ],
+     [
+      "container_stat_update",
+      "CREATE TRIGGER container_stat_update\n    INSTEAD OF UPDATE ON container_stat\n    BEGIN\n        UPDATE container_info\n        SET account = NEW.account,\n            container = NEW.container,\n            created_at = NEW.created_at,\n            put_timestamp = NEW.put_timestamp,\n            delete_timestamp = NEW.delete_timestamp,\n            reported_put_timestamp = NEW.reported_put_timestamp,\n            reported_delete_timestamp = NEW.reported_delete_timestamp,\n            reported_object_count = NEW.reported_object_count,\n            reported_bytes_used = NEW.reported_bytes_used,\n            hash = NEW.hash,\n            id = NEW.id,\n            status = NEW.status,\n            status_changed_at = NEW.status_changed_at,\n            metadata = NEW.metadata,\n            x_container_sync_point1 = NEW.x_container_sync_point1,\n            x_container_sync_point2 = NEW.x_container_sync_point2,\n            storage_policy_index = NEW.storage_policy_index,\n            reconciler_sync_point = NEW.reconciler_sync_point;\n    END"
+     ],
+     [
+      "incoming_sync",
+      "CREATE TABLE incoming_sync (\n                remote_id TEXT UNIQUE,\n                sync_point INTEGER,\n                updated_at TEXT DEFAULT 0\n            )"
+     ],
+     [
+      "incoming_sync_insert",
+      "CREATE TRIGGER incoming_sync_insert AFTER INSERT ON incoming_sync\n            BEGIN\n                UPDATE incoming_sync\n                SET updated_at = STRFTIME('%s', 'NOW')\n                WHERE ROWID = new.ROWID;\n            END"
+     ],
+     [
+      "incoming_sync_update",
+      "CREATE TRIGGER incoming_sync_update AFTER UPDATE ON incoming_sync\n            BEGIN\n                UPDATE incoming_sync\n                SET updated_at = STRFTIME('%s', 'NOW')\n                WHERE ROWID = new.ROWID;\n            END"
+     ],
+     [
+      "ix_object_deleted_name",
+      "CREATE INDEX ix_object_deleted_name ON object (deleted, name)"
+     ],
+     [
+      "object",
+      "CREATE TABLE object (\n                ROWID INTEGER PRIMARY KEY AUTOINCREMENT,\n                name TEXT,\n                created_at TEXT,\n                size INTEGER,\n                content_type TEXT,\n                etag TEXT,\n                deleted INTEGER DEFAULT 0,\n                storage_policy_index INTEGER DEFAULT 0\n            )"
+     ],
+     [
+      "object_delete_policy_stat",
+      "CREATE TRIGGER object_delete_policy_stat AFTER DELETE ON object\n    BEGIN\n        UPDATE policy_stat\n        SET object_count = object_count - (1 - old.deleted),\n            bytes_used = bytes_used - old.size\n        WHERE storage_policy_index = old.storage_policy_index;\n        UPDATE container_info\n        SET hash = chexor(hash, old.name, old.created_at);\n    END"
+     ],
+     [
+      "object_insert_policy_stat",
+      "CREATE TRIGGER object_insert_policy_stat AFTER INSERT ON object\n    BEGIN\n        UPDATE policy_stat\n        SET object_count = object_count + (1 - new.deleted),\n            bytes_used = bytes_used + new.size\n        WHERE storage_policy_index = new.storage_policy_index;\n        INSERT INTO policy_stat (\n            storage_policy_index, object_count, bytes_used)\n        SELECT new.storage_policy_index,\n               (1 - new.deleted),\n               new.size\n        WHERE NOT EXISTS(\n            SELECT changes() as change\n            FROM policy_stat\n            WHERE change <> 0\n        );\n        UPDATE container_info\n        SET hash = chexor(hash, new.name, new.created_at);\n    END"
+     ],
+     [
+      "object_update",
+      "CREATE TRIGGER object_update BEFORE UPDATE ON object\n            BEGIN\n                SELECT RAISE(FAIL, 'UPDATE not allowed; DELETE and INSERT');\n            END"
+     ],
+     [
+      "outgoing_sync",
+      "CREATE TABLE outgoing_sync (\n                remote_id TEXT UNIQUE,\n                sync_point INTEGER,\n                updated_at TEXT DEFAULT 0\n            )"
+     ],
+     [
+      "outgoing_sync_insert",
+      "CREATE TRIGGER outgoing_sync_insert AFTER INSERT ON outgoing_sync\n            BEGIN\n                UPDATE outgoing_sync\n                SET updated_at = STRFTIME('%s', 'NOW')\n                WHERE ROWID = new.ROWID;\n            END"
+     ],
+     [
+      "outgoing_sync_update",
+      "CREATE TRIGGER outgoing_sync_update AFTER UPDATE ON outgoing_sync\n            BEGIN\n                UPDATE outgoing_sync\n                SET updated_at = STRFTIME('%s', 'NOW')\n                WHERE ROWID = new.ROWID;\n            END"
+     ],
+     [
+      "policy_stat",
+      "CREATE TABLE policy_stat (\n        storage_policy_index INTEGER PRIMARY KEY,\n        object_count INTEGER DEFAULT 0,\n        bytes_used INTEGER DEFAULT 0\n    )"
+     ],
+     [
+      "shard_range",
+      "CREATE TABLE shard_range (\n                ROWID INTEGER PRIMARY KEY AUTOINCREMENT,\n                name TEXT,\n                timestamp TEXT,\n                lower TEXT,\n                upper TEXT,\n                object_count INTEGER DEFAULT 0,\n                bytes_used INTEGER DEFAULT 0,\n                meta_timestamp TEXT,\n                deleted INTEGER DEFAULT 0,\n                state INTEGER,\n                state_timestamp TEXT,\n                epoch TEXT,\n                reported INTEGER DEFAULT 0,\n                tombstones INTEGER DEFAULT -1\n            )"
+     ],
+     [
+      "shard_range_update",
+      "CREATE TRIGGER shard_range_update BEFORE UPDATE ON shard_range\n            BEGIN\n                SELECT RAISE(FAIL, 'UPDATE not allowed; DELETE and INSERT');\n            END"
+     ],
+     [
+      "sqlite_autoindex_incoming_sync_1",
+      null
+     ],
+     [
+      "sqlite_autoindex_outgoing_sync_1",
+      null
+     ],
+     [
+      "sqlite_sequence",
+      "CREATE TABLE sqlite_sequence(name,seq)"
+     ]
+    ]
+   },
+   {
+    "desc": "puts-and-merge",
+    "info": {
+     "account": "a",
+     "bytes_used": 49,
+     "container": "c",
+     "created_at": "1751500000.00000",
+     "db_state": "unsharded",
+     "delete_timestamp": "0",
+     "hash": "f459833767c7d4d190177b5956eeabe1",
+     "id": "fixed-db-id-0001",
+     "object_count": 3,
+     "put_timestamp": "1751500000.00000",
+     "reported_bytes_used": 0,
+     "reported_delete_timestamp": "0",
+     "reported_object_count": 0,
+     "reported_put_timestamp": "0",
+     "status": "",
+     "status_changed_at": "1751500000.00000",
+     "storage_policy_index": 0,
+     "x_container_sync_point1": -1,
+     "x_container_sync_point2": -1
+    },
+    "objects": [
+     [
+      1,
+      "obj1",
+      "1751500001.00000",
+      42,
+      "text/plain;swift_bytes=10",
+      "etag1",
+      0,
+      0
+     ],
+     [
+      2,
+      "\u4e2d\u6587/\u2603",
+      "1751500002.00000",
+      0,
+      "application/octet-stream",
+      "etag2",
+      0,
+      0
+     ],
+     [
+      3,
+      "z-obj",
+      "1751500001.00000_1",
+      7,
+      "text/plain",
+      "etag3",
+      0,
+      0
+     ]
+    ],
+    "pending_hex": "3a6741496f5741514141414276596d6f786351425945414141414445334e5445314d4441774d4445754d4441774d4442784155737157426b41414142305a5868304c33427359576c754f334e3361575a3058324a356447567a5054457763514a5942514141414756305957637863514e4c41457341546b3530635151753a6741496f57416f414141446b754b336d6c6f6376347069446351425945414141414445334e5445314d4441774d4449754d4441774d4442784155734157426741414142686348427361574e6864476c76626939765933526c6443317a64484a6c59573178416c6746414141415a5852685a7a4a78413073415377424f546e52784243343d3a6741496f57415541414142364c573969616e454157434541414141784e7a55784e5441774d4441784c6a41774d444177587a41774d4441774d4441774d4441774d4441774d4446784155734857416f41414142305a5868304c33427359576c7563514a5942514141414756305957637a63514e4c41457341546b353063515175",
+    "pending_size_after_commit": 0,
+    "puts": [
+     [
+      "obj1",
+      "1751500001.00000",
+      42,
+      "text/plain;swift_bytes=10",
+      "etag1",
+      0
+     ],
+     [
+      "\u4e2d\u6587/\u2603",
+      "1751500002.00000",
+      0,
+      "application/octet-stream",
+      "etag2",
+      0
+     ],
+     [
+      "z-obj",
+      "1751500001.00000_0000000000000001",
+      7,
+      "text/plain",
+      "etag3",
+      0
+     ]
+    ]
+   },
+   {
+    "desc": "overwrite-and-delete",
+    "info": {
+     "account": "a",
+     "bytes_used": 7,
+     "container": "c",
+     "created_at": "1751500000.00000",
+     "db_state": "unsharded",
+     "delete_timestamp": "0",
+     "hash": "92653e62fa6c681d5d4f3ace3e7e4608",
+     "id": "fixed-db-id-0001",
+     "object_count": 1,
+     "put_timestamp": "1751500000.00000",
+     "reported_bytes_used": 0,
+     "reported_delete_timestamp": "0",
+     "reported_object_count": 0,
+     "reported_put_timestamp": "0",
+     "status": "",
+     "status_changed_at": "1751500000.00000",
+     "storage_policy_index": 0,
+     "x_container_sync_point1": -1,
+     "x_container_sync_point2": -1
+    },
+    "objects": [
+     [
+      2,
+      "gone",
+      "1751500002.00000",
+      0,
+      "application/deleted",
+      "noetag",
+      1,
+      0
+     ],
+     [
+      3,
+      "o2",
+      "1751500001.00000",
+      7,
+      "text/plain;swift_bytes=3",
+      "e2",
+      0,
+      0
+     ],
+     [
+      4,
+      "o",
+      "1751500004.00000",
+      0,
+      "application/deleted",
+      "noetag",
+      1,
+      0
+     ]
+    ]
+   },
+   {
+    "desc": "ctype-meta-merge",
+    "info": {
+     "account": "a",
+     "bytes_used": 10,
+     "container": "c",
+     "created_at": "1751500000.00000",
+     "db_state": "unsharded",
+     "delete_timestamp": "0",
+     "hash": "211ef61b6bd02a591887e4670b1df3c6",
+     "id": "fixed-db-id-0001",
+     "object_count": 1,
+     "put_timestamp": "1751500000.00000",
+     "reported_bytes_used": 0,
+     "reported_delete_timestamp": "0",
+     "reported_object_count": 0,
+     "reported_put_timestamp": "0",
+     "status": "",
+     "status_changed_at": "1751500000.00000",
+     "storage_policy_index": 0,
+     "x_container_sync_point1": -1,
+     "x_container_sync_point2": -1
+    },
+    "objects": [
+     [
+      2,
+      "x",
+      "1751500001.00000+186a0+186a0",
+      10,
+      "text/updated;swift_bytes=99",
+      "ex",
+      0,
+      0
+     ]
+    ]
+   },
+   {
+    "desc": "batch-duplicates",
+    "info": {
+     "account": "a",
+     "bytes_used": 3,
+     "container": "c",
+     "created_at": "1751500000.00000",
+     "db_state": "unsharded",
+     "delete_timestamp": "0",
+     "hash": "4a5f378be8583f8891c4d294af41cb9c",
+     "id": "fixed-db-id-0001",
+     "object_count": 1,
+     "put_timestamp": "1751500000.00000",
+     "reported_bytes_used": 0,
+     "reported_delete_timestamp": "0",
+     "reported_object_count": 0,
+     "reported_put_timestamp": "0",
+     "status": "",
+     "status_changed_at": "1751500000.00000",
+     "storage_policy_index": 0,
+     "x_container_sync_point1": -1,
+     "x_container_sync_point2": -1
+    },
+    "objects": [
+     [
+      1,
+      "dup",
+      "1751500003.00000",
+      3,
+      "ct/3",
+      "e3",
+      0,
+      0
+     ]
+    ]
+   }
+  ]
+ }
+}

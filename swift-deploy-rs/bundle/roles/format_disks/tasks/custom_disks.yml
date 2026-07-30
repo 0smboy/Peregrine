@@ -1,0 +1,79 @@
+---
+- name: Check allowed disk types
+  fail:
+    msg: "{{ disk_type }} is not an allowed disk types"
+  when: disk_type not in allowed_disk_types
+
+- name: Fail when exclude_disks in custom_disks
+  fail: 
+    msg: "{{ item }} of exclude_disks in the list of custom_disks"
+  # TODO: Should use 'when: "/dev/{{ item }}" in custom_disks', but this syntax is not allowed
+  when: item in custom_disks
+  with_items:
+  - "{{ exclude_disks }}"
+
+- name: Check system disk
+  script: files/check_system_disk.sh  {{ item|replace("/dev/", "") }}
+  with_items:
+  - "{{ custom_disks }}"
+
+- name: Remove possibly exist disks_type
+  file: path=/tmp/disks_type
+        state=absent
+
+- name: Set disks_type
+  lineinfile: 
+    path: /tmp/disks_type
+    line: "{{ disk_type }}{{ '%03d'|format((my_idx|int) + 1) }}"
+    state: present
+    insertafter: EOF
+    create: yes
+  with_items:
+  - "{{ custom_disks }}"
+  loop_control:
+    index_var: my_idx
+
+- name: Get disks_type
+  shell: cat /tmp/disks_type
+  register: disks_type
+
+- block:
+  - name: Change disks partition table to mbr before DD
+    shell: parted {{ item }} -s mklabel msdos
+    with_items:
+    - "{{ custom_disks }}"
+  - name: DD before mkfs
+    shell: dd if=/dev/zero of={{ item }} bs=512 count=4
+    become: True
+    with_items:
+    - "{{ custom_disks }}"
+  - name: Umount disks
+    shell: umount -f {{ item }}
+    register: result
+    failed_when: result is failed and 'not mounted' not in result.stderr
+    with_items:
+    - "{{ custom_disks }}"
+  - name: Format all storage nodes disks
+    shell: mkfs.xfs -K -f {{ item }}
+    with_items:
+    - "{{ custom_disks }}"
+  - name: Create mount point directory
+    shell: mkdir -p /srv/node/{{ item }}
+    with_items:
+    - "{{ disks_type.stdout_lines }}"
+  - name: Remove possibly exist file
+    file: path=/usr/bin/startup_automount
+          state=absent
+  - name: Insert header
+    lineinfile: create=yes
+                insertbefore=BOF
+                dest=/usr/bin/startup_automount
+                line="#!/bin/bash"
+                mode=0755
+  - name: Append disks to mount
+    lineinfile: insertafter=EOF
+                dest=/usr/bin/startup_automount
+                line="mount -t xfs -o noatime,nodiratime,logbufs=8 {{ item.0 }} /srv/node/{{ item.1 }}"
+    with_together:
+    - "{{ custom_disks }}"
+    - "{{ disks_type.stdout_lines }}"

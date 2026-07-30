@@ -1,0 +1,8 @@
+# Sample node: storage + proxy with NO custom disks — the node uses the
+# single directory device /srv/node/d1 (no mount, mount_check false).
+management_network_address: 10.0.0.12
+storage_network_address: 10.0.0.12
+replication_network_address: 10.0.0.12
+business_network_address: 10.0.0.12
+disk_type: ssd
+custom_disks: []

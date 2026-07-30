@@ -1,0 +1,37 @@
+---
+# Shared per-agent steps. Parameter (set by the including task): unit_name —
+# also names the unit template ({{ unit_name }}.service.j2).
+
+- name: install the unit file
+  template:
+    src: "{{ unit_name }}.service.j2"
+    dest: "/etc/systemd/system/{{ unit_name }}.service"
+    mode: "0644"
+  register: mon_unit_file
+
+- name: probe the unit state
+  shell: |
+    if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then
+      echo RUNNING
+    else
+      echo STOPPED
+    fi
+  register: mon_unit_probe
+  changed_when: false
+
+- name: enable and start the agent
+  systemd:
+    name: "{{ unit_name }}"
+    daemon_reload: yes
+    enabled: yes
+    state: started
+  when: mon_unit_probe.stdout.find('RUNNING') == -1
+
+- name: restart the agent after a unit-file change
+  systemd:
+    name: "{{ unit_name }}"
+    daemon_reload: yes
+    state: restarted
+  when:
+    - mon_unit_file.changed
+    - mon_unit_probe.stdout.find('RUNNING') != -1

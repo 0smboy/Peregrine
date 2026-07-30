@@ -1,0 +1,60 @@
+---
+- name: Install haproxy pkgs
+  yum: name=haproxy state=present
+
+- block:
+  - name: Create crt file and key file
+    vars:
+        ssl_certs_fields: "/CN={{ auth_url_ip }}"
+        ssl_certs_cert_path: /etc/haproxy/haproxy.crt
+        ssl_certs_privatekey_path: /etc/haproxy/haproxy.key
+    shell:
+        openssl req -new -x509 -nodes -days '{{ ssl_certs_days }}' -subj '{{ ssl_certs_fields }}'  -out '{{ ssl_certs_cert_path }}'  -keyout '{{ ssl_certs_privatekey_path }}'
+
+  - block:
+    - name: Generate uniq dir name for distribute
+      shell: uuidgen
+      register: ha_ssl_uniq_dir
+    - name: Make ha_ssl_uniq_dir
+      shell: "mkdir /tmp/{{ ha_ssl_uniq_dir.stdout }}"
+    - name: Set ha_ssl_uniq_dir fact
+      set_fact:
+        ha_ssl_uniq_dir: "{{ ha_ssl_uniq_dir.stdout }}"
+    run_once: yes
+    delegate_to: localhost
+
+  - name: Fetch  proxy.crt proxy.key
+    fetch: src=/etc/haproxy/{{ item }}
+           dest=/tmp/{{ ha_ssl_uniq_dir }}
+    with_items:
+    - haproxy.key
+    - haproxy.crt
+  when: lb_mode == "https" and inventory_hostname == groups['haproxy_servers'][0]
+
+- block:
+  - name: Distribute proxy.crt proxy.key files to all hosts
+    copy: src=/tmp/{{ ha_ssl_uniq_dir }}/{{ groups['haproxy_servers'][0] }}/etc/haproxy/{{ item }}
+          dest=/etc/haproxy/
+          force=yes
+    with_items:
+    - haproxy.key
+    - haproxy.crt
+
+  - name: Create haproxyCA.pem file
+    shell: cat /etc/haproxy/haproxy.crt /etc/haproxy/haproxy.key > /etc/haproxy/haproxyCA.pem
+
+  - name: Clean ha_ssl_uniq_dir
+    file: path=/tmp/{{ ha_ssl_uniq_dir }}
+          state=absent
+    run_once: yes
+    delegate_to: localhost
+  when: lb_mode == "https"
+
+- name: Deliver haproxy.cfg
+  template: src=templates/haproxy.cfg.j2
+            dest=/etc/haproxy/haproxy.cfg
+- name: Startup haproxy
+  service: name=haproxy
+           state=started
+           enabled=yes
+

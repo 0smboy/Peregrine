@@ -1,0 +1,6 @@
+---
+
+# TODO: use all ?
+- hosts: all
+  roles:
+  - new_ring

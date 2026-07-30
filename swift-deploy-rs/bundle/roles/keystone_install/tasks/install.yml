@@ -1,0 +1,27 @@
+---
+- name: Removing old keystone package
+  yum:
+    name:
+      - openstack-keystone
+    state: absent
+
+- name: Removing old keystone directory
+  file: 
+    path: "{{item}}" 
+    state: absent
+  with_items:
+  - /etc/keystone
+  - /var/log/keystone
+
+- name: Removing old keystone database
+  mysql_db: 
+    name: keystone 
+    state: absent
+  when: inventory_hostname == groups['mariadb_servers'][0]
+
+- name: Install Keystone and dependencies
+  yum:
+    name:
+      - openstack-keystone
+      - python3-pip
+    state: present

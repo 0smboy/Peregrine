@@ -1,0 +1,29 @@
+$template OpenstackSwiftErrorLog,"/var/log/swift/swift-error.log"
+
+# Uncomment the following to have specific log via program name.
+if $programname == 'swift' then /var/log/swift/swift.log
+if $programname == 'proxy-server' then /var/log/swift/proxy-server.log
+if $programname == 'account-server' then /var/log/swift/account-server.log
+if $programname == 'account-replicator' then /var/log/swift/account-replicator.log
+if $programname == 'account-auditor' then /var/log/swift/account-auditor.log
+if $programname == 'account-reaper' then /var/log/swift/account-reaper.log
+if $programname == 'container-server' then /var/log/swift/container-server.log
+if $programname == 'container-replicator' then /var/log/swift/container-replicator.log
+if $programname == 'container-updater' then /var/log/swift/container-updater.log
+if $programname == 'container-auditor' then /var/log/swift/container-auditor.log
+if $programname == 'container-sync' then /var/log/swift/container-sync.log
+if $programname == 'container-sharder' then /var/log/swift/container-sharder.log
+if $programname == 'container-reconciler' then /var/log/swift/container-reconciler.log
+if $programname == 'object-server' then /var/log/swift/object-server.log
+if $programname == 'object-replicator' then /var/log/swift/object-replicator.log
+if $programname == 'object-updater' then /var/log/swift/object-updater.log
+if $programname == 'object-auditor' then /var/log/swift/object-auditor.log
+if $programname == 'object-reconstructor' then /var/log/swift/object-reconstructor.log
+if $programname == 'object-expirer' then /var/log/swift/object-expirer.log
+if $programname == 'object-relinker' then /var/log/swift/object-relinker.log
+
+local0.error            ?OpenstackSwiftErrorLog
+
+# Use the following to discard logs that don't match any of the above to avoid
+# them filling up /var/log/messages.
+local0.* ~

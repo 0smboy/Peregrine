@@ -1,0 +1,9 @@
+[Unit]
+Description=Automount disk
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/startup_automount
+
+[Install]
+WantedBy=multi-user.target

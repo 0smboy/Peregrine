@@ -1,0 +1,3 @@
+---
+- name: Restart chrony service
+  service: name=chronyd state=restarted enabled=yes

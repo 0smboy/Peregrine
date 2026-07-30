@@ -1,0 +1,44 @@
+[package]
+name = "swift-deploy-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Safety-gated Rust deployment engine for the audited Swift Ansible v3 bundle"
+publish = false
+
+[[bin]]
+name = "swift-deploy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.103"
+base64 = "0.22.1"
+clap = { version = "4.6.0", features = ["derive"] }
+hex = "0.4.3"
+minijinja = { version = "2.21.0", features = ["builtins", "json", "loader"] }
+regex = "1.12.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+serde_yaml_ng = "0.10.0"
+sha2 = "0.11.0"
+shell-words = "1.1.1"
+tempfile = "3.27.0"
+walkdir = "2.5.0"
+
+[dev-dependencies]
+pretty_assertions = "1.4.1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"
+too_many_lines = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+needless_pass_by_value = "allow"
+needless_raw_string_hashes = "allow"
+format_push_string = "allow"
+trivially_copy_pass_by_ref = "allow"

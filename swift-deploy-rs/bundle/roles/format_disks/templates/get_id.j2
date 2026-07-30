@@ -1,0 +1,19 @@
+#!/bin/bash
+x=1
+y=1
+for i in {{ disks_to_format.stdout_lines | join(' ') }}
+do
+disks_id=`ls -al /dev/disk/by-id/ | grep -E 'ata|scsi|sas' | grep $i | awk '{print $9}'`
+echo $disks_id >> /tmp/disks_id
+disk_hs_type=`cat /sys/block/$i/queue/rotational`
+dingchangx=`printf "%03d\n" $x` 
+dingchangy=`printf "%03d\n" $y` 
+if [ $disk_hs_type == 0 ]
+then 
+echo ssd$dingchangx >> /tmp/disks_type
+x=$[x+1]
+else
+echo hdd$dingchangy >> /tmp/disks_type
+y=$[y+1]
+fi
+done

@@ -1,0 +1,25 @@
+---
+- name: Deliver container-server.conf
+  template: src=templates/container-server.conf.j2
+            dest=/etc/swift/container-server.conf
+
+- name: Deliver container-reconciler.conf
+  template:
+    src: templates/container-reconciler.conf.j2
+    dest: /etc/swift/container-reconciler.conf
+  
+- name: Deliver internal-client.conf
+  template:
+    src: templates/internal-client.conf.j2
+    dest: /etc/swift/internal-client.conf
+
+- name: Set rsyncd.conf
+  ini_file: dest=/etc/rsyncd.conf
+            section=container
+            option={{ item.key }}
+            value={{ item.value }}
+  with_dict:
+      "max connections": "{{ max_connections }}"
+      path: /srv/node/
+      "read only": "{{ read_only }}"
+      "lock file": "{{ lock_file }}"

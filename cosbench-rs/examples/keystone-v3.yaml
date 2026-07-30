@@ -1,0 +1,30 @@
+name: keystone-v3-auth-demo
+description: |
+  Demonstrates Keystone v3 password auth config (PR #428).
+  Auth runs before stages. Storage here is mock so this is config/auth-path validation
+  without a real OpenStack; point storage at Swift/S3 when you have a cluster.
+auth:
+  type: keystone_v3
+  url: http://keystone.example:5000/v3
+  username: demo
+  password: secret
+  project_name: demo
+  user_domain_name: Default
+  project_domain_name: Default
+  # optional: user_domain_id / project_domain_id
+storage:
+  type: mock
+  latency_us: 0
+stages:
+  - name: main
+    workers: 1
+    total_ops: 1
+    operations:
+      - type: create_container
+        ratio: 100
+    objects:
+      cprefix: c
+      containers: { start: 1, end: 1 }
+      oprefix: o
+      objects: { start: 1, end: 1 }
+      size: 1

@@ -1,0 +1,39 @@
+---
+- include: standard_disks.yml
+  when: not use_custom_disks
+
+- include: custom_disks.yml
+  when: use_custom_disks
+
+- block:
+  - name: Append exit 0
+    lineinfile: insertafter=EOF
+                dest=/usr/bin/startup_automount
+                line="exit 0"
+  - name: Deliver systemctl autostart config
+    template: src=templates/startup_automount.service.j2
+              dest=/etc/systemd/system/startup_automount.service
+              mode=0644
+  - name: Set startup_automount start on boot
+    service: name=startup_automount
+             state=started
+             enabled=yes
+- name: Deliver rsyncd.conf common section
+  template: src=templates/rsyncd.conf.j2
+            dest=/etc/rsyncd.conf
+- name: Change attr of rc.local
+  command: chattr -a /etc/rc.d/rc.local
+- name: Change permissions for rc.local
+  command: chmod +x /etc/rc.d/rc.local
+  register: result
+  failed_when: result is failed and 'Operation not permitted' not in result.stderr
+- name: Change attributes for rc.local
+  command: chattr +a /etc/rc.d/rc.local
+  ignore_errors: yes
+- name: Check if systemctl restart rsyncd exist
+  shell: grep 'systemctl restart rsyncd' /etc/rc.d/rc.local
+  register: restart_rsyncd
+  failed_when: false
+- name: Append restart rsyncd into rc.local
+  shell: echo 'systemctl restart rsyncd' >> /etc/rc.d/rc.local
+  when: restart_rsyncd.rc == 1

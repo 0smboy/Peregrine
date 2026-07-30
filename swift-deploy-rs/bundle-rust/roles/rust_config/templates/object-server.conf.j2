@@ -1,0 +1,43 @@
+# {{ ansible_managed }}
+# Parsed by swift-object-server ([app:object-server]) and by the
+# swift-object-replicator / swift-object-updater / swift-object-reconstructor
+# daemons (their own sections below; they read devices/bind_port from
+# [app:object-server]).
+
+[app:object-server]
+bind_ip = 0.0.0.0
+bind_port = {{ object_bind_port }}
+devices = {{ srv_node_root }}
+mount_check = {{ 'true' if custom_disks | length > 0 else 'false' }}
+workers = {{ object_workers }}
+# statsd -> local statsd_exporter (bundle-monitoring). Each daemon prefixes
+# metrics with its log_name (object-server / object-replicator / ...); a
+# non-empty log_statsd_metric_prefix would be PREPENDED to that, so it stays
+# empty to keep the spec shapes (object-server.<METHOD>.<status>).
+log_statsd_host = 127.0.0.1
+log_statsd_port = 9125
+log_statsd_metric_prefix =
+
+[object-replicator]
+interval = 30
+{% if groups['object_servers'] | length > 1 %}
+rsync_ssh_opts = ssh -i /etc/swift/replication_key -o StrictHostKeyChecking=accept-new
+rsync_devices_root = {{ srv_node_root }}
+{% else %}
+peer_map = {{ object_bind_port }}:{{ srv_node_root }}
+{% endif %}
+log_statsd_host = 127.0.0.1
+log_statsd_port = 9125
+log_statsd_metric_prefix =
+
+[object-updater]
+interval = 300
+log_statsd_host = 127.0.0.1
+log_statsd_port = 9125
+log_statsd_metric_prefix =
+
+[object-reconstructor]
+interval = 30
+log_statsd_host = 127.0.0.1
+log_statsd_port = 9125
+log_statsd_metric_prefix =

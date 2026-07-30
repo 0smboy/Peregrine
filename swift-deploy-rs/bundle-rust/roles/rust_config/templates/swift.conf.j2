@@ -1,0 +1,23 @@
+# {{ ansible_managed }}
+# Cluster identity + storage policies. Parsed by every swift-* binary
+# (HashPathConfig::from_swift_conf + parse_storage_policies).
+
+[swift-hash]
+swift_hash_path_prefix = {{ swift_hash_path_prefix }}
+swift_hash_path_suffix = {{ swift_hash_path_suffix }}
+
+{% for policy in swift_policies %}
+[storage-policy:{{ policy.index }}]
+name = {{ policy.name }}
+{% if policy.type == 'erasure_coding' %}
+policy_type = erasure_coding
+ec_type = {{ policy.ec_type }}
+ec_num_data_fragments = {{ policy.ec_data }}
+ec_num_parity_fragments = {{ policy.ec_parity }}
+ec_object_segment_size = {{ policy.ec_segment_size }}
+{% endif %}
+{% if policy.get('default', false) %}
+default = yes
+{% endif %}
+
+{% endfor %}
