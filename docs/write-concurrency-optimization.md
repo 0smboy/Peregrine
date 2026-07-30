@@ -1,7 +1,28 @@
 # Optimization plan: write concurrency
 
-Status: **planned** (root-caused and scoped against the live 4-node cluster;
-not yet implemented). Added after the 2026-07-30 production test pass.
+Status: **partially implemented** (2026-07-30). Two levers shipped and deployed;
+the rest scoped below. Root-caused against the live 4-node cluster and a clean
+single-node A/B.
+
+## Implemented
+
+- **Object worker floor raised 2 → 16 (config, deployed to all 4 nodes).** The
+  deployed `object-server.conf` pinned `workers = 2`, so each object server
+  processed only two requests at a time. A clean single-node A/B (4 KB writes,
+  concurrency 64) showed 2 → 16 workers roughly **doubled write throughput
+  (194 → 344 PUT/s) and cut p50 187 → 113 ms, p99 2028 → 784 ms**; 16 → 64 was
+  flat, pointing at the shared work-queue lock and single-disk fsync as the next
+  limiters.
+- **Lock-free accept dispatch (code, `swift-http`).** Replaced the
+  `Arc<Mutex<Receiver>>` work queue with a `crossbeam-channel` MPMC: every worker
+  `recv()`s directly, so raising the pool no longer serializes workers on a
+  shared mutex. 946/946 workspace tests still pass; deployed to all 4 nodes.
+
+  A clean throughput delta for the lock-free change could not be isolated on the
+  shared test host (swift1 also runs the live cluster, Loki and Prometheus, so
+  the single-node numbers are too noisy to A/B a second-order change) — it is
+  shipped as a correct, non-regressing contention fix, to be re-measured on a
+  dedicated load source.
 
 ## Observation
 
@@ -44,10 +65,10 @@ receiver contention in the accept dispatch).
    expose a durability knob, to amortize the per-object sync under load.
 3. **Spread the container hotspot** — run with more containers and enable
    container **sharding** so writes are not funneled through one container DB.
-4. **Lock-free accept dispatch + `SO_REUSEPORT`** — replace the
-   `Arc<Mutex<Receiver>>` work queue with a lock-free MPMC (crossbeam) and run
-   multiple accept sockets, so raising the worker pool actually adds parallelism
-   for connection-heavy, small-object write bursts.
+4. **Lock-free accept dispatch (DONE) + `SO_REUSEPORT` (remaining)** — the
+   `Arc<Mutex<Receiver>>` work queue is now a lock-free crossbeam MPMC (shipped);
+   the remaining piece is multiple accept sockets via `SO_REUSEPORT` so a single
+   acceptor thread is not the ceiling for connection-heavy small-object bursts.
 5. **Long-term: async (tokio) server** — an event-driven server gives
    eventlet-parity concurrency (thousands of in-flight requests on a few
    threads) without a large OS-thread pool, removing the thread-count tradeoff

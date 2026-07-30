@@ -27,7 +27,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use crossbeam_channel::{bounded, Sender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -186,26 +186,23 @@ pub fn serve_forever_with_config(
     config: ServerConfig,
 ) -> std::io::Result<()> {
     let worker_count = config.worker_threads.max(1);
-    let (sender, receiver) = sync_channel::<TcpStream>(config.connection_queue.max(1));
-    let receiver = Arc::new(Mutex::new(receiver));
+    // Lock-free MPMC work queue: each worker holds its own Receiver clone and
+    // recv()s directly, so the accept dispatch never serializes workers on a
+    // shared Mutex<Receiver>. That mutex contention capped write concurrency
+    // once the worker pool was raised past a handful of threads.
+    let (sender, receiver) = bounded::<TcpStream>(config.connection_queue.max(1));
 
     let mut workers = Vec::with_capacity(worker_count);
     for worker_id in 0..worker_count {
-        let receiver = Arc::clone(&receiver);
+        let receiver = receiver.clone();
         let handler = Arc::clone(&handler);
         let config = config.clone();
         let worker = std::thread::Builder::new()
             .name(format!("swift-http-{worker_id}"))
             .spawn(move || loop {
-                let stream = {
-                    let guard = match receiver.lock() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    match guard.recv() {
-                        Ok(stream) => stream,
-                        Err(_) => return,
-                    }
+                let stream = match receiver.recv() {
+                    Ok(stream) => stream,
+                    Err(_) => return,
                 };
                 // A handler panic must only terminate the affected request,
                 // never permanently reduce the worker pool.
@@ -254,7 +251,7 @@ pub fn serve_forever_with_config(
 
 fn dispatch_connection(
     stream: TcpStream,
-    sender: &SyncSender<TcpStream>,
+    sender: &Sender<TcpStream>,
     config: &ServerConfig,
 ) -> std::io::Result<()> {
     match sender.try_send(stream) {
