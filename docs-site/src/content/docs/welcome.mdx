@@ -1,0 +1,78 @@
+---
+title: Peregrine
+description: A Rust rewrite of OpenStack Swift — byte-compatible on the wire and on disk — with its deployer, load generator, benchmark automation, and web console, in one monorepo.
+sidebar:
+  order: 0
+---
+
+Peregrine is a production object-storage platform built around a **ground-up
+Rust rewrite of [OpenStack Swift](https://github.com/openstack/swift)**. Every
+on-disk and on-the-wire format is **byte-for-byte compatible** with Python
+Swift, so a Peregrine binary can be dropped onto a node in a live Python cluster
+and validated one component at a time. The repository ships everything needed to
+run the system in production: the storage engine, a Python-free deployer, a load
+generator, a benchmark harness, and a web console.
+
+<Aside type="note" title="Format fidelity over everything">
+Swift's correctness lives in its formats — the ring, the account and container
+SQLite databases, the on-disk diskfile layout, pickled hashes, crypto metadata,
+HMAC signatures, and erasure-coded fragment archives. Peregrine reproduces each
+one exactly, proven against the real Python implementation as a golden oracle.
+That is what makes a node-by-node rollout safe rather than a big-bang rewrite.
+</Aside>
+
+## The components
+
+<CardGrid>
+  <Card title="swift-rust">
+    The storage engine — proxy, object, container and account servers, every
+    consistency daemon, erasure coding, the ring, the SQLite backends, and the
+    middleware pipeline. A 17-crate Rust workspace. [Read more →](/swift-rust)
+  </Card>
+  <Card title="swift-deploy-rs">
+    A bounded, Python-free deployer that executes the upstream Swift Ansible v3
+    plan natively — no Ansible — with sealed, re-verified plans and per-action
+    authorization. [Read more →](/swift-deploy-rs)
+  </Card>
+  <Card title="cosbench-rs">
+    A Rust rewrite of Intel's COSBench core: an S3/Swift load generator with
+    prepare / main / cleanup workloads and JSON/CSV reports. [Read more →](/cosbench-rs)
+  </Card>
+  <Card title="cabt-rs">
+    Benchmark automation over cosbench-rs — submit workloads, track progress,
+    collect and archive results. [Read more →](/cabt-rs)
+  </Card>
+  <Card title="swift-console">
+    The web console: a files browser, deploy control, live monitoring, and a
+    chaos / HA lab, served from a single Rust binary. [Read more →](/swift-console)
+  </Card>
+</CardGrid>
+
+## Where to go next
+
+<CardGrid>
+  <Card title="Get started">
+    Build the engine and stand up a single-host cluster in one command.
+    [Get started →](/getting-started)
+  </Card>
+  <Card title="Architecture">
+    How the data, control, and test planes fit together. [Architecture →](/architecture)
+  </Card>
+  <Card title="Testing & verification">
+    Golden fixtures, functional parity, load, and live HA drills. [Testing →](/testing)
+  </Card>
+  <Card title="Philosophy">
+    Why Peregrine is built the way it is. [Philosophy →](/philosophy)
+  </Card>
+</CardGrid>
+
+## Status
+
+The data path is feature-complete and byte-compatible with Python Swift:
+replication and erasure coding, all four servers, every consistency daemon, the
+middleware pipeline, and container sharding. The workspace runs ~946 tests, and
+the system has been validated live on a four-node high-availability cluster —
+functional parity against Python, sustained load, and node-down failover. See
+[Testing](/testing) and [Performance](/performance) for the numbers.
+
+Licensed Apache-2.0, matching upstream OpenStack Swift.

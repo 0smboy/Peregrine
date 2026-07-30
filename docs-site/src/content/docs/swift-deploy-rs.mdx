@@ -1,0 +1,65 @@
+---
+title: swift-deploy-rs
+description: A bounded, Python-free deployer that runs the upstream Swift Ansible v3 plan natively — sealed plans, per-action authorization, and an embedded control console.
+sidebar:
+  order: 11
+---
+
+`swift-deploy-rs` is a bounded, Rust-native deployment executor for OpenStack
+Swift. It keeps the upstream playbooks, roles, templates and file assets, but at
+runtime depends on **no Python, no Ansible, and no `ansible-playbook`**. Unknown
+modules, unknown task syntax, and a modified plan all fail closed.
+
+## What it does
+
+<Steps>
+<Step>
+Parses the INI inventory, host/group vars, ranges, `children`, and Swift's
+security/ring config generation.
+</Step>
+<Step>
+Expands plays, roles, static includes, blocks, loops, handlers, `register`,
+`delegate` and `run_once` into a **deterministic JSON plan**.
+</Step>
+<Step>
+**Seals the plan with SHA-256.** Before `apply`, it re-verifies the plan,
+bundle, inventory and exact digests — a plan that changed after sealing will not
+apply.
+</Step>
+<Step>
+Applies over strict OpenSSH (host-key checking on by default; inventory
+passwords refused by default). Disk wipes, firewall changes, and SSH
+reconfiguration each require **separate authorization**.
+</Step>
+</Steps>
+
+## Scope
+
+Targets the `swift_ansible_v3` (2023-07-25) source commit: 57 task/handler YAML
+files, 413 leaf tasks, and 28 execution modules are audited and covered. A
+`bundle_audit` proves the selected bundle is fully covered and the audit
+fingerprint is stable.
+
+## Control console
+
+The same binary embeds a reactive web control console (no Node.js, no external
+frontend). Its API — `/api/plan`, `/api/validate`, `/api/preflight`,
+`/api/apply`, `/api/state`, `/api/workspace/*`, `/rings/` — is token-guarded;
+only `/healthz` is public. The [swift-console](/swift-console) Deploy surface is
+a front end over this API.
+
+## Build & run
+
+```sh
+cd swift-deploy-rs
+cargo build --release
+cargo test --workspace        # includes the bundle audit
+./target/release/swift-deploy ui --bind 127.0.0.1 --port 8789 \
+  --auth-token-file /etc/swift-deploy/ui-token
+```
+
+<Aside type="caution" title="Authorization is deliberate">
+The three destructive capabilities — disk erase, firewall, SSH reconfig — are
+each gated behind their own authorization flag. That is by design: a deployer
+that can silently wipe disks is a footgun.
+</Aside>

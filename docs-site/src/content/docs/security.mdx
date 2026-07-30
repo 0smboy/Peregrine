@@ -1,0 +1,64 @@
+---
+title: Security
+description: Access control, supply chain, the unsafe surface, and hardening notes.
+sidebar:
+  order: 24
+---
+
+## Access control
+
+Verified live against the cluster:
+
+| Check | Result |
+|-------|--------|
+| Cross-account read/write | `403` denied |
+| Container ACL: public-read / restrict / revoke | correct, matches Python |
+| No-token / bad-token | `401` |
+| Unsupported method (TRACE) | `405` |
+| Path-traversal object name | stored as a literal, no filesystem escape |
+| ETag integrity on PUT | `422` on md5 mismatch (after the fix below) |
+| Metadata length | `400` over the 256-char limit (after the fix below) |
+
+## Supply chain & unsafe
+
+- **`cargo audit`** — 0 vulnerabilities across a lean 73-crate dependency tree.
+- **`unsafe`** — a small, reviewed surface: FFI (the erasure-coding codec) and
+  syscall wrappers (`getifaddrs`, `flock`, xattr). No transmutes or ambient
+  global-state hacks.
+
+## Control-plane auth
+
+The [swift-deploy-rs](/swift-deploy-rs) control API is token-guarded — plan,
+validate, and apply all require the token; only `/healthz` is public. The
+[swift-console](/swift-console) holds a per-session token and is meant to listen
+on loopback behind the cluster load balancer.
+
+## Validation fixes shipped
+
+Three input-validation/format deviations from Python were found and fixed:
+
+<Steps>
+<Step>
+**ETag integrity.** The proxy dropped the client `ETag` before fan-out, so the
+object server's md5 check never fired and a corrupt upload returned `201`. The
+proxy now forwards it; a mismatch is `422`.
+</Step>
+<Step>
+**ETag format.** The object server correctly returns a quoted ETag (matching
+Python's diskfile and the golden oracle); the proxy now strips the quotes for
+the client (`normalize_etag`), so the client sees the bare md5.
+</Step>
+<Step>
+**Metadata length.** Object writes now run `check_metadata`; an oversized
+`X-Object-Meta-*` value is rejected with `400` instead of stored.
+</Step>
+</Steps>
+
+## Hardening notes
+
+<Aside type="caution">
+- `swift.conf` ships world-readable (`0644`) but holds the hash prefix/suffix —
+  `chmod 0640`.
+- TempURL / formpost / crypto / s3api middleware are **not** in the default
+  proxy pipeline; enable them deliberately if a deployment needs those features.
+</Aside>

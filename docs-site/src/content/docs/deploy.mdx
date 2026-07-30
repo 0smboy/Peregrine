@@ -1,0 +1,89 @@
+---
+title: Deploy
+description: A one-command single-host cluster, a real multi-node deployment, and rolling binary upgrades.
+sidebar:
+  order: 20
+---
+
+## Single-host (SAIO)
+
+`swift-rust/deploy/` stands up a 4-node single-host cluster (a 3× replication
+policy and an EC-4-2 policy) from prebuilt binaries — no compiler, no dependency
+install.
+
+<Steps>
+<Step>
+Unpack the bundle (binaries + liberasurecode `.so` family + scripts).
+
+```sh
+tar xzf swift-rust-bundle.tar.gz
+cd swift-rust-bundle
+```
+</Step>
+<Step>
+Bootstrap. Idempotent; installs libs+bins, builds rings, starts the systemd
+service, runs a smoke test.
+
+```sh
+sudo bash bootstrap.sh          # prints SMOKE: PASS when live at :8080
+```
+</Step>
+<Step>
+Operate.
+
+```sh
+bash smoke.sh                       # re-run the end-to-end check
+bash ec-heal-demo.sh                # delete an EC fragment; watch it heal
+systemctl status swift-rust-saio    # the cluster service
+```
+</Step>
+</Steps>
+
+## Multi-node
+
+A real deployment uses the same binaries with real rings and the replicators'
+rsync-over-ssh mode. Two paths:
+
+- **[swift-deploy-rs](/swift-deploy-rs)** — plan, seal, verify, and apply the
+  Swift Ansible v3 topology natively, driven from its control console or the
+  [swift-console](/swift-console) Deploy surface.
+- **Manual** — build rings with `swift-ring-builder`, place `swift.conf` +
+  rings under `SWIFT_DIR` on every node, and run the servers as systemd units.
+
+## Rolling binary upgrade
+
+Because every format is byte-compatible, a new build drops onto one node at a
+time. The pattern used in production:
+
+<Steps>
+<Step>
+Back up the current binaries on the node.
+
+```sh
+mkdir -p /usr/local/bin/backup-$(date +%F-%H%M%S)
+cp -a /usr/local/bin/swift-*-server /usr/local/bin/backup-*/
+```
+</Step>
+<Step>
+Install the new binaries and restart the services on that node.
+
+```sh
+install -m755 target/release/swift-object-server /usr/local/bin/
+systemctl restart swift-object swift-container swift-account swift-proxy
+```
+</Step>
+<Step>
+Verify health, then move to the next node.
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' http://<node>:8080/healthcheck   # 200
+```
+</Step>
+</Steps>
+
+<Aside type="tip" title="Behind a cloud load balancer">
+If a cloud Internal LB fronts the proxies, note its **hairpin limitation**: a
+backend-pool node cannot reach the LB VIP and have the flow hashed back to
+itself. Run client tools on the nodes against a specific HAProxy address, and
+reserve the VIP for clients outside the backend pool.
+</Aside>

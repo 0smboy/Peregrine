@@ -1,0 +1,58 @@
+---
+title: cosbench-rs
+description: A Rust rewrite of Intel's COSBench core — an S3/Swift load generator with prepare/main/cleanup workloads, hash-integrity checks, and JSON/CSV reports.
+sidebar:
+  order: 12
+---
+
+`cosbench-rs` is a Rust rewrite of the [intel-cloud/cosbench](https://github.com/intel-cloud/cosbench)
+core engine: a load generator for object stores. It drives **mock**, **S3**
+(multipart, range GET, path-style), and **Swift** targets, with Keystone v3 or
+v1 tempauth.
+
+## Workload model
+
+A workload is a YAML document with staged operations. Stages run in order;
+within a stage, workers run concurrently for a fixed op count or duration.
+
+```yaml
+name: prod-mixed
+auth:
+  type: temp_auth
+  url: http://10.42.30.11:8085/auth/v1.0
+  user: test:tester
+  key: azure-swift-2026.bench
+storage:
+  type: swift
+  endpoint: http://10.42.30.11:8085/v1/AUTH_test   # explicit: avoid an LB hairpin
+  timeout_ms: 120000
+stages:
+  - { name: init,    kind: init,    workers: 4,  total_ops: 4,    operations: [{ type: create_container, ratio: 100 }], objects: {...} }
+  - { name: prepare, kind: prepare, workers: 32, total_ops: 2000, operations: [{ type: write, ratio: 100 }],           objects: {...} }
+  - { name: main,    kind: main,    workers: 64, runtime_secs: 90, operations: [{ type: read, ratio: 80 }, { type: write, ratio: 20 }], objects: {...} }
+  - { name: cleanup, kind: cleanup, workers: 32, total_ops: 2000, operations: [{ type: delete, ratio: 100 }],          objects: {...} }
+```
+
+<Aside type="tip" title="Endpoint override">
+Leave `storage.endpoint` empty to use the storage URL returned by auth. Set it
+explicitly (e.g. a specific HAProxy) when the bench runs on a cloud
+load-balancer backend-pool node that cannot hairpin to its own VIP.
+</Aside>
+
+## Run
+
+```sh
+cargo build --release -p cosbench-cli
+./target/release/cosbench-rs run -c examples/swift-tempauth.yaml --report-dir reports
+./target/release/cosbench-rs import-xml -i examples/sample-cosbench.xml -o /tmp/w.yaml
+./target/release/cosbench-rs serve --bind 0.0.0.0:8080     # control plane + dashboard
+```
+
+## Reports
+
+Each run emits JSON and CSV: per-stage `ops_ok` / `ops_fail`, throughput
+(ops/s and MB/s), and latency percentiles (p50 / p95 / p99). In the production
+pass a 90-second mixed run reached **240,120 ops at 0 failures, 2,667 ops/s,
+167 MiB/s, p50 9.6 ms / p99 127 ms** — see [Performance](/performance).
+
+For automation over cosbench-rs, use [cabt-rs](/cabt-rs).

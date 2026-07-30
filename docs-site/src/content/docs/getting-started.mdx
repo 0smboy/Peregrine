@@ -1,0 +1,96 @@
+---
+title: Get started
+description: Build the storage engine, run the test suite, and stand up a single-host cluster in one command.
+sidebar:
+  order: 1
+---
+
+Every component builds and runs independently — there is no monorepo-wide build
+step and no single Cargo workspace forced across them (each keeps its own).
+
+## Requirements
+
+- **Rust** (stable) — `rustc` / `cargo`.
+- **Linux** for erasure coding (`liberasurecode` + the `ec` cargo feature). The
+  default build works anywhere, including macOS.
+- For a full cluster: `xfs`-backed devices (for xattrs), `memcached`, and SSH
+  between nodes.
+
+## Build the engine
+
+The default profile builds anywhere and excludes erasure coding; the `ec`
+feature adds the liberasurecode codec on Linux.
+
+<Steps>
+<Step>
+Build the release binaries.
+
+```sh
+cd swift-rust
+cargo build --release
+```
+</Step>
+<Step>
+Run the test suite (format fidelity vs the Python golden fixtures).
+
+```sh
+cargo test --workspace --exclude swift-ec      # swift-ec needs liberasurecode
+```
+</Step>
+<Step>
+On Linux, build and test with erasure coding.
+
+```sh
+cargo build --release --features swift-proxy-server/ec,swift-object-server/ec
+cargo test -p swift-ec -p swift-object-server -p swift-proxy-server \
+  --features swift-proxy-server/ec,swift-object-server/ec
+```
+</Step>
+</Steps>
+
+## One-command cluster (SAIO)
+
+A self-contained bootstrap in `swift-rust/deploy/` stands up a **4-node
+single-host** cluster (both a 3× replication policy and an EC-4-2 policy) from
+prebuilt binaries — no compiler, no dependency hunting.
+
+```sh
+tar xzf swift-rust-bundle.tar.gz
+cd swift-rust-bundle
+sudo bash bootstrap.sh          # installs libs+bins, builds rings, starts the
+                                # cluster as a systemd service, runs a smoke test
+```
+
+When it prints `SMOKE: PASS` the cluster is live at `http://127.0.0.1:8080`.
+
+<Aside type="tip" title="Auth">
+The SAIO uses tempauth: `test:tester` / `testing` (also `admin:admin` / `admin`).
+</Aside>
+
+## A first request
+
+```sh
+url_tok=$(curl -si -H 'X-Auth-User: test:tester' -H 'X-Auth-Key: testing' \
+  http://127.0.0.1:8080/auth/v1.0)
+TOK=$(echo "$url_tok" | awk 'tolower($1)=="x-auth-token:"{print $2}' | tr -d '\r')
+URL=$(echo "$url_tok" | awk 'tolower($1)=="x-storage-url:"{print $2}' | tr -d '\r')
+curl -X PUT "$URL/mybox" -H "X-Auth-Token: $TOK"                 # container
+echo hello | curl -T- "$URL/mybox/hi" -H "X-Auth-Token: $TOK"    # object
+curl "$URL/mybox/hi" -H "X-Auth-Token: $TOK"                     # -> hello
+```
+
+## The other components
+
+Each is an independent Cargo project; build the release binary of whichever you
+need.
+
+```sh
+cd swift-deploy-rs && cargo build --release   # deployer + control console
+cd cosbench-rs      && cargo build --release   # load generator
+cd cabt-rs          && cargo build --release   # benchmark automation
+cd swift-console    && cargo build --release   # web console
+```
+
+Next: read the [Architecture](/architecture), or jump to a component —
+[swift-rust](/swift-rust), [swift-deploy-rs](/swift-deploy-rs),
+[cosbench-rs](/cosbench-rs), [cabt-rs](/cabt-rs), [swift-console](/swift-console).

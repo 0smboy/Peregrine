@@ -1,0 +1,89 @@
+---
+title: swift-rust
+description: The storage engine — a 17-crate Rust rewrite of OpenStack Swift, byte-compatible with Python on the wire and on disk.
+sidebar:
+  order: 10
+---
+
+`swift-rust` is the storage engine: the proxy, object, container and account
+servers, every consistency daemon, erasure coding, the ring, the SQLite
+backends, and the middleware pipeline — a 17-crate Rust workspace. It is a
+*strangler* of Python Swift: because every format is byte-compatible, a Rust
+binary can join a live Python cluster and be validated one component at a time.
+
+## The data path
+
+A client request travels **client → proxy → object / container / account
+servers → container-update side channel → container server**. The proxy fans
+out to backends and picks a quorum best-response. Object bodies stream end to
+end through 64 KB buffers — a 1 GB object moves with a single-digit-MB peak-RSS
+delta across all servers.
+
+## What's implemented
+
+<CardGrid>
+  <Card title="Servers & daemons">
+    All four servers plus object/DB replicators, reconstructor, object &
+    container updaters, expirer, account reaper, container-sync, reconciler,
+    relinker, auditors, recon, drive-audit.
+  </Card>
+  <Card title="Erasure coding (Linux)">
+    liberasurecode codec (fragments byte-identical to PyECLib), streaming
+    multipart-MIME + multiphase-commit PUT, segment-wise + ranged GET, and a
+    reconstructor that heals a lost fragment from its peers.
+  </Card>
+  <Card title="Container sharding">
+    End to end — backend, cleave state machine, server paths, and the sharder
+    daemon.
+  </Card>
+  <Card title="Middleware">
+    tempauth, copy, SLO/DLO, versioned_writes, symlink, staticweb, listings,
+    account/container quotas, ratelimit, and more.
+  </Card>
+</CardGrid>
+
+## Build & test
+
+<Tabs>
+<TabItem label="Default (any OS)">
+```sh
+cargo build --release
+cargo test --workspace --exclude swift-ec
+cargo clippy --workspace --exclude swift-ec --all-targets -- -D warnings
+```
+</TabItem>
+<TabItem label="Erasure coding (Linux)">
+```sh
+cargo build --release --features swift-proxy-server/ec,swift-object-server/ec
+cargo test -p swift-ec -p swift-object-server -p swift-proxy-server \
+  --features swift-proxy-server/ec,swift-object-server/ec
+```
+</TabItem>
+</Tabs>
+
+## Binaries
+
+The workspace builds the daemon/CLI set: `swift-{proxy,object,container,account}-server`,
+`swift-object-{replicator,reconstructor,updater,auditor}`, `swift-container-updater`,
+`swift-db-replicator`, `swift-ring-builder`, `swift-recon`, `swift-drive-audit`,
+`swift-manage-shard-ranges`, `swift-{account,container,object}-info`,
+`swift-get-nodes`, and `swift-ring-sim`.
+
+## Server configuration
+
+Servers read `SWIFT_DIR` (rings + `swift.conf`) and take a conf file argument.
+Key object-server tunables:
+
+| Key | Meaning |
+|-----|---------|
+| `bind_ip` / `bind_port` | listen address |
+| `devices` / `mount_check` | device root; require mounts |
+| `workers` | HTTP worker threads (raise from a low default for write concurrency — see [Performance](/performance)) |
+
+<Aside type="note">
+The default build excludes `swift-ec` so it links anywhere. macOS cannot link
+liberasurecode; edit locally, build/test the `ec` feature on a Linux box.
+</Aside>
+
+See [Testing](/testing) for the verification strategy and [Performance](/performance)
+for measured throughput and the latency fixes shipped.

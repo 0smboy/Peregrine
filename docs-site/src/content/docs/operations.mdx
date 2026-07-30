@@ -1,0 +1,75 @@
+---
+title: Operations
+description: Health, replication and reconstruction, the node-down HA drill, and EC self-heal.
+sidebar:
+  order: 21
+---
+
+## Health at a glance
+
+A cluster health check should report services, the load balancer, rings,
+capacity, replication passes, accounting, and data integrity — and print
+`UNKNOWN` for anything it cannot determine rather than scoring a failed probe as
+fine. The reference `health.sh` folds a per-node service census, HAProxy backend
+state, ring device counts, per-device usage, the latest replicator /
+reconstructor / updater pass, the account rollup vs container truth, and a
+read-back integrity check into one screen.
+
+## Replication & reconstruction
+
+- **Object replicator** — suffix-hash push, handoff revert, rsync /
+  rsync-over-ssh.
+- **Reconstructor** (EC) — rebuilds this node's missing fragment: gathers
+  `ndata` coherent peer archives, reconstructs at the node's fragment index, and
+  persists it durably.
+
+<Aside type="caution" title="Reconciling mixed EC state by hand">
+A deleted EC object can leave stale data fragments alongside newer tombstones on
+different devices — a state the reconstructor may loop on. The tombstone is
+authoritative (newer): remove only the stale `#<idx>#d.data` fragments, keep the
+`.ts` tombstones, and never touch a live object in the same partition. Revert
+errors clear on the next pass.
+</Aside>
+
+## EC self-heal
+
+The reconstructor heals a lost fragment quickly. In the production pass, deleting
+fragment `#2` of a live object left the degraded read serving correct data
+(2+1 tolerates one loss), and the reconstructor **rebuilt the exact fragment on
+its owner node within ≤15 s** — all three fragments back at the original
+timestamp.
+
+## Node-down HA drill
+
+Drive a real failover from the [swift-console](/swift-console) Lab:
+
+<Steps>
+<Step>
+Take a node down (journaled, auto-restarts on TTL).
+
+```sh
+POST /lab/api/node/down   {"node":"swift2","ttl_secs":300}
+```
+</Step>
+<Step>
+Wait for the load balancer to detect the dead proxy, then drive load on the
+survivors.
+</Step>
+<Step>
+Bring it back.
+
+```sh
+POST /lab/api/node/up     {"node":"swift2"}
+```
+</Step>
+</Steps>
+
+**Result (production pass):** with one node fully down, replication **and**
+erasure coding each served **100% of reads and writes** — EC writes surviving
+via handoffs.
+
+<Aside type="note" title="Tokens on node-down">
+tempauth tokens cached on a downed node's memcached go invalid, so a client
+re-authenticates on `401` (standard Swift). The re-auth during the outage
+succeeds — the memcache client does not hang on the down server.
+</Aside>

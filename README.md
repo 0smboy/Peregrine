@@ -11,6 +11,11 @@ cluster and validated one component at a time. Format fidelity is the design
 constraint; the parity is proven against the real Python implementation as a
 golden oracle.
 
+**Documentation: <https://peregrine-docs-ochre.vercel.app>** — built with
+[Nimbus](https://nimbus-docs.com/) (agent-native: every page has a markdown
+alternate, plus [`/llms.txt`](https://peregrine-docs-ochre.vercel.app/llms.txt)).
+Source in [`docs-site/`](docs-site/).
+
 ---
 
 ## Components

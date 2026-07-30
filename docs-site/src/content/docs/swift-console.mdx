@@ -1,0 +1,81 @@
+---
+title: swift-console
+description: The web console — files browser, deploy control, live monitoring, and a chaos / HA lab, served from one Rust binary.
+sidebar:
+  order: 14
+---
+
+`swift-console` is the management UI for a Peregrine cluster: a single Rust
+(`axum`) binary that serves four surfaces over one authenticated session. No
+Node.js, no external frontend — HTML/CSS/JS are served directly and pages render
+without a client-side framework.
+
+## Surfaces
+
+<CardGrid>
+  <Card title="Files">
+    An S3-style browser: buckets/containers, objects, upload, folders, trash
+    with restore, TempURL, search, user management, and bulk ZIP download.
+  </Card>
+  <Card title="Deploy">
+    A front end over [swift-deploy-rs](/swift-deploy-rs)'s plan / validate /
+    apply control API.
+  </Card>
+  <Card title="Monitor">
+    Live cluster metrics and logs, queried server-side — no backend name, URL,
+    or credential reaches the browser.
+  </Card>
+  <Card title="Lab">
+    Tools that explain and stress the cluster: RingScope, policy compare, Object
+    Capsule, Tombstone Museum, Chaos Arcade, and the **Node HA Drill**.
+  </Card>
+</CardGrid>
+
+## The Node HA Drill
+
+The Lab's node-down tool takes a whole storage node out of the cluster and
+watches the survivors carry the load. It rides the console's guarded mutation
+path — journaled with a TTL **auto-restart**, so a node always comes back even
+if the operator walks away — and it never touches `swift-console` or
+`swift-deploy`, so the console cannot take itself down.
+
+```
+GET  /lab/api/node/status     # per-node service health + which nodes are held down
+POST /lab/api/node/down       # {node, ttl_secs?} — stop a node's swift services
+POST /lab/api/node/up         # {node|journal_id} — restart early, before the TTL
+```
+
+<Aside type="note" title="Verified">
+In the production pass the drill took a node fully down while replication and
+erasure coding both served **100% of reads and writes** on the survivors — see
+[Operations](/operations).
+</Aside>
+
+## Build & run
+
+```sh
+cd swift-console
+cargo build --release
+./target/release/swift-console conf/config.json
+```
+
+`config.json` sets the bind address, the Swift proxy base and auth endpoint, the
+deploy upstream + token file, the metrics/logs upstreams, the account roster,
+per-cluster node metadata, and the Lab gates (`lab_enabled`, `lab_mutations`).
+
+<Aside type="caution" title="Bind to loopback">
+The console holds an authenticated session and proxies privileged operations; it
+is meant to listen on loopback (or a trusted network) behind the cluster load
+balancer, not to be exposed directly.
+</Aside>
+
+## Configuration reference
+
+| Key | Meaning |
+|-----|---------|
+| `bind` | listen address (default loopback) |
+| `swift_base` / `auth_url` | the Swift proxy and its `/auth/v1.0` |
+| `deploy_upstream` / `deploy_token_file` | the swift-deploy-rs control API |
+| `metrics_url` / `logs_url` | metrics + log backends |
+| `lab_enabled` / `lab_mutations` | enable the Lab surface / allow guarded mutations |
+| `cluster_nodes` | node roster (name + storage/replication/public IPs, devices) |

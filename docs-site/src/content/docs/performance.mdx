@@ -1,0 +1,71 @@
+---
+title: Performance
+description: Measured throughput and latency, the accept-loop fix that made the rewrite faster than Python, and the write-concurrency optimization.
+sidebar:
+  order: 23
+---
+
+All numbers are from a four-node cluster and same-host SAIO A/Bs against Python
+OpenStack Swift 2.35.0.
+
+## The accept-loop latency fix
+
+The `swift-http` accept loop set the listener non-blocking and slept 100 ms on
+`WouldBlock`, so every freshly-arriving connection waited up to ~100 ms to be
+accepted. Internal hops use `Connection: close`, so a GET paid it twice (proxy +
+object server). `/healthcheck` — which touches no backend — measured a flat
+95 ms, proving the delay was the server's own accept path. The fix: a 1 ms poll,
+plus `TCP_NODELAY` on the outbound backend sockets.
+
+| Metric | Before | After |
+|--------|-------:|------:|
+| `/healthcheck` | 95 ms | 0.9 ms |
+| 1 KB GET (SAIO) | 96 ms | 2.5 ms |
+| 1 KB PUT (SAIO) | 196 ms | 16 ms |
+| cluster 1 KB PUT | ~200 ms | 27 ms |
+| cluster 1 KB GET | ~92 ms | 9 ms |
+
+<Aside type="danger" title="This bug masked everything">
+Before the fix the cluster was 3–15× slower than the Python it replaces. After
+it, Rust is 2.7–4.4× faster than Python on reads.
+</Aside>
+
+## Rust vs Python (same-host SAIO A/B)
+
+| Workload | Rust (fixed) | Python 2.35 |
+|----------|-------------:|------------:|
+| 1 KB GET · c1 / c32 / c64 | 602 / 1645 / 1751 op/s | 190 / 619 / 646 op/s |
+| 1 MB GET · c1 / c32 (MB/s) | 322 / 471 | 73 / 135 |
+| 16 MB GET · c8 (MB/s) | 682 | 168 |
+| 1 KB PUT · c1 / c32 | 54 / 159 op/s | 32 / 255 op/s |
+
+Rust dominates reads at every size and streaming throughput; Python is
+competitive on concurrent small writes — the write-concurrency work below.
+
+## Production load (4-node, via HAProxy)
+
+A 90-second mixed 80/20 run at 64 workers: **240,120 ops, 0 failures,
+2,667 ops/s, 167 MiB/s, p50 9.6 ms / p99 127 ms**. A `cabt` sweep (6 tasks) ran
+with 0 failures; reads reached 4,180 ops/s (4 KB), 1,346 MB/s (1 MB), and
+1,920 MB/s (16 MB).
+
+## Write-concurrency optimization
+
+A clean single-node A/B (the multi-node result was a load-host artifact) showed
+the deployed `object-server` `workers = 2` starved write concurrency:
+
+| object workers | 4 KB PUT/s | p50 | p99 |
+|---------------:|-----------:|----:|----:|
+| 2 (deployed) | 194 | 187 ms | 2028 ms |
+| **16** | **344** | **113 ms** | **784 ms** |
+| 64 | 350 | 115 ms | 1288 ms |
+
+**Shipped:** the worker floor raised to 16 (config, deployed), and a lock-free
+`crossbeam` MPMC accept queue replacing the `Arc<Mutex<Receiver>>` that
+serialized workers on the hot path (946/946 tests still pass). Cluster 4 KB
+write p99 dropped from ~1017 ms to ~330 ms.
+
+**Remaining levers:** async/batched container updates (biggest), fsync
+coalescing, container sharding, `SO_REUSEPORT`, and a long-term tokio async
+server. Each to be A/B'd from a dedicated load source (the shared test host is
+noise-limited).

@@ -1,0 +1,72 @@
+---
+title: Testing & verification
+description: Four levels of verification, from golden-fixture unit tests to production-grade load and live HA drills on a four-node cluster.
+sidebar:
+  order: 22
+---
+
+Peregrine is verified at four levels, and a change is only done when the
+workspace tests are green, clippy is clean, the functional suite matches the
+Python oracle, and — for anything on the data path — the behavior is confirmed
+live on the cluster.
+
+## 1. Unit + golden (format fidelity)
+
+Every serialized format has a golden round-trip: the real Python Swift writes a
+fixture, `swift-rust` must read it and reproduce it byte-for-byte, then Rust
+writes and Python reads back. The workspace runs ~946 tests.
+
+```sh
+cargo test --workspace --exclude swift-ec
+cargo test -p swift-ec -p swift-object-server -p swift-proxy-server \
+  --features swift-proxy-server/ec,swift-object-server/ec
+cargo clippy --workspace --exclude swift-ec --all-targets -- -D warnings
+```
+
+## 2. Functional parity vs the Python oracle
+
+A single parameterized suite runs against both a Rust stack and a Python Swift
+SAIO, so the two PASS/FAIL tables are a direct parity comparison: CRUD, byte
+ranges (single, suffix, multipart), swob conditionals, SLO/DLO, erasure coding,
+copy, expiry, ACLs, cross-account denial, and negative cases.
+
+<Aside type="note" title="Result">
+Everything matched the oracle except three deviations — client ETag not
+validated on PUT, a quoted client-facing ETag, and metadata length not
+enforced. All three were root-caused, fixed, and re-verified (Rust SAIO 54/54).
+See [Performance](/performance) for the details and the layering.
+</Aside>
+
+## 3. Performance A/B
+
+A concurrent driver runs a PUT/GET matrix (object size × concurrency) and
+reports throughput (ops/s, MB/s) and latency percentiles. Run it against a Rust
+SAIO and a Python SAIO on the same host for an implementation A/B, and against
+the cluster for production numbers. `cosbench-rs` + `cabt-rs` provide
+COSBench-grade load for larger runs.
+
+## 4. Production, on the HA cluster
+
+Against a four-node cluster behind a cloud load balancer with keepalive:
+
+<Steps>
+<Step>the functional suite through the load-balancer path (the real client path);</Step>
+<Step>sustained `cosbench-rs` / `cabt-rs` load at production concurrency;</Step>
+<Step>the console **Lab** for fault injection — fragment loss → reconstructor heal, and node-down failover — with read-back integrity;</Step>
+<Step>large-object streaming-memory checks (a multi-GB PUT/GET while sampling RSS).</Step>
+</Steps>
+
+## The harnesses
+
+`swift-rust/tools/` ships every harness used above, each runnable against any
+endpoint:
+
+| Script | Proves |
+|--------|--------|
+| `func-suite.sh` | functional parity (Rust and Python, one script) |
+| `bench.py` / `wbench.py` | throughput + latency percentiles |
+| `cbench.py` | write throughput vs container count |
+| `py-saio-setup.sh` / `rust-saio-setup.sh` | stand up a Python / Rust SAIO |
+| `ec-heal-test.sh` | EC fragment-loss → reconstructor heal |
+| `ha-test.sh` | node-down failover via the console |
+| `ci-fulltest.sh` / `regress.sh` | remote build + test + clippy + fmt; regression tally |

@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "base": "/",
+  "knownRoutes": [
+    "/",
+    "/404",
+    "/architecture",
+    "/cabt-rs",
+    "/cosbench-rs",
+    "/deploy",
+    "/getting-started",
+    "/operations",
+    "/performance",
+    "/philosophy",
+    "/security",
+    "/swift-console",
+    "/swift-deploy-rs",
+    "/swift-rust",
+    "/testing",
+    "/welcome"
+  ],
+  "opaqueNamespaces": []
+}
