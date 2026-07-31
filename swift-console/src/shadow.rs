@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Swift Shadow: one request, two implementations, a field-by-field diff.
+//! API Parity: capture request responses and diff them field by field.
 //!
 //! The ground truth on this cluster is that there is exactly ONE implementation.
 //! A second one is not installed, so nothing here is compared to anything and
@@ -2337,15 +2337,33 @@ fn head_block(lang: &str, err: &str) -> String {
     format!(
         r#"<div class="pagehead"><h1>{title}</h1></div>
 <p class="statline">{intro}</p>
-{e}<div class="sh-acts">
+{e}<div class="sh-caps">
+  <div class="sh-cap"><b>{cap1t}</b><p>{cap1d}</p></div>
+  <div class="sh-cap"><b>{cap2t}</b><p>{cap2d}</p></div>
+  <div class="sh-cap"><b>{cap3t}</b><p>{cap3d}</p></div>
+</div>
+<div class="sh-acts">
   <form method="post" action="/lab/api/shadow/run"><button class="btn-primary" type="submit">{cap}</button></form>
   <form method="post" action="/lab/api/shadow/replay"><button class="btn" type="submit">{rep}</button></form>
+  <form method="post" action="/lab/api/shadow/mutate" class="sh-mutate">
+    <label class="hint">{mut_seed}</label>
+    <input type="number" name="seed" value="839245" min="1" step="1" class="inp sm">
+    <button class="btn" type="submit">{mut}</button>
+  </form>
   <span class="hint">{hint}</span>
 </div>"#,
         title = esc(i18n::t(lang, "lab.tool.shadow.title")),
         intro = esc(i18n::t(lang, "shadow.intro")),
+        cap1t = esc(i18n::t(lang, "shadow.cap.parity.t")),
+        cap1d = esc(i18n::t(lang, "shadow.cap.parity.d")),
+        cap2t = esc(i18n::t(lang, "shadow.cap.compat.t")),
+        cap2d = esc(i18n::t(lang, "shadow.cap.compat.d")),
+        cap3t = esc(i18n::t(lang, "shadow.cap.response.t")),
+        cap3d = esc(i18n::t(lang, "shadow.cap.response.d")),
         cap = esc(i18n::t(lang, "shadow.act.capture")),
         rep = esc(i18n::t(lang, "shadow.act.replay")),
+        mut = esc(i18n::t(lang, "shadow.act.mutate")),
+        mut_seed = esc(i18n::t(lang, "shadow.act.mutate_seed")),
         hint = esc(i18n::t(lang, "shadow.act.hint")),
     )
 }
@@ -2467,6 +2485,362 @@ pub async fn page(
     crate::pages::lab_tool_shell(&state, &headers, &sess, "shadow", body)
 }
 
+// -------------------------------------------------------- protocol mutation
+
+/// Deterministic LCG so the same seed always yields the same sequence.
+struct MutRng(u64);
+impl MutRng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+        self.0
+    }
+    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+        &xs[(self.next() as usize) % xs.len()]
+    }
+    fn u32_range(&mut self, lo: u32, hi: u32) -> u32 {
+        lo + (self.next() as u32 % (hi - lo + 1))
+    }
+}
+
+#[derive(Clone)]
+pub struct MutStep {
+    pub name: &'static str,
+    pub spec: ReqSpec,
+}
+
+/// Build a seeded mutation sequence. Pure — unit-tested for reproducibility.
+pub fn mutate_sequence(seed: u64) -> Vec<MutStep> {
+    let mut rng = MutRng(seed.max(1));
+    let obj = format!("/{C_MAIN}/mut-{}-{}.bin", seed, rng.u32_range(1, 9999));
+    let mut steps = Vec::new();
+
+    // Always start with a PUT so later steps have a target.
+    steps.push(MutStep {
+        name: "PUT",
+        spec: ReqSpec {
+            method: "PUT".into(),
+            sub: obj.clone(),
+            headers: h(&[("Content-Type", "application/octet-stream")]),
+            body: Some(probe_body()),
+            ..Default::default()
+        },
+    });
+
+    let catalog: &[fn(&mut MutRng, &str) -> MutStep] = &[
+        |_, o| MutStep {
+            name: "POST_meta",
+            spec: ReqSpec {
+                method: "POST".into(),
+                sub: o.into(),
+                headers: h(&[("X-Object-Meta-Color", "red")]),
+                ..Default::default()
+            },
+        },
+        |r, o| {
+            let case = *r.pick(&["bytes=0-0", "bytes=-1", "bytes=0-9", "bytes=4000-99999"]);
+            MutStep {
+                name: "Range_GET",
+                spec: get(o.into(), vec![], h(&[("Range", case)])),
+            }
+        },
+        |r, o| {
+            let key = *r.pick(&["X-Object-Meta-Color", "x-object-meta-color", "X-Object-Meta-COLOR"]);
+            MutStep {
+                name: "POST_meta_case",
+                spec: ReqSpec {
+                    method: "POST".into(),
+                    sub: o.into(),
+                    headers: h(&[(key, "blue")]),
+                    ..Default::default()
+                },
+            }
+        },
+        |_, o| MutStep {
+            name: "HEAD",
+            spec: ReqSpec {
+                method: "HEAD".into(),
+                sub: o.into(),
+                ..Default::default()
+            },
+        },
+        |_, o| MutStep {
+            name: "DELETE",
+            spec: ReqSpec {
+                method: "DELETE".into(),
+                sub: o.into(),
+                ..Default::default()
+            },
+        },
+        |_, o| MutStep {
+            name: "PUT_again",
+            spec: ReqSpec {
+                method: "PUT".into(),
+                sub: o.into(),
+                headers: h(&[("Content-Type", "text/plain")]),
+                body: Some("resurrected\n".into()),
+                ..Default::default()
+            },
+        },
+        |_, o| MutStep {
+            name: "GET_open_expired",
+            spec: get(
+                o.into(),
+                vec![],
+                h(&[("X-Open-Expired", "true")]),
+            ),
+        },
+        |r, o| {
+            let at = crate::util::now_secs() + r.u32_range(30, 120) as u64;
+            MutStep {
+                name: "POST_delete_at",
+                spec: ReqSpec {
+                    method: "POST".into(),
+                    sub: o.into(),
+                    headers: vec![("X-Delete-At".into(), at.to_string())],
+                    ..Default::default()
+                },
+            }
+        },
+    ];
+
+    let n = 3 + (rng.next() as usize % 4); // 3..6 extra steps
+    for _ in 0..n {
+        let f = rng.pick(catalog);
+        steps.push(f(&mut rng, &obj));
+    }
+    // Always finish with HEAD so resurrection / delete semantics are visible.
+    steps.push(MutStep {
+        name: "HEAD_final",
+        spec: ReqSpec {
+            method: "HEAD".into(),
+            sub: obj,
+            ..Default::default()
+        },
+    });
+    steps
+}
+
+fn classify_divergence(seq_names: &[String], a: &[u16], b: &[u16]) -> String {
+    if a == b {
+        return "identical".into();
+    }
+    let joined = seq_names.join("→");
+    if joined.contains("DELETE") && joined.contains("PUT_again") {
+        return "delete-then-put resurrection semantics".into();
+    }
+    if joined.contains("open_expired") || joined.contains("delete_at") {
+        return "expired-object access semantics".into();
+    }
+    if joined.contains("Range") {
+        return "range boundary semantics".into();
+    }
+    if joined.contains("meta_case") || joined.contains("POST_meta") {
+        return "metadata case / update semantics".into();
+    }
+    "status-sequence divergence".into()
+}
+
+fn mutations_path() -> PathBuf {
+    cfg().root.join("mutations.jsonl")
+}
+
+#[derive(Deserialize, Default)]
+pub struct MutateForm {
+    #[serde(default = "default_seed")]
+    pub seed: u64,
+}
+fn default_seed() -> u64 {
+    839245
+}
+
+/// POST /lab/api/shadow/mutate — seeded protocol mutation lab run.
+pub async fn mutate(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let (sid, sess) = match lab::require_lab_api(&state, &headers) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if BUSY.swap(true, Ordering::SeqCst) {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            Json(json!({ "error": "a shadow run is already in flight" })),
+        )
+            .into_response();
+    }
+    let _g = Guard;
+
+    let seed = {
+        let form = body_json_or_form(&headers, &body);
+        form.get("seed")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(839245)
+            .max(1)
+    };
+
+    match run_mutate(&state, &sid, &sess, seed).await {
+        Ok(v) => {
+            if wants_html(&headers) {
+                return Redirect::to(&format!(
+                    "/lab/shadow?run={}",
+                    v.get("run").and_then(|x| x.as_str()).unwrap_or("")
+                ))
+                .into_response();
+            }
+            Json(v).into_response()
+        }
+        Err(e) => fail(&headers, &e),
+    }
+}
+
+fn body_json_or_form(headers: &HeaderMap, body: &bytes::Bytes) -> serde_json::Value {
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if ct.contains("application/json") {
+        return serde_json::from_slice(body).unwrap_or_else(|_| json!({}));
+    }
+    // application/x-www-form-urlencoded
+    let s = String::from_utf8_lossy(body);
+    let mut m = serde_json::Map::new();
+    for part in s.split('&') {
+        if let Some((k, v)) = part.split_once('=') {
+            let k = k.to_string();
+            let v = v.replace('+', " ");
+            m.insert(k, json!(v));
+        }
+    }
+    serde_json::Value::Object(m)
+}
+
+async fn run_mutate(
+    state: &Arc<AppState>,
+    sid: &str,
+    sess: &session::Session,
+    seed: u64,
+) -> Result<serde_json::Value, String> {
+    let s = sides(state, sid, sess).await?;
+    let http = &state.http;
+    let dual = s.b.is_some();
+    let run = format!("m{}-{}", seed, crate::util::rand_hex(3));
+    let ts = crate::util::now_secs();
+    setup(http, &s.a_base, &s.a_token).await?;
+    if let Some((bb, bt)) = &s.b {
+        setup(http, bb, bt).await?;
+    }
+
+    let steps = mutate_sequence(seed);
+    let mut names = Vec::new();
+    let mut statuses_a = Vec::new();
+    let mut statuses_b = Vec::new();
+    let mut step_rows = Vec::new();
+
+    for step in &steps {
+        names.push(step.name.to_string());
+        let a = exec(http, &s.a_base, &s.a_token, &step.spec).await?;
+        statuses_a.push(a.status);
+        let b_status = if let Some((bb, bt)) = &s.b {
+            let b = exec(http, bb, bt, &step.spec).await?;
+            statuses_b.push(b.status);
+            Some(b.status)
+        } else {
+            None
+        };
+        step_rows.push(json!({
+            "name": step.name,
+            "line": step.spec.line(),
+            "a": a.status,
+            "b": b_status,
+        }));
+    }
+
+    let class = if dual {
+        classify_divergence(&names, &statuses_a, &statuses_b)
+    } else {
+        "single-sided (no peer configured)".into()
+    };
+    let diverged = dual && statuses_a != statuses_b;
+
+    let rec = json!({
+        "v": 1,
+        "kind": "mutation",
+        "run": run,
+        "seed": seed,
+        "ts": ts,
+        "sequence": names,
+        "a_statuses": statuses_a,
+        "b_statuses": statuses_b,
+        "divergence_class": class,
+        "diverged": diverged,
+        "steps": step_rows,
+        "peer": dual,
+    });
+    append_line(&mutations_path(), &serde_json::to_string(&rec).unwrap_or_default())?;
+    // Also append a thin pointer into the main corpus so the run list can show it.
+    let pointer = Record {
+        v: 1,
+        run: run.clone(),
+        ts,
+        case_id: format!("mutate.seed.{seed}"),
+        family: "mutation".into(),
+        mode: if dual { "dual".into() } else { "single".into() },
+        req: ReqSpec {
+            method: "MUTATE".into(),
+            sub: format!("seed={seed}"),
+            ..Default::default()
+        },
+        a: CapturedResp {
+            status: statuses_a.last().copied().unwrap_or(0),
+            ..Default::default()
+        },
+        b: statuses_b.last().map(|st| CapturedResp {
+            status: *st,
+            ..Default::default()
+        }),
+        findings: if diverged {
+            vec![Finding::new(
+                "mutation.divergence",
+                "status-sequence",
+                Class::Breaking,
+                vec![
+                    format!("{:?}", statuses_a),
+                    format!("{:?}", statuses_b),
+                    class.clone(),
+                ],
+            )]
+        } else {
+            Vec::new()
+        },
+        class: if diverged {
+            Some(Class::Breaking)
+        } else {
+            Some(Class::Identical)
+        },
+        hdr: HdrStats::default(),
+        converge_ms: None,
+        converged: None,
+        polls: None,
+    };
+    append_line(
+        &corpus_path(),
+        &serde_json::to_string(&pointer).unwrap_or_default(),
+    )?;
+
+    Ok(json!({
+        "run": run,
+        "seed": seed,
+        "sequence": names,
+        "a_statuses": statuses_a,
+        "b_statuses": statuses_b,
+        "divergence_class": class,
+        "diverged": diverged,
+        "steps": step_rows,
+        "peer": dual,
+    }))
+}
 
 #[cfg(test)]
 mod tests {
@@ -3007,5 +3381,31 @@ mod tests {
         assert_eq!(st.suppressed, 2);
         assert_eq!(st.comparable, 2);
         assert_eq!(st.differing, 0, "nothing was compared, so nothing differs");
+    }
+
+    #[test]
+    fn mutate_sequence_is_reproducible_for_a_seed() {
+        let a = mutate_sequence(839245);
+        let b = mutate_sequence(839245);
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.name, y.name);
+            assert_eq!(x.spec.method, y.spec.method);
+            assert_eq!(x.spec.sub, y.spec.sub);
+            assert_eq!(x.spec.headers, y.spec.headers);
+        }
+        let c = mutate_sequence(839246);
+        assert_ne!(
+            a.iter().map(|s| s.name).collect::<Vec<_>>(),
+            c.iter().map(|s| s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn mutate_sequence_always_starts_with_put_and_ends_with_head() {
+        let s = mutate_sequence(42);
+        assert_eq!(s.first().map(|x| x.name), Some("PUT"));
+        assert_eq!(s.last().map(|x| x.name), Some("HEAD_final"));
+        assert!(s.len() >= 5);
     }
 }

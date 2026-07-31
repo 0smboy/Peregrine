@@ -1,5 +1,14 @@
 //! Small dependency-free helpers: escaping, encoding, formatting.
 
+/// Mount point + JSON payload for console.js `CHART.hydrate`.
+/// `kind`: `"bars"` | `"scatter"` | `"hbar"` | `"flow"` | `"grid"` | `"timeline"` | `"lineage"` | `"matrix"`
+pub fn ix_mount(kind: &str, data: &serde_json::Value) -> String {
+    let raw = data.to_string().replace("</", "<\\/");
+    format!(
+        "<div class=\"ix-host\" data-ix-chart=\"{kind}\"><script type=\"application/json\">{raw}</script></div>"
+    )
+}
+
 /// HTML-escape a string for safe embedding in element content or attributes.
 pub fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

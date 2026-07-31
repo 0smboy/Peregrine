@@ -21,7 +21,7 @@ use crate::i18n;
 use crate::lab;
 use crate::nodes;
 use crate::ringlab;
-use crate::util::{esc, fmt_bytes};
+use crate::util::{esc, fmt_bytes, ix_mount};
 use crate::AppState;
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
@@ -29,6 +29,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 const MAX_OPS: usize = 32;
@@ -857,9 +858,6 @@ fn partition_map(lang: &str, states: &[u8]) -> String {
             esc(i18n::t(lang, "rsx.map.empty"))
         );
     }
-    // Aggregate rather than draw a mark per partition on a large ring; the
-    // worst state in a block wins so a single relocated partition never
-    // disappears into an average.
     let per_cell = (states.len() + MAP_MAX_CELLS - 1) / MAP_MAX_CELLS;
     let cells: Vec<u8> = states
         .chunks(per_cell.max(1))
@@ -867,49 +865,38 @@ fn partition_map(lang: &str, states: &[u8]) -> String {
         .collect();
     let n = cells.len();
     let cols = (((n as f64).sqrt() * 2.0).ceil() as usize).clamp(16, 64);
-    let rows = n.div_ceil(cols);
-    let (cell, gap) = (12.0f64, 1.0f64);
-    let mut paths = [String::new(), String::new(), String::new(), String::new()];
-    for (i, st) in cells.iter().enumerate() {
-        let idx = (*st as usize).min(3);
-        let x = (i % cols) as f64 * cell;
-        let y = (i / cols) as f64 * cell;
-        let w = cell - gap;
-        paths[idx].push_str(&format!("M{x} {y}h{w}v{w}h-{w}z"));
-    }
-    let mut body = String::new();
-    for (i, d) in paths.iter().enumerate() {
-        if !d.is_empty() {
-            body.push_str(&format!("<path class=\"rs-p{i}\" d=\"{d}\"/>"));
-        }
-    }
-    let legend: Vec<(&str, &str)> = vec![
-        (i18n::t(lang, "rsx.map.k0"), "rs-p0"),
-        (i18n::t(lang, "rsx.map.k1"), "rs-p1"),
-        (i18n::t(lang, "rsx.map.k2"), "rs-p2"),
-        (i18n::t(lang, "rsx.map.k3"), "rs-p3"),
-    ];
-    let leg = legend
+    let cell_json: Vec<serde_json::Value> = cells
         .iter()
-        .map(|(t, c)| {
-            format!("<span class=\"mon-leg-i\"><i class=\"{c}\"></i><b>{}</b></span>", esc(t))
+        .enumerate()
+        .map(|(i, st)| {
+            json!({
+                "i": i,
+                "cls": format!("rs-p{st}"),
+                "tip": format!("partition {} · state {st}", i * per_cell.max(1)),
+            })
         })
-        .collect::<Vec<_>>()
-        .join("");
+        .collect();
     let scale = if per_cell > 1 {
         i18n::t(lang, "rsx.map.aggregated").replace("{n}", &thou(per_cell as u64))
     } else {
         i18n::t(lang, "rsx.map.exact").replace("{n}", &thou(states.len() as u64))
     };
+    let data = json!({
+        "title": i18n::t(lang, "rsx.map.title"),
+        "cols": cols,
+        "cells": cell_json,
+        "legend": [
+            {"label": i18n::t(lang, "rsx.map.k0"), "cls": "rs-p0"},
+            {"label": i18n::t(lang, "rsx.map.k1"), "cls": "rs-p1"},
+            {"label": i18n::t(lang, "rsx.map.k2"), "cls": "rs-p2"},
+            {"label": i18n::t(lang, "rsx.map.k3"), "cls": "rs-p3"},
+        ],
+    });
     format!(
-        "<div class=\"mon-card wide\"><div class=\"mon-card-h\"><span class=\"mon-t\">{title}</span>\
-         <span class=\"mon-legend\">{leg}</span></div><div class=\"mon-body\">\
-         <svg class=\"rs-map\" viewBox=\"0 0 {vw} {vh}\" width=\"100%\" role=\"img\" \
-         aria-label=\"{title}\" preserveAspectRatio=\"xMidYMid meet\">{body}</svg>\
-         <div class=\"lab-b\">{scale}</div></div></div>",
+        "<div class=\"mon-card wide\"><div class=\"mon-card-h\"><span class=\"mon-t\">{title}</span></div>\
+         <div class=\"mon-body\">{mount}<div class=\"lab-b\">{scale}</div></div></div>",
         title = esc(i18n::t(lang, "rsx.map.title")),
-        vw = cols as f64 * cell,
-        vh = rows as f64 * cell,
+        mount = ix_mount("grid", &data),
         scale = esc(&scale),
     )
 }
@@ -918,42 +905,27 @@ fn partition_map(lang: &str, states: &[u8]) -> String {
 /// much of it it had to touch. One bar, two marks, no interpretation needed.
 fn movement_bar(lang: &str, moved: u64, need: u64, slots: u64, tr: &Transfer) -> String {
     let slots = slots.max(1);
-    let (w, h) = (640.0f64, 66.0f64);
-    let bar_y = 18.0;
-    let bar_h = 16.0;
-    let mx = (moved as f64 / slots as f64).clamp(0.0, 1.0) * w;
-    let nx = (need as f64 / slots as f64).clamp(0.0, 1.0) * w;
-    let flip = nx > w - 120.0;
+    let moved_l = i18n::t(lang, "rsx.budget.moved")
+        .replace("{n}", &thou(moved))
+        .replace("{b}", &fmt_bytes(tr.bytes_moved));
+    let total_l = i18n::t(lang, "rsx.budget.total").replace("{n}", &thou(slots));
+    let floor_l = i18n::t(lang, "rsx.budget.floor")
+        .replace("{n}", &thou(need))
+        .replace("{b}", &fmt_bytes(tr.necessary_bytes));
+    let data = json!({
+        "title": i18n::t(lang, "rsx.budget.title"),
+        "moved": moved,
+        "movedLabel": moved_l,
+        "total": slots,
+        "totalLabel": total_l,
+        "floor": need,
+        "floorLabel": floor_l,
+    });
     format!(
         "<div class=\"mon-card wide\"><div class=\"mon-card-h\"><span class=\"mon-t\">{title}</span></div>\
-         <div class=\"mon-body\">\
-         <svg class=\"rs-budget\" viewBox=\"0 0 {w} {h}\" width=\"100%\" role=\"img\" aria-label=\"{title}\">\
-           <rect class=\"rs-bg\" x=\"0\" y=\"{bar_y}\" width=\"{w}\" height=\"{bar_h}\" rx=\"2\"/>\
-           <rect class=\"rs-moved\" x=\"0\" y=\"{bar_y}\" width=\"{mx:.1}\" height=\"{bar_h}\" rx=\"2\"/>\
-           <line class=\"rs-floor\" x1=\"{nx:.1}\" y1=\"{fy}\" x2=\"{nx:.1}\" y2=\"{fy2}\"/>\
-           <text class=\"rs-lbl\" x=\"2\" y=\"12\">{moved_l}</text>\
-           <text class=\"rs-lbl end\" x=\"{w}\" y=\"12\" text-anchor=\"end\">{total_l}</text>\
-           <text class=\"rs-floor-l\" x=\"{lx:.1}\" y=\"{ly}\" text-anchor=\"{anchor}\">{floor_l}</text>\
-         </svg></div></div>",
+         <div class=\"mon-body\">{mount}</div></div>",
         title = esc(i18n::t(lang, "rsx.budget.title")),
-        fy = bar_y - 5.0,
-        fy2 = bar_y + bar_h + 5.0,
-        lx = if flip { nx - 5.0 } else { nx + 5.0 },
-        ly = h - 6.0,
-        anchor = if flip { "end" } else { "start" },
-        moved_l = esc(
-            &i18n::t(lang, "rsx.budget.moved")
-                .replace("{n}", &thou(moved))
-                .replace("{b}", &fmt_bytes(tr.bytes_moved))
-        ),
-        total_l = esc(
-            &i18n::t(lang, "rsx.budget.total").replace("{n}", &thou(slots))
-        ),
-        floor_l = esc(
-            &i18n::t(lang, "rsx.budget.floor")
-                .replace("{n}", &thou(need))
-                .replace("{b}", &fmt_bytes(tr.necessary_bytes))
-        ),
+        mount = ix_mount("bars", &data),
     )
 }
 
@@ -965,68 +937,242 @@ fn zone_bars(lang: &str, tiers: &[Value]) -> String {
     if zones.is_empty() {
         return String::new();
     }
-    let max = zones
+    let items: Vec<serde_json::Value> = zones
         .iter()
-        .map(|t| f(t, "parts_after").max(f(t, "parts_before")).max(f(t, "ideal_after")))
-        .fold(1.0f64, f64::max);
-    let (w, row_h, pad_l, pad_r) = (640.0f64, 30.0f64, 58.0f64, 96.0f64);
-    let h = zones.len() as f64 * row_h + 8.0;
-    let track = w - pad_l - pad_r;
-    let mut body = String::new();
-    for (i, z) in zones.iter().enumerate() {
-        let y = i as f64 * row_h + 8.0;
-        let before = f(z, "parts_before");
-        let after = f(z, "parts_after");
-        let ideal = f(z, "ideal_after");
-        let bw = after / max * track;
-        let ix = pad_l + ideal / max * track;
-        let delta = after - before;
-        let tone = if delta.abs() < 0.5 {
-            "rs-zone"
-        } else if delta > 0.0 {
-            "rs-zone gain"
-        } else {
-            "rs-zone loss"
-        };
-        body.push_str(&format!(
-            "<text class=\"rs-zl\" x=\"{lx}\" y=\"{ty}\" text-anchor=\"end\">{name}</text>\
-             <rect class=\"rs-zbg\" x=\"{pad_l}\" y=\"{by}\" width=\"{track}\" height=\"12\" rx=\"2\"/>\
-             <rect class=\"{tone}\" x=\"{pad_l}\" y=\"{by}\" width=\"{bw:.1}\" height=\"12\" rx=\"2\"/>\
-             <line class=\"rs-ideal\" x1=\"{ix:.1}\" y1=\"{iy}\" x2=\"{ix:.1}\" y2=\"{iy2}\"/>\
-             <text class=\"rs-zv\" x=\"{vx}\" y=\"{ty}\">{val}</text>",
-            lx = pad_l - 8.0,
-            ty = y + 11.0,
-            by = y + 1.0,
-            iy = y - 2.0,
-            iy2 = y + 15.0,
-            vx = w - pad_r + 8.0,
-            name = esc(s(z, "tier")),
-            val = esc(&format!(
-                "{} {}{}",
-                thou(after as u64),
-                if delta > 0.5 {
-                    "+"
-                } else if delta < -0.5 {
-                    "-"
-                } else {
-                    "="
-                },
-                if delta.abs() >= 0.5 {
-                    thou(delta.abs() as u64)
-                } else {
-                    String::new()
-                }
-            )),
-        ));
+        .map(|z| {
+            let before = f(z, "parts_before");
+            let after = f(z, "parts_after");
+            let ideal = f(z, "ideal_after");
+            let delta = after - before;
+            json!({
+                "label": s(z, "tier"),
+                "value": after,
+                "ideal": ideal,
+                "display": format!(
+                    "{} {}{}",
+                    thou(after as u64),
+                    if delta > 0.5 { "+" } else if delta < -0.5 { "-" } else { "=" },
+                    if delta.abs() >= 0.5 { thou(delta.abs() as u64) } else { String::new() },
+                ),
+                "tone": if delta.abs() < 0.5 { "flat" } else if delta > 0.0 { "gain" } else { "loss" },
+            })
+        })
+        .collect();
+    let data = json!({
+        "title": i18n::t(lang, "rsx.zones.title"),
+        "idealLabel": i18n::t(lang, "rsx.zones.ideal"),
+        "items": items,
+    });
+    format!(
+        "<div class=\"mon-card wide\"><div class=\"mon-card-h\"><span class=\"mon-t\">{title}</span></div>\
+         <div class=\"mon-body\">{mount}</div></div>",
+        title = esc(i18n::t(lang, "rsx.zones.title")),
+        mount = ix_mount("hbar", &data),
+    )
+}
+
+/// Per-device before→after partition bars, grouped by node. Ideal share is the
+/// tick on each track; disk fill and state ride beside the bars so the table
+/// is not the only place those numbers live.
+fn device_chart(lang: &str, devices: &[Value], table_html: &str) -> String {
+    if devices.is_empty() {
+        return String::new();
     }
+    let mut groups: Vec<(String, Vec<&Value>)> = Vec::new();
+    for d in devices {
+        let key = {
+            let n = s(d, "node");
+            if n.is_empty() { s(d, "ip").to_string() } else { n.to_string() }
+        };
+        if let Some((_, list)) = groups.iter_mut().find(|(k, _)| k == &key) {
+            list.push(d);
+        } else {
+            groups.push((key, vec![d]));
+        }
+    }
+    let group_json: Vec<serde_json::Value> = groups
+        .iter()
+        .map(|(node, list)| {
+            let zone = list
+                .first()
+                .map(|d| format!("r{}z{}", u(d, "region"), u(d, "zone")))
+                .unwrap_or_default();
+            let devs: Vec<serde_json::Value> = list
+                .iter()
+                .map(|d| {
+                    let before = u(d, "parts_before");
+                    let after = u(d, "parts_after");
+                    let ideal = f(d, "ideal_after");
+                    let delta = after as i64 - before as i64;
+                    let state = match s(d, "state") {
+                        "ok" | "" => i18n::t(lang, "rsx.dev.ok"),
+                        "down" => i18n::t(lang, "rsx.dev.down"),
+                        "removed" => i18n::t(lang, "rsx.dev.removed"),
+                        "added" => i18n::t(lang, "rsx.dev.added"),
+                        other => other,
+                    };
+                    let used = d.get("used").and_then(|v| v.as_u64());
+                    let size = d.get("size").and_then(|v| v.as_u64());
+                    let disk = match (used, size) {
+                        (Some(us), Some(sz)) if sz > 0 => {
+                            format!("{:.0}%", us as f64 / sz as f64 * 100.0)
+                        }
+                        _ => "—".into(),
+                    };
+                    json!({
+                        "device": s(d, "device"),
+                        "before": before,
+                        "after": after,
+                        "ideal": ideal,
+                        "delta": delta,
+                        "balance": pct1(f(d, "balance_pct")),
+                        "disk": disk,
+                        "state": state,
+                        "weight": f(d, "weight"),
+                        "tip": format!(
+                            "{} / {} · {}={} · {}={} · {}={} · Δ{:+} · {}={} · {} · {}",
+                            s(d, "node"), s(d, "device"),
+                            i18n::t(lang, "rsx.dev.c.weight"), f(d, "weight"),
+                            i18n::t(lang, "rsx.dev.c.ideal"), ideal.round() as i64,
+                            i18n::t(lang, "rsx.dev.c.before"), before,
+                            delta,
+                            i18n::t(lang, "rsx.dev.c.balance"), pct1(f(d, "balance_pct")),
+                            disk, state,
+                        ),
+                    })
+                })
+                .collect();
+            json!({ "node": node, "zone": zone, "devices": devs })
+        })
+        .collect();
+    let data = json!({
+        "title": i18n::t(lang, "rsx.dev.title"),
+        "note": i18n::t(lang, "rsx.dev.note"),
+        "legend": {
+            "before": i18n::t(lang, "rsx.dev.c.before"),
+            "after": i18n::t(lang, "rsx.dev.c.after"),
+            "ideal": i18n::t(lang, "rsx.dev.c.ideal"),
+        },
+        "groups": group_json,
+    });
+    let details = if table_html.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<details class=\"rs-det\"><summary>{}</summary>{}</details>",
+            esc(i18n::t(lang, "rsx.table.toggle")),
+            table_html,
+        )
+    };
     format!(
         "<div class=\"mon-card wide\"><div class=\"mon-card-h\"><span class=\"mon-t\">{title}</span>\
-         <span class=\"mon-legend\"><span class=\"mon-leg-i\"><i class=\"rs-ideal-sw\"></i>\
-         <b>{ideal}</b></span></span></div><div class=\"mon-body\">\
-         <svg class=\"rs-zones\" viewBox=\"0 0 {w} {h}\" width=\"100%\" role=\"img\" aria-label=\"{title}\">{body}</svg>\
-         </div></div>",
-        title = esc(i18n::t(lang, "rsx.zones.title")),
-        ideal = esc(i18n::t(lang, "rsx.zones.ideal")),
+         <span class=\"lab-b\">{note}</span></div><div class=\"mon-body\">{mount}{details}</div></div>",
+        title = esc(i18n::t(lang, "rsx.dev.title")),
+        note = esc(i18n::t(lang, "rsx.dev.note")),
+        mount = ix_mount("bars", &data),
+    )
+}
+
+/// Source→destination ribbons. Width is replica-slot count; hover carries the
+/// exact slots and estimated bytes so the table is not required for a reading.
+fn flow_chart(
+    lang: &str,
+    devices: &[Value],
+    flows: &[Value],
+    bytes_per_slot: u64,
+    table_html: &str,
+) -> String {
+    if flows.is_empty() {
+        return String::new();
+    }
+    let name = |id: u64| -> String {
+        devices
+            .iter()
+            .find(|d| u(d, "dev_id") == id)
+            .map(|d| format!("{}/{}", s(d, "node"), s(d, "device")))
+            .unwrap_or_else(|| format!("dev {id}"))
+    };
+
+    let mut src_sum: Vec<(u64, u64)> = Vec::new();
+    let mut dst_sum: Vec<(u64, u64)> = Vec::new();
+    for f in flows {
+        let from = u(f, "from");
+        let to = u(f, "to");
+        let slots = u(f, "slots");
+        if let Some(e) = src_sum.iter_mut().find(|(id, _)| *id == from) {
+            e.1 += slots;
+        } else {
+            src_sum.push((from, slots));
+        }
+        if let Some(e) = dst_sum.iter_mut().find(|(id, _)| *id == to) {
+            e.1 += slots;
+        } else {
+            dst_sum.push((to, slots));
+        }
+    }
+    src_sum.sort_by_key(|x| std::cmp::Reverse(x.1));
+    dst_sum.sort_by_key(|x| std::cmp::Reverse(x.1));
+    const MAX_END: usize = 16;
+    let src_show: Vec<(u64, u64)> = src_sum.iter().copied().take(MAX_END).collect();
+    let dst_show: Vec<(u64, u64)> = dst_sum.iter().copied().take(MAX_END).collect();
+    let src_ids: HashSet<u64> = src_show.iter().map(|x| x.0).collect();
+    let dst_ids: HashSet<u64> = dst_show.iter().map(|x| x.0).collect();
+
+    let sources: Vec<serde_json::Value> = src_show
+        .iter()
+        .map(|(id, sum)| json!({"id": id, "label": format!("{} ({})", name(*id), thou(*sum)), "sum": sum}))
+        .collect();
+    let dests: Vec<serde_json::Value> = dst_show
+        .iter()
+        .map(|(id, sum)| json!({"id": id, "label": format!("{} ({})", name(*id), thou(*sum)), "sum": sum}))
+        .collect();
+    let ribbons: Vec<serde_json::Value> = flows
+        .iter()
+        .filter(|f| src_ids.contains(&u(f, "from")) && dst_ids.contains(&u(f, "to")))
+        .map(|f| {
+            let from = u(f, "from");
+            let to = u(f, "to");
+            let slots = u(f, "slots");
+            json!({
+                "from": from,
+                "to": to,
+                "slots": slots,
+                "bytes": fmt_bytes(bytes_per_slot * slots),
+                "tip": format!(
+                    "{} → {} · {} {} · {}",
+                    name(from), name(to), thou(slots),
+                    i18n::t(lang, "rsx.flow.c.slots"),
+                    fmt_bytes(bytes_per_slot * slots),
+                ),
+            })
+        })
+        .collect();
+
+    let data = json!({
+        "title": i18n::t(lang, "rsx.flow.title"),
+        "note": i18n::t(lang, "rsx.flow.note").replace("{n}", &thou(flows.len() as u64)),
+        // Drawn as left→right ribbons (the previous flow diagram); tip on hover.
+        "hint": i18n::t(lang, "rsx.flow.hint"),
+        "sources": sources,
+        "dests": dests,
+        "ribbons": ribbons,
+        "layout": "sankey",
+    });
+    let details = if table_html.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<details class=\"rs-det\"><summary>{}</summary>{}</details>",
+            esc(i18n::t(lang, "rsx.table.toggle")),
+            table_html,
+        )
+    };
+    format!(
+        "<div class=\"mon-card wide\"><div class=\"mon-card-h\"><span class=\"mon-t\">{title}</span>\
+         <span class=\"lab-b\">{note}</span></div><div class=\"mon-body\">{mount}{details}</div></div>",
+        title = esc(i18n::t(lang, "rsx.flow.title")),
+        note = esc(&i18n::t(lang, "rsx.flow.note").replace("{n}", &thou(flows.len() as u64))),
+        mount = ix_mount("flow", &data),
     )
 }
 
@@ -1293,16 +1439,12 @@ pub async fn page_content(state: &Arc<AppState>, lang: &str, query: &str) -> Str
             state_word = esc(state_word),
         ));
     }
-    let dev_table = format!(
-        "<div class=\"mon-card wide\"><div class=\"mon-card-h\"><span class=\"mon-t\">{title}</span>\
-         <span class=\"lab-b\">{note}</span></div><div class=\"mon-body\">\
-         <div class=\"tbl-wrap\"><table class=\"tbl\"><thead><tr>\
+    let dev_table_only = format!(
+        "<div class=\"tbl-wrap\"><table class=\"tbl\"><thead><tr>\
          <th>{c1}</th><th>{c2}</th><th class=\"num\">{c3}</th><th class=\"num\">{c4}</th>\
          <th class=\"num\">{c5}</th><th class=\"num\">{c6}</th><th class=\"num\">{c7}</th>\
          <th class=\"num\">{c8}</th><th>{c9}</th><th>{c10}</th></tr></thead>\
-         <tbody>{dev_rows}</tbody></table></div></div></div>",
-        title = esc(i18n::t(lang, "rsx.dev.title")),
-        note = esc(i18n::t(lang, "rsx.dev.note")),
+         <tbody>{dev_rows}</tbody></table></div>",
         c1 = esc(i18n::t(lang, "rsx.dev.c.device")),
         c2 = esc(i18n::t(lang, "rsx.dev.c.zone")),
         c3 = esc(i18n::t(lang, "rsx.dev.c.weight")),
@@ -1314,6 +1456,7 @@ pub async fn page_content(state: &Arc<AppState>, lang: &str, query: &str) -> Str
         c9 = esc(i18n::t(lang, "rsx.dev.c.disk")),
         c10 = esc(i18n::t(lang, "rsx.dev.c.state")),
     );
+    let dev_table = device_chart(lang, &devices, &dev_table_only);
 
     // ---- where the data goes ----
     let flows = mv
@@ -1334,7 +1477,7 @@ pub async fn page_content(state: &Arc<AppState>, lang: &str, query: &str) -> Str
         let mut rows = String::new();
         let mut sorted = flows.clone();
         sorted.sort_by_key(|x| std::cmp::Reverse(u(x, "slots")));
-        for x in sorted.iter().take(40) {
+        for x in sorted.iter() {
             rows.push_str(&format!(
                 "<tr><td>{from}</td><td>{to}</td><td class=\"num\">{n}</td><td class=\"num\">{b}</td></tr>",
                 from = esc(&name(u(x, "from"))),
@@ -1343,21 +1486,16 @@ pub async fn page_content(state: &Arc<AppState>, lang: &str, query: &str) -> Str
                 b = esc(&fmt_bytes(tr.bytes_per_slot * u(x, "slots"))),
             ));
         }
-        format!(
-            "<div class=\"mon-card wide\"><div class=\"mon-card-h\"><span class=\"mon-t\">{title}</span>\
-             <span class=\"lab-b\">{note}</span></div><div class=\"mon-body\">\
-             <div class=\"tbl-wrap\"><table class=\"tbl\"><thead><tr><th>{c1}</th><th>{c2}</th>\
+        let table = format!(
+            "<div class=\"tbl-wrap\"><table class=\"tbl\"><thead><tr><th>{c1}</th><th>{c2}</th>\
              <th class=\"num\">{c3}</th><th class=\"num\">{c4}</th></tr></thead><tbody>{rows}</tbody>\
-             </table></div></div></div>",
-            title = esc(i18n::t(lang, "rsx.flow.title")),
-            note = esc(
-                &i18n::t(lang, "rsx.flow.note").replace("{n}", &thou(flows.len() as u64))
-            ),
+             </table></div>",
             c1 = esc(i18n::t(lang, "rsx.flow.c.from")),
             c2 = esc(i18n::t(lang, "rsx.flow.c.to")),
             c3 = esc(i18n::t(lang, "rsx.flow.c.slots")),
             c4 = esc(i18n::t(lang, "rsx.flow.c.bytes")),
-        )
+        );
+        flow_chart(lang, &devices, &flows, tr.bytes_per_slot, &table)
     };
 
     // ---- partition drill-down ----

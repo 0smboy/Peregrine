@@ -1,0 +1,15 @@
+# Toolchains compared by canary.sh. Install with:
+#   rustup install 1.96.1 1.97.0 1.97.1
+
+toolchains = ["1.96.1", "1.97.0", "1.97.1"]
+
+# Workspace relative to this directory (override with CANARY_WORKSPACE).
+workspace = "../swift-rust"
+
+# Crates exercised on every toolchain (keep short for wall-clock).
+crates = [
+  "swift-diskfile",
+  "swift-object-server",
+  "swift-proxy-server",
+  "swift-core",
+]

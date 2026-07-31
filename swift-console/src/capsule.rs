@@ -16,7 +16,7 @@ use crate::nodes;
 use crate::ringlab::{self, PolicyInfo};
 use crate::session::Session;
 use crate::swift;
-use crate::util::{enc_obj, enc_seg, esc, fmt_bytes};
+use crate::util::{enc_obj, enc_seg, esc, fmt_bytes, ix_mount};
 use crate::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -1006,40 +1006,15 @@ fn placement_matrix(lang: &str, rep: &Report) -> String {
         );
     }
 
-    let (cw, ch) = (108.0f64, 46.0f64);
-    let pad_l = 76.0f64;
-    let pad_t = 24.0f64;
-    let w = pad_l + devices.len() as f64 * cw;
-    let h = pad_t + nodes.len() as f64 * ch + 4.0;
-    let mut body = String::new();
-    for (ci, d) in devices.iter().enumerate() {
-        body.push_str(&format!(
-            "<text class=\"oc-m-h\" x=\"{x:.1}\" y=\"15\" text-anchor=\"middle\">{d}</text>",
-            x = pad_l + ci as f64 * cw + cw / 2.0,
-            d = esc(d),
-        ));
-    }
+    let mut cell_data: Vec<serde_json::Value> = Vec::new();
     for (ri, n) in nodes.iter().enumerate() {
-        let y = pad_t + ri as f64 * ch;
-        body.push_str(&format!(
-            "<text class=\"oc-m-h\" x=\"{lx}\" y=\"{ty:.1}\" text-anchor=\"end\">{n}</text>",
-            lx = pad_l - 10.0,
-            ty = y + ch / 2.0 + 4.0,
-            n = esc(n),
-        ));
         for (ci, d) in devices.iter().enumerate() {
-            let x = pad_l + ci as f64 * cw;
             let slot = rep.slots.iter().find(|s| &s.node == n && &s.device == d);
             let Some(slot) = slot else {
-                // The ring puts nothing here; an empty cell is a fact, not a
-                // fault, and it must not look like a missing replica.
-                body.push_str(&format!(
-                    "<rect class=\"oc-c-none\" x=\"{bx:.1}\" y=\"{by:.1}\" width=\"{bw}\" height=\"{bh}\" rx=\"3\"/>",
-                    bx = x + 3.0,
-                    by = y + 3.0,
-                    bw = cw - 6.0,
-                    bh = ch - 6.0,
-                ));
+                cell_data.push(json!({
+                    "row": ri, "col": ci, "node": n, "device": d,
+                    "cls": "oc-c-none", "label": "", "role": "", "tip": "",
+                }));
                 continue;
             };
             let st = cell_state(slot, &rep.newest);
@@ -1055,34 +1030,17 @@ fn placement_matrix(lang: &str, rep: &Report) -> String {
                 i18n::t(lang, "cap.matrix.handoff")
             };
             let label = frag.unwrap_or_else(|| i18n::t(lang, st.key()).to_string());
-            body.push_str(&format!(
-                "<g><rect class=\"{cls}{ho}\" x=\"{bx:.1}\" y=\"{by:.1}\" width=\"{bw}\" height=\"{bh}\" rx=\"3\"/>\
-                 <text class=\"oc-m-v\" x=\"{tx:.1}\" y=\"{ty:.1}\" text-anchor=\"middle\">{label}</text>\
-                 <text class=\"oc-m-r\" x=\"{tx:.1}\" y=\"{ry:.1}\" text-anchor=\"middle\">{role}</text>\
-                 <title>{tip}</title></g>",
-                cls = st.class(),
-                ho = if slot.role == "handoff" { " ho" } else { "" },
-                bx = x + 3.0,
-                by = y + 3.0,
-                bw = cw - 6.0,
-                bh = ch - 6.0,
-                tx = x + cw / 2.0,
-                ty = y + ch / 2.0 + 1.0,
-                ry = y + ch - 10.0,
-                label = esc(&label),
-                role = esc(role),
-                tip = esc(&format!(
-                    "{}/{} · {} · {}",
-                    n,
-                    d,
-                    role,
-                    i18n::t(lang, st.key())
-                )),
-            ));
+            cell_data.push(json!({
+                "row": ri, "col": ci, "node": n, "device": d,
+                "cls": format!("{}{}", st.class(), if slot.role == "handoff" { " ho" } else { "" }),
+                "label": label,
+                "role": role,
+                "tip": format!("{}/{} · {} · {}", n, d, role, i18n::t(lang, st.key())),
+            }));
         }
     }
 
-    let legend = [
+    let legend: Vec<serde_json::Value> = [
         CellState::Current,
         CellState::Stale,
         CellState::Tombstone,
@@ -1090,23 +1048,23 @@ fn placement_matrix(lang: &str, rep: &Report) -> String {
         CellState::Unknown,
     ]
     .iter()
-    .map(|c| {
-        format!(
-            "<span class=\"mon-leg-i\"><i class=\"{}\"></i><b>{}</b></span>",
-            c.class(),
-            esc(i18n::t(lang, c.key()))
-        )
-    })
-    .collect::<Vec<_>>()
-    .join("");
+    .map(|c| json!({"cls": c.class(), "label": i18n::t(lang, c.key())}))
+    .collect();
+
+    let data = json!({
+        "title": i18n::t(lang, "cap.matrix.title"),
+        "note": i18n::t(lang, "cap.matrix.note"),
+        "nodes": nodes,
+        "devices": devices,
+        "cells": cell_data,
+        "legend": legend,
+    });
 
     format!(
-        "<div class=\"mon-card wide\"><div class=\"mon-card-h\"><span class=\"mon-t\">{title}</span>\
-         <span class=\"mon-legend\">{legend}</span></div><div class=\"mon-body\">\
-         <svg class=\"oc-matrix\" viewBox=\"0 0 {w} {h}\" width=\"100%\" role=\"img\" aria-label=\"{title}\" \
-         preserveAspectRatio=\"xMinYMin meet\">{body}</svg>\
-         <div class=\"lab-b\">{note}</div></div></div>",
+        "<div class=\"mon-card wide\"><div class=\"mon-card-h\"><span class=\"mon-t\">{title}</span></div>\
+         <div class=\"mon-body\">{mount}<div class=\"lab-b\">{note}</div></div></div>",
         title = esc(i18n::t(lang, "cap.matrix.title")),
+        mount = ix_mount("matrix", &data),
         note = esc(i18n::t(lang, "cap.matrix.note")),
     )
 }

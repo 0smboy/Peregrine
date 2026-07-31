@@ -13,7 +13,7 @@ use crate::i18n;
 use crate::lab;
 use crate::nodes;
 use crate::ringlab;
-use crate::util::esc;
+use crate::util::{esc, ix_mount};
 use crate::AppState;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -251,115 +251,53 @@ fn tradeoff(lang: &str, rows: &[Row], rec: &Recommendation, target_nines: f64) -
     if rows.is_empty() {
         return String::new();
     }
-    let (w, h) = (660.0f64, 300.0f64);
-    let (pl, pr, pt, pb) = (56.0f64, 130.0f64, 18.0f64, 34.0f64);
-    let max_cost = rows.iter().map(|r| r.tco).fold(1.0f64, f64::max) * 1.08;
-    let max_nines = rows
+    let title = i18n::t(lang, "pol.chart.title");
+    let points: Vec<serde_json::Value> = rows
         .iter()
-        .map(|r| r.durability_nines)
-        .fold(target_nines, f64::max)
-        * 1.12;
-    let max_rebuild = rows
-        .iter()
-        .map(|r| r.rebuild_read_tb)
-        .fold(1.0f64, f64::max);
-    let x = |c: f64| pl + (c / max_cost).clamp(0.0, 1.0) * (w - pl - pr);
-    let y = |n: f64| pt + (1.0 - (n / max_nines).clamp(0.0, 1.0)) * (h - pt - pb);
-    let rad = |t: f64| 5.0 + (t / max_rebuild).clamp(0.0, 1.0).sqrt() * 11.0;
-
-    let mut body = String::new();
-    // Gridlines and the axis labels first, so every mark reads on top of them.
-    for i in 0..=4 {
-        let n = max_nines * (i as f64 / 4.0);
-        let gy = y(n);
-        body.push_str(&format!(
-            "<line class=\"mon-grid-l\" x1=\"{pl}\" y1=\"{gy:.1}\" x2=\"{gx}\" y2=\"{gy:.1}\"/>\
-             <text class=\"mon-axis\" x=\"{lx}\" y=\"{ly:.1}\" text-anchor=\"end\">{n:.0}</text>",
-            gx = w - pr,
-            lx = pl - 6.0,
-            ly = gy + 3.0,
-        ));
-    }
-    for i in 0..=3 {
-        let c = max_cost * (i as f64 / 3.0);
-        let gx = x(c);
-        body.push_str(&format!(
-            "<text class=\"mon-axis\" x=\"{gx:.1}\" y=\"{ty}\" text-anchor=\"{a}\">{v}</text>",
-            ty = h - 16.0,
-            a = if i == 0 {
-                "start"
-            } else if i == 3 {
-                "end"
+        .enumerate()
+        .map(|(i, r)| {
+            let state = if !r.feasible {
+                "out"
+            } else if r.meets_all() {
+                "ok"
             } else {
-                "middle"
-            },
-            v = esc(&money(c)),
-        ));
-    }
-    // The target is a line, not a column in a table: everything above it is
-    // acceptable and everything below it is not, at a glance.
-    let ty = y(target_nines);
-    body.push_str(&format!(
-        "<line class=\"pe-target\" x1=\"{pl}\" y1=\"{ty:.1}\" x2=\"{gx}\" y2=\"{ty:.1}\"/>\
-         <text class=\"pe-target-l\" x=\"{lx}\" y=\"{lty:.1}\">{lbl}</text>",
-        gx = w - pr,
-        lx = pl + 4.0,
-        lty = ty - 5.0,
-        lbl = esc(&i18n::t(lang, "pol.chart.target").replace("{n}", &format!("{target_nines:.0}"))),
-    ));
-
-    for (i, r) in rows.iter().enumerate() {
-        let cx = x(r.tco);
-        let cy = y(r.durability_nines);
-        let rr = rad(r.rebuild_read_tb);
-        let best = rec.best == Some(i);
-        let cls = if !r.feasible {
-            "pe-pt out"
-        } else if r.meets_all() {
-            "pe-pt ok"
-        } else {
-            "pe-pt miss"
-        };
-        if best {
-            body.push_str(&format!(
-                "<circle class=\"pe-pick\" cx=\"{cx:.1}\" cy=\"{cy:.1}\" r=\"{rp:.1}\"/>",
-                rp = rr + 5.0
-            ));
-        }
-        body.push_str(&format!(
-            "<circle class=\"{cls}\" cx=\"{cx:.1}\" cy=\"{cy:.1}\" r=\"{rr:.1}\"><title>{tip}</title></circle>",
-            tip = esc(&format!(
-                "{} · {} · {} · {}",
-                row_label(lang, r),
-                money(r.tco),
-                i18n::t(lang, "pol.chart.nines").replace("{n}", &format!("{:.1}", r.durability_nines)),
-                i18n::t(lang, "pol.chart.rebuild").replace("{v}", &tb(r.rebuild_read_tb)),
-            )),
-        ));
-        let flip = cx > w - pr - 30.0;
-        body.push_str(&format!(
-            "<text class=\"pe-pt-l{sel}\" x=\"{lx:.1}\" y=\"{ly:.1}\" text-anchor=\"{a}\">{l}</text>",
-            sel = if best { " pick" } else { "" },
-            lx = if flip { cx - rr - 6.0 } else { cx + rr + 6.0 },
-            ly = cy + 3.5,
-            a = if flip { "end" } else { "start" },
-            l = esc(&row_label(lang, r)),
-        ));
-    }
-
+                "miss"
+            };
+            json!({
+                "label": row_label(lang, r),
+                "x": r.tco,
+                "y": r.durability_nines,
+                "r": r.rebuild_read_tb,
+                "state": state,
+                "pick": rec.best == Some(i),
+                "tip": format!(
+                    "{} · {} · {} · {}",
+                    row_label(lang, r),
+                    money(r.tco),
+                    i18n::t(lang, "pol.chart.nines").replace("{n}", &format!("{:.1}", r.durability_nines)),
+                    i18n::t(lang, "pol.chart.rebuild").replace("{v}", &tb(r.rebuild_read_tb)),
+                ),
+            })
+        })
+        .collect();
+    let data = json!({
+        "title": title,
+        "xLabel": i18n::t(lang, "pol.chart.axes"),
+        "yLabel": "",
+        "targetY": target_nines,
+        "targetLabel": i18n::t(lang, "pol.chart.target").replace("{n}", &format!("{target_nines:.0}")),
+        "legend": {
+            "ok": i18n::t(lang, "pol.chart.k.ok"),
+            "miss": i18n::t(lang, "pol.chart.k.miss"),
+            "out": i18n::t(lang, "pol.chart.k.out"),
+        },
+        "points": points,
+    });
     format!(
-        "<div class=\"mon-card wide\"><div class=\"mon-card-h\"><span class=\"mon-t\">{title}</span>\
-         <span class=\"mon-legend\">\
-           <span class=\"mon-leg-i\"><i class=\"pe-sw-ok\"></i><b>{l_ok}</b></span>\
-           <span class=\"mon-leg-i\"><i class=\"pe-sw-miss\"></i><b>{l_miss}</b></span>\
-           <span class=\"mon-leg-i\"><i class=\"pe-sw-out\"></i><b>{l_out}</b></span>\
-         </span></div><div class=\"mon-body\">\
-         <svg class=\"pe-chart\" viewBox=\"0 0 {w} {h}\" width=\"100%\" role=\"img\" aria-label=\"{title}\">{body}</svg>\
-         <div class=\"lab-b\">{axes}</div></div></div>",
-        title = esc(i18n::t(lang, "pol.chart.title")),
-        l_ok = esc(i18n::t(lang, "pol.chart.k.ok")),
-        l_miss = esc(i18n::t(lang, "pol.chart.k.miss")),
-        l_out = esc(i18n::t(lang, "pol.chart.k.out")),
+        "<div class=\"mon-card wide\"><div class=\"mon-card-h\"><span class=\"mon-t\">{title}</span></div>\
+         <div class=\"mon-body\">{mount}<div class=\"lab-b\">{axes}</div></div></div>",
+        title = esc(title),
+        mount = ix_mount("scatter", &data),
         axes = esc(i18n::t(lang, "pol.chart.axes")),
     )
 }
@@ -376,40 +314,35 @@ fn repair_bars(lang: &str, rows: &[Row], limit: f64) -> String {
     if max <= 0.0 {
         return String::new();
     }
-    let (w, row_h, pl, pr) = (660.0f64, 28.0f64, 92.0f64, 84.0f64);
-    let h = rows.len() as f64 * row_h + 10.0;
-    let track = w - pl - pr;
-    let lx = pl + (limit / max).clamp(0.0, 1.0) * track;
-    let mut body = format!(
-        "<line class=\"pe-limit\" x1=\"{lx:.1}\" y1=\"2\" x2=\"{lx:.1}\" y2=\"{y2}\"/>",
-        y2 = h - 2.0
-    );
-    for (i, r) in rows.iter().enumerate() {
-        let y = i as f64 * row_h + 10.0;
-        let v = if r.repair_hours.is_finite() { r.repair_hours } else { max };
-        let bw = (v / max).clamp(0.0, 1.0) * track;
-        body.push_str(&format!(
-            "<text class=\"rs-zl\" x=\"{tlx}\" y=\"{ty}\" text-anchor=\"end\">{name}</text>\
-             <rect class=\"rs-zbg\" x=\"{pl}\" y=\"{by}\" width=\"{track}\" height=\"11\" rx=\"2\"/>\
-             <rect class=\"{cls}\" x=\"{pl}\" y=\"{by}\" width=\"{bw:.1}\" height=\"11\" rx=\"2\"/>\
-             <text class=\"rs-zv\" x=\"{vx}\" y=\"{ty}\">{val}</text>",
-            tlx = pl - 8.0,
-            ty = y + 10.0,
-            by = y + 1.0,
-            vx = w - pr + 8.0,
-            cls = if r.meets_repair_time { "pe-bar ok" } else { "pe-bar over" },
-            name = esc(&row_label(lang, r)),
-            val = esc(&hours(lang, r.repair_hours)),
-        ));
-    }
+    let title = i18n::t(lang, "pol.repair.title");
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let v = if r.repair_hours.is_finite() {
+                r.repair_hours
+            } else {
+                max
+            };
+            json!({
+                "label": row_label(lang, r),
+                "value": v,
+                "display": hours(lang, r.repair_hours),
+                "ok": r.meets_repair_time,
+                "tip": row_label(lang, r),
+            })
+        })
+        .collect();
+    let data = json!({
+        "title": title,
+        "limit": limit,
+        "limitLabel": i18n::t(lang, "pol.repair.limit").replace("{n}", &hours(lang, limit)),
+        "items": items,
+    });
     format!(
-        "<div class=\"mon-card wide\"><div class=\"mon-card-h\"><span class=\"mon-t\">{title}</span>\
-         <span class=\"mon-legend\"><span class=\"mon-leg-i\"><i class=\"pe-sw-limit\"></i>\
-         <b>{lim}</b></span></span></div><div class=\"mon-body\">\
-         <svg class=\"pe-repair\" viewBox=\"0 0 {w} {h}\" width=\"100%\" role=\"img\" aria-label=\"{title}\">{body}</svg>\
-         <div class=\"lab-b\">{note}</div></div></div>",
-        title = esc(i18n::t(lang, "pol.repair.title")),
-        lim = esc(&i18n::t(lang, "pol.repair.limit").replace("{n}", &hours(lang, limit))),
+        "<div class=\"mon-card wide\"><div class=\"mon-card-h\"><span class=\"mon-t\">{title}</span></div>\
+         <div class=\"mon-body\">{mount}<div class=\"lab-b\">{note}</div></div></div>",
+        title = esc(title),
+        mount = ix_mount("hbar", &data),
         note = esc(i18n::t(lang, "pol.repair.note")),
     )
 }
@@ -523,7 +456,9 @@ fn recommendation_block(
     )
 }
 
-fn comparison(lang: &str, rows: &[Row], rec: &Recommendation) -> String {
+/// Exact numbers for the fold-out table. Charts are the reading surface; this
+/// is the audit trail for a change review that needs the same digits.
+fn comparison_table(lang: &str, rows: &[Row], rec: &Recommendation) -> String {
     let head = rows
         .iter()
         .enumerate()
@@ -587,12 +522,14 @@ fn comparison(lang: &str, rows: &[Row], rec: &Recommendation) -> String {
             cells = rows
                 .iter()
                 .enumerate()
-                .map(|(i, r)| format!(
-                    "<td class=\"num{x}{p}\">{v}</td>",
-                    x = if r.feasible { "" } else { " pe-x" },
-                    p = if rec.best == Some(i) { " pe-pick-col" } else { "" },
-                    v = esc(&f(r))
-                ))
+                .map(|(i, r)| {
+                    format!(
+                        "<td class=\"num{x}{p}\">{v}</td>",
+                        x = if r.feasible { "" } else { " pe-x" },
+                        p = if rec.best == Some(i) { " pe-pick-col" } else { "" },
+                        v = esc(&f(r))
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(""),
         ));
@@ -660,12 +597,250 @@ fn comparison(lang: &str, rows: &[Row], rec: &Recommendation) -> String {
     ));
 
     format!(
+        "<div class=\"tbl-wrap\"><table class=\"tbl pe-tbl\">\
+         <thead><tr><th>{metric}</th>{head}</tr></thead><tbody>{body}</tbody></table></div>",
+        metric = esc(i18n::t(lang, "pol.table.metric")),
+    )
+}
+
+/// One HTML bar chart per metric (CSS tracks, not SVG). Magnitudes only
+/// compare within a metric; each bar keeps its exact formatted value.
+fn comparison_charts(lang: &str, rows: &[Row], rec: &Recommendation) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    let mut legend = String::new();
+    for (i, r) in rows.iter().enumerate() {
+        let mark = if rec.best == Some(i) {
+            format!(
+                " <em class=\"pe-pick-mark\">{}</em>",
+                esc(i18n::t(lang, "pol.chart.pick"))
+            )
+        } else {
+            String::new()
+        };
+        let bad = if r.feasible {
+            String::new()
+        } else {
+            format!(
+                " <em class=\"pe-infeasible\">{}</em>",
+                esc(i18n::t(lang, "pol.chart.infeasible"))
+            )
+        };
+        legend.push_str(&format!(
+            "<span class=\"mon-leg-i\"><i class=\"pe-sw mon-s{n}\"></i><b>{l}</b>{mark}{bad}</span>",
+            n = (i % 6) + 1,
+            l = esc(&row_label(lang, r)),
+        ));
+    }
+
+    // dir: -1 lower better, +1 higher better, 0 no best mark
+    let metrics: [(&str, i8, Box<dyn Fn(&Row) -> f64>, Box<dyn Fn(&Row) -> String>); 12] = [
+        (
+            "pol.m.amp",
+            -1,
+            Box::new(|r| r.amplification),
+            Box::new(|r| format!("{:.2}×", r.amplification)),
+        ),
+        (
+            "pol.m.raw",
+            -1,
+            Box::new(|r| r.raw_needed_tb),
+            Box::new(|r| tb(r.raw_needed_tb)),
+        ),
+        (
+            "pol.m.devices",
+            -1,
+            Box::new(|r| r.min_devices as f64),
+            Box::new(|r| r.min_devices.to_string()),
+        ),
+        (
+            "pol.m.fanout",
+            -1,
+            Box::new(|r| r.write_fanout as f64),
+            Box::new(|r| r.write_fanout.to_string()),
+        ),
+        (
+            "pol.m.quorum",
+            0,
+            Box::new(|r| r.write_quorum as f64),
+            Box::new(|r| r.write_quorum.to_string()),
+        ),
+        (
+            "pol.m.margin",
+            1,
+            Box::new(|r| r.write_margin as f64),
+            Box::new(|r| r.write_margin.to_string()),
+        ),
+        (
+            "pol.m.readmin",
+            -1,
+            Box::new(|r| r.read_min_devices as f64),
+            Box::new(|r| r.read_min_devices.to_string()),
+        ),
+        (
+            "pol.m.survives",
+            1,
+            Box::new(|r| r.tolerates_loss as f64),
+            Box::new(|r| r.tolerates_loss.to_string()),
+        ),
+        (
+            "pol.m.rebuild",
+            -1,
+            Box::new(|r| r.rebuild_read_tb),
+            Box::new(|r| tb(r.rebuild_read_tb)),
+        ),
+        (
+            "pol.m.repair",
+            -1,
+            Box::new(|r| r.repair_hours),
+            Box::new(move |r| hours(lang, r.repair_hours)),
+        ),
+        (
+            "pol.m.nines",
+            1,
+            Box::new(|r| r.durability_nines),
+            Box::new(|r| format!("{:.1}", r.durability_nines)),
+        ),
+        (
+            "pol.m.cost",
+            -1,
+            Box::new(|r| r.tco),
+            Box::new(|r| money(r.tco)),
+        ),
+    ];
+
+    let mut grid = String::new();
+    for (key, dir, val, fmt) in &metrics {
+        let max = rows
+            .iter()
+            .map(|r| val(r).abs())
+            .fold(0.0_f64, f64::max);
+        let mut best: Option<f64> = None;
+        if *dir != 0 {
+            for r in rows {
+                if !r.feasible {
+                    continue;
+                }
+                let v = val(r);
+                best = Some(match best {
+                    None => v,
+                    Some(b) if *dir > 0 => b.max(v),
+                    Some(b) => b.min(v),
+                });
+            }
+        }
+        let dir_l = match *dir {
+            1 => format!(
+                "<i class=\"pe-dir\">{}</i>",
+                esc(i18n::t(lang, "pol.dir.higher"))
+            ),
+            -1 => format!(
+                "<i class=\"pe-dir\">{}</i>",
+                esc(i18n::t(lang, "pol.dir.lower"))
+            ),
+            _ => String::new(),
+        };
+        let mut brow = String::new();
+        for (i, r) in rows.iter().enumerate() {
+            let v = val(r);
+            let pct = if max > 0.0 {
+                ((v.abs() / max) * 100.0).max(2.0)
+            } else {
+                2.0
+            };
+            let is_best = r.feasible && best.is_some_and(|b| (v - b).abs() < 1e-12);
+            brow.push_str(&format!(
+                "<div class=\"pe-brow{dim}\" title=\"{tip}\">\
+                   <span class=\"pe-blab\">{lab}</span>\
+                   <div class=\"pe-btrack\" role=\"img\" aria-label=\"{aria}\">\
+                     <div class=\"pe-bbar mon-s{n}\" style=\"width:{pct:.1}%\"></div>\
+                   </div>\
+                   <span class=\"pe-bval{best}\">{fv}{dot}</span>\
+                 </div>",
+                dim = if r.feasible { "" } else { " pe-dim" },
+                tip = esc(&format!(
+                    "{} · {}{}",
+                    row_label(lang, r),
+                    fmt(r),
+                    if is_best {
+                        format!(" · {}", i18n::t(lang, "pol.chart.best"))
+                    } else {
+                        String::new()
+                    }
+                )),
+                lab = esc(&row_label(lang, r)),
+                aria = esc(&format!("{}: {}", row_label(lang, r), fmt(r))),
+                n = (i % 6) + 1,
+                pct = pct,
+                best = if is_best { " best" } else { "" },
+                fv = esc(&fmt(r)),
+                dot = if is_best { " ●" } else { "" },
+            ));
+        }
+        grid.push_str(&format!(
+            "<div class=\"pe-metric\"><div class=\"pe-metric-t\"><b>{t}</b>{dir}</div>{brow}</div>",
+            t = esc(i18n::t(lang, key)),
+            dir = dir_l,
+        ));
+    }
+
+    let mut cons = String::new();
+    for (key, get) in [
+        ("pol.m.meets.dur", 0usize),
+        ("pol.m.meets.repair", 1),
+        ("pol.m.meets.loss", 2),
+    ] {
+        let mut chips = String::new();
+        for r in rows {
+            let ok = match get {
+                0 => r.meets_durability,
+                1 => r.meets_repair_time,
+                _ => r.meets_node_loss,
+            };
+            chips.push_str(&format!(
+                "<span class=\"pe-chip {c}{dim}\">{mark} {lab}</span>",
+                c = if ok { "ok" } else { "no" },
+                dim = if r.feasible { "" } else { " pe-dim" },
+                mark = if ok { "✓" } else { "✗" },
+                lab = esc(&row_label(lang, r)),
+            ));
+        }
+        cons.push_str(&format!(
+            "<div class=\"pe-conrow\"><span class=\"pe-blab\">{k}</span>\
+             <div class=\"pe-chips\">{chips}</div></div>",
+            k = esc(i18n::t(lang, key)),
+        ));
+    }
+
+    format!(
+        "<div class=\"pe-charts\">\
+           <div class=\"pe-legend\">{legend}</div>\
+           <div class=\"pe-mgrid\">{grid}</div>\
+           <div class=\"pe-cons\">\
+             <div class=\"pe-metric-t\"><b>{ct}</b></div>{cons}\
+           </div>\
+         </div>",
+        legend = legend,
+        grid = grid,
+        ct = esc(i18n::t(lang, "pol.cons.title")),
+        cons = cons,
+    )
+}
+
+fn comparison(lang: &str, rows: &[Row], rec: &Recommendation) -> String {
+    let charts = comparison_charts(lang, rows, rec);
+    let table = comparison_table(lang, rows, rec);
+    format!(
         "<div class=\"mon-card wide\"><div class=\"mon-card-h\"><span class=\"mon-t\">{title}</span>\
-         </div><div class=\"mon-body\"><div class=\"tbl-wrap\"><table class=\"tbl pe-tbl\">\
-         <thead><tr><th>{metric}</th>{head}</tr></thead><tbody>{body}</tbody></table></div>\
+         </div><div class=\"mon-body\">{charts}\
+         <details class=\"rs-det\"><summary>{toggle}</summary>{table}</details>\
          </div></div>",
         title = esc(i18n::t(lang, "pol.table.title")),
-        metric = esc(i18n::t(lang, "pol.table.metric")),
+        toggle = esc(i18n::t(lang, "rsx.table.toggle")),
+        charts = charts,
+        table = table,
     )
 }
 

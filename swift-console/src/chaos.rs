@@ -53,7 +53,7 @@ use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::util::{enc_seg, esc, fmt_bytes};
+use crate::util::{enc_seg, esc, fmt_bytes, ix_mount};
 use crate::{capsule, i18n, lab, nodes, ringlab, swift, AppState};
 
 /// The container every experiment writes into. Nothing outside it is ever a
@@ -1881,19 +1881,13 @@ pub fn verdict(lang: &str, run: &Run) -> Verdict {
 /// The timeline: one track per node showing whether that node held a current
 /// copy at every poll, a client track showing what a reader got, a step line
 /// for the copy count, and the daemon passes that did work.
-///
-/// Drawn on the server so it is in the first bytes of the document. Every mark
-/// it carries also sits in the event table below it, so nothing is only visible
-/// here.
-fn timeline_svg(lang: &str, run: &Run) -> String {
+fn timeline_mount(lang: &str, run: &Run) -> String {
     let Some(fault_at) = run.fault_at else {
         return String::new();
     };
     if run.samples.is_empty() {
         return String::new();
     }
-    // Every node any census saw, not only the primaries: a repair that lands on
-    // a handoff is exactly the case a lane-per-primary picture would hide.
     let mut lanes: Vec<String> = Vec::new();
     for c in [&run.before, &run.worst, &run.after] {
         for r in &c.rows {
@@ -1925,229 +1919,109 @@ fn timeline_svg(lang: &str, run: &Run) -> String {
         .unwrap_or(60)
         .max(t0 + 40)
         + 6;
-    let (w, pad_l, pad_r, pad_t) = (1000.0f64, 122.0f64, 26.0f64, 20.0f64);
-    let copies_h = 48.0f64;
-    let lane_h = 26.0f64;
-    let axis_h = 28.0f64;
-    let h = pad_t + copies_h + 12.0 + lane_h * (lanes.len() as f64 + 1.0) + axis_h;
-    let x = |off: i64| -> f64 {
-        pad_l + (off - t0) as f64 / ((t1 - t0).max(1)) as f64 * (w - pad_l - pad_r)
-    };
+    let target_node = run.target.as_ref().map(|t| t.node.clone());
+    let healed_at = run
+        .converged_at
+        .map(|c| c as i64 - fault_at as i64)
+        .unwrap_or(i64::MAX);
 
-    let mut s = String::new();
-    s.push_str(&format!(
-        "<svg class=\"ca-svg\" viewBox=\"0 0 {w:.0} {h:.0}\" width=\"{w:.0}\" height=\"{h:.0}\" \
-         role=\"img\" aria-label=\"{}\">",
-        esc(i18n::t(lang, "chaos.rep.timeline"))
-    ));
-
-    // Copy count over time, with the wanted level as the reference line.
-    let max_c = run
-        .samples
-        .iter()
-        .map(|p| p.copies)
-        .chain(std::iter::once(run.wanted))
-        .max()
-        .unwrap_or(1)
-        .max(1) as f64;
-    let cy = |v: usize| -> f64 { pad_t + copies_h - (v as f64 / max_c) * (copies_h - 10.0) };
-    s.push_str(&format!(
-        "<line class=\"ca-ref\" x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\"/>",
-        pad_l,
-        cy(run.wanted),
-        w - pad_r,
-        cy(run.wanted)
-    ));
-    s.push_str(&format!(
-        "<text class=\"ca-lane-l\" x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"end\">{}</text>",
-        pad_l - 12.0,
-        pad_t + copies_h / 2.0 + 4.0,
-        esc(i18n::t(lang, "chaos.lane.copies"))
-    ));
-    let mut d = String::new();
-    let mut prev_c: Option<usize> = None;
-    for p in &run.samples {
-        match prev_c {
-            None => d.push_str(&format!("M{:.1} {:.1}", x(p.off), cy(p.copies))),
-            Some(pc) => {
-                d.push_str(&format!(" L{:.1} {:.1}", x(p.off), cy(pc)));
-                d.push_str(&format!(" L{:.1} {:.1}", x(p.off), cy(p.copies)));
-            }
-        }
-        prev_c = Some(p.copies);
-    }
-    if let Some(pc) = prev_c {
-        d.push_str(&format!(" L{:.1} {:.1}", x(t1), cy(pc)));
-    }
-    s.push_str(&format!("<path class=\"ca-step\" d=\"{d}\"/>"));
-    s.push_str(&format!(
-        "<text class=\"ca-axis\" x=\"{:.1}\" y=\"{:.1}\">{} {}</text>",
-        pad_l + 6.0,
-        cy(run.wanted) - 6.0,
-        run.wanted,
-        esc(i18n::t(lang, "chaos.lane.wanted"))
-    ));
-
-    // Client lane, then one lane per node.
-    let lane_y = |i: usize| -> f64 { pad_t + copies_h + 12.0 + lane_h * i as f64 + lane_h / 2.0 };
-    let cly = lane_y(0);
-    s.push_str(&format!(
-        "<line class=\"ca-track\" x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\"/>\
-         <text class=\"ca-lane-l client\" x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"end\">{}</text>",
-        pad_l,
-        cly,
-        w - pad_r,
-        cly,
-        pad_l - 12.0,
-        cly + 4.0,
-        esc(i18n::t(lang, "chaos.lane.client"))
-    ));
-    for p in &run.samples {
-        let ok = p.status == 200 && p.md5_ok;
-        s.push_str(&format!(
-            "<circle class=\"ca-read {}\" cx=\"{:.1}\" cy=\"{:.1}\" r=\"3.4\"><title>{}</title></circle>",
-            if ok { "ok" } else { "bad" },
-            x(p.off),
-            cly,
-            esc(&format!("{} · HTTP {}", clock(p.at), p.status))
-        ));
-    }
-
-    for (i, node) in lanes.iter().enumerate() {
-        let y = lane_y(i + 1);
-        let is_target = run.target.as_ref().map(|t| t.node == *node).unwrap_or(false);
-        let label = match &run.target {
-            Some(t) if t.node == *node => format!("{} · {}", node, t.device),
-            _ => node.clone(),
-        };
-        s.push_str(&format!(
-            "<text class=\"ca-lane-l{}\" x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"end\">{}</text>",
-            if is_target { " target" } else { "" },
-            pad_l - 12.0,
-            y + 4.0,
-            esc(&label)
-        ));
-        // A held copy is a solid accent segment, a gap is a red one. The track
-        // is the measurement: every segment spans two real polls.
-        // Corruption leaves the file in place, so presence alone would draw a
-        // healthy track across the whole fault. The damaged stretch gets its own
-        // treatment: there, but not to be trusted.
-        let healed_at = run
-            .converged_at
-            .map(|c| c as i64 - fault_at as i64)
-            .unwrap_or(i64::MAX);
-        let cls = |q: &Sample| -> &'static str {
-            if !q.holders.contains(node) {
-                "miss"
-            } else if is_target && run.fault == Fault::CorruptCopy && q.off >= 0 && q.off < healed_at
-            {
-                "rot"
-            } else {
-                "hold"
-            }
-        };
+    let mut segments: Vec<serde_json::Value> = Vec::new();
+    for node in &lanes {
+        let is_target = target_node.as_deref() == Some(node.as_str());
         let mut prev: Option<&Sample> = None;
         for p in &run.samples {
             if let Some(q) = prev {
-                s.push_str(&format!(
-                    "<line class=\"ca-seg {}\" x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\"/>",
-                    cls(q),
-                    x(q.off),
-                    y,
-                    x(p.off),
-                    y
-                ));
+                let cls = segment_cls(run, q, node, is_target, healed_at);
+                segments.push(json!({"lane": node, "from": q.off, "to": p.off, "cls": cls}));
             }
             prev = Some(p);
         }
         if let Some(q) = prev {
-            s.push_str(&format!(
-                "<line class=\"ca-seg {}\" x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\"/>",
-                cls(q),
-                x(q.off),
-                y,
-                x(t1),
-                y
-            ));
+            let cls = segment_cls(run, q, node, is_target, healed_at);
+            segments.push(json!({"lane": node, "from": q.off, "to": t1, "cls": cls}));
         }
-        for e in &run.evidence {
-            if e.node != *node {
-                continue;
-            }
-            let ex = x(e.at as i64 - fault_at as i64);
-            s.push_str(&format!(
-                "<path class=\"ca-work\" d=\"M{:.1} {:.1} l5 5 l-5 5 l-5 -5 Z\"><title>{}</title></path>",
-                ex,
-                y - 5.0,
-                esc(&format!(
+    }
+
+    let lane_labels: Vec<serde_json::Value> = lanes
+        .iter()
+        .map(|node| {
+            let label = match &run.target {
+                Some(t) if t.node == *node => format!("{} · {}", node, t.device),
+                _ => node.clone(),
+            };
+            json!({
+                "id": node,
+                "label": label,
+                "target": target_node.as_deref() == Some(node.as_str()),
+            })
+        })
+        .collect();
+
+    let evidence: Vec<serde_json::Value> = run
+        .evidence
+        .iter()
+        .map(|e| {
+            json!({
+                "node": e.node,
+                "off": e.at as i64 - fault_at as i64,
+                "tip": format!(
                     "{} {} suffix_syncs={} reverts={}",
                     clock(e.at),
                     e.daemon,
                     e.suffix_syncs,
                     e.reverts
-                ))
-            ));
-        }
-    }
+                ),
+            })
+        })
+        .collect();
 
-    // The three instants that matter, as rules across every lane.
-    let bottom = h - axis_h + 4.0;
-    let mut rule = |off: i64, cls: &str, label: &str| {
-        s.push_str(&format!(
-            "<line class=\"ca-rule {cls}\" x1=\"{x:.1}\" y1=\"{y0:.1}\" x2=\"{x:.1}\" y2=\"{y1:.1}\"/>\
-             <text class=\"ca-rule-l {cls}\" x=\"{tx:.1}\" y=\"{ty:.1}\">{label}</text>",
-            x = x(off),
-            y0 = pad_t - 6.0,
-            y1 = bottom,
-            tx = x(off) + 5.0,
-            ty = pad_t - 8.0,
-            label = esc(label)
-        ));
-    };
-    rule(0, "fault", i18n::t(lang, "chaos.mark.fault"));
+    let mut rules = vec![json!({"off": 0i64, "cls": "fault", "label": i18n::t(lang, "chaos.mark.fault")})];
     if let Some(c) = run.converged_at {
-        rule(
-            c as i64 - fault_at as i64,
-            "ok",
-            i18n::t(lang, "chaos.mark.converged"),
-        );
+        rules.push(json!({
+            "off": c as i64 - fault_at as i64,
+            "cls": "ok",
+            "label": i18n::t(lang, "chaos.mark.converged"),
+        }));
     }
     if let Some(u) = run.undone_at {
         let off = u as i64 - fault_at as i64;
         if off <= t1 {
-            rule(off, "undo", i18n::t(lang, "chaos.mark.undo"));
+            rules.push(json!({
+                "off": off,
+                "cls": "undo",
+                "label": i18n::t(lang, "chaos.mark.undo"),
+            }));
         }
     }
 
-    // Axis in seconds from the fault, with the fault's wall clock beside it so
-    // the whole picture can be lined up against any other log in the building.
-    let ay = h - 9.0;
-    let steps = 6i64;
-    for i in 0..=steps {
-        let off = t0 + (t1 - t0) * i / steps;
-        s.push_str(&format!(
-            "<text class=\"ca-axis\" x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"{}\">{}{}s</text>",
-            x(off),
-            ay,
-            if i == 0 {
-                "start"
-            } else if i == steps {
-                "end"
-            } else {
-                "middle"
-            },
-            if off > 0 { "+" } else { "" },
-            off
-        ));
+    let data = json!({
+        "title": i18n::t(lang, "chaos.rep.timeline"),
+        "variant": "chaos",
+        "t0": t0,
+        "t1": t1,
+        "faultAt": fault_at,
+        "faultClock": clock(fault_at),
+        "wanted": run.wanted,
+        "clientLabel": i18n::t(lang, "chaos.lane.client"),
+        "copiesLabel": i18n::t(lang, "chaos.lane.copies"),
+        "wantedLabel": i18n::t(lang, "chaos.lane.wanted"),
+        "lanes": lane_labels,
+        "samples": run.samples,
+        "segments": segments,
+        "evidence": evidence,
+        "rules": rules,
+    });
+    ix_mount("timeline", &data)
+}
+
+fn segment_cls(run: &Run, q: &Sample, node: &str, is_target: bool, healed_at: i64) -> &'static str {
+    if !q.holders.contains(&node.to_string()) {
+        "miss"
+    } else if is_target && run.fault == Fault::CorruptCopy && q.off >= 0 && q.off < healed_at {
+        "rot"
+    } else {
+        "hold"
     }
-    s.push_str(&format!(
-        "<text class=\"ca-axis\" x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"end\">{}</text>",
-        pad_l - 12.0,
-        ay,
-        esc(&clock(fault_at))
-    ));
-    s.push_str("</svg>");
-    s
 }
 
 /// Predicted convergence against measured convergence, on one scale. Two bars
@@ -2296,17 +2170,13 @@ fn kept_passes(run: &Run) -> Vec<PassLine> {
     keep
 }
 
-/// The daemon passes drawn: one lane per node × daemon, a mark per pass on a
-/// shared clock, the fault as a rule, and the pass that repaired the object
-/// ringed. Every mark carries its full numbers in a tooltip; the table below
-/// keeps them on the page.
-fn pass_chart(lang: &str, run: &Run) -> String {
+/// The daemon passes: one lane per node × daemon, a mark per pass on a shared clock.
+fn pass_mount(lang: &str, run: &Run) -> String {
     let keep = kept_passes(run);
     if keep.is_empty() {
         return String::new();
     }
     let fault_at = run.fault_at.unwrap_or(run.started);
-    // lanes: node · daemon, stable order
     let mut lanes: Vec<(String, String)> = Vec::new();
     for p in &keep {
         let k = (p.node.clone(), p.daemon.clone());
@@ -2315,126 +2185,55 @@ fn pass_chart(lang: &str, run: &Run) -> String {
         }
     }
     lanes.sort();
-    let t0 = keep
+    let lane_json: Vec<serde_json::Value> = lanes
         .iter()
-        .map(|p| p.at)
-        .min()
-        .unwrap_or(fault_at)
-        .min(fault_at)
-        .saturating_sub(5);
-    let t1 = keep.iter().map(|p| p.at).max().unwrap_or(fault_at).max(fault_at) + 5;
-    let (w, pad_l, pad_r, pad_t) = (1000.0f64, 190.0f64, 26.0f64, 14.0f64);
-    let lane_h = 26.0f64;
-    let axis_h = 26.0f64;
-    let h = pad_t + lane_h * lanes.len() as f64 + axis_h;
-    let x = |at: u64| -> f64 {
-        pad_l + at.saturating_sub(t0) as f64 / (t1 - t0).max(1) as f64 * (w - pad_l - pad_r)
-    };
-    let lane_y = |i: usize| -> f64 { pad_t + i as f64 * lane_h + lane_h / 2.0 };
-
-    let mut s = String::new();
-    s.push_str(&format!(
-        "<svg class=\"ca-svg\" viewBox=\"0 0 {w:.0} {h:.0}\" width=\"{w:.0}\" height=\"{h:.0}\" \
-         role=\"img\" aria-label=\"{}\">",
-        esc(i18n::t(lang, "chaos.rep.daemon"))
-    ));
-    // lanes
-    for (i, (node, daemon)) in lanes.iter().enumerate() {
-        let y = lane_y(i);
-        s.push_str(&format!(
-            "<line class=\"ca-pl-track\" x1=\"{:.1}\" y1=\"{y:.1}\" x2=\"{:.1}\" y2=\"{y:.1}\"/>",
-            pad_l,
-            w - pad_r
-        ));
-        s.push_str(&format!(
-            "<text class=\"ca-lane-l\" x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"end\">{} · {}</text>",
-            pad_l - 8.0,
-            y + 3.5,
-            esc(node),
-            esc(&daemon_label(lang, daemon)),
-        ));
-    }
-    // the fault moment
-    let fx = x(fault_at);
-    s.push_str(&format!(
-        "<line class=\"ca-fault\" x1=\"{fx:.1}\" y1=\"{:.1}\" x2=\"{fx:.1}\" y2=\"{:.1}\"/>\
-         <text class=\"ca-fault-t\" x=\"{:.1}\" y=\"{:.1}\">{}</text>",
-        pad_t - 4.0,
-        h - axis_h + 6.0,
-        fx + 5.0,
-        pad_t + 6.0,
-        esc(i18n::t(lang, "chaos.mark.fault")),
-    ));
-    // marks
-    for p in keep.iter() {
-        let li = lanes
-            .iter()
-            .position(|(n, d)| *n == p.node && *d == p.daemon)
-            .unwrap_or(0);
-        let cx = x(p.at);
-        let cy = lane_y(li);
-        let after = p.at >= fault_at;
-        let activity = p.suffix_syncs + p.reverts;
-        let r = 3.0 + (activity as f64).min(12.0).sqrt() * 1.6;
-        let worked = p.worked() && after;
-        let mut cls = String::from("ca-pass");
-        if p.failures > 0 {
-            cls.push_str(" fail");
-        }
-        if !after {
-            cls.push_str(" base");
-        }
-        if worked {
-            s.push_str(&format!(
-                "<circle class=\"ca-pass-ring\" cx=\"{cx:.1}\" cy=\"{cy:.1}\" r=\"{:.1}\"/>",
-                r + 3.5
-            ));
-        }
-        s.push_str(&format!(
-            "<circle class=\"{cls}\" cx=\"{cx:.1}\" cy=\"{cy:.1}\" r=\"{r:.1}\">\
-             <title>{at} · {node} · {daemon} · suffix_syncs {ss} · reverts {rv} · failures {fl} · {win}</title>\
-             </circle>",
-            at = esc(&clock(p.at)),
-            node = esc(&p.node),
-            daemon = esc(&daemon_label(lang, &p.daemon)),
-            ss = p.suffix_syncs,
-            rv = p.reverts,
-            fl = p.failures,
-            win = esc(i18n::t(
-                lang,
-                if after { "chaos.pass.after" } else { "chaos.pass.before" }
-            )),
-        ));
-    }
-    // clock axis
-    for i in 0..=3 {
-        let tt = t0 + (t1 - t0) * i / 3;
-        let anchor = match i {
-            0 => "start",
-            3 => "end",
-            _ => "middle",
-        };
-        s.push_str(&format!(
-            "<text class=\"ca-axis\" x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"{anchor}\">{}</text>",
-            x(tt),
-            h - 8.0,
-            esc(&clock(tt)),
-        ));
-    }
-    s.push_str("</svg>");
-    // legend
-    let legend = format!(
-        "<div class=\"ca-pc-legend\">\
-         <span class=\"mon-leg-i\"><i class=\"ca-pc-sw ok\"></i><b>{}</b></span>\
-         <span class=\"mon-leg-i\"><i class=\"ca-pc-sw ring\"></i><b>{}</b></span>\
-         <span class=\"mon-leg-i\"><i class=\"ca-pc-sw fail\"></i><b>{}</b></span>\
-         <span class=\"mon-leg-i\"><i class=\"ca-pc-sw base\"></i><b>{}</b></span></div>",
-        esc(i18n::t(lang, "chaos.pc.size")),
-        esc(i18n::t(lang, "chaos.pc.worked")),
-        esc(i18n::t(lang, "chaos.pc.fail")),
-        esc(i18n::t(lang, "chaos.pc.base")),
-    );
-    format!("<div class=\"ca-lane\">{s}</div>{legend}")
+        .map(|(n, d)| {
+            json!({
+                "id": format!("{n}·{d}"),
+                "node": n,
+                "daemon": daemon_label(lang, d),
+            })
+        })
+        .collect();
+    let passes: Vec<serde_json::Value> = keep
+        .iter()
+        .map(|p| {
+            let after = p.at >= fault_at;
+            json!({
+                "at": p.at,
+                "lane": format!("{}·{}", p.node, p.daemon),
+                "suffix_syncs": p.suffix_syncs,
+                "reverts": p.reverts,
+                "failures": p.failures,
+                "after": after,
+                "worked": p.worked() && after,
+                "tip": format!(
+                    "{} · {} · {} · suffix_syncs {} · reverts {} · failures {}",
+                    clock(p.at),
+                    p.node,
+                    daemon_label(lang, &p.daemon),
+                    p.suffix_syncs,
+                    p.reverts,
+                    p.failures,
+                ),
+            })
+        })
+        .collect();
+    let data = json!({
+        "title": i18n::t(lang, "chaos.rep.daemon"),
+        "variant": "pass",
+        "faultAt": fault_at,
+        "faultLabel": i18n::t(lang, "chaos.mark.fault"),
+        "lanes": lane_json,
+        "passes": passes,
+        "legend": {
+            "size": i18n::t(lang, "chaos.pc.size"),
+            "worked": i18n::t(lang, "chaos.pc.worked"),
+            "fail": i18n::t(lang, "chaos.pc.fail"),
+            "base": i18n::t(lang, "chaos.pc.base"),
+        },
+    });
+    format!("<div class=\"ca-lane\">{}</div>", ix_mount("timeline", &data))
 }
 
 fn pass_table(lang: &str, run: &Run) -> String {
@@ -2976,7 +2775,7 @@ fn report(lang: &str, run: &Run) -> String {
         score_table(lang, run)
     ));
 
-    let tl = timeline_svg(lang, run);
+    let tl = timeline_mount(lang, run);
     if !tl.is_empty() {
         body.push_str(&format!(
             "<h3 class=\"ca-h\">{}</h3><p class=\"note ca-wide\">{}</p>\
@@ -3015,7 +2814,7 @@ fn report(lang: &str, run: &Run) -> String {
          <details class=\"rs-det\"><summary>{det}</summary>{t}</details>",
         h = esc(i18n::t(lang, "chaos.rep.daemon")),
         p = esc(i18n::t(lang, "chaos.rep.daemonp")),
-        chart = pass_chart(lang, run),
+        chart = pass_mount(lang, run),
         det = esc(i18n::t(lang, "chaos.pc.table")),
         t = pass_table(lang, run),
     ));

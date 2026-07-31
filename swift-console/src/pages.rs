@@ -678,7 +678,8 @@ pub async fn buckets_page(State(state): State<Arc<AppState>>, headers: HeaderMap
         )
     } else {
         format!(
-            r#"<div class="tbl-wrap"><table class="tbl"><thead><tr><th>{bucket}</th><th class="num">{objects}</th><th class="num">{size}</th><th class="acts-h"></th></tr></thead><tbody>{rows}</tbody></table></div>"#,
+            r#"<div class="tbl-wrap"><table class="tbl" id="bucket-table"><thead><tr><th>{bucket}</th><th class="num">{objects}</th><th class="num">{size}</th><th class="acts-h"></th></tr></thead><tbody>{rows}</tbody></table></div>
+<nav class="pager" id="bucket-pager" hidden></nav>"#,
             bucket = i18n::t(lang, "files.bucket"),
             objects = i18n::t(lang, "files.objects"),
             size = i18n::t(lang, "files.size"),
@@ -872,7 +873,8 @@ pub async fn objects_page(
         )
     } else {
         format!(
-            r#"<div class="tbl-wrap"><table class="tbl" id="obj-table"><thead><tr><th>{name}</th><th class="num">{size}</th><th>{ctype}</th><th>{modified}</th><th class="acts-h"></th></tr></thead><tbody>{rows}</tbody></table></div>"#,
+            r#"<div class="tbl-wrap"><table class="tbl" id="obj-table"><thead><tr><th>{name}</th><th class="num">{size}</th><th>{ctype}</th><th>{modified}</th><th class="acts-h"></th></tr></thead><tbody>{rows}</tbody></table></div>
+<nav class="pager" id="obj-pager" hidden></nav>"#,
             name = i18n::t(lang, "files.name"),
             size = i18n::t(lang, "files.size"),
             ctype = i18n::t(lang, "files.type"),

@@ -28,7 +28,7 @@ use crate::monitor;
 use crate::nodes;
 use crate::ringlab::{self, PolicyInfo};
 use crate::session;
-use crate::util::{enc_obj, enc_seg, esc, fmt_bytes};
+use crate::util::{enc_obj, enc_seg, esc, fmt_bytes, ix_mount};
 use crate::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
@@ -1366,192 +1366,72 @@ fn clock(secs: f64, span: f64) -> String {
     }
 }
 
-/// The swimlane: one lane for the client's clock, one per node, on a shared
-/// time axis, with every outage drawn as a band and the delete as a rule
-/// through all of them.
-///
-/// The gap between a mark on the client lane and the same file's mark on a node
-/// lane IS the diagnosis, so the two are never folded into one row. Drawn
-/// server-side and sized by viewBox, so it is in the document and scales with
-/// the column without a script.
-fn swimlane_svg(lang: &str, r: &Report) -> String {
+/// The swimlane: one lane for the client's clock, one per node, on a shared time axis.
+fn swimlane_mount(lang: &str, r: &Report) -> String {
     if r.lanes.is_empty() || r.events.is_empty() {
         return format!(
             "<p class=\"note\">{}</p>",
             esc(i18n::t(lang, "tmb.lane.empty"))
         );
     }
-    let known: Vec<&str> = r.lanes.iter().map(|l| l.id.as_str()).collect();
-    let mut lo = f64::INFINITY;
-    let mut hi = f64::NEG_INFINITY;
-    for e in &r.events {
-        lo = lo.min(e.t);
-        hi = hi.max(e.t);
-    }
-    // Only outages that touch this object's own history belong on this axis;
-    // one from yesterday would squash everything that matters into a pixel.
-    let bands: Vec<&OfflineSpan> = r
-        .offline
+    let lanes: Vec<serde_json::Value> = r
+        .lanes
         .iter()
-        .filter(|b| {
-            known.contains(&b.node.as_str())
-                && b.to as f64 >= lo - 60.0
-                && b.from as f64 <= hi + 60.0
+        .map(|l| {
+            json!({
+                "id": l.id,
+                "label": if l.role == "client" {
+                    i18n::t(lang, "tmb.lane.client").to_string()
+                } else {
+                    l.label.clone()
+                },
+                "role": l.role,
+                "primary": l.primary,
+            })
         })
         .collect();
-    for b in &bands {
-        lo = lo.min(b.from as f64);
-        hi = hi.max(b.to as f64);
-    }
-    if hi - lo < 120.0 {
-        let mid = (hi + lo) / 2.0;
-        lo = mid - 60.0;
-        hi = mid + 60.0;
-    }
-    let mut span = hi - lo;
-    lo -= span * 0.04;
-    hi += span * 0.04;
-    span = hi - lo;
-
-    let (w, row_h, pad_t, pad_b, pad_r) = (720.0f64, 26.0f64, 14.0f64, 28.0f64, 16.0f64);
-    let widest = r.lanes.iter().map(|l| l.label.chars().count()).max().unwrap_or(6);
-    let pad_l = (widest as f64 * 7.4 + 16.0).clamp(56.0, 180.0);
-    let h = pad_t + r.lanes.len() as f64 * row_h + pad_b;
-    let x = |t: f64| pad_l + (t - lo) / span * (w - pad_l - pad_r);
-    let row = |i: usize| pad_t + i as f64 * row_h + row_h / 2.0;
-
-    let mut body = String::new();
-    for (i, l) in r.lanes.iter().enumerate() {
-        let y = row(i);
-        body.push_str(&format!(
-            "<line class=\"tm-track{c}\" x1=\"{pad_l}\" y1=\"{y:.1}\" x2=\"{x2}\" y2=\"{y:.1}\"/>\
-             <text class=\"tm-lane-l{lc}\" x=\"{lx:.1}\" y=\"{ly:.1}\" text-anchor=\"end\">{lab}</text>",
-            c = if l.role == "client" { " client" } else { "" },
-            x2 = w - pad_r,
-            lc = if l.role == "client" {
-                " client"
-            } else if l.primary {
-                ""
-            } else {
-                " handoff"
-            },
-            lx = pad_l - 8.0,
-            ly = y + 3.5,
-            lab = esc(if l.role == "client" {
-                i18n::t(lang, "tmb.lane.client")
-            } else {
-                &l.label
-            }),
-        ));
-    }
-
-    // Outages first, so every mark reads on top of the band it happened inside.
-    for b in &bands {
-        let Some(i) = r.lanes.iter().position(|l| l.id == b.node) else {
-            continue;
-        };
-        let y = row(i) - row_h / 2.0 + 2.0;
-        let x1 = x(b.from as f64).max(pad_l);
-        let x2 = x(b.to as f64).min(w - pad_r);
-        body.push_str(&format!(
-            "<g><rect class=\"tm-band\" x=\"{x1:.1}\" y=\"{y:.1}\" width=\"{bw:.1}\" height=\"{bh}\"/>\
-             <line class=\"tm-band-e\" x1=\"{x1:.1}\" y1=\"{y:.1}\" x2=\"{x1:.1}\" y2=\"{y2:.1}\"/>\
-             <line class=\"tm-band-e\" x1=\"{x2:.1}\" y1=\"{y:.1}\" x2=\"{x2:.1}\" y2=\"{y2:.1}\"/>\
-             <title>{tip}</title></g>",
-            bw = (x2 - x1).max(1.0),
-            bh = row_h - 4.0,
-            y2 = y + row_h - 4.0,
-            tip = esc(
-                &i18n::t(lang, "tmb.lane.offline")
-                    .replace("{node}", &b.node)
-                    .replace("{from}", &clock(b.from as f64, span))
-                    .replace("{to}", &clock(b.to as f64, span))
-            ),
-        ));
-    }
-
-    if let Some(d) = r.delete_ts {
-        let dx = x(d);
-        // Flip the label inside the frame when the delete lands near the right
-        // edge, so the word is never shaved off by the viewBox.
-        let flip = dx > w - pad_r - 60.0;
-        body.push_str(&format!(
-            "<line class=\"tm-rule\" x1=\"{dx:.1}\" y1=\"{y1}\" x2=\"{dx:.1}\" y2=\"{y2}\"/>\
-             <text class=\"tm-rule-l\" x=\"{lx:.1}\" y=\"{ly}\" text-anchor=\"{a}\">{lbl}</text>",
-            y1 = pad_t - 4.0,
-            y2 = h - pad_b + 2.0,
-            lx = if flip { dx - 5.0 } else { dx + 5.0 },
-            ly = pad_t + 3.0,
-            a = if flip { "end" } else { "start" },
-            lbl = esc(i18n::t(lang, "tmb.lane.delete")),
-        ));
-    }
-
-    for e in &r.events {
-        let Some(i) = r.lanes.iter().position(|l| l.id == e.lane) else {
-            continue;
-        };
-        let (cx, cy) = (x(e.t), row(i));
-        let tip = esc(&format!("{}  {}", clock(e.t, span), e.label));
-        if e.kind == "tombstone" {
-            // A delete is struck out, not just recoloured: the shape carries it.
-            body.push_str(&format!(
-                "<path class=\"tm-ev-tombstone\" d=\"M{a:.1} {b:.1}L{c:.1} {d:.1}M{c:.1} {b:.1}L{a:.1} {d:.1}\">\
-                 <title>{tip}</title></path>",
-                a = cx - 4.0,
-                b = cy - 4.0,
-                c = cx + 4.0,
-                d = cy + 4.0,
-            ));
-        } else {
-            body.push_str(&format!(
-                "<circle class=\"tm-ev-{k}\" cx=\"{cx:.1}\" cy=\"{cy:.1}\" r=\"{rr}\">\
-                 <title>{tip}</title></circle>",
-                k = esc(&e.kind),
-                rr = if e.kind == "meta" { 3.5 } else { 4.0 },
-            ));
-        }
-    }
-
-    for i in 0..=3 {
-        let t = lo + span * (i as f64 / 3.0);
-        body.push_str(&format!(
-            "<text class=\"tm-axis\" x=\"{tx:.1}\" y=\"{ty}\" text-anchor=\"{a}\">{v}</text>",
-            tx = x(t),
-            ty = h - 8.0,
-            a = if i == 0 {
-                "start"
-            } else if i == 3 {
-                "end"
-            } else {
-                "middle"
-            },
-            v = esc(&clock(t, span)),
-        ));
-    }
-
+    let events: Vec<serde_json::Value> = r
+        .events
+        .iter()
+        .map(|e| {
+            json!({
+                "lane": e.lane,
+                "t": e.t,
+                "kind": e.kind,
+                "label": e.label,
+            })
+        })
+        .collect();
+    let offline: Vec<serde_json::Value> = r
+        .offline
+        .iter()
+        .map(|b| json!({"node": b.node, "from": b.from, "to": b.to}))
+        .collect();
     let legend = [
-        ("tm-ev-data", "tmb.lane.k.write"),
-        ("tm-ev-tombstone", "tmb.lane.k.delete"),
-        ("tm-ev-meta", "tmb.lane.k.meta"),
-        ("tm-band", "tmb.lane.k.offline"),
+        ("data", "tmb.lane.k.write"),
+        ("tombstone", "tmb.lane.k.delete"),
+        ("meta", "tmb.lane.k.meta"),
+        ("offline", "tmb.lane.k.offline"),
     ]
     .iter()
-    .map(|(c, k)| {
-        format!(
-            "<span class=\"mon-leg-i\"><i class=\"{c}\"></i><b>{}</b></span>",
-            esc(i18n::t(lang, k))
-        )
-    })
-    .collect::<Vec<_>>()
-    .join("");
-
+    .map(|(k, key)| json!({"kind": k, "label": i18n::t(lang, key)}))
+    .collect::<Vec<_>>();
+    let data = json!({
+        "title": i18n::t(lang, "tmb.lane.title"),
+        "note": i18n::t(lang, "tmb.lane.note"),
+        "variant": "swimlane",
+        "delete_ts": r.delete_ts,
+        "deleteLabel": i18n::t(lang, "tmb.lane.delete"),
+        "lanes": lanes,
+        "events": events,
+        "offline": offline,
+        "legend": legend,
+    });
     format!(
-        "<div class=\"mon-card wide\"><div class=\"mon-card-h\"><span class=\"mon-t\">{title}</span>\
-         <span class=\"mon-legend\">{legend}</span></div><div class=\"mon-body\">\
-         <svg class=\"tm-svg\" viewBox=\"0 0 {w} {h}\" width=\"100%\" role=\"img\" aria-label=\"{title}\">{body}</svg>\
-         <div class=\"lab-b\">{note}</div></div></div>",
+        "<div class=\"mon-card wide\"><div class=\"mon-card-h\"><span class=\"mon-t\">{title}</span></div>\
+         <div class=\"mon-body\">{mount}<div class=\"lab-b\">{note}</div></div></div>",
         title = esc(i18n::t(lang, "tmb.lane.title")),
+        mount = ix_mount("timeline", &data),
         note = esc(i18n::t(lang, "tmb.lane.note")),
     )
 }
@@ -1774,7 +1654,7 @@ pub fn report_content(lang: &str, r: &Report) -> String {
             i18n::t(lang, "tmb.h.timeline"),
             format!(
                 "{}{}",
-                swimlane_svg(lang, r),
+                swimlane_mount(lang, r),
                 if ev_rows.is_empty() {
                     format!("<p class=\"note\">{}</p>", esc(i18n::t(lang, "tmb.events.none")))
                 } else {

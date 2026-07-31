@@ -35,6 +35,11 @@ fn err(code: StatusCode, msg: &str) -> Response {
     (code, Json(json!({ "error": msg }))).into_response()
 }
 
+/// JSON-string literal for embedding i18n into an inline script.
+fn json_str(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
+}
+
 /// Which nodes are currently held down by a pending journal entry.
 fn down_nodes(state: &Arc<AppState>) -> Vec<(String, String, u64)> {
     nodes::pending(state)
@@ -132,6 +137,11 @@ struct UpReq {
 }
 
 /// POST /lab/api/node/up {node|journal_id} — restart a node early (before TTL).
+///
+/// If the node is still in the drill journal, undo that entry. If services are
+/// down *without* a journal (console restart, TTL race, external stop), force
+/// `systemctl start` so the operator is never stuck on "Take down" for a
+/// already-down node.
 pub async fn up(State(state): State<Arc<AppState>>, headers: HeaderMap, body: String) -> Response {
     if let Err(r) = lab::require_lab_api(&state, &headers) {
         return r;
@@ -140,20 +150,38 @@ pub async fn up(State(state): State<Arc<AppState>>, headers: HeaderMap, body: St
         Ok(r) => r,
         Err(e) => return err(StatusCode::BAD_REQUEST, &format!("bad request: {e}")),
     };
-    // Resolve to a pending ServiceUnit journal entry: by id, or the newest for
-    // the named node.
     let id = if !req.journal_id.is_empty() {
-        req.journal_id
+        Some(req.journal_id)
     } else if !req.node.is_empty() {
-        match down_nodes(&state).into_iter().find(|(n, _, _)| *n == req.node) {
-            Some((_, id, _)) => id,
-            None => return err(StatusCode::NOT_FOUND, "node is not held down"),
-        }
+        down_nodes(&state)
+            .into_iter()
+            .find(|(n, _, _)| *n == req.node)
+            .map(|(_, id, _)| id)
     } else {
         return err(StatusCode::BAD_REQUEST, "node or journal_id required");
     };
-    match nodes::undo(&state, &id).await {
-        Ok(()) => Json(json!({ "ok": true, "restarted": true, "journal_id": id })).into_response(),
+    if let Some(id) = id {
+        return match nodes::undo(&state, &id).await {
+            Ok(()) => Json(json!({ "ok": true, "restarted": true, "journal_id": id })).into_response(),
+            Err(e) => err(StatusCode::CONFLICT, &e),
+        };
+    }
+    // No journal — services may still be stopped. Start them directly.
+    if !state.cfg.lab_mutations {
+        return err(StatusCode::FORBIDDEN, "lab mutations are disabled");
+    }
+    if nodes::by_name(&state, &req.node).is_none() {
+        return err(StatusCode::BAD_REQUEST, &format!("unknown node {}", req.node));
+    }
+    let start = format!("systemctl start {SERVICES}");
+    match nodes::run(&state, &req.node, &start).await {
+        Ok(_) => Json(json!({
+            "ok": true,
+            "restarted": true,
+            "forced": true,
+            "node": req.node,
+        }))
+        .into_response(),
         Err(e) => err(StatusCode::CONFLICT, &e),
     }
 }
@@ -177,11 +205,12 @@ pub async fn page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
         )
     };
     // Rows are filled by JS from /lab/api/node/status so the page reflects live
-    // state on every load and after every action.
+    // state on every load and after every action. Button choice follows live
+    // service health, not only the in-memory drill journal.
     let body = format!(
         r#"<div class="pagehead"><h1>{title}</h1></div>
 <p class="statline">{blurb}</p>{warn}
-<div class=" nodeops" data-nodeops="1">
+<div class="nodeops" data-nodeops="1">
   <table class="tbl"><thead><tr>
     <th>{h_node}</th><th>{h_state}</th><th>{h_svc}</th><th>{h_act}</th>
   </tr></thead><tbody id="nodeops-rows"><tr><td colspan="4">…</td></tr></tbody></table>
@@ -191,31 +220,45 @@ pub async fn page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
 (function(){{
   var rows=document.getElementById('nodeops-rows');
   var msg=document.getElementById('nodeops-msg');
+  var L={{
+    up:{l_up}, down:{l_down}, degraded:{l_degraded}, unreachable:{l_unreach},
+    take:{l_take}, bring:{l_bring},
+    confirm:{l_confirm}, stopping:{l_stopping}, starting:{l_starting},
+    downOk:{l_down_ok}, upOk:{l_up_ok}
+  }};
   function j(u,o){{return fetch(u,o).then(function(r){{return r.json();}});}}
   function refresh(){{
     j('/lab/api/node/status').then(function(d){{
       rows.innerHTML='';
       (d.nodes||[]).forEach(function(n){{
         var tr=document.createElement('tr');
-        var st = n.held_down ? 'DOWN (drill)' : (n.up ? 'up' : (n.reachable?'degraded':'unreachable'));
-        var act = n.held_down
-          ? '<button data-up="'+n.node+'">Bring up</button>'
-          : '<button data-down="'+n.node+'">Take down</button>';
-        tr.innerHTML='<td>'+n.node+'</td><td>'+st+'</td><td>'+n.active_services+'/'+n.total_services+'</td><td>'+act+'</td>';
+        var st = n.held_down ? L.down
+          : (n.up ? L.up : (n.reachable ? L.degraded : L.unreachable));
+        // Bring up whenever the node is not fully healthy — journal or not.
+        var needUp = n.held_down || !n.up;
+        var act = needUp
+          ? '<button type="button" class="btn sm" data-up="'+n.node+'">'+L.bring+'</button>'
+          : '<button type="button" class="btn sm" data-down="'+n.node+'">'+L.take+'</button>';
+        if (n.held_down && n.expires) {{
+          st += ' · TTL '+Math.max(0, n.expires - Math.floor(Date.now()/1000))+'s';
+        }}
+        tr.innerHTML='<td>'+n.node+'</td><td>'+st+'</td><td>'+n.active_services+'/'+n.total_services+'</td><td class="acts">'+act+'</td>';
+        if (!n.up) tr.classList.add('muted-row');
         rows.appendChild(tr);
       }});
     }});
   }}
   rows.addEventListener('click',function(e){{
-    var d=e.target.getAttribute('data-down'), u=e.target.getAttribute('data-up');
-    if(d){{ if(!confirm('Take '+d+' down? It auto-restarts after the TTL.'))return;
-      msg.textContent='stopping '+d+'…';
+    var t=e.target.closest('[data-down],[data-up]'); if(!t) return;
+    var d=t.getAttribute('data-down'), u=t.getAttribute('data-up');
+    if(d){{ if(!confirm(L.confirm.replace('{{node}}', d)))return;
+      msg.textContent=L.stopping.replace('{{node}}', d);
       j('/lab/api/node/down',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{node:d}})}})
-        .then(function(r){{msg.textContent=r.error?('error: '+r.error):(d+' down; auto-restart in '+r.auto_restart_in_secs+'s');refresh();}});
+        .then(function(r){{msg.textContent=r.error?('error: '+r.error):L.downOk.replace('{{node}}',d).replace('{{secs}}', r.auto_restart_in_secs);refresh();}});
     }}
-    if(u){{ msg.textContent='starting '+u+'…';
+    if(u){{ msg.textContent=L.starting.replace('{{node}}', u);
       j('/lab/api/node/up',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{node:u}})}})
-        .then(function(r){{msg.textContent=r.error?('error: '+r.error):(u+' back up');refresh();}});
+        .then(function(r){{msg.textContent=r.error?('error: '+r.error):L.upOk.replace('{{node}}',u);refresh();}});
     }}
   }});
   refresh(); setInterval(refresh,5000);
@@ -225,6 +268,17 @@ pub async fn page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
         h_state = esc(i18n::t(lang, "nodes.col.state")),
         h_svc = esc(i18n::t(lang, "nodes.col.services")),
         h_act = esc(i18n::t(lang, "nodes.col.action")),
+        l_up = json_str(i18n::t(lang, "nodes.state.up")),
+        l_down = json_str(i18n::t(lang, "nodes.state.down")),
+        l_degraded = json_str(i18n::t(lang, "nodes.state.degraded")),
+        l_unreach = json_str(i18n::t(lang, "nodes.state.unreachable")),
+        l_take = json_str(i18n::t(lang, "nodes.act.take")),
+        l_bring = json_str(i18n::t(lang, "nodes.act.bring")),
+        l_confirm = json_str(i18n::t(lang, "nodes.act.confirm")),
+        l_stopping = json_str(i18n::t(lang, "nodes.act.stopping")),
+        l_starting = json_str(i18n::t(lang, "nodes.act.starting")),
+        l_down_ok = json_str(i18n::t(lang, "nodes.act.down_ok")),
+        l_up_ok = json_str(i18n::t(lang, "nodes.act.up_ok")),
     );
     crate::pages::lab_tool_shell(&state, &headers, &sess, "nodes", body)
 }

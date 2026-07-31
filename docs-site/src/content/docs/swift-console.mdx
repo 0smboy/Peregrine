@@ -23,11 +23,13 @@ without a client-side framework.
   </Card>
   <Card title="Monitor">
     Live cluster metrics and logs, queried server-side — no backend name, URL,
-    or credential reaches the browser.
+    or credential reaches the browser. Overview **在线节点** is host scrape
+    liveness (`up{job="node"}`), not Swift service health.
   </Card>
   <Card title="Lab">
     Tools that explain and stress the cluster: RingScope, policy compare, Object
-    Capsule, Tombstone Museum, Chaos Arcade, and the **Node HA Drill**.
+    Capsule, Tombstone Museum, Chaos Arcade, Node HA Drill, Repair Debt Index,
+    and Protocol Mutation (Shadow).
   </Card>
 </CardGrid>
 
@@ -79,3 +81,37 @@ balancer, not to be exposed directly.
 | `metrics_url` / `logs_url` | metrics + log backends |
 | `lab_enabled` / `lab_mutations` | enable the Lab surface / allow guarded mutations |
 | `cluster_nodes` | node roster (name + storage/replication/public IPs, devices) |
+| `shadow_peer_base` / `shadow_peer_auth` / `shadow_peer_label` | optional second Swift endpoint for Shadow dual-mode (same tempauth user/key as the console login) |
+| `shadow_root` | on-disk corpus + mutation log directory |
+
+## Monitor: what “在线节点” means
+
+The overview **在线节点** tile is `count(up{job="node"} == 1)` — Prometheus
+`node_exporter` scrape success. It answers “is the host still talking?”, not
+“are Swift units running?”. Taking a node down in the HA drill leaves this
+count unchanged while Services / Node HA show the Swift units as down. That is
+intentional; do not replace it with SSH service probes on the overview.
+
+## Lab: Repair Debt Index
+
+`GET /lab/debt` and `GET /lab/api/debt/snapshot` score deferred repair work
+(async pending, quarantine, ring imbalance, disk/repl pressure, unhealthy
+fraction) into a single debt / interest / time-to-insolvency view. Calibration
+notes live in the console tree at `swift-console/docs/debt-calibration.md`.
+
+## Lab: Protocol Mutation (Shadow)
+
+Shadow can run a seeded mutation sequence against the logged-in cluster and,
+when `shadow_peer_*` is set, against a second implementation side-by-side.
+Findings and mutate corpus land under `shadow_root` (`mutations.jsonl`).
+
+On the azure build host a Python SAIO already listens on `127.0.0.1:8081` (same
+`test:tester` / cluster key). Point `shadow_peer_base` there for dual-mode
+对照. A Rust SAIO on `:8090` is available for same-topology A/B if you swap the
+peer URL.
+
+## Rust Toolchain Canary
+
+Out-of-tree under `rust-toolchain-canary/`: install pinned toolchains, run a
+CRUD smoke against a live Swift endpoint, and emit a differential report. This
+is a host CLI, not a console page.

@@ -55,7 +55,6 @@ const MAX_TTL: u64 = 604_800; // 7d
 /// operator. Whatever is not headed is reported as unknown, never as absent.
 const HEAD_CAP: usize = 200;
 const GRAPH_JOBS: usize = 5;
-const GRAPH_NODES: usize = 4;
 const SAMPLE_CAP: u64 = 65_536;
 
 const MCP_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -1725,30 +1724,12 @@ fn trunc(s: &str, n: usize) -> String {
     )
 }
 
-struct GNode {
-    label: String,
-    sub: String,
-    title: String,
-    cls: &'static str,
-}
-
 /// Inputs on the left, the job in the middle, what it produced on the right.
-/// Rendered on the server: a lineage graph that only appears once a script has
-/// run is a lineage graph that is missing exactly when someone is debugging.
-pub fn lineage_svg(lang: &str, r: &Report, now: u64) -> String {
-    const W: i32 = 1080;
-    const NW: i32 = 300;
-    const NH: i32 = 30;
-    const JH: i32 = 48;
-    const PITCH: i32 = 40;
-    const C1: i32 = 6;
-    const C2: i32 = 390;
-    const C3: i32 = 774;
-    const GAP: i32 = 26;
-    const PADT: i32 = 10;
-
-    // Empty layout-only jobs make a sparse graph of "no input / no output"
-    // boxes; those belong in the job cards, not here.
+/// Server-rendered HTML (not a JS hydrate mount): the graph must be fully
+/// visible with no script, and must not sit in the old SVG scroll strip.
+pub fn lineage_mount(lang: &str, r: &Report, now: u64) -> String {
+    const GRAPH_JOBS: usize = 12;
+    const GRAPH_NODES: usize = 8;
     let shown: Vec<&Job> = r
         .jobs
         .iter()
@@ -1759,69 +1740,101 @@ pub fn lineage_svg(lang: &str, r: &Report, now: u64) -> String {
         return String::new();
     }
 
-    let mut bands: Vec<(Vec<GNode>, GNode, Vec<GNode>, i32)> = Vec::new();
+    fn node_html(label: &str, sub: &str, tip: &str, cls: &str, obj: Option<&str>) -> String {
+        let preview = match obj.filter(|p| !p.is_empty()) {
+            Some(p) => format!(
+                " data-wh-obj=\"{}\" role=\"button\" tabindex=\"0\"",
+                esc(p)
+            ),
+            None => String::new(),
+        };
+        format!(
+            "<div class=\"wh-lineage-node {cls}\" data-tip=\"{tip}\"{preview}>\
+               <b>{label}</b>{sub_html}</div>",
+            cls = esc(cls),
+            tip = esc(tip),
+            preview = preview,
+            label = esc(label),
+            sub_html = if sub.is_empty() {
+                String::new()
+            } else {
+                format!("<em>{}</em>", esc(sub))
+            },
+        )
+    }
+
+    let mut bands = String::new();
     for j in &shown {
-        let mut ins: Vec<GNode> = Vec::new();
+        let mut ins = String::new();
         let mut seen: Vec<String> = Vec::new();
         for o in j.inputs.iter().take(GRAPH_NODES) {
             seen.push(o.path.clone());
-            ins.push(GNode {
-                label: trunc(&o.name, 40),
-                sub: fmt_bytes(o.bytes),
-                title: format!("{} · {}", o.path, fmt_bytes(o.bytes)),
-                cls: "wh-n-in",
-            });
+            ins.push_str(&node_html(
+                &trunc(&o.name, 40),
+                &fmt_bytes(o.bytes),
+                &format!("{} · {}", o.path, fmt_bytes(o.bytes)),
+                "wh-n-in",
+                Some(&o.path),
+            ));
         }
-        // An input named by an artifact but no longer in inputs/ still belongs
-        // on the graph: it is the part of the provenance that has gone missing.
         for a in &j.artifacts {
             for p in &a.inputs {
-                if !seen.contains(p) && ins.len() < GRAPH_NODES {
+                if !seen.contains(p) && seen.len() < GRAPH_NODES {
                     seen.push(p.clone());
                     let gone = !j.inputs.iter().any(|o| &o.path == p);
-                    ins.push(GNode {
-                        label: trunc(p.rsplit('/').next().unwrap_or(p), 40),
-                        sub: i18n::t(lang, if gone { "wh.g.gone" } else { "wh.g.ref" }).to_string(),
-                        title: p.clone(),
-                        cls: if gone { "wh-n-gone" } else { "wh-n-in" },
-                    });
+                    ins.push_str(&node_html(
+                        &trunc(p.rsplit('/').next().unwrap_or(p), 40),
+                        i18n::t(lang, if gone { "wh.g.gone" } else { "wh.g.ref" }),
+                        p,
+                        if gone { "wh-n-gone" } else { "wh-n-in" },
+                        if gone { None } else { Some(p.as_str()) },
+                    ));
                 }
             }
         }
         if j.inputs.len() > GRAPH_NODES {
-            ins.push(GNode {
-                label: tr(lang, "wh.g.more", &[("{n}", &(j.inputs.len() - GRAPH_NODES).to_string())]),
-                sub: String::new(),
-                title: String::new(),
-                cls: "wh-n-more",
-            });
+            ins.push_str(&node_html(
+                &tr(lang, "wh.g.more", &[("{n}", &(j.inputs.len() - GRAPH_NODES).to_string())]),
+                "",
+                "",
+                "wh-n-more",
+                None,
+            ));
+        }
+        if ins.is_empty() {
+            ins = format!(
+                "<div class=\"wh-lineage-empty\">{}</div>",
+                esc(i18n::t(lang, "wh.g.noinputs"))
+            );
         }
 
-        let job = GNode {
-            label: trunc(&j.id, 40),
-            sub: trunc_tail(
-                if j.goal.is_empty() { i18n::t(lang, "wh.g.nogoal") } else { j.goal.as_str() },
-                46,
+        let job = node_html(
+            &trunc(&j.id, 40),
+            &trunc_tail(
+                if j.goal.is_empty() {
+                    i18n::t(lang, "wh.g.nogoal")
+                } else {
+                    j.goal.as_str()
+                },
+                56,
             ),
-            title: format!("{} · {}", j.id, j.goal),
-            cls: "wh-n-job",
-        };
+            &format!("{} · {}", j.id, j.goal),
+            "wh-n-job wh-lineage-job",
+            None,
+        );
 
-        let mut outs: Vec<GNode> = Vec::new();
+        let mut outs = String::new();
         for a in j.artifacts.iter().take(GRAPH_NODES) {
-            outs.push(GNode {
-                label: trunc(&a.name, 40),
-                sub: format!(
-                    "{} · {}",
-                    fmt_bytes(a.bytes),
-                    i18n::t(lang, "wh.g.persist")
-                ),
-                title: format!("{} · etag {}", a.path, a.etag),
-                cls: "wh-n-art",
-            });
+            outs.push_str(&node_html(
+                &trunc(&a.name, 40),
+                &format!("{} · {}", fmt_bytes(a.bytes), i18n::t(lang, "wh.g.persist")),
+                &format!("{} · etag {}", a.path, a.etag),
+                "wh-n-art",
+                Some(&a.path),
+            ));
         }
-        for w in j.working.iter().take(GRAPH_NODES.saturating_sub(outs.len().min(GRAPH_NODES))) {
-            if outs.len() >= GRAPH_NODES + 2 {
+        for w in j.working.iter() {
+            if outs.matches("wh-lineage-node").count() >= GRAPH_NODES + 2 {
                 break;
             }
             let sub = match w.delete_at {
@@ -1829,133 +1842,58 @@ pub fn lineage_svg(lang: &str, r: &Report, now: u64) -> String {
                 Some(_) => i18n::t(lang, "wh.g.overdue").to_string(),
                 None => i18n::t(lang, "wh.g.noexp").to_string(),
             };
-            outs.push(GNode {
-                label: trunc(&w.name, 40),
-                sub,
-                title: format!("{} · {}", w.path, fmt_bytes(w.bytes)),
-                cls: "wh-n-work",
-            });
-        }
-        let rows = ins.len().max(outs.len()).max(1) as i32;
-        let band_h = (rows * PITCH - (PITCH - NH)).max(JH);
-        bands.push((ins, job, outs, band_h));
-    }
-
-    let total_h: i32 = PADT * 2 + bands.iter().map(|b| b.3 + GAP).sum::<i32>() - GAP + 26;
-    let mut out = String::new();
-    out.push_str(&format!(
-        "<svg class=\"wh-svg\" viewBox=\"0 0 {W} {total_h}\" width=\"{W}\" height=\"{total_h}\" role=\"img\" aria-label=\"{}\">",
-        esc(i18n::t(lang, "wh.g.alt"))
-    ));
-
-    let node = |x: i32, y: i32, n: &GNode, h: i32| -> String {
-        let mut s = format!(
-            "<g class=\"{cls}\"><rect x=\"{x}\" y=\"{y}\" width=\"{NW}\" height=\"{h}\" rx=\"3\"/>",
-            cls = n.cls
-        );
-        if !n.title.is_empty() {
-            s.push_str(&format!("<title>{}</title>", esc(&n.title)));
-        }
-        if n.sub.is_empty() {
-            s.push_str(&format!(
-                "<text class=\"wh-t\" x=\"{}\" y=\"{}\">{}</text>",
-                x + 10,
-                y + h / 2 + 4,
-                esc(&n.label)
+            outs.push_str(&node_html(
+                &trunc(&w.name, 40),
+                &sub,
+                &format!("{} · {}", w.path, fmt_bytes(w.bytes)),
+                "wh-n-work",
+                Some(&w.path),
             ));
-        } else {
-            // Two baselines whose optical centre lands on the node's, with the
-            // lower one's descenders clear of the border by 3px.
-            s.push_str(&format!(
-                "<text class=\"wh-t\" x=\"{}\" y=\"{}\">{}</text>\
-                 <text class=\"wh-s\" x=\"{}\" y=\"{}\">{}</text>",
-                x + 10,
-                y + h / 2 - 2,
-                esc(&n.label),
-                x + 10,
-                y + h / 2 + 11,
-                esc(&n.sub)
-            ));
-        }
-        s.push_str("</g>");
-        s
-    };
-    let edge = |x1: i32, y1: i32, x2: i32, y2: i32, cls: &str| -> String {
-        let d = ((x2 - x1).abs() / 3).max(6);
-        format!(
-            "<path class=\"wh-e {cls}\" d=\"M{x1} {y1} C{c1} {y1}, {c2} {y2}, {x2} {y2}\"/>",
-            c1 = x1 + d,
-            c2 = x2 - d
-        )
-    };
-
-    let mut y = PADT;
-    for (ins, jn, outs, band_h) in &bands {
-        let by = y;
-        let jy = by + (band_h - JH) / 2;
-        let jcy = jy + JH / 2;
-        let stack = |n: usize| -> i32 {
-            let hh = n as i32 * PITCH - (PITCH - NH);
-            by + (band_h - hh.max(NH)) / 2
-        };
-
-        let iy0 = stack(ins.len().max(1));
-        for (i, n) in ins.iter().enumerate() {
-            let ny = iy0 + i as i32 * PITCH;
-            out.push_str(&edge(C1 + NW, ny + NH / 2, C2, jcy, ""));
-            out.push_str(&node(C1, ny, n, NH));
-        }
-        if ins.is_empty() {
-            out.push_str(&format!(
-                "<text class=\"wh-s\" x=\"{}\" y=\"{}\">{}</text>",
-                C1 + 2,
-                jcy + 4,
-                esc(i18n::t(lang, "wh.g.noinputs"))
-            ));
-        }
-
-        let oy0 = stack(outs.len().max(1));
-        for (i, n) in outs.iter().enumerate() {
-            let ny = oy0 + i as i32 * PITCH;
-            let cls = if n.cls == "wh-n-work" { "work" } else { "" };
-            out.push_str(&edge(C2 + NW, jcy, C3, ny + NH / 2, cls));
-            out.push_str(&node(C3, ny, n, NH));
         }
         if outs.is_empty() {
-            out.push_str(&format!(
-                "<text class=\"wh-s\" x=\"{}\" y=\"{}\">{}</text>",
-                C3 + 2,
-                jcy + 4,
+            outs = format!(
+                "<div class=\"wh-lineage-empty\">{}</div>",
                 esc(i18n::t(lang, "wh.g.nooutputs"))
-            ));
+            );
         }
 
-        out.push_str(&node(C2, jy, jn, JH));
-        y += band_h + GAP;
+        bands.push_str(&format!(
+            "<div class=\"wh-lineage-band\">\
+               <div class=\"wh-lineage-col in\">{ins}</div>\
+               <div class=\"wh-lineage-col mid\">{job}</div>\
+               <div class=\"wh-lineage-col out\">{outs}</div>\
+             </div>",
+            ins = ins,
+            job = job,
+            outs = outs,
+        ));
     }
 
-    // Legend, on the same baseline as the last band's floor.
-    let ly = total_h - 8;
-    let mut lx = C1 + 2;
-    for (cls, key) in [
+    let legend = [
         ("wh-n-in", "wh.g.l.input"),
         ("wh-n-job", "wh.g.l.job"),
         ("wh-n-art", "wh.g.l.art"),
         ("wh-n-work", "wh.g.l.work"),
-    ] {
-        let label = i18n::t(lang, key);
-        out.push_str(&format!(
-            "<g class=\"{cls}\"><rect x=\"{lx}\" y=\"{}\" width=\"13\" height=\"11\" rx=\"2\"/></g>\
-             <text class=\"wh-s\" x=\"{}\" y=\"{ly}\">{}</text>",
-            ly - 10,
-            lx + 18,
-            esc(label)
-        ));
-        lx += 22 + (label.chars().count() as i32 * 9).max(52);
-    }
-    out.push_str("</svg>");
-    out
+    ]
+    .iter()
+    .map(|(cls, key)| {
+        format!(
+            "<span class=\"wh-lineage-leg-i\"><i class=\"{cls}\"></i>{}</span>",
+            esc(i18n::t(lang, key)),
+            cls = cls,
+        )
+    })
+    .collect::<String>();
+
+    format!(
+        "<div class=\"wh-lineage\" role=\"img\" aria-label=\"{alt}\">{bands}\
+           <div class=\"wh-lineage-leg\">{legend}</div></div>",
+        alt = esc(i18n::t(lang, "wh.g.alt")),
+        bands = bands,
+        legend = legend,
+    )
 }
+
 
 // ------------------------------------------------------------ page
 
@@ -2087,7 +2025,7 @@ fn render(lang: &str, r: &Report, note: &str, err: &str) -> String {
     out.push_str(&sec(i18n::t(lang, "wh.sec.jobs"), job_cards(lang, r)));
 
     // ---- lineage graph (only jobs with objects) + table under details
-    let graph = lineage_svg(lang, r, now);
+    let graph = lineage_mount(lang, r, now);
     let graph_block = if graph.is_empty() {
         empty(i18n::t(lang, "wh.empty.nolineage"))
     } else {
@@ -2119,6 +2057,23 @@ fn render(lang: &str, r: &Report, note: &str, err: &str) -> String {
         esc(i18n::t(lang, "wh.sec.mcp")),
         esc(i18n::t(lang, "wh.sec.mcp.sum")),
         mcp_section(lang),
+    ));
+
+    // Object preview dialog — filled by console.js on lineage node click.
+    out.push_str(&format!(
+        r#"<dialog id="dlg-wh-preview" class="dlg dlg-wide">
+  <form method="dialog" class="dlg-in">
+    <h3 id="wh-preview-title">{title}</h3>
+    <p class="note" id="wh-preview-meta"></p>
+    <pre class="wh-preview-body" id="wh-preview-body">{loading}</pre>
+    <div class="dlg-acts">
+      <button type="submit" class="btn ghost">{close}</button>
+    </div>
+  </form>
+</dialog>"#,
+        title = esc(i18n::t(lang, "wh.preview.title")),
+        loading = esc(i18n::t(lang, "wh.preview.loading")),
+        close = esc(i18n::t(lang, "wh.preview.close")),
     ));
     out
 }
@@ -2552,6 +2507,106 @@ pub async fn page(
     crate::pages::lab_tool_shell(&state, &headers, &sess, "warehouse", body)
 }
 
+/// Resolve a lineage path to (container, object). Warehouse job paths live in
+/// [`CONTAINER`]; anything else is treated as `container/object`.
+fn resolve_preview_target(raw: &str) -> Option<(String, String)> {
+    let p = raw.trim();
+    if p.is_empty() || p.contains("..") {
+        return None;
+    }
+    if p.starts_with(JOB_ROOT) {
+        return Some((CONTAINER.to_string(), p.to_string()));
+    }
+    let (c, o) = p.split_once('/')?;
+    if c.is_empty() || o.is_empty() || c.contains('/') {
+        return None;
+    }
+    Some((c.to_string(), o.to_string()))
+}
+
+/// GET /lab/api/warehouse/sample?object=… — live Range preview of a warehouse
+/// (or referenced) object. Same bytes the MCP `object_sample` tool returns.
+pub async fn sample(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let (sid, _) = match lab::require_lab_api(&state, &headers) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let raw = q.get("object").map(|s| s.as_str()).unwrap_or("");
+    let (c, o) = match resolve_preview_target(raw) {
+        Some(v) => v,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "object path required" })),
+            )
+                .into_response();
+        }
+    };
+    let n = q
+        .get("bytes")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(8192)
+        .clamp(1, SAMPLE_CAP);
+    let lines = q
+        .get("lines")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(80)
+        .clamp(1, 400);
+    let sub = swift::obj_subpath(&c, &o);
+    let hs = vec![("Range".to_string(), format!("bytes=0-{}", n - 1))];
+    let resp = match swift::call(
+        &state,
+        &sid,
+        reqwest::Method::GET,
+        &sub,
+        &[],
+        &hs,
+        None,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": e.msg() })),
+            )
+                .into_response();
+        }
+    };
+    let st = resp.status().as_u16();
+    if st >= 300 {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("{c}/{o} is not readable ({st})") })),
+        )
+            .into_response();
+    }
+    let rh = resp.headers().clone();
+    let body = resp.bytes().await.unwrap_or_default();
+    let total: u64 = hv(&rh, "content-range")
+        .rsplit('/')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| hv(&rh, "content-length").parse().unwrap_or(0));
+    let text = String::from_utf8_lossy(&body).into_owned();
+    let text = text.lines().take(lines as usize).collect::<Vec<_>>().join("\n");
+    Json(json!({
+        "ok": true,
+        "dataset": c,
+        "object": o,
+        "bytes_read": body.len(),
+        "bytes_total": total,
+        "complete": total > 0 && body.len() as u64 >= total,
+        "sample": text,
+    }))
+    .into_response()
+}
+
 pub async fn jobs(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let (sid, _) = match lab::require_lab_api(&state, &headers) {
         Ok(v) => v,
@@ -2928,12 +2983,13 @@ mod tests {
         a.inputs = vec!["jobs/job-1785322045-a3f19c/inputs/orders.csv".into()];
         j.artifacts.push(a);
         let r = report(vec![j]);
-        let s = lineage_svg("en", &r, r.scanned_at);
-        assert!(s.starts_with("<svg") && s.ends_with("</svg>"));
+        let s = lineage_mount("en", &r, r.scanned_at);
+        assert!(s.contains("wh-lineage") && s.contains("wh-lineage-band"), "{s}");
+        assert!(!s.contains("ix-host"), "lineage is server HTML, not a JS mount");
         assert!(s.contains("orders.csv") && s.contains("job-1785322045-a3f19c") && s.contains("daily.csv"));
         // One edge in, one edge out.
-        assert_eq!(s.matches("class=\"wh-e").count(), 2, "{s}");
-        assert!(lineage_svg("en", &report(vec![]), 0).is_empty());
+        assert!(s.contains("orders.csv") && s.contains("daily.csv"), "{s}");
+        assert!(lineage_mount("en", &report(vec![]), 0).is_empty());
     }
 
     #[test]
@@ -2943,7 +2999,7 @@ mod tests {
         a.inputs = vec!["jobs/job-1785322045-a3f19c/inputs/vanished.csv".into()];
         j.artifacts.push(a);
         let r = report(vec![j]);
-        let s = lineage_svg("en", &r, r.scanned_at);
+        let s = lineage_mount("en", &r, r.scanned_at);
         assert!(s.contains("vanished.csv"));
         assert!(s.contains("wh-n-gone"), "a missing input reads differently from a present one");
     }
@@ -3084,7 +3140,9 @@ mod tests {
             for cap in ["wh.v.", "wh.th.", "wh.sec.", "wh.g.", "wh.act.", "wh.mcp.", "wh.t.", "wh.st."] {
                 assert!(!h.contains(cap), "{lang} leaked {cap}");
             }
-            assert!(h.contains("<svg class=\"wh-svg\""), "{lang} lost the lineage graph");
+            assert!(h.contains("wh-lineage"), "{lang} lost the lineage graph");
+            assert!(h.contains("data-wh-obj="), "{lang} lost clickable object preview");
+            assert!(h.contains("id=\"dlg-wh-preview\""), "{lang} lost the preview dialog");
             assert!(h.contains("id=\"wh-exp-data\""), "{lang} lost the expiry payload");
         }
     }

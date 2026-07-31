@@ -7,6 +7,7 @@
 mod admin;
 mod capsule;
 mod chaos;
+mod debt;
 mod economist;
 mod files_api;
 mod i18n;
@@ -350,6 +351,8 @@ async fn main() {
         .route("/lab/api/node/status", get(nodeops::status))
         .route("/lab/api/node/down", post(nodeops::down))
         .route("/lab/api/node/up", post(nodeops::up))
+        .route("/lab/debt", get(debt::page))
+        .route("/lab/api/debt/snapshot", get(debt::snapshot))
         .route("/lab/ring", get(pages::lab_ring))
         .route("/lab/policy", get(pages::lab_policy))
         .route("/lab/api/policy/defaults", get(policyapi::defaults))
@@ -379,8 +382,10 @@ async fn main() {
         .route("/lab/api/shadow/run", post(shadow::run))
         .route("/lab/api/shadow/corpus", get(shadow::corpus))
         .route("/lab/api/shadow/replay", post(shadow::replay))
+        .route("/lab/api/shadow/mutate", post(shadow::mutate))
         .route("/lab/warehouse", get(warehouse::page))
         .route("/lab/api/warehouse/jobs", get(warehouse::jobs))
+        .route("/lab/api/warehouse/sample", get(warehouse::sample))
         .route("/lab/api/warehouse/job", post(warehouse::create_job))
         .route("/lab/api/warehouse/promote", post(warehouse::promote))
         .route("/mcp", post(warehouse::mcp))

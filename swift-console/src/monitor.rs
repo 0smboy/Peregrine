@@ -94,6 +94,7 @@ struct Dash {
 // optional node filter, before querying.
 const PANELS: &[Panel] = &[
     // ---- cluster overview ----
+    // "Nodes up" means hosts with a live node_exporter scrape — not Swift units.
     Panel { id: "nodes_up", title: "mon.p.nodes_up", src: Src::Instant, unit: Unit::Num, wide: false, drill: "nodes_up_range",
         series: &[("", "count(up{job=\"node\"} == 1) OR on() vector(0)")] },
     Panel { id: "reqs", title: "mon.p.reqs", src: Src::Instant, unit: Unit::ReqS, wide: false, drill: "reqs_method",
@@ -547,8 +548,8 @@ fn panel_meta(lang: &str, p: &Panel) -> Value {
         Src::SvcGrid => "svcgrid",
         _ => "series",
     };
-    let node_scoped = p.src == Src::SvcGrid
-        || p.series.iter().any(|(_, q)| q.contains("{nf}"));
+    let node_scoped =
+        p.src == Src::SvcGrid || p.series.iter().any(|(_, q)| q.contains("{nf}"));
     json!({
         "id": p.id,
         "title": crate::i18n::t(lang, p.title),

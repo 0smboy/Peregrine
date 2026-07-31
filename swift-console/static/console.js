@@ -80,6 +80,12 @@
       b.setAttribute("aria-pressed", on ? "true" : "false");
     });
     syncDeployFrame();
+    // Canvas paints resolved hexes; force a redraw after the token arm flips.
+    try {
+      if (window.CHART && typeof window.CHART.onThemeChange === "function") {
+        window.CHART.onThemeChange();
+      }
+    } catch (e) { /* charts not mounted yet */ }
   }
 
   // Bind by action, not by class: the language switch is a sibling form that
@@ -244,10 +250,172 @@
       });
   });
 
+  // ------------------------------------------------------- list pagination
+  // Client-side pages over the server-rendered rows so the existing filter
+  // still searches the full loaded set. Page size persists in localStorage.
+  function bindListPager(opts) {
+    var table = $(opts.table);
+    var nav = $(opts.pager);
+    if (!table || !nav) return null;
+    var tbody = table.tBodies[0];
+    if (!tbody) return null;
+    var PER_KEY = "sc_list_per";
+    var perChoices = [25, 50, 100, 200];
+    function readPer() {
+      var n = parseInt(localStorage.getItem(PER_KEY) || "", 10);
+      return perChoices.indexOf(n) >= 0 ? n : 50;
+    }
+    function readPage() {
+      try {
+        var u = new URL(location.href);
+        var p = parseInt(u.searchParams.get("page") || "1", 10);
+        return isFinite(p) && p > 0 ? p : 1;
+      } catch (e) { return 1; }
+    }
+    function writePage(p) {
+      try {
+        var u = new URL(location.href);
+        if (p <= 1) u.searchParams.delete("page");
+        else u.searchParams.set("page", String(p));
+        history.replaceState(null, "", u.pathname + u.search + u.hash);
+      } catch (e) { /* ignore */ }
+    }
+    var state = { page: readPage(), per: readPer(), q: "" };
+    function allRows() {
+      return Array.prototype.slice.call(tbody.querySelectorAll("tr"));
+    }
+    function matchRow(tr) {
+      if (opts.systemSelector && tr.matches(opts.systemSelector)) return true;
+      if (!state.q) return true;
+      var name = (tr.dataset.name || tr.dataset.bucket || "").toLowerCase();
+      if (!name && opts.nameFromRow) name = opts.nameFromRow(tr);
+      return name.indexOf(state.q) !== -1;
+    }
+    function render() {
+      var rows = allRows();
+      var sys = [];
+      var matched = [];
+      rows.forEach(function (tr) {
+        if (opts.systemSelector && tr.matches(opts.systemSelector)) sys.push(tr);
+        else if (matchRow(tr)) matched.push(tr);
+        else tr.style.display = "none";
+      });
+      var total = matched.length;
+      var pages = Math.max(1, Math.ceil(total / state.per) || 1);
+      if (state.page > pages) state.page = pages;
+      if (state.page < 1) state.page = 1;
+      var start = (state.page - 1) * state.per;
+      var end = Math.min(start + state.per, total);
+      matched.forEach(function (tr, i) {
+        tr.style.display = (i >= start && i < end) ? "" : "none";
+      });
+      // System rows (trash / *_segments) stay visible under the current page.
+      sys.forEach(function (tr) { tr.style.display = ""; });
+      writePage(state.page);
+      var showPager = total > perChoices[0] || state.per !== 50 || state.page > 1;
+      if (!showPager && total <= state.per) {
+        nav.hidden = true;
+        nav.innerHTML = "";
+        return;
+      }
+      nav.hidden = false;
+      var rangeTxt = T("{a}–{b} of {n}", "第 {a}–{b} 条，共 {n} 条")
+        .replace("{a}", total ? String(start + 1) : "0")
+        .replace("{b}", String(end))
+        .replace("{n}", String(total));
+      var pageTxt = T("Page {p} / {m}", "第 {p} / {m} 页")
+        .replace("{p}", String(state.page))
+        .replace("{m}", String(pages));
+      var perOpts = perChoices.map(function (n) {
+        return "<option value=\"" + n + "\"" + (n === state.per ? " selected" : "") + ">" + n + "</option>";
+      }).join("");
+      // Compact page buttons: window around current.
+      var buttons = [];
+      var i, lo = Math.max(1, state.page - 2), hi = Math.min(pages, state.page + 2);
+      if (lo > 1) {
+        buttons.push(1);
+        if (lo > 2) buttons.push("…");
+      }
+      for (i = lo; i <= hi; i++) buttons.push(i);
+      if (hi < pages) {
+        if (hi < pages - 1) buttons.push("…");
+        buttons.push(pages);
+      }
+      var nums = buttons.map(function (b) {
+        if (b === "…") return "<span class=\"pager-gap\">…</span>";
+        return "<button type=\"button\" class=\"pager-num" + (b === state.page ? " active" : "") +
+          "\" data-page=\"" + b + "\">" + b + "</button>";
+      }).join("");
+      nav.innerHTML =
+        "<div class=\"pager-meta\">" +
+          "<span class=\"pager-range\">" + rangeTxt + "</span>" +
+          "<label class=\"pager-per\">" + T("Per page", "每页") +
+          " <select class=\"pager-per-sel\">" + perOpts + "</select></label>" +
+        "</div>" +
+        "<div class=\"pager-nav\">" +
+          "<button type=\"button\" class=\"pager-btn\" data-nav=\"prev\"" +
+            (state.page <= 1 ? " disabled" : "") + ">" + T("Previous", "上一页") + "</button>" +
+          "<span class=\"pager-pages\">" + nums + "</span>" +
+          "<span class=\"pager-page\">" + pageTxt + "</span>" +
+          "<button type=\"button\" class=\"pager-btn\" data-nav=\"next\"" +
+            (state.page >= pages ? " disabled" : "") + ">" + T("Next", "下一页") + "</button>" +
+        "</div>";
+      var sel = $(".pager-per-sel", nav);
+      if (sel) sel.addEventListener("change", function () {
+        state.per = parseInt(sel.value, 10) || 50;
+        try { localStorage.setItem(PER_KEY, String(state.per)); } catch (e) { /* ignore */ }
+        state.page = 1;
+        render();
+      });
+      nav.querySelectorAll("[data-nav]").forEach(function (b) {
+        b.addEventListener("click", function () {
+          if (b.dataset.nav === "prev" && state.page > 1) { state.page--; render(); }
+          if (b.dataset.nav === "next" && state.page < pages) { state.page++; render(); }
+        });
+      });
+      nav.querySelectorAll(".pager-num").forEach(function (b) {
+        b.addEventListener("click", function () {
+          state.page = parseInt(b.dataset.page, 10) || 1;
+          render();
+        });
+      });
+    }
+    function setQuery(q) {
+      state.q = (q || "").toLowerCase();
+      state.page = 1;
+      render();
+    }
+    render();
+    return { setQuery: setQuery, render: render };
+  }
+
+  if (PAGE === "buckets") {
+    bindListPager({
+      table: "#bucket-table",
+      pager: "#bucket-pager",
+      systemSelector: "tr.muted-row",
+      nameFromRow: function (tr) {
+        return ((tr.dataset.bucket || "") + " " + (tr.textContent || "")).toLowerCase();
+      }
+    });
+  }
+
   // ------------------------------------------------------------ objects page
+
+  var objPager = null;
+  if (PAGE === "objects") {
+    objPager = bindListPager({
+      table: "#obj-table",
+      pager: "#obj-pager"
+    });
+  }
 
   var filter = $("#filter");
   if (filter) filter.addEventListener("input", function () {
+    if (objPager) {
+      objPager.setQuery(filter.value);
+      return;
+    }
     var q = filter.value.toLowerCase();
     $$("#obj-table tbody tr").forEach(function (tr) {
       var name = (tr.dataset.name || "").toLowerCase();
@@ -804,12 +972,8 @@
   // Native, white-labeled dashboards. Everything is drawn from neutral JSON
   // served by /monitor/api/*; the client never learns the backend.
   // ------------------------------------------------------------- charts
-  // Hand-drawn SVG kit, shared by Monitor and the Lab surfaces. Colours
-  // live in CSS (.mon-s1..6) so everything re-themes with no re-render.
-  var SVGNS = "http://www.w3.org/2000/svg";
-  // Series colours live in CSS (.mon-s1..6) so they follow the theme with
-  // no re-render. They cannot be read from JS: getPropertyValue returns the
-  // literal "light-dark(a, b)" string, not the resolved colour.
+  // Canvas + HTML mounts with a shared floating tip. SVG is not used for charts.
+  var SVGNS = "http://www.w3.org/2000/svg"; // icons only elsewhere
 
   function fmtNum(v) {
     if (v == null || isNaN(v)) return "–";
@@ -846,12 +1010,126 @@
     return e;
   }
 
+  // Canvas cannot paint `light-dark(...)` or raw `var(--x)`. Keep a mirror of
+  // the CSS token table and pick the arm from data-theme / prefers-color-scheme.
+  // A live probe is a last resort only — probes often resolve the light arm.
+  var THEME_TOKENS = {
+    light: {
+      ink: "#212723", mut: "#5f6a63", faint: "#8b958d",
+      line: "#dfe5e0", "line-soft": "#e9eeea", "line-strong": "#d0d8d2",
+      "accent-ink": "#1d7a50",
+      chart: ["#3a9d6e", "#3f78a8", "#b0813a", "#3f8f86", "#b3564a", "#6b7280"]
+    },
+    dark: {
+      ink: "#e2e7e3", mut: "#9ba69f", faint: "#848f88",
+      line: "#2f372f", "line-soft": "#262d27", "line-strong": "#3d463e",
+      "accent-ink": "#5cd6a1",
+      chart: ["#5cbf92", "#74a8cf", "#cba566", "#63b5aa", "#d5867c", "#98a29b"]
+    }
+  };
+  function themeName() {
+    var t = document.documentElement.getAttribute("data-theme");
+    if (t === "dark" || t === "light") return t;
+    try {
+      if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) return "dark";
+    } catch (e) { /* ignore */ }
+    return "light";
+  }
+  var _colorCache = {};
+  function tokenColor(name, fallback) {
+    var tok = THEME_TOKENS[themeName()];
+    var bare = String(name || "").replace(/^--/, "");
+    if (bare.indexOf("chart-") === 0) {
+      var idx = parseInt(bare.slice(6), 10) - 1;
+      if (idx >= 0 && idx < tok.chart.length) return tok.chart[idx];
+    }
+    if (tok[bare]) return tok[bare];
+    return fallback;
+  }
+  function seriesColor(i) {
+    var n = (i % 6) + 1;
+    var key = "ser:" + themeName() + ":" + n;
+    if (_colorCache[key]) return _colorCache[key];
+    _colorCache[key] = tokenColor("--chart-" + n, THEME_TOKENS.dark.chart[n - 1]);
+    return _colorCache[key];
+  }
+  function cssVar(name, fallback) {
+    var key = "var:" + themeName() + ":" + name;
+    if (_colorCache[key]) return _colorCache[key];
+    var c = tokenColor(name, fallback);
+    _colorCache[key] = c || fallback;
+    return _colorCache[key];
+  }
+  try {
+    new MutationObserver(function () { _colorCache = {}; }).observe(document.documentElement, {
+      attributes: true, attributeFilter: ["data-theme", "class", "style"]
+    });
+  } catch (e) { /* older engines */ }
+  var CANVAS_FONT = "11px ui-sans-serif, system-ui, -apple-system, sans-serif";
+  function roundRect(ctx, x, y, w, h, r) {
+    if (w < 1) w = 1;
+    if (h < 1) { ctx.fillRect(x, y, w, Math.max(h, 1)); return; }
+    r = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  var tipEl = null;
+  // Modal <dialog> paints in the top layer; a tip on <body> sits underneath and
+  // looks "missing". Always host the tip inside the open dialog when present.
+  function tipHost() {
+    var open = document.querySelector("dialog[open]");
+    return open || document.body;
+  }
+  function tipEnsure() {
+    if (!tipEl) {
+      tipEl = document.createElement("div");
+      tipEl.className = "ix-tip";
+      tipEl.hidden = true;
+    }
+    var host = tipHost();
+    if (tipEl.parentNode !== host) host.appendChild(tipEl);
+    return tipEl;
+  }
+  function tipShow(clientX, clientY, html) {
+    var el = tipEnsure();
+    el.innerHTML = html;
+    el.hidden = false;
+    var pad = 12, tw = el.offsetWidth, th = el.offsetHeight;
+    var x = clientX + pad, y = clientY + pad;
+    if (x + tw > window.innerWidth - 8) x = clientX - tw - pad;
+    if (y + th > window.innerHeight - 8) y = clientY - th - pad;
+    el.style.left = Math.max(4, x) + "px";
+    el.style.top = Math.max(4, y) + "px";
+  }
+  function tipHide() { if (tipEl) tipEl.hidden = true; }
+  document.addEventListener("close", function (ev) {
+    if (ev.target && ev.target.tagName === "DIALOG") tipHide();
+  }, true);
+  window.ixTipShow = tipShow;
+  window.ixTipHide = tipHide;
+  function bindTip(el, textFn) {
+    el.addEventListener("mousemove", function (ev) {
+      var t = typeof textFn === "function" ? textFn(ev) : textFn;
+      if (t) tipShow(ev.clientX, ev.clientY, t);
+      else tipHide();
+    });
+    el.addEventListener("mouseleave", tipHide);
+  }
+
   function lineChart(body, resp, unit, opts) {
     opts = opts || {};
     var series = (resp.series || []).filter(function (s) { return s.points && s.points.length; });
     var legend = [];
     if (!series.length) { body.innerHTML = '<div class="mon-empty">' + T("No data in range", "该区间内没有数据") + '</div>'; return legend; }
     var W = Math.max(body.clientWidth || 600, 260), H = opts.h || 172;
+    var dpr = window.devicePixelRatio || 1;
     var padR = 12, padT = 10, padB = 22;
     var minT = Infinity, maxT = -Infinity, minV = Infinity, maxV = -Infinity;
     series.forEach(function (s) {
@@ -865,42 +1143,812 @@
     if (minV === Infinity) { minV = 0; maxV = 1; }
     if (maxV === minV) maxV = minV + (minV === 0 ? 1 : Math.abs(minV) * 0.2);
     maxV += (maxV - minV) * 0.08;
-    // Size the label gutter to the widest tick actually rendered: a fixed
-    // gutter clips long labels ("110 MiB/s") against the left edge.
     var tickLabels = [];
     for (var ti = 0; ti <= 4; ti++) tickLabels.push(fmtVal(unit, minV + (maxV - minV) * (ti / 4)));
     var widest = tickLabels.reduce(function (m, s) { return Math.max(m, s.length); }, 0);
     var padL = Math.min(Math.max(34, Math.ceil(widest * 5.9) + 12), Math.round(W * 0.34));
     var x = function (t) { return padL + (maxT === minT ? 0 : (t - minT) / (maxT - minT)) * (W - padL - padR); };
     var y = function (v) { return padT + (1 - (v - minV) / (maxV - minV)) * (H - padT - padB); };
-    var s = svg("svg", { viewBox: "0 0 " + W + " " + H, width: W, height: H, class: "mon-svg" });
-    // horizontal gridlines + y labels
+
+    var wrap = document.createElement("div");
+    wrap.className = "ix-canvas-wrap";
+    var canvas = document.createElement("canvas");
+    canvas.className = "mon-canvas";
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    var ctx = canvas.getContext("2d");
+    ctx.scale(dpr, dpr);
+
+    // Match former SVG theme: faint axis labels, soft grid — never raw CSS vars.
+    var axisC = cssVar("--faint", "#848f88");
+    var gridC = cssVar("--line-soft", "#262d27");
     var i, gy, yv;
+    ctx.strokeStyle = gridC; ctx.lineWidth = 1;
+    ctx.font = CANVAS_FONT;
+    ctx.fillStyle = axisC; ctx.textAlign = "end"; ctx.textBaseline = "middle";
     for (i = 0; i <= 4; i++) {
       yv = minV + (maxV - minV) * (i / 4); gy = y(yv);
-      s.appendChild(svg("line", { x1: padL, y1: gy, x2: W - padR, y2: gy, class: "mon-grid-l" }));
-      var lbl = svg("text", { x: padL - 6, y: gy + 3, class: "mon-axis", "text-anchor": "end" });
-      lbl.textContent = tickLabels[i]; s.appendChild(lbl);
+      ctx.beginPath(); ctx.moveTo(padL, gy); ctx.lineTo(W - padR, gy); ctx.stroke();
+      ctx.fillStyle = axisC;
+      ctx.fillText(tickLabels[i], padL - 6, gy);
     }
-    // x time ticks
+    ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
     for (i = 0; i <= 3; i++) {
       var tt = minT + (maxT - minT) * (i / 3), gx = x(tt);
-      var xl = svg("text", { x: gx, y: H - 6, class: "mon-axis", "text-anchor": i === 0 ? "start" : (i === 3 ? "end" : "middle") });
-      xl.textContent = hhmm(tt); s.appendChild(xl);
+      ctx.textAlign = i === 0 ? "start" : (i === 3 ? "end" : "center");
+      ctx.fillStyle = axisC;
+      ctx.fillText(hhmm(tt), gx, H - 6);
     }
-    // series polylines (break on null)
     series.forEach(function (ser, si) {
-      var cls = "mon-s" + ((si % 6) + 1), d = "", pen = false, last = null;
+      var col = seriesColor(si), last = null;
+      ctx.strokeStyle = col; ctx.lineWidth = 1.6; ctx.lineJoin = "round"; ctx.lineCap = "round";
+      ctx.beginPath();
+      var pen = false;
       ser.points.forEach(function (p) {
         if (p[1] == null) { pen = false; return; }
-        d += (pen ? " L" : " M") + x(p[0]).toFixed(1) + " " + y(p[1]).toFixed(1);
-        pen = true; last = p[1];
+        var px = x(p[0]), py = y(p[1]);
+        if (!pen) { ctx.moveTo(px, py); pen = true; }
+        else ctx.lineTo(px, py);
+        last = p[1];
       });
-      if (d) s.appendChild(svg("path", { d: d.trim(), class: "mon-ser " + cls }));
-      legend.push({ name: ser.name, cls: cls, last: last, unit: unit, key: ser.key || null });
+      ctx.stroke();
+      legend.push({ name: ser.name, cls: "mon-s" + ((si % 6) + 1), last: last, unit: unit, key: ser.key || null, color: col });
     });
-    body.innerHTML = ""; body.appendChild(s);
+
+    var overlay = document.createElement("canvas");
+    overlay.className = "mon-canvas-overlay";
+    overlay.width = canvas.width; overlay.height = canvas.height;
+    overlay.style.width = W + "px"; overlay.style.height = H + "px";
+    var octx = overlay.getContext("2d");
+    octx.scale(dpr, dpr);
+
+    function nearest(mx) {
+      var bestT = null, hits = [];
+      series.forEach(function (ser, si) {
+        var bp = null, bd = Infinity;
+        ser.points.forEach(function (p) {
+          if (p[1] == null) return;
+          var d = Math.abs(x(p[0]) - mx);
+          if (d < bd) { bd = d; bp = p; }
+        });
+        if (bp && bd < 28) hits.push({ ser: ser, si: si, p: bp, d: bd });
+      });
+      if (!hits.length) return null;
+      hits.sort(function (a, b) { return a.d - b.d; });
+      bestT = hits[0].p[0];
+      return hits.filter(function (h) { return Math.abs(h.p[0] - bestT) < 1e-9 || Math.abs(x(h.p[0]) - x(bestT)) < 2; });
+    }
+
+    overlay.addEventListener("mousemove", function (ev) {
+      var rect = overlay.getBoundingClientRect();
+      var mx = (ev.clientX - rect.left) * (W / rect.width);
+      var hits = nearest(mx);
+      octx.clearRect(0, 0, W, H);
+      if (!hits) { tipHide(); return; }
+      var tx = x(hits[0].p[0]);
+      octx.strokeStyle = cssVar("--ink", "#e2e7e3"); octx.globalAlpha = 0.35; octx.lineWidth = 1;
+      octx.beginPath(); octx.moveTo(tx, padT); octx.lineTo(tx, H - padB); octx.stroke();
+      octx.globalAlpha = 1;
+      var lines = ["<b>" + hhmmss(hits[0].p[0]) + "</b>"];
+      hits.forEach(function (h) {
+        octx.fillStyle = seriesColor(h.si);
+        octx.beginPath(); octx.arc(x(h.p[0]), y(h.p[1]), 3.5, 0, Math.PI * 2); octx.fill();
+        lines.push('<span style="color:' + seriesColor(h.si) + '">●</span> ' +
+          h.ser.name + ": <b>" + fmtVal(unit, h.p[1]) + "</b>");
+      });
+      tipShow(ev.clientX, ev.clientY, lines.join("<br>"));
+    });
+    overlay.addEventListener("mouseleave", function () { octx.clearRect(0, 0, W, H); tipHide(); });
+
+    wrap.appendChild(canvas); wrap.appendChild(overlay);
+    body.innerHTML = ""; body.appendChild(wrap);
     return legend;
+  }
+
+  function barsChart(host, data) {
+    host.innerHTML = "";
+    if (data.moved != null && data.total != null) {
+      var box = document.createElement("div");
+      box.className = "ix-budget";
+      var track = document.createElement("div");
+      track.className = "ix-budget-track";
+      var fill = document.createElement("div");
+      fill.className = "ix-budget-moved";
+      fill.style.width = Math.max(2, 100 * data.moved / Math.max(data.total, 1)) + "%";
+      track.appendChild(fill);
+      if (data.floor != null) {
+        var floor = document.createElement("div");
+        floor.className = "ix-budget-floor";
+        floor.style.left = Math.min(100, 100 * data.floor / Math.max(data.total, 1)) + "%";
+        floor.title = data.floorLabel || "";
+        track.appendChild(floor);
+      }
+      box.appendChild(track);
+      var meta = document.createElement("div");
+      meta.className = "ix-budget-meta";
+      meta.innerHTML = "<span>" + (data.movedLabel || "") + "</span><span>" + (data.totalLabel || "") + "</span>";
+      box.appendChild(meta);
+      host.appendChild(box);
+      return;
+    }
+    if (data.groups) {
+      var wrap = document.createElement("div");
+      wrap.className = "rs-devchart";
+      data.groups.forEach(function (g) {
+        var grp = document.createElement("div");
+        grp.className = "rs-devgroup";
+        var head = document.createElement("div");
+        head.className = "rs-devnode";
+        head.textContent = g.node + " · " + (g.zone || "");
+        grp.appendChild(head);
+        var maxP = 1;
+        (g.devices || []).forEach(function (d) {
+          maxP = Math.max(maxP, d.before || 0, d.after || 0, d.ideal || 0);
+        });
+        (g.devices || []).forEach(function (d) {
+          var row = document.createElement("div");
+          row.className = "rs-devrow";
+          var lab = document.createElement("span"); lab.className = "rs-devlab"; lab.textContent = d.device;
+          var bars = document.createElement("div"); bars.className = "rs-devbars";
+          var b1 = document.createElement("div"); b1.className = "rs-bar before";
+          b1.style.width = Math.max(2, 100 * (d.before || 0) / maxP) + "%";
+          var b2 = document.createElement("div"); b2.className = "rs-bar after";
+          b2.style.width = Math.max(2, 100 * (d.after || 0) / maxP) + "%";
+          bars.appendChild(b1); bars.appendChild(b2);
+          var tail = document.createElement("span"); tail.className = "rs-devtail";
+          var delta = (d.delta || 0);
+          tail.textContent = (delta > 0 ? "+" : "") + delta + " · " + (d.balance || "") + " · " + (d.state || "");
+          row.appendChild(lab); row.appendChild(bars); row.appendChild(tail);
+          bindTip(row, d.tip || d.device);
+          grp.appendChild(row);
+        });
+        wrap.appendChild(grp);
+      });
+      host.appendChild(wrap);
+      return;
+    }
+    var wrap = document.createElement("div");
+    wrap.className = "ix-canvas-wrap";
+    var items = data.items || [];
+    var W = Math.max(host.clientWidth || 600, 280);
+    var dpr = window.devicePixelRatio || 1;
+    var n = Math.max(items.length, 1);
+    var max = 0;
+    items.forEach(function (it) { if (it.value > max) max = it.value; });
+    if (max <= 0) max = 1;
+    var axisC = cssVar("--faint", "#848f88");
+    var ink = cssVar("--ink", "#e2e7e3");
+    var mut = cssVar("--mut", "#9ba69f");
+    var gridC = cssVar("--line-soft", "#262d27");
+    // Long category labels need angle + taller bottom; short ones stay flat.
+    var longest = 0;
+    items.forEach(function (it) {
+      var L = String(it.label || "").length;
+      if (L > longest) longest = L;
+    });
+    var angled = n >= 6 || longest > 8 || (n * 72 > W);
+    var padL = 48, padR = 14, padT = 22, padB = angled ? 64 : 36;
+    var H = data.h || (angled ? 260 : 220);
+    var track = W - padL - padR;
+    var gap = Math.max(4, Math.min(14, track / (n * 6)));
+    var bw = Math.max(8, (track - gap * (n - 1)) / n);
+    var showVals = bw >= 36 && n <= 10;
+    var canvas = document.createElement("canvas");
+    canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+    canvas.style.width = W + "px"; canvas.style.height = H + "px";
+    var ctx = canvas.getContext("2d");
+    ctx.scale(dpr, dpr);
+    ctx.font = CANVAS_FONT;
+    ctx.strokeStyle = gridC; ctx.lineWidth = 1;
+    for (var gi = 0; gi <= 3; gi++) {
+      var gv = max * (gi / 3), gy = padT + (1 - gi / 3) * (H - padT - padB);
+      ctx.beginPath(); ctx.moveTo(padL, gy); ctx.lineTo(W - padR, gy); ctx.stroke();
+      ctx.fillStyle = axisC;
+      ctx.textAlign = "end"; ctx.textBaseline = "middle";
+      ctx.fillText(fmtNum(gv), padL - 8, gy);
+    }
+    var hit = [];
+    items.forEach(function (it, i) {
+      var x0 = padL + i * (bw + gap);
+      var bh = (it.value / max) * (H - padT - padB);
+      var y0 = H - padB - bh;
+      var col = seriesColor(it.colorIndex != null ? it.colorIndex : i);
+      ctx.globalAlpha = it.dim ? 0.4 : 0.92;
+      ctx.fillStyle = col;
+      roundRect(ctx, x0, y0, bw, Math.max(bh, 2), Math.min(4, bw / 2));
+      ctx.globalAlpha = 1;
+      var lab = String(it.label || "");
+      var maxChars = angled ? 14 : Math.max(4, Math.floor(bw / 7));
+      if (lab.length > maxChars) lab = lab.slice(0, maxChars - 1) + "…";
+      var cx = x0 + bw / 2;
+      ctx.fillStyle = mut;
+      if (angled) {
+        ctx.save();
+        ctx.translate(cx, H - padB + 10);
+        ctx.rotate(-Math.PI / 4);
+        ctx.textAlign = "right"; ctx.textBaseline = "middle";
+        ctx.fillText(lab, 0, 0);
+        ctx.restore();
+      } else {
+        ctx.textAlign = "center"; ctx.textBaseline = "top";
+        ctx.fillText(lab, cx, H - padB + 8);
+      }
+      if (showVals && it.display) {
+        ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+        ctx.fillStyle = ink;
+        ctx.fillText(it.display, cx, y0 - 4);
+      }
+      hit.push({
+        x0: x0, x1: x0 + bw, y0: Math.min(y0, H - padB) - 12, y1: H - padB + (angled ? 40 : 16),
+        tip: it.tip || ((it.label || "") + ": " + (it.display || it.value))
+      });
+    });
+    wrap.appendChild(canvas);
+    host.appendChild(wrap);
+    canvas.addEventListener("mousemove", function (ev) {
+      var rect = canvas.getBoundingClientRect();
+      var mx = (ev.clientX - rect.left) * (W / rect.width);
+      var my = (ev.clientY - rect.top) * (H / rect.height);
+      for (var i = 0; i < hit.length; i++) {
+        var h = hit[i];
+        if (mx >= h.x0 && mx <= h.x1 && my >= h.y0 && my <= h.y1) {
+          tipShow(ev.clientX, ev.clientY, h.tip); return;
+        }
+      }
+      tipHide();
+    });
+    canvas.addEventListener("mouseleave", tipHide);
+  }
+
+    function hbarChart(host, data) {
+    host.innerHTML = "";
+    var box = document.createElement("div");
+    box.className = "ix-hbar";
+    var items = data.items || [];
+    var max = data.limit || 0;
+    items.forEach(function (it) { if (it.value > max) max = it.value; if (it.ideal > max) max = it.ideal; });
+    max = max * 1.08 || 1;
+    items.forEach(function (it, i) {
+      var row = document.createElement("div");
+      row.className = "ix-hbar-row" + (it.dim ? " pe-dim" : "") + (it.tone ? " " + it.tone : "");
+      var lab = document.createElement("span"); lab.className = "ix-hbar-l"; lab.textContent = it.label;
+      lab.title = it.label || "";
+      var track = document.createElement("div"); track.className = "ix-hbar-track";
+      if (data.limit != null) {
+        var lim = document.createElement("div");
+        lim.className = "ix-hbar-limit";
+        lim.style.left = (100 * data.limit / max) + "%";
+        track.appendChild(lim);
+      }
+      if (it.ideal != null) {
+        var ideal = document.createElement("div");
+        ideal.className = "ix-hbar-ideal";
+        ideal.style.left = Math.min(100, 100 * it.ideal / max) + "%";
+        track.appendChild(ideal);
+      }
+      var bar = document.createElement("div");
+      bar.className = "ix-hbar-fill" + (it.ok === false ? " warn" : "");
+      // Prefer CSS series class so light-dark() resolves in the stylesheet;
+      // inline colour is a canvas-safe hex from the theme token table.
+      var ci = it.colorIndex != null ? it.colorIndex : i;
+      bar.classList.add("mon-s" + ((ci % 6) + 1));
+      bar.style.background = seriesColor(ci);
+      bar.style.width = Math.max(2, 100 * it.value / max) + "%";
+      track.appendChild(bar);
+      var val = document.createElement("span"); val.className = "ix-hbar-v";
+      val.textContent = it.display || fmtNum(it.value);
+      row.appendChild(lab); row.appendChild(track); row.appendChild(val);
+      var tip = it.tip || (it.label + ": " + (it.display || it.value));
+      if (data.limitLabel && data.limit != null) tip += " · " + data.limitLabel;
+      bindTip(row, tip);
+      box.appendChild(row);
+    });
+    host.appendChild(box);
+  }
+
+  function scatterChart(host, data) {
+    // { points:[{label,x,y,r,state,pick,tip}], targetY?, xLabel?, yLabel? }
+    host.innerHTML = "";
+    var pts = data.points || [];
+    if (!pts.length) return;
+    var W = Math.max(host.clientWidth || 640, 300), H = data.h || 280;
+    var dpr = window.devicePixelRatio || 1;
+    var padL = 48, padR = 24, padT = 20, padB = 36;
+    var minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    pts.forEach(function (p) {
+      if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+    });
+    if (data.targetY != null) { if (data.targetY < minY) minY = data.targetY; if (data.targetY > maxY) maxY = data.targetY; }
+    if (maxX === minX) maxX = minX + 1;
+    if (maxY === minY) maxY = minY + 1;
+    minX -= (maxX - minX) * 0.08; maxX += (maxX - minX) * 0.08;
+    minY -= (maxY - minY) * 0.1; maxY += (maxY - minY) * 0.1;
+    var X = function (v) { return padL + (v - minX) / (maxX - minX) * (W - padL - padR); };
+    var Y = function (v) { return padT + (1 - (v - minY) / (maxY - minY)) * (H - padT - padB); };
+    var wrap = document.createElement("div"); wrap.className = "ix-canvas-wrap";
+    var canvas = document.createElement("canvas");
+    canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+    canvas.style.width = W + "px"; canvas.style.height = H + "px";
+    var ctx = canvas.getContext("2d");
+    ctx.scale(dpr, dpr);
+    var axisC = cssVar("--faint", "#848f88");
+    var mut = cssVar("--mut", "#9ba69f");
+    var ink = cssVar("--ink", "#e2e7e3");
+    var accent = cssVar("--accent-ink", "#5cd6a1");
+    ctx.strokeStyle = cssVar("--line-soft", "#262d27"); ctx.fillStyle = axisC; ctx.font = CANVAS_FONT;
+    for (var i = 0; i <= 3; i++) {
+      var yy = minY + (maxY - minY) * (i / 3), gy = Y(yy);
+      ctx.beginPath(); ctx.moveTo(padL, gy); ctx.lineTo(W - padR, gy); ctx.stroke();
+      ctx.fillStyle = axisC;
+      ctx.textAlign = "end"; ctx.textBaseline = "middle"; ctx.fillText(fmtNum(yy), padL - 6, gy);
+      var xx = minX + (maxX - minX) * (i / 3), gx = X(xx);
+      ctx.textAlign = i === 0 ? "start" : (i === 3 ? "end" : "center");
+      ctx.textBaseline = "alphabetic"; ctx.fillText(fmtNum(xx), gx, H - 10);
+    }
+    if (data.targetY != null) {
+      var ty = Y(data.targetY);
+      ctx.setLineDash([4, 3]); ctx.strokeStyle = accent;
+      ctx.beginPath(); ctx.moveTo(padL, ty); ctx.lineTo(W - padR, ty); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = accent;
+      ctx.textAlign = "start"; ctx.fillText(data.targetLabel || ("target " + fmtNum(data.targetY)), padL + 4, ty - 6);
+    }
+    var maxR = 0;
+    pts.forEach(function (p) { if ((p.r || 0) > maxR) maxR = p.r; });
+    var hit = [];
+    pts.forEach(function (p, i) {
+      var cx = X(p.x), cy = Y(p.y);
+      var r = maxR > 0 ? 5 + 16 * Math.sqrt((p.r || 0) / maxR) : 8;
+      var col = p.state === "ok" ? seriesColor(0) : (p.state === "miss" ? seriesColor(2) : mut);
+      if (p.pick) {
+        ctx.strokeStyle = accent; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.arc(cx, cy, r + 4, 0, Math.PI * 2); ctx.stroke();
+      }
+      ctx.globalAlpha = p.state === "out" ? 0.35 : 0.7;
+      ctx.fillStyle = col; ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = ink;
+      ctx.font = (p.pick ? "600 " : "") + CANVAS_FONT;
+      ctx.textAlign = cx > W - padR - 40 ? "end" : "start";
+      ctx.fillText(p.label, cx + (cx > W - padR - 40 ? -r - 5 : r + 5), cy + 3);
+      hit.push({ cx: cx, cy: cy, r: r + 6, tip: p.tip || p.label });
+    });
+    wrap.appendChild(canvas); host.appendChild(wrap);
+    canvas.addEventListener("mousemove", function (ev) {
+      var rect = canvas.getBoundingClientRect();
+      var mx = (ev.clientX - rect.left) * (W / rect.width);
+      var my = (ev.clientY - rect.top) * (H / rect.height);
+      for (var i = 0; i < hit.length; i++) {
+        var h = hit[i], dx = mx - h.cx, dy = my - h.cy;
+        if (dx * dx + dy * dy <= h.r * h.r) { tipShow(ev.clientX, ev.clientY, h.tip); return; }
+      }
+      tipHide();
+    });
+    canvas.addEventListener("mouseleave", tipHide);
+  }
+
+  function flowChart(host, data) {
+    // Sankey-style ribbons: sources left → destinations right. Width = slots.
+    // Falls back to ranked rows only when endpoint lists are missing.
+    host.innerHTML = "";
+    var box = document.createElement("div");
+    box.className = "ix-flow-wrap";
+    var sources = data.sources || [];
+    var dests = data.dests || [];
+    var ribbons = data.ribbons || [];
+    if (!ribbons.length) {
+      host.appendChild(box);
+      return;
+    }
+
+    if (sources.length && dests.length) {
+      var total = 0;
+      sources.forEach(function (s) { total += s.sum || 0; });
+      if (!total) ribbons.forEach(function (r) { total += r.slots || 0; });
+      var W = Math.max(host.clientWidth || 720, 560);
+      var labW = Math.min(200, Math.max(140, Math.floor(W * 0.22)));
+      var colW = 10;
+      var rowGap = 8;
+      var innerH = Math.max(sources.length, dests.length) * 34 + 20;
+      var H = innerH + 16;
+      var x1 = labW, x2 = W - labW;
+      var sy = {}, dy = {};
+      function pack(list, yMap) {
+        var scale = (innerH - rowGap * Math.max(list.length - 1, 0)) / Math.max(total, 1);
+        var y = 10;
+        list.forEach(function (e) {
+          var h = Math.max((e.sum || 0) * scale, 4);
+          yMap[e.id] = { y: y, h: h, off: 0, sum: e.sum || 0, label: e.label || String(e.id) };
+          y += h + rowGap;
+        });
+      }
+      pack(sources, sy);
+      pack(dests, dy);
+
+      var s = svg("svg", {
+        viewBox: "0 0 " + W + " " + H,
+        width: "100%",
+        class: "rs-flow",
+        "aria-label": data.title || "flow"
+      });
+      function endpoint(list, yMap, isSrc) {
+        list.forEach(function (e) {
+          var m = yMap[e.id];
+          if (!m) return;
+          s.appendChild(svg("rect", {
+            x: isSrc ? x1 - colW : x2, y: m.y, width: colW, height: m.h, rx: 2,
+            class: isSrc ? "rs-fl-src" : "rs-fl-dst"
+          }));
+          var lab = svg("text", {
+            x: isSrc ? x1 - colW - 8 : x2 + colW + 8,
+            y: m.y + m.h / 2,
+            "text-anchor": isSrc ? "end" : "start",
+            "dominant-baseline": "central",
+            class: "rs-fl-lab"
+          });
+          lab.textContent = m.label;
+          s.appendChild(lab);
+        });
+      }
+      endpoint(sources, sy, true);
+      endpoint(dests, dy, false);
+
+      function sliceH(slots, sum, h) {
+        return Math.max(h * (slots || 0) / Math.max(sum, 1), 2);
+      }
+      ribbons.forEach(function (r) {
+        var sm = sy[r.from], dm = dy[r.to];
+        if (!sm || !dm) return;
+        var sh = sliceH(r.slots, sm.sum, sm.h);
+        var dh = sliceH(r.slots, dm.sum, dm.h);
+        var ys = sm.y + sm.off + sh / 2;
+        var yd = dm.y + dm.off + dh / 2;
+        sm.off += sh; dm.off += dh;
+        var mid = (x1 + x2) / 2;
+        var path = svg("path", {
+          d: "M" + x1 + " " + ys + " C" + mid + " " + ys + " " + mid + " " + yd + " " + x2 + " " + yd,
+          class: "rs-fl-rib",
+          "stroke-width": Math.max((sh + dh) / 2, 1.6),
+          fill: "none"
+        });
+        var tip = r.tip || (sm.label + " → " + dm.label + " · " + (r.bytes || r.slots || ""));
+        path.style.cursor = "crosshair";
+        path.addEventListener("mousemove", function (ev) {
+          tipShow(ev.clientX, ev.clientY, tip);
+        });
+        path.addEventListener("mouseleave", tipHide);
+        s.appendChild(path);
+      });
+      box.appendChild(s);
+    } else {
+      // Ranked row fallback when only ribbon pairs are present.
+      var nameMap = {};
+      sources.forEach(function (s) { nameMap[s.id] = s.label; });
+      dests.forEach(function (d) { nameMap[d.id] = d.label; });
+      var maxSlots = 1;
+      ribbons.forEach(function (r) { if (r.slots > maxSlots) maxSlots = r.slots; });
+      var list = document.createElement("div");
+      list.className = "ix-flow";
+      ribbons.forEach(function (r, i) {
+        var row = document.createElement("div");
+        row.className = "ix-flow-row";
+        var fromLabel = nameMap[r.from] || ("dev " + r.from);
+        var toLabel = nameMap[r.to] || ("dev " + r.to);
+        var a = document.createElement("span"); a.className = "ix-flow-a"; a.textContent = fromLabel;
+        var mid = document.createElement("div"); mid.className = "ix-flow-mid";
+        var band = document.createElement("div");
+        band.className = "ix-flow-band";
+        band.style.height = Math.max(4, Math.min(28, (r.slots || 1) / maxSlots * 22)) + "px";
+        band.style.background = seriesColor(i);
+        mid.appendChild(band);
+        var b = document.createElement("span"); b.className = "ix-flow-b"; b.textContent = toLabel;
+        var meta = document.createElement("span"); meta.className = "ix-flow-m";
+        meta.textContent = (r.bytes || r.slots || "") + "";
+        row.appendChild(a); row.appendChild(mid); row.appendChild(b); row.appendChild(meta);
+        bindTip(row, r.tip || (fromLabel + " → " + toLabel));
+        list.appendChild(row);
+      });
+      box.appendChild(list);
+    }
+
+    if (data.hint || data.note) {
+      var n = document.createElement("p");
+      n.className = "lab-b";
+      n.textContent = data.hint || data.note;
+      box.appendChild(n);
+    }
+    host.appendChild(box);
+  }
+
+  function gridChart(host, data) {
+    // { cols, cells:[{cls,tip,label?}], caption? }
+    host.innerHTML = "";
+    var g = document.createElement("div");
+    g.className = "ix-grid";
+    g.style.gridTemplateColumns = "repeat(" + (data.cols || 16) + ", minmax(0, 1fr))";
+    (data.cells || []).forEach(function (c) {
+      var cell = document.createElement("button");
+      cell.type = "button";
+      cell.className = "ix-grid-c " + (c.cls || "");
+      if (c.label) cell.textContent = c.label;
+      bindTip(cell, c.tip || c.label || "");
+      if (c.href) cell.addEventListener("click", function () { location.href = c.href; });
+      g.appendChild(cell);
+    });
+    host.appendChild(g);
+    if (data.legend && data.legend.length) {
+      var leg = document.createElement("div"); leg.className = "ix-grid-leg";
+      data.legend.forEach(function (item) {
+        var i = document.createElement("span"); i.className = "ix-grid-leg-i";
+        var sw = document.createElement("i"); sw.className = item.cls || "";
+        i.appendChild(sw);
+        i.appendChild(document.createTextNode(item.label || ""));
+        leg.appendChild(i);
+      });
+      host.appendChild(leg);
+    }
+    if (data.caption) {
+      var cap = document.createElement("p"); cap.className = "lab-b"; cap.textContent = data.caption;
+      host.appendChild(cap);
+    }
+  }
+
+  function timelineChart(host, data) {
+    if (data.variant === "chaos") {
+      chaosTimelineChart(host, data);
+      return;
+    }
+    if (data.variant === "pass") {
+      passTimelineChart(host, data);
+      return;
+    }
+    host.innerHTML = "";
+    var lanes = data.lanes || [], events = data.events || [];
+    if (!lanes.length) return;
+    var bands = data.bands || data.offline || [];
+    var minT = Infinity, maxT = -Infinity;
+    events.forEach(function (e) { if (e.t < minT) minT = e.t; if (e.t > maxT) maxT = e.t; });
+    (bands || []).forEach(function (b) {
+      if (b.from < minT) minT = b.from; if (b.to > maxT) maxT = b.to;
+    });
+    if (!isFinite(minT)) return;
+    if (maxT - minT < 120) { var mid = (maxT + minT) / 2; minT = mid - 60; maxT = mid + 60; }
+    var span = maxT - minT; minT -= span * 0.04; maxT += span * 0.04; span = maxT - minT;
+    var box = document.createElement("div"); box.className = "ix-tl";
+    var axis = document.createElement("div"); axis.className = "ix-tl-axis";
+    for (var ti = 0; ti <= 3; ti++) {
+      var t = minT + span * (ti / 3);
+      var tick = document.createElement("span");
+      tick.style.left = (100 * (t - minT) / span) + "%";
+      tick.textContent = hhmm(t);
+      axis.appendChild(tick);
+    }
+    box.appendChild(axis);
+    lanes.forEach(function (lane) {
+      var row = document.createElement("div");
+      row.className = "ix-tl-row" + (lane.role === "client" ? " client" : "");
+      var lab = document.createElement("span"); lab.className = "ix-tl-l"; lab.textContent = lane.label;
+      var track = document.createElement("div"); track.className = "ix-tl-track";
+      (bands || []).forEach(function (b) {
+        if (b.node !== lane.id && b.lane !== lane.id) return;
+        var band = document.createElement("div");
+        band.className = "ix-tl-band";
+        band.style.left = (100 * (b.from - minT) / span) + "%";
+        band.style.width = Math.max(0.3, 100 * (b.to - b.from) / span) + "%";
+        bindTip(band, b.tip || lane.label);
+        track.appendChild(band);
+      });
+      if (data.delete_ts != null) {
+        var rule = document.createElement("div");
+        rule.className = "ix-tl-rule";
+        rule.style.left = (100 * (data.delete_ts - minT) / span) + "%";
+        track.appendChild(rule);
+      }
+      events.forEach(function (e) {
+        if (e.lane !== lane.id) return;
+        var mark = document.createElement("button");
+        mark.type = "button";
+        mark.className = "ix-tl-ev " + (e.kind || "meta");
+        mark.style.left = (100 * (e.t - minT) / span) + "%";
+        bindTip(mark, e.tip || (hhmmss(e.t) + " · " + (e.label || "")));
+        track.appendChild(mark);
+      });
+      row.appendChild(lab); row.appendChild(track);
+      box.appendChild(row);
+    });
+    host.appendChild(box);
+  }
+
+  function chaosTimelineChart(host, data) {
+    host.innerHTML = "";
+    var box = document.createElement("div");
+    box.className = "ix-chaos-tl";
+    var t0 = data.t0 || 0, t1 = data.t1 || 60, span = Math.max(t1 - t0, 1);
+    var xPct = function (off) { return Math.max(0, Math.min(100, 100 * (off - t0) / span)); };
+    if (data.samples && data.samples.length) {
+      var copies = document.createElement("div");
+      copies.className = "ix-chaos-copies";
+      var maxC = data.wanted || 1;
+      data.samples.forEach(function (s) { if (s.copies > maxC) maxC = s.copies; });
+      data.samples.forEach(function (s, i) {
+        var bar = document.createElement("div");
+        bar.className = "ix-chaos-copy-bar";
+        bar.style.left = xPct(s.off) + "%";
+        bar.style.height = Math.max(8, 100 * s.copies / maxC) + "%";
+        bindTip(bar, s.copies + " copies @ " + s.off + "s");
+        copies.appendChild(bar);
+      });
+      box.appendChild(copies);
+    }
+    (data.lanes || []).forEach(function (lane) {
+      var row = document.createElement("div");
+      row.className = "ix-tl-row" + (lane.target ? " target" : "");
+      var lab = document.createElement("span"); lab.className = "ix-tl-l"; lab.textContent = lane.label;
+      var track = document.createElement("div"); track.className = "ix-tl-track";
+      (data.segments || []).forEach(function (seg) {
+        if (seg.lane !== lane.id) return;
+        var band = document.createElement("div");
+        band.className = "ix-chaos-seg " + (seg.cls || "");
+        band.style.left = xPct(seg.from) + "%";
+        band.style.width = Math.max(0.4, xPct(seg.to) - xPct(seg.from)) + "%";
+        track.appendChild(band);
+      });
+      (data.evidence || []).forEach(function (ev) {
+        if (ev.node !== lane.id) return;
+        var mark = document.createElement("span");
+        mark.className = "ix-chaos-work";
+        mark.style.left = xPct(ev.off) + "%";
+        bindTip(mark, ev.tip || "");
+        track.appendChild(mark);
+      });
+      row.appendChild(lab); row.appendChild(track);
+      box.appendChild(row);
+    });
+    host.appendChild(box);
+  }
+
+  function passTimelineChart(host, data) {
+    host.innerHTML = "";
+    var box = document.createElement("div");
+    box.className = "ix-pass-tl";
+    (data.lanes || []).forEach(function (lane) {
+      var row = document.createElement("div");
+      row.className = "ix-tl-row";
+      var lab = document.createElement("span"); lab.className = "ix-tl-l";
+      lab.textContent = lane.node + " · " + lane.daemon;
+      var track = document.createElement("div"); track.className = "ix-tl-track";
+      (data.passes || []).forEach(function (p) {
+        if (p.lane !== lane.id) return;
+        var mark = document.createElement("span");
+        mark.className = "ix-pass-mark" + (p.worked ? " worked" : "") + (p.failures ? " fail" : "") + (p.after ? "" : " base");
+        bindTip(mark, p.tip || "");
+        track.appendChild(mark);
+      });
+      row.appendChild(lab); row.appendChild(track);
+      box.appendChild(row);
+    });
+    host.appendChild(box);
+  }
+
+  function lineageChart(host, data) {
+    host.innerHTML = "";
+    var box = document.createElement("div"); box.className = "ix-lineage-graph";
+    (data.bands || []).forEach(function (band) {
+      var row = document.createElement("div"); row.className = "ix-lineage-band";
+      var ins = document.createElement("div"); ins.className = "ix-lineage-col in";
+      (band.inputs || []).forEach(function (n) {
+        var node = document.createElement("div"); node.className = "ix-lineage-node " + (n.cls || "");
+        node.innerHTML = "<b>" + n.label + "</b><em>" + (n.sub || "") + "</em>";
+        bindTip(node, n.title || n.label);
+        ins.appendChild(node);
+      });
+      if (!(band.inputs || []).length) ins.textContent = band.noInputs || "";
+      var job = document.createElement("div"); job.className = "ix-lineage-job " + ((band.job || {}).cls || "");
+      if (band.job) job.innerHTML = "<b>" + band.job.label + "</b><em>" + (band.job.sub || "") + "</em>";
+      var outs = document.createElement("div"); outs.className = "ix-lineage-col out";
+      (band.outputs || []).forEach(function (n) {
+        var node = document.createElement("div"); node.className = "ix-lineage-node " + (n.cls || "");
+        node.innerHTML = "<b>" + n.label + "</b><em>" + (n.sub || "") + "</em>";
+        bindTip(node, n.title || n.label);
+        outs.appendChild(node);
+      });
+      if (!(band.outputs || []).length) outs.textContent = band.noOutputs || "";
+      row.appendChild(ins); row.appendChild(job); row.appendChild(outs);
+      box.appendChild(row);
+    });
+    host.appendChild(box);
+  }
+
+  function matrixChart(host, data) {
+    host.innerHTML = "";
+    if (data.nodes && data.devices && data.cells) {
+      var table = document.createElement("div"); table.className = "ix-matrix";
+      var head = document.createElement("div"); head.className = "ix-matrix-row head";
+      head.appendChild(document.createElement("span"));
+      data.devices.forEach(function (d) {
+        var c = document.createElement("span"); c.className = "ix-matrix-h"; c.textContent = d;
+        head.appendChild(c);
+      });
+      table.appendChild(head);
+      data.nodes.forEach(function (node, ri) {
+        var row = document.createElement("div"); row.className = "ix-matrix-row";
+        var lab = document.createElement("span"); lab.className = "ix-matrix-l"; lab.textContent = node;
+        row.appendChild(lab);
+        data.devices.forEach(function (dev, ci) {
+          var cell = data.cells.find(function (c) { return c.row === ri && c.col === ci; });
+          var el = document.createElement("span");
+          el.className = "ix-matrix-c " + ((cell && cell.cls) || "oc-c-none");
+          if (cell && cell.label) {
+            el.innerHTML = "<b>" + cell.label + "</b><em>" + (cell.role || "") + "</em>";
+          }
+          bindTip(el, (cell && cell.tip) || node + "/" + dev);
+          row.appendChild(el);
+        });
+        table.appendChild(row);
+      });
+      host.appendChild(table);
+      return;
+    }
+    var table = document.createElement("div"); table.className = "ix-matrix";
+    (data.rows || []).forEach(function (r) {
+      var row = document.createElement("div"); row.className = "ix-matrix-row";
+      var lab = document.createElement("span"); lab.className = "ix-matrix-l"; lab.textContent = r.label;
+      row.appendChild(lab);
+      (r.cells || []).forEach(function (c) {
+        var cell = document.createElement("span");
+        cell.className = "ix-matrix-c " + (c.cls || "");
+        cell.textContent = c.text || "";
+        bindTip(cell, c.tip || c.text || r.label);
+        row.appendChild(cell);
+      });
+      table.appendChild(row);
+    });
+    host.appendChild(table);
+  }
+
+  function hydrateChart(host) {
+    var kind = host.getAttribute("data-ix-chart");
+    var script = host.querySelector('script[type="application/json"]');
+    if (!kind || !script) return;
+    var data;
+    try { data = JSON.parse(script.textContent); } catch (e) { return; }
+    var mount = host.querySelector(".ix-mount");
+    if (!mount) {
+      mount = document.createElement("div");
+      mount.className = "ix-mount";
+      host.insertBefore(mount, script);
+    } else {
+      mount.innerHTML = "";
+    }
+    if (kind === "bars") barsChart(mount, data);
+    else if (kind === "hbar") hbarChart(mount, data);
+    else if (kind === "scatter") scatterChart(mount, data);
+    else if (kind === "flow") flowChart(mount, data);
+    else if (kind === "grid") gridChart(mount, data);
+    else if (kind === "timeline") timelineChart(mount, data);
+    else if (kind === "lineage") lineageChart(mount, data);
+    else if (kind === "matrix") matrixChart(mount, data);
+    else if (kind === "line") lineChart(mount, data, data.unit || "", { h: data.h });
+  }
+
+  function hydrateAll(root) {
+    (root || document).querySelectorAll(".ix-host[data-ix-chart]").forEach(hydrateChart);
+  }
+
+  // pe-brow bars: bind live tip (server HTML charts)
+  function bindPeTips(root) {
+    (root || document).querySelectorAll(".pe-brow[title], .rs-devrow-svg, .ix-hbar-row").forEach(function (el) {
+      if (el._ixTip) return;
+      el._ixTip = true;
+      var t = el.getAttribute("title");
+      if (t) {
+        el.removeAttribute("title");
+        bindTip(el, t);
+      }
+    });
   }
 
   function statTile(body, resp, unit) {
@@ -935,129 +1983,88 @@
   // axis. The gap between a mark on the client lane and the same file's mark on
   // a node lane IS the diagnosis, so the two are never folded into one row.
   function swimlane(host, d) {
-    var lanes = d.lanes || [], events = d.events || [];
-    host.innerHTML = "";
-    if (!lanes.length || !events.length) return;
-    var known = Object.create(null);
-    lanes.forEach(function (l) { known[l.id] = true; });
-    var minT = Infinity, maxT = -Infinity;
-    events.forEach(function (e) {
-      if (e.t < minT) minT = e.t;
-      if (e.t > maxT) maxT = e.t;
+    timelineChart(host, {
+      lanes: d.lanes || [],
+      events: (d.events || []).map(function (e) {
+        return {
+          lane: e.lane, t: e.t, kind: e.kind, label: e.label,
+          tip: (e.tip || (hhmmss(e.t) + "  " + (e.label || "")))
+        };
+      }),
+      bands: d.offline || d.bands || [],
+      delete_ts: d.delete_ts
     });
-    // Only outages that touch this object's own history belong on this axis;
-    // one from yesterday would squash everything that matters into a pixel.
-    var bands = (d.offline || []).filter(function (b) {
-      return known[b.node] && b.to >= minT - 60 && b.from <= maxT + 60;
-    });
-    bands.forEach(function (b) {
-      if (b.from < minT) minT = b.from;
-      if (b.to > maxT) maxT = b.to;
-    });
-    if (maxT - minT < 120) { var mid = (maxT + minT) / 2; minT = mid - 60; maxT = mid + 60; }
-    var span = maxT - minT;
-    minT -= span * 0.04; maxT += span * 0.04; span = maxT - minT;
+  }
 
-    var W = Math.max(host.clientWidth || 720, 320);
-    var rowH = 26, padT = 12, padB = 26, padR = 14;
-    var widest = lanes.reduce(function (m, l) { return Math.max(m, l.label.length); }, 6);
-    var padL = Math.min(Math.max(52, Math.ceil(widest * 6.6) + 14), Math.round(W * 0.34));
-    var H = padT + lanes.length * rowH + padB;
-    var x = function (t) { return padL + (t - minT) / span * (W - padL - padR); };
-    var row = function (i) { return padT + i * rowH + rowH / 2; };
-    // UTC, matching the tables below: the storage nodes and the service log are
-    // both UTC, and a swimlane on browser-local time would put the delete an
-    // hour away from the same delete in the row underneath it.
-    var clock = function (t) {
-      var u = new Date(t * 1000);
-      return pad2(u.getUTCHours()) + ":" + pad2(u.getUTCMinutes()) +
-        (span < 5400 ? ":" + pad2(u.getUTCSeconds()) : "");
-    };
-    var s = svg("svg", { viewBox: "0 0 " + W + " " + H, width: W, height: H, class: "tm-svg" });
-
-    var index = Object.create(null);
-    lanes.forEach(function (l, i) {
-      index[l.id] = i;
-      var y = row(i);
-      s.appendChild(svg("line", {
-        x1: padL, y1: y, x2: W - padR, y2: y,
-        class: "tm-track" + (l.role === "client" ? " client" : "")
-      }));
-      var lab = svg("text", {
-        x: padL - 8, y: y + 3.5, "text-anchor": "end",
-        class: "tm-lane-l" + (l.role === "client" ? " client" : (l.primary ? "" : " handoff"))
-      });
-      lab.textContent = l.label;
-      s.appendChild(lab);
-    });
-
-    // Outages first, so every mark reads on top of the band it happened inside.
-    bands.forEach(function (b) {
-      var y = row(index[b.node]) - rowH / 2 + 2;
-      var x1 = Math.max(x(b.from), padL), x2 = Math.min(x(b.to), W - padR);
-      var g = svg("g", {});
-      g.appendChild(svg("rect", { x: x1, y: y, width: Math.max(x2 - x1, 1), height: rowH - 4, class: "tm-band" }));
-      g.appendChild(svg("line", { x1: x1, y1: y, x2: x1, y2: y + rowH - 4, class: "tm-band-e" }));
-      g.appendChild(svg("line", { x1: x2, y1: y, x2: x2, y2: y + rowH - 4, class: "tm-band-e" }));
-      var bt = svg("title", {});
-      bt.textContent = b.node + T(" offline ", " 离线 ") + clock(b.from) + "-" + clock(b.to);
-      g.appendChild(bt);
-      s.appendChild(g);
-    });
-
-    if (d.delete_ts != null) {
-      var dx = x(d.delete_ts);
-      s.appendChild(svg("line", { x1: dx, y1: padT - 4, x2: dx, y2: H - padB + 2, class: "tm-rule" }));
-      // Flip the label inside the frame when the delete lands near the right
-      // edge, so the word is never shaved off by the viewBox.
-      var flip = dx > W - padR - 46;
-      var dl = svg("text", {
-        x: dx + (flip ? -5 : 5), y: padT + 3, class: "tm-rule-l",
-        "text-anchor": flip ? "end" : "start"
-      });
-      dl.textContent = T("delete", "删除");
-      s.appendChild(dl);
-    }
-
-    events.forEach(function (e) {
-      var i = index[e.lane];
-      if (i === undefined) return;
-      var cx = x(e.t), cy = row(i), mark;
-      if (e.kind === "tombstone") {
-        // A delete is struck out, not just recoloured: the shape carries it.
-        mark = svg("path", {
-          d: "M" + (cx - 4) + " " + (cy - 4) + "L" + (cx + 4) + " " + (cy + 4) +
-             "M" + (cx + 4) + " " + (cy - 4) + "L" + (cx - 4) + " " + (cy + 4),
-          class: "tm-ev-tombstone"
-        });
-      } else if (e.kind === "meta") {
-        mark = svg("circle", { cx: cx, cy: cy, r: 3.5, class: "tm-ev-meta" });
-      } else {
-        mark = svg("circle", { cx: cx, cy: cy, r: 4, class: "tm-ev-" + e.kind });
-      }
-      var tt = svg("title", {});
-      tt.textContent = clock(e.t) + "  " + e.label;
-      mark.appendChild(tt);
-      s.appendChild(mark);
-    });
-
-    for (var ti = 0; ti <= 3; ti++) {
-      var tt2 = minT + span * (ti / 3);
-      var xl = svg("text", {
-        x: x(tt2), y: H - 8, class: "tm-axis",
-        "text-anchor": ti === 0 ? "start" : (ti === 3 ? "end" : "middle")
-      });
-      xl.textContent = clock(tt2);
-      s.appendChild(xl);
-    }
-    host.appendChild(s);
+  function onThemeChange() {
+    _colorCache = {};
+    hydrateAll(document);
+    try { document.dispatchEvent(new CustomEvent("sc-theme")); } catch (e) { /* ignore */ }
   }
 
   var CHART = {
     SVGNS: SVGNS, svg: svg, fmtNum: fmtNum, fmtDur: fmtDur, fmtVal: fmtVal,
     hhmm: hhmm, hhmmss: hhmmss, lineChart: lineChart, statTile: statTile,
-    logView: logView, swimlane: swimlane
+    logView: logView, swimlane: swimlane,
+    hydrate: hydrateChart, hydrateAll: hydrateAll, onThemeChange: onThemeChange
   };
+  window.CHART = CHART;
+
+  hydrateAll(document);
+  bindPeTips(document);
+  // Warehouse lineage is server HTML; lift data-tip onto the shared tip layer.
+  document.querySelectorAll(".wh-lineage-node[data-tip]").forEach(function (el) {
+    var t = el.getAttribute("data-tip");
+    if (t) bindTip(el, t);
+  });
+
+  // Click a lineage file node → live Range preview of the real object.
+  if (PAGE === "lab-warehouse") {
+    var whDlg = $("#dlg-wh-preview");
+    var whTitle = $("#wh-preview-title");
+    var whMeta = $("#wh-preview-meta");
+    var whBody = $("#wh-preview-body");
+    function openWhPreview(path) {
+      if (!whDlg || !path) return;
+      if (whTitle) whTitle.textContent = path.split("/").pop() || path;
+      if (whMeta) whMeta.textContent = path;
+      if (whBody) whBody.textContent = T("Loading…", "读取中…");
+      if (!whDlg.open) whDlg.showModal();
+      api("GET", "/lab/api/warehouse/sample?object=" + encodeURIComponent(path) + "&bytes=8192&lines=120")
+        .then(function (d) {
+          if (whMeta) {
+            whMeta.textContent = (d.dataset || "") + "/" + (d.object || path) +
+              " · " + fmtBytes(d.bytes_read || 0) +
+              (d.bytes_total ? " / " + fmtBytes(d.bytes_total) : "") +
+              (d.complete ? "" : " · " + T("prefix sample", "前缀样例"));
+          }
+          if (whBody) whBody.textContent = d.sample || T("(empty)", "（空）");
+        })
+        .catch(function (e) {
+          if (whBody) whBody.textContent = e.message || String(e);
+        });
+    }
+    document.addEventListener("click", function (ev) {
+      var n = ev.target.closest && ev.target.closest("[data-wh-obj]");
+      if (!n) return;
+      ev.preventDefault();
+      openWhPreview(n.getAttribute("data-wh-obj"));
+    });
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key !== "Enter" && ev.key !== " ") return;
+      var n = ev.target.closest && ev.target.closest("[data-wh-obj]");
+      if (!n) return;
+      ev.preventDefault();
+      openWhPreview(n.getAttribute("data-wh-obj"));
+    });
+  }
+
+  window.addEventListener("resize", function () {
+    document.querySelectorAll(".ix-host[data-ix-chart]").forEach(function (host) {
+      var mount = host.querySelector(".ix-mount");
+      if (mount) { mount.innerHTML = ""; hydrateChart(host); }
+    });
+  });
 
   if (PAGE === "monitor") {
     var mon = { dashes: [], active: 0, range: 3600, timer: null,
@@ -1250,6 +2257,10 @@
       drillBody.innerHTML = ""; drillTable.innerHTML = "";
       if (!p || resp.error) { drillBody.innerHTML = '<div class="mon-empty">' + T("Unavailable", "暂不可用") + '</div>'; return; }
       if (p.kind === "logs" || resp.kind === "logs") { logView(drillBody, resp); return; }
+      if (p.kind === "svcgrid" || resp.kind === "svcgrid") {
+        svcGridView(drillBody, resp);
+        return;
+      }
 
       var all = resp.series || [];
       var focus = drillState.focus;
@@ -1360,6 +2371,7 @@
 
     if (rangeSel) rangeSel.addEventListener("change", function () { mon.range = parseInt(rangeSel.value, 10) || 3600; loadDash(); });
     if (refreshBtn) refreshBtn.addEventListener("click", refresh);
+    document.addEventListener("sc-theme", refresh);
     var rzTimer = null;
     window.addEventListener("resize", function () { clearTimeout(rzTimer); rzTimer = setTimeout(refresh, 250); });
 
@@ -1378,7 +2390,7 @@
   }
 
   // ------------------------------------------------------------- RingScope
-  if (PAGE === "lab-ring" || PAGE === "lab-ringscope") {
+  if ((PAGE === "lab-ring" || PAGE === "lab-ringscope") && $("#rs-out")) {
     var rs = { topo: null, ops: [], devices: [] };
     var out = $("#rs-out"), status = $("#rs-status");
 
@@ -1944,68 +2956,29 @@
       return strip;
     }
 
-    // Column chart: one bar per run. Labels stay under the bars; values sit on top.
-    function ttColChart(title, runs, getV, fmtV, cls) {
+    function ttColChart(title, runs, getV, fmtV, colorIndex) {
       var card = document.createElement("div"); card.className = "mon-card wide tt-chart";
       var h = document.createElement("div"); h.className = "mon-card-h";
       var ti = document.createElement("span"); ti.className = "mon-t"; ti.textContent = title;
       h.appendChild(ti);
       var body = document.createElement("div"); body.className = "mon-body";
-
-      var W = 720, H = 220, padL = 48, padR = 12, padT = 22, padB = 56;
-      var max = Math.max.apply(null, runs.map(getV)) || 1;
-      var s = CHART.svg("svg", {
-        viewBox: "0 0 " + W + " " + H, width: "100%", height: H,
-        class: "tt-svg", role: "img", "aria-label": title
-      });
-      var i, n = runs.length, gap = 8;
-      var inner = W - padL - padR;
-      var bw = Math.max(10, (inner - gap * (n + 1)) / n);
-      for (i = 0; i <= 4; i++) {
-        var gy = padT + (H - padT - padB) * (i / 4);
-        s.appendChild(CHART.svg("line", {
-          x1: padL, y1: gy, x2: W - padR, y2: gy, class: "mon-grid-l"
-        }));
-        var yl = CHART.svg("text", {
-          x: padL - 6, y: gy + 3, class: "mon-axis", "text-anchor": "end"
-        });
-        yl.textContent = fmtV(max * (1 - i / 4));
-        s.appendChild(yl);
-      }
-      runs.forEach(function (r, idx) {
+      // Horizontal bars: long labels ("64KB write") stay readable; values sit
+      // in a right column with theme ink — never cramped canvas text.
+      var items = runs.map(function (r) {
         var v = getV(r);
-        var bh = (v / max) * (H - padT - padB);
-        var x = padL + gap + idx * (bw + gap);
-        var y = H - padB - bh;
-        var bar = CHART.svg("rect", {
-          x: x, y: y, width: bw, height: Math.max(bh, 1), class: "tt-col " + cls, rx: 2
-        });
-        var tip = CHART.svg("title", {});
-        tip.textContent = ttLabel(r) + " — " + fmtV(v);
-        bar.appendChild(tip);
-        s.appendChild(bar);
-        var vl = CHART.svg("text", {
-          x: x + bw / 2, y: y - 4, class: "tt-col-v", "text-anchor": "middle"
-        });
-        vl.textContent = fmtV(v);
-        s.appendChild(vl);
-        var xl = CHART.svg("text", {
-          x: x + bw / 2, y: H - padB + 14, class: "tt-col-l", "text-anchor": "middle"
-        });
-        xl.textContent = r.size;
-        s.appendChild(xl);
-        var xl2 = CHART.svg("text", {
-          x: x + bw / 2, y: H - padB + 28, class: "tt-col-l2", "text-anchor": "middle"
-        });
-        xl2.textContent = r.op + "×" + r.workers;
-        s.appendChild(xl2);
+        return {
+          label: r.size + " · " + r.op,
+          value: v,
+          display: fmtV(v),
+          tip: ttLabel(r) + " — " + fmtV(v),
+          colorIndex: colorIndex != null ? colorIndex : 0
+        };
       });
-      body.appendChild(s);
+      hbarChart(body, { items: items });
       card.appendChild(h); card.appendChild(body);
       return card;
     }
 
-    // Side-by-side read vs write for the same size×workers when both exist.
     function ttCompare(runs) {
       var map = {};
       runs.forEach(function (r) {
@@ -2023,42 +2996,25 @@
       ti.textContent = T("Read vs write throughput", "读 / 写吞吐量对照");
       h.appendChild(ti);
       var body = document.createElement("div"); body.className = "mon-body";
-      var W = 720, H = 220, padL = 48, padR = 12, padT = 22, padB = 40;
-      var max = 1;
+      var items = [];
       pairs.forEach(function (k) {
-        max = Math.max(max, map[k].read.throughput, map[k].write.throughput);
-      });
-      var s = CHART.svg("svg", {
-        viewBox: "0 0 " + W + " " + H, width: "100%", height: H, class: "tt-svg", role: "img"
-      });
-      var n = pairs.length, gap = 14, pairW = (W - padL - padR - gap * (n + 1)) / n;
-      var bw = Math.max(8, (pairW - 4) / 2);
-      pairs.forEach(function (k, idx) {
-        var x0 = padL + gap + idx * (pairW + gap);
+        var parts = k.split("|");
         ["read", "write"].forEach(function (op, oi) {
           var r = map[k][op];
-          var bh = (r.throughput / max) * (H - padT - padB);
-          var x = x0 + oi * (bw + 4);
-          var y = H - padB - bh;
-          var bar = CHART.svg("rect", {
-            x: x, y: y, width: bw, height: Math.max(bh, 1),
-            class: "tt-col " + (op === "read" ? "mon-s1" : "mon-s2"), rx: 2
+          items.push({
+            label: parts[0] + " ×" + parts[1] + " · " + op,
+            value: r.throughput,
+            display: CHART.fmtNum(r.throughput) + " op/s",
+            tip: ttLabel(r) + " — " + CHART.fmtNum(r.throughput) + " op/s",
+            colorIndex: oi
           });
-          var tip = CHART.svg("title", {});
-          tip.textContent = ttLabel(r) + " — " + CHART.fmtNum(r.throughput) + " op/s";
-          bar.appendChild(tip);
-          s.appendChild(bar);
         });
-        var xl = CHART.svg("text", {
-          x: x0 + pairW / 2, y: H - padB + 16, class: "tt-col-l", "text-anchor": "middle"
-        });
-        xl.textContent = k.replace("|", " ×");
-        s.appendChild(xl);
       });
+      hbarChart(body, { items: items });
       var leg = document.createElement("div"); leg.className = "tt-leg";
       leg.innerHTML = '<span class="tt-leg-i mon-s1"></span>' + T("read", "读") +
         '<span class="tt-leg-i mon-s2"></span>' + T("write", "写");
-      body.appendChild(s); body.appendChild(leg);
+      body.appendChild(leg);
       card.appendChild(h); card.appendChild(body);
       return card;
     }
@@ -2072,17 +3028,17 @@
       grid.appendChild(ttColChart(
         T("Throughput (op/s)", "吞吐量（op/s）"), runs,
         function (r) { return r.throughput; },
-        function (v) { return CHART.fmtNum(v); }, "mon-s1"
+        function (v) { return CHART.fmtNum(v); }, 0
       ));
       grid.appendChild(ttColChart(
         T("Bandwidth", "带宽"), runs,
         function (r) { return r.bandwidth; },
-        function (v) { return fmtBytes(v) + "/s"; }, "mon-s2"
+        function (v) { return fmtBytes(v) + "/s"; }, 1
       ));
       grid.appendChild(ttColChart(
         T("Average latency (ms)", "平均延迟（毫秒）"), runs,
         function (r) { return r.avg_res_ms; },
-        function (v) { return v.toFixed(1); }, "mon-s3"
+        function (v) { return v.toFixed(1); }, 2
       ));
       var cmp = ttCompare(tt.runs);
       if (cmp) grid.appendChild(cmp);
@@ -2155,11 +3111,14 @@
         });
     });
 
+    document.addEventListener("sc-theme", function () { ttRender(); });
     ttLoad();
   }
 
   // ---------------------------------------------------- Policy Economist
-  if (PAGE === "lab-policy" || PAGE === "lab-economist") {
+  // Server-rendered /lab/policy already paints charts. The form+API path below
+  // only runs when the interactive shell (#pe-out) is present.
+  if ((PAGE === "lab-policy" || PAGE === "lab-economist") && $("#pe-out") && $("#pe-run")) {
     var peOut = $("#pe-out");
 
     function num(id, dflt) { var v = parseFloat($(id).value); return isFinite(v) ? v : dflt; }
@@ -2421,97 +3380,65 @@
   }
 })();
 
-/* ---------------------------------------------------- swift-shadow: begin */
-/* Owned by the Shadow tool, appended rather than merged into the block above:
-   the console's single IIFE is shared by every surface, and four tools editing
-   one closure is how a page loses its script. That closure exports nothing, so
-   the two helpers this needs are re-declared here rather than reached for. */
+/* ---------------------------------------------------- API Parity family bars */
 (function () {
   "use strict";
   var src = document.getElementById("sh-data");
   var host = document.getElementById("sh-bars");
   if (!src || !host) return;
-
   var d;
   try { d = JSON.parse(src.textContent); } catch (e) { return; }
   var fams = (d.families || []).filter(function (f) {
     return (f.comparable || 0) + (f.suppressed || 0) > 0;
   });
   if (!fams.length) return;
-
-  var NS = "http://www.w3.org/2000/svg";
-  function el(name, attrs) {
-    var e = document.createElementNS(NS, name);
-    for (var k in attrs) e.setAttribute(k, attrs[k]);
-    return e;
+  function tipShow(x, y, html) {
+    if (window.ixTipShow) { window.ixTipShow(x, y, html); return; }
+    var el = document.querySelector(".ix-tip");
+    if (!el) { el = document.createElement("div"); el.className = "ix-tip"; document.body.appendChild(el); }
+    el.hidden = false; el.textContent = html;
+    el.style.left = Math.max(4, x + 12) + "px";
+    el.style.top = Math.max(4, y + 12) + "px";
   }
-
-  // The bars carry the same three numbers as the table underneath. They exist
-  // because the ratio between "compared" and "set aside as noise" is the thing
-  // a reader has to feel, and a column of integers does not convey a ratio.
-  function draw() {
-    host.innerHTML = "";
-    var W = Math.max(host.clientWidth || 720, 320);
-    var rowH = 30, padT = 6, padB = 6, padR = 96;
-    var widest = fams.reduce(function (m, f) { return Math.max(m, f.label.length); }, 6);
-    var padL = Math.min(Math.max(70, Math.ceil(widest * 7.2) + 12), Math.round(W * 0.34));
-    var H = padT + fams.length * rowH + padB;
-    var max = fams.reduce(function (m, f) {
-      return Math.max(m, (f.comparable || 0) + (f.suppressed || 0));
-    }, 1);
-    var track = Math.max(W - padL - padR, 60);
-    var s = el("svg", { viewBox: "0 0 " + W + " " + H, width: W, height: H, class: "sh-svg" });
-
-    fams.forEach(function (f, i) {
-      var y = padT + i * rowH + 8, h = 13;
-      var comparable = f.comparable || 0, sup = f.suppressed || 0, diff = f.differing || 0;
-      var same = Math.max(comparable - diff, 0);
-      var total = comparable + sup;
-      var unit = track / max;
-
-      var lab = el("text", { x: padL - 10, y: y + h - 2.5, "text-anchor": "end", class: "sh-bar-l" });
-      lab.textContent = f.label;
-      s.appendChild(lab);
-
-      s.appendChild(el("rect", {
-        x: padL, y: y, width: track, height: h, rx: 3, class: "sh-bar-bg"
-      }));
-
-      var x = padL;
-      [[same, "sh-seg-ok"], [diff, "sh-seg-diff"], [sup, "sh-seg-sup"]].forEach(function (seg) {
-        var n = seg[0];
-        if (!n) return;
-        var w = Math.max(n * unit, 1.5);
-        var r = el("rect", { x: x, y: y, width: w, height: h, rx: 2, class: seg[1] });
-        var t = el("title", {});
-        t.textContent = f.label + " · " + n;
-        r.appendChild(t);
-        s.appendChild(r);
-        x += w;
-      });
-
-      var v = el("text", {
-        x: W - padR + 10, y: y + h - 2.5, "text-anchor": "start", class: "sh-bar-v"
-      });
-      v.textContent = comparable + " / " + total;
-      s.appendChild(v);
+  function tipHide() {
+    if (window.ixTipHide) { window.ixTipHide(); return; }
+    var el = document.querySelector(".ix-tip"); if (el) el.hidden = true;
+  }
+  host.innerHTML = "";
+  var box = document.createElement("div"); box.className = "ix-hbar sh-hbar";
+  var max = 1;
+  fams.forEach(function (f) { max = Math.max(max, (f.comparable || 0) + (f.suppressed || 0)); });
+  fams.forEach(function (f) {
+    var comparable = f.comparable || 0, sup = f.suppressed || 0, diff = f.differing || 0;
+    var same = Math.max(comparable - diff, 0), total = comparable + sup;
+    var row = document.createElement("div"); row.className = "ix-hbar-row";
+    var lab = document.createElement("span"); lab.className = "ix-hbar-l"; lab.textContent = f.label;
+    var track = document.createElement("div"); track.className = "ix-hbar-track sh-seg-track";
+    [[same, "sh-seg-ok", "same"], [diff, "sh-seg-diff", "diff"], [sup, "sh-seg-sup", "noise"]].forEach(function (seg) {
+      if (!seg[0]) return;
+      var fill = document.createElement("div");
+      fill.className = "sh-seg " + seg[1];
+      fill.style.flex = String(seg[0]);
+      fill.style.width = Math.max(1.5, 100 * seg[0] / max) + "%";
+      fill.dataset.tip = f.label + " · " + seg[2] + ": " + seg[0];
+      track.appendChild(fill);
     });
-    host.appendChild(s);
-  }
-
-  draw();
-  var t = null;
-  window.addEventListener("resize", function () {
-    clearTimeout(t); t = setTimeout(draw, 200);
+    var val = document.createElement("span"); val.className = "ix-hbar-v"; val.textContent = comparable + " / " + total;
+    row.appendChild(lab); row.appendChild(track); row.appendChild(val);
+    row.addEventListener("mousemove", function (ev) {
+      var t = (ev.target.dataset && ev.target.dataset.tip) || (f.label + ": " + comparable + "/" + total);
+      tipShow(ev.clientX, ev.clientY, t);
+    });
+    row.addEventListener("mouseleave", tipHide);
+    box.appendChild(row);
   });
+  host.appendChild(box);
 })();
-/* ------------------------------------------------------ swift-shadow: end */
+/* ------------------------------------------------------ API Parity bars: end */
 
-/* ------------------------------------------- warehouse expiry lane (appended)
-   Owned by the Agent-Native Object Warehouse tool. It draws only what the table
-   directly beneath it already states, so a page with no script loses a picture
-   and no information. The countdown is redrawn on a timer because a "42 minutes
-   left" rendered once is wrong five minutes later. */
+
+
+/* ------------------------------------------- warehouse expiry lane (HTML) */
 (function () {
   "use strict";
   var host = document.getElementById("wh-exp-lane");
@@ -2520,22 +3447,8 @@
   var rows;
   try { rows = JSON.parse(src.textContent); } catch (e) { return; }
   if (!rows || !rows.length) return;
-
   var ZH = document.documentElement.lang === "zh-CN";
   function T(en, zh) { return ZH ? zh : en; }
-  var NS = "http://www.w3.org/2000/svg";
-  // console.js keeps its svg() helper inside its own IIFE. Restating four lines
-  // here beats reaching into, or exporting from, a scope every tool shares.
-  function svg(n, a) {
-    var e = document.createElementNS(NS, n);
-    for (var k in a) e.setAttribute(k, a[k]);
-    return e;
-  }
-  function pad2(n) { return (n < 10 ? "0" : "") + n; }
-  function clock(t) {
-    var d = new Date(t * 1000);
-    return pad2(d.getUTCHours()) + ":" + pad2(d.getUTCMinutes()) + "Z";
-  }
   function left(s) {
     if (s <= 0) return T("gone", "已过期");
     var d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
@@ -2544,80 +3457,47 @@
     return ZH ? (m + " 分") : (m + "m");
   }
   function tail(p) { var i = p.lastIndexOf("/"); return i < 0 ? p : p.slice(i + 1); }
-
   rows = rows.slice().sort(function (a, b) { return a.at - b.at; }).slice(0, 16);
-
+  function tipShow(x, y, html) {
+    if (window.ixTipShow) { window.ixTipShow(x, y, html); return; }
+    var el = document.querySelector(".ix-tip");
+    if (!el) { el = document.createElement("div"); el.className = "ix-tip"; document.body.appendChild(el); }
+    el.hidden = false; el.textContent = html;
+    el.style.left = Math.max(4, x + 12) + "px"; el.style.top = Math.max(4, y + 12) + "px";
+  }
+  function tipHide() {
+    if (window.ixTipHide) { window.ixTipHide(); return; }
+    var el = document.querySelector(".ix-tip"); if (el) el.hidden = true;
+  }
   function draw() {
     host.innerHTML = "";
-    var W = Math.max(host.clientWidth || 640, 300);
     var now = Math.floor(Date.now() / 1000);
-    var maxT = rows[rows.length - 1].at;
-    if (maxT <= now + 60) maxT = now + 60;
-    var i, longest = 0;
-    for (i = 0; i < rows.length; i++) longest = Math.max(longest, tail(rows[i].path).length);
-    var padL = Math.min(Math.max(84, longest * 6.3 + 10), Math.round(W * 0.34));
-    var padR = 78, padT = 6, rowH = 22, padB = 20;
-    var H = padT + rows.length * rowH + padB;
-    var span = maxT - now;
-    var x = function (t) {
-      var f = (t - now) / span;
-      if (f < 0) f = 0; if (f > 1) f = 1;
-      return padL + f * (W - padL - padR);
-    };
-    var s = svg("svg", {
-      viewBox: "0 0 " + W + " " + H, width: W, height: H, class: "wh-lane-svg", role: "img",
-      "aria-label": T("Time left before each working file is removed",
-                      "每个 working 文件被删除前的剩余时间")
+    var maxLeft = 1;
+    rows.forEach(function (r) { maxLeft = Math.max(maxLeft, Math.max(0, r.at - now)); });
+    var box = document.createElement("div"); box.className = "ix-hbar wh-exp";
+    rows.forEach(function (r) {
+      var rem = Math.max(0, r.at - now);
+      var row = document.createElement("div"); row.className = "ix-hbar-row" + (rem < 3600 ? " soon" : "");
+      var lab = document.createElement("span"); lab.className = "ix-hbar-l"; lab.textContent = tail(r.path);
+      var track = document.createElement("div"); track.className = "ix-hbar-track";
+      var fill = document.createElement("div"); fill.className = "ix-hbar-fill" + (rem < 3600 ? " warn" : "");
+      fill.style.width = Math.max(2, 100 * rem / maxLeft) + "%";
+      track.appendChild(fill);
+      var val = document.createElement("span"); val.className = "ix-hbar-v"; val.textContent = left(rem);
+      row.appendChild(lab); row.appendChild(track); row.appendChild(val);
+      row.addEventListener("mousemove", function (ev) { tipShow(ev.clientX, ev.clientY, r.path + " · " + left(rem)); });
+      row.addEventListener("mouseleave", tipHide);
+      box.appendChild(row);
     });
-
-    for (i = 0; i < rows.length; i++) {
-      var r = rows[i];
-      var top = padT + i * rowH;
-      var cy = top + rowH / 2;
-      var soon = (r.at - now) < 3600 ? " soon" : "";
-
-      var lbl = svg("text", { x: 0, y: cy + 4, class: "wh-lane-l" });
-      lbl.textContent = tail(r.path);
-      var lt = svg("title", {});
-      lt.textContent = r.path;
-      lbl.appendChild(lt);
-      s.appendChild(lbl);
-
-      s.appendChild(svg("rect", {
-        x: padL, y: cy - 4, width: Math.max(W - padL - padR, 1), height: 8, rx: 2, class: "wh-lane-track"
-      }));
-      var end = x(r.at);
-      s.appendChild(svg("rect", {
-        x: padL, y: cy - 4, width: Math.max(end - padL, 1), height: 8, rx: 2, class: "wh-lane-bar" + soon
-      }));
-      s.appendChild(svg("line", {
-        x1: end, y1: cy - 6, x2: end, y2: cy + 6, class: "wh-lane-cap" + soon
-      }));
-
-      var v = svg("text", { x: W - padR + 8, y: cy + 4, class: "wh-lane-v" });
-      v.textContent = left(r.at - now);
-      s.appendChild(v);
-    }
-
-    var floor = padT + rows.length * rowH;
-    s.appendChild(svg("line", { x1: padL, y1: padT - 2, x2: padL, y2: floor + 2, class: "wh-lane-now" }));
-    var ticks = [[padL, T("now", "现在")], [(padL + W - padR) / 2, clock(now + span / 2)], [W - padR, clock(maxT)]];
-    for (i = 0; i < ticks.length; i++) {
-      var tx = svg("text", {
-        x: ticks[i][0], y: floor + 14, class: "wh-lane-ax",
-        "text-anchor": i === 0 ? "start" : (i === 2 ? "end" : "middle")
-      });
-      tx.textContent = ticks[i][1];
-      s.appendChild(tx);
-    }
-    host.appendChild(s);
+    host.appendChild(box);
   }
-
   draw();
   var t = null;
   window.addEventListener("resize", function () { clearTimeout(t); t = setTimeout(draw, 200); });
   setInterval(draw, 30000);
 })();
+
+
 
 /* ------------------------------------------------- chaos arcade [ca-*] */
 /* Owned by src/chaos.rs. Its own closure rather than a branch inside the main

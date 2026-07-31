@@ -118,6 +118,15 @@ pub fn t(l: &str, key: &'static str) -> &'static str {
         "files.bucketsettings" => if zh { "存储桶设置" } else { "Bucket settings" },
         "files.deletebucket" => if zh { "删除存储桶" } else { "Delete bucket" },
         "files.filter" => if zh { "筛选" } else { "Filter" },
+        "files.pager.range" => if zh {
+            "第 {a}–{b} 条，共 {n} 条"
+        } else {
+            "{a}–{b} of {n}"
+        },
+        "files.pager.per" => if zh { "每页" } else { "Per page" },
+        "files.pager.prev" => if zh { "上一页" } else { "Previous" },
+        "files.pager.next" => if zh { "下一页" } else { "Next" },
+        "files.pager.page" => if zh { "第 {p} / {m} 页" } else { "Page {p} / {m}" },
         "files.settings" => if zh { "设置" } else { "Settings" },
         "files.upload" => if zh { "上传" } else { "Upload" },
         "files.zip" => if zh { "打包下载" } else { "Zip" },
@@ -435,13 +444,13 @@ pub fn t(l: &str, key: &'static str) -> &'static str {
             "An object's whole life as a timeline: writes, replicas landing, deletes, \
              tombstones, conflicts and convergence — with an autopsy."
         },
-        "lab.tool.shadow.title" => if zh { "双生影子" } else { "Swift Shadow" },
+        "lab.tool.shadow.title" => if zh { "接口对照" } else { "API Parity" },
         "lab.tool.shadow.blurb" => if zh {
-            "把同一个请求同时发给两套实现，逐字段比对状态码、header、ETag、metadata、listing 与收敛时间，积累一份兼容性语料。"
+            "录制真实请求的响应，与第二套实现或历史回放逐字段比对：状态码、header、ETag、元数据、listing 与收敛行为，积累一份接口兼容性语料。"
         } else {
-            "Send one request to both implementations and diff the answers field by field — \
-             status, headers, ETag, metadata, listings and convergence — building a \
-             compatibility corpus as it goes."
+            "Record real request responses and diff them field by field against a second \
+             implementation or a historical replay — status, headers, ETag, metadata, \
+             listings, and convergence — building an API compatibility corpus."
         },
         "lab.tool.nodes.title" => if zh { "节点宕机演练" } else { "Node HA Drill" },
         "lab.tool.nodes.blurb" => if zh {
@@ -458,6 +467,33 @@ pub fn t(l: &str, key: &'static str) -> &'static str {
         "nodes.col.state" => if zh { "状态" } else { "State" },
         "nodes.col.services" => if zh { "服务" } else { "Services" },
         "nodes.col.action" => if zh { "操作" } else { "Action" },
+        "nodes.state.up" => if zh { "正常" } else { "up" },
+        "nodes.state.down" => if zh { "演练宕机" } else { "DOWN (drill)" },
+        "nodes.state.degraded" => if zh { "降级" } else { "degraded" },
+        "nodes.state.unreachable" => if zh { "不可达" } else { "unreachable" },
+        "nodes.act.take" => if zh { "下机" } else { "Take down" },
+        "nodes.act.bring" => if zh { "恢复上线" } else { "Bring up" },
+        "nodes.act.confirm" => if zh {
+            "确认让 {node} 下机？到期后会自动重启。"
+        } else {
+            "Take {node} down? It auto-restarts after the TTL."
+        },
+        "nodes.act.stopping" => if zh { "正在停止 {node}…" } else { "stopping {node}…" },
+        "nodes.act.starting" => if zh { "正在启动 {node}…" } else { "starting {node}…" },
+        "nodes.act.down_ok" => if zh {
+            "{node} 已下机；约 {secs} 秒后自动重启"
+        } else {
+            "{node} down; auto-restart in {secs}s"
+        },
+        "nodes.act.up_ok" => if zh { "{node} 已恢复" } else { "{node} back up" },
+        "wh.preview.title" => if zh { "对象预览" } else { "Object preview" },
+        "wh.preview.close" => if zh { "关闭" } else { "Close" },
+        "wh.preview.loading" => if zh { "读取中…" } else { "Loading…" },
+        "wh.preview.hint" => if zh {
+            "点击血缘图里的文件节点可预览前几 KB（真实对象，Range 读取）。"
+        } else {
+            "Click a file node in the lineage graph to preview the first few KB (live Range GET)."
+        },
         "lab.tool.chaos.title" => if zh { "故障街机" } else { "Chaos Arcade" },
         "lab.tool.chaos.blurb" => if zh {
             "选一种故障、先预测结果，再让集群真的跑一遍，然后回放修复过程。每个故障都自带撤销。"
@@ -474,6 +510,32 @@ pub fn t(l: &str, key: &'static str) -> &'static str {
              working files expire, published artifacts keep lineage, and agents read and \
              write it over MCP — the same data the console shows."
         },
+        "lab.tool.debt.title" => if zh { "修复债务指数" } else { "Repair Debt Index" },
+        "lab.tool.debt.blurb" => if zh {
+            "把复制积压、磁盘压力、ring 不平衡和修复吞吐压成一个状态变量：损伤速度是否超过自我修复速度？"
+        } else {
+            "Compress backlog, disk pressure, ring imbalance and repair throughput into one \
+             state variable: is damage arriving faster than the cluster can repay it?"
+        },
+        "debt.proxy_note" => if zh {
+            "债务由可审计的代理指标计算（async_pending、quarantine、ring balance、磁盘与复制速率），不是虚构的 backlog gauge。"
+        } else {
+            "Debt is computed from auditable proxies (async_pending, quarantine, ring balance, \
+             disk and replicator rates) — not a fabricated backlog gauge."
+        },
+        "debt.k.debt" => if zh { "修复债务" } else { "Repair Debt" },
+        "debt.k.interest" => if zh { "利息（变化率）" } else { "Interest rate" },
+        "debt.k.tti" => if zh { "距失控" } else { "Time to insolvency" },
+        "debt.tti.none" => if zh { "∞（债务未膨胀）" } else { "∞ (not growing)" },
+        "debt.tti.insolvent" => if zh { "已失控" } else { "already insolvent" },
+        "debt.h.top" => if zh { "最大债务来源" } else { "Largest debt source" },
+        "debt.h.bars" => if zh { "贡献分解" } else { "Contribution breakdown" },
+        "debt.h.feed" => if zh { "原始代理数据" } else { "Raw proxy feeds" },
+        "debt.c.backlog" => if zh { "复制/隔离积压" } else { "Replication / quarantine backlog" },
+        "debt.c.balance" => if zh { "Ring 不平衡" } else { "Ring imbalance" },
+        "debt.c.disk" => if zh { "磁盘压力" } else { "Disk pressure" },
+        "debt.c.failures" => if zh { "复制失败速率" } else { "Replicator failure rate" },
+        "debt.c.unhealthy" => if zh { "Swift 节点不健康" } else { "Unhealthy Swift nodes" },
         "wh.how.title" => if zh { "它实际在做什么" } else { "What this actually does" },
         "wh.how.1.t" => if zh { "1. 建任务" } else { "1. Create a job" },
         "wh.how.1.d" => if zh {
@@ -524,55 +586,77 @@ pub fn t(l: &str, key: &'static str) -> &'static str {
             "An older-timestamped copy reappears. Does it win, or get cleaned up?"
         },
 
-        // ---- Swift Shadow ----
+        // ---- API Parity ----
         "shadow.intro" => if zh {
-            "同一个请求发给两套实现，逐字段比对它们的回答。真正沉淀下来的是语料库：每一个请求、两边的响应、差异的定级，以及哪一边的行为才是对的。"
+            "对照本集群与另一套实现（或历史回放）对每个请求的响应。持久资产是语料库：每个请求、两边的回答、差异定级，以及哪一边的行为才是对的。"
         } else {
-            "One request, two implementations, a field-by-field diff of the answers. The \
-             durable asset is the corpus: every request, both responses, how the difference \
-             classifies, and which behaviour is the correct one."
+            "Compare this cluster's response to each request against a second implementation \
+             or a historical replay. The durable asset is the corpus: every request, both \
+             answers, how the difference classifies, and which behaviour is correct."
+        },
+        "shadow.cap.parity.t" => if zh { "接口对照" } else { "API Parity" },
+        "shadow.cap.parity.d" => if zh {
+            "同一请求的两份响应并排呈现，逐字段标注一致、表面差异、语义差异与破坏性差异。"
+        } else {
+            "Place two responses to the same request side by side, field by field, marking \
+             identical, cosmetic, semantic, and breaking differences."
+        },
+        "shadow.cap.compat.t" => if zh { "兼容性比对" } else { "Compatibility Diff" },
+        "shadow.cap.compat.d" => if zh {
+            "按行为族汇总差异：listing、元数据、ETag、区间读取、拒绝路径与收敛时间各自独立定级。"
+        } else {
+            "Summarise differences by behaviour family: listings, metadata, ETag, byte ranges, \
+             refusal paths, and convergence each get their own classification."
+        },
+        "shadow.cap.response.t" => if zh { "响应比对" } else { "Response Diff" },
+        "shadow.cap.response.d" => if zh {
+            "状态码、header、body 摘要与元数据 key 的大小写全部参与比对；已知噪声字段按规则挡掉。"
+        } else {
+            "Status code, headers, body digest, and metadata key casing all participate; \
+             known noise fields are set aside by rule."
         },
         "shadow.act.capture" => if zh { "采集一轮" } else { "Capture a run" },
         "shadow.act.replay" => if zh { "回放最近一轮" } else { "Replay the latest run" },
+        "shadow.act.mutate" => if zh { "协议突变" } else { "Mutate" },
+        "shadow.act.mutate_seed" => if zh { "种子" } else { "Seed" },
         "shadow.act.hint" => if zh {
-            "采集会在本工具自己的两个临时容器里建测试数据，跑完即删；不碰其他任何数据。"
+            "采集会在本工具自己的两个临时容器里建测试数据，跑完即删；不碰其他任何数据。协议突变用种子生成非常规请求序列，寻找语义裂缝。"
         } else {
             "A capture builds its fixture in two scratch containers this tool owns and removes \
-             them when it finishes. Nothing else is touched."
+             them when it finishes. Mutate builds a seeded unconventional request sequence to \
+             hunt semantic cracks."
         },
 
         "shadow.empty.h" => if zh { "语料库还是空的。" } else { "The corpus is empty." },
         "shadow.empty.d" => if zh {
-            "点上面的「采集一轮」，把下面这些行为逐条发给集群，并把确切的回答录下来——状态码、每一个响应头、ETag、元数据 key 的大小写、字节区间的边界、错误响应体。录完之后就可以回放，也可以在第二套实现出现时直接拿去比对。"
+            "点上面的「采集一轮」，把下面这些行为逐条发给集群，并把确切的回答录下来——状态码、每一个响应头、ETag、元数据 key 的大小写、字节区间的边界、错误响应体。录完之后可以回放，也可以在第二套实现配置好后直接拿去比对。"
         } else {
             "Capture a run to send each of the behaviours below to the cluster and record the \
              exact answers — status code, every response header, the ETag, the case of each \
              metadata key, byte-range boundaries, error bodies. Once recorded they can be \
-             replayed, and diffed the day a second implementation exists."
+             replayed, and diffed once a second implementation is configured."
         },
 
-        "shadow.mode.single" => if zh { "单边" } else { "single-sided" },
-        "shadow.mode.dual" => if zh { "双边" } else { "two-sided" },
+        "shadow.mode.single" => if zh { "单端" } else { "single-sided" },
+        "shadow.mode.dual" => if zh { "双端" } else { "two-sided" },
         "shadow.mode.single.h" => if zh {
-            "单边模式：这里只有一套实现。"
+            "单端模式：未配置第二套实现。"
         } else {
-            "Single-sided: only one implementation is present."
+            "Single-sided: no second implementation is configured."
         },
         "shadow.mode.single.d" => if zh {
-            "没有配置第二个端点，所以这里没有任何一条记录被比对过。语料库里存的是一份基准：这套集群对每个请求的确切回答，录下来，等第二套实现出现的那天再拿去逐字段比对。今天它仍然有用——回放能抓出这套实现自己相对于历史记录的漂移。这里不会给出兼容率，因为没有可以当分母的东西：一个只有一个样本的百分比不是测量结果。"
+            "没有配置第二个端点，因此这里没有任何一条记录被比对过。语料库存的是基准：这套集群对每个请求的确切回答。回放能抓出这套实现相对于历史记录的漂移。这里不会给出兼容率，因为没有可以当分母的东西。"
         } else {
             "No second endpoint is configured, so nothing here has been compared to anything. \
-             What the corpus holds is a reference: the exact answers this cluster gives, \
-             recorded so they can be diffed field by field the day a second implementation \
-             exists. It is still useful today — a replay catches this implementation drifting \
-             from its own record. There is no compatibility percentage, because there is no \
-             denominator to put one over: a percentage with one sample is not a measurement."
+             The corpus holds a reference: the exact answers this cluster gives. A replay \
+             catches this implementation drifting from its own record. There is no \
+             compatibility percentage because there is no denominator."
         },
         "shadow.mode.dual.h" => if zh {
-            "双边模式：每个请求同时发给本集群和 {0}，两边的回答都已录入。"
+            "双端模式：每个请求同时发给本集群和 {0}，两边的回答都已录入并比对。"
         } else {
-            "Two-sided: every request goes to this cluster and to {0}, and both answers are \
-             recorded."
+            "Two-sided: every request goes to this cluster and to {0}; both answers are \
+             recorded and compared."
         },
 
         "shadow.verdict.single" => if zh {
@@ -1156,10 +1240,10 @@ pub fn t(l: &str, key: &'static str) -> &'static str {
         "wh.card.working" => if zh { "中间" } else { "working" },
         "wh.card.arts" => if zh { "产出" } else { "artifacts" },
         "wh.graph.note" => if zh {
-            "下图只画有内容的任务：左输入 → 中任务 → 右产出。空任务见上方卡片。"
+            "下图只画有内容的任务：左输入 → 中任务 → 右产出。空任务见上方卡片。点击文件可在线预览。"
         } else {
             "The graph only draws jobs that hold objects: inputs left, job centre, outputs right. \
-             Empty jobs are listed in the cards above."
+             Empty jobs are listed in the cards above. Click a file to preview."
         },
 
         "wh.st.published" => if zh { "已发布" } else { "published" },
@@ -1869,16 +1953,24 @@ pub fn t(l: &str, key: &'static str) -> &'static str {
         "rsx.dev.c.balance" => if zh { "偏差" } else { "Balance" },
         "rsx.dev.c.disk" => if zh { "磁盘用量" } else { "Disk in use" },
         "rsx.dev.c.state" => if zh { "状态" } else { "State" },
+        "rsx.dev.chart.parts" => if zh { "副本槽（灰=变更前，色=变更后；竖线=理想值）" } else { "Replica slots (grey=before, color=after; tick=ideal)" },
+        "rsx.dev.chart.meta" => if zh { "增减 · 偏差 · 磁盘 · 状态" } else { "Δ · balance · disk · state" },
         "rsx.flow.title" => if zh { "数据流向" } else { "Where the data goes" },
         "rsx.flow.note" => if zh {
             "共 {n} 对设备之间交换数据，按迁移量从大到小排列"
         } else {
             "{n} device pairs exchange data; the busiest are first"
         },
+        "rsx.flow.hint" => if zh {
+            "带宽表示迁移副本槽数量；悬停可看估计数据量。图中最多展示各端 16 台设备，完整列表见下方数据表。"
+        } else {
+            "Ribbon width is replica-slot count; hover for estimated bytes. Up to 16 endpoints per side; the full list is in the table below."
+        },
         "rsx.flow.c.from" => if zh { "源设备" } else { "From" },
         "rsx.flow.c.to" => if zh { "目标设备" } else { "To" },
         "rsx.flow.c.slots" => if zh { "副本槽" } else { "Replica slots" },
         "rsx.flow.c.bytes" => if zh { "估计数据量" } else { "Estimated bytes" },
+        "rsx.table.toggle" => if zh { "查看数据表" } else { "Show data table" },
         "rsx.part.title" => if zh { "查看单个 partition" } else { "Inspect one partition" },
         "rsx.part.label" => if zh { "Partition 号" } else { "Partition" },
         "rsx.part.go" => if zh { "查询" } else { "Look it up" },
@@ -2053,6 +2145,12 @@ pub fn t(l: &str, key: &'static str) -> &'static str {
         },
         "pol.table.title" => if zh { "全部候选方案对照" } else { "Every candidate, side by side" },
         "pol.table.metric" => if zh { "指标" } else { "Metric" },
+        "pol.dir.higher" => if zh { "越高越好" } else { "higher is better" },
+        "pol.dir.lower" => if zh { "越低越好" } else { "lower is better" },
+        "pol.chart.infeasible" => if zh { "本集群不可行" } else { "infeasible here" },
+        "pol.chart.pick" => if zh { "推荐" } else { "pick" },
+        "pol.chart.best" => if zh { "可行方案中的最优值" } else { "best of the feasible candidates" },
+        "pol.cons.title" => if zh { "是否满足设定约束" } else { "Meets the stated constraints" },
         "pol.m.amp" => if zh { "存储放大率" } else { "Storage amplification" },
         "pol.m.raw" => if zh { "所需裸容量" } else { "Raw capacity needed" },
         "pol.m.devices" => if zh { "最少设备数" } else { "Devices needed" },
@@ -2802,6 +2900,11 @@ mod tests {
             "lab.tool.shadow.title", "lab.tool.shadow.blurb",
             "lab.tool.chaos.title", "lab.tool.chaos.blurb",
             "lab.tool.warehouse.title", "lab.tool.warehouse.blurb",
+            "lab.tool.debt.title", "lab.tool.debt.blurb",
+            "debt.proxy_note", "debt.k.debt", "debt.k.interest", "debt.k.tti",
+            "debt.tti.none", "debt.tti.insolvent", "debt.h.top", "debt.h.bars",
+            "debt.h.feed", "debt.c.backlog", "debt.c.balance", "debt.c.disk",
+            "debt.c.failures", "debt.c.unhealthy",
         "chaos.armed", "chaos.busy", "chaos.by.none", "chaos.by.reconstructor",
         "chaos.by.replicator", "chaos.by.unknown", "chaos.cmp.actual",
         "chaos.cmp.never", "chaos.cmp.notconverged", "chaos.cmp.predicted",
@@ -2855,6 +2958,8 @@ mod tests {
         "files.folder", "files.system", "files.stat", "files.quota",
         "files.nobucketshint", "files.namehint", "files.createbucket",
         "files.bucketsettings", "files.deletebucket", "files.filter",
+        "files.pager.range", "files.pager.per", "files.pager.prev",
+        "files.pager.next", "files.pager.page",
         "files.settings", "files.upload", "files.zip", "files.ziptitle",
         "files.emptyfolder", "files.trunc", "files.dlzip", "files.trashfolder",
         "files.delfolder", "files.details", "files.download", "files.share",
@@ -2916,8 +3021,10 @@ mod tests {
         "mon.p.repl_fail_node", "mon.p.repl_node", "mon.p.log_vol", "mon.p.log_err",
         "mon.p.dev_used", "mon.p.dev_inodes", "mon.p.disk_read", "mon.p.disk_write",
         "mon.p.disk_iops", "mon.p.disk_util", "mon.p.svc_grid", "mon.p.svc_events",
-        // ---- Swift Shadow ----
-        "shadow.intro", "shadow.act.capture", "shadow.act.replay",
+        // ---- API Parity ----
+        "shadow.intro", "shadow.cap.parity.t", "shadow.cap.parity.d",
+        "shadow.cap.compat.t", "shadow.cap.compat.d", "shadow.cap.response.t", "shadow.cap.response.d",
+        "shadow.act.capture", "shadow.act.replay", "shadow.act.mutate", "shadow.act.mutate_seed",
         "shadow.why.crange", "shadow.noise.rangeonly",
         "shadow.why.replayacct", "shadow.why.clen", "shadow.noise.listingonly",
         "shadow.h.limits", "shadow.limits.d", "shadow.limits.case",
@@ -2982,6 +3089,10 @@ mod tests {
         "wh.g.ref", "wh.g.gone", "wh.g.l.input", "wh.g.l.job",
         "wh.g.l.art", "wh.g.l.work", "wh.lin.none", "wh.lin.live",
         "wh.lin.gone", "wh.act.goal", "wh.act.goalp", "wh.act.agent",
+        "wh.preview.title", "wh.preview.close", "wh.preview.loading", "wh.preview.hint",
+        "nodes.state.up", "nodes.state.down", "nodes.state.degraded", "nodes.state.unreachable",
+        "nodes.act.take", "nodes.act.bring", "nodes.act.confirm", "nodes.act.stopping",
+        "nodes.act.starting", "nodes.act.down_ok", "nodes.act.up_ok",
         "wh.act.ttl", "wh.act.create", "wh.act.promote", "wh.act.dest",
         "wh.act.promotehint", "wh.msg.done", "wh.msg.failed", "wh.mcp.intro",
         "wh.mcp.endpoint", "wh.mcp.protocol", "wh.mcp.auth", "wh.mcp.authv",
@@ -3011,8 +3122,10 @@ mod tests {
         "rsx.dev.nousage", "rsx.dev.ok", "rsx.dev.down", "rsx.dev.removed", "rsx.dev.added",
         "rsx.dev.c.device", "rsx.dev.c.zone", "rsx.dev.c.weight", "rsx.dev.c.ideal",
         "rsx.dev.c.before", "rsx.dev.c.after", "rsx.dev.c.delta", "rsx.dev.c.balance",
-        "rsx.dev.c.disk", "rsx.dev.c.state", "rsx.flow.title", "rsx.flow.note",
+        "rsx.dev.c.disk", "rsx.dev.c.state", "rsx.dev.chart.parts", "rsx.dev.chart.meta",
+        "rsx.flow.title", "rsx.flow.note", "rsx.flow.hint",
         "rsx.flow.c.from", "rsx.flow.c.to", "rsx.flow.c.slots", "rsx.flow.c.bytes",
+        "rsx.table.toggle",
         "rsx.part.title", "rsx.part.label", "rsx.part.go", "rsx.part.empty", "rsx.part.cap",
         "rsx.part.none", "rsx.part.primary", "rsx.part.handoff", "rsx.part.c.role",
         "rsx.part.c.node", "rsx.part.c.device", "rsx.method.title", "rsx.method.slot",
@@ -3028,7 +3141,9 @@ mod tests {
         "pol.chart.target", "pol.chart.nines", "pol.chart.rebuild", "pol.chart.k.ok",
         "pol.chart.k.miss", "pol.chart.k.out", "pol.u.min", "pol.u.h", "pol.u.d", "pol.u.inf",
         "pol.repair.title", "pol.repair.limit",
-        "pol.repair.note", "pol.table.title", "pol.table.metric", "pol.m.amp", "pol.m.raw",
+        "pol.repair.note", "pol.table.title", "pol.table.metric",
+        "pol.dir.higher", "pol.dir.lower", "pol.chart.infeasible", "pol.chart.pick",
+        "pol.chart.best", "pol.cons.title", "pol.m.amp", "pol.m.raw",
         "pol.m.devices", "pol.m.fanout", "pol.m.quorum", "pol.m.margin", "pol.m.readmin",
         "pol.m.survives", "pol.m.rebuild", "pol.m.repair", "pol.m.nines", "pol.m.cost",
         "pol.m.meets.dur", "pol.m.meets.repair", "pol.m.meets.loss", "pol.m.why", "pol.yes",

@@ -89,6 +89,13 @@ pub const TOOLS: &[LabTool] = &[
         blurb: "lab.tool.warehouse.blurb",
         ready: true,
     },
+    LabTool {
+        id: "debt",
+        title: "lab.tool.debt.title",
+        href: "/lab/debt",
+        blurb: "lab.tool.debt.blurb",
+        ready: true,
+    },
 ];
 
 pub fn tool(id: &str) -> Option<&'static LabTool> {
