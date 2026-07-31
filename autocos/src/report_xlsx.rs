@@ -7,7 +7,9 @@
 
 use anyhow::{bail, Context, Result};
 use chrono::Local;
-use rust_xlsxwriter::{Format, FormatAlign, FormatBorder, Workbook, Worksheet};
+use rust_xlsxwriter::{
+    Chart, ChartType, Format, FormatAlign, FormatBorder, Workbook, Worksheet,
+};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -268,36 +270,85 @@ pub fn write_standard_xlsx(
         sheet.write_with_format(7, i as u16, *h, &hdr)?;
     }
 
+    // Column K (index 10) holds a short category label for the chart sheet —
+    // size + op + workers — so the axes stay readable without inventing a
+    // second table of numbers.
+    sheet.set_column_width(10, 22)?;
+    sheet.write_with_format(6, 10, "图表标签", &hdr)?;
+    sheet.write_with_format(7, 10, "chart label", &hdr)?;
+
+    let first = 8u32;
+    let last = 8 + jobs.len() as u32 - 1;
     for (ri, job) in jobs.iter().enumerate() {
-        let r = 8 + ri as u32;
-        let vals = [
-            job.wid.as_str(),
-            job.size.as_str(),
-            job.worker.as_str(),
-            job.method.as_str(),
-            if job.policy.is_empty() {
-                meta.policy_name.as_str()
-            } else {
-                job.policy.as_str()
-            },
-            job.container_count.as_str(),
-            strip_unit(&job.avg_res_ms),
-            strip_unit(&job.avg_proc_ms),
-            strip_unit(&job.throughput),
-            strip_unit(&job.bandwidth),
-        ];
-        for (ci, v) in vals.iter().enumerate() {
-            sheet.write_with_format(r, ci as u16, *v, &cell)?;
-        }
+        let r = first + ri as u32;
+        let policy = if job.policy.is_empty() {
+            meta.policy_name.as_str()
+        } else {
+            job.policy.as_str()
+        };
+        let label = format!("{} {} ×{}", job.size, job.method, job.worker);
+        sheet.write_with_format(r, 0, job.wid.as_str(), &cell)?;
+        sheet.write_with_format(r, 1, job.size.as_str(), &cell)?;
+        sheet.write_with_format(r, 2, job.worker.as_str(), &cell)?;
+        sheet.write_with_format(r, 3, job.method.as_str(), &cell)?;
+        sheet.write_with_format(r, 4, policy, &cell)?;
+        sheet.write_with_format(r, 5, job.container_count.as_str(), &cell)?;
+        // Metric columns as numbers so Excel charts can plot them.
+        write_num(sheet, r, 6, &job.avg_res_ms, &cell)?;
+        write_num(sheet, r, 7, &job.avg_proc_ms, &cell)?;
+        write_num(sheet, r, 8, &job.throughput, &cell)?;
+        write_num(sheet, r, 9, &job.bandwidth, &cell)?;
+        sheet.write_with_format(r, 10, label.as_str(), &cell)?;
     }
 
     // numeric notes footer
-    let footer_row = 8 + jobs.len() as u32 + 1;
+    let footer_row = last + 2;
     sheet.write_with_format(footer_row, 0, "数值说明：", &note)?;
     sheet.write(
         footer_row + 1,
         0,
-        "AVG-Restime/Proctime 单位 ms；Throughput 单位 op/s；Bandwidth 为汇总带宽（原始 CSV 口径）。",
+        "AVG-Restime/Proctime 单位 ms；Throughput 单位 op/s；Bandwidth 为数值（原始 CSV 口径，单位以表头为准）。",
+    )?;
+
+    // Chart sheet: three column charts over the same numeric columns.
+    let charts = wb.add_worksheet();
+    charts.set_name("图表")?;
+    charts.write_with_format(0, 0, "性能测试图表（与「性能测试结果」同一批数据）", &title)?;
+    charts.merge_range(0, 0, 0, 8, "性能测试图表（与「性能测试结果」同一批数据）", &title)?;
+    charts.write(
+        1,
+        0,
+        "下方三张图分别画出吞吐量、带宽、平均响应时间。类别轴是每行的「图表标签」。",
+    )?;
+
+    let data_sheet = "性能测试结果";
+    let cats = (data_sheet, first, 10u16, last, 10u16);
+    insert_column_chart(
+        charts,
+        3,
+        0,
+        "吞吐量 (op/s)",
+        "op/s",
+        cats,
+        (data_sheet, first, 8, last, 8),
+    )?;
+    insert_column_chart(
+        charts,
+        20,
+        0,
+        "带宽",
+        "bandwidth",
+        cats,
+        (data_sheet, first, 9, last, 9),
+    )?;
+    insert_column_chart(
+        charts,
+        37,
+        0,
+        "平均响应时间 (ms)",
+        "ms",
+        cats,
+        (data_sheet, first, 6, last, 6),
     )?;
 
     if let Some(parent) = output.as_ref().parent() {
@@ -452,21 +503,16 @@ pub fn write_fool_xlsx(
 }
 
 fn write_fool_row(sheet: &mut Worksheet, row: u32, j: &JobRow, cell: &Format) -> Result<()> {
-    let vals = [
-        j.wid.as_str(),
-        j.policy.as_str(),
-        j.container_count.as_str(),
-        strip_unit(&j.avg_res_ms),
-        strip_unit(&j.avg_proc_ms),
-        strip_unit(&j.throughput),
-        strip_unit(&j.bandwidth),
-        j.worker.as_str(),
-        j.method.as_str(),
-        j.size.as_str(),
-    ];
-    for (ci, v) in vals.iter().enumerate() {
-        sheet.write_with_format(row, ci as u16, *v, cell)?;
-    }
+    sheet.write_with_format(row, 0, j.wid.as_str(), cell)?;
+    sheet.write_with_format(row, 1, j.policy.as_str(), cell)?;
+    sheet.write_with_format(row, 2, j.container_count.as_str(), cell)?;
+    write_num(sheet, row, 3, &j.avg_res_ms, cell)?;
+    write_num(sheet, row, 4, &j.avg_proc_ms, cell)?;
+    write_num(sheet, row, 5, &j.throughput, cell)?;
+    write_num(sheet, row, 6, &j.bandwidth, cell)?;
+    sheet.write_with_format(row, 7, j.worker.as_str(), cell)?;
+    sheet.write_with_format(row, 8, j.method.as_str(), cell)?;
+    sheet.write_with_format(row, 9, j.size.as_str(), cell)?;
     Ok(())
 }
 
@@ -499,6 +545,51 @@ fn strip_unit(s: &str) -> &str {
     s.trim()
 }
 
+/// Pull the leading number out of strings like `"1.13 ms"` / `"3538.82 op/s"`.
+fn parse_num(s: &str) -> Option<f64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let end = t
+        .char_indices()
+        .find(|(_, c)| !(c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+' || *c == 'e' || *c == 'E'))
+        .map(|(i, _)| i)
+        .unwrap_or(t.len());
+    t[..end].parse().ok()
+}
+
+fn write_num(sheet: &mut Worksheet, row: u32, col: u16, raw: &str, fmt: &Format) -> Result<()> {
+    if let Some(n) = parse_num(raw) {
+        sheet.write_with_format(row, col, n, fmt)?;
+    } else {
+        sheet.write_with_format(row, col, strip_unit(raw), fmt)?;
+    }
+    Ok(())
+}
+
+fn insert_column_chart(
+    sheet: &mut Worksheet,
+    row: u32,
+    col: u16,
+    title: &str,
+    y_name: &str,
+    categories: (&str, u32, u16, u32, u16),
+    values: (&str, u32, u16, u32, u16),
+) -> Result<()> {
+    let mut chart = Chart::new(ChartType::Column);
+    chart.title().set_name(title);
+    chart.x_axis().set_name("case");
+    chart.y_axis().set_name(y_name);
+    chart
+        .add_series()
+        .set_categories(categories)
+        .set_values(values)
+        .set_name(title);
+    sheet.insert_chart(row, col, &chart)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,10 +613,25 @@ mod tests {
             "t,64KB,4,write,100,1 MB,w1,,10,1.0 ms,1.0 ms,10 op/s,1 KB"
         )
         .unwrap();
+        writeln!(
+            f,
+            "t,1MB,8,read,200,2 MB,w2,,10,2.5 ms,2.0 ms,80 op/s,40 KB"
+        )
+        .unwrap();
         let out = NamedTempFile::new().unwrap();
         let path = out.path().with_extension("xlsx");
         write_standard_xlsx(f.path(), &path, &ReportMeta::from_env()).unwrap();
-        assert!(path.is_file());
+        let meta = fs::metadata(&path).unwrap();
+        // A bare table is a few KB; three embedded charts push it well past that.
+        assert!(meta.len() > 8_000, "xlsx too small to hold charts: {} bytes", meta.len());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn parse_num_strips_units() {
+        assert_eq!(parse_num("1.13 ms"), Some(1.13));
+        assert_eq!(parse_num("3538.82 op/s"), Some(3538.82));
+        assert_eq!(parse_num("  50 "), Some(50.0));
+        assert_eq!(parse_num(""), None);
     }
 }

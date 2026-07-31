@@ -1825,17 +1825,20 @@
 
   // ------------------------------------------------------------- Testing
   if (PAGE === "test") {
-    var tt = { runs: [], view: "table", timer: null };
+    var tt = { runs: [], view: "chart", timer: null };
     var ttOut = $("#tt-out"), ttState = $("#tt-state");
 
-    function fmtRate(v) { return CHART.fmtNum(v) + " op/s"; }
+    function ttLabel(r) {
+      return r.size + " " + r.op + " ×" + r.workers;
+    }
 
-    function ttTable() {
-      if (!tt.runs.length) {
-        var e = document.createElement("div"); e.className = "empty";
-        e.textContent = T("No test runs yet.", "还没有测试记录。");
-        return e;
-      }
+    function ttEmpty() {
+      var e = document.createElement("div"); e.className = "empty";
+      e.textContent = T("No test runs yet.", "还没有测试记录。");
+      return e;
+    }
+
+    function ttTable(runs) {
       var wrap = document.createElement("div"); wrap.className = "tbl-wrap";
       var t = document.createElement("table"); t.className = "tbl";
       var head = [
@@ -1848,7 +1851,7 @@
         return "<th" + (h[1] ? " class='" + h[1] + "'" : "") + ">" + h[0] + "</th>";
       }).join("") + "</tr></thead>";
       var tb = document.createElement("tbody");
-      tt.runs.forEach(function (r) {
+      runs.forEach(function (r) {
         var tr = document.createElement("tr");
         [[r.finished, ""], [r.size, ""], [r.op, ""],
          [r.workers, "num"], [r.ops, "num"], [fmtBytes(r.bytes), "num"],
@@ -1869,51 +1872,192 @@
       return wrap;
     }
 
-    // Grouped bars: one group per run, so different workloads compare directly.
-    function ttChart() {
-      if (!tt.runs.length) {
-        var e = document.createElement("div"); e.className = "empty";
-        e.textContent = T("No test runs yet.", "还没有测试记录。");
-        return e;
-      }
-      var runs = tt.runs.slice(0, 12).reverse();
-      var box = document.createElement("div");
-      [[T("Throughput (op/s)", "吞吐量（op/s）"), function (r) { return r.throughput; }, function (v) { return CHART.fmtNum(v); }, "mon-s1"],
-       [T("Bandwidth", "带宽"), function (r) { return r.bandwidth; }, function (v) { return fmtBytes(v) + "/s"; }, "mon-s2"],
-       [T("Average latency (ms)", "平均延迟（毫秒）"), function (r) { return r.avg_res_ms; }, function (v) { return v.toFixed(1) + " ms"; }, "mon-s3"]
-      ].forEach(function (metric) {
-        var card = document.createElement("div"); card.className = "mon-card wide";
-        var h = document.createElement("div"); h.className = "mon-card-h";
-        var ti = document.createElement("span"); ti.className = "mon-t"; ti.textContent = metric[0];
-        h.appendChild(ti);
-        var body = document.createElement("div"); body.className = "mon-body";
-
-        var max = Math.max.apply(null, runs.map(metric[1])) || 1;
-        var rows = document.createElement("div"); rows.className = "tt-bars";
-        runs.forEach(function (r) {
-          var row = document.createElement("div"); row.className = "tt-bar-row";
-          var lab = document.createElement("span"); lab.className = "tt-bar-l";
-          lab.textContent = r.size + " " + r.op + " ×" + r.workers;
-          var track = document.createElement("span"); track.className = "tt-bar-t";
-          var fill = document.createElement("i");
-          fill.className = metric[3];
-          fill.style.width = Math.max(1, (metric[1](r) / max) * 100) + "%";
-          track.appendChild(fill);
-          var val = document.createElement("span"); val.className = "tt-bar-v";
-          val.textContent = metric[2](metric[1](r));
-          row.appendChild(lab); row.appendChild(track); row.appendChild(val);
-          rows.appendChild(row);
-        });
-        body.appendChild(rows);
-        card.appendChild(h); card.appendChild(body);
-        box.appendChild(card);
+    function ttKpis(runs) {
+      var bestT = runs.reduce(function (a, r) { return r.throughput > a.throughput ? r : a; }, runs[0]);
+      var bestB = runs.reduce(function (a, r) { return r.bandwidth > a.bandwidth ? r : a; }, runs[0]);
+      var bestL = runs.reduce(function (a, r) { return r.avg_res_ms < a.avg_res_ms ? r : a; }, runs[0]);
+      var ok = runs.filter(function (r) { return r.success_pct >= 99.9; }).length;
+      var strip = document.createElement("div"); strip.className = "tt-kpis";
+      [
+        [T("Peak throughput", "峰值吞吐量"), CHART.fmtNum(bestT.throughput) + " op/s", ttLabel(bestT)],
+        [T("Peak bandwidth", "峰值带宽"), fmtBytes(bestB.bandwidth) + "/s", ttLabel(bestB)],
+        [T("Lowest latency", "最低延迟"), bestL.avg_res_ms.toFixed(1) + " ms", ttLabel(bestL)],
+        [T("Clean runs", "零错误轮次"), ok + " / " + runs.length, T("success ≥ 99.9%", "成功率 ≥ 99.9%")]
+      ].forEach(function (k) {
+        var card = document.createElement("div"); card.className = "tt-kpi";
+        var lab = document.createElement("div"); lab.className = "tt-kpi-l"; lab.textContent = k[0];
+        var val = document.createElement("div"); val.className = "tt-kpi-v"; val.textContent = k[1];
+        var sub = document.createElement("div"); sub.className = "tt-kpi-s"; sub.textContent = k[2];
+        card.appendChild(lab); card.appendChild(val); card.appendChild(sub);
+        strip.appendChild(card);
       });
+      return strip;
+    }
+
+    // Column chart: one bar per run. Labels stay under the bars; values sit on top.
+    function ttColChart(title, runs, getV, fmtV, cls) {
+      var card = document.createElement("div"); card.className = "mon-card wide tt-chart";
+      var h = document.createElement("div"); h.className = "mon-card-h";
+      var ti = document.createElement("span"); ti.className = "mon-t"; ti.textContent = title;
+      h.appendChild(ti);
+      var body = document.createElement("div"); body.className = "mon-body";
+
+      var W = 720, H = 220, padL = 48, padR = 12, padT = 22, padB = 56;
+      var max = Math.max.apply(null, runs.map(getV)) || 1;
+      var s = CHART.svg("svg", {
+        viewBox: "0 0 " + W + " " + H, width: "100%", height: H,
+        class: "tt-svg", role: "img", "aria-label": title
+      });
+      var i, n = runs.length, gap = 8;
+      var inner = W - padL - padR;
+      var bw = Math.max(10, (inner - gap * (n + 1)) / n);
+      for (i = 0; i <= 4; i++) {
+        var gy = padT + (H - padT - padB) * (i / 4);
+        s.appendChild(CHART.svg("line", {
+          x1: padL, y1: gy, x2: W - padR, y2: gy, class: "mon-grid-l"
+        }));
+        var yl = CHART.svg("text", {
+          x: padL - 6, y: gy + 3, class: "mon-axis", "text-anchor": "end"
+        });
+        yl.textContent = fmtV(max * (1 - i / 4));
+        s.appendChild(yl);
+      }
+      runs.forEach(function (r, idx) {
+        var v = getV(r);
+        var bh = (v / max) * (H - padT - padB);
+        var x = padL + gap + idx * (bw + gap);
+        var y = H - padB - bh;
+        var bar = CHART.svg("rect", {
+          x: x, y: y, width: bw, height: Math.max(bh, 1), class: "tt-col " + cls, rx: 2
+        });
+        var tip = CHART.svg("title", {});
+        tip.textContent = ttLabel(r) + " — " + fmtV(v);
+        bar.appendChild(tip);
+        s.appendChild(bar);
+        var vl = CHART.svg("text", {
+          x: x + bw / 2, y: y - 4, class: "tt-col-v", "text-anchor": "middle"
+        });
+        vl.textContent = fmtV(v);
+        s.appendChild(vl);
+        var xl = CHART.svg("text", {
+          x: x + bw / 2, y: H - padB + 14, class: "tt-col-l", "text-anchor": "middle"
+        });
+        xl.textContent = r.size;
+        s.appendChild(xl);
+        var xl2 = CHART.svg("text", {
+          x: x + bw / 2, y: H - padB + 28, class: "tt-col-l2", "text-anchor": "middle"
+        });
+        xl2.textContent = r.op + "×" + r.workers;
+        s.appendChild(xl2);
+      });
+      body.appendChild(s);
+      card.appendChild(h); card.appendChild(body);
+      return card;
+    }
+
+    // Side-by-side read vs write for the same size×workers when both exist.
+    function ttCompare(runs) {
+      var map = {};
+      runs.forEach(function (r) {
+        var k = r.size + "|" + r.workers;
+        if (!map[k]) map[k] = {};
+        map[k][r.op] = r;
+      });
+      var pairs = Object.keys(map).filter(function (k) {
+        return map[k].read && map[k].write;
+      }).slice(0, 8);
+      if (!pairs.length) return null;
+      var card = document.createElement("div"); card.className = "mon-card wide tt-chart";
+      var h = document.createElement("div"); h.className = "mon-card-h";
+      var ti = document.createElement("span"); ti.className = "mon-t";
+      ti.textContent = T("Read vs write throughput", "读 / 写吞吐量对照");
+      h.appendChild(ti);
+      var body = document.createElement("div"); body.className = "mon-body";
+      var W = 720, H = 220, padL = 48, padR = 12, padT = 22, padB = 40;
+      var max = 1;
+      pairs.forEach(function (k) {
+        max = Math.max(max, map[k].read.throughput, map[k].write.throughput);
+      });
+      var s = CHART.svg("svg", {
+        viewBox: "0 0 " + W + " " + H, width: "100%", height: H, class: "tt-svg", role: "img"
+      });
+      var n = pairs.length, gap = 14, pairW = (W - padL - padR - gap * (n + 1)) / n;
+      var bw = Math.max(8, (pairW - 4) / 2);
+      pairs.forEach(function (k, idx) {
+        var x0 = padL + gap + idx * (pairW + gap);
+        ["read", "write"].forEach(function (op, oi) {
+          var r = map[k][op];
+          var bh = (r.throughput / max) * (H - padT - padB);
+          var x = x0 + oi * (bw + 4);
+          var y = H - padB - bh;
+          var bar = CHART.svg("rect", {
+            x: x, y: y, width: bw, height: Math.max(bh, 1),
+            class: "tt-col " + (op === "read" ? "mon-s1" : "mon-s2"), rx: 2
+          });
+          var tip = CHART.svg("title", {});
+          tip.textContent = ttLabel(r) + " — " + CHART.fmtNum(r.throughput) + " op/s";
+          bar.appendChild(tip);
+          s.appendChild(bar);
+        });
+        var xl = CHART.svg("text", {
+          x: x0 + pairW / 2, y: H - padB + 16, class: "tt-col-l", "text-anchor": "middle"
+        });
+        xl.textContent = k.replace("|", " ×");
+        s.appendChild(xl);
+      });
+      var leg = document.createElement("div"); leg.className = "tt-leg";
+      leg.innerHTML = '<span class="tt-leg-i mon-s1"></span>' + T("read", "读") +
+        '<span class="tt-leg-i mon-s2"></span>' + T("write", "写");
+      body.appendChild(s); body.appendChild(leg);
+      card.appendChild(h); card.appendChild(body);
+      return card;
+    }
+
+    function ttChart() {
+      if (!tt.runs.length) return ttEmpty();
+      var runs = tt.runs.slice(0, 16).reverse();
+      var box = document.createElement("div"); box.className = "tt-dash";
+      box.appendChild(ttKpis(tt.runs));
+      var grid = document.createElement("div"); grid.className = "tt-grid";
+      grid.appendChild(ttColChart(
+        T("Throughput (op/s)", "吞吐量（op/s）"), runs,
+        function (r) { return r.throughput; },
+        function (v) { return CHART.fmtNum(v); }, "mon-s1"
+      ));
+      grid.appendChild(ttColChart(
+        T("Bandwidth", "带宽"), runs,
+        function (r) { return r.bandwidth; },
+        function (v) { return fmtBytes(v) + "/s"; }, "mon-s2"
+      ));
+      grid.appendChild(ttColChart(
+        T("Average latency (ms)", "平均延迟（毫秒）"), runs,
+        function (r) { return r.avg_res_ms; },
+        function (v) { return v.toFixed(1); }, "mon-s3"
+      ));
+      var cmp = ttCompare(tt.runs);
+      if (cmp) grid.appendChild(cmp);
+      box.appendChild(grid);
+
+      var det = document.createElement("details"); det.className = "tt-data";
+      var sum = document.createElement("summary");
+      sum.textContent = T("Data table", "数据表");
+      det.appendChild(sum);
+      det.appendChild(ttTable(tt.runs));
+      box.appendChild(det);
       return box;
     }
 
     function ttRender() {
       ttOut.innerHTML = "";
-      ttOut.appendChild(tt.view === "chart" ? ttChart() : ttTable());
+      if (!tt.runs.length && tt.view !== "table") {
+        ttOut.appendChild(ttEmpty());
+        return;
+      }
+      if (tt.view === "table") {
+        ttOut.appendChild(tt.runs.length ? ttTable(tt.runs) : ttEmpty());
+      } else {
+        ttOut.appendChild(ttChart());
+      }
     }
 
     function ttLoad() {

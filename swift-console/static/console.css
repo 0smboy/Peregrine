@@ -809,6 +809,41 @@ input::placeholder, .filter::placeholder { color: var(--faint); }
 /* ------------------------------------------------------------- testing */
 
 .tt-form { max-width: 1000px; margin-bottom: 18px; }
+.tt-dash { display: flex; flex-direction: column; gap: 16px; }
+.tt-kpis {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px;
+}
+.tt-kpi {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 12px 14px;
+}
+.tt-kpi-l { font-size: 12px; color: var(--mut); }
+.tt-kpi-v {
+  font-size: 20px; font-weight: 650; letter-spacing: -0.02em; margin-top: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.tt-kpi-s { font-size: 11.5px; color: var(--faint); margin-top: 4px; overflow-wrap: anywhere; }
+.tt-grid { display: flex; flex-direction: column; gap: 12px; }
+.tt-chart .mon-body { overflow-x: auto; }
+.tt-svg { display: block; min-width: 560px; }
+.tt-col { fill: var(--accent-ink); opacity: 0.85; }
+.tt-col.mon-s1 { fill: var(--chart-1, var(--accent-ink)); }
+.tt-col.mon-s2 { fill: var(--chart-2, var(--mut)); }
+.tt-col.mon-s3 { fill: var(--chart-3, var(--mut)); }
+.tt-col-v { fill: var(--ink); font-size: 10px; font-variant-numeric: tabular-nums; }
+.tt-col-l { fill: var(--ink); font-size: 11px; }
+.tt-col-l2 { fill: var(--mut); font-size: 10px; }
+.tt-leg { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--mut); margin-top: 8px; }
+.tt-leg-i { display: inline-block; width: 12px; height: 10px; border-radius: 2px; margin-right: 2px; }
+.tt-leg-i.mon-s1 { background: var(--chart-1, var(--accent-ink)); }
+.tt-leg-i.mon-s2 { background: var(--chart-2, var(--mut)); }
+.tt-data { margin-top: 4px; }
+.tt-data > summary {
+  cursor: pointer; font-size: 13px; color: var(--mut); margin-bottom: 8px; user-select: none;
+}
+@media (max-width: 900px) {
+  .tt-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 .tt-bars { display: flex; flex-direction: column; gap: 6px; }
 .tt-bar-row { display: flex; align-items: center; gap: 10px; font-size: 12px; }
 .tt-bar-l { flex: 0 0 160px; color: var(--mut); }

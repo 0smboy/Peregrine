@@ -289,8 +289,8 @@ pub fn page_content(lang: &str) -> String {
   <h1>{title}</h1>
   <div class="actions">
     <div class="seg" id="tt-view" role="tablist">
-      <button class="seg-b active" type="button" data-view="table">{table}</button>
-      <button class="seg-b" type="button" data-view="chart">{chart}</button>
+      <button class="seg-b active" type="button" data-view="chart">{chart}</button>
+      <button class="seg-b" type="button" data-view="table">{table}</button>
     </div>
     <a class="btn sm" href="/test/api/export.csv">{export}</a>
   </div>
