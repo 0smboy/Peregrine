@@ -96,6 +96,27 @@ pub const TOOLS: &[LabTool] = &[
         blurb: "lab.tool.debt.blurb",
         ready: true,
     },
+    LabTool {
+        id: "expired",
+        title: "lab.tool.expired.title",
+        href: "/lab/expired",
+        blurb: "lab.tool.expired.blurb",
+        ready: true,
+    },
+    LabTool {
+        id: "profilemap",
+        title: "lab.tool.profilemap.title",
+        href: "/lab/profilemap",
+        blurb: "lab.tool.profilemap.blurb",
+        ready: true,
+    },
+    LabTool {
+        id: "genome",
+        title: "lab.tool.genome.title",
+        href: "/lab/genome",
+        blurb: "lab.tool.genome.blurb",
+        ready: true,
+    },
 ];
 
 pub fn tool(id: &str) -> Option<&'static LabTool> {

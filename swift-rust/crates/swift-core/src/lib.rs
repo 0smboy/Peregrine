@@ -31,6 +31,7 @@ pub mod obslog;
 pub mod otlp;
 pub mod pickle;
 pub mod recon;
+pub mod stage;
 pub mod statsd;
 pub mod storage_policy;
 pub mod timestamp;

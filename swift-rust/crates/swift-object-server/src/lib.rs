@@ -683,6 +683,21 @@ impl ObjectServer {
         if req.path.contains('\u{0}') {
             return plain_response(412, "Invalid UTF8 or contains NULL");
         }
+        if req.path == "/recon/stage" && matches!(req.method.as_str(), "GET" | "HEAD") {
+            let body = swift_core::stage::snapshot_json();
+            let mut resp = Response::with_body(
+                200,
+                if req.method == "HEAD" {
+                    Vec::new()
+                } else {
+                    body.clone().into_bytes()
+                },
+            );
+            resp.headers
+                .set("Content-Type", "application/json; charset=utf-8");
+            resp.headers.set("Content-Length", body.len());
+            return resp;
+        }
         let mut resp = match req.method.as_str() {
             // GET/HEAD are conditional responses: an otherwise-2xx result may be
             // reduced to a 304/412 by If-[None-]Match / If-[Un]Modified-Since.
@@ -716,6 +731,8 @@ impl ObjectServer {
     }
 
     fn put(&self, req: &mut Request) -> Response {
+        let _meta_stage =
+            swift_core::stage::StageTimer::start("object-server", "put", "metadata_parse");
         let (drive, part, account, container, obj, policy_index, policy) = match self.obj_path(req) {
             Ok(v) => v,
             Err(resp) => return resp,
@@ -906,6 +923,9 @@ impl ObjectServer {
         // abort paths below return without `put()`, so the writer's drop
         // removes the temp file (Python: the `with diskfile.create()`
         // block unwinding without a put).
+        drop(_meta_stage);
+        let _write_stage =
+            swift_core::stage::StageTimer::start("object-server", "put", "disk_write");
         let mut buf = [0u8; STREAM_CHUNK];
         let mut upload_size: u64 = 0;
         loop {
@@ -954,7 +974,11 @@ impl ObjectServer {
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
                 .map(|(_, v)| v.as_str())
         };
-        let (upload_size, etag) = writer.chunks_finished();
+        drop(_write_stage);
+        let (upload_size, etag) = {
+            let _hash = swift_core::stage::StageTimer::start("object-server", "put", "hash");
+            writer.chunks_finished()
+        };
         // The received etag — footer first, else the request header — must
         // match the streamed md5 (server.py:996-1007; the body is already
         // consumed at this point, as in Python).
@@ -1007,6 +1031,7 @@ impl ObjectServer {
             ));
         }
 
+        let _commit_stage = swift_core::stage::StageTimer::start("object-server", "put", "commit");
         if let Err(e) = writer.put(metadata) {
             writer.close();
             return match e {
@@ -1014,6 +1039,7 @@ impl ObjectServer {
                 other => plain_response(500, &other.to_string()),
             };
         }
+        drop(_commit_stage);
         // Two-phase commit (server.py:1009-1021): the fragment is on disk
         // but NOT durable; tell the proxy with a second 100 Continue (which
         // also re-arms the chunked body for the commit sequence), then
@@ -1414,6 +1440,14 @@ impl ObjectServer {
             Ok(df) => df,
             Err(e) => return plain_response(500, &e.to_string()),
         };
+        // Python `allow_open_expired` / `X-Open-Expired: true`: open a file that
+        // is past X-Delete-At but has not been reaped yet. Default remains 404.
+        let open_expired = req
+            .headers
+            .get("X-Open-Expired")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false);
+        df = df.with_open_expired(open_expired);
         let opened = match df.open(None) {
             Ok(df) => df,
             Err(DiskFileError::Deleted { timestamp, .. }) => {

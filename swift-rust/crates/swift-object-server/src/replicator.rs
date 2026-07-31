@@ -176,7 +176,10 @@ pub fn replicate_partition(
     syncer: &dyn SuffixSyncer,
     stats: &mut ReplicatorStats,
 ) {
-    let local = local_hashes(partition_path, policy, cleanup);
+    let local = {
+        let _scan = swift_core::stage::StageTimer::start("object-replicator", "replication", "scan");
+        local_hashes(partition_path, policy, cleanup)
+    };
     for peer in peers {
         let Some(remote) = hash_client.peer_hashes(peer, device, partition, policy_index) else {
             stats.failures += 1;
@@ -187,23 +190,31 @@ pub fn replicate_partition(
             continue;
         }
         let mut ok = true;
-        for suffix in &diff {
-            if syncer.sync_suffix(
-                &partition_path.join(suffix),
-                peer,
-                device,
-                partition,
-                suffix,
-                policy_index,
-            ) {
-                stats.suffix_syncs += 1;
-            } else {
-                ok = false;
+        {
+            let _sync =
+                swift_core::stage::StageTimer::start("object-replicator", "replication", "sync");
+            for suffix in &diff {
+                if syncer.sync_suffix(
+                    &partition_path.join(suffix),
+                    peer,
+                    device,
+                    partition,
+                    suffix,
+                    policy_index,
+                ) {
+                    stats.suffix_syncs += 1;
+                } else {
+                    ok = false;
+                }
             }
         }
         // Only ask the peer to rehash once the pushes it depends on succeeded.
-        if ok && !hash_client.peer_rehash(peer, device, partition, &diff, policy_index) {
-            ok = false;
+        {
+            let _fin =
+                swift_core::stage::StageTimer::start("object-replicator", "replication", "finalize");
+            if ok && !hash_client.peer_rehash(peer, device, partition, &diff, policy_index) {
+                ok = false;
+            }
         }
         if !ok {
             stats.failures += 1;

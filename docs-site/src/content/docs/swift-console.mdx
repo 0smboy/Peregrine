@@ -29,7 +29,8 @@ without a client-side framework.
   <Card title="Lab">
     Tools that explain and stress the cluster: RingScope, policy compare, Object
     Capsule, Tombstone Museum, Chaos Arcade, Node HA Drill, Repair Debt Index,
-    and Protocol Mutation (Shadow).
+    Protocol Mutation (Shadow), Expired-but-Alive Observatory, Profile
+    Cartographer, and Cluster Genome Lab.
   </Card>
 </CardGrid>
 
@@ -109,6 +110,31 @@ On the azure build host a Python SAIO already listens on `127.0.0.1:8081` (same
 `test:tester` / cluster key). Point `shadow_peer_base` there for dual-mode
 对照. A Rust SAIO on `:8090` is available for same-topology A/B if you swap the
 peer URL.
+
+## Lab: Expired-but-Alive Observatory
+
+`GET /lab/expired` seeds staggered `X-Delete-At` objects and polls ordinary
+GET vs `X-Open-Expired: true` plus SSH disk presence. States:
+
+`Alive → Logically Expired → Recoverable Ghost → Physically Reaped`
+
+Summary tiles report mean / P95 / max ghost period. Requires the proxy and
+object-server to forward / honour `X-Open-Expired` (Rust path now does). If the
+object-expirer is not running, objects stay Recoverable Ghost — reported as a
+finding, not faked into reaped.
+
+## Lab: Profile Cartographer
+
+`GET /lab/profilemap` turns stage timers into an architecture tree (Proxy /
+Object / Replicator). Pulse PUTs via `POST /lab/api/profilemap/pulse`, then
+read `GET /lab/api/profilemap/snapshot?path=put|replication|get`. Sources:
+process-local `/recon/stage` on nodes, or Prom `swift_stage_*` when present.
+
+## Lab: Cluster Genome Lab
+
+`GET /lab/genome` evolves object-ring **weights** only under a simulated fault
+suite (`swift-ring-sim`), then shows a Pareto front (lowest migration, highest
+availability, lowest waste, fastest repair proxy). Never writes the live ring.
 
 ## Rust Toolchain Canary
 

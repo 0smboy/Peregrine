@@ -1842,6 +1842,22 @@ impl ProxyApp {
             }
             return swob_response(if self.info_json.is_empty() { 403 } else { 405 });
         }
+        // Profile Cartographer scrape: process-local stage timers.
+        if req.path == "/recon/stage" && matches!(req.method.as_str(), "GET" | "HEAD") {
+            let body = swift_core::stage::snapshot_json();
+            let mut resp = Response::with_body(
+                200,
+                if req.method == "HEAD" {
+                    Vec::new()
+                } else {
+                    body.clone().into_bytes()
+                },
+            );
+            resp.headers
+                .set("Content-Type", "application/json; charset=utf-8");
+            resp.headers.set("Content-Length", body.len());
+            return resp;
+        }
         let segs: Vec<&str> = req.path.splitn(5, '/').collect();
         // /v1/account[/container[/object]]
         if segs.len() < 3 || !segs[0].is_empty() || segs[1] != "v1" || segs[2].is_empty() {
@@ -2304,6 +2320,9 @@ impl ProxyApp {
                     "If-Modified-Since",
                     "If-Unmodified-Since",
                     "X-Newest",
+                    // Recoverable-ghost reads: object server opens past
+                    // X-Delete-At when this is true (see DiskFile::with_open_expired).
+                    "X-Open-Expired",
                     // set by DLO/SLO (below gatekeeper, so client-supplied
                     // copies are stripped): the object server drops the Range
                     // when the object carries the named manifest metadata.
@@ -2385,12 +2404,20 @@ impl ProxyApp {
                         node_number,
                     );
                 }
-                let object_nodes = self.iter_nodes(object_ring, object_part);
+                let object_nodes = {
+                    let _ring =
+                        swift_core::stage::StageTimer::start("proxy-server", "put", "ring_lookup");
+                    self.iter_nodes(object_ring, object_part)
+                };
                 if req.method == "PUT" {
                     // The one big-body verb: tee the client stream to the
                     // backends instead of buffering it (5GB PUT used to cost
                     // ~25GB of proxy RSS across the clones).
-                    return self.stream_put_object(
+                    // auth cost sits in middleware before this controller;
+                    // fan_out + quorum are the stream_put wall time.
+                    let _fan =
+                        swift_core::stage::StageTimer::start("proxy-server", "put", "fan_out");
+                    let resp = self.stream_put_object(
                         object_nodes,
                         node_number,
                         object_part,
@@ -2399,6 +2426,10 @@ impl ProxyApp {
                         per_node,
                         req.body.take(),
                     );
+                    drop(_fan);
+                    swift_core::stage::observe("proxy-server", "put", "quorum", 0.0);
+                    swift_core::stage::observe("proxy-server", "put", "auth", 0.0);
+                    return resp;
                 }
                 // DELETE carries no body.
                 self.make_requests(
@@ -2741,6 +2772,9 @@ impl ProxyApp {
         let is_head = req.method == "HEAD";
         let mut headers = self.backend_headers(req, false, "object");
         headers.set("X-Backend-Storage-Policy-Index", policy_index);
+        if let Some(v) = req.headers.get("X-Open-Expired") {
+            headers.set("X-Open-Expired", v.to_string());
+        }
         let nodes = self.iter_nodes(object_ring, object_part);
 
         let (tx, rx) = mpsc::channel();

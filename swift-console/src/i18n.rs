@@ -510,6 +510,96 @@ pub fn t(l: &str, key: &'static str) -> &'static str {
              working files expire, published artifacts keep lineage, and agents read and \
              write it over MCP — the same data the console shows."
         },
+        "lab.tool.expired.title" => if zh {
+            "过期幽灵观察站"
+        } else {
+            "Expired-but-Alive Observatory"
+        },
+        "lab.tool.expired.blurb" => if zh {
+            "观察对象逻辑过期与物理清除之间的灰色阶段：普通 GET、X-Open-Expired、磁盘与幽灵期统计。"
+        } else {
+            "Watch the grey zone between logical expiry and physical reaping: ordinary GET, \
+             X-Open-Expired, disk presence, and ghost-period stats."
+        },
+        "exp.leg.alive" => if zh {
+            "未到 X-Delete-At，对用户可见"
+        } else {
+            "before X-Delete-At; visible to clients"
+        },
+        "exp.leg.logical" => if zh {
+            "已过期；普通请求 404"
+        } else {
+            "past deadline; ordinary requests 404"
+        },
+        "exp.leg.ghost" => if zh {
+            "磁盘仍在（或 open-expired 可读）"
+        } else {
+            "still on disk (or open-expired readable)"
+        },
+        "exp.leg.reaped" => if zh {
+            "磁盘与 open-expired 均已消失"
+        } else {
+            "gone from disk and open-expired"
+        },
+        "exp.k.mean" => if zh { "平均幽灵期" } else { "Mean ghost period" },
+        "exp.k.p95" => if zh { "P95 幽灵期" } else { "P95 ghost period" },
+        "exp.k.max" => if zh { "最长幽灵期" } else { "Max ghost period" },
+        "exp.btn.run" => if zh { "播种实验" } else { "Seed run" },
+        "exp.btn.poll" => if zh { "立即探测" } else { "Poll now" },
+        "exp.h.anom" => if zh { "异常" } else { "Anomalies" },
+        "exp.anom.none" => if zh { "暂无异常" } else { "No anomalies yet" },
+        "exp.idle" => if zh {
+            "尚未播种。点「播种实验」创建带阶梯 TTL 的对象。"
+        } else {
+            "No run yet. Seed staggered-TTL objects to begin."
+        },
+        "lab.tool.profilemap.title" => if zh {
+            "剖析架构地图"
+        } else {
+            "Profile Cartographer"
+        },
+        "lab.tool.profilemap.blurb" => if zh {
+            "把 Proxy / Object / Replicator 的阶段耗时收成架构热力树，而不是函数火焰图。"
+        } else {
+            "Turn Proxy / Object / Replicator stage time into an architecture heat tree — \
+             not a function flame graph."
+        },
+        "pmap.note" => if zh {
+            "阶段数据来自各节点 /recon/stage（及可选 Prom）。先脉冲 PUT 再刷新树。"
+        } else {
+            "Stage data comes from /recon/stage on nodes (and Prom when present). Pulse PUTs, then refresh."
+        },
+        "pmap.btn.pulse" => if zh { "脉冲负载" } else { "Pulse load" },
+        "pmap.path" => if zh { "路径" } else { "Path" },
+        "pmap.empty" => if zh {
+            "尚无阶段样本。部署带 stage 计时的二进制并脉冲负载。"
+        } else {
+            "No stage samples yet. Deploy stage-instrumented binaries and pulse load."
+        },
+        "lab.tool.genome.title" => if zh {
+            "集群基因组实验室"
+        } else {
+            "Cluster Genome Lab"
+        },
+        "lab.tool.genome.blurb" => if zh {
+            "在模拟故障下进化 ring 权重，给出迁移量 / 可用性 / 浪费的 Pareto 前沿。"
+        } else {
+            "Evolve ring weights under simulated faults; return a Pareto front for migration, \
+             availability, and waste."
+        },
+        "genome.note" => if zh {
+            "只改权重副本，不写生产 ring。每代经历设备失效与 zone 压力，再 rebalance。"
+        } else {
+            "Weight copies only — never writes the live ring. Each generation fails a device, \
+             stresses a zone, then rebalances."
+        },
+        "genome.btn.run" => if zh { "进化一代种群" } else { "Evolve population" },
+        "genome.idle" => if zh {
+            "尚未运行。点按钮开始 weight-only 进化。"
+        } else {
+            "No run yet. Start a weight-only evolution."
+        },
+        "genome.empty" => if zh { "前沿为空" } else { "Empty front" },
         "lab.tool.debt.title" => if zh { "修复债务指数" } else { "Repair Debt Index" },
         "lab.tool.debt.blurb" => if zh {
             "把复制积压、磁盘压力、ring 不平衡和修复吞吐压成一个状态变量：损伤速度是否超过自我修复速度？"
@@ -2905,6 +2995,14 @@ mod tests {
             "debt.tti.none", "debt.tti.insolvent", "debt.h.top", "debt.h.bars",
             "debt.h.feed", "debt.c.backlog", "debt.c.balance", "debt.c.disk",
             "debt.c.failures", "debt.c.unhealthy",
+            "lab.tool.expired.title", "lab.tool.expired.blurb",
+            "exp.leg.alive", "exp.leg.logical", "exp.leg.ghost", "exp.leg.reaped",
+            "exp.k.mean", "exp.k.p95", "exp.k.max", "exp.btn.run", "exp.btn.poll",
+            "exp.h.anom", "exp.anom.none", "exp.idle",
+            "lab.tool.profilemap.title", "lab.tool.profilemap.blurb",
+            "pmap.note", "pmap.btn.pulse", "pmap.path", "pmap.empty",
+            "lab.tool.genome.title", "lab.tool.genome.blurb",
+            "genome.note", "genome.btn.run", "genome.idle", "genome.empty",
         "chaos.armed", "chaos.busy", "chaos.by.none", "chaos.by.reconstructor",
         "chaos.by.replicator", "chaos.by.unknown", "chaos.cmp.actual",
         "chaos.cmp.never", "chaos.cmp.notconverged", "chaos.cmp.predicted",

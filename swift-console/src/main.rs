@@ -9,6 +9,9 @@ mod capsule;
 mod chaos;
 mod debt;
 mod economist;
+mod expired;
+mod genome;
+mod profilemap;
 mod files_api;
 mod i18n;
 mod lab;
@@ -353,6 +356,16 @@ async fn main() {
         .route("/lab/api/node/up", post(nodeops::up))
         .route("/lab/debt", get(debt::page))
         .route("/lab/api/debt/snapshot", get(debt::snapshot))
+        .route("/lab/expired", get(expired::page))
+        .route("/lab/api/expired/run", post(expired::run))
+        .route("/lab/api/expired/poll", post(expired::poll))
+        .route("/lab/api/expired/status", get(expired::status))
+        .route("/lab/profilemap", get(profilemap::page))
+        .route("/lab/api/profilemap/pulse", post(profilemap::pulse))
+        .route("/lab/api/profilemap/snapshot", get(profilemap::snapshot))
+        .route("/lab/genome", get(genome::page))
+        .route("/lab/api/genome/evolve", post(genome::evolve))
+        .route("/lab/api/genome/result", get(genome::result))
         .route("/lab/ring", get(pages::lab_ring))
         .route("/lab/policy", get(pages::lab_policy))
         .route("/lab/api/policy/defaults", get(policyapi::defaults))
