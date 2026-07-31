@@ -57,6 +57,13 @@ Docs site: https://peregrine-docs-ochre.vercel.app
 - Result home moved to `/root/.autocos`
 - Smoke: login 200, `sc_lang=en` cookie set, static JS contains drill/chart helpers, shadow API returns 401 without session (not a Content-Type rejection)
 
+### Follow-up fix (same day, redeployed)
+
+- **Single-node monitor empty:** PromQL `{nf}` used `\.` in double-quoted regex → Prometheus 400 → UI showed “no data”. Fixed to `[.]`.
+- **Drill-down overlap:** each series now gets its own chart/axis; legend/table click isolates one series (e.g. P50 alone).
+- **RingScope / Policy charts not binding:** `data-page` was `lab-ringscope` / `lab-economist` but JS listened for `lab-ring` / `lab-policy` — both accepted now.
+- **Agent warehouse:** clearer “what this does” strip, job cards first, lineage graph only for jobs with objects, MCP folded under details.
+
 ## What is left
 
 1. **Click-verify in a browser** (console is loopback-only — SSH tunnel or on-host browser):
