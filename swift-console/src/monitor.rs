@@ -312,13 +312,23 @@ fn log_node_filter(node: &str) -> String {
     format!(",host=\"{}\"", node.replace('"', ""))
 }
 
+/// Escape a literal for a PromQL double-quoted regex. PromQL string literals
+/// reject `\.` (`unknown escape sequence`); a literal dot has to be written
+/// as `[.]`, and a real backslash as `\\`.
 fn regex_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 4);
+    let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
-        if "\\.^$|?*+()[]{}".contains(c) {
-            out.push('\\');
+        match c {
+            '.' => out.push_str("[.]"),
+            '\\' => out.push_str("\\\\"),
+            '^' | '$' | '|' | '?' | '*' | '+' | '(' | ')' | '[' | ']' | '{' | '}' => {
+                // PromQL keeps one backslash only when the source has two.
+                out.push('\\');
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
         }
-        out.push(c);
     }
     out
 }
@@ -408,7 +418,7 @@ pub(crate) async fn q_range(
     step: i64,
 ) -> Result<Value, String> {
     let url = format!("{}/api/v1/query_range", state.cfg.metrics_url);
-    state
+    let data: Value = state
         .http
         .get(&url)
         .query(&[
@@ -422,7 +432,15 @@ pub(crate) async fn q_range(
         .map_err(|e| e.to_string())?
         .json::<Value>()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if data.get("status").and_then(|s| s.as_str()) == Some("error") {
+        return Err(data
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("query failed")
+            .to_string());
+    }
+    Ok(data)
 }
 
 pub(crate) async fn q_log_range(
@@ -705,4 +723,17 @@ fn err_json(e: &str) -> Response {
     // Never surface backend identity in an error; keep it generic.
     let _ = e;
     Json(json!({"error": "metrics temporarily unavailable"})).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn promql_regex_escape_avoids_dot_backslash() {
+        let s = regex_escape("10.42.10.11");
+        assert!(!s.contains("\\."), "PromQL rejects \\. in double-quoted strings: {s}");
+        assert!(s.contains("[.]"), "{s}");
+        assert_eq!(regex_escape("swift1"), "swift1");
+    }
 }

@@ -1747,7 +1747,14 @@ pub fn lineage_svg(lang: &str, r: &Report, now: u64) -> String {
     const GAP: i32 = 26;
     const PADT: i32 = 10;
 
-    let shown: Vec<&Job> = r.jobs.iter().take(GRAPH_JOBS).collect();
+    // Empty layout-only jobs make a sparse graph of "no input / no output"
+    // boxes; those belong in the job cards, not here.
+    let shown: Vec<&Job> = r
+        .jobs
+        .iter()
+        .filter(|j| !j.inputs.is_empty() || !j.working.is_empty() || !j.artifacts.is_empty())
+        .take(GRAPH_JOBS)
+        .collect();
     if shown.is_empty() {
         return String::new();
     }
@@ -2073,25 +2080,107 @@ fn render(lang: &str, r: &Report, note: &str, err: &str) -> String {
         ));
     }
 
-    // ---- lineage graph
+    // ---- what this is (before the data dump)
+    out.push_str(&how_it_works(lang));
+
+    // ---- jobs as cards (the primary index)
+    out.push_str(&sec(i18n::t(lang, "wh.sec.jobs"), job_cards(lang, r)));
+
+    // ---- lineage graph (only jobs with objects) + table under details
     let graph = lineage_svg(lang, r, now);
-    let cap = if r.jobs.len() > GRAPH_JOBS {
-        format!(
-            "<p class=\"note wh-note\">{}</p>",
-            esc(&tr(lang, "wh.g.cap", &[("{n}", &GRAPH_JOBS.to_string())]))
-        )
+    let graph_block = if graph.is_empty() {
+        empty(i18n::t(lang, "wh.empty.nolineage"))
     } else {
-        String::new()
+        format!(
+            "<p class=\"note wh-note\">{}</p>\
+             <div class=\"wh-graph\">{}</div>\
+             <details class=\"wh-data\"><summary>{}</summary>{}</details>",
+            esc(i18n::t(lang, "wh.graph.note")),
+            graph,
+            esc(if lang == "zh" { "血缘数据表" } else { "Lineage data table" }),
+            lineage_table(lang, r),
+        )
     };
-    out.push_str(&sec(
-        i18n::t(lang, "wh.sec.lineage"),
-        format!("{graph}{cap}{}", lineage_table(lang, r)),
-    ));
+    out.push_str(&sec(i18n::t(lang, "wh.sec.lineage"), graph_block));
 
     // ---- expiry
     out.push_str(&sec(i18n::t(lang, "wh.sec.expiry"), expiry_block(lang, r, now)));
 
-    // ---- jobs
+    // ---- actions
+    out.push_str(&sec(
+        i18n::t(lang, "wh.sec.actions"),
+        format!("{}{}", create_form(lang), promote_block(lang, r)),
+    ));
+
+    // ---- MCP (reference; people don't need it to use the page)
+    out.push_str(&format!(
+        "<details class=\"wh-mcp\"><summary class=\"wh-h\">{}</summary>\
+         <p class=\"note wh-note\">{}</p>{}</details>",
+        esc(i18n::t(lang, "wh.sec.mcp")),
+        esc(i18n::t(lang, "wh.sec.mcp.sum")),
+        mcp_section(lang),
+    ));
+    out
+}
+
+fn how_it_works(lang: &str) -> String {
+    format!(
+        "<div class=\"wh-how\">\
+           <div class=\"wh-how-t\">{}</div>\
+           <div class=\"wh-how-grid\">\
+             <div class=\"wh-how-i\"><b>{}</b><p>{}</p></div>\
+             <div class=\"wh-how-i\"><b>{}</b><p>{}</p></div>\
+             <div class=\"wh-how-i\"><b>{}</b><p>{}</p></div>\
+           </div>\
+         </div>",
+        esc(i18n::t(lang, "wh.how.title")),
+        esc(i18n::t(lang, "wh.how.1.t")),
+        esc(i18n::t(lang, "wh.how.1.d")),
+        esc(i18n::t(lang, "wh.how.2.t")),
+        esc(i18n::t(lang, "wh.how.2.d")),
+        esc(i18n::t(lang, "wh.how.3.t")),
+        esc(i18n::t(lang, "wh.how.3.d")),
+    )
+}
+
+fn job_cards(lang: &str, r: &Report) -> String {
+    let mut cards = String::from("<div class=\"wh-jobs\">");
+    for j in &r.jobs {
+        let goal = if j.goal.is_empty() {
+            i18n::t(lang, "wh.g.nogoal")
+        } else {
+            j.goal.as_str()
+        };
+        cards.push_str(&format!(
+            "<article class=\"wh-job\">\
+               <header class=\"wh-job-h\">\
+                 <span class=\"wh-job-st\">{st}</span>\
+                 <code class=\"wh-job-id\">{id}</code>\
+               </header>\
+               <div class=\"wh-job-goal\">{goal}</div>\
+               <div class=\"wh-job-m\">\
+                 <span><b>{i}</b> {il}</span>\
+                 <span><b>{w}</b> {wl}</span>\
+                 <span><b>{a}</b> {al}</span>\
+                 <span>{b}</span>\
+               </div>\
+               <div class=\"wh-job-when\">{when}</div>\
+             </article>",
+            st = esc(state_label(lang, j.state())),
+            id = esc(&j.id),
+            goal = esc(&trunc(goal, 80)),
+            i = j.inputs.len(),
+            w = j.working.len(),
+            a = j.artifacts.len(),
+            il = esc(i18n::t(lang, "wh.card.inputs")),
+            wl = esc(i18n::t(lang, "wh.card.working")),
+            al = esc(i18n::t(lang, "wh.card.arts")),
+            b = esc(&fmt_bytes(j.bytes)),
+            when = esc(&fmt_utc(j.created)),
+        ));
+    }
+    cards.push_str("</div>");
+    // Full table kept for export-grade scanning, not as the first read.
     let rows: Vec<String> = r
         .jobs
         .iter()
@@ -2103,7 +2192,14 @@ fn render(lang: &str, r: &Report, note: &str, err: &str) -> String {
                 id = esc(&x.id),
                 st = esc(state_label(lang, x.state())),
                 when = esc(&fmt_utc(x.created)),
-                goal = esc(&trunc(if x.goal.is_empty() { i18n::t(lang, "wh.g.nogoal") } else { x.goal.as_str() }, 60)),
+                goal = esc(&trunc(
+                    if x.goal.is_empty() {
+                        i18n::t(lang, "wh.g.nogoal")
+                    } else {
+                        x.goal.as_str()
+                    },
+                    60
+                )),
                 i = x.inputs.len(),
                 w = x.working.len(),
                 a = x.artifacts.len(),
@@ -2111,8 +2207,9 @@ fn render(lang: &str, r: &Report, note: &str, err: &str) -> String {
             )
         })
         .collect();
-    out.push_str(&sec(
-        i18n::t(lang, "wh.sec.jobs"),
+    format!(
+        "{cards}<details class=\"wh-data\"><summary>{}</summary>{}</details>",
+        esc(if lang == "zh" { "任务数据表" } else { "Jobs data table" }),
         tbl(
             &[
                 i18n::t(lang, "wh.th.job"),
@@ -2125,18 +2222,8 @@ fn render(lang: &str, r: &Report, note: &str, err: &str) -> String {
                 i18n::t(lang, "wh.th.bytes"),
             ],
             rows,
-        ),
-    ));
-
-    // ---- actions
-    out.push_str(&sec(
-        i18n::t(lang, "wh.sec.actions"),
-        format!("{}{}", create_form(lang), promote_block(lang, r)),
-    ));
-
-    // ---- MCP
-    out.push_str(&sec(i18n::t(lang, "wh.sec.mcp"), mcp_section(lang)));
-    out
+        )
+    )
 }
 
 /// The evidence behind the lineage sentence: every artifact, what it came from,

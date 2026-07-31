@@ -467,10 +467,31 @@ pub fn t(l: &str, key: &'static str) -> &'static str {
         },
         "lab.tool.warehouse.title" => if zh { "Agent 仓库" } else { "Agent Warehouse" },
         "lab.tool.warehouse.blurb" => if zh {
-            "给 agent 的对象工作空间：按任务分容器、保留血缘、中间产物自动过期，并通过 MCP 暴露。"
+            "这是集群上的一块对象工作区，专门给自动化任务用：每个任务一个目录，中间文件会过期，\
+             正式产出留下血缘，agent 通过 MCP 读写，人和控制台看的是同一份数据。"
         } else {
-            "An object workspace built for agents: a container per job, lineage kept, working \
-             files expired automatically, exposed over MCP."
+            "A cluster-side object workspace for automated jobs: one directory per job, \
+             working files expire, published artifacts keep lineage, and agents read and \
+             write it over MCP — the same data the console shows."
+        },
+        "wh.how.title" => if zh { "它实际在做什么" } else { "What this actually does" },
+        "wh.how.1.t" => if zh { "1. 建任务" } else { "1. Create a job" },
+        "wh.how.1.d" => if zh {
+            "在集群上建出 inputs/、working/、artifacts/ 四个目录，并写入任务说明。"
+        } else {
+            "Creates inputs/, working/, and artifacts/ on the cluster and writes a job manifest."
+        },
+        "wh.how.2.t" => if zh { "2. 写中间结果" } else { "2. Write working files" },
+        "wh.how.2.d" => if zh {
+            "中间产物进 working/，由 Swift 的临时 URL / 过期时间负责删除，不会永久占盘。"
+        } else {
+            "Intermediate outputs go into working/ and expire under Swift’s own delete-at rules."
+        },
+        "wh.how.3.t" => if zh { "3. 发布产出" } else { "3. Publish artifacts" },
+        "wh.how.3.d" => if zh {
+            "值得留下的文件提升到 artifacts/，并记下它是从哪些输入算出来的，方便事后核对。"
+        } else {
+            "Keepers are promoted into artifacts/ with the inputs they were built from recorded."
         },
 
         // ---- Chaos Arcade ----
@@ -1121,11 +1142,25 @@ pub fn t(l: &str, key: &'static str) -> &'static str {
             "This scan reads lineage for at most {n} objects. Anything past that is reported as unknown rather than assumed clean."
         },
 
-        "wh.sec.lineage" => if zh { "血缘：输入、任务、artifact" } else { "Lineage: inputs, job, artifacts" },
-        "wh.sec.expiry" => if zh { "什么会消失，什么时候" } else { "What disappears, and when" },
-        "wh.sec.jobs" => if zh { "任务" } else { "Jobs" },
-        "wh.sec.actions" => if zh { "动手操作" } else { "Run something" },
-        "wh.sec.mcp" => if zh { "Agent 接入端点" } else { "Agent endpoint" },
+        "wh.sec.lineage" => if zh { "数据从哪来、到哪去" } else { "Where data came from and went" },
+        "wh.sec.expiry" => if zh { "即将过期的中间文件" } else { "Working files about to expire" },
+        "wh.sec.jobs" => if zh { "任务一览" } else { "Jobs" },
+        "wh.sec.actions" => if zh { "在这里建一个任务" } else { "Create a job here" },
+        "wh.sec.mcp" => if zh { "给 agent 用的 MCP 接口" } else { "MCP endpoint for agents" },
+        "wh.sec.mcp.sum" => if zh {
+            "展开查看端点、协议和工具列表（人用本页即可，不必先读这些）"
+        } else {
+            "Endpoint, protocol, and tool list — people can use this page without opening this"
+        },
+        "wh.card.inputs" => if zh { "输入" } else { "inputs" },
+        "wh.card.working" => if zh { "中间" } else { "working" },
+        "wh.card.arts" => if zh { "产出" } else { "artifacts" },
+        "wh.graph.note" => if zh {
+            "下图只画有内容的任务：左输入 → 中任务 → 右产出。空任务见上方卡片。"
+        } else {
+            "The graph only draws jobs that hold objects: inputs left, job centre, outputs right. \
+             Empty jobs are listed in the cards above."
+        },
 
         "wh.st.published" => if zh { "已发布" } else { "published" },
         "wh.st.working" => if zh { "进行中" } else { "in progress" },

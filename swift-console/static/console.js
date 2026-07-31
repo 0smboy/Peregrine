@@ -1068,7 +1068,8 @@
 
     function panelUrl(p, range) {
       var u = "/monitor/api/panel?id=" + encodeURIComponent(p.id) + "&range=" + range;
-      if (mon.node && p.node_scoped) u += "&node=" + encodeURIComponent(mon.node);
+      // Always pin the node when one is selected. Panels without `{nf}` ignore it.
+      if (mon.node) u += "&node=" + encodeURIComponent(mon.node);
       return u;
     }
 
@@ -1118,16 +1119,20 @@
       card._resp = resp; // reused by the drill without a second query
       var legend = lineChart(body, resp, p.unit);
       if (leg && legend.length) {
-        legend.forEach(function (l) {
-          var it = document.createElement("span"); it.className = "mon-leg-i" + (l.key ? " linked" : "");
+        legend.forEach(function (l, li) {
+          var it = document.createElement("span"); it.className = "mon-leg-i linked";
           var sw = document.createElement("i"); sw.className = l.cls;
           var nm = document.createElement("b"); nm.textContent = l.name;
           var vv = document.createElement("em"); vv.textContent = fmtVal(l.unit, l.last);
           it.appendChild(sw); it.appendChild(nm); it.appendChild(vv);
-          if (l.key) {
-            it.title = T("Open ", "查看 ") + l.key;
-            it.addEventListener("click", function (ev) { ev.stopPropagation(); selectNode(l.key); });
-          }
+          it.title = l.key
+            ? T("Open node ", "查看节点 ") + l.key
+            : T("Open series ", "单独查看 ") + l.name;
+          it.addEventListener("click", function (ev) {
+            ev.stopPropagation();
+            if (l.key) selectNode(l.key);
+            else openDrill(p, l.name);
+          });
           leg.appendChild(it);
         });
       }
@@ -1229,7 +1234,7 @@
     var drill = $("#mon-drill"), drillT = $("#mon-drill-t"),
         drillBody = $("#mon-drill-body"), drillTable = $("#mon-drill-table"),
         drillRange = $("#mon-drill-range"), drillClose = $("#mon-drill-close");
-    var drillState = { p: null, range: 3600 };
+    var drillState = { p: null, range: 3600, focus: "" };
 
     function seriesStats(s) {
       var vals = (s.points || []).map(function (p) { return p[1]; })
@@ -1245,8 +1250,33 @@
       drillBody.innerHTML = ""; drillTable.innerHTML = "";
       if (!p || resp.error) { drillBody.innerHTML = '<div class="mon-empty">' + T("Unavailable", "暂不可用") + '</div>'; return; }
       if (p.kind === "logs" || resp.kind === "logs") { logView(drillBody, resp); return; }
-      var legend = lineChart(drillBody, resp, p.unit, { h: 300 });
-      // The numbers behind the lines: nothing the chart shows is unreadable.
+
+      var all = resp.series || [];
+      var focus = drillState.focus;
+      var shown = focus
+        ? all.filter(function (s) { return s.name === focus; })
+        : all;
+      if (!shown.length) {
+        drillBody.innerHTML = '<div class="mon-empty">' + T("No data in range", "该区间内没有数据") + '</div>';
+        return;
+      }
+
+      // One chart per series so P50 is never crushed under P99 on a shared axis.
+      var wrap = document.createElement("div"); wrap.className = "mon-drill-split";
+      shown.forEach(function (s, i) {
+        var card = document.createElement("div"); card.className = "mon-drill-one";
+        var h = document.createElement("div"); h.className = "mon-drill-one-h";
+        var sw = document.createElement("i"); sw.className = "mon-leg-sw mon-s" + ((i % 6) + 1);
+        var nm = document.createElement("b"); nm.textContent = s.name;
+        h.appendChild(sw); h.appendChild(nm);
+        var body = document.createElement("div"); body.className = "mon-body";
+        lineChart(body, { series: [s] }, p.unit, { h: shown.length === 1 ? 280 : 180 });
+        card.appendChild(h); card.appendChild(body);
+        wrap.appendChild(card);
+      });
+      drillBody.appendChild(wrap);
+
+      // Numbers for every series in the panel; click a row to isolate that line.
       var tbl = document.createElement("table"); tbl.className = "tbl mon-drill-tbl";
       var thead = document.createElement("thead");
       thead.innerHTML = "<tr><th></th><th>" + T("Series", "系列") + "</th><th>" +
@@ -1254,18 +1284,35 @@
         T("Avg", "平均") + "</th><th>" + T("Max", "最大") + "</th></tr>";
       tbl.appendChild(thead);
       var tb = document.createElement("tbody");
-      (resp.series || []).forEach(function (s, i) {
+      all.forEach(function (s, i) {
         var st = seriesStats(s); if (!st) return;
         var tr = document.createElement("tr");
+        if (focus && s.name === focus) tr.classList.add("on");
+        tr.style.cursor = "pointer";
         var sw = "<i class='mon-leg-sw " + ("mon-s" + ((i % 6) + 1)) + "'></i>";
         tr.innerHTML = "<td>" + sw + "</td><td>" + s.name + "</td><td>" + fmtVal(p.unit, st.last) +
           "</td><td>" + fmtVal(p.unit, st.min) + "</td><td>" + fmtVal(p.unit, st.avg) +
           "</td><td>" + fmtVal(p.unit, st.max) + "</td>";
+        tr.addEventListener("click", function () {
+          drillState.focus = (drillState.focus === s.name) ? "" : s.name;
+          drillT.textContent = p.title +
+            (mon.node ? " · " + mon.node : "") +
+            (drillState.focus ? " · " + drillState.focus : "");
+          paintDrill(resp);
+        });
         tb.appendChild(tr);
       });
       tbl.appendChild(tb);
-      if (tb.children.length) drillTable.appendChild(tbl);
-      void legend;
+      if (tb.children.length) {
+        var hint = document.createElement("p");
+        hint.className = "note";
+        hint.textContent = T(
+          "Click a row to show only that series; click again to show all, each on its own axis.",
+          "点击一行只看该系列；再点一次恢复全部，每条线各自一条轴。"
+        );
+        drillTable.appendChild(hint);
+        drillTable.appendChild(tbl);
+      }
     }
 
     function fetchDrill() {
@@ -1276,7 +1323,7 @@
         .catch(function () { drillBody.innerHTML = '<div class="mon-empty">' + T("Unavailable", "暂不可用") + '</div>'; });
     }
 
-    function openDrill(p) {
+    function openDrill(p, focusName) {
       // A stat tile opens its history panel; everything else opens itself.
       var target = p;
       if (p.kind === "stat" && p.drill) {
@@ -1286,8 +1333,11 @@
         target = hit || { id: p.drill, title: p.title, kind: "series", unit: p.unit, node_scoped: true, drill: "" };
       }
       drillState.p = target;
+      drillState.focus = focusName || "";
       drillState.range = mon.range;
-      drillT.textContent = target.title + (mon.node ? " · " + mon.node : "");
+      drillT.textContent = target.title +
+        (mon.node ? " · " + mon.node : "") +
+        (drillState.focus ? " · " + drillState.focus : "");
       // range chips
       drillRange.innerHTML = "";
       [[900, T("15m", "15 分钟")], [3600, T("1h", "1 小时")], [21600, T("6h", "6 小时")],
@@ -1328,7 +1378,7 @@
   }
 
   // ------------------------------------------------------------- RingScope
-  if (PAGE === "lab-ring") {
+  if (PAGE === "lab-ring" || PAGE === "lab-ringscope") {
     var rs = { topo: null, ops: [], devices: [] };
     var out = $("#rs-out"), status = $("#rs-status");
 
@@ -2109,7 +2159,7 @@
   }
 
   // ---------------------------------------------------- Policy Economist
-  if (PAGE === "lab-policy") {
+  if (PAGE === "lab-policy" || PAGE === "lab-economist") {
     var peOut = $("#pe-out");
 
     function num(id, dflt) { var v = parseFloat($(id).value); return isFinite(v) ? v : dflt; }

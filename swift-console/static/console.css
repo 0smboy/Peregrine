@@ -1020,6 +1020,49 @@ input::placeholder, .filter::placeholder { color: var(--faint); }
    this file is shared by every Lab surface. */
 
 .wh-head { margin: 2px 0 18px; max-width: 78ch; }
+.wh-how {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 14px 16px; margin: 0 0 22px; max-width: 960px;
+}
+.wh-how-t { font-size: 13px; font-weight: 600; color: var(--mut); margin-bottom: 10px; }
+.wh-how-grid {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px;
+}
+.wh-how-i b { display: block; font-size: 14px; margin-bottom: 4px; }
+.wh-how-i p { margin: 0; font-size: 12.5px; color: var(--mut); line-height: 1.5; }
+.wh-jobs {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px;
+  margin-bottom: 10px;
+}
+.wh-job {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 12px 14px; min-height: 120px;
+}
+.wh-job-h { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+.wh-job-st { font-size: 11.5px; color: var(--accent-ink); font-weight: 600; }
+.wh-job-id { font-size: 11px; color: var(--faint); overflow-wrap: anywhere; }
+.wh-job-goal { font-size: 14px; font-weight: 600; line-height: 1.35; margin-bottom: 8px; }
+.wh-job-m {
+  display: flex; flex-wrap: wrap; gap: 10px; font-size: 12px; color: var(--mut);
+}
+.wh-job-m b { color: var(--ink); font-variant-numeric: tabular-nums; }
+.wh-job-when { font-size: 11px; color: var(--faint); margin-top: 8px; }
+.wh-graph {
+  overflow-x: auto; overflow-y: visible; max-width: 100%;
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 12px; margin-bottom: 10px;
+}
+.wh-graph .wh-svg { max-width: none; min-width: 900px; height: auto; }
+.wh-data { margin: 8px 0 0; }
+.wh-data > summary {
+  cursor: pointer; font-size: 13px; color: var(--mut); margin-bottom: 8px; user-select: none;
+}
+.wh-mcp { margin: 28px 0 8px; max-width: 960px; }
+.wh-mcp > summary.wh-h { cursor: pointer; list-style: disclosure-closed; }
+.wh-mcp[open] > summary.wh-h { list-style: disclosure-open; }
+@media (max-width: 800px) {
+  .wh-how-grid { grid-template-columns: 1fr; }
+}
 .wh-verdict { font-size: 19px; font-weight: 650; letter-spacing: -0.01em; line-height: 1.35; }
 .wh-verdict.ok { color: var(--accent-ink); }
 .wh-verdict.warn { color: var(--chart-3); }
@@ -1368,8 +1411,19 @@ input::placeholder, .filter::placeholder { color: var(--faint); }
 .mon-drill-h { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
 .mon-drill-h h2 { font-size: 15px; margin: 0; flex: 1; }
 .mon-drill-body { min-height: 120px; }
-.mon-drill-table { margin-top: 12px; max-height: 260px; overflow: auto; }
+.mon-drill-split { display: flex; flex-direction: column; gap: 14px; }
+.mon-drill-one {
+  background: var(--sunken); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 8px 10px 4px;
+}
+.mon-drill-one-h {
+  display: flex; align-items: center; gap: 8px; font-size: 13px; margin-bottom: 4px;
+}
+.mon-drill-one-h b { font-weight: 600; }
+.mon-drill-table { margin-top: 12px; max-height: 280px; overflow: auto; }
 .mon-drill-tbl td, .mon-drill-tbl th { font-variant-numeric: tabular-nums; }
+.mon-drill-tbl tr.on { background: var(--hover); }
+.mon-drill-tbl tr:hover { background: var(--hover); }
 .mon-leg-sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; }
 
 /* ---- RingScope: device chart + data-flow ribbons ---- */
