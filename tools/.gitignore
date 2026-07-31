@@ -1,0 +1,5 @@
+# Binary archives and large evidence bundles — keep markdown summaries only.
+test-results/pre-destroy-archive/
+test-results/*.tgz
+test-results/**/*.tgz
+*.log

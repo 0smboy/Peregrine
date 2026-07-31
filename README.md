@@ -68,8 +68,10 @@ golden fixtures that `swift-rust` is checked against.
   runs and collects the results; the console's Lab injects faults and verifies
   integrity.
 
-See [`docs/architecture.md`](docs/architecture.md) for the full picture and
-[`docs/testing.md`](docs/testing.md) for the verification strategy.
+See [`docs/architecture.md`](docs/architecture.md) for the full picture,
+[`docs/testing.md`](docs/testing.md) for the verification strategy, and
+[`docs/lab-cluster.md`](docs/lab-cluster.md) for the four-node Azure lab layout
+and cutover rules.
 
 ---
 
@@ -114,7 +116,9 @@ Peregrine/
 ├── cosbench-rs/        COSBench-compatible S3/Swift load generator
 ├── autocos/            benchmark automation over cosbench-rs
 ├── swift-console/      web console (files / deploy / monitor / lab)
-└── docs/               architecture and testing methodology
+├── docs/               architecture, testing, lab-cluster ops
+├── docs-site/          Nimbus docs published to Vercel
+└── tools/              cutover scripts + migration evidence summaries
 ```
 
 ## License

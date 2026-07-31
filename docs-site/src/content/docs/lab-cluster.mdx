@@ -1,0 +1,71 @@
+---
+title: Lab cluster
+description: Four-node Azure HA lab layout, EC build requirements, and cutover rules.
+sidebar:
+  order: 23
+---
+
+The development lab is a four-node Azure HA cluster used to prove Peregrine
+end-to-end — the same environment described under
+[Testing](/testing) §4. This page is the operator-facing layout; full cutover
+checklists live in the monorepo under `tools/`.
+
+## Planes
+
+| Plane | Purpose |
+|-------|---------|
+| Management | SSH, Prometheus scrape targets, console on the build host |
+| Replication | Object / account / container sync traffic |
+| Proxy | HAProxy on each node; Internal Load Balancer VIP for clients |
+
+Prefer hitting a **node HAProxy** (`:8085` on a proxy-plane address) when the
+client is itself a backend VM. Azure ILB hairpin from backends is unreliable;
+external VNet clients can use the VIP.
+
+Lab policies: replication `default`, and erasure coding `ec-2-1` via
+`liberasurecode_rs_vand`. Rings and the replication key must be identical on
+every node.
+
+## Install checklist
+
+- Full daemon set + HAProxy on each node.
+- Schedule the object auditor with a **timer** unit (a oneshot that never runs
+  again is a silent integrity gap).
+- Ship EC plugin libraries (`libnullcode`, `liberasurecode_rs_vand`) with a
+  working `liberasurecode_rs_vand.so.1.0.1` link.
+- Build release binaries **with the `ec` cargo features**. Without them the
+  proxy returns HTTP 501 for EC puts.
+- Observability on the build host: Prometheus, Loki, Alloy, statsd; `node_exporter`
+  on every node (`nodes_up` should be 4).
+- After copying binaries under SELinux, run `restorecon` so labels stay
+  executable (`bin_t`).
+
+## Build with erasure coding
+
+```sh
+cd swift-rust
+cargo build --release \
+  --features swift-proxy-server/ec,swift-object-server/ec
+```
+
+Install on Linux only — never copy macOS Mach-O binaries to the cluster.
+
+## Cluster cutover
+
+When replacing VMs or a subscription:
+
+1. Migrate configuration, rings, keys, binaries, systemd units, monitoring, and
+   lab tools.
+2. Treat `/srv/node` object bytes as **optional** — omit them for a fresh lab;
+   migrating them is a separate, slow data move.
+3. Re-run the hard gates: `func-suite.sh`, `ha-test.sh`, `ec-heal-test.sh`, and
+   confirm Prometheus `nodes_up=4`.
+
+Destroying the previous cluster permanently deletes any object data you did not
+copy. Keep a written go/no-go note before teardown.
+
+## See also
+
+- [Operations](/operations) — health, HA drill, EC heal
+- [Testing](/testing) — harness levels
+- [Get started](/getting-started) — local SAIO bootstrap

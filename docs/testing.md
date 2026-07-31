@@ -36,15 +36,20 @@ an implementation A/B, and against the 4-node cluster for production numbers.
 
 ## 4. Production, on the HA cluster
 
-The reference cluster is four nodes (`swift1–4`) behind an Azure load balancer
-with keepalive, running the full daemon set plus a Prometheus/Loki/statsd
-observability stack. Against it we run:
+The reference cluster is four nodes (`swift1–4`) behind an Azure load balancer,
+running the full daemon set plus a Prometheus/Loki/statsd observability stack.
+Layout, EC install rules, and cutover notes: [`lab-cluster.md`](lab-cluster.md).
 
-- the functional suite through the load-balancer VIP (the real client path);
+Against it we run:
+
+- the functional suite on the real client path (prefer node HAProxy `:8085`
+  when driving load from a backend VM — ILB hairpin is unreliable);
 - sustained `cosbench-rs`/`autocos` load at production concurrency;
 - the console **Lab** for fault injection (fragment loss → reconstructor heal,
   node down) with read-back integrity verification;
-- large-object streaming-memory checks (a multi-GB PUT/GET while sampling RSS).
+- large-object streaming-memory checks (a multi-GB PUT/GET while sampling RSS);
+- after a VM/subscription cutover: `ha-test.sh`, `ec-heal-test.sh`, and
+  Prometheus `nodes_up=4` before declaring the new cluster ready.
 
 ## What test infrastructure ships here
 
@@ -57,10 +62,14 @@ against any endpoint:
 | `bench.py` | concurrent throughput + latency-percentile benchmark |
 | `edge-diag.sh` | isolated checks for ETag, metadata, EC edge cases |
 | `acl-meta-verify.sh` | ACL enforcement/revocation and metadata-limit parity |
+| `ha-test.sh` | node-down failover drill |
+| `ec-heal-test.sh` | EC fragment-loss → reconstructor heal |
 | `py-saio-setup.sh` | stand up a Python Swift SAIO (parity oracle) |
 | `rust-saio-setup.sh` | stand up a single-node Rust SAIO |
 | `ci-fulltest.sh` | remote build + test + clippy + fmt |
 | `regress.sh` | full workspace regression tally |
+
+Operator cutover scripts and evidence summaries: repo-root [`tools/`](../tools/).
 
 ## The verification bar
 
