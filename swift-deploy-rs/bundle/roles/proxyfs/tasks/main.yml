@@ -48,13 +48,13 @@
     dest: /etc/proxyfsd.conf
     mode: '0640'
 
-- name: Touch temp file ostorage_proxyfs_account 
+- name: Touch temp file peregrine_proxyfs_account 
   file:
-    path: /tmp/ostorage_proxyfs_account
+    path: /tmp/peregrine_proxyfs_account
     state: touch
 
 - name: Get proxyfs account id
-  shell: 'cat /tmp/ostorage_proxyfs_account'
+  shell: 'cat /tmp/peregrine_proxyfs_account'
   register: proxyfs_account_id
 
 - name: Abort when cannnot get account id

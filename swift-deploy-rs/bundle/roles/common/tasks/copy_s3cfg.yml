@@ -9,7 +9,7 @@
   blockinfile:
     path: "/root/.s3cfg_{{ item.key }}"
     insertafter: EOF
-    marker: "# OSTORAGE s3cfg ak sk {mark}"
+    marker: "# PEREGRINE s3cfg ak sk {mark}"
     block: |
       access_key = {{ item.key }}
       secret_key = {{ item.value }}

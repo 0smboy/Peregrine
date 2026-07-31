@@ -13,7 +13,7 @@
 - name: Set log facility
   blockinfile:
     path: /etc/sysconfig/keepalived
-    marker: "# OSTORAGE_SWIFT_ANSIBLE_keepalived_config {mark}"
+    marker: "# PEREGRINE_SWIFT_ANSIBLE_keepalived_config {mark}"
     block: |
       KEEPALIVED_OPTIONS="-D --log-facility=1"
     insertafter: EOF

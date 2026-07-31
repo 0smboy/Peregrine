@@ -1,9 +1,9 @@
-//! Rust rewrite of cabt's Python report generators:
-//! - standard.so / xltpl `render` → standard Excel report
-//! - fool.so / openpyxl `update_xlsx` → fool Excel report
+//! Excel report generation: a formatted workbook per collect, with a chart
+//! sheet so a finished sweep reads as pictures rather than a wall of numbers.
 //!
-//! Original templates lived in dep-packages/{standard,fool}.xlsx with Jinja2 /
-//! placeholder fill. We regenerate equivalent .xlsx layouts with rust_xlsxwriter.
+//! Two layouts: the standard report (one row per run) and the fool-suite
+//! report (1-worker baseline section plus the concurrency matrix). Both are
+//! built with rust_xlsxwriter — no template files, nothing external.
 
 use anyhow::{bail, Context, Result};
 use chrono::Local;
@@ -34,10 +34,10 @@ impl ReportMeta {
             cosbench_url: std::env::var("cosbench_url")
                 .unwrap_or_else(|_| "http://127.0.0.1:19088/controller".into()),
             endpoint,
-            policy_name: std::env::var("CABT_POLICY").unwrap_or_default(),
-            policy_numstr: std::env::var("CABT_POLICY_NUM").unwrap_or_default(),
-            policy_str: std::env::var("CABT_POLICY_STR").unwrap_or_default(),
-            nodes: std::env::var("CABT_STORAGE_NODES").unwrap_or_default(),
+            policy_name: std::env::var("AUTOCOS_POLICY").unwrap_or_default(),
+            policy_numstr: std::env::var("AUTOCOS_POLICY_NUM").unwrap_or_default(),
+            policy_str: std::env::var("AUTOCOS_POLICY_STR").unwrap_or_default(),
+            nodes: std::env::var("AUTOCOS_STORAGE_NODES").unwrap_or_default(),
             time: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         }
     }
@@ -68,7 +68,7 @@ impl ReportMeta {
     }
 }
 
-/// One result row (mirrors cabt list / .collect fields used by Python).
+/// One result row (the fields autocos list / .collect carry).
 #[derive(Debug, Clone)]
 pub struct JobRow {
     pub time: String,
@@ -175,7 +175,7 @@ fn note_fmt() -> Format {
     Format::new().set_font_size(10).set_align(FormatAlign::Left).set_text_wrap()
 }
 
-/// Equivalent of Python `standard.render(template, collect_file, values, output)`.
+/// The standard report: one formatted sheet, one row per run, plus charts.
 pub fn write_standard_xlsx(
     collect_path: impl AsRef<Path>,
     output: impl AsRef<Path>,
@@ -183,7 +183,7 @@ pub fn write_standard_xlsx(
 ) -> Result<()> {
     let jobs = load_collect_file(collect_path)?;
     if jobs.is_empty() {
-        bail!("no rows in collect file — run some tasks and `cabt list` first");
+        bail!("no rows in collect file — run some tasks and `autocos list` first");
     }
 
     let mut wb = Workbook::new();
@@ -236,7 +236,7 @@ pub fn write_standard_xlsx(
     sheet.write_with_format(5, 0, &section, &title)?;
     sheet.merge_range(5, 0, 5, 9, &section, &title)?;
 
-    // bilingual headers like original template
+    // bilingual headers
     let headers_cn = [
         "测试编号",
         "测试大小",
@@ -308,7 +308,7 @@ pub fn write_standard_xlsx(
     Ok(())
 }
 
-/// Equivalent of Python `fool.update_xlsx(one_csv, more_csv, template, output, values)`.
+/// The fool-suite report: 1-worker baseline, concurrency matrix, detail sheet.
 pub fn write_fool_xlsx(
     one_worker_csv: impl AsRef<Path>,
     more_worker_csv: impl AsRef<Path>,
@@ -348,7 +348,7 @@ pub fn write_fool_xlsx(
     );
     sheet.merge_range(1, 0, 4, 9, &intro, &note)?;
 
-    // Section 1: 1-worker baseline (original fool template layout)
+    // Section 1: 1-worker baseline
     let sec1 = format!("1.  {} 基准测试", meta.policy_display());
     sheet.write_with_format(5, 0, &sec1, &title)?;
     sheet.merge_range(5, 0, 5, 9, &sec1, &title)?;

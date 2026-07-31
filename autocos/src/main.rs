@@ -14,7 +14,7 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "cabt",
+    name = "autocos",
     version,
     about = "Automation benchmark tool using cosbench-rs / Cosbench (Rust)"
 )]

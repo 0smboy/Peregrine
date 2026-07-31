@@ -1,7 +1,7 @@
 ---
 - block:
   - name: Create backup_dir
-    file: dest=/etc/.ostorage
+    file: dest=/etc/.peregrine
           state=directory
     delegate_to: localhost
   - name: Check  ring build file on ansible control node

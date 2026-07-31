@@ -3,8 +3,8 @@ BASE_DIR="/etc/swift"
 cd $BASE_DIR && git init > /dev/null
 # 使用git对"/etc/swift"目录进行管理
 git add . 
-git config --global user.email "ostorage@ostorage.com.cn"
-git config --global user.name "ostorage"
+git config --global user.email "swift@peregrine.local"
+git config --global user.name "peregrine"
 git commit -m "swift" > /dev/null
 # 切换到keystone s3api分支，并使用sed把prox-server.conf进行修改
 git checkout -B "keystone_s3api" "master" 2> /dev/null

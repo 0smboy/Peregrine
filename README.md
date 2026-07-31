@@ -25,7 +25,7 @@ Source in [`docs-site/`](docs-site/).
 | [`swift-rust/`](swift-rust/) | The storage engine — proxy, object, container, account servers, all consistency daemons, erasure coding, the ring, the SQLite backends, the middleware pipeline. A 17-crate workspace. | Rust | Feature-complete data path; 946 workspace tests; runs a live 4-node cluster. |
 | [`swift-deploy-rs/`](swift-deploy-rs/) | A bounded, Python-free deployer. Executes the upstream Swift Ansible v3 plan natively — no Ansible, no `ansible-playbook` — with sealed, re-verified plans and per-action authorization for destructive steps. Ships its own web control console. | Rust | Covers v3's 57 task/handler files, 413 leaf tasks, 28 modules. |
 | [`cosbench-rs/`](cosbench-rs/) | A Rust rewrite of Intel's COSBench core: an S3/Swift load generator with prepare/main/cleanup workloads, hash-integrity checks, and JSON/CSV reports. | Rust | mock / S3 / Swift drivers, Keystone v3. |
-| [`cabt-rs/`](cabt-rs/) | Benchmark automation over `cosbench-rs`: submit workloads, track progress, list, collect, and archive results. | Rust | `run` / `list` / `remove` / `collect`. |
+| [`autocos/`](autocos/) | Benchmark automation over `cosbench-rs`: submit workloads, track progress, list, collect, and archive results. | Rust | `run` / `list` / `remove` / `collect`. |
 | [`swift-console/`](swift-console/) | The web console: a files browser, deploy control, live monitoring, and a chaos/verification lab, served from a single Rust binary. | Rust | Files / Deploy / Monitor / Lab. |
 
 Nothing here depends on Python at runtime. The Python Swift tree is **not**
@@ -53,7 +53,7 @@ golden fixtures that `swift-rust` is checked against.
                                               └───────────────┬───────────────┘
                                                               ▲
                               load  ┌───────────────┐         │  S3 / Swift API
-                            ───────▶│  cabt-rs      │────────▶ │
+                            ───────▶│  autocos      │────────▶ │
                                     │   └▶ cosbench-rs (workers)│
                                     └───────────────┘
 ```
@@ -64,7 +64,7 @@ golden fixtures that `swift-rust` is checked against.
   whole.
 - **Control plane** — `swift-deploy-rs` stands up and reconfigures the cluster
   from sealed, re-verified plans; `swift-console` drives day-to-day operation.
-- **Test plane** — `cosbench-rs` generates S3/Swift load; `cabt-rs` scripts the
+- **Test plane** — `cosbench-rs` generates S3/Swift load; `autocos` scripts the
   runs and collects the results; the console's Lab injects faults and verifies
   integrity.
 
@@ -94,7 +94,7 @@ cd swift-deploy-rs && cargo build --release
 
 # The load generator and its automation.
 cd cosbench-rs && cargo build --release
-cd cabt-rs      && cargo build --release
+cd autocos      && cargo build --release
 
 # The web console.
 cd swift-console && cargo build --release
@@ -112,7 +112,7 @@ Peregrine/
 ├── swift-rust/         the storage engine (17-crate Rust workspace)
 ├── swift-deploy-rs/    Python-free native deployer + control console
 ├── cosbench-rs/        COSBench-compatible S3/Swift load generator
-├── cabt-rs/            benchmark automation over cosbench-rs
+├── autocos/            benchmark automation over cosbench-rs
 ├── swift-console/      web console (files / deploy / monitor / lab)
 └── docs/               architecture and testing methodology
 ```

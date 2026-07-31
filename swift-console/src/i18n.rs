@@ -2513,30 +2513,30 @@ pub fn t(l: &str, key: &'static str) -> &'static str {
         "tmb.state.resurrected" => if zh { "删除后又复活" } else { "Resurrected after a delete" },
         "tmb.state.lost" => if zh { "磁盘上已无残留" } else { "Nothing left on disk" },
         "tmb.cod.clean" => if zh {
-            "死因：客户端在 {t} 发起 DELETE。全部 {n} 个主副本在 {spread} 内都收到了墓碑，没有任何东西幸存。"
+            "客户端在 {t} 发起 DELETE。全部 {n} 个主副本在 {spread} 内都收到了墓碑，磁盘上没有更新的数据文件。"
         } else {
-            "Cause of death: a client DELETE at {t}. All {n} primaries took the tombstone within {spread}, and nothing survives it."
+            "A client DELETE at {t}. All {n} primaries took the tombstone within {spread}, and no newer data file remains on disk."
         },
         "tmb.cod.incomplete" => if zh {
-            "死因：客户端在 {t} 发起 DELETE，但只到达了 {want} 个主副本中的 {got} 个。{where} 仍持有数据，可能把它返回给读取者，或者再次向外复制。"
+            "客户端在 {t} 发起 DELETE，但只到达了 {want} 个主副本中的 {got} 个。{where} 仍持有数据，可能把它返回给读取者，或者再次向外复制。"
         } else {
-            "Cause of death: a client DELETE at {t} that reached only {got} of {want} primaries. {where} still holds data and can serve it to a reader or replicate it outwards again."
+            "A client DELETE at {t} reached only {got} of {want} primaries. {where} still holds data and can serve it to a reader or replicate it outwards again."
         },
         "tmb.cod.nowhere" => if zh { "没有任何位置" } else { "no placement" },
         "tmb.cod.resurrected" => if zh {
-            "死因：无 —— 这个对象活过了自己的葬礼。它在 {t} 被删除，又在 {wrote} 被重新写入，因此墓碑已经决定不了读取者拿到什么。"
+            "这个对象在 {t} 被删除，又在 {wrote} 被重新写入。新写入的时间戳比墓碑更新，因此读取者拿到的是删除之后的那份数据。"
         } else {
-            "Cause of death: none — this object outlived its own funeral. It was deleted at {t} and written again at {wrote}, so the tombstone no longer decides what a reader gets."
+            "Deleted at {t}, then written again at {wrote}. The new write outranks the tombstone, so readers get the post-delete data."
         },
         "tmb.cod.lost" => if zh {
-            "没有记录到死因：ring 指派的 {n} 个位置里没有任何一个持有文件，也没有墓碑说明它去了哪里。"
+            "ring 指派的 {n} 个位置里没有任何一个持有文件，也没有墓碑。要么这个对象从未写入这里，要么删除已超过 reclaim_age、连墓碑都被回收了。"
         } else {
-            "No cause of death is recorded: not one of the {n} placements the ring assigns holds a file, and no tombstone explains where it went."
+            "Not one of the {n} placements the ring assigns holds a file, and there is no tombstone. Either the object was never written here, or the delete is past reclaim_age and even its tombstones have been reclaimed."
         },
         "tmb.cod.alive" => if zh {
-            "仍然活着：写入于 {t}，目前磁盘上有 {n} 份，没有记录到任何删除。"
+            "对象仍然存在：写入于 {t}，目前磁盘上有 {n} 份，没有记录到任何删除。"
         } else {
-            "Still alive: written at {t}, {n} copies are on disk now, and no delete is recorded for it."
+            "The object is present: written at {t}, {n} copies are on disk now, and no delete is recorded for it."
         },
         "tmb.cod.unknown" => if zh { "未知时间" } else { "an unknown time" },
         "tmb.dur.s" => if zh { "{n} 秒" } else { "{n} seconds" },
@@ -2556,14 +2556,14 @@ pub fn t(l: &str, key: &'static str) -> &'static str {
             "Nothing anomalous: every copy the ring asks for is on disk, on time, and no node was missing while this object changed."
         },
         "tmb.files.none" => if zh {
-            "任何节点的任何设备上都没有这个对象的文件。要么它从未写在这里，要么连墓碑在内的一切都已过期清除。"
+            "任何节点的任何设备上都没有这个对象的文件。要么它从未写在这里，要么删除已超过 reclaim_age（本集群为 7 天）—— replicator 会在那之后清除墓碑本身，于是磁盘上什么都不剩。"
         } else {
-            "No file for this object on any device of any node. Either it was never written here, or everything including its tombstones has already aged out."
+            "No file for this object on any device of any node. Either it was never written here, or the delete is older than reclaim_age (7 days on this cluster) — past that the replicator removes the tombstones themselves, leaving nothing on disk."
         },
         "tmb.offline.none" => if zh {
-            "在这个时间窗内所有节点都有响应。"
+            "在这个时间窗内所有节点都有响应 —— 没有节点缺席，也就没有因此错过的写入或删除。"
         } else {
-            "Every node answered throughout this window."
+            "Every node answered throughout this window — none was absent, so nothing was missed because of an outage."
         },
         "tmb.events.none" => if zh {
             "没有事件：磁盘上没有这个对象的任何内容。"
@@ -2571,9 +2571,9 @@ pub fn t(l: &str, key: &'static str) -> &'static str {
             "No events: nothing for this object is on disk."
         },
         "tmb.logs.none" => if zh {
-            "该时间窗内没有日志提到这个对象或它的 partition。"
+            "该时间窗内没有日志提到这个对象或它的 partition。日志后端只保留最近一段时间：对更早的写入或删除，这里查不到当时的记录。"
         } else {
-            "No log lines named this object or its partition in this window."
+            "No log lines named this object or its partition in this window. The log store keeps a limited history: for older writes or deletes the lines from that time are gone."
         },
         "tmb.logs.bypart" => if zh {
             "没有日志直接提到这个对象；下面这些提到了 partition {p}。"
@@ -2684,6 +2684,33 @@ pub fn t(l: &str, key: &'static str) -> &'static str {
         "mon.p.repl_fail_node" => if zh { "各节点复制失败数" } else { "Replication failures per node" },
         "mon.p.log_vol" => if zh { "各服务日志量" } else { "Log volume by unit" },
         "mon.p.log_err" => if zh { "最近的错误" } else { "Recent errors" },
+        "mon.d.backends" => if zh { "后端服务" } else { "Backend services" },
+        "mon.d.storage" => if zh { "磁盘与设备" } else { "Disks & devices" },
+        "mon.d.services" => if zh { "服务健康" } else { "Service health" },
+        "mon.d.node" => if zh { "节点详情" } else { "Node detail" },
+        "mon.p.reqs_status" => if zh { "各状态码请求数 / 秒" } else { "Requests / s by status class" },
+        "mon.p.backend_reqs" => if zh { "各后端请求数 / 秒" } else { "Backend requests / s by service" },
+        "mon.p.backend_p99" => if zh { "各服务 P99 延迟" } else { "P99 latency by service" },
+        "mon.p.backend_err" => if zh { "各服务 5xx / 秒" } else { "5xx / s by service" },
+        "mon.p.backend_status" => if zh { "后端各状态码请求数 / 秒" } else { "Backend requests / s by status class" },
+        "mon.p.mem" => if zh { "各节点内存使用率" } else { "Memory used per node" },
+        "mon.p.dev_used" => if zh { "各盘容量使用率" } else { "Device capacity used" },
+        "mon.p.dev_inodes" => if zh { "各盘 inode 使用率" } else { "Device inodes used" },
+        "mon.p.disk_read" => if zh { "磁盘读吞吐" } else { "Disk read throughput" },
+        "mon.p.disk_write" => if zh { "磁盘写吞吐" } else { "Disk write throughput" },
+        "mon.p.disk_iops" => if zh { "磁盘 IOPS" } else { "Disk IOPS" },
+        "mon.p.disk_util" => if zh { "磁盘繁忙度" } else { "Disk busy" },
+        "mon.p.repl_node" => if zh { "各节点复制活动" } else { "Replicator activity per node" },
+        "mon.p.svc_grid" => if zh { "各节点服务状态" } else { "Service state per node" },
+        "mon.p.svc_events" => if zh { "服务启停事件" } else { "Service start/stop events" },
+        "mon.range7d" => if zh { "最近 7 天" } else { "Last 7d" },
+        "mon.allnodes" => if zh { "全部节点" } else { "All nodes" },
+        "mon.back" => if zh { "返回总览" } else { "Back to overview" },
+        "chaos.pc.size" => if zh { "点的大小 = 同步 + 回收的活动量" } else { "Mark size = suffix syncs + reverts" },
+        "chaos.pc.worked" => if zh { "带圈的点 = 完成修复的那次 pass" } else { "Ringed mark = the pass that did the repair" },
+        "chaos.pc.fail" => if zh { "橙色点 = 该次 pass 有失败" } else { "Amber mark = the pass logged failures" },
+        "chaos.pc.base" => if zh { "空心点 = 故障前的基线 pass" } else { "Hollow mark = baseline pass before the fault" },
+        "chaos.pc.table" => if zh { "查看数据表" } else { "Data table" },
 
         other => other,
     }
@@ -2771,6 +2798,7 @@ mod tests {
         "chaos.rep.after", "chaos.rep.auditor", "chaos.rep.auditorwhy",
         "chaos.rep.before", "chaos.rep.board", "chaos.rep.boardp",
         "chaos.rep.census", "chaos.rep.censusp", "chaos.rep.daemon",
+        "chaos.pc.size", "chaos.pc.worked", "chaos.pc.fail", "chaos.pc.base", "chaos.pc.table",
         "chaos.rep.daemonp", "chaos.rep.meta", "chaos.rep.safety",
         "chaos.rep.score", "chaos.rep.sub", "chaos.rep.subdrill",
         "chaos.rep.tally", "chaos.rep.timeline", "chaos.rep.timelinep",
@@ -2842,13 +2870,17 @@ mod tests {
         "common.error", "common.back", "common.none", "common.close",
         "common.copy", "common.edit", "common.remove", "common.savechanges",
         "mon.title", "mon.range15", "mon.range1h", "mon.range6h",
-        "mon.range24h", "mon.rangelabel",
+        "mon.range24h", "mon.range7d", "mon.rangelabel", "mon.allnodes", "mon.back",
         "mon.d.overview", "mon.d.nodes", "mon.d.replication", "mon.d.logs",
+        "mon.d.backends", "mon.d.storage", "mon.d.services", "mon.d.node",
         "mon.p.nodes_up", "mon.p.reqs", "mon.p.err5xx", "mon.p.p99",
-        "mon.p.reqs_method", "mon.p.latency", "mon.p.err_ratio",
-        "mon.p.fs_used", "mon.p.cpu", "mon.p.net_storage", "mon.p.net_repl",
+        "mon.p.reqs_method", "mon.p.latency", "mon.p.err_ratio", "mon.p.reqs_status",
+        "mon.p.backend_reqs", "mon.p.backend_p99", "mon.p.backend_err", "mon.p.backend_status",
+        "mon.p.fs_used", "mon.p.cpu", "mon.p.mem", "mon.p.net_storage", "mon.p.net_repl",
         "mon.p.net_public", "mon.p.load", "mon.p.repl_kind", "mon.p.repl_sf",
-        "mon.p.repl_fail_node", "mon.p.log_vol", "mon.p.log_err",
+        "mon.p.repl_fail_node", "mon.p.repl_node", "mon.p.log_vol", "mon.p.log_err",
+        "mon.p.dev_used", "mon.p.dev_inodes", "mon.p.disk_read", "mon.p.disk_write",
+        "mon.p.disk_iops", "mon.p.disk_util", "mon.p.svc_grid", "mon.p.svc_events",
         // ---- Swift Shadow ----
         "shadow.intro", "shadow.act.capture", "shadow.act.replay",
         "shadow.why.crange", "shadow.noise.rangeonly",

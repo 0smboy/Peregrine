@@ -23,8 +23,8 @@ pub enum Creds {
     Swift(SwiftCreds),
 }
 
-pub fn cabt_home() -> PathBuf {
-    dirs_fallback_home().join(".cabt")
+pub fn autocos_home() -> PathBuf {
+    dirs_fallback_home().join(".autocos")
 }
 
 fn dirs_fallback_home() -> PathBuf {
@@ -35,7 +35,7 @@ fn dirs_fallback_home() -> PathBuf {
 }
 
 pub fn ensure_dirs() -> Result<()> {
-    let home = cabt_home();
+    let home = autocos_home();
     for sub in ["config", "result", "fool", "lib"] {
         fs::create_dir_all(home.join(sub))?;
     }
@@ -117,7 +117,7 @@ pub fn load_swift_creds() -> Result<SwiftCreds> {
 }
 
 pub fn probe_swift(creds: &SwiftCreds) -> Result<()> {
-    if std::env::var("CABT_SKIP_S3_PROBE").ok().as_deref() == Some("1") {
+    if std::env::var("AUTOCOS_SKIP_S3_PROBE").ok().as_deref() == Some("1") {
         return Ok(());
     }
     let hp = creds
@@ -157,9 +157,9 @@ pub fn endpoint_url(host: &str) -> String {
     }
 }
 
-/// Optional probe: HEAD/PUT not required for local mock; skip if CABT_SKIP_S3_PROBE=1
+/// Optional probe: HEAD/PUT not required for local mock; skip if AUTOCOS_SKIP_S3_PROBE=1
 pub fn probe_s3(creds: &S3Creds) -> Result<()> {
-    if std::env::var("CABT_SKIP_S3_PROBE").ok().as_deref() == Some("1") {
+    if std::env::var("AUTOCOS_SKIP_S3_PROBE").ok().as_deref() == Some("1") {
         return Ok(());
     }
     // lightweight TCP connect check to host:port

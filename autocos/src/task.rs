@@ -1,4 +1,4 @@
-//! Parse cabt task names: 64KB_write_100
+//! Parse autocos task names: 64KB_write_100
 
 use anyhow::{bail, Context, Result};
 use regex::Regex;
@@ -62,7 +62,7 @@ pub fn parse_task(name: &str) -> Result<TaskSpec> {
     })
 }
 
-/// Default prepare knobs from original cabt README / fool_job.
+/// Default prepare knobs for the fool suite.
 pub fn fool_defaults(size_label: &str) -> (u64, u32) {
     // (object_count, prepare_workers)
     let s = size_label.to_ascii_uppercase();

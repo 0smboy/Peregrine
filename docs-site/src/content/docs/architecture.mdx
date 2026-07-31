@@ -65,10 +65,10 @@ Ansible at runtime. It expands plays, roles, includes, loops, handlers and
 re-verifies plan, bundle, inventory and digests before `apply`. Disk wipes,
 firewall changes, and SSH reconfiguration each require separate authorization.
 
-## The test plane — cosbench-rs, cabt-rs, and the console Lab
+## The test plane — cosbench-rs, autocos, and the console Lab
 
 `cosbench-rs` generates S3/Swift load (prepare / main / cleanup, hash-integrity
-checks, JSON/CSV reports); `cabt-rs` scripts the run lifecycle over it; the
+checks, JSON/CSV reports); `autocos` scripts the run lifecycle over it; the
 [swift-console](/swift-console) Lab injects faults (fragment loss, node down)
 and verifies read-back integrity.
 

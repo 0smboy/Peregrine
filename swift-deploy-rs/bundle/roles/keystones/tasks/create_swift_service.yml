@@ -47,7 +47,7 @@
 
 - name: Remove proxyfs account id tmp file
   file:
-    path: /tmp/ostorage_proxyfs_account
+    path: /tmp/peregrine_proxyfs_account
     state: absent
   when: install_proxyfs
   delegate_to: "{{item}}"
@@ -55,7 +55,7 @@
 
 - name: Save proxyfs account id to tmp file
   lineinfile:
-    path: /tmp/ostorage_proxyfs_account
+    path: /tmp/peregrine_proxyfs_account
     line: "{{proxyfs_swift_account_id.stdout_lines[0]}}"
     create: yes
   when: install_proxyfs

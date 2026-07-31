@@ -42,7 +42,7 @@ See [Performance](/performance) for the details and the layering.
 A concurrent driver runs a PUT/GET matrix (object size × concurrency) and
 reports throughput (ops/s, MB/s) and latency percentiles. Run it against a Rust
 SAIO and a Python SAIO on the same host for an implementation A/B, and against
-the cluster for production numbers. `cosbench-rs` + `cabt-rs` provide
+the cluster for production numbers. `cosbench-rs` + `autocos` provide
 COSBench-grade load for larger runs.
 
 ## 4. Production, on the HA cluster
@@ -51,7 +51,7 @@ Against a four-node cluster behind a cloud load balancer with keepalive:
 
 <Steps>
 <Step>the functional suite through the load-balancer path (the real client path);</Step>
-<Step>sustained `cosbench-rs` / `cabt-rs` load at production concurrency;</Step>
+<Step>sustained `cosbench-rs` / `autocos` load at production concurrency;</Step>
 <Step>the console **Lab** for fault injection — fragment loss → reconstructor heal, and node-down failover — with read-back integrity;</Step>
 <Step>large-object streaming-memory checks (a multi-GB PUT/GET while sampling RSS).</Step>
 </Steps>

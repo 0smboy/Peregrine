@@ -32,7 +32,7 @@ negative/security cases. The harness lives at `swift-rust/tools/func-suite.sh`.
 concurrency) and reports throughput (ops/s, MB/s) and latency percentiles
 (p50/p95/p99). Run it against a Rust SAIO and a Python SAIO on the same host for
 an implementation A/B, and against the 4-node cluster for production numbers.
-`cosbench-rs` + `cabt-rs` provide COSBench-grade load for larger runs.
+`cosbench-rs` + `autocos` provide COSBench-grade load for larger runs.
 
 ## 4. Production, on the HA cluster
 
@@ -41,7 +41,7 @@ with keepalive, running the full daemon set plus a Prometheus/Loki/statsd
 observability stack. Against it we run:
 
 - the functional suite through the load-balancer VIP (the real client path);
-- sustained `cosbench-rs`/`cabt-rs` load at production concurrency;
+- sustained `cosbench-rs`/`autocos` load at production concurrency;
 - the console **Lab** for fault injection (fragment loss → reconstructor heal,
   node down) with read-back integrity verification;
 - large-object streaming-memory checks (a multi-GB PUT/GET while sampling RSS).

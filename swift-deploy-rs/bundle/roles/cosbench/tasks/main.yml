@@ -1,33 +1,33 @@
 ---
 - block:
-  - name: Clear old cabt files
+  - name: Clear old autocos files
     file:
       path: "{{ item }}"
       state: absent
     with_items:
-      - /opt/cabt_package/cabt_lib
-      - /usr/local/bin/cabt
+      - /opt/autocos_package/autocos_lib
+      - /usr/local/bin/autocos
     ignore_errors: yes
-  - name: Create cabt package folder
+  - name: Create autocos package folder
     file:
-      path: /opt/cabt_package
+      path: /opt/autocos_package
       state: directory
       recurse: yes
-  - name: Check cabt package folder existed
-    shell: "/usr/local/bin/cabt --help"
+  - name: Check autocos package folder existed
+    shell: "/usr/local/bin/autocos --help"
     register: result
     ignore_errors: yes
-  - name: Download cabt package
+  - name: Download autocos package
     unarchive:
-      src: http://{{ local_repo_address }}/component/cabt_package.tar.gz
-      dest: /opt/cabt_package
+      src: http://{{ local_repo_address }}/component/autocos_package.tar.gz
+      dest: /opt/autocos_package
       remote_src: True
     when: result is failed
-  - name: Copy cabt lib
-    shell: 'cp -r /opt/cabt_package/cabt_lib /root/.cabt'
+  - name: Copy autocos lib
+    shell: 'cp -r /opt/autocos_package/autocos_lib /root/.autocos'
     when: result is failed
-  - name: Copy cabt program
-    shell: 'cp /opt/cabt_package/cabt /usr/local/bin/cabt && chmod +x /usr/local/bin/cabt'
+  - name: Copy autocos program
+    shell: 'cp /opt/autocos_package/autocos /usr/local/bin/autocos && chmod +x /usr/local/bin/autocos'
     when: result is failed
 
 - block: 
@@ -69,8 +69,8 @@
     -p 127.0.0.1:19088:19088 \
     -p {{ inventory_hostname }}:19088:19088 \
     -p {{ inventory_hostname }}:18088:18088 \
-    -v /root/.cabt:/root/.cabt \
-    -v /usr/local/bin/cabt:/usr/local/bin/cabt \
+    -v /root/.autocos:/root/.autocos \
+    -v /usr/local/bin/autocos:/usr/local/bin/autocos \
     -v {{ cosbench_path }}/{{ cosbench_version }}/conf/controller.conf:/cosbench/{{ cosbench_version }}/conf/controller.conf \
     -v {{ cosbench_path }}/{{ cosbench_version }}/conf/driver_1.conf:/cosbench/{{ cosbench_version }}/conf/driver_1.conf \
     -v {{ cosbench_path }}/{{ cosbench_version }}/conf/log:/cosbench/{{ cosbench_version }}/log \

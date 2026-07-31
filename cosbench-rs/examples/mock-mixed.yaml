@@ -1,5 +1,7 @@
 name: mock-mixed
 description: In-memory dry run with sequential prepare + mixed main + cleanup
+# Timeline bucket width (seconds, 1..=60, default 5). 1 s suits this short run.
+sample_interval_secs: 1
 storage:
   type: mock
   latency_us: 50

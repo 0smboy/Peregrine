@@ -1,13 +1,14 @@
 ---
-title: cabt-rs
+title: autocos
 description: Benchmark automation over cosbench-rs — submit workloads, watch progress, list, collect and archive results.
 sidebar:
   order: 13
 ---
 
-`cabt-rs` is a Rust rewrite of the `cabt` COSBench automation tool. It keeps the
-same CLI shape and drives benchmarks through [cosbench-rs](/cosbench-rs) by
-default (or a Java COSBench controller), storing state under `~/.cabt/`.
+`autocos` turns a task name like `64KB_write_100` into a complete benchmark
+run: workload generation, submission, progress, collection, and an Excel
+report. It drives benchmarks through [cosbench-rs](/cosbench-rs) by default
+(or a Java COSBench controller), storing state under `~/.autocos/`.
 
 ## Commands
 
@@ -23,17 +24,17 @@ A task name is `<size>_<op>_<workers>` — `4KB_read_128`, `1MB_write_32`,
 
 ## Targets
 
-`cabt` auto-selects the Swift target when the classic swiftclient environment is
+`autocos` auto-selects the Swift target when the classic swiftclient environment is
 set:
 
 ```sh
 export ST_AUTH=http://10.42.30.11:8085/auth/v1.0
 export ST_USER=test:tester
-export ST_KEY=azure-swift-2026.bench
+export ST_KEY=<tempauth-key>
 export ST_ENDPOINT=http://10.42.30.11:8085/v1/AUTH_test   # pin storage; skip the LB hairpin
-cabt run 64KB_write_64 --object-count 400 --container-count 4 --runtime 25
-cabt list
-cabt collect
+autocos run 64KB_write_64 --object-count 400 --container-count 4 --runtime 25
+autocos list
+autocos collect
 ```
 
 <Aside type="note" title="ST_ENDPOINT">

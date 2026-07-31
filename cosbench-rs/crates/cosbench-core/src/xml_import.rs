@@ -153,6 +153,7 @@ pub fn import_cosbench_xml(xml: &str) -> anyhow::Result<Workload> {
     let wl = Workload {
         name,
         description: "imported from COSBench XML (best-effort)".into(),
+        sample_interval_secs: crate::config::default_sample_interval_secs(),
         storage,
         auth,
         stages,

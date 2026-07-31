@@ -3,13 +3,13 @@
 #   fail: msg="****************** Please check group_vars/format_disks ******************"
 #   when: not DISKS_INFO_CONFIRMED
 - name: Get all_disks
-  shell: lsblk  | awk '{print $1}' | grep sd | grep -E  -v '├─|└─' | grep -v mnt > /tmp/ostorage_test
+  shell: lsblk  | awk '{print $1}' | grep sd | grep -E  -v '├─|└─' | grep -v mnt > /tmp/peregrine_test
 - name: Remove exclude_disks
-  shell: sed -i '/^{{ item }}$/d' /tmp/ostorage_test
+  shell: sed -i '/^{{ item }}$/d' /tmp/peregrine_test
   with_items:
   - "{{ exclude_disks }}"
 - name: Get disks_to_format
-  shell: cat /tmp/ostorage_test
+  shell: cat /tmp/peregrine_test
   register: disks_to_format
 - name: Check system disk
   script: files/check_system_disk.sh  {{ item }}

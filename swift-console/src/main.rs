@@ -97,10 +97,10 @@ pub struct Config {
     /// Testing surface (runs real load against the cluster), off by default.
     #[serde(default)]
     pub test_enabled: bool,
-    #[serde(default = "d_cabt_bin")]
-    pub cabt_bin: String,
-    #[serde(default = "d_cabt_home")]
-    pub cabt_home: String,
+    #[serde(default = "d_autocos_bin")]
+    pub autocos_bin: String,
+    #[serde(default = "d_autocos_home")]
+    pub autocos_home: String,
     /// Credentials the benchmark authenticates with. Kept separate from the
     /// console session: a load test should not run as whoever is signed in.
     #[serde(default)]
@@ -130,11 +130,11 @@ pub struct Config {
     pub lab_root: String,
 }
 
-fn d_cabt_bin() -> String {
-    "/usr/local/bin/cabt".into()
+fn d_autocos_bin() -> String {
+    "/usr/local/bin/autocos".into()
 }
-fn d_cabt_home() -> String {
-    "/root/.cabt".into()
+fn d_autocos_home() -> String {
+    "/root/.autocos".into()
 }
 fn d_swift_dir() -> String {
     "/etc/swift".into()
@@ -338,7 +338,7 @@ async fn main() {
         .route("/app.css", any(proxy::deploy))
         .route("/api/{*path}", any(proxy::deploy))
         // Lab surface: tools that explain the cluster. Gated on lab_enabled.
-        // Testing surface: real load against the cluster via cabt.
+        // Testing surface: real load against the cluster via autocos.
         .route("/test", get(pages::test_page))
         .route("/test/api/runs", get(testing::runs))
         .route("/test/api/run", post(testing::start))

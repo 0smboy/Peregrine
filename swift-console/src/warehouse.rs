@@ -1736,15 +1736,15 @@ struct GNode {
 /// Rendered on the server: a lineage graph that only appears once a script has
 /// run is a lineage graph that is missing exactly when someone is debugging.
 pub fn lineage_svg(lang: &str, r: &Report, now: u64) -> String {
-    const W: i32 = 720;
-    const NW: i32 = 196;
-    const NH: i32 = 24;
-    const JH: i32 = 38;
-    const PITCH: i32 = 32;
+    const W: i32 = 1080;
+    const NW: i32 = 300;
+    const NH: i32 = 30;
+    const JH: i32 = 48;
+    const PITCH: i32 = 40;
     const C1: i32 = 6;
-    const C2: i32 = 262;
-    const C3: i32 = 518;
-    const GAP: i32 = 22;
+    const C2: i32 = 390;
+    const C3: i32 = 774;
+    const GAP: i32 = 26;
     const PADT: i32 = 10;
 
     let shown: Vec<&Job> = r.jobs.iter().take(GRAPH_JOBS).collect();
@@ -1759,7 +1759,7 @@ pub fn lineage_svg(lang: &str, r: &Report, now: u64) -> String {
         for o in j.inputs.iter().take(GRAPH_NODES) {
             seen.push(o.path.clone());
             ins.push(GNode {
-                label: trunc(&o.name, 26),
+                label: trunc(&o.name, 40),
                 sub: fmt_bytes(o.bytes),
                 title: format!("{} · {}", o.path, fmt_bytes(o.bytes)),
                 cls: "wh-n-in",
@@ -1773,7 +1773,7 @@ pub fn lineage_svg(lang: &str, r: &Report, now: u64) -> String {
                     seen.push(p.clone());
                     let gone = !j.inputs.iter().any(|o| &o.path == p);
                     ins.push(GNode {
-                        label: trunc(p.rsplit('/').next().unwrap_or(p), 26),
+                        label: trunc(p.rsplit('/').next().unwrap_or(p), 40),
                         sub: i18n::t(lang, if gone { "wh.g.gone" } else { "wh.g.ref" }).to_string(),
                         title: p.clone(),
                         cls: if gone { "wh-n-gone" } else { "wh-n-in" },
@@ -1791,10 +1791,10 @@ pub fn lineage_svg(lang: &str, r: &Report, now: u64) -> String {
         }
 
         let job = GNode {
-            label: trunc(&j.id, 26),
+            label: trunc(&j.id, 40),
             sub: trunc_tail(
                 if j.goal.is_empty() { i18n::t(lang, "wh.g.nogoal") } else { j.goal.as_str() },
-                30,
+                46,
             ),
             title: format!("{} · {}", j.id, j.goal),
             cls: "wh-n-job",
@@ -1803,7 +1803,7 @@ pub fn lineage_svg(lang: &str, r: &Report, now: u64) -> String {
         let mut outs: Vec<GNode> = Vec::new();
         for a in j.artifacts.iter().take(GRAPH_NODES) {
             outs.push(GNode {
-                label: trunc(&a.name, 26),
+                label: trunc(&a.name, 40),
                 sub: format!(
                     "{} · {}",
                     fmt_bytes(a.bytes),
@@ -1823,7 +1823,7 @@ pub fn lineage_svg(lang: &str, r: &Report, now: u64) -> String {
                 None => i18n::t(lang, "wh.g.noexp").to_string(),
             };
             outs.push(GNode {
-                label: trunc(&w.name, 26),
+                label: trunc(&w.name, 40),
                 sub,
                 title: format!("{} · {}", w.path, fmt_bytes(w.bytes)),
                 cls: "wh-n-work",
@@ -1852,7 +1852,7 @@ pub fn lineage_svg(lang: &str, r: &Report, now: u64) -> String {
         if n.sub.is_empty() {
             s.push_str(&format!(
                 "<text class=\"wh-t\" x=\"{}\" y=\"{}\">{}</text>",
-                x + 9,
+                x + 10,
                 y + h / 2 + 4,
                 esc(&n.label)
             ));
@@ -1862,11 +1862,11 @@ pub fn lineage_svg(lang: &str, r: &Report, now: u64) -> String {
             s.push_str(&format!(
                 "<text class=\"wh-t\" x=\"{}\" y=\"{}\">{}</text>\
                  <text class=\"wh-s\" x=\"{}\" y=\"{}\">{}</text>",
-                x + 9,
-                y + h / 2 - 1,
+                x + 10,
+                y + h / 2 - 2,
                 esc(&n.label),
-                x + 9,
-                y + h / 2 + 9,
+                x + 10,
+                y + h / 2 + 11,
                 esc(&n.sub)
             ));
         }
@@ -1938,13 +1938,13 @@ pub fn lineage_svg(lang: &str, r: &Report, now: u64) -> String {
     ] {
         let label = i18n::t(lang, key);
         out.push_str(&format!(
-            "<g class=\"{cls}\"><rect x=\"{lx}\" y=\"{}\" width=\"12\" height=\"10\" rx=\"2\"/></g>\
+            "<g class=\"{cls}\"><rect x=\"{lx}\" y=\"{}\" width=\"13\" height=\"11\" rx=\"2\"/></g>\
              <text class=\"wh-s\" x=\"{}\" y=\"{ly}\">{}</text>",
-            ly - 9,
-            lx + 17,
+            ly - 10,
+            lx + 18,
             esc(label)
         ));
-        lx += 20 + (label.chars().count() as i32 * 7).max(46);
+        lx += 22 + (label.chars().count() as i32 * 9).max(52);
     }
     out.push_str("</svg>");
     out
@@ -1960,13 +1960,16 @@ fn sec(title: &str, body: String) -> String {
     )
 }
 
+// `wh-tbl`: warehouse rows carry long object paths — those cells wrap instead
+// of forcing the whole table into a sideways scroll that hides the action
+// column (the promote input lives in one).
 fn tbl(heads: &[&str], rows: Vec<String>) -> String {
     let th: String = heads
         .iter()
         .map(|h| format!("<th>{}</th>", esc(h)))
         .collect();
     format!(
-        "<div class=\"tbl-wrap\"><table class=\"tbl\"><thead><tr>{th}</tr></thead><tbody>{}</tbody></table></div>",
+        "<div class=\"tbl-wrap\"><table class=\"tbl wh-tbl\"><thead><tr>{th}</tr></thead><tbody>{}</tbody></table></div>",
         rows.join("")
     )
 }

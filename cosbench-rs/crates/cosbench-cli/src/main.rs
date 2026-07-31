@@ -44,6 +44,16 @@ enum Cmd {
         #[arg(short, long)]
         output: String,
     },
+    /// Render a self-contained HTML report (inline SVG charts) from a run
+    /// report JSON file or a report directory
+    Report {
+        /// Run report JSON, or a directory containing one
+        #[arg(short, long)]
+        input: String,
+        /// Output HTML file
+        #[arg(short, long, default_value = "report.html")]
+        output: String,
+    },
     /// HTTP control plane + simple dashboard
     Serve {
         #[arg(long, default_value = "0.0.0.0:8080")]
@@ -85,7 +95,23 @@ async fn main() -> anyhow::Result<()> {
                 bundle.write_json(&json_path)?;
                 bundle.write_csv(&csv_path)?;
                 println!("reports: {json_path}, {csv_path}");
+                for p in cosbench_core::report::write_timeline_csvs(&dir, &reports)? {
+                    println!("timeline: {}", p.display());
+                }
             }
+            Ok(())
+        }
+        Cmd::Report { input, output } => {
+            let (src, bundle) = cosbench_core::report::load_report_input(&input)?;
+            let html = cosbench_core::html_report::render_html(&bundle);
+            let out = std::path::Path::new(&output);
+            if let Some(parent) = out.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            std::fs::write(out, &html)?;
+            println!("report: {output} (from {})", src.display());
             Ok(())
         }
         Cmd::Serve { bind } => {
@@ -96,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/api/health", get(|| async { "ok" }))
                 .route("/api/workloads", post(submit_workload).get(list_workloads))
                 .route("/api/workloads/{id}", get(get_workload))
+                .route("/runs/{id}", get(run_report_html))
                 .with_state(state)
                 .layer(CorsLayer::permissive());
             println!("cosbench-rs serve on http://{addr}");
@@ -173,6 +200,7 @@ a{color:#9cf}
 <p>POST YAML workloads. API: <code>/api/workloads</code>, health <code>/api/health</code>.</p>
 <textarea id=y placeholder="paste workload YAML"></textarea>
 <br><button onclick="run()">Submit</button>
+<p id=l></p>
 <pre id=o>idle</pre>
 <script>
 async function run(){
@@ -188,7 +216,11 @@ async function poll(id){
     const r=await fetch('/api/workloads/'+id);
     const j=await r.json();
     document.getElementById('o').textContent=JSON.stringify(j,null,2);
-    if(j.status==='done'||j.status==='error')break;
+    if(j.status==='done'){
+      document.getElementById('l').innerHTML='<a href="/runs/'+id+'">HTML report with charts</a>';
+      break;
+    }
+    if(j.status==='error')break;
   }
 }
 </script>
@@ -262,4 +294,32 @@ async fn get_workload(
         .cloned()
         .map(Json)
         .ok_or(axum::http::StatusCode::NOT_FOUND)
+}
+
+/// Run-detail view: the same self-contained HTML report (summary table plus
+/// SVG charts) that `cosbench-rs report` writes.
+async fn run_report_html(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Html<String>, axum::http::StatusCode> {
+    let job = st
+        .inner
+        .read()
+        .get(&id)
+        .cloned()
+        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+    if let Some(bundle) = &job.report {
+        return Ok(Html(cosbench_core::html_report::render_html(bundle)));
+    }
+    let esc = cosbench_core::html_report::escape_html;
+    let detail = match &job.error {
+        Some(e) => format!("error: {}", esc(e)),
+        None => format!("status: {}", esc(&job.status)),
+    };
+    Ok(Html(format!(
+        "<!doctype html>\n<html><head><meta charset=\"utf-8\">\
+         <meta http-equiv=\"refresh\" content=\"2\"><title>{name}</title></head>\
+         <body><p>run {name} has no report yet. {detail}</p></body></html>",
+        name = esc(&job.name),
+    )))
 }

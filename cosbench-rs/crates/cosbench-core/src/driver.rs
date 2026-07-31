@@ -6,6 +6,9 @@ use crate::ops::{worker_loop, OpChooser, WorkerCtx};
 use crate::storage::mock::MockStorage;
 use crate::storage::swift::SwiftStorage;
 use crate::storage::Storage;
+use crate::timeline::{
+    clamp_interval_secs, StageTimeline, TimelineBuilder, TimelineSample, MAX_BUCKET_SAMPLES,
+};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -22,6 +25,8 @@ pub struct StageReport {
     pub elapsed_secs: f64,
     #[serde(skip)]
     pub metrics: MetricsSnapshot,
+    /// Full-resolution per-bucket timeline for this stage.
+    pub timeline: StageTimeline,
 }
 
 impl Driver {
@@ -81,6 +86,19 @@ impl Driver {
         let global_ops = Arc::new(AtomicU64::new(0));
         let seq_counter = Arc::new(AtomicU64::new(0));
 
+        // Timeline samples flow over a channel so all bucketing work happens
+        // in this collector task, off the workers' hot path.
+        let interval = clamp_interval_secs(self.workload.sample_interval_secs);
+        let (timeline_tx, mut timeline_rx) =
+            tokio::sync::mpsc::unbounded_channel::<TimelineSample>();
+        let collector = tokio::spawn(async move {
+            let mut builder = TimelineBuilder::new(interval, MAX_BUCKET_SAMPLES);
+            while let Some(s) = timeline_rx.recv().await {
+                builder.record(&s);
+            }
+            builder
+        });
+
         let start = Instant::now();
         let mut handles = Vec::new();
         for wid in 0..stage.workers {
@@ -98,9 +116,14 @@ impl Driver {
                     || stage.kind == "cleanup"
                     || stage.kind == "init",
                 seq_counter: seq_counter.clone(),
+                stage_start: start,
+                timeline_tx: timeline_tx.clone(),
             });
             handles.push(tokio::spawn(worker_loop(ctx)));
         }
+        // Workers hold the remaining senders; the channel closes when the
+        // last worker exits, which ends the collector loop.
+        drop(timeline_tx);
 
         if let Some(dur) = stage.duration() {
             let stop2 = stop.clone();
@@ -115,11 +138,20 @@ impl Driver {
                 warn!("worker join error: {e}");
             }
         }
+        let elapsed_secs = start.elapsed().as_secs_f64();
+        let timeline = match collector.await {
+            Ok(builder) => builder.finish(elapsed_secs),
+            Err(e) => {
+                warn!("timeline collector join error: {e}");
+                StageTimeline::default()
+            }
+        };
 
         Ok(StageReport {
             name: stage.name.clone(),
-            elapsed_secs: start.elapsed().as_secs_f64(),
+            elapsed_secs,
             metrics: metrics.snapshot(),
+            timeline,
         })
     }
 }

@@ -113,8 +113,8 @@
             <div class="field-grid two">
               <label class="field" for="hostname-prefix">
                 <span><b data-i18n="hostnamePrefix">主机名前缀</b></span>
-                <input id="hostname-prefix" value="ostorage" autocomplete="off" placeholder="ostorage">
-                <small data-i18n="hostnamePrefixHelp">开启修改 hostname 后，生成 ostorage_51 这类名称。</small>
+                <input id="hostname-prefix" value="peregrine" autocomplete="off" placeholder="peregrine">
+                <small data-i18n="hostnamePrefixHelp">开启修改 hostname 后，生成 peregrine_51 这类名称。</small>
               </label>
               <label class="field" for="ntp-internet-server">
                 <span><b data-i18n="ntpServer">互联网 NTP</b><em data-i18n="required">必填</em></span>
@@ -217,7 +217,7 @@
                 <div class="field-grid two">
                   <label class="field locked-field" for="auth-method"><span><b data-i18n="authMethod">认证方式</b><em data-i18n="currentContract">当前合同</em></span><select id="auth-method" disabled><option value="keystone">Keystone</option><option value="tempauth">TempAuth</option></select><small data-i18n="authMethodHelp">认证方式由部署栈决定：python-v3 使用 Keystone，rust 使用 TempAuth。</small></label>
                   <label class="field locked-field" for="swift-interface"><span><b data-i18n="interface">访问接口</b><em data-i18n="currentContract">当前合同</em></span><select id="swift-interface" disabled><option value="swift">Swift API</option></select><small data-i18n="interfaceHelp">S3 需要单独生成 EC2 access/secret 凭据，当前 UI 未开放。</small></label>
-                  <label class="field python-only" for="account-name"><span><b data-i18n="accountName">初始账号 / Project</b><em data-i18n="required">必填</em></span><input id="account-name" value="ostorage" autocomplete="off"></label>
+                  <label class="field python-only" for="account-name"><span><b data-i18n="accountName">初始账号 / Project</b><em data-i18n="required">必填</em></span><input id="account-name" value="peregrine" autocomplete="off"></label>
                   <label class="field python-only" for="admin-user"><span><b data-i18n="adminUser">Swift 管理用户</b><em data-i18n="required">必填</em></span><input id="admin-user" value="reseller_admin" autocomplete="off"><small data-i18n="adminUserHelp">不能命名为 swift 或 admin。</small></label>
                   <label class="field python-only" for="admin-password"><span><b data-i18n="adminPassword">Swift 管理用户密码</b><em data-i18n="required">必填</em></span><input id="admin-password" type="password" minlength="12" pattern="[A-Za-z0-9._~-]{12,}" autocomplete="new-password" aria-describedby="password-contract" data-secret="true"></label>
                   <label class="field rust-only" for="tempauth-account"><span><b data-i18n="tempauthAccount">TempAuth 账户</b><em data-i18n="required">必填</em></span><input id="tempauth-account" value="test" autocomplete="off"><small data-i18n="tempauthAccountHelp">首个账户是管理账户，写入 swift_tempauth_users。</small></label>

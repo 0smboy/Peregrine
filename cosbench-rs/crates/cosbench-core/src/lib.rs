@@ -4,14 +4,18 @@ pub mod auth;
 pub mod config;
 pub mod driver;
 pub mod generator;
+pub mod html_report;
 pub mod integrity;
 pub mod metrics;
 pub mod ops;
 pub mod report;
 pub mod storage;
+pub mod svgchart;
+pub mod timeline;
 pub mod xml_import;
 
 pub use config::Workload;
 pub use driver::{Driver, StageReport};
 pub use metrics::{MetricsSnapshot, StageMetrics};
 pub use report::ReportBundle;
+pub use timeline::StageTimeline;

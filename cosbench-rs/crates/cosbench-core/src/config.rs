@@ -8,10 +8,17 @@ pub struct Workload {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// Timeline bucket width in seconds; clamped to 1..=60 at run time.
+    #[serde(default = "default_sample_interval_secs")]
+    pub sample_interval_secs: u64,
     pub storage: StorageConfig,
     #[serde(default)]
     pub auth: Option<AuthConfig>,
     pub stages: Vec<Stage>,
+}
+
+pub(crate) fn default_sample_interval_secs() -> u64 {
+    crate::timeline::DEFAULT_SAMPLE_INTERVAL_SECS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

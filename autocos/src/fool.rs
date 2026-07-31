@@ -41,19 +41,19 @@ async fn run_one_with_defaults(task: &str, backend: &str, cosbench_url: &str) ->
     };
 
     // Capacity knobs for constrained clusters (all default to full fool):
-    //   CABT_FOOL_SCALE       multiply object_count + prepare_worker (e.g. 0.02)
-    //   CABT_FOOL_WORKER_CAP  cap the normal/prepare concurrency
-    //   CABT_FOOL_RUNTIME     per-task normal-stage seconds (default 150)
-    let scale = env_f64("CABT_FOOL_SCALE").filter(|s| *s > 0.0);
+    //   AUTOCOS_FOOL_SCALE       multiply object_count + prepare_worker (e.g. 0.02)
+    //   AUTOCOS_FOOL_WORKER_CAP  cap the normal/prepare concurrency
+    //   AUTOCOS_FOOL_RUNTIME     per-task normal-stage seconds (default 150)
+    let scale = env_f64("AUTOCOS_FOOL_SCALE").filter(|s| *s > 0.0);
     if let Some(s) = scale {
         object_count = ((object_count as f64 * s).round() as u64).max(1);
         prepare_worker = ((prepare_worker as f64 * s).round() as u32).max(1);
     }
-    let worker_cap = env_u64("CABT_FOOL_WORKER_CAP").map(|c| c.max(1) as u32);
-    let runtime = env_u64("CABT_FOOL_RUNTIME");
+    let worker_cap = env_u64("AUTOCOS_FOOL_WORKER_CAP").map(|c| c.max(1) as u32);
+    let runtime = env_u64("AUTOCOS_FOOL_RUNTIME");
     // prepare writes the container × object cross product, so containers
-    // multiply stored bytes; CABT_FOOL_CONTAINERS caps that on small disks.
-    let container_count = env_u64("CABT_FOOL_CONTAINERS").map(|c| c.max(1));
+    // multiply stored bytes; AUTOCOS_FOOL_CONTAINERS caps that on small disks.
+    let container_count = env_u64("AUTOCOS_FOOL_CONTAINERS").map(|c| c.max(1));
 
     let overrides = RunOverrides {
         object_count: Some(object_count),

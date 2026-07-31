@@ -9,10 +9,10 @@ use std::path::PathBuf;
 pub fn collect_normal(out: Option<&str>) -> Result<()> {
     env_cfg::ensure_dirs()?;
     // rebuild collect cache via list
-    let _ = fs::remove_file(env_cfg::cabt_home().join("result").join(".collect"));
+    let _ = fs::remove_file(env_cfg::autocos_home().join("result").join(".collect"));
     list::list_results(None)?;
 
-    let src = env_cfg::cabt_home().join("result").join(".collect");
+    let src = env_cfg::autocos_home().join("result").join(".collect");
     let meta = ReportMeta::from_env();
 
     let out = out.map(PathBuf::from).unwrap_or_else(|| {
@@ -44,7 +44,7 @@ pub fn collect_normal(out: Option<&str>) -> Result<()> {
 
 pub fn collect_fool() -> Result<()> {
     env_cfg::ensure_dirs()?;
-    let fool_dir = env_cfg::cabt_home().join("fool");
+    let fool_dir = env_cfg::autocos_home().join("fool");
     let _ = fs::remove_file(fool_dir.join(".collect"));
     list::list_results(Some("fool"))?;
 

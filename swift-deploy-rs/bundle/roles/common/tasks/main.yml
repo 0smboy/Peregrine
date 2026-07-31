@@ -178,7 +178,7 @@
     blockinfile:
       dest: /etc/rsyslog.conf
       insertafter: "# Provides UDP syslog reception"
-      marker: "# OSTORAGE RSYSLOG UDP SETTINGS {mark}"
+      marker: "# PEREGRINE RSYSLOG UDP SETTINGS {mark}"
       content: |
         $ModLoad imudp
         $UDPServerRun 514

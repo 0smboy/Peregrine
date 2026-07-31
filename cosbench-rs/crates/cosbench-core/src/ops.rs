@@ -3,13 +3,15 @@ use crate::generator::ObjectGenerator;
 use crate::integrity::{generate_payload, verify_payload};
 use crate::metrics::StageMetrics;
 use crate::storage::Storage;
+use crate::timeline::TimelineSample;
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::mpsc::UnboundedSender;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OpKind {
     Write,
     Read,
@@ -29,6 +31,18 @@ impl OpKind {
             "create_container" | "init_container" => Some(Self::CreateContainer),
             "delete_container" => Some(Self::DeleteContainer),
             _ => None,
+        }
+    }
+
+    /// Stable name used in timeline rows and report series.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::Read => "read",
+            Self::Delete => "delete",
+            Self::List => "list",
+            Self::CreateContainer => "create_container",
+            Self::DeleteContainer => "delete_container",
         }
     }
 }
@@ -115,6 +129,10 @@ pub struct WorkerCtx {
     pub worker_id: u32,
     pub sequential: bool,
     pub seq_counter: Arc<AtomicU64>,
+    /// Stage start; per-op completion offsets are measured against it.
+    pub stage_start: Instant,
+    /// Channel to the timeline collector task (non-blocking send).
+    pub timeline_tx: UnboundedSender<TimelineSample>,
 }
 
 pub async fn worker_loop(ctx: Arc<WorkerCtx>) {
@@ -220,8 +238,18 @@ async fn run_one(ctx: &WorkerCtx, op: OpKind, rng: &mut impl Rng) {
         }
     };
     let lat = start.elapsed();
+    let lat_us = (lat.as_micros().min(u128::from(u64::MAX)) as u64).max(1);
+    let sample = TimelineSample {
+        offset: ctx.stage_start.elapsed(),
+        op,
+        ok: result.is_ok(),
+        lat_us,
+        bytes: *result.as_ref().unwrap_or(&0),
+    };
     match result {
         Ok(bytes) => ctx.metrics.record_ok(lat, bytes),
         Err(msg) => ctx.metrics.record_err(lat, msg),
     }
+    // Collector gone (stage tearing down): sample is droppable.
+    let _ = ctx.timeline_tx.send(sample);
 }

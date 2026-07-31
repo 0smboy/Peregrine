@@ -20,9 +20,9 @@
     - name: Copy iptables template
       template:
         src: templates/iptables.j2
-        dest: /opt/ostorage_default.iptables
+        dest: /opt/peregrine_default.iptables
     - name: Import iptables rules
-      shell: "iptables-restore < /opt/ostorage_default.iptables"
+      shell: "iptables-restore < /opt/peregrine_default.iptables"
     - name: Save iptables rules
       shell: "service iptables save"
     - name: Backup iptables.save2

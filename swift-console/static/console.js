@@ -69,6 +69,7 @@
   }
 
   function applyTheme(t) {
+    if (t !== "light" && t !== "dark") return;
     var root = document.documentElement;
     root.setAttribute("data-theme", t);
     document.cookie = "sc_theme=" + t +
@@ -81,7 +82,10 @@
     syncDeployFrame();
   }
 
-  var themeForm = $(".theme-seg");
+  // Bind by action, not by class: the language switch is a sibling form that
+  // must submit natively (its text is server-rendered), only theme is a
+  // client-side CSS swap.
+  var themeForm = document.querySelector('form[action="/theme"]');
   if (themeForm) themeForm.addEventListener("submit", function (ev) {
     ev.preventDefault();
     applyTheme((ev.submitter && ev.submitter.value) || "dark");
@@ -842,11 +846,12 @@
     return e;
   }
 
-  function lineChart(body, resp, unit) {
+  function lineChart(body, resp, unit, opts) {
+    opts = opts || {};
     var series = (resp.series || []).filter(function (s) { return s.points && s.points.length; });
     var legend = [];
     if (!series.length) { body.innerHTML = '<div class="mon-empty">' + T("No data in range", "该区间内没有数据") + '</div>'; return legend; }
-    var W = Math.max(body.clientWidth || 600, 260), H = 172;
+    var W = Math.max(body.clientWidth || 600, 260), H = opts.h || 172;
     var padR = 12, padT = 10, padB = 22;
     var minT = Infinity, maxT = -Infinity, minV = Infinity, maxV = -Infinity;
     series.forEach(function (s) {
@@ -892,7 +897,7 @@
         pen = true; last = p[1];
       });
       if (d) s.appendChild(svg("path", { d: d.trim(), class: "mon-ser " + cls }));
-      legend.push({ name: ser.name, cls: cls, last: last, unit: unit });
+      legend.push({ name: ser.name, cls: cls, last: last, unit: unit, key: ser.key || null });
     });
     body.innerHTML = ""; body.appendChild(s);
     return legend;
@@ -1055,29 +1060,81 @@
   };
 
   if (PAGE === "monitor") {
-    var mon = { dashes: [], active: 0, range: 3600, timer: null };
+    var mon = { dashes: [], active: 0, range: 3600, timer: null,
+                nodes: [], node: "", nodePanels: [], nodeTitle: "" };
     var grid = $("#mon-grid"), tabs = $("#mon-tabs");
     var rangeSel = $("#mon-range"), refreshBtn = $("#mon-refresh");
+    var nodeBar = $("#mon-nodebar"), nodeSeg = $("#mon-nodes");
+
+    function panelUrl(p, range) {
+      var u = "/monitor/api/panel?id=" + encodeURIComponent(p.id) + "&range=" + range;
+      if (mon.node && p.node_scoped) u += "&node=" + encodeURIComponent(mon.node);
+      return u;
+    }
+
+    // Service-state grid: one row per node, one dot per service; every cell
+    // names its service and state, every row opens that node.
+    function svcGridView(body, resp) {
+      var g = resp.grid || {}, services = g.services || [], rows = g.rows || [];
+      if (!rows.length) { body.innerHTML = '<div class="mon-empty">' + T("No data", "没有数据") + '</div>'; return; }
+      var box = document.createElement("div"); box.className = "mon-svcgrid";
+      var head = document.createElement("div"); head.className = "mon-svc-row head";
+      var hn = document.createElement("span"); hn.className = "mon-svc-node"; hn.textContent = T("Node", "节点");
+      head.appendChild(hn);
+      services.forEach(function (s) {
+        var c = document.createElement("span"); c.className = "mon-svc-h";
+        c.textContent = s.replace(/^swift-/, ""); head.appendChild(c);
+      });
+      box.appendChild(head);
+      rows.forEach(function (r) {
+        var row = document.createElement("div"); row.className = "mon-svc-row";
+        row.setAttribute("data-node", r.node); row.tabIndex = 0;
+        row.setAttribute("role", "button");
+        row.title = T("Open ", "查看 ") + r.node;
+        var nm = document.createElement("span"); nm.className = "mon-svc-node"; nm.textContent = r.node;
+        row.appendChild(nm);
+        (r.cells || []).forEach(function (c) {
+          var cell = document.createElement("span");
+          cell.className = "mon-svc-c " + (c.state === "active" ? "ok" : (c.state === "unreachable" ? "unk" : "bad"));
+          cell.title = c.service + ": " + c.state;
+          row.appendChild(cell);
+        });
+        box.appendChild(row);
+      });
+      box.addEventListener("click", function (ev) {
+        var row = ev.target.closest(".mon-svc-row[data-node]");
+        if (row) selectNode(row.getAttribute("data-node"));
+      });
+      body.innerHTML = ""; body.appendChild(box);
+    }
+
     function paint(p, card, resp) {
       var body = card.querySelector(".mon-body"), leg = card.querySelector(".mon-legend");
       if (leg) leg.innerHTML = "";
       if (resp.error) { body.innerHTML = '<div class="mon-empty">' + T("Unavailable", "暂不可用") + '</div>'; return; }
       if (p.kind === "stat") { statTile(body, resp, p.unit); return; }
       if (p.kind === "logs") { logView(body, resp); return; }
+      if (p.kind === "svcgrid") { svcGridView(body, resp); return; }
+      card._resp = resp; // reused by the drill without a second query
       var legend = lineChart(body, resp, p.unit);
       if (leg && legend.length) {
         legend.forEach(function (l) {
-          var it = document.createElement("span"); it.className = "mon-leg-i";
+          var it = document.createElement("span"); it.className = "mon-leg-i" + (l.key ? " linked" : "");
           var sw = document.createElement("i"); sw.className = l.cls;
           var nm = document.createElement("b"); nm.textContent = l.name;
           var vv = document.createElement("em"); vv.textContent = fmtVal(l.unit, l.last);
-          it.appendChild(sw); it.appendChild(nm); it.appendChild(vv); leg.appendChild(it);
+          it.appendChild(sw); it.appendChild(nm); it.appendChild(vv);
+          if (l.key) {
+            it.title = T("Open ", "查看 ") + l.key;
+            it.addEventListener("click", function (ev) { ev.stopPropagation(); selectNode(l.key); });
+          }
+          leg.appendChild(it);
         });
       }
     }
 
     function fetchPanel(p, card) {
-      api("GET", "/monitor/api/panel?id=" + encodeURIComponent(p.id) + "&range=" + mon.range)
+      api("GET", panelUrl(p, mon.range))
         .then(function (resp) { paint(p, card, resp); })
         .catch(function () {
           var body = card.querySelector(".mon-body");
@@ -1096,21 +1153,32 @@
       var b = document.createElement("div"); b.className = "mon-body";
       b.innerHTML = '<div class="mon-empty">…</div>';
       card.appendChild(h); card.appendChild(b);
+      // Every tile opens: series and logs enlarge in place, stat tiles open
+      // their history panel.
+      if (p.kind !== "svcgrid") {
+        card.classList.add("openable");
+        card.title = T("Click to enlarge", "点击放大查看");
+        card.addEventListener("click", function () { openDrill(p); });
+      }
       return card;
     }
 
+    function activePanels() {
+      if (mon.node) return mon.nodePanels;
+      var d = mon.dashes[mon.active];
+      return d ? d.panels : [];
+    }
+
     function loadDash() {
-      var d = mon.dashes[mon.active]; if (!d) return;
       grid.innerHTML = "";
-      d.panels.forEach(function (p) {
+      activePanels().forEach(function (p) {
         var card = cardShell(p);
         grid.appendChild(card);
         fetchPanel(p, card);
       });
     }
     function refresh() {
-      var d = mon.dashes[mon.active]; if (!d) return;
-      d.panels.forEach(function (p) {
+      activePanels().forEach(function (p) {
         var card = grid.querySelector('.mon-card[data-panel="' + p.id + '"]');
         if (card) fetchPanel(p, card);
       });
@@ -1120,16 +1188,125 @@
       tabs.innerHTML = "";
       mon.dashes.forEach(function (d, i) {
         var b = document.createElement("button");
-        b.type = "button"; b.className = "seg-b" + (i === mon.active ? " active" : "");
+        b.type = "button"; b.className = "seg-b" + (!mon.node && i === mon.active ? " active" : "");
         b.textContent = d.title;
         b.addEventListener("click", function () {
           mon.active = i;
-          $$(".seg-b", tabs).forEach(function (x, xi) { x.classList.toggle("active", xi === i); });
-          loadDash();
+          selectNode("");
         });
         tabs.appendChild(b);
       });
     }
+
+    function buildNodeBar() {
+      if (!nodeBar || !nodeSeg || !mon.nodes.length) return;
+      nodeBar.hidden = false;
+      nodeSeg.innerHTML = "";
+      var all = document.createElement("button");
+      all.type = "button"; all.className = "seg-b" + (mon.node ? "" : " active");
+      all.textContent = T("All", "全部");
+      all.addEventListener("click", function () { selectNode(""); });
+      nodeSeg.appendChild(all);
+      mon.nodes.forEach(function (n) {
+        var b = document.createElement("button");
+        b.type = "button"; b.className = "seg-b" + (mon.node === n ? " active" : "");
+        b.textContent = n;
+        b.addEventListener("click", function () { selectNode(n); });
+        nodeSeg.appendChild(b);
+      });
+    }
+
+    function selectNode(name) {
+      mon.node = name || "";
+      buildNodeBar();
+      $$(".seg-b", tabs).forEach(function (x, xi) {
+        x.classList.toggle("active", !mon.node && xi === mon.active);
+      });
+      loadDash();
+    }
+
+    // ---- panel drill: a full-width chart plus the numbers behind it ----
+    var drill = $("#mon-drill"), drillT = $("#mon-drill-t"),
+        drillBody = $("#mon-drill-body"), drillTable = $("#mon-drill-table"),
+        drillRange = $("#mon-drill-range"), drillClose = $("#mon-drill-close");
+    var drillState = { p: null, range: 3600 };
+
+    function seriesStats(s) {
+      var vals = (s.points || []).map(function (p) { return p[1]; })
+        .filter(function (v) { return v != null && !isNaN(v); });
+      if (!vals.length) return null;
+      var min = Infinity, max = -Infinity, sum = 0;
+      vals.forEach(function (v) { if (v < min) min = v; if (v > max) max = v; sum += v; });
+      return { min: min, max: max, avg: sum / vals.length, last: vals[vals.length - 1] };
+    }
+
+    function paintDrill(resp) {
+      var p = drillState.p;
+      drillBody.innerHTML = ""; drillTable.innerHTML = "";
+      if (!p || resp.error) { drillBody.innerHTML = '<div class="mon-empty">' + T("Unavailable", "暂不可用") + '</div>'; return; }
+      if (p.kind === "logs" || resp.kind === "logs") { logView(drillBody, resp); return; }
+      var legend = lineChart(drillBody, resp, p.unit, { h: 300 });
+      // The numbers behind the lines: nothing the chart shows is unreadable.
+      var tbl = document.createElement("table"); tbl.className = "tbl mon-drill-tbl";
+      var thead = document.createElement("thead");
+      thead.innerHTML = "<tr><th></th><th>" + T("Series", "系列") + "</th><th>" +
+        T("Current", "当前") + "</th><th>" + T("Min", "最小") + "</th><th>" +
+        T("Avg", "平均") + "</th><th>" + T("Max", "最大") + "</th></tr>";
+      tbl.appendChild(thead);
+      var tb = document.createElement("tbody");
+      (resp.series || []).forEach(function (s, i) {
+        var st = seriesStats(s); if (!st) return;
+        var tr = document.createElement("tr");
+        var sw = "<i class='mon-leg-sw " + ("mon-s" + ((i % 6) + 1)) + "'></i>";
+        tr.innerHTML = "<td>" + sw + "</td><td>" + s.name + "</td><td>" + fmtVal(p.unit, st.last) +
+          "</td><td>" + fmtVal(p.unit, st.min) + "</td><td>" + fmtVal(p.unit, st.avg) +
+          "</td><td>" + fmtVal(p.unit, st.max) + "</td>";
+        tb.appendChild(tr);
+      });
+      tbl.appendChild(tb);
+      if (tb.children.length) drillTable.appendChild(tbl);
+      void legend;
+    }
+
+    function fetchDrill() {
+      var p = drillState.p; if (!p) return;
+      drillBody.innerHTML = '<div class="mon-empty">…</div>';
+      api("GET", panelUrl(p, drillState.range))
+        .then(paintDrill)
+        .catch(function () { drillBody.innerHTML = '<div class="mon-empty">' + T("Unavailable", "暂不可用") + '</div>'; });
+    }
+
+    function openDrill(p) {
+      // A stat tile opens its history panel; everything else opens itself.
+      var target = p;
+      if (p.kind === "stat" && p.drill) {
+        var all = mon.dashes.reduce(function (acc, d) { return acc.concat(d.panels); }, [])
+          .concat(mon.nodePanels);
+        var hit = all.filter(function (x) { return x.id === p.drill; })[0];
+        target = hit || { id: p.drill, title: p.title, kind: "series", unit: p.unit, node_scoped: true, drill: "" };
+      }
+      drillState.p = target;
+      drillState.range = mon.range;
+      drillT.textContent = target.title + (mon.node ? " · " + mon.node : "");
+      // range chips
+      drillRange.innerHTML = "";
+      [[900, T("15m", "15 分钟")], [3600, T("1h", "1 小时")], [21600, T("6h", "6 小时")],
+       [86400, T("24h", "24 小时")], [604800, T("7d", "7 天")]].forEach(function (r) {
+        var b = document.createElement("button");
+        b.type = "button"; b.className = "seg-b" + (drillState.range === r[0] ? " active" : "");
+        b.textContent = r[1];
+        b.addEventListener("click", function () {
+          drillState.range = r[0];
+          $$(".seg-b", drillRange).forEach(function (x) { x.classList.toggle("active", x === b); });
+          fetchDrill();
+        });
+        drillRange.appendChild(b);
+      });
+      if (drill && !drill.open) drill.showModal();
+      fetchDrill();
+    }
+    if (drillClose) drillClose.addEventListener("click", function () { drill.close(); });
+    if (drill) drill.addEventListener("click", function (ev) { if (ev.target === drill) drill.close(); });
 
     if (rangeSel) rangeSel.addEventListener("change", function () { mon.range = parseInt(rangeSel.value, 10) || 3600; loadDash(); });
     if (refreshBtn) refreshBtn.addEventListener("click", refresh);
@@ -1138,7 +1315,11 @@
 
     api("GET", "/monitor/api/dash").then(function (d) {
       mon.dashes = d.dashboards || [];
+      mon.nodes = d.nodes || [];
+      mon.nodePanels = d.node_panels || [];
+      mon.nodeTitle = d.node_title || "";
       buildTabs();
+      buildNodeBar();
       loadDash();
       mon.timer = setInterval(refresh, 30000);
     }).catch(function () {
@@ -1343,6 +1524,176 @@
       return c;
     }
 
+    // The chart is the reading surface; the full table stays one click away so
+    // nothing the table said is lost.
+    function withTable(chartNode, cols, rows) {
+      var box = document.createElement("div");
+      box.appendChild(chartNode);
+      var det = document.createElement("details"); det.className = "rs-det";
+      var sum = document.createElement("summary");
+      sum.textContent = T("Data table", "查看数据表");
+      det.appendChild(sum);
+      det.appendChild(table(cols, rows));
+      box.appendChild(det);
+      return box;
+    }
+
+    // Devices, drawn: per device a before→after partition bar pair, its share
+    // of the ring, and its state — everything the table carried, readable at a
+    // glance. Devices group under their node.
+    function deviceChart(devices) {
+      var wrap = document.createElement("div"); wrap.className = "rs-devchart";
+      var maxParts = 1;
+      devices.forEach(function (x) {
+        maxParts = Math.max(maxParts, x.parts_before || 0, x.parts_after || 0);
+      });
+      var byNode = {};
+      devices.forEach(function (x) {
+        var k = x.node || x.ip;
+        (byNode[k] = byNode[k] || []).push(x);
+      });
+      Object.keys(byNode).forEach(function (nodeName) {
+        var g = document.createElement("div"); g.className = "rs-devgroup";
+        var head = document.createElement("div"); head.className = "rs-devnode";
+        var zone = byNode[nodeName][0];
+        head.textContent = nodeName + "  ·  r" + zone.region + "z" + zone.zone;
+        g.appendChild(head);
+        byNode[nodeName].forEach(function (x) {
+          var row = document.createElement("div"); row.className = "rs-devrow";
+          var lab = document.createElement("span"); lab.className = "rs-devlab";
+          lab.textContent = x.device;
+          var meta = document.createElement("span"); meta.className = "rs-devmeta";
+          meta.textContent = T("weight ", "权重 ") + x.weight;
+          var bars = document.createElement("div"); bars.className = "rs-devbars";
+          var pb = Math.round(100 * (x.parts_before || 0) / maxParts);
+          var pa = Math.round(100 * (x.parts_after || 0) / maxParts);
+          var b1 = document.createElement("div"); b1.className = "rs-bar before";
+          b1.style.width = Math.max(pb, 1) + "%";
+          var b1v = document.createElement("em"); b1v.textContent = x.parts_before;
+          b1.appendChild(b1v);
+          b1.title = T("before: ", "变更前：") + x.parts_before + T(" partitions", " 个分区");
+          var b2 = document.createElement("div"); b2.className = "rs-bar after";
+          b2.style.width = Math.max(pa, 1) + "%";
+          var b2v = document.createElement("em"); b2v.textContent = x.parts_after;
+          b2.appendChild(b2v);
+          b2.title = T("after: ", "变更后：") + x.parts_after + T(" partitions", " 个分区");
+          bars.appendChild(b1); bars.appendChild(b2);
+          var delta = (x.parts_after || 0) - (x.parts_before || 0);
+          var tail = document.createElement("span"); tail.className = "rs-devtail";
+          var dchip = document.createElement("b");
+          dchip.className = "rs-delta " + (delta > 0 ? "up" : (delta < 0 ? "down" : "flat"));
+          dchip.textContent = (delta > 0 ? "+" : "") + delta;
+          dchip.title = T("partitions gained/lost", "分区增减");
+          var bal = document.createElement("i"); bal.className = "rs-bal";
+          bal.textContent = (x.balance_pct || 0).toFixed(1) + "%";
+          bal.title = T("balance vs fair share", "相对公平份额的均衡度");
+          var st = document.createElement("i");
+          st.className = "rs-state " + (x.state === "ok" || x.state === "unchanged" ? "ok" : "warn");
+          st.textContent = x.state;
+          tail.appendChild(dchip); tail.appendChild(bal); tail.appendChild(st);
+          row.appendChild(lab); row.appendChild(meta); row.appendChild(bars); row.appendChild(tail);
+          g.appendChild(row);
+        });
+        wrap.appendChild(g);
+      });
+      var legend = document.createElement("div"); legend.className = "rs-devlegend";
+      [["before", T("partitions before", "变更前分区数")], ["after", T("partitions after", "变更后分区数")]]
+        .forEach(function (p) {
+          var i = document.createElement("span"); i.className = "mon-leg-i";
+          var sw = document.createElement("i"); sw.className = "rs-bar-sw " + p[0];
+          var nm = document.createElement("b"); nm.textContent = p[1];
+          i.appendChild(sw); i.appendChild(nm); legend.appendChild(i);
+        });
+      wrap.appendChild(legend);
+      return wrap;
+    }
+
+    // Where the data goes, drawn: sources on the left, destinations on the
+    // right, one ribbon per flow with width carrying the replica count. Every
+    // ribbon names its endpoints, replica count and bytes on hover.
+    function flowChart(flows, devices, bytesPerSlot) {
+      var name = function (id) {
+        var d = devices.find(function (x) { return x.dev_id === id; });
+        return d ? (d.node || d.ip) + "/" + d.device : "dev " + id;
+      };
+      var srcs = [], dsts = [], total = 0;
+      var sIdx = {}, dIdx = {};
+      flows.forEach(function (f) {
+        if (!(f.from in sIdx)) { sIdx[f.from] = srcs.length; srcs.push({ id: f.from, sum: 0 }); }
+        if (!(f.to in dIdx)) { dIdx[f.to] = dsts.length; dsts.push({ id: f.to, sum: 0 }); }
+        srcs[sIdx[f.from]].sum += f.slots;
+        dsts[dIdx[f.to]].sum += f.slots;
+        total += f.slots;
+      });
+      srcs.sort(function (a, b) { return b.sum - a.sum; });
+      dsts.sort(function (a, b) { return b.sum - a.sum; });
+      sIdx = {}; dIdx = {};
+      srcs.forEach(function (s, i) { sIdx[s.id] = i; });
+      dsts.forEach(function (d, i) { dIdx[d.id] = i; });
+
+      var W = 860, labW = 190, colW = 10;
+      var innerH = Math.max(srcs.length, dsts.length) * 34 + 20;
+      var H = innerH + 16;
+      var x1 = labW, x2 = W - labW;
+      var sy = {}, dy = {};
+      var pack = function (list, idx, yMap) {
+        var gap = 8;
+        var scale = (innerH - gap * (list.length - 1)) / Math.max(total, 1);
+        var y = 10;
+        list.forEach(function (e) {
+          var h = Math.max(e.sum * scale, 4);
+          yMap[e.id] = { y: y, h: h, off: 0 };
+          y += h + gap;
+        });
+      };
+      pack(srcs, sIdx, sy); pack(dsts, dIdx, dy);
+
+      var s = CHART.svg("svg", { viewBox: "0 0 " + W + " " + H, width: "100%", class: "rs-flow" });
+      // endpoint bars + labels
+      var endpoint = function (list, yMap, isSrc) {
+        list.forEach(function (e) {
+          var m = yMap[e.id];
+          s.appendChild(CHART.svg("rect", {
+            x: isSrc ? x1 - colW : x2, y: m.y, width: colW, height: m.h, rx: 2,
+            class: isSrc ? "rs-fl-src" : "rs-fl-dst"
+          }));
+          var lab = CHART.svg("text", {
+            x: isSrc ? x1 - colW - 8 : x2 + colW + 8, y: m.y + m.h / 2 + 3.5,
+            "text-anchor": isSrc ? "end" : "start", class: "rs-fl-lab"
+          });
+          lab.textContent = name(e.id) + "  (" + e.sum + ")";
+          s.appendChild(lab);
+        });
+      };
+      endpoint(srcs, sy, true); endpoint(dsts, dy, false);
+      // ribbons
+      var scale = function (slots, sum, h) { return Math.max(h * slots / Math.max(sum, 1), 2); };
+      flows.forEach(function (f) {
+        var sm = sy[f.from], dm = dy[f.to];
+        var sh = scale(f.slots, srcs[sIdx[f.from]].sum, sm.h);
+        var dh = scale(f.slots, dsts[dIdx[f.to]].sum, dm.h);
+        var ys = sm.y + sm.off + sh / 2, yd = dm.y + dm.off + dh / 2;
+        sm.off += sh; dm.off += dh;
+        var mid = (x1 + x2) / 2;
+        var path = CHART.svg("path", {
+          d: "M" + x1 + " " + ys + " C" + mid + " " + ys + " " + mid + " " + yd + " " + x2 + " " + yd,
+          class: "rs-fl-rib", "stroke-width": Math.max((sh + dh) / 2, 1.6), fill: "none"
+        });
+        var tt = CHART.svg("title", {});
+        tt.textContent = name(f.from) + " -> " + name(f.to) + " · " + f.slots +
+          T(" replicas · ", " 个副本 · ") + fmtBytes((bytesPerSlot || 0) * f.slots);
+        path.appendChild(tt);
+        s.appendChild(path);
+      });
+      var box = document.createElement("div");
+      box.appendChild(s);
+      var note = document.createElement("div"); note.className = "lab-b";
+      note.textContent = T("Ribbon width is the replica count; hover for exact replicas and bytes.",
+        "带宽代表副本数量；悬停可见精确的副本数与数据量。");
+      box.appendChild(note);
+      return box;
+    }
+
     function render(d) {
       out.innerHTML = "";
       if (d.warnings && d.warnings.length) {
@@ -1400,9 +1751,10 @@
         ];
       });
       grid.appendChild(card(T("Devices", "设备"),
-        table(["Device", "Zone", "Weight", "Partitions before", "after", "Balance", "State"], devRows)));
+        withTable(deviceChart(d.devices || []),
+          ["Device", "Zone", "Weight", "Partitions before", "after", "Balance", "State"], devRows)));
 
-      var flows = (mv.flows || []).map(function (f) {
+      var flowRows = (mv.flows || []).map(function (f) {
         var from = (d.devices || []).find(function (x) { return x.dev_id === f.from; });
         var to = (d.devices || []).find(function (x) { return x.dev_id === f.to; });
         return [
@@ -1412,7 +1764,9 @@
           { cls: "num", v: fmtBytes((tr.bytes_per_slot || 0) * f.slots) }
         ];
       });
-      if (flows.length) grid.appendChild(card(T("Where the data goes", "数据流向"), table(["From", "To", "Replicas", "Bytes"], flows)));
+      if (flowRows.length) grid.appendChild(card(T("Where the data goes", "数据流向"),
+        withTable(flowChart(mv.flows || [], d.devices || [], tr.bytes_per_slot || 0),
+          ["From", "To", "Replicas", "Bytes"], flowRows)));
 
       var disp = d.dispersion_after || d.dispersion_before;
       if (disp) {
@@ -1673,6 +2027,115 @@
       return wrap;
     }
 
+    // Candidates drawn as small multiples: one mini bar chart per metric so
+    // magnitudes are comparable within a metric, every bar carries its exact
+    // value, and the direction of "better" is stated instead of implied.
+    function peCharts(rows) {
+      var box = document.createElement("div"); box.className = "pe-charts";
+      // legend: one colour per candidate, infeasible ones marked
+      var lg = document.createElement("div"); lg.className = "pe-legend";
+      rows.forEach(function (r, i) {
+        var it = document.createElement("span"); it.className = "mon-leg-i";
+        var sw = document.createElement("i"); sw.className = "pe-sw mon-s" + ((i % 6) + 1);
+        var nm = document.createElement("b"); nm.textContent = r.label;
+        it.appendChild(sw); it.appendChild(nm);
+        if (!r.feasible) {
+          var x = document.createElement("em"); x.className = "pe-infeasible";
+          x.textContent = T("infeasible here", "本集群不可行");
+          it.appendChild(x);
+        }
+        lg.appendChild(it);
+      });
+      box.appendChild(lg);
+
+      var metrics = [
+        { t: T("Storage amplification", "存储放大率"), dir: -1, v: function (r) { return r.amplification; }, f: function (r) { return r.amplification.toFixed(2) + "×"; } },
+        { t: T("Raw capacity needed", "所需裸容量"), dir: -1, v: function (r) { return r.raw_needed_tb; }, f: function (r) { return CHART.fmtNum(r.raw_needed_tb) + " TB"; } },
+        { t: T("Minimum devices", "最少设备数"), dir: -1, v: function (r) { return r.min_devices; }, f: function (r) { return String(r.min_devices); } },
+        { t: T("Write fanout", "写入扇出"), dir: -1, v: function (r) { return r.write_fanout; }, f: function (r) { return String(r.write_fanout); } },
+        { t: T("Write quorum", "写入法定数"), dir: 0, v: function (r) { return r.write_quorum; }, f: function (r) { return String(r.write_quorum); } },
+        { t: T("Write margin", "写入余量"), dir: 1, v: function (r) { return r.write_margin; }, f: function (r) { return String(r.write_margin) + (r.write_margin === 0 ? T(" (none)", "（无）") : ""); } },
+        { t: T("Devices to read", "读取所需设备"), dir: -1, v: function (r) { return r.read_min_devices; }, f: function (r) { return String(r.read_min_devices); } },
+        { t: T("Survives losing", "可损失设备"), dir: 1, v: function (r) { return r.tolerates_loss; }, f: function (r) { return String(r.tolerates_loss); } },
+        { t: T("Rebuild reads", "重建读取量"), dir: -1, v: function (r) { return r.rebuild_read_tb; }, f: function (r) { return CHART.fmtNum(r.rebuild_read_tb) + " TB"; } },
+        { t: T("Worst repair time", "最坏修复时间"), dir: -1, v: function (r) { return r.repair_hours; }, f: function (r) { return r.repair_hours.toFixed(1) + " h"; } },
+        { t: T("Durability", "耐久性"), dir: 1, v: function (r) { return r.durability_nines; }, f: function (r) { return r.durability_nines.toFixed(1) + T(" nines", " 个 9"); } },
+        { t: T("5-year disk cost", "五年磁盘成本"), dir: -1, v: function (r) { return r.tco; }, f: function (r) { return CHART.fmtNum(r.tco); } }
+      ];
+      var grid = document.createElement("div"); grid.className = "pe-mgrid";
+      metrics.forEach(function (m) {
+        var cardEl = document.createElement("div"); cardEl.className = "pe-metric";
+        var h = document.createElement("div"); h.className = "pe-metric-t";
+        var tt = document.createElement("b"); tt.textContent = m.t;
+        h.appendChild(tt);
+        if (m.dir !== 0) {
+          var dd = document.createElement("i"); dd.className = "pe-dir";
+          dd.textContent = m.dir > 0 ? T("higher is better", "越高越好") : T("lower is better", "越低越好");
+          h.appendChild(dd);
+        }
+        cardEl.appendChild(h);
+        var max = 0;
+        rows.forEach(function (r) { max = Math.max(max, Math.abs(m.v(r) || 0)); });
+        // best feasible value gets the mark
+        var best = null;
+        rows.forEach(function (r) {
+          if (!r.feasible || m.dir === 0) return;
+          var v = m.v(r);
+          if (best === null || (m.dir > 0 ? v > best : v < best)) best = v;
+        });
+        rows.forEach(function (r, i) {
+          var v = m.v(r) || 0;
+          var row = document.createElement("div");
+          row.className = "pe-brow" + (r.feasible ? "" : " pe-dim");
+          var lab = document.createElement("span"); lab.className = "pe-blab"; lab.textContent = r.label;
+          var track = document.createElement("div"); track.className = "pe-btrack";
+          var bar = document.createElement("div");
+          bar.className = "pe-bbar mon-s" + ((i % 6) + 1);
+          bar.style.width = (max ? Math.max(100 * Math.abs(v) / max, 2) : 2) + "%";
+          track.appendChild(bar);
+          var val = document.createElement("span");
+          val.className = "pe-bval" + (r.feasible && best !== null && v === best ? " best" : "");
+          val.textContent = m.f(r) + (r.feasible && best !== null && v === best ? " ●" : "");
+          if (r.feasible && best !== null && v === best) val.title = T("best of the feasible candidates", "可行方案中的最优值");
+          row.appendChild(lab); row.appendChild(track); row.appendChild(val);
+          cardEl.appendChild(row);
+        });
+        grid.appendChild(cardEl);
+      });
+      box.appendChild(grid);
+
+      // Constraint verdicts: same ✓/✗ facts as the table's last three rows.
+      var cons = document.createElement("div"); cons.className = "pe-cons";
+      var ch = document.createElement("div"); ch.className = "pe-metric-t";
+      var cb = document.createElement("b"); cb.textContent = T("Meets the stated constraints", "是否满足设定约束");
+      ch.appendChild(cb); cons.appendChild(ch);
+      [[T("Durability target", "耐久目标"), "meets_durability"],
+       [T("Repair-time cap", "修复时间上限"), "meets_repair_time"],
+       [T("Loss tolerance", "容错要求"), "meets_node_loss"]
+      ].forEach(function (chk) {
+        var row = document.createElement("div"); row.className = "pe-conrow";
+        var lab = document.createElement("span"); lab.className = "pe-blab"; lab.textContent = chk[0];
+        row.appendChild(lab);
+        var chips = document.createElement("div"); chips.className = "pe-chips";
+        rows.forEach(function (r) {
+          var c = document.createElement("span");
+          c.className = "pe-chip " + (r[chk[1]] ? "ok" : "no") + (r.feasible ? "" : " pe-dim");
+          c.textContent = (r[chk[1]] ? "✓ " : "✗ ") + r.label;
+          chips.appendChild(c);
+        });
+        row.appendChild(chips);
+        cons.appendChild(row);
+      });
+      box.appendChild(cons);
+
+      // The numbers, exactly as before, one click away.
+      var det = document.createElement("details"); det.className = "rs-det";
+      var sum = document.createElement("summary"); sum.textContent = T("Data table", "查看数据表");
+      det.appendChild(sum); det.appendChild(peTable(rows));
+      box.appendChild(det);
+      return box;
+    }
+
     function peNotes(rows) {
       var box = document.createElement("div"); box.className = "pe-notes";
       rows.forEach(function (r) {
@@ -1722,7 +2185,7 @@
       };
       api("POST", "/lab/api/policy/compare", body).then(function (d) {
         peOut.innerHTML = "";
-        peOut.appendChild(peTable(d.rows || []));
+        peOut.appendChild(peCharts(d.rows || []));
         peOut.appendChild(peNotes(d.rows || []));
       }).catch(function (e) {
         peOut.innerHTML = '<p class="err on">' + e.message + "</p>";

@@ -24,8 +24,8 @@ use std::sync::Arc;
 
 /// The swift cluster services a node runs. Deliberately explicit — a
 /// `swift-*` glob would also match `swift-console`/`swift-deploy` and let the
-/// console stop itself.
-const SERVICES: &str = "swift-proxy swift-object swift-container swift-account \
+/// console stop itself. Shared with the Monitor's service-health grid.
+pub const SERVICES: &str = "swift-proxy swift-object swift-container swift-account \
 swift-object-replicator swift-object-reconstructor swift-object-updater \
 swift-container-updater swift-account-replicator swift-container-replicator";
 

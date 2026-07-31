@@ -13,15 +13,15 @@ done
 
 if [ $a == "1" ]
 then
-# 获取swift_hosts里的所有节点IP,并输出到ostorage_host文件中。
-grep "ansible_ssh_user" ../swift_hosts | grep "^[1-9]" | awk '{print $1}' > ostorage_host
+# 获取swift_hosts里的所有节点IP,并输出到peregrine_host文件中。
+grep "ansible_ssh_user" ../swift_hosts | grep "^[1-9]" | awk '{print $1}' > peregrine_host
 else
-# 获取add_nodes里的所有节点IP,并输出到ostorage_host文件中。
-grep "ansible_ssh_user" ../add_nodes | grep "^[1-9]" | awk '{print $1}' > ostorage_host
+# 获取add_nodes里的所有节点IP,并输出到peregrine_host文件中。
+grep "ansible_ssh_user" ../add_nodes | grep "^[1-9]" | awk '{print $1}' > peregrine_host
 fi
 
-# 把192.168.2.[51:53]连续的IP转换成单独的IP,并追加到ostorage_host文件中。
-a=`grep "\[.*\]" ostorage_host`
+# 把192.168.2.[51:53]连续的IP转换成单独的IP,并追加到peregrine_host文件中。
+a=`grep "\[.*\]" peregrine_host`
 for i in $a
 do
 test1=`echo $i | awk -F [ '{print $1}'`
@@ -29,13 +29,13 @@ test2=`echo $i | grep -o '\[.*\]'  | sed 's/\[//;s/:.*//'`
 test3=`echo $i | grep -o '\[.*\]'  | sed 's/.*://;s/\]//'`
 for j in $(seq ${test2} ${test3})
 do
-echo $test1$j >> ostorage_host
+echo $test1$j >> peregrine_host
 done
 done
 
-# 删除192.168.2.[51:53]此类型的IP删除，并使用重定向生成以主机命名的host_vars文件,最后删除ostorage_host文件
-sed -i '/\[.*\]/d' ostorage_host
-all_hosts=`cat ostorage_host`
+# 删除192.168.2.[51:53]此类型的IP删除，并使用重定向生成以主机命名的host_vars文件,最后删除peregrine_host文件
+sed -i '/\[.*\]/d' peregrine_host
+all_hosts=`cat peregrine_host`
 for i in $all_hosts
 do
 echo "---
@@ -68,4 +68,4 @@ exclude_disks: ['sda']
 " > $i
 done
 
-rm -rf ostorage_host
+rm -rf peregrine_host

@@ -61,14 +61,14 @@ SHA-256; and re-verifies the plan, bundle, inventory, and digests before
 separate authorization. It embeds its own web control console in the same
 binary.
 
-## The test plane — `cosbench-rs`, `cabt-rs`, and the console Lab
+## The test plane — `cosbench-rs`, `autocos`, and the console Lab
 
 - **`cosbench-rs`** is a Rust rewrite of Intel's COSBench core: workloads with
   sequential prepare / main / cleanup stages, mock / S3 / Swift drivers,
   Keystone v3 auth, hash-integrity verification, and JSON/CSV reports.
-- **`cabt-rs`** scripts the benchmark lifecycle over `cosbench-rs`: submit a
+- **`autocos`** scripts the benchmark lifecycle over `cosbench-rs`: submit a
   workload, watch progress, list and collect and archive results, with state
-  under `~/.cabt/`.
+  under `~/.autocos/`.
 - **The console Lab** injects faults (fragment loss, node down) and runs
   read-back integrity checks against the live cluster.
 

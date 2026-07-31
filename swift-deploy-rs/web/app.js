@@ -24,7 +24,7 @@ const english = {
   deploymentMode: 'Deployment mode', production: 'Production', development: 'Development', modeHelp: 'Development forces ring rebalance and must never be used for production.',
   timezone: 'Timezone', timezoneHelp: 'Written to every Swift node.', saioHelp: 'Single-node test environment; requires development mode.',
   wwidLocked: 'USE_WWID (locked off)', wwidHelp: 'The explicit custom_disks contract conflicts with the upstream v3 WWID path. Use a reboot-stable /dev/disk/by-id path and let target preflight verify it.', changeHostname: 'Change hostname', hostnameHelp: 'Enable only when hostnames have no other purpose.',
-  hostnamePrefix: 'Hostname prefix', hostnamePrefixHelp: 'When enabled, names look like ostorage_51.', ntpServer: 'Internet NTP', ntpHelp: 'The ntp_server node synchronizes from this source.',
+  hostnamePrefix: 'Hostname prefix', hostnamePrefixHelp: 'When enabled, names look like peregrine_51.', ntpServer: 'Internet NTP', ntpHelp: 'The ntp_server node synchronizes from this source.',
   repoAddress: 'Local repository IPv4', repoHelp: 'Enter only the repository IPv4, with no http://, port, or path. Targets must reach http://IP/yum/, /pip/, and /component/.',
   adminIps: 'Admin allow-list IPs', adminIpsHelp: 'Comma or newline separated. Include this deployment host.', targetSshPort: 'SSH service port after deployment', targetSshHelp: 'The security role writes this sshd port. It is not the initial connection port.',
   step2Title: 'Nodes and roles', step2Desc: 'Every host requires a label, SSH address, initial port, root key, and at least one role. Production must also cover proxy, account, container, object, and time synchronization.',

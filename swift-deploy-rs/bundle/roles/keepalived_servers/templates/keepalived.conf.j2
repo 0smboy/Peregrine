@@ -5,7 +5,7 @@ global_defs {
     smtp_connect_timeout 30
     router_id LVS_1
 }
-# OStorage_vrrp_script BEGIN
+# Peregrine_vrrp_script BEGIN
 vrrp_script {{ keepalived_vrrp_script.name }} {
 {% if use_lb %}
      script   "/etc/keepalived/check_haproxy.sh"
@@ -15,9 +15,9 @@ vrrp_script {{ keepalived_vrrp_script.name }} {
     interval {{ keepalived_vrrp_script.interval }}
     weight {{ keepalived_vrrp_script.weight }}
 }
-# OStorage_vrrp_script END
+# Peregrine_vrrp_script END
 
-# OStorage_vrrp_intance BEGIN
+# Peregrine_vrrp_intance BEGIN
 vrrp_instance swift {
     state   BACKUP
     interface {{ keepalived_interface }}
@@ -37,4 +37,4 @@ vrrp_instance swift {
        {{ keepalived_vrrp_script.name }}
     }
 }
-# OStorage_vrrp_intance END
+# Peregrine_vrrp_intance END

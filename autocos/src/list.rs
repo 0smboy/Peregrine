@@ -7,12 +7,12 @@ use std::path::Path;
 pub fn list_results(mode: Option<&str>) -> Result<()> {
     let fool = matches!(mode, Some(m) if m == "fool");
     let result_dir = if fool {
-        env_cfg::cabt_home().join("fool")
+        env_cfg::autocos_home().join("fool")
     } else {
-        env_cfg::cabt_home().join("result")
+        env_cfg::autocos_home().join("result")
     };
     if fool && !result_dir.is_dir() {
-        bail!("no fool result! Try `cabt run fool` first.");
+        bail!("no fool result! Try `autocos run fool` first.");
     }
     env_cfg::ensure_dirs()?;
     fs::create_dir_all(&result_dir)?;

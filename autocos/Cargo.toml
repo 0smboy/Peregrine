@@ -1,14 +1,14 @@
 [package]
-name = "cabt"
+name = "autocos"
 version = "1.0.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["0smboy"]
-description = "Automation benchmark tool for Cosbench / cosbench-rs (Rust rewrite of cabt x86-64)"
-repository = "https://github.com/0smboy/myfile"
+description = "Benchmark automation for cosbench-rs / COSBench: task matrices, suites, result collection, Excel reports"
+repository = "https://github.com/0smboy/Peregrine"
 
 [[bin]]
-name = "cabt"
+name = "autocos"
 path = "src/main.rs"
 
 [dependencies]

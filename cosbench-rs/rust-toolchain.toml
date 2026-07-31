@@ -1,0 +1,4 @@
+# The locked AWS SDK crates (aws-sdk-s3 1.138 and friends) require
+# rustc >= 1.94.1; pin a toolchain that satisfies them.
+[toolchain]
+channel = "1.97.0"

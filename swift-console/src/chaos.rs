@@ -2273,19 +2273,16 @@ fn census_table(lang: &str, c: &Census) -> String {
     )
 }
 
-fn pass_table(lang: &str, run: &Run) -> String {
+/// Every pass at or after the fault, plus the last one each daemon logged
+/// before it. Those baseline lines are what "the pass line that changed" is
+/// measured against; forty rows of idle passes would bury it.
+fn kept_passes(run: &Run) -> Vec<PassLine> {
     let mut all: Vec<PassLine> = run.passes_before.clone();
     merge_passes(&mut all, run.passes_after.clone());
     if all.is_empty() {
-        return format!(
-            "<p class=\"note\">{}</p>",
-            esc(i18n::t(lang, "chaos.empty.pass"))
-        );
+        return Vec::new();
     }
     let fault_at = run.fault_at.unwrap_or(run.started);
-    // Every pass at or after the fault, plus the last one each daemon logged
-    // before it. Those baseline lines are what "the pass line that changed" is
-    // measured against; forty rows of idle passes would bury it.
     let mut keep: Vec<PassLine> = all.iter().filter(|p| p.at >= fault_at).cloned().collect();
     let mut seen: Vec<(String, String)> = Vec::new();
     for p in all.iter().rev().filter(|p| p.at < fault_at) {
@@ -2296,6 +2293,159 @@ fn pass_table(lang: &str, run: &Run) -> String {
         }
     }
     keep.sort_by_key(|p| std::cmp::Reverse(p.at));
+    keep
+}
+
+/// The daemon passes drawn: one lane per node × daemon, a mark per pass on a
+/// shared clock, the fault as a rule, and the pass that repaired the object
+/// ringed. Every mark carries its full numbers in a tooltip; the table below
+/// keeps them on the page.
+fn pass_chart(lang: &str, run: &Run) -> String {
+    let keep = kept_passes(run);
+    if keep.is_empty() {
+        return String::new();
+    }
+    let fault_at = run.fault_at.unwrap_or(run.started);
+    // lanes: node · daemon, stable order
+    let mut lanes: Vec<(String, String)> = Vec::new();
+    for p in &keep {
+        let k = (p.node.clone(), p.daemon.clone());
+        if !lanes.contains(&k) {
+            lanes.push(k);
+        }
+    }
+    lanes.sort();
+    let t0 = keep
+        .iter()
+        .map(|p| p.at)
+        .min()
+        .unwrap_or(fault_at)
+        .min(fault_at)
+        .saturating_sub(5);
+    let t1 = keep.iter().map(|p| p.at).max().unwrap_or(fault_at).max(fault_at) + 5;
+    let (w, pad_l, pad_r, pad_t) = (1000.0f64, 190.0f64, 26.0f64, 14.0f64);
+    let lane_h = 26.0f64;
+    let axis_h = 26.0f64;
+    let h = pad_t + lane_h * lanes.len() as f64 + axis_h;
+    let x = |at: u64| -> f64 {
+        pad_l + at.saturating_sub(t0) as f64 / (t1 - t0).max(1) as f64 * (w - pad_l - pad_r)
+    };
+    let lane_y = |i: usize| -> f64 { pad_t + i as f64 * lane_h + lane_h / 2.0 };
+
+    let mut s = String::new();
+    s.push_str(&format!(
+        "<svg class=\"ca-svg\" viewBox=\"0 0 {w:.0} {h:.0}\" width=\"{w:.0}\" height=\"{h:.0}\" \
+         role=\"img\" aria-label=\"{}\">",
+        esc(i18n::t(lang, "chaos.rep.daemon"))
+    ));
+    // lanes
+    for (i, (node, daemon)) in lanes.iter().enumerate() {
+        let y = lane_y(i);
+        s.push_str(&format!(
+            "<line class=\"ca-pl-track\" x1=\"{:.1}\" y1=\"{y:.1}\" x2=\"{:.1}\" y2=\"{y:.1}\"/>",
+            pad_l,
+            w - pad_r
+        ));
+        s.push_str(&format!(
+            "<text class=\"ca-lane-l\" x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"end\">{} · {}</text>",
+            pad_l - 8.0,
+            y + 3.5,
+            esc(node),
+            esc(&daemon_label(lang, daemon)),
+        ));
+    }
+    // the fault moment
+    let fx = x(fault_at);
+    s.push_str(&format!(
+        "<line class=\"ca-fault\" x1=\"{fx:.1}\" y1=\"{:.1}\" x2=\"{fx:.1}\" y2=\"{:.1}\"/>\
+         <text class=\"ca-fault-t\" x=\"{:.1}\" y=\"{:.1}\">{}</text>",
+        pad_t - 4.0,
+        h - axis_h + 6.0,
+        fx + 5.0,
+        pad_t + 6.0,
+        esc(i18n::t(lang, "chaos.mark.fault")),
+    ));
+    // marks
+    for p in keep.iter() {
+        let li = lanes
+            .iter()
+            .position(|(n, d)| *n == p.node && *d == p.daemon)
+            .unwrap_or(0);
+        let cx = x(p.at);
+        let cy = lane_y(li);
+        let after = p.at >= fault_at;
+        let activity = p.suffix_syncs + p.reverts;
+        let r = 3.0 + (activity as f64).min(12.0).sqrt() * 1.6;
+        let worked = p.worked() && after;
+        let mut cls = String::from("ca-pass");
+        if p.failures > 0 {
+            cls.push_str(" fail");
+        }
+        if !after {
+            cls.push_str(" base");
+        }
+        if worked {
+            s.push_str(&format!(
+                "<circle class=\"ca-pass-ring\" cx=\"{cx:.1}\" cy=\"{cy:.1}\" r=\"{:.1}\"/>",
+                r + 3.5
+            ));
+        }
+        s.push_str(&format!(
+            "<circle class=\"{cls}\" cx=\"{cx:.1}\" cy=\"{cy:.1}\" r=\"{r:.1}\">\
+             <title>{at} · {node} · {daemon} · suffix_syncs {ss} · reverts {rv} · failures {fl} · {win}</title>\
+             </circle>",
+            at = esc(&clock(p.at)),
+            node = esc(&p.node),
+            daemon = esc(&daemon_label(lang, &p.daemon)),
+            ss = p.suffix_syncs,
+            rv = p.reverts,
+            fl = p.failures,
+            win = esc(i18n::t(
+                lang,
+                if after { "chaos.pass.after" } else { "chaos.pass.before" }
+            )),
+        ));
+    }
+    // clock axis
+    for i in 0..=3 {
+        let tt = t0 + (t1 - t0) * i / 3;
+        let anchor = match i {
+            0 => "start",
+            3 => "end",
+            _ => "middle",
+        };
+        s.push_str(&format!(
+            "<text class=\"ca-axis\" x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"{anchor}\">{}</text>",
+            x(tt),
+            h - 8.0,
+            esc(&clock(tt)),
+        ));
+    }
+    s.push_str("</svg>");
+    // legend
+    let legend = format!(
+        "<div class=\"ca-pc-legend\">\
+         <span class=\"mon-leg-i\"><i class=\"ca-pc-sw ok\"></i><b>{}</b></span>\
+         <span class=\"mon-leg-i\"><i class=\"ca-pc-sw ring\"></i><b>{}</b></span>\
+         <span class=\"mon-leg-i\"><i class=\"ca-pc-sw fail\"></i><b>{}</b></span>\
+         <span class=\"mon-leg-i\"><i class=\"ca-pc-sw base\"></i><b>{}</b></span></div>",
+        esc(i18n::t(lang, "chaos.pc.size")),
+        esc(i18n::t(lang, "chaos.pc.worked")),
+        esc(i18n::t(lang, "chaos.pc.fail")),
+        esc(i18n::t(lang, "chaos.pc.base")),
+    );
+    format!("<div class=\"ca-lane\">{s}</div>{legend}")
+}
+
+fn pass_table(lang: &str, run: &Run) -> String {
+    let keep = kept_passes(run);
+    if keep.is_empty() {
+        return format!(
+            "<p class=\"note\">{}</p>",
+            esc(i18n::t(lang, "chaos.empty.pass"))
+        );
+    }
+    let fault_at = run.fault_at.unwrap_or(run.started);
     let mut rows = String::new();
     for p in keep.iter() {
         let after = p.at >= fault_at;
@@ -2861,9 +3011,12 @@ fn report(lang: &str, run: &Run) -> String {
     ));
 
     body.push_str(&format!(
-        "<h3 class=\"ca-h\">{h}</h3><p class=\"note ca-wide\">{p}</p>{t}",
+        "<h3 class=\"ca-h\">{h}</h3><p class=\"note ca-wide\">{p}</p>{chart}\
+         <details class=\"rs-det\"><summary>{det}</summary>{t}</details>",
         h = esc(i18n::t(lang, "chaos.rep.daemon")),
         p = esc(i18n::t(lang, "chaos.rep.daemonp")),
+        chart = pass_chart(lang, run),
+        det = esc(i18n::t(lang, "chaos.pc.table")),
         t = pass_table(lang, run),
     ));
     body.push_str(&auditor_panel(lang, run));

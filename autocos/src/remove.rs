@@ -5,7 +5,7 @@ use std::fs;
 pub fn remove(target: &str, fool_flag: bool) -> Result<()> {
     env_cfg::ensure_dirs()?;
     if target == "fool" {
-        let dir = env_cfg::cabt_home().join("fool");
+        let dir = env_cfg::autocos_home().join("fool");
         if dir.is_dir() {
             for e in fs::read_dir(&dir)? {
                 let e = e?;
@@ -16,9 +16,9 @@ pub fn remove(target: &str, fool_flag: bool) -> Result<()> {
         return Ok(());
     }
     let dir = if fool_flag {
-        env_cfg::cabt_home().join("fool")
+        env_cfg::autocos_home().join("fool")
     } else {
-        env_cfg::cabt_home().join("result")
+        env_cfg::autocos_home().join("result")
     };
     if !dir.is_dir() {
         bail!("no result dir");

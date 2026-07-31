@@ -45,7 +45,7 @@ competitive on concurrent small writes — the write-concurrency work below.
 ## Production load (4-node, via HAProxy)
 
 A 90-second mixed 80/20 run at 64 workers: **240,120 ops, 0 failures,
-2,667 ops/s, 167 MiB/s, p50 9.6 ms / p99 127 ms**. A `cabt` sweep (6 tasks) ran
+2,667 ops/s, 167 MiB/s, p50 9.6 ms / p99 127 ms**. A `autocos` sweep (6 tasks) ran
 with 0 failures; reads reached 4,180 ops/s (4 KB), 1,346 MB/s (1 MB), and
 1,920 MB/s (16 MB).
 

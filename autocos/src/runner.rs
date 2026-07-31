@@ -124,9 +124,9 @@ pub async fn run_task(
 
     // store under result or fool
     let dest_dir = if is_fool {
-        env_cfg::cabt_home().join("fool")
+        env_cfg::autocos_home().join("fool")
     } else {
-        env_cfg::cabt_home().join("result")
+        env_cfg::autocos_home().join("result")
     };
     fs::create_dir_all(&dest_dir)?;
     let ts = Local::now().format("%Y-%m-%d-%H:%M:%S");
@@ -176,7 +176,7 @@ async fn run_via_cosbench_rs(
     // small cluster's RAM without changing the benchmark's shape.
     let cap = |w: u32| worker_cap.map_or(w, |c| w.min(c)).max(1);
     let cprefix = format!(
-        "cabt{}",
+        "autocos{}",
         &format!("{:x}", md5_lite(&format!("{}{}", task.name, Local::now())))[..8]
     );
     let (storage, auth) = match creds {
@@ -327,6 +327,7 @@ async fn run_via_cosbench_rs(
             task.workers,
             task.method.as_str()
         ),
+        sample_interval_secs: cosbench_core::timeline::DEFAULT_SAMPLE_INTERVAL_SECS,
         storage,
         auth,
         stages,
@@ -427,6 +428,7 @@ async fn run_via_mock(
     let wl = Workload {
         name: task.name.clone(),
         description: "mock".into(),
+        sample_interval_secs: cosbench_core::timeline::DEFAULT_SAMPLE_INTERVAL_SECS,
         storage: StorageConfig::Mock { latency_us: 20 },
         auth: None,
         stages,
@@ -450,13 +452,13 @@ async fn run_via_java_controller(
     runtime: u64,
     cosbench_url: &str,
 ) -> Result<InternalOutcome> {
-    // Generate COSBench XML (same shape as original templates) and submit.
+    // Generate COSBench XML and submit.
     let cprefix = format!(
         "mycontainers{}",
         &format!("{:x}", md5_lite(&task.name))[..7]
     );
     let object_size = format!("(1,1){}", {
-        // original used (num,num)UNIT from label; for write sizes=u(num,num)UNIT
+        // size expression: for write, sizes=u(num,num)UNIT from the task label
         let n: String = task.size_label.chars().filter(|c| c.is_ascii_digit()).collect();
         let u: String = task
             .size_label
@@ -616,7 +618,7 @@ async fn run_via_java_controller(
             }
         }
     }
-    let tmp = env_cfg::cabt_home().join("config").join(format!("{wid}-raw.csv"));
+    let tmp = env_cfg::autocos_home().join("config").join(format!("{wid}-raw.csv"));
     if let Some(p) = found {
         fs::copy(p, &tmp)?;
     } else {
@@ -638,7 +640,7 @@ fn write_stage_csv(
     task: &TaskSpec,
     stage: &cosbench_core::StageReport,
 ) -> Result<PathBuf> {
-    let path = env_cfg::cabt_home()
+    let path = env_cfg::autocos_home()
         .join("config")
         .join(format!("{wid}-stage.csv"));
     // Cosbench-like worker csv columns used by list()
@@ -673,7 +675,7 @@ fn write_stage_csv(
 }
 
 fn next_wid() -> Result<String> {
-    let counter = env_cfg::cabt_home().join("config").join(".wid");
+    let counter = env_cfg::autocos_home().join("config").join(".wid");
     let mut n: u64 = if counter.is_file() {
         fs::read_to_string(&counter)?.trim().parse().unwrap_or(0)
     } else {

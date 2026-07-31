@@ -74,7 +74,7 @@ docker_monitornet_ip_range: 172.20.240.0/20  # this ip range should include x.x.
 # 某些环境中 hostname 是已经设置好的且有其他用途, 则不可修改
 # 如果配置为 true 可修改, 则会依次按照 hostname_prefix + 下划线 + inventory_hostname ip 后两位进行配置
 hostname_modifiable: true
-hostname_prefix: ostorage
+hostname_prefix: peregrine
 
 # proxy-server.conf, account-server.conf, container-server.conf, object-server.conf通用配置
 user: swift
@@ -206,7 +206,7 @@ swift_lb_port: "{{ haproxy_storage_port }}"
 # !!! 用户名不能为 swift 或者 admin
 #
 swift_cluster_accounts:
-- account_name: ostorage
+- account_name: peregrine
   super_users:
      reseller_admin: please set your reseller_admin user password
 

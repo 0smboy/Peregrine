@@ -1648,11 +1648,11 @@ fn wants_html(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-pub async fn run(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    _body: Option<Json<serde_json::Value>>,
-) -> Response {
+// No body extractor: the page's plain form posts urlencoded, scripts may post
+// anything or nothing — the run takes no parameters, so read none. (An
+// `Option<Json<_>>` here made axum 0.8 reject form posts outright with
+// "Expected request with Content-Type: application/json".)
+pub async fn run(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let (sid, sess) = match lab::require_lab_api(&state, &headers) {
         Ok(v) => v,
         Err(r) => return r,
@@ -1685,7 +1685,6 @@ pub async fn replay(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(q): Query<RunQ>,
-    _body: Option<Json<serde_json::Value>>,
 ) -> Response {
     let (sid, sess) = match lab::require_lab_api(&state, &headers) {
         Ok(v) => v,

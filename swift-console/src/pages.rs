@@ -234,8 +234,11 @@ fn shell(state: &Arc<AppState>, headers: &HeaderMap, s: Shell) -> Html<String> {
         let pressed = if lang == v { "true" } else { "false" };
         format!("<button class=\"{cls}\" name=\"l\" value=\"{v}\" aria-pressed=\"{pressed}\">{label}</button>")
     };
+    // Its own class: console.js intercepts the theme form to swap CSS without
+    // a reload, but language is server-rendered text — it must submit natively
+    // so the whole page re-renders in the chosen language.
     let lang_switch = format!(
-        "<form class=\"seg theme-seg\" method=\"post\" action=\"/lang\" role=\"group\" aria-label=\"{}\">{}{}</form>",
+        "<form class=\"seg lang-seg\" method=\"post\" action=\"/lang\" role=\"group\" aria-label=\"{}\">{}{}</form>",
         i18n::t(lang, "shell.language"),
         lseg("en", "EN"),
         lseg("zh", "中文"),
@@ -1895,17 +1898,34 @@ pub async fn monitor_page(State(state): State<Arc<AppState>>, headers: HeaderMap
       <option value="3600" selected>{r1h}</option>
       <option value="21600">{r6h}</option>
       <option value="86400">{r24h}</option>
+      <option value="604800">{r7d}</option>
     </select>
     <button class="btn sm" id="mon-refresh" type="button">{refresh}</button>
   </div>
 </div>
-<div class="mon-grid" id="mon-grid" aria-live="polite"></div>"#,
+<div class="mon-nodebar" id="mon-nodebar" hidden>
+  <span class="mon-nodebar-l">{allnodes}</span>
+  <div class="seg" id="mon-nodes" role="tablist"></div>
+</div>
+<div class="mon-grid" id="mon-grid" aria-live="polite"></div>
+<dialog class="mon-drill" id="mon-drill">
+  <div class="mon-drill-h">
+    <h2 id="mon-drill-t"></h2>
+    <div class="seg" id="mon-drill-range"></div>
+    <button class="btn sm" id="mon-drill-close" type="button" aria-label="{close}">{close}</button>
+  </div>
+  <div class="mon-drill-body" id="mon-drill-body"></div>
+  <div class="mon-drill-table" id="mon-drill-table"></div>
+</dialog>"#,
         title = i18n::t(lang, "mon.title"),
         rangelabel = i18n::t(lang, "mon.rangelabel"),
         r15 = i18n::t(lang, "mon.range15"),
         r1h = i18n::t(lang, "mon.range1h"),
         r6h = i18n::t(lang, "mon.range6h"),
         r24h = i18n::t(lang, "mon.range24h"),
+        r7d = i18n::t(lang, "mon.range7d"),
+        allnodes = i18n::t(lang, "mon.allnodes"),
+        close = i18n::t(lang, "common.close"),
         refresh = i18n::t(lang, "common.refresh"),
     );
     shell(
