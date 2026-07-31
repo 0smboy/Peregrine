@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-31  
 **Repo:** https://github.com/0smboy/Peregrine  
-**Latest commit on this work:** `1ff6f05` (plus uncommitted Testing / Excel chart follow-ups if present)
+**Latest commits:** `1ff6f05` (console/lab/cosbench/autocos rename) · `c2ec71b` (Excel charts, Testing dashboard, this handoff)
 
 Docs site: https://peregrine-docs-ochre.vercel.app
 
@@ -22,7 +22,7 @@ Docs site: https://peregrine-docs-ochre.vercel.app
 | Twin Shadow | Done | Handlers take no JSON body; form posts no longer hit `Content-Type: application/json`. |
 | Chaos Arcade | Done | “Who did the work” → pass timeline chart; table under details. |
 | Agent warehouse | Done | Larger lineage SVG, wrapping tables, bigger type. |
-| Testing page charts | In progress / local | KPI strip + SVG column charts + read/write compare; default view is Chart. Deploy to swift1 still needed. |
+| Testing page charts | Done (deployed) | KPI strip + SVG column charts + read/write compare; default view is Chart. Built and installed on swift1. |
 
 ### cosbench-rs
 
@@ -50,16 +50,22 @@ Docs site: https://peregrine-docs-ochre.vercel.app
 
 ---
 
+## Deployed on swift1 (2026-07-31)
+
+- `/usr/local/bin/swift-console` and `/usr/local/bin/autocos` (release builds from `/root/work/Peregrine/`)
+- `/etc/swift-console/config.json` uses `autocos_bin` / `autocos_home`
+- Result home moved to `/root/.autocos`
+- Smoke: login 200, `sc_lang=en` cookie set, static JS contains drill/chart helpers, shadow API returns 401 without session (not a Content-Type rejection)
+
 ## What is left
 
-1. **Deploy console + autocos to swift1** and click-verify:
+1. **Click-verify in a browser** (console is loopback-only — SSH tunnel or on-host browser):
    - Language EN
    - Monitor drill-down
    - Each lab tool (RingScope, policy, tombstone, shadow, chaos, warehouse)
    - Testing chart view with ≥2 runs
-2. **Cluster config.json** on swift1: ensure `autocos_bin` / `autocos_home` are set, install the `autocos` binary, and move any leftover result dir under `~/.autocos` if an older home path is still on disk.
-3. **History rewrite (optional but requested):** older commits still contain retired product / vendor names in messages. Squash or filter-repo before a public push if those strings must never appear in `git log`.
-4. **Push** to `origin` after verification (not done in this session unless asked).
+2. **History rewrite (optional but requested):** older commits still contain retired product / vendor names in messages. Squash or filter-repo before a public push if those strings must never appear in `git log`.
+3. **Push** to `origin` after browser verification (not done unless asked).
 
 ---
 
