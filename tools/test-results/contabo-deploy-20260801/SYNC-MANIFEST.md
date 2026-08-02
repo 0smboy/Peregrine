@@ -24,8 +24,16 @@
 - autocos `*.csv` result dumps
 - Cursor IDE canvases under `~/.cursor/projects/.../canvases/` (IDE-local; data mirrored in `perf-levers/`)
 
-## docs-site
+## docs-site (Vercel)
 
-`docs-site/src/content/docs/performance.mdx` and `docs/write-concurrency-optimization.md`
-are in Git `main`. Online docs refresh depends on the repo’s Cloudflare Nimbus
-pipeline for `main` (no separate wrangler deploy was run from this agent).
+| Item | Value |
+|------|-------|
+| Live URL | https://peregrine-docs-ochre.vercel.app |
+| Performance page | https://peregrine-docs-ochre.vercel.app/performance/ |
+| Source | `docs-site/` (+ `docs/write-concurrency-optimization.md` in Git) |
+| Last prod deploy | 2026-08-02 — `dpl_5o97iFr9QscS9Xj7myfvxfFUS93V` (includes write-path L1a–L4) |
+| Manual / agent publish | `cd docs-site && npm run deploy:prod` |
+| Auto on `main` | `.github/workflows/deploy-docs.yml` (needs `VERCEL_*` Actions secrets) |
+
+Verified live: Performance → Write-concurrency optimization includes
+“Write-path lever A/B (2026-08-02 … L1a KEEP … L1b/L2/L4 DROP …)”.

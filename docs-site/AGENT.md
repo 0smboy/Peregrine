@@ -27,7 +27,22 @@ src/
 └── styles/                  # globals.css, prose.css
 ```
 
-Cloudflare deploys also have `wrangler.jsonc` at the project root.
+## Publish (Vercel — keep live in sync)
+
+Production site: <https://peregrine-docs-ochre.vercel.app>
+Project: `peregrine-docs` (Vercel team `0smboys-projects`).
+
+**After any change under `docs-site/` that should be public, deploy before
+claiming done:**
+
+```bash
+cd docs-site && npm run deploy:prod
+```
+
+CI: `.github/workflows/deploy-docs.yml` auto-deploys on `main` pushes that
+touch `docs-site/**` once `VERCEL_TOKEN` / `VERCEL_ORG_ID` / `VERCEL_PROJECT_ID`
+are set as GitHub Actions secrets. Until then, the local `deploy:prod` path is
+mandatory for every docs content change.
 
 ## Writing docs
 
@@ -85,7 +100,8 @@ End with `Summary: N errors, N warnings.`
 - **Registry hygiene** — every `src/components/ui/<slug>/` is either MDX-registered or imported in `src/`; transitive deps (`lib/cn.ts`, etc.) exist.
 - **AI surface** — `<AgentDirective />` renders in `BaseLayout.astro`; doc `<head>` has `<link rel="alternate" type="text/markdown" ...>`.
 - **Search** — `data-pagefind-body` is on the docs main wrapper; after `pnpm build`, `dist/pagefind/` exists with ≥1 indexed page.
-- **Cloudflare** (if applicable) — `wrangler.jsonc` has `name`, `compatibility_date`, `assets.directory = "./dist"`, `not_found_handling`.
+- **Vercel publish** — after content edits, `npm run deploy:prod` succeeded (or
+  the `Deploy docs-site` GitHub Action is green on `main`).
 
 ## Don't
 

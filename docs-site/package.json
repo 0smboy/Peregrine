@@ -9,7 +9,8 @@
     "preview": "astro preview",
     "typecheck": "astro check",
     "lint:docs": "nimbus-docs lint",
-    "lint:docs:fix": "nimbus-docs lint --fix"
+    "lint:docs:fix": "nimbus-docs lint --fix",
+    "deploy:prod": "bash scripts/deploy-prod.sh"
   },
   "dependencies": {
     "@fontsource-variable/inter": "^5.2.8",

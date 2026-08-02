@@ -117,7 +117,8 @@ Peregrine/
 ├── autocos/            benchmark automation over cosbench-rs
 ├── swift-console/      web console (files / deploy / monitor / lab)
 ├── docs/               architecture, testing, lab-cluster ops
-├── docs-site/          Nimbus docs published to Vercel
+├── docs-site/          Nimbus docs → https://peregrine-docs-ochre.vercel.app
+│                       (`cd docs-site && npm run deploy:prod`)
 └── tools/              cutover scripts + migration evidence summaries
 ```
 
