@@ -1,0 +1,56 @@
+---
+description: Evidence alignment — no partial publish; claims must match SUMMARY/live
+alwaysApply: true
+---
+
+# Evidence alignment (Peregrine)
+
+Failure mode this rule prevents: updating one paragraph while leaving stale
+tables/topology/KEEP-DROP language elsewhere (partial publish).
+
+## Hard rules
+
+1. **Cite evidence.** Every public number, KEEP/DROP, topology, or gate verdict
+   in `docs-site/`, `docs/`, README, or SUMMARY must name an evidence path + date
+   (e.g. `tools/test-results/contabo-deploy-20260801/perf-levers/SUMMARY.json`).
+   Do not imply currency from a nearby updated sentence.
+
+2. **Three-way check before "docs done".** For every changed claim:
+   **source ↔ live site ↔ SUMMARY.json** (or Contabo SUMMARY.md). Fetch live
+   `/performance` and `/lab-cluster` markdown alternates when those pages move.
+
+3. **Closed means closed.** After an A/B program is CLOSED, do not leave open
+   Plan/TODO language that re-opens DROP'd levers (L1b/L2/L4/SO_REUSEPORT as
+   "remaining").
+
+4. **Contabo is current lab.** Azure / `10.42.*` / ILB only as explicitly
+   **retired**. Prefer VIP `10.0.0.10:8085`. SAIO ports: Python `:8090`, Rust
+   `:8081` on swift1.
+
+5. **Atomic claim updates.** One commit must update **all** surfaces that state
+   a fact (performance.mdx + write-concurrency doc + Contabo SUMMARY + live
+   deploy). Never ship half.
+
+6. **Verification > narrative.** WARN stays WARN with the exact workload. Never
+   upgrade ACCEPT_WITH_WARN to ACCEPT by prose alone.
+
+7. **Publish checklist.** After docs-site changes: `npm run deploy:prod` and/or
+   green `Deploy docs-site` Action; confirm live tokens; refresh
+   `SYNC-MANIFEST.md` + Drive when evidence moves.
+
+8. **Audit before claiming 全量更新.** Run `tools/docs-claim-audit.sh` (exit 0)
+   and complete Phase F three-way sync. Do not declare full update otherwise.
+
+## Production knobs (re-confirm before perf claims)
+
+```ini
+workers = 16
+container_update_mode = sync
+container_update_timeout = 1.0
+fsync_on_close = true
+reuse_port = false
+```
+
+## Constraints
+
+No `/srv/node` wipe; no second Keepalived; no secret/jar publish.
