@@ -32,15 +32,17 @@ it, Rust is 2.7–4.4× faster than Python on reads.
 
 ## Rust vs Python (same-host SAIO A/B)
 
-| Workload | Rust (fixed) | Python 2.35 |
-|----------|-------------:|------------:|
+| Workload | Rust | Python 2.35 |
+|----------|-----:|------------:|
 | 1 KB GET · c1 / c32 / c64 | 602 / 1645 / 1751 op/s | 190 / 619 / 646 op/s |
 | 1 MB GET · c1 / c32 (MB/s) | 322 / 471 | 73 / 135 |
 | 16 MB GET · c8 (MB/s) | 682 | 168 |
-| 1 KB PUT · c1 / c32 | 54 / 159 op/s | 32 / 255 op/s |
+| 1 KB PUT · c1 / c32 (2026-08-02) | **72 / 264 op/s** | 32 / 70 op/s |
 
-Rust dominates reads at every size and streaming throughput; Python is
-competitive on concurrent small writes — the write-concurrency work below.
+Reads win at every size. **Small writes too:** after workers=16 + lock-free
+accept + L1a parallel container update, SAIO 1 KB PUT @c32 is ~**3.8×** Python
+(median of 3 runs; evidence `perf-levers/SUMMARY.json` → `saio_phase0`). The
+older 54 / 159 vs 32 / 255 row was a pre-optimization baseline and is retired.
 
 ## Production load (4-node, via HAProxy)
 
@@ -69,7 +71,8 @@ write p99 dropped from ~1017 ms to ~330 ms.
 update (**L1a KEEP**, ~+24% 4KB write @128 / c1, p99 ~−30%); always-async
 container updates (**L1b DROP**, ~0.95×); disable put fsync (**L2 DROP**,
 ~+4.9% &lt;10% gate); `SO_REUSEPORT` (**L4 DROP**); multi-container ops guidance
-(**L3a**, c4/c1 ≈1.19×, sharding deferred). SAIO Rust 1KB PUT @c32 already
-~3.8× Python, so tokio remains ADR-only. Evidence:
+(**L3a**, c4/c1 ≈1.19×, sharding deferred). SAIO 1 KB PUT numbers in the table
+above are from the same pack; tokio remains ADR-only. Contabo cluster 4 KB
+write A/Bs used a shared load host (still noise-limited for second-order
+deltas). Evidence:
 `tools/test-results/contabo-deploy-20260801/perf-levers/SUMMARY.json`.
-Shared-load host still noise-limited for second-order deltas.
