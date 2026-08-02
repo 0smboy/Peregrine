@@ -20,7 +20,7 @@
 //! own parser).
 
 use swift_http::{HeaderKeyDict, Request};
-use swift_object_server::{iter_async_pendings, ObjectServer, ObjectServerConfig, UpdaterStats};
+use swift_object_server::{ContainerUpdateMode, iter_async_pendings, ObjectServer, ObjectServerConfig, UpdaterStats};
 
 fn config(devices: &std::path::Path) -> ObjectServerConfig {
     ObjectServerConfig {
@@ -33,6 +33,8 @@ fn config(devices: &std::path::Path) -> ObjectServerConfig {
             0,
             swift_diskfile::PolicyKind::Replication,
         )]),
+        container_update_timeout: std::time::Duration::from_secs(1),
+        container_update_mode: swift_object_server::ContainerUpdateMode::Sync,
     }
 }
 
@@ -76,6 +78,40 @@ fn test_put_without_container_hosts_writes_async_pending() {
         .headers
         .iter()
         .any(|(k, v)| k.eq_ignore_ascii_case("x-timestamp") && v == "1751500000.00000"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_async_mode_always_writes_pending_even_with_hosts() {
+    let dir = std::env::temp_dir().join(format!("swift-os-async-mode-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let device = dir.join("sda1");
+    std::fs::create_dir_all(&device).unwrap();
+
+    let mut cfg = config(&dir);
+    cfg.container_update_mode = ContainerUpdateMode::Async;
+    let server = ObjectServer::new(cfg);
+    let mut headers = HeaderKeyDict::new();
+    headers.set("X-Timestamp", "1751500000.00000");
+    headers.set("Content-Length", "5");
+    headers.set("Content-Type", "text/plain");
+    // Well-formed side channel that would normally be contacted synchronously.
+    // In async mode we must still enqueue and never dial these hosts.
+    headers.set("X-Container-Host", "127.0.0.1:1");
+    headers.set("X-Container-Device", "sda1");
+    headers.set("X-Container-Partition", "0");
+    let req = Request {
+        method: "PUT".into(),
+        path: "/sda1/0/AUTH_test/c/o-async".into(),
+        query_string: String::new(),
+        headers,
+        body: b"hello".to_vec().into(),
+    };
+    assert_eq!(server.handle(req).status, 201);
+    let mut stats = UpdaterStats::default();
+    let updates = iter_async_pendings(&device, &mut stats);
+    assert_eq!(updates.len(), 1, "async mode must always write pending");
+    assert_eq!(updates[0].obj, "o-async");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

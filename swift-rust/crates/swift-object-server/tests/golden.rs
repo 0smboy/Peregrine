@@ -20,7 +20,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use serde_json::Value as Json;
-use swift_object_server::{serve, ObjectServerConfig};
+use swift_object_server::{ContainerUpdateMode, serve, ObjectServerConfig};
 
 fn expectations() -> Json {
     let raw = std::fs::read(
@@ -92,6 +92,8 @@ fn object_config(devices: &std::path::Path, hash_suffix: &str) -> ObjectServerCo
             0,
             swift_diskfile::PolicyKind::Replication,
         )]),
+        container_update_timeout: std::time::Duration::from_secs(1),
+        container_update_mode: ContainerUpdateMode::Sync,
     }
 }
 

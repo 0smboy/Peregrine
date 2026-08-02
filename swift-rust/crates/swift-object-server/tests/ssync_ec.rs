@@ -26,7 +26,7 @@ use swift_object_server::reconstructor::{
 use swift_object_server::ssync_sender::{
     Sender, SsyncJob, SsyncNode, SsyncWire, TcpSsyncWire,
 };
-use swift_object_server::{ObjectServer, ObjectServerConfig};
+use swift_object_server::{ContainerUpdateMode, ObjectServer, ObjectServerConfig};
 use swift_ring::{Ring, RingData, RingDevice};
 
 static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
@@ -77,6 +77,8 @@ fn object_server(devices: &Path) -> ObjectServer {
         hash_config: hash_config(),
         diskfile: DiskFileConfig::default(),
         policies,
+        container_update_timeout: std::time::Duration::from_secs(1),
+        container_update_mode: ContainerUpdateMode::Sync,
     })
 }
 

@@ -44,6 +44,6 @@ pub use range::{
 };
 pub use request::{parse_query, reason_phrase, split_path, unquote, Request, Response};
 pub use server::{
-    install_sigterm_flag, serve_forever, serve_forever_with_config, AccessLog, Handler,
-    ServerConfig,
+    bind_listener, install_sigterm_flag, serve_forever, serve_forever_with_config, AccessLog,
+    Handler, ServerConfig,
 };

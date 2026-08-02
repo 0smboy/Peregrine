@@ -43,7 +43,8 @@ pub use expirer::{
     DeleteResult, ExpiryClient, TaskInfo,
 };
 pub use updater::{
-    iter_async_pendings, process_update, run_once, AsyncUpdate, ContainerNodeClient,
+    iter_async_pendings, process_update, run_once, run_once_with_concurrency, AsyncUpdate,
+    ContainerNodeClient,
     HttpContainerClient, NodeResult, UpdateOutcome, UpdaterStats,
 };
 
@@ -65,7 +66,19 @@ use crate::ssync::{MissingOffer, SsyncEvent, SsyncParser, SsyncSubrequest};
 
 pub const MAX_FILE_SIZE: i64 = 5_368_709_122;
 
-#[derive(Debug, Clone)]
+/// How the object server applies the container-listing side channel after a
+/// durable object PUT/DELETE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContainerUpdateMode {
+    /// Contact container replicas in parallel under `container_update_timeout`;
+    /// fall back to `async_pending` on any miss (L1a / Python default).
+    #[default]
+    Sync,
+    /// Always enqueue `async_pending` and return; the object-updater drains
+    /// the listing update off the write path (L1b).
+    Async,
+}
+
 pub struct ObjectServerConfig {
     pub devices: PathBuf,
     pub mount_check: bool,
@@ -75,6 +88,13 @@ pub struct ObjectServerConfig {
     /// complete registry lets request handling distinguish a replication policy
     /// from an unknown index instead of treating every map miss as replication.
     pub policies: std::collections::HashMap<u32, PolicyKind>,
+    /// Per-replica budget for the synchronous container update on the object
+    /// PUT/DELETE path (Python `container_update_timeout`, default 1.0s).
+    /// Replicas are contacted in parallel; any that miss this budget fall
+    /// through to `async_pending`.
+    pub container_update_timeout: std::time::Duration,
+    /// `sync` (default) or `async` — see [`ContainerUpdateMode`].
+    pub container_update_mode: ContainerUpdateMode,
 }
 
 pub struct ObjectServer {
@@ -1677,11 +1697,12 @@ impl ObjectServer {
     }
 
     /// `container_update`: synchronous PUT/DELETE to the container servers
-    /// named by X-Container-Host/Partition/Device. Any node that cannot be
-    /// updated synchronously (unreachable, non-2xx, or none supplied) is
-    /// recorded and an async_pending is written so the object-updater daemon
-    /// replays the update later — without this, a container listing
-    /// permanently misses the object when a container node is down.
+    /// named by X-Container-Host/Partition/Device. Replicas are contacted in
+    /// parallel under `container_update_timeout`; any node that cannot be
+    /// updated synchronously (unreachable, non-2xx, timeout, or none supplied)
+    /// causes an async_pending write so the object-updater daemon replays the
+    /// update later — without this, a container listing permanently misses the
+    /// object when a container node is down.
     #[allow(clippy::too_many_arguments)]
     fn container_update(
         &self,
@@ -1699,6 +1720,12 @@ impl ObjectServer {
             .get("X-Backend-Replication")
             .is_some_and(config_true_value)
         {
+            return;
+        }
+        // L1b: take the container update fully off the PUT/DELETE critical
+        // path. Listing lag is bounded by object-updater drain.
+        if self.config.container_update_mode == ContainerUpdateMode::Async {
+            self.write_async_pending(op, drive, account, container, obj, update, policy_index);
             return;
         }
         let hosts: Vec<&str> = req
@@ -1729,33 +1756,20 @@ impl ObjectServer {
         // whole update goes async.
         let well_formed =
             !hosts.is_empty() && hosts.len() == devices.len() && !partition.is_empty();
-        let mut all_ok = well_formed;
-        if well_formed {
-            for (host, device) in hosts.iter().zip(&devices) {
-                let mut request = format!(
-                    "{op} /{device}/{partition}{path} HTTP/1.1\r\nHost: {host}\r\n\
-                     X-Backend-Storage-Policy-Index: {policy_index}\r\n"
-                );
-                for (k, v) in update.iter() {
-                    request.push_str(&format!("{k}: {v}\r\n"));
-                }
-                request.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
-                let ok = match std::net::TcpStream::connect(host) {
-                    Ok(mut conn) => {
-                        conn.set_nodelay(true).ok();
-                        let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(3)));
-                        let mut buf = Vec::new();
-                        conn.write_all(request.as_bytes()).is_ok()
-                            && conn.read_to_end(&mut buf).is_ok()
-                            && response_is_success(&buf)
-                    }
-                    Err(_) => false,
-                };
-                if !ok {
-                    all_ok = false;
-                }
-            }
-        }
+        let all_ok = if well_formed {
+            fanout_container_http(
+                op,
+                &hosts,
+                &devices,
+                partition,
+                &path,
+                update,
+                policy_index,
+                self.config.container_update_timeout,
+            )
+        } else {
+            false
+        };
         if !all_ok {
             self.write_async_pending(op, drive, account, container, obj, update, policy_index);
         }
@@ -1826,33 +1840,20 @@ impl ObjectServer {
         );
         let well_formed =
             !hosts.is_empty() && hosts.len() == devices.len() && !partition.is_empty();
-        let mut all_ok = well_formed;
-        if well_formed {
-            for (host, device) in hosts.iter().zip(&devices) {
-                let mut request = format!(
-                    "PUT /{device}/{partition}{path} HTTP/1.1\r\nHost: {host}\r\n\
-                     X-Backend-Storage-Policy-Index: 0\r\n"
-                );
-                for (k, v) in update.iter() {
-                    request.push_str(&format!("{k}: {v}\r\n"));
-                }
-                request.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
-                let ok = match std::net::TcpStream::connect(host) {
-                    Ok(mut conn) => {
-                        conn.set_nodelay(true).ok();
-                        let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(3)));
-                        let mut buf = Vec::new();
-                        conn.write_all(request.as_bytes()).is_ok()
-                            && conn.read_to_end(&mut buf).is_ok()
-                            && response_is_success(&buf)
-                    }
-                    Err(_) => false,
-                };
-                if !ok {
-                    all_ok = false;
-                }
-            }
-        }
+        let all_ok = if well_formed {
+            fanout_container_http(
+                "PUT",
+                &hosts,
+                &devices,
+                partition,
+                &path,
+                &update,
+                0,
+                self.config.container_update_timeout,
+            )
+        } else {
+            false
+        };
         if !all_ok {
             // enqueue via async_pending against the object's own device;
             // storage policy 0 is the expirer account's policy.
@@ -1958,6 +1959,105 @@ impl ObjectServer {
             );
         }
     }
+}
+
+/// Fire one container-server update over a fresh TCP connection, honouring
+/// `timeout` for connect + read (Python `container_update_timeout`).
+fn sync_container_http(
+    op: &str,
+    host: &str,
+    device: &str,
+    partition: &str,
+    path: &str,
+    update: &HeaderKeyDict,
+    policy_index: u32,
+    timeout: std::time::Duration,
+) -> bool {
+    let Ok(addr) = host.parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    let mut request = format!(
+        "{op} /{device}/{partition}{path} HTTP/1.1\r\nHost: {host}\r\n\
+         X-Backend-Storage-Policy-Index: {policy_index}\r\n"
+    );
+    for (k, v) in update.iter() {
+        request.push_str(&format!("{k}: {v}\r\n"));
+    }
+    request.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
+    match std::net::TcpStream::connect_timeout(&addr, timeout) {
+        Ok(mut conn) => {
+            conn.set_nodelay(true).ok();
+            let _ = conn.set_read_timeout(Some(timeout));
+            let _ = conn.set_write_timeout(Some(timeout));
+            let mut buf = Vec::new();
+            conn.write_all(request.as_bytes()).is_ok()
+                && conn.read_to_end(&mut buf).is_ok()
+                && response_is_success(&buf)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Contact every container replica in parallel. Returns true only when every
+/// replica accepts the update inside `timeout`.
+#[allow(clippy::too_many_arguments)]
+fn fanout_container_http(
+    op: &str,
+    hosts: &[&str],
+    devices: &[&str],
+    partition: &str,
+    path: &str,
+    update: &HeaderKeyDict,
+    policy_index: u32,
+    timeout: std::time::Duration,
+) -> bool {
+    if hosts.is_empty() || hosts.len() != devices.len() {
+        return false;
+    }
+    // Owned copies so worker threads do not borrow the request-scoped strs
+    // across a join that outlives the loop body.
+    let jobs: Vec<(String, String)> = hosts
+        .iter()
+        .zip(devices.iter())
+        .map(|(h, d)| ((*h).to_string(), (*d).to_string()))
+        .collect();
+    let op = op.to_string();
+    let partition = partition.to_string();
+    let path = path.to_string();
+    // HeaderKeyDict is not Sync-cloned cheaply; rebuild the wire headers once
+    // and share the rendered pairs.
+    let header_pairs: Vec<(String, String)> = update
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(jobs.len());
+        for (host, device) in &jobs {
+            let op = op.as_str();
+            let partition = partition.as_str();
+            let path = path.as_str();
+            let header_pairs = &header_pairs;
+            handles.push(scope.spawn(move || {
+                let mut hdrs = HeaderKeyDict::new();
+                for (k, v) in header_pairs {
+                    hdrs.set(k, v);
+                }
+                sync_container_http(
+                    op,
+                    host,
+                    device,
+                    partition,
+                    path,
+                    &hdrs,
+                    policy_index,
+                    timeout,
+                )
+            }));
+        }
+        handles
+            .into_iter()
+            .all(|h| h.join().unwrap_or(false))
+    })
 }
 
 /// Whether a raw HTTP response's status line is 2xx.
@@ -2499,6 +2599,8 @@ mod fallocate_reserve_tests {
             hash_config: HashPathConfig::new(Vec::new(), b"reserve-tests".to_vec()).unwrap(),
             diskfile: DiskFileConfig::default(),
             policies: std::collections::HashMap::from([(0, PolicyKind::Replication)]),
+            container_update_timeout: std::time::Duration::from_secs(1),
+            container_update_mode: ContainerUpdateMode::Sync,
         })
         .with_fallocate_reserve(reserve)
     }

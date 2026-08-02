@@ -1,0 +1,73 @@
+{
+  "phase": "l1a-vs-phase0-contabo",
+  "rows": [
+    {
+      "task": "4KB_write_128",
+      "containers": 1,
+      "phase0_ops": 112.45901639344262,
+      "l1a_ops": 139.72131147540983,
+      "ops_ratio": 1.2424198250728862,
+      "phase0_p99_us": 2244607,
+      "l1a_p99_us": 1560575,
+      "p99_ratio": 0.6952553386851239,
+      "fail0": true
+    },
+    {
+      "task": "4KB_write_128",
+      "containers": 4,
+      "phase0_ops": 134.0483870967742,
+      "l1a_ops": 137.27868852459017,
+      "ops_ratio": 1.0240980253308374,
+      "phase0_p99_us": 1753087,
+      "l1a_p99_us": 1905663,
+      "p99_ratio": 1.0870327599257767,
+      "fail0": true
+    },
+    {
+      "task": "4KB_write_32",
+      "containers": 1,
+      "phase0_ops": 107.85245901639344,
+      "l1a_ops": 135.95081967213116,
+      "ops_ratio": 1.2605259157926738,
+      "phase0_p99_us": 887295,
+      "l1a_p99_us": 647679,
+      "p99_ratio": 0.7299477625817794,
+      "fail0": true
+    },
+    {
+      "task": "4KB_write_32",
+      "containers": 4,
+      "phase0_ops": 132.2622950819672,
+      "l1a_ops": 128.91803278688525,
+      "ops_ratio": 0.9747149231531979,
+      "phase0_p99_us": 702975,
+      "l1a_p99_us": 699391,
+      "p99_ratio": 0.9949016679113767,
+      "fail0": true
+    },
+    {
+      "task": "4KB_write_64",
+      "containers": 1,
+      "phase0_ops": 172.4,
+      "l1a_ops": 126.40983606557377,
+      "ops_ratio": 0.7332357080369708,
+      "phase0_p99_us": 943103,
+      "l1a_p99_us": 1163263,
+      "p99_ratio": 1.2334421584917024,
+      "fail0": true
+    },
+    {
+      "task": "4KB_write_64",
+      "containers": 4,
+      "phase0_ops": 137.5,
+      "l1a_ops": 123.1774193548387,
+      "ops_ratio": 0.8958357771260996,
+      "phase0_p99_us": 1173503,
+      "l1a_p99_us": 1368063,
+      "p99_ratio": 1.165794207598958,
+      "fail0": true
+    }
+  ],
+  "gate_fail0": true,
+  "note": "shared load host (swift1); ratios are noisy"
+}

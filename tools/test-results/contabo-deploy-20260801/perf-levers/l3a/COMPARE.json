@@ -1,0 +1,31 @@
+{
+  "phase": "l3a-multi-container",
+  "from": "phase0",
+  "rows": [
+    {
+      "task": "4KB_write_128",
+      "c1_ops": 112.45901639344262,
+      "c4_ops": 134.0483870967742,
+      "ops_ratio_c4_c1": 1.1919754537759806,
+      "c1_p99": 2244607,
+      "c4_p99": 1753087
+    },
+    {
+      "task": "4KB_write_32",
+      "c1_ops": 107.85245901639344,
+      "c4_ops": 132.2622950819672,
+      "ops_ratio_c4_c1": 1.2263261893904849,
+      "c1_p99": 887295,
+      "c4_p99": 702975
+    },
+    {
+      "task": "4KB_write_64",
+      "c1_ops": 172.4,
+      "c4_ops": 137.5,
+      "ops_ratio_c4_c1": 0.7975638051044083,
+      "c1_p99": 943103,
+      "c4_p99": 1173503
+    }
+  ],
+  "decision": "KEEP as ops guidance (not a code lever): c4 vs c1 uplift is modest on Contabo shared-load host; prefer multi-container for hotspot spread; full sharding (L3b) deferred"
+}

@@ -25,7 +25,7 @@ use swift_core::hashing::HashPathConfig;
 use swift_core::obslog::{LogLevel, Logger};
 use swift_core::statsd::StatsdClient;
 use swift_object_server::daemonutil;
-use swift_object_server::updater::{run_once, HttpContainerClient};
+use swift_object_server::updater::{run_once_with_concurrency, HttpContainerClient};
 use swift_ring::{Ring, RingData};
 
 fn parse_conf_file(path: &str) -> SwiftConfig {
@@ -51,6 +51,12 @@ fn main() {
     let devices = get("app:object-server", "devices", "/srv/node");
     // Python parity: swift/obj/updater.py defaults interval to 300 seconds.
     let interval: u64 = get("object-updater", "interval", "300").parse().unwrap_or(300);
+    // Python uses eventlet concurrency; default 10. Raise under L1b async mode
+    // so the pending backlog drains faster than it accumulates.
+    let concurrency: usize = get("object-updater", "concurrency", "10")
+        .parse()
+        .unwrap_or(10)
+        .max(1);
     let log_name = get("object-updater", "log_name", "object-updater");
     let log_level = get("object-updater", "log_level", "INFO")
         .parse::<LogLevel>()
@@ -90,7 +96,8 @@ fn main() {
     let stop = swift_http::install_sigterm_flag();
 
     logger.info(&format!(
-        "swift-object-updater: devices={devices} interval={interval}s once={run_once_only}"
+        "swift-object-updater: devices={devices} interval={interval}s \
+         concurrency={concurrency} once={run_once_only}"
     ));
     loop {
         let sweep_start = std::time::Instant::now();
@@ -98,7 +105,12 @@ fn main() {
         if let Ok(entries) = std::fs::read_dir(&devices) {
             for e in entries.flatten() {
                 if e.path().is_dir() {
-                    let s = run_once(&e.path(), &container_ring, &client);
+                    let s = run_once_with_concurrency(
+                        &e.path(),
+                        &container_ring,
+                        &client,
+                        concurrency,
+                    );
                     ok += s.successes;
                     fail += s.failures;
                     unlink += s.unlinks + s.outdated_unlinks;

@@ -24,7 +24,9 @@ use swift_core::obslog::{LogLevel, Logger};
 use swift_core::statsd::StatsdClient;
 use swift_core::storage_policy::parse_storage_policies;
 use swift_diskfile::{DiskFileConfig, PolicyKind};
-use swift_object_server::{serve_with_config, ObjectServer, ObjectServerConfig};
+use swift_object_server::{
+    serve_with_config, ContainerUpdateMode, ObjectServer, ObjectServerConfig,
+};
 
 fn parse_conf_file(path: &str) -> Result<SwiftConfig, String> {
     let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
@@ -123,8 +125,29 @@ fn main() {
             "true" | "1" | "yes" | "on" | "t" | "y"
         ),
         hash_config,
-        diskfile: DiskFileConfig::default(),
+        diskfile: {
+            let mut df = DiskFileConfig::default();
+            // L2 A/B knob: fsync_on_close = false skips put/rename fsync.
+            df.fsync_on_close = matches!(
+                get("fsync_on_close", "true").to_lowercase().as_str(),
+                "true" | "1" | "yes" | "on" | "t" | "y"
+            );
+            df
+        },
         policies,
+        container_update_timeout: std::time::Duration::from_secs_f64(
+            get("container_update_timeout", "1.0")
+                .parse::<f64>()
+                .unwrap_or(1.0)
+                .max(0.001),
+        ),
+        container_update_mode: match get("container_update_mode", "sync")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "async" | "asynchronous" | "pending" => ContainerUpdateMode::Async,
+            _ => ContainerUpdateMode::Sync,
+        },
     };
 
     // eventlet parity: `workers` processes each serving `max_clients`
@@ -150,11 +173,16 @@ fn main() {
                 elapsed.as_secs_f64()
             ));
         });
+    let reuse_port = matches!(
+        get("reuse_port", "false").to_lowercase().as_str(),
+        "true" | "1" | "yes" | "on" | "t" | "y"
+    );
     let mut http_config = swift_http::ServerConfig {
         client_timeout_secs,
         access_log: Some(access_log),
         // SIGTERM/SIGINT: stop accepting, drain in-flight requests, return.
         shutdown: Some(swift_http::install_sigterm_flag()),
+        reuse_port,
         ..Default::default()
     };
     if workers > 0 {
@@ -163,8 +191,8 @@ fn main() {
     http_config.connection_queue = max_clients.max(1);
 
     let bind = format!("{}:{}", get("bind_ip", "0.0.0.0"), get("bind_port", "6200"));
-    let listener = std::net::TcpListener::bind(&bind).unwrap_or_else(|e| {
-        logger.error(&format!("could not bind {bind}: {e}"));
+    let listener = swift_http::bind_listener(&bind, reuse_port).unwrap_or_else(|e| {
+        logger.error(&format!("could not bind {bind} (reuse_port={reuse_port}): {e}"));
         std::process::exit(1);
     });
     logger.info(&format!("swift-object-server listening on {bind}"));

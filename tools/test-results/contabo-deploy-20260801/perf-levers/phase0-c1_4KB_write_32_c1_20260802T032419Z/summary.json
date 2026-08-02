@@ -1,0 +1,37 @@
+{
+  "label": "phase0-c1",
+  "task": "4KB_write_32",
+  "container_count": 1,
+  "reps": 3,
+  "rows": [
+    {
+      "ok": 6248,
+      "fail": 0,
+      "p99_us": 1029631,
+      "ops_per_s": 104.13333333333334,
+      "runtime_s": 60.0
+    },
+    {
+      "ok": 6579,
+      "fail": 0,
+      "p99_us": 887295,
+      "ops_per_s": 107.85245901639344,
+      "runtime_s": 61.0
+    },
+    {
+      "ok": 10249,
+      "fail": 0,
+      "p99_us": 616447,
+      "ops_per_s": 170.81666666666666,
+      "runtime_s": 60.0
+    }
+  ],
+  "median": {
+    "ok": 6579,
+    "fail": 0,
+    "p99_us": 887295,
+    "ops_per_s": 107.85245901639344,
+    "runtime_s": 60.0
+  },
+  "gate_fail0": true
+}

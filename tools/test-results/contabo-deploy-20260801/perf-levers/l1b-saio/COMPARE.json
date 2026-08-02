@@ -1,0 +1,56 @@
+{
+  "phase": "l1b-saio",
+  "decision_hint": "Contabo L1b missed 1.5x; SAIO numbers below",
+  "rows": [
+    {
+      "conc": 1,
+      "l1b": {
+        "ops": 51.9,
+        "p50_ms": 17.6,
+        "p99_ms": 53.5,
+        "errs": 0
+      },
+      "phase0_rust": {
+        "ops": 71.8,
+        "p50_ms": 11.8,
+        "p99_ms": 40.5,
+        "errs": 0
+      },
+      "phase0_python": {
+        "ops": 32.3,
+        "p50_ms": 28.6,
+        "p99_ms": 73.0,
+        "errs": 0
+      },
+      "vs_phase0_rust": 0.7228412256267409,
+      "vs_python": 1.606811145510836,
+      "gate_fail0": true,
+      "gate_ge90pct_python_c32": null
+    },
+    {
+      "conc": 32,
+      "l1b": {
+        "ops": 220.2,
+        "p50_ms": 128.6,
+        "p99_ms": 421.0,
+        "errs": 0
+      },
+      "phase0_rust": {
+        "ops": 264.4,
+        "p50_ms": 108.0,
+        "p99_ms": 306.3,
+        "errs": 0
+      },
+      "phase0_python": {
+        "ops": 69.8,
+        "p50_ms": 461.9,
+        "p99_ms": 720.6,
+        "errs": 0
+      },
+      "vs_phase0_rust": 0.8328290468986385,
+      "vs_python": 3.154727793696275,
+      "gate_fail0": true,
+      "gate_ge90pct_python_c32": true
+    }
+  ]
+}

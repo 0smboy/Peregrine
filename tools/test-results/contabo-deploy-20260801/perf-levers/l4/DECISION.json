@@ -1,0 +1,20 @@
+{
+  "lever": "L4-SO_REUSEPORT",
+  "baseline": {
+    "ok": 8579,
+    "fail": 0,
+    "p99_us": 2087935,
+    "ops_per_s": 140.63934426229508,
+    "runtime_s": 61.0
+  },
+  "on": {
+    "ok": 7327,
+    "fail": 0,
+    "p99_us": 2592767,
+    "ops_per_s": 118.1774193548387,
+    "runtime_s": 61.0
+  },
+  "ops_ratio": 0.8402870475166291,
+  "decision": "DROP",
+  "reason": "need >=10% PUT/s vs reuse_port=false; observed ratio 0.8402870475166291; restore reuse_port=false"
+}

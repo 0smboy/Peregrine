@@ -408,20 +408,72 @@ pub fn iter_async_pendings(device: &Path, stats: &mut UpdaterStats) -> Vec<Async
 pub fn run_once(
     device: &Path,
     container_ring: &Ring,
-    client: &dyn ContainerNodeClient,
+    client: &(dyn ContainerNodeClient + Sync),
+) -> UpdaterStats {
+    run_once_with_concurrency(device, container_ring, client, 1)
+}
+
+/// Like [`run_once`], but replays up to `concurrency` pending updates at a
+/// time (L1b drain). `concurrency <= 1` is strictly sequential.
+pub fn run_once_with_concurrency(
+    device: &Path,
+    container_ring: &Ring,
+    client: &(dyn ContainerNodeClient + Sync),
+    concurrency: usize,
 ) -> UpdaterStats {
     let mut stats = UpdaterStats::default();
-    for update in iter_async_pendings(device, &mut stats) {
-        let Ok((part, nodes)) =
-            container_ring.get_nodes(&update.account, Some(&update.container), None)
-        else {
-            stats.errors += 1;
-            continue;
-        };
-        let devs: Vec<&swift_ring::RingDevice> = nodes.iter().map(|n| n.dev).collect();
-        let _ = process_update(&update, part, &devs, client, &mut stats);
+    let updates = iter_async_pendings(device, &mut stats);
+    if updates.is_empty() {
+        return stats;
     }
-    stats
+    let concurrency = concurrency.max(1);
+    if concurrency == 1 {
+        for update in updates {
+            let Ok((part, nodes)) =
+                container_ring.get_nodes(&update.account, Some(&update.container), None)
+            else {
+                stats.errors += 1;
+                continue;
+            };
+            let devs: Vec<&swift_ring::RingDevice> = nodes.iter().map(|n| n.dev).collect();
+            let _ = process_update(&update, part, &devs, client, &mut stats);
+        }
+        return stats;
+    }
+
+    use std::sync::Mutex;
+    let stats = Mutex::new(stats);
+    let mut start = 0usize;
+    while start < updates.len() {
+        let end = (start + concurrency).min(updates.len());
+        let chunk = &updates[start..end];
+        std::thread::scope(|scope| {
+            for update in chunk {
+                let stats = &stats;
+                scope.spawn(move || {
+                    let Ok((part, nodes)) =
+                        container_ring.get_nodes(&update.account, Some(&update.container), None)
+                    else {
+                        stats.lock().unwrap().errors += 1;
+                        return;
+                    };
+                    let devs: Vec<&swift_ring::RingDevice> =
+                        nodes.iter().map(|n| n.dev).collect();
+                    let mut local = UpdaterStats::default();
+                    let _ = process_update(update, part, &devs, client, &mut local);
+                    let mut g = stats.lock().unwrap();
+                    g.successes += local.successes;
+                    g.failures += local.failures;
+                    g.unlinks += local.unlinks;
+                    g.outdated_unlinks += local.outdated_unlinks;
+                    g.errors += local.errors;
+                    g.redirects += local.redirects;
+                });
+            }
+        });
+        start = end;
+    }
+    stats.into_inner().unwrap()
 }
 
 #[cfg(test)]

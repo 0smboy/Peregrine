@@ -22,7 +22,7 @@
 
 use swift_diskfile::{DiskFileConfig, MetaValue, Metadata, PolicyKind};
 use swift_http::{HeaderKeyDict, Request, Response};
-use swift_object_server::{
+use swift_object_server::{ContainerUpdateMode, 
     iter_async_pendings, AsyncUpdate, ObjectServer, ObjectServerConfig, UpdaterStats,
 };
 
@@ -42,6 +42,8 @@ fn config(devices: &std::path::Path) -> ObjectServerConfig {
             0,
             swift_diskfile::PolicyKind::Replication,
         )]),
+        container_update_timeout: std::time::Duration::from_secs(1),
+        container_update_mode: ContainerUpdateMode::Sync,
     }
 }
 

@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use swift_core::hashing::HashPathConfig;
 use swift_http::{Body, HeaderKeyDict, InterimResponder, Request, Response};
 use swift_object_server::ssync::{encode_missing, SsyncEvent, SsyncParser};
-use swift_object_server::{ObjectServer, ObjectServerConfig};
+use swift_object_server::{ContainerUpdateMode, ObjectServer, ObjectServerConfig};
 
 static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 
@@ -69,6 +69,8 @@ fn server(devices: &Path, mount_check: bool) -> ObjectServer {
         hash_config: hash_config(),
         diskfile: swift_diskfile::DiskFileConfig::default(),
         policies,
+        container_update_timeout: std::time::Duration::from_secs(1),
+        container_update_mode: ContainerUpdateMode::Sync,
     })
 }
 

@@ -1,28 +1,30 @@
 # Optimization plan: write concurrency
 
-Status: **partially implemented** (2026-07-30). Two levers shipped and deployed;
-the rest scoped below. Root-caused against the live 4-node cluster and a clean
-single-node A/B.
+Status: **A/B program closed** (2026-08-02 Contabo + SAIO). Workers + lock-free
+accept shipped earlier; L1a parallel container update **KEEP**; L1b always-async
+**DROP**; L2 fsync-off **DROP**; L4 `SO_REUSEPORT` **DROP**; L3a multi-container
+kept as ops guidance. Evidence:
+`tools/test-results/contabo-deploy-20260801/perf-levers/SUMMARY.json`.
 
-## Implemented
+## Implemented / decided
 
-- **Object worker floor raised 2 → 16 (config, deployed to all 4 nodes).** The
-  deployed `object-server.conf` pinned `workers = 2`, so each object server
-  processed only two requests at a time. A clean single-node A/B (4 KB writes,
-  concurrency 64) showed 2 → 16 workers roughly **doubled write throughput
-  (194 → 344 PUT/s) and cut p50 187 → 113 ms, p99 2028 → 784 ms**; 16 → 64 was
-  flat, pointing at the shared work-queue lock and single-disk fsync as the next
-  limiters.
-- **Lock-free accept dispatch (code, `swift-http`).** Replaced the
-  `Arc<Mutex<Receiver>>` work queue with a `crossbeam-channel` MPMC: every worker
-  `recv()`s directly, so raising the pool no longer serializes workers on a
-  shared mutex. 946/946 workspace tests still pass; deployed to all 4 nodes.
-
-  A clean throughput delta for the lock-free change could not be isolated on the
-  shared test host (swift1 also runs the live cluster, Loki and Prometheus, so
-  the single-node numbers are too noisy to A/B a second-order change) — it is
-  shipped as a correct, non-regressing contention fix, to be re-measured on a
-  dedicated load source.
+- **Object worker floor raised 2 → 16 (config, deployed).**
+- **Lock-free accept dispatch (`swift-http` crossbeam MPMC).**
+- **L1a KEEP — parallel bounded `container_update`.** Object server fans out
+  container replicas under `container_update_timeout` (default 1.0s). Contabo
+  primary gate `4KB_write_128` c1: ~**+24% PUT/s**, p99 ~**-30%** vs Phase0,
+  fail=0. Deployed with `container_update_mode = sync`.
+- **L1b DROP — always-async mode.** Code kept behind
+  `container_update_mode = async` + updater `concurrency`/`interval`, but
+  Contabo measured ~**0.95×** Phase0 (async_pending fsync cost). Production
+  left on `sync`. SAIO Rust still ≫ Python at 1KB c32 without needing async.
+- **L3a KEEP (ops) — multi-container.** c4/c1 ≈ **1.19×** on 128-worker writes;
+  c16 did not beat c4 on the shared load host. Full sharding (L3b) deferred.
+- **L2 DROP — `fsync_on_close=false`.** ~**+4.9%** PUT/s (<10% KEEP gate).
+- **L4 DROP — `SO_REUSEPORT`.** No gain on single-acceptor thread pool
+  (regression in the A/B). Knob retained as `reuse_port=false`.
+- **L5 tokio:** ADR/spike only; not required while SAIO Rust 1KB c32 is
+  ~**3.8×** Python.
 
 ## Observation
 

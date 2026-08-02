@@ -79,7 +79,11 @@ mount_check = {{ mount_check }}
 # Time to wait while sending each chunk of data to another backend node.
 # node_timeout = 3
 # Time to wait while sending a container update on object update.
-# container_update_timeout = 1.0
+# Replicas are contacted in parallel under this budget (L1a).
+container_update_timeout = 1.0
+# sync = parallel fanout + async_pending fallback (L1a)
+# async = always enqueue async_pending; object-updater drains listings (L1b)
+container_update_mode = sync
 # Time to wait while receiving each chunk of data from a client or another
 # backend node.
 # client_timeout = 60.0
@@ -487,7 +491,7 @@ concurrency = {{ object_replicator_concurrency }}
 # log_level = INFO
 # log_address = /dev/log
 #
-# interval = 300.0
+interval = 5
 # node_timeout = <whatever's in the DEFAULT section or 10>
 #
 # updater_workers controls how many processes the object updater will
@@ -495,7 +499,7 @@ concurrency = {{ object_replicator_concurrency }}
 # each updater process will operate on at any one time. With
 # concurrency=C and updater_workers=W, there will be up to W*C
 # async_pending records being processed at once.
-# concurrency = 8
+concurrency = 16
 # updater_workers = 1
 #
 # Send at most this many object updates per second

@@ -65,7 +65,11 @@ the deployed `object-server` `workers = 2` starved write concurrency:
 serialized workers on the hot path (946/946 tests still pass). Cluster 4 KB
 write p99 dropped from ~1017 ms to ~330 ms.
 
-**Remaining levers:** async/batched container updates (biggest), fsync
-coalescing, container sharding, `SO_REUSEPORT`, and a long-term tokio async
-server. Each to be A/B'd from a dedicated load source (the shared test host is
-noise-limited).
+**Write-path lever A/B (2026-08-02 Contabo + SAIO):** parallel bounded container
+update (**L1a KEEP**, ~+24% 4KB write @128 / c1, p99 ~−30%); always-async
+container updates (**L1b DROP**, ~0.95×); disable put fsync (**L2 DROP**,
+~+4.9% &lt;10% gate); `SO_REUSEPORT` (**L4 DROP**); multi-container ops guidance
+(**L3a**, c4/c1 ≈1.19×, sharding deferred). SAIO Rust 1KB PUT @c32 already
+~3.8× Python, so tokio remains ADR-only. Evidence:
+`tools/test-results/contabo-deploy-20260801/perf-levers/SUMMARY.json`.
+Shared-load host still noise-limited for second-order deltas.

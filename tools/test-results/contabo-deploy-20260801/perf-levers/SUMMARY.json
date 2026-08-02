@@ -1,0 +1,158 @@
+{
+  "title": "Write-path lever A/B (Contabo dual-gate program)",
+  "load_note": "autocos from swift1 against 10.0.0.1:8085 (shared load host; noisy)",
+  "decisions": {
+    "L1a_parallel_container_update": "KEEP (code+deployed). Primary 4KB_write_128 c1 ~+24% ops, p99 ~-30% vs Phase0; fail=0",
+    "L1b_always_async": "DROP (code retained behind container_update_mode=async). Contabo ~0.95x Phase0; async_pending fsync dominated. Reverted to sync",
+    "L3a_multi_container": "KEEP as ops guidance. c4/c1 ~1.19x on 128-worker; c16 not better on shared host. Sharding (L3b) deferred",
+    "L2_fsync_off": "DROP (~+4.9% <10% gate). fsync_on_close=true restored",
+    "L4_SO_REUSEPORT": "DROP (no gain / regression on single-acceptor). reuse_port=false restored",
+    "L5_tokio": "ADR/spike only \u2014 not executed; still not behind Python on SAIO 1KB c32"
+  },
+  "saio_phase0": {
+    "phase": "0-saio-1kb",
+    "rows": [
+      {
+        "side": "python",
+        "conc": 1,
+        "containers": 1,
+        "rows": [
+          {
+            "ops": 32.3,
+            "p50_ms": 29.1,
+            "p95_ms": 44.8,
+            "p99_ms": 73.0,
+            "errs": 0
+          },
+          {
+            "ops": 31.4,
+            "p50_ms": 28.6,
+            "p95_ms": 50.0,
+            "p99_ms": 93.7,
+            "errs": 0
+          },
+          {
+            "ops": 33.1,
+            "p50_ms": 28.1,
+            "p95_ms": 45.6,
+            "p99_ms": 69.8,
+            "errs": 0
+          }
+        ],
+        "median": {
+          "ops": 32.3,
+          "p50_ms": 28.6,
+          "p99_ms": 73.0,
+          "errs": 0
+        },
+        "gate_fail0": true
+      },
+      {
+        "side": "python",
+        "conc": 32,
+        "containers": 1,
+        "rows": [
+          {
+            "ops": 76.9,
+            "p50_ms": 423.9,
+            "p95_ms": 584.0,
+            "p99_ms": 652.9,
+            "errs": 0
+          },
+          {
+            "ops": 69.8,
+            "p50_ms": 461.9,
+            "p95_ms": 646.5,
+            "p99_ms": 720.6,
+            "errs": 0
+          },
+          {
+            "ops": 64.2,
+            "p50_ms": 497.6,
+            "p95_ms": 713.0,
+            "p99_ms": 846.2,
+            "errs": 0
+          }
+        ],
+        "median": {
+          "ops": 69.8,
+          "p50_ms": 461.9,
+          "p99_ms": 720.6,
+          "errs": 0
+        },
+        "gate_fail0": true
+      },
+      {
+        "side": "rust",
+        "conc": 1,
+        "containers": 1,
+        "rows": [
+          {
+            "ops": 75.6,
+            "p50_ms": 11.8,
+            "p95_ms": 22.3,
+            "p99_ms": 36.6,
+            "errs": 0
+          },
+          {
+            "ops": 71.8,
+            "p50_ms": 11.2,
+            "p95_ms": 26.3,
+            "p99_ms": 65.0,
+            "errs": 0
+          },
+          {
+            "ops": 70.4,
+            "p50_ms": 12.5,
+            "p95_ms": 25.0,
+            "p99_ms": 40.5,
+            "errs": 0
+          }
+        ],
+        "median": {
+          "ops": 71.8,
+          "p50_ms": 11.8,
+          "p99_ms": 40.5,
+          "errs": 0
+        },
+        "gate_fail0": true
+      },
+      {
+        "side": "rust",
+        "conc": 32,
+        "containers": 1,
+        "rows": [
+          {
+            "ops": 264.4,
+            "p50_ms": 108.0,
+            "p95_ms": 230.1,
+            "p99_ms": 306.3,
+            "errs": 0
+          },
+          {
+            "ops": 252.9,
+            "p50_ms": 113.2,
+            "p95_ms": 241.4,
+            "p99_ms": 346.8,
+            "errs": 0
+          },
+          {
+            "ops": 302.6,
+            "p50_ms": 95.8,
+            "p95_ms": 192.1,
+            "p99_ms": 251.7,
+            "errs": 0
+          }
+        ],
+        "median": {
+          "ops": 264.4,
+          "p50_ms": 108.0,
+          "p99_ms": 306.3,
+          "errs": 0
+        },
+        "gate_fail0": true
+      }
+    ],
+    "rust_vs_python_c32_ops_ratio": 3.7879656160458453
+  }
+}

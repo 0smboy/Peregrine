@@ -1,0 +1,116 @@
+PHASE0-START 2026-08-02T03:24:19Z
+=== phase0-c1 4KB_write_32 ===
+CLIENT ulimit=65535 endpoint=http://10.0.0.1:8085/v1/AUTH_test task=4KB_write_32 cont=1 rt=60 reps=3
+=== REP 1/3 4KB_write_32 ===
+[2m2026-08-02T03:24:19.258213Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0minit [3mok[0m[2m=[0m1 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m97727
+[0m[2m2026-08-02T03:25:19.473402Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0mnormal [3mok[0m[2m=[0m6248 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m1029631
+[32m  write finished! wid=w9 result=/root/.autocos/result/w9-4KB-write-32-2026-08-02-05:25:19.csv[0m
+{"ok": 6248, "fail": 0, "p99_us": 1029631, "ops_per_s": 104.13333333333334, "runtime_s": 60.0}
+=== REP 2/3 4KB_write_32 ===
+[2m2026-08-02T03:25:19.637078Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0minit [3mok[0m[2m=[0m1 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m92287
+[0m[2m2026-08-02T03:26:20.225431Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0mnormal [3mok[0m[2m=[0m6579 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m887295
+[32m  write finished! wid=w10 result=/root/.autocos/result/w10-4KB-write-32-2026-08-02-05:26:20.csv[0m
+{"ok": 6579, "fail": 0, "p99_us": 887295, "ops_per_s": 107.85245901639344, "runtime_s": 61.0}
+=== REP 3/3 4KB_write_32 ===
+[0m[2m2026-08-02T03:26:20.562823Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0minit [3mok[0m[2m=[0m1 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m198783
+[0m[2m2026-08-02T03:27:20.727752Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0mnormal [3mok[0m[2m=[0m10249 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m616447
+[32m  write finished! wid=w11 result=/root/.autocos/result/w11-4KB-write-32-2026-08-02-05:27:20.csv[0m
+{"ok": 10249, "fail": 0, "p99_us": 616447, "ops_per_s": 170.81666666666666, "runtime_s": 60.0}
+SUMMARY label=phase0-c1 task=4KB_write_32 cont=1 median_ops=107.85245901639344 median_p99_us=887295 median_fail=0 gate_fail0=True
+WROTE /root/contabo-deploy-20260801T125749Z/perf-levers/phase0-c1_4KB_write_32_c1_20260802T032419Z/summary.json
+=== phase0-c1 4KB_write_64 ===
+CLIENT ulimit=65535 endpoint=http://10.0.0.1:8085/v1/AUTH_test task=4KB_write_64 cont=1 rt=60 reps=3
+=== REP 1/3 4KB_write_64 ===
+[2m2026-08-02T03:27:20.947945Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0minit [3mok[0m[2m=[0m1 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m40703
+[0m[2m2026-08-02T03:28:21.406382Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0mnormal [3mok[0m[2m=[0m9634 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m943103
+[32m  write finished! wid=w12 result=/root/.autocos/result/w12-4KB-write-64-2026-08-02-05:28:21.csv[0m
+{"ok": 9634, "fail": 0, "p99_us": 943103, "ops_per_s": 157.9344262295082, "runtime_s": 61.0}
+=== REP 2/3 4KB_write_64 ===
+[2m2026-08-02T03:28:21.628040Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0minit [3mok[0m[2m=[0m1 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m76671
+[0m[2m2026-08-02T03:29:22.130444Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0mnormal [3mok[0m[2m=[0m10985 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m726527
+[32m  write finished! wid=w13 result=/root/.autocos/result/w13-4KB-write-64-2026-08-02-05:29:22.csv[0m
+{"ok": 10985, "fail": 0, "p99_us": 726527, "ops_per_s": 180.08196721311475, "runtime_s": 61.0}
+=== REP 3/3 4KB_write_64 ===
+[2m2026-08-02T03:29:22.287668Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0minit [3mok[0m[2m=[0m1 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m37791
+[0m[2m2026-08-02T03:30:22.738327Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0mnormal [3mok[0m[2m=[0m10344 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m1470463
+[32m  write finished! wid=w14 result=/root/.autocos/result/w14-4KB-write-64-2026-08-02-05:30:22.csv[0m
+{"ok": 10344, "fail": 0, "p99_us": 1470463, "ops_per_s": 172.4, "runtime_s": 60.0}
+SUMMARY label=phase0-c1 task=4KB_write_64 cont=1 median_ops=172.4 median_p99_us=943103 median_fail=0 gate_fail0=True
+WROTE /root/contabo-deploy-20260801T125749Z/perf-levers/phase0-c1_4KB_write_64_c1_20260802T032720Z/summary.json
+=== phase0-c1 4KB_write_128 ===
+CLIENT ulimit=65535 endpoint=http://10.0.0.1:8085/v1/AUTH_test task=4KB_write_128 cont=1 rt=60 reps=3
+=== REP 1/3 4KB_write_128 ===
+[2m2026-08-02T03:30:22.995114Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0minit [3mok[0m[2m=[0m1 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m85375
+[0m[2m2026-08-02T03:31:24.747178Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0mnormal [3mok[0m[2m=[0m6853 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m2254847
+[32m  write finished! wid=w15 result=/root/.autocos/result/w15-4KB-write-128-2026-08-02-05:31:24.csv[0m
+{"ok": 6853, "fail": 0, "p99_us": 2254847, "ops_per_s": 110.53225806451613, "runtime_s": 62.0}
+=== REP 2/3 4KB_write_128 ===
+[2m2026-08-02T03:31:24.883114Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0minit [3mok[0m[2m=[0m1 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m52607
+[0m[2m2026-08-02T03:32:25.786050Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0mnormal [3mok[0m[2m=[0m6860 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m2244607
+[32m  write finished! wid=w16 result=/root/.autocos/result/w16-4KB-write-128-2026-08-02-05:32:25.csv[0m
+{"ok": 6860, "fail": 0, "p99_us": 2244607, "ops_per_s": 112.45901639344262, "runtime_s": 61.0}
+=== REP 3/3 4KB_write_128 ===
+[2m2026-08-02T03:32:25.967551Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0minit [3mok[0m[2m=[0m1 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m69055
+[0m[2m2026-08-02T03:33:28.498658Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0mnormal [3mok[0m[2m=[0m7428 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m2119679
+[32m  write finished! wid=w17 result=/root/.autocos/result/w17-4KB-write-128-2026-08-02-05:33:28.csv[0m
+{"ok": 7428, "fail": 0, "p99_us": 2119679, "ops_per_s": 117.9047619047619, "runtime_s": 63.0}
+SUMMARY label=phase0-c1 task=4KB_write_128 cont=1 median_ops=112.45901639344262 median_p99_us=2244607 median_fail=0 gate_fail0=True
+WROTE /root/contabo-deploy-20260801T125749Z/perf-levers/phase0-c1_4KB_write_128_c1_20260802T033022Z/summary.json
+=== phase0-c4 4KB_write_32 ===
+CLIENT ulimit=65535 endpoint=http://10.0.0.1:8085/v1/AUTH_test task=4KB_write_32 cont=4 rt=60 reps=3
+=== REP 1/3 4KB_write_32 ===
+[0m[2m2026-08-02T03:33:29.203615Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0minit [3mok[0m[2m=[0m4 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m195839
+[0m[2m2026-08-02T03:34:29.328089Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0mnormal [3mok[0m[2m=[0m8787 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m685567
+[32m  write finished! wid=w18 result=/root/.autocos/result/w18-4KB-write-32-2026-08-02-05:34:29.csv[0m
+{"ok": 8787, "fail": 0, "p99_us": 685567, "ops_per_s": 144.04918032786884, "runtime_s": 61.0}
+=== REP 2/3 4KB_write_32 ===
+[0m[2m2026-08-02T03:34:30.105551Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0minit [3mok[0m[2m=[0m4 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m258303
+[0m[2m2026-08-02T03:35:30.511705Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0mnormal [3mok[0m[2m=[0m7948 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m894975
+[32m  write finished! wid=w19 result=/root/.autocos/result/w19-4KB-write-32-2026-08-02-05:35:30.csv[0m
+{"ok": 7948, "fail": 0, "p99_us": 894975, "ops_per_s": 130.29508196721312, "runtime_s": 61.0}
+=== REP 3/3 4KB_write_32 ===
+[0m[2m2026-08-02T03:35:31.068679Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0minit [3mok[0m[2m=[0m4 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m197119
+[0m[2m2026-08-02T03:36:31.297356Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0mnormal [3mok[0m[2m=[0m8068 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m702975
+[32m  write finished! wid=w20 result=/root/.autocos/result/w20-4KB-write-32-2026-08-02-05:36:31.csv[0m
+{"ok": 8068, "fail": 0, "p99_us": 702975, "ops_per_s": 132.2622950819672, "runtime_s": 61.0}
+SUMMARY label=phase0-c4 task=4KB_write_32 cont=4 median_ops=132.2622950819672 median_p99_us=702975 median_fail=0 gate_fail0=True
+WROTE /root/contabo-deploy-20260801T125749Z/perf-levers/phase0-c4_4KB_write_32_c4_20260802T033328Z/summary.json
+=== phase0-c4 4KB_write_64 ===
+CLIENT ulimit=65535 endpoint=http://10.0.0.1:8085/v1/AUTH_test task=4KB_write_64 cont=4 rt=60 reps=3
+=== REP 1/3 4KB_write_64 ===
+[0m[2m2026-08-02T03:36:32.172397Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0minit [3mok[0m[2m=[0m4 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m482559
+[0m[2m2026-08-02T03:37:32.539041Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0mnormal [3mok[0m[2m=[0m8156 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m1173503
+[32m  write finished! wid=w21 result=/root/.autocos/result/w21-4KB-write-64-2026-08-02-05:37:32.csv[0m
+{"ok": 8156, "fail": 0, "p99_us": 1173503, "ops_per_s": 133.70491803278688, "runtime_s": 61.0}
+=== REP 2/3 4KB_write_64 ===
+[0m[2m2026-08-02T03:37:33.005603Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0minit [3mok[0m[2m=[0m4 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m102655
+[0m[2m2026-08-02T03:38:33.336172Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0mnormal [3mok[0m[2m=[0m9141 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m1048575
+[32m  write finished! wid=w22 result=/root/.autocos/result/w22-4KB-write-64-2026-08-02-05:38:33.csv[0m
+{"ok": 9141, "fail": 0, "p99_us": 1048575, "ops_per_s": 149.85245901639345, "runtime_s": 61.0}
+=== REP 3/3 4KB_write_64 ===
+[0m[2m2026-08-02T03:38:33.605149Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0minit [3mok[0m[2m=[0m4 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m53535
+[0m[2m2026-08-02T03:39:33.904705Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0mnormal [3mok[0m[2m=[0m8250 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m1364991
+[32m  write finished! wid=w23 result=/root/.autocos/result/w23-4KB-write-64-2026-08-02-05:39:33.csv[0m
+{"ok": 8250, "fail": 0, "p99_us": 1364991, "ops_per_s": 137.5, "runtime_s": 60.0}
+SUMMARY label=phase0-c4 task=4KB_write_64 cont=4 median_ops=137.5 median_p99_us=1173503 median_fail=0 gate_fail0=True
+WROTE /root/contabo-deploy-20260801T125749Z/perf-levers/phase0-c4_4KB_write_64_c4_20260802T033631Z/summary.json
+=== phase0-c4 4KB_write_128 ===
+CLIENT ulimit=65535 endpoint=http://10.0.0.1:8085/v1/AUTH_test task=4KB_write_128 cont=4 rt=60 reps=3
+=== REP 1/3 4KB_write_128 ===
+[0m[2m2026-08-02T03:39:34.701952Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0minit [3mok[0m[2m=[0m4 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m293631
+[0m[2m2026-08-02T03:40:35.753454Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0mnormal [3mok[0m[2m=[0m6515 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m2308095
+[32m  write finished! wid=w24 result=/root/.autocos/result/w24-4KB-write-128-2026-08-02-05:40:35.csv[0m
+{"ok": 6515, "fail": 0, "p99_us": 2308095, "ops_per_s": 106.80327868852459, "runtime_s": 61.0}
+=== REP 2/3 4KB_write_128 ===
+[0m[2m2026-08-02T03:40:36.530536Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0minit [3mok[0m[2m=[0m4 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m234239
+[0m[2m2026-08-02T03:41:37.542227Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0mnormal [3mok[0m[2m=[0m8311 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m1645567
+[32m  write finished! wid=w25 result=/root/.autocos/result/w25-4KB-write-128-2026-08-02-05:41:37.csv[0m
+{"ok": 8311, "fail": 0, "p99_us": 1645567, "ops_per_s": 134.0483870967742, "runtime_s": 62.0}
+=== REP 3/3 4KB_write_128 ===
+[0m[2m2026-08-02T03:41:37.946404Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0minit [3mok[0m[2m=[0m4 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m78015
+[0m[2m2026-08-02T03:42:38.617056Z[0m [32m INFO[0m stage finished [3mstage[0m[2m=[0mnormal [3mok[0m[2m=[0m8537 [3mfail[0m[2m=[0m0 [3msuccess[0m[2m=[0m"100.00%" [3mp99_us[0m[2m=[0m1753087
+[32m  write finished! wid=w26 result=/root/.autocos/result/w26-4KB-write-128-2026-08-02-05:42:38.csv[0m
+{"ok": 8537, "fail": 0, "p99_us": 1753087, "ops_per_s": 139.95081967213116, "runtime_s": 61.0}
+SUMMARY label=phase0-c4 task=4KB_write_128 cont=4 median_ops=134.0483870967742 median_p99_us=1753087 median_fail=0 gate_fail0=True
+WROTE /root/contabo-deploy-20260801T125749Z/perf-levers/phase0-c4_4KB_write_128_c4_20260802T033934Z/summary.json
+PHASE0-DONE 2026-08-02T03:42:38Z

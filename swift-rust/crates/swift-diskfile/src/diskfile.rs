@@ -108,6 +108,10 @@ pub struct DiskFileConfig {
     pub xattr_size: usize,
     pub disk_chunk_size: usize,
     pub bytes_per_sync: u64,
+    /// When true (default), `put` fsyncs the datafile (`sync_all`) and the
+    /// rename path fsyncs parent dirs. Set false only for controlled A/B of
+    /// the fsync ceiling (L2); not a production durability recommendation.
+    pub fsync_on_close: bool,
 }
 
 impl Default for DiskFileConfig {
@@ -117,6 +121,7 @@ impl Default for DiskFileConfig {
             xattr_size: DEFAULT_XATTR_SIZE,
             disk_chunk_size: 65536,
             bytes_per_sync: 512 * 1024 * 1024,
+            fsync_on_close: true,
         }
     }
 }
@@ -731,7 +736,9 @@ impl DiskFileWriter<'_> {
         file.write_all(chunk)?;
         self.upload_size += chunk.len() as u64;
         // for large files, sync every bytes_per_sync written
-        if self.upload_size - self.last_sync >= self.df.cfg.bytes_per_sync {
+        if self.df.cfg.fsync_on_close
+            && self.upload_size - self.last_sync >= self.df.cfg.bytes_per_sync
+        {
             file.sync_data()?;
             self.last_sync = self.upload_size;
         }
@@ -826,12 +833,14 @@ impl DiskFileWriter<'_> {
         // metadata goes down before the fsync so data and metadata flush
         // together
         write_file_metadata(XattrSource::File(file), &metadata, self.df.cfg.xattr_size)?;
-        file.sync_all()?;
+        if self.df.cfg.fsync_on_close {
+            file.sync_all()?;
+        }
         if let Some(suffix_dir) = self.df.datadir.parent() {
             invalidate_hash(suffix_dir)?;
         }
         let tmppath = self.tmppath.as_ref().unwrap();
-        renamer(tmppath, &target_path, true)?;
+        renamer(tmppath, &target_path, self.df.cfg.fsync_on_close)?;
         self.put_succeeded = true;
         if cleanup {
             let _ = cleanup_ondisk_files(&self.df.datadir, self.df.policy, &self.df.cfg.cleanup);

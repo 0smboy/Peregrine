@@ -235,6 +235,8 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
             hash_config: hash_cfg(),
             diskfile: swift_diskfile::DiskFileConfig::default(),
             policies,
+            container_update_timeout: std::time::Duration::from_secs(1),
+            container_update_mode: swift_object_server::ContainerUpdateMode::Sync,
         };
         std::thread::spawn(move || swift_object_server::serve(listener, config));
     }

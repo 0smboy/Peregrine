@@ -1,0 +1,140 @@
+{
+  "lever": "L1b-always-async",
+  "decision": "DROP",
+  "reason": "Contabo primary gate 4KB_write_128 c1 requires >=1.5x Phase0 PUT/s; observed ~0.95x with fail=0. async_pending fsync cost dominates sync container fanout on this cluster. Reverted container_update_mode=sync (L1a KEEP). Code retained behind config knob.",
+  "primary_gate": {
+    "task": "4KB_write_128",
+    "containers": 1,
+    "phase0_ops": 112.45901639344262,
+    "l1a_ops": 139.72131147540983,
+    "l1b_ops": 106.65573770491804,
+    "l1b_vs_phase0": 0.948396501457726,
+    "phase0_p99": 2244607,
+    "l1b_p99": 1981439,
+    "fail0": true
+  },
+  "rows": [
+    {
+      "task": "4KB_write_128",
+      "containers": 1,
+      "phase0_ops": 112.45901639344262,
+      "l1a_ops": 139.72131147540983,
+      "l1b_ops": 106.65573770491804,
+      "l1b_vs_phase0": 0.948396501457726,
+      "phase0_p99": 2244607,
+      "l1b_p99": 1981439,
+      "fail0": true
+    },
+    {
+      "task": "4KB_write_128",
+      "containers": 4,
+      "phase0_ops": 134.0483870967742,
+      "l1a_ops": 137.27868852459017,
+      "l1b_ops": 96.29032258064517,
+      "l1b_vs_phase0": 0.7183251112982794,
+      "phase0_p99": 1753087,
+      "l1b_p99": 2256895,
+      "fail0": true
+    },
+    {
+      "task": "4KB_write_32",
+      "containers": 1,
+      "phase0_ops": 107.85245901639344,
+      "l1a_ops": 135.95081967213116,
+      "l1b_ops": 89.15,
+      "l1b_vs_phase0": 0.8265921872625019,
+      "phase0_p99": 887295,
+      "l1b_p99": 964607,
+      "fail0": true
+    },
+    {
+      "task": "4KB_write_32",
+      "containers": 4,
+      "phase0_ops": 132.2622950819672,
+      "l1a_ops": 128.91803278688525,
+      "l1b_ops": 90.20967741935483,
+      "l1b_vs_phase0": 0.6820513538151518,
+      "phase0_p99": 702975,
+      "l1b_p99": 986623,
+      "fail0": true
+    },
+    {
+      "task": "4KB_write_64",
+      "containers": 1,
+      "phase0_ops": 172.4,
+      "l1a_ops": 126.40983606557377,
+      "l1b_ops": 88.37704918032787,
+      "l1b_vs_phase0": 0.5126278954775398,
+      "phase0_p99": 943103,
+      "l1b_p99": 1596415,
+      "fail0": true
+    },
+    {
+      "task": "4KB_write_64",
+      "containers": 4,
+      "phase0_ops": 137.5,
+      "l1a_ops": 123.1774193548387,
+      "l1b_ops": 97.60655737704919,
+      "l1b_vs_phase0": 0.709865871833085,
+      "phase0_p99": 1173503,
+      "l1b_p99": 1478655,
+      "fail0": true
+    }
+  ],
+  "saio": {
+    "phase": "l1b-saio",
+    "decision_hint": "Contabo L1b missed 1.5x; SAIO numbers below",
+    "rows": [
+      {
+        "conc": 1,
+        "l1b": {
+          "ops": 51.9,
+          "p50_ms": 17.6,
+          "p99_ms": 53.5,
+          "errs": 0
+        },
+        "phase0_rust": {
+          "ops": 71.8,
+          "p50_ms": 11.8,
+          "p99_ms": 40.5,
+          "errs": 0
+        },
+        "phase0_python": {
+          "ops": 32.3,
+          "p50_ms": 28.6,
+          "p99_ms": 73.0,
+          "errs": 0
+        },
+        "vs_phase0_rust": 0.7228412256267409,
+        "vs_python": 1.606811145510836,
+        "gate_fail0": true,
+        "gate_ge90pct_python_c32": null
+      },
+      {
+        "conc": 32,
+        "l1b": {
+          "ops": 220.2,
+          "p50_ms": 128.6,
+          "p99_ms": 421.0,
+          "errs": 0
+        },
+        "phase0_rust": {
+          "ops": 264.4,
+          "p50_ms": 108.0,
+          "p99_ms": 306.3,
+          "errs": 0
+        },
+        "phase0_python": {
+          "ops": 69.8,
+          "p50_ms": 461.9,
+          "p99_ms": 720.6,
+          "errs": 0
+        },
+        "vs_phase0_rust": 0.8328290468986385,
+        "vs_python": 3.154727793696275,
+        "gate_fail0": true,
+        "gate_ge90pct_python_c32": true
+      }
+    ]
+  }
+}

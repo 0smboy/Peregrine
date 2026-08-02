@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use swift_object_server::{ObjectServer, ObjectServerConfig};
+use swift_object_server::{ContainerUpdateMode, ObjectServer, ObjectServerConfig};
 
 static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -72,6 +72,8 @@ fn spawn_server(devices: &Path) -> std::net::SocketAddr {
                 1,
                 swift_diskfile::PolicyKind::Ec {
                     n_unique_fragments: Some(6),
+        container_update_timeout: std::time::Duration::from_secs(1),
+        container_update_mode: ContainerUpdateMode::Sync,
                 },
             ),
         ]),

@@ -1,0 +1,20 @@
+{
+  "lever": "L2-fsync-off",
+  "on": {
+    "ok": 8579,
+    "fail": 0,
+    "p99_us": 2087935,
+    "ops_per_s": 140.63934426229508,
+    "runtime_s": 61.0
+  },
+  "off": {
+    "ok": 8998,
+    "fail": 0,
+    "p99_us": 2234367,
+    "ops_per_s": 147.50819672131146,
+    "runtime_s": 61.0
+  },
+  "ops_ratio_off_on": 1.0488401911644714,
+  "decision": "DROP",
+  "reason": "need >=10% PUT/s; observed 4.9% with fail=0; restore fsync_on_close=true"
+}

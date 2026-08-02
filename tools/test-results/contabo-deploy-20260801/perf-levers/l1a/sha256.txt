@@ -1,0 +1,1 @@
+6bc065830a713cb151268f07ac6200d774bb1a9e3473c6cbef3c5475898f44dc  /root/work/swift-rust/target/release/swift-object-server

@@ -92,6 +92,9 @@ pub struct ServerConfig {
     /// requests, and `serve_forever_with_config` returns `Ok(())`. Pair with
     /// [`install_sigterm_flag`] for graceful daemon shutdown.
     pub shutdown: Option<Arc<AtomicBool>>,
+    /// Bind with `SO_REUSEPORT` when using [`bind_listener`] (L4). No effect on
+    /// an already-bound `TcpListener` passed to `serve_*`.
+    pub reuse_port: bool,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -115,6 +118,7 @@ impl std::fmt::Debug for ServerConfig {
                 &self.access_log.as_ref().map(|_| "<callback>"),
             )
             .field("shutdown", &self.shutdown)
+            .field("reuse_port", &self.reuse_port)
             .finish()
     }
 }
@@ -137,8 +141,103 @@ impl Default for ServerConfig {
             max_body_bytes: swift_core::constraints::MAX_FILE_SIZE as u64,
             access_log: None,
             shutdown: None,
+            reuse_port: false,
         }
     }
+}
+
+/// Bind `addr` (`ip:port`) as a `TcpListener`, optionally with `SO_REUSEPORT`
+/// so multiple acceptors can share the port (L4).
+pub fn bind_listener(addr: &str, reuse_port: bool) -> std::io::Result<TcpListener> {
+    use std::net::SocketAddr;
+    use std::os::fd::FromRawFd;
+
+    if !reuse_port {
+        return TcpListener::bind(addr);
+    }
+
+    let sock_addr: SocketAddr = addr
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    fn set_bool_sockopt(fd: libc::c_int, opt: libc::c_int) -> std::io::Result<()> {
+        let v: libc::c_int = 1;
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                &v as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&v) as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    let fd = unsafe { libc::socket(
+        match sock_addr {
+            SocketAddr::V4(_) => libc::AF_INET,
+            SocketAddr::V6(_) => libc::AF_INET6,
+        },
+        libc::SOCK_STREAM,
+        0,
+    )};
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if let Err(e) = set_bool_sockopt(fd, libc::SO_REUSEADDR) {
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    if let Err(e) = set_bool_sockopt(fd, libc::SO_REUSEPORT) {
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    let bind_rc = unsafe {
+        match sock_addr {
+            SocketAddr::V4(a) => {
+                let mut sa: libc::sockaddr_in = std::mem::zeroed();
+                sa.sin_family = libc::AF_INET as _;
+                sa.sin_port = u16::to_be(a.port());
+                sa.sin_addr = libc::in_addr {
+                    s_addr: u32::from(*a.ip()).to_be(),
+                };
+                libc::bind(
+                    fd,
+                    &sa as *const _ as *const libc::sockaddr,
+                    std::mem::size_of_val(&sa) as libc::socklen_t,
+                )
+            }
+            SocketAddr::V6(a) => {
+                let mut sa: libc::sockaddr_in6 = std::mem::zeroed();
+                sa.sin6_family = libc::AF_INET6 as _;
+                sa.sin6_port = u16::to_be(a.port());
+                sa.sin6_addr = libc::in6_addr {
+                    s6_addr: a.ip().octets(),
+                };
+                libc::bind(
+                    fd,
+                    &sa as *const _ as *const libc::sockaddr,
+                    std::mem::size_of_val(&sa) as libc::socklen_t,
+                )
+            }
+        }
+    };
+    if bind_rc != 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+    if unsafe { libc::listen(fd, 1024) } != 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+    Ok(unsafe { TcpListener::from_raw_fd(fd) })
 }
 
 fn socket_timeout(config: &ServerConfig) -> Option<Duration> {

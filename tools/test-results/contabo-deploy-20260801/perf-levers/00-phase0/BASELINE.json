@@ -1,0 +1,65 @@
+{
+  "phase": "0-contabo",
+  "rows": [
+    {
+      "label": "phase0-c1",
+      "task": "4KB_write_128",
+      "container_count": 1,
+      "median_ops": 112.45901639344262,
+      "median_p99_us": 2244607,
+      "median_fail": 0,
+      "gate_fail0": true,
+      "path": "/root/contabo-deploy-20260801T125749Z/perf-levers/phase0-c1_4KB_write_128_c1_20260802T033022Z/summary.json"
+    },
+    {
+      "label": "phase0-c1",
+      "task": "4KB_write_32",
+      "container_count": 1,
+      "median_ops": 107.85245901639344,
+      "median_p99_us": 887295,
+      "median_fail": 0,
+      "gate_fail0": true,
+      "path": "/root/contabo-deploy-20260801T125749Z/perf-levers/phase0-c1_4KB_write_32_c1_20260802T032419Z/summary.json"
+    },
+    {
+      "label": "phase0-c1",
+      "task": "4KB_write_64",
+      "container_count": 1,
+      "median_ops": 172.4,
+      "median_p99_us": 943103,
+      "median_fail": 0,
+      "gate_fail0": true,
+      "path": "/root/contabo-deploy-20260801T125749Z/perf-levers/phase0-c1_4KB_write_64_c1_20260802T032720Z/summary.json"
+    },
+    {
+      "label": "phase0-c4",
+      "task": "4KB_write_128",
+      "container_count": 4,
+      "median_ops": 134.0483870967742,
+      "median_p99_us": 1753087,
+      "median_fail": 0,
+      "gate_fail0": true,
+      "path": "/root/contabo-deploy-20260801T125749Z/perf-levers/phase0-c4_4KB_write_128_c4_20260802T033934Z/summary.json"
+    },
+    {
+      "label": "phase0-c4",
+      "task": "4KB_write_32",
+      "container_count": 4,
+      "median_ops": 132.2622950819672,
+      "median_p99_us": 702975,
+      "median_fail": 0,
+      "gate_fail0": true,
+      "path": "/root/contabo-deploy-20260801T125749Z/perf-levers/phase0-c4_4KB_write_32_c4_20260802T033328Z/summary.json"
+    },
+    {
+      "label": "phase0-c4",
+      "task": "4KB_write_64",
+      "container_count": 4,
+      "median_ops": 137.5,
+      "median_p99_us": 1173503,
+      "median_fail": 0,
+      "gate_fail0": true,
+      "path": "/root/contabo-deploy-20260801T125749Z/perf-levers/phase0-c4_4KB_write_64_c4_20260802T033631Z/summary.json"
+    }
+  ]
+}

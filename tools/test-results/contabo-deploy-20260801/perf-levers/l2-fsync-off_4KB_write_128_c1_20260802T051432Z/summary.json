@@ -1,0 +1,37 @@
+{
+  "label": "l2-fsync-off",
+  "task": "4KB_write_128",
+  "container_count": 1,
+  "reps": 3,
+  "rows": [
+    {
+      "ok": 10878,
+      "fail": 0,
+      "p99_us": 1598463,
+      "ops_per_s": 178.327868852459,
+      "runtime_s": 61.0
+    },
+    {
+      "ok": 8038,
+      "fail": 0,
+      "p99_us": 2234367,
+      "ops_per_s": 129.6451612903226,
+      "runtime_s": 62.0
+    },
+    {
+      "ok": 8998,
+      "fail": 0,
+      "p99_us": 3409919,
+      "ops_per_s": 147.50819672131146,
+      "runtime_s": 61.0
+    }
+  ],
+  "median": {
+    "ok": 8998,
+    "fail": 0,
+    "p99_us": 2234367,
+    "ops_per_s": 147.50819672131146,
+    "runtime_s": 61.0
+  },
+  "gate_fail0": true
+}

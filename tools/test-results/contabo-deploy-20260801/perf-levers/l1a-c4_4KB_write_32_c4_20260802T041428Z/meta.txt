@@ -1,0 +1,1 @@
+CLIENT ulimit=65535 endpoint=http://10.0.0.1:8085/v1/AUTH_test task=4KB_write_32 cont=4 rt=60 reps=3

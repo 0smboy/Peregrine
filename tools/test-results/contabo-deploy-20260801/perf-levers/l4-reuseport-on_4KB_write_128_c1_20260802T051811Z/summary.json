@@ -1,0 +1,37 @@
+{
+  "label": "l4-reuseport-on",
+  "task": "4KB_write_128",
+  "container_count": 1,
+  "reps": 3,
+  "rows": [
+    {
+      "ok": 7327,
+      "fail": 0,
+      "p99_us": 1868799,
+      "ops_per_s": 118.1774193548387,
+      "runtime_s": 62.0
+    },
+    {
+      "ok": 7450,
+      "fail": 0,
+      "p99_us": 3174399,
+      "ops_per_s": 122.1311475409836,
+      "runtime_s": 61.0
+    },
+    {
+      "ok": 6259,
+      "fail": 0,
+      "p99_us": 2592767,
+      "ops_per_s": 102.60655737704919,
+      "runtime_s": 61.0
+    }
+  ],
+  "median": {
+    "ok": 7327,
+    "fail": 0,
+    "p99_us": 2592767,
+    "ops_per_s": 118.1774193548387,
+    "runtime_s": 61.0
+  },
+  "gate_fail0": true
+}

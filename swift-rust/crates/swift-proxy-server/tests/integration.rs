@@ -233,6 +233,8 @@ fn test_proxy_object_round_trip() {
                     0,
                     swift_diskfile::PolicyKind::Replication,
                 )]),
+                container_update_timeout: std::time::Duration::from_secs(1),
+                container_update_mode: swift_object_server::ContainerUpdateMode::Sync,
             },
         )
     });
@@ -387,6 +389,8 @@ fn spawn_object_server(tag: &str) -> (std::net::SocketAddr, std::path::PathBuf) 
                     0,
                     swift_diskfile::PolicyKind::Replication,
                 )]),
+                container_update_timeout: std::time::Duration::from_secs(1),
+                container_update_mode: swift_object_server::ContainerUpdateMode::Sync,
             },
         )
     });

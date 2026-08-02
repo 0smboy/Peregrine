@@ -1,0 +1,37 @@
+{
+  "label": "l1b-c4",
+  "task": "4KB_write_128",
+  "container_count": 4,
+  "reps": 3,
+  "rows": [
+    {
+      "ok": 5970,
+      "fail": 0,
+      "p99_us": 2129919,
+      "ops_per_s": 96.29032258064517,
+      "runtime_s": 62.0
+    },
+    {
+      "ok": 5297,
+      "fail": 0,
+      "p99_us": 2314239,
+      "ops_per_s": 85.43548387096774,
+      "runtime_s": 62.0
+    },
+    {
+      "ok": 6491,
+      "fail": 0,
+      "p99_us": 2256895,
+      "ops_per_s": 103.03174603174604,
+      "runtime_s": 63.0
+    }
+  ],
+  "median": {
+    "ok": 5970,
+    "fail": 0,
+    "p99_us": 2256895,
+    "ops_per_s": 96.29032258064517,
+    "runtime_s": 62.0
+  },
+  "gate_fail0": true
+}

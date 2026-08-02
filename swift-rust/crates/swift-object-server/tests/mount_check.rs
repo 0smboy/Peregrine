@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use swift_http::{HeaderKeyDict, Request};
-use swift_object_server::{ObjectServer, ObjectServerConfig};
+use swift_object_server::{ContainerUpdateMode, ObjectServer, ObjectServerConfig};
 
 static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -60,6 +60,8 @@ fn server(devices: &Path, mount_check: bool) -> ObjectServer {
             0,
             swift_diskfile::PolicyKind::Replication,
         )]),
+        container_update_timeout: std::time::Duration::from_secs(1),
+        container_update_mode: ContainerUpdateMode::Sync,
     })
 }
 

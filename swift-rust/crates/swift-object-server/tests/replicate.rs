@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use swift_core::pickle::{self, Value};
 use swift_http::{Body, HeaderKeyDict, Request, Response};
-use swift_object_server::{ObjectServer, ObjectServerConfig};
+use swift_object_server::{ContainerUpdateMode, ObjectServer, ObjectServerConfig};
 
 const REPL_HASH: &str = "db57fb79699b56d0b801140d67a1caa1";
 const EC_FRAG_HASH: &str = "8d8bc42a67759705bb3a3e1e625d3175";
@@ -64,6 +64,8 @@ fn server(devices: &Path, mount_check: bool) -> ObjectServer {
             .unwrap(),
         diskfile: swift_diskfile::DiskFileConfig::default(),
         policies,
+        container_update_timeout: std::time::Duration::from_secs(1),
+        container_update_mode: ContainerUpdateMode::Sync,
     })
 }
 
