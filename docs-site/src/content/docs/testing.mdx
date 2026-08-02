@@ -34,7 +34,7 @@ copy, expiry, ACLs, cross-account denial, and negative cases.
 Everything matched the oracle except three deviations — client ETag not
 validated on PUT, a quoted client-facing ETag, and metadata length not
 enforced. All three were root-caused, fixed, and re-verified (Rust SAIO 54/54).
-See [Performance](/performance) for the details and the layering.
+See [Security](/security) for the details and the layering.
 </Aside>
 
 ## 3. Performance A/B
@@ -47,11 +47,11 @@ COSBench-grade load for larger runs.
 
 ## 4. Production, on the HA cluster
 
-Against a four-node cluster behind a cloud load balancer (see
+Against the four-node Contabo HA lab (VIP `10.0.0.10:8085` — see
 [Lab cluster](/lab-cluster) for topology and cutover rules):
 
 <Steps>
-<Step>the functional suite on the real client path (prefer a node HAProxy when the client is itself a backend — ILB hairpin is unreliable);</Step>
+<Step>the functional suite on the real client path (prefer the Keepalived VIP, or a node HAProxy `:8085`);</Step>
 <Step>sustained `cosbench-rs` / `autocos` load at production concurrency;</Step>
 <Step>the console **Lab** for fault injection — fragment loss → reconstructor heal, and node-down failover — with read-back integrity;</Step>
 <Step>large-object streaming-memory checks (a multi-GB PUT/GET while sampling RSS);</Step>

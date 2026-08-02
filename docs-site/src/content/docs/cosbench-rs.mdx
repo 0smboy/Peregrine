@@ -19,12 +19,12 @@ within a stage, workers run concurrently for a fixed op count or duration.
 name: prod-mixed
 auth:
   type: temp_auth
-  url: http://10.42.30.11:8085/auth/v1.0
+  url: http://10.0.0.10:8085/auth/v1.0
   user: test:tester
   key: azure-swift-2026.bench
 storage:
   type: swift
-  endpoint: http://10.42.30.11:8085/v1/AUTH_test   # explicit: avoid an LB hairpin
+  endpoint: http://10.0.0.10:8085/v1/AUTH_test   # Contabo Keepalived VIP
   timeout_ms: 120000
 stages:
   - { name: init,    kind: init,    workers: 4,  total_ops: 4,    operations: [{ type: create_container, ratio: 100 }], objects: {...} }
@@ -34,9 +34,9 @@ stages:
 ```
 
 <Aside type="tip" title="Endpoint override">
-Leave `storage.endpoint` empty to use the storage URL returned by auth. Set it
-explicitly (e.g. a specific HAProxy) when the bench runs on a cloud
-load-balancer backend-pool node that cannot hairpin to its own VIP.
+Leave `storage.endpoint` empty to use the storage URL returned by auth. On the
+Contabo lab, pin the Keepalived VIP `http://10.0.0.10:8085/v1/AUTH_test` (or a
+node HAProxy) so runs do not depend on whatever auth returns.
 </Aside>
 
 ## Run

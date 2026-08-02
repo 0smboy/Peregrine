@@ -36,14 +36,15 @@ an implementation A/B, and against the 4-node cluster for production numbers.
 
 ## 4. Production, on the HA cluster
 
-The reference cluster is four nodes (`swift1–4`) behind an Azure load balancer,
-running the full daemon set plus a Prometheus/Loki/statsd observability stack.
-Layout, EC install rules, and cutover notes: [`lab-cluster.md`](lab-cluster.md).
+The reference cluster is four Contabo nodes (`swift1–4`) behind Keepalived VIP
+`10.0.0.10:8085`, running the full daemon set plus a Prometheus/Loki/statsd
+observability stack. Layout, EC install rules, and cutover notes:
+[`lab-cluster.md`](lab-cluster.md). The previous Azure ILB topology is retired.
 
 Against it we run:
 
-- the functional suite on the real client path (prefer node HAProxy `:8085`
-  when driving load from a backend VM — ILB hairpin is unreliable);
+- the functional suite on the real client path (prefer the VIP, or node
+  HAProxy `:8085`);
 - sustained `cosbench-rs`/`autocos` load at production concurrency;
 - the console **Lab** for fault injection (fragment loss → reconstructor heal,
   node down) with read-back integrity verification;

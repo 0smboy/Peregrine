@@ -5,8 +5,10 @@ sidebar:
   order: 23
 ---
 
-All numbers are from a four-node cluster and same-host SAIO A/Bs against Python
-OpenStack Swift 2.35.0.
+All numbers are from a four-node Contabo HA lab and same-host SAIO A/Bs against
+Python OpenStack Swift 2.35.0. Evidence pack:
+`tools/test-results/contabo-deploy-20260801/` (write-path levers under
+`perf-levers/`).
 
 ## The accept-loop latency fix
 
@@ -27,7 +29,8 @@ plus `TCP_NODELAY` on the outbound backend sockets.
 
 <Aside type="danger" title="This bug masked everything">
 Before the fix the cluster was 3–15× slower than the Python it replaces. After
-it, Rust is 2.7–4.4× faster than Python on reads.
+it, Rust is 2.7–4.4× faster than Python on reads. Small-write A/Bs below are on
+that fixed accept path.
 </Aside>
 
 ## Rust vs Python (same-host SAIO A/B)
@@ -37,12 +40,16 @@ it, Rust is 2.7–4.4× faster than Python on reads.
 | 1 KB GET · c1 / c32 / c64 | 602 / 1645 / 1751 op/s | 190 / 619 / 646 op/s |
 | 1 MB GET · c1 / c32 (MB/s) | 322 / 471 | 73 / 135 |
 | 16 MB GET · c8 (MB/s) | 682 | 168 |
-| 1 KB PUT · c1 / c32 (2026-08-02) | **72 / 264 op/s** | 32 / 70 op/s |
+| 1 KB PUT · c1 / c32 | **71.8 / 264.4 op/s** | 32.3 / 69.8 op/s |
 
-Reads win at every size. **Small writes too:** after workers=16 + lock-free
-accept + L1a parallel container update, SAIO 1 KB PUT @c32 is ~**3.8×** Python
-(median of 3 runs; evidence `perf-levers/SUMMARY.json` → `saio_phase0`). The
-older 54 / 159 vs 32 / 255 row was a pre-optimization baseline and is retired.
+Reads win at every size. **Small writes too:** SAIO 1 KB PUT @c32 is
+~**3.79×** Python (median of 3 runs, `perf-levers/SUMMARY.json` →
+`saio_phase0`, 2026-08-02). That pack already includes workers=16 + lock-free
+accept; it is **not** an L1a delta (L1a SAIO re-check was ~0.92× phase0 Rust and
+was not the KEEP gate).
+
+Retired baseline (pre workers/accept work): 54 / 159 vs 32 / 255 — do not treat
+as current.
 
 ## Production load (4-node, via HAProxy)
 
@@ -53,26 +60,44 @@ with 0 failures; reads reached 4,180 ops/s (4 KB), 1,346 MB/s (1 MB), and
 
 ## Write-concurrency optimization
 
-A clean single-node A/B (the multi-node result was a load-host artifact) showed
-the deployed `object-server` `workers = 2` starved write concurrency:
+A clean single-node A/B (an earlier multi-node 2-vs-32 try was a noisy load-host
+artifact and is **not** evidence) showed `object-server` `workers = 2` starved
+write concurrency:
 
 | object workers | 4 KB PUT/s | p50 | p99 |
 |---------------:|-----------:|----:|----:|
-| 2 (deployed) | 194 | 187 ms | 2028 ms |
-| **16** | **344** | **113 ms** | **784 ms** |
+| 2 (historical baseline) | 194 | 187 ms | 2028 ms |
+| **16 (current deployed floor)** | **344** | **113 ms** | **784 ms** |
 | 64 | 350 | 115 ms | 1288 ms |
 
-**Shipped:** the worker floor raised to 16 (config, deployed), and a lock-free
-`crossbeam` MPMC accept queue replacing the `Arc<Mutex<Receiver>>` that
-serialized workers on the hot path (946/946 tests still pass). Cluster 4 KB
-write p99 dropped from ~1017 ms to ~330 ms.
+**Shipped:** worker floor **16**, lock-free `crossbeam` MPMC accept queue
+(replacing `Arc<Mutex<Receiver>>`). Cluster 4 KB write p99 dropped from
+~1017 ms to ~330 ms on that work.
 
-**Write-path lever A/B (2026-08-02 Contabo + SAIO):** parallel bounded container
-update (**L1a KEEP**, ~+24% 4KB write @128 / c1, p99 ~−30%); always-async
-container updates (**L1b DROP**, ~0.95×); disable put fsync (**L2 DROP**,
-~+4.9% &lt;10% gate); `SO_REUSEPORT` (**L4 DROP**); multi-container ops guidance
-(**L3a**, c4/c1 ≈1.19×, sharding deferred). SAIO 1 KB PUT numbers in the table
-above are from the same pack; tokio remains ADR-only. Contabo cluster 4 KB
-write A/Bs used a shared load host (still noise-limited for second-order
-deltas). Evidence:
-`tools/test-results/contabo-deploy-20260801/perf-levers/SUMMARY.json`.
+### Write-path lever A/B (2026-08-02 Contabo + SAIO)
+
+Primary Contabo gate: shared load host `swift1` → `10.0.0.1:8085` (noisy;
+second-order deltas limited).
+
+| Lever | Decision | Result |
+|-------|----------|--------|
+| L1a parallel bounded `container_update` | **KEEP** (deployed) | `4KB_write_128` c1 ~**+24%** PUT/s, p99 ~**−30%** vs Phase0; fail=0 |
+| L1b `container_update_mode=async` | **DROP** | ~0.95× Phase0; async_pending fsync dominated |
+| L2 `fsync_on_close=false` | **DROP** | ~+4.9% (&lt;10% gate) |
+| L4 `SO_REUSEPORT` | **DROP** | ~0.84×; no gain on single-acceptor pool |
+| L3a multi-container | **ops guidance** | c4/c1 ≈1.19× @128; sharding (L3b) deferred |
+| L5 tokio | **ADR only** | not required while SAIO Rust 1 KB PUT @c32 ≫ Python |
+
+**Production knobs after the program (restored / kept):**
+
+```ini
+workers = 16
+container_update_mode = sync
+container_update_timeout = 1.0
+fsync_on_close = true
+reuse_port = false
+```
+
+Updater `concurrency = 16` / `interval = 5` kept for pending drain on sync
+failures. Evidence: `perf-levers/SUMMARY.json` + per-lever `COMPARE` /
+`DECISION` JSON.

@@ -106,10 +106,9 @@ Shadow can run a seeded mutation sequence against the logged-in cluster and,
 when `shadow_peer_*` is set, against a second implementation side-by-side.
 Findings and mutate corpus land under `shadow_root` (`mutations.jsonl`).
 
-On the azure build host a Python SAIO already listens on `127.0.0.1:8081` (same
-`test:tester` / cluster key). Point `shadow_peer_base` there for dual-mode
-对照. A Rust SAIO on `:8090` is available for same-topology A/B if you swap the
-peer URL.
+On Contabo swift1, Python SAIO listens on `127.0.0.1:8090` and Rust SAIO on
+`127.0.0.1:8081` (same `test:tester` / cluster key). Point `shadow_peer_base`
+at the peer you want for dual-mode 对照.
 
 ## Lab: Expired-but-Alive Observatory
 

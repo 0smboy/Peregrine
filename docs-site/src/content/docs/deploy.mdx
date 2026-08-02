@@ -81,9 +81,8 @@ curl -s -o /dev/null -w '%{http_code}\n' http://<node>:8080/healthcheck   # 200
 </Step>
 </Steps>
 
-<Aside type="tip" title="Behind a cloud load balancer">
-If a cloud Internal LB fronts the proxies, note its **hairpin limitation**: a
-backend-pool node cannot reach the LB VIP and have the flow hashed back to
-itself. Run client tools on the nodes against a specific HAProxy address, and
-reserve the VIP for clients outside the backend pool.
+<Aside type="tip" title="Contabo VIP">
+The lab fronts proxies with Keepalived VIP `10.0.0.10:8085` (HAProxy on each
+node). Prefer that VIP for clients and gates; per-node `10.0.0.N:8085` is the
+local HAProxy. See [Lab cluster](/lab-cluster).
 </Aside>

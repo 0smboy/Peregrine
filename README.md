@@ -70,7 +70,7 @@ golden fixtures that `swift-rust` is checked against.
 
 See [`docs/architecture.md`](docs/architecture.md) for the full picture,
 [`docs/testing.md`](docs/testing.md) for the verification strategy, and
-[`docs/lab-cluster.md`](docs/lab-cluster.md) for the four-node Azure lab layout
+[`docs/lab-cluster.md`](docs/lab-cluster.md) for the four-node Contabo lab layout
 and cutover rules.
 
 ---

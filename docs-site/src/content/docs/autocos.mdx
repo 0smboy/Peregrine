@@ -28,10 +28,10 @@ A task name is `<size>_<op>_<workers>` — `4KB_read_128`, `1MB_write_32`,
 set:
 
 ```sh
-export ST_AUTH=http://10.42.30.11:8085/auth/v1.0
+export ST_AUTH=http://10.0.0.10:8085/auth/v1.0
 export ST_USER=test:tester
 export ST_KEY=<tempauth-key>
-export ST_ENDPOINT=http://10.42.30.11:8085/v1/AUTH_test   # pin storage; skip the LB hairpin
+export ST_ENDPOINT=http://10.0.0.10:8085/v1/AUTH_test   # pin storage URL
 autocos run 64KB_write_64 --object-count 400 --container-count 4 --runtime 25
 autocos list
 autocos collect
@@ -39,8 +39,8 @@ autocos collect
 
 <Aside type="note" title="ST_ENDPOINT">
 `ST_ENDPOINT` pins the storage base to a specific address instead of following
-the storage URL auth returns. It was added so a benchmark run from inside a
-cloud load-balancer backend pool can bypass the Internal-LB hairpin limitation.
+the storage URL auth returns. On Contabo prefer the Keepalived VIP
+`10.0.0.10:8085` (or a node HAProxy `10.0.0.N:8085`).
 </Aside>
 
 ## Backends
