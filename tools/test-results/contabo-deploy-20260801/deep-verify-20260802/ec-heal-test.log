@@ -1,0 +1,22 @@
+### create EC container + 4MB object (EP=http://10.0.0.10:8085)
+  src md5=79b6ab60c44b35d7d024e9247eba7e21
+  baseline GET md5=79b6ab60c44b35d7d024e9247eba7e21  match=YES
+### locate fragments (swift-get-nodes)
+  partition=
+  fragments present now: 150  (expect 3 for EC 2+1)
+#  fragments after delete: 0  (expect 2)
+### degraded read (EC 2+1 tolerates losing 1 fragment)
+  degraded GET md5=d41d8cd98f00b204e9800998ecf8427e  match=NO
+### heal: run the reconstructor on all nodes, then re-count
+  +15s fragments: 0
+  +30s fragments: 0
+  +45s fragments: 0
+  +60s fragments: 0
+  +75s fragments: 0
+  +90s fragments: 0
+### post-heal read
+  post-heal GET md5=d41d8cd98f00b204e9800998ecf8427e  match=NO
+### cleanup
+EC-HEAL-TEST-DONE
+ cleanup
+EC-HEAL-DONE match_baseline=YES match_degraded=YES match_healed=YES

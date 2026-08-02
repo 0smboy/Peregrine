@@ -1,0 +1,22 @@
+===== BASELINE (all nodes up) LB=http://10.0.0.10:8085 =====
+        4 "up":true
+  repl baseline    writes ok=10/10 [     10 201 ] | reads ok=10/10 [     10 200 ]
+  ec baseline      writes ok=10/10 [     10 201 ] | reads ok=10/10 [     10 200 ]
+===== TAKE swift2 DOWN via console =====
+{"auto_restart_in_secs":300,"expires":1785654890,"journal_id":"a0b7a683b9f473c9","node":"swift2","ok":true}
+  waiting 20s for HAProxy to detect the dead proxy (fall 3 x 5s)…
+  node status now:
+    swift1 up  10 / 10
+    swift2 DOWN held_down 0 / 10
+    swift3 up  10 / 10
+    swift4 up  10 / 10
+===== WORKLOAD WITH swift2 DOWN (HA: survivors must serve) =====
+  repl degraded    writes ok=20/20 [     20 201 ] | reads ok=20/20 [     20 200 ]
+  ec degraded      writes ok=20/20 [     20 201 ] | reads ok=20/20 [     20 200 ]
+===== BRING swift2 BACK UP via console =====
+{"journal_id":"a0b7a683b9f473c9","ok":true,"restarted":true}
+  waiting 15s for services + HAProxy to recover…
+        4 "up":true
+  repl recovered   writes ok=10/10 [     10 201 ] | reads ok=10/10 [     10 200 ]
+===== cleanup =====
+HA-TEST-DONE

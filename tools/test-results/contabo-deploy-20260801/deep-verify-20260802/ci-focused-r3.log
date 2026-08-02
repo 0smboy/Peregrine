@@ -1,0 +1,91 @@
+########## R3 START 2026-08-02T07:29:04Z ##########
+=== fmt exit=0 ===
+    Checking swift-cli v0.1.0 (/root/work/swift-rust/crates/swift-cli)
+    Checking swift-object-server v0.1.0 (/root/work/swift-rust/crates/swift-object-server)
+    Checking swift-diskfile v0.1.0 (/root/work/swift-rust/crates/swift-diskfile)
+    Checking swift-db v0.1.0 (/root/work/swift-rust/crates/swift-db)
+    Checking swift-proxy-server v0.1.0 (/root/work/swift-rust/crates/swift-proxy-server)
+    Checking swift-account-server v0.1.0 (/root/work/swift-rust/crates/swift-account-server)
+    Checking swift-middleware v0.1.0 (/root/work/swift-rust/crates/swift-middleware)
+    Checking swift-ring v0.1.0 (/root/work/swift-rust/crates/swift-ring)
+    Checking swift-s3api v0.1.0 (/root/work/swift-rust/crates/swift-s3api)
+    Checking swift-http v0.1.0 (/root/work/swift-rust/crates/swift-http)
+    Checking swift-core v0.1.0 (/root/work/swift-rust/crates/swift-core)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.87s
+=== clippy_noec exit=0 ===
+    Checking swift-object-server v0.1.0 (/root/work/swift-rust/crates/swift-object-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.44s
+=== clippy_ec exit=0 ===
+   Doc-tests swift_middleware
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_object_server
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_proxy_server
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_ring
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_s3api
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+=== test_noec exit=0 ===
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/ec_integration.rs (target/release/deps/ec_integration-421526afee3afb83)
+
+running 1 test
+test test_ec_object_put_get_round_trip_and_fragment_loss ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+
+     Running tests/integration.rs (target/release/deps/integration-cd285918c78c52f4)
+
+running 7 tests
+test test_pipeline_healthcheck_gatekeeper_transid ... ok
+test test_get_unreachable_primaries_and_empty_handoff_is_503 ... ok
+test test_get_stale_handoff_data_loses_to_newer_tombstones ... ok
+test test_post_mixed_results_falls_back_to_handoff ... ok
+test test_proxy_end_to_end_account_and_container ... ok
+test test_proxy_object_round_trip ... ok
+test test_tempauth_end_to_end ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+
+   Doc-tests swift_ec
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_object_server
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_proxy_server
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+=== test_ec exit=0 ===
+########## R3 DONE 2026-08-02T07:29:31Z ##########

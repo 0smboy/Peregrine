@@ -1,0 +1,6 @@
+/files/api/whoami -> 200
+/files/api/buckets -> 200
+/lab/api/node/status -> 200
+/monitor/api/dash -> 200
+/test/api/runs -> 200
+/deploy/ -> 200

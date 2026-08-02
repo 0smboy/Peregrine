@@ -1,0 +1,5 @@
+login=303
+/api/health -> 404
+/lab/api/node/status -> 200
+/deploy/api/status -> 404
+/monitor/api/targets -> 404

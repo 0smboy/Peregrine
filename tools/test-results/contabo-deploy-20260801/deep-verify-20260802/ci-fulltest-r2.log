@@ -1,0 +1,1664 @@
+
+########## CI START 2026-08-02T07:09:32Z  commit-marker=fe56fb8-wip ##########
+
+########## TOOLCHAIN ##########
+cargo 1.97.0 (c980f4866 2026-06-30)
+rustc 1.97.0 (2d8144b78 2026-07-07)
+4
+               total        used        free      shared  buff/cache   available
+Mem:           7.5Gi       4.1Gi       1.5Gi       4.0Mi       2.5Gi       3.4Gi
+
+########## PHASE 1: release build (all crates, EC feature) ##########
++ cargo build --release --features swift-proxy-server/ec,swift-object-server/ec
+   Compiling swift-core v0.1.0 (/root/work/swift-rust/crates/swift-core)
+   Compiling swift-ec v0.1.0 (/root/work/swift-rust/crates/swift-ec)
+   Compiling swift-memcache v0.1.0 (/root/work/swift-rust/crates/swift-memcache)
+   Compiling swift-crypto v0.1.0 (/root/work/swift-rust/crates/swift-crypto)
+   Compiling swift-http v0.1.0 (/root/work/swift-rust/crates/swift-http)
+   Compiling swift-ring v0.1.0 (/root/work/swift-rust/crates/swift-ring)
+   Compiling swift-diskfile v0.1.0 (/root/work/swift-rust/crates/swift-diskfile)
+   Compiling swift-db v0.1.0 (/root/work/swift-rust/crates/swift-db)
+   Compiling swift-cli v0.1.0 (/root/work/swift-rust/crates/swift-cli)
+   Compiling swift-object-server v0.1.0 (/root/work/swift-rust/crates/swift-object-server)
+   Compiling swift-container-server v0.1.0 (/root/work/swift-rust/crates/swift-container-server)
+   Compiling swift-middleware v0.1.0 (/root/work/swift-rust/crates/swift-middleware)
+   Compiling swift-account-server v0.1.0 (/root/work/swift-rust/crates/swift-account-server)
+   Compiling swift-proxy-server v0.1.0 (/root/work/swift-rust/crates/swift-proxy-server)
+   Compiling swift-s3api v0.1.0 (/root/work/swift-rust/crates/swift-s3api)
+    Finished `release` profile [optimized] target(s) in 40.52s
+=== exit=0 (cargo ...) ===
+
+########## PHASE 2: fmt check ##########
++ cargo fmt --all -- --check
+=== exit=0 (cargo ...) ===
+
+########## PHASE 3: clippy (workspace, no EC) -D warnings ##########
++ cargo clippy --workspace --exclude swift-ec --all-targets -- -D warnings
+    Checking swift-core v0.1.0 (/root/work/swift-rust/crates/swift-core)
+    Checking swift-crypto v0.1.0 (/root/work/swift-rust/crates/swift-crypto)
+    Checking swift-memcache v0.1.0 (/root/work/swift-rust/crates/swift-memcache)
+    Checking swift-http v0.1.0 (/root/work/swift-rust/crates/swift-http)
+    Checking swift-ring v0.1.0 (/root/work/swift-rust/crates/swift-ring)
+    Checking swift-diskfile v0.1.0 (/root/work/swift-rust/crates/swift-diskfile)
+    Checking swift-middleware v0.1.0 (/root/work/swift-rust/crates/swift-middleware)
+    Checking swift-db v0.1.0 (/root/work/swift-rust/crates/swift-db)
+    Checking swift-object-server v0.1.0 (/root/work/swift-rust/crates/swift-object-server)
+    Checking swift-proxy-server v0.1.0 (/root/work/swift-rust/crates/swift-proxy-server)
+    Checking swift-cli v0.1.0 (/root/work/swift-rust/crates/swift-cli)
+    Checking swift-container-server v0.1.0 (/root/work/swift-rust/crates/swift-container-server)
+    Checking swift-account-server v0.1.0 (/root/work/swift-rust/crates/swift-account-server)
+error: field assignment outside of initializer for an instance created with Default::default()
+   --> crates/swift-object-server/src/main.rs:130:13
+    |
+130 | /             df.fsync_on_close = matches!(
+131 | |                 get("fsync_on_close", "true").to_lowercase().as_str(),
+132 | |                 "true" | "1" | "yes" | "on" | "t" | "y"
+133 | |             );
+    | |______________^
+    |
+note: consider initializing the variable with `swift_diskfile::DiskFileConfig { fsync_on_close: matches!(
+                      get("fsync_on_close", "true").to_lowercase().as_str(),
+                      "true" | "1" | "yes" | "on" | "t" | "y"
+                  ), ..Default::default() }` and removing relevant reassignments
+   --> crates/swift-object-server/src/main.rs:128:13
+    |
+128 |             let mut df = DiskFileConfig::default();
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#field_reassign_with_default
+    = note: `-D clippy::field-reassign-with-default` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::field_reassign_with_default)]`
+
+error: could not compile `swift-object-server` (bin "swift-object-server" test) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+=== exit=101 (cargo ...) ===
+
+########## PHASE 4: clippy (EC crates) -D warnings ##########
++ cargo clippy -p swift-proxy-server -p swift-object-server -p swift-ec --features swift-proxy-server/ec,swift-object-server/ec --all-targets -- -D warnings
+   Compiling swift-ec v0.1.0 (/root/work/swift-rust/crates/swift-ec)
+    Checking swift-object-server v0.1.0 (/root/work/swift-rust/crates/swift-object-server)
+    Checking swift-proxy-server v0.1.0 (/root/work/swift-rust/crates/swift-proxy-server)
+error: field assignment outside of initializer for an instance created with Default::default()
+   --> crates/swift-object-server/src/main.rs:130:13
+    |
+130 | /             df.fsync_on_close = matches!(
+131 | |                 get("fsync_on_close", "true").to_lowercase().as_str(),
+132 | |                 "true" | "1" | "yes" | "on" | "t" | "y"
+133 | |             );
+    | |______________^
+    |
+note: consider initializing the variable with `swift_diskfile::DiskFileConfig { fsync_on_close: matches!(
+                      get("fsync_on_close", "true").to_lowercase().as_str(),
+                      "true" | "1" | "yes" | "on" | "t" | "y"
+                  ), ..Default::default() }` and removing relevant reassignments
+   --> crates/swift-object-server/src/main.rs:128:13
+    |
+128 |             let mut df = DiskFileConfig::default();
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#field_reassign_with_default
+    = note: `-D clippy::field-reassign-with-default` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::field_reassign_with_default)]`
+
+error: could not compile `swift-object-server` (bin "swift-object-server" test) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+=== exit=101 (cargo ...) ===
+
+########## PHASE 5: workspace tests (no EC) ##########
++ cargo test --release --workspace --exclude swift-ec
+   Compiling swift-proxy-server v0.1.0 (/root/work/swift-rust/crates/swift-proxy-server)
+   Compiling swift-object-server v0.1.0 (/root/work/swift-rust/crates/swift-object-server)
+   Compiling swift-crypto v0.1.0 (/root/work/swift-rust/crates/swift-crypto)
+   Compiling swift-cli v0.1.0 (/root/work/swift-rust/crates/swift-cli)
+   Compiling swift-container-server v0.1.0 (/root/work/swift-rust/crates/swift-container-server)
+   Compiling swift-diskfile v0.1.0 (/root/work/swift-rust/crates/swift-diskfile)
+   Compiling swift-account-server v0.1.0 (/root/work/swift-rust/crates/swift-account-server)
+   Compiling swift-db v0.1.0 (/root/work/swift-rust/crates/swift-db)
+   Compiling swift-middleware v0.1.0 (/root/work/swift-rust/crates/swift-middleware)
+   Compiling swift-ring v0.1.0 (/root/work/swift-rust/crates/swift-ring)
+   Compiling swift-s3api v0.1.0 (/root/work/swift-rust/crates/swift-s3api)
+   Compiling swift-http v0.1.0 (/root/work/swift-rust/crates/swift-http)
+   Compiling swift-core v0.1.0 (/root/work/swift-rust/crates/swift-core)
+   Compiling swift-memcache v0.1.0 (/root/work/swift-rust/crates/swift-memcache)
+    Finished `release` profile [optimized] target(s) in 1m 23s
+     Running unittests src/lib.rs (target/release/deps/swift_account_server-78552a5b8cf2823d)
+
+running 4 tests
+test reaper::tests::test_is_reapable ... ok
+test reaper::tests::test_reap_container_keeps_container_if_object_fails ... ok
+test reaper::tests::test_reap_container_deletes_objects_then_container ... ok
+test reaper::tests::test_reap_account_end_to_end ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src/main.rs (target/release/deps/swift_account_server-a1b68f926ba26733)
+
+running 1 test
+test startup_policy_tests::invalid_storage_policy_is_not_silently_replaced_with_policy_zero ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/golden.rs (target/release/deps/golden-24700d3754ee3875)
+
+running 1 test
+test test_account_server_matches_python_oracle ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running unittests src/lib.rs (target/release/deps/swift_cli-3a3aa5bdfe17d5ef)
+
+running 28 tests
+test daemon::tests::sleep_unless_stopped_returns_immediately_when_flag_is_set ... ok
+test daemon::tests::statsd_prefix_prepends_only_when_configured ... ok
+test daemon::tests::sleep_unless_stopped_completes_a_zero_interval_without_stop ... ok
+test daemon::tests::db_replicator_recon_update_dumps_python_recon_keys ... ok
+test dispersion::tests::test_well_dispersed_no_overlaps ... ok
+test dispersion::tests::test_region_overlap_detected ... ok
+test drive_audit::tests::test_accumulates_and_limit ... ok
+test drive_audit::tests::test_device_before_error ... ok
+test drive_audit::tests::test_error_before_device ... ok
+test drive_audit::tests::test_no_error_word_ignored ... ok
+test dispersion::tests::test_zone_overlap_detected ... ok
+test drive_audit::tests::test_is_device_token ... ok
+test recon::tests::test_md5_hash_for_file ... ok
+test recon::tests::test_async_pending_count ... ok
+test recon::tests::test_aggregate_recon ... ok
+test ringsim::tests::identical_assignments_move_nothing ... ok
+test ringsim::tests::row_permutation_is_not_movement ... ok
+test recon::tests::test_quarantine_counts ... ok
+test ringsim::tests::one_replica_replaced_counts_once ... ok
+test ringsim::tests::selector_matches_by_ip_and_errors_when_empty ... ok
+test ringsim::tests::survival_counts_degraded_and_lost ... ok
+test ringsim::tests::tolerance_counts_only_what_is_still_standing ... ok
+test ringsim::tests::tier_loads_flags_imbalance ... ok
+test ringsim::tests::tolerance_never_claims_headroom_on_a_dead_ring ... ok
+test ringsim::tests::tolerance_one_zone_per_node_survives_one_loss ... ok
+test ringsim::tests::whole_partition_relocation_is_flagged ... ok
+test ringsim::tests::tolerance_respects_min_readable ... ok
+test info::tests::test_container_info_renders ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/bin/account_info.rs (target/release/deps/swift_account_info-8efc2ea6ebb3e53e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/container_info.rs (target/release/deps/swift_container_info-cbadebed928456d8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/db_auditor.rs (target/release/deps/swift_db_auditor-a8ee6ca8532f1394)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/db_replicator.rs (target/release/deps/swift_db_replicator-3307b20aca24128b)
+
+running 2 tests
+test tests::test_rsync_dest_local_stages_into_peer_tmp ... ok
+test tests::test_rsync_dest_ssh_stages_into_remote_tmp ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/drive_audit.rs (target/release/deps/swift_drive_audit-1edde663ee3e6309)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/get_nodes.rs (target/release/deps/swift_get_nodes-ed2f29338c8fd978)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/manage_shard_ranges.rs (target/release/deps/swift_manage_shard_ranges-6aa5d4802933343b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/object_auditor.rs (target/release/deps/swift_object_auditor-21b55415e9b5d3c7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/object_info.rs (target/release/deps/swift_object_info-e0533cf1d853e7cd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/recon.rs (target/release/deps/swift_recon-9a35b2f71a194906)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/ring_builder.rs (target/release/deps/swift_ring_builder-8e26bff9b139fb52)
+
+running 1 test
+test tests::parse_plain_and_replication_specs ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/ring_info.rs (target/release/deps/swift_ring_info-7d249284b57bc58d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/ring_sim.rs (target/release/deps/swift_ring_sim-3e7120bee10047d1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/golden.rs (target/release/deps/golden-188fe53a5d83b720)
+
+running 2 tests
+test test_get_nodes_matches_ring_expectations ... ok
+test test_get_nodes_partition_and_handoffs ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/release/deps/swift_container_server-73333b67b4ad9f37)
+
+running 17 tests
+test reconciler::tests::test_container_name_hour_bucket ... ok
+test reconciler::tests::test_reconcile_already_correct_just_pops ... ok
+test reconciler::tests::test_reconcile_failed_move_keeps_entry ... ok
+test reconciler::tests::test_reconcile_moves_then_pops ... ok
+test reconciler::tests::test_content_type_roundtrip ... ok
+test reconciler::tests::test_reconciler_obj_name_and_parse ... ok
+test reconciler::tests::test_decide_move_vs_correct ... ok
+test sync::tests::test_get_sig_deterministic ... ok
+test sync::tests::test_row_action ... ok
+test sync::tests::test_sync_auth_header ... ok
+test sync::tests::test_sync_rows_advances_point ... ok
+test sync::tests::test_sync_rows_stops_on_failure ... ok
+test updater::tests::test_needs_report_detects_change ... ok
+test updater::tests::test_report_failure_not_stamped ... ok
+test updater::tests::test_report_majority_stamps_reported ... ok
+test sharder::tests::test_find_create_and_cleave ... ok
+test sharder::tests::test_cleave_is_batched ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running unittests src/main.rs (target/release/deps/swift_container_server-68c765bcb28fa275)
+
+running 1 test
+test startup_policy_tests::invalid_storage_policy_is_not_silently_replaced_with_policy_zero ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/container_updater.rs (target/release/deps/swift_container_updater-d789cb86ff67c018)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/golden.rs (target/release/deps/golden-e250f61f6e047825)
+
+running 4 tests
+test test_container_put_updates_account_server ... ok
+test test_replicate_rpc_matches_python ... ok
+test test_container_server_matches_python_oracle ... ok
+test test_usync_push_replication_between_two_servers ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/replication.rs (target/release/deps/replication-deab954c8d83c2c2)
+
+running 1 test
+test test_replicate_container_db_converges ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/rsync_ops.rs (target/release/deps/rsync_ops-1c5903f2624c10c4)
+
+running 2 tests
+test test_complete_rsync_adopts_staged_db ... ok
+test test_rsync_then_merge_merges_existing_into_staged ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/sharding.rs (target/release/deps/sharding-28db1767c93e2f9e)
+
+running 1 test
+test test_shard_put_get_and_redirect ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/release/deps/swift_core-c58ae13360341f53)
+
+running 91 tests
+test config::tests::test_affinity_key_function ... ok
+test config::tests::test_affinity_locality_predicate ... ok
+test config::tests::test_colon_delimiter_and_constructor_defaults ... ok
+test config::tests::test_fallocate_value ... ok
+test config::tests::test_list_from_csv ... ok
+test config::tests::test_multiline_and_interpolation ... ok
+test config::tests::test_multiline_value_comment_and_blank ... ok
+test config::tests::test_items_order_and_merge ... ok
+test config::tests::test_config_true_value ... ok
+test config::tests::test_numeric_coercions ... ok
+test config::tests::test_parse_errors ... ok
+test config::tests::test_parse_sections_and_defaults ... ok
+test constraints::tests::test_check_float ... ok
+test config::tests::test_request_node_count ... ok
+test constraints::tests::test_check_name_format ... ok
+test constraints::tests::test_check_utf8 ... ok
+test constraints::tests::test_check_drive ... ok
+test constraints::tests::test_check_metadata ... ok
+test constraints::tests::test_defaults ... ok
+test constraints::tests::test_from_swift_conf_overrides ... ok
+test constraints::tests::test_valid_drive_name ... ok
+test daemon::tests::sleep_reports_a_clean_interval ... ok
+test daemon::tests::statsd_prefix_matches_python_get_logger ... ok
+test fsutil::tests::interior_nul_is_invalid_input ... ok
+test daemon::tests::dump_recon_merges_rather_than_replaces ... ok
+test daemon::tests::sleep_returns_immediately_when_already_stopped ... ok
+test fsutil::tests::temp_dir_reports_free_space ... ok
+test fsutil::tests::missing_path_is_an_error ... ok
+test hashing::tests::test_hash_path ... ok
+test hashing::tests::test_hash_path_matches_python ... ok
+test hashing::tests::test_validation ... ok
+test lockutil::tests::test_lock_file_survives_release ... ok
+test obslog::tests::civil_from_days_handles_pre_epoch_days ... ok
+test obslog::tests::from_str_is_case_insensitive_and_defaults_to_info ... ok
+test obslog::tests::level_filter_gates_each_method ... ok
+test obslog::tests::month_abbreviation_table_covers_all_twelve_months ... ok
+test obslog::tests::pri_is_local0_times_eight_plus_severity ... ok
+test obslog::tests::syslog_datagrams_carry_pri_tag_pid_and_level ... ok
+test obslog::tests::timestamps_match_known_utc_instants ... ok
+test otlp::tests::empty_endpoint_disables_the_exporter ... ok
+test lockutil::tests::test_name_variant_uses_a_distinct_file ... ok
+test otlp::tests::otlp_json_encoding_matches_the_wire_format ... ok
+test otlp::tests::random_ids_are_distinct_and_nonzero ... ok
+test lockutil::tests::test_second_holder_blocks_until_first_drops ... ok
+test otlp::tests::sampling_ratio_bounds_and_determinism ... ok
+test lockutil::tests::test_times_out_while_held ... ok
+test pickle::tests::test_dumps_matches_python_protocol2 ... ok
+test pickle::tests::test_forbidden_global ... ok
+test pickle::tests::test_ints ... ok
+test pickle::tests::test_py2_short_binstring ... ok
+test pickle::tests::test_round_trips ... ok
+test pickle::tests::test_surrogate_escape_bytes ... ok
+test recon::tests::corrupt_cache_files_are_recreated ... ok
+test recon::tests::creates_the_cache_file_and_parent_directories ... ok
+test recon::tests::merges_updates_into_the_existing_entry ... ok
+test recon::tests::non_object_updates_are_rejected ... ok
+test recon::tests::null_and_empty_object_values_delete_keys ... ok
+test recon::tests::object_values_merge_one_level_deep ... ok
+test recon::tests::output_is_a_single_sorted_json_line ... ok
+test stage::tests::observe_accumulates ... ok
+test statsd::tests::empty_host_disables_the_client ... ok
+test statsd::tests::datagram_lines_match_the_statsd_wire_format ... ok
+test statsd::tests::empty_prefix_omits_the_leading_dot ... ok
+test storage_policy::tests::test_alias_management ... ok
+test storage_policy::tests::test_collection_validation_errors ... ok
+test storage_policy::tests::test_defaults_when_no_policies_defined ... ok
+test storage_policy::tests::test_ec_duplication_and_flat_xor_quorum ... ok
+test storage_policy::tests::test_ec_policy ... ok
+test storage_policy::tests::test_ec_validation_errors ... ok
+test storage_policy::tests::test_get_by_name_or_index ... ok
+test storage_policy::tests::test_lenient_duplicate_sections ... ok
+test storage_policy::tests::test_parse_multiple_policies ... ok
+test storage_policy::tests::test_policy_strings ... ok
+test storage_policy::tests::test_quorum_size ... ok
+test timestamp::tests::test_bounds ... ok
+test timestamp::tests::test_ceil ... ok
+test timestamp::tests::test_delta ... ok
+test timestamp::tests::test_encode_decode_timestamps ... ok
+test timestamp::tests::test_internal_format_with_offset ... ok
+test timestamp::tests::test_invert ... ok
+test timestamp::tests::test_isoformat ... ok
+test timestamp::tests::test_normal_format ... ok
+test timestamp::tests::test_normalize_delete_at_timestamp ... ok
+test timestamp::tests::test_ordering ... ok
+test timestamp::tests::test_normalize_timestamp ... ok
+test timestamp::tests::test_parse ... ok
+test timestamp::tests::test_python_golden_vectors ... ok
+test timestamp::tests::test_truthiness ... ok
+test timestamp::tests::test_parse_with ... ok
+test otlp::tests::exporter_posts_spans_to_the_collector ... ok
+test otlp::tests::ratio_zero_never_contacts_the_collector ... ok
+
+test result: ok. 91 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.61s
+
+     Running unittests src/lib.rs (target/release/deps/swift_crypto-ed9ecacd02d2754f)
+
+running 21 tests
+test crypto::tests::body_round_trip_streaming_chunks ... ok
+test crypto::tests::key_and_iv_length_validation ... ok
+test crypto::tests::metadata_empty_value_rejected ... ok
+test crypto::tests::base64_uses_standard_padded_alphabet ... ok
+test crypto::tests::metadata_value_known_answer ... ok
+test crypto::tests::metadata_value_round_trip ... ok
+test crypto::tests::nist_ctr_aes256_known_answer ... ok
+test crypto::tests::offset_ranged_decrypt_matches_whole ... ok
+test crypto::tests::offset_adjusted_iv_matches_python ... ok
+test crypto::tests::wrap_key_is_ctr_encrypt ... ok
+test crypto::tests::wrap_unwrap_round_trip ... ok
+test crypto_meta::tests::test_append_extract ... ok
+test crypto_meta::tests::test_json_dumps_sorted_matches_python ... ok
+test crypto_meta::tests::test_dump_load_roundtrip ... ok
+test keymaster::tests::container_and_object_key_paths ... ok
+test crypto_meta::tests::test_quote_plus_roundtrip ... ok
+test keymaster::tests::create_key_utf8_object_name ... ok
+test keymaster::tests::rfc4231_hmac_sha256_known_answer ... ok
+test keymaster::tests::create_key_known_answers ... ok
+test crypto::tests::python_derived_body_known_answer ... ok
+test keymaster::tests::derivation_is_deterministic_and_path_dependent ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/xcheck.rs (target/release/deps/xcheck-341b2a10ef8d292f)
+
+running 1 test
+test xcheck_python_crypto ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/release/deps/swift_db-cde1d3dcf5911d64)
+
+running 39 tests
+test account::tests::test_zero_like ... ok
+test broker::tests::test_py_float_repr ... ok
+test broker::tests::test_py_json_round_trip ... ok
+test container::tests::test_db_filename_helpers ... ok
+test container::tests::test_extract_swift_bytes ... ok
+test auditor::tests::test_container_db_audit ... ok
+test container::tests::test_find_shard_ranges_too_small ... ok
+test container::tests::test_find_shard_ranges_pivots ... ok
+test container::tests::test_merge_and_get_shard_ranges ... ok
+test container::tests::test_own_shard_range_default_when_absent ... ok
+test account::tests::test_newid_changes_id_and_records_sync_point ... ok
+test container::tests::test_shard_name_matches_python ... ok
+test container::tests::test_update_new_item_fresh ... ok
+test repl_loop::tests::test_repl_peers_handoff_returns_all ... ok
+test container::tests::test_newid_empty_table_records_minus_one ... ok
+test repl_loop::tests::test_repl_peers_rotation ... ok
+test repl_loop::tests::test_run_once_pushes_to_peers ... ok
+test repl_loop::tests::test_run_once_failure_when_peer_fails ... ok
+test replicator::tests::test_rsync_db_stages_under_local_id_then_completes ... ok
+test replicator::tests::test_rsync_failure_skips_complete ... ok
+test replicator::tests::test_sync_response_metadata_merged_into_local ... ok
+test shard::tests::test_includes ... ok
+test shard::tests::test_merge_higher_state_on_state_ts_tie_is_new ... ok
+test shard::tests::test_merge_newer_timestamp_wins ... ok
+test shard::tests::test_merge_no_existing_adds ... ok
+test shard::tests::test_merge_older_timestamp_loses ... ok
+test shard::tests::test_merge_same_ts_preserves_bounds_takes_newer_meta ... ok
+test container::tests::test_newid_changes_id_and_records_sync_point ... ok
+test shard::tests::test_sift_supersedes ... ok
+test util::tests::test_base64_round_trip ... ok
+test util::tests::test_chexor ... ok
+test shard::tests::test_sort_key_empty_upper_last ... ok
+test util::tests::test_count_missing_levels ... ok
+test util::tests::test_is_corruption_error ... ok
+test util::tests::test_quarantine_db_moves_hash_dir ... ok
+test util::tests::test_renamer_creates_parents_and_replaces ... ok
+test util::tests::test_initialize_database_creates_ancestors ... ok
+test container::tests::test_sharding_state_machine ... ok
+test replicator::tests::test_remote_merge_heuristic_sets_usync_incomplete ... ok
+
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/golden.rs (target/release/deps/golden-a21b2d9d3292b10c)
+
+running 14 tests
+test test_account_metadata_reclaim_delete_match_python ... ok
+test test_account_pending_and_merge_match_python ... ok
+test test_account_merge_semantics_match_python ... ok
+test test_account_schema_matches_python ... ok
+test test_account_reads_python_created_database ... ok
+test test_account_listings_match_python ... ok
+test test_batch_duplicates_match_python ... ok
+test test_container_listings_match_python ... ok
+test test_pending_file_and_merge_match_python ... ok
+test test_reads_python_created_database ... ok
+test test_ctype_meta_merge_matches_python ... ok
+test test_overwrite_and_delete_matches_python ... ok
+test test_schema_matches_python ... ok
+test test_container_metadata_reclaim_delete_match_python ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running unittests src/lib.rs (target/release/deps/swift_diskfile-b8dab28dbe7ec079)
+
+running 20 tests
+test hashes::tests::test_semantic_eq_numeric ... ok
+test hashes::tests::test_read_missing_is_invalid ... ok
+test layout::tests::test_dirs ... ok
+test layout::tests::test_extract_policy_index ... ok
+test layout::tests::test_makedirs_count ... ok
+test layout::tests::test_renamer_creates_deep_destination ... ok
+test layout::tests::test_storage_directory ... ok
+test hashes::tests::test_invalidate_consolidate_cycle ... ok
+test layout::tests::test_valid_suffix ... ok
+test metadata::tests::test_missing_file ... ok
+test metadata::tests::test_pickle_round_trip ... ok
+test naming::tests::test_ec_frag_upper_bound ... ok
+test naming::tests::test_make_filenames ... ok
+test naming::tests::test_python_int ... ok
+test naming::tests::test_splitext ... ok
+test relinker::tests::test_partition_for_hash ... ok
+test metadata::tests::test_xattr_round_trip ... ok
+test layout::tests::test_renamer_retries_after_concurrent_rmdir ... ok
+test relinker::tests::test_relink_hard_links_to_new_partition ... ok
+test auditor::tests::test_audit_passes_good_and_quarantines_corrupt ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/ec_lifecycle.rs (target/release/deps/ec_lifecycle-ae77b04bdff168e5)
+
+running 1 test
+test test_ec_put_then_commit_becomes_durable_via_metadata_frag_index ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/golden.rs (target/release/deps/golden-cf2ef649b9d7f28c)
+
+running 9 tests
+test test_legacy_py2_pickles ... ok
+test test_hashes_pkl_read_matches_python ... ok
+test test_hashes_pkl_write_matches_python ... ok
+test test_ondisk_selection_matches_python ... ok
+test test_metadata_pickles_match_python ... ok
+test test_xattr_chunk_layout_matches_python ... ok
+test test_reader_verifies_etag_and_size ... ok
+test test_partition_hashing_matches_python ... ok
+test test_diskfile_lifecycle_matches_python ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running unittests src/lib.rs (target/release/deps/swift_http-6ebcc46bc35203d8)
+
+running 52 tests
+test body::tests::fn_reader_propagates_errors_once ... ok
+test body::tests::chain_reader_orders_parts ... ok
+test body::tests::buffered_basics ... ok
+test body::tests::into_reader_round_trip ... ok
+test body::tests::shared_bytes_reader_reads_all ... ok
+test body::tests::streamed_materialize_and_cap ... ok
+test conditional::tests::test_apply_replaces_body ... ok
+test conditional::tests::test_if_match_412 ... ok
+test body::tests::fn_reader_is_lazy_and_terminates ... ok
+test conditional::tests::test_if_none_match_304 ... ok
+test conditional::tests::test_if_unmodified_since_412 ... ok
+test headers::tests::test_case_insensitive_ops ... ok
+test headers::tests::test_title_case ... ok
+test dates::tests::test_round_trip ... ok
+test mime::tests::empty_document_bodies_parse ... ok
+test mime::tests::leading_blank_lines_are_skipped_and_bad_boundary_rejected ... ok
+test mime::tests::next_document_drains_an_unread_body ... ok
+test mime::tests::body_bytes_containing_boundary_prefixes_survive ... ok
+test mime::tests::parses_the_multiphase_put_shape ... ok
+test range::tests::test_content_range ... ok
+test range::tests::test_multipart_byteranges_matches_python ... ok
+test mime::tests::truncation_is_an_error_not_eof ... ok
+test range::tests::test_match ... ok
+test request::tests::test_split_path ... ok
+test request::tests::test_unquote_and_query ... ok
+test conditional::tests::test_if_modified_since ... ok
+test range::tests::test_normalize_etag ... ok
+test server::tests::body_at_limit_is_accepted ... ok
+test server::tests::access_log_reports_handler_panics_as_500 ... ok
+test server::tests::client_timeout_zero_disables_socket_timeouts ... ok
+test server::tests::defaults_are_finite_and_keep_swifts_object_size_limit ... ok
+test server::tests::access_log_sees_the_request_head_and_response_status ... ok
+test server::tests::expect_continue_is_withheld_when_the_handler_rejects_unread ... ok
+test server::tests::chunked_body_and_trailers_are_bounded_and_decoded ... ok
+test server::tests::expect_continue_is_sent_only_when_the_body_is_read ... ok
+test server::tests::handler_sees_a_streamed_body_with_declared_length ... ok
+test server::tests::conflicting_or_duplicate_body_framing_is_rejected ... ok
+test server::tests::head_streamed_body_is_dropped_unread ... ok
+test server::tests::install_sigterm_flag_flips_on_signal ... ok
+test server::tests::hijacked_connection_is_full_duplex_and_server_writes_nothing ... ok
+test server::tests::keep_alive_works_after_a_fully_consumed_streamed_body ... ok
+test server::tests::large_unconsumed_body_closes_the_connection ... ok
+test server::tests::multiphase_interim_responses_rearm_chunked_reading ... ok
+test server::tests::oversized_content_length_is_rejected_before_body_read ... ok
+test server::tests::response_header_newlines_are_not_serialized ... ok
+test server::tests::small_unconsumed_body_is_drained_for_keep_alive ... ok
+test server::tests::request_line_and_header_limits_are_enforced ... ok
+test server::tests::streamed_response_with_unknown_length_is_close_delimited ... ok
+test server::tests::streamed_response_with_known_length_gets_content_length ... ok
+test server::tests::unsupported_expectation_is_rejected_without_continue ... ok
+test server::tests::shutdown_flag_stops_the_accept_loop_after_draining ... ok
+test server::tests::head_deadline_defeats_slow_header_drip ... ok
+
+test result: ok. 52 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.02s
+
+     Running tests/golden.rs (target/release/deps/golden-3c14e2949056dcff)
+
+running 5 tests
+test test_match_semantics_match_swob ... ok
+test test_http_dates_match_python ... ok
+test test_range_semantics_match_swob ... ok
+test test_title_case_matches_python ... ok
+test test_server_round_trip ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/release/deps/swift_memcache-f1f50a3a7a801035)
+
+running 13 tests
+test conn::tests::parse_socket_string_variants ... ok
+test conn::tests::read_response_handles_crlf_in_value_data ... ok
+test conn::tests::read_response_frames_a_value ... ok
+test tests::all_servers_failing_surfaces_error_then_no_servers ... ok
+test tests::delete_removes_key ... ok
+test tests::incr_decr_create_and_step ... ok
+test tests::json_round_trip_sets_json_flag ... ok
+test tests::md5hash_matches_python ... ok
+test tests::expiry_is_sent_and_sanitized ... ok
+test tests::server_selection_partitions_keys_deterministically ... ok
+test conn::tests::read_response_frames_single_line ... ok
+test tests::error_limiting_skips_a_dead_server ... ok
+test tests::set_get_round_trip ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/release/deps/swift_middleware-974ce71268094c4a)
+
+running 320 tests
+test account_quotas::tests::test_container_put_ignored ... ok
+test account_quotas::tests::test_bad_path_passes_through ... ok
+test account_quotas::tests::test_bogus_quota_ignored ... ok
+test account_quotas::tests::test_account_response_exposes_sysmeta_quotas ... ok
+test account_quotas::tests::test_content_length_counts_against_bytes_quota ... ok
+test account_quotas::tests::test_exceed_bytes_quota ... ok
+test account_quotas::tests::test_exceed_bytes_quota_legacy_meta ... ok
+test account_quotas::tests::test_exceed_count_quota ... ok
+test account_quotas::tests::test_exceed_per_policy_bytes_quota ... ok
+test account_quotas::tests::test_exceed_per_policy_count_quota ... ok
+test account_quotas::tests::test_nonreseller_cannot_set_quota ... ok
+test account_quotas::tests::test_object_write_ignores_attempt_to_set_quota ... ok
+test account_quotas::tests::test_object_delete_allowed ... ok
+test account_quotas::tests::test_object_get_ignored ... ok
+test account_quotas::tests::test_no_quota_passes ... ok
+test account_quotas::tests::test_reseller_bypasses_quota ... ok
+test account_quotas::tests::test_reseller_can_set_quota ... ok
+test acl::tests::test_empty_acl_denies ... ok
+test acl::tests::test_hostname_extraction ... ok
+test acl::tests::test_parse_acl_v1 ... ok
+test acl::tests::test_referrer_exact_and_suffix ... ok
+test acl::tests::test_referrer_negation_last_wins ... ok
+test acl::tests::test_referrer_star_allows_any ... ok
+test account_quotas::tests::test_reseller_rejects_non_numeric_quota ... ok
+test backend_ratelimit::tests::test_aggregate_blocks_even_when_method_has_capacity ... ok
+test account_quotas::tests::test_under_quota_with_content_length ... ok
+test backend_ratelimit::tests::test_529_response_shape ... ok
+test backend_ratelimit::tests::test_handle_passes_through_when_allowed ... ok
+test backend_ratelimit::tests::test_handle_rejects_second_rapid_request ... ok
+test backend_ratelimit::tests::test_no_limits_configured_passes ... ok
+test backend_ratelimit::tests::test_method_is_part_of_the_key ... ok
+test backend_ratelimit::tests::test_non_integer_partition_passes ... ok
+test backend_ratelimit::tests::test_non_rate_limited_method_passes ... ok
+test backend_ratelimit::tests::test_python_int_ok ... ok
+test backend_ratelimit::tests::test_configured_reject_status ... ok
+test backend_ratelimit::tests::test_aggregate_device_limit_enforced ... ok
+test backend_ratelimit::tests::test_unparseable_or_incomplete_path_passes ... ok
+test backend_ratelimit::tests::test_validate_device_partition ... ok
+test bulk::tests::test_bulk_delete_errors_yield_400 ... ok
+test bulk::tests::test_bulk_delete_counts ... ok
+test bulk::tests::test_non_bulk_passes_through ... ok
+test bulk::tests::test_empty_body_is_invalid ... ok
+test catch_errors::tests::test_stamps_trans_id ... ok
+test backend_ratelimit::tests::test_rate_buffer_allows_a_burst ... ok
+test cname_lookup::tests::test_cname_matching_ending_not_domain ... ok
+test bulk::tests::test_parse_orders_objects_before_containers ... ok
+test cname_lookup::tests::test_empty_storage_domain_passes_through ... ok
+test cname_lookup::tests::test_good_lookup_preserves_port ... ok
+test cname_lookup::tests::test_good_lookup_rewrites_host ... ok
+test cname_lookup::tests::test_host_is_storage_domain_skips_resolver ... ok
+test cname_lookup::tests::test_location_rewrite_leaves_foreign_urls_alone ... ok
+test cname_lookup::tests::test_lookup_chain_bad_target ... ok
+test cname_lookup::tests::test_lookup_chain_too_long ... ok
+test cname_lookup::tests::test_multiple_storage_domains ... ok
+test cname_lookup::tests::test_missing_host_passes_through ... ok
+test cname_lookup::tests::test_redirect_rewrites_location ... ok
+test cname_lookup::tests::test_passthrough_already_in_storage_domain ... ok
+test cname_lookup::tests::test_resolution_to_storage_domain_exactly ... ok
+test cname_lookup::tests::test_storage_domains_conf_format ... ok
+test cname_lookup::tests::test_something_weird_none ... ok
+test container_quotas::tests::test_container_head_failure_passes_through ... ok
+test container_quotas::tests::test_bad_path_passes_through ... ok
+test container_quotas::tests::test_empty_quota_header_is_not_validated ... ok
+test container_quotas::tests::test_no_quota_set_passes ... ok
+test container_quotas::tests::test_non_digit_quota_meta_not_enforced ... ok
+test container_quotas::tests::test_object_get_makes_no_subrequest ... ok
+test container_quotas::tests::test_object_put_no_content_length_defaults_zero ... ok
+test container_quotas::tests::test_object_put_at_bytes_quota_boundary_passes ... ok
+test container_quotas::tests::test_object_put_over_bytes_quota_rejected ... ok
+test container_quotas::tests::test_object_put_under_bytes_quota_passes ... ok
+test container_quotas::tests::test_object_put_over_count_quota_rejected ... ok
+test container_quotas::tests::test_object_put_under_count_quota_passes ... ok
+test cname_lookup::tests::test_pass_ip_addresses ... ok
+test container_quotas::tests::test_set_invalid_bytes_quota_rejected ... ok
+test container_quotas::tests::test_set_valid_quota_passes ... ok
+test copy::tests::test_copy_method_uses_destination ... ok
+test copy::tests::test_fresh_metadata_drops_source_meta ... ok
+test container_quotas::tests::test_set_invalid_count_quota_rejected_on_post ... ok
+test copy::tests::test_missing_destination_is_412 ... ok
+test copy::tests::test_non_object_passes_through ... ok
+test copy::tests::test_source_404_propagates ... ok
+test copy::tests::test_put_x_copy_from_copies_body_and_metadata ... ok
+test crossdomain::tests::test_crossdomain ... ok
+test copy::tests::test_range_header_forwarded_to_source_get ... ok
+test dlo::tests::test_full_get_reassembles ... ok
+test dlo::tests::test_listing_error_relayed ... ok
+test dlo::tests::test_put_validation ... ok
+test dlo::tests::test_head_no_body ... ok
+test dlo::tests::test_non_manifest_passthrough ... ok
+test dlo::tests::test_range_middle ... ok
+test dlo::tests::test_range_from_start_of_second_segment ... ok
+test domain_remap::tests::test_account_container_with_path ... ok
+test domain_remap::tests::test_account_container ... ok
+test domain_remap::tests::test_account_container_with_path_obj_slash_v1 ... ok
+test domain_remap::tests::test_account_container_with_path_root_and_path ... ok
+test domain_remap::tests::test_account_container_with_path_trailing_slash ... ok
+test domain_remap::tests::test_account_container_with_root_path_obj_slash_v1 ... ok
+test domain_remap::tests::test_account_matching_ending_not_domain ... ok
+test domain_remap::tests::test_account_container_with_path_root_obj ... ok
+test domain_remap::tests::test_account_with_path_root_container ... ok
+test domain_remap::tests::test_account_with_path_root_unicode_container ... ok
+test domain_remap::tests::test_add_prefix ... ok
+test domain_remap::tests::test_configured_with_bad_prefixes ... ok
+test domain_remap::tests::test_configured_with_empty_storage_domain ... ok
+test domain_remap::tests::test_account ... ok
+test domain_remap::tests::test_add_prefix_already_there ... ok
+test domain_remap::tests::test_configured_with_prefixes ... ok
+test domain_remap::tests::test_extra_subdomains_is_bad_request ... ok
+test domain_remap::tests::test_configured_with_no_prefixes ... ok
+test domain_remap::tests::test_mangle_account_container_with_path_obj_slash_v1 ... ok
+test domain_remap::tests::test_mangle_account_container_with_path_root_obj ... ok
+test domain_remap::tests::test_mangle_account_container_with_path_trailing_slash ... ok
+test domain_remap::tests::test_mangle_account_container_with_root_path_obj_slash_v1 ... ok
+test domain_remap::tests::test_mangle_account_with_path_root_container ... ok
+test domain_remap::tests::test_mangle_account_container_with_path_root_and_path ... ok
+test domain_remap::tests::test_multiple_storage_domains ... ok
+test domain_remap::tests::test_mangle_with_path_root_and_path_no_slash ... ok
+test domain_remap::tests::test_passthrough ... ok
+test domain_remap::tests::test_storage_domains_conf_format ... ok
+test domain_remap::tests::test_redirect ... ok
+test domain_remap::tests::test_with_path_root_and_path_no_slash ... ok
+test etag_quoter::tests::test_account_response_sysmeta_translated ... ok
+test etag_quoter::tests::test_account_true_header_becomes_sysmeta ... ok
+test etag_quoter::tests::test_bad_api_version_passes_through ... ok
+test etag_quoter::tests::test_already_quoted_etag_is_untouched ... ok
+test etag_quoter::tests::test_bare_etag_is_quoted_when_enabled ... ok
+test etag_quoter::tests::test_bare_etag_not_quoted_when_disabled ... ok
+test etag_quoter::tests::test_container_empty_header_clears_sysmeta ... ok
+test etag_quoter::tests::test_container_falsey_header_becomes_false_sysmeta ... ok
+test etag_quoter::tests::test_container_remove_header_clears_sysmeta ... ok
+test etag_quoter::tests::test_container_true_header_becomes_sysmeta ... ok
+test etag_quoter::tests::test_container_request_does_not_quote_etag ... ok
+test etag_quoter::tests::test_no_client_header_leaves_no_sysmeta ... ok
+test etag_quoter::tests::test_default_is_disabled ... ok
+test etag_quoter::tests::test_non_swifty_path_passes_through ... ok
+test etag_quoter::tests::test_object_without_etag_header ... ok
+test etag_quoter::tests::test_pseudo_dir_object_with_trailing_slash_is_object ... ok
+test etag_quoter::tests::test_response_sysmeta_translated_to_client_header ... ok
+test etag_quoter::tests::test_weak_validator_is_untouched ... ok
+test formpost::tests::test_hmac_lengths_per_algo ... ok
+test etag_quoter::tests::test_open_quote_without_close_is_still_quoted ... ok
+test healthcheck::tests::test_disabled ... ok
+test gatekeeper::tests::test_strips_inbound_and_outbound ... ok
+test formpost::tests::test_verify_valid_and_invalid ... ok
+test keystoneauth::tests::test_cross_tenant_acl_grant ... ok
+test keystoneauth::tests::test_operator_is_owner ... ok
+test keystoneauth::tests::test_operator_requires_service_role_when_configured ... ok
+test keystoneauth::tests::test_options_allowed ... ok
+test keystoneauth::tests::test_project_reader_read_only ... ok
+test keystoneauth::tests::test_no_role_denied ... ok
+test keystoneauth::tests::test_referrer_acl_grant ... ok
+test healthcheck::tests::test_healthcheck ... ok
+test keystoneauth::tests::test_self_account_delete_denied ... ok
+test keystoneauth::tests::test_system_reader_read_only ... ok
+test keystoneauth::tests::test_reseller_admin_is_owner ... ok
+test listing_formats::tests::test_accept_header_negotiation_adds_vary ... ok
+test listing_formats::tests::test_account_get_json_roundtrip ... ok
+test listing_formats::tests::test_account_get_xml_empty_keeps_text_node ... ok
+test listing_formats::tests::test_account_get_xml ... ok
+test listing_formats::tests::test_allow_reserved_names_header_keeps_them ... ok
+test listing_formats::tests::test_array_of_non_objects_passthrough ... ok
+test listing_formats::tests::test_container_get_xml ... ok
+test listing_formats::tests::test_container_get_xml_empty_self_closes ... ok
+test listing_formats::tests::test_empty_text_becomes_204 ... ok
+test listing_formats::tests::test_bad_json_passthrough_with_vary ... ok
+test listing_formats::tests::test_format_forced_to_json_preserving_other_params ... ok
+test listing_formats::tests::test_get_text ... ok
+test listing_formats::tests::test_invalid_api_version_passthrough ... ok
+test listing_formats::tests::test_json_reserialization_escapes_non_ascii ... ok
+test listing_formats::tests::test_missing_required_field_keyerror_passthrough ... ok
+test listing_formats::tests::test_non_array_json_passthrough ... ok
+test listing_formats::tests::test_head_sets_content_type_and_zero_length ... ok
+test listing_formats::tests::test_non_2xx_status_passthrough ... ok
+test listing_formats::tests::test_non_json_content_type_passthrough_with_vary ... ok
+test listing_formats::tests::test_object_request_passthrough_untouched ... ok
+test listing_formats::tests::test_text_missing_name_and_subdir_keyerror_passthrough ... ok
+test listing_formats::tests::test_unknown_format_defaults_to_text ... ok
+test listing_formats::tests::test_post_method_passthrough ... ok
+test listing_formats::tests::test_vary_appended_to_existing ... ok
+test listing_formats::tests::test_vary_not_duplicated ... ok
+test name_check::tests::test_check_order_character_wins ... ok
+test name_check::tests::test_invalid_character ... ok
+test listing_formats::tests::test_xml_field_empty_self_closes ... ok
+test listing_formats::tests::test_reserved_names_filtered ... ok
+test name_check::tests::test_invalid_length ... ok
+test name_check::tests::test_length_counts_characters_not_bytes ... ok
+test name_check::tests::test_maximum_length_from_config ... ok
+test name_check::tests::test_regexp_disabled ... ok
+test name_check::tests::test_regexp_dollar_before_trailing_newline ... ok
+test name_check::tests::test_valid_length_and_character ... ok
+test proxy_logging::tests::test_auth_token_is_capped ... ok
+test name_check::tests::test_valid_regexp ... ok
+test proxy_logging::tests::test_client_ip_precedence ... ok
+test proxy_logging::tests::test_full_happy_path ... ok
+test proxy_logging::tests::test_headers_dump_only_filter ... ok
+test proxy_logging::tests::test_headers_dump_all_with_sensitive_capping ... ok
+test proxy_logging::tests::test_log_info_and_source_and_referer_encoding ... ok
+test proxy_logging::tests::test_middleware_passthrough_is_unchanged ... ok
+test proxy_logging::tests::test_missing_values_become_hyphen ... ok
+test name_check::tests::test_invalid_regexp ... ok
+test proxy_logging::tests::test_path_is_double_quoted_with_query ... ok
+test proxy_logging::tests::test_policy_index_response_wins_and_zero_survives ... ok
+test proxy_logging::tests::test_time_fields_formatting ... ok
+test ratelimit::tests::test_account_bucket_rejects_then_recovers ... ok
+test ratelimit::tests::test_blacklist_sysmeta_rejects_497 ... ok
+test ratelimit::tests::test_bucket_resets_after_idle ... ok
+test ratelimit::tests::test_container_listing_bucket_rejects ... ok
+test ratelimit::tests::test_empty_container_not_size_limited ... ok
+test ratelimit::tests::test_blacklist_config_rejects_497 ... ok
+test ratelimit::tests::test_from_conf ... ok
+test ratelimit::tests::test_get_maxrate ... ok
+test ratelimit::tests::test_invalid_and_non_swift_paths_pass_through ... ok
+test ratelimit::tests::test_global_write_ratelimit_sysmeta ... ok
+test ratelimit::tests::test_whitelist_config_skips_limiting ... ok
+test ratelimit::tests::test_ratelimitable_key_tuples ... ok
+test ratelimit::tests::test_whitelist_sysmeta_skips_limiting ... ok
+test read_only::tests::test_account_read_only_on ... ok
+test read_only::tests::test_account_read_only_on_allow_deletes ... ok
+test read_only::tests::test_copy_bad_destination_account ... ok
+test read_only::tests::test_copy_destination_account_read_only ... ok
+test read_only::tests::test_account_read_only_off ... ok
+test read_only::tests::test_copy_destination_account_writable ... ok
+test read_only::tests::test_from_conf_coercion ... ok
+test ratelimit::tests::test_container_bucket_rejects ... ok
+test read_only::tests::test_global_read_only_off ... ok
+test read_only::tests::test_global_read_only_on_account_off ... ok
+test read_only::tests::test_non_swift_paths_pass_through ... ok
+test read_only::tests::test_global_read_only_on_allow_deletes ... ok
+test slo::tests::test_dlo_etag ... ok
+test slo::tests::test_manifest_etag ... ok
+test slo::tests::test_normalize_etag ... ok
+test slo::tests::test_slo_etag_data_segment ... ok
+test slo::tests::test_slo_etag_whole_segments ... ok
+test slo::tests::test_slo_etag_ranged_segment ... ok
+test slo::tests::test_slo_full_get_reassembles ... ok
+test slo::tests::test_slo_get_is_lazy_and_aborts_midstream ... ok
+test slo::tests::test_slo_non_manifest_passthrough ... ok
+test slo::tests::test_slo_range_get ... ok
+test staticweb::tests::test_falls_back_to_listing ... ok
+test staticweb::tests::test_html_escape ... ok
+test staticweb::tests::test_human_readable ... ok
+test staticweb::tests::test_serves_index_when_present ... ok
+test staticweb::tests::test_unconfigured_passes_through ... ok
+test symlink::tests::test_container_request_passes_through ... ok
+test symlink::tests::test_cross_account_symlink_uses_target_account ... ok
+test symlink::tests::test_delete_passes_through ... ok
+test symlink::tests::test_dynamic_symlink_follows_target ... ok
+test staticweb::tests::test_listing_html_structure ... ok
+test symlink::tests::test_nested_symlink_chain_within_limit ... ok
+test read_only::tests::test_global_read_only_on ... ok
+test symlink::tests::test_non_swift_path_passes_through ... ok
+test symlink::tests::test_from_conf_clamps_below_one ... ok
+test symlink::tests::test_plain_object_passes_through ... ok
+test symlink::tests::test_post_to_plain_object_passes_through ... ok
+test symlink::tests::test_post_with_symlink_target_rejected ... ok
+test symlink::tests::test_put_bad_target_account_rejected ... ok
+test symlink::tests::test_put_dynamic_symlink_stores_sysmeta ... ok
+test symlink::tests::test_put_malformed_target_rejected ... ok
+test symlink::tests::test_put_non_zero_body_rejected ... ok
+test symlink::tests::test_put_static_symlink_etag_mismatch ... ok
+test symlink::tests::test_put_static_symlink_target_missing ... ok
+test symlink::tests::test_put_static_symlink_verifies_target ... ok
+test symlink::tests::test_put_symlink_targeting_itself_rejected ... ok
+test symlink::tests::test_put_target_with_leading_slash_rejected ... ok
+test symlink::tests::test_post_to_symlink_redirects ... ok
+test symlink::tests::test_symlink_get_returns_symlink_itself ... ok
+test symlink::tests::test_static_symlink_get_etag_mismatch ... ok
+test tempauth::tests::test_authorize_acl ... ok
+test tempauth::tests::test_token_issue_and_stamp ... ok
+test tempurl::tests::test_altered_path_is_invalid ... ok
+test tempurl::tests::test_bad_hex_length_is_invalid ... ok
+test tempurl::tests::test_basename ... ok
+test symlink::tests::test_symloop_max_exceeded_conflicts ... ok
+test tempurl::tests::test_container_root_with_staticweb ... ok
+test tempurl::tests::test_container_request_is_invalid ... ok
+test tempurl::tests::test_container_root_requires_staticweb ... ok
+test tempurl::tests::test_disallowed_header_on_get_is_allowed ... ok
+test tempurl::tests::test_disallowed_digest_is_invalid ... ok
+test tempurl::tests::test_disallowed_header_on_put_is_bad_request ... ok
+test tempurl::tests::test_empty_signature_is_invalid ... ok
+test tempurl::tests::test_extract_digest_and_algorithm ... ok
+test tempurl::tests::test_expired_is_invalid ... ok
+test tempurl::tests::test_filename_override_attachment ... ok
+test tempurl::tests::test_head_invalid_has_empty_body ... ok
+test tempurl::tests::test_head_matches_get_signature ... ok
+test tempurl::tests::test_get_does_not_match_put_signature ... ok
+test tempurl::tests::test_hmac_vectors ... ok
+test tempurl::tests::test_head_matches_post_signature ... ok
+test tempurl::tests::test_incoming_headers_scrubbed ... ok
+test tempurl::tests::test_inline_disposition ... ok
+test tempurl::tests::test_existing_disposition_preserved ... ok
+test tempurl::tests::test_iso8601_expires_accepted ... ok
+test tempurl::tests::test_inline_with_filename ... ok
+test tempurl::tests::test_missing_expires_is_invalid ... ok
+test tempurl::tests::test_missing_signature_is_invalid ... ok
+test tempurl::tests::test_method_not_in_allowed_methods ... ok
+test tempurl::tests::test_no_tempurl_params_passthrough ... ok
+test tempurl::tests::test_normalize_expires ... ok
+test tempurl::tests::test_no_keys_is_invalid ... ok
+test tempurl::tests::test_options_passthrough ... ok
+test tempurl::tests::test_outgoing_headers_scrubbed ... ok
+test tempurl::tests::test_prefix_object_not_under_prefix ... ok
+test tempurl::tests::test_quote_helpers ... ok
+test tempurl::tests::test_second_key_matches ... ok
+test tempurl::tests::test_iso8601_docstring_value ... ok
+test tempurl::tests::test_tampered_signature_is_invalid ... ok
+test tempurl::tests::test_valid_get_sha1 ... ok
+test tempurl::tests::test_uppercase_hex_signature_is_invalid ... ok
+test tempurl::tests::test_streq_const_time ... ok
+test tempurl::tests::test_valid_get_sha256_base64_urlsafe ... ok
+test tempurl::tests::test_valid_get_sha256 ... ok
+test tempurl::tests::test_valid_get_sha512_hex ... ok
+test tempurl::tests::test_valid_prefix ... ok
+test tempurl::tests::test_valid_get_sha512_base64 ... ok
+test tempurl::tests::test_valid_put ... ok
+test versioned_writes::tests::test_put_archives_current_version ... ok
+test versioned_writes::tests::test_put_no_current_skips_archive ... ok
+test versioned_writes::tests::test_versions_object_name_format ... ok
+test versioned_writes::tests::test_unversioned_container_passes_through ... ok
+test listing_formats::tests::test_oversize_body_passthrough ... ok
+
+test result: ok. 320 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/dlo_percent.rs (target/release/deps/dlo_percent-db54af9323385638)
+
+running 2 tests
+test percent_named_segments_are_reassembled ... ok
+test manifest_prefix_is_unquoted_once_then_quoted_for_the_listing ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/slo_put_validation.rs (target/release/deps/slo_put_validation-444451ea11a37d5c)
+
+running 6 tests
+test ordinary_segment_uses_head_metadata ... ok
+test nested_submanifest_uses_slo_metadata_not_physical_object_metadata ... ok
+test wrong_etag_is_rejected ... ok
+test path_must_identify_a_container_and_object ... ok
+test wrong_size_is_rejected ... ok
+test submanifest_suffix_range_is_normalized_and_counted ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/release/deps/swift_object_server-9c7560c1289d8e9c)
+
+running 48 tests
+test daemonutil::tests::replicator_recon_update_has_python_recon_keys ... ok
+test daemonutil::tests::sleep_unless_stopped_completes_a_zero_interval_without_stop ... ok
+test daemonutil::tests::sleep_unless_stopped_returns_immediately_when_flag_is_set ... ok
+test daemonutil::tests::statsd_prefix_prepends_only_when_configured ... ok
+test delete_header_tests::test_if_none_match_has_star ... ok
+test daemonutil::tests::updater_recon_update_dumps_python_recon_keys ... ok
+test delete_header_tests::test_parse_int_like ... ok
+test expirer::tests::test_build_and_parse_roundtrip ... ok
+test delete_header_tests::test_check_delete_headers ... ok
+test expirer::tests::test_iter_due_stops_at_future ... ok
+test expirer::tests::test_expirer_container_bucket ... ok
+test expirer::tests::test_process_deletes_then_pops ... ok
+test expirer::tests::test_stale_recent_retained_old_popped ... ok
+test expirer::tests::test_normalize_matches_python_format ... ok
+test fallocate_reserve_tests::breach_math_matches_python_fallocate_reserve ... ok
+test localdev::tests::a_bindable_address_that_is_not_an_interface_address_is_not_local ... ok
+test localdev::tests::a_hostname_is_never_claimed_as_local ... ok
+test fast_post_helper_tests::test_meta_upsert_replaces_in_place_or_appends ... ok
+test fast_post_helper_tests::test_extract_swift_bytes ... ok
+test reconstructor::suffix_sync_tests::test_get_suffix_delta_differing_data_hash ... ok
+test localdev::tests::loopback_is_local_and_a_documentation_address_is_not ... ok
+test reconstructor::suffix_sync_tests::test_get_suffix_delta_in_sync ... ok
+test reconstructor::suffix_sync_tests::test_get_suffix_delta_none_key_tombstones ... ok
+test reconstructor::suffix_sync_tests::test_get_suffix_delta_remote_missing_suffix ... ok
+test localdev::tests::every_enumerated_address_answers_local ... ok
+test reconstructor::suffix_sync_tests::test_partner_missing_its_own_fragment_is_flagged_for_sync ... ok
+test reconstructor::suffix_sync_tests::test_sync_job_fully_in_sync_pushes_nothing ... ok
+test fallocate_reserve_tests::put_honors_the_fallocate_reserve_against_a_temp_device ... ok
+test reconstructor::suffix_sync_tests::test_sync_job_pushes_to_a_partner_that_lost_its_fragment ... ok
+test replicator::tests::test_divergent_suffixes ... ok
+test replicator::tests::test_hashes_pickle_roundtrip ... ok
+test replicator::tests::test_revert_keeps_partition_when_a_primary_fails ... ok
+test replicator::tests::test_run_once_handoff_reverts_and_deletes ... ok
+test reconstructor::suffix_sync_tests::test_sync_job_ssyncs_only_the_delta_and_skips_failed_replicate ... ok
+test replicator::tests::test_run_once_reaps_orphaned_tmp_files ... ok
+test replicator::tests::test_unlink_older_than_reaps_only_old_files ... ok
+test ssync_sender::tests::test_decode_wanted ... ok
+test ssync_sender::tests::test_sender_empty_partition_round_trip ... ok
+test ssync_sender::tests::test_sender_unexpected_response_line_is_an_error ... ok
+test updater::tests::test_full_success_unlinks ... ok
+test updater::tests::test_leftover_tmp_sibling_is_skipped_not_treated_as_newest ... ok
+test updater::tests::test_multi_dash_and_bad_timestamp_names_are_errors ... ok
+test replicator::tests::test_run_once_primary_dispatch_queries_peers ... ok
+test updater::tests::test_outdated_duplicates_unlinked ... ok
+test updater::tests::test_parse_roundtrip ... ok
+test updater::tests::test_partial_failure_rewrites_with_successes ... ok
+test reconstructor::suffix_sync_tests::test_sync_job_stops_advertising_a_fragment_that_vanished ... ok
+test reconstructor::suffix_sync_tests::test_revert_job_skips_cleanly_when_partition_lock_held ... ok
+
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+     Running unittests src/bin/object_reconstructor.rs (target/release/deps/swift_object_reconstructor-033a7128fca6b47a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/object_replicator.rs (target/release/deps/swift_object_replicator-27b0b79097b8f7c8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/release/deps/swift_object_server-88441e487482d1cc)
+
+running 2 tests
+test startup_policy_tests::configured_policy_kinds_preserve_replication_and_ec ... ok
+test startup_policy_tests::invalid_storage_policy_is_not_silently_treated_as_replication ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/object_updater.rs (target/release/deps/swift_object_updater-34e692d2adae45c0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/async_pending.rs (target/release/deps/async_pending-fdf2ed5e833662f7)
+
+running 3 tests
+test test_async_mode_always_writes_pending_even_with_hosts ... ok
+test test_put_without_container_hosts_writes_async_pending ... ok
+test test_put_with_x_delete_at_enqueues_expiry_task ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/fast_post.rs (target/release/deps/fast_post-8a0bcc04016871da)
+
+running 3 tests
+test test_post_without_content_type_keeps_original_ctype_timestamp ... ok
+test test_post_with_newer_content_type_wins_and_is_carried_forward ... ok
+test test_409_only_when_both_timestamps_are_stale ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/golden.rs (target/release/deps/golden-f7b73e5239e87846)
+
+running 2 tests
+test test_object_server_matches_python_oracle ... ok
+test test_object_put_updates_container_server ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/mount_check.rs (target/release/deps/mount_check-968ee007c05d5e3f)
+
+running 2 tests
+test mount_check_returns_507_for_every_object_data_verb_after_unmount ... ok
+test mount_check_false_allows_a_plain_saio_device_directory ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/multiphase.rs (target/release/deps/multiphase-ffc65b3f0215f19a)
+
+running 4 tests
+test footer_etag_mismatch_is_422 ... ok
+test corrupt_footer_md5_is_422 ... ok
+test full_multiphase_put_stores_data_footers_and_overrides ... ok
+test ec_policy_put_is_durable_only_after_commit ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/replicate.rs (target/release/deps/replicate-0253967f08755145)
+
+running 5 tests
+test replicate_validates_path_policy_device_and_mount ... ok
+test replicate_returns_ec_fragment_and_durable_hashes ... ok
+test replicate_returns_replication_hashes ... ok
+test replicate_with_suffixes_only_invalidates_and_returns_none ... ok
+test rust_replicate_pickles_are_loadable_by_python ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/ssync.rs (target/release/deps/ssync-4455b636bf710ad5)
+
+running 15 tests
+test ssync_encode_missing_matches_python_wire_format ... ok
+test ssync_advertises_accept_no_commit_in_the_response_head ... ok
+test ssync_enforces_path_device_and_mount_contract ... ok
+test ssync_incremental_parser_accepts_one_byte_feeds ... ok
+test ssync_incremental_parser_pauses_between_missing_check_and_updates ... ok
+test ssync_rejects_bad_framing_and_invalid_headers ... ok
+test ssync_applies_updates_sequentially_like_python_then_reports_the_error ... ok
+test ssync_truncated_sessions_drop_the_connection_like_python ... ok
+test ssync_rejects_oversized_lines_headers_and_bodies_without_panicking ... ok
+test unknown_policy_get_post_and_delete_fail_closed ... ok
+test unknown_policy_put_fails_closed_without_creating_policy_directory ... ok
+test unknown_policy_ssync_fails_closed_without_creating_policy_directory ... ok
+test ssync_missing_check_compares_local_data_and_metadata_timestamps ... ok
+test ssync_updates_apply_put_post_and_delete_subrequests ... ok
+test python_stdlib_batch_fixture_can_generate_request_and_parse_response ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/ssync_ec.rs (target/release/deps/ssync_ec-14a431a90ec8bf16)
+
+running 6 tests
+test reconstructor_revert_moves_a_handoff_fragment_and_purges_it ... ok
+test duplex_replication_round_trip_over_a_real_socket ... ok
+test suffix_delta_fires_against_an_emptied_victim_partition ... ok
+test rust_sender_moves_a_fragment_to_the_rust_receiver ... ok
+test duplex_ec_frag_index_missing_check_and_fragment_puts_over_a_real_socket ... ok
+test sync_job_rebuilds_the_fragment_at_the_receivers_index ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+     Running tests/streaming.rs (target/release/deps/streaming-ec2e6bd1c62805d2)
+
+running 5 tests
+test short_body_is_a_499_and_commits_nothing ... ok
+test head_serves_metadata_without_reading_a_corrupt_data_file ... ok
+test single_range_get_streams_the_window ... ok
+test multi_range_get_matches_the_buffered_oracle ... ok
+test streamed_put_commits_exactly_the_streamed_bytes_and_etag ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src/lib.rs (target/release/deps/swift_proxy_server-37c6da76bcdca9b8)
+
+running 8 tests
+test info_cache_tests::test_info_cache_time_matches_set_info_cache ... ok
+test policy_ring_tests::test_object_ring_for_selects_policy_ring ... ok
+test stale_read_and_post_tests::test_backend_404_timestamp_absent_is_not_truthy ... ok
+test stale_read_and_post_tests::test_is_good_source_matches_python ... ok
+test stale_read_and_post_tests::test_post_mixed_result_resolution ... ok
+test stale_read_and_post_tests::test_source_timestamp_precedence_and_fallbacks ... ok
+test info_cache_tests::test_account_map_hit_expiry_and_clear ... ok
+test info_cache_tests::test_container_hit_expiry_and_clear ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running unittests src/main.rs (target/release/deps/swift_proxy_server-576fba78418dbcbc)
+
+running 6 tests
+test startup_policy_tests::ec_ring_replica_mismatch_is_rejected ... ok
+test startup_policy_tests::ratelimit_filter_is_built_only_when_configured ... ok
+test startup_policy_tests::server_options_read_workers_clients_timeout_and_log_conf ... ok
+test startup_policy_tests::every_configured_policy_requires_its_own_ring ... ok
+test startup_policy_tests::proxy_config_reads_tuning_knobs_with_default_fallback ... ok
+test startup_policy_tests::startup_and_reload_share_one_build_path ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/ec_integration.rs (target/release/deps/ec_integration-6e245aa735287ae4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/release/deps/integration-c96f9a9f6f314e8f)
+
+running 7 tests
+test test_pipeline_healthcheck_gatekeeper_transid ... ok
+test test_get_unreachable_primaries_and_empty_handoff_is_503 ... ok
+test test_post_mixed_results_falls_back_to_handoff ... ok
+test test_proxy_end_to_end_account_and_container ... ok
+test test_get_stale_handoff_data_loses_to_newer_tombstones ... ok
+test test_proxy_object_round_trip ... ok
+test test_tempauth_end_to_end ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
+
+     Running unittests src/lib.rs (target/release/deps/swift_ring-9da8bb2a3d066c7c)
+
+running 8 tests
+test builder::tests::test_device_management_validate_and_json ... ok
+test builder::tests::test_from_ring_data_preserves_removed_device_holes ... ok
+test builder::tests::test_from_ring_data_round_trips ... ok
+test builder::tests::test_too_few_devices ... ok
+test ring::tests::test_calc_replica_count ... ok
+test ring::tests::test_handoff_sequence_matches_python ... ok
+test builder::tests::test_weighted_balance ... ok
+test builder::tests::test_rebalance_produces_valid_dispersed_ring ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/builder_roundtrip.rs (target/release/deps/builder_roundtrip-4a7fde10c02798e6)
+
+running 3 tests
+test test_written_ring_is_deterministic ... ok
+test test_emit_ring_for_python_crosscheck ... ok
+test test_v1_write_read_roundtrip ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/golden.rs (target/release/deps/golden-f99490325ea30f42)
+
+running 4 tests
+test test_corrupt_section_checksum_detected ... ok
+test test_metadata_only ... ok
+test test_v1_v2_load_identically ... ok
+test test_golden_rings_match_python ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/release/deps/swift_s3api-af6036f16e128716)
+
+running 35 tests
+test crypto::tests::test_sha256_abc ... ok
+test parse::tests::test_invalid_path_style_bucket_name ... ok
+test parse::tests::test_path_style_bucket_and_key ... ok
+test parse::tests::test_path_style_bucket_only ... ok
+test crypto::tests::test_streq_const_time ... ok
+test crypto::tests::test_sha256_empty ... ok
+test parse::tests::test_validate_bucket_name_dns ... ok
+test parse::tests::test_validate_bucket_name_legacy ... ok
+test crypto::tests::test_hmac_rfc4231_case2 ... ok
+test parse::tests::test_path_style_service_request ... ok
+test parse::tests::test_vhost_port_stripped ... ok
+test response::tests::test_delete_result ... ok
+test parse::tests::test_vhost_style ... ok
+test response::tests::test_error_response_signature_does_not_match ... ok
+test response::tests::test_copy_object_result ... ok
+test response::tests::test_error_xml_shape ... ok
+test response::tests::test_list_all_my_buckets ... ok
+test response::tests::test_error_response_status_and_default_message ... ok
+test response::tests::test_list_bucket_result_shape ... ok
+test response::tests::test_object_responses ... ok
+test sigv4::tests::test_aws_vector_canonical_request ... ok
+test sigv4::tests::test_aws_vector_string_to_sign ... ok
+test sigv4::tests::test_aws_vector_signing_key_and_signature ... ok
+test sigv4::tests::test_parse_credential ... ok
+test sigv4::tests::test_verify_sigv4_header_auth ... ok
+test sigv4::tests::test_canonical_query_sorted_and_encoded ... ok
+test response::tests::test_list_bucket_result_with_owner_and_delimiter ... ok
+test sigv4::tests::test_verify_sigv4_rejects_tampered_path ... ok
+test sigv4::tests::test_verify_sigv4_query_auth ... ok
+test sigv4::tests::test_verify_sigv4_rejects_wrong_secret ... ok
+test sigv4::tests::test_verify_sigv4_rejects_wrong_access_key ... ok
+test xml::tests::test_error_shape_no_ns ... ok
+test xml::tests::test_self_closing_empty_element ... ok
+test xml::tests::test_success_shape_with_ns_and_empty_leaf ... ok
+test parse::tests::test_s3_to_swift_path ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_account_server
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_cli
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_container_server
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_crypto
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_db
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_diskfile
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_http
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_memcache
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_middleware
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_object_server
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_proxy_server
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_ring
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_s3api
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+=== exit=0 (cargo ...) ===
+
+########## PHASE 6: EC-featured tests (codec + object + proxy, incl. ec_integration) ##########
++ cargo test --release -p swift-ec -p swift-object-server -p swift-proxy-server --features swift-proxy-server/ec,swift-object-server/ec
+   Compiling swift-ec v0.1.0 (/root/work/swift-rust/crates/swift-ec)
+   Compiling swift-proxy-server v0.1.0 (/root/work/swift-rust/crates/swift-proxy-server)
+   Compiling swift-object-server v0.1.0 (/root/work/swift-rust/crates/swift-object-server)
+    Finished `release` profile [optimized] target(s) in 26.26s
+     Running unittests src/lib.rs (target/release/deps/swift_ec-0a42ce1c18bb9594)
+
+running 5 tests
+test tests::test_encode_decode_reconstruct ... ok
+test tests::test_fragment_index_metadata ... ok
+test tests::test_encode_decode_object_multi_segment ... ok
+test tests::test_empty_object_stores_and_round_trips_empty_archives ... ok
+test tests::test_reconstruct_object_rebuilds_identical_archive ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/lib.rs (target/release/deps/swift_object_server-71991060e78eb282)
+
+running 50 tests
+test daemonutil::tests::replicator_recon_update_has_python_recon_keys ... ok
+test daemonutil::tests::sleep_unless_stopped_completes_a_zero_interval_without_stop ... ok
+test daemonutil::tests::statsd_prefix_prepends_only_when_configured ... ok
+test daemonutil::tests::sleep_unless_stopped_returns_immediately_when_flag_is_set ... ok
+test delete_header_tests::test_parse_int_like ... ok
+test delete_header_tests::test_if_none_match_has_star ... ok
+test daemonutil::tests::updater_recon_update_dumps_python_recon_keys ... ok
+test delete_header_tests::test_check_delete_headers ... ok
+test expirer::tests::test_expirer_container_bucket ... ok
+test expirer::tests::test_iter_due_stops_at_future ... ok
+test expirer::tests::test_build_and_parse_roundtrip ... ok
+test expirer::tests::test_stale_recent_retained_old_popped ... ok
+test expirer::tests::test_process_deletes_then_pops ... ok
+test expirer::tests::test_normalize_matches_python_format ... ok
+test fallocate_reserve_tests::breach_math_matches_python_fallocate_reserve ... ok
+test fast_post_helper_tests::test_extract_swift_bytes ... ok
+test localdev::tests::a_hostname_is_never_claimed_as_local ... ok
+test localdev::tests::a_bindable_address_that_is_not_an_interface_address_is_not_local ... ok
+test fast_post_helper_tests::test_meta_upsert_replaces_in_place_or_appends ... ok
+test reconstructor::suffix_sync_tests::test_get_suffix_delta_differing_data_hash ... ok
+test reconstructor::suffix_sync_tests::test_get_suffix_delta_in_sync ... ok
+test reconstructor::suffix_sync_tests::test_get_suffix_delta_none_key_tombstones ... ok
+test localdev::tests::loopback_is_local_and_a_documentation_address_is_not ... ok
+test reconstructor::suffix_sync_tests::test_get_suffix_delta_remote_missing_suffix ... ok
+test reconstructor::suffix_sync_tests::test_partner_missing_its_own_fragment_is_flagged_for_sync ... ok
+test localdev::tests::every_enumerated_address_answers_local ... ok
+test reconstructor::suffix_sync_tests::test_sync_job_fully_in_sync_pushes_nothing ... ok
+test fallocate_reserve_tests::put_honors_the_fallocate_reserve_against_a_temp_device ... ok
+test reconstructor::suffix_sync_tests::test_sync_job_pushes_to_a_partner_that_lost_its_fragment ... ok
+test reconstructor::tests::test_rebuild_job_not_enough_fragments ... ok
+test reconstructor::suffix_sync_tests::test_sync_job_ssyncs_only_the_delta_and_skips_failed_replicate ... ok
+test replicator::tests::test_divergent_suffixes ... ok
+test replicator::tests::test_hashes_pickle_roundtrip ... ok
+test replicator::tests::test_revert_keeps_partition_when_a_primary_fails ... ok
+test replicator::tests::test_run_once_handoff_reverts_and_deletes ... ok
+test reconstructor::tests::test_rebuild_job_persists_identical_durable_fragment ... ok
+test replicator::tests::test_run_once_reaps_orphaned_tmp_files ... ok
+test replicator::tests::test_unlink_older_than_reaps_only_old_files ... ok
+test ssync_sender::tests::test_decode_wanted ... ok
+test reconstructor::suffix_sync_tests::test_sync_job_stops_advertising_a_fragment_that_vanished ... ok
+test ssync_sender::tests::test_sender_empty_partition_round_trip ... ok
+test ssync_sender::tests::test_sender_unexpected_response_line_is_an_error ... ok
+test updater::tests::test_full_success_unlinks ... ok
+test updater::tests::test_leftover_tmp_sibling_is_skipped_not_treated_as_newest ... ok
+test updater::tests::test_multi_dash_and_bad_timestamp_names_are_errors ... ok
+test updater::tests::test_outdated_duplicates_unlinked ... ok
+test updater::tests::test_parse_roundtrip ... ok
+test updater::tests::test_partial_failure_rewrites_with_successes ... ok
+test replicator::tests::test_run_once_primary_dispatch_queries_peers ... ok
+test reconstructor::suffix_sync_tests::test_revert_job_skips_cleanly_when_partition_lock_held ... ok
+
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running unittests src/bin/object_reconstructor.rs (target/release/deps/swift_object_reconstructor-2c46e9dea122580c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/object_replicator.rs (target/release/deps/swift_object_replicator-a2d938eda02d5b06)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/release/deps/swift_object_server-b7b0548b2b5691fe)
+
+running 2 tests
+test startup_policy_tests::configured_policy_kinds_preserve_replication_and_ec ... ok
+test startup_policy_tests::invalid_storage_policy_is_not_silently_treated_as_replication ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/object_updater.rs (target/release/deps/swift_object_updater-43490b351fcc1999)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/async_pending.rs (target/release/deps/async_pending-7fedef77317c5ea2)
+
+running 3 tests
+test test_async_mode_always_writes_pending_even_with_hosts ... ok
+test test_put_without_container_hosts_writes_async_pending ... ok
+test test_put_with_x_delete_at_enqueues_expiry_task ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/fast_post.rs (target/release/deps/fast_post-a327a01807ee38eb)
+
+running 3 tests
+test test_post_without_content_type_keeps_original_ctype_timestamp ... ok
+test test_409_only_when_both_timestamps_are_stale ... ok
+test test_post_with_newer_content_type_wins_and_is_carried_forward ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/golden.rs (target/release/deps/golden-3079a6765f12cc24)
+
+running 2 tests
+test test_object_server_matches_python_oracle ... ok
+test test_object_put_updates_container_server ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/mount_check.rs (target/release/deps/mount_check-ab5cfb13434500ed)
+
+running 2 tests
+test mount_check_returns_507_for_every_object_data_verb_after_unmount ... ok
+test mount_check_false_allows_a_plain_saio_device_directory ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/multiphase.rs (target/release/deps/multiphase-ecaa69c99ff10533)
+
+running 4 tests
+test footer_etag_mismatch_is_422 ... ok
+test corrupt_footer_md5_is_422 ... ok
+test full_multiphase_put_stores_data_footers_and_overrides ... ok
+test ec_policy_put_is_durable_only_after_commit ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/replicate.rs (target/release/deps/replicate-261e37ea38acbfaa)
+
+running 5 tests
+test replicate_validates_path_policy_device_and_mount ... ok
+test replicate_returns_replication_hashes ... ok
+test replicate_with_suffixes_only_invalidates_and_returns_none ... ok
+test replicate_returns_ec_fragment_and_durable_hashes ... ok
+test rust_replicate_pickles_are_loadable_by_python ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/ssync.rs (target/release/deps/ssync-7056b9de5873e309)
+
+running 15 tests
+test ssync_encode_missing_matches_python_wire_format ... ok
+test ssync_advertises_accept_no_commit_in_the_response_head ... ok
+test ssync_incremental_parser_accepts_one_byte_feeds ... ok
+test ssync_enforces_path_device_and_mount_contract ... ok
+test ssync_applies_updates_sequentially_like_python_then_reports_the_error ... ok
+test ssync_rejects_bad_framing_and_invalid_headers ... ok
+test ssync_rejects_oversized_lines_headers_and_bodies_without_panicking ... ok
+test ssync_truncated_sessions_drop_the_connection_like_python ... ok
+test ssync_incremental_parser_pauses_between_missing_check_and_updates ... ok
+test unknown_policy_get_post_and_delete_fail_closed ... ok
+test unknown_policy_put_fails_closed_without_creating_policy_directory ... ok
+test ssync_missing_check_compares_local_data_and_metadata_timestamps ... ok
+test ssync_updates_apply_put_post_and_delete_subrequests ... ok
+test unknown_policy_ssync_fails_closed_without_creating_policy_directory ... ok
+test python_stdlib_batch_fixture_can_generate_request_and_parse_response ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/ssync_ec.rs (target/release/deps/ssync_ec-396592cd63b90ba2)
+
+running 6 tests
+test reconstructor_revert_moves_a_handoff_fragment_and_purges_it ... ok
+test duplex_replication_round_trip_over_a_real_socket ... ok
+test suffix_delta_fires_against_an_emptied_victim_partition ... ok
+test rust_sender_moves_a_fragment_to_the_rust_receiver ... ok
+test duplex_ec_frag_index_missing_check_and_fragment_puts_over_a_real_socket ... ok
+test sync_job_rebuilds_the_fragment_at_the_receivers_index ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running tests/streaming.rs (target/release/deps/streaming-8d95bbf21411f0c5)
+
+running 5 tests
+test short_body_is_a_499_and_commits_nothing ... ok
+test single_range_get_streams_the_window ... ok
+test head_serves_metadata_without_reading_a_corrupt_data_file ... ok
+test multi_range_get_matches_the_buffered_oracle ... ok
+test streamed_put_commits_exactly_the_streamed_bytes_and_etag ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src/lib.rs (target/release/deps/swift_proxy_server-9861aa19064c3616)
+
+running 8 tests
+test info_cache_tests::test_info_cache_time_matches_set_info_cache ... ok
+test stale_read_and_post_tests::test_backend_404_timestamp_absent_is_not_truthy ... ok
+test policy_ring_tests::test_object_ring_for_selects_policy_ring ... ok
+test stale_read_and_post_tests::test_is_good_source_matches_python ... ok
+test stale_read_and_post_tests::test_source_timestamp_precedence_and_fallbacks ... ok
+test stale_read_and_post_tests::test_post_mixed_result_resolution ... ok
+test info_cache_tests::test_account_map_hit_expiry_and_clear ... ok
+test info_cache_tests::test_container_hit_expiry_and_clear ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running unittests src/main.rs (target/release/deps/swift_proxy_server-16cddbb4e3c0fe53)
+
+running 6 tests
+test startup_policy_tests::every_configured_policy_requires_its_own_ring ... ok
+test startup_policy_tests::ec_ring_replica_mismatch_is_rejected ... ok
+test startup_policy_tests::proxy_config_reads_tuning_knobs_with_default_fallback ... ok
+test startup_policy_tests::ratelimit_filter_is_built_only_when_configured ... ok
+test startup_policy_tests::server_options_read_workers_clients_timeout_and_log_conf ... ok
+test startup_policy_tests::startup_and_reload_share_one_build_path ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/ec_integration.rs (target/release/deps/ec_integration-421526afee3afb83)
+
+running 1 test
+test test_ec_object_put_get_round_trip_and_fragment_loss ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+
+     Running tests/integration.rs (target/release/deps/integration-cd285918c78c52f4)
+
+running 7 tests
+test test_pipeline_healthcheck_gatekeeper_transid ... ok
+test test_get_unreachable_primaries_and_empty_handoff_is_503 ... ok
+test test_get_stale_handoff_data_loses_to_newer_tombstones ... ok
+test test_post_mixed_results_falls_back_to_handoff ... ok
+test test_proxy_end_to_end_account_and_container ... ok
+test test_proxy_object_round_trip ... ok
+test test_tempauth_end_to_end ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+
+   Doc-tests swift_ec
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_object_server
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_proxy_server
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+=== exit=0 (cargo ...) ===
+
+########## CI DONE 2026-08-02T07:12:31Z ##########
+CI-FULLTEST-COMPLETE rc-file=/root/contabo-deep-verify-20260802/ci-fulltest-r2.log

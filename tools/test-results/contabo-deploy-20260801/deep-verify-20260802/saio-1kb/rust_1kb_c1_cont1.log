@@ -1,0 +1,7 @@
+SIDE=rust EP=http://127.0.0.1:8081 cont=1 conc=1 n=2000
+=== REP 1 ===
+      43.3 PUT/s  p50=   17.7ms p95=    52.5ms p99=   112.5ms  errs=0
+=== REP 2 ===
+      54.3 PUT/s  p50=   16.0ms p95=    31.4ms p99=    53.0ms  errs=0
+=== REP 3 ===
+      63.3 PUT/s  p50=   13.7ms p95=    27.4ms p99=    52.5ms  errs=0

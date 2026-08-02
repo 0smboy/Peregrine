@@ -1,0 +1,2 @@
+VIP auth over 100: ok=100 bad=0  (elapsed 2s)  badcodes:
+### haproxy log: recent non-2xx / timeout terminations on the proxy backend

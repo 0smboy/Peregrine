@@ -1,0 +1,7 @@
+SIDE=python EP=http://127.0.0.1:8090 cont=1 conc=32 n=6000
+=== REP 1 ===
+      65.2 PUT/s  p50=  490.6ms p95=   691.5ms p99=   799.8ms  errs=0
+=== REP 2 ===
+      68.6 PUT/s  p50=  465.1ms p95=   672.6ms p99=   793.2ms  errs=0
+=== REP 3 ===
+      68.9 PUT/s  p50=  465.2ms p95=   652.4ms p99=   785.6ms  errs=0

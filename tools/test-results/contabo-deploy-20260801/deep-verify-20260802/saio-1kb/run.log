@@ -1,0 +1,33 @@
+SIDE=rust EP=http://127.0.0.1:8081 cont=1 conc=1 n=2000
+=== REP 1 ===
+      43.3 PUT/s  p50=   17.7ms p95=    52.5ms p99=   112.5ms  errs=0
+=== REP 2 ===
+      54.3 PUT/s  p50=   16.0ms p95=    31.4ms p99=    53.0ms  errs=0
+=== REP 3 ===
+      63.3 PUT/s  p50=   13.7ms p95=    27.4ms p99=    52.5ms  errs=0
+{"ops": 54.3, "p50_ms": 16.0, "p99_ms": 53.0, "errs": 0} gate_fail0= True
+SIDE=rust EP=http://127.0.0.1:8081 cont=1 conc=32 n=6000
+=== REP 1 ===
+     222.1 PUT/s  p50=  122.5ms p95=   296.9ms p99=   391.4ms  errs=0
+=== REP 2 ===
+     264.4 PUT/s  p50=   98.6ms p95=   230.2ms p99=   307.9ms  errs=0
+=== REP 3 ===
+     236.7 PUT/s  p50=  115.9ms p95=   279.2ms p99=   368.3ms  errs=0
+{"ops": 236.7, "p50_ms": 115.9, "p99_ms": 368.3, "errs": 0} gate_fail0= True
+SIDE=python EP=http://127.0.0.1:8090 cont=1 conc=1 n=2000
+=== REP 1 ===
+      26.9 PUT/s  p50=   33.2ms p95=    60.8ms p99=   103.5ms  errs=0
+=== REP 2 ===
+      23.9 PUT/s  p50=   34.2ms p95=    83.5ms p99=   165.9ms  errs=0
+=== REP 3 ===
+      26.5 PUT/s  p50=   34.0ms p95=    63.1ms p99=    89.6ms  errs=0
+{"ops": 26.5, "p50_ms": 34.0, "p99_ms": 103.5, "errs": 0} gate_fail0= True
+SIDE=python EP=http://127.0.0.1:8090 cont=1 conc=32 n=6000
+=== REP 1 ===
+      65.2 PUT/s  p50=  490.6ms p95=   691.5ms p99=   799.8ms  errs=0
+=== REP 2 ===
+      68.6 PUT/s  p50=  465.1ms p95=   672.6ms p99=   793.2ms  errs=0
+=== REP 3 ===
+      68.9 PUT/s  p50=  465.2ms p95=   652.4ms p99=   785.6ms  errs=0
+{"ops": 68.6, "p50_ms": 465.2, "p99_ms": 793.2, "errs": 0} gate_fail0= True
+SAIO-PHASE0-DONE

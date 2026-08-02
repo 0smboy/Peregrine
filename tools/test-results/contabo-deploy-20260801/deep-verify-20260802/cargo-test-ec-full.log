@@ -1,0 +1,257 @@
+    Finished `release` profile [optimized] target(s) in 0.06s
+     Running unittests src/lib.rs (target/release/deps/swift_ec-0a42ce1c18bb9594)
+
+running 5 tests
+test tests::test_empty_object_stores_and_round_trips_empty_archives ... ok
+test tests::test_fragment_index_metadata ... ok
+test tests::test_encode_decode_object_multi_segment ... ok
+test tests::test_encode_decode_reconstruct ... ok
+test tests::test_reconstruct_object_rebuilds_identical_archive ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/release/deps/swift_object_server-71991060e78eb282)
+
+running 50 tests
+test daemonutil::tests::sleep_unless_stopped_returns_immediately_when_flag_is_set ... ok
+test daemonutil::tests::replicator_recon_update_has_python_recon_keys ... ok
+test daemonutil::tests::statsd_prefix_prepends_only_when_configured ... ok
+test delete_header_tests::test_check_delete_headers ... ok
+test delete_header_tests::test_if_none_match_has_star ... ok
+test delete_header_tests::test_parse_int_like ... ok
+test daemonutil::tests::sleep_unless_stopped_completes_a_zero_interval_without_stop ... ok
+test expirer::tests::test_build_and_parse_roundtrip ... ok
+test expirer::tests::test_expirer_container_bucket ... ok
+test daemonutil::tests::updater_recon_update_dumps_python_recon_keys ... ok
+test expirer::tests::test_iter_due_stops_at_future ... ok
+test expirer::tests::test_process_deletes_then_pops ... ok
+test expirer::tests::test_normalize_matches_python_format ... ok
+test expirer::tests::test_stale_recent_retained_old_popped ... ok
+test fallocate_reserve_tests::breach_math_matches_python_fallocate_reserve ... ok
+test fast_post_helper_tests::test_extract_swift_bytes ... ok
+test localdev::tests::a_bindable_address_that_is_not_an_interface_address_is_not_local ... ok
+test fast_post_helper_tests::test_meta_upsert_replaces_in_place_or_appends ... ok
+test localdev::tests::a_hostname_is_never_claimed_as_local ... ok
+test localdev::tests::loopback_is_local_and_a_documentation_address_is_not ... ok
+test reconstructor::suffix_sync_tests::test_get_suffix_delta_differing_data_hash ... ok
+test localdev::tests::every_enumerated_address_answers_local ... ok
+test reconstructor::suffix_sync_tests::test_get_suffix_delta_remote_missing_suffix ... ok
+test reconstructor::suffix_sync_tests::test_get_suffix_delta_none_key_tombstones ... ok
+test reconstructor::suffix_sync_tests::test_get_suffix_delta_in_sync ... ok
+test reconstructor::suffix_sync_tests::test_partner_missing_its_own_fragment_is_flagged_for_sync ... ok
+test reconstructor::suffix_sync_tests::test_sync_job_fully_in_sync_pushes_nothing ... ok
+test fallocate_reserve_tests::put_honors_the_fallocate_reserve_against_a_temp_device ... ok
+test reconstructor::suffix_sync_tests::test_sync_job_pushes_to_a_partner_that_lost_its_fragment ... ok
+test reconstructor::tests::test_rebuild_job_not_enough_fragments ... ok
+test reconstructor::suffix_sync_tests::test_sync_job_ssyncs_only_the_delta_and_skips_failed_replicate ... ok
+test replicator::tests::test_divergent_suffixes ... ok
+test replicator::tests::test_hashes_pickle_roundtrip ... ok
+test replicator::tests::test_revert_keeps_partition_when_a_primary_fails ... ok
+test reconstructor::tests::test_rebuild_job_persists_identical_durable_fragment ... ok
+test replicator::tests::test_run_once_handoff_reverts_and_deletes ... ok
+test replicator::tests::test_run_once_reaps_orphaned_tmp_files ... ok
+test replicator::tests::test_unlink_older_than_reaps_only_old_files ... ok
+test reconstructor::suffix_sync_tests::test_sync_job_stops_advertising_a_fragment_that_vanished ... ok
+test ssync_sender::tests::test_sender_empty_partition_round_trip ... ok
+test ssync_sender::tests::test_sender_unexpected_response_line_is_an_error ... ok
+test updater::tests::test_full_success_unlinks ... ok
+test ssync_sender::tests::test_decode_wanted ... ok
+test updater::tests::test_leftover_tmp_sibling_is_skipped_not_treated_as_newest ... ok
+test updater::tests::test_outdated_duplicates_unlinked ... ok
+test updater::tests::test_multi_dash_and_bad_timestamp_names_are_errors ... ok
+test updater::tests::test_parse_roundtrip ... ok
+test updater::tests::test_partial_failure_rewrites_with_successes ... ok
+test replicator::tests::test_run_once_primary_dispatch_queries_peers ... ok
+test reconstructor::suffix_sync_tests::test_revert_job_skips_cleanly_when_partition_lock_held ... ok
+
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running unittests src/bin/object_reconstructor.rs (target/release/deps/swift_object_reconstructor-2c46e9dea122580c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/object_replicator.rs (target/release/deps/swift_object_replicator-a2d938eda02d5b06)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/release/deps/swift_object_server-b7b0548b2b5691fe)
+
+running 2 tests
+test startup_policy_tests::invalid_storage_policy_is_not_silently_treated_as_replication ... ok
+test startup_policy_tests::configured_policy_kinds_preserve_replication_and_ec ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/object_updater.rs (target/release/deps/swift_object_updater-43490b351fcc1999)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/async_pending.rs (target/release/deps/async_pending-7fedef77317c5ea2)
+
+running 3 tests
+test test_put_without_container_hosts_writes_async_pending ... ok
+test test_async_mode_always_writes_pending_even_with_hosts ... ok
+test test_put_with_x_delete_at_enqueues_expiry_task ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/fast_post.rs (target/release/deps/fast_post-a327a01807ee38eb)
+
+running 3 tests
+test test_post_without_content_type_keeps_original_ctype_timestamp ... ok
+test test_409_only_when_both_timestamps_are_stale ... ok
+test test_post_with_newer_content_type_wins_and_is_carried_forward ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/golden.rs (target/release/deps/golden-3079a6765f12cc24)
+
+running 2 tests
+test test_object_server_matches_python_oracle ... ok
+test test_object_put_updates_container_server ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/mount_check.rs (target/release/deps/mount_check-ab5cfb13434500ed)
+
+running 2 tests
+test mount_check_returns_507_for_every_object_data_verb_after_unmount ... ok
+test mount_check_false_allows_a_plain_saio_device_directory ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/multiphase.rs (target/release/deps/multiphase-ecaa69c99ff10533)
+
+running 4 tests
+test corrupt_footer_md5_is_422 ... ok
+test footer_etag_mismatch_is_422 ... ok
+test full_multiphase_put_stores_data_footers_and_overrides ... ok
+test ec_policy_put_is_durable_only_after_commit ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/replicate.rs (target/release/deps/replicate-261e37ea38acbfaa)
+
+running 5 tests
+test replicate_validates_path_policy_device_and_mount ... ok
+test replicate_returns_replication_hashes ... ok
+test replicate_returns_ec_fragment_and_durable_hashes ... ok
+test replicate_with_suffixes_only_invalidates_and_returns_none ... ok
+test rust_replicate_pickles_are_loadable_by_python ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/ssync.rs (target/release/deps/ssync-7056b9de5873e309)
+
+running 15 tests
+test ssync_encode_missing_matches_python_wire_format ... ok
+test ssync_advertises_accept_no_commit_in_the_response_head ... ok
+test ssync_enforces_path_device_and_mount_contract ... ok
+test ssync_incremental_parser_accepts_one_byte_feeds ... ok
+test ssync_incremental_parser_pauses_between_missing_check_and_updates ... ok
+test ssync_rejects_bad_framing_and_invalid_headers ... ok
+test ssync_rejects_oversized_lines_headers_and_bodies_without_panicking ... ok
+test ssync_truncated_sessions_drop_the_connection_like_python ... ok
+test ssync_applies_updates_sequentially_like_python_then_reports_the_error ... ok
+test unknown_policy_get_post_and_delete_fail_closed ... ok
+test unknown_policy_put_fails_closed_without_creating_policy_directory ... ok
+test unknown_policy_ssync_fails_closed_without_creating_policy_directory ... ok
+test ssync_missing_check_compares_local_data_and_metadata_timestamps ... ok
+test ssync_updates_apply_put_post_and_delete_subrequests ... ok
+test python_stdlib_batch_fixture_can_generate_request_and_parse_response ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/ssync_ec.rs (target/release/deps/ssync_ec-396592cd63b90ba2)
+
+running 6 tests
+test duplex_replication_round_trip_over_a_real_socket ... ok
+test reconstructor_revert_moves_a_handoff_fragment_and_purges_it ... ok
+test suffix_delta_fires_against_an_emptied_victim_partition ... ok
+test rust_sender_moves_a_fragment_to_the_rust_receiver ... ok
+test sync_job_rebuilds_the_fragment_at_the_receivers_index ... ok
+test duplex_ec_frag_index_missing_check_and_fragment_puts_over_a_real_socket ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+     Running tests/streaming.rs (target/release/deps/streaming-8d95bbf21411f0c5)
+
+running 5 tests
+test short_body_is_a_499_and_commits_nothing ... ok
+test single_range_get_streams_the_window ... ok
+test head_serves_metadata_without_reading_a_corrupt_data_file ... ok
+test multi_range_get_matches_the_buffered_oracle ... ok
+test streamed_put_commits_exactly_the_streamed_bytes_and_etag ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running unittests src/lib.rs (target/release/deps/swift_proxy_server-9861aa19064c3616)
+
+running 8 tests
+test policy_ring_tests::test_object_ring_for_selects_policy_ring ... ok
+test info_cache_tests::test_info_cache_time_matches_set_info_cache ... ok
+test stale_read_and_post_tests::test_backend_404_timestamp_absent_is_not_truthy ... ok
+test stale_read_and_post_tests::test_post_mixed_result_resolution ... ok
+test stale_read_and_post_tests::test_source_timestamp_precedence_and_fallbacks ... ok
+test stale_read_and_post_tests::test_is_good_source_matches_python ... ok
+test info_cache_tests::test_account_map_hit_expiry_and_clear ... ok
+test info_cache_tests::test_container_hit_expiry_and_clear ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running unittests src/main.rs (target/release/deps/swift_proxy_server-16cddbb4e3c0fe53)
+
+running 6 tests
+test startup_policy_tests::every_configured_policy_requires_its_own_ring ... ok
+test startup_policy_tests::server_options_read_workers_clients_timeout_and_log_conf ... ok
+test startup_policy_tests::proxy_config_reads_tuning_knobs_with_default_fallback ... ok
+test startup_policy_tests::ratelimit_filter_is_built_only_when_configured ... ok
+test startup_policy_tests::ec_ring_replica_mismatch_is_rejected ... ok
+test startup_policy_tests::startup_and_reload_share_one_build_path ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/ec_integration.rs (target/release/deps/ec_integration-421526afee3afb83)
+
+running 1 test
+test test_ec_object_put_get_round_trip_and_fragment_loss ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
+
+     Running tests/integration.rs (target/release/deps/integration-cd285918c78c52f4)
+
+running 7 tests
+test test_pipeline_healthcheck_gatekeeper_transid ... ok
+test test_get_unreachable_primaries_and_empty_handoff_is_503 ... ok
+test test_post_mixed_results_falls_back_to_handoff ... ok
+test test_get_stale_handoff_data_loses_to_newer_tombstones ... ok
+test test_proxy_end_to_end_account_and_container ... ok
+test test_proxy_object_round_trip ... ok
+test test_tempauth_end_to_end ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.58s
+
+   Doc-tests swift_ec
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_object_server
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests swift_proxy_server
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

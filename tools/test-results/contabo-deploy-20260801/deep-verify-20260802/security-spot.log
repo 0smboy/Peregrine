@@ -1,0 +1,36 @@
+### firewalld zones
+public
+  interfaces: eth0
+trusted
+  interfaces: eth3 eth2 eth1
+eth0: public
+eth1: trusted
+eth2: trusted
+eth3: trusted
+### ssh PasswordAuthentication
+/etc/ssh/sshd_config:PermitRootLogin yes
+/etc/ssh/sshd_config:PasswordAuthentication no
+/etc/ssh/sshd_config.d/00-no-password.conf:PasswordAuthentication no
+/etc/ssh/sshd_config.d/50-cloud-init.conf:PasswordAuthentication no
+/etc/ssh/sshd_config.d/99-no-password.conf:PasswordAuthentication no
+### eth0 public drop check
+public (active)
+  target: DROP
+  icmp-block-inversion: no
+  interfaces: eth0
+  sources: 
+  services: ssh
+  ports: 
+  protocols: 
+  forward: yes
+  masquerade: no
+  forward-ports: 
+  source-ports: 
+  icmp-blocks: 
+  rich rules: 
+	rule family="ipv4" port port="8404" protocol="tcp" reject
+	rule family="ipv4" port port="9100" protocol="tcp" reject
+	rule family="ipv4" port port="9102" protocol="tcp" reject
+	rule family="ipv4" port port="6201" protocol="tcp" reject
+	rule family="ipv4" port port="8080" protocol="tcp" reject
+	rule family="ipv4" port port="6202" protocol="tcp" reject
