@@ -1,0 +1,1 @@
+{"cluster":{"capacity_tb":0.643,"device_tb":0.054,"devices_total":12,"node_count":4,"policies":["Policy-0","ec-2-1"],"stored_tb":0.009,"usage_unknown":false,"zone_count":4},"suggested":{"cross_rack_gbps":10.0,"disk_cost_per_tb_year":20.0,"max_repair_hours":8.0,"raw_tb":0.214,"target_durability_nines":11.0,"tolerate_node_loss":1,"years":5.0}}

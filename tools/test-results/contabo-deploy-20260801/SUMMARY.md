@@ -35,6 +35,20 @@ Lab12 details: `lab12-deep-final/SUMMARY.md` on host (mirrored under this tree w
 - HAProxy backends local-only (Rust tempauth per-process)
 - Security hardening (firewall / disable password SSH) **not** in this pass
 
+## Write-path lever A/B (2026-08-02) — CLOSED
+
+| Lever | Decision | Primary note |
+|-------|----------|--------------|
+| L1a parallel `container_update` | **KEEP** (deployed) | `4KB_write_128` c1 ≈ **+24% PUT/s**, p99 ≈ **−30%** vs Phase0; fail=0 |
+| L1b always-async | **DROP** (reverted to sync) | ≈0.95× Phase0; code kept behind `container_update_mode=async` |
+| L3a multi-container | **OPS KEEP** | c4/c1 ≈1.19× @128; sharding (L3b) deferred |
+| L2 `fsync_on_close=false` | **DROP** | +4.9% &lt; 10% gate |
+| L4 `SO_REUSEPORT` | **DROP** | 0.84× baseline |
+| L5 tokio | SKIP / ADR | SAIO Rust 1KB c32 ≈ **3.8×** Python |
+
+Evidence pack: `perf-levers/SUMMARY.json` (+ Phase0 / L1a–L4 DECISION+COMPARE).  
+Git: Peregrine `main` @ `bda936f`.
+
 ## Drive
 
 `gdrive:Peregrine/2026-08-01-contabo/`

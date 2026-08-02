@@ -1,0 +1,1 @@
+neg http=502 body={"error":"second endpoint refused the login: auth request failed: error sending request for url (http://127.0.0.1:8090/auth/v1.0)"}
