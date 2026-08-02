@@ -4,7 +4,7 @@
 
 | Channel | Status | Location |
 |---------|--------|----------|
-| GitHub Peregrine `main` | See latest SHA after Phase F push | `https://github.com/0smboy/Peregrine` |
+| GitHub Peregrine `main` | Pushed `a24a556` (deep-verify) | `https://github.com/0smboy/Peregrine` |
 | Mac mirror | Complete | `Peregrine/tools/test-results/contabo-deploy-20260801/` |
 | Google Drive | `gdrive:Peregrine/2026-08-01-contabo/` | includes `deep-verify-20260802/` |
 | Contabo host (source) | Authoritative runtime | `/root/contabo-deploy-20260801T125749Z/` + `/root/contabo-deep-verify-20260802/` |
@@ -43,6 +43,7 @@
 | Live URL | https://peregrine-docs-ochre.vercel.app |
 | Performance page | https://peregrine-docs-ochre.vercel.app/performance/ |
 | Source | `docs-site/` (+ write-concurrency docs in Git) |
+| Last prod deploy | 2026-08-02 — `dpl_2bP7kdu9VZroKcXaMasmz847kzBr` (deep-verify Performance notes) |
 | Manual / agent publish | `cd docs-site && npm run deploy:prod` |
 | Auto on `main` | `.github/workflows/deploy-docs.yml` (needs `VERCEL_*` Actions secrets) |
 | Claim audit | `bash tools/docs-claim-audit.sh` before declaring docs done |
