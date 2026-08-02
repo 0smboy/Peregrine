@@ -1,10 +1,12 @@
 # Auto-publish docs-site → Vercel production on every main push that touches it.
-# Secrets (repo Settings → Secrets → Actions):
+#
+# GitHub → Settings → Secrets and variables → Actions:
 #   VERCEL_TOKEN       — https://vercel.com/account/tokens
+#                        Scope: Full Account，或至少覆盖团队 "0smboy's projects"
 #   VERCEL_ORG_ID      — team_2UuIPaF18B8OBgOpf3NC5KkK
 #   VERCEL_PROJECT_ID  — prj_ZiG8HzjzWAyBRVDA1GVpRkhRBs51
 #
-# Until secrets exist, agents must run: cd docs-site && npm run deploy:prod
+# Fallback: cd docs-site && npm run deploy:prod
 name: Deploy docs-site
 
 on:
@@ -33,24 +35,51 @@ jobs:
       - name: Install
         run: npm ci
 
-      - name: Pull Vercel project settings
+      - name: Check + normalize Vercel secrets
+        id: secrets
+        env:
+          RAW_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          RAW_ORG: ${{ secrets.VERCEL_ORG_ID }}
+          RAW_PROJECT: ${{ secrets.VERCEL_PROJECT_ID }}
         run: |
-          npx vercel pull --yes --environment=production \
-            --token="${{ secrets.VERCEL_TOKEN }}"
-        env:
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          set -euo pipefail
+          trim() { printf '%s' "$1" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+          TOKEN="$(trim "${RAW_TOKEN:-}")"
+          ORG="$(trim "${RAW_ORG:-}")"
+          PROJECT="$(trim "${RAW_PROJECT:-}")"
+          fail=0
+          if [[ ${#TOKEN} -lt 20 ]]; then
+            echo "::error::VERCEL_TOKEN empty/too short (len=${#TOKEN}). Create at https://vercel.com/account/tokens and paste into GitHub Actions secrets (not Vercel)."
+            fail=1
+          else
+            echo "VERCEL_TOKEN ok (len=${#TOKEN}, prefix=${TOKEN:0:4}…)"
+          fi
+          if [[ "$ORG" != team_* ]]; then
+            echo "::error::VERCEL_ORG_ID must be team_2UuIPaF18B8OBgOpf3NC5KkK (got len=${#ORG} prefix=${ORG:0:8})"
+            fail=1
+          else
+            echo "VERCEL_ORG_ID ok"
+          fi
+          if [[ "$PROJECT" != prj_* ]]; then
+            echo "::error::VERCEL_PROJECT_ID must be prj_ZiG8HzjzWAyBRVDA1GVpRkhRBs51 (got len=${#PROJECT} prefix=${PROJECT:0:8})"
+            fail=1
+          else
+            echo "VERCEL_PROJECT_ID ok"
+          fi
+          # Persist for later steps (masked by Actions when sourced from secrets)
+          {
+            echo "VERCEL_TOKEN=$TOKEN"
+            echo "VERCEL_ORG_ID=$ORG"
+            echo "VERCEL_PROJECT_ID=$PROJECT"
+          } >> "$GITHUB_ENV"
+          exit "$fail"
 
-      - name: Build
-        run: npx vercel build --prod --token="${{ secrets.VERCEL_TOKEN }}"
-        env:
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-
-      - name: Deploy prebuilt production
+      - name: Link project for CI
         run: |
-          npx vercel deploy --prebuilt --prod --yes \
-            --token="${{ secrets.VERCEL_TOKEN }}"
-        env:
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          set -euo pipefail
+          mkdir -p .vercel
+          python3 -c "import json,os; open('.vercel/project.json','w').write(json.dumps({'orgId':os.environ['VERCEL_ORG_ID'],'projectId':os.environ['VERCEL_PROJECT_ID']}, indent=2)+'\n')"
+          echo "Wrote .vercel/project.json"
+
+      - name: Deploy production
+        run: npx vercel --prod --yes --token="$VERCEL_TOKEN"
