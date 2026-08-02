@@ -1,0 +1,79 @@
+groups:
+  - name: swift_statsd_compat
+    interval: 15s
+    rules:
+      # Map statsd_exporter flat counters → labeled swift_request_total
+      - record: swift_request_total
+        expr: |
+          label_replace(
+            label_replace(
+              label_replace(
+                {__name__=~"proxy_server_(GET|PUT|POST|DELETE|HEAD|COPY|OPTIONS|CONNECT)_[0-9]{3}"},
+                "method", "$1", "__name__", "proxy_server_([A-Z]+)_[0-9]{3}"
+              ),
+              "status", "$1", "__name__", "proxy_server_[A-Z]+_([0-9]{3})"
+            ),
+            "service", "proxy-server", "__name__", ".*"
+          )
+      - record: swift_request_total
+        expr: |
+          label_replace(
+            label_replace(
+              label_replace(
+                {__name__=~"object_server_(GET|PUT|POST|DELETE|HEAD|COPY|REPLICATE|SSYNC)_[0-9]{3}"},
+                "method", "$1", "__name__", "object_server_([A-Z]+)_[0-9]{3}"
+              ),
+              "status", "$1", "__name__", "object_server_[A-Z]+_([0-9]{3})"
+            ),
+            "service", "object-server", "__name__", ".*"
+          )
+      - record: swift_request_total
+        expr: |
+          label_replace(
+            label_replace(
+              label_replace(
+                {__name__=~"container_server_(GET|PUT|POST|DELETE|HEAD|REPLICATE)_[0-9]{3}"},
+                "method", "$1", "__name__", "container_server_([A-Z]+)_[0-9]{3}"
+              ),
+              "status", "$1", "__name__", "container_server_[A-Z]+_([0-9]{3})"
+            ),
+            "service", "container-server", "__name__", ".*"
+          )
+      - record: swift_request_total
+        expr: |
+          label_replace(
+            label_replace(
+              label_replace(
+                {__name__=~"account_server_(GET|PUT|POST|DELETE|HEAD|REPLICATE)_[0-9]{3}"},
+                "method", "$1", "__name__", "account_server_([A-Z]+)_[0-9]{3}"
+              ),
+              "status", "$1", "__name__", "account_server_[A-Z]+_([0-9]{3})"
+            ),
+            "service", "account-server", "__name__", ".*"
+          )
+      # Avg latency stand-in (no histogram buckets from statsd timers)
+      - record: swift_request_duration_seconds_sum
+        expr: |
+          label_replace(proxy_server_timing_sum, "service", "proxy-server", "__name__", ".*")
+      - record: swift_request_duration_seconds_count
+        expr: |
+          label_replace(proxy_server_timing_count, "service", "proxy-server", "__name__", ".*")
+      - record: swift_request_duration_seconds_sum
+        expr: |
+          label_replace(object_server_GET_timing_sum, "service", "object-server", "__name__", ".*")
+      - record: swift_request_duration_seconds_count
+        expr: |
+          label_replace(object_server_GET_timing_count, "service", "object-server", "__name__", ".*")
+      # Replicator kinds
+      - record: swift_replicator_total
+        expr: label_replace(object_replicator_failures, "kind", "failures", "__name__", ".*")
+      - record: swift_replicator_total
+        expr: label_replace(object_replicator_reverts, "kind", "reverts", "__name__", ".*")
+      - record: swift_replicator_total
+        expr: label_replace(object_replicator_suffix_syncs, "kind", "suffix_syncs", "__name__", ".*")
+      - record: swift_replicator_total
+        expr: label_replace(object_reconstructor_failures, "kind", "recon_failures", "__name__", ".*")
+      - record: swift_replicator_total
+        expr: label_replace(object_reconstructor_reverts, "kind", "recon_reverts", "__name__", ".*")
+      - record: swift_replicator_total
+        expr: label_replace(object_reconstructor_suffix_syncs, "kind", "recon_suffix_syncs", "__name__", ".*")

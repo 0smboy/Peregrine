@@ -132,6 +132,7 @@ fn swob_response(status: u16) -> Response {
     let explanation = match status {
         404 => "The resource could not be found.",
         409 => "There was a conflict when trying to complete your request.",
+        422 => "Unable to process the contained instructions",
         503 => "The server is currently unavailable. Please try again at a later time.",
         507 => "There was not enough space to save the resource. Drive: ",
         _ => "",
@@ -1525,9 +1526,19 @@ impl ObjectServer {
             .map(|range| range.ranges_for_length(Some(obj_size)))
         {
             Some(Some(ranges)) if ranges.is_empty() => {
-                let mut resp = swob_response(416);
+                // Python object 416 keeps identifying headers + Accept-Ranges
+                // and returns a short HTML body (swob).
+                let body = concat!(
+                    "<html><h1>Requested Range Not Satisfiable</h1>",
+                    "<p>The Range requested is not available.</p></html>"
+                );
+                let mut resp = Response::with_body(416, body.as_bytes().to_vec());
                 resp.headers
                     .set("Content-Range", format!("bytes */{obj_size}"));
+                resp.headers.set("Accept-Ranges", "bytes");
+                resp.headers.set("ETag", format!("\"{etag}\""));
+                resp.headers.set("Last-Modified", http_date(x_ts.ceil()));
+                resp.headers.set("X-Timestamp", x_ts.normal());
                 return resp;
             }
             Some(Some(ranges)) if ranges.len() == 1 => {
@@ -1573,7 +1584,7 @@ impl ObjectServer {
                 // stream carries a Content-Length
                 let part_head = |start: u64, stop: u64| {
                     format!(
-                        "--{boundary}\r\nContent-Type: {content_type}\r\n{}\r\n\r\n",
+                        "--{boundary}\r\nContent-Type: {content_type}\r\nContent-Range: {}\r\n\r\n",
                         swift_http::content_range_header_value(start, stop, obj_size)
                     )
                 };

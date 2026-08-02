@@ -1,20 +1,29 @@
 # Lab cluster operations
 
-Reference layout for the four-node Azure HA lab used to develop and verify
+Reference layout for the four-node Contabo HA lab used to develop and verify
 Peregrine. This is the day-to-day cluster described in [`testing.md`](testing.md)
 §4 — not a production runbook.
 
+The previous Azure PAYG topology (`10.42.*` + ILB) is **retired**. Cutover
+notes: [`tools/CONTABO-CLUSTER.md`](../tools/CONTABO-CLUSTER.md). Azure doc
+[`tools/NEW-CLUSTER-CUTOVER.md`](../tools/NEW-CLUSTER-CUTOVER.md) is historical.
+
 ## Topology
 
-| Plane | CIDR / VIP | Role |
-|-------|------------|------|
-| Management | `10.42.10.1N` | SSH, Prometheus scrape, console loopback |
-| Replication | `10.42.20.1N` | Object/account/container sync |
-| Proxy / client | `10.42.30.1N` + ILB VIP `10.42.30.10:8085` | HAProxy frontends |
+| Plane | Address | Role |
+|-------|---------|------|
+| Management / SSH | public `169.58.108.{85,86,87,121}` | SSH, Ansible |
+| Proxy / client | `10.0.0.1–4` + Keepalived VIP **`10.0.0.10:8085`** | HAProxy → proxy `:8080` |
+| Storage | `10.0.4.1–4` | account/container/object data path |
+| Replication | `10.0.8.1–4` | replicator / reconstructor |
 
-Nodes: `swift1`–`swift4`. Prefer **node HAProxy** `http://10.42.30.1N:8085`
-for tests from a backend VM (Azure ILB hairpin from the backends themselves is
-unreliable). External clients in the VNet can use the VIP.
+Nodes: `swift1`–`swift4` (swift1 = hub + VIP MASTER). Prefer the **real VIP**
+`http://10.0.0.10:8085` for clients and gates. Per-node
+`http://10.0.0.N:8085` remains valid (local HAProxy backend only — see cutover
+note on tempauth).
+
+Devices: `/srv/node/{d1,d2,d3}` XFS per node (12 total). **Never format** them
+from deploy tooling.
 
 Storage policies (lab): `default` (replication) and `ec-2-1`
 (`liberasurecode_rs_vand`). Rings and `replication_key` must match across all
@@ -31,29 +40,30 @@ nodes.
 - On the build/console host (`swift1`): Prometheus, Loki, Alloy, statsd_exporter,
   node_exporter (all nodes), `swift-console`, `cabt` / `autocos`, Rust toolchain
   under `/root/.cargo` + `/root/.rustup`.
-- SELinux: `haproxy_connect_any=1`; after installing binaries run `restorecon`
-  so labels stay `bin_t`.
+- Python SAIO `:8090` + Rust SAIO `:8081` on swift1 for Lab Shadow.
+- SELinux: `haproxy_connect_any=1`; `ip_nonlocal_bind=1` for VIP binds; after
+  installing binaries run `restorecon` so labels stay `bin_t`.
+
+## Auth
+
+Harness credentials (unchanged): `test:tester` / `azure-swift-2026.bench`.
 
 ## Cutover / migration notes
 
-When replacing a subscription or VNet:
+When replacing a provider or VNet:
 
 1. Copy conf, rings, keys, bins, units, monitoring, SAIO, and lab tools — **not**
    `/srv/node` object bytes unless you explicitly need the dataset.
 2. Gate the new cluster with `swift-rust/tools/func-suite.sh`, `ha-test.sh`,
    `ec-heal-test.sh`, and a Prometheus `nodes_up=4` check.
 3. Operator checklist and evidence live under [`tools/`](../tools/)
-   (`NEW-CLUSTER-CUTOVER.md`, `test-results/`).
-
-Destroying an old cluster after cutover permanently drops any unmigrated
-object data. Confirm with the destroy go/no-go note in `tools/test-results/`
-before tearing down VMs.
+   (`CONTABO-CLUSTER.md`, `test-results/`).
 
 ## Build & install (Linux host)
 
 ```sh
 export PATH=/usr/local/bin:/root/.cargo/bin:$PATH
-cd /root/work/Peregrine/swift-rust   # or the synced engine tree
+cd /root/work/swift-rust
 cargo build --release \
   --features swift-proxy-server/ec,swift-object-server/ec
 # install bins, then:
@@ -68,5 +78,6 @@ Console / autocos follow the same pattern from their crates; see
 
 - [`testing.md`](testing.md) — verification levels and harnesses
 - [`architecture.md`](architecture.md) — component map
+- [`tools/CONTABO-CLUSTER.md`](../tools/CONTABO-CLUSTER.md) — Contabo endpoints
 - Docs site: [Operations](https://peregrine-docs-ochre.vercel.app/operations),
   [Testing](https://peregrine-docs-ochre.vercel.app/testing)

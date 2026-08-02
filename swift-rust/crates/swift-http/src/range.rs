@@ -254,8 +254,14 @@ pub fn multipart_byteranges(
     for &(start, stop) in ranges {
         out.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
         out.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
+        // Current OpenStack Swift emits the header name in each part
+        // (`Content-Range: bytes …`); older swob omitted the name.
         out.extend_from_slice(
-            format!("{}\r\n\r\n", content_range_header_value(start, stop, size)).as_bytes(),
+            format!(
+                "Content-Range: {}\r\n\r\n",
+                content_range_header_value(start, stop, size)
+            )
+            .as_bytes(),
         );
         out.extend_from_slice(&body[start as usize..stop as usize]);
         out.extend_from_slice(b"\r\n");
@@ -289,8 +295,8 @@ mod tests {
         let body = b"0123456789";
         let out = multipart_byteranges("BOUND", &[(0, 3), (5, 8)], body, "text/plain", 10);
         // byte-identical to swob's multi_range_iterator
-        let expected: &[u8] = b"--BOUND\r\nContent-Type: text/plain\r\nbytes 0-2/10\r\n\r\n012\r\n\
-                                --BOUND\r\nContent-Type: text/plain\r\nbytes 5-7/10\r\n\r\n567\r\n\
+        let expected: &[u8] = b"--BOUND\r\nContent-Type: text/plain\r\nContent-Range: bytes 0-2/10\r\n\r\n012\r\n\
+                                --BOUND\r\nContent-Type: text/plain\r\nContent-Range: bytes 5-7/10\r\n\r\n567\r\n\
                                 --BOUND--";
         assert_eq!(out, expected);
         assert_eq!(

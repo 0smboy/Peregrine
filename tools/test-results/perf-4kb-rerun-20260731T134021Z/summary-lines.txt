@@ -1,0 +1,5 @@
+WRITE stage=init ok=4 fail=0 success=100.00% p99_us=36831
+WRITE stage=normal ok=30801 fail=0 success=100.00% p99_us=2611199
+READ stage=init ok=4 fail=0 success=100.00% p99_us=37535
+READ stage=prepare ok=16000 fail=0 success=100.00% p99_us=2738175
+READ stage=normal ok=377121 fail=0 success=100.00% p99_us=48031

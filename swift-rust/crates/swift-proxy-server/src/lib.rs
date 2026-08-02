@@ -336,6 +336,7 @@ fn swob_response(status: u16) -> Response {
         501 => "The requested method is not implemented by this server.",
         412 => "A precondition for this request was not met.",
         400 => "The server could not comply with the request since it is either malformed or otherwise incorrect.",
+        422 => "Unable to process the contained instructions",
         _ => "",
     };
     let mut resp = if explanation.is_empty() {
@@ -1671,6 +1672,19 @@ impl ProxyApp {
                 }
                 out.headers.set(k, v);
             }
+            // Python GetOrHeadHandler.get_working_response emits Accept-Ranges
+            // on successful account/container/object GET/HEAD. Do not attach it
+            // to 4xx (Python 404s omit it; adding it here flips to a new break).
+            if (200..300).contains(&out.status) {
+                out.headers.set("Accept-Ranges", "bytes");
+            }
+            // HEAD/empty 2xx: Python always emits Content-Length (0 when there
+            // is no body). Some backends omit it; without this the client-facing
+            // contract header disappears.
+            if is_head && (200..300).contains(&out.status) && out.headers.get("Content-Length").is_none()
+            {
+                out.headers.set("Content-Length", 0);
+            }
             out
         };
         // Object GET bodies stream backend->client; everything else
@@ -1690,6 +1704,9 @@ impl ProxyApp {
                     continue;
                 }
                 out.headers.set(k, v);
+            }
+            if (200..300).contains(&out.status) {
+                out.headers.set("Accept-Ranges", "bytes");
             }
             out.body = head.into_body();
             out
@@ -2365,7 +2382,8 @@ impl ProxyApp {
                 };
                 let container_nodes = self.iter_nodes(&self.container_ring, container_part);
                 let mut base = self.backend_headers(req, true, "object");
-                base.set("X-Timestamp", Timestamp::now().internal());
+                let put_ts = Timestamp::now();
+                base.set("X-Timestamp", put_ts.internal());
                 // Route the write/tombstone to the right policy datadir (see
                 // the GET note above) — an EC DELETE landing in objects/ would
                 // 404 and leave the fragments orphaned.
@@ -2417,7 +2435,7 @@ impl ProxyApp {
                     // fan_out + quorum are the stream_put wall time.
                     let _fan =
                         swift_core::stage::StageTimer::start("proxy-server", "put", "fan_out");
-                    let resp = self.stream_put_object(
+                    let mut resp = self.stream_put_object(
                         object_nodes,
                         node_number,
                         object_part,
@@ -2429,6 +2447,12 @@ impl ProxyApp {
                     drop(_fan);
                     swift_core::stage::observe("proxy-server", "put", "quorum", 0.0);
                     swift_core::stage::observe("proxy-server", "put", "auth", 0.0);
+                    // obj.py:_store_object — every PUT answer (201 and 422
+                    // alike) carries Last-Modified from the request timestamp.
+                    resp.headers.set(
+                        "Last-Modified",
+                        swift_http::http_date(put_ts.ceil()),
+                    );
                     return resp;
                 }
                 // DELETE carries no body.
@@ -2487,7 +2511,8 @@ impl ProxyApp {
         // object server verifies its own bytes against it), computable
         // only when the client declared a length.
         let archive_len = client_len.map(|total| ec_archive_size(&driver, ec.segment_size, total));
-        let ts = Timestamp::now().internal();
+        let put_ts = Timestamp::now();
+        let ts = put_ts.internal();
         let content_type = req
             .headers
             .get("Content-Type")
@@ -2693,7 +2718,10 @@ impl ProxyApp {
         if let Some(client_etag) = req.headers.get("ETag") {
             let norm = client_etag.trim_matches('"');
             if !norm.is_empty() && !norm.eq_ignore_ascii_case(&ec_etag) {
-                return swob_response(422);
+                let mut resp = swob_response(422);
+                resp.headers
+                    .set("Last-Modified", swift_http::http_date(put_ts.ceil()));
+                return resp;
             }
         }
 
@@ -2745,6 +2773,8 @@ impl ProxyApp {
             resp.headers.set("Content-Type", &content_type);
             resp.headers.set("X-Timestamp", &ts);
             resp.headers.set("Content-Length", 0);
+            resp.headers
+                .set("Last-Modified", swift_http::http_date(put_ts.ceil()));
             resp
         } else {
             swob_response(503)
@@ -2867,10 +2897,28 @@ impl ProxyApp {
 
         if let Some(ranges) = &resolved_ranges {
             if ranges.is_empty() {
-                let mut resp = swob_response(416);
+                // Match Python object 416: Content-Range + Accept-Ranges plus
+                // the object's identifying headers (etag / last-modified /
+                // x-timestamp) and a short explanatory body.
+                let body = concat!(
+                    "<html><h1>Requested Range Not Satisfiable</h1>",
+                    "<p>The Range requested is not available.</p></html>"
+                );
+                let mut resp = Response::with_body(416, body.as_bytes().to_vec());
                 resp.headers
                     .set("Content-Range", format!("bytes */{orig_size}"));
                 resp.headers.set("Accept-Ranges", "bytes");
+                if let Some(etag) =
+                    resp_header(&meta, "ETag").or_else(|| resp_header(&meta, "Etag"))
+                {
+                    resp.headers.set("Etag", etag.trim_matches('"'));
+                }
+                if let Some(lm) = resp_header(&meta, "Last-Modified") {
+                    resp.headers.set("Last-Modified", lm);
+                }
+                if let Some(ts) = resp_header(&meta, "X-Timestamp") {
+                    resp.headers.set("X-Timestamp", ts);
+                }
                 return resp;
             }
         }
@@ -2995,7 +3043,7 @@ impl ProxyApp {
         let mut total_len: u64 = 0;
         for &(start, stop) in ranges {
             let head = format!(
-                "--{boundary}\r\nContent-Type: {content_type}\r\n{}\r\n\r\n",
+                "--{boundary}\r\nContent-Type: {content_type}\r\nContent-Range: {}\r\n\r\n",
                 swift_http::content_range_header_value(start, stop, orig_size as u64)
             )
             .into_bytes();
@@ -3277,7 +3325,8 @@ fn synthesized_account_listing(req: &Request) -> Response {
     };
     // A HEAD (or an empty listing) is 204 with no body; a GET with a
     // format still returns the empty document at 200.
-    let mut resp = if req.method == "HEAD" || body.is_empty() {
+    let empty = body.is_empty();
+    let mut resp = if req.method == "HEAD" || empty {
         Response::new(204)
     } else {
         Response::with_body(200, body)
@@ -3288,6 +3337,10 @@ fn synthesized_account_listing(req: &Request) -> Response {
     resp.headers.set("X-Account-Bytes-Used", 0);
     resp.headers.set("X-Timestamp", now.normal());
     resp.headers.set("X-PUT-Timestamp", now.normal());
+    resp.headers.set("Accept-Ranges", "bytes");
+    if req.method == "HEAD" || empty {
+        resp.headers.set("Content-Length", 0);
+    }
     resp
 }
 

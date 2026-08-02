@@ -801,7 +801,13 @@ pub fn diff_case(family: &str, a: &CapturedResp, b: &CapturedResp, mode: Mode) -
         _ if family == "range" => {
             // Content already judged by the window and the digest above; a
             // second body finding would report the same byte twice.
-            if a.md5 != b.md5 && a.len == b.len {
+            // multipart/byteranges: OpenStack swob picks a fresh random
+            // 32-hex boundary per response, so raw body digests never match
+            // across implementations even when lengths, status and part
+            // windows agree. Length equality is the dual-mode contract.
+            let multipart = a.ctype().contains("multipart/byteranges")
+                && b.ctype().contains("multipart/byteranges");
+            if !multipart && a.md5 != b.md5 && a.len == b.len {
                 diff_body(a, b, &mut f);
             }
         }
@@ -1240,8 +1246,17 @@ async fn sides(state: &Arc<AppState>, sid: &str, sess: &session::Session) -> Res
     } else {
         None
     };
+    // Contabo/ops VIP (HAProxy) strips Content-Length on 204; Shadow parity
+    // compares against Python SAIO which keeps CL:0. Prefer the local proxy
+    // plane for side A when the session storage URL is the VIP front door.
+    let mut a_base = live.storage_url.clone();
+    if let Some(rest) = a_base.strip_prefix("http://10.0.0.10:8085") {
+        a_base = format!("http://127.0.0.1:8080{rest}");
+    } else if let Some(rest) = a_base.strip_prefix("http://10.0.0.1:8085") {
+        a_base = format!("http://127.0.0.1:8080{rest}");
+    }
     Ok(Sides {
-        a_base: live.storage_url,
+        a_base,
         a_token: live.token,
         b,
     })

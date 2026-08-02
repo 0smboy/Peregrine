@@ -1,3 +1,9 @@
+# New PAYG cluster cutover (2026-07-31) — RETIRED
+
+> **Retired 2026-08-01.** Active lab is Contabo (`10.0.0.0/24` VIP
+> `10.0.0.10`). See [`CONTABO-CLUSTER.md`](CONTABO-CLUSTER.md).
+> Azure hosts remapped to `swift-old*` in SSH config; do not use for new work.
+
 # New PAYG cluster cutover (2026-07-31)
 
 ## Endpoints
@@ -37,6 +43,12 @@ cd /root/work/Peregrine/swift-console   # or /root/work/swift-rust
 - Verdict: **ACCEPT** (G8 VIP WARN — ILB hairpin / 92% auth from swift3)
 - Gap-fill applied: EC plugin libs, auditor.timer, EC-enabled bins from `backup-20260730-112444`, SAIO (8090/8081), cabt/autocos, shadow corpus, docs
 - Hard gates G0–G7 PASS including func-suite 54/54, HA drill, EC heal, nodes_up=4
+- **R1 func** (empty-ish lab): `func-test-20260731-SUMMARY.md` — func-suite 54/54 ×4 nodes; ACL/meta; edge-diag; EC heal; Rust SAIO 54/54
+- **R2 HA/console/recon** (plan-first): `func-test-r2-20260731T130611Z-SUMMARY.md` — ha-test swift2 degraded **20/20** repl+EC; console hard APIs OK (3 relative-URL false FAILs); recon failures=0 / part-871=0; py-saio SKIP/WARN (memcached installed; oracle still 503-heavy)
+- **Perf full matrix** (plan-first): `perf-test-20260731T131513Z-SUMMARY.md` — **ACCEPT_WITH_WARN**; bench repl+EC err=0; cbench/wbench errs=0; autocos 60s (4KB read 83.94% success WARN); Drive `gdrive:Peregrine/2026-07-31-lab-456/perf-tests/20260731T131513Z/` (+ func-tests/ archive)
+- **4KB read RCA + retune**: `perf-4kb-rerun-20260731T134021Z-SUMMARY.md` — root cause client TIME_WAIT/`ulimit -n=1024` (not Swift); sysctl+nofile+`ST_ENDPOINT`; rerun write/read **fail=0** (read ok=377121); Drive `.../perf-tests/20260731T134021Z-4kb-rca/`
+
+- **Lab12 deep** (interrupted): `lab12-deep-20260731T142015Z` — overall **REJECT**; Shadow dual peer=Python:8090 **breaking=15**; Azure ReadOnlyDisabled stopped VMs mid-run; Drive `.../lab-tests/20260731T142015Z/`
 
 ## Destroy old VMs
 
