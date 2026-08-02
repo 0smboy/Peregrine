@@ -125,14 +125,13 @@ fn main() {
             "true" | "1" | "yes" | "on" | "t" | "y"
         ),
         hash_config,
-        diskfile: {
-            let mut df = DiskFileConfig::default();
+        diskfile: DiskFileConfig {
             // L2 A/B knob: fsync_on_close = false skips put/rename fsync.
-            df.fsync_on_close = matches!(
+            fsync_on_close: matches!(
                 get("fsync_on_close", "true").to_lowercase().as_str(),
                 "true" | "1" | "yes" | "on" | "t" | "y"
-            );
-            df
+            ),
+            ..DiskFileConfig::default()
         },
         policies,
         container_update_timeout: std::time::Duration::from_secs_f64(

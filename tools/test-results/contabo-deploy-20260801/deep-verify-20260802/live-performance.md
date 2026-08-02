@@ -1,9 +1,13 @@
 ---
-title: Performance
-description: Measured throughput and latency, the accept-loop fix that made the rewrite faster than Python, and the write-concurrency optimization.
-sidebar:
-  order: 23
+title: "Performance"
+description: "Measured throughput and latency, the accept-loop fix that made the rewrite faster than Python, and the write-concurrency optimization."
 ---
+
+> Documentation Index
+> Fetch the complete documentation index at: https://peregrine-docs-ochre.vercel.app/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Performance
 
 All numbers are from a four-node Contabo HA lab and same-host SAIO A/Bs against
 Python OpenStack Swift 2.35.0. Evidence pack:
@@ -27,11 +31,11 @@ plus `TCP_NODELAY` on the outbound backend sockets.
 | cluster 1 KB PUT | ~200 ms | 27 ms |
 | cluster 1 KB GET | ~92 ms | 9 ms |
 
-<Aside type="danger" title="This bug masked everything">
-Before the fix the cluster was 3–15× slower than the Python it replaces. After
-it, Rust is 2.7–4.4× faster than Python on reads. Small-write A/Bs below are on
-that fixed accept path.
-</Aside>
+> **This bug masked everything**
+>
+> Before the fix the cluster was 3–15× slower than the Python it replaces. After
+> it, Rust is 2.7–4.4× faster than Python on reads. Small-write A/Bs below are on
+> that fixed accept path.
 
 ## Rust vs Python (same-host SAIO A/B)
 
@@ -43,12 +47,10 @@ that fixed accept path.
 | 1 KB PUT · c1 / c32 | **71.8 / 264.4 op/s** | 32.3 / 69.8 op/s |
 
 Reads win at every size. **Small writes too:** SAIO 1 KB PUT @c32 is
-~**3.79×** Python in the dated evidence pack (median of 3 runs,
-`perf-levers/SUMMARY.json` → `saio_phase0`, 2026-08-02). A deep-verify re-check
-the same day measured ~**3.45×** (Rust 236.7 / Python 68.6, fail=0) under shared
-host noise — still ≫ Python; table keeps the phase0 pack numbers. That pack
-already includes workers=16 + lock-free accept; it is **not** an L1a delta
-(L1a SAIO re-check was ~0.92× phase0 Rust and was not the KEEP gate).
+~**3.79×** Python (median of 3 runs, `perf-levers/SUMMARY.json` →
+`saio_phase0`, 2026-08-02). That pack already includes workers=16 + lock-free
+accept; it is **not** an L1a delta (L1a SAIO re-check was ~0.92× phase0 Rust and
+was not the KEEP gate).
 
 Retired baseline (pre workers/accept work): 54 / 159 vs 32 / 255 — do not treat
 as current.
@@ -59,12 +61,6 @@ A 90-second mixed 80/20 run at 64 workers: **240,120 ops, 0 failures,
 2,667 ops/s, 167 MiB/s, p50 9.6 ms / p99 127 ms**. A `autocos` sweep (6 tasks) ran
 with 0 failures; reads reached 4,180 ops/s (4 KB), 1,346 MB/s (1 MB), and
 1,920 MB/s (16 MB).
-
-**Clean-load re-measure (2026-08-02, client swift4 → VIP `10.0.0.10:8085`):**
-4KB write @128 ≈ **138 ops/s** fail=0; 4KB read @128 ≈ **1055 ops/s** fail=0;
-1MB write/read @32 fail=0. **16MB read @8 remains ACCEPT_WITH_WARN** (normal-stage
-success ~9% even after prepare 80/80) — see
-`deep-verify-20260802/PERF-REMEASURE.md`. Do not treat 16MB as cleared.
 
 ## Write-concurrency optimization
 
@@ -109,3 +105,5 @@ reuse_port = false
 Updater `concurrency = 16` / `interval = 5` kept for pending drain on sync
 failures. Evidence: `perf-levers/SUMMARY.json` + per-lever `COMPARE` /
 `DECISION` JSON.
+
+Source: https://peregrine-docs-ochre.vercel.app/performance/index.mdx

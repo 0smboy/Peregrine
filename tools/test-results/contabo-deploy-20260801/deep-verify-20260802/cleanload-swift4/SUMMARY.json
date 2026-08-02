@@ -1,0 +1,224 @@
+{
+  "client": "swift4",
+  "target": "http://10.0.0.10:8085",
+  "note": "last-rep only per task log (overwrote); fail=0 gates for 4KB/1MB; 16MB read still prepare-limited",
+  "4KB_write_128": {
+    "prepare": null,
+    "normal": {
+      "stage": "normal",
+      "ok": 8301,
+      "fail": 0,
+      "success": "100.00%",
+      "p99_us": 1836031,
+      "ops_per_s": 138.35
+    },
+    "all_stages": [
+      {
+        "stage": "init",
+        "ok": 1,
+        "fail": 0,
+        "success": "100.00%",
+        "p99_us": 73343,
+        "ops_per_s": null
+      },
+      {
+        "stage": "normal",
+        "ok": 8301,
+        "fail": 0,
+        "success": "100.00%",
+        "p99_us": 1836031,
+        "ops_per_s": 138.35
+      }
+    ]
+  },
+  "4KB_read_128": {
+    "prepare": {
+      "stage": "prepare",
+      "ok": 4000,
+      "fail": 0,
+      "success": "100.00%",
+      "p99_us": 1760255,
+      "ops_per_s": null
+    },
+    "normal": {
+      "stage": "normal",
+      "ok": 63272,
+      "fail": 0,
+      "success": "100.00%",
+      "p99_us": 365823,
+      "ops_per_s": 1054.533
+    },
+    "all_stages": [
+      {
+        "stage": "init",
+        "ok": 1,
+        "fail": 0,
+        "success": "100.00%",
+        "p99_us": 130111,
+        "ops_per_s": null
+      },
+      {
+        "stage": "prepare",
+        "ok": 4000,
+        "fail": 0,
+        "success": "100.00%",
+        "p99_us": 1760255,
+        "ops_per_s": null
+      },
+      {
+        "stage": "normal",
+        "ok": 63272,
+        "fail": 0,
+        "success": "100.00%",
+        "p99_us": 365823,
+        "ops_per_s": 1054.533
+      }
+    ]
+  },
+  "1MB_write_32": {
+    "prepare": null,
+    "normal": {
+      "stage": "normal",
+      "ok": 2516,
+      "fail": 0,
+      "success": "100.00%",
+      "p99_us": 1343487,
+      "ops_per_s": 41.933
+    },
+    "all_stages": [
+      {
+        "stage": "init",
+        "ok": 1,
+        "fail": 0,
+        "success": "100.00%",
+        "p99_us": 58175,
+        "ops_per_s": null
+      },
+      {
+        "stage": "normal",
+        "ok": 2516,
+        "fail": 0,
+        "success": "100.00%",
+        "p99_us": 1343487,
+        "ops_per_s": 41.933
+      }
+    ]
+  },
+  "1MB_read_32": {
+    "prepare": {
+      "stage": "prepare",
+      "ok": 500,
+      "fail": 0,
+      "success": "100.00%",
+      "p99_us": 3338239,
+      "ops_per_s": null
+    },
+    "normal": {
+      "stage": "normal",
+      "ok": 4793,
+      "fail": 0,
+      "success": "100.00%",
+      "p99_us": 1245183,
+      "ops_per_s": 79.883
+    },
+    "all_stages": [
+      {
+        "stage": "init",
+        "ok": 1,
+        "fail": 0,
+        "success": "100.00%",
+        "p99_us": 92671,
+        "ops_per_s": null
+      },
+      {
+        "stage": "prepare",
+        "ok": 500,
+        "fail": 0,
+        "success": "100.00%",
+        "p99_us": 3338239,
+        "ops_per_s": null
+      },
+      {
+        "stage": "normal",
+        "ok": 4793,
+        "fail": 0,
+        "success": "100.00%",
+        "p99_us": 1245183,
+        "ops_per_s": 79.883
+      }
+    ]
+  },
+  "16MB_write_8": {
+    "prepare": null,
+    "normal": {
+      "stage": "normal",
+      "ok": 497,
+      "fail": 0,
+      "success": "100.00%",
+      "p99_us": 5148671,
+      "ops_per_s": 2.761
+    },
+    "all_stages": [
+      {
+        "stage": "init",
+        "ok": 1,
+        "fail": 0,
+        "success": "100.00%",
+        "p99_us": 166527,
+        "ops_per_s": null
+      },
+      {
+        "stage": "normal",
+        "ok": 497,
+        "fail": 0,
+        "success": "100.00%",
+        "p99_us": 5148671,
+        "ops_per_s": 2.761
+      }
+    ]
+  },
+  "16MB_read_8": {
+    "prepare": {
+      "stage": "prepare",
+      "ok": 80,
+      "fail": 0,
+      "success": "100.00%",
+      "p99_us": 31293439,
+      "ops_per_s": null
+    },
+    "normal": {
+      "stage": "normal",
+      "ok": 632,
+      "fail": 6267,
+      "success": "9.16%",
+      "p99_us": 3131391,
+      "ops_per_s": 5.267
+    },
+    "all_stages": [
+      {
+        "stage": "init",
+        "ok": 1,
+        "fail": 0,
+        "success": "100.00%",
+        "p99_us": 38975,
+        "ops_per_s": null
+      },
+      {
+        "stage": "prepare",
+        "ok": 80,
+        "fail": 0,
+        "success": "100.00%",
+        "p99_us": 31293439,
+        "ops_per_s": null
+      },
+      {
+        "stage": "normal",
+        "ok": 632,
+        "fail": 6267,
+        "success": "9.16%",
+        "p99_us": 3131391,
+        "ops_per_s": 5.267
+      }
+    ]
+  }
+}

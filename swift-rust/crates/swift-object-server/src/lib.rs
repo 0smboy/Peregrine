@@ -1963,6 +1963,7 @@ impl ObjectServer {
 
 /// Fire one container-server update over a fresh TCP connection, honouring
 /// `timeout` for connect + read (Python `container_update_timeout`).
+#[allow(clippy::too_many_arguments)]
 fn sync_container_http(
     op: &str,
     host: &str,

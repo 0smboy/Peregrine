@@ -1,7 +1,7 @@
 #!/bin/bash
 # Steady-state VIP reliability + capture the haproxy log lines for failures.
 set -u
-VIP=http://10.42.30.10:8085
+VIP=${VIP:-http://10.0.0.10:8085}
 N=${1:-100}
 ok=0; bad=0; badcodes=""
 t0=$(date +%s)

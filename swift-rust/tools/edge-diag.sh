@@ -7,7 +7,7 @@
 set -u
 USR=${1:?user}; KEY=${2:?key}
 PROXY=http://127.0.0.1:8080
-VIP=http://10.42.30.10:8085
+VIP=${VIP:-http://10.0.0.10:8085}
 
 tok() { curl -s -m20 -D - -o /dev/null -H "X-Auth-User: $USR" -H "X-Auth-Key: $KEY" "$1/auth/v1.0" \
         | awk 'tolower($1)=="x-auth-token:"{print $2}' | tr -d '\r'; }

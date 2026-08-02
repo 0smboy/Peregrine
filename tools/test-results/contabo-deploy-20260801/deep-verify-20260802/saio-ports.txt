@@ -1,0 +1,4 @@
+=== SAIO listeners ===
+LISTEN 0      4096       127.0.0.1:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=429922,fd=19),("swift-proxy-ser",pid=429915,fd=19))
+LISTEN 0      4096       127.0.0.1:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=429921,fd=17),("swift-proxy-ser",pid=429915,fd=17))
+LISTEN 0      128        127.0.0.1:8081       0.0.0.0:*    users:(("swift-proxy-ser",pid=32589,fd=4))                                       

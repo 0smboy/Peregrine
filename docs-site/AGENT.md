@@ -27,6 +27,22 @@ src/
 └── styles/                  # globals.css, prose.css
 ```
 
+## Evidence alignment (mandatory)
+
+Project rule: `.cursor/rules/evidence-alignment.mdc`. Before claiming docs or
+perf numbers are current:
+
+```bash
+# from repo root
+bash tools/docs-claim-audit.sh
+```
+
+Three-way check every changed claim: **source ↔ live site ↔**
+`tools/test-results/contabo-deploy-20260801/perf-levers/SUMMARY.json`.
+Do not update one paragraph while leaving stale tables/topology/KEEP-DROP
+elsewhere. Contabo VIP `10.0.0.10:8085` is current lab (Azure/`10.42.*` only as
+retired). SAIO on swift1: Python `:8090`, Rust `:8081`.
+
 ## Publish (Vercel — keep live in sync)
 
 Production site: <https://peregrine-docs-ochre.vercel.app>
@@ -39,10 +55,9 @@ claiming done:**
 cd docs-site && npm run deploy:prod
 ```
 
-CI: `.github/workflows/deploy-docs.yml` auto-deploys on `main` pushes that
-touch `docs-site/**` once `VERCEL_TOKEN` / `VERCEL_ORG_ID` / `VERCEL_PROJECT_ID`
-are set as GitHub Actions secrets. Until then, the local `deploy:prod` path is
-mandatory for every docs content change.
+Then confirm live `/performance` and `/lab-cluster` markdown alternates contain
+the new tokens. CI: `.github/workflows/deploy-docs.yml` on `main` when
+`VERCEL_*` Actions secrets are set.
 
 ## Writing docs
 

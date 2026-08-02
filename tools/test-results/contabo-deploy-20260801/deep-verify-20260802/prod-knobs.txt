@@ -1,0 +1,39 @@
+=== prod knobs sample (swift1 object-server) ===
+-- /etc/swift/object-server.conf
+reuse_port = false
+fsync_on_close = true
+container_update_timeout = 1.0
+container_update_mode = sync
+workers = 16
+== swift1 ==
+(no match)
+== swift2 ==
+(no match)
+== swift3 ==
+(no match)
+== swift4 ==
+(no match)
+== 10.0.0.1 ==
+reuse_port = false
+fsync_on_close = true
+container_update_timeout = 1.0
+container_update_mode = sync
+workers = 16
+== 10.0.0.2 ==
+reuse_port = false
+fsync_on_close = true
+container_update_timeout = 1.0
+container_update_mode = sync
+workers = 16
+== 10.0.0.3 ==
+reuse_port = false
+fsync_on_close = true
+container_update_timeout = 1.0
+container_update_mode = sync
+workers = 16
+== 10.0.0.4 ==
+reuse_port = false
+fsync_on_close = true
+container_update_timeout = 1.0
+container_update_mode = sync
+workers = 16

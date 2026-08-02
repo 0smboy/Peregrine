@@ -2,22 +2,29 @@
 # High-availability drill DRIVEN THROUGH swift-console's node-down feature:
 # take swift2 down via /lab/api/node/down, verify reads/writes survive on the
 # survivors, then bring it back via /lab/api/node/up. Runs on swift1.
+#
+# Usage (optional overrides):
+#   ha-test.sh [LB_BASE] [user] [key]
+# Defaults: Contabo VIP http://10.0.0.10:8085
 set -u
-CON=http://127.0.0.1:9000
-LB=http://10.42.30.11:8085          # a specific HAProxy (no ILB hairpin)
-DOWN_NODE=swift2
+CON=${CON:-http://127.0.0.1:9000}
+LB=${1:-http://10.0.0.10:8085}
+USR=${2:-test:tester}
+KEY=${3:-azure-swift-2026.bench}
+DOWN_NODE=${DOWN_NODE:-swift2}
 J=/tmp/ha.jar; rm -f "$J"
 
 # --- console session ---
-curl -s -m15 -c "$J" -o /dev/null -X POST -d 'tenant=test&user=tester&key=azure-swift-2026.bench' "$CON/login"
+curl -s -m15 -c "$J" -o /dev/null -X POST -d "tenant=test&user=tester&key=$KEY" "$CON/login"
 capi(){ curl -s -m30 -b "$J" "$@"; }
 
-# --- swift workload helpers (via HAProxy, tempauth) ---
+# --- swift workload helpers (via HAProxy/VIP, tempauth) ---
 B="$LB/v1/AUTH_test"
 # Fresh token: real clients re-auth on 401, and tempauth tokens cached on a
 # downed node's memcached go invalid, so each phase re-authenticates.
-auth(){ curl -s -m10 -D - -o /dev/null -H "X-Auth-User: test:tester" -H "X-Auth-Key: azure-swift-2026.bench" "$LB/auth/v1.0" | awk 'tolower($1)=="x-auth-token:"{print $2}' | tr -d '\r'; }
+auth(){ curl -s -m10 -D - -o /dev/null -H "X-Auth-User: $USR" -H "X-Auth-Key: $KEY" "$LB/auth/v1.0" | awk 'tolower($1)=="x-auth-token:"{print $2}' | tr -d '\r'; }
 TOK=$(auth)
+if [ -z "$TOK" ]; then echo "FATAL: auth failed against $LB"; exit 3; fi
 rep=ha-rep-$RANDOM ; ec=ha-ec-$RANDOM
 curl -s -X PUT -H "X-Auth-Token: $TOK" "$B/$rep" >/dev/null
 curl -s -X PUT -H "X-Auth-Token: $TOK" -H "X-Storage-Policy: ec-2-1" "$B/$ec" >/dev/null
@@ -39,7 +46,7 @@ workload(){ # <label> <container> <n>
     "$(echo $rcodes | tr ' ' '\n' | sort | uniq -c | tr '\n' ' ')"
 }
 
-echo "===== BASELINE (all nodes up) ====="
+echo "===== BASELINE (all nodes up) LB=$LB ====="
 capi "$CON/lab/api/node/status" | grep -o '"up":[a-z]*' | sort | uniq -c | sed 's/^/  /'
 workload "repl baseline"  "$rep" 10
 workload "ec baseline"    "$ec"  10
@@ -65,6 +72,7 @@ capi "$CON/lab/api/node/status" | grep -o '"up":[a-z]*' | sort | uniq -c | sed '
 workload "repl recovered" "$rep" 10
 
 echo "===== cleanup ====="
+TOK=$(auth)
 for c in "$rep" "$ec"; do
   for o in $(curl -s -m15 -H "X-Auth-Token: $TOK" "$B/$c"); do curl -s -X DELETE -H "X-Auth-Token: $TOK" "$B/$c/$o" >/dev/null; done
   curl -s -X DELETE -H "X-Auth-Token: $TOK" "$B/$c" >/dev/null

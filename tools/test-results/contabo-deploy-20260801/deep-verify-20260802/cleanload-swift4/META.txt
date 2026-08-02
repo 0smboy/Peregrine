@@ -1,0 +1,1 @@
+host=swift4 AUTOCOS=/usr/local/bin/autocos 2026-08-02T07:31:16Z

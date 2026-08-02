@@ -5,15 +5,15 @@
 #
 # Client tuning (required for 128-worker 4KB write→read):
 #   - ulimit -n >= 65535 (default 1024 + TIME_WAIT storm → connect fails)
-#   - ST_ENDPOINT must point at a node HAProxy, not VIP 10.42.30.10 (hairpin)
+#   - Contabo: prefer Keepalived VIP 10.0.0.10:8085 (override ST_* as needed)
 # Host sysctl (persistent on load node): /etc/sysctl.d/99-swift-bench.conf
 #   ip_local_port_range=1024 65535, tcp_tw_reuse=1, tcp_fin_timeout=15
 set -u
 ulimit -n 65535 2>/dev/null || true
-export ST_AUTH=http://10.42.30.11:8085/auth/v1.0
-export ST_USER=test:tester
-export ST_KEY=azure-swift-2026.bench
-export ST_ENDPOINT=http://10.42.30.11:8085/v1/AUTH_test
+export ST_AUTH=${ST_AUTH:-http://10.0.0.10:8085/auth/v1.0}
+export ST_USER=${ST_USER:-test:tester}
+export ST_KEY=${ST_KEY:-azure-swift-2026.bench}
+export ST_ENDPOINT=${ST_ENDPOINT:-http://10.0.0.10:8085/v1/AUTH_test}
 AUTOCOS=${AUTOCOS:-/usr/local/bin/autocos}
 if [[ ! -x "$AUTOCOS" ]]; then
   AUTOCOS=/root/work/autocos-rs/target/release/autocos

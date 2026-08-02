@@ -1,0 +1,86 @@
+---
+title: "Lab cluster"
+description: "Four-node Contabo HA lab layout, EC build requirements, and cutover rules."
+---
+
+> Documentation Index
+> Fetch the complete documentation index at: https://peregrine-docs-ochre.vercel.app/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Lab cluster
+
+The development lab is a four-node Contabo HA cluster used to prove Peregrine
+end-to-end — the same environment described under [Testing](/testing) §4. The
+previous Azure PAYG topology (`10.42.*` + ILB) is **retired**. Full cutover
+notes live in the monorepo under `tools/CONTABO-CLUSTER.md`.
+
+## Topology
+
+| Plane | Address | Role |
+|-------|---------|------|
+| Management / SSH | public `169.58.108.{85,86,87,121}` | SSH, deploy |
+| Proxy / client | `10.0.0.1–4` + Keepalived VIP **`10.0.0.10:8085`** | HAProxy → proxy `:8080` |
+| Storage | `10.0.4.1–4` | account / container / object data path |
+| Replication | `10.0.8.1–4` | replicator / reconstructor |
+
+Nodes: `swift1`–`swift4` (swift1 = hub + VIP MASTER). Prefer the **real VIP**
+`http://10.0.0.10:8085` for clients and gates. Per-node
+`http://10.0.0.N:8085` remains valid (local HAProxy).
+
+Devices: `/srv/node/{d1,d2,d3}` XFS per node (12 total). **Never format** them
+from deploy tooling.
+
+Lab policies: replication `default`, and erasure coding `ec-2-1` via
+`liberasurecode_rs_vand`. Rings and the replication key must be identical on
+every node.
+
+## Install checklist
+
+- Full daemon set + HAProxy on each node; Keepalived for the VIP.
+- Schedule the object auditor with a **timer** unit.
+- Ship EC plugin libraries (`libnullcode`, `liberasurecode_rs_vand`) with a
+  working `liberasurecode_rs_vand.so.1.0.1` link.
+- Build release binaries **with the `ec` cargo features**. Without them the
+  proxy returns HTTP 501 for EC puts.
+- On swift1: Prometheus, Loki, Alloy, statsd_exporter, `swift-console`,
+  `cabt` / `autocos`; `node_exporter` on every node (`nodes_up` should be 4).
+- Python SAIO `:8090` + Rust SAIO `:8081` on swift1 for Lab Shadow.
+- After copying binaries under SELinux, run `restorecon` so labels stay
+  executable (`bin_t`); `haproxy_connect_any=1`, `ip_nonlocal_bind=1`.
+
+## Auth
+
+Harness credentials: `test:tester` / `azure-swift-2026.bench` (key name is
+historical; cluster is Contabo).
+
+## Build with erasure coding
+
+```sh
+cd swift-rust
+cargo build --release \
+  --features swift-proxy-server/ec,swift-object-server/ec
+```
+
+Install on Linux only — never copy macOS Mach-O binaries to the cluster.
+
+## Cluster cutover
+
+When replacing VMs or a provider:
+
+1. Migrate configuration, rings, keys, binaries, systemd units, monitoring, and
+   lab tools.
+2. Treat `/srv/node` object bytes as **optional** — omit them for a fresh lab.
+3. Re-run the hard gates: `func-suite.sh`, `ha-test.sh`, `ec-heal-test.sh`, and
+   confirm Prometheus `nodes_up=4`.
+
+Destroying the previous cluster permanently deletes any object data you did not
+copy. Keep a written go/no-go note before teardown.
+
+## See also
+
+- [Operations](/operations) — health, HA drill, EC heal
+- [Testing](/testing) — harness levels
+- [Performance](/performance) — Contabo + SAIO numbers
+- [Get started](/getting-started) — local SAIO bootstrap
+
+Source: https://peregrine-docs-ochre.vercel.app/lab-cluster/index.mdx

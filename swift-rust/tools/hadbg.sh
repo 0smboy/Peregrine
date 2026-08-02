@@ -1,6 +1,6 @@
 #!/bin/bash
 set -u
-LB=http://10.42.30.11:8085
+LB=${LB:-http://10.0.0.10:8085}
 A=$(curl -s -m10 -D - -o /dev/null -H "X-Auth-User: test:tester" -H "X-Auth-Key: azure-swift-2026.bench" "$LB/auth/v1.0")
 TOK=$(printf '%s' "$A" | awk 'tolower($1)=="x-auth-token:"{print $2}' | tr -d '\r')
 echo "token=${TOK:0:16}..."

@@ -72,11 +72,11 @@ fn spawn_server(devices: &Path) -> std::net::SocketAddr {
                 1,
                 swift_diskfile::PolicyKind::Ec {
                     n_unique_fragments: Some(6),
-        container_update_timeout: std::time::Duration::from_secs(1),
-        container_update_mode: ContainerUpdateMode::Sync,
                 },
             ),
         ]),
+        container_update_timeout: std::time::Duration::from_secs(1),
+        container_update_mode: ContainerUpdateMode::Sync,
     }));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
