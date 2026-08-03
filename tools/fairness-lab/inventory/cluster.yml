@@ -1,0 +1,29 @@
+# Contabo fairness-lab inventory (management + roles)
+schema_version: 1
+vip: 10.0.0.10
+proxy_port: 8085
+nodes:
+  swift1:
+    public: 169.58.108.85
+    client_ip: 10.0.0.1
+    roles: [proxy, account, container, object, vip_master, hub_services]
+    hub_services: [console_9000, prometheus_9090, saio_py_8090, saio_rust_8081]
+    fairness_note: "NOISY for SAIO/perf until hub services relocated"
+  swift2:
+    client_ip: 10.0.0.2
+    roles: [proxy, account, container, object]
+  swift3:
+    client_ip: 10.0.0.3
+    roles: [proxy, account, container, object]
+  swift4:
+    client_ip: 10.0.0.4
+    roles: [proxy, account, container, object, preferred_bench_client]
+network_planes:
+  client_proxy: 10.0.0.0/24
+  storage: 10.0.4.0/24
+  replication: 10.0.8.0/24
+  collapse_flag: PLANES_DOCUMENTED_SEPARATE
+pins:
+  rust_repo: Peregrine/swift-rust
+  python_reference_target: "2.37.2 (upgrade change-control if Contabo still on 2.35.x)"
+devices_json: devices.json

@@ -8,6 +8,12 @@ The previous Azure PAYG topology (`10.42.*` + ILB) is **retired**. Cutover
 notes: [`tools/CONTABO-CLUSTER.md`](../tools/CONTABO-CLUSTER.md). Azure doc
 [`tools/NEW-CLUSTER-CUTOVER.md`](../tools/NEW-CLUSTER-CUTOVER.md) is historical.
 
+**Fairness lab (2026-08-03):** Contabo is a hybrid on `swift-deploy-rs`, not full
+ansible parity. SAIO on swift1 is **NOISY** for performance; VIP path is
+**HA-PATH ONLY**; formal throughput requires Performance mode +
+`DIRECT-4PROXY`. See [`docs/fairness-lab/`](fairness-lab/) and
+[`tools/test-results/fairness-lab-20260803/REPORT.html`](../tools/test-results/fairness-lab-20260803/REPORT.html).
+
 ## Topology
 
 | Plane | Address | Role |

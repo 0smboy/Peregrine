@@ -1,0 +1,47 @@
+{
+  "collected_utc": "20260803T033907Z",
+  "hosts": {
+    "swift1": {
+      "nproc": 4,
+      "mem_total_bytes_line": "Mem:      8054063104",
+      "interesting_listeners": [
+        "LISTEN 0      20000      10.0.0.10:8085       0.0.0.0:*",
+        "LISTEN 0      20000       10.0.0.1:8085       0.0.0.0:*",
+        "LISTEN 0      128        127.0.0.1:9000       0.0.0.0:*",
+        "LISTEN 0      65535      127.0.0.1:9090       0.0.0.0:*",
+        "LISTEN 0      4096       127.0.0.1:8090       0.0.0.0:*",
+        "LISTEN 0      4096       127.0.0.1:8090       0.0.0.0:*",
+        "LISTEN 0      128        127.0.0.1:8081       0.0.0.0:*",
+        "LISTEN 0      128         10.0.4.1:6200       0.0.0.0:*"
+      ],
+      "ssh_ok": true
+    },
+    "swift2": {
+      "nproc": 4,
+      "mem_total_bytes_line": "Mem:      8054063104",
+      "interesting_listeners": [
+        "LISTEN 0      20000       10.0.0.2:8085       0.0.0.0:*",
+        "LISTEN 0      128         10.0.4.2:6200       0.0.0.0:*"
+      ],
+      "ssh_ok": true
+    },
+    "swift3": {
+      "nproc": 4,
+      "mem_total_bytes_line": "Mem:      8054071296",
+      "interesting_listeners": [
+        "LISTEN 0      128         10.0.4.3:6200       0.0.0.0:*",
+        "LISTEN 0      20000       10.0.0.3:8085       0.0.0.0:*"
+      ],
+      "ssh_ok": true
+    },
+    "swift4": {
+      "nproc": 4,
+      "mem_total_bytes_line": "Mem:      8054063104",
+      "interesting_listeners": [
+        "LISTEN 0      20000       10.0.0.4:8085       0.0.0.0:*",
+        "LISTEN 0      128         10.0.4.4:6200       0.0.0.0:*"
+      ],
+      "ssh_ok": true
+    }
+  }
+}

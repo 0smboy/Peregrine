@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>Fairness lab · Four scorecards</title>
+<style>
+  body{font:14px/1.5 system-ui,sans-serif;background:#0f1114;color:#e8eaed;margin:0;padding:28px}
+  h1{font-size:22px} h2{font-size:16px;margin-top:28px;border-top:1px solid #2a3038;padding-top:20px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .card{background:#171a1f;border:1px solid #2a3038;border-radius:6px;padding:14px}
+  .card h3{margin:0 0 8px;font-size:14px}
+  .muted{color:#9aa3ad;font-size:12px}
+  .tag{display:inline-block;font-size:11px;padding:2px 7px;border-radius:3px;background:#22262c;color:#9aa3ad;margin:2px}
+  .tag.warn{background:#2e2814;color:#c4a035}
+  .tag.bad{background:#2e1818;color:#c45c5c}
+  .tag.ok{background:#163226;color:#3d9a6a}
+  ul{margin:8px 0;padding-left:18px;color:#9aa3ad;font-size:13px}
+  code{color:#7eb8c9;font-size:11px}
+</style>
+</head>
+<body>
+  <h1>Four independent scorecards</h1>
+  <p class="muted">禁止合成一句「Rust 更快」。每张卡独立填充；空卡表示该门禁尚未跑完。</p>
+  <div class="grid">
+    <div class="card">
+      <h3>1. Compatibility</h3>
+      <span class="tag ok">CORE-PATH PASS 11/11</span>
+      <ul>
+        <li>L1 differential: <code>compatibility/SUMMARY.json</code> gate PASS fail=0</li>
+        <li>Unsupported L2 in <code>blocked-by-missing-impl.md</code></li>
+        <li>Host still hub-colocated — OK for API equality, not for perf</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>2. Correctness & recovery</h3>
+      <span class="tag ok">proxy-loss 20/20</span>
+      <ul>
+        <li><code>chaos-proxy-loss/</code>: stop swift2 proxy → VIP PUTs ok=20 fail=0 → restart</li>
+        <li>More scenarios via <code>chaos-run.sh</code> + ha-test/ec-heal</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>3. Performance</h3>
+      <span class="tag bad">No formal DIRECT-4PROXY yet</span>
+      <span class="tag warn">HA-PATH historical only</span>
+      <ul>
+        <li>Scheduler: <code>perf-formal.sh</code> (REPS≥8) + dry-run manifest</li>
+        <li>Requires Performance mode exclusivity before citing</li>
+        <li>Old SAIO numbers: <span class="tag bad">NOISY</span></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>4. Efficiency</h3>
+      <span class="tag">Pending formal cells</span>
+      <ul>
+        <li>CPU-seconds/request, CPU/GiB, RSS, network/disk amplification</li>
+        <li>Recovery interference from chaos+load cells</li>
+      </ul>
+    </div>
+  </div>
+  <h2>Observability migration (P7)</h2>
+  <p class="muted">Target: Prometheus/Grafana/console off VIP MASTER. Until then every hub-colocated metric run carries <code>HUB_COLOCATED</code>.</p>
+  <ul>
+    <li>Preferred: dedicated monitoring host</li>
+    <li>Interim: move scrape/UI to swift4 management ports; forbid SAIO/bench on that node</li>
+    <li>Record: <code>observability-migration.md</code> in this evidence dir</li>
+  </ul>
+</body>
+</html>

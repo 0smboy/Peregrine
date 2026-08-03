@@ -1,0 +1,7 @@
+[Unit]
+Description=Aggregate target for Rust Swift stack (fairness-lab)
+Wants=swift-proxy.service swift-account.service swift-container.service swift-object.service
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target

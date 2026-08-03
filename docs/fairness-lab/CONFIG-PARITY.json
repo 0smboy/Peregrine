@@ -1,0 +1,603 @@
+{
+  "generated": "fairness-lab CONFIG-PARITY",
+  "workers_semantics": "Rust maps workers*max_clients -> worker_threads clamped to 128; NOT Python eventlet prefork process count. Iso-config must align effective concurrency / CPU quota, not the integer alone.",
+  "labels_required_on_claims": [
+    "CORE-PATH-ONLY",
+    "ISO-CONFIG",
+    "ISO-RESOURCE",
+    "HA-PATH",
+    "DIRECT-4PROXY",
+    "DATA-PATH",
+    "PRODUCTION-COMPLETE",
+    "NOISY",
+    "SUPERSEDED",
+    "NON_EQUIVALENT",
+    "unsupported"
+  ],
+  "rows": [
+    {
+      "service": "object",
+      "knob": "bind_ip",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "object",
+      "knob": "bind_port",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "object",
+      "knob": "client_timeout",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "object",
+      "knob": "conn_timeout",
+      "rust_parsed": false,
+      "rust_behavior": "Python/ansible has it; Rust daemon does not get()",
+      "deploy_template_likely": false,
+      "fairness_class": "unsupported"
+    },
+    {
+      "service": "object",
+      "knob": "container_update_mode",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "object",
+      "knob": "container_update_timeout",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "object",
+      "knob": "devices",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "object",
+      "knob": "eventlet_tpool_num_threads",
+      "rust_parsed": false,
+      "rust_behavior": "not parsed / not deployable as Python Paste knob",
+      "deploy_template_likely": false,
+      "fairness_class": "unsupported"
+    },
+    {
+      "service": "object",
+      "knob": "fallocate_reserve",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "object",
+      "knob": "fsync_on_close",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "object",
+      "knob": "log_level",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "object",
+      "knob": "log_name",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "object",
+      "knob": "log_statsd_host",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "object",
+      "knob": "log_statsd_metric_prefix",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "object",
+      "knob": "log_statsd_port",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "object",
+      "knob": "max_clients",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "object",
+      "knob": "mount_check",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "object",
+      "knob": "node_timeout",
+      "rust_parsed": false,
+      "rust_behavior": "Python/ansible has it; Rust daemon does not get()",
+      "deploy_template_likely": false,
+      "fairness_class": "unsupported"
+    },
+    {
+      "service": "object",
+      "knob": "replication_server",
+      "rust_parsed": false,
+      "rust_behavior": "not parsed / not deployable as Python Paste knob",
+      "deploy_template_likely": false,
+      "fairness_class": "unsupported"
+    },
+    {
+      "service": "object",
+      "knob": "reuse_port",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "object",
+      "knob": "servers_per_port",
+      "rust_parsed": false,
+      "rust_behavior": "not parsed / not deployable as Python Paste knob",
+      "deploy_template_likely": false,
+      "fairness_class": "unsupported"
+    },
+    {
+      "service": "object",
+      "knob": "use_splice",
+      "rust_parsed": false,
+      "rust_behavior": "not parsed / not deployable as Python Paste knob",
+      "deploy_template_likely": false,
+      "fairness_class": "unsupported"
+    },
+    {
+      "service": "object",
+      "knob": "workers",
+      "rust_parsed": true,
+      "rust_behavior": "Rust maps workers*max_clients -> worker_threads clamped to 128; NOT Python eventlet prefork process count. Iso-config must align effective concurrency / CPU quota, not the integer alone.",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config-with-semantic-mapping"
+    },
+    {
+      "service": "proxy",
+      "knob": "account_autocreate",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "proxy",
+      "knob": "allow_account_management",
+      "rust_parsed": false,
+      "rust_behavior": "not parsed / not deployable as Python Paste knob",
+      "deploy_template_likely": false,
+      "fairness_class": "unsupported"
+    },
+    {
+      "service": "proxy",
+      "knob": "bind_ip",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "proxy",
+      "knob": "bind_port",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "proxy",
+      "knob": "client_timeout",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "proxy",
+      "knob": "conn_timeout",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "proxy",
+      "knob": "error_suppression_interval",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "proxy",
+      "knob": "error_suppression_limit",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "proxy",
+      "knob": "gold",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "proxy",
+      "knob": "log_level",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "proxy",
+      "knob": "log_name",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "proxy",
+      "knob": "log_statsd_host",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "proxy",
+      "knob": "log_statsd_metric_prefix",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "proxy",
+      "knob": "log_statsd_port",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "proxy",
+      "knob": "max_clients",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "proxy",
+      "knob": "memcache_servers",
+      "rust_parsed": false,
+      "rust_behavior": "not parsed / not deployable as Python Paste knob",
+      "deploy_template_likely": false,
+      "fairness_class": "unsupported"
+    },
+    {
+      "service": "proxy",
+      "knob": "node_timeout",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "proxy",
+      "knob": "pipeline",
+      "rust_parsed": false,
+      "rust_behavior": "not parsed / not deployable as Python Paste knob",
+      "deploy_template_likely": false,
+      "fairness_class": "unsupported"
+    },
+    {
+      "service": "proxy",
+      "knob": "recheck_account_existence",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "proxy",
+      "knob": "recheck_container_existence",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "proxy",
+      "knob": "storage_url",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "proxy",
+      "knob": "trace_endpoint",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "proxy",
+      "knob": "trace_sample_ratio",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "proxy",
+      "knob": "workers",
+      "rust_parsed": true,
+      "rust_behavior": "Rust maps workers*max_clients -> worker_threads clamped to 128; NOT Python eventlet prefork process count. Iso-config must align effective concurrency / CPU quota, not the integer alone.",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config-with-semantic-mapping"
+    },
+    {
+      "service": "account",
+      "knob": "bind_ip",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "account",
+      "knob": "bind_port",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "account",
+      "knob": "client_timeout",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "account",
+      "knob": "databases_per_node",
+      "rust_parsed": false,
+      "rust_behavior": "not parsed / not deployable as Python Paste knob",
+      "deploy_template_likely": false,
+      "fairness_class": "unsupported"
+    },
+    {
+      "service": "account",
+      "knob": "devices",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "account",
+      "knob": "log_level",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "account",
+      "knob": "log_name",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "account",
+      "knob": "log_statsd_host",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "account",
+      "knob": "log_statsd_metric_prefix",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "account",
+      "knob": "log_statsd_port",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "account",
+      "knob": "max_clients",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "account",
+      "knob": "mount_check",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "account",
+      "knob": "workers",
+      "rust_parsed": true,
+      "rust_behavior": "Rust maps workers*max_clients -> worker_threads clamped to 128; NOT Python eventlet prefork process count. Iso-config must align effective concurrency / CPU quota, not the integer alone.",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config-with-semantic-mapping"
+    },
+    {
+      "service": "container",
+      "knob": "allow_versions",
+      "rust_parsed": false,
+      "rust_behavior": "not parsed / not deployable as Python Paste knob",
+      "deploy_template_likely": false,
+      "fairness_class": "unsupported"
+    },
+    {
+      "service": "container",
+      "knob": "bind_ip",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "container",
+      "knob": "bind_port",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "container",
+      "knob": "client_timeout",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "container",
+      "knob": "devices",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "container",
+      "knob": "log_level",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "container",
+      "knob": "log_name",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "container",
+      "knob": "log_statsd_host",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "container",
+      "knob": "log_statsd_metric_prefix",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "container",
+      "knob": "log_statsd_port",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "container",
+      "knob": "max_clients",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "container",
+      "knob": "mount_check",
+      "rust_parsed": true,
+      "rust_behavior": "honored via conf get()",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
+    },
+    {
+      "service": "container",
+      "knob": "workers",
+      "rust_parsed": true,
+      "rust_behavior": "Rust maps workers*max_clients -> worker_threads clamped to 128; NOT Python eventlet prefork process count. Iso-config must align effective concurrency / CPU quota, not the integer alone.",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config-with-semantic-mapping"
+    }
+  ]
+}

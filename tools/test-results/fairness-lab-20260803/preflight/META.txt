@@ -1,0 +1,2 @@
+collected_utc=20260803T033907Z
+script=preflight-collect.sh

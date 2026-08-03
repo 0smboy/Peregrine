@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Contabo 公平实验系统 · 审计与重设计 · 2026-08-03</title>
+<style>
+  :root {
+    --bg:#0f1114; --panel:#171a1f; --ink:#e8eaed; --muted:#9aa3ad;
+    --line:#2a3038; --ok:#3d9a6a; --ok-bg:#163226; --warn:#c4a035;
+    --warn-bg:#2e2814; --bad:#c45c5c; --bad-bg:#2e1818; --accent:#7eb8c9;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font:15px/1.5 "SF Pro Text","PingFang SC",sans-serif;background:var(--bg);color:var(--ink)}
+  .wrap{max-width:1100px;margin:0 auto;padding:32px 24px 72px}
+  h1{font-size:26px;font-weight:650;margin:0 0 8px;letter-spacing:-.02em}
+  h2{font-size:18px;font-weight:600;margin:36px 0 12px;border-top:1px solid var(--line);padding-top:28px}
+  h3{font-size:13px;font-weight:600;color:var(--muted);margin:16px 0 8px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:16px}
+  code{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--accent)}
+  .pills{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}
+  .pill{font-size:12px;padding:4px 10px;border-radius:4px;border:1px solid var(--line);background:var(--panel);color:var(--muted)}
+  .pill.ok{color:var(--ok);border-color:#2a5a40;background:var(--ok-bg)}
+  .pill.warn{color:var(--warn);border-color:#5a4a20;background:var(--warn-bg)}
+  .pill.bad{color:var(--bad);border-color:#5a3030;background:var(--bad-bg)}
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:18px 0}
+  @media(max-width:800px){.stats{grid-template-columns:1fr 1fr}}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:14px}
+  .stat .l{font-size:11px;color:var(--muted)} .stat .v{font-size:20px;font-weight:650;margin-top:4px}
+  .stat.bad .v{color:var(--bad)} .stat.warn .v{color:var(--warn)} .stat.ok .v{color:var(--ok)}
+  .callout{background:var(--panel);border-left:3px solid var(--accent);padding:12px 16px;margin:14px 0;border-radius:0 6px 6px 0;font-size:13px;color:var(--muted)}
+  .callout.bad{border-left-color:var(--bad)} .callout.warn{border-left-color:var(--warn)}
+  .callout strong{color:var(--ink)}
+  table{width:100%;border-collapse:collapse;font-size:13px;background:var(--panel);border:1px solid var(--line);border-radius:6px;overflow:hidden;margin:10px 0}
+  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:500;font-size:11px}
+  tr:last-child td{border-bottom:0}
+  tr.bad td{background:var(--bad-bg)} tr.warn td{background:var(--warn-bg)}
+  .tag{font-size:11px;padding:2px 7px;border-radius:3px;font-weight:600}
+  .tag.ok{background:var(--ok-bg);color:var(--ok)} .tag.warn{background:var(--warn-bg);color:var(--warn)}
+  .tag.bad{background:var(--bad-bg);color:var(--bad)} .tag.n{background:#22262c;color:var(--muted)}
+  .flow{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0;font-size:12px}
+  .flow .box{background:var(--panel);border:1px solid var(--line);padding:8px 12px;border-radius:4px}
+  .flow .arr{color:var(--muted)}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:800px){.two{grid-template-columns:1fr}}
+  ul{margin:8px 0;padding-left:18px;color:var(--muted);font-size:13px}
+  ul strong{color:var(--ink)}
+  .meta{margin-top:40px;border-top:1px solid var(--line);padding-top:16px;font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Contabo 公平实验系统 · 审计与重设计</h1>
+  <p class="sub">
+    2026-08-03 · 方法论权威 <code>deep-swiftrust-test.md</code> · 工程栈 Peregrine
+    <code>swift-deploy-rs</code> · 证据根
+    <code>tools/test-results/fairness-lab-20260803/</code>
+  </p>
+  <div class="pills">
+    <span class="pill bad">测法污染 CONFIRMED</span>
+    <span class="pill bad">配置不对等 CONFIRMED</span>
+    <span class="pill warn">部署薄层 PARTIAL</span>
+    <span class="pill ok">三模式重设计 ACTIVE</span>
+    <span class="pill warn">历史 SAIO/VIP 数字已降级</span>
+  </div>
+
+  <div class="stats">
+    <div class="stat bad"><div class="l">SAIO 宿主</div><div class="v">swift1 hub</div></div>
+    <div class="stat bad"><div class="l">正式 A/B 资格</div><div class="v">NOISY</div></div>
+    <div class="stat warn"><div class="l">VIP-only 吞吐</div><div class="v">HA-PATH</div></div>
+    <div class="stat ok"><div class="l">func 54/54 标签</div><div class="v">CORE-PATH</div></div>
+  </div>
+
+  <div class="callout bad">
+    <strong>一句话：</strong>此前 deep-verify / SAIO 1KB / 部分集群数字在「混跑 hub」上取得，
+    <strong>不得再当作正式公平结论</strong>。本实验室改为 Compatibility / Performance / Chaos
+    三模式；正式性能必须单实现独占 12 盘 + 直连四 proxy，且先过 Compatibility 门禁。
+  </div>
+
+  <h2>0. 三点审计（你的指摘）</h2>
+  <table>
+    <thead><tr><th>#</th><th>指摘</th><th>裁决</th><th>证据</th><th>方案原则</th></tr></thead>
+    <tbody>
+      <tr class="bad">
+        <td>1</td>
+        <td>双 SAIO 在 swift1；swift1=VIP MASTER+监控+集群节点</td>
+        <td><span class="tag bad">CONFIRMED</span></td>
+        <td><code>CONTABO-CLUSTER.md</code>；live <code>:8090/:8081/:9090/:9000/:8085</code> 同机</td>
+        <td>Compat 可并发；Perf 必须单实现独占；客户端/监控在实验平面外</td>
+      </tr>
+      <tr class="bad">
+        <td>2</td>
+        <td>Rust 配置远薄于 Python，环境不对等</td>
+        <td><span class="tag bad">CONFIRMED</span></td>
+        <td><code>bundle-rust</code> ~30–44 行 vs ansible 数百行；workers→thread clamp 128</td>
+        <td>Iso-config / Iso-resource 分轨；禁止裸比 workers=N</td>
+      </tr>
+      <tr class="warn">
+        <td>3</td>
+        <td>未用好 deploy-rs；因插件未实现而薄部署</td>
+        <td><span class="tag warn">PARTIAL</span></td>
+        <td><code>bundle-rust/README</code> non-goals；Contabo hybrid 手工叠层</td>
+        <td>部署面=已实现契约；unsupported 诚实标注</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>1. 立即降级的历史数字</h2>
+  <table>
+    <thead><tr><th>旧 claim</th><th>新标签</th><th>可否进主结论</th></tr></thead>
+    <tbody>
+      <tr class="bad"><td>swift1 同机 SAIO 1KB（含 3.45× / phase0 污染跑）</td><td><span class="tag bad">NOISY / SUPERSEDED</span></td><td>否</td></tr>
+      <tr class="warn"><td>仅 VIP 单入口集群吞吐</td><td><span class="tag warn">HA-PATH ONLY</span></td><td>仅 HA 轨，非核心吞吐</td></tr>
+      <tr class="warn"><td>func 54/54</td><td><span class="tag warn">CORE-PATH</span></td><td>是（已实现表面），非全 Python API</td></tr>
+      <tr class="warn"><td>16MB read ~9% success</td><td><span class="tag warn">ACCEPT_WITH_WARN</span></td><td>保持 WARN</td></tr>
+      <tr><td>swift4→VIP clean-load 4KB/1MB fail=0</td><td><span class="tag n">HA-PATH · 有用但非正式 DIRECT-4PROXY</span></td><td>过渡参考</td></tr>
+    </tbody>
+  </table>
+
+  <h2>2. 三模式实验系统</h2>
+  <div class="flow">
+    <div class="box">Compatibility<br/><span style="color:var(--muted)">Py+Rust 分盘分端口</span></div>
+    <span class="arr">→ API PASS →</span>
+    <div class="box">Performance<br/><span style="color:var(--muted)">单实现 × 12 盘</span></div>
+    <span class="arr">→ validity →</span>
+    <div class="box">Chaos<br/><span style="color:var(--muted)">脚本化故障</span></div>
+    <span class="arr">→</span>
+    <div class="box">四 Scorecard</div>
+  </div>
+  <table>
+    <thead><tr><th>Mode</th><th>资源模型</th><th>主结论</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Compatibility</strong></td><td>并发；Py=d1 / Rust=d2；分端口分环</td><td>像不像 Swift？</td></tr>
+      <tr><td><strong>Performance</strong></td><td>同时仅一实现占满 4×3 盘；对方进程清零</td><td>谁更快/更省？</td></tr>
+      <tr><td><strong>Chaos</strong></td><td>单实现；故障注入</td><td>挂了是否正确？</td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn">
+    Compatibility 下的任何吞吐数字 <strong>永远不能</strong> 作为正式性能结论。
+    核心吞吐 = <code>DIRECT-4PROXY</code>；VIP = 独立 <code>HA-PATH</code>。
+  </div>
+
+  <h2>3. 门禁流（未过禁止报 perf）</h2>
+  <div class="flow">
+    <div class="box">Preflight</div><span class="arr">→</span>
+    <div class="box">Py self-test</div><span class="arr">→</span>
+    <div class="box">Rust pin</div><span class="arr">→</span>
+    <div class="box">L1 differential</div><span class="arr">→</span>
+    <div class="box">Foreground perf</div><span class="arr">→</span>
+    <div class="box">Prod-complete</div><span class="arr">→</span>
+    <div class="box">Chaos/Soak</div><span class="arr">→</span>
+    <div class="box">Scorecards</div>
+  </div>
+
+  <h2>4. 契约与公平轨道</h2>
+  <div class="two">
+    <div>
+      <h3>契约层级</h3>
+      <ul>
+        <li><strong>L1</strong> Public Swift v1 — Mandatory</li>
+        <li><strong>L2</strong> Middleware — feature-dependent；unsupported ≠ FAIL</li>
+        <li><strong>L3</strong> Backend protocol — 仅声明 drop-in 时强制</li>
+        <li><strong>L4</strong> On-disk/ops — 同上</li>
+      </ul>
+    </div>
+    <div>
+      <h3>公平轨道</h3>
+      <ul>
+        <li><strong>ISO-CONFIG</strong> — knobs 交集 + 有效并发/CPU 配额对齐</li>
+        <li><strong>ISO-RESOURCE</strong> — 同配额，允许实现特有调优</li>
+        <li>Rust <code>workers*max_clients→≤128 threads</code> ≠ Python prefork</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>5. 本轮交付地图（P0–P8）</h2>
+  <table>
+    <thead><tr><th>Phase</th><th>交付</th><th>路径</th></tr></thead>
+    <tbody>
+      <tr><td>P0</td><td>本报告 + Canvas</td><td><code>fairness-lab-20260803/REPORT.html</code></td></tr>
+      <tr><td>P1</td><td>Preflight inventory</td><td><code>fairness-lab/inventory/</code> + <code>preflight/</code></td></tr>
+      <tr><td>P2</td><td>mode-switch + systemd targets</td><td><code>tools/fairness-lab/scripts/</code></td></tr>
+      <tr><td>P3</td><td>CONFIG-PARITY + 标签</td><td><code>docs/fairness-lab/</code></td></tr>
+      <tr><td>P4</td><td>differential API harness</td><td><code>tools/fairness-lab/scripts/compat-diff.sh</code></td></tr>
+      <tr><td>P5</td><td>formal perf scheduler</td><td><code>scripts/perf-formal.sh</code></td></tr>
+      <tr><td>P6</td><td>chaos / soak</td><td><code>scripts/chaos-*.sh</code></td></tr>
+      <tr><td>P7</td><td>schema + scorecards + 监控迁出记录</td><td><code>schemas/</code> · <code>SCORECARDS.html</code></td></tr>
+      <tr><td>P8</td><td>hybrid + blocked-by-missing-impl</td><td><code>docs/fairness-lab/</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2>6. 污染拓扑（现状）</h2>
+  <pre style="background:var(--panel);border:1px solid var(--line);padding:14px;border-radius:6px;font-size:12px;overflow:auto;color:var(--muted)">
+swift1 (hub) ── VIP MASTER 10.0.0.10:8085
+            ├── cluster proxy/object/account/container
+            ├── Prometheus :9090 · Console :9000
+            ├── Python SAIO :8090 · Rust SAIO :8081   ← 污染源
+            └── memcached / autocos / deploy UI
+swift2..4 ── storage+proxy peers（资源不对称：监控与双 SAIO 全压在 swift1）
+  </pre>
+
+  <div class="meta">
+    生成：fairness-lab P0 · 数据来自 Contabo live 核查 + deep-verify 证据包。
+    权威方法论：<code>/Users/oboy/Downloads/deep-swiftrust-test.md</code>
+  </div>
+</div>
+</body>
+</html>

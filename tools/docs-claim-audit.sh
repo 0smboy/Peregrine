@@ -68,7 +68,18 @@ if [[ -f "$PERF" ]]; then
   rg -q "reuse_port = false" "$PERF" || err "$PERF missing reuse_port=false"
   rg -qi "L1a" "$PERF" && rg -qi "KEEP" "$PERF" || err "$PERF missing L1a KEEP"
   rg -q "Contabo" "$PERF" || err "$PERF missing Contabo context"
+  # Fairness lab: SAIO must be demoted; VIP path labeled HA-PATH
+  rg -q "NOISY" "$PERF" || err "$PERF missing NOISY label for polluted SAIO claims"
+  rg -q "SUPERSEDED" "$PERF" || err "$PERF missing SUPERSEDED label for polluted SAIO claims"
+  rg -q "HA-PATH" "$PERF" || err "$PERF missing HA-PATH label for VIP throughput"
+  rg -q "DIRECT-4PROXY" "$PERF" || err "$PERF missing DIRECT-4PROXY pointer"
+  rg -q "fairness-lab" "$PERF" || err "$PERF missing fairness-lab pointer"
 fi
+
+echo "== fairness-lab docs present =="
+[[ -f docs/fairness-lab/CONFIG-PARITY.md ]] || err "missing docs/fairness-lab/CONFIG-PARITY.md"
+[[ -f docs/fairness-lab/CONTRACTS.md ]] || err "missing docs/fairness-lab/CONTRACTS.md"
+[[ -f docs/fairness-lab/DEPLOY-HYBRID.md ]] || err "missing docs/fairness-lab/DEPLOY-HYBRID.md"
 
 if [[ -f "$SUMMARY_JSON" ]]; then
   python3 - <<'PY' || err "SUMMARY.json saio_phase0 mismatch vs performance.mdx"

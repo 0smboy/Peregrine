@@ -3,6 +3,20 @@
 Greenfield Peregrine/Swift lab on Contabo. Replaces the Azure PAYG cutover
 ([`NEW-CLUSTER-CUTOVER.md`](NEW-CLUSTER-CUTOVER.md) — **retired**).
 
+## Fairness lab (2026-08-03)
+
+Contabo is a **hybrid** on `swift-deploy-rs` (`bundle-rust` + Keepalived /
+monitoring / SAIO overlays) — **not** full Python ansible parity. Formal
+experiments follow three modes (Compatibility / Performance / Chaos): see
+[`docs/fairness-lab/`](../docs/fairness-lab/) and
+[`tools/fairness-lab/`](fairness-lab/).
+
+**Pollution note:** Python SAIO `:8090` and Rust SAIO `:8081` currently share
+**swift1** with VIP MASTER + Prometheus/console. SAIO throughput claims are
+**NOISY / SUPERSEDED** until Performance mode (single impl owns 12 disks) and
+hub relocation complete. VIP client path = **HA-PATH ONLY**; core throughput
+must use **DIRECT-4PROXY** (`10.0.0.1–4:8085`).
+
 ## Endpoints
 
 | Node | Public SSH | Proxy | Storage | Replication |

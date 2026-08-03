@@ -1,0 +1,4 @@
+entry: HA-PATH
+task: 4KB_write_128
+soak_seconds: 60
+note: Run at concurrency chosen as saturation-minus-20% from prior formal cell.

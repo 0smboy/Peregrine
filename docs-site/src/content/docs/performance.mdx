@@ -5,10 +5,16 @@ sidebar:
   order: 23
 ---
 
-All numbers are from a four-node Contabo HA lab and same-host SAIO A/Bs against
-Python OpenStack Swift 2.35.0. Evidence pack:
+All numbers below are from a four-node Contabo HA lab against Python OpenStack
+Swift 2.35.0. Evidence pack:
 `tools/test-results/contabo-deploy-20260801/` (write-path levers under
 `perf-levers/`).
+
+**Fairness redesign (2026-08-03):** same-host SAIO A/Bs on swift1 (VIP MASTER +
+monitoring hub) are labeled **NOISY / SUPERSEDED** for formal performance
+conclusions. VIP-only cluster throughput is **HA-PATH ONLY**, not
+`DIRECT-4PROXY`. `func` 54/54 is **CORE-PATH-ONLY**. See
+`docs/fairness-lab/` and `tools/test-results/fairness-lab-20260803/REPORT.html`.
 
 ## The accept-loop latency fix
 
@@ -33,7 +39,12 @@ it, Rust is 2.7–4.4× faster than Python on reads. Small-write A/Bs below are 
 that fixed accept path.
 </Aside>
 
-## Rust vs Python (same-host SAIO A/B)
+## Rust vs Python (same-host SAIO A/B) — NOISY / SUPERSEDED
+
+**Tags: `NOISY` · `SUPERSEDED`.** Both SAIOs ran on **swift1** with VIP MASTER +
+Prometheus/console/cluster services. Useful as a directional signal only;
+**not** a formal iso-resource A/B. Formal performance requires the fairness-lab
+Performance mode (one implementation owns all 12 disks; `DIRECT-4PROXY`).
 
 | Workload | Rust | Python 2.35 |
 |----------|-----:|------------:|
@@ -42,28 +53,27 @@ that fixed accept path.
 | 16 MB GET · c8 (MB/s) | 682 | 168 |
 | 1 KB PUT · c1 / c32 | **71.8 / 264.4 op/s** | 32.3 / 69.8 op/s |
 
-Reads win at every size. **Small writes too:** SAIO 1 KB PUT @c32 is
-~**3.79×** Python in the dated evidence pack (median of 3 runs,
-`perf-levers/SUMMARY.json` → `saio_phase0`, 2026-08-02). A deep-verify re-check
-the same day measured ~**3.45×** (Rust 236.7 / Python 68.6, fail=0) under shared
-host noise — still ≫ Python; table keeps the phase0 pack numbers. That pack
-already includes workers=16 + lock-free accept; it is **not** an L1a delta
-(L1a SAIO re-check was ~0.92× phase0 Rust and was not the KEEP gate).
+Dated evidence pack medians (`perf-levers/SUMMARY.json` → `saio_phase0`,
+2026-08-02): ~**3.79×** @c32. Deep-verify re-check ~**3.45×** under the same
+hub noise. Pack includes workers=16 + lock-free accept; not an L1a delta.
 
 Retired baseline (pre workers/accept work): 54 / 159 vs 32 / 255 — do not treat
 as current.
 
-## Production load (4-node, via HAProxy)
+## Production load (4-node, via HAProxy) — HA-PATH ONLY
+
+**Tag: `HA-PATH`.** VIP / HAProxy entry. Not a `DIRECT-4PROXY` core-throughput
+conclusion (single ingress can cap aggregate bandwidth).
 
 A 90-second mixed 80/20 run at 64 workers: **240,120 ops, 0 failures,
 2,667 ops/s, 167 MiB/s, p50 9.6 ms / p99 127 ms**. A `autocos` sweep (6 tasks) ran
 with 0 failures; reads reached 4,180 ops/s (4 KB), 1,346 MB/s (1 MB), and
 1,920 MB/s (16 MB).
 
-**Clean-load re-measure (2026-08-02, client swift4 → VIP `10.0.0.10:8085`):**
-4KB write @128 ≈ **138 ops/s** fail=0; 4KB read @128 ≈ **1055 ops/s** fail=0;
-1MB write/read @32 fail=0. **16MB read @8 remains ACCEPT_WITH_WARN** (normal-stage
-success ~9% even after prepare 80/80) — see
+**Clean-load re-measure (2026-08-02, client swift4 → VIP `10.0.0.10:8085`,
+HA-PATH):** 4KB write @128 ≈ **138 ops/s** fail=0; 4KB read @128 ≈ **1055 ops/s**
+fail=0; 1MB write/read @32 fail=0. **16MB read @8 remains ACCEPT_WITH_WARN**
+(normal-stage success ~9% even after prepare 80/80) — see
 `deep-verify-20260802/PERF-REMEASURE.md`. Do not treat 16MB as cleared.
 
 ## Write-concurrency optimization

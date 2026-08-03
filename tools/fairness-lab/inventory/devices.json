@@ -1,0 +1,25 @@
+{
+  "note": "Filled from preflight UUIDs (by-uuid). Prefer by-uuid over /dev/sdX.",
+  "hosts": {
+    "swift1": {
+      "/srv/node/d1": "/dev/disk/by-uuid/6eab8051-ec34-43cf-bcc2-cd688154660a",
+      "/srv/node/d2": "/dev/disk/by-uuid/feb30b1d-551b-4926-a447-59ac90e6eaf3",
+      "/srv/node/d3": "/dev/disk/by-uuid/5a766bc5-d852-4cfb-b9e6-37100e6d45e3"
+    },
+    "swift2": {
+      "/srv/node/d1": "/dev/disk/by-uuid/c077bb14-3c39-4844-b3f2-2d4c5d17f424",
+      "/srv/node/d2": "/dev/disk/by-uuid/cf8e0400-bc0d-4119-b9b1-7d56d46d8182",
+      "/srv/node/d3": "/dev/disk/by-uuid/6b6dcbc3-ce1f-403d-8b34-27c88c3ca676"
+    },
+    "swift3": {
+      "/srv/node/d1": "/dev/disk/by-uuid/82f8bcf7-56b4-477b-a404-5a855908827b",
+      "/srv/node/d2": "/dev/disk/by-uuid/389b00e1-90ae-4ee5-8e70-9cd9b445df6b",
+      "/srv/node/d3": "/dev/disk/by-uuid/ae5c701b-5a97-4cc0-bd30-9a0d6fd5900f"
+    },
+    "swift4": {
+      "/srv/node/d1": "/dev/disk/by-uuid/7b653187-088c-41aa-9df2-9378e1c802bf",
+      "/srv/node/d2": "/dev/disk/by-uuid/41cb5b5e-7e2d-4715-9ccc-c12d7adb01b3",
+      "/srv/node/d3": "/dev/disk/by-uuid/befb258c-ab42-47d2-b95b-52586069c7cf"
+    }
+  }
+}

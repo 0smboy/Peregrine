@@ -1,0 +1,14 @@
+schema_version: 1
+entry: HA-PATH
+implementation: rust
+profile: data-path
+track: ISO-CONFIG
+task: 4KB_write_128
+reps_measured: 8
+warmup_discarded: 0
+endpoints: http://10.0.0.10:8085
+st_auth: http://10.0.0.10:8085/auth/v1.0
+note: >
+  Formal A-B-B-A pairing is operator-scheduled across IMPL flips via mode-switch.sh.
+  A single invocation runs REPS for one IMPL/ENTRY/PROFILE cell.
+dry_run: true

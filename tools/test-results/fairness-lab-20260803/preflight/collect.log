@@ -1,0 +1,71 @@
+collected_utc=20260803T033907Z
+script=preflight-collect.sh
+### swift1 ###
+### swift2 ###
+### swift3 ###
+### swift4 ###
+note=short RTT matrix; iperf3 optional
+swift1 -> 10.0.0.1 :: rtt min/avg/max/mdev = 0.056/0.073/0.088/0.013 ms
+swift1 -> 10.0.0.2 :: rtt min/avg/max/mdev = 0.631/1.372/1.891/0.537 ms
+swift1 -> 10.0.0.3 :: rtt min/avg/max/mdev = 0.607/1.291/1.705/0.487 ms
+swift1 -> 10.0.0.4 :: rtt min/avg/max/mdev = 0.688/88.178/251.411/115.522 ms
+swift2 -> 10.0.0.1 :: rtt min/avg/max/mdev = 0.655/3.722/9.530/4.109 ms
+swift2 -> 10.0.0.2 :: rtt min/avg/max/mdev = 0.076/0.095/0.121/0.018 ms
+swift2 -> 10.0.0.3 :: rtt min/avg/max/mdev = 1.639/27.861/76.559/34.468 ms
+swift2 -> 10.0.0.4 :: rtt min/avg/max/mdev = 0.770/35.765/53.513/24.746 ms
+swift3 -> 10.0.0.1 :: rtt min/avg/max/mdev = 0.566/1.330/2.669/0.949 ms
+swift3 -> 10.0.0.2 :: rtt min/avg/max/mdev = 1.423/12.145/19.307/7.722 ms
+swift3 -> 10.0.0.3 :: rtt min/avg/max/mdev = 0.054/0.081/0.102/0.020 ms
+swift3 -> 10.0.0.4 :: rtt min/avg/max/mdev = 2.129/15.886/31.617/12.119 ms
+swift4 -> 10.0.0.1 :: rtt min/avg/max/mdev = 0.647/2.144/3.863/1.322 ms
+swift4 -> 10.0.0.2 :: rtt min/avg/max/mdev = 3.570/7.051/12.182/3.704 ms
+swift4 -> 10.0.0.3 :: rtt min/avg/max/mdev = 1.764/33.552/91.713/41.185 ms
+swift4 -> 10.0.0.4 :: rtt min/avg/max/mdev = 0.077/3.196/8.771/3.951 ms
+{
+  "collected_utc": "20260803T033907Z",
+  "hosts": {
+    "swift1": {
+      "nproc": 4,
+      "mem_total_bytes_line": "Mem:      8054063104",
+      "interesting_listeners": [
+        "LISTEN 0      20000      10.0.0.10:8085       0.0.0.0:*",
+        "LISTEN 0      20000       10.0.0.1:8085       0.0.0.0:*",
+        "LISTEN 0      128        127.0.0.1:9000       0.0.0.0:*",
+        "LISTEN 0      65535      127.0.0.1:9090       0.0.0.0:*",
+        "LISTEN 0      4096       127.0.0.1:8090       0.0.0.0:*",
+        "LISTEN 0      4096       127.0.0.1:8090       0.0.0.0:*",
+        "LISTEN 0      128        127.0.0.1:8081       0.0.0.0:*",
+        "LISTEN 0      128         10.0.4.1:6200       0.0.0.0:*"
+      ],
+      "ssh_ok": true
+    },
+    "swift2": {
+      "nproc": 4,
+      "mem_total_bytes_line": "Mem:      8054063104",
+      "interesting_listeners": [
+        "LISTEN 0      20000       10.0.0.2:8085       0.0.0.0:*",
+        "LISTEN 0      128         10.0.4.2:6200       0.0.0.0:*"
+      ],
+      "ssh_ok": true
+    },
+    "swift3": {
+      "nproc": 4,
+      "mem_total_bytes_line": "Mem:      8054071296",
+      "interesting_listeners": [
+        "LISTEN 0      128         10.0.4.3:6200       0.0.0.0:*",
+        "LISTEN 0      20000       10.0.0.3:8085       0.0.0.0:*"
+      ],
+      "ssh_ok": true
+    },
+    "swift4": {
+      "nproc": 4,
+      "mem_total_bytes_line": "Mem:      8054063104",
+      "interesting_listeners": [
+        "LISTEN 0      20000       10.0.0.4:8085       0.0.0.0:*",
+        "LISTEN 0      128         10.0.4.4:6200       0.0.0.0:*"
+      ],
+      "ssh_ok": true
+    }
+  }
+}
+OK preflight -> /Users/oboy/Downloads/Peregrine/tools/test-results/fairness-lab-20260803/preflight

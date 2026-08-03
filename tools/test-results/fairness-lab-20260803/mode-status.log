@@ -1,0 +1,43 @@
+======== swift1 ========
+HOST=swift1 EXPECT=?
+LISTEN 0      4096       127.0.0.1:8090       0.0.0.0:*   
+LISTEN 0      4096       127.0.0.1:8090       0.0.0.0:*   
+LISTEN 0      128        127.0.0.1:8081       0.0.0.0:*   
+LISTEN 0      128         10.0.4.1:6200       0.0.0.0:*   
+28946 /usr/local/bin/swift-object-replicator /etc/swift/object-server.conf
+32589 /root/work/swift-rust/target/release/swift-proxy-server /etc/rsaio/proxy-server.conf
+413583 /usr/local/bin/swift-proxy-server /etc/swift/proxy-server.conf
+429893 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-object-server /etc/pyswift/object-server.conf -v
+429913 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-object-server /etc/pyswift/object-server.conf -v
+429914 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-object-server /etc/pyswift/object-server.conf -v
+429915 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-proxy-server /etc/pyswift/proxy-server.conf -v
+429921 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-proxy-server /etc/pyswift/proxy-server.conf -v
+429922 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-proxy-server /etc/pyswift/proxy-server.conf -v
+1916666 /usr/local/bin/swift-object-updater /etc/swift/object-server.conf
+2674816 /root/work/swift-rust/target/release/swift-object-server /etc/rsaio/object-server.conf
+3121683 /usr/local/bin/swift-object-server /etc/swift/object-server.conf
+3165411 /usr/local/bin/swift-object-reconstructor /etc/swift/object-server.conf
+======== swift2 ========
+HOST=swift2 EXPECT=?
+LISTEN 0      128         10.0.4.2:6200       0.0.0.0:*   
+385085 /usr/local/bin/swift-proxy-server /etc/swift/proxy-server.conf
+385086 /usr/local/bin/swift-object-server /etc/swift/object-server.conf
+385491 /usr/local/bin/swift-object-replicator /etc/swift/object-server.conf
+385493 /usr/local/bin/swift-object-updater /etc/swift/object-server.conf
+385913 /usr/local/bin/swift-object-reconstructor /etc/swift/object-server.conf
+======== swift3 ========
+HOST=swift3 EXPECT=?
+LISTEN 0      128         10.0.4.3:6200       0.0.0.0:*   
+9868 /usr/local/bin/swift-object-replicator /etc/swift/object-server.conf
+29748 /usr/local/bin/swift-proxy-server /etc/swift/proxy-server.conf
+160621 /usr/local/bin/swift-object-updater /etc/swift/object-server.conf
+351747 /usr/local/bin/swift-object-server /etc/swift/object-server.conf
+360922 /usr/local/bin/swift-object-reconstructor /etc/swift/object-server.conf
+======== swift4 ========
+HOST=swift4 EXPECT=?
+LISTEN 0      128         10.0.4.4:6200       0.0.0.0:*   
+4094 /usr/local/bin/swift-object-replicator /etc/swift/object-server.conf
+24635 /usr/local/bin/swift-proxy-server /etc/swift/proxy-server.conf
+153177 /usr/local/bin/swift-object-updater /etc/swift/object-server.conf
+367859 /usr/local/bin/swift-object-server /etc/swift/object-server.conf
+376286 /usr/local/bin/swift-object-reconstructor /etc/swift/object-server.conf

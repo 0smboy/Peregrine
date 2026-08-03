@@ -1,0 +1,4 @@
+{"injected_at_utc": "2026-08-03T03:45:16.892597589Z", "note": "stop swift-proxy", "scenario": "proxy-loss", "target": "swift2"}
+{"injected_at_utc": "2026-08-03T03:45:23.733841166Z", "note": "recovered ok=20 fail=0", "scenario": "proxy-loss", "target": "swift2"}
+{"ok":20,"fail":0}
+OK chaos -> /root/fairness-chaos-proxy-loss

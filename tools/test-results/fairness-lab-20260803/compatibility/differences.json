@@ -1,0 +1,183 @@
+{
+  "endpoint_py": "http://127.0.0.1:8090",
+  "endpoint_rs": "http://127.0.0.1:8081",
+  "rows": [
+    {
+      "case": "create-container",
+      "python": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "rust": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "classification": "match"
+    },
+    {
+      "case": "put-object",
+      "python": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "rust": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "classification": "match"
+    },
+    {
+      "case": "head-object",
+      "python": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "rust": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "classification": "match"
+    },
+    {
+      "case": "get-object",
+      "python": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "rust": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "classification": "match"
+    },
+    {
+      "case": "range-get",
+      "python": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "rust": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "classification": "match"
+    },
+    {
+      "case": "post-meta",
+      "python": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "rust": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "classification": "match"
+    },
+    {
+      "case": "list-container",
+      "python": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "rust": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "classification": "match"
+    },
+    {
+      "case": "zero-byte",
+      "python": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "rust": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "classification": "match"
+    },
+    {
+      "case": "delete-empty",
+      "python": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "rust": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "classification": "match"
+    },
+    {
+      "case": "delete-obj",
+      "python": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "rust": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "classification": "match"
+    },
+    {
+      "case": "delete-container",
+      "python": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "rust": {
+        "status": 0,
+        "headers": {},
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_len": 0
+      },
+      "classification": "match"
+    }
+  ],
+  "fail": 0
+}

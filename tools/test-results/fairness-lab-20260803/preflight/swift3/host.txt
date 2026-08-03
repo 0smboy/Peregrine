@@ -1,0 +1,165 @@
+=== hostname ===
+swift3
+2026-08-03T03:39:23Z
+=== uname ===
+Linux swift3 5.14.0-687.31.1.el9_8.x86_64 #1 SMP PREEMPT_DYNAMIC Wed Jul 29 13:22:17 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+=== lscpu ===
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           52 bits physical, 48 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  4
+On-line CPU(s) list:                     0-3
+Vendor ID:                               AuthenticAMD
+BIOS Vendor ID:                          QEMU
+Model name:                              AMD EPYC Processor (with IBPB)
+BIOS Model name:                         pc-i440fx-9.0
+CPU family:                              23
+Model:                                   1
+Thread(s) per core:                      1
+Core(s) per socket:                      4
+Socket(s):                               1
+Stepping:                                2
+BogoMIPS:                                4992.49
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm rep_good nopl xtopology cpuid extd_apicid tsc_known_freq pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext ssbd ibpb stibp vmmcall fsgsbase bmi1 avx2 smep bmi2 rdseed adx smap clflushopt sha_ni xsaveopt xsavec xgetbv1 arat
+Hypervisor vendor:                       KVM
+Virtualization type:                     full
+L1d cache:                               128 KiB (4 instances)
+L1i cache:                               256 KiB (4 instances)
+L2 cache:                                2 MiB (4 instances)
+L3 cache:                                8 MiB (1 instance)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-3
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Old microcode:             Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Mitigation; untrained return thunk; SMT disabled
+Vulnerability Spec rstack overflow:      Mitigation; SMT disabled
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Retpolines; IBPB conditional; STIBP disabled; RSB filling; PBRSB-eIBRS Not affected; BHI Not affected
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Not affected
+=== nproc ===
+4
+=== free ===
+               total        used        free      shared  buff/cache   available
+Mem:      8054071296  3138822144  3056361472     4751360  2176376832  4915249152
+Swap:              0           0           0
+=== swapon ===
+=== cgroup cpu ===
+=== cgroup mem ===
+=== lsblk ===
+NAME    SIZE TYPE FSTYPE MOUNTPOINT   UUID                                 MODEL
+sda     200G disk                                                          QEMU HARDDISK
+├─sda1    2M part                                                          
+├─sda2  100M part vfat   /boot/efi    F30C-AABE                            
+├─sda3 1000M part xfs    /boot        7f0d7766-ad7b-478e-8457-8ebe91a63573 
+├─sda4   40G part xfs    /            3f3e91cd-0d04-4767-8757-fb54a8afafb2 
+├─sda5   50G part xfs    /srv/node/d1 82f8bcf7-56b4-477b-a404-5a855908827b 
+├─sda6   50G part xfs    /srv/node/d2 389b00e1-90ae-4ee5-8e70-9cd9b445df6b 
+└─sda7   50G part xfs    /srv/node/d3 ae5c701b-5a97-4cc0-bd30-9a0d6fd5900f 
+=== by-id ===
+total 0
+lrwxrwxrwx. 1 root root  9 Aug  1 13:44 scsi-0QEMU_QEMU_HARDDISK_drive-scsi0 -> ../../sda
+lrwxrwxrwx. 1 root root 10 Aug  1 13:44 scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-part1 -> ../../sda1
+lrwxrwxrwx. 1 root root 10 Aug  1 13:44 scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-part2 -> ../../sda2
+lrwxrwxrwx. 1 root root 10 Aug  1 13:44 scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-part3 -> ../../sda3
+lrwxrwxrwx. 1 root root 10 Aug  1 13:44 scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-part4 -> ../../sda4
+lrwxrwxrwx. 1 root root 10 Aug  1 13:44 scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-part5 -> ../../sda5
+lrwxrwxrwx. 1 root root 10 Aug  1 13:44 scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-part6 -> ../../sda6
+lrwxrwxrwx. 1 root root 10 Aug  1 13:44 scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-part7 -> ../../sda7
+=== findmnt srv ===
+TARGET SOURCE    FSTYPE OPTIONS
+/      /dev/sda4 xfs    rw,relatime,seclabel,attr2,inode64,logbufs=8,logbsize=32k,noquota
+├─/srv/node/d1                                          /dev/sda5  xfs        rw,noatime,nodiratime,seclabel,attr2,inode64,logbufs=8,logbsize=32k,noquota
+├─/srv/node/d3                                          /dev/sda7  xfs        rw,noatime,nodiratime,seclabel,attr2,inode64,logbufs=8,logbsize=32k,noquota
+└─/srv/node/d2                                          /dev/sda6  xfs        rw,noatime,nodiratime,seclabel,attr2,inode64,logbufs=8,logbsize=32k,noquota
+=== xfs_info ===
+-- /srv/node/d1 --
+meta-data=/dev/sda5              isize=512    agcount=4, agsize=3276800 blks
+         =                       sectsz=512   attr=2, projid32bit=1
+         =                       crc=1        finobt=1, sparse=1, rmapbt=0
+         =                       reflink=1    bigtime=1 inobtcount=1 nrext64=0
+data     =                       bsize=4096   blocks=13107200, imaxpct=25
+         =                       sunit=0      swidth=0 blks
+naming   =version 2              bsize=4096   ascii-ci=0, ftype=1
+log      =internal log           bsize=4096   blocks=16384, version=2
+         =                       sectsz=512   sunit=0 blks, lazy-count=1
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+-- /srv/node/d2 --
+meta-data=/dev/sda6              isize=512    agcount=4, agsize=3276800 blks
+         =                       sectsz=512   attr=2, projid32bit=1
+         =                       crc=1        finobt=1, sparse=1, rmapbt=0
+         =                       reflink=1    bigtime=1 inobtcount=1 nrext64=0
+data     =                       bsize=4096   blocks=13107200, imaxpct=25
+         =                       sunit=0      swidth=0 blks
+naming   =version 2              bsize=4096   ascii-ci=0, ftype=1
+log      =internal log           bsize=4096   blocks=16384, version=2
+         =                       sectsz=512   sunit=0 blks, lazy-count=1
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+-- /srv/node/d3 --
+meta-data=/dev/sda7              isize=512    agcount=4, agsize=3276800 blks
+         =                       sectsz=512   attr=2, projid32bit=1
+         =                       crc=1        finobt=1, sparse=1, rmapbt=0
+         =                       reflink=1    bigtime=1 inobtcount=1 nrext64=0
+data     =                       bsize=4096   blocks=13107200, imaxpct=25
+         =                       sunit=0      swidth=0 blks
+naming   =version 2              bsize=4096   ascii-ci=0, ftype=1
+log      =internal log           bsize=4096   blocks=16384, version=2
+         =                       sectsz=512   sunit=0 blks, lazy-count=1
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+=== ip -br ===
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+eth0             UP             169.58.108.87/17 2a02:c207:2347:9173::1/64 fe80::250:56ff:fe66:185b/64 
+eth1             UP             10.0.0.3/22 fe80::be24:11ff:fe9d:4928/64 
+eth2             UP             10.0.4.3/22 fe80::be24:11ff:fe01:d907/64 
+eth3             UP             10.0.8.3/22 fe80::be24:11ff:fed2:1b7a/64 
+=== ip route ===
+default via 169.58.0.1 dev eth0 proto static metric 100 
+10.0.0.0/22 dev eth1 proto kernel scope link src 10.0.0.3 metric 101 
+10.0.4.0/22 dev eth2 proto kernel scope link src 10.0.4.3 metric 102 
+10.0.8.0/22 dev eth3 proto kernel scope link src 10.0.8.3 metric 103 
+169.58.0.0/17 via 169.58.0.1 dev eth0 
+169.58.0.0/17 dev eth0 proto kernel scope link src 169.58.108.87 metric 100 
+=== chrony ===
+Reference ID    : 5241F838 (82-65-248-56.subs.proxad.net)
+Stratum         : 2
+Ref time (UTC)  : Mon Aug 03 03:36:24 2026
+System time     : 0.000497442 seconds slow of NTP time
+Last offset     : -0.000184450 seconds
+RMS offset      : 0.000265846 seconds
+Frequency       : 2.422 ppm fast
+Residual freq   : +0.000 ppm
+Skew            : 0.015 ppm
+Root delay      : 0.015062469 seconds
+Root dispersion : 0.004281939 seconds
+Update interval : 1032.7 seconds
+Leap status     : Normal
+=== ss listeners interesting ===
+LISTEN 0      128         10.0.4.3:6202       0.0.0.0:*   
+LISTEN 0      128         10.0.4.3:6201       0.0.0.0:*   
+LISTEN 0      128         10.0.4.3:6200       0.0.0.0:*   
+LISTEN 0      20000       10.0.0.3:8085       0.0.0.0:*   
+=== systemctl swift ===
+  swift-account-replicator.service   loaded active running Swift account replicator
+  swift-account.service              loaded active running Swift account (rust)
+  swift-container-replicator.service loaded active running Swift container replicator
+  swift-container-updater.service    loaded active running Swift container updater
+  swift-container.service            loaded active running Swift container (rust)
+  swift-object-reconstructor.service loaded active running Swift object reconstructor
+  swift-object-replicator.service    loaded active running Swift object replicator
+  swift-object-updater.service       loaded active running Swift object updater
+  swift-object.service               loaded active running Swift object (rust)
+  swift-proxy.service                loaded active running Swift proxy (rust)
+  swift-audit-sweep.timer            loaded active waiting Nightly Swift auditor sweep
+=== steal sample ===
+cpu  1828842 2219 3489984 47300099 288570 0 1714554 0 0 0

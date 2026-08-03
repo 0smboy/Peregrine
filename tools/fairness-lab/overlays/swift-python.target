@@ -1,0 +1,7 @@
+[Unit]
+Description=Aggregate target for Python OpenStack Swift stack (fairness-lab)
+Wants=openstack-swift-proxy.service openstack-swift-account.service openstack-swift-container.service openstack-swift-object.service
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target
