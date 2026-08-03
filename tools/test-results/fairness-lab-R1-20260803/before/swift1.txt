@@ -1,0 +1,39 @@
+swift1
+2026-08-03T04:34:22Z
+---UNITS---
+active
+active
+active
+active
+active
+active
+active
+---SS---
+LISTEN 0      1024        10.0.0.1:11211      0.0.0.0:*    users:(("memcached",pid=70689,fd=26))                                            
+LISTEN 0      20000      10.0.0.10:8085       0.0.0.0:*    users:(("haproxy",pid=412772,fd=10))                                             
+LISTEN 0      20000       10.0.0.1:8085       0.0.0.0:*    users:(("haproxy",pid=412772,fd=8))                                              
+LISTEN 0      128        127.0.0.1:8789       0.0.0.0:*    users:(("swift-deploy",pid=402527,fd=3))                                         
+LISTEN 0      128        127.0.0.1:9000       0.0.0.0:*    users:(("swift-console",pid=413384,fd=9))                                        
+LISTEN 0      65535      127.0.0.1:9090       0.0.0.0:*    users:(("prometheus",pid=403255,fd=7))                                           
+LISTEN 0      4096       127.0.0.1:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=429922,fd=19),("swift-proxy-ser",pid=429915,fd=19))
+LISTEN 0      4096       127.0.0.1:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=429921,fd=17),("swift-proxy-ser",pid=429915,fd=17))
+LISTEN 0      128        127.0.0.1:8081       0.0.0.0:*    users:(("swift-proxy-ser",pid=32589,fd=4))                                       
+LISTEN 0      1024       127.0.0.1:11211      0.0.0.0:*    users:(("memcached",pid=70689,fd=27))                                            
+LISTEN 0      65535              *:3100             *:*    users:(("loki",pid=403665,fd=8))                                                 
+---SAIO---
+  32137 /root/work/swift-rust/target/release/swift-account-server /etc/rsaio/account-server.conf
+  32138 /root/work/swift-rust/target/release/swift-container-server /etc/rsaio/container-server.conf
+  32589 /root/work/swift-rust/target/release/swift-proxy-server /etc/rsaio/proxy-server.conf
+ 429891 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-account-server /etc/pyswift/account-server.conf -v
+ 429892 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-container-server /etc/pyswift/container-server.conf -v
+ 429893 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-object-server /etc/pyswift/object-server.conf -v
+ 429909 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-container-server /etc/pyswift/container-server.conf -v
+ 429910 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-container-server /etc/pyswift/container-server.conf -v
+ 429911 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-account-server /etc/pyswift/account-server.conf -v
+ 429912 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-account-server /etc/pyswift/account-server.conf -v
+ 429913 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-object-server /etc/pyswift/object-server.conf -v
+ 429914 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-object-server /etc/pyswift/object-server.conf -v
+ 429915 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-proxy-server /etc/pyswift/proxy-server.conf -v
+ 429921 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-proxy-server /etc/pyswift/proxy-server.conf -v
+ 429922 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-proxy-server /etc/pyswift/proxy-server.conf -v
+2674816 /root/work/swift-rust/target/release/swift-object-server /etc/rsaio/object-server.conf

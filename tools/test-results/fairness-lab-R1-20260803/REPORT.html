@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>Fairness Lab R1 — Hub Cleared</title>
+<style>
+  :root { --bg:#12110f; --ink:#e8e2d6; --muted:#9a9284; --ok:#7cb87c; --line:#2a2824; --panel:#1a1916; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.45 ui-sans-serif, system-ui, sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width:920px; margin:0 auto; padding:40px 28px 80px; }
+  h1 { font-size:28px; font-weight:650; letter-spacing:-0.02em; margin:0 0 8px; }
+  .sub { color:var(--muted); margin-bottom:28px; }
+  .badge { display:inline-block; padding:2px 8px; border:1px solid var(--ok); color:var(--ok); font-size:12px; }
+  table { width:100%; border-collapse:collapse; margin:18px 0 28px; }
+  th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:0.04em; }
+  .ok { color:var(--ok); }
+  .panel { background:var(--panel); padding:16px 18px; margin:16px 0; }
+  code { font:13px/1.4 ui-monospace, Menlo, monospace; color:#d4cfc3; }
+  h2 { font-size:18px; margin:32px 0 10px; font-weight:600; }
+</style>
+</head>
+<body>
+<main>
+  <div class="badge">R1 STOP · GREEN</div>
+  <h1>Hub cleared off VIP MASTER</h1>
+  <p class="sub">2026-08-03 · Contabo fairness lab · evidence <code>fairness-lab-R1-20260803/</code></p>
+
+  <table>
+    <tr><th>Gate</th><th>Result</th><th>Proof</th></tr>
+    <tr><td>swift1 no :8090 / :8081</td><td class="ok">PASS</td><td><code>after/swift1.txt</code> SAIO=NONE</td></tr>
+    <tr><td>Prometheus / console off MASTER</td><td class="ok">PASS</td><td>hub active on <strong>swift4</strong></td></tr>
+    <tr><td>VIP health</td><td class="ok">PASS</td><td>auth <code>HTTP/1.1 200 OK</code></td></tr>
+  </table>
+
+  <h2>Layout now</h2>
+  <div class="panel">
+    <div><strong>swift1</strong> — VIP MASTER + cluster only (haproxy / keepalived / memcached / alloy)</div>
+    <div><strong>swift4</strong> — prometheus :9090 · loki :3100 · console :9000 · deploy-ui :8789</div>
+    <div><strong>SAIO</strong> — stopped; relocate to swift3 before R3 (not on hub host)</div>
+  </div>
+
+  <h2>Tunnel</h2>
+  <div class="panel"><code>ssh -L 9000:127.0.0.1:9000 -L 9090:127.0.0.1:9090 -L 3100:127.0.0.1:3100 swift4</code></div>
+
+  <h2>Next</h2>
+  <p>R1 green → open <strong>R2</strong> mode exclusivity. Do not start R4.</p>
+</main>
+</body>
+</html>

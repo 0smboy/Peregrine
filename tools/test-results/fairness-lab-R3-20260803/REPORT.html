@@ -1,0 +1,33 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Fairness Lab R3 — Compat Gate</title>
+<style>
+:root{--bg:#14120f;--ink:#f2ebe1;--muted:#a89a88;--ok:#7dba6e;--warn:#d4a24c;--line:#2c2822}
+body{margin:0;font:15px/1.5 ui-sans-serif,system-ui;background:var(--bg);color:var(--ink)}
+main{max-width:920px;margin:0 auto;padding:32px 24px 64px}
+h1{font-size:28px;font-weight:650;margin:0 0 8px}
+.sub{color:var(--muted);margin-bottom:28px}
+.card{background:#1c1915;border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin:12px 0}
+.ok{color:var(--ok);font-weight:650}
+table{width:100%;border-collapse:collapse;margin-top:8px}
+td,th{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);font-size:14px}
+th{color:var(--muted);font-weight:550}
+code{font:13px ui-monospace,Menlo,monospace;color:#e6d8c4}
+</style>
+<main>
+<h1>R3 Compatibility Gate</h1>
+<p class="sub">2026-08-03 · Contabo · Stop <span class="ok">GREEN</span></p>
+<div class="card">
+<strong>Verdict:</strong> L1 CORE-PATH <code>compat-diff</code> fail=0 (11/11).
+func-suite VIP / rust-saio / py-saio = 54/54 (py 首轮 flake 已复测).
+SAIO 重建于 <code>swift3</code>；hub 仍在 <code>swift4</code>。
+</div>
+<table>
+<tr><th>Check</th><th>Result</th></tr>
+<tr><td>compat-diff CORE-PATH</td><td class="ok">PASS fail=0</td></tr>
+<tr><td>func VIP</td><td class="ok">54/54</td></tr>
+<tr><td>func rust-saio :8081</td><td class="ok">54/54</td></tr>
+<tr><td>func py-saio :8090</td><td class="ok">54/54 (rerun)</td></tr>
+<tr><td>Layout R1-clean</td><td class="ok">PASS</td></tr>
+<tr><td>shadow_peer → swift3:8090</td><td class="ok">PASS</td></tr>
+</table>
+<p class="sub" style="margin-top:24px">Evidence: <code>tools/test-results/fairness-lab-R3-20260803/</code></p>
+</main></html>

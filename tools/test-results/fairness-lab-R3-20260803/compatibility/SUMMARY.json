@@ -1,0 +1,17 @@
+{
+  "cases": 11,
+  "fail": 0,
+  "gate": "PASS",
+  "label": "CORE-PATH",
+  "when_utc": "2026-08-03T05:35:50Z",
+  "endpoint_py": "http://10.0.0.3:8090",
+  "endpoint_rs": "http://10.0.0.3:8081",
+  "layout": "R1-clean: hub=swift4; SAIO=swift3 bind 10.0.0.3; VIP MASTER=swift1",
+  "func_suite": {
+    "vip": "PASS=54 FAIL=0",
+    "rust_saio": "PASS=54 FAIL=0",
+    "py_saio_first": "PASS=53 FAIL=1 (flake: account HEAD)",
+    "py_saio_rerun": "PASS=54 FAIL=0"
+  },
+  "unsupported_registered": []
+}

@@ -1,0 +1,34 @@
+{
+  "entry": "DIRECT-4PROXY",
+  "impl": "rust",
+  "profile": "data-path",
+  "track": "ISO-CONFIG",
+  "task": "16MB_read_4",
+  "ops_per_s_samples": [
+    1.3333333333333333,
+    0.8333333333333334,
+    1.2,
+    0.45161290322580644,
+    1.5333333333333334,
+    0.4,
+    1.3,
+    0.0
+  ],
+  "ops_median": 1.0166666666666666,
+  "ops_p05": 0.14,
+  "ops_p95": 1.4633333333333334,
+  "fail_samples": [
+    4125,
+    3908,
+    1280,
+    44510,
+    8013,
+    1232,
+    6673,
+    133751
+  ],
+  "n": 8,
+  "reps_met": true,
+  "total_fails": 203492,
+  "label": "DIRECT-4PROXY"
+}

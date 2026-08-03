@@ -1,0 +1,8 @@
+swift3
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=29748,fd=5))              
+LISTEN 0      128         10.0.4.3:6202       0.0.0.0:*    users:(("swift-account-s",pid=25266,fd=4))              
+LISTEN 0      128         10.0.4.3:6201       0.0.0.0:*    users:(("swift-container",pid=25348,fd=4))              
+LISTEN 0      128         10.0.4.3:6200       0.0.0.0:*    users:(("swift-object-se",pid=351747,fd=5))             
+LISTEN 0      20000       10.0.0.3:8085       0.0.0.0:*    users:(("haproxy",pid=29330,fd=8))                      
+active
+SAIO_NONE

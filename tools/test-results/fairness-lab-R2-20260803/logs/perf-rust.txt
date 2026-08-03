@@ -1,0 +1,164 @@
+MODE=perf-rust: stop python surface + SAIO, ensure rust cluster up
+HOST=swift1 EXPECT=rust
+---LISTEN---
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=413583,fd=5))              
+LISTEN 0      20000      10.0.0.10:8085       0.0.0.0:*    users:(("haproxy",pid=412772,fd=10))                     
+LISTEN 0      20000       10.0.0.1:8085       0.0.0.0:*    users:(("haproxy",pid=412772,fd=8))                      
+LISTEN 0      128         10.0.4.1:6201       0.0.0.0:*    users:(("swift-container",pid=400503,fd=4))              
+LISTEN 2      128         10.0.4.1:6200       0.0.0.0:*    users:(("swift-object-se",pid=3121683,fd=5))             
+LISTEN 0      128         10.0.4.1:6202       0.0.0.0:*    users:(("swift-account-s",pid=400485,fd=4))              
+---UNITS---
+unit swift-proxy=active
+unit swift-account=active
+unit swift-container=active
+unit swift-object=active
+unit swift-account-replicator=active
+unit swift-container-replicator=active
+unit swift-container-updater=active
+unit swift-object-replicator=active
+unit swift-object-updater=active
+unit swift-object-reconstructor=active
+unit openstack-swift-proxy=inactive
+absent
+unit openstack-swift-account=inactive
+absent
+unit openstack-swift-container=inactive
+absent
+unit openstack-swift-object=inactive
+absent
+---SAIO_PROCS---
+---CLUSTER_PROCS---
+28665 /usr/local/bin/swift-db-replicator account /etc/swift/account-server.conf
+28878 /usr/local/bin/swift-db-replicator container /etc/swift/container-server.conf
+28946 /usr/local/bin/swift-object-replicator /etc/swift/object-server.conf
+29109 /usr/local/bin/swift-container-updater /etc/swift/container-server.conf
+50270 /usr/local/bin/swift-object-reconstructor --help
+400485 /usr/local/bin/swift-account-server /etc/swift/account-server.conf
+400503 /usr/local/bin/swift-container-server /etc/swift/container-server.conf
+413583 /usr/local/bin/swift-proxy-server /etc/swift/proxy-server.conf
+1916666 /usr/local/bin/swift-object-updater /etc/swift/object-server.conf
+3121683 /usr/local/bin/swift-object-server /etc/swift/object-server.conf
+3165411 /usr/local/bin/swift-object-reconstructor /etc/swift/object-server.conf
+HOST=swift2 EXPECT=rust
+---LISTEN---
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=435684,fd=5))              
+LISTEN 0      20000       10.0.0.2:8085       0.0.0.0:*    users:(("haproxy",pid=43741,fd=8))                       
+LISTEN 0      128         10.0.4.2:6201       0.0.0.0:*    users:(("swift-container",pid=385174,fd=4))              
+LISTEN 2      128         10.0.4.2:6200       0.0.0.0:*    users:(("swift-object-se",pid=385086,fd=5))              
+LISTEN 0      128         10.0.4.2:6202       0.0.0.0:*    users:(("swift-account-s",pid=385308,fd=4))              
+---UNITS---
+unit swift-proxy=active
+unit swift-account=active
+unit swift-container=active
+unit swift-object=active
+unit swift-account-replicator=active
+unit swift-container-replicator=active
+unit swift-container-updater=active
+unit swift-object-replicator=active
+unit swift-object-updater=active
+unit swift-object-reconstructor=active
+unit openstack-swift-proxy=inactive
+absent
+unit openstack-swift-account=inactive
+absent
+unit openstack-swift-container=inactive
+absent
+unit openstack-swift-object=inactive
+absent
+---SAIO_PROCS---
+---CLUSTER_PROCS---
+385086 /usr/local/bin/swift-object-server /etc/swift/object-server.conf
+385174 /usr/local/bin/swift-container-server /etc/swift/container-server.conf
+385308 /usr/local/bin/swift-account-server /etc/swift/account-server.conf
+385491 /usr/local/bin/swift-object-replicator /etc/swift/object-server.conf
+385492 /usr/local/bin/swift-container-updater /etc/swift/container-server.conf
+385493 /usr/local/bin/swift-object-updater /etc/swift/object-server.conf
+385494 /usr/local/bin/swift-db-replicator account /etc/swift/account-server.conf
+385495 /usr/local/bin/swift-db-replicator container /etc/swift/container-server.conf
+385913 /usr/local/bin/swift-object-reconstructor /etc/swift/object-server.conf
+435684 /usr/local/bin/swift-proxy-server /etc/swift/proxy-server.conf
+HOST=swift3 EXPECT=rust
+---LISTEN---
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=29748,fd=5))              
+LISTEN 0      128         10.0.4.3:6202       0.0.0.0:*    users:(("swift-account-s",pid=25266,fd=4))              
+LISTEN 0      128         10.0.4.3:6201       0.0.0.0:*    users:(("swift-container",pid=25348,fd=4))              
+LISTEN 0      128         10.0.4.3:6200       0.0.0.0:*    users:(("swift-object-se",pid=351747,fd=5))             
+LISTEN 0      20000       10.0.0.3:8085       0.0.0.0:*    users:(("haproxy",pid=29330,fd=8))                      
+---UNITS---
+unit swift-proxy=active
+unit swift-account=active
+unit swift-container=active
+unit swift-object=active
+unit swift-account-replicator=active
+unit swift-container-replicator=active
+unit swift-container-updater=active
+unit swift-object-replicator=active
+unit swift-object-updater=active
+unit swift-object-reconstructor=active
+unit openstack-swift-proxy=inactive
+absent
+unit openstack-swift-account=inactive
+absent
+unit openstack-swift-container=inactive
+absent
+unit openstack-swift-object=inactive
+absent
+---SAIO_PROCS---
+---CLUSTER_PROCS---
+9606 /usr/local/bin/swift-db-replicator account /etc/swift/account-server.conf
+9865 /usr/local/bin/swift-db-replicator container /etc/swift/container-server.conf
+9868 /usr/local/bin/swift-object-replicator /etc/swift/object-server.conf
+10050 /usr/local/bin/swift-container-updater /etc/swift/container-server.conf
+25266 /usr/local/bin/swift-account-server /etc/swift/account-server.conf
+25348 /usr/local/bin/swift-container-server /etc/swift/container-server.conf
+29748 /usr/local/bin/swift-proxy-server /etc/swift/proxy-server.conf
+160621 /usr/local/bin/swift-object-updater /etc/swift/object-server.conf
+351747 /usr/local/bin/swift-object-server /etc/swift/object-server.conf
+360922 /usr/local/bin/swift-object-reconstructor /etc/swift/object-server.conf
+HOST=swift4 EXPECT=rust
+---LISTEN---
+LISTEN 0      20000       10.0.0.4:8085       0.0.0.0:*    users:(("haproxy",pid=24300,fd=8))                      
+LISTEN 0      128         10.0.4.4:6200       0.0.0.0:*    users:(("swift-object-se",pid=367859,fd=5))             
+LISTEN 0      128         10.0.4.4:6201       0.0.0.0:*    users:(("swift-container",pid=20622,fd=4))              
+LISTEN 0      128         10.0.4.4:6202       0.0.0.0:*    users:(("swift-account-s",pid=20491,fd=4))              
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=24635,fd=5))              
+---UNITS---
+unit swift-proxy=active
+unit swift-account=active
+unit swift-container=active
+unit swift-object=active
+unit swift-account-replicator=active
+unit swift-container-replicator=active
+unit swift-container-updater=active
+unit swift-object-replicator=active
+unit swift-object-updater=active
+unit swift-object-reconstructor=active
+unit openstack-swift-proxy=inactive
+absent
+unit openstack-swift-account=inactive
+absent
+unit openstack-swift-container=inactive
+absent
+unit openstack-swift-object=inactive
+absent
+---SAIO_PROCS---
+---CLUSTER_PROCS---
+3865 /usr/local/bin/swift-db-replicator account /etc/swift/account-server.conf
+3995 /usr/local/bin/swift-db-replicator container /etc/swift/container-server.conf
+4094 /usr/local/bin/swift-object-replicator /etc/swift/object-server.conf
+4309 /usr/local/bin/swift-container-updater /etc/swift/container-server.conf
+20491 /usr/local/bin/swift-account-server /etc/swift/account-server.conf
+20622 /usr/local/bin/swift-container-server /etc/swift/container-server.conf
+24635 /usr/local/bin/swift-proxy-server /etc/swift/proxy-server.conf
+153177 /usr/local/bin/swift-object-updater /etc/swift/object-server.conf
+367859 /usr/local/bin/swift-object-server /etc/swift/object-server.conf
+376286 /usr/local/bin/swift-object-reconstructor /etc/swift/object-server.conf
+======== GATE perf-rust swift1 ========
+GATE_OK host=swift1
+======== GATE perf-rust swift2 ========
+GATE_OK host=swift2
+======== GATE perf-rust swift3 ========
+GATE_OK host=swift3
+======== GATE perf-rust swift4 ========
+GATE_OK host=swift4
+MODE_GATE=PASS expect=perf-rust

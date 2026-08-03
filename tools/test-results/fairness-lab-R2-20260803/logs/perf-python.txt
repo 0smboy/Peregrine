@@ -1,0 +1,50 @@
+MODE=perf-python: require full 4-node Python cluster units
+python_unit_files host=swift1 count=0
+python_unit_files host=swift2 count=0
+python_unit_files host=swift3 count=0
+python_unit_files host=swift4 count=0
+PYTHON_CLUSTER_ABSENT
+MODE_GATE=SKIP_FREEZE_PY_FORMAL — Contabo has no openstack-swift cluster units
+Refusing to stop Rust cluster (would destroy live lab with no Python replacement).
+HOST=swift1 EXPECT=python-absent
+---LISTEN---
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=413583,fd=5))              
+LISTEN 0      20000      10.0.0.10:8085       0.0.0.0:*    users:(("haproxy",pid=412772,fd=10))                     
+LISTEN 0      20000       10.0.0.1:8085       0.0.0.0:*    users:(("haproxy",pid=412772,fd=8))                      
+LISTEN 0      128         10.0.4.1:6201       0.0.0.0:*    users:(("swift-container",pid=400503,fd=4))              
+LISTEN 0      128         10.0.4.1:6200       0.0.0.0:*    users:(("swift-object-se",pid=3121683,fd=5))             
+LISTEN 0      128         10.0.4.1:6202       0.0.0.0:*    users:(("swift-account-s",pid=400485,fd=4))              
+---UNITS---
+unit swift-proxy=active
+unit swift-account=active
+unit swift-container=active
+unit swift-object=active
+unit swift-account-replicator=active
+unit swift-container-replicator=active
+unit swift-container-updater=active
+unit swift-object-replicator=active
+unit swift-object-updater=active
+unit swift-object-reconstructor=active
+unit openstack-swift-proxy=inactive
+absent
+unit openstack-swift-account=inactive
+absent
+unit openstack-swift-container=inactive
+absent
+unit openstack-swift-object=inactive
+absent
+---SAIO_PROCS---
+---CLUSTER_PROCS---
+28665 /usr/local/bin/swift-db-replicator account /etc/swift/account-server.conf
+28878 /usr/local/bin/swift-db-replicator container /etc/swift/container-server.conf
+28946 /usr/local/bin/swift-object-replicator /etc/swift/object-server.conf
+29109 /usr/local/bin/swift-container-updater /etc/swift/container-server.conf
+50270 /usr/local/bin/swift-object-reconstructor --help
+400485 /usr/local/bin/swift-account-server /etc/swift/account-server.conf
+400503 /usr/local/bin/swift-container-server /etc/swift/container-server.conf
+413583 /usr/local/bin/swift-proxy-server /etc/swift/proxy-server.conf
+1916666 /usr/local/bin/swift-object-updater /etc/swift/object-server.conf
+3121683 /usr/local/bin/swift-object-server /etc/swift/object-server.conf
+3165411 /usr/local/bin/swift-object-reconstructor /etc/swift/object-server.conf
+Connection timed out during banner exchange
+Connection to 169.58.108.86 port 22 timed out

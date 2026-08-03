@@ -1,0 +1,9 @@
+HTTP/1.1 200 OK
+x-auth-token: AUTH_tkcda5ed5b70e1f80d00000117
+x-storage-token: AUTH_tkcda5ed5b70e1f80d00000117
+x-storage-url: http://10.0.0.10:8085/v1/AUTH_test
+content-type: text/plain
+content-length: 0
+x-trans-id: tx54123c3fb558bb36c45c8-006a701c32
+x-openstack-request-id: tx54123c3fb558bb36c45c8-006a701c32
+

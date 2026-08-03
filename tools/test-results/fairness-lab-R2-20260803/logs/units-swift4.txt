@@ -1,0 +1,47 @@
+HOST=swift4
+  UNIT                               LOAD   ACTIVE   SUB     DESCRIPTION
+  swift-account-replicator.service   loaded active   running Swift account replicator
+  swift-account.service              loaded active   running Swift account (rust)
+  swift-audit-sweep.service          loaded inactive dead    Swift auditor sweep
+  swift-console.service              loaded active   running Swift Console (unified Files / Deploy / Monitor UI)
+  swift-container-replicator.service loaded active   running Swift container replicator
+  swift-container-updater.service    loaded active   running Swift container updater
+  swift-container.service            loaded active   running Swift container (rust)
+  swift-deploy-ui.service            loaded active   running Swift Deploy UI (localhost only)
+  swift-object-reconstructor.service loaded active   running Swift object reconstructor
+  swift-object-replicator.service    loaded active   running Swift object replicator
+  swift-object-updater.service       loaded active   running Swift object updater
+  swift-object.service               loaded active   running Swift object (rust)
+  swift-proxy.service                loaded active   running Swift proxy (rust)
+
+LOAD   = Reflects whether the unit definition was properly loaded.
+ACTIVE = The high-level unit activation state, i.e. generalization of SUB.
+SUB    = The low-level unit activation state, values depend on unit type.
+13 loaded units listed.
+To show all installed unit files use 'systemctl list-unit-files'.
+---
+UNIT FILE                          STATE    PRESET
+swift-account-replicator.service   enabled  disabled
+swift-account.service              enabled  disabled
+swift-audit-sweep.service          static   -
+swift-console.service              enabled  disabled
+swift-container-replicator.service enabled  disabled
+swift-container-updater.service    enabled  disabled
+swift-container.service            enabled  disabled
+swift-deploy-ui.service            enabled  disabled
+swift-object-reconstructor.service enabled  disabled
+swift-object-replicator.service    enabled  disabled
+swift-object-updater.service       enabled  disabled
+swift-object.service               enabled  disabled
+swift-proxy.service                enabled  disabled
+swift-python.target                disabled disabled
+swift-rust.target                  disabled disabled
+swift-audit-sweep.timer            enabled  disabled
+
+16 unit files listed.
+---SS---
+LISTEN 0      20000       10.0.0.4:8085       0.0.0.0:*    users:(("haproxy",pid=24300,fd=8))                      
+LISTEN 0      128         10.0.4.4:6200       0.0.0.0:*    users:(("swift-object-se",pid=367859,fd=5))             
+LISTEN 0      128         10.0.4.4:6201       0.0.0.0:*    users:(("swift-container",pid=20622,fd=4))              
+LISTEN 0      128         10.0.4.4:6202       0.0.0.0:*    users:(("swift-account-s",pid=20491,fd=4))              
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=24635,fd=5))              

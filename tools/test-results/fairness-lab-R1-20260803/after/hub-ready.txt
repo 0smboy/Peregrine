@@ -1,0 +1,5 @@
+Prometheus Server is Ready.
+
+ready
+
+console=303

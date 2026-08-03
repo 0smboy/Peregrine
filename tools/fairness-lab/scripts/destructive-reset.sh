@@ -16,9 +16,11 @@ python3 - <<'PY' "$INV"
 import json, sys, pathlib
 inv = json.loads(pathlib.Path(sys.argv[1]).read_text())
 for host, mounts in inv["hosts"].items():
-    for mp, by_id in mounts.items():
+    for mp, path in mounts.items():
         assert mp.startswith("/srv/node/"), mp
-        assert by_id.startswith("/dev/disk/by-id/"), by_id
+        # Contabo inventory uses by-uuid; by-id also accepted. Never /dev/sdX.
+        ok = path.startswith("/dev/disk/by-id/") or path.startswith("/dev/disk/by-uuid/")
+        assert ok and "/dev/sd" not in path, path
 print("inventory_ok hosts=", len(inv["hosts"]))
 PY
 

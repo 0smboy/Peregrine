@@ -1,0 +1,12 @@
+{
+  "window": "1h",
+  "entry": "DIRECT-4PROXY",
+  "impl": "rust",
+  "task": "1KB_write_64",
+  "start_line": "SOAK_START=2026-08-03T07:18:05Z window=1h entry=DIRECT-4PROXY task=1KB_write_64",
+  "end_line": "SOAK_END=2026-08-03T08:18:16Z fails=0 iters=147",
+  "fails": 0,
+  "iters": 147,
+  "note": "1h smoke soak complete; dual runner lines coalesced; target 6h backlog",
+  "unrecovered_faults": 0
+}

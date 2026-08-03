@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>Fairness Lab R2 — Mode Gate</title>
+<style>
+  :root { --bg:#12110f; --ink:#e8e2d6; --muted:#9a9284; --ok:#7cb87c; --warn:#c4a35a; --line:#2a2824; --panel:#1a1916; }
+  body { margin:0; font:15px/1.45 ui-sans-serif, system-ui, sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width:920px; margin:0 auto; padding:40px 28px 80px; }
+  h1 { font-size:28px; font-weight:650; letter-spacing:-0.02em; margin:0 0 8px; }
+  .sub { color:var(--muted); margin-bottom:28px; }
+  .badge { display:inline-block; padding:2px 8px; border:1px solid var(--ok); color:var(--ok); font-size:12px; margin-right:8px; }
+  .badge.warn { border-color:var(--warn); color:var(--warn); }
+  table { width:100%; border-collapse:collapse; margin:18px 0 28px; }
+  th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:0.04em; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); }
+  .panel { background:var(--panel); padding:16px 18px; margin:16px 0; }
+  code { font:13px ui-monospace, Menlo, monospace; }
+  h2 { font-size:18px; margin:32px 0 10px; font-weight:600; }
+</style>
+</head>
+<body>
+<main>
+  <span class="badge">R2 STOP · GREEN</span>
+  <span class="badge warn">PY FORMAL FROZEN</span>
+  <h1>Mode exclusivity gate</h1>
+  <p class="sub">2026-08-03 · <code>fairness-lab-R2-20260803/</code></p>
+
+  <table>
+    <tr><th>Gate</th><th>Result</th><th>Proof</th></tr>
+    <tr><td>perf-rust · peer listeners 0</td><td class="ok">PASS</td><td>4× GATE_OK · no :8081/:8090</td></tr>
+    <tr><td>perf-python</td><td class="warn">PYTHON_CLUSTER_ABSENT</td><td>openstack-swift units = 0; Rust not stopped</td></tr>
+    <tr><td>destructive-reset dry</td><td class="ok">exit 3</td><td>inventory_ok · agent refuse wipe</td></tr>
+    <tr><td>VIP after switch</td><td class="ok">200</td><td>auth health</td></tr>
+  </table>
+
+  <h2>Freeze</h2>
+  <div class="panel">
+    Rust DIRECT-4PROXY formal: allowed after R3.<br/>
+    Python Performance formal: <strong>frozen</strong> until a real 4-node Python cluster exists.
+  </div>
+
+  <h2>Next</h2>
+  <p>R2 green → open <strong>R3</strong> compat-diff + func-suite. Do not start R4 yet.</p>
+</main>
+</body>
+</html>

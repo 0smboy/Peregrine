@@ -1,0 +1,27 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Fairness Lab R4 — DIRECT Perf</title>
+<style>
+:root{--bg:#14120f;--ink:#f2ebe1;--muted:#a89a88;--ok:#7dba6e;--warn:#d4a24c;--line:#2c2822}
+body{margin:0;font:15px/1.5 ui-sans-serif,system-ui;background:var(--bg);color:var(--ink)}
+main{max-width:980px;margin:0 auto;padding:32px 24px 64px}
+h1{font-size:28px;margin:0 0 8px} .sub{color:var(--muted)}
+.card{background:#1c1915;border:1px solid var(--line);border-radius:10px;padding:16px;margin:12px 0}
+.ok{color:var(--ok);font-weight:650} .warn{color:var(--warn);font-weight:650}
+table{width:100%;border-collapse:collapse} td,th{padding:8px 6px;border-bottom:1px solid var(--line);text-align:left;font-size:13px}
+th{color:var(--muted)} code{font:12px ui-monospace,Menlo,monospace}
+.bar{height:10px;background:#2a251f;border-radius:6px;overflow:hidden}
+.bar>i{display:block;height:100%;background:#8a7a62}
+</style>
+<main>
+<h1>R4 DIRECT-4PROXY Performance</h1>
+<p class="sub">2026-08-03 · Rust · data-path / ISO-CONFIG · Stop <span class="ok">GREEN</span> · 16MB_read <span class="warn">WARN</span></p>
+<div class="card">主表仅 DIRECT（非 VIP）。每 cell ≥8 measured。Python formal FROZEN。</div>
+<table><tr><th>Task</th><th>median ops/s</th><th>p05–p95</th><th>n</th><th>fail_rate</th><th>validity</th></tr>
+<tr><td><code>16MB_read_4</code></td><td>1.02</td><td>0.1–1.5</td><td>8</td><td>0.9990</td><td class='warn'>WARN</td></tr>
+<tr><td><code>16MB_write_4</code></td><td>2.29</td><td>2.2–2.6</td><td>8</td><td>0.0000</td><td class='ok'>ACCEPT</td></tr>
+<tr><td><code>1KB_read_64</code></td><td>685.40</td><td>569.7–1135.8</td><td>8</td><td>0.0000</td><td class='ok'>ACCEPT</td></tr>
+<tr><td><code>1KB_write_64</code></td><td>140.69</td><td>111.4–172.3</td><td>8</td><td>0.0000</td><td class='ok'>ACCEPT</td></tr>
+<tr><td><code>1MB_read_16</code></td><td>67.88</td><td>53.1–80.0</td><td>8</td><td>0.0000</td><td class='ok'>ACCEPT</td></tr>
+<tr><td><code>1MB_write_16</code></td><td>33.40</td><td>29.8–38.2</td><td>8</td><td>0.0000</td><td class='ok'>ACCEPT</td></tr>
+<tr><td><code>64KB_read_32</code></td><td>505.95</td><td>395.2–660.5</td><td>8</td><td>0.0000</td><td class='ok'>ACCEPT</td></tr>
+<tr><td><code>64KB_write_32</code></td><td>140.33</td><td>101.0–164.1</td><td>8</td><td>0.0000</td><td class='ok'>ACCEPT</td></tr>
+</table><p class='sub' style='margin-top:24px'>Evidence: <code>tools/test-results/fairness-lab-R4-20260803/</code></p></main></html>

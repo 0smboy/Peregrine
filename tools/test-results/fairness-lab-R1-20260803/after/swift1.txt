@@ -1,0 +1,19 @@
+swift1
+2026-08-03T04:41:44Z
+---UNITS---
+inactive
+inactive
+inactive
+inactive
+active
+active
+active
+---SS---
+LISTEN 0      1024        10.0.0.1:11211      0.0.0.0:*    users:(("memcached",pid=70689,fd=26))                    
+LISTEN 0      20000      10.0.0.10:8085       0.0.0.0:*    users:(("haproxy",pid=412772,fd=10))                     
+LISTEN 0      20000       10.0.0.1:8085       0.0.0.0:*    users:(("haproxy",pid=412772,fd=8))                      
+LISTEN 0      1024       127.0.0.1:11211      0.0.0.0:*    users:(("memcached",pid=70689,fd=27))                    
+---SAIO---
+NONE
+---ALLOY---
+    url = "http://10.0.0.4:3100/loki/api/v1/push"

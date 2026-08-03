@@ -1,0 +1,181 @@
+{
+  "Compatibility": {
+    "gate": "PASS",
+    "cases": 11,
+    "fail": 0,
+    "func": {
+      "vip": "PASS=54 FAIL=0",
+      "rust_saio": "PASS=54 FAIL=0",
+      "py_saio_first": "PASS=53 FAIL=1 (flake: account HEAD)",
+      "py_saio_rerun": "PASS=54 FAIL=0"
+    },
+    "path": "fairness-lab-R3-20260803"
+  },
+  "Performance_DIRECT": {
+    "entry": "DIRECT-4PROXY",
+    "impl": "rust",
+    "all_reps_met": true,
+    "cells": [
+      {
+        "task": "16MB_read_4",
+        "ops_median": 1.0166666666666666,
+        "n": 8,
+        "validity": "WARN",
+        "fail_rate": 0.9989592742410557
+      },
+      {
+        "task": "16MB_write_4",
+        "ops_median": 2.2903225806451615,
+        "n": 8,
+        "validity": "ACCEPT",
+        "fail_rate": 0.0
+      },
+      {
+        "task": "1KB_read_64",
+        "ops_median": 685.4,
+        "n": 8,
+        "validity": "ACCEPT",
+        "fail_rate": 0.0
+      },
+      {
+        "task": "1KB_write_64",
+        "ops_median": 140.69354838709677,
+        "n": 8,
+        "validity": "ACCEPT",
+        "fail_rate": 0.0
+      },
+      {
+        "task": "1MB_read_16",
+        "ops_median": 67.8758064516129,
+        "n": 8,
+        "validity": "ACCEPT",
+        "fail_rate": 0.0
+      },
+      {
+        "task": "1MB_write_16",
+        "ops_median": 33.400000000000006,
+        "n": 8,
+        "validity": "ACCEPT",
+        "fail_rate": 0.0
+      },
+      {
+        "task": "64KB_read_32",
+        "ops_median": 505.95,
+        "n": 8,
+        "validity": "ACCEPT",
+        "fail_rate": 0.0
+      },
+      {
+        "task": "64KB_write_32",
+        "ops_median": 140.33333333333334,
+        "n": 8,
+        "validity": "ACCEPT",
+        "fail_rate": 0.0
+      }
+    ],
+    "path": "fairness-lab-R4-20260803"
+  },
+  "HA_PATH": {
+    "entry": "HA-PATH ONLY",
+    "all_reps_met": true,
+    "cells": [
+      {
+        "task": "16MB_read_4",
+        "ops_median": 1.0333333333333334,
+        "n": 8,
+        "validity": "WARN",
+        "fail_rate": 0.9949961508852964
+      },
+      {
+        "task": "16MB_write_4",
+        "ops_median": 2.252016129032258,
+        "n": 8,
+        "validity": "ACCEPT",
+        "fail_rate": 0.0
+      },
+      {
+        "task": "1KB_read_64",
+        "ops_median": 82.41182795698924,
+        "n": 8,
+        "validity": "ACCEPT",
+        "fail_rate": 0.0
+      },
+      {
+        "task": "1KB_write_64",
+        "ops_median": 136.46774193548387,
+        "n": 8,
+        "validity": "ACCEPT",
+        "fail_rate": 0.0
+      },
+      {
+        "task": "1MB_read_16",
+        "ops_median": 15.564516129032258,
+        "n": 8,
+        "validity": "WARN",
+        "fail_rate": 0.6623508739480255
+      },
+      {
+        "task": "1MB_write_16",
+        "ops_median": 12.510584677419356,
+        "n": 8,
+        "validity": "ACCEPT",
+        "fail_rate": 0.0
+      },
+      {
+        "task": "64KB_read_32",
+        "ops_median": 42.41290322580645,
+        "n": 8,
+        "validity": "ACCEPT",
+        "fail_rate": 0.0
+      },
+      {
+        "task": "64KB_write_32",
+        "ops_median": 26.458165322580648,
+        "n": 8,
+        "validity": "ACCEPT",
+        "fail_rate": 0.0
+      }
+    ],
+    "path": "fairness-lab-R5-20260803",
+    "note": "Do not compare as faster than DIRECT"
+  },
+  "Chaos_Soak": {
+    "chaos": {
+      "dry-health": {
+        "ok": 1,
+        "fail": 0,
+        "note": "rerun auth 200"
+      },
+      "proxy-loss": {
+        "ok": 20,
+        "fail": 0
+      },
+      "object-loss": {
+        "ok": 20,
+        "fail": 0
+      },
+      "vip-master-loss": {
+        "delegated": "ha-test.sh",
+        "ha_test_done": true,
+        "highlights": [
+          "repl/ec baseline 10/10",
+          "repl/ec degraded (swift2 down) 20/20",
+          "repl recovered 10/10"
+        ]
+      }
+    },
+    "soak": {
+      "window": "1h",
+      "entry": "DIRECT-4PROXY",
+      "impl": "rust",
+      "task": "1KB_write_64",
+      "start_line": "SOAK_START=2026-08-03T07:18:05Z window=1h entry=DIRECT-4PROXY task=1KB_write_64",
+      "end_line": "SOAK_END=2026-08-03T08:18:16Z fails=0 iters=147",
+      "fails": 0,
+      "iters": 147,
+      "note": "1h smoke soak complete; dual runner lines coalesced; target 6h backlog",
+      "unrecovered_faults": 0
+    },
+    "path": "fairness-lab-R6-20260803"
+  }
+}

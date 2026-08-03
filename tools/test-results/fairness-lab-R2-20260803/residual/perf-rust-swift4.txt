@@ -1,0 +1,8 @@
+swift4
+LISTEN 0      20000       10.0.0.4:8085       0.0.0.0:*    users:(("haproxy",pid=24300,fd=8))                      
+LISTEN 0      128         10.0.4.4:6200       0.0.0.0:*    users:(("swift-object-se",pid=367859,fd=5))             
+LISTEN 0      128         10.0.4.4:6201       0.0.0.0:*    users:(("swift-container",pid=20622,fd=4))              
+LISTEN 0      128         10.0.4.4:6202       0.0.0.0:*    users:(("swift-account-s",pid=20491,fd=4))              
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=24635,fd=5))              
+active
+SAIO_NONE

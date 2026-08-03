@@ -1,0 +1,20 @@
+swift4
+2026-08-03T04:42:23Z
+---UNITS---
+active
+active
+active
+active
+active
+active
+active
+---SS---
+LISTEN 0      20000       10.0.0.4:8085       0.0.0.0:*    users:(("haproxy",pid=24300,fd=8))                      
+LISTEN 0      65535      127.0.0.1:9090       0.0.0.0:*    users:(("prometheus",pid=423579,fd=7))                  
+LISTEN 0      128        127.0.0.1:9000       0.0.0.0:*    users:(("swift-console",pid=423591,fd=9))               
+LISTEN 0      128        127.0.0.1:8789       0.0.0.0:*    users:(("swift-deploy",pid=423585,fd=3))                
+LISTEN 0      65535              *:3100             *:*    users:(("loki",pid=423580,fd=8))                        
+---SAIO---
+NONE
+---ALLOY---
+    url = "http://10.0.0.4:3100/loki/api/v1/push"

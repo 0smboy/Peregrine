@@ -6,18 +6,20 @@ nodes:
   swift1:
     public: 169.58.108.85
     client_ip: 10.0.0.1
-    roles: [proxy, account, container, object, vip_master, hub_services]
-    hub_services: [console_9000, prometheus_9090, saio_py_8090, saio_rust_8081]
-    fairness_note: "NOISY for SAIO/perf until hub services relocated"
+    roles: [proxy, account, container, object, vip_master]
+    hub_services: []
+    fairness_note: "R1 cleared 2026-08-03 — no SAIO/prom/console on MASTER"
   swift2:
     client_ip: 10.0.0.2
     roles: [proxy, account, container, object]
   swift3:
     client_ip: 10.0.0.3
-    roles: [proxy, account, container, object]
+    roles: [proxy, account, container, object, saio_relocate_target]
+    fairness_note: "SAIO recreate target before R3 (not yet running)"
   swift4:
     client_ip: 10.0.0.4
-    roles: [proxy, account, container, object, preferred_bench_client]
+    roles: [proxy, account, container, object, preferred_bench_client, hub_services]
+    hub_services: [console_9000, prometheus_9090, loki_3100, deploy_ui_8789]
 network_planes:
   client_proxy: 10.0.0.0/24
   storage: 10.0.4.0/24

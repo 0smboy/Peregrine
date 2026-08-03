@@ -1,0 +1,2 @@
+{"scenario": "object-loss", "injected_at_utc": "2026-08-03T07:19:26.402329Z", "target": "swift3", "note": "stop swift-object"}
+{"scenario": "object-loss", "injected_at_utc": "2026-08-03T07:20:20.289276Z", "target": "swift3", "note": "recovered {\"ok\":20,\"fail\":0}"}

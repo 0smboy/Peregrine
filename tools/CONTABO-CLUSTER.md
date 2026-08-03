@@ -11,29 +11,31 @@ experiments follow three modes (Compatibility / Performance / Chaos): see
 [`docs/fairness-lab/`](../docs/fairness-lab/) and
 [`tools/fairness-lab/`](fairness-lab/).
 
-**Pollution note:** Python SAIO `:8090` and Rust SAIO `:8081` currently share
-**swift1** with VIP MASTER + Prometheus/console. SAIO throughput claims are
-**NOISY / SUPERSEDED** until Performance mode (single impl owns 12 disks) and
-hub relocation complete. VIP client path = **HA-PATH ONLY**; core throughput
-must use **DIRECT-4PROXY** (`10.0.0.1–4:8085`).
+**R1–R7 (2026-08-03) fairness batch:** hub on **swift4**; dual SAIO on **swift3**
+(`:8090`/`:8081` @ `10.0.0.3`); R3 compat GREEN; R4 DIRECT-4PROXY Rust formal
+GREEN (16MB_read WARN); R5 HA-PATH ONLY 分册; R6 chaos/soak GREEN; R7 four
+scorecards. Evidence: `test-results/fairness-lab-R{1..7}-20260803/` · batch
+[`fairness-lab-R7-20260803/REPORT.html`](test-results/fairness-lab-R7-20260803/REPORT.html).
+Old SAIO 3.45×/3.79× remain **NOISY**. VIP = **HA-PATH ONLY**; core throughput =
+**DIRECT-4PROXY** (`10.0.0.1–4:8085`). Python Performance formal **FROZEN**.
 
 ## Endpoints
 
 | Node | Public SSH | Proxy | Storage | Replication |
 |------|------------|-------|---------|-------------|
-| swift1 (hub + VIP MASTER) | `169.58.108.85` | `10.0.0.1` | `10.0.4.1` | `10.0.8.1` |
+| swift1 (VIP MASTER only) | `169.58.108.85` | `10.0.0.1` | `10.0.4.1` | `10.0.8.1` |
 | swift2 | `169.58.108.86` | `10.0.0.2` | `10.0.4.2` | `10.0.8.2` |
 | swift3 | `169.58.108.87` | `10.0.0.3` | `10.0.4.3` | `10.0.8.3` |
-| swift4 | `169.58.108.121` | `10.0.0.4` | `10.0.4.4` | `10.0.8.4` |
+| swift4 (obs + console hub) | `169.58.108.121` | `10.0.0.4` | `10.0.4.4` | `10.0.8.4` |
 
 - Keepalived VIP: **`10.0.0.10`** (swift1 MASTER)
 - Client API (preferred): `http://10.0.0.10:8085` (HAProxy → local `127.0.0.1:8080`)
 - Per-node HAProxy: `http://10.0.0.N:8085`
 - Auth (tempauth): `test:tester` / `azure-swift-2026.bench` (name historical)
-- Console (swift1 loopback): `ssh -L 9000:127.0.0.1:9000 swift1` → http://127.0.0.1:9000/
-- Shadow peer: Python SAIO `http://127.0.0.1:8090` (label **Python SAIO**; not Rust `:8081`)
-- Rust SAIO: `http://127.0.0.1:8081`
-- Prometheus: `http://127.0.0.1:9090` (ssh tunnel)
+- Console / Prom / Loki (swift4 loopback):
+  `ssh -L 9000:127.0.0.1:9000 -L 9090:127.0.0.1:9090 -L 3100:127.0.0.1:3100 swift4`
+- Shadow peer: Python SAIO `@swift3` → `http://10.0.0.3:8090` (Rust SAIO `:8081`)
+- Alloy → Loki: `http://10.0.0.4:3100/loki/api/v1/push` (all nodes)
 
 ## Devices
 
@@ -42,16 +44,15 @@ Each node: `/srv/node/{d1,d2,d3}` XFS (12 devices total). Rings use storage
 
 Policies: `default` (replication) + `ec-2-1` (`liberasurecode_rs_vand`).
 
-## Hub services (swift1)
+## Hub services (swift4 · post-R1)
 
 - `swift-console` `:9000` — `swift_base=http://10.0.0.10:8085`,
-  `shadow_peer_base=http://127.0.0.1:8090`
+  shadow peer → `http://10.0.0.3:8090` (Python SAIO @swift3)
 - Deploy UI (loopback): `swift-deploy ui` on `127.0.0.1:8789` → console `/deploy`
-- Prometheus `127.0.0.1:9090` + recording rules → `swift_request_total` from statsd;
-  Loki `:3100`; Alloy on all nodes (journal → Loki)
+- Prometheus `127.0.0.1:9090`; Loki `*:3100`; Alloy on all nodes → swift4 Loki
 - `node_exporter` / `statsd_exporter` on all nodes
-- `autocos` / `cabt` (cosbench-rs)
-- memcached (SAIO)
+- `autocos` / `cabt` (cosbench-rs) remain where installed
+- memcached on cluster nodes (cluster cache — not hub pollution)
 
 ## HAProxy note
 

@@ -1,0 +1,50 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Fairness Lab R3–R7 Batch</title>
+<style>
+:root{--bg:#14120f;--ink:#f2ebe1;--muted:#a89a88;--ok:#7dba6e;--warn:#d4a24c;--line:#2c2822}
+body{margin:0;font:15px/1.45 ui-sans-serif,system-ui;background:var(--bg);color:var(--ink)}
+main{max-width:1040px;margin:0 auto;padding:28px 22px 72px}
+h1{font-size:30px;margin:0 0 6px} h2{font-size:18px;margin:28px 0 10px;color:#e8dccb}
+.sub{color:var(--muted);margin-bottom:20px}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.card{background:#1c1915;border:1px solid var(--line);border-radius:10px;padding:14px}
+.ok{color:var(--ok);font-weight:650} .warn{color:var(--warn);font-weight:650}
+table{width:100%;border-collapse:collapse;margin-top:8px}
+td,th{padding:7px 6px;border-bottom:1px solid var(--line);font-size:12.5px;text-align:left}
+th{color:var(--muted)} code{font:12px ui-monospace,Menlo,monospace}
+@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}}
+</style>
+<main>
+<h1>Fairness Lab · R3→R7 Batch</h1>
+<p class="sub">Contabo · 2026-08-03 · Rust track · Python formal FROZEN</p>
+<div class="grid">
+  <div class="card"><div class="ok">R3 GREEN</div><div class="sub">compat 11/11 · func 54/54 · SAIO@swift3</div></div>
+  <div class="card"><div class="ok">R4 GREEN</div><div class="sub">DIRECT ≥8/cell · 16MB_read <span class="warn">WARN</span></div></div>
+  <div class="card"><div class="ok">R5 GREEN</div><div class="sub">HA-PATH ONLY 分册 · 部分 WARN/NOISY</div></div>
+  <div class="card"><div class="ok">R6 GREEN</div><div class="sub">chaos 20/20 · soak 1h fails=0</div></div>
+</div>
+<h2>Performance DIRECT（主表）</h2>
+<table><tr><th>Entry</th><th>Task</th><th>median ops/s</th><th>n</th><th>validity</th></tr>
+<tr><td>DIRECT</td><td><code>16MB_read_4</code></td><td>1.02</td><td>8</td><td class='warn'>WARN</td></tr>
+<tr><td>DIRECT</td><td><code>16MB_write_4</code></td><td>2.29</td><td>8</td><td class='ok'>ACCEPT</td></tr>
+<tr><td>DIRECT</td><td><code>1KB_read_64</code></td><td>685.40</td><td>8</td><td class='ok'>ACCEPT</td></tr>
+<tr><td>DIRECT</td><td><code>1KB_write_64</code></td><td>140.69</td><td>8</td><td class='ok'>ACCEPT</td></tr>
+<tr><td>DIRECT</td><td><code>1MB_read_16</code></td><td>67.88</td><td>8</td><td class='ok'>ACCEPT</td></tr>
+<tr><td>DIRECT</td><td><code>1MB_write_16</code></td><td>33.40</td><td>8</td><td class='ok'>ACCEPT</td></tr>
+<tr><td>DIRECT</td><td><code>64KB_read_32</code></td><td>505.95</td><td>8</td><td class='ok'>ACCEPT</td></tr>
+<tr><td>DIRECT</td><td><code>64KB_write_32</code></td><td>140.33</td><td>8</td><td class='ok'>ACCEPT</td></tr>
+</table>
+<h2>HA-PATH（分册 · 禁止混比）</h2>
+<table><tr><th>Entry</th><th>Task</th><th>median ops/s</th><th>n</th><th>validity</th></tr>
+<tr><td>HA-PATH</td><td><code>16MB_read_4</code></td><td>1.03</td><td>8</td><td class='warn'>WARN</td></tr>
+<tr><td>HA-PATH</td><td><code>16MB_write_4</code></td><td>2.25</td><td>8</td><td class='ok'>ACCEPT</td></tr>
+<tr><td>HA-PATH</td><td><code>1KB_read_64</code></td><td>82.41</td><td>8</td><td class='ok'>ACCEPT</td></tr>
+<tr><td>HA-PATH</td><td><code>1KB_write_64</code></td><td>136.47</td><td>8</td><td class='ok'>ACCEPT</td></tr>
+<tr><td>HA-PATH</td><td><code>1MB_read_16</code></td><td>15.56</td><td>8</td><td class='warn'>WARN</td></tr>
+<tr><td>HA-PATH</td><td><code>1MB_write_16</code></td><td>12.51</td><td>8</td><td class='ok'>ACCEPT</td></tr>
+<tr><td>HA-PATH</td><td><code>64KB_read_32</code></td><td>42.41</td><td>8</td><td class='ok'>ACCEPT</td></tr>
+<tr><td>HA-PATH</td><td><code>64KB_write_32</code></td><td>26.46</td><td>8</td><td class='ok'>ACCEPT</td></tr>
+</table>
+<h2>Chaos / Soak</h2>
+<div class="card">proxy-loss ok=20 · object-loss ok=20 · ha-test PASS · soak 1h fails=0 iters=147</div>
+<p class="sub" style="margin-top:28px">Evidence roots under <code>tools/test-results/fairness-lab-R{3..7}-20260803/</code> · R7 index <code>FOUR-SCORECARDS.json</code></p>
+</main></html>

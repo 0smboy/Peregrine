@@ -1,0 +1,2 @@
+{"scenario": "proxy-loss", "injected_at_utc": "2026-08-03T07:18:44.125573Z", "target": "swift2", "note": "stop swift-proxy"}
+{"scenario": "proxy-loss", "injected_at_utc": "2026-08-03T07:19:26.367872Z", "target": "swift2", "note": "recovered {\"ok\":20,\"fail\":0}"}

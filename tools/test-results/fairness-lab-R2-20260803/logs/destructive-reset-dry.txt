@@ -1,0 +1,5 @@
+inventory_ok hosts= 4
+FATAL: destructive reset is intentionally NOT auto-executed from agent runs.
+Operator must run the remote wipe sequence after reviewing /Users/oboy/Downloads/Peregrine/tools/fairness-lab/inventory/devices.json
+Ticket=R2-DRY-20260803
+See docs/fairness-lab/MODES.md §destructive-reset

@@ -1,0 +1,24 @@
+{
+  "dry-health": {
+    "ok": 1,
+    "fail": 0,
+    "note": "rerun auth 200"
+  },
+  "proxy-loss": {
+    "ok": 20,
+    "fail": 0
+  },
+  "object-loss": {
+    "ok": 20,
+    "fail": 0
+  },
+  "vip-master-loss": {
+    "delegated": "ha-test.sh",
+    "ha_test_done": true,
+    "highlights": [
+      "repl/ec baseline 10/10",
+      "repl/ec degraded (swift2 down) 20/20",
+      "repl recovered 10/10"
+    ]
+  }
+}

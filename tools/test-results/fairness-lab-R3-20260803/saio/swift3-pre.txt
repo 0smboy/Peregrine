@@ -1,0 +1,23 @@
+swift3
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda4        40G  6.2G   34G  16% /
+total 0
+drwxr-xr-x. 5 root root  36 Aug  1 13:42 .
+drwxr-xr-x. 3 root root  18 Aug  1 13:42 ..
+drwxr-xr-x. 9 root root 124 Aug  1 16:19 d1
+drwxr-xr-x. 9 root root 124 Aug  1 15:41 d2
+drwxr-xr-x. 9 root root 124 Aug  1 15:41 d3
+total 156
+drwxr-xr-x.    9 root root   124 Aug  1 16:19 .
+drwxr-xr-x.    5 root root    36 Aug  1 13:42 ..
+drwxr-xr-x. 4056 root root 69632 Aug  2 06:53 async_pending
+drwxr-xr-x.   13 root root   127 Aug  1 18:32 async_pending-1
+drwxr-xr-x.   99 root root  4096 Aug  3 05:45 containers
+drwxr-xr-x.  258 root root  8192 Aug  2 09:47 objects
+drwxr-xr-x.  277 root root  8192 Aug  1 18:32 objects-1
+drwxr-xr-x.    2 root root     6 Aug  2 09:49 tmp
+drwxr-xr-x.    2 root root     6 Aug  2 09:10 tmp-1
+WORK_MISSING
+               total        used        free      shared  buff/cache   available
+Mem:           7.5Gi       2.9Gi       2.9Gi       4.0Mi       2.0Gi       4.6Gi
+Swap:             0B          0B          0B

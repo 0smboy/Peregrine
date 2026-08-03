@@ -1,0 +1,16 @@
+swift3
+2026-08-03T04:41:51Z
+---UNITS---
+inactive
+inactive
+inactive
+inactive
+active
+active
+active
+---SS---
+LISTEN 0      20000       10.0.0.3:8085       0.0.0.0:*    users:(("haproxy",pid=29330,fd=8))                      
+---SAIO---
+NONE
+---ALLOY---
+    url = "http://10.0.0.4:3100/loki/api/v1/push"

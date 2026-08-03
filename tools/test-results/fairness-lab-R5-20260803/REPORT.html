@@ -1,0 +1,25 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Fairness Lab R5 — HA-PATH</title>
+<style>
+:root{--bg:#14120f;--ink:#f2ebe1;--muted:#a89a88;--ok:#7dba6e;--warn:#d4a24c;--line:#2c2822}
+body{margin:0;font:15px/1.5 ui-sans-serif,system-ui;background:var(--bg);color:var(--ink)}
+main{max-width:980px;margin:0 auto;padding:32px 24px 64px}
+h1{font-size:28px;margin:0 0 8px} .sub{color:var(--muted)}
+.card{background:#1c1915;border:1px solid var(--line);border-radius:10px;padding:16px;margin:12px 0}
+.ok{color:var(--ok);font-weight:650} .warn{color:var(--warn);font-weight:650}
+table{width:100%;border-collapse:collapse} td,th{padding:8px 6px;border-bottom:1px solid var(--line);font-size:13px;text-align:left}
+th{color:var(--muted)} code{font:12px ui-monospace,Menlo,monospace}
+</style>
+<main>
+<h1>R5 HA-PATH Scorecard</h1>
+<p class="sub">VIP 10.0.0.10:8085 · <span class="warn">HA-PATH ONLY</span> · 不与 DIRECT 混比</p>
+<div class="card">与 R4 分册。部分 cell 与 soak 并发 → NOISY/WARN，不作 VIP vs DIRECT 快慢结论。</div>
+<table><tr><th>Task</th><th>median ops/s</th><th>n</th><th>fail_rate</th><th>validity</th></tr>
+<tr><td><code>16MB_read_4</code></td><td>1.03</td><td>8</td><td>0.9950</td><td class='warn'>WARN</td></tr>
+<tr><td><code>16MB_write_4</code></td><td>2.25</td><td>8</td><td>0.0000</td><td class='ok'>ACCEPT</td></tr>
+<tr><td><code>1KB_read_64</code></td><td>82.41</td><td>8</td><td>0.0000</td><td class='ok'>ACCEPT</td></tr>
+<tr><td><code>1KB_write_64</code></td><td>136.47</td><td>8</td><td>0.0000</td><td class='ok'>ACCEPT</td></tr>
+<tr><td><code>1MB_read_16</code></td><td>15.56</td><td>8</td><td>0.6624</td><td class='warn'>WARN</td></tr>
+<tr><td><code>1MB_write_16</code></td><td>12.51</td><td>8</td><td>0.0000</td><td class='ok'>ACCEPT</td></tr>
+<tr><td><code>64KB_read_32</code></td><td>42.41</td><td>8</td><td>0.0000</td><td class='ok'>ACCEPT</td></tr>
+<tr><td><code>64KB_write_32</code></td><td>26.46</td><td>8</td><td>0.0000</td><td class='ok'>ACCEPT</td></tr>
+</table></main></html>
