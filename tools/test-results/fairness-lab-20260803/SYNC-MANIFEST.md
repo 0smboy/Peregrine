@@ -2,6 +2,8 @@
 
 | Channel | Location |
 |---------|----------|
+| Git tip | `b9f5506` |
+| Vercel | `dpl_B3B4t7vsde5TQWz7khFaZFDvw8TN` |
 | Evidence | `tools/test-results/fairness-lab-20260803/` |
 | Tooling | `tools/fairness-lab/` |
 | Docs | `docs/fairness-lab/` |
