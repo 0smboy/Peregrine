@@ -22,5 +22,5 @@ L3b container sharding stays **after** Formal Performance `ISO-CONFIG` clean bas
 |---------------------------|--------|
 | Full 4-node `openstack-swift` Performance cluster | **Absent** → Python formal **FROZEN** (`PYTHON_CLUSTER_ABSENT`) |
 | autocos multi-endpoint true 4-proxy fanout | Pilot uses `ST_ENDPOINT` RR; full fanout backlog |
-| 16MB_read formal ACCEPT | Blocked until prepare object_count/runtime retune (R8) |
-| 6h soak per impl | 1h smoke done in R6; extend in R8 |
+| 16MB_read formal ACCEPT | **DONE R8** — DIRECT+HA ACCEPT (oc=40/rt=180, n=8) |
+| 6h soak per impl | **DONE R8** — DIRECT 4KB_write_128 6h fail_total=0 |

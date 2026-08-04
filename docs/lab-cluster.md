@@ -43,10 +43,12 @@ nodes.
   `liberasurecode_rs_vand.so.1.0.1` must resolve).
 - Release binaries built with `--features …/ec`. A proxy without EC returns
   **501** “erasure coding not built”.
-- On the build/console host (`swift1`): Prometheus, Loki, Alloy, statsd_exporter,
-  node_exporter (all nodes), `swift-console`, `cabt` / `autocos`, Rust toolchain
-  under `/root/.cargo` + `/root/.rustup`.
-- Python SAIO `:8090` + Rust SAIO `:8081` on swift1 for Lab Shadow.
+- Observability + console hub (**swift4**, post-R1 2026-08-03): Prometheus,
+  Loki, `swift-console`, deploy-ui. Alloy / statsd_exporter / node_exporter on
+  all nodes (Alloy → `10.0.0.4:3100`). Build tree historically on swift1
+  (`/root/work`, cargo/rustup); VIP MASTER is **not** the hub host.
+- Dual SAIO stopped off VIP MASTER; recreate on a non-hub node (swift3) before
+  Compatibility R3 shadow runs.
 - SELinux: `haproxy_connect_any=1`; `ip_nonlocal_bind=1` for VIP binds; after
   installing binaries run `restorecon` so labels stay `bin_t`.
 

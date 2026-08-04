@@ -133,14 +133,18 @@ flowchart TD
 
 ---
 
-## R8 — Backlog only（不与验证混跑）
+## R8 — 验证项完成 · 实现项另立
 
-仅在 R7 Stop 之后立项，**单独轮次**：
+| 项 | 状态 |
+|----|------|
+| 16MB_read retune（oc=40 / rt=180）+ formal ≥8 DIRECT/HA | **GREEN ACCEPT**（两册） |
+| Soak 6h Rust DIRECT | **GREEN** fail_total=0（12 chunks） |
+| L3b sharding | 未开（需独立 feature 轮） |
+| Paste pipeline / memcache / servers_per_port | 未开（见 `blocked-by-missing-impl.md`） |
+| Python formal 4 节点集群 | 仍 **FROZEN** |
+| 监控专用机 / 双 bench | 未开（硬件/采购） |
 
-- L3b sharding（相对 R4 干净 4KB write 基线）
-- 16MB WARN 专项
-- `blocked-by-missing-impl` 实现项（pipeline/memcache/servers_per_port/…）
-- 监控专用机 / 双 bench 机扩容
+证据：`tools/test-results/fairness-lab-R8-20260803/R8-GATE.md`
 
 ---
 
@@ -162,6 +166,5 @@ flowchart TD
 
 ## 当前指针
 
-- **已停在**：R7 Stop（完成）— R0…R7 本批闭环
-- **下一轮**：R8 backlog only（L3b / 16MB WARN 专项 / missing-impl）；不与验证混跑
-- **批次报告**：`tools/test-results/fairness-lab-R7-20260803/REPORT.html`
+- **已停在**：R8 验证项 Stop（完成）— R0…R8 验证闭环；实现类 backlog 仍另立
+- **批次报告**：R7 `fairness-lab-R7-20260803/REPORT.html` · R8 `fairness-lab-R8-20260803/REPORT.html`

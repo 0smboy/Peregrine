@@ -1,0 +1,83 @@
+{
+  "entry": "DIRECT-4PROXY",
+  "task": "4KB_write_128",
+  "soak_seconds": 21600,
+  "chunks": 12,
+  "ok_total": 2199378,
+  "fail_total": 0,
+  "validity": "ACCEPT",
+  "chunks_detail": [
+    {
+      "chunk": 1,
+      "ok": 163261,
+      "fail": 0,
+      "runtime": 1800
+    },
+    {
+      "chunk": 2,
+      "ok": 176153,
+      "fail": 0,
+      "runtime": 1800
+    },
+    {
+      "chunk": 3,
+      "ok": 161427,
+      "fail": 0,
+      "runtime": 1800
+    },
+    {
+      "chunk": 4,
+      "ok": 180470,
+      "fail": 0,
+      "runtime": 1800
+    },
+    {
+      "chunk": 5,
+      "ok": 163229,
+      "fail": 0,
+      "runtime": 1800
+    },
+    {
+      "chunk": 6,
+      "ok": 159556,
+      "fail": 0,
+      "runtime": 1800
+    },
+    {
+      "chunk": 7,
+      "ok": 165807,
+      "fail": 0,
+      "runtime": 1800
+    },
+    {
+      "chunk": 8,
+      "ok": 197638,
+      "fail": 0,
+      "runtime": 1800
+    },
+    {
+      "chunk": 9,
+      "ok": 216183,
+      "fail": 0,
+      "runtime": 1800
+    },
+    {
+      "chunk": 10,
+      "ok": 213604,
+      "fail": 0,
+      "runtime": 1800
+    },
+    {
+      "chunk": 11,
+      "ok": 192516,
+      "fail": 0,
+      "runtime": 1800
+    },
+    {
+      "chunk": 12,
+      "ok": 209534,
+      "fail": 0,
+      "runtime": 1774
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Fairness Lab R8</title>
+<style>
+:root{--bg:#14120f;--ink:#f2ebe1;--muted:#a89a88;--ok:#7dba6e;--line:#2c2822}
+body{margin:0;font:15px/1.45 ui-sans-serif,system-ui;background:var(--bg);color:var(--ink)}
+main{max-width:920px;margin:0 auto;padding:28px 22px 72px}
+h1{font-size:28px;margin:0 0 6px}.sub{color:var(--muted)}.ok{color:var(--ok);font-weight:650}
+table{width:100%;border-collapse:collapse;margin-top:16px}
+td,th{padding:8px 6px;border-bottom:1px solid var(--line);text-align:left;font-size:13px}
+th{color:var(--muted)}
+</style>
+<main>
+<h1>Fairness Lab · R8</h1>
+<p class="sub">16MB_read retune + 6h soak · <span class="ok">gate=GREEN</span></p>
+<table>
+<tr><th>Cell</th><th>validity</th><th>median ops/s</th><th>n / detail</th></tr>
+<tr><td>DIRECT 16MB_read_4</td><td class="ok">ACCEPT</td><td>4.078</td><td>8</td></tr>
+<tr><td>HA 16MB_read_4</td><td class="ok">ACCEPT</td><td>4.153</td><td>8</td></tr>
+<tr><td>Soak 6h 4KB_write_128</td><td class="ok">ACCEPT</td><td>ok=2199378 fail=0</td><td>chunks=12</td></tr>
+</table>
+<p class="sub">object_count=40 runtime=180 · Evidence <code>fairness-lab-R8-20260803/</code></p>
+</main></html>

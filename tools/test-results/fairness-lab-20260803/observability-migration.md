@@ -29,3 +29,8 @@ Formal `DIRECT-4PROXY` Performance citations require either (a) monitoring off V
 - Inventory roles documented in `tools/fairness-lab/inventory/cluster.yml`
 - Scorecard template: `SCORECARDS.html`
 - Live systemd move **not** executed automatically (needs maintenance window)
+
+
+## R1 executed 2026-08-03
+
+See `../fairness-lab-R1-20260803/HUB-CLEARED.md`. Hub now on **swift4**. Alloy → `10.0.0.4:3100`.

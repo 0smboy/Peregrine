@@ -1,0 +1,30 @@
+RUN measured 4 ep=http://10.0.0.2:8085 12:21:04Z
+RUN measured 5 ep=http://10.0.0.3:8085 12:24:27Z
+RUN measured 6 ep=http://10.0.0.4:8085 12:27:47Z
+RUN measured 7 ep=http://10.0.0.1:8085 12:31:04Z
+RUN measured 8 ep=http://10.0.0.2:8085 12:34:21Z
+=== CELL HA-PATH_16MB_read_4 ===
+RUN warmup 1 ep=http://10.0.0.10:8085 12:37:39Z
+RUN warmup 2 ep=http://10.0.0.10:8085 12:40:58Z
+RUN measured 1 ep=http://10.0.0.10:8085 12:44:17Z
+RUN measured 2 ep=http://10.0.0.10:8085 12:47:33Z
+RUN measured 3 ep=http://10.0.0.10:8085 12:50:49Z
+RUN measured 4 ep=http://10.0.0.10:8085 12:54:09Z
+RUN measured 5 ep=http://10.0.0.10:8085 12:57:27Z
+RUN measured 6 ep=http://10.0.0.10:8085 13:00:44Z
+RUN measured 7 ep=http://10.0.0.10:8085 13:04:05Z
+RUN measured 8 ep=http://10.0.0.10:8085 13:07:23Z
+=== SOAK 6h DIRECT ===
+soak chunk 1 runtime=1800 13:10:40Z
+soak chunk 2 runtime=1800 13:40:43Z
+soak chunk 3 runtime=1800 14:10:44Z
+soak chunk 4 runtime=1800 14:40:47Z
+soak chunk 5 runtime=1800 15:10:49Z
+soak chunk 6 runtime=1800 15:40:51Z
+soak chunk 7 runtime=1800 16:10:53Z
+soak chunk 8 runtime=1800 16:40:55Z
+soak chunk 9 runtime=1800 17:10:58Z
+soak chunk 10 runtime=1800 17:41:00Z
+soak chunk 11 runtime=1800 18:11:04Z
+soak chunk 12 runtime=1774 18:41:06Z
+END 2026-08-03T21:10:00Z (SUMMARY backfilled after heredoc bug)

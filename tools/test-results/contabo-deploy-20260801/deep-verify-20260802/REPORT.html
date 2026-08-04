@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Peregrine Deep Verify · 2026-08-02 交付报告</title>
+<style>
+  :root {
+    --bg: #0f1114;
+    --panel: #171a1f;
+    --ink: #e8eaed;
+    --muted: #9aa3ad;
+    --line: #2a3038;
+    --ok: #3d9a6a;
+    --ok-bg: #163226;
+    --warn: #c4a035;
+    --warn-bg: #2e2814;
+    --bad: #c45c5c;
+    --bad-bg: #2e1818;
+    --accent: #7eb8c9;
+    --bar: #4a8fa0;
+    --bar2: #8a7a5a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 15px/1.5 "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 32px 24px 64px; }
+  h1 { font-size: 28px; font-weight: 650; margin: 0 0 8px; letter-spacing: -0.02em; }
+  h2 { font-size: 18px; font-weight: 600; margin: 36px 0 12px; border-top: 1px solid var(--line); padding-top: 28px; }
+  h3 { font-size: 14px; font-weight: 600; margin: 0 0 10px; color: var(--muted); text-transform: none; letter-spacing: 0; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .sub code { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--accent); }
+  .pills { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 8px; }
+  .pill {
+    font-size: 12px; padding: 4px 10px; border-radius: 4px;
+    border: 1px solid var(--line); color: var(--muted); background: var(--panel);
+  }
+  .pill.ok { color: var(--ok); border-color: #2a5a40; background: var(--ok-bg); }
+  .pill.warn { color: var(--warn); border-color: #5a4a20; background: var(--warn-bg); }
+  .pill.bad { color: var(--bad); border-color: #5a3030; background: var(--bad-bg); }
+  .stats {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 20px 0;
+  }
+  @media (max-width: 800px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+  .stat {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px;
+  }
+  .stat .label { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .stat .value { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .stat .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .stat.ok .value { color: var(--ok); }
+  .stat.warn .value { color: var(--warn); }
+  .callout {
+    background: var(--panel); border-left: 3px solid var(--accent);
+    padding: 12px 16px; margin: 16px 0; border-radius: 0 6px 6px 0;
+  }
+  .callout.warn { border-left-color: var(--warn); }
+  .callout p { margin: 0; font-size: 13px; color: var(--muted); }
+  .callout strong { color: var(--ink); }
+  table {
+    width: 100%; border-collapse: collapse; font-size: 13px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: hidden;
+  }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; letter-spacing: 0.02em; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  tr:last-child td { border-bottom: 0; }
+  tr.warn-row td { background: var(--warn-bg); }
+  .tag { font-size: 11px; padding: 2px 7px; border-radius: 3px; font-weight: 600; }
+  .tag.ok { background: var(--ok-bg); color: var(--ok); }
+  .tag.warn { background: var(--warn-bg); color: var(--warn); }
+  .tag.neutral { background: #22262c; color: var(--muted); }
+  .bars { display: flex; flex-direction: column; gap: 10px; margin: 12px 0 8px; }
+  .bar-row { display: grid; grid-template-columns: 140px 1fr 72px; gap: 10px; align-items: center; font-size: 12px; }
+  .bar-track { height: 10px; background: #22262c; border-radius: 2px; overflow: hidden; }
+  .bar-fill { height: 100%; background: var(--bar); border-radius: 2px; }
+  .bar-fill.py { background: var(--bar2); }
+  .bar-fill.warn { background: var(--warn); }
+  .bar-label { color: var(--muted); }
+  .bar-val { text-align: right; font-variant-numeric: tabular-nums; font-family: ui-monospace, Menlo, monospace; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 800px) { .two { grid-template-columns: 1fr; } }
+  ul.done { margin: 8px 0; padding-left: 18px; color: var(--muted); font-size: 13px; }
+  ul.done li { margin: 6px 0; }
+  ul.done strong { color: var(--ink); }
+  .meta { font-size: 12px; color: var(--muted); margin-top: 40px; border-top: 1px solid var(--line); padding-top: 16px; }
+  .meta a { color: var(--accent); }
+  code.path { font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--accent); word-break: break-all; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Peregrine Rigor + Deep Verify</h1>
+  <p class="sub">
+    周期：2026-08-02 · 范围：<strong>证据对齐 + 全量门禁 + 干净负载重测</strong>（不含 L3b 产品化） ·
+    Git tip <code>ffe4c3f</code> · 证据
+    <code>tools/test-results/contabo-deploy-20260801/deep-verify-20260802/</code>
+  </p>
+  <div class="pills">
+    <span class="pill ok">本周期计划：已闭环 A–F + H</span>
+    <span class="pill ok">硬门禁：全绿</span>
+    <span class="pill warn">16MB read：ACCEPT_WITH_WARN</span>
+    <span class="pill ok">已发布：Git + Vercel + Drive</span>
+    <span class="pill">下一周期：L3b sharding（未开工）</span>
+  </div>
+
+  <div class="stats">
+    <div class="stat ok">
+      <div class="label">Cargo tests</div>
+      <div class="value">949 / 0</div>
+      <div class="hint">825 no-EC + 124 EC · fail=0</div>
+    </div>
+    <div class="stat ok">
+      <div class="label">Func suite</div>
+      <div class="value">54 / 54</div>
+      <div class="hint">VIP + Rust SAIO + Py SAIO ×3</div>
+    </div>
+    <div class="stat ok">
+      <div class="label">SAIO PUT @c32</div>
+      <div class="value">3.45×</div>
+      <div class="hint">Rust 236.7 / Python 68.6 · fail=0</div>
+    </div>
+    <div class="stat warn">
+      <div class="label">16MB read success</div>
+      <div class="value">9.16%</div>
+      <div class="hint">WARN 保留 · prepare 80/80 已满</div>
+    </div>
+  </div>
+
+  <div class="callout">
+    <p><strong>一句话结论：</strong>这不是新功能冲刺，而是把「半截发布」失败模式制度化修掉，并在 Contabo 现网上跑完整验证。生产旋钮未改（L1a KEEP 配置仍在）；新数字来自干净客户端重测。16MB 读仍 WARN，禁止用文字升级成 ACCEPT。</p>
+  </div>
+
+  <!-- 1. WHAT -->
+  <h2>1. 这一次做了什么</h2>
+  <div class="two">
+    <div>
+      <h3>流程（按计划顺序）</h3>
+      <ul class="done">
+        <li><strong>R0</strong> 证据对齐硬规则 + <code>docs-claim-audit.sh</code> + AGENT checklist</li>
+        <li><strong>A</strong> 三方对齐审计（源码 / 线上 / SUMMARY）· 0 FAIL</li>
+        <li><strong>B</strong> 本地 cargo fmt/clippy/test · 949 pass</li>
+        <li><strong>C</strong> SAIO 双栈 func + 1KB PUT 3× median</li>
+        <li><strong>D</strong> Contabo VIP：func / HA / EC / prom / console / security</li>
+        <li><strong>E</strong> swift4→VIP 干净负载 autocos 重测</li>
+        <li><strong>F</strong> Git + Vercel + Drive 三方同步</li>
+        <li><strong>H</strong> 仅写 L3b 下周期 brief（无代码）</li>
+      </ul>
+    </div>
+    <div>
+      <h3>明确不做（本周期）</h3>
+      <ul class="done">
+        <li>L3b container sharding 产品化</li>
+        <li>L1b / L2 / L4 杠杆重开</li>
+        <li>L5 tokio 实现</li>
+        <li>擦除 <code>/srv/node</code>、第二套 Keepalived、密钥/jar 发布</li>
+      </ul>
+      <h3 style="margin-top:20px">生产旋钮（四节点确认）</h3>
+      <ul class="done">
+        <li><code>workers = 16</code></li>
+        <li><code>container_update_mode = sync</code></li>
+        <li><code>container_update_timeout = 1.0</code></li>
+        <li><code>fsync_on_close = true</code></li>
+        <li><code>reuse_port = false</code></li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- 2. OPT -->
+  <h2>2. 优化 / 修复了哪些（不是新杠杆 KEEP）</h2>
+  <table>
+    <thead>
+      <tr><th>类别</th><th>变更</th><th>为何重要</th><th>效果</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>流程</td>
+        <td>evidence-alignment 规则 + claim-audit</td>
+        <td>杜绝「段落改了、表格还是旧的」半截发布</td>
+        <td><span class="tag ok">制度化</span></td>
+      </tr>
+      <tr>
+        <td>测试</td>
+        <td>multiphase.rs：container_update_* 移出 Ec 变体</td>
+        <td>挡住 cargo EC 测试编译/语义错误</td>
+        <td><span class="tag ok">949 pass</span></td>
+      </tr>
+      <tr>
+        <td>质量</td>
+        <td>clippy allow + DiskFileConfig 结构更新语法</td>
+        <td>-D warnings 门禁可通过</td>
+        <td><span class="tag ok">clippy PASS</span></td>
+      </tr>
+      <tr>
+        <td>运维</td>
+        <td>ha/ec/autocos/vip/edge/hadbg 默认 Contabo VIP</td>
+        <td>硬编码 Azure 10.42 导致 HA 基线 ok=0/10</td>
+        <td><span class="tag ok">HA 10/10</span></td>
+      </tr>
+      <tr>
+        <td>测法</td>
+        <td>负载客户端改到 swift4 → VIP</td>
+        <td>去掉「测压机=VIP MASTER」噪声 caveat</td>
+        <td><span class="tag ok">干净基线</span></td>
+      </tr>
+      <tr>
+        <td>文档</td>
+        <td>Performance 页补 deep-verify / clean-load / WARN</td>
+        <td>与 SUMMARY 同提交对齐</td>
+        <td><span class="tag ok">已上线</span></td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="callout" style="margin-top:14px">
+    <p><strong>与上波 write-path A/B 的关系：</strong>L1a KEEP（+24% 4KB write）已在上一周期落地。本周期<strong>没有</strong>再 KEEP 新杠杆；重点是验证现网仍 ACCEPT，并给出干净客户端数字。</p>
+  </div>
+
+  <!-- 3. EFFECT -->
+  <h2>3. 效果怎么样（数字）</h2>
+
+  <h3>SAIO 1KB PUT · Rust vs Python（3× median）</h3>
+  <div class="bars">
+    <div class="bar-row">
+      <span class="bar-label">Rust c32</span>
+      <div class="bar-track"><div class="bar-fill" style="width:100%"></div></div>
+      <span class="bar-val">236.7 op/s</span>
+    </div>
+    <div class="bar-row">
+      <span class="bar-label">Python c32</span>
+      <div class="bar-track"><div class="bar-fill py" style="width:29%"></div></div>
+      <span class="bar-val">68.6 op/s</span>
+    </div>
+    <div class="bar-row">
+      <span class="bar-label">Rust c1</span>
+      <div class="bar-track"><div class="bar-fill" style="width:23%"></div></div>
+      <span class="bar-val">54.3 op/s</span>
+    </div>
+    <div class="bar-row">
+      <span class="bar-label">Python c1</span>
+      <div class="bar-track"><div class="bar-fill py" style="width:11%"></div></div>
+      <span class="bar-val">26.5 op/s</span>
+    </div>
+  </div>
+  <p class="sub">
+    c32 比值 <strong>3.45×</strong>（phase0 证据包发布表仍用 3.79×：Rust 264.4 / Python 69.8）。
+    相对 phase0 有 &gt;10% 漂移（共享主机噪声），结论不变：Rust ≫ Python。证据：<code class="path">saio-1kb/COMPARE.json</code>
+  </p>
+
+  <h3>Clean-load · swift4 → VIP 10.0.0.10:8085（normal stage）</h3>
+  <div class="bars">
+    <div class="bar-row">
+      <span class="bar-label">4KB read @128</span>
+      <div class="bar-track"><div class="bar-fill" style="width:100%"></div></div>
+      <span class="bar-val">1054.5</span>
+    </div>
+    <div class="bar-row">
+      <span class="bar-label">4KB write @128</span>
+      <div class="bar-track"><div class="bar-fill" style="width:13%"></div></div>
+      <span class="bar-val">138.4</span>
+    </div>
+    <div class="bar-row">
+      <span class="bar-label">1MB read @32</span>
+      <div class="bar-track"><div class="bar-fill" style="width:8%"></div></div>
+      <span class="bar-val">79.9</span>
+    </div>
+    <div class="bar-row">
+      <span class="bar-label">1MB write @32</span>
+      <div class="bar-track"><div class="bar-fill" style="width:4%"></div></div>
+      <span class="bar-val">41.9</span>
+    </div>
+    <div class="bar-row">
+      <span class="bar-label">16MB write @8</span>
+      <div class="bar-track"><div class="bar-fill" style="width:1%"></div></div>
+      <span class="bar-val">2.8</span>
+    </div>
+    <div class="bar-row">
+      <span class="bar-label">16MB read @8</span>
+      <div class="bar-track"><div class="bar-fill warn" style="width:1%"></div></div>
+      <span class="bar-val">5.3*</span>
+    </div>
+  </div>
+  <p class="sub">单位 op/s；条长相对 4KB read。*16MB read 成功率仅 9.16%（fail=6267），吞吐不可当作健康指标。</p>
+
+  <!-- 4. RESULTS -->
+  <h2>4. 结果展示 · 全部门禁</h2>
+  <table>
+    <thead>
+      <tr><th>门禁</th><th>结果</th><th>关键数</th><th>证据文件</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>docs-claim-audit</td><td><span class="tag ok">PASS</span></td><td class="num">—</td><td><code class="path">docs-claim-audit.log</code></td></tr>
+      <tr><td>三方对齐审计</td><td><span class="tag ok">PASS</span></td><td class="num">0 FAIL</td><td><code class="path">ALIGNMENT-AUDIT.md</code></td></tr>
+      <tr><td>cargo fmt / clippy</td><td><span class="tag ok">PASS</span></td><td class="num">—</td><td><code class="path">ci-focused-r3.log</code></td></tr>
+      <tr><td>cargo test (no EC)</td><td><span class="tag ok">PASS</span></td><td class="num">825 / 0</td><td><code class="path">cargo-test-noec-full.log</code></td></tr>
+      <tr><td>cargo test (EC)</td><td><span class="tag ok">PASS</span></td><td class="num">124 / 0</td><td><code class="path">cargo-test-ec-full.log</code></td></tr>
+      <tr><td>VIP auth ×100</td><td><span class="tag ok">PASS</span></td><td class="num">100 / 100</td><td><code class="path">vip-triage.log</code></td></tr>
+      <tr><td>func VIP</td><td><span class="tag ok">PASS</span></td><td class="num">54 / 54</td><td><code class="path">func-vip.log</code></td></tr>
+      <tr><td>func Rust SAIO :8081</td><td><span class="tag ok">PASS</span></td><td class="num">54 / 54</td><td><code class="path">func-rust-saio.log</code></td></tr>
+      <tr><td>func Python SAIO :8090</td><td><span class="tag ok">PASS</span></td><td class="num">54 / 54</td><td><code class="path">func-py-saio.log</code></td></tr>
+      <tr><td>HA drill</td><td><span class="tag ok">PASS</span></td><td class="num">10/10 · 20/20</td><td><code class="path">ha-test.log</code></td></tr>
+      <tr><td>EC heal md5</td><td><span class="tag ok">PASS</span> <span class="tag warn">计数 WARN</span></td><td class="num">YES/YES/YES</td><td><code class="path">ec-heal-test.log</code></td></tr>
+      <tr><td>Prometheus nodes_up</td><td><span class="tag ok">PASS</span></td><td class="num">4 / 4</td><td><code class="path">prom-nodes.json</code></td></tr>
+      <tr><td>Console smoke</td><td><span class="tag ok">PASS</span></td><td class="num">all 200</td><td><code class="path">console-smoke2.log</code></td></tr>
+      <tr><td>Security spot</td><td><span class="tag ok">PASS</span></td><td class="num">—</td><td><code class="path">security-spot.log</code></td></tr>
+      <tr><td>SAIO 1KB PUT</td><td><span class="tag ok">PASS</span></td><td class="num">3.45× · fail=0</td><td><code class="path">saio-1kb/</code></td></tr>
+      <tr class="warn-row"><td>Clean-load 4KB/1MB</td><td><span class="tag ok">ACCEPT</span></td><td class="num">fail=0</td><td><code class="path">cleanload-swift4/</code></td></tr>
+      <tr class="warn-row"><td>Clean-load 16MB read</td><td><span class="tag warn">ACCEPT_WITH_WARN</span></td><td class="num">success 9.16%</td><td><code class="path">PERF-REMEASURE.md</code></td></tr>
+    </tbody>
+  </table>
+
+  <h3 style="margin-top:22px">Clean-load 明细表</h3>
+  <table>
+    <thead>
+      <tr><th>Task</th><th class="num">ok</th><th class="num">fail</th><th class="num">success</th><th class="num">ops/s</th><th class="num">p99</th><th>判定</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>4KB_write_128 / 60s</td><td class="num">8301</td><td class="num">0</td><td class="num">100%</td><td class="num">138.4</td><td class="num">1.84s</td><td><span class="tag ok">ACCEPT</span></td></tr>
+      <tr><td>4KB_read_128 / 60s</td><td class="num">63272</td><td class="num">0</td><td class="num">100%</td><td class="num">1054.5</td><td class="num">0.37s</td><td><span class="tag ok">ACCEPT</span></td></tr>
+      <tr><td>1MB_write_32 / 60s</td><td class="num">2516</td><td class="num">0</td><td class="num">100%</td><td class="num">41.9</td><td class="num">1.34s</td><td><span class="tag ok">ACCEPT</span></td></tr>
+      <tr><td>1MB_read_32 / 60s</td><td class="num">4793</td><td class="num">0</td><td class="num">100%</td><td class="num">79.9</td><td class="num">1.25s</td><td><span class="tag ok">ACCEPT</span></td></tr>
+      <tr><td>16MB_write_8 / 180s</td><td class="num">497</td><td class="num">0</td><td class="num">100%</td><td class="num">2.8</td><td class="num">5.15s</td><td><span class="tag ok">ACCEPT</span></td></tr>
+      <tr class="warn-row"><td>16MB_read_8 / 120s</td><td class="num">632</td><td class="num">6267</td><td class="num">9.16%</td><td class="num">5.3</td><td class="num">3.13s</td><td><span class="tag warn">WARN</span></td></tr>
+    </tbody>
+  </table>
+
+  <h3 style="margin-top:22px">发布三方</h3>
+  <table>
+    <thead><tr><th>通道</th><th>状态</th><th>定位</th></tr></thead>
+    <tbody>
+      <tr><td>GitHub Peregrine main</td><td><span class="tag ok">推送</span></td><td><code class="path">ffe4c3f</code>（深验内容 a24a556 + manifest）</td></tr>
+      <tr><td>Vercel docs-site</td><td><span class="tag ok">生产</span></td><td><code class="path">dpl_2bP7kdu9VZroKcXaMasmz847kzBr</code> · peregrine-docs-ochre.vercel.app</td></tr>
+      <tr><td>Google Drive</td><td><span class="tag ok">同步</span></td><td><code class="path">gdrive:Peregrine/2026-08-01-contabo/deep-verify-20260802/</code>（45 files）</td></tr>
+      <tr><td>Mac mirror</td><td><span class="tag ok">完整</span></td><td><code class="path">Peregrine/.../deep-verify-20260802/</code></td></tr>
+    </tbody>
+  </table>
+
+  <!-- 5. REMAINING -->
+  <h2>5. 剩余任务（下一周期，未执行）</h2>
+  <div class="callout warn">
+    <p><strong>L3b container sharding</strong> — 问题：即使 L1a KEEP 后，4KB write 仍受 container-DB 热点形状约束（干净基线 ~138 op/s @128）。成功标准：swift4→VIP 上 3× median <code>4KB_write_128</code> 相对 138 有清晰 uplift，且 fail=0、func 54/54。风险：proxy 路由 / DB 迁移 / updater 跨 shard。Brief：<code class="path">docs/superpowers/plans/2026-08-02-l3b-sharding-next-cycle.md</code></p>
+  </div>
+  <ul class="done">
+    <li><strong>仍挂着的 WARN：</strong>16MB read @8 正常阶段成功率 ~9%（prepare 已 80/80）— 需单独大对象调优或保持 WARN 标注工作负载</li>
+    <li><strong>EC heal：</strong>md5 三阶段 YES，但 fragment 计数器有空 partition / 全局计数 WARN</li>
+    <li><strong>不在本周期：</strong>L1b 更便宜 async_pending、L5 tokio</li>
+  </ul>
+
+  <div class="meta">
+    <p>主索引：<code class="path">GATES.md</code> · <code class="path">PERF-REMEASURE.md</code> · <code class="path">SYNC-MANIFEST.md</code></p>
+    <p>线上 Performance：<a href="https://peregrine-docs-ochre.vercel.app/performance/">peregrine-docs-ochre.vercel.app/performance/</a></p>
+    <p>生成：deep-verify 交付报告 · 数据全部来自 2026-08-02 证据包，无编造数字。</p>
+  </div>
+</div>
+</body>
+</html>

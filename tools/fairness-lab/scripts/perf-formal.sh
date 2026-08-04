@@ -14,6 +14,8 @@ TASK="${1:-4KB_write_128}"
 RUNTIME="${RUNTIME:-60}"
 REPS="${REPS:-8}"                 # formal minimum
 WARMUP="${WARMUP:-2}"
+OBJECT_COUNT="${OBJECT_COUNT:-4000}"
+CONTAINER_COUNT="${CONTAINER_COUNT:-1}"
 OUT="${OUT:-/tmp/fairness-perf}"
 mkdir -p "$OUT"
 
@@ -75,8 +77,8 @@ run_one() {
   local i=$1 kind=$2
   local log="$OUT/${kind}-${i}.log"
   echo "=== $kind $i $TASK ===" | tee -a "$OUT/run.log"
-  "$AUTOCOS" run "$TASK" --object-count 4000 --container-count 1 --runtime "$RUNTIME" \
-    2>&1 | tee "$log" | tail -30
+  "$AUTOCOS" run "$TASK" --object-count "$OBJECT_COUNT" --container-count "$CONTAINER_COUNT" \
+    --runtime "$RUNTIME" 2>&1 | tee "$log" | tail -30
 }
 
 for i in $(seq 1 "$WARMUP"); do

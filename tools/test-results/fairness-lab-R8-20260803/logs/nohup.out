@@ -1,0 +1,119 @@
+START 2026-08-03T12:04:36Z
+=== CELL DIRECT-4PROXY_16MB_read_4 ===
+RUN warmup 1 ep=http://10.0.0.1:8085 12:04:36Z
+RUN warmup 2 ep=http://10.0.0.2:8085 12:07:53Z
+RUN measured 1 ep=http://10.0.0.3:8085 12:11:13Z
+1	737	0	100.0	40	0	100.0	4.094444444444444	http://10.0.0.3:8085
+RUN measured 2 ep=http://10.0.0.4:8085 12:14:31Z
+2	887	0	100.0	40	0	100.0	4.927777777777778	http://10.0.0.4:8085
+RUN measured 3 ep=http://10.0.0.1:8085 12:17:48Z
+3	928	0	100.0	40	0	100.0	5.155555555555556	http://10.0.0.1:8085
+RUN measured 4 ep=http://10.0.0.2:8085 12:21:04Z
+4	680	0	100.0	40	0	100.0	3.7777777777777777	http://10.0.0.2:8085
+RUN measured 5 ep=http://10.0.0.3:8085 12:24:27Z
+5	680	0	100.0	40	0	100.0	3.7777777777777777	http://10.0.0.3:8085
+RUN measured 6 ep=http://10.0.0.4:8085 12:27:47Z
+6	731	0	100.0	40	0	100.0	4.061111111111111	http://10.0.0.4:8085
+RUN measured 7 ep=http://10.0.0.1:8085 12:31:04Z
+7	863	0	100.0	40	0	100.0	4.794444444444444	http://10.0.0.1:8085
+RUN measured 8 ep=http://10.0.0.2:8085 12:34:21Z
+8	698	0	100.0	40	0	100.0	3.8777777777777778	http://10.0.0.2:8085
+{
+  "entry": "DIRECT-4PROXY",
+  "task": "16MB_read_4",
+  "object_count": 40,
+  "runtime_s": 180,
+  "impl": "rust",
+  "profile": "data-path",
+  "track": "ISO-CONFIG",
+  "n": 8,
+  "reps_met": true,
+  "ops_median": 4.0777777777777775,
+  "ops_samples": [
+    4.094444444444444,
+    4.927777777777778,
+    5.155555555555556,
+    3.7777777777777777,
+    3.7777777777777777,
+    4.061111111111111,
+    4.794444444444444,
+    3.8777777777777778
+  ],
+  "fail_rate_median": 0.0,
+  "validity": "ACCEPT",
+  "validity_note": "R8 retune object_count/runtime; ACCEPT iff prepare+normal fail=0"
+}
+=== CELL HA-PATH_16MB_read_4 ===
+RUN warmup 1 ep=http://10.0.0.10:8085 12:37:39Z
+RUN warmup 2 ep=http://10.0.0.10:8085 12:40:58Z
+RUN measured 1 ep=http://10.0.0.10:8085 12:44:17Z
+1	720	0	100.0	40	0	100.0	4.0	http://10.0.0.10:8085
+RUN measured 2 ep=http://10.0.0.10:8085 12:47:33Z
+2	837	0	100.0	40	0	100.0	4.65	http://10.0.0.10:8085
+RUN measured 3 ep=http://10.0.0.10:8085 12:50:49Z
+3	773	0	100.0	40	0	100.0	4.294444444444444	http://10.0.0.10:8085
+RUN measured 4 ep=http://10.0.0.10:8085 12:54:09Z
+4	769	0	100.0	40	0	100.0	4.272222222222222	http://10.0.0.10:8085
+RUN measured 5 ep=http://10.0.0.10:8085 12:57:27Z
+5	735	0	100.0	40	0	100.0	4.083333333333333	http://10.0.0.10:8085
+RUN measured 6 ep=http://10.0.0.10:8085 13:00:44Z
+6	709	0	100.0	40	0	100.0	3.938888888888889	http://10.0.0.10:8085
+RUN measured 7 ep=http://10.0.0.10:8085 13:04:05Z
+7	748	0	100.0	40	0	100.0	4.155555555555556	http://10.0.0.10:8085
+RUN measured 8 ep=http://10.0.0.10:8085 13:07:23Z
+8	747	0	100.0	40	0	100.0	4.15	http://10.0.0.10:8085
+{
+  "entry": "HA-PATH",
+  "task": "16MB_read_4",
+  "object_count": 40,
+  "runtime_s": 180,
+  "impl": "rust",
+  "profile": "data-path",
+  "track": "ISO-CONFIG",
+  "n": 8,
+  "reps_met": true,
+  "ops_median": 4.152777777777779,
+  "ops_samples": [
+    4.0,
+    4.65,
+    4.294444444444444,
+    4.272222222222222,
+    4.083333333333333,
+    3.938888888888889,
+    4.155555555555556,
+    4.15
+  ],
+  "fail_rate_median": 0.0,
+  "validity": "ACCEPT",
+  "validity_note": "R8 retune object_count/runtime; ACCEPT iff prepare+normal fail=0"
+}
+=== SOAK 6h DIRECT ===
+soak chunk 1 runtime=1800 13:10:40Z
+1	163261	0	1800
+soak chunk 2 runtime=1800 13:40:43Z
+2	176153	0	1800
+soak chunk 3 runtime=1800 14:10:44Z
+3	161427	0	1800
+soak chunk 4 runtime=1800 14:40:47Z
+4	180470	0	1800
+soak chunk 5 runtime=1800 15:10:49Z
+5	163229	0	1800
+soak chunk 6 runtime=1800 15:40:51Z
+6	159556	0	1800
+soak chunk 7 runtime=1800 16:10:53Z
+7	165807	0	1800
+soak chunk 8 runtime=1800 16:40:55Z
+8	197638	0	1800
+soak chunk 9 runtime=1800 17:10:58Z
+9	216183	0	1800
+soak chunk 10 runtime=1800 17:41:00Z
+10	213604	0	1800
+soak chunk 11 runtime=1800 18:11:04Z
+11	192516	0	1800
+soak chunk 12 runtime=1774 18:41:06Z
+12	209534	0	1774
+/tmp/fairness-R8/r8-16mb-soak.sh: line 173: warning: here-document at line 160 delimited by end-of-file (wanted `PY')
+  File "<stdin>", line 12
+    cat "/tmp/fairness-R8/soak/SUMMARY.json"
+        ^
+SyntaxError: invalid syntax

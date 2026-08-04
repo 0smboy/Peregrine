@@ -1,0 +1,115 @@
+{
+  "entry": "HA-PATH",
+  "task": "16MB_read_4",
+  "object_count": 40,
+  "runtime_s": 180,
+  "impl": "rust",
+  "profile": "data-path",
+  "track": "ISO-CONFIG",
+  "n": 8,
+  "reps_met": true,
+  "ops_median": 4.152777777777779,
+  "ops_samples": [
+    4.0,
+    4.65,
+    4.294444444444444,
+    4.272222222222222,
+    4.083333333333333,
+    3.938888888888889,
+    4.155555555555556,
+    4.15
+  ],
+  "fail_rate_median": 0.0,
+  "validity": "ACCEPT",
+  "validity_note": "R8 retune object_count/runtime; ACCEPT iff prepare+normal fail=0",
+  "runs": [
+    {
+      "i": 1,
+      "ok": 720,
+      "fail": 0,
+      "success_pct": 100.0,
+      "prepare_ok": 40,
+      "prepare_fail": 0,
+      "prepare_success_pct": 100.0,
+      "ops_per_s": 4.0,
+      "endpoint": "http://10.0.0.10:8085"
+    },
+    {
+      "i": 2,
+      "ok": 837,
+      "fail": 0,
+      "success_pct": 100.0,
+      "prepare_ok": 40,
+      "prepare_fail": 0,
+      "prepare_success_pct": 100.0,
+      "ops_per_s": 4.65,
+      "endpoint": "http://10.0.0.10:8085"
+    },
+    {
+      "i": 3,
+      "ok": 773,
+      "fail": 0,
+      "success_pct": 100.0,
+      "prepare_ok": 40,
+      "prepare_fail": 0,
+      "prepare_success_pct": 100.0,
+      "ops_per_s": 4.294444444444444,
+      "endpoint": "http://10.0.0.10:8085"
+    },
+    {
+      "i": 4,
+      "ok": 769,
+      "fail": 0,
+      "success_pct": 100.0,
+      "prepare_ok": 40,
+      "prepare_fail": 0,
+      "prepare_success_pct": 100.0,
+      "ops_per_s": 4.272222222222222,
+      "endpoint": "http://10.0.0.10:8085"
+    },
+    {
+      "i": 5,
+      "ok": 735,
+      "fail": 0,
+      "success_pct": 100.0,
+      "prepare_ok": 40,
+      "prepare_fail": 0,
+      "prepare_success_pct": 100.0,
+      "ops_per_s": 4.083333333333333,
+      "endpoint": "http://10.0.0.10:8085"
+    },
+    {
+      "i": 6,
+      "ok": 709,
+      "fail": 0,
+      "success_pct": 100.0,
+      "prepare_ok": 40,
+      "prepare_fail": 0,
+      "prepare_success_pct": 100.0,
+      "ops_per_s": 3.938888888888889,
+      "endpoint": "http://10.0.0.10:8085"
+    },
+    {
+      "i": 7,
+      "ok": 748,
+      "fail": 0,
+      "success_pct": 100.0,
+      "prepare_ok": 40,
+      "prepare_fail": 0,
+      "prepare_success_pct": 100.0,
+      "ops_per_s": 4.155555555555556,
+      "endpoint": "http://10.0.0.10:8085"
+    },
+    {
+      "i": 8,
+      "ok": 747,
+      "fail": 0,
+      "success_pct": 100.0,
+      "prepare_ok": 40,
+      "prepare_fail": 0,
+      "prepare_success_pct": 100.0,
+      "ops_per_s": 4.15,
+      "endpoint": "http://10.0.0.10:8085"
+    }
+  ]
+}

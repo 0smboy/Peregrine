@@ -25,19 +25,28 @@
 //! `.reseller_reader`; account PUT/DELETE requires reseller admin.
 //!
 //! Deferred: per-container/account ACLs (`X-Container-Read` etc.), S3
-//! auth, memcache/fernet token formats (tokens are held in-process),
-//! service tokens, and the deferred `swift.authorize` callback (we
-//! authorize inline, so public-ACL reads are not yet honored).
+//! auth, Python memcache/fernet token wire formats, service tokens, and
+//! the deferred `swift.authorize` callback (we authorize inline, so
+//! public-ACL reads are not yet honored).
+//!
+//! When [`TempAuth::with_shared_secret`] is set (cluster deploy: derived
+//! from `swift.conf` hash prefix/suffix), issued tokens are HMAC-signed
+//! and valid on every proxy that shares the secret — required for
+//! HAProxy to load-balance across nodes without per-process 401s.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use swift_http::{Request, Response};
 
 use crate::acl::{parse_acl_v1, referrer_allowed};
 use crate::{Middleware, NextFn};
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// One configured user identity.
 #[derive(Debug, Clone)]
@@ -64,6 +73,8 @@ pub struct TempAuth {
     users: HashMap<String, UserRecord>,
     tokens: Mutex<HashMap<String, CachedToken>>,
     token_counter: AtomicU64,
+    /// Cluster-shared HMAC key. `None` keeps legacy in-process tokens (tests).
+    shared_secret: Option<Vec<u8>>,
 }
 
 impl TempAuth {
@@ -78,7 +89,20 @@ impl TempAuth {
             users: HashMap::new(),
             tokens: Mutex::new(HashMap::new()),
             token_counter: AtomicU64::new(0),
+            shared_secret: None,
         }
+    }
+
+    /// Enable HMAC tokens that any proxy with the same secret can validate.
+    pub fn with_shared_secret(mut self, secret: impl AsRef<[u8]>) -> Self {
+        self.shared_secret = Some(secret.as_ref().to_vec());
+        self
+    }
+
+    /// Same as [`with_shared_secret`] on `&mut Self` for builder-style setup.
+    pub fn set_shared_secret(&mut self, secret: impl AsRef<[u8]>) -> &mut Self {
+        self.shared_secret = Some(secret.as_ref().to_vec());
+        self
     }
 
     /// Add a `user_<account>_<user>` record.
@@ -124,6 +148,9 @@ impl TempAuth {
     }
 
     fn issue_token(&self, groups: Vec<String>) -> String {
+        if let Some(secret) = &self.shared_secret {
+            return self.issue_shared_token(secret, groups);
+        }
         let n = self.token_counter.fetch_add(1, Ordering::Relaxed);
         let mut x = (std::process::id() as u64)
             .wrapping_mul(0x9e3779b97f4a7c15)
@@ -141,7 +168,34 @@ impl TempAuth {
         token
     }
 
+    fn issue_shared_token(&self, secret: &[u8], groups: Vec<String>) -> String {
+        let exp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .saturating_add(self.token_life.as_secs());
+        // groups joined with RS (0x1e) — account names in practice lack this byte
+        let payload = format!("{exp}\x1e{}", groups.join("\x1e"));
+        let mac = {
+            let mut h = HmacSha256::new_from_slice(secret).expect("HMAC key");
+            h.update(payload.as_bytes());
+            h.finalize().into_bytes()
+        };
+        format!(
+            "{}tkv1.{}.{}",
+            self.reseller_prefix,
+            hex_encode(payload.as_bytes()),
+            hex_encode(&mac)
+        )
+    }
+
     fn validate_token(&self, token: &str) -> Option<Vec<String>> {
+        if let Some(secret) = &self.shared_secret {
+            if let Some(groups) = self.validate_shared_token(secret, token) {
+                return Some(groups);
+            }
+            // Fall through: allow in-process tokens during mixed rollout.
+        }
         let mut tokens = self.tokens.lock().unwrap();
         match tokens.get(token) {
             Some(cached) if cached.expires > Instant::now() => Some(cached.groups.clone()),
@@ -153,6 +207,28 @@ impl TempAuth {
         }
     }
 
+    fn validate_shared_token(&self, secret: &[u8], token: &str) -> Option<Vec<String>> {
+        let prefix = format!("{}tkv1.", self.reseller_prefix);
+        let rest = token.strip_prefix(&prefix)?;
+        let (payload_hex, mac_hex) = rest.split_once('.')?;
+        let payload = hex_decode(payload_hex)?;
+        let mac = hex_decode(mac_hex)?;
+        let mut h = HmacSha256::new_from_slice(secret).ok()?;
+        h.update(&payload);
+        h.verify_slice(&mac).ok()?;
+        let text = String::from_utf8(payload).ok()?;
+        let mut parts = text.split('\x1e');
+        let exp: u64 = parts.next()?.parse().ok()?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now > exp {
+            return None;
+        }
+        Some(parts.map(|s| s.to_string()).collect())
+    }
+
     fn unauthorized(realm: &str) -> Response {
         let mut resp = Response::with_body(401, b"401 Unauthorized".to_vec());
         resp.headers
@@ -160,7 +236,44 @@ impl TempAuth {
         resp.headers.set("Content-Type", "text/plain");
         resp
     }
+}
 
+fn hex_encode(data: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(data.len() * 2);
+    for &b in data {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    out
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = hex_nibble(bytes[i])?;
+        let lo = hex_nibble(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Some(out)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+impl TempAuth {
     fn forbidden() -> Response {
         let mut resp = Response::with_body(403, b"403 Forbidden".to_vec());
         resp.headers.set("Content-Type", "text/plain");
@@ -428,6 +541,32 @@ mod tests {
             204
         );
         assert_eq!(seen.lock().unwrap().clone().unwrap(), "");
+    }
+
+    #[test]
+    fn test_shared_secret_token_cross_instance() {
+        let secret = b"lab-shared-tempauth-secret";
+        let mut a = TempAuth::new("http://vip:8085").with_shared_secret(secret);
+        a.add_user("test", "tester", "testing", &[".admin"]);
+        let mut b = TempAuth::new("http://vip:8085").with_shared_secret(secret);
+        b.add_user("test", "tester", "testing", &[".admin"]);
+
+        let resp = a.handle(
+            mk(
+                "GET",
+                "/auth/v1.0",
+                &[("X-Auth-User", "test:tester"), ("X-Auth-Key", "testing")],
+            ),
+            &(std::sync::Arc::new(|_r| Response::new(500)) as crate::NextFn),
+        );
+        assert_eq!(resp.status, 200);
+        let token = resp.headers.get("X-Auth-Token").unwrap().to_string();
+        assert!(token.contains("tkv1."), "{token}");
+
+        let (seen, app) = recording_app();
+        let resp = b.handle(mk("GET", "/v1/AUTH_test/c", &[("X-Auth-Token", &token)]), &app);
+        assert_eq!(resp.status, 204, "peer proxy must accept HMAC token");
+        assert!(seen.lock().unwrap().clone().unwrap().contains("AUTH_test"));
     }
 
     #[test]

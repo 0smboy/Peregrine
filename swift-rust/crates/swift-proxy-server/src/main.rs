@@ -180,7 +180,11 @@ fn main() {
     // Build tempauth first: whether auth is in the pipeline decides whether the
     // proxy enforces container ACLs (auth_enabled) — so a request path that
     // forgets to authorize cannot silently become world-accessible.
-    let tempauth = build_tempauth(&conf, &get("storage_url", "http://127.0.0.1:8080"));
+    let tempauth = build_tempauth(
+        &conf,
+        &swift_conf,
+        &get("storage_url", "http://127.0.0.1:8080"),
+    );
     let config = proxy_config_from_conf(&conf, tempauth.is_some());
     let info_json = build_info_json(&swift_conf, config.account_autocreate, config.auth_enabled);
 
@@ -649,7 +653,11 @@ fn build_info_json(
 /// Build a `TempAuth` from a `[filter:tempauth]` section, or `None` if there are
 /// no user records (auth stays off). Each `user_<account>_<user> = <key>
 /// <group...>` line becomes one credential.
-fn build_tempauth(conf: &SwiftConfig, storage_url: &str) -> Option<swift_middleware::TempAuth> {
+fn build_tempauth(
+    conf: &SwiftConfig,
+    swift_conf: &SwiftConfig,
+    storage_url: &str,
+) -> Option<swift_middleware::TempAuth> {
     let items = conf.items("filter:tempauth").ok()?;
     let mut auth = swift_middleware::TempAuth::new(storage_url.to_string());
     let mut any = false;
@@ -667,7 +675,25 @@ fn build_tempauth(conf: &SwiftConfig, storage_url: &str) -> Option<swift_middlew
         auth.add_user(account, user, secret, &groups);
         any = true;
     }
-    any.then_some(auth)
+    if !any {
+        return None;
+    }
+    // Shared HMAC secret so HAProxy can fan out across proxies (tokens were
+    // previously per-process and forced local-only backends).
+    let prefix = swift_conf
+        .get("swift-hash", "swift_hash_path_prefix")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let suffix = swift_conf
+        .get("swift-hash", "swift_hash_path_suffix")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if !prefix.is_empty() || !suffix.is_empty() {
+        auth.set_shared_secret(format!("{prefix}:{suffix}"));
+    }
+    Some(auth)
 }
 
 #[cfg(test)]

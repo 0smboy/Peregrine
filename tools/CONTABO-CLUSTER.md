@@ -28,9 +28,10 @@ Old SAIO 3.45×/3.79× remain **NOISY**. VIP = **HA-PATH ONLY**; core throughput
 | swift3 | `169.58.108.87` | `10.0.0.3` | `10.0.4.3` | `10.0.8.3` |
 | swift4 (obs + console hub) | `169.58.108.121` | `10.0.0.4` | `10.0.4.4` | `10.0.8.4` |
 
-- Keepalived VIP: **`10.0.0.10`** (swift1 MASTER)
-- Client API (preferred): `http://10.0.0.10:8085` (HAProxy → local `127.0.0.1:8080`)
-- Per-node HAProxy: `http://10.0.0.N:8085`
+- Keepalived VIP: **`10.0.0.10`** (priority 140/130/120/110 → swift1 MASTER by default)
+- Client API (preferred): `http://10.0.0.10:8085` (HAProxy → **round-robin** `10.0.0.1–4:8080`)
+- Per-node HAProxy: `http://10.0.0.N:8085` (same four-proxy pool)
+- Evidence of real LB + failover: [`HA-LB-CORRECT-20260804.md`](test-results/HA-LB-CORRECT-20260804.md)
 - Auth (tempauth): `test:tester` / `azure-swift-2026.bench` (name historical)
 - Console / Prom / Loki (swift4 loopback):
   `ssh -L 9000:127.0.0.1:9000 -L 9090:127.0.0.1:9090 -L 3100:127.0.0.1:3100 swift4`
@@ -54,14 +55,27 @@ Policies: `default` (replication) + `ec-2-1` (`liberasurecode_rs_vand`).
 - `autocos` / `cabt` (cosbench-rs) remain where installed
 - memcached on cluster nodes (cluster cache — not hub pollution)
 
-## HAProxy note
+## HAProxy + Keepalived (corrected 2026-08-04)
 
-Rust tempauth is per-process. HAProxy backends must stay **local-only**
-(`127.0.0.1:8080`). Fan-out across peer proxies causes cross-node **401**.
+**Was broken as “LB”:** backends were local-only (`127.0.0.1:8080`) because
+old Rust tempauth tokens were per-process (cross-proxy → 401). VIP was
+failover-only, not multi-proxy throughput. Only swift1 bound `10.0.0.10:8085`,
+so VIP move left the new MASTER with nothing listening → connection refused.
+
+**Now:**
+1. tempauth tokens are HMAC-signed with `swift_hash_path_prefix:suffix`
+   (shared across proxies) → one token accepted on all four `:8080`.
+2. HAProxy `swift_back` = `s1..s4` → `10.0.0.1..4:8080` check, `balance roundrobin`.
+3. Every node binds **both** `10.0.0.N:8085` and `10.0.0.10:8085`
+   (`net.ipv4.ip_nonlocal_bind=1`) so VIP failover has a live listener.
+
+Verified 2026-08-04 from swift4: VIP auth/PUT/GET OK; 60 GETs split
+~15/16/15/15 across s1–s4; stop keepalived+haproxy on swift1 → VIP to swift2,
+auth/IO still 200; restore → VIP back to swift1.
 
 HAProxy still strips `Content-Length` on HTTP 204 even when forced; Shadow
-parity therefore compares side A via **local** `127.0.0.1:8080` (not VIP).
-Ops/Files keep using VIP `10.0.0.10:8085`.
+parity that cares about empty-body headers should hit a proxy `:8080` directly
+when needed. Ops/Files use VIP `10.0.0.10:8085`.
 
 ## Security (2026-08-01 hardening)
 

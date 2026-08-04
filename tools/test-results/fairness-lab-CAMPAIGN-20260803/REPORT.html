@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>需求对齐与动作对照表</title>
+<style>
+  body {
+    margin: 0;
+    font: 15px/1.5 "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", system-ui, sans-serif;
+    background: #faf8f5;
+    color: #222;
+  }
+  main { max-width: 980px; margin: 0 auto; padding: 40px 18px 80px; }
+  h1 { font-size: 24px; font-weight: 650; margin: 0 0 6px; }
+  .when { color: #666; font-size: 13px; margin-bottom: 28px; }
+  h2 {
+    font-size: 15px;
+    font-weight: 650;
+    margin: 36px 0 10px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid #e5dfd4;
+  }
+  p { margin: 0 0 12px; max-width: 72ch; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 8px 0 6px;
+    font-size: 13px;
+    background: #fff;
+    border: 1px solid #e5dfd4;
+  }
+  th, td {
+    text-align: left;
+    padding: 9px 10px;
+    border-bottom: 1px solid #e5dfd4;
+    vertical-align: top;
+  }
+  th {
+    background: #f3efe7;
+    color: #555;
+    font-weight: 600;
+    font-size: 12px;
+  }
+  tr:last-child td { border-bottom: 0; }
+  .n { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .soft { color: #666; font-size: 13px; margin-top: 8px; }
+  .yes { color: #1a7a3c; font-weight: 600; }
+  .no { color: #9a5b00; font-weight: 600; }
+  .partial { color: #6b5b00; font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>需求对齐与动作对照表</h1>
+  <p class="when">Contabo 四台机器 · 2026-08-03～04 · 对象存储（Rust 重写）验证</p>
+
+  <h2>表一：你的需求 vs 完美对齐长什么样 vs 现在到哪了</h2>
+  <table>
+    <tr>
+      <th style="width:22%">你的需求</th>
+      <th style="width:38%">完美对齐长什么样</th>
+      <th style="width:40%">现在到哪了</th>
+    </tr>
+    <tr>
+      <td>测法要公平，不能拿脏环境当成绩</td>
+      <td>流量入口机器上不挂玩具单机、不挂监控面板；正式速度成绩只走「直接打四台」；带负载均衡的入口单独记，不抢主结论</td>
+      <td class="yes">已做到。入口机已清干净；主成绩与入口成绩分开</td>
+    </tr>
+    <tr>
+      <td>知道 Rust 版行为是否像原来的对象存储</td>
+      <td>在干净布局下，接口对比和功能套件全过；两边单机也能各跑一套功能套件</td>
+      <td class="yes">已做到。对比 11/11；功能套件三路各 54/54</td>
+    </tr>
+    <tr>
+      <td>知道单独跑时读写有多快、多稳</td>
+      <td>每种负载测满约定次数（至少 8 次），有中位数、失败数为 0 才当有效成绩</td>
+      <td class="yes">主成绩表已齐（含修好后的大文件读取）</td>
+    </tr>
+    <tr>
+      <td>知道坏一块、入口出问题能不能撑住</td>
+      <td>代理挂掉、存数据服务挂掉、入口主节点相关场景都有记录，且能恢复</td>
+      <td class="yes">已做到（各 20 次恢复；入口相关检查通过）</td>
+    </tr>
+    <tr>
+      <td>知道能不能扛久一点</td>
+      <td>至少连续压数小时，失败为 0</td>
+      <td class="yes">已做到 6 小时、失败 0</td>
+    </tr>
+    <tr>
+      <td>Rust 和 Python 谁更快，要公平对比</td>
+      <td>四台完整 Python 集群与 Rust 集群同拓扑、同配置映射后再比</td>
+      <td class="no">未做到。Python 整集群没装齐，故意不做假对比</td>
+    </tr>
+    <tr>
+      <td>功能要对齐到能声称「和 Python 一样全」</td>
+      <td>中间件链路、缓存、按盘监听等关键能力都落地并有证明</td>
+      <td class="no">未做到。记在实现缺口清单里</td>
+    </tr>
+    <tr>
+      <td>测完要有一份能打开看的总报告</td>
+      <td>用人话写清：需求、做了什么、环境、原因、效果、剩余、下一步</td>
+      <td class="partial">就是本页（此前分轮薄页不够，这版按你的问题重写）</td>
+    </tr>
+  </table>
+
+  <h2>表二：每一个动作——做了什么 / 环境 / 为什么 / 效果</h2>
+  <table>
+    <tr>
+      <th>动作</th>
+      <th>做了什么</th>
+      <th>环境（在哪、什么状态）</th>
+      <th>为什么这么做</th>
+      <th>做完效果</th>
+    </tr>
+    <tr>
+      <td>1. 清入口机</td>
+      <td>停掉入口机上的两套玩具单机；把监控、日志、管理界面迁到第 4 台</td>
+      <td>四台 Contabo；入口虚拟 IP 仍在第 1 台；第 1 台原先挤满干扰进程</td>
+      <td>不拆开就没法相信任何速度数字</td>
+      <td>第 1 台只剩正常集群服务；管理界面改从第 4 台进</td>
+    </tr>
+    <tr>
+      <td>2. 证明「只跑一边」</td>
+      <td>检查四台：该停的停干净，Rust 集群服务正常；发现没有完整 Python 集群单元</td>
+      <td>清完干扰后的四台；仍是 Rust 在跑生产式集群服务</td>
+      <td>防止两边进程偷跑抢资源</td>
+      <td>确认可以开正式测；并记下「Python 正式对比暂不可做」</td>
+    </tr>
+    <tr>
+      <td>3. 兼容性重测</td>
+      <td>在第 3 台重建两套玩具单机（Rust / Python 各一）；跑接口对比 + 功能套件</td>
+      <td>玩具单机在第 3 台；集群入口仍用虚拟 IP；监控在第 4 台</td>
+      <td>兼容性需要对照面，但不能再放回入口机</td>
+      <td>对比 11/11；功能套件三路各 54 项全过</td>
+    </tr>
+    <tr>
+      <td>4. 正式速度（主成绩）</td>
+      <td>从第 4 台直接打四台地址；小/中/大文件读写；每项至少 8 次有效测量</td>
+      <td>客户端：第 4 台；目标：四台各自的代理端口；不走虚拟 IP</td>
+      <td>这才是「集群本身」的速度，不被负载均衡和入口机噪音带偏</td>
+      <td>见下方「主成绩数字」；大文件读第一次几乎全挂（参数问题）</td>
+    </tr>
+    <tr>
+      <td>5. 入口路径另记一册</td>
+      <td>同一套负载，改打虚拟 IP 入口，单独成表</td>
+      <td>客户端仍宜在非入口机；目标是集群虚拟 IP</td>
+      <td>入口路径有价值，但不能和主成绩混写成「谁更快」</td>
+      <td>有单独数字；其中一格和长时间压测撞车，标了不干净</td>
+    </tr>
+    <tr>
+      <td>6. 故障注入</td>
+      <td>人为让代理挂掉、存数据服务挂掉；再跑入口主节点相关检查</td>
+      <td>运行中的四台 Rust 集群</td>
+      <td>只看速度不够，要看坏了能不能回来</td>
+      <td>代理 / 存数据各 20 次都能恢复；入口相关检查通过</td>
+    </tr>
+    <tr>
+      <td>7. 先压 1 小时</td>
+      <td>持续写小文件约 1 小时，看失败数</td>
+      <td>直接打集群（非玩具单机）</td>
+      <td>先冒烟，再决定要不要拉长</td>
+      <td>失败 0</td>
+    </tr>
+    <tr>
+      <td>8. 修好大文件读取</td>
+      <td>把「一次准备太多文件、时间太短」改成少准备、给足时间；主路径和入口路径各再测满 8 次</td>
+      <td>同正式速度环境；参数改为约 40 个对象、每次约 180 秒</td>
+      <td>第一次成绩无效，不能假装「读不动」</td>
+      <td>失败变为 0；主路径中位约每秒 4.1 次，入口路径约 4.2 次</td>
+    </tr>
+    <tr>
+      <td>9. 再压 6 小时</td>
+      <td>连续写约 6 小时</td>
+      <td>第 4 台打集群；大文件专项跑完之后再压，避免互相抢</td>
+      <td>1 小时只能叫冒烟，要更有把握得拉长</td>
+      <td>失败 0；大约成功 220 万次写</td>
+    </tr>
+    <tr>
+      <td>10. 写总报告</td>
+      <td>把需求、动作、环境、原因、效果、剩余、下一步收成可打开的一页</td>
+      <td>证据在仓库各轮文件夹；本页是给人看的汇总</td>
+      <td>你多次要求：长测要以报告为交付，不是聊天摘要</td>
+      <td>就是你现在看的这页</td>
+    </tr>
+  </table>
+
+  <h2>表三：主成绩数字（直接打四台 · 每项 8 次取中位）</h2>
+  <table>
+    <tr><th>做什么</th><th>大约每秒几次</th><th>失败</th></tr>
+    <tr><td>很小的文件 · 读</td><td class="n">685</td><td>没有</td></tr>
+    <tr><td>中等文件 · 读</td><td class="n">506</td><td>没有</td></tr>
+    <tr><td>很小的文件 · 写</td><td class="n">141</td><td>没有</td></tr>
+    <tr><td>中等文件 · 写</td><td class="n">140</td><td>没有</td></tr>
+    <tr><td>较大文件（约 1MB）· 读</td><td class="n">68</td><td>没有</td></tr>
+    <tr><td>较大文件 · 写</td><td class="n">33</td><td>没有</td></tr>
+    <tr><td>大文件（约 16MB）· 写</td><td class="n">2.3</td><td>没有</td></tr>
+    <tr><td>大文件 · 读（修好后）</td><td class="n">4.1</td><td>没有</td></tr>
+  </table>
+  <p class="soft">入口路径另有一表，不和这张比输赢。原始分轮材料在 <code>tools/test-results/fairness-lab-R1</code> … <code>R8-20260803/</code>。</p>
+
+  <h2>表四：还没做的 · 怎么规划</h2>
+  <table>
+    <tr>
+      <th>剩余任务</th>
+      <th>为什么还没做</th>
+      <th>建议怎么规划</th>
+      <th>依赖 / 前置</th>
+    </tr>
+    <tr>
+      <td>四台完整 Python 集群 + 正式双实现速度对比</td>
+      <td>机器上根本没有完整 Python 集群服务可切</td>
+      <td>单独一轮：装齐 → 用同一套「只跑一边」规矩 → 再比</td>
+      <td>安装与配置映射（工人数等不能只抄同名旋钮）</td>
+    </tr>
+    <tr>
+      <td>中间件链路、缓存层、按盘监听等实现</td>
+      <td>这是开发，不是验证；混在验证里会把结论搅脏</td>
+      <td>按缺口清单逐项开发 + 单测/对照测；完成一项收一项</td>
+      <td>见仓库里「缺什么实现」那份清单</td>
+    </tr>
+    <tr>
+      <td>监控专用机 / 压测专用机</td>
+      <td>这轮先把监控挪到第 4 台就够用，没新买机器</td>
+      <td>有机器再迁；没有就维持现状并写明「暂住第 4 台」</td>
+      <td>硬件或云主机预算</td>
+    </tr>
+    <tr>
+      <td>入口路径上「较大文件读取」干净复测</td>
+      <td>上次和长时间压测重叠，那一格不能当硬结论</td>
+      <td>单独开一小段：只打入口、不跑 soak，补满次数</td>
+      <td>集群空闲窗口约数十分钟</td>
+    </tr>
+    <tr>
+      <td>更长的稳态（例如按天）</td>
+      <td>这轮目标先落到 6 小时</td>
+      <td>若产品要按天承诺，再开；否则 6 小时可先用</td>
+      <td>明确 SLA / 产品要求</td>
+    </tr>
+  </table>
+
+  <h2>表五：我建议的下一步顺序（等你拍板）</h2>
+  <table>
+    <tr><th>顺序</th><th>做什么</th><th>为什么排这里</th></tr>
+    <tr>
+      <td class="n">A</td>
+      <td>你先定主目标：要「和 Python 比快慢」，还是「先补齐实现」，还是「先把环境再收干净」</td>
+      <td>三条线工作量不同，不能假装同时完美</td>
+    </tr>
+    <tr>
+      <td class="n">B</td>
+      <td>若要比快慢 → 先装四台 Python 集群，再开正式对比轮</td>
+      <td>没有对等环境，比了也是假的</td>
+    </tr>
+    <tr>
+      <td class="n">C</td>
+      <td>若要功能宣称完整 → 按缺口清单开实现轮，验证另算</td>
+      <td>开发和验证分开，报告才诚实</td>
+    </tr>
+    <tr>
+      <td class="n">D</td>
+      <td>可选小补丁：入口路径较大文件读取复测；监控是否迁专用机</td>
+      <td>便宜、能消掉已知「不干净」格</td>
+    </tr>
+  </table>
+
+  <p class="soft">
+    看管理界面：<code>ssh -L 9000:127.0.0.1:9000 swift4</code>，浏览器打开本机 9000 端口。
+  </p>
+</main>
+</body>
+</html>
