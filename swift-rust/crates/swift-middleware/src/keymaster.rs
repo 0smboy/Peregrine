@@ -35,7 +35,9 @@
 //! Residuals (honest):
 //! * **KMIP / KMS keymasters** — still deferred (external KMS; see
 //!   `kmip_keymaster.py` / `kms_keymaster.py` in Python Swift)
-//! * meta version `"1"` / `"3"` and the legacy leading-slash object path bug
+//! * meta version `"1"` path derivation: leading-slash object bug + py3
+//!   WSGI latin1 path rewrite for `"1"`/`"2"` (not trivial; we write/read
+//!   `"2"`/`"3"` path form only — `meta_version_to_write` is still accepted)
 //! * `keymaster_config_path` external file (use inline filter conf)
 //! * Python `swift.callback.fetch_crypto_keys` environ hook — Encrypter /
 //!   Decrypter hold an [`Arc`] to this keymaster and call
@@ -295,6 +297,33 @@ impl KeyMaster {
         serde_json::Value::Object(map)
     }
 
+    /// Object path keys for **every** loaded root secret (Python
+    /// `CryptoKeyHelper.get_multiple_keys` → each `keys['object']`).
+    ///
+    /// Used by encrypter when masking `If-Match` / `If-None-Match`: the
+    /// on-disk Etag-Mac may have been produced under any historic root
+    /// secret, so each HMAC is appended.
+    pub fn fetch_all_object_keys(
+        &self,
+        account: &str,
+        container: &str,
+        object: &str,
+    ) -> Vec<[u8; KEY_LENGTH]> {
+        self.root_secret_ids()
+            .into_iter()
+            .filter_map(|id| {
+                self.fetch_keys_for_secret(
+                    account,
+                    Some(container),
+                    Some(object),
+                    id.as_deref(),
+                )
+                .ok()
+                .and_then(|k| k.object)
+            })
+            .collect()
+    }
+
     /// Root secret bytes for the active secret (tests / diagnostics only —
     /// never log).
     #[cfg(test)]
@@ -440,5 +469,19 @@ mod tests {
         let keys = km.fetch_keys("a", Some("c"), Some("o"));
         assert_eq!(keys.id["secret_id"], "s1");
         assert_eq!(keys.all_ids.len(), 1);
+    }
+
+    #[test]
+    fn fetch_all_object_keys_covers_every_secret() {
+        let root_a = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+        let root_b = vec![0xabu8; 32];
+        let items = vec![
+            ("encryption_root_secret".into(), b64_of(&root_a)),
+            ("encryption_root_secret_b".into(), b64_of(&root_b)),
+        ];
+        let km = KeyMaster::from_conf_items(&items).unwrap();
+        let all = km.fetch_all_object_keys("a", "c", "o");
+        assert_eq!(all.len(), 2);
+        assert_ne!(all[0], all[1]);
     }
 }

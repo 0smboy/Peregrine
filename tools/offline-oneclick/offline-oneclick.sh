@@ -12,12 +12,17 @@
 #   ./offline-oneclick.sh stop
 #   ./offline-oneclick.sh status
 #   ./offline-oneclick.sh test [--func] [--smoke] [--lab]
+#   ./offline-oneclick.sh tls [--pem PATH] [--check] [--dest DIR]
+#   ./offline-oneclick.sh tls --vip -- [apply-vip-tls-pem.sh args…]
 #   ./offline-oneclick.sh all-local [--features ec] [--console]
 #
 # After `pack`, the tarball is self-contained (binaries + scripts + conf).
 # Target host needs: bash, tar, gzip, coreutils, and a compatible libc (no
 # network required). macOS builds produce Darwin binaries; Linux builds
 # produce Linux binaries — pack on the target OS family.
+#
+# TLS: SAIO stays HTTP :8080. `tls` validates/stages PEM (SWIFT_TLS_PEM).
+# Production VIP HAProxy → tools/ops/apply-vip-tls-pem.sh (via tls --vip -- …).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -257,9 +262,93 @@ cmd_start() {
   fi
 
   if [[ -n "${SWIFT_TLS_PEM:-}" ]]; then
-    log "SWIFT_TLS_PEM set ($SWIFT_TLS_PEM) — apply via HAProxy/lb outside SAIO; not auto-wired on :8080"
+    local tls_dir="${PEREGRINE_PREFIX:-$DEFAULT_PREFIX}/etc/tls"
+    mkdir -p "$tls_dir" 2>/dev/null || true
+    if [[ -f "$SWIFT_TLS_PEM" ]]; then
+      install -m 0600 "$SWIFT_TLS_PEM" "$tls_dir/server.pem" 2>/dev/null \
+        && log "staged SWIFT_TLS_PEM → $tls_dir/server.pem (SAIO proxy stays HTTP; front with HAProxy/nginx)" \
+        || log "warn: could not stage SWIFT_TLS_PEM (permissions?)"
+    else
+      log "warn: SWIFT_TLS_PEM set but missing: $SWIFT_TLS_PEM"
+    fi
+    log "production VIP TLS: $REPO_ROOT/tools/ops/apply-vip-tls-pem.sh (not SAIO :8080)"
   fi
   log "start complete. ST_AUTH=${ST_AUTH:-$ST_AUTH_DEFAULT}"
+}
+
+# Validate / stage TLS PEM for operators. Does NOT terminate TLS on SAIO :8080.
+# Production VIP: tools/ops/apply-vip-tls-pem.sh (tls --vip -- …)
+cmd_tls() {
+  # Production VIP path: pass remaining args through unchanged (no Contabo auto).
+  if [[ "${1:-}" == "--vip" ]]; then
+    shift
+    [[ "${1:-}" == "--" ]] && shift
+    local apply="$REPO_ROOT/tools/ops/apply-vip-tls-pem.sh"
+    [[ -f "$apply" ]] || die "missing $apply"
+    exec bash "$apply" "$@"
+  fi
+
+  local pem="${SWIFT_TLS_PEM:-}" dest="" check=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --pem) pem="${2:?}"; shift 2 ;;
+      --dest) dest="${2:?}"; shift 2 ;;
+      --check) check=1; shift ;;
+      -h|--help)
+        cat <<'EOF'
+Usage: offline-oneclick.sh tls [--pem PATH] [--dest DIR] [--check]
+       offline-oneclick.sh tls --vip -- [apply-vip-tls-pem.sh args…]
+
+  SAIO path (default): validate PEM (+ openssl if present) and stage under
+  prefix/etc/tls/server.pem. Proxy remains HTTP :8080.
+
+  --pem PATH   Source PEM (or env SWIFT_TLS_PEM)
+  --dest DIR   Stage directory (default: $PEREGRINE_PREFIX/etc/tls)
+  --check      Validate only; do not stage
+  --vip -- …   Exec tools/ops/apply-vip-tls-pem.sh (production HAProxy;
+               requires explicit --local or --ssh there)
+
+Examples:
+  SWIFT_TLS_PEM=/secure/lab.pem ./offline-oneclick.sh tls --check
+  ./offline-oneclick.sh tls --pem /secure/lab.pem
+  ./offline-oneclick.sh tls --vip -- --pem /secure/vip.pem --check
+  ./offline-oneclick.sh tls --vip -- --pem /secure/vip.pem --ssh swift1 --dry-run
+EOF
+        return 0
+        ;;
+      *) die "tls: unknown arg $1 (try tls --help)" ;;
+    esac
+  done
+
+  [[ -n "$pem" ]] || die "tls: pass --pem PATH or set SWIFT_TLS_PEM"
+  [[ -f "$pem" ]] || die "tls: PEM missing: $pem"
+  [[ -s "$pem" ]] || die "tls: PEM empty: $pem"
+  grep -q 'BEGIN CERTIFICATE' "$pem" || die "tls: PEM missing BEGIN CERTIFICATE"
+  if ! grep -qE 'BEGIN (RSA |EC )?PRIVATE KEY' "$pem"; then
+    die "tls: PEM missing PRIVATE KEY (need cert+key concatenated)"
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    local tmp
+    tmp="$(mktemp "${TMPDIR:-/tmp}/oo-tls.XXXXXX")"
+    awk '/BEGIN CERTIFICATE/{p=1} p; /END CERTIFICATE/{exit}' "$pem" >"$tmp"
+    openssl x509 -in "$tmp" -noout 2>/dev/null || { rm -f "$tmp"; die "tls: openssl x509 parse failed"; }
+    rm -f "$tmp"
+    log "openssl x509 OK"
+  else
+    log "openssl absent — marker check only"
+  fi
+  log "PEM validated: $pem"
+  if [[ "$check" -eq 1 ]]; then
+    log "check-only complete"
+    return 0
+  fi
+  local prefix="${PEREGRINE_PREFIX:-$DEFAULT_PREFIX}"
+  [[ -n "$dest" ]] || dest="$prefix/etc/tls"
+  mkdir -p "$dest"
+  install -m 0600 "$pem" "$dest/server.pem"
+  log "staged $dest/server.pem"
+  log "SAIO still HTTP :8080 — use nginx/caddy/HAProxy in front, or:"
+  log "  $REPO_ROOT/tools/ops/apply-vip-tls-pem.sh --pem $pem --local|--ssh …"
 }
 
 cmd_stop() {
@@ -390,6 +479,7 @@ main() {
     stop) cmd_stop "$@" ;;
     status) cmd_status "$@" ;;
     test) cmd_test "$@" ;;
+    tls) cmd_tls "$@" ;;
     all-local) cmd_all_local "$@" ;;
     -h|--help|help|"") usage ;;
     *) die "unknown command: $cmd (try --help)" ;;

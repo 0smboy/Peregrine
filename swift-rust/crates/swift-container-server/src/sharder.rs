@@ -24,34 +24,41 @@
 //! (`find_shard_ranges`, `merge_shard_ranges`, `make_shard_name`,
 //! `set_sharding_state`/`set_sharded_state`).
 //!
-//! [`run_once`] walks a device's container DBs and continues cleave for
-//! containers already in the `sharding` state, writing shard DBs onto the
-//! **same device** under the normal `containers/<part>/<suf>/<hash>/` layout
-//! (local cleave). Wave 3 adds CleavingContext persistence, optional
-//! `auto_shard`, a local misplaced-object pass, and an HTTP shard-replicate
-//! hook. Proxy listing fan-out lives in `swift-proxy-server`.
+//! [`run_once`] / [`run_once_with_opts`] walk a device's container DBs and
+//! continue cleave for containers in the `sharding` state. Object rows are
+//! still written under the **same device** layout (local cleave). When a
+//! container ring is available, [`run_once_with_opts_and_replicator`] (and the
+//! `swift-container-sharder` binary) also **HTTP-creates** each uncleaved
+//! shard container on ring primaries via [`LookupHttpShardReplicator`] /
+//! [`HttpShardReplicator`] before cleaving. Wave 3 adds CleavingContext
+//! persistence, optional `auto_shard`, a local misplaced-object pass, and a
+//! SHRINKING-donor detection stub. Proxy listing fan-out lives in
+//! `swift-proxy-server`.
 //!
-//! ## Multi-node residual list (KEEP blockers — no Contabo claim without live evidence)
+//! ## Claimable vs residual (no Contabo KEEP claim without live evidence)
 //!
-//! Unit-tested foundation (this module):
+//! **Claimable (unit-tested code path in this module / binary):**
 //! - [`HttpShardReplicator`] quorum create (`replica_count/2+1`, overrideable)
-//! - [`primary_shard_replica_nodes`] / [`shard_replicas_from_ring_devices`]:
-//!   map ring primary devices → [`ShardReplicaNode`] list (order preserved)
-//! - [`LocalShardReplicator`] for same-device lab cleave
+//! - [`LookupHttpShardReplicator`]: per-shard primary resolve + quorum PUT
+//! - [`primary_shard_replica_nodes`] / [`shard_replicas_from_ring_devices`] /
+//!   [`ring_get_nodes_for_shard`]: ring devices → [`ShardReplicaNode`]
+//! - Daemon loop: optional container.ring.gz → inject lookup replicator into
+//!   [`process_sharding_container_with_replicator`] for uncleaved ranges
+//! - [`find_shrinking_donors`] / [`process_shrinking_donors_stub`]: detect
+//!   donors marked SHRINKING by CLI compact/repair (no acceptor cleave yet)
+//! - [`LocalShardReplicator`] + same-device lab cleave (SAIO-safe default when
+//!   no ring is loaded)
 //!
-//! Still required for multi-node KEEP (not claimed):
+//! **Still not KEEP (residuals):**
 //! 1. **Live Contabo/VIP quorum drill** — create shard containers on ≥ quorum
-//!    of real container-servers under the production ring; no synthetic-only
-//!    evidence counts as KEEP.
-//! 2. **Daemon loop wiring** — `swift-container-sharder` still uses local
-//!    cleave only; load container.ring.gz, resolve primaries per shard name,
-//!    inject [`HttpShardReplicator`] into
-//!    [`process_sharding_container_with_replicator`] for every uncleaved range.
-//! 3. **Durable multi-primary cleave under concurrent load** — local same-device
-//!    cleave is insufficient for a product multi-node claim.
-//! 4. **Sharder-side shrink/compact execution** after CLI marks donors
-//!    SHRINKING (CLI compact/repair/analyze now ship; daemon compact pass TBD).
-//! 5. WAN / async container-sync (wontfix).
+//!    of real container-servers under the production ring; synthetic unit
+//!    tests alone never count as KEEP.
+//! 2. **Durable multi-primary object cleave under concurrent load** — local
+//!    same-device row write is not a multi-node product claim; remote object
+//!    push / rsync of cleaved shard DBs remains open.
+//! 3. **Full shrink/compact execution** — daemon only *detects* SHRINKING
+//!    donors; acceptor expand + donor object move + SHRUNK transition TBD.
+//! 4. WAN / async container-sync (wontfix).
 
 use std::path::Path;
 
@@ -291,38 +298,141 @@ pub fn http_replicator_for_primaries<T: ShardHttpTransport>(
     HttpShardReplicator::new(nodes, transport)
 }
 
-impl<T: ShardHttpTransport> ShardReplicator for HttpShardReplicator<T> {
-    fn replicate_shard(&mut self, shard_name: &str, part: &str) -> Result<(), String> {
-        let (account, container) = split_shard_name(shard_name);
-        if account.is_empty() || container.is_empty() {
-            return Err(format!("invalid shard name: {shard_name}"));
-        }
-        let ts = swift_core::timestamp::Timestamp::now().internal();
-        let mut ok = 0usize;
-        let mut errors = Vec::new();
-        // Clone node list so we can mutably borrow transport while iterating.
-        let nodes = self.nodes.clone();
-        for node in &nodes {
-            match self
-                .transport
-                .put_container(node, part, &account, &container, &ts)
-            {
-                Ok(status) if (200..300).contains(&status) || status == 202 => ok += 1,
-                Ok(status) => errors.push(format!("{}:{} → {status}", node.ip, node.port)),
-                Err(e) => errors.push(format!("{}:{} → {e}", node.ip, node.port)),
-            }
-        }
-        if ok >= self.quorum {
-            Ok(())
-        } else {
-            Err(format!(
-                "shard create quorum failed for {shard_name}: ok={ok}/{} need={}; {}",
-                self.nodes.len(),
-                self.quorum,
-                errors.join("; ")
-            ))
+/// Quorum PUT of an empty shard container to a fixed primary list.
+/// Shared by [`HttpShardReplicator`] and [`LookupHttpShardReplicator`].
+pub fn put_shard_quorum<T: ShardHttpTransport>(
+    transport: &mut T,
+    nodes: &[ShardReplicaNode],
+    quorum: usize,
+    shard_name: &str,
+    part: &str,
+) -> Result<(), String> {
+    let (account, container) = split_shard_name(shard_name);
+    if account.is_empty() || container.is_empty() {
+        return Err(format!("invalid shard name: {shard_name}"));
+    }
+    let need = quorum.max(1);
+    let ts = swift_core::timestamp::Timestamp::now().internal();
+    let mut ok = 0usize;
+    let mut errors = Vec::new();
+    for node in nodes {
+        match transport.put_container(node, part, &account, &container, &ts) {
+            Ok(status) if (200..300).contains(&status) || status == 202 => ok += 1,
+            Ok(status) => errors.push(format!("{}:{} → {status}", node.ip, node.port)),
+            Err(e) => errors.push(format!("{}:{} → {e}", node.ip, node.port)),
         }
     }
+    if ok >= need {
+        Ok(())
+    } else {
+        Err(format!(
+            "shard create quorum failed for {shard_name}: ok={ok}/{} need={need}; {}",
+            nodes.len(),
+            errors.join("; ")
+        ))
+    }
+}
+
+impl<T: ShardHttpTransport> ShardReplicator for HttpShardReplicator<T> {
+    fn replicate_shard(&mut self, shard_name: &str, part: &str) -> Result<(), String> {
+        // Clone node list so we can mutably borrow transport while iterating.
+        let nodes = self.nodes.clone();
+        let quorum = self.quorum;
+        put_shard_quorum(&mut self.transport, &nodes, quorum, shard_name, part)
+    }
+}
+
+/// HTTP shard create that **resolves primaries per shard name** via a ring
+/// (or mock) lookup callback, then applies quorum PUT.
+///
+/// Use this from the daemon loop: each uncleaved range may hash to a different
+/// partition/primary set than the root container.
+pub struct LookupHttpShardReplicator<T, F>
+where
+    T: ShardHttpTransport,
+    F: FnMut(&str, &str) -> Result<(u32, Vec<(String, u16, String)>), String>,
+{
+    pub transport: T,
+    pub get_nodes: F,
+    /// Override quorum; `None` → [`default_shard_quorum`] for that shard's nodes.
+    pub quorum: Option<usize>,
+}
+
+impl<T, F> LookupHttpShardReplicator<T, F>
+where
+    T: ShardHttpTransport,
+    F: FnMut(&str, &str) -> Result<(u32, Vec<(String, u16, String)>), String>,
+{
+    pub fn new(transport: T, get_nodes: F) -> Self {
+        Self {
+            transport,
+            get_nodes,
+            quorum: None,
+        }
+    }
+
+    pub fn with_quorum(mut self, quorum: usize) -> Self {
+        self.quorum = Some(quorum.max(1));
+        self
+    }
+}
+
+impl<T, F> ShardReplicator for LookupHttpShardReplicator<T, F>
+where
+    T: ShardHttpTransport + Send,
+    F: FnMut(&str, &str) -> Result<(u32, Vec<(String, u16, String)>), String> + Send,
+{
+    fn replicate_shard(&mut self, shard_name: &str, _fallback_part: &str) -> Result<(), String> {
+        let (part, nodes) = primary_shard_replica_nodes(shard_name, &mut self.get_nodes)?;
+        let quorum = self
+            .quorum
+            .unwrap_or_else(|| default_shard_quorum(nodes.len()));
+        put_shard_quorum(
+            &mut self.transport,
+            &nodes,
+            quorum,
+            shard_name,
+            &part,
+        )
+    }
+}
+
+/// Map `Ring::get_nodes(account, Some(container), None)` into the tuple shape
+/// expected by [`primary_shard_replica_nodes`] / [`LookupHttpShardReplicator`].
+pub fn ring_get_nodes_for_shard(
+    ring: &swift_ring::Ring,
+    account: &str,
+    container: &str,
+) -> Result<(u32, Vec<(String, u16, String)>), String> {
+    let (part, nodes) = ring
+        .get_nodes(account, Some(container), None)
+        .map_err(|e| e.to_string())?;
+    Ok((
+        part,
+        nodes
+            .iter()
+            .map(|n| {
+                (
+                    n.dev.ip.clone(),
+                    n.dev.port as u16,
+                    n.dev.device.clone(),
+                )
+            })
+            .collect(),
+    ))
+}
+
+/// Build a [`LookupHttpShardReplicator`] backed by a live [`swift_ring::Ring`]
+/// and TCP transport (daemon default multi-node path).
+pub fn lookup_replicator_for_ring(
+    ring: &swift_ring::Ring,
+) -> LookupHttpShardReplicator<
+    TcpShardHttpTransport,
+    impl FnMut(&str, &str) -> Result<(u32, Vec<(String, u16, String)>), String> + '_,
+> {
+    LookupHttpShardReplicator::new(TcpShardHttpTransport::new(), move |account, container| {
+        ring_get_nodes_for_shard(ring, account, container)
+    })
 }
 
 /// Std TCP transport: `PUT /{device}/{part}/{account}/{container}` with
@@ -535,6 +645,10 @@ pub struct SharderStats {
     pub finished: u64,
     pub skipped: u64,
     pub failures: u64,
+    /// HTTP/ring shard-create attempts that failed quorum (multi-node path).
+    pub replicate_errors: u64,
+    /// SHRINKING donor ranges observed (stub compact pass; no object move).
+    pub shrinking_donors: u64,
 }
 
 /// Recon-cache update dumped after a sharder sweep.
@@ -547,6 +661,8 @@ pub fn recon_update(elapsed: std::time::Duration, end_epoch_secs: f64, stats: &S
         "container_sharder_cleaved_batches": stats.cleaved_batches,
         "container_sharder_finished": stats.finished,
         "container_sharder_failures": stats.failures,
+        "container_sharder_replicate_errors": stats.replicate_errors,
+        "container_sharder_shrinking_donors": stats.shrinking_donors,
     })
 }
 
@@ -604,7 +720,21 @@ pub fn process_sharding_container(
     )
 }
 
+/// Outcome of one SHARDING container process pass.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProcessShardingOutcome {
+    /// True when the container reached SHARDED this pass.
+    pub finished: bool,
+    /// Uncleaved ranges for which remote create failed quorum (or lookup).
+    pub replicate_errors: u64,
+}
+
 /// Same as [`process_sharding_container`] but with an injectable replicator.
+///
+/// For each uncleaved range, calls [`ShardReplicator::replicate_shard`] so
+/// multi-node backends ([`LookupHttpShardReplicator`]) can create the shard
+/// container on ring primaries. Cleave still writes objects to the **local**
+/// device path (SAIO-safe); remote object placement remains a residual.
 pub fn process_sharding_container_with_replicator(
     broker: &mut ContainerBroker,
     device: &Path,
@@ -613,6 +743,27 @@ pub fn process_sharding_container_with_replicator(
     cleave_batch_size: usize,
     replicator: &mut dyn ShardReplicator,
 ) -> Result<bool, DbError> {
+    Ok(process_sharding_container_detailed(
+        broker,
+        device,
+        hash_config,
+        part,
+        cleave_batch_size,
+        replicator,
+    )?
+    .finished)
+}
+
+/// Like [`process_sharding_container_with_replicator`] but returns replicate
+/// error counts for daemon stats.
+pub fn process_sharding_container_detailed(
+    broker: &mut ContainerBroker,
+    device: &Path,
+    hash_config: &HashPathConfig,
+    part: &str,
+    cleave_batch_size: usize,
+    replicator: &mut dyn ShardReplicator,
+) -> Result<ProcessShardingOutcome, DbError> {
     let info = broker.get_info()?;
     let account = info
         .iter()
@@ -625,14 +776,14 @@ pub fn process_sharding_container_with_replicator(
         .and_then(|(_, v)| v.as_text())
         .unwrap_or_default();
     if account.is_empty() || container.is_empty() {
-        return Ok(false);
+        return Ok(ProcessShardingOutcome::default());
     }
     let mut ranges = broker.get_shard_ranges(&GetShardRangesArgs {
         include_own: false,
         ..GetShardRangesArgs::default()
     })?;
     if ranges.is_empty() {
-        return Ok(false);
+        return Ok(ProcessShardingOutcome::default());
     }
     // Prefer persisted context; fall back to CLEAVED-range scan.
     let mut ctx = load_cleaving_context(broker)?;
@@ -649,10 +800,14 @@ pub fn process_sharding_container_with_replicator(
                 .count();
         }
     }
-    // Ensure shard DBs exist remotely (hook; local no-op).
+    // Ensure shard containers exist on primary replicas (local = no-op;
+    // LookupHttpShardReplicator resolves ring primaries per shard name).
+    let mut replicate_errors = 0u64;
     for sr in &ranges {
         if sr.state < shard_state::CLEAVED {
-            let _ = replicator.replicate_shard(&sr.name, part);
+            if replicator.replicate_shard(&sr.name, part).is_err() {
+                replicate_errors += 1;
+            }
         }
     }
     let mut shard_for = |sr: &ShardRange| local_shard_broker(device, hash_config, part, &sr.name);
@@ -661,10 +816,39 @@ pub fn process_sharding_container_with_replicator(
     save_cleaving_context(broker, &ctx, &ts)?;
     // Misplaced pass: objects still in retiring DB outside cleaved ranges.
     let _ = move_misplaced_from_retiring(broker, device, hash_config, part, &ranges);
-    if ctx.cleaving_done || ranges.iter().all(|r| r.state >= shard_state::CLEAVED) {
-        return broker.set_sharded_state();
-    }
-    Ok(false)
+    let finished = if ctx.cleaving_done || ranges.iter().all(|r| r.state >= shard_state::CLEAVED) {
+        broker.set_sharded_state()?
+    } else {
+        false
+    };
+    Ok(ProcessShardingOutcome {
+        finished,
+        replicate_errors,
+    })
+}
+
+/// Collect non-deleted shard ranges in SHRINKING state (CLI compact/repair
+/// marks these as donors for the daemon).
+pub fn find_shrinking_donors(
+    broker: &mut ContainerBroker,
+) -> Result<Vec<ShardRange>, DbError> {
+    let ranges = broker.get_shard_ranges(&GetShardRangesArgs {
+        include_own: false,
+        ..GetShardRangesArgs::default()
+    })?;
+    Ok(ranges
+        .into_iter()
+        .filter(|r| r.deleted == 0 && r.state == shard_state::SHRINKING)
+        .collect())
+}
+
+/// Daemon compact-pass stub: count SHRINKING donors so the run loop can
+/// report them. Does **not** cleave donor objects into acceptors or mark
+/// SHRUNK — that remains a multi-node KEEP residual.
+pub fn process_shrinking_donors_stub(
+    broker: &mut ContainerBroker,
+) -> Result<usize, DbError> {
+    Ok(find_shrinking_donors(broker)?.len())
 }
 
 /// Move objects left in the retiring DB that fall outside CLEAVED/ACTIVE
@@ -722,7 +906,7 @@ impl Default for SharderRunOpts {
     }
 }
 
-/// One full sweep of a device's container DBs.
+/// One full sweep of a device's container DBs (local replicator / SAIO path).
 pub fn run_once(
     device: &Path,
     hash_config: &HashPathConfig,
@@ -738,16 +922,61 @@ pub fn run_once(
     )
 }
 
-/// Sweep with full Wave 3 options (`auto_shard`, shard sizes).
+/// Sweep with full Wave 3 options (`auto_shard`, shard sizes) using
+/// [`LocalShardReplicator`] (same-device; does not break SAIO).
 pub fn run_once_with_opts(
     device: &Path,
     hash_config: &HashPathConfig,
     opts: &SharderRunOpts,
 ) -> SharderStats {
+    let mut local = LocalShardReplicator;
+    run_once_with_opts_and_replicator(device, hash_config, opts, &mut local)
+}
+
+/// Re-open a broker with account/container from `container_stat` so
+/// [`ContainerBroker::get_db_state`] can compare the own-range epoch (needed
+/// for SHARDED detection and own-range filters).
+fn broker_with_path_from_db(db: &Path) -> Result<ContainerBroker, DbError> {
+    let mut probe = ContainerBroker::new(db, "", "");
+    let info = probe.get_info()?;
+    let account = info
+        .iter()
+        .find(|(k, _)| k == "account")
+        .and_then(|(_, v)| v.as_text())
+        .unwrap_or_default();
+    let container = info
+        .iter()
+        .find(|(k, _)| k == "container")
+        .and_then(|(_, v)| v.as_text())
+        .unwrap_or_default();
+    if account.is_empty() {
+        Ok(probe)
+    } else {
+        Ok(ContainerBroker::new(db, &account, &container))
+    }
+}
+
+/// Sweep with an injectable [`ShardReplicator`] for multi-node shard create.
+///
+/// Pass [`LookupHttpShardReplicator`] (ring callback + transport) so each
+/// uncleaved range is created on its ring primaries before local cleave.
+/// Pass [`LocalShardReplicator`] for lab/SAIO.
+pub fn run_once_with_opts_and_replicator(
+    device: &Path,
+    hash_config: &HashPathConfig,
+    opts: &SharderRunOpts,
+    replicator: &mut dyn ShardReplicator,
+) -> SharderStats {
     let mut stats = SharderStats::default();
     for db in db_locations(device, "containers") {
         stats.containers_seen += 1;
-        let mut broker = ContainerBroker::new(&db, "", "");
+        let mut broker = match broker_with_path_from_db(&db) {
+            Ok(b) => b,
+            Err(_) => {
+                stats.failures += 1;
+                continue;
+            }
+        };
         let state = match broker.get_db_state() {
             Ok(s) => s,
             Err(_) => {
@@ -765,18 +994,21 @@ pub fn run_once_with_opts(
         match state {
             DbState::Sharding => {
                 stats.sharding += 1;
-                match process_sharding_container(
+                match process_sharding_container_detailed(
                     &mut broker,
                     device,
                     hash_config,
                     &part,
                     opts.cleave_batch_size,
+                    replicator,
                 ) {
-                    Ok(true) => {
+                    Ok(out) => {
                         stats.cleaved_batches += 1;
-                        stats.finished += 1;
+                        stats.replicate_errors += out.replicate_errors;
+                        if out.finished {
+                            stats.finished += 1;
+                        }
                     }
-                    Ok(false) => stats.cleaved_batches += 1,
                     Err(_) => stats.failures += 1,
                 }
             }
@@ -784,18 +1016,21 @@ pub fn run_once_with_opts(
                 match maybe_auto_shard(&mut broker, opts) {
                     Ok(true) => {
                         stats.sharding += 1;
-                        match process_sharding_container(
+                        match process_sharding_container_detailed(
                             &mut broker,
                             device,
                             hash_config,
                             &part,
                             opts.cleave_batch_size,
+                            replicator,
                         ) {
-                            Ok(true) => {
+                            Ok(out) => {
                                 stats.cleaved_batches += 1;
-                                stats.finished += 1;
+                                stats.replicate_errors += out.replicate_errors;
+                                if out.finished {
+                                    stats.finished += 1;
+                                }
                             }
-                            Ok(false) => stats.cleaved_batches += 1,
                             Err(_) => stats.failures += 1,
                         }
                     }
@@ -803,12 +1038,42 @@ pub fn run_once_with_opts(
                     Err(_) => stats.failures += 1,
                 }
             }
-            DbState::Sharded | DbState::Unsharded | DbState::Collapsed | DbState::NotFound => {
+            DbState::Sharded => {
+                // Compact residual: detect CLI-marked SHRINKING donors.
+                match process_shrinking_donors_stub(&mut broker) {
+                    Ok(n) if n > 0 => {
+                        stats.shrinking_donors += n as u64;
+                    }
+                    Ok(_) => stats.skipped += 1,
+                    Err(_) => stats.failures += 1,
+                }
+            }
+            DbState::Unsharded | DbState::Collapsed | DbState::NotFound => {
                 stats.skipped += 1;
             }
         }
     }
     stats
+}
+
+/// Convenience: ring-backed multi-node sweep (TCP PUT to primaries).
+///
+/// Equivalent to building [`lookup_replicator_for_ring`] and calling
+/// [`run_once_with_opts_and_replicator`]. When `container_ring` is `None`,
+/// falls back to local SAIO path.
+pub fn run_once_with_opts_and_ring(
+    device: &Path,
+    hash_config: &HashPathConfig,
+    opts: &SharderRunOpts,
+    container_ring: Option<&swift_ring::Ring>,
+) -> SharderStats {
+    match container_ring {
+        Some(ring) => {
+            let mut rep = lookup_replicator_for_ring(ring);
+            run_once_with_opts_and_replicator(device, hash_config, opts, &mut rep)
+        }
+        None => run_once_with_opts(device, hash_config, opts),
+    }
 }
 
 /// If object_count ≥ shard_size, find ranges + enter SHARDING. Returns true
@@ -1354,5 +1619,308 @@ mod tests {
             .replicate_shard(".shards_AUTH_test/c-epoch-0", &part)
             .is_ok());
         assert_eq!(rep.transport.calls.len(), 3);
+    }
+
+    /// Mock ring callback: different shards → different primary sets/parts.
+    #[test]
+    fn test_lookup_http_shard_replicator_per_shard_primaries() {
+        let mut map = MapShardHttpTransport::new();
+        // shard-0 → part 3, nodes a,b,c
+        for host in ["10.0.0.1", "10.0.0.2", "10.0.0.3"] {
+            map.responses
+                .insert(format!("{host}:6201/sda"), 201);
+        }
+        // shard-1 → part 9, nodes d,e,f
+        for host in ["10.0.1.1", "10.0.1.2", "10.0.1.3"] {
+            map.responses
+                .insert(format!("{host}:6201/sdb"), 201);
+        }
+
+        let mut lookup = LookupHttpShardReplicator::new(map, |account, container| {
+            assert_eq!(account, ".shards_a");
+            match container {
+                "c-0" => Ok((
+                    3u32,
+                    vec![
+                        ("10.0.0.1".into(), 6201, "sda".into()),
+                        ("10.0.0.2".into(), 6201, "sda".into()),
+                        ("10.0.0.3".into(), 6201, "sda".into()),
+                    ],
+                )),
+                "c-1" => Ok((
+                    9u32,
+                    vec![
+                        ("10.0.1.1".into(), 6201, "sdb".into()),
+                        ("10.0.1.2".into(), 6201, "sdb".into()),
+                        ("10.0.1.3".into(), 6201, "sdb".into()),
+                    ],
+                )),
+                other => Err(format!("unexpected container {other}")),
+            }
+        });
+
+        // fallback_part ignored — ring part is used
+        assert!(lookup.replicate_shard(".shards_a/c-0", "999").is_ok());
+        assert!(lookup.replicate_shard(".shards_a/c-1", "999").is_ok());
+        let calls = &lookup.transport.calls;
+        assert_eq!(calls.len(), 6);
+        assert!(calls.iter().any(|c| c.1 == "3" && c.3 == "c-0"));
+        assert!(calls.iter().any(|c| c.1 == "9" && c.3 == "c-1"));
+        // Missing primaries → error
+        let mut bad = LookupHttpShardReplicator::new(MapShardHttpTransport::new(), |_, _| {
+            Ok((1, vec![]))
+        });
+        assert!(bad.replicate_shard(".shards_a/c-x", "0").is_err());
+    }
+
+    #[test]
+    fn test_run_once_with_replicator_invokes_create_for_uncleaved() {
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharder-mn-run-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "mn";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let db = hd.join(format!("{hsh}.db"));
+        let mut source = ContainerBroker::new(&db, account, container);
+        source
+            .initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        for i in 0..6 {
+            source
+                .put_object(
+                    &format!("o{i:04}"),
+                    "1751500001.00000",
+                    1,
+                    "text/plain",
+                    "e",
+                    0,
+                    0,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        let epoch = "1751500010.00000";
+        find_and_merge_found_ranges(&mut source, account, container, 3, 1, epoch).unwrap();
+        source.enable_sharding(epoch).unwrap();
+        assert!(source.set_sharding_state().unwrap());
+        let ranges = source
+            .get_shard_ranges(&GetShardRangesArgs {
+                include_own: false,
+                ..GetShardRangesArgs::default()
+            })
+            .unwrap();
+        assert!(!ranges.is_empty());
+        drop(source);
+
+        // Recording replicator: counts ensure_shard calls, always ok.
+        struct RecordingRep {
+            names: Vec<String>,
+        }
+        impl ShardReplicator for RecordingRep {
+            fn replicate_shard(&mut self, shard_name: &str, _part: &str) -> Result<(), String> {
+                self.names.push(shard_name.to_string());
+                Ok(())
+            }
+        }
+        let mut rep = RecordingRep { names: Vec::new() };
+        let opts = SharderRunOpts {
+            cleave_batch_size: 10,
+            auto_shard: false,
+            shard_size: 1_000_000,
+            minimum_shard_size: 1,
+        };
+        let stats = run_once_with_opts_and_replicator(&device, &hash_config, &opts, &mut rep);
+        assert_eq!(stats.failures, 0, "{stats:?}");
+        assert_eq!(stats.sharding, 1);
+        assert!(stats.finished >= 1, "{stats:?}");
+        assert_eq!(stats.replicate_errors, 0);
+        // One create call per uncleaved range
+        assert_eq!(rep.names.len(), ranges.len(), "{:?}", rep.names);
+        for r in &ranges {
+            assert!(rep.names.contains(&r.name), "missing {}", r.name);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_run_once_with_lookup_replicator_mock_ring_and_errors() {
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharder-lookup-run-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "lk";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let db = hd.join(format!("{hsh}.db"));
+        let mut source = ContainerBroker::new(&db, account, container);
+        source
+            .initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        for i in 0..4 {
+            source
+                .put_object(
+                    &format!("o{i:04}"),
+                    "1751500001.00000",
+                    1,
+                    "text/plain",
+                    "e",
+                    0,
+                    0,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        let epoch = "1751500010.00000";
+        find_and_merge_found_ranges(&mut source, account, container, 2, 1, epoch).unwrap();
+        source.enable_sharding(epoch).unwrap();
+        assert!(source.set_sharding_state().unwrap());
+        drop(source);
+
+        // Only 1/3 nodes ok → quorum fail; local cleave must still finish.
+        let mut map = MapShardHttpTransport::new();
+        map.responses
+            .insert("10.9.0.1:6201/d".into(), 201);
+        let mut lookup = LookupHttpShardReplicator::new(map, |_a, _c| {
+            Ok((
+                0u32,
+                vec![
+                    ("10.9.0.1".into(), 6201, "d".into()),
+                    ("10.9.0.2".into(), 6201, "d".into()),
+                    ("10.9.0.3".into(), 6201, "d".into()),
+                ],
+            ))
+        });
+        let opts = SharderRunOpts {
+            cleave_batch_size: 10,
+            ..SharderRunOpts::default()
+        };
+        let stats =
+            run_once_with_opts_and_replicator(&device, &hash_config, &opts, &mut lookup);
+        // Local cleave still works despite remote quorum fails
+        assert_eq!(stats.failures, 0, "{stats:?}");
+        assert!(stats.finished >= 1, "{stats:?}");
+        assert!(stats.replicate_errors >= 1, "{stats:?}");
+        let mut check = ContainerBroker::new(&db, account, container);
+        assert_eq!(check.get_db_state().unwrap(), DbState::Sharded);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_ring_get_nodes_for_shard_and_run_with_ring() {
+        use swift_ring::{Ring, RingData, RingDevice};
+
+        fn dev(id: u64) -> RingDevice {
+            RingDevice {
+                id,
+                region: 1,
+                zone: 1,
+                ip: format!("10.0.0.{}", id + 1),
+                port: 6201,
+                replication_ip: None,
+                replication_port: None,
+                device: format!("sd{id}"),
+                weight: 1.0,
+                meta: String::new(),
+                extra: Default::default(),
+            }
+        }
+        let data = RingData::from_parts(
+            vec![Some(dev(0)), Some(dev(1)), Some(dev(2))],
+            32, // part_power 0 → single partition
+            vec![vec![0u32], vec![1u32], vec![2u32]],
+        );
+        let ring = Ring::new(data, HashPathConfig::new("", "changeme").unwrap());
+        let (part, nodes) =
+            ring_get_nodes_for_shard(&ring, ".shards_AUTH_test", "c-epoch-0").unwrap();
+        assert_eq!(part, 0);
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[0].0, "10.0.0.1");
+        assert_eq!(nodes[0].2, "sd0");
+
+        // run_once_with_opts_and_ring(None) == local path
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharder-ring-none-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        std::fs::create_dir_all(device.join("containers")).unwrap();
+        let stats = run_once_with_opts_and_ring(
+            &device,
+            &hash_config,
+            &SharderRunOpts::default(),
+            None,
+        );
+        assert_eq!(stats.containers_seen, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_find_shrinking_donors_and_run_once_stub() {
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharder-shrink-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "root";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let db = hd.join(format!("{hsh}.db"));
+        let mut source = ContainerBroker::new(&db, account, container);
+        source
+            .initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        let epoch = "1751500010.00000";
+        let mut donor = ShardRange::new(".shards_AUTH_test/c-d0", epoch, "", "m");
+        donor.state = shard_state::SHRINKING;
+        let mut acceptor = ShardRange::new(".shards_AUTH_test/c-a0", epoch, "m", "");
+        acceptor.state = shard_state::ACTIVE;
+        source
+            .merge_shard_ranges(vec![donor.clone(), acceptor])
+            .unwrap();
+        // SHARDING → SHARDED so run_once hits the compact stub arm.
+        source.enable_sharding(epoch).unwrap();
+        assert!(source.set_sharding_state().unwrap());
+        assert!(source.set_sharded_state().unwrap());
+        assert_eq!(source.get_db_state().unwrap(), DbState::Sharded);
+
+        let donors = find_shrinking_donors(&mut source).unwrap();
+        assert_eq!(donors.len(), 1);
+        assert_eq!(donors[0].name, donor.name);
+        assert_eq!(process_shrinking_donors_stub(&mut source).unwrap(), 1);
+        drop(source);
+
+        let stats = run_once(&device, &hash_config, 2);
+        assert_eq!(stats.shrinking_donors, 1, "{stats:?}");
+        assert_eq!(stats.failures, 0, "{stats:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

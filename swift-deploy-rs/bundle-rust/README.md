@@ -43,8 +43,21 @@ When `lb_mode: https` (workspace `ingress.http_mode=https` with haproxy/keepaliv
 1. Operator PEM: set `haproxy_tls_pem_src` to a controller-side cert+key PEM, or
 2. Lab self-signed: `haproxy_tls_self_signed: true` (default) generates CN=`auth_url_ip`.
 
-Backends stay plain HTTP to proxies. Contabo lab without a real cert: keep
-`http` for live traffic; verify https via dry-run / `haproxy -c` plan evidence.
+Backends stay plain HTTP to proxies. Contabo lab may already use self-signed on
+VIP; **production** needs an operator-trusted PEM (no secrets in git).
+
+One-shot operator install (does not auto-touch Contabo without `--ssh`):
+
+```sh
+# from monorepo root
+./tools/ops/apply-vip-tls-pem.sh --pem /secure/vip.pem --check
+./tools/ops/apply-vip-tls-pem.sh --pem /secure/vip.pem \
+  --ssh swift1,swift2,swift3,swift4 --reload   # after explicit confirmation
+./tools/ops/check-haproxy-tls-contract.sh      # static dry-run, no cluster
+```
+
+See [`tools/ops/README.md`](../../tools/ops/README.md) and
+[P3-OPS-CONTRACT.md](../../docs/fairness-lab/P3-OPS-CONTRACT.md).
 
 ## P3-ops: add-disk / add-node
 

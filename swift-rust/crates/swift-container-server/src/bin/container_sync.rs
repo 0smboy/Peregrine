@@ -216,7 +216,8 @@ fn main() {
             timeout: std::time::Duration::from_secs_f64(cfg.conn_timeout.max(0.1)),
         })
     };
-    let client = HttpSyncClient::new(object_source, cfg.conn_timeout);
+    let client =
+        HttpSyncClient::with_tls(object_source, cfg.conn_timeout, cfg.tls_options());
     let stop = swift_http::install_sigterm_flag();
 
     // Local bind identity for primary-node ordinal (Python is_local_device).

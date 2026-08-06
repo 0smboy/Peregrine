@@ -13,13 +13,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! S3 ACL / CORS XML shapes mapped onto Swift container headers.
+//! S3 ACL / CORS XML shapes mapped onto Swift container / object headers.
 //!
 //! # Claimable (this module)
 //! * Canned bucket ACLs: **private**, **public-read**, **public-read-write**
 //!   via `X-Container-Read` / `X-Container-Write` (Python `acl_utils.swift_acl_translate`).
 //! * **bucket-owner-read** / **bucket-owner-full-control** collapse to private
 //!   (same as Python when object ACLs are unavailable).
+//! * Object canned ACLs on PUT object / PUT `?acl`: **private**, **public-read**
+//!   (and **public-read-write** as stored name) via
+//!   [`S3_OBJECT_ACL_META`] (`X-Object-Sysmeta-S3-Acl`); GET object `?acl`
+//!   reconstructs AccessControlPolicy XML from that meta (default private).
 //! * Multi-rule CORSConfiguration put/get: rules stored as compact meta
 //!   (`X-Container-Meta-S3-Cors`) plus first-rule `Access-Control-*` stamps for
 //!   Swift CORS middleware interop.
@@ -28,7 +32,11 @@
 //! * **authenticated-read** / **log-delivery-write**: Python raises
 //!   `S3NotImplemented` in `swift_acl_translate` — we treat them as unsupported
 //!   (map to private on apply; no Swift ACL equivalent for AuthenticatedUsers).
-//! * Full IAM / per-object ACL / ACL XML body PUT (only `x-amz-acl` canned).
+//! * Full IAM / grant-header ACL / ACL XML body PUT (only `x-amz-acl` canned).
+//! * Python `s3_acl=true` JSON sysmeta (`X-Object-Sysmeta-S3api-Acl`) and
+//!   enforcement of object ACP on subsequent ops — we store a canned name only.
+//! * Object public-read does **not** grant anonymous Swift GET by itself
+//!   (container ACL still gates access); meta is for S3 GET `?acl` fidelity.
 //! * CORS `ExposeHeader` / `ID` fields not persisted in the compact encoding.
 
 use crate::xml::Element;
@@ -39,6 +47,12 @@ const AUTH_USERS: &str = "http://acs.amazonaws.com/groups/global/AuthenticatedUs
 
 /// Meta header holding the compact multi-rule CORS encoding.
 pub const S3_CORS_META: &str = "X-Container-Meta-S3-Cors";
+
+/// Object sysmeta holding the canned ACL name (`private` / `public-read` / …).
+///
+/// Minimal stand-in for Python `s3_acl` JSON in `X-Object-Sysmeta-S3api-Acl`.
+/// Sysmeta keeps the value off the public `x-amz-meta-*` surface.
+pub const S3_OBJECT_ACL_META: &str = "X-Object-Sysmeta-S3-Acl";
 
 // ---------------------------------------------------------------------------
 // ACL
@@ -176,6 +190,35 @@ pub fn acl_xml_from_swift_headers(
 /// Infer canned ACL XML from Swift `X-Container-Read` only (legacy helper).
 pub fn acl_xml_from_swift_read(owner_id: &str, read_acl: Option<&str>) -> Vec<u8> {
     acl_xml_from_swift_headers(owner_id, read_acl, None)
+}
+
+/// Normalize a canned ACL name for object storage.
+///
+/// Claimable: `private`, `public-read` (and empty → private).
+/// `public-read-write` is stored as-is for GET `?acl` XML fidelity.
+/// `bucket-owner-*` collapse to `private` (Python non-s3_acl best-effort).
+/// Unsupported names (`authenticated-read`, …) → `private`.
+pub fn normalize_object_canned_acl(canned: &str) -> &'static str {
+    match canned {
+        "public-read" => "public-read",
+        "public-read-write" => "public-read-write",
+        "private" | "" | "bucket-owner-read" | "bucket-owner-full-control" => "private",
+        _ => "private",
+    }
+}
+
+/// Stamp object sysmeta for a canned `x-amz-acl` (does not set container ACL).
+pub fn apply_object_canned_acl(headers: &mut HeaderKeyDict, canned: &str) {
+    headers.set(S3_OBJECT_ACL_META, normalize_object_canned_acl(canned));
+}
+
+/// Build AccessControlPolicy XML from stored object canned ACL meta.
+pub fn object_acl_xml_from_meta(owner_id: &str, canned: Option<&str>) -> Vec<u8> {
+    match normalize_object_canned_acl(canned.unwrap_or("private")) {
+        "public-read" => public_read_acl_xml(owner_id),
+        "public-read-write" => public_read_write_acl_xml(owner_id),
+        _ => private_acl_xml(owner_id),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -574,6 +617,36 @@ mod tests {
         .unwrap();
         assert!(!xml2.contains("<Permission>WRITE</Permission>"));
         assert!(xml2.contains("<Permission>READ</Permission>"));
+    }
+
+    #[test]
+    fn object_canned_acl_private_and_public_read() {
+        assert_eq!(normalize_object_canned_acl("private"), "private");
+        assert_eq!(normalize_object_canned_acl(""), "private");
+        assert_eq!(normalize_object_canned_acl("public-read"), "public-read");
+        assert_eq!(
+            normalize_object_canned_acl("bucket-owner-read"),
+            "private"
+        );
+        assert_eq!(
+            normalize_object_canned_acl("authenticated-read"),
+            "private"
+        );
+
+        let mut h = HeaderKeyDict::new();
+        apply_object_canned_acl(&mut h, "public-read");
+        assert_eq!(h.get(S3_OBJECT_ACL_META), Some("public-read"));
+        // Must not stamp container ACL headers on objects.
+        assert!(h.get("X-Container-Read").is_none());
+
+        let xml = String::from_utf8(object_acl_xml_from_meta("owner", Some("public-read"))).unwrap();
+        assert!(xml.contains(ALL_USERS));
+        assert!(xml.contains("<Permission>READ</Permission>"));
+        assert!(!xml.contains("<Permission>WRITE</Permission>"));
+
+        let priv_xml = String::from_utf8(object_acl_xml_from_meta("owner", None)).unwrap();
+        assert!(priv_xml.contains("FULL_CONTROL"));
+        assert!(!priv_xml.contains(ALL_USERS));
     }
 
     #[test]

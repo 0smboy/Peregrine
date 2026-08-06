@@ -334,6 +334,9 @@ fn rust_stack_allows_https_on_haproxy_and_emits_region_devices() {
     assert_eq!(compiled["lb_mode"], "https");
     assert_eq!(compiled["haproxy_tls_self_signed"], true);
     assert_eq!(compiled["haproxy_tls_pem"], "/etc/haproxy/haproxyCA.pem");
+    // Production path: empty default; operator sets haproxy_tls_pem_src outside git.
+    assert_eq!(compiled["haproxy_tls_pem_src"], "");
+    assert_eq!(compiled["haproxy_tls_days"], 825);
     assert_eq!(compiled["ring_expand"], false);
     assert_eq!(compiled["ring_force_rebuild"], false);
 
@@ -385,6 +388,56 @@ fn wave2_multi_region_sample_host_vars_cover_r1_and_r2() {
     assert!(r1z1.contains("region: 1"));
     assert!(r2z1.contains("region: 2") && r2z1.contains("zone: 1"), "{r2z1}");
     assert!(r2z2.contains("region: 2") && r2z2.contains("zone: 2"), "{r2z2}");
+}
+
+/// P3-ops static dry-run: HAProxy TLS template + tasks honor haproxy_tls_pem_src.
+#[test]
+fn rust_haproxy_tls_pem_src_contract_in_bundle() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bundle-rust");
+    let cfg = fs::read_to_string(root.join("roles/rust_haproxy/templates/haproxy.cfg.j2"))
+        .expect("haproxy.cfg.j2");
+    assert!(
+        cfg.contains("lb_mode == \"https\""),
+        "template must branch on lb_mode=https"
+    );
+    assert!(
+        cfg.contains("ssl crt {{ haproxy_tls_pem"),
+        "https bind must use ssl crt + haproxy_tls_pem: {cfg}"
+    );
+
+    let tasks = fs::read_to_string(root.join("roles/rust_haproxy/tasks/main.yml"))
+        .expect("rust_haproxy tasks");
+    assert!(
+        tasks.contains("haproxy_tls_pem_src"),
+        "tasks must reference operator PEM source"
+    );
+    assert!(
+        tasks.contains("install operator-provided HAProxy TLS PEM"),
+        "tasks must install operator PEM when haproxy_tls_pem_src is set"
+    );
+    assert!(
+        tasks.contains("generate self-signed HAProxy TLS material"),
+        "tasks must support lab self-signed path"
+    );
+    assert!(
+        tasks.contains("refuse https without TLS material path"),
+        "tasks must fail closed when https and no PEM path"
+    );
+    assert!(
+        tasks.contains("src: \"{{ haproxy_tls_pem_src }}\""),
+        "copy task must use haproxy_tls_pem_src as src"
+    );
+
+    let sample = fs::read_to_string(root.join("config_sample/group_vars/all")).expect("sample all");
+    assert!(sample.contains("haproxy_tls_pem_src:"));
+    assert!(sample.contains("haproxy_tls_pem:"));
+    assert!(sample.contains("haproxy_tls_self_signed:"));
+
+    let expand = fs::read_to_string(root.join("expand.yml")).expect("expand.yml");
+    assert!(
+        expand.contains("rust_haproxy"),
+        "expand playbook must re-apply rust_haproxy (TLS material stays in expand path)"
+    );
 }
 
 #[test]

@@ -47,8 +47,8 @@ Canonical long form in-repo:
 | name_check, etag_quoter, crossdomain, read_only, domain_remap, cname_lookup, backend_ratelimit | yes | yes (on-by-config) |
 | keystoneauth + authtoken (lab Keystone) | yes | yes |
 | s3api + s3token (core path) + ListParts | yes | yes |
-| container-sync filter + daemon (HTTP/HTTPS) | yes | yes (unit; multi-cluster live not claimed) |
-| encrypter / decrypter / keymaster (multi-root + listing decrypt) | yes | yes (on-by-config; KMIP residual) |
+| container-sync filter + daemon (HTTP/HTTPS + CA knobs) | yes | yes (unit; multi-cluster live not claimed) |
+| encrypter / decrypter / keymaster (multi-root, listing, range GET, etag mask) | yes | yes (on-by-config; KMIP residual) |
 | Full arbitrary / unknown Paste filter names | yes | **no** |
 
 ## S3
@@ -57,7 +57,7 @@ Canonical long form in-repo:
 |------------|:------:|:----:|
 | SigV4 CRUD, List v1/v2, MultiDelete, MPU path, ListMPU, ListParts | yes | yes (lab) |
 | s3token / EC2 → Keystone | yes | yes (lab) |
-| Canned ACL + multi-rule CORS | yes | yes (public-read-write + multi-rule) |
+| Canned ACL + multi-rule CORS + object ?acl | yes | yes |
 | SigV2, aws-chunked, versioning/tagging/lifecycle | yes | **no** (wontfix) |
 | Full IAM / object ACL XML | yes | **no** |
 
@@ -68,8 +68,10 @@ Canonical long form in-repo:
 | EC policy encode/decode, multiphase PUT, ranged GET | yes | yes (Linux `ec`) |
 | Degraded read + reconstructor heal | yes | yes (lab, after spp identity fix) |
 | Local sharder + manage-shard-ranges (incl. analyze/compact/repair) | yes | yes |
-| Multi-node container sharding KEEP (live) | yes | **no** |
+| Sharder ring HTTP primary create path | yes | yes (unit; Contabo daemon ×4 active, KEEP not claimed) |
+| Multi-node container sharding KEEP (live product) | yes | **no** |
 | container-sync daemon | yes | yes |
+| Operator VIP TLS PEM ops path | yes | yes (script); Contabo still lab self-signed |
 | object/account/container replicators, expirer, auditors, recon | yes | yes |
 
 ## Lab evidence (Contabo, 2026-08-06)

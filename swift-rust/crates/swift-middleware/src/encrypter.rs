@@ -27,14 +27,15 @@
 //! * streaming PUT footers (`swift.callback.update_footers`) — body is
 //!   materialized before encrypt so etag/crypto sysmeta can be stamped as
 //!   request headers (Python uses MIME footers after the body stream)
-//! * conditional If-Match / If-None-Match etag HMAC masking on GET/HEAD
-//!   (including multi-root-secret historic-key masking)
 //! * full `swift.crypto.override` environ path (header stamp only)
 //! * **KMIP / KMS keymasters** — still deferred (keymaster residual)
 //!
 //! Multi-root secrets: writes use the keymaster's active root secret; the
 //! resulting `key_id` (including optional `secret_id`) is stamped into
-//! body/listing crypto-meta for later decrypt.
+//! body/listing crypto-meta for later decrypt. GET/HEAD conditionals mask
+//! `If-Match` / `If-None-Match` with HMAC etags under **all** root secrets
+//! and set `X-Backend-Etag-Is-At: X-Object-Sysmeta-Crypto-Etag-Mac`
+//! (Python `_mask_conditional_etags` + `update_etag_is_at_header`).
 
 use std::sync::Arc;
 
@@ -47,7 +48,7 @@ use swift_crypto::{
     append_crypto_meta, dump_crypto_meta, encrypt, encrypt_header_value, hmac_etag, wrap_key,
     CryptoError, WrappedKey, CIPHER, IV_LENGTH, KEY_LENGTH,
 };
-use swift_http::{normalize_etag, split_path, Body, Request, Response};
+use swift_http::{normalize_etag, split_path, Body, Match, Request, Response};
 
 use crate::keymaster::KeyMaster;
 use crate::{Middleware, NextFn};
@@ -243,7 +244,9 @@ impl Middleware for Encrypter {
         match req.method.as_str() {
             "PUT" => self.handle_put(req, next, &account, &container, &object),
             "POST" => self.handle_post(req, next, &account, &container, &object),
-            // GET/HEAD: Python masks conditional etags — residual.
+            "GET" | "HEAD" => {
+                self.handle_get_or_head(req, next, &account, &container, &object)
+            }
             _ => next(req),
         }
     }
@@ -342,6 +345,83 @@ impl Encrypter {
         encrypt_user_metadata(&mut req, &object_key, &keys.id);
         next(req)
     }
+
+    /// Python `EncrypterObjContext.handle_get_or_head`: mask conditional etag
+    /// headers with HMAC values so the object server can match against
+    /// `X-Object-Sysmeta-Crypto-Etag-Mac`.
+    fn handle_get_or_head(
+        &self,
+        mut req: Request,
+        next: &NextFn,
+        account: &str,
+        container: &str,
+        object: &str,
+    ) -> Response {
+        let object_keys = self
+            .keymaster
+            .fetch_all_object_keys(account, container, object);
+        if object_keys.is_empty() {
+            return next(req);
+        }
+        let masked1 = mask_conditional_etags(&mut req, "If-Match", &object_keys);
+        let masked2 = mask_conditional_etags(&mut req, "If-None-Match", &object_keys);
+        if masked1 || masked2 {
+            update_etag_is_at_header(&mut req, ETAG_MAC_HEADER);
+        }
+        next(req)
+    }
+}
+
+/// Python `_mask_conditional_etags`: keep the original etag tags (unencrypted
+/// objects still match) and append HMAC(object_key, etag) for every root
+/// secret. Returns true when any masking was applied.
+pub fn mask_conditional_etags(
+    req: &mut Request,
+    header_name: &str,
+    object_keys: &[[u8; KEY_LENGTH]],
+) -> bool {
+    let Some(old) = req.headers.get(header_name).map(|s| s.to_string()) else {
+        return false;
+    };
+    if old.is_empty() {
+        return false;
+    }
+    let tags = Match::parse(&old).tags;
+    if tags.is_empty() {
+        return false;
+    }
+    let mut new_etags: Vec<String> = Vec::new();
+    let mut masked = false;
+    for etag in tags {
+        if etag == "*" {
+            new_etags.push(etag);
+            continue;
+        }
+        new_etags.push(format!("\"{etag}\""));
+        for key in object_keys {
+            let mac = hmac_etag(key, &etag);
+            new_etags.push(format!("\"{mac}\""));
+        }
+        masked = true;
+    }
+    if masked {
+        req.headers.set(header_name, new_etags.join(", "));
+    }
+    masked
+}
+
+/// Python `update_etag_is_at_header` / `csv_append`.
+fn update_etag_is_at_header(req: &mut Request, name: &str) {
+    let existing = req
+        .headers
+        .get("X-Backend-Etag-Is-At")
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let value = match existing {
+        Some(e) => format!("{e},{name}"),
+        None => name.to_string(),
+    };
+    req.headers.set("X-Backend-Etag-Is-At", value);
 }
 
 fn encrypt_user_metadata(
@@ -567,12 +647,13 @@ mod tests {
             headers: HeaderKeyDict::new(),
             body: Body::empty(),
         };
-        let get_resp = pipeline(get);
+        let mut get_resp = pipeline(get);
         assert_eq!(get_resp.status, 200);
-        let got = match get_resp.body {
-            Body::Buffered(b) => b,
-            _ => panic!("expected buffered body"),
-        };
+        let got = get_resp
+            .body
+            .materialize(MAX_FILE_SIZE as u64)
+            .expect("materialize get body")
+            .to_vec();
         assert_eq!(got, plaintext);
         assert_eq!(
             get_resp.headers.get("Etag").map(normalize_etag),
@@ -609,5 +690,98 @@ mod tests {
         };
         let resp = enc.handle(req, &app);
         assert_eq!(resp.status, 201);
+    }
+
+    #[test]
+    fn mask_conditional_etags_appends_hmac_all_secrets() {
+        let root_a = unhex(
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        );
+        let root_b = vec![0xffu8; 32];
+        let items = vec![
+            (
+                "encryption_root_secret".into(),
+                B64.encode(&root_a),
+            ),
+            (
+                "encryption_root_secret_old".into(),
+                B64.encode(&root_b),
+            ),
+        ];
+        let km = Arc::new(KeyMaster::from_conf_items(&items).unwrap());
+        let keys = km.fetch_all_object_keys("a", "c", "o");
+        assert_eq!(keys.len(), 2);
+
+        let plaintext_etag = "d41d8cd98f00b204e9800998ecf8427e";
+        let mut req = Request {
+            method: "GET".into(),
+            path: "/v1/a/c/o".into(),
+            query_string: String::new(),
+            headers: {
+                let mut h = HeaderKeyDict::new();
+                h.set("If-None-Match", format!("\"{plaintext_etag}\""));
+                h
+            },
+            body: Body::empty(),
+        };
+        assert!(mask_conditional_etags(
+            &mut req,
+            "If-None-Match",
+            &keys
+        ));
+        let val = req.headers.get("If-None-Match").unwrap();
+        // Original plaintext etag preserved (unencrypted objects).
+        assert!(val.contains(plaintext_etag), "{val}");
+        for k in &keys {
+            let mac = hmac_etag(k, plaintext_etag);
+            assert!(val.contains(&mac), "missing hmac {mac} in {val}");
+        }
+        // Wildcard alone is not "masked" into HMACs.
+        let mut star = Request {
+            method: "GET".into(),
+            path: "/v1/a/c/o".into(),
+            query_string: String::new(),
+            headers: {
+                let mut h = HeaderKeyDict::new();
+                h.set("If-Match", "*");
+                h
+            },
+            body: Body::empty(),
+        };
+        assert!(!mask_conditional_etags(&mut star, "If-Match", &keys));
+        assert_eq!(star.headers.get("If-Match"), Some("*"));
+    }
+
+    #[test]
+    fn middleware_get_masks_and_sets_etag_is_at() {
+        let km = root_km();
+        let enc = Encrypter::new(Arc::clone(&km), false);
+        let plaintext_etag = "abc123deadbeef";
+        let expected_mac = {
+            let keys = km.fetch_keys("a", Some("c"), Some("o"));
+            hmac_etag(&keys.object.unwrap(), plaintext_etag)
+        };
+        let app: NextFn = Arc::new(move |req: Request| {
+            let inm = req.headers.get("If-None-Match").unwrap_or("").to_string();
+            assert!(inm.contains(plaintext_etag), "{inm}");
+            assert!(inm.contains(&expected_mac), "{inm}");
+            assert_eq!(
+                req.headers.get("X-Backend-Etag-Is-At"),
+                Some(ETAG_MAC_HEADER)
+            );
+            Response::new(200)
+        });
+        let req = Request {
+            method: "GET".into(),
+            path: "/v1/a/c/o".into(),
+            query_string: String::new(),
+            headers: {
+                let mut h = HeaderKeyDict::new();
+                h.set("If-None-Match", format!("\"{plaintext_etag}\""));
+                h
+            },
+            body: Body::empty(),
+        };
+        assert_eq!(enc.handle(req, &app).status, 200);
     }
 }

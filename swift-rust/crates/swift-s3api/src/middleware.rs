@@ -30,7 +30,8 @@
 //!
 //! # Residuals
 //!
-//! SigV2, aws-chunked, full IAM/object ACL, versioning/tagging/lifecycle
+//! SigV2, aws-chunked, full IAM / grant-header object ACL (canned
+//! private/public-read stored as sysmeta is claimable), versioning/tagging/lifecycle
 //! (written WONTFIX for production stop-line unless reopened), clock-skew
 //! on every path, advertising `s3api` on Swift `GET /info`. Multipart
 //! includes ListMultipartUploads via `{bucket}+segments` upload markers.
@@ -47,9 +48,9 @@ use swift_http::{Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
 use swift_middleware::{Middleware, NextFn, S3TokenClient, S3TokenResult};
 
 use crate::acl_cors::{
-    acl_xml_from_swift_headers, acl_xml_from_swift_read, apply_canned_acl,
+    acl_xml_from_swift_headers, apply_canned_acl, apply_object_canned_acl,
     clear_cors_swift_headers, cors_config_to_swift_headers, cors_xml_from_swift_headers,
-    parse_cors_configuration, xml_ok,
+    object_acl_xml_from_meta, parse_cors_configuration, xml_ok, S3_OBJECT_ACL_META,
 };
 use crate::delete::parse_multi_delete_body;
 use crate::mpu::{
@@ -849,7 +850,12 @@ impl Middleware for S3Api {
         map_amz_meta(&mut swift_req);
         apply_copy_source(&mut swift_req);
         if let Some(canned) = swift_req.headers.get("X-Amz-Acl").map(str::to_string) {
-            apply_canned_acl(&mut swift_req.headers, &canned);
+            if key.is_some() {
+                // Object PUT: store canned ACL as object sysmeta (not container ACL).
+                apply_object_canned_acl(&mut swift_req.headers, &canned);
+            } else {
+                apply_canned_acl(&mut swift_req.headers, &canned);
+            }
         }
         strip_s3_only_headers(&mut swift_req.headers);
         stamp_auth(&mut swift_req, &cred);
@@ -968,49 +974,81 @@ fn handle_acl(
     key: Option<&str>,
     next: &NextFn,
 ) -> Response {
-    if key.is_some() {
-        // Object ACL: return private owner ACL (Swift has no per-object ACL).
-        if req.method == "GET" || req.method == "HEAD" {
-            return xml_ok(acl_xml_from_swift_read(&owner.id, None));
-        }
-        if req.method == "PUT" {
-            return Response::new(200);
-        }
-        return s3_error_response("MethodNotAllowed", None, &[]);
-    }
-    match req.method.as_str() {
-        "GET" | "HEAD" => {
-            let mut head =
-                make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
-            stamp_auth(&mut head, cred);
-            let resp = next(head);
-            if !(200..300).contains(&resp.status) {
-                return map_swift_error(resp.status, Some(bucket), None);
+    if let Some(obj) = key {
+        // Object ACL: canned name in X-Object-Sysmeta-S3-Acl.
+        match req.method.as_str() {
+            "GET" | "HEAD" => {
+                let mut head = make_swift_req(
+                    "HEAD",
+                    &s3_to_swift_path(&cred.account, Some(bucket), Some(obj)),
+                );
+                stamp_auth(&mut head, cred);
+                let resp = next(head);
+                if !(200..300).contains(&resp.status) {
+                    return map_swift_error(resp.status, Some(bucket), Some(obj));
+                }
+                let canned = resp
+                    .headers
+                    .get(S3_OBJECT_ACL_META)
+                    .or_else(|| resp.headers.get("X-Object-Meta-S3-Acl"));
+                xml_ok(object_acl_xml_from_meta(&owner.id, canned))
             }
-            xml_ok(acl_xml_from_swift_headers(
-                &owner.id,
-                resp.headers.get("X-Container-Read"),
-                resp.headers.get("X-Container-Write"),
-            ))
-        }
-        "PUT" => {
-            let canned = req
-                .headers
-                .get("X-Amz-Acl")
-                .unwrap_or("private")
-                .to_string();
-            let mut post =
-                make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
-            apply_canned_acl(&mut post.headers, &canned);
-            stamp_auth(&mut post, cred);
-            let resp = next(post);
-            if (200..300).contains(&resp.status) {
-                Response::new(200)
-            } else {
-                map_swift_error(resp.status, Some(bucket), None)
+            "PUT" => {
+                let canned = req
+                    .headers
+                    .get("X-Amz-Acl")
+                    .unwrap_or("private")
+                    .to_string();
+                let mut post = make_swift_req(
+                    "POST",
+                    &s3_to_swift_path(&cred.account, Some(bucket), Some(obj)),
+                );
+                apply_object_canned_acl(&mut post.headers, &canned);
+                stamp_auth(&mut post, cred);
+                let resp = next(post);
+                if (200..300).contains(&resp.status) {
+                    Response::new(200)
+                } else {
+                    map_swift_error(resp.status, Some(bucket), Some(obj))
+                }
             }
+            _ => s3_error_response("MethodNotAllowed", None, &[]),
         }
-        _ => s3_error_response("MethodNotAllowed", None, &[]),
+    } else {
+        match req.method.as_str() {
+            "GET" | "HEAD" => {
+                let mut head =
+                    make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+                stamp_auth(&mut head, cred);
+                let resp = next(head);
+                if !(200..300).contains(&resp.status) {
+                    return map_swift_error(resp.status, Some(bucket), None);
+                }
+                xml_ok(acl_xml_from_swift_headers(
+                    &owner.id,
+                    resp.headers.get("X-Container-Read"),
+                    resp.headers.get("X-Container-Write"),
+                ))
+            }
+            "PUT" => {
+                let canned = req
+                    .headers
+                    .get("X-Amz-Acl")
+                    .unwrap_or("private")
+                    .to_string();
+                let mut post =
+                    make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
+                apply_canned_acl(&mut post.headers, &canned);
+                stamp_auth(&mut post, cred);
+                let resp = next(post);
+                if (200..300).contains(&resp.status) {
+                    Response::new(200)
+                } else {
+                    map_swift_error(resp.status, Some(bucket), None)
+                }
+            }
+            _ => s3_error_response("MethodNotAllowed", None, &[]),
+        }
     }
 }
 
@@ -2037,6 +2075,79 @@ mod tests {
             );
             assert_eq!(r.headers.get("X-Container-Write"), Some(".r:*"));
             Response::new(204)
+        });
+        assert_eq!(api.handle(req, &next).status, 200);
+    }
+
+    #[test]
+    fn put_object_stores_canned_acl_sysmeta() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket/obj1", "");
+        req.headers.set("x-amz-acl", "public-read");
+        req.headers
+            .set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.body = Body::from(b"hi".to_vec());
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.method, "PUT");
+            assert_eq!(r.path, "/v1/AUTH_test/mybucket/obj1");
+            assert_eq!(
+                r.headers.get(S3_OBJECT_ACL_META),
+                Some("public-read")
+            );
+            // Object path must not stamp container ACL headers.
+            assert!(r.headers.get("X-Container-Read").is_none());
+            let mut resp = Response::new(201);
+            resp.headers.set("Etag", "\"abc\"");
+            resp
+        });
+        assert_eq!(api.handle(req, &next).status, 200);
+    }
+
+    #[test]
+    fn get_object_acl_from_sysmeta() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/mybucket/obj1", "acl"), "testing");
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.method, "HEAD");
+            assert_eq!(r.path, "/v1/AUTH_test/mybucket/obj1");
+            let mut resp = Response::new(200);
+            resp.headers.set(S3_OBJECT_ACL_META, "public-read");
+            resp
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("AccessControlPolicy"));
+        assert!(body.contains("AllUsers"));
+        assert!(body.contains("<Permission>READ</Permission>"));
+    }
+
+    #[test]
+    fn get_object_acl_defaults_private_when_no_meta() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/mybucket/obj1", "acl"), "testing");
+        let next: NextFn = Arc::new(|_| Response::new(200));
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("FULL_CONTROL"));
+        assert!(!body.contains("AllUsers"));
+    }
+
+    #[test]
+    fn put_object_acl_posts_sysmeta() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket/obj1", "acl");
+        req.headers.set("x-amz-acl", "private");
+        req.headers
+            .set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.method, "POST");
+            assert_eq!(r.path, "/v1/AUTH_test/mybucket/obj1");
+            assert_eq!(r.headers.get(S3_OBJECT_ACL_META), Some("private"));
+            Response::new(202)
         });
         assert_eq!(api.handle(req, &next).status, 200);
     }

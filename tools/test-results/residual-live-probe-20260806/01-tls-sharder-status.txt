@@ -1,0 +1,32 @@
+=== hostname / date ===
+swift1
+Thu Aug  6 10:53:46 AM UTC 2026
+=== TLS PEM ===
+-rw-------. 1 root root 2933 Aug  5 09:51 /etc/haproxy/haproxyCA.pem
+subject=CN=10.0.0.10, O=Contabo-LAB, OU=Peregrine
+issuer=CN=10.0.0.10, O=Contabo-LAB, OU=Peregrine
+notBefore=Aug  5 09:51:47 2026 GMT
+notAfter=Nov  7 09:51:47 2028 GMT
+=== haproxy frontends ===
+frontend swift_proxy_front
+=== sharder units all nodes ===
+--- 169.58.108.85 ---
+active
+inactive
+/usr/local/bin/swift-manage-shard-ranges
+/usr/local/bin/swift-container-sharder
+--- 169.58.108.86 ---
+active
+inactive
+/usr/local/bin/swift-manage-shard-ranges
+/usr/local/bin/swift-container-sharder
+--- 169.58.108.87 ---
+active
+inactive
+/usr/local/bin/swift-manage-shard-ranges
+/usr/local/bin/swift-container-sharder
+--- 169.58.108.121 ---
+active
+inactive
+/usr/local/bin/swift-manage-shard-ranges
+/usr/local/bin/swift-container-sharder

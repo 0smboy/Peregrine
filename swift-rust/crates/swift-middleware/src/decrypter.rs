@@ -20,21 +20,27 @@
 //! Scope implemented:
 //! * object `GET`/`HEAD` — unwrap body key from
 //!   `X-Object-Sysmeta-Crypto-Body-Meta`, decrypt body (with Content-Range
-//!   offset), restore plaintext `Etag` from `X-Object-Sysmeta-Crypto-Etag`,
-//!   restore user meta from `X-Object-Transient-Sysmeta-Crypto-Meta-*`,
-//!   purge crypto sysmeta from the client response; resolves multi-root
-//!   secrets via crypto-meta `key_id.secret_id`
+//!   offset **and** `multipart/byteranges` multi-range 206 bodies), restore
+//!   plaintext `Etag` from `X-Object-Sysmeta-Crypto-Etag`, restore user meta
+//!   from `X-Object-Transient-Sysmeta-Crypto-Meta-*`, purge crypto sysmeta
+//!   from the client response; resolves multi-root secrets via crypto-meta
+//!   `key_id.secret_id`
 //! * container `GET` JSON listings — decrypt each object's `hash` when it
 //!   carries `; swift_meta=...` (Python `DecrypterContContext`); unknown
 //!   secret → `"<unknown>"`
+//! * single-range / full-object GET decrypt streams via
+//!   [`create_decryption_ctxt`] + a transforming reader (no whole-body
+//!   materialize when the response is already a stream)
 //!
 //! Residuals (honest):
-//! * multipart/byteranges ranged GET decryption
 //! * CORS `Access-Control-Expose-Headers` rewrite for decrypted meta
-//! * streaming body decrypt without materialize (GET body is decrypted in
-//!   one shot after materialize up to max file size)
+//! * multipart/byteranges decrypt still materializes the MIME envelope once
+//!   (part bodies are decrypted at their Content-Range offsets; streaming
+//!   multipart reassembly is not wired)
+//! * container listing JSON still materializes (parse-bound)
 //! * **KMIP / KMS keymasters** — still deferred (keymaster residual)
 
+use std::io::Read;
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -42,10 +48,12 @@ use base64::Engine;
 use swift_core::config::config_true_value;
 use swift_core::constraints::{MAX_FILE_SIZE, VALID_API_VERSIONS};
 use swift_crypto::{
-    decrypt, decrypt_header_value, extract_crypto_meta, load_crypto_meta, unwrap_key, CryptoError,
-    WrappedKey, CIPHER, IV_LENGTH, KEY_LENGTH,
+    create_decryption_ctxt, decrypt, decrypt_header_value, extract_crypto_meta, load_crypto_meta,
+    unwrap_key, CryptoCtxt, CryptoError, WrappedKey, CIPHER, IV_LENGTH, KEY_LENGTH,
 };
-use swift_http::{split_path, Body, Request, Response};
+use swift_http::{
+    content_range_header_value, split_path, Body, MimeDocs, Request, Response, STREAM_CHUNK,
+};
 
 use crate::encrypter::{BODY_META_HEADER, ETAG_HEADER, ETAG_MAC_HEADER, OVERRIDE_ETAG_HEADER};
 use crate::keymaster::KeyMaster;
@@ -69,6 +77,144 @@ pub fn decrypt_object_body(
     let body_key = unwrap_body_key(object_key, &meta)?;
     let iv = meta_iv(&meta)?;
     decrypt(&body_key, &iv, offset, ciphertext).map_err(|e| e.to_string())
+}
+
+/// Decrypt a `multipart/byteranges` 206 body (Python
+/// `DecrypterObjContext.multipart_response_iter`).
+///
+/// Each part's `Content-Range` supplies the CTR offset; part headers are
+/// preserved and the MIME framing is rebuilt byte-compatible with
+/// [`multipart_byteranges`].
+pub fn decrypt_multipart_byteranges(
+    object_key: &[u8; KEY_LENGTH],
+    body_meta_header: &str,
+    boundary: &str,
+    ciphertext_multipart: &[u8],
+) -> Result<Vec<u8>, String> {
+    let meta = load_crypto_meta(body_meta_header)?;
+    check_crypto_meta(&meta)?;
+    let body_key = unwrap_body_key(object_key, &meta)?;
+    let iv = meta_iv(&meta)?;
+
+    let mut docs = MimeDocs::new(
+        Box::new(std::io::Cursor::new(ciphertext_multipart.to_vec())),
+        boundary.as_bytes(),
+    );
+    // Re-frame each part after offset-aware CTR decrypt (Python
+    // multipart_response_iter streams framing; we rebuild the envelope).
+    let mut out = Vec::new();
+    loop {
+        let headers = match docs.next_document() {
+            Ok(Some(h)) => h,
+            Ok(None) => break,
+            Err(e) => return Err(format!("multipart parse: {e}")),
+        };
+        let mut content_type = "application/octet-stream".to_string();
+        let mut content_range: Option<String> = None;
+        for (k, v) in &headers {
+            if k.eq_ignore_ascii_case("Content-Type") {
+                content_type = v.clone();
+            } else if k.eq_ignore_ascii_case("Content-Range") {
+                content_range = Some(v.clone());
+            }
+        }
+        let (first, last, total) = match content_range
+            .as_deref()
+            .and_then(parse_content_range)
+        {
+            Some(t) => t,
+            None => {
+                return Err("multipart part missing Content-Range".into());
+            }
+        };
+        let mut part_ct = Vec::new();
+        let mut buf = [0u8; STREAM_CHUNK];
+        loop {
+            let n = docs
+                .read(&mut buf)
+                .map_err(|e| format!("multipart part read: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            part_ct.extend_from_slice(&buf[..n]);
+        }
+        let pt = decrypt(&body_key, &iv, first, &part_ct).map_err(|e| e.to_string())?;
+
+        out.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        out.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
+        out.extend_from_slice(
+            format!(
+                "Content-Range: {}\r\n\r\n",
+                content_range_header_value(first, last + 1, total)
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(&pt);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(format!("--{boundary}--").as_bytes());
+    Ok(out)
+}
+
+/// Parse `Content-Range: bytes START-END/TOTAL` → `(first, last, total)`.
+/// `TOTAL` may be `*` (treated as 0 when unknown).
+pub fn parse_content_range(header: &str) -> Option<(u64, u64, u64)> {
+    let v = header.trim();
+    let rest = v
+        .strip_prefix("bytes ")
+        .or_else(|| v.strip_prefix("bytes"))
+        .unwrap_or(v)
+        .trim();
+    let (range, total_s) = rest.split_once('/')?;
+    let (start_s, end_s) = range.split_once('-')?;
+    let first: u64 = start_s.trim().parse().ok()?;
+    let last: u64 = end_s.trim().parse().ok()?;
+    let total = if total_s.trim() == "*" {
+        0
+    } else {
+        total_s.trim().parse().ok()?
+    };
+    Some((first, last, total))
+}
+
+/// Extract `boundary=` from a `multipart/byteranges; boundary=...` Content-Type.
+pub fn multipart_boundary_from_content_type(content_type: &str) -> Option<String> {
+    // Content-Type may be `multipart/byteranges;boundary=X` or with spaces /
+    // quoted boundary.
+    let mut parts = content_type.split(';');
+    let base = parts.next()?.trim();
+    if !base.eq_ignore_ascii_case("multipart/byteranges") {
+        return None;
+    }
+    for part in parts {
+        let part = part.trim();
+        let lower = part.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("boundary=") {
+            let v = part[part.len() - rest.len()..]
+                .trim()
+                .trim_matches('"');
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Streaming AES-CTR decrypt reader (CTR is length-preserving).
+struct DecryptingReader {
+    inner: Box<dyn Read + Send>,
+    ctxt: CryptoCtxt,
+}
+
+impl Read for DecryptingReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.ctxt.update_in_place(&mut buf[..n]);
+        }
+        Ok(n)
+    }
 }
 
 /// Decrypt a container-listing object `hash` value that may carry crypto-meta
@@ -267,19 +413,8 @@ impl Decrypter {
         // Decrypt body on successful GET with body crypto-meta.
         if method == "GET" && (200..300).contains(&resp.status) {
             if let Some(meta_hdr) = body_meta {
-                let offset = content_range_offset(resp.headers.get("Content-Range"));
-                let ciphertext = match materialize_body(&mut resp) {
-                    Ok(b) => b,
-                    Err(_) => return Response::error(500, "Error decrypting object"),
-                };
-                match decrypt_object_body(&object_key, &meta_hdr, offset, &ciphertext) {
-                    Ok(pt) => {
-                        resp.headers.set("Content-Length", pt.len());
-                        resp.body = Body::from(pt);
-                    }
-                    Err(_) => {
-                        return Response::error(500, "Error decrypting object");
-                    }
+                if let Err(msg) = decrypt_response_body(&mut resp, &object_key, &meta_hdr) {
+                    return Response::error(500, msg);
                 }
             }
         }
@@ -455,18 +590,66 @@ fn purge_crypto_sysmeta(resp: &mut Response) {
 }
 
 fn content_range_offset(header: Option<&str>) -> u64 {
-    // Content-Range: bytes START-END/TOTAL
-    let Some(v) = header else {
-        return 0;
-    };
-    let v = v.trim();
-    let rest = v
-        .strip_prefix("bytes ")
-        .or_else(|| v.strip_prefix("bytes"))
-        .unwrap_or(v)
-        .trim();
-    let start = rest.split('-').next().unwrap_or("0");
-    start.parse().unwrap_or(0)
+    header
+        .and_then(parse_content_range)
+        .map(|(first, _, _)| first)
+        .unwrap_or(0)
+}
+
+/// Decrypt the response body in place: multipart/byteranges (materialize +
+/// reframe) or single-range/full GET (streaming decrypt reader).
+fn decrypt_response_body(
+    resp: &mut Response,
+    object_key: &[u8; KEY_LENGTH],
+    body_meta_header: &str,
+) -> Result<(), &'static str> {
+    let content_type = resp
+        .headers
+        .get("Content-Type")
+        .or_else(|| resp.headers.get("content-type"))
+        .unwrap_or("")
+        .to_string();
+
+    if resp.status == 206 {
+        if let Some(boundary) = multipart_boundary_from_content_type(&content_type) {
+            let ciphertext = materialize_body(resp).map_err(|_| "Error decrypting object")?;
+            let pt = decrypt_multipart_byteranges(
+                object_key,
+                body_meta_header,
+                &boundary,
+                &ciphertext,
+            )
+            .map_err(|_| "Error decrypting object")?;
+            resp.headers.set("Content-Length", pt.len());
+            resp.body = Body::from(pt);
+            return Ok(());
+        }
+    }
+
+    let offset = content_range_offset(resp.headers.get("Content-Range"));
+    let meta = load_crypto_meta(body_meta_header).map_err(|_| "Error decrypting object")?;
+    check_crypto_meta(&meta).map_err(|_| "Error decrypting object")?;
+    let body_key = unwrap_body_key(object_key, &meta).map_err(|_| "Error decrypting object")?;
+    let iv = meta_iv(&meta).map_err(|_| "Error decrypting object")?;
+    let ctxt =
+        create_decryption_ctxt(&body_key, &iv, offset).map_err(|_| "Error decrypting object")?;
+
+    // Prefer streaming transform: CTR is length-preserving so Content-Length
+    // stays valid. Buffered bodies still go through the reader path (cheap).
+    let taken = resp.body.take();
+    let len = taken.content_length();
+    let (reader, _) = taken.into_reader();
+    resp.body = Body::from_reader(
+        Box::new(DecryptingReader {
+            inner: reader,
+            ctxt,
+        }),
+        len,
+    );
+    if let Some(l) = len {
+        resp.headers.set("Content-Length", l);
+    }
+    Ok(())
 }
 
 fn materialize_body(resp: &mut Response) -> Result<Vec<u8>, u16> {
@@ -631,12 +814,175 @@ mod tests {
             headers: HeaderKeyDict::new(),
             body: Body::empty(),
         };
-        let resp = decrypter.handle(req, &app);
+        let mut resp = decrypter.handle(req, &app);
         assert_eq!(resp.status, 200);
-        let got = match resp.body {
-            Body::Buffered(b) => b,
-            _ => panic!("buffered"),
-        };
+        let got = resp
+            .body
+            .materialize(MAX_FILE_SIZE as u64)
+            .expect("materialize")
+            .to_vec();
         assert_eq!(got, pt);
+    }
+
+    #[test]
+    fn multipart_byteranges_decrypt_two_ranges() {
+        use swift_http::multipart_byteranges;
+
+        let root = unhex(
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        );
+        let km = KeyMaster::new(root).unwrap();
+        let keys = km.fetch_keys("a", Some("c"), Some("o"));
+        let ok = keys.object.unwrap();
+        let ck = keys.container.unwrap();
+        let pt = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        let mut body_iv = [0u8; IV_LENGTH];
+        body_iv[15] = 7;
+        let body_key = [0xcdu8; KEY_LENGTH];
+        let enc = encrypt_object_body(
+            &ok,
+            &ck,
+            &keys.id,
+            pt,
+            body_iv,
+            body_key,
+            [2u8; IV_LENGTH],
+            [3u8; IV_LENGTH],
+        )
+        .unwrap();
+
+        // Two ranges: bytes 0-2 and 10-14 (exclusive stops 3 and 15).
+        let ranges = [(0u64, 3u64), (10u64, 15u64)];
+        let multi = multipart_byteranges(
+            "BOUND42",
+            &ranges,
+            &enc.ciphertext,
+            "application/octet-stream",
+            pt.len() as u64,
+        );
+        let got = decrypt_multipart_byteranges(
+            &ok,
+            &enc.body_meta_header,
+            "BOUND42",
+            &multi,
+        )
+        .unwrap();
+        let expected = multipart_byteranges(
+            "BOUND42",
+            &ranges,
+            pt,
+            "application/octet-stream",
+            pt.len() as u64,
+        );
+        assert_eq!(got, expected);
+
+        // Also through middleware 206 path.
+        use std::sync::Arc;
+        use swift_http::HeaderKeyDict;
+        let decrypter = Decrypter::new(Arc::new(km));
+        let meta = enc.body_meta_header.clone();
+        let ct_etag = enc.ciphertext_etag.clone();
+        let crypto_etag = enc.crypto_etag_header.clone();
+        let app: NextFn = Arc::new(move |_req: Request| {
+            let mut resp = Response::with_body(206, multi.clone());
+            resp.headers.set(BODY_META_HEADER, &meta);
+            resp.headers.set(ETAG_HEADER, &crypto_etag);
+            resp.headers.set("Etag", &ct_etag);
+            resp.headers.set(
+                "Content-Type",
+                "multipart/byteranges;boundary=BOUND42",
+            );
+            resp
+        });
+        let req = Request {
+            method: "GET".into(),
+            path: "/v1/a/c/o".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let mut resp = decrypter.handle(req, &app);
+        assert_eq!(resp.status, 206);
+        let body = resp
+            .body
+            .materialize(MAX_FILE_SIZE as u64)
+            .unwrap()
+            .to_vec();
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn single_range_content_range_decrypt_via_middleware() {
+        use std::sync::Arc;
+        use swift_http::{content_range_header_value, HeaderKeyDict};
+
+        let root = unhex(
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        );
+        let km = KeyMaster::new(root).unwrap();
+        let keys = km.fetch_keys("a", Some("c"), Some("o"));
+        let ok = keys.object.unwrap();
+        let ck = keys.container.unwrap();
+        let pt = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        let enc = encrypt_object_body(
+            &ok,
+            &ck,
+            &keys.id,
+            pt,
+            [9u8; IV_LENGTH],
+            [8u8; KEY_LENGTH],
+            [7u8; IV_LENGTH],
+            [6u8; IV_LENGTH],
+        )
+        .unwrap();
+        let start = 5u64;
+        let stop = 20u64;
+        let slice = enc.ciphertext[start as usize..stop as usize].to_vec();
+        let decrypter = Decrypter::new(Arc::new(km));
+        let meta = enc.body_meta_header.clone();
+        let app: NextFn = Arc::new(move |_req: Request| {
+            let mut resp = Response::with_body(206, slice.clone());
+            resp.headers.set(BODY_META_HEADER, &meta);
+            resp.headers.set(
+                "Content-Range",
+                content_range_header_value(start, stop, pt.len() as u64),
+            );
+            resp.headers.set("Content-Type", "application/octet-stream");
+            resp
+        });
+        let req = Request {
+            method: "GET".into(),
+            path: "/v1/a/c/o".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let mut resp = decrypter.handle(req, &app);
+        assert_eq!(resp.status, 206);
+        let got = resp.body.materialize(MAX_FILE_SIZE as u64).unwrap().to_vec();
+        assert_eq!(got, pt[start as usize..stop as usize]);
+    }
+
+    #[test]
+    fn parse_content_range_and_boundary() {
+        assert_eq!(
+            parse_content_range("bytes 0-2/10"),
+            Some((0, 2, 10))
+        );
+        assert_eq!(
+            parse_content_range("bytes 5-99/*"),
+            Some((5, 99, 0))
+        );
+        assert_eq!(
+            multipart_boundary_from_content_type("multipart/byteranges;boundary=BOUND"),
+            Some("BOUND".into())
+        );
+        assert_eq!(
+            multipart_boundary_from_content_type(
+                "multipart/byteranges; boundary=\"xyz\""
+            ),
+            Some("xyz".into())
+        );
+        assert!(multipart_boundary_from_content_type("text/plain").is_none());
     }
 }

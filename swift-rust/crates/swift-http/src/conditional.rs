@@ -21,6 +21,28 @@ use crate::dates::parse_http_date;
 use crate::range::Match;
 use crate::request::{Request, Response};
 
+/// Resolve an alternate etag for conditional matching from
+/// `X-Backend-Etag-Is-At` (Python `resolve_etag_is_at_header`).
+///
+/// The request header is a comma-separated list of response/metadata header
+/// names; the first present non-empty value wins. Used by crypto encrypter
+/// (`X-Object-Sysmeta-Crypto-Etag-Mac`) and EC (`X-Object-Sysmeta-Ec-Etag`).
+pub fn resolve_etag_is_at<'a>(req: &Request, resp: &'a Response) -> Option<&'a str> {
+    let names = req.headers.get("X-Backend-Etag-Is-At")?;
+    for name in names.split(',') {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if let Some(v) = resp.headers.get(name) {
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 /// `_get_conditional_response_status`: given a request and an otherwise-2xx
 /// response, return `Some(304)` or `Some(412)` if the request's preconditions
 /// mean an empty conditional response should be sent, else `None`.
@@ -31,8 +53,12 @@ use crate::request::{Request, Response};
 /// 3. a 404 with `If-Match: *` -> 412.
 /// 4. `Last-Modified <= If-Modified-Since` -> 304.
 /// 5. `Last-Modified > If-Unmodified-Since` -> 412.
+///
+/// When `X-Backend-Etag-Is-At` resolves to a sysmeta value (e.g. crypto
+/// Etag-Mac), that value is used for Match comparison instead of `ETag`
+/// (Python `conditional_etag=`).
 pub fn conditional_response_status(req: &Request, resp: &Response) -> Option<u16> {
-    let etag = resp.headers.get("ETag");
+    let etag = resolve_etag_is_at(req, resp).or_else(|| resp.headers.get("ETag"));
     let if_none_match = req.headers.get("If-None-Match").map(Match::parse);
     let if_match = req.headers.get("If-Match").map(Match::parse);
 
@@ -168,5 +194,27 @@ mod tests {
         let out = apply_conditional(&r, resp);
         assert_eq!(out.status, 304);
         assert!(out.body.is_definitely_empty());
+    }
+
+    #[test]
+    fn test_etag_is_at_overrides_response_etag() {
+        // Crypto path: If-None-Match carries HMAC(plaintext etag); object
+        // ETag is ciphertext md5. X-Backend-Etag-Is-At points at Etag-Mac.
+        let mac = "dGVzdC1obWFjLXZhbHVl"; // any opaque token
+        let r = req(&[
+            ("If-None-Match", &format!("\"{mac}\"")),
+            (
+                "X-Backend-Etag-Is-At",
+                "X-Object-Sysmeta-Crypto-Etag-Mac",
+            ),
+        ]);
+        let resp = resp_ok(&[
+            ("ETag", "ciphertext-md5-hex"),
+            ("X-Object-Sysmeta-Crypto-Etag-Mac", mac),
+        ]);
+        assert_eq!(conditional_response_status(&r, &resp), Some(304));
+        // Without Etag-Is-At the ciphertext etag would not match.
+        let bare = req(&[("If-None-Match", &format!("\"{mac}\""))]);
+        assert_eq!(conditional_response_status(&bare, &resp), None);
     }
 }

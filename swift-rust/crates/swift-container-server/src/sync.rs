@@ -33,8 +33,9 @@
 //! Residual vs Python: remote HEAD-before-PUT short-circuit, InternalClient
 //! object GET (PUT body is supplied by [`ObjectSource`]), ring ordinal
 //! locality filter (caller can pass `ordinal`/`replica_count`), and live
-//! multi-cluster soak. HTTPS remotes use system-root `native-tls` verify
-//! (no custom CA / insecure-skip-verify knobs yet).
+//! multi-cluster soak. HTTPS remotes use `native-tls` with system roots by
+//! default; optional `[container-sync] ssl_ca_file` and
+//! `insecure_skip_verify` (default **false**) tune verification.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -659,17 +660,61 @@ fn status_from_response_buf(buf: &[u8]) -> u16 {
         .unwrap_or(0)
 }
 
+/// TLS verification knobs for outbound HTTPS sync (and optional CA pin).
+///
+/// Defaults are **secure**: system trust store, certificate verification on.
+/// `insecure_skip_verify` is only for lab / self-signed remotes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TlsOptions {
+    /// Optional PEM bundle of extra root CAs (`ssl_ca_file`).
+    pub ssl_ca_file: Option<PathBuf>,
+    /// When true, accept invalid certs/hostnames (default **false**).
+    pub insecure_skip_verify: bool,
+}
+
+/// Build a `native-tls` connector from [`TlsOptions`].
+///
+/// Returns `Err` if the CA file is missing/unreadable or PEM is invalid.
+pub fn build_tls_connector(opts: &TlsOptions) -> Result<native_tls::TlsConnector, String> {
+    let mut builder = native_tls::TlsConnector::builder();
+    if opts.insecure_skip_verify {
+        builder.danger_accept_invalid_certs(true);
+        builder.danger_accept_invalid_hostnames(true);
+    }
+    if let Some(path) = &opts.ssl_ca_file {
+        let pem = std::fs::read(path).map_err(|e| format!("ssl_ca_file read {}: {e}", path.display()))?;
+        let cert = native_tls::Certificate::from_pem(&pem)
+            .map_err(|e| format!("ssl_ca_file parse {}: {e}", path.display()))?;
+        builder.add_root_certificate(cert);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("tls connector build: {e}"))
+}
+
 /// Issue a bare HTTP/1.1 request; returns status code (0 on transport error).
 ///
-/// HTTPS uses `native-tls` with the system trust store and default verify
-/// (same approach as `swift-middleware` authtoken/s3token). There is no
-/// knob yet for custom CAs or `insecure_skip_verify`.
+/// HTTPS uses `native-tls` (system trust store by default). Pass
+/// [`TlsOptions`] for custom CA (`ssl_ca_file`) or lab-only
+/// `insecure_skip_verify` (defaults secure).
 pub fn http_request(
     method: &str,
     url: &str,
     headers: &[(String, String)],
     body: &[u8],
     timeout: Duration,
+) -> u16 {
+    http_request_with_tls(method, url, headers, body, timeout, &TlsOptions::default())
+}
+
+/// Like [`http_request`] with explicit TLS options.
+pub fn http_request_with_tls(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    timeout: Duration,
+    tls_opts: &TlsOptions,
 ) -> u16 {
     let Some((host, port, path, tls)) = parse_http_url(url) else {
         return 0;
@@ -696,7 +741,7 @@ pub fn http_request(
     let _ = conn.set_nodelay(true);
 
     if tls {
-        let Ok(connector) = native_tls::TlsConnector::builder().build() else {
+        let Ok(connector) = build_tls_connector(tls_opts) else {
             return 0;
         };
         // SNI / cert CN uses the hostname (not host:port).
@@ -730,14 +775,24 @@ pub fn http_request(
 pub struct HttpSyncClient {
     pub object_source: Box<dyn ObjectSource>,
     pub timeout: Duration,
+    pub tls: TlsOptions,
     nonce_counter: AtomicU64,
 }
 
 impl HttpSyncClient {
     pub fn new(object_source: Box<dyn ObjectSource>, timeout_secs: f64) -> Self {
+        Self::with_tls(object_source, timeout_secs, TlsOptions::default())
+    }
+
+    pub fn with_tls(
+        object_source: Box<dyn ObjectSource>,
+        timeout_secs: f64,
+        tls: TlsOptions,
+    ) -> Self {
         HttpSyncClient {
             object_source,
             timeout: Duration::from_secs_f64(timeout_secs.max(0.1)),
+            tls,
             nonce_counter: AtomicU64::new(1),
         }
     }
@@ -769,7 +824,14 @@ impl SyncClient for HttpSyncClient {
                     &nonce,
                     &[],
                 );
-                let status = http_request("DELETE", &url, &headers, &[], self.timeout);
+                let status = http_request_with_tls(
+                    "DELETE",
+                    &url,
+                    &headers,
+                    &[],
+                    self.timeout,
+                    &self.tls,
+                );
                 // Python treats 404/409 as success for DELETE.
                 matches!(status, 200..=299 | 404 | 409)
             }
@@ -813,7 +875,14 @@ impl SyncClient for HttpSyncClient {
                     &nonce,
                     &extra,
                 );
-                let status = http_request("PUT", &url, &headers, &body, self.timeout);
+                let status = http_request_with_tls(
+                    "PUT",
+                    &url,
+                    &headers,
+                    &body,
+                    self.timeout,
+                    &self.tls,
+                );
                 (200..300).contains(&status)
             }
         }
@@ -1127,6 +1196,10 @@ pub struct ContainerSyncConfig {
     pub conn_timeout: f64,
     pub realms_conf_path: PathBuf,
     pub mount_check: bool,
+    /// Extra PEM CA file for HTTPS remotes (`ssl_ca_file`). Empty → none.
+    pub ssl_ca_file: Option<PathBuf>,
+    /// Skip TLS cert/hostname verify (default **false** / secure).
+    pub insecure_skip_verify: bool,
 }
 
 impl Default for ContainerSyncConfig {
@@ -1139,6 +1212,8 @@ impl Default for ContainerSyncConfig {
             conn_timeout: 5.0,
             realms_conf_path: PathBuf::from("/etc/swift/container-sync-realms.conf"),
             mount_check: true,
+            ssl_ca_file: None,
+            insecure_skip_verify: false,
         }
     }
 }
@@ -1158,6 +1233,18 @@ impl ContainerSyncConfig {
                 .unwrap_or_else(|| default.to_string())
         };
         let hosts = get("container-sync", "allowed_sync_hosts", "127.0.0.1");
+        let ca_raw = get("container-sync", "ssl_ca_file", "");
+        let ssl_ca_file = {
+            let t = ca_raw.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(t))
+            }
+        };
+        // Secure default: only explicit true-values enable skip-verify.
+        let insecure_skip_verify =
+            config_true_value(&get("container-sync", "insecure_skip_verify", "false"));
         ContainerSyncConfig {
             devices: PathBuf::from(get("container-sync", "devices", "/srv/node")),
             interval: get("container-sync", "interval", "300")
@@ -1176,6 +1263,16 @@ impl ContainerSyncConfig {
                 .unwrap_or(5.0),
             realms_conf_path: PathBuf::from(format!("{swift_dir}/container-sync-realms.conf")),
             mount_check: config_true_value(&get("container-sync", "mount_check", "true")),
+            ssl_ca_file,
+            insecure_skip_verify,
+        }
+    }
+
+    /// TLS options for [`HttpSyncClient`] / [`http_request_with_tls`].
+    pub fn tls_options(&self) -> TlsOptions {
+        TlsOptions {
+            ssl_ca_file: self.ssl_ca_file.clone(),
+            insecure_skip_verify: self.insecure_skip_verify,
         }
     }
 }
@@ -1555,5 +1652,90 @@ cluster_west = http://west/v1/
             .unwrap();
         assert_eq!(v.endpoint, "https://secure.example.com/v1/a/c");
         assert!(v.realm.is_none());
+    }
+
+    #[test]
+    fn test_tls_options_default_is_secure() {
+        let opts = TlsOptions::default();
+        assert!(!opts.insecure_skip_verify);
+        assert!(opts.ssl_ca_file.is_none());
+        // Default connector must build (system roots).
+        assert!(build_tls_connector(&opts).is_ok());
+    }
+
+    #[test]
+    fn test_container_sync_config_tls_defaults_secure() {
+        let conf = swift_core::config::SwiftConfig::parse_lenient(
+            r#"
+[container-sync]
+devices = /tmp/node
+"#,
+            &[],
+            false,
+        )
+        .unwrap();
+        let cfg = ContainerSyncConfig::from_swift_conf(&conf, "/etc/swift");
+        assert!(!cfg.insecure_skip_verify, "insecure must default false");
+        assert!(cfg.ssl_ca_file.is_none());
+        let tls = cfg.tls_options();
+        assert!(!tls.insecure_skip_verify);
+        assert!(tls.ssl_ca_file.is_none());
+    }
+
+    #[test]
+    fn test_container_sync_config_tls_knobs_parsed() {
+        let conf = swift_core::config::SwiftConfig::parse_lenient(
+            r#"
+[container-sync]
+ssl_ca_file = /etc/swift/ca.pem
+insecure_skip_verify = true
+"#,
+            &[],
+            false,
+        )
+        .unwrap();
+        let cfg = ContainerSyncConfig::from_swift_conf(&conf, "/etc/swift");
+        assert_eq!(
+            cfg.ssl_ca_file.as_deref(),
+            Some(Path::new("/etc/swift/ca.pem"))
+        );
+        assert!(cfg.insecure_skip_verify);
+        let tls = cfg.tls_options();
+        assert_eq!(tls.ssl_ca_file, cfg.ssl_ca_file);
+        assert!(tls.insecure_skip_verify);
+        // Explicit false / empty must stay secure.
+        let conf2 = swift_core::config::SwiftConfig::parse_lenient(
+            r#"
+[container-sync]
+ssl_ca_file =
+insecure_skip_verify = false
+"#,
+            &[],
+            false,
+        )
+        .unwrap();
+        let cfg2 = ContainerSyncConfig::from_swift_conf(&conf2, "/etc/swift");
+        assert!(cfg2.ssl_ca_file.is_none());
+        assert!(!cfg2.insecure_skip_verify);
+    }
+
+    #[test]
+    fn test_build_tls_connector_missing_ca_errors() {
+        let opts = TlsOptions {
+            ssl_ca_file: Some(PathBuf::from("/nonexistent/path/no-ca.pem")),
+            insecure_skip_verify: false,
+        };
+        assert!(build_tls_connector(&opts).is_err());
+    }
+
+    #[test]
+    fn test_https_scheme_selects_tls_flag() {
+        // Scheme drives use_tls; default ports 443 vs 80.
+        let (_, p, _, tls) = parse_http_url("https://r.example/v1/a/c").unwrap();
+        assert!(tls);
+        assert_eq!(p, 443);
+        let (_, p, _, tls) = parse_http_url("http://r.example/v1/a/c").unwrap();
+        assert!(!tls);
+        assert_eq!(p, 80);
     }
 }

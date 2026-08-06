@@ -25,7 +25,8 @@
 //!
 //! # Residuals
 //!
-//! SigV2, aws-chunked streaming, full IAM/object ACL fidelity,
+//! SigV2, aws-chunked streaming, full IAM / grant-header object ACL
+//! (canned private/public-read object ACL via sysmeta is claimable),
 //! authenticated-read / log-delivery-write canned ACLs (Python NotImplemented),
 //! CORS ExposeHeader edge cases in live preflight, versioning / tagging /
 //! lifecycle / object-lock (production stop-line: written WONTFIX unless

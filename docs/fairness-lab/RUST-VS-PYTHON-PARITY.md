@@ -60,8 +60,8 @@
 | authtoken (HTTP token validate) | ✅ | ✅ | Live Contabo Keystone |
 | keystoneauth coexist with TempAuth | ✅ | ✅ | Stamp-only-when-confirmed fix |
 | s3api / s3token | ✅ | ✅ | See S3 section; not full AWS |
-| container-sync middleware + daemon | ✅ | ✅ | Proxy filter + daemon; **HTTPS remotes** via native-tls (multi-cluster live soak not claimed) |
-| encrypter / decrypter / keymaster / encryption | ✅ | ✅ | Multi-root secret + listing hash decrypt; KMIP residual |
+| container-sync middleware + daemon | ✅ | ✅ | HTTPS + ssl_ca_file / insecure_skip_verify knobs; multi-cluster live soak not claimed |
+| encrypter / decrypter / keymaster / encryption | ✅ | ✅ | Multi-root + listing decrypt + multipart/range GET decrypt + conditional etag mask; KMIP residual |
 | xprofile / other niche Paste filters | ✅ | ❌ | |
 
 ---
@@ -78,12 +78,12 @@
 | MPU initiate / part / complete / abort | ✅ | ✅ | live 11/11 deep |
 | ListMultipartUploads | ✅ | ✅ | live |
 | ListParts | ✅ | ✅ | part-number-marker + max-parts + IsTruncated (2026-08-06) |
-| Canned ACL (private/public-read/public-read-write) + multi-rule CORS | ✅ | ✅ | authenticated-read → private (Python NotImplemented); object ACL residual |
+| Canned ACL + multi-rule CORS + object ?acl store | ✅ | ✅ | Object x-amz-acl → sysmeta + GET ?acl; IAM residual |
 | s3token → Keystone /v3/s3tokens | ✅ | ✅ | live EC2 GREEN 2026-08-06 |
 | SigV2 | ✅ | ❌ | WONTFIX |
 | aws-chunked | ✅ | ❌ | WONTFIX |
 | Versioning / tagging / lifecycle / object-lock | ✅ | ❌ | WONTFIX / 501 |
-| Full IAM-style ACL / object ACL XML | ✅ | ❌ | canned + multi-rule CORS only |
+| Full IAM-style ACL / ACP XML body | ✅ | ❌ | canned + object sysmeta store only |
 
 ---
 
@@ -110,7 +110,7 @@
 | object-updater / expirer / auditor | ✅ | ✅ | |
 | account-reaper | ✅ | ✅ | full reaper E2E residual → main path ✅ |
 | container-updater / reconciler | ✅ | ✅ | |
-| container-sharder (local + auto_shard unit) | ✅ | ✅ | local cleave + auto_shard unit; multi-node KEEP still **not product-claimed** |
+| container-sharder (local + ring HTTP create path) | ✅ | ✅ | LookupHttpShardReplicator + ring primaries in run loop; KEEP live still **not product-claimed** |
 | container-sharder multi-node KEEP (live) | ✅ | ❌ | Contabo multi-node quorum/KEEP **未实现** |
 | container-sync daemon | ✅ | ✅ | `swift-container-sync` binary + deploy script |
 | db-replicator | ✅ | ✅ | |
@@ -142,7 +142,7 @@
 | eventlet multi-process workers | ✅ | ❌ | thread pool mapping → **语义不等价** |
 | `servers_per_port` process isolation | ✅ | ✅ | Contabo live 6211/6212 |
 | HAProxy + Keepalived | ✅ | ✅ | lab |
-| VIP TLS (operator PEM) | ✅ | ❌ | self-signed LAB only → **生产 TLS 未实现** |
+| VIP TLS (operator PEM path) | ✅ | ⚠️ | Code+ops script GREEN; Contabo still **self-signed LAB** (2026-08-06 probe); production PEM apply not executed |
 | Full ansible v3 surface | ✅ | ❌ | deploy-rs subset + dual-guard |
 | Keystone + Galera | ✅ | ✅ | Contabo LAB (not prod PEM) |
 | Monitoring (Prom/Grafana/tombstone) | ✅ | ✅ | R0 wired |
@@ -157,10 +157,10 @@
 | Auth | TempAuth + Keystone lab | Production-only ops polish |
 | S3 | SigV4 + MPU + ListParts + canned ACL + multi-rule CORS | SigV2, versioning, full IAM/object ACL, aws-chunked |
 | EC | Data path + heal | macOS/default build; some EC throttling niceties |
-| Sharding L3b CLI + local | full main CLI + local sharder + primary HTTP helpers | **multi-node KEEP product claim 未实现** |
-| Crypto at-rest middleware | multi-root + listing decrypt | KMIP, streaming, multipart decrypt residual |
-| container-sync | filter + daemon + HTTPS | multi-cluster live soak; custom CA knobs |
-| Production go-live | — | **未实现** (TLS PEM deferred) |
+| Sharding L3b | CLI + daemon ring HTTP create path + ×4 Contabo active | **multi-node KEEP product claim 未实现** (status≠KEEP) |
+| Crypto at-rest middleware | multi-root + listing + range/multipart GET decrypt + etag mask | KMIP, PUT materialize residual |
+| container-sync | filter + daemon + HTTPS + CA knobs | multi-cluster live soak |
+| Production go-live | ops TLS script ready | **未实现** (Contabo still lab self-signed; operator PEM not applied) |
 
 **Bottom line under the user rule (“部分 = 未实现”):**  
 Rust is a **strong core-path + lab-proven** Swift, **not** a drop-in “full OpenStack Swift feature twin.” Fairness and product claims must stay **CORE-PATH / LAB-HARD-GREEN**, not “feature-complete vs Python.”
@@ -179,7 +179,9 @@ Rust is a **strong core-path + lab-proven** Swift, **not** a drop-in “full Ope
 | EC2 s3token | GREEN |
 | VIP failover | PASS |
 | L3b multi-node KEEP | **not claimed** |
-| Operator TLS PEM | **deferred** |
+| Operator TLS PEM path (script) | **code GREEN**; Contabo **self-signed LAB** (probe 2026-08-06) |
+| container-sharder ×4 Contabo | **active** (status probe; KEEP not claimed) |
+| Operator TLS PEM live apply | **deferred** |
 
 See `tools/test-results/PARALLEL-RUN-20260806/` and `PARALLEL-123-20260806/`.
 

@@ -35,7 +35,9 @@ pub use body::{
     StreamedBody, MAX_CONTROL_BODY, STREAM_CHUNK,
 };
 pub use mime::MimeDocs;
-pub use conditional::{apply_conditional, conditional_response_status};
+pub use conditional::{
+    apply_conditional, conditional_response_status, resolve_etag_is_at,
+};
 pub use dates::{http_date, parse_http_date};
 pub use headers::{title_case, HeaderKeyDict};
 pub use range::{

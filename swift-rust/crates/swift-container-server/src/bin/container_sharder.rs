@@ -15,14 +15,19 @@
 
 //! `swift-container-sharder <config.conf> [once]`: cleave SHARDING containers;
 //! when `auto_shard=true`, also transition oversized unsharded containers.
-//! See `sharder.rs` module docs for residuals vs full Python L3b.
+//! When `container.ring.gz` loads, uncleaved shard containers are HTTP-created
+//! on ring primaries (quorum) before local cleave. See `sharder.rs` module docs
+//! for claimable path vs Contabo KEEP residuals.
 
-use swift_container_server::sharder::{self, run_once_with_opts, SharderRunOpts};
+use std::path::Path;
+
+use swift_container_server::sharder::{self, run_once_with_opts_and_ring, SharderRunOpts};
 use swift_core::daemon;
 use swift_core::config::SwiftConfig;
 use swift_core::hashing::HashPathConfig;
 use swift_core::obslog::{LogLevel, Logger};
 use swift_core::statsd::StatsdClient;
+use swift_ring::{Ring, RingData};
 
 fn parse_conf_file(path: &str) -> SwiftConfig {
     let content = std::fs::read_to_string(path).unwrap_or_default();
@@ -92,13 +97,35 @@ fn main() {
         shard_size,
         minimum_shard_size,
     };
+    let swift_dir = std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string());
+    let ring_path = format!("{swift_dir}/container.ring.gz");
+    // Optional ring: missing → local SAIO path (LocalShardReplicator). Present →
+    // LookupHttpShardReplicator creates uncleaved shards on ring primaries.
+    let mut container_ring: Option<Ring> = match RingData::load(Path::new(&ring_path)) {
+        Ok(data) => {
+            logger.info(&format!("loaded container ring {ring_path}"));
+            Some(Ring::new(data, hash_config.clone()))
+        }
+        Err(e) => {
+            logger.warning(&format!(
+                "no container ring at {ring_path} ({e}); multi-node shard create disabled \
+                 (local cleave only — SAIO-safe)"
+            ));
+            None
+        }
+    };
     let stop = swift_http::install_sigterm_flag();
 
+    let mode = if container_ring.is_some() {
+        "ring-primaries+local-cleave"
+    } else {
+        "local-cleave-only"
+    };
     logger.info(&format!(
         "swift-container-sharder: devices={devices} interval={interval}s \
          cleave_batch_size={cleave_batch_size} auto_shard={auto_shard} \
-         shard_size={shard_size} once={run_once_only} \
-         mode=wave3-local-cleave+auto_shard-gate"
+         shard_size={shard_size} once={run_once_only} mode={mode} \
+         (no Contabo KEEP claim without live quorum evidence)"
     ));
     loop {
         let sweep_start = std::time::Instant::now();
@@ -106,30 +133,41 @@ fn main() {
         if let Ok(entries) = std::fs::read_dir(&devices) {
             for e in entries.flatten() {
                 if e.path().is_dir() {
-                    let s = run_once_with_opts(&e.path(), &hash_config, &opts);
+                    let s = run_once_with_opts_and_ring(
+                        &e.path(),
+                        &hash_config,
+                        &opts,
+                        container_ring.as_ref(),
+                    );
                     agg.containers_seen += s.containers_seen;
                     agg.sharding += s.sharding;
                     agg.cleaved_batches += s.cleaved_batches;
                     agg.finished += s.finished;
                     agg.skipped += s.skipped;
                     agg.failures += s.failures;
+                    agg.replicate_errors += s.replicate_errors;
+                    agg.shrinking_donors += s.shrinking_donors;
                 }
             }
         }
         logger.info(&format!(
             "container-sharder pass: seen={} sharding={} cleaved_batches={} \
-             finished={} skipped={} failures={}",
+             finished={} skipped={} failures={} replicate_errors={} shrinking_donors={}",
             agg.containers_seen,
             agg.sharding,
             agg.cleaved_batches,
             agg.finished,
             agg.skipped,
-            agg.failures
+            agg.failures,
+            agg.replicate_errors,
+            agg.shrinking_donors
         ));
         statsd.update_stats("containers_seen", agg.containers_seen as i64);
         statsd.update_stats("sharding", agg.sharding as i64);
         statsd.update_stats("finished", agg.finished as i64);
         statsd.update_stats("failures", agg.failures as i64);
+        statsd.update_stats("replicate_errors", agg.replicate_errors as i64);
+        statsd.update_stats("shrinking_donors", agg.shrinking_donors as i64);
         let update = sharder::recon_update(sweep_start.elapsed(), daemon::epoch_secs_now(), &agg);
         if let Err(e) = daemon::dump_recon(&recon_cache_path, "container.recon", &update) {
             logger.warning(&format!(
@@ -142,6 +180,17 @@ fn main() {
         if daemon::sleep_unless_stopped(interval, &stop) {
             logger.info("exiting on SIGTERM");
             break;
+        }
+        // Reload container ring each pass; on failure keep previous (or None).
+        match RingData::load(Path::new(&ring_path)) {
+            Ok(data) => container_ring = Some(Ring::new(data, hash_config.clone())),
+            Err(e) => {
+                if container_ring.is_some() {
+                    logger.warning(&format!(
+                        "could not reload {ring_path}: {e}; reusing previous ring"
+                    ));
+                }
+            }
         }
     }
 }

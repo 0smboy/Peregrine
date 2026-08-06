@@ -46,11 +46,39 @@ source /opt/peregrine/env.sh
 
 ## Production TLS PEM
 
-This SAIO path serves HTTP on `:8080`. For production VIP TLS:
+This SAIO path serves **HTTP on `:8080`**. TLS is not terminated by the proxy.
 
-1. Place fullchain+key PEM where HAProxy expects it.
-2. Set `SWIFT_TLS_PEM=/path/to/pem` as documentation for operators.
-3. Use `swift-deploy-rs` `lb_mode=https` + `haproxy_tls_pem_src` on Contabo.
+### Operator one-shot (SAIO stage)
+
+```sh
+# Validate only (also accepts env SWIFT_TLS_PEM)
+./tools/offline-oneclick/offline-oneclick.sh tls --pem /secure/lab.pem --check
+
+# Stage under $PEREGRINE_PREFIX/etc/tls/server.pem (front with nginx/caddy)
+./tools/offline-oneclick/offline-oneclick.sh tls --pem /secure/lab.pem
+```
+
+### Production VIP (HAProxy)
+
+Contabo / multi-node VIP TLS uses HAProxy (`lb_mode=https`), not SAIO:
+
+```sh
+# Prefer the dedicated ops script
+./tools/ops/apply-vip-tls-pem.sh --pem /secure/vip.pem --check
+./tools/ops/apply-vip-tls-pem.sh --pem /secure/vip.pem \
+  --ssh swift1,swift2,swift3,swift4 --reload   # only after SSH confirmation
+
+# Or via offline-oneclick delegate
+./tools/offline-oneclick/offline-oneclick.sh tls --vip -- \
+  --pem /secure/vip.pem --ssh swift1 --dry-run --print-commands
+```
+
+Deploy-rs path: set `haproxy_tls_pem_src` (controller-local PEM) +
+`haproxy_tls_self_signed: false` + `lb_mode: https`. See
+[`tools/ops/README.md`](../ops/README.md) and
+[`docs/fairness-lab/P3-OPS-CONTRACT.md`](../../docs/fairness-lab/P3-OPS-CONTRACT.md).
+
+**No secrets in git.** Contabo is never mutated without explicit `--ssh` hosts.
 
 ## Commands
 
@@ -61,6 +89,7 @@ This SAIO path serves HTTP on `:8080`. For production VIP TLS:
 | `start [--console]` | saio-setup + saio-start (+ console) |
 | `stop` | Stop SAIO services + console |
 | `test [--smoke\|--func\|--lab]` | Verification |
+| `tls [--pem\|--check\|--vip]` | Validate/stage PEM or delegate VIP apply |
 | `status` | Process + auth probe |
 | `all-local` | Full local path |
 
