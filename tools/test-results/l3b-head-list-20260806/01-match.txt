@@ -1,0 +1,4 @@
+=== HEAD vs list match after fan-out HEAD 2026-08-06 ===
+shrinklab1786029572: list=20 head_count=20 match=YES
+l3bclean1786024121:  list=170 head_count=170 match=YES
+HEAD uses same sharded listing fan-out as GET (name-deduped), body stripped to 204.

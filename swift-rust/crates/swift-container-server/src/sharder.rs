@@ -720,6 +720,68 @@ fn open_existing_shard_broker(
     Some(ContainerBroker::new(&db, &account, &container))
 }
 
+/// Sibling device directories under the same parent as `device` (e.g. all of
+/// `/srv/node/d*`), including `device` itself. Used so shrink can find a
+/// donor DB that landed on another local device.
+fn local_device_siblings(device: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = vec![device.to_path_buf()];
+    let Some(parent) = device.parent() else {
+        return out;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() && p != device {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Find an existing shard DB on any of `devices` (ring part preferred).
+fn open_existing_shard_on_devices(
+    devices: &[std::path::PathBuf],
+    hash_config: &HashPathConfig,
+    part: &str,
+    shard_name: &str,
+) -> Option<(std::path::PathBuf, ContainerBroker)> {
+    for dev in devices {
+        if let Some(b) = open_existing_shard_broker(dev, hash_config, part, shard_name) {
+            return Some((dev.clone(), b));
+        }
+        // Also try common part layouts if ring part is wrong (lab handoffs).
+        // Walk device/containers/*/suffix/hash only when part miss.
+    }
+    // Fallback: scan each device for the hash path under any part.
+    let (account, container) = split_shard_name(shard_name);
+    let hsh = hash_config
+        .hash_path(&account, Some(&container), None)
+        .ok()?;
+    let suffix = &hsh[hsh.len().saturating_sub(3)..];
+    for dev in devices {
+        let cont_root = dev.join("containers");
+        let Ok(parts) = std::fs::read_dir(&cont_root) else {
+            continue;
+        };
+        for part_ent in parts.flatten() {
+            let db = part_ent
+                .path()
+                .join(suffix)
+                .join(&hsh)
+                .join(format!("{hsh}.db"));
+            if db.exists() {
+                return Some((
+                    dev.clone(),
+                    ContainerBroker::new(&db, &account, &container),
+                ));
+            }
+        }
+    }
+    None
+}
+
 fn local_shard_broker(
     device: &Path,
     hash_config: &HashPathConfig,
@@ -957,8 +1019,13 @@ pub fn find_shrink_acceptor<'a>(
 /// donor shard container into a covering ACTIVE acceptor, zero donor stats,
 /// and mark the donor **SHRUNK** on the root.
 ///
-/// Lab/SAIO path writes under the local device. Multi-node KEEP still needs
-/// replication of the acceptor and root range updates to other primaries.
+/// Searches **all sibling devices** under the parent of `device` (e.g. every
+/// `/srv/node/d*` on this host) for the donor DB so multi-device nodes still
+/// shrink when the root and donor land on different local devices.
+///
+/// Multi-node KEEP still needs the root range table replicated to the node
+/// that holds the donor (container-replicator); this function never creates
+/// empty donor DBs.
 ///
 /// Returns the number of donors successfully marked SHRUNK.
 pub fn process_shrinking_donors(
@@ -979,22 +1046,34 @@ pub fn process_shrinking_donors(
     })?;
     let ts = swift_core::timestamp::Timestamp::now().internal();
     let mut finished = 0usize;
+    let search_devices = local_device_siblings(device);
     for donor in donors {
         let Some(acceptor) = find_shrink_acceptor(&ranges, &donor) else {
             continue;
         };
         let donor_part = shard_part_for(&donor.name, ring, root_part);
         let acc_part = shard_part_for(&acceptor.name, ring, root_part);
-        // Only shrink when the donor shard DB already lives on this device.
+        // Only shrink when the donor shard DB already lives on this host.
         // `local_shard_broker` auto-creates empty DBs — that would mark SHRUNK
         // without moving real objects (Contabo multi-primary hazard).
-        let Some(mut donor_b) =
-            open_existing_shard_broker(device, hash_config, &donor_part, &donor.name)
-        else {
+        let Some((donor_dev, mut donor_b)) = open_existing_shard_on_devices(
+            &search_devices,
+            hash_config,
+            &donor_part,
+            &donor.name,
+        ) else {
             continue;
         };
-        let mut acc_b =
-            local_shard_broker(device, hash_config, &acc_part, &acceptor.name);
+        // Prefer acceptor on same device as donor; else create under donor device.
+        let mut acc_b = open_existing_shard_broker(
+            &donor_dev,
+            hash_config,
+            &acc_part,
+            &acceptor.name,
+        )
+        .unwrap_or_else(|| {
+            local_shard_broker(&donor_dev, hash_config, &acc_part, &acceptor.name)
+        });
 
         // Copy all rows in the donor's original bounds into the acceptor.
         let records =

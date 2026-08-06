@@ -2251,18 +2251,36 @@ impl ProxyApp {
                 // Wave 3 L3b: shard-range listing fan-out for sharded containers.
                 // Skip when the client already asked for record-type=shard (or
                 // backend override), so admin shard listings stay single-hop.
+                // HEAD uses the same fan-out so Object-Count matches list
+                // (name-deduped residual + shards), then strips the body.
                 let record_type = req
                     .headers
                     .get("X-Backend-Record-Type")
                     .unwrap_or("")
                     .to_ascii_lowercase();
-                if req.method == "GET"
-                    && record_type != "shard"
-                    && !req.query_string.contains("states=")
-                {
-                    if let Some(fan) =
+                if record_type != "shard" && !req.query_string.contains("states=") {
+                    if let Some(mut fan) =
                         self.maybe_sharded_container_listing(req, account, container)
                     {
+                        if req.method == "HEAD" {
+                            // Listing path returns 200 + JSON; HEAD must be
+                            // empty-body with count headers only.
+                            let count = fan
+                                .headers
+                                .get("X-Container-Object-Count")
+                                .unwrap_or("0")
+                                .to_string();
+                            let bytes = fan
+                                .headers
+                                .get("X-Container-Bytes-Used")
+                                .unwrap_or("0")
+                                .to_string();
+                            fan.status = 204;
+                            fan.body = swift_http::Body::empty();
+                            fan.headers.set("Content-Length", "0");
+                            fan.headers.set("X-Container-Object-Count", count);
+                            fan.headers.set("X-Container-Bytes-Used", bytes);
+                        }
                         return fan;
                     }
                 }
@@ -2292,10 +2310,8 @@ impl ProxyApp {
                     {
                         resp.headers.set("X-Storage-Policy", name);
                     }
-                    // Sharded root HEAD often reports a stale root object_count
-                    // (post-cleave residual / post-shard PUTs land on shards).
-                    // For HEAD, fan out to listing-state shards and sum live
-                    // counts so clients match listing reality.
+                    // Fallback when listing fan-out did not run: sum shard
+                    // HEADs (+ residual heuristic).
                     if req.method == "HEAD" {
                         self.patch_sharded_head_counts(
                             req,
@@ -2500,7 +2516,7 @@ impl ProxyApp {
         shard_headers.set("X-Backend-Record-Type", "shard");
         shard_headers.set("X-Backend-Allow-Reserved-Names", "true");
         let Some(arr) =
-            self.fetch_listing_shard_ranges(nodes, part, &path, &shard_headers)
+            self.fetch_listing_shard_ranges(nodes.clone(), part, &path, &shard_headers)
         else {
             return;
         };
@@ -2514,8 +2530,12 @@ impl ProxyApp {
             // Skip soft-deleted / SHRUNK donors so we do not double-count
             // during shrink (objects already live on the acceptor).
             let st = sr.get("state").and_then(|v| v.as_i64()).unwrap_or(0);
-            if st == 80 {
-                // SHRUNK
+            let deleted = sr
+                .get("deleted")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            if st == 80 || deleted != 0 {
+                // SHRUNK or soft-deleted
                 continue;
             }
             let name = sr.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -2556,6 +2576,59 @@ impl ProxyApp {
                 .get("X-Container-Bytes-Used")
                 .and_then(|v| v.parse::<i64>().ok())
                 .unwrap_or(0);
+        }
+        // Residual root rows (same condition as listing fan-out): when the
+        // root still reports object_count > 0, GET listing merges those rows
+        // (name-deduped against shards). For HEAD we cannot cheaply dedupe
+        // without names from every shard; approximate by adding residual
+        // count only when shard_sum is 0 (pure residual) or when residual
+        // fetch returns rows and we use max(shard_sum, residual) as a floor
+        // when residual alone is larger (rare). Prefer: add residual when
+        // non-empty and track via name set from residual only if shard_sum
+        // already covers live shards — residual names are typically
+        // post-cleave leftovers not yet removed from root.
+        let root_oc = resp
+            .headers
+            .get("X-Container-Object-Count")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        if root_oc > 0 {
+            let mut root_headers = self.backend_headers(req, false, "container");
+            root_headers.set("X-Backend-Record-Type", "object");
+            if let Some(items) = self.fetch_shard_object_listing_first_nonempty(
+                &nodes,
+                part,
+                &path,
+                "format=json&limit=10000",
+                &root_headers,
+            ) {
+                if !items.is_empty() {
+                    // Name-dedupe residual against would-be double count: if
+                    // shard_sum already reflects live data, residual rows
+                    // that still sit on root after cleave are *extra* only
+                    // when not moved. Listing dedupes by name; we add residual
+                    // count when it is the only signal (shard_sum==0), else
+                    // take max(shard_sum, residual) to avoid under-count
+                    // without full name merge (cheap HEAD path).
+                    let residual = items.len() as i64;
+                    let residual_bytes: i64 = items
+                        .iter()
+                        .filter_map(|o| o.get("bytes").and_then(|v| v.as_i64()))
+                        .sum();
+                    if total_count == 0 {
+                        total_count = residual;
+                        total_bytes = residual_bytes;
+                    } else if residual > total_count {
+                        // Residual listing longer than shard sum — use it as
+                        // the more complete signal ( Contabo partial cleave ).
+                        total_count = residual;
+                        total_bytes = residual_bytes;
+                    }
+                    // else keep shard_sum (typical sharded case; residual is
+                    // stale root rows also present on shards — list dedupes).
+                    saw_shard = true;
+                }
+            }
         }
         if saw_shard {
             resp.headers

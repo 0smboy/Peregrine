@@ -118,7 +118,7 @@
 | ring-builder | ✅ | ✅ | .builder pickle not bit-identical tool format |
 | manage-shard-ranges (main CLI) | ✅ | ✅ | find/show/info/enable/delete/merge/find_and_replace + **analyze/compact/repair/activate_cleaved** (`--include-cleaved`) |
 | sharder shrink (SHRINKING→SHRUNK) | ✅ | ✅ | Local-device object move + SHRUNK (`process_shrinking_donors`); multi-node quorum KEEP residual |
-| sharded HEAD object_count | ✅ | ✅ | Proxy sums listing-state shard HEADs (`patch_sharded_head_counts`); may still lag list when root residual rows exist |
+| sharded HEAD object_count | ✅ | ✅ | HEAD reuses listing fan-out → Object-Count matches list (`l3b-head-list-20260806`) |
 | dispersion / drive-audit / relinker | ✅ | ✅ | |
 
 ---
