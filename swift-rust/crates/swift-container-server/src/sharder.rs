@@ -31,16 +31,27 @@
 //! `auto_shard`, a local misplaced-object pass, and an HTTP shard-replicate
 //! hook. Proxy listing fan-out lives in `swift-proxy-server`.
 //!
-//! Residuals vs full Python L3b / multi-node KEEP claim blockers:
-//! - shrink / expand / compactible-sequence of shard ranges
-//! - live Contabo multi-node quorum drill (unit [`HttpShardReplicator`] only;
-//!   ring → primary nodes wiring in daemon loop not driven end-to-end on VIP)
-//! - sharder HTTP create+replicate of shard DBs on *all* primary replicas with
-//!   durable cleave under concurrent load (local same-device cleave is KEEP-
-//!   insufficient for product claim)
-//! - manage-shard-ranges compact/repair/analyze (CLI deferred; find/show/info/
-//!   enable/delete/merge/find_and_replace ship)
-//! - WAN / async container-sync (wontfix)
+//! ## Multi-node residual list (KEEP blockers — no Contabo claim without live evidence)
+//!
+//! Unit-tested foundation (this module):
+//! - [`HttpShardReplicator`] quorum create (`replica_count/2+1`, overrideable)
+//! - [`primary_shard_replica_nodes`] / [`shard_replicas_from_ring_devices`]:
+//!   map ring primary devices → [`ShardReplicaNode`] list (order preserved)
+//! - [`LocalShardReplicator`] for same-device lab cleave
+//!
+//! Still required for multi-node KEEP (not claimed):
+//! 1. **Live Contabo/VIP quorum drill** — create shard containers on ≥ quorum
+//!    of real container-servers under the production ring; no synthetic-only
+//!    evidence counts as KEEP.
+//! 2. **Daemon loop wiring** — `swift-container-sharder` still uses local
+//!    cleave only; load container.ring.gz, resolve primaries per shard name,
+//!    inject [`HttpShardReplicator`] into
+//!    [`process_sharding_container_with_replicator`] for every uncleaved range.
+//! 3. **Durable multi-primary cleave under concurrent load** — local same-device
+//!    cleave is insufficient for a product multi-node claim.
+//! 4. **Sharder-side shrink/compact execution** after CLI marks donors
+//!    SHRINKING (CLI compact/repair/analyze now ship; daemon compact pass TBD).
+//! 5. WAN / async container-sync (wontfix).
 
 use std::path::Path;
 
@@ -216,6 +227,68 @@ impl<T: ShardHttpTransport> HttpShardReplicator<T> {
         self.quorum = quorum.max(1);
         self
     }
+}
+
+/// Default quorum for a replica set size: `n/2 + 1` (at least 1).
+pub fn default_shard_quorum(replica_count: usize) -> usize {
+    ((replica_count / 2) + 1).max(1)
+}
+
+/// Build ordered primary [`ShardReplicaNode`]s from ring device fields
+/// (`ip`, `port`, `device`). Preserves ring primary order so HTTP create
+/// targets match proxy/container placement.
+///
+/// Callers obtain the device list via `Ring::get_nodes(account, Some(container), None)`
+/// or `Ring::get_part_nodes(part)` and map each `PartNode.dev`.
+pub fn shard_replicas_from_ring_devices<'a, I>(devices: I) -> Vec<ShardReplicaNode>
+where
+    I: IntoIterator<Item = (&'a str, u16, &'a str)>,
+{
+    devices
+        .into_iter()
+        .map(|(ip, port, device)| ShardReplicaNode {
+            ip: ip.to_string(),
+            port,
+            device: device.to_string(),
+        })
+        .collect()
+}
+
+/// Select primary shard replica nodes for `shard_name` using a ring lookup
+/// callback. The callback receives `(account, container)` from the shard
+/// path and must return `(partition, Vec<(ip, port, device)>)` — typically
+/// wrapping `Ring::get_nodes`.
+///
+/// Returns `(part, nodes)` ready for [`HttpShardReplicator::new`].
+pub fn primary_shard_replica_nodes<F>(
+    shard_name: &str,
+    mut get_nodes: F,
+) -> Result<(String, Vec<ShardReplicaNode>), String>
+where
+    F: FnMut(&str, &str) -> Result<(u32, Vec<(String, u16, String)>), String>,
+{
+    let (account, container) = split_shard_name(shard_name);
+    if account.is_empty() || container.is_empty() {
+        return Err(format!("invalid shard name: {shard_name}"));
+    }
+    let (part, devices) = get_nodes(&account, &container)?;
+    let nodes = shard_replicas_from_ring_devices(
+        devices
+            .iter()
+            .map(|(ip, port, dev)| (ip.as_str(), *port, dev.as_str())),
+    );
+    if nodes.is_empty() {
+        return Err(format!("no primary nodes for shard {shard_name} part={part}"));
+    }
+    Ok((part.to_string(), nodes))
+}
+
+/// Convenience: build [`HttpShardReplicator`] with default quorum from primary nodes.
+pub fn http_replicator_for_primaries<T: ShardHttpTransport>(
+    nodes: Vec<ShardReplicaNode>,
+    transport: T,
+) -> HttpShardReplicator<T> {
+    HttpShardReplicator::new(nodes, transport)
 }
 
 impl<T: ShardHttpTransport> ShardReplicator for HttpShardReplicator<T> {
@@ -1221,5 +1294,65 @@ mod tests {
         );
         let mut local = LocalShardReplicator;
         assert!(local.replicate_shard("a/c", "0").is_ok());
+    }
+
+    #[test]
+    fn test_primary_shard_replica_nodes_selection() {
+        assert_eq!(default_shard_quorum(0), 1);
+        assert_eq!(default_shard_quorum(1), 1);
+        assert_eq!(default_shard_quorum(2), 2);
+        assert_eq!(default_shard_quorum(3), 2);
+        assert_eq!(default_shard_quorum(4), 3);
+
+        let from_devs = shard_replicas_from_ring_devices([
+            ("10.0.0.1", 6201u16, "sda"),
+            ("10.0.0.2", 6201u16, "sdb"),
+            ("10.0.0.3", 6201u16, "sdc"),
+        ]);
+        assert_eq!(from_devs.len(), 3);
+        assert_eq!(from_devs[0].ip, "10.0.0.1");
+        assert_eq!(from_devs[0].device, "sda");
+        assert_eq!(from_devs[2].port, 6201);
+
+        // Simulated ring: get_nodes for account/container returns fixed primaries.
+        let (part, nodes) = primary_shard_replica_nodes(
+            ".shards_AUTH_test/c-epoch-0",
+            |account, container| {
+                assert_eq!(account, ".shards_AUTH_test");
+                assert_eq!(container, "c-epoch-0");
+                Ok((
+                    7u32,
+                    vec![
+                        ("10.1.0.1".into(), 6201, "d1".into()),
+                        ("10.1.0.2".into(), 6201, "d1".into()),
+                        ("10.1.0.3".into(), 6201, "d1".into()),
+                    ],
+                ))
+            },
+        )
+        .unwrap();
+        assert_eq!(part, "7");
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[1].ip, "10.1.0.2");
+
+        // Invalid name
+        assert!(primary_shard_replica_nodes("nopath", |_, _| Ok((0, vec![]))).is_err());
+
+        // Empty primaries rejected
+        let err = primary_shard_replica_nodes(".shards_a/c", |_, _| Ok((1, vec![]))).unwrap_err();
+        assert!(err.contains("no primary"), "{err}");
+
+        // Wire into HttpShardReplicator and hit quorum
+        let mut map = MapShardHttpTransport::new();
+        for n in &nodes {
+            map.responses
+                .insert(format!("{}:{}/{}", n.ip, n.port, n.device), 201);
+        }
+        let mut rep = http_replicator_for_primaries(nodes, map);
+        assert_eq!(rep.quorum, 2);
+        assert!(rep
+            .replicate_shard(".shards_AUTH_test/c-epoch-0", &part)
+            .is_ok());
+        assert_eq!(rep.transport.calls.len(), 3);
     }
 }

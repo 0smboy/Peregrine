@@ -776,9 +776,16 @@ fn build_etag_quoter(conf: &SwiftConfig) -> swift_middleware::EtagQuoter {
     }
 }
 
-/// Build [`KeyMaster`] from `[filter:keymaster]` (or `encryption_root_secret`
-/// on `[filter:encryption]` as a fallback). Requires a base64 root secret of
-/// ≥ 32 raw bytes — same policy as Python `KeyMaster._decode_root_secret`.
+/// Build [`KeyMaster`] from `[filter:keymaster]` (or `encryption_root_secret*`
+/// on `[filter:encryption]` as a fallback).
+///
+/// Conf options (Python `KeyMaster` / `load_multikey_opts`):
+/// * `encryption_root_secret` — default unlabeled root secret (base64 ≥32 raw bytes)
+/// * `encryption_root_secret_<id>` — additional secrets for rotation
+/// * `active_root_secret_id` — which secret new writes use (empty → default)
+/// * `meta_version_to_write` — `"1"` / `"2"` / `"3"` (default `"2"`)
+///
+/// KMIP / KMS keymasters remain deferred.
 fn build_keymaster(conf: &SwiftConfig) -> Result<swift_middleware::KeyMaster, String> {
     let items = conf
         .items("filter:keymaster")
@@ -2648,6 +2655,53 @@ mod startup_policy_tests {
         );
         // only copy survives
         assert_eq!(filters.len(), 1, "notes={notes:?}");
+    }
+
+    #[test]
+    fn pipeline_crypto_multi_root_secret_conf() {
+        // default + named secret; active = named
+        let root_a = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="; // bytes(range(32))
+        let root_b = "//////////////////////////////////////////8="; // 32 x 0xff
+        let conf = SwiftConfig::parse_lenient(
+            &format!(
+                "[pipeline:main]\n\
+                 pipeline = catch_errors gatekeeper healthcheck keymaster encryption copy proxy-server\n\
+                 [filter:keymaster]\n\
+                 encryption_root_secret = {root_a}\n\
+                 encryption_root_secret_rot1 = {root_b}\n\
+                 active_root_secret_id = rot1\n\
+                 [filter:encryption]\ndisable_encryption = false\n"
+            ),
+            &[],
+            false,
+        )
+        .unwrap();
+        let km = build_keymaster(&conf).expect("multi-root keymaster");
+        assert_eq!(km.active_secret_id(), Some("rot1"));
+        let keys = km.fetch_keys("a", Some("c"), Some("o"));
+        assert_eq!(keys.id["secret_id"], "rot1");
+        assert_eq!(km.root_secret_ids().len(), 2);
+
+        let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
+        let (filters, notes) = build_configured_filters(
+            &conf,
+            None,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            &pols,
+        );
+        assert!(
+            notes.iter().any(|n| n == "keymaster enabled"),
+            "{notes:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("encryption enabled")),
+            "{notes:?}"
+        );
+        // keymaster + decrypter + encrypter + copy
+        assert_eq!(filters.len(), 4, "notes={notes:?}");
     }
 
     #[test]

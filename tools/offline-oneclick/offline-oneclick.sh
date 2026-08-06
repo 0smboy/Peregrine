@@ -69,6 +69,7 @@ cmd_pack() {
     swift-object-replicator swift-object-reconstructor swift-object-updater swift-object-expirer
     swift-object-auditor swift-db-auditor swift-db-replicator
     swift-container-updater swift-container-reconciler swift-container-sharder
+    swift-container-sync
     swift-account-reaper swift-ring-builder swift-ring-info swift-recon
     swift-drive-audit swift-manage-shard-ranges swift-get-nodes
     swift-effective-concurrency

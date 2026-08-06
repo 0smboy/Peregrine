@@ -47,8 +47,9 @@ use swift_http::{Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
 use swift_middleware::{Middleware, NextFn, S3TokenClient, S3TokenResult};
 
 use crate::acl_cors::{
-    acl_xml_from_swift_read, apply_canned_acl, cors_to_swift_headers, cors_xml_from_swift_headers,
-    parse_cors_body, xml_ok,
+    acl_xml_from_swift_headers, acl_xml_from_swift_read, apply_canned_acl,
+    clear_cors_swift_headers, cors_config_to_swift_headers, cors_xml_from_swift_headers,
+    parse_cors_configuration, xml_ok,
 };
 use crate::delete::parse_multi_delete_body;
 use crate::mpu::{
@@ -986,9 +987,10 @@ fn handle_acl(
             if !(200..300).contains(&resp.status) {
                 return map_swift_error(resp.status, Some(bucket), None);
             }
-            xml_ok(acl_xml_from_swift_read(
+            xml_ok(acl_xml_from_swift_headers(
                 &owner.id,
                 resp.headers.get("X-Container-Read"),
+                resp.headers.get("X-Container-Write"),
             ))
         }
         "PUT" => {
@@ -1029,13 +1031,13 @@ fn handle_cors(req: Request, cred: &S3Credential, bucket: &str, next: &NextFn) -
                 Ok(b) => b,
                 Err(_) => return s3_error_response("IncompleteBody", None, &[]),
             };
-            let rule = match parse_cors_body(&body) {
-                Ok(r) => r,
+            let cfg = match parse_cors_configuration(&body) {
+                Ok(c) => c,
                 Err(_) => return s3_error_response("MalformedXML", None, &[]),
             };
             let mut post =
                 make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
-            cors_to_swift_headers(&mut post.headers, &rule);
+            cors_config_to_swift_headers(&mut post.headers, &cfg);
             stamp_auth(&mut post, cred);
             let resp = next(post);
             if (200..300).contains(&resp.status) {
@@ -1047,8 +1049,7 @@ fn handle_cors(req: Request, cred: &S3Credential, bucket: &str, next: &NextFn) -
         "DELETE" => {
             let mut post =
                 make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
-            post.headers
-                .set("X-Container-Meta-Access-Control-Allow-Origin", "");
+            clear_cors_swift_headers(&mut post.headers);
             stamp_auth(&mut post, cred);
             let _ = next(post);
             Response::new(204)
@@ -1965,6 +1966,79 @@ mod tests {
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
         assert!(body.contains("CORSConfiguration"));
         assert!(body.contains("<AllowedOrigin>*</AllowedOrigin>"));
+    }
+
+    #[test]
+    fn cors_multi_rule_put_stamps_s3_cors_meta() {
+        use crate::acl_cors::S3_CORS_META;
+        let api = S3Api::new(cred_map());
+        let mut put_req = base_s3_req("PUT", "/mybucket", "cors");
+        put_req
+            .headers
+            .set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put_req.body = Body::from(
+            br#"<CORSConfiguration>
+              <CORSRule>
+                <AllowedOrigin>https://a.example.com</AllowedOrigin>
+                <AllowedMethod>GET</AllowedMethod>
+              </CORSRule>
+              <CORSRule>
+                <AllowedOrigin>https://b.example.com</AllowedOrigin>
+                <AllowedMethod>PUT</AllowedMethod>
+                <AllowedMethod>POST</AllowedMethod>
+              </CORSRule>
+            </CORSConfiguration>"#
+                .to_vec(),
+        );
+        let put_req = sign_request(put_req, "testing");
+        let stored = std::sync::Arc::new(std::sync::Mutex::new(None::<HeaderKeyDict>));
+        let stored_c = stored.clone();
+        let put_next: NextFn = Arc::new(move |r| {
+            assert_eq!(r.method, "POST");
+            assert!(r.headers.get(S3_CORS_META).is_some_and(|v| !v.is_empty()));
+            assert_eq!(
+                r.headers.get("X-Container-Meta-Access-Control-Allow-Origin"),
+                Some("https://a.example.com")
+            );
+            *stored_c.lock().unwrap() = Some(r.headers.clone());
+            Response::new(204)
+        });
+        assert_eq!(api.handle(put_req, &put_next).status, 200);
+
+        let hdrs = stored.lock().unwrap().clone().unwrap();
+        let get_req = sign_request(base_s3_req("GET", "/mybucket", "cors"), "testing");
+        let get_next: NextFn = Arc::new(move |_| {
+            let mut r = Response::new(204);
+            r.headers = hdrs.clone();
+            r
+        });
+        let resp = api.handle(get_req, &get_next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert_eq!(body.matches("<CORSRule>").count(), 2);
+        assert!(body.contains("https://a.example.com"));
+        assert!(body.contains("https://b.example.com"));
+        assert!(body.contains("<AllowedMethod>PUT</AllowedMethod>"));
+    }
+
+    #[test]
+    fn put_bucket_acl_public_read_write() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket", "acl");
+        req.headers.set("x-amz-acl", "public-read-write");
+        req.headers
+            .set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.method, "POST");
+            assert_eq!(
+                r.headers.get("X-Container-Read"),
+                Some(".r:*,.rlistings")
+            );
+            assert_eq!(r.headers.get("X-Container-Write"), Some(".r:*"));
+            Response::new(204)
+        });
+        assert_eq!(api.handle(req, &next).status, 200);
     }
 
     #[test]

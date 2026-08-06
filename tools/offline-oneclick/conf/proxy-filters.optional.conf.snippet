@@ -1,0 +1,24 @@
+# Optional ON-BY-CONFIG filters for Peregrine swift-rust proxy.
+# Merge into [pipeline:main] and add the matching [filter:*] sections.
+# Default SAIO stays without these; enable when you need the surface.
+
+# --- container-sync (proxy auth stamp for remote sync) ---
+# pipeline = ... container_sync tempauth ...
+# [filter:container_sync]
+# # realms file optional: /etc/swift/container-sync-realms.conf
+
+# --- at-rest crypto (keymaster before encryption composite) ---
+# pipeline = ... keymaster encryption tempauth ...
+# [filter:keymaster]
+# encryption_root_secret = <base64 of >=32 random bytes>
+# # multi-secret (when supported): encryption_root_secret_<id> = ...
+# # active_root_secret_id = <id>
+# [filter:encryption]
+# disable_encryption = false
+
+# --- specialty L2 (already wired when named) ---
+# name_check etag_quoter crossdomain read_only domain_remap cname_lookup backend_ratelimit
+
+# --- account management ---
+# [app:proxy-server]
+# allow_account_management = true

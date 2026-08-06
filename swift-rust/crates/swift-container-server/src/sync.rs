@@ -33,7 +33,8 @@
 //! Residual vs Python: remote HEAD-before-PUT short-circuit, InternalClient
 //! object GET (PUT body is supplied by [`ObjectSource`]), ring ordinal
 //! locality filter (caller can pass `ordinal`/`replica_count`), and live
-//! multi-cluster soak.
+//! multi-cluster soak. HTTPS remotes use system-root `native-tls` verify
+//! (no custom CA / insecure-skip-verify knobs yet).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -620,7 +621,8 @@ fn percent_encode_path(s: &str) -> String {
 }
 
 /// Parse `http[s]://host[:port]/path` into (host, port, path, use_tls).
-fn parse_http_url(url: &str) -> Option<(String, u16, String, bool)> {
+/// Public for unit tests of scheme / default-port selection.
+pub fn parse_http_url(url: &str) -> Option<(String, u16, String, bool)> {
     let (rest, tls) = if let Some(r) = url.strip_prefix("https://") {
         (r, true)
     } else if let Some(r) = url.strip_prefix("http://") {
@@ -647,7 +649,21 @@ fn parse_http_url(url: &str) -> Option<(String, u16, String, bool)> {
     Some((host, port, path, tls))
 }
 
+/// Read the HTTP status line from a raw response buffer.
+fn status_from_response_buf(buf: &[u8]) -> u16 {
+    let head = String::from_utf8_lossy(buf);
+    let line = head.lines().next().unwrap_or("");
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
 /// Issue a bare HTTP/1.1 request; returns status code (0 on transport error).
+///
+/// HTTPS uses `native-tls` with the system trust store and default verify
+/// (same approach as `swift-middleware` authtoken/s3token). There is no
+/// knob yet for custom CAs or `insecure_skip_verify`.
 pub fn http_request(
     method: &str,
     url: &str,
@@ -658,12 +674,8 @@ pub fn http_request(
     let Some((host, port, path, tls)) = parse_http_url(url) else {
         return 0;
     };
-    if tls {
-        // TLS remote endpoints are residual for this wave; report as failure
-        // so the row is retried (or ops can use http:// allowed_sync_hosts).
-        return 0;
-    }
-    let host_header = if port == 80 {
+    // Omit default ports from Host (RFC 7230).
+    let host_header = if (!tls && port == 80) || (tls && port == 443) {
         host.clone()
     } else {
         format!("{host}:{port}")
@@ -682,6 +694,26 @@ pub fn http_request(
     let _ = conn.set_read_timeout(Some(timeout));
     let _ = conn.set_write_timeout(Some(timeout));
     let _ = conn.set_nodelay(true);
+
+    if tls {
+        let Ok(connector) = native_tls::TlsConnector::builder().build() else {
+            return 0;
+        };
+        // SNI / cert CN uses the hostname (not host:port).
+        let Ok(mut tls_stream) = connector.connect(&host, conn) else {
+            return 0;
+        };
+        if tls_stream.write_all(req.as_bytes()).is_err() {
+            return 0;
+        }
+        if !body.is_empty() && tls_stream.write_all(body).is_err() {
+            return 0;
+        }
+        let mut buf = Vec::new();
+        let _ = tls_stream.read_to_end(&mut buf);
+        return status_from_response_buf(&buf);
+    }
+
     if conn.write_all(req.as_bytes()).is_err() {
         return 0;
     }
@@ -690,12 +722,7 @@ pub fn http_request(
     }
     let mut buf = Vec::new();
     let _ = conn.read_to_end(&mut buf);
-    let head = String::from_utf8_lossy(&buf);
-    let line = head.lines().next().unwrap_or("");
-    line.split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
+    status_from_response_buf(&buf)
 }
 
 /// Production remote client: signs requests and issues HTTP PUT/DELETE.
@@ -1486,5 +1513,47 @@ cluster_west = http://west/v1/
         let info = realms.info_realms(Some(("US", "EAST")));
         assert_eq!(info["US"]["clusters"]["EAST"]["current"], true);
         assert!(info["US"]["clusters"]["WEST"].get("current").is_none());
+    }
+
+    #[test]
+    fn test_parse_http_url_scheme_and_ports() {
+        let (h, p, path, tls) =
+            parse_http_url("https://sync.example.com/v1/a/c/obj").unwrap();
+        assert_eq!(h, "sync.example.com");
+        assert_eq!(p, 443);
+        assert_eq!(path, "/v1/a/c/obj");
+        assert!(tls);
+
+        let (h, p, path, tls) =
+            parse_http_url("http://sync.example.com/v1/a/c").unwrap();
+        assert_eq!(h, "sync.example.com");
+        assert_eq!(p, 80);
+        assert_eq!(path, "/v1/a/c");
+        assert!(!tls);
+
+        let (h, p, _, tls) =
+            parse_http_url("https://sync.example.com:8443/v1/a").unwrap();
+        assert_eq!(h, "sync.example.com");
+        assert_eq!(p, 8443);
+        assert!(tls);
+
+        let (h, p, _, tls) = parse_http_url("http://127.0.0.1:8080/v1").unwrap();
+        assert_eq!(h, "127.0.0.1");
+        assert_eq!(p, 8080);
+        assert!(!tls);
+
+        assert!(parse_http_url("ftp://bad/path").is_none());
+        assert!(parse_http_url("//no-scheme").is_none());
+    }
+
+    #[test]
+    fn test_validate_sync_to_https_allowed_host() {
+        let realms = ContainerSyncRealms::default();
+        let hosts = vec!["secure.example.com".into()];
+        let v = validate_sync_to("https://secure.example.com/v1/a/c", &hosts, &realms)
+            .unwrap()
+            .unwrap();
+        assert_eq!(v.endpoint, "https://secure.example.com/v1/a/c");
+        assert!(v.realm.is_none());
     }
 }

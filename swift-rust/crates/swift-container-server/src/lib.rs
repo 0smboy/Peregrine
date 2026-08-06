@@ -33,13 +33,14 @@ pub mod sharder;
 pub mod sync;
 pub mod updater;
 pub use sharder::{
-    cleave, cleave_shard_range, find_and_merge_found_ranges, load_cleaving_context,
-    maybe_auto_shard, move_misplaced_from_retiring, process_sharding_container,
+    cleave, cleave_shard_range, default_shard_quorum, find_and_merge_found_ranges,
+    http_replicator_for_primaries, load_cleaving_context, maybe_auto_shard,
+    move_misplaced_from_retiring, primary_shard_replica_nodes, process_sharding_container,
     process_sharding_container_with_replicator, recon_update as sharder_recon_update,
     run_once as sharder_run_once, run_once_with_opts as sharder_run_once_with_opts,
-    save_cleaving_context, CleavingContext, HttpShardReplicator, LocalShardReplicator,
-    MapShardHttpTransport, ShardHttpTransport, ShardReplicaNode, ShardReplicator, SharderRunOpts,
-    SharderStats, TcpShardHttpTransport, CLEAVING_CONTEXT_KEY,
+    save_cleaving_context, shard_replicas_from_ring_devices, CleavingContext, HttpShardReplicator,
+    LocalShardReplicator, MapShardHttpTransport, ShardHttpTransport, ShardReplicaNode,
+    ShardReplicator, SharderRunOpts, SharderStats, TcpShardHttpTransport, CLEAVING_CONTEXT_KEY,
 };
 pub use reconciler::{
     decide as reconciler_decide, parse_reconciler_obj_name, reconcile, reconciler_container_name,

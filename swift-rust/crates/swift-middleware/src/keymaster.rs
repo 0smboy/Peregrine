@@ -24,16 +24,24 @@
 //! with container path `/account/container` and object path
 //! `/account/container/object` (meta version `"2"` — the Python default).
 //!
+//! Multi-root-secret rotation (Python `load_multikey_opts`):
+//! * `encryption_root_secret` — default / unlabeled secret (`secret_id = None`)
+//! * `encryption_root_secret_<id>` — named secrets for rotation
+//! * `active_root_secret_id` — which secret new writes use (empty → default)
+//!
+//! Crypto-meta `key_id` may carry `secret_id` so decrypter can re-derive the
+//! historic key when reading data encrypted under a retired root secret.
+//!
 //! Residuals (honest):
-//! * multi-root-secret rotation (`encryption_root_secret_<id>`,
-//!   `active_root_secret_id`) — only the single default root secret is loaded
-//! * KMIP / KMS keymasters
+//! * **KMIP / KMS keymasters** — still deferred (external KMS; see
+//!   `kmip_keymaster.py` / `kms_keymaster.py` in Python Swift)
 //! * meta version `"1"` / `"3"` and the legacy leading-slash object path bug
 //! * `keymaster_config_path` external file (use inline filter conf)
 //! * Python `swift.callback.fetch_crypto_keys` environ hook — Encrypter /
 //!   Decrypter hold an [`Arc`] to this keymaster and call
-//!   [`KeyMaster::fetch_keys`] directly
+//!   [`KeyMaster::fetch_keys`] / [`KeyMaster::fetch_keys_with_key_id`] directly
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -55,14 +63,23 @@ pub struct CryptoKeys {
     pub container: Option<[u8; KEY_LENGTH]>,
     /// Opaque key-id dict persisted into crypto-meta (`keys['id']`).
     pub id: serde_json::Value,
+    /// All key-id dicts for every loaded root secret (`keys['all_ids']`).
+    pub all_ids: Vec<serde_json::Value>,
 }
 
 /// Root-secret keymaster. Shared by the keymaster filter and by
 /// encrypter/decrypter via [`Arc`].
+///
+/// Secrets are keyed by optional id: `None` is the default unlabeled
+/// `encryption_root_secret`; `Some(id)` is `encryption_root_secret_<id>`.
 #[derive(Debug, Clone)]
 pub struct KeyMaster {
-    /// Decoded root secret bytes (≥ 32).
-    root_secret: Vec<u8>,
+    /// Decoded root secrets (≥ 32 bytes each). Key is secret id (`None` =
+    /// default).
+    root_secrets: HashMap<Option<String>, Vec<u8>>,
+    /// Secret used for new encryption (`active_root_secret_id`; `None` =
+    /// default unlabeled secret).
+    active_secret_id: Option<String>,
     /// Meta version written into `key_id` (Python `meta_version_to_write`,
     /// default `"2"`).
     pub meta_version_to_write: String,
@@ -70,15 +87,19 @@ pub struct KeyMaster {
 
 impl KeyMaster {
     /// Build from a raw root secret (already decoded). Secret must be at
-    /// least [`KEY_LENGTH`] bytes.
+    /// least [`KEY_LENGTH`] bytes. Registers it as the default (unlabeled)
+    /// secret and sets it active.
     pub fn new(root_secret: Vec<u8>) -> Result<Self, String> {
         if root_secret.len() < KEY_LENGTH {
             return Err(format!(
                 "encryption_root_secret must be a base64 encoding of at least {KEY_LENGTH} raw bytes"
             ));
         }
+        let mut root_secrets = HashMap::new();
+        root_secrets.insert(None, root_secret);
         Ok(KeyMaster {
-            root_secret,
+            root_secrets,
+            active_secret_id: None,
             meta_version_to_write: "2".into(),
         })
     }
@@ -86,74 +107,200 @@ impl KeyMaster {
     /// Decode a base64 root secret (Python `KeyMaster._decode_root_secret`:
     /// strict base64, allow line breaks/whitespace, ≥ 32 raw bytes).
     pub fn from_b64_root_secret(b64: &str) -> Result<Self, String> {
+        let secret = Self::decode_root_secret(b64)?;
+        Self::new(secret)
+    }
+
+    /// Decode one base64 root secret string.
+    pub fn decode_root_secret(b64: &str) -> Result<Vec<u8>, String> {
         let cleaned: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
         let secret = B64
             .decode(cleaned.as_bytes())
             .map_err(|e| format!("encryption_root_secret base64 decode failed: {e}"))?;
-        Self::new(secret)
+        if secret.len() < KEY_LENGTH {
+            return Err(format!(
+                "encryption_root_secret must be a base64 encoding of at least {KEY_LENGTH} raw bytes"
+            ));
+        }
+        Ok(secret)
     }
 
-    /// Build from filter conf items. Looks for `encryption_root_secret`
-    /// (the default / None secret_id). Multi-id keys are residual.
+    /// Build from filter conf items. Loads multi-key options matching Python
+    /// `load_multikey_opts(conf, 'encryption_root_secret', allow_none_key=True)`:
+    ///
+    /// * `encryption_root_secret` → secret_id `None`
+    /// * `encryption_root_secret_<id>` → secret_id `Some(id)`
+    /// * `active_root_secret_id` → which secret new writes use
+    /// * `meta_version_to_write` → `"1"` / `"2"` / `"3"`
     pub fn from_conf_items(items: &[(String, String)]) -> Result<Self, String> {
-        let mut root: Option<String> = None;
+        let mut root_secrets: HashMap<Option<String>, Vec<u8>> = HashMap::new();
+        let mut active: Option<String> = None;
         let mut meta_version = "2".to_string();
+
+        const PREFIX: &str = "encryption_root_secret";
         for (k, v) in items {
             let kl = k.to_ascii_lowercase();
-            if kl == "encryption_root_secret" {
-                root = Some(v.clone());
+            if kl == "active_root_secret_id" {
+                active = if v.is_empty() {
+                    None
+                } else {
+                    Some(v.clone())
+                };
             } else if kl == "meta_version_to_write" && !v.is_empty() {
                 meta_version = v.clone();
+            } else if kl == PREFIX {
+                root_secrets.insert(None, Self::decode_root_secret(v)?);
+            } else if let Some(id) = kl.strip_prefix("encryption_root_secret_") {
+                if id.is_empty() {
+                    return Err(format!("Malformed multi-key option name {k}"));
+                }
+                // Preserve id casing from the original option name when the
+                // key was lowercased only for matching (Python keeps case).
+                let secret_id = if k.len() >= PREFIX.len() + 1 + id.len() {
+                    k[k.len() - id.len()..].to_string()
+                } else {
+                    id.to_string()
+                };
+                root_secrets.insert(Some(secret_id), Self::decode_root_secret(v)?);
+            } else if kl.starts_with(PREFIX) {
+                // e.g. encryption_root_secretfoo without underscore
+                return Err(format!("Malformed multi-key option name {k}"));
             }
+            // other filter opts (use, keymaster_config_path residual) ignored
         }
-        let b64 = root.ok_or_else(|| {
-            "keymaster requires encryption_root_secret (base64 of ≥32 bytes)".to_string()
-        })?;
-        let mut km = Self::from_b64_root_secret(&b64)?;
+
+        if root_secrets.is_empty() {
+            return Err(
+                "keymaster requires encryption_root_secret (base64 of ≥32 bytes)".to_string(),
+            );
+        }
+
+        let active_key = active.clone();
+        if !root_secrets.contains_key(&active_key) {
+            return Err(format!(
+                "No secret loaded for active_root_secret_id {}",
+                active.as_deref().unwrap_or("<none>")
+            ));
+        }
+
         if !matches!(meta_version.as_str(), "1" | "2" | "3") {
             return Err(format!(
                 "Unknown/unsupported metadata version: {meta_version:?}"
             ));
         }
-        km.meta_version_to_write = meta_version;
-        Ok(km)
+
+        Ok(KeyMaster {
+            root_secrets,
+            active_secret_id: active,
+            meta_version_to_write: meta_version,
+        })
     }
 
-    /// Derive keys for the given path parts (account required; container /
-    /// object optional). Mirrors `KeyMasterContext.fetch_crypto_keys` for
-    /// the non-`key_id` (write / active secret) path.
+    /// Active root secret id used for new encryption (`None` = default).
+    pub fn active_secret_id(&self) -> Option<&str> {
+        self.active_secret_id.as_deref()
+    }
+
+    /// Sorted secret ids (Python `root_secret_ids`; `None` sorts as `""`).
+    pub fn root_secret_ids(&self) -> Vec<Option<String>> {
+        let mut ids: Vec<Option<String>> = self.root_secrets.keys().cloned().collect();
+        ids.sort_by(|a, b| a.as_deref().unwrap_or("").cmp(b.as_deref().unwrap_or("")));
+        ids
+    }
+
+    /// Look up raw root secret bytes by id (`None` = default unlabeled).
+    pub fn root_secret_for(&self, secret_id: Option<&str>) -> Result<&[u8], String> {
+        let key = secret_id.map(|s| s.to_string());
+        self.root_secrets
+            .get(&key)
+            .map(|s| s.as_slice())
+            .ok_or_else(|| format!("Unrecognised secret id: {}", secret_id.unwrap_or("<none>")))
+    }
+
+    /// Derive keys for the given path parts using the **active** root secret
+    /// (write path / Python `fetch_crypto_keys` without `key_id`).
     pub fn fetch_keys(
         &self,
         account: &str,
         container: Option<&str>,
         object: Option<&str>,
     ) -> CryptoKeys {
+        self.fetch_keys_for_secret(account, container, object, self.active_secret_id.as_deref())
+            .expect("active secret is validated at construction")
+    }
+
+    /// Derive keys using the secret referenced by crypto-meta `key_id`
+    /// (Python `fetch_crypto_keys(key_id=...)`).
+    ///
+    /// * `key_id == None` → use active secret (same as [`fetch_keys`])
+    /// * `key_id` present without `secret_id` → default unlabeled secret
+    /// * `key_id.secret_id` set → that named secret
+    pub fn fetch_keys_with_key_id(
+        &self,
+        account: &str,
+        container: Option<&str>,
+        object: Option<&str>,
+        key_id: Option<&serde_json::Value>,
+    ) -> Result<CryptoKeys, String> {
+        let secret_id = match key_id {
+            None => self.active_secret_id.as_deref(),
+            Some(kid) => kid.get("secret_id").and_then(|v| v.as_str()),
+        };
+        self.fetch_keys_for_secret(account, container, object, secret_id)
+    }
+
+    fn fetch_keys_for_secret(
+        &self,
+        account: &str,
+        container: Option<&str>,
+        object: Option<&str>,
+        secret_id: Option<&str>,
+    ) -> Result<CryptoKeys, String> {
+        let root = self.root_secret_for(secret_id)?;
         let mut keys = CryptoKeys {
             object: None,
             container: None,
             id: serde_json::Value::Null,
+            all_ids: Vec::new(),
         };
         let Some(cont) = container.filter(|c| !c.is_empty()) else {
-            return keys;
+            return Ok(keys);
         };
-        keys.container = Some(container_key(&self.root_secret, account, cont));
+        keys.container = Some(container_key(root, account, cont));
         let path = if let Some(obj) = object.filter(|o| !o.is_empty()) {
-            keys.object = Some(object_key(&self.root_secret, account, cont, obj));
+            keys.object = Some(object_key(root, account, cont, obj));
             format!("/{account}/{cont}/{obj}")
         } else {
             format!("/{account}/{cont}")
         };
-        keys.id = serde_json::json!({
-            "v": self.meta_version_to_write,
-            "path": path,
-        });
-        keys
+        keys.id = Self::make_key_id(&path, secret_id, &self.meta_version_to_write);
+        keys.all_ids = self
+            .root_secret_ids()
+            .into_iter()
+            .map(|id| Self::make_key_id(&path, id.as_deref(), &self.meta_version_to_write))
+            .collect();
+        Ok(keys)
     }
 
-    /// Root secret bytes (tests / diagnostics only — never log).
+    fn make_key_id(path: &str, secret_id: Option<&str>, version: &str) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        map.insert("v".into(), serde_json::Value::String(version.into()));
+        map.insert("path".into(), serde_json::Value::String(path.into()));
+        if let Some(sid) = secret_id.filter(|s| !s.is_empty()) {
+            map.insert(
+                "secret_id".into(),
+                serde_json::Value::String(sid.to_string()),
+            );
+        }
+        serde_json::Value::Object(map)
+    }
+
+    /// Root secret bytes for the active secret (tests / diagnostics only —
+    /// never log).
     #[cfg(test)]
     pub fn root_secret(&self) -> &[u8] {
-        &self.root_secret
+        self.root_secret_for(self.active_secret_id.as_deref())
+            .expect("active secret present")
     }
 }
 
@@ -191,6 +338,10 @@ mod tests {
             .collect()
     }
 
+    fn b64_of(raw: &[u8]) -> String {
+        B64.encode(raw)
+    }
+
     #[test]
     fn from_b64_and_fetch_keys_known() {
         // root = bytes(range(32)) — same vector as swift-crypto keymaster tests
@@ -206,11 +357,88 @@ mod tests {
         );
         assert_eq!(keys.id["v"], "2");
         assert_eq!(keys.id["path"], "/acct/cont/obj");
+        assert!(keys.id.get("secret_id").is_none());
     }
 
     #[test]
     fn rejects_short_secret() {
         let short = B64.encode([0u8; 16]);
         assert!(KeyMaster::from_b64_root_secret(&short).is_err());
+    }
+
+    #[test]
+    fn multi_root_secret_conf_and_active() {
+        let root_a = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+        let root_b = vec![0xffu8; 32];
+        let items = vec![
+            (
+                "encryption_root_secret".into(),
+                b64_of(&root_a),
+            ),
+            (
+                "encryption_root_secret_old".into(),
+                b64_of(&root_b),
+            ),
+            ("active_root_secret_id".into(), "old".into()),
+            ("meta_version_to_write".into(), "2".into()),
+        ];
+        let km = KeyMaster::from_conf_items(&items).unwrap();
+        assert_eq!(km.active_secret_id(), Some("old"));
+        assert_eq!(km.root_secret_ids().len(), 2);
+
+        // Writes use active ("old") secret → key_id carries secret_id.
+        let keys = km.fetch_keys("acct", Some("cont"), Some("obj"));
+        assert_eq!(keys.id["secret_id"], "old");
+        let obj_old = keys.object.unwrap();
+
+        // Historic default secret via key_id without secret_id field.
+        let kid_default = serde_json::json!({"v": "2", "path": "/acct/cont/obj"});
+        let keys_def = km
+            .fetch_keys_with_key_id("acct", Some("cont"), Some("obj"), Some(&kid_default))
+            .unwrap();
+        assert!(keys_def.id.get("secret_id").is_none());
+        assert_ne!(keys_def.object.unwrap(), obj_old);
+
+        // Named secret via key_id.secret_id
+        let kid_old = serde_json::json!({
+            "v": "2",
+            "path": "/acct/cont/obj",
+            "secret_id": "old",
+        });
+        let keys_named = km
+            .fetch_keys_with_key_id("acct", Some("cont"), Some("obj"), Some(&kid_old))
+            .unwrap();
+        assert_eq!(keys_named.object.unwrap(), obj_old);
+
+        // Unknown secret_id errors
+        let kid_bad = serde_json::json!({"v": "2", "path": "/x", "secret_id": "nope"});
+        assert!(km
+            .fetch_keys_with_key_id("acct", Some("cont"), Some("obj"), Some(&kid_bad))
+            .is_err());
+    }
+
+    #[test]
+    fn active_must_exist() {
+        let root = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+        let items = vec![
+            ("encryption_root_secret".into(), b64_of(&root)),
+            ("active_root_secret_id".into(), "missing".into()),
+        ];
+        let err = KeyMaster::from_conf_items(&items).unwrap_err();
+        assert!(err.contains("active_root_secret_id"), "{err}");
+    }
+
+    #[test]
+    fn named_only_secret_with_active() {
+        // Only encryption_root_secret_s1, active = s1 (no default None secret).
+        let root = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+        let items = vec![
+            ("encryption_root_secret_s1".into(), b64_of(&root)),
+            ("active_root_secret_id".into(), "s1".into()),
+        ];
+        let km = KeyMaster::from_conf_items(&items).unwrap();
+        let keys = km.fetch_keys("a", Some("c"), Some("o"));
+        assert_eq!(keys.id["secret_id"], "s1");
+        assert_eq!(keys.all_ids.len(), 1);
     }
 }

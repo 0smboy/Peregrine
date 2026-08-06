@@ -28,8 +28,13 @@
 //!   materialized before encrypt so etag/crypto sysmeta can be stamped as
 //!   request headers (Python uses MIME footers after the body stream)
 //! * conditional If-Match / If-None-Match etag HMAC masking on GET/HEAD
+//!   (including multi-root-secret historic-key masking)
 //! * full `swift.crypto.override` environ path (header stamp only)
-//! * multi-root-secret etag masking over historic keys
+//! * **KMIP / KMS keymasters** — still deferred (keymaster residual)
+//!
+//! Multi-root secrets: writes use the keymaster's active root secret; the
+//! resulting `key_id` (including optional `secret_id`) is stamped into
+//! body/listing crypto-meta for later decrypt.
 
 use std::sync::Arc;
 

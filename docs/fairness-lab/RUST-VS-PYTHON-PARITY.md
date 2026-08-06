@@ -27,7 +27,7 @@
 | Single + multi Range / multipart byteranges | ✅ | ✅ | |
 | Server-side COPY / X-Copy-From | ✅ | ✅ | |
 | Expiry `X-Delete-At` / `X-Delete-After` | ✅ | ✅ | Expirer daemon |
-| SLO (manifest PUT + GET reassembly) | ✅ | ✅ | Nested/streamed + inline data + heartbeat PUT + multipart-manifest=delete (2026-08-06) |
+| SLO (manifest PUT + GET reassembly) | ✅ | ✅ | Nested/streamed + inline + streaming heartbeat + sync/async multipart-delete (2026-08-06) |
 | DLO | ✅ | ✅ | Listing pagination beyond limit residual → main path ✅ |
 | Versioned writes (stack) | ✅ | ✅ | Primary suite |
 | Symlink | ✅ | ✅ | |
@@ -38,7 +38,7 @@
 | Bulk upload / extract-archive | ✅ | ✅ | tar / tar.gz / tar.bz2; `/info` bulk_upload (2026-08-06) |
 | Account autocreate | ✅ | ✅ | |
 | Allow account management | ✅ | ✅ | `allow_account_management` conf; PUT/DELETE gated 405 when off (2026-08-06) |
-| SLO residual: async multipart-delete / streaming mid-heartbeat | ✅ | ❌ | async=yes → 501; streaming whitespace heartbeat deferred |
+| SLO residual: expirer hash sharding / async ACL probes | ✅ | ❌ | day-bucket enqueue without hash_path offset; authorize residual |
 | Full Paste arbitrary pipeline (any filter name) | ✅ | ❌ | Only known filter names |
 
 ---
@@ -60,8 +60,8 @@
 | authtoken (HTTP token validate) | ✅ | ✅ | Live Contabo Keystone |
 | keystoneauth coexist with TempAuth | ✅ | ✅ | Stamp-only-when-confirmed fix |
 | s3api / s3token | ✅ | ✅ | See S3 section; not full AWS |
-| container-sync middleware + daemon | ✅ | ✅ | Proxy auth filter + `swift-container-sync` two-pass daemon + realms (unit; multi-cluster live not claimed) |
-| encrypter / decrypter / keymaster / encryption | ✅ | ✅ | ON-BY-CONFIG; PUT encrypt / GET decrypt; KMIP/rotation residual |
+| container-sync middleware + daemon | ✅ | ✅ | Proxy filter + daemon; **HTTPS remotes** via native-tls (multi-cluster live soak not claimed) |
+| encrypter / decrypter / keymaster / encryption | ✅ | ✅ | Multi-root secret + listing hash decrypt; KMIP residual |
 | xprofile / other niche Paste filters | ✅ | ❌ | |
 
 ---
@@ -78,12 +78,12 @@
 | MPU initiate / part / complete / abort | ✅ | ✅ | live 11/11 deep |
 | ListMultipartUploads | ✅ | ✅ | live |
 | ListParts | ✅ | ✅ | part-number-marker + max-parts + IsTruncated (2026-08-06) |
-| Basic canned ACL / CORS | ✅ | ❌ | unit “basics” residual → **未实现** full |
+| Canned ACL (private/public-read/public-read-write) + multi-rule CORS | ✅ | ✅ | authenticated-read → private (Python NotImplemented); object ACL residual |
 | s3token → Keystone /v3/s3tokens | ✅ | ✅ | live EC2 GREEN 2026-08-06 |
 | SigV2 | ✅ | ❌ | WONTFIX |
 | aws-chunked | ✅ | ❌ | WONTFIX |
 | Versioning / tagging / lifecycle / object-lock | ✅ | ❌ | WONTFIX / 501 |
-| Full IAM-style ACL fidelity | ✅ | ❌ | |
+| Full IAM-style ACL / object ACL XML | ✅ | ❌ | canned + multi-rule CORS only |
 
 ---
 
@@ -116,7 +116,7 @@
 | db-replicator | ✅ | ✅ | |
 | swift-recon (md5/async/quarantine/tombstone/dbspace) | ✅ | ✅ | Contabo textfile+Prom |
 | ring-builder | ✅ | ✅ | .builder pickle not bit-identical tool format |
-| manage-shard-ranges (main CLI) | ✅ | ✅ | find/show/info/enable/delete/merge/find_and_replace; compact/repair/analyze residual → strict residual |
+| manage-shard-ranges (main CLI) | ✅ | ✅ | find/show/info/enable/delete/merge/find_and_replace + **analyze/compact/repair** (dry-run/force); interactive residual |
 | dispersion / drive-audit / relinker | ✅ | ✅ | |
 
 ---
@@ -153,13 +153,13 @@
 
 | Domain | Implemented | Not implemented (incl. partial) |
 |--------|-------------|----------------------------------|
-| Swift v1 core CRUD + common middleware | **Most** | full arbitrary Paste; SLO async-delete; streaming mid-heartbeat |
+| Swift v1 core CRUD + common middleware | **Most** | full arbitrary Paste; SLO async ACL/hash_path residual |
 | Auth | TempAuth + Keystone lab | Production-only ops polish |
-| S3 | Core SigV4 + MPU + ListParts | SigV2, versioning, full IAM ACL/CORS multi-rule, aws-chunked |
+| S3 | SigV4 + MPU + ListParts + canned ACL + multi-rule CORS | SigV2, versioning, full IAM/object ACL, aws-chunked |
 | EC | Data path + heal | macOS/default build; some EC throttling niceties |
-| Sharding L3b CLI + local | manage-shard-ranges main path + local sharder | **multi-node KEEP product claim 未实现** |
-| Crypto at-rest middleware | ON-BY-CONFIG path | KMIP, multi-secret rotation, listing decrypt |
-| container-sync | filter + daemon path | multi-cluster live soak; HTTPS remotes residual |
+| Sharding L3b CLI + local | full main CLI + local sharder + primary HTTP helpers | **multi-node KEEP product claim 未实现** |
+| Crypto at-rest middleware | multi-root + listing decrypt | KMIP, streaming, multipart decrypt residual |
+| container-sync | filter + daemon + HTTPS | multi-cluster live soak; custom CA knobs |
 | Production go-live | — | **未实现** (TLS PEM deferred) |
 
 **Bottom line under the user rule (“部分 = 未实现”):**  

@@ -85,7 +85,9 @@ pub use copy::Copy;
 pub use dlo::DynamicLargeObject;
 pub use crossdomain::Crossdomain;
 pub use cname_lookup::{CnameLookup, Resolver};
-pub use decrypter::{decrypt_object_body, Decrypter};
+pub use decrypter::{
+    decrypt_container_listing_json, decrypt_listing_hash, decrypt_object_body, Decrypter,
+};
 pub use domain_remap::DomainRemap;
 pub use encrypter::{
     encrypt_object_body, random_iv, random_key, EncryptedObject, Encrypter, BODY_META_HEADER,

@@ -17,11 +17,13 @@
 //! `swift/cli/manage_shard_ranges.py`.
 //!
 //! **Implemented:** `find`, `show`, `info`, `enable`, `delete`, `merge`,
-//! `find_and_replace` (force/no-prompt mode).
+//! `find_and_replace` (force/no-prompt), `analyze` (read-only report),
+//! `compact` (identify + optional `--force` apply compactible sequences),
+//! `repair` (gaps/overlaps report + optional `--force` apply).
 //!
-//! **Deferred (explicit exit 2):** `compact`, `repair`, `analyze`, interactive
-//! replace prompts, shrink/expand sequences — need compactible-sequence /
-//! overlap-repair helpers not yet in `swift-db`.
+//! **Still deferred:** interactive prompts (use `--force` / `--yes`), full
+//! Python path-ranking repair (parent/child age filters, multi-path rank),
+//! shrink/expand driven by the sharder daemon after compact marks donors.
 //!
 //! Multi-node KEEP claim still blocked by live Contabo quorum drill + ring-
 //! directed HTTP create on all primaries (see sharder residuals).
@@ -32,8 +34,8 @@ use std::process;
 
 use swift_core::timestamp::Timestamp;
 use swift_db::{
-    make_shard_name, shard_state, shards_account_name, ContainerBroker, DbState,
-    GetShardRangesArgs, ShardRange,
+    find_namespace_gaps, find_overlapping_ranges, make_shard_name, shard_state,
+    shards_account_name, ContainerBroker, DbState, GetShardRangesArgs, ShardRange,
 };
 
 const EXIT_OK: i32 = 0;
@@ -53,7 +55,10 @@ fn usage() -> ! {
            merge --force <ranges.json>         Merge ranges from JSON array file\n\
            find_and_replace [shard_size] [--enable] [--force]\n\
                                                Find, soft-delete old, inject new\n\
-           compact | repair | analyze          Deferred (exit 2)\n\
+           analyze                             Read-only shard state report\n\
+           compact [--force] [--shrink-threshold N] [--expansion-limit N]\n\
+                                               Find (and optionally apply) compactible sequences\n\
+           repair [--gaps] [--force]           Report/fix gaps or overlaps\n\
          \n\
          Multi-node KEEP / live quorum: not claimed here; local DB ops only."
     );
@@ -464,12 +469,594 @@ fn cmd_find_and_replace(
     EXIT_OK
 }
 
-fn deferred(cmd: &str) -> i32 {
-    eprintln!(
-        "subcommand '{cmd}' is Deferred: needs shrink/expand/repair helpers \
-         not yet in swift-db (see manage_shard_ranges.py compact/repair/analyze)."
+/// Sort key for lower bound (empty = MIN).
+fn sort_by_lower(ranges: &mut [ShardRange]) {
+    ranges.sort_by(|a, b| {
+        ShardRange::lower_cmp(&a.lower, &b.lower)
+            .then_with(|| ShardRange::upper_cmp(&a.upper, &b.upper))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+/// Read-only report of stored shard ranges: states, gaps, overlaps, coverage.
+fn cmd_analyze(broker: &mut ContainerBroker) -> i32 {
+    let ranges = match broker.get_shard_ranges(&GetShardRangesArgs {
+        include_own: false,
+        include_deleted: false,
+        ..GetShardRangesArgs::default()
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return EXIT_ERROR;
+        }
+    };
+    let db_state = broker.get_db_state().ok();
+    let own = broker.get_own_shard_range(true).ok().flatten();
+    let root = broker.is_root_container().unwrap_or(true);
+
+    println!("analyze: root_container = {root}");
+    if let Some(st) = db_state {
+        println!("analyze: db_state = {}", st.as_str());
+    }
+    println!("analyze: sharding_enabled = {}", sharding_enabled(broker));
+    if let Some(own) = &own {
+        println!(
+            "analyze: own_range state={} lower={:?} upper={:?} epoch={:?}",
+            state_text(own.state),
+            own.lower,
+            own.upper,
+            own.epoch
+        );
+    } else {
+        println!("analyze: own_range = null");
+    }
+    println!("analyze: shard_range_count = {}", ranges.len());
+
+    if ranges.is_empty() {
+        println!("analyze: no shard ranges stored");
+        return EXIT_OK;
+    }
+
+    // State histogram
+    let mut by_state: Vec<(i64, usize)> = Vec::new();
+    for r in &ranges {
+        if let Some(e) = by_state.iter_mut().find(|(s, _)| *s == r.state) {
+            e.1 += 1;
+        } else {
+            by_state.push((r.state, 1));
+        }
+    }
+    by_state.sort_by_key(|(s, _)| *s);
+    print!("analyze: states =");
+    for (s, n) in &by_state {
+        print!(" {}={}", state_text(*s), n);
+    }
+    println!();
+
+    let total_objects: i64 = ranges.iter().map(|r| r.object_count).sum();
+    let total_rows: i64 = ranges.iter().map(|r| r.row_count()).sum();
+    println!("analyze: total object_count = {total_objects}");
+    println!("analyze: total row_count = {total_rows}");
+
+    let non_shrinking: Vec<ShardRange> = ranges
+        .iter()
+        .filter(|r| r.state != shard_state::SHRINKING)
+        .cloned()
+        .collect();
+    let overlaps = find_overlapping_ranges(&non_shrinking);
+    if overlaps.is_empty() {
+        println!("analyze: overlapping_groups = 0");
+    } else {
+        println!("analyze: overlapping_groups = {}", overlaps.len());
+        for (i, group) in overlaps.iter().enumerate() {
+            let names: Vec<&str> = group.iter().map(|r| r.name.as_str()).collect();
+            println!("  overlap[{i}]: {}", names.join(", "));
+        }
+    }
+
+    let gaps = find_namespace_gaps(&ranges);
+    if gaps.is_empty() {
+        println!("analyze: gaps = 0 (continuous coverage of namespace)");
+    } else {
+        println!("analyze: gaps = {}", gaps.len());
+        for (i, (lo, hi)) in gaps.iter().enumerate() {
+            let lo_s = if lo.is_empty() { "MIN" } else { lo.as_str() };
+            let hi_s = if hi.is_empty() { "MAX" } else { hi.as_str() };
+            println!("  gap[{i}]: ({lo_s}, {hi_s}]");
+        }
+    }
+
+    // Compactible preview (defaults matching common Python conf)
+    let sequences = find_compactible_sequences(&ranges, 100_000, 500_000, 1, -1);
+    println!(
+        "analyze: compactible_sequences (shrink_threshold=100000 expansion_limit=500000) = {}",
+        sequences.len()
     );
-    EXIT_INVALID
+    for (i, seq) in sequences.iter().enumerate() {
+        let donors = &seq[..seq.len() - 1];
+        let acceptor = &seq[seq.len() - 1];
+        let donor_rows: i64 = donors.iter().map(|r| r.row_count()).sum();
+        println!(
+            "  compact[{i}]: {} donor(s) rows={donor_rows} → acceptor {}",
+            donors.len(),
+            acceptor.name
+        );
+    }
+
+    // Exit 0 even when issues found — analyze is a report, not a gate.
+    EXIT_OK
+}
+
+/// Neighbour sequences that can be compacted: donors + final acceptor.
+/// Port of `find_compactible_shard_sequences` (simplified: no include_shrinking
+/// already-in-progress filter beyond state checks).
+fn find_compactible_sequences(
+    shard_ranges: &[ShardRange],
+    shrink_threshold: i64,
+    expansion_limit: i64,
+    max_shrinking: i64,
+    max_expanding: i64,
+) -> Vec<Vec<ShardRange>> {
+    let mut ranges = shard_ranges.to_vec();
+    sort_by_lower(&mut ranges);
+
+    let is_shrinking_candidate = |sr: &ShardRange| {
+        matches!(sr.state, shard_state::ACTIVE | shard_state::SHRINKING)
+            && sr.row_count() < shrink_threshold
+            && sr.row_count() <= expansion_limit
+    };
+
+    let sequence_complete = |sequence: &[ShardRange]| {
+        if sequence.is_empty() {
+            return false;
+        }
+        let last = &sequence[sequence.len() - 1];
+        let seq_rows: i64 = sequence.iter().map(|r| r.row_count()).sum();
+        !is_shrinking_candidate(last)
+            || (max_shrinking > 0 && sequence.len() as i64 > max_shrinking)
+            || seq_rows >= expansion_limit
+    };
+
+    let mut compactible = Vec::new();
+    let mut index = 0usize;
+    let mut expanding = 0i64;
+    while (max_expanding < 0 || expanding < max_expanding) && index < ranges.len() {
+        if !is_shrinking_candidate(&ranges[index]) {
+            index += 1;
+            continue;
+        }
+        let mut sequence = vec![ranges[index].clone()];
+        for shard_range in ranges.iter().skip(index + 1) {
+            let seq_upper = &sequence[sequence.len() - 1].upper;
+            // gap: sequence.upper < shard_range.lower
+            if !seq_upper.is_empty()
+                && ShardRange::lower_cmp(&shard_range.lower, seq_upper)
+                    == std::cmp::Ordering::Greater
+            {
+                break;
+            }
+            if !matches!(
+                shard_range.state,
+                shard_state::ACTIVE | shard_state::SHRINKING
+            ) {
+                break;
+            }
+            if shard_range.state == shard_state::SHRINKING {
+                sequence.push(shard_range.clone());
+            } else {
+                let seq_rows: i64 = sequence.iter().map(|r| r.row_count()).sum();
+                if seq_rows + shard_range.row_count() <= expansion_limit {
+                    sequence.push(shard_range.clone());
+                    if sequence_complete(&sequence) {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        index += sequence.len();
+        if sequence.len() < 2 {
+            continue;
+        }
+        let last_state = sequence[sequence.len() - 1].state;
+        if last_state != shard_state::ACTIVE && last_state != shard_state::SHARDED {
+            continue;
+        }
+        // already-in-progress sequences (include_shrinking=false): skip
+        if sequence.iter().any(|sr| sr.state == shard_state::SHRINKING) {
+            continue;
+        }
+        expanding += 1;
+        compactible.push(sequence);
+    }
+    compactible
+}
+
+fn cmd_compact(
+    broker: &mut ContainerBroker,
+    force: bool,
+    shrink_threshold: i64,
+    expansion_limit: i64,
+    max_shrinking: i64,
+    max_expanding: i64,
+) -> i32 {
+    match broker.is_root_container() {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("WARNING: Shard containers cannot be compacted.");
+            eprintln!("This command should be used on a root container.");
+            return EXIT_ERROR;
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            return EXIT_ERROR;
+        }
+    }
+    match broker.get_db_state() {
+        Ok(DbState::Sharded) => {}
+        Ok(st) => {
+            eprintln!(
+                "WARNING: Container is not yet sharded (db_state={}) so cannot be compacted.",
+                st.as_str()
+            );
+            return EXIT_ERROR;
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            return EXIT_ERROR;
+        }
+    }
+
+    let ranges = match broker.get_shard_ranges(&GetShardRangesArgs {
+        include_own: false,
+        include_deleted: false,
+        ..GetShardRangesArgs::default()
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return EXIT_ERROR;
+        }
+    };
+
+    let non_shrinking: Vec<ShardRange> = ranges
+        .iter()
+        .filter(|r| r.state != shard_state::SHRINKING)
+        .cloned()
+        .collect();
+    if !find_overlapping_ranges(&non_shrinking).is_empty() {
+        eprintln!("WARNING: Container has overlapping shard ranges so cannot be compacted.");
+        return EXIT_ERROR;
+    }
+
+    let compactible = find_compactible_sequences(
+        &ranges,
+        shrink_threshold,
+        expansion_limit,
+        max_shrinking,
+        max_expanding,
+    );
+    if compactible.is_empty() {
+        println!("No shards identified for compaction.");
+        return EXIT_OK;
+    }
+
+    for sequence in &compactible {
+        let acceptor = &sequence[sequence.len() - 1];
+        let donors = &sequence[..sequence.len() - 1];
+        let donor_rows: i64 = donors.iter().map(|r| r.row_count()).sum();
+        println!(
+            "Donor shard range(s) with total of {donor_rows} rows → acceptor {}:",
+            acceptor.name
+        );
+        for d in donors {
+            println!(
+                "  donor {} ({:?}, {:?}] rows={} state={}",
+                d.name,
+                d.lower,
+                d.upper,
+                d.row_count(),
+                state_text(d.state)
+            );
+        }
+        println!(
+            "  acceptor {} ({:?}, {:?}] rows={} state={}",
+            acceptor.name,
+            acceptor.lower,
+            acceptor.upper,
+            acceptor.row_count(),
+            state_text(acceptor.state)
+        );
+    }
+    println!(
+        "Total of {} shard sequences identified for compaction.",
+        compactible.len()
+    );
+
+    if !force {
+        println!("Dry-run only. Re-run with --force to apply SHRINKING donors + expand acceptors.");
+        return EXIT_OK;
+    }
+
+    let ts = Timestamp::now().internal();
+    let mut to_merge = Vec::new();
+    for sequence in &compactible {
+        let donors = &sequence[..sequence.len() - 1];
+        let mut acceptor = sequence[sequence.len() - 1].clone();
+        if acceptor.expand(donors) {
+            acceptor.timestamp = ts.clone();
+        }
+        if acceptor.update_state(shard_state::ACTIVE, Some(&ts)) {
+            // state_timestamp already set by update_state
+        }
+        for d in donors {
+            let mut donor = d.clone();
+            if donor.update_state(shard_state::SHRINKING, Some(&ts)) {
+                donor.epoch = Some(ts.clone());
+            }
+            to_merge.push(donor);
+        }
+        to_merge.push(acceptor);
+    }
+    match broker.merge_shard_ranges(to_merge) {
+        Ok(()) => {
+            println!(
+                "Updated {} shard sequences for compaction.",
+                compactible.len()
+            );
+            println!("Run container-replicator to replicate the changes to other nodes.");
+            println!("Run container-sharder on all nodes to compact shards.");
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            EXIT_ERROR
+        }
+    }
+}
+
+fn cmd_repair(broker: &mut ContainerBroker, gaps_mode: bool, force: bool) -> i32 {
+    match broker.is_root_container() {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("WARNING: Shard containers cannot be repaired.");
+            eprintln!("This command should be used on a root container.");
+            return EXIT_ERROR;
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            return EXIT_ERROR;
+        }
+    }
+
+    let ranges = match broker.get_shard_ranges(&GetShardRangesArgs {
+        include_own: false,
+        include_deleted: false,
+        ..GetShardRangesArgs::default()
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return EXIT_ERROR;
+        }
+    };
+
+    if ranges.is_empty() {
+        println!("No shards found, nothing to do.");
+        return EXIT_OK;
+    }
+
+    if gaps_mode {
+        return repair_gaps(broker, &ranges, force);
+    }
+    repair_overlaps(broker, &ranges, force)
+}
+
+fn repair_gaps(broker: &mut ContainerBroker, ranges: &[ShardRange], force: bool) -> i32 {
+    let gaps = find_namespace_gaps(ranges);
+    if gaps.is_empty() {
+        println!(
+            "Found one continuous span of {} shard ranges with no gaps.",
+            ranges.len()
+        );
+        println!("No repairs necessary.");
+        return EXIT_OK;
+    }
+
+    println!("Found {} gap(s):", gaps.len());
+    let mut expansions: Vec<ShardRange> = Vec::new();
+    let ts = Timestamp::now().internal();
+
+    for (lo, hi) in &gaps {
+        let lo_s = if lo.is_empty() { "MIN" } else { lo.as_str() };
+        let hi_s = if hi.is_empty() { "MAX" } else { hi.as_str() };
+        println!("  gap: ({lo_s}, {hi_s}]");
+
+        // Prefer expanding the lower ACTIVE neighbour (upper bound = gap lower),
+        // else the upper ACTIVE neighbour (lower bound = gap upper).
+        let mut sorted = ranges.to_vec();
+        sort_by_lower(&mut sorted);
+        let lower_neighbor = sorted
+            .iter()
+            .filter(|r| r.state == shard_state::ACTIVE && r.upper == *lo)
+            .last()
+            .cloned();
+        let upper_neighbor = sorted
+            .iter()
+            .find(|r| r.state == shard_state::ACTIVE && r.lower == *hi)
+            .cloned();
+
+        if let Some(mut n) = lower_neighbor {
+            let donor = ShardRange::new("gap", &ts, lo, hi);
+            if n.expand(std::slice::from_ref(&donor)) {
+                n.timestamp = ts.clone();
+                println!("    expand lower neighbor {} → upper {:?}", n.name, n.upper);
+                expansions.push(n);
+            }
+        } else if let Some(mut n) = upper_neighbor {
+            let donor = ShardRange::new("gap", &ts, lo, hi);
+            if n.expand(std::slice::from_ref(&donor)) {
+                n.timestamp = ts.clone();
+                println!("    expand upper neighbor {} → lower {:?}", n.name, n.lower);
+                expansions.push(n);
+            }
+        } else {
+            println!("    WARNING: cannot fix gap: no ACTIVE neighbour");
+        }
+    }
+
+    if expansions.is_empty() {
+        eprintln!("No gap repairs could be planned.");
+        return EXIT_ERROR;
+    }
+
+    if !force {
+        println!(
+            "Planned {} expansion(s). Re-run with --force to apply.",
+            expansions.len()
+        );
+        return EXIT_OK;
+    }
+
+    match broker.merge_shard_ranges(expansions.clone()) {
+        Ok(()) => {
+            println!("Applied {} expanded shard range(s).", expansions.len());
+            println!("Run container-replicator to replicate the changes to other nodes.");
+            println!("Run container-sharder on all nodes to fill gaps.");
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            EXIT_ERROR
+        }
+    }
+}
+
+fn repair_overlaps(broker: &mut ContainerBroker, ranges: &[ShardRange], force: bool) -> i32 {
+    if ranges
+        .iter()
+        .any(|r| r.state == shard_state::SHARDING || r.state == shard_state::SHRINKING)
+    {
+        eprintln!(
+            "WARNING: Found shard ranges in sharding/shrinking state; \
+             re-try repair after those complete."
+        );
+        return EXIT_ERROR;
+    }
+
+    let overlaps = find_overlapping_ranges(ranges);
+    if overlaps.is_empty() {
+        let gaps = find_namespace_gaps(ranges);
+        if !gaps.is_empty() {
+            println!("Found no overlapping shard ranges but {} gap(s).", gaps.len());
+            println!("Use: … repair --gaps  to plan gap fills.");
+            return EXIT_OK;
+        }
+        println!(
+            "Found one complete sequence of {} shard ranges and no overlapping shard ranges.",
+            ranges.len()
+        );
+        println!("No repairs necessary.");
+        return EXIT_OK;
+    }
+
+    // Keep the highest-ranked range in each overlapping group as acceptor;
+    // all other members of the group become donors. Rank: ACTIVE first,
+    // then object_count, then name (stable).
+    let mut donor_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut acceptor_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for group in &overlaps {
+        let best = group
+            .iter()
+            .max_by(|a, b| {
+                (a.state == shard_state::ACTIVE)
+                    .cmp(&(b.state == shard_state::ACTIVE))
+                    .then(a.object_count.cmp(&b.object_count))
+                    .then(a.name.cmp(&b.name))
+            })
+            .expect("non-empty overlap group");
+        acceptor_names.insert(best.name.clone());
+        for r in group {
+            if r.name != best.name {
+                donor_names.insert(r.name.clone());
+            }
+        }
+    }
+    // A name chosen as acceptor in one group may still be a donor in another;
+    // prefer acceptor.
+    donor_names.retain(|n| !acceptor_names.contains(n));
+
+    let donors: Vec<ShardRange> = ranges
+        .iter()
+        .filter(|r| donor_names.contains(&r.name))
+        .cloned()
+        .collect();
+    let acceptors: Vec<ShardRange> = ranges
+        .iter()
+        .filter(|r| !donor_names.contains(&r.name))
+        .cloned()
+        .collect();
+
+    println!("Repairs necessary to remove overlapping shard ranges.");
+    println!(
+        "Chosen {} acceptor range(s); {} donor range(s) will be set SHRINKING.",
+        acceptors.len(),
+        donors.len()
+    );
+    for d in &donors {
+        println!(
+            "  donor {} ({:?}, {:?}] objects={}",
+            d.name, d.lower, d.upper, d.object_count
+        );
+    }
+    for a in &acceptors {
+        println!(
+            "  acceptor {} ({:?}, {:?}] objects={}",
+            a.name, a.lower, a.upper, a.object_count
+        );
+    }
+
+    if donors.is_empty() {
+        println!("No donor ranges to shrink.");
+        return EXIT_OK;
+    }
+
+    if !force {
+        println!("Dry-run only. Re-run with --force to mark donors SHRINKING.");
+        return EXIT_OK;
+    }
+
+    let ts = Timestamp::now().internal();
+    let mut to_merge = Vec::new();
+    for d in &donors {
+        let mut donor = d.clone();
+        if donor.update_state(shard_state::SHRINKING, Some(&ts)) {
+            donor.epoch = Some(ts.clone());
+        }
+        to_merge.push(donor);
+    }
+    match broker.merge_shard_ranges(to_merge) {
+        Ok(()) => {
+            println!("Updated {} donor shard ranges.", donors.len());
+            println!("Run container-replicator to replicate the changes to other nodes.");
+            println!("Run container-sharder on all nodes to repair shards.");
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            EXIT_ERROR
+        }
+    }
+}
+
+fn parse_flag_i64(args: &[String], name: &str, default: i64) -> i64 {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 fn main() {
@@ -534,7 +1121,34 @@ fn main() {
             let min_size = nums.get(1).copied().unwrap_or(shard_size / 5).max(1);
             cmd_find_and_replace(&mut broker, shard_size, min_size, enable, force)
         }
-        "compact" | "repair" | "analyze" | "replace" => deferred(&cmd),
+        "analyze" => cmd_analyze(&mut broker),
+        "compact" => {
+            let force = args.iter().any(|a| a == "--force" || a == "-f" || a == "--yes" || a == "-y");
+            let shrink_threshold = parse_flag_i64(&args, "--shrink-threshold", 100_000);
+            let expansion_limit = parse_flag_i64(&args, "--expansion-limit", 500_000);
+            let max_shrinking = parse_flag_i64(&args, "--max-shrinking", 1);
+            let max_expanding = parse_flag_i64(&args, "--max-expanding", -1);
+            cmd_compact(
+                &mut broker,
+                force,
+                shrink_threshold,
+                expansion_limit,
+                max_shrinking,
+                max_expanding,
+            )
+        }
+        "repair" => {
+            let force = args.iter().any(|a| a == "--force" || a == "-f" || a == "--yes" || a == "-y");
+            let gaps_mode = args.iter().any(|a| a == "--gaps");
+            cmd_repair(&mut broker, gaps_mode, force)
+        }
+        "replace" => {
+            eprintln!(
+                "subcommand 'replace' is Deferred: use find_and_replace --force \
+                 or merge --force <ranges.json> after delete --force."
+            );
+            EXIT_INVALID
+        }
         other => {
             eprintln!("unknown subcommand: {other}");
             usage();
@@ -666,5 +1280,128 @@ mod tests {
     fn state_text_known() {
         assert_eq!(state_text(shard_state::ACTIVE), "active");
         assert_eq!(state_text(shard_state::FOUND), "found");
+    }
+
+    #[test]
+    fn analyze_reports_gaps_and_overlaps() {
+        let (dir, mut b) = tmp_db("an");
+        let epoch = "1751500010.00000";
+        // gap between m and z, plus overlap on the high side
+        let mut lo = ShardRange::new(".shards_AUTH_test/big-0", epoch, "", "m");
+        lo.state = shard_state::ACTIVE;
+        lo.object_count = 2;
+        let mut mid = ShardRange::new(".shards_AUTH_test/big-1", epoch, "m", "z");
+        mid.state = shard_state::ACTIVE;
+        mid.object_count = 1;
+        let mut ov = ShardRange::new(".shards_AUTH_test/big-ov", epoch, "p", "");
+        ov.state = shard_state::ACTIVE;
+        ov.object_count = 5;
+        let mut hi = ShardRange::new(".shards_AUTH_test/big-2", epoch, "z", "");
+        hi.state = shard_state::ACTIVE;
+        b.merge_shard_ranges(vec![lo, mid, ov, hi]).unwrap();
+        assert_eq!(cmd_analyze(&mut b), EXIT_OK);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn find_compactible_sequences_small_donor() {
+        let mut a = ShardRange::new("a/c-0", "1", "", "m");
+        a.state = shard_state::ACTIVE;
+        a.object_count = 10; // below shrink_threshold
+        let mut b = ShardRange::new("a/c-1", "1", "m", "");
+        b.state = shard_state::ACTIVE;
+        b.object_count = 50;
+        let seqs = find_compactible_sequences(&[a, b], 20, 100, 1, -1);
+        assert_eq!(seqs.len(), 1);
+        assert_eq!(seqs[0].len(), 2);
+        assert_eq!(seqs[0][1].name, "a/c-1");
+    }
+
+    fn force_sharded(b: &mut ContainerBroker) {
+        let epoch = Timestamp::now().internal();
+        b.enable_sharding(&epoch).unwrap();
+        assert!(b.set_sharding_state().unwrap());
+        assert!(b.set_sharded_state().unwrap());
+        assert_eq!(b.get_db_state().unwrap(), DbState::Sharded);
+    }
+
+    #[test]
+    fn compact_dry_run_and_force() {
+        let (dir, mut b) = tmp_db("cp");
+        let epoch = "1751500010.00000";
+        let mut donor = ShardRange::new(".shards_AUTH_test/big-0", epoch, "", "m");
+        donor.state = shard_state::ACTIVE;
+        donor.object_count = 5;
+        let mut acc = ShardRange::new(".shards_AUTH_test/big-1", epoch, "m", "");
+        acc.state = shard_state::ACTIVE;
+        acc.object_count = 50;
+        b.merge_shard_ranges(vec![donor, acc]).unwrap();
+        force_sharded(&mut b);
+        // dry-run
+        assert_eq!(cmd_compact(&mut b, false, 20, 100, 1, -1), EXIT_OK);
+        let before = b
+            .get_shard_ranges(&GetShardRangesArgs::default())
+            .unwrap();
+        assert!(before.iter().all(|r| r.state == shard_state::ACTIVE));
+        // apply
+        assert_eq!(cmd_compact(&mut b, true, 20, 100, 1, -1), EXIT_OK);
+        let after = b
+            .get_shard_ranges(&GetShardRangesArgs {
+                include_deleted: false,
+                include_own: false,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            after.iter().any(|r| r.state == shard_state::SHRINKING),
+            "{after:?}"
+        );
+        let acceptor = after
+            .iter()
+            .find(|r| r.name.contains("big-1"))
+            .expect("acceptor");
+        assert_eq!(acceptor.lower, "");
+        assert_eq!(acceptor.upper, "");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn repair_gaps_and_overlaps_force() {
+        let (dir, mut b) = tmp_db("rp");
+        let epoch = "1751500010.00000";
+        // gap: m..z missing
+        let mut lo = ShardRange::new(".shards_AUTH_test/g0", epoch, "", "m");
+        lo.state = shard_state::ACTIVE;
+        let mut hi = ShardRange::new(".shards_AUTH_test/g1", epoch, "z", "");
+        hi.state = shard_state::ACTIVE;
+        b.merge_shard_ranges(vec![lo, hi]).unwrap();
+        assert_eq!(cmd_repair(&mut b, true, false), EXIT_OK);
+        assert_eq!(cmd_repair(&mut b, true, true), EXIT_OK);
+        let fixed = b
+            .get_shard_ranges(&GetShardRangesArgs::default())
+            .unwrap();
+        assert!(
+            find_namespace_gaps(&fixed).is_empty(),
+            "gaps remain: {:?}",
+            find_namespace_gaps(&fixed)
+        );
+
+        // Overlap case on a fresh set of names
+        let mut a = ShardRange::new(".shards_AUTH_test/o0", epoch, "", "z");
+        a.state = shard_state::ACTIVE;
+        a.object_count = 1;
+        let mut c = ShardRange::new(".shards_AUTH_test/o1", epoch, "m", "");
+        c.state = shard_state::ACTIVE;
+        c.object_count = 9;
+        b.merge_shard_ranges(vec![a, c]).unwrap();
+        assert_eq!(cmd_repair(&mut b, false, true), EXIT_OK);
+        let after = b
+            .get_shard_ranges(&GetShardRangesArgs::default())
+            .unwrap();
+        assert!(
+            after.iter().any(|r| r.state == shard_state::SHRINKING),
+            "{after:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -638,6 +638,7 @@ name = "swift-container-server"
 version = "0.1.0"
 dependencies = [
  "hmac",
+ "native-tls",
  "serde_json",
  "sha1",
  "swift-account-server",

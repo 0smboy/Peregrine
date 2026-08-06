@@ -101,6 +101,14 @@ for must in swift-proxy-server swift-account-server swift-container-server \
             swift-object-server swift-ring-builder; do
   [ -x "$STAGE/bin/$must" ] || die "required binary missing from pack: $must"
 done
+# Optional but expected after parallel feature wave (warn, don't fail old packs)
+for opt in swift-container-sync swift-container-sharder swift-manage-shard-ranges; do
+  if [ -x "$STAGE/bin/$opt" ]; then
+    ok "optional binary present: $opt"
+  else
+    warn "optional binary missing (feature incomplete or not built): $opt"
+  fi
+done
 
 install -m 0755 "$CONSOLE_REL/swift-console" "$STAGE/bin/swift-console"
 copied=$((copied + 1))

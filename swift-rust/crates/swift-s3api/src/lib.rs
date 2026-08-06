@@ -25,10 +25,11 @@
 //!
 //! # Residuals
 //!
-//! SigV2, aws-chunked streaming, full IAM/object ACL fidelity, multi-rule
-//! CORS edge cases, versioning / tagging / lifecycle / object-lock
-//! (production stop-line: written WONTFIX unless reopened), clock-skew/
-//! expiry enforcement on every path.
+//! SigV2, aws-chunked streaming, full IAM/object ACL fidelity,
+//! authenticated-read / log-delivery-write canned ACLs (Python NotImplemented),
+//! CORS ExposeHeader edge cases in live preflight, versioning / tagging /
+//! lifecycle / object-lock (production stop-line: written WONTFIX unless
+//! reopened), clock-skew/expiry enforcement on every path.
 //! Unknown access keys (EC2 / Keystone) are deferred via an optional
 //! [`swift_middleware::S3TokenClient`] on [`middleware::S3Api`] (inline
 //! `/v3/s3tokens` exchange with a real base64 string-to-sign). The

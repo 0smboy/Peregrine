@@ -221,6 +221,184 @@ impl ShardRange {
         let below_upper = self.upper.is_empty() || value <= self.upper.as_str();
         above_lower && below_upper
     }
+
+    /// `ShardRange.row_count`: object_count + max(tombstones, 0).
+    pub fn row_count(&self) -> i64 {
+        self.object_count + self.tombstones.max(0)
+    }
+
+    /// Compare two lower bounds where `""` is namespace minimum (-inf).
+    pub fn lower_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+        match (a.is_empty(), b.is_empty()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (false, false) => a.cmp(b),
+        }
+    }
+
+    /// Compare two upper bounds where `""` is namespace maximum (+inf).
+    pub fn upper_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+        match (a.is_empty(), b.is_empty()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater, // MAX > real
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => a.cmp(b),
+        }
+    }
+
+    /// True if this range's lower is strictly less than `upper` (empty upper = MAX).
+    fn lower_lt_upper(lower: &str, upper: &str) -> bool {
+        if upper.is_empty() {
+            true // anything < MAX (including MIN lower)
+        } else if lower.is_empty() {
+            true // MIN < any real upper
+        } else {
+            lower < upper
+        }
+    }
+
+    /// `Namespace.overlaps`: `max(lower) < min(upper)` with empty = MIN/MAX.
+    pub fn overlaps(&self, other: &ShardRange) -> bool {
+        // max of lowers (empty = MIN)
+        let max_lo = match Self::lower_cmp(&self.lower, &other.lower) {
+            std::cmp::Ordering::Less => other.lower.as_str(),
+            _ => self.lower.as_str(),
+        };
+        // min of uppers (empty = MAX)
+        let min_hi = match Self::upper_cmp(&self.upper, &other.upper) {
+            std::cmp::Ordering::Greater => other.upper.as_str(),
+            _ => self.upper.as_str(),
+        };
+        Self::lower_lt_upper(max_lo, min_hi)
+    }
+
+    /// Whether this range includes the whole of `other` (`Namespace.includes`).
+    pub fn includes_range(&self, other: &ShardRange) -> bool {
+        Self::lower_cmp(&self.lower, &other.lower) != std::cmp::Ordering::Greater
+            && Self::upper_cmp(&other.upper, &self.upper) != std::cmp::Ordering::Greater
+    }
+
+    /// `Namespace.expand`: widen bounds to cover all donors. Returns true if
+    /// bounds changed.
+    pub fn expand(&mut self, donors: &[ShardRange]) -> bool {
+        let mut new_lower = self.lower.clone();
+        let mut new_upper = self.upper.clone();
+        for d in donors {
+            if Self::lower_cmp(&d.lower, &new_lower) == std::cmp::Ordering::Less {
+                new_lower = d.lower.clone();
+            }
+            if Self::upper_cmp(&d.upper, &new_upper) == std::cmp::Ordering::Greater {
+                new_upper = d.upper.clone();
+            }
+        }
+        if new_lower != self.lower || new_upper != self.upper {
+            self.lower = new_lower;
+            self.upper = new_upper;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Update state if different; bumps `state_timestamp` when set. Returns
+    /// whether the state changed (`ShardRange.update_state`).
+    pub fn update_state(&mut self, new_state: i64, state_timestamp: Option<&str>) -> bool {
+        if self.state == new_state {
+            return false;
+        }
+        self.state = new_state;
+        if let Some(ts) = state_timestamp {
+            self.state_timestamp = ts.to_string();
+        }
+        true
+    }
+}
+
+/// Pairwise overlapping groups among non-deleted ranges (excluding self-pairs).
+/// Each group is sorted by [`ShardRange::sort_key`].
+pub fn find_overlapping_ranges(shard_ranges: &[ShardRange]) -> Vec<Vec<ShardRange>> {
+    let mut result: Vec<Vec<ShardRange>> = Vec::new();
+    for i in 0..shard_ranges.len() {
+        let mut overlapping: Vec<ShardRange> = Vec::new();
+        for j in (i + 1)..shard_ranges.len() {
+            if shard_ranges[i].name != shard_ranges[j].name
+                && shard_ranges[i].overlaps(&shard_ranges[j])
+            {
+                overlapping.push(shard_ranges[j].clone());
+            }
+        }
+        if !overlapping.is_empty() {
+            overlapping.push(shard_ranges[i].clone());
+            overlapping.sort_by_key(|r| r.sort_key());
+            // Dedup by sorted name-set so the same clique isn't reported twice
+            // when found from different seeds (best-effort).
+            let key: Vec<String> = overlapping.iter().map(|r| r.name.clone()).collect();
+            let already = result.iter().any(|g| {
+                let mut gk: Vec<String> = g.iter().map(|r| r.name.clone()).collect();
+                gk.sort();
+                let mut kk = key.clone();
+                kk.sort();
+                gk == kk
+            });
+            if !already {
+                result.push(overlapping);
+            }
+        }
+    }
+    result
+}
+
+/// Gaps between contiguous sorted (by lower) non-SHRINKING ranges.
+/// Each gap is `(lower, upper)` of the missing namespace interval.
+pub fn find_namespace_gaps(shard_ranges: &[ShardRange]) -> Vec<(String, String)> {
+    let mut ranges: Vec<&ShardRange> = shard_ranges
+        .iter()
+        .filter(|r| r.deleted == 0 && r.state != state::SHRINKING)
+        .collect();
+    ranges.sort_by(|a, b| {
+        ShardRange::lower_cmp(&a.lower, &b.lower).then_with(|| ShardRange::upper_cmp(&a.upper, &b.upper))
+    });
+    let mut gaps = Vec::new();
+    if ranges.is_empty() {
+        // entire namespace is a gap
+        gaps.push((String::new(), String::new()));
+        return gaps;
+    }
+    // gap before first
+    if !ranges[0].lower.is_empty() {
+        gaps.push((String::new(), ranges[0].lower.clone()));
+    }
+    let mut cursor_upper = ranges[0].upper.clone();
+    for r in ranges.iter().skip(1) {
+        // if r.lower > cursor_upper → gap (cursor_upper, r.lower)
+        // empty cursor_upper = MAX → no further gap possible
+        if cursor_upper.is_empty() {
+            break;
+        }
+        match ShardRange::lower_cmp(&r.lower, &cursor_upper) {
+            std::cmp::Ordering::Greater => {
+                gaps.push((cursor_upper.clone(), r.lower.clone()));
+                cursor_upper = r.upper.clone();
+            }
+            std::cmp::Ordering::Equal => {
+                // contiguous: advance cursor if this range extends further
+                if ShardRange::upper_cmp(&r.upper, &cursor_upper) == std::cmp::Ordering::Greater {
+                    cursor_upper = r.upper.clone();
+                }
+            }
+            std::cmp::Ordering::Less => {
+                // overlap or nested: extend cursor if needed
+                if ShardRange::upper_cmp(&r.upper, &cursor_upper) == std::cmp::Ordering::Greater {
+                    cursor_upper = r.upper.clone();
+                }
+            }
+        }
+    }
+    if !cursor_upper.is_empty() {
+        gaps.push((cursor_upper, String::new()));
+    }
+    gaps
 }
 
 /// `merge_shards`: compare `new` against `existing`, folding any items of
@@ -424,5 +602,44 @@ mod tests {
         assert!(!r.includes("n"));
         let whole = ShardRange::new("a", "1", "", ""); // (-inf, +inf]
         assert!(whole.includes("anything"));
+    }
+
+    #[test]
+    fn test_overlaps_and_expand() {
+        let a = ShardRange::new("a", "1", "", "m");
+        let b = ShardRange::new("b", "1", "m", "");
+        let c = ShardRange::new("c", "1", "g", "z");
+        assert!(!a.overlaps(&b), "contiguous abutting ranges do not overlap");
+        assert!(a.overlaps(&c));
+        assert!(b.overlaps(&c));
+        let mut acc = b.clone();
+        assert!(acc.expand(&[a.clone()]));
+        assert_eq!(acc.lower, "");
+        assert_eq!(acc.upper, "");
+        assert_eq!(a.row_count(), 0);
+        let mut with_tomb = a.clone();
+        with_tomb.object_count = 3;
+        with_tomb.tombstones = 2;
+        assert_eq!(with_tomb.row_count(), 5);
+    }
+
+    #[test]
+    fn test_find_gaps_and_overlaps() {
+        let ranges = vec![
+            ShardRange::new("lo", "1", "", "m"),
+            ShardRange::new("hi", "1", "z", ""),
+        ];
+        let gaps = find_namespace_gaps(&ranges);
+        assert_eq!(gaps, vec![("m".into(), "z".into())]);
+        let ok = vec![
+            ShardRange::new("lo", "1", "", "m"),
+            ShardRange::new("hi", "1", "m", ""),
+        ];
+        assert!(find_namespace_gaps(&ok).is_empty());
+        let ov = vec![
+            ShardRange::new("a", "1", "", "z"),
+            ShardRange::new("b", "1", "m", ""),
+        ];
+        assert!(!find_overlapping_ranges(&ov).is_empty());
     }
 }

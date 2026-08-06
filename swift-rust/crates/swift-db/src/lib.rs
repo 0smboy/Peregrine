@@ -52,8 +52,8 @@ pub use replicator::{
     ReplicateOutcome, RsyncTransport,
 };
 pub use shard::{
-    merge_shards, resolve_shard_range_states, sift_shard_ranges, state as shard_state, ShardRange,
-    SHARD_RANGE_KEYS, SHARD_UPDATE_STATES,
+    find_namespace_gaps, find_overlapping_ranges, merge_shards, resolve_shard_range_states,
+    sift_shard_ranges, state as shard_state, ShardRange, SHARD_RANGE_KEYS, SHARD_UPDATE_STATES,
 };
 pub use container::{
     get_db_files, hash_container_name, make_db_file_path, make_shard_name, parse_db_filename,
