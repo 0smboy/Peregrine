@@ -10,6 +10,7 @@ authors.workspace = true
 swift-core = { path = "../swift-core" }
 swift-http = { path = "../swift-http" }
 swift-memcache = { path = "../swift-memcache" }
+swift-crypto = { path = "../swift-crypto" }
 sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"

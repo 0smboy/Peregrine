@@ -18,11 +18,11 @@ These items explain why Contabo/deploy cannot mirror full Python ansible.
 | memcache-backed account/container **info** cache (shared across proxies) | — | **DONE (P1c)** — L2 authoritative when `memcache_servers` set; L1-only fallback without memcache |
 | P2a: object-expirer / account-reaper / container-reconciler / container-updater as conf services | — | **DONE (P2a)** — VIP E2E expirer+updater; func 54/54; see `tools/test-results/p2a-daemons-20260804/` |
 | `servers_per_port` / per-disk object listeners | — | **Wave 2 CODE GREEN / Contabo PARTIAL** — per-device ring ports (`object_port_per_device`) + process-per-port supervise; Contabo live ring rebuild backlog (no wipe). See `tools/test-results/wave2-spp-region-20260805/` |
-| `bulk_upload` / `?extract-archive` | Upload archive path unsupported | Medium (wontfix P1b; backlog) |
+| `bulk_upload` / `?extract-archive` | — | **DONE (2026-08-06)** — tar/tar.gz/tar.bz2 + `/info` bulk_upload |
 | Keystone / MariaDB on Contabo | Identity infra absent; VIP stays TempAuth | Medium — code path PARTIAL; live cutover FROZEN without external Keystone |
 | Full S3 API (SigV2 / aws-chunked / versioning WONTFIX; full IAM ACL; Contabo VIP enable) | Beyond unit stop-line | Medium — see wave3-s3-l3b-prod matrix; [S3-ON-BY-CONFIG.md](S3-ON-BY-CONFIG.md) |
 | Continuous auditor SLA | — | **DONE (P2b)** — continuous systemd daemons (object interval=30, DB=1800); nightly timer disabled; see `tools/test-results/p2b-audit-20260804/` + AUDITOR-SLA.md |
-| container-sync full proxy filter + daemon path | Not claimed | **wontfix P2b** — library HMAC/sync-row core only; backlog if product claims sync |
+| container-sync full proxy filter + daemon path | — | **DONE path (2026-08-06)** — proxy filter + `swift-container-sync` daemon; multi-cluster live soak not claimed |
 | `workers` prefork semantics | Integer knobs mislead A/B | **DONE (P2c)** — WORKERS-SEMANTICS.md + `swift-effective-concurrency` / `effective-concurrency.py` + library `effective_concurrency` |
 | Keepalived inside bundle-rust | Was Contabo-only overlay | **DONE (build/phase1)** — `rust_keepalived` + workspace allows `ingress.mode=keepalived` |
 | HAProxy TLS termination (`lb_mode=https`) | Client HTTPS at VIP | **DONE (P3-ops code)** — self-signed or `haproxy_tls_pem_src`; Contabo live cert apply = dry-run only (lab stays http:8085). Evidence `tools/test-results/p3-ops-20260804/` |
@@ -30,11 +30,14 @@ These items explain why Contabo/deploy cannot mirror full Python ansible.
 | Multi-region ring labels | Cross-region affinity | **Wave 2 samples + dry-run** — r1/r2 host_vars samples + drill plan; Contabo live label drill backlog (not WAN). [MULTI-REGION.md](MULTI-REGION.md) · `wave2-spp-region-20260805/` |
 | P3-ops: HAProxy TLS + expand + multi-region host_vars | Ops completeness | **DONE (P3-ops code)** — `lb_mode=https` TLS terminate; `expand.yml`; region/zone/swift_devices in rings; dual-guard no wipe. Contabo live TLS may be dry-run only. See `tools/test-results/p3-ops-*` + P3-OPS-CONTRACT.md |
 
-L3b container sharding: **Wave 3 PARTIAL** (2026-08-05 prod stop-line) —
-CleavingContext persist, auto_shard gate, misplaced unit, `HttpShardReplicator`
-quorum (unit), proxy listing fan-out helpers + tests. Contabo multi-node live
-quorum + 4KB KEEP **not claimed**. See
-`tools/test-results/wave3-s3-l3b-prod-20260805/`.
+L3b container sharding: **Wave 3 PARTIAL** (2026-08-05 prod stop-line; CLI
+expanded 2026-08-06) — CleavingContext persist, auto_shard gate + unit path,
+misplaced unit, `HttpShardReplicator` quorum (unit), proxy listing fan-out,
+manage-shard-ranges find/show/info/enable/delete/merge/find_and_replace.
+**Multi-node KEEP blockers:** live Contabo quorum drill; ring-directed HTTP
+shard create on all primaries wired through daemon; compact/repair/analyze;
+shrink/expand sequences. Contabo multi-node live quorum + 4KB KEEP **not
+claimed**. See `tools/test-results/wave3-s3-l3b-prod-20260805/`.
 
 | Item (2026-08-03 refresh) | Status |
 |---------------------------|--------|
@@ -45,4 +48,4 @@ quorum + 4KB KEEP **not claimed**. See
 | 6h soak per impl | **DONE R8** — DIRECT 4KB_write_128 6h fail_total=0 |
 | P3-data X-Newest best-source | **PARTIAL DONE** — proxy collect+newest; resumable multi-GET still deferred |
 | P3-data / Wave 3 L3b sharder | **PARTIAL** — persist + auto_shard + fan-out code; live multi-node quorum / KEEP not claimed (`wave3-s3-l3b-20260805/`) |
-| P3-data at-rest crypto middleware | **Deferred** — `swift-crypto` library only |
+| P3-data at-rest crypto middleware | **DONE path (2026-08-06)** — keymaster/encrypter/decrypter/encryption ON-BY-CONFIG; KMIP residual |

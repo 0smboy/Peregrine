@@ -31,10 +31,15 @@
 //! `auto_shard`, a local misplaced-object pass, and an HTTP shard-replicate
 //! hook. Proxy listing fan-out lives in `swift-proxy-server`.
 //!
-//! Residuals vs full Python L3b:
-//! - shrink / expand of shard ranges
-//! - multi-node quorum with real ring-direct HTTP (trait + local stub ship;
-//!   live Contabo drill is backlog)
+//! Residuals vs full Python L3b / multi-node KEEP claim blockers:
+//! - shrink / expand / compactible-sequence of shard ranges
+//! - live Contabo multi-node quorum drill (unit [`HttpShardReplicator`] only;
+//!   ring → primary nodes wiring in daemon loop not driven end-to-end on VIP)
+//! - sharder HTTP create+replicate of shard DBs on *all* primary replicas with
+//!   durable cleave under concurrent load (local same-device cleave is KEEP-
+//!   insufficient for product claim)
+//! - manage-shard-ranges compact/repair/analyze (CLI deferred; find/show/info/
+//!   enable/delete/merge/find_and_replace ship)
 //! - WAN / async container-sync (wontfix)
 
 use std::path::Path;
@@ -1109,5 +1114,112 @@ mod tests {
         assert!(!maybe_auto_shard(&mut source, &opts).unwrap());
         assert_eq!(source.get_db_state().unwrap(), DbState::Unsharded);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_run_once_with_opts_auto_shard_path() {
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharder-auto-run-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "auto";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let db = hd.join(format!("{hsh}.db"));
+        let mut source = ContainerBroker::new(&db, account, container);
+        source
+            .initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        for i in 0..10 {
+            source
+                .put_object(
+                    &format!("o{i:04}"),
+                    "1751500001.00000",
+                    1,
+                    "text/plain",
+                    "e",
+                    0,
+                    0,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        drop(source);
+        let opts = SharderRunOpts {
+            cleave_batch_size: 10,
+            auto_shard: true,
+            shard_size: 5,
+            minimum_shard_size: 1,
+        };
+        let stats = run_once_with_opts(&device, &hash_config, &opts);
+        assert_eq!(stats.failures, 0, "{stats:?}");
+        assert!(stats.sharding >= 1 || stats.finished >= 1, "{stats:?}");
+        let mut check = ContainerBroker::new(&db, account, container);
+        let st = check.get_db_state().unwrap();
+        assert!(
+            matches!(st, DbState::Sharding | DbState::Sharded),
+            "expected sharding/sharded, got {st:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_http_shard_replicator_with_quorum_override() {
+        let nodes = vec![
+            ShardReplicaNode {
+                ip: "10.0.0.1".into(),
+                port: 6201,
+                device: "sdb".into(),
+            },
+            ShardReplicaNode {
+                ip: "10.0.0.2".into(),
+                port: 6201,
+                device: "sdb".into(),
+            },
+            ShardReplicaNode {
+                ip: "10.0.0.3".into(),
+                port: 6201,
+                device: "sdb".into(),
+            },
+        ];
+        let mut map = MapShardHttpTransport::new();
+        map.responses.insert("10.0.0.1:6201/sdb".into(), 201);
+        // only 1 ok; default quorum=2 fails, with_quorum(1) passes
+        let mut strict = HttpShardReplicator::new(nodes.clone(), MapShardHttpTransport {
+            responses: map.responses.clone(),
+            calls: Vec::new(),
+        });
+        assert!(strict
+            .replicate_shard(".shards_a/c-0", "1")
+            .unwrap_err()
+            .contains("quorum failed"));
+        let mut loose = HttpShardReplicator::new(nodes, map).with_quorum(1);
+        assert!(loose.replicate_shard(".shards_a/c-0", "1").is_ok());
+        assert_eq!(loose.transport.calls.len(), 3);
+        assert_eq!(loose.transport.calls[0].2, ".shards_a");
+        assert_eq!(loose.transport.calls[0].3, "c-0");
+    }
+
+    #[test]
+    fn test_split_shard_name_and_local_replicator() {
+        assert_eq!(
+            split_shard_name(".shards_AUTH/c-x"),
+            (".shards_AUTH".into(), "c-x".into())
+        );
+        assert_eq!(
+            split_shard_name("nopath"),
+            (String::new(), "nopath".into())
+        );
+        let mut local = LocalShardReplicator;
+        assert!(local.replicate_shard("a/c", "0").is_ok());
     }
 }

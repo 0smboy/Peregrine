@@ -27,7 +27,7 @@
 | Single + multi Range / multipart byteranges | ✅ | ✅ | |
 | Server-side COPY / X-Copy-From | ✅ | ✅ | |
 | Expiry `X-Delete-At` / `X-Delete-After` | ✅ | ✅ | Expirer daemon |
-| SLO (manifest PUT + GET reassembly) | ✅ | ✅ | Nested/streamed P1c; some specialty residual → strict: main path ✅ |
+| SLO (manifest PUT + GET reassembly) | ✅ | ✅ | Nested/streamed + inline data + heartbeat PUT + multipart-manifest=delete (2026-08-06) |
 | DLO | ✅ | ✅ | Listing pagination beyond limit residual → main path ✅ |
 | Versioned writes (stack) | ✅ | ✅ | Primary suite |
 | Symlink | ✅ | ✅ | |
@@ -37,8 +37,8 @@
 | Bulk delete | ✅ | ✅ | |
 | Bulk upload / extract-archive | ✅ | ✅ | tar / tar.gz / tar.bz2; `/info` bulk_upload (2026-08-06) |
 | Account autocreate | ✅ | ✅ | |
-| Allow account management (full reseller) | ✅ | ❌ | Config unsupported |
-| Large object edge: inline data SLO, heartbeat PUT, multipart-manifest=delete | ✅ | ❌ | Documented residual → **未实现** |
+| Allow account management | ✅ | ✅ | `allow_account_management` conf; PUT/DELETE gated 405 when off (2026-08-06) |
+| SLO residual: async multipart-delete / streaming mid-heartbeat | ✅ | ❌ | async=yes → 501; streaming whitespace heartbeat deferred |
 | Full Paste arbitrary pipeline (any filter name) | ✅ | ❌ | Only known filter names |
 
 ---
@@ -60,8 +60,8 @@
 | authtoken (HTTP token validate) | ✅ | ✅ | Live Contabo Keystone |
 | keystoneauth coexist with TempAuth | ✅ | ✅ | Stamp-only-when-confirmed fix |
 | s3api / s3token | ✅ | ✅ | See S3 section; not full AWS |
-| container-sync middleware + daemon | ✅ | ❌ | Library HMAC only → **未实现** |
-| encrypter / decrypter / keymaster middleware | ✅ | ❌ | crypto lib only → **未实现** |
+| container-sync middleware + daemon | ✅ | ✅ | Proxy auth filter + `swift-container-sync` two-pass daemon + realms (unit; multi-cluster live not claimed) |
+| encrypter / decrypter / keymaster / encryption | ✅ | ✅ | ON-BY-CONFIG; PUT encrypt / GET decrypt; KMIP/rotation residual |
 | xprofile / other niche Paste filters | ✅ | ❌ | |
 
 ---
@@ -110,12 +110,13 @@
 | object-updater / expirer / auditor | ✅ | ✅ | |
 | account-reaper | ✅ | ✅ | full reaper E2E residual → main path ✅ |
 | container-updater / reconciler | ✅ | ✅ | |
-| container-sharder (full multi-node) | ✅ | ❌ | local cleave + unit HTTP; live multi-node/KEEP **未实现** |
-| container-sync daemon | ✅ | ❌ | |
+| container-sharder (local + auto_shard unit) | ✅ | ✅ | local cleave + auto_shard unit; multi-node KEEP still **not product-claimed** |
+| container-sharder multi-node KEEP (live) | ✅ | ❌ | Contabo multi-node quorum/KEEP **未实现** |
+| container-sync daemon | ✅ | ✅ | `swift-container-sync` binary + deploy script |
 | db-replicator | ✅ | ✅ | |
 | swift-recon (md5/async/quarantine/tombstone/dbspace) | ✅ | ✅ | Contabo textfile+Prom |
 | ring-builder | ✅ | ✅ | .builder pickle not bit-identical tool format |
-| manage-shard-ranges (full) | ✅ | ❌ | `find` only → **未实现** full CLI |
+| manage-shard-ranges (main CLI) | ✅ | ✅ | find/show/info/enable/delete/merge/find_and_replace; compact/repair/analyze residual → strict residual |
 | dispersion / drive-audit / relinker | ✅ | ✅ | |
 
 ---
@@ -152,13 +153,13 @@
 
 | Domain | Implemented | Not implemented (incl. partial) |
 |--------|-------------|----------------------------------|
-| Swift v1 core CRUD + common middleware | **Most** | full arbitrary Paste; some SLO edges (inline/heartbeat/manifest-delete); allow_account_management |
-| Auth | TempAuth + Keystone lab | Production-only ops polish; KMIP |
+| Swift v1 core CRUD + common middleware | **Most** | full arbitrary Paste; SLO async-delete; streaming mid-heartbeat |
+| Auth | TempAuth + Keystone lab | Production-only ops polish |
 | S3 | Core SigV4 + MPU + ListParts | SigV2, versioning, full IAM ACL/CORS multi-rule, aws-chunked |
 | EC | Data path + heal | macOS/default build; some EC throttling niceties |
-| Sharding L3b | — | **Treat as 未实现** for multi-node product claim |
-| Crypto at-rest middleware | — | **未实现** |
-| container-sync | — | **未实现** |
+| Sharding L3b CLI + local | manage-shard-ranges main path + local sharder | **multi-node KEEP product claim 未实现** |
+| Crypto at-rest middleware | ON-BY-CONFIG path | KMIP, multi-secret rotation, listing decrypt |
+| container-sync | filter + daemon path | multi-cluster live soak; HTTPS remotes residual |
 | Production go-live | — | **未实现** (TLS PEM deferred) |
 
 **Bottom line under the user rule (“部分 = 未实现”):**  

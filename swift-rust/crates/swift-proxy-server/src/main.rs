@@ -28,7 +28,7 @@
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use swift_core::config::SwiftConfig;
+use swift_core::config::{config_true_value, SwiftConfig};
 use swift_core::hashing::HashPathConfig;
 use swift_core::obslog::{LogLevel, Logger};
 use swift_core::otlp::{self, AttrValue, TraceExporter, TraceSpan};
@@ -196,6 +196,7 @@ fn main() {
         &swift_conf,
         &conf,
         config.account_autocreate,
+        config.allow_account_management,
         tempauth_on,
     );
 
@@ -326,12 +327,15 @@ fn main() {
     // claiming full Paste parity.
     let key_provider: Arc<dyn swift_middleware::KeyProvider> =
         Arc::new(ProxyTempUrlKeys::new(Arc::clone(&app)));
+    let sync_key_provider: Arc<dyn swift_middleware::SyncKeyProvider> =
+        Arc::new(ProxySyncKeys::new(Arc::clone(&app)));
     let (filters, notes) = build_configured_filters(
         &conf,
         tempauth,
         keystoneauth,
         Some(Arc::clone(&logger)),
         key_provider,
+        sync_key_provider,
         &policies_for_filters,
     );
     for note in &notes {
@@ -374,6 +378,12 @@ fn proxy_config_from_conf(conf: &SwiftConfig, auth_enabled: bool) -> ProxyConfig
             .unwrap_or(10),
         account_autocreate: matches!(
             get("account_autocreate", "false").to_lowercase().as_str(),
+            "true" | "1" | "yes" | "on" | "t" | "y"
+        ),
+        allow_account_management: matches!(
+            get("allow_account_management", "false")
+                .to_lowercase()
+                .as_str(),
             "true" | "1" | "yes" | "on" | "t" | "y"
         ),
         // server.py:235-246: TTLs for the proxy's account/container info
@@ -542,6 +552,30 @@ impl swift_middleware::KeyProvider for ProxyTempUrlKeys {
             Arc::clone(&guard)
         };
         current.temp_url_keys(account, container)
+    }
+}
+
+/// Container-sync user-key lookup against the live proxy app.
+struct ProxySyncKeys {
+    app: Arc<RwLock<Arc<ProxyApp>>>,
+}
+
+impl ProxySyncKeys {
+    fn new(app: Arc<RwLock<Arc<ProxyApp>>>) -> Self {
+        Self { app }
+    }
+}
+
+impl swift_middleware::SyncKeyProvider for ProxySyncKeys {
+    fn sync_key(&self, account: &str, container: &str) -> Option<String> {
+        let current = {
+            let guard = self
+                .app
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(&guard)
+        };
+        current.container_sync_key(account, container)
     }
 }
 
@@ -742,6 +776,34 @@ fn build_etag_quoter(conf: &SwiftConfig) -> swift_middleware::EtagQuoter {
     }
 }
 
+/// Build [`KeyMaster`] from `[filter:keymaster]` (or `encryption_root_secret`
+/// on `[filter:encryption]` as a fallback). Requires a base64 root secret of
+/// ≥ 32 raw bytes — same policy as Python `KeyMaster._decode_root_secret`.
+fn build_keymaster(conf: &SwiftConfig) -> Result<swift_middleware::KeyMaster, String> {
+    let items = conf
+        .items("filter:keymaster")
+        .ok()
+        .filter(|i| !i.is_empty())
+        .or_else(|| conf.items("filter:encryption").ok())
+        .unwrap_or_default();
+    swift_middleware::KeyMaster::from_conf_items(&items)
+}
+
+/// `disable_encryption` from `[filter:encryption]` or `[filter:encrypter]`.
+fn encryption_disabled(conf: &SwiftConfig) -> bool {
+    conf.get("filter:encryption", "disable_encryption")
+        .ok()
+        .flatten()
+        .or_else(|| {
+            conf.get("filter:encrypter", "disable_encryption")
+                .ok()
+                .flatten()
+        })
+        .as_deref()
+        .map(swift_core::config::config_true_value)
+        .unwrap_or(false)
+}
+
 fn build_crossdomain(conf: &SwiftConfig) -> swift_middleware::Crossdomain {
     let mut cd = swift_middleware::Crossdomain::default();
     if let Some(policy) = conf
@@ -877,6 +939,7 @@ fn build_configured_filters(
     keystoneauth: Option<swift_middleware::KeystoneAuth>,
     access_logger: Option<Arc<Logger>>,
     key_provider: Arc<dyn swift_middleware::KeyProvider>,
+    sync_key_provider: Arc<dyn swift_middleware::SyncKeyProvider>,
     policies: &StoragePolicyCollection,
 ) -> (Vec<Arc<dyn swift_middleware::Middleware>>, Vec<String>) {
     let mut notes = Vec::new();
@@ -905,6 +968,8 @@ fn build_configured_filters(
     let mut filters: Vec<Arc<dyn swift_middleware::Middleware>> = Vec::new();
     let mut tempauth = tempauth;
     let mut keystoneauth = keystoneauth;
+    // Shared across keymaster / encrypter / decrypter / encryption filters.
+    let mut keymaster_state: Option<Arc<swift_middleware::KeyMaster>> = None;
 
     for name in &names {
         match name.as_str() {
@@ -1130,11 +1195,100 @@ fn build_configured_filters(
                     ));
                 }
             }
+            "container_sync" | "container-sync" => {
+                let cs = build_container_sync(conf, Arc::clone(&sync_key_provider));
+                notes.push(format!(
+                    "container_sync enabled (allow_full_urls={}, realms={})",
+                    cs.allow_full_urls,
+                    cs.realms.realms.len()
+                ));
+                filters.push(Arc::new(cs));
+            }
+            // At-rest crypto (ON-BY-CONFIG). Typical order:
+            //   ... keymaster encryption ...  or
+            //   ... keymaster decrypter encrypter ...
+            // Python's egg name `encryption` = Decrypter(Encrypter(app)).
+            "keymaster" => match build_keymaster(conf) {
+                Ok(km) => {
+                    let arc = Arc::new(km);
+                    keymaster_state = Some(Arc::clone(&arc));
+                    notes.push("keymaster enabled".into());
+                    filters.push(Arc::new(swift_middleware::KeyMasterMw::new(arc)));
+                }
+                Err(e) => {
+                    notes.push(format!(
+                        "pipeline: keymaster listed but failed to build ({e}); skip"
+                    ));
+                }
+            },
+            "encrypter" => {
+                let km = keymaster_state
+                    .clone()
+                    .or_else(|| build_keymaster(conf).ok().map(Arc::new));
+                match km {
+                    Some(arc) => {
+                        keymaster_state.get_or_insert_with(|| Arc::clone(&arc));
+                        let disable = encryption_disabled(conf);
+                        notes.push(format!(
+                            "encrypter enabled (disable_encryption={disable})"
+                        ));
+                        filters.push(Arc::new(swift_middleware::Encrypter::new(arc, disable)));
+                    }
+                    None => {
+                        notes.push(
+                            "pipeline: encrypter listed but no encryption_root_secret; skip"
+                                .into(),
+                        );
+                    }
+                }
+            }
+            "decrypter" => {
+                let km = keymaster_state
+                    .clone()
+                    .or_else(|| build_keymaster(conf).ok().map(Arc::new));
+                match km {
+                    Some(arc) => {
+                        keymaster_state.get_or_insert_with(|| Arc::clone(&arc));
+                        notes.push("decrypter enabled".into());
+                        filters.push(Arc::new(swift_middleware::Decrypter::new(arc)));
+                    }
+                    None => {
+                        notes.push(
+                            "pipeline: decrypter listed but no encryption_root_secret; skip"
+                                .into(),
+                        );
+                    }
+                }
+            }
+            "encryption" => {
+                // Python filter_factory: Decrypter(Encrypter(app)) — outer
+                // decrypter, inner encrypter. Push in that order so
+                // build_pipeline sees decrypter outermost of the pair.
+                let km = keymaster_state
+                    .clone()
+                    .or_else(|| build_keymaster(conf).ok().map(Arc::new));
+                match km {
+                    Some(arc) => {
+                        keymaster_state.get_or_insert_with(|| Arc::clone(&arc));
+                        let disable = encryption_disabled(conf);
+                        notes.push(format!(
+                            "encryption enabled (decrypter+encrypter; disable_encryption={disable})"
+                        ));
+                        filters.push(Arc::new(swift_middleware::Decrypter::new(Arc::clone(
+                            &arc,
+                        ))));
+                        filters.push(Arc::new(swift_middleware::Encrypter::new(arc, disable)));
+                    }
+                    None => {
+                        notes.push(
+                            "pipeline: encryption listed but no encryption_root_secret; skip"
+                                .into(),
+                        );
+                    }
+                }
+            }
             // Known but not-wired this wave (ops / residual).
-            "container_sync"
-            | "container-sync"
-            | "list_endpoints"
-            | "list-endpoints" => {
+            "list_endpoints" | "list-endpoints" => {
                 notes.push(format!(
                     "pipeline: filter '{name}' not implemented in proxy wiring; skip"
                 ));
@@ -1201,10 +1355,47 @@ fn configured_filter_names(conf: &SwiftConfig, has_tempauth: bool) -> Vec<&'stat
             "authtoken" if build_authtoken(conf).is_ok() => out.push("authtoken"),
             "keystoneauth" => out.push("keystoneauth"),
             "s3api" if build_s3api(conf).is_some() => out.push("s3api"),
+            "container_sync" | "container-sync" => out.push("container_sync"),
+            "keymaster" if build_keymaster(conf).is_ok() => out.push("keymaster"),
+            "encrypter" if build_keymaster(conf).is_ok() => out.push("encrypter"),
+            "decrypter" if build_keymaster(conf).is_ok() => out.push("decrypter"),
+            // Composite egg name expands to two filters at build time; report
+            // the name as listed in the pipeline for test helpers.
+            "encryption" if build_keymaster(conf).is_ok() => out.push("encryption"),
             _ => {}
         }
     }
     out
+}
+
+/// Build proxy `container_sync` middleware from `[filter:container_sync]`.
+fn build_container_sync(
+    conf: &SwiftConfig,
+    sync_keys: Arc<dyn swift_middleware::SyncKeyProvider>,
+) -> swift_middleware::ContainerSync {
+    let swift_dir = conf
+        .get("DEFAULT", "swift_dir")
+        .ok()
+        .flatten()
+        .or_else(|| conf.get("filter:container_sync", "swift_dir").ok().flatten())
+        .unwrap_or_else(|| {
+            std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string())
+        });
+    let allow_full = conf
+        .get("filter:container_sync", "allow_full_urls")
+        .ok()
+        .flatten()
+        .map(|v| config_true_value(&v))
+        .unwrap_or(true);
+    let current = conf
+        .get("filter:container_sync", "current")
+        .ok()
+        .flatten();
+    let realms_path = format!("{swift_dir}/container-sync-realms.conf");
+    swift_middleware::ContainerSync::new(sync_keys)
+        .with_realms_path(realms_path)
+        .with_allow_full_urls(allow_full)
+        .with_current(current.as_deref())
 }
 
 /// Every input a [`ProxyApp`] is constructed from — ring locations
@@ -1338,6 +1529,7 @@ fn build_info_json(
     swift_conf: &SwiftConfig,
     conf: &SwiftConfig,
     account_autocreate: bool,
+    allow_account_management: bool,
     tempauth_on: bool,
 ) -> String {
     let c = swift_core::constraints::Constraints::from_swift_conf(swift_conf).unwrap_or_default();
@@ -1363,7 +1555,7 @@ fn build_info_json(
             // NOTE: strict_cors_mode deliberately absent — CORS is not
             // implemented, so cors tests skip ("cors mode is unknown").
             "account_autocreate": account_autocreate,
-            "allow_account_management": false,
+            "allow_account_management": allow_account_management,
             "max_file_size": c.max_file_size,
             "max_meta_name_length": c.max_meta_name_length,
             "max_meta_value_length": c.max_meta_value_length,
@@ -1527,6 +1719,27 @@ fn build_info_json(
         if ro.read_only {
             info["read_only"] = serde_json::json!({});
         }
+    }
+    // container_sync: Python registers realms when the filter is in the pipeline.
+    if configured_pipeline_has(conf, "container_sync")
+        || configured_pipeline_has(conf, "container-sync")
+    {
+        let empty_keys: Arc<dyn swift_middleware::SyncKeyProvider> =
+            Arc::new(swift_middleware::ClosureSyncKeyProvider::new(|_, _| None));
+        let cs = build_container_sync(conf, empty_keys);
+        info["container_sync"] = cs.info_json();
+    }
+    // encryption: Python register_swift_info('encryption', admin=True,
+    // enabled=not disable_encryption) when the encryption filter loads.
+    // Advertise when encryption / encrypter / decrypter is in the pipeline and
+    // a keymaster root secret is available (same enable gate as wiring).
+    let crypto_in_pipeline = configured_pipeline_has(conf, "encryption")
+        || configured_pipeline_has(conf, "encrypter")
+        || configured_pipeline_has(conf, "decrypter");
+    if crypto_in_pipeline && build_keymaster(conf).is_ok() {
+        info["encryption"] = serde_json::json!({
+            "enabled": !encryption_disabled(conf),
+        });
     }
     // P3-s3: deliberately do NOT advertise `s3api` on Swift v1 `/info`.
     // S3 is a parallel API surface enabled by pipeline wiring; a v1 /info
@@ -1847,6 +2060,10 @@ mod startup_policy_tests {
         Arc::new(swift_middleware::ClosureKeyProvider::new(|_, _| Vec::new()))
     }
 
+    fn no_sync_keys() -> Arc<dyn swift_middleware::SyncKeyProvider> {
+        Arc::new(swift_middleware::ClosureSyncKeyProvider::new(|_, _| None))
+    }
+
     fn policies(conf: &str) -> StoragePolicyCollection {
         let parsed = SwiftConfig::parse_lenient(conf, &[], false).unwrap();
         parse_storage_policies(&parsed).unwrap()
@@ -1925,6 +2142,7 @@ mod startup_policy_tests {
         assert_eq!(config.error_suppression_interval, 90.0);
         assert_eq!(config.error_suppression_limit, 3);
         assert!(config.account_autocreate);
+        assert!(!config.allow_account_management);
         assert!(config.auth_enabled);
         assert_eq!(config.recheck_container_existence, 120.0);
         assert_eq!(config.recheck_account_existence, 30.0);
@@ -1948,6 +2166,15 @@ mod startup_policy_tests {
         assert!(!config.auth_enabled);
         // garbage / missing recheck values keep the Python default of 60
         assert_eq!(config.recheck_container_existence, 60.0);
+
+        let conf = SwiftConfig::parse_lenient(
+            "[app:proxy-server]\nallow_account_management = true\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let config = proxy_config_from_conf(&conf, false);
+        assert!(config.allow_account_management);
         assert_eq!(config.recheck_account_existence, 60.0);
     }
 
@@ -2059,6 +2286,39 @@ mod startup_policy_tests {
     }
 
     #[test]
+    fn pipeline_container_sync_wires_and_info() {
+        let conf = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck container_sync tempauth proxy-server\n\
+             [filter:tempauth]\nuser_test_tester = secret .admin\n\
+             [filter:container_sync]\nallow_full_urls = true\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            configured_filter_names(&conf, true),
+            vec!["container_sync", "tempauth"]
+        );
+        let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
+        let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
+        let (filters, notes) =
+            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols);
+        assert!(
+            notes.iter().any(|n| n.contains("container_sync enabled")),
+            "{notes:?}"
+        );
+        assert_eq!(filters.len(), 2, "notes={notes:?}");
+        let info = build_info_json(&conf, &conf, true, false, true);
+        let v: serde_json::Value = serde_json::from_str(&info).unwrap();
+        assert!(
+            v.get("container_sync").is_some(),
+            "must advertise container_sync on /info when filter is wired: {v}"
+        );
+        assert!(v["container_sync"].get("realms").is_some());
+    }
+
+    #[test]
     fn pipeline_p1a_wires_bulk_tempurl() {
         let conf = SwiftConfig::parse_lenient(
             "[pipeline:main]\n\
@@ -2090,7 +2350,7 @@ mod startup_policy_tests {
         let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
         let (filters, notes) =
-            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), &pols);
+            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols);
         assert!(notes.iter().any(|n| n.contains("bulk enabled")), "{notes:?}");
         assert!(
             notes.iter().any(|n| n == "tempurl enabled"),
@@ -2098,7 +2358,7 @@ mod startup_policy_tests {
         );
         assert_eq!(filters.len(), 10, "notes={notes:?}");
 
-        let info = build_info_json(&conf, &conf, true, true);
+        let info = build_info_json(&conf, &conf, true, false, true);
         let v: serde_json::Value = serde_json::from_str(&info).unwrap();
         assert_eq!(v["tempauth"]["account_acls"], true);
         assert_eq!(v["bulk_delete"]["max_deletes_per_request"], 100);
@@ -2140,7 +2400,7 @@ mod startup_policy_tests {
         let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
         let (filters, notes) =
-            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), &pols);
+            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols);
         assert!(notes.iter().any(|n| n == "formpost enabled"), "{notes:?}");
         assert!(notes.iter().any(|n| n == "staticweb enabled"), "{notes:?}");
         assert!(
@@ -2149,7 +2409,7 @@ mod startup_policy_tests {
         );
         assert_eq!(filters.len(), 11, "notes={notes:?}");
 
-        let info = build_info_json(&conf, &conf, true, true);
+        let info = build_info_json(&conf, &conf, true, false, true);
         let v: serde_json::Value = serde_json::from_str(&info).unwrap();
         assert!(v.get("formpost").is_some());
         assert_eq!(
@@ -2182,7 +2442,7 @@ mod startup_policy_tests {
         let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
         let (filters, notes) =
-            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), &pols);
+            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols);
         assert!(notes.iter().any(|n| n.contains("s3api enabled")), "{notes:?}");
         assert!(
             notes.iter().all(|n| !n.contains("EC2→s3token deferral")),
@@ -2197,7 +2457,7 @@ mod startup_policy_tests {
             1
         );
         // Honest /info: no s3api key even when the filter is wired.
-        let info = build_info_json(&conf, &conf, true, true);
+        let info = build_info_json(&conf, &conf, true, false, true);
         let v: serde_json::Value = serde_json::from_str(&info).unwrap();
         assert!(
             v.get("s3api").is_none(),
@@ -2221,7 +2481,7 @@ mod startup_policy_tests {
         let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
         let (_filters, notes) =
-            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), &pols);
+            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols);
         assert!(
             notes
                 .iter()
@@ -2249,7 +2509,7 @@ mod startup_policy_tests {
         let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
         let (filters, notes) =
-            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), &pols);
+            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols);
         assert_eq!(filters.len(), 2);
         assert!(notes
             .iter()
@@ -2281,7 +2541,7 @@ mod startup_policy_tests {
         assert!(ka.is_some());
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
         let (filters, notes) =
-            build_configured_filters(&conf, ta, ka, None, no_tempurl_keys(), &pols);
+            build_configured_filters(&conf, ta, ka, None, no_tempurl_keys(), no_sync_keys(), &pols);
         assert!(
             notes.iter().any(|n| n.contains("authtoken enabled")),
             "{notes:?}"
@@ -2292,11 +2552,102 @@ mod startup_policy_tests {
         );
         assert_eq!(filters.len(), 4, "notes={notes:?}");
 
-        let info = build_info_json(&conf, &conf, true, true);
+        let info = build_info_json(&conf, &conf, true, false, true);
         let v: serde_json::Value = serde_json::from_str(&info).unwrap();
         assert_eq!(v["tempauth"]["account_acls"], true);
         assert!(v.get("keystoneauth").is_some(), "{v}");
         assert_eq!(v["keystoneauth"]["reseller_prefix"][0], "AUTH_");
+    }
+
+    #[test]
+    fn pipeline_crypto_wires_keymaster_encryption_and_info() {
+        // root_secret = base64(bytes(range(32)))
+        let root_b64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+        let conf = SwiftConfig::parse_lenient(
+            &format!(
+                "[pipeline:main]\n\
+                 pipeline = catch_errors gatekeeper healthcheck keymaster encryption tempauth copy proxy-server\n\
+                 [filter:tempauth]\nuser_test_tester = secret .admin\n\
+                 [filter:keymaster]\nencryption_root_secret = {root_b64}\n\
+                 [filter:encryption]\ndisable_encryption = false\n"
+            ),
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            configured_filter_names(&conf, true),
+            vec!["keymaster", "encryption", "tempauth", "copy"]
+        );
+        let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
+        let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
+        let (filters, notes) =
+            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols);
+        assert!(
+            notes.iter().any(|n| n == "keymaster enabled"),
+            "{notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("encryption enabled") && n.contains("disable_encryption=false")),
+            "{notes:?}"
+        );
+        // keymaster + decrypter + encrypter + tempauth + copy = 5
+        assert_eq!(filters.len(), 5, "notes={notes:?}");
+
+        let info = build_info_json(&conf, &conf, true, false, true);
+        let v: serde_json::Value = serde_json::from_str(&info).unwrap();
+        assert_eq!(v["encryption"]["enabled"], true, "{v}");
+
+        // Default pipeline (no crypto names) must not advertise encryption.
+        let bare = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck tempauth copy proxy-server\n\
+             [filter:tempauth]\nuser_test_tester = secret .admin\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let bare_info = build_info_json(&bare, &bare, true, false, true);
+        let bv: serde_json::Value = serde_json::from_str(&bare_info).unwrap();
+        assert!(
+            bv.get("encryption").is_none(),
+            "default pipeline must not advertise encryption: {bv}"
+        );
+    }
+
+    #[test]
+    fn pipeline_crypto_skips_without_root_secret() {
+        let conf = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck keymaster encryption copy proxy-server\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
+        let (filters, notes) = build_configured_filters(
+            &conf,
+            None,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            &pols,
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("keymaster") && n.contains("skip")),
+            "{notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("encryption") && n.contains("skip")),
+            "{notes:?}"
+        );
+        // only copy survives
+        assert_eq!(filters.len(), 1, "notes={notes:?}");
     }
 
     #[test]

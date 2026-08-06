@@ -2007,6 +2007,39 @@ impl ContainerBroker {
         crate::broker::get_max_row(self.conn()?, "object")
     }
 
+    /// `ContainerBroker.set_x_container_sync_points`: advance one or both
+    /// container-sync ROWID watermarks. `None` leaves that point unchanged.
+    pub fn set_x_container_sync_points(
+        &mut self,
+        sync_point1: Option<i64>,
+        sync_point2: Option<i64>,
+    ) -> Result<(), DbError> {
+        let conn = self.conn()?;
+        match (sync_point1, sync_point2) {
+            (Some(p1), Some(p2)) => {
+                conn.execute(
+                    "UPDATE container_stat SET x_container_sync_point1 = ?, \
+                     x_container_sync_point2 = ?",
+                    rusqlite::params![p1, p2],
+                )?;
+            }
+            (Some(p1), None) => {
+                conn.execute(
+                    "UPDATE container_stat SET x_container_sync_point1 = ?",
+                    rusqlite::params![p1],
+                )?;
+            }
+            (None, Some(p2)) => {
+                conn.execute(
+                    "UPDATE container_stat SET x_container_sync_point2 = ?",
+                    rusqlite::params![p2],
+                )?;
+            }
+            (None, None) => {}
+        }
+        Ok(())
+    }
+
     /// Port of `ContainerBroker.list_objects_iter`, including the
     /// delimiter/prefix/path subdir machinery. Returns listing rows:
     /// `[name, last_modified, size, content_type, etag]` with subdir

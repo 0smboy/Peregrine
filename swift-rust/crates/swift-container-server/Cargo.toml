@@ -28,6 +28,10 @@ path = "src/bin/container_reconciler.rs"
 name = "swift-container-sharder"
 path = "src/bin/container_sharder.rs"
 
+[[bin]]
+name = "swift-container-sync"
+path = "src/bin/container_sync.rs"
+
 [dev-dependencies]
 swift-db = { path = "../swift-db" }
 swift-account-server = { path = "../swift-account-server" }

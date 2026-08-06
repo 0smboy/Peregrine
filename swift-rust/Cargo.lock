@@ -725,6 +725,7 @@ dependencies = [
  "sha1",
  "sha2",
  "swift-core",
+ "swift-crypto",
  "swift-http",
  "swift-memcache",
  "tar",

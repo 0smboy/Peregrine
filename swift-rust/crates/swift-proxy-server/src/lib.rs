@@ -117,6 +117,9 @@ pub struct ProxyConfig {
     /// consider per request, as a multiple of the replica count.
     pub request_node_count_factor: u64,
     pub account_autocreate: bool,
+    /// When true, account PUT/DELETE are allowed (Python
+    /// `allow_account_management`). Default false → 405 Method Not Allowed.
+    pub allow_account_management: bool,
     pub error_suppression_interval: f64,
     pub error_suppression_limit: u64,
     pub default_policy_index: i64,
@@ -148,6 +151,7 @@ impl Default for ProxyConfig {
             node_timeout: Duration::from_secs(10),
             request_node_count_factor: 2,
             account_autocreate: false,
+            allow_account_management: false,
             error_suppression_interval: 60.0,
             error_suppression_limit: 10,
             default_policy_index: 0,
@@ -169,6 +173,8 @@ struct ContainerInfo {
     read_acl: Option<String>,
     write_acl: Option<String>,
     temp_url_keys: Vec<String>,
+    /// Destination container's `X-Container-Sync-Key` (for inbound sync auth).
+    sync_key: Option<String>,
 }
 
 impl ContainerInfo {
@@ -353,6 +359,7 @@ fn container_info_to_json(info: &ContainerInfo) -> serde_json::Value {
         "read_acl": info.read_acl,
         "write_acl": info.write_acl,
         "temp_url_keys": info.temp_url_keys,
+        "sync_key": info.sync_key,
     })
 }
 
@@ -377,6 +384,10 @@ fn container_info_from_json(v: &serde_json::Value) -> Option<ContainerInfo> {
                     .collect()
             })
             .unwrap_or_default(),
+        sync_key: v
+            .get("sync_key")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -1295,6 +1306,10 @@ impl ProxyApp {
                 let kl = k.to_lowercase();
                 let user = format!("x-{server_type}-meta-");
                 let sys = format!("x-{server_type}-sysmeta-");
+                // Object transient sysmeta (crypto user-meta, etc.) must reach
+                // the object server so at-rest encryption can persist it.
+                let object_transient = server_type == "object"
+                    && kl.starts_with("x-object-transient-sysmeta-");
                 // Object write requests also pass conditional, expiry and
                 // content headers through to the object server, which owns their
                 // validation (X-Delete-At/After -> 400, If-None-Match: * -> 412).
@@ -1324,6 +1339,7 @@ impl ProxyApp {
                     && kl.starts_with("x-remove-container-");
                 if kl.starts_with(&user)
                     || kl.starts_with(&sys)
+                    || object_transient
                     || object_passthrough
                     || container_remove
                     || [
@@ -2150,6 +2166,13 @@ impl ProxyApp {
                     None => swob_response(503),
                 }
             }
+            "PUT" | "DELETE" if !self.config.allow_account_management => {
+                // account.py:37-39,112-115,170: remove PUT/DELETE from allowed
+                // methods when allow_account_management is off.
+                let mut resp = swob_response(405);
+                resp.headers.set("Allow", "GET, HEAD, POST, OPTIONS");
+                resp
+            }
             "PUT" | "POST" | "DELETE" => {
                 // account.py:128,150,177: clear the cached account info
                 // BEFORE the backend fan-out, so nothing serves the
@@ -2387,6 +2410,7 @@ impl ProxyApp {
             read_acl: None,
             write_acl: None,
             temp_url_keys: Vec::new(),
+            sync_key: None,
         };
         let Ok((part, _)) = self.container_ring.get_nodes(account, Some(container), None) else {
             return info;
@@ -2406,6 +2430,11 @@ impl ProxyApp {
             info.read_acl = resp.headers.get("X-Container-Read").map(str::to_string);
             info.write_acl = resp.headers.get("X-Container-Write").map(str::to_string);
             info.temp_url_keys = temp_url_keys_from_headers(&resp.headers, "container");
+            info.sync_key = resp
+                .headers
+                .get("X-Container-Sync-Key")
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             if let Some(ttl) = info_cache_time(
                 resp.status,
                 resp.headers.get("X-Backend-Recheck-Container-Existence"),
@@ -2415,6 +2444,11 @@ impl ProxyApp {
             }
         }
         info
+    }
+
+    /// Container-sync user key for inbound realm HMAC validation.
+    pub fn container_sync_key(&self, account: &str, container: &str) -> Option<String> {
+        self.container_info(account, container).sync_key
     }
 
     /// Wave 3: if the root container is sharding/sharded, fan out object
@@ -4165,6 +4199,7 @@ mod info_cache_tests {
             read_acl: Some("r".to_string()),
             write_acl: None,
             temp_url_keys: Vec::new(),
+            sync_key: None,
         }
     }
 

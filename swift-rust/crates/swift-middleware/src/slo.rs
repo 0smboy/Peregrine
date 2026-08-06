@@ -30,13 +30,20 @@
 //! (including nested `sub_slo` expansion up to [`MAX_SLO_RECURSION_DEPTH`])
 //! and honours a single top-level `Range` via per-segment ranged
 //! subrequests. PUT validates/normalizes client manifests (HEAD each
-//! segment, including sub-SLO sysmeta). Residual vs. `slo.py` (documented,
-//! not claimed): inline `{"data":…}` PUT segments, heartbeat PUT, and
-//! `multipart-manifest=delete`.
+//! segment, including sub-SLO sysmeta; inline `{"data":…}` base64 segments).
+//! Also: `?multipart-manifest=delete` (sync segment+manifest delete) and a
+//! simplified `heartbeat=on` PUT response wrapper.
+//!
+//! **Deferred vs `slo.py`:** async multipart-delete (`async=yes` + expirer
+//! enqueue), mid-validation concurrent-HEAD heartbeat whitespace yields,
+//! SLO-etag container-listing refetch dance, bulk Accept negotiation on
+//! delete beyond JSON.
 
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::sync::Arc;
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use md5::{Digest, Md5};
 use swift_core::config::config_true_value;
 use swift_http::{
@@ -168,8 +175,8 @@ pub fn dlo_etag_and_size(segment_hashes: &[(String, i64)]) -> (String, i64) {
 /// setting `Content-Length` to the summed segment lengths and `Etag` to the
 /// SLO etag. A single top-level `Range` uses per-segment ranged subrequests.
 ///
-/// Residual vs. `slo.py` (not claimed): inline `data` PUT segments, the
-/// SLO-etag refetch dance, heartbeat PUT, `multipart-manifest=delete`.
+/// Residual vs. `slo.py` (see module docs): async delete, streaming heartbeat
+/// mid-HEAD, container-listing slo_etag refetch.
 #[derive(Debug, Default, Clone)]
 pub struct Slo;
 
@@ -187,20 +194,29 @@ struct StoredSeg {
     hash: String,
     range: Option<String>,
     sub_slo: bool,
+    /// Base64-encoded inline data as stored (`{"data":…}` segments).
+    data_b64: Option<String>,
 }
 
 /// A leaf segment after nested `sub_slo` expansion — ready for a GET
-/// subrequest. `range` is an inclusive `start-end` within the segment object;
-/// `bytes` is this leaf's contribution length (after any range).
+/// subrequest (or inline bytes). `range` is an inclusive `start-end` within
+/// the segment object; `bytes` is this leaf's contribution length.
 #[derive(Debug, Clone)]
 struct LeafSeg {
     name: String,
     bytes: i64,
     range: Option<String>,
+    raw_data: Option<Vec<u8>>,
 }
 
 /// Contribution length of a stored segment (range-adjusted when present).
 fn contrib_length(seg: &StoredSeg) -> i64 {
+    if let Some(b64) = &seg.data_b64 {
+        return match B64.decode(b64.as_bytes()) {
+            Ok(raw) => raw.len() as i64,
+            Err(_) => 0,
+        };
+    }
     if let Some(range) = &seg.range {
         if let Some((start, end)) = parse_inclusive_range(range) {
             return (end - start + 1) as i64;
@@ -232,6 +248,22 @@ fn expand_segments(
 ) -> Result<Vec<LeafSeg>, Response> {
     let mut out = Vec::new();
     for seg in segments {
+        if let Some(b64) = &seg.data_b64 {
+            let raw = B64
+                .decode(b64.as_bytes())
+                .map_err(|_| Response::error(409, "Conflict"))?;
+            let length = raw.len() as i64;
+            if length <= 0 {
+                continue;
+            }
+            out.push(LeafSeg {
+                name: String::new(),
+                bytes: length,
+                range: None,
+                raw_data: Some(raw),
+            });
+            continue;
+        }
         if seg.sub_slo {
             if depth >= MAX_SLO_RECURSION_DEPTH {
                 return Err(Response::error(409, "Conflict"));
@@ -267,6 +299,7 @@ fn expand_segments(
                 name: seg.name.clone(),
                 bytes: length,
                 range: seg.range.clone(),
+                raw_data: None,
             });
         }
     }
@@ -313,6 +346,20 @@ fn slice_leaves_for_range(
             return Err(Response::error(409, "Conflict"));
         }
         let contrib = (obj_last - obj_start + 1) as i64;
+        // Inline data: slice the raw bytes rather than object ranges.
+        if let Some(raw) = &leaf.raw_data {
+            let slice = raw
+                .get(obj_start as usize..=obj_last as usize)
+                .unwrap_or(&[])
+                .to_vec();
+            out.push(LeafSeg {
+                name: String::new(),
+                bytes: contrib,
+                range: None,
+                raw_data: Some(slice),
+            });
+            continue;
+        }
         let need_range = obj_start != 0 || obj_last != obj_end_incl || leaf.range.is_some();
         out.push(LeafSeg {
             name: leaf.name.clone(),
@@ -322,6 +369,7 @@ fn slice_leaves_for_range(
             } else {
                 None
             },
+            raw_data: None,
         });
     }
     Ok(out)
@@ -332,6 +380,17 @@ fn parse_stored_manifest(json: &[u8]) -> Option<Vec<StoredSeg>> {
     let arr = value.as_array()?;
     let mut out = Vec::with_capacity(arr.len());
     for it in arr {
+        if let Some(data) = it.get("data").and_then(|v| v.as_str()) {
+            out.push(StoredSeg {
+                name: String::new(),
+                bytes: 0,
+                hash: String::new(),
+                range: None,
+                sub_slo: false,
+                data_b64: Some(data.to_string()),
+            });
+            continue;
+        }
         let name = it.get("name").and_then(|v| v.as_str())?.to_string();
         out.push(StoredSeg {
             name,
@@ -350,6 +409,7 @@ fn parse_stored_manifest(json: &[u8]) -> Option<Vec<StoredSeg>> {
                     _ => false,
                 })
                 .unwrap_or(false),
+            data_b64: None,
         });
     }
     Some(out)
@@ -455,11 +515,23 @@ impl Slo {
             };
             let slo_segs: Vec<SloSegment> = segments
                 .iter()
-                .map(|s| SloSegment {
-                    hash: s.hash.clone(),
-                    segment_length: contrib_length(s),
-                    range: s.range.clone(),
-                    raw_data: None,
+                .map(|s| {
+                    if let Some(b64) = &s.data_b64 {
+                        let raw = B64.decode(b64.as_bytes()).unwrap_or_default();
+                        SloSegment {
+                            hash: String::new(),
+                            segment_length: raw.len() as i64,
+                            range: None,
+                            raw_data: Some(raw),
+                        }
+                    } else {
+                        SloSegment {
+                            hash: s.hash.clone(),
+                            segment_length: contrib_length(s),
+                            range: s.range.clone(),
+                            raw_data: None,
+                        }
+                    }
                 })
                 .collect();
             let (etag, total_len) = slo_etag_and_size(&slo_segs);
@@ -567,7 +639,8 @@ impl Slo {
 
     /// Lazy leaf-segment reassembly: each subrequest runs only when the
     /// client stream reaches that leaf; a mid-stream failure aborts the
-    /// connection (Python parity — the status is already sent).
+    /// connection (Python parity — the status is already sent). Inline
+    /// `data` leaves yield from memory without a subrequest.
     fn leaf_stream_body(
         orig: Request,
         version: String,
@@ -579,6 +652,10 @@ impl Slo {
         let mut queue = leaves.into_iter();
         let reader = FnReader::new(move || {
             let seg = queue.next()?;
+            if let Some(raw) = seg.raw_data {
+                let reader: Box<dyn Read + Send> = Box::new(Cursor::new(raw));
+                return Some(Ok(reader));
+            }
             let path = format!("/{version}/{account}{}", seg.name);
             let sub = slo_subreq(&orig, path.clone(), seg.range.as_deref());
             let sresp = next(sub);
@@ -595,13 +672,19 @@ impl Slo {
     }
 
     /// `?multipart-manifest=put`: validate the client manifest (a JSON list of
-    /// `{path, etag, size_bytes, range?}`), HEAD each segment to confirm it
-    /// exists and matches, then store the normalized internal manifest with
-    /// `X-Static-Large-Object: true` so a later GET can reassemble it. A HEAD
-    /// that identifies a segment as an SLO is validated against its aggregate
-    /// SLO sysmeta, never the physical manifest JSON object's metadata.
-    /// Residual vs. slo.py: inline `{"data":…}` segments (wontfix P1c).
+    /// `{path, etag, size_bytes, range?}` or `{"data": base64}`), HEAD each
+    /// object-backed segment to confirm it exists and matches, then store the
+    /// normalized internal manifest with `X-Static-Large-Object: true`.
+    /// A HEAD that identifies a segment as an SLO is validated against its
+    /// aggregate SLO sysmeta, never the physical manifest JSON object's
+    /// metadata. `heartbeat=on` wraps a successful store (or post-validation
+    /// error) as a 202 heartbeat body — mid-HEAD streaming is Deferred.
     fn handle_put(&self, mut req: Request, next: &NextFn) -> Response {
+        let heartbeat = req
+            .param("heartbeat")
+            .as_deref()
+            .map(config_true_value)
+            .unwrap_or(false);
         let manifest_bytes = match req.body.materialize(MAX_MANIFEST_SIZE) {
             Ok(b) => b,
             Err(e) if body_too_large(&e) => {
@@ -625,15 +708,48 @@ impl Slo {
         let mut internal: Vec<serde_json::Value> = Vec::new();
         let mut slo_segs: Vec<SloSegment> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
+        let mut has_object_backed = false;
         for (i, e) in entries.iter().enumerate() {
             let Some(e) = e.as_object() else {
                 errors.push(format!("Index {i}: not a JSON object"));
                 continue;
             };
+            // Inline data segment: `{"data": "<base64>"}` (Python slo.py).
+            if e.contains_key("data") {
+                let Some(data_str) = e.get("data").and_then(|v| v.as_str()) else {
+                    errors.push(format!("Index {i}: data must be valid base64"));
+                    continue;
+                };
+                let raw = match B64.decode(data_str.as_bytes()) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        errors.push(format!("Index {i}: data must be valid base64"));
+                        continue;
+                    }
+                };
+                if raw.is_empty() {
+                    errors.push(format!(
+                        "Index {i}: too small; each segment must be at least 1 byte."
+                    ));
+                    continue;
+                }
+                let normalized = B64.encode(&raw);
+                let mut stored = serde_json::Map::new();
+                stored.insert("data".into(), normalized.into());
+                internal.push(serde_json::Value::Object(stored));
+                slo_segs.push(SloSegment {
+                    hash: String::new(),
+                    segment_length: raw.len() as i64,
+                    range: None,
+                    raw_data: Some(raw),
+                });
+                continue;
+            }
             let Some(path) = e.get("path").and_then(|v| v.as_str()) else {
                 errors.push(format!("Index {i}: no path in segment"));
                 continue;
             };
+            has_object_backed = true;
             let stripped_path = path.trim_matches('/');
             let valid_path = stripped_path
                 .split_once('/')
@@ -792,7 +908,23 @@ impl Slo {
             });
         }
         if !errors.is_empty() {
-            return Response::error(400, &format!("Errors: {}", errors.join(", ")));
+            let err = Response::error(400, &format!("Errors: {}", errors.join(", ")));
+            return if heartbeat {
+                heartbeat_wrap(err)
+            } else {
+                err
+            };
+        }
+        if !entries.is_empty() && !has_object_backed {
+            let err = Response::error(
+                400,
+                "Inline data segments require at least one object-backed segment.",
+            );
+            return if heartbeat {
+                heartbeat_wrap(err)
+            } else {
+                err
+            };
         }
 
         let (slo_etag, total) = slo_etag_and_size(&slo_segs);
@@ -807,7 +939,166 @@ impl Slo {
             req.headers.set("Content-Type", "application/json");
         }
         req.body = body.into();
-        next(req)
+        let resp = next(req);
+        if heartbeat {
+            heartbeat_wrap(resp)
+        } else {
+            resp
+        }
+    }
+
+    /// `?multipart-manifest=delete`: expand the SLO (and nested sub_slo)
+    /// segment list, DELETE each object-backed segment, then DELETE the
+    /// manifest. Response mirrors bulk-delete JSON summary.
+    /// Deferred: `async=yes` expirer enqueue path.
+    fn handle_multipart_delete(&self, req: Request, next: &NextFn) -> Response {
+        if req
+            .param("async")
+            .as_deref()
+            .map(config_true_value)
+            .unwrap_or(false)
+        {
+            return Response::error(
+                501,
+                "async multipart-manifest=delete Deferred (expirer enqueue)",
+            );
+        }
+        let parts = match split_path(&req.path, 4, 4, true) {
+            Ok(p) => p,
+            Err(_) => return Response::error(400, "Invalid path"),
+        };
+        let version = parts[0].clone().unwrap_or_default();
+        let account = parts[1].clone().unwrap_or_default();
+        let container = parts[2].clone().unwrap_or_default();
+        let object = parts[3].clone().unwrap_or_default();
+        let manifest_name = format!("/{container}/{object}");
+
+        // Fetch stored manifest (raw GET with multipart-manifest=get).
+        let mut get = req.clone_head();
+        get.method = "GET".to_string();
+        get.query_string = "multipart-manifest=get".to_string();
+        get.headers.remove("Content-Length");
+        ignore_range(&mut get.headers, SLO_HEADER);
+        let mut mresp = next(get);
+        if !(200..300).contains(&mresp.status) {
+            return Response::error(mresp.status, "Unable to load SLO manifest");
+        }
+        let is_slo = mresp
+            .headers
+            .get(SLO_HEADER)
+            .map(config_true_value)
+            .unwrap_or(false);
+        if !is_slo {
+            return Response::error(400, "Not an SLO manifest");
+        }
+        let body = match mresp.body.materialize(MAX_CONTROL_BODY) {
+            Ok(b) => b.to_vec(),
+            Err(_) => return Response::error(500, "Unable to load SLO manifest data"),
+        };
+        let Some(root_segs) = parse_stored_manifest(&body) else {
+            return Response::error(400, "Invalid SLO manifest");
+        };
+
+        // Depth-first expand sub_slo; delete leaves first, then manifests.
+        let mut to_delete: Vec<String> = Vec::new();
+        let mut stack: Vec<(StoredSeg, bool)> = root_segs
+            .into_iter()
+            .map(|s| (s, false))
+            .collect();
+        // Also delete the top-level manifest last.
+        let mut pending_manifests: Vec<String> = vec![manifest_name];
+        let mut expanded = 0usize;
+        while let Some((seg, expanded_flag)) = stack.pop() {
+            if seg.data_b64.is_some() {
+                continue;
+            }
+            if expanded > MAX_SLO_RECURSION_DEPTH * 1000 {
+                return Response::error(400, "Too many buffered slo segments to delete.");
+            }
+            if seg.sub_slo && !expanded_flag {
+                let path = format!("/{version}/{account}{}", seg.name);
+                let mut sub = req.clone_head();
+                sub.method = "GET".to_string();
+                sub.path = path;
+                sub.query_string = "multipart-manifest=get".to_string();
+                sub.headers.remove("Content-Length");
+                ignore_range(&mut sub.headers, SLO_HEADER);
+                let mut sresp = next(sub);
+                if (200..300).contains(&sresp.status)
+                    && sresp
+                        .headers
+                        .get(SLO_HEADER)
+                        .map(config_true_value)
+                        .unwrap_or(false)
+                {
+                    if let Ok(bytes) = sresp.body.materialize(MAX_CONTROL_BODY) {
+                        if let Some(nested) = parse_stored_manifest(bytes) {
+                            // Re-push self after children so nested manifest
+                            // is deleted after its segments.
+                            stack.push((seg.clone(), true));
+                            for n in nested.into_iter().rev() {
+                                stack.push((n, false));
+                            }
+                            expanded += 1;
+                            continue;
+                        }
+                    }
+                }
+                // Failed to expand: still try to delete the path itself.
+                if !seg.name.is_empty() {
+                    to_delete.push(seg.name.clone());
+                }
+            } else if expanded_flag {
+                // Nested manifest object after its segments.
+                if !seg.name.is_empty() {
+                    pending_manifests.push(seg.name.clone());
+                }
+            } else if !seg.name.is_empty() {
+                to_delete.push(seg.name.clone());
+            }
+        }
+        to_delete.extend(pending_manifests);
+
+        let mut number_deleted = 0u64;
+        let mut number_not_found = 0u64;
+        let mut errors: Vec<(String, String)> = Vec::new();
+        for name in &to_delete {
+            // Manifest names are `/container/object` (absolute within account).
+            let delete_path = if name.starts_with('/') {
+                format!("/{version}/{account}{name}")
+            } else {
+                format!("/{version}/{account}/{name}")
+            };
+            let mut del = req.clone_head();
+            del.method = "DELETE".to_string();
+            del.path = delete_path;
+            del.query_string = String::new();
+            del.headers.remove("Content-Length");
+            let resp = next(del);
+            match resp.status {
+                s if (200..300).contains(&s) => number_deleted += 1,
+                404 => number_not_found += 1,
+                s => errors.push((name.clone(), format!("{s}"))),
+            }
+        }
+
+        let (status, body_note) = if !errors.is_empty() {
+            (400u16, "")
+        } else if number_deleted == 0 && number_not_found == 0 {
+            (400, "Invalid bulk delete.")
+        } else {
+            (200, "")
+        };
+        let summary = serde_json::json!({
+            "Number Deleted": number_deleted,
+            "Number Not Found": number_not_found,
+            "Response Status": format!("{status} {}", swift_http::reason_phrase(status)),
+            "Response Body": body_note,
+            "Errors": errors.iter().map(|(p, e)| vec![p.clone(), e.clone()]).collect::<Vec<_>>(),
+        });
+        let mut out = Response::with_body(200, summary.to_string().into_bytes());
+        out.headers.set("Content-Type", "application/json");
+        out
     }
 
     /// `?multipart-manifest=get&format=raw`: convert the stored internal
@@ -868,6 +1159,28 @@ impl Slo {
     }
 }
 
+/// Simplified heartbeat PUT response (Python slo.py 202 + whitespace prefix).
+/// Mid-validation concurrent-HEAD yields are Deferred; this only wraps the
+/// final status after validation / backend PUT complete.
+fn heartbeat_wrap(resp: Response) -> Response {
+    let status = resp.status;
+    let body_note = match &resp.body {
+        Body::Buffered(b) if !b.is_empty() => String::from_utf8_lossy(b).into_owned(),
+        _ => String::new(),
+    };
+    let summary = serde_json::json!({
+        "Response Status": format!("{status} {}", swift_http::reason_phrase(status)),
+        "Response Body": body_note,
+        "Errors": [],
+    });
+    let mut out = Response::with_body(
+        202,
+        format!(" \r\n\r\n{}", summary).into_bytes(),
+    );
+    out.headers.set("Content-Type", "application/json");
+    out
+}
+
 impl Middleware for Slo {
     fn handle(&self, req: Request, next: &NextFn) -> Response {
         if split_path(&req.path, 4, 4, true).is_err() {
@@ -877,6 +1190,10 @@ impl Middleware for Slo {
         // PUT ?multipart-manifest=put creates an SLO from a client manifest.
         if req.method == "PUT" && mpm.as_deref() == Some("put") {
             return self.handle_put(req, next);
+        }
+        // DELETE ?multipart-manifest=delete removes segments then the manifest.
+        if req.method == "DELETE" && mpm.as_deref() == Some("delete") {
+            return self.handle_multipart_delete(req, next);
         }
         let is_get_head = req.method == "GET" || req.method == "HEAD";
         if is_get_head && mpm.as_deref() == Some("get") {
@@ -1263,5 +1580,168 @@ mod tests {
         assert!(arr[0].get("sub_slo").is_none());
         assert_eq!(arr[1]["path"], "/c/s2");
         assert_eq!(arr[1]["range"], "0-1");
+    }
+
+    #[test]
+    fn test_inline_data_put_and_get() {
+        use std::sync::{Arc as SArc, Mutex};
+        let writes: SArc<Mutex<Vec<Vec<u8>>>> = SArc::new(Mutex::new(Vec::new()));
+        let w_put = writes.clone();
+        let w_get = writes.clone();
+        let be: NextFn = Arc::new(move |mut req: Request| {
+            if req.method == "HEAD" && req.path == "/v1/a/c/s1" {
+                let mut r = Response::new(200);
+                r.headers.set("Etag", md5_hex(b"one"));
+                r.headers.set("Content-Length", "3");
+                return r;
+            }
+            if req.method == "PUT" && req.path == "/v1/a/c/manifest" {
+                let body = req.body.materialize(u64::MAX).unwrap().to_vec();
+                w_put.lock().unwrap().push(body);
+                return Response::new(201);
+            }
+            if req.method == "GET" && req.path == "/v1/a/c/manifest" {
+                let body = w_get.lock().unwrap().last().cloned().unwrap_or_default();
+                let mut r = Response::with_body(200, body);
+                r.headers.set("X-Static-Large-Object", "True");
+                // No sysmeta → reassembly recomputes etag/size from JSON.
+                return r;
+            }
+            if req.method == "GET" && req.path == "/v1/a/c/s1" {
+                return Response::with_body(200, b"one".to_vec());
+            }
+            Response::new(404)
+        });
+        let data_b64 = B64.encode(b" hi ");
+        let manifest = serde_json::json!([
+            {"path": "/c/s1", "etag": md5_hex(b"one"), "size_bytes": 3},
+            {"data": data_b64},
+        ]);
+        let body = serde_json::to_vec(&manifest).unwrap();
+        let put = Request {
+            method: "PUT".into(),
+            path: "/v1/a/c/manifest".into(),
+            query_string: "multipart-manifest=put".into(),
+            headers: HeaderKeyDict::new(),
+            body: body.into(),
+        };
+        let resp = Slo::new().handle(put, &be);
+        assert_eq!(resp.status, 201, "{resp:?}");
+        let stored = writes.lock().unwrap()[0].clone();
+        let v: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+        assert!(v[1].get("data").is_some());
+        // GET reassembly: "one" + " hi "
+        let mut get = Slo::new().handle(slo_get("/v1/a/c/manifest", None), &be);
+        assert_eq!(get.status, 200);
+        assert_eq!(body_of(&mut get), b"one hi ");
+    }
+
+    #[test]
+    fn test_inline_data_only_rejected() {
+        let be: NextFn = Arc::new(|_req: Request| Response::new(404));
+        let manifest = serde_json::json!([{"data": B64.encode(b"x")}]);
+        let body = serde_json::to_vec(&manifest).unwrap();
+        let put = Request {
+            method: "PUT".into(),
+            path: "/v1/a/c/manifest".into(),
+            query_string: "multipart-manifest=put".into(),
+            headers: HeaderKeyDict::new(),
+            body: body.into(),
+        };
+        let resp = Slo::new().handle(put, &be);
+        assert_eq!(resp.status, 400);
+    }
+
+    #[test]
+    fn test_heartbeat_put_returns_202() {
+        let be: NextFn = Arc::new(|req: Request| {
+            if req.method == "HEAD" {
+                let mut r = Response::new(200);
+                r.headers.set("Etag", "e");
+                r.headers.set("Content-Length", "1");
+                return r;
+            }
+            if req.method == "PUT" {
+                return Response::new(201);
+            }
+            Response::new(404)
+        });
+        let manifest = serde_json::json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}]);
+        let body = serde_json::to_vec(&manifest).unwrap();
+        let put = Request {
+            method: "PUT".into(),
+            path: "/v1/a/c/manifest".into(),
+            query_string: "multipart-manifest=put&heartbeat=on".into(),
+            headers: HeaderKeyDict::new(),
+            body: body.into(),
+        };
+        let mut resp = Slo::new().handle(put, &be);
+        assert_eq!(resp.status, 202);
+        let b = body_of(&mut resp);
+        assert!(b.starts_with(b" "), "{b:?}");
+        assert!(b.windows(4).any(|w| w == b"\r\n\r\n"));
+    }
+
+    #[test]
+    fn test_multipart_manifest_delete() {
+        use std::sync::{Arc as SArc, Mutex};
+        let deleted: SArc<Mutex<Vec<String>>> = SArc::new(Mutex::new(Vec::new()));
+        let d2 = deleted.clone();
+        let manifest_json = serde_json::to_vec(&serde_json::json!([
+            {"name": "/c/s1", "bytes": 3, "hash": "h1"},
+            {"name": "/c/s2", "bytes": 3, "hash": "h2"},
+            {"data": B64.encode(b"x")},
+        ]))
+        .unwrap();
+        let be: NextFn = Arc::new(move |req: Request| {
+            if req.method == "GET"
+                && req.path == "/v1/a/c/manifest"
+                && req.query_string.contains("multipart-manifest=get")
+            {
+                let mut r = Response::with_body(200, manifest_json.clone());
+                r.headers.set("X-Static-Large-Object", "True");
+                return r;
+            }
+            if req.method == "DELETE" {
+                d2.lock().unwrap().push(req.path.clone());
+                return Response::new(204);
+            }
+            Response::new(404)
+        });
+        let req = Request {
+            method: "DELETE".into(),
+            path: "/v1/a/c/manifest".into(),
+            query_string: "multipart-manifest=delete".into(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let mut resp = Slo::new().handle(req, &be);
+        assert_eq!(resp.status, 200);
+        let body = body_of(&mut resp);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["Number Deleted"], 3); // s1, s2, manifest (data skipped)
+        let paths = deleted.lock().unwrap().clone();
+        assert!(paths.iter().any(|p| p.ends_with("/c/s1")), "{paths:?}");
+        assert!(paths.iter().any(|p| p.ends_with("/c/s2")), "{paths:?}");
+        assert!(
+            paths.iter().any(|p| p == "/v1/a/c/manifest"),
+            "{paths:?}"
+        );
+        // manifest last
+        assert_eq!(paths.last().map(String::as_str), Some("/v1/a/c/manifest"));
+    }
+
+    #[test]
+    fn test_multipart_delete_async_deferred() {
+        let be: NextFn = Arc::new(|_r| Response::new(404));
+        let req = Request {
+            method: "DELETE".into(),
+            path: "/v1/a/c/manifest".into(),
+            query_string: "multipart-manifest=delete&async=yes".into(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let resp = Slo::new().handle(req, &be);
+        assert_eq!(resp.status, 501);
     }
 }

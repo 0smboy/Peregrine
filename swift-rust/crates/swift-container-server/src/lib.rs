@@ -20,9 +20,10 @@
 //! Sharding request paths ARE implemented: record-type=shard PUT (merge
 //! shard ranges), record-type=shard/auto GET (shard-range listing), and the
 //! _redirect_to_shard 301 on object PUT. Deviations tracked for later:
-//! REPLICATE is handled via the db_replicator RPC; container-sync validation
-//! and sync_store are not implemented; the fallocate_reserve free-space check
-//! is not enforced.
+//! REPLICATE is handled via the db_replicator RPC. Container-sync is a full
+//! path: metadata updates maintain `sync_containers/`, `swift-container-sync`
+//! ships rows, and the proxy `container_sync` filter validates inbound realm
+//! auth. Residual: fallocate_reserve free-space check is not enforced.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -47,7 +48,10 @@ pub use reconciler::{
     ReconcileDecision, ReconcileOutcome, MISPLACED_OBJECTS_ACCOUNT,
 };
 pub use sync::{
-    get_sig, sync_auth_header, sync_rows, SyncAction, SyncClient, SyncRow, SyncStats,
+    build_sync_headers, get_sig, owns_object, process_container_db, run_once as sync_run_once,
+    sync_auth_header, sync_rows, validate_sync_to, ContainerSyncConfig, ContainerSyncRealms,
+    ContainerSyncStore, EmptyObjectSource, HttpSyncClient, MapObjectSource, ObjectSource,
+    SyncAction, SyncClient, SyncContext, SyncRow, SyncStats, ValidatedSyncTo, SYNC_DATADIR,
 };
 pub use updater::{
     process_container, run_once as updater_run_once, AccountNodeClient, ContainerOutcome,
@@ -1031,9 +1035,36 @@ impl ContainerServer {
             }
         }
         validate_metadata(&merged)?;
+        // Reset sync points when X-Container-Sync-To changes (Python PUT/POST).
+        if metadata
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("X-Container-Sync-To"))
+        {
+            let old_to = broker
+                .metadata()
+                .ok()
+                .and_then(|md| {
+                    md.into_iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("X-Container-Sync-To"))
+                        .map(|(_, (v, _))| v)
+                })
+                .unwrap_or_default();
+            let new_to = metadata
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("X-Container-Sync-To"))
+                .map(|(_, (v, _))| v.as_str())
+                .unwrap_or("");
+            if old_to != new_to {
+                let _ = broker.set_x_container_sync_points(Some(-1), Some(-1));
+            }
+        }
         broker
             .update_metadata(&metadata)
-            .map_err(|e| self.db_error_response(&e, broker.db_file()))
+            .map_err(|e| self.db_error_response(&e, broker.db_file()))?;
+        // Maintain sync_containers/ index for the container-sync daemon.
+        let store = crate::sync::ContainerSyncStore::new(&self.config.devices);
+        let _ = store.update_sync_store(broker);
+        Ok(())
     }
 
     fn put(&self, req: &mut Request) -> Response {

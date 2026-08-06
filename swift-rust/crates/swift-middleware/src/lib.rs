@@ -29,6 +29,8 @@
 //! `formpost`, `staticweb`, quotas, `symlink`, `versioned_writes`, and the
 //! smaller L2 filters. P3-auth wires `authtoken` + `keystoneauth`. P3-s3
 //! `s3api` lives in `swift-s3api` (proxy-wired; not advertised on `/info`).
+//! At-rest crypto: `keymaster` + `encrypter` + `decrypter` (or composite
+//! `encryption`), ON-BY-CONFIG only.
 
 mod account_quotas;
 mod acl;
@@ -38,15 +40,19 @@ mod bulk;
 mod cache;
 mod catch_errors;
 mod container_quotas;
+mod container_sync;
 mod copy;
 mod crossdomain;
 mod cname_lookup;
+mod decrypter;
 mod dlo;
 mod domain_remap;
+mod encrypter;
 mod etag_quoter;
 mod formpost;
 mod gatekeeper;
 mod healthcheck;
+mod keymaster;
 mod keystoneauth;
 mod listing_formats;
 mod name_check;
@@ -71,12 +77,22 @@ pub use bulk::{parse_delete_body, Bulk, BulkDeleteResult};
 pub use cache::{Cache, DEFAULT_MEMCACHE_SERVERS};
 pub use catch_errors::CatchErrors;
 pub use container_quotas::ContainerQuotas;
+pub use container_sync::{
+    get_sig as container_sync_get_sig, ClosureSyncKeyProvider, ContainerSync, MapSyncKeyProvider,
+    RealmInfo, RealmsConf, SyncKeyProvider,
+};
 pub use copy::Copy;
 pub use dlo::DynamicLargeObject;
 pub use crossdomain::Crossdomain;
 pub use cname_lookup::{CnameLookup, Resolver};
+pub use decrypter::{decrypt_object_body, Decrypter};
 pub use domain_remap::DomainRemap;
+pub use encrypter::{
+    encrypt_object_body, random_iv, random_key, EncryptedObject, Encrypter, BODY_META_HEADER,
+    ETAG_HEADER, ETAG_MAC_HEADER, OVERRIDE_ETAG_HEADER,
+};
 pub use etag_quoter::EtagQuoter;
+pub use keymaster::{CryptoKeys, KeyMaster, KeyMasterMw};
 pub use formpost::{
     formpost_hmac, multipart_boundary, parse_content_disposition,
     verify_signature as formpost_verify, FormPost, FormPostAttributes, FormPostVerify,
