@@ -566,6 +566,10 @@ pub fn find_and_merge_found_ranges(
 /// its `shard` container, update the range's stats from the shard, and mark it
 /// CLEAVED. The updated range is persisted into both the shard container (as
 /// its own range) and the `source` container (so the root records progress).
+///
+/// Both live and deleted rows are copied (Python `yield_objects` order), but
+/// object_count / bytes_used always come from the shard's live stats after
+/// merge (policy_stat triggers ignore deleted=1).
 pub fn cleave_shard_range(
     retiring: &mut ContainerBroker,
     shard: &mut ContainerBroker,
@@ -576,7 +580,8 @@ pub fn cleave_shard_range(
     if !records.is_empty() {
         shard.merge_items(records)?;
     }
-    // Update the range's object/byte counts from the cleaved shard.
+    // Refresh range stats from live rows only (triggers keep object_count =
+    // count of deleted=0; tombstones contribute 0).
     let info = shard.get_info()?;
     let get = |k: &str| {
         info.iter()
@@ -674,7 +679,11 @@ fn split_shard_name(name: &str) -> (String, String) {
     }
 }
 
-/// Place a local shard broker under `device/containers/…` using the hash path.
+/// Place a local shard broker under `device/containers/{part}/…`.
+///
+/// `part` **must** be the container-ring partition for `shard_name` (not the
+/// root container's part). Writing under the root part is SAIO-convenient but
+/// makes proxy listing fan-out (which ring-looks up the shard) always miss.
 fn local_shard_broker(
     device: &Path,
     hash_config: &HashPathConfig,
@@ -699,6 +708,24 @@ fn local_shard_broker(
         let _ = b.initialize(&ts, 0, &ts, "shard");
     }
     b
+}
+
+/// Resolve the container-ring partition for a shard range name.
+/// Falls back to `fallback_part` (root part) when the ring is unavailable —
+/// that path is SAIO-only and will not fan out correctly multi-node.
+fn shard_part_for(
+    shard_name: &str,
+    ring: Option<&swift_ring::Ring>,
+    fallback_part: &str,
+) -> String {
+    let Some(ring) = ring else {
+        return fallback_part.to_string();
+    };
+    let (account, container) = split_shard_name(shard_name);
+    match ring.get_nodes(&account, Some(&container), None) {
+        Ok((part, _)) => part.to_string(),
+        Err(_) => fallback_part.to_string(),
+    }
 }
 
 /// Continue cleave for one container already in the SHARDING state.
@@ -764,6 +791,29 @@ pub fn process_sharding_container_detailed(
     cleave_batch_size: usize,
     replicator: &mut dyn ShardReplicator,
 ) -> Result<ProcessShardingOutcome, DbError> {
+    process_sharding_container_detailed_with_ring(
+        broker,
+        device,
+        hash_config,
+        part,
+        cleave_batch_size,
+        replicator,
+        None,
+    )
+}
+
+/// Same as [`process_sharding_container_detailed`] but places local shard DBs
+/// under each shard's **own** container-ring partition when `ring` is set.
+/// Multi-node listing fan-out requires this; root-part placement is SAIO-only.
+pub fn process_sharding_container_detailed_with_ring(
+    broker: &mut ContainerBroker,
+    device: &Path,
+    hash_config: &HashPathConfig,
+    part: &str,
+    cleave_batch_size: usize,
+    replicator: &mut dyn ShardReplicator,
+    ring: Option<&swift_ring::Ring>,
+) -> Result<ProcessShardingOutcome, DbError> {
     let info = broker.get_info()?;
     let account = info
         .iter()
@@ -805,17 +855,22 @@ pub fn process_sharding_container_detailed(
     let mut replicate_errors = 0u64;
     for sr in &ranges {
         if sr.state < shard_state::CLEAVED {
-            if replicator.replicate_shard(&sr.name, part).is_err() {
+            let spart = shard_part_for(&sr.name, ring, part);
+            if replicator.replicate_shard(&sr.name, &spart).is_err() {
                 replicate_errors += 1;
             }
         }
     }
-    let mut shard_for = |sr: &ShardRange| local_shard_broker(device, hash_config, part, &sr.name);
+    let mut shard_for = |sr: &ShardRange| {
+        let spart = shard_part_for(&sr.name, ring, part);
+        local_shard_broker(device, hash_config, &spart, &sr.name)
+    };
     cleave(broker, &mut ranges, &mut shard_for, &mut ctx, cleave_batch_size)?;
     let ts = swift_core::timestamp::Timestamp::now().internal();
     save_cleaving_context(broker, &ctx, &ts)?;
     // Misplaced pass: objects still in retiring DB outside cleaved ranges.
-    let _ = move_misplaced_from_retiring(broker, device, hash_config, part, &ranges);
+    // Owner shards must also be under their ring part.
+    let _ = move_misplaced_from_retiring_with_ring(broker, device, hash_config, part, &ranges, ring);
     let finished = if ctx.cleaving_done || ranges.iter().all(|r| r.state >= shard_state::CLEAVED) {
         broker.set_sharded_state()?
     } else {
@@ -851,8 +906,24 @@ pub fn process_shrinking_donors_stub(
     Ok(find_shrinking_donors(broker)?.len())
 }
 
-/// Move objects left in the retiring DB that fall outside CLEAVED/ACTIVE
-/// shard ranges into the owning shard (local device). Returns count moved.
+/// Move misplaced objects out of the **retiring** DB (Python `_cleave` →
+/// `_move_misplaced_objects` with `src_broker=get_brokers()[0]` and
+/// `src_bounds=_make_default_misplaced_object_bounds`).
+///
+/// Only objects **outside the own shard range** are misplaced on the retiring
+/// DB. A root container (empty lower/upper) therefore yields a no-op: rows
+/// that still sit in retiring after a normal cleave are *expected* and stay
+/// until [`ContainerBroker::set_sharded_state`] unlinks the retiring file.
+///
+/// ## Contabo bug (fixed)
+/// An earlier implementation re-merged every object that fell *inside* a
+/// CLEAVED range into its shard, then wrote a **newer** tombstone
+/// (`delete_object` → `deleted=1, etag=noetag`) into retiring. On the next
+/// sharder pass those tombstones were merged into the shards (newest-wins)
+/// and overwrote the live rows — listings went empty while object GET still
+/// 200'd. Match Python: do not re-process already-cleaved retiring rows, and
+/// when a real misplaced move succeeds use hard `remove_object_named` (not a
+/// tombstone write).
 pub fn move_misplaced_from_retiring(
     source: &mut ContainerBroker,
     device: &Path,
@@ -860,26 +931,60 @@ pub fn move_misplaced_from_retiring(
     part: &str,
     ranges: &[ShardRange],
 ) -> Result<usize, DbError> {
+    move_misplaced_from_retiring_with_ring(source, device, hash_config, part, ranges, None)
+}
+
+/// Same as [`move_misplaced_from_retiring`] but places owner shards under
+/// their ring partition when `ring` is provided.
+pub fn move_misplaced_from_retiring_with_ring(
+    source: &mut ContainerBroker,
+    device: &Path,
+    hash_config: &HashPathConfig,
+    part: &str,
+    ranges: &[ShardRange],
+    ring: Option<&swift_ring::Ring>,
+) -> Result<usize, DbError> {
     let Some(mut retiring) = source.retiring_broker() else {
         return Ok(0);
     };
-    let records = retiring.object_records_in_range("", "")?;
+    let own = match source.get_own_shard_range(false)? {
+        Some(o) => o,
+        None => return Ok(0),
+    };
+    // `_make_default_misplaced_object_bounds`: only outside own range.
+    let mut bounds: Vec<(String, String)> = Vec::new();
+    if !own.lower.is_empty() {
+        bounds.push((String::new(), own.lower.clone()));
+    }
+    if !own.upper.is_empty() {
+        bounds.push((own.upper.clone(), String::new()));
+    }
+    if bounds.is_empty() {
+        return Ok(0);
+    }
+    let source_path = source.path();
     let mut moved = 0usize;
-    for rec in records {
-        let name = rec.name.clone();
-        let Some(owner) = ranges.iter().find(|r| {
-            r.state >= shard_state::CLEAVED
-                && (r.lower.is_empty() || name.as_str() > r.lower.as_str())
-                && (r.upper.is_empty() || name.as_str() <= r.upper.as_str())
-        }) else {
-            continue;
-        };
-        let mut shard = local_shard_broker(device, hash_config, part, &owner.name);
-        shard.merge_items(vec![rec])?;
-        // Tombstone in retiring so a later reclaim can drop it.
-        let ts = swift_core::timestamp::Timestamp::now().internal();
-        let _ = retiring.delete_object(&name, &ts, 0);
-        moved += 1;
+    for (lower, upper) in &bounds {
+        let records = retiring.object_records_in_range(lower, upper)?;
+        for rec in records {
+            let name = rec.name.clone();
+            let Some(owner) = ranges.iter().find(|r| {
+                r.deleted == 0
+                    && (r.lower.is_empty() || name.as_str() > r.lower.as_str())
+                    && (r.upper.is_empty() || name.as_str() <= r.upper.as_str())
+            }) else {
+                continue;
+            };
+            if owner.name == source_path {
+                continue;
+            }
+            let spart = shard_part_for(&owner.name, ring, part);
+            let mut shard = local_shard_broker(device, hash_config, &spart, &owner.name);
+            shard.merge_items(vec![rec])?;
+            // Hard-delete from retiring (Python `remove_objects`), not tombstone.
+            retiring.remove_object_named(&name)?;
+            moved += 1;
+        }
     }
     Ok(moved)
 }
@@ -967,6 +1072,18 @@ pub fn run_once_with_opts_and_replicator(
     opts: &SharderRunOpts,
     replicator: &mut dyn ShardReplicator,
 ) -> SharderStats {
+    run_once_with_opts_replicator_and_ring(device, hash_config, opts, replicator, None)
+}
+
+/// Sweep with replicator + optional ring so local shard DBs land on the
+/// correct partition for listing fan-out.
+pub fn run_once_with_opts_replicator_and_ring(
+    device: &Path,
+    hash_config: &HashPathConfig,
+    opts: &SharderRunOpts,
+    replicator: &mut dyn ShardReplicator,
+    ring: Option<&swift_ring::Ring>,
+) -> SharderStats {
     let mut stats = SharderStats::default();
     for db in db_locations(device, "containers") {
         stats.containers_seen += 1;
@@ -994,13 +1111,14 @@ pub fn run_once_with_opts_and_replicator(
         match state {
             DbState::Sharding => {
                 stats.sharding += 1;
-                match process_sharding_container_detailed(
+                match process_sharding_container_detailed_with_ring(
                     &mut broker,
                     device,
                     hash_config,
                     &part,
                     opts.cleave_batch_size,
                     replicator,
+                    ring,
                 ) {
                     Ok(out) => {
                         stats.cleaved_batches += 1;
@@ -1016,13 +1134,14 @@ pub fn run_once_with_opts_and_replicator(
                 match maybe_auto_shard(&mut broker, opts) {
                     Ok(true) => {
                         stats.sharding += 1;
-                        match process_sharding_container_detailed(
+                        match process_sharding_container_detailed_with_ring(
                             &mut broker,
                             device,
                             hash_config,
                             &part,
                             opts.cleave_batch_size,
                             replicator,
+                            ring,
                         ) {
                             Ok(out) => {
                                 stats.cleaved_batches += 1;
@@ -1070,7 +1189,13 @@ pub fn run_once_with_opts_and_ring(
     match container_ring {
         Some(ring) => {
             let mut rep = lookup_replicator_for_ring(ring);
-            run_once_with_opts_and_replicator(device, hash_config, opts, &mut rep)
+            run_once_with_opts_replicator_and_ring(
+                device,
+                hash_config,
+                opts,
+                &mut rep,
+                Some(ring),
+            )
         }
         None => run_once_with_opts(device, hash_config, opts),
     }
@@ -1378,7 +1503,9 @@ mod tests {
     }
 
     #[test]
-    fn test_move_misplaced_from_retiring_into_owner_shard() {
+    fn test_move_misplaced_from_retiring_is_noop_for_root_namespace() {
+        // Root own range spans ("", ""): default misplaced bounds are empty,
+        // so retiring rows (including post-cleave leftovers) are not re-moved.
         let hash_config = HashPathConfig::new("", "changeme").unwrap();
         let dir = std::env::temp_dir().join(format!("swift-sharder-mis-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1417,7 +1544,6 @@ mod tests {
         source.merge_shard_ranges(ranges.clone()).unwrap();
         source.enable_sharding(epoch).unwrap();
         assert!(source.set_sharding_state().unwrap());
-        // Simulate a leftover object still in retiring after a partial cleave.
         let mut retiring = source.retiring_broker().expect("retiring db");
         retiring
             .put_object("m2", "1751500002.00000", 1, "text/plain", "e", 0, 0, None, None)
@@ -1425,16 +1551,164 @@ mod tests {
         drop(retiring);
         let moved = move_misplaced_from_retiring(&mut source, &device, &hash_config, "0", &ranges)
             .unwrap();
-        assert!(moved >= 1, "expected misplaced move, got {moved}");
-        // Owner of "m2" is the hi shard (lower=m, upper="").
-        let mut hi = local_shard_broker(&device, &hash_config, "0", &ranges[1].name);
-        let objs = hi
+        assert_eq!(moved, 0, "root whole-namespace must not re-move retiring rows");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_move_misplaced_outside_own_range_into_owner_shard() {
+        // Shrunk own range (lower=m): objects ≤ m are outside and must move.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!("swift-sharder-mis2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "shardlike";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let db = hd.join(format!("{hsh}.db"));
+        let mut source = ContainerBroker::new(&db, account, container);
+        source
+            .initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        for name in ["a1", "m1", "z1"] {
+            source
+                .put_object(name, "1751500001.00000", 1, "text/plain", "e", 0, 0, None, None)
+                .unwrap();
+        }
+        let epoch = "1751500010.00000";
+        // Own range only covers (m, +inf]; a1 is outside and misplaced.
+        let mut own = source.get_own_shard_range(false).unwrap().unwrap();
+        own.lower = "m".into();
+        own.upper = String::new();
+        own.epoch = Some(epoch.into());
+        own.state = shard_state::SHARDING;
+        own.timestamp = epoch.into();
+        own.state_timestamp = epoch.into();
+        source.merge_shard_ranges(vec![own]).unwrap();
+        let ranges = vec![{
+            let mut sr = ShardRange::new(".shards_AUTH_test/c-lo", epoch, "", "m");
+            sr.state = shard_state::ACTIVE;
+            sr
+        }];
+        source.merge_shard_ranges(ranges.clone()).unwrap();
+        assert!(source.set_sharding_state().unwrap());
+        let moved = move_misplaced_from_retiring(&mut source, &device, &hash_config, "0", &ranges)
+            .unwrap();
+        assert!(moved >= 1, "expected a1 (and possibly more) moved, got {moved}");
+        let mut lo = local_shard_broker(&device, &hash_config, "0", &ranges[0].name);
+        let objs = lo
             .object_records_in_range("", "")
             .unwrap()
             .into_iter()
-            .map(|r| r.name)
+            .map(|r| (r.name, r.deleted, r.etag))
             .collect::<Vec<_>>();
-        assert!(objs.iter().any(|n| n == "m2"), "{objs:?}");
+        assert!(
+            objs.iter().any(|(n, d, e)| n == "a1" && *d == 0 && e == "e"),
+            "misplaced live object must stay live, got {objs:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Contabo regression: multi-pass cleave (batch_size=1) must not leave
+    /// shard rows as tombstones (deleted=1, etag=noetag, size=0).
+    #[test]
+    fn test_multipass_cleave_keeps_live_objects_not_tombstones() {
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharder-live-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "livec";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let db = hd.join(format!("{hsh}.db"));
+        let mut source = ContainerBroker::new(&db, account, container);
+        source
+            .initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        for i in 0..10 {
+            source
+                .put_object(
+                    &format!("o{i:04}"),
+                    "1751500001.00000",
+                    10 + i as i64,
+                    "text/plain",
+                    &format!("etag{i:04}"),
+                    0,
+                    0,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        let epoch = "1751500010.00000";
+        find_and_merge_found_ranges(&mut source, account, container, 3, 1, epoch).unwrap();
+        source.enable_sharding(epoch).unwrap();
+        assert!(source.set_sharding_state().unwrap());
+        // own range + epoch must survive set_sharding_state (db_state path)
+        let own = source.get_own_shard_range(true).unwrap();
+        assert!(own.is_some(), "own range must persist into fresh epoch DB");
+        assert!(own.unwrap().epoch.is_some());
+
+        // Multi-pass with batch_size=1 (mirrors daemon sweeps + Contabo load).
+        for _ in 0..8 {
+            let finished = process_sharding_container(
+                &mut source,
+                &device,
+                &hash_config,
+                "0",
+                1,
+            )
+            .unwrap();
+            if finished {
+                break;
+            }
+        }
+
+        let ranges = source
+            .get_shard_ranges(&GetShardRangesArgs {
+                include_own: false,
+                ..GetShardRangesArgs::default()
+            })
+            .unwrap();
+        assert!(!ranges.is_empty());
+        let mut live_total = 0i64;
+        for sr in &ranges {
+            let mut shard = local_shard_broker(&device, &hash_config, "0", &sr.name);
+            let rows = shard.object_records_in_range("", "").unwrap();
+            for r in &rows {
+                assert_eq!(
+                    r.deleted, 0,
+                    "cleaved object {} became tombstone (deleted=1 etag={})",
+                    r.name, r.etag
+                );
+                assert_ne!(r.etag, "noetag", "tombstone etag on {}", r.name);
+                assert!(r.size > 0, "zero size on live object {}", r.name);
+                live_total += 1;
+            }
+            // object_count must reflect live only
+            let oc = shard
+                .get_info()
+                .unwrap()
+                .into_iter()
+                .find(|(k, _)| k == "object_count")
+                .and_then(|(_, v)| v.as_i64())
+                .unwrap_or(-1);
+            assert_eq!(oc, rows.len() as i64, "shard {} object_count", sr.name);
+        }
+        assert_eq!(live_total, 10, "all 10 objects must be live across shards");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

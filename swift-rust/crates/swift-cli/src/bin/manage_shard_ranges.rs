@@ -96,8 +96,18 @@ fn open_broker(db: &str) -> ContainerBroker {
         eprintln!("error: database not found: {db}");
         process::exit(EXIT_ERROR);
     }
-    // Account/container are re-read from the DB after open for ops that need them.
-    ContainerBroker::new(path, "", "")
+    // Probe container_stat for account/container so path()/own-range and
+    // get_db_state epoch comparison work (empty ""/"" → path="/" and own
+    // range always looks missing → Contabo reported Own shard range: null
+    // + db_state=unsharded after cleave even when epoch DB was present).
+    let mut probe = ContainerBroker::new(path, "", "");
+    let account = info_text(&mut probe, "account");
+    let container = info_text(&mut probe, "container");
+    if account.is_empty() {
+        probe
+    } else {
+        ContainerBroker::new(path, &account, &container)
+    }
 }
 
 fn info_i64(broker: &mut ContainerBroker, key: &str) -> i64 {

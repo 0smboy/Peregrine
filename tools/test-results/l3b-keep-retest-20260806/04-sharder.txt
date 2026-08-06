@@ -1,0 +1,61 @@
+=== sharder once x6 on swift1-3 (parallel per pass) ===
+PASS1
+swift1 Aug 06 12:56:43 swift1 container-sharder[2026103]: INFO container-sharder pass: seen=1350 sharding=0 cleaved_batches=0 finished=0 skipped=1350 failures=0 replicate_errors=0 shrinking_donors=0
+swift1 Aug 06 12:57:14 swift1 container-sharder[2026103]: INFO container-sharder pass: seen=1350 sharding=0 cleaved_batches=0 finished=0 skipped=1350 failures=0 replicate_errors=0 shrinking_donors=0
+swift1 Aug 06 12:57:45 swift1 container-sharder[2026103]: INFO container-sharder pass: seen=1350 sharding=0 cleaved_batches=0 finished=0 skipped=1350 failures=0 replicate_errors=0 shrinking_donors=0
+swift2 Aug 06 12:56:43 swift2 container-sharder[1987752]: INFO container-sharder pass: seen=1429 sharding=1 cleaved_batches=1 finished=1 skipped=1428 failures=0 replicate_errors=0 shrinking_donors=0
+swift2 Aug 06 12:57:15 swift2 container-sharder[1987752]: INFO container-sharder pass: seen=1429 sharding=1 cleaved_batches=1 finished=1 skipped=1428 failures=0 replicate_errors=0 shrinking_donors=0
+swift2 Aug 06 12:57:47 swift2 container-sharder[1987752]: INFO container-sharder pass: seen=1429 sharding=1 cleaved_batches=1 finished=1 skipped=1428 failures=0 replicate_errors=0 shrinking_donors=0
+swift3 Aug 06 12:57:03 swift3 container-sharder[2099932]: INFO container-sharder pass: seen=1509 sharding=2 cleaved_batches=2 finished=2 skipped=1507 failures=0 replicate_errors=0 shrinking_donors=0
+swift3 Aug 06 12:57:34 swift3 container-sharder[2099932]: INFO container-sharder pass: seen=1509 sharding=2 cleaved_batches=2 finished=2 skipped=1507 failures=0 replicate_errors=0 shrinking_donors=0
+swift3 Aug 06 12:58:05 swift3 container-sharder[2099932]: INFO container-sharder pass: seen=1509 sharding=2 cleaved_batches=2 finished=2 skipped=1507 failures=0 replicate_errors=0 shrinking_donors=0
+PASS2
+swift1 Aug 06 12:57:14 swift1 container-sharder[2026103]: INFO container-sharder pass: seen=1350 sharding=0 cleaved_batches=0 finished=0 skipped=1350 failures=0 replicate_errors=0 shrinking_donors=0
+swift1 Aug 06 12:57:45 swift1 container-sharder[2026103]: INFO container-sharder pass: seen=1350 sharding=0 cleaved_batches=0 finished=0 skipped=1350 failures=0 replicate_errors=0 shrinking_donors=0
+swift1 Aug 06 12:58:16 swift1 container-sharder[2026103]: INFO container-sharder pass: seen=1350 sharding=0 cleaved_batches=0 finished=0 skipped=1350 failures=0 replicate_errors=0 shrinking_donors=0
+swift2 Aug 06 12:57:15 swift2 container-sharder[1987752]: INFO container-sharder pass: seen=1429 sharding=1 cleaved_batches=1 finished=1 skipped=1428 failures=0 replicate_errors=0 shrinking_donors=0
+swift2 Aug 06 12:57:47 swift2 container-sharder[1987752]: INFO container-sharder pass: seen=1429 sharding=1 cleaved_batches=1 finished=1 skipped=1428 failures=0 replicate_errors=0 shrinking_donors=0
+swift2 Aug 06 12:58:21 swift2 container-sharder[1987752]: INFO container-sharder pass: seen=1429 sharding=1 cleaved_batches=1 finished=1 skipped=1428 failures=0 replicate_errors=0 shrinking_donors=0
+swift3 Aug 06 12:57:34 swift3 container-sharder[2099932]: INFO container-sharder pass: seen=1509 sharding=2 cleaved_batches=2 finished=2 skipped=1507 failures=0 replicate_errors=0 shrinking_donors=0
+swift3 Aug 06 12:58:05 swift3 container-sharder[2099932]: INFO container-sharder pass: seen=1509 sharding=2 cleaved_batches=2 finished=2 skipped=1507 failures=0 replicate_errors=0 shrinking_donors=0
+swift3 Aug 06 12:58:36 swift3 container-sharder[2099932]: INFO container-sharder pass: seen=1507 sharding=0 cleaved_batches=0 finished=0 skipped=1507 failures=0 replicate_errors=0 shrinking_donors=0
+PASS3
+swift1 Aug 06 12:57:14 swift1 container-sharder[2026103]: INFO container-sharder pass: seen=1350 sharding=0 cleaved_batches=0 finished=0 skipped=1350 failures=0 replicate_errors=0 shrinking_donors=0
+swift1 Aug 06 12:57:45 swift1 container-sharder[2026103]: INFO container-sharder pass: seen=1350 sharding=0 cleaved_batches=0 finished=0 skipped=1350 failures=0 replicate_errors=0 shrinking_donors=0
+swift1 Aug 06 12:58:16 swift1 container-sharder[2026103]: INFO container-sharder pass: seen=1350 sharding=0 cleaved_batches=0 finished=0 skipped=1350 failures=0 replicate_errors=0 shrinking_donors=0
+swift2 Aug 06 12:57:47 swift2 container-sharder[1987752]: INFO container-sharder pass: seen=1429 sharding=1 cleaved_batches=1 finished=1 skipped=1428 failures=0 replicate_errors=0 shrinking_donors=0
+swift2 Aug 06 12:58:21 swift2 container-sharder[1987752]: INFO container-sharder pass: seen=1429 sharding=1 cleaved_batches=1 finished=1 skipped=1428 failures=0 replicate_errors=0 shrinking_donors=0
+swift2 Aug 06 12:58:55 swift2 container-sharder[1987752]: INFO container-sharder pass: seen=1429 sharding=1 cleaved_batches=1 finished=1 skipped=1428 failures=0 replicate_errors=0 shrinking_donors=0
+swift3 Aug 06 12:57:34 swift3 container-sharder[2099932]: INFO container-sharder pass: seen=1509 sharding=2 cleaved_batches=2 finished=2 skipped=1507 failures=0 replicate_errors=0 shrinking_donors=0
+swift3 Aug 06 12:58:05 swift3 container-sharder[2099932]: INFO container-sharder pass: seen=1509 sharding=2 cleaved_batches=2 finished=2 skipped=1507 failures=0 replicate_errors=0 shrinking_donors=0
+swift3 Aug 06 12:58:36 swift3 container-sharder[2099932]: INFO container-sharder pass: seen=1507 sharding=0 cleaved_batches=0 finished=0 skipped=1507 failures=0 replicate_errors=0 shrinking_donors=0
+PASS4
+swift1 Aug 06 12:57:45 swift1 container-sharder[2026103]: INFO container-sharder pass: seen=1350 sharding=0 cleaved_batches=0 finished=0 skipped=1350 failures=0 replicate_errors=0 shrinking_donors=0
+swift1 Aug 06 12:58:16 swift1 container-sharder[2026103]: INFO container-sharder pass: seen=1350 sharding=0 cleaved_batches=0 finished=0 skipped=1350 failures=0 replicate_errors=0 shrinking_donors=0
+swift1 Aug 06 12:58:46 swift1 container-sharder[2026103]: INFO container-sharder pass: seen=1350 sharding=0 cleaved_batches=0 finished=0 skipped=1350 failures=0 replicate_errors=0 shrinking_donors=0
+swift2 Aug 06 12:57:47 swift2 container-sharder[1987752]: INFO container-sharder pass: seen=1429 sharding=1 cleaved_batches=1 finished=1 skipped=1428 failures=0 replicate_errors=0 shrinking_donors=0
+swift2 Aug 06 12:58:21 swift2 container-sharder[1987752]: INFO container-sharder pass: seen=1429 sharding=1 cleaved_batches=1 finished=1 skipped=1428 failures=0 replicate_errors=0 shrinking_donors=0
+swift2 Aug 06 12:58:55 swift2 container-sharder[1987752]: INFO container-sharder pass: seen=1429 sharding=1 cleaved_batches=1 finished=1 skipped=1428 failures=0 replicate_errors=0 shrinking_donors=0
+swift3 Aug 06 12:58:05 swift3 container-sharder[2099932]: INFO container-sharder pass: seen=1509 sharding=2 cleaved_batches=2 finished=2 skipped=1507 failures=0 replicate_errors=0 shrinking_donors=0
+swift3 Aug 06 12:58:36 swift3 container-sharder[2099932]: INFO container-sharder pass: seen=1507 sharding=0 cleaved_batches=0 finished=0 skipped=1507 failures=0 replicate_errors=0 shrinking_donors=0
+swift3 Aug 06 12:59:07 swift3 container-sharder[2099932]: INFO container-sharder pass: seen=1508 sharding=1 cleaved_batches=1 finished=1 skipped=1507 failures=0 replicate_errors=0 shrinking_donors=0
+PASS5
+swift1 Aug 06 12:57:45 swift1 container-sharder[2026103]: INFO container-sharder pass: seen=1350 sharding=0 cleaved_batches=0 finished=0 skipped=1350 failures=0 replicate_errors=0 shrinking_donors=0
+swift1 Aug 06 12:58:16 swift1 container-sharder[2026103]: INFO container-sharder pass: seen=1350 sharding=0 cleaved_batches=0 finished=0 skipped=1350 failures=0 replicate_errors=0 shrinking_donors=0
+swift1 Aug 06 12:58:46 swift1 container-sharder[2026103]: INFO container-sharder pass: seen=1350 sharding=0 cleaved_batches=0 finished=0 skipped=1350 failures=0 replicate_errors=0 shrinking_donors=0
+swift2 Aug 06 12:58:21 swift2 container-sharder[1987752]: INFO container-sharder pass: seen=1429 sharding=1 cleaved_batches=1 finished=1 skipped=1428 failures=0 replicate_errors=0 shrinking_donors=0
+swift2 Aug 06 12:58:55 swift2 container-sharder[1987752]: INFO container-sharder pass: seen=1429 sharding=1 cleaved_batches=1 finished=1 skipped=1428 failures=0 replicate_errors=0 shrinking_donors=0
+swift2 Aug 06 12:59:26 swift2 container-sharder[1987752]: INFO container-sharder pass: seen=1428 sharding=0 cleaved_batches=0 finished=0 skipped=1428 failures=0 replicate_errors=0 shrinking_donors=0
+swift3 Aug 06 12:58:05 swift3 container-sharder[2099932]: INFO container-sharder pass: seen=1509 sharding=2 cleaved_batches=2 finished=2 skipped=1507 failures=0 replicate_errors=0 shrinking_donors=0
+swift3 Aug 06 12:58:36 swift3 container-sharder[2099932]: INFO container-sharder pass: seen=1507 sharding=0 cleaved_batches=0 finished=0 skipped=1507 failures=0 replicate_errors=0 shrinking_donors=0
+swift3 Aug 06 12:59:07 swift3 container-sharder[2099932]: INFO container-sharder pass: seen=1508 sharding=1 cleaved_batches=1 finished=1 skipped=1507 failures=0 replicate_errors=0 shrinking_donors=0
+PASS6
+swift1 Aug 06 12:58:16 swift1 container-sharder[2026103]: INFO container-sharder pass: seen=1350 sharding=0 cleaved_batches=0 finished=0 skipped=1350 failures=0 replicate_errors=0 shrinking_donors=0
+swift1 Aug 06 12:58:46 swift1 container-sharder[2026103]: INFO container-sharder pass: seen=1350 sharding=0 cleaved_batches=0 finished=0 skipped=1350 failures=0 replicate_errors=0 shrinking_donors=0
+swift1 Aug 06 12:59:17 swift1 container-sharder[2026103]: INFO container-sharder pass: seen=1350 sharding=0 cleaved_batches=0 finished=0 skipped=1350 failures=0 replicate_errors=0 shrinking_donors=0
+swift2 Aug 06 12:58:21 swift2 container-sharder[1987752]: INFO container-sharder pass: seen=1429 sharding=1 cleaved_batches=1 finished=1 skipped=1428 failures=0 replicate_errors=0 shrinking_donors=0
+swift2 Aug 06 12:58:55 swift2 container-sharder[1987752]: INFO container-sharder pass: seen=1429 sharding=1 cleaved_batches=1 finished=1 skipped=1428 failures=0 replicate_errors=0 shrinking_donors=0
+swift2 Aug 06 12:59:26 swift2 container-sharder[1987752]: INFO container-sharder pass: seen=1428 sharding=0 cleaved_batches=0 finished=0 skipped=1428 failures=0 replicate_errors=0 shrinking_donors=0
+swift3 Aug 06 12:58:36 swift3 container-sharder[2099932]: INFO container-sharder pass: seen=1507 sharding=0 cleaved_batches=0 finished=0 skipped=1507 failures=0 replicate_errors=0 shrinking_donors=0
+swift3 Aug 06 12:59:07 swift3 container-sharder[2099932]: INFO container-sharder pass: seen=1508 sharding=1 cleaved_batches=1 finished=1 skipped=1507 failures=0 replicate_errors=0 shrinking_donors=0
+swift3 Aug 06 12:59:38 swift3 container-sharder[2099932]: INFO container-sharder pass: seen=1508 sharding=1 cleaved_batches=1 finished=1 skipped=1507 failures=0 replicate_errors=0 shrinking_donors=0

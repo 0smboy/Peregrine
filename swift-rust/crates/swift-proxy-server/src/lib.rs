@@ -2451,9 +2451,13 @@ impl ProxyApp {
         self.container_info(account, container).sync_key
     }
 
-    /// Wave 3: if the root container is sharding/sharded, fan out object
-    /// listings across listing-state shard ranges and merge JSON arrays.
-    /// Returns `None` when the container is unsharded or the probe fails
+    /// Wave 3: fan out object listings across listing-state shard ranges and
+    /// merge JSON arrays.
+    ///
+    /// Fans out when HEAD reports sharding/sharded **or** when the root still
+    /// looks unsharded but has object_count=0 and non-empty listing/CLEAVED
+    /// shard ranges (partial L3b cleave: Contabo often keeps DB state
+    /// `unsharded` after ranges exist). Returns `None` when not applicable
     /// (caller falls back to the single-hop path).
     fn maybe_sharded_container_listing(
         self: &Arc<Self>,
@@ -2470,9 +2474,19 @@ impl ProxyApp {
             percent_encode(container)
         );
         let nodes = self.iter_nodes(&self.container_ring, part);
-        // Probe HEAD for sharding state.
-        let head_headers = HeaderKeyDict::new();
-        let head = self.get_or_head("container", nodes.clone(), part, "HEAD", &path, "", &head_headers)?;
+        // Probe HEAD for sharding state + object count. Use backend_headers so
+        // internal requests carry the same baseline as other container hops
+        // (User-Agent / X-Trans-Id); gatekeeper strips client X-Backend-*.
+        let head_headers = self.backend_headers(req, false, "container");
+        let head = self.get_or_head(
+            "container",
+            nodes.clone(),
+            part,
+            "HEAD",
+            &path,
+            "",
+            &head_headers,
+        )?;
         if !(200..300).contains(&head.status) {
             return None;
         }
@@ -2481,29 +2495,31 @@ impl ProxyApp {
             .get("X-Backend-Sharding-State")
             .unwrap_or("unsharded")
             .to_ascii_lowercase();
-        if state != "sharding" && state != "sharded" {
+        let object_count = head
+            .headers
+            .get("X-Container-Object-Count")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        // May still probe ranges when unsharded + empty root (partial cleave).
+        if !should_probe_sharded_listing(&state, object_count) {
             return None;
         }
-        // Fetch shard ranges (listing states).
-        let mut shard_headers = HeaderKeyDict::new();
+        // Fetch shard ranges. Prefer SHARD_LISTING_STATES via states=listing
+        // (ACTIVE/CLEAVED/SHARDING/SHRINKING). If empty, retry without state
+        // filter then keep only listing-state rows client-side.
+        //
+        // Walk primaries until a non-empty listing-state set appears: a replica
+        // that still has only FOUND/CREATED ranges answers 200 with `[]` for
+        // `states=listing`, and get_or_head first-wins would short-circuit
+        // fan-out on that empty body even when another primary is CLEAVED.
+        let mut shard_headers = self.backend_headers(req, false, "container");
         shard_headers.set("X-Backend-Record-Type", "shard");
-        let shard_qs = "states=listing&format=json";
-        let shard_resp = self.get_or_head(
-            "container",
-            nodes,
-            part,
-            "GET",
-            &path,
-            shard_qs,
-            &shard_headers,
-        )?;
-        if !(200..300).contains(&shard_resp.status) {
-            return None;
-        }
-        let shard_body = shard_resp.body.into_vec(16 * 1024 * 1024).ok()?;
-        let ranges: serde_json::Value = serde_json::from_slice(&shard_body).ok()?;
-        let arr = ranges.as_array()?;
-        if arr.is_empty() {
+        // Allow reserved `.shards_*` accounts on the subsequent fan-out GETs.
+        shard_headers.set("X-Backend-Allow-Reserved-Names", "true");
+        let arr = self.fetch_listing_shard_ranges(nodes.clone(), part, &path, &shard_headers)?;
+        // Unsharded/collapsed path only fans out when ranges actually exist
+        // (partial cleave with CLEAVED ranges + empty root).
+        if !should_fanout_sharded_listing(&state, object_count, !arr.is_empty()) {
             return None;
         }
         // Parse client listing knobs.
@@ -2513,7 +2529,7 @@ impl ProxyApp {
             .param("limit")
             .and_then(|v| v.parse().ok())
             .unwrap_or(10000);
-        let selected = select_listing_shard_ranges(arr, &marker, &prefix);
+        let selected = select_listing_shard_ranges(&arr, &marker, &prefix);
         let mut shard_listings: Vec<Vec<serde_json::Value>> = Vec::new();
         for sr in &selected {
             let name = sr.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -2547,7 +2563,9 @@ impl ProxyApp {
                 qs_parts.push(format!("prefix={}", percent_encode(&prefix)));
             }
             qs_parts.push(format!("limit={remaining}"));
-            let headers = self.backend_headers(req, false, "container");
+            let mut headers = self.backend_headers(req, false, "container");
+            // Shard containers live under the reserved `.shards_*` account.
+            headers.set("X-Backend-Allow-Reserved-Names", "true");
             let Some(resp) = self.get_or_head(
                 "container",
                 snodes,
@@ -2576,6 +2594,13 @@ impl ProxyApp {
         out.headers.set("Content-Type", "application/json; charset=utf-8");
         out.headers.set("X-Backend-Sharding-State", state);
         out.headers.set("X-Backend-Record-Type", "object");
+        // Root object_count is often 0 after cleave; report the merged listing
+        // length so clients see a coherent count for this response page.
+        out.headers
+            .set("X-Container-Object-Count", merged.len().to_string());
+        if let Some(bytes_used) = head.headers.get("X-Container-Bytes-Used") {
+            out.headers.set("X-Container-Bytes-Used", bytes_used);
+        }
         if let Some(name) = head
             .headers
             .get("X-Backend-Storage-Policy-Index")
@@ -2585,6 +2610,87 @@ impl ProxyApp {
             out.headers.set("X-Storage-Policy", name);
         }
         Some(out)
+    }
+
+    /// GET root container shard ranges for listing fan-out.
+    ///
+    /// Prefer `states=listing` (ACTIVE/CLEAVED/SHARDING/SHRINKING). Walk every
+    /// primary (and handoff) until a non-empty listing-state set is found —
+    /// do **not** first-win on an empty `[]` from a lagging replica.
+    /// If all listing-state GETs are empty, retry without a state filter and
+    /// keep listing-state rows client-side (or fall back to any ranges).
+    fn fetch_listing_shard_ranges(
+        &self,
+        nodes: Vec<Node>,
+        part: u32,
+        path: &str,
+        shard_headers: &HeaderKeyDict,
+    ) -> Option<Vec<serde_json::Value>> {
+        // 1) Prefer non-empty states=listing from any primary.
+        if let Some(arr) = self.fetch_shard_ranges_first_nonempty(
+            &nodes,
+            part,
+            path,
+            "states=listing&format=json",
+            shard_headers,
+        ) {
+            if !arr.is_empty() {
+                return Some(arr);
+            }
+        }
+        // 2) Broader: no state filter; prefer listing-state rows, else all.
+        let broad = self.fetch_shard_ranges_first_nonempty(
+            &nodes,
+            part,
+            path,
+            "format=json",
+            shard_headers,
+        )?;
+        Some(prefer_listing_state_ranges(&broad))
+    }
+
+    /// GET shard-range JSON from backends until a 2xx body parses as a
+    /// non-empty array (or all nodes are exhausted — then return the last
+    /// empty array / None).
+    fn fetch_shard_ranges_first_nonempty(
+        &self,
+        nodes: &[Node],
+        part: u32,
+        path: &str,
+        query: &str,
+        shard_headers: &HeaderKeyDict,
+    ) -> Option<Vec<serde_json::Value>> {
+        let mut last_empty: Option<Vec<serde_json::Value>> = None;
+        for node in nodes {
+            let Some(resp) = self.get_or_head(
+                "container",
+                vec![node.clone()],
+                part,
+                "GET",
+                path,
+                query,
+                shard_headers,
+            ) else {
+                continue;
+            };
+            if !(200..300).contains(&resp.status) {
+                continue;
+            }
+            let body = match resp.body.into_vec(16 * 1024 * 1024) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let val: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let arr = val.as_array().cloned().unwrap_or_default();
+            if !arr.is_empty() {
+                return Some(arr);
+            }
+            last_empty = Some(arr);
+        }
+        last_empty
     }
 
     /// `get_account_info`-lite: status, account ACL sysmeta, Temp-URL keys.
@@ -3860,6 +3966,69 @@ fn synthesized_account_listing(req: &Request) -> Response {
     resp
 }
 
+/// Numeric `SHARD_LISTING_STATES` (ACTIVE/SHARDING/SHRINKING/CLEAVED).
+/// Mirrors `swift_db::SHARD_LISTING_STATES` so the proxy need not depend on
+/// the db crate for a pure JSON filter.
+pub(crate) const SHARD_LISTING_STATE_NUMS: [i64; 4] = [
+    40, // ACTIVE
+    60, // SHARDING
+    50, // SHRINKING
+    30, // CLEAVED
+];
+
+/// Whether HEAD state / object_count justify probing for shard ranges.
+///
+/// Always for `sharding`/`sharded`. Also for empty roots that still report
+/// `unsharded` after partial cleave (Contabo L3b) — the subsequent range GET
+/// decides if fan-out actually runs.
+pub(crate) fn should_probe_sharded_listing(sharding_state: &str, object_count: i64) -> bool {
+    let state = sharding_state.to_ascii_lowercase();
+    if state == "sharding" || state == "sharded" {
+        return true;
+    }
+    object_count == 0
+}
+
+/// Whether non-empty listing/CLEAVED ranges should trigger fan-out.
+///
+/// True when DB state is sharding/sharded, or when the root still claims
+/// unsharded (or other) with object_count=0 but usable ranges exist.
+pub(crate) fn should_fanout_sharded_listing(
+    sharding_state: &str,
+    object_count: i64,
+    has_listing_ranges: bool,
+) -> bool {
+    if !has_listing_ranges {
+        return false;
+    }
+    let state = sharding_state.to_ascii_lowercase();
+    if state == "sharding" || state == "sharded" {
+        return true;
+    }
+    object_count == 0
+}
+
+/// Prefer ranges whose `state` is in SHARD_LISTING_STATES. If none match
+/// (e.g. missing `state` field), return the input unchanged so a broader
+/// retry can still drive fan-out.
+pub(crate) fn prefer_listing_state_ranges(ranges: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let listing: Vec<serde_json::Value> = ranges
+        .iter()
+        .filter(|sr| {
+            sr.get("state")
+                .and_then(|v| v.as_i64())
+                .map(|s| SHARD_LISTING_STATE_NUMS.contains(&s))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    if listing.is_empty() {
+        ranges.to_vec()
+    } else {
+        listing
+    }
+}
+
 /// Select listing-state shard ranges that can contribute to a client listing
 /// given `marker` / `prefix` (Wave 3 L3b fan-out filter).
 pub(crate) fn select_listing_shard_ranges<'a>(
@@ -4401,10 +4570,22 @@ mod p1a_wiring_tests {
 
 #[cfg(test)]
 mod shard_listing_fanout_tests {
-    use super::{merge_sharded_object_listings, select_listing_shard_ranges};
+    use super::{
+        merge_sharded_object_listings, prefer_listing_state_ranges, select_listing_shard_ranges,
+        should_fanout_sharded_listing, should_probe_sharded_listing, SHARD_LISTING_STATE_NUMS,
+    };
 
     fn sr(name: &str, lower: &str, upper: &str) -> serde_json::Value {
         serde_json::json!({"name": name, "lower": lower, "upper": upper})
+    }
+
+    fn sr_state(name: &str, lower: &str, upper: &str, state: i64) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "lower": lower,
+            "upper": upper,
+            "state": state,
+        })
     }
 
     #[test]
@@ -4439,5 +4620,46 @@ mod shard_listing_fanout_tests {
         assert_eq!(merged.len(), 3);
         assert_eq!(merged[0]["name"], "a1");
         assert_eq!(merged[2]["name"], "b1");
+    }
+
+    #[test]
+    fn empty_state_with_ranges_is_fanout_eligible() {
+        // Contabo partial cleave: DB state still unsharded, root emptied,
+        // CLEAVED ranges present → fan out.
+        assert!(should_probe_sharded_listing("unsharded", 0));
+        assert!(should_fanout_sharded_listing("unsharded", 0, true));
+        assert!(!should_fanout_sharded_listing("unsharded", 0, false));
+
+        // Non-empty unsharded root: do not probe (objects still local).
+        assert!(!should_probe_sharded_listing("unsharded", 5));
+        assert!(!should_fanout_sharded_listing("unsharded", 5, true));
+
+        // Explicit sharding/sharded always eligible when ranges exist.
+        assert!(should_probe_sharded_listing("sharding", 0));
+        assert!(should_probe_sharded_listing("sharded", 100));
+        assert!(should_fanout_sharded_listing("sharding", 0, true));
+        assert!(should_fanout_sharded_listing("sharded", 0, true));
+        assert!(!should_fanout_sharded_listing("sharded", 0, false));
+    }
+
+    #[test]
+    fn prefer_listing_states_keeps_cleaved_drops_found() {
+        // CLEAVED = 30 is in SHARD_LISTING_STATES; FOUND = 10 is not.
+        assert!(SHARD_LISTING_STATE_NUMS.contains(&30));
+        let ranges = vec![
+            sr_state(".shards/found", "", "m", 10),
+            sr_state(".shards/cleaved", "m", "t", 30),
+            sr_state(".shards/active", "t", "", 40),
+        ];
+        let preferred = prefer_listing_state_ranges(&ranges);
+        assert_eq!(preferred.len(), 2);
+        assert_eq!(preferred[0]["name"], ".shards/cleaved");
+        assert_eq!(preferred[1]["name"], ".shards/active");
+
+        // All non-listing → fall back to full list (broader retry path).
+        let only_found = vec![sr_state(".shards/f", "", "", 10)];
+        let fallback = prefer_listing_state_ranges(&only_found);
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0]["name"], ".shards/f");
     }
 }

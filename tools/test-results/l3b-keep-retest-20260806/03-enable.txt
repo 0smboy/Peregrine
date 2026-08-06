@@ -1,0 +1,87 @@
+No shard ranges found to delete.
+Injected 2 shard ranges.
+Run container-replicator to replicate them to other nodes.
+Created epoch DB for SHARDING state (set_sharding_state).
+Container moved to state 'sharding' with epoch 1786020914.54887.
+Run container-sharder on all nodes to shard the container.
+EXIT=0
+Sharding enabled = true
+Own shard range: {
+  "bytes_used": 0,
+  "deleted": 0,
+  "epoch": "1786020914.54887",
+  "lower": "",
+  "meta_timestamp": "1786020914.54960",
+  "name": "AUTH_test/l3bretest1786020669",
+  "object_count": 0,
+  "reported": 0,
+  "state": 60,
+  "state_text": "sharding",
+  "state_timestamp": "1786020914.54887",
+  "timestamp": "1786020914.54960",
+  "tombstones": -1,
+  "upper": ""
+}
+db_state = sharding
+object_count = 0
+bytes_used = 0
+Metadata:
+  X-Container-Sysmeta-Sharding = True
+No shard ranges found to delete.
+Injected 2 shard ranges.
+Run container-replicator to replicate them to other nodes.
+Created epoch DB for SHARDING state (set_sharding_state).
+Container moved to state 'sharding' with epoch 1786020919.70178.
+Run container-sharder on all nodes to shard the container.
+EXIT=0
+Sharding enabled = true
+Own shard range: {
+  "bytes_used": 0,
+  "deleted": 0,
+  "epoch": "1786020919.70178",
+  "lower": "",
+  "meta_timestamp": "1786020919.70281",
+  "name": "AUTH_test/l3bretest1786020669",
+  "object_count": 0,
+  "reported": 0,
+  "state": 60,
+  "state_text": "sharding",
+  "state_timestamp": "1786020919.70178",
+  "timestamp": "1786020919.70281",
+  "tombstones": -1,
+  "upper": ""
+}
+db_state = sharding
+object_count = 0
+bytes_used = 0
+Metadata:
+  X-Container-Sysmeta-Sharding = True
+No shard ranges found to delete.
+Injected 2 shard ranges.
+Run container-replicator to replicate them to other nodes.
+Created epoch DB for SHARDING state (set_sharding_state).
+Container moved to state 'sharding' with epoch 1786020923.64574.
+Run container-sharder on all nodes to shard the container.
+EXIT=0
+Sharding enabled = true
+Own shard range: {
+  "bytes_used": 0,
+  "deleted": 0,
+  "epoch": "1786020923.64574",
+  "lower": "",
+  "meta_timestamp": "1786020923.64678",
+  "name": "AUTH_test/l3bretest1786020669",
+  "object_count": 0,
+  "reported": 0,
+  "state": 60,
+  "state_text": "sharding",
+  "state_timestamp": "1786020923.64574",
+  "timestamp": "1786020923.64678",
+  "tombstones": -1,
+  "upper": ""
+}
+db_state = sharding
+object_count = 0
+bytes_used = 0
+Metadata:
+  X-Container-Sysmeta-Sharding = True

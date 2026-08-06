@@ -763,6 +763,47 @@ impl ContainerBroker {
         )
     }
 
+    /// Port of `ContainerBroker.remove_objects`: hard-DELETE object rows in
+    /// `(lower, upper]` (empty bounds = -inf / +inf), optionally limited by
+    /// max ROWID. Used after a successful misplaced-object move so the source
+    /// no longer carries the rows (not a tombstone write).
+    pub fn remove_objects(
+        &mut self,
+        lower: &str,
+        upper: &str,
+        max_row: Option<i64>,
+    ) -> Result<u64, DbError> {
+        self.commit_pending()?;
+        let conn = self.conn()?;
+        let mut sql = String::from("DELETE FROM object WHERE deleted IN (0, 1)");
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(mr) = max_row {
+            sql.push_str(" AND ROWID <= ?");
+            params.push(Box::new(mr));
+        }
+        if !lower.is_empty() {
+            sql.push_str(" AND name > ?");
+            params.push(Box::new(lower.to_string()));
+        }
+        if !upper.is_empty() {
+            sql.push_str(" AND name <= ?");
+            params.push(Box::new(upper.to_string()));
+        }
+        let n = conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+        Ok(n as u64)
+    }
+
+    /// Hard-DELETE every row for a single object name (all policies).
+    pub fn remove_object_named(&mut self, name: &str) -> Result<u64, DbError> {
+        self.commit_pending()?;
+        let conn = self.conn()?;
+        let n = conn.execute(
+            "DELETE FROM object WHERE deleted IN (0, 1) AND name = ?",
+            [name],
+        )?;
+        Ok(n as u64)
+    }
+
     /// `make_tuple_for_pickle` for a container record.
     fn record_to_pickle_value(record: &ObjectRecord) -> Value {
         let opt = |o: &Option<String>| match o {
@@ -1733,6 +1774,48 @@ mod tests {
     }
 
     #[test]
+    fn test_get_shard_ranges_listing_includes_cleaved() {
+        use crate::shard::{resolve_shard_range_states, state, ShardRange, SHARD_LISTING_STATES};
+
+        let dir = std::env::temp_dir().join(format!(
+            "swift-shard-listing-cleaved-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut b = shard_broker(&dir, 0);
+
+        let mut cleaved = ShardRange::new(".shards_a/c-1", "1751500001.00000", "", "m");
+        cleaved.state = state::CLEAVED;
+        cleaved.state_timestamp = "1751500002.00000".into();
+        let mut found = ShardRange::new(".shards_a/c-2", "1751500001.00000", "m", "");
+        found.state = state::FOUND;
+        found.state_timestamp = "1751500002.00000".into();
+        b.merge_shard_ranges(vec![cleaved, found]).unwrap();
+
+        let listing_states = resolve_shard_range_states(&["listing".into()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            listing_states.len(),
+            SHARD_LISTING_STATES.len(),
+            "{listing_states:?}"
+        );
+        assert!(listing_states.contains(&state::CLEAVED));
+
+        let got = b
+            .get_shard_ranges(&GetShardRangesArgs {
+                states: Some(listing_states),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(got.len(), 1, "FOUND must be excluded from states=listing: {got:?}");
+        assert_eq!(got[0].name, ".shards_a/c-1");
+        assert_eq!(got[0].state, state::CLEAVED);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn test_db_filename_helpers() {
         let p = std::path::Path::new("/x/ab2134.db");
         assert_eq!(parse_db_filename(p), ("ab2134".into(), None, ".db".into()));
@@ -1780,14 +1863,36 @@ mod tests {
         assert!(b.set_sharding_state().unwrap());
         assert_eq!(b.db_files().len(), 2, "retiring + fresh");
         assert_eq!(b.get_db_state().unwrap(), DbState::Sharding);
-        // the fresh DB carries the shard ranges + own range
+        // the fresh DB carries the shard ranges + own range (epoch must survive
+        // so get_db_state can reach SHARDED after set_sharded_state)
         let ranges = b.get_shard_ranges(&GetShardRangesArgs::default()).unwrap();
         assert_eq!(ranges.len(), 2, "{ranges:?}");
+        let own = b.get_own_shard_range(true).unwrap();
+        assert!(
+            own.as_ref().and_then(|o| o.epoch.as_ref()).is_some(),
+            "own range with epoch must be copied into the fresh DB: {own:?}"
+        );
 
         // SHARDING -> SHARDED: retires the old DB
         assert!(b.set_sharded_state().unwrap());
         assert_eq!(b.db_files().len(), 1);
         assert_eq!(b.get_db_state().unwrap(), DbState::Sharded);
+        // Epoch-only path: constructor `<hash>.db` is gone; is_deleted /
+        // get_info_is_deleted must still see the container (listing fan-out).
+        assert!(!b.db_file().exists(), "retiring base path unlinked");
+        assert!(
+            !b.is_deleted().unwrap(),
+            "SHARDED epoch-only DB must not look deleted"
+        );
+        let (info, del) = b.get_info_is_deleted().unwrap();
+        assert!(!del, "get_info_is_deleted must be false for SHARDED");
+        assert!(!info.is_empty());
+        // re-open with identity and confirm SHARDED sticks
+        let mut b2 = ContainerBroker::new(&db, "AUTH_test", "c");
+        assert_eq!(b2.get_db_state().unwrap(), DbState::Sharded);
+        assert!(!b2.is_deleted().unwrap());
+        let (_, del2) = b2.get_info_is_deleted().unwrap();
+        assert!(!del2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1968,8 +2073,13 @@ impl ContainerBroker {
 
     /// `ContainerBroker.is_deleted`: no objects and delete after put.
     /// (Unlike accounts, the status column is not consulted.)
+    ///
+    /// Existence uses [`Self::db_files`] (Python `DatabaseBroker.db_file`
+    /// resolves to the freshest epoch DB). After `set_sharded_state` only
+    /// `<hash>_<epoch>.db` remains — checking the constructor `<hash>.db`
+    /// path would falsely treat SHARDED containers as deleted (404).
     pub fn is_deleted(&mut self) -> Result<bool, DbError> {
-        if !self.db_file().exists() {
+        if self.db_files().is_empty() {
             return Ok(true);
         }
         self.commit_pending()?;
@@ -2266,11 +2376,15 @@ impl ContainerBroker {
         Ok(matches!(max_count, None | Some(0)))
     }
 
-    /// `get_info_is_deleted`: `({}, true)` when the DB is missing.
+    /// `get_info_is_deleted`: `({}, true)` when no DB file (including
+    /// epoch-suffixed) exists under the hash dir.
+    ///
+    /// Must use [`Self::db_files`], not the constructor `<hash>.db` path —
+    /// SHARDED roots keep only `<hash>_<epoch>.db` after retiring is unlinked.
     pub fn get_info_is_deleted(
         &mut self,
     ) -> Result<(Vec<(String, DbValue)>, bool), DbError> {
-        if !self.db_file().exists() {
+        if self.db_files().is_empty() {
             return Ok((Vec::new(), true));
         }
         let info = self.get_info()?;

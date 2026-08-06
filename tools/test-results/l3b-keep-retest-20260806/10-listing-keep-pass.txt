@@ -1,0 +1,52 @@
+C=l3bretest1786020669
+HTTP/1.1 204 No Content
+X-Container-Object-Count: 0
+X-Container-Bytes-Used: 0
+Accept-Ranges: bytes
+listed 59
+first obj-00000 last obj-00060
+GET obj-00001=200
+GET obj-00015=200
+GET obj-00030=200
+GET obj-00031=200
+GET obj-00045=200
+GET obj-00059=200
+=== bins ===
+9abdc2458dfea5e215a270bf279d80d6ab53dfbe7af07f0559e59c04a203d67f  /usr/local/bin/swift-proxy-server
+2211df9526c68ca3d5481638bb66fe98d2b6b402ae223f7dc3395157a4929f29  /usr/local/bin/swift-container-server
+f40bbd99e30c1a014d7bd97ffd60bcf2aa6f09159378d9750c9366fdb317e33b  /usr/local/bin/swift-container-sharder
+63f90b6404e3dd16149444c43aa9b469c3f06ce01bf18139426b7b34f0ec97b8  /usr/local/bin/swift-manage-shard-ranges
+Sharding enabled = true
+Own shard range: {
+  "bytes_used": 0,
+  "deleted": 0,
+  "epoch": "1786020914.54887",
+  "lower": "",
+  "meta_timestamp": "1786020914.54960",
+  "name": "AUTH_test/l3bretest1786020669",
+  "object_count": 0,
+  "reported": 0,
+  "state": 60,
+  "state_text": "sharding",
+  "state_timestamp": "1786020914.54887",
+  "timestamp": "1786020914.54960",
+  "tombstones": -1,
+  "upper": ""
+}
+db_state = sharded
+object_count = 0
+bytes_used = 0
+Metadata:
+  X-Container-Sysmeta-Sharding = True
+  X-Container-Sysmeta-Shard-Cleaving-Context = {"cursor":"obj-00031","ranges_done":2,"ranges_todo":1,"cleaving_done":true}
+analyze: root_container = true
+analyze: db_state = sharded
+analyze: sharding_enabled = true
+analyze: own_range state=sharding lower="" upper="" epoch=Some("1786020914.54887")
+analyze: shard_range_count = 2
+analyze: states = cleaved=2
+analyze: total object_count = 59
+analyze: total row_count = 59
+analyze: overlapping_groups = 0
+analyze: gaps = 0 (continuous coverage of namespace)
+analyze: compactible_sequences (shrink_threshold=100000 expansion_limit=500000) = 0

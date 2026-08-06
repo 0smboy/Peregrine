@@ -1,0 +1,29 @@
+total 52
+drwxr-xr-x. 2 root root   130 Aug  6 13:05 .
+drwxr-xr-x. 3 root root    46 Aug  6 12:51 ..
+-rw-r--r--. 1 root root 53248 Aug  6 13:05 e052eca6d27b878ea9f0e4fc48948c12_1786020914.54887.db
+-rw-r--r--. 1 root root     0 Aug  6 12:52 e052eca6d27b878ea9f0e4fc48948c12.db.pending
+-rw-r--r--. 1 root root     0 Aug  6 12:51 .lock
+=== direct HEAD epoch-only ===
+HTTP/1.1 204 No Content
+X-Backend-Timestamp: 1786020673.30920
+X-Backend-Put-Timestamp: 1786020673.30748
+X-Backend-Delete-Timestamp: 0000000000.00000
+X-Backend-Status-Changed-At: 1786020673.30748
+X-Backend-Storage-Policy-Index: 0
+X-Container-Object-Count: 0
+X-Container-Bytes-Used: 0
+X-Timestamp: 1786020673.30920
+X-Put-Timestamp: 1786020673.30748
+X-Backend-Sharding-State: sharded
+X-Container-Sysmeta-Sharding: True
+X-Container-Sysmeta-Shard-Cleaving-Context: {"cursor":"obj-00031","ranges_done":2,"ranges_todo":1,"cleaving_done":true}
+Content-Type: text/plain; charset=utf-8
+Last-Modified: Thu, 06 Aug 2026 12:51:14 GMT
+Content-Length: 0
+Connection: keep-alive
+
+=== direct GET shard ===
+n 2
+0dfb05bd4e801aea3d997-1786020914.53509-0 30 30
+0dfb05bd4e801aea3d997-1786020914.53509-1 30 29

@@ -1,0 +1,16 @@
+token_len=149
+=== HEAD ===
+HTTP/1.1 204 No Content
+X-Container-Object-Count: 0
+X-Container-Bytes-Used: 0
+X-Timestamp: 1786020673.30920
+X-Put-Timestamp: 1786020673.30748
+Accept-Ranges: bytes
+=== LIST ===
+HTTP=200
+listed 0
+=== GETs ===
+GET obj-00001=200
+GET obj-00030=200
+GET obj-00031=200
+GET obj-00059=200

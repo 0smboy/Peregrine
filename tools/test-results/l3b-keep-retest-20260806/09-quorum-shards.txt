@@ -1,0 +1,37 @@
+=== swift1 ===
+total 52
+drwxr-xr-x. 2 root root   130 Aug  6 13:08 .
+drwxr-xr-x. 3 root root    46 Aug  6 12:51 ..
+-rw-r--r--. 1 root root 53248 Aug  6 13:08 e052eca6d27b878ea9f0e4fc48948c12_1786020914.54887.db
+-rw-r--r--. 1 root root     0 Aug  6 12:52 e052eca6d27b878ea9f0e4fc48948c12.db.pending
+-rw-r--r--. 1 root root     0 Aug  6 12:51 .lock
+HTTP/1.1 204 No Content
+X-Container-Object-Count: 0
+X-Backend-Sharding-State: sharded
+ranges 2 [(30, 30, '7-1786020914.53509-0'), (30, 29, '7-1786020914.53509-1')]
+=== swift2 ===
+total 52
+drwxr-xr-x. 2 root root   130 Aug  6 13:08 .
+drwxr-xr-x. 3 root root    46 Aug  6 12:51 ..
+-rw-r--r--. 1 root root 53248 Aug  6 13:08 e052eca6d27b878ea9f0e4fc48948c12_1786020919.70178.db
+-rw-r--r--. 1 root root     0 Aug  6 12:52 e052eca6d27b878ea9f0e4fc48948c12.db.pending
+-rw-r--r--. 1 root root     0 Aug  6 12:51 .lock
+HTTP/1.1 204 No Content
+X-Container-Object-Count: 0
+X-Backend-Sharding-State: sharded
+ranges 2 [(10, 30, '7-1786020919.67610-0'), (10, 29, '7-1786020919.67610-1')]
+=== swift3 ===
+total 52
+drwxr-xr-x. 2 root root   130 Aug  6 13:08 .
+drwxr-xr-x. 3 root root    46 Aug  6 12:51 ..
+-rw-r--r--. 1 root root 53248 Aug  6 13:08 e052eca6d27b878ea9f0e4fc48948c12_1786020923.64574.db
+-rw-r--r--. 1 root root     0 Aug  6 12:52 e052eca6d27b878ea9f0e4fc48948c12.db.pending
+-rw-r--r--. 1 root root     0 Aug  6 12:51 .lock
+HTTP/1.1 204 No Content
+X-Container-Object-Count: 0
+X-Backend-Sharding-State: sharded
+ranges 2 [(30, 30, '7-1786020923.59280-0'), (30, 29, '7-1786020923.59280-1')]
+SHARD ('.shards_AUTH_test', 'l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020914.53509-0', 30) /srv/node/d2/containers/14356/cb8/29dedaa2c1cd5ac912d13bb2003cdcb8/29dedaa2c1cd5ac912d13bb2003cdcb8.db
+ LIST 200 b'[{"bytes": 7, "hash": "9993c5788f7a03e9803ff6acbbd98326", "name": "obj-00000", "content_type": "text/plain", "last_modif'
+SHARD ('.shards_AUTH_test', 'l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020914.53509-1', 29) /srv/node/d2/containers/14356/012/6268c1ca89978ae20452bfbb06447012/6268c1ca89978ae20452bfbb06447012.db
+ LIST 200 b'[{"bytes": 7, "hash": "0b1f75e65204017f18070075d1a15d2b", "name": "obj-00032", "content_type": "text/plain", "last_modif'

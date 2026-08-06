@@ -1,0 +1,194 @@
+=== post DB state ===
+--- swift1 ---
+total 52
+drwxr-xr-x. 2 root root   130 Aug  6 12:59 .
+drwxr-xr-x. 3 root root    46 Aug  6 12:51 ..
+-rw-r--r--. 1 root root 53248 Aug  6 12:59 e052eca6d27b878ea9f0e4fc48948c12_1786020914.54887.db
+-rw-r--r--. 1 root root     0 Aug  6 12:52 e052eca6d27b878ea9f0e4fc48948c12.db.pending
+-rw-r--r--. 1 root root     0 Aug  6 12:51 .lock
+INFO_DB=/srv/node/d2/containers/14356/c12/e052eca6d27b878ea9f0e4fc48948c12/e052eca6d27b878ea9f0e4fc48948c12_1786020914.54887.db
+Sharding enabled = true
+Own shard range: {
+  "bytes_used": 0,
+  "deleted": 0,
+  "epoch": "1786020914.54887",
+  "lower": "",
+  "meta_timestamp": "1786020914.54960",
+  "name": "AUTH_test/l3bretest1786020669",
+  "object_count": 0,
+  "reported": 0,
+  "state": 60,
+  "state_text": "sharding",
+  "state_timestamp": "1786020914.54887",
+  "timestamp": "1786020914.54960",
+  "tombstones": -1,
+  "upper": ""
+}
+db_state = sharded
+object_count = 0
+bytes_used = 0
+Metadata:
+  X-Container-Sysmeta-Sharding = True
+  X-Container-Sysmeta-Shard-Cleaving-Context = {"cursor":"obj-00031","ranges_done":2,"ranges_todo":1,"cleaving_done":true}
+Existing shard ranges:
+[
+  [
+    "",
+    "obj-00031"
+  ],
+  [
+    "obj-00031",
+    ""
+  ]
+]
+STAT AUTH_test l3bretest1786020669 count 0 /srv/node/d2/containers/14356/c12/e052eca6d27b878ea9f0e4fc48948c12/e052eca6d27b878ea9f0e4fc48948c12_1786020914.54887.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020914.53509-0 count 30 /srv/node/d2/containers/14356/cb8/29dedaa2c1cd5ac912d13bb2003cdcb8/29dedaa2c1cd5ac912d13bb2003cdcb8.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020914.53509-1 count 29 /srv/node/d2/containers/14356/012/6268c1ca89978ae20452bfbb06447012/6268c1ca89978ae20452bfbb06447012.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020923.59280-0 count 0 /srv/node/d2/containers/8716/025/8833a94c7fec23a477832c21d0cf3025/8833a94c7fec23a477832c21d0cf3025.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020919.67610-0 count 0 /srv/node/d2/containers/1960/c98/1ea149ee2d7232d26e620ca676ee5c98/1ea149ee2d7232d26e620ca676ee5c98.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020919.67610-1 count 0 /srv/node/d2/containers/14160/fff/dd43d6bcae2cf7257a628a95dee02fff/dd43d6bcae2cf7257a628a95dee02fff.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020914.53509-1 count 0 /srv/node/d2/containers/6298/012/6268c1ca89978ae20452bfbb06447012/6268c1ca89978ae20452bfbb06447012.db
+--- swift2 ---
+total 104
+drwxr-xr-x. 2 root root   173 Aug  6 13:00 .
+drwxr-xr-x. 3 root root    46 Aug  6 12:51 ..
+-rw-r--r--. 1 root root 53248 Aug  6 12:59 e052eca6d27b878ea9f0e4fc48948c12_1786020919.70178.db
+-rw-r--r--. 1 root root 53248 Aug  6 13:00 e052eca6d27b878ea9f0e4fc48948c12.db
+-rw-r--r--. 1 root root     0 Aug  6 12:52 e052eca6d27b878ea9f0e4fc48948c12.db.pending
+-rw-r--r--. 1 root root     0 Aug  6 12:51 .lock
+INFO_DB=/srv/node/d2/containers/14356/c12/e052eca6d27b878ea9f0e4fc48948c12/e052eca6d27b878ea9f0e4fc48948c12_1786020919.70178.db
+Sharding enabled = true
+Own shard range: {
+  "bytes_used": 0,
+  "deleted": 0,
+  "epoch": "1786020919.70178",
+  "lower": "",
+  "meta_timestamp": "1786020919.70281",
+  "name": "AUTH_test/l3bretest1786020669",
+  "object_count": 0,
+  "reported": 0,
+  "state": 60,
+  "state_text": "sharding",
+  "state_timestamp": "1786020919.70178",
+  "timestamp": "1786020919.70281",
+  "tombstones": -1,
+  "upper": ""
+}
+db_state = sharding
+object_count = 0
+bytes_used = 0
+Cleaving context: {"cursor":"obj-00031","ranges_done":2,"ranges_todo":1,"cleaving_done":true}
+Metadata:
+  X-Container-Sysmeta-Sharding = True
+  X-Container-Sysmeta-Shard-Cleaving-Context = {"cursor":"obj-00031","ranges_done":2,"ranges_todo":1,"cleaving_done":true}
+Existing shard ranges:
+[
+  [
+    "",
+    "obj-00031"
+  ],
+  [
+    "obj-00031",
+    ""
+  ]
+]
+INFO_DB=/srv/node/d2/containers/14356/c12/e052eca6d27b878ea9f0e4fc48948c12/e052eca6d27b878ea9f0e4fc48948c12.db
+Sharding enabled = true
+Own shard range: {
+  "bytes_used": 0,
+  "deleted": 0,
+  "epoch": "1786020919.70178",
+  "lower": "",
+  "meta_timestamp": "1786020919.70281",
+  "name": "AUTH_test/l3bretest1786020669",
+  "object_count": 0,
+  "reported": 0,
+  "state": 60,
+  "state_text": "sharding",
+  "state_timestamp": "1786020919.70178",
+  "timestamp": "1786020919.70281",
+  "tombstones": -1,
+  "upper": ""
+}
+db_state = sharding
+object_count = 0
+bytes_used = 0
+Cleaving context: {"cursor":"obj-00031","ranges_done":2,"ranges_todo":1,"cleaving_done":true}
+Metadata:
+  X-Container-Sysmeta-Sharding = True
+  X-Container-Sysmeta-Shard-Cleaving-Context = {"cursor":"obj-00031","ranges_done":2,"ranges_todo":1,"cleaving_done":true}
+Existing shard ranges:
+[
+  [
+    "",
+    "obj-00031"
+  ],
+  [
+    "obj-00031",
+    ""
+  ]
+]
+STAT AUTH_test l3bretest1786020669 count 0 /srv/node/d2/containers/14356/c12/e052eca6d27b878ea9f0e4fc48948c12/e052eca6d27b878ea9f0e4fc48948c12_1786020919.70178.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020914.53509-1 count 29 /srv/node/d2/containers/14356/012/6268c1ca89978ae20452bfbb06447012/6268c1ca89978ae20452bfbb06447012.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020914.53509-0 count 30 /srv/node/d2/containers/14356/cb8/29dedaa2c1cd5ac912d13bb2003cdcb8/29dedaa2c1cd5ac912d13bb2003cdcb8.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020923.59280-0 count 30 /srv/node/d2/containers/14356/025/8833a94c7fec23a477832c21d0cf3025/8833a94c7fec23a477832c21d0cf3025.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020923.59280-1 count 29 /srv/node/d2/containers/14356/0f0/b6befcf183619de34158230f5bf070f0/b6befcf183619de34158230f5bf070f0.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020923.59280-0 count 0 /srv/node/d2/containers/8716/025/8833a94c7fec23a477832c21d0cf3025/8833a94c7fec23a477832c21d0cf3025.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020923.59280-1 count 0 /srv/node/d2/containers/11695/0f0/b6befcf183619de34158230f5bf070f0/b6befcf183619de34158230f5bf070f0.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020919.67610-0 count 0 /srv/node/d2/containers/1960/c98/1ea149ee2d7232d26e620ca676ee5c98/1ea149ee2d7232d26e620ca676ee5c98.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020919.67610-1 count 0 /srv/node/d2/containers/14160/fff/dd43d6bcae2cf7257a628a95dee02fff/dd43d6bcae2cf7257a628a95dee02fff.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020914.53509-0 count 0 /srv/node/d2/containers/2679/cb8/29dedaa2c1cd5ac912d13bb2003cdcb8/29dedaa2c1cd5ac912d13bb2003cdcb8.db
+--- swift3 ---
+total 52
+drwxr-xr-x. 2 root root   130 Aug  6 13:00 .
+drwxr-xr-x. 3 root root    46 Aug  6 12:51 ..
+-rw-r--r--. 1 root root 53248 Aug  6 13:00 e052eca6d27b878ea9f0e4fc48948c12_1786020923.64574.db
+-rw-r--r--. 1 root root     0 Aug  6 12:52 e052eca6d27b878ea9f0e4fc48948c12.db.pending
+-rw-r--r--. 1 root root     0 Aug  6 12:51 .lock
+INFO_DB=/srv/node/d2/containers/14356/c12/e052eca6d27b878ea9f0e4fc48948c12/e052eca6d27b878ea9f0e4fc48948c12_1786020923.64574.db
+Sharding enabled = true
+Own shard range: {
+  "bytes_used": 0,
+  "deleted": 0,
+  "epoch": "1786020923.64574",
+  "lower": "",
+  "meta_timestamp": "1786020923.64678",
+  "name": "AUTH_test/l3bretest1786020669",
+  "object_count": 0,
+  "reported": 0,
+  "state": 60,
+  "state_text": "sharding",
+  "state_timestamp": "1786020923.64574",
+  "timestamp": "1786020923.64678",
+  "tombstones": -1,
+  "upper": ""
+}
+db_state = sharded
+object_count = 0
+bytes_used = 0
+Metadata:
+  X-Container-Sysmeta-Sharding = True
+  X-Container-Sysmeta-Shard-Cleaving-Context = {"cursor":"obj-00031","ranges_done":2,"ranges_todo":1,"cleaving_done":true}
+Existing shard ranges:
+[
+  [
+    "",
+    "obj-00031"
+  ],
+  [
+    "obj-00031",
+    ""
+  ]
+]
+STAT AUTH_test l3bretest1786020669 count 0 /srv/node/d2/containers/14356/c12/e052eca6d27b878ea9f0e4fc48948c12/e052eca6d27b878ea9f0e4fc48948c12_1786020923.64574.db
+STAT AUTH_test l3bretest1786020669 count 0 /srv/node/d2/containers/14356/c12/e052eca6d27b878ea9f0e4fc48948c12/e052eca6d27b878ea9f0e4fc48948c12.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020923.59280-0 count 30 /srv/node/d2/containers/14356/025/8833a94c7fec23a477832c21d0cf3025/8833a94c7fec23a477832c21d0cf3025.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020923.59280-1 count 29 /srv/node/d2/containers/14356/0f0/b6befcf183619de34158230f5bf070f0/b6befcf183619de34158230f5bf070f0.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020914.53509-1 count 29 /srv/node/d2/containers/14356/012/6268c1ca89978ae20452bfbb06447012/6268c1ca89978ae20452bfbb06447012.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020914.53509-0 count 30 /srv/node/d2/containers/14356/cb8/29dedaa2c1cd5ac912d13bb2003cdcb8/29dedaa2c1cd5ac912d13bb2003cdcb8.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020923.59280-0 count 0 /srv/node/d2/containers/8716/025/8833a94c7fec23a477832c21d0cf3025/8833a94c7fec23a477832c21d0cf3025.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020923.59280-1 count 0 /srv/node/d2/containers/11695/0f0/b6befcf183619de34158230f5bf070f0/b6befcf183619de34158230f5bf070f0.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020919.67610-0 count 0 /srv/node/d2/containers/1960/c98/1ea149ee2d7232d26e620ca676ee5c98/1ea149ee2d7232d26e620ca676ee5c98.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020919.67610-1 count 0 /srv/node/d2/containers/14160/fff/dd43d6bcae2cf7257a628a95dee02fff/dd43d6bcae2cf7257a628a95dee02fff.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020914.53509-0 count 0 /srv/node/d2/containers/2679/cb8/29dedaa2c1cd5ac912d13bb2003cdcb8/29dedaa2c1cd5ac912d13bb2003cdcb8.db
+STAT .shards_AUTH_test l3bretest1786020669-badb616245a0dfb05bd4e801aea3d997-1786020914.53509-1 count 0 /srv/node/d2/containers/6298/012/6268c1ca89978ae20452bfbb06447012/6268c1ca89978ae20452bfbb06447012.db

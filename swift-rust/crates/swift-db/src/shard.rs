@@ -500,6 +500,21 @@ mod tests {
     }
 
     #[test]
+    fn listing_alias_includes_cleaved() {
+        // states=listing must return CLEAVED (30) ranges after L3b cleave.
+        let resolved = resolve_shard_range_states(&["listing".into()])
+            .unwrap()
+            .expect("listing expands to a state set");
+        assert!(
+            resolved.contains(&state::CLEAVED),
+            "CLEAVED missing from listing states: {resolved:?}"
+        );
+        for s in SHARD_LISTING_STATES {
+            assert!(resolved.contains(&s), "missing {s} in {resolved:?}");
+        }
+    }
+
+    #[test]
     fn test_merge_no_existing_adds() {
         let mut new = sr("a", "1751500000.00000");
         assert!(merge_shards(&mut new, None));
