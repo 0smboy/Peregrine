@@ -1,18 +1,18 @@
 # Sharder shrink KEEP (2026-08-06)
 
 ## Unit
-- `process_shrinking_donors` moves objects, marks SHRUNK (timestamp-bumped merge)
-- Skip when donor DB not local (no false SHRUNK)
+- `process_shrinking_donors`: local move + SHRUNK; skip missing donor DB
 
-## Contabo lab KEEP (`02-shrinklab-KEEP.txt`)
-- Container `shrinklab1786029572`: 20 objects, 2 local shards
-- CLEAVED → ACTIVE → compact SHRINKING → sharder shrink
-- Donor **SHRUNK** live=0; acceptor live=20
-- Client HEAD count=20, list=20, GET 20/20
+## Contabo LAB KEEP
+1. **shrinklab1786029572** (`02-shrinklab-KEEP.txt`): single-node full path
+   CLEAVED→ACTIVE→compact→shrink; donor SHRUNK; acceptor 20; GET 20/20
+2. **l3bclean co-located repair** (`03-l3bclean-colocate-shrink.txt`):
+   donor 90→0, acceptor 0→90 after root DB co-located with donor on swift1
 
-## Proxy HEAD counts
-- `patch_sharded_head_counts` sums shard HEADs for sharded roots
+## Proxy HEAD
+- Sums listing-state shard HEADs; may lag list when residual root rows exist
 
-## Not claimed
-- Multi-primary shrink when donor/acceptor on different nodes (needs remote move / replicate)
-- PRODUCTION-GO-LIVE
+## Residual (honest)
+- Automatic multi-primary shrink (range table only on nodes without donor data)
+  needs container-replicator / root fan-out — **not claimed**
+- PRODUCTION-GO-LIVE not claimed

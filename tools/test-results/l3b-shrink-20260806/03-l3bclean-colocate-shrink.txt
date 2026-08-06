@@ -1,0 +1,21 @@
+=== l3bclean multi-device shrink repair 2026-08-06 ===
+
+Problem:
+- Root range table on swift2 had false SHRUNK (no local donor data)
+- Real objects on swift1 donor shard: live=90; acceptor live=0
+
+Repair:
+1. Re-merge root ranges: donor SHRINKING oc=90, acceptor ACTIVE full NS
+2. Copy root epoch DB directory to swift1 (same relative path) so sharder
+   sees SHARDED root + SHRINKING on a node that has the donor DB
+3. swift-container-sharder once on swift1
+
+After:
+- donor live 90 → 0, state SHRUNK deleted=1
+- acceptor live 0 → 90, object_count=90 ACTIVE
+- Client GET burst-00001=200, k4b-wave2-01=200/4096
+- HEAD Object-Count=60 (shard sum partial / residual); list_len=80
+
+RESULT=objects moved off donor onto acceptor when root metadata co-located
+  with donor data. True multi-primary shrink still needs container-replicator
+  (range table to all primaries) — not claimed as automatic multi-node KEEP.
