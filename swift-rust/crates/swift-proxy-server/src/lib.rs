@@ -2292,6 +2292,18 @@ impl ProxyApp {
                     {
                         resp.headers.set("X-Storage-Policy", name);
                     }
+                    // Sharded root HEAD often reports a stale root object_count
+                    // (post-cleave residual / post-shard PUTs land on shards).
+                    // For HEAD, fan out to listing-state shards and sum live
+                    // counts so clients match listing reality.
+                    if req.method == "HEAD" {
+                        self.patch_sharded_head_counts(
+                            req,
+                            account,
+                            container,
+                            &mut resp,
+                        );
+                    }
                 }
                 resp
             }
@@ -2454,6 +2466,103 @@ impl ProxyApp {
     /// Container-sync user key for inbound realm HMAC validation.
     pub fn container_sync_key(&self, account: &str, container: &str) -> Option<String> {
         self.container_info(account, container).sync_key
+    }
+
+    /// For a sharded root HEAD: sum live `X-Container-Object-Count` /
+    /// `X-Container-Bytes-Used` from listing-state shard containers and
+    /// overwrite the (often stale) root totals. No-op when not sharded or
+    /// no listing ranges are available.
+    fn patch_sharded_head_counts(
+        self: &Arc<Self>,
+        req: &Request,
+        account: &str,
+        container: &str,
+        resp: &mut Response,
+    ) {
+        let state = resp
+            .headers
+            .get("X-Backend-Sharding-State")
+            .unwrap_or("unsharded")
+            .to_ascii_lowercase();
+        if state != "sharding" && state != "sharded" {
+            return;
+        }
+        let Ok((part, _)) = self.container_ring.get_nodes(account, Some(container), None) else {
+            return;
+        };
+        let path = format!(
+            "/{}/{}",
+            percent_encode(account),
+            percent_encode(container)
+        );
+        let nodes = self.iter_nodes(&self.container_ring, part);
+        let mut shard_headers = self.backend_headers(req, false, "container");
+        shard_headers.set("X-Backend-Record-Type", "shard");
+        shard_headers.set("X-Backend-Allow-Reserved-Names", "true");
+        let Some(arr) =
+            self.fetch_listing_shard_ranges(nodes, part, &path, &shard_headers)
+        else {
+            return;
+        };
+        if arr.is_empty() {
+            return;
+        }
+        let mut total_count: i64 = 0;
+        let mut total_bytes: i64 = 0;
+        let mut saw_shard = false;
+        for sr in &arr {
+            // Skip soft-deleted / SHRUNK donors so we do not double-count
+            // during shrink (objects already live on the acceptor).
+            let st = sr.get("state").and_then(|v| v.as_i64()).unwrap_or(0);
+            if st == 80 {
+                // SHRUNK
+                continue;
+            }
+            let name = sr.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let (shard_account, shard_container) = match name.split_once('/') {
+                Some((a, c)) => (a, c),
+                None => continue,
+            };
+            let Ok((spart, _)) =
+                self.container_ring
+                    .get_nodes(shard_account, Some(shard_container), None)
+            else {
+                continue;
+            };
+            let spath = format!(
+                "/{}/{}",
+                percent_encode(shard_account),
+                percent_encode(shard_container)
+            );
+            let snodes = self.iter_nodes(&self.container_ring, spart);
+            let mut headers = self.backend_headers(req, false, "container");
+            headers.set("X-Backend-Allow-Reserved-Names", "true");
+            let Some(head) =
+                self.get_or_head("container", snodes, spart, "HEAD", &spath, "", &headers)
+            else {
+                continue;
+            };
+            if !(200..300).contains(&head.status) {
+                continue;
+            }
+            saw_shard = true;
+            total_count += head
+                .headers
+                .get("X-Container-Object-Count")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
+            total_bytes += head
+                .headers
+                .get("X-Container-Bytes-Used")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
+        }
+        if saw_shard {
+            resp.headers
+                .set("X-Container-Object-Count", total_count.to_string());
+            resp.headers
+                .set("X-Container-Bytes-Used", total_bytes.to_string());
+        }
     }
 
     /// Wave 3: fan out object listings across listing-state shard ranges and

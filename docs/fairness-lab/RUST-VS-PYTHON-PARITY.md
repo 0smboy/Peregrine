@@ -116,7 +116,9 @@
 | db-replicator | ✅ | ✅ | |
 | swift-recon (md5/async/quarantine/tombstone/dbspace) | ✅ | ✅ | Contabo textfile+Prom |
 | ring-builder | ✅ | ✅ | .builder pickle not bit-identical tool format |
-| manage-shard-ranges (main CLI) | ✅ | ✅ | find/show/info/enable/delete/merge/find_and_replace + **analyze/compact/repair/activate_cleaved** (`--include-cleaved`); shrink object migration by sharder residual |
+| manage-shard-ranges (main CLI) | ✅ | ✅ | find/show/info/enable/delete/merge/find_and_replace + **analyze/compact/repair/activate_cleaved** (`--include-cleaved`) |
+| sharder shrink (SHRINKING→SHRUNK) | ✅ | ✅ | Local-device object move + SHRUNK (`process_shrinking_donors`); multi-node quorum KEEP residual |
+| sharded HEAD object_count | ✅ | ✅ | Proxy sums listing-state shard HEADs (`patch_sharded_head_counts`); may still lag list when root residual rows exist |
 | dispersion / drive-audit / relinker | ✅ | ✅ | |
 
 ---
@@ -186,7 +188,8 @@ Rust is a **strong core-path + lab-proven** Swift, **not** a drop-in “full Ope
 | L3b sharder cleave creates shard DBs | **PASS lab** (`l3bkeep…`, shard DBs present) |
 | L3b listing KEEP post-cleave | **LAB CLEAN PASS** listed 60 no relocate (`l3b-clean-e2e-20260806`); post-shard 4KB PUT→list via shard update route (`l3b-4kb-keep-20260806`); wave2 30×4KB put_fail=0 list+GET (`l3b-4kb-wave2-20260806`); product long soak **not claimed** |
 | container-sync Contabo same-cluster | **KEEP** puts=28 fails=0 dst 5/5 GET (`sync-smoke-20260806d`); multi-cluster soak not run |
-| compact / activate_cleaved | CLI + unit; lab CLEAVED→ACTIVE→SHRINKING mark (`l3b-compact-20260806`); sharder object shrink residual |
+| compact / activate_cleaved | CLI + unit; lab CLEAVED→ACTIVE→SHRINKING mark (`l3b-compact-20260806`) |
+| sharder shrink + HEAD counts | unit PASS object move+SHRUNK; Contabo HEAD sum + list residual (`l3b-shrink-20260806`); multi-node shrink KEEP residual |
 | TLS Contabo dry-run | **LAB self-signed** (`tls-dry-run-20260806`) |
 | Operator TLS PEM live apply | **deferred** |
 

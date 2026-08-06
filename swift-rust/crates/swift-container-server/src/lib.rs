@@ -34,11 +34,12 @@ pub mod sync;
 pub mod updater;
 pub use sharder::{
     cleave, cleave_shard_range, default_shard_quorum, find_and_merge_found_ranges,
-    find_shrinking_donors, http_replicator_for_primaries, load_cleaving_context,
-    lookup_replicator_for_ring, maybe_auto_shard, move_misplaced_from_retiring,
-    primary_shard_replica_nodes, process_sharding_container,
+    find_shrink_acceptor, find_shrinking_donors, http_replicator_for_primaries,
+    load_cleaving_context, lookup_replicator_for_ring, maybe_auto_shard,
+    move_misplaced_from_retiring, primary_shard_replica_nodes, process_sharding_container,
     process_sharding_container_detailed, process_sharding_container_with_replicator,
-    process_shrinking_donors_stub, put_shard_quorum, recon_update as sharder_recon_update,
+    process_shrinking_donors, process_shrinking_donors_stub, put_shard_quorum,
+    range_covers, recon_update as sharder_recon_update,
     ring_get_nodes_for_shard, run_once as sharder_run_once,
     run_once_with_opts as sharder_run_once_with_opts, run_once_with_opts_and_replicator,
     run_once_with_opts_and_ring, save_cleaving_context, shard_replicas_from_ring_devices,

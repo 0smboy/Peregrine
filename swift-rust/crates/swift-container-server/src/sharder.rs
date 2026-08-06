@@ -44,8 +44,9 @@
 //!   [`ring_get_nodes_for_shard`]: ring devices → [`ShardReplicaNode`]
 //! - Daemon loop: optional container.ring.gz → inject lookup replicator into
 //!   [`process_sharding_container_with_replicator`] for uncleaved ranges
-//! - [`find_shrinking_donors`] / [`process_shrinking_donors_stub`]: detect
-//!   donors marked SHRINKING by CLI compact/repair (no acceptor cleave yet)
+//! - [`find_shrinking_donors`] / [`process_shrinking_donors`]: detect donors
+//!   marked SHRINKING by CLI compact and move their objects into a covering
+//!   ACTIVE acceptor, then mark the donor SHRUNK
 //! - [`LocalShardReplicator`] + same-device lab cleave (SAIO-safe default when
 //!   no ring is loaded)
 //!
@@ -56,8 +57,8 @@
 //! 2. **Durable multi-primary object cleave under concurrent load** — local
 //!    same-device row write is not a multi-node product claim; remote object
 //!    push / rsync of cleaved shard DBs remains open.
-//! 3. **Full shrink/compact execution** — daemon only *detects* SHRINKING
-//!    donors; acceptor expand + donor object move + SHRUNK transition TBD.
+//! 3. **Multi-node shrink KEEP** — local-device object move + SHRUNK on root
+//!    is unit-tested; Contabo quorum + concurrent shrink not claimed.
 //! 4. WAN / async container-sync (wontfix).
 
 use std::path::Path;
@@ -684,12 +685,13 @@ fn split_shard_name(name: &str) -> (String, String) {
 /// `part` **must** be the container-ring partition for `shard_name` (not the
 /// root container's part). Writing under the root part is SAIO-convenient but
 /// makes proxy listing fan-out (which ring-looks up the shard) always miss.
-fn local_shard_broker(
+/// Path of the local shard container DB (may not exist yet).
+fn shard_db_path(
     device: &Path,
     hash_config: &HashPathConfig,
     part: &str,
     shard_name: &str,
-) -> ContainerBroker {
+) -> (std::path::PathBuf, String, String) {
     let (account, container) = split_shard_name(shard_name);
     let hsh = hash_config
         .hash_path(&account, Some(&container), None)
@@ -700,8 +702,32 @@ fn local_shard_broker(
         .join(part)
         .join(suffix)
         .join(&hsh);
-    let _ = std::fs::create_dir_all(&hd);
     let db = hd.join(format!("{hsh}.db"));
+    (db, account, container)
+}
+
+/// Open a shard broker only if its DB file already exists (no auto-create).
+fn open_existing_shard_broker(
+    device: &Path,
+    hash_config: &HashPathConfig,
+    part: &str,
+    shard_name: &str,
+) -> Option<ContainerBroker> {
+    let (db, account, container) = shard_db_path(device, hash_config, part, shard_name);
+    if !db.exists() {
+        return None;
+    }
+    Some(ContainerBroker::new(&db, &account, &container))
+}
+
+fn local_shard_broker(
+    device: &Path,
+    hash_config: &HashPathConfig,
+    part: &str,
+    shard_name: &str,
+) -> ContainerBroker {
+    let (db, account, container) = shard_db_path(device, hash_config, part, shard_name);
+    let _ = std::fs::create_dir_all(db.parent().unwrap_or(device));
     let mut b = ContainerBroker::new(&db, &account, &container);
     if !db.exists() {
         let ts = swift_core::timestamp::Timestamp::now().internal();
@@ -897,9 +923,128 @@ pub fn find_shrinking_donors(
         .collect())
 }
 
-/// Daemon compact-pass stub: count SHRINKING donors so the run loop can
-/// report them. Does **not** cleave donor objects into acceptors or mark
-/// SHRUNK — that remains a multi-node KEEP residual.
+/// Whether `acceptor` fully covers `donor`'s namespace (inclusive bounds
+/// matching shard-range convention: (lower, upper]).
+pub fn range_covers(acceptor: &ShardRange, donor: &ShardRange) -> bool {
+    // lower: acceptor.lower <= donor.lower (empty lower = MIN)
+    let lower_ok = acceptor.lower.is_empty()
+        || (!donor.lower.is_empty()
+            && ShardRange::lower_cmp(&acceptor.lower, &donor.lower)
+                != std::cmp::Ordering::Greater);
+    // upper: acceptor.upper >= donor.upper (empty upper = MAX)
+    let upper_ok = acceptor.upper.is_empty()
+        || (!donor.upper.is_empty()
+            && ShardRange::lower_cmp(&donor.upper, &acceptor.upper)
+                != std::cmp::Ordering::Greater);
+    lower_ok && upper_ok
+}
+
+/// Find an ACTIVE non-deleted range on the root that covers `donor` and is
+/// not the donor itself (compact expands the acceptor to cover donors).
+pub fn find_shrink_acceptor<'a>(
+    ranges: &'a [ShardRange],
+    donor: &ShardRange,
+) -> Option<&'a ShardRange> {
+    ranges.iter().find(|r| {
+        r.deleted == 0
+            && r.state == shard_state::ACTIVE
+            && r.name != donor.name
+            && range_covers(r, donor)
+    })
+}
+
+/// Process SHRINKING donors on a SHARDED root: move live objects from each
+/// donor shard container into a covering ACTIVE acceptor, zero donor stats,
+/// and mark the donor **SHRUNK** on the root.
+///
+/// Lab/SAIO path writes under the local device. Multi-node KEEP still needs
+/// replication of the acceptor and root range updates to other primaries.
+///
+/// Returns the number of donors successfully marked SHRUNK.
+pub fn process_shrinking_donors(
+    root: &mut ContainerBroker,
+    device: &Path,
+    hash_config: &HashPathConfig,
+    root_part: &str,
+    ring: Option<&swift_ring::Ring>,
+) -> Result<usize, DbError> {
+    let donors = find_shrinking_donors(root)?;
+    if donors.is_empty() {
+        return Ok(0);
+    }
+    let ranges = root.get_shard_ranges(&GetShardRangesArgs {
+        include_own: false,
+        include_deleted: false,
+        ..GetShardRangesArgs::default()
+    })?;
+    let ts = swift_core::timestamp::Timestamp::now().internal();
+    let mut finished = 0usize;
+    for donor in donors {
+        let Some(acceptor) = find_shrink_acceptor(&ranges, &donor) else {
+            continue;
+        };
+        let donor_part = shard_part_for(&donor.name, ring, root_part);
+        let acc_part = shard_part_for(&acceptor.name, ring, root_part);
+        // Only shrink when the donor shard DB already lives on this device.
+        // `local_shard_broker` auto-creates empty DBs — that would mark SHRUNK
+        // without moving real objects (Contabo multi-primary hazard).
+        let Some(mut donor_b) =
+            open_existing_shard_broker(device, hash_config, &donor_part, &donor.name)
+        else {
+            continue;
+        };
+        let mut acc_b =
+            local_shard_broker(device, hash_config, &acc_part, &acceptor.name);
+
+        // Copy all rows in the donor's original bounds into the acceptor.
+        let records =
+            donor_b.object_records_in_range(&donor.lower, &donor.upper)?;
+        let names: Vec<String> = records.iter().map(|r| r.name.clone()).collect();
+        if !records.is_empty() {
+            acc_b.merge_items(records)?;
+        }
+        // Remove from donor so listing does not double-count if both still list.
+        for name in &names {
+            let _ = donor_b.remove_object_named(name);
+        }
+
+        // Refresh acceptor stats from live DB.
+        let mut acc_updated = acceptor.clone();
+        if let Ok(info) = acc_b.get_info() {
+            let get = |k: &str| {
+                info.iter()
+                    .find(|(n, _)| n == k)
+                    .and_then(|(_, v)| v.as_i64())
+                    .unwrap_or(0)
+            };
+            acc_updated.object_count = get("object_count");
+            acc_updated.bytes_used = get("bytes_used");
+            acc_updated.meta_timestamp = ts.clone();
+        }
+
+        let mut donor_updated = donor.clone();
+        // Bump created timestamp so merge_shards takes the full new row
+        // (same timestamp would preserve existing deleted=0).
+        donor_updated.timestamp = ts.clone();
+        donor_updated.object_count = 0;
+        donor_updated.bytes_used = 0;
+        donor_updated.meta_timestamp = ts.clone();
+        let _ = donor_updated.update_state(shard_state::SHRUNK, Some(&ts));
+        // SHRUNK donors are soft-deleted from the namespace (Python).
+        donor_updated.deleted = 1;
+
+        // Acceptor bounds/stats: bump timestamp so meta wins cleanly.
+        acc_updated.timestamp = ts.clone();
+
+        // Persist own-range view on the acceptor shard (optional consistency).
+        let _ = acc_b.merge_shard_ranges(vec![acc_updated.clone()]);
+        root.merge_shard_ranges(vec![donor_updated, acc_updated])?;
+        finished += 1;
+    }
+    Ok(finished)
+}
+
+/// Back-compat name used by older call sites / tests.
 pub fn process_shrinking_donors_stub(
     broker: &mut ContainerBroker,
 ) -> Result<usize, DbError> {
@@ -1158,10 +1303,18 @@ pub fn run_once_with_opts_replicator_and_ring(
                 }
             }
             DbState::Sharded => {
-                // Compact residual: detect CLI-marked SHRINKING donors.
-                match process_shrinking_donors_stub(&mut broker) {
+                // Compact: move objects from SHRINKING donors into acceptors
+                // and mark donors SHRUNK on this root replica.
+                match process_shrinking_donors(
+                    &mut broker,
+                    device,
+                    hash_config,
+                    &part,
+                    ring,
+                ) {
                     Ok(n) if n > 0 => {
                         stats.shrinking_donors += n as u64;
+                        stats.finished += n as u64;
                     }
                     Ok(_) => stats.skipped += 1,
                     Err(_) => stats.failures += 1,
@@ -2151,10 +2304,24 @@ mod tests {
     }
 
     #[test]
-    fn test_find_shrinking_donors_and_run_once_stub() {
+    fn test_range_covers_and_find_acceptor() {
+        let mut donor = ShardRange::new("d", "1", "", "m");
+        donor.state = shard_state::SHRINKING;
+        let mut acc = ShardRange::new("a", "1", "", "");
+        acc.state = shard_state::ACTIVE;
+        assert!(range_covers(&acc, &donor));
+        let ranges = vec![donor.clone(), acc.clone()];
+        assert_eq!(
+            find_shrink_acceptor(&ranges, &donor).map(|r| r.name.as_str()),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn test_process_shrinking_donors_moves_objects_and_marks_shrunk() {
         let hash_config = HashPathConfig::new("", "changeme").unwrap();
         let dir = std::env::temp_dir().join(format!(
-            "swift-sharder-shrink-{}",
+            "swift-sharder-shrink-move-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2175,26 +2342,68 @@ mod tests {
         let epoch = "1751500010.00000";
         let mut donor = ShardRange::new(".shards_AUTH_test/c-d0", epoch, "", "m");
         donor.state = shard_state::SHRINKING;
-        let mut acceptor = ShardRange::new(".shards_AUTH_test/c-a0", epoch, "m", "");
+        donor.object_count = 1;
+        // Acceptor covers full namespace (compact expand).
+        let mut acceptor = ShardRange::new(".shards_AUTH_test/c-a0", epoch, "", "");
         acceptor.state = shard_state::ACTIVE;
         source
-            .merge_shard_ranges(vec![donor.clone(), acceptor])
+            .merge_shard_ranges(vec![donor.clone(), acceptor.clone()])
             .unwrap();
-        // SHARDING → SHARDED so run_once hits the compact stub arm.
-        source.enable_sharding(epoch).unwrap();
-        assert!(source.set_sharding_state().unwrap());
-        assert!(source.set_sharded_state().unwrap());
-        assert_eq!(source.get_db_state().unwrap(), DbState::Sharded);
+        // Seed one object into the donor shard DB under part "0".
+        let mut donor_b = local_shard_broker(&device, &hash_config, "0", &donor.name);
+        donor_b
+            .merge_items(vec![swift_db::ObjectRecord {
+                name: "aaa".into(),
+                created_at: "1751500011.00000".into(),
+                size: 3,
+                content_type: "text/plain".into(),
+                etag: "d41d8cd98f00b204e9800998ecf8427e".into(),
+                deleted: 0,
+                storage_policy_index: 0,
+                ctype_timestamp: None,
+                meta_timestamp: None,
+            }])
+            .unwrap();
+        assert_eq!(
+            donor_b.object_records_in_range("", "m").unwrap().len(),
+            1
+        );
 
         let donors = find_shrinking_donors(&mut source).unwrap();
-        assert_eq!(donors.len(), 1);
-        assert_eq!(donors[0].name, donor.name);
-        assert_eq!(process_shrinking_donors_stub(&mut source).unwrap(), 1);
-        drop(source);
+        assert_eq!(donors.len(), 1, "expected one SHRINKING donor, got {donors:?}");
+        let all = source
+            .get_shard_ranges(&GetShardRangesArgs {
+                include_own: false,
+                include_deleted: false,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            find_shrink_acceptor(&all, &donors[0]).is_some(),
+            "no acceptor covering donor among {all:?}"
+        );
+        let n = process_shrinking_donors(&mut source, &device, &hash_config, "0", None)
+            .unwrap();
+        assert_eq!(n, 1, "process_shrinking_donors returned {n}");
 
-        let stats = run_once(&device, &hash_config, 2);
-        assert_eq!(stats.shrinking_donors, 1, "{stats:?}");
-        assert_eq!(stats.failures, 0, "{stats:?}");
+        let after = source
+            .get_shard_ranges(&GetShardRangesArgs {
+                include_deleted: true,
+                include_own: false,
+                ..Default::default()
+            })
+            .unwrap();
+        let d = after.iter().find(|r| r.name == donor.name).unwrap();
+        assert_eq!(d.state, shard_state::SHRUNK, "{d:?}");
+        assert_eq!(d.deleted, 1);
+        assert_eq!(d.object_count, 0);
+
+        let mut acc_b = local_shard_broker(&device, &hash_config, "0", &acceptor.name);
+        let moved = acc_b.object_records_in_range("", "").unwrap();
+        assert!(
+            moved.iter().any(|r| r.name == "aaa" && r.deleted == 0),
+            "{moved:?}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

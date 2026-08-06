@@ -1,0 +1,5 @@
+HEAD Object-Count: 60  Bytes: 411
+list_json_len=80
+get_k4b01=200/4096
+get_obj00001=200
+unit: process_shrinking_donors PASS
