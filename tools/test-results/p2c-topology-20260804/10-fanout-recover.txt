@@ -1,0 +1,12 @@
+fanout 10.0.0.1
+active
+LISTEN 0      128          0.0.0.0:6200       0.0.0.0:*    users:(("swift-object-se",pid=302713,fd=5))              
+fanout 10.0.0.2
+active
+LISTEN 1      128          0.0.0.0:6200       0.0.0.0:*    users:(("swift-object-se",pid=744818,fd=5))                                      
+fanout 10.0.0.3
+active
+LISTEN 0      128          0.0.0.0:6200       0.0.0.0:*    users:(("swift-object-se",pid=3927704,fd=5))            
+fanout 10.0.0.4
+active
+LISTEN 0      128          0.0.0.0:6200       0.0.0.0:*    users:(("swift-object-se",pid=2462997,fd=5))            

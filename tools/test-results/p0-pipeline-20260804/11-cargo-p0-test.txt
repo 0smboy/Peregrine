@@ -1,0 +1,17 @@
+warning: failed to auto-clean cache data
+
+failed to clean entries from the global cache
+
+Caused by:
+  failed to remove file `/Users/oboy/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-macro-0.3.31/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
+     Running unittests src/main.rs (target/debug/deps/swift_proxy_server-336bbc08ebb4e3b4)
+
+running 1 test
+test startup_policy_tests::pipeline_p0_filters_wire_and_l2_still_skips ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.01s
+

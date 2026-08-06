@@ -1,0 +1,68 @@
+=== 169.58.108.85 ===
+activating
+Aug 04 15:12:25 swift1 systemd[1]: swift-object.service: Failed with result 'exit-code'.
+Aug 04 15:12:27 swift1 systemd[1]: swift-object.service: Scheduled restart job, restart counter is at 33.
+Aug 04 15:12:27 swift1 systemd[1]: Stopped Swift object server (rust).
+Aug 04 15:12:28 swift1 systemd[1]: Started Swift object server (rust).
+Aug 04 15:12:28 swift1 systemd[291707]: swift-object.service: Failed to execute /usr/local/bin/swift-object-server: Exec format error
+Aug 04 15:12:28 swift1 systemd[291707]: swift-object.service: Failed at step EXEC spawning /usr/local/bin/swift-object-server: Exec format error
+Aug 04 15:12:28 swift1 systemd[1]: swift-object.service: Main process exited, code=exited, status=203/EXEC
+Aug 04 15:12:28 swift1 systemd[1]: swift-object.service: Failed with result 'exit-code'.
+Aug 04 15:12:30 swift1 systemd[1]: swift-object.service: Scheduled restart job, restart counter is at 34.
+Aug 04 15:12:30 swift1 systemd[1]: Stopped Swift object server (rust).
+Aug 04 15:12:30 swift1 systemd[1]: Started Swift object server (rust).
+Aug 04 15:12:30 swift1 systemd[292072]: swift-object.service: Failed to execute /usr/local/bin/swift-object-server: Exec format error
+Aug 04 15:12:30 swift1 systemd[292072]: swift-object.service: Failed at step EXEC spawning /usr/local/bin/swift-object-server: Exec format error
+Aug 04 15:12:30 swift1 systemd[1]: swift-object.service: Main process exited, code=exited, status=203/EXEC
+Aug 04 15:12:30 swift1 systemd[1]: swift-object.service: Failed with result 'exit-code'.
+=== 169.58.108.86 ===
+activating
+Aug 04 15:12:30 swift2 systemd[1]: swift-object.service: Failed with result 'exit-code'.
+Aug 04 15:12:32 swift2 systemd[1]: swift-object.service: Scheduled restart job, restart counter is at 23.
+Aug 04 15:12:32 swift2 systemd[1]: Stopped Swift object server (rust).
+Aug 04 15:12:32 swift2 systemd[1]: Started Swift object server (rust).
+Aug 04 15:12:32 swift2 systemd[743874]: swift-object.service: Failed to execute /usr/local/bin/swift-object-server: Exec format error
+Aug 04 15:12:32 swift2 systemd[743874]: swift-object.service: Failed at step EXEC spawning /usr/local/bin/swift-object-server: Exec format error
+Aug 04 15:12:32 swift2 systemd[1]: swift-object.service: Main process exited, code=exited, status=203/EXEC
+Aug 04 15:12:32 swift2 systemd[1]: swift-object.service: Failed with result 'exit-code'.
+Aug 04 15:12:34 swift2 systemd[1]: swift-object.service: Scheduled restart job, restart counter is at 24.
+Aug 04 15:12:34 swift2 systemd[1]: Stopped Swift object server (rust).
+Aug 04 15:12:34 swift2 systemd[1]: Started Swift object server (rust).
+Aug 04 15:12:34 swift2 systemd[743895]: swift-object.service: Failed to execute /usr/local/bin/swift-object-server: Exec format error
+Aug 04 15:12:34 swift2 systemd[743895]: swift-object.service: Failed at step EXEC spawning /usr/local/bin/swift-object-server: Exec format error
+Aug 04 15:12:34 swift2 systemd[1]: swift-object.service: Main process exited, code=exited, status=203/EXEC
+Aug 04 15:12:34 swift2 systemd[1]: swift-object.service: Failed with result 'exit-code'.
+=== 169.58.108.87 ===
+activating
+Aug 04 15:12:36 swift3 systemd[1]: swift-object.service: Failed with result 'exit-code'.
+Aug 04 15:12:38 swift3 systemd[1]: swift-object.service: Scheduled restart job, restart counter is at 19.
+Aug 04 15:12:38 swift3 systemd[1]: Stopped Swift object server (rust).
+Aug 04 15:12:38 swift3 systemd[1]: Started Swift object server (rust).
+Aug 04 15:12:38 swift3 systemd[3926719]: swift-object.service: Failed to execute /usr/local/bin/swift-object-server: Exec format error
+Aug 04 15:12:38 swift3 systemd[3926719]: swift-object.service: Failed at step EXEC spawning /usr/local/bin/swift-object-server: Exec format error
+Aug 04 15:12:38 swift3 systemd[1]: swift-object.service: Main process exited, code=exited, status=203/EXEC
+Aug 04 15:12:38 swift3 systemd[1]: swift-object.service: Failed with result 'exit-code'.
+Aug 04 15:12:40 swift3 systemd[1]: swift-object.service: Scheduled restart job, restart counter is at 20.
+Aug 04 15:12:40 swift3 systemd[1]: Stopped Swift object server (rust).
+Aug 04 15:12:40 swift3 systemd[1]: Started Swift object server (rust).
+Aug 04 15:12:40 swift3 systemd[3926746]: swift-object.service: Failed to execute /usr/local/bin/swift-object-server: Exec format error
+Aug 04 15:12:40 swift3 systemd[3926746]: swift-object.service: Failed at step EXEC spawning /usr/local/bin/swift-object-server: Exec format error
+Aug 04 15:12:40 swift3 systemd[1]: swift-object.service: Main process exited, code=exited, status=203/EXEC
+Aug 04 15:12:40 swift3 systemd[1]: swift-object.service: Failed with result 'exit-code'.
+=== 169.58.108.121 ===
+activating
+Aug 04 15:12:44 swift4 systemd[1]: swift-object.service: Failed with result 'exit-code'.
+Aug 04 15:12:46 swift4 systemd[1]: swift-object.service: Scheduled restart job, restart counter is at 14.
+Aug 04 15:12:46 swift4 systemd[1]: Stopped Swift object server (rust).
+Aug 04 15:12:46 swift4 systemd[1]: Started Swift object server (rust).
+Aug 04 15:12:46 swift4 systemd[2454127]: swift-object.service: Failed to execute /usr/local/bin/swift-object-server: Exec format error
+Aug 04 15:12:46 swift4 systemd[2454127]: swift-object.service: Failed at step EXEC spawning /usr/local/bin/swift-object-server: Exec format error
+Aug 04 15:12:46 swift4 systemd[1]: swift-object.service: Main process exited, code=exited, status=203/EXEC
+Aug 04 15:12:46 swift4 systemd[1]: swift-object.service: Failed with result 'exit-code'.
+Aug 04 15:12:48 swift4 systemd[1]: swift-object.service: Scheduled restart job, restart counter is at 15.
+Aug 04 15:12:48 swift4 systemd[1]: Stopped Swift object server (rust).
+Aug 04 15:12:48 swift4 systemd[1]: Started Swift object server (rust).
+Aug 04 15:12:48 swift4 systemd[2454410]: swift-object.service: Failed to execute /usr/local/bin/swift-object-server: Exec format error
+Aug 04 15:12:48 swift4 systemd[2454410]: swift-object.service: Failed at step EXEC spawning /usr/local/bin/swift-object-server: Exec format error
+Aug 04 15:12:48 swift4 systemd[1]: swift-object.service: Main process exited, code=exited, status=203/EXEC
+Aug 04 15:12:48 swift4 systemd[1]: swift-object.service: Failed with result 'exit-code'.

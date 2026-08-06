@@ -1,0 +1,17 @@
+[filter:s3api]
+use = egg:swift#s3api
+location = RegionOne
+
+
+[filter:s3token]
+use = egg:swift#s3token
+auth_uri = http://127.0.0.1:5001
+reseller_prefix = AUTH_
+---
+access 1371713510fb45e9 project 29af7f1e19774999
+ListBuckets region=us-east-1 HTTP 200 body=b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Owner><ID>1371713510fb45e98ab1e26b694d55d3</ID><'
+CreateBucket HTTP 200 body=b''
+PutObject HTTP 200 etag="6d56fe7f2743f77b2fd657151142df5a" body=b''
+GetObject HTTP 200 body=b'ec2-sigv4-put-get-ok'
+cleanup delobj=204 delbucket=204
+VERDICT GREEN region=us-east-1

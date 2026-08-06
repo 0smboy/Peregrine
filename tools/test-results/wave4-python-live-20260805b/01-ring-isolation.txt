@@ -1,0 +1,5 @@
+object_ring_devices ['d1', 'd2', 'd3']
+object_ring_ips ['10.0.4.1', '10.0.4.2', '10.0.4.3', '10.0.4.4']
+device_count_blobs 12
+RUST_USES_D1 True
+ISOLATION_OK False

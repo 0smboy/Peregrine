@@ -1,0 +1,12 @@
+ks=200
+vip=200
+b1=200 b2=200 b3=200 b4=200 
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+[filter:s3token]
+use = egg:swift#s3token
+auth_uri = http://127.0.0.1:5001
+reseller_prefix = AUTH_
+[filter:s3api]
+use = egg:swift#s3api
+location = RegionOne
+

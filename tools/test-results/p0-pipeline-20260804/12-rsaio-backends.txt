@@ -1,0 +1,19 @@
+-rwxr-xr-x. 1 root root 3407656 Aug  4 05:36 /usr/local/bin/swift-account-server
+-rwxr-xr-x. 1 root root 3593048 Aug  4 05:36 /usr/local/bin/swift-container-server
+-rwxr-xr-x. 1 root root 1802064 Aug  4 05:36 /usr/local/bin/swift-object-server
+-rwxr-xr-x. 1 root root 2346896 Aug  4 13:20 /usr/local/bin/swift-proxy-server
+LISTEN 0      128        127.0.0.1:6320       0.0.0.0:*    users:(("swift-object-se",pid=3366635,fd=4))            
+LISTEN 0      128        127.0.0.1:6321       0.0.0.0:*    users:(("swift-container",pid=3366634,fd=4))            
+LISTEN 0      128        127.0.0.1:6322       0.0.0.0:*    users:(("swift-account-s",pid=3366633,fd=4))            
+LISTEN 0      128         10.0.0.3:8081       0.0.0.0:*    users:(("swift-proxy-ser",pid=3367122,fd=4))            
+rsaio_health=200
+HTTP/1.1 200 OK
+X-Auth-Token: AUTH_tkv1.313738353933363134311e746573741e746573743a7465737465721e415554485f74657374.09f22c872d21786c1930059db0ced6179d371354e0c45874e8608a5b158f64fe
+X-Storage-Token: AUTH_tkv1.313738353933363134311e746573741e746573743a7465737465721e415554485f74657374.09f22c872d21786c1930059db0ced6179d371354e0c45874e8608a5b158f64fe
+X-Storage-Url: http://10.0.0.3:8081/v1/AUTH_test
+Content-Type: text/plain
+Content-Length: 0
+X-Trans-Id: txe1f26deb10cc797200001-006a71e78d
+X-Openstack-Request-Id: txe1f26deb10cc797200001-006a71e78d
+Connection: keep-alive
+

@@ -10,7 +10,12 @@ authors.workspace = true
 swift-core = { path = "../swift-core" }
 swift-db = { path = "../swift-db" }
 swift-http = { path = "../swift-http" }
+swift-ring = { path = "../swift-ring" }
 serde_json = "1"
+
+[[bin]]
+name = "swift-account-reaper"
+path = "src/bin/account_reaper.rs"
 
 [dev-dependencies]
 serde_json = "1"

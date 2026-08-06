@@ -1,0 +1,3 @@
+swift1
+/root/.cargo/bin/cargo
+/tmp/p1b-swift-rust/crates/swift-proxy-server/src/main.rs

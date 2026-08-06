@@ -1,0 +1,12 @@
+===rsaio===
+[filter:tempauth]
+===pyswift===
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth copy slo dlo versioned_writes symlink proxy-server
+[filter:tempauth]
+use = egg:swift#tempauth
+use = egg:swift#memcache
+memcache_servers = 127.0.0.1:11211
+[filter:proxy-logging]
+[filter:listing_formats]
+use = egg:swift#listing_formats
+-rwxr-xr-x. 1 root root 2214440 Aug  4 05:36 /usr/local/bin/swift-proxy-server

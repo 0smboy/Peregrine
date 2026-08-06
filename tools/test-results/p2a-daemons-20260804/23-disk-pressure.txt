@@ -1,0 +1,13 @@
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda4        40G   20G   21G  49% /
+/dev/sda4        40G   20G   21G  49% /
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda4        40G   20G   21G  49% /
+active
+active
+active
+active
+Aug 04 14:56:40 swift1 object-expirer[178663]: INFO object-expirer pass: expired=1 errors=0 retained=14
+Aug 04 14:57:38 swift1 object-expirer[181051]: INFO object-expirer pass: expired=1 errors=0 retained=15
+Aug 04 15:01:01 swift1 object-expirer[204186]: INFO object-expirer pass: expired=2 errors=0 retained=17
+Aug 04 15:02:28 swift1 object-expirer[214292]: INFO object-expirer pass: expired=2 errors=0 retained=20

@@ -1,0 +1,25 @@
+swift2
+active,active,active,active
+0.0.0.0:6100
+0.0.0.0:6101
+0.0.0.0:6102
+10.0.0.2:8090
+Ring file /etc/pyswift/object.ring.gz is up-to-date
+Devices:   id region zone ip address:port replication ip:port  name weight partitions balance flags meta
+            0      1    1   10.0.4.2:6100       10.0.4.2:6100    py 100.00        512    0.00       
+            1      1    2   10.0.4.3:6100       10.0.4.3:6100    py 100.00        512    0.00       
+            2      1    3   10.0.4.4:6100       10.0.4.4:6100    py 100.00        512    0.00       
+swift3
+active,active,active,active
+0.0.0.0:6100
+0.0.0.0:6101
+0.0.0.0:6102
+10.0.0.3:8090
+Ring Builder file is invalid: /etc/pyswift/object.builder
+swift4
+active,active,active,active
+0.0.0.0:6100
+0.0.0.0:6101
+0.0.0.0:6102
+10.0.0.4:8090
+Ring Builder file is invalid: /etc/pyswift/object.builder

@@ -1,0 +1,85 @@
+==== build start 2026-08-04T14:27:38Z ====
+   Compiling bitflags v2.13.0
+   Compiling rusqlite v0.32.1
+   Compiling swift-db v0.1.0 (/tmp/p1c-swift-rust/crates/swift-db)
+   Compiling swift-account-server v0.1.0 (/tmp/p1c-swift-rust/crates/swift-account-server)
+   Compiling swift-container-server v0.1.0 (/tmp/p1c-swift-rust/crates/swift-container-server)
+
+running 3 tests
+test remove_header_tests::remove_user_meta ... ok
+test remove_header_tests::remove_container_read_clears_acl ... ok
+test remove_header_tests::empty_remove_trigger_ignored ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.71s
+     Running unittests src/lib.rs (target/debug/deps/swift_container_server-65a4e66818d750be)
+1218 |         let mut req = Request {
+     |             ----^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib test) generated 1 warning (run `cargo fix --lib -p swift-middleware --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.58s
+     Running unittests src/lib.rs (target/debug/deps/swift_middleware-a7268e230ca44006)
+
+running 15 tests
+test slo::tests::test_manifest_etag ... ok
+test copy::tests::test_manifest_get_copy_slo_rewrites_to_put ... ok
+test slo::tests::test_multipart_manifest_get_format_raw ... ok
+test slo::tests::test_normalize_etag ... ok
+test slo::tests::test_slo_etag_data_segment ... ok
+test slo::tests::test_slo_etag_ranged_segment ... ok
+test slo::tests::test_slo_etag_whole_segments ... ok
+test slo::tests::test_dlo_etag ... ok
+test slo::tests::test_slo_head_uses_sysmeta_not_manifest_length ... ok
+test slo::tests::test_slo_get_is_lazy_and_aborts_midstream ... ok
+test slo::tests::test_slo_non_manifest_passthrough ... ok
+test slo::tests::test_slo_full_get_reassembles ... ok
+test slo::tests::test_slo_nested_sub_slo_get ... ok
+test slo::tests::test_slo_range_get ... ok
+test slo::tests::test_slo_range_uses_per_segment_range ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 325 filtered out; finished in 0.00s
+
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling swift-middleware v0.1.0 (/tmp/p1c-swift-rust/crates/swift-middleware)
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling swift-proxy-server v0.1.0 (/tmp/p1c-swift-rust/crates/swift-proxy-server)
+warning: `swift-middleware` (lib) generated 1 warning (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 12.61s
+   Compiling zerocopy v0.8.54
+   Compiling ahash v0.8.12
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.9
+   Compiling once_cell v1.21.4
+   Compiling pkg-config v0.3.33
+   Compiling cc v1.2.67
+   Compiling vcpkg v0.2.15
+   Compiling bitflags v2.13.0
+   Compiling fallible-iterator v0.3.0
+   Compiling smallvec v1.15.2
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling libsqlite3-sys v0.30.1
+   Compiling hashbrown v0.14.5
+   Compiling hashlink v0.9.1
+   Compiling rusqlite v0.32.1
+   Compiling swift-db v0.1.0 (/tmp/p1c-swift-rust/crates/swift-db)
+   Compiling swift-container-server v0.1.0 (/tmp/p1c-swift-rust/crates/swift-container-server)
+    Finished `release` profile [optimized] target(s) in 1m 13s
+ed1e66aa9bf2c68fb767a61864fe54e3  target/release/swift-proxy-server
+d563d9a84b8aa7f44a3d3ff72c9c3421  target/release/swift-container-server
+-rwxr-xr-x. 2 root root 3591824 Aug  4 14:29 target/release/swift-container-server
+-rwxr-xr-x. 2 root root 3139152 Aug  4 14:27 target/release/swift-proxy-server
+==== build end 2026-08-04T14:29:12Z ====

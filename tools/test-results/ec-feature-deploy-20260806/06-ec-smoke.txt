@@ -1,0 +1,33 @@
+STOR=https://10.0.0.10:8085/v1/AUTH_test
+REPL_PUT_CONT=201
+REPL_PUT_OBJ=201
+REPL_GET=200
+REPL_BODY=repl-payload-1488381
+REPL_DEL_OBJ=204
+REPL_DEL_CONT=204
+EC_PUT_CONT=201
+--- cont headers ---
+HTTP/2 201 
+content-type: text/html; charset=UTF-8
+x-trans-id: tx0b5a38980d3c57570001b-006a740b80
+x-openstack-request-id: tx0b5a38980d3c57570001b-006a740b80
+content-length: 0
+
+EC_PUT_OBJ=201
+--- obj headers ---
+HTTP/2 201 
+etag: 6278a85f097cd50bdd05b82231ce62b8
+content-type: application/octet-stream
+x-timestamp: 1785990022.51107
+content-length: 0
+last-modified: Thu, 06 Aug 2026 04:20:23 GMT
+x-trans-id: tx8ec15cea5d800b4300024-006a740b81
+x-openstack-request-id: tx8ec15cea5d800b4300024-006a740b81
+
+--- obj body ---
+
+EC_GET=200
+EC_SIZE_PUT 131072 GET 131072 MATCH True
+MD5_PUT 6278a85f097cd50bdd05b82231ce62b8
+MD5_GET 6278a85f097cd50bdd05b82231ce62b8
+EC_SMOKE_DONE

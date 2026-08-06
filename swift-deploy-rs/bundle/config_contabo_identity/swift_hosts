@@ -1,0 +1,65 @@
+# Contabo Identity inventory — python bundle Galera×3 + Keystone
+# inventory_hostname = management IP (SSH). Planes in host_vars.
+# DO NOT point format_disk_servers at Contabo (mkfs forbidden).
+
+# SSH key: omit ansible_ssh_private_key_file so ssh picks the controller default
+# (Mac often ~/.ssh/id_rsa; Contabo nodes use ~/.ssh/id_ed25519).
+169.58.108.85 ansible_user=root ansible_port=22
+169.58.108.86 ansible_user=root ansible_port=22
+169.58.108.87 ansible_user=root ansible_port=22
+169.58.108.121 ansible_user=root ansible_port=22
+
+[ntp_server]
+169.58.108.85
+
+[ntp_clients]
+169.58.108.86
+169.58.108.87
+169.58.108.121
+
+# Identity-only apply: leave Swift groups empty so python bundle does not
+# touch Contabo Rust data-plane rings/services.
+[proxy_servers]
+
+[account_servers]
+
+[container_servers]
+
+[object_servers]
+
+[swift_nodes:children]
+proxy_servers
+account_servers
+container_servers
+object_servers
+
+[storage_nodes:children]
+account_servers
+container_servers
+object_servers
+
+# Galera odd quorum on swift1–3 (NOT swift4)
+[mariadb_servers]
+169.58.108.85
+169.58.108.86
+169.58.108.87
+
+[keystones]
+169.58.108.85
+169.58.108.86
+169.58.108.87
+
+# Empty on purpose: Contabo Swift VIP HAProxy is owned by bundle-rust.
+# Identity frontends are added via rust haproxy identity overlay, not
+# by running the python haproxy_servers role against Contabo.
+[haproxy_servers]
+
+[keepalived_servers]
+
+[format_disk_servers]
+
+[performance_tuning]
+
+[proxyfs]
+
+[add_new_disk_servers]

@@ -1,0 +1,12 @@
+swift1 8080=200
+inactive
+29874 /usr/local/bin/swift-proxy-server /etc/swift/proxy-server.conf
+swift2 8080=200
+inactive
+3988599 /usr/local/bin/swift-proxy-server /etc/swift/proxy-server.conf
+swift3 8080=200
+inactive
+74468 /usr/local/bin/swift-proxy-server /etc/swift/proxy-server.conf
+swift4 8080=200
+inactive
+1327473 /usr/local/bin/swift-proxy-server /etc/swift/proxy-server.conf

@@ -1,0 +1,114 @@
+---
+# VRRP VIP in front of the rust haproxy pair (only reached when the play's
+# role-level `when: use_lb` holds). Keepalived mode implies use_lb in the
+# workspace, so the health check always tracks haproxy.
+
+- name: probe for keepalived
+  shell: command -v keepalived >/dev/null 2>&1 && echo PRESENT || echo ABSENT
+  register: rust_keepalived_probe
+  changed_when: false
+
+- name: install keepalived
+  package:
+    name: keepalived
+    state: present
+  when: rust_keepalived_probe.stdout.find('PRESENT') == -1
+
+- name: persist net.ipv4.ip_nonlocal_bind
+  copy:
+    src: 99-rust-keepalived-sysctl.conf
+    dest: /etc/sysctl.d/99-rust-keepalived.conf
+    mode: "0644"
+  register: rust_keepalived_sysctl
+
+- name: apply ip_nonlocal_bind
+  shell: |
+    sysctl -p /etc/sysctl.d/99-rust-keepalived.conf >/dev/null
+    CURRENT=$(sysctl -n net.ipv4.ip_nonlocal_bind 2>/dev/null || echo 0)
+    if [ "$CURRENT" = "1" ]; then
+      echo APPLIED
+    else
+      echo FAILED
+      exit 1
+    fi
+  when: rust_keepalived_sysctl.changed
+  changed_when: true
+
+- name: ensure ip_nonlocal_bind is live
+  shell: |
+    CURRENT=$(sysctl -n net.ipv4.ip_nonlocal_bind 2>/dev/null || echo 0)
+    if [ "$CURRENT" = "1" ]; then
+      echo OK
+    else
+      sysctl -w net.ipv4.ip_nonlocal_bind=1 >/dev/null
+      echo TOGGLED
+    fi
+  register: rust_keepalived_nonlocal
+  changed_when: rust_keepalived_nonlocal.stdout.find('TOGGLED') != -1
+  when: not rust_keepalived_sysctl.changed
+
+- name: ensure keepalived config directory
+  file:
+    path: /etc/keepalived
+    state: directory
+    mode: "0755"
+  changed_when: false
+
+- name: render keepalived.conf
+  template:
+    src: keepalived.conf.j2
+    dest: /etc/keepalived/keepalived.conf
+    mode: "0644"
+  register: rust_keepalived_cfg
+
+- name: install check_haproxy.sh
+  copy:
+    src: check_haproxy.sh
+    dest: /etc/keepalived/check_haproxy.sh
+    mode: "0755"
+  register: rust_keepalived_check
+
+- name: set keepalived log facility
+  shell: |
+    CONF=/etc/sysconfig/keepalived
+    LINE='KEEPALIVED_OPTIONS="-D --log-facility=1"'
+    if [ ! -f "$CONF" ]; then
+      printf '%s\n' "$LINE" > "$CONF"
+      echo TOGGLED
+    elif grep -q '^KEEPALIVED_OPTIONS=' "$CONF"; then
+      if grep -qxF "$LINE" "$CONF"; then
+        echo UNCHANGED
+      else
+        sed -i 's|^KEEPALIVED_OPTIONS=.*|'"$LINE"'|' "$CONF"
+        echo TOGGLED
+      fi
+    else
+      printf '\n%s\n' "$LINE" >> "$CONF"
+      echo TOGGLED
+    fi
+  register: rust_keepalived_log
+  changed_when: rust_keepalived_log.stdout.find('TOGGLED') != -1
+
+- name: restart keepalived on configuration change
+  systemd:
+    name: keepalived
+    state: restarted
+  when: rust_keepalived_cfg.changed or rust_keepalived_check.changed or rust_keepalived_log.changed
+
+- name: probe the keepalived unit state
+  shell: |
+    if systemctl is-enabled keepalived >/dev/null 2>&1 && systemctl is-active keepalived >/dev/null 2>&1; then
+      echo RUNNING
+    else
+      echo STOPPED
+    fi
+  register: rust_keepalived_state
+  changed_when: false
+
+- name: enable and start keepalived
+  systemd:
+    name: keepalived
+    daemon_reload: yes
+    enabled: yes
+    state: started
+  when: rust_keepalived_state.stdout.find('RUNNING') == -1

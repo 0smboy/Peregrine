@@ -28,8 +28,11 @@
 //! object metadata unless `X-Fresh-Metadata: true` is set, in which case only
 //! the request's own metadata is used.
 //!
-//! Deferred: SLO/DLO manifest-aware copy (`multipart-manifest=get` raw copy),
-//! `Range` partial copy, and container/account sync-key propagation.
+//! Manifest-aware copy (`?multipart-manifest=get`) fetches the raw SLO/DLO
+//! manifest and re-PUTs it as a manifest (`multipart-manifest=put` for SLO;
+//! `X-Object-Manifest` for DLO). `Range` partial copy is supported via the
+//! source GET. Residual vs. `copy.py` (wontfix P1c): container/account
+//! sync-key propagation.
 
 use swift_http::{split_path, Body, HeaderKeyDict, Request, Response};
 
@@ -58,11 +61,56 @@ fn parse_container_object(value: &str) -> Option<(String, String)> {
 /// Object metadata headers copied from the source when metadata is preserved.
 fn is_copied_source_header(name: &str) -> bool {
     let lname = name.to_ascii_lowercase();
+    // Python excludes x-static-large-object / x-object-manifest from the
+    // generic copy set; those are handled by the multipart-manifest path.
+    if lname == "x-static-large-object" || lname == "x-object-manifest" {
+        return false;
+    }
     lname == "content-type"
         || lname == "content-encoding"
         || lname == "content-disposition"
         || lname.starts_with("x-object-meta-")
         || lname.starts_with("x-object-sysmeta-")
+}
+
+/// True when the client asked for a raw-manifest copy
+/// (`?multipart-manifest=get`).
+fn is_manifest_get(req: &Request) -> bool {
+    req.param("multipart-manifest").as_deref() == Some("get")
+}
+
+/// Rewrite `query_string`, setting or clearing `multipart-manifest`.
+fn set_multipart_manifest_param(query: &str, value: Option<&str>) -> String {
+    let mut parts: Vec<(String, String)> = Vec::new();
+    if !query.is_empty() {
+        for pair in query.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (k, v) = match pair.split_once('=') {
+                Some((k, v)) => (k, v),
+                None => (pair, ""),
+            };
+            if k.eq_ignore_ascii_case("multipart-manifest") {
+                continue;
+            }
+            parts.push((k.to_string(), v.to_string()));
+        }
+    }
+    if let Some(v) = value {
+        parts.push(("multipart-manifest".to_string(), v.to_string()));
+    }
+    parts
+        .into_iter()
+        .map(|(k, v)| {
+            if v.is_empty() {
+                k
+            } else {
+                format!("{k}={v}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 impl Copy {
@@ -91,11 +139,19 @@ impl Copy {
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        let manifest_get = is_manifest_get(&req);
+
         // 1) GET the source object.
         let mut get_req = Request {
             method: "GET".to_string(),
             path: format!("/{version}/{src_account}/{src_container}/{src_object}"),
-            query_string: String::new(),
+            query_string: if manifest_get {
+                // Python: multipart-manifest=get&format=raw so SLO/DLO return
+                // the stored manifest body, not the reassembled object.
+                "multipart-manifest=get&format=raw".to_string()
+            } else {
+                String::new()
+            },
             headers: HeaderKeyDict::new(),
             body: Body::empty(),
         };
@@ -131,6 +187,16 @@ impl Copy {
             return source;
         }
 
+        let source_is_slo = source
+            .headers
+            .get("X-Static-Large-Object")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let source_dlo_manifest = source
+            .headers
+            .get("X-Object-Manifest")
+            .map(str::to_string);
+
         // 2) build the destination PUT: source body, merged headers.
         let mut put_headers = HeaderKeyDict::new();
         if !fresh_metadata {
@@ -152,6 +218,20 @@ impl Copy {
             }
             put_headers.set(k, v);
         }
+
+        // Manifest-aware copy: re-PUT as SLO put or DLO header, matching
+        // Python copy.py handle_PUT multipart-manifest=get branch.
+        if manifest_get {
+            if source_is_slo {
+                req.query_string = set_multipart_manifest_param(&req.query_string, Some("put"));
+            } else if let Some(dlo) = &source_dlo_manifest {
+                req.query_string = set_multipart_manifest_param(&req.query_string, None);
+                put_headers.set("X-Object-Manifest", dlo);
+            } else {
+                req.query_string = set_multipart_manifest_param(&req.query_string, None);
+            }
+        }
+
         // The source body is plumbed straight through to the destination PUT
         // as a stream — an object copy never materializes the object.
         let (source_reader, source_len) = source.body.into_reader();
@@ -380,5 +460,82 @@ mod tests {
         let app: NextFn = Arc::new(|_r: Request| Response::new(204));
         let r = req("PUT", "/v1/AUTH_test/c", &[("X-Copy-From", "/x/y")]);
         assert_eq!(c.handle(r, &app).status, 204);
+    }
+
+    #[test]
+    fn test_manifest_get_copy_slo_rewrites_to_put() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let app: NextFn = Arc::new(move |mut r: Request| {
+            let is_get = r.method == "GET";
+            let qs = r.query_string.clone();
+            r.body.materialize(u64::MAX).unwrap();
+            log2.lock().unwrap().push(r);
+            if is_get {
+                let mut resp = Response::with_body(
+                    200,
+                    br#"[{"path":"/c/s","etag":"e","size_bytes":1}]"#.to_vec(),
+                );
+                resp.headers.set("X-Static-Large-Object", "True");
+                resp.headers.set("Content-Type", "application/json");
+                // Source GET must ask for the raw manifest.
+                assert!(
+                    qs.contains("multipart-manifest=get"),
+                    "source GET qs={qs}"
+                );
+                resp
+            } else {
+                Response::new(201)
+            }
+        });
+        let mut r = req(
+            "PUT",
+            "/v1/AUTH_test/dstc/dsto",
+            &[("X-Copy-From", "/srcc/srco")],
+        );
+        r.query_string = "multipart-manifest=get".to_string();
+        let resp = Copy::new().handle(r, &app);
+        assert_eq!(resp.status, 201);
+        let calls = log.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls[1].query_string.contains("multipart-manifest=put"),
+            "dest PUT qs={}",
+            calls[1].query_string
+        );
+        assert!(calls[1].headers.get("X-Static-Large-Object").is_none());
+    }
+
+    #[test]
+    fn test_manifest_get_copy_dlo_sets_x_object_manifest() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let app: NextFn = Arc::new(move |mut r: Request| {
+            let is_get = r.method == "GET";
+            r.body.materialize(u64::MAX).unwrap();
+            log2.lock().unwrap().push(r);
+            if is_get {
+                let mut resp = Response::with_body(200, Vec::new());
+                resp.headers.set("X-Object-Manifest", "c/segs/");
+                resp.headers.set("Content-Type", "text/plain");
+                resp
+            } else {
+                Response::new(201)
+            }
+        });
+        let mut r = req(
+            "PUT",
+            "/v1/AUTH_test/dstc/dsto",
+            &[("X-Copy-From", "/srcc/srco")],
+        );
+        r.query_string = "multipart-manifest=get".to_string();
+        let resp = Copy::new().handle(r, &app);
+        assert_eq!(resp.status, 201);
+        let calls = log.lock().unwrap();
+        assert!(!calls[1].query_string.contains("multipart-manifest"));
+        assert_eq!(
+            calls[1].headers.get("X-Object-Manifest"),
+            Some("c/segs/")
+        );
     }
 }

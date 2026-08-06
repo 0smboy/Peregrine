@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>P3-auth report — Keystone + authtoken</title>
+<style>
+  :root { --ink:#1a1a1a; --muted:#5a5a5a; --ok:#1b6b3a; --warn:#8a5a00; --bad:#8b1e1e; --bg:#f7f5f1; --card:#fff; }
+  body { font-family: ui-sans-serif, system-ui, sans-serif; margin:0; background:var(--bg); color:var(--ink); line-height:1.45; }
+  main { max-width:920px; margin:0 auto; padding:2rem 1.25rem 3rem; }
+  h1 { font-size:1.55rem; margin:0 0 .35rem; }
+  h2 { font-size:1.1rem; margin:1.75rem 0 .6rem; }
+  .meta { color:var(--muted); font-size:.92rem; }
+  .verdict { display:inline-block; margin:.8rem 0 1.2rem; padding:.35rem .7rem; background:#fff3d6; color:var(--warn); font-weight:600; border-radius:4px; }
+  table { width:100%; border-collapse:collapse; background:var(--card); margin:.5rem 0 1rem; }
+  th, td { text-align:left; padding:.45rem .6rem; border-bottom:1px solid #e6e2da; vertical-align:top; font-size:.93rem; }
+  th { color:var(--muted); font-weight:600; }
+  .pass { color:var(--ok); font-weight:600; }
+  .gap { color:var(--warn); font-weight:600; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.86em; }
+  ul { padding-left:1.2rem; }
+  .path { font-family: ui-monospace, Menlo, monospace; font-size:.85rem; color:var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>P3-auth — Keystone + authtoken</h1>
+  <p class="meta">2026-08-04 · Peregrine production-gap wave · Contabo VIP left on TempAuth</p>
+  <div class="verdict">PARTIAL — code/unit GREEN · Contabo Keystone infra ABSENT</div>
+
+  <h2>1) What this cycle did</h2>
+  <ul>
+    <li>Wired <code>authtoken</code> (pluggable validator: static map + live Keystone v3 HTTP).</li>
+    <li>Wired <code>keystoneauth</code> middleware + proxy authorize dispatch (<code>X-Backend-Auth-Plugin: keystone</code>).</li>
+    <li>Threat negatives: forged identity, bad token, cross-tenant deny, anonymous deny.</li>
+    <li>Probed Contabo: no Keystone; TempAuth VIP CRUD smoke without pipeline change.</li>
+    <li>Updated ROADMAP / CONTRACTS / blocked docs with honest claim level.</li>
+  </ul>
+
+  <h2>2) Optimized / fixed</h2>
+  <ul>
+    <li>Closed “authorize-only library, no wiring” gap for Keystone.</li>
+    <li>Unspoofable <code>X-Backend-Authtoken-Status</code> so client-forged <code>X-Identity-Status</code> cannot elevate.</li>
+    <li><code>/info</code> advertises <code>keystoneauth</code> only when both filters are actually wired.</li>
+  </ul>
+
+  <h2>3) Measured effect</h2>
+  <table>
+    <tr><th>Metric</th><th>Before</th><th>After</th></tr>
+    <tr><td>Proxy pipeline names <code>authtoken</code>/<code>keystoneauth</code></td><td>silent skip</td><td class="pass">wired ON-BY-CONFIG</td></tr>
+    <tr><td>Middleware unit suite</td><td>—</td><td class="pass">351/351</td></tr>
+    <tr><td>Proxy wiring tests</td><td>—</td><td class="pass">13/13 (incl. p3_auth)</td></tr>
+    <tr><td>Contabo Keystone E2E</td><td>n/a</td><td class="gap">ABSENT (no Identity)</td></tr>
+    <tr><td>TempAuth VIP CRUD</td><td>live</td><td class="pass">unchanged 201/201/200</td></tr>
+  </table>
+
+  <h2>4) Gate table</h2>
+  <table>
+    <tr><th>Gate</th><th>Result</th><th>Evidence</th></tr>
+    <tr><td>Unit middleware</td><td class="pass">PASS 351/351</td><td><code>05-cargo-middleware.txt</code></td></tr>
+    <tr><td>Unit proxy bin</td><td class="pass">PASS 13/13</td><td><code>05-cargo-proxy-bin.txt</code></td></tr>
+    <tr><td>Unit proxy lib</td><td class="pass">PASS 13/13</td><td><code>05-cargo-proxy-lib.txt</code></td></tr>
+    <tr><td>Threat negatives</td><td class="pass">PASS</td><td><code>THREAT-NOTE.md</code></td></tr>
+    <tr><td>Contabo Keystone</td><td class="gap">ABSENT</td><td><code>10-contabo-tempauth-smoke.txt</code></td></tr>
+    <tr><td>TempAuth VIP smoke</td><td class="pass">PASS</td><td>same</td></tr>
+    <tr><td>Live /info keystoneauth</td><td class="pass">not advertised</td><td>honest (filter off)</td></tr>
+  </table>
+
+  <h2>5) Remaining / next (FROZEN vs backlog)</h2>
+  <ul>
+    <li><strong>FROZEN on Contabo:</strong> do not flip VIP pipeline to Keystone without external Identity + cutover plan.</li>
+    <li><strong>Backlog:</strong> SAIO or external Keystone E2E → upgrade this wave to GREEN; TLS to Identity (P3-ops); project-domain-id sysmeta persistence.</li>
+    <li>Parallel tracks (S3 / TLS / sharding) untouched by this wave’s claim surface.</li>
+  </ul>
+
+  <p class="path">Evidence: tools/test-results/p3-auth-20260804/</p>
+</main>
+</body>
+</html>

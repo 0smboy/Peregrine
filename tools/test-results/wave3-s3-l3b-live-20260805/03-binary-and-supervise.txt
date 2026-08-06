@@ -1,0 +1,48 @@
+UTC=2026-08-05T10:02:11Z
+-rwxr-xr-x. 1 root root 3488800 Aug  4 15:38 /usr/local/bin/swift-proxy-server
+6a3ddd697daea0ec3f75e3afdf8fbf840c8ba9502708125c275109e8e86e44eb  /usr/local/bin/swift-proxy-server
+=== strings capability ===
+count_s3api=177
+count_s3token=0
+count_ListMultipartUploads=0
+count_list_multipart=0
+count_HttpS3TokenClient=0
+count_filter:s3token=0
+=== ring devices JSON extract ===
+device_blobs 0
+unique_device_names ['d1', 'd2', 'd3']
+=== proxy process parent ===
+    PID    PPID CMD
+ 438908       1 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-proxy-server /etc/pyswift/proxy-server.conf
+swift-proxy-ser(438908)-+-swift-proxy-ser(439059)
+                        `-swift-proxy-ser(439060)
+● swift-proxy-rust.service - /usr/local/bin/swift-proxy-server /etc/swift/proxy-server.conf
+     Loaded: loaded (/run/systemd/transient/swift-proxy-rust.service; transient)
+  Transient: yes
+     Active: active (running) since Wed 2026-08-05 09:57:51 UTC; 4min 21s ago
+   Main PID: 3965157 (swift-proxy-ser)
+      Tasks: 67 (limit: 48623)
+     Memory: 13.7M (peak: 14.2M)
+        CPU: 23.702s
+     CGroup: /system.slice/swift-proxy-rust.service
+             └─3965157 /usr/local/bin/swift-proxy-server /etc/swift/proxy-server.conf
+
+Aug 05 10:02:00 swift2 proxy-server[3965157]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 05 10:02:02 swift2 proxy-server[3965157]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 05 10:02:05 swift2 proxy-server[3965157]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 05 10:02:05 swift2 proxy-server[3965157]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 05 10:02:05 swift2 proxy-server[3965157]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 05 10:02:07 swift2 proxy-server[3965157]: INFO - GET /healthcheck 200 0 0.0004 -
+Aug 05 10:02:10 swift2 proxy-server[3965157]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 05 10:02:10 swift2 proxy-server[3965157]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 05 10:02:10 swift2 proxy-server[3965157]: INFO - GET /healthcheck 200 0 0.0003 -
+Aug 05 10:02:12 swift2 proxy-server[3965157]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 05 10:02:15 swift2 proxy-server[3965157]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 05 10:02:15 swift2 proxy-server[3965157]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 05 10:02:15 swift2 proxy-server[3965157]: INFO - GET /healthcheck 200 0 0.0002 -
+
+/etc/systemd/system/swift-proxy.service
+/usr/lib/systemd/system/gssproxy.service
+/usr/lib/systemd/system/haproxy.service
+SWIFT_DIR=/etc/pyswift
+/root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-proxy-server /etc/pyswift/proxy-server.conf 

@@ -1,0 +1,85 @@
+total 4
+drwxr-x---.  2 keystone keystone   26 Aug  5 09:35 .
+drwxr-xr-x. 12 root     root     4096 Aug  5 09:37 ..
+-rw-rw----.  1 root     keystone    0 Aug  5 09:35 keystone.log
+---
+---uwsgi---
+-- No entries --
+root       38829  1.0  0.0   7276  3628 ?        Ss   10:10   0:00 bash -c ls -la /var/log/keystone/; echo ---; tail -80 /var/log/keystone/keystone.log 2>/dev/null | sed -E "s/(password|secret|token)[=:][^ ,\"]+/\\1***/gi"; echo ---uwsgi---; ls /var/log/uwsgi* 2>/dev/null; journalctl -u "httpd" --no-pager -n 20 2>/dev/null | tail -10; ps aux | grep -i uwsgi | head -5; # find unit systemctl status $(systemctl list-units --all --type=service --no-legend | awk "/keystone|uwsgi/{print \$1}" | head -5) --no-pager 2>/dev/null | head -60 # try credential keys ls -la /etc/keystone/credential-keys/ 2>/dev/null; ls -la /etc/keystone/fernet-keys/ 2>/dev/null # python stack in keystone for s3 /usr/bin/python3 - <<'PY' import traceback try:   from keystone.api import ec2tokens   print("ec2tokens module", ec2tokens) except Exception as e:   print("import ec2tokens", e) try:   from keystone.api import s3tokens   print("s3tokens module", s3tokens) except Exception as e:   print("import s3tokens", e) # simulate from keystone.common import provider_api print("providers ok?") PY dmesg | tail -20 | grep -iE "segfault|uwsgi|killed" || true 
+root       38872  0.0  0.0   6420  2304 ?        S    10:10   0:00 grep -i uwsgi
+root     4153435  0.0  0.1  21148 12672 ?        S    09:42   0:00 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-admin.ini
+root     4153439  0.0  0.1  21148 12644 ?        S    09:42   0:00 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-public.ini
+root     4153459  0.0  0.0  21148  7176 ?        S    09:42   0:00 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-public.ini
+● swift1
+    State: running
+    Units: 361 loaded (incl. loaded aliases)
+     Jobs: 0 queued
+   Failed: 0 units
+    Since: Sat 2026-08-01 11:23:03 UTC; 3 days ago
+  systemd: 252-67.el9_8.4.rocky.0.1
+   CGroup: /
+           ├─init.scope
+           │ └─1 /usr/lib/systemd/systemd --switched-root --system --deserialize 31
+           ├─system.slice
+           │ ├─NetworkManager.service
+           │ │ └─805 /usr/sbin/NetworkManager --no-daemon
+           │ ├─alloy.service
+           │ │ └─3635494 /usr/local/bin/alloy run --server.http.listen-addr=127.0.0.1:12345 --storage.path=/var/lib/alloy --disable-reporting /etc/alloy/config.alloy
+           │ ├─auditd.service
+           │ │ ├─775 /sbin/auditd
+           │ │ └─777 /usr/sbin/sedispatch
+           │ ├─chronyd.service
+           │ │ └─814 /usr/sbin/chronyd -F 2
+           │ ├─crond.service
+           │ │ └─860 /usr/sbin/crond -n
+           │ ├─dbus-broker.service
+           │ │ ├─803 /usr/bin/dbus-broker-launch --scope system --audit
+           │ │ └─804 dbus-broker --log 4 --controller 9 --machine-id 0cf8abde8c3d477c8dafc6ffe2d5d1a6 --max-bytes 536870912 --max-fds 4096 --max-matches 131072 --audit
+           │ ├─firewalld.service
+           │ │ └─398833 /usr/bin/python3 -s /usr/sbin/firewalld --nofork --nopid
+           │ ├─gssproxy.service
+           │ │ └─840 /usr/sbin/gssproxy -D
+           │ ├─haproxy.service
+           │ │ ├─   7063 /usr/sbin/haproxy -Ws -f /etc/haproxy/haproxy.cfg -f /etc/haproxy/conf.d -p /run/haproxy.pid
+           │ │ └─4180537 /usr/sbin/haproxy -sf 4122043 -x sockpair@5 -Ws -f /etc/haproxy/haproxy.cfg -f /etc/haproxy/conf.d -p /run/haproxy.pid
+           │ ├─irqbalance.service
+           │ │ └─808 /usr/sbin/irqbalance
+           │ ├─keepalived.service
+           │ │ ├─7059 /usr/sbin/keepalived --dont-fork -D --log-facility=1
+           │ │ └─7061 /usr/sbin/keepalived --dont-fork -D --log-facility=1
+           │ ├─mariadb.service
+           │ │ └─4114826 /usr/libexec/mariadbd --basedir=/usr --wsrep-new-cluster
+           │ ├─memcached.service
+           │ │ └─70689 /usr/bin/memcached -p 11211 -u memcached -m 256 -c 4096 -l 10.0.0.1:11211,127.0.0.1:11211
+           │ ├─node_exporter.service
+           │ │ └─3868235 /usr/local/bin/node_exporter --web.listen-address=:9100 --collector.textfile.directory=/var/lib/node_exporter/textfile_collector
+           │ ├─polkit.service
+           │ │ └─398877 /usr/lib/polkit-1/polkitd --no-debug
+           │ ├─prometheus.service
+           │ │ └─3868103 /usr/local/bin/prometheus --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/var/lib/prometheus --web.listen-address=127.0.0.1:9090
+           │ ├─rngd.service
+           │ │ └─809 /usr/sbin/rngd -f --fill-watermark=0 -x pkcs11 -x nist -x qrypt -x namedpipe -x jitter -D daemon:daemon
+           │ ├─rpcbind.service
+           │ │ └─774 /usr/bin/rpcbind -w -f
+           │ ├─rsyslog.service
+           │ │ └─871 /usr/sbin/rsyslogd -n
+           │ ├─sshd.service
+           │ │ └─827 "sshd: /usr/sbin/sshd -D [listener] 0 of 10-100 startups"
+           │ ├─sssd-kcm.service
+           │ │ └─4172478 /usr/libexec/sssd/sssd_kcm --uid 0 --gid 0 --logger=files
+           │ ├─statsd_exporter.service
+           │ │ └─34133 /usr/local/bin/statsd_exporter --web.listen-address=:9102 --statsd.listen-udp=:9125 --statsd.listen-tcp=:9125
+           │ ├─supervisord.service
+total 8
+drwx------. 2 keystone keystone  24 Aug  5 09:42 .
+drwxr-x---. 5 root     keystone 172 Aug  5 09:42 ..
+-rw-------. 1 keystone keystone  44 Aug  5 09:42 0
+-rw-------. 1 keystone keystone  44 Aug  5 09:42 1
+total 8
+drwx------. 2 keystone keystone  24 Aug  5 09:42 .
+drwxr-x---. 5 root     keystone 172 Aug  5 09:42 ..
+-rw-------. 1 keystone keystone  44 Aug  5 09:42 0
+-rw-------. 1 keystone keystone  44 Aug  5 09:42 1
+ec2tokens module <module 'keystone.api.ec2tokens' from '/usr/lib/python3.9/site-packages/keystone/api/ec2tokens.py'>
+s3tokens module <module 'keystone.api.s3tokens' from '/usr/lib/python3.9/site-packages/keystone/api/s3tokens.py'>
+providers ok?

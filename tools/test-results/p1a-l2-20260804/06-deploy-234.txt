@@ -1,0 +1,15 @@
+===== swift2 =====
+pipeline not found
+active
+health=200
+['bulk_delete', 'bulk_upload', 'tempauth', 'tempurl']
+===== swift3 =====
+pipeline not found
+active
+health=200
+['bulk_delete', 'bulk_upload', 'tempauth', 'tempurl']
+===== swift4 =====
+pipeline not found
+active
+health=200
+['bulk_delete', 'bulk_upload', 'tempauth', 'tempurl']

@@ -1,0 +1,62 @@
+===================================================================
+FUNCTIONAL SUITE  label=vip-p1b-core  endpoint=http://10.0.0.10:8085  2026-08-04T14:00:50Z
+===================================================================
+  PASS  auth: bad key -> 401
+  PASS  auth: token acquired (test:tester)
+  FAIL  account: HEAD 204  -- want=204 got=502 
+  PASS  account: X-Account-Container-Count present
+  PASS  container: PUT 201
+  PASS  container: idempotent PUT 202
+  PASS  container: HEAD 204
+  PASS  container: POST meta 204
+  PASS  container: meta persisted
+  PASS  container: GET empty 204
+  PASS  object: PUT 201
+  PASS  object: GET body
+  PASS  object: etag matches md5
+  PASS  object: content-type
+  PASS  object: custom meta
+  PASS  object: HEAD 200
+  PASS  object: POST meta 202
+  PASS  object: fast-POST meta updated
+  PASS  object: PUT wrong-etag 422
+  PASS  range: bytes=0-3
+  PASS  range: suffix bytes=-3
+  PASS  range: 206 status
+  PASS  range: unsatisfiable 416
+  PASS  range: multipart/byteranges
+  PASS  range: multipart 2nd part
+  PASS  cond: If-None-Match * -> 304
+  PASS  cond: If-Match wrong -> 412
+  PASS  cond: If-Match right -> 200
+  PASS  large: PUT 4MB 201
+  PASS  large: 4MB md5 round-trip
+  PASS  SLO: manifest PUT 201
+  PASS  SLO: reassembled 3MB md5
+  PASS  SLO: manifest-get is json
+  PASS  DLO: concatenation md5 == SLO segs
+  PASS  copy: X-Copy-From 201
+  PASS  copy: copied body
+  PASS  expiry: PUT with X-Delete-After 201
+  PASS  expiry: X-Delete-At set
+  PASS  name: unicode+space PUT 201
+  PASS  name: unicode GET body
+  PASS  listing: json has bytes
+  PASS  listing: prefix filter
+  PASS  listing: limit=1 returns 1
+  PASS  EC: container create (policy ec-2-1) 201
+  PASS  EC: policy header
+  FAIL  EC: PUT 3MB 201  -- want=201 got=501 
+  FAIL  EC: 5MB md5 round-trip  -- want=db1709afade9213ced1a6610545d65e5 got=e21d349b84e8bc62ea8241a2e5dc1f45 
+  FAIL  EC: ranged GET 206  -- want=206 got=501 
+  FAIL  EC: ranged GET length=1024  -- want=1024 got=53 
+  PASS  sec: no-token account -> 401
+  PASS  sec: bad-token -> 401
+  PASS  sec: GET missing object -> 404
+  PASS  sec: DELETE non-empty container -> 409
+  PASS  sec: traversal name literal 201
+
+-------------------------------------------------------------------
+RESULT  label=vip-p1b-core  PASS=49  FAIL=5
+  failed: account: HEAD 204 EC: PUT 3MB 201 EC: 5MB md5 round-trip EC: ranged GET 206 EC: ranged GET length=1024
+-------------------------------------------------------------------

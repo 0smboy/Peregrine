@@ -1,0 +1,29 @@
+=== tombstones swift1 ===
+total_count	184
+total_bytes	0
+device=d1	policy=0	count=79	bytes=0
+device=d2	policy=0	count=47	bytes=0
+device=d3	policy=0	count=58	bytes=0
+
+=== proxy sha256 x4 ===
+swift1 657e07439cde3520e83dd1bb47bf0f130120e532d39fda53a2925a0d938c2f77  /usr/local/bin/swift-proxy-server
+69a7e5ebdd0193d08a2848d127dd7fceefb0b8c4c410d8dd57294cf864823b3e  /usr/local/bin/swift-object-server
+swift2 657e07439cde3520e83dd1bb47bf0f130120e532d39fda53a2925a0d938c2f77  /usr/local/bin/swift-proxy-server
+69a7e5ebdd0193d08a2848d127dd7fceefb0b8c4c410d8dd57294cf864823b3e  /usr/local/bin/swift-object-server
+swift3 657e07439cde3520e83dd1bb47bf0f130120e532d39fda53a2925a0d938c2f77  /usr/local/bin/swift-proxy-server
+69a7e5ebdd0193d08a2848d127dd7fceefb0b8c4c410d8dd57294cf864823b3e  /usr/local/bin/swift-object-server
+swift4 657e07439cde3520e83dd1bb47bf0f130120e532d39fda53a2925a0d938c2f77  /usr/local/bin/swift-proxy-server
+69a7e5ebdd0193d08a2848d127dd7fceefb0b8c4c410d8dd57294cf864823b3e  /usr/local/bin/swift-object-server
+
+=== EC policy PUT probe (expect fail if no ec feature) ===
+PUT_CONT=201
+PUT_OBJ=501
+--- response headers ---
+HTTP/2 501 
+content-type: text/plain; charset=utf-8
+x-trans-id: tx3519908a844072c60bb13-006a740ac7
+x-openstack-request-id: tx3519908a844072c60bb13-006a740ac7
+content-length: 53
+
+--- body ---
+erasure coding not built (compile with --features ec)

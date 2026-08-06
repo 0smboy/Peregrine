@@ -1,0 +1,4 @@
+W0′ status (referenced, not re-run this cycle):
+  pack: tools/test-results/w0-meta-repair-20260805/
+  verdict: LAB_META_CLEAN
+Gate for W4 consideration: PASS (LAB). Does not unblock PORT-DISK isolation.

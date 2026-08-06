@@ -320,6 +320,25 @@ pub fn payload_hash(req: &Request) -> String {
         .to_string()
 }
 
+/// Build the raw SigV4 string-to-sign for a request (UTF-8), or `None` if
+/// auth material / signed headers / date are incomplete.
+///
+/// Used by `s3api` when deferring an unknown access key to Keystone
+/// `/v3/s3tokens` (Python `s3api.auth_details['string_to_sign']`).
+pub fn string_to_sign_for_request(req: &Request) -> Option<String> {
+    let auth = parse_sigv4_auth(req)?;
+    let date = amz_date(req)?;
+    let hts = headers_to_sign(&req.headers, &auth.signed_headers)?;
+    let cr = canonical_request(
+        &req.method,
+        &canonical_uri(&req.path),
+        &canonical_query(&req.query_string),
+        &hts,
+        &payload_hash(req),
+    );
+    Some(string_to_sign(&date, &auth.scope.scope_string(), &cr))
+}
+
 /// Verify a client-presented AWS Signature V4 against the given credentials.
 ///
 /// `access_key` / `secret_key` are the credentials the caller looked up for

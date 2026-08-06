@@ -1,0 +1,13 @@
+=== VIP holder ===
+VIP on 10.0.0.2
+=== health ===
+vip_health 200
+auth_token_len=149
+=== seed cont=p2a-exp-1785855508 del_at=1785855516 now=1785855508 ===
+PUT_CONT 201
+PUT_OBJ 201
+GET_BEFORE 200
+sleep 15 for delete-at to pass...
+=== force updater+expirer once on all nodes ===
+GET_AFTER_EXPIRE http=404
+EXPIRER_E2E=PASS

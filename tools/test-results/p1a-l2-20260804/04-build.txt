@@ -1,0 +1,54 @@
+test tempurl::tests::test_quote_helpers ... ok
+test tempurl::tests::test_streq_const_time ... ok
+test tempurl::tests::test_second_key_matches ... ok
+test tempurl::tests::test_uppercase_hex_signature_is_invalid ... ok
+test tempurl::tests::test_no_tempurl_params_passthrough ... ok
+test tempurl::tests::test_tampered_signature_is_invalid ... ok
+test tempurl::tests::test_valid_get_sha256 ... ok
+test tempurl::tests::test_valid_get_sha256_base64_urlsafe ... ok
+test tempurl::tests::test_valid_get_sha512_base64 ... ok
+test tempurl::tests::test_valid_prefix ... ok
+test tempurl::tests::test_valid_get_sha512_hex ... ok
+test versioned_writes::tests::test_put_no_current_skips_archive ... ok
+test versioned_writes::tests::test_put_archives_current_version ... ok
+test versioned_writes::tests::test_unversioned_container_passes_through ... ok
+test versioned_writes::tests::test_versions_object_name_format ... ok
+test tempurl::tests::test_valid_put ... ok
+test tempurl::tests::test_valid_get_sha1 ... ok
+
+test result: ok. 326 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+test startup_policy_tests::pipeline_p1a_wires_bulk_and_skips_unwired_l2 ... ok
+test startup_policy_tests::startup_and_reload_share_one_build_path ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/ec_integration.rs (target/debug/deps/ec_integration-a754514e6119ce37)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-ec84fff128d7072e)
+
+running 7 tests
+test test_pipeline_healthcheck_gatekeeper_transid ... ok
+test test_get_unreachable_primaries_and_empty_handoff_is_503 ... ok
+test test_post_mixed_results_falls_back_to_handoff ... ok
+test test_get_stale_handoff_data_loses_to_newer_tombstones ... ok
+test test_proxy_end_to_end_account_and_container ... ok
+test test_proxy_object_round_trip ... ok
+test test_tempauth_end_to_end ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+
+   Doc-tests swift_proxy_server
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Compiling swift-middleware v0.1.0 (/tmp/p0-swift-rust/crates/swift-middleware)
+   Compiling swift-proxy-server v0.1.0 (/tmp/p0-swift-rust/crates/swift-proxy-server)
+    Finished `release` profile [optimized] target(s) in 12.74s
+-rwxr-xr-x. 2 root root 2738792 Aug  4 13:38 target/release/swift-proxy-server

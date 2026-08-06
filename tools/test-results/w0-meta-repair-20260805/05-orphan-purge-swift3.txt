@@ -1,0 +1,6 @@
+mode=APPLY root=/srv/node reclaim_age=600.0
+hash_prefix_len=24 hash_suffix_len=16
+=== B: orphan hash-dir purge ===
+B: referenced_hashes=0
+B: orphan_dirs=162 orphan_files=162 orphan_bytes=16915640 kept_dirs=0
+DONE mode=APPLY A_ts=0 A_bytes=0 B_dirs=162 B_files=162 B_bytes=16915640

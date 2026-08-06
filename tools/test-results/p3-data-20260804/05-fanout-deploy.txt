@@ -1,0 +1,24 @@
+=== deploy 10.0.0.1 ===
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-container-sharder.service → /etc/systemd/system/swift-container-sharder.service.
+active
+active
+active
+P3-data deploy OK on swift1
+=== deploy 10.0.0.2 ===
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-container-sharder.service → /etc/systemd/system/swift-container-sharder.service.
+active
+active
+active
+P3-data deploy OK on swift2
+=== deploy 10.0.0.3 ===
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-container-sharder.service → /etc/systemd/system/swift-container-sharder.service.
+active
+active
+active
+P3-data deploy OK on swift3
+=== deploy 10.0.0.4 ===
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-container-sharder.service → /etc/systemd/system/swift-container-sharder.service.
+active
+active
+active
+P3-data deploy OK on swift4

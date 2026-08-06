@@ -1,0 +1,7 @@
+PARTIAL/BLOCKED (Keystone s3tokens live exchange)
+- s3token filter WIRED on all 4 proxies (auth_uri=http://127.0.0.1:5001 on swift1-3; http://10.0.0.1:5001 on swift4)
+- Keystone POST /v3/s3tokens exists (empty body -> 400 Bad Request)
+- OS-EC2 credential create works (201)
+- Live exchange with valid EC2 access -> uwsgi worker RemoteDisconnected (crash); bogus access -> 404 clean
+- VIP SigV4 with EC2 keys not exercised end-to-end: Rust s3api rejects unknown access keys before s3token (InvalidAccessKeyId) — architectural gap
+NEXT: fix Keystone credential decrypt / s3tokens worker crash (credential-keys + uwsgi stderr); then s3api passthrough-or-dual-auth for EC2 keys

@@ -1,0 +1,112 @@
+==== swift2 proxy ====
+● pyswift-proxy.service - Python Swift proxy server (pyswift dual-stack)
+     Loaded: loaded (/etc/systemd/system/pyswift-proxy.service; enabled; preset: disabled)
+     Active: activating (auto-restart) (Result: exit-code) since Wed 2026-08-05 11:58:47 UTC; 904ms ago
+    Process: 132975 ExecStart=/opt/pyswift-venv/bin/swift-proxy-server /etc/pyswift/proxy-server.conf (code=exited, status=1/FAILURE)
+   Main PID: 132975 (code=exited, status=1/FAILURE)
+        CPU: 1.205s
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:   File "/opt/pyswift-venv/bin/swift-proxy-server", line 6, in <module>
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:     sys.exit(main())
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:   File "/opt/swift-master/swift/proxy/server.py", line 847, in main
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:     sys.exit(run_wsgi(conf_file, 'proxy-server', **options))
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:   File "/opt/swift-master/swift/common/wsgi.py", line 1020, in run_wsgi
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:     conf, logger, global_conf, strategy = check_config(
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:   File "/opt/swift-master/swift/common/wsgi.py", line 992, in check_config
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:     loadapp(conf_path, global_conf=global_conf)
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:   File "/opt/swift-master/swift/common/wsgi.py", line 355, in loadapp
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:     ultimate_app = ctx.app_context.create()
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:   File "/opt/pyswift-venv/lib64/python3.9/site-packages/paste/deploy/loadwsgi.py", line 738, in create
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:     return self.object_type.invoke(self)
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:   File "/opt/pyswift-venv/lib64/python3.9/site-packages/paste/deploy/loadwsgi.py", line 136, in invoke
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:     return fix_call(context.object, context.global_conf, **context.local_conf)
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:   File "/opt/pyswift-venv/lib64/python3.9/site-packages/paste/deploy/util.py", line 61, in fix_call
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:     val = callable(*args, **kw)
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:   File "/opt/swift-master/swift/proxy/server.py", line 840, in app_factory
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:     app = Application(conf)
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:   File "/opt/swift-master/swift/proxy/server.py", line 279, in __init__
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:     policy.load_ring(swift_dir)
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:   File "/opt/swift-master/swift/common/storage_policy.py", line 387, in load_ring
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:     self.object_ring = Ring(
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:   File "/opt/swift-master/swift/common/ring/ring.py", line 335, in __init__
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:     self._reload(force=True)
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:   File "/opt/swift-master/swift/common/ring/ring.py", line 340, in _reload
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:     ring_data = RingData.load(self.serialized_path)
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:   File "/opt/swift-master/swift/common/ring/ring.py", line 203, in load
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:     with RingReader.open(filename) as reader:
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:   File "/usr/lib64/python3.9/contextlib.py", line 119, in __enter__
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:     return next(self.gen)
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:   File "/opt/swift-master/swift/common/ring/io.py", line 106, in open
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]:     with open(filename, 'rb') as fp:
+Aug 05 11:58:47 swift2 swift-proxy-server[132975]: FileNotFoundError: [Errno 2] No such file or directory: '/etc/pyswift/object-1.ring.gz'
+Aug 05 11:58:47 swift2 systemd[1]: pyswift-proxy.service: Main process exited, code=exited, status=1/FAILURE
+Aug 05 11:58:47 swift2 systemd[1]: pyswift-proxy.service: Failed with result 'exit-code'.
+Aug 05 11:58:47 swift2 systemd[1]: pyswift-proxy.service: Consumed 1.205s CPU time.
+Aug 05 11:58:50 swift2 systemd[1]: pyswift-proxy.service: Scheduled restart job, restart counter is at 12.
+Aug 05 11:58:50 swift2 systemd[1]: Stopped Python Swift proxy server (pyswift dual-stack).
+Aug 05 11:58:50 swift2 systemd[1]: pyswift-proxy.service: Consumed 1.205s CPU time.
+Aug 05 11:58:50 swift2 systemd[1]: Started Python Swift proxy server (pyswift dual-stack).
+==== swift4 proxy ====
+● pyswift-proxy.service - Python Swift proxy server (pyswift dual-stack)
+     Loaded: loaded (/etc/systemd/system/pyswift-proxy.service; enabled; preset: disabled)
+     Active: active (running) since Wed 2026-08-05 11:58:52 UTC; 1s ago
+   Main PID: 1579087 (swift-proxy-ser)
+      Tasks: 1 (limit: 48623)
+     Memory: 31.5M (peak: 34.5M)
+        CPU: 1.501s
+     CGroup: /system.slice/pyswift-proxy.service
+             └─1579087 /opt/pyswift-venv/bin/python3 /opt/pyswift-venv/bin/swift-proxy-server /etc/pyswift/proxy-server.conf
+
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:   File "/opt/swift-master/swift/common/ring/ring.py", line 203, in load
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:     with RingReader.open(filename) as reader:
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:   File "/usr/lib64/python3.9/contextlib.py", line 119, in __enter__
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:     return next(self.gen)
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:   File "/opt/swift-master/swift/common/ring/io.py", line 106, in open
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:     with open(filename, 'rb') as fp:
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]: FileNotFoundError: [Errno 2] No such file or directory: '/etc/pyswift/object-1.ring.gz'
+Aug 05 11:58:54 swift4 systemd[1]: pyswift-proxy.service: Main process exited, code=exited, status=1/FAILURE
+Aug 05 11:58:54 swift4 systemd[1]: pyswift-proxy.service: Failed with result 'exit-code'.
+Aug 05 11:58:54 swift4 systemd[1]: pyswift-proxy.service: Consumed 1.569s CPU time, 34.5M memory peak.
+Aug 05 11:58:57 swift4 systemd[1]: pyswift-proxy.service: Scheduled restart job, restart counter is at 10.
+Aug 05 11:58:57 swift4 systemd[1]: Stopped Python Swift proxy server (pyswift dual-stack).
+Aug 05 11:58:57 swift4 systemd[1]: pyswift-proxy.service: Consumed 1.569s CPU time, 34.5M memory peak.
+Aug 05 11:58:57 swift4 systemd[1]: Started Python Swift proxy server (pyswift dual-stack).
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:   File "/opt/pyswift-venv/bin/swift-proxy-server", line 6, in <module>
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:     sys.exit(main())
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:   File "/opt/swift-master/swift/proxy/server.py", line 847, in main
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:     sys.exit(run_wsgi(conf_file, 'proxy-server', **options))
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:   File "/opt/swift-master/swift/common/wsgi.py", line 1020, in run_wsgi
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:     conf, logger, global_conf, strategy = check_config(
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:   File "/opt/swift-master/swift/common/wsgi.py", line 992, in check_config
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:     loadapp(conf_path, global_conf=global_conf)
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:   File "/opt/swift-master/swift/common/wsgi.py", line 355, in loadapp
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:     ultimate_app = ctx.app_context.create()
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:   File "/opt/pyswift-venv/lib64/python3.9/site-packages/paste/deploy/loadwsgi.py", line 738, in create
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:     return self.object_type.invoke(self)
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:   File "/opt/pyswift-venv/lib64/python3.9/site-packages/paste/deploy/loadwsgi.py", line 136, in invoke
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:     return fix_call(context.object, context.global_conf, **context.local_conf)
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:   File "/opt/pyswift-venv/lib64/python3.9/site-packages/paste/deploy/util.py", line 61, in fix_call
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:     val = callable(*args, **kw)
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:   File "/opt/swift-master/swift/proxy/server.py", line 840, in app_factory
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:     app = Application(conf)
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:   File "/opt/swift-master/swift/proxy/server.py", line 279, in __init__
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:     policy.load_ring(swift_dir)
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:   File "/opt/swift-master/swift/common/storage_policy.py", line 387, in load_ring
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:     self.object_ring = Ring(
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:   File "/opt/swift-master/swift/common/ring/ring.py", line 335, in __init__
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:     self._reload(force=True)
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:   File "/opt/swift-master/swift/common/ring/ring.py", line 340, in _reload
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:     ring_data = RingData.load(self.serialized_path)
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:   File "/opt/swift-master/swift/common/ring/ring.py", line 203, in load
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:     with RingReader.open(filename) as reader:
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:   File "/usr/lib64/python3.9/contextlib.py", line 119, in __enter__
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:     return next(self.gen)
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:   File "/opt/swift-master/swift/common/ring/io.py", line 106, in open
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]:     with open(filename, 'rb') as fp:
+Aug 05 11:58:54 swift4 swift-proxy-server[1579087]: FileNotFoundError: [Errno 2] No such file or directory: '/etc/pyswift/object-1.ring.gz'
+Aug 05 11:58:54 swift4 systemd[1]: pyswift-proxy.service: Main process exited, code=exited, status=1/FAILURE
+Aug 05 11:58:54 swift4 systemd[1]: pyswift-proxy.service: Failed with result 'exit-code'.
+Aug 05 11:58:54 swift4 systemd[1]: pyswift-proxy.service: Consumed 1.569s CPU time, 34.5M memory peak.
+Aug 05 11:58:57 swift4 systemd[1]: pyswift-proxy.service: Scheduled restart job, restart counter is at 10.
+Aug 05 11:58:57 swift4 systemd[1]: Stopped Python Swift proxy server (pyswift dual-stack).
+Aug 05 11:58:57 swift4 systemd[1]: pyswift-proxy.service: Consumed 1.569s CPU time, 34.5M memory peak.
+Aug 05 11:58:57 swift4 systemd[1]: Started Python Swift proxy server (pyswift dual-stack).

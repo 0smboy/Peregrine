@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 
 pub mod daemonutil;
 pub mod localdev;
+pub mod servers_per_port;
 pub mod expirer;
 pub mod replicator;
 pub mod ssync;
@@ -40,7 +41,9 @@ pub mod reconstructor;
 pub mod updater;
 pub use expirer::{
     build_task_obj, get_expirer_container, iter_due_tasks, parse_task_obj, process_task,
-    DeleteResult, ExpiryClient, TaskInfo,
+    recon_update as expirer_recon_update, run_once as expirer_run_once, DeleteResult,
+    ExpirerStats, ExpiryClient, HttpExpiryClient, TaskInfo, ASYNC_DELETE_TYPE,
+    EXPIRER_ACCOUNT_NAME, EXPIRER_CONTAINER_DIVISOR,
 };
 pub use updater::{
     iter_async_pendings, process_update, run_once, run_once_with_concurrency, AsyncUpdate,
@@ -1386,32 +1389,107 @@ impl ObjectServer {
         if let Err(resp) = self.check_drive(&drive) {
             return resp;
         }
-        // A supplied X-If-Delete-At must be a valid timestamp (server.py DELETE
-        // rejects an unparseable value with 400 before doing anything else).
-        if let Some(raw) = req.headers.get("X-If-Delete-At") {
-            if raw.parse::<Timestamp>().is_err() {
-                return plain_response(400, "Bad X-If-Delete-At header value");
-            }
-        }
+        // Parse X-If-Delete-At up front (Python server.py DELETE): bad value
+        // → 400; when present we must verify it against the object's
+        // X-Delete-At before writing a tombstone (412 on mismatch).
+        let if_delete_at: Option<Timestamp> = match req.headers.get("X-If-Delete-At") {
+            None => None,
+            Some(raw) => match raw.parse::<Timestamp>() {
+                Ok(t) => Some(t),
+                Err(_) => return plain_response(400, "Bad X-If-Delete-At header value"),
+            },
+        };
         let mut df = match self.diskfile_for(&drive, part, &account, &container, &obj, (policy_index, policy))
         {
             Ok(df) => df,
             Err(e) => return plain_response(500, &e.to_string()),
         };
+        // Expirer deletes already-past X-Delete-At objects; open them.
+        if if_delete_at.is_some() {
+            df = df.with_open_expired(true);
+        }
         // A live object yields 204 (if we win the timestamp race) or 409;
         // a missing or already-deleted object always yields 404 even
         // though a fresh tombstone is still written when we win.
-        let (orig_timestamp, was_live) = match df.open(None) {
-            Ok(df) => (
-                df.data_timestamp().unwrap_or_else(|_| "0".parse().unwrap()),
-                true,
-            ),
-            Err(DiskFileError::Deleted { timestamp, .. }) => (timestamp, false),
+        let (orig_timestamp, was_live, orig_delete_at) = match df.open(None) {
+            Ok(_) => {
+                let ts = df
+                    .data_timestamp()
+                    .unwrap_or_else(|_| "0".parse().unwrap());
+                let delete_at = df
+                    .get_metadata()
+                    .ok()
+                    .and_then(|m| {
+                        m.iter().find_map(|(k, v)| {
+                            if k.as_str() != Some("X-Delete-At") {
+                                return None;
+                            }
+                            match v {
+                                MetaValue::Str(s) => s.parse::<Timestamp>().ok(),
+                                MetaValue::Int(i) => i.to_string().parse::<Timestamp>().ok(),
+                                _ => None,
+                            }
+                        })
+                    })
+                    .unwrap_or_else(|| "0".parse().unwrap());
+                (ts, true, delete_at)
+            }
+            Err(DiskFileError::Deleted { timestamp, .. }) => {
+                (timestamp, false, "0".parse().unwrap())
+            }
             Err(DiskFileError::NotExist) | Err(DiskFileError::Quarantined(_)) => {
-                ("0".parse().unwrap(), false)
+                ("0".parse().unwrap(), false, "0".parse().unwrap())
+            }
+            Err(DiskFileError::Expired { metadata }) => {
+                // open_expired=false path; treat as live-but-expired for
+                // X-If-Delete-At verification.
+                let ts = metadata
+                    .iter()
+                    .find_map(|(k, v)| {
+                        if k.as_str() == Some("X-Timestamp") {
+                            v.as_str().and_then(|s| s.parse().ok())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "0".parse().unwrap());
+                let delete_at = metadata
+                    .iter()
+                    .find_map(|(k, v)| {
+                        if k.as_str() != Some("X-Delete-At") {
+                            return None;
+                        }
+                        match v {
+                            MetaValue::Str(s) => s.parse::<Timestamp>().ok(),
+                            MetaValue::Int(i) => i.to_string().parse::<Timestamp>().ok(),
+                            _ => None,
+                        }
+                    })
+                    .unwrap_or_else(|| "0".parse().unwrap());
+                (ts, true, delete_at)
             }
             Err(e) => return plain_response(500, &e.to_string()),
         };
+        // Python: when X-If-Delete-At is set, refuse to tombstone unless the
+        // object's X-Delete-At matches (412) / object exists (404) / not
+        // newer (409).
+        if let Some(req_if) = if_delete_at {
+            if !was_live {
+                let mut resp = swob_response(404);
+                resp.headers
+                    .set("X-Backend-Timestamp", orig_timestamp.max(req_timestamp).internal());
+                return resp;
+            }
+            if orig_timestamp >= req_timestamp {
+                let mut resp = swob_response(409);
+                resp.headers
+                    .set("X-Backend-Timestamp", orig_timestamp.max(req_timestamp).internal());
+                return resp;
+            }
+            if orig_delete_at != req_if {
+                return plain_response(412, "X-If-Delete-At and X-Delete-At do not match");
+            }
+        }
         let response_timestamp = orig_timestamp.max(req_timestamp);
         let response_class = if !was_live {
             404
@@ -2460,9 +2538,19 @@ pub fn serve_with_config(
     server: ObjectServer,
     http_config: swift_http::ServerConfig,
 ) -> std::io::Result<()> {
+    serve_with_config_multi(vec![listener], server, http_config)
+}
+
+/// Serve across multiple listen sockets (`servers_per_port` topology).
+/// All listeners share one worker pool ([`swift_http::serve_forever_multi`]).
+pub fn serve_with_config_multi(
+    listeners: Vec<std::net::TcpListener>,
+    server: ObjectServer,
+    http_config: swift_http::ServerConfig,
+) -> std::io::Result<()> {
     let server = std::sync::Arc::new(server);
     let handler: swift_http::Handler = std::sync::Arc::new(move |req| server.handle(req));
-    swift_http::serve_forever_with_config(listener, handler, http_config)
+    swift_http::server::serve_forever_multi(listeners, handler, http_config)
 }
 
 #[cfg(test)]

@@ -1,0 +1,23 @@
+Aug 04 13:38:12 swift1 proxy-server[3985384]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl tempauth copy slo dlo proxy-logging proxy-server
+Aug 04 13:38:12 swift1 proxy-server[3985384]: INFO proxy_logging enabled (logger sink)
+Aug 04 13:38:12 swift1 proxy-server[3985384]: INFO cache enabled (memcache_servers=10.0.0.1:11211)
+Aug 04 13:38:12 swift1 proxy-server[3985384]: INFO listing_formats enabled
+Aug 04 13:38:12 swift1 proxy-server[3985384]: INFO bulk enabled (delete; max_deletes_per_request=10000)
+Aug 04 13:38:12 swift1 proxy-server[3985384]: INFO tempurl enabled
+Aug 04 13:38:12 swift1 proxy-server[3985384]: INFO tempauth enabled
+Aug 04 13:38:12 swift1 proxy-server[3985384]: INFO copy enabled
+Aug 04 13:38:12 swift1 proxy-server[3985384]: INFO slo enabled
+Aug 04 13:38:12 swift1 proxy-server[3985384]: INFO dlo enabled
+Aug 04 13:38:12 swift1 proxy-server[3985384]: INFO proxy_logging enabled (logger sink)
+Aug 04 13:38:42 swift1 proxy-server[3993645]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth tempurl bulk ratelimit copy slo dlo proxy-logging proxy-server
+Aug 04 13:38:42 swift1 proxy-server[3993645]: INFO proxy_logging enabled (logger sink)
+Aug 04 13:38:42 swift1 proxy-server[3993645]: INFO cache enabled (memcache_servers=10.0.0.1:11211)
+Aug 04 13:38:42 swift1 proxy-server[3993645]: INFO listing_formats enabled
+Aug 04 13:38:42 swift1 proxy-server[3993645]: INFO tempauth enabled
+Aug 04 13:38:42 swift1 proxy-server[3993645]: INFO tempurl enabled
+Aug 04 13:38:42 swift1 proxy-server[3993645]: INFO bulk enabled (delete; max_deletes_per_request=10000)
+Aug 04 13:38:42 swift1 proxy-server[3993645]: INFO ratelimit enabled
+Aug 04 13:38:42 swift1 proxy-server[3993645]: INFO copy enabled
+Aug 04 13:38:42 swift1 proxy-server[3993645]: INFO slo enabled
+Aug 04 13:38:42 swift1 proxy-server[3993645]: INFO dlo enabled
+Aug 04 13:38:42 swift1 proxy-server[3993645]: INFO proxy_logging enabled (logger sink)

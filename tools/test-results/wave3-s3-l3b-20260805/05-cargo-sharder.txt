@@ -1,0 +1,23 @@
+warning: failed to auto-clean cache data
+
+failed to clean entries from the global cache
+
+Caused by:
+  failed to remove file `/Users/oboy/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-macro-0.3.31/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.33s
+     Running unittests src/lib.rs (target/debug/deps/swift_container_server-8cc8327101a75f5d)
+
+running 7 tests
+test sharder::tests::test_cleaving_context_roundtrip ... ok
+test sharder::tests::test_run_once_skips_unsharded ... ok
+test sharder::tests::test_cleaving_context_persists_on_broker ... ok
+test sharder::tests::test_auto_shard_triggers_above_threshold ... ok
+test sharder::tests::test_find_create_and_cleave ... ok
+test sharder::tests::test_cleave_is_batched ... ok
+test sharder::tests::test_run_once_cleaves_sharding_container_on_device ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.22s
+

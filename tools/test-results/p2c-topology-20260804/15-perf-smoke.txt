@@ -1,0 +1,10 @@
+token_len=149 storage=http://10.0.0.10:8085/v1/AUTH_test
+PUT_cont 201
+PUT_ok=50 PUT_fail=0 PUT_total_ms=12940 PUT_avg_ms=258
+GET_ok=50 GET_fail=0 GET_total_ms=6665 GET_avg_ms=133
+cleanup_done
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda4        40G  8.7G   32G  22% /
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda4        40G  8.7G   32G  22% /
+PERF_SMOKE=PASS

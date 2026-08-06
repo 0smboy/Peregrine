@@ -23,13 +23,19 @@
 //! `gatekeeper` (strips client-supplied backend/sysmeta headers — a
 //! security boundary), and `healthcheck`.
 //!
-//! Deferred: proxy_logging (needs a logger sink), tempauth/keystoneauth
-//! (token validation), and the ~35 feature middlewares.
+//! P0 wired (proxy `build_configured_filters`): `cache`, `listing_formats`,
+//! `proxy_logging` (optional logger sink). P1a adds `bulk` (delete),
+//! `tempurl`, account ACL helpers, and deployable `ratelimit`. P1b adds
+//! `formpost`, `staticweb`, quotas, `symlink`, `versioned_writes`, and the
+//! smaller L2 filters. P3-auth wires `authtoken` + `keystoneauth`. P3-s3
+//! `s3api` lives in `swift-s3api` (proxy-wired; not advertised on `/info`).
 
 mod account_quotas;
 mod acl;
+mod authtoken;
 mod backend_ratelimit;
 mod bulk;
+mod cache;
 mod catch_errors;
 mod container_quotas;
 mod copy;
@@ -47,6 +53,7 @@ mod name_check;
 mod proxy_logging;
 mod ratelimit;
 mod read_only;
+mod s3token;
 mod slo;
 mod staticweb;
 mod symlink;
@@ -55,9 +62,13 @@ mod tempurl;
 mod versioned_writes;
 
 pub use account_quotas::AccountQuotas;
-pub use acl::{parse_acl_v1, referrer_allowed};
+pub use acl::{
+    acls_from_sysmeta, format_acl_v2, parse_acl_v1, parse_acl_v2, referrer_allowed,
+    validate_account_acl_header, AccountAcls,
+};
 pub use backend_ratelimit::BackendRateLimit;
 pub use bulk::{parse_delete_body, Bulk, BulkDeleteResult};
+pub use cache::{Cache, DEFAULT_MEMCACHE_SERVERS};
 pub use catch_errors::CatchErrors;
 pub use container_quotas::ContainerQuotas;
 pub use copy::Copy;
@@ -67,20 +78,30 @@ pub use cname_lookup::{CnameLookup, Resolver};
 pub use domain_remap::DomainRemap;
 pub use etag_quoter::EtagQuoter;
 pub use formpost::{
-    formpost_hmac, verify_signature as formpost_verify, FormPostAttributes, FormPostVerify,
+    formpost_hmac, multipart_boundary, parse_content_disposition,
+    verify_signature as formpost_verify, FormPost, FormPostAttributes, FormPostVerify,
     DEFAULT_ALLOWED_DIGESTS as FORMPOST_DEFAULT_DIGESTS,
+};
+pub use authtoken::{
+    AuthToken, HttpKeystoneValidator, HttpTokenValidator, MapTokenValidator, StaticTokenMap,
+    TokenOutcome, TokenValidator, ValidatedToken,
 };
 pub use gatekeeper::Gatekeeper;
 pub use healthcheck::HealthCheck;
 pub use keystoneauth::{
-    authorize as keystone_authorize, cross_tenant_match, AuthRequest, AuthResult, Identity,
-    RoleConfig,
+    authorize as keystone_authorize, cross_tenant_match, AccountRules, AuthRequest, AuthResult,
+    Identity, KeystoneAuth, RoleConfig, AUTH_PLUGIN_HEADER, AUTH_PLUGIN_KEYSTONE,
 };
 pub use listing_formats::ListingFormats;
 pub use name_check::NameCheck;
-pub use proxy_logging::{LogContext, ProxyLogging};
+pub use proxy_logging::{LogContext, LogSink, ProxyLogging};
 pub use ratelimit::{Clock, RateLimit, RateTier, SystemClock};
 pub use read_only::ReadOnly;
+pub use s3token::{
+    access_key_from_authorization, encode_s3tokens_token, HttpS3TokenClient, MapS3TokenClient,
+    S3Token, S3TokenClient, S3TokenResult, HDR_S3_ACCESS_KEY, HDR_S3_SIGNATURE,
+    HDR_S3_STRING_TO_SIGN,
+};
 pub use slo::{
     dlo_etag_and_size, manifest_etag, normalize_etag, slo_etag_and_size, Slo, SloSegment,
 };
@@ -89,7 +110,7 @@ pub use staticweb::{
 };
 pub use symlink::Symlink;
 pub use tempauth::{TempAuth, UserRecord};
-pub use tempurl::{KeyProvider, TempUrl};
+pub use tempurl::{ClosureKeyProvider, KeyProvider, TempUrl};
 pub use versioned_writes::{versions_object_name, VersionedWrites};
 
 use std::sync::Arc;

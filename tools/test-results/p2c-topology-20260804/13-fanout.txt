@@ -1,0 +1,44 @@
+=== fanout 10.0.0.1 ===
+active
+LISTEN 0      128          0.0.0.0:6200       0.0.0.0:*    users:(("swift-object-se",pid=310587,fd=5))              
+Aug 04 15:16:25 swift1 object-server[310587]: INFO REPLICATE /d1/15129 200 0.0002s
+Aug 04 15:16:25 swift1 object-server[310587]: INFO REPLICATE /d1/15542/4f2 200 0.0002s
+Aug 04 15:16:25 swift1 object-server[310587]: INFO REPLICATE /d1/396 200 0.0002s
+Aug 04 15:16:25 swift1 object-server[310587]: INFO REPLICATE /d1/960 200 0.0003s
+Aug 04 15:16:25 swift1 object-server[310587]: INFO REPLICATE /d1/708 200 0.0004s
+Aug 04 15:16:25 swift1 object-server[310587]: INFO REPLICATE /d1/14378 200 0.0091s
+Aug 04 15:16:25 swift1 object-server[310587]: INFO REPLICATE /d1/4432/7a7 200 0.0003s
+Aug 04 15:16:25 swift1 object-server[310587]: INFO REPLICATE /d1/660 200 0.0002s
+=== fanout 10.0.0.2 ===
+active
+LISTEN 0      128          0.0.0.0:6200       0.0.0.0:*    users:(("swift-object-se",pid=746199,fd=5))                                      
+Aug 04 15:16:30 swift2 object-server[746199]: INFO PUT /d1/15345/AUTH_test/wb335114-1/o-73 201 0.0653s
+Aug 04 15:16:30 swift2 object-server[746199]: INFO PUT /d1/14337/AUTH_test/wb335114-1/o-75 201 0.0481s
+Aug 04 15:16:30 swift2 object-server[746199]: INFO PUT /d1/8697/AUTH_test/wb335114-1/o-51 201 0.0586s
+Aug 04 15:16:30 swift2 object-server[746199]: INFO PUT /d1/1048/AUTH_test/wb335114-1/o-77 201 0.0665s
+Aug 04 15:16:30 swift2 object-server[746199]: INFO REPLICATE /d1/912 200 0.0002s
+Aug 04 15:16:30 swift2 object-server[746199]: INFO REPLICATE /d1/912 200 0.0002s
+Aug 04 15:16:30 swift2 object-server[746199]: INFO PUT /d1/5223/AUTH_test/wb335114-0/o-68 201 0.1066s
+Aug 04 15:16:30 swift2 object-server[746199]: INFO PUT /d1/2491/AUTH_test/wb335114-1/o-89 201 0.0650s
+=== fanout 10.0.0.3 ===
+active
+LISTEN 0      128          0.0.0.0:6200       0.0.0.0:*    users:(("swift-object-se",pid=3932897,fd=5))            
+Aug 04 15:16:35 swift3 object-server[3932897]: INFO REPLICATE /d1/14739 200 0.0001s
+Aug 04 15:16:35 swift3 object-server[3932897]: INFO REPLICATE /d1/474 200 0.0001s
+Aug 04 15:16:35 swift3 object-server[3932897]: INFO REPLICATE /d1/474 200 0.0001s
+Aug 04 15:16:35 swift3 object-server[3932897]: INFO REPLICATE /d1/8816 200 0.0001s
+Aug 04 15:16:35 swift3 object-server[3932897]: INFO REPLICATE /d1/8816 200 0.0001s
+Aug 04 15:16:35 swift3 object-server[3932897]: INFO REPLICATE /d1/768 200 0.0002s
+Aug 04 15:16:35 swift3 object-server[3932897]: INFO REPLICATE /d1/13618/061-4a4-543 200 0.0004s
+Aug 04 15:16:35 swift3 object-server[3932897]: INFO PUT /d1/7298/AUTH_test/wb335114-0/o-266 201 0.0597s
+=== fanout 10.0.0.4 ===
+active
+LISTEN 0      128          0.0.0.0:6200       0.0.0.0:*    users:(("swift-object-se",pid=2480368,fd=5))            
+Aug 04 15:16:41 swift4 object-server[2480368]: INFO REPLICATE /d1/3935 200 0.0006s
+Aug 04 15:16:41 swift4 object-server[2480368]: INFO REPLICATE /d1/129 200 0.0003s
+Aug 04 15:16:41 swift4 object-server[2480368]: INFO REPLICATE /d1/3703 200 0.0003s
+Aug 04 15:16:41 swift4 object-server[2480368]: INFO REPLICATE /d1/12455 200 0.0003s
+Aug 04 15:16:41 swift4 object-server[2480368]: INFO REPLICATE /d1/9775 200 0.0003s
+Aug 04 15:16:41 swift4 object-server[2480368]: INFO REPLICATE /d1/12455 200 0.0001s
+Aug 04 15:16:41 swift4 object-server[2480368]: INFO REPLICATE /d1/453 200 0.0003s
+Aug 04 15:16:41 swift4 object-server[2480368]: INFO PUT /d1/277/AUTH_test/wb335114-1/o-551 201 0.1060s

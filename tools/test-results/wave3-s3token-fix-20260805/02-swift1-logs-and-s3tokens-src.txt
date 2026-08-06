@@ -1,0 +1,266 @@
+===SUPERVISOR LOGS (tail)===
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines     self.dialect.do_execute(
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/engine/default.py", line 736, in do_execute
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines     cursor.execute(statement, parameters)
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/cursors.py", line 159, in execute
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines     result = self._query(query)
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/cursors.py", line 330, in _query
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines     conn.query(q)
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 582, in query
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines     self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 847, in _read_query_result
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines     result.read()
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 1245, in read
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines     first_packet = self.connection._read_packet()
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 772, in _read_packet
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines     packet_header = self._read_bytes(4)
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 826, in _read_bytes
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines     raise err.OperationalError(
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines oslo_db.exception.DBConnectionError: (pymysql.err.OperationalError) (2013, 'Lost connection to MySQL server during query')
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines [SQL: SELECT 1]
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines (Background on this error at: https://sqlalche.me/e/14/e3q8)
+2026-08-05 10:14:10.626 4154570 ERROR oslo_db.sqlalchemy.engines [00m
+[pid: 4154570|app: 0|req: 43/323] 127.0.0.1 () {30 vars in 698 bytes} [Wed Aug  5 10:14:10 2026] GET /v3/auth/tokens => generated 1735 bytes in 286 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 2)
+[pid: 4154570|app: 0|req: 44/324] 10.0.4.4 () {30 vars in 695 bytes} [Wed Aug  5 10:14:12 2026] GET /v3/auth/tokens => generated 1735 bytes in 23 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 1)
+[pid: 4154305|app: 0|req: 41/325] 127.0.0.1 () {30 vars in 698 bytes} [Wed Aug  5 10:14:12 2026] GET /v3/auth/tokens => generated 1735 bytes in 16 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 0)
+[pid: 4154305|app: 0|req: 42/326] 10.0.4.4 () {30 vars in 696 bytes} [Wed Aug  5 10:14:29 2026] GET /v3/auth/tokens => generated 1735 bytes in 19 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 1)
+[pid: 4154305|app: 0|req: 43/327] 10.0.4.4 () {30 vars in 696 bytes} [Wed Aug  5 10:14:29 2026] GET /v3/auth/tokens => generated 1735 bytes in 20 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 2)
+[pid: 4154305|app: 0|req: 44/328] 127.0.0.1 () {30 vars in 698 bytes} [Wed Aug  5 10:14:29 2026] GET /v3/auth/tokens => generated 1735 bytes in 23 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 3)
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines [None req-d8348f87-b9e1-409f-9da9-5e230009403b - - - - - -] Database connection was found disconnected; reconnecting: oslo_db.exception.DBConnectionError: (pymysql.err.OperationalError) (2013, 'Lost connection to MySQL server during query')
+[SQL: SELECT 1]
+(Background on this error at: https://sqlalche.me/e/14/e3q8)
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines Traceback (most recent call last):
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/engine/base.py", line 1910, in _execute_context
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     self.dialect.do_execute(
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/engine/default.py", line 736, in do_execute
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     cursor.execute(statement, parameters)
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/cursors.py", line 159, in execute
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     result = self._query(query)
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/cursors.py", line 330, in _query
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     conn.query(q)
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 582, in query
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 847, in _read_query_result
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     result.read()
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 1245, in read
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     first_packet = self.connection._read_packet()
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 772, in _read_packet
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     packet_header = self._read_bytes(4)
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 826, in _read_bytes
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     raise err.OperationalError(
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines pymysql.err.OperationalError: (2013, 'Lost connection to MySQL server during query')
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines 
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines The above exception was the direct cause of the following exception:
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines 
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines Traceback (most recent call last):
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib/python3.9/site-packages/oslo_db/sqlalchemy/engines.py", line 81, in _connect_ping_listener
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     connection.scalar(select(1))
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/engine/base.py", line 1267, in scalar
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     return self.execute(object_, *multiparams, **params).scalar()
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/engine/base.py", line 1385, in execute
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     return meth(self, multiparams, params, _EMPTY_EXECUTION_OPTS)
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/sql/elements.py", line 334, in _execute_on_connection
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     return connection._execute_clauseelement(
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/engine/base.py", line 1577, in _execute_clauseelement
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     ret = self._execute_context(
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/engine/base.py", line 1953, in _execute_context
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     self._handle_dbapi_exception(
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/engine/base.py", line 2132, in _handle_dbapi_exception
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     util.raise_(newraise, with_traceback=exc_info[2], from_=e)
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/util/compat.py", line 211, in raise_
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     raise exception
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/engine/base.py", line 1910, in _execute_context
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     self.dialect.do_execute(
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/engine/default.py", line 736, in do_execute
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     cursor.execute(statement, parameters)
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/cursors.py", line 159, in execute
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     result = self._query(query)
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/cursors.py", line 330, in _query
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     conn.query(q)
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 582, in query
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 847, in _read_query_result
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     result.read()
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 1245, in read
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     first_packet = self.connection._read_packet()
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 772, in _read_packet
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     packet_header = self._read_bytes(4)
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 826, in _read_bytes
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines     raise err.OperationalError(
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines oslo_db.exception.DBConnectionError: (pymysql.err.OperationalError) (2013, 'Lost connection to MySQL server during query')
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines [SQL: SELECT 1]
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines (Background on this error at: https://sqlalche.me/e/14/e3q8)
+2026-08-05 10:14:45.205 4154817 ERROR oslo_db.sqlalchemy.engines [00m
+2026-08-05 10:14:45.347 4154817 WARNING keystone.common.password_hashing [None req-d8348f87-b9e1-409f-9da9-5e230009403b - - - - - -] Truncating password to algorithm specific maximum length 72 characters.[00m
+[pid: 4154817|app: 0|req: 41/329] 10.0.4.2 () {32 vars in 369 bytes} [Wed Aug  5 10:14:45 2026] POST /v3/auth/tokens => generated 1735 bytes in 323 msecs (HTTP/1.1 201) 5 headers in 366 bytes (1 switches on core 0)
+[pid: 4154817|app: 0|req: 42/330] 10.0.4.4 () {30 vars in 694 bytes} [Wed Aug  5 10:14:46 2026] GET /v3/auth/tokens => generated 1735 bytes in 19 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 3)
+[pid: 4154817|app: 0|req: 43/331] 10.0.4.4 () {30 vars in 695 bytes} [Wed Aug  5 10:14:46 2026] GET /v3/auth/tokens => generated 1735 bytes in 16 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 2)
+[pid: 4154817|app: 0|req: 44/332] 10.0.4.4 () {30 vars in 695 bytes} [Wed Aug  5 10:14:46 2026] GET /v3/auth/tokens => generated 1735 bytes in 22 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 1)
+[pid: 4154751|app: 0|req: 41/333] 10.0.4.4 () {30 vars in 695 bytes} [Wed Aug  5 10:14:46 2026] GET /v3/auth/tokens => generated 1735 bytes in 18 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 0)
+[pid: 4154751|app: 0|req: 42/334] 127.0.0.1 () {30 vars in 698 bytes} [Wed Aug  5 10:14:46 2026] GET /v3/auth/tokens => generated 1735 bytes in 27 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 3)
+[pid: 4154751|app: 0|req: 43/335] 127.0.0.1 () {30 vars in 698 bytes} [Wed Aug  5 10:14:46 2026] GET /v3/auth/tokens => generated 1735 bytes in 37 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 2)
+===ADMIN LOG===
+Respawned uWSGI worker 6 (new pid: 4154139)
+DAMN ! worker 7 (pid: 4153815) died :( trying respawn ...
+Respawned uWSGI worker 7 (new pid: 4154140)
+/etc/keystone/fernet-keys/ does not exist
+DAMN ! worker 1 (pid: 4153810) died :( trying respawn ...
+Respawned uWSGI worker 1 (new pid: 4154163)
+DAMN ! worker 8 (pid: 4153816) died :( trying respawn ...
+Respawned uWSGI worker 8 (new pid: 4154211)
+/etc/keystone/fernet-keys/ does not exist
+/etc/keystone/fernet-keys/ does not exist
+/etc/keystone/fernet-keys/ does not exist
+DAMN ! worker 4 (pid: 4154044) died :( trying respawn ...
+Respawned uWSGI worker 4 (new pid: 4154843)
+DAMN ! worker 2 (pid: 4154066) died :( trying respawn ...
+Respawned uWSGI worker 2 (new pid: 4154844)
+/etc/keystone/fernet-keys/ does not exist
+DAMN ! worker 5 (pid: 4154045) died :( trying respawn ...
+Respawned uWSGI worker 5 (new pid: 4154871)
+/etc/keystone/fernet-keys/ does not exist
+/etc/keystone/fernet-keys/ does not exist
+/etc/keystone/fernet-keys/ does not exist
+/etc/keystone/fernet-keys/ does not exist
+DAMN ! worker 3 (pid: 4154067) died :( trying respawn ...
+Respawned uWSGI worker 3 (new pid: 4155098)
+DAMN ! worker 6 (pid: 4154139) died :( trying respawn ...
+Respawned uWSGI worker 6 (new pid: 4155388)
+DAMN ! worker 7 (pid: 4154140) died :( trying respawn ...
+Respawned uWSGI worker 7 (new pid: 4155389)
+DAMN ! worker 1 (pid: 4154163) died :( trying respawn ...
+Respawned uWSGI worker 1 (new pid: 4155420)
+DAMN ! worker 8 (pid: 4154211) died :( trying respawn ...
+Respawned uWSGI worker 8 (new pid: 4155490)
+WSGI app 0 (mountpoint='') ready in 17 seconds on interpreter 0x14eba20 pid: 4154844 (default app)
+WSGI app 0 (mountpoint='') ready in 17 seconds on interpreter 0x14eba20 pid: 4154843 (default app)
+WSGI app 0 (mountpoint='') ready in 21 seconds on interpreter 0x14eba20 pid: 4154871 (default app)
+WSGI app 0 (mountpoint='') ready in 17 seconds on interpreter 0x14eba20 pid: 4155490 (default app)
+WSGI app 0 (mountpoint='') ready in 18 seconds on interpreter 0x14eba20 pid: 4155420 (default app)
+WSGI app 0 (mountpoint='') ready in 21 seconds on interpreter 0x14eba20 pid: 4155098 (default app)
+WSGI app 0 (mountpoint='') ready in 19 seconds on interpreter 0x14eba20 pid: 4155389 (default app)
+WSGI app 0 (mountpoint='') ready in 19 seconds on interpreter 0x14eba20 pid: 4155388 (default app)
+===EC2 CREDS FILE===
+-rw-------. 1 root root 652 Aug  5 09:57 /root/contabo-identity-secrets.yml
+-rw-r--r--. 1 root root 375 Aug  5 10:03 /root/contabo-s3-ec2-tester.json
+admin_pass_len 32
+auth 201 token_len 183
+ec2_count 6
+cred 4886c7200569 user a174f157 blob_type str blob_preview {"access": "1371713510fb45e98ab1e26b694d55d3", "secret": "e29c6188ab4c454abe26f9
+cred 55497854190f user 08fe207f blob_type str blob_preview {"access": "AKIAW3S3LAB0001", "secret": "w3s3labsecretkey00000000000000000001"}
+cred 9c3e4bd43064 user 08fe207f blob_type str blob_preview {"access": "a719f6f4235e4fd397db5a937e438fab", "secret": "b6a1629e51094c7c819814
+cred b66ac6505341 user 08fe207f blob_type str blob_preview {"access": "28de7daf94f0483db03ab2aa3c4662f3", "secret": "f2e8d4c1aeca492793f0f5
+cred bd335ba3dbfc user 08fe207f blob_type str blob_preview {"access": "8dbbc83cb7ce4c9299986e8f8dcad614", "secret": "80918423ccfb4135afe075
+tester_keys ['access', 'credential_id', 'note', 'project_id', 'secret', 'user', 'user_id']
+access_prefix 13717135 secret_len 48
+will probe after inspecting s3tokens source
+===S3TOKENS SOURCE===
+/usr/lib/python3.9/site-packages/keystone/api/s3tokens.py
+---
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
+# not use this file except in compliance with the License. You may obtain
+# a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations
+# under the License.
+
+# This file handles all flask-restful resources for /v3/s3tokens
+
+import base64
+import hashlib
+import hmac
+
+import flask
+import http.client
+from oslo_serialization import jsonutils
+
+from keystone.api._shared import EC2_S3_Resource
+from keystone.api._shared import json_home_relations
+from keystone.common import render_token
+from keystone.common import utils
+from keystone import exception
+from keystone.i18n import _
+from keystone.server import flask as ks_flask
+
+
+def _calculate_signature_v1(string_to_sign, secret_key):
+    """Calculate a v1 signature.
+
+    :param bytes string_to_sign: String that contains request params and
+                                 is used for calculate signature of request
+    :param text secret_key: Second auth key of EC2 account that is used to
+                            sign requests
+    """
+    key = str(secret_key).encode('utf-8')
+    b64_encode = base64.encodebytes
+    signed = b64_encode(hmac.new(key, string_to_sign, hashlib.sha1)
+                        .digest()).decode('utf-8').strip()
+    return signed
+
+
+def _calculate_signature_v4(string_to_sign, secret_key):
+    """Calculate a v4 signature.
+
+    :param bytes string_to_sign: String that contains request params and
+                                 is used for calculate signature of request
+    :param text secret_key: Second auth key of EC2 account that is used to
+                            sign requests
+    """
+    parts = string_to_sign.split(b'\n')
+    if len(parts) != 4 or parts[0] != b'AWS4-HMAC-SHA256':
+        raise exception.Unauthorized(message=_('Invalid EC2 signature.'))
+    scope = parts[2].split(b'/')
+    if len(scope) != 4 or scope[3] != b'aws4_request':
+        raise exception.Unauthorized(message=_('Invalid EC2 signature.'))
+    allowed_services = [b's3', b'iam', b'sts']
+    if scope[2] not in allowed_services:
+        raise exception.Unauthorized(message=_('Invalid EC2 signature.'))
+
+    def _sign(key, msg):
+        return hmac.new(key, msg, hashlib.sha256).digest()
+
+    signed = _sign(('AWS4' + secret_key).encode('utf-8'), scope[0])
+    signed = _sign(signed, scope[1])
+    signed = _sign(signed, scope[2])
+    signed = _sign(signed, b'aws4_request')
+
+    signature = hmac.new(signed, string_to_sign, hashlib.sha256)
+    return signature.hexdigest()
+
+
+class S3Resource(EC2_S3_Resource.ResourceBase):
+    @staticmethod
+    def _check_signature(creds_ref, credentials):
+        string_to_sign = base64.urlsafe_b64decode(str(credentials['token']))
+
+        if string_to_sign[0:4] != b'AWS4':
+            signature = _calculate_signature_v1(string_to_sign,
+                                                creds_ref['secret'])
+        else:
+            signature = _calculate_signature_v4(string_to_sign,
+                                                creds_ref['secret'])
+
+        if not utils.auth_str_equal(credentials['signature'], signature):
+            raise exception.Unauthorized(
+                message=_('Credential signature mismatch'))
+
+    @ks_flask.unenforced_api
+    def post(self):
+        """Authenticate s3token.
+
+        POST /v3/s3tokens
+        """
+        token = self.handle_authenticate()
+        token_reference = render_token.render_token_response_from_model(token)
+        resp_body = jsonutils.dumps(token_reference)
+        response = flask.make_response(resp_body, http.client.OK)
+        response.headers['Content-Type'] = 'application/json'
+        return response
+
+
+class S3Api(ks_fla

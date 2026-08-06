@@ -1,0 +1,20 @@
+==== swift1 ====
+/srv/node/d1/accounts/11610/64d/b56ad7a193561dc795131366fc92864d/b56ad7a193561dc795131366fc92864d.db stat ('.expiring_objects', 0, 0, 0) live 0 names []
+/srv/node/d2/accounts/976/dd5/f41c17e6415c98d5b7200e615237edd5/f41c17e6415c98d5b7200e615237edd5.db stat ('AUTH_test', 0, 0, 0) live 0 names []
+/srv/node/d3/accounts/725/64d/b56ad7a193561dc795131366fc92864d/b56ad7a193561dc795131366fc92864d.db stat ('.expiring_objects', 0, 0, 0) live 0 names []
+container_deleted0_total 0
+==== swift2 ====
+/srv/node/d1/accounts/15623/dd5/f41c17e6415c98d5b7200e615237edd5/f41c17e6415c98d5b7200e615237edd5.db stat ('AUTH_test', 0, 0, 0) live 0 names []
+/srv/node/d2/accounts/976/dd5/f41c17e6415c98d5b7200e615237edd5/f41c17e6415c98d5b7200e615237edd5.db stat ('AUTH_test', 0, 0, 0) live 0 names []
+/srv/node/d3/accounts/725/64d/b56ad7a193561dc795131366fc92864d/b56ad7a193561dc795131366fc92864d.db stat ('.expiring_objects', 0, 0, 0) live 0 names []
+container_deleted0_total 0
+==== swift3 ====
+/srv/node/d1/accounts/15623/dd5/f41c17e6415c98d5b7200e615237edd5/f41c17e6415c98d5b7200e615237edd5.db stat ('AUTH_test', 0, 0, 0) live 0 names []
+/srv/node/d1/accounts/11610/64d/b56ad7a193561dc795131366fc92864d/b56ad7a193561dc795131366fc92864d.db stat ('.expiring_objects', 0, 0, 0) live 0 names []
+container_deleted0_total 0
+==== swift4 ====
+/srv/node/d1/accounts/15623/dd5/f41c17e6415c98d5b7200e615237edd5/f41c17e6415c98d5b7200e615237edd5.db stat ('AUTH_test', 0, 0, 0) live 0 names []
+/srv/node/d1/accounts/11610/64d/b56ad7a193561dc795131366fc92864d/b56ad7a193561dc795131366fc92864d.db stat ('.expiring_objects', 0, 0, 0) live 0 names []
+/srv/node/d2/accounts/976/dd5/f41c17e6415c98d5b7200e615237edd5/f41c17e6415c98d5b7200e615237edd5.db stat ('AUTH_test', 0, 0, 0) live 0 names []
+/srv/node/d3/accounts/725/64d/b56ad7a193561dc795131366fc92864d/b56ad7a193561dc795131366fc92864d.db stat ('.expiring_objects', 0, 0, 0) live 0 names []
+container_deleted0_total 0

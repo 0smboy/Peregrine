@@ -1,0 +1,12 @@
+-rw-r--r--. 1 501 games   589 Jul 17 03:55 /root/work/swift-rust/Cargo.toml
+-rw-r--r--. 1 501 games 33295 Aug  4 15:34 /root/work/swift-rust/crates/swift-s3api/src/middleware.rs
+/root/work/autocos/Cargo.toml
+/root/work/cosbench-rs/Cargo.toml
+/root/work/swift-console/Cargo.toml
+/root/work/swift-deploy-rs/Cargo.toml
+/root/work/swift-deploy-rs-phase1/Cargo.toml
+/root/work/swift-rust/Cargo.toml
+rustc 1.97.0 (2d8144b78 2026-07-07)
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda4        40G   20G   21G  50% /
+/dev/sda4        40G   20G   21G  50% /

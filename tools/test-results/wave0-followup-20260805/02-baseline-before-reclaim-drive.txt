@@ -1,0 +1,61 @@
+UTC=2026-08-05T05:49:07Z
+=== swift1 ===
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   48G  2.3G  96% /srv/node/d1
+/dev/sda6        50G   45G  5.1G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.6G  89% /srv/node/d3
+total_count	48876
+total_bytes	0
+device=d1	policy=0	count=30077	bytes=0
+device=d1	policy=1	count=2102	bytes=0
+device=d2	policy=0	count=6458	bytes=0
+device=d2	policy=1	count=1981	bytes=0
+device=d3	policy=0	count=6300	bytes=0
+device=d3	policy=1	count=1958	bytes=0
+-rwxr-xr-x. 1 root root 1518184 Aug  5 05:36 /usr/local/bin/swift-object-replicator
+active
+=== swift2 ===
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   45G  5.5G  90% /srv/node/d1
+/dev/sda6        50G   45G  5.3G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.2G  90% /srv/node/d3
+total_count	48400
+total_bytes	0
+device=d1	policy=0	count=29654	bytes=0
+device=d1	policy=1	count=2122	bytes=0
+device=d2	policy=0	count=6420	bytes=0
+device=d2	policy=1	count=1956	bytes=0
+device=d3	policy=0	count=6297	bytes=0
+device=d3	policy=1	count=1951	bytes=0
+-rwxr-xr-x. 1 root root 1518184 Aug  5 05:36 /usr/local/bin/swift-object-replicator
+active
+=== swift3 ===
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   48G  2.5G  96% /srv/node/d1
+/dev/sda6        50G   45G  5.8G  89% /srv/node/d2
+/dev/sda7        50G   45G  5.6G  89% /srv/node/d3
+total_count	48800
+total_bytes	0
+device=d1	policy=0	count=30168	bytes=0
+device=d1	policy=1	count=2071	bytes=0
+device=d2	policy=0	count=6349	bytes=0
+device=d2	policy=1	count=2032	bytes=0
+device=d3	policy=0	count=6250	bytes=0
+device=d3	policy=1	count=1930	bytes=0
+-rwxr-xr-x. 1 root root 1518184 Aug  5 05:37 /usr/local/bin/swift-object-replicator
+active
+=== swift4 ===
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   44G  6.3G  88% /srv/node/d1
+/dev/sda6        50G   46G  5.0G  91% /srv/node/d2
+/dev/sda7        50G   45G  5.5G  90% /srv/node/d3
+total_count	48411
+total_bytes	0
+device=d1	policy=0	count=29856	bytes=0
+device=d1	policy=1	count=2066	bytes=0
+device=d2	policy=0	count=6351	bytes=0
+device=d2	policy=1	count=1995	bytes=0
+device=d3	policy=0	count=6221	bytes=0
+device=d3	policy=1	count=1922	bytes=0
+-rwxr-xr-x. 1 root root 1518184 Aug  5 05:37 /usr/local/bin/swift-object-replicator
+active

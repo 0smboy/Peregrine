@@ -1,0 +1,35 @@
+===================================================================
+P2b AUDITOR SUITE  label=vip  endpoint=http://10.0.0.10:8085  local=1  2026-08-04T15:26:37Z
+===================================================================
+  PASS  auth token
+  [10.0.0.1] units: active active active 
+  PASS  units active on 10.0.0.1
+  [10.0.0.2] units: active active active 
+  PASS  units active on 10.0.0.2
+  [10.0.0.3] units: active active active 
+  PASS  units active on 10.0.0.3
+  [10.0.0.4] units: active active active 
+  PASS  units active on 10.0.0.4
+  Aug 04 15:26:01 swift1 account-auditor[360356]: INFO account-auditor pass: passed=3 failed=0 duration=0.0s
+  Aug 04 15:26:39 swift1 account-auditor[361495]: INFO account-auditor pass: passed=3 failed=0 duration=0.0s
+  Aug 04 15:26:02 swift1 container-auditor[360357]: INFO container-auditor pass: passed=970 failed=0 duration=0.9s
+  Aug 04 15:26:40 swift1 container-auditor[361496]: INFO container-auditor pass: passed=970 failed=0 duration=0.5s
+  PASS  account-auditor once pass
+  PASS  container-auditor once pass
+  Aug 04 15:26:40 swift1 object-auditor[361585]: INFO object-auditor pass: passed=0 quarantined=0 errors=0 duration=0.0s
+  PASS  object-auditor tiny once pass
+  PASS  object-auditor continuous mode log (3)
+  continuous object-auditor: active
+0
+0
+  PASS  object-auditor continuous unit running
+  timer state: disabled
+disabled
+inactive
+inactive
+  PASS  nightly timer not active
+  SLA: object interval=30s (Python ObjectAuditor default); account/container interval=1800s (Python DatabaseAuditor default)
+  SLA: continuous Type=simple + Restart=on-failure — NOT nightly timer equivalence
+  NOTE: first /srv/node object pass can take many minutes on Contabo disk load; tiny-once proves pass path
+-------------------------------------------------------------------
+RESULT vip  pass=11 fail=0

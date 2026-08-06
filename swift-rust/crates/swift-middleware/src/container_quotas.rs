@@ -48,9 +48,30 @@
 //!   `'PUT'`, not a tuple) is faithfully rendered as `method == "PUT"`, the
 //!   only real HTTP method it can match.
 
-use swift_http::{split_path, Body, HeaderKeyDict, Request, Response};
+use swift_http::{split_path, Request, Response};
 
 use crate::{Middleware, NextFn};
+
+/// Resolve the request's byte size for quota math. Prefer `Content-Length`,
+/// then a declared streamed length. When the body is chunked / unknown
+/// (common behind HAProxy), materialize up to `cap` bytes — overflowing
+/// `cap` means the upload already exceeds the remaining quota.
+fn request_content_length(req: &mut Request, cap: u64) -> Result<i64, ()> {
+    if let Some(v) = req
+        .headers
+        .get("Content-Length")
+        .and_then(|v| v.parse::<i64>().ok())
+    {
+        return Ok(v);
+    }
+    if let Some(n) = req.body.content_length() {
+        return Ok(n as i64);
+    }
+    match req.body.materialize(cap) {
+        Ok(b) => Ok(b.len() as i64),
+        Err(_) => Err(()),
+    }
+}
 
 /// Port of `swift.common.http.is_success`: a 2xx status.
 fn is_success(status: u16) -> bool {
@@ -92,7 +113,7 @@ impl ContainerQuotas {
 }
 
 impl Middleware for ContainerQuotas {
-    fn handle(&self, req: Request, next: &NextFn) -> Response {
+    fn handle(&self, mut req: Request, next: &NextFn) -> Response {
         // req.split_path(3, 4, True); a ValueError (bad/short path) means
         // this is not an object or container request we police -> pass through.
         let parts = match split_path(&req.path, 3, 4, true) {
@@ -121,16 +142,16 @@ impl Middleware for ContainerQuotas {
             }
         } else if !obj.is_empty() && req.method == "PUT" {
             // Uploading an object: check it against the container's quotas.
-            // Make a backend HEAD subrequest for the container's usage,
-            // standing in for `get_container_info`.
-            let subreq = Request {
-                method: "HEAD".into(),
-                path: format!("/{version}/{account}/{container}"),
-                query_string: String::new(),
-                headers: HeaderKeyDict::new(),
-                body: Body::empty(),
+            // HEAD the container with the caller's auth headers (clone_head),
+            // standing in for `get_container_info` / make_subrequest.
+            let info = {
+                let mut sub = req.clone_head();
+                sub.method = "HEAD".into();
+                sub.path = format!("/{version}/{account}/{container}");
+                sub.query_string = String::new();
+                sub.headers.remove("Content-Length");
+                next(sub)
             };
-            let info = next(subreq);
             if !is_success(info.status) {
                 // No usable container info; let the real request 404 later.
                 return next(req);
@@ -144,11 +165,14 @@ impl Middleware for ContainerQuotas {
             ) {
                 if is_digit_str(quota) {
                     if let (Ok(quota), Ok(used)) = (quota.parse::<i64>(), used.parse::<i64>()) {
-                        let content_length = req
-                            .headers
-                            .get("Content-Length")
-                            .and_then(|v| v.parse::<i64>().ok())
-                            .unwrap_or(0);
+                        let remaining = (quota - used).max(0) as u64;
+                        // Cap materialize at remaining+1 so an oversize
+                        // chunked body (e.g. HAProxy) trips Err → 413.
+                        let cap = remaining.saturating_add(1).max(1);
+                        let content_length = match request_content_length(&mut req, cap) {
+                            Ok(n) => n,
+                            Err(()) => return upload_exceeds_quota(),
+                        };
                         let new_size = used + content_length;
                         if quota < new_size {
                             return upload_exceeds_quota();
@@ -182,6 +206,7 @@ impl Middleware for ContainerQuotas {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    use swift_http::HeaderKeyDict;
 
     /// Records every `(method, path)` that reaches the fake backend, so a
     /// test can prove whether the container HEAD subrequest was issued.

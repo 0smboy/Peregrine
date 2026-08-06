@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>P3-s3 S3 API — PARTIAL GREEN</title>
+<style>
+  :root { --ink:#1a1a1a; --muted:#555; --ok:#1b6b2a; --warn:#8a6d1b; --bg:#f7f5f0; --card:#fff; }
+  body { font-family: ui-sans-serif, system-ui, sans-serif; margin:0; background:var(--bg); color:var(--ink); line-height:1.45; }
+  main { max-width:960px; margin:0 auto; padding:32px 20px 64px; }
+  h1 { font-size:1.75rem; margin:0 0 8px; }
+  .verdict { display:inline-block; background:var(--warn); color:#fff; padding:4px 12px; font-weight:700; letter-spacing:.04em; }
+  .meta { color:var(--muted); margin:12px 0 28px; }
+  section { background:var(--card); padding:20px 22px; margin:0 0 18px; border:1px solid #e2ddd3; }
+  h2 { font-size:1.1rem; margin:0 0 12px; }
+  table { width:100%; border-collapse:collapse; font-size:.95rem; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid #ebe6dc; vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  code { font-family: ui-monospace, Menlo, monospace; font-size:.88em; }
+  ul { margin:8px 0 0; padding-left:1.2em; }
+  .ok { color:var(--ok); font-weight:700; }
+  .partial { color:var(--warn); font-weight:700; }
+</style>
+</head>
+<body>
+<main>
+  <p class="verdict">PARTIAL GREEN</p>
+  <h1>P3-s3 — Production S3 API path</h1>
+  <p class="meta">2026-08-04 · evidence
+    <code>tools/test-results/p3-s3-20260804/</code> · Swift v1 <code>/info</code> not polluted · verify-rerun <code>2026-08-04T15:37:53Z</code></p>
+
+  <section>
+    <h2>1. What this cycle did</h2>
+    <ul>
+      <li>Implemented <code>swift-s3api::middleware::S3Api</code>: SigV4 verify, S3→Swift path map, TempAuth credential map (<code>account:user</code> / secret), ListBuckets + ListObjects v1 XML, bucket/object CRUD, CopyObject, GetBucketLocation.</li>
+      <li>Wired <code>s3api</code> in proxy <code>build_configured_filters</code> (ON-BY-CONFIG; place before <code>tempauth</code>).</li>
+      <li>Documented sample in <code>bundle-rust</code> <code>proxy-server.conf.j2</code>; default pipeline unchanged.</li>
+      <li>Explicitly refused to advertise <code>s3api</code> on Swift <code>GET /info</code>.</li>
+      <li>Avoided Keystone/TLS ownership: only kept parallel P3-auth builders compiling; no TLS edits.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>2. Optimized / fixed / demoted</h2>
+    <ul>
+      <li><strong>Unblocked:</strong> S3 is no longer “library core only” — production filter path exists.</li>
+      <li><strong>Fixed false claim risk:</strong> wired filter does not add an <code>s3api</code> key to v1 <code>/info</code>.</li>
+      <li><strong>Demoted to residual:</strong> MPU, ListObjects v2, multi-delete, S3 ACL/CORS/versioning/tagging, SigV2, aws-chunked, s3token/Keystone, Contabo default-pipeline enable.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>3. Measured effect</h2>
+    <table>
+      <tr><th>Metric</th><th>Before</th><th>After</th></tr>
+      <tr><td><code>s3api</code> in <code>build_configured_filters</code></td><td>silent skip</td><td class="ok">wires when listed + TempAuth users</td></tr>
+      <tr><td>Swift <code>/info</code> <code>s3api</code> key</td><td>n/a</td><td class="ok">absent (even when wired)</td></tr>
+      <tr><td><code>cargo test -p swift-s3api</code></td><td>core-only</td><td class="ok">47/47 (incl. middleware)</td></tr>
+      <tr><td>Default Contabo pipeline</td><td>no s3api</td><td>unchanged (CORE-PATH baseline)</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>4. Gate results</h2>
+    <table>
+      <tr><th>Gate</th><th>Result</th><th>Evidence</th></tr>
+      <tr><td>Unit <code>swift-s3api</code></td><td class="ok">47/47</td><td><code>05-cargo-s3api.txt</code></td></tr>
+      <tr><td>Proxy wire + <code>/info</code> honesty</td><td class="ok">PASS</td><td><code>05-cargo-proxy-s3api.txt</code></td></tr>
+      <tr><td>S3 compat matrix (minimal surface)</td><td class="ok">documented PASS</td><td><code>S3-COMPAT-MATRIX.md</code></td></tr>
+      <tr><td>Default pipeline / CORE-PATH VIP</td><td class="ok">untouched</td><td>no deploy of s3api by default</td></tr>
+      <tr><td>Full S3 (MPU/ACL/v2/…)</td><td class="partial">residual</td><td>matrix NotImplemented rows</td></tr>
+      <tr><td>Contabo VIP with s3api enabled</td><td class="partial">not run</td><td>ON-BY-CONFIG residual</td></tr>
+      <tr><td>Contract / ROADMAP</td><td class="ok">DONE</td><td>docs update this wave</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>5. Remaining / next cycle</h2>
+    <ul>
+      <li><strong>FROZEN this wave:</strong> full S3 feature parity; advertising on <code>/info</code>; changing default Contabo pipeline.</li>
+      <li><strong>Backlog:</strong> MPU, ListObjects v2, multi-delete, S3 ACL; optional Contabo ON enable + aws-cli smoke; s3token after P3-auth GREEN.</li>
+      <li><strong>Parallel:</strong> P3-auth / P3-ops / TLS — do not merge ownership into this evidence pack.</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

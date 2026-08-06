@@ -1,0 +1,42 @@
+UTC=2026-08-05T10:05:16Z
+PASS ListBuckets http=200 bytes=322
+PASS ListBuckets_xml b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Owner><I'
+PASS CreateBucket http=200 b''
+PASS PutObject http=200
+PASS GetObject http=200 body=b'wave3-s3-live-payload'
+PASS ListObjects http=200
+PASS ListObjectsV2 http=200 snippet=b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-'
+PASS MultiDelete http=200 b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Deleted><Key>obj1.txt</Key></Deleted></DeleteResult>'
+PASS CreateMultipartUpload http=200 b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>w3s3-24316</Bucket><Key>mpu-obj</Key><UploadId>000000000000000018c8e0b7572'
+PASS UploadPart http=200 etag="d47b127bc2de2d687ddc82dac354c415"
+PASS ListParts http=200 b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>w3s3-243'
+PASS ListMultipartUploads http=200 b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>w3s3-24316</Bucket><Prefix></Prefix><KeyMarker></KeyMarker><UploadIdMarker></UploadIdMarker><Next'
+PASS CompleteMultipartUpload http=200 b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Location>/w3s3-24316/mpu-obj</Location><B'
+PASS DeleteObject http=204
+FAIL DeleteBucket http=409
+FAIL Swift_TempAuth_CRUD HTTP Error 401: Unauthorized
+PASS s3token_SigV4_ListBuckets http=403 body=b"<?xml version='1.0' encoding='UTF-8'?>\n<Error><Code>InvalidAccessKeyId</Code><Message>The AWS Access Key Id you provided does not exist in our records.</Message></Error>"
+FAIL Keystone_s3tokens_endpoint Remote end closed connection without response
+
+=== SUMMARY ===
+total 18 fail 3
+PASS	ListBuckets	http=200 bytes=322
+PASS	ListBuckets_xml	b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Owner><I'
+PASS	CreateBucket	http=200 b''
+PASS	PutObject	http=200
+PASS	GetObject	http=200 body=b'wave3-s3-live-payload'
+PASS	ListObjects	http=200
+PASS	ListObjectsV2	http=200 snippet=b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-'
+PASS	MultiDelete	http=200 b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Deleted><Key>obj1.txt</Key></Deleted></DeleteResult>'
+PASS	CreateMultipartUpload	http=200 b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>w3s3-24316</Bucket><Key>mpu-obj</Key><UploadId>000000000000000018c8e0b7572'
+PASS	UploadPart	http=200 etag="d47b127bc2de2d687ddc82dac354c415"
+PASS	ListParts	http=200 b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>w3s3-243'
+PASS	ListMultipartUploads	http=200 b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>w3s3-24316</Bucket><Prefix></Prefix><KeyMarker></KeyMarker><UploadIdMarker></UploadIdMarker><Next'
+PASS	CompleteMultipartUpload	http=200 b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Location>/w3s3-24316/mpu-obj</Location><B'
+PASS	DeleteObject	http=204
+FAIL	DeleteBucket	http=409
+FAIL	Swift_TempAuth_CRUD	HTTP Error 401: Unauthorized
+PASS	s3token_SigV4_ListBuckets	http=403 body=b"<?xml version='1.0' encoding='UTF-8'?>\n<Error><Code>InvalidAccessKeyId</Code><Message>The AWS Access Key Id you provided does not exist in our records.</Message></Error>"
+FAIL	Keystone_s3tokens_endpoint	Remote end closed connection without response
+VERDICT PARTIAL
+DONE

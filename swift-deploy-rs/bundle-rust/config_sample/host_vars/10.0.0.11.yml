@@ -1,4 +1,4 @@
-# Sample node: all roles, directory device d1 (rust stack v1 deploys
+# Sample node: all roles, directory device d1 (rust stack deploys
 # directory devices only; block devices are prepared out-of-band).
 management_network_address: 10.0.0.11
 storage_network_address: 10.0.0.11
@@ -6,3 +6,7 @@ replication_network_address: 10.0.0.11
 business_network_address: 10.0.0.11
 disk_type: hdd
 custom_disks: []
+region: 1
+zone: 1
+swift_devices:
+  - d1

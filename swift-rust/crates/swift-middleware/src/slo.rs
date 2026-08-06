@@ -26,10 +26,13 @@
 //!   an inline data segment), and
 //! * the **manifest Etag** — `md5` of the stored manifest JSON bytes.
 //!
-//! Both are golden-tested here. Deferred: the streaming GET reassembly, PUT
-//! validation/normalization of the client manifest, and range math across
-//! segment boundaries (the transport layer), plus DLO's prefix-listing
-//! variant.
+//! Both are golden-tested here. GET reassembly streams leaf segments
+//! (including nested `sub_slo` expansion up to [`MAX_SLO_RECURSION_DEPTH`])
+//! and honours a single top-level `Range` via per-segment ranged
+//! subrequests. PUT validates/normalizes client manifests (HEAD each
+//! segment, including sub-SLO sysmeta). Residual vs. `slo.py` (documented,
+//! not claimed): inline `{"data":…}` PUT segments, heartbeat PUT, and
+//! `multipart-manifest=delete`.
 
 use std::io::Read;
 use std::sync::Arc;
@@ -46,6 +49,10 @@ use crate::{Middleware, NextFn};
 /// `max_manifest_size` (Python slo.py default): the client manifest on a
 /// `?multipart-manifest=put` may not exceed this.
 const MAX_MANIFEST_SIZE: u64 = 8 * 1024 * 1024;
+
+/// Python `SloGetContext.max_slo_recursion_depth` — nested `sub_slo`
+/// expansion beyond this depth is a 409 Conflict.
+const MAX_SLO_RECURSION_DEPTH: usize = 10;
 
 const SLO_HEADER: &str = "X-Static-Large-Object";
 const IGNORE_RANGE_HDR: &str = "X-Backend-Ignore-Range-If-Metadata-Present";
@@ -153,15 +160,16 @@ pub fn dlo_etag_and_size(segment_hashes: &[(String, i64)]) -> (String, i64) {
 /// Static Large Object middleware: reassembles a manifest object on GET/HEAD.
 ///
 /// The stored manifest object body is a JSON array of segment dicts (`name`
-/// like `"/container/object"`, `bytes`, `hash`, optional `range` `"M-N"`); the
-/// response carries `X-Static-Large-Object: true`. On a plain GET/HEAD (no
-/// `multipart-manifest=get`) this fetches each referenced segment with a
-/// **subrequest** and streams the concatenation, setting `Content-Length` to
-/// the summed segment lengths and `Etag` to the SLO etag.
+/// like `"/container/object"`, `bytes`, `hash`, optional `range` `"M-N"`,
+/// optional `sub_slo`); the response carries `X-Static-Large-Object: true`.
+/// On a plain GET/HEAD (no `multipart-manifest=get`) this expands nested
+/// `sub_slo` manifests (depth ≤ [`MAX_SLO_RECURSION_DEPTH`]), fetches each
+/// leaf segment with a **subrequest**, and streams the concatenation,
+/// setting `Content-Length` to the summed segment lengths and `Etag` to the
+/// SLO etag. A single top-level `Range` uses per-segment ranged subrequests.
 ///
-/// Deferred vs. `slo.py`: nested `sub_slo` GET recursion, inline `data`
-/// segments, the SLO-etag refetch dance, and per-segment range subrequests
-/// (a single top-level `Range` is honoured by slicing the concatenation).
+/// Residual vs. `slo.py` (not claimed): inline `data` PUT segments, the
+/// SLO-etag refetch dance, heartbeat PUT, `multipart-manifest=delete`.
 #[derive(Debug, Default, Clone)]
 pub struct Slo;
 
@@ -179,6 +187,144 @@ struct StoredSeg {
     hash: String,
     range: Option<String>,
     sub_slo: bool,
+}
+
+/// A leaf segment after nested `sub_slo` expansion — ready for a GET
+/// subrequest. `range` is an inclusive `start-end` within the segment object;
+/// `bytes` is this leaf's contribution length (after any range).
+#[derive(Debug, Clone)]
+struct LeafSeg {
+    name: String,
+    bytes: i64,
+    range: Option<String>,
+}
+
+/// Contribution length of a stored segment (range-adjusted when present).
+fn contrib_length(seg: &StoredSeg) -> i64 {
+    if let Some(range) = &seg.range {
+        if let Some((start, end)) = parse_inclusive_range(range) {
+            return (end - start + 1) as i64;
+        }
+    }
+    seg.bytes
+}
+
+/// Parse an inclusive `M-N` range string written into a stored SLO manifest.
+fn parse_inclusive_range(range: &str) -> Option<(u64, u64)> {
+    let (a, b) = range.split_once('-')?;
+    let start = a.parse().ok()?;
+    let end = b.parse().ok()?;
+    if end < start {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// Expand nested `sub_slo` entries into leaf object segments by fetching
+/// submanifests through `next` (post-SLO pipeline — raw stored JSON).
+fn expand_segments(
+    orig: &Request,
+    version: &str,
+    account: &str,
+    segments: &[StoredSeg],
+    next: &NextFn,
+    depth: usize,
+) -> Result<Vec<LeafSeg>, Response> {
+    let mut out = Vec::new();
+    for seg in segments {
+        if seg.sub_slo {
+            if depth >= MAX_SLO_RECURSION_DEPTH {
+                return Err(Response::error(409, "Conflict"));
+            }
+            let path = format!("/{version}/{account}{}", seg.name);
+            let sub = slo_subreq(orig, path.clone(), None);
+            let mut sresp = next(sub);
+            if !(200..300).contains(&sresp.status) {
+                return Err(Response::error(409, "Conflict"));
+            }
+            let body = match sresp.body.materialize(MAX_CONTROL_BODY) {
+                Ok(b) => b,
+                Err(_) => return Err(Response::error(409, "Conflict")),
+            };
+            let Some(sub_segs) = parse_stored_manifest(body) else {
+                return Err(Response::error(409, "Conflict"));
+            };
+            let mut nested = expand_segments(orig, version, account, &sub_segs, next, depth + 1)?;
+            // A ranged sub_slo contributes only a window of the nested aggregate.
+            if let Some(range) = &seg.range {
+                let Some((start, end)) = parse_inclusive_range(range) else {
+                    return Err(Response::error(409, "Conflict"));
+                };
+                nested = slice_leaves_for_range(&nested, start, end + 1)?;
+            }
+            out.extend(nested);
+        } else {
+            let length = contrib_length(seg);
+            if length <= 0 {
+                continue;
+            }
+            out.push(LeafSeg {
+                name: seg.name.clone(),
+                bytes: length,
+                range: seg.range.clone(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Narrow `leaves` to the half-open aggregate window `[first, last_excl)`,
+/// rewriting each surviving leaf's object `range` accordingly.
+fn slice_leaves_for_range(
+    leaves: &[LeafSeg],
+    first: u64,
+    last_excl: u64,
+) -> Result<Vec<LeafSeg>, Response> {
+    if last_excl <= first {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut cursor = 0u64;
+    for leaf in leaves {
+        let len = leaf.bytes.max(0) as u64;
+        let leaf_start = cursor;
+        let leaf_end = cursor + len; // exclusive in aggregate space
+        cursor = leaf_end;
+        if first >= leaf_end || last_excl <= leaf_start {
+            continue;
+        }
+        let take_from = first.max(leaf_start) - leaf_start;
+        let take_to_excl = last_excl.min(leaf_end) - leaf_start;
+        if take_to_excl <= take_from {
+            continue;
+        }
+        // Map aggregate offsets into the segment object's byte space.
+        let (obj_base, obj_end_incl) = if let Some(r) = &leaf.range {
+            let Some((s, e)) = parse_inclusive_range(r) else {
+                return Err(Response::error(409, "Conflict"));
+            };
+            (s, e)
+        } else {
+            (0u64, len.saturating_sub(1))
+        };
+        let obj_start = obj_base + take_from;
+        let obj_last = obj_base + take_to_excl - 1;
+        if obj_last > obj_end_incl {
+            return Err(Response::error(409, "Conflict"));
+        }
+        let contrib = (obj_last - obj_start + 1) as i64;
+        let need_range = obj_start != 0 || obj_last != obj_end_incl || leaf.range.is_some();
+        out.push(LeafSeg {
+            name: leaf.name.clone(),
+            bytes: contrib,
+            range: if need_range {
+                Some(format!("{obj_start}-{obj_last}"))
+            } else {
+                None
+            },
+        });
+    }
+    Ok(out)
 }
 
 fn parse_stored_manifest(json: &[u8]) -> Option<Vec<StoredSeg>> {
@@ -253,16 +399,71 @@ impl Slo {
             return resp;
         }
 
-        // A stored manifest is bounded (max_manifest_size at PUT time); an
-        // unexpectedly huge body cannot be a manifest, so relay it as-is.
-        if resp.body.materialize(MAX_CONTROL_BODY).is_err() {
-            return resp;
-        }
-        // Second materialize is a no-op on the now-buffered body.
-        let manifest_bytes = resp.body.materialize(MAX_CONTROL_BODY).expect("buffered");
-        let Some(segments) = parse_stored_manifest(manifest_bytes) else {
-            // Malformed manifest; hand back what we got.
-            return resp;
+        // Prefer sysmeta aggregate (Python `X-Backend-Etag-Is-At` path): a
+        // HEAD returns an empty body, so we cannot parse the stored JSON.
+        let sys_etag = resp
+            .headers
+            .get(SYSMETA_SLO_ETAG)
+            .map(normalize_etag)
+            .filter(|e| !e.is_empty())
+            .map(str::to_string);
+        let sys_size = resp
+            .headers
+            .get(SYSMETA_SLO_SIZE)
+            .and_then(|s| s.parse::<i64>().ok());
+
+        let is_get = orig.method == "GET";
+
+        // Resolve segments when we need them for streaming, or when sysmeta
+        // is missing (legacy manifests). HEAD with sysmeta skips the body.
+        let (etag, total_len, segments) = if let (Some(e), Some(sz)) = (&sys_etag, sys_size) {
+            if is_get {
+                // Still need the segment listing for reassembly.
+                if resp.body.materialize(MAX_CONTROL_BODY).is_err() {
+                    return resp;
+                }
+                let manifest_bytes = resp.body.materialize(MAX_CONTROL_BODY).expect("buffered");
+                let Some(segments) = parse_stored_manifest(manifest_bytes) else {
+                    return resp;
+                };
+                (e.clone(), sz, segments)
+            } else {
+                (e.clone(), sz, Vec::new())
+            }
+        } else {
+            // No sysmeta: need the manifest body. HEAD → refetch as GET.
+            if !is_get {
+                let mut get_req = orig.clone_head();
+                get_req.method = "GET".to_string();
+                ignore_range(&mut get_req.headers, SLO_HEADER);
+                resp = next(get_req);
+                if !resp
+                    .headers
+                    .get(SLO_HEADER)
+                    .map(config_true_value)
+                    .unwrap_or(false)
+                {
+                    return resp;
+                }
+            }
+            if resp.body.materialize(MAX_CONTROL_BODY).is_err() {
+                return resp;
+            }
+            let manifest_bytes = resp.body.materialize(MAX_CONTROL_BODY).expect("buffered");
+            let Some(segments) = parse_stored_manifest(manifest_bytes) else {
+                return resp;
+            };
+            let slo_segs: Vec<SloSegment> = segments
+                .iter()
+                .map(|s| SloSegment {
+                    hash: s.hash.clone(),
+                    segment_length: contrib_length(s),
+                    range: s.range.clone(),
+                    raw_data: None,
+                })
+                .collect();
+            let (etag, total_len) = slo_etag_and_size(&slo_segs);
+            (etag, total_len, segments)
         };
 
         // version, account from the manifest object's path.
@@ -272,18 +473,6 @@ impl Slo {
         };
         let version = parts[0].clone().unwrap_or_default();
         let account = parts[1].clone().unwrap_or_default();
-
-        // Aggregate size and SLO etag.
-        let slo_segs: Vec<SloSegment> = segments
-            .iter()
-            .map(|s| SloSegment {
-                hash: s.hash.clone(),
-                segment_length: s.bytes,
-                range: s.range.clone(),
-                raw_data: None,
-            })
-            .collect();
-        let (etag, total_len) = slo_etag_and_size(&slo_segs);
 
         // Resolve a single top-level Range against the aggregate length.
         let mut byte_range: Option<(u64, u64)> = None;
@@ -317,30 +506,23 @@ impl Slo {
         headers.set("Etag", etag);
         headers.set("Accept-Ranges", "bytes");
 
-        let is_get = orig.method == "GET";
-
-        // Nested SLOs are not reassembled here (deferred); the manifest is
-        // known up front, so reject before any segment is fetched.
-        if is_get && segments.iter().any(|s| s.sub_slo) {
-            return Response::error(409, "Conflict");
-        }
+        // Expand nested sub_slo manifests before committing the response
+        // status (a depth/parse failure is still a 409 the client can see).
+        let leaves = if is_get {
+            match expand_segments(&orig, &version, &account, &segments, next, 1) {
+                Ok(l) => l,
+                Err(err) => return err,
+            }
+        } else {
+            Vec::new()
+        };
 
         let (status, body, content_len) = if let Some((first, last_excl)) = byte_range {
-            // P1-leftover: still buffered — a ranged SLO GET assembles the
-            // whole concatenation and slices it (per-segment ranged
-            // subrequests are a later pass).
-            let full = if is_get {
-                match self.fetch_segments(&orig, &version, &account, &segments, next) {
-                    Ok(b) => b,
-                    Err(resp) => return resp,
+            let ranged = if is_get {
+                match slice_leaves_for_range(&leaves, first, last_excl) {
+                    Ok(l) => l,
+                    Err(err) => return err,
                 }
-            } else {
-                Vec::new()
-            };
-            let slice = if is_get {
-                let f = first as usize;
-                let l = (last_excl as usize).min(full.len().max(f));
-                full.get(f..l).unwrap_or(&[]).to_vec()
             } else {
                 Vec::new()
             };
@@ -348,16 +530,26 @@ impl Slo {
                 "Content-Range",
                 format!("bytes {}-{}/{}", first, last_excl - 1, total_len.max(0)),
             );
-            (206u16, Body::from(slice), (last_excl - first) as i64)
+            let len = (last_excl - first) as i64;
+            let body = if is_get {
+                Self::leaf_stream_body(
+                    orig.clone_head(),
+                    version.clone(),
+                    account.clone(),
+                    ranged,
+                    Arc::clone(next),
+                    last_excl - first,
+                )
+            } else {
+                Body::empty()
+            };
+            (206u16, body, len)
         } else if is_get {
-            // Lazy segment streaming: each subrequest is issued only when the
-            // client stream reaches that segment; a mid-stream failure aborts
-            // the connection (Python parity — the status is already sent).
-            let body = Self::segment_stream_body(
+            let body = Self::leaf_stream_body(
                 orig.clone_head(),
                 version.clone(),
                 account.clone(),
-                segments,
+                leaves,
                 Arc::clone(next),
                 total_len.max(0) as u64,
             );
@@ -373,21 +565,20 @@ impl Slo {
         out
     }
 
-    /// The lazy SLO reassembly body: a [`FnReader`] that pulls one segment
-    /// subrequest at a time through a cloned `NextFn`. Segment failures
-    /// surface as `io::Error` (the transport aborts the response).
-    fn segment_stream_body(
+    /// Lazy leaf-segment reassembly: each subrequest runs only when the
+    /// client stream reaches that leaf; a mid-stream failure aborts the
+    /// connection (Python parity — the status is already sent).
+    fn leaf_stream_body(
         orig: Request,
         version: String,
         account: String,
-        segments: Vec<StoredSeg>,
+        leaves: Vec<LeafSeg>,
         next: NextFn,
         total_len: u64,
     ) -> Body {
-        let mut queue = segments.into_iter();
+        let mut queue = leaves.into_iter();
         let reader = FnReader::new(move || {
             let seg = queue.next()?;
-            // seg.name is "/container/object"; prefix with /version/account.
             let path = format!("/{version}/{account}{}", seg.name);
             let sub = slo_subreq(&orig, path.clone(), seg.range.as_deref());
             let sresp = next(sub);
@@ -409,7 +600,7 @@ impl Slo {
     /// `X-Static-Large-Object: true` so a later GET can reassemble it. A HEAD
     /// that identifies a segment as an SLO is validated against its aggregate
     /// SLO sysmeta, never the physical manifest JSON object's metadata.
-    /// (Deferred vs. slo.py: inline `data` segments.)
+    /// Residual vs. slo.py: inline `{"data":…}` segments (wontfix P1c).
     fn handle_put(&self, mut req: Request, next: &NextFn) -> Response {
         let manifest_bytes = match req.body.materialize(MAX_MANIFEST_SIZE) {
             Ok(b) => b,
@@ -619,37 +810,61 @@ impl Slo {
         next(req)
     }
 
-    fn fetch_segments(
-        &self,
-        orig: &Request,
-        version: &str,
-        account: &str,
-        segments: &[StoredSeg],
-        next: &NextFn,
-    ) -> Result<Vec<u8>, Response> {
-        let mut body = Vec::new();
-        for seg in segments {
-            if seg.sub_slo {
-                // Nested SLOs are not reassembled here (deferred).
-                return Err(Response::error(409, "Conflict"));
-            }
-            // seg.name is "/container/object"; prefix with /version/account.
-            let path = format!("/{version}/{account}{}", seg.name);
-            let sub = slo_subreq(orig, path, seg.range.as_deref());
-            let sresp = next(sub);
-            if !(200..300).contains(&sresp.status) {
-                return Err(Response::error(409, "Conflict"));
-            }
-            // P1-leftover: still buffered (ranged-GET assembly only).
-            match sresp
-                .body
-                .into_vec(swift_core::constraints::MAX_FILE_SIZE as u64)
-            {
-                Ok(b) => body.extend_from_slice(&b),
-                Err(_) => return Err(Response::error(409, "Conflict")),
-            }
+    /// `?multipart-manifest=get&format=raw`: convert the stored internal
+    /// listing (`name`/`bytes`/`hash`) to the client PUT shape
+    /// (`path`/`size_bytes`/`etag`) so a server-side copy can re-PUT it.
+    fn handle_manifest_get_raw(&self, req: Request, next: &NextFn) -> Response {
+        let mut resp = next(req);
+        let is_slo = resp
+            .headers
+            .get(SLO_HEADER)
+            .map(config_true_value)
+            .unwrap_or(false);
+        if !is_slo {
+            return resp;
         }
-        Ok(body)
+        if resp.body.materialize(MAX_CONTROL_BODY).is_err() {
+            return resp;
+        }
+        let manifest_bytes = resp.body.materialize(MAX_CONTROL_BODY).expect("buffered");
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(manifest_bytes) else {
+            return resp;
+        };
+        let Some(arr) = value.as_array() else {
+            return resp;
+        };
+        let mut raw: Vec<serde_json::Value> = Vec::with_capacity(arr.len());
+        for it in arr {
+            let Some(obj) = it.as_object() else {
+                continue;
+            };
+            if obj.contains_key("data") {
+                raw.push(it.clone());
+                continue;
+            }
+            let mut out = serde_json::Map::new();
+            if let Some(name) = obj.get("name") {
+                out.insert("path".into(), name.clone());
+            }
+            if let Some(bytes) = obj.get("bytes") {
+                out.insert("size_bytes".into(), bytes.clone());
+            }
+            if let Some(hash) = obj.get("hash") {
+                out.insert("etag".into(), hash.clone());
+            }
+            if let Some(range) = obj.get("range") {
+                out.insert("range".into(), range.clone());
+            }
+            // sub_slo / content_type / last_modified intentionally dropped
+            // (Python convert_segment_listing).
+            raw.push(serde_json::Value::Object(out));
+        }
+        let body = serde_json::to_vec(&raw).unwrap_or_default();
+        resp.headers.set("Content-Length", body.len().to_string());
+        resp.headers.set("Etag", manifest_etag(&body));
+        // Keep the large object's Content-Type (Python) so SSC works.
+        resp.body = body.into();
+        resp
     }
 }
 
@@ -663,10 +878,16 @@ impl Middleware for Slo {
         if req.method == "PUT" && mpm.as_deref() == Some("put") {
             return self.handle_put(req, next);
         }
-        // GET/HEAD reassembles, unless ?multipart-manifest=get asks for the raw
-        // manifest.
         let is_get_head = req.method == "GET" || req.method == "HEAD";
-        if is_get_head && mpm.as_deref() != Some("get") {
+        if is_get_head && mpm.as_deref() == Some("get") {
+            // format=raw → client-shaped JSON for server-side copy.
+            if req.param("format").as_deref() == Some("raw") {
+                return self.handle_manifest_get_raw(req, next);
+            }
+            return next(req);
+        }
+        // GET/HEAD reassembles unless ?multipart-manifest=get asked for raw.
+        if is_get_head {
             return self.handle_get_head(req, next);
         }
         next(req)
@@ -757,9 +978,48 @@ mod tests {
         Arc::new(move |req: Request| {
             for (m, p, status, headers, body) in routes.iter() {
                 if &req.method == m && &req.path == p {
-                    let mut out = Response::new(*status);
+                    // Object-server parity: ignore Range when the ignore-range
+                    // header names metadata this response carries (SLO
+                    // manifests must return the full JSON).
+                    let ignore = req
+                        .headers
+                        .get(IGNORE_RANGE_HDR)
+                        .map(|v| {
+                            v.split(',')
+                                .any(|n| headers.get(n.trim()).is_some())
+                        })
+                        .unwrap_or(false);
+                    let (status, slice) = if !ignore {
+                        if let Some(rh) = req.headers.get("Range") {
+                            if let Ok(parsed) = Range::parse(rh) {
+                                if let Some(ranges) =
+                                    parsed.ranges_for_length(Some(body.len() as u64))
+                                {
+                                    if ranges.len() == 1 {
+                                        let (a, b) = ranges[0];
+                                        let slice = body
+                                            .get(a as usize..b as usize)
+                                            .unwrap_or(&[])
+                                            .to_vec();
+                                        (206u16, slice)
+                                    } else {
+                                        (*status, body.clone())
+                                    }
+                                } else {
+                                    (*status, body.clone())
+                                }
+                            } else {
+                                (*status, body.clone())
+                            }
+                        } else {
+                            (*status, body.clone())
+                        }
+                    } else {
+                        (*status, body.clone())
+                    };
+                    let mut out = Response::new(status);
                     out.headers = headers.clone();
-                    out.body = body.clone().into();
+                    out.body = slice.into();
                     return out;
                 }
             }
@@ -860,5 +1120,148 @@ mod tests {
         let err = reader.read_to_end(&mut out).unwrap_err();
         assert!(err.to_string().contains("/v1/a/c/missing"), "{err}");
         assert_eq!(out, b"one");
+    }
+
+    #[test]
+    fn test_slo_nested_sub_slo_get() {
+        // Outer manifest references an inner SLO (sub_slo=true); GET must
+        // expand the submanifest and stream leaf bytes.
+        let inner_json = serde_json::to_vec(&serde_json::json!([
+            {"name": "/c/a", "bytes": 2, "hash": md5_hex(b"aa")},
+            {"name": "/c/b", "bytes": 2, "hash": md5_hex(b"bb")},
+        ]))
+        .unwrap();
+        let outer_json = serde_json::to_vec(&serde_json::json!([
+            {
+                "name": "/c/inner",
+                "bytes": 4,
+                "hash": md5_hex(format!("{}{}", md5_hex(b"aa"), md5_hex(b"bb")).as_bytes()),
+                "sub_slo": true
+            },
+            {"name": "/c/c", "bytes": 2, "hash": md5_hex(b"cc")},
+        ]))
+        .unwrap();
+        let mut outer = Response::with_body(200, outer_json);
+        outer.headers.set("X-Static-Large-Object", "True");
+        outer.headers.set("Content-Type", "text/plain");
+        let mut inner = Response::with_body(200, inner_json);
+        inner.headers.set("X-Static-Large-Object", "True");
+        let be = backend(vec![
+            ("GET", "/v1/a/c/outer", outer),
+            ("GET", "/v1/a/c/inner", inner),
+            ("GET", "/v1/a/c/a", Response::with_body(200, b"aa".to_vec())),
+            ("GET", "/v1/a/c/b", Response::with_body(200, b"bb".to_vec())),
+            ("GET", "/v1/a/c/c", Response::with_body(200, b"cc".to_vec())),
+        ]);
+        let mut resp = Slo::new().handle(slo_get("/v1/a/c/outer", None), &be);
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_of(&mut resp), b"aabbcc");
+        assert_eq!(resp.headers.get("Content-Length"), Some("6"));
+    }
+
+    #[test]
+    fn test_slo_range_uses_per_segment_range() {
+        // Ranged GET must issue a Range on the intersecting segment only.
+        use std::sync::{Arc, Mutex};
+        let log = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let log2 = log.clone();
+        let manifest_json = serde_json::to_vec(&serde_json::json!([
+            {"name": "/c/s1", "bytes": 3, "hash": md5_hex(b"one")},
+            {"name": "/c/s2", "bytes": 3, "hash": md5_hex(b"two")},
+        ]))
+        .unwrap();
+        let be: NextFn = Arc::new(move |req: Request| {
+            if req.method == "GET" && req.path == "/v1/a/c/manifest" {
+                let mut manifest = Response::with_body(200, manifest_json.clone());
+                manifest.headers.set("X-Static-Large-Object", "True");
+                return manifest;
+            }
+            let range = req.headers.get("Range").map(str::to_string);
+            log2.lock().unwrap().push((req.path.clone(), range.clone()));
+            match req.path.as_str() {
+                "/v1/a/c/s1" => Response::with_body(200, b"one".to_vec()),
+                "/v1/a/c/s2" => {
+                    // bytes=0-0 of "two" → "t"
+                    if range.as_deref() == Some("bytes=0-0") {
+                        Response::with_body(206, b"t".to_vec())
+                    } else {
+                        Response::with_body(200, b"two".to_vec())
+                    }
+                }
+                _ => Response::new(404),
+            }
+        });
+        // "onetwo"[3..4] = "t" → only s2 with bytes=0-0
+        let mut resp = Slo::new().handle(slo_get("/v1/a/c/manifest", Some("bytes=3-3")), &be);
+        assert_eq!(resp.status, 206);
+        assert_eq!(body_of(&mut resp), b"t");
+        let calls = log.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "/v1/a/c/s2");
+        assert_eq!(calls[0].1.as_deref(), Some("bytes=0-0"));
+    }
+
+    #[test]
+    fn test_slo_head_uses_sysmeta_not_manifest_length() {
+        // HEAD body is empty; Content-Length/Etag must come from SLO sysmeta.
+        let be: NextFn = Arc::new(|req: Request| {
+            assert_eq!(req.method, "HEAD");
+            let mut resp = Response::new(200);
+            resp.headers.set("X-Static-Large-Object", "True");
+            resp.headers.set("Content-Length", "159"); // physical manifest
+            resp.headers.set("Etag", "manifestmd5xxxxxxxxxxxxxxxxxxxx");
+            resp.headers.set(SYSMETA_SLO_ETAG, "aabbccddeeff00112233445566778899");
+            resp.headers.set(SYSMETA_SLO_SIZE, "6");
+            resp.headers.set("Content-Type", "text/plain");
+            resp
+        });
+        let req = Request {
+            method: "HEAD".to_string(),
+            path: "/v1/a/c/manifest".to_string(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let resp = Slo::new().handle(req, &be);
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("Content-Length"), Some("6"));
+        assert_eq!(
+            resp.headers.get("Etag"),
+            Some("aabbccddeeff00112233445566778899")
+        );
+    }
+
+    #[test]
+    fn test_multipart_manifest_get_format_raw() {
+        let stored = serde_json::to_vec(&serde_json::json!([
+            {"name": "/c/s1", "bytes": 3, "hash": "abc", "sub_slo": false},
+            {"name": "/c/s2", "bytes": 4, "hash": "def", "range": "0-1"},
+        ]))
+        .unwrap();
+        let be: NextFn = Arc::new(move |req: Request| {
+            assert!(req.query_string.contains("multipart-manifest=get"));
+            let mut resp = Response::with_body(200, stored.clone());
+            resp.headers.set("X-Static-Large-Object", "True");
+            resp.headers.set("Content-Type", "application/json");
+            resp
+        });
+        let req = Request {
+            method: "GET".to_string(),
+            path: "/v1/a/c/manifest".to_string(),
+            query_string: "multipart-manifest=get&format=raw".to_string(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let mut resp = Slo::new().handle(req, &be);
+        assert_eq!(resp.status, 200);
+        let body = body_of(&mut resp);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr[0]["path"], "/c/s1");
+        assert_eq!(arr[0]["size_bytes"], 3);
+        assert_eq!(arr[0]["etag"], "abc");
+        assert!(arr[0].get("sub_slo").is_none());
+        assert_eq!(arr[1]["path"], "/c/s2");
+        assert_eq!(arr[1]["range"], "0-1");
     }
 }

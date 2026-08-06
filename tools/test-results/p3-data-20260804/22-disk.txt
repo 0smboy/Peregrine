@@ -1,0 +1,6 @@
+swift1
+/dev/sda4        40G   19G   22G  47% /
+/dev/sda5        50G   50G   24K 100% /srv/node/d1
+swift4
+/dev/sda4        40G  8.8G   32G  22% /
+/dev/sda5        50G   46G  4.9G  91% /srv/node/d1

@@ -1,0 +1,5 @@
+w3-s3-l3b-live: PARTIAL
+unit_stop_line: PASS
+contabo_live: BLOCKED (VIP /info unhealthy 2026-08-05)
+keep_4kb: NOT_CLAIMED
+production_go_live: NOT_CLAIMED

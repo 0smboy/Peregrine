@@ -1,0 +1,2 @@
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda6        50G   45G  5.1G  90% /srv/node/d2

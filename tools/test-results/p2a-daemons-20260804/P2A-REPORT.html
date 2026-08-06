@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>P2a Daemons — GREEN</title>
+<style>
+  :root { --ink:#1a1a1a; --muted:#555; --ok:#1b6b2a; --bg:#f7f5f0; --card:#fff; }
+  body { font-family: ui-sans-serif, system-ui, sans-serif; margin:0; background:var(--bg); color:var(--ink); line-height:1.45; }
+  main { max-width:920px; margin:0 auto; padding:32px 20px 64px; }
+  h1 { font-size:1.75rem; margin:0 0 8px; }
+  .verdict { display:inline-block; background:var(--ok); color:#fff; padding:4px 12px; font-weight:700; letter-spacing:.04em; }
+  .meta { color:var(--muted); margin:12px 0 28px; }
+  section { background:var(--card); padding:20px 22px; margin:0 0 18px; border:1px solid #e2ddd3; }
+  h2 { font-size:1.1rem; margin:0 0 12px; }
+  table { width:100%; border-collapse:collapse; font-size:.95rem; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid #ebe6dc; vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  code { font-family: ui-monospace, Menlo, monospace; font-size:.88em; }
+  ul { margin:8px 0 0; padding-left:1.2em; }
+  .ok { color:var(--ok); font-weight:700; }
+</style>
+</head>
+<body>
+<main>
+  <p class="verdict">GREEN</p>
+  <h1>P2a — Production daemons</h1>
+  <p class="meta">2026-08-04 · Contabo VIP <code>10.0.0.10:8085</code> · evidence
+    <code>tools/test-results/p2a-daemons-20260804/</code></p>
+
+  <section>
+    <h2>1. What this cycle did</h2>
+    <ul>
+      <li>Shipped four background daemons as production services: binary + bundle-rust payload + systemd (<code>Restart=on-failure</code>, <code>TimeoutStopSec=180</code>) + conf parse.</li>
+      <li><code>swift-object-expirer</code> — drains <code>.expiring_objects</code>; DELETE with <code>X-If-Delete-At</code>.</li>
+      <li><code>swift-account-reaper</code> — reaps status=DELETED accounts after <code>delay_reaping</code>.</li>
+      <li><code>swift-container-reconciler</code> — drains <code>.misplaced_objects</code> queue.</li>
+      <li><code>swift-container-updater</code> — reports container stats to account ring (was coded; now in payload/systemd).</li>
+      <li>Deployed to Contabo swift1–4; no wipe of <code>/srv/node</code>.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>2. Optimized / fixed / demoted</h2>
+    <ul>
+      <li><strong>Fixed deploy gap:</strong> container-updater binary existed but was absent from systemd/payload before this wave.</li>
+      <li><strong>Fixed stop hangs:</strong> long updater sweeps were SIGKILL'd at 90s; units now use <code>TimeoutStopSec=180</code>.</li>
+      <li><strong>Expirer E2E:</strong> proven hard-delete (journal <code>expired&gt;=1</code> + on-disk <code>.data</code> removed), not only soft GET 404.</li>
+      <li><strong>Demoted / residual:</strong> reseller account-purge E2E and multi-policy reconciler inject → backlog, not blockers.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>3. Measured effect</h2>
+    <table>
+      <tr><th>Metric</th><th>Before</th><th>After</th></tr>
+      <tr><td>P2a systemd units on Contabo</td><td>0 / 4 daemons</td><td>4 / 4 active on all nodes</td></tr>
+      <tr><td>Expire queue consumer</td><td>library only</td><td>live daemon; suite saw <code>expired=2</code></td></tr>
+      <tr><td>CORE-PATH func</td><td>54/54 (P1c)</td><td>54/54 (no regress)</td></tr>
+      <tr><td>Root disk use</td><td>~same cluster</td><td>~49% (acceptable; no wipe)</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>4. Gate results</h2>
+    <table>
+      <tr><th>Gate</th><th>Result</th><th>Evidence</th></tr>
+      <tr><td>Lib unit tests</td><td class="ok">20/20</td><td><code>07-cargo-lib-units.txt</code></td></tr>
+      <tr><td>P2a specialty suite VIP</td><td class="ok">21/21</td><td><code>21-p2a-suite.txt</code></td></tr>
+      <tr><td>Expirer hard-delete</td><td class="ok">PASS</td><td><code>16-expire-hard-verify.txt</code></td></tr>
+      <tr><td>Unit matrix ×4 nodes</td><td class="ok">PASS</td><td><code>06-verify-units.txt</code>, suite</td></tr>
+      <tr><td>CORE-PATH func VIP</td><td class="ok">54/54</td><td><code>22-func-suite-vip.txt</code></td></tr>
+      <tr><td>Disk / no wipe</td><td class="ok">OK</td><td><code>23-disk-pressure.txt</code></td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>5. Remaining / next cycle</h2>
+    <ul>
+      <li><strong>FROZEN this wave:</strong> P2b auditor continuity, P2c <code>servers_per_port</code>, P3 tracks.</li>
+      <li><strong>Backlog:</strong> reseller account-reaper purge E2E; multi-policy reconciler inject; proxy <code>X-Delete-At-Host</code> sync enqueue (async path works today).</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

@@ -1,0 +1,6 @@
+['bind_ip = 10.0.0.2', 'bind_port = 8090', 'pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth copy slo dlo proxy-server']
+LISTEN 0      4096       127.0.0.1:6312       0.0.0.0:*    users:(("swift-account-s",pid=437810,fd=8),("swift-account-s",pid=437477,fd=8))
+LISTEN 0      4096       127.0.0.1:6312       0.0.0.0:*    users:(("swift-account-s",pid=437809,fd=6),("swift-account-s",pid=437477,fd=6))
+LISTEN 0      4096       127.0.0.1:6311       0.0.0.0:*    users:(("swift-container",pid=437827,fd=8),("swift-container",pid=437478,fd=8))
+LISTEN 0      4096       127.0.0.1:6311       0.0.0.0:*    users:(("swift-container",pid=437826,fd=6),("swift-container",pid=437478,fd=6))
+py_health=000

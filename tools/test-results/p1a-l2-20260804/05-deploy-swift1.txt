@@ -1,0 +1,11 @@
+patched /etc/swift/proxy-server.conf
+['pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl tempauth copy slo dlo proxy-logging proxy-server', '[filter:proxy-logging]', '[filter:cache]', '[filter:listing_formats]', '[filter:bulk]', '[filter:tempurl]', '[filter:tempauth]']
+active
+health=200
+bulk_delete True
+tempurl True
+account_acls {'account_acls': True}
+no_upload True
+Aug 04 13:38:12 swift1 proxy-server[3985384]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl tempauth copy slo dlo proxy-logging proxy-server
+Aug 04 13:38:12 swift1 proxy-server[3985384]: INFO bulk enabled (delete; max_deletes_per_request=10000)
+Aug 04 13:38:12 swift1 proxy-server[3985384]: INFO tempurl enabled

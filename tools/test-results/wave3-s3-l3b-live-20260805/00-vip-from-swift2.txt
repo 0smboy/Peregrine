@@ -1,0 +1,23 @@
+UTC=2026-08-05T10:00:57Z
+    inet 10.0.0.10/22 scope global secondary eth1
+=== https /info ===
+code=200 bytes=1270 err=
+1270 /tmp/info.b
+keys ['account_quotas', 'bulk_delete', 'container_quotas', 'dlo', 'formpost', 'keystoneauth', 'slo', 'staticweb', 'swift', 'symlink', 'tempauth', 'tempurl', 'versioned_writes']
+tempauth True
+keystoneauth True
+s3api False
+=== health ===
+hc=200
+=== local :8080 ===
+p=200
+proxy_keys ['account_quotas', 'bulk_delete', 'container_quotas', 'dlo', 'formpost', 'keystoneauth', 'slo', 'staticweb', 'swift', 'symlink', 'tempauth', 'tempurl', 'versioned_writes']
+=== tempauth testing ===
+ta=401
+HTTP/2 401 
+=== tempauth azure ===
+ta2=200
+=== keystone /v3 ===
+ks=200
+{"version": {"id": "v3.14", "status": "stable", "updated": "2020-04-07T00:00:00Z", "links": [{"rel": "self", "href": "http://10.0.0.10:5000/v3/"}], "media-types": [{"base": "applic
+DONE

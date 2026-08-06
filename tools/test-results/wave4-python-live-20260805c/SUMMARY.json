@@ -1,0 +1,25 @@
+{
+  "wave": "w4-python-live",
+  "pack": "wave4-python-live-20260805c",
+  "timestamp_utc": "20260805T112200Z",
+  "verdict": "BLOCKED",
+  "python_cluster": "ABSENT",
+  "production_go_live": false,
+  "gates": {
+    "disk_use_lt_70": "PASS",
+    "disk_use_lt_50": "PASS",
+    "meta_lab_clean": "PASS",
+    "port_disk_isolation": "FAIL",
+    "migrate_executed": "NO",
+    "install_3node": "BLOCKED",
+    "node_4": "N/A"
+  },
+  "rings": {
+    "account": {"devices": ["d1"], "ports": [6202]},
+    "container": {"devices": ["d1"], "ports": [6201]},
+    "object": {"devices": ["d1", "d2", "d3"], "ports": [6210, 6211, 6212]}
+  },
+  "migrate_decision": "BLOCKED_UNSAFE_MID_IDENTITY",
+  "vip_healthcheck": 200,
+  "next": "05-OPERATOR-MIGRATE-STEPS.md then INSTALL-PLAN.md"
+}

@@ -1,0 +1,6 @@
+will_push 10.0.4.3
+will_push 10.0.4.4
+-rw-r--r--. 1 root root 254 Aug  5 11:52 account.ring.gz
+-rw-r--r--. 1 root root 255 Aug  5 11:52 container.ring.gz
+-rw-r--r--. 1 root root 252 Aug  5 11:53 object.ring.gz
+-rw-r--r--. 1 root root 179 Aug  5 11:52 swift.conf

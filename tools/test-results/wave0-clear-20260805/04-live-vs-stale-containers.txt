@@ -1,0 +1,4 @@
+containers_in_account 989
+live_containers 26 gone_404 963 live_object_sum 128
+samples_live [('p1b-21784', 0), ('p1b-28970', 0), ('p1b-4164', 0), ('p1b-4803', 0), ('p1b-s-19427', 1), ('p1b-s-20570', 1), ('p1c-18386', 10), ('p1c-379', 9), ('p1c-4756', 9), ('p1c-9516', 10)]
+samples_gone [('autocos1026990a1', 404, 25), ...]

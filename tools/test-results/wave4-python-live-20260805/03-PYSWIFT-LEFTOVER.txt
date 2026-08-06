@@ -1,0 +1,39 @@
+## pyswift conf ports
+/etc/pyswift/account-server.conf:2:devices = /srv/node/d1/pysaio
+/etc/pyswift/account-server.conf:8:bind_port = 6312
+/etc/pyswift/container-server.conf:2:devices = /srv/node/d1/pysaio
+/etc/pyswift/container-server.conf:8:bind_port = 6311
+/etc/pyswift/object-server.conf:2:devices = /srv/node/d1/pysaio
+/etc/pyswift/object-server.conf:8:bind_port = 6310
+/etc/pyswift/proxy-server.conf:3:bind_port = 8090
+## listeners
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=808820,fd=5))                                      
+LISTEN 0      4096        10.0.0.2:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=439060,fd=18),("swift-proxy-ser",pid=438908,fd=18))
+LISTEN 0      4096        10.0.0.2:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=439059,fd=16),("swift-proxy-ser",pid=438908,fd=16))
+LISTEN 0      128          0.0.0.0:6202       0.0.0.0:*    users:(("swift-account-s",pid=2040794,fd=5))                                     
+LISTEN 0      128          0.0.0.0:6201       0.0.0.0:*    users:(("swift-container",pid=808827,fd=5))                                      
+LISTEN 0      128          0.0.0.0:6200       0.0.0.0:*    users:(("swift-object-se",pid=746199,fd=5))                                      
+## rings under pyswift
+-rw-r--r--. 1 root root 9911 Aug  3 05:32 /etc/pyswift/account.builder
+-rw-r--r--. 1 root root 1482 Aug  3 05:32 /etc/pyswift/account.ring.gz
+-rw-r--r--. 1 root root 9911 Aug  3 05:32 /etc/pyswift/container.builder
+-rw-r--r--. 1 root root 1473 Aug  3 05:32 /etc/pyswift/container.ring.gz
+-rw-r--r--. 1 root root 9911 Aug  3 05:32 /etc/pyswift/object-1.builder
+-rw-r--r--. 1 root root 1483 Aug  3 05:32 /etc/pyswift/object-1.ring.gz
+-rw-r--r--. 1 root root 9911 Aug  3 05:32 /etc/pyswift/object.builder
+-rw-r--r--. 1 root root 1496 Aug  3 05:32 /etc/pyswift/object.ring.gz
+## health
+pyswift8090=200
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=UTF-8
+X-Auth-Token: AUTH_tk8a131ec26ab74bd49f5fb2713fb11bf0
+X-Storage-Token: AUTH_tk8a131ec26ab74bd49f5fb2713fb11bf0
+X-Auth-Token-Expires: 86399
+X-Storage-Url: http://10.0.0.2:8090/v1/AUTH_test
+Content-Length: 0
+X-Trans-Id: tx8ac1bf60bd3e4cfeaea85-006a72e948
+X-Openstack-Request-Id: tx8ac1bf60bd3e4cfeaea85-006a72e948
+Date: Wed, 05 Aug 2026 07:42:00 GMT
+
+## NOT a 3-node cluster proof
+swift3/4 have no 8090; openstack-swift RPM absent; this is single-node pyswift leftover on swift2

@@ -1,0 +1,32 @@
+=== 169.58.108.85 ===
+swift1
+-rwxr-xr-x. 2 root root 2147096 Aug  4 15:13 /root/work/swift-rust/target/release/swift-object-server
+/root/.cargo/bin/cargo
+/root/.cargo/bin/cargo
+/root/.cargo/bin/rustc
+/root/work/swift-rust/crates/swift-object-server/src/servers_per_port.rs
+/usr/local/bin/swift-object-server: Mach-O 64-bit arm64 executable, flags:<NOUNDEFS|DYLDLINK|TWOLEVEL|PIE|HAS_TLV_DESCRIPTORS>
+=== 169.58.108.86 ===
+swift2
+ls: cannot access '/root/work/swift-rust/target/release/swift-object-server': No such file or directory
+ls: cannot access '/root/.cargo/bin/cargo': No such file or directory
+/usr/bin/which: no cargo in (/root/.local/bin:/root/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin)
+/usr/bin/which: no rustc in (/root/.local/bin:/root/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin)
+ls: cannot access '/root/work/swift-rust/crates/swift-object-server/src/servers_per_port.rs': No such file or directory
+/usr/local/bin/swift-object-server: Mach-O 64-bit arm64 executable, flags:<NOUNDEFS|DYLDLINK|TWOLEVEL|PIE|HAS_TLV_DESCRIPTORS>
+=== 169.58.108.87 ===
+swift3
+-rwxr-xr-x. 2 root root 1802904 Aug  2 07:29 /root/work/swift-rust/target/release/swift-object-server
+ls: cannot access '/root/.cargo/bin/cargo': No such file or directory
+/usr/bin/which: no cargo in (/root/.local/bin:/root/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin)
+/usr/bin/which: no rustc in (/root/.local/bin:/root/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin)
+ls: cannot access '/root/work/swift-rust/crates/swift-object-server/src/servers_per_port.rs': No such file or directory
+/usr/local/bin/swift-object-server: Mach-O 64-bit arm64 executable, flags:<NOUNDEFS|DYLDLINK|TWOLEVEL|PIE|HAS_TLV_DESCRIPTORS>
+=== 169.58.108.121 ===
+swift4
+ls: cannot access '/root/work/swift-rust/target/release/swift-object-server': No such file or directory
+ls: cannot access '/root/.cargo/bin/cargo': No such file or directory
+/usr/bin/which: no cargo in (/root/.local/bin:/root/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin)
+/usr/bin/which: no rustc in (/root/.local/bin:/root/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin)
+ls: cannot access '/root/work/swift-rust/crates/swift-object-server/src/servers_per_port.rs': No such file or directory
+/usr/local/bin/swift-object-server: Mach-O 64-bit arm64 executable, flags:<NOUNDEFS|DYLDLINK|TWOLEVEL|PIE|HAS_TLV_DESCRIPTORS>

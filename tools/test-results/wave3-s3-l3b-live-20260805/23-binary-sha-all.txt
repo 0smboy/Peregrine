@@ -1,0 +1,13 @@
+UTC=2026-08-05T10:07:27Z
+swift1 5f3ded5e4ce24b2a5e868362aa0d9746a9dd247d9742a175dfcac01a9cb7cf48  /usr/local/bin/swift-proxy-server
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+inactive
+swift2 5f3ded5e4ce24b2a5e868362aa0d9746a9dd247d9742a175dfcac01a9cb7cf48  /usr/local/bin/swift-proxy-server
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+inactive
+swift3 5f3ded5e4ce24b2a5e868362aa0d9746a9dd247d9742a175dfcac01a9cb7cf48  /usr/local/bin/swift-proxy-server
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+inactive
+swift4 5f3ded5e4ce24b2a5e868362aa0d9746a9dd247d9742a175dfcac01a9cb7cf48  /usr/local/bin/swift-proxy-server
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+inactive

@@ -1,0 +1,29 @@
+active
+wait 1 n=0
+active
+wait 2 n=0
+active
+wait 3 n=0
+active
+wait 4 n=0
+active
+wait 5 n=0
+active
+wait 6 n=0
+active
+wait 7 n=0
+active
+wait 8 n=0
+active
+wait 9 n=0
+active
+wait 10 n=0
+active
+wait 11 n=0
+active
+wait 12 n=0
+active
+Aug 04 15:10:49 swift1 object-auditor[277432]: INFO swift-object-auditor: devices=/srv/node mount_check=false interval=30s policies=2 once=false
+Aug 04 15:11:28 swift1 object-auditor[283215]: INFO swift-object-auditor: devices=/srv/node mount_check=false interval=30s policies=2 once=true
+Aug 04 15:19:13 swift1 object-auditor[335143]: INFO swift-object-auditor: devices=/srv/node mount_check=false interval=30s policies=2 once=false
+Aug 04 15:19:28 swift1 object-auditor[337314]: INFO swift-object-auditor: devices=/srv/node mount_check=false interval=30s policies=2 once=false

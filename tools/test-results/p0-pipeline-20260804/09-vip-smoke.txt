@@ -1,0 +1,19 @@
+vip_health=200
+auth_token_len=149
+put_c=201
+put_o=201
+get_o=200
+list_json code=200 ctype=application/json; charset=utf-8 bytes=152
+[{"bytes": 22, "hash": "f1eb838d981a2d196fc7b07e444049e9", "name": "obj1", "content_type": "text/plain", "last_modified"
+list_plain code=200 ctype=text/plain; charset=utf-8 bytes=5
+obj1
+
+list_xml code=200 ctype=application/xml; charset=utf-8 bytes=268
+<?xml version="1.0" encoding="UTF-8"?>
+<container name="p0pipe"><object><name>obj1</name><hash>f1eb838d981a2d196fc7b07e4
+s1_8080=200
+s2_8080=200
+s3_8080=200
+s4_8080=200
+acct_json=200
+DONE

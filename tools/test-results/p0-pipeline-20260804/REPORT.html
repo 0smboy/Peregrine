@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>P0 Pipeline Foundation — 2026-08-04</title>
+<style>
+body{font:15px/1.45 system-ui,sans-serif;margin:2rem;max-width:960px;color:#1a1a1a;background:#faf9f7}
+h1{font-size:1.4rem;margin:0 0 .5rem}
+h2{font-size:1.1rem;margin:1.6rem 0 .5rem;border-bottom:1px solid #ddd;padding-bottom:.3rem}
+table{border-collapse:collapse;width:100%;margin:.6rem 0 1rem}
+th,td{border:1px solid #ccc;padding:.4rem .55rem;text-align:left;vertical-align:top}
+th{background:#eee}
+.ok{color:#0a6b2d;font-weight:600}
+.warn{color:#8a5a00;font-weight:600}
+.bad{color:#a11;font-weight:600}
+code,pre{font:13px/1.35 ui-monospace,Menlo,monospace;background:#f0eeea}
+pre{padding:.7rem;overflow:auto;border:1px solid #ddd}
+.meta{color:#555;font-size:.92rem}
+</style>
+</head>
+<body>
+<h1>P0 — 管道地基（pipeline foundation）</h1>
+<p class="meta">Date: 2026-08-04 · Branch: <code>build/phase1-deploy-rs-lb</code> · Evidence: <code>tools/test-results/p0-pipeline-20260804/</code><br/>
+Roadmap: <code>docs/fairness-lab/PRODUCTION-GAP-ROADMAP.md</code> · Plan file not edited.</p>
+
+<h2>1) What this cycle did</h2>
+<ul>
+<li>Froze waves/gates into <code>PRODUCTION-GAP-ROADMAP.md</code>.</li>
+<li>Wired <code>proxy_logging</code> (logger sink), <code>cache</code> (MemcacheClient), <code>listing_formats</code> into <code>build_configured_filters</code> — no longer silent-skip.</li>
+<li>Updated <code>bundle-rust</code> <code>proxy-server.conf.j2</code> to Python-aligned thin+cache pipeline.</li>
+<li>Updated CONTRACTS / blocked / CONFIG-PARITY honestly (info cache still in-process).</li>
+<li>Built release proxy on Contabo; deployed binary+pipeline to swift1–4; restarted <code>swift-proxy</code> only (no <code>/srv/node</code> wipe).</li>
+<li>Brought dual SAIO up <em>alongside</em> cluster (ports 8090/8081) without running phase-1a stop-cluster.</li>
+</ul>
+
+<h2>2) What was optimized / fixed</h2>
+<table>
+<tr><th>Item</th><th>Before</th><th>After</th></tr>
+<tr><td><code>cache</code> / <code>listing_formats</code> / <code>proxy_logging</code></td><td>silent-skip</td><td class="ok">enabled + startup notes</td></tr>
+<tr><td>Default pipeline (bundle-rust + live cluster)</td><td>tempauth copy slo dlo</td><td class="ok">thin+cache (same string as Py SAIO)</td></tr>
+<tr><td>Listing <code>format=</code> json/plain/xml</td><td>backend-only / skipped MW</td><td class="ok">middleware wired; VIP verified</td></tr>
+<tr><td>proxy access log</td><td>no Swift-format sink</td><td class="ok">Logger sink emits Swift line</td></tr>
+</table>
+
+<h2>3) Measured effect</h2>
+<pre>Same pipeline string everywhere:
+catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth copy slo dlo proxy-server
+
+Startup (each node):
+  proxy_logging enabled (logger sink)
+  cache enabled (memcache_servers=10.0.0.N:11211)
+  listing_formats enabled</pre>
+
+<h2>4) Gate results</h2>
+<table>
+<tr><th>Gate</th><th>Result</th><th>Evidence</th></tr>
+<tr><td>Unit: swift-middleware + swift-proxy-server</td><td class="ok">PASS (325+10+integration)</td><td>local <code>cargo test</code></td></tr>
+<tr><td>Pipeline name parity (Py SAIO / Rs SAIO / cluster)</td><td class="ok">IDENTICAL</td><td><code>14-pipeline-parity.txt</code></td></tr>
+<tr><td>Python SAIO func-suite</td><td class="warn">53/54 (account HEAD 200≠204)</td><td><code>15-func-suite-dual.txt</code></td></tr>
+<tr><td>Rust SAIO func-suite</td><td class="ok">54/54</td><td><code>19-func-rsaio-ec.txt</code> (EC object binary)</td></tr>
+<tr><td>Cluster VIP func-suite</td><td class="ok">54/54</td><td><code>15-func-suite-dual.txt</code></td></tr>
+<tr><td>VIP auth + CRUD + listing formats</td><td class="ok">PASS</td><td><code>09-vip-smoke.txt</code></td></tr>
+<tr><td>HAProxy backends s1–s4 :8080 health</td><td class="ok">200×4</td><td><code>09-vip-smoke.txt</code></td></tr>
+<tr><td>Unknown L2 still skip (bulk…)</td><td class="ok">unit covered</td><td><code>pipeline_p0_filters_wire_and_l2_still_skips</code></td></tr>
+</table>
+
+<p><strong>P0 gate verdict:</strong> <span class="ok">GREEN</span> for Rust path (SAIO 54/54 + VIP 54/54 + same pipeline).
+Python SAIO remains <span class="warn">WARN</span> on a single HEAD status (200 vs expected 204) — not a Rust wiring miss; CORE-PATH label still applies.
+Honest residual: shared memcache-backed <em>info</em> cache still in-process (<code>InfoCache</code>); filter holds live client.</p>
+
+<h2>5) Remaining / next</h2>
+<table>
+<tr><th>Item</th><th>Label</th></tr>
+<tr><td>P1a: bulk / tempurl / account ACL / ratelimit deployable</td><td>backlog (do not start until this HTML accepted)</td></tr>
+<tr><td>memcache-backed ProxyApp info cache</td><td>FROZEN follow (post-P0 honesty)</td></tr>
+<tr><td>Python account HEAD 200 vs 204 on SAIO</td><td>WARN / investigate if claiming Py 54/54</td></tr>
+<tr><td>P2/P3 tracks</td><td>FROZEN per roadmap</td></tr>
+</table>
+
+<h2>Evidence index</h2>
+<pre>00-START.txt … 19-func-rsaio-ec.txt
+07/08 deploy journals · 09 VIP smoke · 14 pipeline parity · 15/19 func-suite</pre>
+</body>
+</html>

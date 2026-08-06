@@ -1,0 +1,21 @@
+swift1 bins installed
+ADDED [object-expirer] to /etc/swift/object-server.conf
+ADDED [account-reaper] to /etc/swift/account-server.conf
+ADDED [container-updater] to /etc/swift/container-server.conf
+ADDED [container-reconciler] to /etc/swift/container-server.conf
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-object-expirer.service → /etc/systemd/system/swift-object-expirer.service.
+active
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-account-reaper.service → /etc/systemd/system/swift-account-reaper.service.
+active
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-container-updater.service → /etc/systemd/system/swift-container-updater.service.
+active
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-container-reconciler.service → /etc/systemd/system/swift-container-reconciler.service.
+active
+swift1 units active
+active
+active
+active
+active
+===== fanout 10.0.0.12 =====
+ssh: connect to host 10.0.0.12 port 22: No route to host
+scp: Connection closed

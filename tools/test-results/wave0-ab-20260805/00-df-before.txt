@@ -1,0 +1,20 @@
+swift1
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   48G  2.6G  95% /srv/node/d1
+/dev/sda6        50G   45G  5.1G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.6G  89% /srv/node/d3
+swift2
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   45G  5.6G  89% /srv/node/d1
+/dev/sda6        50G   45G  5.3G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.2G  90% /srv/node/d3
+swift3
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   48G  2.7G  95% /srv/node/d1
+/dev/sda6        50G   45G  5.9G  89% /srv/node/d2
+/dev/sda7        50G   45G  5.6G  89% /srv/node/d3
+swift4
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   44G  6.3G  88% /srv/node/d1
+/dev/sda6        50G   46G  5.0G  91% /srv/node/d2
+/dev/sda7        50G   45G  5.5G  90% /srv/node/d3

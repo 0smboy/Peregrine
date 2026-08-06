@@ -1,0 +1,23 @@
+===== deploy swift1 =====
+--- pipeline ---
+# Managed by P0 pipeline foundation deploy (2026-08-04)
+# P0 thin+cache pipeline (2026-08-04)
+[pipeline:main]
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth copy slo dlo proxy-server
+[filter:proxy-logging]
+[filter:cache]
+[filter:listing_formats]
+[filter:tempauth]
+active
+health=200
+Aug 04 13:19:44 swift1 proxy-server[3846383]: INFO proxy_logging enabled (logger sink)
+Aug 04 13:19:57 swift1 proxy-server[3847869]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth copy slo dlo proxy-server
+Aug 04 13:19:57 swift1 proxy-server[3847869]: INFO proxy_logging enabled (logger sink)
+Aug 04 13:19:57 swift1 proxy-server[3847869]: INFO cache enabled (memcache_servers=10.0.0.1:11211)
+Aug 04 13:19:57 swift1 proxy-server[3847869]: INFO listing_formats enabled
+===== deploy swift2 =====
+install: cannot stat '/tmp/swift-proxy-server.p0': No such file or directory
+===== deploy swift3 =====
+install: cannot stat '/tmp/swift-proxy-server.p0': No such file or directory
+===== deploy swift4 =====
+install: cannot stat '/tmp/swift-proxy-server.p0': No such file or directory

@@ -1,0 +1,12 @@
+WAVE4-PYTHON-LIVE: BLOCKED
+DISK_GATE: PASS (d1/d2/d3 Use%=2% on swift1–4; all <70% and <50%)
+MEM: PASS-ish (MemAvailable ~2.9–4.8 GiB; not the install blocker)
+META: PASS for LAB (W0′ LAB_META_CLEAN)
+PORT-DISK-MATRIX isolation: FAIL
+  - account/container rings still devices=['d1'] only
+  - object ring now d1+d2+d3 ports 6210–6212 (spp) — still includes d1
+  - Python cannot claim exclusive d1 without Rust collision
+PYTHON_CLUSTER: ABSENT (leftover pyswift single-node on swift2 :8090 / d1/pysaio — not stage-3)
+3NODE_INSTALL: NOT STARTED (honest BLOCKED)
+4NODE: NOT STARTED (requires 3-node GREEN)
+NEXT: migrate Rust account/container (and object) off exclusive/shared d1 per PORT-DISK-MATRIX (Rust→d2), then INSTALL-PLAN.md on swift2/3/4 only

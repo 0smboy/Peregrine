@@ -67,6 +67,10 @@ pub struct Node {
     pub disk_type: String,
     pub system_disk: String,
     pub disks: Vec<String>,
+    /// Rust-stack directory device basenames under `srv_node_root` (e.g. `d1`).
+    /// Empty means a single `d1`. Never block devices — no wipe/mkfs path.
+    #[serde(default)]
+    pub swift_devices: Vec<String>,
     pub keepalived_interface: String,
     pub keepalived_priority: Option<u16>,
 }
@@ -692,15 +696,28 @@ impl WorkspaceRequest {
                     "存储节点必须逐盘列出将被清空的设备。",
                 );
             }
-            // rust v1 deploys directory devices only, so no rust plan ever
-            // carries the disk_wipe capability; managed formatting is v2.
+            // rust stack deploys directory devices only, so no rust plan ever
+            // carries the disk_wipe capability; block-device wipe/format stays
+            // behind an explicit ticket + --allow-disk-wipe (not in this bundle).
             if self.is_rust() && !node.disks.is_empty() {
                 error(
                     errors,
                     "storage",
                     &format!("{prefix}.disks"),
-                    "rust 栈 v1 只部署目录设备（每节点 d1），不管理数据盘格式化；请清空数据盘列表，磁盘准备在带外完成。",
+                    "rust 栈只部署目录设备（host_vars.swift_devices，默认 d1），不管理数据盘格式化/wipe；请清空 disks 列表。扩容见 expand.yml + P3-ops 双守卫。",
                 );
+            }
+            if self.is_rust() {
+                for (dev_index, device) in node.swift_devices.iter().enumerate() {
+                    if !is_safe_swift_device(device) {
+                        error(
+                            errors,
+                            "storage",
+                            &format!("{prefix}.swift_devices[{dev_index}]"),
+                            "swift_devices 必须是安全的目录基名（如 d1、d2），不能含 /、.. 或空白。",
+                        );
+                    }
+                }
             }
             if !storage && !node.disks.is_empty() {
                 error(
@@ -920,15 +937,15 @@ impl WorkspaceRequest {
         }
     }
 
-    /// Ring devices available to one role. The rust stack counts diskless
-    /// nodes as one directory device (`/srv/node/d1`).
+    /// Ring devices available to one role. The rust stack counts directory
+    /// devices from `swift_devices` (default one `d1` per storage node).
     fn role_device_count(&self, role: &str) -> usize {
         self.nodes
             .iter()
             .filter(|node| has_effective_role(node, role))
             .map(|node| {
                 if self.is_rust() {
-                    node.disks.len().max(1)
+                    rust_device_basenames(node).len()
                 } else {
                     node.disks.len()
                 }
@@ -944,7 +961,7 @@ impl WorkspaceRequest {
                     errors,
                     "auth",
                     "auth.method",
-                    "rust 栈 v1 只支持 TempAuth；Keystone 尚未开放。",
+                    "rust 栈默认 TempAuth；Keystone/authtoken 已在代理接线（ON-BY-CONFIG），但 bundle-rust 仍不部署 MariaDB/Keystone — 需外部 Identity，勿在 Contabo VIP 上切换。",
                 );
             }
             if self.auth.interface != "swift" {
@@ -1105,21 +1122,36 @@ impl WorkspaceRequest {
             );
             return;
         }
-        if self.is_rust() && mode == Some("keepalived") {
-            error(
-                errors,
-                "ingress",
-                "ingress.mode",
-                "rust 栈 v1 不支持 Keepalived/VIP 入口；请选择 direct 或 haproxy。",
-            );
-            return;
-        }
-        if self.ingress.http_mode != "http" {
+        // rust stack: keepalived VIP is supported (bundle-rust rust_keepalived +
+        // shared HMAC tempauth → HAProxy roundrobin). Same topology rules as
+        // python-v3 apply below.
+        //
+        // P3-ops: rust TempAuth + HAProxy may terminate TLS (`http_mode=https`).
+        // python-v3 Keystone bootstrap/endpoints remain HTTP-only.
+        let http_mode = self.ingress.http_mode.as_str();
+        if self.is_rust() {
+            if http_mode != "http" && http_mode != "https" {
+                error(
+                    errors,
+                    "ingress",
+                    "ingress.http_mode",
+                    "rust 栈 ingress.http_mode 只能是 http 或 https（HAProxy TLS 终止）。",
+                );
+            }
+            if http_mode == "https" && mode == Some("direct") {
+                error(
+                    errors,
+                    "ingress",
+                    "ingress.http_mode",
+                    "rust HTTPS 仅支持 HAProxy/Keepalived 终止；direct 模式请保持 http（proxy 本身不终结 TLS）。",
+                );
+            }
+        } else if http_mode != "http" {
             error(
                 errors,
                 "ingress",
                 "ingress.http_mode",
-                "选定 v3 的 Keystone bootstrap、endpoint 与 proxy authtoken 均硬编码 HTTP；HTTPS 已在所有模式下禁用。",
+                "选定 v3 的 Keystone bootstrap、endpoint 与 proxy authtoken 均硬编码 HTTP；HTTPS 已在 python-v3 模式下禁用（rust 栈见 P3-ops HAProxy TLS）。",
             );
         }
         if self.ingress.auth_url_ip.parse::<Ipv4Addr>().is_err() {
@@ -1660,7 +1692,7 @@ impl WorkspaceRequest {
         let system = normalized_system_disk(&node.system_disk)
             .map(|device| format!("/dev/{device}"))
             .unwrap_or_default();
-        let value = json!({
+        let mut value = json!({
             "management_network_address": node.management_ip,
             "storage_network_address": node.storage_ip,
             "replication_network_address": self.effective_replication_ip(node),
@@ -1671,6 +1703,14 @@ impl WorkspaceRequest {
             "disk_type": node.disk_type,
             "exclude_disks": [system]
         });
+        if self.is_rust() {
+            let map = value
+                .as_object_mut()
+                .context("host_vars root must be a mapping")?;
+            map.insert("region".to_owned(), json!(node.region));
+            map.insert("zone".to_owned(), json!(node.zone));
+            map.insert("swift_devices".to_owned(), json!(rust_device_basenames(node)));
+        }
         yaml_document(&value)
     }
 
@@ -1816,6 +1856,8 @@ impl WorkspaceRequest {
             ("account_bind_port", json!(6202)),
             ("container_bind_port", json!(6201)),
             ("object_bind_port", json!(6200)),
+            ("object_port_per_device", json!(true)),
+            ("object_servers_per_port", json!(0)),
             ("srv_node_root", json!("/srv/node")),
             (
                 "ring_fetch_dir",
@@ -1851,6 +1893,16 @@ impl WorkspaceRequest {
                 "haproxy_stats_password",
                 json!(self.auth.haproxy_stats_password),
             ),
+            // P3-ops TLS defaults (self-signed lab when https; override via
+            // haproxy_tls_pem_src for production PEMs).
+            ("haproxy_tls_self_signed", json!(true)),
+            ("haproxy_tls_days", json!(825)),
+            ("haproxy_tls_pem", json!("/etc/haproxy/haproxyCA.pem")),
+            ("haproxy_tls_pem_src", json!("")),
+            // Expand mode is opt-in via expand.yml set_fact or group_vars.
+            ("ring_expand", json!(false)),
+            ("ADD_NODES", json!(false)),
+            ("ring_force_rebuild", json!(false)),
         ] {
             values.insert(key.to_owned(), value);
         }
@@ -2377,6 +2429,27 @@ fn has_role(node: &Node, role: &str) -> bool {
 fn has_effective_role(node: &Node, role: &str) -> bool {
     has_role(node, role)
         || (has_role(node, "storage") && matches!(role, "account" | "container" | "object"))
+}
+
+/// Safe directory device basenames for the rust stack (no wipe path).
+fn is_safe_swift_device(device: &str) -> bool {
+    let trimmed = device.trim();
+    !trimmed.is_empty()
+        && !trimmed.contains('/')
+        && !trimmed.contains('\\')
+        && !trimmed.contains("..")
+        && !trimmed.contains(char::is_whitespace)
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
+}
+
+fn rust_device_basenames(node: &Node) -> Vec<String> {
+    if node.swift_devices.is_empty() {
+        vec!["d1".to_owned()]
+    } else {
+        node.swift_devices.clone()
+    }
 }
 
 fn is_storage_node(node: &Node) -> bool {

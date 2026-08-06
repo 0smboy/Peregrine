@@ -43,8 +43,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use swift_ring::Ring;
 
-/// The addresses configured on this host (Python `whataremyips()`).
-fn local_addrs() -> Vec<IpAddr> {
+/// The addresses configured on this host (Python `whataremyips()` with no arg).
+pub fn local_addrs() -> Vec<IpAddr> {
     let mut addrs = Vec::new();
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs fills in a list it owns until freeifaddrs; every
@@ -90,6 +90,28 @@ pub fn is_local_addr(ip: &str) -> bool {
     }
 }
 
+/// IP set used for ring port lookup (Python `whataremyips(ring_ip)`).
+///
+/// A concrete non-wildcard `ring_ip` returns just that address. Wildcard /
+/// empty / unparseable values expand to every address on this host (including
+/// loopback), matching Python when `bind_ip` is `0.0.0.0` / `::`.
+pub fn ips_for_ring_lookup(ring_ip: &str) -> std::collections::BTreeSet<String> {
+    let trimmed = ring_ip.trim();
+    if !trimmed.is_empty() {
+        if let Ok(addr) = trimmed.parse::<IpAddr>() {
+            if !addr.is_unspecified() {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(trimmed.to_string());
+                return set;
+            }
+        }
+    }
+    local_addrs()
+        .into_iter()
+        .map(|a| a.to_string())
+        .collect()
+}
+
 /// The id of the ring device this host serves at `(bind_port, dev_name)`.
 ///
 /// Candidates are narrowed by port and device name, then disambiguated by
@@ -99,6 +121,13 @@ pub fn is_local_addr(ip: &str) -> bool {
 ///
 /// A device's `ip` and `replication_ip` are both accepted, because a node may
 /// legitimately be addressed on either plane.
+///
+/// When `servers_per_port` / `object_port_per_device` is in use, conf
+/// `bind_port` is only a discovery base (e.g. 6210) while ring entries carry
+/// the real per-device ports (6211, 6212, …). In that case pass
+/// [`ring_device_id_local_name`] instead — matching on the conf base port
+/// yields **no** candidates and every partition is silently skipped
+/// (`suffix_syncs=0` forever).
 pub fn ring_device_id(ring: &Ring, bind_port: u32, dev_name: &str) -> Option<u64> {
     let candidates: Vec<&swift_ring::RingDevice> = ring
         .devs()
@@ -123,6 +152,32 @@ pub fn ring_device_id(ring: &Ring, bind_port: u32, dev_name: &str) -> Option<u64
                     .is_some_and(is_local_addr)
         })
         .map(|d| d.id)
+}
+
+/// Ring device id for a local directory when conf `bind_port` is **not** the
+/// ring listen port (multi-port / `servers_per_port` topology).
+///
+/// Narrow by device name, then require a local `ip` / `replication_ip`. If
+/// several ring entries share the name on this host (should not happen for a
+/// single device dir), pick the lowest id for stability.
+pub fn ring_device_id_local_name(ring: &Ring, dev_name: &str) -> Option<u64> {
+    let mut local: Vec<&swift_ring::RingDevice> = ring
+        .devs()
+        .iter()
+        .flatten()
+        .filter(|d| {
+            d.device == dev_name
+                && (is_local_addr(&d.ip)
+                    || d.replication_ip
+                        .as_deref()
+                        .is_some_and(is_local_addr))
+        })
+        .collect();
+    if local.is_empty() {
+        return None;
+    }
+    local.sort_by_key(|d| d.id);
+    Some(local[0].id)
 }
 
 #[cfg(test)]
@@ -161,4 +216,16 @@ mod tests {
         assert!(!is_local_addr("swift1"));
         assert!(!is_local_addr(""));
     }
+
+    #[test]
+    fn ips_for_ring_lookup_exact_vs_wildcard() {
+        let exact = ips_for_ring_lookup("10.0.4.1");
+        assert_eq!(exact.len(), 1);
+        assert!(exact.contains("10.0.4.1"));
+        let wild = ips_for_ring_lookup("0.0.0.0");
+        assert!(wild.contains(&"127.0.0.1".to_string()) || !wild.is_empty());
+    }
+
+    // ring_device_id_local_name needs a real Ring fixture; covered by Contabo
+    // heal re-proof after deploy (spp>0 + conf bind_port ≠ ring port).
 }

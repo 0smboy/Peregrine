@@ -1,0 +1,88 @@
+## date=2026-08-05T07:37:52Z
+## rings present
+-rw-r--r--. 1 root root 412 Aug  4 05:39 /etc/swift/account.ring.gz
+-rw-r--r--. 1 root root 412 Aug  4 05:39 /etc/swift/container.ring.gz
+-rw-r--r--. 1 root root 412 Aug  4 05:39 /etc/swift/object-1.ring.gz
+-rw-r--r--. 1 root root 412 Aug  4 05:39 /etc/swift/object.ring.gz
+## rust binary ring dump tools
+/usr/local/bin/swift-account-info
+/usr/local/bin/swift-account-info.d
+/usr/local/bin/swift-account-reaper
+/usr/local/bin/swift-account-server
+/usr/local/bin/swift-account-server.d
+/usr/local/bin/swift-console
+/usr/local/bin/swift-container-info
+/usr/local/bin/swift-container-info.d
+/usr/local/bin/swift-container-reconciler
+/usr/local/bin/swift-container-server
+/usr/local/bin/swift-container-server.d
+/usr/local/bin/swift-container-sharder
+/usr/local/bin/swift-container-updater
+/usr/local/bin/swift-container-updater.d
+/usr/local/bin/swift-db-auditor
+/usr/local/bin/swift-db-auditor.d
+/usr/local/bin/swift-db-replicator
+/usr/local/bin/swift-db-replicator.d
+/usr/local/bin/swift-deploy
+/usr/local/bin/swift-drive-audit
+/usr/local/bin/swift-drive-audit.d
+/usr/local/bin/swift-effective-concurrency
+/usr/local/bin/swift-get-nodes
+/usr/local/bin/swift-get-nodes.d
+/usr/local/bin/swift-manage-shard-ranges
+/usr/local/bin/swift-manage-shard-ranges.d
+/usr/local/bin/swift-object-auditor
+/usr/local/bin/swift-object-auditor.d
+/usr/local/bin/swift-object-expirer
+/usr/local/bin/swift-object-info
+/usr/local/bin/swift-object-info.d
+/usr/local/bin/swift-object-reconstructor
+/usr/local/bin/swift-object-reconstructor.d
+/usr/local/bin/swift-object-replicator
+/usr/local/bin/swift-object-replicator.bak.wave0
+/usr/local/bin/swift-object-replicator.d
+/usr/local/bin/swift-object-server
+/usr/local/bin/swift-object-server.d
+/usr/local/bin/swift-object-updater
+/usr/local/bin/swift-object-updater.d
+/usr/local/bin/swift-ring-builder
+/usr/bin/curl
+/usr/local/bin/swift-ring-builder
+object.ring.gz bytes 99071 magic b'R1NG\x00\x01\x00\x00\x02\xf5{"byteorde'
+pickle fail UnpicklingError unpickling stack underflow
+## VIP health
+VIP_health=200
+local_proxy=200
+## tempauth token + container listing (meta dirtiness)
+pass_len=22
+token_len=149 storage=http://10.0.0.10:8085/v1/AUTH_test
+account_http=200
+container_count_header=x-account-container-count: 968
+object_count_header=x-account-object-count: 846331
+bytes_header=x-account-bytes-used: 176797386545
+listing_lines=968
+autocos1026990a1
+autocos1026990a2
+autocos102f2a4b1
+autocos102f2a4b2
+autocos107751551
+autocos107e3c241
+autocos107e3c242
+autocos10c77e9c1
+autocos1165d7191
+autocos116e1e711
+autocos118ba6611
+autocos11cad62d1
+autocos11cad62d2
+autocos11cad62d3
+autocos11cad62d4
+autocos11e7def31
+autocos11e7def32
+autocos12a2551e1
+autocos132675de1
+autocos1368fe851
+...
+sample_n=30 hit=0 miss404=30 META_HINT=DIRTY
+## servers_per_port in conf
+servers_per_port ABSENT (defaults 0)
+## haproxy backends

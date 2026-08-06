@@ -1,0 +1,9 @@
+Tue Aug  4 02:46:38 PM UTC 2026
+-rwxr-xr-x. 1 root root 3307784 2026-08-04 14:46 /usr/local/bin/swift-account-reaper
+-rwxr-xr-x. 1 root root 1145992 2026-08-04 14:46 /usr/local/bin/swift-container-reconciler
+-rwxr-xr-x. 1 root root 3286976 2026-08-04 14:46 /usr/local/bin/swift-container-updater
+-rwxr-xr-x. 1 root root 1171944 2026-08-04 14:46 /usr/local/bin/swift-object-expirer
+-rwxr-xr-x. 2 root root 3307784 2026-08-04 14:45 target/release/swift-account-reaper
+-rwxr-xr-x. 2 root root 1145992 2026-08-04 14:45 target/release/swift-container-reconciler
+-rwxr-xr-x. 2 root root 3286976 2026-08-04 14:45 target/release/swift-container-updater
+-rwxr-xr-x. 2 root root 1171944 2026-08-04 14:45 target/release/swift-object-expirer

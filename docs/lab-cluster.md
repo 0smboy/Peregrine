@@ -8,11 +8,14 @@ The previous Azure PAYG topology (`10.42.*` + ILB) is **retired**. Cutover
 notes: [`tools/CONTABO-CLUSTER.md`](../tools/CONTABO-CLUSTER.md). Azure doc
 [`tools/NEW-CLUSTER-CUTOVER.md`](../tools/NEW-CLUSTER-CUTOVER.md) is historical.
 
-**Fairness lab (2026-08-03):** Contabo is a hybrid on `swift-deploy-rs`, not full
-ansible parity. SAIO on swift1 is **NOISY** for performance; VIP path is
-**HA-PATH ONLY**; formal throughput requires Performance mode +
-`DIRECT-4PROXY`. See [`docs/fairness-lab/`](fairness-lab/) and
-[`tools/test-results/fairness-lab-20260803/REPORT.html`](../tools/test-results/fairness-lab-20260803/REPORT.html).
+**Formal method:** [`docs/fairness-lab/USER-METHOD-PLAN.md`](fairness-lab/USER-METHOD-PLAN.md).
+R0–R8 (2026-08-03) = historical baseline only. Contabo target: `swift-deploy apply`
+(`stack=rust`, Keepalived VIP + HAProxy roundrobin). Stage-1 SAIO must not run on
+swift1/4. See [`docs/fairness-lab/`](fairness-lab/).
+
+**Pointer 2026-08-04:** Stage 2 evidence `tools/test-results/phase-2-20260804/`;
+Stage 3 Python path FROZEN (`PYTHON_CLUSTER_ABSENT`) —
+`tools/test-results/phase-3-20260804/`. VIP may sit on swift2 (nopreempt).
 
 ## Topology
 
@@ -23,10 +26,10 @@ ansible parity. SAIO on swift1 is **NOISY** for performance; VIP path is
 | Storage | `10.0.4.1–4` | account/container/object data path |
 | Replication | `10.0.8.1–4` | replicator / reconstructor |
 
-Nodes: `swift1`–`swift4` (swift1 = hub + VIP MASTER). Prefer the **real VIP**
-`http://10.0.0.10:8085` for clients and gates. Per-node
-`http://10.0.0.N:8085` remains valid (local HAProxy backend only — see cutover
-note on tempauth).
+Nodes: `swift1`–`swift4` (VIP MASTER by keepalived priority; hub/observability on
+**swift4**). Prefer VIP `http://10.0.0.10:8085`. Per-node `http://10.0.0.N:8085`
+shares the same four-proxy backend pool (roundrobin) after the 2026-08-04 LB fix /
+bundle-rust keepalived path.
 
 Devices: `/srv/node/{d1,d2,d3}` XFS per node (12 total). **Never format** them
 from deploy tooling.

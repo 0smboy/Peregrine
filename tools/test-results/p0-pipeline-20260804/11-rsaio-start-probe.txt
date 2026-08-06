@@ -1,0 +1,49 @@
+/etc/rsaio/:
+total 104
+drwxr-xr-x.  3 root root 4096 Aug  4 04:49 .
+drwxr-xr-x. 97 root root 8192 Aug  4 05:38 ..
+-rw-r--r--.  1 root root 9911 Aug  3 05:32 account.builder
+-rw-r--r--.  1 root root 1497 Aug  3 05:32 account.ring.gz
+-rw-r--r--.  1 root root  119 Aug  3 05:32 account-server.conf
+drwxr-xr-x.  2 root root 4096 Aug  3 05:32 backups
+-rw-r--r--.  1 root root 9911 Aug  3 05:32 container.builder
+-rw-r--r--.  1 root root 1481 Aug  3 05:32 container.ring.gz
+-rw-r--r--.  1 root root  121 Aug  3 05:32 container-server.conf
+-rw-r--r--.  1 root root 9911 Aug  3 05:32 object-1.builder
+-rw-r--r--.  1 root root 1463 Aug  3 05:32 object-1.ring.gz
+-rw-r--r--.  1 root root 9911 Aug  3 05:32 object.builder
+-rw-r--r--.  1 root root 1486 Aug  3 05:32 object.ring.gz
+-rw-r--r--.  1 root root  118 Aug  3 05:32 object-server.conf
+-rw-r--r--.  1 root root  555 Aug  4 13:21 proxy-server.conf
+-rw-r--r--.  1 root root  361 Aug  3 05:32 swift.conf
+
+/root/work/rsaio/:
+total 0
+drwxr-xr-x. 2 root root  81 Aug  3 05:31 .
+drwxr-xr-x. 8 root root 125 Aug  4 05:09 ..
+-rw-r--r--. 1 root root   0 Aug  4 04:52 account.log
+-rw-r--r--. 1 root root   0 Aug  4 04:52 container.log
+-rw-r--r--. 1 root root   0 Aug  4 04:52 object.log
+-rw-r--r--. 1 root root   0 Aug  4 04:52 proxy.log
+--- conf bind ---
+/etc/rsaio/account-server.conf:bind_ip = 127.0.0.1
+/etc/rsaio/account-server.conf:bind_port = 6322
+/etc/rsaio/account-server.conf:devices = /srv/node/d1/rsaio
+/etc/rsaio/container-server.conf:bind_ip = 127.0.0.1
+/etc/rsaio/container-server.conf:bind_port = 6321
+/etc/rsaio/container-server.conf:devices = /srv/node/d1/rsaio
+/etc/rsaio/object-server.conf:bind_ip = 127.0.0.1
+/etc/rsaio/object-server.conf:bind_port = 6320
+/etc/rsaio/object-server.conf:devices = /srv/node/d1/rsaio
+/etc/rsaio/proxy-server.conf:[pipeline:main]
+/etc/rsaio/proxy-server.conf:pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth copy slo dlo proxy-server
+/etc/rsaio/proxy-server.conf:bind_ip = 10.0.0.3
+/etc/rsaio/proxy-server.conf:bind_port = 8081
+/etc/rsaio/proxy-server.conf:user_test_tester = azure-swift-2026.bench .admin
+/etc/rsaio/proxy-server.conf:user_admin_admin = admin .admin .reseller_admin
+--- prior start cmds from logs ---
+/etc/rsaio/account.ring.gz
+/etc/rsaio/container.ring.gz
+/etc/rsaio/object-1.ring.gz
+/etc/rsaio/object.ring.gz
+LISTEN 0      128         10.0.0.3:8081       0.0.0.0:*    users:(("swift-proxy-ser",pid=3364724,fd=4))            

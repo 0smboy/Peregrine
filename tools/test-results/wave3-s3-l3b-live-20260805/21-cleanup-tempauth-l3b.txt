@@ -1,0 +1,21 @@
+buckets 200 b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Owner><ID>test:tester</ID><DisplayName>test:tester</DisplayName></Owner><Buckets><Bucket><Name>w1-rollback</Name><CreationDate>2026-08-05T09:48:29.460Z</CreationDate></Bucket><Bucket><Name'
+cleanup w3s3-24316
+ del b'mpu-obj' 204
+ abort mpu-obj 204
+ delbucket 204
+cleanup w3s3-24316+segments
+ delbucket 403
+=== TempAuth ===
+auth 200 token AUTH_tkv1.3137383630 storage http://10.0.0.10:8085/v1/AUTH_test
+vip_path FAIL HTTPError 401 HTTP Error 401: Unauthorized
+storage_as_https FAIL HTTPError 401 HTTP Error 401: Unauthorized
+=== s3tokens endpoints ===
+https://10.0.0.10:5000/v3/s3tokens HTTP 404 b'{"error":{"code":404,"message":"Could not find credential: 2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4'
+http://127.0.0.1:5001/v3/s3tokens HTTP 404 b'{"error":{"code":404,"message":"Could not find credential: 2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4'
+http://10.0.0.1:5001/v3/s3tokens HTTP 404 b'{"error":{"code":404,"message":"Could not find credential: 2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4'
+=== L3b probe ===
+container_management 10000
+keys_sample ['container_quotas']
+root      382081  0.1  0.0   6544  2732 ?        Ss   Aug04   1:14 /usr/local/bin/swift-container-sharder /etc/swift/container-server.conf
+73
+no_sharder_conf

@@ -1,0 +1,30 @@
+  failed to remove file `/Users/oboy/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-macro-0.3.31/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.33s
+     Running unittests src/lib.rs (target/debug/deps/swift_container_server-8cc8327101a75f5d)
+
+running 4 tests
+test sharder::tests::test_run_once_skips_unsharded ... ok
+test sharder::tests::test_find_create_and_cleave ... ok
+test sharder::tests::test_cleave_is_batched ... ok
+test sharder::tests::test_run_once_cleaves_sharding_container_on_device ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.14s
+
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib) generated 1 warning (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.25s
+     Running unittests src/lib.rs (target/debug/deps/swift_proxy_server-cd4e09efe64c658d)
+
+running 5 tests
+test stale_read_and_post_tests::test_is_good_source_matches_python ... ok
+test stale_read_and_post_tests::test_backend_404_timestamp_absent_is_not_truthy ... ok
+test stale_read_and_post_tests::test_source_timestamp_precedence_and_fallbacks ... ok
+test stale_read_and_post_tests::test_x_newest_picks_max_timestamp_after_tombstone_filter ... ok
+test stale_read_and_post_tests::test_post_mixed_result_resolution ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+

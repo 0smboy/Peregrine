@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>Contabo 生产剩余任务 · 综合报告 · 2026-08-05</title>
+<style>
+  :root { --ink:#1c1b19; --muted:#5c5852; --ok:#1b6b3a; --warn:#7a5a00; --bad:#8b1e1e; --bg:#f6f3ee; --card:#fff; --line:#ddd6cb; }
+  * { box-sizing: border-box; }
+  body { font-family: "Songti SC", "Noto Serif SC", ui-serif, Georgia, serif; color: var(--ink); background: var(--bg); margin: 0; line-height: 1.55; }
+  .wrap { max-width: 920px; margin: 0 auto; padding: 2.5rem 1.5rem 4rem; }
+  h1 { font-size: 1.75rem; font-weight: 650; margin: 0 0 .35rem; letter-spacing: -.02em; }
+  .lede { font-family: ui-sans-serif, system-ui, sans-serif; color: var(--muted); font-size: .95rem; margin: 0 0 1.75rem; }
+  h2 { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 1.05rem; margin: 2.25rem 0 .75rem; padding-bottom: .35rem; border-bottom: 1px solid var(--line); }
+  h3 { font-family: ui-sans-serif, system-ui, sans-serif; font-size: .95rem; margin: 1.25rem 0 .4rem; }
+  p, li { font-size: 1.02rem; }
+  .sans { font-family: ui-sans-serif, system-ui, sans-serif; font-size: .9rem; }
+  table { border-collapse: collapse; width: 100%; background: var(--card); font-family: ui-sans-serif, system-ui, sans-serif; font-size: .88rem; margin: .75rem 0 1rem; }
+  th, td { border: 1px solid var(--line); padding: .45rem .6rem; text-align: left; vertical-align: top; }
+  th { background: #ebe6de; font-weight: 600; }
+  .ok { color: var(--ok); font-weight: 650; }
+  .warn { color: var(--warn); font-weight: 650; }
+  .bad { color: var(--bad); font-weight: 650; }
+  code { font-family: ui-monospace, Menlo, monospace; font-size: .84em; background: #ebe6de; padding: .05em .3em; border-radius: 3px; }
+  .callout { background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--ink); padding: .9rem 1.1rem; margin: 1rem 0; font-family: ui-sans-serif, system-ui, sans-serif; font-size: .92rem; }
+  .story { margin: .6rem 0 1rem; }
+  ul { padding-left: 1.2rem; }
+  a { color: #1a4a7a; }
+  .meta { font-family: ui-sans-serif, system-ui, sans-serif; font-size: .8rem; color: var(--muted); margin-top: 2.5rem; }
+  .timeline { font-family: ui-sans-serif, system-ui, sans-serif; font-size: .88rem; }
+  .timeline td:first-child { white-space: nowrap; width: 7.5rem; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Contabo 生产剩余任务：综合报告</h1>
+<p class="lede">日期 2026-08-05 · 集群 VIP <code>https://10.0.0.10:8085</code>（自签 TLS）· 计划权威：生产剩余任务规划（审计修订版）· <strong>未宣称 PRODUCTION-GO-LIVE</strong></p>
+
+<div class="callout">
+  <strong>一句话结论：</strong>盘腾开了，监控进面板了，Keystone 与 TLS 在实验室级绿灯，S3（含 EC2）能打通，Python 三节点对照集群也装上了。
+  但整条链路仍是 <strong>LAB-READY</strong>：有 soak 毛刺、func 未满 54、L3b 未做生产停线、证书是自签、四节点 Python 没做。
+  可以继续公平测试与联调；不能拿今天的证据对外写「生产上线完成」。
+</div>
+
+<h2>1. 故事线：我们实际经历了什么</h2>
+
+<p class="story">起点很糟：数据盘几乎满（swift1 d1 一度 100%）。大家以为 <code>swift delete -a</code> 就能腾空间，结果只删掉约 128 个「还能 HEAD 到的」活对象；盘上仍有几十万孤儿 <code>.data</code> 和数万墓碑。<code>reclaim_age=600</code> 也没在 10 分钟内把墓碑清掉——后来证明 replicator 一度根本不读配置里的 reclaim_age。</p>
+
+<p class="story">真正腾盘靠的是 A+B：强制扫墓碑 + 按（修好后的）hash 对账清孤儿。四节点三盘从约 90% 掉到约 <strong>2%</strong>。对账脚本当初少写了一个斜杠，导致 <code>kept_dirs=0</code>，差点误判；根因修掉后，又清了幽灵容器和约 65 万僵尸 DB 行。</p>
+
+<p class="story">盘空之后，Identity 和监控才站得住。Galera×3 + Keystone 上了，VIP 加了自签 TLS，TempAuth 与 Keystone 共存。中间踩过：Mac 编的二进制扔 Linux 上 Exec format error、部署时 HAProxy 后端空了导致 soak 一串 503、keystoneauth 误给 TempAuth 请求盖章导致 list 401、Keystone s3tokens 坏 base64 直接把 uwsgi 打崩。这些都修了，证据都在。</p>
+
+<p class="story">最后 Rust 让出 d1，Python 三节点在 swift2/3/4 上以 venv 路径跑起来，和 Rust VIP 分盘分端口。阶段三「双实现」终于有了真实对照面，而不再是 FROZEN 空壳。</p>
+
+<h2>2. 总览表</h2>
+
+<table>
+  <tr><th>轨</th><th>结果</th><th>人话</th><th>证据包</th></tr>
+  <tr><td>盘清理 A+B</td><td class="ok">PASS</td><td>约 2% 占用；无 mkfs</td><td><code>wave0-ab-20260805/</code></td></tr>
+  <tr><td>R0 监控</td><td class="ok">WIRED</td><td>墓碑/SQLite → Prom/Grafana + 告警（曾仅 CLI）</td><td><code>r0-metrics-prom-20260805/</code></td></tr>
+  <tr><td>W0′ 元数据</td><td class="ok">LAB META_CLEAN</td><td>幽灵/僵尸清掉；非生产元数据盖章</td><td><code>w0-meta-repair-20260805/</code></td></tr>
+  <tr><td>W1 Keystone</td><td class="ok">LAB GREEN</td><td>Galera×3 + Keystone + 共存管道</td><td><code>wave1-identity-live-20260805/</code></td></tr>
+  <tr><td>P3-ops TLS</td><td class="warn">LAB GREEN</td><td>自签终止；无运营级 PEM → 非生产宣称</td><td><code>p3-ops-tls-live-20260805/</code></td></tr>
+  <tr><td>W2 spp / 多 Region</td><td class="warn">PARTIAL</td><td>端口 6210–6212、spp=1、r1/r2；soak 185/192</td><td><code>wave2-spp-region-live-20260805/</code></td></tr>
+  <tr><td>W3 S3</td><td class="ok">LAB GREEN</td><td>TempAuth + EC2 SigV4 VIP 通；L3b KEEP 未宣称</td><td><code>wave3-s3-*-20260805/</code></td></tr>
+  <tr><td>VIP 鉴权修复</td><td class="ok">GREEN</td><td>TempAuth/Keystone CRUD 双绿</td><td><code>vip-auth-crud-fix-20260805/</code></td></tr>
+  <tr><td>W4 Python 三节点</td><td class="ok">LAB GREEN</td><td>swift2/3/4 对照集群 PRESENT</td><td><code>wave4-python-live-20260805d/</code></td></tr>
+  <tr><td>PRODUCTION-GO-LIVE</td><td class="bad">未宣称</td><td>硬门未齐（TLS PEM、soak=0、func、L3b…）</td><td>计划审计节</td></tr>
+</table>
+
+<h2>3. 今天集群长什么样</h2>
+
+<table class="sans">
+  <tr><th>入口</th><th>用途</th></tr>
+  <tr><td><code>https://10.0.0.10:8085</code></td><td>Rust 集群 VIP（TLS 自签；TempAuth + Keystone 共存）</td></tr>
+  <tr><td><code>:5000 / :35357 / :3030</code></td><td>Keystone / MariaDB（HAProxy additive，未覆盖 8085）</td></tr>
+  <tr><td>swift2/3/4 <code>:8090</code> 等</td><td>Python 三节点（设备 <code>py</code> 在 d1；从 Contabo 内网访问）</td></tr>
+  <tr><td>Rust 数据盘</td><td>A/C → d2；object → d2+d3，端口 6211/6212（d1 留给 Python）</td></tr>
+</table>
+
+<p class="sans">凭据：TempAuth 仍是 lab 账号；Keystone 密钥在 Contabo <code>/root/contabo-identity-secrets.yml</code>（不进 git）。Swift 项目账号形如 <code>AUTH_&lt;project_id&gt;</code>，不是字面 <code>AUTH_test</code>。</p>
+
+<h2>4. 分波说明（人性化）</h2>
+
+<h3>腾盘与观测</h3>
+<p class="story"><code>delete -a</code> 诚实结论是「API 清仓 ≠ 清盘」。墓碑指标 <code>swift-recon tombstones</code>、SQLite <code>dbspace/vacuum</code> 先做了 CLI，后接到 Prometheus textfile 与 Grafana；告警含墓碑增长、freelist、盘压。Grafana 渲染截图仍有 stub，但查询可用。</p>
+
+<h3>Identity 与 TLS</h3>
+<p class="story">MariaDB Galera 三节点 + Keystone，Fernet 同步。切管道时做过 TempAuth 回滚演练（PARTIAL：有一次窗口撞上 proxy 503）。TLS 是自签 CN=VIP，够 lab；生产要运营证书才能改标签。</p>
+
+<h3>拓扑 spp / Region</h3>
+<p class="story">对象环重建到每盘端口 6210+，避免和 A/C 的 6201/6202 撞车；标签 r1=swift1/2、r2=swift3/4，只是环亲和，不是跨城灾备。1h soak：185 成功 / 7 失败——其中一串 503 是并发部署错误架构二进制导致后端空窗，不是 spp 本身坏了。</p>
+
+<h3>S3</h3>
+<p class="story">ListMPU、MPU、MultiDelete 等单元停线补齐后，VIP 上 TempAuth SigV4 与 EC2→Keystone s3tokens→S3 都通了。路径上修过：s3tokens 崩溃、Rust 不认识 EC2 key 就直接 InvalidAccessKeyId（现已 defer 到 Keystone）。L3b 多节点 quorum 与 4KB KEEP <strong>没有</strong>用今天的数据宣称。</p>
+
+<h3>Python 对照</h3>
+<p class="story">阶段三终于解冻：Rust 退出 d1，Python 三节点用 venv（RPM 被 pyxattr 卡住）。CRUD 在三台上从内网验证通过。四节点故意没做：swift1 继续当 client/monitor 更干净。本机直连 :8090 可能空回复（防火墙），请从 swift1 或内网打。</p>
+
+<h2>5. 时间线（压缩）</h2>
+
+<table class="timeline">
+  <tr><td>上午</td><td>盘满诊断；delete -a 无效于孤儿；A+B 清盘 → ~2%</td></tr>
+  <tr><td>午后</td><td>R0 进 Prom；W0′ 修 hash「少斜杠」+ 清幽灵；Keystone + TLS</td></tr>
+  <tr><td>傍晚</td><td>spp 6210+；S3 live；s3tokens / EC2 SigV4；鉴权共存 bug</td></tr>
+  <tr><td>夜间</td><td>Rust 让 d1；Python 三节点 LAB GREEN</td></tr>
+</table>
+
+<h2>6. 明确还没做完的事</h2>
+<ul class="sans">
+  <li>PRODUCTION-GO-LIVE：运营 PEM、soak fail=0、Keystone/EC 完整 func 门禁、L3b 生产停线</li>
+  <li>proxy 需 <code>--features ec</code> 重编部署（当前 EC 501）</li>
+  <li>TempAuth 与 Keystone 并存下的「经典 54/54」叙事要改成 Keystone 原生套件或修好共存语义</li>
+  <li>Python 四节点；本机访问 Python API 的网络策略</li>
+  <li>Keystone 站点包 s3tokens 补丁：RPM 升级后要重打</li>
+  <li>container-sync / 真跨站多 Region：保持 wont fix / 非宣称</li>
+</ul>
+
+<h2>7. 建议你怎么用这些结果</h2>
+<ol class="sans">
+  <li><strong>公平测试：</strong>Rust VIP HTTPS vs Python :8090（内网），分表报告，不要混入口。</li>
+  <li><strong>联调 S3：</strong>TempAuth 或 EC2+Keystone 均可；记着用 <code>curl -k</code> / 信任自签。</li>
+  <li><strong>别升级标签：</strong>对外仍写 LAB / CORE-PATH / 分波 PARTIAL，直到生产硬门勾完。</li>
+  <li><strong>下一刀优先：</strong>EC 特性二进制 → 干净 soak → 运营证书 → L3b 多节点，或按需开 Python 四节点。</li>
+</ol>
+
+<p class="meta">
+  本卷宗：<code>tools/test-results/PRODUCTION-REMAINING-ROLLUP-20260805/</code><br/>
+  计划：<code>~/.cursor/plans/生产剩余任务规划_319471f3.plan.md</code><br/>
+  纪律：部分完成 ≠ 交付；HTTP/自签 lab ≠ 生产安全合格。
+</p>
+
+</div>
+</body>
+</html>

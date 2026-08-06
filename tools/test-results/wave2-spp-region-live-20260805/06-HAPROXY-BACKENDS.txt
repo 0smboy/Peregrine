@@ -1,0 +1,24 @@
+    timeout server          60s
+    timeout http-request    30s
+
+--
+    default_backend swift_proxy_back
+
+backend swift_proxy_back
+    # roundrobin across every proxy business address. Tokens are HMAC-signed
+    # with swift_hash_path_prefix:suffix (shared), so any proxy can validate
+--
+    server proxy1 10.0.0.1:8080 check inter 5s fall 3 rise 2
+
+    server proxy2 10.0.0.2:8080 check inter 5s fall 3 rise 2
+
+    server proxy3 10.0.0.3:8080 check inter 5s fall 3 rise 2
+
+    server proxy4 10.0.0.4:8080 check inter 5s fall 3 rise 2
+
+
+---
+10.0.0.1:200
+10.0.0.2:200
+10.0.0.3:200
+10.0.0.4:200

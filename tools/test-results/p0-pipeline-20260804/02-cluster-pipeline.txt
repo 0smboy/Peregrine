@@ -1,0 +1,28 @@
+===== swift1 =====
+swift1
+Tue Aug  4 01:16:50 PM UTC 2026
+-rwxr-xr-x. 1 root root 2214440 Aug  4 05:35 /usr/local/bin/swift-proxy-server
+active
+local8080=200
+vip8085=200
+===== swift2 =====
+swift2
+Tue Aug  4 01:16:55 PM UTC 2026
+-rwxr-xr-x. 1 root root 2214440 Aug  4 05:36 /usr/local/bin/swift-proxy-server
+active
+local8080=200
+vip8085=200
+===== swift3 =====
+swift3
+Tue Aug  4 01:16:58 PM UTC 2026
+-rwxr-xr-x. 1 root root 2214440 Aug  4 05:36 /usr/local/bin/swift-proxy-server
+failed
+local8080=200
+vip8085=200
+===== swift4 =====
+swift4
+Tue Aug  4 01:17:02 PM UTC 2026
+-rwxr-xr-x. 1 root root 2214440 Aug  4 05:37 /usr/local/bin/swift-proxy-server
+inactive
+local8080=200
+vip8085=200

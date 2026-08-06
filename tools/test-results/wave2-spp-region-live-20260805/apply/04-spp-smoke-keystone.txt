@@ -1,0 +1,22 @@
+C=w2ok-1785924690
+PUT_CONT=201
+PUT_OBJ=201
+GET_OBJ=200 body=hello-spp-6210
+DEL_OBJ=204
+Partition	6226
+Hash	61482e3d336ffe903ba1aa8b18a75a27
+Server:Port Device	10.0.4.2:6211 d2
+Server:Port Device	10.0.4.3:6211 d2
+Server:Port Device	10.0.4.4:6211 d2
+Server:Port Device	10.0.4.1:6210 d1	 # [Handoff]
+Server:Port Device	10.0.4.2:6212 d3	 # [Handoff]
+Server:Port Device	10.0.4.3:6212 d3	 # [Handoff]
+=== PUT hits on object servers ===
+-- 10.0.4.1 --
+Aug 05 10:11:16 swift1 object-server[24231]: INFO PUT /d2/5749/AUTH_29af7f1e19774999bf700fbef31994d3/w2dbg-1785924675/obj1 201 0.0128s
+-- 10.0.4.2 --
+Aug 05 10:11:31 swift2 object-server[3976682]: INFO PUT /d2/6226/AUTH_29af7f1e19774999bf700fbef31994d3/w2ok-1785924690/obj1 201 0.0605s
+-- 10.0.4.3 --
+Aug 05 10:11:31 swift3 object-server[69525]: INFO PUT /d2/6226/AUTH_29af7f1e19774999bf700fbef31994d3/w2ok-1785924690/obj1 201 0.0700s
+-- 10.0.4.4 --
+Aug 05 10:11:31 swift4 object-server[1318283]: INFO PUT /d2/6226/AUTH_29af7f1e19774999bf700fbef31994d3/w2ok-1785924690/obj1 201 0.0916s

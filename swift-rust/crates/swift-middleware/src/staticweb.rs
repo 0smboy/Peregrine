@@ -293,14 +293,12 @@ impl Middleware for StaticWeb {
         let container = parts[2].clone().unwrap_or_default();
         let obj = parts[3].clone();
 
-        // HEAD the container for its web config.
-        let head = Request {
-            method: "HEAD".to_string(),
-            path: format!("/{version}/{account}/{container}"),
-            query_string: String::new(),
-            headers: HeaderKeyDict::new(),
-            body: Body::empty(),
-        };
+        // HEAD the container for its web config (carry caller auth).
+        let mut head = req.clone_head();
+        head.method = "HEAD".to_string();
+        head.path = format!("/{version}/{account}/{container}");
+        head.query_string = String::new();
+        head.headers.remove("Content-Length");
         let cinfo = next(head);
         let web_index = cinfo
             .headers

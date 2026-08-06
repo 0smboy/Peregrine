@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Wave 2 — servers_per_port + multi-region</title>
+<style>
+  body{font-family:ui-sans-serif,system-ui,sans-serif;margin:2rem;max-width:920px;color:#1a1a1a;background:#faf9f7}
+  h1{font-size:1.5rem;margin:0 0 .5rem}
+  .meta{color:#555;margin-bottom:1.5rem}
+  table{border-collapse:collapse;width:100%;margin:1rem 0}
+  th,td{border:1px solid #ccc;padding:.45rem .6rem;text-align:left;font-size:.9rem}
+  th{background:#eee}
+  .pass{color:#0a6}.partial{color:#a60}.backlog{color:#666}
+  code{font-size:.85em}
+  section{margin:1.5rem 0}
+</style>
+</head>
+<body>
+<h1>Wave 2 — servers_per_port + multi-region</h1>
+<p class="meta">2026-08-05 · Verdict: <strong class="partial">PARTIAL GREEN</strong> · Evidence: <code>tools/test-results/wave2-spp-region-20260805/</code></p>
+
+<section>
+<h2>1. What this cycle did</h2>
+<ul>
+  <li>Ring template: <code>object_port_per_device</code> → d1:6200, d2:6201, d3:6202</li>
+  <li>Runtime: process-per-port (parent re-exec supervise; child binds one port)</li>
+  <li>Docs: WORKERS-SEMANTICS, CONFIG-PARITY → <code>iso-config</code></li>
+  <li>Multi-region sample host_vars r1z1/r1z2 + r2z1/r2z2; dry-run drill plan</li>
+  <li>Unit/workspace tests green; Contabo live rebuild not run (Wave 0 space / no wipe)</li>
+</ul>
+</section>
+
+<section>
+<h2>2. Optimized / fixed</h2>
+<ul>
+  <li>Closed P2c residual “shared-pool only” for process model</li>
+  <li>Closed “single port in ring template” for greenfield/expand object adds</li>
+</ul>
+</section>
+
+<section>
+<h2>3. Measured effect</h2>
+<table>
+  <tr><th>Gate</th><th>Before</th><th>After</th></tr>
+  <tr><td>spp unit</td><td>8/8 (shared pool)</td><td class="pass">9/9 (plan + process notes)</td></tr>
+  <tr><td>workspace wave2 contracts</td><td>—</td><td class="pass">2/2</td></tr>
+  <tr><td>Contabo discovery ports</td><td>{6200}</td><td class="backlog">unchanged (rebuild backlog)</td></tr>
+</table>
+</section>
+
+<section>
+<h2>4. Gate table</h2>
+<table>
+  <tr><th>Gate</th><th>Result</th></tr>
+  <tr><td>Code: per-device ports template</td><td class="pass">PASS</td></tr>
+  <tr><td>Code: process-per-port</td><td class="pass">PASS</td></tr>
+  <tr><td>Docs honesty</td><td class="pass">PASS</td></tr>
+  <tr><td>Multi-region host_vars/docs</td><td class="pass">PASS (samples + dry-run)</td></tr>
+  <tr><td>Contabo live ring rebuild</td><td class="backlog">BACKLOG</td></tr>
+  <tr><td>Contabo live r1/r2 drill</td><td class="backlog">BACKLOG</td></tr>
+  <tr><td>func 54/54 + spp smoke</td><td class="backlog">Not run</td></tr>
+</table>
+</section>
+
+<section>
+<h2>5. Remaining / next</h2>
+<p><strong>FROZEN:</strong> Contabo wipe/mkfs. <strong>Backlog:</strong> ring rebuild after Wave 0; enable spp; VIP smoke.</p>
+</section>
+</body>
+</html>

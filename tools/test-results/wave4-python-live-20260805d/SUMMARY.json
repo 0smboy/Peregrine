@@ -1,0 +1,31 @@
+{
+  "wave": "w4-python-live",
+  "pack": "wave4-python-live-20260805d",
+  "timestamp_utc": "20260805T121100Z",
+  "verdict": "GREEN_LAB",
+  "python_cluster": "PRESENT_3NODE",
+  "production_go_live": false,
+  "gates": {
+    "disk_use_lt_70": "PASS",
+    "disk_use_lt_50": "PASS",
+    "isolation": "PASS",
+    "vip_tempauth_crud": "PASS",
+    "vip_keystone_crud": "PASS",
+    "python_crud_internal": "PASS",
+    "install_3node": "PASS",
+    "node_4": "NOT_EXECUTED"
+  },
+  "rust_rings_after": {
+    "account": {"devices": ["d2"], "ports": [6202]},
+    "container": {"devices": ["d2"], "ports": [6201]},
+    "object": {"devices": ["d2", "d3"], "ports": [6211, 6212]}
+  },
+  "python": {
+    "nodes": ["swift2", "swift3", "swift4"],
+    "entry": "http://10.0.0.2-4:8090",
+    "device": "py under /srv/node/d1",
+    "runtime": "/opt/pyswift-venv + /etc/pyswift"
+  },
+  "backup": "/root/w4-ring-backup-20260805T113908Z",
+  "report": "WAVE4-LIVE-REPORT.html"
+}

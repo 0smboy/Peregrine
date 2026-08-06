@@ -2,9 +2,19 @@
 - name: Stopping/killing mariadb service
   shell: pkill -9 -u mysql || true
 
+# Package names differ by repo:
+#   MariaDB.org → MariaDB-backup / galera-4
+#   Rocky/RHEL AppStream → mariadb-backup / galera
+# Contabo Identity sets mariadb_*_package overrides in group_vars.
 - name: Deleting old mariadb
   yum:
-    name: ['mariadb','mariadb-server', 'MariaDB-backup', 'galera-4', 'python3-PyMySQL']
+    name:
+      - mariadb
+      - mariadb-server
+      - "{{ mariadb_backup_package | default('MariaDB-backup') }}"
+      - "{{ mariadb_galera_legacy_package | default('galera-4') }}"
+      - "{{ mariadb_galera_package | default('galera') }}"
+      - python3-PyMySQL
     state: removed
 
 - name: Removing old mariadb directory
@@ -20,11 +30,13 @@
 
 - name: Installing mariadb packages
   package:
-    name={{ item }}
-    state=latest
+    name: "{{ item }}"
+    state: latest
   with_items:
     - mariadb
     - mariadb-server
-    - MariaDB-backup
-    - galera
+    - "{{ mariadb_backup_package | default('MariaDB-backup') }}"
+    - "{{ mariadb_galera_package | default('galera') }}"
     - python3-PyMySQL
+    # Rocky AppStream: provides /usr/bin/galera_new_cluster (harmless no-op when absent elsewhere)
+    - "{{ mariadb_server_galera_package | default('mariadb-server-galera') }}"

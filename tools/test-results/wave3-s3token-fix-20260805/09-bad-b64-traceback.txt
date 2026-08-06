@@ -1,0 +1,62 @@
+RemoteDisconnected Remote end closed connection without response
+===TRACE===
+2026-08-05 10:19:15.379 4154570 ERROR keystone     app_iter = application(self.environ, start_response)
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/keystone/server/flask/request_processing/middleware/url_normalize.py", line 38, in __call__
+2026-08-05 10:19:15.379 4154570 ERROR keystone     return self.app(environ, start_response)
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/webob/dec.py", line 129, in __call__
+2026-08-05 10:19:15.379 4154570 ERROR keystone     resp = self.call_func(req, *args, **kw)
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/webob/dec.py", line 193, in call_func
+2026-08-05 10:19:15.379 4154570 ERROR keystone     return self.func(req, *args, **kwargs)
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/keystonemiddleware/auth_token/__init__.py", line 340, in __call__
+2026-08-05 10:19:15.379 4154570 ERROR keystone     response = req.get_response(self._app)
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/webob/request.py", line 1313, in send
+2026-08-05 10:19:15.379 4154570 ERROR keystone     status, headers, app_iter = self.call_application(
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/webob/request.py", line 1278, in call_application
+2026-08-05 10:19:15.379 4154570 ERROR keystone     app_iter = application(self.environ, start_response)
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/werkzeug/middleware/dispatcher.py", line 80, in __call__
+2026-08-05 10:19:15.379 4154570 ERROR keystone     return app(environ, start_response)
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/flask/app.py", line 1466, in wsgi_app
+2026-08-05 10:19:15.379 4154570 ERROR keystone     response = self.handle_exception(e)
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/flask_restful/__init__.py", line 271, in error_router
+2026-08-05 10:19:15.379 4154570 ERROR keystone     return original_handler(e)
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/flask_restful/__init__.py", line 271, in error_router
+2026-08-05 10:19:15.379 4154570 ERROR keystone     return original_handler(e)
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/flask_restful/__init__.py", line 271, in error_router
+2026-08-05 10:19:15.379 4154570 ERROR keystone     return original_handler(e)
+2026-08-05 10:19:15.379 4154570 ERROR keystone   [Previous line repeated 28 more times]
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/flask/app.py", line 1463, in wsgi_app
+2026-08-05 10:19:15.379 4154570 ERROR keystone     response = self.full_dispatch_request()
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/flask/app.py", line 872, in full_dispatch_request
+2026-08-05 10:19:15.379 4154570 ERROR keystone     rv = self.handle_user_exception(e)
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/flask_restful/__init__.py", line 271, in error_router
+2026-08-05 10:19:15.379 4154570 ERROR keystone     return original_handler(e)
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/flask_restful/__init__.py", line 271, in error_router
+2026-08-05 10:19:15.379 4154570 ERROR keystone     return original_handler(e)
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/flask_restful/__init__.py", line 271, in error_router
+2026-08-05 10:19:15.379 4154570 ERROR keystone     return original_handler(e)
+2026-08-05 10:19:15.379 4154570 ERROR keystone   [Previous line repeated 28 more times]
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/flask/app.py", line 870, in full_dispatch_request
+2026-08-05 10:19:15.379 4154570 ERROR keystone     rv = self.dispatch_request()
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/flask/app.py", line 855, in dispatch_request
+2026-08-05 10:19:15.379 4154570 ERROR keystone     return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/flask_restful/__init__.py", line 467, in wrapper
+2026-08-05 10:19:15.379 4154570 ERROR keystone     resp = resource(*args, **kwargs)
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/flask/views.py", line 110, in view
+2026-08-05 10:19:15.379 4154570 ERROR keystone     return current_app.ensure_sync(self.dispatch_request)(**kwargs)  # type: ignore[no-any-return]
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/flask_restful/__init__.py", line 582, in dispatch_request
+2026-08-05 10:19:15.379 4154570 ERROR keystone     resp = meth(*args, **kwargs)
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/keystone/server/flask/common.py", line 1055, in wrapper
+2026-08-05 10:19:15.379 4154570 ERROR keystone     return f(*args, **kwargs)
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/keystone/api/s3tokens.py", line 99, in post
+2026-08-05 10:19:15.379 4154570 ERROR keystone     token = self.handle_authenticate()
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/keystone/api/_shared/EC2_S3_Resource.py", line 123, in handle_authenticate
+2026-08-05 10:19:15.379 4154570 ERROR keystone     self._check_signature(cred_data, credentials)
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib/python3.9/site-packages/keystone/api/s3tokens.py", line 80, in _check_signature
+2026-08-05 10:19:15.379 4154570 ERROR keystone     string_to_sign = base64.urlsafe_b64decode(str(credentials['token']))
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib64/python3.9/base64.py", line 133, in urlsafe_b64decode
+2026-08-05 10:19:15.379 4154570 ERROR keystone     return b64decode(s)
+2026-08-05 10:19:15.379 4154570 ERROR keystone   File "/usr/lib64/python3.9/base64.py", line 87, in b64decode
+2026-08-05 10:19:15.379 4154570 ERROR keystone     return binascii.a2b_base64(s)
+2026-08-05 10:19:15.379 4154570 ERROR keystone binascii.Error: Incorrect padding
+2026-08-05 10:19:15.379 4154570 ERROR keystone [00m
+[pid: 4154570|app: 0|req: 60/452] 127.0.0.1 () {34 vars in 408 bytes} [Wed Aug  5 10:19:15 2026] POST /v3/s3tokens => generated 0 bytes in 9 msecs (HTTP/1.1 500) 0 headers in 0 bytes (0 switches on core 1)

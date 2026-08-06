@@ -1,0 +1,5192 @@
+{
+  "schema_version": 2,
+  "bundle_fingerprint": "671981180efd87de910210c2531436d8f84af3da081fcf52d644f0f2c28fd5a0",
+  "inventory_fingerprint": "ef150e341b113e4afcf72f024544245f04aa49e4e1160f8f6cf2f1b8a660e4a3",
+  "playbook": "swift.yml",
+  "hosts": [
+    "10.88.0.11",
+    "10.88.0.12",
+    "10.88.0.13"
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "source": "roles/rust_common/tasks/main.yml#1",
+      "role": "rust_common",
+      "name": "probe the current timezone",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "timedatectl show -p Timezone --value 2>/dev/null || echo unknown",
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_tz_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 2,
+      "source": "roles/rust_common/tasks/main.yml#2",
+      "role": "rust_common",
+      "name": "set the timezone",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "timezone",
+      "args": {
+        "name": "{{ timezone }}"
+      },
+      "vars": {},
+      "when": [
+        "rust_tz_probe.stdout.find(timezone) == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 3,
+      "source": "roles/rust_common/tasks/main.yml#3",
+      "role": "rust_common",
+      "name": "create the swift configuration and state directories",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "file",
+      "args": {
+        "mode": "0755",
+        "path": "{{ item }}",
+        "state": "directory"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [
+        {
+          "kind": "with_items",
+          "expression": [
+            "/etc/swift",
+            "{{ srv_node_root }}",
+            "/var/cache/swift",
+            "/var/log/swift",
+            "/usr/local/bin",
+            "/usr/local/libexec"
+          ],
+          "loop_var": "item"
+        }
+      ],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 4,
+      "source": "roles/rust_common/tasks/main.yml#4",
+      "role": "rust_common",
+      "name": "probe for rsync",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "command -v rsync >/dev/null 2>&1 && echo PRESENT || echo ABSENT",
+      "vars": {},
+      "when": [
+        "'storage_nodes' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_rsync_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 5,
+      "source": "roles/rust_common/tasks/main.yml#5",
+      "role": "rust_common",
+      "name": "install rsync for the replicators",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "package",
+      "args": {
+        "name": "rsync",
+        "state": "present"
+      },
+      "vars": {},
+      "when": [
+        "'storage_nodes' in group_names",
+        "rust_rsync_probe.stdout.find('PRESENT') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 6,
+      "source": "roles/rust_common/tasks/main.yml#6",
+      "role": "rust_common",
+      "name": "disable conflicting legacy swift services if present",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "OUT=ABSENT\n# known legacy names from earlier hand deployments on these hosts:\n# the SAIO supervisor and the transient systemd-run swiftd-* units\nfor unit in swift-rust-saio swiftd-proxy swiftd-account swiftd-container swiftd-object; do\n  if systemctl is-active \"$unit\" >/dev/null 2>&1 || systemctl is-enabled \"$unit\" >/dev/null 2>&1; then\n    systemctl disable --now \"$unit\" >/dev/null 2>&1 || systemctl stop \"$unit\" >/dev/null 2>&1 || true\n    OUT=DISABLED\n  fi\ndone\necho \"$OUT\"\n",
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_saio_stop",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "rust_saio_stop.stdout.find('DISABLED') != -1"
+      ],
+      "risk": []
+    },
+    {
+      "id": 7,
+      "source": "roles/rust_payload/tasks/main.yml#1",
+      "role": "rust_payload",
+      "name": "install the swift binaries",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "copy",
+      "args": {
+        "dest": "/usr/local/bin/{{ item }}",
+        "mode": "0755",
+        "src": "bin/{{ item }}"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [
+        {
+          "kind": "with_items",
+          "expression": [
+            "swift-account-info",
+            "swift-account-reaper",
+            "swift-account-server",
+            "swift-container-info",
+            "swift-container-reconciler",
+            "swift-container-server",
+            "swift-container-sharder",
+            "swift-container-updater",
+            "swift-db-auditor",
+            "swift-db-replicator",
+            "swift-drive-audit",
+            "swift-get-nodes",
+            "swift-manage-shard-ranges",
+            "swift-object-auditor",
+            "swift-object-expirer",
+            "swift-object-info",
+            "swift-object-reconstructor",
+            "swift-object-replicator",
+            "swift-object-server",
+            "swift-object-updater",
+            "swift-proxy-server",
+            "swift-recon",
+            "swift-ring-builder",
+            "swift-ring-info"
+          ],
+          "loop_var": "item"
+        }
+      ],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 8,
+      "source": "roles/rust_payload/tasks/main.yml#2",
+      "role": "rust_payload",
+      "name": "register /usr/local/lib with the dynamic loader",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "copy",
+      "args": {
+        "content": "/usr/local/lib\n",
+        "dest": "/etc/ld.so.conf.d/swift-rust.conf",
+        "mode": "0644"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 9,
+      "source": "roles/rust_payload/tasks/main.yml#3",
+      "role": "rust_payload",
+      "name": "install the erasure-coding shared libraries",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "copy",
+      "args": {
+        "dest": "/usr/local/lib/{{ item }}",
+        "mode": "0755",
+        "src": "lib/{{ item }}"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [
+        {
+          "kind": "with_items",
+          "expression": [
+            "liberasurecode.so.1.8.0",
+            "liberasurecode.so.1",
+            "liberasurecode.so",
+            "liberasurecode_rs_vand.so.1.0.1",
+            "liberasurecode_rs_vand.so.1",
+            "liberasurecode_rs_vand.so",
+            "libnullcode.so.1.0.1",
+            "libnullcode.so.1",
+            "libnullcode.so",
+            "libXorcode.so.1.0.1",
+            "libXorcode.so.1",
+            "libXorcode.so"
+          ],
+          "loop_var": "item"
+        }
+      ],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_libs_copy",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 10,
+      "source": "roles/rust_payload/tasks/main.yml#4",
+      "role": "rust_payload",
+      "name": "refresh the shared library cache",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "command",
+      "args": "ldconfig",
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 11,
+      "source": "roles/rust_payload/tasks/main.yml#5",
+      "role": "rust_payload",
+      "name": "verify liberasurecode is resolvable",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "ldconfig -p | grep -q liberasurecode && echo OK",
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_ldconfig_check",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [
+        "rust_ldconfig_check.stdout.find('OK') == -1"
+      ],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 12,
+      "source": "roles/rust_disks/tasks/main.yml#1",
+      "role": "rust_disks",
+      "name": "ensure srv_node_root exists",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "file",
+      "args": {
+        "mode": "0755",
+        "path": "{{ srv_node_root }}",
+        "state": "directory"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 13,
+      "source": "roles/rust_disks/tasks/main.yml#2",
+      "role": "rust_disks",
+      "name": "ensure swift device directories exist (mkdir only)",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "file",
+      "args": {
+        "mode": "0755",
+        "path": "{{ srv_node_root }}/{{ item }}",
+        "state": "directory"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [
+        {
+          "kind": "with_items",
+          "expression": "{{ swift_devices | default(['d1']) }}",
+          "loop_var": "item"
+        }
+      ],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 14,
+      "source": "roles/rust_replication_key/tasks/main.yml#1",
+      "role": "rust_replication_key",
+      "name": "generate the replication keypair on the first storage node",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "command",
+      "args": {
+        "_raw_params": "ssh-keygen -t ed25519 -N '' -C swift-replication -f /etc/swift/replication_key",
+        "creates": "/etc/swift/replication_key"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "{{ groups['storage_nodes'][0] }}",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 15,
+      "source": "roles/rust_replication_key/tasks/main.yml#2",
+      "role": "rust_replication_key",
+      "name": "ensure the controller staging directory exists",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "file",
+      "args": {
+        "mode": "0700",
+        "path": "{{ ring_fetch_dir }}",
+        "state": "directory"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "localhost",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 16,
+      "source": "roles/rust_replication_key/tasks/main.yml#3",
+      "role": "rust_replication_key",
+      "name": "fetch the private key to the controller",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "fetch",
+      "args": {
+        "dest": "{{ ring_fetch_dir }}/replication_key",
+        "flat": "yes",
+        "src": "/etc/swift/replication_key"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "{{ groups['storage_nodes'][0] }}",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 17,
+      "source": "roles/rust_replication_key/tasks/main.yml#4",
+      "role": "rust_replication_key",
+      "name": "fetch the public key to the controller",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "fetch",
+      "args": {
+        "dest": "{{ ring_fetch_dir }}/replication_key.pub",
+        "flat": "yes",
+        "src": "/etc/swift/replication_key.pub"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "{{ groups['storage_nodes'][0] }}",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 18,
+      "source": "roles/rust_replication_key/tasks/main.yml#5",
+      "role": "rust_replication_key",
+      "name": "install the private key on every storage node",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "copy",
+      "args": {
+        "dest": "/etc/swift/replication_key",
+        "mode": "0600",
+        "src": "{{ ring_fetch_dir }}/replication_key"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 19,
+      "source": "roles/rust_replication_key/tasks/main.yml#6",
+      "role": "rust_replication_key",
+      "name": "install the public key on every storage node",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "copy",
+      "args": {
+        "dest": "/etc/swift/replication_key.pub",
+        "mode": "0644",
+        "src": "{{ ring_fetch_dir }}/replication_key.pub"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 20,
+      "source": "roles/rust_replication_key/tasks/main.yml#7",
+      "role": "rust_replication_key",
+      "name": "read the public key",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "command",
+      "args": "cat /etc/swift/replication_key.pub",
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "{{ groups['storage_nodes'][0] }}",
+      "register": "rust_replication_pub",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 21,
+      "source": "roles/rust_replication_key/tasks/main.yml#8",
+      "role": "rust_replication_key",
+      "name": "ensure /root/.ssh exists",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "file",
+      "args": {
+        "mode": "0700",
+        "path": "/root/.ssh",
+        "state": "directory"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 22,
+      "source": "roles/rust_replication_key/tasks/main.yml#9",
+      "role": "rust_replication_key",
+      "name": "authorize the replication key on every storage node",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "lineinfile",
+      "args": {
+        "create": "yes",
+        "line": "{{ rust_replication_pub.stdout.strip() }}",
+        "mode": "0600",
+        "path": "/root/.ssh/authorized_keys"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 23,
+      "source": "roles/rust_config/tasks/main.yml#1",
+      "role": "rust_config",
+      "name": "render swift.conf",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/swift/swift.conf",
+        "mode": "0644",
+        "src": "swift.conf.j2"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [
+        "restart swift services"
+      ],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 24,
+      "source": "roles/rust_config/tasks/main.yml#2",
+      "role": "rust_config",
+      "name": "render proxy-server.conf",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/swift/proxy-server.conf",
+        "mode": "0600",
+        "src": "proxy-server.conf.j2"
+      },
+      "vars": {},
+      "when": [
+        "'proxy_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [
+        "restart swift services"
+      ],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 25,
+      "source": "roles/rust_config/tasks/main.yml#3",
+      "role": "rust_config",
+      "name": "render account-server.conf",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/swift/account-server.conf",
+        "mode": "0644",
+        "src": "account-server.conf.j2"
+      },
+      "vars": {},
+      "when": [
+        "'account_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [
+        "restart swift services"
+      ],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 26,
+      "source": "roles/rust_config/tasks/main.yml#4",
+      "role": "rust_config",
+      "name": "render container-server.conf",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/swift/container-server.conf",
+        "mode": "0644",
+        "src": "container-server.conf.j2"
+      },
+      "vars": {},
+      "when": [
+        "'container_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [
+        "restart swift services"
+      ],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 27,
+      "source": "roles/rust_config/tasks/main.yml#5",
+      "role": "rust_config",
+      "name": "render object-server.conf",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/swift/object-server.conf",
+        "mode": "0644",
+        "src": "object-server.conf.j2"
+      },
+      "vars": {},
+      "when": [
+        "'object_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [
+        "restart swift services"
+      ],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 28,
+      "source": "roles/rust_rings/tasks/main.yml#1",
+      "role": "rust_rings",
+      "name": "render the ring build script on the first proxy node",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/swift/build_rings.sh",
+        "mode": "0755",
+        "src": "build_rings.sh.j2"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "{{ groups['proxy_servers'][0] }}",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 29,
+      "source": "roles/rust_rings/tasks/main.yml#2",
+      "role": "rust_rings",
+      "name": "build the rings on the first proxy node",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "command",
+      "args": "bash /etc/swift/build_rings.sh",
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "{{ groups['proxy_servers'][0] }}",
+      "register": "rust_ring_build",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "rust_ring_build.stdout.find('RINGS-REBUILT') != -1 or rust_ring_build.stdout.find('RINGS-EXPANDED') != -1\n"
+      ],
+      "risk": []
+    },
+    {
+      "id": 30,
+      "source": "roles/rust_rings/tasks/main.yml#3",
+      "role": "rust_rings",
+      "name": "ensure the controller staging directory exists",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "file",
+      "args": {
+        "mode": "0700",
+        "path": "{{ ring_fetch_dir }}",
+        "state": "directory"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "localhost",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 31,
+      "source": "roles/rust_rings/tasks/main.yml#4",
+      "role": "rust_rings",
+      "name": "fetch the base rings to the controller",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "fetch",
+      "args": {
+        "dest": "{{ ring_fetch_dir }}/{{ item }}.ring.gz",
+        "flat": "yes",
+        "src": "/etc/swift/{{ item }}.ring.gz"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [
+        {
+          "kind": "with_items",
+          "expression": [
+            "account",
+            "container",
+            "object"
+          ],
+          "loop_var": "item"
+        }
+      ],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "{{ groups['proxy_servers'][0] }}",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 32,
+      "source": "roles/rust_rings/tasks/main.yml#5",
+      "role": "rust_rings",
+      "name": "fetch the extra policy rings to the controller",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "fetch",
+      "args": {
+        "dest": "{{ ring_fetch_dir }}/object-{{ item.index }}.ring.gz",
+        "flat": "yes",
+        "src": "/etc/swift/object-{{ item.index }}.ring.gz"
+      },
+      "vars": {},
+      "when": [
+        "item.index != 0"
+      ],
+      "loops": [
+        {
+          "kind": "with_items",
+          "expression": "{{ swift_policies }}",
+          "loop_var": "item"
+        }
+      ],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "{{ groups['proxy_servers'][0] }}",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 33,
+      "source": "roles/rust_rings/tasks/main.yml#6",
+      "role": "rust_rings",
+      "name": "distribute the base rings to every node",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "copy",
+      "args": {
+        "dest": "/etc/swift/{{ item }}.ring.gz",
+        "mode": "0644",
+        "src": "{{ ring_fetch_dir }}/{{ item }}.ring.gz"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [
+        {
+          "kind": "with_items",
+          "expression": [
+            "account",
+            "container",
+            "object"
+          ],
+          "loop_var": "item"
+        }
+      ],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 34,
+      "source": "roles/rust_rings/tasks/main.yml#7",
+      "role": "rust_rings",
+      "name": "distribute the extra policy rings to every node",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "copy",
+      "args": {
+        "dest": "/etc/swift/object-{{ item.index }}.ring.gz",
+        "mode": "0644",
+        "src": "{{ ring_fetch_dir }}/object-{{ item.index }}.ring.gz"
+      },
+      "vars": {},
+      "when": [
+        "item.index != 0"
+      ],
+      "loops": [
+        {
+          "kind": "with_items",
+          "expression": "{{ swift_policies }}",
+          "loop_var": "item"
+        }
+      ],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 35,
+      "source": "roles/rust_systemd/tasks/unit.yml#1",
+      "role": "rust_systemd",
+      "name": "install the unit file",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/systemd/system/{{ unit_name }}.service",
+        "mode": "0644",
+        "src": "swift-service.j2"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-account-server",
+        "svc_conf": "account-server.conf",
+        "svc_description": "Swift account server (rust)",
+        "unit_name": "swift-account"
+      },
+      "when": [
+        "'account_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_file",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 36,
+      "source": "roles/rust_systemd/tasks/unit.yml#2",
+      "role": "rust_systemd",
+      "name": "probe the unit state",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-account-server",
+        "svc_conf": "account-server.conf",
+        "svc_description": "Swift account server (rust)",
+        "unit_name": "swift-account"
+      },
+      "when": [
+        "'account_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 37,
+      "source": "roles/rust_systemd/tasks/unit.yml#3",
+      "role": "rust_systemd",
+      "name": "enable and start the unit",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "{{ unit_name }}",
+        "state": "started"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-account-server",
+        "svc_conf": "account-server.conf",
+        "svc_description": "Swift account server (rust)",
+        "unit_name": "swift-account"
+      },
+      "when": [
+        "'account_servers' in group_names",
+        "rust_unit_probe.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 38,
+      "source": "roles/rust_systemd/tasks/unit.yml#4",
+      "role": "rust_systemd",
+      "name": "restart the unit after a unit-file change",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "{{ unit_name }}",
+        "state": "restarted"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-account-server",
+        "svc_conf": "account-server.conf",
+        "svc_description": "Swift account server (rust)",
+        "unit_name": "swift-account"
+      },
+      "when": [
+        "'account_servers' in group_names",
+        "rust_unit_file.changed",
+        "rust_unit_probe.stdout.find('RUNNING') != -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 39,
+      "source": "roles/rust_systemd/tasks/unit.yml#1",
+      "role": "rust_systemd",
+      "name": "install the unit file",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/systemd/system/{{ unit_name }}.service",
+        "mode": "0644",
+        "src": "swift-service.j2"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-container-server",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container server (rust)",
+        "unit_name": "swift-container"
+      },
+      "when": [
+        "'container_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_file",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 40,
+      "source": "roles/rust_systemd/tasks/unit.yml#2",
+      "role": "rust_systemd",
+      "name": "probe the unit state",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-container-server",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container server (rust)",
+        "unit_name": "swift-container"
+      },
+      "when": [
+        "'container_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 41,
+      "source": "roles/rust_systemd/tasks/unit.yml#3",
+      "role": "rust_systemd",
+      "name": "enable and start the unit",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "{{ unit_name }}",
+        "state": "started"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-container-server",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container server (rust)",
+        "unit_name": "swift-container"
+      },
+      "when": [
+        "'container_servers' in group_names",
+        "rust_unit_probe.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 42,
+      "source": "roles/rust_systemd/tasks/unit.yml#4",
+      "role": "rust_systemd",
+      "name": "restart the unit after a unit-file change",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "{{ unit_name }}",
+        "state": "restarted"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-container-server",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container server (rust)",
+        "unit_name": "swift-container"
+      },
+      "when": [
+        "'container_servers' in group_names",
+        "rust_unit_file.changed",
+        "rust_unit_probe.stdout.find('RUNNING') != -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 43,
+      "source": "roles/rust_systemd/tasks/unit.yml#1",
+      "role": "rust_systemd",
+      "name": "install the unit file",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/systemd/system/{{ unit_name }}.service",
+        "mode": "0644",
+        "src": "swift-service.j2"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-server",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object server (rust)",
+        "unit_name": "swift-object"
+      },
+      "when": [
+        "'object_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_file",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 44,
+      "source": "roles/rust_systemd/tasks/unit.yml#2",
+      "role": "rust_systemd",
+      "name": "probe the unit state",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-server",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object server (rust)",
+        "unit_name": "swift-object"
+      },
+      "when": [
+        "'object_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 45,
+      "source": "roles/rust_systemd/tasks/unit.yml#3",
+      "role": "rust_systemd",
+      "name": "enable and start the unit",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "{{ unit_name }}",
+        "state": "started"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-server",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object server (rust)",
+        "unit_name": "swift-object"
+      },
+      "when": [
+        "'object_servers' in group_names",
+        "rust_unit_probe.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 46,
+      "source": "roles/rust_systemd/tasks/unit.yml#4",
+      "role": "rust_systemd",
+      "name": "restart the unit after a unit-file change",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "{{ unit_name }}",
+        "state": "restarted"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-server",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object server (rust)",
+        "unit_name": "swift-object"
+      },
+      "when": [
+        "'object_servers' in group_names",
+        "rust_unit_file.changed",
+        "rust_unit_probe.stdout.find('RUNNING') != -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 47,
+      "source": "roles/rust_systemd/tasks/unit.yml#1",
+      "role": "rust_systemd",
+      "name": "install the unit file",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/systemd/system/{{ unit_name }}.service",
+        "mode": "0644",
+        "src": "swift-service.j2"
+      },
+      "vars": {
+        "svc_args": "account",
+        "svc_bin": "swift-db-replicator",
+        "svc_conf": "account-server.conf",
+        "svc_description": "Swift account DB replicator (rust)",
+        "unit_name": "swift-account-replicator"
+      },
+      "when": [
+        "'account_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_file",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 48,
+      "source": "roles/rust_systemd/tasks/unit.yml#2",
+      "role": "rust_systemd",
+      "name": "probe the unit state",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {
+        "svc_args": "account",
+        "svc_bin": "swift-db-replicator",
+        "svc_conf": "account-server.conf",
+        "svc_description": "Swift account DB replicator (rust)",
+        "unit_name": "swift-account-replicator"
+      },
+      "when": [
+        "'account_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 49,
+      "source": "roles/rust_systemd/tasks/unit.yml#3",
+      "role": "rust_systemd",
+      "name": "enable and start the unit",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "{{ unit_name }}",
+        "state": "started"
+      },
+      "vars": {
+        "svc_args": "account",
+        "svc_bin": "swift-db-replicator",
+        "svc_conf": "account-server.conf",
+        "svc_description": "Swift account DB replicator (rust)",
+        "unit_name": "swift-account-replicator"
+      },
+      "when": [
+        "'account_servers' in group_names",
+        "rust_unit_probe.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 50,
+      "source": "roles/rust_systemd/tasks/unit.yml#4",
+      "role": "rust_systemd",
+      "name": "restart the unit after a unit-file change",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "{{ unit_name }}",
+        "state": "restarted"
+      },
+      "vars": {
+        "svc_args": "account",
+        "svc_bin": "swift-db-replicator",
+        "svc_conf": "account-server.conf",
+        "svc_description": "Swift account DB replicator (rust)",
+        "unit_name": "swift-account-replicator"
+      },
+      "when": [
+        "'account_servers' in group_names",
+        "rust_unit_file.changed",
+        "rust_unit_probe.stdout.find('RUNNING') != -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 51,
+      "source": "roles/rust_systemd/tasks/unit.yml#1",
+      "role": "rust_systemd",
+      "name": "install the unit file",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/systemd/system/{{ unit_name }}.service",
+        "mode": "0644",
+        "src": "swift-service.j2"
+      },
+      "vars": {
+        "svc_args": "container",
+        "svc_bin": "swift-db-replicator",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container DB replicator (rust)",
+        "unit_name": "swift-container-replicator"
+      },
+      "when": [
+        "'container_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_file",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 52,
+      "source": "roles/rust_systemd/tasks/unit.yml#2",
+      "role": "rust_systemd",
+      "name": "probe the unit state",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {
+        "svc_args": "container",
+        "svc_bin": "swift-db-replicator",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container DB replicator (rust)",
+        "unit_name": "swift-container-replicator"
+      },
+      "when": [
+        "'container_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 53,
+      "source": "roles/rust_systemd/tasks/unit.yml#3",
+      "role": "rust_systemd",
+      "name": "enable and start the unit",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "{{ unit_name }}",
+        "state": "started"
+      },
+      "vars": {
+        "svc_args": "container",
+        "svc_bin": "swift-db-replicator",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container DB replicator (rust)",
+        "unit_name": "swift-container-replicator"
+      },
+      "when": [
+        "'container_servers' in group_names",
+        "rust_unit_probe.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 54,
+      "source": "roles/rust_systemd/tasks/unit.yml#4",
+      "role": "rust_systemd",
+      "name": "restart the unit after a unit-file change",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "{{ unit_name }}",
+        "state": "restarted"
+      },
+      "vars": {
+        "svc_args": "container",
+        "svc_bin": "swift-db-replicator",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container DB replicator (rust)",
+        "unit_name": "swift-container-replicator"
+      },
+      "when": [
+        "'container_servers' in group_names",
+        "rust_unit_file.changed",
+        "rust_unit_probe.stdout.find('RUNNING') != -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 55,
+      "source": "roles/rust_systemd/tasks/unit.yml#1",
+      "role": "rust_systemd",
+      "name": "install the unit file",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/systemd/system/{{ unit_name }}.service",
+        "mode": "0644",
+        "src": "swift-service.j2"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-replicator",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object replicator (rust)",
+        "unit_name": "swift-object-replicator"
+      },
+      "when": [
+        "'object_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_file",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 56,
+      "source": "roles/rust_systemd/tasks/unit.yml#2",
+      "role": "rust_systemd",
+      "name": "probe the unit state",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-replicator",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object replicator (rust)",
+        "unit_name": "swift-object-replicator"
+      },
+      "when": [
+        "'object_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 57,
+      "source": "roles/rust_systemd/tasks/unit.yml#3",
+      "role": "rust_systemd",
+      "name": "enable and start the unit",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "{{ unit_name }}",
+        "state": "started"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-replicator",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object replicator (rust)",
+        "unit_name": "swift-object-replicator"
+      },
+      "when": [
+        "'object_servers' in group_names",
+        "rust_unit_probe.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 58,
+      "source": "roles/rust_systemd/tasks/unit.yml#4",
+      "role": "rust_systemd",
+      "name": "restart the unit after a unit-file change",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "{{ unit_name }}",
+        "state": "restarted"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-replicator",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object replicator (rust)",
+        "unit_name": "swift-object-replicator"
+      },
+      "when": [
+        "'object_servers' in group_names",
+        "rust_unit_file.changed",
+        "rust_unit_probe.stdout.find('RUNNING') != -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 59,
+      "source": "roles/rust_systemd/tasks/unit.yml#1",
+      "role": "rust_systemd",
+      "name": "install the unit file",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/systemd/system/{{ unit_name }}.service",
+        "mode": "0644",
+        "src": "swift-service.j2"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-updater",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object updater (rust)",
+        "unit_name": "swift-object-updater"
+      },
+      "when": [
+        "'object_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_file",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 60,
+      "source": "roles/rust_systemd/tasks/unit.yml#2",
+      "role": "rust_systemd",
+      "name": "probe the unit state",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-updater",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object updater (rust)",
+        "unit_name": "swift-object-updater"
+      },
+      "when": [
+        "'object_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 61,
+      "source": "roles/rust_systemd/tasks/unit.yml#3",
+      "role": "rust_systemd",
+      "name": "enable and start the unit",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "{{ unit_name }}",
+        "state": "started"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-updater",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object updater (rust)",
+        "unit_name": "swift-object-updater"
+      },
+      "when": [
+        "'object_servers' in group_names",
+        "rust_unit_probe.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 62,
+      "source": "roles/rust_systemd/tasks/unit.yml#4",
+      "role": "rust_systemd",
+      "name": "restart the unit after a unit-file change",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "{{ unit_name }}",
+        "state": "restarted"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-updater",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object updater (rust)",
+        "unit_name": "swift-object-updater"
+      },
+      "when": [
+        "'object_servers' in group_names",
+        "rust_unit_file.changed",
+        "rust_unit_probe.stdout.find('RUNNING') != -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 63,
+      "source": "roles/rust_systemd/tasks/unit.yml#1",
+      "role": "rust_systemd",
+      "name": "install the unit file",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/systemd/system/{{ unit_name }}.service",
+        "mode": "0644",
+        "src": "swift-service.j2"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-expirer",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object expirer (rust)",
+        "unit_name": "swift-object-expirer"
+      },
+      "when": [
+        "'object_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_file",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 64,
+      "source": "roles/rust_systemd/tasks/unit.yml#2",
+      "role": "rust_systemd",
+      "name": "probe the unit state",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-expirer",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object expirer (rust)",
+        "unit_name": "swift-object-expirer"
+      },
+      "when": [
+        "'object_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 65,
+      "source": "roles/rust_systemd/tasks/unit.yml#3",
+      "role": "rust_systemd",
+      "name": "enable and start the unit",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "{{ unit_name }}",
+        "state": "started"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-expirer",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object expirer (rust)",
+        "unit_name": "swift-object-expirer"
+      },
+      "when": [
+        "'object_servers' in group_names",
+        "rust_unit_probe.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 66,
+      "source": "roles/rust_systemd/tasks/unit.yml#4",
+      "role": "rust_systemd",
+      "name": "restart the unit after a unit-file change",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "{{ unit_name }}",
+        "state": "restarted"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-expirer",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object expirer (rust)",
+        "unit_name": "swift-object-expirer"
+      },
+      "when": [
+        "'object_servers' in group_names",
+        "rust_unit_file.changed",
+        "rust_unit_probe.stdout.find('RUNNING') != -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 67,
+      "source": "roles/rust_systemd/tasks/unit.yml#1",
+      "role": "rust_systemd",
+      "name": "install the unit file",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/systemd/system/{{ unit_name }}.service",
+        "mode": "0644",
+        "src": "swift-service.j2"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-account-reaper",
+        "svc_conf": "account-server.conf",
+        "svc_description": "Swift account reaper (rust)",
+        "unit_name": "swift-account-reaper"
+      },
+      "when": [
+        "'account_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_file",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 68,
+      "source": "roles/rust_systemd/tasks/unit.yml#2",
+      "role": "rust_systemd",
+      "name": "probe the unit state",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-account-reaper",
+        "svc_conf": "account-server.conf",
+        "svc_description": "Swift account reaper (rust)",
+        "unit_name": "swift-account-reaper"
+      },
+      "when": [
+        "'account_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 69,
+      "source": "roles/rust_systemd/tasks/unit.yml#3",
+      "role": "rust_systemd",
+      "name": "enable and start the unit",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "{{ unit_name }}",
+        "state": "started"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-account-reaper",
+        "svc_conf": "account-server.conf",
+        "svc_description": "Swift account reaper (rust)",
+        "unit_name": "swift-account-reaper"
+      },
+      "when": [
+        "'account_servers' in group_names",
+        "rust_unit_probe.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 70,
+      "source": "roles/rust_systemd/tasks/unit.yml#4",
+      "role": "rust_systemd",
+      "name": "restart the unit after a unit-file change",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "{{ unit_name }}",
+        "state": "restarted"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-account-reaper",
+        "svc_conf": "account-server.conf",
+        "svc_description": "Swift account reaper (rust)",
+        "unit_name": "swift-account-reaper"
+      },
+      "when": [
+        "'account_servers' in group_names",
+        "rust_unit_file.changed",
+        "rust_unit_probe.stdout.find('RUNNING') != -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 71,
+      "source": "roles/rust_systemd/tasks/unit.yml#1",
+      "role": "rust_systemd",
+      "name": "install the unit file",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/systemd/system/{{ unit_name }}.service",
+        "mode": "0644",
+        "src": "swift-service.j2"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-container-updater",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container updater (rust)",
+        "unit_name": "swift-container-updater"
+      },
+      "when": [
+        "'container_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_file",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 72,
+      "source": "roles/rust_systemd/tasks/unit.yml#2",
+      "role": "rust_systemd",
+      "name": "probe the unit state",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-container-updater",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container updater (rust)",
+        "unit_name": "swift-container-updater"
+      },
+      "when": [
+        "'container_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 73,
+      "source": "roles/rust_systemd/tasks/unit.yml#3",
+      "role": "rust_systemd",
+      "name": "enable and start the unit",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "{{ unit_name }}",
+        "state": "started"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-container-updater",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container updater (rust)",
+        "unit_name": "swift-container-updater"
+      },
+      "when": [
+        "'container_servers' in group_names",
+        "rust_unit_probe.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 74,
+      "source": "roles/rust_systemd/tasks/unit.yml#4",
+      "role": "rust_systemd",
+      "name": "restart the unit after a unit-file change",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "{{ unit_name }}",
+        "state": "restarted"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-container-updater",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container updater (rust)",
+        "unit_name": "swift-container-updater"
+      },
+      "when": [
+        "'container_servers' in group_names",
+        "rust_unit_file.changed",
+        "rust_unit_probe.stdout.find('RUNNING') != -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 75,
+      "source": "roles/rust_systemd/tasks/unit.yml#1",
+      "role": "rust_systemd",
+      "name": "install the unit file",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/systemd/system/{{ unit_name }}.service",
+        "mode": "0644",
+        "src": "swift-service.j2"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-container-reconciler",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container reconciler (rust)",
+        "unit_name": "swift-container-reconciler"
+      },
+      "when": [
+        "'container_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_file",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 76,
+      "source": "roles/rust_systemd/tasks/unit.yml#2",
+      "role": "rust_systemd",
+      "name": "probe the unit state",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-container-reconciler",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container reconciler (rust)",
+        "unit_name": "swift-container-reconciler"
+      },
+      "when": [
+        "'container_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 77,
+      "source": "roles/rust_systemd/tasks/unit.yml#3",
+      "role": "rust_systemd",
+      "name": "enable and start the unit",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "{{ unit_name }}",
+        "state": "started"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-container-reconciler",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container reconciler (rust)",
+        "unit_name": "swift-container-reconciler"
+      },
+      "when": [
+        "'container_servers' in group_names",
+        "rust_unit_probe.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 78,
+      "source": "roles/rust_systemd/tasks/unit.yml#4",
+      "role": "rust_systemd",
+      "name": "restart the unit after a unit-file change",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "{{ unit_name }}",
+        "state": "restarted"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-container-reconciler",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container reconciler (rust)",
+        "unit_name": "swift-container-reconciler"
+      },
+      "when": [
+        "'container_servers' in group_names",
+        "rust_unit_file.changed",
+        "rust_unit_probe.stdout.find('RUNNING') != -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 79,
+      "source": "roles/rust_systemd/tasks/unit.yml#1",
+      "role": "rust_systemd",
+      "name": "install the unit file",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/systemd/system/{{ unit_name }}.service",
+        "mode": "0644",
+        "src": "swift-service.j2"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-container-sharder",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container sharder (rust, local cleave)",
+        "unit_name": "swift-container-sharder"
+      },
+      "when": [
+        "'container_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_file",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 80,
+      "source": "roles/rust_systemd/tasks/unit.yml#2",
+      "role": "rust_systemd",
+      "name": "probe the unit state",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-container-sharder",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container sharder (rust, local cleave)",
+        "unit_name": "swift-container-sharder"
+      },
+      "when": [
+        "'container_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 81,
+      "source": "roles/rust_systemd/tasks/unit.yml#3",
+      "role": "rust_systemd",
+      "name": "enable and start the unit",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "{{ unit_name }}",
+        "state": "started"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-container-sharder",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container sharder (rust, local cleave)",
+        "unit_name": "swift-container-sharder"
+      },
+      "when": [
+        "'container_servers' in group_names",
+        "rust_unit_probe.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 82,
+      "source": "roles/rust_systemd/tasks/unit.yml#4",
+      "role": "rust_systemd",
+      "name": "restart the unit after a unit-file change",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "{{ unit_name }}",
+        "state": "restarted"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-container-sharder",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container sharder (rust, local cleave)",
+        "unit_name": "swift-container-sharder"
+      },
+      "when": [
+        "'container_servers' in group_names",
+        "rust_unit_file.changed",
+        "rust_unit_probe.stdout.find('RUNNING') != -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 83,
+      "source": "roles/rust_systemd/tasks/unit.yml#1",
+      "role": "rust_systemd",
+      "name": "install the unit file",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/systemd/system/{{ unit_name }}.service",
+        "mode": "0644",
+        "src": "swift-service.j2"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-reconstructor",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object reconstructor (rust)",
+        "unit_name": "swift-object-reconstructor"
+      },
+      "when": [
+        "'object_servers' in group_names",
+        "swift_policies | length > 1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_file",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 84,
+      "source": "roles/rust_systemd/tasks/unit.yml#2",
+      "role": "rust_systemd",
+      "name": "probe the unit state",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-reconstructor",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object reconstructor (rust)",
+        "unit_name": "swift-object-reconstructor"
+      },
+      "when": [
+        "'object_servers' in group_names",
+        "swift_policies | length > 1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 85,
+      "source": "roles/rust_systemd/tasks/unit.yml#3",
+      "role": "rust_systemd",
+      "name": "enable and start the unit",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "{{ unit_name }}",
+        "state": "started"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-reconstructor",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object reconstructor (rust)",
+        "unit_name": "swift-object-reconstructor"
+      },
+      "when": [
+        "'object_servers' in group_names",
+        "swift_policies | length > 1",
+        "rust_unit_probe.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 86,
+      "source": "roles/rust_systemd/tasks/unit.yml#4",
+      "role": "rust_systemd",
+      "name": "restart the unit after a unit-file change",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "{{ unit_name }}",
+        "state": "restarted"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-reconstructor",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object reconstructor (rust)",
+        "unit_name": "swift-object-reconstructor"
+      },
+      "when": [
+        "'object_servers' in group_names",
+        "swift_policies | length > 1",
+        "rust_unit_file.changed",
+        "rust_unit_probe.stdout.find('RUNNING') != -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 87,
+      "source": "roles/rust_systemd/tasks/unit.yml#1",
+      "role": "rust_systemd",
+      "name": "install the unit file",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/systemd/system/{{ unit_name }}.service",
+        "mode": "0644",
+        "src": "swift-service.j2"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-auditor",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object auditor (rust continuous)",
+        "unit_name": "swift-object-auditor"
+      },
+      "when": [
+        "'object_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_file",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 88,
+      "source": "roles/rust_systemd/tasks/unit.yml#2",
+      "role": "rust_systemd",
+      "name": "probe the unit state",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-auditor",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object auditor (rust continuous)",
+        "unit_name": "swift-object-auditor"
+      },
+      "when": [
+        "'object_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 89,
+      "source": "roles/rust_systemd/tasks/unit.yml#3",
+      "role": "rust_systemd",
+      "name": "enable and start the unit",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "{{ unit_name }}",
+        "state": "started"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-auditor",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object auditor (rust continuous)",
+        "unit_name": "swift-object-auditor"
+      },
+      "when": [
+        "'object_servers' in group_names",
+        "rust_unit_probe.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 90,
+      "source": "roles/rust_systemd/tasks/unit.yml#4",
+      "role": "rust_systemd",
+      "name": "restart the unit after a unit-file change",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "{{ unit_name }}",
+        "state": "restarted"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-object-auditor",
+        "svc_conf": "object-server.conf",
+        "svc_description": "Swift object auditor (rust continuous)",
+        "unit_name": "swift-object-auditor"
+      },
+      "when": [
+        "'object_servers' in group_names",
+        "rust_unit_file.changed",
+        "rust_unit_probe.stdout.find('RUNNING') != -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 91,
+      "source": "roles/rust_systemd/tasks/unit.yml#1",
+      "role": "rust_systemd",
+      "name": "install the unit file",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/systemd/system/{{ unit_name }}.service",
+        "mode": "0644",
+        "src": "swift-service.j2"
+      },
+      "vars": {
+        "svc_args": "account",
+        "svc_bin": "swift-db-auditor",
+        "svc_conf": "account-server.conf",
+        "svc_description": "Swift account DB auditor (rust continuous)",
+        "unit_name": "swift-account-auditor"
+      },
+      "when": [
+        "'account_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_file",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 92,
+      "source": "roles/rust_systemd/tasks/unit.yml#2",
+      "role": "rust_systemd",
+      "name": "probe the unit state",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {
+        "svc_args": "account",
+        "svc_bin": "swift-db-auditor",
+        "svc_conf": "account-server.conf",
+        "svc_description": "Swift account DB auditor (rust continuous)",
+        "unit_name": "swift-account-auditor"
+      },
+      "when": [
+        "'account_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 93,
+      "source": "roles/rust_systemd/tasks/unit.yml#3",
+      "role": "rust_systemd",
+      "name": "enable and start the unit",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "{{ unit_name }}",
+        "state": "started"
+      },
+      "vars": {
+        "svc_args": "account",
+        "svc_bin": "swift-db-auditor",
+        "svc_conf": "account-server.conf",
+        "svc_description": "Swift account DB auditor (rust continuous)",
+        "unit_name": "swift-account-auditor"
+      },
+      "when": [
+        "'account_servers' in group_names",
+        "rust_unit_probe.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 94,
+      "source": "roles/rust_systemd/tasks/unit.yml#4",
+      "role": "rust_systemd",
+      "name": "restart the unit after a unit-file change",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "{{ unit_name }}",
+        "state": "restarted"
+      },
+      "vars": {
+        "svc_args": "account",
+        "svc_bin": "swift-db-auditor",
+        "svc_conf": "account-server.conf",
+        "svc_description": "Swift account DB auditor (rust continuous)",
+        "unit_name": "swift-account-auditor"
+      },
+      "when": [
+        "'account_servers' in group_names",
+        "rust_unit_file.changed",
+        "rust_unit_probe.stdout.find('RUNNING') != -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 95,
+      "source": "roles/rust_systemd/tasks/unit.yml#1",
+      "role": "rust_systemd",
+      "name": "install the unit file",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/systemd/system/{{ unit_name }}.service",
+        "mode": "0644",
+        "src": "swift-service.j2"
+      },
+      "vars": {
+        "svc_args": "container",
+        "svc_bin": "swift-db-auditor",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container DB auditor (rust continuous)",
+        "unit_name": "swift-container-auditor"
+      },
+      "when": [
+        "'container_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_file",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 96,
+      "source": "roles/rust_systemd/tasks/unit.yml#2",
+      "role": "rust_systemd",
+      "name": "probe the unit state",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {
+        "svc_args": "container",
+        "svc_bin": "swift-db-auditor",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container DB auditor (rust continuous)",
+        "unit_name": "swift-container-auditor"
+      },
+      "when": [
+        "'container_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 97,
+      "source": "roles/rust_systemd/tasks/unit.yml#3",
+      "role": "rust_systemd",
+      "name": "enable and start the unit",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "{{ unit_name }}",
+        "state": "started"
+      },
+      "vars": {
+        "svc_args": "container",
+        "svc_bin": "swift-db-auditor",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container DB auditor (rust continuous)",
+        "unit_name": "swift-container-auditor"
+      },
+      "when": [
+        "'container_servers' in group_names",
+        "rust_unit_probe.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 98,
+      "source": "roles/rust_systemd/tasks/unit.yml#4",
+      "role": "rust_systemd",
+      "name": "restart the unit after a unit-file change",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "{{ unit_name }}",
+        "state": "restarted"
+      },
+      "vars": {
+        "svc_args": "container",
+        "svc_bin": "swift-db-auditor",
+        "svc_conf": "container-server.conf",
+        "svc_description": "Swift container DB auditor (rust continuous)",
+        "unit_name": "swift-container-auditor"
+      },
+      "when": [
+        "'container_servers' in group_names",
+        "rust_unit_file.changed",
+        "rust_unit_probe.stdout.find('RUNNING') != -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 99,
+      "source": "roles/rust_systemd/tasks/unit.yml#1",
+      "role": "rust_systemd",
+      "name": "install the unit file",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/systemd/system/{{ unit_name }}.service",
+        "mode": "0644",
+        "src": "swift-service.j2"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-proxy-server",
+        "svc_conf": "proxy-server.conf",
+        "svc_description": "Swift proxy server (rust)",
+        "unit_name": "swift-proxy"
+      },
+      "when": [
+        "'proxy_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_file",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 100,
+      "source": "roles/rust_systemd/tasks/unit.yml#2",
+      "role": "rust_systemd",
+      "name": "probe the unit state",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-proxy-server",
+        "svc_conf": "proxy-server.conf",
+        "svc_description": "Swift proxy server (rust)",
+        "unit_name": "swift-proxy"
+      },
+      "when": [
+        "'proxy_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_unit_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 101,
+      "source": "roles/rust_systemd/tasks/unit.yml#3",
+      "role": "rust_systemd",
+      "name": "enable and start the unit",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "{{ unit_name }}",
+        "state": "started"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-proxy-server",
+        "svc_conf": "proxy-server.conf",
+        "svc_description": "Swift proxy server (rust)",
+        "unit_name": "swift-proxy"
+      },
+      "when": [
+        "'proxy_servers' in group_names",
+        "rust_unit_probe.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 102,
+      "source": "roles/rust_systemd/tasks/unit.yml#4",
+      "role": "rust_systemd",
+      "name": "restart the unit after a unit-file change",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "{{ unit_name }}",
+        "state": "restarted"
+      },
+      "vars": {
+        "svc_args": "",
+        "svc_bin": "swift-proxy-server",
+        "svc_conf": "proxy-server.conf",
+        "svc_description": "Swift proxy server (rust)",
+        "unit_name": "swift-proxy"
+      },
+      "when": [
+        "'proxy_servers' in group_names",
+        "rust_unit_file.changed",
+        "rust_unit_probe.stdout.find('RUNNING') != -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 103,
+      "source": "roles/rust_systemd/tasks/main.yml#18",
+      "role": "rust_systemd",
+      "name": "install the auditor sweep script (manual ops)",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/usr/local/libexec/swift-audit-sweep.sh",
+        "mode": "0755",
+        "src": "swift-audit-sweep.sh.j2"
+      },
+      "vars": {},
+      "when": [
+        "'storage_nodes' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 104,
+      "source": "roles/rust_systemd/tasks/main.yml#19",
+      "role": "rust_systemd",
+      "name": "install the auditor sweep oneshot unit (manual; not timed)",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "copy",
+      "args": {
+        "content": "[Unit]\nDescription=Swift auditor sweep oneshot (rust manual)\n\n[Service]\nType=oneshot\nExecStart=/usr/local/libexec/swift-audit-sweep.sh\nStandardOutput=append:/var/log/swift/audit-sweep.log\nStandardError=append:/var/log/swift/audit-sweep.log\n",
+        "dest": "/etc/systemd/system/swift-audit-sweep.service",
+        "mode": "0644"
+      },
+      "vars": {},
+      "when": [
+        "'storage_nodes' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 105,
+      "source": "roles/rust_systemd/tasks/main.yml#20",
+      "role": "rust_systemd",
+      "name": "disable legacy nightly auditor timer (replaced by continuous daemons)",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "no",
+        "name": "swift-audit-sweep.timer",
+        "state": "stopped"
+      },
+      "vars": {},
+      "when": [
+        "'storage_nodes' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [
+        "false"
+      ],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 106,
+      "source": "roles/rust_haproxy/tasks/main.yml#1",
+      "role": "rust_haproxy",
+      "name": "probe for haproxy",
+      "host_pattern": "haproxy_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "command -v haproxy >/dev/null 2>&1 && echo PRESENT || echo ABSENT",
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_haproxy_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 107,
+      "source": "roles/rust_haproxy/tasks/main.yml#2",
+      "role": "rust_haproxy",
+      "name": "install haproxy",
+      "host_pattern": "haproxy_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "package",
+      "args": {
+        "name": "haproxy",
+        "state": "present"
+      },
+      "vars": {},
+      "when": [
+        "use_lb",
+        "rust_haproxy_probe.stdout.find('PRESENT') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 108,
+      "source": "roles/rust_haproxy/tasks/main.yml#3",
+      "role": "rust_haproxy",
+      "name": "allow haproxy to connect to any port under SELinux",
+      "host_pattern": "haproxy_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "if command -v getsebool >/dev/null 2>&1 && getsebool haproxy_connect_any 2>/dev/null | grep -q ' off$'; then\n  setsebool -P haproxy_connect_any 1\n  echo TOGGLED\nelse\n  echo UNCHANGED\nfi\n",
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_haproxy_sebool",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "rust_haproxy_sebool.stdout.find('TOGGLED') != -1"
+      ],
+      "risk": []
+    },
+    {
+      "id": 109,
+      "source": "roles/rust_haproxy/tasks/main.yml#4",
+      "role": "rust_haproxy",
+      "name": "ensure haproxy TLS staging dir on controller",
+      "host_pattern": "haproxy_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "file",
+      "args": {
+        "mode": "0700",
+        "path": "{{ ring_fetch_dir }}/haproxy-tls",
+        "state": "directory"
+      },
+      "vars": {},
+      "when": [
+        "use_lb",
+        "lb_mode == \"https\""
+      ],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "localhost",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 110,
+      "source": "roles/rust_haproxy/tasks/main.yml#5",
+      "role": "rust_haproxy",
+      "name": "install operator-provided HAProxy TLS PEM",
+      "host_pattern": "haproxy_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "copy",
+      "args": {
+        "dest": "{{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}",
+        "mode": "0600",
+        "src": "{{ haproxy_tls_pem_src }}"
+      },
+      "vars": {},
+      "when": [
+        "use_lb",
+        "lb_mode == \"https\" and (haproxy_tls_pem_src | default('')) | length > 0"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 111,
+      "source": "roles/rust_haproxy/tasks/main.yml#6",
+      "role": "rust_haproxy",
+      "name": "generate self-signed HAProxy TLS material on first LB host",
+      "host_pattern": "haproxy_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "set -euo pipefail\nPEM=\"{{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}\"\nCRT=/etc/haproxy/haproxy.crt\nKEY=/etc/haproxy/haproxy.key\nDAYS=\"{{ haproxy_tls_days | default(825) }}\"\nCN=\"{{ auth_url_ip }}\"\nif [ -f \"$PEM\" ] && [ -s \"$PEM\" ]; then\n  echo TLS-PRESENT\n  exit 0\nfi\nopenssl req -new -x509 -nodes -days \"$DAYS\" -subj \"/CN=$CN\" -out \"$CRT\" -keyout \"$KEY\"\ncat \"$CRT\" \"$KEY\" > \"$PEM\"\nchmod 600 \"$PEM\" \"$KEY\"\nchmod 644 \"$CRT\"\necho TLS-GENERATED\n",
+      "vars": {},
+      "when": [
+        "use_lb",
+        "lb_mode == \"https\" and (haproxy_tls_pem_src | default('')) | length == 0 and (haproxy_tls_self_signed | default(true)) and inventory_hostname == groups['haproxy_servers'][0]\n"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_haproxy_tls_gen",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "rust_haproxy_tls_gen.stdout.find('TLS-GENERATED') != -1"
+      ],
+      "risk": []
+    },
+    {
+      "id": 112,
+      "source": "roles/rust_haproxy/tasks/main.yml#7",
+      "role": "rust_haproxy",
+      "name": "fetch self-signed PEM to controller staging",
+      "host_pattern": "haproxy_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "fetch",
+      "args": {
+        "dest": "{{ ring_fetch_dir }}/haproxy-tls/haproxyCA.pem",
+        "flat": "yes",
+        "src": "{{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}"
+      },
+      "vars": {},
+      "when": [
+        "use_lb",
+        "lb_mode == \"https\" and (haproxy_tls_pem_src | default('')) | length == 0 and (haproxy_tls_self_signed | default(true))\n"
+      ],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "{{ groups['haproxy_servers'][0] }}",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 113,
+      "source": "roles/rust_haproxy/tasks/main.yml#8",
+      "role": "rust_haproxy",
+      "name": "distribute self-signed PEM to all HAProxy hosts",
+      "host_pattern": "haproxy_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "copy",
+      "args": {
+        "dest": "{{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}",
+        "mode": "0600",
+        "src": "{{ ring_fetch_dir }}/haproxy-tls/haproxyCA.pem"
+      },
+      "vars": {},
+      "when": [
+        "use_lb",
+        "lb_mode == \"https\" and (haproxy_tls_pem_src | default('')) | length == 0 and (haproxy_tls_self_signed | default(true))\n"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 114,
+      "source": "roles/rust_haproxy/tasks/main.yml#9",
+      "role": "rust_haproxy",
+      "name": "refuse https without TLS material path",
+      "host_pattern": "haproxy_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "echo \"lb_mode=https requires haproxy_tls_pem_src or haproxy_tls_self_signed=true\" >&2\nexit 1\n",
+      "vars": {},
+      "when": [
+        "use_lb",
+        "lb_mode == \"https\" and (haproxy_tls_pem_src | default('')) | length == 0 and haproxy_tls_self_signed == false"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 115,
+      "source": "roles/rust_haproxy/tasks/main.yml#10",
+      "role": "rust_haproxy",
+      "name": "render haproxy.cfg",
+      "host_pattern": "haproxy_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/haproxy/haproxy.cfg",
+        "mode": "0644",
+        "src": "haproxy.cfg.j2"
+      },
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_haproxy_cfg",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 116,
+      "source": "roles/rust_haproxy/tasks/main.yml#11",
+      "role": "rust_haproxy",
+      "name": "restart haproxy on configuration change",
+      "host_pattern": "haproxy_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "name": "haproxy",
+        "state": "restarted"
+      },
+      "vars": {},
+      "when": [
+        "use_lb",
+        "rust_haproxy_cfg.changed"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 117,
+      "source": "roles/rust_haproxy/tasks/main.yml#12",
+      "role": "rust_haproxy",
+      "name": "probe the haproxy unit state",
+      "host_pattern": "haproxy_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled haproxy >/dev/null 2>&1 && systemctl is-active haproxy >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_haproxy_state",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 118,
+      "source": "roles/rust_haproxy/tasks/main.yml#13",
+      "role": "rust_haproxy",
+      "name": "enable and start haproxy",
+      "host_pattern": "haproxy_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "haproxy",
+        "state": "started"
+      },
+      "vars": {},
+      "when": [
+        "use_lb",
+        "rust_haproxy_state.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 119,
+      "source": "roles/rust_haproxy/tasks/main.yml#14",
+      "role": "rust_haproxy",
+      "name": "validate haproxy can parse the rendered config",
+      "host_pattern": "haproxy_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "haproxy -c -f /etc/haproxy/haproxy.cfg",
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 120,
+      "source": "roles/rust_keepalived/tasks/main.yml#1",
+      "role": "rust_keepalived",
+      "name": "probe for keepalived",
+      "host_pattern": "keepalived_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "command -v keepalived >/dev/null 2>&1 && echo PRESENT || echo ABSENT",
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_keepalived_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 121,
+      "source": "roles/rust_keepalived/tasks/main.yml#2",
+      "role": "rust_keepalived",
+      "name": "install keepalived",
+      "host_pattern": "keepalived_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "package",
+      "args": {
+        "name": "keepalived",
+        "state": "present"
+      },
+      "vars": {},
+      "when": [
+        "use_lb",
+        "rust_keepalived_probe.stdout.find('PRESENT') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 122,
+      "source": "roles/rust_keepalived/tasks/main.yml#3",
+      "role": "rust_keepalived",
+      "name": "persist net.ipv4.ip_nonlocal_bind",
+      "host_pattern": "keepalived_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "copy",
+      "args": {
+        "dest": "/etc/sysctl.d/99-rust-keepalived.conf",
+        "mode": "0644",
+        "src": "99-rust-keepalived-sysctl.conf"
+      },
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_keepalived_sysctl",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 123,
+      "source": "roles/rust_keepalived/tasks/main.yml#4",
+      "role": "rust_keepalived",
+      "name": "apply ip_nonlocal_bind",
+      "host_pattern": "keepalived_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "sysctl -p /etc/sysctl.d/99-rust-keepalived.conf >/dev/null\nCURRENT=$(sysctl -n net.ipv4.ip_nonlocal_bind 2>/dev/null || echo 0)\nif [ \"$CURRENT\" = \"1\" ]; then\n  echo APPLIED\nelse\n  echo FAILED\n  exit 1\nfi\n",
+      "vars": {},
+      "when": [
+        "use_lb",
+        "rust_keepalived_sysctl.changed"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "true"
+      ],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 124,
+      "source": "roles/rust_keepalived/tasks/main.yml#5",
+      "role": "rust_keepalived",
+      "name": "ensure ip_nonlocal_bind is live",
+      "host_pattern": "keepalived_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "CURRENT=$(sysctl -n net.ipv4.ip_nonlocal_bind 2>/dev/null || echo 0)\nif [ \"$CURRENT\" = \"1\" ]; then\n  echo OK\nelse\n  sysctl -w net.ipv4.ip_nonlocal_bind=1 >/dev/null\n  echo TOGGLED\nfi\n",
+      "vars": {},
+      "when": [
+        "use_lb",
+        "not rust_keepalived_sysctl.changed"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_keepalived_nonlocal",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "rust_keepalived_nonlocal.stdout.find('TOGGLED') != -1"
+      ],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 125,
+      "source": "roles/rust_keepalived/tasks/main.yml#6",
+      "role": "rust_keepalived",
+      "name": "ensure keepalived config directory",
+      "host_pattern": "keepalived_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "file",
+      "args": {
+        "mode": "0755",
+        "path": "/etc/keepalived",
+        "state": "directory"
+      },
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 126,
+      "source": "roles/rust_keepalived/tasks/main.yml#7",
+      "role": "rust_keepalived",
+      "name": "render keepalived.conf",
+      "host_pattern": "keepalived_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/keepalived/keepalived.conf",
+        "mode": "0644",
+        "src": "keepalived.conf.j2"
+      },
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_keepalived_cfg",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 127,
+      "source": "roles/rust_keepalived/tasks/main.yml#8",
+      "role": "rust_keepalived",
+      "name": "install check_haproxy.sh",
+      "host_pattern": "keepalived_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "copy",
+      "args": {
+        "dest": "/etc/keepalived/check_haproxy.sh",
+        "mode": "0755",
+        "src": "check_haproxy.sh"
+      },
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_keepalived_check",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 128,
+      "source": "roles/rust_keepalived/tasks/main.yml#9",
+      "role": "rust_keepalived",
+      "name": "set keepalived log facility",
+      "host_pattern": "keepalived_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "CONF=/etc/sysconfig/keepalived\nLINE='KEEPALIVED_OPTIONS=\"-D --log-facility=1\"'\nif [ ! -f \"$CONF\" ]; then\n  printf '%s\\n' \"$LINE\" > \"$CONF\"\n  echo TOGGLED\nelif grep -q '^KEEPALIVED_OPTIONS=' \"$CONF\"; then\n  if grep -qxF \"$LINE\" \"$CONF\"; then\n    echo UNCHANGED\n  else\n    sed -i 's|^KEEPALIVED_OPTIONS=.*|'\"$LINE\"'|' \"$CONF\"\n    echo TOGGLED\n  fi\nelse\n  printf '\\n%s\\n' \"$LINE\" >> \"$CONF\"\n  echo TOGGLED\nfi\n",
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_keepalived_log",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "rust_keepalived_log.stdout.find('TOGGLED') != -1"
+      ],
+      "risk": []
+    },
+    {
+      "id": 129,
+      "source": "roles/rust_keepalived/tasks/main.yml#10",
+      "role": "rust_keepalived",
+      "name": "restart keepalived on configuration change",
+      "host_pattern": "keepalived_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "name": "keepalived",
+        "state": "restarted"
+      },
+      "vars": {},
+      "when": [
+        "use_lb",
+        "rust_keepalived_cfg.changed or rust_keepalived_check.changed or rust_keepalived_log.changed"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 130,
+      "source": "roles/rust_keepalived/tasks/main.yml#11",
+      "role": "rust_keepalived",
+      "name": "probe the keepalived unit state",
+      "host_pattern": "keepalived_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled keepalived >/dev/null 2>&1 && systemctl is-active keepalived >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_keepalived_state",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 131,
+      "source": "roles/rust_keepalived/tasks/main.yml#12",
+      "role": "rust_keepalived",
+      "name": "enable and start keepalived",
+      "host_pattern": "keepalived_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "keepalived",
+        "state": "started"
+      },
+      "vars": {},
+      "when": [
+        "use_lb",
+        "rust_keepalived_state.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 132,
+      "source": "roles/rust_verify/tasks/main.yml#1",
+      "role": "rust_verify",
+      "name": "wait for the local proxy to come up",
+      "host_pattern": "proxy_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "for _ in $(seq 30); do\n  code=$(curl -s -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:{{ proxy_bind_port }}/healthcheck || true)\n  if [ \"$code\" = \"200\" ]; then\n    echo UP\n    exit 0\n  fi\n  sleep 1\ndone\necho \"proxy did not answer /healthcheck within 30s\" >&2\nexit 1\n",
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 133,
+      "source": "roles/rust_verify/tasks/main.yml#2",
+      "role": "rust_verify",
+      "name": "proxy healthcheck answers 200",
+      "host_pattern": "proxy_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "uri",
+      "args": {
+        "status_code": 200,
+        "url": "http://127.0.0.1:{{ proxy_bind_port }}/healthcheck"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 134,
+      "source": "roles/rust_verify/tasks/main.yml#3",
+      "role": "rust_verify",
+      "name": "tempauth issues a token for the first account",
+      "host_pattern": "proxy_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "uri",
+      "args": {
+        "headers": {
+          "X-Auth-Key": "{{ swift_tempauth_users[0].key }}",
+          "X-Auth-User": "{{ swift_tempauth_users[0].account }}:{{ swift_tempauth_users[0].user }}"
+        },
+        "status_code": 200,
+        "url": "http://127.0.0.1:{{ proxy_bind_port }}/auth/v1.0"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 135,
+      "source": "roles/rust_verify/tasks/main.yml#4",
+      "role": "rust_verify",
+      "name": "container PUT/GET round trip",
+      "host_pattern": "proxy_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "set -e\nresp=$(curl -sf -m 10 -D - -o /dev/null http://127.0.0.1:{{ proxy_bind_port }}/auth/v1.0 \\\n  -H 'X-Auth-User: {{ swift_tempauth_users[0].account }}:{{ swift_tempauth_users[0].user }}' \\\n  -H 'X-Auth-Key: {{ swift_tempauth_users[0].key }}')\ntoken=$(printf '%s' \"$resp\" | tr -d '\\r' | awk 'tolower($1)==\"x-auth-token:\" {print $2}')\nurl=$(printf '%s' \"$resp\" | tr -d '\\r' | awk 'tolower($1)==\"x-storage-url:\" {print $2}')\ntest -n \"$token\"\ntest -n \"$url\"\ncurl -sf -m 10 -X PUT \"$url/swift-deploy-verify\" -H \"X-Auth-Token: $token\" -o /dev/null\ncurl -sf -m 10 \"$url?format=plain\" -H \"X-Auth-Token: $token\" | grep -q '^swift-deploy-verify$'\necho ROUND-TRIP-OK\n",
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 136,
+      "source": "roles/rust_verify/tasks/main.yml#5",
+      "role": "rust_verify",
+      "name": "HTTPS VIP healthcheck via HAProxy",
+      "host_pattern": "proxy_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "set -e\ncode=$(curl -sk -m 10 -o /dev/null -w '%{http_code}' \\\n  \"https://{{ auth_url_ip }}:{{ swift_lb_port }}/healthcheck\" || true)\nif [ \"$code\" != \"200\" ]; then\n  echo \"HTTPS VIP healthcheck failed: http_code=$code\" >&2\n  exit 1\nfi\necho HTTPS-VIP-OK\n",
+      "vars": {},
+      "when": [
+        "use_lb and lb_mode == \"https\""
+      ],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    }
+  ],
+  "handlers": [
+    {
+      "id": 137,
+      "source": "roles/rust_config/handlers/main.yml#1",
+      "role": "rust_config",
+      "name": "restart swift services",
+      "host_pattern": "all",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "shell",
+      "args": "units=$(systemctl list-units --type=service --state=running --no-legend --plain 'swift-*' 2>/dev/null | awk '{print $1}')\nfor unit in $units; do\n  systemctl try-restart \"$unit\"\ndone\necho \"restarted: $units\"\n",
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 138,
+      "source": "roles/rust_haproxy/handlers/main.yml#1",
+      "role": "rust_haproxy",
+      "name": "restart haproxy",
+      "host_pattern": "haproxy_servers",
+      "hosts": [
+        "10.88.0.11",
+        "10.88.0.12",
+        "10.88.0.13"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "haproxy",
+        "state": "restarted"
+      },
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    }
+  ],
+  "digest": "cb29aac3612f89b0ad14483fb58faff831d76858a33207b1d1f68c563d2cdd93"
+}

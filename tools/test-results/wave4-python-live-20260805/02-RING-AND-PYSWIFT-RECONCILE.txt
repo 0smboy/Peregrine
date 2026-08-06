@@ -1,0 +1,53 @@
+======== swift1 ========
+object: n=4 ports=[6200] devices=['d1'] regions=[1] ring_sha=d1ced8de0fe0ca81 mtime=1785821961.0945241
+container: n=4 ports=[6201] devices=['d1'] regions=[1] ring_sha=e21508f2982f798b mtime=1785821960.259523
+account: n=4 ports=[6202] devices=['d1'] regions=[1] ring_sha=4e7c9f3b4c2d82d4 mtime=1785821959.3475213
+pyswift:
+total 112
+drwxr-xr-x.   3 root root 4096 Aug  2 07:04 .
+drwxr-xr-x. 102 root root 8192 Aug  4 05:38 ..
+-rw-r--r--.   1 root root 9911 Aug  1 16:26 account.builder
+-rw-r--r--.   1 root root 1490 Aug  1 16:26 account.ring.gz
+no 8090/610x
+package openstack-swift is not installed
+======== swift2 ========
+object: n=12 ports=[6200] devices=['d1', 'd2', 'd3'] regions=[1] ring_sha=d1ced8de0fe0ca81 mtime=1785821966.9987247
+container: n=12 ports=[6201] devices=['d1', 'd2', 'd3'] regions=[1] ring_sha=e21508f2982f798b mtime=1785821965.2747612
+account: n=12 ports=[6202] devices=['d1', 'd2', 'd3'] regions=[1] ring_sha=4e7c9f3b4c2d82d4 mtime=1785821963.0468082
+pyswift:
+total 104
+drwxr-xr-x.  3 root root 4096 Aug  3 05:32 .
+drwxr-xr-x. 97 root root 8192 Aug  5 07:40 ..
+-rw-r--r--.  1 root root 9911 Aug  3 05:32 account.builder
+-rw-r--r--.  1 root root 1482 Aug  3 05:32 account.ring.gz
+LISTEN 0      4096        10.0.0.2:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=439060,fd=18),("swift-proxy-ser",pid=438908,fd=18))
+LISTEN 0      4096        10.0.0.2:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=439059,fd=16),("swift-proxy-ser",pid=438908,fd=16))
+437477 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-account-server /etc/pyswift/account-server.conf
+437478 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-container-server /etc/pyswift/container-server.conf
+437809 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-account-server /etc/pyswift/account-server.conf
+437810 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-account-server /etc/pyswift/account-server.conf
+437826 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-container-server /etc/pyswift/container-server.conf
+437827 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-container-server /etc/pyswift/container-server.conf
+438908 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-proxy-server /etc/pyswift/proxy-server.conf
+439059 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-proxy-server /etc/pyswift/proxy-server.conf
+439060 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-proxy-server /etc/pyswift/proxy-server.conf
+package openstack-swift is not installed
+======== swift3 ========
+object: n=12 ports=[6200] devices=['d1', 'd2', 'd3'] regions=[1] ring_sha=d1ced8de0fe0ca81 mtime=1785821969.8456352
+container: n=12 ports=[6201] devices=['d1', 'd2', 'd3'] regions=[1] ring_sha=e21508f2982f798b mtime=1785821968.9046376
+account: n=12 ports=[6202] devices=['d1', 'd2', 'd3'] regions=[1] ring_sha=4e7c9f3b4c2d82d4 mtime=1785821968.0166397
+pyswift:
+total 104
+drwxr-xr-x.  3 root root 4096 Aug  3 05:32 .
+drwxr-xr-x. 98 root root 8192 Aug  5 07:41 ..
+-rw-r--r--.  1 root root 9911 Aug  3 05:32 account.builder
+-rw-r--r--.  1 root root 1482 Aug  3 05:32 account.ring.gz
+no 8090/610x
+package openstack-swift is not installed
+======== swift4 ========
+object: n=12 ports=[6200] devices=['d1', 'd2', 'd3'] regions=[1] ring_sha=d1ced8de0fe0ca81 mtime=1785821975.1235895
+container: n=12 ports=[6201] devices=['d1', 'd2', 'd3'] regions=[1] ring_sha=e21508f2982f798b mtime=1785821973.558604
+account: n=12 ports=[6202] devices=['d1', 'd2', 'd3'] regions=[1] ring_sha=4e7c9f3b4c2d82d4 mtime=1785821971.9406188
+pyswift:
+no 8090/610x
+package openstack-swift is not installed

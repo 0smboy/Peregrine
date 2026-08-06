@@ -265,6 +265,7 @@ fn generated_request(key: &Path) -> WorkspaceRequest {
             disk_type: "hdd".to_owned(),
             system_disk: "nvme0n1".to_owned(),
             disks: vec!["/dev/nvme1n1".to_owned()],
+            swift_devices: Vec::new(),
             keepalived_interface: String::new(),
             keepalived_priority: None,
         }],

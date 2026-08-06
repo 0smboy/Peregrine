@@ -1,0 +1,12 @@
+Aug 04 13:40:53 swift2 proxy-server[481410]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth tempurl bulk ratelimit copy slo dlo proxy-logging proxy-server
+Aug 04 13:40:53 swift2 proxy-server[481410]: INFO tempurl enabled
+Aug 04 13:40:53 swift2 proxy-server[481410]: INFO bulk enabled (delete; max_deletes_per_request=10000)
+Aug 04 13:40:53 swift2 proxy-server[481410]: INFO ratelimit enabled
+Aug 04 13:40:58 swift3 proxy-server[3416346]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth tempurl bulk ratelimit copy slo dlo proxy-logging proxy-server
+Aug 04 13:40:58 swift3 proxy-server[3416346]: INFO tempurl enabled
+Aug 04 13:40:58 swift3 proxy-server[3416346]: INFO bulk enabled (delete; max_deletes_per_request=10000)
+Aug 04 13:40:58 swift3 proxy-server[3416346]: INFO ratelimit enabled
+Aug 04 13:41:04 swift4 proxy-server[2217531]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth tempurl bulk ratelimit copy slo dlo proxy-logging proxy-server
+Aug 04 13:41:04 swift4 proxy-server[2217531]: INFO tempurl enabled
+Aug 04 13:41:04 swift4 proxy-server[2217531]: INFO bulk enabled (delete; max_deletes_per_request=10000)
+Aug 04 13:41:04 swift4 proxy-server[2217531]: INFO ratelimit enabled

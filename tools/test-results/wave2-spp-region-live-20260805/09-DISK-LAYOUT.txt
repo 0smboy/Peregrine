@@ -1,0 +1,102 @@
+== d1 ==
+accounts
+async_pending
+async_pending-1
+containers
+objects
+objects-1
+quarantined
+tmp
+tmp-1
+/srv/node/d1
+/srv/node/d1/containers
+/srv/node/d1/containers/666
+/srv/node/d1/containers/666/7fa
+/srv/node/d1/containers/666/8c3
+/srv/node/d1/containers/603
+/srv/node/d1/containers/603/6bf
+/srv/node/d1/containers/603/c2c
+/srv/node/d1/containers/99
+/srv/node/d1/containers/99/835
+/srv/node/d1/containers/99/a33
+/srv/node/d1/containers/99/fcc
+/srv/node/d1/containers/519
+/srv/node/d1/containers/519/92e
+/srv/node/d1/containers/519/5bc
+/srv/node/d1/containers/519/210
+/srv/node/d1/containers/831
+/srv/node/d1/containers/831/07d
+/srv/node/d1/containers/6
+/srv/node/d1/containers/6/5f5
+48K	/srv/node/d1/accounts
+136K	/srv/node/d1/async_pending
+4.0K	/srv/node/d1/async_pending-1
+56M	/srv/node/d1/containers
+88M	/srv/node/d1/objects
+2.4M	/srv/node/d1/objects-1
+8.0K	/srv/node/d1/quarantined
+0	/srv/node/d1/tmp
+0	/srv/node/d1/tmp-1
+== d2 ==
+accounts
+async_pending
+async_pending-1
+containers
+objects
+objects-1
+tmp-1
+/srv/node/d2
+/srv/node/d2/accounts
+/srv/node/d2/accounts/976
+/srv/node/d2/accounts/976/dd5
+/srv/node/d2/objects
+/srv/node/d2/objects/19
+/srv/node/d2/objects/19/1d5
+/srv/node/d2/objects/19/073
+/srv/node/d2/objects/19/ec9
+/srv/node/d2/objects/19/dee
+/srv/node/d2/objects/19/b19
+/srv/node/d2/objects/19/f9b
+/srv/node/d2/objects/19/4bc
+/srv/node/d2/objects/19/091
+/srv/node/d2/objects/19/a1d
+/srv/node/d2/objects/19/717
+/srv/node/d2/objects/19/58a
+/srv/node/d2/objects/19/790
+/srv/node/d2/objects/19/886
+/srv/node/d2/objects/19/ec0
+136K	/srv/node/d2/accounts
+128K	/srv/node/d2/async_pending
+4.0K	/srv/node/d2/async_pending-1
+35M	/srv/node/d2/containers
+8.0M	/srv/node/d2/objects
+16K	/srv/node/d2/objects-1
+0	/srv/node/d2/tmp-1
+== d3 ==
+accounts
+async_pending
+async_pending-1
+containers
+objects
+objects-1
+tmp-1
+/srv/node/d3
+/srv/node/d3/objects
+/srv/node/d3/objects/641
+/srv/node/d3/objects/641/140
+/srv/node/d3/objects/641/ff9
+/srv/node/d3/objects/641/1fe
+/srv/node/d3/objects/641/f0a
+/srv/node/d3/objects/641/018
+/srv/node/d3/objects/641/476
+/srv/node/d3/objects/641/97f
+/srv/node/d3/objects/641/2f6
+/srv/node/d3/objects/641/b79
+/srv/node/d3/objects/641/93d
+/srv/node/d3/objects/641/3ab
+/srv/node/d3/objects/641/437
+/srv/node/d3/objects/641/30e
+/srv/node/d3/objects/641/777
+/srv/node/d3/objects/641/166
+/srv/node/d3/objects/641/59d
+/srv/node/d3/objects/641/0e1

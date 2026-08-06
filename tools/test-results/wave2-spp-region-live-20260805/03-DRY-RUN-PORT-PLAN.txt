@@ -1,0 +1,14 @@
+# Dry-run port plan (NO writes). date=2026-08-05T07:38:36Z
+# Current object ring devices (all ports should be 6200 today):
+unknown command search
+
+# Proposed object_port_per_device mapping (d1→6200,d2→6201,d3→6202) per node:
+
+# Conflict check: ports 6201/6202 currently owned by container/account
+LISTEN 0      128          0.0.0.0:6202       0.0.0.0:*    users:(("swift-account-s",pid=4188494,fd=5))             
+LISTEN 0      128          0.0.0.0:6200       0.0.0.0:*    users:(("swift-object-se",pid=310587,fd=5))              
+LISTEN 0      128          0.0.0.0:6201       0.0.0.0:*    users:(("swift-container",pid=382079,fd=5))              
+
+# ABORT: enabling spp without ring rebuild would leave discovery={6200} only
+# ABORT: ring_force_rebuild while META_DIRTY (968 ghost containers, API bytes 176GB vs disk ~2%) is UNSAFE per wave2 gate
+# GO criteria unmet: META_DIRTY conflict

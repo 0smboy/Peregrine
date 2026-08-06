@@ -29,13 +29,19 @@
 //! * queue object    = `"{policy_index}:/{account}/{container}/{object}"`,
 //! * content-type    = `application/x-put` | `application/x-delete`.
 //!
-//! Deferred: the `cmp_policy_info` container-recreation tie-break, the
-//! per-node direct GET/PUT/DELETE move transport, and the two-phase enqueue.
+//! Production uses [`HttpReconcileClient`] (ring-direct GET/PUT/DELETE move)
+//! and [`run_once`] over the `.misplaced_objects` queue. Deferred: the
+//! `cmp_policy_info` container-recreation tie-break and the two-phase enqueue.
 //! The move *decision* (which policy is authoritative, whether a queue entry
 //! is still actionable) is ported and unit-tested over a pluggable client.
 
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use swift_core::timestamp::decode_timestamps;
 use swift_http::split_path;
+use swift_ring::Ring;
 
 /// The hidden account holding the misplaced-object queue.
 pub const MISPLACED_OBJECTS_ACCOUNT: &str = ".misplaced_objects";
@@ -184,6 +190,485 @@ pub fn reconcile(
             }
         }
     }
+}
+
+fn pe(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            b => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn http_status(buf: &[u8]) -> u16 {
+    String::from_utf8_lossy(buf)
+        .split("\r\n")
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(500)
+}
+
+fn http_body(buf: &[u8]) -> &[u8] {
+    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        &buf[pos + 4..]
+    } else {
+        &[]
+    }
+}
+
+fn header_value<'a>(buf: &'a [u8], name: &str) -> Option<&'a str> {
+    let head = std::str::from_utf8(buf).ok()?;
+    let end = head.find("\r\n\r\n").unwrap_or(head.len());
+    for line in head[..end].split("\r\n").skip(1) {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.eq_ignore_ascii_case(name) {
+                return Some(v.trim());
+            }
+        }
+    }
+    None
+}
+
+fn node_host(node: &swift_ring::RingDevice, replication: bool) -> String {
+    if replication {
+        let ip = node
+            .replication_ip
+            .clone()
+            .unwrap_or_else(|| node.ip.clone());
+        let port = node.replication_port.unwrap_or(node.port);
+        format!("{ip}:{port}")
+    } else {
+        format!("{}:{}", node.ip, node.port)
+    }
+}
+
+fn raw_request(
+    host: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Option<(u16, Vec<u8>)> {
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n");
+    for (k, v) in headers {
+        request.push_str(&format!("{k}: {v}\r\n"));
+    }
+    request.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    ));
+    let Ok(mut conn) = TcpStream::connect(host) else {
+        return None;
+    };
+    conn.set_nodelay(true).ok();
+    let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    if conn.write_all(request.as_bytes()).is_err() {
+        return None;
+    }
+    if !body.is_empty() && conn.write_all(body).is_err() {
+        return None;
+    }
+    let mut buf = Vec::new();
+    if conn.read_to_end(&mut buf).is_err() {
+        return None;
+    }
+    Some((http_status(&buf), buf))
+}
+
+/// List containers under an account (JSON names).
+pub fn list_account_containers(account_ring: &Ring, account: &str) -> Option<Vec<String>> {
+    let (part, nodes) = account_ring.get_nodes(account, None, None).ok()?;
+    for node in &nodes {
+        let host = node_host(node.dev, true);
+        let path = format!(
+            "/{}/{part}/{}?format=json&limit=10000",
+            node.dev.device,
+            pe(account)
+        );
+        let Some((status, buf)) = raw_request(
+            &host,
+            "GET",
+            &path,
+            &[
+                ("Accept", "application/json"),
+                ("X-Backend-Allow-Reserved-Names", "true"),
+            ],
+            &[],
+        ) else {
+            continue;
+        };
+        if status == 404 {
+            return Some(Vec::new());
+        }
+        if !(200..300).contains(&status) {
+            continue;
+        }
+        let body = http_body(&buf);
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+            continue;
+        };
+        let Some(arr) = v.as_array() else {
+            continue;
+        };
+        let mut names = Vec::new();
+        for item in arr {
+            if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                names.push(name.to_string());
+            }
+        }
+        return Some(names);
+    }
+    None
+}
+
+/// List misplaced-object queue entries (name + content_type).
+pub fn list_queue_objects(
+    container_ring: &Ring,
+    account: &str,
+    container: &str,
+) -> Option<Vec<(String, String)>> {
+    let (part, nodes) = container_ring
+        .get_nodes(account, Some(container), None)
+        .ok()?;
+    for node in &nodes {
+        let host = node_host(node.dev, true);
+        let path = format!(
+            "/{}/{part}/{}/{}?format=json&limit=10000",
+            node.dev.device,
+            pe(account),
+            pe(container)
+        );
+        let Some((status, buf)) = raw_request(
+            &host,
+            "GET",
+            &path,
+            &[
+                ("Accept", "application/json"),
+                ("X-Backend-Allow-Reserved-Names", "true"),
+                ("X-Backend-Storage-Policy-Index", "0"),
+            ],
+            &[],
+        ) else {
+            continue;
+        };
+        if status == 404 {
+            return Some(Vec::new());
+        }
+        if !(200..300).contains(&status) {
+            continue;
+        }
+        let body = http_body(&buf);
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+            continue;
+        };
+        let Some(arr) = v.as_array() else {
+            continue;
+        };
+        let mut out = Vec::new();
+        for item in arr {
+            let Some(name) = item.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let ctype = item
+                .get("content_type")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            out.push((name.to_string(), ctype));
+        }
+        return Some(out);
+    }
+    None
+}
+
+/// Read a container's authoritative storage policy index (HEAD).
+pub fn container_policy_index(
+    container_ring: &Ring,
+    account: &str,
+    container: &str,
+) -> Option<i64> {
+    let (part, nodes) = container_ring
+        .get_nodes(account, Some(container), None)
+        .ok()?;
+    for node in &nodes {
+        let host = node_host(node.dev, true);
+        let path = format!(
+            "/{}/{part}/{}/{}",
+            node.dev.device,
+            pe(account),
+            pe(container)
+        );
+        let Some((status, buf)) = raw_request(
+            &host,
+            "HEAD",
+            &path,
+            &[("X-Backend-Storage-Policy-Index", "0")],
+            &[],
+        ) else {
+            continue;
+        };
+        if !(200..300).contains(&status) {
+            continue;
+        }
+        if let Some(raw) = header_value(&buf, "X-Backend-Storage-Policy-Index") {
+            if let Ok(pi) = raw.parse::<i64>() {
+                return Some(pi);
+            }
+        }
+        return Some(0);
+    }
+    None
+}
+
+/// Ring-direct reconcile client: GET from wrong policy → PUT to right →
+/// DELETE from wrong; pop via container ring.
+pub struct HttpReconcileClient<'a> {
+    pub object_ring: &'a Ring,
+    pub container_ring: &'a Ring,
+    /// Queue container the entry was listed from (for pop_queue).
+    pub queue_container: String,
+}
+
+impl ReconcileClient for HttpReconcileClient<'_> {
+    fn move_object(&self, entry: &QueueEntry, from_policy: i64, to_policy: i64) -> bool {
+        let Ok((part, nodes)) = self.object_ring.get_nodes(
+            &entry.account,
+            Some(&entry.container),
+            Some(&entry.obj),
+        ) else {
+            return false;
+        };
+        let from_pi = from_policy.to_string();
+        let to_pi = to_policy.to_string();
+        // GET body from any primary that still has the misplaced object.
+        let mut body: Option<Vec<u8>> = None;
+        let mut etag = String::new();
+        let mut content_type = String::from("application/octet-stream");
+        let mut x_timestamp = String::new();
+        for node in &nodes {
+            let host = node_host(node.dev, false);
+            let path = format!(
+                "/{}/{part}/{}/{}/{}",
+                node.dev.device,
+                pe(&entry.account),
+                pe(&entry.container),
+                pe(&entry.obj)
+            );
+            let Some((status, buf)) = raw_request(
+                &host,
+                "GET",
+                &path,
+                &[("X-Backend-Storage-Policy-Index", from_pi.as_str())],
+                &[],
+            ) else {
+                continue;
+            };
+            if !(200..300).contains(&status) {
+                continue;
+            }
+            etag = header_value(&buf, "ETag")
+                .unwrap_or("")
+                .trim_matches('"')
+                .to_string();
+            content_type = header_value(&buf, "Content-Type")
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            x_timestamp = header_value(&buf, "X-Timestamp")
+                .or_else(|| header_value(&buf, "X-Backend-Timestamp"))
+                .unwrap_or("")
+                .to_string();
+            body = Some(http_body(&buf).to_vec());
+            break;
+        }
+        let Some(body) = body else {
+            // Already gone from the wrong policy — treat as success so the
+            // queue entry can be popped (AlreadyCorrect-ish).
+            return true;
+        };
+        if x_timestamp.is_empty() {
+            x_timestamp = format!(
+                "{:.5}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0)
+            );
+        }
+        // PUT to the correct policy on a majority of primaries.
+        let mut put_ok = 0usize;
+        for node in &nodes {
+            let host = node_host(node.dev, false);
+            let path = format!(
+                "/{}/{part}/{}/{}/{}",
+                node.dev.device,
+                pe(&entry.account),
+                pe(&entry.container),
+                pe(&entry.obj)
+            );
+            let Some((status, _)) = raw_request(
+                &host,
+                "PUT",
+                &path,
+                &[
+                    ("X-Timestamp", x_timestamp.as_str()),
+                    ("Content-Type", content_type.as_str()),
+                    ("X-Backend-Storage-Policy-Index", to_pi.as_str()),
+                    ("ETag", etag.as_str()),
+                ],
+                &body,
+            ) else {
+                continue;
+            };
+            if (200..300).contains(&status) {
+                put_ok += 1;
+            }
+        }
+        if put_ok * 2 <= nodes.len() {
+            return false;
+        }
+        // DELETE the misplaced copy.
+        let mut del_ok = 0usize;
+        for node in &nodes {
+            let host = node_host(node.dev, false);
+            let path = format!(
+                "/{}/{part}/{}/{}/{}",
+                node.dev.device,
+                pe(&entry.account),
+                pe(&entry.container),
+                pe(&entry.obj)
+            );
+            let Some((status, _)) = raw_request(
+                &host,
+                "DELETE",
+                &path,
+                &[
+                    ("X-Timestamp", x_timestamp.as_str()),
+                    ("X-Backend-Storage-Policy-Index", from_pi.as_str()),
+                ],
+                &[],
+            ) else {
+                continue;
+            };
+            if (200..300).contains(&status) || status == 404 {
+                del_ok += 1;
+            }
+        }
+        del_ok > 0
+    }
+
+    fn pop_queue(&self, entry: &QueueEntry) -> bool {
+        let qname = reconciler_obj_name(entry.policy_index, &entry.account, &entry.container, &entry.obj);
+        let Ok((part, nodes)) = self.container_ring.get_nodes(
+            MISPLACED_OBJECTS_ACCOUNT,
+            Some(&self.queue_container),
+            Some(&qname),
+        ) else {
+            return false;
+        };
+        let ts = format!(
+            "{:.5}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0)
+        );
+        let mut ok = 0usize;
+        for node in &nodes {
+            let host = node_host(node.dev, true);
+            let path = format!(
+                "/{}/{part}/{}/{}/{}",
+                node.dev.device,
+                pe(MISPLACED_OBJECTS_ACCOUNT),
+                pe(&self.queue_container),
+                pe(&qname)
+            );
+            let Some((status, _)) = raw_request(
+                &host,
+                "DELETE",
+                &path,
+                &[
+                    ("X-Timestamp", ts.as_str()),
+                    ("X-Backend-Storage-Policy-Index", "0"),
+                    ("X-Backend-Allow-Reserved-Names", "true"),
+                ],
+                &[],
+            ) else {
+                continue;
+            };
+            if (200..300).contains(&status) || status == 404 {
+                ok += 1;
+            }
+        }
+        ok > 0
+    }
+}
+
+/// Aggregated reconciler pass stats.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReconcilerStats {
+    pub moved: u64,
+    pub already_correct: u64,
+    pub failed: u64,
+    pub errors: u64,
+}
+
+/// One full pass over `.misplaced_objects`.
+pub fn run_once(
+    account_ring: &Ring,
+    container_ring: &Ring,
+    object_ring: &Ring,
+) -> ReconcilerStats {
+    let mut stats = ReconcilerStats::default();
+    let Some(containers) = list_account_containers(account_ring, MISPLACED_OBJECTS_ACCOUNT) else {
+        stats.errors += 1;
+        return stats;
+    };
+    for qcontainer in containers {
+        let Some(objects) =
+            list_queue_objects(container_ring, MISPLACED_OBJECTS_ACCOUNT, &qcontainer)
+        else {
+            stats.errors += 1;
+            continue;
+        };
+        for (name, _ctype) in objects {
+            let Some(entry) = parse_reconciler_obj_name(&name) else {
+                continue;
+            };
+            let Some(current_pi) =
+                container_policy_index(container_ring, &entry.account, &entry.container)
+            else {
+                stats.errors += 1;
+                continue;
+            };
+            let client = HttpReconcileClient {
+                object_ring,
+                container_ring,
+                queue_container: qcontainer.clone(),
+            };
+            match reconcile(&entry, current_pi, &client) {
+                ReconcileOutcome::Moved => stats.moved += 1,
+                ReconcileOutcome::AlreadyCorrect => stats.already_correct += 1,
+                ReconcileOutcome::Failed => stats.failed += 1,
+            }
+        }
+    }
+    stats
+}
+
+/// Recon-cache update for the container reconciler.
+pub fn recon_update(elapsed: std::time::Duration, stats: &ReconcilerStats) -> serde_json::Value {
+    serde_json::json!({
+        "container_reconciler_pass": elapsed.as_secs_f64(),
+        "moved": stats.moved,
+        "already_correct": stats.already_correct,
+        "failed": stats.failed,
+    })
 }
 
 #[cfg(test)]

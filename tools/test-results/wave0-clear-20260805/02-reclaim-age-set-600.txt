@@ -1,0 +1,96 @@
+===== swift1 =====
+2026-08-05T03:40:10Z
+swift1
+-- /etc/swift/object-server.conf --
+45:reclaim_age = 600
+-- /etc/swift/container-server.conf --
+36:reclaim_age = 600
+21:[object-replicator]
+22:interval = 30
+32:interval = 300
+38:interval = 30
+44:interval = 300
+45:reclaim_age = 600
+51:interval = 30
+restarted swift-object-replicator
+restarted swift-object-auditor
+restarted swift-object-updater
+active
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   50G  340M 100% /srv/node/d1
+/dev/sda6        50G   45G  5.1G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.6G  89% /srv/node/d3
+ts=30715
+data=688022
+===== swift2 =====
+2026-08-05T03:42:24Z
+swift2
+-- /etc/swift/object-server.conf --
+45:reclaim_age = 600
+-- /etc/swift/container-server.conf --
+36:reclaim_age = 600
+21:[object-replicator]
+22:interval = 30
+32:interval = 300
+38:interval = 30
+44:interval = 300
+45:reclaim_age = 600
+51:interval = 30
+restarted swift-object-replicator
+restarted swift-object-auditor
+restarted swift-object-updater
+active
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   45G  5.2G  90% /srv/node/d1
+/dev/sda6        50G   45G  5.3G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.2G  90% /srv/node/d3
+ts=42147
+data=654132
+===== swift3 =====
+2026-08-05T03:48:37Z
+swift3
+-- /etc/swift/object-server.conf --
+45:reclaim_age = 600
+-- /etc/swift/container-server.conf --
+36:reclaim_age = 600
+21:[object-replicator]
+22:interval = 30
+32:interval = 300
+38:interval = 30
+44:interval = 300
+45:reclaim_age = 600
+51:interval = 30
+restarted swift-object-replicator
+restarted swift-object-auditor
+restarted swift-object-updater
+active
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   49G  1.8G  97% /srv/node/d1
+/dev/sda6        50G   45G  5.8G  89% /srv/node/d2
+/dev/sda7        50G   45G  5.6G  89% /srv/node/d3
+ts=48811
+data=669694
+===== swift4 =====
+2026-08-05T03:53:51Z
+swift4
+-- /etc/swift/object-server.conf --
+45:reclaim_age = 600
+-- /etc/swift/container-server.conf --
+36:reclaim_age = 600
+21:[object-replicator]
+22:interval = 30
+32:interval = 300
+38:interval = 30
+44:interval = 300
+45:reclaim_age = 600
+51:interval = 30
+restarted swift-object-replicator
+restarted swift-object-auditor
+restarted swift-object-updater
+active
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   44G  6.3G  88% /srv/node/d1
+/dev/sda6        50G   46G  5.0G  91% /srv/node/d2
+/dev/sda7        50G   45G  5.5G  90% /srv/node/d3
+ts=48165
+data=646458

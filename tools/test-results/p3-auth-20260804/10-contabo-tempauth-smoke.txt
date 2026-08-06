@@ -1,0 +1,13 @@
+NO_KEYSTONE_DIR=yes
+inactive
+keystone_inactive
+AUTH_STATUS=HTTP/1.1 200 OK
+PUT_CONT 201
+PUT_OBJ 201
+GET_OBJ 200
+DEL_OBJ 204
+DEL_CONT 204
+BAD_TOKEN 401
+info_tempauth True
+info_keystoneauth False
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server

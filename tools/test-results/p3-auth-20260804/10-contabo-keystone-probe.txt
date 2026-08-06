@@ -1,0 +1,33 @@
+# Contabo Keystone probe 2026-08-04T153653Z
+== 169.58.108.85 ==
+swift1
+ks5000=000unreachable
+
+ks35357=000unreachable
+
+pipeline=pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server
+vip_tempauth=200
+== 169.58.108.86 ==
+swift2
+ks5000=000unreachable
+
+ks35357=000unreachable
+
+pipeline=pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server
+vip_tempauth=200
+== 169.58.108.87 ==
+swift3
+ks5000=000unreachable
+
+ks35357=000unreachable
+
+pipeline=pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server
+vip_tempauth=200
+== 169.58.108.121 ==
+swift4
+ks5000=000unreachable
+
+ks35357=000unreachable
+
+pipeline=pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server
+vip_tempauth=200

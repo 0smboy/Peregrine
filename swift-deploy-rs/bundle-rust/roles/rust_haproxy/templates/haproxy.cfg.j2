@@ -22,16 +22,21 @@ defaults
     timeout http-request    30s
 
 frontend swift_proxy_front
+    # bind * so VIP (keepalived) and node IP both accept traffic once
+    # net.ipv4.ip_nonlocal_bind=1 is set by rust_keepalived.
+{% if lb_mode == "https" %}
+    # P3-ops: TLS termination at HAProxy. Backends stay plain HTTP to proxies.
+    bind *:{{ swift_lb_port }} ssl crt {{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}
+{% else %}
     bind *:{{ swift_lb_port }}
+{% endif %}
     default_backend swift_proxy_back
 
 backend swift_proxy_back
-    # source affinity, not roundrobin: tempauth tokens live in each proxy's
-    # in-process cache (the rust stand-in for Python's shared memcache), so a
-    # token minted by one proxy is unknown to the others. Affinity pins a
-    # client to one proxy; on failover the client re-auths once. A shared /
-    # self-validating token scheme is the v2 path to true roundrobin.
-    balance source
+    # roundrobin across every proxy business address. Tokens are HMAC-signed
+    # with swift_hash_path_prefix:suffix (shared), so any proxy can validate
+    # a token minted by another — source affinity is no longer required.
+    balance roundrobin
     option httpchk GET /healthcheck
 {% for host in groups['proxy_servers'] %}
     server proxy{{ loop.index }} {{ hostvars[host].business_network_address }}:{{ proxy_bind_port }} check inter 5s fall 3 rise 2
@@ -43,3 +48,37 @@ listen stats
     stats hide-version
     stats uri /haproxy?stats
     stats auth {{ haproxy_stats_user }}:{{ haproxy_stats_password }}
+
+{# Identity overlay — inlined (deploy-rs Renderer has no include loader).
+   Docs fragment: roles/rust_haproxy/templates/identity/haproxy-identity-listeners.cfg.j2
+   Contabo must NOT run python haproxy_servers (would clobber VIP :8085). #}
+{% if identity_haproxy_enabled | default(false) %}
+listen mariadb_cluster
+    bind 0.0.0.0:{{ haproxy_mariadb_port | default(3030) }}
+    mode tcp
+    balance leastconn
+    option httpchk
+{% for addr in identity_mariadb_backends | default([]) %}
+    server mariadb{{ loop.index }} {{ addr }}:{{ mariadb_bind_port | default(3306) }} check port {{ mariadb_check_bind_port | default(9600) }}
+{% endfor %}
+
+listen keystone_admin_cluster
+    bind *:{{ haproxy_keystone_admin_service_port | default(35357) }}
+    mode tcp
+    balance roundrobin
+    option tcpka
+    option tcplog
+{% for addr in identity_keystone_backends | default([]) %}
+    server keystone-admin{{ loop.index }} {{ addr }}:{{ uwsgi_keystone_admin_service_port | default(35358) }} check inter 2000 rise 2 fall 5
+{% endfor %}
+
+listen keystone_public_cluster
+    bind *:{{ haproxy_keystone_public_service_port | default(5000) }}
+    mode tcp
+    balance roundrobin
+    option tcpka
+    option tcplog
+{% for addr in identity_keystone_backends | default([]) %}
+    server keystone-public{{ loop.index }} {{ addr }}:{{ uwsgi_keystone_public_service_port | default(5001) }} check inter 2000 rise 2 fall 5
+{% endfor %}
+{% endif %}

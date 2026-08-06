@@ -1,0 +1,250 @@
+======== swift1 ========
+## hostname=swift1 date=2026-08-05T07:36:53Z
+## df
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  951M   50G   2% /srv/node/d1
+/dev/sda6        50G  748M   50G   2% /srv/node/d2
+/dev/sda7        50G  760M   50G   2% /srv/node/d3
+## mem
+MemTotal:        7865296 kB
+MemAvailable:    5234296 kB
+SwapTotal:             0 kB
+SwapFree:              0 kB
+## units
+active
+active
+active
+  UNIT                               LOAD   ACTIVE SUB     DESCRIPTION
+  swift-account-auditor.service      loaded active running Swift account DB auditor (rust continuous)
+  swift-account-reaper.service       loaded active running Swift account reaper (rust)
+  swift-account-replicator.service   loaded active running Swift account DB replicator (rust)
+  swift-account.service              loaded active running Swift account server (rust)
+  swift-container-auditor.service    loaded active running Swift container DB auditor (rust continuous)
+  swift-container-reconciler.service loaded active running Swift container reconciler (rust)
+  swift-container-replicator.service loaded active running Swift container DB replicator (rust)
+  swift-container-sharder.service    loaded active running Swift container sharder (rust, local cleave)
+  swift-container-updater.service    loaded active running Swift container updater (rust)
+  swift-container.service            loaded active running Swift container server (rust)
+  swift-object-auditor.service       loaded active running Swift object auditor (rust continuous)
+  swift-object-expirer.service       loaded active running Swift object expirer (rust)
+  swift-object-reconstructor.service loaded active running Swift object reconstructor (rust)
+  swift-object-replicator.service    loaded active running Swift object replicator (rust)
+  swift-object-updater.service       loaded active running Swift object updater (rust)
+  swift-object.service               loaded active running Swift object server (rust)
+  swift-proxy.service                loaded active running Swift proxy server (rust)
+
+LOAD   = Reflects whether the unit definition was properly loaded.
+ACTIVE = The high-level unit activation state, i.e. generalization of SUB.
+SUB    = The low-level unit activation state, values depend on unit type.
+17 loaded units listed.
+## object-server conf spp / bind
+# daemons (their own sections below; they read devices/bind_port from
+bind_port = 6200
+devices = /srv/node
+mount_check = false
+rsync_devices_root = /srv/node
+devices = /srv/node
+mount_check = false
+## ss object ports
+LISTEN 0      128          0.0.0.0:6202       0.0.0.0:*    users:(("swift-account-s",pid=4188494,fd=5))             
+LISTEN 0      128          0.0.0.0:6200       0.0.0.0:*    users:(("swift-object-se",pid=310587,fd=5))              
+LISTEN 0      128          0.0.0.0:6201       0.0.0.0:*    users:(("swift-container",pid=382079,fd=5))              
+## ring object devices (python if available)
+RING_PARSE_FAIL ModuleNotFoundError No module named 'swift'
+## object.builder if present
+-rw-r--r--. 1 root root 412 Aug  4 05:39 /etc/swift/object.ring.gz
+## sample account listing (meta dirtiness hint)
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server
+account_autocreate = true
+user_test_tester = azure-swift-2026.bench .admin
+account_ratelimit = 200
+[filter:account_quotas]
+use = egg:swift#account_quotas
+======== swift2 ========
+## hostname=swift2 date=2026-08-05T07:36:57Z
+## df
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  887M   50G   2% /srv/node/d1
+/dev/sda6        50G  755M   50G   2% /srv/node/d2
+/dev/sda7        50G  760M   50G   2% /srv/node/d3
+## mem
+MemTotal:        7865296 kB
+MemAvailable:    5183192 kB
+SwapTotal:             0 kB
+SwapFree:              0 kB
+## units
+active
+active
+active
+  UNIT                               LOAD   ACTIVE SUB     DESCRIPTION
+  swift-account-auditor.service      loaded active running Swift account DB auditor (rust continuous)
+  swift-account-reaper.service       loaded active running Swift account reaper (rust)
+  swift-account-replicator.service   loaded active running Swift account DB replicator (rust)
+  swift-account.service              loaded active running Swift account server (rust)
+  swift-container-auditor.service    loaded active running Swift container DB auditor (rust continuous)
+  swift-container-reconciler.service loaded active running Swift container reconciler (rust)
+  swift-container-replicator.service loaded active running Swift container DB replicator (rust)
+  swift-container-sharder.service    loaded active running Swift container sharder (rust, local cleave)
+  swift-container-updater.service    loaded active running Swift container updater (rust)
+  swift-container.service            loaded active running Swift container server (rust)
+  swift-object-auditor.service       loaded active running Swift object auditor (rust continuous)
+  swift-object-expirer.service       loaded active running Swift object expirer (rust)
+  swift-object-reconstructor.service loaded active running Swift object reconstructor (rust)
+  swift-object-replicator.service    loaded active running Swift object replicator (rust)
+  swift-object-updater.service       loaded active running Swift object updater (rust)
+  swift-object.service               loaded active running Swift object server (rust)
+  swift-proxy.service                loaded active running Swift proxy server (rust)
+
+LOAD   = Reflects whether the unit definition was properly loaded.
+ACTIVE = The high-level unit activation state, i.e. generalization of SUB.
+SUB    = The low-level unit activation state, values depend on unit type.
+17 loaded units listed.
+## object-server conf spp / bind
+# daemons (their own sections below; they read devices/bind_port from
+bind_port = 6200
+devices = /srv/node
+mount_check = false
+rsync_devices_root = /srv/node
+devices = /srv/node
+mount_check = false
+## ss object ports
+LISTEN 0      128          0.0.0.0:6202       0.0.0.0:*    users:(("swift-account-s",pid=2040794,fd=5))                                     
+LISTEN 0      128          0.0.0.0:6201       0.0.0.0:*    users:(("swift-container",pid=808827,fd=5))                                      
+LISTEN 0      128          0.0.0.0:6200       0.0.0.0:*    users:(("swift-object-se",pid=746199,fd=5))                                      
+## ring object devices (python if available)
+RING_PARSE_FAIL ModuleNotFoundError No module named 'swift'
+## object.builder if present
+-rw-r--r--. 1 root root 412 Aug  4 05:39 /etc/swift/object.ring.gz
+## sample account listing (meta dirtiness hint)
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server
+account_autocreate = true
+user_test_tester = azure-swift-2026.bench .admin
+account_ratelimit = 200
+[filter:account_quotas]
+use = egg:swift#account_quotas
+======== swift3 ========
+## hostname=swift3 date=2026-08-05T07:37:00Z
+## df
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  944M   50G   2% /srv/node/d1
+/dev/sda6        50G  757M   50G   2% /srv/node/d2
+/dev/sda7        50G  759M   50G   2% /srv/node/d3
+## mem
+MemTotal:        7865304 kB
+MemAvailable:    5111404 kB
+SwapTotal:             0 kB
+SwapFree:              0 kB
+## units
+active
+active
+active
+  UNIT                               LOAD   ACTIVE SUB     DESCRIPTION
+  swift-account-auditor.service      loaded active running Swift account DB auditor (rust continuous)
+  swift-account-reaper.service       loaded active running Swift account reaper (rust)
+  swift-account-replicator.service   loaded active running Swift account DB replicator (rust)
+  swift-account.service              loaded active running Swift account server (rust)
+  swift-container-auditor.service    loaded active running Swift container DB auditor (rust continuous)
+  swift-container-reconciler.service loaded active running Swift container reconciler (rust)
+  swift-container-replicator.service loaded active running Swift container DB replicator (rust)
+  swift-container-sharder.service    loaded active running Swift container sharder (rust, local cleave)
+  swift-container-updater.service    loaded active running Swift container updater (rust)
+  swift-container.service            loaded active running Swift container server (rust)
+  swift-object-auditor.service       loaded active running Swift object auditor (rust continuous)
+  swift-object-expirer.service       loaded active running Swift object expirer (rust)
+  swift-object-reconstructor.service loaded active running Swift object reconstructor (rust)
+  swift-object-replicator.service    loaded active running Swift object replicator (rust)
+  swift-object-updater.service       loaded active running Swift object updater (rust)
+  swift-object.service               loaded active running Swift object server (rust)
+  swift-proxy.service                loaded active running Swift proxy server (rust)
+
+LOAD   = Reflects whether the unit definition was properly loaded.
+ACTIVE = The high-level unit activation state, i.e. generalization of SUB.
+SUB    = The low-level unit activation state, values depend on unit type.
+17 loaded units listed.
+## object-server conf spp / bind
+# daemons (their own sections below; they read devices/bind_port from
+bind_port = 6200
+devices = /srv/node
+mount_check = false
+rsync_devices_root = /srv/node
+devices = /srv/node
+mount_check = false
+## ss object ports
+LISTEN 0      128          0.0.0.0:6202       0.0.0.0:*    users:(("swift-account-s",pid=4062782,fd=5))            
+LISTEN 0      128          0.0.0.0:6201       0.0.0.0:*    users:(("swift-container",pid=4000762,fd=5))            
+LISTEN 0      128          0.0.0.0:6200       0.0.0.0:*    users:(("swift-object-se",pid=3932897,fd=5))            
+## ring object devices (python if available)
+RING_PARSE_FAIL ModuleNotFoundError No module named 'swift'
+## object.builder if present
+-rw-r--r--. 1 root root 412 Aug  4 05:39 /etc/swift/object.ring.gz
+## sample account listing (meta dirtiness hint)
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server
+account_autocreate = true
+user_test_tester = azure-swift-2026.bench .admin
+account_ratelimit = 200
+[filter:account_quotas]
+use = egg:swift#account_quotas
+======== swift4 ========
+## hostname=swift4 date=2026-08-05T07:37:05Z
+## df
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  863M   50G   2% /srv/node/d1
+/dev/sda6        50G  751M   50G   2% /srv/node/d2
+/dev/sda7        50G  755M   50G   2% /srv/node/d3
+## mem
+MemTotal:        7865296 kB
+MemAvailable:    5083096 kB
+SwapTotal:             0 kB
+SwapFree:              0 kB
+## units
+active
+active
+active
+  UNIT                               LOAD   ACTIVE SUB     DESCRIPTION
+  swift-account-auditor.service      loaded active running Swift account DB auditor (rust continuous)
+  swift-account-reaper.service       loaded active running Swift account reaper (rust)
+  swift-account-replicator.service   loaded active running Swift account DB replicator (rust)
+  swift-account.service              loaded active running Swift account server (rust)
+  swift-console.service              loaded active running Swift Console (unified Files / Deploy / Monitor UI)
+  swift-container-auditor.service    loaded active running Swift container DB auditor (rust continuous)
+  swift-container-reconciler.service loaded active running Swift container reconciler (rust)
+  swift-container-replicator.service loaded active running Swift container DB replicator (rust)
+  swift-container-sharder.service    loaded active running Swift container sharder (rust, local cleave)
+  swift-container-updater.service    loaded active running Swift container updater (rust)
+  swift-container.service            loaded active running Swift container server (rust)
+  swift-deploy-ui.service            loaded active running Swift Deploy UI (localhost only)
+  swift-object-auditor.service       loaded active running Swift object auditor (rust continuous)
+  swift-object-expirer.service       loaded active running Swift object expirer (rust)
+  swift-object-reconstructor.service loaded active running Swift object reconstructor (rust)
+  swift-object-replicator.service    loaded active running Swift object replicator (rust)
+  swift-object-updater.service       loaded active running Swift object updater (rust)
+  swift-object.service               loaded active running Swift object server (rust)
+  swift-proxy.service                loaded active running Swift proxy server (rust)
+
+LOAD   = Reflects whether the unit definition was properly loaded.
+ACTIVE = The high-level unit activation state, i.e. generalization of SUB.
+SUB    = The low-level unit activation state, values depend on unit type.
+19 loaded units listed.
+## object-server conf spp / bind
+# daemons (their own sections below; they read devices/bind_port from
+bind_port = 6200
+devices = /srv/node
+mount_check = false
+rsync_devices_root = /srv/node
+devices = /srv/node
+mount_check = false
+## ss object ports
+LISTEN 0      128          0.0.0.0:6201       0.0.0.0:*    users:(("swift-container",pid=2552599,fd=5))            
+LISTEN 0      128          0.0.0.0:6200       0.0.0.0:*    users:(("swift-object-se",pid=2480368,fd=5))            
+LISTEN 0      128          0.0.0.0:6202       0.0.0.0:*    users:(("swift-account-s",pid=3877087,fd=5))            
+## ring object devices (python if available)
+RING_PARSE_FAIL ModuleNotFoundError No module named 'swift'
+## object.builder if present
+-rw-r--r--. 1 root root 412 Aug  4 05:39 /etc/swift/object.ring.gz
+## sample account listing (meta dirtiness hint)
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server
+account_autocreate = true
+user_test_tester = azure-swift-2026.bench .admin
+account_ratelimit = 200
+[filter:account_quotas]
+use = egg:swift#account_quotas

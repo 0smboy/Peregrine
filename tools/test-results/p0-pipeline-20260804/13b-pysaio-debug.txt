@@ -1,0 +1,16 @@
+--- object log ---
+--- try start proxy foreground ---
+bind_ip = 10.0.0.2
+bind_port = 8090
+[pipeline:main]
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth copy slo dlo proxy-server
+use = egg:swift#memcache
+memcache_servers = 127.0.0.1:11211
+LISTEN 0      4096        10.0.0.2:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=437851,fd=18),("swift-proxy-ser",pid=437578,fd=18))
+LISTEN 0      4096        10.0.0.2:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=437848,fd=16),("swift-proxy-ser",pid=437578,fd=16))
+437479 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-object-server /etc/pyswift/object-server.conf
+437849 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-object-server /etc/pyswift/object-server.conf
+437850 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-object-server /etc/pyswift/object-server.conf
+LISTEN 0      4096        10.0.0.2:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=439060,fd=18),("swift-proxy-ser",pid=438908,fd=18))
+LISTEN 0      4096        10.0.0.2:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=439059,fd=16),("swift-proxy-ser",pid=438908,fd=16))
+py_health=200

@@ -1,0 +1,10 @@
+{
+  "scenario": "object-loss",
+  "target": "swift4",
+  "during_ok": 20,
+  "during_fail": 0,
+  "recovered_active": "active",
+  "after_ok": 10,
+  "after_fail": 0,
+  "pass": true
+}

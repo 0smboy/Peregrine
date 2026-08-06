@@ -1,0 +1,51 @@
+===== fanout 10.0.0.2 =====
+ADDED [object-expirer] to /etc/swift/object-server.conf
+ADDED [account-reaper] to /etc/swift/account-server.conf
+ADDED [container-updater] to /etc/swift/container-server.conf
+ADDED [container-reconciler] to /etc/swift/container-server.conf
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-object-expirer.service → /etc/systemd/system/swift-object-expirer.service.
+swift-object-expirer=active
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-account-reaper.service → /etc/systemd/system/swift-account-reaper.service.
+swift-account-reaper=active
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-container-updater.service → /etc/systemd/system/swift-container-updater.service.
+swift-container-updater=active
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-container-reconciler.service → /etc/systemd/system/swift-container-reconciler.service.
+swift-container-reconciler=active
+853a8662da9ed45cc293a9534fe0b80d  /usr/local/bin/swift-object-expirer
+db1809331de7a66693526e25518db3f7  /usr/local/bin/swift-account-reaper
+18891a84767f16866bf982e40075dc05  /usr/local/bin/swift-container-updater
+560b6a082415523aa819fcd861690fb6  /usr/local/bin/swift-container-reconciler
+===== fanout 10.0.0.3 =====
+ADDED [object-expirer] to /etc/swift/object-server.conf
+ADDED [account-reaper] to /etc/swift/account-server.conf
+ADDED [container-updater] to /etc/swift/container-server.conf
+ADDED [container-reconciler] to /etc/swift/container-server.conf
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-object-expirer.service → /etc/systemd/system/swift-object-expirer.service.
+swift-object-expirer=active
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-account-reaper.service → /etc/systemd/system/swift-account-reaper.service.
+swift-account-reaper=active
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-container-updater.service → /etc/systemd/system/swift-container-updater.service.
+swift-container-updater=active
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-container-reconciler.service → /etc/systemd/system/swift-container-reconciler.service.
+swift-container-reconciler=active
+853a8662da9ed45cc293a9534fe0b80d  /usr/local/bin/swift-object-expirer
+db1809331de7a66693526e25518db3f7  /usr/local/bin/swift-account-reaper
+18891a84767f16866bf982e40075dc05  /usr/local/bin/swift-container-updater
+560b6a082415523aa819fcd861690fb6  /usr/local/bin/swift-container-reconciler
+===== fanout 10.0.0.4 =====
+ADDED [object-expirer] to /etc/swift/object-server.conf
+ADDED [account-reaper] to /etc/swift/account-server.conf
+ADDED [container-updater] to /etc/swift/container-server.conf
+ADDED [container-reconciler] to /etc/swift/container-server.conf
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-object-expirer.service → /etc/systemd/system/swift-object-expirer.service.
+swift-object-expirer=active
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-account-reaper.service → /etc/systemd/system/swift-account-reaper.service.
+swift-account-reaper=active
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-container-updater.service → /etc/systemd/system/swift-container-updater.service.
+swift-container-updater=active
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-container-reconciler.service → /etc/systemd/system/swift-container-reconciler.service.
+swift-container-reconciler=active
+853a8662da9ed45cc293a9534fe0b80d  /usr/local/bin/swift-object-expirer
+db1809331de7a66693526e25518db3f7  /usr/local/bin/swift-account-reaper
+18891a84767f16866bf982e40075dc05  /usr/local/bin/swift-container-updater
+560b6a082415523aa819fcd861690fb6  /usr/local/bin/swift-container-reconciler

@@ -1,0 +1,6 @@
+[filter:ratelimit]
+use = egg:swift#ratelimit
+account_ratelimit = 200
+max_sleep_time_seconds = 60
+container_ratelimits = 0 , 0
+container_listing_ratelimits = 0 , 0

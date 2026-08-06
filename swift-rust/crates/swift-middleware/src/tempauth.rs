@@ -24,10 +24,13 @@
 //! user's groups, when the user is `.reseller_admin`, or (for GET/HEAD)
 //! `.reseller_reader`; account PUT/DELETE requires reseller admin.
 //!
-//! Deferred: per-container/account ACLs (`X-Container-Read` etc.), S3
-//! auth, Python memcache/fernet token wire formats, service tokens, and
-//! the deferred `swift.authorize` callback (we authorize inline, so
-//! public-ACL reads are not yet honored).
+//! Container ACLs (`X-Container-Read`/`Write`) and account ACLs
+//! (`X-Account-Access-Control`) are enforced via [`TempAuth::authorize_acl`]
+//! (proxy supplies the ACL data after info lookups). With shared memcache
+//! info-cache L2 (P1c), ACL updates clear across VIP backends. Residual
+//! (wontfix P1c / P3): S3 auth, Python memcache/fernet token wire
+//! formats, service tokens, and the deferred `swift.authorize` callback
+//! shape (we authorize inline).
 //!
 //! When [`TempAuth::with_shared_secret`] is set (cluster deploy: derived
 //! from `swift.conf` hash prefix/suffix), issued tokens are HMAC-signed
@@ -43,7 +46,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use swift_http::{Request, Response};
 
-use crate::acl::{parse_acl_v1, referrer_allowed};
+use crate::acl::{parse_acl_v1, referrer_allowed, AccountAcls};
 use crate::{Middleware, NextFn};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -338,12 +341,15 @@ impl TempAuth {
 
     /// `authorize`: ACL-aware account/container authorization, ported from
     /// Python `TempAuth.authorize`. The proxy calls this AFTER it has learned
-    /// the container ACL for the request (tempauth itself only authenticates and
-    /// stamps the group list). `user_groups` is the authenticated user's groups
-    /// (empty = anonymous); `acl` is the relevant container read/write ACL (or
-    /// `None` for owner-only resources like account requests or container
-    /// PUT/POST/DELETE); `referer` is the request Referer. Returns `Some(denial)`
-    /// (401 anonymous / 403 authenticated) or `None` (authorized).
+    /// the container ACL and account ACL sysmeta (tempauth itself only
+    /// authenticates and stamps the group list). `user_groups` is the
+    /// authenticated user's groups (empty = anonymous); `acl` is the relevant
+    /// container read/write ACL (or `None` for owner-only resources like
+    /// account requests or container PUT/POST/DELETE); `account_acls` is the
+    /// parsed `X-Account-Access-Control` sysmeta when set; `referer` is the
+    /// request Referer. Returns `Some(denial)` (401 anonymous / 403
+    /// authenticated) or `None` (authorized). When authorized as account
+    /// owner / account-ACL admin, `swift_owner` is set to `true`.
     pub fn authorize_acl(
         method: &str,
         path: &str,
@@ -351,6 +357,8 @@ impl TempAuth {
         acl: Option<&str>,
         referer: Option<&str>,
         reseller_prefix: &str,
+        account_acls: Option<&AccountAcls>,
+        swift_owner: &mut bool,
     ) -> Option<Response> {
         // path is /v1/<account>[/container[/object]]
         let segs: Vec<&str> = path.trim_start_matches('/').splitn(4, '/').collect();
@@ -359,9 +367,11 @@ impl TempAuth {
         };
         let container = segs.get(2).copied().filter(|c| !c.is_empty());
         let obj = segs.get(3).copied().filter(|o| !o.is_empty());
+        *swift_owner = false;
 
         // reseller admin has full access; reseller reader has read access.
         if user_groups.iter().any(|g| g == ".reseller_admin") {
+            *swift_owner = true;
             return None;
         }
         if user_groups.iter().any(|g| g == ".reseller_reader")
@@ -374,6 +384,7 @@ impl TempAuth {
         if user_groups.iter().any(|g| g == account)
             && (!matches!(method, "PUT" | "DELETE") || container.is_some())
         {
+            *swift_owner = true;
             return None;
         }
         // container/object ACL: public/referrer read, .rlistings, and account or
@@ -389,6 +400,21 @@ impl TempAuth {
                 if groups.iter().any(|g| g == ug) {
                     return None;
                 }
+            }
+        }
+        // X-Account-Access-Control (admin / read-write / read-only).
+        if let Some(acct) = account_acls {
+            if acct.is_admin(user_groups) {
+                *swift_owner = true;
+                return None;
+            }
+            if acct.is_read_write(user_groups)
+                && (container.is_some() || matches!(method, "GET" | "HEAD"))
+            {
+                return None;
+            }
+            if acct.is_read_only(user_groups) && matches!(method, "GET" | "HEAD") {
+                return None;
             }
         }
         let _ = reseller_prefix;
@@ -408,6 +434,22 @@ impl Middleware for TempAuth {
         if req.path.starts_with(&self.auth_prefix) {
             return self.handle_get_token(&req);
         }
+        // TempURL (and peers) set authorize_override after validating a
+        // signature; skip re-auth so we do not wipe their Remote-User stamp.
+        if req
+            .headers
+            .get("X-Backend-Authorize-Override")
+            .map(|v| {
+                matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "true" | "1" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+        {
+            return next(req);
+        }
+
         let token = req
             .headers
             .get("X-Auth-Token")
@@ -415,8 +457,7 @@ impl Middleware for TempAuth {
         // Authenticate only. A valid token yields the user's groups; an invalid
         // one of ours is a hard 401; anything else (incl. no token) is
         // anonymous. Authorization is deferred to the proxy, which knows the
-        // container ACL — so a public container is reachable anonymously and a
-        // private one is denied there.
+        // container/account ACL.
         let groups: Vec<String> = match token {
             Some(token) if token.starts_with(&self.reseller_prefix) => {
                 match self.validate_token(token) {
@@ -434,9 +475,35 @@ impl Middleware for TempAuth {
             }
             _ => Vec::new(),
         };
+        let mut req = req;
+        // Translate client X-Account-Access-Control → sysmeta (TempAuth
+        // extract_acl_and_report_errors). Invalid syntax → 400 before the app.
+        if req.headers.contains_key("X-Account-Access-Control") {
+            match crate::acl::validate_account_acl_header(
+                req.headers.get("X-Account-Access-Control"),
+            ) {
+                Ok(Some(json)) => {
+                    req.headers.remove("X-Account-Access-Control");
+                    req.headers
+                        .set("X-Account-Sysmeta-Core-Access-Control", json);
+                }
+                Ok(None) => {}
+                Err(msg) => {
+                    let body = format!(
+                        "X-Account-Access-Control invalid: {msg}\n\nInput: {}\n",
+                        req.headers
+                            .get("X-Account-Access-Control")
+                            .unwrap_or("")
+                    );
+                    let mut resp = Response::with_body(400, body);
+                    resp.headers
+                        .set("Content-Type", "text/plain; charset=UTF-8");
+                    return resp;
+                }
+            }
+        }
         // Stamp the group list for the proxy's authorize. gatekeeper strips
         // inbound x-backend* headers, so a client cannot forge this.
-        let mut req = req;
         req.headers.set("X-Backend-Remote-User", groups.join(","));
         next(req)
     }
@@ -575,29 +642,132 @@ mod tests {
         let other = vec!["other:u".into(), "AUTH_other".to_string()];
         let admin = vec!["a:b".into(), ".reseller_admin".to_string()];
         let anon: Vec<String> = vec![];
-        let az = |m: &str, p: &str, g: &[String], acl: Option<&str>, rf: Option<&str>| {
-            TempAuth::authorize_acl(m, p, g, acl, rf, "AUTH_")
+        let az = |m: &str,
+                  p: &str,
+                  g: &[String],
+                  acl: Option<&str>,
+                  rf: Option<&str>,
+                  acct: Option<&AccountAcls>| {
+            let mut owner_flag = false;
+            let denied =
+                TempAuth::authorize_acl(m, p, g, acl, rf, "AUTH_", acct, &mut owner_flag);
+            (denied, owner_flag)
         };
 
         // owner: allowed on their objects/containers
-        assert!(az("GET", "/v1/AUTH_test/c/o", &owner, None, None).is_none());
-        assert!(az("PUT", "/v1/AUTH_test/c/o", &owner, None, None).is_none());
+        let (d, own) = az("GET", "/v1/AUTH_test/c/o", &owner, None, None, None);
+        assert!(d.is_none() && own);
+        assert!(az("PUT", "/v1/AUTH_test/c/o", &owner, None, None, None)
+            .0
+            .is_none());
         // owner barred from account-level PUT/DELETE
-        assert_eq!(az("PUT", "/v1/AUTH_test", &owner, None, None).unwrap().status, 403);
+        assert_eq!(
+            az("PUT", "/v1/AUTH_test", &owner, None, None, None)
+                .0
+                .unwrap()
+                .status,
+            403
+        );
         // cross-account without ACL -> 403; anonymous without ACL -> 401
-        assert_eq!(az("GET", "/v1/AUTH_test/c/o", &other, None, None).unwrap().status, 403);
-        assert_eq!(az("GET", "/v1/AUTH_test/c/o", &anon, None, None).unwrap().status, 401);
+        assert_eq!(
+            az("GET", "/v1/AUTH_test/c/o", &other, None, None, None)
+                .0
+                .unwrap()
+                .status,
+            403
+        );
+        assert_eq!(
+            az("GET", "/v1/AUTH_test/c/o", &anon, None, None, None)
+                .0
+                .unwrap()
+                .status,
+            401
+        );
         // reseller admin: allowed anywhere
-        assert!(az("DELETE", "/v1/AUTH_test/c/o", &admin, None, None).is_none());
+        let (d, own) = az("DELETE", "/v1/AUTH_test/c/o", &admin, None, None, None);
+        assert!(d.is_none() && own);
         // public read (.r:*) allows anonymous OBJECT GET
-        assert!(az("GET", "/v1/AUTH_test/c/o", &anon, Some(".r:*"), None).is_none());
+        assert!(az("GET", "/v1/AUTH_test/c/o", &anon, Some(".r:*"), None, None)
+            .0
+            .is_none());
         // .r:* on a container LISTING needs .rlistings
-        assert_eq!(az("GET", "/v1/AUTH_test/c", &anon, Some(".r:*"), None).unwrap().status, 401);
-        assert!(az("GET", "/v1/AUTH_test/c", &anon, Some(".r:*,.rlistings"), None).is_none());
+        assert_eq!(
+            az("GET", "/v1/AUTH_test/c", &anon, Some(".r:*"), None, None)
+                .0
+                .unwrap()
+                .status,
+            401
+        );
+        assert!(az(
+            "GET",
+            "/v1/AUTH_test/c",
+            &anon,
+            Some(".r:*,.rlistings"),
+            None,
+            None
+        )
+        .0
+        .is_none());
         // cross-account granted by an ACL group (read + write)
-        assert!(az("GET", "/v1/AUTH_test/c/o", &other, Some("AUTH_other"), None).is_none());
-        assert!(az("PUT", "/v1/AUTH_test/c/o", &other, Some("AUTH_other"), None).is_none());
+        assert!(az(
+            "GET",
+            "/v1/AUTH_test/c/o",
+            &other,
+            Some("AUTH_other"),
+            None,
+            None
+        )
+        .0
+        .is_none());
+        assert!(az(
+            "PUT",
+            "/v1/AUTH_test/c/o",
+            &other,
+            Some("AUTH_other"),
+            None,
+            None
+        )
+        .0
+        .is_none());
         // a container with only a read ACL: another user's write (write_acl=None) -> 403
-        assert_eq!(az("PUT", "/v1/AUTH_test/c/o", &other, None, None).unwrap().status, 403);
+        assert_eq!(
+            az("PUT", "/v1/AUTH_test/c/o", &other, None, None, None)
+                .0
+                .unwrap()
+                .status,
+            403
+        );
+
+        // Account ACL: admin is swift_owner; read-write can mutate containers;
+        // read-only is GET/HEAD only.
+        let acct = AccountAcls {
+            admin: vec!["AUTH_other".into()],
+            read_write: vec!["rw:user".into()],
+            read_only: vec!["ro:user".into()],
+        };
+        let (d, own) = az("POST", "/v1/AUTH_test", &other, None, None, Some(&acct));
+        assert!(d.is_none() && own);
+        let rw = vec!["rw:user".into()];
+        assert!(az("PUT", "/v1/AUTH_test/c", &rw, None, None, Some(&acct))
+            .0
+            .is_none());
+        assert_eq!(
+            az("POST", "/v1/AUTH_test", &rw, None, None, Some(&acct))
+                .0
+                .unwrap()
+                .status,
+            403
+        );
+        let ro = vec!["ro:user".into()];
+        assert!(az("GET", "/v1/AUTH_test", &ro, None, None, Some(&acct))
+            .0
+            .is_none());
+        assert_eq!(
+            az("PUT", "/v1/AUTH_test/c/o", &ro, None, None, Some(&acct))
+                .0
+                .unwrap()
+                .status,
+            403
+        );
     }
 }

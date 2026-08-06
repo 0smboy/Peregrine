@@ -1,0 +1,5 @@
+Linux swift1 5.14.0-687.31.1.el9_8.x86_64 #1 SMP PREEMPT_DYNAMIC Wed Jul 29 13:22:17 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+/root/.cargo/bin/rustc
+/root/.cargo/bin/cargo
+/usr/local/bin/swift-proxy-server
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth copy slo dlo proxy-logging proxy-server

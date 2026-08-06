@@ -1,0 +1,24 @@
+=== swift1 ===
+swift1
+/dev/sda4        40G   19G   22G  47% /
+/dev/sda5        50G   50G   28K 100% /srv/node/d1
+/dev/sda6        50G   45G  5.1G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.6G  89% /srv/node/d3
+=== swift2 ===
+swift2
+/dev/sda4        40G  7.0G   33G  18% /
+/dev/sda5        50G   46G  4.0G  92% /srv/node/d1
+/dev/sda6        50G   45G  5.3G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.2G  90% /srv/node/d3
+=== swift3 ===
+swift3
+/dev/sda4        40G  7.3G   33G  19% /
+/dev/sda5        50G   49G  1.3G  98% /srv/node/d1
+/dev/sda6        50G   45G  5.8G  89% /srv/node/d2
+/dev/sda7        50G   45G  5.6G  89% /srv/node/d3
+=== swift4 ===
+swift4
+/dev/sda4        40G  8.6G   32G  22% /
+/dev/sda5        50G   46G  5.0G  91% /srv/node/d1
+/dev/sda6        50G   46G  5.0G  91% /srv/node/d2
+/dev/sda7        50G   45G  5.5G  90% /srv/node/d3

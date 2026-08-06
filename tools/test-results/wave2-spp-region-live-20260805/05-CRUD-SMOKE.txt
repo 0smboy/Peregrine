@@ -1,0 +1,8 @@
+create w2spp-live-smoke-1785915524
+PUT_cont=201
+PUT_obj=201
+GET_obj=200 bytes=10
+smoke-body
+DEL_obj=204
+DEL_cont=204
+NOTE: CRUD smoke does not clear META_DIRTY; not a GREEN for W2 live rebuild

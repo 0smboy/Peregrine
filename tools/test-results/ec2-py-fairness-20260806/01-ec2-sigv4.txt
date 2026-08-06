@@ -1,0 +1,2 @@
+# REDACTED. First attempt BLOCKED (existing EC2 access key without secret).
+# Re-proof: see 03-ec2-create-retry.txt (sanitized) and SUMMARY.md → GREEN.

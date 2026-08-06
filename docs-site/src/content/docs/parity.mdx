@@ -1,0 +1,82 @@
+---
+title: Rust vs Python parity
+description: Honest feature matrix — partial counts as not implemented. What Peregrine/swift-rust can claim against OpenStack Swift.
+sidebar:
+  order: 15
+audience: human
+---
+
+This page is the public, **strict** comparison of Peregrine `swift-rust` to
+upstream OpenStack Swift. **Partial implementation is treated as not
+implemented.** Product and fairness claims must stay inside what is green here.
+
+Canonical long form in-repo:
+[`docs/fairness-lab/RUST-VS-PYTHON-PARITY.md`](https://github.com/0smboy/Peregrine/blob/main/docs/fairness-lab/RUST-VS-PYTHON-PARITY.md).
+
+**As of 2026-08-06 · Contabo lab · LAB-HARD-GREEN · not PRODUCTION-GO-LIVE.**
+
+## Headline
+
+| Area | Status |
+|------|--------|
+| Swift v1 core CRUD + common middleware | **Mostly implemented** |
+| TempAuth + Keystone lab + EC + S3 core/MPU | **Implemented (lab-proven)** |
+| Full Paste / bulk upload / crypto middleware / container-sync | **Not implemented** |
+| Multi-node container sharding (KEEP) | **Not implemented** (strict) |
+| Operator TLS / production go-live | **Not implemented** |
+
+## Swift REST (v1)
+
+| Capability | Python | Rust |
+|------------|:------:|:----:|
+| TempAuth v1.0 | yes | yes |
+| Account / container / object CRUD | yes | yes |
+| Range, conditionals, COPY, expiry | yes | yes |
+| SLO / DLO (main path) | yes | yes |
+| TempURL / FormPost / bulk **delete** | yes | yes |
+| Bulk **upload** / extract-archive | yes | **no** |
+| Full arbitrary Paste pipeline | yes | **no** |
+
+## Middleware
+
+| Filter | Python | Rust |
+|--------|:------:|:----:|
+| catch_errors, gatekeeper, healthcheck, proxy_logging, cache, listing_formats | yes | yes |
+| tempauth, copy, slo, dlo, quotas, versioned_writes, symlink, staticweb, ratelimit | yes | yes |
+| keystoneauth + authtoken (lab Keystone) | yes | yes |
+| s3api + s3token (core path) | yes | yes |
+| container-sync filter + daemon | yes | **no** |
+| encrypter / decrypter / keymaster | yes | **no** |
+| niche filters / full specialty residual | yes | **no** (strict) |
+
+## S3
+
+| Capability | Python | Rust |
+|------------|:------:|:----:|
+| SigV4 CRUD, List v1/v2, MultiDelete, MPU path, ListMPU | yes | yes (lab) |
+| s3token / EC2 → Keystone | yes | yes (lab) |
+| SigV2, aws-chunked, versioning/tagging/lifecycle | yes | **no** (wontfix) |
+| Full IAM ACL / CORS fidelity | yes | **no** |
+
+## EC & consistency
+
+| Capability | Python | Rust |
+|------------|:------:|:----:|
+| EC policy encode/decode, multiphase PUT, ranged GET | yes | yes (Linux `ec`) |
+| Degraded read + reconstructor heal | yes | yes (lab, after spp identity fix) |
+| Multi-node container sharding KEEP | yes | **no** (local/unit only under strict rule) |
+| object/account/container replicators, expirer, auditors, recon | yes | yes |
+
+## Lab evidence (Contabo, 2026-08-06)
+
+- TempAuth func VIP **54/54**; soak **1h fail=0**
+- Python `:8090` ×3 **54/54** each
+- S3 MPU deep **11/11**; EC2 SigV4 **green**
+- VIP failover **pass**; EC heal fragment restore **pass** after fix
+- Operator TLS PEM **deferred** → not production go-live
+
+## How to use this matrix
+
+- Fairness A/B: only compare surfaces marked **yes** on both sides.
+- Marketing: do **not** say “full Swift compatibility.”
+- Shipping: label **LAB-HARD-GREEN** until operator TLS and any claimed L3b/S3 extras are fully green.

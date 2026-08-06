@@ -1,0 +1,31 @@
+c=201
+put=201
+Partition	11697
+Hash	b6c49708fe64f3e714bca4947bbb717e
+Server:Port Device	10.0.4.4:6200 d1
+Server:Port Device	10.0.4.1:6200 d1
+Server:Port Device	10.0.4.2:6200 d1
+Server:Port Device	10.0.4.3:6200 d1	 # [Handoff]
+LINE=Server:Port Device	10.0.4.4:6200 d1
+HASH=b6c49708fe64f3e714bca4947bbb717e PART=11697 SUF=17e PIP=10.0.4.4 DEV=d1
+total 8
+drwxr-xr-x. 2 root root 35 Aug  4 15:34 .
+drwxr-xr-x. 3 root root 46 Aug  4 15:34 ..
+-rw-r--r--. 1 root root 26 Aug  4 Connection to 169.58.108.85 closed by remote host.
+s/11697/17e/b6c49708fe64f3e714bca4947bbb717e/1785857666.43655.data
+corrupted /srv/node/d1/objects/11697/17e/b6c49708fe64f3e714bca4947bbb717e/1785857666.43655.data len 26
+--- oneshot auditor on device ---
+Terminated
+ine tree ===
+/srv/node/d1/quarantined/objects/b6c49708fe64f3e714bca4947bbb717e/1785857666.43655.data
+=== hash gone? ===
+ls: cannot access '/srv/node/d1/objects/11697/17e/b6c49708fe64f3e714bca4947bbb717e': No such file or directory
+HASHDIR_GONE
+active
+active
+active
+get=200
+conts ['p2bq2-1785857665']
+get=200 bytes=26
+p2b-audit-unique-656831411
+QUARANTINE_E2E_DONE

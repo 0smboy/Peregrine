@@ -1,0 +1,11 @@
+{
+  "workers": 0,
+  "max_clients": 1024,
+  "servers_per_port": 1,
+  "bind_ports": 1,
+  "worker_threads": 128,
+  "connection_queue": 1024,
+  "acceptors": 1,
+  "formula": "servers_per_port * n_ports * max_clients → worker_threads (cap 128)",
+  "notes": ["servers_per_port>0: workers knob ignored (Python parity)","Rust: shared thread pool across REUSEPORT acceptors (not prefork)","worker_threads clamped to 128"]
+}

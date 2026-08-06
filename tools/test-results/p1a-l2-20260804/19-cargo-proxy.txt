@@ -1,0 +1,8 @@
+     |
+help: consider wrapping the receiver expression with the appropriate type
+     |
+3995 |             Arc::new(app).temp_url_keys("AUTH_test", "container"),
+     |             +++++++++   +
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `swift-proxy-server` (lib test) due to 1 previous error

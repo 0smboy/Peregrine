@@ -1,0 +1,20 @@
+## date=2026-08-05T07:40:53Z
+## packages
+no openstack-swift rpm
+## import
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'swift'
+## listeners
+LISTEN 0      4096        10.0.0.2:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=439060,fd=18),("swift-proxy-ser",pid=438908,fd=18))
+LISTEN 0      4096        10.0.0.2:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=439059,fd=16),("swift-proxy-ser",pid=438908,fd=16))
+## who owns 8090
+LISTEN 0      4096        10.0.0.2:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=439060,fd=18),("swift-proxy-ser",pid=438908,fd=18))
+LISTEN 0      4096        10.0.0.2:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=439059,fd=16),("swift-proxy-ser",pid=438908,fd=16))
+UID          PID    PPID  C STIME TTY          TIME CMD
+root      439060  438908  0 Aug04 ?        00:00:03 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-proxy-server /etc/pyswift/proxy-server.conf
+## conf hints
+/usr/local/bin/swift-proxy-server /etc/swift/proxy-server.conf 
+/etc/swift/proxy-server.conf
+## d1 ownership (Rust ring still lists d1)
+[{'region': 1, 'zone': 1, 'ip': '10.0.4.1', 'port': 6200, 'replication_ip': '10.0.8.1', 'replication_port': 6200, 'device': 'd1', 'weight': 100.0}, {'region': 1, 'zone': 1, 'ip': '10.0.4.1', 'port': 6200, 'replication_ip': '10.0.8.1', 'replication_port': 6200, 'device': 'd2', 'weight': 100.0}, {'region': 1, 'zone': 1, 'ip': '10.0.4.1', 'port': 6200, 'replication_ip': '10.0.8.1', 'replication_port': 6200, 'device': 'd3', 'weight': 100.0}, {'region': 1, 'zone': 2, 'ip': '10.0.4.2', 'port': 6200, 'replication_ip': '10.0.8.2', 'replication_port': 6200, 'device': 'd1', 'weight': 100.0}, {'region': 1, 'zone': 2, 'ip': '10.0.4.2', 'port': 6200, 'replication_ip': '10.0.8.2', 'replication_port': 6200, 'device': 'd2', 'weight': 100.0}, {'region': 1, 'zone': 2, 'ip': '10.0.4.2', 'port': 6200, 'replication_ip': '10.0.8.2', 'replication_port': 6200, 'device': 'd3', 'weight': 100.0}, {'region': 1, 'zone': 3, 'ip': '10.0.4.3', 'port': 6200, 'replication_ip': '10.0.8.3', 'replication_port': 6200, 'device': 'd1', 'weight': 100.0}, {'region': 1, 'zone': 3, 'ip': '10.0.4.3', 'port': 6200, 'replication_ip': '10.0.8.3', 'replication_port': 6200, 'device': 'd2', 'weight': 100.0}, {'region': 1, 'zone': 3, 'ip': '10.0.4.3', 'port': 6200, 'replication_ip': '10.0.8.3', 'replication_port': 6200, 'device': 'd3', 'weight': 100.0}, {'region': 1, 'zone': 4, 'ip': '10.0.4.4', 'port': 6200, 'replication_ip': '10.0.8.4', 'replication_port': 6200, 'device': 'd1', 'weight': 100.0}, {'region': 1, 'zone': 4, 'ip': '10.0.4.4', 'port': 6200, 'replication_ip': '10.0.8.4', 'replication_port': 6200, 'device': 'd2', 'weight': 100.0}, {'region': 1, 'zone': 4, 'ip': '10.0.4.4', 'port': 6200, 'replication_ip': '10.0.8.4', 'replication_port': 6200, 'device': 'd3', 'weight': 100.0}]

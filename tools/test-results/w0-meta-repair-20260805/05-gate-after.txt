@@ -1,0 +1,8 @@
+api_listed 0 names []
+account_container_count 0
+account_object_count 0
+account_bytes 0
+disk_hash_dirs 200
+container_deleted0_rows 0 checked 0 hash_not_on_disk 0
+account_deleted0_container_rows_local 0
+remaining_HEAD_ok 0 remaining_HEAD_404 0

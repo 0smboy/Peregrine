@@ -1,0 +1,2 @@
+VIP holder check
+VIP_ON=10.0.0.2

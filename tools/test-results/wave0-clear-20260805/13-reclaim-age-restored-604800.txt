@@ -1,0 +1,45 @@
+===== restore swift1 =====
+reclaim lines:
+1 [DEFAULT]
+2 reclaim_age = 604800
+25 [object-replicator]
+26 reclaim_age = 604800
+48 [object-expirer]
+50 reclaim_age = 604800
+Aug 05 05:35:23 swift1 systemd[1]: swift-object-replicator.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 05:35:23 swift1 systemd[1]: swift-object-replicator.service: Failed with result 'exit-code'.
+===== restore swift2 =====
+reclaim lines:
+1 [DEFAULT]
+2 reclaim_age = 604800
+25 [object-replicator]
+26 reclaim_age = 604800
+48 [object-expirer]
+50 reclaim_age = 604800
+Aug 05 05:35:33 swift2 systemd[1]: swift-object-replicator.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 05:35:33 swift2 systemd[1]: swift-object-replicator.service: Failed with result 'exit-code'.
+===== restore swift3 =====
+reclaim lines:
+1 [DEFAULT]
+2 reclaim_age = 604800
+25 [object-replicator]
+26 reclaim_age = 604800
+48 [object-expirer]
+50 reclaim_age = 604800
+Aug 05 05:35:48 swift3 systemd[1]: swift-object-replicator.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 05:35:48 swift3 systemd[1]: swift-object-replicator.service: Failed with result 'exit-code'.
+===== restore swift4 =====
+reclaim lines:
+1 [DEFAULT]
+2 reclaim_age = 604800
+25 [object-replicator]
+26 reclaim_age = 604800
+48 [object-expirer]
+50 reclaim_age = 604800
+Aug 05 05:35:58 swift4 systemd[1]: swift-object-replicator.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 05:35:58 swift4 systemd[1]: swift-object-replicator.service: Failed with result 'exit-code'.
+VERIFY 2026-08-05T05:38:31Z
+swift1 active reclaim_age=604800s
+swift2 active reclaim_age=604800s
+swift3 active reclaim_age=604800s
+swift4 active reclaim_age=604800s

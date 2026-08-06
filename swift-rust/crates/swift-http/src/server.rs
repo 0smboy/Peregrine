@@ -284,6 +284,22 @@ pub fn serve_forever_with_config(
     handler: Handler,
     config: ServerConfig,
 ) -> std::io::Result<()> {
+    serve_forever_multi(vec![listener], handler, config)
+}
+
+/// Like [`serve_forever_with_config`], but accept from multiple listeners
+/// into one shared worker pool (`servers_per_port` / multi-port topology).
+pub fn serve_forever_multi(
+    listeners: Vec<TcpListener>,
+    handler: Handler,
+    config: ServerConfig,
+) -> std::io::Result<()> {
+    if listeners.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "serve_forever_multi requires at least one listener",
+        ));
+    }
     let worker_count = config.worker_threads.max(1);
     // Lock-free MPMC work queue: each worker holds its own Receiver clone and
     // recv()s directly, so the accept dispatch never serializes workers on a
@@ -313,28 +329,101 @@ pub fn serve_forever_with_config(
     }
 
     let Some(shutdown) = config.shutdown.clone() else {
-        for stream in listener.incoming() {
-            let stream = stream?;
-            dispatch_connection(stream, &sender, &config)?;
-        }
-        return Ok(());
-    };
-
-    listener.set_nonblocking(true)?;
-    while !shutdown.load(Ordering::SeqCst) {
-        match listener.accept() {
-            Ok((stream, _peer)) => {
-                // On BSD-derived platforms accepted sockets inherit the
-                // listener's O_NONBLOCK; the connection handler needs
-                // blocking reads with timeouts.
-                stream.set_nonblocking(false).ok();
+        if listeners.len() == 1 {
+            let mut listeners = listeners;
+            let listener = listeners.pop().unwrap();
+            for stream in listener.incoming() {
+                let stream = stream?;
                 dispatch_connection(stream, &sender, &config)?;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(SHUTDOWN_POLL_INTERVAL);
+            return Ok(());
+        }
+        // Multiple listeners, no shutdown: one blocking accept thread each;
+        // this thread joins them (they run until process exit / accept err).
+        let mut acceptors = Vec::with_capacity(listeners.len());
+        for (idx, listener) in listeners.into_iter().enumerate() {
+            let sender = sender.clone();
+            let config = config.clone();
+            let acceptor = std::thread::Builder::new()
+                .name(format!("swift-http-accept-{idx}"))
+                .spawn(move || -> std::io::Result<()> {
+                    for stream in listener.incoming() {
+                        let stream = stream?;
+                        dispatch_connection(stream, &sender, &config)?;
+                    }
+                    Ok(())
+                })?;
+            acceptors.push(acceptor);
+        }
+        let mut first_err = None;
+        for acceptor in acceptors {
+            match acceptor.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) if first_err.is_none() => first_err = Some(e),
+                Ok(Err(_)) => {}
+                Err(_) if first_err.is_none() => {
+                    first_err = Some(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "accept thread panicked",
+                    ));
+                }
+                Err(_) => {}
             }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
+        }
+        return match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        };
+    };
+
+    // Shutdown path: non-blocking accept on each listener from dedicated
+    // threads; main waits until the flag flips, then joins and drains.
+    let mut acceptors = Vec::with_capacity(listeners.len());
+    for (idx, listener) in listeners.into_iter().enumerate() {
+        listener.set_nonblocking(true)?;
+        let sender = sender.clone();
+        let config = config.clone();
+        let shutdown = Arc::clone(&shutdown);
+        let acceptor = std::thread::Builder::new()
+            .name(format!("swift-http-accept-{idx}"))
+            .spawn(move || -> std::io::Result<()> {
+                while !shutdown.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _peer)) => {
+                            // On BSD-derived platforms accepted sockets inherit
+                            // the listener's O_NONBLOCK; the connection handler
+                            // needs blocking reads with timeouts.
+                            stream.set_nonblocking(false).ok();
+                            dispatch_connection(stream, &sender, &config)?;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(SHUTDOWN_POLL_INTERVAL);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(())
+            })?;
+        acceptors.push(acceptor);
+    }
+
+    while !shutdown.load(Ordering::SeqCst) {
+        std::thread::sleep(SHUTDOWN_POLL_INTERVAL);
+    }
+    let mut first_err = None;
+    for acceptor in acceptors {
+        match acceptor.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) if first_err.is_none() => first_err = Some(e),
+            Ok(Err(_)) => {}
+            Err(_) if first_err.is_none() => {
+                first_err = Some(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "accept thread panicked",
+                ));
+            }
+            Err(_) => {}
         }
     }
 
@@ -345,7 +434,10 @@ pub fn serve_forever_with_config(
     for worker in workers {
         let _ = worker.join();
     }
-    Ok(())
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 fn dispatch_connection(

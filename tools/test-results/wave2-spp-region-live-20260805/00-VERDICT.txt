@@ -1,0 +1,18 @@
+WAVE2-SPP-REGION-LIVE: PARTIAL (live apply done; hard gates incomplete)
+DISK_GATE: PASS (~2%)
+SERVICES: PASS (post-soak VIP/backends 200; 6210-12 ×4)
+META: LAB META_CLEAN (W0′ prior); not re-gated as blocker this apply
+OBJECT_PORTS: PASS (6210/6211/6212; A/C stay 6201/6202)
+SPP_ENABLE: PASS (servers_per_port=1; 3 ports listening all nodes)
+REGION_LABELS: PASS (r1=swift1/2, r2=swift3/4; drill OK)
+SPP_SMOKE_KEYSTONE: PASS
+FAILOVER: PASS (swift2→swift1; CRUD during FO OK)
+SOAK_1H: COMPLETE / WARN — n=192 ok=185 fail=7 (need fail=0 for PASS)
+  early: 401/409 (token/delete races n=22,24)
+  mid: 503 burst n=60-64 (~10:33Z) concurrent proxy binary deploy (Exec format / Text file busy → HAProxy backends empty)
+  after: last ~128 iters clean; RCA apply/09b-soak-503-rca.txt (Identity/TLS untouched)
+FUNC_TEMPAUTH_HTTPS: FAIL 5/54 (TempAuth storage 401; Keystone owns data plane)
+FUNC_KEYSTONE_ADAPTED: FAIL 46/13 (not canonical 54; EC 501 no --features ec)
+LIVE_REBUILD: EXECUTED (object + object-1 only; backup /root/w2-ring-backup-20260805T100051Z/)
+PRODUCTION-GO-LIVE: NOT CLAIMED
+DATE: 2026-08-05T11:16Z

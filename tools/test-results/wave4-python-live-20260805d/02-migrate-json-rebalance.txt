@@ -1,0 +1,43 @@
+=== CLEAN MIGRATE via builder.json rewrite 20260805T114144Z ===
+NOTE: Contabo swift-ring-builder lacks 'updated weight' — edit JSON then rebalance only
+wrote account.ring.gz.builder.json n=4
+wrote container.ring.gz.builder.json n=4
+wrote object.ring.gz.builder.json n=8
+wrote object-1.ring.gz.builder.json n=8
+JSON rewrite done
+=== rebalance ===
+rebalanced and wrote account.ring.gz
+rebalanced and wrote container.ring.gz
+rebalanced and wrote object.ring.gz
+rebalanced and wrote object-1.ring.gz
+=== isolation check ===
+account: live_devs=['d2'] ports=[6202] n=4
+  r1z1 10.0.4.1:6202/d2 w=100.0
+  r1z2 10.0.4.2:6202/d2 w=100.0
+  r1z3 10.0.4.3:6202/d2 w=100.0
+  r1z4 10.0.4.4:6202/d2 w=100.0
+container: live_devs=['d2'] ports=[6201] n=4
+  r1z1 10.0.4.1:6201/d2 w=100.0
+  r1z2 10.0.4.2:6201/d2 w=100.0
+  r1z3 10.0.4.3:6201/d2 w=100.0
+  r1z4 10.0.4.4:6201/d2 w=100.0
+object: live_devs=['d2', 'd3'] ports=[6211, 6212] n=8
+  r1z1 10.0.4.1:6211/d2 w=100.0
+  r1z1 10.0.4.1:6212/d3 w=100.0
+  r1z2 10.0.4.2:6211/d2 w=100.0
+  r1z2 10.0.4.2:6212/d3 w=100.0
+  r2z1 10.0.4.3:6211/d2 w=100.0
+  r2z1 10.0.4.3:6212/d3 w=100.0
+  r2z2 10.0.4.4:6211/d2 w=100.0
+  r2z2 10.0.4.4:6212/d3 w=100.0
+object-1: live_devs=['d2', 'd3'] ports=[6211, 6212] n=8
+  r1z1 10.0.4.1:6211/d2 w=100.0
+  r1z1 10.0.4.1:6212/d3 w=100.0
+  r1z2 10.0.4.2:6211/d2 w=100.0
+  r1z2 10.0.4.2:6212/d3 w=100.0
+  r2z1 10.0.4.3:6211/d2 w=100.0
+  r2z1 10.0.4.3:6212/d3 w=100.0
+  r2z2 10.0.4.4:6211/d2 w=100.0
+  r2z2 10.0.4.4:6212/d3 w=100.0
+ISOLATION_OK True
+CLEAN_MIGRATE_BUILD_OK

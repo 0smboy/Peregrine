@@ -1,0 +1,4 @@
+/root/work/swift-rust/target/release/swift-object-server: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=5b5081f38f7499c924573a58544401b0d1ddeb6a, not stripped
+-rwxr-xr-x. 2 root root  603112 Aug  4 15:13 /root/work/swift-rust/target/release/swift-effective-concurrency
+-rwxr-xr-x. 2 root root 2147096 Aug  4 15:13 /root/work/swift-rust/target/release/swift-object-server
+29dff5cd9ebd610b8e794f2a47b4db06  /root/work/swift-rust/target/release/swift-object-server

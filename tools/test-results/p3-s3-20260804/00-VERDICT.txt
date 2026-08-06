@@ -1,0 +1,8 @@
+P3-s3 VERDICT: PARTIAL GREEN
+date: 2026-08-04
+surface: SigV4 + bucket/object CRUD + ListBuckets/ListObjects v1 + GetBucketLocation + CopyObject
+info: Swift GET /info does NOT advertise s3api (PASS)
+unit: swift-s3api 47/47 PASS; proxy pipeline_s3api_wires_without_info_pollution PASS
+cluster: s3api NOT in default pipeline (CORE-PATH baseline preserved); VIP s3 enable residual
+residuals: MPU, ListObjectsV2, multi-delete, S3 ACL/CORS/versioning, SigV2, aws-chunked, s3token/Keystone
+verify-rerun: 2026-08-04T15:37:53Z (independent re-confirm of unit+wire gates)

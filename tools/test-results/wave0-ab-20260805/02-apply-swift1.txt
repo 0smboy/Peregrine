@@ -1,0 +1,6 @@
+EXIT:0
+A: ts_reclaimable=48247 bytes=0
+=== B: orphan hash-dir purge ===
+B: referenced_hashes=650925
+B: orphan_dirs=665518 orphan_files=665520 orphan_bytes=140536975246 kept_dirs=0
+DONE mode=APPLY A_ts=48247 A_bytes=0 B_dirs=665518 B_files=665520 B_bytes=140536975246

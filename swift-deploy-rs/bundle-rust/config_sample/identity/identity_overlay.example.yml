@@ -1,0 +1,44 @@
+---
+# Example group_vars overlay for Contabo Identity 对接 (bundle-rust).
+# Copy knobs into the live project's group_vars/all when Keystone is up.
+# Default Contabo: leave identity_*_enabled false (TempAuth VIP).
+
+identity_haproxy_enabled: false
+identity_proxy_enabled: false
+
+# Storage-plane backends (Galera / Keystone uwsgi) — Contabo swift1–3
+identity_mariadb_backends:
+  - 10.0.4.1
+  - 10.0.4.2
+  - 10.0.4.3
+identity_keystone_backends:
+  - 10.0.4.1
+  - 10.0.4.2
+  - 10.0.4.3
+
+haproxy_mariadb_port: 3030
+mariadb_bind_port: 3306
+mariadb_check_bind_port: 9600
+haproxy_keystone_public_service_port: 5000
+haproxy_keystone_admin_service_port: 35357
+uwsgi_keystone_public_service_port: 5001
+uwsgi_keystone_admin_service_port: 35358
+
+identity_auth_url: http://10.0.0.10:5000/v3
+identity_www_authenticate_uri: http://10.0.0.10:5000
+identity_swift_username: swift
+identity_swift_password: CHANGE_ME
+identity_swift_project: service
+identity_delay_auth_decision: true
+identity_operator_roles: admin,swiftoperator
+
+# Suggested pipeline when cutting over (manual edit or template flag):
+# pipeline = ... authtoken keystoneauth copy slo dlo proxy-logging proxy-server
+# (drop or keep tempauth per cutover window — see KEYSTONE-LIVE.md)
+#
+# S3 + Keystone (Wave 3 s3token hook — ON-BY-CONFIG; not default CORE-PATH):
+# pipeline = ... s3api s3token authtoken keystoneauth ... proxy-server
+# [filter:s3token]
+# use = egg:swift#s3token   # Rust: built-in filter name "s3token"
+# auth_uri = {{ identity_auth_url }}
+# reseller_prefix = AUTH_

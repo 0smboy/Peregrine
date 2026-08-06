@@ -1,0 +1,10 @@
+swift2
+2026-08-04T07:36:43Z
+eth1             UP             10.0.0.2/22 10.0.0.10/22 
+active
+active
+active
+active
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=2045772,fd=5))             
+LISTEN 0      4000         0.0.0.0:8085       0.0.0.0:*    users:(("haproxy",pid=2032550,fd=7))                     
+/dev/sda5        50G   45G  5.7G  89% /srv/node/d1

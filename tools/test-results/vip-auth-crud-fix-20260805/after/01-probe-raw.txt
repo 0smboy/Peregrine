@@ -1,0 +1,24 @@
+UTC 2026-08-05T11:35:07Z
+=== proxy sha ×4 ===
+10.0.0.1 657e07439cde3520e83dd1bb47bf0f130120e532d39fda53a2925a0d938c2f77  /usr/local/bin/swift-proxy-server active local=200
+10.0.0.2 657e07439cde3520e83dd1bb47bf0f130120e532d39fda53a2925a0d938c2f77  /usr/local/bin/swift-proxy-server active local=200
+10.0.0.3 657e07439cde3520e83dd1bb47bf0f130120e532d39fda53a2925a0d938c2f77  /usr/local/bin/swift-proxy-server active local=200
+10.0.0.4 657e07439cde3520e83dd1bb47bf0f130120e532d39fda53a2925a0d938c2f77  /usr/local/bin/swift-proxy-server active local=200
+=== health/info ===
+vip_health 200
+info 200 True True
+=== TempAuth HTTPS CRUD ===
+auth=200 toklen=149 storage=https://10.0.0.10:8085/v1/AUTH_test
+list=200 www_auth=None
+CRUD put_c=201 put_o=201 get_o=200 body=b'ta-hello' del_o=204 del_c=204
+=== Keystone tester/test CRUD ===
+token=201 toklen=183
+project_id 29af7f1e19774999bf700fbef31994d3 roles ['swiftoperator']
+list_project=200 list_AUTH_test_cross_tenant=403
+CRUD put_c=201 put_o=201 get_o=200 body=b'ks-hello' del_o=204 del_c=204
+neg_bogus 401
+=== VERDICT ===
+TEMPAUTH_CRUD PASS
+KEYSTONE_CRUD PASS
+OVERALL GREEN
+PRODUCTION_GO_LIVE NOT_CLAIMED

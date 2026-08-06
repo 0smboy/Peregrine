@@ -1,7 +1,9 @@
 # Contabo 公平实验 · 分轮执行地图
 
-权威方法论：`docs/fairness-lab/` + `tools/fairness-lab/` + 证据 `fairness-lab-20260803/`。  
-本文回答：**每一轮做完停在哪里、什么算绿、什么禁止提前开下轮。**
+**权威正式计划：** [`USER-METHOD-PLAN.md`](USER-METHOD-PLAN.md)（三阶段：双单机 API → 仅 Rust 集群 → 三节点双实现）。
+
+下文 R0–R8（2026-08-03）为**历史基线 / 非正式**，不得冒充 USER-METHOD-PLAN 下的正式结论。  
+工具与证据仍见 `tools/fairness-lab/`、`tools/test-results/fairness-lab-*-20260803/`。
 
 ```mermaid
 flowchart TD
@@ -166,5 +168,7 @@ flowchart TD
 
 ## 当前指针
 
-- **已停在**：R8 验证项 Stop（完成）— R0…R8 验证闭环；实现类 backlog 仍另立
-- **批次报告**：R7 `fairness-lab-R7-20260803/REPORT.html` · R8 `fairness-lab-R8-20260803/REPORT.html`
+- **正式主线**：[`USER-METHOD-PLAN.md`](USER-METHOD-PLAN.md)（R0–R8 = 历史基线 / 非正式）
+- **阶段 2（2026-08-04）**：补全见 `tools/test-results/phase-2-20260804/REPORT.html`（VIP PASS / DIRECT WARN / chaos PASS / soak）
+- **阶段 3（2026-08-04）**：Python 三节点 **FROZEN** — `tools/test-results/phase-3-20260804/`
+- **历史 R8 Stop**：仍有效作基线；实现类 backlog 另立

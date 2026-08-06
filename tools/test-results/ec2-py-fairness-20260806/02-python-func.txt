@@ -1,0 +1,25 @@
+===== http://10.0.0.2:8090 =====
+tempauth_probe=200
+  PASS  sec: traversal name literal 201
+
+-------------------------------------------------------------------
+RESULT  label=py-http___10.0.0.2_8090  PASS=54  FAIL=0
+-------------------------------------------------------------------
+{"swift": {"version": "2.33.0", "strict_cors_mode": true, "policies": [{"name": "Policy-0", "aliases": "Policy-0", "defa
+===== http://10.0.0.3:8090 =====
+tempauth_probe=200
+  PASS  sec: traversal name literal 201
+
+-------------------------------------------------------------------
+RESULT  label=py-http___10.0.0.3_8090  PASS=54  FAIL=0
+-------------------------------------------------------------------
+{"swift": {"version": "2.33.0", "strict_cors_mode": true, "policies": [{"name": "Policy-0", "aliases": "Policy-0", "defa
+===== http://10.0.0.4:8090 =====
+tempauth_probe=200
+  PASS  sec: traversal name literal 201
+
+-------------------------------------------------------------------
+RESULT  label=py-http___10.0.0.4_8090  PASS=54  FAIL=0
+-------------------------------------------------------------------
+{"swift": {"version": "2.33.0", "strict_cors_mode": true, "policies": [{"name": "Policy-0", "aliases": "Policy-0", "defa
+PY_FUNC_DONE

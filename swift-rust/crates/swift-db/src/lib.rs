@@ -35,9 +35,13 @@ mod repl_loop;
 mod replicator;
 mod shard;
 mod util;
+mod vacuum;
 
 pub use account::{zero_like, AccountBroker, ContainerRecord, ListContainersArgs};
-pub use auditor::{audit_account_dbs, audit_container_dbs, db_locations, DbAuditReport};
+pub use auditor::{
+    audit_account_dbs, audit_container_dbs, audit_dbs_on_devices, db_locations, list_db_devices,
+    DbAuditReport,
+};
 pub use broker::{py_json_dumps_metadata, py_json_parse_metadata, BrokerMetadata};
 pub use repl_loop::{
     iter_db_partitions, repl_peers, run_once as replicator_run_once, DbPartition,
@@ -57,6 +61,10 @@ pub use container::{
     ListObjectsArgs, ObjectRecord,
 };
 pub use util::{chexor, is_corruption_error, quarantine_db, renamer, DbError};
+pub use vacuum::{
+    sample_db_space, sample_device_db_space, vacuum_db, vacuum_device_dbs, DbSpaceSample,
+    DbSpaceTotals,
+};
 
 /// Max size of a `.pending` file before puts are applied directly
 /// (`swift.common.db.PENDING_CAP`).

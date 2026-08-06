@@ -19,8 +19,10 @@
 //! reader (which verifies size and ETag and quarantines on mismatch),
 //! and report the tally.
 //!
-//! Deferred: the daemon loop, rate limiting, `hashes.pkl`-driven
-//! incremental audits, ZBF (zero-byte-file) mode, and watcher plugins.
+//! The continuous daemon loop lives in `swift-object-auditor` (conf +
+//! interval sleep, matching Python `ObjectAuditor.interval` default 30s).
+//! Deferred: rate limiting, `hashes.pkl`-driven incremental audits, ZBF
+//! (zero-byte-file) mode, and watcher plugins.
 
 use std::path::{Path, PathBuf};
 
@@ -148,6 +150,76 @@ pub fn audit_device(
     report
 }
 
+impl AuditReport {
+    /// Merge another device/policy report into this one.
+    pub fn merge(&mut self, other: AuditReport) {
+        self.passed += other.passed;
+        self.quarantined += other.quarantined;
+        self.errors += other.errors;
+        self.quarantined_paths.extend(other.quarantined_paths);
+    }
+}
+
+/// List local storage devices under `devices_root` (Python `devices`).
+/// When `mount_check` is true, only mountpoints are included.
+pub fn list_devices(devices_root: &Path, mount_check: bool) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(devices_root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if mount_check && !is_mountpoint(&path) {
+            continue;
+        }
+        out.push(path);
+    }
+    out.sort();
+    out
+}
+
+fn is_mountpoint(path: &Path) -> bool {
+    // Best-effort: compare st_dev with parent. Matches Python's common
+    // `ismount` check without requiring the `mountpoint` binary.
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Some(parent) = path.parent() else {
+        return true;
+    };
+    let Ok(parent_meta) = std::fs::metadata(parent) else {
+        return false;
+    };
+    use std::os::unix::fs::MetadataExt;
+    meta.dev() != parent_meta.dev()
+}
+
+/// One continuous-auditor pass: every local device × every policy index.
+pub fn audit_devices(
+    devices_root: &Path,
+    mount_check: bool,
+    policies: &[(u32, PolicyKind)],
+    hash_config: &HashPathConfig,
+    cfg: &DiskFileConfig,
+) -> AuditReport {
+    let mut report = AuditReport::default();
+    for device in list_devices(devices_root, mount_check) {
+        for &(policy_index, policy) in policies {
+            report.merge(audit_device(
+                &device,
+                policy,
+                policy_index,
+                hash_config,
+                cfg,
+            ));
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +301,29 @@ mod tests {
         assert_eq!(report.quarantined, 1, "the corrupt object is quarantined");
         // the quarantined object is gone from the object tree
         assert_eq!(audit_locations(&device, 0).len(), 1);
+
+        // Multi-device pass sees the same device under devices_root.
+        let multi = audit_devices(
+            &dir,
+            false,
+            &[(0, PolicyKind::Replication)],
+            &hc(),
+            &cfg,
+        );
+        assert_eq!(multi.passed, 1);
+        assert_eq!(list_devices(&dir, false), vec![device]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_list_devices_skips_files() {
+        let dir = std::env::temp_dir().join(format!("swift-adev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        std::fs::write(dir.join("notes"), b"x").unwrap();
+        let devices = list_devices(&dir, false);
+        assert_eq!(devices.len(), 1);
+        assert!(devices[0].ends_with("sda1"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

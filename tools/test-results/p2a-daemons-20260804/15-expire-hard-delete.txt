@@ -1,0 +1,20 @@
+put=201
+DEL_AT=1785855385 now=1785855382
+--- on-disk before expire ---
+Partition	8024
+Hash	7d6058b17d7f5c0d583db3ae94a124a0
+Server:Port Device	10.0.4.1:6200 d1
+Server:Port Device	10.0.4.2:6200 d1
+Server:Port Device	10.0.4.3:6200 d1
+Server:Port Device	10.0.4.4:6200 d1	 # [Handoff]
+now=1785855400
+client_get=404
+NODE=Device DEV= PART=
+--- run expirer ---
+10.0.0.1: 
+10.0.0.2: 
+10.0.0.3: 
+10.0.0.4: 
+--- on-disk after expire ---
+backend after:
+backend_open_expired=000

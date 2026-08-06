@@ -1,0 +1,26 @@
+patched
+PASS vip_info_200: http=200 keys=['account_quotas', 'bulk_delete', 'container_quotas', 'dlo', 'formpost', 'keystoneauth', 'slo', 'staticweb', 'swift', 'symlink', 'tempauth', 'tempurl', 'versioned_writes']
+PASS info_no_s3api: s3api_in_info=False
+PASS info_tempauth_keystone: tempauth/keystoneauth present
+PASS tempauth: http=200
+PASS ListBuckets: base=https://10.0.0.10:8085 http=200 body=b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Owner><ID>test:tester</ID><DisplayName>
+PASS CreateBucket: http=200 body=b''
+PASS PutObject: http=200
+PASS GetObject: http=200 len=22
+PASS ListObjectsV1: http=200
+PASS ListObjectsV2: http=200 body=b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>w3s3-1785'
+PASS GetBucketLocation: http=200 body=b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">RegionOne</Lo'
+PASS GetBucketCors: http=200 (recorded)
+PASS GetBucketAcl: http=200 body=b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Owner><ID>t'
+PASS MultiDelete: http=200 body=b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Deleted><Key>obj1.txt</Key></Deleted></DeleteResult>'
+PASS CreateMultipartUpload: http=200 upload_id=000000000000000018c8e0cd16d4f4a4
+PASS UploadPart: http=200 etag="355d8d63cd342edc051d3683bc623c4c"
+PASS ListParts: http=200
+PASS ListMultipartUploads: http=200 body=b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>w3s3-1785924409</Bucket><Prefix></Prefix><KeyMarker></Ke
+PASS AbortMultipartUpload: http=204
+PASS DeleteBucket: http=204
+PASS keystone_admin_token: http=201
+FAIL keystone_test_user: users={'users': [], 'links': {'next': None, 'self': 'http://127.0.0.1:5001/v3/users?name=test', 'previous': None}}
+FAIL keystone_s3tokens_live: no ec2 creds
+PASS l3b_info_no_false_shard_claim: container_sharding in info=False; not claiming multi-node quorum this cycle without suite
+VERDICT=PARTIAL passed=22 failed=2 crit_fail=[]

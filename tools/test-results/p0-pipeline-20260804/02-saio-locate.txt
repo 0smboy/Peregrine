@@ -1,0 +1,3 @@
+/etc/swift/proxy-server.conf
+/etc/rsaio/proxy-server.conf
+/etc/pyswift/proxy-server.conf

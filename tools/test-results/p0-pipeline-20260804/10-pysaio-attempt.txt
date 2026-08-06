@@ -1,0 +1,6 @@
+no SAIO on swift2
+active
+account.log
+container.log
+object.log
+proxy.log

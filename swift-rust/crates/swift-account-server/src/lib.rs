@@ -24,7 +24,10 @@
 use std::path::{Path, PathBuf};
 
 pub mod reaper;
-pub use reaper::{is_reapable, reap_account, reap_container, ReaperClient, ReaperStats};
+pub use reaper::{
+    is_reapable, reap_account, reap_container, recon_update as reaper_recon_update,
+    run_once as reaper_run_once, HttpReaperClient, ReaperClient, ReaperPassStats, ReaperStats,
+};
 
 use swift_core::hashing::HashPathConfig;
 use swift_core::timestamp::Timestamp;

@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Wave 3 Contabo S3/L3b live — 2026-08-05</title>
+<style>
+body{font:14px/1.45 system-ui,sans-serif;margin:24px;color:#1a1a1a;background:#f7f5f1}
+h1{font-size:1.4rem;margin:0 0 8px}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-weight:600;font-size:12px}
+.ok{background:#d7f0d7}.partial{background:#ffe6a8}.bad{background:#f5c2c2}
+table{border-collapse:collapse;width:100%;margin:12px 0;background:#fff}
+th,td{border:1px solid #ddd;padding:8px;text-align:left}
+th{background:#eee}
+code{font-size:12px}
+</style>
+</head>
+<body>
+<h1>Wave 3 — Contabo S3 + L3b live retry</h1>
+<p><span class="badge partial">PARTIAL</span> · VIP HTTPS TempAuth S3 <span class="badge ok">GREEN</span> · s3token live <span class="badge bad">BLOCKED</span> · 2026-08-05</p>
+
+<h2>1) What this cycle did</h2>
+<ul>
+<li>Retried Contabo after prior BLOCKED empty <code>/info</code>; VIP now <code>https://10.0.0.10:8085</code> with tempauth+keystoneauth.</li>
+<li>Enabled ON-BY-CONFIG <code>s3api</code> + <code>s3token</code> on all four Rust proxies.</li>
+<li>Ran SigV4 live suite (ListBuckets → MPU → ListMPU → MultiDelete).</li>
+<li>Probed Keystone <code>/v3/s3tokens</code> with OS-EC2 credentials (worker crash on valid access).</li>
+</ul>
+
+<h2>2) Optimized / fixed / demoted</h2>
+<table>
+<tr><th>Item</th><th>Change</th></tr>
+<tr><td>Contabo live S3</td><td class="ok">BLOCKED → TempAuth live GREEN</td></tr>
+<tr><td>s3api pipeline</td><td class="ok">off → ON-BY-CONFIG enabled ×4</td></tr>
+<tr><td>ListMultipartUploads live</td><td class="ok">200 (not 501)</td></tr>
+<tr><td>s3token live exchange</td><td class="bad">still BLOCKED (Keystone crash)</td></tr>
+<tr><td>4KB KEEP</td><td class="partial">explicitly not claimed</td></tr>
+</table>
+
+<h2>3) Measured effect</h2>
+<table>
+<tr><th>Metric</th><th>Before</th><th>After</th></tr>
+<tr><td>VIP /info</td><td>000 / unhealthy</td><td class="ok">200 HTTPS</td></tr>
+<tr><td>ListBuckets…ListMPU</td><td>not run</td><td class="ok">PASS</td></tr>
+<tr><td>Keystone s3tokens</td><td>W1 blocked</td><td class="bad">endpoint OK / exchange crash</td></tr>
+</table>
+
+<h2>4) Gate results</h2>
+<table>
+<tr><th>Gate</th><th>Result</th><th>Evidence</th></tr>
+<tr><td>VIP /info + honesty</td><td class="ok">PASS</td><td><code>20-contabo-s3-gate.txt</code></td></tr>
+<tr><td>TempAuth SigV4 CRUD/list/MPU</td><td class="ok">PASS</td><td><code>30-s3-live-suite.txt</code></td></tr>
+<tr><td>ListMultipartUploads</td><td class="ok">PASS</td><td>same</td></tr>
+<tr><td>s3token wired</td><td class="ok">PASS</td><td><code>32-post-cluster-health.txt</code></td></tr>
+<tr><td>Keystone s3tokens exchange</td><td class="bad">BLOCKED</td><td><code>31-s3token-verdict.txt</code></td></tr>
+<tr><td>L3b multi-node quorum</td><td class="partial">NOT RUN</td><td>SUMMARY</td></tr>
+<tr><td>4KB KEEP</td><td class="partial">NOT CLAIMED</td><td>—</td></tr>
+</table>
+
+<h2>5) Remaining / FROZEN</h2>
+<ul>
+<li><strong>FROZEN:</strong> PRODUCTION-GO-LIVE; 4KB KEEP without对照 data.</li>
+<li><strong>Backlog:</strong> Keystone s3tokens worker crash; s3api→s3token passthrough; L3b multi-node HTTP quorum.</li>
+</ul>
+<p>Evidence: <code>tools/test-results/wave3-s3-l3b-live-20260805/</code></p>
+</body>
+</html>

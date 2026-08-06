@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>P3-data — PARTIAL</title>
+<style>
+  :root { --ink:#1a1a1a; --muted:#5a5a5a; --ok:#1b6b3a; --warn:#8a5a00; --bad:#8b1e1e; --bg:#f7f5f1; --card:#fff; }
+  body { font-family: "IBM Plex Sans", system-ui, sans-serif; margin:0; color:var(--ink); background:var(--bg); line-height:1.45; }
+  header { background:#222; color:#f2f2f2; padding:1.5rem 2rem; }
+  header h1 { margin:0 0 .25rem; font-size:1.4rem; font-weight:600; }
+  header p { margin:0; color:#bbb; font-size:.95rem; }
+  main { max-width:920px; margin:0 auto; padding:1.5rem 1.25rem 3rem; }
+  .verdict { display:inline-block; padding:.2rem .7rem; border-radius:3px; font-weight:700; letter-spacing:.02em; background:#f0e0b0; color:var(--warn); }
+  section { background:var(--card); border:1px solid #e2ddd4; border-radius:6px; padding:1rem 1.25rem; margin:1rem 0; }
+  h2 { margin:0 0 .6rem; font-size:1.05rem; }
+  table { width:100%; border-collapse:collapse; font-size:.92rem; }
+  th, td { text-align:left; padding:.4rem .5rem; border-bottom:1px solid #eee; vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  .ok { color:var(--ok); font-weight:600; }
+  .warn { color:var(--warn); font-weight:600; }
+  .bad { color:var(--bad); font-weight:600; }
+  ul { margin:.3rem 0 .3rem 1.2rem; }
+  code { font-family:"IBM Plex Mono", ui-monospace, monospace; font-size:.88em; background:#f0eee8; padding:.05em .3em; border-radius:3px; }
+  .paths { font-size:.85rem; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>P3-data wave — L3b / X-Newest / crypto</h1>
+  <p>2026-08-04 · Contabo VIP <code>10.0.0.10:8085</code> · no wipe</p>
+</header>
+<main>
+  <p>Verdict: <span class="verdict">PARTIAL</span> — shippable progress with honest residuals. Not a full L3b production claim.</p>
+
+  <section>
+    <h2>1. What this cycle did</h2>
+    <ul>
+      <li><strong>X-Newest</strong> best-source selection in proxy <code>get_or_head</code> (collect + newest timestamp).</li>
+      <li><strong>swift-container-sharder</strong> daemon + systemd unit + conf on all four Contabo nodes (local cleave only).</li>
+      <li><strong>X-Backend-Sharding-State</strong> reports real DB state (was hardcoded <code>unsharded</code>).</li>
+      <li><strong>At-rest crypto</strong> left deferred (primitives exist; no middleware wire).</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>2. Optimized / fixed / demoted</h2>
+    <ul>
+      <li>Fixed: COPY / versioned_writes path can request newest replica correctly via <code>X-Newest</code>.</li>
+      <li>Fixed: container HEAD/GET advertise accurate sharding state.</li>
+      <li>Added: sharder binary/unit (operator-initiated SHARDING cleave; <code>auto_shard</code> ignored).</li>
+      <li>Demoted / deferred: full multi-node shard replication, proxy shard listing fan-out, resumable GET, encryption middleware.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>3. Measured effect</h2>
+    <table>
+      <tr><th>Metric</th><th>Before</th><th>After</th></tr>
+      <tr><td>X-Newest semantics</td><td>header forward only; first-good source</td><td>newest valid source wins</td></tr>
+      <tr><td>Sharder daemon</td><td>library cleave only</td><td>binary + unit active ×4</td></tr>
+      <tr><td>Sharding-state header</td><td>always <code>unsharded</code></td><td>live <code>get_db_state()</code></td></tr>
+      <tr><td>CORE-PATH func VIP</td><td>54/54 (P2c)</td><td><span class="ok">54/54</span></td></tr>
+      <tr><td>Sharder Contabo pass</td><td>n/a</td><td>~950–1045 containers/node, sharding=0, failures=0</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>4. Gate results</h2>
+    <table>
+      <tr><th>Gate</th><th>Result</th><th>Evidence</th></tr>
+      <tr><td>Sharder unit tests</td><td class="ok">4/4</td><td><code>05-cargo-unit-local.txt</code> / <code>03-build.txt</code></td></tr>
+      <tr><td>Proxy X-Newest unit</td><td class="ok">PASS</td><td><code>05-cargo-unit-local.txt</code></td></tr>
+      <tr><td>Deploy ×4</td><td class="ok">PASS</td><td><code>05-fanout-deploy.txt</code></td></tr>
+      <tr><td>Sharder continuous</td><td class="ok">PASS</td><td><code>10-daemon-status.txt</code></td></tr>
+      <tr><td>Backend sharding-state</td><td class="ok">unsharded</td><td><code>12-sharding-state.txt</code></td></tr>
+      <tr><td>X-Newest smoke</td><td class="ok">200</td><td><code>11-xnewest-smoke.txt</code></td></tr>
+      <tr><td>func-suite VIP</td><td class="ok">54/54</td><td><code>20-func-suite-vip.txt</code></td></tr>
+      <tr><td>At-rest crypto</td><td class="warn">DEFERRED</td><td>—</td></tr>
+      <tr><td>Resumable multi-GET</td><td class="warn">DEFERRED</td><td>—</td></tr>
+      <tr><td>Full L3b production</td><td class="warn">NOT CLAIMED</td><td>—</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>5. Remaining / next cycle</h2>
+    <ul>
+      <li><span class="warn">FROZEN this wave:</span> crypto middleware; resumable multi-node GET; L3b perf uplift cell.</li>
+      <li><strong>Backlog:</strong> HTTP shard-container create + replication quorum; cleave-context persistence; misplaced_objects; proxy shard-range listing fan-out; optional auto_shard (dev-only).</li>
+      <li>Disk: swift1 <code>/srv/node/d1</code> pre-existing ~100% — do not wipe; avoid creating large SHARDING containers until space plan exists.</li>
+    </ul>
+  </section>
+
+  <p class="paths">Evidence pack: <code>tools/test-results/p3-data-20260804/</code></p>
+</main>
+</body>
+</html>

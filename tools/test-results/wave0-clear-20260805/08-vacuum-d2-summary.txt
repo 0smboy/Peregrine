@@ -1,0 +1,12 @@
+summary	ok=264	fail=0	bytes_before=41111552	bytes_after=36540416	bytes_reclaimed=4571136
+BEFORE
+kind=account	files=3	file_bytes=241664	freelist_count=0	freelist_bytes=0	errors=0
+kind=container	files=975	file_bytes=149176320	freelist_count=587	freelist_bytes=2404352	errors=0
+AFTER
+kind=account	files=3	file_bytes=233472	freelist_count=0	freelist_bytes=0	errors=0
+kind=container	files=975	file_bytes=144613376	freelist_count=560	freelist_bytes=2293760	errors=0
+DF
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda6        50G   45G  5.1G  90% /srv/node/d2
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda6        50G   45G  5.1G  90% /srv/node/d2

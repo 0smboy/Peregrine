@@ -1,0 +1,7 @@
+# HELP swift_object_tombstones Count of on-disk .ts tombstone files
+# TYPE swift_object_tombstones gauge
+# HELP swift_object_tombstone_bytes Total bytes of .ts tombstone files
+# TYPE swift_object_tombstone_bytes gauge
+====
+kind=account	files=3	file_bytes=233472	freelist_count=0	freelist_bytes=0	errors=0
+kind=container	files=975	file_bytes=144613376	freelist_count=561	freelist_bytes=2297856	errors=0

@@ -1,0 +1,8 @@
+=== RUST VIP regression 20260805T120922Z ===
+health=200
+TEMPAUTH_CRUD 201/201/200/204/204
+KEYSTONE_CRUD 201/201/200/204/204
+account devices ['d2'] ports [6202]
+container devices ['d2'] ports [6201]
+object devices ['d2', 'd3'] ports [6211, 6212]
+ISOLATION_OK True

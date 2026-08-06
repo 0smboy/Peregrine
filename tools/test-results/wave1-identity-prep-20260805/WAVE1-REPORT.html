@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>Wave 1 · Identity prep (2026-08-05)</title>
+<style>
+ body{font:15px/1.45 system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;color:#1a1a1a}
+ table{border-collapse:collapse;width:100%;margin:1rem 0}
+ th,td{border:1px solid #ccc;padding:.45rem .6rem;text-align:left;vertical-align:top}
+ th{background:#f3f3f3} .ok{color:#0a6} .warn{color:#a60} .fail{color:#b00}
+ code{font-size:.92em}
+</style>
+</head>
+<body>
+<h1>Wave 1：Galera + Keystone prep（2026-08-05）</h1>
+<p>计划权威：生产缺口完整计划 · 仓内合同：<code>docs/fairness-lab/KEYSTONE-LIVE.md</code></p>
+
+<h2>1. 本轮做了什么</h2>
+<ul>
+<li>Contabo swift1–4 <code>df</code> / mem / Identity 探测（无 mkfs）</li>
+<li>python <code>bundle/config_contabo_identity/</code>：MariaDB×3 + Keystone inventory</li>
+<li>bundle-rust Identity <strong>对接</strong>模板（不部署 Galera）</li>
+<li><code>HttpTokenValidator</code> 支持 <code>https://</code></li>
+<li>dry-run plan JSON；live 安装因盘压 <span class="fail">BLOCKED</span></li>
+</ul>
+
+<h2>2. 优化 / 降级</h2>
+<table>
+<tr><th>项</th><th>动作</th></tr>
+<tr><td>Contabo live Galera/Keystone</td><td class="fail">BLOCKED（d* 89–100%；Wave 0 未证明腾空间）</td></tr>
+<tr><td>python haproxy_servers 上 Contabo</td><td class="warn">降级：改用 rust HAProxy 加法 Identity listeners</td></tr>
+<tr><td>Galera 写入 bundle-rust</td><td class="ok">拒绝（按计划）</td></tr>
+</table>
+
+<h2>3. 测量效果</h2>
+<table>
+<tr><th>指标</th><th>之前</th><th>之后</th></tr>
+<tr><td>Contabo Keystone</td><td>ABSENT</td><td class="warn">ABSENT（诚实未装）</td></tr>
+<tr><td>Identity inventory</td><td>无</td><td class="ok">config_contabo_identity/</td></tr>
+<tr><td>KEYSTONE-LIVE.md</td><td>无</td><td class="ok">有</td></tr>
+<tr><td>HttpTokenValidator</td><td>http only</td><td class="ok">http + https</td></tr>
+</table>
+
+<h2>4. 门禁表</h2>
+<table>
+<tr><th>门禁</th><th>结果</th><th>证据</th></tr>
+<tr><td>盘压 gate（live）</td><td class="fail">BLOCK</td><td>00-df-evidence.txt</td></tr>
+<tr><td>Inventory + dry-run plan</td><td class="ok">PASS</td><td>dry-run-plan.json</td></tr>
+<tr><td>双 bundle 文档/模板</td><td class="ok">PASS</td><td>KEYSTONE-LIVE.md / IDENTITY.md</td></tr>
+<tr><td>Keystone→Swift CRUD</td><td class="warn">NOT RUN</td><td>blocked</td></tr>
+<tr><td>TempAuth VIP 未改管道</td><td class="ok">PASS</td><td>intentional</td></tr>
+</table>
+
+<h2>5. 剩余 / 下一轮</h2>
+<ol>
+<li class="warn">FROZEN：Contabo live Identity，直到 Wave 0 腾空间</li>
+<li>解冻后：ansible --check → live tags → rust Identity listeners → proxy cutover → <code>p3-auth-live-*</code></li>
+<li>RAM 再验；可能需在 Galera 节点降负载</li>
+</ol>
+<p>证据目录：<code>tools/test-results/wave1-identity-prep-20260805/</code></p>
+</body>
+</html>

@@ -1,0 +1,2 @@
+   Compiling swift-proxy-server v0.1.0 (/tmp/p0-swift-rust/crates/swift-proxy-server)
+    Finished `release` profile [optimized] target(s) in 6.66s

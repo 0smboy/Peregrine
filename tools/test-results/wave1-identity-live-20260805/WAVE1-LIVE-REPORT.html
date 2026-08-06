@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Wave1 Identity + P3-ops TLS — 2026-08-05</title>
+<style>
+body{font-family:ui-sans-serif,system-ui,sans-serif;margin:2rem;max-width:960px;color:#1a1a1a;background:#faf9f7}
+h1{font-size:1.4rem;margin:0 0 .5rem}
+.meta{color:#555;margin-bottom:1.5rem}
+table{border-collapse:collapse;width:100%;margin:1rem 0}
+th,td{border:1px solid #ccc;padding:.45rem .6rem;text-align:left;font-size:.92rem}
+th{background:#eee}
+.pass{color:#0a5}.partial{color:#a60}.fail{color:#a00}
+.box{background:#fff;border:1px solid #ddd;padding:1rem;margin:1rem 0}
+code{font-size:.85rem}
+</style>
+</head>
+<body>
+<h1>Wave 1 Identity live + P3-ops TLS</h1>
+<p class="meta">2026-08-05 Contabo · Verdict: <strong>LAB GREEN</strong> · PRODUCTION-GO-LIVE: <strong>NOT claimed</strong></p>
+
+<div class="box">
+<strong>Arc</strong>
+<ol>
+<li>Disk/mem gate PASS (~2% disk, ~5 GiB MemAvailable)</li>
+<li>Galera×3 + Keystone on swift1–3; Fernet sync</li>
+<li>Additive HAProxy :3030/:5000/:35357 (Swift :8085 kept)</li>
+<li>Proxy keystone_coexist cutover; token→CRUD</li>
+<li>VIP+Keystone TLS terminate (self-signed LAB); HTTPS CRUD</li>
+</ol>
+</div>
+
+<table>
+<tr><th>Gate</th><th>Result</th><th>Notes</th></tr>
+<tr><td>Disk Use% &lt;70%</td><td class="pass">PASS</td><td>~2% /srv/node</td></tr>
+<tr><td>MemAvailable ≥3 GiB</td><td class="pass">PASS</td><td>~4.8–5.0 GiB</td></tr>
+<tr><td>wsrep_cluster_size=3</td><td class="pass">PASS</td><td>swift1–3</td></tr>
+<tr><td>Fernet sync</td><td class="pass">PASS</td><td>2 keys ×3 nodes</td></tr>
+<tr><td>Keystone token → CRUD (HTTP)</td><td class="pass">PASS</td><td>before TLS cutover</td></tr>
+<tr><td>HTTPS CRUD + Keystone TLS</td><td class="pass">PASS</td><td>201/201/tls-obj/204; bad=401</td></tr>
+<tr><td>TempAuth coexist</td><td class="pass">PASS</td><td>/info has both</td></tr>
+<tr><td>TempAuth rollback drill</td><td class="partial">PARTIAL</td><td>bak restore; one window proxy-down 503</td></tr>
+<tr><td>PRODUCTION-GO-LIVE TLS</td><td class="fail">NOT MET</td><td>self-signed LAB only</td></tr>
+</table>
+
+<div class="box">
+<strong>Endpoints (LAB)</strong>
+<ul>
+<li>Swift VIP: <code>https://10.0.0.10:8085</code></li>
+<li>Keystone: <code>https://10.0.0.10:5000</code></li>
+<li>PEM: <code>/etc/haproxy/haproxyCA.pem</code> · rotation: <code>/etc/haproxy/TLS-ROTATION.txt</code></li>
+</ul>
+</div>
+
+<p>Evidence: <code>tools/test-results/wave1-identity-live-20260805/</code> ·
+<code>tools/test-results/p3-ops-tls-live-20260805/</code> ·
+docs: <code>docs/fairness-lab/KEYSTONE-LIVE.md</code></p>
+</body>
+</html>

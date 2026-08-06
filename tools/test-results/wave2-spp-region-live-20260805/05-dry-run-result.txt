@@ -1,0 +1,7 @@
+LIVE=d1ced8de0fe0ca81bfd896d71e1c0afcf6d7f4e2af93a9bc36e95f1da43b7c8d /etc/swift/object.ring.gz
+DRY=0eb7b65a741c61aba665adeba6c93d08962da07fe2260a45441406ba7ee907ac /tmp/wave2-spp-dryrun-20260805/object.ring.gz
+ports Counter({6200: 4, 6201: 4, 6202: 4})
+regions Counter({1: 6, 2: 6})
+device_count=12
+LIVE_RINGS_UNTOUCHED=yes
+DRY-RUN-OK

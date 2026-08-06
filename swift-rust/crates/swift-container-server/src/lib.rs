@@ -31,10 +31,19 @@ pub mod reconciler;
 pub mod sharder;
 pub mod sync;
 pub mod updater;
-pub use sharder::{cleave, cleave_shard_range, find_and_merge_found_ranges, CleavingContext};
+pub use sharder::{
+    cleave, cleave_shard_range, find_and_merge_found_ranges, load_cleaving_context,
+    maybe_auto_shard, move_misplaced_from_retiring, process_sharding_container,
+    process_sharding_container_with_replicator, recon_update as sharder_recon_update,
+    run_once as sharder_run_once, run_once_with_opts as sharder_run_once_with_opts,
+    save_cleaving_context, CleavingContext, HttpShardReplicator, LocalShardReplicator,
+    MapShardHttpTransport, ShardHttpTransport, ShardReplicaNode, ShardReplicator, SharderRunOpts,
+    SharderStats, TcpShardHttpTransport, CLEAVING_CONTEXT_KEY,
+};
 pub use reconciler::{
     decide as reconciler_decide, parse_reconciler_obj_name, reconcile, reconciler_container_name,
-    reconciler_content_type, reconciler_obj_name, QueueEntry, QueueOp, ReconcileClient,
+    reconciler_content_type, reconciler_obj_name, run_once as reconciler_run_once, QueueEntry,
+    QueueOp, ReconcileClient, ReconcilerStats,
     ReconcileDecision, ReconcileOutcome, MISPLACED_OBJECTS_ACCOUNT,
 };
 pub use sync::{
@@ -365,6 +374,41 @@ fn is_sys_or_user_meta(server_type: &str, key: &str) -> bool {
         || (lower.starts_with(&sys) && lower.len() > sys.len())
 }
 
+/// Translate Swift `X-Remove-*` headers into empty-value updates of the
+/// target header (container/server.py POST metadata path).
+///
+/// Examples:
+/// - `X-Remove-Container-Read: x` → `("X-Container-Read", "")`
+/// - `X-Remove-Container-Meta-Color: x` → `("X-Container-Meta-Color", "")`
+///
+/// Returns `None` when the header is not an X-Remove of a savable key, or
+/// when the remove trigger value is empty (Python ignores empty removes).
+fn translate_container_remove_header(key: &str, value: &str) -> Option<(String, String)> {
+    if value.is_empty() {
+        return None;
+    }
+    let lower = key.to_ascii_lowercase();
+    const PREFIX: &str = "x-remove-container-";
+    if !lower.starts_with(PREFIX) || lower.len() <= PREFIX.len() {
+        return None;
+    }
+    let rest = &lower[PREFIX.len()..];
+    // ACL / sync headers: X-Remove-Container-Read → X-Container-Read
+    let target = format!("x-container-{rest}");
+    if SAVE_HEADERS.contains(&target.as_str()) || is_sys_or_user_meta("container", &target) {
+        // Preserve conventional casing for the well-known ACL headers.
+        let out_key = match target.as_str() {
+            "x-container-read" => "X-Container-Read".to_string(),
+            "x-container-write" => "X-Container-Write".to_string(),
+            "x-container-sync-key" => "X-Container-Sync-Key".to_string(),
+            "x-container-sync-to" => "X-Container-Sync-To".to_string(),
+            _ => target,
+        };
+        return Some((out_key, String::new()));
+    }
+    None
+}
+
 fn validate_metadata(md: &BrokerMetadata) -> Result<(), Response> {
     let mut meta_count = 0usize;
     let mut meta_size = 0usize;
@@ -566,7 +610,12 @@ impl ContainerServer {
     }
 
     /// `gen_resp_headers`.
-    fn gen_resp_headers(&self, info: &[(String, DbValue)], is_deleted: bool) -> HeaderKeyDict {
+    fn gen_resp_headers(
+        &self,
+        info: &[(String, DbValue)],
+        is_deleted: bool,
+        sharding_state: &str,
+    ) -> HeaderKeyDict {
         let get = |k: &str| -> String {
             info.iter()
                 .find(|(key, _)| key == k)
@@ -603,7 +652,7 @@ impl ContainerServer {
             headers.set("X-Container-Bytes-Used", get("bytes_used"));
             headers.set("X-Timestamp", normal("created_at"));
             headers.set("X-PUT-Timestamp", normal("put_timestamp"));
-            headers.set("X-Backend-Sharding-State", "unsharded");
+            headers.set("X-Backend-Sharding-State", sharding_state);
         }
         headers
     }
@@ -647,7 +696,11 @@ impl ContainerServer {
             Ok(v) => v,
             Err(e) => return self.db_error_response(&e, broker.db_file()),
         };
-        let mut headers = self.gen_resp_headers(&info, is_deleted);
+        let sharding_state = broker
+            .get_db_state()
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_else(|_| "unsharded".to_string());
+        let mut headers = self.gen_resp_headers(&info, is_deleted, &sharding_state);
         if is_deleted {
             let mut resp = swob_response(404, None);
             for (k, v) in headers.iter() {
@@ -709,7 +762,11 @@ impl ContainerServer {
             Ok(v) => v,
             Err(e) => return self.db_error_response(&e, broker.db_file()),
         };
-        let mut headers = self.gen_resp_headers(&info, is_deleted);
+        let sharding_state = broker
+            .get_db_state()
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_else(|_| "unsharded".to_string());
+        let mut headers = self.gen_resp_headers(&info, is_deleted, &sharding_state);
         if is_deleted {
             let mut resp = swob_response(404, None);
             for (k, v) in headers.iter() {
@@ -942,15 +999,17 @@ impl ContainerServer {
         broker: &mut ContainerBroker,
         timestamp: &Timestamp,
     ) -> Result<(), Response> {
-        let metadata: BrokerMetadata = req
-            .headers
-            .iter()
-            .filter(|(k, _)| {
-                SAVE_HEADERS.contains(&k.to_lowercase().as_str())
-                    || is_sys_or_user_meta("container", k)
-            })
-            .map(|(k, v)| (k.to_string(), (v.to_string(), timestamp.internal())))
-            .collect();
+        let mut metadata: BrokerMetadata = Vec::new();
+        for (k, v) in req.headers.iter() {
+            if let Some((rk, rv)) = translate_container_remove_header(k, v) {
+                metadata.push((rk, (rv, timestamp.internal())));
+                continue;
+            }
+            let lower = k.to_lowercase();
+            if SAVE_HEADERS.contains(&lower.as_str()) || is_sys_or_user_meta("container", k) {
+                metadata.push((k.to_string(), (v.to_string(), timestamp.internal())));
+            }
+        }
         if metadata.is_empty() {
             return Ok(());
         }
@@ -1776,4 +1835,29 @@ pub fn serve_with_config(
     let server = std::sync::Arc::new(ContainerServer::new(config));
     let handler: swift_http::Handler = std::sync::Arc::new(move |req| server.handle(req));
     swift_http::serve_forever_with_config(listener, handler, http_config)
+}
+
+#[cfg(test)]
+mod remove_header_tests {
+    use super::translate_container_remove_header;
+
+    #[test]
+    fn remove_container_read_clears_acl() {
+        let (k, v) = translate_container_remove_header("X-Remove-Container-Read", "x").unwrap();
+        assert_eq!(k, "X-Container-Read");
+        assert_eq!(v, "");
+    }
+
+    #[test]
+    fn empty_remove_trigger_ignored() {
+        assert!(translate_container_remove_header("X-Remove-Container-Read", "").is_none());
+    }
+
+    #[test]
+    fn remove_user_meta() {
+        let (k, v) =
+            translate_container_remove_header("X-Remove-Container-Meta-Color", "true").unwrap();
+        assert_eq!(k.to_ascii_lowercase(), "x-container-meta-color");
+        assert_eq!(v, "");
+    }
 }

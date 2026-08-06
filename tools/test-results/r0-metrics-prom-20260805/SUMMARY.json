@@ -1,0 +1,14 @@
+{
+  "date": "2026-08-05",
+  "verdict": "WIRED_SCRAPE_ALERTS_GREEN",
+  "grafana": "dashboard_provisioned_render_stub",
+  "evidence": "/Users/oboy/Downloads/Peregrine/tools/test-results/r0-metrics-prom-20260805",
+  "alerts": [
+    "SwiftTombstoneGrowth",
+    "SwiftDbFreelistHigh",
+    "SwiftDeviceUsePctHigh",
+    "GaleraClusterSizeNotThree:STUB",
+    "KeystoneHttp5xx:STUB"
+  ],
+  "production_claim": false
+}

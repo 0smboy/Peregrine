@@ -1,0 +1,56 @@
+   Compiling bitflags v2.13.0
+   Compiling rusqlite v0.32.1
+   Compiling swift-db v0.1.0 (/root/work/swift-rust/crates/swift-db)
+   Compiling swift-account-server v0.1.0 (/root/work/swift-rust/crates/swift-account-server)
+   Compiling swift-container-server v0.1.0 (/root/work/swift-rust/crates/swift-container-server)
+    Finished `release` profile [optimized] target(s) in 15.07s
+     Running unittests src/lib.rs (target/release/deps/swift_container_server-47666b88ba7258ab)
+
+running 4 tests
+test sharder::tests::test_run_once_skips_unsharded ... ok
+test sharder::tests::test_run_once_cleaves_sharding_container_on_device ... ok
+test sharder::tests::test_cleave_is_batched ... ok
+test sharder::tests::test_find_create_and_cleave ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.22s
+
+   |          ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: type alias `KeystoneAuthHandle` is never used
+   --> crates/swift-middleware/src/keystoneauth.rs:597:10
+    |
+597 | pub type KeystoneAuthHandle = Arc<KeystoneAuth>;
+    |          ^^^^^^^^^^^^^^^^^^
+
+   Compiling swift-s3api v0.1.0 (/root/work/swift-rust/crates/swift-s3api)
+warning: `swift-middleware` (lib) generated 3 warnings (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+   Compiling swift-proxy-server v0.1.0 (/root/work/swift-rust/crates/swift-proxy-server)
+    Finished `release` profile [optimized] target(s) in 16.36s
+     Running unittests src/lib.rs (target/release/deps/swift_proxy_server-24258383f1cc8f66)
+
+running 5 tests
+test stale_read_and_post_tests::test_is_good_source_matches_python ... ok
+test stale_read_and_post_tests::test_source_timestamp_precedence_and_fallbacks ... ok
+test stale_read_and_post_tests::test_post_mixed_result_resolution ... ok
+test stale_read_and_post_tests::test_x_newest_picks_max_timestamp_after_tombstone_filter ... ok
+test stale_read_and_post_tests::test_backend_404_timestamp_absent_is_not_truthy ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     = note: `build_keystoneauth` must be defined only once in the value namespace of this module
+
+error[E0428]: the name `build_authtoken` is defined multiple times
+    --> crates/swift-proxy-server/src/main.rs:1734:1
+     |
+1515 | fn build_authtoken(conf: &SwiftConfig) -> Result<swift_middleware::AuthToken, String> {
+     | ------------------------------------------------------------------------------------- previous definition of the value `build_authtoken` here
+...
+1734 | fn build_authtoken(conf: &SwiftConfig) -> Result<swift_middleware::AuthToken, String> {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `build_authtoken` redefined here
+     |
+     = note: `build_authtoken` must be defined only once in the value namespace of this module
+
+For more information about this error, try `rustc --explain E0428`.
+error: could not compile `swift-proxy-server` (bin "swift-proxy-server") due to 2 previous errors

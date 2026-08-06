@@ -1,0 +1,14 @@
+put_c=201
+put_o=201
+vip_health=200
+HTTP/1.1 200 OK
+x-auth-token: AUTH_tkv1.313738353934303331391e746573741e746573743a7465737465721e415554485f74657374.94a23d943d6d74c2ccdc42a538738deef85e7036ffa08addbd4d9abfb0601813
+x-storage-token: AUTH_tkv1.313738353934303331391e746573741e746573743a7465737465721e415554485f74657374.94a23d943d6d74c2ccdc42a538738deef85e7036ffa08addbd4d9abfb0601813
+get_during=200
+vip_health_after=200
+get_after=200
+    inet 127.0.0.1/8 scope host lo
+    inet 169.58.108.85/17 brd 169.58.127.255 scope global noprefixroute eth0
+    inet 10.0.0.1/22 brd 10.0.3.255 scope global noprefixroute eth1
+    inet 10.0.4.1/22 brd 10.0.7.255 scope global noprefixroute eth2
+    inet 10.0.8.1/22 brd 10.0.11.255 scope global noprefixroute eth3

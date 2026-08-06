@@ -1,0 +1,5 @@
+2254:        let mut keys = self.account_info_uncached(account).temp_url_keys;
+2262:    fn account_info_uncached(self: &Arc<Self>, account: &str) -> AccountInfo {
+   Compiling swift-middleware v0.1.0 (/tmp/p0-swift-rust/crates/swift-middleware)
+   Compiling swift-proxy-server v0.1.0 (/tmp/p0-swift-rust/crates/swift-proxy-server)
+    Finished `release` profile [optimized] target(s) in 9.42s

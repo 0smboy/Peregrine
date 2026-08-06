@@ -1,0 +1,19 @@
+UTC=2026-08-04T08:05:58Z
+=== openstack-swift unit count per node ===
+10.0.0.1 openstack_units=0
+10.0.0.2 openstack_units=0
+10.0.0.3 openstack_units=0
+10.0.0.4 openstack_units=0
+=== python import / disk ===
+HOST=swift2: ModuleNotFoundError: No module named 'swift'; pyswift=present; /srv/node/d1 ~89% used; pip3=absent
+HOST=swift3: ModuleNotFoundError: No module named 'swift'; pyswift=present(logs only tree); /srv/node/d1 ~90% used; pip3=absent
+HOST=swift4: ModuleNotFoundError: No module named 'swift'; /srv/node/d1 ~88% used; pip3=absent
+container_runtime=absent (no docker/podman)
+VERDICT=PYTHON_CLUSTER_ABSENT
+3A_PYTHON=FROZEN
+3B=FROZEN (no bilateral Python 3-node endpoint)
+3C=BACKLOG (Rust exclusive on 2/3/4 demote-swift1 — not cut over this cycle; phase-2 keeps 4-node Rust)
+3D=FROZEN
+BLOCKERS=openstack-swift units=0; no python swift module; no pip3; disks ~90% full; wipe /srv/node forbidden
+SAIO_NOTE=/etc/pyswift configs may remain from phase-1 but SAIO listeners absent (required for stage 2)
+RUST_SIDE=4-node Rust+HAProxy RR+Keepalived VIP healthy; middleware per deploy-rs gate (not full Paste)

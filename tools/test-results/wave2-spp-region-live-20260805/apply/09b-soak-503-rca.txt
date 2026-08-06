@@ -1,0 +1,40 @@
+# Soak residual failures — brief RCA (2026-08-05)
+
+SOAK_END: n=192 ok=185 fail=7  (2026-08-05T11:13:52Z)
+Evidence: apply/09-soak-result.log
+NO Identity / TLS changes. NO ring rebuild for this note.
+
+## Failure breakdown
+
+| Iters | Codes | Count | Class |
+|-------|-------|-------|-------|
+| n=22 | c1=201 c2=201 c3=401 c4=409 | 1 | Keystone token mid-cycle expiry / delete race (401 then 409 on container delete) |
+| n=24 | c1..c4=401 | 1 | Empty/expired token (auth scrape race); all ops 401 |
+| n=60–64 | c1..c4=503 got_len=106 | 5 | HAProxy 503 Service Unavailable (HTML body ~106B) |
+
+After n=64, fail stayed at 7 through SOAK_END (last ~128 iters clean).
+
+## 503 root cause (n=60–64 ≈ 10:33–10:39Z)
+
+Concurrent proxy binary deploy / restart storm on Contabo nodes — NOT spp/object-ring:
+
+1. journalctl swift-proxy @ ~10:32–10:34:
+   - swift1/3/4: `Failed to execute /usr/local/bin/swift-proxy-server: Exec format error`
+   - swift2/4: `Text file busy` (classic overwrite-while-exec / restart race)
+2. haproxy on VIP holder (swift1) during same window:
+   - `Server swift_proxy_back/proxy{1..4} is DOWN ... Connection refused`
+   - `backend 'swift_proxy_back' has no server available!` @ 10:33:02Z
+3. VIP still answered on :8085 → clients saw HTTP 503 from HAProxy while all proxy backends were down/flapping.
+
+Object servers (6210–6212) stayed up throughout; post-soak health 200 on VIP + all four :8080 (apply/10-post-soak-health.txt).
+
+## Not the cause
+
+- Identity / Keystone TLS path (5000/authtoken) — unchanged; early 401s are soak-script token refresh gaps, not IdP outage.
+- Object ring / spp / ports 6210+ — listen stable; CRUD OK outside restart window.
+- Disk / capacity — still ~2%.
+
+## Disposition
+
+Soak gate fail=0: **NOT MET** → WARN / PARTIAL. Do not claim soak PASS.
+Mitigation for next soak: serialize proxy binary replace (stop → install → start; avoid in-place overwrite under load); optional soak token re-auth every N iters. No PRODUCTION-GO-LIVE.

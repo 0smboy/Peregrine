@@ -1,0 +1,33 @@
+=== container-updater converge ===
+PUT_CONT 201
+PUT_O1 201
+PUT_O2 201
+PUT_O3 201
+HTTP/1.1 200 OK
+x-container-object-count: 3
+x-container-bytes-used: 15
+object_count=3
+UPDATER_E2E=PASS
+=== account-reaper smoke ===
+swift1 
+active
+swift2 
+active
+swift3 
+active
+swift4 
+active
+REAPER_SMOKE=PASS (daemon once+active; full account-delete E2E needs reseller account create)
+=== container-reconciler smoke ===
+swift1 
+active
+swift2 
+active
+swift3 
+active
+swift4 
+active
+RECONCILER_SMOKE=PASS (daemon once+active; policy-race inject deferred)
+=== disk ===
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda4        40G   20G   21G  49% /

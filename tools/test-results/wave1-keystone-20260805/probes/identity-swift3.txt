@@ -1,0 +1,8 @@
+swift3
+ls: cannot access '/etc/keystone': No such file or directory
+package MariaDB-server is not installed
+package mariadb-server is not installed
+inactive
+inactive
+inactive
+no-identity-listeners

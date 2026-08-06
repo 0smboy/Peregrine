@@ -1,0 +1,14 @@
+UTC=2026-08-05T10:07:57Z
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=3988599,fd=5))                                                                                                                                                                                                              
+LISTEN 0      4000         0.0.0.0:8085       0.0.0.0:*    users:(("haproxy",pid=3946973,fd=8))                                                                                                                                                                                                                      
+root     3988599  8.5  0.2 2187716 17680 ?       Ssl  10:05   0:15 /usr/local/bin/swift-proxy-server /etc/swift/proxy-server.conf
+  UNIT                LOAD   ACTIVE   SUB  DESCRIPTION
+  swift-proxy.service loaded inactive dead Swift proxy server (rust)
+
+LOAD   = Reflects whether the unit definition was properly loaded.
+ACTIVE = The high-level unit activation state, i.e. generalization of SUB.
+SUB    = The low-level unit activation state, values depend on unit type.
+1 loaded units listed.
+To show all installed unit files use 'systemctl list-unit-files'.
+local=200
+vip=200

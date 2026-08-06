@@ -24,11 +24,18 @@
 //!
 //! This module ports the pure task-name / bucket arithmetic (byte-identical
 //! to Python, golden-tested) plus the due-task iteration and the
-//! delete-then-pop flow over a pluggable [`ExpiryClient`]. Deferred: the
-//! InternalClient listing transport, process-sharding (`hash_mod`), delay
-//! reaping, and async-delete content-type bookkeeping (modelled as a flag).
+//! delete-then-pop flow over a pluggable [`ExpiryClient`], plus a
+//! ring-direct [`HttpExpiryClient`] and [`run_once`] sweep used by the
+//! `swift-object-expirer` daemon. Deferred: process-sharding (`hash_mod`),
+//! delay_reaping per-account overrides, and InternalClient/proxy transport
+//! (ring-direct matches the object/container updaters).
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use swift_http::split_path;
+use swift_ring::Ring;
 
 /// Default `expiring_objects_container_divisor` (one bucket per day).
 pub const EXPIRER_CONTAINER_DIVISOR: i64 = 86400;
@@ -212,6 +219,353 @@ pub fn process_task(
             false
         }
     }
+}
+
+fn pe(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            b => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn http_status(buf: &[u8]) -> u16 {
+    String::from_utf8_lossy(buf)
+        .split("\r\n")
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(500)
+}
+
+fn http_body(buf: &[u8]) -> &[u8] {
+    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        &buf[pos + 4..]
+    } else {
+        &[]
+    }
+}
+
+fn node_host(node: &swift_ring::RingDevice, replication: bool) -> String {
+    if replication {
+        let ip = node
+            .replication_ip
+            .clone()
+            .unwrap_or_else(|| node.ip.clone());
+        let port = node.replication_port.unwrap_or(node.port);
+        format!("{ip}:{port}")
+    } else {
+        format!("{}:{}", node.ip, node.port)
+    }
+}
+
+fn raw_request(
+    host: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Option<(u16, Vec<u8>)> {
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n");
+    for (k, v) in headers {
+        request.push_str(&format!("{k}: {v}\r\n"));
+    }
+    request.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
+    let Ok(mut conn) = TcpStream::connect(host) else {
+        return None;
+    };
+    conn.set_nodelay(true).ok();
+    let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(15)));
+    let _ = conn.set_write_timeout(Some(std::time::Duration::from_secs(15)));
+    if conn.write_all(request.as_bytes()).is_err() {
+        return None;
+    }
+    let mut buf = Vec::new();
+    if conn.read_to_end(&mut buf).is_err() {
+        return None;
+    }
+    Some((http_status(&buf), buf))
+}
+
+/// List containers under an account via the account ring (JSON).
+pub fn list_account_containers(account_ring: &Ring, account: &str) -> Option<Vec<String>> {
+    let (part, nodes) = account_ring.get_nodes(account, None, None).ok()?;
+    for node in &nodes {
+        let host = node_host(node.dev, true);
+        let path = format!(
+            "/{}/{part}/{}?format=json&limit=10000",
+            node.dev.device,
+            pe(account)
+        );
+        let Some((status, buf)) = raw_request(
+            &host,
+            "GET",
+            &path,
+            &[("Accept", "application/json"), ("X-Backend-Allow-Reserved-Names", "true")],
+        ) else {
+            continue;
+        };
+        if status == 404 {
+            return Some(Vec::new());
+        }
+        if !(200..300).contains(&status) {
+            continue;
+        }
+        let body = http_body(&buf);
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+            continue;
+        };
+        let Some(arr) = v.as_array() else {
+            continue;
+        };
+        let mut names = Vec::new();
+        for item in arr {
+            if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                names.push(name.to_string());
+            }
+        }
+        return Some(names);
+    }
+    None
+}
+
+/// List objects in a container via the container ring (name + content_type).
+pub fn list_container_objects(
+    container_ring: &Ring,
+    account: &str,
+    container: &str,
+) -> Option<Vec<(String, String)>> {
+    let (part, nodes) = container_ring
+        .get_nodes(account, Some(container), None)
+        .ok()?;
+    for node in &nodes {
+        let host = node_host(node.dev, true);
+        let path = format!(
+            "/{}/{part}/{}/{}?format=json&limit=10000",
+            node.dev.device,
+            pe(account),
+            pe(container)
+        );
+        let Some((status, buf)) = raw_request(
+            &host,
+            "GET",
+            &path,
+            &[
+                ("Accept", "application/json"),
+                ("X-Backend-Allow-Reserved-Names", "true"),
+                ("X-Backend-Storage-Policy-Index", "0"),
+            ],
+        ) else {
+            continue;
+        };
+        if status == 404 {
+            return Some(Vec::new());
+        }
+        if !(200..300).contains(&status) {
+            continue;
+        }
+        let body = http_body(&buf);
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+            continue;
+        };
+        let Some(arr) = v.as_array() else {
+            continue;
+        };
+        let mut out = Vec::new();
+        for item in arr {
+            let Some(name) = item.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let ctype = item
+                .get("content_type")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            out.push((name.to_string(), ctype));
+        }
+        return Some(out);
+    }
+    None
+}
+
+/// Ring-direct expiry client: DELETE the real object on the object ring,
+/// then DELETE the queue entry on every container replica (Python
+/// `direct_delete_container_entry`).
+pub struct HttpExpiryClient<'a> {
+    pub object_ring: &'a Ring,
+    pub container_ring: &'a Ring,
+}
+
+impl ExpiryClient for HttpExpiryClient<'_> {
+    fn delete_actual_object(&self, task: &TaskInfo) -> DeleteResult {
+        let Ok((part, nodes)) = self.object_ring.get_nodes(
+            &task.target_account,
+            Some(&task.target_container),
+            Some(&task.target_object),
+        ) else {
+            return DeleteResult::Error;
+        };
+        let ts = normalize_delete_at_timestamp(task.delete_timestamp);
+        let mut saw_success = false;
+        let mut saw_stale = false;
+        let mut saw_error = false;
+        for node in &nodes {
+            let host = node_host(node.dev, false);
+            let path = format!(
+                "/{}/{part}/{}/{}/{}",
+                node.dev.device,
+                pe(&task.target_account),
+                pe(&task.target_container),
+                pe(&task.target_object)
+            );
+            let headers: Vec<(&str, &str)> = if task.is_async_delete {
+                vec![
+                    ("X-Timestamp", ts.as_str()),
+                    ("X-Backend-Storage-Policy-Index", "0"),
+                ]
+            } else {
+                vec![
+                    ("X-Timestamp", ts.as_str()),
+                    ("X-If-Delete-At", ts.as_str()),
+                    ("X-Backend-Clean-Expiring-Object-Queue", "no"),
+                    ("X-Backend-Storage-Policy-Index", "0"),
+                ]
+            };
+            let Some((status, _)) = raw_request(&host, "DELETE", &path, &headers) else {
+                saw_error = true;
+                continue;
+            };
+            if task.is_async_delete {
+                if (200..300).contains(&status) || status == 404 || status == 409 {
+                    saw_success = true;
+                } else {
+                    saw_error = true;
+                }
+            } else if (200..300).contains(&status) || status == 409 {
+                // 2xx or 409 (newer object) — Python acceptable_statuses
+                saw_success = true;
+            } else if status == 404 || status == 412 {
+                saw_stale = true;
+            } else {
+                saw_error = true;
+            }
+        }
+        if saw_success {
+            DeleteResult::Deleted
+        } else if saw_stale && !saw_error {
+            DeleteResult::Stale
+        } else {
+            DeleteResult::Error
+        }
+    }
+
+    fn pop_queue(&self, task: &TaskInfo) -> bool {
+        let Ok((part, nodes)) = self.container_ring.get_nodes(
+            &task.task_account,
+            Some(&task.task_container),
+            Some(&task.task_object),
+        ) else {
+            return false;
+        };
+        let ts = format!(
+            "{:.5}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0)
+        );
+        let mut ok = 0usize;
+        for node in &nodes {
+            let host = node_host(node.dev, true);
+            let path = format!(
+                "/{}/{part}/{}/{}/{}",
+                node.dev.device,
+                pe(&task.task_account),
+                pe(&task.task_container),
+                pe(&task.task_object)
+            );
+            let Some((status, _)) = raw_request(
+                &host,
+                "DELETE",
+                &path,
+                &[
+                    ("X-Timestamp", ts.as_str()),
+                    ("X-Backend-Storage-Policy-Index", "0"),
+                    ("X-Backend-Allow-Reserved-Names", "true"),
+                ],
+            ) else {
+                continue;
+            };
+            if (200..300).contains(&status) || status == 404 {
+                ok += 1;
+            }
+        }
+        ok > 0
+    }
+}
+
+/// One full expiry pass: list due task containers under `.expiring_objects`,
+/// process each due task. Returns aggregated stats.
+pub fn run_once(
+    account_ring: &Ring,
+    container_ring: &Ring,
+    object_ring: &Ring,
+    now: i64,
+    reclaim_age: i64,
+) -> ExpirerStats {
+    let mut stats = ExpirerStats::default();
+    let client = HttpExpiryClient {
+        object_ring,
+        container_ring,
+    };
+    let Some(containers) = list_account_containers(account_ring, EXPIRER_ACCOUNT_NAME) else {
+        stats.errors += 1;
+        return stats;
+    };
+    for cname in containers {
+        let Ok(c_int) = cname.parse::<i64>() else {
+            continue;
+        };
+        if c_int > now {
+            break;
+        }
+        // Zero-padded form used by the enqueue path.
+        let task_container = normalize_delete_at_timestamp(c_int);
+        let Some(objects) =
+            list_container_objects(container_ring, EXPIRER_ACCOUNT_NAME, &task_container)
+        else {
+            // try the unpadded name Python listing may return
+            let Some(objects) =
+                list_container_objects(container_ring, EXPIRER_ACCOUNT_NAME, &cname)
+            else {
+                stats.errors += 1;
+                continue;
+            };
+            let due = iter_due_tasks(EXPIRER_ACCOUNT_NAME, &cname, &objects, now);
+            for task in due {
+                process_task(&task, now, reclaim_age, &client, &mut stats);
+            }
+            continue;
+        };
+        let due = iter_due_tasks(EXPIRER_ACCOUNT_NAME, &task_container, &objects, now);
+        for task in due {
+            process_task(&task, now, reclaim_age, &client, &mut stats);
+        }
+    }
+    stats
+}
+
+/// Recon-cache update for the object expirer (`object_expiration_pass` /
+/// `expired_last_pass`).
+pub fn recon_update(elapsed: std::time::Duration, expired: u64) -> serde_json::Value {
+    serde_json::json!({
+        "object_expiration_pass": elapsed.as_secs_f64(),
+        "expired_last_pass": expired,
+    })
 }
 
 #[cfg(test)]

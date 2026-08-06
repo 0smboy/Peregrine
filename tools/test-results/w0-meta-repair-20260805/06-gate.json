@@ -1,0 +1,31 @@
+{
+  "swift1_db": {
+    "live_object_rows": 0,
+    "all_object_rows": 48577,
+    "live_account_container_rows": 0,
+    "disk_hash_dirs": 201
+  },
+  "api_account": {
+    "x-account-access-control": "{}",
+    "x-account-bytes-used": "0",
+    "x-account-container-count": "0",
+    "x-account-meta-temp-url-key": "p1b-form-key",
+    "x-account-object-count": "0",
+    "x-account-storage-policy-ec-2-1-bytes-used": "0",
+    "x-account-storage-policy-ec-2-1-container-count": "0",
+    "x-account-storage-policy-ec-2-1-object-count": "0",
+    "x-account-storage-policy-policy-0-bytes-used": "0",
+    "x-account-storage-policy-policy-0-container-count": "0",
+    "x-account-storage-policy-policy-0-object-count": "0"
+  },
+  "api_listing_lines": 0,
+  "api_listing_sample": [],
+  "crud": {
+    "put_c": 201,
+    "put_o": 201,
+    "get_o": 200,
+    "del_o": 204,
+    "del_c": 204
+  },
+  "api_listing_after_smoke": 0
+}

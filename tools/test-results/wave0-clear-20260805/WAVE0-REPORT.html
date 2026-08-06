@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Wave 0 — API clear / tombstone / VACUUM — 2026-08-05</title>
+<style>
+  :root { --ink:#1a1a1a; --muted:#555; --ok:#1b6b3a; --bad:#8b1e1e; --warn:#7a5a00; --bg:#f7f5f1; }
+  body { font-family: ui-sans-serif, system-ui, sans-serif; color: var(--ink); background: var(--bg); margin: 0; padding: 2rem; line-height: 1.45; }
+  h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.15rem; margin: 2rem 0 .5rem; border-bottom: 1px solid #ccc; padding-bottom: .25rem; }
+  .meta { color: var(--muted); font-size: .9rem; margin-bottom: 1.5rem; }
+  table { border-collapse: collapse; width: 100%; max-width: 960px; background: #fff; }
+  th, td { border: 1px solid #ddd; padding: .4rem .55rem; text-align: left; font-size: .9rem; }
+  th { background: #eee; }
+  .ok { color: var(--ok); font-weight: 600; }
+  .bad { color: var(--bad); font-weight: 600; }
+  .warn { color: var(--warn); font-weight: 600; }
+  code { font-family: ui-monospace, Menlo, monospace; font-size: .85em; }
+  ul { max-width: 960px; }
+</style>
+</head>
+<body>
+<h1>Wave 0 — API clear + tombstone / SQLite observability</h1>
+<p class="meta">Contabo VIP <code>http://10.0.0.10:8085</code> · evidence <code>tools/test-results/wave0-clear-20260805/</code> · 2026-08-05 · no mkfs / no wipe <code>/srv/node</code></p>
+
+<h2>1. What this cycle did</h2>
+<ul>
+  <li><strong>0A</strong> — REST clear equivalent to <code>swift delete -a</code> (python on-cluster; laptop VIP often times out).</li>
+  <li><strong>0B</strong> — Implemented <code>swift-recon tombstones</code> metrics; lab <code>reclaim_age=600</code>; found and fixed replicator conf ignore.</li>
+  <li><strong>0C</strong> — Implemented <code>swift-recon dbspace</code> / <code>vacuum</code>; ran VACUUM on <code>/srv/node/d2</code> with before/after.</li>
+</ul>
+
+<h2>2. What was optimized / fixed / demoted</h2>
+<ul>
+  <li><strong>Fixed:</strong> <code>swift-object-replicator</code> now reads <code>reclaim_age</code> / <code>commit_window</code> from conf (was always 604800).</li>
+  <li><strong>Fixed:</strong> Contabo conf placed <code>reclaim_age</code> under <code>[DEFAULT]</code> + <code>[object-replicator]</code> (was only under <code>[object-expirer]</code>).</li>
+  <li><strong>Added:</strong> <code>swift_object_tombstones*</code>, <code>swift_db_*</code> exporters + VACUUM path in <code>swift-db</code>.</li>
+  <li><strong>Demoted / residual:</strong> account listing ghosts; orphan on-disk objects; first 14m reclaim window failed until wire-up.</li>
+</ul>
+
+<h2>3. Measured effect</h2>
+<table>
+  <tr><th>Metric</th><th>Before</th><th>After</th><th>Notes</th></tr>
+  <tr><td>Account objects (header)</td><td>874 835</td><td>stale ~846k ghosts</td><td>Live HEAD sum was 128 before final live delete</td></tr>
+  <tr><td>Live containers (HEAD 200)</td><td>26</td><td>~0–4 empty leftovers</td><td>963 account ghosts remain (404)</td></tr>
+  <tr><td>Tombstones (wired reclaim_age=600)</td><td>T0: s1=48901 s2=48407 s3=48833 s4=48418</td><td>T+21m: s1=48901 s2=48406 s3=48800 s4=48418</td><td class="warn">Near-flat; reclaim not clearing backlog in window</td></tr>
+  <tr><td>d2 SQLite bytes (device VACUUM)</td><td>41 111 552</td><td>36 540 416</td><td><span class="ok">−4 571 136</span> (264 DBs)</td></tr>
+  <tr><td>Cluster freelist (all devices sample)</td><td>587 pages / ~2.4 MB</td><td>560 / ~2.3 MB</td><td>After d2 VACUUM only</td></tr>
+  <tr><td>d1 Avail</td><td>304 M (100%)</td><td>~2.2 G (96%)</td><td>Some reclaim/delete effect; still high used</td></tr>
+</table>
+
+<h2>4. Gate results</h2>
+<table>
+  <tr><th>Gate</th><th>Result</th><th>Evidence</th></tr>
+  <tr><td>Unit: VACUUM freelist shrink</td><td class="ok">PASS</td><td><code>cargo test -p swift-db vacuum</code></td></tr>
+  <tr><td>Unit: tombstone/dbspace metrics</td><td class="ok">PASS</td><td><code>cargo test -p swift-cli space_metrics</code></td></tr>
+  <tr><td>API clear live objects</td><td class="ok">PASS</td><td><code>06-delete-live-only.txt</code> (128 objs)</td></tr>
+  <tr><td>Account listing empty</td><td class="bad">FAIL</td><td>~963 ghost containers; <code>04-live-vs-stale-containers.txt</code></td></tr>
+  <tr><td>Reclaim ~10m → ts≈0 (pre-fix)</td><td class="bad">FAIL</td><td><code>wave0_tombstone_experiment.json</code> flat 48928</td></tr>
+  <tr><td>Reclaim after conf+binary wire</td><td class="bad">FAIL</td><td>Δ≈0–33 over ~21m; <code>11/12-ts-*-wired-all-nodes.txt</code></td></tr>
+  <tr><td>VACUUM before/after</td><td class="ok">PASS</td><td><code>08-vacuum-d2-summary.txt</code></td></tr>
+  <tr><td>Restore reclaim_age=604800</td><td class="ok">PASS</td><td><code>13-reclaim-age-restored-604800.txt</code> + logs show 604800s</td></tr>
+</table>
+
+<h2>5. Remaining / next</h2>
+<ul>
+  <li class="warn"><strong>FROZEN for Wave 0:</strong> orphan <code>.data</code> without API names; account DB ghost rows (needs updater/reconcile path, not mkfs).</li>
+  <li><strong>Backlog:</strong> deploy reclaim_age-aware replicator via bundle-rust; optional scheduled VACUUM policy; account ghost cleanup tool.</li>
+  <li>Later waves (Keystone / spp / S3 / Python) not claimed.</li>
+</ul>
+
+<p class="meta">Docs: <code>docs/fairness-lab/TOMBSTONE-VACUUM.md</code> · ROADMAP Wave 0 section only.</p>
+</body>
+</html>

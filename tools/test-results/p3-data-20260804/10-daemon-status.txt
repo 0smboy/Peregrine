@@ -1,0 +1,32 @@
+=== 10.0.0.1 ===
+active
+active
+active
+Aug 04 15:38:12 container-sharder[382081]: INFO swift-container-sharder: devices=/srv/node interval=30s cleave_batch_size=2 once=false mode=local-cleave-only
+Aug 04 15:38:12 container-sharder[382081]: INFO container-sharder pass: seen=973 sharding=0 cleaved_batches=0 finished=0 skipped=973 failures=0
+Aug 04 15:38:42 container-sharder[382081]: INFO container-sharder pass: seen=973 sharding=0 cleaved_batches=0 finished=0 skipped=973 failures=0
+Aug 04 15:39:12 container-sharder[382081]: INFO container-sharder pass: seen=973 sharding=0 cleaved_batches=0 finished=0 skipped=973 failures=0
+=== 10.0.0.2 ===
+active
+active
+active
+Aug 04 15:38:19 container-sharder[808927]: INFO swift-container-sharder: devices=/srv/node interval=30s cleave_batch_size=2 once=false mode=local-cleave-only
+Aug 04 15:38:19 container-sharder[808927]: INFO container-sharder pass: seen=967 sharding=0 cleaved_batches=0 finished=0 skipped=967 failures=0
+Aug 04 15:38:49 container-sharder[808927]: INFO container-sharder pass: seen=967 sharding=0 cleaved_batches=0 finished=0 skipped=967 failures=0
+Aug 04 15:39:20 container-sharder[808927]: INFO container-sharder pass: seen=968 sharding=0 cleaved_batches=0 finished=0 skipped=968 failures=0
+=== 10.0.0.3 ===
+active
+active
+active
+Aug 04 15:38:23 container-sharder[4000829]: INFO swift-container-sharder: devices=/srv/node interval=30s cleave_batch_size=2 once=false mode=local-cleave-only
+Aug 04 15:38:23 container-sharder[4000829]: INFO container-sharder pass: seen=1044 sharding=0 cleaved_batches=0 finished=0 skipped=1044 failures=0
+Aug 04 15:38:53 container-sharder[4000829]: INFO container-sharder pass: seen=1044 sharding=0 cleaved_batches=0 finished=0 skipped=1044 failures=0
+Aug 04 15:39:23 container-sharder[4000829]: INFO container-sharder pass: seen=1045 sharding=0 cleaved_batches=0 finished=0 skipped=1045 failures=0
+=== 10.0.0.4 ===
+active
+active
+active
+Aug 04 15:38:43 systemd[1]: Started Swift container sharder (rust, local cleave).
+Aug 04 15:38:43 container-sharder[2552602]: INFO swift-container-sharder: devices=/srv/node interval=30s cleave_batch_size=2 once=false mode=local-cleave-only
+Aug 04 15:38:43 container-sharder[2552602]: INFO container-sharder pass: seen=953 sharding=0 cleaved_batches=0 finished=0 skipped=953 failures=0
+Aug 04 15:39:13 container-sharder[2552602]: INFO container-sharder pass: seen=954 sharding=0 cleaved_batches=0 finished=0 skipped=954 failures=0

@@ -1,0 +1,24 @@
+RB=/Users/oboy/Downloads/Peregrine/swift-rust/target/debug/swift-ring-builder
+created builder: part_power=8 replicas=3
+added device 0
+added device 1
+--- list after create ---
+0	r1z1-10.0.4.1:6200R10.0.8.1:6200/d1	100
+1	r1z1-10.0.4.1:6200R10.0.8.1:6200/d2	100
+devices	2
+--- idempotent add d2 ---
+already present r1z1-10.0.4.1:6200R10.0.8.1:6200/d2
+--- expand add d3 ---
+added device 2
+rebalanced and wrote object.ring.gz
+0	r1z1-10.0.4.1:6200R10.0.8.1:6200/d1	100
+1	r1z1-10.0.4.1:6200R10.0.8.1:6200/d2	100
+2	r1z1-10.0.4.1:6200R10.0.8.1:6200/d3	100
+devices	3
+--- search ---
+found r1z1-10.0.4.1:6200/d3
+search_rc=0
+No matching devices found
+search_missing_rc=2
+EXPAND_DRY_RUN=PASS
+NOTE: first rebalance with 2 devices / 3 replicas fails as expected; expand to d3 then rebalances OK

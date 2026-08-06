@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>P1a L2 Production Gap — GREEN</title>
+<style>
+  :root { --bg:#111; --fg:#e8e4dc; --muted:#9a958c; --ok:#6a9f6a; --warn:#c4a35a; --bad:#c46a6a; --line:#2a2a2a; }
+  body { margin:0; font:15px/1.45 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:920px; margin:0 auto; padding:2rem 1.25rem 4rem; }
+  h1 { font-size:1.6rem; font-weight:650; margin:0 0 .35rem; }
+  .sub { color:var(--muted); margin-bottom:1.5rem; }
+  .badge { display:inline-block; padding:.15rem .55rem; border:1px solid var(--ok); color:var(--ok); border-radius:3px; font-size:.85rem; }
+  section { margin:1.75rem 0; padding-top:1rem; border-top:1px solid var(--line); }
+  h2 { font-size:1.1rem; margin:0 0 .75rem; font-weight:600; }
+  table { width:100%; border-collapse:collapse; font-size:.92rem; }
+  th, td { text-align:left; padding:.45rem .5rem; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; }
+  .ok { color:var(--ok); }
+  .warn { color:var(--warn); }
+  code, pre { font-family:ui-monospace,Menlo,monospace; font-size:.84rem; }
+  pre { background:#1a1a1a; padding:.75rem 1rem; overflow:auto; border-radius:4px; }
+  ul { padding-left:1.2rem; }
+  li { margin:.25rem 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>P1a — L2 common middleware</h1>
+  <p class="sub">2026-08-04 · Contabo VIP <code>10.0.0.10:8085</code> · <span class="badge">GREEN</span></p>
+
+  <section>
+    <h2>1) What this cycle did</h2>
+    <ul>
+      <li><strong>bulk</strong> — wired into proxy pipeline; <code>/info</code> advertises <code>bulk_delete</code> only (<code>extract-archive</code> / <code>bulk_upload</code> = wontfix P1a).</li>
+      <li><strong>tempurl</strong> — wired with uncached-HEAD <code>KeyProvider</code> + authorize override; negatives for tamper/expiry/wrong path.</li>
+      <li><strong>Account ACL</strong> — validate → sysmeta + authorize; <code>tempauth.account_acls: true</code> in <code>/info</code>; not silent-skip.</li>
+      <li><strong>ratelimit</strong> — deployable on-by-config: commented sample in <code>bundle-rust</code>; not in default pipeline (avoids shifting CORE-PATH perf baselines).</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>2) Optimized / fixed</h2>
+    <ul>
+      <li>TempURL key lookup bypasses per-proxy info cache (VIP RR coherency after key POST).</li>
+      <li>Account ACL invalid headers return 400; owner-header stripping for non-owners.</li>
+      <li>Suite JSON matching tolerates compact serde (<code>ckjson</code>).</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>3) Measured effect</h2>
+    <table>
+      <tr><th>Metric</th><th>Before (P0)</th><th>After (P1a)</th></tr>
+      <tr><td>Pipeline L2 filters</td><td>skip bulk/tempurl</td><td class="ok">bulk + tempurl wired; ratelimit optional</td></tr>
+      <tr><td><code>/info</code> ads</td><td>no bulk/tempurl/account_acls</td><td class="ok">bulk_delete + tempurl + account_acls</td></tr>
+      <tr><td>CORE-PATH func-suite VIP</td><td>54/54</td><td class="ok">54/54 (no regress)</td></tr>
+      <tr><td>P1a specialty VIP / local</td><td>—</td><td class="ok">27/27 · 27/27</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>4) Gate tables</h2>
+    <table>
+      <tr><th>Gate</th><th>Result</th><th>Evidence</th></tr>
+      <tr><td>Unit / golden (middleware + proxy wire)</td><td class="ok">PASS</td><td><code>18-cargo-middleware.txt</code>, <code>19-cargo-proxy.txt</code>, local cargo test</td></tr>
+      <tr><td>Wire + accurate <code>/info</code></td><td class="ok">PASS</td><td><code>02-info-keys.txt</code>, <code>10-vip-info.txt</code></td></tr>
+      <tr><td>P1a specialty VIP</td><td class="ok">27/27</td><td><code>17-suites-rerun.txt</code></td></tr>
+      <tr><td>P1a specialty local</td><td class="ok">27/27</td><td><code>17-suites-rerun.txt</code></td></tr>
+      <tr><td>TempURL threat negatives</td><td class="ok">PASS</td><td><code>THREAT-TEMPURL.md</code> / <code>THREAT-NOTE.md</code></td></tr>
+      <tr><td>CORE-PATH func-suite VIP</td><td class="ok">54/54</td><td><code>12-func-suite-vip.txt</code></td></tr>
+      <tr><td>HA-PATH / chaos / soak</td><td class="warn">not re-run this wave</td><td>FROZEN — CORE-PATH sampling only</td></tr>
+    </table>
+    <pre>bundle-rust default pipeline =
+  catch_errors gatekeeper healthcheck proxy-logging cache listing_formats
+  bulk tempurl tempauth copy slo dlo proxy-logging proxy-server
+# ratelimit: insert before tempauth + uncomment [filter:ratelimit] sample</pre>
+  </section>
+
+  <section>
+    <h2>5) Remaining / next</h2>
+    <ul>
+      <li><strong>FROZEN for next wave:</strong> P1a GREEN — start P1b only after accept.</li>
+      <li><strong>Backlog:</strong> bulk_upload/extract-archive; temp_url_ip_range; shared memcache info cache; ACL authorize TTL lag across proxies.</li>
+      <li><strong>Next wave:</strong> P1b (formpost, staticweb, quotas, symlink, versioned_writes, …).</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

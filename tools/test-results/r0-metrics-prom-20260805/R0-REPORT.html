@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>R0 metrics → Prometheus / Grafana — 2026-08-05</title>
+<style>
+  :root { --bg:#141210; --ink:#f2ebe0; --muted:#a89a88; --ok:#7d9b6a; --warn:#c4a35a; --bad:#c47a6a; --line:#2c2822; }
+  body { margin:0; font:15px/1.45 ui-sans-serif, system-ui, sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width:980px; margin:0 auto; padding:32px 24px 64px; }
+  h1 { font-size:1.6rem; font-weight:650; margin:0 0 8px; }
+  h2 { font-size:1.1rem; margin:28px 0 10px; color:var(--muted); font-weight:600; }
+  .sub { color:var(--muted); margin-bottom:24px; }
+  .pill { display:inline-block; padding:2px 10px; border:1px solid var(--line); border-radius:4px; font-size:12px; letter-spacing:.02em; }
+  .ok { color:var(--ok); border-color:#3a4a32; }
+  .warn { color:var(--warn); border-color:#4a4030; }
+  table { width:100%; border-collapse:collapse; margin:10px 0 18px; font-size:13px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:550; }
+  code { font:12px/1.4 ui-monospace, Menlo, monospace; color:#e0d4c2; }
+  pre { background:#1c1915; padding:12px 14px; overflow:auto; font:12px/1.4 ui-monospace, Menlo, monospace; border:1px solid var(--line); }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  @media (max-width:720px){ .grid { grid-template-columns:1fr; } }
+  .card { border:1px solid var(--line); padding:14px 16px; background:#1a1713; }
+  .card strong { display:block; margin-bottom:6px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>R0 — Tombstone / DB metrics into Prometheus</h1>
+  <p class="sub">Contabo lab · 2026-08-05 · evidence <code>tools/test-results/r0-metrics-prom-20260805/</code></p>
+  <p>
+    <span class="pill ok">SCRAPE GREEN</span>
+    <span class="pill ok">ALERTS LOADED</span>
+    <span class="pill warn">GRAFANA DS OK / RENDER STUB</span>
+  </p>
+
+  <h2>1) What this cycle did</h2>
+  <ul>
+    <li>Documented pre-R0 gap: metrics were <strong>CLI-only</strong>, not in Prometheus/Grafana (<code>TOMBSTONE-VACUUM.md</code> + ROADMAP).</li>
+    <li>Deployed per-node <code>swift-recon-textfile.timer</code> → node_exporter textfile on swift1–4.</li>
+    <li>Enabled <code>--collector.textfile.directory=/var/lib/node_exporter/textfile_collector</code>.</li>
+    <li>Loaded <code>swift-ops-alerts.yml</code> on Prometheus (swift4 <code>127.0.0.1:9090</code>).</li>
+    <li>Grafana dashboard uid <code>swift-r0-tombstone-dbspace</code> provisioned; SELinux fixed so Grafana can query Prom.</li>
+  </ul>
+
+  <h2>2) Before → after</h2>
+  <table>
+    <tr><th>Surface</th><th>Before</th><th>After</th></tr>
+    <tr><td>CLI <code>swift-recon --prometheus</code></td><td>only path</td><td>still works</td></tr>
+    <tr><td>node_exporter textfile</td><td>absent</td><td><code>swift-recon.prom</code> every 2m</td></tr>
+    <tr><td>Prom series</td><td>missing</td><td>4 nodes <code>swift_object_*</code> / <code>swift_db_*</code></td></tr>
+    <tr><td>Alerts</td><td>none</td><td>tombstone growth, freelist, Use%&gt;85%; W1 stubs</td></tr>
+    <tr><td>Grafana</td><td>not wired</td><td>dashboard live; <code>/render</code> PNG stub only</td></tr>
+  </table>
+
+  <h2>3) Measured Prom queries</h2>
+  <div class="grid">
+    <div class="card"><strong>sum by (node) (swift_object_tombstones)</strong>early ≈35–41/node; after reclaim→0 all four report <code>0</code> via zero-series wrapper (`08-prom-after-zero-fix.txt`)</div>
+    <div class="card"><strong>nodes up</strong><code>count(up{job="node"}==1) = 4</code></div>
+    <div class="card"><strong>freelist_bytes (container)</strong>≈0 after W0′ VACUUM (was ~2–2.5 MiB)</div>
+    <div class="card"><strong>device Use% /srv/node/d*</strong>~1.4–1.8% (alert inactive)</div>
+  </div>
+  <pre>groups: swift_statsd_compat, swift_ops_r0, swift_ops_w1_stubs
+SwiftTombstoneGrowth inactive
+SwiftDbFreelistHigh inactive
+SwiftDeviceUsePctHigh inactive
+GaleraClusterSizeNotThree inactive (STUB)
+KeystoneHttp5xx inactive (STUB)</pre>
+
+  <h2>4) Grafana honesty</h2>
+  <p>Dashboard searchable at uid <code>swift-r0-tombstone-dbspace</code>. <code>api/ds/query</code> returns live tombstone series after <code>semanage port</code> fix for :9090. Grafana <code>/render</code> returns identical 9 KB stub PNGs (image renderer not functional) — screenshots are <strong>not</strong> panel proof; Prom API + DS query are.</p>
+
+  <h2>5) Remaining / FROZEN</h2>
+  <ul>
+    <li><strong>FROZEN for W1:</strong> Galera size≠3 and Keystone 5xx alert exprs (stubs).</li>
+    <li>Backlog: install Grafana image renderer or capture real UI screenshots from a workstation tunnel.</li>
+    <li>Not claimed: PRODUCTION paging / Alertmanager routing.</li>
+  </ul>
+</main>
+</body>
+</html>

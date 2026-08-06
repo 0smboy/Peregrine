@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Wave3 S3 EC2 SigV4 deferral — 2026-08-05</title>
+<style>
+  :root { --bg:#141210; --ink:#efe8dc; --muted:#9a9080; --ok:#6f9f6a; --bad:#c45c4a; --line:#2c2822; --panel:#1c1915; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.45 ui-sans-serif, system-ui, sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width:920px; margin:0 auto; padding:32px 24px 64px; }
+  h1 { font-size:1.55rem; font-weight:650; margin:0 0 8px; letter-spacing:-0.02em; }
+  h2 { font-size:1.05rem; margin:28px 0 10px; color:var(--muted); font-weight:600; }
+  .verdict { display:inline-block; padding:4px 10px; background:var(--ok); color:#0e120e; font-weight:700; font-size:0.85rem; }
+  .meta { color:var(--muted); margin:10px 0 22px; }
+  table { width:100%; border-collapse:collapse; background:var(--panel); }
+  th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; font-size:0.8rem; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:0.86em; }
+  .pass { color:var(--ok); font-weight:650; }
+  .fail { color:var(--bad); font-weight:650; }
+  ul { padding-left:1.2rem; }
+  li { margin:4px 0; }
+  pre { background:var(--panel); padding:14px 16px; overflow:auto; border:1px solid var(--line); font-size:0.82rem; }
+</style>
+</head>
+<body>
+<main>
+  <p><span class="verdict">GREEN</span></p>
+  <h1>Rust s3api → Keystone s3token EC2 deferral</h1>
+  <p class="meta">2026-08-05 · Contabo VIP <code>https://10.0.0.10:8085</code> · pack <code>tools/test-results/wave3-s3-ec2-sigv4-20260805/</code> · not PRODUCTION-GO-LIVE</p>
+
+  <h2>1) What this cycle did</h2>
+  <ul>
+    <li>Keystone <code>/v3/s3tokens</code> was already GREEN (prior pack). VIP S3 SigV4 with EC2 was blocked by Rust <code>InvalidAccessKeyId</code>.</li>
+    <li><code>HttpS3TokenClient</code> now urlsafe-base64-encodes the raw SigV4 string-to-sign (never posts <code>X-Amz-Date</code> as token).</li>
+    <li><code>S3Api</code> defers unknown access keys to Keystone via injected <code>S3TokenClient</code>; maps <code>AUTH_{project_id}</code> on success.</li>
+    <li>Proxy wiring attaches the client when <code>[filter:s3token] auth_uri</code> is set.</li>
+    <li>Unit tests proved; ELF deployed to swift1–4; live VIP EC2 SigV4 PUT/GET proved.</li>
+  </ul>
+
+  <h2>2) What was fixed</h2>
+  <table>
+    <tr><th>Component</th><th>Change</th></tr>
+    <tr><td class="mono">swift-middleware/s3token.rs</td><td>base64 STS token; require <code>X-Backend-S3-String-To-Sign</code></td></tr>
+    <tr><td class="mono">swift-s3api/middleware.rs</td><td>unknown-key → <code>s3token_client.exchange</code></td></tr>
+    <tr><td class="mono">swift-s3api/sigv4.rs</td><td><code>string_to_sign_for_request</code></td></tr>
+    <tr><td class="mono">swift-proxy-server/main.rs</td><td>inject client from s3token auth_uri</td></tr>
+  </table>
+
+  <h2>3) Measured effect</h2>
+  <table>
+    <tr><th>Item</th><th>Before</th><th>After</th></tr>
+    <tr><td>VIP S3 SigV4 + EC2</td><td class="fail">InvalidAccessKeyId</td><td class="pass">200 List / Put / Get</td></tr>
+    <tr><td>s3token credentials.token</td><td class="fail">X-Amz-Date</td><td class="pass">urlsafe-base64 STS</td></tr>
+    <tr><td>TempAuth S3 ListBuckets</td><td class="pass">200</td><td class="pass">200</td></tr>
+  </table>
+
+  <h2>4) Gate results</h2>
+  <table>
+    <tr><th>Gate</th><th>Result</th><th>Evidence</th></tr>
+    <tr><td>Unit s3token (7)</td><td class="pass">PASS</td><td class="mono">00-cargo-unit.txt</td></tr>
+    <tr><td>Unit unknown_ec2 (2)</td><td class="pass">PASS</td><td class="mono">00-cargo-unit.txt</td></tr>
+    <tr><td>Proxy deferral wiring</td><td class="pass">PASS</td><td class="mono">00-cargo-unit.txt</td></tr>
+    <tr><td>Deploy ×4 SHA a0c252bc…</td><td class="pass">PASS</td><td class="mono">04-redeploy-consistent-and-reprove.txt</td></tr>
+    <tr><td>VIP EC2 SigV4 PUT/GET</td><td class="pass">PASS</td><td class="mono">02-vip-ec2-sigv4-putget.txt + 04 reprove</td></tr>
+    <tr><td>TempAuth regression</td><td class="pass">PASS</td><td class="mono">03-cluster-and-tempauth.txt</td></tr>
+    <tr><td>PRODUCTION-GO-LIVE</td><td class="fail">NO</td><td>LAB only</td></tr>
+  </table>
+
+  <h2>5) Live proof (excerpt)</h2>
+  <pre>ListBuckets region=us-east-1 HTTP 200
+CreateBucket HTTP 200
+PutObject HTTP 200 etag="6d56fe7f2743f77b2fd657151142df5a"
+GetObject HTTP 200 body=b'ec2-sigv4-put-get-ok'
+cleanup delobj=204 delbucket=204
+VERDICT GREEN</pre>
+
+  <h2>6) Remaining / FROZEN</h2>
+  <ul>
+    <li><strong>FROZEN:</strong> PRODUCTION-GO-LIVE and any claim of full Wave-3 stop-line without remaining plan hard gates.</li>
+    <li>Ops: build ELF on Contabo; never install macOS Mach-O to <code>/usr/local/bin/swift-proxy-server</code>.</li>
+  </ul>
+</main>
+</body>
+</html>

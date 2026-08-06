@@ -1,7 +1,30 @@
 # {{ ansible_managed }}
-# Parsed by swift-proxy-server ([app:proxy-server] + [filter:tempauth]).
+# Parsed by swift-proxy-server ([app:proxy-server] + filters).
 # storage_url is what tempauth hands back as X-Storage-Url: the load
 # balancer entry point when use_lb, otherwise this node's business address.
+#
+# P1b pipeline (P0+P1a + formpost/staticweb/quotas/symlink/versioned_writes).
+# Smaller L2 (name_check/etag_quoter/crossdomain/domain_remap/cname_lookup/
+# read_only) are ON-BY-CONFIG — insert into pipeline= and add filter sections.
+# backend_ratelimit is a storage-node filter in Python; proxy wiring is
+# available but not in the default pipeline.
+# See docs/fairness-lab/PRODUCTION-GAP-ROADMAP.md.
+#
+# ratelimit: ON-BY-CONFIG (not in the default pipeline — changes perf
+# baselines). To enable: insert `ratelimit` before `tempauth` in pipeline=
+# and uncomment the [filter:ratelimit] sample below.
+#
+# Identity: auth_method=tempauth (default) | keystone | keystone_coexist
+# keystone* require external Keystone (python bundle inventories/contabo-identity)
+# plus identity_bridge HAProxy knobs — see docs/fairness-lab/KEYSTONE-LIVE.md
+[pipeline:main]
+{% if (auth_method | default('tempauth')) == 'keystone' %}
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes authtoken keystoneauth copy slo dlo proxy-logging proxy-server
+{% elif (auth_method | default('tempauth')) == 'keystone_coexist' %}
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+{% else %}
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server
+{% endif %}
 
 [app:proxy-server]
 bind_ip = 0.0.0.0
@@ -24,8 +47,137 @@ log_statsd_metric_prefix =
 trace_endpoint = {{ trace_endpoint | default('') }}
 trace_sample_ratio = {{ trace_sample_ratio | default('1.0') }}
 
+[filter:proxy-logging]
+use = egg:swift#proxy_logging
+
+[filter:cache]
+use = egg:swift#memcache
+# Per-node memcached (cluster cache). Override via inventory if needed.
+memcache_servers = {{ memcache_servers | default(business_network_address ~ ':11211') }}
+
+[filter:listing_formats]
+use = egg:swift#listing_formats
+
+[filter:bulk]
+use = egg:swift#bulk
+max_deletes_per_request = 10000
+max_failed_deletes = 1000
+
+[filter:tempurl]
+use = egg:swift#tempurl
+# methods / allowed_digests default to Swift's GET HEAD PUT POST DELETE and
+# sha1/sha256/sha512 when omitted.
+
+[filter:formpost]
+use = egg:swift#formpost
+
+[filter:staticweb]
+use = egg:swift#staticweb
+
+[filter:container_quotas]
+use = egg:swift#container_quotas
+
+[filter:account_quotas]
+use = egg:swift#account_quotas
+
+[filter:symlink]
+use = egg:swift#symlink
+symloop_max = 2
+
+[filter:versioned_writes]
+use = egg:swift#versioned_writes
+allow_versioned_writes = true
+
+{% if (auth_method | default('tempauth')) in ['tempauth', 'keystone_coexist'] %}
 [filter:tempauth]
 {% for entry in swift_tempauth_users %}
 user_{{ entry.account }}_{{ entry.user }} = {{ entry.key }}{% if entry.get('admin', false) %} .admin{% endif %}
 
 {% endfor %}
+{% endif %}
+
+# --- ratelimit sample (disabled by default; add `ratelimit` to pipeline=) ---
+# [filter:ratelimit]
+# use = egg:swift#ratelimit
+# account_ratelimit = 200
+# clock_accuracy = 1000
+# max_sleep_time_seconds = 60
+# log_sleep_time_seconds = 0
+# rate_buffer_seconds = 5
+# account_whitelist =
+# account_blacklist =
+# container_ratelimit_0 = 100
+# container_ratelimit_1000 = 50
+# container_listing_ratelimit_0 = 200
+# container_listing_ratelimit_1000 = 100
+
+# --- smaller P1b samples (add name to pipeline= to enable) ---
+# [filter:name_check]
+# use = egg:swift#name_check
+# [filter:etag_quoter]
+# use = egg:swift#etag_quoter
+# enable_by_default = false
+# [filter:crossdomain]
+# use = egg:swift#crossdomain
+# [filter:read_only]
+# use = egg:swift#read_only
+# read_only = false
+# [filter:domain_remap]
+# use = egg:swift#domain_remap
+# storage_domain = example.com
+# [filter:cname_lookup]
+# use = egg:swift#cname_lookup
+# storage_domain = example.com
+# lookup_depth = 1
+
+# --- P3-auth Keystone path (ON-BY-CONFIG; Contabo lab stays TempAuth) ---
+# External Keystone: python bundle/config_contabo_identity (see KEYSTONE-LIVE.md).
+# Inlined (deploy-rs Renderer has no Jinja include loader). Default off.
+# Triggers when identity_proxy_enabled OR auth_method in keystone|keystone_coexist.
+{% set _auth = auth_method | default('tempauth') %}
+{% if identity_proxy_enabled | default(false) or _auth in ['keystone', 'keystone_coexist'] %}
+[filter:authtoken]
+use = egg:swift#authtoken
+delay_auth_decision = {{ identity_delay_auth_decision | default('true') }}
+auth_url = {{ identity_auth_url | default('http://' ~ auth_url_ip ~ ':5000/v3') }}
+username = {{ identity_swift_username | default('swift') }}
+password = {{ identity_swift_password | default('CHANGE_ME') }}
+project_name = {{ identity_swift_project | default('service') }}
+user_domain_name = {{ identity_user_domain | default('Default') }}
+project_domain_name = {{ identity_project_domain | default('Default') }}
+www_authenticate_uri = {{ identity_www_authenticate_uri | default('http://' ~ auth_url_ip ~ ':5000') }}
+http_connect_timeout = {{ identity_http_timeout | default('5') }}
+
+[filter:keystoneauth]
+use = egg:swift#keystoneauth
+operator_roles = {{ identity_operator_roles | default('admin,swiftoperator') }}
+reseller_prefix = {{ identity_reseller_prefix | default('AUTH') }}
+reseller_admin_role = {{ identity_reseller_admin_role | default('ResellerAdmin') }}
+allow_overrides = true
+allow_names_in_acls = true
+{% endif %}
+# Manual / lab static map (when filters off):
+# [filter:authtoken]
+# use = egg:swift#authtoken
+# delay_auth_decision = true
+# auth_url = http://10.0.0.10:5000/v3
+# username = swift
+# password = CHANGE_ME
+# project_name = service
+# www_authenticate_uri = http://10.0.0.10:5000
+# static_token_<tok> = <user_id> <user_name> <project_id> <project_name> [roles…]
+# [filter:keystoneauth]
+# use = egg:swift#keystoneauth
+# operator_roles = admin,swiftoperator
+# reseller_prefix = AUTH
+
+# --- P3-s3 (ON-BY-CONFIG; NOT in default pipeline; NOT on Swift /info) ---
+# Insert `s3api` immediately before `tempauth` in pipeline=, then uncomment:
+# [filter:s3api]
+# use = egg:swift#s3api
+# location = us-east-1
+# dns_compliant_bucket_names = true
+# storage_domains =
+# Access key = <account>:<user> from [filter:tempauth] user_* lines;
+# secret = the TempAuth key. Minimal surface: SigV4 + bucket/object CRUD +
+# ListBuckets/ListObjects v1 + GetBucketLocation. Residuals: MPU, ACL, v2 list.

@@ -37,17 +37,19 @@
 //! provider returns every candidate key (account and container) for the
 //! request's account/container.
 //!
-//! Deferrals (all Python behavior that has no observable effect in this
-//! standalone port, or that requires state this crate does not carry):
-//!   - `temp_url_ip_range`: IP-scoped signatures need `REMOTE_ADDR`, which
-//!     `Request` does not carry. Not parsed or honored here; the HMAC message
-//!     is always the three-field form without the `ip=` prefix.
-//!   - `swift.authorize` / `swift.authorize_override` / `REMOTE_USER`: the
-//!     account-vs-container key *scope* only feeds these proxy-internal
-//!     authorization hooks, so the provider returns a flat key list and the
-//!     scope is not tracked.
-//!   - `logger.increment('tempurl.digests.*')` metrics, `filter_factory`,
-//!     and `register_swift_info`/`register_sensitive_param`.
+//! On a valid signature this middleware stamps
+//! `X-Backend-Authorize-Override: true` and
+//! `X-Backend-Remote-User: .wsgi.tempurl` (Python `authorize_override` +
+//! `REMOTE_USER`). Account-vs-container key *scope* is not tracked: the
+//! [`KeyProvider`] returns a flat key list.
+//!
+//! Deferrals (documented; none block P1a wire + /info accuracy):
+//!   - `temp_url_ip_range`: needs `REMOTE_ADDR` (not on `Request`).
+//!   - `logger.increment('tempurl.digests.*')` metrics.
+//!
+//! Wiring: the proxy supplies a [`KeyProvider`] that HEADs account/container
+//! metadata for `Temp-URL-Key[-2]`. `/info` advertising is done by the proxy
+//! when the filter is enabled (not inside this crate).
 
 use std::sync::Arc;
 
@@ -86,6 +88,27 @@ const DEFAULT_ALLOWED_DIGESTS: [&str; 3] = ["sha1", "sha256", "sha512"];
 pub trait KeyProvider: Send + Sync {
     /// All Temp-URL keys configured for `account`/`container`, in any order.
     fn keys_for(&self, account: &str, container: &str) -> Vec<String>;
+}
+
+/// [`KeyProvider`] backed by an injectable closure (proxy wires account /
+/// container meta HEAD lookups).
+pub struct ClosureKeyProvider {
+    inner: Arc<dyn Fn(&str, &str) -> Vec<String> + Send + Sync>,
+}
+
+impl ClosureKeyProvider {
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(&str, &str) -> Vec<String> + Send + Sync + 'static,
+    {
+        ClosureKeyProvider { inner: Arc::new(f) }
+    }
+}
+
+impl KeyProvider for ClosureKeyProvider {
+    fn keys_for(&self, account: &str, container: &str) -> Vec<String> {
+        (self.inner)(account, container)
+    }
 }
 
 /// Exact-name plus prefix-match rules parsed from a header configuration
@@ -169,6 +192,57 @@ impl TempUrl {
                 .collect(),
             key_provider,
         }
+    }
+
+    /// Build from a `[filter:tempurl]` conf map around a key provider.
+    pub fn from_conf(
+        options: &std::collections::HashMap<String, String>,
+        key_provider: Arc<dyn KeyProvider>,
+    ) -> Self {
+        let mut tu = TempUrl::new(key_provider);
+        if let Some(v) = options.get("methods") {
+            let methods: Vec<String> = v.split_whitespace().map(|s| s.to_string()).collect();
+            if !methods.is_empty() {
+                tu.methods = methods;
+            }
+        }
+        if let Some(v) = options.get("allowed_digests") {
+            let digests: Vec<String> = v
+                .split_whitespace()
+                .map(|s| s.to_ascii_lowercase())
+                .collect();
+            if !digests.is_empty() {
+                tu.allowed_digests = digests;
+            }
+        }
+        if let Some(v) = options.get("incoming_remove_headers") {
+            tu.incoming_remove_headers = v.split_whitespace().map(|s| s.to_string()).collect();
+        }
+        if let Some(v) = options.get("incoming_allow_headers") {
+            tu.incoming_allow_headers = v.split_whitespace().map(|s| s.to_string()).collect();
+        }
+        if let Some(v) = options.get("outgoing_remove_headers") {
+            tu.outgoing_remove_headers = v.split_whitespace().map(|s| s.to_string()).collect();
+        }
+        if let Some(v) = options.get("outgoing_allow_headers") {
+            tu.outgoing_allow_headers = v.split_whitespace().map(|s| s.to_string()).collect();
+        }
+        tu
+    }
+
+    /// `/info` fragment for an enabled tempurl filter (Python
+    /// `register_swift_info('tempurl', ...)`).
+    pub fn info_dict(&self) -> serde_json::Value {
+        let mut digests = self.allowed_digests.clone();
+        digests.sort();
+        serde_json::json!({
+            "methods": self.methods,
+            "incoming_remove_headers": self.incoming_remove_headers,
+            "incoming_allow_headers": self.incoming_allow_headers,
+            "outgoing_remove_headers": self.outgoing_remove_headers,
+            "outgoing_allow_headers": self.outgoing_allow_headers,
+            "allowed_digests": digests,
+        })
     }
 
     /// `401 Unauthorized`, matching `_invalid`: a `HEAD` gets an empty body,
@@ -386,6 +460,10 @@ impl Middleware for TempUrl {
             qs_pairs.push(("inline".to_string(), String::new()));
         }
         req.query_string = urlencode(&qs_pairs);
+
+        // Bypass TempAuth + proxy ACL checks (Python authorize_override).
+        req.headers.set("X-Backend-Authorize-Override", "true");
+        req.headers.set("X-Backend-Remote-User", ".wsgi.tempurl");
 
         // Keep the original path for the default Content-Disposition name.
         let path_info = req.path.clone();
@@ -858,6 +936,14 @@ mod tests {
         assert_eq!(
             resp.headers.get("Echo-Query"),
             Some(format!("temp_url_sig={SIG_GET_SHA256}&temp_url_expires={EXPIRES}").as_str())
+        );
+        assert_eq!(
+            resp.headers.get("Echo-X-Backend-Authorize-Override"),
+            Some("true")
+        );
+        assert_eq!(
+            resp.headers.get("Echo-X-Backend-Remote-User"),
+            Some(".wsgi.tempurl")
         );
         // GET success gets a Content-Disposition (default attachment named
         // after the object) and an Expires header.

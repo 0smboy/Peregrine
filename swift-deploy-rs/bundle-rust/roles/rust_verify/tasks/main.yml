@@ -45,3 +45,18 @@
     echo ROUND-TRIP-OK
   run_once: true
   changed_when: false
+
+# P3-ops: when LB terminates TLS, smoke the public HTTPS VIP once (self-signed OK).
+- name: HTTPS VIP healthcheck via HAProxy
+  shell: |
+    set -e
+    code=$(curl -sk -m 10 -o /dev/null -w '%{http_code}' \
+      "https://{{ auth_url_ip }}:{{ swift_lb_port }}/healthcheck" || true)
+    if [ "$code" != "200" ]; then
+      echo "HTTPS VIP healthcheck failed: http_code=$code" >&2
+      exit 1
+    fi
+    echo HTTPS-VIP-OK
+  run_once: true
+  changed_when: false
+  when: use_lb and lb_mode == "https"

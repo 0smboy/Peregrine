@@ -1,0 +1,26 @@
+06409fff5877b2ea582fb648a658f71f  crates/swift-object-server/src/servers_per_port.rs
+ee09193c40ab5353a118426fba53c190  crates/swift-object-server/src/main.rs
+06dd839b4bb47f80ab96e990d3fbb84d  crates/swift-http/src/server.rs
+   Compiling swift-http v0.1.0 (/root/work/swift-rust/crates/swift-http)
+   Compiling swift-container-server v0.1.0 (/root/work/swift-rust/crates/swift-container-server)
+   Compiling swift-object-server v0.1.0 (/root/work/swift-rust/crates/swift-object-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.24s
+     Running unittests src/lib.rs (target/debug/deps/swift_object_server-9f142b6e7994b3d9)
+
+running 8 tests
+test servers_per_port::tests::bind_acceptors_reuseport_when_n_gt_1 ... ok
+test servers_per_port::tests::json_shape ... ok
+test servers_per_port::tests::servers_per_port_ignores_workers ... ok
+test servers_per_port::tests::servers_per_port_one_does_not_collapse_threads ... ok
+test servers_per_port::tests::workers_times_max_clients_clamps_at_128 ... ok
+test servers_per_port::tests::discover_reads_ports_from_ring_files ... ok
+test servers_per_port::tests::ports_for_local_devs_filters_by_ip ... ok
+test servers_per_port::tests::listen_ports_fallback_when_empty ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 49 filtered out; finished in 0.01s
+
+   Compiling swift-http v0.1.0 (/root/work/swift-rust/crates/swift-http)
+   Compiling swift-object-server v0.1.0 (/root/work/swift-rust/crates/swift-object-server)
+    Finished `release` profile [optimized] target(s) in 8.96s
+target/release/swift-object-server:         ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=af36574ad7287bcb43d0100e560356073b35e437, not stripped
+target/release/swift-effective-concurrency: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=271f99129980f31849d691a99bf90785363db2ae, not stripped

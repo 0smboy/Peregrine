@@ -1,0 +1,28 @@
+# Contabo probe UTC=2026-08-05T09:59:50Z
+=== HTTPS /info ===
+curl: (35) TLS connect error: error:00000000:lib(0)::reason(0)
+http=000 time=5.004240
+curl_fail=35
+=== HTTP /info ===
+curl: (52) Empty reply from server
+http=000
+http_fail
+=== healthcheck ===
+curl: (28) Connection timed out after 5003 milliseconds
+https_hc=000
+=== /info keys (tempauth/keystone/s3) ===
+Traceback (most recent call last):
+  File "<stdin>", line 4, in <module>
+  File "/Users/oboy/.local/share/mise/installs/python/3.11.15/lib/python3.11/pathlib.py", line 1058, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/oboy/.local/share/mise/installs/python/3.11.15/lib/python3.11/pathlib.py", line 1044, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/Users/oboy/Downloads/Peregrine/tools/test-results/wave3-s3-l3b-live-20260805/00-info-body.json'
+=== Keystone HTTPS :5000 ===
+curl: (28) Connection timed out after 5003 milliseconds
+ks=000
+ks_fail
+head: /Users/oboy/Downloads/Peregrine/tools/test-results/wave3-s3-l3b-live-20260805/00-keystone-v3.json: No such file or directory
+

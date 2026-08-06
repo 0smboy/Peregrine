@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>阶段 1A · 薄管道双单机 API</title>
+<style>
+  body{font:15px/1.45 system-ui,sans-serif;max-width:880px;margin:2rem auto;padding:0 1rem;color:#1a1a1a}
+  h1{font-size:1.4rem} table{border-collapse:collapse;width:100%;margin:1rem 0}
+  th,td{border:1px solid #ccc;padding:.45rem .6rem;text-align:left;vertical-align:top}
+  th{background:#f3f3f3} .ok{color:#0a6} .warn{color:#a60}
+</style>
+</head>
+<body>
+<h1>阶段 1A：薄管道双单机 API</h1>
+<p>按 <code>USER-METHOD-PLAN.md</code>。旧 R0–R8 不计入本轮正式结论。</p>
+
+<h2>1. 需求 / 目标 / 现状</h2>
+<table>
+<tr><th>用户需求</th><td>swift1 只发请求；swift2 Python 单机；swift3 Rust 单机；swift4 只监控；薄管道 API 套件失败为 0</td></tr>
+<tr><th>完美对齐</th><td>两侧 54/54；1/4 无任何 Swift 数据面；差异只记未支持</td></tr>
+<tr><th>现在到哪了</th><td class="ok">布局就绪；双侧 func-suite <strong>54/54</strong></td></tr>
+</table>
+
+<h2>2. 动作 / 环境 / 效果</h2>
+<table>
+<tr><th>动作</th><th>环境</th><th>为什么</th><th>效果</th></tr>
+<tr><td>停并 disable 四台集群 Swift 单元</td><td>swift1–4</td><td>阶段 1 禁止 1/4 跑 Swift；2/3 改单机</td><td class="ok">1/4 端口 CLEAN</td></tr>
+<tr><td>Python SAIO 迁到 swift2 :8090</td><td>管道含 cache（Python tempauth 硬依赖 memcache）</td><td>薄但可认证</td><td class="ok">auth 200；54/54</td></tr>
+<tr><td>Rust SAIO 在 swift3 :8081</td><td>release 带 EC 二进制</td><td>对齐 EC 用例</td><td class="ok">首跑 EC 501（旧 bin）→ 换 release 后 54/54</td></tr>
+<tr><td>func-suite 从 swift1 打两侧</td><td>凭据 test:tester</td><td>正式薄管道 API</td><td class="ok">Py 54/0；Rs 54/0</td></tr>
+</table>
+
+<h2>3. 剩余 / 下一步</h2>
+<table>
+<tr><th>剩余</th><th>规划</th></tr>
+<tr><td>阶段 1B（已实现中间件子集再跑）</td><td>缺口诚实列表；不装全 Paste</td></tr>
+<tr><td>deploy-rs Keepalived+roundrobin Contabo apply（阶段 2 门禁）</td><td>代码已进分支；真机 apply 待做</td></tr>
+<tr><td>阶段 2 集群性能/故障</td><td>门禁绿后开；先关全部 SAIO</td></tr>
+</table>
+
+<p>证据：<code>LAYOUT.md</code>、<code>func-suite.log</code>、<code>func-rs-rerun.log</code>、<code>bringup.log</code></p>
+</body>
+</html>

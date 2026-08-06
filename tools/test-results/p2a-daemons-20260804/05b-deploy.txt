@@ -1,0 +1,33 @@
+===== deploy 10.0.0.1 =====
+host=swift1
+  swift-object                     active
+  swift-object-updater             active
+  swift-object-expirer             active
+  swift-account-reaper             active
+  swift-container-updater          active
+  swift-container-reconciler       active
+===== deploy 10.0.0.2 =====
+host=swift2
+  swift-object                     active
+  swift-object-updater             active
+  swift-object-expirer             active
+  swift-account-reaper             active
+  swift-container-updater          active
+  swift-container-reconciler       active
+===== deploy 10.0.0.3 =====
+host=swift3
+  swift-object                     active
+  swift-object-updater             active
+  swift-object-expirer             active
+  swift-account-reaper             active
+  swift-container-updater          active
+  swift-container-reconciler       active
+===== deploy 10.0.0.4 =====
+host=swift4
+  swift-object                     active
+  swift-object-updater             active
+  swift-object-expirer             active
+  swift-account-reaper             active
+  swift-container-updater          active
+  swift-container-reconciler       active
+DEPLOY_DONE

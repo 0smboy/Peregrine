@@ -1,0 +1,2 @@
+RSYNC_OK
+1834 /root/work/swift-rust/crates/swift-s3api/src/middleware.rs

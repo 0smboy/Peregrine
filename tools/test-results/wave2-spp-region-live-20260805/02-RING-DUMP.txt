@@ -1,0 +1,39 @@
+===== /etc/swift/account.ring.gz.builder.json =====
+keys ['part_power', 'replicas', 'devices']
+part_power 14 replicas 3.0 n_devs 4
+  {'id': None, 'ip': '10.0.4.1', 'region': 1, 'zone': 1, 'port': 6202, 'device': 'd1', 'weight': 100.0, 'replication_ip': '10.0.8.1', 'replication_port': 6202}
+  {'id': None, 'ip': '10.0.4.2', 'region': 1, 'zone': 2, 'port': 6202, 'device': 'd1', 'weight': 100.0, 'replication_ip': '10.0.8.2', 'replication_port': 6202}
+  {'id': None, 'ip': '10.0.4.3', 'region': 1, 'zone': 3, 'port': 6202, 'device': 'd1', 'weight': 100.0, 'replication_ip': '10.0.8.3', 'replication_port': 6202}
+  {'id': None, 'ip': '10.0.4.4', 'region': 1, 'zone': 4, 'port': 6202, 'device': 'd1', 'weight': 100.0, 'replication_ip': '10.0.8.4', 'replication_port': 6202}
+
+===== /etc/swift/container.ring.gz.builder.json =====
+keys ['part_power', 'replicas', 'devices']
+part_power 14 replicas 3.0 n_devs 4
+  {'id': None, 'ip': '10.0.4.1', 'region': 1, 'zone': 1, 'port': 6201, 'device': 'd1', 'weight': 100.0, 'replication_ip': '10.0.8.1', 'replication_port': 6201}
+  {'id': None, 'ip': '10.0.4.2', 'region': 1, 'zone': 2, 'port': 6201, 'device': 'd1', 'weight': 100.0, 'replication_ip': '10.0.8.2', 'replication_port': 6201}
+  {'id': None, 'ip': '10.0.4.3', 'region': 1, 'zone': 3, 'port': 6201, 'device': 'd1', 'weight': 100.0, 'replication_ip': '10.0.8.3', 'replication_port': 6201}
+  {'id': None, 'ip': '10.0.4.4', 'region': 1, 'zone': 4, 'port': 6201, 'device': 'd1', 'weight': 100.0, 'replication_ip': '10.0.8.4', 'replication_port': 6201}
+
+===== /etc/swift/object-1.ring.gz.builder.json =====
+keys ['part_power', 'replicas', 'devices']
+part_power 14 replicas 3.0 n_devs 4
+  {'id': None, 'ip': '10.0.4.1', 'region': 1, 'zone': 1, 'port': 6200, 'device': 'd1', 'weight': 100.0, 'replication_ip': '10.0.8.1', 'replication_port': 6200}
+  {'id': None, 'ip': '10.0.4.2', 'region': 1, 'zone': 2, 'port': 6200, 'device': 'd1', 'weight': 100.0, 'replication_ip': '10.0.8.2', 'replication_port': 6200}
+  {'id': None, 'ip': '10.0.4.3', 'region': 1, 'zone': 3, 'port': 6200, 'device': 'd1', 'weight': 100.0, 'replication_ip': '10.0.8.3', 'replication_port': 6200}
+  {'id': None, 'ip': '10.0.4.4', 'region': 1, 'zone': 4, 'port': 6200, 'device': 'd1', 'weight': 100.0, 'replication_ip': '10.0.8.4', 'replication_port': 6200}
+
+===== /etc/swift/object.ring.gz.builder.json =====
+keys ['part_power', 'replicas', 'devices']
+part_power 14 replicas 3.0 n_devs 4
+  {'id': None, 'ip': '10.0.4.1', 'region': 1, 'zone': 1, 'port': 6200, 'device': 'd1', 'weight': 100.0, 'replication_ip': '10.0.8.1', 'replication_port': 6200}
+  {'id': None, 'ip': '10.0.4.2', 'region': 1, 'zone': 2, 'port': 6200, 'device': 'd1', 'weight': 100.0, 'replication_ip': '10.0.8.2', 'replication_port': 6200}
+  {'id': None, 'ip': '10.0.4.3', 'region': 1, 'zone': 3, 'port': 6200, 'device': 'd1', 'weight': 100.0, 'replication_ip': '10.0.8.3', 'replication_port': 6200}
+  {'id': None, 'ip': '10.0.4.4', 'region': 1, 'zone': 4, 'port': 6200, 'device': 'd1', 'weight': 100.0, 'replication_ip': '10.0.8.4', 'replication_port': 6200}
+
+## get-nodes sample
+Partition	12487
+Hash	c31da0fd2846a35f238edef7a7f8f833
+Server:Port Device	10.0.4.2:6200 d1
+Server:Port Device	10.0.4.3:6200 d1
+Server:Port Device	10.0.4.4:6200 d1
+Server:Port Device	10.0.4.1:6200 d1	 # [Handoff]

@@ -15,6 +15,8 @@
 
 //! `swift-ring-builder <ring.gz> create <part_power> <replicas>`
 //! `swift-ring-builder <ring.gz> add r<R>z<Z>-<ip>:<port>[R<rip>:<rport>]/<dev> <weight>`
+//! `swift-ring-builder <ring.gz> search r<R>z<Z>-<ip>:<port>[R<rip>:<rport>]/<dev>`
+//! `swift-ring-builder <ring.gz> list`
 //! `swift-ring-builder <ring.gz> rebalance`
 //!
 //! The optional `R<rip>:<rport>` sets the device's replication-network
@@ -24,6 +26,9 @@
 //! A minimal builder CLI over swift_ring::RingBuilder. The builder state
 //! is kept as a sidecar JSON next to the ring file (the Python .builder
 //! is a pickle; ours is JSON — not interchangeable, documented).
+//!
+//! `add` is idempotent on the device identity (region/zone/ip/port/device);
+//! a matching row updates weight only. Used by bundle-rust expand flows.
 
 use std::path::Path;
 
@@ -32,7 +37,9 @@ use swift_ring::RingBuilder;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
-        eprintln!("usage: swift-ring-builder <ring.gz> <create|add|rebalance> ...");
+        eprintln!(
+            "usage: swift-ring-builder <ring.gz> <create|add|search|list|rebalance> ..."
+        );
         std::process::exit(1);
     }
     let ring_path = &args[0];
@@ -60,9 +67,51 @@ fn main() {
                 eprintln!("bad device spec: {spec} (expected r1z1-10.0.0.1:6200/sda)");
                 std::process::exit(1);
             });
-            println!("added device {}", state.devices.len());
-            state.devices.push(dev);
-            state.save(&state_path);
+            if let Some(existing) = state
+                .devices
+                .iter_mut()
+                .find(|d| device_identity_eq(d, &dev))
+            {
+                if (existing.weight - weight).abs() > f64::EPSILON {
+                    existing.weight = weight;
+                    state.save(&state_path);
+                    println!("updated weight for {}", spec);
+                } else {
+                    println!("already present {}", spec);
+                }
+            } else {
+                println!("added device {}", state.devices.len());
+                state.devices.push(dev);
+                state.save(&state_path);
+            }
+        }
+        "search" => {
+            let spec = args.get(2).cloned().unwrap_or_default();
+            let probe = parse_device_spec(&spec, 0.0).unwrap_or_else(|| {
+                eprintln!("bad device spec: {spec}");
+                std::process::exit(1);
+            });
+            let state = BuilderState::load(&state_path);
+            if state.devices.iter().any(|d| device_identity_eq(d, &probe)) {
+                println!("found {}", spec);
+                std::process::exit(0);
+            }
+            println!("No matching devices found");
+            std::process::exit(2);
+        }
+        "list" => {
+            let state = BuilderState::load(&state_path);
+            for (index, d) in state.devices.iter().enumerate() {
+                let repl = match (&d.replication_ip, d.replication_port) {
+                    (Some(ip), Some(port)) => format!("R{ip}:{port}"),
+                    _ => String::new(),
+                };
+                println!(
+                    "{index}\tr{}z{}-{}:{}{}/{}\t{}",
+                    d.region, d.zone, d.ip, d.port, repl, d.device, d.weight
+                );
+            }
+            println!("devices\t{}", state.devices.len());
         }
         "rebalance" => {
             let state = BuilderState::load(&state_path);
@@ -101,6 +150,14 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn device_identity_eq(left: &DevSpec, right: &DevSpec) -> bool {
+    left.region == right.region
+        && left.zone == right.zone
+        && left.ip == right.ip
+        && left.port == right.port
+        && left.device == right.device
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -183,5 +240,14 @@ mod tests {
         assert_eq!(d.replication_ip.as_deref(), Some("172.19.1.3"));
         assert_eq!(d.replication_port, Some(6200));
         assert_eq!(d.device, "d1");
+    }
+
+    #[test]
+    fn device_identity_ignores_weight_and_replication() {
+        let a = parse_device_spec("r2z3-10.0.4.1:6200R10.0.8.1:6200/d2", 100.0).unwrap();
+        let b = parse_device_spec("r2z3-10.0.4.1:6200/d2", 50.0).unwrap();
+        assert!(device_identity_eq(&a, &b));
+        let c = parse_device_spec("r2z3-10.0.4.1:6200/d3", 100.0).unwrap();
+        assert!(!device_identity_eq(&a, &c));
     }
 }

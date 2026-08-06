@@ -4,9 +4,9 @@
 # it is not already running, and restarts it when the unit file drifted, so
 # a steady-state re-apply converges with changed=0.
 #
-# The auditor binaries (swift-object-auditor, swift-db-auditor) are one-shot
-# per-device tools, not conf-driven daemons, so they are scheduled as a cron
-# sweep instead of systemd units (see swift-audit-sweep.sh.j2).
+# Auditors (P2b): continuous conf-driven daemons (interval sleep), matching
+# Python ObjectAuditor / DatabaseAuditor. Legacy one-shot CLI + optional
+# nightly sweep script remain for manual ops.
 
 - name: account server unit
   include_tasks:
@@ -78,6 +78,56 @@
     svc_conf: object-server.conf
   when: "'object_servers' in group_names"
 
+- name: object expirer unit
+  include_tasks:
+    file: unit.yml
+    unit_name: swift-object-expirer
+    svc_description: Swift object expirer (rust)
+    svc_bin: swift-object-expirer
+    svc_args: ""
+    svc_conf: object-server.conf
+  when: "'object_servers' in group_names"
+
+- name: account reaper unit
+  include_tasks:
+    file: unit.yml
+    unit_name: swift-account-reaper
+    svc_description: Swift account reaper (rust)
+    svc_bin: swift-account-reaper
+    svc_args: ""
+    svc_conf: account-server.conf
+  when: "'account_servers' in group_names"
+
+- name: container updater unit
+  include_tasks:
+    file: unit.yml
+    unit_name: swift-container-updater
+    svc_description: Swift container updater (rust)
+    svc_bin: swift-container-updater
+    svc_args: ""
+    svc_conf: container-server.conf
+  when: "'container_servers' in group_names"
+
+- name: container reconciler unit
+  include_tasks:
+    file: unit.yml
+    unit_name: swift-container-reconciler
+    svc_description: Swift container reconciler (rust)
+    svc_bin: swift-container-reconciler
+    svc_args: ""
+    svc_conf: container-server.conf
+  when: "'container_servers' in group_names"
+
+- name: container sharder unit (P3-data partial — local cleave only)
+  include_tasks:
+    file: unit.yml
+    unit_name: swift-container-sharder
+    svc_description: Swift container sharder (rust, local cleave)
+    svc_bin: swift-container-sharder
+    svc_args: ""
+    svc_conf: container-server.conf
+  when: "'container_servers' in group_names"
+
 - name: object reconstructor unit (EC clusters only)
   include_tasks:
     file: unit.yml
@@ -90,6 +140,36 @@
     - "'object_servers' in group_names"
     - swift_policies | length > 1
 
+- name: object auditor unit (continuous, P2b)
+  include_tasks:
+    file: unit.yml
+    unit_name: swift-object-auditor
+    svc_description: Swift object auditor (rust continuous)
+    svc_bin: swift-object-auditor
+    svc_args: ""
+    svc_conf: object-server.conf
+  when: "'object_servers' in group_names"
+
+- name: account auditor unit (continuous, P2b)
+  include_tasks:
+    file: unit.yml
+    unit_name: swift-account-auditor
+    svc_description: Swift account DB auditor (rust continuous)
+    svc_bin: swift-db-auditor
+    svc_args: account
+    svc_conf: account-server.conf
+  when: "'account_servers' in group_names"
+
+- name: container auditor unit (continuous, P2b)
+  include_tasks:
+    file: unit.yml
+    unit_name: swift-container-auditor
+    svc_description: Swift container DB auditor (rust continuous)
+    svc_bin: swift-db-auditor
+    svc_args: container
+    svc_conf: container-server.conf
+  when: "'container_servers' in group_names"
+
 - name: proxy server unit
   include_tasks:
     file: unit.yml
@@ -100,20 +180,20 @@
     svc_conf: proxy-server.conf
   when: "'proxy_servers' in group_names"
 
-- name: install the auditor sweep script
+# Optional manual oneshot sweep (legacy). Continuous auditor units above are
+# the production path; disable any previously-enabled nightly timer.
+- name: install the auditor sweep script (manual ops)
   template:
     src: swift-audit-sweep.sh.j2
     dest: /usr/local/libexec/swift-audit-sweep.sh
     mode: "0755"
   when: "'storage_nodes' in group_names"
 
-# A systemd timer, not cron: minimal Debian images ship without crontab,
-# and every supported distro has systemd.
-- name: install the auditor sweep service unit
+- name: install the auditor sweep oneshot unit (manual; not timed)
   copy:
     content: |
       [Unit]
-      Description=Swift auditor sweep (rust)
+      Description=Swift auditor sweep oneshot (rust manual)
 
       [Service]
       Type=oneshot
@@ -124,26 +204,11 @@
     mode: "0644"
   when: "'storage_nodes' in group_names"
 
-- name: install the auditor sweep timer unit
-  copy:
-    content: |
-      [Unit]
-      Description=Nightly Swift auditor sweep (rust)
-
-      [Timer]
-      OnCalendar=*-*-* 03:17:00
-      Persistent=true
-
-      [Install]
-      WantedBy=timers.target
-    dest: /etc/systemd/system/swift-audit-sweep.timer
-    mode: "0644"
-  when: "'storage_nodes' in group_names"
-
-- name: enable the auditor sweep timer
+- name: disable legacy nightly auditor timer (replaced by continuous daemons)
   systemd:
     name: swift-audit-sweep.timer
-    enabled: yes
-    state: started
+    enabled: no
+    state: stopped
     daemon_reload: yes
+  failed_when: false
   when: "'storage_nodes' in group_names"

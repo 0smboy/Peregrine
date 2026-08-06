@@ -1,0 +1,123 @@
+==== swift1 ====
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  951M   50G   2% /srv/node/d1
+/dev/sda6        50G  748M   50G   2% /srv/node/d2
+/dev/sda7        50G  760M   50G   2% /srv/node/d3
+---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  951M   50G   2% /srv/node/d1
+/dev/sda6        50G  748M   50G   2% /srv/node/d2
+/dev/sda7        50G  760M   50G   2% /srv/node/d3
+---
+total_count	0
+total_bytes	0
+mode=APPLY root=/srv/node reclaim_age=600.0
+hash_prefix_len=24 hash_suffix_len=16
+=== A: tombstone reclaim walk ===
+A: ts_reclaimable=48247 bytes=0
+=== B: orphan hash-dir purge ===
+B: referenced_hashes=650925
+B: orphan_dirs=665518 orphan_files=665520 orphan_bytes=140536975246 kept_dirs=0
+DONE mode=APPLY A_ts=48247 A_bytes=0 B_dirs=665518 B_files=665520 B_bytes=140536975246
+total_count	0
+total_bytes	0
+---
+=== A: tombstone reclaim walk ===
+A: ts_reclaimable=48247 bytes=0
+=== B: orphan hash-dir purge ===
+B: referenced_hashes=650925
+B: orphan_dirs=665518 orphan_files=665520 orphan_bytes=140536975246 kept_dirs=0
+DONE mode=APPLY A_ts=48247 A_bytes=0 B_dirs=665518 B_files=665520 B_bytes=140536975246
+==== swift2 ====
+==== swift2 ====
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  887M   50G   2% /srv/node/d1
+/dev/sda6        50G  755M   50G   2% /srv/node/d2
+/dev/sda7        50G  760M   50G   2% /srv/node/d3
+---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  887M   50G   2% /srv/node/d1
+/dev/sda6        50G  755M   50G   2% /srv/node/d2
+/dev/sda7        50G  760M   50G   2% /srv/node/d3
+---
+total_count	0
+total_bytes	0
+mode=APPLY root=/srv/node reclaim_age=600.0
+hash_prefix_len=24 hash_suffix_len=16
+=== A: tombstone reclaim walk ===
+A: ts_reclaimable=26566 bytes=0
+=== B: orphan hash-dir purge ===
+B: referenced_hashes=657078
+B: orphan_dirs=648970 orphan_files=648971 orphan_bytes=137881563113 kept_dirs=0
+DONE mode=APPLY A_ts=26566 A_bytes=0 B_dirs=648970 B_files=648971 B_bytes=137881563113
+total_count	0
+total_bytes	0
+---
+=== A: tombstone reclaim walk ===
+A: ts_reclaimable=26566 bytes=0
+=== B: orphan hash-dir purge ===
+B: referenced_hashes=657078
+B: orphan_dirs=648970 orphan_files=648971 orphan_bytes=137881563113 kept_dirs=0
+DONE mode=APPLY A_ts=26566 A_bytes=0 B_dirs=648970 B_files=648971 B_bytes=137881563113
+==== swift3 ====
+==== swift3 ====
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  944M   50G   2% /srv/node/d1
+/dev/sda6        50G  757M   50G   2% /srv/node/d2
+/dev/sda7        50G  759M   50G   2% /srv/node/d3
+---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  944M   50G   2% /srv/node/d1
+/dev/sda6        50G  757M   50G   2% /srv/node/d2
+/dev/sda7        50G  759M   50G   2% /srv/node/d3
+---
+total_count	0
+total_bytes	0
+mode=APPLY root=/srv/node reclaim_age=600.0
+hash_prefix_len=24 hash_suffix_len=16
+=== A: tombstone reclaim walk ===
+A: ts_reclaimable=48205 bytes=0
+=== B: orphan hash-dir purge ===
+B: referenced_hashes=740496
+B: orphan_dirs=665385 orphan_files=665388 orphan_bytes=139667362697 kept_dirs=0
+DONE mode=APPLY A_ts=48205 A_bytes=0 B_dirs=665385 B_files=665388 B_bytes=139667362697
+total_count	0
+total_bytes	0
+---
+=== A: tombstone reclaim walk ===
+A: ts_reclaimable=48205 bytes=0
+=== B: orphan hash-dir purge ===
+B: referenced_hashes=740496
+B: orphan_dirs=665385 orphan_files=665388 orphan_bytes=139667362697 kept_dirs=0
+DONE mode=APPLY A_ts=48205 A_bytes=0 B_dirs=665385 B_files=665388 B_bytes=139667362697
+==== swift4 ====
+==== swift4 ====
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  863M   50G   2% /srv/node/d1
+/dev/sda6        50G  751M   50G   2% /srv/node/d2
+/dev/sda7        50G  755M   50G   2% /srv/node/d3
+---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  863M   50G   2% /srv/node/d1
+/dev/sda6        50G  751M   50G   2% /srv/node/d2
+/dev/sda7        50G  755M   50G   2% /srv/node/d3
+---
+total_count	0
+total_bytes	0
+mode=APPLY root=/srv/node reclaim_age=600.0
+hash_prefix_len=24 hash_suffix_len=16
+=== A: tombstone reclaim walk ===
+A: ts_reclaimable=47215 bytes=0
+=== B: orphan hash-dir purge ===
+B: referenced_hashes=608597
+B: orphan_dirs=646354 orphan_files=646357 orphan_bytes=137043148879 kept_dirs=0
+DONE mode=APPLY A_ts=47215 A_bytes=0 B_dirs=646354 B_files=646357 B_bytes=137043148879
+total_count	0
+total_bytes	0
+---
+=== A: tombstone reclaim walk ===
+A: ts_reclaimable=47215 bytes=0
+=== B: orphan hash-dir purge ===
+B: referenced_hashes=608597
+B: orphan_dirs=646354 orphan_files=646357 orphan_bytes=137043148879 kept_dirs=0
+DONE mode=APPLY A_ts=47215 A_bytes=0 B_dirs=646354 B_files=646357 B_bytes=137043148879

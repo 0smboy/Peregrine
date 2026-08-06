@@ -149,8 +149,8 @@ impl From<MemcacheError> for OpError {
     }
 }
 
-type ConnFactory<C> = Box<dyn Fn(&str) -> std::io::Result<C>>;
-type Clock = Box<dyn Fn() -> f64>;
+type ConnFactory<C> = Box<dyn Fn(&str) -> std::io::Result<C> + Send + Sync>;
+type Clock = Box<dyn Fn() -> f64 + Send + Sync>;
 
 /// A consistent-hashed memcache client over the text protocol.
 ///
@@ -199,7 +199,7 @@ impl<C: MemcacheConn> MemcacheClient<C> {
         factory: F,
     ) -> Result<MemcacheClient<C>, MemcacheError>
     where
-        F: Fn(&str) -> std::io::Result<C> + 'static,
+        F: Fn(&str) -> std::io::Result<C> + Send + Sync + 'static,
     {
         if servers.is_empty() {
             return Err(MemcacheError::Connection(
@@ -242,7 +242,7 @@ impl<C: MemcacheConn> MemcacheClient<C> {
 
     /// Override the clock used for error-limiting and timeout sanitization.
     /// Intended for tests; production uses the wall clock.
-    pub fn set_clock<F: Fn() -> f64 + 'static>(&mut self, clock: F) {
+    pub fn set_clock<F: Fn() -> f64 + Send + Sync + 'static>(&mut self, clock: F) {
         self.clock = Box::new(clock);
     }
 
@@ -684,9 +684,8 @@ fn trim_crlf(line: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     // ---- an in-memory memcached, used as the injected backend ------------
 
@@ -703,15 +702,15 @@ mod tests {
         connects: usize,
     }
 
-    /// A connection to one shared `FakeStore`. Cloning the `Rc` models
+    /// A connection to one shared `FakeStore`. Cloning the `Arc` models
     /// reconnecting to the same server.
     struct FakeConn {
-        store: Rc<RefCell<FakeStore>>,
+        store: Arc<Mutex<FakeStore>>,
     }
 
     impl MemcacheConn for FakeConn {
         fn request(&mut self, cmd: &[u8]) -> std::io::Result<Vec<u8>> {
-            let mut store = self.store.borrow_mut();
+            let mut store = self.store.lock().unwrap();
             if store.dead {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::ConnectionReset,
@@ -810,19 +809,19 @@ mod tests {
     /// A set of fake servers plus a client wired to them.
     struct Harness {
         client: MemcacheClient<FakeConn>,
-        stores: HashMap<String, Rc<RefCell<FakeStore>>>,
+        stores: HashMap<String, Arc<Mutex<FakeStore>>>,
     }
 
     fn harness(servers: &[&str], config: MemcacheConfig) -> Harness {
         let servers: Vec<String> = servers.iter().map(|s| s.to_string()).collect();
-        let stores: HashMap<String, Rc<RefCell<FakeStore>>> = servers
+        let stores: HashMap<String, Arc<Mutex<FakeStore>>> = servers
             .iter()
-            .map(|s| (s.clone(), Rc::new(RefCell::new(FakeStore::default()))))
+            .map(|s| (s.clone(), Arc::new(Mutex::new(FakeStore::default()))))
             .collect();
         let factory_stores = stores.clone();
         let client = MemcacheClient::new(servers, config, move |server| {
             let store = factory_stores.get(server).unwrap().clone();
-            store.borrow_mut().connects += 1;
+            store.lock().unwrap().connects += 1;
             Ok(FakeConn { store })
         })
         .unwrap();
@@ -866,7 +865,7 @@ mod tests {
         // The stored item carries JSON_FLAG (2), like Python's serialize=True.
         let key = md5hash(b"doc");
         assert_eq!(
-            h.stores["10.0.0.1:11211"].borrow().items[&key].flags,
+            h.stores["10.0.0.1:11211"].lock().unwrap().items[&key].flags,
             JSON_FLAG
         );
 
@@ -904,7 +903,7 @@ mod tests {
         // A small TTL is passed through verbatim into the set command.
         h.client.set_raw("ttl", b"v", 0, 120).unwrap();
         let key = md5hash(b"ttl");
-        assert_eq!(h.stores["10.0.0.1:11211"].borrow().items[&key].exptime, 120);
+        assert_eq!(h.stores["10.0.0.1:11211"].lock().unwrap().items[&key].exptime, 120);
 
         // A TTL beyond 30 days is converted to an absolute time using the
         // clock (sanitize_timeout).
@@ -912,7 +911,7 @@ mod tests {
         let big = EXPTIME_MAXDELTA + 10;
         h.client.set_raw("ttl", b"v", 0, big).unwrap();
         assert_eq!(
-            h.stores["10.0.0.1:11211"].borrow().items[&key].exptime,
+            h.stores["10.0.0.1:11211"].lock().unwrap().items[&key].exptime,
             big + 1_000
         );
     }
@@ -933,8 +932,8 @@ mod tests {
             h.client.set_raw(&key, format!("v{i}").as_bytes(), 0, 0).unwrap();
             let hk = md5hash(key.as_bytes());
             // The value lands in exactly the primary's store.
-            let in_a = h.stores["10.0.0.1:11211"].borrow().items.contains_key(&hk);
-            let in_b = h.stores["10.0.0.2:11211"].borrow().items.contains_key(&hk);
+            let in_a = h.stores["10.0.0.1:11211"].lock().unwrap().items.contains_key(&hk);
+            let in_b = h.stores["10.0.0.2:11211"].lock().unwrap().items.contains_key(&hk);
             assert_ne!(in_a, in_b, "key must live on exactly one server");
             if primary == "10.0.0.1:11211" {
                 assert!(in_a);
@@ -952,7 +951,7 @@ mod tests {
 
     #[test]
     fn error_limiting_skips_a_dead_server() {
-        let now = Rc::new(Cell::new(1_000.0f64));
+        let now = Arc::new(Mutex::new(1_000.0f64));
         let config = MemcacheConfig {
             tries: 2,
             error_limit_count: 2,
@@ -960,8 +959,8 @@ mod tests {
             error_limit_duration: 60.0,
         };
         let mut h = harness(&["10.0.0.1:11211", "10.0.0.2:11211"], config);
-        let now_clock = now.clone();
-        h.client.set_clock(move || now_clock.get());
+        let now_clock = Arc::clone(&now);
+        h.client.set_clock(move || *now_clock.lock().unwrap());
 
         // Pick a key whose PRIMARY is server A, then kill server A. Every set
         // should still succeed by failing over to server B.
@@ -971,7 +970,7 @@ mod tests {
             .find(|k| h.client.primary_server(k) == dead)
             .unwrap();
         assert_eq!(h.client.server_candidates(&key).len(), 2);
-        h.stores[dead].borrow_mut().dead = true;
+        h.stores[dead].lock().unwrap().dead = true;
 
         // Errors accumulate on A until it trips the limit (count=2 -> the 3rd
         // error suppresses it). Each op reconnects to A first, so `connects`
@@ -981,23 +980,23 @@ mod tests {
         }
         assert!(h.client.is_error_limited(dead));
         assert!(!h.client.is_error_limited("10.0.0.2:11211"));
-        let connects_when_limited = h.stores[dead].borrow().connects;
+        let connects_when_limited = h.stores[dead].lock().unwrap().connects;
         assert_eq!(connects_when_limited, 3);
 
         // Now A is skipped entirely: further ops do not even try to connect.
         for _ in 0..5 {
             h.client.set_raw(&key, b"v", 0, 0).unwrap();
         }
-        assert_eq!(h.stores[dead].borrow().connects, connects_when_limited);
+        assert_eq!(h.stores[dead].lock().unwrap().connects, connects_when_limited);
 
         // Suppression expires once the clock passes limited_until.
-        now.set(1_000.0 + 61.0);
+        *now.lock().unwrap() = 1_000.0 + 61.0;
         assert!(!h.client.is_error_limited(dead));
     }
 
     #[test]
     fn all_servers_failing_surfaces_error_then_no_servers() {
-        let now = Rc::new(Cell::new(500.0f64));
+        let now = Arc::new(Mutex::new(500.0f64));
         let config = MemcacheConfig {
             tries: 1,
             error_limit_count: 2,
@@ -1005,9 +1004,9 @@ mod tests {
             error_limit_duration: 60.0,
         };
         let mut h = harness(&["10.0.0.1:11211"], config);
-        let nc = now.clone();
-        h.client.set_clock(move || nc.get());
-        h.stores["10.0.0.1:11211"].borrow_mut().dead = true;
+        let nc = Arc::clone(&now);
+        h.client.set_clock(move || *nc.lock().unwrap());
+        h.stores["10.0.0.1:11211"].lock().unwrap().dead = true;
 
         // While the only server is still being tried, the underlying transport
         // error surfaces rather than a generic message.

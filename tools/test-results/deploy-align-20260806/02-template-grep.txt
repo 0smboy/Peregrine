@@ -1,0 +1,89 @@
+=== bundle-rust grep ports/devices ===
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/expand.yml:8:#        - append basename to swift_devices (add-disk), and/or
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/expand.yml:9:#        - add host to storage groups with region/zone/swift_devices (add-node)
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/README.md:19:| Devices | `host_vars.swift_devices` (default `d1`) — **mkdir only**, never mkfs/wipe `/srv/node` |
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/README.md:33:- Per-node devices: `swift_devices: [d1, d2, …]` under `srv_node_root`.
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/README.md:54:2. Update inventory host_vars (`swift_devices`, region/zone, groups).
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/README.md:105:  rust_replication_key/  ed25519 keypair
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/host_vars/10.0.0.14.yml:11:swift_devices:
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/host_vars/10.0.0.14.yml:12:  - d1
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/swift_hosts:6:#   10.0.0.12  proxy + account + container + object (directory device d1)
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/swift_hosts:9:10.0.0.11 ansible_user=root ansible_port=22 ansible_ssh_private_key_file=/path/to/id_ed25519
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/swift_hosts:10:10.0.0.12 ansible_user=root ansible_port=22 ansible_ssh_private_key_file=/path/to/id_ed25519
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/templates/haproxy.cfg.j2:42:    server proxy{{ loop.index }} {{ hostvars[host].business_network_address }}:{{ proxy_bind_port }} check inter 5s fall 3 rise 2
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/templates/haproxy.cfg.j2:62:    server mariadb{{ loop.index }} {{ addr }}:{{ mariadb_bind_port | default(3306) }} check port {{ mariadb_check_bind_port | default(9600) }}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/host_vars/10.0.0.12.yml:1:# Sample second node (P3-ops: distinct zone; multi-device example as d1 only
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/host_vars/10.0.0.12.yml:2:# in the sample — append d2 then run expand.yml to exercise add-disk).
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/host_vars/10.0.0.12.yml:11:swift_devices:
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/host_vars/10.0.0.12.yml:12:  - d1
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/host_vars/10.0.0.13.yml:11:swift_devices:
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/host_vars/10.0.0.13.yml:12:  - d1
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/group_vars/all:16:ssh_bind_port: 22
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/group_vars/all:45:proxy_bind_port: 8080
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/group_vars/all:46:account_bind_port: 6202
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/group_vars/all:47:container_bind_port: 6201
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/group_vars/all:48:object_bind_port: 6200
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/group_vars/all:49:# Wave 2: per-device object ring ports (d1→6200, d2→6201, …). Account/container
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/group_vars/all:51:object_port_per_device: true
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/group_vars/all:53:# with object_port_per_device (process-per-port supervision).
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/group_vars/all:54:object_servers_per_port: 0
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/group_vars/all:69:# d1 on .12 = 4 devices) actually satisfies data+parity <= devices. ----
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/group_vars/all.raw:16:ssh_bind_port: 22
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/group_vars/all.raw:29:proxy_bind_port: 8080
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/group_vars/all.raw:30:account_bind_port: 6202
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/group_vars/all.raw:31:container_bind_port: 6201
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/group_vars/all.raw:32:object_bind_port: 6200
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/group_vars/all.raw:33:# Wave 2: per-device object ring ports (d1→6200, d2→6201, …). Account/container
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/group_vars/all.raw:35:object_port_per_device: true
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/group_vars/all.raw:36:object_servers_per_port: 0
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/group_vars/all.raw:51:# d1 on .12 = 4 devices) actually satisfies data+parity <= devices. ----
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/identity/identity_overlay.example.yml:20:mariadb_bind_port: 3306
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/identity/identity_overlay.example.yml:21:mariadb_check_bind_port: 9600
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/host_vars/10.0.0.11.yml:1:# Sample node: all roles, directory device d1 (rust stack deploys
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/host_vars/10.0.0.11.yml:11:swift_devices:
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/config_sample/host_vars/10.0.0.11.yml:12:  - d1
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/templates/identity/haproxy-identity-listeners.cfg.j2:12:    server mariadb{{ loop.index }} {{ addr }}:{{ mariadb_bind_port | default(3306) }} check port {{ mariadb_check_bind_port | default(9600) }}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_verify/tasks/main.yml:9:      code=$(curl -s -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:{{ proxy_bind_port }}/healthcheck || true)
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_verify/tasks/main.yml:22:    url: "http://127.0.0.1:{{ proxy_bind_port }}/healthcheck"
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_verify/tasks/main.yml:27:    url: "http://127.0.0.1:{{ proxy_bind_port }}/auth/v1.0"
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_verify/tasks/main.yml:36:    resp=$(curl -sf -m 10 -D - -o /dev/null http://127.0.0.1:{{ proxy_bind_port }}/auth/v1.0 \
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:9:# Devices: host_vars.swift_devices (default ["d1"]).
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:11:# Object ports: when object_port_per_device (default true), each device on a host
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:12:# gets object_bind_port + device_index (d1→6200, d2→6201, d3→6202). Account and
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:13:# container rings stay on a single bind port (Python servers_per_port parity —
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:24:# object_port_per_device default true — Wave 2 full servers_per_port ring contract.
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:25:OBJECT_PORT_PER_DEVICE={{ '1' if (object_port_per_device | default(true)) else '0' }}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:44:object_port_for_index() {
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:46:  local base={{ object_bind_port | int }}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:68:{% set devices = hv.swift_devices | default(['d1']) %}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:72:    "{{ account_bind_port }}" "{{ device }}" "{{ swift_device_weight }}"; then
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:89:{% set devices = hv.swift_devices | default(['d1']) %}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:93:    "{{ container_bind_port }}" "{{ device }}" "{{ swift_device_weight }}"; then
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:112:{% set devices = hv.swift_devices | default(['d1']) %}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:114:  OBJ_PORT=$(object_port_for_index {{ loop.index0 }})
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:159:{% set devices = hv.swift_devices | default(['d1']) %}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:162:"$RB" account.ring.gz add r{{ region }}z{{ zone }}-{{ hv.storage_network_address }}:{{ account_bind_port }}/{{ device }} {{ swift_device_weight }}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:164:"$RB" account.ring.gz add r{{ region }}z{{ zone }}-{{ hv.storage_network_address }}:{{ account_bind_port }}R{{ hv.replication_network_address }}:{{ account_bind_port }}/{{ device }} {{ swift_device_weight }}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:177:{% set devices = hv.swift_devices | default(['d1']) %}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:180:"$RB" container.ring.gz add r{{ region }}z{{ zone }}-{{ hv.storage_network_address }}:{{ container_bind_port }}/{{ device }} {{ swift_device_weight }}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:182:"$RB" container.ring.gz add r{{ region }}z{{ zone }}-{{ hv.storage_network_address }}:{{ container_bind_port }}R{{ hv.replication_network_address }}:{{ container_bind_port }}/{{ device }} {{ swift_device_weight }}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:197:{% set devices = hv.swift_devices | default(['d1']) %}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:199:{% set obj_port = (object_bind_port | int) + ((loop.index0) if (object_port_per_device | default(true)) else 0) %}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_disks/tasks/main.yml:10:# Device names come from host_vars.swift_devices (default ["d1"]). Real block
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_disks/tasks/main.yml:25:  with_items: "{{ swift_devices | default(['d1']) }}"
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_config/templates/account-server.conf.j2:9:bind_port = {{ account_bind_port }}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_config/templates/account-server.conf.j2:26:peer_map = {{ account_bind_port }}:{{ srv_node_root }}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_replication_key/tasks/main.yml:2:# One ed25519 keypair for rsync-over-ssh replication: generated once on the
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_replication_key/tasks/main.yml:9:  command: ssh-keygen -t ed25519 -N '' -C swift-replication -f /etc/swift/replication_key
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_config/templates/object-server.conf.j2:5:# sections below; they read devices/bind_port from [app:object-server]).
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_config/templates/object-server.conf.j2:9:bind_port = {{ object_bind_port }}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_config/templates/object-server.conf.j2:13:# Rust: workers*max_clients → worker_threads (cap 128) when servers_per_port=0.
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_config/templates/object-server.conf.j2:14:# Wave 2: servers_per_port>0 → discover local object-ring ports; parent
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_config/templates/object-server.conf.j2:16:# Python. Rings use object_port_per_device (d1→6200, d2→6201, …). Contabo
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_config/templates/object-server.conf.j2:19:servers_per_port = {{ object_servers_per_port | default(0) }}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_config/templates/object-server.conf.j2:35:peer_map = {{ object_bind_port }}:{{ srv_node_root }}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_config/templates/proxy-server.conf.j2:31:bind_port = {{ proxy_bind_port }}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_config/templates/proxy-server.conf.j2:36:storage_url = http://{{ business_network_address }}:{{ proxy_bind_port }}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_config/templates/container-server.conf.j2:11:bind_port = {{ container_bind_port }}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_config/templates/container-server.conf.j2:28:peer_map = {{ container_bind_port }}:{{ srv_node_root }}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_config/templates/identity/haproxy-identity-listeners.cfg.j2:12:    server mariadb{{ loop.index }} {{ addr }}:{{ mariadb_bind_port | default(3306) }} check port {{ mariadb_check_bind_port | default(9600) }}

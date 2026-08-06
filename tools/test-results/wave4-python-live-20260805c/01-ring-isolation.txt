@@ -1,0 +1,34 @@
+=== ring isolation 20260805T112139Z ===
+account: n=4 ports=[6202] devices=['d1'] ips=['10.0.4.1', '10.0.4.2', '10.0.4.3', '10.0.4.4']
+container: n=4 ports=[6201] devices=['d1'] ips=['10.0.4.1', '10.0.4.2', '10.0.4.3', '10.0.4.4']
+object: n=12 ports=[6210, 6211, 6212] devices=['d1', 'd2', 'd3'] ips=['10.0.4.1', '10.0.4.2', '10.0.4.3', '10.0.4.4']
+object-1: n=12 ports=[6210, 6211, 6212] devices=['d1', 'd2', 'd3'] ips=['10.0.4.1', '10.0.4.2', '10.0.4.3', '10.0.4.4']
+RUST_USES_D1 True
+ISOLATION_OK False
+MATRIX_TARGET Python exclusive d1; Rust d2 (+d3)
+MIGRATE_DECISION BLOCKED_UNSAFE_MID_IDENTITY
+=== build_rings.sh vs live ===
+#!/usr/bin/env bash
+# Managed by swift-deploy-rs
+# Ring build plan for the whole cluster; runs once on the first proxy node.
+# swift-ring-builder argv (verified against crates/swift-cli/src/bin/ring_builder.rs):
+#   <ring.gz> create <part_power> <replicas> [<min_part_hours> is accepted and ignored]
+  "$RB" account.ring.gz add r1z1-10.0.4.1:6202R10.0.8.1:6202/d1 100
+  "$RB" account.ring.gz add r1z2-10.0.4.2:6202R10.0.8.2:6202/d1 100
+  "$RB" account.ring.gz add r1z3-10.0.4.3:6202R10.0.8.3:6202/d1 100
+  "$RB" account.ring.gz add r1z4-10.0.4.4:6202R10.0.8.4:6202/d1 100
+  "$RB" container.ring.gz add r1z1-10.0.4.1:6201R10.0.8.1:6201/d1 100
+  "$RB" container.ring.gz add r1z2-10.0.4.2:6201R10.0.8.2:6201/d1 100
+  "$RB" container.ring.gz add r1z3-10.0.4.3:6201R10.0.8.3:6201/d1 100
+  "$RB" container.ring.gz add r1z4-10.0.4.4:6201R10.0.8.4:6201/d1 100
+  "$RB" object.ring.gz add r1z1-10.0.4.1:6200R10.0.8.1:6200/d1 100
+  "$RB" object.ring.gz add r1z2-10.0.4.2:6200R10.0.8.2:6200/d1 100
+  "$RB" object.ring.gz add r1z3-10.0.4.3:6200R10.0.8.3:6200/d1 100
+  "$RB" object.ring.gz add r1z4-10.0.4.4:6200R10.0.8.4:6200/d1 100
+  "$RB" object-1.ring.gz add r1z1-10.0.4.1:6200R10.0.8.1:6200/d1 100
+  "$RB" object-1.ring.gz add r1z2-10.0.4.2:6200R10.0.8.2:6200/d1 100
+  "$RB" object-1.ring.gz add r1z3-10.0.4.3:6200R10.0.8.3:6200/d1 100
+  "$RB" object-1.ring.gz add r1z4-10.0.4.4:6200R10.0.8.4:6200/d1 100
+STAMP=b8efcc1e078662fc7479336ceea161695406c10f31df0d34ae819d7dfd21a334
+SCRIPT_SHA=b8efcc1e078662fc7479336ceea161695406c10f31df0d34ae819d7dfd21a334
+RING_BUILDER_USAGE=usage: swift-ring-builder <ring.gz> <create|add|rebalance> ...

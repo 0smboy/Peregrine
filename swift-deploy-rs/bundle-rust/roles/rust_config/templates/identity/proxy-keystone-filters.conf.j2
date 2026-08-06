@@ -1,0 +1,28 @@
+{# Identity 对接 fragment — include into proxy-server.conf when
+   identity_proxy_enabled|default(false) OR auth_method in keystone*.
+   Contabo default remains TempAuth. Galera/Keystone packages: python bundle. #}
+{% set _auth = auth_method | default('tempauth') %}
+{% set _ks = identity_proxy_enabled | default(false) or _auth in ['keystone', 'keystone_coexist'] %}
+{% if _ks %}
+# --- Identity cutover (external Keystone from python bundle) ---
+# Pipeline: auth_method=keystone drops tempauth; keystone_coexist keeps both.
+[filter:authtoken]
+use = egg:swift#authtoken
+delay_auth_decision = {{ identity_delay_auth_decision | default(swift_keystone_delay_auth_decision | default('true')) }}
+auth_url = {{ identity_auth_url | default(swift_keystone_auth_url | default('http://' ~ auth_url_ip ~ ':5000/v3')) }}
+username = {{ identity_swift_username | default(swift_keystone_username | default('swift')) }}
+password = {{ identity_swift_password | default(swift_keystone_password | default('CHANGE_ME')) }}
+project_name = {{ identity_swift_project | default(swift_keystone_project_name | default('service')) }}
+user_domain_name = {{ identity_user_domain | default(swift_keystone_user_domain_name | default('Default')) }}
+project_domain_name = {{ identity_project_domain | default(swift_keystone_project_domain_name | default('Default')) }}
+www_authenticate_uri = {{ identity_www_authenticate_uri | default(swift_keystone_www_authenticate_uri | default('http://' ~ auth_url_ip ~ ':5000')) }}
+http_connect_timeout = {{ identity_http_timeout | default('5') }}
+
+[filter:keystoneauth]
+use = egg:swift#keystoneauth
+operator_roles = {{ identity_operator_roles | default(swift_keystone_operator_roles | default('admin,swiftoperator')) }}
+reseller_prefix = {{ identity_reseller_prefix | default(swift_keystone_reseller_prefix | default('AUTH')) }}
+reseller_admin_role = {{ identity_reseller_admin_role | default(swift_keystone_reseller_admin_role | default('ResellerAdmin')) }}
+allow_overrides = true
+allow_names_in_acls = true
+{% endif %}

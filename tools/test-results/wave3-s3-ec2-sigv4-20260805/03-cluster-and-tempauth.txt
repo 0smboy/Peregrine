@@ -1,0 +1,14 @@
+TempAuth_ListBuckets 200 b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<ListAllMyBucketsResult xmlns="http://s3.'
+10.0.0.1 active
+awk: cmd. line:1: {print
+awk: cmd. line:1:       ^ unexpected newline or end of string
+10.0.0.2 active
+awk: cmd. line:1: {print
+awk: cmd. line:1:       ^ unexpected newline or end of string
+10.0.0.3 active
+10.0.0.4 awk: cmd. line:1: {print
+awk: cmd. line:1:       ^ unexpected newline or end of string
+active
+awk: cmd. line:1: {print
+awk: cmd. line:1:       ^ unexpected newline or end of string
+vip_hc=200

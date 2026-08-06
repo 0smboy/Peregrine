@@ -1,0 +1,16 @@
+object: n=12 ports=[6210, 6211, 6212] devices=['d1', 'd2', 'd3'] ips_sample=['10.0.4.1', '10.0.4.2', '10.0.4.3', '10.0.4.4']
+container: n=4 ports=[6201] devices=['d1'] ips_sample=['10.0.4.1', '10.0.4.2', '10.0.4.3', '10.0.4.4']
+account: n=4 ports=[6202] devices=['d1'] ips_sample=['10.0.4.1', '10.0.4.2', '10.0.4.3', '10.0.4.4']
+d1 exclusive for python? False
+pyswift devices conf:
+/etc/pyswift/object-server.conf devices = /srv/node/d1/pysaio
+/etc/pyswift/object-server.conf bind_ip = 127.0.0.1
+/etc/pyswift/object-server.conf bind_port = 6310
+/etc/pyswift/proxy-server.conf bind_ip = 10.0.0.2
+/etc/pyswift/proxy-server.conf bind_port = 8090
+
+## Isolation conclusion (2026-08-05b)
+- object: devices d1+d2+d3, ports 6210-6212 (spp) — still occupies d1
+- container/account: devices=['d1'] only — Rust exclusive claim on Python's matrix disk
+- PORT-DISK-MATRIX requires Python exclusive d1 / Rust on d2 → FAIL
+- Unsafe to install 3-node Python claiming d1 until Rust rings leave d1

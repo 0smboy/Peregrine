@@ -1,0 +1,6 @@
+-rw-------. 1 root root 652 Aug  5 09:57 /root/contabo-identity-secrets.yml
+---
+# Contabo live Identity secrets — DO NOT COPY INTO GIT
+mariadb_root_password: "A_nlJi4sGraAgHqCpzMbkl-AWR4uOmn8"
+mariadb_keystone_pass: "hDR6K7crKZpAPsTX5UHF5fRcb0m0Qvtf"
+mariadb_clustercheck_password: "G8p7Ns7XLohb91pzFcBR6XSNT61o3TzD"

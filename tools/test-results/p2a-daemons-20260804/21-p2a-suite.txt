@@ -1,0 +1,31 @@
+===================================================================
+P2a DAEMON SUITE  label=vip  endpoint=http://10.0.0.10:8085  local=1  2026-08-04T15:02:14Z
+===================================================================
+  PASS  auth: token acquired
+  PASS  container: PUT 201
+  PASS  expire: PUT with X-Delete-At 201
+  PASS  expire: object present before deadline
+  PASS  expire: PUT with X-Delete-After 201
+  [10.0.0.1] Aug 04 15:02:28 swift1 object-expirer[214292]: INFO object-expirer pass: expired=2 errors=0 retained=20
+  [10.0.0.2] Aug 04 15:02:31 swift2 object-expirer[708159]: INFO object-expirer pass: expired=0 errors=0 retained=22
+  [10.0.0.3] Aug 04 15:02:32 swift3 object-expirer[3899535]: INFO object-expirer pass: expired=0 errors=0 retained=22
+  [10.0.0.4] Aug 04 15:02:36 swift4 object-expirer[2436702]: INFO object-expirer pass: expired=0 errors=0 retained=22
+  PASS  force-once: updater+expirer on peers
+  PASS  expire: X-Delete-At client 404
+  PASS  expire: X-Delete-After client 404
+  PASS  expire: expirer hard-delete pass (expired>=1)
+  PASS  updater: put obj for stats 201
+  PASS  updater: container HEAD ok (listing lag tolerated)
+  PASS  reaper: systemd active on swift1
+  PASS  reaper: completed at least one pass
+  PASS  reconciler: systemd active on swift1
+  PASS  reconciler: completed at least one pass
+  PASS  reconciler: once pass ok
+  PASS  units active on 10.0.0.1
+  PASS  units active on 10.0.0.2
+  PASS  units active on 10.0.0.3
+  PASS  units active on 10.0.0.4
+  PASS  unit matrix: all 4 nodes
+===================================================================
+P2a RESULT  pass=21 fail=0  2026-08-04T15:02:56Z
+ALL GREEN

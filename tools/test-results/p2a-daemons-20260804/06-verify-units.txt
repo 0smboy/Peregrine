@@ -1,0 +1,96 @@
+===== 10.0.0.1 =====
+swift1
+active
+active
+deactivating
+active
+/etc/swift/account-server.conf:[account-reaper]
+/etc/swift/container-server.conf:[container-updater]
+/etc/swift/container-server.conf:[container-reconciler]
+/etc/swift/object-server.conf:[object-expirer]
+Aug 04 14:46:57 swift1 container-updater[107980]: INFO swift-container-updater: devices=/srv/node interval=300s once=false
+Aug 04 14:46:58 swift1 systemd[1]: Started Swift container reconciler (rust).
+Aug 04 14:46:58 swift1 container-reconciler[108071]: INFO swift-container-reconciler: interval=30s once=false
+Aug 04 14:46:58 swift1 container-reconciler[108071]: INFO container-reconciler pass: moved=0 already_correct=0 failed=0 errors=0
+Aug 04 14:47:15 swift1 systemd[1]: Stopping Swift object expirer (rust)...
+Aug 04 14:47:16 swift1 object-expirer[107906]: INFO exiting on SIGTERM
+Aug 04 14:47:16 swift1 systemd[1]: swift-object-expirer.service: Deactivated successfully.
+Aug 04 14:47:16 swift1 systemd[1]: Stopped Swift object expirer (rust).
+Aug 04 14:47:16 swift1 systemd[1]: Started Swift object expirer (rust).
+Aug 04 14:47:16 swift1 systemd[1]: Stopping Swift account reaper (rust)...
+Aug 04 14:47:16 swift1 object-expirer[110677]: INFO swift-object-expirer: interval=300s reclaim_age=604800s once=false
+Aug 04 14:47:16 swift1 object-expirer[110677]: INFO object-expirer pass: expired=0 errors=0 retained=0
+Aug 04 14:47:16 swift1 systemd[1]: swift-account-reaper.service: Deactivated successfully.
+Aug 04 14:47:16 swift1 systemd[1]: Stopped Swift account reaper (rust).
+Aug 04 14:47:16 swift1 systemd[1]: Started Swift account reaper (rust).
+Aug 04 14:47:16 swift1 account-reaper[110723]: INFO swift-account-reaper: devices=/srv/node interval=3600s delay_reaping=0s once=false
+Aug 04 14:47:16 swift1 systemd[1]: Stopping Swift container updater (rust)...
+Aug 04 14:47:16 swift1 account-reaper[110723]: INFO account-reaper pass: accounts_reaped=0 containers_deleted=0 objects_deleted=0 errors=0
+Aug 04 14:47:28 swift1 container-reconciler[108071]: INFO container-reconciler pass: moved=0 already_correct=0 failed=0 errors=0
+Aug 04 14:47:58 swift1 container-reconciler[108071]: INFO container-reconciler pass: moved=0 already_correct=0 failed=0 errors=0
+===== 10.0.0.2 =====
+swift2
+active
+active
+active
+active
+/etc/swift/account-server.conf:[account-reaper]
+/etc/swift/container-server.conf:[container-updater]
+/etc/swift/container-server.conf:[container-reconciler]
+/etc/swift/object-server.conf:[object-expirer]
+Aug 04 14:47:51 swift2 systemd[1]: Started Swift object expirer (rust).
+Aug 04 14:47:51 swift2 object-expirer[680595]: INFO swift-object-expirer: interval=300s reclaim_age=604800s once=false
+Aug 04 14:47:51 swift2 object-expirer[680595]: INFO object-expirer pass: expired=0 errors=0 retained=0
+Aug 04 14:47:51 swift2 systemd[1]: Started Swift account reaper (rust).
+Aug 04 14:47:51 swift2 account-reaper[680636]: INFO swift-account-reaper: devices=/srv/node interval=3600s delay_reaping=0s once=false
+Aug 04 14:47:52 swift2 systemd[1]: Started Swift container updater (rust).
+Aug 04 14:47:52 swift2 container-updater[680709]: INFO swift-container-updater: devices=/srv/node interval=300s once=false
+Aug 04 14:47:53 swift2 systemd[1]: Started Swift container reconciler (rust).
+Aug 04 14:47:53 swift2 container-reconciler[680781]: INFO swift-container-reconciler: interval=30s once=false
+Aug 04 14:47:53 swift2 container-reconciler[680781]: INFO container-reconciler pass: moved=0 already_correct=0 failed=0 errors=0
+Aug 04 14:48:02 swift2 account-reaper[680636]: INFO account-reaper pass: accounts_reaped=0 containers_deleted=0 objects_deleted=0 errors=0
+Aug 04 14:48:23 swift2 container-reconciler[680781]: INFO container-reconciler pass: moved=0 already_correct=0 failed=0 errors=0
+===== 10.0.0.3 =====
+swift3
+active
+active
+active
+active
+/etc/swift/account-server.conf:[account-reaper]
+/etc/swift/container-server.conf:[container-updater]
+/etc/swift/container-server.conf:[container-reconciler]
+/etc/swift/object-server.conf:[object-expirer]
+Aug 04 14:47:56 swift3 systemd[1]: Started Swift object expirer (rust).
+Aug 04 14:47:56 swift3 object-expirer[3829060]: INFO swift-object-expirer: interval=300s reclaim_age=604800s once=false
+Aug 04 14:47:56 swift3 object-expirer[3829060]: INFO object-expirer pass: expired=0 errors=0 retained=0
+Aug 04 14:47:56 swift3 systemd[1]: Started Swift account reaper (rust).
+Aug 04 14:47:56 swift3 account-reaper[3829102]: INFO swift-account-reaper: devices=/srv/node interval=3600s delay_reaping=0s once=false
+Aug 04 14:47:56 swift3 account-reaper[3829102]: INFO account-reaper pass: accounts_reaped=0 containers_deleted=0 objects_deleted=0 errors=0
+Aug 04 14:47:57 swift3 systemd[1]: Started Swift container updater (rust).
+Aug 04 14:47:57 swift3 container-updater[3829165]: INFO swift-container-updater: devices=/srv/node interval=300s once=false
+Aug 04 14:47:57 swift3 systemd[1]: Started Swift container reconciler (rust).
+Aug 04 14:47:57 swift3 container-reconciler[3829205]: INFO swift-container-reconciler: interval=30s once=false
+Aug 04 14:47:57 swift3 container-reconciler[3829205]: INFO container-reconciler pass: moved=0 already_correct=0 failed=0 errors=0
+Aug 04 14:48:27 swift3 container-reconciler[3829205]: INFO container-reconciler pass: moved=0 already_correct=0 failed=0 errors=0
+===== 10.0.0.4 =====
+swift4
+active
+active
+active
+active
+/etc/swift/account-server.conf:[account-reaper]
+/etc/swift/container-server.conf:[container-updater]
+/etc/swift/container-server.conf:[container-reconciler]
+/etc/swift/object-server.conf:[object-expirer]
+Aug 04 14:48:05 swift4 systemd[1]: Started Swift object expirer (rust).
+Aug 04 14:48:05 swift4 object-expirer[2385664]: INFO swift-object-expirer: interval=300s reclaim_age=604800s once=false
+Aug 04 14:48:05 swift4 object-expirer[2385664]: INFO object-expirer pass: expired=0 errors=0 retained=0
+Aug 04 14:48:06 swift4 systemd[1]: Started Swift account reaper (rust).
+Aug 04 14:48:06 swift4 account-reaper[2385708]: INFO swift-account-reaper: devices=/srv/node interval=3600s delay_reaping=0s once=false
+Aug 04 14:48:06 swift4 systemd[1]: Started Swift container updater (rust).
+Aug 04 14:48:06 swift4 container-updater[2385748]: INFO swift-container-updater: devices=/srv/node interval=300s once=false
+Aug 04 14:48:07 swift4 systemd[1]: Started Swift container reconciler (rust).
+Aug 04 14:48:07 swift4 container-reconciler[2385786]: INFO swift-container-reconciler: interval=30s once=false
+Aug 04 14:48:07 swift4 container-reconciler[2385786]: INFO container-reconciler pass: moved=0 already_correct=0 failed=0 errors=0
+Aug 04 14:48:09 swift4 account-reaper[2385708]: INFO account-reaper pass: accounts_reaped=0 containers_deleted=0 objects_deleted=0 errors=0
+Aug 04 14:48:37 swift4 container-reconciler[2385786]: INFO container-reconciler pass: moved=0 already_correct=0 failed=0 errors=0

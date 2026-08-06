@@ -1,7 +1,12 @@
 ---
-# HTTP load balancer in front of the swift proxies (only reached when the
-# play's role-level `when: use_lb` holds). TLS is a stated v1 non-goal:
-# the frontend is plain http whatever lb_mode says.
+# HTTP(S) load balancer in front of the swift proxies (only reached when the
+# play's role-level `when: use_lb` holds).
+#
+# P3-ops TLS: when lb_mode=https, terminate TLS here (not on the proxy).
+# Cert sources (first match wins):
+#   1) haproxy_tls_pem_src — controller-side PEM (cert+key concatenated)
+#   2) haproxy_tls_self_signed (default true) — openssl on first haproxy host
+# Contabo lab without a real cert: keep http, or dry-run plan only.
 
 - name: probe for haproxy
   shell: command -v haproxy >/dev/null 2>&1 && echo PRESENT || echo ABSENT
@@ -24,6 +29,78 @@
     fi
   register: rust_haproxy_sebool
   changed_when: rust_haproxy_sebool.stdout.find('TOGGLED') != -1
+
+# ---- TLS material (lb_mode=https only) ----
+- name: ensure haproxy TLS staging dir on controller
+  file:
+    path: "{{ ring_fetch_dir }}/haproxy-tls"
+    state: directory
+    mode: "0700"
+  changed_when: false
+  delegate_to: localhost
+  run_once: true
+  when: lb_mode == "https"
+
+- name: install operator-provided HAProxy TLS PEM
+  copy:
+    src: "{{ haproxy_tls_pem_src }}"
+    dest: "{{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}"
+    mode: "0600"
+  when: lb_mode == "https" and (haproxy_tls_pem_src | default('')) | length > 0
+
+- name: generate self-signed HAProxy TLS material on first LB host
+  shell: |
+    set -euo pipefail
+    PEM="{{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}"
+    CRT=/etc/haproxy/haproxy.crt
+    KEY=/etc/haproxy/haproxy.key
+    DAYS="{{ haproxy_tls_days | default(825) }}"
+    CN="{{ auth_url_ip }}"
+    if [ -f "$PEM" ] && [ -s "$PEM" ]; then
+      echo TLS-PRESENT
+      exit 0
+    fi
+    openssl req -new -x509 -nodes -days "$DAYS" -subj "/CN=$CN" -out "$CRT" -keyout "$KEY"
+    cat "$CRT" "$KEY" > "$PEM"
+    chmod 600 "$PEM" "$KEY"
+    chmod 644 "$CRT"
+    echo TLS-GENERATED
+  register: rust_haproxy_tls_gen
+  changed_when: rust_haproxy_tls_gen.stdout.find('TLS-GENERATED') != -1
+  when: >
+    lb_mode == "https"
+    and (haproxy_tls_pem_src | default('')) | length == 0
+    and (haproxy_tls_self_signed | default(true))
+    and inventory_hostname == groups['haproxy_servers'][0]
+
+- name: fetch self-signed PEM to controller staging
+  fetch:
+    src: "{{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}"
+    dest: "{{ ring_fetch_dir }}/haproxy-tls/haproxyCA.pem"
+    flat: yes
+  changed_when: false
+  delegate_to: "{{ groups['haproxy_servers'][0] }}"
+  run_once: true
+  when: >
+    lb_mode == "https"
+    and (haproxy_tls_pem_src | default('')) | length == 0
+    and (haproxy_tls_self_signed | default(true))
+
+- name: distribute self-signed PEM to all HAProxy hosts
+  copy:
+    src: "{{ ring_fetch_dir }}/haproxy-tls/haproxyCA.pem"
+    dest: "{{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}"
+    mode: "0600"
+  when: >
+    lb_mode == "https"
+    and (haproxy_tls_pem_src | default('')) | length == 0
+    and (haproxy_tls_self_signed | default(true))
+
+- name: refuse https without TLS material path
+  shell: |
+    echo "lb_mode=https requires haproxy_tls_pem_src or haproxy_tls_self_signed=true" >&2
+    exit 1
+  when: lb_mode == "https" and (haproxy_tls_pem_src | default('')) | length == 0 and haproxy_tls_self_signed == false
 
 - name: render haproxy.cfg
   template:
@@ -57,3 +134,7 @@
     enabled: yes
     state: started
   when: rust_haproxy_state.stdout.find('RUNNING') == -1
+
+- name: validate haproxy can parse the rendered config
+  shell: haproxy -c -f /etc/haproxy/haproxy.cfg
+  changed_when: false

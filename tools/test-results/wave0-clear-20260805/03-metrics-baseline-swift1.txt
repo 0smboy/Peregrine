@@ -1,0 +1,50 @@
+2026-08-05T03:50:20Z
+total_count	47151
+total_bytes	0
+device=d1	policy=0	count=28352	bytes=0
+device=d1	policy=1	count=2102	bytes=0
+device=d2	policy=0	count=6458	bytes=0
+device=d2	policy=1	count=1981	bytes=0
+device=d3	policy=0	count=6300	bytes=0
+device=d3	policy=1	count=1958	bytes=0
+---
+kind=account	files=3	file_bytes=241664	freelist_count=0	freelist_bytes=0	errors=0
+kind=container	files=973	file_bytes=149041152	freelist_count=555	freelist_bytes=2273280	errors=0
+---PROM-TS---
+# HELP swift_object_tombstones Count of on-disk .ts tombstone files
+# TYPE swift_object_tombstones gauge
+swift_object_tombstones{node="swift1",device="d1",policy="0"} 29104
+swift_object_tombstones{node="swift1",device="d1",policy="1"} 2102
+swift_object_tombstones{node="swift1",device="d2",policy="0"} 6458
+swift_object_tombstones{node="swift1",device="d2",policy="1"} 1981
+swift_object_tombstones{node="swift1",device="d3",policy="0"} 6300
+swift_object_tombstones{node="swift1",device="d3",policy="1"} 1958
+# HELP swift_object_tombstone_bytes Total bytes of .ts tombstone files
+# TYPE swift_object_tombstone_bytes gauge
+swift_object_tombstone_bytes{node="swift1",device="d1",policy="0"} 0
+swift_object_tombstone_bytes{node="swift1",device="d1",policy="1"} 0
+swift_object_tombstone_bytes{node="swift1",device="d2",policy="0"} 0
+swift_object_tombstone_bytes{node="swift1",device="d2",policy="1"} 0
+swift_object_tombstone_bytes{node="swift1",device="d3",policy="0"} 0
+swift_object_tombstone_bytes{node="swift1",device="d3",policy="1"} 0
+---PROM-DB---
+# HELP swift_db_file_bytes Sum of account/container SQLite file sizes
+# TYPE swift_db_file_bytes gauge
+# HELP swift_db_freelist_count Sum of PRAGMA freelist_count
+# TYPE swift_db_freelist_count gauge
+# HELP swift_db_freelist_bytes Approximate freelist bytes (pages * page_size)
+# TYPE swift_db_freelist_bytes gauge
+# HELP swift_db_files Count of sampled .db files
+# TYPE swift_db_files gauge
+swift_db_file_bytes{node="swift1",kind="account"} 241664
+swift_db_freelist_count{node="swift1",kind="account"} 0
+swift_db_freelist_bytes{node="swift1",kind="account"} 0
+swift_db_files{node="swift1",kind="account"} 3
+swift_db_file_bytes{node="swift1",kind="container"} 149041152
+swift_db_freelist_count{node="swift1",kind="container"} 584
+swift_db_freelist_bytes{node="swift1",kind="container"} 2392064
+swift_db_files{node="swift1",kind="container"} 973
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   49G  1.6G  97% /srv/node/d1
+/dev/sda6        50G   45G  5.1G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.6G  89% /srv/node/d3

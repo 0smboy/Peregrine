@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Wave 4 Python live — 2026-08-05d</title>
+<style>
+body{font:14px/1.45 system-ui,sans-serif;margin:24px;color:#1a1a1a;background:#f7f5f1}
+h1{font-size:1.4rem;margin:0 0 8px}
+h2{font-size:1.1rem;margin:20px 0 8px}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-weight:600;font-size:12px}
+.ok{background:#d7f0d7}.warn{background:#ffe6a8}.bad{background:#f5c2c2}
+table{border-collapse:collapse;width:100%;margin:12px 0;background:#fff}
+th,td{border:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}
+th{background:#eee}
+code{font-size:12px}
+</style>
+</head>
+<body>
+<h1>Wave 4 — Python 3-node live</h1>
+<p><span class="badge ok">LAB GREEN</span> · <code>PYTHON_CLUSTER=PRESENT</code> · 2026-08-05d · no PRODUCTION-GO-LIVE</p>
+
+<h2>1) What this cycle did</h2>
+<ul>
+<li>VIP auth CRUD already GREEN — opened maintenance window.</li>
+<li>Backed up rings; first Contabo <code>add weight=0</code> path duplicated devices → <strong>rolled back</strong>.</li>
+<li>Clean migrate via builder.json rewrite: Rust A/C→d2; object→d2+d3 (no d1).</li>
+<li>VIP TempAuth+Keystone CRUD PASS; isolation PASS.</li>
+<li>Installed Python 3-node on swift2/3/4 via <code>/opt/pyswift-venv</code> + <code>/etc/pyswift</code> (RPM blocked by pyxattr provide).</li>
+<li>Python CRUD 201/201/200/204/204 on all three LAN proxies.</li>
+</ul>
+
+<h2>2) Optimized / fixed / demoted</h2>
+<table>
+<tr><th>Item</th><th>Status</th></tr>
+<tr><td>Rust leave d1</td><td class="ok">DONE</td></tr>
+<tr><td>Contabo ring-builder weight update</td><td class="bad">Broken — avoided</td></tr>
+<tr><td>Isolation</td><td class="ok">PASS</td></tr>
+<tr><td>3-node Python</td><td class="ok">PRESENT</td></tr>
+<tr><td>4-node</td><td class="warn">Not executed (disk eligible)</td></tr>
+<tr><td>openstack-swift RPM</td><td class="warn">Deps blocked; venv path used</td></tr>
+</table>
+
+<h2>3) Measured effect</h2>
+<table>
+<tr><th>Metric</th><th>Before</th><th>After</th></tr>
+<tr><td>Rust A/C</td><td>d1</td><td>d2</td></tr>
+<tr><td>Rust object</td><td>d1+d2+d3 :6210–12</td><td>d2+d3 :6211–12</td></tr>
+<tr><td>Python</td><td>ABSENT / SAIO leftover</td><td>3-node :8090 / :610x / d1/py</td></tr>
+<tr><td>VIP CRUD</td><td>GREEN</td><td>GREEN post-migrate</td></tr>
+</table>
+
+<h2>4) Gate table</h2>
+<table>
+<tr><th>Gate</th><th>Result</th><th>Evidence</th></tr>
+<tr><td>Use% &lt;70%</td><td class="ok">PASS (2%)</td><td><code>00-df-mem-gate.txt</code></td></tr>
+<tr><td>Isolation</td><td class="ok">PASS</td><td><code>08-rust-vip-regression.txt</code></td></tr>
+<tr><td>VIP TempAuth+Keystone</td><td class="ok">PASS</td><td>same</td></tr>
+<tr><td>Python listeners 2/3/4</td><td class="ok">PASS</td><td><code>09-python-listeners.txt</code></td></tr>
+<tr><td>Python CRUD ×3</td><td class="ok">PASS</td><td><code>08-python-crud-internal.txt</code></td></tr>
+<tr><td>4-node</td><td class="warn">N/A</td><td>deferred</td></tr>
+</table>
+
+<h2>5) Remaining / next</h2>
+<ol>
+<li><strong>FROZEN:</strong> 4-node on swift1 (optional).</li>
+<li>Stage 3B dual-API compare can use this pack.</li>
+<li>Open Contabo :8090 from operator nets if external access needed (LAN works).</li>
+<li>Upgrade Contabo <code>swift-ring-builder</code> to idempotent weight-update binary.</li>
+</ol>
+
+<p>Evidence: <code>tools/test-results/wave4-python-live-20260805d/</code></p>
+</body>
+</html>

@@ -1,0 +1,7 @@
+VERDICT: PARTIAL
+- Keystone /v3/s3tokens live exchange: GREEN (VIP HTTPS)
+- bad-base64 crash (RemoteDisconnected): FIXED → clean 401
+- X-Subject-Token on s3tokens: FIXED (parity with ec2tokens)
+- EC2 → s3tokens → Swift native PUT/GET over VIP: GREEN
+- EC2 → VIP S3 SigV4 PUT/GET: BLOCKED (Rust s3api InvalidAccessKeyId before s3token)
+- NOT PRODUCTION-GO-LIVE

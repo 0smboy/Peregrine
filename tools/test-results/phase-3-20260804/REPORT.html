@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>阶段 3 · 三节点双实现（状态）</title>
+<style>
+ body{font:15px/1.45 system-ui,sans-serif;max-width:920px;margin:2rem auto;padding:0 1rem;color:#1a1a1a}
+ table{border-collapse:collapse;width:100%;margin:1rem 0}
+ th,td{border:1px solid #ccc;padding:.45rem .6rem;text-align:left}
+ th{background:#f3f3f3} .ok{color:#0a6} .warn{color:#a60} .fail{color:#b00}
+</style>
+</head>
+<body>
+<h1>阶段 3：三节点双实现（2026-08-04）</h1>
+<p>权威：<code>docs/fairness-lab/USER-METHOD-PLAN.md</code> · 探针：<code>PYTHON-PROBE.txt</code></p>
+
+<h2>1. 需求 / 目标 / 现状</h2>
+<table>
+<tr><th>用户需求</th><td>3A 装齐 Python+Rust 三节点（2/3/4，分盘分端口）→ 3B API 对比 → 3C Rust 独占 → 3D Python 独占</td></tr>
+<tr><th>完美对齐</th><td>双侧全量中间件对齐 + 双侧性能/故障分表</td></tr>
+<tr><th>现在到哪了</th><td class="warn">3A Python <strong>FROZEN</strong>（PYTHON_CLUSTER_ABSENT）；3B/3D FROZEN；3C Rust 独占 cutover <strong>backlog</strong>（阶段2 仍占四节点）</td></tr>
+</table>
+
+<h2>2. 动作 / 环境 / 效果</h2>
+<table>
+<tr><th>动作</th><th>环境</th><th>效果</th></tr>
+<tr><td>装机调研</td><td>swift2/3/4：openstack-swift unit=0；python import swift 失败；无 pip3；无 docker/podman；/srv/node ~90%</td><td class="warn">不可达全量 Python 三节点；禁止 wipe 取空间</td></tr>
+<tr><td>SAIO 残留</td><td>/etc/pyswift 配置可能存在；:8090/:8081 未监听</td><td>符合阶段2「关 SAIO」；不能冒充三节点 Python 集群</td></tr>
+<tr><td>Rust 侧</td><td>现网四节点 Rust + VIP RR（阶段2）</td><td class="ok">可用；非阶段3「仅 2/3/4」拓扑</td></tr>
+</table>
+
+<h2>3. 子轮状态</h2>
+<table>
+<tr><th>子轮</th><th>状态</th><th>说明</th></tr>
+<tr><td>3A Python</td><td class="warn">FROZEN</td><td>PYTHON_CLUSTER_ABSENT</td></tr>
+<tr><td>3A Rust 三节点独占拓扑</td><td class="warn">backlog</td><td>需从四节点 demote swift1 数据面；本轮优先阶段2</td></tr>
+<tr><td>3B 双侧 API</td><td class="warn">FROZEN</td><td>无 Python 侧入口</td></tr>
+<tr><td>3C Rust 独占测</td><td class="warn">backlog</td><td>可在下一轮 cutover 后用阶段2 矩阵复跑</td></tr>
+<tr><td>3D Python 独占</td><td class="warn">FROZEN</td><td>同 3A</td></tr>
+</table>
+
+<h2>4. 剩余 / 下一步</h2>
+<ol>
+<li>不装假绿：在出现 openstack-swift（或等价）三节点 + 分盘分端口方案前，3A/3B/3D 保持 FROZEN。</li>
+<li>可选下一轮：Rust-only 3C（停 swift1 数据面服务，环仅 2/3/4）——需维护窗，且勿 wipe。</li>
+<li>Python 装机若要做：另开盘/降占用，禁止 wipe <code>/srv/node</code> 现有 XFS。</li>
+</ol>
+</body>
+</html>

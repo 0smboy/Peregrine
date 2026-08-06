@@ -3,21 +3,142 @@
 # Ring build plan for the whole cluster; runs once on the first proxy node.
 # swift-ring-builder argv (verified against crates/swift-cli/src/bin/ring_builder.rs):
 #   <ring.gz> create <part_power> <replicas> [<min_part_hours> is accepted and ignored]
-#   <ring.gz> add r<R>z<Z>-<ip>:<port>/<device> <weight>
+#   <ring.gz> add r<R>z<Z>-<ip>:<port>[R<rip>:<rport>]/<device> <weight>   (idempotent)
 #   <ring.gz> rebalance
-# Zones are assigned per node (z1..zN, group order). Every node has the
-# single directory device d1 (rust stack v1 — no managed block devices).
+#
+# Devices: host_vars.swift_devices (default ["d1"]).
+# Optional split (Contabo hybrid): host_vars.account_container_devices and/or
+# host_vars.object_devices override swift_devices for those rings only.
+# Region/zone: host_vars.region / host_vars.zone (default r1 / group-order).
+# Object ports: when object_port_per_device (default true), each *object* device
+# on a host gets object_bind_port + device_index (list order, not device name).
+# Contabo live: object_devices=[d2,d3] + object_bind_port=6211 → 6211/6212.
+# Account and container rings stay on a single bind port (Python spp parity —
+# only the object server uses per-device ports).
+# Expand: ADD_NODES or ring_expand true → never rm rings; idempotent add + rebalance.
+# Dual-guard: this script never formats or wipes /srv/node.
 set -euo pipefail
 SWIFT_DIR=/etc/swift
 RB=/usr/local/bin/swift-ring-builder
 cd "$SWIFT_DIR"
 
-# Rebuild everything whenever this rendered plan changes (the script content
-# is deterministic from the inventory). A stale ring left by anything else
-# never survives: only a stamp written by THIS plan skips the rebuild.
+EXPAND={{ '1' if (ADD_NODES | default(false) or ring_expand | default(false)) else '0' }}
+FORCE={{ '1' if (ring_force_rebuild | default(false)) else '0' }}
+# object_port_per_device default true — Wave 2 full servers_per_port ring contract.
+OBJECT_PORT_PER_DEVICE={{ '1' if (object_port_per_device | default(true)) else '0' }}
+
+add_device() {
+  local ring_file="$1" region="$2" zone="$3" sip="$4" rip="$5" port="$6" device="$7" weight="$8"
+  local spec
+  if [ "$sip" = "$rip" ]; then
+    spec="r${region}z${zone}-${sip}:${port}/${device}"
+  else
+    spec="r${region}z${zone}-${sip}:${port}R${rip}:${port}/${device}"
+  fi
+  local out
+  out=$("$RB" "$ring_file" add "$spec" "$weight")
+  echo "$ring_file: $out"
+  case "$out" in
+    added\ device*|updated\ weight*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+object_port_for_index() {
+  local idx="$1"
+  local base={{ object_bind_port | int }}
+  if [ "$OBJECT_PORT_PER_DEVICE" = "1" ]; then
+    echo $((base + idx))
+  else
+    echo "$base"
+  fi
+}
+
+if [ "$EXPAND" = "1" ]; then
+  echo "RING-MODE=expand"
+  for req in account.ring.gz.builder.json container.ring.gz.builder.json object.ring.gz.builder.json; do
+    if [ ! -f "$req" ]; then
+      echo "expand requires existing $req" >&2
+      exit 1
+    fi
+  done
+
+  CHANGED=0
+{% for host in groups['account_servers'] %}
+{% set hv = hostvars[host] %}
+{% set region = hv.region | default(1) %}
+{% set zone = hv.zone | default(loop.index) %}
+{% set devices = hv.account_container_devices | default(hv.swift_devices | default(['d1'])) %}
+{% for device in devices %}
+  if add_device account.ring.gz "{{ region }}" "{{ zone }}" \
+    "{{ hv.storage_network_address }}" "{{ hv.replication_network_address }}" \
+    "{{ account_bind_port }}" "{{ device }}" "{{ swift_device_weight }}"; then
+    CHANGED=1
+  fi
+{% endfor %}
+{% endfor %}
+  if [ "$CHANGED" = 1 ]; then
+    "$RB" account.ring.gz rebalance
+    echo "EXPAND-REBALANCED account.ring.gz"
+  else
+    echo "EXPAND-CURRENT account.ring.gz"
+  fi
+
+  CHANGED=0
+{% for host in groups['container_servers'] %}
+{% set hv = hostvars[host] %}
+{% set region = hv.region | default(1) %}
+{% set zone = hv.zone | default(loop.index) %}
+{% set devices = hv.account_container_devices | default(hv.swift_devices | default(['d1'])) %}
+{% for device in devices %}
+  if add_device container.ring.gz "{{ region }}" "{{ zone }}" \
+    "{{ hv.storage_network_address }}" "{{ hv.replication_network_address }}" \
+    "{{ container_bind_port }}" "{{ device }}" "{{ swift_device_weight }}"; then
+    CHANGED=1
+  fi
+{% endfor %}
+{% endfor %}
+  if [ "$CHANGED" = 1 ]; then
+    "$RB" container.ring.gz rebalance
+    echo "EXPAND-REBALANCED container.ring.gz"
+  else
+    echo "EXPAND-CURRENT container.ring.gz"
+  fi
+
+{% for policy in swift_policies %}
+{% set ring_file = 'object.ring.gz' if policy.index == 0 else 'object-' ~ policy.index ~ '.ring.gz' %}
+  CHANGED=0
+{% for host in groups['object_servers'] %}
+{% set hv = hostvars[host] %}
+{% set region = hv.region | default(1) %}
+{% set zone = hv.zone | default(loop.index) %}
+{% set devices = hv.object_devices | default(hv.swift_devices | default(['d1'])) %}
+{% for device in devices %}
+  OBJ_PORT=$(object_port_for_index {{ loop.index0 }})
+  if add_device {{ ring_file }} "{{ region }}" "{{ zone }}" \
+    "{{ hv.storage_network_address }}" "{{ hv.replication_network_address }}" \
+    "$OBJ_PORT" "{{ device }}" "{{ swift_device_weight }}"; then
+    CHANGED=1
+  fi
+{% endfor %}
+{% endfor %}
+  if [ "$CHANGED" = 1 ]; then
+    "$RB" {{ ring_file }} rebalance
+    echo "EXPAND-REBALANCED {{ ring_file }}"
+  else
+    echo "EXPAND-CURRENT {{ ring_file }}"
+  fi
+{% endfor %}
+
+  ls -l "$SWIFT_DIR"/*.ring.gz
+  echo "RINGS-EXPANDED"
+  exit 0
+fi
+
+# ---- greenfield / stamp rebuild ----
 STAMP="$SWIFT_DIR/.rings.built"
 SELF_SHA=$(sha256sum "$0" | awk '{print $1}')
-if [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$SELF_SHA" ]; then
+if [ "$FORCE" != "1" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$SELF_SHA" ]; then
   MISSING=0
   for f in account.ring.gz container.ring.gz {% for policy in swift_policies %}{{ 'object.ring.gz' if policy.index == 0 else 'object-' ~ policy.index ~ '.ring.gz' }} {% endfor %}; do
     [ -f "$f" ] || MISSING=1
@@ -27,24 +148,43 @@ if [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$SELF_SHA" ]; then
     exit 0
   fi
 fi
+if [ "$FORCE" = "1" ]; then
+  echo "RING-MODE=force-rebuild"
+fi
 
 # ---- account ring ----
 rm -f account.ring.gz account.ring.gz.builder.json
-  "$RB" account.ring.gz create {{ account_swift_partition_power }} {{ account_swift_replicas }} {{ account_swift_minimum_time }}
+"$RB" account.ring.gz create {{ account_swift_partition_power }} {{ account_swift_replicas }} {{ account_swift_minimum_time }}
 {% for host in groups['account_servers'] %}
-{% set zone = loop.index %}
 {% set hv = hostvars[host] %}
-  "$RB" account.ring.gz add r1z{{ zone }}-{{ hv.storage_network_address }}:{{ account_bind_port }}R{{ hv.replication_network_address }}:{{ account_bind_port }}/d1 {{ swift_device_weight }}
+{% set region = hv.region | default(1) %}
+{% set zone = hv.zone | default(loop.index) %}
+{% set devices = hv.account_container_devices | default(hv.swift_devices | default(['d1'])) %}
+{% for device in devices %}
+{% if hv.storage_network_address == hv.replication_network_address %}
+"$RB" account.ring.gz add r{{ region }}z{{ zone }}-{{ hv.storage_network_address }}:{{ account_bind_port }}/{{ device }} {{ swift_device_weight }}
+{% else %}
+"$RB" account.ring.gz add r{{ region }}z{{ zone }}-{{ hv.storage_network_address }}:{{ account_bind_port }}R{{ hv.replication_network_address }}:{{ account_bind_port }}/{{ device }} {{ swift_device_weight }}
+{% endif %}
+{% endfor %}
 {% endfor %}
 "$RB" account.ring.gz rebalance
 
 # ---- container ring ----
 rm -f container.ring.gz container.ring.gz.builder.json
-  "$RB" container.ring.gz create {{ container_swift_partition_power }} {{ container_swift_replicas }} {{ container_swift_minimum_time }}
+"$RB" container.ring.gz create {{ container_swift_partition_power }} {{ container_swift_replicas }} {{ container_swift_minimum_time }}
 {% for host in groups['container_servers'] %}
-{% set zone = loop.index %}
 {% set hv = hostvars[host] %}
-  "$RB" container.ring.gz add r1z{{ zone }}-{{ hv.storage_network_address }}:{{ container_bind_port }}R{{ hv.replication_network_address }}:{{ container_bind_port }}/d1 {{ swift_device_weight }}
+{% set region = hv.region | default(1) %}
+{% set zone = hv.zone | default(loop.index) %}
+{% set devices = hv.account_container_devices | default(hv.swift_devices | default(['d1'])) %}
+{% for device in devices %}
+{% if hv.storage_network_address == hv.replication_network_address %}
+"$RB" container.ring.gz add r{{ region }}z{{ zone }}-{{ hv.storage_network_address }}:{{ container_bind_port }}/{{ device }} {{ swift_device_weight }}
+{% else %}
+"$RB" container.ring.gz add r{{ region }}z{{ zone }}-{{ hv.storage_network_address }}:{{ container_bind_port }}R{{ hv.replication_network_address }}:{{ container_bind_port }}/{{ device }} {{ swift_device_weight }}
+{% endif %}
+{% endfor %}
 {% endfor %}
 "$RB" container.ring.gz rebalance
 
@@ -52,11 +192,20 @@ rm -f container.ring.gz container.ring.gz.builder.json
 {% for policy in swift_policies %}
 {% set ring_file = 'object.ring.gz' if policy.index == 0 else 'object-' ~ policy.index ~ '.ring.gz' %}
 rm -f {{ ring_file }} {{ ring_file }}.builder.json
-  "$RB" {{ ring_file }} create {{ policy.partition_power }} {{ policy.replicas }} {{ policy.min_part_hours }}
+"$RB" {{ ring_file }} create {{ policy.partition_power }} {{ policy.replicas }} {{ policy.min_part_hours }}
 {% for host in groups['object_servers'] %}
-{% set zone = loop.index %}
 {% set hv = hostvars[host] %}
-  "$RB" {{ ring_file }} add r1z{{ zone }}-{{ hv.storage_network_address }}:{{ object_bind_port }}R{{ hv.replication_network_address }}:{{ object_bind_port }}/d1 {{ swift_device_weight }}
+{% set region = hv.region | default(1) %}
+{% set zone = hv.zone | default(loop.index) %}
+{% set devices = hv.object_devices | default(hv.swift_devices | default(['d1'])) %}
+{% for device in devices %}
+{% set obj_port = (object_bind_port | int) + ((loop.index0) if (object_port_per_device | default(true)) else 0) %}
+{% if hv.storage_network_address == hv.replication_network_address %}
+"$RB" {{ ring_file }} add r{{ region }}z{{ zone }}-{{ hv.storage_network_address }}:{{ obj_port }}/{{ device }} {{ swift_device_weight }}
+{% else %}
+"$RB" {{ ring_file }} add r{{ region }}z{{ zone }}-{{ hv.storage_network_address }}:{{ obj_port }}R{{ hv.replication_network_address }}:{{ obj_port }}/{{ device }} {{ swift_device_weight }}
+{% endif %}
+{% endfor %}
 {% endfor %}
 "$RB" {{ ring_file }} rebalance
 {% endfor %}
@@ -64,3 +213,4 @@ rm -f {{ ring_file }} {{ ring_file }}.builder.json
 echo "$SELF_SHA" > "$STAMP"
 ls -l "$SWIFT_DIR"/*.ring.gz
 echo "RINGS-REBUILT"
+echo "OBJECT_PORT_PER_DEVICE=$OBJECT_PORT_PER_DEVICE"

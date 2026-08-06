@@ -1,0 +1,18 @@
+UTC 2026-08-05T11:26:14Z
+=== health/info ===
+health 200
+info 200 keys ['account_quotas', 'bulk_delete', 'container_quotas', 'dlo', 'formpost', 'keystoneauth', 'slo', 'staticweb', 'swift', 'symlink', 'tempauth', 'tempurl', 'versioned_writes']
+=== TempAuth HTTPS ===
+auth=200 toklen=149 storage=http://10.0.0.10:8085/v1/AUTH_test
+list https_AUTH_test=401 body_prefix=b'Unauthorized\n'
+list storage_rewritten_https=401 body_prefix=b'Unauthorized\n'
+=== Keystone tester/test ===
+token=201 toklen=183
+project_id 29af7f1e19774999bf700fbef31994d3 roles ['swiftoperator']
+list AUTH_project=200
+list AUTH_test_wrong=403
+CRUD put_c=201 put_o=201 get_o=200 body=b'hello-auth-fix' del_o=204 del_c=204
+=== Keystone AUTH_test only (wave4 bug repro) ===
+AUTH_test_with_keystone_token 403
+=== negative bogus token ===
+bogus 401

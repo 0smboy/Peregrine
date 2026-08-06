@@ -1,0 +1,44 @@
+{
+    "dlo": {},
+    "slo": {
+        "max_get_time": 86400,
+        "max_manifest_segments": 1000,
+        "max_manifest_size": 8388608,
+        "min_segment_size": 1
+    },
+    "swift": {
+        "account_autocreate": true,
+        "account_listing_limit": 10000,
+        "allow_account_management": false,
+        "auto_create_account_prefix": ".",
+        "container_listing_limit": 10000,
+        "extra_header_count": 0,
+        "max_account_name_length": 256,
+        "max_container_name_length": 256,
+        "max_file_size": 5368709122,
+        "max_header_size": 8192,
+        "max_meta_count": 90,
+        "max_meta_name_length": 128,
+        "max_meta_overall_size": 4096,
+        "max_meta_value_length": 256,
+        "max_object_name_length": 1024,
+        "policies": [
+            {
+                "aliases": "default",
+                "default": true,
+                "name": "default"
+            },
+            {
+                "aliases": "ec-2-1",
+                "default": false,
+                "name": "ec-2-1"
+            }
+        ],
+        "valid_api_versions": [
+            "v1",
+            "v1.0"
+        ],
+        "version": "2.35.0"
+    },
+    "tempauth": {}
+}

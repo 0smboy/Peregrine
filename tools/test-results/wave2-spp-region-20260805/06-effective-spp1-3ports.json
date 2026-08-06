@@ -1,0 +1,16 @@
+{
+  "workers": 0,
+  "max_clients": 1024,
+  "servers_per_port": 1,
+  "bind_ports": 3,
+  "worker_threads": 128,
+  "connection_queue": 1024,
+  "acceptors": 3,
+  "formula": "per-process: max_clients \u2192 worker_threads; children = spp * n_ports",
+  "notes": [
+    "servers_per_port>0: workers knob ignored (Python parity)",
+    "Rust Wave2: one OS process per (port, worker) \u2014 process-isolated",
+    "per-process worker_threads clamped to 128",
+    "aggregate \u2248 servers_per_port * n_ports * max_clients across children"
+  ]
+}

@@ -1,0 +1,13 @@
+==== failover smoke start 2026-08-04T14:34:23Z ====
+active
+put_c=201
+put_o=201
+acl=204
+anon_before=200
+revoke=204
+deny_while_n2_down=8/8 unexpected=0
+active
+local_health=200
+deny_after_n2_up=6/6
+vip_health=200
+==== failover smoke end 2026-08-04T14:34:41Z ====

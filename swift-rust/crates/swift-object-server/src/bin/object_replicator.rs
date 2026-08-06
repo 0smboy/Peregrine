@@ -263,12 +263,24 @@ fn main() {
 
     let hash_client = HttpSuffixHashClient;
     let syncer = RsyncSuffixSyncer { dest };
-    let cleanup = CleanupConfig::default();
+    // Honor conf `reclaim_age` / `commit_window` (DEFAULT or [object-replicator]).
+    // Previously always CleanupConfig::default() (604800s), so lab reclaim_age=600
+    // had no effect — Wave 0 residual until this wire-up.
+    let reclaim_age: f64 = get("object-replicator", "reclaim_age", "604800")
+        .parse()
+        .unwrap_or(604800.0);
+    let commit_window: f64 = get("object-replicator", "commit_window", "60")
+        .parse()
+        .unwrap_or(60.0);
+    let cleanup = CleanupConfig {
+        reclaim_age,
+        commit_window,
+    };
     let stop = swift_http::install_sigterm_flag();
 
     logger.info(&format!(
         "swift-object-replicator: devices={devices} bind_port={bind_port} \
-         interval={interval}s once={run_once_only}"
+         interval={interval}s reclaim_age={reclaim_age}s once={run_once_only}"
     ));
     loop {
         let pass_start = std::time::Instant::now();

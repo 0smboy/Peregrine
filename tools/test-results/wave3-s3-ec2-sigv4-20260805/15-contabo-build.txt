@@ -1,0 +1,112 @@
+   Compiling swift-core v0.1.0 (/root/work/swift-rust/crates/swift-core)
+   Compiling swift-memcache v0.1.0 (/root/work/swift-rust/crates/swift-memcache)
+   Compiling swift-http v0.1.0 (/root/work/swift-rust/crates/swift-http)
+   Compiling swift-middleware v0.1.0 (/root/work/swift-rust/crates/swift-middleware)
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib) generated 1 warning (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+   Compiling swift-s3api v0.1.0 (/root/work/swift-rust/crates/swift-s3api)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.65s
+     Running unittests src/lib.rs (target/debug/deps/swift_s3api-b9e631e5ebca47f1)
+
+running 2 tests
+test middleware::tests::unknown_ec2_key_without_client_still_invalid ... ok
+test middleware::tests::unknown_ec2_key_defers_to_s3token_client ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 64 filtered out; finished in 0.00s
+
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling swift-middleware v0.1.0 (/root/work/swift-rust/crates/swift-middleware)
+warning: `swift-middleware` (lib) generated 1 warning (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.24s
+     Running unittests src/lib.rs (target/debug/deps/swift_middleware-32f509423f8ef430)
+
+running 7 tests
+test s3token::tests::encode_s3tokens_token_urlsafe_b64 ... ok
+test s3token::tests::access_key_parse ... ok
+test s3token::tests::passthrough_without_s3_auth ... ok
+test s3token::tests::passthrough_when_only_amz_date_no_sts_header ... ok
+test s3token::tests::parse_s3tokens_json_body ... ok
+test s3token::tests::http_s3token_client_live_against_local_listener ... ok
+test s3token::tests::stamps_headers_on_exchange ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 352 filtered out; finished in 0.00s
+
+     Running tests/dlo_percent.rs (target/debug/deps/dlo_percent-6fd2610ffd2132d3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/slo_put_validation.rs (target/debug/deps/slo_put_validation-c837018b4eac74e8)
+   Compiling swift-core v0.1.0 (/root/work/swift-rust/crates/swift-core)
+   Compiling serde_derive v1.0.228
+   Compiling openssl v0.10.81
+   Compiling swift-memcache v0.1.0 (/root/work/swift-rust/crates/swift-memcache)
+   Compiling swift-http v0.1.0 (/root/work/swift-rust/crates/swift-http)
+   Compiling swift-diskfile v0.1.0 (/root/work/swift-rust/crates/swift-diskfile)
+   Compiling serde v1.0.228
+   Compiling swift-ring v0.1.0 (/root/work/swift-rust/crates/swift-ring)
+   Compiling native-tls v0.2.18
+   Compiling swift-middleware v0.1.0 (/root/work/swift-rust/crates/swift-middleware)
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling swift-db v0.1.0 (/root/work/swift-rust/crates/swift-db)
+   Compiling swift-object-server v0.1.0 (/root/work/swift-rust/crates/swift-object-server)
+   Compiling swift-s3api v0.1.0 (/root/work/swift-rust/crates/swift-s3api)
+   Compiling swift-proxy-server v0.1.0 (/root/work/swift-rust/crates/swift-proxy-server)
+   Compiling swift-account-server v0.1.0 (/root/work/swift-rust/crates/swift-account-server)
+   Compiling swift-container-server v0.1.0 (/root/work/swift-rust/crates/swift-container-server)
+warning: `swift-middleware` (lib) generated 1 warning (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16.82s
+     Running unittests src/main.rs (target/debug/deps/swift_proxy_server-ea4ae4b54374f7bc)
+
+running 2 tests
+test startup_policy_tests::pipeline_s3api_wires_ec2_s3token_deferral_when_auth_uri_set ... ok
+test startup_policy_tests::pipeline_s3api_wires_without_info_pollution ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+   Compiling swift-core v0.1.0 (/root/work/swift-rust/crates/swift-core)
+   Compiling swift-memcache v0.1.0 (/root/work/swift-rust/crates/swift-memcache)
+   Compiling swift-http v0.1.0 (/root/work/swift-rust/crates/swift-http)
+   Compiling swift-ring v0.1.0 (/root/work/swift-rust/crates/swift-ring)
+   Compiling swift-middleware v0.1.0 (/root/work/swift-rust/crates/swift-middleware)
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling swift-s3api v0.1.0 (/root/work/swift-rust/crates/swift-s3api)
+   Compiling swift-proxy-server v0.1.0 (/root/work/swift-rust/crates/swift-proxy-server)
+warning: `swift-middleware` (lib) generated 1 warning (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 26.68s
+target/release/swift-proxy-server: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=8bf73f978ab7f4cf94185948700ceda13afc0af9, not stripped
+325a28840e6bb20526d29d79afc8216c410c99bb6f6a6a512a7b4c1784495174  target/release/swift-proxy-server

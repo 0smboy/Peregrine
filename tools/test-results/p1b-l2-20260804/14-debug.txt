@@ -1,0 +1,29 @@
+TOK=AUTH_tkv1.3137383539... SURL=http://10.0.0.10:8085/v1/AUTH_test
+account HEAD: 502
+EC create: 201
+EC PUT body:
+HTTP/1.1 501 Not Implemented
+content-type: text/plain; charset=utf-8
+x-trans-id: tx677fdb4b7f91cb6800077-006a71f0d7
+x-openstack-request-id: tx677fdb4b7f91cb6800077-006a71f0d7
+content-length: 53
+
+body=erasure coding not built (compile with --features ec)
+quota oversize: 201
+after remove header: x-container-meta-quota-bytes: 5
+after empty value PUT oversize: 201
+symlink target: 201
+symlink link: HTTP/1.1 201 Created
+etag: "d41d8cd98f00b204e9800998ecf8427e"
+content-type: text/html; charset=UTF-8
+last-modified: Tue, 04 Aug 2026 14:02:02 GMT
+x-trans-id: tx1b4d059ce1259da900003-006a71f0d9
+symlink get: TGT
+10.0.0.1 obj=active
+400
+10.0.0.2 obj=active
+400
+10.0.0.3 obj=active
+400
+10.0.0.4 obj=active
+400

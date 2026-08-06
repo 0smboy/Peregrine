@@ -1,0 +1,14 @@
+=== VIP health 20260805T112142Z ===
+healthcheck=200
+info=200
+info_keys_sample ['account_quotas', 'bulk_delete', 'container_quotas', 'dlo', 'formpost', 'keystoneauth', 'slo', 'staticweb', 'swift', 'symlink', 'tempauth', 'tempurl']
+has_tempauth_section True
+swift 2.35.0
+tempauth_auth_v1_http=200
+tempauth_storage_url=http://10.0.0.10:8085/v1/AUTH_test
+tempauth_toklen=149
+tempauth_account_list=401
+keystone_token_http=201
+keystone_toklen=183
+keystone_AUTH_test=403
+NOTE: Keystone 403 on Swift path observed this cycle; TempAuth auth/v1.0 200 but account list 401 — VIP healthcheck still 200. Ring migrate deferred. Tokens redacted from evidence.

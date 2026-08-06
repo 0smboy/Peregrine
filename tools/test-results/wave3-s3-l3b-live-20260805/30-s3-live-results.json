@@ -1,0 +1,125 @@
+{
+  "base": "https://10.0.0.10:8085",
+  "results": [
+    {
+      "name": "vip_info_200",
+      "ok": true,
+      "detail": "http=200 keys=['account_quotas', 'bulk_delete', 'container_quotas', 'dlo', 'formpost', 'keystoneauth', 'slo', 'staticweb', 'swift', 'symlink', 'tempauth', 'tempurl', 'versioned_writes']"
+    },
+    {
+      "name": "info_no_s3api",
+      "ok": true,
+      "detail": "s3api_in_info=False"
+    },
+    {
+      "name": "info_tempauth_keystone",
+      "ok": true,
+      "detail": "tempauth/keystoneauth present"
+    },
+    {
+      "name": "tempauth",
+      "ok": true,
+      "detail": "http=200"
+    },
+    {
+      "name": "ListBuckets",
+      "ok": true,
+      "detail": "base=https://10.0.0.10:8085 http=200 body=b'<?xml version=\\'1.0\\' encoding=\\'UTF-8\\'?>\\n<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Owner><ID>test:tester</ID><DisplayName>test:test'"
+    },
+    {
+      "name": "CreateBucket",
+      "ok": true,
+      "detail": "http=200 body=b''"
+    },
+    {
+      "name": "PutObject",
+      "ok": true,
+      "detail": "http=200"
+    },
+    {
+      "name": "GetObject",
+      "ok": true,
+      "detail": "http=200 len=22"
+    },
+    {
+      "name": "ListObjectsV1",
+      "ok": true,
+      "detail": "http=200"
+    },
+    {
+      "name": "ListObjectsV2",
+      "ok": true,
+      "detail": "http=200 body=b'<?xml version=\\'1.0\\' encoding=\\'UTF-8\\'?>\\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>w3s3-1785'"
+    },
+    {
+      "name": "GetBucketLocation",
+      "ok": true,
+      "detail": "http=200 body=b'<?xml version=\\'1.0\\' encoding=\\'UTF-8\\'?>\\n<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">RegionOne</Lo'"
+    },
+    {
+      "name": "GetBucketCors",
+      "ok": true,
+      "detail": "http=200 (recorded)"
+    },
+    {
+      "name": "GetBucketAcl",
+      "ok": true,
+      "detail": "http=200 body=b'<?xml version=\\'1.0\\' encoding=\\'UTF-8\\'?>\\n<AccessControlPolicy xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Owner><ID>t'"
+    },
+    {
+      "name": "MultiDelete",
+      "ok": true,
+      "detail": "http=200 body=b'<?xml version=\\'1.0\\' encoding=\\'UTF-8\\'?>\\n<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Deleted><Key>obj1.txt</Key></Deleted></DeleteResult>'"
+    },
+    {
+      "name": "CreateMultipartUpload",
+      "ok": true,
+      "detail": "http=200 upload_id=000000000000000018c8e0cd16d4f4a4"
+    },
+    {
+      "name": "UploadPart",
+      "ok": true,
+      "detail": "http=200 etag=\"355d8d63cd342edc051d3683bc623c4c\""
+    },
+    {
+      "name": "ListParts",
+      "ok": true,
+      "detail": "http=200"
+    },
+    {
+      "name": "ListMultipartUploads",
+      "ok": true,
+      "detail": "http=200 body=b'<?xml version=\\'1.0\\' encoding=\\'UTF-8\\'?>\\n<ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>w3s3-1785924409</Bucket><Prefix></Prefix><KeyMarker></Key'"
+    },
+    {
+      "name": "AbortMultipartUpload",
+      "ok": true,
+      "detail": "http=204"
+    },
+    {
+      "name": "DeleteBucket",
+      "ok": true,
+      "detail": "http=204"
+    },
+    {
+      "name": "keystone_admin_token",
+      "ok": true,
+      "detail": "http=201"
+    },
+    {
+      "name": "keystone_test_user",
+      "ok": false,
+      "detail": "users={'users': [], 'links': {'next': None, 'self': 'http://127.0.0.1:5001/v3/users?name=test', 'previous': None}}"
+    },
+    {
+      "name": "keystone_s3tokens_live",
+      "ok": false,
+      "detail": "no ec2 creds"
+    },
+    {
+      "name": "l3b_info_no_false_shard_claim",
+      "ok": true,
+      "detail": "container_sharding in info=False; not claiming multi-node quorum this cycle without suite"
+    }
+  ]
+}

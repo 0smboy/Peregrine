@@ -1,0 +1,12 @@
+swift1
+da5ab2f1818c828577a522497a7a3d461c32d6840a1b465ca43e45551a40fc79  /usr/local/bin/swift-proxy-server
+5bc9aa465df345aac416645ec7e1455196c3543e555b955e544a0733742e82aa  /usr/local/bin/swift-object-server
+swift2
+da5ab2f1818c828577a522497a7a3d461c32d6840a1b465ca43e45551a40fc79  /usr/local/bin/swift-proxy-server
+5bc9aa465df345aac416645ec7e1455196c3543e555b955e544a0733742e82aa  /usr/local/bin/swift-object-server
+swift3
+da5ab2f1818c828577a522497a7a3d461c32d6840a1b465ca43e45551a40fc79  /usr/local/bin/swift-proxy-server
+5bc9aa465df345aac416645ec7e1455196c3543e555b955e544a0733742e82aa  /usr/local/bin/swift-object-server
+swift4
+da5ab2f1818c828577a522497a7a3d461c32d6840a1b465ca43e45551a40fc79  /usr/local/bin/swift-proxy-server
+5bc9aa465df345aac416645ec7e1455196c3543e555b955e544a0733742e82aa  /usr/local/bin/swift-object-server

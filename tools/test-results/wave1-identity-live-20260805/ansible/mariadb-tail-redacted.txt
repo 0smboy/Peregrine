@@ -1,0 +1,30 @@
+skipping: [169.58.108.87] => (item=localhost) 
+skipping: [169.58.108.87] => (item=127.0.0.1) 
+skipping: [169.58.108.87]
+ok: [169.58.108.85] => (item=localhost)
+changed: [169.58.108.85] => (item=127.0.0.1)
+
+TASK [mariadb_servers : Disabling anonymous access] ****************************
+skipping: [169.58.108.86]
+skipping: [169.58.108.87]
+ok: [169.58.108.85]
+
+TASK [mariadb_servers : Stoping mariadb service] *******************************
+changed: [169.58.108.85]
+changed: [169.58.108.87]
+changed: [169.58.108.86]
+
+TASK [mariadb_servers : Starting mariadb service on mariadb master node] *******
+skipping: [169.58.108.86]
+skipping: [169.58.108.87]
+fatal: [169.58.108.85]: FAILED! => {"changed": false, "cmd": "galera_new_cluster", "msg": "[Errno 2] No such file or directory: b'galera_new_cluster'", "rc": 2, "stderr": "", "stderr_lines": [], "stdout": "", "stdout_lines": []}
+
+TASK [mariadb_servers : Syncing other nodes to the mariadb master node] ********
+fatal: [169.58.108.87]: FAILED! => {"changed": true, "cmd": ["systemctl", "start", "mariadb"], "delta": "0:00:37.049694", "end": "2026-08-05 09:30:45.351190", "msg": "non-zero return code", "rc": 1, "start": "2026-08-05 09:30:08.301496", "stderr": "Job for mariadb.service failed because the control process exited with error code.\nSee \"systemctl status mariadb.service\" and \"journalctl -xeu mariadb.service\" for details.", "stderr_lines": ["Job for mariadb.service failed because the control process exited with error code.", "See \"systemctl status mariadb.service\" and \"journalctl -xeu mariadb.service\" for details."], "stdout": "", "stdout_lines": []}
+fatal: [169.58.108.86]: FAILED! => {"changed": true, "cmd": ["systemctl", "start", "mariadb"], "delta": "0:00:36.918375", "end": "2026-08-05 09:30:46.176970", "msg": "non-zero return code", "rc": 1, "start": "2026-08-05 09:30:09.258595", "stderr": "Job for mariadb.service failed because the control process exited with error code.\nSee \"systemctl status mariadb.service\" and \"journalctl -xeu mariadb.service\" for details.", "stderr_lines": ["Job for mariadb.service failed because the control process exited with error code.", "See \"systemctl status mariadb.service\" and \"journalctl -xeu mariadb.service\" for details."], "stdout": "", "stdout_lines": []}
+
+PLAY RECAP *********************************************************************
+169.58.108.85              : ok=17   changed=15   unreachable=0    failed=1    skipped=0    rescued=0    ignored=0   
+169.58.108.86              : ok=13   changed=12   unreachable=0    failed=1    skipped=5    rescued=0    ignored=0   
+169.58.108.87              : ok=13   changed=12   unreachable=0    failed=1    skipped=5    rescued=0    ignored=0   
+

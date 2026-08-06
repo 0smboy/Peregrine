@@ -1,0 +1,38 @@
+{
+  "captured_utc": "2026-08-05T09:22:57Z",
+  "rule": "Use%<70 AND MemAvailable>=3GiB",
+  "pass": true,
+  "nodes": [
+    {
+      "host": "swift1",
+      "disk_use_pct": [
+        2,
+        2,
+        2
+      ],
+      "mem_available_bytes": 5360992256,
+      "mem_available_gib": 4.99
+    },
+    {
+      "host": "swift2",
+      "disk_use_pct": [
+        2,
+        2,
+        2
+      ],
+      "mem_available_bytes": 5231554560,
+      "mem_available_gib": 4.87
+    },
+    {
+      "host": "swift3",
+      "disk_use_pct": [
+        2,
+        2,
+        2
+      ],
+      "mem_available_bytes": 5196156928,
+      "mem_available_gib": 4.84
+    }
+  ],
+  "verdict": "PASS"
+}

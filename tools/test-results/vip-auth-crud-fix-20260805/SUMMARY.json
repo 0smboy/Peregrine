@@ -1,0 +1,41 @@
+{
+  "pack": "vip-auth-crud-fix-20260805",
+  "utc": "2026-08-05T11:35:07Z",
+  "verdict": "GREEN",
+  "production_go_live": "NOT_CLAIMED",
+  "vip": "https://10.0.0.10:8085",
+  "keystone": "https://10.0.0.10:5000",
+  "before": {
+    "tempauth_auth": 200,
+    "tempauth_list": 401,
+    "keystone_token": 201,
+    "keystone_AUTH_test": 403,
+    "keystone_AUTH_project_crud": "PASS (already green; probe used wrong account)"
+  },
+  "after": {
+    "tempauth_crud": "PASS",
+    "keystone_crud": "PASS",
+    "keystone_cross_tenant_AUTH_test": 403,
+    "bogus_token": 401
+  },
+  "root_causes": [
+    {
+      "symptom": "Keystone Swift 403 on AUTH_test",
+      "cause": "client/probe used TempAuth account name; correct is AUTH_<project_id>",
+      "fix": "document + Keystone client path using project UUID"
+    },
+    {
+      "symptom": "TempAuth list 401",
+      "cause": "keystoneauth stamped X-Backend-Auth-Plugin:keystone for all AUTH_* without identity",
+      "fix": "stamp Auth-Plugin only when Keystone identity Confirmed"
+    }
+  ],
+  "proxy_sha256": "657e07439cde3520e83dd1bb47bf0f130120e532d39fda53a2925a0d938c2f77",
+  "code_change": "swift-rust/crates/swift-middleware/src/keystoneauth.rs",
+  "evidence": {
+    "before": "before/01-probe-raw.txt",
+    "after": "after/01-probe-raw.txt",
+    "report": "VIP-AUTH-CRUD-REPORT.html"
+  },
+  "not_done": ["ring migrate", "Python install", "mkfs", "PRODUCTION-GO-LIVE"]
+}

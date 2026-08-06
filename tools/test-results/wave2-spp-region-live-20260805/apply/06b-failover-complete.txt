@@ -1,0 +1,37 @@
+=== FAILOVER 2026-08-05T10:14:48Z ===
+swift1: swift1
+no_vip
+active
+swift2: swift2
+    inet 10.0.0.10/22 scope global secondary eth1
+active
+swift3: swift3
+no_vip
+active
+swift4: swift4
+no_vip
+active
+MASTER=swift2
+KTOK_LEN=183
+mkcont=201
+seed=201
+Stopping keepalived on swift2
+vip_left
+after swift1: 1
+swift1
+after swift2: 0
+swift2
+after swift3: 0
+swift3
+after swift4: 0
+swift4
+vip_hc=200
+fo_put=201
+fo_get=200 body=during
+seed_get=200 body=seed
+Restarting keepalived on swift2
+final swift1: vip=1 ka=active
+final swift2: vip=0 ka=active
+final swift3: vip=0 ka=active
+final swift4: vip=0 ka=active
+vip_hc2=200

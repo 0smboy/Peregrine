@@ -1,0 +1,10 @@
+token_len=149 storage=http://10.0.0.10:8085/v1/AUTH_test
+PUT_cont 201
+PUT_obj 201
+GET body=hello-p3-newest code=200
+GET_newest body=hello-p3-newest code=200
+HTTP/1.1 204 No Content
+x-container-object-count: 1
+x-container-bytes-used: 15
+x-timestamp: 1785857941.91801
+SMOKE_DONE

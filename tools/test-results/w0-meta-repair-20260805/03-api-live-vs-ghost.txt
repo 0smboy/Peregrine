@@ -1,0 +1,5 @@
+listed 968
+HEAD_ok 5 HEAD_404 963 other 0
+LIVE_SAMPLE [('p1b-21784', '?', 200), ('p1b-28970', '?', 200), ('p1b-4164', '?', 200), ('p1b-4803', '?', 200), ('wave0-probe-put', '0', 204)]
+OTHER_SAMPLE []
+ACCOUNT {'x-account-container-count': '968', 'x-account-object-count': '846331', 'x-account-bytes-used': '176797386545', 'x-account-storage-policy-policy-0-container-count': '962', 'x-account-storage-policy-policy-0-object-count': '846316', 'x-account-storage-policy-policy-0-bytes-used': '176792143438', 'x-account-storage-policy-ec-2-1-container-count': '6', 'x-account-storage-policy-ec-2-1-object-count': '15', 'x-account-storage-policy-ec-2-1-bytes-used': '5243107', 'x-account-meta-temp-url-key': 'p1b-form-key', 'x-account-access-control': '{}'}

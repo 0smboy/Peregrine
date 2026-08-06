@@ -1,0 +1,5 @@
+Contabo S3 gate @ 2026-08-05T07:42:21Z
+VIP=http://10.0.0.10:8085
+curl: (52) Empty reply from server
+GET http://10.0.0.10:8085/info → HTTP 000
+VERDICT=BLOCKED reason=cluster_unhealthy (info not 200)

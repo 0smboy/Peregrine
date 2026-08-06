@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Wave 3 — S3 + L3b</title>
+<style>
+  body{font-family:ui-sans-serif,system-ui,sans-serif;margin:2rem;max-width:960px;color:#1a1a1a;background:#faf9f7}
+  h1{font-size:1.5rem;margin:0 0 .5rem}
+  .meta{color:#555;margin-bottom:1.5rem}
+  table{border-collapse:collapse;width:100%;margin:1rem 0}
+  th,td{border:1px solid #ccc;padding:.45rem .6rem;text-align:left;font-size:.9rem}
+  th{background:#eee}
+  .pass{color:#0a6}.partial{color:#a60}.backlog{color:#666}
+  code{font-size:.85em}
+  section{margin:1.5rem 0}
+</style>
+</head>
+<body>
+<h1>Wave 3 — S3 + L3b sharding</h1>
+<p class="meta">2026-08-05 · Verdict: <strong class="partial">PARTIAL GREEN</strong> · Evidence: <code>tools/test-results/wave3-s3-l3b-20260805/</code></p>
+
+<section>
+<h2>1. What this cycle did</h2>
+<ul>
+  <li>S3: MultiDelete, ListObjectsV2, MPU (segments+SLO), ACL/CORS basics, s3token hooks</li>
+  <li>L3b: CleavingContext sysmeta persist, auto_shard gate, misplaced local pass, ShardReplicator trait, proxy listing fan-out</li>
+  <li>Extended <code>S3-COMPAT-MATRIX.md</code>; cargo unit evidence captured</li>
+</ul>
+</section>
+
+<section>
+<h2>2. Optimized / fixed</h2>
+<ul>
+  <li>Closed prior NotImplemented residuals for delete / list-type=2 / MPU / ACL·CORS (unit surface)</li>
+  <li>Sharder no longer in-memory-only for cleave cursor</li>
+</ul>
+</section>
+
+<section>
+<h2>3. Measured effect</h2>
+<table>
+  <tr><th>Suite</th><th>Before (p3-*-20260804)</th><th>After</th></tr>
+  <tr><td>swift-s3api</td><td>47/47 minimal</td><td class="pass">61/61 Wave 3 surface</td></tr>
+  <tr><td>sharder lib</td><td>4–5 local cleave</td><td class="pass">7/7 (+persist, auto_shard)</td></tr>
+  <tr><td>s3token</td><td>—</td><td class="pass">3/3</td></tr>
+  <tr><td>Contabo VIP S3 / L3b perf</td><td>Not run</td><td class="backlog">Still not run</td></tr>
+</table>
+</section>
+
+<section>
+<h2>4. Gate tables</h2>
+<h3>S3</h3>
+<table>
+  <tr><th>Op</th><th>Result</th></tr>
+  <tr><td>CRUD + SigV4 + List v1</td><td class="pass">PASS</td></tr>
+  <tr><td>ListObjectsV2</td><td class="pass">PASS</td></tr>
+  <tr><td>MultiDelete</td><td class="pass">PASS</td></tr>
+  <tr><td>MPU initiate/part/complete/abort</td><td class="pass">PASS</td></tr>
+  <tr><td>ACL/CORS basics</td><td class="pass">PASS</td></tr>
+  <tr><td>ListMultipartUploads</td><td class="partial">501 residual</td></tr>
+  <tr><td>s3token live Keystone</td><td class="partial">hooks + stub HTTP</td></tr>
+  <tr><td>Contabo VIP pipeline</td><td class="backlog">Not run</td></tr>
+</table>
+<h3>L3b</h3>
+<table>
+  <tr><th>Piece</th><th>Result</th></tr>
+  <tr><td>CleavingContext persist</td><td class="pass">PASS (unit)</td></tr>
+  <tr><td>Proxy fan-out</td><td class="partial">CODE (no live drill)</td></tr>
+  <tr><td>HTTP shard replicate</td><td class="partial">Local stub + trait</td></tr>
+  <tr><td>Misplaced</td><td class="partial">Local path</td></tr>
+  <tr><td>auto_shard</td><td class="pass">PASS (unit gate)</td></tr>
+  <tr><td>4KB KEEP claim</td><td class="backlog">Not claimed</td></tr>
+</table>
+</section>
+
+<section>
+<h2>5. Remaining / next</h2>
+<p><strong>FROZEN:</strong> false GREEN / Contabo wipe. <strong>Backlog:</strong> Contabo ON-BY-CONFIG s3api; live Keystone s3tokens (Wave 1); multi-node shard quorum; proxy fan-out integration; ListMultipartUploads store.</p>
+<p>Full matrix: <a href="S3-COMPAT-MATRIX.md">S3-COMPAT-MATRIX.md</a> · <a href="SUMMARY.md">SUMMARY.md</a></p>
+</section>
+</body>
+</html>

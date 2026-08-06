@@ -32,6 +32,7 @@ fn rust_stack_workspace_generates_tempauth_group_vars_without_keystone_files() {
     assert_eq!(compiled["swift_tempauth_users"][0]["admin"], true);
     assert_eq!(compiled["proxy_bind_port"], 8080);
     assert_eq!(compiled["object_bind_port"], 6200);
+    assert_eq!(compiled["object_port_per_device"], true);
     assert_eq!(compiled["srv_node_root"], "/srv/node");
     assert_eq!(
         compiled["ring_fetch_dir"], "/var/lib/swift-deploy/rings/rocky9-rust-tempauth",
@@ -198,17 +199,16 @@ fn rust_stack_rejects_keystone_or_mariadb_roles() {
 }
 
 #[test]
-fn rust_stack_rejects_keepalived_ingress_and_unknown_stacks() {
-    let mut keepalived = rust_request();
-    keepalived.ingress.mode = "keepalived".to_owned();
+fn rust_stack_accepts_keepalived_ingress_and_rejects_unknown_stacks() {
+    let keepalived = rust_keepalived_request();
     let report = keepalived.validate();
-    assert!(!report.valid);
     assert!(
-        report
-            .errors
-            .iter()
-            .any(|issue| { issue.field == "ingress.mode" && issue.message.contains("Keepalived") })
+        report.valid,
+        "rust keepalived ingress should validate: {:#?}",
+        report.errors
     );
+    assert_eq!(keepalived.ingress.mode, "keepalived");
+    assert_eq!(keepalived.ingress.auth_url_ip, "10.88.20.100");
 
     let mut unknown = rust_request();
     unknown.stack = "go".to_owned();
@@ -289,7 +289,7 @@ fn rust_stack_erasure_coding_requires_enough_object_devices() {
 
 #[test]
 fn rust_stack_rejects_custom_disks() {
-    // rust v1 deploys directory devices only; a data-disk list must fail
+    // rust stack deploys directory devices only; a data-disk list must fail
     // closed so no rust plan ever carries the disk_wipe capability.
     let mut request = rust_request();
     request.nodes[0].disks = vec!["/dev/sdb".to_owned()];
@@ -302,6 +302,89 @@ fn rust_stack_rejects_custom_disks() {
             .iter()
             .any(|issue| issue.field == "nodes[0].disks" && issue.message.contains("目录设备"))
     );
+}
+
+#[test]
+fn rust_stack_allows_https_on_haproxy_and_emits_region_devices() {
+    // P3-ops: HAProxy TLS termination is valid for rust TempAuth; direct+https is not.
+    let mut https = rust_keepalived_request();
+    https.ingress.http_mode = "https".to_owned();
+    https.nodes[0].swift_devices = vec!["d1".to_owned(), "d2".to_owned()];
+    https.nodes[0].region = 2;
+    https.nodes[0].zone = 9;
+    let report = https.validate();
+    assert!(report.valid, "{:#?}", report.errors);
+
+    let mut direct_https = rust_request();
+    direct_https.ingress.http_mode = "https".to_owned();
+    let report = direct_https.validate();
+    assert!(report.errors.iter().any(|issue| {
+        issue.field == "ingress.http_mode" && issue.message.contains("direct")
+    }));
+
+    let root = tempdir().expect("workspace root");
+    let bundle = rust_fixture_bundle(root.path());
+    let generated = https
+        .generate(&bundle, root.path().join("projects"))
+        .expect("generate rust https workspace");
+    let all = fs::read_to_string(generated.project_root.join("group_vars/all"))
+        .expect("read group_vars/all");
+    let compiled: serde_json::Value =
+        serde_yaml_ng::from_str(&all).expect("parse group_vars/all");
+    assert_eq!(compiled["lb_mode"], "https");
+    assert_eq!(compiled["haproxy_tls_self_signed"], true);
+    assert_eq!(compiled["haproxy_tls_pem"], "/etc/haproxy/haproxyCA.pem");
+    assert_eq!(compiled["ring_expand"], false);
+    assert_eq!(compiled["ring_force_rebuild"], false);
+
+    let host_vars = fs::read_to_string(generated.project_root.join("host_vars/10.88.0.11.yml"))
+        .expect("read host_vars");
+    assert!(host_vars.contains("region: 2"), "{host_vars}");
+    assert!(host_vars.contains("zone: 9"), "{host_vars}");
+    assert!(host_vars.contains("- d1"), "{host_vars}");
+    assert!(host_vars.contains("- d2"), "{host_vars}");
+}
+
+#[test]
+fn rust_stack_rejects_unsafe_swift_devices() {
+    let mut request = rust_request();
+    request.nodes[0].swift_devices = vec!["../etc".to_owned()];
+    let report = request.validate();
+    assert!(!report.valid);
+    assert!(report.errors.iter().any(|issue| {
+        issue.field == "nodes[0].swift_devices[0]" && issue.message.contains("基名")
+    }));
+}
+
+#[test]
+fn wave2_build_rings_template_has_per_device_object_ports() {
+    // Contract: d1→object_bind_port, d2→+1, … when object_port_per_device (default true).
+    let template = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("bundle-rust/roles/rust_rings/templates/build_rings.sh.j2");
+    let text = fs::read_to_string(&template).expect("read build_rings.sh.j2");
+    assert!(
+        text.contains("object_port_per_device"),
+        "template must honor object_port_per_device"
+    );
+    assert!(
+        text.contains("object_bind_port | int) + ((loop.index0)"),
+        "greenfield object add must offset port by device index: {text}"
+    );
+    assert!(
+        text.contains("object_port_for_index"),
+        "expand path must use object_port_for_index helper"
+    );
+}
+
+#[test]
+fn wave2_multi_region_sample_host_vars_cover_r1_and_r2() {
+    let hv = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bundle-rust/config_sample/host_vars");
+    let r1z1 = fs::read_to_string(hv.join("10.0.0.11.yml")).expect("11");
+    let r2z1 = fs::read_to_string(hv.join("10.0.0.13.yml")).expect("13");
+    let r2z2 = fs::read_to_string(hv.join("10.0.0.14.yml")).expect("14");
+    assert!(r1z1.contains("region: 1"));
+    assert!(r2z1.contains("region: 2") && r2z1.contains("zone: 1"), "{r2z1}");
+    assert!(r2z2.contains("region: 2") && r2z2.contains("zone: 2"), "{r2z2}");
 }
 
 #[test]
@@ -440,6 +523,24 @@ fn rust_request() -> WorkspaceRequest {
     }
 }
 
+fn rust_keepalived_request() -> WorkspaceRequest {
+    let mut request = rust_request();
+    request.ingress.mode = "keepalived".to_owned();
+    request.ingress.auth_url_ip = "10.88.20.100".to_owned();
+    request.ingress.vip_prefix = 24;
+    request.ingress.virtual_router_id = 51;
+    request.ingress.vrrp_auth_pass = "vrrpPass".to_owned();
+    request.auth.haproxy_stats_user = "admin".to_owned();
+    request.auth.haproxy_stats_password = "Stats-Pass-9xQ4".to_owned();
+    for (index, node) in request.nodes.iter_mut().enumerate() {
+        node.roles.push("haproxy".to_owned());
+        node.roles.push("keepalived".to_owned());
+        node.keepalived_interface = "eth1".to_owned();
+        node.keepalived_priority = Some(140 - (index as u16 * 10));
+    }
+    request
+}
+
 fn rust_node(
     name: &str,
     management_ip: &str,
@@ -478,6 +579,7 @@ fn rust_node(
         disk_type: "hdd".to_owned(),
         system_disk,
         disks: disks.into_iter().map(str::to_owned).collect(),
+        swift_devices: Vec::new(),
         keepalived_interface: String::new(),
         keepalived_priority: None,
     }

@@ -1,0 +1,32 @@
+{
+  "container_zero": {
+    "container_dbs_seen": 983,
+    "live_rows_marked": 650926,
+    "vacuumed": 702,
+    "errors": [],
+    "mode": "APPLY"
+  },
+  "account_zero": {
+    "account_dbs_seen": 3,
+    "live_rows_marked": 1014,
+    "vacuumed": 3,
+    "errors": [],
+    "mode": "APPLY"
+  }
+}
+{
+  "container_zero": {
+    "container_dbs_seen": 983,
+    "live_rows_marked": 650926,
+    "vacuumed": 702,
+    "errors": [],
+    "mode": "APPLY"
+  },
+  "account_zero": {
+    "account_dbs_seen": 3,
+    "live_rows_marked": 1014,
+    "vacuumed": 3,
+    "errors": [],
+    "mode": "APPLY"
+  }
+}

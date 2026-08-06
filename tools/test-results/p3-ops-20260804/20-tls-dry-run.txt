@@ -1,0 +1,10 @@
+HTTPS_BIND_PRESENT True
+--- rendered fragment ---
+frontend swift_proxy_front
+    # bind * so VIP (keepalived) and node IP both accept traffic once
+    # net.ipv4.ip_nonlocal_bind=1 is set by rust_keepalived.
+    bind *:8085 ssl crt /etc/haproxy/haproxyCA.pem
+    # http form:     bind *:8085
+    bind *:1080
+CONTABO_LIVE_TLS=NOT_APPLIED reason=no_operator_pem lab_stays_http_8085
+DRY_RUN_TLS_PLAN=PASS

@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>P1c Debt Clear — GREEN</title>
+<style>
+  :root { --ink:#1a1a1a; --ok:#1b6b3a; --warn:#8a6d1b; --bg:#f7f5f1; --card:#fff; }
+  body { font-family: ui-sans-serif, system-ui, sans-serif; margin:0; background:var(--bg); color:var(--ink); }
+  main { max-width: 920px; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+  h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
+  .sub { color:#555; margin-bottom: 1.5rem; }
+  .badge { display:inline-block; padding:.2rem .55rem; background:var(--ok); color:#fff; font-weight:600; font-size:.85rem; }
+  table { width:100%; border-collapse: collapse; background:var(--card); margin:1rem 0 1.5rem; }
+  th, td { text-align:left; padding:.55rem .7rem; border-bottom:1px solid #e5e1da; vertical-align:top; }
+  th { font-size:.75rem; text-transform:uppercase; letter-spacing:.04em; color:#666; }
+  .pass { color:var(--ok); font-weight:600; }
+  .warn { color:var(--warn); }
+  code { font-family: ui-monospace, Menlo, monospace; font-size:.88em; background:#eee; padding:.05em .3em; }
+  ul { line-height:1.45; }
+  section { margin-bottom: 1.75rem; }
+</style>
+</head>
+<body>
+<main>
+  <p><span class="badge">GREEN</span></p>
+  <h1>P1c — Already-claimed CORE/L2 debt clear</h1>
+  <p class="sub">2026-08-04 · Contabo VIP <code>http://10.0.0.10:8085</code> · no <code>/srv/node</code> wipe · P2 not started</p>
+
+  <section>
+    <h2>1. What this cycle did</h2>
+    <ul>
+      <li><strong>SLO</strong> — nested <code>sub_slo</code> GET (depth ≤ 10); lazy leaf streaming; ranged GET via per-segment <code>Range</code>; HEAD from <code>X-Object-Sysmeta-Slo-*</code>; <code>multipart-manifest=get&amp;format=raw</code>.</li>
+      <li><strong>Copy</strong> — manifest-aware <code>?multipart-manifest=get</code> (SLO→put, DLO→<code>X-Object-Manifest</code>).</li>
+      <li><strong>ACL / TempAuth</strong> — shared memcache info-cache L2 (reads skip process-local L1 when memcache configured); container-server implements <code>X-Remove-Container-*</code> → empty-value clear.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>2. Optimized / fixed / demoted</h2>
+    <table>
+      <tr><th>Item</th><th>Before</th><th>After</th></tr>
+      <tr><td>Nested SLO GET</td><td>409 / Deferred</td><td>Expand + stream leaves</td></tr>
+      <tr><td>SLO ranged GET</td><td>Whole-object buffer</td><td>Per-segment Range subrequests</td></tr>
+      <tr><td>SLO HEAD</td><td>Physical manifest CL/etag</td><td>Sysmeta aggregate etag/size</td></tr>
+      <tr><td>Manifest copy</td><td>Internal JSON → 400 on put</td><td><code>format=raw</code> client schema</td></tr>
+      <tr><td>ACL across VIP</td><td>Per-proxy L1 lag (P1a residual)</td><td>Shared memcache L2 authoritative</td></tr>
+      <tr><td>ACL revoke</td><td><code>X-Remove-Container-*</code> ignored on container</td><td>Translate to empty ACL + cache clear</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>3. Measured effect</h2>
+    <table>
+      <tr><th>Metric</th><th>Value</th></tr>
+      <tr><td>P1c specialty suite (VIP)</td><td class="pass">28/28</td></tr>
+      <tr><td>CORE-PATH func-suite (VIP)</td><td class="pass">54/54</td></tr>
+      <tr><td>ACL revoke via VIP</td><td class="pass">6/6 denied after revoke</td></tr>
+      <tr><td>ACL failover smoke (stop proxy on .2 during revoke)</td><td class="pass">8/8 deny while down · 6/6 after restart</td></tr>
+      <tr><td>Proxy binary (ec)</td><td><code>ed1e66aa9bf2c68fb767a61864fe54e3</code></td></tr>
+      <tr><td>Container binary</td><td><code>d563d9a84b8aa7f44a3d3ff72c9c3421</code></td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>4. Gate table</h2>
+    <table>
+      <tr><th>Gate</th><th>Result</th><th>Path</th></tr>
+      <tr><td>Unit (container remove + SLO/copy/info-cache)</td><td class="pass">PASS</td><td><code>04b-build.txt</code></td></tr>
+      <tr><td>Deploy 4 nodes</td><td class="pass">PASS</td><td><code>05b-deploy.txt</code></td></tr>
+      <tr><td>P1c specialty VIP</td><td class="pass">28/28</td><td><code>20-gates-rerun.txt</code></td></tr>
+      <tr><td>func-suite VIP</td><td class="pass">54/54</td><td><code>20-gates-rerun.txt</code></td></tr>
+      <tr><td>ACL failover smoke</td><td class="pass">PASS</td><td><code>21-acl-failover-smoke.txt</code></td></tr>
+      <tr><td>Contracts</td><td class="pass">DONE</td><td>ROADMAP / CONTRACTS / blocked / CONFIG-PARITY</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>5. Remaining / next cycle</h2>
+    <p><strong>FROZEN for P1c (wontfix this wave — do not claim):</strong></p>
+    <ul>
+      <li>SLO inline <code>{"data":…}</code> PUT segments, heartbeat PUT, <code>multipart-manifest=delete</code></li>
+      <li>DLO multi-page listing beyond single <code>CONTAINER_LISTING_LIMIT</code> page</li>
+      <li>Copy sync-key propagation</li>
+      <li>P1b smaller-filter specialty residual; <code>bulk_upload</code> still wontfix</li>
+    </ul>
+    <p><strong>Backlog (next wave = P2a):</strong> object-expirer / account-reaper / container-reconciler / container-updater into payload+systemd. Do not start until this GREEN holds.</p>
+  </section>
+
+  <section>
+    <h2>Evidence root</h2>
+    <p><code>tools/test-results/p1c-debt-20260804/</code></p>
+  </section>
+</main>
+</body>
+</html>

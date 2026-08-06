@@ -1,0 +1,18 @@
+[Unit]
+Description=Prometheus Node Exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Contabo lab currently runs node_exporter as root on :9100 (all interfaces).
+# Keep listen address stable; enable textfile collector for swift-recon export.
+ExecStartPre=/bin/mkdir -p /var/lib/node_exporter/textfile_collector
+ExecStart=/usr/local/bin/node_exporter \
+  --web.listen-address=:9100 \
+  --collector.textfile.directory=/var/lib/node_exporter/textfile_collector
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

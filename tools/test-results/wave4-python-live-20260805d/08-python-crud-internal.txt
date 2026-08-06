@@ -1,0 +1,29 @@
+=== PYTHON CRUD internal 20260805T121028Z ===
+---- 10.0.0.2:8090 ----
+healthcheck=200
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=UTF-8
+X-Auth-Token: AUTH_tkREDACTED
+X-Storage-Token: AUTH_tkREDACTED
+X-Auth-Token-Expires: 70291
+toklen=39
+CRUD 201/201/200/204/204 body=hello-py-10.0.0.2
+---- 10.0.0.3:8090 ----
+healthcheck=200
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=UTF-8
+X-Auth-Token: AUTH_tkREDACTED
+X-Storage-Token: AUTH_tkREDACTED
+X-Auth-Token-Expires: 86399
+toklen=39
+CRUD 201/201/200/204/204 body=hello-py-10.0.0.3
+---- 10.0.0.4:8090 ----
+healthcheck=200
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=UTF-8
+X-Auth-Token: AUTH_tkREDACTED
+X-Storage-Token: AUTH_tkREDACTED
+X-Auth-Token-Expires: 86399
+toklen=39
+CRUD 201/201/200/204/204 body=hello-py-10.0.0.4
+PYTHON_CRUD_PASS=1

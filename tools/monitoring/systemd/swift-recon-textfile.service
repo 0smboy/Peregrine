@@ -1,0 +1,16 @@
+[Unit]
+Description=Export Swift tombstone/dbspace metrics to node_exporter textfile
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Environment=TEXTFILE_DIR=/var/lib/node_exporter/textfile_collector
+Environment=DEVICES_ROOT=/srv/node
+# Wrapper keeps quoting sane under systemd; also emits tombstone zeros when
+# the Contabo swift-recon binary omits empty buckets (pre zero-series fix).
+ExecStart=/usr/local/libexec/swift-recon-textfile.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

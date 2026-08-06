@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Wave 3 S3/L3b PRODUCTION stop-line — 2026-08-05</title>
+<style>
+  :root { --bg:#141210; --ink:#ebe4d8; --muted:#9a9080; --ok:#6a9a6a; --partial:#c4a35a; --bad:#b86a5a; --line:#2a2620; }
+  body { margin:0; font:15px/1.45 ui-sans-serif, system-ui, sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width:920px; margin:0 auto; padding:32px 28px 64px; }
+  h1 { font-size:1.55rem; font-weight:650; margin:0 0 8px; letter-spacing:-0.02em; }
+  h2 { font-size:1.05rem; margin:28px 0 10px; color:var(--muted); font-weight:600; }
+  .verdict { display:inline-block; padding:4px 10px; border:1px solid var(--partial); color:var(--partial); border-radius:4px; font-weight:600; }
+  p, li { color:var(--ink); }
+  .muted { color:var(--muted); }
+  table { width:100%; border-collapse:collapse; margin:12px 0 8px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:550; font-size:0.85rem; }
+  .ok { color:var(--ok); } .partial { color:var(--partial); } .bad { color:var(--bad); }
+  code { font:13px/1.35 ui-monospace, Menlo, monospace; }
+  a { color:#c8b89a; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Wave 3 — S3 + L3b PRODUCTION stop-line</h1>
+  <p class="muted">2026-08-05 · todo <code>w3-s3-l3b-live</code> · evidence
+    <code>tools/test-results/wave3-s3-l3b-prod-20260805/</code></p>
+  <p><span class="verdict">PARTIAL</span>
+    Unit stop-line green; Contabo live blocked. Not PRODUCTION-GO-LIVE. No 4KB KEEP claim.</p>
+
+  <h2>1) What this cycle did</h2>
+  <ul>
+    <li>Implemented <strong>ListMultipartUploads</strong> (markers under <code>{bucket}+segments</code>; no longer 501).</li>
+    <li>Wired live-ready <strong>HttpS3TokenClient</strong> (real HTTP(S) to Keystone <code>/v3/s3tokens</code>).</li>
+    <li>L3b: <strong>HttpShardReplicator</strong> with quorum; misplaced + auto_shard unit gates; proxy fan-out helpers tested.</li>
+    <li>Docs + suite: <code>S3-ON-BY-CONFIG.md</code>, <code>wave3-s3-unit-suite.sh</code>, <code>wave3-s3-contabo-gate.sh</code>.</li>
+    <li>SigV2 / aws-chunked / versioning → written <strong>WONTFIX</strong>.</li>
+  </ul>
+
+  <h2>2) Optimized / fixed / demoted</h2>
+  <table>
+    <tr><th>Item</th><th>Change</th></tr>
+    <tr><td>ListMultipartUploads</td><td class="ok">501 → implemented</td></tr>
+    <tr><td>s3token HTTP</td><td class="ok">stub → live Tcp/TLS client</td></tr>
+    <tr><td>Shard replicate</td><td class="ok">Local-only → HttpShardReplicator + quorum unit</td></tr>
+    <tr><td>Proxy fan-out</td><td class="ok">code → selectable/merge helpers + tests</td></tr>
+    <tr><td>Contabo live S3</td><td class="bad">BLOCKED (VIP /info unhealthy)</td></tr>
+    <tr><td>4KB KEEP</td><td class="partial">explicitly not claimed</td></tr>
+  </table>
+
+  <h2>3) Measured effect</h2>
+  <table>
+    <tr><th>Metric</th><th>Before (wave3-20260805)</th><th>After (prod-20260805)</th></tr>
+    <tr><td>swift-s3api tests</td><td>61/61</td><td class="ok">64/64</td></tr>
+    <tr><td>s3token tests</td><td>3/3 (Map stub)</td><td class="ok">5/5 (+ live HTTP)</td></tr>
+    <tr><td>sharder tests</td><td>7/7</td><td class="ok">10/10</td></tr>
+    <tr><td>ListMultipartUploads</td><td class="bad">501</td><td class="ok">PASS</td></tr>
+    <tr><td>Contabo VIP S3</td><td>Not run</td><td class="bad">BLOCKED</td></tr>
+  </table>
+
+  <h2>4) Gate results</h2>
+  <table>
+    <tr><th>Gate</th><th>Result</th><th>Evidence</th></tr>
+    <tr><td>Unit s3api</td><td class="ok">PASS 64/64</td><td><code>05-cargo-s3api.txt</code></td></tr>
+    <tr><td>Unit s3token</td><td class="ok">PASS 5/5</td><td><code>05-cargo-s3token.txt</code></td></tr>
+    <tr><td>Unit sharder / quorum / misplaced</td><td class="ok">PASS 10/10</td><td><code>05-cargo-sharder.txt</code></td></tr>
+    <tr><td>Proxy fan-out helpers</td><td class="ok">PASS 2/2</td><td><code>05-cargo-proxy-fanout.txt</code></td></tr>
+    <tr><td>Proxy s3api wire</td><td class="ok">PASS</td><td><code>05-cargo-proxy-s3api.txt</code></td></tr>
+    <tr><td>Container shard HTTP paths</td><td class="ok">PASS</td><td><code>05-cargo-container-sharding.txt</code></td></tr>
+    <tr><td>Contabo VIP /info + S3 live</td><td class="bad">BLOCKED</td><td><code>20-contabo-s3-gate.txt</code></td></tr>
+    <tr><td>compat matrix</td><td class="partial">PARTIAL</td><td><code>S3-COMPAT-MATRIX.md</code></td></tr>
+    <tr><td>DIRECT / HA-PATH / chaos / soak</td><td class="muted">not owned this todo</td><td>—</td></tr>
+  </table>
+
+  <h2>5) Remaining / next</h2>
+  <ul>
+    <li><strong>FROZEN here:</strong> R0, W0′, W1 Keystone, W2 spp, W4 Python, P3-ops TLS.</li>
+    <li><strong>Backlog:</strong> restore Contabo VIP health → ON-BY-CONFIG enable s3api → live S3 suite; W1 then live s3token; Contabo multi-node shard HTTP quorum; 4KB KEEP only with对照 data.</li>
+  </ul>
+  <p class="muted">Open <code>SUMMARY.md</code> beside this report for the honest claim boundary.</p>
+</main>
+</body>
+</html>

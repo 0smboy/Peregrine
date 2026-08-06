@@ -1,0 +1,125 @@
+===HOST=== swift1 2026-08-05T10:14:38Z
+===UWSGI INI===
+total 20
+drwxr-xr-x.   2 root root   59 Aug  5 09:37 .
+drwxr-xr-x. 108 root root 8192 Aug  5 09:37 ..
+-rw-r--r--.   1 root root  215 Aug  5 09:37 keystone-admin.ini
+-rw-r--r--.   1 root root  215 Aug  5 09:37 keystone-public.ini
+--- /etc/uwsgi/keystone-public.ini ---
+[uwsgi]
+http = :5001
+enable-threads = true
+processes = 8
+master = true
+threads = 4
+listen = 65535
+wsgi-file = /usr/bin/keystone-wsgi-public
+thunder-lock = true
+lazy-apps = true
+pidfile = /var/run/keystone-public.pid--- /etc/uwsgi/keystone-admin.ini ---
+[uwsgi]
+http = :35358
+enable-threads = true
+processes = 8
+master = true
+threads = 4
+listen = 65535
+wsgi-file = /usr/bin/keystone-wsgi-admin
+thunder-lock = true
+lazy-apps = true
+pidfile = /var/run/keystone-admin.pid
+===KEYSTONE LOG DIR===
+/var/log/keystone/:
+total 4
+drwxr-x---.  2 keystone keystone   26 Aug  5 09:35 .
+drwxr-xr-x. 12 root     root     4096 Aug  5 09:37 ..
+-rw-rw----.  1 root     keystone    0 Aug  5 09:35 keystone.log
+/var/log/keystone
+/var/log/keystone/keystone.log
+/var/log/supervisor/keystone-admin.log
+/var/log/supervisor/keystone-public.log
+===CRED KEYS MD5===
+/etc/keystone/credential-keys/:
+total 8
+drwx------. 2 keystone keystone  24 Aug  5 09:42 .
+drwxr-x---. 5 root     keystone 172 Aug  5 09:42 ..
+-rw-------. 1 keystone keystone  44 Aug  5 09:42 0
+-rw-------. 1 keystone keystone  44 Aug  5 09:42 1
+
+/etc/keystone/fernet-keys/:
+total 8
+drwx------. 2 keystone keystone  24 Aug  5 09:42 .
+drwxr-x---. 5 root     keystone 172 Aug  5 09:42 ..
+-rw-------. 1 keystone keystone  44 Aug  5 09:42 0
+-rw-------. 1 keystone keystone  44 Aug  5 09:42 1
+4a9d93a4bad164f7f7b47f78243ad976  /etc/keystone/credential-keys/0
+a89c0061e7325e75e96da1a26b066d41  /etc/keystone/credential-keys/1
+05b99f78fc004f72b0a3d6a8fcfd8853  /etc/keystone/fernet-keys/0
+068605c415847b65da79c8579ba9d252  /etc/keystone/fernet-keys/1
+===KEYSTONE CONF credential/fernet===
+650:[credential]
+939:[fernet_tokens]
+2605:[token]
+2634:provider = fernet
+[credential]
+
+#
+# From keystone
+#
+
+# Entry point for the credential backend driver in the `keystone.credential`
+# namespace. Keystone only provides a `sql` driver, so there's no reason to
+# change this unless you are providing a custom entry point. (string value)
+#driver = sql
+
+# Entry point for credential encryption and decryption operations in the
+# `keystone.credential.provider` namespace. Keystone only provides a `fernet`
+# driver, so there's no reason to change this unless you are providing a custom
+# entry point to encrypt and decrypt credentials. (string value)
+#provider = fernet
+
+# Directory containing Fernet keys used to encrypt and decrypt credentials
+# stored in the credential backend. Fernet keys used to encrypt credentials
+# have no relationship to Fernet keys used to encrypt Fernet tokens. Both sets
+# of keys should be managed separately and require different rotation policies.
+[fernet_tokens]
+
+#
+# From keystone
+#
+
+# Directory containing Fernet token keys. This directory must exist before
+# using `keystone-manage fernet_setup` for the first time, must be writable by
+# the user running `keystone-manage fernet_setup` or `keystone-manage
+# fernet_rotate`, and of course must be readable by keystone's server process.
+# The repository may contain keys in one of three states: a single staged key
+# (always index 0) used for token validation, a single primary key (always the
+# highest index) used for token creation and validation, and any number of
+# secondary keys (all other index values) used for token validation. With
+# multiple keystone nodes, each node must share the same key repository
+# contents, with the exception of the staged key (index 0). It is safe to run
+===UWSGI PROCS===
+root       45016  0.0  0.0   7276  3608 ?        Ss   10:14   0:00 bash -c set -e echo "===HOST=== $(hostname) $(date -u +%Y-%m-%dT%H:%M:%SZ)" echo "===UWSGI INI===" ls -la /etc/uwsgi/ 2>/dev/null || true for f in /etc/uwsgi/keystone-public.ini /etc/uwsgi/keystone-admin.ini; do echo "--- $f ---"; cat "$f" 2>/dev/null; done echo "===KEYSTONE LOG DIR===" ls -la /var/log/keystone/ /var/log/uwsgi/ 2>/dev/null || true find /var/log -name "*keystone*" -o -name "*uwsgi*" 2>/dev/null | head -40 echo "===CRED KEYS MD5===" ls -la /etc/keystone/credential-keys/ /etc/keystone/fernet-keys/ 2>/dev/null md5sum /etc/keystone/credential-keys/* /etc/keystone/fernet-keys/* 2>/dev/null echo "===KEYSTONE CONF credential/fernet===" grep -nE "^(key_repository|provider|\[credential\]|\[fernet_tokens\]|\[token\])" /etc/keystone/keystone.conf 2>/dev/null | head -40 grep -A20 "^\[credential\]" /etc/keystone/keystone.conf 2>/dev/null | head -30 grep -A15 "^\[fernet_tokens\]" /etc/keystone/keystone.conf 2>/dev/null | head -20 echo "===UWSGI PROCS===" ps auxww | grep -E "[u]wsgi|[k]eystone" | head -20 echo "===VIP/LOCAL KEYSTONE===" ss -lntp | grep -E "5000|5001|35357" || true 
+root     4153435  0.0  0.1  21148 12672 ?        S    09:42   0:00 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-admin.ini
+root     4153439  0.0  0.1  21148 12644 ?        S    09:42   0:00 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-public.ini
+root     4153459  0.0  0.0  21148  7176 ?        S    09:42   0:00 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-public.ini
+root     4153469  0.0  0.0  21148  6332 ?        S    09:42   0:00 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-admin.ini
+root     4154305  0.3  1.5 356808 123212 ?       Sl   09:42   0:05 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-public.ini
+root     4154570  0.2  1.5 355132 121692 ?       Sl   09:42   0:05 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-public.ini
+root     4154751  0.3  1.5 354816 119028 ?       Sl   09:42   0:06 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-public.ini
+root     4154817  0.3  1.5 357904 122316 ?       Sl   09:42   0:06 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-public.ini
+root     4154843  0.1  1.3 342824 106212 ?       Sl   09:42   0:02 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-admin.ini
+root     4154844  0.1  1.3 342824 106212 ?       Sl   09:42   0:03 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-admin.ini
+root     4154871  0.1  1.3 342824 106212 ?       Sl   09:42   0:03 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-admin.ini
+root     4155026  0.3  1.5 353852 119908 ?       Sl   09:42   0:06 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-public.ini
+root     4155098  0.1  1.3 342824 106212 ?       Sl   09:42   0:03 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-admin.ini
+root     4155388  0.1  1.3 342824 106212 ?       Sl   09:42   0:03 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-admin.ini
+root     4155389  0.1  1.3 342824 106212 ?       Sl   09:42   0:03 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-admin.ini
+root     4155419  0.2  1.5 357224 123552 ?       Sl   09:42   0:05 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-public.ini
+root     4155420  0.1  1.3 342824 106212 ?       Sl   09:42   0:03 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-admin.ini
+root     4155461  0.2  1.5 356284 120772 ?       Sl   09:42   0:05 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-public.ini
+root     4155490  0.1  1.3 342824 106212 ?       Sl   09:42   0:03 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-admin.ini
+===VIP/LOCAL KEYSTONE===
+LISTEN 0      4000         0.0.0.0:35357      0.0.0.0:*    users:(("haproxy",pid=4180537,fd=13))                                                                                                                                                                                                                     
+LISTEN 0      4000         0.0.0.0:5000       0.0.0.0:*    users:(("haproxy",pid=4180537,fd=14))                                                                                                                                                                                                                     
+LISTEN 0      65535        0.0.0.0:5001       0.0.0.0:*    users:(("uwsgi",pid=4153459,fd=4),("uwsgi",pid=4153439,fd=4))                                                                                                                                                                                             

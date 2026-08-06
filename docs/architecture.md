@@ -31,7 +31,7 @@ A 17-crate workspace mirroring Swift's module boundaries:
 | `swift-middleware` | `swift.common.middleware.*` | tempauth, copy, SLO/DLO, versioned_writes, symlink, staticweb, quotas, ratelimit, … |
 | `swift-crypto` | crypto middleware | AES-256-CTR at rest, crypto-meta, HMAC etag |
 | `swift-memcache` | `memcached` client | consistent-hash memcache client |
-| `swift-s3api` | `s3api` middleware | S3 request parsing, SigV4 |
+| `swift-s3api` | `s3api` middleware | S3 SigV4 + minimal CRUD/list gateway (P3-s3; ON-BY-CONFIG; not on Swift `/info`) |
 | `swift-cli` | `swift-*` scripts | ring-builder, recon, get-nodes, info tools, shard-range mgmt, ring-sim |
 | `swift-ec` | `pyeclib` / liberasurecode | the erasure-coding codec (Linux-only, `ec` feature) |
 

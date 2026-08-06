@@ -1,0 +1,18 @@
+/etc/swift/object-server.conf:devices = /srv/node
+/etc/swift/object-server.conf:mount_check = false
+/etc/swift/account-server.conf:devices = /srv/node
+/etc/swift/account-server.conf:mount_check = false
+d1
+d2
+d3
+/dev/sda5 on /srv/node/d1 type xfs (rw,noatime,nodiratime,seclabel,attr2,inode64,logbufs=8,logbsize=32k,noquota)
+/dev/sda6 on /srv/node/d2 type xfs (rw,noatime,nodiratime,seclabel,attr2,inode64,logbufs=8,logbsize=32k,noquota)
+/dev/sda7 on /srv/node/d3 type xfs (rw,noatime,nodiratime,seclabel,attr2,inode64,logbufs=8,logbsize=32k,noquota)
+TARGET       SOURCE    FSTYPE OPTIONS
+/srv/node/d1 /dev/sda5 xfs    rw,noatime,nodiratime,seclabel,attr2,inode64,logbufs=8,logbsize=32k,noquota
+/root/.cargo/bin/cargo
+/root/.cargo/bin/rustc
+/root/work/swift-rust/Cargo.toml
+4
+               total        used        free      shared  buff/cache   available
+Mem:           7.5Gi       4.4Gi       399Mi       4.0Mi       3.0Gi       3.1Gi

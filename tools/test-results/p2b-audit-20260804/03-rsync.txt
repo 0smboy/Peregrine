@@ -1,0 +1,30 @@
+Transfer starting: 1 files
+auditor.rs
+
+sent 1574 bytes  received 108 bytes  2405 bytes/sec
+total size is 10678  speedup is 6.35
+Transfer starting: 1 files
+lib.rs
+
+sent 433 bytes  received 72 bytes  734 bytes/sec
+total size is 3170  speedup is 6.28
+Transfer starting: 1 files
+auditor.rs
+
+sent 1330 bytes  received 84 bytes  2051 bytes/sec
+total size is 6511  speedup is 4.60
+Transfer starting: 1 files
+lib.rs
+
+sent 466 bytes  received 66 bytes  740 bytes/sec
+total size is 2672  speedup is 5.02
+Transfer starting: 1 files
+object_auditor.rs
+
+sent 2712 bytes  received 72 bytes  3920 bytes/sec
+total size is 7979  speedup is 2.87
+Transfer starting: 1 files
+db_auditor.rs
+
+sent 2281 bytes  received 60 bytes  3310 bytes/sec
+total size is 6746  speedup is 2.88

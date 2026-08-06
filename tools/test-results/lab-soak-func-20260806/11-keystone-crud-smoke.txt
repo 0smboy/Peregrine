@@ -1,0 +1,5 @@
+auth try failed code=401
+KEYSTONE_AUTH=201 with try_len=7
+tok_len=183 project=29af7f1e19774999bf700fbef31994d3
+c1=201 c2=201 body=ks c3=204 c4=204
+KEYSTONE_CRUD=PASS

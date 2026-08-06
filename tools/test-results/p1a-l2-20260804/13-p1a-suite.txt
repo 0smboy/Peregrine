@@ -1,0 +1,72 @@
+{'bulk_delete': {'max_deletes_per_request': 10000, 'max_failed_deletes': 1000}, 'tempurl': {'allowed_digests': ['sha1', 'sha256', 'sha512'], 'incoming_allow_headers': [], 'incoming_remove_headers': ['x-timestamp', 'x-open-expired'], 'methods': ['GET', 'HEAD', 'PUT', 'POST', 'DELETE'], 'outgoing_allow_headers': ['x-object-meta-public-*'], 'outgoing_remove_headers': ['x-object-meta-*']}, 'tempauth': {'account_acls': True}}
+upload False
+--- P1A SUITE VIP ---
+===================================================================
+P1a L2 SUITE  label=vip-p1a-l2  endpoint=http://10.0.0.10:8085  2026-08-04T13:41:53Z
+===================================================================
+  PASS  auth: token acquired
+  PASS  info: bulk_delete present
+  PASS  info: bulk_upload absent (wontfix P1a)
+  PASS  info: tempurl present
+  FAIL  info: tempauth.account_acls  -- missing '"account_acls": true'
+  PASS  info: tempurl allowed_digests
+  PASS  container: PUT 201
+  PASS  obj a: PUT 201
+  PASS  obj b: PUT 201
+  PASS  obj c: PUT 201
+  PASS  bulk: POST status 200
+  FAIL  bulk: Number Deleted  -- missing '"Number Deleted": 2'
+  FAIL  bulk: Number Not Found  -- missing '"Number Not Found": 1'
+  PASS  bulk: deleted object gone 404
+  PASS  bulk: remaining object present 200
+  PASS  tempurl: set account key 204
+  FAIL  tempurl: valid GET 200  -- want=200 got=401 
+  FAIL  tempurl: body  -- want=cc got=401 Unauthorized: Temp URL invalid 
+  PASS  tempurl: tampered sig -> 401
+  PASS  tempurl: expired -> 401
+  PASS  tempurl: wrong path -> 401
+  PASS  acl: invalid JSON -> 400
+  PASS  acl: set valid 204
+  PASS  acl: owner sees X-Account-Access-Control
+  PASS  acl: clear 204
+  PASS  ratelimit: on-by-config (not default pipeline; sample in bundle-rust)
+
+-------------------------------------------------------------------
+RESULT  label=vip-p1a-l2  PASS=21  FAIL=5
+  failed: info: tempauth.account_acls bulk: Number Deleted bulk: Number Not Found tempurl: valid GET 200 tempurl: body
+-------------------------------------------------------------------
+--- P1A SUITE LOCAL ---
+===================================================================
+P1a L2 SUITE  label=local-p1a-l2  endpoint=http://127.0.0.1:8080  2026-08-04T13:41:56Z
+===================================================================
+  PASS  auth: token acquired
+  PASS  info: bulk_delete present
+  PASS  info: bulk_upload absent (wontfix P1a)
+  PASS  info: tempurl present
+  FAIL  info: tempauth.account_acls  -- missing '"account_acls": true'
+  PASS  info: tempurl allowed_digests
+  PASS  container: PUT 201
+  PASS  obj a: PUT 201
+  PASS  obj b: PUT 201
+  PASS  obj c: PUT 201
+  PASS  bulk: POST status 200
+  FAIL  bulk: Number Deleted  -- missing '"Number Deleted": 2'
+  FAIL  bulk: Number Not Found  -- missing '"Number Not Found": 1'
+  PASS  bulk: deleted object gone 404
+  PASS  bulk: remaining object present 200
+  PASS  tempurl: set account key 204
+  PASS  tempurl: valid GET 200
+  PASS  tempurl: body
+  PASS  tempurl: tampered sig -> 401
+  PASS  tempurl: expired -> 401
+  PASS  tempurl: wrong path -> 401
+  PASS  acl: invalid JSON -> 400
+  PASS  acl: set valid 204
+  PASS  acl: owner sees X-Account-Access-Control
+  PASS  acl: clear 204
+  PASS  ratelimit: on-by-config (not default pipeline; sample in bundle-rust)
+
+-------------------------------------------------------------------
+RESULT  label=local-p1a-l2  PASS=23  FAIL=3
+  failed: info: tempauth.account_acls bulk: Number Deleted bulk: Number Not Found
+-------------------------------------------------------------------

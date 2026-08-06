@@ -21,9 +21,11 @@
 //! were already gone, and any per-path errors. Objects are processed before
 //! containers so a container empties before it is removed.
 //!
-//! Deferred: the archive-extraction half (`?extract-archive`, which needs a
-//! streaming tar reader), the periodic-whitespace heartbeat, and `version_id`
-//! handling.
+//! P1a delivers **bulk-delete only**. Honest deferrals / wont-fix-for-P1a:
+//! - `?extract-archive` (bulk upload / tar extraction) — not wired; `/info`
+//!   must NOT advertise `bulk_upload` until that lands (P1b+).
+//! - Periodic whitespace heartbeat on long deletes.
+//! - `version_id` handling for versioned objects.
 
 use swift_http::{split_path, Body, HeaderKeyDict, Request, Response};
 
@@ -94,6 +96,17 @@ impl Bulk {
         Bulk::default()
     }
 
+    /// Build from a `[filter:bulk]` conf map (`max_deletes_per_request`).
+    pub fn from_conf(options: &std::collections::HashMap<String, String>) -> Self {
+        let mut b = Bulk::new();
+        if let Some(v) = options.get("max_deletes_per_request") {
+            if let Ok(n) = v.trim().parse::<usize>() {
+                b.max_deletes_per_request = n.max(1);
+            }
+        }
+        b
+    }
+
     fn handle_delete(&self, mut req: Request, next: &NextFn) -> Response {
         let parts = match split_path(&req.path, 2, 3, true) {
             Ok(p) => p,
@@ -122,6 +135,22 @@ impl Bulk {
             return Response::error(413, "Maximum Bulk Deletes exceeded");
         }
 
+        // Propagate auth / authorize stamps (Python make_subrequest keeps
+        // X-Auth-Token; our pipeline also needs the unspoofable backend stamps).
+        let mut sub_headers = HeaderKeyDict::new();
+        for key in [
+            "X-Auth-Token",
+            "X-Storage-Token",
+            "X-Backend-Remote-User",
+            "X-Backend-Authorize-Override",
+            "X-Backend-Swift-Owner",
+            "X-Trans-Id",
+        ] {
+            if let Some(v) = req.headers.get(key) {
+                sub_headers.set(key, v);
+            }
+        }
+
         let mut result = BulkDeleteResult::default();
         for name in &names {
             let delete_path = format!("/{version}/{account}/{}", name.trim_start_matches('/'));
@@ -129,7 +158,7 @@ impl Bulk {
                 method: "DELETE".to_string(),
                 path: delete_path,
                 query_string: String::new(),
-                headers: HeaderKeyDict::new(),
+                headers: sub_headers.clone(),
                 body: Body::empty(),
             };
             let resp = next(subreq);
@@ -226,6 +255,35 @@ mod tests {
         assert_eq!(summary["Response Status"], "200 OK");
         // subrequests hit the full paths
         assert_eq!(calls.lock().unwrap()[0], "/v1/AUTH_test/c/a");
+    }
+
+    #[test]
+    fn test_bulk_delete_copies_auth_headers_to_subrequests() {
+        let b = Bulk::new();
+        let app: crate::NextFn = Arc::new(|r: Request| {
+            assert_eq!(r.headers.get("X-Auth-Token"), Some("auth-token"));
+            assert_eq!(r.headers.get("X-Storage-Token"), Some("storage-token"));
+            assert_eq!(
+                r.headers.get("X-Backend-Remote-User"),
+                Some("AUTH_test,AUTH_test:user")
+            );
+            assert_eq!(
+                r.headers.get("X-Backend-Authorize-Override"),
+                Some("true")
+            );
+            Response::new(204)
+        });
+        let mut request = req("/c/a\n");
+        request.headers.set("X-Auth-Token", "auth-token");
+        request.headers.set("X-Storage-Token", "storage-token");
+        request
+            .headers
+            .set("X-Backend-Remote-User", "AUTH_test,AUTH_test:user");
+        request
+            .headers
+            .set("X-Backend-Authorize-Override", "true");
+
+        assert_eq!(b.handle(request, &app).status, 200);
     }
 
     #[test]

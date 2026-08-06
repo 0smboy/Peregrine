@@ -1,0 +1,14 @@
+P3-data VERDICT: PARTIAL
+date: 2026-08-04
+scope: L3b local-cleave daemon+unit + X-Newest best-source; NOT full sharding production; crypto deferred; resumable multi-node GET remains deferred
+gates:
+  sharder unit tests: 4/4 PASS (local + Contabo)
+  proxy X-Newest unit: PASS
+  container sharding HTTP test: PASS
+  Contabo sharder active x4: PASS (scan skip, sharding=0, failures=0)
+  X-Backend-Sharding-State: unsharded (backend HEAD)
+  X-Newest smoke GET: 200
+  CORE-PATH func VIP: 54/54
+  at-rest crypto: DEFERRED (library only, no middleware wire)
+  resumable multi-node GET: DEFERRED
+  L3b full production (proxy shard fanout, HTTP replicate quorum, auto_shard, perf uplift): NOT CLAIMED

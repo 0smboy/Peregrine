@@ -1,0 +1,22 @@
+2026-08-05T03:37:03Z
+=== df ===
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   50G  304M 100% /srv/node/d1
+/dev/sda6        50G   45G  5.1G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.6G  89% /srv/node/d3
+=== reclaim_age ===
+/etc/swift/object-server.conf:45:reclaim_age = 604800
+/etc/swift/container-server.conf:36:reclaim_age = 604800
+=== counts ===
+ts=27584
+data=691795
+meta=2
+db=976
+=== db bytes sample ===
+db_files=976 db_bytes=149270528
+=== which swift ===
+/usr/bin/which: no swift in (/root/.cargo/bin:/root/.local/bin:/root/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin)
+bash: line 16: swift: command not found
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'swiftclient'

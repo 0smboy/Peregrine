@@ -1,0 +1,18 @@
+=== TempAuth auth + CRUD ===
+HTTP/2 200 
+x-auth-token: AUTH_tkv1.313738363037363138361e746573741e746573743a7465737465721e415554485f74657374.c704d355635280ac6977ae27b4b5d029fbef7cceffc34562f5ccbdbb91744044
+x-storage-token: AUTH_tkv1.313738363037363138361e746573741e746573743a7465737465721e415554485f74657374.c704d355635280ac6977ae27b4b5d029fbef7cceffc34562f5ccbdbb91744044
+x-storage-url: https://10.0.0.10:8085/v1/AUTH_test
+content-type: text/plain
+content-length: 0
+x-trans-id: txe594eb1d7fda9bf10baed-006a740a9a
+x-openstack-request-id: txe594eb1d7fda9bf10baed-006a740a9a
+
+TOKEN_LEN=149
+STOR=https://10.0.0.10:8085/v1/AUTH_test
+PUT_CONT=201
+PUT_OBJ=201
+GET_OBJ=200
+BODY=hello-handoff
+DEL_OBJ=204
+DEL_CONT=204

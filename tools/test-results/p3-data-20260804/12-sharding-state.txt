@@ -1,0 +1,11 @@
+Partition	5137
+Hash	50449902725e23f34784831d5cc1ba6b
+Server:Port Device	10.0.4.4:6201 d1
+Server:Port Device	10.0.4.1:6201 d1
+Server:Port Device	10.0.4.2:6201 d1
+Server:Port Device	10.0.4.3:6201 d1	 # [Handoff]
+URL=http://10.0.4.4:6201/d1/5137/AUTH_test/p3ss-1785858002
+HTTP/1.1 204 No Content
+X-Container-Object-Count: 0
+X-Timestamp: 1785858003.05889
+X-Backend-Sharding-State: unsharded

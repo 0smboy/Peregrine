@@ -1,0 +1,9 @@
+swift2
+no_saio_ports
+111881 bash -c hostname; ss -lntp | grep -E ":8090|:6310|:6311|:6312" || echo no_saio_ports; pgrep -af /etc/pyswift/ || echo no_pyswift_procs
+swift3
+no_saio_ports
+295247 bash -c hostname; ss -lntp | grep -E ":8090|:6310|:6311|:6312" || echo no_saio_ports; pgrep -af /etc/pyswift/ || echo no_pyswift_procs
+swift4
+no_saio_ports
+1541662 bash -c hostname; ss -lntp | grep -E ":8090|:6310|:6311|:6312" || echo no_saio_ports; pgrep -af /etc/pyswift/ || echo no_pyswift_procs

@@ -16,52 +16,50 @@
 //! Core of the S3 API translation layer, ported from
 //! `swift/common/middleware/s3api/`.
 //!
-//! This crate implements the parts of the S3 gateway that are pure and
-//! well-specified:
+//! # Production surface (Wave 3)
 //!
-//! * [`parse`] — bucket/key extraction from path-style and virtual-host-style
-//!   requests, bucket-name validation, and the S3 -> Swift path mapping
-//!   (`/bucket/key` -> `/v1/<account>/bucket/key`).
-//! * [`sigv4`] — AWS Signature Version 4: the canonical request, the
-//!   string-to-sign, the HMAC-SHA256 signing-key chain, and
-//!   [`sigv4::verify_sigv4`] to verify a client-presented signature (header
-//!   auth and presigned-URL query auth).
-//! * [`xml`] — a byte-faithful minimal XML writer matching the middleware's
-//!   `lxml` output.
-//! * [`response`] — S3 error documents and the bucket-listing / object-result
-//!   XML shapes for GET/PUT/DELETE/HEAD on buckets and objects.
-//! * [`crypto`] — SHA-256, HMAC-SHA256, and constant-time comparison.
+//! [`middleware::S3Api`]: SigV4 + CRUD + ListObjects v1/v2 + MultiDelete +
+//! basic ACL/CORS + multipart upload (segments + SLO complete). Enable via
+//! `pipeline = … s3api tempauth …` (or s3token + keystoneauth). Does **not**
+//! register on Swift `GET /info`.
 //!
-//! It reuses [`swift_http::Request`] / [`swift_http::Response`] /
-//! [`swift_http::HeaderKeyDict`] as its HTTP containers.
+//! # Residuals
 //!
-//! # Deferred (documented, not implemented)
-//!
-//! Multipart upload, ACLs and the ACL/subresource signing rules, object
-//! versioning, CORS/tagging/lifecycle/object-lock documents, SigV2, the
-//! aws-chunked streaming signature/trailer chain, request-lifecycle concerns
-//! (clock-skew and expiry checks, error-code mapping from Swift backend
-//! responses), and the full middleware `__call__` dispatch. These belong to
-//! later stages; the pieces here are the reusable, deterministic core.
+//! SigV2, aws-chunked streaming, full IAM/object ACL fidelity, multi-rule
+//! CORS edge cases, versioning / tagging / lifecycle / object-lock
+//! (production stop-line: written WONTFIX unless reopened), clock-skew/
+//! expiry enforcement on every path.
+//! Unknown access keys (EC2 / Keystone) are deferred via an optional
+//! [`swift_middleware::S3TokenClient`] on [`middleware::S3Api`] (inline
+//! `/v3/s3tokens` exchange with a real base64 string-to-sign). The
+//! `s3token` pipeline filter remains available for environ-style stamped
+//! auth details.
 
+pub mod acl_cors;
 pub mod crypto;
+pub mod delete;
+pub mod middleware;
+pub mod mpu;
 pub mod parse;
 pub mod response;
 pub mod sigv4;
 pub mod xml;
 
+pub use middleware::{
+    as_middleware, credentials_from_tempauth_users, S3Api, S3Credential,
+};
 pub use parse::{
     extract_bucket_and_key, parse_host, s3_to_swift_path, validate_bucket_name, MULTIUPLOAD_SUFFIX,
 };
 pub use response::{
     copy_object_result_xml, delete_object_response, delete_result_xml, error_status_and_message,
     list_all_my_buckets_xml, object_metadata_response, put_object_response, s3_error_response,
-    s3_error_xml, BucketInfo, DeleteError, ListBucketResult, Owner, S3Object,
+    s3_error_xml, BucketInfo, DeleteError, ListBucketResult, ListBucketResultV2, Owner, S3Object,
 };
 pub use sigv4::{
     amz_date, canonical_query, canonical_request, canonical_uri, compute_signature,
     headers_to_sign, parse_authorization_header, parse_credential, parse_query_authentication,
-    parse_sigv4_auth, payload_hash, signing_key, string_to_sign, verify_sigv4, CredentialScope,
-    SigV4Auth, ALGORITHM, SERVICE,
+    parse_sigv4_auth, payload_hash, signing_key, string_to_sign, string_to_sign_for_request,
+    verify_sigv4, CredentialScope, SigV4Auth, ALGORITHM, SERVICE,
 };
 pub use xml::{Element, XMLNS_S3};

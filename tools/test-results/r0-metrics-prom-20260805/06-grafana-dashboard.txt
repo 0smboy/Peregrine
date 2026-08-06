@@ -1,0 +1,13 @@
+{"message":"Cannot save provisioned dashboard"}
+[{"id":2,"uid":"swift-r0-tombstone-dbspace","title":"Swift tombstones + DB space (R0)","uri":"db/swift-tombstones-2b-db-space-r0","url":"/d/swift-r0-tombstone-dbspace/swift-tombstones-2b-db-space-r0","slug":"","type":"dash-db","tags":["dbspace","r0","swift","tombstone"],"isStarred":false,"folderId":1,"folderUid":"b0d05d11-b1d5-43b1-849c-a809304f33ee","folderTitle":"Swift","folderUrl":"/dashboards/f/b0d05d11-b1d5-43b1-849c-a809304f33ee/swift","sortMeta":0}]
+render_http=200 size=9095
+-rw-r--r--. 1 root root 9095 Aug  5 07:54 /tmp/r0-dash.png
+{
+    "results": {
+        "A": {
+            "error": "Post \"http://127.0.0.1:9090/api/v1/query\": dial tcp 127.0.0.1:9090: connect: permission denied",
+            "errorSource": "",
+            "status": 401
+        }
+    }
+}

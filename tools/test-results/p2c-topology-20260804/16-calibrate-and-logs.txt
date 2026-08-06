@@ -1,0 +1,31 @@
+{
+  "workers": 0,
+  "max_clients": 1024,
+  "servers_per_port": 0,
+  "bind_ports": 1,
+  "worker_threads": 64,
+  "connection_queue": 1024,
+  "acceptors": 1,
+  "formula": "default: cpus*16 → worker_threads (clamp 16..128)",
+  "notes": ["workers=0: use ServerConfig default (cpus*16, clamp 16..128)"]
+}
+{
+  "workers": 0,
+  "max_clients": 1024,
+  "servers_per_port": 1,
+  "bind_ports": 1,
+  "worker_threads": 128,
+  "connection_queue": 1024,
+  "acceptors": 1,
+  "formula": "servers_per_port * n_ports * max_clients → worker_threads (cap 128)",
+  "notes": ["servers_per_port>0: workers knob ignored (Python parity)","Rust: shared thread pool across REUSEPORT acceptors (not prefork)","worker_threads clamped to 128"]
+}
+# daemons (their own sections below; they read devices/bind_port from
+bind_port = 6200
+workers = 0
+Aug 04 15:14:03 swift4 object-server[2462997]: INFO concurrency: default: cpus*16 → worker_threads (clamp 16..128) → worker_threads=64 queue=1024 acceptors=1 notes=["workers=0: use ServerConfig default (cpus*16, clamp 16..128)"]
+Aug 04 15:14:03 swift4 object-server[2462997]: INFO swift-object-server listening on 0.0.0.0:6200 (socket 0/1)
+Aug 04 15:14:30 swift4 object-server[2466400]: INFO concurrency: default: cpus*16 → worker_threads (clamp 16..128) → worker_threads=64 queue=1024 acceptors=1 notes=["workers=0: use ServerConfig default (cpus*16, clamp 16..128)"]
+Aug 04 15:14:30 swift4 object-server[2466400]: INFO swift-object-server listening on 0.0.0.0:6200 (socket 0/1)
+Aug 04 15:16:40 swift4 object-server[2480368]: INFO concurrency: default: cpus*16 → worker_threads (clamp 16..128) → worker_threads=64 queue=1024 acceptors=1 notes=["workers=0: use ServerConfig default (cpus*16, clamp 16..128)"]
+Aug 04 15:16:40 swift4 object-server[2480368]: INFO swift-object-server listening on 0.0.0.0:6200 (socket 0/1)

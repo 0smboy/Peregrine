@@ -1,0 +1,302 @@
+{
+  "ts_utc": "2026-08-05T03:40:00Z",
+  "wave0_owner": "other_agent",
+  "gate": "disk_pressure_srv_node_lt_70pct",
+  "srv_node_max_use_pct": 100,
+  "srv_node_rows": [
+    {
+      "host": "swift2",
+      "fs": "/dev/sda7",
+      "use_pct": 90,
+      "mount": "/srv/node/d3"
+    },
+    {
+      "host": "swift2",
+      "fs": "/dev/sda5",
+      "use_pct": 92,
+      "mount": "/srv/node/d1"
+    },
+    {
+      "host": "swift2",
+      "fs": "/dev/sda6",
+      "use_pct": 90,
+      "mount": "/srv/node/d2"
+    },
+    {
+      "host": "swift2",
+      "fs": "/dev/sda5",
+      "use_pct": 92,
+      "mount": "/srv/node/d1"
+    },
+    {
+      "host": "swift2",
+      "fs": "/dev/sda6",
+      "use_pct": 90,
+      "mount": "/srv/node/d2"
+    },
+    {
+      "host": "swift2",
+      "fs": "/dev/sda7",
+      "use_pct": 90,
+      "mount": "/srv/node/d3"
+    },
+    {
+      "host": "swift3",
+      "fs": "/dev/sda5",
+      "use_pct": 99,
+      "mount": "/srv/node/d1"
+    },
+    {
+      "host": "swift3",
+      "fs": "/dev/sda7",
+      "use_pct": 89,
+      "mount": "/srv/node/d3"
+    },
+    {
+      "host": "swift3",
+      "fs": "/dev/sda6",
+      "use_pct": 89,
+      "mount": "/srv/node/d2"
+    },
+    {
+      "host": "swift3",
+      "fs": "/dev/sda5",
+      "use_pct": 99,
+      "mount": "/srv/node/d1"
+    },
+    {
+      "host": "swift3",
+      "fs": "/dev/sda6",
+      "use_pct": 89,
+      "mount": "/srv/node/d2"
+    },
+    {
+      "host": "swift3",
+      "fs": "/dev/sda7",
+      "use_pct": 89,
+      "mount": "/srv/node/d3"
+    },
+    {
+      "host": "swift1",
+      "fs": "/dev/sda5",
+      "use_pct": 100,
+      "mount": "/srv/node/d1"
+    },
+    {
+      "host": "swift1",
+      "fs": "/dev/sda6",
+      "use_pct": 90,
+      "mount": "/srv/node/d2"
+    },
+    {
+      "host": "swift1",
+      "fs": "/dev/sda7",
+      "use_pct": 89,
+      "mount": "/srv/node/d3"
+    },
+    {
+      "host": "swift1",
+      "fs": "/dev/sda5",
+      "use_pct": 100,
+      "mount": "/srv/node/d1"
+    },
+    {
+      "host": "swift1",
+      "fs": "/dev/sda6",
+      "use_pct": 90,
+      "mount": "/srv/node/d2"
+    },
+    {
+      "host": "swift1",
+      "fs": "/dev/sda7",
+      "use_pct": 89,
+      "mount": "/srv/node/d3"
+    },
+    {
+      "host": "swift4",
+      "fs": "/dev/sda6",
+      "use_pct": 91,
+      "mount": "/srv/node/d2"
+    },
+    {
+      "host": "swift4",
+      "fs": "/dev/sda5",
+      "use_pct": 91,
+      "mount": "/srv/node/d1"
+    },
+    {
+      "host": "swift4",
+      "fs": "/dev/sda7",
+      "use_pct": 90,
+      "mount": "/srv/node/d3"
+    },
+    {
+      "host": "swift4",
+      "fs": "/dev/sda5",
+      "use_pct": 91,
+      "mount": "/srv/node/d1"
+    },
+    {
+      "host": "swift4",
+      "fs": "/dev/sda6",
+      "use_pct": 91,
+      "mount": "/srv/node/d2"
+    },
+    {
+      "host": "swift4",
+      "fs": "/dev/sda7",
+      "use_pct": 90,
+      "mount": "/srv/node/d3"
+    }
+  ],
+  "blocked_mounts": [
+    {
+      "host": "swift2",
+      "fs": "/dev/sda7",
+      "use_pct": 90,
+      "mount": "/srv/node/d3"
+    },
+    {
+      "host": "swift2",
+      "fs": "/dev/sda5",
+      "use_pct": 92,
+      "mount": "/srv/node/d1"
+    },
+    {
+      "host": "swift2",
+      "fs": "/dev/sda6",
+      "use_pct": 90,
+      "mount": "/srv/node/d2"
+    },
+    {
+      "host": "swift2",
+      "fs": "/dev/sda5",
+      "use_pct": 92,
+      "mount": "/srv/node/d1"
+    },
+    {
+      "host": "swift2",
+      "fs": "/dev/sda6",
+      "use_pct": 90,
+      "mount": "/srv/node/d2"
+    },
+    {
+      "host": "swift2",
+      "fs": "/dev/sda7",
+      "use_pct": 90,
+      "mount": "/srv/node/d3"
+    },
+    {
+      "host": "swift3",
+      "fs": "/dev/sda5",
+      "use_pct": 99,
+      "mount": "/srv/node/d1"
+    },
+    {
+      "host": "swift3",
+      "fs": "/dev/sda7",
+      "use_pct": 89,
+      "mount": "/srv/node/d3"
+    },
+    {
+      "host": "swift3",
+      "fs": "/dev/sda6",
+      "use_pct": 89,
+      "mount": "/srv/node/d2"
+    },
+    {
+      "host": "swift3",
+      "fs": "/dev/sda5",
+      "use_pct": 99,
+      "mount": "/srv/node/d1"
+    },
+    {
+      "host": "swift3",
+      "fs": "/dev/sda6",
+      "use_pct": 89,
+      "mount": "/srv/node/d2"
+    },
+    {
+      "host": "swift3",
+      "fs": "/dev/sda7",
+      "use_pct": 89,
+      "mount": "/srv/node/d3"
+    },
+    {
+      "host": "swift1",
+      "fs": "/dev/sda5",
+      "use_pct": 100,
+      "mount": "/srv/node/d1"
+    },
+    {
+      "host": "swift1",
+      "fs": "/dev/sda6",
+      "use_pct": 90,
+      "mount": "/srv/node/d2"
+    },
+    {
+      "host": "swift1",
+      "fs": "/dev/sda7",
+      "use_pct": 89,
+      "mount": "/srv/node/d3"
+    },
+    {
+      "host": "swift1",
+      "fs": "/dev/sda5",
+      "use_pct": 100,
+      "mount": "/srv/node/d1"
+    },
+    {
+      "host": "swift1",
+      "fs": "/dev/sda6",
+      "use_pct": 90,
+      "mount": "/srv/node/d2"
+    },
+    {
+      "host": "swift1",
+      "fs": "/dev/sda7",
+      "use_pct": 89,
+      "mount": "/srv/node/d3"
+    },
+    {
+      "host": "swift4",
+      "fs": "/dev/sda6",
+      "use_pct": 91,
+      "mount": "/srv/node/d2"
+    },
+    {
+      "host": "swift4",
+      "fs": "/dev/sda5",
+      "use_pct": 91,
+      "mount": "/srv/node/d1"
+    },
+    {
+      "host": "swift4",
+      "fs": "/dev/sda7",
+      "use_pct": 90,
+      "mount": "/srv/node/d3"
+    },
+    {
+      "host": "swift4",
+      "fs": "/dev/sda5",
+      "use_pct": 91,
+      "mount": "/srv/node/d1"
+    },
+    {
+      "host": "swift4",
+      "fs": "/dev/sda6",
+      "use_pct": 91,
+      "mount": "/srv/node/d2"
+    },
+    {
+      "host": "swift4",
+      "fs": "/dev/sda7",
+      "use_pct": 90,
+      "mount": "/srv/node/d3"
+    }
+  ],
+  "live_galera_keystone_install": "BLOCKED",
+  "live_python_cluster_install": "BLOCKED",
+  "reason": "Wave 0 clear incomplete: all /srv/node/d* still >=89%. Plan forbids Contabo live Galera/Keystone/Python until disk pressure allows. Root FS has space but data-plane pressure + MEM ~5/7.5Gi used => unsafe to stack Identity+Python now.",
+  "mkfs": "FORBIDDEN_this_cycle"
+}

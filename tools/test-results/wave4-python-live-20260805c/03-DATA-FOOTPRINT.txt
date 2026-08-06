@@ -1,0 +1,27 @@
+=== d1/d2/d3 A/C/O footprint 20260805T112147Z ===
+---- 10.0.4.1 ----
+swift1
+d1 120K	/srv/node/d1/accounts 32M	/srv/node/d1/containers 58M	/srv/node/d1/objects 2.4M	/srv/node/d1/objects-1 
+d2 56K	/srv/node/d2/accounts 14M	/srv/node/d2/containers 8.3M	/srv/node/d2/objects 16K	/srv/node/d2/objects-1 
+d3 48K	/srv/node/d3/accounts 18M	/srv/node/d3/containers 8.4M	/srv/node/d3/objects 12K	/srv/node/d3/objects-1 
+---- 10.0.4.2 ----
+swift2
+d1 284K	/srv/node/d1/accounts 32M	/srv/node/d1/containers 59M	/srv/node/d1/objects 2.0M	/srv/node/d1/objects-1 
+d2 56K	/srv/node/d2/accounts 15M	/srv/node/d2/containers 8.4M	/srv/node/d2/objects 28K	/srv/node/d2/objects-1 
+d3 48K	/srv/node/d3/accounts 16M	/srv/node/d3/containers 8.4M	/srv/node/d3/objects 16K	/srv/node/d3/objects-1 
+---- 10.0.4.3 ----
+swift3
+d1 240K	/srv/node/d1/accounts 37M	/srv/node/d1/containers 48M	/srv/node/d1/objects 2.4M	/srv/node/d1/objects-1 
+d2 14M	/srv/node/d2/containers 8.3M	/srv/node/d2/objects 36K	/srv/node/d2/objects-1 
+d3 17M	/srv/node/d3/containers 8.4M	/srv/node/d3/objects 16K	/srv/node/d3/objects-1 
+---- 10.0.4.4 ----
+swift4
+d1 316K	/srv/node/d1/accounts 32M	/srv/node/d1/containers 58M	/srv/node/d1/objects 2.0M	/srv/node/d1/objects-1 
+d2 56K	/srv/node/d2/accounts 14M	/srv/node/d2/containers 8.3M	/srv/node/d2/objects 24K	/srv/node/d2/objects-1 
+d3 48K	/srv/node/d3/accounts 17M	/srv/node/d3/containers 8.4M	/srv/node/d3/objects 12K	/srv/node/d3/objects-1 
+
+=== openstack-swift RPM (from live probe this cycle) ===
+swift1–4: openstack-swift* NOT installed
+swift2: /etc/pyswift PRESENT (leftover single-node :8090 / d1/pysaio) — NOT 3-node
+swift1/3/4: pyswift may exist as leftover dirs; no openstack-swift cluster
+PYTHON_CLUSTER=ABSENT

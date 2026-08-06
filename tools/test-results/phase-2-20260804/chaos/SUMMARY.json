@@ -1,0 +1,26 @@
+{
+  "gate": "PASS",
+  "proxy_loss": {
+    "scenario": "proxy-loss",
+    "target": "swift3",
+    "during_ok": 20,
+    "during_fail": 0,
+    "recovered_active": "active",
+    "after_ok": 10,
+    "after_fail": 0,
+    "pass": true
+  },
+  "object_loss": {
+    "scenario": "object-loss",
+    "target": "swift4",
+    "during_ok": 20,
+    "during_fail": 0,
+    "recovered_active": "active",
+    "after_ok": 10,
+    "after_fail": 0,
+    "pass": true
+  },
+  "residual_all_active": true,
+  "vip_auth": "200",
+  "note": "v2: create container; inject non-VIP proxy (swift3) + object (swift4)"
+}

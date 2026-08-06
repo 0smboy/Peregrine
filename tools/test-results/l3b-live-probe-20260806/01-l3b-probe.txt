@@ -1,0 +1,15 @@
+tok_len=149 C=l3b-probe-12239
+PUT_CONT=201
+=== HEAD container headers (subset) ===
+HTTP/2 204 
+x-container-object-count: 5
+x-container-bytes-used: 20
+=== sharder status x4 ===
+10.0.0.1 active
+Aug 06 05:41:23 swift1 container-sharder[382081]: INFO container-sharder pass: seen=1329 sharding=0 cleaved_batches=0 finished=0 skipped=1329 failures=0
+10.0.0.2 active
+Aug 06 05:41:35 swift2 container-sharder[808927]: INFO container-sharder pass: seen=1409 sharding=0 cleaved_batches=0 finished=0 skipped=1409 failures=0
+10.0.0.3 active
+Aug 06 05:41:19 swift3 container-sharder[4000829]: INFO container-sharder pass: seen=1484 sharding=0 cleaved_batches=0 finished=0 skipped=1484 failures=0
+10.0.0.4 active
+Aug 06 05:41:39 swift4 container-sharder[2552602]: INFO container-sharder pass: seen=1432 sharding=0 cleaved_batches=0 finished=0 skipped=1432 failures=0

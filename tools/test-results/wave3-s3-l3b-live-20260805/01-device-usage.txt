@@ -1,0 +1,163 @@
+UTC=2026-08-05T10:01:18Z
+=== d1 ===
+260K	/srv/node/d1/accounts
+192K	/srv/node/d1/async_pending
+16K	/srv/node/d1/async_pending-1
+1.1M	/srv/node/d1/chaos-park
+25M	/srv/node/d1/containers
+60M	/srv/node/d1/objects
+2.0M	/srv/node/d1/objects-1
+1.1M	/srv/node/d1/pysaio
+4.1M	/srv/node/d1/quarantined
+0	/srv/node/d1/tmp
+0	/srv/node/d1/tmp-1
+/srv/node/d1
+/srv/node/d1/objects
+/srv/node/d1/objects/477
+/srv/node/d1/objects/24
+/srv/node/d1/objects/123
+/srv/node/d1/objects/621
+/srv/node/d1/objects/828
+/srv/node/d1/objects/603
+/srv/node/d1/objects/507
+/srv/node/d1/objects/609
+/srv/node/d1/objects/909
+/srv/node/d1/objects/408
+/srv/node/d1/objects/447
+/srv/node/d1/objects/324
+/srv/node/d1/objects/948
+/srv/node/d1/objects/264
+/srv/node/d1/objects/111
+/srv/node/d1/objects/117
+/srv/node/d1/objects/216
+/srv/node/d1/objects/519
+/srv/node/d1/objects/177
+/srv/node/d1/objects/939
+/srv/node/d1/objects/213
+/srv/node/d1/objects/807
+/srv/node/d1/objects/528
+/srv/node/d1/objects/993
+/srv/node/d1/objects/573
+/srv/node/d1/objects/6176
+/srv/node/d1/objects/465
+/srv/node/d1/objects/669
+=== d2 ===
+56K	/srv/node/d2/accounts
+128K	/srv/node/d2/async_pending
+15M	/srv/node/d2/containers
+8.0M	/srv/node/d2/objects
+28K	/srv/node/d2/objects-1
+0	/srv/node/d2/tmp-1
+/srv/node/d2
+/srv/node/d2/accounts
+/srv/node/d2/accounts/976
+/srv/node/d2/objects
+/srv/node/d2/objects/202
+/srv/node/d2/objects/52
+/srv/node/d2/objects/214
+/srv/node/d2/objects/28
+/srv/node/d2/objects/625
+/srv/node/d2/objects/613
+/srv/node/d2/objects/481
+/srv/node/d2/objects/1018
+/srv/node/d2/objects/385
+/srv/node/d2/objects/568
+/srv/node/d2/objects/1009
+/srv/node/d2/objects/145
+/srv/node/d2/objects/808
+/srv/node/d2/objects/340
+/srv/node/d2/objects/649
+/srv/node/d2/objects/94
+/srv/node/d2/objects/13
+/srv/node/d2/objects/784
+/srv/node/d2/objects/217
+/srv/node/d2/objects/16
+/srv/node/d2/objects/796
+/srv/node/d2/objects/40
+/srv/node/d2/objects/964
+/srv/node/d2/objects/841
+/srv/node/d2/objects/730
+/srv/node/d2/objects/172
+=== d3 ===
+48K	/srv/node/d3/accounts
+128K	/srv/node/d3/async_pending
+16M	/srv/node/d3/containers
+8.0M	/srv/node/d3/objects
+16K	/srv/node/d3/objects-1
+0	/srv/node/d3/tmp-1
+/srv/node/d3
+/srv/node/d3/containers
+/srv/node/d3/containers/635
+/srv/node/d3/containers/341
+/srv/node/d3/containers/638
+/srv/node/d3/containers/641
+/srv/node/d3/containers/455
+/srv/node/d3/containers/413
+/srv/node/d3/containers/809
+/srv/node/d3/containers/779
+/srv/node/d3/containers/401
+/srv/node/d3/containers/629
+/srv/node/d3/containers/965
+/srv/node/d3/containers/149
+/srv/node/d3/containers/437
+/srv/node/d3/containers/995
+/srv/node/d3/containers/845
+/srv/node/d3/containers/74
+/srv/node/d3/containers/233
+/srv/node/d3/containers/458
+/srv/node/d3/containers/329
+/srv/node/d3/containers/542
+/srv/node/d3/containers/242
+/srv/node/d3/containers/89
+/srv/node/d3/containers/389
+/srv/node/d3/containers/230
+/srv/node/d3/containers/701
+/srv/node/d3/containers/566
+/srv/node/d3/containers/818
+/srv/node/d3/containers/191
+usage: swift-ring-builder <ring.gz> <create|add|rebalance> ...
+magic/head 52314e470001000002f57b2262797465 b'R1NG\x00\x01\x00\x00\x02\xf5{"byteorder": "little"'
+d1 contexts [(55, b'vice": "d1", "id'), (223, b'vice": "d1", "id'), (391, b'vice": "d1", "id'), (559, b'vice": "d1", "id')]
+root      696822  0.0  0.0   4896  3672 ?        Ss   Aug04   0:59 /usr/local/bin/swift-object-expirer /etc/swift/object-server.conf
+root      746199 17.1  0.5 2209892 41104 ?       Ssl  Aug04 192:50 /usr/local/bin/swift-object-server /etc/swift/object-server.conf
+root     2041000  6.7  0.0   7648  5572 ?        Ss   Aug04 114:36 /usr/local/bin/swift-object-reconstructor /etc/swift/object-server.conf
+root     2703004 29.8  0.7  59188 56004 ?        Ss   03:46 111:40 /usr/local/bin/swift-object-auditor /etc/swift/object-server.conf
+root     2703317  0.1  0.0 887932  4484 ?        Ss   03:47   0:30 /usr/local/bin/swift-object-updater /etc/swift/object-server.conf
+root     3338621  3.1  0.0   5204  4276 ?        Ss   07:23   4:57 /usr/local/bin/swift-object-replicator /etc/swift/object-server.conf
+/srv/node/d1/:
+total 532
+drwxr-xr-x.    13 root root    191 Aug  4 15:41 .
+drwxr-xr-x.     5 root root     36 Aug  1 11:31 ..
+drwxr-xr-x.     4 root root     31 Aug  5 09:47 accounts
+drwxr-xr-x.  4072 root root  69632 Aug  5 03:51 async_pending
+drwxr-xr-x.     6 root root     50 Aug  4 15:41 async_pending-1
+drwxr-xr-x.     3 root root     26 Aug  1 16:28 chaos-park
+drwxr-xr-x.   311 root root   8192 Aug  5 09:58 containers
+drwxr-xr-x. 10529 root root 233472 Aug  5 07:52 objects
+drwxr-xr-x.   496 root root  12288 Aug  5 07:40 objects-1
+drwxr-xr-x.     6 root root     54 Aug  4 13:22 pysaio
+drwxr-xr-x.     3 root root     21 Aug  1 15:03 quarantined
+drwxr-xr-x.     2 root root      6 Aug  5 07:52 tmp
+drwxr-xr-x.     2 root root      6 Aug  5 07:40 tmp-1
+
+/srv/node/d2/:
+total 160
+drwxr-xr-x.    8 root root   106 Aug  4 05:14 .
+drwxr-xr-x.    5 root root    36 Aug  1 11:31 ..
+drwxr-xr-x.    3 root root    17 Aug  1 13:07 accounts
+drwxr-xr-x. 4044 root root 69632 Aug  3 17:17 async_pending
+drwxr-xr-x.  172 root root  4096 Aug  3 12:47 containers
+drwxr-xr-x.  258 root root  8192 Aug  3 19:11 objects
+drwxr-xr-x.  258 root root  8192 Aug  1 14:02 objects-1
+drwxr-xr-x.    2 root root     6 Aug  3 07:17 tmp-1
+
+/srv/node/d3/:
+total 160
+drwxr-xr-x.    8 root root   106 Aug  4 05:14 .
+drwxr-xr-x.    5 root root    36 Aug  1 11:31 ..
+drwxr-xr-x.    3 root root    17 Aug  1 13:26 accounts
+drwxr-xr-x. 4045 root root 69632 Aug  3 18:32 async_pending
+drwxr-xr-x.  182 root root  4096 Aug  4 04:03 containers
+drwxr-xr-x.  258 root root  8192 Aug  3 19:12 objects
+drwxr-xr-x.  257 root root  8192 Aug  1 14:03 objects-1
+drwxr-xr-x.    2 root root     6 Aug  3 07:17 tmp-1

@@ -1,0 +1,32 @@
+active
+active
+active
+activating
+LISTEN 0      4096         0.0.0.0:6102       0.0.0.0:*    users:(("swift-account-s",pid=132146,fd=8),("swift-account-s",pid=132109,fd=8))                                                                                                                                                                           
+LISTEN 0      4096         0.0.0.0:6102       0.0.0.0:*    users:(("swift-account-s",pid=132145,fd=6),("swift-account-s",pid=132109,fd=6))                                                                                                                                                                           
+LISTEN 0      4096         0.0.0.0:6101       0.0.0.0:*    users:(("swift-container",pid=132153,fd=8),("swift-container",pid=132110,fd=8))                                                                                                                                                                           
+LISTEN 0      4096         0.0.0.0:6101       0.0.0.0:*    users:(("swift-container",pid=132152,fd=6),("swift-container",pid=132110,fd=6))                                                                                                                                                                           
+LISTEN 0      4096         0.0.0.0:6100       0.0.0.0:*    users:(("swift-object-se",pid=132157,fd=8),("swift-object-se",pid=132111,fd=8))                                                                                                                                                                           
+LISTEN 0      4096         0.0.0.0:6100       0.0.0.0:*    users:(("swift-object-se",pid=132155,fd=6),("swift-object-se",pid=132111,fd=6))                                                                                                                                                                           
+active
+active
+active
+active
+LISTEN 0      4096        10.0.0.3:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=332867,fd=18),("swift-proxy-ser",pid=332831,fd=18))                                                                                                                                                                
+LISTEN 0      4096        10.0.0.3:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=332866,fd=16),("swift-proxy-ser",pid=332831,fd=16))                                                                                                                                                                
+LISTEN 0      4096         0.0.0.0:6102       0.0.0.0:*    users:(("swift-account-s",pid=332861,fd=8),("swift-account-s",pid=332828,fd=8))                                                                                                                                                                  
+LISTEN 0      4096         0.0.0.0:6102       0.0.0.0:*    users:(("swift-account-s",pid=332860,fd=6),("swift-account-s",pid=332828,fd=6))                                                                                                                                                                  
+LISTEN 0      4096         0.0.0.0:6101       0.0.0.0:*    users:(("swift-container",pid=332864,fd=8),("swift-container",pid=332829,fd=8))                                                                                                                                                                  
+LISTEN 0      4096         0.0.0.0:6101       0.0.0.0:*    users:(("swift-container",pid=332862,fd=6),("swift-container",pid=332829,fd=6))                                                                                                                                                                  
+LISTEN 0      4096         0.0.0.0:6100       0.0.0.0:*    users:(("swift-object-se",pid=332865,fd=8),("swift-object-se",pid=332830,fd=8))                                                                                                                                                                  
+LISTEN 0      4096         0.0.0.0:6100       0.0.0.0:*    users:(("swift-object-se",pid=332863,fd=6),("swift-object-se",pid=332830,fd=6))                                                                                                                                                                  
+active
+active
+active
+activating
+LISTEN 0      4096         0.0.0.0:6101       0.0.0.0:*    users:(("swift-container",pid=1577382,fd=8),("swift-container",pid=1577299,fd=8))
+LISTEN 0      4096         0.0.0.0:6101       0.0.0.0:*    users:(("swift-container",pid=1577381,fd=6),("swift-container",pid=1577299,fd=6))
+LISTEN 0      4096         0.0.0.0:6100       0.0.0.0:*    users:(("swift-object-se",pid=1577391,fd=8),("swift-object-se",pid=1577300,fd=8))
+LISTEN 0      4096         0.0.0.0:6100       0.0.0.0:*    users:(("swift-object-se",pid=1577390,fd=6),("swift-object-se",pid=1577300,fd=6))
+LISTEN 0      4096         0.0.0.0:6102       0.0.0.0:*    users:(("swift-account-s",pid=1577384,fd=8),("swift-account-s",pid=1577296,fd=8))
+LISTEN 0      4096         0.0.0.0:6102       0.0.0.0:*    users:(("swift-account-s",pid=1577383,fd=6),("swift-account-s",pid=1577296,fd=6))

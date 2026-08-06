@@ -1,0 +1,10 @@
+{
+  "soak_seconds_target": 3600,
+  "chunks": 6,
+  "ok_total": 720441,
+  "fail_total": 0,
+  "gate": "PASS",
+  "note": "reparsed ANSI-safe from chunk logs; original summary.tsv ok/fail fields were broken by ANSI",
+  "first_chunk_mtime": "2026-08-04T08:15:53Z",
+  "last_chunk_mtime": "2026-08-04T09:05:52Z"
+}

@@ -1,0 +1,8 @@
+=== swift1 ===
+active
+health=200
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth ratelimit copy slo dlo proxy-logging proxy-server
+keys ['account_quotas', 'bulk_delete', 'container_quotas', 'formpost', 'staticweb', 'symlink', 'tempurl', 'versioned_writes']
+=== peer 10.0.0.2 ===
+scp: dest open "/usr/local/bin/swift-proxy-server": Failure
+scp: failed to upload file /tmp/p1b-swift-rust/target/release/swift-proxy-server to /usr/local/bin/swift-proxy-server

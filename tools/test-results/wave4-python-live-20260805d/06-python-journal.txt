@@ -1,0 +1,93 @@
+======== swift2 ========
+activating
+activating
+activating
+activating
+NO_LISTEN
+Aug 05 11:56:15 swift2 systemd[1]: Started Python Swift object server (pyswift dual-stack).
+Aug 05 11:56:15 swift2 systemd[1]: Stopped Python Swift proxy server (pyswift dual-stack).
+Aug 05 11:56:15 swift2 systemd[129921]: pyswift-object.service: Failed to locate executable /root/work/pyswift-venv/bin/swift-object-server: Permission denied
+Aug 05 11:56:15 swift2 systemd[129921]: pyswift-object.service: Failed at step EXEC spawning /root/work/pyswift-venv/bin/swift-object-server: Permission denied
+Aug 05 11:56:15 swift2 systemd[129922]: pyswift-proxy.service: Failed to locate executable /root/work/pyswift-venv/bin/swift-proxy-server: Permission denied
+Aug 05 11:56:15 swift2 systemd[129922]: pyswift-proxy.service: Failed at step EXEC spawning /root/work/pyswift-venv/bin/swift-proxy-server: Permission denied
+Aug 05 11:56:15 swift2 systemd[1]: Started Python Swift proxy server (pyswift dual-stack).
+Aug 05 11:56:15 swift2 systemd[1]: pyswift-object.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 11:56:15 swift2 systemd[1]: pyswift-object.service: Failed with result 'exit-code'.
+Aug 05 11:56:15 swift2 systemd[1]: pyswift-proxy.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 11:56:15 swift2 systemd[1]: pyswift-proxy.service: Failed with result 'exit-code'.
+Aug 05 11:56:18 swift2 systemd[1]: pyswift-object.service: Scheduled restart job, restart counter is at 9.
+Aug 05 11:56:18 swift2 systemd[1]: pyswift-proxy.service: Scheduled restart job, restart counter is at 9.
+Aug 05 11:56:18 swift2 systemd[1]: Stopped Python Swift object server (pyswift dual-stack).
+Aug 05 11:56:18 swift2 systemd[130014]: pyswift-object.service: Failed to locate executable /root/work/pyswift-venv/bin/swift-object-server: Permission denied
+Aug 05 11:56:18 swift2 systemd[130014]: pyswift-object.service: Failed at step EXEC spawning /root/work/pyswift-venv/bin/swift-object-server: Permission denied
+Aug 05 11:56:18 swift2 systemd[1]: Started Python Swift object server (pyswift dual-stack).
+Aug 05 11:56:18 swift2 systemd[1]: Stopped Python Swift proxy server (pyswift dual-stack).
+Aug 05 11:56:18 swift2 systemd[1]: Started Python Swift proxy server (pyswift dual-stack).
+Aug 05 11:56:18 swift2 systemd[130015]: pyswift-proxy.service: Failed to locate executable /root/work/pyswift-venv/bin/swift-proxy-server: Permission denied
+Aug 05 11:56:18 swift2 systemd[130015]: pyswift-proxy.service: Failed at step EXEC spawning /root/work/pyswift-venv/bin/swift-proxy-server: Permission denied
+Aug 05 11:56:18 swift2 systemd[1]: pyswift-object.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 11:56:18 swift2 systemd[1]: pyswift-object.service: Failed with result 'exit-code'.
+Aug 05 11:56:18 swift2 systemd[1]: pyswift-proxy.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 11:56:18 swift2 systemd[1]: pyswift-proxy.service: Failed with result 'exit-code'.
+======== swift3 ========
+activating
+activating
+activating
+activating
+NO_LISTEN
+Aug 05 11:56:18 swift3 systemd[1]: pyswift-object.service: Scheduled restart job, restart counter is at 7.
+Aug 05 11:56:18 swift3 systemd[1]: Stopped Python Swift object server (pyswift dual-stack).
+Aug 05 11:56:18 swift3 systemd[329978]: pyswift-object.service: Failed to locate executable /root/work/pyswift-venv/bin/swift-object-server: Permission denied
+Aug 05 11:56:18 swift3 systemd[329978]: pyswift-object.service: Failed at step EXEC spawning /root/work/pyswift-venv/bin/swift-object-server: Permission denied
+Aug 05 11:56:18 swift3 systemd[1]: Started Python Swift object server (pyswift dual-stack).
+Aug 05 11:56:18 swift3 systemd[1]: Stopped Python Swift proxy server (pyswift dual-stack).
+Aug 05 11:56:18 swift3 systemd[329979]: pyswift-proxy.service: Failed to locate executable /root/work/pyswift-venv/bin/swift-proxy-server: Permission denied
+Aug 05 11:56:18 swift3 systemd[329979]: pyswift-proxy.service: Failed at step EXEC spawning /root/work/pyswift-venv/bin/swift-proxy-server: Permission denied
+Aug 05 11:56:18 swift3 systemd[1]: Started Python Swift proxy server (pyswift dual-stack).
+Aug 05 11:56:18 swift3 systemd[1]: pyswift-object.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 11:56:18 swift3 systemd[1]: pyswift-object.service: Failed with result 'exit-code'.
+Aug 05 11:56:18 swift3 systemd[1]: pyswift-proxy.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 11:56:18 swift3 systemd[1]: pyswift-proxy.service: Failed with result 'exit-code'.
+Aug 05 11:56:21 swift3 systemd[1]: pyswift-proxy.service: Scheduled restart job, restart counter is at 8.
+Aug 05 11:56:21 swift3 systemd[1]: pyswift-object.service: Scheduled restart job, restart counter is at 8.
+Aug 05 11:56:21 swift3 systemd[1]: Stopped Python Swift object server (pyswift dual-stack).
+Aug 05 11:56:21 swift3 systemd[1]: Started Python Swift object server (pyswift dual-stack).
+Aug 05 11:56:21 swift3 systemd[330056]: pyswift-object.service: Failed to locate executable /root/work/pyswift-venv/bin/swift-object-server: Permission denied
+Aug 05 11:56:21 swift3 systemd[330056]: pyswift-object.service: Failed at step EXEC spawning /root/work/pyswift-venv/bin/swift-object-server: Permission denied
+Aug 05 11:56:21 swift3 systemd[1]: Stopped Python Swift proxy server (pyswift dual-stack).
+Aug 05 11:56:21 swift3 systemd[1]: Started Python Swift proxy server (pyswift dual-stack).
+Aug 05 11:56:21 swift3 systemd[1]: pyswift-object.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 11:56:21 swift3 systemd[1]: pyswift-object.service: Failed with result 'exit-code'.
+Aug 05 11:56:21 swift3 systemd[1]: pyswift-proxy.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 11:56:21 swift3 systemd[1]: pyswift-proxy.service: Failed with result 'exit-code'.
+======== swift4 ========
+activating
+activating
+activating
+activating
+NO_LISTEN
+Aug 05 11:56:27 swift4 systemd[1]: pyswift-object.service: Scheduled restart job, restart counter is at 7.
+Aug 05 11:56:27 swift4 systemd[1]: Stopped Python Swift object server (pyswift dual-stack).
+Aug 05 11:56:27 swift4 systemd[1]: Started Python Swift object server (pyswift dual-stack).
+Aug 05 11:56:27 swift4 systemd[1]: Stopped Python Swift proxy server (pyswift dual-stack).
+Aug 05 11:56:27 swift4 systemd[1572718]: pyswift-object.service: Failed to locate executable /root/work/pyswift-venv/bin/swift-object-server: Permission denied
+Aug 05 11:56:27 swift4 systemd[1572718]: pyswift-object.service: Failed at step EXEC spawning /root/work/pyswift-venv/bin/swift-object-server: Permission denied
+Aug 05 11:56:27 swift4 systemd[1]: Started Python Swift proxy server (pyswift dual-stack).
+Aug 05 11:56:27 swift4 systemd[1572719]: pyswift-proxy.service: Failed to locate executable /root/work/pyswift-venv/bin/swift-proxy-server: Permission denied
+Aug 05 11:56:27 swift4 systemd[1572719]: pyswift-proxy.service: Failed at step EXEC spawning /root/work/pyswift-venv/bin/swift-proxy-server: Permission denied
+Aug 05 11:56:27 swift4 systemd[1]: pyswift-object.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 11:56:27 swift4 systemd[1]: pyswift-object.service: Failed with result 'exit-code'.
+Aug 05 11:56:27 swift4 systemd[1]: pyswift-proxy.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 11:56:27 swift4 systemd[1]: pyswift-proxy.service: Failed with result 'exit-code'.
+Aug 05 11:56:30 swift4 systemd[1]: pyswift-proxy.service: Scheduled restart job, restart counter is at 8.
+Aug 05 11:56:30 swift4 systemd[1]: pyswift-object.service: Scheduled restart job, restart counter is at 8.
+Aug 05 11:56:30 swift4 systemd[1]: Stopped Python Swift object server (pyswift dual-stack).
+Aug 05 11:56:30 swift4 systemd[1572909]: pyswift-object.service: Failed to locate executable /root/work/pyswift-venv/bin/swift-object-server: Permission denied
+Aug 05 11:56:30 swift4 systemd[1572909]: pyswift-object.service: Failed at step EXEC spawning /root/work/pyswift-venv/bin/swift-object-server: Permission denied
+Aug 05 11:56:30 swift4 systemd[1]: Started Python Swift object server (pyswift dual-stack).
+Aug 05 11:56:30 swift4 systemd[1]: Stopped Python Swift proxy server (pyswift dual-stack).
+Aug 05 11:56:30 swift4 systemd[1]: Started Python Swift proxy server (pyswift dual-stack).
+Aug 05 11:56:30 swift4 systemd[1]: pyswift-object.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 11:56:30 swift4 systemd[1]: pyswift-object.service: Failed with result 'exit-code'.
+Aug 05 11:56:30 swift4 systemd[1]: pyswift-proxy.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 11:56:30 swift4 systemd[1]: pyswift-proxy.service: Failed with result 'exit-code'.

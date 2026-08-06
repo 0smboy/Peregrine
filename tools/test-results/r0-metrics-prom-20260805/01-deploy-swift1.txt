@@ -1,0 +1,27 @@
+active
+active
+-rw-r--r--. 1 root root 1331 Aug  5 07:41 /var/lib/node_exporter/textfile_collector/swift-recon.prom
+# HELP swift_object_tombstones Count of on-disk .ts tombstone files
+# TYPE swift_object_tombstones gauge
+swift_object_tombstones{node="swift1",device="d1",policy="0"} 22
+swift_object_tombstones{node="swift1",device="d1",policy="1"} 17
+# HELP swift_object_tombstone_bytes Total bytes of .ts tombstone files
+# TYPE swift_object_tombstone_bytes gauge
+swift_object_tombstone_bytes{node="swift1",device="d1",policy="0"} 0
+swift_object_tombstone_bytes{node="swift1",device="d1",policy="1"} 0
+# HELP swift_db_file_bytes Sum of account/container SQLite file sizes
+# TYPE swift_db_file_bytes gauge
+# HELP swift_db_freelist_count Sum of PRAGMA freelist_count
+# TYPE swift_db_freelist_count gauge
+# HELP swift_db_freelist_bytes Approximate freelist bytes (pages * page_size)
+# TYPE swift_db_freelist_bytes gauge
+# HELP swift_db_files Count of sampled .db files
+# TYPE swift_db_files gauge
+swift_db_file_bytes{node="swift1",kind="account"} 233472
+swift_db_freelist_count{node="swift1",kind="account"} 0
+swift_db_freelist_bytes{node="swift1",kind="account"} 0
+swift_db_files{node="swift1",kind="account"} 3
+swift_db_file_bytes{kind="account",node="swift1"} 233472
+swift_db_file_bytes{kind="container",node="swift1"} 1.44986112e+08
+swift_object_tombstones{device="d1",node="swift1",policy="0"} 22
+swift_object_tombstones{device="d1",node="swift1",policy="1"} 17

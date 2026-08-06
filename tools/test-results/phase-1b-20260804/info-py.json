@@ -1,0 +1,43 @@
+{
+    "swift": {
+        "version": "0.0.0",
+        "strict_cors_mode": true,
+        "policies": [
+            {
+                "name": "Policy-0",
+                "aliases": "Policy-0",
+                "default": true
+            },
+            {
+                "name": "ec-2-1",
+                "aliases": "ec-2-1"
+            }
+        ],
+        "allow_account_management": true,
+        "account_autocreate": true,
+        "allow_open_expired": false,
+        "max_file_size": 5368709122,
+        "max_meta_name_length": 128,
+        "max_meta_value_length": 256,
+        "max_meta_count": 90,
+        "max_meta_overall_size": 4096,
+        "max_header_size": 8192,
+        "max_request_line": 8192,
+        "max_object_name_length": 1024,
+        "container_listing_limit": 10000,
+        "account_listing_limit": 10000,
+        "max_account_name_length": 256,
+        "max_container_name_length": 256,
+        "extra_header_count": 0
+    },
+    "slo": {
+        "max_manifest_segments": 1000,
+        "max_manifest_size": 8388608,
+        "yield_frequency": 10,
+        "min_segment_size": 1,
+        "allow_async_delete": true
+    },
+    "tempauth": {
+        "account_acls": true
+    }
+}

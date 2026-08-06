@@ -1,0 +1,10 @@
+-rw-r--r--. 1 501 games 3517 Aug  4 15:06 /root/work/swift-rust/crates/swift-cli/src/auditor_daemon.rs
+18://! * Continuous daemon (Python `ObjectAuditor` parity):
+33:use swift_diskfile::{audit_device, audit_devices, DiskFileConfig, PolicyKind};
+158:        let report = audit_devices(
+21://!   default 1800s).
+30:use swift_db::{audit_account_dbs, audit_container_dbs, audit_dbs_on_devices, DbAuditReport};
+75:            "1800",
+81:            "1800",
+86:        .unwrap_or(1800);
+110:        let report = audit_dbs_on_devices(Path::new(&devices), mount_check, kind);

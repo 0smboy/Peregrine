@@ -1,0 +1,3 @@
+{"host": "swift2", "live_object_rows": 0, "live_account_container_rows": 0, "disk_hash_dirs": 50}
+{"host": "swift3", "live_object_rows": 0, "live_account_container_rows": 0, "disk_hash_dirs": 162}
+{"host": "swift4", "live_object_rows": 0, "live_account_container_rows": 0, "disk_hash_dirs": 44}

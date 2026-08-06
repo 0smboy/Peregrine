@@ -1,0 +1,16 @@
+{
+  "container_zero": {
+    "container_dbs_seen": 983,
+    "live_rows_marked": 650927,
+    "vacuumed": 0,
+    "errors": [],
+    "mode": "DRY-RUN"
+  },
+  "account_zero": {
+    "account_dbs_seen": 3,
+    "live_rows_marked": 1013,
+    "vacuumed": 0,
+    "errors": [],
+    "mode": "DRY-RUN"
+  }
+}

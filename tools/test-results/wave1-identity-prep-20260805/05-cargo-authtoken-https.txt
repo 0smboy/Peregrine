@@ -1,0 +1,60 @@
+    Updating crates.io index
+     Locking 17 packages to latest compatible versions
+      Adding core-foundation v0.10.1
+      Adding core-foundation-sys v0.8.7
+      Adding fastrand v2.5.0
+      Adding foreign-types v0.3.2
+      Adding foreign-types-shared v0.1.1
+      Adding getrandom v0.4.3
+      Adding log v0.4.33
+      Adding native-tls v0.2.18
+      Adding openssl v0.10.81
+      Adding openssl-macros v0.1.1
+      Adding openssl-probe v0.2.1
+      Adding openssl-sys v0.9.117
+      Adding r-efi v6.0.0
+      Adding schannel v0.1.29
+      Adding security-framework v3.7.0
+      Adding security-framework-sys v2.17.0
+      Adding tempfile v3.27.0
+ Downloading crates ...
+  Downloaded security-framework-sys v2.17.0
+  Downloaded core-foundation v0.10.1
+  Downloaded native-tls v0.2.18
+  Downloaded core-foundation-sys v0.8.7
+  Downloaded fastrand v2.5.0
+  Downloaded security-framework v3.7.0
+warning: failed to auto-clean cache data
+
+failed to clean entries from the global cache
+
+Caused by:
+  failed to remove file `/Users/oboy/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-macro-0.3.31/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
+   Compiling rustix v1.1.4
+   Compiling getrandom v0.4.3
+   Compiling core-foundation-sys v0.8.7
+   Compiling once_cell v1.21.4
+   Compiling fastrand v2.5.0
+   Compiling native-tls v0.2.18
+   Compiling core-foundation v0.10.1
+   Compiling security-framework-sys v2.17.0
+   Compiling security-framework v3.7.0
+   Compiling tempfile v3.27.0
+   Compiling swift-middleware v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-middleware)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.87s
+     Running unittests src/lib.rs (target/debug/deps/swift_middleware-17b980ba1c9b1d22)
+
+running 7 tests
+test authtoken::tests::forged_client_identity_cleared_without_token ... ok
+test authtoken::tests::stamps_backend_authtoken_marker ... ok
+test authtoken::tests::invalid_token_is_401 ... ok
+test authtoken::tests::stamps_confirmed_identity ... ok
+test authtoken::tests::no_delay_missing_token_401 ... ok
+test authtoken::tests::http_json_accepts_http_and_https_schemes_only ... ok
+test authtoken::tests::parse_keystone_token_json ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 345 filtered out; finished in 0.00s
+

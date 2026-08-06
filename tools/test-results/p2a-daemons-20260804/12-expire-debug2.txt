@@ -1,0 +1,51 @@
++ EP=http://10.0.0.10:8085
++ USR=test:tester
++ KEY=azure-swift-2026.bench
+++ curl -s -m10 -H 'X-Auth-User: test:tester' -H 'X-Auth-Key: azure-swift-2026.bench' -D - -o /dev/null http://10.0.0.10:8085/auth/v1.0
+++ awk 'tolower($1)=="x-auth-token:"{print $2}'
+++ tr -d '\r'
++ TOK=AUTH_tkv1.313738353934313630311e746573741e746573743a7465737465721e415554485f74657374.b6d649185b763d8c8de8988acadb04031776c87c3073535165999cbf8a6bb36a
++ BASE=http://10.0.0.10:8085/v1/AUTH_test
++ H=(-H "X-Auth-Token: $TOK")
++ C=p2adbg2-23737
++ curl -s -o /dev/null -w 'c=%{http_code}\n' -X PUT -H 'X-Auth-Token: AUTH_tkv1.313738353934313630311e746573741e746573743a7465737465721e415554485f74657374.b6d649185b763d8c8de8988acadb04031776c87c3073535165999cbf8a6bb36a' http://10.0.0.10:8085/v1/AUTH_test/p2adbg2-23737
+c=201
+++ date +%s
++ DEL_AT=1785855191
+++ date +%s
+DEL_AT=1785855191 now=1785855201
++ echo 'DEL_AT=1785855191 now=1785855201'
+++ date +%s
++ DEL_AT=1785855203
++ curl -s -D - -o /dev/null -X PUT -H 'X-Auth-Token: AUTH_tkv1.313738353934313630311e746573741e746573743a7465737465721e415554485f74657374.b6d649185b763d8c8de8988acadb04031776c87c3073535165999cbf8a6bb36a' -H 'Content-Type: text/plain' -H 'X-Delete-At: 1785855203' -d x http://10.0.0.10:8085/v1/AUTH_test/p2adbg2-23737/o.txt
++ head -15
+HTTP/1.1 201 Created
+etag: "9dd4e461268c8034f5c8564e155c67a6"
+content-type: text/html; charset=UTF-8
+last-modified: Tue, 04 Aug 2026 14:53:23 GMT
+x-trans-id: tx4bb2cfe3108d24b8004b7-006a71fce1
+x-openstack-request-id: tx4bb2cfe3108d24b8004b7-006a71fce1
+content-length: 0
+
+--- updater local ---
++ echo '--- updater local ---'
++ timeout 60 /usr/local/bin/swift-object-updater /etc/swift/object-server.conf once
+updater_exit=0
+--- peer updaters ---
+peer 10.0.0.2
++ echo updater_exit=0
++ echo '--- peer updaters ---'
++ for h in 10.0.0.2 10.0.0.3 10.0.0.4
++ echo 'peer 10.0.0.2'
++ timeout 30 ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 root@10.0.0.2 'timeout 50 /usr/local/bin/swift-object-updater /etc/swift/object-server.conf once; echo ok'
+ok
+peer 10.0.0.3
++ for h in 10.0.0.2 10.0.0.3 10.0.0.4
++ echo 'peer 10.0.0.3'
++ timeout 30 ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 root@10.0.0.3 'timeout 50 /usr/local/bin/swift-object-updater /etc/swift/object-server.conf once; echo ok'
+ok
+peer 10.0.0.4
++ for h in 10.0.0.2 10.0.0.3 10.0.0.4
++ echo 'peer 10.0.0.4'
++ timeout 30 ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 root@10.0.0.4 'timeout 50 /usr/local/bin/swift-object-updater /etc/swift/object-server.conf once; echo ok'
+ok

@@ -1,0 +1,18 @@
+DB_EC2 6
+id=4886c7200569 key_hash=7a543f06608bc8e6 elen=248 ehead='gAAAAABqcwp_gP2yPp8pTCPW_ouXGkMftx8ZW3U0yMcAhqrY'
+id=55497854190f key_hash=7a543f06608bc8e6 elen=204 ehead='gAAAAABqcwuax2xjbfhMdKlPDFccxHjVGtRMgSBIj61TRbIB'
+id=9c3e4bd43064 key_hash=7a543f06608bc8e6 elen=248 ehead='gAAAAABqcwvzR4iSEV9tsH7sKwefR13eDfBty3eErqC2u_gt'
+id=b66ac6505341 key_hash=7a543f06608bc8e6 elen=248 ehead='gAAAAABqcwuaDtjGUwzStnq73HigGZSheojmewvSrv1T9Jn6'
+id=bd335ba3dbfc key_hash=7a543f06608bc8e6 elen=248 ehead='gAAAAABqcwwTdCkIAXv_lHEsV2UdqonhOFdzBIIMTOt15cbE'
+id=e142f44049f5 key_hash=7a543f06608bc8e6 elen=248 ehead='gAAAAABqcwxJUoOzVsbG-u7Hbs3cbMhFiOy4V54k7lrHfWbq'
+tester_access 1371713510fb project 29af7f1e1977
+STRESS ok 30 fail 0
+rust_style_date HTTP 401 b'{"error":{"code":401,"message":"The request you have made requires authentication.","title":"Unauthorized"}}\n'
+bad_b64 HTTP 401 b'{"error":{"code":401,"message":"The request you have made requires authentication.","title":"Unauthorized"}}\n'
+wrong_sig HTTP 401 b'{"error":{"code":401,"message":"The request you have made requires authentication.","title":"Unauthorized"}}\n'
+VIP_STRESS ok 10 fail 0
+project 29af7f1e19774999bf700fbef31994d3 subj_len 183 auth_tok_len 183 token_keys ['methods', 'user', 'audit_ids', 'expires_at', 'issued_at', 'project', 'is_domain', 'roles', 'catalog']
+create_container HTTP 201 len 0 b''
+put_object HTTP 201 len 0 b''
+get_object HTTP 200 len 17 b's3token-fix-hello'
+S3_ListBuckets_EC2 HTTP 403 b"<?xml version='1.0' encoding='UTF-8'?>\n<Error><Code>InvalidAccessKeyId</Code><Message>The AWS Access Key Id you provided does not exist in our records.</Message></Error>"

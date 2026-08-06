@@ -69,6 +69,11 @@ fn main() {
     let bind_port: u32 = get("app:object-server", "bind_port", "6010")
         .parse()
         .unwrap_or(6010);
+    // When >0 the object server discovers per-device ring ports; conf
+    // bind_port is only a base and must not be used for ring identity.
+    let servers_per_port: u32 = get("app:object-server", "servers_per_port", "0")
+        .parse()
+        .unwrap_or(0);
     let interval: u64 = get("object-reconstructor", "interval", "30")
         .parse()
         .unwrap_or(30);
@@ -139,7 +144,16 @@ fn main() {
     }
 
     let diskfile_config = DiskFileConfig::default();
-    let cleanup = CleanupConfig::default();
+    let reclaim_age: f64 = get("object-reconstructor", "reclaim_age", "604800")
+        .parse()
+        .unwrap_or(604800.0);
+    let commit_window: f64 = get("object-reconstructor", "commit_window", "60")
+        .parse()
+        .unwrap_or(60.0);
+    let cleanup = CleanupConfig {
+        reclaim_age,
+        commit_window,
+    };
     let pusher = TcpSsyncPusher::default();
     let hash_fetcher = HttpSuffixHashFetcher::default();
     let stop = swift_http::install_sigterm_flag();
@@ -147,7 +161,7 @@ fn main() {
 
     logger.info(&format!(
         "swift-object-reconstructor: devices={devices} bind_port={bind_port} \
-         interval={interval}s once={run_once_only} policies={}",
+         servers_per_port={servers_per_port} interval={interval}s once={run_once_only} policies={}",
         ec_policies.len()
     ));
     loop {
@@ -157,6 +171,7 @@ fn main() {
             sweep_policy(
                 &devices_path,
                 bind_port,
+                servers_per_port,
                 policy,
                 &hash_config,
                 &diskfile_config,
@@ -214,6 +229,7 @@ fn main() {
 fn sweep_policy(
     devices_path: &Path,
     bind_port: u32,
+    servers_per_port: u32,
     policy: &EcPolicy,
     hash_config: &HashPathConfig,
     diskfile_config: &DiskFileConfig,
@@ -236,9 +252,14 @@ fn sweep_policy(
         // Identify self: the ring device on this port owning this dir.
         // Address-aware: (port, device) alone is ambiguous across nodes and
         // made every node but the first act as swift1. See `localdev`.
-        let Some(local_id) =
+        // With servers_per_port>0 conf bind_port is only a base (e.g. 6210)
+        // while ring ports are 6211/6212 — match by local IP + device name.
+        let local_id = if servers_per_port > 0 {
+            swift_object_server::localdev::ring_device_id_local_name(&policy.ring, dev_name)
+        } else {
             swift_object_server::localdev::ring_device_id(&policy.ring, bind_port, dev_name)
-        else {
+        };
+        let Some(local_id) = local_id else {
             continue; // device not in this policy's ring
         };
         let part_root = device_path.join(get_data_dir(policy.index));

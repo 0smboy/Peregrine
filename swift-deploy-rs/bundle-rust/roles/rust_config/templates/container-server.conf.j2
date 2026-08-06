@@ -1,6 +1,10 @@
 # {{ ansible_managed }}
-# Parsed by swift-container-server ([app:container-server]) and by
-# swift-db-replicator container ([container-replicator]).
+# Parsed by swift-container-server ([app:container-server]),
+# swift-db-replicator container ([container-replicator]),
+# swift-container-updater ([container-updater]),
+# swift-container-reconciler ([container-reconciler]),
+# swift-container-sharder ([container-sharder]), and
+# swift-db-auditor container ([container-auditor]).
 
 [app:container-server]
 bind_ip = 0.0.0.0
@@ -23,6 +27,38 @@ rsync_devices_root = {{ srv_node_root }}
 {% else %}
 peer_map = {{ container_bind_port }}:{{ srv_node_root }}
 {% endif %}
+log_statsd_host = 127.0.0.1
+log_statsd_port = 9125
+log_statsd_metric_prefix =
+
+[container-updater]
+interval = 300
+log_statsd_host = 127.0.0.1
+log_statsd_port = 9125
+log_statsd_metric_prefix =
+
+[container-reconciler]
+interval = 30
+reclaim_age = 604800
+log_statsd_host = 127.0.0.1
+log_statsd_port = 9125
+log_statsd_metric_prefix =
+
+# Continuous container DB auditor (P2b): Python DatabaseAuditor interval default 1800s.
+[container-auditor]
+interval = 1800
+devices = {{ srv_node_root }}
+mount_check = {{ 'true' if custom_disks | length > 0 else 'false' }}
+log_statsd_host = 127.0.0.1
+log_statsd_port = 9125
+log_statsd_metric_prefix =
+
+# P3-data partial: local cleave only for containers already in SHARDING.
+# auto_shard is ignored (not implemented). Not a full Python L3b claim.
+[container-sharder]
+interval = 30
+cleave_batch_size = 2
+auto_shard = false
 log_statsd_host = 127.0.0.1
 log_statsd_port = 9125
 log_statsd_metric_prefix =

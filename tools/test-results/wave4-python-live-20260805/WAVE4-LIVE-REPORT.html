@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Wave4 Python LIVE — 2026-08-05</title>
+<style>
+body{font:14px/1.45 system-ui,sans-serif;margin:24px;color:#1a1a1a;background:#fafafa}
+h1{font-size:1.4rem;margin:0 0 8px}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-weight:600}
+.bad{background:#fde8e8;color:#8b1a1a}
+.ok{background:#e5f6e8;color:#14532d}
+.warn{background:#fff4d6;color:#7a5b00}
+table{border-collapse:collapse;width:100%;margin:12px 0;background:#fff}
+th,td{border:1px solid #ddd;padding:6px 8px;text-align:left}
+th{background:#f3f3f3}
+code{background:#f0f0f0;padding:1px 4px}
+.muted{color:#555}
+</style>
+</head>
+<body>
+<h1>Wave 4 — Python 3-node LIVE</h1>
+<p><span class="badge bad">BLOCKED</span> · <code>PYTHON_CLUSTER=ABSENT</code> · 2026-08-05</p>
+
+<h2>1) What this cycle did</h2>
+<ul>
+<li>Re-checked df Use% and MemAvailable on swift1–4.</li>
+<li>Confirmed openstack-swift RPM / system <code>import swift</code> absent on 2/3/4.</li>
+<li>Documented swift2 <code>/etc/pyswift</code> single-node leftover (proxy :8090, devices under <code>d1/pysaio</code>) — <strong>not</strong> a stage-3 Python cluster.</li>
+<li>Did <strong>not</strong> install 3-node Python; updated freeze checklist with current df.</li>
+</ul>
+
+<h2>2) Optimized / demoted</h2>
+<table>
+<tr><th>Item</th><th>Action</th></tr>
+<tr><td>3-node install</td><td>BLOCKED (matrix isolation + META_DIRTY)</td></tr>
+<tr><td>4-node</td><td>NOT STARTED</td></tr>
+</table>
+
+<h2>3) Measured</h2>
+<table>
+<tr><th>Host</th><th>d1/d2/d3 Use%</th><th>MemAvailable</th><th>Python</th></tr>
+<tr><td>swift2</td><td>2%/2%/2%</td><td>~4.9 GiB</td><td>ABSENT (pyswift SAIO leftover on :8090/631x — not 3-node)</td></tr>
+<tr><td>swift3</td><td>2%/2%/2%</td><td>~4.9 GiB</td><td>ABSENT</td></tr>
+<tr><td>swift4</td><td>2%/2%/2%</td><td>~4.8 GiB</td><td>ABSENT</td></tr>
+</table>
+
+<h2>4) Gates</h2>
+<table>
+<tr><th>Gate</th><th>Result</th></tr>
+<tr><td>Use% &lt;70%</td><td><span class="badge ok">PASS</span></td></tr>
+<tr><td>MemAvailable</td><td><span class="badge ok">PASS</span></td></tr>
+<tr><td>PORT-DISK-MATRIX Python exclusive d1</td><td><span class="badge bad">FAIL</span> (Rust rings d1-only)</td></tr>
+<tr><td>META / W0′</td><td><span class="badge bad">FAIL</span></td></tr>
+<tr><td>Install executed</td><td><span class="badge bad">NO</span></td></tr>
+<tr><td>4-node (needs 3-node green + Use%&lt;50%)</td><td><span class="badge warn">N/A</span></td></tr>
+</table>
+
+<h2>5) Remaining / FROZEN</h2>
+<ul>
+<li>Stages 3A/3B/3D remain <strong>FROZEN</strong>.</li>
+<li>Unfreeze after W0′ + Rust/Python disk isolation reconciled with W2 spp plan, then <code>INSTALL-PLAN.md</code>.</li>
+</ul>
+<p class="muted">Pack: <code>tools/test-results/wave4-python-live-20260805/</code> · checklist: <code>wave4-python-prep-20260805/FREEZE-UNFREEZE-CHECKLIST.md</code></p>
+</body>
+</html>

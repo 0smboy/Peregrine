@@ -1,0 +1,6 @@
+admin_pass_present True
+secret_keys ['haproxy_stats_password', 'keystone_admin_password', 'keystone_swift_password', 'mariadb_clustercheck_password', 'mariadb_keystone_pass', 'mariadb_root_password', 'swift_cluster_accounts']
+token_ok True status 201
+users_sample []
+users_sample [('admin', '1247a30b'), ('swift', '70e0a84d'), ('tester1', '5bfef885'), ('tester', 'a174f157')]
+test_user_absent

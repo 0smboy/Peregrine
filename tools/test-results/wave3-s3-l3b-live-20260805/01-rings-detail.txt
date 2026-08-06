@@ -1,0 +1,26 @@
+object: paths=[] ips=['10.0.4.1', '10.0.4.2', '10.0.4.3', '10.0.4.4', '10.0.8.1', '10.0.8.2', '10.0.8.3', '10.0.8.4']
+account: paths=[] ips=['10.0.4.1', '10.0.4.2', '10.0.4.3', '10.0.4.4', '10.0.8.1', '10.0.8.2', '10.0.8.3', '10.0.8.4']
+container: paths=[] ips=['10.0.4.1', '10.0.4.2', '10.0.4.3', '10.0.4.4', '10.0.8.1', '10.0.8.2', '10.0.8.3', '10.0.8.4']
+---object-server---
+
+reclaim_age = 604800
+bind_ip = 0.0.0.0
+
+# Managed by swift-deploy-rs
+# Parsed by swift-object-server ([app:object-server]) and by the
+# swift-object-replicator / swift-object-updater / swift-object-reconstructor
+# daemons (their own sections below; they read devices/bind_port from
+# [app:object-server]).
+
+[app:object-server]
+bind_ip = 0.0.0.0
+bind_port = 6200
+devices = /srv/node
+mount_check = fal
+# daemons (their own sections below; they read devices/bind_port from
+bind_port = 6200
+devices = /srv/node
+mount_check = false
+rsync_devices_root = /srv/node
+devices = /srv/node
+mount_check = false

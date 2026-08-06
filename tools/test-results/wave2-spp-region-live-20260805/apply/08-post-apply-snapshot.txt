@@ -1,0 +1,112 @@
+=== POST-APPLY CLUSTER SNAPSHOT 2026-08-05T10:17:03Z ===
+---- swift1 ----
+swift1
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  889M   50G   2% /srv/node/d1
+/dev/sda6        50G  726M   50G   2% /srv/node/d2
+/dev/sda7        50G  729M   50G   2% /srv/node/d3
+spp:
+bind_port = 6210
+servers_per_port = 1
+listen:
+LISTEN 0      128          0.0.0.0:6212       0.0.0.0:*    users:(("swift-object-se",pid=24231,fd=7))                                                                                                                                                                                                                
+LISTEN 0      128          0.0.0.0:6210       0.0.0.0:*    users:(("swift-object-se",pid=24231,fd=5))                                                                                                                                                                                                                
+LISTEN 0      128          0.0.0.0:6211       0.0.0.0:*    users:(("swift-object-se",pid=24231,fd=6))                                                                                                                                                                                                                
+LISTEN 0      128          0.0.0.0:6202       0.0.0.0:*    users:(("swift-account-s",pid=4188494,fd=5))                                                                                                                                                                                                              
+LISTEN 0      128          0.0.0.0:6201       0.0.0.0:*    users:(("swift-container",pid=382079,fd=5))                                                                                                                                                                                                               
+units:
+active
+active
+active
+active
+vip:
+    inet 10.0.0.10/22 scope global secondary eth1
+---- swift2 ----
+swift2
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  855M   50G   2% /srv/node/d1
+/dev/sda6        50G  727M   50G   2% /srv/node/d2
+/dev/sda7        50G  728M   50G   2% /srv/node/d3
+spp:
+bind_port = 6210
+servers_per_port = 1
+listen:
+LISTEN 0      128          0.0.0.0:6202       0.0.0.0:*    users:(("swift-account-s",pid=2040794,fd=5))                                                                                                                                                                                                              
+LISTEN 0      128          0.0.0.0:6201       0.0.0.0:*    users:(("swift-container",pid=808827,fd=5))                                                                                                                                                                                                               
+LISTEN 0      128          0.0.0.0:6211       0.0.0.0:*    users:(("swift-object-se",pid=3976682,fd=6))                                                                                                                                                                                                              
+LISTEN 0      128          0.0.0.0:6210       0.0.0.0:*    users:(("swift-object-se",pid=3976682,fd=5))                                                                                                                                                                                                              
+LISTEN 0      128          0.0.0.0:6212       0.0.0.0:*    users:(("swift-object-se",pid=3976682,fd=7))                                                                                                                                                                                                              
+units:
+active
+active
+active
+active
+vip:
+none
+---- swift3 ----
+swift3
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  887M   50G   2% /srv/node/d1
+/dev/sda6        50G  727M   50G   2% /srv/node/d2
+/dev/sda7        50G  729M   50G   2% /srv/node/d3
+spp:
+bind_port = 6210
+servers_per_port = 1
+listen:
+LISTEN 0      128          0.0.0.0:6202       0.0.0.0:*    users:(("swift-account-s",pid=4062782,fd=5))                                                                                                                                                                                     
+LISTEN 0      128          0.0.0.0:6201       0.0.0.0:*    users:(("swift-container",pid=4000762,fd=5))                                                                                                                                                                                     
+LISTEN 0      128          0.0.0.0:6212       0.0.0.0:*    users:(("swift-object-se",pid=69525,fd=7))                                                                                                                                                                                       
+LISTEN 0      128          0.0.0.0:6211       0.0.0.0:*    users:(("swift-object-se",pid=69525,fd=6))                                                                                                                                                                                       
+LISTEN 0      128          0.0.0.0:6210       0.0.0.0:*    users:(("swift-object-se",pid=69525,fd=5))                                                                                                                                                                                       
+units:
+active
+active
+active
+active
+vip:
+none
+---- swift4 ----
+swift4
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  844M   50G   2% /srv/node/d1
+/dev/sda6        50G  725M   50G   2% /srv/node/d2
+/dev/sda7        50G  728M   50G   2% /srv/node/d3
+spp:
+bind_port = 6210
+servers_per_port = 1
+listen:
+LISTEN 0      128          0.0.0.0:6201       0.0.0.0:*    users:(("swift-container",pid=2552599,fd=5))            
+LISTEN 0      128          0.0.0.0:6202       0.0.0.0:*    users:(("swift-account-s",pid=3877087,fd=5))            
+LISTEN 0      128          0.0.0.0:6211       0.0.0.0:*    users:(("swift-object-se",pid=1318283,fd=6))            
+LISTEN 0      128          0.0.0.0:6210       0.0.0.0:*    users:(("swift-object-se",pid=1318283,fd=5))            
+LISTEN 0      128          0.0.0.0:6212       0.0.0.0:*    users:(("swift-object-se",pid=1318283,fd=7))            
+units:
+active
+active
+active
+active
+vip:
+none
+---- RING ----
+---
+== object ==
+Partition	10986
+Hash	aba872308cfe4bfd519a1967a2074372
+Server:Port Device	10.0.4.3:6210 d1
+Server:Port Device	10.0.4.1:6210 d1
+Server:Port Device	10.0.4.4:6210 d1
+Server:Port Device	10.0.4.2:6212 d3	 # [Handoff]
+Server:Port Device	10.0.4.4:6212 d3	 # [Handoff]
+Server:Port Device	10.0.4.1:6212 d3	 # [Handoff]
+== object-1 ==
+Partition	10986
+Hash	aba872308cfe4bfd519a1967a2074372
+Server:Port Device	10.0.4.3:6210 d1
+Server:Port Device	10.0.4.1:6210 d1
+Server:Port Device	10.0.4.4:6210 d1
+Server:Port Device	10.0.4.2:6212 d3	 # [Handoff]
+Server:Port Device	10.0.4.4:6212 d3	 # [Handoff]
+Server:Port Device	10.0.4.1:6212 d3	 # [Handoff]
+---- VIP HC ----
+vip_hc=200
+be1=200 be2=200 be3=200 be4=200 

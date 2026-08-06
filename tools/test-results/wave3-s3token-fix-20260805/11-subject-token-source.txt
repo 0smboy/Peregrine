@@ -1,0 +1,44 @@
+76:        self.access_token_id = None
+95:    @property
+101:    @property
+111:    @property
+121:    @property
+128:    @property
+132:    @property
+139:    @property
+148:    @property
+157:    @property
+161:    @property
+170:    @property
+174:    @property
+183:    @property
+195:    @property
+197:        return self.access_token_id is not None
+199:    @property
+202:            if self.access_token_id:
+204:                    self.access_token_id
+575:    def mint(self, token_id, issued_at):
+592:        self.id = token_id
+FILE /usr/lib/python3.9/site-packages/keystone/api/auth.py
+  302:        response.headers['X-Subject-Token'] = token_id
+  321:        response.headers['X-Subject-Token'] = token.id
+FILE /usr/lib/python3.9/site-packages/keystone/api/ec2tokens.py
+  73:        response.headers['X-Subject-Token'] = token.id
+FILE /usr/lib/python3.9/site-packages/keystone/api/os_federation.py
+  463:        flask_resp.headers['X-Subject-Token'] = token.id
+AUTHFILE /usr/lib/python3.9/site-packages/keystone/api/auth.py
+  105:    def _render_template_response(host, token_id):
+  108:        subs = {'host': host, 'token': token_id}
+  110:        resp = flask.make_response(body, http.client.OK)
+  287:        token_id = flask.request.headers.get(
+  296:            token_id, window_seconds=window_secs,
+  301:        response = flask.make_response(resp_body, http.client.OK)
+  302:        response.headers['X-Subject-Token'] = token_id
+  320:        response = flask.make_response(resp_body, http.client.CREATED)
+  321:        response.headers['X-Subject-Token'] = token.id
+  331:        token_id = flask.request.headers.get(
+  333:        PROVIDERS.token_provider_api.revoke_token(token_id)
+  407:        response = flask.make_response(response.to_string(), http.client.OK)
+  433:        response = flask.make_response(
+AUTHFILE /usr/lib/python3.9/site-packages/keystone/api/_shared/authentication.py
+  186:        if auth_context.get('access_token_id'):

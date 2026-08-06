@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>Wave 4 · Python prep (2026-08-05)</title>
+<style>
+ body{font:15px/1.45 system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;color:#1a1a1a}
+ table{border-collapse:collapse;width:100%;margin:1rem 0}
+ th,td{border:1px solid #ccc;padding:.45rem .6rem;text-align:left;vertical-align:top}
+ th{background:#f3f3f3} .ok{color:#0a6} .warn{color:#a60} .fail{color:#b00}
+</style>
+</head>
+<body>
+<h1>Wave 4：Python 三节点 prep（2026-08-05）</h1>
+<p>权威：<code>USER-METHOD-PLAN.md</code> 阶段三 · <code>MODES.md</code> Compatibility</p>
+
+<h2>1. 本轮做了什么</h2>
+<ul>
+<li>Contabo df 复核（swift1–4）</li>
+<li>交付 INSTALL-PLAN / PORT-DISK-MATRIX / FREEZE-UNFREEZE-CHECKLIST</li>
+<li><strong>未</strong>装 openstack-swift；<strong>未</strong>宣称 PYTHON_CLUSTER</li>
+</ul>
+
+<h2>2. 优化 / 降级</h2>
+<table>
+<tr><th>项</th><th>动作</th></tr>
+<tr><td>Live Python 三节点（2/3/4）</td><td class="fail">BLOCKED（d* ≥89%）</td></tr>
+<tr><td>四节点 Python</td><td class="warn">Defer（三节点绿且盘&lt;70%后）</td></tr>
+<tr><td>SAIO 冒充三节点</td><td class="ok">拒绝</td></tr>
+</table>
+
+<h2>3. 测量</h2>
+<table>
+<tr><th>检查</th><th>结果</th></tr>
+<tr><td>openstack-swift / import swift</td><td class="fail">ABSENT</td></tr>
+<tr><td>Python :8090/:6100</td><td class="fail">ABSENT</td></tr>
+<tr><td>Rust VIP :8085</td><td class="ok">仍为唯一集群入口</td></tr>
+<tr><td>阶段 3A/3B/3D</td><td class="warn">仍 FROZEN</td></tr>
+</table>
+
+<h2>4. 门禁</h2>
+<table>
+<tr><th>门禁</th><th>结果</th><th>证据</th></tr>
+<tr><td>盘 &lt;~70% 才装</td><td class="fail">FAIL</td><td>00-df-evidence.txt</td></tr>
+<tr><td>计划/矩阵/清单交付</td><td class="ok">PASS</td><td>INSTALL-PLAN.md 等</td></tr>
+<tr><td>PYTHON_CLUSTER present</td><td class="fail">NO</td><td>诚实</td></tr>
+</table>
+
+<h2>5. 剩余 / 下一轮</h2>
+<ol>
+<li class="warn">FROZEN 直至 Wave 0 腾空间 + checklist 全勾</li>
+<li>解冻后按 INSTALL-PLAN 装 2/3/4，证据进 <code>wave4-python-live-*</code></li>
+<li>禁止用本 prep 包冒充 live 绿</li>
+</ol>
+<p>证据：<code>tools/test-results/wave4-python-prep-20260805/</code></p>
+</body>
+</html>

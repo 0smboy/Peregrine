@@ -1,0 +1,24 @@
+STATUS 200 b''
+--- ListMPU uploads= ---
+STATUS 200 b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>mpu90670</Bucket><Prefix></Prefix><KeyMarker></KeyMarker><UploadIdMarker></Up'
+--- ListMPU uploads ---
+STATUS 403 b"<?xml version='1.0' encoding='UTF-8'?>\n<Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does not match the signature you provided. Check your key and signing method.</Message></Error>"
+NOT_501 True st1 200 st2 403
+STATUS 204 b''
+=== sharder conf ===
+● swift-container-sharder.service - Swift container sharder (rust, local cleave)
+     Loaded: loaded (/etc/systemd/system/swift-container-sharder.service; enabled; preset: disabled)
+     Active: active (running) since Tue 2026-08-04 15:38:12 UTC; 1 day 12h ago
+   Main PID: 382081 (swift-container)
+      Tasks: 1 (limit: 48623)
+     Memory: 2.8M (peak: 4.5M)
+        CPU: 3min 30.957s
+     CGroup: /system.slice/swift-container-sharder.service
+             └─382081 /usr/local/bin/swift-container-sharder /etc/swift/container-server.conf
+
+Aug 06 04:26:40 swift1 container-sharder[382081]: INFO container-sharder pass: seen=1159 sharding=0 cleaved_batches=0 finished=0 skipped=1159 failures=0
+Aug 06 04:27:10 swift1 container-sharder[382081]: INFO container-sharder pass: seen=1159 sharding=0 cleaved_batches=0 finished=0 skipped=1159 failures=0
+Aug 06 04:27:40 swift1 container-sharder[382081]: INFO container-sharder pass: seen=1159 sharding=0 cleaved_batches=0 finished=0 skipped=1159 failures=0
+Aug 06 04:28:10 swift1 container-sharder[382081]: INFO container-sharder pass: seen=1159 sharding=0 cleaved_batches=0 finished=0 skipped=1159 failures=0
+Aug 06 04:28:40 swift1 container-sharder[382081]: INFO container-sharder pass: seen=1159 sharding=0 cleaved_batches=0 finished=0 skipped=1159 failures=0
+error: database connection error: --help: DB doesn't exist

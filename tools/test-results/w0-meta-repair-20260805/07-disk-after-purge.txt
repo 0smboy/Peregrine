@@ -1,0 +1,4 @@
+swift1 disk_hash_dirs 0
+swift2 disk_hash_dirs 0
+swift3 disk_hash_dirs 0
+swift4 disk_hash_dirs 0

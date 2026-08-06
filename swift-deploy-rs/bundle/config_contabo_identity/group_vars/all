@@ -1,0 +1,107 @@
+---
+# Contabo Identity — python bundle group_vars (placeholders only).
+# Live secrets: ansible -e @/root/contabo-identity-secrets.yml (mode 0600, not in git).
+
+INSTALL_MODE: production
+SAIO: false
+REINSTALL: false
+USE_WWID: false
+ADD_NODES: false
+use_custom_disks: false
+hostname_modifiable: false
+hostname_prefix: swift
+timezone: Asia/Shanghai
+ntp_internet_server_address: time.pool.aliyun.com
+ntp_local_server_address: 10.0.0.1
+firewall_type: none
+install_proxyfs: false
+ec2_credentials: []
+proxyfs_swift_accounts: []
+
+user: swift
+swift_dir: /etc/swift
+devices: /srv/node
+mount_check: "true"
+
+# ---- Identity ----
+auth_method: keystone
+use_local_mariadbs: true
+use_lb: true
+lb_mode: http
+swift_lb_port: 8085
+proxy_server_bind_port: 8080
+
+# Contabo client VIP (Keepalived already owns 10.0.0.10 for Swift :8085).
+# Keystone public endpoint will share the VIP on :5000 once rust haproxy
+# identity listeners are enabled.
+auth_url_ip: 10.0.0.10
+keystone_endpoint_ip: 10.0.0.10
+keystone_public_interface: eth1
+keystone_endpoint_controller_hostname: controller
+keystone_used_mariadb_port: 3030
+
+haproxy_mariadb_port: 3030
+mariadb_bind_port: 3306
+mariadb_check_bind_port: 9600
+haproxy_keystone_public_service_port: 5000
+haproxy_keystone_admin_service_port: 35357
+uwsgi_keystone_admin_service_port: 35358
+uwsgi_keystone_public_service_port: 5001
+haproxy_monitor_port: 1080
+haproxy_max_conn: 4000
+haproxy_process_num: 1
+
+# Rocky 9 AppStream package / Galera path overrides
+mariadb_backup_package: mariadb-backup
+mariadb_galera_package: galera
+mariadb_galera_legacy_package: galera-4
+mariadb_wsrep_provider: /usr/lib64/galera/libgalera_smm.so
+# Provides /usr/bin/galera_new_cluster on Rocky AppStream (install manually if role list omits it)
+mariadb_server_galera_package: mariadb-server-galera
+
+# Explicit address lists (Identity-only inventory skips ring_config_helper).
+mariadb_storage_network_addresses:
+  - 10.0.4.1
+  - 10.0.4.2
+  - 10.0.4.3
+# Keystone dogpile cache → Contabo memcached (business plane)
+keystone_storage_network_addresses:
+  - 10.0.0.1
+  - 10.0.0.2
+  - 10.0.0.3
+mariadb_cluster_name: contabo-galera
+mariadb_gcache_page_size: 1M
+mariadb_gcache_size: 128M
+mariadb_gcache_recover: "yes"
+
+# PLACEHOLDERS — replace via -e @secrets.yml before live apply; do not commit real secrets.
+mariadb_root_password: REPLACE-MariaRoot-Contabo
+mariadb_keystone_pass: REPLACE-MariaKeystone-Contabo
+mariadb_clustercheck_password: REPLACE-Clustercheck-Contabo
+keystone_admin_password: REPLACE-KeystoneAdmin-Contabo
+keystone_swift_password: REPLACE-KeystoneSwift-Contabo
+haproxy_stats_user: admin
+haproxy_stats_password: REPLACE-HaproxyStats-Contabo
+
+admin_ips:
+  - 10.0.0.1
+
+swift_cluster_accounts:
+  - account_name: test
+    privileged_users:
+      tester: testing
+    regular_users:
+      tester1: testing1
+  - account_name: service
+    privileged_users:
+      swift: REPLACE-KeystoneSwift-Contabo
+
+# Hash paths unused by Identity-only apply; keep distinct from sample.
+swift_hash_path_prefix: CONTABO-IDENTITY-UNUSED
+swift_hash_path_suffix: CONTABO-IDENTITY-UNUSED
+
+memcached_max_conn: 1024
+memcached_cache_size_in_mb: 64
+xinetd_check_instance_max_conn: 50
+xinetd_check_wait_sec: 10
+xinetd_check_instance: 10

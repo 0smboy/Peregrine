@@ -1,0 +1,16 @@
+===== redeploy swift1 =====
+active
+health=200
+	liberasurecode.so.1 => /usr/local/lib/liberasurecode.so.1 (0x00007f8ce64d7000)
+===== redeploy swift2 =====
+active
+health=200
+	liberasurecode.so.1 => /usr/local/lib/liberasurecode.so.1 (0x00007f834b410000)
+===== redeploy swift3 =====
+active
+health=200
+	liberasurecode.so.1 => /usr/local/lib/liberasurecode.so.1 (0x00007f567d2bc000)
+===== redeploy swift4 =====
+active
+health=200
+	liberasurecode.so.1 => /usr/local/lib/liberasurecode.so.1 (0x00007fa7043ab000)

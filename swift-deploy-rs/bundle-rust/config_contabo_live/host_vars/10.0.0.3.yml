@@ -1,0 +1,18 @@
+# Contabo live host_vars for 10.0.0.3
+region: 2
+zone: 3
+# Rust object uses d2+d3; A/C rings use d2 only (manual ring truth).
+# Inventory lists object devices; ring build scripts must not re-add d1 for object.
+# Hybrid Contabo: d1 = Python; Rust A/C on d2; object on d2+d3
+swift_devices:
+  - d2
+  - d3
+account_container_devices:
+  - d2
+object_devices:
+  - d2
+  - d3
+# If building A/C rings separately, use account_container_devices: [d2]
+business_network_address: 10.0.0.3
+storage_network_address: 10.0.4.3
+replication_network_address: 10.0.8.3

@@ -1,0 +1,3 @@
+    Finished `release` profile [optimized] target(s) in 0.28s
+-rwxr-xr-x. 2 root root 2994080 Aug  4 15:10 target/release/swift-db-auditor
+-rwxr-xr-x. 2 root root 1144768 Aug  4 15:10 target/release/swift-object-auditor

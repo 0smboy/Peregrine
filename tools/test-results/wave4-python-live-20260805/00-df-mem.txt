@@ -1,0 +1,44 @@
+# Wave4 gate re-check 2026-08-05T07:39:40Z
+=== 10.0.4.2 ===
+swift2
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  887M   50G   2% /srv/node/d1
+/dev/sda6        50G  755M   50G   2% /srv/node/d2
+/dev/sda7        50G  760M   50G   2% /srv/node/d3
+MemTotal:        7865296 kB
+MemFree:         2353192 kB
+MemAvailable:    5177632 kB
+package openstack-swift is not installed
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'swift'
+LISTEN 0      4096        10.0.0.2:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=439060,fd=18),("swift-proxy-ser",pid=438908,fd=18))
+LISTEN 0      4096        10.0.0.2:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=439059,fd=16),("swift-proxy-ser",pid=438908,fd=16))
+=== 10.0.4.3 ===
+swift3
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  944M   50G   2% /srv/node/d1
+/dev/sda6        50G  757M   50G   2% /srv/node/d2
+/dev/sda7        50G  759M   50G   2% /srv/node/d3
+MemTotal:        7865304 kB
+MemFree:         2697148 kB
+MemAvailable:    5107932 kB
+package openstack-swift is not installed
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'swift'
+no python ports
+=== 10.0.4.4 ===
+swift4
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  864M   50G   2% /srv/node/d1
+/dev/sda6        50G  751M   50G   2% /srv/node/d2
+/dev/sda7        50G  755M   50G   2% /srv/node/d3
+MemTotal:        7865296 kB
+MemFree:         2158840 kB
+MemAvailable:    5056728 kB
+package openstack-swift is not installed
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'swift'
+no python ports

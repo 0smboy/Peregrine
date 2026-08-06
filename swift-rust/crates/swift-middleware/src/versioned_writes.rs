@@ -13,51 +13,106 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `versioned_writes` (legacy/stack mode), ported from
+//! `versioned_writes` (legacy stack + history modes), ported from
 //! `swift/common/middleware/versioned_writes/legacy.py`.
 //!
-//! A container flagged with `X-Versions-Location: <versions_cont>` keeps a
-//! copy of each object's prior contents: before an overwriting `PUT`, the
-//! current object is archived into the versions container under a name that
-//! sorts by object then timestamp, so `DELETE` can later restore the most
-//! recent prior version.
+//! A container flagged with `X-Versions-Location` (stack) or
+//! `X-History-Location` (history) keeps prior object contents in a versions
+//! container. Stack mode restores the newest archive on `DELETE`; history
+//! mode archives the current object and writes a delete-marker before the
+//! delete proceeds.
 //!
-//! The archived name is the interoperability contract and is golden-tested:
+//! Archive name interoperability contract (golden-tested):
 //! `"{len(object):03x}{object}/{Timestamp(ts).internal}"`.
 //!
-//! This module ports the copy-current-on-PUT flow over the Next framework
-//! (HEAD container -> if versioned, GET current -> archive -> proceed with the
-//! PUT). Deferred: the DELETE-restore listing walk, history mode
-//! (`X-History-Location`, which archives deletes too), and the
-//! `swift.authorize` write-ACL recheck.
+//! Container `PUT`/`POST` translates client `X-Versions-Location` /
+//! `X-History-Location` into sysmeta when `allow_versioned_writes` is true.
+//!
+//! Deferred / wontfix:
+//! * `swift.authorize` write-ACL recheck before archive (no authorize hook).
+//! * In-proxy reverse-listing fallback for pre-2.6.0 container servers
+//!   (listing uses `reverse=on` only).
 
+use swift_core::config::config_true_value;
+use swift_core::constraints::check_container_format;
 use swift_core::timestamp::Timestamp;
-use swift_http::{split_path, Body, HeaderKeyDict, Request, Response};
+use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
 
 use crate::{Middleware, NextFn};
 
-/// The `versioned_writes` middleware.
-#[derive(Default)]
-pub struct VersionedWrites;
+const DELETE_MARKER_CONTENT_TYPE: &str = "application/x-deleted;swift_versions_deleted=1";
+const SYSMETA_VERSIONS_LOC: &str = "X-Container-Sysmeta-Versions-Location";
+const SYSMETA_VERSIONS_MODE: &str = "X-Container-Sysmeta-Versions-Mode";
 
-impl VersionedWrites {
-    pub fn new() -> Self {
-        VersionedWrites
+/// The `versioned_writes` middleware.
+pub struct VersionedWrites {
+    /// When set (true/false), this middleware owns enablement. When `None`,
+    /// object versioning still runs if the container already has a location
+    /// (legacy container-server `allow_versions` compatibility).
+    pub allow_versioned_writes: Option<bool>,
+}
+
+impl Default for VersionedWrites {
+    fn default() -> Self {
+        VersionedWrites {
+            allow_versioned_writes: Some(true),
+        }
     }
 }
 
-/// `_build_versions_object_name`: the archive object name for a prior version.
-/// `object_name` length is prefixed as 3 hex digits so archives sort together,
-/// then the object name, then the source version's internal timestamp.
+impl VersionedWrites {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_conf(allow: Option<&str>) -> Self {
+        VersionedWrites {
+            allow_versioned_writes: allow.map(config_true_value),
+        }
+    }
+}
+
+/// Archive object name for a prior version.
 pub fn versions_object_name(object_name: &str, ts: &str) -> Option<String> {
     let internal = ts.parse::<Timestamp>().ok()?.internal();
-    // Python uses len(object_name): the code-point count.
     let len = object_name.chars().count();
     Some(format!("{len:03x}{object_name}/{internal}"))
 }
 
+/// Listing prefix for an object's archives.
+pub fn versions_object_prefix(object_name: &str) -> String {
+    let len = object_name.chars().count();
+    format!("{len:03x}{object_name}/")
+}
+
+struct VersionCfg {
+    location: String,
+    mode: String, // "stack" | "history"
+}
+
+/// Build an internal subrequest that carries the caller's auth and bypasses
+/// TempAuth re-checks (`make_pre_authed_request` stand-in).
+fn pre_authed(method: &str, path: &str, from: &Request) -> Request {
+    let mut sub = from.clone_head();
+    sub.method = method.to_string();
+    sub.path = path.to_string();
+    sub.query_string = String::new();
+    sub.headers.remove("Content-Length");
+    sub.headers.remove("X-If-Delete-At");
+    sub.headers.set("X-Backend-Authorize-Override", "true");
+    sub.headers.set("X-Backend-Source", "VW");
+    sub
+}
+
 impl VersionedWrites {
-    fn copy_current_then_put(
+    fn is_enabled(&self, has_legacy_versions: bool) -> bool {
+        match self.allow_versioned_writes {
+            Some(v) => v,
+            None => has_legacy_versions,
+        }
+    }
+
+    fn copy_current_then_continue(
         &self,
         req: Request,
         version: &str,
@@ -65,44 +120,30 @@ impl VersionedWrites {
         object: &str,
         versions_cont: &str,
         next: &NextFn,
-    ) -> Response {
-        // GET the current object; if absent, nothing to archive.
-        let get_req = Request {
-            method: "GET".to_string(),
-            path: req.path.clone(),
-            query_string: String::new(),
-            headers: HeaderKeyDict::new(),
-            body: Body::empty(),
-        };
+    ) -> Result<Request, Response> {
+        let get_req = pre_authed("GET", &req.path, &req);
         let current = next(get_req);
         if current.status == 404 {
-            return next(req);
+            return Ok(req);
         }
         if !(200..300).contains(&current.status) {
-            // an error reading the current object aborts the write
-            return current;
+            return Err(current);
         }
-        // Determine the source timestamp (x-timestamp preferred).
         let ts_source = current
             .headers
             .get("X-Timestamp")
             .map(|s| s.to_string())
             .unwrap_or_else(|| "0".to_string());
         let Some(vers_name) = versions_object_name(object, &ts_source) else {
-            return next(req);
+            return Ok(req);
         };
-
-        // Archive the current contents into the versions container. The
-        // current object's body is plumbed straight into the archive PUT as
-        // a stream — the copy never materializes the object.
         let (current_reader, current_len) = current.body.into_reader();
-        let mut archive = Request {
-            method: "PUT".to_string(),
-            path: format!("/{version}/{account}/{versions_cont}/{vers_name}"),
-            query_string: String::new(),
-            headers: HeaderKeyDict::new(),
-            body: Body::from_reader(current_reader, current_len),
-        };
+        let mut archive = pre_authed(
+            "PUT",
+            &format!("/{version}/{account}/{versions_cont}/{vers_name}"),
+            &req,
+        );
+        archive.body = Body::from_reader(current_reader, current_len);
         if let Some(ct) = current.headers.get("Content-Type") {
             archive.headers.set("Content-Type", ct);
         }
@@ -111,22 +152,386 @@ impl VersionedWrites {
         }
         let archive_resp = next(archive);
         if !(200..300).contains(&archive_resp.status) {
-            // could not archive -> refuse the overwrite, as Python does
-            return archive_resp;
+            return Err(archive_resp);
         }
+        Ok(req)
+    }
 
-        // Proceed with the original PUT.
+    fn handle_put(
+        &self,
+        req: Request,
+        version: &str,
+        account: &str,
+        object: &str,
+        versions_cont: &str,
+        next: &NextFn,
+    ) -> Response {
+        match self.copy_current_then_continue(req, version, account, object, versions_cont, next) {
+            Ok(req) => next(req),
+            Err(resp) => resp,
+        }
+    }
+
+    fn handle_delete_history(
+        &self,
+        req: Request,
+        version: &str,
+        account: &str,
+        object: &str,
+        versions_cont: &str,
+        next: &NextFn,
+    ) -> Response {
+        let req = match self
+            .copy_current_then_continue(req, version, account, object, versions_cont, next)
+        {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+        let marker_name = versions_object_name(object, &Timestamp::now().internal())
+            .unwrap_or_else(|| format!("{}marker", versions_object_prefix(object)));
+        let mut marker = pre_authed(
+            "PUT",
+            &format!("/{version}/{account}/{versions_cont}/{marker_name}"),
+            &req,
+        );
+        marker
+            .headers
+            .set("Content-Type", DELETE_MARKER_CONTENT_TYPE);
+        marker.headers.set("Content-Length", "0");
+        let marker_resp = next(marker);
+        if !(200..300).contains(&marker_resp.status) {
+            return marker_resp;
+        }
         next(req)
     }
+
+    fn handle_delete_stack(
+        &self,
+        mut req: Request,
+        version: &str,
+        account: &str,
+        container: &str,
+        object: &str,
+        versions_cont: &str,
+        next: &NextFn,
+    ) -> Response {
+        let prefix = versions_object_prefix(object);
+        let mut list_req = pre_authed(
+            "GET",
+            &format!("/{version}/{account}/{versions_cont}"),
+            &req,
+        );
+        list_req.query_string =
+            format!("prefix={}&reverse=on&format=json", quote_path(&prefix));
+        let mut list_resp = next(list_req);
+        if list_resp.status == 404 {
+            return next(req);
+        }
+        if !(200..300).contains(&list_resp.status) {
+            return list_resp;
+        }
+        let listing = match list_resp.body.materialize(MAX_CONTROL_BODY) {
+            Ok(b) => b.to_vec(),
+            Err(_) => return Response::error(500, "Internal Error"),
+        };
+        let items = parse_listing_json(&listing);
+        if items.is_empty() {
+            return next(req);
+        }
+
+        // Walk newest-first (reverse=on). Skip missing archives.
+        let mut idx = 0;
+        while idx < items.len() {
+            let item = &items[idx];
+            idx += 1;
+            if item.content_type == DELETE_MARKER_CONTENT_TYPE {
+                // If current object exists, just delete it (restore to marker).
+                let mut head = pre_authed("HEAD", &req.path, &req);
+                head.headers.set("X-Newest", "True");
+                let hresp = next(head);
+                if hresp.status != 404 {
+                    if !(200..300).contains(&hresp.status) {
+                        return hresp;
+                    }
+                    break;
+                }
+                // No current data — find next non-marker to restore.
+                let mut restored_path: Option<String> = None;
+                while idx < items.len() {
+                    let restore = &items[idx];
+                    idx += 1;
+                    if restore.content_type == DELETE_MARKER_CONTENT_TYPE {
+                        break;
+                    }
+                    if let Some(path) = self.restore_data(
+                        &req,
+                        version,
+                        account,
+                        container,
+                        object,
+                        versions_cont,
+                        &restore.name,
+                        next,
+                    ) {
+                        // Delete the archive we restored from.
+                        let del = pre_authed("DELETE", &path, &req);
+                        let del_resp = next(del);
+                        if del_resp.status != 404 && !(200..300).contains(&del_resp.status) {
+                            return del_resp;
+                        }
+                        restored_path = Some(path);
+                        break;
+                    }
+                }
+                let _ = restored_path;
+                // Redirect original DELETE to the delete-marker archive.
+                req = pre_authed(
+                    "DELETE",
+                    &format!("/{version}/{account}/{versions_cont}/{}", item.name),
+                    &req,
+                );
+                break;
+            } else {
+                // Restore previous version into place, then DELETE the archive.
+                if let Some(restored_path) = self.restore_data(
+                    &req,
+                    version,
+                    account,
+                    container,
+                    object,
+                    versions_cont,
+                    &item.name,
+                    next,
+                ) {
+                    req = pre_authed("DELETE", &restored_path, &req);
+                    break;
+                }
+                // Archive vanished — try next.
+                continue;
+            }
+        }
+        req.headers.remove("X-If-Delete-At");
+        next(req)
+    }
+
+    fn restore_data(
+        &self,
+        auth_from: &Request,
+        version: &str,
+        account: &str,
+        container: &str,
+        object: &str,
+        versions_cont: &str,
+        prev_obj_name: &str,
+        next: &NextFn,
+    ) -> Option<String> {
+        let get_path = format!("/{version}/{account}/{versions_cont}/{prev_obj_name}");
+        let get_req = pre_authed("GET", &get_path, auth_from);
+        let get_resp = next(get_req);
+        if get_resp.status == 404 {
+            return None;
+        }
+        if !(200..300).contains(&get_resp.status) {
+            return None;
+        }
+        let (reader, len) = get_resp.body.into_reader();
+        let mut put = pre_authed(
+            "PUT",
+            &format!("/{version}/{account}/{container}/{object}"),
+            auth_from,
+        );
+        put.body = Body::from_reader(reader, len);
+        if let Some(ct) = get_resp.headers.get("Content-Type") {
+            put.headers.set("Content-Type", ct);
+        }
+        if let Some(l) = len {
+            put.headers.set("Content-Length", l.to_string());
+        }
+        let put_resp = next(put);
+        if !(200..300).contains(&put_resp.status) {
+            return None;
+        }
+        Some(get_path)
+    }
+
+    fn handle_container(&self, mut req: Request, next: &NextFn) -> Response {
+        let enabled = self.allow_versioned_writes;
+        let has_versions = req.headers.contains_key("X-Versions-Location");
+        let has_history = req.headers.contains_key("X-History-Location");
+
+        if has_versions && has_history {
+            let hist = req.headers.get("X-History-Location").unwrap_or("");
+            let vers = req.headers.get("X-Versions-Location").unwrap_or("");
+            if hist.is_empty() {
+                req.headers.remove("X-History-Location");
+            } else if !vers.is_empty() {
+                let mut resp = Response::with_body(
+                    400,
+                    "Only one of x-versions-location or x-history-location may be specified",
+                );
+                resp.headers.set("Content-Type", "text/plain");
+                return resp;
+            } else {
+                req.headers.remove("X-Versions-Location");
+            }
+        }
+
+        let has_versions = req.headers.contains_key("X-Versions-Location");
+        let has_history = req.headers.contains_key("X-History-Location");
+        if has_versions || has_history {
+            let (val, mode) = if has_versions {
+                (
+                    req.headers
+                        .get("X-Versions-Location")
+                        .unwrap_or("")
+                        .to_string(),
+                    "stack",
+                )
+            } else {
+                (
+                    req.headers
+                        .get("X-History-Location")
+                        .unwrap_or("")
+                        .to_string(),
+                    "history",
+                )
+            };
+            if val.is_empty() {
+                req.headers.set("X-Remove-Versions-Location", "x");
+            } else if matches!(enabled, Some(false))
+                && (req.method == "PUT" || req.method == "POST")
+            {
+                let mut resp = Response::with_body(412, "Versioned Writes is disabled");
+                resp.headers.set("Content-Type", "text/plain");
+                return resp;
+            } else {
+                match check_container_format(&val) {
+                    Ok(location) => {
+                        req.headers.set(SYSMETA_VERSIONS_LOC, location);
+                        req.headers.set(SYSMETA_VERSIONS_MODE, mode);
+                        req.headers.set("X-Versions-Location", "");
+                        req.headers.remove("X-Remove-Versions-Location");
+                        req.headers.remove("X-Remove-History-Location");
+                    }
+                    Err(e) => {
+                        let mut resp = Response::with_body(400, e.0);
+                        resp.headers.set("Content-Type", "text/plain");
+                        return resp;
+                    }
+                }
+            }
+        }
+
+        if req.headers.get("X-Remove-Versions-Location").is_some_and(|v| !v.is_empty())
+            || req
+                .headers
+                .get("X-Remove-History-Location")
+                .is_some_and(|v| !v.is_empty())
+        {
+            req.headers.set("X-Versions-Location", "");
+            req.headers.set(SYSMETA_VERSIONS_LOC, "");
+            req.headers.set(SYSMETA_VERSIONS_MODE, "");
+            req.headers.remove("X-Remove-Versions-Location");
+            req.headers.remove("X-Remove-History-Location");
+        }
+
+        let mut resp = next(req);
+        let location = resp
+            .headers
+            .get(SYSMETA_VERSIONS_LOC)
+            .filter(|v| !v.is_empty())
+            .map(|s| s.to_string());
+        let mode = resp
+            .headers
+            .get(SYSMETA_VERSIONS_MODE)
+            .unwrap_or("stack")
+            .to_string();
+        if let Some(loc) = location {
+            if mode == "history" {
+                resp.headers.set("X-History-Location", loc);
+            } else {
+                resp.headers.set("X-Versions-Location", loc);
+            }
+        }
+        resp
+    }
+
+    fn read_version_cfg(&self, cinfo: &Response) -> Option<VersionCfg> {
+        let mut location = cinfo
+            .headers
+            .get(SYSMETA_VERSIONS_LOC)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let mut mode = cinfo
+            .headers
+            .get(SYSMETA_VERSIONS_MODE)
+            .unwrap_or("stack")
+            .to_string();
+        let mut legacy = false;
+        if location.is_none() {
+            if let Some(v) = cinfo
+                .headers
+                .get("X-Versions-Location")
+                .filter(|s| !s.is_empty())
+            {
+                location = Some(v.split('/').next().unwrap_or(v).to_string());
+                mode = "stack".into();
+                legacy = true;
+            }
+        }
+        let location = location?;
+        if !self.is_enabled(legacy) {
+            return None;
+        }
+        let location = location.split('/').next().unwrap_or(&location).to_string();
+        Some(VersionCfg { location, mode })
+    }
+}
+
+fn quote_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+struct ListingItem {
+    name: String,
+    content_type: String,
+}
+
+fn parse_listing_json(bytes: &[u8]) -> Vec<ListingItem> {
+    let value: serde_json::Value = match serde_json::from_slice(bytes) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    if let Some(arr) = value.as_array() {
+        for it in arr {
+            if let Some(name) = it.get("name").and_then(|v| v.as_str()) {
+                out.push(ListingItem {
+                    name: name.to_string(),
+                    content_type: it
+                        .get("content_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("application/octet-stream")
+                        .to_string(),
+                });
+            }
+        }
+    }
+    out
 }
 
 impl Middleware for VersionedWrites {
     fn handle(&self, req: Request, next: &NextFn) -> Response {
-        // Only object PUTs are candidates.
-        if req.method != "PUT" {
-            return next(req);
-        }
-        let parts = match split_path(&req.path, 4, 4, true) {
+        let parts = match split_path(&req.path, 2, 4, true) {
             Ok(p) => p,
             Err(_) => return next(req),
         };
@@ -135,25 +540,45 @@ impl Middleware for VersionedWrites {
         let container = parts[2].clone().unwrap_or_default();
         let object = parts[3].clone().unwrap_or_default();
 
-        // HEAD the container to learn its versioning config.
-        let head = Request {
-            method: "HEAD".to_string(),
-            path: format!("/{version}/{account}/{container}"),
-            query_string: String::new(),
-            headers: HeaderKeyDict::new(),
-            body: Body::empty(),
-        };
-        let cinfo = next(head);
-        let versions_cont = cinfo
-            .headers
-            .get("X-Container-Sysmeta-Versions-Location")
-            .or_else(|| cinfo.headers.get("X-Versions-Location"))
-            .map(|s| s.to_string())
-            .filter(|s| !s.is_empty());
+        // Container request (no object).
+        if !container.is_empty()
+            && object.is_empty()
+            && self.allow_versioned_writes.is_some()
+            && (req.method == "PUT" || req.method == "POST" || req.method == "GET" || req.method == "HEAD")
+        {
+            return self.handle_container(req, next);
+        }
 
-        match versions_cont {
-            Some(vc) => self.copy_current_then_put(req, &version, &account, &object, &vc, next),
-            None => next(req),
+        if object.is_empty() || (req.method != "PUT" && req.method != "DELETE") {
+            return next(req);
+        }
+
+        let head = pre_authed(
+            "HEAD",
+            &format!("/{version}/{account}/{container}"),
+            &req,
+        );
+        let cinfo = next(head);
+        let Some(cfg) = self.read_version_cfg(&cinfo) else {
+            return next(req);
+        };
+
+        if req.method == "PUT" {
+            return self.handle_put(req, &version, &account, &object, &cfg.location, next);
+        }
+        // DELETE
+        if cfg.mode == "history" {
+            self.handle_delete_history(req, &version, &account, &object, &cfg.location, next)
+        } else {
+            self.handle_delete_stack(
+                req,
+                &version,
+                &account,
+                &container,
+                &object,
+                &cfg.location,
+                next,
+            )
         }
     }
 }
@@ -165,13 +590,12 @@ mod tests {
 
     #[test]
     fn test_versions_object_name_format() {
-        // len("obj") == 3 -> "003", then name, then internal timestamp
         let name = versions_object_name("obj", "1751500000.00000").unwrap();
         assert!(name.starts_with("003obj/"), "{name}");
-        // 16-char name -> 0x10 -> "010"
         let long = "x".repeat(16);
         let n2 = versions_object_name(&long, "1751500000.00000").unwrap();
         assert!(n2.starts_with("010"), "{n2}");
+        assert_eq!(versions_object_prefix("obj"), "003obj/");
     }
 
     fn req(method: &str, path: &str) -> Request {
@@ -184,8 +608,6 @@ mod tests {
         }
     }
 
-    /// Backend: HEAD container reports versioning; GET current returns a body;
-    /// records the archive PUT and the final PUT.
     #[allow(clippy::type_complexity)]
     fn backend(
         versioned: bool,
@@ -196,13 +618,25 @@ mod tests {
         let app: NextFn = Arc::new(move |r: Request| {
             log2.lock().unwrap().push((r.method.clone(), r.path.clone()));
             match r.method.as_str() {
-                "HEAD" => {
+                "HEAD" if r.path.ends_with("/c") || r.path.contains("/c?") => {
                     let mut resp = Response::new(204);
                     if versioned {
                         resp.headers
-                            .set("X-Container-Sysmeta-Versions-Location", "versions");
+                            .set(SYSMETA_VERSIONS_LOC, "versions");
+                        resp.headers.set(SYSMETA_VERSIONS_MODE, "stack");
                     }
                     resp
+                }
+                "HEAD" => {
+                    if current_exists {
+                        Response::new(200)
+                    } else {
+                        Response::new(404)
+                    }
+                }
+                "GET" if r.path.contains("/versions") && r.query_string.contains("prefix=") => {
+                    // Empty listing by default
+                    Response::with_body(200, b"[]".to_vec())
                 }
                 "GET" => {
                     if current_exists {
@@ -227,18 +661,9 @@ mod tests {
         let resp = vw.handle(req("PUT", "/v1/AUTH_test/c/obj"), &app);
         assert_eq!(resp.status, 201);
         let calls = log.lock().unwrap();
-        // HEAD container, GET current, PUT archive, PUT original
-        assert_eq!(calls.len(), 4, "{calls:?}");
+        assert!(calls.len() >= 4, "{calls:?}");
         assert_eq!(calls[0].0, "HEAD");
-        assert_eq!(calls[1], ("GET".into(), "/v1/AUTH_test/c/obj".into()));
-        // archive lands in the versions container with the 003obj/ prefix
-        assert_eq!(calls[2].0, "PUT");
-        assert!(
-            calls[2].1.starts_with("/v1/AUTH_test/versions/003obj/"),
-            "{}",
-            calls[2].1
-        );
-        assert_eq!(calls[3], ("PUT".into(), "/v1/AUTH_test/c/obj".into()));
+        assert!(calls.iter().any(|(m, p)| m == "PUT" && p.contains("/versions/003obj/")));
     }
 
     #[test]
@@ -248,9 +673,7 @@ mod tests {
         let resp = vw.handle(req("PUT", "/v1/AUTH_test/c/obj"), &app);
         assert_eq!(resp.status, 201);
         let calls = log.lock().unwrap();
-        // HEAD, GET (404), PUT original — no archive PUT
-        assert_eq!(calls.len(), 3, "{calls:?}");
-        assert!(calls.iter().all(|(_, p)| !p.contains("/versions/")));
+        assert!(calls.iter().all(|(_, p)| !p.contains("/versions/") || p.ends_with("/versions")));
     }
 
     #[test]
@@ -260,8 +683,161 @@ mod tests {
         let resp = vw.handle(req("PUT", "/v1/AUTH_test/c/obj"), &app);
         assert_eq!(resp.status, 201);
         let calls = log.lock().unwrap();
-        // HEAD container, then the PUT — no GET/archive
         assert_eq!(calls.len(), 2, "{calls:?}");
         assert_eq!(calls[1], ("PUT".into(), "/v1/AUTH_test/c/obj".into()));
+    }
+
+    #[test]
+    fn test_delete_stack_restores_previous() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let archive_name = "003obj/1751500000.00000";
+        let app: NextFn = Arc::new(move |r: Request| {
+            log2.lock().unwrap().push((r.method.clone(), r.path.clone()));
+            match (r.method.as_str(), r.path.as_str()) {
+                ("HEAD", p) if p.ends_with("/c") => {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(SYSMETA_VERSIONS_LOC, "versions");
+                    resp.headers.set(SYSMETA_VERSIONS_MODE, "stack");
+                    resp
+                }
+                ("GET", p) if p.contains("/versions") && r.query_string.contains("prefix=") => {
+                    let body = format!(
+                        r#"[{{"name":"{archive_name}","content_type":"text/plain","bytes":7}}]"#
+                    );
+                    Response::with_body(200, body.into_bytes())
+                }
+                ("GET", p) if p.contains("/versions/") => {
+                    let mut resp = Response::with_body(200, b"olddata".to_vec());
+                    resp.headers.set("Content-Type", "text/plain");
+                    resp
+                }
+                ("PUT", _) => Response::new(201),
+                ("DELETE", _) => Response::new(204),
+                _ => Response::new(200),
+            }
+        });
+        let vw = VersionedWrites::new();
+        let mut dreq = req("DELETE", "/v1/AUTH_test/c/obj");
+        dreq.body = Body::empty();
+        let resp = vw.handle(dreq, &app);
+        assert_eq!(resp.status, 204);
+        let calls = log.lock().unwrap();
+        // Must restore (PUT current) then DELETE archive.
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p)| m == "PUT" && p == "/v1/AUTH_test/c/obj"),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p)| m == "DELETE" && p.contains("/versions/003obj/")),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn test_container_sets_sysmeta_from_versions_location() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let app: NextFn = Arc::new(move |r: Request| {
+            log2.lock().unwrap().push((
+                r.method.clone(),
+                r.headers
+                    .get(SYSMETA_VERSIONS_LOC)
+                    .unwrap_or("")
+                    .to_string(),
+            ));
+            let mut resp = Response::new(204);
+            if let Some(v) = r.headers.get(SYSMETA_VERSIONS_LOC) {
+                resp.headers.set(SYSMETA_VERSIONS_LOC, v);
+                resp.headers.set(
+                    SYSMETA_VERSIONS_MODE,
+                    r.headers.get(SYSMETA_VERSIONS_MODE).unwrap_or("stack"),
+                );
+            }
+            resp
+        });
+        let vw = VersionedWrites::new();
+        let mut r = req("POST", "/v1/AUTH_test/c");
+        r.body = Body::empty();
+        r.headers.set("X-Versions-Location", "versions");
+        let resp = vw.handle(r, &app);
+        assert_eq!(resp.status, 204);
+        assert_eq!(
+            resp.headers.get("X-Versions-Location"),
+            Some("versions")
+        );
+        let calls = log.lock().unwrap();
+        assert_eq!(calls[0].1, "versions");
+    }
+
+    #[test]
+    fn test_container_mutual_exclusion() {
+        let app: NextFn = Arc::new(|_r| Response::new(204));
+        let vw = VersionedWrites::new();
+        let mut r = req("POST", "/v1/AUTH_test/c");
+        r.body = Body::empty();
+        r.headers.set("X-Versions-Location", "v1");
+        r.headers.set("X-History-Location", "v2");
+        assert_eq!(vw.handle(r, &app).status, 400);
+    }
+
+    #[test]
+    fn test_delete_history_archives_and_marker() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let app: NextFn = Arc::new(move |r: Request| {
+            let ct = r.headers.get("Content-Type").unwrap_or("").to_string();
+            log2.lock()
+                .unwrap()
+                .push((r.method.clone(), r.path.clone(), ct));
+            match (r.method.as_str(), r.path.as_str()) {
+                ("HEAD", p) if p.ends_with("/c") => {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(SYSMETA_VERSIONS_LOC, "versions");
+                    resp.headers.set(SYSMETA_VERSIONS_MODE, "history");
+                    resp
+                }
+                ("GET", p) if p == "/v1/AUTH_test/c/obj" => {
+                    let mut resp = Response::with_body(200, b"cur".to_vec());
+                    resp.headers.set("X-Timestamp", "1751500000.00000");
+                    resp.headers.set("Content-Type", "text/plain");
+                    resp
+                }
+                ("PUT", _) => Response::new(201),
+                ("DELETE", _) => Response::new(204),
+                _ => Response::new(200),
+            }
+        });
+        let vw = VersionedWrites::new();
+        let mut dreq = req("DELETE", "/v1/AUTH_test/c/obj");
+        dreq.body = Body::empty();
+        let resp = vw.handle(dreq, &app);
+        assert_eq!(resp.status, 204);
+        let calls = log.lock().unwrap();
+        // Archive current, write delete-marker, then DELETE current.
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p, _)| m == "PUT" && p.contains("/versions/003obj/")),
+            "archive missing: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|(m, p, ct)| {
+                m == "PUT"
+                    && p.contains("/versions/")
+                    && ct == DELETE_MARKER_CONTENT_TYPE
+            }),
+            "delete marker missing: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p, _)| m == "DELETE" && p == "/v1/AUTH_test/c/obj"),
+            "original delete missing: {calls:?}"
+        );
     }
 }

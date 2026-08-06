@@ -1,0 +1,43 @@
+vip_health=200
+HTTP/1.1 200 OK
+x-auth-token: AUTH_tkv1.313738353933393632301e746573741e746573743a7465737465721e415554485f74657374.3950208938eecd582e59dd76d4604e90c669045eedeea938f9492dad5bc8fa79
+x-storage-token: AUTH_tkv1.313738353933393632301e746573741e746573743a7465737465721e415554485f74657374.3950208938eecd582e59dd76d4604e90c669045eedeea938f9492dad5bc8fa79
+x-storage-url: http://10.0.0.10:8085/v1/AUTH_test
+content-type: text/plain
+content-length: 0
+x-trans-id: txc3c02e26dd7c6a9800010-006a71f524
+x-openstack-request-id: txc3c02e26dd7c6a9800010-006a71f524
+
+Aug 04 14:20:07 swift1 proxy-server[4178097]: INFO - GET /healthcheck 200 0 0.0003 -
+Aug 04 14:20:07 swift1 proxy-server[4178097]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 04 14:20:09 swift1 proxy-server[4178097]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 04 14:20:09 swift1 proxy-server[4178097]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 04 14:20:12 swift1 proxy-server[4178097]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 04 14:20:12 swift1 proxy-server[4178097]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 04 14:20:14 swift1 proxy-server[4178097]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 04 14:20:14 swift1 proxy-server[4178097]: INFO - - 04/Aug/2026/14/20/14 GET /auth/v1.0 HTTP/1.0 200 - curl/7.76.1 - - - - txac44eea6889649960000e-006a71f51e - 0.0001 - - 1785853214.359338045 1785853214.359388828 -
+Aug 04 14:20:14 swift1 proxy-server[4178097]: INFO - GET /auth/v1.0 200 0 0.0002 -
+Aug 04 14:20:14 swift1 proxy-server[4178097]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 04 14:20:14 swift1 proxy-server[4178097]: INFO - - 04/Aug/2026/14/20/14 HEAD /v1/AUTH_test/p1c-4756 HTTP/1.0 204 - curl/7.76.1 AUTH_tkv1.313738... - - - tx3033422254c6792a00010-006a71f51e - 0.0073 - - 1785853214.956213951 1785853214.963533163 0
+Aug 04 14:20:14 swift1 proxy-server[4178097]: INFO - - 04/Aug/2026/14/20/14 HEAD /v1/AUTH_test HTTP/1.0 204 - curl/7.76.1 AUTH_tkv1.313738... - - - tx3033422254c6792a00010-006a71f51e - 0.0087 - - 1785853214.963600159 1785853214.972317934 -
+Aug 04 14:20:14 swift1 proxy-server[4178097]: INFO - - 04/Aug/2026/14/20/14 HEAD /v1/AUTH_test/p1c-4756 HTTP/1.0 204 - curl/7.76.1 AUTH_tkv1.313738... - - - tx3033422254c6792a00010-006a71f51e - 0.0029 - - 1785853214.972557306 1785853214.975443363 0
+Aug 04 14:20:14 swift1 proxy-server[4178097]: INFO - - 04/Aug/2026/14/20/14 HEAD /v1/AUTH_test/p1c-4756 HTTP/1.0 204 - curl/7.76.1 AUTH_tkv1.313738... - - - tx3033422254c6792a00010-006a71f51e - 0.0028 - - 1785853214.975504637 1785853214.978323221 0
+Aug 04 14:20:15 swift1 proxy-server[4178097]: INFO - - 04/Aug/2026/14/20/15 PUT /v1/AUTH_test/p1c-4756/leaf-c HTTP/1.0 201 - curl/7.76.1 AUTH_tkv1.313738... 2 - - tx3033422254c6792a00010-006a71f51e - 0.0600 - - 1785853214.978366613 1785853215.038361549 -
+Aug 04 14:20:15 swift1 proxy-server[4178097]: INFO - - 04/Aug/2026/14/20/15 PUT /v1/AUTH_test/p1c-4756/leaf-c HTTP/1.0 201 - curl/7.76.1 AUTH_tkv1.313738... 2 - - tx3033422254c6792a00010-006a71f51e - 0.0822 - - 1785853214.956181765 1785853215.038426161 -
+Aug 04 14:20:15 swift1 proxy-server[4178097]: INFO - PUT /v1/AUTH_test/p1c-4756/leaf-c 201 0 0.0824 -
+Aug 04 14:20:15 swift1 proxy-server[4178097]: INFO - - 04/Aug/2026/14/20/15 HEAD /v1/AUTH_test/p1c-4756 HTTP/1.0 204 - curl/7.76.1 AUTH_tkv1.313738... - - - tx6e3c18666edfe3be00011-006a71f51f - 0.0034 - - 1785853215.348639250 1785853215.352043390 0
+Aug 04 14:20:15 swift1 proxy-server[4178097]: INFO - - 04/Aug/2026/14/20/15 HEAD /v1/AUTH_test HTTP/1.0 204 - curl/7.76.1 AUTH_tkv1.313738... - - - tx6e3c18666edfe3be00011-006a71f51f - 0.0277 - - 1785853215.352107048 1785853215.379802465 -
+Aug 04 14:20:15 swift1 proxy-server[4178097]: INFO - - 04/Aug/2026/14/20/15 HEAD /v1/AUTH_test/p1c-4756 HTTP/1.0 204 - curl/7.76.1 AUTH_tkv1.313738... - - - tx6e3c18666edfe3be00011-006a71f51f - 0.0040 - - 1785853215.379875183 1785853215.383829832 0
+Aug 04 14:20:15 swift1 proxy-server[4178097]: INFO - - 04/Aug/2026/14/20/15 HEAD /v1/AUTH_test/p1c-4756 HTTP/1.0 204 - curl/7.76.1 AUTH_tkv1.313738... - - - tx6e3c18666edfe3be00011-006a71f51f - 0.0021 - - 1785853215.383882999 1785853215.386018276 0
+Aug 04 14:20:15 swift1 proxy-server[4178097]: INFO - - 04/Aug/2026/14/20/15 HEAD /v1/AUTH_test/p1c-4756/leaf-a HTTP/1.0 200 - curl/7.76.1 AUTH_tkv1.313738... - - - tx6e3c18666edfe3be00011-006a71f51f - 0.0074 - - 1785853215.386116028 1785853215.393526554 -
+Aug 04 14:20:15 swift1 proxy-server[4178097]: INFO - - 04/Aug/2026/14/20/15 HEAD /v1/AUTH_test/p1c-4756/leaf-b HTTP/1.0 200 - curl/7.76.1 AUTH_tkv1.313738... - - - tx6e3c18666edfe3be00011-006a71f51f - 0.0745 - - 1785853215.393594742 1785853215.468059778 -
+Aug 04 14:20:16 swift1 proxy-server[4178097]: INFO - - 04/Aug/2026/14/20/16 PUT /v1/AUTH_test/p1c-4756/inner HTTP/1.0 201 - curl/7.76.1 AUTH_tkv1.313738... 161 - - tx6e3c18666edfe3be00011-006a71f51f - 0.5664 - - 1785853215.468129635 1785853216.034497261 -
+Aug 04 14:20:16 swift1 proxy-server[4178097]: INFO - - 04/Aug/2026/14/20/16 PUT /v1/AUTH_test/p1c-4756/inner%3Fmultipart-manifest%3Dput HTTP/1.0 201 - curl/7.76.1 AUTH_tkv1.313738... 171 - - tx6e3c18666edfe3be00011-006a71f51f - 0.6860 - - 1785853215.348602772 1785853216.034561872 -
+Aug 04 14:20:16 swift1 proxy-server[4178097]: INFO - PUT /v1/AUTH_test/p1c-4756/inner?multipart-manifest=put 201 0 0.6862 -
+Aug 04 14:20:17 swift1 proxy-server[4178097]: INFO - GET /healthcheck 200 0 0.0003 -
+Aug 04 14:20:17 swift1 proxy-server[4178097]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 04 14:20:19 swift1 proxy-server[4178097]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 04 14:20:19 swift1 proxy-server[4178097]: INFO - GET /healthcheck 200 0 0.0003 -
+[filter:cache]
+use = egg:swift#memcache
+memcache_servers = 10.0.0.1:11211

@@ -1,0 +1,25 @@
+=== LOCAL object_port_per_device ===
+9:# Devices: host_vars.swift_devices (default ["d1"]).
+11:# Object ports: when object_port_per_device (default true), each device on a host
+24:# object_port_per_device default true — Wave 2 full servers_per_port ring contract.
+25:OBJECT_PORT_PER_DEVICE={{ '1' if (object_port_per_device | default(true)) else '0' }}
+47:  if [ "$OBJECT_PORT_PER_DEVICE" = "1" ]; then
+68:{% set devices = hv.swift_devices | default(['d1']) %}
+89:{% set devices = hv.swift_devices | default(['d1']) %}
+112:{% set devices = hv.swift_devices | default(['d1']) %}
+159:{% set devices = hv.swift_devices | default(['d1']) %}
+177:{% set devices = hv.swift_devices | default(['d1']) %}
+197:{% set devices = hv.swift_devices | default(['d1']) %}
+199:{% set obj_port = (object_bind_port | int) + ((loop.index0) if (object_port_per_device | default(true)) else 0) %}
+213:echo "OBJECT_PORT_PER_DEVICE=$OBJECT_PORT_PER_DEVICE"
+=== REMOTE Contabo template ===
+---
+bash: line 1: rg: command not found
+66 /opt/swift-deploy/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2
+604afd947f707c648173067a57cc30b2  /opt/swift-deploy/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2
+3f2c20aeb94b5f0ac4110ec27f647c1d  /Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2
+51:object_port_per_device: true
+53:# with object_port_per_device (process-per-port supervision).
+54:object_servers_per_port: 0
+-rwxr-xr-x. 1 root root 2147088 Aug  4 15:16 /usr/local/bin/swift-object-server
+69a7e5ebdd0193d08a2848d127dd7fceefb0b8c4c410d8dd57294cf864823b3e  /usr/local/bin/swift-object-server

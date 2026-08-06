@@ -1,0 +1,28 @@
+put=201
+C=p2ae5-10458 DEL_AT=1785855437
+Partition	8844
+Hash	8a31ba39e96754f8d1971fe7935ad5f6
+Server:Port Device	10.0.4.1:6200 d1
+Server:Port Device	10.0.4.2:6200 d1
+Server:Port Device	10.0.4.3:6200 d1
+Server:Port Device	10.0.4.4:6200 d1	 # [Handoff]
+HOSTPORT=Device DEV=10.0.4.1:6200 PART=8844 HASH=8a31ba39e96754f8d1971fe7935ad5f6
+--- files before ---
+/srv/node/d1/objects/8844/5f6/8a31ba39e96754f8d1971fe7935ad5f6/1785855434.75503.data
+/srv/node/d1/objects/8844/5f6/8a31ba39e96754f8d1971fe7935ad5f6/1785855437.00000.ts
+/srv/node/d1/objects/8844/5f6/8a31ba39e96754f8d1971fe7935ad5f6/1785855437.00000.ts
+before_client=404
+before_backend=000
+Partition	11610
+Hash	b56ad7a193561dc795131366fc92864d
+Server:Port Device	10.0.4.3:6202 d1
+Server:Port Device	10.0.4.4:6202 d1
+Server:Port Device	10.0.4.1:6202 d1
+Server:Port Device	10.0.4.2:6202 d1	 # [Handoff]
+AHOST=Device ADEV=10.0.4.3:6202 APART=11610
+
+--- journal ---
+after_client=404
+after_backend=000
+--- files after ---
+/srv/node/d1/objects/8844/5f6/8a31ba39e96754f8d1971fe7935ad5f6/1785855437.00000.ts

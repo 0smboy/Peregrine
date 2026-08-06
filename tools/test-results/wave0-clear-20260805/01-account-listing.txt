@@ -1,0 +1,30 @@
+storage http://10.0.0.10:8085/v1/AUTH_test
+x-account-access-control {}
+x-account-bytes-used 178630104308
+x-account-container-count 1021
+x-account-meta-temp-url-key p1b-form-key
+x-account-object-count 874835
+x-account-storage-policy-ec-2-1-bytes-used 5243107
+x-account-storage-policy-ec-2-1-container-count 6
+x-account-storage-policy-ec-2-1-object-count 15
+x-account-storage-policy-policy-0-bytes-used 178624861201
+x-account-storage-policy-policy-0-container-count 1015
+x-account-storage-policy-policy-0-object-count 874820
+containers_listed 1021
+objects_sum 874835
+bytes_sum 178630104308
+  'autocos205e8b511' count=4000 bytes=16384000
+  'autocos31f23a0f1' count=4000 bytes=16384000
+  'autocos3a820b141' count=4000 bytes=16384000
+  'autocos4c7d6e8c1' count=4000 bytes=16384000
+  'autocos7b22216a1' count=4000 bytes=16384000
+  'autocos946b9e191' count=4000 bytes=16384000
+  'autocos9ce0698e1' count=4000 bytes=16384000
+  'autocosa5cec1251' count=4000 bytes=16384000
+  'autocosb41dae341' count=4000 bytes=16384000
+  'autocosc25cbd791' count=4000 bytes=16384000
+  'autocosc93d3ecd1' count=4000 bytes=16384000
+  'autocosd329cc111' count=4000 bytes=16384000
+  'autocose35dcee31' count=4000 bytes=16384000
+  'autocose4d27b9f1' count=4000 bytes=16384000
+  'autocose5cadd231' count=4000 bytes=16384000

@@ -29,15 +29,14 @@
 //! start_time end_time policy_index
 //! ```
 //!
-//! The formatted line is exposed via [`ProxyLogging::get_log_line`]; the
-//! [`Middleware`] impl is a behavior-preserving pass-through (it mutates
-//! nothing and makes no subrequests) because emitting the line needs a
-//! logger sink that the Rust framework does not yet provide.
+//! The formatted line is exposed via [`ProxyLogging::get_log_line`]. When a
+//! [`LogSink`] is installed (proxy wiring passes the process `Logger`),
+//! [`Middleware::handle`] emits one access-log line after the inner app
+//! returns. Without a sink the filter stays a pure pass-through.
 //!
 //! Deferred (need external plumbing that does not exist here, and none of
 //! which changes the default log line):
-//!   * the logger/statsd sinks and every StatsD metric (`*.timing`,
-//!     `*.xfer`, ttfb, labeled counters) — no sink exists yet;
+//!   * StatsD metrics (`*.timing`, `*.xfer`, ttfb, labeled counters);
 //!   * `StrAnonymizer.anonymized` (md5/salt hashing) — only reached when a
 //!     custom `log_msg_template` uses the `.anonymized` format spec; the
 //!     documented default format never does, so values pass through as the
@@ -53,9 +52,15 @@
 //!     headers proxy_logging itself registers (`x-auth-token`,
 //!     `x-storage-token`) IS implemented.
 
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use swift_http::{Request, Response};
 
 use crate::{Middleware, NextFn};
+
+/// Destination for a formatted proxy access-log line.
+pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Missing/zero values render as a single hyphen (`LogStringFormatter`'s
 /// `default='-'`).
@@ -127,6 +132,8 @@ pub struct ProxyLogging {
     /// `access_log_headers_only`: if non-empty, only these (title-cased)
     /// header names are dumped. Ignored unless `log_hdrs` is set.
     pub log_hdrs_only: Vec<String>,
+    /// Optional sink; when set, [`Middleware::handle`] emits the line.
+    sink: Option<LogSink>,
 }
 
 impl Default for ProxyLogging {
@@ -135,11 +142,62 @@ impl Default for ProxyLogging {
             reveal_sensitive_prefix: 16,
             log_hdrs: false,
             log_hdrs_only: Vec::new(),
+            sink: None,
         }
     }
 }
 
 impl ProxyLogging {
+    /// Attach a logger sink so the filter emits access lines at runtime.
+    pub fn with_sink(mut self, sink: LogSink) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
+    /// Build from `[filter:proxy-logging]` / `[filter:proxy_logging]` items.
+    pub fn from_conf(options: &std::collections::HashMap<String, String>) -> Self {
+        let mut pl = ProxyLogging::default();
+        if let Some(v) = options.get("reveal_sensitive_prefix") {
+            if let Ok(n) = v.trim().parse::<usize>() {
+                pl.reveal_sensitive_prefix = n;
+            }
+        }
+        let log_hdrs = options
+            .get("access_log_headers")
+            .or_else(|| options.get("log_headers"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "true" | "1" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+        pl.log_hdrs = log_hdrs;
+        if let Some(only) = options.get("access_log_headers_only") {
+            pl.log_hdrs_only = only
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    // Title-Case like Python's header dump keys.
+                    s.split('-')
+                        .map(|p| {
+                            let mut c = p.chars();
+                            match c.next() {
+                                None => String::new(),
+                                Some(f) => {
+                                    f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase()
+                                }
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("-")
+                })
+                .collect();
+        }
+        pl
+    }
+
     /// `LogStringFormatter.format_field` for a single field: falsy (empty)
     /// values become `-`, everything else is url-quoted with `:/{}` kept
     /// safe (`quote(log, ':/{}')`).
@@ -245,13 +303,45 @@ impl ProxyLogging {
 
 impl Middleware for ProxyLogging {
     fn handle(&self, req: Request, next: &NextFn) -> Response {
-        // Behavior-preserving pass-through. proxy_logging never alters the
-        // request or response that flows through the pipeline; it only
-        // observes them to emit a log line. Emission needs a logger sink
-        // the framework does not expose yet (see the module deferrals), so
-        // here we forward untouched and leave the formatted line available
-        // to callers via `get_log_line`.
-        next(req)
+        // Never mutates request/response; only observes them for the line.
+        let start_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let bytes_recvd = req.body.content_length().unwrap_or(0) as u64;
+        let remote_addr = req
+            .headers
+            .get("x-real-ip")
+            .or_else(|| req.headers.get("remote-addr"))
+            .unwrap_or("")
+            .to_string();
+        let head = req.clone_head();
+        let resp = next(req);
+        if let Some(sink) = &self.sink {
+            let end_time = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(start_time);
+            let bytes_sent = resp.body.content_length().unwrap_or(0) as u64;
+            let ctx = LogContext {
+                remote_addr,
+                protocol: "HTTP/1.0".to_string(),
+                trans_id: resp
+                    .headers
+                    .get("x-trans-id")
+                    .or_else(|| head.headers.get("x-trans-id"))
+                    .map(|s| s.to_string()),
+                source: None,
+                log_info: Vec::new(),
+                start_time,
+                end_time,
+                bytes_recvd,
+                bytes_sent,
+                status_int: resp.status,
+            };
+            sink(&self.get_log_line(&head, &resp, &ctx));
+        }
+        resp
     }
 }
 
@@ -655,5 +745,25 @@ mod tests {
         assert_eq!(resp.status, 204);
         assert_eq!(resp.headers.get("Echo-Method"), Some("GET"));
         assert_eq!(resp.headers.get("Echo-Meta"), Some("bar"));
+    }
+
+    #[test]
+    fn test_sink_emits_access_line() {
+        use std::sync::{Arc, Mutex};
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_lines = Arc::clone(&lines);
+        let pl = ProxyLogging::default().with_sink(Arc::new(move |line: &str| {
+            sink_lines.lock().unwrap().push(line.to_string());
+        }));
+        let req = make_req("GET", "/v1/a/c/o", "", &[]);
+        let app: Arc<dyn Fn(Request) -> Response + Send + Sync> =
+            Arc::new(|_r: Request| Response::new(200));
+        let resp = pl.handle(req, &app);
+        assert_eq!(resp.status, 200);
+        let got = lines.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].contains("GET"), "{}", got[0]);
+        assert!(got[0].contains("/v1/a/c/o"), "{}", got[0]);
+        assert!(got[0].contains("200"), "{}", got[0]);
     }
 }

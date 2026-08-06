@@ -1,0 +1,25 @@
+# Contabo LIVE topology overlay (2026-08-06) — NOT default sample.
+# Source of truth: HANDOFF-20260805 + deploy-align-20260806 live dump.
+# Apply only as inventory overlay; do not blindly rebuild rings without ticket.
+
+# Ports (live):
+#   account 6202, container 6201 (on d2 only in ring)
+#   object base 6210 with object_port_per_device → d2:6211 d3:6212
+#   (d1 reserved for Python py device on swift2/3/4)
+object_bind_port: 6211  # first object device port; +1 per device => 6212
+account_bind_port: 6202
+container_bind_port: 6201
+object_port_per_device: true
+object_servers_per_port: 1
+
+# Devices for RUST data plane (exclude d1 on hybrid nodes)
+# Per-host overrides in host_vars.
+
+# Ingress
+use_lb: true
+lb_mode: https
+haproxy_tls_self_signed: true   # LAB only; PRODUCTION needs haproxy_tls_pem_src
+auth_method: keystone_coexist
+
+# Regions (label affinity, not WAN DR)
+# swift1/2 → r1 ; swift3/4 → r2

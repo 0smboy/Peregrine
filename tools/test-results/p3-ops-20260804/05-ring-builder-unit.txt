@@ -1,0 +1,18 @@
+warning: failed to auto-clean cache data
+
+failed to clean entries from the global cache
+
+Caused by:
+  failed to remove file `/Users/oboy/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-macro-0.3.31/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
+     Running unittests src/bin/ring_builder.rs (target/debug/deps/swift_ring_builder-871727ab78efb10d)
+
+running 2 tests
+test tests::device_identity_ignores_weight_and_replication ... ok
+test tests::parse_plain_and_replication_specs ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

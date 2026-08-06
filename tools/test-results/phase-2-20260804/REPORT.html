@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>阶段 2 · 仅 Rust 四节点（补全）</title>
+<style>
+  body{font:15px/1.45 system-ui,sans-serif;max-width:980px;margin:2rem auto;padding:0 1rem;color:#1a1a1a;background:#fafaf8}
+  h1{font-size:1.45rem;margin-bottom:.3rem} h2{font-size:1.15rem;margin-top:1.6rem}
+  table{border-collapse:collapse;width:100%;margin:1rem 0;background:#fff}
+  th,td{border:1px solid #ccc;padding:.4rem .55rem;text-align:left;vertical-align:top}
+  th{background:#eee} .ok{color:#0a6} .warn{color:#a60} .fail{color:#b00}
+  tr.warn td{background:#fff8e8} code{font-size:13px}
+  .meta{color:#555;font-size:14px}
+</style>
+</head>
+<body>
+<h1>阶段 2：仅 Rust 四节点（2026-08-04 补全）</h1>
+<p class="meta">权威计划：<code>docs/fairness-lab/USER-METHOD-PLAN.md</code> · 门禁：<code>deploy-rs-rust-lb-20260804/</code> · 生成 2026-08-04T08:07Z UTC</p>
+
+<h2>1. 需求 / 目标 / 现状</h2>
+<table>
+<tr><th>用户需求</th><td>关 SAIO；四节点仅 Rust；小→大读写矩阵；VIP 与 DIRECT/单入口<strong>分表</strong>；故障注入；soak≥1h（或诚实 FROZEN）</td></tr>
+<tr><th>完美对齐</th><td>矩阵 fail=0 + chaos PASS + soak≥1h fail=0 + 分表不混比</td></tr>
+<tr><th>现在到哪了</th><td>
+  环境健康 <span class="ok">PASS</span>（VIP@swift2 nopreempt；SAIO 监听全无）·
+  VIP 矩阵 <span class="ok">PASS</span>（fail 合计=0）·
+  DIRECT 矩阵 <span class="warn">WARN</span>（fail 合计=4565；单入口饱和/盘压）·
+  故障 <span class="ok">PASS</span> ·
+  soak <span class="ok">PASS</span>（6 chunks · ok=720441 · fail=0 · ~1h）
+</td></tr>
+</table>
+
+<h2>2. 动作 / 环境 / 效果</h2>
+<table>
+<tr><th>动作</th><th>环境</th><th>效果</th></tr>
+<tr><td>健康核实</td><td>四节点 keepalived+haproxy+proxy+object active；VIP 10.0.0.10@swift2；发请求 swift1；监控 swift4</td><td class="ok">SAIO :8090/:8081 全无；VIP/DIRECT auth 200</td></tr>
+<tr><td>性能矩阵</td><td>autocos backend=swift；VIP=<code>10.0.0.10:8085</code>；DIRECT 单入口=<code>10.0.0.2:8080</code>；尺寸 1KB→16MB；盘约 90% 故限 oc</td><td>见分表；<strong>禁止混比输赢</strong></td></tr>
+<tr><td>故障注入</td><td>proxy-loss@swift3（非 VIP）；object-loss@swift4；先建容器</td><td class="ok">during 20/20；恢复后 10/10；四节点 active；vip_auth=200</td></tr>
+<tr><td>soak</td><td>VIP 4KB_write_32 × 600s chunks × 3600s</td><td class="ok">gate=PASS · chunks=6 · ok_total=720441 · fail_total=0 · 2026-08-04T08:15:53Z→2026-08-04T09:05:52Z</td></tr>
+</table>
+
+<h2>3A. VIP / HA-PATH 表（非正式 Formal-8rep；本轮 breadth 矩阵）</h2>
+<p>入口：<code>http://10.0.0.10:8085</code> · gate=<strong class="pass">PASS</strong></p>
+<table><tr><th>task</th><th>runtime</th><th>oc</th><th>ok</th><th>fail</th><th>ops/s</th><th>success</th></tr>
+<tr class='ok'><td>1KB_write_32</td><td>45</td><td>1500</td><td>8220</td><td>0</td><td>182.67</td><td>100.00%</td></tr>
+<tr class='ok'><td>1KB_read_32</td><td>45</td><td>1500</td><td>35656</td><td>0</td><td>792.36</td><td>100.00%</td></tr>
+<tr class='ok'><td>4KB_write_64</td><td>45</td><td>2000</td><td>11524</td><td>0</td><td>256.09</td><td>100.00%</td></tr>
+<tr class='ok'><td>4KB_read_64</td><td>45</td><td>2000</td><td>56093</td><td>0</td><td>1246.51</td><td>100.00%</td></tr>
+<tr class='ok'><td>64KB_write_32</td><td>45</td><td>800</td><td>6374</td><td>0</td><td>141.64</td><td>100.00%</td></tr>
+<tr class='ok'><td>64KB_read_32</td><td>45</td><td>800</td><td>26417</td><td>0</td><td>587.04</td><td>100.00%</td></tr>
+<tr class='ok'><td>1MB_write_16</td><td>45</td><td>120</td><td>2573</td><td>0</td><td>57.18</td><td>100.00%</td></tr>
+<tr class='ok'><td>1MB_read_16</td><td>45</td><td>120</td><td>2498</td><td>0</td><td>55.51</td><td>100.00%</td></tr>
+<tr class='ok'><td>16MB_write_4</td><td>90</td><td>16</td><td>225</td><td>0</td><td>2.50</td><td>100.00%</td></tr>
+<tr class='ok'><td>16MB_read_4</td><td>90</td><td>16</td><td>312</td><td>0</td><td>3.47</td><td>100.00%</td></tr>
+</table>
+
+<h2>3B. DIRECT / 单入口表（与 VIP 分册，不混比）</h2>
+<p>入口：<code>http://10.0.0.2:8080</code>（单 proxy）· gate=<strong class="warn">WARN</strong></p>
+<table><tr><th>task</th><th>runtime</th><th>oc</th><th>ok</th><th>fail</th><th>ops/s</th><th>success</th></tr>
+<tr class='ok'><td>1KB_write_32</td><td>45</td><td>1500</td><td>8683</td><td>0</td><td>192.96</td><td>100.00%</td></tr>
+<tr class='warn'><td>1KB_read_32</td><td>45</td><td>1500</td><td>38687</td><td>2</td><td>859.71</td><td>99.99%</td></tr>
+<tr class='warn'><td>4KB_write_64</td><td>45</td><td>2000</td><td>9497</td><td>3230</td><td>211.04</td><td>74.62%</td></tr>
+<tr class='ok'><td>4KB_read_64</td><td>45</td><td>2000</td><td>43789</td><td>0</td><td>973.09</td><td>100.00%</td></tr>
+<tr class='warn'><td>64KB_write_32</td><td>45</td><td>800</td><td>7146</td><td>3</td><td>158.80</td><td>99.96%</td></tr>
+<tr class='ok'><td>64KB_read_32</td><td>45</td><td>800</td><td>20728</td><td>0</td><td>460.62</td><td>100.00%</td></tr>
+<tr class='ok'><td>1MB_write_16</td><td>45</td><td>120</td><td>1529</td><td>0</td><td>33.98</td><td>100.00%</td></tr>
+<tr class='warn'><td>1MB_read_16</td><td>45</td><td>120</td><td>3191</td><td>1330</td><td>70.91</td><td>70.58%</td></tr>
+<tr class='ok'><td>16MB_write_4</td><td>90</td><td>16</td><td>243</td><td>0</td><td>2.70</td><td>100.00%</td></tr>
+<tr class='ok'><td>16MB_read_4</td><td>90</td><td>16</td><td>346</td><td>0</td><td>3.84</td><td>100.00%</td></tr>
+</table>
+<p class="meta">DIRECT 上 4KB_write / 1MB_read 等出现 fail：单入口并发+盘压（~90%），不升级为集群 VIP 失败。历史 R4 Formal DIRECT-4PROXY 另册。</p>
+
+<h2>4. 故障注入</h2>
+<pre>{
+  &quot;gate&quot;: &quot;PASS&quot;,
+  &quot;proxy_loss&quot;: {
+    &quot;scenario&quot;: &quot;proxy-loss&quot;,
+    &quot;target&quot;: &quot;swift3&quot;,
+    &quot;during_ok&quot;: 20,
+    &quot;during_fail&quot;: 0,
+    &quot;recovered_active&quot;: &quot;active&quot;,
+    &quot;after_ok&quot;: 10,
+    &quot;after_fail&quot;: 0,
+    &quot;pass&quot;: true
+  },
+  &quot;object_loss&quot;: {
+    &quot;scenario&quot;: &quot;object-loss&quot;,
+    &quot;target&quot;: &quot;swift4&quot;,
+    &quot;during_ok&quot;: 20,
+    &quot;during_fail&quot;: 0,
+    &quot;recovered_active&quot;: &quot;active&quot;,
+    &quot;after_ok&quot;: 10,
+    &quot;after_fail&quot;: 0,
+    &quot;pass&quot;: true
+  },
+  &quot;residual_all_active&quot;: true,
+  &quot;vip_auth&quot;: &quot;200&quot;,
+  &quot;note&quot;: &quot;v2: create container; inject non-VIP proxy (swift3) + object (swift4)&quot;
+}</pre>
+
+<h2>4b. Soak（VIP 4KB_write_32）</h2>
+<table><tr><th>chunk</th><th>ok</th><th>fail</th></tr>
+<tr class='ok'><td>chunk-1</td><td>119117</td><td>0</td></tr>
+<tr class='ok'><td>chunk-2</td><td>89245</td><td>0</td></tr>
+<tr class='ok'><td>chunk-3</td><td>122668</td><td>0</td></tr>
+<tr class='ok'><td>chunk-4</td><td>126619</td><td>0</td></tr>
+<tr class='ok'><td>chunk-5</td><td>129202</td><td>0</td></tr>
+<tr class='ok'><td>chunk-6</td><td>133590</td><td>0</td></tr>
+</table><p class='meta'>gate=<strong class='ok'>PASS</strong> · ok_total=720441 · fail_total=0</p>
+<h2>5. 剩余 / 下一步</h2>
+<table>
+<tr><th>项</th><th>状态</th></tr>
+<tr><td>soak ≥1h</td><td class="ok">PASS fail_total=0（见 soak/SUMMARY.json）</td></tr>
+<tr><td>Formal ≥8rep A-B-B-A</td><td class="warn">backlog（历史 R4 另册；本轮为阶段2 breadth）</td></tr>
+<tr><td>阶段 3 Python 三节点</td><td class="warn">FROZEN — PYTHON_CLUSTER_ABSENT（见 phase-3-20260804/）</td></tr>
+<tr><td>阶段 3C Rust 独占 2/3/4</td><td class="warn">backlog（本轮保持四节点 Rust 以完成阶段2）</td></tr>
+</table>
+
+<p>证据根：<code>tools/test-results/phase-2-20260804/</code> · 脚本：<code>tools/fairness-lab/scripts/phase-2-*.sh</code></p>
+</body>
+</html>

@@ -1,0 +1,33 @@
+account_listed=989 live=26 gone_404=963
+delete live 'p1b-21784' objects=0
+delete live 'p1b-28970' objects=0
+delete live 'p1b-4164' objects=0
+delete live 'p1b-4803' objects=0
+delete live 'p1b-s-19427' objects=1
+delete live 'p1b-s-20570' objects=1
+delete live 'p1c-18386' objects=10
+delete live 'p1c-379' objects=9
+delete live 'p1c-4756' objects=9
+delete live 'p1c-9516' objects=10
+delete live 'p1cdbg-30876' objects=3
+delete live 'p2-chaos-obj-29851' objects=20
+delete live 'p2-ol-1785830724' objects=20
+delete live 'p2-olr-1785830732' objects=10
+delete live 'p2-pl-1785830709' objects=20
+delete live 'p2-plr-1785830723' objects=10
+delete live 'p2a-2908' objects=0
+delete live 'p2adbg-26295' objects=0
+delete live 'p2adbg2-23737' objects=0
+delete live 'p2baud-29269' objects=1
+delete live 'p2baud-3082' objects=1
+delete live 'p2bq-1785857651' objects=1
+delete live 'p2bq2-1785857665' objects=1
+delete live 'p3ss-1785857986' objects=0
+delete live 'swift-deploy-verify' objects=0
+delete live 'tudbg' objects=1
+{
+  "deleted_objs": 128,
+  "deleted_ctrs": 22,
+  "still_live_containers": 4,
+  "stale_account_ghosts": 963
+}

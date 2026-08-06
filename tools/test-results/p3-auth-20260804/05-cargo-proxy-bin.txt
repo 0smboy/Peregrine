@@ -1,0 +1,38 @@
+warning: failed to auto-clean cache data
+
+failed to clean entries from the global cache
+
+Caused by:
+  failed to remove file `/Users/oboy/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-macro-0.3.31/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib) generated 1 warning (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.32s
+     Running unittests src/main.rs (target/debug/deps/swift_proxy_server-2bdf0d8960469c1b)
+
+running 13 tests
+test startup_policy_tests::no_pipeline_line_keeps_default_order ... ok
+test startup_policy_tests::pipeline_order_from_conf_reorders_implemented_filters ... ok
+test startup_policy_tests::every_configured_policy_requires_its_own_ring ... ok
+test startup_policy_tests::ec_ring_replica_mismatch_is_rejected ... ok
+test startup_policy_tests::pipeline_unknown_filter_still_skips ... ok
+test startup_policy_tests::ratelimit_filter_is_built_only_when_configured ... ok
+test startup_policy_tests::server_options_read_workers_clients_timeout_and_log_conf ... ok
+test startup_policy_tests::proxy_config_reads_tuning_knobs_with_default_fallback ... ok
+test startup_policy_tests::pipeline_p1b_wires_formpost_staticweb_quotas_symlink_vw ... ok
+test startup_policy_tests::pipeline_p3_auth_wires_authtoken_keystoneauth_and_info ... ok
+test startup_policy_tests::pipeline_p1a_wires_bulk_tempurl ... ok
+test startup_policy_tests::pipeline_s3api_wires_without_info_pollution ... ok
+test startup_policy_tests::startup_and_reload_share_one_build_path ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

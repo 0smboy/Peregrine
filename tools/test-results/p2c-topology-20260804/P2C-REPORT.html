@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>P2c Topology — GREEN</title>
+<style>
+  :root { --ink:#1a1a1a; --muted:#555; --ok:#1b6b2a; --bg:#f7f5f0; --card:#fff; }
+  body { font-family: ui-sans-serif, system-ui, sans-serif; margin:0; background:var(--bg); color:var(--ink); line-height:1.45; }
+  main { max-width:920px; margin:0 auto; padding:32px 20px 64px; }
+  h1 { font-size:1.75rem; margin:0 0 8px; }
+  .verdict { display:inline-block; background:var(--ok); color:#fff; padding:4px 12px; font-weight:700; letter-spacing:.04em; }
+  .meta { color:var(--muted); margin:12px 0 28px; }
+  section { background:var(--card); padding:20px 22px; margin:0 0 18px; border:1px solid #e2ddd3; }
+  h2 { font-size:1.1rem; margin:0 0 12px; }
+  table { width:100%; border-collapse:collapse; font-size:.95rem; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid #ebe6dc; vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  code { font-family: ui-monospace, Menlo, monospace; font-size:.88em; }
+  ul { margin:8px 0 0; padding-left:1.2em; }
+  .ok { color:var(--ok); font-weight:700; }
+</style>
+</head>
+<body>
+<main>
+  <p class="verdict">GREEN</p>
+  <h1>P2c — Topology / workers</h1>
+  <p class="meta">2026-08-04 · Contabo VIP <code>10.0.0.10:8085</code> · evidence
+    <code>tools/test-results/p2c-topology-20260804/</code></p>
+
+  <section>
+    <h2>1. What this cycle did</h2>
+    <ul>
+      <li>Minimal usable <code>servers_per_port</code>: discover local ports from <code>object*.ring.gz</code> (+ optional <code>ring_ip</code>), bind N REUSEPORT acceptors per port into one shared HTTP worker pool.</li>
+      <li>Workers semantics documented in <code>docs/fairness-lab/WORKERS-SEMANTICS.md</code>; calibration via <code>swift-effective-concurrency</code> and <code>tools/fairness-lab/scripts/effective-concurrency.py</code>.</li>
+      <li>CONFIG-PARITY / blocked / CONTRACTS / ROADMAP updated; Contabo default left at <code>servers_per_port=0</code>.</li>
+      <li>Linux ELF built on swift1 and fanned out to all four nodes; no wipe of <code>/srv/node</code>.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>2. Optimized / fixed / demoted</h2>
+    <ul>
+      <li><strong>Unblocked ISO-CONFIG:</strong> <code>servers_per_port</code> is no longer <code>unsupported</code>; class is <code>iso-config-with-semantic-mapping</code>.</li>
+      <li><strong>Fixed false parity:</strong> docs state clearly that Rust shared pool ≠ Python prefork I/O isolation.</li>
+      <li><strong>Demoted:</strong> Contabo multi-port per-disk rings (requires ring rebuild) → residual, not blocker.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>3. Measured effect</h2>
+    <table>
+      <tr><th>Metric</th><th>Before</th><th>After</th></tr>
+      <tr><td><code>servers_per_port</code> fairness class</td><td>unsupported</td><td>iso-config-with-semantic-mapping</td></tr>
+      <tr><td>Object listen path</td><td>single <code>bind_port</code> only</td><td>same default; multi-port path available when enabled</td></tr>
+      <tr><td>CORE-PATH func VIP</td><td>54/54 (P2a)</td><td class="ok">54/54</td></tr>
+      <tr><td>64KB PUT×50 / GET×50 smoke</td><td>—</td><td class="ok">50/50 · 50/50 · avg 258ms / 133ms</td></tr>
+      <tr><td>Effective concurrency (workers=0)</td><td>cpus*16 clamp</td><td>unchanged (64 threads on Contabo 4-vCPU)</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>4. Gate results</h2>
+    <table>
+      <tr><th>Gate</th><th>Result</th><th>Evidence</th></tr>
+      <tr><td>Unit tests <code>servers_per_port</code></td><td class="ok">8/8</td><td><code>05-cargo-unit.txt</code>, <code>12-build-swift1.txt</code></td></tr>
+      <tr><td>HTTP shutdown multi-accept path</td><td class="ok">PASS</td><td><code>05b-http-shutdown.txt</code></td></tr>
+      <tr><td>Contabo object active ×4</td><td class="ok">PASS</td><td><code>13-fanout.txt</code></td></tr>
+      <tr><td>Ring discovery (swift4)</td><td class="ok">{6200}</td><td><code>07-discovery-smoke.txt</code></td></tr>
+      <tr><td>CORE-PATH func VIP</td><td class="ok">54/54</td><td><code>14-func-suite-vip.txt</code></td></tr>
+      <tr><td>Perf smoke (no pathological regression)</td><td class="ok">PASS</td><td><code>15-perf-smoke.txt</code></td></tr>
+      <tr><td>Disk / no wipe</td><td class="ok">OK</td><td>~22% root sample on swift4</td></tr>
+      <tr><td>Contract / ROADMAP</td><td class="ok">DONE</td><td>CONFIG-PARITY, blocked, CONTRACTS, ROADMAP</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>5. Remaining / next cycle</h2>
+    <ul>
+      <li><strong>FROZEN this wave:</strong> P3 tracks (Keystone / S3 / TLS / sharding). Do not start P3 from this evidence pack.</li>
+      <li><strong>P2b</strong> may continue in parallel (auditor / container-sync) — avoided conflicting edits beyond object bind/listen + docs/tools.</li>
+      <li><strong>Backlog:</strong> Contabo ring rebuild for true per-disk ports; optional process-isolated acceptors if Python I/O isolation is required for ISO-RESOURCE claims.</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

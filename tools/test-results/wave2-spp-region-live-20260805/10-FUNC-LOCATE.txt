@@ -1,0 +1,8 @@
+/opt/swift-deploy/bundle-rust/../:
+total 4
+drwxr-xr-x. 4 root root    39 Aug  4 05:10 .
+drwxr-xr-x. 3 root root    26 Aug  1 15:38 ..
+drwxr-xr-x. 5  501 games 4096 Jul 30 06:22 bundle
+drwxr-xr-x. 4  501 games   93 Jul 30 06:22 bundle-rust
+/root/work/swift-tools/func-suite.sh
+/root/work/swift-rust/tools/func-suite.sh

@@ -27,12 +27,20 @@ name = "swift-object-updater"
 path = "src/bin/object_updater.rs"
 
 [[bin]]
+name = "swift-object-expirer"
+path = "src/bin/object_expirer.rs"
+
+[[bin]]
 name = "swift-object-replicator"
 path = "src/bin/object_replicator.rs"
 
 [[bin]]
 name = "swift-object-reconstructor"
 path = "src/bin/object_reconstructor.rs"
+
+[[bin]]
+name = "swift-effective-concurrency"
+path = "src/bin/effective_concurrency.rs"
 
 [dev-dependencies]
 swift-container-server = { path = "../swift-container-server" }

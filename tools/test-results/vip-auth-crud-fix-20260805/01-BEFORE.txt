@@ -1,0 +1,10 @@
+=== BEFORE vip-auth-crud-fix ===
+proxy_sha256 a0c252bc8dd9bd649b95f99b4b74aa188a7ef40c92d78680e3ea9be5f5d640f8
+proxy_mtime 1785926396.1177306
+pipeline catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+tempauth_auth=200 toklen=149 storage_url=http://10.0.0.10:8085/v1/AUTH_test
+tempauth_list_AUTH_test=401
+keystone_token=201 toklen=183 project_id=29af7f1e19774999bf700fbef31994d3
+keystone_list_AUTH_project_id=200
+keystone_list_AUTH_test_name=403  # expect 403 (name≠id)
+NOTE: BEFORE binary keystoneauth stamped Auth-Plugin on AUTH_* without identity → TempAuth list 401.

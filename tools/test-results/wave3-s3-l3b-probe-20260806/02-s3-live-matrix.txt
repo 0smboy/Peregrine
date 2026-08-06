@@ -1,0 +1,14 @@
+PASS  s3:ListBuckets  status=200  <?xml version='1.0' encoding='UTF-8'?>
+<ListAllMyBucketsResult xmlns="http://s3.
+PASS  s3:CreateBucket  status=200  
+PASS  s3:PutObject  status=200  
+PASS  s3:GetObject  status=200  len=15
+PASS  s3:ListObjectsV1  status=200  <?xml version='1.0' encoding='UTF-8'?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-
+PASS  s3:ListObjectsV2  status=200  <?xml version='1.0' encoding='UTF-8'?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-
+FAIL  s3:ListMultipartUploads  status=403  <?xml version='1.0' encoding='UTF-8'?>
+<Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calcul
+PASS  s3:DeleteObject  status=204  
+PASS  s3:DeleteBucket  status=204  
+SUMMARY pass=8 fail=1

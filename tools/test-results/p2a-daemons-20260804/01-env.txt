@@ -1,0 +1,2 @@
+TOKEN=... STORAGE=
+Using STORAGE=http://10.0.0.10:8085/v1/AUTH_test

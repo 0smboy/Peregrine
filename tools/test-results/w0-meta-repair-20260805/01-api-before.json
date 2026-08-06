@@ -1,0 +1,17 @@
+{
+  "storage_url": "http://10.0.0.10:8085/v1/AUTH_test",
+  "token_prefix": "AUTH_tkv1.3137383630",
+  "headers": {
+    "x-account-container-count": "968",
+    "x-account-object-count": "846331",
+    "x-account-bytes-used": "176797386545",
+    "x-account-storage-policy-policy-0-container-count": "962",
+    "x-account-storage-policy-policy-0-object-count": "846316",
+    "x-account-storage-policy-policy-0-bytes-used": "176792143438",
+    "x-account-storage-policy-ec-2-1-container-count": "6",
+    "x-account-storage-policy-ec-2-1-object-count": "15",
+    "x-account-storage-policy-ec-2-1-bytes-used": "5243107",
+    "x-account-meta-temp-url-key": "p1b-form-key",
+    "x-account-access-control": "{}"
+  }
+}

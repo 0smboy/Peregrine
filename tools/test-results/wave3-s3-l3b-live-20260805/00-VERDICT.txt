@@ -1,0 +1,7 @@
+WAVE3-CONTABO-LIVE: PARTIAL
+unit_prior: GREEN (wave3-s3-l3b-prod-20260805)
+contabo_tempauth_s3: GREEN (VIP HTTPS SigV4 suite incl ListMPU)
+s3token_live: BLOCKED (Keystone worker crash on valid EC2; s3api no passthrough)
+l3b_quorum: NOT_RUN
+keep_4kb: NOT_CLAIMED
+production_go_live: NO

@@ -1,0 +1,91 @@
+===== swift1 =====
+active
+active
+active
+inactive
+Aug 04 15:19:13 swift1 object-auditor[335143]: INFO swift-object-auditor: devices=/srv/node mount_check=false interval=30s policies=2 once=false
+Aug 04 15:19:28 swift1 object-auditor[337314]: INFO swift-object-auditor: devices=/srv/node mount_check=false interval=30s policies=2 once=false
+Aug 04 15:16:38 swift1 account-auditor[311912]: INFO account-auditor pass: passed=3 failed=0 duration=0.0s
+Aug 04 15:16:39 swift1 container-auditor[311926]: INFO container-auditor pass: passed=966 failed=0 duration=0.4s
+object.recon audit_keys= ['object_auditor_stats_ALL']
+  object_auditor_stats_ALL = {'audit_time': 5.459785461425781e-05, 'errors': 0, 'passes': 0, 'quarantined': 0, 'start_time': 1785857200.9574485}
+account.recon audit_keys= ['account_auditor_failure', 'account_auditor_last', 'account_auditor_pass', 'account_audits_since']
+  account_auditor_failure = 0
+  account_auditor_last = 1785857199.5206892
+  account_auditor_pass = 3
+  account_audits_since = 0.004647016525268555
+container.recon audit_keys= ['container_auditor_failure', 'container_auditor_last', 'container_auditor_pass', 'container_audits_since']
+  container_auditor_failure = 0
+  container_auditor_last = 1785857200.0300128
+  container_auditor_pass = 970
+  container_audits_since = 0.5068097114562988
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   50G   24K 100% /srv/node/d1
+/dev/sda6        50G   45G  5.1G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.6G  89% /srv/node/d3
+===== swift2 =====
+active
+active
+active
+inactive
+Aug 04 15:41:15 swift2 account-auditor[742780]: INFO account-auditor pass: passed=3 failed=0 duration=0.1s
+Aug 04 15:41:15 swift2 container-auditor[742782]: INFO container-auditor pass: passed=979 failed=0 duration=0.9s
+object.recon audit_keys= []
+account.recon audit_keys= ['account_auditor_failure', 'account_auditor_last', 'account_auditor_pass', 'account_audits_since']
+  account_auditor_failure = 0
+  account_auditor_last = 1785858075.686403
+  account_auditor_pass = 3
+  account_audits_since = 0.09633898735046388
+container.recon audit_keys= ['container_auditor_failure', 'container_auditor_last', 'container_auditor_pass', 'container_audits_since']
+  container_auditor_failure = 0
+  container_auditor_last = 1785858075.019974
+  container_auditor_pass = 979
+  container_audits_since = 0.8647050857543945
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   46G  4.0G  92% /srv/node/d1
+/dev/sda6        50G   45G  5.3G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.2G  90% /srv/node/d3
+===== swift3 =====
+active
+active
+active
+inactive
+Aug 04 15:41:06 swift3 account-auditor[3918332]: INFO account-auditor pass: passed=2 failed=0 duration=0.1s
+Aug 04 15:41:07 swift3 container-auditor[3918334]: INFO container-auditor pass: passed=1056 failed=0 duration=0.5s
+object.recon audit_keys= []
+account.recon audit_keys= ['account_auditor_failure', 'account_auditor_last', 'account_auditor_pass', 'account_audits_since']
+  account_auditor_failure = 0
+  account_auditor_last = 1785858066.335785
+  account_auditor_pass = 2
+  account_audits_since = 0.0935826301574707
+container.recon audit_keys= ['container_auditor_failure', 'container_auditor_last', 'container_auditor_pass', 'container_audits_since']
+  container_auditor_failure = 0
+  container_auditor_last = 1785858067.1005328
+  container_auditor_pass = 1056
+  container_audits_since = 0.45789599418640137
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   49G  1.3G  98% /srv/node/d1
+/dev/sda6        50G   45G  5.8G  89% /srv/node/d2
+/dev/sda7        50G   45G  5.6G  89% /srv/node/d3
+===== swift4 =====
+active
+active
+active
+inactive
+Aug 04 15:41:18 swift4 account-auditor[2447164]: INFO account-auditor pass: passed=4 failed=0 duration=0.1s
+Aug 04 15:41:19 swift4 container-auditor[2447167]: INFO container-auditor pass: passed=965 failed=0 duration=1.0s
+object.recon audit_keys= []
+account.recon audit_keys= ['account_auditor_failure', 'account_auditor_last', 'account_auditor_pass', 'account_audits_since']
+  account_auditor_failure = 0
+  account_auditor_last = 1785858078.4388618
+  account_auditor_pass = 4
+  account_audits_since = 0.07253551483154297
+container.recon audit_keys= ['container_auditor_failure', 'container_auditor_last', 'container_auditor_pass', 'container_audits_since']
+  container_auditor_failure = 0
+  container_auditor_last = 1785858079.328072
+  container_auditor_pass = 965
+  container_audits_since = 0.9515790939331056
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   46G  5.0G  91% /srv/node/d1
+/dev/sda6        50G   46G  5.0G  91% /srv/node/d2
+/dev/sda7        50G   45G  5.5G  90% /srv/node/d3

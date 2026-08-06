@@ -1,0 +1,73 @@
+=== mkfs/wipefs/dd/parted in bundle-rust (executable tasks only) ===
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/expand.yml:12:# Dual-guard: never mkfs / wipe /srv/node. Expand mode never rm's existing
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/README.md:19:| Devices | `host_vars.swift_devices` (default `d1`) — **mkdir only**, never mkfs/wipe `/srv/node` |
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/README.md:90:  rust_disks/        mkdir device dirs only (never mkfs)
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_disks/tasks/main.yml:5:#   1) This role NEVER runs mkfs / wipefs / dd / parted.
+=== expand.yml exists ===
+OK
+=== haproxy ssl bind ===
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/templates/haproxy.cfg.j2:27:{% if lb_mode == "https" %}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/templates/haproxy.cfg.j2:29:    bind *:{{ swift_lb_port }} ssl crt {{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:7:#   1) haproxy_tls_pem_src — controller-side PEM (cert+key concatenated)
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:8:#   2) haproxy_tls_self_signed (default true) — openssl on first haproxy host
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:42:  when: lb_mode == "https"
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:46:    src: "{{ haproxy_tls_pem_src }}"
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:47:    dest: "{{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}"
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:49:  when: lb_mode == "https" and (haproxy_tls_pem_src | default('')) | length > 0
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:54:    PEM="{{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}"
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:57:    DAYS="{{ haproxy_tls_days | default(825) }}"
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:68:  register: rust_haproxy_tls_gen
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:69:  changed_when: rust_haproxy_tls_gen.stdout.find('TLS-GENERATED') != -1
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:71:    lb_mode == "https"
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:72:    and (haproxy_tls_pem_src | default('')) | length == 0
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:73:    and (haproxy_tls_self_signed | default(true))
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:78:    src: "{{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}"
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:85:    lb_mode == "https"
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:86:    and (haproxy_tls_pem_src | default('')) | length == 0
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:87:    and (haproxy_tls_self_signed | default(true))
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:92:    dest: "{{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}"
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:95:    lb_mode == "https"
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:96:    and (haproxy_tls_pem_src | default('')) | length == 0
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:97:    and (haproxy_tls_self_signed | default(true))
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:101:    echo "lb_mode=https requires haproxy_tls_pem_src or haproxy_tls_self_signed=true" >&2
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/roles/rust_haproxy/tasks/main.yml:103:  when: lb_mode == "https" and (haproxy_tls_pem_src | default('')) | length == 0 and haproxy_tls_self_signed == false
+=== build_rings region/zone/devices/expand ===
+9:# Devices: host_vars.swift_devices (default ["d1"]).
+10:# Region/zone: host_vars.region / host_vars.zone (default r1 / group-order).
+11:# Expand: ADD_NODES or ring_expand true → never rm rings; idempotent add + rebalance.
+18:EXPAND={{ '1' if (ADD_NODES | default(false) or ring_expand | default(false)) else '0' }}
+19:FORCE={{ '1' if (ring_force_rebuild | default(false)) else '0' }}
+22:  local ring_file="$1" region="$2" zone="$3" sip="$4" rip="$5" port="$6" device="$7" weight="$8"
+25:    spec="r${region}z${zone}-${sip}:${port}/${device}"
+27:    spec="r${region}z${zone}-${sip}:${port}R${rip}:${port}/${device}"
+38:if [ "$EXPAND" = "1" ]; then
+50:{% set region = hv.region | default(1) %}
+52:{% set devices = hv.swift_devices | default(['d1']) %}
+54:  if add_device account.ring.gz "{{ region }}" "{{ zone }}" \
+63:    echo "EXPAND-REBALANCED account.ring.gz"
+65:    echo "EXPAND-CURRENT account.ring.gz"
+71:{% set region = hv.region | default(1) %}
+73:{% set devices = hv.swift_devices | default(['d1']) %}
+75:  if add_device container.ring.gz "{{ region }}" "{{ zone }}" \
+84:    echo "EXPAND-REBALANCED container.ring.gz"
+86:    echo "EXPAND-CURRENT container.ring.gz"
+94:{% set region = hv.region | default(1) %}
+96:{% set devices = hv.swift_devices | default(['d1']) %}
+98:  if add_device {{ ring_file }} "{{ region }}" "{{ zone }}" \
+107:    echo "EXPAND-REBALANCED {{ ring_file }}"
+109:    echo "EXPAND-CURRENT {{ ring_file }}"
+114:  echo "RINGS-EXPANDED"
+121:if [ "$FORCE" != "1" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$SELF_SHA" ]; then
+131:if [ "$FORCE" = "1" ]; then
+140:{% set region = hv.region | default(1) %}
+142:{% set devices = hv.swift_devices | default(['d1']) %}
+145:"$RB" account.ring.gz add r{{ region }}z{{ zone }}-{{ hv.storage_network_address }}:{{ account_bind_port }}/{{ device }} {{ swift_device_weight }}
+147:"$RB" account.ring.gz add r{{ region }}z{{ zone }}-{{ hv.storage_network_address }}:{{ account_bind_port }}R{{ hv.replication_network_address }}:{{ account_bind_port }}/{{ device }} {{ swift_device_weight }}
+158:{% set region = hv.region | default(1) %}
+160:{% set devices = hv.swift_devices | default(['d1']) %}
+163:"$RB" container.ring.gz add r{{ region }}z{{ zone }}-{{ hv.storage_network_address }}:{{ container_bind_port }}/{{ device }} {{ swift_device_weight }}
+165:"$RB" container.ring.gz add r{{ region }}z{{ zone }}-{{ hv.storage_network_address }}:{{ container_bind_port }}R{{ hv.replication_network_address }}:{{ container_bind_port }}/{{ device }} {{ swift_device_weight }}
+178:{% set region = hv.region | default(1) %}
+180:{% set devices = hv.swift_devices | default(['d1']) %}
+183:"$RB" {{ ring_file }} add r{{ region }}z{{ zone }}-{{ hv.storage_network_address }}:{{ object_bind_port }}/{{ device }} {{ swift_device_weight }}
+185:"$RB" {{ ring_file }} add r{{ region }}z{{ zone }}-{{ hv.storage_network_address }}:{{ object_bind_port }}R{{ hv.replication_network_address }}:{{ object_bind_port }}/{{ device }} {{ swift_device_weight }}

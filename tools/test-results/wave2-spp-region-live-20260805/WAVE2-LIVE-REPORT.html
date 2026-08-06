@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Wave2 spp/region LIVE apply — 2026-08-05</title>
+<style>
+body{font:14px/1.45 system-ui,sans-serif;margin:24px;color:#1a1a1a;background:#fafafa}
+h1{font-size:1.4rem;margin:0 0 8px}
+h2{font-size:1.1rem;margin:20px 0 8px}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-weight:600}
+.bad{background:#fde8e8;color:#8b1a1a}
+.ok{background:#e5f6e8;color:#14532d}
+.warn{background:#fff4d6;color:#7a5b00}
+table{border-collapse:collapse;width:100%;margin:12px 0;background:#fff}
+th,td{border:1px solid #ddd;padding:6px 8px;text-align:left}
+th{background:#f3f3f3}
+code{background:#f0f0f0;padding:1px 4px}
+.muted{color:#555}
+</style>
+</head>
+<body>
+<h1>Wave 2 — spp + multi-region LIVE (apply)</h1>
+<p><span class="badge warn">PARTIAL</span> · 2026-08-05 · Contabo VIP <code>https://10.0.0.10:8085</code> (self-signed) · Keystone LAB + TempAuth coexist</p>
+<p class="muted">Not GREEN. Not PRODUCTION-GO-LIVE. Soak completed ≥1h with fail=7 (need fail=0 for PASS). Object ports 6210+ / spp=1 / r1-r2 applied.</p>
+
+<h2>1) What this cycle did</h2>
+<ul>
+<li>Prep pack had BACKLOG (META dirty, port collision). W0′ META_CLEAN assumed; apply used object base <strong>6210+</strong>.</li>
+<li>Maintenance window: backup <code>/root/w2-ring-backup-20260805T100051Z/</code>; rebuilt <code>object</code> + <code>object-1</code> rings only (A/C untouched).</li>
+<li>12 devices (d1/d2/d3 × 4 nodes), ports 6210/6211/6212, regions r1=swift1/2 r2=swift3/4.</li>
+<li><code>servers_per_port=1</code>, <code>bind_port=6210</code>; all nodes listen 6210–6212.</li>
+<li>Keystone spp smoke + region/port drill PASS; keepalived failover PASS.</li>
+<li>1h Keystone soak closed: <code>SOAK_END 2026-08-05T11:13:52Z n=192 ok=185 fail=7</code>.</li>
+</ul>
+
+<h2>2) Optimized / demoted</h2>
+<table>
+<tr><th>Item</th><th>Action</th></tr>
+<tr><td>Colliding object ports 6201/6202</td><td>Remapped to <strong>6210–6212</strong></td></tr>
+<tr><td>Live spp + 3-port discovery</td><td><strong>Applied</strong></td></tr>
+<tr><td>r1/r2 labels</td><td><strong>Applied</strong> + drill</td></tr>
+<tr><td>TempAuth func as gate</td><td>Demoted (storage 401 → Keystone)</td></tr>
+<tr><td>EC in func suite</td><td>Blocked (proxy without <code>--features ec</code>)</td></tr>
+<tr><td>Soak fail=0</td><td><strong>Not met</strong> (WARN)</td></tr>
+<tr><td>W2 GREEN / PRODUCTION-GO-LIVE</td><td><strong>Rejected</strong></td></tr>
+</table>
+
+<h2>3) Measured effect</h2>
+<table>
+<tr><th>Metric</th><th>Before apply</th><th>After apply</th></tr>
+<tr><td>Object ports</td><td>{6200}</td><td>{6210,6211,6212}</td></tr>
+<tr><td>servers_per_port</td><td>0 / absent</td><td>1</td></tr>
+<tr><td>Object devices</td><td>4× d1 region=1</td><td>12× d1/d2/d3 r1+r2</td></tr>
+<tr><td>Disk Use%</td><td>~2%</td><td>~2%</td></tr>
+<tr><td>Failover</td><td>note only</td><td>PASS (swift2→swift1)</td></tr>
+<tr><td>Soak 1h</td><td>not run</td><td><strong>WARN</strong> 185/192 (fail=7)</td></tr>
+<tr><td>Func TempAuth HTTPS</td><td>baseline 54/54 (older HTTP)</td><td>FAIL 5/54</td></tr>
+</table>
+
+<h2>4) Gates</h2>
+<table>
+<tr><th>Gate</th><th>Result</th><th>Evidence</th></tr>
+<tr><td>Disk ~2% / units</td><td><span class="badge ok">PASS</span></td><td>apply/08-post-apply-snapshot.txt</td></tr>
+<tr><td>Object ports non-colliding</td><td><span class="badge ok">PASS</span></td><td>6210+ vs A/C 6201/6202</td></tr>
+<tr><td>spp + 3-port listen</td><td><span class="badge ok">PASS</span></td><td>apply/01-apply2.log, 08-*</td></tr>
+<tr><td>Region/port drill</td><td><span class="badge ok">PASS</span></td><td>apply/05-region-port-drill.txt</td></tr>
+<tr><td>spp smoke (Keystone)</td><td><span class="badge ok">PASS</span></td><td>apply/04-spp-smoke-keystone.txt</td></tr>
+<tr><td>Failover</td><td><span class="badge ok">PASS</span></td><td>apply/06b-failover-complete.txt</td></tr>
+<tr><td>Soak ≥1h fail=0</td><td><span class="badge warn">WARN fail=7</span></td><td>apply/09-soak-result.log — n=192 ok=185; start 10:13:50Z end 11:13:52Z</td></tr>
+<tr><td>func-suite TempAuth 54/54</td><td><span class="badge bad">FAIL 5/54</span></td><td>apply/03-func-suite-tempauth-https.log</td></tr>
+<tr><td>Keystone adapted suite</td><td><span class="badge bad">46/13</span></td><td>apply/03b-func-suite-keystone-https.log</td></tr>
+<tr><td>DIRECT / HA-PATH / chaos</td><td><span class="badge warn">N/A this pack</span></td><td>—</td></tr>
+</table>
+
+<h2>4b) Soak residual RCA</h2>
+<table>
+<tr><th>Class</th><th>Iters</th><th>Cause</th></tr>
+<tr><td>401/409</td><td>n=22,24</td><td>Soak-script Keystone token mid-cycle expiry / empty token (not IdP outage)</td></tr>
+<tr><td>503 ×5</td><td>n=60–64 (~10:33Z)</td><td>Concurrent proxy binary deploy: <code>Exec format error</code> / <code>Text file busy</code> → HAProxy <code>swift_proxy_back</code> empty → VIP 503</td></tr>
+</table>
+<p class="muted">Identity/TLS not touched. Object 6210–6212 stayed up. Post-soak health VIP + all four proxies 200 (<code>apply/09b-soak-503-rca.txt</code>, <code>apply/10-post-soak-health.txt</code>). After n=64, last ~128 iterations clean.</p>
+
+<h2>5) Remaining / FROZEN</h2>
+<ul>
+<li><strong>BACKLOG:</strong> Keystone-native 54/54 (or TempAuth storage coexist); re-soak fail=0 with serialized proxy install + token refresh; optional EC feature rebuild.</li>
+<li><strong>FROZEN:</strong> mkfs; PRODUCTION-GO-LIVE from this evidence; ring rebuild (not needed to close soak).</li>
+</ul>
+<p class="muted">Pack: <code>tools/test-results/wave2-spp-region-live-20260805/</code> · Rollback: restore from <code>/root/w2-ring-backup-20260805T100051Z/</code></p>
+</body>
+</html>

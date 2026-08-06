@@ -1,0 +1,36 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.38s
+     Running unittests src/lib.rs (target/debug/deps/swift_middleware-a7268e230ca44006)
+
+running 8 tests
+test versioned_writes::tests::test_container_mutual_exclusion ... ok
+test versioned_writes::tests::test_container_sets_sysmeta_from_versions_location ... ok
+test versioned_writes::tests::test_delete_history_archives_and_marker ... ok
+test versioned_writes::tests::test_put_no_current_skips_archive ... ok
+test versioned_writes::tests::test_delete_stack_restores_previous ... ok
+test versioned_writes::tests::test_unversioned_container_passes_through ... ok
+test versioned_writes::tests::test_versions_object_name_format ... ok
+test versioned_writes::tests::test_put_archives_current_version ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 326 filtered out; finished in 0.00s
+
+   |
+51 | use swift_http::{split_path, HeaderKeyDict, Request, Response};
+   |                              ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+
+   Compiling swift-proxy-server v0.1.0 (/tmp/p1b-swift-rust/crates/swift-proxy-server)
+warning: `swift-middleware` (lib) generated 2 warnings (run `cargo fix --lib -p swift-middleware` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 13.99s
+-rwxr-xr-x. 2 root root 3040792 Aug  4 14:04 target/release/swift-proxy-server
+EC_STUB_ABSENT_OK
+active
+active
+active
+active

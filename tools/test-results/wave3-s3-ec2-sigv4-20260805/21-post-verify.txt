@@ -1,0 +1,47 @@
+=== local unit (Mac) ===
+swift-s3api unknown_ec2: 2/2 PASS
+swift-middleware s3token: 7/7 PASS
+swift-proxy-server pipeline_s3api: 2/2 PASS
+
+=== contabo unit ===
+running 2 tests
+test middleware::tests::unknown_ec2_key_without_client_still_invalid ... ok
+test middleware::tests::unknown_ec2_key_defers_to_s3token_client ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 64 filtered out; finished in 0.00s
+running 7 tests
+test s3token::tests::encode_s3tokens_token_urlsafe_b64 ... ok
+test s3token::tests::access_key_parse ... ok
+test s3token::tests::passthrough_without_s3_auth ... ok
+test s3token::tests::passthrough_when_only_amz_date_no_sts_header ... ok
+test s3token::tests::parse_s3tokens_json_body ... ok
+test s3token::tests::http_s3token_client_live_against_local_listener ... ok
+test s3token::tests::stamps_headers_on_exchange ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 352 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+running 2 tests
+test startup_policy_tests::pipeline_s3api_wires_ec2_s3token_deferral_when_auth_uri_set ... ok
+test startup_policy_tests::pipeline_s3api_wires_without_info_pollution ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+=== binary sha ×4 ===
+swift1
+325a28840e6bb20526d29d79afc8216c410c99bb6f6a6a512a7b4c1784495174  /usr/local/bin/swift-proxy-server
+active
+
+swift2
+325a28840e6bb20526d29d79afc8216c410c99bb6f6a6a512a7b4c1784495174  /usr/local/bin/swift-proxy-server
+active
+
+swift3
+325a28840e6bb20526d29d79afc8216c410c99bb6f6a6a512a7b4c1784495174  /usr/local/bin/swift-proxy-server
+active
+
+swift4
+325a28840e6bb20526d29d79afc8216c410c99bb6f6a6a512a7b4c1784495174  /usr/local/bin/swift-proxy-server
+active
+
+=== VIP health ===
+vip_health=000

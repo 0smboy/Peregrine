@@ -1,0 +1,11 @@
+{
+  "workers": 0,
+  "max_clients": 1024,
+  "servers_per_port": 0,
+  "bind_ports": 1,
+  "worker_threads": 64,
+  "connection_queue": 1024,
+  "acceptors": 1,
+  "formula": "default: cpus*16 → worker_threads (clamp 16..128)",
+  "notes": ["workers=0: use ServerConfig default (cpus*16, clamp 16..128)"]
+}

@@ -1,0 +1,4 @@
+Dry-run built object ring with ports 6200/6201/6202 ×4 hosts and regions 1+2.
+LIVE Contabo already binds container:6201 and account:6202.
+→ Dry-run proves shape only; apply must use non-colliding object base (e.g. 6210+).
+LIVE_RINGS_UNTOUCHED=yes (sha d1ced8de…)

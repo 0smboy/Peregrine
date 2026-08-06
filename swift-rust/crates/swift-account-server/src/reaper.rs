@@ -24,11 +24,18 @@
 //!
 //! The orchestration here is ring/transport-agnostic: object and container
 //! deletes and the object listing go through a pluggable [`ReaperClient`], so
-//! the sweep logic is unit-tested without a live cluster. Deferred: the
-//! direct-client HTTP transport, per-device sharding of container work, the
-//! reap-not-done warning, and concurrency.
+//! the sweep logic is unit-tested without a live cluster. Production uses
+//! [`HttpReaperClient`] (ring-direct HTTP on the replication network) and
+//! [`run_once`] over local account DBs. Deferred: per-device sharding of
+//! container work, the reap-not-done warning, and concurrency.
 
-use swift_db::{AccountBroker, DbError, DbValue, ListContainersArgs};
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use swift_db::{db_locations, AccountBroker, DbError, DbValue, ListContainersArgs};
+use swift_ring::Ring;
 
 /// Running tally over a reap pass (Python `stats_*`).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -157,6 +164,263 @@ pub fn reap_account(
         }
     }
     Ok(Some(stats))
+}
+
+fn pe(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            b => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn http_status(buf: &[u8]) -> u16 {
+    String::from_utf8_lossy(buf)
+        .split("\r\n")
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(500)
+}
+
+fn http_body(buf: &[u8]) -> &[u8] {
+    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        &buf[pos + 4..]
+    } else {
+        &[]
+    }
+}
+
+fn node_host(node: &swift_ring::RingDevice) -> String {
+    let ip = node
+        .replication_ip
+        .clone()
+        .unwrap_or_else(|| node.ip.clone());
+    let port = node.replication_port.unwrap_or(node.port);
+    format!("{ip}:{port}")
+}
+
+fn raw_request(
+    host: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Option<(u16, Vec<u8>)> {
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n");
+    for (k, v) in headers {
+        request.push_str(&format!("{k}: {v}\r\n"));
+    }
+    request.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
+    let Ok(mut conn) = TcpStream::connect(host) else {
+        return None;
+    };
+    conn.set_nodelay(true).ok();
+    let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(15)));
+    if conn.write_all(request.as_bytes()).is_err() {
+        return None;
+    }
+    let mut buf = Vec::new();
+    if conn.read_to_end(&mut buf).is_err() {
+        return None;
+    }
+    Some((http_status(&buf), buf))
+}
+
+/// Ring-direct reaper client (Python `direct_get_container` /
+/// `direct_delete_object` / container DELETE).
+pub struct HttpReaperClient<'a> {
+    pub object_ring: &'a Ring,
+    pub container_ring: &'a Ring,
+}
+
+impl ReaperClient for HttpReaperClient<'_> {
+    fn list_objects(&self, account: &str, container: &str, policy_index: i64) -> Option<Vec<String>> {
+        let (part, nodes) = self
+            .container_ring
+            .get_nodes(account, Some(container), None)
+            .ok()?;
+        let pi = policy_index.to_string();
+        for node in &nodes {
+            let host = node_host(node.dev);
+            let path = format!(
+                "/{}/{part}/{}/{}?format=json&limit=10000",
+                node.dev.device,
+                pe(account),
+                pe(container)
+            );
+            let Some((status, buf)) = raw_request(
+                &host,
+                "GET",
+                &path,
+                &[
+                    ("Accept", "application/json"),
+                    ("X-Backend-Storage-Policy-Index", pi.as_str()),
+                ],
+            ) else {
+                continue;
+            };
+            if status == 404 {
+                return Some(Vec::new());
+            }
+            if !(200..300).contains(&status) {
+                continue;
+            }
+            let body = http_body(&buf);
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+                continue;
+            };
+            let Some(arr) = v.as_array() else {
+                continue;
+            };
+            let mut names = Vec::new();
+            for item in arr {
+                if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                    names.push(name.to_string());
+                }
+            }
+            return Some(names);
+        }
+        None
+    }
+
+    fn reap_object(
+        &self,
+        account: &str,
+        container: &str,
+        obj: &str,
+        policy_index: i64,
+        timestamp: &str,
+    ) -> bool {
+        let Ok((part, nodes)) = self
+            .object_ring
+            .get_nodes(account, Some(container), Some(obj))
+        else {
+            return false;
+        };
+        let pi = policy_index.to_string();
+        let mut ok = 0usize;
+        for node in &nodes {
+            let host = format!("{}:{}", node.dev.ip, node.dev.port);
+            let path = format!(
+                "/{}/{part}/{}/{}/{}",
+                node.dev.device,
+                pe(account),
+                pe(container),
+                pe(obj)
+            );
+            let Some((status, _)) = raw_request(
+                &host,
+                "DELETE",
+                &path,
+                &[
+                    ("X-Timestamp", timestamp),
+                    ("X-Backend-Storage-Policy-Index", pi.as_str()),
+                ],
+            ) else {
+                continue;
+            };
+            if (200..300).contains(&status) || status == 404 {
+                ok += 1;
+            }
+        }
+        ok * 2 > nodes.len()
+    }
+
+    fn reap_container(&self, account: &str, container: &str, timestamp: &str) -> bool {
+        let Ok((part, nodes)) = self.container_ring.get_nodes(account, Some(container), None)
+        else {
+            return false;
+        };
+        let mut ok = 0usize;
+        for node in &nodes {
+            let host = node_host(node.dev);
+            let path = format!(
+                "/{}/{part}/{}/{}",
+                node.dev.device,
+                pe(account),
+                pe(container)
+            );
+            let Some((status, _)) = raw_request(
+                &host,
+                "DELETE",
+                &path,
+                &[
+                    ("X-Timestamp", timestamp),
+                    ("X-Backend-Storage-Policy-Index", "0"),
+                ],
+            ) else {
+                continue;
+            };
+            if (200..300).contains(&status) || status == 404 {
+                ok += 1;
+            }
+        }
+        ok * 2 > nodes.len()
+    }
+}
+
+/// Aggregated pass stats across every account DB on a device.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReaperPassStats {
+    pub accounts_reaped: u64,
+    pub accounts_skipped: u64,
+    pub containers_deleted: u64,
+    pub containers_remaining: u64,
+    pub objects_deleted: u64,
+    pub objects_remaining: u64,
+    pub errors: u64,
+}
+
+/// Sweep every account DB on `device`; reap those past `delay_reaping`.
+pub fn run_once(
+    device: &Path,
+    now: f64,
+    delay_reaping: f64,
+    object_ring: &Ring,
+    container_ring: &Ring,
+) -> ReaperPassStats {
+    let mut pass = ReaperPassStats::default();
+    let client = HttpReaperClient {
+        object_ring,
+        container_ring,
+    };
+    let timestamp = format!(
+        "{:.5}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)
+    );
+    for db in db_locations(device, "accounts") {
+        let mut broker = AccountBroker::new(&db, "");
+        match reap_account(&mut broker, now, delay_reaping, &timestamp, &client) {
+            Ok(None) => pass.accounts_skipped += 1,
+            Ok(Some(s)) => {
+                pass.accounts_reaped += 1;
+                pass.containers_deleted += s.containers_deleted;
+                pass.containers_remaining += s.containers_remaining;
+                pass.objects_deleted += s.objects_deleted;
+                pass.objects_remaining += s.objects_remaining;
+            }
+            Err(_) => pass.errors += 1,
+        }
+    }
+    pass
+}
+
+/// Recon-cache update for the account reaper.
+pub fn recon_update(elapsed: std::time::Duration, pass: &ReaperPassStats) -> serde_json::Value {
+    serde_json::json!({
+        "account_reaper_pass": elapsed.as_secs_f64(),
+        "accounts_reaped": pass.accounts_reaped,
+        "containers_deleted": pass.containers_deleted,
+        "objects_deleted": pass.objects_deleted,
+    })
 }
 
 #[cfg(test)]

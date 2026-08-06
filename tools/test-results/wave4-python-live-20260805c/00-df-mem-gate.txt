@@ -1,0 +1,35 @@
+=== wave4-python-live-20260805c df/mem 20260805T112133Z ===
+---- 10.0.4.1 ----
+swift1
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  896M   50G   2% /srv/node/d1
+/dev/sda6        50G  727M   50G   2% /srv/node/d2
+/dev/sda7        50G  729M   50G   2% /srv/node/d3
+MemAvailable_GiB=3.99
+---- 10.0.4.2 ----
+swift2
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  862M   50G   2% /srv/node/d1
+/dev/sda6        50G  727M   50G   2% /srv/node/d2
+/dev/sda7        50G  728M   50G   2% /srv/node/d3
+MemAvailable_GiB=2.95
+---- 10.0.4.3 ----
+swift3
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  894M   50G   2% /srv/node/d1
+/dev/sda6        50G  728M   50G   2% /srv/node/d2
+/dev/sda7        50G  729M   50G   2% /srv/node/d3
+MemAvailable_GiB=3.28
+---- 10.0.4.4 ----
+swift4
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  852M   50G   2% /srv/node/d1
+/dev/sda6        50G  725M   50G   2% /srv/node/d2
+/dev/sda7        50G  729M   50G   2% /srv/node/d3
+MemAvailable_GiB=4.57
+
+=== USE_PCT_GATE (derived from above snapshot) ===
+swift1–4 /srv/node/d1,d2,d3 Use%=2 each
+WORST_USE_PCT=2
+DISK_GATE_70 PASS
+DISK_GATE_50 PASS

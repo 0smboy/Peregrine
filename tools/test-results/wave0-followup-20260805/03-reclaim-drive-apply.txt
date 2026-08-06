@@ -1,0 +1,76 @@
+===== drive swift1 =====
+reclaim_age lines:
+1:[DEFAULT]
+2:reclaim_age = 600
+11:[app:object-server]
+25:[object-replicator]
+26:reclaim_age = 600
+36:[object-updater]
+42:[object-reconstructor]
+48:[object-expirer]
+50:reclaim_age = 600
+55:[object-auditor]
+hash_files_before=25188 after_delete=534
+active
+Aug 05 05:53:24 swift1 systemd[1]: swift-object-replicator.service: Failed with result 'timeout'.
+Aug 05 05:53:24 swift1 systemd[1]: Stopped Swift object replicator (rust).
+Aug 05 05:53:24 swift1 systemd[1]: swift-object-replicator.service: Consumed 1min 7.737s CPU time, 11.3M memory peak.
+Aug 05 05:53:24 swift1 systemd[1]: Started Swift object replicator (rust).
+Aug 05 05:53:24 swift1 object-replicator[3579208]: INFO swift-object-replicator: devices=/srv/node bind_port=6200 interval=30s reclaim_age=600s once=false
+===== drive swift2 =====
+reclaim_age lines:
+1:[DEFAULT]
+2:reclaim_age = 600
+11:[app:object-server]
+25:[object-replicator]
+26:reclaim_age = 600
+36:[object-updater]
+42:[object-reconstructor]
+48:[object-expirer]
+50:reclaim_age = 600
+55:[object-auditor]
+hash_files_before=24117 after_delete=1592
+active
+Aug 05 05:56:29 swift2 systemd[1]: swift-object-replicator.service: Failed with result 'timeout'.
+Aug 05 05:56:29 swift2 systemd[1]: Stopped Swift object replicator (rust).
+Aug 05 05:56:29 swift2 systemd[1]: swift-object-replicator.service: Consumed 2min 17.442s CPU time.
+Aug 05 05:56:29 swift2 systemd[1]: Started Swift object replicator (rust).
+Aug 05 05:56:29 swift2 object-replicator[3028730]: INFO swift-object-replicator: devices=/srv/node bind_port=6200 interval=30s reclaim_age=600s once=false
+===== drive swift3 =====
+reclaim_age lines:
+1:[DEFAULT]
+2:reclaim_age = 600
+11:[app:object-server]
+25:[object-replicator]
+26:reclaim_age = 600
+36:[object-updater]
+42:[object-reconstructor]
+48:[object-expirer]
+50:reclaim_age = 600
+55:[object-auditor]
+hash_files_before=25752 after_delete=398
+active
+Aug 05 05:59:02 swift3 systemd[1]: swift-object-replicator.service: Failed with result 'timeout'.
+Aug 05 05:59:02 swift3 systemd[1]: Stopped Swift object replicator (rust).
+Aug 05 05:59:02 swift3 systemd[1]: swift-object-replicator.service: Consumed 1min 38.545s CPU time.
+Aug 05 05:59:02 swift3 systemd[1]: Started Swift object replicator (rust).
+Aug 05 05:59:02 swift3 object-replicator[3637911]: INFO swift-object-replicator: devices=/srv/node bind_port=6200 interval=30s reclaim_age=600s once=false
+===== drive swift4 =====
+reclaim_age lines:
+1:[DEFAULT]
+2:reclaim_age = 600
+11:[app:object-server]
+25:[object-replicator]
+26:reclaim_age = 600
+36:[object-updater]
+42:[object-reconstructor]
+48:[object-expirer]
+50:reclaim_age = 600
+55:[object-auditor]
+hash_files_before=24083 after_delete=464
+active
+Aug 05 06:02:16 swift4 systemd[1]: swift-object-replicator.service: Failed with result 'timeout'.
+Aug 05 06:02:16 swift4 systemd[1]: Stopped Swift object replicator (rust).
+Aug 05 06:02:16 swift4 systemd[1]: swift-object-replicator.service: Consumed 2min 59.784s CPU time.
+Aug 05 06:02:16 swift4 systemd[1]: Started Swift object replicator (rust).
+Aug 05 06:02:16 swift4 object-replicator[586279]: INFO swift-object-replicator: devices=/srv/node bind_port=6200 interval=30s reclaim_age=600s once=false

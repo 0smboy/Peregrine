@@ -40,7 +40,9 @@ fn is_excluded(name_lower: &str) -> bool {
             return true;
         }
     }
-    // exact-match rules (regex anchored with `$` in Python)
+    // exact-match rules (regex anchored with `$` in Python) plus Keystone
+    // identity headers: clients must not forge Confirmed identity past
+    // gatekeeper; authtoken re-stamps them after validation.
     matches!(
         name_lower,
         "x-account-host"
@@ -54,6 +56,20 @@ fn is_excluded(name_lower: &str) -> bool {
             | "x-delete-at-device"
             | "x-delete-at-partition"
             | "x-delete-at-container"
+            | "x-identity-status"
+            | "x-service-identity-status"
+            | "x-roles"
+            | "x-service-roles"
+            | "x-user-id"
+            | "x-user-name"
+            | "x-project-id"
+            | "x-project-name"
+            | "x-tenant-id"
+            | "x-tenant-name"
+            | "x-user-domain-id"
+            | "x-user-domain-name"
+            | "x-project-domain-id"
+            | "x-project-domain-name"
     )
 }
 
@@ -131,6 +147,27 @@ mod tests {
             resp.headers.set("X-Object-Meta-Public", "ok");
             resp
         })
+    }
+
+    #[test]
+    fn test_strips_forged_keystone_identity_headers() {
+        let gk = Gatekeeper::default();
+        let mut req = Request {
+            method: "GET".into(),
+            path: "/v1/AUTH_t1/c/o".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        };
+        req.headers.set("X-Identity-Status", "Confirmed");
+        req.headers.set("X-Roles", "admin");
+        req.headers.set("X-Project-Id", "evil");
+        req.headers.set("X-Object-Meta-Fine", "keep");
+        let resp = gk.handle(req, &echo_headers());
+        assert!(resp.headers.get("Echo-X-Identity-Status").is_none());
+        assert!(resp.headers.get("Echo-X-Roles").is_none());
+        assert!(resp.headers.get("Echo-X-Project-Id").is_none());
+        assert_eq!(resp.headers.get("Echo-X-Object-Meta-Fine"), Some("keep"));
     }
 
     #[test]

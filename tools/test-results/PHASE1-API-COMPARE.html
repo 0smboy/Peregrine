@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"/>
+<title>阶段1 · 薄管道 vs 已实现子集 API 对比</title>
+<style>
+body{font:15px/1.45 system-ui,sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem;color:#1a1a1a;background:#fafaf8}
+h1{font-size:1.4rem} h2{font-size:1.15rem;margin-top:1.5rem}
+table{border-collapse:collapse;width:100%;margin:1rem 0;background:#fff}
+th,td{border:1px solid #ccc;padding:.4rem .55rem;text-align:left;vertical-align:top}
+th{background:#eee} .ok{color:#0a6} .warn{color:#a60} .fail{color:#b00}
+tr.fail td{background:#fff0f0} code,pre{font-size:12.5px;background:#f2f2f0;padding:2px 6px;border-radius:3px}
+pre{padding:10px;overflow:auto;white-space:pre-wrap}
+.meta{color:#555;font-size:14px} .box{background:#fff;border:1px solid #ccc;padding:12px 14px;margin:1rem 0}
+</style></head><body>
+<h1>阶段 1：薄管道 /「全管道」API 对比</h1>
+<p class="meta">正式结论仅认本轮。1B <strong>不是</strong>完整 Paste 全管道，而是两侧<strong>已实现可对齐子集</strong>；完整 Paste 见下方参考行。</p>
+
+<h2>管道定义（你要的薄 / 「全」）</h2>
+<div class="box">
+<p><strong>薄管道（阶段 1A）</strong></p>
+<p>Python（swift2 <code>:8090</code>）——可认证最小集（<code>cache</code> 因 Python tempauth 硬依赖 memcache，去不掉）：</p>
+<pre>catch_errors → gatekeeper → healthcheck → proxy-logging → cache → listing_formats → tempauth → copy → slo → dlo → proxy-server</pre>
+<p>Rust（swift3 <code>:8081</code>）：</p>
+<pre>catch_errors → gatekeeper → healthcheck → tempauth → copy → slo → dlo → proxy-server  （进程硬编码 / 无 Paste pipeline 行）</pre>
+</div>
+<div class="box">
+<p><strong>「全管道」在本轮的含义（阶段 1B）</strong>——已实现子集再测一遍 + 缺口探针；<span class="warn">禁止宣称全 Paste 对齐</span>。</p>
+<p>Python 1B 实测管道（与 1A 相同可运行集）：</p>
+<pre>catch_errors → gatekeeper → healthcheck → proxy-logging → cache → listing_formats → tempauth → copy → slo → dlo → proxy-server  （1B 实测与 1A 相同薄可运行集；未开 bulk/tempurl/versioned_writes/symlink 等）</pre>
+<p>Rust 1B：</p>
+<pre>catch_errors → gatekeeper → healthcheck → tempauth → copy → slo → dlo → proxy-server  （进程硬编码 / 无 Paste pipeline 行）  （可选 ratelimit 未开；B4 支持 conf [pipeline:main] 但 Contabo SAIO 仍默认序）</pre>
+<p>Python ansible/v3 完整 Paste <em>参考</em>（本轮<strong>未</strong>部署、未测齐）：</p>
+<pre>catch_errors gatekeeper healthcheck proxy-logging cache cname_lookup domain_remap listing_formats container_sync bulk tempurl list-endpoints ratelimit formpost tempauth read_only staticweb container-quotas account-quotas slo dlo versioned_writes symlink proxy-logging proxy-server</pre>
+</div>
+
+<h2>总结果</h2>
+<table>
+<tr><th>轮次</th><th>Python</th><th>Rust</th><th>说明</th></tr>
+<tr><td>1A 薄管道</td><td class="ok">54/54</td><td class="ok">54/54</td><td>Rust 首跑 EC 501（旧 bin）→ 换 EC release 后 <code>func-rs-rerun.log</code> 54/54；以重跑为准</td></tr>
+<tr><td>1B 已实现子集</td><td class="ok">54/54</td><td class="ok">54/54</td><td>同源 func-suite；缺口见下表，不计入 FAIL</td></tr>
+</table>
+
+<h2>1A 用例级对比（薄管道 · 以重跑为准）</h2>
+<table>
+<tr><th>用例</th><th>Python</th><th>Rust（rerun）</th></tr>
+<tr class="warn"><td>auth: bad key -&gt; 401</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>auth: token acquired (test:tester)</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>account: HEAD 204</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>account: X-Account-Container-Count present</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>container: PUT 201</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>container: idempotent PUT 202</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>container: HEAD 204</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>container: POST meta 204</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>container: meta persisted</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>container: GET empty 204</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>object: PUT 201</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>object: GET body</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>object: etag matches md5</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>object: content-type</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>object: custom meta</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>object: HEAD 200</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>object: POST meta 202</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>object: fast-POST meta updated</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>object: PUT wrong-etag 422</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>range: bytes=0-3</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>range: suffix bytes=-3</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>range: 206 status</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>range: unsatisfiable 416</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>range: multipart/byteranges</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>range: multipart 2nd part</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>cond: If-None-Match * -&gt; 304</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>cond: If-Match wrong -&gt; 412</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>cond: If-Match right -&gt; 200</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>large: PUT 4MB 201</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>large: 4MB md5 round-trip</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>SLO: manifest PUT 201</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>SLO: reassembled 3MB md5</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>SLO: manifest-get is json</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>DLO: concatenation md5 == SLO segs</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>copy: X-Copy-From 201</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>copy: copied body</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>expiry: PUT with X-Delete-After 201</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>expiry: X-Delete-At set</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>name: unicode+space PUT 201</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>name: unicode GET body</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>listing: json has bytes</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>listing: prefix filter</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>listing: limit=1 returns 1</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>EC: container create (policy ec-2-1) 201</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>EC: policy header</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>EC: PUT 3MB 201</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>EC: 5MB md5 round-trip</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>EC: ranged GET 206</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>EC: ranged GET length=1024</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>sec: no-token account -&gt; 401</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>sec: bad-token -&gt; 401</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>sec: GET missing object -&gt; 404</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>sec: DELETE non-empty container -&gt; 409</td><td>—</td><td>PASS</td></tr>
+<tr class="warn"><td>sec: traversal name literal 201</td><td>—</td><td>PASS</td></tr>
+</table>
+<p class="meta">Py cases=0 · Rs cases=54 · RESULT  label=py-saio-1a  PASS=54  FAIL=0 · RESULT  label=rs-saio-1a-rerun  PASS=54  FAIL=0</p>
+
+<h2>1B 用例级对比（已实现子集）</h2>
+<table>
+<tr><th>用例</th><th>Python</th><th>Rust</th></tr>
+<tr class="ok"><td>auth: bad key -&gt; 401</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>auth: token acquired (test:tester)</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>account: HEAD 204</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>account: X-Account-Container-Count present</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>container: PUT 201</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>container: idempotent PUT 202</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>container: HEAD 204</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>container: POST meta 204</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>container: meta persisted</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>container: GET empty 204</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>object: PUT 201</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>object: GET body</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>object: etag matches md5</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>object: content-type</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>object: custom meta</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>object: HEAD 200</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>object: POST meta 202</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>object: fast-POST meta updated</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>object: PUT wrong-etag 422</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>range: bytes=0-3</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>range: suffix bytes=-3</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>range: 206 status</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>range: unsatisfiable 416</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>range: multipart/byteranges</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>range: multipart 2nd part</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>cond: If-None-Match * -&gt; 304</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>cond: If-Match wrong -&gt; 412</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>cond: If-Match right -&gt; 200</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>large: PUT 4MB 201</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>large: 4MB md5 round-trip</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>SLO: manifest PUT 201</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>SLO: reassembled 3MB md5</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>SLO: manifest-get is json</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>DLO: concatenation md5 == SLO segs</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>copy: X-Copy-From 201</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>copy: copied body</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>expiry: PUT with X-Delete-After 201</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>expiry: X-Delete-At set</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>name: unicode+space PUT 201</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>name: unicode GET body</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>listing: json has bytes</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>listing: prefix filter</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>listing: limit=1 returns 1</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>EC: container create (policy ec-2-1) 201</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>EC: policy header</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>EC: PUT 3MB 201</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>EC: 5MB md5 round-trip</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>EC: ranged GET 206</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>EC: ranged GET length=1024</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>sec: no-token account -&gt; 401</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>sec: bad-token -&gt; 401</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>sec: GET missing object -&gt; 404</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>sec: DELETE non-empty container -&gt; 409</td><td>PASS</td><td>PASS</td></tr>
+<tr class="ok"><td>sec: traversal name literal 201</td><td>PASS</td><td>PASS</td></tr>
+</table>
+<p class="meta">Py cases=54 · Rs cases=54 · RESULT  label=phase1b-py  PASS=54  FAIL=0 · RESULT  label=phase1b-rs  PASS=54  FAIL=0</p>
+
+<h2>1B 缺口（非套件 FAIL）</h2>
+<table>
+<tr><th>项</th><th>Python</th><th>Rust</th><th>判定</th></tr>
+<tr><td>cache / memcache</td><td>有（tempauth 需要）</td><td>无</td><td class="warn">GAP</td></tr>
+<tr><td>proxy-logging / listing_formats</td><td>在管道中</td><td>未接线</td><td class="warn">GAP</td></tr>
+<tr><td>bulk / tempurl / formpost / staticweb / quotas</td><td>未进本轮管道</td><td>未实现/未接线</td><td class="warn">不宣称</td></tr>
+<tr><td>versioned_writes / symlink</td><td>conf 有 filter 段但未进 pipeline</td><td>无</td><td class="warn">不宣称</td></tr>
+<tr><td>Keystone / S3</td><td>无</td><td>无</td><td>不宣称</td></tr>
+</table>
+
+<h2>原始报告路径</h2>
+<ul>
+<li>1A：<code>tools/test-results/phase-1a-20260804/REPORT.html</code></li>
+<li>1B：<code>tools/test-results/phase-1b-20260804/REPORT.html</code> · <code>GAPS.md</code></li>
+<li>本汇总：同目录 <code>PHASE1-API-COMPARE.html</code></li>
+</ul>
+</body></html>

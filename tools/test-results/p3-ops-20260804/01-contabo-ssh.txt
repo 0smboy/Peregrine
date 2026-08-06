@@ -1,0 +1,42 @@
+UTC=2026-08-04T15:38:00Z
+=== ssh root@169.58.108.85 ===
+swift1
+vip_http=200
+    # bind * so VIP (keepalived) and node IP both accept traffic once
+    # net.ipv4.ip_nonlocal_bind=1 is set by rust_keepalived.
+    bind *:8085
+    bind *:1080
+---
+d1
+d2
+d3
+dual_guard_mkfs_in_bundle=check_local
+=== ssh root@169.58.108.86 ===
+swift2
+vip_http=200
+    # bind * so VIP (keepalived) and node IP both accept traffic once
+    # net.ipv4.ip_nonlocal_bind=1 is set by rust_keepalived.
+    bind *:8085
+    bind *:1080
+---
+d1
+d2
+d3
+dual_guard_mkfs_in_bundle=check_local
+=== ssh root@169.58.108.87 ===
+swift3
+vip_http=200
+    # bind * so VIP (keepalived) and node IP both accept traffic once
+    # net.ipv4.ip_nonlocal_bind=1 is set by rust_keepalived.
+    bind *:8085
+    bind *:1080
+---
+d1
+d2
+d3
+dual_guard_mkfs_in_bundle=check_local
+=== ssh root@169.58.108.88 ===
+Warning: Permanently added '169.58.108.88' (ED25519) to the list of known hosts.
+root@169.58.108.88: Permission denied (publickey,password).
+=== live TLS apply ===
+NOT_APPLIED: Contabo remains http bind *:8085; no production PEM; dry-run only this wave

@@ -1,0 +1,395 @@
+=== QUERY: sum(swift_object_tombstones) ===
+{
+    "status": "success",
+    "data": {
+        "resultType": "vector",
+        "result": [
+            {
+                "metric": {},
+                "value": [
+                    1785915741.982,
+                    "153"
+                ]
+            }
+        ]
+    }
+}
+
+=== QUERY: sum by (node) (swift_object_tombstones) ===
+{
+    "status": "success",
+    "data": {
+        "resultType": "vector",
+        "result": [
+            {
+                "metric": {
+                    "node": "swift1"
+                },
+                "value": [
+                    1785915742.232,
+                    "39"
+                ]
+            },
+            {
+                "metric": {
+                    "node": "swift2"
+                },
+                "value": [
+                    1785915742.232,
+                    "41"
+                ]
+            },
+            {
+                "metric": {
+                    "node": "swift3"
+                },
+                "value": [
+                    1785915742.232,
+                    "38"
+                ]
+            },
+            {
+                "metric": {
+                    "node": "swift4"
+                },
+                "value": [
+                    1785915742.232,
+                    "35"
+                ]
+            }
+        ]
+    }
+}
+
+=== QUERY: sum by (node,kind) (swift_db_freelist_bytes) ===
+{
+    "status": "success",
+    "data": {
+        "resultType": "vector",
+        "result": [
+            {
+                "metric": {
+                    "kind": "account",
+                    "node": "swift1"
+                },
+                "value": [
+                    1785915742.372,
+                    "0"
+                ]
+            },
+            {
+                "metric": {
+                    "kind": "container",
+                    "node": "swift1"
+                },
+                "value": [
+                    1785915742.372,
+                    "2297856"
+                ]
+            },
+            {
+                "metric": {
+                    "kind": "account",
+                    "node": "swift2"
+                },
+                "value": [
+                    1785915742.372,
+                    "0"
+                ]
+            },
+            {
+                "metric": {
+                    "kind": "container",
+                    "node": "swift2"
+                },
+                "value": [
+                    1785915742.372,
+                    "2514944"
+                ]
+            },
+            {
+                "metric": {
+                    "kind": "account",
+                    "node": "swift3"
+                },
+                "value": [
+                    1785915742.372,
+                    "24576"
+                ]
+            },
+            {
+                "metric": {
+                    "kind": "container",
+                    "node": "swift3"
+                },
+                "value": [
+                    1785915742.372,
+                    "2342912"
+                ]
+            },
+            {
+                "metric": {
+                    "kind": "account",
+                    "node": "swift4"
+                },
+                "value": [
+                    1785915742.372,
+                    "28672"
+                ]
+            },
+            {
+                "metric": {
+                    "kind": "container",
+                    "node": "swift4"
+                },
+
+=== QUERY: sum by (node,kind) (swift_db_file_bytes) ===
+{
+    "status": "success",
+    "data": {
+        "resultType": "vector",
+        "result": [
+            {
+                "metric": {
+                    "kind": "account",
+                    "node": "swift1"
+                },
+                "value": [
+                    1785915742.482,
+                    "233472"
+                ]
+            },
+            {
+                "metric": {
+                    "kind": "container",
+                    "node": "swift1"
+                },
+                "value": [
+                    1785915742.482,
+                    "144986112"
+                ]
+            },
+            {
+                "metric": {
+                    "kind": "account",
+                    "node": "swift2"
+                },
+                "value": [
+                    1785915742.482,
+                    "389120"
+                ]
+            },
+            {
+                "metric": {
+                    "kind": "container",
+                    "node": "swift2"
+                },
+                "value": [
+                    1785915742.482,
+                    "153100288"
+                ]
+            },
+            {
+                "metric": {
+                    "kind": "account",
+                    "node": "swift3"
+                },
+                "value": [
+                    1785915742.482,
+                    "225280"
+                ]
+            },
+            {
+                "metric": {
+                    "kind": "container",
+                    "node": "swift3"
+                },
+                "value": [
+                    1785915742.482,
+                    "168009728"
+                ]
+            },
+            {
+                "metric": {
+                    "kind": "account",
+                    "node": "swift4"
+                },
+                "value": [
+                    1785915742.482,
+                    "430080"
+                ]
+            },
+            {
+                "metric": {
+                    "kind": "container",
+                    "node": "swift4"
+                },
+
+=== QUERY: count(swift_db_files) ===
+{
+    "status": "success",
+    "data": {
+        "resultType": "vector",
+        "result": [
+            {
+                "metric": {},
+                "value": [
+                    1785915742.587,
+                    "8"
+                ]
+            }
+        ]
+    }
+}
+
+=== QUERY: 100*(1-node_filesystem_avail_bytes{mountpoint=~"/srv/node/d[0-9]+"}/node_filesystem_size_bytes{mountpoint=~"/srv/node/d[0-9]+"}) ===
+{
+    "status": "success",
+    "data": {
+        "resultType": "vector",
+        "result": [
+            {
+                "metric": {
+                    "device": "/dev/sda5",
+                    "fstype": "xfs",
+                    "instance": "10.0.0.4:9100",
+                    "job": "node",
+                    "mountpoint": "/srv/node/d1"
+                },
+                "value": [
+                    1785915742.672,
+                    "1.688152976865609"
+                ]
+            },
+            {
+                "metric": {
+                    "device": "/dev/sda6",
+                    "fstype": "xfs",
+                    "instance": "10.0.0.4:9100",
+                    "job": "node",
+                    "mountpoint": "/srv/node/d2"
+                },
+                "value": [
+                    1785915742.672,
+                    "1.466944459382824"
+                ]
+            },
+            {
+                "metric": {
+                    "device": "/dev/sda7",
+                    "fstype": "xfs",
+                    "instance": "10.0.0.4:9100",
+                    "job": "node",
+                    "mountpoint": "/srv/node/d3"
+                },
+                "value": [
+                    1785915742.672,
+                    "1.476409110020338"
+                ]
+            },
+            {
+                "metric": {
+                    "device": "/dev/sda5",
+                    "fstype": "xfs",
+                    "instance": "10.0.0.3:9100",
+                    "job": "node",
+                    "mountpoint": "/srv/node/d1"
+                },
+                "value": [
+                    1785915742.672,
+                    "1.846401324409419"
+                ]
+            },
+            {
+                "metric": {
+                    "device": "/dev/sda6",
+                    "fstype": "xfs",
+                    "instance": "10.0.0.3:9100",
+                    "job": "node",
+                    "mountpoint": "/srv/node/d2"
+                },
+                "value": [
+                    1785915742.672,
+                    "1.4786778761537889"
+                ]
+            },
+            {
+                "metric": {
+                    "device": "/dev/sda7",
+                    "fstype": "xfs",
+                    "instance": "10.0.0.3:9100",
+                    "job": "node",
+                    "mountpoint": "/srv/node/d3"
+                },
+                "value": [
+                    1785915742.672,
+
+=== QUERY: ALERTS ===
+{
+    "status": "success",
+    "data": {
+        "resultType": "vector",
+        "result": []
+    }
+}
+
+=== QUERY: up{job="node"} ===
+{
+    "status": "success",
+    "data": {
+        "resultType": "vector",
+        "result": [
+            {
+                "metric": {
+                    "__name__": "up",
+                    "instance": "10.0.0.4:9100",
+                    "job": "node"
+                },
+                "value": [
+                    1785915742.808,
+                    "1"
+                ]
+            },
+            {
+                "metric": {
+                    "__name__": "up",
+                    "instance": "10.0.0.3:9100",
+                    "job": "node"
+                },
+                "value": [
+                    1785915742.808,
+                    "1"
+                ]
+            },
+            {
+                "metric": {
+                    "__name__": "up",
+                    "instance": "10.0.0.1:9100",
+                    "job": "node"
+                },
+                "value": [
+                    1785915742.808,
+                    "1"
+                ]
+            },
+            {
+                "metric": {
+                    "__name__": "up",
+                    "instance": "10.0.0.2:9100",
+                    "job": "node"
+                },
+                "value": [
+                    1785915742.808,
+                    "1"
+                ]
+            }
+        ]
+    }
+}
+
+=== ALERT RULES LOADED ===
+swift_statsd_compat rules 14
+=== GRAFANA ===
+inactive
+grafana-server: not installed/inactive
+no grafana-server binary

@@ -1,0 +1,13 @@
+acl-meta-verify.sh
+autocos-sweep.sh
+bench.py
+cbench.py
+ci-fulltest.sh
+cluster
+console-test.sh
+cosbench-prod-mixed.yaml
+deploy-fixed.sh
+ec-heal-test.sh
+/root/work/swift-tools/func-suite.sh
+/root/work/swift-rust/tools/func-suite.sh
+/root/work/phase-1b-20260804/func-suite.log

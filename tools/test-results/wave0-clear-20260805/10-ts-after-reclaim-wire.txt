@@ -1,0 +1,49 @@
+epoch 2026-08-05T05:05:05Z
+=== swift1 ===
+total_count	48901
+total_bytes	0
+device=d1	policy=0	count=30102	bytes=0
+device=d1	policy=1	count=2102	bytes=0
+device=d2	policy=0	count=6458	bytes=0
+device=d2	policy=1	count=1981	bytes=0
+device=d3	policy=0	count=6300	bytes=0
+device=d3	policy=1	count=1958	bytes=0
+/dev/sda5        50G   48G  2.2G  96% /srv/node/d1
+/dev/sda6        50G   45G  5.1G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.6G  89% /srv/node/d3
+=== swift2 ===
+total_count	48407
+total_bytes	0
+device=d1	policy=0	count=29661	bytes=0
+device=d1	policy=1	count=2122	bytes=0
+device=d2	policy=0	count=6420	bytes=0
+device=d2	policy=1	count=1956	bytes=0
+device=d3	policy=0	count=6297	bytes=0
+device=d3	policy=1	count=1951	bytes=0
+/dev/sda5        50G   45G  5.5G  90% /srv/node/d1
+/dev/sda6        50G   45G  5.3G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.2G  90% /srv/node/d3
+=== swift3 ===
+total_count	48833
+total_bytes	0
+device=d1	policy=0	count=30201	bytes=0
+device=d1	policy=1	count=2071	bytes=0
+device=d2	policy=0	count=6349	bytes=0
+device=d2	policy=1	count=2032	bytes=0
+device=d3	policy=0	count=6250	bytes=0
+device=d3	policy=1	count=1930	bytes=0
+/dev/sda5        50G   48G  2.3G  96% /srv/node/d1
+/dev/sda6        50G   45G  5.8G  89% /srv/node/d2
+/dev/sda7        50G   45G  5.6G  89% /srv/node/d3
+=== swift4 ===
+total_count	48418
+total_bytes	0
+device=d1	policy=0	count=29863	bytes=0
+device=d1	policy=1	count=2066	bytes=0
+device=d2	policy=0	count=6351	bytes=0
+device=d2	policy=1	count=1995	bytes=0
+device=d3	policy=0	count=6221	bytes=0
+device=d3	policy=1	count=1922	bytes=0
+/dev/sda5        50G   44G  6.3G  88% /srv/node/d1
+/dev/sda6        50G   46G  5.0G  91% /srv/node/d2
+/dev/sda7        50G   45G  5.5G  90% /srv/node/d3

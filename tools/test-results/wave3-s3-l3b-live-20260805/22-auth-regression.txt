@@ -1,0 +1,19 @@
+=== authtoken delay_auth ===
+delay_auth_decision = true
+www_authenticate_uri = https://10.0.0.10:5000
+auth_uri = http://127.0.0.1:5001
+=== TempAuth token decode attempt via local proxy (bypass haproxy) ===
+http://127.0.0.1:8080 auth 200 tok AUTH_tkv1.31373836303130 stor http://10.0.0.10:8085/v1/AUTH_test
+http://127.0.0.1:8080 put_fail 401 b'Unauthorized\n'
+https://10.0.0.10:8085 auth 200 tok AUTH_tkv1.31373836303130 stor http://10.0.0.10:8085/v1/AUTH_test
+https://10.0.0.10:8085 put_fail 401 b'Unauthorized\n'
+account_keys <class 'list'>
+tester_pass_present False
+tester_login ok pwd_tried_len 7
+project_id 29af7f1e1977
+ks_put_c 201
+ks_put_o 201
+ks_get 200 b'k'
+Keystone_CRUD PASS
+s3tokens_real_access http://127.0.0.1:5001/v3/s3tokens 401 b'{"error":{"code":401,"message":"The request you have made requires authentication.","title":"Unauthorized"}}\n'
+s3tokens_real_access https://10.0.0.10:5000/v3/s3tokens 401 b'{"error":{"code":401,"message":"The request you have made requires authentication.","title":"Unauthorized"}}\n'

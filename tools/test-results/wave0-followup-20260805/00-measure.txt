@@ -1,0 +1,213 @@
+# Wave0 followup measurement UTC=2026-08-05T05:43:40Z
+===== swift1 =====
+2026-08-05T05:43:45Z
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   48G  2.3G  96% /srv/node/d1
+/dev/sda6        50G   45G  5.1G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.6G  89% /srv/node/d3
+---RECON---
+total_count	48876
+total_bytes	0
+device=d1	policy=0	count=30077	bytes=0
+device=d1	policy=1	count=2102	bytes=0
+device=d2	policy=0	count=6458	bytes=0
+device=d2	policy=1	count=1981	bytes=0
+device=d3	policy=0	count=6300	bytes=0
+device=d3	policy=1	count=1958	bytes=0
+---TS-AGE-SAMPLE---
+1785590775.4191998030 /srv/node/d1/objects/624/6c1/9c10cbd9e4976c223893429742ac86c1/1785590775.41940.ts
+1785592751.7060641670 /srv/node/d1/objects/624/17e/9c2a3e368e47c31b5c053356c292f17e/1785592751.70686.ts
+1785592772.9040950700 /srv/node/d1/objects/624/ee9/9c138436a15c134ea1439302e8006ee9/1785592772.89380.ts
+1785592775.7480992160 /srv/node/d1/objects/624/51d/9c33424b92ddfa57560378cab380f51d/1785592775.74815.ts
+1785592776.4851002900 /srv/node/d1/objects/624/cdc/9c35f08477f17eba1ec650a4299c8cdc/1785592776.48458.ts
+1785590767.7161887010
+1785590768.7212603910
+1785590774.6607651440
+1785904298.4962946970
+1785904298.6662950170
+1785904298.7642952010
+---DATA-SAMPLE---
+47G	/srv/node/d1/objects
+13M	/srv/node/d1/objects-1
+45G	/srv/node/d2/objects
+44G	/srv/node/d3/objects
+---CONF---
+2:reclaim_age = 604800
+26:reclaim_age = 604800
+50:reclaim_age = 604800
+active
+Aug 05 05:35:26 swift1 systemd[1]: swift-object-replicator.service: Failed with result 'exit-code'.
+Aug 05 05:35:28 swift1 systemd[1]: swift-object-replicator.service: Scheduled restart job, restart counter is at 3.
+Aug 05 05:35:28 swift1 systemd[1]: Stopped Swift object replicator (rust).
+Aug 05 05:35:28 swift1 systemd[3546315]: swift-object-replicator.service: Failed to locate executable /usr/local/bin/swift-object-replicator: Permission denied
+Aug 05 05:35:28 swift1 systemd[1]: Started Swift object replicator (rust).
+Aug 05 05:35:28 swift1 systemd[3546315]: swift-object-replicator.service: Failed at step EXEC spawning /usr/local/bin/swift-object-replicator: Permission denied
+Aug 05 05:35:28 swift1 systemd[1]: swift-object-replicator.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 05:35:28 swift1 systemd[1]: swift-object-replicator.service: Failed with result 'exit-code'.
+Aug 05 05:35:30 swift1 systemd[1]: swift-object-replicator.service: Scheduled restart job, restart counter is at 4.
+Aug 05 05:35:30 swift1 systemd[1]: Stopped Swift object replicator (rust).
+Aug 05 05:35:30 swift1 systemd[1]: swift-object-replicator.service: Start request repeated too quickly.
+Aug 05 05:35:30 swift1 systemd[1]: swift-object-replicator.service: Failed with result 'exit-code'.
+Aug 05 05:35:30 swift1 systemd[1]: Failed to start Swift object replicator (rust).
+Aug 05 05:36:35 swift1 systemd[1]: Started Swift object replicator (rust).
+Aug 05 05:36:35 swift1 object-replicator[3546647]: INFO swift-object-replicator: devices=/srv/node bind_port=6200 interval=30s reclaim_age=604800s once=false
+
+===== swift2 =====
+2026-08-05T05:44:41Z
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   45G  5.5G  90% /srv/node/d1
+/dev/sda6        50G   45G  5.3G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.2G  90% /srv/node/d3
+---RECON---
+total_count	48400
+total_bytes	0
+device=d1	policy=0	count=29654	bytes=0
+device=d1	policy=1	count=2122	bytes=0
+device=d2	policy=0	count=6420	bytes=0
+device=d2	policy=1	count=1956	bytes=0
+device=d3	policy=0	count=6297	bytes=0
+device=d3	policy=1	count=1951	bytes=0
+---TS-AGE-SAMPLE---
+1785590768.7218923790 /srv/node/d1/objects/477/4fc/776e5043fa34530121b5b64aee9804fc/1785590768.72043.ts
+1785591858.8105497330 /srv/node/d1/objects/477/fe8/775ae96607b51c9124753a2846b20fe8/1785591858.79902.ts
+1785592739.9438015450 /srv/node/d1/objects/477/49b/776bfb0d82f3bf4d36a539a603d1649b/1785592739.94299.ts
+1785592746.4836623940 /srv/node/d1/objects/477/007/777e439881a817a3b689abb4dbbc3007/1785592746.47847.ts
+1785592747.0676499690 /srv/node/d1/objects/477/876/7762d76f3ef6728a5ca740ac1f043876/1785592747.05201.ts
+1785590767.5929165660
+1785590767.7179138890
+1785590768.7218923790
+1785904298.3885144510
+1785904298.5155117430
+1785904298.6775082890
+---DATA-SAMPLE---
+44G	/srv/node/d1/objects
+12M	/srv/node/d1/objects-1
+44G	/srv/node/d2/objects
+45G	/srv/node/d3/objects
+---CONF---
+2:reclaim_age = 604800
+26:reclaim_age = 604800
+50:reclaim_age = 604800
+active
+Aug 05 05:36:47 swift2 systemd[1]: Started Swift object replicator (rust).
+Aug 05 05:36:47 swift2 systemd[1]: swift-object-replicator.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 05:36:47 swift2 systemd[1]: swift-object-replicator.service: Failed with result 'exit-code'.
+Aug 05 05:36:49 swift2 systemd[1]: swift-object-replicator.service: Scheduled restart job, restart counter is at 36.
+Aug 05 05:36:49 swift2 systemd[1]: Stopped Swift object replicator (rust).
+Aug 05 05:36:49 swift2 systemd[1]: Started Swift object replicator (rust).
+Aug 05 05:36:49 swift2 systemd[2980745]: swift-object-replicator.service: Failed to locate executable /usr/local/bin/swift-object-replicator: Permission denied
+Aug 05 05:36:49 swift2 systemd[2980745]: swift-object-replicator.service: Failed at step EXEC spawning /usr/local/bin/swift-object-replicator: Permission denied
+Aug 05 05:36:49 swift2 systemd[1]: swift-object-replicator.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 05:36:49 swift2 systemd[1]: swift-object-replicator.service: Failed with result 'exit-code'.
+Aug 05 05:36:51 swift2 systemd[1]: swift-object-replicator.service: Scheduled restart job, restart counter is at 1.
+Aug 05 05:36:51 swift2 systemd[1]: Stopped Swift object replicator (rust).
+Aug 05 05:36:51 swift2 systemd[1]: Started Swift object replicator (rust).
+Aug 05 05:36:51 swift2 object-replicator[2980871]: INFO swift-object-replicator: devices=/srv/node bind_port=6200 interval=30s reclaim_age=604800s once=false
+Aug 05 05:43:21 swift2 object-replicator[2980871]: INFO object-replicator pass: partitions=10521 suffix_syncs=9 reverts=0 failures=0
+
+===== swift3 =====
+2026-08-05T05:45:50Z
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   48G  2.5G  96% /srv/node/d1
+/dev/sda6        50G   45G  5.8G  89% /srv/node/d2
+/dev/sda7        50G   45G  5.6G  89% /srv/node/d3
+---RECON---
+total_count	48800
+total_bytes	0
+device=d1	policy=0	count=30168	bytes=0
+device=d1	policy=1	count=2071	bytes=0
+device=d2	policy=0	count=6349	bytes=0
+device=d2	policy=1	count=2032	bytes=0
+device=d3	policy=0	count=6250	bytes=0
+device=d3	policy=1	count=1930	bytes=0
+---TS-AGE-SAMPLE---
+1785901889.0947843570 /srv/node/d1/objects/10928/a53/aac13c7eec2dc7598b8d64a1fdbc6a53/1785901889.07995.ts
+1785901425.2329200130 /srv/node/d1/objects/10928/15a/aac1035eadad35bb68ff50128ae8c15a/1785901425.22954.ts
+1785901483.5847771460 /srv/node/d1/objects/10928/6c8/aac2f9a31e00b1c7b8f70218de9cd6c8/1785901483.54692.ts
+1785901706.8572305250 /srv/node/d1/objects/10928/f91/aac196874a78466188e1481ca9f8cf91/1785901706.85410.ts
+1785901517.2486947250 /srv/node/d1/objects/10928/4ee/aac378c9e32691bcede88196611ec4ee/1785901517.24622.ts
+1785590767.5932708130
+1785590767.7205379050
+1785590775.4275278880
+1785904298.3319210630
+1785904298.3819209400
+1785904298.7659200010
+---DATA-SAMPLE---
+47G	/srv/node/d1/objects
+13M	/srv/node/d1/objects-1
+44G	/srv/node/d2/objects
+44G	/srv/node/d3/objects
+---CONF---
+2:reclaim_age = 604800
+26:reclaim_age = 604800
+50:reclaim_age = 604800
+active
+Aug 05 05:35:50 swift3 systemd[1]: swift-object-replicator.service: Failed with result 'exit-code'.
+Aug 05 05:35:52 swift3 systemd[1]: swift-object-replicator.service: Scheduled restart job, restart counter is at 3.
+Aug 05 05:35:52 swift3 systemd[1]: Stopped Swift object replicator (rust).
+Aug 05 05:35:52 swift3 systemd[3593369]: swift-object-replicator.service: Failed to locate executable /usr/local/bin/swift-object-replicator: Permission denied
+Aug 05 05:35:52 swift3 systemd[3593369]: swift-object-replicator.service: Failed at step EXEC spawning /usr/local/bin/swift-object-replicator: Permission denied
+Aug 05 05:35:52 swift3 systemd[1]: Started Swift object replicator (rust).
+Aug 05 05:35:52 swift3 systemd[1]: swift-object-replicator.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 05:35:52 swift3 systemd[1]: swift-object-replicator.service: Failed with result 'exit-code'.
+Aug 05 05:35:54 swift3 systemd[1]: swift-object-replicator.service: Scheduled restart job, restart counter is at 4.
+Aug 05 05:35:54 swift3 systemd[1]: Stopped Swift object replicator (rust).
+Aug 05 05:35:54 swift3 systemd[1]: swift-object-replicator.service: Start request repeated too quickly.
+Aug 05 05:35:54 swift3 systemd[1]: swift-object-replicator.service: Failed with result 'exit-code'.
+Aug 05 05:35:54 swift3 systemd[1]: Failed to start Swift object replicator (rust).
+Aug 05 05:37:10 swift3 systemd[1]: Started Swift object replicator (rust).
+Aug 05 05:37:10 swift3 object-replicator[3593780]: INFO swift-object-replicator: devices=/srv/node bind_port=6200 interval=30s reclaim_age=604800s once=false
+
+===== swift4 =====
+2026-08-05T05:46:45Z
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   44G  6.3G  88% /srv/node/d1
+/dev/sda6        50G   46G  5.0G  91% /srv/node/d2
+/dev/sda7        50G   45G  5.5G  90% /srv/node/d3
+---RECON---
+total_count	48411
+total_bytes	0
+device=d1	policy=0	count=29856	bytes=0
+device=d1	policy=1	count=2066	bytes=0
+device=d2	policy=0	count=6351	bytes=0
+device=d2	policy=1	count=1995	bytes=0
+device=d3	policy=0	count=6221	bytes=0
+device=d3	policy=1	count=1922	bytes=0
+---TS-AGE-SAMPLE---
+1785590775.8641943960 /srv/node/d1/objects/201/c43/3278faa694781e49e814960329800c43/1785590775.85913.ts
+1785591859.3041503270 /srv/node/d1/objects/201/e3b/32447345a3f4996fe2688d31cc50de3b/1785591859.30197.ts
+1785591927.0955219750 /srv/node/d1/objects/201/f2b/3279aba4d19603f85f91e16c77bfbf2b/1785591927.08529.ts
+1785592172.3722485820 /srv/node/d1/objects/201/990/3248fdfa18a9919d11d9070a2153f990/1785592172.37308.ts
+1785592719.2003138890 /srv/node/d1/objects/201/d3b/3242f9df70d06b3dde6eaf031b0e8d3b/1785592719.19611.ts
+1785590767.5932708130
+1785590768.7212603910
+1785590774.6622055010
+1785904298.5034114500
+1785904298.6694099200
+1785904298.7614090730
+---DATA-SAMPLE---
+43G	/srv/node/d1/objects
+12M	/srv/node/d1/objects-1
+45G	/srv/node/d2/objects
+44G	/srv/node/d3/objects
+---CONF---
+2:reclaim_age = 604800
+26:reclaim_age = 604800
+50:reclaim_age = 604800
+active
+Aug 05 05:37:43 swift4 systemd[1]: Started Swift object replicator (rust).
+Aug 05 05:37:43 swift4 systemd[1]: swift-object-replicator.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 05:37:43 swift4 systemd[1]: swift-object-replicator.service: Failed with result 'exit-code'.
+Aug 05 05:37:45 swift4 systemd[1]: swift-object-replicator.service: Scheduled restart job, restart counter is at 50.
+Aug 05 05:37:45 swift4 systemd[1]: Stopped Swift object replicator (rust).
+Aug 05 05:37:45 swift4 systemd[1]: Started Swift object replicator (rust).
+Aug 05 05:37:45 swift4 systemd[526336]: swift-object-replicator.service: Failed to locate executable /usr/local/bin/swift-object-replicator: Permission denied
+Aug 05 05:37:45 swift4 systemd[526336]: swift-object-replicator.service: Failed at step EXEC spawning /usr/local/bin/swift-object-replicator: Permission denied
+Aug 05 05:37:45 swift4 systemd[1]: swift-object-replicator.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 05:37:45 swift4 systemd[1]: swift-object-replicator.service: Failed with result 'exit-code'.
+Aug 05 05:37:47 swift4 systemd[1]: swift-object-replicator.service: Scheduled restart job, restart counter is at 1.
+Aug 05 05:37:48 swift4 systemd[1]: Stopped Swift object replicator (rust).
+Aug 05 05:37:48 swift4 systemd[1]: Started Swift object replicator (rust).
+Aug 05 05:37:48 swift4 object-replicator[526458]: INFO swift-object-replicator: devices=/srv/node bind_port=6200 interval=30s reclaim_age=604800s once=false
+Aug 05 05:43:23 swift4 object-replicator[526458]: INFO object-replicator pass: partitions=10520 suffix_syncs=8 reverts=0 failures=0
+

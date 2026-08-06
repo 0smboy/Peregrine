@@ -1,0 +1,66 @@
+=== MIGRATE START 20260805T114028Z ===
+BEFORE account: n=4 bytes=412 sha=4e7c9f3b4c2d82d4
+  [('10.0.4.1', 6202, 'd1', 100.0, 1, 1), ('10.0.4.2', 6202, 'd1', 100.0, 1, 2), ('10.0.4.3', 6202, 'd1', 100.0, 1, 3), ('10.0.4.4', 6202, 'd1', 100.0, 1, 4)]
+BEFORE container: n=4 bytes=412 sha=e21508f2982f798b
+  [('10.0.4.1', 6201, 'd1', 100.0, 1, 1), ('10.0.4.2', 6201, 'd1', 100.0, 1, 2), ('10.0.4.3', 6201, 'd1', 100.0, 1, 3), ('10.0.4.4', 6201, 'd1', 100.0, 1, 4)]
+BEFORE object: n=12 bytes=636 sha=9cb2ba88d3c4f613
+  [('10.0.4.1', 6210, 'd1', 100.0, 1, 1), ('10.0.4.1', 6211, 'd2', 100.0, 1, 1), ('10.0.4.1', 6212, 'd3', 100.0, 1, 1), ('10.0.4.2', 6210, 'd1', 100.0, 1, 2), ('10.0.4.2', 6211, 'd2', 100.0, 1, 2), ('10.0.4.2', 6212, 'd3', 100.0, 1, 2), ('10.0.4.3', 6210, 'd1', 100.0, 2, 1), ('10.0.4.3', 6211, 'd2', 100.0, 2, 1), ('10.0.4.3', 6212, 'd3', 100.0, 2, 1), ('10.0.4.4', 6210, 'd1', 100.0, 2, 2), ('10.0.4.4', 6211, 'd2', 100.0, 2, 2), ('10.0.4.4', 6212, 'd3', 100.0, 2, 2)]
+BEFORE object-1: n=12 bytes=636 sha=9cb2ba88d3c4f613
+  [('10.0.4.1', 6210, 'd1', 100.0, 1, 1), ('10.0.4.1', 6211, 'd2', 100.0, 1, 1), ('10.0.4.1', 6212, 'd3', 100.0, 1, 1), ('10.0.4.2', 6210, 'd1', 100.0, 1, 2), ('10.0.4.2', 6211, 'd2', 100.0, 1, 2), ('10.0.4.2', 6212, 'd3', 100.0, 1, 2), ('10.0.4.3', 6210, 'd1', 100.0, 2, 1), ('10.0.4.3', 6211, 'd2', 100.0, 2, 1), ('10.0.4.3', 6212, 'd3', 100.0, 2, 1), ('10.0.4.4', 6210, 'd1', 100.0, 2, 2), ('10.0.4.4', 6211, 'd2', 100.0, 2, 2), ('10.0.4.4', 6212, 'd3', 100.0, 2, 2)]
+=== account: add d2 + weight d1=0 ===
+added device 4
+added device 5
+added device 6
+added device 7
+added device 8
+added device 9
+added device 10
+added device 11
+rebalanced and wrote account.ring.gz
+=== container: add d2 + weight d1=0 ===
+added device 4
+added device 5
+added device 6
+added device 7
+added device 8
+added device 9
+added device 10
+added device 11
+rebalanced and wrote container.ring.gz
+=== object/object-1: weight d1=0 (keep d2/d3) ===
+object.ring.gz added device 12 -> r1z1-10.0.4.1:6210R10.0.8.1:6210/d1 w 0
+object.ring.gz added device 13 -> r1z1-10.0.4.1:6211R10.0.8.1:6211/d2 w 100
+object.ring.gz added device 14 -> r1z1-10.0.4.1:6212R10.0.8.1:6212/d3 w 100
+object.ring.gz added device 15 -> r1z2-10.0.4.2:6210R10.0.8.2:6210/d1 w 0
+object.ring.gz added device 16 -> r1z2-10.0.4.2:6211R10.0.8.2:6211/d2 w 100
+object.ring.gz added device 17 -> r1z2-10.0.4.2:6212R10.0.8.2:6212/d3 w 100
+object.ring.gz added device 18 -> r2z1-10.0.4.3:6210R10.0.8.3:6210/d1 w 0
+object.ring.gz added device 19 -> r2z1-10.0.4.3:6211R10.0.8.3:6211/d2 w 100
+object.ring.gz added device 20 -> r2z1-10.0.4.3:6212R10.0.8.3:6212/d3 w 100
+object.ring.gz added device 21 -> r2z2-10.0.4.4:6210R10.0.8.4:6210/d1 w 0
+object.ring.gz added device 22 -> r2z2-10.0.4.4:6211R10.0.8.4:6211/d2 w 100
+object.ring.gz added device 23 -> r2z2-10.0.4.4:6212R10.0.8.4:6212/d3 w 100
+object.ring.gz rebalanced and wrote object.ring.gz
+object-1.ring.gz added device 12 -> r1z1-10.0.4.1:6210R10.0.8.1:6210/d1 w 0
+object-1.ring.gz added device 13 -> r1z1-10.0.4.1:6211R10.0.8.1:6211/d2 w 100
+object-1.ring.gz added device 14 -> r1z1-10.0.4.1:6212R10.0.8.1:6212/d3 w 100
+object-1.ring.gz added device 15 -> r1z2-10.0.4.2:6210R10.0.8.2:6210/d1 w 0
+object-1.ring.gz added device 16 -> r1z2-10.0.4.2:6211R10.0.8.2:6211/d2 w 100
+object-1.ring.gz added device 17 -> r1z2-10.0.4.2:6212R10.0.8.2:6212/d3 w 100
+object-1.ring.gz added device 18 -> r2z1-10.0.4.3:6210R10.0.8.3:6210/d1 w 0
+object-1.ring.gz added device 19 -> r2z1-10.0.4.3:6211R10.0.8.3:6211/d2 w 100
+object-1.ring.gz added device 20 -> r2z1-10.0.4.3:6212R10.0.8.3:6212/d3 w 100
+object-1.ring.gz added device 21 -> r2z2-10.0.4.4:6210R10.0.8.4:6210/d1 w 0
+object-1.ring.gz added device 22 -> r2z2-10.0.4.4:6211R10.0.8.4:6211/d2 w 100
+object-1.ring.gz added device 23 -> r2z2-10.0.4.4:6212R10.0.8.4:6212/d3 w 100
+object-1.ring.gz rebalanced and wrote object-1.ring.gz
+=== AFTER builders ===
+AFTER account: live_devs=['d1', 'd2'] ports=[6202] n_live=8 n_zero=4
+FAIL still live d1 account
+AFTER container: live_devs=['d1', 'd2'] ports=[6201] n_live=8 n_zero=4
+FAIL still live d1 container
+AFTER object: live_devs=['d1', 'd2', 'd3'] ports=[6210, 6211, 6212] n_live=20 n_zero=4
+FAIL still live d1 object
+AFTER object-1: live_devs=['d1', 'd2', 'd3'] ports=[6210, 6211, 6212] n_live=20 n_zero=4
+FAIL still live d1 object-1
+ISOLATION_OK False

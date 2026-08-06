@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>阶段 1B · 已实现中间件子集 API</title>
+<style>
+  body{font:15px/1.45 system-ui,sans-serif;max-width:920px;margin:2rem auto;padding:0 1rem;color:#1a1a1a}
+  h1{font-size:1.4rem} table{border-collapse:collapse;width:100%;margin:1rem 0}
+  th,td{border:1px solid #ccc;padding:.45rem .6rem;text-align:left;vertical-align:top}
+  th{background:#f3f3f3} .ok{color:#0a6} .warn{color:#a60} .bad{color:#a00}
+  code{font-size:.92em}
+</style>
+</head>
+<body>
+<h1>阶段 1B：已实现中间件子集 API</h1>
+<p>按 <code>USER-METHOD-PLAN.md</code>。禁止写成「全 Paste 已对齐」。旧 R0–R8 不计入本轮正式结论。</p>
+
+<h2>1. 需求 / 目标 / 现状</h2>
+<table>
+<tr><th>用户需求</th><td>两侧同一可部署中间件名单再跑全量 API；缺口单表；不宣称全 Paste</td></tr>
+<tr><th>完美对齐</th><td>已实现子集双侧通过；缺口诚实列出；布局仍为 1A（1/4 无 Swift）</td></tr>
+<tr><th>现在到哪了</th><td class="ok">布局保持 1A；func-suite 双侧 <strong>54/54</strong>；缺口表已出；B4 代码落地（conf 可读子集 pipeline）</td></tr>
+</table>
+
+<h2>2. 动作 / 环境 / 效果</h2>
+<table>
+<tr><th>动作</th><th>环境</th><th>为什么</th><th>效果</th></tr>
+<tr><td>核实 1A 布局</td><td>swift1/4 CLEAN；swift2 Py :8090；swift3 Rs :8081</td><td>1B 建立在 1A 上</td><td class="ok">布局未漂移</td></tr>
+<tr><td>func-suite 双侧</td><td>凭据 test:tester / azure-swift-2026.bench</td><td>已实现子集核心路径</td><td class="ok">Py 54/0；Rs 54/0</td></tr>
+<tr><td>/info 对比</td><td>两侧 endpoint</td><td>能力广告诚实</td><td class="ok">共有 slo/swift/tempauth；Rs 多报 dlo；均未报 bulk/tempurl</td></tr>
+<tr><td>缺口探针</td><td>bulk / account-ACL / versions-location / healthcheck</td><td>区分「未实现」与 FAIL</td><td class="warn">见缺口表（非套件 FAIL）</td></tr>
+<tr><td>Python 管道</td><td>cache + listing_formats（tempauth 硬依赖 memcache）</td><td>可认证最小集</td><td class="warn">多出 cache/proxy-logging/listing_formats — Rust 跳过</td></tr>
+</table>
+
+<h2>3. 管道与缺口（诚实）</h2>
+<table>
+<tr><th>侧</th><th>管道 / 接线</th></tr>
+<tr><td>Python</td><td><code>catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth copy slo dlo proxy-server</code></td></tr>
+<tr><td>Rust</td><td>always-on: catch_errors/gatekeeper/healthcheck；可配：tempauth/copy/slo/dlo（+可选 ratelimit）；无 memcache filter</td></tr>
+</table>
+<table>
+<tr><th>缺口项</th><th>影响</th><th>判定</th></tr>
+<tr><td>memcache / <code>[filter:cache]</code></td><td>Python 认证缓存路径不同</td><td class="warn">未对齐 — 记缺口，非 1B FAIL</td></tr>
+<tr><td>proxy-logging / listing_formats</td><td>Python 薄管道携带；Rust 未接线</td><td class="warn">未对齐</td></tr>
+<tr><td>bulk / tempurl / formpost / staticweb / quotas / Keystone / S3</td><td>L2 未实现</td><td class="warn">禁止写成已对齐</td></tr>
+<tr><td>account ACL / versioned_writes</td><td>探针双侧多为 204 无行为差（未真正启用）</td><td class="warn">不宣称支持</td></tr>
+<tr><td>可配 pipeline 子集（B4）</td><td>代码已支持 <code>[pipeline:main]</code> 排序已实现过滤器</td><td class="ok">本地单测 4/4；Contabo SAIO 仍用默认接线</td></tr>
+</table>
+
+<h2>4. 剩余 / 下一步</h2>
+<table>
+<tr><th>剩余</th><th>规划</th></tr>
+<tr><td>B3 Contabo <code>swift-deploy apply</code> LB 门禁</td><td>阶段 2 硬门禁；证据 <code>deploy-rs-rust-lb-YYYYMMDD/</code></td></tr>
+<tr><td>阶段 2 仅 Rust 四节点性能/故障</td><td>门禁绿后；先关全部 SAIO</td></tr>
+<tr><td>全 Paste / memcache 真对齐</td><td><strong>FROZEN</strong> 直至实现</td></tr>
+</table>
+
+<p>证据：<code>func-suite.log</code>、<code>info-*.json</code>、<code>gap-probes2.log</code>、本报告。标签：<code>CORE-PATH-ONLY</code>。</p>
+</body>
+</html>

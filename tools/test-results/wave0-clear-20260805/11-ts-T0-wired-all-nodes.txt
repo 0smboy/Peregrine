@@ -1,0 +1,17 @@
+T0_WIRED 2026-08-05T05:11:17Z
+=== swift1 ===
+Aug 05 05:11:10 swift1 object-replicator[3513401]: INFO swift-object-replicator: devices=/srv/node bind_port=6200 interval=30s reclaim_age=600s once=false
+total_count	48901
+total_bytes	0
+=== swift2 ===
+Aug 05 05:09:46 swift2 object-replicator[2920513]: INFO swift-object-replicator: devices=/srv/node bind_port=6200 interval=30s reclaim_age=600s once=false
+total_count	48407
+total_bytes	0
+=== swift3 ===
+Aug 05 05:10:14 swift3 object-replicator[3559170]: INFO swift-object-replicator: devices=/srv/node bind_port=6200 interval=30s reclaim_age=600s once=false
+total_count	48833
+total_bytes	0
+=== swift4 ===
+Aug 05 05:10:41 swift4 object-replicator[464370]: INFO swift-object-replicator: devices=/srv/node bind_port=6200 interval=30s reclaim_age=600s once=false
+total_count	48418
+total_bytes	0

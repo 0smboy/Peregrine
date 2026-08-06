@@ -1,0 +1,16 @@
+account.ring.gz
+account.ring.gz.builder.json
+account-server.conf
+container.ring.gz
+container.ring.gz.builder.json
+container-server.conf
+object-1.ring.gz
+object-1.ring.gz.builder.json
+object.ring.gz
+object.ring.gz.builder.json
+object-server.conf
+proxy-server.conf
+replication_key
+replication_key.pub
+swift.conf
+no 8081/8090

@@ -1,0 +1,5 @@
+# REDACTED for publication — raw file contained live EC2 access/secret.
+# Result summary only:
+# - OS-EC2 credential create with tenant_id: PASS
+# - ListBuckets/Create/Put/Get with new EC2 keys: VERDICT GREEN
+# - Do not commit live Keystone secrets or EC2 secrets to git.

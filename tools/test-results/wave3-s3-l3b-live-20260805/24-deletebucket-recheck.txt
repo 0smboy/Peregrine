@@ -1,0 +1,4 @@
+  File "<stdin>", line 14
+    pairs.sort(); cq="&".join(f"{quote(k,safe=\"-_.~\")}={quote(v,safe=\"-_.~\")}" for k,v in pairs)
+                                                                                   ^
+SyntaxError: f-string expression part cannot include a backslash

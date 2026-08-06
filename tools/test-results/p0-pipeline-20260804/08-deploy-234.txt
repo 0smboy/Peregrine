@@ -1,0 +1,45 @@
+===== push+deploy swift2 =====
+# Managed by P0 pipeline foundation deploy (2026-08-04)
+# P0 thin+cache pipeline (2026-08-04)
+[pipeline:main]
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth copy slo dlo proxy-server
+[filter:proxy-logging]
+[filter:cache]
+[filter:listing_formats]
+[filter:tempauth]
+active
+health=200
+Aug 04 13:20:45 swift2 proxy-server[426829]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth copy slo dlo proxy-server
+Aug 04 13:20:45 swift2 proxy-server[426829]: INFO proxy_logging enabled (logger sink)
+Aug 04 13:20:45 swift2 proxy-server[426829]: INFO cache enabled (memcache_servers=10.0.0.2:11211)
+Aug 04 13:20:45 swift2 proxy-server[426829]: INFO listing_formats enabled
+===== push+deploy swift3 =====
+# Managed by P0 pipeline foundation deploy (2026-08-04)
+# P0 thin+cache pipeline (2026-08-04)
+[pipeline:main]
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth copy slo dlo proxy-server
+[filter:proxy-logging]
+[filter:cache]
+[filter:listing_formats]
+[filter:tempauth]
+active
+health=200
+Aug 04 13:20:58 swift3 proxy-server[3356845]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth copy slo dlo proxy-server
+Aug 04 13:20:58 swift3 proxy-server[3356845]: INFO proxy_logging enabled (logger sink)
+Aug 04 13:20:58 swift3 proxy-server[3356845]: INFO cache enabled (memcache_servers=10.0.0.3:11211)
+Aug 04 13:20:58 swift3 proxy-server[3356845]: INFO listing_formats enabled
+===== push+deploy swift4 =====
+# Managed by P0 pipeline foundation deploy (2026-08-04)
+# P0 thin+cache pipeline (2026-08-04)
+[pipeline:main]
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth copy slo dlo proxy-server
+[filter:proxy-logging]
+[filter:cache]
+[filter:listing_formats]
+[filter:tempauth]
+active
+health=200
+Aug 04 13:21:17 swift4 proxy-server[2161429]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth copy slo dlo proxy-server
+Aug 04 13:21:17 swift4 proxy-server[2161429]: INFO proxy_logging enabled (logger sink)
+Aug 04 13:21:17 swift4 proxy-server[2161429]: INFO cache enabled (memcache_servers=10.0.0.4:11211)
+Aug 04 13:21:17 swift4 proxy-server[2161429]: INFO listing_formats enabled

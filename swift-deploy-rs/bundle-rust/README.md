@@ -11,14 +11,14 @@ with `stack: rust` and carry the `deploy_stack: rust` marker in
 
 | Piece | Detail |
 | --- | --- |
-| Binaries | 19 `swift-*` binaries → `/usr/local/bin` (payload inside the bundle, see `roles/rust_payload/PAYLOAD.md`) |
+| Binaries | 23 `swift-*` binaries → `/usr/local/bin` (payload inside the bundle, see `roles/rust_payload/PAYLOAD.md`) |
 | Libraries | liberasurecode family → `/usr/lib64` + ldconfig |
 | Config | `/etc/swift/{swift,proxy-server,account-server,container-server,object-server}.conf`, verified against what the Rust binaries actually parse |
-| Rings | built once on the first proxy node with `swift-ring-builder`, staged on the controller under `ring_fetch_dir`, distributed to every node |
-| Services | one systemd unit per service: `swift-proxy`, `swift-account`, `swift-container`, `swift-object`, `swift-account-replicator`, `swift-container-replicator`, `swift-object-replicator`, `swift-object-updater`, and `swift-object-reconstructor` on EC clusters. `Environment=SWIFT_DIR=/etc/swift`, `Restart=on-failure` |
-| Auditors | `swift-object-auditor` / `swift-db-auditor` are one-shot per-device tools (not conf daemons), scheduled as a nightly cron sweep (`/usr/local/libexec/swift-audit-sweep.sh`) |
-| LB | haproxy on `haproxy_servers` when `use_lb`, balancing every proxy's business address on `swift_lb_port`, stats guarded by `haproxy_stats_user/password` |
-| Verify | fail-closed: `/healthcheck` per proxy, tempauth token for the first account, container PUT/GET round trip |
+| Rings | built on the first proxy with `swift-ring-builder`, staged under `ring_fetch_dir`, distributed to every node. Greenfield uses a content stamp; **expand** via `expand.yml` (`ring_expand`) idempotently adds missing devices |
+| Services | one systemd unit per service (proxy/account/container/object + replicators/updater/expirer/reaper/reconciler/auditors; EC reconstructor when multi-policy) |
+| Devices | `host_vars.swift_devices` (default `d1`) — **mkdir only**, never mkfs/wipe `/srv/node` |
+| LB | haproxy when `use_lb`; `lb_mode=http` or **`https`** (TLS terminate at HAProxy); optional Keepalived VIP |
+| Verify | fail-closed: `/healthcheck`, tempauth token, container PUT/GET |
 
 All server daemons run as **root** (matching the reference `deploy/bootstrap.sh`
 model); no `swift` unix user is created.
@@ -30,83 +30,83 @@ model); no `swift` unix user is created.
   `haproxy_servers`, `ntp_server`/`ntp_clients`; the keystone/mariadb/
   keepalived/... groups must EXIST but may be empty. `inventory_hostname` is
   the management IP, `ansible_user=root`.
-- Per-node devices come from `host_vars/<ip>.yml`:
-  - `custom_disks` non-empty → each disk is formatted **xfs** (only when not
-    already xfs — an existing xfs filesystem is never wiped), mounted at
-    `/srv/node/<basename>`, persisted in fstab; ring device = basename.
-  - `custom_disks: []` → one directory device `/srv/node/d1`, no mount,
-    `mount_check = false`.
-- Zones are assigned per node in group order (`z1..zN`), region fixed at `r1`,
-  weight from `swift_device_weight`.
-- Replication transport is chosen by cluster size
-  (`groups['object_servers'] | length > 1`):
-  - multi-node → rsync-over-ssh: `rsync_ssh_opts` +
-    `rsync_devices_root = srv_node_root`, using one ed25519 key generated on
-    the first storage node and authorized on all storage nodes.
-  - single node → local `peer_map = <port>:<srv_node_root>` model.
-- All servers bind `0.0.0.0` on `proxy/account/container/object_bind_port`.
-- The EC reconstructor unit is installed only when more than one storage
-  policy exists (`swift_policies | length > 1`).
+- Per-node devices: `swift_devices: [d1, d2, …]` under `srv_node_root`.
+  Block devices must be prepared **out-of-band** (XFS mount already present).
+- `region` / `zone` from host_vars feed ring device ids (`r<R>z<Z>-…`).
+  See [MULTI-REGION.md](../../docs/fairness-lab/MULTI-REGION.md).
+- Replication transport: multi-node → rsync-over-ssh; single node → local peer_map.
+
+## P3-ops: TLS
+
+When `lb_mode: https` (workspace `ingress.http_mode=https` with haproxy/keepalived):
+
+1. Operator PEM: set `haproxy_tls_pem_src` to a controller-side cert+key PEM, or
+2. Lab self-signed: `haproxy_tls_self_signed: true` (default) generates CN=`auth_url_ip`.
+
+Backends stay plain HTTP to proxies. Contabo lab without a real cert: keep
+`http` for live traffic; verify https via dry-run / `haproxy -c` plan evidence.
+
+## P3-ops: add-disk / add-node
+
+Playbook: **`expand.yml`** (sets `ring_expand` via `rust_expand_mode`).
+
+1. Mount/prepare new device out-of-band at `/srv/node/<name>` (or bring up a node).
+2. Update inventory host_vars (`swift_devices`, region/zone, groups).
+3. `swift-deploy apply … --playbook expand.yml`
+4. Dual-guard: no wipe of `/srv/node` without an explicit ticket outside this bundle.
+
+Honest note: Rust `swift-ring-builder` rebalance rebuilds assignment from the
+device list (no persistent replica2part2dev) — expect partition movement;
+replicators heal. Use a maintenance window.
 
 ## Variables (group_vars/all)
 
-See `config_sample/group_vars/all` — it defines every variable any template
-or task references, which is exactly the set workspace.rs must render:
-
-- contract vars: `deploy_stack`, `auth_method`, `swift_tempauth_users`,
-  `proxy/account/container/object_bind_port`, `srv_node_root`,
-  `object_workers`, `swift_policies`, `swift_lb_port`, `swift_device_weight`
-- v3-shared vars: `INSTALL_MODE`, `SAIO`, `timezone`, ntp vars, `admin_ips`,
-  `ssh_bind_port`, `swift_hash_path_prefix/suffix`,
-  `account/container_swift_{partition_power,replicas,minimum_time}`,
-  `use_lb`, `lb_mode`, `auth_url_ip`, `haproxy_stats_user/password`
-- bundle-rust additions: `ring_fetch_dir` (controller-side staging directory
-  for fetched rings and the replication keypair; give every project its own
-  path), plus optional `haproxy_monitor_port` / `haproxy_max_conn`
-  (defaulted in-template).
-
-`config_sample/` is a structure example: applying from a `config_sample`
-path is permanently refused by the UI/backend, and its secrets/key paths are
-obvious placeholders.
+See `config_sample/group_vars/all` — includes TLS (`haproxy_tls_*`) and expand
+(`ring_expand`, `ADD_NODES`, `ring_force_rebuild`) knobs. Workspace.rs renders
+the real project file from the same contract.
 
 ## Idempotency
 
-Re-applying a converged cluster reports changed=0: templates/copies compare
-content, formatting/mounting/units/packages are probe-guarded, ring building
-is `creates:`-guarded plus per-ring skips inside the script. Config drift
-triggers the `restart swift services` handler; unit-file drift restarts the
-affected unit; ring files hot-reload without restarts.
+Re-applying a converged cluster reports changed=0 when stamp matches.
+Topology edits re-render `build_rings.sh` (stamp change → rebuild) or use
+`expand.yml` for additive expand. Config drift restarts services via handlers.
 
-## Honest non-goals (v1)
+## Identity 对接 (not provisioning)
 
-- No keepalived/VIP for the rust stack; `ingress` is direct or haproxy only.
-- No TLS anywhere (`lb_mode: https` is not honored — the haproxy frontend is
-  plain http).
-- No S3 API.
-- No ring rebalance-only reruns: add-disk/add-node flows are not supported.
-  Rings build once; topology changes need the ring files removed and rebuilt
-  (or a manual `swift-ring-builder` run) — deliberately manual in v1.
+MariaDB Galera + Keystone are installed with the **python**
+[`bundle/config_contabo_identity`](../bundle/config_contabo_identity/) inventory.
+This bundle only wires:
+
+- optional HAProxy Identity listeners (`identity_haproxy_enabled`)
+- optional proxy `authtoken`/`keystoneauth` filters (`identity_proxy_enabled`)
+
+See [IDENTITY.md](IDENTITY.md) and [KEYSTONE-LIVE.md](../../docs/fairness-lab/KEYSTONE-LIVE.md).
+Default Contabo remains TempAuth on VIP `:8085`.
+
+## Honest non-goals
+
+- No S3 API default; no MariaDB/Keystone *provisioning* in this bundle.
+- No managed block-device wipe/format (dual-guard).
 - Rocky 9 x86_64 only (prebuilt binaries; glibc >= 2.34).
-- Single-node clusters: the DB replicators' full-DB rsync fallback addresses
-  peers as `127.0.0.1:<port>` in local peer_map mode, so with rings built on
-  a real storage IP that fallback is inert; same-host usync over REPLICATE
-  still converges DBs. Multi-node clusters use the ssh path and are unaffected.
-- NTP/chrony is not managed by this bundle (groups kept for validation only).
+- NTP/chrony groups kept for validation only (not managed here).
 
 ## Layout
 
 ```
-swift.yml            roles-only plays (planner reads hosts: + roles:)
+swift.yml            greenfield roles-only plays
+expand.yml           P3-ops add-disk/add-node (ring_expand)
 ansible.cfg
 config_sample/       swift_hosts, group_vars/all, host_vars/<ip>.yml
 roles/
   rust_common/       timezone, dirs, rsync dep, stop legacy SAIO unit
-  rust_disks/        xfs format+mount OR directory device
-  rust_payload/      binaries + libs (payload files, see PAYLOAD.md)
-  rust_config/       swift.conf + per-server confs (+ restart handler)
-  rust_replication_key/  ed25519 keypair, fetched + distributed
-  rust_rings/        build_rings.sh.j2, build once, fetch, distribute
-  rust_systemd/      per-service units + auditor cron sweep
-  rust_haproxy/      haproxy when use_lb
-  rust_verify/       healthcheck + tempauth + PUT/GET round trip
+  rust_disks/        mkdir device dirs only (never mkfs)
+  rust_payload/      binaries + libs
+  rust_config/       swift.conf + per-server confs
+  rust_replication_key/  ed25519 keypair
+  rust_rings/        build_rings.sh.j2 (create / expand / force)
+  rust_expand_mode/  set_fact ring_expand for expand.yml
+  rust_systemd/      per-service units
+  rust_haproxy/      haproxy (+ optional TLS)
+  rust_keepalived/   Keepalived VIP
+  rust_verify/       healthcheck + tempauth + PUT/GET
 ```

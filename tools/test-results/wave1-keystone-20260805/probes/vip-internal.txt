@@ -1,0 +1,4 @@
+vip_hc=200
+local_proxy=200
+VIP_not_on_swift1
+s1=200 s2=200 s3=200 s4=200 

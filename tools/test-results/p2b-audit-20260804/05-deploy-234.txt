@@ -1,0 +1,24 @@
+===== fanout swift2 =====
+scp: /tmp/p2b-stage/: destination is not a directory
+scp: /tmp/p2b-stage/: destination is not a directory
+scp: /tmp/p2b-stage/: destination is not a directory
+active
+active
+active
+P2b deploy OK on swift2
+===== fanout swift3 =====
+scp: /tmp/p2b-stage/: destination is not a directory
+scp: /tmp/p2b-stage/: destination is not a directory
+scp: /tmp/p2b-stage/: destination is not a directory
+active
+active
+active
+P2b deploy OK on swift3
+===== fanout swift4 =====
+scp: /tmp/p2b-stage/: destination is not a directory
+scp: /tmp/p2b-stage/: destination is not a directory
+scp: /tmp/p2b-stage/: destination is not a directory
+active
+active
+active
+P2b deploy OK on swift4

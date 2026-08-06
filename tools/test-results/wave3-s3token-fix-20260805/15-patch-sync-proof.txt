@@ -1,0 +1,24 @@
+HOST=swift1
+4a9d93a4bad164f7f7b47f78243ad976  /etc/keystone/credential-keys/0
+a89c0061e7325e75e96da1a26b066d41  /etc/keystone/credential-keys/1
+05b99f78fc004f72b0a3d6a8fcfd8853  /etc/keystone/fernet-keys/0
+068605c415847b65da79c8579ba9d252  /etc/keystone/fernet-keys/1
+3c4c5669e10d7591cf19e0def00beb8a  /usr/lib/python3.9/site-packages/keystone/api/s3tokens.py
+2
+1
+HOST=swift2
+4a9d93a4bad164f7f7b47f78243ad976  /etc/keystone/credential-keys/0
+a89c0061e7325e75e96da1a26b066d41  /etc/keystone/credential-keys/1
+05b99f78fc004f72b0a3d6a8fcfd8853  /etc/keystone/fernet-keys/0
+068605c415847b65da79c8579ba9d252  /etc/keystone/fernet-keys/1
+3c4c5669e10d7591cf19e0def00beb8a  /usr/lib/python3.9/site-packages/keystone/api/s3tokens.py
+2
+1
+HOST=swift3
+4a9d93a4bad164f7f7b47f78243ad976  /etc/keystone/credential-keys/0
+a89c0061e7325e75e96da1a26b066d41  /etc/keystone/credential-keys/1
+05b99f78fc004f72b0a3d6a8fcfd8853  /etc/keystone/fernet-keys/0
+068605c415847b65da79c8579ba9d252  /etc/keystone/fernet-keys/1
+3c4c5669e10d7591cf19e0def00beb8a  /usr/lib/python3.9/site-packages/keystone/api/s3tokens.py
+2
+1

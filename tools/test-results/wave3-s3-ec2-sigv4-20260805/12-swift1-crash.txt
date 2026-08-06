@@ -1,0 +1,80 @@
+Aug 05 10:30:38 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:30:38 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 05 10:30:39 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:30:40 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:30:43 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:30:43 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0005 -
+Aug 05 10:30:45 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:30:45 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:30:48 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:30:48 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:30:50 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:30:50 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 05 10:30:53 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:30:53 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:30:54 swift1 proxy-server[37418]: INFO - - 05/Aug/2026/10/30/54 HEAD /v1/AUTH_29af7f1e19774999bf700fbef31994d3/soak-53-933 HTTP/1.0 204 - curl/7.76.1 gAAAAABqcxDdFpqY... - - - tx5e3d4d2711d8d03c00459-006a7310dd - 0.0738 - - 1785925854.015219927 1785925854.089039564 0
+Aug 05 10:30:54 swift1 proxy-server[37418]: INFO - - 05/Aug/2026/10/30/54 HEAD /v1/AUTH_29af7f1e19774999bf700fbef31994d3 HTTP/1.0 204 - curl/7.76.1 gAAAAABqcxDdFpqY... - - - tx5e3d4d2711d8d03c00459-006a7310dd - 0.1121 - - 1785925854.336228371 1785925854.448359251 -
+Aug 05 10:30:54 swift1 proxy-server[37418]: INFO - - 05/Aug/2026/10/30/54 HEAD /v1/AUTH_29af7f1e19774999bf700fbef31994d3/soak-53-933 HTTP/1.0 204 - curl/7.76.1 gAAAAABqcxDdFpqY... - - - tx5e3d4d2711d8d03c00459-006a7310dd - 0.0148 - - 1785925854.925226927 1785925854.940044403 0
+Aug 05 10:30:54 swift1 proxy-server[37418]: INFO - - 05/Aug/2026/10/30/54 HEAD /v1/AUTH_29af7f1e19774999bf700fbef31994d3/soak-53-933 HTTP/1.0 204 - curl/7.76.1 gAAAAABqcxDdFpqY... - - - tx5e3d4d2711d8d03c00459-006a7310dd - 0.0253 - - 1785925854.940132618 1785925854.965444565 0
+Aug 05 10:30:55 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:30:55 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:30:55 swift1 proxy-server[37418]: INFO - - 05/Aug/2026/10/30/55 PUT /v1/AUTH_29af7f1e19774999bf700fbef31994d3/soak-53-933/o1 HTTP/1.0 201 - curl/7.76.1 gAAAAABqcxDdFpqY... 18 - - tx5e3d4d2711d8d03c00459-006a7310dd - 0.1129 - - 1785925855.380654335 1785925855.493569374 -
+Aug 05 10:30:55 swift1 proxy-server[37418]: INFO - - 05/Aug/2026/10/30/55 PUT /v1/AUTH_29af7f1e19774999bf700fbef31994d3/soak-53-933/o1 HTTP/1.0 201 - curl/7.76.1 gAAAAABqcxDdFpqY... 18 - - tx5e3d4d2711d8d03c00459-006a7310dd - 1.7576 - - 1785925853.736047983 1785925855.493638039 -
+Aug 05 10:30:55 swift1 proxy-server[37418]: INFO - PUT /v1/AUTH_29af7f1e19774999bf700fbef31994d3/soak-53-933/o1 201 0 1.7578 -
+Aug 05 10:30:58 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:30:58 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 05 10:31:00 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:31:00 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:31:03 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0052 -
+Aug 05 10:31:03 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:31:05 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:31:05 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:31:08 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0005 -
+Aug 05 10:31:08 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:31:10 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:31:10 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:31:13 swift1 proxy-server[37418]: INFO - - 05/Aug/2026/10/31/13 PUT /v1/AUTH_29af7f1e19774999bf700fbef31994d3/soak-54-7213 HTTP/1.0 201 - curl/7.76.1 gAAAAABqcxDxOvsg... - - - txabff712c0844ba570046a-006a7310f1 - 0.0601 - - 1785925873.647789717 1785925873.707927227 0
+Aug 05 10:31:13 swift1 proxy-server[37418]: INFO - - 05/Aug/2026/10/31/13 PUT /v1/AUTH_29af7f1e19774999bf700fbef31994d3/soak-54-7213 HTTP/1.0 201 - curl/7.76.1 gAAAAABqcxDxOvsg... - - - txabff712c0844ba570046a-006a7310f1 - 0.2159 - - 1785925873.492101431 1785925873.707977057 0
+Aug 05 10:31:13 swift1 proxy-server[37418]: INFO - PUT /v1/AUTH_29af7f1e19774999bf700fbef31994d3/soak-54-7213 201 0 0.2161 -
+Aug 05 10:31:13 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 05 10:31:14 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:31:15 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:31:15 swift1 proxy-server[37418]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 05 10:31:17 swift1 systemd[1]: Stopping Swift proxy server (rust)...
+Aug 05 10:31:18 swift1 proxy-server[37418]: INFO exiting
+Aug 05 10:31:18 swift1 systemd[1]: swift-proxy.service: Deactivated successfully.
+Aug 05 10:31:18 swift1 systemd[1]: Stopped Swift proxy server (rust).
+Aug 05 10:31:18 swift1 systemd[1]: swift-proxy.service: Consumed 1min 51.786s CPU time.
+Aug 05 10:31:18 swift1 systemd[1]: Started Swift proxy server (rust).
+Aug 05 10:31:18 swift1 systemd[91280]: swift-proxy.service: Failed to execute /usr/local/bin/swift-proxy-server: Exec format error
+Aug 05 10:31:18 swift1 systemd[91280]: swift-proxy.service: Failed at step EXEC spawning /usr/local/bin/swift-proxy-server: Exec format error
+Aug 05 10:31:18 swift1 systemd[1]: swift-proxy.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 10:31:18 swift1 systemd[1]: swift-proxy.service: Failed with result 'exit-code'.
+Aug 05 10:31:20 swift1 systemd[1]: swift-proxy.service: Scheduled restart job, restart counter is at 1.
+Aug 05 10:31:20 swift1 systemd[1]: Stopped Swift proxy server (rust).
+Aug 05 10:31:20 swift1 systemd[1]: Started Swift proxy server (rust).
+Aug 05 10:31:20 swift1 systemd[91356]: swift-proxy.service: Failed to execute /usr/local/bin/swift-proxy-server: Exec format error
+Aug 05 10:31:20 swift1 systemd[91356]: swift-proxy.service: Failed at step EXEC spawning /usr/local/bin/swift-proxy-server: Exec format error
+Aug 05 10:31:20 swift1 systemd[1]: swift-proxy.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 10:31:20 swift1 systemd[1]: swift-proxy.service: Failed with result 'exit-code'.
+Aug 05 10:31:22 swift1 systemd[1]: swift-proxy.service: Scheduled restart job, restart counter is at 2.
+Aug 05 10:31:22 swift1 systemd[1]: Stopped Swift proxy server (rust).
+Aug 05 10:31:22 swift1 systemd[1]: Started Swift proxy server (rust).
+Aug 05 10:31:22 swift1 systemd[91397]: swift-proxy.service: Failed to execute /usr/local/bin/swift-proxy-server: Exec format error
+Aug 05 10:31:22 swift1 systemd[91397]: swift-proxy.service: Failed at step EXEC spawning /usr/local/bin/swift-proxy-server: Exec format error
+Aug 05 10:31:22 swift1 systemd[1]: swift-proxy.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 10:31:22 swift1 systemd[1]: swift-proxy.service: Failed with result 'exit-code'.
+Aug 05 10:31:25 swift1 systemd[1]: swift-proxy.service: Scheduled restart job, restart counter is at 3.
+Aug 05 10:31:25 swift1 systemd[1]: Stopped Swift proxy server (rust).
+Aug 05 10:31:25 swift1 systemd[1]: Started Swift proxy server (rust).
+Aug 05 10:31:25 swift1 systemd[91437]: swift-proxy.service: Failed to execute /usr/local/bin/swift-proxy-server: Exec format error
+Aug 05 10:31:25 swift1 systemd[91437]: swift-proxy.service: Failed at step EXEC spawning /usr/local/bin/swift-proxy-server: Exec format error
+Aug 05 10:31:25 swift1 systemd[1]: swift-proxy.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 10:31:25 swift1 systemd[1]: swift-proxy.service: Failed with result 'exit-code'.
+Aug 05 10:31:27 swift1 systemd[1]: swift-proxy.service: Scheduled restart job, restart counter is at 4.
+Aug 05 10:31:27 swift1 systemd[1]: Stopped Swift proxy server (rust).
+Aug 05 10:31:27 swift1 systemd[1]: Started Swift proxy server (rust).
+Aug 05 10:31:27 swift1 systemd[91476]: swift-proxy.service: Failed to execute /usr/local/bin/swift-proxy-server: Exec format error
+Aug 05 10:31:27 swift1 systemd[91476]: swift-proxy.service: Failed at step EXEC spawning /usr/local/bin/swift-proxy-server: Exec format error
+Aug 05 10:31:27 swift1 systemd[1]: swift-proxy.service: Main process exited, code=exited, status=203/EXEC
+Aug 05 10:31:27 swift1 systemd[1]: swift-proxy.service: Failed with result 'exit-code'.

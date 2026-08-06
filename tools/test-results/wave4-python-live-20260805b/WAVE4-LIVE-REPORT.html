@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Wave 4 Python live re-gate — 2026-08-05b</title>
+<style>
+body{font:14px/1.45 system-ui,sans-serif;margin:24px;color:#1a1a1a;background:#f7f5f1}
+h1{font-size:1.4rem;margin:0 0 8px}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-weight:600;font-size:12px}
+.ok{background:#d7f0d7}.warn{background:#ffe6a8}.bad{background:#f5c2c2}
+table{border-collapse:collapse;width:100%;margin:12px 0;background:#fff}
+th,td{border:1px solid #ddd;padding:8px;text-align:left}
+th{background:#eee}
+code{font-size:12px}
+</style>
+</head>
+<body>
+<h1>Wave 4 — Python 3-node live re-gate</h1>
+<p><span class="badge bad">BLOCKED</span> · <code>PYTHON_CLUSTER=ABSENT</code> · 2026-08-05b</p>
+
+<h2>1) What this cycle did</h2>
+<ul>
+<li>Re-checked df Use% and MemAvailable on swift1–4.</li>
+<li>Re-read rings: object spp on d1–d3 ports 6210–6212; account/container still d1-only.</li>
+<li>Confirmed W0′ <code>LAB_META_CLEAN</code> (unblocks META gate from prior pack).</li>
+<li>Documented swift2 <code>/etc/pyswift</code> leftover — not stage-3.</li>
+<li><strong>Did not install</strong> Python 3-node (disk isolation FAIL).</li>
+</ul>
+
+<h2>2) Optimized / fixed / demoted</h2>
+<table>
+<tr><th>Item</th><th>Status</th></tr>
+<tr><td>Disk Use% gate</td><td class="ok">PASS (2%)</td></tr>
+<tr><td>META / W0′</td><td class="ok">LAB_META_CLEAN (improved vs prior FAIL cite)</td></tr>
+<tr><td>PORT-DISK-MATRIX Python exclusive d1</td><td class="bad">FAIL (Rust still on d1)</td></tr>
+<tr><td>3-node install</td><td class="bad">BLOCKED (honest)</td></tr>
+<tr><td>4-node</td><td class="warn">N/A (needs 3-node GREEN; Use% already &lt;50%)</td></tr>
+</table>
+
+<h2>3) Host snapshot</h2>
+<table>
+<tr><th>Host</th><th>d1/d2/d3 Use%</th><th>MemAvailable</th><th>Python</th></tr>
+<tr><td>swift1</td><td>2%/2%/2%</td><td>~3.2 GiB</td><td>no (until optional 4-node)</td></tr>
+<tr><td>swift2</td><td>2%/2%/2%</td><td>~2.9 GiB</td><td>leftover pyswift :8090 / d1/pysaio</td></tr>
+<tr><td>swift3</td><td>2%/2%/2%</td><td>~3.0 GiB</td><td>/etc/pyswift present, no cluster</td></tr>
+<tr><td>swift4</td><td>2%/2%/2%</td><td>~4.6 GiB</td><td>none</td></tr>
+</table>
+
+<h2>4) Remaining / FROZEN</h2>
+<ul>
+<li>Stages 3A/3B/3D remain <strong>FROZEN</strong>.</li>
+<li><strong>Next:</strong> migrate Rust account/container (and object weight) off exclusive/shared d1 → d2 per PORT-DISK-MATRIX; prove VIP regression; then INSTALL-PLAN on swift2/3/4 only.</li>
+</ul>
+<p>Evidence: <code>tools/test-results/wave4-python-live-20260805b/</code></p>
+</body>
+</html>

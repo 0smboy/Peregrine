@@ -1,0 +1,9 @@
+---
+management_network_address: 169.58.108.86
+storage_network_address: 10.0.4.2
+business_network_address: 10.0.0.2
+keystone_node: true
+mariadb_node: true
+exclude_disks: ['sda']
+custom_disks: []
+disk_type: ''

@@ -1,0 +1,18 @@
+/root/work/swift-rust/target/release/swift-proxy-server: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=bed1ca9133137e9455934a7c2456b5cceb0ec9eb, not stripped
+NEW_SHA=a0c252bc8dd9bd649b95f99b4b74aa188a7ef40c92d78680e3ea9be5f5d640f8
+active
+local_hc=200
+===== deploy 10.0.0.2 =====
+failed
+local_hc=000
+a0c252bc8dd9bd649b95f99b4b74aa188a7ef40c92d78680e3ea9be5f5d640f8  /usr/local/bin/swift-proxy-server
+===== deploy 10.0.0.3 =====
+active
+local_hc=200
+a0c252bc8dd9bd649b95f99b4b74aa188a7ef40c92d78680e3ea9be5f5d640f8  /usr/local/bin/swift-proxy-server
+===== deploy 10.0.0.4 =====
+active
+local_hc=200
+a0c252bc8dd9bd649b95f99b4b74aa188a7ef40c92d78680e3ea9be5f5d640f8  /usr/local/bin/swift-proxy-server
+ALL_DEPLOYED
+a0c252bc8dd9bd649b95f99b4b74aa188a7ef40c92d78680e3ea9be5f5d640f8  /usr/local/bin/swift-proxy-server

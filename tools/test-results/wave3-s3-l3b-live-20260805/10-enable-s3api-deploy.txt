@@ -1,0 +1,61 @@
+NEW_SHA=5f3ded5e4ce24b2a5e868362aa0d9746a9dd247d9742a175dfcac01a9cb7cf48 UTC=2026-08-05T10:04:23Z
+===== deploy 10.0.0.1 =====
+5f3ded5e4ce24b2a5e868362aa0d9746a9dd247d9742a175dfcac01a9cb7cf48  /usr/local/bin/swift-proxy-server
+already_enabled pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+pipeline_now pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+has_s3api_section True
+has_s3token_section True
+active
+local_info=200
+info_keys_has_s3api False
+tempauth True keystoneauth True
+Aug 05 10:04:25 swift1 proxy-server[29177]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+Aug 05 10:04:25 swift1 proxy-server[29177]: INFO s3api enabled (SigV4+CRUD+list; not advertised on Swift /info)
+Aug 05 10:04:25 swift1 proxy-server[29177]: INFO s3token enabled (auth_uri=http://127.0.0.1:5001)
+===== deploy 10.0.0.2 =====
+5f3ded5e4ce24b2a5e868362aa0d9746a9dd247d9742a175dfcac01a9cb7cf48  /usr/local/bin/swift-proxy-server
+already_enabled pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+pipeline_now pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+has_s3api_section True
+has_s3token_section True
+active
+local_info=200
+info_keys_has_s3api False
+tempauth True keystoneauth True
+Aug 05 10:04:31 swift2 proxy-server[3986691]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+Aug 05 10:04:31 swift2 proxy-server[3986691]: INFO s3api enabled (SigV4+CRUD+list; not advertised on Swift /info)
+Aug 05 10:04:31 swift2 proxy-server[3986691]: INFO s3token enabled (auth_uri=http://127.0.0.1:5001)
+===== deploy 10.0.0.3 =====
+5f3ded5e4ce24b2a5e868362aa0d9746a9dd247d9742a175dfcac01a9cb7cf48  /usr/local/bin/swift-proxy-server
+already_enabled pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+pipeline_now pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+has_s3api_section True
+has_s3token_section True
+active
+local_info=200
+info_keys_has_s3api False
+tempauth True keystoneauth True
+Aug 05 10:04:35 swift3 proxy-server[73437]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+Aug 05 10:04:35 swift3 proxy-server[73437]: INFO s3api enabled (SigV4+CRUD+list; not advertised on Swift /info)
+Aug 05 10:04:35 swift3 proxy-server[73437]: INFO s3token enabled (auth_uri=http://127.0.0.1:5001)
+===== deploy 10.0.0.4 =====
+5f3ded5e4ce24b2a5e868362aa0d9746a9dd247d9742a175dfcac01a9cb7cf48  /usr/local/bin/swift-proxy-server
+already_enabled pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+pipeline_now pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+has_s3api_section True
+has_s3token_section True
+active
+local_info=200
+info_keys_has_s3api False
+tempauth True keystoneauth True
+Aug 05 10:04:39 swift4 proxy-server[1325771]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+Aug 05 10:04:39 swift4 proxy-server[1325771]: INFO s3api enabled (SigV4+CRUD+list; not advertised on Swift /info)
+Aug 05 10:04:39 swift4 proxy-server[1325771]: INFO s3token enabled (auth_uri=http://10.0.0.1:5001)
+=== VIP check from this host ===
+vip_info=200
+vip_keys ['account_quotas', 'bulk_delete', 'container_quotas', 'dlo', 'formpost', 'keystoneauth', 'slo', 'staticweb', 'swift', 'symlink', 'tempauth', 'tempurl', 'versioned_writes']
+s3api_advertised False
+tempauth True keystoneauth True
+hc=200
+ta=200
+ALL_DONE

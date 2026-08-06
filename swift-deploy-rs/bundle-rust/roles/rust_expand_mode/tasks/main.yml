@@ -1,0 +1,7 @@
+---
+# Opt-in expand flag for build_rings.sh (P3-ops). Used only by expand.yml.
+# Dual-guard: this role never touches disks; it only sets ring_expand=true.
+
+- name: enable ring expand mode for this apply
+  set_fact:
+    ring_expand: true

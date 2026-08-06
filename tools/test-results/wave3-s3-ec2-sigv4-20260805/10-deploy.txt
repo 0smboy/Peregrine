@@ -1,0 +1,13 @@
+===== deploy swift1 =====
+0cafe5f164da0c19906a74f0efb0e57be4494106fdc11cd40969b0d1b43ed02e  /usr/local/bin/swift-proxy-server
+activating
+===== deploy swift2 =====
+0cafe5f164da0c19906a74f0efb0e57be4494106fdc11cd40969b0d1b43ed02e  /usr/local/bin/swift-proxy-server
+activating
+===== deploy swift3 =====
+0cafe5f164da0c19906a74f0efb0e57be4494106fdc11cd40969b0d1b43ed02e  /usr/local/bin/swift-proxy-server
+active
+===== deploy swift4 =====
+0cafe5f164da0c19906a74f0efb0e57be4494106fdc11cd40969b0d1b43ed02e  /usr/local/bin/swift-proxy-server
+active
+DONE

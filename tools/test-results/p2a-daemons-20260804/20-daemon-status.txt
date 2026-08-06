@@ -1,0 +1,32 @@
+===== 10.0.0.1 =====
+  swift-object                     active restarts=0
+  swift-object-updater             active restarts=0
+  swift-object-expirer             active restarts=0
+  swift-account-reaper             active restarts=0
+  swift-container-updater          active restarts=0
+  swift-container-reconciler       active restarts=0
+/dev/sda4        40G   20G   21G  49% /
+===== 10.0.0.2 =====
+  swift-object                     active restarts=0
+  swift-object-updater             active restarts=0
+  swift-object-expirer             active restarts=0
+  swift-account-reaper             active restarts=0
+  swift-container-updater          active restarts=0
+  swift-container-reconciler       active restarts=0
+/dev/sda4        40G  7.0G   33G  18% /
+===== 10.0.0.3 =====
+  swift-object                     active restarts=0
+  swift-object-updater             active restarts=0
+  swift-object-expirer             active restarts=0
+  swift-account-reaper             active restarts=0
+  swift-container-updater          active restarts=0
+  swift-container-reconciler       active restarts=0
+/dev/sda4        40G  7.5G   33G  19% /
+===== 10.0.0.4 =====
+  swift-object                     active restarts=0
+  swift-object-updater             active restarts=0
+  swift-object-expirer             active restarts=0
+  swift-account-reaper             active restarts=0
+  swift-container-updater          active restarts=0
+  swift-container-reconciler       active restarts=0
+/dev/sda4        40G  8.7G   32G  22% /

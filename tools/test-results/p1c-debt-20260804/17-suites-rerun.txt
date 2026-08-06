@@ -1,0 +1,135 @@
+HTTP/1.1 200 OK
+x-auth-token: AUTH_tkv1.313738353933393634361e746573741e746573743a7465737465721e415554485f74657374.a924f8c363d494e01aea62ec41258ecd7600ec0e373609db424f65c84b7256f8
+x-storage-token: AUTH_tkv1.313738353933393634361e746573741e746573743a7465737465721e415554485f74657374.a924f8c363d494e01aea62ec41258ecd7600ec0e373609db424f65c84b7256f8
+x-storage-url: http://10.0.0.10:8085/v1/AUTH_test
+content-type: text/plain
+content-length: 0
+x-trans-id: txb4219583216269fe0002a-006a71f53e
+x-openstack-request-id: txb4219583216269fe0002a-006a71f53e
+======== FUNC SUITE ========
+===================================================================
+FUNCTIONAL SUITE  label=vip-p1c-core  endpoint=http://10.0.0.10:8085  2026-08-04T14:20:46Z
+===================================================================
+  PASS  auth: bad key -> 401
+  PASS  auth: token acquired (test:tester)
+  PASS  account: HEAD 204
+  PASS  account: X-Account-Container-Count present
+  PASS  container: PUT 201
+  PASS  container: idempotent PUT 202
+  PASS  container: HEAD 204
+  PASS  container: POST meta 204
+  PASS  container: meta persisted
+  PASS  container: GET empty 204
+  PASS  object: PUT 201
+  PASS  object: GET body
+  PASS  object: etag matches md5
+  PASS  object: content-type
+  PASS  object: custom meta
+  PASS  object: HEAD 200
+  PASS  object: POST meta 202
+  PASS  object: fast-POST meta updated
+  PASS  object: PUT wrong-etag 422
+  PASS  range: bytes=0-3
+  PASS  range: suffix bytes=-3
+  PASS  range: 206 status
+  PASS  range: unsatisfiable 416
+  PASS  range: multipart/byteranges
+  PASS  range: multipart 2nd part
+  PASS  cond: If-None-Match * -> 304
+  PASS  cond: If-Match wrong -> 412
+  PASS  cond: If-Match right -> 200
+  PASS  large: PUT 4MB 201
+  PASS  large: 4MB md5 round-trip
+  PASS  SLO: manifest PUT 201
+  PASS  SLO: reassembled 3MB md5
+  PASS  SLO: manifest-get is json
+  PASS  DLO: concatenation md5 == SLO segs
+  PASS  copy: X-Copy-From 201
+  PASS  copy: copied body
+  PASS  expiry: PUT with X-Delete-After 201
+  PASS  expiry: X-Delete-At set
+  PASS  name: unicode+space PUT 201
+  PASS  name: unicode GET body
+  PASS  listing: json has bytes
+  PASS  listing: prefix filter
+  PASS  listing: limit=1 returns 1
+  PASS  EC: container create (policy ec-2-1) 201
+  PASS  EC: policy header
+  PASS  EC: PUT 3MB 201
+  PASS  EC: 5MB md5 round-trip
+  PASS  EC: ranged GET 206
+  PASS  EC: ranged GET length=1024
+  PASS  sec: no-token account -> 401
+  PASS  sec: bad-token -> 401
+  PASS  sec: GET missing object -> 404
+  PASS  sec: DELETE non-empty container -> 409
+  PASS  sec: traversal name literal 201
+
+-------------------------------------------------------------------
+RESULT  label=vip-p1c-core  PASS=54  FAIL=0
+-------------------------------------------------------------------
+======== P1C SUITE ========
+===================================================================
+P1c DEBT SUITE  label=vip-p1c  endpoint=http://10.0.0.10:8085  2026-08-04T14:21:02Z
+===================================================================
+  PASS  auth: token acquired
+  PASS  container: PUT 201
+  PASS  nested: put leaf a 201
+  PASS  nested: put leaf b 201
+  PASS  nested: put leaf c 201
+  PASS  nested: inner SLO PUT 201
+  FAIL  nested: outer SLO PUT  -- want=201 got=400 
+  PASS  nested: outer SLO PUT (null etag)
+  PASS  nested: reassembled body
+  FAIL  nested: Content-Length 6  -- want=200 got=HTTP/1.1 200 OK
+content-type: text/plain
+x-static-large-object: True
+last-modified: Tue, 04 Aug 2026 14:22:05 GMT
+x-timestamp: 1785853324.86618
+accept-ranges: bytes
+etag: ffe62abe1a7d045783a26d1f9d3e2254
+content-length: 6
+x-trans-id: tx8bd17d4d41315c49000a2-006a71f58d
+x-openstack-request-id: tx8bd17d4d41315c49000a2-006a71f58d
+
+200 
+  PASS  nested: Content-Length header
+  PASS  range: nested bytes=3-4
+  FAIL  range: status 206  -- want=206 got=HTTP/1.1 206 Partial Content
+content-type: text/plain
+x-static-large-object: True
+last-modified: Tue, 04 Aug 2026 14:22:05 GMT
+x-timestamp: 1785853324.86618
+accept-ranges: bytes
+etag: ffe62abe1a7d045783a26d1f9d3e2254
+content-range: bytes 3-4/6
+content-length: 2
+x-trans-id: txd6b82d15985f07d0000a4-006a71f58d
+x-openstack-request-id: txd6b82d15985f07d0000a4-006a71f58d
+
+206 
+  FAIL  copy-slo: multipart-manifest=get 201  -- want=201 got=400 
+  FAIL  copy-slo: reassembled equals source  -- want=aabbcc got=<html><h1>Not Found</h1><p>The resource could not be found.</p></html> 
+  FAIL  copy-slo: raw manifest is json list  -- missing '"name"'
+  PASS  dlo: put seg0 201
+  PASS  dlo: put seg1 201
+  PASS  dlo: put manifest 201
+  PASS  dlo: reassembled
+  PASS  copy-dlo: multipart-manifest=get 201
+  PASS  copy-dlo: reassembled equals source
+  PASS  copy-dlo: X-Object-Manifest present
+  PASS  acl: put private obj 201
+  PASS  acl: set .r:* 204
+  PASS  acl: anonymous GET via VIP (8/8)
+  PASS  acl: revoke read 204
+  FAIL  acl: revoke visible via VIP  -- 0/6 denied
+===================================================================
+RESULT  label=vip-p1c  PASS=21  FAIL=7
+FAILED:
+  - nested: outer SLO PUT
+  - nested: Content-Length 6
+  - range: status 206
+  - copy-slo: multipart-manifest=get 201
+  - copy-slo: reassembled equals source
+  - copy-slo: raw manifest is json list
+  - acl: revoke visible via VIP

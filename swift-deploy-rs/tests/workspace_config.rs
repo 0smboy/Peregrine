@@ -396,6 +396,7 @@ fn production_node(
         disk_type: "hdd".to_owned(),
         system_disk: "sda".to_owned(),
         disks: vec!["/dev/sdb".to_owned(), "/dev/sdc".to_owned()],
+        swift_devices: Vec::new(),
         keepalived_interface: "eth2".to_owned(),
         keepalived_priority: Some(keepalived_priority),
     }

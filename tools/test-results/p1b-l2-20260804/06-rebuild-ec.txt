@@ -1,0 +1,15 @@
+   Compiling swift-middleware v0.1.0 (/tmp/p1b-swift-rust/crates/swift-middleware)
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling swift-proxy-server v0.1.0 (/tmp/p1b-swift-rust/crates/swift-proxy-server)
+warning: `swift-middleware` (lib) generated 1 warning (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 13.59s
+	liberasurecode.so.1 => /usr/local/lib/liberasurecode.so.1 (0x00007fa6bd9cb000)
+	liberasurecode_rs_vand.so.1 => /usr/local/lib/liberasurecode_rs_vand.so.1 (0x00007fa6bd99a000)
+-rwxr-xr-x. 2 root root 3041944 Aug  4 14:06 target/release/swift-proxy-server

@@ -1,0 +1,6 @@
+   Compiling swift-db v0.1.0 (/root/work/swift-rust/crates/swift-db)
+   Compiling swift-diskfile v0.1.0 (/root/work/swift-rust/crates/swift-diskfile)
+   Compiling swift-object-server v0.1.0 (/root/work/swift-rust/crates/swift-object-server)
+   Compiling swift-container-server v0.1.0 (/root/work/swift-rust/crates/swift-container-server)
+   Compiling swift-account-server v0.1.0 (/root/work/swift-rust/crates/swift-account-server)
+    Finished `release` profile [optimized] target(s) in 17.06s

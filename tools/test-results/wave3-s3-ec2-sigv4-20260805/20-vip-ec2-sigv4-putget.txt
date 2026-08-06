@@ -1,0 +1,7 @@
+access 1371713510fb... project 29af7f1e1977
+ListBuckets HTTP 200 len 1424 b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<ListAllMyBucketsResult xmlns="http://s3.'
+CreateBucket HTTP 200 len 0 b''
+PutObject HTTP 200 len 0 b''
+GetObject HTTP 200 len 23 b'from-ec2-sigv4-deferral'
+VERDICT PASS put_get_roundtrip True
+HeadBucket HTTP 200 len 0 b''

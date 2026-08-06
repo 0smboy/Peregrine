@@ -1,18 +1,26 @@
 ---
-# Device preparation on storage nodes.
+# Device preparation on storage nodes (P3-ops).
 #
-# rust stack v1 deploys DIRECTORY devices only: one device `d1` under
-# {{ srv_node_root }} on the node's root filesystem (the server confs set
-# mount_check = false). Block-device formatting/mounting is deliberately
-# excluded — it is destructive, was untestable in this environment, and
-# would force every rust plan to carry the disk_wipe capability. Prepare
-# and mount real disks out-of-band; a v2 role can add the managed path.
-# Workspace validation rejects custom_disks for the rust stack, so
-# custom_disks is always [] here.
+# Dual-guard:
+#   1) This role NEVER runs mkfs / wipefs / dd / parted.
+#   2) Workspace rejects node.disks for the rust stack, so no plan carries
+#      RiskClass::DiskWipe. Wiping Contabo /srv/node requires an explicit
+#      ticket + --allow-disk-wipe on a non-bundle-rust path.
+#
+# Device names come from host_vars.swift_devices (default ["d1"]). Real block
+# devices must be prepared out-of-band and exposed as these directory names.
 
-- name: create the directory device
+- name: ensure srv_node_root exists
   file:
-    path: "{{ srv_node_root }}/d1"
+    path: "{{ srv_node_root }}"
     state: directory
     mode: "0755"
+  changed_when: false
+
+- name: ensure swift device directories exist (mkdir only)
+  file:
+    path: "{{ srv_node_root }}/{{ item }}"
+    state: directory
+    mode: "0755"
+  with_items: "{{ swift_devices | default(['d1']) }}"
   changed_when: false

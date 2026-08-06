@@ -1,0 +1,104 @@
+{
+  "prefix": "contabo-f5183cf3f3eaf886",
+  "suffix": "4afcbe289acfdfa1",
+  "prefix_len": 24,
+  "suffix_len": 16,
+  "disk_hash_dirs": 200,
+  "container_live_object_rows_seen": 33342,
+  "hash_sample_n": 5000,
+  "correct_formula_disk_hits": 0,
+  "buggy_formula_disk_hits": 0,
+  "account_live_container_rows": 1013,
+  "sample_mismatch": [
+    {
+      "account": "AUTH_test",
+      "container": "lab12-fix-19532",
+      "object": "o1",
+      "hash_correct": "5c39de7f3256771b9ddf0dbdd225c718",
+      "hash_buggy": "fbd658cd49b69c06c8df69274866eaa6"
+    },
+    {
+      "account": "AUTH_test",
+      "container": "autocos41a29d462",
+      "object": "obj-1",
+      "hash_correct": "06378bbbbf6a1f36ce39dd47a9dd93fe",
+      "hash_buggy": "aee3745e73fa57a8af3e335a7e683a2b"
+    },
+    {
+      "account": "AUTH_test",
+      "container": "autocos41a29d462",
+      "object": "obj-10",
+      "hash_correct": "d365cc78246323cfd7ac139ac469b3cd",
+      "hash_buggy": "72d68b16c52c0e2c7150e5e85ae16d66"
+    },
+    {
+      "account": "AUTH_test",
+      "container": "autocos41a29d462",
+      "object": "obj-101",
+      "hash_correct": "77efe495382aba71b2081efed6a5656b",
+      "hash_buggy": "9f0c972a08147a424f118fca5b6dd44c"
+    },
+    {
+      "account": "AUTH_test",
+      "container": "autocos41a29d462",
+      "object": "obj-104",
+      "hash_correct": "28a094d6e34489a8f946b5bfb85204c2",
+      "hash_buggy": "b0f364529f17266cc6180b425683578b"
+    }
+  ],
+  "root_cause": "wave0-ab used prefix+account/... without '/' after prefix; broker/rust-core uses prefix/account/container/object+suffix"
+}
+{
+  "ts": 1785915813.1835952,
+  "host": "swift1",
+  "diagnose": {
+    "prefix": "contabo-f5183cf3f3eaf886",
+    "suffix": "4afcbe289acfdfa1",
+    "prefix_len": 24,
+    "suffix_len": 16,
+    "disk_hash_dirs": 200,
+    "container_live_object_rows_seen": 33342,
+    "hash_sample_n": 5000,
+    "correct_formula_disk_hits": 0,
+    "buggy_formula_disk_hits": 0,
+    "account_live_container_rows": 1013,
+    "sample_mismatch": [
+      {
+        "account": "AUTH_test",
+        "container": "lab12-fix-19532",
+        "object": "o1",
+        "hash_correct": "5c39de7f3256771b9ddf0dbdd225c718",
+        "hash_buggy": "fbd658cd49b69c06c8df69274866eaa6"
+      },
+      {
+        "account": "AUTH_test",
+        "container": "autocos41a29d462",
+        "object": "obj-1",
+        "hash_correct": "06378bbbbf6a1f36ce39dd47a9dd93fe",
+        "hash_buggy": "aee3745e73fa57a8af3e335a7e683a2b"
+      },
+      {
+        "account": "AUTH_test",
+        "container": "autocos41a29d462",
+        "object": "obj-10",
+        "hash_correct": "d365cc78246323cfd7ac139ac469b3cd",
+        "hash_buggy": "72d68b16c52c0e2c7150e5e85ae16d66"
+      },
+      {
+        "account": "AUTH_test",
+        "container": "autocos41a29d462",
+        "object": "obj-101",
+        "hash_correct": "77efe495382aba71b2081efed6a5656b",
+        "hash_buggy": "9f0c972a08147a424f118fca5b6dd44c"
+      },
+      {
+        "account": "AUTH_test",
+        "container": "autocos41a29d462",
+        "object": "obj-104",
+        "hash_correct": "28a094d6e34489a8f946b5bfb85204c2",
+        "hash_buggy": "b0f364529f17266cc6180b425683578b"
+      }
+    ],
+    "root_cause": "wave0-ab used prefix+account/... without '/' after prefix; broker/rust-core uses prefix/account/container/object+suffix"
+  }
+}

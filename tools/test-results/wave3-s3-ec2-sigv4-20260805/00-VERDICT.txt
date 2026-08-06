@@ -1,0 +1,8 @@
+GREEN (VIP S3 SigV4 with EC2 keys)
+- Rust s3api unknown-key → Keystone /v3/s3tokens deferral: LIVE
+- s3token client posts urlsafe-base64 string-to-sign (not X-Amz-Date)
+- Unit: swift-middleware s3token 7/7; swift-s3api unknown_ec2 2/2; proxy wiring 2/2
+- Contabo proxies ×4 SHA a0c252bc… with "EC2→s3token deferral" in pipeline notes
+- VIP HTTPS EC2 SigV4 ListBuckets/CreateBucket/PutObject/GetObject: GREEN
+- TempAuth S3 ListBuckets still 200 (regression)
+- NOT PRODUCTION-GO-LIVE

@@ -1,0 +1,74 @@
+total 104
+drwxr-xr-x.   3 root root 4096 Aug  3 05:32 .
+drwxr-xr-x. 104 root root 8192 Aug  5 11:52 ..
+-rw-r--r--.   1 root root 9911 Aug  3 05:32 account.builder
+-rw-r--r--.   1 root root 1482 Aug  3 05:32 account.ring.gz
+-rw-r--r--.   1 root root  371 Aug  3 05:32 account-server.conf
+drwxr-xr-x.   2 root root 4096 Aug  3 05:32 backups
+-rw-r--r--.   1 root root 9911 Aug  3 05:32 container.builder
+-rw-r--r--.   1 root root 1473 Aug  3 05:32 container.ring.gz
+-rw-r--r--.   1 root root  386 Aug  3 05:32 container-server.conf
+RESTORE_FROM /etc/pyswift.bak-20260805T115249Z
+[swift-hash]
+swift_hash_path_prefix = a7e047fcefe014fbefad296bc6785c84
+swift_hash_path_suffix = 7a3cc73587dc333d113e93495a8ec4c4
+[swift-hash]
+swift_hash_path_prefix = a7e047fcefe014fbefad296bc6785c84
+swift_hash_path_suffix = 7a3cc73587dc333d113e93495a8ec4c4
+
+[storage-policy:0]
+name = default
+default = yes
+
+[storage-policy:1]
+name = ec-2-1
+policy_type = erasure_coding
+ec_type = liberasurecode_rs_vand
+ec_num_data_fragments = 2
+ec_num_parity_fragments = 1
+ec_object_segment_size = 1048576
+Device d0r1z1-10.0.4.2:6102R10.0.4.2:6102/py_"" with 100.0 weight got id 0
+Device d0r1z1-10.0.4.2:6101R10.0.4.2:6101/py_"" with 100.0 weight got id 0
+Device d0r1z1-10.0.4.2:6100R10.0.4.2:6100/py_"" with 100.0 weight got id 0
+Device d1r1z2-10.0.4.3:6102R10.0.4.3:6102/py_"" with 100.0 weight got id 1
+Device d1r1z2-10.0.4.3:6101R10.0.4.3:6101/py_"" with 100.0 weight got id 1
+Device d1r1z2-10.0.4.3:6100R10.0.4.3:6100/py_"" with 100.0 weight got id 1
+Device d2r1z3-10.0.4.4:6102R10.0.4.4:6102/py_"" with 100.0 weight got id 2
+Device d2r1z3-10.0.4.4:6101R10.0.4.4:6101/py_"" with 100.0 weight got id 2
+Device d2r1z3-10.0.4.4:6100R10.0.4.4:6100/py_"" with 100.0 weight got id 2
+Defaulting to --format-version=1. This ensures the ring
+written will be readable by older versions of Swift.
+In a future release, the default will change to
+--format-version=2
+
+Reassigned 1536 (300.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
+Defaulting to --format-version=1. This ensures the ring
+written will be readable by older versions of Swift.
+In a future release, the default will change to
+--format-version=2
+
+Reassigned 1536 (300.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
+Defaulting to --format-version=1. This ensures the ring
+written will be readable by older versions of Swift.
+In a future release, the default will change to
+--format-version=2
+
+Reassigned 1536 (300.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
+-rw-r--r--. 1 root root 5505 Aug  5 12:04 account.builder
+-rw-r--r--. 1 root root  254 Aug  5 12:04 account.ring.gz
+-rw-r--r--. 1 root root 5506 Aug  5 12:04 container.builder
+-rw-r--r--. 1 root root  255 Aug  5 12:04 container.ring.gz
+-rw-r--r--. 1 root root 5505 Aug  5 12:04 object-1.builder
+-rw-r--r--. 1 root root  252 Aug  5 12:04 object-1.ring.gz
+-rw-r--r--. 1 root root 5505 Aug  5 12:04 object.builder
+-rw-r--r--. 1 root root  252 Aug  5 12:04 object.ring.gz
+-rw-r--r--. 1 root root  361 Aug  3 05:32 swift.conf
+512 partitions, 3.000000 replicas, 1 regions, 3 zones, 3 devices, 2-byte IDs, 0.00 balance, 0.00 dispersion
+The minimum number of hours before a partition can be reassigned is 1 (0:59:59 remaining)
+The overload factor is 0.00% (0.000000)
+Ring file object.ring.gz is up-to-date
+Devices:   id region zone ip address:port replication ip:port  name weight partitions balance flags meta
+            0      1    1   10.0.4.2:6100       10.0.4.2:6100    py 100.00        512    0.00       
+            1      1    2   10.0.4.3:6100       10.0.4.3:6100    py 100.00        512    0.00       
+            2      1    3   10.0.4.4:6100       10.0.4.4:6100    py 100.00        512    0.00       
+REBUILD_OK

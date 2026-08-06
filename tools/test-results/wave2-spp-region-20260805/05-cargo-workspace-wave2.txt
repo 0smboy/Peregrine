@@ -1,0 +1,18 @@
+warning: failed to auto-clean cache data
+
+failed to clean entries from the global cache
+
+Caused by:
+  failed to remove file `/Users/oboy/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-macro-0.3.31/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.45s
+     Running tests/workspace_rust_stack.rs (target/debug/deps/workspace_rust_stack-4499667aa44609c6)
+
+running 2 tests
+test wave2_multi_region_sample_host_vars_cover_r1_and_r2 ... ok
+test wave2_build_rings_template_has_per_device_object_ports ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+

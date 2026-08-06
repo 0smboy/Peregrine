@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>VIP auth CRUD fix — 2026-08-05</title>
+<style>
+  :root { --bg:#1a1814; --fg:#e8e2d6; --muted:#9a9183; --ok:#6b9b6e; --bad:#c45c4a; --warn:#c4a35a; --card:#242018; }
+  body { margin:0; font:15px/1.45 ui-sans-serif, system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:920px; margin:0 auto; padding:32px 24px 64px; }
+  h1 { font-size:1.6rem; font-weight:650; margin:0 0 8px; }
+  h2 { font-size:1.1rem; margin:28px 0 10px; color:var(--muted); font-weight:600; }
+  .sub { color:var(--muted); margin-bottom:24px; }
+  .badge { display:inline-block; padding:2px 10px; border-radius:4px; font-size:12px; font-weight:650; letter-spacing:.02em; }
+  .ok { background:rgba(107,155,110,.2); color:var(--ok); }
+  .bad { background:rgba(196,92,74,.2); color:var(--bad); }
+  .warn { background:rgba(196,163,90,.2); color:var(--warn); }
+  table { width:100%; border-collapse:collapse; background:var(--card); border-radius:8px; overflow:hidden; }
+  th, td { text-align:left; padding:10px 12px; border-bottom:1px solid #333028; vertical-align:top; }
+  th { color:var(--muted); font-size:12px; font-weight:600; }
+  code { font:13px/1.35 ui-monospace, Menlo, monospace; background:#2c281f; padding:1px 5px; border-radius:3px; }
+  ul { padding-left:1.2em; }
+  li { margin:6px 0; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  @media (max-width:700px){ .grid { grid-template-columns:1fr; } }
+  .card { background:var(--card); padding:14px 16px; border-radius:8px; }
+  .card strong { display:block; margin-bottom:6px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>VIP auth CRUD fix</h1>
+  <p class="sub">2026-08-05 · Contabo LAB · <span class="badge ok">GREEN</span> · <span class="badge warn">PRODUCTION-GO-LIVE not claimed</span></p>
+
+  <h2>1) What this cycle did</h2>
+  <ul>
+    <li>Reproduced wave4 noise: TempAuth list 401 / Keystone <code>AUTH_test</code> 403 while VIP healthcheck 200.</li>
+    <li>Split causes: Keystone probe used wrong account; TempAuth authorize stolen by keystoneauth stamp.</li>
+    <li>Fixed <code>keystoneauth.rs</code> (stamp Auth-Plugin only with Confirmed identity); rolled proxy ×4.</li>
+    <li>Auth-only: no ring migrate, no Python install, no mkfs.</li>
+  </ul>
+
+  <h2>2) Optimized / fixed / demoted</h2>
+  <table>
+    <tr><th>Item</th><th>Action</th></tr>
+    <tr><td>Keystone CRUD path</td><td>Confirmed green with <code>AUTH_&lt;project_id&gt;</code> (IdP OK)</td></tr>
+    <tr><td>TempAuth coexist</td><td><strong>Fixed</strong> — not demoted</td></tr>
+    <tr><td>Wave4 Keystone→AUTH_test</td><td>Documented as incorrect client path (403 expected)</td></tr>
+    <tr><td>W4 migrate / Python</td><td>Still deferred; auth no longer blocks attribution</td></tr>
+  </table>
+
+  <h2>3) Measured effect</h2>
+  <div class="grid">
+    <div class="card"><strong>Before</strong>
+      TempAuth list <span class="badge bad">401</span><br/>
+      Keystone AUTH_test <span class="badge bad">403</span><br/>
+      Keystone AUTH_project CRUD already OK
+    </div>
+    <div class="card"><strong>After</strong>
+      TempAuth CRUD <span class="badge ok">PASS</span> 201/201/200/204/204<br/>
+      Keystone CRUD <span class="badge ok">PASS</span> 201/201/200/204/204<br/>
+      Cross-tenant AUTH_test <span class="badge ok">403</span> expected
+    </div>
+  </div>
+  <table style="margin-top:14px">
+    <tr><th>Probe</th><th>Before</th><th>After</th></tr>
+    <tr><td>VIP healthcheck</td><td>200</td><td>200</td></tr>
+    <tr><td>TempAuth auth</td><td>200</td><td>200</td></tr>
+    <tr><td>TempAuth list AUTH_test</td><td>401</td><td><strong>200</strong></td></tr>
+    <tr><td>Keystone token</td><td>201</td><td>201</td></tr>
+    <tr><td>Keystone AUTH_&lt;project_id&gt;</td><td>(wave4 skipped)</td><td><strong>200 + CRUD</strong></td></tr>
+    <tr><td>Keystone AUTH_test</td><td>403</td><td>403 (correct)</td></tr>
+    <tr><td>Bogus token</td><td>401</td><td>401</td></tr>
+  </table>
+
+  <h2>4) Gate results</h2>
+  <table>
+    <tr><th>Gate</th><th>Result</th><th>Evidence</th></tr>
+    <tr><td>TempAuth CRUD</td><td><span class="badge ok">PASS</span></td><td><code>after/01-probe-raw.txt</code></td></tr>
+    <tr><td>Keystone CRUD</td><td><span class="badge ok">PASS</span></td><td>same</td></tr>
+    <tr><td>Cross-tenant deny</td><td><span class="badge ok">PASS</span></td><td>403 on AUTH_test w/ KS token</td></tr>
+    <tr><td>Proxy sha ×4</td><td><span class="badge ok">PASS</span></td><td><code>657e07439cde3520e83dd1bb47bf0f130120e532d39fda53a2925a0d938c2f77</code></td></tr>
+    <tr><td>Secrets in git</td><td><span class="badge ok">PASS</span> (absent)</td><td>Contabo <code>/root/contabo-identity-secrets.yml</code></td></tr>
+    <tr><td>PRODUCTION-GO-LIVE</td><td><span class="badge warn">NOT claimed</span></td><td>LAB self-signed TLS</td></tr>
+  </table>
+
+  <h2>5) Remaining / next</h2>
+  <ul>
+    <li><strong>Unblocked for W4:</strong> auth attribution clean; operator may schedule migrate per <code>wave4-python-live-20260805c/05-OPERATOR-MIGRATE-STEPS.md</code>.</li>
+    <li><strong>FROZEN:</strong> PRODUCTION-GO-LIVE until operator PEM; Python 3A/3B until isolation migrate.</li>
+    <li>Optional: Keystone catalog URLs still say <code>http://10.0.0.10:8085</code> — use HTTPS VIP in clients.</li>
+  </ul>
+
+  <h2>Paths</h2>
+  <p class="sub">
+    Pack: <code>tools/test-results/vip-auth-crud-fix-20260805/</code><br/>
+    Code: <code>swift-rust/crates/swift-middleware/src/keystoneauth.rs</code><br/>
+    Doc: <code>docs/fairness-lab/KEYSTONE-LIVE.md</code><br/>
+    Prior noise: <code>tools/test-results/wave4-python-live-20260805c/02-VIP-HEALTH.txt</code>
+  </p>
+</main>
+</body>
+</html>

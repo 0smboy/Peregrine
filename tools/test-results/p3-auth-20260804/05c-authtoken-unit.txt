@@ -1,0 +1,37 @@
+warning: failed to auto-clean cache data
+
+failed to clean entries from the global cache
+
+Caused by:
+  failed to remove file `/Users/oboy/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-macro-0.3.31/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
+warning: type alias `TokenCheck` is never used
+  --> crates/swift-middleware/src/authtoken.rs:77:10
+   |
+77 | pub type TokenCheck = TokenOutcome;
+   |          ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: type alias `KeystoneAuthHandle` is never used
+   --> crates/swift-middleware/src/keystoneauth.rs:597:10
+    |
+597 | pub type KeystoneAuthHandle = Arc<KeystoneAuth>;
+    |          ^^^^^^^^^^^^^^^^^^
+
+warning: `swift-middleware` (lib test) generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.21s
+     Running unittests src/lib.rs (target/debug/deps/swift_middleware-bdd7e1cbae4bc998)
+
+running 6 tests
+test authtoken::tests::forged_client_identity_cleared_without_token ... ok
+test authtoken::tests::no_delay_missing_token_401 ... ok
+test authtoken::tests::parse_keystone_token_json ... ok
+test authtoken::tests::invalid_token_is_401 ... ok
+test authtoken::tests::stamps_confirmed_identity ... ok
+test authtoken::tests::stamps_backend_authtoken_marker ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 345 filtered out; finished in 0.00s
+

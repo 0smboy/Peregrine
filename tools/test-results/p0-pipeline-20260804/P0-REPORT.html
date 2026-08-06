@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>P0 Pipeline Foundation — Contabo Evidence 2026-08-04</title>
+<style>
+  :root { --ink:#1a1a1a; --muted:#5a5a5a; --ok:#1b6b3a; --warn:#8a5a00; --bad:#8b1e1e; --bg:#f7f4ef; --card:#fff; }
+  body { font-family: "IBM Plex Sans", "Segoe UI", sans-serif; margin:0; background:var(--bg); color:var(--ink); line-height:1.45; }
+  header { background:#1f2420; color:#f2efe8; padding:1.5rem 2rem; }
+  header h1 { margin:0 0 .35rem; font-size:1.45rem; font-weight:600; }
+  header p { margin:0; color:#c9c4b8; max-width:52rem; }
+  main { padding:1.5rem 2rem 3rem; max-width:980px; }
+  h2 { font-size:1.1rem; margin:1.6rem 0 .6rem; }
+  table { width:100%; border-collapse:collapse; background:var(--card); margin:.5rem 0 1rem; }
+  th, td { text-align:left; padding:.55rem .7rem; border-bottom:1px solid #e4dfd5; font-size:.92rem; vertical-align:top; }
+  th { background:#efeae1; font-weight:600; }
+  .ok { color:var(--ok); font-weight:600; }
+  .warn { color:var(--warn); font-weight:600; }
+  .bad { color:var(--bad); font-weight:600; }
+  .pill { display:inline-block; padding:.15rem .55rem; border-radius:3px; background:#e8f2ea; color:var(--ok); font-size:.8rem; font-weight:600; }
+  .pill.warn { background:#f5ecd6; color:var(--warn); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.85rem; }
+  ul { margin:.3rem 0 .8rem 1.2rem; }
+  .box { background:var(--card); padding:1rem 1.1rem; border:1px solid #e4dfd5; margin:0 0 1rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>P0 — Pipeline foundation</h1>
+  <p>Production-gap wave P0 (memcache / listing_formats / proxy_logging wiring). Contabo lab 2026-08-04. No wipe of <span class="mono">/srv/node</span>.</p>
+</header>
+<main>
+
+<div class="box">
+  <span class="pill">GATE: GREEN</span>
+  <p style="margin:.7rem 0 0">VIP + Rust SAIO both <strong>54/54</strong>. Python SAIO thin+cache on <span class="mono">10.0.0.2:8090</span> ran dual contrast at <strong>53/54</strong> (account HEAD 200 vs suite expect 204 — suite/Python quirk, not a P0 wire miss). Formal Python 3-node cluster remains FROZEN.</p>
+</div>
+
+<h2>1) What this cycle did</h2>
+<ul>
+  <li>Froze plan → <span class="mono">docs/fairness-lab/PRODUCTION-GAP-ROADMAP.md</span></li>
+  <li>Wired <span class="mono">cache</span>, <span class="mono">listing_formats</span>, <span class="mono">proxy_logging</span> (+ logger sink) in <span class="mono">build_configured_filters</span></li>
+  <li>Updated <span class="mono">bundle-rust</span> <span class="mono">proxy-server.conf.j2</span> to thin+cache default pipeline</li>
+  <li>Honest contract updates: CONTRACTS / blocked / CONFIG-PARITY</li>
+  <li>Built <span class="mono">swift-proxy-server --features ec</span> on Contabo; rolled binary+conf to swift1–4; restarted RSAIO :8081</li>
+</ul>
+
+<h2>2) What was optimized / fixed / demoted</h2>
+<table>
+  <tr><th>Item</th><th>Before</th><th>After</th></tr>
+  <tr><td>P0 filter names in pipeline</td><td>silent skip</td><td class="ok">enabled (startup notes)</td></tr>
+  <tr><td>proxy_logging</td><td>pass-through, no sink</td><td class="ok">Logger sink emits Swift access line</td></tr>
+  <tr><td>cache / memcache</td><td>unwired</td><td class="ok">MemcacheClient constructed; info still may be in-process</td></tr>
+  <tr><td>listing_formats</td><td>unwired</td><td class="ok">wired; json/xml listings verified</td></tr>
+  <tr><td>bundle-rust default pipeline</td><td>tempauth copy slo dlo only</td><td class="ok">proxy-logging cache listing_formats …</td></tr>
+</table>
+
+<h2>3) Measured effect</h2>
+<table>
+  <tr><th>Surface</th><th>Metric</th><th>Result</th></tr>
+  <tr><td>Local cargo</td><td>swift-memcache + middleware + proxy-server tests</td><td class="ok">all passed (incl. pipeline_p0_filters_wire)</td></tr>
+  <tr><td>VIP <span class="mono">10.0.0.10:8085</span></td><td>func-suite</td><td class="ok">PASS=54 FAIL=0 (<span class="mono">13-func-suite-vip-ec.log</span>)</td></tr>
+  <tr><td>Rust SAIO <span class="mono">10.0.0.3:8081</span></td><td>func-suite</td><td class="ok">PASS=54 FAIL=0 (<span class="mono">15-func-suite-rsaio.log</span>)</td></tr>
+  <tr><td>Direct proxies</td><td>/info + /healthcheck ×4</td><td class="ok">200/200 all backends</td></tr>
+  <tr><td>Listing smoke</td><td>format=json + format=xml</td><td class="ok">correct Content-Type + body (<span class="mono">vip-smoke.log</span>)</td></tr>
+  <tr><td>proxy_logging</td><td>journal sample</td><td class="ok">Swift-shaped access lines present</td></tr>
+  <tr><td>Python SAIO :8090</td><td>func-suite dual</td><td class="warn">53/54 (HEAD 204≠200 only)</td></tr>
+</table>
+
+<h2>4) Gate table</h2>
+<table>
+  <tr><th>Gate</th><th>Requirement</th><th>Status</th></tr>
+  <tr><td>Unit</td><td>wiring + sink + cache tests</td><td class="ok">GREEN</td></tr>
+  <tr><td>Wire + / notes</td><td>P0 names enable, not skip</td><td class="ok">GREEN (journal on all 4 nodes)</td></tr>
+  <tr><td>SAIO same pipeline</td><td>Rust + Python thin+cache names</td><td class="ok">GREEN (Py 53/54 known HEAD quirk)</td></tr>
+  <tr><td>func-suite</td><td>54/54</td><td class="ok">GREEN (VIP + RSAIO)</td></tr>
+  <tr><td>Cluster VIP</td><td>auth + CRUD + 4 backends</td><td class="ok">GREEN</td></tr>
+  <tr><td>Contract honesty</td><td>blocked / CONTRACTS / CONFIG-PARITY</td><td class="ok">updated</td></tr>
+</table>
+
+<h2>5) Remaining / next</h2>
+<ul>
+  <li><span class="pill warn">FROZEN</span> Python formal 3-node / 4-node Performance cluster — thin SAIO dual ran; do not reopen DROP’d levers</li>
+  <li><span class="pill warn">backlog</span> Bridge proxy <span class="mono">InfoCache</span> onto shared memcache (client wired; coherency still in-process)</li>
+  <li><strong>Do not start P1a</strong> until this report’s GREEN is accepted; next wave = bulk / tempurl / ACL</li>
+</ul>
+
+<h2>Evidence paths</h2>
+<ul class="mono">
+  <li>tools/test-results/p0-pipeline-20260804/P0-REPORT.html (this file)</li>
+  <li>tools/test-results/p0-pipeline-20260804/vip-smoke.log</li>
+  <li>tools/test-results/p0-pipeline-20260804/13-func-suite-vip-ec.log</li>
+  <li>tools/test-results/p0-pipeline-20260804/15-func-suite-rsaio.log</li>
+  <li>tools/test-results/p0-pipeline-20260804/09-backends.txt</li>
+  <li>docs/fairness-lab/PRODUCTION-GAP-ROADMAP.md</li>
+</ul>
+
+<p class="mono" style="color:var(--muted);margin-top:2rem">Generated 2026-08-04 · label CORE-PATH-ONLY + P0-PIPELINE-WIRED · EC track exercised in func-suite</p>
+</main>
+</body>
+</html>

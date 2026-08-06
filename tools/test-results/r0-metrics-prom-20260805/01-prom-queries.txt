@@ -1,0 +1,37 @@
+## textfile on :9100 (swift4 local)
+swift_db_file_bytes{kind="account",node="swift4"} 430080
+swift_db_file_bytes{kind="container",node="swift4"} 1.44601088e+08
+swift_db_files{kind="account",node="swift4"} 4
+swift_db_files{kind="container",node="swift4"} 969
+swift_db_freelist_bytes{kind="account",node="swift4"} 28672
+swift_db_freelist_bytes{kind="container",node="swift4"} 2.4576e+06
+swift_db_freelist_count{kind="account",node="swift4"} 7
+swift_db_freelist_count{kind="container",node="swift4"} 600
+swift_object_tombstone_bytes{device="d1",node="swift4",policy="0"} 0
+swift_object_tombstone_bytes{device="d1",node="swift4",policy="1"} 0
+swift_object_tombstones{device="d1",node="swift4",policy="0"} 19
+swift_object_tombstones{device="d1",node="swift4",policy="1"} 16
+
+## instant queries
+### QUERY sum by (node) (swift_object_tombstones)
+{"status":"success","data":{"resultType":"vector","result":[{"metric":{"node":"swift1"},"value":[1785915748.665,"39"]},{"metric":{"node":"swift2"},"value":[1785915748.665,"41"]},{"metric":{"node":"swift3"},"value":[1785915748.665,"38"]},{"metric":{"node":"swift4"},"value":[1785915748.665,"35"]}]}}
+### QUERY sum by (node) (swift_object_tombstone_bytes)
+{"status":"success","data":{"resultType":"vector","result":[{"metric":{"node":"swift1"},"value":[1785915748.683,"0"]},{"metric":{"node":"swift2"},"value":[1785915748.683,"0"]},{"metric":{"node":"swift3"},"value":[1785915748.683,"0"]},{"metric":{"node":"swift4"},"value":[1785915748.683,"0"]}]}}
+### QUERY sum by (node,kind) (swift_db_file_bytes)
+{"status":"success","data":{"resultType":"vector","result":[{"metric":{"kind":"account","node":"swift1"},"value":[1785915748.694,"233472"]},{"metric":{"kind":"container","node":"swift1"},"value":[1785915748.694,"144986112"]},{"metric":{"kind":"account","node":"swift2"},"value":[1785915748.694,"389120"]},{"metric":{"kind":"container","node":"swift2"},"value":[1785915748.694,"153100288"]},{"metric":{"kind":"account","node":"swift3"},"value":[1785915748.694,"225280"]},{"metric":{"kind":"container","node":"swift3"},"value":[1785915748.694,"168009728"]},{"metric":{"kind":"account","node":"swift4"},"value":[1785915748.694,"430080"]},{"metric":{"kind":"container","node":"swift4"},"value":[1785915748.694,"144601088"]}]}}
+### QUERY sum by (node,kind) (swift_db_freelist_bytes)
+{"status":"success","data":{"resultType":"vector","result":[{"metric":{"kind":"account","node":"swift1"},"value":[1785915748.727,"0"]},{"metric":{"kind":"container","node":"swift1"},"value":[1785915748.727,"2297856"]},{"metric":{"kind":"account","node":"swift2"},"value":[1785915748.727,"0"]},{"metric":{"kind":"container","node":"swift2"},"value":[1785915748.727,"2514944"]},{"metric":{"kind":"account","node":"swift3"},"value":[1785915748.727,"24576"]},{"metric":{"kind":"container","node":"swift3"},"value":[1785915748.727,"2342912"]},{"metric":{"kind":"account","node":"swift4"},"value":[1785915748.727,"28672"]},{"metric":{"kind":"container","node":"swift4"},"value":[1785915748.727,"2457600"]}]}}
+### QUERY count(swift_object_tombstones)
+{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1785915748.751,"8"]}]}}
+### QUERY count(up{job="node"}==1)
+{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1785915748.772,"4"]}]}}
+### QUERY ALERTS{alertname=~"Swift.*|Galera.*|Keystone.*"}
+{"status":"success","data":{"resultType":"vector","result":[]}}
+
+## rules loaded
+groups ['swift_statsd_compat', 'swift_ops_r0', 'swift_ops_w1_stubs']
+swift_ops_r0 SwiftTombstoneGrowth inactive unknown
+swift_ops_r0 SwiftDbFreelistHigh inactive unknown
+swift_ops_r0 SwiftDeviceUsePctHigh inactive unknown
+swift_ops_w1_stubs GaleraClusterSizeNotThree inactive unknown
+swift_ops_w1_stubs KeystoneHttp5xx inactive unknown

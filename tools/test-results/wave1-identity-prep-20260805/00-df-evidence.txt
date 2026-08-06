@@ -1,0 +1,92 @@
+# Contabo df evidence — Wave1/Wave4 prep
+# captured_utc=2026-08-05T03:38:36Z
+# mkfs=FORBIDDEN  wave0_owner=other_agent
+
+===== swift1 =====
+swift1
+2026-08-05T03:38:41Z
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda4        40G   19G   22G  48% /
+/dev/sda5        50G   50G  304M 100% /srv/node/d1
+/dev/sda6        50G   45G  5.1G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.6G  89% /srv/node/d3
+---MEM---
+               total        used        free      shared  buff/cache   available
+Mem:           7.5Gi       3.6Gi       305Mi       4.0Mi       3.9Gi       3.9Gi
+Swap:             0B          0B          0B
+---IDENTITY---
+inactive
+inactive
+inactive
+inactive
+inactive
+ls: cannot access '/etc/keystone': No such file or directory
+ls: cannot access '/var/lib/mysql': No such file or directory
+(no identity listeners)
+
+===== swift2 =====
+swift2
+2026-08-05T03:38:46Z
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda4        40G  7.3G   33G  19% /
+/dev/sda5        50G   46G  4.2G  92% /srv/node/d1
+/dev/sda6        50G   45G  5.3G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.2G  90% /srv/node/d3
+---MEM---
+               total        used        free      shared  buff/cache   available
+Mem:           7.5Gi       4.9Gi       165Mi       4.0Mi       2.7Gi       2.6Gi
+Swap:             0B          0B          0B
+---IDENTITY---
+inactive
+inactive
+inactive
+inactive
+inactive
+ls: cannot access '/etc/keystone': No such file or directory
+ls: cannot access '/var/lib/mysql': No such file or directory
+(no identity listeners)
+
+===== swift3 =====
+swift3
+2026-08-05T03:38:52Z
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda4        40G  7.5G   33G  19% /
+/dev/sda5        50G   50G  520M  99% /srv/node/d1
+/dev/sda6        50G   45G  5.8G  89% /srv/node/d2
+/dev/sda7        50G   45G  5.6G  89% /srv/node/d3
+---MEM---
+               total        used        free      shared  buff/cache   available
+Mem:           7.5Gi       5.2Gi       190Mi       4.0Mi       2.4Gi       2.3Gi
+Swap:             0B          0B          0B
+---IDENTITY---
+inactive
+inactive
+inactive
+inactive
+inactive
+ls: cannot access '/etc/keystone': No such file or directory
+ls: cannot access '/var/lib/mysql': No such file or directory
+(no identity listeners)
+
+===== swift4 =====
+swift4
+2026-08-05T03:38:56Z
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda4        40G  9.0G   32G  23% /
+/dev/sda5        50G   46G  5.0G  91% /srv/node/d1
+/dev/sda6        50G   46G  5.0G  91% /srv/node/d2
+/dev/sda7        50G   45G  5.5G  90% /srv/node/d3
+---MEM---
+               total        used        free      shared  buff/cache   available
+Mem:           7.5Gi       5.0Gi       191Mi       4.0Mi       2.6Gi       2.5Gi
+Swap:             0B          0B          0B
+---IDENTITY---
+inactive
+inactive
+inactive
+inactive
+inactive
+ls: cannot access '/etc/keystone': No such file or directory
+ls: cannot access '/var/lib/mysql': No such file or directory
+(no identity listeners)
+

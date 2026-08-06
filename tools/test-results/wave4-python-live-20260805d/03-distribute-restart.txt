@@ -1,0 +1,41 @@
+=== scp to 10.0.4.2 ===
+=== scp to 10.0.4.3 ===
+=== scp to 10.0.4.4 ===
+build_rings.sh stamped d7bcf784ef23cff7
+=== restart services ===
+---- 10.0.4.1 ----
+active
+active
+active
+active
+LISTEN 0      128          0.0.0.0:6212       0.0.0.0:*    users:(("swift-object-se",pid=258115,fd=6))                                                                                                                                                                                             
+LISTEN 0      128          0.0.0.0:6211       0.0.0.0:*    users:(("swift-object-se",pid=258115,fd=5))                                                                                                                                                                                             
+LISTEN 0      128          0.0.0.0:6202       0.0.0.0:*    users:(("swift-account-s",pid=258113,fd=5))                                                                                                                                                                                             
+LISTEN 0      128          0.0.0.0:6201       0.0.0.0:*    users:(("swift-container",pid=258114,fd=5))                                                                                                                                                                                             
+---- 10.0.4.2 ----
+active
+active
+active
+active
+LISTEN 0      128          0.0.0.0:6202       0.0.0.0:*    users:(("swift-account-s",pid=80335,fd=5))                                                                                                                                                                                                                
+LISTEN 0      128          0.0.0.0:6201       0.0.0.0:*    users:(("swift-container",pid=80134,fd=5))                                                                                                                                                                                                                
+LISTEN 0      128          0.0.0.0:6211       0.0.0.0:*    users:(("swift-object-se",pid=80161,fd=5))                                                                                                                                                                                                                
+LISTEN 0      128          0.0.0.0:6212       0.0.0.0:*    users:(("swift-object-se",pid=80161,fd=6))                                                                                                                                                                                                                
+---- 10.0.4.3 ----
+active
+active
+active
+active
+LISTEN 0      128          0.0.0.0:6202       0.0.0.0:*    users:(("swift-account-s",pid=285658,fd=5))                                                                                                                                                                                                      
+LISTEN 0      128          0.0.0.0:6201       0.0.0.0:*    users:(("swift-container",pid=285453,fd=5))                                                                                                                                                                                                      
+LISTEN 0      128          0.0.0.0:6212       0.0.0.0:*    users:(("swift-object-se",pid=285454,fd=6))                                                                                                                                                                                                      
+LISTEN 0      128          0.0.0.0:6211       0.0.0.0:*    users:(("swift-object-se",pid=285454,fd=5))                                                                                                                                                                                                      
+---- 10.0.4.4 ----
+active
+active
+active
+active
+LISTEN 0      128          0.0.0.0:6201       0.0.0.0:*    users:(("swift-container",pid=1532717,fd=5))            
+LISTEN 0      128          0.0.0.0:6202       0.0.0.0:*    users:(("swift-account-s",pid=1533866,fd=5))            
+LISTEN 0      128          0.0.0.0:6211       0.0.0.0:*    users:(("swift-object-se",pid=1532785,fd=5))            
+LISTEN 0      128          0.0.0.0:6212       0.0.0.0:*    users:(("swift-object-se",pid=1532785,fd=6))            

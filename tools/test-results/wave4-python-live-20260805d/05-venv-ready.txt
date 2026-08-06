@@ -1,0 +1,6 @@
+push swift3
+/root/work/swift-master/swift/__init__.py
+swift-ring-builder 1.3
+push swift4
+/root/work/swift-master/swift/__init__.py
+swift-ring-builder 1.3

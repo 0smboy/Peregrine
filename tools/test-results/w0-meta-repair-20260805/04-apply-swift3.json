@@ -1,0 +1,27 @@
+{
+  "preserve": [
+    "p1b-21784",
+    "p1b-28970",
+    "p1b-4164",
+    "p1b-4803",
+    "wave0-probe-put"
+  ],
+  "zombie_zero": {
+    "container_dbs_seen": 1064,
+    "disk_hash_dirs": 161,
+    "live_rows_marked": 0,
+    "ghost_containers_soft_deleted": 1060,
+    "vacuumed": 1060,
+    "errors": [],
+    "mode": "APPLY"
+  },
+  "account_zero": {
+    "account_dbs_seen": 2,
+    "live_rows_marked": 897,
+    "preserved_rows": 5,
+    "vacuumed": 2,
+    "errors": [],
+    "mode": "APPLY",
+    "preserve_count": 5
+  }
+}

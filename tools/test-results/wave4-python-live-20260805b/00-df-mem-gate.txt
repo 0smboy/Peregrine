@@ -1,0 +1,49 @@
+UTC=2026-08-05T10:07:36Z
+=== swift1 df/mem ===
+swift1
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  888M   50G   2% /srv/node/d1
+/dev/sda6        50G  726M   50G   2% /srv/node/d2
+/dev/sda7        50G  729M   50G   2% /srv/node/d3
+---
+MemAvailable_kB 3391116
+---
+/etc/pyswift
+34454 bash -c hostname; df -h /srv/node/d1 /srv/node/d2 /srv/node/d3 2>/dev/null; echo ---; awk "/MemAvailable/ {printf \"MemAvailable_kB %s\n\", \$2}" /proc/meminfo; echo ---; ls -d /etc/pyswift 2>/dev/null || echo no_pyswift_etc; pgrep -af "pyswift|swift-proxy-server /etc/pyswift" | head -5 || true
+=== swift2 df/mem ===
+swift2
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  854M   50G   2% /srv/node/d1
+/dev/sda6        50G  727M   50G   2% /srv/node/d2
+/dev/sda7        50G  728M   50G   2% /srv/node/d3
+---
+MemAvailable_kB 3057684
+---
+/etc/pyswift
+437477 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-account-server /etc/pyswift/account-server.conf
+437478 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-container-server /etc/pyswift/container-server.conf
+437809 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-account-server /etc/pyswift/account-server.conf
+437810 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-account-server /etc/pyswift/account-server.conf
+437826 /root/work/pyswift-venv/bin/python3 /root/work/pyswift-venv/bin/swift-container-server /etc/pyswift/container-server.conf
+=== swift3 df/mem ===
+swift3
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  886M   50G   2% /srv/node/d1
+/dev/sda6        50G  727M   50G   2% /srv/node/d2
+/dev/sda7        50G  729M   50G   2% /srv/node/d3
+---
+MemAvailable_kB 3187816
+---
+/etc/pyswift
+77810 bash -c hostname; df -h /srv/node/d1 /srv/node/d2 /srv/node/d3 2>/dev/null; echo ---; awk "/MemAvailable/ {printf \"MemAvailable_kB %s\n\", \$2}" /proc/meminfo; echo ---; ls -d /etc/pyswift 2>/dev/null || echo no_pyswift_etc; pgrep -af "pyswift|swift-proxy-server /etc/pyswift" | head -5 || true
+=== swift4 df/mem ===
+swift4
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  843M   50G   2% /srv/node/d1
+/dev/sda6        50G  725M   50G   2% /srv/node/d2
+/dev/sda7        50G  728M   50G   2% /srv/node/d3
+---
+MemAvailable_kB 4820068
+---
+no_pyswift_etc
+1330195 bash -c hostname; df -h /srv/node/d1 /srv/node/d2 /srv/node/d3 2>/dev/null; echo ---; awk "/MemAvailable/ {printf \"MemAvailable_kB %s\n\", \$2}" /proc/meminfo; echo ---; ls -d /etc/pyswift 2>/dev/null || echo no_pyswift_etc; pgrep -af "pyswift|swift-proxy-server /etc/pyswift" | head -5 || true

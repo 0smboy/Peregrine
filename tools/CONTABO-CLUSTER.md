@@ -1,23 +1,33 @@
 # Contabo four-node Swift cluster (2026-08-01)
 
+> **2026-08-05+ 交接（现行）：**  
+> [`docs/fairness-lab/HANDOFF-20260805-PRODUCTION-REMAINING.md`](../docs/fairness-lab/HANDOFF-20260805-PRODUCTION-REMAINING.md)  
+> 人话卷宗：[`test-results/PRODUCTION-REMAINING-ROLLUP-20260805/ROLLUP-REPORT.html`](test-results/PRODUCTION-REMAINING-ROLLUP-20260805/ROLLUP-REPORT.html)  
+> VIP 现为 **HTTPS** `https://10.0.0.10:8085`（自签）；Python 三节点 **PRESENT**（swift2/3/4）。下文若干「HTTP:8085 / 阶段3 FROZEN」段落为历史基线，以交接文档为准。
+
 Greenfield Peregrine/Swift lab on Contabo. Replaces the Azure PAYG cutover
 ([`NEW-CLUSTER-CUTOVER.md`](NEW-CLUSTER-CUTOVER.md) — **retired**).
 
-## Fairness lab (2026-08-03)
+## Fairness lab (authoritative)
 
-Contabo is a **hybrid** on `swift-deploy-rs` (`bundle-rust` + Keepalived /
-monitoring / SAIO overlays) — **not** full Python ansible parity. Formal
-experiments follow three modes (Compatibility / Performance / Chaos): see
-[`docs/fairness-lab/`](../docs/fairness-lab/) and
-[`tools/fairness-lab/`](fairness-lab/).
+**Formal plan:** [`docs/fairness-lab/USER-METHOD-PLAN.md`](../docs/fairness-lab/USER-METHOD-PLAN.md)
+(three phases). R0–R8 (2026-08-03) = **historical baseline / informal** only —
+see [`docs/fairness-lab/ROUNDS.md`](../docs/fairness-lab/ROUNDS.md).
 
-**R1–R7 (2026-08-03) fairness batch:** hub on **swift4**; dual SAIO on **swift3**
-(`:8090`/`:8081` @ `10.0.0.3`); R3 compat GREEN; R4 DIRECT-4PROXY Rust formal
-GREEN (16MB_read WARN); R5 HA-PATH ONLY 分册; R6 chaos/soak GREEN; R7 four
-scorecards. Evidence: `test-results/fairness-lab-R{1..7}-20260803/` · batch
-[`fairness-lab-R7-20260803/REPORT.html`](test-results/fairness-lab-R7-20260803/REPORT.html).
-Old SAIO 3.45×/3.79× remain **NOISY**. VIP = **HA-PATH ONLY**; core throughput =
-**DIRECT-4PROXY** (`10.0.0.1–4:8085`). Python Performance formal **FROZEN**.
+**Deploy target (stage 2 gate):** `swift-deploy apply` with `stack=rust`,
+`ingress.mode=keepalived`, HAProxy **roundrobin** over `10.0.0.1–4:8080`,
+shared HMAC tempauth. Manual `install-cluster` HA is not the source of truth.
+
+**Gate status 2026-08-04:** **PASS** — evidence
+[`deploy-rs-rust-lb-20260804/`](test-results/deploy-rs-rust-lb-20260804/).
+Ops evidence of mid-flight LB fix (pre-gate): [`HA-LB-CORRECT-20260804.md`](test-results/HA-LB-CORRECT-20260804.md).
+
+**USER-METHOD-PLAN progress 2026-08-04:**
+- Stage 1A/1B **PASS** — `phase-1a-20260804/`, `phase-1b-20260804/`
+- Stage 2 **completed breadth** — VIP matrix PASS / DIRECT WARN / chaos PASS / soak in
+  [`phase-2-20260804/`](test-results/phase-2-20260804/) (VIP @ swift2 nopreempt; SAIO off)
+- Stage 3 **FROZEN** Python path (`PYTHON_CLUSTER_ABSENT`) —
+  [`phase-3-20260804/`](test-results/phase-3-20260804/)
 
 ## Endpoints
 

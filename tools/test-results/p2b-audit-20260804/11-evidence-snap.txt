@@ -1,0 +1,29 @@
++ systemctl is-active swift-object-auditor swift-account-auditor swift-container-auditor
+active
+active
+active
++ ps -o pid,etime,pcpu,pmem,cmd -C swift-object-auditor -C swift-db-auditor
+    PID     ELAPSED %CPU %MEM CMD
+ 311912       09:23  0.0  0.0 /usr/local/bin/swift-db-auditor account /etc/swift/account-server.conf
+ 311926       09:22  0.0  0.0 /usr/local/bin/swift-db-auditor container /etc/swift/container-server.conf
+ 337314       06:33 45.2  0.7 /usr/local/bin/swift-object-auditor /etc/swift/object-server.conf
++ /usr/local/bin/swift-db-auditor account /etc/swift/account-server.conf once
+ACC_EXIT=0
++ echo ACC_EXIT=0
++ /usr/local/bin/swift-db-auditor container /etc/swift/container-server.conf once
+CON_EXIT=0
++ echo CON_EXIT=0
++ TD=/tmp/p2b-tiny-dev
++ rm -rf /tmp/p2b-tiny-dev
++ mkdir -p /tmp/p2b-tiny-dev/d1
++ cat
++ timeout 30 /usr/local/bin/swift-object-auditor /tmp/p2b-tiny-obj.conf once
+TINY_EXIT=0
++ echo TINY_EXIT=0
++ tail -15
++ journalctl -t object-auditor --since '2 min ago' --no-pager
+Aug 04 15:26:02 swift1 object-auditor[360371]: INFO swift-object-auditor: devices=/tmp/p2b-tiny-dev mount_check=false interval=30s policies=2 once=true
+Aug 04 15:26:02 swift1 object-auditor[360371]: INFO object-auditor pass: passed=0 quarantined=0 errors=0 duration=0.0s
++ python3 -
+object.recon auditor keys: ['object_auditor_stats_ALL']
+object_auditor_stats_ALL {'audit_time': 6.866455078125e-05, 'errors': 0, 'passes': 0, 'quarantined': 0, 'start_time': 1785857162.1976213}

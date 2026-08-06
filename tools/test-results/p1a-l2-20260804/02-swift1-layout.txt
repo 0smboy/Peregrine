@@ -1,0 +1,38 @@
+/tmp/p0-func.log
+
+/tmp/p0-swift-rust:
+Cargo.lock
+Cargo.toml
+crates
+deploy
+HANDOFF.md
+PLAN.md
+README.md
+# Managed by P0 pipeline foundation deploy (2026-08-04)
+# P0 thin+cache pipeline (2026-08-04)
+[pipeline:main]
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth copy slo dlo proxy-logging proxy-server
+
+[app:proxy-server]
+bind_ip = 0.0.0.0
+bind_port = 8080
+account_autocreate = true
+storage_url = http://10.0.0.10:8085
+log_statsd_host = 127.0.0.1
+log_statsd_port = 9125
+log_statsd_metric_prefix =
+trace_endpoint =
+trace_sample_ratio = 1.0
+
+[filter:proxy-logging]
+use = egg:swift#proxy_logging
+
+[filter:cache]
+use = egg:swift#memcache
+memcache_servers = 10.0.0.1:11211
+
+[filter:listing_formats]
+use = egg:swift#listing_formats
+
+[filter:tempauth]
+user_test_tester = azure-swift-2026.bench .admin

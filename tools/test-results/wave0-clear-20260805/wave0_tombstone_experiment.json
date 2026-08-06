@@ -1,0 +1,82 @@
+{
+  "container": "wave0-tombstone-lab",
+  "n": 200,
+  "ts_before_delete_local": 48784,
+  "ts_after_delete_local": 48928,
+  "samples": [
+    {
+      "t_rel_sec": 0.0,
+      "ts_local": 48928,
+      "phase": "after_delete",
+      "epoch": "2026-08-05T04:31:50Z"
+    },
+    {
+      "t_rel_sec": 126.2,
+      "ts_local": 48928,
+      "phase": "wait",
+      "epoch": "2026-08-05T04:33:02Z"
+    },
+    {
+      "t_rel_sec": 198.3,
+      "ts_local": 48928,
+      "phase": "wait",
+      "epoch": "2026-08-05T04:34:14Z"
+    },
+    {
+      "t_rel_sec": 270.4,
+      "ts_local": 48928,
+      "phase": "wait",
+      "epoch": "2026-08-05T04:35:26Z"
+    },
+    {
+      "t_rel_sec": 343.1,
+      "ts_local": 48928,
+      "phase": "wait",
+      "epoch": "2026-08-05T04:36:39Z"
+    },
+    {
+      "t_rel_sec": 415.1,
+      "ts_local": 48928,
+      "phase": "wait",
+      "epoch": "2026-08-05T04:37:51Z"
+    },
+    {
+      "t_rel_sec": 487.3,
+      "ts_local": 48928,
+      "phase": "wait",
+      "epoch": "2026-08-05T04:39:03Z"
+    },
+    {
+      "t_rel_sec": 560.6,
+      "ts_local": 48928,
+      "phase": "wait",
+      "epoch": "2026-08-05T04:40:16Z"
+    },
+    {
+      "t_rel_sec": 632.4,
+      "ts_local": 48928,
+      "phase": "wait",
+      "epoch": "2026-08-05T04:41:28Z"
+    },
+    {
+      "t_rel_sec": 704.2,
+      "ts_local": 48928,
+      "phase": "wait",
+      "epoch": "2026-08-05T04:42:40Z"
+    },
+    {
+      "t_rel_sec": 776.2,
+      "ts_local": 48928,
+      "phase": "wait",
+      "epoch": "2026-08-05T04:43:52Z"
+    },
+    {
+      "t_rel_sec": 847.9,
+      "ts_local": 48928,
+      "phase": "wait",
+      "epoch": "2026-08-05T04:45:03Z"
+    }
+  ],
+  "before_raw": "total_count\t48784\ntotal_bytes\t0\ndevice=d1\tpolicy=0\tcount=29985\tbytes=0\ndevice=d1\tpolicy=1\tcount=2102\tbytes=0\ndevice=d2\tpolicy=0\tcount=6458\tbytes=0\ndevice=d2\tpolicy=1\tcount=1981\tbytes=0\ndevice=d3\tpolicy=0\tcount=6300\tbytes=0\ndevice=d3\tpolicy=1\tcount=1958\tbytes=0\n",
+  "after_delete_raw": "total_count\t48928\ntotal_bytes\t0\ndevice=d1\tpolicy=0\tcount=30129\tbytes=0\ndevice=d1\tpolicy=1\tcount=2102\tbytes=0\ndevice=d2\tpolicy=0\tcount=6458\tbytes=0\ndevice=d2\tpolicy=1\tcount=1981\tbytes=0\ndevice=d3\tpolicy=0\tcount=6300\tbytes=0\ndevice=d3\tpolicy=1\tcount=1958\tbytes=0\n"
+}

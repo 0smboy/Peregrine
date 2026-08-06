@@ -1,0 +1,34 @@
+ed1e66aa9bf2c68fb767a61864fe54e3  /tmp/swift-proxy-server-p1c
+d563d9a84b8aa7f44a3d3ff72c9c3421  /tmp/swift-container-server-p1c
+===== redeploy 10.0.0.1 =====
+active
+active
+health=200
+ed1e66aa9bf2c68fb767a61864fe54e3  /usr/local/bin/swift-proxy-server
+d563d9a84b8aa7f44a3d3ff72c9c3421  /usr/local/bin/swift-container-server
+	liberasurecode.so.1 => /usr/local/lib/liberasurecode.so.1 (0x00007fe6d4203000)
+	liberasurecode_rs_vand.so.1 => /usr/local/lib/liberasurecode_rs_vand.so.1 (0x00007fe6d41d2000)
+===== redeploy 10.0.0.2 =====
+active
+active
+health=200
+ed1e66aa9bf2c68fb767a61864fe54e3  /usr/local/bin/swift-proxy-server
+d563d9a84b8aa7f44a3d3ff72c9c3421  /usr/local/bin/swift-container-server
+	liberasurecode.so.1 => /usr/local/lib/liberasurecode.so.1 (0x00007f9f8c2a4000)
+	liberasurecode_rs_vand.so.1 => /usr/local/lib/liberasurecode_rs_vand.so.1 (0x00007f9f8c273000)
+===== redeploy 10.0.0.3 =====
+active
+active
+health=200
+ed1e66aa9bf2c68fb767a61864fe54e3  /usr/local/bin/swift-proxy-server
+d563d9a84b8aa7f44a3d3ff72c9c3421  /usr/local/bin/swift-container-server
+	liberasurecode.so.1 => /usr/local/lib/liberasurecode.so.1 (0x00007fbe898b3000)
+	liberasurecode_rs_vand.so.1 => /usr/local/lib/liberasurecode_rs_vand.so.1 (0x00007fbe89882000)
+===== redeploy 10.0.0.4 =====
+active
+active
+health=200
+ed1e66aa9bf2c68fb767a61864fe54e3  /usr/local/bin/swift-proxy-server
+d563d9a84b8aa7f44a3d3ff72c9c3421  /usr/local/bin/swift-container-server
+	liberasurecode.so.1 => /usr/local/lib/liberasurecode.so.1 (0x00007f319e964000)
+	liberasurecode_rs_vand.so.1 => /usr/local/lib/liberasurecode_rs_vand.so.1 (0x00007f319e933000)

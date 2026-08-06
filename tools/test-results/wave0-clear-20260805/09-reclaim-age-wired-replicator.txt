@@ -1,0 +1,60 @@
+===== swift1 =====
+wrote /etc/swift/object-server.conf
+  1 [DEFAULT] [DEFAULT]
+  2 [DEFAULT] reclaim_age = 600
+ 11 [app:object-server] [app:object-server]
+ 25 [object-replicator] [object-replicator]
+ 26 [object-replicator] reclaim_age = 600
+ 36 [object-updater] [object-updater]
+ 42 [object-reconstructor] [object-reconstructor]
+ 48 [object-expirer] [object-expirer]
+ 50 [object-expirer] reclaim_age = 600
+ 55 [object-auditor] [object-auditor]
+Aug 05 04:58:06 swift1 systemd[1]: swift-object-replicator.service: Consumed 8.329s CPU time, 11.3M memory peak.
+Aug 05 04:58:06 swift1 systemd[1]: Started Swift object replicator (rust).
+Aug 05 04:58:06 swift1 object-replicator[3507530]: INFO swift-object-replicator: devices=/srv/node bind_port=6200 interval=30s reclaim_age=600s once=false
+===== swift2 =====
+wrote /etc/swift/object-server.conf
+  1 [DEFAULT] [DEFAULT]
+  2 [DEFAULT] reclaim_age = 600
+ 11 [app:object-server] [app:object-server]
+ 25 [object-replicator] [object-replicator]
+ 26 [object-replicator] reclaim_age = 600
+ 36 [object-updater] [object-updater]
+ 42 [object-reconstructor] [object-reconstructor]
+ 48 [object-expirer] [object-expirer]
+ 50 [object-expirer] reclaim_age = 600
+ 55 [object-auditor] [object-auditor]
+Aug 05 04:59:42 swift2 systemd[1]: swift-object-replicator.service: Consumed 8min 12.204s CPU time.
+Aug 05 04:59:42 swift2 systemd[1]: Started Swift object replicator (rust).
+Aug 05 04:59:42 swift2 object-replicator[2892677]: INFO swift-object-replicator: devices=/srv/node bind_port=6200 interval=30s once=false
+===== swift3 =====
+wrote /etc/swift/object-server.conf
+  1 [DEFAULT] [DEFAULT]
+  2 [DEFAULT] reclaim_age = 600
+ 11 [app:object-server] [app:object-server]
+ 25 [object-replicator] [object-replicator]
+ 26 [object-replicator] reclaim_age = 600
+ 36 [object-updater] [object-updater]
+ 42 [object-reconstructor] [object-reconstructor]
+ 48 [object-expirer] [object-expirer]
+ 50 [object-expirer] reclaim_age = 600
+ 55 [object-auditor] [object-auditor]
+Aug 05 05:01:38 swift3 systemd[1]: swift-object-replicator.service: Consumed 4min 34.638s CPU time.
+Aug 05 05:01:38 swift3 systemd[1]: Started Swift object replicator (rust).
+Aug 05 05:01:38 swift3 object-replicator[3555170]: INFO swift-object-replicator: devices=/srv/node bind_port=6200 interval=30s once=false
+===== swift4 =====
+wrote /etc/swift/object-server.conf
+  1 [DEFAULT] [DEFAULT]
+  2 [DEFAULT] reclaim_age = 600
+ 11 [app:object-server] [app:object-server]
+ 25 [object-replicator] [object-replicator]
+ 26 [object-replicator] reclaim_age = 600
+ 36 [object-updater] [object-updater]
+ 42 [object-reconstructor] [object-reconstructor]
+ 48 [object-expirer] [object-expirer]
+ 50 [object-expirer] reclaim_age = 600
+ 55 [object-auditor] [object-auditor]
+Aug 05 05:03:15 swift4 systemd[1]: swift-object-replicator.service: Consumed 7min 35.981s CPU time.
+Aug 05 05:03:15 swift4 systemd[1]: Started Swift object replicator (rust).
+Aug 05 05:03:15 swift4 object-replicator[443616]: INFO swift-object-replicator: devices=/srv/node bind_port=6200 interval=30s once=false

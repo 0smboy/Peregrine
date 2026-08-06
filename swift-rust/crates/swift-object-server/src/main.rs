@@ -24,8 +24,12 @@ use swift_core::obslog::{LogLevel, Logger};
 use swift_core::statsd::StatsdClient;
 use swift_core::storage_policy::parse_storage_policies;
 use swift_diskfile::{DiskFileConfig, PolicyKind};
+use swift_object_server::servers_per_port::{
+    bind_acceptors, child_bind_port_from_env, default_swift_dir, effective_concurrency,
+    listen_ports, maybe_supervise_port_workers, ConcurrencyInputs,
+};
 use swift_object_server::{
-    serve_with_config, ContainerUpdateMode, ObjectServer, ObjectServerConfig,
+    serve_with_config_multi, ContainerUpdateMode, ObjectServer, ObjectServerConfig,
 };
 
 fn parse_conf_file(path: &str) -> Result<SwiftConfig, String> {
@@ -72,9 +76,6 @@ fn main() {
             .unwrap_or_else(|| default.to_string())
     };
 
-    // Observability: syslog-or-stderr logger plus a fire-and-forget statsd
-    // client (a no-op when log_statsd_host is unset), named as Python's
-    // get_logger would name them.
     let log_name = get("log_name", "object-server");
     let log_level = get("log_level", "INFO")
         .parse::<LogLevel>()
@@ -126,7 +127,6 @@ fn main() {
         ),
         hash_config,
         diskfile: DiskFileConfig {
-            // L2 A/B knob: fsync_on_close = false skips put/rename fsync.
             fsync_on_close: matches!(
                 get("fsync_on_close", "true").to_lowercase().as_str(),
                 "true" | "1" | "yes" | "on" | "t" | "y"
@@ -149,12 +149,21 @@ fn main() {
         },
     };
 
-    // eventlet parity: `workers` processes each serving `max_clients`
-    // concurrent clients becomes one bounded thread pool (capped like the
-    // built-in default) plus a connection queue of max_clients.
+    // Topology / concurrency — docs/fairness-lab/WORKERS-SEMANTICS.md
     let workers: usize = get("workers", "0").parse().unwrap_or(0);
     let max_clients: usize = get("max_clients", "1024").parse().unwrap_or(1024);
+    let servers_per_port: usize = get("servers_per_port", "0").parse().unwrap_or(0);
     let client_timeout_secs: u64 = get("client_timeout", "60").parse().unwrap_or(60);
+    let bind_ip = get("bind_ip", "0.0.0.0");
+    let bind_port: u16 = get("bind_port", "6200").parse().unwrap_or(6200);
+    let ring_ip = {
+        let rip = get("ring_ip", "");
+        if rip.is_empty() {
+            bind_ip.clone()
+        } else {
+            rip
+        }
+    };
     let access_logger = Arc::clone(&logger);
     let access_statsd = Arc::clone(&statsd);
     let access_log: swift_http::AccessLog =
@@ -172,31 +181,100 @@ fn main() {
                 elapsed.as_secs_f64()
             ));
         });
+
+    // Wave 2: discover ring ports; parent supervises one OS child per
+    // (port, worker_index); child binds a single port (REUSEPORT when spp>1).
+    let discovered = if servers_per_port > 0 {
+        let p = listen_ports(&default_swift_dir(), &ring_ip, bind_port);
+        logger.info(&format!(
+            "servers_per_port={servers_per_port}: listen_ports={p:?} ring_ip={ring_ip}"
+        ));
+        p
+    } else {
+        vec![bind_port]
+    };
+
+    if servers_per_port > 0 {
+        let conf_argv = std::env::args().skip(1).collect::<Vec<_>>();
+        match maybe_supervise_port_workers(servers_per_port, &discovered, &conf_argv) {
+            Ok(Some(code)) => {
+                logger.info(&format!(
+                    "servers_per_port supervisor: {} child process(es) exited (code={code})",
+                    discovered.len().saturating_mul(servers_per_port.max(1))
+                ));
+                std::process::exit(code);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                logger.error(&format!("servers_per_port supervise failed: {e}"));
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let ports = if let Some(child_port) = child_bind_port_from_env() {
+        logger.info(&format!(
+            "servers_per_port child: bind_port={child_port} (process-isolated)"
+        ));
+        vec![child_port]
+    } else {
+        discovered
+    };
+
+    // Children always bind one acceptor; REUSEPORT when spp>1 (siblings share port).
+    let n_per_port = 1usize;
     let reuse_port = matches!(
         get("reuse_port", "false").to_lowercase().as_str(),
         "true" | "1" | "yes" | "on" | "t" | "y"
-    );
-    let mut http_config = swift_http::ServerConfig {
+    ) || (servers_per_port > 1 && child_bind_port_from_env().is_some());
+
+    // Child process: size the local pool as one acceptor; parent already exited.
+    let eff_spp = if child_bind_port_from_env().is_some() {
+        1
+    } else {
+        servers_per_port
+    };
+    let eff = effective_concurrency(ConcurrencyInputs {
+        workers,
+        max_clients,
+        servers_per_port: eff_spp,
+        bind_ports: ports.len().max(1),
+    });
+    logger.info(&format!(
+        "concurrency: {} → worker_threads={} queue={} acceptors={} notes={:?}",
+        eff.formula, eff.worker_threads, eff.connection_queue, eff.acceptors, eff.notes
+    ));
+
+    let http_config = swift_http::ServerConfig {
         client_timeout_secs,
         access_log: Some(access_log),
-        // SIGTERM/SIGINT: stop accepting, drain in-flight requests, return.
         shutdown: Some(swift_http::install_sigterm_flag()),
         reuse_port,
+        worker_threads: eff.worker_threads,
+        connection_queue: eff.connection_queue,
         ..Default::default()
     };
-    if workers > 0 {
-        http_config.worker_threads = workers.saturating_mul(max_clients).clamp(1, 128);
-    }
-    http_config.connection_queue = max_clients.max(1);
 
-    let bind = format!("{}:{}", get("bind_ip", "0.0.0.0"), get("bind_port", "6200"));
-    let listener = swift_http::bind_listener(&bind, reuse_port).unwrap_or_else(|e| {
-        logger.error(&format!("could not bind {bind} (reuse_port={reuse_port}): {e}"));
+    let listeners = bind_acceptors(&bind_ip, &ports, n_per_port).unwrap_or_else(|e| {
+        logger.error(&format!(
+            "could not bind {bind_ip} ports={ports:?} n_per_port={n_per_port} \
+             reuse_port={reuse_port}: {e}"
+        ));
         std::process::exit(1);
     });
-    logger.info(&format!("swift-object-server listening on {bind}"));
+    for (i, lis) in listeners.iter().enumerate() {
+        let addr = lis
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "?".into());
+        logger.info(&format!(
+            "swift-object-server listening on {addr} (socket {i}/{})",
+            listeners.len()
+        ));
+    }
+
     let server = ObjectServer::new(config).with_fallocate_reserve(fallocate_reserve);
-    match serve_with_config(listener, server, http_config) {
+    match serve_with_config_multi(listeners, server, http_config) {
         Ok(()) => logger.info("exiting"),
         Err(e) => {
             logger.error(&format!("server error: {e}"));

@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>P3-ops TLS / expand — partial GREEN</title>
+<style>
+  :root { --ink:#1a1a1a; --muted:#555; --ok:#1b6b2a; --warn:#8a5a00; --bg:#f7f5f0; --card:#fff; }
+  body { font-family: ui-sans-serif, system-ui, sans-serif; margin:0; background:var(--bg); color:var(--ink); line-height:1.45; }
+  main { max-width:920px; margin:0 auto; padding:32px 20px 64px; }
+  h1 { font-size:1.75rem; margin:0 0 8px; }
+  .verdict { display:inline-block; background:var(--warn); color:#fff; padding:4px 12px; font-weight:700; letter-spacing:.04em; }
+  .meta { color:var(--muted); margin:12px 0 28px; }
+  section { background:var(--card); padding:20px 22px; margin:0 0 18px; border:1px solid #e2ddd3; }
+  h2 { font-size:1.1rem; margin:0 0 12px; }
+  table { width:100%; border-collapse:collapse; font-size:.95rem; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid #ebe6dc; vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  code { font-family: ui-monospace, Menlo, monospace; font-size:.88em; }
+  ul { margin:8px 0 0; padding-left:1.2em; }
+  .ok { color:var(--ok); font-weight:700; }
+  .warn { color:var(--warn); font-weight:700; }
+</style>
+</head>
+<body>
+<main>
+  <p class="verdict">partial GREEN</p>
+  <h1>P3-ops — TLS / expand / multi-region</h1>
+  <p class="meta">2026-08-04 · Contabo VIP <code>10.0.0.10:8085</code> (still HTTP) · evidence
+    <code>tools/test-results/p3-ops-20260804/</code></p>
+
+  <section>
+    <h2>1. What this cycle did</h2>
+    <ul>
+      <li>HAProxy TLS termination when <code>lb_mode=https</code> (operator PEM or lab self-signed); proxies stay plain HTTP.</li>
+      <li>Workspace: rust allows <code>ingress.http_mode=https</code> with haproxy/keepalived; rejects https+direct; python-v3 HTTPS still disabled.</li>
+      <li>Expand: <code>expand.yml</code> + <code>rust_expand_mode</code> + idempotent ring <code>add</code>/<code>search</code>/<code>list</code>; <code>swift_devices</code> / region / zone in host_vars → rings.</li>
+      <li>Dual-guard: no mkfs/wipe in rust roles; workspace rejects <code>node.disks</code>; Contabo <code>/srv/node</code> not wiped.</li>
+      <li>Docs: <code>P3-OPS-CONTRACT.md</code>, <code>MULTI-REGION.md</code>, README / DEPLOY-HYBRID / blocked / ROADMAP.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>2. Optimized / fixed / demoted</h2>
+    <ul>
+      <li><strong>Unblocked:</strong> <code>lb_mode=https</code> is no longer a silent no-op; TLS tasks appear in sealed plans.</li>
+      <li><strong>Unblocked:</strong> add-disk/add-node via <code>expand.yml</code> (idempotent add, no ring <code>rm</code> in expand mode).</li>
+      <li><strong>Fixed false claim:</strong> README no longer says “no TLS / no expand”.</li>
+      <li><strong>Demoted (honest):</strong> Contabo live TLS cutover and live expand drill → residual this wave.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>3. Measured effect</h2>
+    <table>
+      <tr><th>Metric</th><th>Before</th><th>After</th></tr>
+      <tr><td>HAProxy TLS in bundle-rust</td><td>not honored</td><td class="ok">plan includes 6 TLS tasks when https</td></tr>
+      <tr><td>Expand automation</td><td>unsupported</td><td class="ok"><code>expand.yml</code> plans (50 tasks)</td></tr>
+      <tr><td>Plan disk_wipe risk</td><td>—</td><td class="ok">0 (expand + swift)</td></tr>
+      <tr><td>workspace_rust_stack</td><td>—</td><td class="ok">11/11</td></tr>
+      <tr><td>Contabo VIP bind</td><td><code>*:8085</code> http</td><td class="warn">unchanged (live TLS not applied)</td></tr>
+      <tr><td><code>/srv/node</code> on Contabo</td><td>d1/d2/d3</td><td class="ok">untouched</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>4. Gate results</h2>
+    <table>
+      <tr><th>Gate</th><th>Result</th><th>Evidence</th></tr>
+      <tr><td>ring-builder unit</td><td class="ok">2/2</td><td><code>05-ring-builder-unit.txt</code></td></tr>
+      <tr><td>workspace_rust_stack</td><td class="ok">11/11</td><td><code>05-cargo-workspace.txt</code></td></tr>
+      <tr><td>plan expand.yml</td><td class="ok">PASS</td><td><code>plan-expand.json</code> · <code>22-plan-analysis.txt</code></td></tr>
+      <tr><td>plan swift.yml + https</td><td class="ok">PASS</td><td><code>plan-swift.json</code></td></tr>
+      <tr><td>openssl self-signed dry-run</td><td class="ok">PASS</td><td><code>23-tls-openssl-dryrun.txt</code></td></tr>
+      <tr><td>Static dual-guard</td><td class="ok">PASS</td><td><code>10-static-dual-guard.txt</code></td></tr>
+      <tr><td>Contabo probe (public IP)</td><td class="ok">VIP http 200</td><td><code>01-contabo-ssh.txt</code></td></tr>
+      <tr><td>Contabo live TLS / expand</td><td class="warn">NOT APPLIED</td><td>no prod PEM; needs ticket</td></tr>
+      <tr><td>Contract / ROADMAP</td><td class="ok">DONE</td><td>P3-OPS-CONTRACT · MULTI-REGION · blocked</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>5. Remaining / next cycle</h2>
+    <ul>
+      <li><strong>FROZEN this wave:</strong> Contabo live TLS cutover (needs operator PEM + maintenance window).</li>
+      <li><strong>FROZEN this wave:</strong> Contabo live expand drill (partition movement; ticket required).</li>
+      <li><strong>Backlog:</strong> multi-region live drill; geo-DNS / multi-VIP federation.</li>
+      <li>Parallel P3 tracks (auth / s3 / data) stay separate; do not claim full ops GREEN until live cutover.</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

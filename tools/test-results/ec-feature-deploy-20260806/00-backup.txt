@@ -1,0 +1,4 @@
+pre-ec-backup=/root/bin-backup-pre-ec-20260806T041831Z
+swift-object-reconstructor
+swift-object-server
+swift-proxy-server

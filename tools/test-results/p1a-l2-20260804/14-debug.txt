@@ -1,0 +1,24 @@
+curl: (56) Recv failure: Connection reset by peer
+curl: (7) Failed to connect to 127.0.0.1 port 8080: Connection refused
+curl: (7) Failed to connect to 127.0.0.1 port 8080: Connection refused
+curl: (7)=== BULK BODY ===
+ Failed to connect to 127.0.0.1 port 8080: Connection refused
+0000000
+=== INFO tempauth ===
+{'account_acls': True}
+=== TEMPURL VIP debug ===
+post=404
+10.0.0.1 key=
+curl: (7) Failed to connect to 127.0.0.1 port 8080: Connection refused
+Expecting value: line 1 column 1 (char 0)
+10.0.0.2 key=
+10.0.0.3 key=
+10.0.0.4 key=
+msg=GET
+1785854545
+/p1dbg-22090/b
+sig=d66b610f54ff2cf238672d3354e359dea8f70986149a3539e110ebd3efc93686
+10.0.0.1 tu=401 body=401 Unauthorized: Temp URL invalid
+10.0.0.2 tu=401 body=401 Unauthorized: Temp URL invalid
+10.0.0.3 tu=401 body=401 Unauthorized: Temp URL invalid
+10.0.0.4 tu=401 body=401 Unauthorized: Temp URL invalid

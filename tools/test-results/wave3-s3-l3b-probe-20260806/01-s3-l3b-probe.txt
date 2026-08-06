@@ -1,0 +1,18 @@
+=== pipeline snippet ===
+# Managed by P0 pipeline foundation deploy (2026-08-04)
+# P0 thin+cache pipeline (2026-08-04)
+[pipeline:main]
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+[filter:tempauth]
+[filter:keystoneauth]
+use = egg:swift#keystoneauth
+[filter:s3api]
+use = egg:swift#s3api
+[filter:s3token]
+use = egg:swift#s3token
+=== sharder units ===
+active
+10.0.0.1 sharder=active
+10.0.0.2 sharder=active
+10.0.0.3 sharder=active
+10.0.0.4 sharder=active

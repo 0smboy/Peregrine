@@ -1,0 +1,7 @@
+=== Python :8090 from swift1 ===
+--- 10.0.0.2 ---
+{"swift": {"version": "2.33.0", "strict_cors_mode": true, "policies": [{"name": "Policy-0", "aliases": "Policy-0", "default": true}, {"name": "ec-2-1", "aliases": "ec-2-1"}], "allow_account_management
+--- 10.0.0.3 ---
+{"swift": {"version": "2.33.0", "strict_cors_mode": true, "policies": [{"name": "Policy-0", "aliases": "Policy-0", "default": true}, {"name": "ec-2-1", "aliases": "ec-2-1"}], "allow_account_management
+--- 10.0.0.4 ---
+{"swift": {"version": "2.33.0", "strict_cors_mode": true, "policies": [{"name": "Policy-0", "aliases": "Policy-0", "default": true}, {"name": "ec-2-1", "aliases": "ec-2-1"}], "allow_account_management

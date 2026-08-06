@@ -1,0 +1,3 @@
+PARTIAL
+passed=22 failed=2
+crit_fail=[]

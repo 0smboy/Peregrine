@@ -1,0 +1,75 @@
+{
+  "wave": "wave1-galera-keystone",
+  "captured_utc": "2026-08-05T03:39:00Z",
+  "contabo_live": "BLOCKED",
+  "block_reason": "Wave 0 disk reclaim not proven; /srv/node/d* still 89-100% Use%; Galera+Keystone on same 7.5GiB nodes as full Rust daemons is unsafe until pressure drops",
+  "mkfs": "FORBIDDEN",
+  "ansible_on_controller": false,
+  "inventory": "swift-deploy-rs/bundle/config_contabo_identity/",
+  "playbook": "swift-deploy-rs/bundle/install_mariadb_keystone.yml",
+  "topology": {
+    "mariadb_servers": [
+      "169.58.108.85",
+      "169.58.108.86",
+      "169.58.108.87"
+    ],
+    "keystones": [
+      "169.58.108.85",
+      "169.58.108.86",
+      "169.58.108.87"
+    ],
+    "galera_plane": "10.0.4.1-3",
+    "keystone_public": "http://10.0.0.10:5000",
+    "mariadb_haproxy": "10.0.0.10:3030",
+    "swift4_in_galera": false,
+    "haproxy_owner": "bundle-rust (additive identity listeners; python haproxy_servers NOT applied)"
+  },
+  "acceptance_when_unblocked": [
+    "wsrep_cluster_size=3",
+    "clustercheck :9600 healthy on each MariaDB",
+    "Keystone token issue via VIP :5000",
+    "Rust proxy authtoken+keystoneauth CRUD via VIP :8085",
+    "TempAuth coexistence or documented cutover window"
+  ],
+  "dry_run_commands": [
+    "cd swift-deploy-rs/bundle && ansible-playbook -i config_contabo_identity/swift_hosts install_mariadb_keystone.yml --check --diff",
+    "cd swift-deploy-rs/bundle && ansible-playbook -i config_contabo_identity/swift_hosts swift.yml --tags mariadb_servers,keystones_install,keystones_setup --check --diff"
+  ],
+  "post_identity_rust_cutover": [
+    "Set identity_haproxy_enabled=true with backends 10.0.4.1-3; haproxy -c; reload",
+    "Set identity_proxy_enabled=true; pipeline insert authtoken keystoneauth; rolling restart proxies",
+    "Evidence pack tools/test-results/p3-auth-live-YYYYMMDD/"
+  ],
+  "disk_gate": {
+    "rule": "Do not live-apply while any /srv/node/d* Use% >= ~70% OR Wave 0 SUMMARY lacks reclaim proof",
+    "evidence": "00-df-evidence.txt",
+    "observed_max_use_pct": {
+      "swift1_d1": 100,
+      "swift2_d1": 92,
+      "swift3_d1": 99,
+      "swift4_d1": 91
+    }
+  },
+  "code_docs_delivered_without_disk": [
+    "HttpTokenValidator https:// via native-tls",
+    "This dry-run-plan.json",
+    "bundle-rust IDENTITY.md + identity templates + haproxy/proxy includes",
+    "config_contabo_identity inventory + host_vars",
+    "config_contabo_identity mariadb/keystone address lists",
+    "docs/fairness-lab/KEYSTONE-LIVE.md",
+    "haproxy.cfg.j2 single identity_haproxy_enabled overlay (no duplicate bridge)",
+    "proxy-server.conf.j2 auth_method keystone|keystone_coexist pipeline + filters"
+  ],
+  "tags_note": "install_mariadb_keystone.yml uses install_standalone_*; full swift.yml uses mariadb_servers/keystones_*",
+  "supplemental_disk_gate": "tools/test-results/wave1-keystone-20260805/00-DISK-GATE.json",
+  "consolidated_utc": "2026-08-05T03:45:00Z",
+  "tags_order_standalone_playbook": [
+    "install_standalone_mariadb",
+    "install_standalone_keystone"
+  ],
+  "tags_order_swift_yml": [
+    "mariadb_servers",
+    "keystones_install",
+    "keystones_setup"
+  ]
+}

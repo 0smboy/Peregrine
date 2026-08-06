@@ -1,0 +1,124 @@
+# Pipeline/ring probe UTC=2026-08-05T09:59:56Z
+===== swift1 =====
+---proxy-pipeline---
+[pipeline:main]
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+[filter:tempauth]
+[filter:authtoken]
+[filter:keystoneauth]
+---proxy-active---
+inactive
+inactive
+LISTEN 0      4000         0.0.0.0:8085       0.0.0.0:*    users:(("haproxy",pid=4180537,fd=8))                                                                                                                                                                                                                      
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=4151,fd=5))                                                                                                                                                                                                                 
+LISTEN 0      4000         0.0.0.0:5000       0.0.0.0:*    users:(("haproxy",pid=4180537,fd=14))                                                                                                                                                                                                                     
+LISTEN 0      65535        0.0.0.0:5001       0.0.0.0:*    users:(("uwsgi",pid=4153459,fd=4),("uwsgi",pid=4153439,fd=4))                                                                                                                                                                                             
+---df---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  888M   50G   2% /srv/node/d1
+/dev/sda6        50G  726M   50G   2% /srv/node/d2
+/dev/sda7        50G  729M   50G   2% /srv/node/d3
+---mem---
+MemAvailable_kB=3655232 MemAvailable_GiB=3.49
+---rings-d1-d2---
+RING /etc/swift/object.ring.gz
+RING /etc/swift/account.ring.gz
+RING /etc/swift/container.ring.gz
+---python-swift---
+package openstack-swift is not installed
+package openstack-swift-proxy is not installed
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+
+===== swift2 =====
+---proxy-pipeline---
+[pipeline:main]
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+[filter:tempauth]
+[filter:authtoken]
+[filter:keystoneauth]
+---proxy-active---
+inactive
+inactive
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=3965157,fd=5))                                                                                                                                                                                                              
+LISTEN 0      4000         0.0.0.0:8085       0.0.0.0:*    users:(("haproxy",pid=3946973,fd=8))                                                                                                                                                                                                                      
+LISTEN 0      65535        0.0.0.0:5001       0.0.0.0:*    users:(("uwsgi",pid=3887966,fd=4),("uwsgi",pid=3887843,fd=4))                                                                                                                                                                                             
+LISTEN 0      4000         0.0.0.0:5000       0.0.0.0:*    users:(("haproxy",pid=3946973,fd=14))                                                                                                                                                                                                                     
+---df---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  855M   50G   2% /srv/node/d1
+/dev/sda6        50G  727M   50G   2% /srv/node/d2
+/dev/sda7        50G  728M   50G   2% /srv/node/d3
+---mem---
+MemAvailable_kB=3201104 MemAvailable_GiB=3.05
+---rings-d1-d2---
+RING /etc/swift/object.ring.gz
+RING /etc/swift/account.ring.gz
+RING /etc/swift/container.ring.gz
+---python-swift---
+package openstack-swift is not installed
+package openstack-swift-proxy is not installed
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+
+===== swift3 =====
+---proxy-pipeline---
+[pipeline:main]
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+[filter:tempauth]
+[filter:authtoken]
+[filter:keystoneauth]
+---proxy-active---
+inactive
+inactive
+LISTEN 0      4000         0.0.0.0:8085       0.0.0.0:*    users:(("haproxy",pid=35770,fd=8))                                                                                                                                                                                               
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=63319,fd=5))                                                                                                                                                                                       
+LISTEN 0      65535        0.0.0.0:5001       0.0.0.0:*    users:(("uwsgi",pid=8398,fd=4),("uwsgi",pid=8380,fd=4))                                                                                                                                                                          
+LISTEN 0      4000         0.0.0.0:5000       0.0.0.0:*    users:(("haproxy",pid=35770,fd=14))                                                                                                                                                                                              
+---df---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  886M   50G   2% /srv/node/d1
+/dev/sda6        50G  727M   50G   2% /srv/node/d2
+/dev/sda7        50G  729M   50G   2% /srv/node/d3
+---mem---
+MemAvailable_kB=3376436 MemAvailable_GiB=3.22
+---rings-d1-d2---
+RING /etc/swift/object.ring.gz
+RING /etc/swift/account.ring.gz
+RING /etc/swift/container.ring.gz
+---python-swift---
+package openstack-swift is not installed
+package openstack-swift-proxy is not installed
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+
+===== swift4 =====
+---proxy-pipeline---
+[pipeline:main]
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+[filter:tempauth]
+[filter:authtoken]
+[filter:keystoneauth]
+---proxy-active---
+inactive
+inactive
+LISTEN 0      4000         0.0.0.0:5000       0.0.0.0:*    users:(("haproxy",pid=1286469,fd=14))                   
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=1302764,fd=5))            
+LISTEN 0      4000         0.0.0.0:8085       0.0.0.0:*    users:(("haproxy",pid=1286469,fd=8))                    
+---df---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  831M   50G   2% /srv/node/d1
+/dev/sda6        50G  725M   50G   2% /srv/node/d2
+/dev/sda7        50G  728M   50G   2% /srv/node/d3
+---mem---
+MemAvailable_kB=4733856 MemAvailable_GiB=4.51
+---rings-d1-d2---
+RING /etc/swift/object.ring.gz
+RING /etc/swift/account.ring.gz
+RING /etc/swift/container.ring.gz
+---python-swift---
+package openstack-swift is not installed
+package openstack-swift-proxy is not installed
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+

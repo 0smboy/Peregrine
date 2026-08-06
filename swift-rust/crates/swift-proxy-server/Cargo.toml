@@ -11,6 +11,8 @@ swift-core = { path = "../swift-core" }
 swift-http = { path = "../swift-http" }
 swift-ring = { path = "../swift-ring" }
 swift-middleware = { path = "../swift-middleware" }
+swift-s3api = { path = "../swift-s3api" }
+swift-memcache = { path = "../swift-memcache" }
 # Erasure coding links liberasurecode (Linux-only), so it is opt-in: the EC
 # proxy path is built only with `--features ec`. Without it, EC object requests
 # return 501 and replication is unaffected (so the crate still builds on macOS).

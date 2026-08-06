@@ -8,4 +8,6 @@ authors.workspace = true
 
 [dependencies]
 swift-http = { path = "../swift-http" }
+swift-middleware = { path = "../swift-middleware" }
 sha2 = "0.10"
+serde_json = "1"

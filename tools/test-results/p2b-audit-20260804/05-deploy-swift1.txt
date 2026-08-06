@@ -1,0 +1,7 @@
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-object-auditor.service → /etc/systemd/system/swift-object-auditor.service.
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-account-auditor.service → /etc/systemd/system/swift-account-auditor.service.
+Created symlink /etc/systemd/system/multi-user.target.wants/swift-container-auditor.service → /etc/systemd/system/swift-container-auditor.service.
+active
+active
+active
+P2b deploy OK on swift1

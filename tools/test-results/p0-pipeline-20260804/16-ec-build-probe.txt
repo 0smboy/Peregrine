@@ -1,0 +1,26 @@
+NO_LEC
+alg_sig.h
+config_liberasurecode.h
+erasurecode_backend.h
+erasurecode.h
+erasurecode_helpers_ext.h
+erasurecode_helpers.h
+erasurecode_log.h
+erasurecode_postprocessing.h
+erasurecode_preprocessing.h
+erasurecode_stdinc.h
+   Compiling digest v0.10.7
+   Compiling rustix v1.1.4
+   Compiling bitflags v2.13.0
+   Compiling linux-raw-sys v0.12.1
+   Compiling md-5 v0.10.6
+   Compiling swift-core v0.1.0 (/tmp/p0-swift-rust/crates/swift-core)
+   Compiling swift-ec v0.1.0 (/tmp/p0-swift-rust/crates/swift-ec)
+   Compiling sha1 v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling swift-http v0.1.0 (/tmp/p0-swift-rust/crates/swift-http)
+   Compiling swift-ring v0.1.0 (/tmp/p0-swift-rust/crates/swift-ring)
+   Compiling xattr v1.6.1
+   Compiling swift-diskfile v0.1.0 (/tmp/p0-swift-rust/crates/swift-diskfile)
+   Compiling swift-object-server v0.1.0 (/tmp/p0-swift-rust/crates/swift-object-server)
+    Finished `release` profile [optimized] target(s) in 15.67s

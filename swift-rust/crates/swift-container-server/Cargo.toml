@@ -20,6 +20,14 @@ sha1 = "0.10"
 name = "swift-container-updater"
 path = "src/bin/container_updater.rs"
 
+[[bin]]
+name = "swift-container-reconciler"
+path = "src/bin/container_reconciler.rs"
+
+[[bin]]
+name = "swift-container-sharder"
+path = "src/bin/container_sharder.rs"
+
 [dev-dependencies]
 swift-db = { path = "../swift-db" }
 swift-account-server = { path = "../swift-account-server" }

@@ -1,0 +1,30 @@
+=== haproxy binds ===
+    # bind * so VIP (keepalived) and node IP both accept traffic once
+    bind *:8085 ssl crt /etc/haproxy/haproxyCA.pem
+    bind *:1080
+    bind 0.0.0.0:3030
+    bind *:35357 ssl crt /etc/haproxy/haproxyCA.pem
+    bind *:5000 ssl crt /etc/haproxy/haproxyCA.pem
+=== cert files ===
+-rw-------. 1 root root 2933 Aug  5 09:51 /etc/haproxy/haproxyCA.pem
+
+/etc/ssl:
+total 12
+drwxr-xr-x.   2 root root   77 May 25 19:52 .
+drwxr-xr-x. 108 root root 8192 Aug  5 09:37 ..
+lrwxrwxrwx.   1 root root   49 Nov 21  2025 cert.pem -> /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+lrwxrwxrwx.   1 root root   18 Nov 21  2025 certs -> /etc/pki/tls/certs
+lrwxrwxrwx.   1 root root   28 Nov 21  2025 ct_log_list.cnf -> /etc/pki/tls/ct_log_list.cnf
+lrwxrwxrwx.   1 root root   24 Nov 21  2025 openssl.cnf -> /etc/pki/tls/openssl.cnf
+TLS-GENERATED 2026-08-05T09:51:47Z CN=10.0.0.10 days=825 self-signed LAB
+=== openssl VIP cert ===
+subject=CN=10.0.0.10, O=Contabo-LAB, OU=Peregrine
+issuer=CN=10.0.0.10, O=Contabo-LAB, OU=Peregrine
+notBefore=Aug  5 09:51:47 2026 GMT
+notAfter=Nov  7 09:51:47 2028 GMT
+=== keystone 5000 ===
+subject=CN=10.0.0.10, O=Contabo-LAB, OU=Peregrine
+issuer=CN=10.0.0.10, O=Contabo-LAB, OU=Peregrine
+notBefore=Aug  5 09:51:47 2026 GMT
+notAfter=Nov  7 09:51:47 2028 GMT
+=== search for operator PEM paths ===

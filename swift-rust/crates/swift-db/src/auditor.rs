@@ -19,8 +19,10 @@
 //! open or query). Reports a tally; quarantining of corrupt DBs is left
 //! to the daemon (we only classify).
 //!
-//! Deferred: the daemon loop, per-row consistency checks, and the
-//! actual quarantine move.
+//! The continuous daemon loop lives in `swift-db-auditor` (conf +
+//! interval sleep, matching Python `DatabaseAuditor.interval` default
+//! 1800s). Deferred: per-row consistency checks and the actual
+//! quarantine move.
 
 use std::path::{Path, PathBuf};
 
@@ -101,6 +103,67 @@ pub fn audit_account_dbs(device_path: &Path) -> DbAuditReport {
     report
 }
 
+impl DbAuditReport {
+    /// Merge another device report into this one.
+    pub fn merge(&mut self, other: DbAuditReport) {
+        self.passed += other.passed;
+        self.failed += other.failed;
+        self.failed_paths.extend(other.failed_paths);
+    }
+}
+
+/// List local storage devices under `devices_root`.
+/// When `mount_check` is true, only mountpoints are included.
+pub fn list_db_devices(devices_root: &Path, mount_check: bool) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(devices_root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if mount_check && !is_mountpoint(&path) {
+            continue;
+        }
+        out.push(path);
+    }
+    out.sort();
+    out
+}
+
+fn is_mountpoint(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Some(parent) = path.parent() else {
+        return true;
+    };
+    let Ok(parent_meta) = std::fs::metadata(parent) else {
+        return false;
+    };
+    use std::os::unix::fs::MetadataExt;
+    meta.dev() != parent_meta.dev()
+}
+
+/// Audit account or container DBs on every local device.
+pub fn audit_dbs_on_devices(
+    devices_root: &Path,
+    mount_check: bool,
+    kind: &str,
+) -> DbAuditReport {
+    let mut report = DbAuditReport::default();
+    for device in list_db_devices(devices_root, mount_check) {
+        let one = match kind {
+            "account" => audit_account_dbs(&device),
+            _ => audit_container_dbs(&device),
+        };
+        report.merge(one);
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +189,10 @@ mod tests {
         let report = audit_container_dbs(&device);
         assert_eq!(report.passed, 1, "{report:?}");
         assert_eq!(report.failed, 1, "{report:?}");
+
+        let multi = audit_dbs_on_devices(&dir, false, "container");
+        assert_eq!(multi.passed, 1);
+        assert_eq!(multi.failed, 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

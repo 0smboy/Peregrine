@@ -1,0 +1,36 @@
+captured_utc=2026-08-05T03:44:17Z
+verdict=PYTHON_CLUSTER_ABSENT
+===== swift2 =====
+swift2
+package openstack-swift is not installed
+package openstack-swift-proxy is not installed
+package python3-swift is not installed
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+LISTENERS:
+LISTEN 0      4096        10.0.0.2:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=439060,fd=18),("swift-proxy-ser",pid=438908,fd=18))
+LISTEN 0      4096        10.0.0.2:8090       0.0.0.0:*    users:(("swift-proxy-ser",pid=439059,fd=16),("swift-proxy-ser",pid=438908,fd=16))
+DF_D1:
+/dev/sda5        50G   46G  4.6G  91% /srv/node/d1
+===== swift3 =====
+swift3
+package openstack-swift is not installed
+package openstack-swift-proxy is not installed
+package python3-swift is not installed
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+LISTENERS:
+(no python-compat listeners)
+DF_D1:
+/dev/sda5        50G   50G  934M  99% /srv/node/d1
+===== swift4 =====
+swift4
+package openstack-swift is not installed
+package openstack-swift-proxy is not installed
+package python3-swift is not installed
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+LISTENERS:
+(no python-compat listeners)
+DF_D1:
+/dev/sda5        50G   45G  5.4G  90% /srv/node/d1

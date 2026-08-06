@@ -1,0 +1,12 @@
+HEAD p1b-21784 404
+HEAD p1b-28970 200 None
+HEAD p1b-4164 404
+HEAD p1b-4803 200 None
+HEAD wave0-probe-put 204 0
+HEAD new-after-repair 404
+PUT_CONT 201
+PUT_OBJ 201
+GET_OBJ 200 b'w0-meta-ok'
+DEL_OBJ 204
+DEL_CONT 204
+list_after_crud [{'name': 'w0-meta-smoke-1785916361', 'count': 0, 'bytes': 0, 'last_modified': '2026-08-05T07:52:41.689330', 'storage_policy': 'Policy-0'}]

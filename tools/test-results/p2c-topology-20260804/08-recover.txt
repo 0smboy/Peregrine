@@ -1,0 +1,15 @@
+-rwxr-xr-x. 1 root root 1767984 Aug  4 15:11 /usr/local/bin/swift-object-server
+-rwxr-xr-x. 1 root root    3013 Aug  1 13:05 /usr/local/bin/swift-object-server.d
+/root/work/swift-rust/target/release/swift-object-server
+-rwxr-xr-x. 1 root root 1767984 Aug  4 15:11 /usr/local/bin/swift-object-server
+-rwxr-xr-x. 1 root root    3013 Aug  1 13:05 /usr/local/bin/swift-object-server.d
+-rwxr-xr-x. 1 root root 1767984 Aug  4 15:11 /usr/local/bin/swift-object-server
+-rwxr-xr-x. 1 root root    3013 Aug  1 13:05 /usr/local/bin/swift-object-server.d
+/root/work/swift-rust/target/release/swift-object-server
+-rwxr-xr-x. 1 root root 1767984 Aug  4 15:12 /usr/local/bin/swift-object-server
+-rwxr-xr-x. 1 root root    3013 Aug  1 13:05 /usr/local/bin/swift-object-server.d
+ls: cannot access '/root/work/swift-rust/crates/swift-object-server/src/main.rs': No such file or directory
+ls: cannot access '/root/work/swift-rust/target/release/swift-object-server': No such file or directory
+/root/work/swift-rust/target/release/swift-object-server: cannot open `/root/work/swift-rust/target/release/swift-object-server' (No such file or directory)
+bash: line 1: rustc: command not found
+/usr/bin/which: no cargo in (/root/.local/bin:/root/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin)

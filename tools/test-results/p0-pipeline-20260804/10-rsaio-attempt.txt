@@ -1,0 +1,6 @@
+rsaio pipeline: ['pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth copy slo dlo proxy-server']
+account.log
+container.log
+object.log
+proxy.log
+SAIO ports still down

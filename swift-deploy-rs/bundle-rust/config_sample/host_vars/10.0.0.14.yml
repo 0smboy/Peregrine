@@ -1,0 +1,12 @@
+# Sample fourth node — multi-region drill (region 2 / zone 2).
+# Contabo mapping (labels only, not WAN): swift4 ≈ r2z2.
+management_network_address: 10.0.0.14
+storage_network_address: 10.0.0.14
+replication_network_address: 10.0.0.14
+business_network_address: 10.0.0.14
+disk_type: hdd
+custom_disks: []
+region: 2
+zone: 2
+swift_devices:
+  - d1

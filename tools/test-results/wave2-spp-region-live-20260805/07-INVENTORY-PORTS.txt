@@ -1,0 +1,52 @@
+/opt/swift-deploy/bundle-rust/config_sample/group_vars/all:16:ssh_bind_port: 22
+/opt/swift-deploy/bundle-rust/config_sample/group_vars/all:29:proxy_bind_port: 8080
+/opt/swift-deploy/bundle-rust/config_sample/group_vars/all:30:account_bind_port: 6202
+/opt/swift-deploy/bundle-rust/config_sample/group_vars/all:31:container_bind_port: 6201
+/opt/swift-deploy/bundle-rust/config_sample/group_vars/all:32:object_bind_port: 6200
+/opt/swift-deploy/bundle-rust/config_sample/group_vars/all.raw:16:ssh_bind_port: 22
+/opt/swift-deploy/bundle-rust/config_sample/group_vars/all.raw:29:proxy_bind_port: 8080
+/opt/swift-deploy/bundle-rust/config_sample/group_vars/all.raw:30:account_bind_port: 6202
+/opt/swift-deploy/bundle-rust/config_sample/group_vars/all.raw:31:container_bind_port: 6201
+/opt/swift-deploy/bundle-rust/config_sample/group_vars/all.raw:32:object_bind_port: 6200
+/opt/swift-deploy/bundle-rust/roles/rust_config/templates/account-server.conf.j2:7:bind_port = {{ account_bind_port }}
+/opt/swift-deploy/bundle-rust/roles/rust_config/templates/account-server.conf.j2:24:peer_map = {{ account_bind_port }}:{{ srv_node_root }}
+/opt/swift-deploy/bundle-rust/roles/rust_config/templates/container-server.conf.j2:7:bind_port = {{ container_bind_port }}
+/opt/swift-deploy/bundle-rust/roles/rust_config/templates/container-server.conf.j2:24:peer_map = {{ container_bind_port }}:{{ srv_node_root }}
+/opt/swift-deploy/bundle-rust/roles/rust_config/templates/object-server.conf.j2:4:# daemons (their own sections below; they read devices/bind_port from
+/opt/swift-deploy/bundle-rust/roles/rust_config/templates/object-server.conf.j2:9:bind_port = {{ object_bind_port }}
+/opt/swift-deploy/bundle-rust/roles/rust_config/templates/object-server.conf.j2:27:peer_map = {{ object_bind_port }}:{{ srv_node_root }}
+/opt/swift-deploy/bundle-rust/roles/rust_config/templates/proxy-server.conf.j2:19:bind_port = {{ proxy_bind_port }}
+/opt/swift-deploy/bundle-rust/roles/rust_config/templates/proxy-server.conf.j2:24:storage_url = http://{{ business_network_address }}:{{ proxy_bind_port }}
+/opt/swift-deploy/bundle-rust/roles/rust_haproxy/templates/haproxy.cfg.j2:37:    server proxy{{ loop.index }} {{ hostvars[host].business_network_address }}:{{ proxy_bind_port }} check inter 5s fall 3 rise 2
+/opt/swift-deploy/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:37:  "$RB" account.ring.gz add r1z{{ zone }}-{{ hv.storage_network_address }}:{{ account_bind_port }}R{{ hv.replication_network_address }}:{{ account_bind_port }}/d1 {{ swift_device_weight }}
+/opt/swift-deploy/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:47:  "$RB" container.ring.gz add r1z{{ zone }}-{{ hv.storage_network_address }}:{{ container_bind_port }}R{{ hv.replication_network_address }}:{{ container_bind_port }}/d1 {{ swift_device_weight }}
+/opt/swift-deploy/bundle-rust/roles/rust_rings/templates/build_rings.sh.j2:59:  "$RB" {{ ring_file }} add r1z{{ zone }}-{{ hv.storage_network_address }}:{{ object_bind_port }}R{{ hv.replication_network_address }}:{{ object_bind_port }}/d1 {{ swift_device_weight }}
+/opt/swift-deploy/bundle-rust/roles/rust_verify/tasks/main.yml:9:      code=$(curl -s -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:{{ proxy_bind_port }}/healthcheck || true)
+/opt/swift-deploy/bundle-rust/roles/rust_verify/tasks/main.yml:22:    url: "http://127.0.0.1:{{ proxy_bind_port }}/healthcheck"
+/opt/swift-deploy/bundle-rust/roles/rust_verify/tasks/main.yml:27:    url: "http://127.0.0.1:{{ proxy_bind_port }}/auth/v1.0"
+/opt/swift-deploy/bundle-rust/roles/rust_verify/tasks/main.yml:36:    resp=$(curl -sf -m 10 -D - -o /dev/null http://127.0.0.1:{{ proxy_bind_port }}/auth/v1.0 \
+/opt/swift-deploy/bundle-rust/README.md:47:- All servers bind `0.0.0.0` on `proxy/account/container/object_bind_port`.
+/opt/swift-deploy/bundle-rust/README.md:57:  `proxy/account/container/object_bind_port`, `srv_node_root`,
+/opt/swift-deploy/bundle-rust/README.md:60:  `ssh_bind_port`, `swift_hash_path_prefix/suffix`,
+ansible.cfg
+config_sample
+README.md
+roles
+swift.yml
+/opt/swift-deploy/bundle-rust/config_sample/group_vars
+/opt/swift-deploy/bundle-rust/config_sample/host_vars/10.0.0.11.yml
+/opt/swift-deploy/bundle-rust/config_sample/host_vars/10.0.0.12.yml
+/opt/swift-deploy/bundle-rust/roles/rust_common/tasks/main.yml
+/opt/swift-deploy/bundle-rust/roles/rust_config/handlers/main.yml
+/opt/swift-deploy/bundle-rust/roles/rust_config/tasks/main.yml
+/opt/swift-deploy/bundle-rust/roles/rust_disks/tasks/main.yml
+/opt/swift-deploy/bundle-rust/roles/rust_haproxy/handlers/main.yml
+/opt/swift-deploy/bundle-rust/roles/rust_haproxy/tasks/main.yml
+/opt/swift-deploy/bundle-rust/roles/rust_keepalived/tasks/main.yml
+/opt/swift-deploy/bundle-rust/roles/rust_payload/tasks/main.yml
+/opt/swift-deploy/bundle-rust/roles/rust_replication_key/tasks/main.yml
+/opt/swift-deploy/bundle-rust/roles/rust_rings/tasks/main.yml
+/opt/swift-deploy/bundle-rust/roles/rust_systemd/tasks/main.yml
+/opt/swift-deploy/bundle-rust/roles/rust_systemd/tasks/unit.yml
+/opt/swift-deploy/bundle-rust/roles/rust_verify/tasks/main.yml
+/opt/swift-deploy/bundle-rust/swift.yml

@@ -1,0 +1,39 @@
+===== swift2 =====
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth tempurl bulk ratelimit copy slo dlo proxy-logging proxy-server
+[filter:proxy-logging]
+[filter:cache]
+[filter:listing_formats]
+[filter:bulk]
+[filter:tempurl]
+[filter:tempauth]
+[filter:ratelimit]
+-rwxr-xr-x. 1 root root 2738792 Aug  4 13:38 /usr/local/bin/swift-proxy-server
+keys ['bulk_delete', 'tempauth', 'tempurl']
+acls {'account_acls': True}
+has_upload False
+===== swift3 =====
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth tempurl bulk ratelimit copy slo dlo proxy-logging proxy-server
+[filter:proxy-logging]
+[filter:cache]
+[filter:listing_formats]
+[filter:bulk]
+[filter:tempurl]
+[filter:tempauth]
+[filter:ratelimit]
+-rwxr-xr-x. 1 root root 2738792 Aug  4 13:39 /usr/local/bin/swift-proxy-server
+keys ['bulk_delete', 'tempauth', 'tempurl']
+acls {'account_acls': True}
+has_upload False
+===== swift4 =====
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth tempurl bulk ratelimit copy slo dlo proxy-logging proxy-server
+[filter:proxy-logging]
+[filter:cache]
+[filter:listing_formats]
+[filter:bulk]
+[filter:tempurl]
+[filter:tempauth]
+[filter:ratelimit]
+-rwxr-xr-x. 1 root root 2738792 Aug  4 13:39 /usr/local/bin/swift-proxy-server
+keys ['bulk_delete', 'tempauth', 'tempurl']
+acls {'account_acls': True}
+has_upload False

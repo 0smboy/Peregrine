@@ -1,0 +1,133 @@
+===== swift1 =====
+swift1
+---DISK---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda4        40G   19G   22G  48% /
+/dev/sda5        50G  887M   50G   2% /srv/node/d1
+/dev/sda6        50G  726M   50G   2% /srv/node/d2
+/dev/sda7        50G  729M   50G   2% /srv/node/d3
+---MEM---
+MemTotal=8054063104 MemAvailable=5342834688 avail_GiB=4.98
+---PKGS---
+centos-release-openstack-caracal-1-2.el9.noarch
+package openstack-keystone is not installed
+package mariadb-server is not installed
+package galera is not installed
+package ansible-core is not installed
+---SVCS---
+inactive
+inactive
+inactive
+inactive
+inactive
+inactive
+inactive
+active
+active:haproxy
+---PORTS---
+LISTEN 0      4000         0.0.0.0:8085       0.0.0.0:*    users:(("haproxy",pid=7066,fd=7))                        
+---KEYSTONE_DIR---
+---WSREP---
+mysql-query-fail
+---HAPROXY_IDENTITY---
+===== swift2 =====
+swift2
+---DISK---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda4        40G  7.1G   33G  18% /
+/dev/sda5        50G  854M   50G   2% /srv/node/d1
+/dev/sda6        50G  727M   50G   2% /srv/node/d2
+/dev/sda7        50G  728M   50G   2% /srv/node/d3
+---MEM---
+MemTotal=8054063104 MemAvailable=5239484416 avail_GiB=4.88
+---PKGS---
+package centos-release-openstack-caracal is not installed
+package openstack-keystone is not installed
+package mariadb-server is not installed
+package galera is not installed
+package ansible-core is not installed
+---SVCS---
+inactive
+inactive
+inactive
+inactive
+inactive
+inactive
+inactive
+active
+active:haproxy
+---PORTS---
+LISTEN 0      4000         0.0.0.0:8085       0.0.0.0:*    users:(("haproxy",pid=2032550,fd=7))                                             
+---KEYSTONE_DIR---
+---WSREP---
+mysql-query-fail
+---HAPROXY_IDENTITY---
+===== swift3 =====
+swift3
+---DISK---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda4        40G  8.0G   32G  20% /
+/dev/sda5        50G  885M   50G   2% /srv/node/d1
+/dev/sda6        50G  727M   50G   2% /srv/node/d2
+/dev/sda7        50G  729M   50G   2% /srv/node/d3
+---MEM---
+MemTotal=8054071296 MemAvailable=5197201408 avail_GiB=4.84
+---PKGS---
+package centos-release-openstack-caracal is not installed
+package openstack-keystone is not installed
+package mariadb-server is not installed
+package galera is not installed
+package ansible-core is not installed
+---SVCS---
+inactive
+inactive
+inactive
+inactive
+inactive
+inactive
+inactive
+active
+active:haproxy
+---PORTS---
+LISTEN 0      4000         0.0.0.0:8085       0.0.0.0:*    users:(("haproxy",pid=4030548,fd=7))                    
+---KEYSTONE_DIR---
+---WSREP---
+mysql-query-fail
+---HAPROXY_IDENTITY---
+===== swift4 =====
+swift4
+---DISK---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda4        40G  9.6G   31G  24% /
+/dev/sda5        50G  831M   50G   2% /srv/node/d1
+/dev/sda6        50G  725M   50G   2% /srv/node/d2
+/dev/sda7        50G  728M   50G   2% /srv/node/d3
+---MEM---
+MemTotal=8054063104 MemAvailable=4848283648 avail_GiB=4.52
+---PKGS---
+package centos-release-openstack-caracal is not installed
+package openstack-keystone is not installed
+package mariadb-server is not installed
+package galera is not installed
+package ansible-core is not installed
+---SVCS---
+inactive
+inactive
+inactive
+inactive
+inactive
+inactive
+inactive
+active
+active:haproxy
+---PORTS---
+LISTEN 0      4000         0.0.0.0:8085       0.0.0.0:*    users:(("haproxy",pid=3856525,fd=7))                    
+---KEYSTONE_DIR---
+---WSREP---
+mysql-query-fail
+---HAPROXY_IDENTITY---
+===== VIP =====
+curl: (52) Empty reply from server
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+FileNotFoundError: [Errno 2] No such file or directory: '/tmp/vip-info.json'

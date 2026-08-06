@@ -1,0 +1,10 @@
+---
+# swift4 — not in Galera/Keystone groups (monitor hub).
+management_network_address: 169.58.108.121
+storage_network_address: 10.0.4.4
+business_network_address: 10.0.0.4
+keystone_node: false
+mariadb_node: false
+exclude_disks: ['sda']
+custom_disks: []
+disk_type: ''

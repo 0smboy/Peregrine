@@ -30,6 +30,10 @@ proxy_bind_port: 8080
 account_bind_port: 6202
 container_bind_port: 6201
 object_bind_port: 6200
+# Wave 2: per-device object ring ports (d1→6200, d2→6201, …). Account/container
+# stay single-port. Contabo live ring rebuild is a separate no-wipe ops ticket.
+object_port_per_device: true
+object_servers_per_port: 0
 srv_node_root: /srv/node
 object_workers: 0
 swift_device_weight: 100
@@ -62,6 +66,15 @@ haproxy_stats_user: admin
 haproxy_stats_password: SAMPLE-STATS-REPLACE-ME
 haproxy_monitor_port: 1080
 haproxy_max_conn: 4000
+
+# ---- P3-ops TLS / expand defaults (workspace.rs also injects these) ----
+haproxy_tls_self_signed: true
+haproxy_tls_days: 825
+haproxy_tls_pem: /etc/haproxy/haproxyCA.pem
+haproxy_tls_pem_src: ""
+ring_expand: false
+ADD_NODES: false
+ring_force_rebuild: false
 
 # ---- controller-side staging directory for fetched rings + replication
 # keys (flat files; per-project path avoids cross-project clobbering) ----

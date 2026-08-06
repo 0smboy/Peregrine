@@ -1,0 +1,3 @@
+da5ab2f1818c828577a522497a7a3d461c32d6840a1b465ca43e45551a40fc79  /root/work/swift-rust/target/release/swift-proxy-server
+5bc9aa465df345aac416645ec7e1455196c3543e555b955e544a0733742e82aa  /root/work/swift-rust/target/release/swift-object-server
+f548c09c276f7653675e9abf25c5dfb22cd9ffe400f7eebc7e9628dca06b61c5  /root/work/swift-rust/target/release/swift-object-reconstructor

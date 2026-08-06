@@ -1,0 +1,9 @@
+LISTEN 0      65535      127.0.0.1:3000       0.0.0.0:*    users:(("grafana",pid=906993,fd=13))                    
+auth_try admin:admin -> 200 {
+  "commit": "NA",
+  "database": "ok",
+  "version": "10.2.6"
+}
+USING admin:admin
+[{"id":1,"uid":"prometheus","orgId":1,"name":"Prometheus","type":"prometheus","typeName":"Prometheus","typeLogoUrl":"public/app/plugins/datasource/prometheus/img/prometheus_logo.svg","access":"proxy","url":"http://127.0.0.1:9090","user":"","database":"","basicAuth":false,"isDefault":true,"jsonData":{},"readOnly":false}]
+{"message":"data source with the same name already exists","traceID":""}

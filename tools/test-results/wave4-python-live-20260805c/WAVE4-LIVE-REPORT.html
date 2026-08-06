@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Wave 4 Python live — 2026-08-05c</title>
+<style>
+body{font:14px/1.45 system-ui,sans-serif;margin:24px;color:#1a1a1a;background:#f7f5f1}
+h1{font-size:1.4rem;margin:0 0 8px}
+h2{font-size:1.1rem;margin:20px 0 8px}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-weight:600;font-size:12px}
+.ok{background:#d7f0d7}.warn{background:#ffe6a8}.bad{background:#f5c2c2}
+table{border-collapse:collapse;width:100%;margin:12px 0;background:#fff}
+th,td{border:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}
+th{background:#eee}
+code,pre{font-size:12px}
+pre{background:#fff;border:1px solid #ddd;padding:12px;overflow:auto}
+</style>
+</head>
+<body>
+<h1>Wave 4 — Python 3-node live re-gate</h1>
+<p><span class="badge bad">BLOCKED</span> · <code>PYTHON_CLUSTER=ABSENT</code> · 2026-08-05c · no PRODUCTION-GO-LIVE</p>
+
+<h2>1) What this cycle did</h2>
+<ul>
+<li>Re-checked df Use% / MemAvailable on swift1–4 (worst Use% <strong>2%</strong>).</li>
+<li>Re-read rings: object spp ports 6210–6212 on d1/d2/d3; account/container still <strong>d1-only</strong>.</li>
+<li>Found Contabo <code>build_rings.sh</code> <strong>STALE</strong> (still object :6200/d1) vs live spp rings — force-rebuild landmine.</li>
+<li>Assessed migrate: Rust builder full remap + no remove; Identity auth CRUD noisy (TempAuth list 401 / Keystone Swift 403).</li>
+<li><strong>Did not migrate</strong> rings; <strong>did not install</strong> openstack-swift; no mkfs.</li>
+<li>Wrote exact operator migrate runbook for a later maintenance window.</li>
+</ul>
+
+<h2>2) Optimized / fixed / demoted</h2>
+<table>
+<tr><th>Item</th><th>Status</th></tr>
+<tr><td>Disk Use% &lt;70% / &lt;50%</td><td class="ok">PASS (2%)</td></tr>
+<tr><td>W0′ META (LAB)</td><td class="ok">LAB_META_CLEAN (ref)</td></tr>
+<tr><td>PORT-DISK isolation (Python exclusive d1)</td><td class="bad">FAIL — Rust still on d1</td></tr>
+<tr><td>Live A/C (+object d1) migrate</td><td class="bad">NOT executed — unsafe mid-Identity</td></tr>
+<tr><td>Shared-d1 matrix revision</td><td class="warn">Rejected (would enable unsafe install)</td></tr>
+<tr><td>3-node openstack-swift install</td><td class="bad">BLOCKED</td></tr>
+<tr><td>4-node</td><td class="warn">N/A (needs 3-node GREEN; disk already &lt;50%)</td></tr>
+</table>
+
+<h2>3) Measured effect</h2>
+<table>
+<tr><th>Metric</th><th>05b</th><th>05c</th></tr>
+<tr><td>Isolation</td><td>FAIL</td><td>FAIL (unchanged)</td></tr>
+<tr><td>Migrate plan</td><td>named as next</td><td>risk doc + operator steps shipped</td></tr>
+<tr><td>VIP healthcheck</td><td>—</td><td>200</td></tr>
+<tr><td>Python cluster</td><td>ABSENT</td><td>ABSENT</td></tr>
+</table>
+
+<h2>4) Gate table</h2>
+<table>
+<tr><th>Gate</th><th>Result</th><th>Evidence</th></tr>
+<tr><td>Use% &lt;70%</td><td class="ok">PASS</td><td><code>00-df-mem-gate.txt</code></td></tr>
+<tr><td>META LAB clean</td><td class="ok">PASS</td><td><code>01-META-STATUS.txt</code></td></tr>
+<tr><td>Matrix isolation</td><td class="bad">FAIL</td><td><code>01-ring-isolation.txt</code></td></tr>
+<tr><td>VIP health</td><td class="ok">200</td><td><code>02-VIP-HEALTH.txt</code></td></tr>
+<tr><td>Auth CRUD (this probe)</td><td class="warn">NOISY</td><td>TempAuth list 401; Keystone Swift 403</td></tr>
+<tr><td>3A/3B unfreeze</td><td class="bad">FROZEN</td><td>isolation FAIL</td></tr>
+</table>
+
+<h2>5) Remaining / next cycle</h2>
+<ol>
+<li><strong>FROZEN:</strong> 3A install, 3B dual API, 3D Python-only, 4-node.</li>
+<li>Repair VIP auth CRUD (TempAuth 401 / Keystone 403) before ring surgery.</li>
+<li>Maintenance window: follow <code>05-OPERATOR-MIGRATE-STEPS.md</code> (backup → sync build plan → weight d1→0 → rebalance → distribute → VIP 54/54).</li>
+<li>Isolation PASS + Use%&lt;70% → <code>INSTALL-PLAN.md</code> on swift2/3/4 only.</li>
+<li>4-node only if 3-node GREEN and Use%&lt;50%.</li>
+</ol>
+
+<p>Evidence pack: <code>tools/test-results/wave4-python-live-20260805c/</code></p>
+</body>
+</html>

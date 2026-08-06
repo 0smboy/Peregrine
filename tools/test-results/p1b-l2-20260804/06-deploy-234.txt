@@ -1,0 +1,12 @@
+=== peer 10.0.0.2 ===
+active
+health=200
+formpost True staticweb True quotas True symlink True vw True
+=== peer 10.0.0.3 ===
+active
+health=200
+formpost True staticweb True quotas True symlink True vw True
+=== peer 10.0.0.4 ===
+active
+health=200
+formpost True staticweb True quotas True symlink True vw True

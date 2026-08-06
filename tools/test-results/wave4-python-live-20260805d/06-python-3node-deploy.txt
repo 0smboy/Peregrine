@@ -1,0 +1,48 @@
+hash_prefix_len=32 hash_suffix_len=32
+backed up to /etc/pyswift.bak-20260805T115249Z
+Device d0r1z1-10.0.4.2:6102R10.0.4.2:6102/py_"" with 100.0 weight got id 0
+Device d0r1z1-10.0.4.2:6101R10.0.4.2:6101/py_"" with 100.0 weight got id 0
+Device d0r1z1-10.0.4.2:6100R10.0.4.2:6100/py_"" with 100.0 weight got id 0
+Device d1r1z2-10.0.4.3:6102R10.0.4.3:6102/py_"" with 100.0 weight got id 1
+Device d1r1z2-10.0.4.3:6101R10.0.4.3:6101/py_"" with 100.0 weight got id 1
+Device d1r1z2-10.0.4.3:6100R10.0.4.3:6100/py_"" with 100.0 weight got id 1
+Device d2r1z3-10.0.4.4:6102R10.0.4.4:6102/py_"" with 100.0 weight got id 2
+Device d2r1z3-10.0.4.4:6101R10.0.4.4:6101/py_"" with 100.0 weight got id 2
+Device d2r1z3-10.0.4.4:6100R10.0.4.4:6100/py_"" with 100.0 weight got id 2
+Defaulting to --format-version=1. This ensures the ring
+written will be readable by older versions of Swift.
+In a future release, the default will change to
+--format-version=2
+
+Reassigned 1536 (300.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
+Defaulting to --format-version=1. This ensures the ring
+written will be readable by older versions of Swift.
+In a future release, the default will change to
+--format-version=2
+
+Reassigned 1536 (300.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
+Defaulting to --format-version=1. This ensures the ring
+written will be readable by older versions of Swift.
+In a future release, the default will change to
+--format-version=2
+
+Reassigned 1536 (300.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
+account.builder, build version 4, id 04ef45816b804968a462760fac10ac43
+512 partitions, 3.000000 replicas, 1 regions, 3 zones, 3 devices, 2-byte IDs, 0.00 balance, 0.00 dispersion
+The minimum number of hours before a partition can be reassigned is 1 (0:59:57 remaining)
+The overload factor is 0.00% (0.000000)
+Ring file account.ring.gz is up-to-date
+Devices:   id region zone ip address:port replication ip:port  name weight partitions balance flags meta
+            0      1    1   10.0.4.2:6102       10.0.4.2:6102    py 100.00        512    0.00       
+            1      1    2   10.0.4.3:6102       10.0.4.3:6102    py 100.00        512    0.00       
+            2      1    3   10.0.4.4:6102       10.0.4.4:6102    py 100.00        512    0.00       
+object.builder, build version 4, id c4f604cfb1584985946bd85bfdea533f
+512 partitions, 3.000000 replicas, 1 regions, 3 zones, 3 devices, 2-byte IDs, 0.00 balance, 0.00 dispersion
+The minimum number of hours before a partition can be reassigned is 1 (0:59:59 remaining)
+The overload factor is 0.00% (0.000000)
+Ring file object.ring.gz is up-to-date
+Devices:   id region zone ip address:port replication ip:port  name weight partitions balance flags meta
+            0      1    1   10.0.4.2:6100       10.0.4.2:6100    py 100.00        512    0.00       
+            1      1    2   10.0.4.3:6100       10.0.4.3:6100    py 100.00        512    0.00       
+            2      1    3   10.0.4.4:6100       10.0.4.4:6100    py 100.00        512    0.00       
+RINGS_BUILT

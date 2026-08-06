@@ -1,0 +1,51 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.24s
+     Running unittests src/lib.rs (target/debug/deps/swift_object_server-9f142b6e7994b3d9)
+
+running 6 tests
+test expirer::tests::test_normalize_matches_python_format ... ok
+test expirer::tests::test_build_and_parse_roundtrip ... ok
+test expirer::tests::test_expirer_container_bucket ... ok
+test expirer::tests::test_iter_due_stops_at_future ... ok
+test expirer::tests::test_process_deletes_then_pops ... ok
+test expirer::tests::test_stale_recent_retained_old_popped ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s
+
+---
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/swift_container_server-c6b0d426a12e60d8)
+
+running 7 tests
+test reconciler::tests::test_content_type_roundtrip ... ok
+test reconciler::tests::test_decide_move_vs_correct ... ok
+test reconciler::tests::test_container_name_hour_bucket ... ok
+test reconciler::tests::test_reconcile_already_correct_just_pops ... ok
+test reconciler::tests::test_reconcile_failed_move_keeps_entry ... ok
+test reconciler::tests::test_reconcile_moves_then_pops ... ok
+test reconciler::tests::test_reconciler_obj_name_and_parse ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+
+---
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running unittests src/lib.rs (target/debug/deps/swift_container_server-c6b0d426a12e60d8)
+
+running 3 tests
+test updater::tests::test_needs_report_detects_change ... ok
+test updater::tests::test_report_failure_not_stamped ... ok
+test updater::tests::test_report_majority_stamps_reported ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.02s
+
+---
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/swift_account_server-9e51b94410d96b12)
+
+running 4 tests
+test reaper::tests::test_is_reapable ... ok
+test reaper::tests::test_reap_container_keeps_container_if_object_fails ... ok
+test reaper::tests::test_reap_container_deletes_objects_then_container ... ok
+test reaper::tests::test_reap_account_end_to_end ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+

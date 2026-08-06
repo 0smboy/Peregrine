@@ -1,0 +1,21 @@
+=== df /srv/node ===
+--- swift1 ---
+swift1
+/dev/sda5        50G  898M   50G   2% /srv/node/d1
+/dev/sda6        50G  727M   50G   2% /srv/node/d2
+/dev/sda7        50G  730M   50G   2% /srv/node/d3
+--- swift2 ---
+swift2
+/dev/sda5        50G  863M   50G   2% /srv/node/d1
+/dev/sda6        50G  735M   50G   2% /srv/node/d2
+/dev/sda7        50G  728M   50G   2% /srv/node/d3
+--- swift3 ---
+swift3
+/dev/sda5        50G  906M   50G   2% /srv/node/d1
+/dev/sda6        50G  735M   50G   2% /srv/node/d2
+/dev/sda7        50G  729M   50G   2% /srv/node/d3
+--- swift4 ---
+swift4
+/dev/sda5        50G  852M   50G   2% /srv/node/d1
+/dev/sda6        50G  736M   50G   2% /srv/node/d2
+/dev/sda7        50G  729M   50G   2% /srv/node/d3

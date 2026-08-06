@@ -1,0 +1,6 @@
+P3-s3 evidence pack complete.
+Verdict: PARTIAL GREEN
+HTML: P3S3-REPORT.html
+Matrix: S3-COMPAT-MATRIX.md
+
+verify-rerun: 2026-08-04T15:37:53Z cargo test green

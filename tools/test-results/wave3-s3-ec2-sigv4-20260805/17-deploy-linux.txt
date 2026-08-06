@@ -1,0 +1,21 @@
+325a28840e6bb20526d29d79afc8216c410c99bb6f6a6a512a7b4c1784495174  /root/work/swift-rust/target/release/swift-proxy-server
+===== deploy 10.0.0.1 =====
+325a28840e6bb20526d29d79afc8216c410c99bb6f6a6a512a7b4c1784495174  /usr/local/bin/swift-proxy-server
+active
+===== deploy 10.0.0.2 =====
+325a28840e6bb20526d29d79afc8216c410c99bb6f6a6a512a7b4c1784495174  /usr/local/bin/swift-proxy-server
+active
+===== deploy 10.0.0.3 =====
+325a28840e6bb20526d29d79afc8216c410c99bb6f6a6a512a7b4c1784495174  /usr/local/bin/swift-proxy-server
+active
+Aug 05 10:37:36 swift3 systemd[1]: Started Swift proxy server (rust).
+Aug 05 10:37:36 swift3 proxy-server[138866]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+Aug 05 10:37:36 swift3 proxy-server[138866]: INFO s3api enabled (SigV4+CRUD+list + EC2→s3token deferral; not advertised on Swift /info)
+Aug 05 10:37:36 swift3 proxy-server[138866]: INFO s3token enabled (auth_uri=http://127.0.0.1:5001)
+===== deploy 10.0.0.4 =====
+325a28840e6bb20526d29d79afc8216c410c99bb6f6a6a512a7b4c1784495174  /usr/local/bin/swift-proxy-server
+active
+Aug 05 10:38:10 swift4 systemd[1]: Started Swift proxy server (rust).
+Aug 05 10:38:10 swift4 proxy-server[1392130]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+Aug 05 10:38:10 swift4 proxy-server[1392130]: INFO s3api enabled (SigV4+CRUD+list + EC2→s3token deferral; not advertised on Swift /info)
+Aug 05 10:38:10 swift4 proxy-server[1392130]: INFO s3token enabled (auth_uri=http://10.0.0.1:5001)

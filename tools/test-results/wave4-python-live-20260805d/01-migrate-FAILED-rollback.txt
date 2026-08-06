@@ -1,0 +1,74 @@
+=== broken builder state ===
+account[0] r1z1 10.0.4.1:6202/d1 w=100.0 rip=10.0.8.1
+account[1] r1z2 10.0.4.2:6202/d1 w=100.0 rip=10.0.8.2
+account[2] r1z3 10.0.4.3:6202/d1 w=100.0 rip=10.0.8.3
+account[3] r1z4 10.0.4.4:6202/d1 w=100.0 rip=10.0.8.4
+account[4] r1z1 10.0.4.1:6202/d2 w=100.0 rip=10.0.8.1
+account[5] r1z1 10.0.4.1:6202/d1 w=0.0 rip=10.0.8.1
+account[6] r1z2 10.0.4.2:6202/d2 w=100.0 rip=10.0.8.2
+account[7] r1z2 10.0.4.2:6202/d1 w=0.0 rip=10.0.8.2
+account[8] r1z3 10.0.4.3:6202/d2 w=100.0 rip=10.0.8.3
+account[9] r1z3 10.0.4.3:6202/d1 w=0.0 rip=10.0.8.3
+account[10] r1z4 10.0.4.4:6202/d2 w=100.0 rip=10.0.8.4
+account[11] r1z4 10.0.4.4:6202/d1 w=0.0 rip=10.0.8.4
+container[0] r1z1 10.0.4.1:6201/d1 w=100.0 rip=10.0.8.1
+container[1] r1z2 10.0.4.2:6201/d1 w=100.0 rip=10.0.8.2
+container[2] r1z3 10.0.4.3:6201/d1 w=100.0 rip=10.0.8.3
+container[3] r1z4 10.0.4.4:6201/d1 w=100.0 rip=10.0.8.4
+container[4] r1z1 10.0.4.1:6201/d2 w=100.0 rip=10.0.8.1
+container[5] r1z1 10.0.4.1:6201/d1 w=0.0 rip=10.0.8.1
+container[6] r1z2 10.0.4.2:6201/d2 w=100.0 rip=10.0.8.2
+container[7] r1z2 10.0.4.2:6201/d1 w=0.0 rip=10.0.8.2
+container[8] r1z3 10.0.4.3:6201/d2 w=100.0 rip=10.0.8.3
+container[9] r1z3 10.0.4.3:6201/d1 w=0.0 rip=10.0.8.3
+container[10] r1z4 10.0.4.4:6201/d2 w=100.0 rip=10.0.8.4
+container[11] r1z4 10.0.4.4:6201/d1 w=0.0 rip=10.0.8.4
+object[0] r1z1 10.0.4.1:6210/d1 w=100.0 rip=10.0.8.1
+object[1] r1z1 10.0.4.1:6211/d2 w=100.0 rip=10.0.8.1
+object[2] r1z1 10.0.4.1:6212/d3 w=100.0 rip=10.0.8.1
+object[3] r1z2 10.0.4.2:6210/d1 w=100.0 rip=10.0.8.2
+object[4] r1z2 10.0.4.2:6211/d2 w=100.0 rip=10.0.8.2
+object[5] r1z2 10.0.4.2:6212/d3 w=100.0 rip=10.0.8.2
+object[6] r2z1 10.0.4.3:6210/d1 w=100.0 rip=10.0.8.3
+object[7] r2z1 10.0.4.3:6211/d2 w=100.0 rip=10.0.8.3
+object[8] r2z1 10.0.4.3:6212/d3 w=100.0 rip=10.0.8.3
+object[9] r2z2 10.0.4.4:6210/d1 w=100.0 rip=10.0.8.4
+object[10] r2z2 10.0.4.4:6211/d2 w=100.0 rip=10.0.8.4
+object[11] r2z2 10.0.4.4:6212/d3 w=100.0 rip=10.0.8.4
+object[12] r1z1 10.0.4.1:6210/d1 w=0.0 rip=10.0.8.1
+object[13] r1z1 10.0.4.1:6211/d2 w=100.0 rip=10.0.8.1
+object[14] r1z1 10.0.4.1:6212/d3 w=100.0 rip=10.0.8.1
+object[15] r1z2 10.0.4.2:6210/d1 w=0.0 rip=10.0.8.2
+object[16] r1z2 10.0.4.2:6211/d2 w=100.0 rip=10.0.8.2
+object[17] r1z2 10.0.4.2:6212/d3 w=100.0 rip=10.0.8.2
+object[18] r2z1 10.0.4.3:6210/d1 w=0.0 rip=10.0.8.3
+object[19] r2z1 10.0.4.3:6211/d2 w=100.0 rip=10.0.8.3
+object[20] r2z1 10.0.4.3:6212/d3 w=100.0 rip=10.0.8.3
+object[21] r2z2 10.0.4.4:6210/d1 w=0.0 rip=10.0.8.4
+object[22] r2z2 10.0.4.4:6211/d2 w=100.0 rip=10.0.8.4
+object[23] r2z2 10.0.4.4:6212/d3 w=100.0 rip=10.0.8.4
+=== ROLLBACK from /root/w4-ring-backup-20260805T113908Z ===
+account.ring.gz
+account.ring.gz.builder.json
+account-server.conf
+build_rings.sh
+container.ring.gz
+container.ring.gz.builder.json
+container-server.conf
+object-1.ring.gz
+object-1.ring.gz.builder.json
+object.ring.gz
+object.ring.gz.builder.json
+object-server.conf
+=== AFTER ROLLBACK ===
+account n 4 devs ['d1'] ports [6202]
+ sha 4e7c9f3b4c2d82d4
+container n 4 devs ['d1'] ports [6201]
+ sha e21508f2982f798b
+object n 12 devs ['d1', 'd2', 'd3'] ports [6210, 6211, 6212]
+ sha 9cb2ba88d3c4f613
+object-1 n 12 devs ['d1', 'd2', 'd3'] ports [6210, 6211, 6212]
+ sha 9cb2ba88d3c4f613
+PEER 10.0.4.2 account/object sha: 4e7c9f3b4c2d82d44427dc519ce5b22fb33988b0d80c1bb097dd40c519908eab  /etc/swift/account.ring.gz 9cb2ba88d3c4f61336abe060b2050448c7cac55fd58a2f50cd966d65bd21f9ad  /etc/swift/object.ring.gz 
+PEER 10.0.4.3 account/object sha: 4e7c9f3b4c2d82d44427dc519ce5b22fb33988b0d80c1bb097dd40c519908eab  /etc/swift/account.ring.gz 9cb2ba88d3c4f61336abe060b2050448c7cac55fd58a2f50cd966d65bd21f9ad  /etc/swift/object.ring.gz 
+PEER 10.0.4.4 account/object sha: 4e7c9f3b4c2d82d44427dc519ce5b22fb33988b0d80c1bb097dd40c519908eab  /etc/swift/account.ring.gz 9cb2ba88d3c4f61336abe060b2050448c7cac55fd58a2f50cd966d65bd21f9ad  /etc/swift/object.ring.gz 

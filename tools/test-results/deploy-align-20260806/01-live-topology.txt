@@ -1,0 +1,38 @@
+=== object listeners ===
+LISTEN 0      4000         0.0.0.0:8085       0.0.0.0:*    users:(("haproxy",pid=4180537,fd=8))                                                                                                                                                                                                    
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=1487364,fd=5))                                                                                                                                                                                            
+LISTEN 0      128          0.0.0.0:6212       0.0.0.0:*    users:(("swift-object-se",pid=1487373,fd=5))                                                                                                                                                                                            
+LISTEN 0      128          0.0.0.0:6211       0.0.0.0:*    users:(("swift-object-se",pid=1487372,fd=5))                                                                                                                                                                                            
+LISTEN 0      128          0.0.0.0:6202       0.0.0.0:*    users:(("swift-account-s",pid=258113,fd=5))                                                                                                                                                                                             
+LISTEN 0      128          0.0.0.0:6201       0.0.0.0:*    users:(("swift-container",pid=258114,fd=5))                                                                                                                                                                                             
+LISTEN 0      65535      127.0.0.1:8175       0.0.0.0:*    users:(("uwsgi",pid=58100,fd=3),("uwsgi",pid=58099,fd=3),("uwsgi",pid=58098,fd=3),("uwsgi",pid=58097,fd=3),("uwsgi",pid=58096,fd=3),("uwsgi",pid=58095,fd=3),("uwsgi",pid=58094,fd=3),("uwsgi",pid=58093,fd=3),("uwsgi",pid=58090,fd=3))
+LISTEN 0      65535        0.0.0.0:5001       0.0.0.0:*    users:(("uwsgi",pid=58101,fd=4),("uwsgi",pid=58090,fd=4))                                                                                                                                                                               
+=== rings ===
+-rw-r--r--. 1 root root 413 Aug  5 11:41 /etc/swift/account.ring.gz
+-rw-r--r--. 1 root root 412 Aug  5 11:41 /etc/swift/container.ring.gz
+-rw-r--r--. 1 root root 536 Aug  5 11:41 /etc/swift/object-1.ring.gz
+-rw-r--r--. 1 root root 536 Aug  5 11:41 /etc/swift/object.ring.gz
+=== object ring devices ===
+--- /etc/swift/object-1.ring.gz ---
+--- /etc/swift/object.ring.gz ---
+=== account/container rings ===
+--- /etc/swift/account.ring.gz ---
+--- /etc/swift/container.ring.gz ---
+=== object-server conf snippets ===
+bind_ip = 0.0.0.0
+bind_ip = 0.0.0.0
+bind_port = 6210
+servers_per_port = 1
+devices = /srv/node
+mount_check = false
+devices = /srv/node
+mount_check = false
+13:bind_port = 6210
+14:servers_per_port = 1
+=== devices ===
+total 0
+drwxr-xr-x.  5 root root  36 Aug  1 11:21 .
+drwxr-xr-x.  3 root root  18 Aug  1 11:21 ..
+drwxr-xr-x. 11 root root 159 Aug  4 15:48 d1
+drwxr-xr-x. 10 root root 140 Aug  5 10:05 d2
+drwxr-xr-x. 10 root root 140 Aug  5 10:05 d3

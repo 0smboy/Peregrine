@@ -1,0 +1,3 @@
+host_ips ['10.0.0.4', '10.0.4.4', '10.0.8.4', '169.58.108.121', '2a02:c207:2347:9566::1']
+discovered_local_object_ports [6200]
+NOTE Contabo rings are single-port-per-node; servers_per_port=1 would bind {6200}

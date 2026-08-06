@@ -16,12 +16,14 @@
 //! CLI and ops tooling, ported from `swift/cli/`. Each tool is a small
 //! consumer of the finished swift-core / swift-ring crates.
 
+pub mod auditor_daemon;
 pub mod daemon;
 pub mod dispersion;
 pub mod drive_audit;
 pub mod info;
 pub mod recon;
 pub mod ringsim;
+pub mod space_metrics;
 
 use swift_core::hashing::HashPathConfig;
 use swift_ring::{Ring, RingError};

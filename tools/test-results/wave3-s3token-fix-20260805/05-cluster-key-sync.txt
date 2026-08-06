@@ -1,0 +1,62 @@
+===== swift1 =====
+swift1
+CRED
+4a9d93a4bad164f7f7b47f78243ad976  /etc/keystone/credential-keys/0
+a89c0061e7325e75e96da1a26b066d41  /etc/keystone/credential-keys/1
+FERNET
+05b99f78fc004f72b0a3d6a8fcfd8853  /etc/keystone/fernet-keys/0
+068605c415847b65da79c8579ba9d252  /etc/keystone/fernet-keys/1
+LISTEN 0      65535        0.0.0.0:35358      0.0.0.0:*    users:(("uwsgi",pid=4153469,fd=4),("uwsgi",pid=4153435,fd=4))                                                                                                                                                                                             
+LISTEN 0      65535        0.0.0.0:5001       0.0.0.0:*    users:(("uwsgi",pid=4153459,fd=4),("uwsgi",pid=4153439,fd=4))                                                                                                                                                                                             
+keystone-admin                   RUNNING   pid 4153435, uptime 0:33:40
+keystone-public                  RUNNING   pid 4153439, uptime 0:33:40
+/etc/swift/proxy-server.conf
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+[filter:s3api]
+[filter:s3token]
+auth_uri = http://127.0.0.1:5001
+===== swift2 =====
+swift2
+CRED
+4a9d93a4bad164f7f7b47f78243ad976  /etc/keystone/credential-keys/0
+a89c0061e7325e75e96da1a26b066d41  /etc/keystone/credential-keys/1
+FERNET
+05b99f78fc004f72b0a3d6a8fcfd8853  /etc/keystone/fernet-keys/0
+068605c415847b65da79c8579ba9d252  /etc/keystone/fernet-keys/1
+LISTEN 0      65535        0.0.0.0:35358      0.0.0.0:*    users:(("uwsgi",pid=3888029,fd=4),("uwsgi",pid=3887822,fd=4))                                                                                                                                                                                             
+LISTEN 0      65535        0.0.0.0:5001       0.0.0.0:*    users:(("uwsgi",pid=3887966,fd=4),("uwsgi",pid=3887843,fd=4))                                                                                                                                                                                             
+keystone-admin                   RUNNING   pid 3887822, uptime 0:33:31
+keystone-public                  RUNNING   pid 3887843, uptime 0:33:31
+/etc/swift/proxy-server.conf
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+[filter:s3api]
+[filter:s3token]
+auth_uri = http://127.0.0.1:5001
+===== swift3 =====
+swift3
+CRED
+4a9d93a4bad164f7f7b47f78243ad976  /etc/keystone/credential-keys/0
+a89c0061e7325e75e96da1a26b066d41  /etc/keystone/credential-keys/1
+FERNET
+05b99f78fc004f72b0a3d6a8fcfd8853  /etc/keystone/fernet-keys/0
+068605c415847b65da79c8579ba9d252  /etc/keystone/fernet-keys/1
+LISTEN 0      65535        0.0.0.0:35358      0.0.0.0:*    users:(("uwsgi",pid=8407,fd=4),("uwsgi",pid=8379,fd=4))                                                                                                                                                                          
+LISTEN 0      65535        0.0.0.0:5001       0.0.0.0:*    users:(("uwsgi",pid=8398,fd=4),("uwsgi",pid=8380,fd=4))                                                                                                                                                                          
+keystone-admin                   RUNNING   pid 8379, uptime 0:33:22
+keystone-public                  RUNNING   pid 8380, uptime 0:33:22
+/etc/swift/proxy-server.conf
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+[filter:s3api]
+[filter:s3token]
+auth_uri = http://127.0.0.1:5001
+===== swift4 =====
+swift4
+CRED
+no-cred-keys
+FERNET
+no-fernet
+/etc/swift/proxy-server.conf
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+[filter:s3api]
+[filter:s3token]
+auth_uri = http://10.0.0.1:5001

@@ -1,0 +1,19 @@
+=== du top ===
+47G	/srv/node/d1/objects
+13M	/srv/node/d1/objects-1
+45G	/srv/node/d2/objects
+44G	/srv/node/d3/objects
+=== sample object dirs composition (first 2000 leaf dirs under d1/objects) ===
+sampled_leaf_dirs=8000 only_ts=230 only_data=7770 both=0 other=0
+sample_data_bytes=1513852951 sample_ts_bytes=0
+ts_mtime_min_age_s=318110 ts_mtime_max_age_s=7002 ts_median_age_s=315802
+hash_marker_dirs_seen_approx_walk_limited
+=== replicator interval ===
+reclaim_age = 604800
+reclaim_age = 604800
+interval = 30
+interval = 300
+interval = 30
+interval = 300
+reclaim_age = 604800
+interval = 30

@@ -1,0 +1,26 @@
+=== plan-expand.json ===
+tasks=50 risks={'host_reconfigure': 9}
+wipe_patterns=NONE
+disk_wipe_risk=False
+tls_related_tasks=6
+  - ensure haproxy TLS staging dir on controller
+  - install operator-provided HAProxy TLS PEM
+  - generate self-signed HAProxy TLS material on first LB host
+  - fetch self-signed PEM to controller staging
+  - distribute self-signed PEM to all HAProxy hosts
+  - refuse https without TLS material path
+expand_related=['rust_expand_mode:enable ring expand mode for this apply']
+
+=== plan-swift.json ===
+tasks=136 risks={'host_reconfigure': 64}
+wipe_patterns=NONE
+disk_wipe_risk=False
+tls_related_tasks=6
+  - ensure haproxy TLS staging dir on controller
+  - install operator-provided HAProxy TLS PEM
+  - generate self-signed HAProxy TLS material on first LB host
+  - fetch self-signed PEM to controller staging
+  - distribute self-signed PEM to all HAProxy hosts
+  - refuse https without TLS material path
+expand_related=[]
+

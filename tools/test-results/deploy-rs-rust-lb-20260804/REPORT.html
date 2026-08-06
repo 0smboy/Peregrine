@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>B3 · deploy-rs Rust LB Contabo 门禁</title>
+<style>
+  body{font:15px/1.45 system-ui,sans-serif;max-width:920px;margin:2rem auto;padding:0 1rem;color:#1a1a1a}
+  h1{font-size:1.4rem} table{border-collapse:collapse;width:100%;margin:1rem 0}
+  th,td{border:1px solid #ccc;padding:.45rem .6rem;text-align:left;vertical-align:top}
+  th{background:#f3f3f3} .ok{color:#0a6} .warn{color:#a60} .bad{color:#a00}
+</style>
+</head>
+<body>
+<h1>B3：Contabo <code>swift-deploy apply</code>（stack=rust + Keepalived VIP + roundrobin）</h1>
+<p>按 <code>USER-METHOD-PLAN.md</code> 阶段 2 硬门禁。禁止 wipe <code>/srv/node</code>；本轮 risks 仅 <code>HostReconfigure</code>。</p>
+
+<h2>1. 需求 / 目标 / 现状</h2>
+<table>
+<tr><th>用户需求</th><td>用 deploy-rs 收敛合格 Keepalived+HAProxy 四节点 Rust 集群，再开阶段 2</td></tr>
+<tr><th>完美对齐</th><td>VIP auth；同 token 四 proxy；PUT/GET；≥40 请求四后端有流量；failover 后 IO 通</td></tr>
+<tr><th>现在到哪了</th><td class="ok"><strong>门禁 PASS</strong>（见下表）</td></tr>
+</table>
+
+<h2>2. 动作 / 环境 / 效果</h2>
+<table>
+<tr><th>动作</th><th>环境</th><th>为什么</th><th>效果</th></tr>
+<tr><td>关全部 SAIO</td><td>swift2/3</td><td>阶段 2 前清场</td><td class="ok">:8090/:8081 停</td></tr>
+<tr><td>备份 haproxy/keepalived/swift</td><td>四节点</td><td>可回滚</td><td class="ok"><code>backup/*-etc.tgz</code></td></tr>
+<tr><td>生成 workspace + 保留 Contabo hash</td><td><code>contabo-rust-lb</code></td><td>避免路径哈希漂移</td><td class="ok">prefix/suffix 保持 contabo-*</td></tr>
+<tr><td>修 preflight <code>ip link show --</code></td><td>deploy-rs</td><td>Contabo iproute2 对 <code>--</code> 失败</td><td class="ok">改 <code>/sys/class/net</code> 探测</td></tr>
+<tr><td>补 payload EC .so</td><td>bundle-rust files/lib</td><td>缺 <code>liberasurecode_rs_vand.so</code></td><td class="ok">补齐后 apply 收敛</td></tr>
+<tr><td><code>swift-deploy apply</code></td><td>digest fd1cd802…；`--allow-host-reconfigure`；无 disk-wipe</td><td>门禁真理源</td><td class="ok">四节点 proxy/object/haproxy/keepalived active；HAProxy <code>bind *:8085</code> + roundrobin</td></tr>
+</table>
+
+<h2>3. 冒烟结果</h2>
+<table>
+<tr><th>项</th><th>结果</th></tr>
+<tr><td>VIP auth <code>10.0.0.10:8085</code></td><td class="ok">200；HMAC token</td></tr>
+<tr><td>同 token → 四 proxy :8080</td><td class="ok">204/204/204/204</td></tr>
+<tr><td>VIP PUT/GET</td><td class="ok">201/201；body 匹配</td></tr>
+<tr><td>≥40 请求四后端流量</td><td class="ok">48 GET → stot 14/14/13/13（proxy1–4 全 UP）</td></tr>
+<tr><td>Failover（停 MASTER keepalived+haproxy）</td><td class="ok">VIP 1→2；health 200；auth 200</td></tr>
+</table>
+
+<h2>4. 剩余 / 下一步</h2>
+<table>
+<tr><th>剩余</th><th>规划</th></tr>
+<tr><td>阶段 2 小文件性能 + VIP/DIRECT 分表 + 更长 soak</td><td>门禁已绿，可开；长 soak 另开 HTML</td></tr>
+<tr><td>apply 日志缓冲导致本地 tee 空文件</td><td>已知运维噪音；以集群态+冒烟为准</td></tr>
+<tr><td>VIP 停在 swift2（nopreempt）</td><td>可接受；恢复 keepalived 后不抢回</td></tr>
+</table>
+
+<p>证据：<code>smoke.log</code>、<code>failover.log</code>、<code>haproxy-stats-after.csv</code>、<code>plan4.log</code>、<code>backup/</code></p>
+</body>
+</html>

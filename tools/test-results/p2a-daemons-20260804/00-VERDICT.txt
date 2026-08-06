@@ -1,0 +1,7 @@
+P2a VERDICT: GREEN
+date: 2026-08-04
+suite: 21/21
+func: 54/54
+units: active x4 nodes (expirer, reaper, container-updater, container-reconciler)
+evidence: tools/test-results/p2a-daemons-20260804/
+html: P2A-REPORT.html

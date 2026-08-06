@@ -1,0 +1,12 @@
+PASS CreateBucket st=200
+PASS CreateMultipartUpload st=200 body=b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><B'
+PASS UploadIdPresent 000000000000000018c920e309ef9610
+PASS UploadPart1 st=200 etag="72ec8cdb461ba6ff85f014d5c922a232"
+PASS UploadPart2 st=200 etag="a4e617849520de2ea5129c20c3aaf6cb"
+PASS UploadPart3 st=200 etag="4f570beb7eff9da7692a892fe80f566a"
+PASS CompleteMultipartUpload st=200 body=b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><L'
+PASS GetAssembledObject st=200 len=655360 expect=655360
+PASS ListMPU_after_complete st=200
+PASS MultiDelete st=200 body=b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"'
+PASS DeleteBucket st=204
+SUMMARY pass=11 fail=0

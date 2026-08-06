@@ -1,0 +1,100 @@
+==== VIP INFO ====
+['account_quotas', 'bulk_delete', 'container_quotas', 'dlo', 'formpost', 'slo', 'staticweb', 'swift', 'symlink', 'tempauth', 'tempurl', 'versioned_writes']
+slo {'max_get_time': 86400, 'max_manifest_segments': 1000, 'max_manifest_size': 8388608, 'min_segment_size': 1}
+tempauth {'account_acls': True}
+==== FUNC SUITE ====
+===================================================================
+FUNCTIONAL SUITE  label=vip-p1c-core2  endpoint=http://10.0.0.10:8085  2026-08-04T14:30:48Z
+===================================================================
+  PASS  auth: bad key -> 401
+  PASS  auth: token acquired (test:tester)
+  PASS  account: HEAD 204
+  PASS  account: X-Account-Container-Count present
+  PASS  container: PUT 201
+  PASS  container: idempotent PUT 202
+  PASS  container: HEAD 204
+  PASS  container: POST meta 204
+  PASS  container: meta persisted
+  PASS  container: GET empty 204
+  PASS  object: PUT 201
+  PASS  object: GET body
+  PASS  object: etag matches md5
+  PASS  object: content-type
+  PASS  object: custom meta
+  PASS  object: HEAD 200
+  PASS  object: POST meta 202
+  PASS  object: fast-POST meta updated
+  PASS  object: PUT wrong-etag 422
+  PASS  range: bytes=0-3
+  PASS  range: suffix bytes=-3
+  PASS  range: 206 status
+  PASS  range: unsatisfiable 416
+  PASS  range: multipart/byteranges
+  PASS  range: multipart 2nd part
+  PASS  cond: If-None-Match * -> 304
+  PASS  cond: If-Match wrong -> 412
+  PASS  cond: If-Match right -> 200
+  PASS  large: PUT 4MB 201
+  PASS  large: 4MB md5 round-trip
+  PASS  SLO: manifest PUT 201
+  PASS  SLO: reassembled 3MB md5
+  PASS  SLO: manifest-get is json
+  PASS  DLO: concatenation md5 == SLO segs
+  PASS  copy: X-Copy-From 201
+  PASS  copy: copied body
+  PASS  expiry: PUT with X-Delete-After 201
+  PASS  expiry: X-Delete-At set
+  PASS  name: unicode+space PUT 201
+  PASS  name: unicode GET body
+  PASS  listing: json has bytes
+  PASS  listing: prefix filter
+  PASS  listing: limit=1 returns 1
+  PASS  EC: container create (policy ec-2-1) 201
+  PASS  EC: policy header
+  PASS  EC: PUT 3MB 201
+  PASS  EC: 5MB md5 round-trip
+  PASS  EC: ranged GET 206
+  PASS  EC: ranged GET length=1024
+  PASS  sec: no-token account -> 401
+  PASS  sec: bad-token -> 401
+  PASS  sec: GET missing object -> 404
+  PASS  sec: DELETE non-empty container -> 409
+  PASS  sec: traversal name literal 201
+
+-------------------------------------------------------------------
+RESULT  label=vip-p1c-core2  PASS=54  FAIL=0
+-------------------------------------------------------------------
+==== P1C SUITE ====
+===================================================================
+P1c DEBT SUITE  label=vip-p1c2  endpoint=http://10.0.0.10:8085  2026-08-04T14:31:02Z
+===================================================================
+  PASS  auth: token acquired
+  PASS  container: PUT 201
+  PASS  nested: put leaf a 201
+  PASS  nested: put leaf b 201
+  PASS  nested: put leaf c 201
+  PASS  nested: inner SLO PUT 201
+  PASS  nested: inner HEAD Content-Length is aggregate
+  PASS  nested: outer SLO PUT 201
+  PASS  nested: reassembled body
+  PASS  nested: Content-Length header
+  PASS  range: nested bytes=3-4
+  PASS  range: status 206
+  PASS  copy-slo: multipart-manifest=get 201
+  PASS  copy-slo: reassembled equals source
+  PASS  copy-slo: raw manifest has path
+  PASS  copy-slo: raw manifest has etag
+  PASS  dlo: put seg0 201
+  PASS  dlo: put seg1 201
+  PASS  dlo: put manifest 201
+  PASS  dlo: reassembled
+  PASS  copy-dlo: multipart-manifest=get 201
+  PASS  copy-dlo: reassembled equals source
+  PASS  copy-dlo: X-Object-Manifest present
+  PASS  acl: put private obj 201
+  PASS  acl: set .r:* 204
+  PASS  acl: anonymous GET via VIP (8/8)
+  PASS  acl: revoke read 204
+  PASS  acl: revoke visible via VIP (6/6)
+===================================================================
+RESULT  label=vip-p1c2  PASS=28  FAIL=0

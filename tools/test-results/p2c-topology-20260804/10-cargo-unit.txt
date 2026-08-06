@@ -1,0 +1,29 @@
+=== cargo unit 2026-08-04T15:11:00Z ===
+   Compiling swift-http v0.1.0 (/root/work/swift-rust/crates/swift-http)
+   Compiling swift-db v0.1.0 (/root/work/swift-rust/crates/swift-db)
+   Compiling swift-diskfile v0.1.0 (/root/work/swift-rust/crates/swift-diskfile)
+   Compiling swift-container-server v0.1.0 (/root/work/swift-rust/crates/swift-container-server)
+   Compiling swift-object-server v0.1.0 (/root/work/swift-rust/crates/swift-object-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.75s
+     Running unittests src/lib.rs (target/debug/deps/swift_object_server-9f142b6e7994b3d9)
+
+running 8 tests
+test servers_per_port::tests::json_shape ... ok
+test servers_per_port::tests::ports_for_local_devs_filters_by_ip ... ok
+test servers_per_port::tests::listen_ports_fallback_when_empty ... ok
+test servers_per_port::tests::servers_per_port_ignores_workers ... ok
+test servers_per_port::tests::workers_times_max_clients_clamps_at_128 ... ok
+test servers_per_port::tests::bind_acceptors_reuseport_when_n_gt_1 ... ok
+test servers_per_port::tests::discover_reads_ports_from_ring_files ... ok
+test servers_per_port::tests::servers_per_port_one_does_not_collapse_threads ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 49 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.45s
+     Running unittests src/lib.rs (target/debug/deps/swift_object_server-9f142b6e7994b3d9)
+
+running 1 test
+test localdev::tests::ips_for_ring_lookup_exact_vs_wildcard ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 56 filtered out; finished in 0.00s
+

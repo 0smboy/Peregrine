@@ -1,0 +1,19 @@
+warning: failed to auto-clean cache data
+
+failed to clean entries from the global cache
+
+Caused by:
+  failed to remove file `/Users/oboy/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-macro-0.3.31/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.29s
+     Running unittests src/lib.rs (target/debug/deps/swift_middleware-17b980ba1c9b1d22)
+
+running 3 tests
+test s3token::tests::access_key_parse ... ok
+test s3token::tests::passthrough_without_s3_auth ... ok
+test s3token::tests::stamps_headers_on_exchange ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 352 filtered out; finished in 0.01s
+

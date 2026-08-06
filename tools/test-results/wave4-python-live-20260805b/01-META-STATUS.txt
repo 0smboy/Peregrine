@@ -1,0 +1,5 @@
+W0 META probe @ 2026-08-05T10:08:04Z
+**Verdict:** **LAB META_CLEAN (listing + zombie rows)** · **not** PRODUCTION-GO-LIVE. Residuals below are honest, not GREENwashed.
+W0′ listing/zombie/disk-hash stop-line **met for LAB** (`META_CLEAN`). Label remains **not PRODUCTION**. If future waves reintroduce ghosts, re-run `--ghosts-only`.
+---
+{'date': '2026-08-05', 'verdict': 'LAB_META_CLEAN', 'root_cause': 'hash_path missing slash after prefix in wave0-ab-reclaim-orphans.py', 'api_listing': 0, 'live_object_rows': 0, 'disk_hash_dirs': 0, 'crud_smoke': {'put_c': 201, 'put_o': 201, 'get_o': 200, 'del_o': 204, 'del_c': 204}, 'production_claim': False, 'label': 'not PRODUCTION-GO-LIVE', 'evidence': '/Users/oboy/Downloads/Peregrine/tools/test-results/w0-meta-repair-20260805'}

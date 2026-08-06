@@ -1,0 +1,12 @@
+# Sample third node — multi-region drill (region 2 / zone 1).
+# Contabo mapping (labels only, not WAN): swift3 ≈ r2z1.
+management_network_address: 10.0.0.13
+storage_network_address: 10.0.0.13
+replication_network_address: 10.0.0.13
+business_network_address: 10.0.0.13
+disk_type: hdd
+custom_disks: []
+region: 2
+zone: 1
+swift_devices:
+  - d1

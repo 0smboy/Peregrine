@@ -178,10 +178,18 @@
     {
       "service": "object",
       "knob": "servers_per_port",
-      "rust_parsed": false,
-      "rust_behavior": "not parsed / not deployable as Python Paste knob",
-      "deploy_template_likely": false,
-      "fairness_class": "unsupported"
+      "rust_parsed": true,
+      "rust_behavior": "P2c: discovers local object-ring ports; binds N REUSEPORT acceptors/port into shared thread pool; workers ignored for acceptor count. NOT Python prefork I/O isolation. Tool: swift-effective-concurrency. See WORKERS-SEMANTICS.md.",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config-with-semantic-mapping"
+    },
+    {
+      "service": "object",
+      "knob": "ring_ip",
+      "rust_parsed": true,
+      "rust_behavior": "P2c: optional override for ring device IP match when bind_ip is wildcard (Python BindPortsCache ring_ip)",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
     },
     {
       "service": "object",

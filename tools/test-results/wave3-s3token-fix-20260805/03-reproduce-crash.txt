@@ -1,0 +1,166 @@
+using access 1371713510fb ...
+body_len 337
+valid status 200 body b'{"token": {"methods": ["ec2credential"], "user": {"domain": {"id": "default", "name": "Default"}, "id": "a174f157c6a04a76b7f7a5d612dc81c9", "name": "tester", "password_expires_at": null}, "audit_ids":'
+bogus HTTPError 404 b'{"error":{"code":404,"message":"Could not find credential: e4d6f585ca63463e5de611e10fc69498f83787445c6c8a6feffda892fbb0695b.","title":"Not Found"}}\n'
+===NEW LOG LINES===
+2026-08-05 10:15:08.484 4155671 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 1245, in read
+2026-08-05 10:15:08.484 4155671 ERROR oslo_db.sqlalchemy.engines     first_packet = self.connection._read_packet()
+2026-08-05 10:15:08.484 4155671 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 772, in _read_packet
+2026-08-05 10:15:08.484 4155671 ERROR oslo_db.sqlalchemy.engines     packet_header = self._read_bytes(4)
+2026-08-05 10:15:08.484 4155671 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 826, in _read_bytes
+2026-08-05 10:15:08.484 4155671 ERROR oslo_db.sqlalchemy.engines     raise err.OperationalError(
+2026-08-05 10:15:08.484 4155671 ERROR oslo_db.sqlalchemy.engines oslo_db.exception.DBConnectionError: (pymysql.err.OperationalError) (2013, 'Lost connection to MySQL server during query')
+2026-08-05 10:15:08.484 4155671 ERROR oslo_db.sqlalchemy.engines [SQL: SELECT 1]
+2026-08-05 10:15:08.484 4155671 ERROR oslo_db.sqlalchemy.engines (Background on this error at: https://sqlalche.me/e/14/e3q8)
+2026-08-05 10:15:08.484 4155671 ERROR oslo_db.sqlalchemy.engines [00m
+[pid: 4155671|app: 0|req: 44/344] 127.0.0.1 () {34 vars in 408 bytes} [Wed Aug  5 10:15:08 2026] POST /v3/s3tokens => generated 1740 bytes in 428 msecs (HTTP/1.1 200) 4 headers in 159 bytes (1 switches on core 1)
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines [None req-6be5538c-9552-477f-9c67-41a7c64a6593 - - - - - -] Database connection was found disconnected; reconnecting: oslo_db.exception.DBConnectionError: (pymysql.err.OperationalError) (2013, 'Lost connection to MySQL server during query')
+[SQL: SELECT 1]
+(Background on this error at: https://sqlalche.me/e/14/e3q8)
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines Traceback (most recent call last):
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/engine/base.py", line 1910, in _execute_context
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     self.dialect.do_execute(
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/engine/default.py", line 736, in do_execute
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     cursor.execute(statement, parameters)
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/cursors.py", line 159, in execute
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     result = self._query(query)
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/cursors.py", line 330, in _query
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     conn.query(q)
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 582, in query
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 847, in _read_query_result
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     result.read()
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 1245, in read
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     first_packet = self.connection._read_packet()
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 772, in _read_packet
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     packet_header = self._read_bytes(4)
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 826, in _read_bytes
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     raise err.OperationalError(
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines pymysql.err.OperationalError: (2013, 'Lost connection to MySQL server during query')
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines 
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines The above exception was the direct cause of the following exception:
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines 
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines Traceback (most recent call last):
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib/python3.9/site-packages/oslo_db/sqlalchemy/engines.py", line 81, in _connect_ping_listener
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     connection.scalar(select(1))
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/engine/base.py", line 1267, in scalar
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     return self.execute(object_, *multiparams, **params).scalar()
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/engine/base.py", line 1385, in execute
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     return meth(self, multiparams, params, _EMPTY_EXECUTION_OPTS)
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/sql/elements.py", line 334, in _execute_on_connection
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     return connection._execute_clauseelement(
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/engine/base.py", line 1577, in _execute_clauseelement
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     ret = self._execute_context(
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/engine/base.py", line 1953, in _execute_context
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     self._handle_dbapi_exception(
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/engine/base.py", line 2132, in _handle_dbapi_exception
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     util.raise_(newraise, with_traceback=exc_info[2], from_=e)
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/util/compat.py", line 211, in raise_
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     raise exception
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/engine/base.py", line 1910, in _execute_context
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     self.dialect.do_execute(
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/lib64/python3.9/site-packages/sqlalchemy/engine/default.py", line 736, in do_execute
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     cursor.execute(statement, parameters)
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/cursors.py", line 159, in execute
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     result = self._query(query)
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/cursors.py", line 330, in _query
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     conn.query(q)
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 582, in query
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 847, in _read_query_result
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     result.read()
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 1245, in read
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     first_packet = self.connection._read_packet()
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 772, in _read_packet
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     packet_header = self._read_bytes(4)
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines   File "/usr/local/lib/python3.9/site-packages/pymysql/connections.py", line 826, in _read_bytes
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines     raise err.OperationalError(
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines oslo_db.exception.DBConnectionError: (pymysql.err.OperationalError) (2013, 'Lost connection to MySQL server during query')
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines [SQL: SELECT 1]
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines (Background on this error at: https://sqlalche.me/e/14/e3q8)
+2026-08-05 10:15:08.870 4155419 ERROR oslo_db.sqlalchemy.engines [00m
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application [None req-6be5538c-9552-477f-9c67-41a7c64a6593 - - - - - -] Could not find credential: e4d6f585ca63463e5de611e10fc69498f83787445c6c8a6feffda892fbb0695b.: keystone.exception.CredentialNotFound: Could not find credential: e4d6f585ca63463e5de611e10fc69498f83787445c6c8a6feffda892fbb0695b.
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application Traceback (most recent call last):
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/flask/app.py", line 870, in full_dispatch_request
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     rv = self.dispatch_request()
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/flask/app.py", line 855, in dispatch_request
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/flask_restful/__init__.py", line 467, in wrapper
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     resp = resource(*args, **kwargs)
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/flask/views.py", line 110, in view
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     return current_app.ensure_sync(self.dispatch_request)(**kwargs)  # type: ignore[no-any-return]
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/flask_restful/__init__.py", line 582, in dispatch_request
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     resp = meth(*args, **kwargs)
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/keystone/server/flask/common.py", line 1055, in wrapper
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     return f(*args, **kwargs)
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/keystone/api/s3tokens.py", line 99, in post
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     token = self.handle_authenticate()
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/keystone/api/_shared/EC2_S3_Resource.py", line 101, in handle_authenticate
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     cred = PROVIDERS.credential_api.get_credential(credential_id)
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/keystone/common/manager.py", line 110, in wrapped
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     __ret_val = __f(*args, **kwargs)
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/keystone/credential/core.py", line 119, in get_credential
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     credential = self._get_credential(credential_id)
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "<decorator-gen-21>", line 2, in _get_credential
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/dogpile/cache/region.py", line 1632, in get_or_create_for_user_func
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     return self.get_or_create(
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/dogpile/cache/region.py", line 1092, in get_or_create
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     with Lock(
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/dogpile/lock.py", line 185, in __enter__
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     return self._enter()
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/dogpile/lock.py", line 94, in _enter
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     generated = self._enter_create(value, createdtime)
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/dogpile/lock.py", line 178, in _enter_create
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     return self.creator()
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/dogpile/cache/region.py", line 1046, in gen_value
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     created_value = creator(
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/keystone/credential/core.py", line 124, in _get_credential
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     return self.driver.get_credential(credential_id)
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/keystone/credential/backends/sql.py", line 88, in get_credential
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     return self._get_credential(session, credential_id).to_dict()
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/keystone/credential/backends/sql.py", line 83, in _get_credential
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     raise exception.CredentialNotFound(credential_id=credential_id)
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application keystone.exception.CredentialNotFound: Could not find credential: e4d6f585ca63463e5de611e10fc69498f83787445c6c8a6feffda892fbb0695b.
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application [00m
+[pid: 4155419|app: 0|req: 41/345] 127.0.0.1 () {34 vars in 408 bytes} [Wed Aug  5 10:15:08 2026] POST /v3/s3tokens => generated 148 bytes in 840 msecs (HTTP/1.1 404) 4 headers in 165 bytes (1 switches on core 0)
+===WORKER DEATHS RECENT===
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/flask/app.py", line 855, in dispatch_request
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/flask_restful/__init__.py", line 467, in wrapper
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     resp = resource(*args, **kwargs)
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/flask/views.py", line 110, in view
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     return current_app.ensure_sync(self.dispatch_request)(**kwargs)  # type: ignore[no-any-return]
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/flask_restful/__init__.py", line 582, in dispatch_request
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     resp = meth(*args, **kwargs)
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/keystone/server/flask/common.py", line 1055, in wrapper
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     return f(*args, **kwargs)
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/keystone/api/s3tokens.py", line 99, in post
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     token = self.handle_authenticate()
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/keystone/api/_shared/EC2_S3_Resource.py", line 101, in handle_authenticate
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     cred = PROVIDERS.credential_api.get_credential(credential_id)
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/keystone/common/manager.py", line 110, in wrapped
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     __ret_val = __f(*args, **kwargs)
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/keystone/credential/core.py", line 119, in get_credential
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     credential = self._get_credential(credential_id)
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "<decorator-gen-21>", line 2, in _get_credential
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/dogpile/cache/region.py", line 1632, in get_or_create_for_user_func
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     return self.get_or_create(
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/dogpile/cache/region.py", line 1092, in get_or_create
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     with Lock(
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/dogpile/lock.py", line 185, in __enter__
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     return self._enter()
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/dogpile/lock.py", line 94, in _enter
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     generated = self._enter_create(value, createdtime)
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/dogpile/lock.py", line 178, in _enter_create
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     return self.creator()
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/dogpile/cache/region.py", line 1046, in gen_value
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     created_value = creator(
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/keystone/credential/core.py", line 124, in _get_credential
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     return self.driver.get_credential(credential_id)
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/keystone/credential/backends/sql.py", line 88, in get_credential
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     return self._get_credential(session, credential_id).to_dict()
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application   File "/usr/lib/python3.9/site-packages/keystone/credential/backends/sql.py", line 83, in _get_credential
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application     raise exception.CredentialNotFound(credential_id=credential_id)
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application keystone.exception.CredentialNotFound: Could not find credential: e4d6f585ca63463e5de611e10fc69498f83787445c6c8a6feffda892fbb0695b.
+2026-08-05 10:15:09.694 4155419 ERROR keystone.server.flask.application [00m
+[pid: 4155419|app: 0|req: 41/345] 127.0.0.1 () {34 vars in 408 bytes} [Wed Aug  5 10:15:08 2026] POST /v3/s3tokens => generated 148 bytes in 840 msecs (HTTP/1.1 404) 4 headers in 165 bytes (1 switches on core 0)

@@ -1,0 +1,4 @@
+primary_region_hits {'r1': 76, 'r2': 68}
+primary_ports {6210: 54, 6211: 51, 6212: 39}
+primary_hosts {1: 44, 2: 32, 3: 31, 4: 37}
+REGION_PORT_DRILL_OK

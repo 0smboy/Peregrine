@@ -1,6 +1,8 @@
 # {{ ansible_managed }}
-# Parsed by swift-account-server ([app:account-server]) and by
-# swift-db-replicator account ([account-replicator]).
+# Parsed by swift-account-server ([app:account-server]),
+# swift-db-replicator account ([account-replicator]),
+# swift-account-reaper ([account-reaper]), and
+# swift-db-auditor account ([account-auditor]).
 
 [app:account-server]
 bind_ip = 0.0.0.0
@@ -23,6 +25,22 @@ rsync_devices_root = {{ srv_node_root }}
 {% else %}
 peer_map = {{ account_bind_port }}:{{ srv_node_root }}
 {% endif %}
+log_statsd_host = 127.0.0.1
+log_statsd_port = 9125
+log_statsd_metric_prefix =
+
+[account-reaper]
+interval = 3600
+delay_reaping = 0
+log_statsd_host = 127.0.0.1
+log_statsd_port = 9125
+log_statsd_metric_prefix =
+
+# Continuous account DB auditor (P2b): Python DatabaseAuditor interval default 1800s.
+[account-auditor]
+interval = 1800
+devices = {{ srv_node_root }}
+mount_check = {{ 'true' if custom_disks | length > 0 else 'false' }}
 log_statsd_host = 127.0.0.1
 log_statsd_port = 9125
 log_statsd_metric_prefix =

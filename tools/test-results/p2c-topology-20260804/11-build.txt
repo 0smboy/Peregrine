@@ -1,0 +1,3 @@
+   Compiling swift-http v0.1.0 (/root/work/swift-rust/crates/swift-http)
+   Compiling swift-object-server v0.1.0 (/root/work/swift-rust/crates/swift-object-server)
+    Finished `release` profile [optimized] target(s) in 9.00s

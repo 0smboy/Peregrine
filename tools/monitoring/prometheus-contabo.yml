@@ -1,3 +1,7 @@
+# Contabo Prometheus (swift4 127.0.0.1:9090).
+# R0 (2026-08-05): node_exporter on each host also exposes swift-recon
+# textfile metrics from /var/lib/node_exporter/textfile_collector/swift-recon.prom
+# (swift-recon-textfile.timer). Alert rules: rules/swift-ops-alerts.yml.
 global:
   scrape_interval: 15s
   evaluation_interval: 15s

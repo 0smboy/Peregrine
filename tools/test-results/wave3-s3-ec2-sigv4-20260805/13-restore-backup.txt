@@ -1,0 +1,24 @@
+===== restore swift1 =====
+BAK=/usr/local/bin/swift-proxy-server.bak.20260805T100423Z
+/usr/local/bin/swift-proxy-server.bak.20260805T100423Z: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=44f0189a49db259cafa6794b96a6cfc0c8eb891d, not stripped
+active
+6a3ddd697daea0ec3f75e3afdf8fbf840c8ba9502708125c275109e8e86e44eb  /usr/local/bin/swift-proxy-server
+/usr/local/bin/swift-proxy-server: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=44f0189a49db259cafa6794b96a6cfc0c8eb891d, not stripped
+===== restore swift2 =====
+BAK=/usr/local/bin/swift-proxy-server.bak.20260805T100423Z
+/usr/local/bin/swift-proxy-server.bak.20260805T100423Z: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=44f0189a49db259cafa6794b96a6cfc0c8eb891d, not stripped
+active
+6a3ddd697daea0ec3f75e3afdf8fbf840c8ba9502708125c275109e8e86e44eb  /usr/local/bin/swift-proxy-server
+/usr/local/bin/swift-proxy-server: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=44f0189a49db259cafa6794b96a6cfc0c8eb891d, not stripped
+===== restore swift3 =====
+BAK=/usr/local/bin/swift-proxy-server.bak.20260805T100423Z
+/usr/local/bin/swift-proxy-server.bak.20260805T100423Z: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=44f0189a49db259cafa6794b96a6cfc0c8eb891d, not stripped
+active
+6a3ddd697daea0ec3f75e3afdf8fbf840c8ba9502708125c275109e8e86e44eb  /usr/local/bin/swift-proxy-server
+/usr/local/bin/swift-proxy-server: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=44f0189a49db259cafa6794b96a6cfc0c8eb891d, not stripped
+===== restore swift4 =====
+BAK=/usr/local/bin/swift-proxy-server.bak.20260805T100423Z
+/usr/local/bin/swift-proxy-server.bak.20260805T100423Z: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=44f0189a49db259cafa6794b96a6cfc0c8eb891d, not stripped
+active
+6a3ddd697daea0ec3f75e3afdf8fbf840c8ba9502708125c275109e8e86e44eb  /usr/local/bin/swift-proxy-server
+/usr/local/bin/swift-proxy-server: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=44f0189a49db259cafa6794b96a6cfc0c8eb891d, not stripped

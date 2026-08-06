@@ -1,0 +1,49 @@
+lib.rs
+main.rs
+swift-account-server
+swift-cli
+swift-container-server
+swift-core
+swift-crypto
+swift-db
+swift-diskfile
+swift-ec
+   Compiling version_check v0.9.5
+   Compiling typenum v1.20.1
+   Compiling cfg-if v1.0.4
+   Compiling subtle v2.6.1
+   Compiling serde_core v1.0.228
+   Compiling zmij v1.0.23
+   Compiling generic-array v0.14.7
+   Compiling serde_json v1.0.150
+   Compiling proc-macro2 v1.0.106
+   Compiling itoa v1.0.18
+   Compiling quote v1.0.46
+   Compiling unicode-ident v1.0.24
+   Compiling libc v0.2.186
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling memchr v2.8.3
+   Compiling md-5 v0.10.6
+   Compiling crossbeam-utils v0.8.22
+   Compiling crc32fast v1.5.0
+   Compiling cpufeatures v0.2.17
+   Compiling syn v2.0.119
+   Compiling serde v1.0.228
+   Compiling simd-adler32 v0.3.10
+   Compiling adler2 v2.0.1
+   Compiling miniz_oxide v0.8.9
+   Compiling crossbeam-channel v0.5.16
+   Compiling swift-core v0.1.0 (/tmp/p0-swift-rust/crates/swift-core)
+   Compiling serde_derive v1.0.228
+   Compiling sha2 v0.10.9
+   Compiling sha1 v0.10.7
+   Compiling swift-http v0.1.0 (/tmp/p0-swift-rust/crates/swift-http)
+   Compiling flate2 v1.1.9
+   Compiling swift-memcache v0.1.0 (/tmp/p0-swift-rust/crates/swift-memcache)
+   Compiling hmac v0.12.1
+   Compiling swift-middleware v0.1.0 (/tmp/p0-swift-rust/crates/swift-middleware)
+   Compiling swift-ring v0.1.0 (/tmp/p0-swift-rust/crates/swift-ring)
+   Compiling swift-proxy-server v0.1.0 (/tmp/p0-swift-rust/crates/swift-proxy-server)
+    Finished `release` profile [optimized] target(s) in 37.66s

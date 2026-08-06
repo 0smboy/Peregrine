@@ -1,0 +1,38 @@
+=== haproxy servers (cfg) ===
+    default_backend swift_proxy_back
+
+backend swift_proxy_back
+    # roundrobin across every proxy business address. Tokens are HMAC-signed
+    # with swift_hash_path_prefix:suffix (shared), so any proxy can validate
+    # a token minted by another — source affinity is no longer required.
+    balance roundrobin
+    option httpchk GET /healthcheck
+
+    server proxy1 10.0.0.1:8080 check inter 5s fall 3 rise 2
+
+    server proxy2 10.0.0.2:8080 check inter 5s fall 3 rise 2
+
+    server proxy3 10.0.0.3:8080 check inter 5s fall 3 rise 2
+
+    server proxy4 10.0.0.4:8080 check inter 5s fall 3 rise 2
+
+
+listen stats
+    bind *:1080
+    stats enable
+    stats hide-version
+    stats uri /haproxy?stats
+=== backend health via local checks ===
+10.0.0.1:8080 healthcheck=200
+10.0.0.2:8080 healthcheck=200
+10.0.0.3:8080 healthcheck=200
+10.0.0.4:8080 healthcheck=200
+=== VIP sample requests across roundrobin (4 GETs) ===
+0 200 txb2a68dea6aa195f200022-006a731fc7
+1 200 tx0c4bcacd48d6947f00044-006a731fc8
+2 200 tx206cf49d559bcfc900023-006a731fc8
+3 200 tx5642532898f89a7d00048-006a731fc9
+4 200 tx31571cd052da6f2800024-006a731fc9
+5 200 txce42f49ca35f8c1100045-006a731fc9
+6 200 txa1bc65ab29b7269300025-006a731fc9
+7 200 txd791c452e4d1bbc70004a-006a731fca

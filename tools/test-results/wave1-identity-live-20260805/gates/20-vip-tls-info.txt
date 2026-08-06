@@ -1,0 +1,18 @@
+=== HTTPS health ===
+https_8085=200
+https_5000=200
+=== /info keys ===
+['account_quotas', 'bulk_delete', 'container_quotas', 'dlo', 'formpost', 'keystoneauth', 'slo', 'staticweb', 'swift', 'symlink', 'tempauth', 'tempurl', 'versioned_writes']
+=== TLS rotation ===
+TLS-GENERATED 2026-08-05T09:51:47Z CN=10.0.0.10 days=825 self-signed LAB
+=== haproxy binds ===
+    bind *:8085 ssl crt /etc/haproxy/haproxyCA.pem
+    bind *:35357 ssl crt /etc/haproxy/haproxyCA.pem
+    bind *:5000 ssl crt /etc/haproxy/haproxyCA.pem
+=== proxy pipeline (redacted) ===
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+[filter:tempauth]
+[filter:authtoken]
+auth_url = http://127.0.0.1:5001/v3
+www_authenticate_uri = https://10.0.0.10:5000
+[filter:keystoneauth]

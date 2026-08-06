@@ -1,0 +1,111 @@
+===== swift1 =====
+active
+active
+active
+inactive
+timer=inactive
+/etc/swift/object-server.conf:interval = 30
+/etc/swift/object-server.conf:interval = 300
+/etc/swift/object-server.conf:interval = 30
+/etc/swift/object-server.conf:interval = 300
+/etc/swift/object-server.conf:[object-auditor]
+/etc/swift/object-server.conf:interval = 30
+/etc/swift/account-server.conf:interval = 30
+/etc/swift/account-server.conf:interval = 3600
+/etc/swift/account-server.conf:[account-auditor]
+/etc/swift/account-server.conf:interval = 1800
+/etc/swift/container-server.conf:interval = 30
+/etc/swift/container-server.conf:interval = 300
+/etc/swift/container-server.conf:interval = 30
+/etc/swift/container-server.conf:[container-auditor]
+/etc/swift/container-server.conf:interval = 1800
+Aug 04 15:19:26 swift1 systemd[1]: swift-object-auditor.service: Main process exited, code=killed, status=9/KILL
+Aug 04 15:19:26 swift1 systemd[1]: swift-object-auditor.service: Failed with result 'signal'.
+Aug 04 15:19:26 swift1 systemd[1]: swift-object-auditor.service: Consumed 8.456s CPU time.
+Aug 04 15:19:28 swift1 systemd[1]: swift-object-auditor.service: Scheduled restart job, restart counter is at 1.
+Aug 04 15:19:28 swift1 systemd[1]: Stopped Swift object auditor (rust continuous).
+Aug 04 15:19:28 swift1 systemd[1]: swift-object-auditor.service: Consumed 8.456s CPU time.
+Aug 04 15:19:28 swift1 systemd[1]: Started Swift object auditor (rust continuous).
+Aug 04 15:19:28 swift1 object-auditor[337314]: INFO swift-object-auditor: devices=/srv/node mount_check=false interval=30s policies=2 once=false
+-rw-r--r--. 1 root root 528 Aug  4 15:22 /var/cache/swift/account.recon
+-rw-r--r--. 1 root root 600 Aug  4 15:22 /var/cache/swift/container.recon
+-rw-r--r--. 1 root root 524 Aug  4 15:22 /var/cache/swift/object.recon
+object.recon ['expired_last_pass', 'object_expiration_pass', 'object_reconstruction_last', 'object_reconstruction_time', 'object_replication_last', 'object_replication_time'] None
+===== swift2 =====
+active
+active
+active
+inactive
+timer=inactive
+/etc/swift/object-server.conf:interval = 30
+/etc/swift/object-server.conf:interval = 300
+/etc/swift/object-server.conf:interval = 30
+/etc/swift/object-server.conf:interval = 300
+/etc/swift/object-server.conf:[object-auditor]
+/etc/swift/object-server.conf:interval = 30
+/etc/swift/account-server.conf:interval = 30
+/etc/swift/account-server.conf:interval = 3600
+/etc/swift/account-server.conf:[account-auditor]
+/etc/swift/account-server.conf:interval = 1800
+/etc/swift/container-server.conf:interval = 30
+/etc/swift/container-server.conf:interval = 300
+/etc/swift/container-server.conf:interval = 30
+/etc/swift/container-server.conf:[container-auditor]
+/etc/swift/container-server.conf:interval = 1800
+-- No entries --
+-rw-r--r--. 1 root root 528 Aug  4 15:22 /var/cache/swift/account.recon
+-rw-r--r--. 1 root root 603 Aug  4 15:22 /var/cache/swift/container.recon
+-rw-r--r--. 1 root root 549 Aug  4 15:21 /var/cache/swift/object.recon
+object.recon ['expired_last_pass', 'object_expiration_pass', 'object_reconstruction_last', 'object_reconstruction_time', 'object_replication_last', 'object_replication_time'] None
+===== swift3 =====
+active
+active
+active
+inactive
+timer=inactive
+/etc/swift/object-server.conf:interval = 30
+/etc/swift/object-server.conf:interval = 300
+/etc/swift/object-server.conf:interval = 30
+/etc/swift/object-server.conf:interval = 300
+/etc/swift/object-server.conf:[object-auditor]
+/etc/swift/object-server.conf:interval = 30
+/etc/swift/account-server.conf:interval = 30
+/etc/swift/account-server.conf:interval = 3600
+/etc/swift/account-server.conf:[account-auditor]
+/etc/swift/account-server.conf:interval = 1800
+/etc/swift/container-server.conf:interval = 30
+/etc/swift/container-server.conf:interval = 300
+/etc/swift/container-server.conf:interval = 30
+/etc/swift/container-server.conf:[container-auditor]
+/etc/swift/container-server.conf:interval = 1800
+-- No entries --
+-rw-r--r--. 1 root root 528 Aug  4 15:22 /var/cache/swift/account.recon
+-rw-r--r--. 1 root root 602 Aug  4 15:22 /var/cache/swift/container.recon
+-rw-r--r--. 1 root root 539 Aug  4 15:22 /var/cache/swift/object.recon
+object.recon ['expired_last_pass', 'object_expiration_pass', 'object_reconstruction_last', 'object_reconstruction_time', 'object_replication_last', 'object_replication_time'] None
+===== swift4 =====
+active
+active
+active
+inactive
+timer=inactive
+/etc/swift/object-server.conf:interval = 30
+/etc/swift/object-server.conf:interval = 300
+/etc/swift/object-server.conf:interval = 30
+/etc/swift/object-server.conf:interval = 300
+/etc/swift/object-server.conf:[object-auditor]
+/etc/swift/object-server.conf:interval = 30
+/etc/swift/account-server.conf:interval = 30
+/etc/swift/account-server.conf:interval = 3600
+/etc/swift/account-server.conf:[account-auditor]
+/etc/swift/account-server.conf:interval = 1800
+/etc/swift/container-server.conf:interval = 30
+/etc/swift/container-server.conf:interval = 300
+/etc/swift/container-server.conf:interval = 30
+/etc/swift/container-server.conf:[container-auditor]
+/etc/swift/container-server.conf:interval = 1800
+-- No entries --
+-rw-r--r--. 1 root root 528 Aug  4 15:22 /var/cache/swift/account.recon
+-rw-r--r--. 1 root root 602 Aug  4 15:22 /var/cache/swift/container.recon
+-rw-r--r--. 1 root root 545 Aug  4 15:22 /var/cache/swift/object.recon
+object.recon ['expired_last_pass', 'object_expiration_pass', 'object_reconstruction_last', 'object_reconstruction_time', 'object_replication_last', 'object_replication_time'] None

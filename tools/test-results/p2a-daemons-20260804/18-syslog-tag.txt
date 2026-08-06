@@ -1,0 +1,5 @@
+Aug 04 14:59:46 swift1 object-expirer[110677]: INFO exiting on SIGTERM
+Aug 04 14:59:46 swift1 object-expirer[195306]: INFO swift-object-expirer: interval=300s reclaim_age=604800s once=false
+Aug 04 14:59:47 swift1 object-expirer[195306]: INFO object-expirer pass: expired=0 errors=0 retained=17
+Aug 04 15:00:38 swift1 object-expirer[201008]: INFO swift-object-expirer: interval=300s reclaim_age=604800s once=true
+Aug 04 15:00:41 swift1 object-expirer[201008]: INFO object-expirer pass: expired=0 errors=0 retained=17

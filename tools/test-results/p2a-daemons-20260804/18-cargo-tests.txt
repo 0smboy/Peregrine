@@ -1,0 +1,167 @@
+warning: failed to auto-clean cache data
+
+failed to clean entries from the global cache
+
+Caused by:
+  failed to remove file `/Users/oboy/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-macro-0.3.31/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
+   Compiling swift-container-server v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-container-server)
+   Compiling swift-account-server v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-account-server)
+   Compiling swift-object-server v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-object-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.89s
+     Running unittests src/lib.rs (target/debug/deps/swift_account_server-d10468b08ed0da67)
+
+running 4 tests
+test reaper::tests::test_is_reapable ... ok
+test reaper::tests::test_reap_container_deletes_objects_then_container ... ok
+test reaper::tests::test_reap_container_keeps_container_if_object_fails ... ok
+test reaper::tests::test_reap_account_end_to_end ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/bin/account_reaper.rs (target/debug/deps/swift_account_reaper-f161f0a6b20b68d6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/swift_account_server-c5b82861d0c5985e)
+
+running 1 test
+test startup_policy_tests::invalid_storage_policy_is_not_silently_replaced_with_policy_zero ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/swift_container_server-f16d2bb94068e44c)
+
+running 20 tests
+test reconciler::tests::test_content_type_roundtrip ... ok
+test reconciler::tests::test_decide_move_vs_correct ... ok
+test reconciler::tests::test_reconcile_already_correct_just_pops ... ok
+test remove_header_tests::empty_remove_trigger_ignored ... ok
+test reconciler::tests::test_reconcile_moves_then_pops ... ok
+test reconciler::tests::test_reconcile_failed_move_keeps_entry ... ok
+test remove_header_tests::remove_container_read_clears_acl ... ok
+test reconciler::tests::test_container_name_hour_bucket ... ok
+test reconciler::tests::test_reconciler_obj_name_and_parse ... ok
+test remove_header_tests::remove_user_meta ... ok
+test sync::tests::test_row_action ... ok
+test sync::tests::test_sync_auth_header ... ok
+test sync::tests::test_sync_rows_stops_on_failure ... ok
+test sync::tests::test_sync_rows_advances_point ... ok
+test updater::tests::test_needs_report_detects_change ... ok
+test sync::tests::test_get_sig_deterministic ... ok
+test updater::tests::test_report_failure_not_stamped ... ok
+test updater::tests::test_report_majority_stamps_reported ... ok
+test sharder::tests::test_cleave_is_batched ... ok
+test sharder::tests::test_find_create_and_cleave ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running unittests src/bin/container_reconciler.rs (target/debug/deps/swift_container_reconciler-e20406076a9b8968)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/swift_container_server-a4a06ac00d455911)
+
+running 1 test
+test startup_policy_tests::invalid_storage_policy_is_not_silently_replaced_with_policy_zero ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/container_updater.rs (target/debug/deps/swift_container_updater-65b978cec81e3add)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/swift_object_server-fb89cb8c6546eb4b)
+
+running 48 tests
+test daemonutil::tests::sleep_unless_stopped_completes_a_zero_interval_without_stop ... ok
+test daemonutil::tests::sleep_unless_stopped_returns_immediately_when_flag_is_set ... ok
+test delete_header_tests::test_if_none_match_has_star ... ok
+test daemonutil::tests::replicator_recon_update_has_python_recon_keys ... ok
+test expirer::tests::test_expirer_container_bucket ... ok
+test daemonutil::tests::statsd_prefix_prepends_only_when_configured ... ok
+test expirer::tests::test_build_and_parse_roundtrip ... ok
+test delete_header_tests::test_parse_int_like ... ok
+test expirer::tests::test_normalize_matches_python_format ... ok
+test expirer::tests::test_iter_due_stops_at_future ... ok
+test expirer::tests::test_process_deletes_then_pops ... ok
+test fallocate_reserve_tests::breach_math_matches_python_fallocate_reserve ... ok
+test expirer::tests::test_stale_recent_retained_old_popped ... ok
+test fast_post_helper_tests::test_extract_swift_bytes ... ok
+test localdev::tests::a_hostname_is_never_claimed_as_local ... ok
+test delete_header_tests::test_check_delete_headers ... ok
+test fast_post_helper_tests::test_meta_upsert_replaces_in_place_or_appends ... ok
+test reconstructor::suffix_sync_tests::test_get_suffix_delta_differing_data_hash ... ok
+test reconstructor::suffix_sync_tests::test_get_suffix_delta_in_sync ... ok
+test localdev::tests::a_bindable_address_that_is_not_an_interface_address_is_not_local ... ok
+test reconstructor::suffix_sync_tests::test_get_suffix_delta_none_key_tombstones ... ok
+test reconstructor::suffix_sync_tests::test_partner_missing_its_own_fragment_is_flagged_for_sync ... ok
+test reconstructor::suffix_sync_tests::test_get_suffix_delta_remote_missing_suffix ... ok
+test localdev::tests::loopback_is_local_and_a_documentation_address_is_not ... ok
+test daemonutil::tests::updater_recon_update_dumps_python_recon_keys ... ok
+test replicator::tests::test_divergent_suffixes ... ok
+test replicator::tests::test_hashes_pickle_roundtrip ... ok
+test localdev::tests::every_enumerated_address_answers_local ... ok
+test replicator::tests::test_run_once_handoff_reverts_and_deletes ... ok
+test replicator::tests::test_revert_keeps_partition_when_a_primary_fails ... ok
+test reconstructor::suffix_sync_tests::test_sync_job_fully_in_sync_pushes_nothing ... ok
+test replicator::tests::test_run_once_reaps_orphaned_tmp_files ... ok
+test ssync_sender::tests::test_decode_wanted ... ok
+test reconstructor::suffix_sync_tests::test_sync_job_pushes_to_a_partner_that_lost_its_fragment ... ok
+test reconstructor::suffix_sync_tests::test_sync_job_ssyncs_only_the_delta_and_skips_failed_replicate ... ok
+test ssync_sender::tests::test_sender_empty_partition_round_trip ... ok
+test ssync_sender::tests::test_sender_unexpected_response_line_is_an_error ... ok
+test replicator::tests::test_run_once_primary_dispatch_queries_peers ... ok
+test replicator::tests::test_unlink_older_than_reaps_only_old_files ... ok
+test updater::tests::test_parse_roundtrip ... ok
+test updater::tests::test_partial_failure_rewrites_with_successes ... ok
+test updater::tests::test_multi_dash_and_bad_timestamp_names_are_errors ... ok
+test updater::tests::test_leftover_tmp_sibling_is_skipped_not_treated_as_newest ... ok
+test updater::tests::test_full_success_unlinks ... ok
+test fallocate_reserve_tests::put_honors_the_fallocate_reserve_against_a_temp_device ... ok
+test reconstructor::suffix_sync_tests::test_sync_job_stops_advertising_a_fragment_that_vanished ... ok
+test updater::tests::test_outdated_duplicates_unlinked ... ok
+test reconstructor::suffix_sync_tests::test_revert_job_skips_cleanly_when_partition_lock_held ... ok
+
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running unittests src/bin/object_expirer.rs (target/debug/deps/swift_object_expirer-95b8857a9cb0e1d6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/object_reconstructor.rs (target/debug/deps/swift_object_reconstructor-4db4e9ec5c780fc1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/object_replicator.rs (target/debug/deps/swift_object_replicator-e718fdb4c02dc3f9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/swift_object_server-d099600f71c35297)
+
+running 2 tests
+test startup_policy_tests::invalid_storage_policy_is_not_silently_treated_as_replication ... ok
+test startup_policy_tests::configured_policy_kinds_preserve_replication_and_ec ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/object_updater.rs (target/debug/deps/swift_object_updater-4eb583b326ed79ee)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

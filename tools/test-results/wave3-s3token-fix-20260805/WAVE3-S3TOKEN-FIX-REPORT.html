@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Wave3 s3token fix — 20260805</title>
+<style>
+  :root { --ink:#1a1a1a; --muted:#5a5a5a; --ok:#1b6b3a; --bad:#8b1e1e; --warn:#8a5a00; --bg:#f7f5f1; --card:#fff; }
+  body { font-family: "IBM Plex Sans", "Segoe UI", sans-serif; margin:0; color:var(--ink); background:var(--bg); line-height:1.45; }
+  main { max-width:920px; margin:0 auto; padding:28px 22px 64px; }
+  h1 { font-size:1.55rem; margin:0 0 6px; font-weight:650; }
+  h2 { font-size:1.1rem; margin:28px 0 10px; border-bottom:1px solid #ddd; padding-bottom:4px; }
+  .meta { color:var(--muted); font-size:0.92rem; margin-bottom:18px; }
+  .verdict { display:inline-block; padding:4px 10px; background:#fff3cd; color:var(--warn); font-weight:650; letter-spacing:0.02em; }
+  table { width:100%; border-collapse:collapse; background:var(--card); margin:10px 0 18px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid #e6e2da; font-size:0.92rem; vertical-align:top; }
+  th { background:#efece6; font-weight:600; }
+  .pass { color:var(--ok); font-weight:650; }
+  .fail { color:var(--bad); font-weight:650; }
+  .block { color:var(--warn); font-weight:650; }
+  code, .path { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size:0.86em; }
+  ul { padding-left:1.2rem; }
+  .note { background:#fff; border-left:3px solid #c4b8a0; padding:10px 14px; margin:12px 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Wave 3 — Keystone <code>/v3/s3tokens</code> crash fix</h1>
+  <div class="meta">Contabo lab · 2026-08-05 · pack <span class="path">tools/test-results/wave3-s3token-fix-20260805/</span></div>
+  <div class="verdict">VERDICT: PARTIAL — not PRODUCTION-GO-LIVE</div>
+
+  <h2>1) What this cycle did</h2>
+  <ul>
+    <li>Traced prior live failure (<span class="path">wave3-s3-l3b-live-20260805/</span>): valid-looking EC2 exchange → uwsgi <code>RemoteDisconnected</code>.</li>
+    <li>Root cause: uncaught <code>binascii.Error: Incorrect padding</code> in <code>s3tokens._check_signature</code> on non-base64 <code>credentials.token</code> (HTTP 500 / empty body).</li>
+    <li>Secondary gap: s3tokens omitted <code>X-Subject-Token</code> (ec2tokens sets it), so Fernet token id never reached Swift.</li>
+    <li>Patched site-package on swift1–3, restarted Keystone after confirming Fernet/credential keys present and synced.</li>
+    <li>Re-proved VIP HTTPS exchange + Swift native PUT/GET; measured VIP S3 SigV4+EC2 still blocked in Rust.</li>
+  </ul>
+
+  <h2>2) What was optimized / fixed / demoted</h2>
+  <table>
+    <tr><th>Change</th><th>Scope</th></tr>
+    <tr><td>Catch bad base64 → <code>Unauthorized</code> 401</td><td>FIXED (Keystone s3tokens.py ×3)</td></tr>
+    <tr><td>Set <code>X-Subject-Token = token.id</code></td><td>FIXED (parity with ec2tokens)</td></tr>
+    <tr><td>Credential/Fernet key sync</td><td>Already OK on swift1–3 (no rotate needed)</td></tr>
+    <tr><td>Rust s3api unknown EC2 key → s3token</td><td>DEMOTED / backlog (not changed this cycle)</td></tr>
+    <tr><td>Python cluster / ring rebuild</td><td>Out of scope (W4 / W2 other agent)</td></tr>
+  </table>
+
+  <h2>3) Measured effect</h2>
+  <table>
+    <tr><th>Probe</th><th>Before</th><th>After</th></tr>
+    <tr><td>Valid EC2 <code>/v3/s3tokens</code> VIP HTTPS</td><td>disconnect / no Subject-Token</td><td class="pass">200 · Subject-Token len 183 · stress 10/10</td></tr>
+    <tr><td>Invalid base64 token field</td><td class="fail">RemoteDisconnected</td><td class="pass">401 Unauthorized</td></tr>
+    <tr><td>Local stress valid ×30</td><td>—</td><td class="pass">30/30</td></tr>
+    <tr><td>EC2→s3token→Swift native PUT/GET VIP</td><td class="fail">401</td><td class="pass">201 / 201 / 200</td></tr>
+    <tr><td>EC2→VIP S3 SigV4 ListBuckets</td><td class="block">InvalidAccessKeyId</td><td class="block">InvalidAccessKeyId (unchanged)</td></tr>
+  </table>
+
+  <h2>4) Gate results</h2>
+  <table>
+    <tr><th>Gate</th><th>Result</th><th>Evidence</th></tr>
+    <tr><td>Key sync credential+fernet ×3</td><td class="pass">PASS</td><td><span class="path">15-patch-sync-proof.txt</span></td></tr>
+    <tr><td>s3tokens.py patch identical ×3</td><td class="pass">PASS</td><td>md5 <code>3c4c5669e10d7591cf19e0def00beb8a</code></td></tr>
+    <tr><td>Live <code>/v3/s3tokens</code> exchange</td><td class="pass">PASS</td><td><span class="path">13-post-fix-verify.txt</span>, <span class="path">14-vip-swift-native-proof.txt</span></td></tr>
+    <tr><td>bad-base64 no uwsgi crash</td><td class="pass">PASS</td><td>HTTP 401 in 13/14</td></tr>
+    <tr><td>EC2→Swift native over VIP</td><td class="pass">PASS</td><td><span class="path">14-vip-swift-native-proof.txt</span></td></tr>
+    <tr><td>EC2→VIP S3 SigV4 PUT/GET</td><td class="block">BLOCKED</td><td>Rust <code>InvalidAccessKeyId</code> before s3token</td></tr>
+    <tr><td>PRODUCTION-GO-LIVE</td><td class="fail">NO</td><td>plan hard gates incomplete</td></tr>
+  </table>
+
+  <h2>5) Remaining / next cycle</h2>
+  <div class="note">
+    <strong>FROZEN / backlog:</strong> Rust <code>s3api</code> must defer unknown EC2 access keys to Keystone (or exchange inline) with a real base64 string-to-sign; today’s <code>s3token</code> client also sends <code>X-Amz-Date</code> as <code>token</code> (would 401). L3b multi-node quorum untouched. Do not upgrade to PRODUCTION-GO-LIVE from this pack.
+  </div>
+  <ul>
+    <li>Ops: re-run <span class="path">apply_s3tokens_patch.py</span> after any Keystone RPM upgrade (site-package patch).</li>
+    <li>Backups on nodes: <code>s3tokens.py.bak-20260805</code>.</li>
+  </ul>
+</main>
+</body>
+</html>

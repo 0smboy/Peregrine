@@ -1,0 +1,10 @@
+local bin swift-object-expirer 4687532d36b8
+local bin swift-account-reaper 923bf4e65908
+local bin swift-container-reconciler bf053e40aaaa
+local bin swift-container-updater 380d37498869
+local bin swift-object-server 9ef4d639d298
+===== deploy 10.0.0.1 =====
+===== deploy 10.0.0.2 =====
+===== deploy 10.0.0.3 =====
+===== deploy 10.0.0.4 =====
+DEPLOY_DONE

@@ -1,0 +1,7 @@
+APPLY CYCLE VERDICT: PARTIAL
+LIVE_RINGS_SPP_REGION: PASS
+FAILOVER: PASS
+SOAK_1H: WARN (fail=7 / n=192; SOAK_END 2026-08-05T11:13:52Z)
+SOAK_503_RCA: apply/09b-soak-503-rca.txt (proxy deploy storm; Identity/TLS untouched)
+FUNC_54_54: FAIL (TempAuth 5/54; Keystone adapted 46/13)
+PRODUCTION-GO-LIVE: NOT CLAIMED

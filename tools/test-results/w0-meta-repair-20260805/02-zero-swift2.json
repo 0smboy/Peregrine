@@ -1,0 +1,84 @@
+{
+  "container_zero": {
+    "container_dbs_seen": 986,
+    "live_rows_marked": 657080,
+    "vacuumed": 0,
+    "errors": [
+      "/srv/node/d1/containers/603/c2c/96ee271755a7a4fd09615b5f74271c2c/96ee271755a7a4fd09615b5f74271c2c.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/99/a33/18fcd9598e6cdef235a8173c308a6a33/18fcd9598e6cdef235a8173c308a6a33.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/519/92e/81c9157b8e4e02cb5392c2f9aeafc92e/81c9157b8e4e02cb5392c2f9aeafc92e.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/519/5bc/81f4bca93b22d7087508e25e7a4b95bc/81f4bca93b22d7087508e25e7a4b95bc.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/519/210/81ec69c7744862a30b5a2a1b2639d210/81ec69c7744862a30b5a2a1b2639d210.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/669/f71/a76fd6068e8a12d94fe582b13c0cbf71/a76fd6068e8a12d94fe582b13c0cbf71.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/669/0c1/a74c7c3938c662a4e55a0a1c6bcdd0c1/a74c7c3938c662a4e55a0a1c6bcdd0c1.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/201/17e/3246346c6b6cfda86f2ae2ff4976c17e/3246346c6b6cfda86f2ae2ff4976c17e.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/396/6bd/6325854ff459ae4d77b57d15cdbc56bd/6325854ff459ae4d77b57d15cdbc56bd.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/396/460/632884c8253fe9d8cb9f04f10f35c460/632884c8253fe9d8cb9f04f10f35c460.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/1017/e48/fe63981c0b5045ff0f731e61eb648e48/fe63981c0b5045ff0f731e61eb648e48.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/279/c11/45e698a2b66526c80da192d5402c8c11/45e698a2b66526c80da192d5402c8c11.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/279/081/45d513cb3aba3bb70c53d3925e313081/45d513cb3aba3bb70c53d3925e313081.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/279/33a/45ec0f5315d134a19d76c7422667333a/45ec0f5315d134a19d76c7422667333a.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/972/b1f/f306d81e49f69dbc49227ccc2f1a7b1f/f306d81e49f69dbc49227ccc2f1a7b1f.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/327/4b7/51cddd8886007431c0418bd9b9b324b7/51cddd8886007431c0418bd9b9b324b7.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/327/a58/51e66de8272e7ab4f8288fff72413a58/51e66de8272e7ab4f8288fff72413a58.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/561/b76/8c668f1ef6a7efa3fe44ee0ec1dcbb76/8c668f1ef6a7efa3fe44ee0ec1dcbb76.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/561/236/8c6df7c1f816e6c7ca8ba94c38662236/8c6df7c1f816e6c7ca8ba94c38662236.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/693/1c3/ad6be8d244b3ed0a12d1df12042e91c3/ad6be8d244b3ed0a12d1df12042e91c3.db: UPDATE not allowed; DELETE and INSERT"
+    ],
+    "mode": "APPLY"
+  },
+  "account_zero": {
+    "account_dbs_seen": 3,
+    "live_rows_marked": 1976,
+    "vacuumed": 0,
+    "errors": [
+      "/srv/node/d1/accounts/15623/dd5/f41c17e6415c98d5b7200e615237edd5/f41c17e6415c98d5b7200e615237edd5.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d2/accounts/976/dd5/f41c17e6415c98d5b7200e615237edd5/f41c17e6415c98d5b7200e615237edd5.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d3/accounts/725/64d/b56ad7a193561dc795131366fc92864d/b56ad7a193561dc795131366fc92864d.db: UPDATE not allowed; DELETE and INSERT"
+    ],
+    "mode": "APPLY"
+  }
+}
+{
+  "ts": 1785915889.2235754,
+  "host": "swift2",
+  "container_zero": {
+    "container_dbs_seen": 986,
+    "live_rows_marked": 657080,
+    "vacuumed": 0,
+    "errors": [
+      "/srv/node/d1/containers/603/c2c/96ee271755a7a4fd09615b5f74271c2c/96ee271755a7a4fd09615b5f74271c2c.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/99/a33/18fcd9598e6cdef235a8173c308a6a33/18fcd9598e6cdef235a8173c308a6a33.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/519/92e/81c9157b8e4e02cb5392c2f9aeafc92e/81c9157b8e4e02cb5392c2f9aeafc92e.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/519/5bc/81f4bca93b22d7087508e25e7a4b95bc/81f4bca93b22d7087508e25e7a4b95bc.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/519/210/81ec69c7744862a30b5a2a1b2639d210/81ec69c7744862a30b5a2a1b2639d210.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/669/f71/a76fd6068e8a12d94fe582b13c0cbf71/a76fd6068e8a12d94fe582b13c0cbf71.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/669/0c1/a74c7c3938c662a4e55a0a1c6bcdd0c1/a74c7c3938c662a4e55a0a1c6bcdd0c1.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/201/17e/3246346c6b6cfda86f2ae2ff4976c17e/3246346c6b6cfda86f2ae2ff4976c17e.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/396/6bd/6325854ff459ae4d77b57d15cdbc56bd/6325854ff459ae4d77b57d15cdbc56bd.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/396/460/632884c8253fe9d8cb9f04f10f35c460/632884c8253fe9d8cb9f04f10f35c460.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/1017/e48/fe63981c0b5045ff0f731e61eb648e48/fe63981c0b5045ff0f731e61eb648e48.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/279/c11/45e698a2b66526c80da192d5402c8c11/45e698a2b66526c80da192d5402c8c11.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/279/081/45d513cb3aba3bb70c53d3925e313081/45d513cb3aba3bb70c53d3925e313081.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/279/33a/45ec0f5315d134a19d76c7422667333a/45ec0f5315d134a19d76c7422667333a.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/972/b1f/f306d81e49f69dbc49227ccc2f1a7b1f/f306d81e49f69dbc49227ccc2f1a7b1f.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/327/4b7/51cddd8886007431c0418bd9b9b324b7/51cddd8886007431c0418bd9b9b324b7.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/327/a58/51e66de8272e7ab4f8288fff72413a58/51e66de8272e7ab4f8288fff72413a58.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/561/b76/8c668f1ef6a7efa3fe44ee0ec1dcbb76/8c668f1ef6a7efa3fe44ee0ec1dcbb76.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/561/236/8c6df7c1f816e6c7ca8ba94c38662236/8c6df7c1f816e6c7ca8ba94c38662236.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d1/containers/693/1c3/ad6be8d244b3ed0a12d1df12042e91c3/ad6be8d244b3ed0a12d1df12042e91c3.db: UPDATE not allowed; DELETE and INSERT"
+    ],
+    "mode": "APPLY"
+  },
+  "account_zero": {
+    "account_dbs_seen": 3,
+    "live_rows_marked": 1976,
+    "vacuumed": 0,
+    "errors": [
+      "/srv/node/d1/accounts/15623/dd5/f41c17e6415c98d5b7200e615237edd5/f41c17e6415c98d5b7200e615237edd5.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d2/accounts/976/dd5/f41c17e6415c98d5b7200e615237edd5/f41c17e6415c98d5b7200e615237edd5.db: UPDATE not allowed; DELETE and INSERT",
+      "/srv/node/d3/accounts/725/64d/b56ad7a193561dc795131366fc92864d/b56ad7a193561dc795131366fc92864d.db: UPDATE not allowed; DELETE and INSERT"
+    ],
+    "mode": "APPLY"
+  }
+}

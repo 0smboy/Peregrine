@@ -1,0 +1,21 @@
+==== swift2 ====
+-rw-r--r--. 1 root root 0 Aug  5 11:59 /etc/pyswift/account.ring.gz
+-rw-r--r--. 1 root root 0 Aug  5 11:59 /etc/pyswift/container.ring.gz
+-rw-r--r--. 1 root root 0 Aug  5 11:59 /etc/pyswift/object-1.ring.gz
+-rw-r--r--. 1 root root 0 Aug  5 11:59 /etc/pyswift/object.ring.gz
+-rw-r--r--. 1 root root 0 Aug  5 12:00 /etc/pyswift/swift.conf
+Error: [swift-hash]: both swift_hash_path_suffix and swift_hash_path_prefix are missing from /etc/pyswift/swift.conf
+==== swift3 ====
+-rw-r--r--. 1 root root 0 Aug  5 12:03 /etc/pyswift/account.ring.gz
+-rw-r--r--. 1 root root 0 Aug  5 12:03 /etc/pyswift/container.ring.gz
+-rw-r--r--. 1 root root 0 Aug  5 12:03 /etc/pyswift/object-1.ring.gz
+-rw-r--r--. 1 root root 0 Aug  5 12:03 /etc/pyswift/object.ring.gz
+-rw-r--r--. 1 root root 0 Aug  5 12:03 /etc/pyswift/swift.conf
+Error: [swift-hash]: both swift_hash_path_suffix and swift_hash_path_prefix are missing from /etc/pyswift/swift.conf
+==== swift4 ====
+-rw-r--r--. 1 root root 0 Aug  5 12:03 /etc/pyswift/account.ring.gz
+-rw-r--r--. 1 root root 0 Aug  5 12:03 /etc/pyswift/container.ring.gz
+-rw-r--r--. 1 root root 0 Aug  5 12:03 /etc/pyswift/object-1.ring.gz
+-rw-r--r--. 1 root root 0 Aug  5 12:03 /etc/pyswift/object.ring.gz
+-rw-r--r--. 1 root root 0 Aug  5 12:03 /etc/pyswift/swift.conf
+Error: [swift-hash]: both swift_hash_path_suffix and swift_hash_path_prefix are missing from /etc/pyswift/swift.conf

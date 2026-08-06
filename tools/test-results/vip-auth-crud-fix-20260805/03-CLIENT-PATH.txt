@@ -1,0 +1,8 @@
+VIP=https://10.0.0.10:8085
+KEYSTONE=https://10.0.0.10:5000
+TEMPAUTH_ACCOUNT=AUTH_test
+KEYSTONE_TEST_PROJECT_ID=29af7f1e19774999bf700fbef31994d3
+KEYSTONE_STORAGE=https://10.0.0.10:8085/v1/AUTH_29af7f1e19774999bf700fbef31994d3
+NOTE=Do not use AUTH_test with Keystone tokens (403 expected).
+NOTE=TempAuth coexist restored (list/CRUD PASS after keystoneauth stamp fix).
+PROXY_SHA256=657e07439cde3520e83dd1bb47bf0f130120e532d39fda53a2925a0d938c2f77

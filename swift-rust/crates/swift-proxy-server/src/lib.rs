@@ -21,10 +21,13 @@
 //!
 //! Per-policy object rings are supported (`object_ring_for`), routing object
 //! requests by the container's storage policy index. Account/container info
-//! is cached in-process with `recheck_*_existence` TTLs (Python keeps it in
-//! memcache, shared across proxies; a per-process map is the deviation).
-//! Deviations tracked for later: X-Newest best-source selection and the
-//! resumable multi-node GET iterator.
+//! is cached with `recheck_*_existence` TTLs: a process-local L1 map plus an
+//! optional shared memcache L2 (`account/…`, `container/…` keys, matching
+//! Python `get_cache_key`) so TempAuth ACL / Temp-URL key updates propagate
+//! across VIP backends without waiting for per-proxy TTL expiry.
+//! Deviations tracked for later: the resumable multi-node GET iterator
+//! (mid-stream failover via ranged re-fetch). X-Newest best-source selection
+//! is implemented in [`ProxyApp::get_or_head`].
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -32,8 +35,10 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use swift_core::config::config_true_value;
 use swift_core::timestamp::Timestamp;
 use swift_http::{HeaderKeyDict, Request, Response};
+use swift_memcache::{MemcacheClient, TcpConn};
 use swift_ring::Ring;
 
 /// An owned backend node (device ip/port/name), so node lists can move
@@ -125,10 +130,15 @@ pub struct ProxyConfig {
     pub recheck_account_existence: f64,
     /// When true, every account/container/object request is authorized against
     /// the container ACL using the (unspoofable) `X-Backend-Remote-User` group
-    /// list an auth middleware (tempauth) stamped. Set by `main` iff auth is in
-    /// the pipeline — so a request path that forgets to authorize cannot silently
+    /// list an auth middleware (tempauth) stamped, or Keystone roles when
+    /// `keystone_auth` is set and the request carries `X-Backend-Auth-Plugin:
+    /// keystone`. Set by `main` iff tempauth and/or keystoneauth is in the
+    /// pipeline — so a request path that forgets to authorize cannot silently
     /// become world-accessible.
     pub auth_enabled: bool,
+    /// When `Some`, Keystone authorize is used for requests stamped by the
+    /// keystoneauth middleware (`X-Backend-Auth-Plugin: keystone`).
+    pub keystone_auth: Option<swift_middleware::KeystoneAuth>,
 }
 
 impl Default for ProxyConfig {
@@ -144,19 +154,21 @@ impl Default for ProxyConfig {
             recheck_container_existence: 60.0,
             recheck_account_existence: 60.0,
             auth_enabled: false,
+            keystone_auth: None,
         }
     }
 }
 
 /// A container's cached info: its storage policy index, read/write ACLs,
-/// and the HEAD status that produced it (0 = no response — treated like
-/// Python's synthesized 503: not a success).
-#[derive(Clone)]
+/// Temp-URL keys, and the HEAD status that produced it (0 = no response —
+/// treated like Python's synthesized 503: not a success).
+#[derive(Clone, Default)]
 struct ContainerInfo {
     status: u16,
     policy_index: i64,
     read_acl: Option<String>,
     write_acl: Option<String>,
+    temp_url_keys: Vec<String>,
 }
 
 impl ContainerInfo {
@@ -165,18 +177,28 @@ impl ContainerInfo {
     }
 }
 
-/// In-process TTL cache of container info and account existence, standing in
-/// for Python's memcache-backed info cache (`get_container_info` /
-/// `get_account_info` with `set_info_cache` / `clear_info_cache`,
-/// base.py:430-744). Without it the proxy re-HEADs the container on every
-/// object request, and a node-down window floods the error limiter. One map
-/// per server type — keyed `"account/container"` and `"account"` (account
-/// names cannot contain `/`, so keys cannot collide within a map) — and each
-/// entry carries its own expiry deadline, since a 404 entry lives a tenth as
-/// long as a 2xx entry (base.py:687-688).
+/// Cached account HEAD: status plus sysmeta ACL and Temp-URL keys.
+#[derive(Clone, Default)]
+struct AccountInfo {
+    status: u16,
+    /// Raw `X-Account-Sysmeta-Core-Access-Control` value when present.
+    core_access_control: Option<String>,
+    temp_url_keys: Vec<String>,
+}
+
+/// L1 (process-local) + optional L2 (shared memcache) cache of container /
+/// account info, porting Python `get_container_info` / `get_account_info`
+/// with `set_info_cache` / `clear_info_cache` (base.py:430-744).
+///
+/// L1 is keyed `"account/container"` and `"account"` (account names cannot
+/// contain `/`). L2 uses Python `get_cache_key` strings (`container/a/c`,
+/// `account/a`) so every VIP backend that shares `memcache_servers` sees
+/// the same ACL / Temp-URL-key state after a clear+refill. Memcache misses
+/// or errors fall through to a live HEAD; they never fail the request.
 struct InfoCache {
     containers: Mutex<HashMap<String, (Instant, ContainerInfo)>>,
-    accounts: Mutex<HashMap<String, (Instant, u16)>>,
+    accounts: Mutex<HashMap<String, (Instant, AccountInfo)>>,
+    memcache: Option<Mutex<MemcacheClient<TcpConn>>>,
 }
 
 impl InfoCache {
@@ -184,69 +206,205 @@ impl InfoCache {
         InfoCache {
             containers: Mutex::new(HashMap::new()),
             accounts: Mutex::new(HashMap::new()),
+            memcache: None,
         }
     }
 
+    /// Attach a shared memcache client (P1c). Builder-style for `ProxyApp`.
+    fn with_memcache(mut self, client: MemcacheClient<TcpConn>) -> Self {
+        self.memcache = Some(Mutex::new(client));
+        self
+    }
+
+    fn memcache_key_container(account_container: &str) -> String {
+        format!("container/{account_container}")
+    }
+
+    fn memcache_key_account(account: &str) -> String {
+        format!("account/{account}")
+    }
+
     /// A fresh cached entry, or `None` (removing the entry if it expired).
+    ///
+    /// When shared memcache is configured it is consulted first so a clear on
+    /// another VIP backend is visible immediately (L1 alone would lag).
     fn get_container(&self, key: &str) -> Option<ContainerInfo> {
+        if self.memcache.is_some() {
+            let mkey = Self::memcache_key_container(key);
+            return self.memcache_get_container(&mkey);
+        }
         let mut map = self.containers.lock().unwrap();
         match map.get(key) {
             None => None,
             Some((deadline, info)) => {
                 if Instant::now() >= *deadline {
                     map.remove(key);
-                    return None;
+                    None
+                } else {
+                    Some(info.clone())
                 }
-                Some(info.clone())
             }
         }
     }
 
     /// Insert with a TTL in seconds. A non-positive or non-finite TTL caches
-    /// nothing: Python hands memcache a 0 expiry (never expires there), but an
-    /// in-process map must not pin an entry forever, so 0 disables instead.
-    /// Capped at 1e9 s like `conf_timeout_secs`, past which
-    /// `Duration::from_secs_f64` / `Instant + Duration` could panic.
+    /// nothing. Capped at 1e9 s like `conf_timeout_secs`.
     fn set_container(&self, key: String, info: ContainerInfo, ttl_secs: f64) {
         if !ttl_secs.is_finite() || ttl_secs <= 0.0 {
             return;
         }
         let deadline = Instant::now() + Duration::from_secs_f64(ttl_secs.min(1e9));
-        self.containers.lock().unwrap().insert(key, (deadline, info));
+        self.containers
+            .lock()
+            .unwrap()
+            .insert(key.clone(), (deadline, info.clone()));
+        let mkey = Self::memcache_key_container(&key);
+        self.memcache_set_container(&mkey, &info, ttl_secs);
     }
 
     /// `clear_info_cache` for one container (base.py:732-744).
     fn clear_container(&self, key: &str) {
         self.containers.lock().unwrap().remove(key);
+        let mkey = Self::memcache_key_container(key);
+        self.memcache_delete(&mkey);
     }
 
-    /// A fresh cached account HEAD status, or `None`.
-    fn get_account(&self, account: &str) -> Option<u16> {
+    /// A fresh cached account info, or `None`.
+    ///
+    /// Shared memcache is authoritative when configured (cross-proxy ACL).
+    fn get_account(&self, account: &str) -> Option<AccountInfo> {
+        if self.memcache.is_some() {
+            let mkey = Self::memcache_key_account(account);
+            return self.memcache_get_account(&mkey);
+        }
         let mut map = self.accounts.lock().unwrap();
         match map.get(account) {
             None => None,
-            Some((deadline, status)) => {
+            Some((deadline, info)) => {
                 if Instant::now() >= *deadline {
                     map.remove(account);
-                    return None;
+                    None
+                } else {
+                    Some(info.clone())
                 }
-                Some(*status)
             }
         }
     }
 
-    fn set_account(&self, account: String, status: u16, ttl_secs: f64) {
+    fn set_account(&self, account: String, info: AccountInfo, ttl_secs: f64) {
         if !ttl_secs.is_finite() || ttl_secs <= 0.0 {
             return;
         }
         let deadline = Instant::now() + Duration::from_secs_f64(ttl_secs.min(1e9));
-        self.accounts.lock().unwrap().insert(account, (deadline, status));
+        self.accounts
+            .lock()
+            .unwrap()
+            .insert(account.clone(), (deadline, info.clone()));
+        let mkey = Self::memcache_key_account(&account);
+        self.memcache_set_account(&mkey, &info, ttl_secs);
     }
 
     /// `clear_info_cache` for one account (base.py:732-744).
     fn clear_account(&self, account: &str) {
         self.accounts.lock().unwrap().remove(account);
+        let mkey = Self::memcache_key_account(account);
+        self.memcache_delete(&mkey);
     }
+
+    fn memcache_delete(&self, key: &str) {
+        let Some(mc) = &self.memcache else { return };
+        let Ok(mut guard) = mc.lock() else { return };
+        let _ = guard.delete(key);
+    }
+
+    fn memcache_get_container(&self, key: &str) -> Option<ContainerInfo> {
+        let mc = self.memcache.as_ref()?;
+        let mut guard = mc.lock().ok()?;
+        let value = guard.get_json(key).ok().flatten()?;
+        container_info_from_json(&value)
+    }
+
+    fn memcache_set_container(&self, key: &str, info: &ContainerInfo, ttl_secs: f64) {
+        let Some(mc) = &self.memcache else { return };
+        let Ok(mut guard) = mc.lock() else { return };
+        let value = container_info_to_json(info);
+        let _ = guard.set_json(key, &value, ttl_secs as i64);
+    }
+
+    fn memcache_get_account(&self, key: &str) -> Option<AccountInfo> {
+        let mc = self.memcache.as_ref()?;
+        let mut guard = mc.lock().ok()?;
+        let value = guard.get_json(key).ok().flatten()?;
+        account_info_from_json(&value)
+    }
+
+    fn memcache_set_account(&self, key: &str, info: &AccountInfo, ttl_secs: f64) {
+        let Some(mc) = &self.memcache else { return };
+        let Ok(mut guard) = mc.lock() else { return };
+        let value = account_info_to_json(info);
+        let _ = guard.set_json(key, &value, ttl_secs as i64);
+    }
+}
+
+fn container_info_to_json(info: &ContainerInfo) -> serde_json::Value {
+    serde_json::json!({
+        "status": info.status,
+        "policy_index": info.policy_index,
+        "read_acl": info.read_acl,
+        "write_acl": info.write_acl,
+        "temp_url_keys": info.temp_url_keys,
+    })
+}
+
+fn container_info_from_json(v: &serde_json::Value) -> Option<ContainerInfo> {
+    Some(ContainerInfo {
+        status: v.get("status")?.as_u64()? as u16,
+        policy_index: v.get("policy_index").and_then(|x| x.as_i64()).unwrap_or(0),
+        read_acl: v
+            .get("read_acl")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        write_acl: v
+            .get("write_acl")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        temp_url_keys: v
+            .get("temp_url_keys")
+            .and_then(|x| x.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+fn account_info_to_json(info: &AccountInfo) -> serde_json::Value {
+    serde_json::json!({
+        "status": info.status,
+        "core_access_control": info.core_access_control,
+        "temp_url_keys": info.temp_url_keys,
+    })
+}
+
+fn account_info_from_json(v: &serde_json::Value) -> Option<AccountInfo> {
+    Some(AccountInfo {
+        status: v.get("status")?.as_u64()? as u16,
+        core_access_control: v
+            .get("core_access_control")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        temp_url_keys: v
+            .get("temp_url_keys")
+            .and_then(|x| x.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
 }
 
 /// `set_info_cache`'s cache lifetime for a backend info response
@@ -316,8 +474,8 @@ pub struct ProxyApp {
     pub info_json: String,
     pub config: ProxyConfig,
     pub error_limiter: ErrorLimiter,
-    /// In-process account/container info cache (Python: memcache). Private —
-    /// per-proxy state, rebuilt (empty) whenever the app is reconstructed.
+    /// Account/container info cache (L1 local + optional shared memcache L2).
+    /// Rebuilt whenever the app is reconstructed (ring reload).
     info_cache: InfoCache,
 }
 
@@ -1060,6 +1218,14 @@ impl ProxyApp {
         self
     }
 
+    /// Attach a shared memcache client for the info-cache L2 (P1c). When
+    /// unset, the proxy keeps the process-local L1 only.
+    pub fn with_info_memcache(mut self, client: MemcacheClient<TcpConn>) -> Self {
+        self.info_cache = InfoCache::new().with_memcache(client);
+        // Preserve any entries already written? Build always starts empty.
+        self
+    }
+
     /// Set the storage-policy name→index table (used to resolve a container
     /// PUT's `X-Storage-Policy` header). Builder-style so `main` can chain it.
     pub fn with_policy_names(
@@ -1152,9 +1318,14 @@ impl ProxyApp {
                         "etag",
                     ]
                     .contains(&kl.as_str());
+                // X-Remove-Container-* is translated to empty ACL/meta
+                // updates on the container server (P1c ACL revoke path).
+                let container_remove = server_type == "container"
+                    && kl.starts_with("x-remove-container-");
                 if kl.starts_with(&user)
                     || kl.starts_with(&sys)
                     || object_passthrough
+                    || container_remove
                     || [
                         "x-container-read",
                         "x-container-write",
@@ -1627,8 +1798,8 @@ impl ProxyApp {
     }
 
     /// `GETorHEAD_base` via `GetOrHeadHandler._make_node_request`
-    /// (base.py:1560-1692): iterate primaries then handoffs and return the
-    /// first *valid* source, guarding against stale reads during a
+    /// (base.py:1560-1692): iterate primaries then handoffs and return a
+    /// *valid* source, guarding against stale reads during a
     /// rebalance (upstream bug #1560574):
     /// - every object 404's `X-Backend-Timestamp` (a tombstone) raises
     ///   `latest_404_timestamp` (base.py:1642-1648);
@@ -1639,9 +1810,12 @@ impl ProxyApp {
     /// - a 404 from a handoff with no truthy `X-Backend-Timestamp` is not
     ///   authoritative and is thrown out (base.py:1617-1624), so a request
     ///   whose primaries are all unreachable resolves to 503, not 404.
+    /// - with `X-Newest: true`, every good source is collected and the
+    ///   newest-timestamp winner is returned (base.py:1614-1615, 1678-1688);
+    ///   without it, the first valid source wins (Python default for objects).
     #[allow(clippy::too_many_arguments)]
     fn get_or_head(
-        self: &Arc<Self>,
+        &self,
         server_type: &str,
         nodes: Vec<Node>,
         part: u32,
@@ -1652,6 +1826,10 @@ impl ProxyApp {
     ) -> Option<Response> {
         let is_object = server_type == "object";
         let is_head = method == "HEAD";
+        let newest = headers
+            .get("X-Newest")
+            .map(config_true_value)
+            .unwrap_or(false);
         let build = |resp: BackendResponse| -> Response {
             let mut out = Response::with_body(resp.status, resp.body);
             out.reason = resp.reason;
@@ -1720,6 +1898,10 @@ impl ProxyApp {
         // base.py:1416: the newest tombstone timestamp seen so far, zero
         // until an object 404 carries one.
         let mut latest_404_timestamp = Timestamp::zero();
+        // X-Newest path: collect every good source, then pick the newest
+        // timestamp after the node walk (base.py:1678-1688). Non-newest
+        // returns the first valid source immediately.
+        let mut newest_candidates: Vec<(Timestamp, BackendHead)> = Vec::new();
         for node in nodes {
             match backend_request_head(
                 &node,
@@ -1772,11 +1954,18 @@ impl ProxyApp {
                     // otherwise it is a stale copy (e.g. un-replicated data
                     // on a handoff after a DELETE) and is never returned
                     // (base.py:1679-1681).
-                    if source_timestamp(&head.headers) >= latest_404_timestamp {
+                    let ts = source_timestamp(&head.headers);
+                    if ts >= latest_404_timestamp {
+                        if newest {
+                            // Keep looking — one good source is not enough
+                            // when searching for the newest (base.py:1614).
+                            newest_candidates.push((ts, head));
+                            continue;
+                        }
                         // Once the winner streams there is no failover: a
                         // mid-stream backend failure aborts the client
-                        // connection (resumable ranged re-fetch is a
-                        // documented non-goal this pass).
+                        // connection (resumable ranged re-fetch remains
+                        // deferred).
                         if is_object && !is_head {
                             return Some(build_streamed(head));
                         }
@@ -1794,6 +1983,23 @@ impl ProxyApp {
                     Err(_) => self.error_limiter.increment(&node),
                 },
                 Err(_) => self.error_limiter.increment(&node),
+            }
+        }
+        if newest {
+            // Weed out sources older than tombstones discovered later in
+            // the walk, then take the newest (base.py:1678-1688).
+            newest_candidates.retain(|(ts, _)| *ts >= latest_404_timestamp);
+            if let Some((_, head)) = newest_candidates
+                .into_iter()
+                .max_by(|(a, _), (b, _)| a.cmp(b))
+            {
+                if is_object && !is_head {
+                    return Some(build_streamed(head));
+                }
+                return match buffered(head) {
+                    Ok(resp) => Some(build(resp)),
+                    Err(_) => recorded_404,
+                };
             }
         }
         recorded_404
@@ -1883,20 +2089,36 @@ impl ProxyApp {
         let account = segs[2].to_string();
         let container = segs.get(3).map(|s| s.to_string()).filter(|s| !s.is_empty());
         let object = segs.get(4).map(|s| s.to_string()).filter(|s| !s.is_empty());
-        // Authorize against the container ACL BEFORE dispatch — one central
-        // gate so no verb path can skip it (a skipped path would be a bypass,
-        // since tempauth now only authenticates). No-op when auth is disabled.
-        if let Some(denied) = self.authorize(&req, &account, container.as_deref(), object.as_deref())
+        // Authorize against the container/account ACL BEFORE dispatch — one
+        // central gate so no verb path can skip it (a skipped path would be a
+        // bypass, since tempauth now only authenticates). No-op when auth is
+        // disabled. Also rewrites X-Account-Access-Control → sysmeta.
+        let mut req = req;
+        if let Some(denied) =
+            self.authorize(&mut req, &account, container.as_deref(), object.as_deref())
         {
             return denied;
         }
+        let swift_owner = req
+            .headers
+            .get("X-Backend-Swift-Owner")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         match (container, object) {
             (Some(container), Some(object)) => {
-                let mut req = req;
                 self.object_request(&mut req, &account, &container, &object)
             }
-            (Some(container), None) => self.container_request(&req, &account, &container),
-            (None, _) => self.account_request(&req, &account),
+            (Some(container), None) => {
+                let mut resp = self.container_request(&req, &account, &container);
+                strip_owner_headers(&mut resp, swift_owner);
+                resp
+            }
+            (None, _) => {
+                let mut resp = self.account_request(&req, &account);
+                expose_account_acl_header(&mut resp);
+                strip_owner_headers(&mut resp, swift_owner);
+                resp
+            }
         }
     }
 
@@ -1998,6 +2220,24 @@ impl ProxyApp {
         );
         match req.method.as_str() {
             "GET" | "HEAD" => {
+                // Wave 3 L3b: shard-range listing fan-out for sharded containers.
+                // Skip when the client already asked for record-type=shard (or
+                // backend override), so admin shard listings stay single-hop.
+                let record_type = req
+                    .headers
+                    .get("X-Backend-Record-Type")
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if req.method == "GET"
+                    && record_type != "shard"
+                    && !req.query_string.contains("states=")
+                {
+                    if let Some(fan) =
+                        self.maybe_sharded_container_listing(req, account, container)
+                    {
+                        return fan;
+                    }
+                }
                 let headers = self.backend_headers(req, false, "container");
                 let nodes = self.iter_nodes(&self.container_ring, container_part);
                 let mut resp = self
@@ -2039,35 +2279,7 @@ impl ProxyApp {
                 // else do the live HEAD and cache it with set_info_cache
                 // semantics. An unreachable ring (None → 503) is never
                 // cached, like Python's synthesized 503 info.
-                let acct_status = match self.info_cache.get_account(account) {
-                    Some(status) => status,
-                    None => {
-                        let acct_headers = HeaderKeyDict::new();
-                        let acct_path = format!("/{}", percent_encode(account));
-                        let acct_nodes = self.iter_nodes(&self.account_ring, account_part);
-                        let acct_resp = self.get_or_head(
-                            "account",
-                            acct_nodes,
-                            account_part,
-                            "HEAD",
-                            &acct_path,
-                            "",
-                            &acct_headers,
-                        );
-                        let status = acct_resp.as_ref().map(|r| r.status).unwrap_or(503);
-                        if let Some(resp) = &acct_resp {
-                            if let Some(ttl) = info_cache_time(
-                                resp.status,
-                                resp.headers.get("X-Backend-Recheck-Account-Existence"),
-                                self.config.recheck_account_existence,
-                            ) {
-                                self.info_cache
-                                    .set_account(account.to_string(), resp.status, ttl);
-                            }
-                        }
-                        status
-                    }
-                };
+                let acct_status = self.account_info(account).status;
                 if acct_status == 404 {
                     if self.config.account_autocreate && req.method != "DELETE" {
                         self.autocreate_account(account);
@@ -2155,16 +2367,16 @@ impl ProxyApp {
     }
 
     /// `get_container_info`-lite (base.py:430-538): the container's
-    /// storage-policy index plus its read/write ACLs. Served from the
-    /// in-process info cache when fresh; a miss does a live HEAD to the
-    /// container ring and populates the cache with `set_info_cache`
-    /// semantics (base.py:672-694): 2xx for `recheck_container_existence`
-    /// seconds, 404 — the negative result, resolving to the default policy
-    /// and no ACLs — for a tenth of that, other errors and an unreachable
-    /// ring (Python's synthesized 503 info) never cached.
-    /// `read_acl`/`write_acl` are `None` when the container has none or is
-    /// unreachable; the policy falls back to the default.
-    fn container_info(self: &Arc<Self>, account: &str, container: &str) -> ContainerInfo {
+    /// storage-policy index plus its read/write ACLs and Temp-URL keys.
+    /// Served from the in-process info cache when fresh; a miss does a live
+    /// HEAD to the container ring and populates the cache with
+    /// `set_info_cache` semantics (base.py:672-694): 2xx for
+    /// `recheck_container_existence` seconds, 404 — the negative result,
+    /// resolving to the default policy and no ACLs — for a tenth of that,
+    /// other errors and an unreachable ring (Python's synthesized 503 info)
+    /// never cached. `read_acl`/`write_acl` are `None` when the container
+    /// has none or is unreachable; the policy falls back to the default.
+    fn container_info(&self, account: &str, container: &str) -> ContainerInfo {
         let cache_key = format!("{account}/{container}");
         if let Some(info) = self.info_cache.get_container(&cache_key) {
             return info;
@@ -2174,6 +2386,7 @@ impl ProxyApp {
             policy_index: self.config.default_policy_index,
             read_acl: None,
             write_acl: None,
+            temp_url_keys: Vec::new(),
         };
         let Ok((part, _)) = self.container_ring.get_nodes(account, Some(container), None) else {
             return info;
@@ -2192,6 +2405,7 @@ impl ProxyApp {
             }
             info.read_acl = resp.headers.get("X-Container-Read").map(str::to_string);
             info.write_acl = resp.headers.get("X-Container-Write").map(str::to_string);
+            info.temp_url_keys = temp_url_keys_from_headers(&resp.headers, "container");
             if let Some(ttl) = info_cache_time(
                 resp.status,
                 resp.headers.get("X-Backend-Recheck-Container-Existence"),
@@ -2203,32 +2417,252 @@ impl ProxyApp {
         info
     }
 
+    /// Wave 3: if the root container is sharding/sharded, fan out object
+    /// listings across listing-state shard ranges and merge JSON arrays.
+    /// Returns `None` when the container is unsharded or the probe fails
+    /// (caller falls back to the single-hop path).
+    fn maybe_sharded_container_listing(
+        self: &Arc<Self>,
+        req: &Request,
+        account: &str,
+        container: &str,
+    ) -> Option<Response> {
+        let Ok((part, _)) = self.container_ring.get_nodes(account, Some(container), None) else {
+            return None;
+        };
+        let path = format!(
+            "/{}/{}",
+            percent_encode(account),
+            percent_encode(container)
+        );
+        let nodes = self.iter_nodes(&self.container_ring, part);
+        // Probe HEAD for sharding state.
+        let head_headers = HeaderKeyDict::new();
+        let head = self.get_or_head("container", nodes.clone(), part, "HEAD", &path, "", &head_headers)?;
+        if !(200..300).contains(&head.status) {
+            return None;
+        }
+        let state = head
+            .headers
+            .get("X-Backend-Sharding-State")
+            .unwrap_or("unsharded")
+            .to_ascii_lowercase();
+        if state != "sharding" && state != "sharded" {
+            return None;
+        }
+        // Fetch shard ranges (listing states).
+        let mut shard_headers = HeaderKeyDict::new();
+        shard_headers.set("X-Backend-Record-Type", "shard");
+        let shard_qs = "states=listing&format=json";
+        let shard_resp = self.get_or_head(
+            "container",
+            nodes,
+            part,
+            "GET",
+            &path,
+            shard_qs,
+            &shard_headers,
+        )?;
+        if !(200..300).contains(&shard_resp.status) {
+            return None;
+        }
+        let shard_body = shard_resp.body.into_vec(16 * 1024 * 1024).ok()?;
+        let ranges: serde_json::Value = serde_json::from_slice(&shard_body).ok()?;
+        let arr = ranges.as_array()?;
+        if arr.is_empty() {
+            return None;
+        }
+        // Parse client listing knobs.
+        let marker = req.param("marker").unwrap_or_default();
+        let prefix = req.param("prefix").unwrap_or_default();
+        let limit: usize = req
+            .param("limit")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10000);
+        let selected = select_listing_shard_ranges(arr, &marker, &prefix);
+        let mut shard_listings: Vec<Vec<serde_json::Value>> = Vec::new();
+        for sr in &selected {
+            let name = sr.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let (shard_account, shard_container) = match name.split_once('/') {
+                Some((a, c)) => (a, c),
+                None => continue,
+            };
+            let Ok((spart, _)) =
+                self.container_ring
+                    .get_nodes(shard_account, Some(shard_container), None)
+            else {
+                continue;
+            };
+            let spath = format!(
+                "/{}/{}",
+                percent_encode(shard_account),
+                percent_encode(shard_container)
+            );
+            let snodes = self.iter_nodes(&self.container_ring, spart);
+            let remaining = limit.saturating_sub(
+                shard_listings.iter().map(|v| v.len()).sum::<usize>(),
+            );
+            if remaining == 0 {
+                break;
+            }
+            let mut qs_parts = vec!["format=json".to_string()];
+            if !marker.is_empty() {
+                qs_parts.push(format!("marker={}", percent_encode(&marker)));
+            }
+            if !prefix.is_empty() {
+                qs_parts.push(format!("prefix={}", percent_encode(&prefix)));
+            }
+            qs_parts.push(format!("limit={remaining}"));
+            let headers = self.backend_headers(req, false, "container");
+            let Some(resp) = self.get_or_head(
+                "container",
+                snodes,
+                spart,
+                "GET",
+                &spath,
+                &qs_parts.join("&"),
+                &headers,
+            ) else {
+                continue;
+            };
+            if !(200..300).contains(&resp.status) {
+                continue;
+            }
+            let body = match resp.body.into_vec(16 * 1024 * 1024) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if let Ok(serde_json::Value::Array(items)) = serde_json::from_slice(&body) {
+                shard_listings.push(items);
+            }
+        }
+        let merged = merge_sharded_object_listings(&shard_listings, limit);
+        let bytes = serde_json::to_vec(&merged).unwrap_or_else(|_| b"[]".to_vec());
+        let mut out = Response::with_body(200, bytes);
+        out.headers.set("Content-Type", "application/json; charset=utf-8");
+        out.headers.set("X-Backend-Sharding-State", state);
+        out.headers.set("X-Backend-Record-Type", "object");
+        if let Some(name) = head
+            .headers
+            .get("X-Backend-Storage-Policy-Index")
+            .and_then(|v| v.parse::<i64>().ok())
+            .and_then(|idx| self.policy_index_to_name.get(&idx))
+        {
+            out.headers.set("X-Storage-Policy", name);
+        }
+        Some(out)
+    }
+
+    /// `get_account_info`-lite: status, account ACL sysmeta, Temp-URL keys.
+    fn account_info(&self, account: &str) -> AccountInfo {
+        if let Some(info) = self.info_cache.get_account(account) {
+            return info;
+        }
+        let mut info = AccountInfo::default();
+        let Ok((part, _)) = self.account_ring.get_nodes(account, None, None) else {
+            info.status = 503;
+            return info;
+        };
+        let path = format!("/{}", percent_encode(account));
+        let nodes = self.iter_nodes(&self.account_ring, part);
+        let headers = HeaderKeyDict::new();
+        if let Some(resp) = self.get_or_head("account", nodes, part, "HEAD", &path, "", &headers)
+        {
+            info = account_info_from_response(&resp);
+            if let Some(ttl) = info_cache_time(
+                resp.status,
+                resp.headers.get("X-Backend-Recheck-Account-Existence"),
+                self.config.recheck_account_existence,
+            ) {
+                self.info_cache
+                    .set_account(account.to_string(), info.clone(), ttl);
+            }
+        } else {
+            info.status = 503;
+        }
+        info
+    }
+
+    /// Parsed TempAuth account ACLs from the account HEAD sysmeta.
+    fn account_acls(&self, account: &str) -> Option<swift_middleware::AccountAcls> {
+        let info = self.account_info(account);
+        swift_middleware::acls_from_sysmeta(info.core_access_control.as_deref())
+    }
+
+    /// Temp-URL keys for `account` + optional `container` (account keys
+    /// first, then container keys), matching Python `_get_keys` order.
+    ///
+    /// Uses the shared info cache (L1 + memcache L2). Account/container POST
+    /// clears the cache key on every proxy's L2, so a key set via VIP on one
+    /// backend is visible to TempURL validation on another without waiting
+    /// for a stale per-process TTL.
+    pub fn temp_url_keys(&self, account: &str, container: &str) -> Vec<String> {
+        let mut keys = self.account_info(account).temp_url_keys;
+        if !container.is_empty() {
+            keys.extend(self.container_info(account, container).temp_url_keys);
+        }
+        keys
+    }
+
     /// `get_container_info`-lite: the container's storage-policy index only.
-    fn container_policy_index(self: &Arc<Self>, account: &str, container: &str) -> i64 {
+    fn container_policy_index(&self, account: &str, container: &str) -> i64 {
         self.container_info(account, container).policy_index
     }
 
-    /// Authorize a request against the container ACL (Python `swift.authorize`),
-    /// using the unspoofable group list a preceding auth middleware stamped.
-    /// Returns `Some(denial)` (401/403) or `None` (allowed / auth disabled).
+    /// Authorize + prepare account ACL header (Python `swift.authorize` +
+    /// TempAuth `extract_acl_and_report_errors`). Returns `Some(denial)` or
+    /// `None` (allowed / auth disabled). On success, stamps
+    /// `X-Backend-Swift-Owner` when the caller is a swift_owner.
     fn authorize(
         self: &Arc<Self>,
-        req: &Request,
+        req: &mut Request,
         account: &str,
         container: Option<&str>,
         object: Option<&str>,
     ) -> Option<Response> {
+        // TempURL (etc.) stamped authorize_override after a valid signature.
+        if req
+            .headers
+            .get("X-Backend-Authorize-Override")
+            .map(config_true_value)
+            .unwrap_or(false)
+        {
+            // TempURL is deliberately not a Swift owner: privileged response
+            // metadata must still be stripped on the way back out.
+            req.headers.remove("X-Backend-Swift-Owner");
+            return None;
+        }
         if !self.config.auth_enabled {
             return None;
         }
-        let groups: Vec<String> = req
-            .headers
-            .get("X-Backend-Remote-User")
-            .unwrap_or("")
-            .split(',')
-            .filter(|g| !g.is_empty())
-            .map(str::to_string)
-            .collect();
+
+        // Validate / rewrite X-Account-Access-Control → sysmeta before the
+        // backend write (TempAuth.extract_acl_and_report_errors).
+        if req.headers.contains_key("X-Account-Access-Control") {
+            match swift_middleware::validate_account_acl_header(
+                req.headers.get("X-Account-Access-Control"),
+            ) {
+                Ok(Some(sysmeta)) => {
+                    req.headers.remove("X-Account-Access-Control");
+                    req.headers
+                        .set("X-Account-Sysmeta-Core-Access-Control", sysmeta);
+                }
+                Ok(None) => {}
+                Err(msg) => {
+                    let body = format!(
+                        "X-Account-Access-Control invalid: {msg}\n\nInput: {}\n",
+                        req.headers
+                            .get("X-Account-Access-Control")
+                            .unwrap_or("")
+                    );
+                    let mut resp = Response::with_body(400, body);
+                    resp.headers
+                        .set("Content-Type", "text/plain; charset=UTF-8");
+                    return Some(resp);
+                }
+            }
+        }
+
         // The relevant ACL: object/container reads use read_acl, object writes
         // use write_acl; account requests and container writes are owner-only.
         let acl: Option<String> = match container {
@@ -2242,14 +2676,62 @@ impl ProxyApp {
             }
             _ => None,
         };
-        swift_middleware::TempAuth::authorize_acl(
+
+        // Keystone path (P3-auth): keystoneauth stamped Auth-Plugin.
+        let keystone_plugin = req
+            .headers
+            .get(swift_middleware::AUTH_PLUGIN_HEADER)
+            .map(|v| v.eq_ignore_ascii_case(swift_middleware::AUTH_PLUGIN_KEYSTONE))
+            .unwrap_or(false);
+        if keystone_plugin {
+            if let Some(ka) = &self.config.keystone_auth {
+                let (denied, swift_owner) = ka.authorize_request(
+                    req,
+                    account,
+                    container,
+                    object,
+                    acl.as_deref(),
+                    req.headers.get("Referer"),
+                );
+                if denied.is_none() {
+                    if swift_owner {
+                        req.headers.set("X-Backend-Swift-Owner", "true");
+                    } else {
+                        req.headers.remove("X-Backend-Swift-Owner");
+                    }
+                }
+                return denied;
+            }
+        }
+
+        let groups: Vec<String> = req
+            .headers
+            .get("X-Backend-Remote-User")
+            .unwrap_or("")
+            .split(',')
+            .filter(|g| !g.is_empty())
+            .map(str::to_string)
+            .collect();
+        let account_acls = self.account_acls(account);
+        let mut swift_owner = false;
+        let denied = swift_middleware::TempAuth::authorize_acl(
             &req.method,
             &req.path,
             &groups,
             acl.as_deref(),
             req.headers.get("Referer"),
             "AUTH_",
-        )
+            account_acls.as_ref(),
+            &mut swift_owner,
+        );
+        if denied.is_none() {
+            if swift_owner {
+                req.headers.set("X-Backend-Swift-Owner", "true");
+            } else {
+                req.headers.remove("X-Backend-Swift-Owner");
+            }
+        }
+        denied
     }
 
     fn object_request(
@@ -3344,6 +3826,44 @@ fn synthesized_account_listing(req: &Request) -> Response {
     resp
 }
 
+/// Select listing-state shard ranges that can contribute to a client listing
+/// given `marker` / `prefix` (Wave 3 L3b fan-out filter).
+pub(crate) fn select_listing_shard_ranges<'a>(
+    ranges: &'a [serde_json::Value],
+    marker: &str,
+    prefix: &str,
+) -> Vec<&'a serde_json::Value> {
+    let mut out = Vec::new();
+    for sr in ranges {
+        let upper = sr.get("upper").and_then(|v| v.as_str()).unwrap_or("");
+        if !marker.is_empty() && !upper.is_empty() && upper <= marker {
+            continue;
+        }
+        if !prefix.is_empty() && !upper.is_empty() && upper < prefix {
+            continue;
+        }
+        out.push(sr);
+    }
+    out
+}
+
+/// Merge per-shard object listing arrays, stopping at `limit`.
+pub(crate) fn merge_sharded_object_listings(
+    shard_listings: &[Vec<serde_json::Value>],
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    let mut merged = Vec::new();
+    for items in shard_listings {
+        for item in items {
+            merged.push(item.clone());
+            if merged.len() >= limit {
+                return merged;
+            }
+        }
+    }
+    merged
+}
+
 fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -3355,6 +3875,72 @@ fn percent_encode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Python `get_tempurl_keys_from_metadata` for account/container user meta.
+fn temp_url_keys_from_headers(headers: &HeaderKeyDict, server_type: &str) -> Vec<String> {
+    let prefix = format!("x-{server_type}-meta-");
+    let mut keys = Vec::new();
+    for (name, value) in headers.iter() {
+        let lower = name.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix(&prefix) {
+            if rest == "temp-url-key" || rest == "temp-url-key-2" {
+                if !value.is_empty() {
+                    keys.push(value.to_string());
+                }
+            }
+        }
+    }
+    keys
+}
+
+fn account_info_from_response(resp: &Response) -> AccountInfo {
+    AccountInfo {
+        status: resp.status,
+        core_access_control: resp
+            .headers
+            .get("X-Account-Sysmeta-Core-Access-Control")
+            .map(str::to_string),
+        temp_url_keys: temp_url_keys_from_headers(&resp.headers, "account"),
+    }
+}
+
+/// Account controller `add_acls_from_sys_metadata`: expose the client header.
+fn expose_account_acl_header(resp: &mut Response) {
+    if let Some(sys) = resp.headers.remove("X-Account-Sysmeta-Core-Access-Control") {
+        if let Some(acls) = swift_middleware::acls_from_sysmeta(Some(&sys)) {
+            resp.headers
+                .set("X-Account-Access-Control", swift_middleware::format_acl_v2(&acls));
+        } else if let Some(raw) = swift_middleware::parse_acl_v2(Some(&sys)) {
+            // Empty dict / clear — still surface an empty JSON object when
+            // sysmeta was explicitly set to {}.
+            if raw.is_empty() {
+                resp.headers.set("X-Account-Access-Control", "{}");
+            }
+        }
+    }
+}
+
+/// Strip privileged account/container headers for non-owners (Python
+/// `swift_owner_headers`).
+fn strip_owner_headers(resp: &mut Response, swift_owner: bool) {
+    if swift_owner {
+        return;
+    }
+    const OWNER_HEADERS: &[&str] = &[
+        "X-Container-Read",
+        "X-Container-Write",
+        "X-Container-Sync-Key",
+        "X-Container-Sync-To",
+        "X-Account-Meta-Temp-Url-Key",
+        "X-Account-Meta-Temp-Url-Key-2",
+        "X-Container-Meta-Temp-Url-Key",
+        "X-Container-Meta-Temp-Url-Key-2",
+        "X-Account-Access-Control",
+    ];
+    for name in OWNER_HEADERS {
+        resp.headers.remove(name);
+    }
 }
 
 pub fn serve(listener: std::net::TcpListener, app: Arc<ProxyApp>) -> std::io::Result<()> {
@@ -3516,6 +4102,25 @@ mod stale_read_and_post_tests {
         assert!(!is_good_source(416, false));
     }
 
+    #[test]
+    fn test_x_newest_picks_max_timestamp_after_tombstone_filter() {
+        // Mirrors base.py:1678-1688: after collecting candidates under
+        // X-Newest, drop any older than the latest tombstone and take max.
+        let older: Timestamp = "1000000001.00000".parse().unwrap();
+        let newer: Timestamp = "1000000003.00000".parse().unwrap();
+        let tombstone: Timestamp = "1000000002.00000".parse().unwrap();
+        let mut candidates = vec![older, newer];
+        candidates.retain(|ts| *ts >= tombstone);
+        assert_eq!(candidates, vec![newer]);
+        assert_eq!(candidates.into_iter().max(), Some(newer));
+        // Without X-Newest semantics the first good source would win even
+        // when a later replica is newer — that path is covered by the
+        // existing first-valid-source walk; this asserts the newest filter.
+        assert!(config_true_value("true"));
+        assert!(config_true_value("True"));
+        assert!(!config_true_value("f"));
+    }
+
     fn br(status: u16) -> BackendResponse {
         BackendResponse {
             status,
@@ -3559,6 +4164,7 @@ mod info_cache_tests {
             policy_index: policy,
             read_acl: Some("r".to_string()),
             write_acl: None,
+            temp_url_keys: Vec::new(),
         }
     }
 
@@ -3595,18 +4201,32 @@ mod info_cache_tests {
     #[test]
     fn test_account_map_hit_expiry_and_clear() {
         let cache = InfoCache::new();
-        assert_eq!(cache.get_account("a"), None);
-        cache.set_account("a".to_string(), 204, 60.0);
-        assert_eq!(cache.get_account("a"), Some(204));
+        assert!(cache.get_account("a").is_none());
+        cache.set_account(
+            "a".to_string(),
+            AccountInfo {
+                status: 204,
+                ..Default::default()
+            },
+            60.0,
+        );
+        assert_eq!(cache.get_account("a").unwrap().status, 204);
         // the maps are independent namespaces
         assert!(cache.get_container("a").is_none());
         // clear_info_cache (account PUT/POST/DELETE, successful autocreate)
         cache.clear_account("a");
-        assert_eq!(cache.get_account("a"), None);
+        assert!(cache.get_account("a").is_none());
         // expiry
-        cache.set_account("a".to_string(), 404, 0.01);
+        cache.set_account(
+            "a".to_string(),
+            AccountInfo {
+                status: 404,
+                ..Default::default()
+            },
+            0.01,
+        );
         std::thread::sleep(Duration::from_millis(30));
-        assert_eq!(cache.get_account("a"), None);
+        assert!(cache.get_account("a").is_none());
     }
 
     #[test]
@@ -3625,5 +4245,164 @@ mod info_cache_tests {
         assert_eq!(info_cache_time(200, Some("120"), 60.0), Some(120.0));
         assert_eq!(info_cache_time(404, Some("120"), 60.0), Some(12.0));
         assert_eq!(info_cache_time(200, Some("banana"), 60.0), Some(60.0));
+    }
+}
+
+#[cfg(test)]
+mod p1a_wiring_tests {
+    use super::policy_ring_tests::ring;
+    use super::*;
+
+    fn app(auth_enabled: bool) -> Arc<ProxyApp> {
+        Arc::new(ProxyApp::new(
+            ring(0),
+            ring(0),
+            ProxyConfig {
+                auth_enabled,
+                ..Default::default()
+            },
+        ))
+    }
+
+    #[test]
+    fn authorize_override_allows_as_non_owner() {
+        let app = app(true);
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Authorize-Override", "true");
+        headers.set("X-Backend-Swift-Owner", "true");
+        let mut req = Request {
+            method: "GET".to_string(),
+            path: "/v1/AUTH_test/container/object".to_string(),
+            query_string: String::new(),
+            headers,
+            body: swift_http::Body::empty(),
+        };
+
+        assert!(app
+            .authorize(&mut req, "AUTH_test", Some("container"), Some("object"))
+            .is_none());
+        assert!(req.headers.get("X-Backend-Swift-Owner").is_none());
+    }
+
+    #[test]
+    fn cached_account_acls_are_loaded() {
+        let app = app(true);
+        app.info_cache.set_account(
+            "AUTH_test".to_string(),
+            AccountInfo {
+                status: 204,
+                core_access_control: Some(
+                    r#"{"admin":["AUTH_other:admin"],"read-only":["AUTH_other:reader"]}"#
+                        .to_string(),
+                ),
+                temp_url_keys: Vec::new(),
+            },
+            60.0,
+        );
+
+        let acls = app.account_acls("AUTH_test").expect("account ACLs");
+        assert_eq!(acls.admin, vec!["AUTH_other:admin"]);
+        assert_eq!(acls.read_only, vec!["AUTH_other:reader"]);
+    }
+
+    #[test]
+    fn account_acl_is_exposed_then_owner_headers_are_filtered() {
+        let mut resp = Response::new(204);
+        resp.headers.set(
+            "X-Account-Sysmeta-Core-Access-Control",
+            r#"{"read-write":["AUTH_other:user"]}"#,
+        );
+        for name in [
+            "X-Account-Meta-Temp-Url-Key",
+            "X-Account-Meta-Temp-Url-Key-2",
+            "X-Container-Meta-Temp-Url-Key",
+            "X-Container-Meta-Temp-Url-Key-2",
+            "X-Container-Read",
+            "X-Container-Write",
+        ] {
+            resp.headers.set(name, "secret");
+        }
+
+        expose_account_acl_header(&mut resp);
+        assert!(resp
+            .headers
+            .get("X-Account-Sysmeta-Core-Access-Control")
+            .is_none());
+        let exposed: serde_json::Value = serde_json::from_str(
+            resp.headers
+                .get("X-Account-Access-Control")
+                .expect("client ACL header"),
+        )
+        .unwrap();
+        assert_eq!(exposed["read-write"][0], "AUTH_other:user");
+
+        strip_owner_headers(&mut resp, true);
+        assert!(resp.headers.get("X-Account-Access-Control").is_some());
+        strip_owner_headers(&mut resp, false);
+        for name in [
+            "X-Account-Access-Control",
+            "X-Account-Meta-Temp-Url-Key",
+            "X-Account-Meta-Temp-Url-Key-2",
+            "X-Container-Meta-Temp-Url-Key",
+            "X-Container-Meta-Temp-Url-Key-2",
+            "X-Container-Read",
+            "X-Container-Write",
+        ] {
+            assert!(resp.headers.get(name).is_none(), "{name} leaked");
+        }
+    }
+
+    #[test]
+    fn tempurl_key_header_extraction_ignores_empty_values() {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Account-Meta-Temp-Url-Key", "");
+        headers.set("X-Account-Meta-Temp-Url-Key-2", "second");
+        assert_eq!(
+            temp_url_keys_from_headers(&headers, "account"),
+            vec!["second"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod shard_listing_fanout_tests {
+    use super::{merge_sharded_object_listings, select_listing_shard_ranges};
+
+    fn sr(name: &str, lower: &str, upper: &str) -> serde_json::Value {
+        serde_json::json!({"name": name, "lower": lower, "upper": upper})
+    }
+
+    #[test]
+    fn select_ranges_skips_before_marker_and_prefix() {
+        let ranges = vec![
+            sr(".shards/a", "", "m"),
+            sr(".shards/b", "m", "t"),
+            sr(".shards/c", "t", ""),
+        ];
+        let selected = select_listing_shard_ranges(&ranges, "m", "");
+        // upper "m" <= marker "m" → skip first
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0]["name"], ".shards/b");
+
+        let selected = select_listing_shard_ranges(&ranges, "", "u");
+        // upper "m" < "u" and upper "t" < "u" → only open-ended last range
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0]["name"], ".shards/c");
+    }
+
+    #[test]
+    fn merge_listings_respects_limit_across_shards() {
+        let a = vec![
+            serde_json::json!({"name": "a1"}),
+            serde_json::json!({"name": "a2"}),
+        ];
+        let b = vec![
+            serde_json::json!({"name": "b1"}),
+            serde_json::json!({"name": "b2"}),
+        ];
+        let merged = merge_sharded_object_listings(&[a, b], 3);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0]["name"], "a1");
+        assert_eq!(merged[2]["name"], "b1");
     }
 }

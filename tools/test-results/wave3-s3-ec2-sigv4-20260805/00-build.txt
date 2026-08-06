@@ -1,0 +1,3 @@
+NEWSHA=0cafe5f164da0c19906a74f0efb0e57be4494106fdc11cd40969b0d1b43ed02e
+-rwxr-xr-x@ 1 oboy  staff  2914976 Aug  5 18:30 /Users/oboy/Downloads/Peregrine/swift-rust/target/release/swift-proxy-server
+2026-08-05T10:31:04Z

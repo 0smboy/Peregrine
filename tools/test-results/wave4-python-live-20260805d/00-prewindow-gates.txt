@@ -1,0 +1,56 @@
+=== pre-window 20260805T113908Z ===
+---- swift1 ----
+swift1
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  897M   50G   2% /srv/node/d1
+/dev/sda6        50G  727M   50G   2% /srv/node/d2
+/dev/sda7        50G  729M   50G   2% /srv/node/d3
+active
+active
+active
+active
+active
+active
+MemAvail_GiB=4.42
+---- swift2 ----
+swift2
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  863M   50G   2% /srv/node/d1
+/dev/sda6        50G  727M   50G   2% /srv/node/d2
+/dev/sda7        50G  728M   50G   2% /srv/node/d3
+active
+active
+active
+active
+active
+active
+MemAvail_GiB=2.98
+---- swift3 ----
+swift3
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  895M   50G   2% /srv/node/d1
+/dev/sda6        50G  728M   50G   2% /srv/node/d2
+/dev/sda7        50G  729M   50G   2% /srv/node/d3
+active
+active
+active
+active
+active
+active
+MemAvail_GiB=3.26
+---- swift4 ----
+swift4
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  852M   50G   2% /srv/node/d1
+/dev/sda6        50G  725M   50G   2% /srv/node/d2
+/dev/sda7        50G  729M   50G   2% /srv/node/d3
+active
+active
+active
+active
+active
+active
+MemAvail_GiB=4.56
+=== backup ===
+BACKUP_OK swift1 12 files
+BACKUP_TS=20260805T113908Z

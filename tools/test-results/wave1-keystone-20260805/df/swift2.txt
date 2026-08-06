@@ -1,0 +1,25 @@
+Filesystem      Size  Used Avail Use% Mounted on
+devtmpfs        3.8G     0  3.8G   0% /dev
+tmpfs           3.8G  4.0K  3.8G   1% /dev/shm
+tmpfs           1.6G  676K  1.5G   1% /run
+/dev/sda4        40G  7.3G   33G  19% /
+/dev/sda3       936M  519M  417M  56% /boot
+/dev/sda7        50G   45G  5.2G  90% /srv/node/d3
+/dev/sda5        50G   46G  4.2G  92% /srv/node/d1
+/dev/sda6        50G   45G  5.3G  90% /srv/node/d2
+/dev/sda2       100M   12M   89M  12% /boot/efi
+tmpfs           769M     0  769M   0% /run/user/0
+---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda4        40G  7.3G   33G  19% /
+/dev/sda4        40G  7.3G   33G  19% /
+/dev/sda4        40G  7.3G   33G  19% /
+/dev/sda5        50G   46G  4.2G  92% /srv/node/d1
+/dev/sda6        50G   45G  5.3G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.2G  90% /srv/node/d3
+---MEM---
+               total        used        free      shared  buff/cache   available
+Mem:            7680        5021         165           4        2796        2659
+Swap:              0           0           0
+---LOAD---
+ 03:38:52 up 3 days, 16:04,  0 users,  load average: 5.66, 5.89, 6.20

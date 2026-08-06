@@ -1,0 +1,87 @@
+===== swift1 =====
+patched ok
+['pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server', '[filter:formpost]', '[filter:versioned_writes]']
+active
+health=200
+['account_quotas', 'bulk_delete', 'container_quotas', 'dlo', 'formpost', 'slo', 'staticweb', 'swift', 'symlink', 'tempauth', 'tempurl', 'versioned_writes']
+INFO_OK
+Aug 04 14:00:31 swift1 proxy-server[4112651]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server
+Aug 04 14:00:31 swift1 proxy-server[4112651]: INFO proxy_logging enabled (logger sink)
+Aug 04 14:00:31 swift1 proxy-server[4112651]: INFO cache enabled (memcache_servers=10.0.0.1:11211)
+Aug 04 14:00:31 swift1 proxy-server[4112651]: INFO listing_formats enabled
+Aug 04 14:00:31 swift1 proxy-server[4112651]: INFO bulk enabled (delete; max_deletes_per_request=10000)
+Aug 04 14:00:31 swift1 proxy-server[4112651]: INFO tempurl enabled
+Aug 04 14:00:31 swift1 proxy-server[4112651]: INFO formpost enabled
+Aug 04 14:00:31 swift1 proxy-server[4112651]: INFO staticweb enabled
+Aug 04 14:00:31 swift1 proxy-server[4112651]: INFO container_quotas enabled
+Aug 04 14:00:31 swift1 proxy-server[4112651]: INFO account_quotas enabled
+Aug 04 14:00:31 swift1 proxy-server[4112651]: INFO symlink enabled (symloop_max=2)
+Aug 04 14:00:31 swift1 proxy-server[4112651]: INFO versioned_writes enabled (allow=Some(true))
+Aug 04 14:00:31 swift1 proxy-server[4112651]: INFO tempauth enabled
+Aug 04 14:00:31 swift1 proxy-server[4112651]: INFO copy enabled
+Aug 04 14:00:31 swift1 proxy-server[4112651]: INFO slo enabled
+Aug 04 14:00:31 swift1 proxy-server[4112651]: INFO dlo enabled
+Aug 04 14:00:31 swift1 proxy-server[4112651]: INFO proxy_logging enabled (logger sink)
+===== swift2 =====
+patched ok
+['pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server', '[filter:formpost]', '[filter:versioned_writes]']
+active
+health=200
+['account_quotas', 'bulk_delete', 'container_quotas', 'dlo', 'formpost', 'slo', 'staticweb', 'swift', 'symlink', 'tempauth', 'tempurl', 'versioned_writes']
+INFO_OK
+Aug 04 14:01:18 swift2 proxy-server[540234]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server
+Aug 04 14:01:18 swift2 proxy-server[540234]: INFO proxy_logging enabled (logger sink)
+Aug 04 14:01:18 swift2 proxy-server[540234]: INFO cache enabled (memcache_servers=10.0.0.1:11211)
+Aug 04 14:01:18 swift2 proxy-server[540234]: INFO listing_formats enabled
+Aug 04 14:01:18 swift2 proxy-server[540234]: INFO bulk enabled (delete; max_deletes_per_request=10000)
+Aug 04 14:01:18 swift2 proxy-server[540234]: INFO tempurl enabled
+Aug 04 14:01:18 swift2 proxy-server[540234]: INFO formpost enabled
+Aug 04 14:01:18 swift2 proxy-server[540234]: INFO staticweb enabled
+Aug 04 14:01:18 swift2 proxy-server[540234]: INFO container_quotas enabled
+Aug 04 14:01:18 swift2 proxy-server[540234]: INFO account_quotas enabled
+Aug 04 14:01:18 swift2 proxy-server[540234]: INFO symlink enabled (symloop_max=2)
+Aug 04 14:01:18 swift2 proxy-server[540234]: INFO versioned_writes enabled (allow=Some(true))
+Aug 04 14:01:18 swift2 proxy-server[540234]: INFO tempauth enabled
+Aug 04 14:01:18 swift2 proxy-server[540234]: INFO copy enabled
+Aug 04 14:01:18 swift2 proxy-server[540234]: INFO slo enabled
+Aug 04 14:01:18 swift2 proxy-server[540234]: INFO dlo enabled
+Aug 04 14:01:18 swift2 proxy-server[540234]: INFO proxy_logging enabled (logger sink)
+===== swift3 =====
+patched ok
+['pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server', '[filter:formpost]', '[filter:versioned_writes]']
+active
+health=200
+['account_quotas', 'bulk_delete', 'container_quotas', 'dlo', 'formpost', 'slo', 'staticweb', 'swift', 'symlink', 'tempauth', 'tempurl', 'versioned_writes']
+INFO_OK
+Aug 04 14:01:59 swift3 proxy-server[3538753]: INFO symlink enabled (symloop_max=2)
+Aug 04 14:01:59 swift3 proxy-server[3538753]: INFO versioned_writes enabled (allow=Some(true))
+Aug 04 14:01:59 swift3 proxy-server[3538753]: INFO tempauth enabled
+Aug 04 14:01:59 swift3 proxy-server[3538753]: INFO copy enabled
+Aug 04 14:01:59 swift3 proxy-server[3538753]: INFO slo enabled
+Aug 04 14:01:59 swift3 proxy-server[3538753]: INFO dlo enabled
+Aug 04 14:01:59 swift3 proxy-server[3538753]: INFO proxy_logging enabled (logger sink)
+===== swift4 =====
+patched ok
+['pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server', '[filter:formpost]', '[filter:versioned_writes]']
+active
+health=200
+['account_quotas', 'bulk_delete', 'container_quotas', 'dlo', 'formpost', 'slo', 'staticweb', 'swift', 'symlink', 'tempauth', 'tempurl', 'versioned_writes']
+INFO_OK
+Aug 04 14:02:30 swift4 proxy-server[2272846]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server
+Aug 04 14:02:30 swift4 proxy-server[2272846]: INFO proxy_logging enabled (logger sink)
+Aug 04 14:02:30 swift4 proxy-server[2272846]: INFO cache enabled (memcache_servers=10.0.0.1:11211)
+Aug 04 14:02:30 swift4 proxy-server[2272846]: INFO listing_formats enabled
+Aug 04 14:02:30 swift4 proxy-server[2272846]: INFO bulk enabled (delete; max_deletes_per_request=10000)
+Aug 04 14:02:30 swift4 proxy-server[2272846]: INFO tempurl enabled
+Aug 04 14:02:30 swift4 proxy-server[2272846]: INFO formpost enabled
+Aug 04 14:02:30 swift4 proxy-server[2272846]: INFO staticweb enabled
+Aug 04 14:02:30 swift4 proxy-server[2272846]: INFO container_quotas enabled
+Aug 04 14:02:30 swift4 proxy-server[2272846]: INFO account_quotas enabled
+Aug 04 14:02:30 swift4 proxy-server[2272846]: INFO symlink enabled (symloop_max=2)
+Aug 04 14:02:30 swift4 proxy-server[2272846]: INFO versioned_writes enabled (allow=Some(true))
+Aug 04 14:02:30 swift4 proxy-server[2272846]: INFO tempauth enabled
+Aug 04 14:02:30 swift4 proxy-server[2272846]: INFO copy enabled
+Aug 04 14:02:30 swift4 proxy-server[2272846]: INFO slo enabled
+Aug 04 14:02:30 swift4 proxy-server[2272846]: INFO dlo enabled
+Aug 04 14:02:30 swift4 proxy-server[2272846]: INFO proxy_logging enabled (logger sink)
+DEPLOY_DONE

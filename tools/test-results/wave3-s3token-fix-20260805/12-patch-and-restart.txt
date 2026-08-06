@@ -1,0 +1,153 @@
+===== PATCH swift1 =====
+PATCHED /usr/lib/python3.9/site-packages/keystone/api/s3tokens.py
+--- /usr/lib/python3.9/site-packages/keystone/api/s3tokens.py.bak-20260805	2024-04-03 12:48:14.000000000 +0000
++++ /usr/lib/python3.9/site-packages/keystone/api/s3tokens.py	2026-08-05 10:20:52.477648596 +0000
+@@ -13,6 +13,7 @@
+ # This file handles all flask-restful resources for /v3/s3tokens
+ 
+ import base64
++import binascii
+ import hashlib
+ import hmac
+ 
+@@ -77,7 +78,13 @@
+ class S3Resource(EC2_S3_Resource.ResourceBase):
+     @staticmethod
+     def _check_signature(creds_ref, credentials):
+-        string_to_sign = base64.urlsafe_b64decode(str(credentials['token']))
++        # Contabo LAB fix 2026-08-05: invalid base64 used to raise binascii.Error
++        # uncaught → uwsgi 500/RemoteDisconnected. Return Unauthorized instead.
++        try:
++            string_to_sign = base64.urlsafe_b64decode(str(credentials['token']))
++        except (TypeError, ValueError, binascii.Error):
++            raise exception.Unauthorized(
++                message=_('Invalid EC2 signature.'))
+ 
+         if string_to_sign[0:4] != b'AWS4':
+             signature = _calculate_signature_v1(string_to_sign,
+@@ -100,6 +107,8 @@
+         token_reference = render_token.render_token_response_from_model(token)
+         resp_body = jsonutils.dumps(token_reference)
+         response = flask.make_response(resp_body, http.client.OK)
++        # Match /v3/ec2tokens — Fernet token id is not in JSON body.
++        response.headers['X-Subject-Token'] = token.id
+         response.headers['Content-Type'] = 'application/json'
+         return response
+ 
+
+keystone-public: stopped
+keystone-admin: stopped
+keystone-public: started
+keystone-admin: started
+===== PATCH swift2 =====
+PATCHED /usr/lib/python3.9/site-packages/keystone/api/s3tokens.py
+--- /usr/lib/python3.9/site-packages/keystone/api/s3tokens.py.bak-20260805	2024-04-03 12:48:14.000000000 +0000
++++ /usr/lib/python3.9/site-packages/keystone/api/s3tokens.py	2026-08-05 10:21:23.299275966 +0000
+@@ -13,6 +13,7 @@
+ # This file handles all flask-restful resources for /v3/s3tokens
+ 
+ import base64
++import binascii
+ import hashlib
+ import hmac
+ 
+@@ -77,7 +78,13 @@
+ class S3Resource(EC2_S3_Resource.ResourceBase):
+     @staticmethod
+     def _check_signature(creds_ref, credentials):
+-        string_to_sign = base64.urlsafe_b64decode(str(credentials['token']))
++        # Contabo LAB fix 2026-08-05: invalid base64 used to raise binascii.Error
++        # uncaught → uwsgi 500/RemoteDisconnected. Return Unauthorized instead.
++        try:
++            string_to_sign = base64.urlsafe_b64decode(str(credentials['token']))
++        except (TypeError, ValueError, binascii.Error):
++            raise exception.Unauthorized(
++                message=_('Invalid EC2 signature.'))
+ 
+         if string_to_sign[0:4] != b'AWS4':
+             signature = _calculate_signature_v1(string_to_sign,
+@@ -100,6 +107,8 @@
+         token_reference = render_token.render_token_response_from_model(token)
+         resp_body = jsonutils.dumps(token_reference)
+         response = flask.make_response(resp_body, http.client.OK)
++        # Match /v3/ec2tokens — Fernet token id is not in JSON body.
++        response.headers['X-Subject-Token'] = token.id
+         response.headers['Content-Type'] = 'application/json'
+         return response
+ 
+
+keystone-public: stopped
+keystone-admin: stopped
+keystone-public: started
+keystone-admin: started
+===== PATCH swift3 =====
+PATCHED /usr/lib/python3.9/site-packages/keystone/api/s3tokens.py
+--- /usr/lib/python3.9/site-packages/keystone/api/s3tokens.py.bak-20260805	2024-04-03 12:48:14.000000000 +0000
++++ /usr/lib/python3.9/site-packages/keystone/api/s3tokens.py	2026-08-05 10:21:53.979657398 +0000
+@@ -13,6 +13,7 @@
+ # This file handles all flask-restful resources for /v3/s3tokens
+ 
+ import base64
++import binascii
+ import hashlib
+ import hmac
+ 
+@@ -77,7 +78,13 @@
+ class S3Resource(EC2_S3_Resource.ResourceBase):
+     @staticmethod
+     def _check_signature(creds_ref, credentials):
+-        string_to_sign = base64.urlsafe_b64decode(str(credentials['token']))
++        # Contabo LAB fix 2026-08-05: invalid base64 used to raise binascii.Error
++        # uncaught → uwsgi 500/RemoteDisconnected. Return Unauthorized instead.
++        try:
++            string_to_sign = base64.urlsafe_b64decode(str(credentials['token']))
++        except (TypeError, ValueError, binascii.Error):
++            raise exception.Unauthorized(
++                message=_('Invalid EC2 signature.'))
+ 
+         if string_to_sign[0:4] != b'AWS4':
+             signature = _calculate_signature_v1(string_to_sign,
+@@ -100,6 +107,8 @@
+         token_reference = render_token.render_token_response_from_model(token)
+         resp_body = jsonutils.dumps(token_reference)
+         response = flask.make_response(resp_body, http.client.OK)
++        # Match /v3/ec2tokens — Fernet token id is not in JSON body.
++        response.headers['X-Subject-Token'] = token.id
+         response.headers['Content-Type'] = 'application/json'
+         return response
+ 
+
+keystone-public: stopped
+keystone-admin: stopped
+keystone-public: started
+keystone-admin: started
+===== STATUS swift1 =====
+keystone-public                  RUNNING   pid 58090, uptime 0:01:40
+keystone-admin                   RUNNING   pid 58591, uptime 0:01:35
+LISTEN 0      65535        0.0.0.0:5001       0.0.0.0:*    users:(("uwsgi",pid=58101,fd=4),("uwsgi",pid=58090,fd=4))                                                                                                                                                                               
+22
+[pid: 58094|app: 0|req: 1/13] 10.0.4.1 () {32 vars in 369 bytes} [Wed Aug  5 10:22:33 2026] POST /v3/auth/tokens => generated 1735 bytes in 751 msecs (HTTP/1.1 201) 5 headers in 366 bytes (1 switches on core 0)
+2026-08-05 10:22:36.289 58094 WARNING keystone.common.rbac_enforcer.enforcer [None req-80295e5e-a235-48c0-86d3-c0284b7f3f71 70e0a84dd4834affa106bec18d427907 28f85df36c4840979827f0d4da521c8e - - default default] Deprecated policy rules found. Use oslopolicy-policy-generator and oslopolicy-policy-upgrade to detect and resolve deprecated policies in your configuration.[00m
+[pid: 58094|app: 0|req: 2/14] 10.0.4.4 () {30 vars in 695 bytes} [Wed Aug  5 10:22:36 2026] GET /v3/auth/tokens => generated 1735 bytes in 90 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 1)
+[pid: 58094|app: 0|req: 3/15] 10.0.4.4 () {30 vars in 695 bytes} [Wed Aug  5 10:22:36 2026] GET /v3/auth/tokens => generated 1735 bytes in 101 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 2)
+[pid: 58094|app: 0|req: 4/16] 127.0.0.1 () {30 vars in 698 bytes} [Wed Aug  5 10:22:36 2026] GET /v3/auth/tokens => generated 1735 bytes in 265 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 3)
+===== STATUS swift2 =====
+keystone-public                  RUNNING   pid 4043819, uptime 0:01:13
+keystone-admin                   RUNNING   pid 4043910, uptime 0:01:07
+LISTEN 0      65535        0.0.0.0:5001       0.0.0.0:*    users:(("uwsgi",pid=4043828,fd=4),("uwsgi",pid=4043819,fd=4))                                                                                                                                                                                             
+8
+2026-08-05 10:22:16.783 4043822 WARNING keystone.common.rbac_enforcer.enforcer [None req-1b86225a-0a18-41ae-a126-a1f2d547d760 70e0a84dd4834affa106bec18d427907 28f85df36c4840979827f0d4da521c8e - - default default] Deprecated policy rules found. Use oslopolicy-policy-generator and oslopolicy-policy-upgrade to detect and resolve deprecated policies in your configuration.[00m
+[pid: 4043822|app: 0|req: 1/5] 127.0.0.1 () {30 vars in 698 bytes} [Wed Aug  5 10:22:16 2026] GET /v3/auth/tokens => generated 1735 bytes in 540 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 0)
+[pid: 4043822|app: 0|req: 2/6] 127.0.0.1 () {30 vars in 698 bytes} [Wed Aug  5 10:22:17 2026] GET /v3/auth/tokens => generated 1735 bytes in 263 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 1)
+[pid: 4043822|app: 0|req: 3/7] 127.0.0.1 () {30 vars in 698 bytes} [Wed Aug  5 10:22:34 2026] GET /v3/auth/tokens => generated 1735 bytes in 686 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 2)
+[pid: 4043822|app: 0|req: 4/8] 127.0.0.1 () {30 vars in 695 bytes} [Wed Aug  5 10:22:36 2026] GET /v3/auth/tokens => generated 1735 bytes in 330 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 3)
+===== STATUS swift3 =====
+keystone-public                  RUNNING   pid 118429, uptime 0:00:46
+keystone-admin                   RUNNING   pid 118552, uptime 0:00:41
+LISTEN 0      65535        0.0.0.0:5001       0.0.0.0:*    users:(("uwsgi",pid=118438,fd=4),("uwsgi",pid=118429,fd=4))                                                                                                                                                                                      
+18
+[pid: 118435|app: 0|req: 4/4] 127.0.0.1 () {30 vars in 698 bytes} [Wed Aug  5 10:22:35 2026] GET /v3/auth/tokens => generated 1735 bytes in 120 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 3)
+2026-08-05 10:22:35.735 118431 WARNING keystone.common.rbac_enforcer.enforcer [None req-000d00fb-f7be-46bb-ada0-de2ec45dda2d 70e0a84dd4834affa106bec18d427907 28f85df36c4840979827f0d4da521c8e - - default default] Deprecated policy rules found. Use oslopolicy-policy-generator and oslopolicy-policy-upgrade to detect and resolve deprecated policies in your configuration.[00m
+[pid: 118431|app: 0|req: 1/5] 127.0.0.1 () {30 vars in 698 bytes} [Wed Aug  5 10:22:35 2026] GET /v3/auth/tokens => generated 1735 bytes in 259 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 0)
+[pid: 118431|app: 0|req: 2/6] 127.0.0.1 () {30 vars in 698 bytes} [Wed Aug  5 10:22:35 2026] GET /v3/auth/tokens => generated 1735 bytes in 135 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 1)
+[pid: 118431|app: 0|req: 3/7] 127.0.0.1 () {30 vars in 698 bytes} [Wed Aug  5 10:22:36 2026] GET /v3/auth/tokens => generated 1735 bytes in 99 msecs (HTTP/1.1 200) 5 headers in 361 bytes (1 switches on core 2)

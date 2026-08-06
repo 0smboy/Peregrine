@@ -27,6 +27,11 @@
     - role: rust_haproxy
       when: use_lb
 
+- hosts: keepalived_servers
+  roles:
+    - role: rust_keepalived
+      when: use_lb
+
 - hosts: proxy_servers
   roles:
     - rust_verify

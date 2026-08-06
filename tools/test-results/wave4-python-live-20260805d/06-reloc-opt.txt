@@ -1,0 +1,6 @@
+swift_ok /opt/swift-master/swift/__init__.py
+RELOC_OK_swift2
+swift_ok /opt/swift-master/swift/__init__.py
+RELOC_OK_swift3
+swift_ok /opt/swift-master/swift/__init__.py
+RELOC_OK_swift4

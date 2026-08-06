@@ -1,0 +1,41 @@
+===================================================================
+P1b L2 SUITE  label=vip-p1b  endpoint=http://10.0.0.10:8085  2026-08-04T14:00:42Z
+===================================================================
+  PASS  auth: token acquired
+  PASS  info: formpost present
+  PASS  info: staticweb present
+  PASS  info: container_quotas present
+  PASS  info: account_quotas present
+  PASS  info: symlink present
+  PASS  info: versioned_writes present
+  PASS  info: bulk_upload absent
+  PASS  info: bulk_delete still present
+  PASS  info: tempurl still present
+  PASS  container: PUT 201
+  PASS  formpost: set account key 204
+  PASS  formpost: valid upload 201
+  PASS  formpost: uploaded body
+  PASS  formpost: tampered sig -> 401
+  PASS  formpost: expired -> 401
+  PASS  staticweb: put index 201
+  PASS  staticweb: enable web-index 204
+  PASS  staticweb: unauth index body
+  PASS  quota: set bytes=5 204
+  FAIL  quota: oversize PUT -> 413  -- want=413 got=201 
+  PASS  quota: clear 204
+  FAIL  symlink: put target 201  -- want=201 got=413 
+  FAIL  symlink: put link 201  -- want=201 got=413 
+  FAIL  symlink: follow GET body  -- want=TGT got=<html><h1>Not Found</h1><p>The resource could not be found.</p></html> 
+  FAIL  symlink: Content-Location  -- missing 'Content-Location'
+  PASS  vw: versions container 201
+  PASS  vw: enable versions-location 204
+  PASS  vw: PUT v1 201
+  FAIL  vw: PUT v1 overwrite 201  -- want=201 got=413 
+  FAIL  vw: current is two  -- want=two got=one 
+  FAIL  vw: DELETE restores 204  -- want=204 got=401 
+  PASS  vw: restored previous body
+
+-------------------------------------------------------------------
+RESULT  label=vip-p1b  PASS=25  FAIL=8
+  failed: quota: oversize PUT -> 413 symlink: put target 201 symlink: put link 201 symlink: follow GET body symlink: Content-Location vw: PUT v1 overwrite 201 vw: current is two vw: DELETE restores 204
+-------------------------------------------------------------------

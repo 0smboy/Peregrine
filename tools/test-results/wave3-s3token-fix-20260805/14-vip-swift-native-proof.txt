@@ -1,0 +1,15 @@
+bad_b64_vip HTTP 401 b'{"error":{"code":401,"message":"The request you have made requires authentication.","title":"Unauthorized"}}\n'
+valid_vip 200 subj_len 183 project 29af7f1e19774999bf700fbef31994d3
+mkcontainer 201 b''
+put 201 b''
+get 200 b'from-s3token-ec2'
+delobj 204 b''
+delcont 204 b''
+DAMN ! worker 5 (pid: 4154304) died :( trying respawn ...
+DAMN ! worker 3 (pid: 4154161) died :( trying respawn ...
+DAMN ! worker 7 (pid: 4154138) died :( trying respawn ...
+      02:25 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-public.ini
+      02:25 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-public.ini
+      02:25 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-public.ini
+      02:25 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-public.ini
+      02:25 /usr/local/bin/uwsgi --ini /etc/uwsgi/keystone-public.ini

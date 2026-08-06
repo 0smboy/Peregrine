@@ -1,0 +1,25 @@
+POST_SOAK_HEALTH 2026-08-05T11:16:00Z
+=== units ===
+active
+active
+active
+active
+active
+active
+=== vip ===
+    inet 10.0.0.10/22 scope global secondary eth1
+=== ports ===
+LISTEN 0      4000         0.0.0.0:8085       0.0.0.0:*    users:(("haproxy",pid=4180537,fd=8))                                                                                                                                                                                                    
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=109079,fd=5))                                                                                                                                                                                             
+LISTEN 0      128          0.0.0.0:6212       0.0.0.0:*    users:(("swift-object-se",pid=24231,fd=7))                                                                                                                                                                                              
+LISTEN 0      128          0.0.0.0:6210       0.0.0.0:*    users:(("swift-object-se",pid=24231,fd=5))                                                                                                                                                                                              
+LISTEN 0      128          0.0.0.0:6211       0.0.0.0:*    users:(("swift-object-se",pid=24231,fd=6))                                                                                                                                                                                              
+LISTEN 0      4000         0.0.0.0:5000       0.0.0.0:*    users:(("haproxy",pid=4180537,fd=14))                                                                                                                                                                                                   
+=== healthchecks ===
+200 https://10.0.0.10:8085/healthcheck
+200 http://10.0.0.1:8080/healthcheck
+200 http://10.0.4.2:8080/healthcheck
+200 http://10.0.4.3:8080/healthcheck
+200 http://10.0.4.4:8080/healthcheck
+=== haproxy backends (if sock) ===
+sock=/var/lib/haproxy/stats

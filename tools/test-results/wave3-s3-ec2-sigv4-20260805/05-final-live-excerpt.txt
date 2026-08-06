@@ -1,0 +1,41 @@
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib) generated 1 warning (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+   Compiling swift-proxy-server v0.1.0 (/root/work/swift-rust/crates/swift-proxy-server)
+    Finished `release` profile [optimized] target(s) in 10.99s
+NEW_SHA=a0c252bc8dd9bd649b95f99b4b74aa188a7ef40c92d78680e3ea9be5f5d640f8
+target/release/swift-proxy-server: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=bed1ca9133137e9455934a7c2456b5cceb0ec9eb, not stripped
+===== 10.0.0.1 =====
+active
+a0c252bc8dd9bd649b95f99b4b74aa188a7ef40c92d78680e3ea9be5f5d640f8  /usr/local/bin/swift-proxy-server
+hc=200
+Aug 05 10:39:56 swift1 proxy-server[109079]: INFO s3api enabled (SigV4+CRUD+list + EC2→s3token deferral; not advertised on Swift /info)
+Aug 05 10:39:56 swift1 proxy-server[109079]: INFO s3token enabled (auth_uri=http://127.0.0.1:5001)
+===== 10.0.0.2 =====
+active
+a0c252bc8dd9bd649b95f99b4b74aa188a7ef40c92d78680e3ea9be5f5d640f8  /usr/local/bin/swift-proxy-server
+hc=200
+Aug 05 10:40:30 swift2 proxy-server[4107826]: INFO s3api enabled (SigV4+CRUD+list + EC2→s3token deferral; not advertised on Swift /info)
+Aug 05 10:40:30 swift2 proxy-server[4107826]: INFO s3token enabled (auth_uri=http://127.0.0.1:5001)
+===== 10.0.0.3 =====
+active
+a0c252bc8dd9bd649b95f99b4b74aa188a7ef40c92d78680e3ea9be5f5d640f8  /usr/local/bin/swift-proxy-server
+hc=200
+Aug 05 10:41:06 swift3 proxy-server[154514]: INFO s3api enabled (SigV4+CRUD+list + EC2→s3token deferral; not advertised on Swift /info)
+Aug 05 10:41:06 swift3 proxy-server[154514]: INFO s3token enabled (auth_uri=http://127.0.0.1:5001)
+===== 10.0.0.4 =====
+active
+a0c252bc8dd9bd649b95f99b4b74aa188a7ef40c92d78680e3ea9be5f5d640f8  /usr/local/bin/swift-proxy-server
+hc=200
+Aug 05 10:41:42 swift4 proxy-server[1401597]: INFO s3api enabled (SigV4+CRUD+list + EC2→s3token deferral; not advertised on Swift /info)
+Aug 05 10:41:42 swift4 proxy-server[1401597]: INFO s3token enabled (auth_uri=http://10.0.0.1:5001)
+access 1371713510fb45e9 project 29af7f1e19774999
+ListBuckets region=us-east-1 HTTP 200 body=b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Owner><ID>1371713510fb45e98ab1e26b694d55d3</ID><'
+CreateBucket HTTP 200 body=b''
+PutObject HTTP 200 etag="6d56fe7f2743f77b2fd657151142df5a" body=b''
+GetObject HTTP 200 body=b'ec2-sigv4-put-get-ok'
+cleanup delobj=204 delbucket=204
+VERDICT GREEN region=us-east-1

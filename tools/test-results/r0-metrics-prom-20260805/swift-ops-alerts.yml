@@ -1,0 +1,79 @@
+# Contabo / production-path ops alerts (R0).
+# Galera / Keystone rules are STUBS until W1 Identity live.
+groups:
+  - name: swift_ops_r0
+    interval: 30s
+    rules:
+      - alert: SwiftTombstoneGrowth
+        expr: |
+          (
+            sum by (node) (swift_object_tombstones)
+            -
+            sum by (node) (swift_object_tombstones offset 1h)
+          ) > 5000
+        for: 30m
+        labels:
+          severity: warning
+          wave: r0
+        annotations:
+          summary: "Swift tombstones growing on {{ $labels.node }}"
+          description: >-
+            Tombstone count on {{ $labels.node }} rose by more than 5000 over 1h
+            and stayed elevated for 30m. Check reclaim_age / object-replicator.
+
+      - alert: SwiftDbFreelistHigh
+        expr: sum by (node, kind) (swift_db_freelist_bytes) > 52428800
+        for: 15m
+        labels:
+          severity: warning
+          wave: r0
+        annotations:
+          summary: "SQLite freelist high on {{ $labels.node }} ({{ $labels.kind }})"
+          description: >-
+            Approx freelist_bytes > 50MiB for {{ $labels.kind }} DBs on
+            {{ $labels.node }}. Schedule VACUUM off the hot path.
+
+      - alert: SwiftDeviceUsePctHigh
+        expr: |
+          (
+            100 * (1 - node_filesystem_avail_bytes{mountpoint=~"/srv/node/d[0-9]+"}
+              / node_filesystem_size_bytes{mountpoint=~"/srv/node/d[0-9]+"})
+          ) > 85
+        for: 10m
+        labels:
+          severity: critical
+          wave: r0
+        annotations:
+          summary: "Swift device Use%>85% on {{ $labels.instance }} {{ $labels.mountpoint }}"
+          description: >-
+            Filesystem {{ $labels.mountpoint }} on {{ $labels.instance }} is above
+            85% used for 10m.
+
+  - name: swift_ops_w1_stubs
+    interval: 30s
+    rules:
+      # STUB until Galera×3 is live (W1). Expr intentionally never fires.
+      - alert: GaleraClusterSizeNotThree
+        expr: vector(0) > 1
+        for: 5m
+        labels:
+          severity: critical
+          wave: w1-stub
+        annotations:
+          summary: "STUB — Galera size≠3 (enable after W1)"
+          description: >-
+            Placeholder. Replace expr with wsrep_cluster_size != 3 once Galera
+            exporters are scraped.
+
+      # STUB until Keystone is live (W1). Expr intentionally never fires.
+      - alert: KeystoneHttp5xx
+        expr: vector(0) > 1
+        for: 5m
+        labels:
+          severity: critical
+          wave: w1-stub
+        annotations:
+          summary: "STUB — Keystone 5xx (enable after W1)"
+          description: >-
+            Placeholder. Replace with Keystone/HAProxy 5xx rate once Identity
+            is on the scrape path.

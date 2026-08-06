@@ -1,0 +1,12 @@
+# Alias / pointer — canonical overlay is:
+#   bundle-rust/config_sample/identity/identity_overlay.example.yml
+#
+# Preferred knobs:
+#   identity_haproxy_enabled: true   # HAProxy :3030/:5000/:35357
+#   identity_proxy_enabled: true     # render authtoken+keystoneauth filters
+#   auth_method: keystone | keystone_coexist | tempauth
+#
+# Also accepted (aliases wired in proxy-keystone-filters.conf.j2):
+#   swift_keystone_* password/url fields
+#
+# Do NOT set identity_bridge_enabled (removed; use identity_haproxy_enabled).

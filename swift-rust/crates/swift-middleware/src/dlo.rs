@@ -32,13 +32,11 @@
 //! A HEAD returns the aggregate metadata with no body. `multipart-manifest=get`
 //! bypasses reassembly (returns the raw manifest object).
 //!
-//! Simplifications vs. Python: the container listing is fetched as a single
-//! page (the `CONTAINER_LISTING_LIMIT` marker-pagination loop and the
-//! `RateLimitedIterator`/`SegmentedIterable` streaming machinery are not
-//! ported), and a ranged GET fetches whole segments and slices the
-//! concatenation rather than issuing per-segment ranged subrequests. The
-//! observable result (status, headers, body bytes) matches Python for any
-//! listing under the limit.
+//! Residual vs. Python (wontfix P1c / documented): the container listing is
+//! fetched as a single page (`CONTAINER_LISTING_LIMIT` marker-pagination and
+//! `RateLimitedIterator` are not ported). A ranged GET streams intersecting
+//! segments (whole-segment fetch then slice for the window). Observable
+//! status/headers/body match Python for listings under the limit.
 
 use std::io::Read;
 use std::sync::Arc;

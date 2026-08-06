@@ -21,24 +21,28 @@ delta across all servers.
 
 ## What's implemented
 
+For a **strict** yes/no matrix (partial = not implemented), see
+[Rust vs Python parity](/parity). Marketing claims must stay inside that page.
+
 <CardGrid>
   <Card title="Servers & daemons">
     All four servers plus object/DB replicators, reconstructor, object &
-    container updaters, expirer, account reaper, container-sync, reconciler,
-    relinker, auditors, recon, drive-audit.
+    container updaters, expirer, account reaper, reconciler, relinker,
+    auditors, recon, drive-audit. Container-sync is library-only — not a
+    full product claim.
   </Card>
   <Card title="Erasure coding (Linux)">
     liberasurecode codec (fragments byte-identical to PyECLib), streaming
     multipart-MIME + multiphase-commit PUT, segment-wise + ranged GET, and a
-    reconstructor that heals a lost fragment from its peers.
+    reconstructor that heals a lost fragment from its peers (lab-proven).
   </Card>
   <Card title="Container sharding">
-    End to end — backend, cleave state machine, server paths, and the sharder
-    daemon.
+    Backend + local cleave path + unit HTTP helpers. Multi-node KEEP is
+    **not** claimed under the strict parity rule.
   </Card>
   <Card title="Middleware">
-    tempauth, copy, SLO/DLO, versioned_writes, symlink, staticweb, listings,
-    account/container quotas, ratelimit, and more.
+    tempauth, keystoneauth/authtoken (lab), copy, SLO/DLO, versioned_writes,
+    symlink, staticweb, listings, quotas, ratelimit, s3api/s3token core path.
   </Card>
 </CardGrid>
 

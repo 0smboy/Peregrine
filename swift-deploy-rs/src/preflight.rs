@@ -408,8 +408,11 @@ fn discovery_command(
         .map(str::trim)
         .filter(|interface| !interface.is_empty())
     {
+        // Prefer /sys/class/net (stable). `ip link show -- NAME` fails on some
+        // iproute2 builds that do not treat `--` as end-of-options here.
         command.push_str(&format!(
-            "printf '__KEEPALIVED_INTERFACE__='; if ip link show -- {} >/dev/null 2>&1; then printf 'ok\\n'; else printf 'fail\\n'; fi; ",
+            "printf '__KEEPALIVED_INTERFACE__='; if test -d /sys/class/net/{} || ip -o link show dev {} >/dev/null 2>&1; then printf 'ok\\n'; else printf 'fail\\n'; fi; ",
+            shell_quote(interface),
             shell_quote(interface)
         ));
     }

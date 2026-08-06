@@ -1,0 +1,67 @@
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling libc v0.2.186
+   Compiling quote v1.0.46
+   Compiling unicode-ident v1.0.24
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling md-5 v0.10.6
+   Compiling crossbeam-utils v0.8.22
+   Compiling cpufeatures v0.2.17
+   Compiling crc32fast v1.5.0
+   Compiling syn v2.0.119
+   Compiling simd-adler32 v0.3.10
+   Compiling adler2 v2.0.1
+   Compiling serde v1.0.228
+   Compiling miniz_oxide v0.8.9
+   Compiling crossbeam-channel v0.5.16
+   Compiling swift-core v0.1.0 (/tmp/p1b-swift-rust/crates/swift-core)
+   Compiling serde_derive v1.0.228
+   Compiling sha2 v0.10.9
+   Compiling sha1 v0.10.7
+   Compiling swift-http v0.1.0 (/tmp/p1b-swift-rust/crates/swift-http)
+   Compiling flate2 v1.1.9
+   Compiling swift-memcache v0.1.0 (/tmp/p1b-swift-rust/crates/swift-memcache)
+   Compiling hmac v0.12.1
+   Compiling swift-middleware v0.1.0 (/tmp/p1b-swift-rust/crates/swift-middleware)
+   Compiling swift-ring v0.1.0 (/tmp/p1b-swift-rust/crates/swift-ring)
+   Compiling swift-proxy-server v0.1.0 (/tmp/p1b-swift-rust/crates/swift-proxy-server)
+    Finished `release` profile [optimized] target(s) in 33.45s
+-rwxr-xr-x. 2 root root 2802416 Aug  4 13:58 target/release/swift-proxy-server
+ious ... ok
+test versioned_writes::tests::test_put_no_current_skips_archive ... ok
+test versioned_writes::tests::test_unversioned_container_passes_through ... ok
+test versioned_writes::tests::test_versions_object_name_format ... ok
+test tempurl::tests::test_head_matches_get_signature ... ok
+test listing_formats::tests::test_oversize_body_passthrough ... ok
+
+test result: ok. 334 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+   Compiling swift-diskfile v0.1.0 (/tmp/p1b-swift-rust/crates/swift-diskfile)
+   Compiling swift-proxy-server v0.1.0 (/tmp/p1b-swift-rust/crates/swift-proxy-server)
+   Compiling rusqlite v0.32.1
+   Compiling swift-object-server v0.1.0 (/tmp/p1b-swift-rust/crates/swift-object-server)
+   Compiling swift-db v0.1.0 (/tmp/p1b-swift-rust/crates/swift-db)
+   Compiling swift-container-server v0.1.0 (/tmp/p1b-swift-rust/crates/swift-container-server)
+   Compiling swift-account-server v0.1.0 (/tmp/p1b-swift-rust/crates/swift-account-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.82s
+     Running unittests src/main.rs (target/debug/deps/swift_proxy_server-fbb997056afa1c99)
+
+running 11 tests
+test startup_policy_tests::no_pipeline_line_keeps_default_order ... ok
+test startup_policy_tests::every_configured_policy_requires_its_own_ring ... ok
+test startup_policy_tests::ec_ring_replica_mismatch_is_rejected ... ok
+test startup_policy_tests::pipeline_order_from_conf_reorders_implemented_filters ... ok
+test startup_policy_tests::pipeline_unknown_filter_still_skips ... ok
+test startup_policy_tests::ratelimit_filter_is_built_only_when_configured ... ok
+test startup_policy_tests::proxy_config_reads_tuning_knobs_with_default_fallback ... ok
+test startup_policy_tests::pipeline_p1b_wires_formpost_staticweb_quotas_symlink_vw ... ok
+test startup_policy_tests::pipeline_p1a_wires_bulk_tempurl ... ok
+test startup_policy_tests::server_options_read_workers_clients_timeout_and_log_conf ... ok
+test startup_policy_tests::startup_and_reload_share_one_build_path ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+    Finished `release` profile [optimized] target(s) in 0.13s
+-rwxr-xr-x. 2 root root 2802416 Aug  4 13:58 target/release/swift-proxy-server

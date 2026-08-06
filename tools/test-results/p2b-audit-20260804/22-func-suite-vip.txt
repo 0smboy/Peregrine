@@ -1,0 +1,42 @@
+● swift-object-auditor.service - Swift object auditor (rust continuous)
+     Loaded: loaded (/etc/systemd/system/swift-object-auditor.service; enabled; preset: disabled)
+     Active: active (running) since Tue 2026-08-04 15:19:28 UTC; 7min ago
+   Main PID: 337314 (swift-object-au)
+      Tasks: 1 (limit: 48623)
+     Memory: 183.7M (peak: 941.3M)
+        CPU: 3min 18.177s
+     CGroup: /system.slice/swift-object-auditor.service
+             └─337314 /usr/local/bin/swift-object-auditor /etc/swift/object-server.conf
+
+Aug 04 15:19:28 swift1 systemd[1]: Started Swift object auditor (rust continuous).
+Aug 04 15:19:28 swift1 object-auditor[337314]: INFO swift-object-auditor: devices=/srv/node mount_check=false interval=30s policies=2 once=false
+  PASS  large: PUT 4MB 201
+  PASS  large: 4MB md5 round-trip
+  PASS  SLO: manifest PUT 201
+  PASS  SLO: reassembled 3MB md5
+  PASS  SLO: manifest-get is json
+  PASS  DLO: concatenation md5 == SLO segs
+  PASS  copy: X-Copy-From 201
+  PASS  copy: copied body
+  PASS  expiry: PUT with X-Delete-After 201
+  PASS  expiry: X-Delete-At set
+  PASS  name: unicode+space PUT 201
+  PASS  name: unicode GET body
+  PASS  listing: json has bytes
+  PASS  listing: prefix filter
+  PASS  listing: limit=1 returns 1
+  PASS  EC: container create (policy ec-2-1) 201
+  PASS  EC: policy header
+  PASS  EC: PUT 3MB 201
+  PASS  EC: 5MB md5 round-trip
+  PASS  EC: ranged GET 206
+  PASS  EC: ranged GET length=1024
+  PASS  sec: no-token account -> 401
+  PASS  sec: bad-token -> 401
+  PASS  sec: GET missing object -> 404
+  PASS  sec: DELETE non-empty container -> 409
+  PASS  sec: traversal name literal 201
+
+-------------------------------------------------------------------
+RESULT  label=vip  PASS=54  FAIL=0
+-------------------------------------------------------------------

@@ -1,0 +1,15 @@
+TOK=AUTH_tkv1.3137383539... SURL=http://10.0.0.10:8085/v1/AUTH_test
+cput=201
+oput=201
+kpost=204
+x-account-meta-temp-url-key: p1a-temp-key
+OBJPATH=/v1/AUTH_test/p1t-24702/c
+MSG<<GET
+1785854578
+/v1/AUTH_test/p1t-24702/c>>
+SIG=95b9c0c4955d70e92f0ca16ee003b5550a3307105a56a7d7438cca360652f41b
+http://10.0.0.1:8080 -> 200 cc
+http://10.0.0.2:8080 -> 200 cc
+http://10.0.0.3:8080 -> 200 cc
+http://10.0.0.4:8080 -> 200 cc
+http://10.0.0.10:8085 -> 200 cc

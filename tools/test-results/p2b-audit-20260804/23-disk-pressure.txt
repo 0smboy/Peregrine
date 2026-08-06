@@ -1,0 +1,13 @@
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda4        40G   19G   22G  47% /
+/dev/sda5        50G   50G   24K 100% /srv/node/d1
+/dev/sda6        50G   45G  5.1G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.6G  89% /srv/node/d3
+swift1 Host key verification failed.
+
+swift2 ssh: Could not resolve hostname swift2: Name or service not known
+
+swift3 ssh: Could not resolve hostname swift3: Name or service not known
+
+swift4 ssh: Could not resolve hostname swift4: Name or service not known
+

@@ -1,0 +1,126 @@
+{
+  "part_power": 14,
+  "replicas": 3.0,
+  "devices": [
+    {
+      "region": 1,
+      "zone": 1,
+      "ip": "10.0.4.1",
+      "port": 6210,
+      "replication_ip": "10.0.8.1",
+      "replication_port": 6210,
+      "device": "d1",
+      "weight": 100.0
+    },
+    {
+      "region": 1,
+      "zone": 1,
+      "ip": "10.0.4.1",
+      "port": 6211,
+      "replication_ip": "10.0.8.1",
+      "replication_port": 6211,
+      "device": "d2",
+      "weight": 100.0
+    },
+    {
+      "region": 1,
+      "zone": 1,
+      "ip": "10.0.4.1",
+      "port": 6212,
+      "replication_ip": "10.0.8.1",
+      "replication_port": 6212,
+      "device": "d3",
+      "weight": 100.0
+    },
+    {
+      "region": 1,
+      "zone": 2,
+      "ip": "10.0.4.2",
+      "port": 6210,
+      "replication_ip": "10.0.8.2",
+      "replication_port": 6210,
+      "device": "d1",
+      "weight": 100.0
+    },
+    {
+      "region": 1,
+      "zone": 2,
+      "ip": "10.0.4.2",
+      "port": 6211,
+      "replication_ip": "10.0.8.2",
+      "replication_port": 6211,
+      "device": "d2",
+      "weight": 100.0
+    },
+    {
+      "region": 1,
+      "zone": 2,
+      "ip": "10.0.4.2",
+      "port": 6212,
+      "replication_ip": "10.0.8.2",
+      "replication_port": 6212,
+      "device": "d3",
+      "weight": 100.0
+    },
+    {
+      "region": 2,
+      "zone": 1,
+      "ip": "10.0.4.3",
+      "port": 6210,
+      "replication_ip": "10.0.8.3",
+      "replication_port": 6210,
+      "device": "d1",
+      "weight": 100.0
+    },
+    {
+      "region": 2,
+      "zone": 1,
+      "ip": "10.0.4.3",
+      "port": 6211,
+      "replication_ip": "10.0.8.3",
+      "replication_port": 6211,
+      "device": "d2",
+      "weight": 100.0
+    },
+    {
+      "region": 2,
+      "zone": 1,
+      "ip": "10.0.4.3",
+      "port": 6212,
+      "replication_ip": "10.0.8.3",
+      "replication_port": 6212,
+      "device": "d3",
+      "weight": 100.0
+    },
+    {
+      "region": 2,
+      "zone": 2,
+      "ip": "10.0.4.4",
+      "port": 6210,
+      "replication_ip": "10.0.8.4",
+      "replication_port": 6210,
+      "device": "d1",
+      "weight": 100.0
+    },
+    {
+      "region": 2,
+      "zone": 2,
+      "ip": "10.0.4.4",
+      "port": 6211,
+      "replication_ip": "10.0.8.4",
+      "replication_port": 6211,
+      "device": "d2",
+      "weight": 100.0
+    },
+    {
+      "region": 2,
+      "zone": 2,
+      "ip": "10.0.4.4",
+      "port": 6212,
+      "replication_ip": "10.0.8.4",
+      "replication_port": 6212,
+      "device": "d3",
+      "weight": 100.0
+    }
+  ]
+}

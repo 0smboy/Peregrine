@@ -1,0 +1,22 @@
+## targets
+10.0.0.1:9100 up lastError= 
+10.0.0.2:9100 up lastError= 
+10.0.0.3:9100 up lastError= 
+10.0.0.4:9100 up lastError= 
+
+### sum by (node) (swift_object_tombstones)
+{"status":"success","data":{"resultType":"vector","result":[{"metric":{"node":"swift1"},"value":[1785916401.708,"39"]},{"metric":{"node":"swift2"},"value":[1785916401.708,"41"]},{"metric":{"node":"swift3"},"value":[1785916401.708,"38"]},{"metric":{"node":"swift4"},"value":[1785916401.708,"35"]}]}}
+### sum by (node,kind) (swift_db_freelist_bytes)
+{"status":"success","data":{"resultType":"vector","result":[{"metric":{"kind":"account","node":"swift1"},"value":[1785916401.768,"0"]},{"metric":{"kind":"container","node":"swift1"},"value":[1785916401.768,"0"]},{"metric":{"kind":"account","node":"swift2"},"value":[1785916401.768,"4096"]},{"metric":{"kind":"container","node":"swift2"},"value":[1785916401.768,"0"]},{"metric":{"kind":"account","node":"swift3"},"value":[1785916401.768,"4096"]},{"metric":{"kind":"container","node":"swift3"},"value":[1785916401.768,"0"]},{"metric":{"kind":"account","node":"swift4"},"value":[1785916401.768,"0"]},{"metric":{"kind":"container","node":"swift4"},"value":[1785916401.768,"0"]}]}}
+### 100*(1-node_filesystem_avail_bytes{mountpoint=~"/srv/node/d[0-9]+"}/node_filesystem_size_bytes{mountpoint=~"/srv/node/d[0-9]+"})
+{"status":"success","data":{"resultType":"vector","result":[{"metric":{"device":"/dev/sda5","fstype":"xfs","instance":"10.0.0.4:9100","job":"node","mountpoint":"/srv/node/d1"},"value":[1785916401.795,"1.6253914194500951"]},{"metric":{"device":"/dev/sda6","fstype":"xfs","instance":"10.0.0.4:9100","job":"node","mountpoint":"/srv/node/d2"},"value":[1785916401.795,"1.4166878520025072"]},{"metric":{"device":"/dev/sda7","fstype":"xfs","instance":"10.0.0.4:9100","job":"node","mountpoint":"/srv/node/d3"},"value":[1785916401.795,"1.4233566494250671"]},{"metric":{"device":"/dev/sda5","fstype":"xfs","instance":"10.0.0.3:9100","job":"node","mountpoint":"/srv/node/d1"},"value":[1785916401.795,"1.7636028189533803"]},{"metric":{"device":"/dev/sda6","fstype":"xfs","instance":"10.0.0.3:9100","job":"node","mountpoint":"/srv/node/d2"},"value":[1785916401.795,"1.4213552463039791"]},{"metric":{"device":"/dev/sda7","fstype":"xfs","instance":"10.0.0.3:9100","job":"node","mountpoint":"/srv/node/d3"},"value":[1785916401.795,"1.4240059595979404"]},{"metric":{"device":"/dev/sda5","fstype":"xfs","instance":"10.0.0.1:9100","job":"node","mountpoint":"/srv/node/d1"},"value":[1785916401.795,"1.7966183315081374"]},{"metric":{"device":"/dev/sda6","fstype":"xfs","instance":"10.0.0.1:9100","job":"node","mountpoint":"/srv/node/d2"},"value":[1785916401.795,"1.4195142609902955"]},{"metric":{"device":"/dev/sda7","fstype":"xfs","instance":"10.0.0.1:9100","job":"node","mountpoint":"/srv/node/d3"},"value":[1785916401.795,"1.4247316592029047"]},{"metric":{"device":"/dev/sda5","fstype":"xfs","instance":"10.0.0.2:9100","job":"node","mountpoint":"/srv/node/d1"},"value":[1785916401.795,"1.6711563282227782"]},{"metric":{"device":"/dev/sda6","fstype":"xfs","instance":"10.0.0.2:9100","job":"node","mountpoint":"/srv/node/d2"},"value":[1785916401.795,"1.420094820674278"]},{"metric":{"device":"/dev/sda7","fstype":"xfs","instance":"10.0.0.2:9100","job":"node","mountpoint":"/srv/node/d3"},"value":[1785916401.795,"1.4223788646941515"]}]}}
+## alerts
+swift_ops_r0 SwiftTombstoneGrowth inactive
+swift_ops_r0 SwiftDbFreelistHigh inactive
+swift_ops_r0 SwiftDeviceUsePctHigh inactive
+swift_ops_w1_stubs GaleraClusterSizeNotThree inactive
+swift_ops_w1_stubs KeystoneHttp5xx inactive
+## grafana
+● grafana-server.service - Grafana instance
+     Loaded: loaded (/usr/lib/systemd/system/grafana-server.service; enabled; preset: disabled)
+     Active: active (running) since Wed 2026-08-05 07:46:04 UTC; 7min ago

@@ -1,0 +1,10 @@
+===uwsgi===
+LISTEN 0      65535        0.0.0.0:5001       0.0.0.0:*    users:(("uwsgi",pid=4153459,fd=4),("uwsgi",pid=4153439,fd=4))                                                                                                                                                                                             
+===retry curl===
+auth 201
+ec2 201
+s3tokens_exc <class 'http.client.RemoteDisconnected'> Remote end closed connection without response
+empty_s3tokens 400 b'{"error":{"code":400,"message":"request must include a request body","title":"Bad Request"}}\n'
+===journal===
+-- No entries --
+keystone.log

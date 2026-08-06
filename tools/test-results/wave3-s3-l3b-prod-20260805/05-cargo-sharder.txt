@@ -1,0 +1,76 @@
+==> 05-cargo-sharder
+warning: failed to auto-clean cache data
+
+failed to clean entries from the global cache
+
+Caused by:
+  failed to remove file `/Users/oboy/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-macro-0.3.31/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.34s
+     Running unittests src/lib.rs (target/debug/deps/swift_container_server-8cc8327101a75f5d)
+
+running 10 tests
+test sharder::tests::test_cleaving_context_roundtrip ... ok
+test sharder::tests::test_http_shard_replicator_quorum_pass_and_fail ... ok
+test sharder::tests::test_run_once_skips_unsharded ... ok
+test sharder::tests::test_cleaving_context_persists_on_broker ... ok
+test sharder::tests::test_auto_shard_gate_skips_below_threshold ... ok
+test sharder::tests::test_auto_shard_triggers_above_threshold ... ok
+test sharder::tests::test_move_misplaced_from_retiring_into_owner_shard ... ok
+test sharder::tests::test_cleave_is_batched ... ok
+test sharder::tests::test_find_create_and_cleave ... ok
+test sharder::tests::test_run_once_cleaves_sharding_container_on_device ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.24s
+
+     Running unittests src/bin/container_reconciler.rs (target/debug/deps/swift_container_reconciler-00cc54656b7af1db)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/swift_container_server-5c6315e70c27a7db)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running unittests src/bin/container_sharder.rs (target/debug/deps/swift_container_sharder-978b4d6d20d758d2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/container_updater.rs (target/debug/deps/swift_container_updater-5d558fb68d75e8a3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/golden.rs (target/debug/deps/golden-a4e08dea85903e48)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/replication.rs (target/debug/deps/replication-570fa90eb7b252c5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/rsync_ops.rs (target/debug/deps/rsync_ops-2103e75ef22df598)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/sharding.rs (target/debug/deps/sharding-78ad7bf6a1523487)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+PASS 05-cargo-sharder

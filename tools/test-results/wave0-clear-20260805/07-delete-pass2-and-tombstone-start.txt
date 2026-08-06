@@ -1,0 +1,20 @@
+account_listed=967 live=4 gone_404=963
+delete live 'p1b-21784' objects=0
+delete live 'p1b-28970' objects=0
+delete live 'p1b-4164' objects=0
+delete live 'p1b-4803' objects=0
+2026-08-05T04:24:54Z
+total_count	48806
+total_bytes	0
+device=d1	policy=0	count=30007	bytes=0
+device=d1	policy=1	count=2102	bytes=0
+device=d2	policy=0	count=6458	bytes=0
+device=d2	policy=1	count=1981	bytes=0
+device=d3	policy=0	count=6300	bytes=0
+device=d3	policy=1	count=1958	bytes=0
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G   49G  1.8G  97% /srv/node/d1
+/dev/sda6        50G   45G  5.1G  90% /srv/node/d2
+/dev/sda7        50G   45G  5.6G  89% /srv/node/d3
+TS_PID:3468450
+seed N=200 container=wave0-tombstone-lab

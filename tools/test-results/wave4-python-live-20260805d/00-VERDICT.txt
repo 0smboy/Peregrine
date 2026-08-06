@@ -1,0 +1,10 @@
+GREEN_LAB
+PYTHON_CLUSTER=PRESENT_3NODE
+ISOLATION_OK=True
+MIGRATE=PASS (JSON rewrite + rebalance; Contabo add-weight broken → rolled back then clean rebuild)
+VIP_TEMPAUTH_CRUD=PASS
+VIP_KEYSTONE_CRUD=PASS
+PYTHON_CRUD=PASS (internal LAN; Contabo public :8090 not opened from operator Mac)
+4NODE=NOT_EXECUTED (eligible: Use%=2%<50%; deferred — swift1 stays client/monitor)
+PRODUCTION-GO-LIVE=NOT_CLAIMED
+openstack-swift_RPM=BLOCKED (missing python3.9dist(pyxattr) provide); used /opt/pyswift-venv + /etc/pyswift per INSTALL-PLAN SAIO→cluster path

@@ -1,0 +1,72 @@
+# Wave2 live env probe 2026-08-05T07:39:18Z
+## hosts
+--- local 10.0.4.1 ---
+swift1
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  951M   50G   2% /srv/node/d1
+/dev/sda6        50G  748M   50G   2% /srv/node/d2
+/dev/sda7        50G  760M   50G   2% /srv/node/d3
+MemTotal:        7865296 kB
+MemAvailable:    5189760 kB
+active
+active
+inactive
+inactive
+inactive
+inactive
+LISTEN 0      4000         0.0.0.0:8085       0.0.0.0:*    users:(("haproxy",pid=7066,fd=7))                        
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=382009,fd=5))              
+LISTEN 0      128          0.0.0.0:6202       0.0.0.0:*    users:(("swift-account-s",pid=4188494,fd=5))             
+LISTEN 1      128          0.0.0.0:6200       0.0.0.0:*    users:(("swift-object-se",pid=310587,fd=5))              
+LISTEN 0      128          0.0.0.0:6201       0.0.0.0:*    users:(("swift-container",pid=382079,fd=5))              
+--- ssh 10.0.4.2 ---
+swift2
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  887M   50G   2% /srv/node/d1
+/dev/sda6        50G  755M   50G   2% /srv/node/d2
+/dev/sda7        50G  760M   50G   2% /srv/node/d3
+MemTotal:        7865296 kB
+MemAvailable:    5196344 kB
+active
+active
+inactive
+inactive
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=808820,fd=5))                                      
+LISTEN 0      4000         0.0.0.0:8085       0.0.0.0:*    users:(("haproxy",pid=2032550,fd=7))                                             
+LISTEN 0      128          0.0.0.0:6202       0.0.0.0:*    users:(("swift-account-s",pid=2040794,fd=5))                                     
+LISTEN 0      128          0.0.0.0:6201       0.0.0.0:*    users:(("swift-container",pid=808827,fd=5))                                      
+LISTEN 0      128          0.0.0.0:6200       0.0.0.0:*    users:(("swift-object-se",pid=746199,fd=5))                                      
+--- ssh 10.0.4.3 ---
+swift3
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  944M   50G   2% /srv/node/d1
+/dev/sda6        50G  757M   50G   2% /srv/node/d2
+/dev/sda7        50G  759M   50G   2% /srv/node/d3
+MemTotal:        7865304 kB
+MemAvailable:    5103220 kB
+active
+active
+inactive
+inactive
+LISTEN 0      128          0.0.0.0:6202       0.0.0.0:*    users:(("swift-account-s",pid=4062782,fd=5))            
+LISTEN 1      128          0.0.0.0:6201       0.0.0.0:*    users:(("swift-container",pid=4000762,fd=5))            
+LISTEN 0      128          0.0.0.0:6200       0.0.0.0:*    users:(("swift-object-se",pid=3932897,fd=5))            
+LISTEN 0      4000         0.0.0.0:8085       0.0.0.0:*    users:(("haproxy",pid=4030548,fd=7))                    
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=4000690,fd=5))            
+--- ssh 10.0.4.4 ---
+swift4
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda5        50G  864M   50G   2% /srv/node/d1
+/dev/sda6        50G  751M   50G   2% /srv/node/d2
+/dev/sda7        50G  755M   50G   2% /srv/node/d3
+MemTotal:        7865296 kB
+MemAvailable:    5059756 kB
+active
+active
+inactive
+inactive
+LISTEN 0      128          0.0.0.0:6201       0.0.0.0:*    users:(("swift-container",pid=2552599,fd=5))            
+LISTEN 0      128          0.0.0.0:6200       0.0.0.0:*    users:(("swift-object-se",pid=2480368,fd=5))            
+LISTEN 0      128          0.0.0.0:6202       0.0.0.0:*    users:(("swift-account-s",pid=3877087,fd=5))            
+LISTEN 0      128          0.0.0.0:8080       0.0.0.0:*    users:(("swift-proxy-ser",pid=2552503,fd=5))            
+LISTEN 0      4000         0.0.0.0:8085       0.0.0.0:*    users:(("haproxy",pid=3856525,fd=7))                    

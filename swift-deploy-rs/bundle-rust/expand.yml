@@ -1,0 +1,43 @@
+---
+# P3-ops expand playbook — add-disk / add-node without wiping data.
+#
+# Operator workflow:
+#   1) Prepare new disk out-of-band (mount XFS at /srv/node/<name>) OR add a
+#      new storage node with ssh + empty /srv/node dirs.
+#   2) Update inventory / host_vars:
+#        - append basename to swift_devices (add-disk), and/or
+#        - add host to storage groups with region/zone/swift_devices (add-node)
+#   3) Apply: swift-deploy apply … --playbook expand.yml
+#
+# Dual-guard: never mkfs / wipe /srv/node. Expand mode never rm's existing
+# *.ring.gz; it idempotently adds missing devices then rebalances.
+# Honest note: Rust ring builder rebalance rebuilds assignment from the
+# device list (no replica2part2dev persistence) — expect partition moves;
+# replicators heal. Schedule during a maintenance window.
+
+- hosts: all
+  roles:
+    - rust_expand_mode
+
+- hosts: storage_nodes
+  roles:
+    - rust_disks
+    - rust_replication_key
+
+- hosts: all
+  roles:
+    - rust_rings
+
+- hosts: haproxy_servers
+  roles:
+    - role: rust_haproxy
+      when: use_lb
+
+- hosts: keepalived_servers
+  roles:
+    - role: rust_keepalived
+      when: use_lb
+
+- hosts: proxy_servers
+  roles:
+    - rust_verify

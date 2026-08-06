@@ -1,0 +1,29 @@
+   Compiling swift-deploy-rs v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-deploy-rs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.22s
+     Running tests/planner_safety.rs (target/debug/deps/planner_safety-3e2ce25d404a313c)
+
+running 4 tests
+test redaction_hides_sensitive_values_without_damaging_normal_fields ... ok
+test independent_capabilities_are_required_for_each_high_risk_class ... ok
+test planner_flattens_includes_blocks_and_inherited_controls ... ok
+test selected_v3_swift_playbook_builds_a_sealed_safety_classified_plan ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/workspace_rust_stack.rs (target/debug/deps/workspace_rust_stack-4499667aa44609c6)
+
+running 11 tests
+test rust_stack_rejects_custom_disks ... ok
+test rust_stack_rejects_unsafe_swift_devices ... ok
+test rust_stack_accepts_keepalived_ingress_and_rejects_unknown_stacks ... ok
+test rust_stack_requires_a_valid_tempauth_account ... ok
+test rust_stack_rejects_keystone_or_mariadb_roles ... ok
+test stack_defaults_to_python_v3_and_python_rules_still_apply ... ok
+test rust_stack_preview_redacts_tempauth_keys ... ok
+test rust_stack_allows_https_on_haproxy_and_emits_region_devices ... ok
+test rust_stack_erasure_coding_requires_enough_object_devices ... ok
+test rust_stack_allows_a_dedicated_replication_network ... ok
+test rust_stack_workspace_generates_tempauth_group_vars_without_keystone_files ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+

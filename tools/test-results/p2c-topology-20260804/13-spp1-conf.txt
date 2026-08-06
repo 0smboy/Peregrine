@@ -1,0 +1,5 @@
+# daemons (their own sections below; they read devices/bind_port from
+servers_per_port = 1
+bind_ip = 0.0.0.0
+bind_port = 6200
+workers = 0

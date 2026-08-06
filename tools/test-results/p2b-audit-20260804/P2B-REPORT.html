@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>P2b Auditor — Contabo Evidence</title>
+<style>
+  :root { --ink:#1a1a1a; --muted:#555; --ok:#0a7a3e; --bg:#f7f5f1; --card:#fff; --warn:#8a5a00; }
+  body { font-family: ui-sans-serif, system-ui, sans-serif; margin:0; background:var(--bg); color:var(--ink); line-height:1.45; }
+  main { max-width:920px; margin:0 auto; padding:2rem 1.25rem 4rem; }
+  h1 { font-size:1.75rem; margin:0 0 .25rem; }
+  .meta { color:var(--muted); margin-bottom:1.5rem; }
+  .verdict { display:inline-block; background:var(--ok); color:#fff; padding:.35rem .75rem; font-weight:700; letter-spacing:.02em; }
+  section { background:var(--card); padding:1.1rem 1.25rem; margin:1rem 0; border:1px solid #e4e0d8; }
+  h2 { font-size:1.1rem; margin:0 0 .75rem; }
+  table { width:100%; border-collapse:collapse; font-size:.95rem; }
+  th, td { text-align:left; padding:.4rem .5rem; border-bottom:1px solid #eee; vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  code, .path { font-family: ui-monospace, Menlo, monospace; font-size:.85rem; }
+  ul { margin:.4rem 0 .4rem 1.2rem; }
+  .ok { color:var(--ok); font-weight:600; }
+  .warn { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body>
+<main>
+  <p class="verdict">GREEN</p>
+  <h1>P2b — Continuous Auditor</h1>
+  <p class="meta">2026-08-04 · Contabo VIP <code>10.0.0.10:8085</code> · no wipe · evidence <code>tools/test-results/p2b-audit-20260804/</code></p>
+
+  <section>
+    <h2>1) What this cycle did</h2>
+    <ul>
+      <li>Shipped continuous conf-driven auditors (Python <code>ObjectAuditor</code> / <code>DatabaseAuditor</code> shape): interval sleep, SIGTERM-aware, recon merge.</li>
+      <li>Wired systemd units on all four Contabo nodes; disabled nightly <code>swift-audit-sweep.timer</code>.</li>
+      <li>Documented SLA in <code>docs/fairness-lab/AUDITOR-SLA.md</code> (continuous, not timer-equivalent).</li>
+      <li>Marked <strong>container-sync</strong> as explicit wontfix (no proxy filter + no daemon claim).</li>
+      <li>Proved quarantine on Contabo: corrupt one replica → moved under <code>quarantined/</code>; client GET still 200.</li>
+      <li>CORE-PATH func 54/54 (no regress). Did not start P3 from this wave.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>2) What was optimized / fixed / demoted</h2>
+    <ul>
+      <li><strong>Fixed:</strong> auditors are no longer “nightly oneshot only” — continuous <code>Type=simple</code> + <code>Restart=on-failure</code>.</li>
+      <li><strong>Intervals:</strong> object=30s, account/container DB=1800s (Python defaults).</li>
+      <li><strong>Demoted / wontfix:</strong> container-sync full proxy filter + daemon path (library HMAC/sync-row core remains).</li>
+      <li><strong>Retired claim:</strong> nightly timer SLA equivalence (not claimed).</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>3) Measured effect</h2>
+    <table>
+      <tr><th>Metric</th><th>Before (pre-P2b)</th><th>After</th></tr>
+      <tr><td>Auditor model</td><td>Nightly oneshot timer 03:17</td><td>Continuous daemons ×3 roles</td></tr>
+      <tr><td>Object interval</td><td>~24h max lag</td><td>30s between passes</td></tr>
+      <tr><td>DB interval</td><td>~24h max lag</td><td>1800s between passes</td></tr>
+      <tr><td>Units active (4 nodes)</td><td>timer only</td><td>object+account+container auditor active</td></tr>
+      <tr><td>Quarantine (corrupt replica)</td><td>not exercised as continuous path</td><td class="ok">hash dir quarantined; GET 200</td></tr>
+      <tr><td>CORE-PATH func</td><td>54/54 (P2a)</td><td class="ok">54/54 (no regress)</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>4) Gate results</h2>
+    <table>
+      <tr><th>Gate</th><th>Result</th><th>Evidence</th></tr>
+      <tr><td>Unit (auditor crates)</td><td class="ok">PASS</td><td><span class="path">05-cargo-unit.txt</span></td></tr>
+      <tr><td>Deploy ×4</td><td class="ok">PASS</td><td><span class="path">05-deploy-swift1.txt</span> · <span class="path">05-deploy-234.txt</span> · <span class="path">20-daemon-status.txt</span></td></tr>
+      <tr><td>P2b suite VIP</td><td class="ok">11/11</td><td><span class="path">20-p2b-suite.txt</span></td></tr>
+      <tr><td>Quarantine E2E</td><td class="ok">PASS</td><td><span class="path">10-quarantine-e2e.txt</span></td></tr>
+      <tr><td>CORE-PATH func VIP</td><td class="ok">54/54</td><td><span class="path">12-func-suite-vip.txt</span> · <span class="path">22-func-suite-vip.txt</span></td></tr>
+      <tr><td>Nightly timer</td><td class="ok">disabled</td><td><span class="path">20-daemon-status.txt</span></td></tr>
+      <tr><td>Disk / wipe</td><td class="warn">no wipe; swift1 d1 hit 100% during cycle</td><td><span class="path">23-disk-pressure.txt</span> · <span class="path">20-daemon-status.txt</span></td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>5) Remaining / next</h2>
+    <ul>
+      <li><strong>FROZEN / residual:</strong> long first Contabo object pass (100k+ hash dirs); hashes.pkl incremental; ZBF; watchers; DB quarantine move.</li>
+      <li><strong>Backlog wontfix:</strong> container-sync full path (only if product claims sync later).</li>
+      <li><strong>Lab residual:</strong> Contabo disk pressure on d1 (100% on swift1 observed) — no wipe this cycle.</li>
+      <li>P2c already GREEN in parallel; P3 tracks are separate.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Docs</h2>
+    <ul>
+      <li><span class="path">docs/fairness-lab/AUDITOR-SLA.md</span></li>
+      <li><span class="path">docs/fairness-lab/PRODUCTION-GAP-ROADMAP.md</span> (P2b GREEN)</li>
+      <li><span class="path">docs/fairness-lab/CONTRACTS.md</span> · <span class="path">blocked-by-missing-impl.md</span></li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

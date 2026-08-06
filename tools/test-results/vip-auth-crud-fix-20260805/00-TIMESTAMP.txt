@@ -1,0 +1,4 @@
+UTC=2026-08-05T11:35:07Z
+PACK=vip-auth-crud-fix-20260805
+SCOPE=auth-only (no ring migrate, no Python install, no mkfs)
+PRODUCTION-GO-LIVE=NOT_CLAIMED

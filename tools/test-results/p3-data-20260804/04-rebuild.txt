@@ -1,0 +1,29 @@
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: type alias `TokenCheck` is never used
+  --> crates/swift-middleware/src/authtoken.rs:77:10
+   |
+77 | pub type TokenCheck = TokenOutcome;
+   |          ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: type alias `KeystoneAuthHandle` is never used
+   --> crates/swift-middleware/src/keystoneauth.rs:597:10
+    |
+597 | pub type KeystoneAuthHandle = Arc<KeystoneAuth>;
+    |          ^^^^^^^^^^^^^^^^^^
+
+warning: `swift-middleware` (lib) generated 3 warnings (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+   Compiling swift-proxy-server v0.1.0 (/root/work/swift-rust/crates/swift-proxy-server)
+    Finished `release` profile [optimized] target(s) in 5.46s
+   Compiling swift-container-server v0.1.0 (/root/work/swift-rust/crates/swift-container-server)
+    Finished `release` profile [optimized] target(s) in 4.49s
+total 10016
+drwxr-xr-x.  2 root root     118 Aug  4 15:37 .
+drwxrwxrwt. 46 root root    8192 Aug  4 15:37 ..
+-rw-r--r--.  1 root root    1700 Aug  4 15:36 deploy-p3-data.sh
+-rwxr-xr-x.  1 root root 3624832 Aug  4 15:37 swift-container-server
+-rwxr-xr-x.  1 root root 3123608 Aug  4 15:37 swift-container-sharder
+-rwxr-xr-x.  1 root root 3488800 Aug  4 15:37 swift-proxy-server

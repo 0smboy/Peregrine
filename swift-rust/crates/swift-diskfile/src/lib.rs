@@ -45,7 +45,10 @@ pub use cleanup::{
     cleanup_ondisk_files, get_partition_hashes, hash_suffix_repl, CleanupConfig, CleanupResult,
     SuffixHashes,
 };
-pub use auditor::{audit_device, audit_locations, audit_object, AuditOutcome, AuditReport};
+pub use auditor::{
+    audit_device, audit_devices, audit_locations, audit_object, list_devices, AuditOutcome,
+    AuditReport,
+};
 pub use diskfile::{
     DiskFile, DiskFileConfig, DiskFileRangeReader, DiskFileReader, DiskFileStreamReader,
     DiskFileWriter,

@@ -1,0 +1,13 @@
+=== VIP regression post-migrate 20260805T114254Z ===
+health=200
+info=200
+tempauth_auth=200 toklen=149
+TEMPAUTH_CRUD GET=204 PUT=201 PUT=201 GET=200 DELETE=204 DELETE=204
+keystone_token=201 project=29af7f1e19774999bf700fbef31994d3
+KEYSTONE_CRUD GET=200 PUT=201 PUT=201 GET=200 DELETE=204 DELETE=204
+account devices ['d2'] ports [6202]
+container devices ['d2'] ports [6201]
+object devices ['d2', 'd3'] ports [6211, 6212]
+ISOLATION_OK True
+TEMPAUTH_PASS=0 KEYSTONE_PASS=1 ISOLATION=1
+POST_MIGRATE_GATES FAIL

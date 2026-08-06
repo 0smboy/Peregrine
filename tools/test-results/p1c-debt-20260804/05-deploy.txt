@@ -1,0 +1,21 @@
+58a94acf0c130819d21af1f1ec31c1fb  /tmp/swift-proxy-server-p1c
+===== redeploy 10.0.0.1 =====
+active
+health=200
+	liberasurecode.so.1 => /usr/local/lib/liberasurecode.so.1 (0x00007fd130fcb000)
+58a94acf0c130819d21af1f1ec31c1fb  /usr/local/bin/swift-proxy-server
+===== redeploy 10.0.0.2 =====
+active
+health=200
+	liberasurecode.so.1 => /usr/local/lib/liberasurecode.so.1 (0x00007f458329a000)
+58a94acf0c130819d21af1f1ec31c1fb  /usr/local/bin/swift-proxy-server
+===== redeploy 10.0.0.3 =====
+active
+health=200
+	liberasurecode.so.1 => /usr/local/lib/liberasurecode.so.1 (0x00007f01b2568000)
+58a94acf0c130819d21af1f1ec31c1fb  /usr/local/bin/swift-proxy-server
+===== redeploy 10.0.0.4 =====
+active
+health=200
+	liberasurecode.so.1 => /usr/local/lib/liberasurecode.so.1 (0x00007fa9f4279000)
+58a94acf0c130819d21af1f1ec31c1fb  /usr/local/bin/swift-proxy-server

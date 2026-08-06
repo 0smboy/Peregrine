@@ -1,0 +1,29 @@
+86 /etc/swift/proxy-server.conf
+3:# Managed by P0 pipeline foundation deploy (2026-08-04)
+4:# P0 thin+cache pipeline (2026-08-04)
+5:[pipeline:main]
+6:pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+38:[filter:tempauth]
+39:user_test_tester = azure-swift-2026.bench .admin
+68:[filter:authtoken]
+[filter:tempauth]
+user_test_tester = azure-swift-2026.bench .admin
+
+[filter:ratelimit]
+use = egg:swift#ratelimit
+account_ratelimit = 200
+max_sleep_time_seconds = 60
+container_ratelimits = 0 , 0
+container_listing_ratelimits = 0 , 0
+
+[filter:formpost]
+use = egg:swift#formpost
+
+[filter:staticweb]
+use = egg:swift#staticweb
+
+[filter:container_quotas]
+use = egg:swift#container_quotas
+
+[filter:account_quotas]
+use = egg:swift#account_quotas

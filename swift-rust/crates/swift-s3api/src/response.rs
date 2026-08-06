@@ -17,8 +17,8 @@
 //!
 //! Ported from `s3response.py` (`ErrorResponse`), `controllers/service.py`
 //! (`ListAllMyBucketsResult`), `controllers/bucket.py` (`ListBucketResult`)
-//! and `controllers/multi_delete.py` (`DeleteResult`). ACL, tagging,
-//! versioning and MPU documents are deferred.
+//! and `controllers/multi_delete.py` (`DeleteResult`). Wave 3 adds ListObjects
+//! v2 shapes; ACL/CORS/MPU live in sibling modules.
 
 use crate::xml::Element;
 use swift_http::Response;
@@ -66,6 +66,10 @@ pub fn error_status_and_message(code: &str) -> (u16, &'static str) {
         "InvalidBucketName" => (400, "The specified bucket is not valid."),
         "InvalidBucketState" => (409, "The request is not valid with the current state of the bucket."),
         "InvalidDigest" => (400, "The Content-MD5 you specified was invalid."),
+        "InvalidPart" => (
+            400,
+            "One or more of the specified parts could not be found. The part might not have been uploaded, or the specified entity tag might not have matched the part's entity tag.",
+        ),
         "InvalidPartNumber" => (416, "The requested partnumber is not satisfiable"),
         "InvalidRange" => (416, "The requested range cannot be satisfied."),
         "InvalidRequest" => (400, "Invalid Request."),
@@ -203,6 +207,64 @@ impl ListBucketResult {
     }
 
     /// A ready-to-send `200 OK` `application/xml` [`Response`].
+    pub fn into_response(self) -> Response {
+        xml_response(200, self.to_xml())
+    }
+}
+
+/// A `ListBucketResult` for ListObjectsV2 (`list-type=2`).
+#[derive(Debug, Clone, Default)]
+pub struct ListBucketResultV2 {
+    pub name: String,
+    pub prefix: String,
+    pub start_after: String,
+    pub continuation_token: Option<String>,
+    pub next_continuation_token: Option<String>,
+    pub key_count: u32,
+    pub max_keys: u32,
+    pub delimiter: Option<String>,
+    pub encoding_type: Option<String>,
+    pub is_truncated: bool,
+    pub contents: Vec<S3Object>,
+    pub common_prefixes: Vec<String>,
+}
+
+impl ListBucketResultV2 {
+    pub fn to_xml(&self) -> Vec<u8> {
+        let mut elem = Element::new("ListBucketResult");
+        elem.push_leaf("Name", &self.name);
+        elem.push_leaf("Prefix", &self.prefix);
+        if !self.start_after.is_empty() {
+            elem.push_leaf("StartAfter", &self.start_after);
+        }
+        if let Some(ct) = &self.continuation_token {
+            elem.push_leaf("ContinuationToken", ct);
+        }
+        if let Some(nct) = &self.next_continuation_token {
+            elem.push_leaf("NextContinuationToken", nct);
+        }
+        elem.push_leaf("KeyCount", self.key_count.to_string());
+        elem.push_leaf("MaxKeys", self.max_keys.to_string());
+        if let Some(d) = &self.delimiter {
+            elem.push_leaf("Delimiter", d);
+        }
+        if let Some(e) = &self.encoding_type {
+            elem.push_leaf("EncodingType", e);
+        }
+        elem.push_leaf(
+            "IsTruncated",
+            if self.is_truncated { "true" } else { "false" },
+        );
+        for obj in &self.contents {
+            elem.push(object_element(obj));
+        }
+        for prefix in &self.common_prefixes {
+            let cp = Element::new("CommonPrefixes").with_leaf("Prefix", prefix);
+            elem.push(cp);
+        }
+        elem.to_xml(true)
+    }
+
     pub fn into_response(self) -> Response {
         xml_response(200, self.to_xml())
     }

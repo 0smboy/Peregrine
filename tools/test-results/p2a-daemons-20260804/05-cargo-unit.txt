@@ -1,0 +1,150 @@
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/mount_check.rs (target/debug/deps/mount_check-ee2dbb2e06628310)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/multiphase.rs (target/debug/deps/multiphase-24c48379bca47bbf)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/replicate.rs (target/debug/deps/replicate-3e719aceed543103)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/ssync.rs (target/debug/deps/ssync-a58d2afad76f07f0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+
+     Running tests/ssync_ec.rs (target/debug/deps/ssync_ec-f34a9fea609d38f2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/streaming.rs (target/debug/deps/streaming-c6a31240e4e8e0a6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+   Compiling digest v0.10.7
+   Compiling bitflags v2.13.0
+   Compiling md-5 v0.10.6
+   Compiling sha2 v0.10.9
+   Compiling sha1 v0.10.7
+   Compiling swift-core v0.1.0 (/root/work/swift-rust/crates/swift-core)
+   Compiling rusqlite v0.32.1
+   Compiling swift-ring v0.1.0 (/root/work/swift-rust/crates/swift-ring)
+   Compiling swift-http v0.1.0 (/root/work/swift-rust/crates/swift-http)
+   Compiling swift-db v0.1.0 (/root/work/swift-rust/crates/swift-db)
+   Compiling swift-account-server v0.1.0 (/root/work/swift-rust/crates/swift-account-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.56s
+     Running unittests src/lib.rs (target/debug/deps/swift_account_server-9e51b94410d96b12)
+
+running 4 tests
+test reaper::tests::test_is_reapable ... ok
+test reaper::tests::test_reap_container_deletes_objects_then_container ... ok
+test reaper::tests::test_reap_container_keeps_container_if_object_fails ... ok
+test reaper::tests::test_reap_account_end_to_end ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running unittests src/bin/account_reaper.rs (target/debug/deps/swift_account_reaper-b6568da8a7f3035f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/swift_account_server-2cff043304d5a2bd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/golden.rs (target/debug/deps/golden-64de873a8329748e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/swift_container_server-50574bf9df1210ae)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running unittests src/bin/container_updater.rs (target/debug/deps/swift_container_updater-82b610b1fb4781b9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/golden.rs (target/debug/deps/golden-e4c83372e69e024d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/replication.rs (target/debug/deps/replication-c2c56783a40bcdde)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/rsync_ops.rs (target/debug/deps/rsync_ops-a76fca354eafb45b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/sharding.rs (target/debug/deps/sharding-57a746fdd27d6301)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running unittests src/bin/container_updater.rs (target/debug/deps/swift_container_updater-82b610b1fb4781b9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/golden.rs (target/debug/deps/golden-e4c83372e69e024d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/replication.rs (target/debug/deps/replication-c2c56783a40bcdde)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/rsync_ops.rs (target/debug/deps/rsync_ops-a76fca354eafb45b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/sharding.rs (target/debug/deps/sharding-57a746fdd27d6301)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+

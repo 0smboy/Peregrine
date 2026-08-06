@@ -12,15 +12,20 @@
     mode: "0755"
   with_items:
     - swift-account-info
+    - swift-account-reaper
     - swift-account-server
     - swift-container-info
+    - swift-container-reconciler
     - swift-container-server
+    - swift-container-sharder
+    - swift-container-updater
     - swift-db-auditor
     - swift-db-replicator
     - swift-drive-audit
     - swift-get-nodes
     - swift-manage-shard-ranges
     - swift-object-auditor
+    - swift-object-expirer
     - swift-object-info
     - swift-object-reconstructor
     - swift-object-replicator

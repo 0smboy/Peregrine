@@ -1,0 +1,4 @@
+LISTEN 0      128        127.0.0.1:6320       0.0.0.0:*    users:(("swift-object-se",pid=3385552,fd=4))            
+LISTEN 0      128         10.0.0.3:8081       0.0.0.0:*    users:(("swift-proxy-ser",pid=3385688,fd=4))            
+rsaio=200
+cluster=200

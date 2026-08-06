@@ -1,0 +1,10 @@
+   Compiling swift-http v0.1.0 (/root/work/swift-rust/crates/swift-http)
+   Compiling swift-db v0.1.0 (/root/work/swift-rust/crates/swift-db)
+   Compiling swift-diskfile v0.1.0 (/root/work/swift-rust/crates/swift-diskfile)
+   Compiling swift-object-server v0.1.0 (/root/work/swift-rust/crates/swift-object-server)
+   Compiling swift-container-server v0.1.0 (/root/work/swift-rust/crates/swift-container-server)
+    Finished `release` profile [optimized] target(s) in 17.49s
+     Running `target/release/examples/spp_probe`
+discover(0.0.0.0)={6200}
+discover(10.0.4.1)={6200}
+ips_for_ring_lookup(0.0.0.0) count=11 has_10_0_4_1=true

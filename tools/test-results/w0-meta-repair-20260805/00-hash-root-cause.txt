@@ -1,0 +1,4 @@
+expected_db_hash 66369328010f0b6b76653d5725d314a4
+correct_slash   66369328010f0b6b76653d5725d314a4 MATCH
+buggy_no_slash  af28d132539458c71a0878811b7070ab NO
+root_cause: wave0-ab omitted '/' after swift_hash_path_prefix → kept_dirs=0

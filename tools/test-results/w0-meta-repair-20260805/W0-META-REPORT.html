@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>W0′ meta repair — 2026-08-05</title>
+<style>
+  :root { --bg:#141210; --ink:#f2ebe0; --muted:#a89a88; --ok:#7d9b6a; --warn:#c4a35a; --bad:#c47a6a; --line:#2c2822; }
+  body { margin:0; font:15px/1.45 ui-sans-serif, system-ui, sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width:980px; margin:0 auto; padding:32px 24px 64px; }
+  h1 { font-size:1.6rem; font-weight:650; margin:0 0 8px; }
+  h2 { font-size:1.1rem; margin:28px 0 10px; color:var(--muted); font-weight:600; }
+  .sub { color:var(--muted); margin-bottom:24px; }
+  .pill { display:inline-block; padding:2px 10px; border:1px solid var(--line); border-radius:4px; font-size:12px; letter-spacing:.02em; }
+  .ok { color:var(--ok); border-color:#3a4a32; }
+  .warn { color:var(--warn); border-color:#4a4030; }
+  table { width:100%; border-collapse:collapse; margin:10px 0 18px; font-size:13px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:550; }
+  code { font:12px/1.4 ui-monospace, Menlo, monospace; color:#e0d4c2; }
+  pre { background:#1c1915; padding:12px 14px; overflow:auto; font:12px/1.4 ui-monospace, Menlo, monospace; border:1px solid var(--line); }
+</style>
+</head>
+<body>
+<main>
+  <h1>W0′ — Meta repair after A+B</h1>
+  <p class="sub">Contabo lab · 2026-08-05 · evidence <code>tools/test-results/w0-meta-repair-20260805/</code></p>
+  <p>
+    <span class="pill ok">LAB META_CLEAN</span>
+    <span class="pill warn">NOT PRODUCTION-GO-LIVE</span>
+  </p>
+
+  <h2>1) What this cycle did</h2>
+  <ul>
+    <li>Root-caused wave0-ab <code>kept_dirs=0</code>: missing <code>/</code> after <code>swift_hash_path_prefix</code>.</li>
+    <li>Fixed <code>tools/wave0-ab-reclaim-orphans.py</code> to match rust-core <code>HashPathConfig</code>.</li>
+    <li>Cleared ghost account container rows + zombie <code>object where deleted=0</code> via <code>wave0-meta-repair.py</code> (DELETE + chexor stub; VACUUM).</li>
+    <li>Purged residual orphan object hash dirs with fixed reclaim script (<code>referenced_hashes=0</code> → remove all).</li>
+    <li>VIP CRUD smoke: PUT container/object → GET → DELETE OK; listing empty after.</li>
+  </ul>
+
+  <h2>2) Hash root cause</h2>
+  <pre>buggy:   md5(prefix + account + "/" + container + "/" + obj + suffix)
+correct: md5(prefix + "/" + account + "/" + container + "/" + obj + suffix)
+# Contabo prefix=contabo-f5183cf3f3eaf886 suffix=4afcbe289acfdfa1
+# Early A+B kept_dirs=0 with ~650k referenced hashes was formula bug, not empty store.</pre>
+
+  <h2>3) Measured before → after</h2>
+  <table>
+    <tr><th>Gate</th><th>Before</th><th>After</th></tr>
+    <tr><td>API listing lines</td><td>968</td><td><strong>0</strong></td></tr>
+    <tr><td>X-Account-Object-Count</td><td>846331</td><td><strong>0</strong></td></tr>
+    <tr><td>Container DB live object rows</td><td>~650k/node</td><td><strong>0</strong> (swift1–4)</td></tr>
+    <tr><td>Account DB live container rows</td><td>~1000+</td><td><strong>0</strong></td></tr>
+    <tr><td>Disk object hash dirs</td><td>40–200/node</td><td><strong>0</strong> after orphan purge</td></tr>
+    <tr><td>CRUD smoke</td><td>—</td><td>201/201/200/204/204</td></tr>
+  </table>
+
+  <h2>4) Threat / integrity note</h2>
+  <ul>
+    <li>Repair used stock <code>sqlite3</code> with a local <code>chexor()</code> stub so Swift DELETE triggers can fire. Brokers rewrite hashes on next real write.</li>
+    <li>Soft-deleted / historical <code>deleted=1</code> object rows may remain inside container DBs (not listing-visible).</li>
+    <li>Orphan container <code>.db</code> files under drifted partitions may remain on disk as empty/soft-deleted brokers.</li>
+    <li><strong>Forbidden claim:</strong> PRODUCTION meta OK / PRODUCTION-GO-LIVE. This is Contabo LAB listing+row consistency only.</li>
+  </ul>
+
+  <h2>5) Remaining / FROZEN</h2>
+  <ul>
+    <li><strong>FROZEN:</strong> using Contabo HTTP lab META_CLEAN as PRODUCTION-GO-LIVE.</li>
+    <li>Backlog: partition-drifted container DB files (auditor/reaper), optional hard DROP of empty broker files.</li>
+    <li>Next: W1 Identity live (memory/disk gates first).</li>
+  </ul>
+</main>
+</body>
+</html>

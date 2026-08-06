@@ -1,0 +1,6 @@
+P1c GREEN 2026-08-04T14:35:16Z
+proxy=ed1e66aa9bf2c68fb767a61864fe54e3
+container=d563d9a84b8aa7f44a3d3ff72c9c3421
+func=54/54
+p1c=28/28
+acl-failover=PASS

@@ -1,0 +1,4 @@
+PLAY RECAP *********************************************************************
+169.58.108.85              : ok=32   changed=24   unreachable=0    failed=1    skipped=0    rescued=0    ignored=0   
+169.58.108.86              : ok=10   changed=6    unreachable=0    failed=0    skipped=24   rescued=0    ignored=0   
+169.58.108.87              : ok=10   changed=6    unreachable=0    failed=0    skipped=24   rescued=0    ignored=0   

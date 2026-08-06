@@ -1,0 +1,56 @@
+201 http://127.0.0.1:5001/v3/credentials b'{"credential": {"id": "55497854190f3c669a032d83272e46d6b8c62af52bf4a95eb584a3fd423ec010", "user_id": "08fe207f3db14e8ca84d0ba7ea9afeb7", "project_id": "5a848b56'
+400 http://127.0.0.1:5001/v3/credentials b'{"error":{"code":400,"message":"Invalid input for field \'blob\': {\'access\': \'AKIAW3S3LAB0001\', \'secret\': \'w3s3labsecretkey00000000000000000001\'} is not of type \''
+201 http://127.0.0.1:5001/v3/users/08fe207f3db14e8ca84d0ba7ea9afeb7/credentials/OS-EC2 b'{"credential": {"user_id": "08fe207f3db14e8ca84d0ba7ea9afeb7", "tenant_id": "5a848b56c5e049f390d7e3ae38961157", "access": "28de7daf94f0483db03ab2aa3c4662f3", "s'
+404 http://127.0.0.1:5001/v3/OS-EC2/credentials b'<!doctype html>\n<html lang=en>\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually'
+GET 200 http://127.0.0.1:5001/v3 b'{"version": {"id": "v3.14", "status": "stable", "updated": "2020-04-07T00:00:00Z", "links": [{"rel": "self", "href": "http://127.0.0.1:5001/v3/"}], "media-types": [{"base": "application/json", "type":'
+GET 200 http://127.0.0.1:5001/v3/credentials b'{"credentials": [{"id": "4886c72005697f91d036a1c992398f7a22930aaf6a05cba10e14729c0361804d", "user_id": "a174f157c6a04a76b7f7a5d612dc81c9", "project_id": "29af7f1e19774999bf700fbef31994d3", "type": "ec'
+GET 300 http://127.0.0.1:5001/ b'{"versions": {"values": [{"id": "v3.14", "status": "stable", "updated": "2020-04-07T00:00:00Z", "links": [{"rel": "self", "href": "http://127.0.0.1:5001/v3/"}], "media-types": [{"base": "application/j'
+259:# The network address and optional user credentials for connecting to the
+281:[application_credential]
+287:# Entry point for the application credential backend driver in the
+288:# `keystone.application_credential` namespace.  Keystone only provides a `sql`
+293:# Toggle for application credential caching. This has no effect unless global
+297:# Time to cache application credential data in seconds. This has no effect
+301:# Maximum number of application credentials a user is permitted to create. A
+303:# create application credentials at will, which could lead to bloat in the
+336:#methods = external,password,token,oauth1,mapped,application_credential
+371:# Entry point for the application_credential auth plugin module in the
+372:# `keystone.auth.application_credential` namespace. You do not need to set this
+373:# unless you are overriding keystone's own `application_credential`
+375:#application_credential = <None>
+632:# Indicate that the actual request can include user credentials (boolean value)
+633:#allow_credentials = true
+650:[credential]
+656:# Entry point for the credential backend driver in the `keystone.credential`
+661:# Entry point for credential encryption and decryption operations in the
+662:# `keystone.credential.provider` namespace. Keystone only provides a `fernet`
+664:# entry point to encrypt and decrypt credentials. (string value)
+667:# Directory containing Fernet keys used to encrypt and decrypt credentials
+668:# stored in the credential backend. Fernet keys used to encrypt credentials
+673:#key_repository = /etc/keystone/credential-keys/
+675:# Toggle for caching only on retrieval of user credentials. This has no effect
+679:# Time to cache credential data in seconds. This has no effect unless global
+687:# Maximum number of credentials a user is permitted to create. A value of -1
+689:# credentials at will, which could lead to bloat in the keystone database or
+2658:# token for tokens with a more specific scope) or to provide their credentials
+python3-keystoneauth1-5.6.1-1.el9s.noarch
+python3-keystoneclient-5.4.0-1.el9s.noarch
+python3-keystonemiddleware-10.6.0-1.el9s.noarch
+python3-keystone+memcache-25.0.0-1.el9s.noarch
+python3-keystone-25.0.0-1.el9s.noarch
+python3-keystone+ldap-25.0.0-1.el9s.noarch
+openstack-keystone-25.0.0-1.el9s.noarch
+Name: keystonemiddleware
+Version: 10.6.0
+backends.py
+flask
+__init__.py
+__pycache__
+wsgi.py
+
+25.0.0
+keystone-dist.conf
+keystone-schema.json
+keystone-schema.yaml
+sample_data.sh
+wsgi-keystone.conf

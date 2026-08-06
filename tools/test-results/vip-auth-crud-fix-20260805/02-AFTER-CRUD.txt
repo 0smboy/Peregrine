@@ -1,0 +1,28 @@
+=== AFTER vip-auth-crud-fix ===
+utc 2026-08-05T11:33:39Z
+proxy_sha256 657e07439cde3520e83dd1bb47bf0f130120e532d39fda53a2925a0d938c2f77
+pipeline catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+storage_url https://10.0.0.10:8085
+tempauth_auth=200 toklen=149 storage_url=https://10.0.0.10:8085/v1/AUTH_test
+tempauth_list 200
+tempauth_put_cont 201
+tempauth_put_obj 201
+tempauth_get_obj 200 b'tempauth-ok\n'
+tempauth_del_obj 204
+tempauth_del_cont 204
+keystone_token=201 toklen=183 project_id=29af7f1e19774999bf700fbef31994d3 roles=['swiftoperator']
+keystone_list 200
+keystone_put_cont 201
+keystone_put_obj 201
+keystone_get_obj 200 b'keystone-ok\n'
+keystone_del_obj 204
+keystone_del_cont 204
+neg_AUTH_test_name 403
+neg_bogus 401
+=== haproxy backend checks ===
+
+=== VERDICT ===
+KEYSTONE_CRUD PASS {'tempauth_auth': 200, 'tempauth_list': 200, 'tempauth_put_cont': 201, 'tempauth_put_obj': 201, 'tempauth_get_obj': 200, 'tempauth_del_obj': 204, 'tempauth_del_cont': 204, 'keystone_token': 201, 'keystone_list': 200, 'keystone_put_cont': 201, 'keystone_put_obj': 201, 'keystone_get_obj': 200, 'keystone_del_obj': 204, 'keystone_del_cont': 204, 'neg_AUTH_test_name': 403, 'neg_bogus': 401}
+TEMPAUTH_CRUD PASS
+NEGATIVES PASS
+OVERALL GREEN

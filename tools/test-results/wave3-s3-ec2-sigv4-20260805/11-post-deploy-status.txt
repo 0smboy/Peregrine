@@ -1,0 +1,20 @@
+===== swift1 =====
+activating
+0cafe5f164da0c19906a74f0efb0e57be4494106fdc11cd40969b0d1b43ed02e  /usr/local/bin/swift-proxy-server
+Aug 05 10:31:18 swift1 systemd[1]: Started Swift proxy server (rust).
+Aug 05 10:31:20 swift1 systemd[1]: Started Swift proxy server (rust).
+Aug 05 10:31:22 swift1 systemd[1]: Started Swift proxy server (rust).
+Aug 05 10:31:25 swift1 systemd[1]: Started Swift proxy server (rust).
+Aug 05 10:31:27 swift1 systemd[1]: Started Swift proxy server (rust).
+===== swift2 =====
+activating
+0cafe5f164da0c19906a74f0efb0e57be4494106fdc11cd40969b0d1b43ed02e  /usr/local/bin/swift-proxy-server
+Aug 05 10:32:09 swift2 systemd[1]: Started Swift proxy server (rust).
+Aug 05 10:32:11 swift2 systemd[1]: Started Swift proxy server (rust).
+Aug 05 10:32:13 swift2 systemd[1]: Started Swift proxy server (rust).
+===== swift3 =====
+activating
+0cafe5f164da0c19906a74f0efb0e57be4494106fdc11cd40969b0d1b43ed02e  /usr/local/bin/swift-proxy-server
+===== swift4 =====
+activating
+0cafe5f164da0c19906a74f0efb0e57be4494106fdc11cd40969b0d1b43ed02e  /usr/local/bin/swift-proxy-server
