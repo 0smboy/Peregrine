@@ -159,10 +159,10 @@
 | Auth | TempAuth + Keystone lab | Production-only ops polish |
 | S3 | SigV4 + MPU + ListParts + canned ACL + multi-rule CORS | SigV2, versioning, full IAM/object ACL, aws-chunked |
 | EC | Data path + heal | macOS/default build; some EC throttling niceties |
-| Sharding L3b | CLI + daemon ring-part cleave + fan-out + ×4 Contabo | **lab clean listing KEEP** `l3b-clean-e2e-20260806` (listed 60, no relocate); **product KEEP vs Python对照 未宣称** |
+| Sharding L3b | CLI + daemon ring-part cleave + fan-out + ×4 Contabo; **product-style 40×4KB KEEP** on SHARDED `shrinklab` (HEAD=list, GET 5/5) `priority-wave-20260806` | Python对照 / multi-hour soak / multi-primary auto-shrink **未宣称** |
 | Crypto at-rest middleware | multi-root + listing + range GET + etag mask + **chunked PUT encrypt** | KMIP; ciphertext still buffered (footer residual) |
-| container-sync | filter + daemon + HTTPS + CA knobs + Contabo same-cluster object KEEP | multi-cluster realm live soak |
-| Production go-live | ops TLS script ready | **未实现** (Contabo still lab self-signed; operator PEM not applied) |
+| container-sync | filter + daemon + HTTPS + CA knobs + Contabo same-cluster object KEEP | multi-cluster realm live soak (no second cluster / realms conf) |
+| Production go-live | ops TLS script ready; VIP :8085 **lab SSL live** (self-signed) | **未实现** operator PEM + trust path (`priority-wave-20260806`) |
 
 **Bottom line under the user rule (“部分 = 未实现”):**  
 Rust is a **strong core-path + lab-proven** Swift, **not** a drop-in “full OpenStack Swift feature twin.” Fairness and product claims must stay **CORE-PATH / LAB-HARD-GREEN**, not “feature-complete vs Python.”
@@ -180,18 +180,18 @@ Rust is a **strong core-path + lab-proven** Swift, **not** a drop-in “full Ope
 | S3 MPU deep | 11/11 |
 | EC2 s3token | GREEN |
 | VIP failover | PASS |
-| L3b multi-node KEEP | **lab clean PASS** (`l3b-clean-e2e-20260806` listed 60, RIGHT partitions, no relocate); product claim **not claimed** |
-| Operator TLS PEM path (script) | **code GREEN**; Contabo **self-signed LAB** (probe 2026-08-06) |
-| container-sharder ×4 Contabo | **active** (status probe; KEEP not claimed) |
+| L3b multi-node KEEP | **lab clean PASS** (`l3b-clean-e2e-20260806` listed 60); **product-style 40×4KB KEEP** on SHARDED container (`priority-wave-20260806` put=40 HEAD=LIST=100 GET 5/5); Python对照 **not claimed** |
+| Operator TLS PEM path (script) | **code GREEN**; Contabo **self-signed LAB live** on VIP :8085 (`priority-wave-20260806/01-tls-lab-status.txt`); operator PEM **not applied** |
+| container-sharder ×4 Contabo | **active**; shrink + listing KEEP lab paths claimed separately |
 | Linux redeploy L3b bins ×4 | **PASS** (`linux-redeploy-20260806`) |
 | L3b CLI enable + epoch DB | **PASS** after set_sharding_state fix |
 | L3b sharder cleave creates shard DBs | **PASS lab** (`l3bkeep…`, shard DBs present) |
-| L3b listing KEEP post-cleave | **LAB CLEAN PASS** listed 60 no relocate (`l3b-clean-e2e-20260806`); post-shard 4KB PUT→list via shard update route (`l3b-4kb-keep-20260806`); wave2 30×4KB put_fail=0 list+GET (`l3b-4kb-wave2-20260806`); product long soak **not claimed** |
-| container-sync Contabo same-cluster | **KEEP** puts=28 fails=0 dst 5/5 GET (`sync-smoke-20260806d`); multi-cluster soak not run |
+| L3b listing KEEP post-cleave | **LAB CLEAN PASS** listed 60 no relocate (`l3b-clean-e2e-20260806`); post-shard 4KB PUT→list (`l3b-4kb-keep-20260806`); wave2 30×4KB (`l3b-4kb-wave2-20260806`); **priority-wave 40×4KB product KEEP** + VIP `-k` path (`priority-wave-20260806`); multi-hour soak **not claimed** |
+| container-sync Contabo same-cluster | **KEEP** puts=28 fails=0 dst 5/5 GET (`sync-smoke-20260806d`); multi-cluster soak **residual** (no realms conf / second cluster) |
 | compact / activate_cleaved | CLI + unit; lab CLEAVED→ACTIVE→SHRINKING mark (`l3b-compact-20260806`) |
-| sharder shrink + HEAD counts | **LAB KEEP** shrinklab 20→SHRUNK+acceptor 20 + GET 20/20 (`l3b-shrink-20260806`); multi-primary remote shrink residual |
-| TLS Contabo dry-run | **LAB self-signed** (`tls-dry-run-20260806`) |
-| Operator TLS PEM live apply | **deferred** |
+| sharder shrink + HEAD counts | **LAB KEEP** shrinklab 20→SHRUNK+acceptor 20 + GET 20/20 (`l3b-shrink-20260806`); multi-primary remote shrink residual (roots multi-node present — `priority-wave-20260806/04b`) |
+| TLS Contabo dry-run | **LAB self-signed** (`tls-dry-run-20260806` + `priority-wave-20260806`) |
+| Operator TLS PEM live apply | **deferred** → blocks PRODUCTION-GO-LIVE |
 
 See `tools/test-results/PARALLEL-RUN-20260806/` and `PARALLEL-123-20260806/`.
 

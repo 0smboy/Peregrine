@@ -1,0 +1,19 @@
+# Multi-primary root placement · Contabo · 2026-08-06
+# Full per-node sqlite scan of all DBs is too slow for this wave (timeout).
+# Targeted hash path probe (04b) is authoritative.
+
+API (swift1 :8080):
+- shrinklab1786029572: HEAD count=100 list=100 (post product 4KB)
+- l3bclean1786024121: prior sharded lab (root object_count residual 80)
+
+Targeted root DB hash presence (see 04b-targeted-root-replicas.txt):
+- shrinklab hash 76c9fdade2ec5b7a703159d5e3ed902f: swift1, swift3, swift4
+- l3bclean hash 695c2176777150c5c73835e396470638: swift1, swift2, swift3, swift4
+
+Partial swift1 full scan:
+ROOTDB shrinklab1786029572 0  (root empty post-shard — expected)
+ROOTDB l3bclean1786024121 80
+RECENT_4K_DATA_FILES=62 (swift1)
+
+VERDICT_MULTI_PRIMARY_AUTO_SHRINK=RESIDUAL
+# Roots multi-replicated; automatic shrink without co-locate still residual.

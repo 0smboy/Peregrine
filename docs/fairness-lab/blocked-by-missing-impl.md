@@ -25,19 +25,19 @@ These items explain why Contabo/deploy cannot mirror full Python ansible.
 | container-sync full proxy filter + daemon path | — | **DONE path (2026-08-06)** — proxy filter + `swift-container-sync` daemon; multi-cluster live soak not claimed |
 | `workers` prefork semantics | Integer knobs mislead A/B | **DONE (P2c)** — WORKERS-SEMANTICS.md + `swift-effective-concurrency` / `effective-concurrency.py` + library `effective_concurrency` |
 | Keepalived inside bundle-rust | Was Contabo-only overlay | **DONE (build/phase1)** — `rust_keepalived` + workspace allows `ingress.mode=keepalived` |
-| HAProxy TLS termination (`lb_mode=https`) | Client HTTPS at VIP | **DONE (P3-ops code)** — self-signed or `haproxy_tls_pem_src`; Contabo live cert apply = dry-run only (lab stays http:8085). Evidence `tools/test-results/p3-ops-20260804/` |
+| HAProxy TLS termination (`lb_mode=https`) | Client HTTPS at VIP | **DONE (P3-ops code)** — Contabo VIP **:8085 ssl live** with lab self-signed `haproxyCA.pem` (`priority-wave-20260806`); operator PEM still deferred → PRODUCTION-GO-LIVE blocked |
 | add-disk / add-node automation | Topology expand | **DONE (P3-ops code)** — `expand.yml` + idempotent ring `add`/`search`/`list`; dual-guard no wipe `/srv/node`. Live Contabo expand drill = backlog without ticket |
 | Multi-region ring labels | Cross-region affinity | **Wave 2 samples + dry-run** — r1/r2 host_vars samples + drill plan; Contabo live label drill backlog (not WAN). [MULTI-REGION.md](MULTI-REGION.md) · `wave2-spp-region-20260805/` |
 | P3-ops: HAProxy TLS + expand + multi-region host_vars | Ops completeness | **DONE (P3-ops code)** — `lb_mode=https` TLS terminate; `expand.yml`; region/zone/swift_devices in rings; dual-guard no wipe. Contabo live TLS may be dry-run only. See `tools/test-results/p3-ops-*` + P3-OPS-CONTRACT.md |
 
-L3b container sharding: **Wave 3 PARTIAL** (2026-08-05 prod stop-line; CLI
-expanded 2026-08-06) — CleavingContext persist, auto_shard gate + unit path,
-misplaced unit, `HttpShardReplicator` quorum (unit), proxy listing fan-out,
-manage-shard-ranges find/show/info/enable/delete/merge/find_and_replace.
-**Multi-node KEEP blockers:** live Contabo quorum drill; ring-directed HTTP
-shard create on all primaries wired through daemon; compact/repair/analyze;
-shrink/expand sequences. Contabo multi-node live quorum + 4KB KEEP **not
-claimed**. See `tools/test-results/wave3-s3-l3b-prod-20260805/`.
+L3b container sharding: **Wave 3 PARTIAL → LAB KEEP expanded 2026-08-06** —
+CleavingContext, auto_shard gate, proxy listing fan-out, manage-shard-ranges
+compact/activate_cleaved, sharder shrink (local/co-locate), HEAD=list fan-out,
+**product-style 40×4KB on SHARDED container KEEP**
+(`tools/test-results/priority-wave-20260806/`).
+**Still residual:** multi-primary automatic shrink without manual co-locate;
+multi-hour soak; full Python对照; multi-cluster sync realms.
+See also `l3b-clean-e2e-20260806`, `l3b-4kb-*`, `l3b-shrink-20260806`.
 
 | Item (2026-08-03 refresh) | Status |
 |---------------------------|--------|
@@ -47,5 +47,5 @@ claimed**. See `tools/test-results/wave3-s3-l3b-prod-20260805/`.
 | 16MB_read formal ACCEPT | **DONE R8** — DIRECT+HA ACCEPT (oc=40/rt=180, n=8) |
 | 6h soak per impl | **DONE R8** — DIRECT 4KB_write_128 6h fail_total=0 |
 | P3-data X-Newest best-source | **PARTIAL DONE** — proxy collect+newest; resumable multi-GET still deferred |
-| P3-data / Wave 3 L3b sharder | **PARTIAL** — lab clean listing KEEP PASS (`l3b-clean-e2e-20260806` listed 60, ring-part, no relocate); product multi-node 4KB KEEP / Python对照 **not claimed** |
+| P3-data / Wave 3 L3b sharder | **PARTIAL / LAB KEEP** — clean listing KEEP + product-style 40×4KB KEEP on SHARDED (`priority-wave-20260806`); multi-primary auto-shrink + Python对照 residual |
 | P3-data at-rest crypto middleware | **DONE path (2026-08-06)** — keymaster/encrypter/decrypter/encryption ON-BY-CONFIG; KMIP residual |

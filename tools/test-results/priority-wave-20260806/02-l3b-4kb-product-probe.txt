@@ -1,0 +1,13 @@
+# L3b product 4KB probe · Contabo · 2026-08-06
+# Path: internal proxy http://127.0.0.1:8080 (not VIP HTTPS self-signed)
+# Container: shrinklab1786029572 (SHARDED lab)
+
+TOK_LEN=149 ST=http://127.0.0.1:8080/v1/AUTH_test
+BASELINE: Object-Count 60 / list 60
+PUT 40×4KB prefix=prod4kb-1786031278 → PUT_OK=40 PUT_FAIL=0
+AFTER: HEAD_CNT=100 LIST_N=100 NEW_PREFIX_N=40 HEAD_LIST_MATCH=YES
+GET sample 01/10/20/30/40 → all 200 size=4096 GET_OK_5=5
+VERDICT=KEEP_PRODUCT_4KB_INTERNAL
+
+Note: first attempt used X-Storage-Url=https://10.0.0.10:8085 → curl without -k → all 000 (TLS self-signed). Not a product data-path failure.
+

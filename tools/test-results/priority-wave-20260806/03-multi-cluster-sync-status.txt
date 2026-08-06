@@ -1,0 +1,21 @@
+=== multi-cluster / container-sync status 2026-08-06T15:47Z ===
+--- contabo single LAB note: 4-node one cluster; multi-cluster needs second endpoint ---
+--- container-server conf sync bits ---
+/etc/swift/container-server.conf:21:rsync_ssh_opts = ssh -i /etc/swift/replication_key -o StrictHostKeyChecking=accept-new
+/etc/swift/container-server.conf:22:rsync_devices_root = /srv/node
+/etc/swift/container-server.conf:58:[container-sync]
+/etc/swift/container-server.conf:62:allowed_sync_hosts = 127.0.0.1,localhost
+/etc/swift/container-server.conf:63:internal_client_url = http://127.0.0.1:8080/v1
+/etc/swift/container-server.conf:64:internal_client_auth_url = http://127.0.0.1:8080/auth/v1.0
+/etc/swift/container-server.conf:65:internal_client_auth_user = test:tester
+/etc/swift/container-server.conf:66:internal_client_auth_key = azure-swift-2026.bench
+NO realms conf
+--- container-sync unit ---
+inactive
+inactive
+root     1965625  0.0  0.0  14412  7628 ?        S    11:48   0:04 /usr/local/bin/swift-container-sync --help
+root     2109074  0.0  0.0  14672  7744 ?        S    13:56   0:02 /usr/local/bin/swift-container-sync --help
+--- recent sync evidence containers ---
+--- honest residual ---
+LAB is single 4-node cluster. Multi-cluster sync soak REQUIRES second cluster endpoint + realms keys.
+Same-cluster object sync path: previously KEEP (puts!=0) evidence l3b-sync-smoke-*

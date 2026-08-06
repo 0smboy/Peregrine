@@ -1,0 +1,29 @@
+=== TLS/PEM status Contabo LAB 2026-08-06T15:47Z ===
+--- haproxy bind / crt on swift1 ---
+25:    # bind * so VIP (keepalived) and node IP both accept traffic once
+26:    # net.ipv4.ip_nonlocal_bind=1 is set by rust_keepalived.
+27:    bind *:8085 ssl crt /etc/haproxy/haproxyCA.pem
+47:    bind *:1080
+55:    bind 0.0.0.0:3030
+64:    bind *:35357 ssl crt /etc/haproxy/haproxyCA.pem
+74:    bind *:5000 ssl crt /etc/haproxy/haproxyCA.pem
+-rw-------. 1 root root 2933 Aug  5 09:51 /etc/haproxy/haproxyCA.pem
+subject=CN=10.0.0.10, O=Contabo-LAB, OU=Peregrine
+issuer=CN=10.0.0.10, O=Contabo-LAB, OU=Peregrine
+notBefore=Aug  5 09:51:47 2026 GMT
+notAfter=Nov  7 09:51:47 2028 GMT
+--- local curl :8085 HTTPS (lab self-signed) ---
+HTTP/2 200 
+content-type: text/plain
+x-trans-id: tx402856c026535b3c001ed-006a74ac88
+x-openstack-request-id: tx402856c026535b3c001ed-006a74ac88
+content-length: 2
+
+---
+HTTP/2 200 
+content-type: application/json; charset=utf-8
+content-length: 1354
+x-trans-id: tx50f8dbe84a9bd71000262-006a74ac88
+x-openstack-request-id: tx50f8dbe84a9bd71000262-006a74ac88
+
+--- operator PEM search (expect empty / lab-only) ---
