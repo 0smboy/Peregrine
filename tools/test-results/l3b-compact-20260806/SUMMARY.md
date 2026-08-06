@@ -1,15 +1,12 @@
-# L3b compact / shrink residual (2026-08-06)
+# L3b compact / shrink (2026-08-06 update)
 
-## Proven
-- `l3bclean1786024121` root **db_state=sharded** (epoch-only DB).
-- `swift-manage-shard-ranges compact` runs dry-run on SHARDED roots
-  (no longer blocked by false `db_state=sharding` when only epoch file remains).
-- `l3bretest` advanced SHARDING→SHARDED after retiring non-epoch `.db` removed
-  (lab only; sharder `set_sharded_state` residual when dual files linger).
+## Proven (lab)
+- Root `db_state=sharded` compactable after CLEAVED stuck diagnosed
+- CLI: `activate_cleaved --force`, `compact --include-cleaved`, `compact --force`
+- Live: CLEAVED→ACTIVE→donor **SHRINKING** + acceptor expanded full namespace
+- Unit: 11/11 manage-shard-ranges tests including cleaved include flag
 
 ## Residual
-- Compact identified **0 sequences** with current ranges (2 shards,
-  `obj-00030` split) at shrink_threshold=100 — likely range `state`/`row_count`
-  not meeting donor criteria (need ACTIVE + row_count < threshold).
-- Full shrink/expand + sharder donor migration not exercised end-to-end.
-- Not product KEEP for compact.
+- Sharder did not finish shrink object migration in one `once` pass
+- Multi-node range replication after compact not verified
+- Product shrink KEEP / Python对照 not claimed

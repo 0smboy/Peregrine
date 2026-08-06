@@ -1,0 +1,13 @@
+=== compact path lab KEEP (mark donors SHRINKING) 2026-08-06 ===
+Root: AUTH_test/l3bclean1786024121 db_state=sharded
+Prior: 2× CLEAVED ranges (compact saw 0 sequences)
+
+1) analyze: compactible=0; compactible_if_include_cleaved=1
+2) activate_cleaved --force → 2× ACTIVE
+3) compact --force --shrink-threshold 100000:
+   donor …-0 SHRINKING (30 rows)
+   acceptor …-1 ACTIVE expanded lower="" upper=""
+4) sharder once: exit=0; ranges still SHRINKING/ACTIVE (object migration residual)
+
+RESULT=LAB KEEP for CLEAVED→ACTIVE→compact SHRINKING mark
+NOT claimed: sharder shrink object move / SHRUNK final state

@@ -60,7 +60,7 @@
 | authtoken (HTTP token validate) | ✅ | ✅ | Live Contabo Keystone |
 | keystoneauth coexist with TempAuth | ✅ | ✅ | Stamp-only-when-confirmed fix |
 | s3api / s3token | ✅ | ✅ | See S3 section; not full AWS |
-| container-sync middleware + daemon | ✅ | ✅ | HTTPS + ssl_ca_file / insecure_skip_verify knobs; multi-cluster live soak not claimed |
+| container-sync middleware + daemon | ✅ | ✅ | Same-cluster object path Contabo **KEEP** (`sync-smoke-20260806d`); TempAuth GET + legacy sync-key authorize + hop-by-hop PUT header strip; multi-cluster realm soak not claimed |
 | encrypter / decrypter / keymaster / encryption | ✅ | ✅ | Multi-root + listing decrypt + multipart/range GET decrypt + conditional etag mask; KMIP residual |
 | xprofile / other niche Paste filters | ✅ | ❌ | |
 
@@ -116,7 +116,7 @@
 | db-replicator | ✅ | ✅ | |
 | swift-recon (md5/async/quarantine/tombstone/dbspace) | ✅ | ✅ | Contabo textfile+Prom |
 | ring-builder | ✅ | ✅ | .builder pickle not bit-identical tool format |
-| manage-shard-ranges (main CLI) | ✅ | ✅ | find/show/info/enable/delete/merge/find_and_replace + **analyze/compact/repair** (dry-run/force); interactive residual |
+| manage-shard-ranges (main CLI) | ✅ | ✅ | find/show/info/enable/delete/merge/find_and_replace + **analyze/compact/repair/activate_cleaved** (`--include-cleaved`); shrink object migration by sharder residual |
 | dispersion / drive-audit / relinker | ✅ | ✅ | |
 
 ---
@@ -159,7 +159,7 @@
 | EC | Data path + heal | macOS/default build; some EC throttling niceties |
 | Sharding L3b | CLI + daemon ring-part cleave + fan-out + ×4 Contabo | **lab clean listing KEEP** `l3b-clean-e2e-20260806` (listed 60, no relocate); **product KEEP vs Python对照 未宣称** |
 | Crypto at-rest middleware | multi-root + listing + range GET + etag mask + **chunked PUT encrypt** | KMIP; ciphertext still buffered (footer residual) |
-| container-sync | filter + daemon + HTTPS + CA knobs | multi-cluster live soak |
+| container-sync | filter + daemon + HTTPS + CA knobs + Contabo same-cluster object KEEP | multi-cluster realm live soak |
 | Production go-live | ops TLS script ready | **未实现** (Contabo still lab self-signed; operator PEM not applied) |
 
 **Bottom line under the user rule (“部分 = 未实现”):**  
@@ -184,9 +184,9 @@ Rust is a **strong core-path + lab-proven** Swift, **not** a drop-in “full Ope
 | Linux redeploy L3b bins ×4 | **PASS** (`linux-redeploy-20260806`) |
 | L3b CLI enable + epoch DB | **PASS** after set_sharding_state fix |
 | L3b sharder cleave creates shard DBs | **PASS lab** (`l3bkeep…`, shard DBs present) |
-| L3b listing KEEP post-cleave | **LAB CLEAN PASS** listed 60 no relocate (`l3b-clean-e2e-20260806`); post-shard 4KB PUT→list via shard update route (`l3b-4kb-keep-20260806`); product 4KB KEEP **not claimed** |
-| container-sync binary on Contabo | **deployed** (multi-cluster soak not run) |
-| container-sync Contabo | **not deployed** (binary absent) |
+| L3b listing KEEP post-cleave | **LAB CLEAN PASS** listed 60 no relocate (`l3b-clean-e2e-20260806`); post-shard 4KB PUT→list via shard update route (`l3b-4kb-keep-20260806`); wave2 30×4KB put_fail=0 list+GET (`l3b-4kb-wave2-20260806`); product long soak **not claimed** |
+| container-sync Contabo same-cluster | **KEEP** puts=28 fails=0 dst 5/5 GET (`sync-smoke-20260806d`); multi-cluster soak not run |
+| compact / activate_cleaved | CLI + unit; lab CLEAVED→ACTIVE→SHRINKING mark (`l3b-compact-20260806`); sharder object shrink residual |
 | TLS Contabo dry-run | **LAB self-signed** (`tls-dry-run-20260806`) |
 | Operator TLS PEM live apply | **deferred** |
 

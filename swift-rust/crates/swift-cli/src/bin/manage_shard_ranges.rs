@@ -18,12 +18,15 @@
 //!
 //! **Implemented:** `find`, `show`, `info`, `enable`, `delete`, `merge`,
 //! `find_and_replace` (force/no-prompt), `analyze` (read-only report),
-//! `compact` (identify + optional `--force` apply compactible sequences),
+//! `compact` (identify + optional `--force` apply; `--include-cleaved` for
+//! lab when shards stuck in CLEAVED instead of ACTIVE),
+//! `activate_cleaved` (CLEAVED→ACTIVE so compact/sharder can proceed),
 //! `repair` (gaps/overlaps report + optional `--force` apply).
 //!
 //! **Still deferred:** interactive prompts (use `--force` / `--yes`), full
 //! Python path-ranking repair (parent/child age filters, multi-path rank),
-//! shrink/expand driven by the sharder daemon after compact marks donors.
+//! full shrink/expand object migration by the sharder after compact marks
+//! donors (lab marks SHRINKING; daemon residual).
 //!
 //! Multi-node KEEP claim still blocked by live Contabo quorum drill + ring-
 //! directed HTTP create on all primaries (see sharder residuals).
@@ -56,8 +59,9 @@ fn usage() -> ! {
            find_and_replace [shard_size] [--enable] [--force]\n\
                                                Find, soft-delete old, inject new\n\
            analyze                             Read-only shard state report\n\
-           compact [--force] [--shrink-threshold N] [--expansion-limit N]\n\
-                                               Find (and optionally apply) compactible sequences\n\
+           compact [--force] [--include-cleaved] [--shrink-threshold N]\n\
+                   [--expansion-limit N]       Find (and optionally apply) compactible sequences\n\
+           activate_cleaved [--force]          CLEAVED → ACTIVE (lab / stuck sharder)\n\
            repair [--gaps] [--force]           Report/fix gaps or overlaps\n\
          \n\
          Multi-node KEEP / live quorum: not claimed here; local DB ops only."
@@ -595,11 +599,19 @@ fn cmd_analyze(broker: &mut ContainerBroker) -> i32 {
     }
 
     // Compactible preview (defaults matching common Python conf)
-    let sequences = find_compactible_sequences(&ranges, 100_000, 500_000, 1, -1);
+    let sequences = find_compactible_sequences(&ranges, 100_000, 500_000, 1, -1, false);
+    let sequences_cleaved =
+        find_compactible_sequences(&ranges, 100_000, 500_000, 1, -1, true);
     println!(
         "analyze: compactible_sequences (shrink_threshold=100000 expansion_limit=500000) = {}",
         sequences.len()
     );
+    if sequences.is_empty() && !sequences_cleaved.is_empty() {
+        println!(
+            "analyze: compactible_if_include_cleaved = {} (use compact --include-cleaved)",
+            sequences_cleaved.len()
+        );
+    }
     for (i, seq) in sequences.iter().enumerate() {
         let donors = &seq[..seq.len() - 1];
         let acceptor = &seq[seq.len() - 1];
@@ -618,18 +630,28 @@ fn cmd_analyze(broker: &mut ContainerBroker) -> i32 {
 /// Neighbour sequences that can be compacted: donors + final acceptor.
 /// Port of `find_compactible_shard_sequences` (simplified: no include_shrinking
 /// already-in-progress filter beyond state checks).
+///
+/// `include_cleaved`: lab/operator override when the sharder left ranges in
+/// CLEAVED (Python compact only walks ACTIVE). CLEAVED donors/acceptors are
+/// treated like ACTIVE for candidate selection.
 fn find_compactible_sequences(
     shard_ranges: &[ShardRange],
     shrink_threshold: i64,
     expansion_limit: i64,
     max_shrinking: i64,
     max_expanding: i64,
+    include_cleaved: bool,
 ) -> Vec<Vec<ShardRange>> {
     let mut ranges = shard_ranges.to_vec();
     sort_by_lower(&mut ranges);
 
+    let eligible_state = |st: i64| -> bool {
+        matches!(st, shard_state::ACTIVE | shard_state::SHRINKING)
+            || (include_cleaved && st == shard_state::CLEAVED)
+    };
+
     let is_shrinking_candidate = |sr: &ShardRange| {
-        matches!(sr.state, shard_state::ACTIVE | shard_state::SHRINKING)
+        eligible_state(sr.state)
             && sr.row_count() < shrink_threshold
             && sr.row_count() <= expansion_limit
     };
@@ -663,10 +685,7 @@ fn find_compactible_sequences(
             {
                 break;
             }
-            if !matches!(
-                shard_range.state,
-                shard_state::ACTIVE | shard_state::SHRINKING
-            ) {
+            if !eligible_state(shard_range.state) {
                 break;
             }
             if shard_range.state == shard_state::SHRINKING {
@@ -688,7 +707,10 @@ fn find_compactible_sequences(
             continue;
         }
         let last_state = sequence[sequence.len() - 1].state;
-        if last_state != shard_state::ACTIVE && last_state != shard_state::SHARDED {
+        let last_ok = last_state == shard_state::ACTIVE
+            || last_state == shard_state::SHARDED
+            || (include_cleaved && last_state == shard_state::CLEAVED);
+        if !last_ok {
             continue;
         }
         // already-in-progress sequences (include_shrinking=false): skip
@@ -708,6 +730,7 @@ fn cmd_compact(
     expansion_limit: i64,
     max_shrinking: i64,
     max_expanding: i64,
+    include_cleaved: bool,
 ) -> i32 {
     match broker.is_root_container() {
         Ok(true) => {}
@@ -764,9 +787,24 @@ fn cmd_compact(
         expansion_limit,
         max_shrinking,
         max_expanding,
+        include_cleaved,
     );
     if compactible.is_empty() {
         println!("No shards identified for compaction.");
+        if !include_cleaved
+            && ranges
+                .iter()
+                .any(|r| r.state == shard_state::CLEAVED)
+        {
+            println!(
+                "Hint: {} range(s) are CLEAVED (not ACTIVE). Re-run with \
+                 --include-cleaved, or `activate_cleaved --force` first.",
+                ranges
+                    .iter()
+                    .filter(|r| r.state == shard_state::CLEAVED)
+                    .count()
+            );
+        }
         return EXIT_OK;
     }
 
@@ -835,6 +873,70 @@ fn cmd_compact(
             );
             println!("Run container-replicator to replicate the changes to other nodes.");
             println!("Run container-sharder on all nodes to compact shards.");
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            EXIT_ERROR
+        }
+    }
+}
+
+/// Promote CLEAVED shard ranges to ACTIVE so Python-style compact (ACTIVE-only)
+/// and the sharder can proceed. Lab uses this when cleave finished but ranges
+/// never left CLEAVED.
+fn cmd_activate_cleaved(broker: &mut ContainerBroker, force: bool) -> i32 {
+    let ranges = match broker.get_shard_ranges(&GetShardRangesArgs {
+        include_own: false,
+        include_deleted: false,
+        ..GetShardRangesArgs::default()
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return EXIT_ERROR;
+        }
+    };
+    let cleaved: Vec<&ShardRange> = ranges
+        .iter()
+        .filter(|r| r.state == shard_state::CLEAVED)
+        .collect();
+    if cleaved.is_empty() {
+        println!("No CLEAVED shard ranges to activate.");
+        return EXIT_OK;
+    }
+    println!(
+        "Found {} CLEAVED range(s) to promote to ACTIVE:",
+        cleaved.len()
+    );
+    for r in &cleaved {
+        println!(
+            "  {} ({:?}, {:?}] rows={}",
+            r.name,
+            r.lower,
+            r.upper,
+            r.row_count()
+        );
+    }
+    if !force {
+        println!("Dry-run only. Re-run with --force to apply CLEAVED → ACTIVE.");
+        return EXIT_OK;
+    }
+    let ts = Timestamp::now().internal();
+    let mut to_merge = Vec::new();
+    for r in cleaved {
+        let mut sr = r.clone();
+        if sr.update_state(shard_state::ACTIVE, Some(&ts)) {
+            to_merge.push(sr);
+        }
+    }
+    if to_merge.is_empty() {
+        println!("No ranges changed (update_state rejected).");
+        return EXIT_OK;
+    }
+    match broker.merge_shard_ranges(to_merge) {
+        Ok(()) => {
+            println!("Promoted CLEAVED ranges to ACTIVE.");
             EXIT_OK
         }
         Err(e) => {
@@ -1151,6 +1253,7 @@ fn main() {
         "analyze" => cmd_analyze(&mut broker),
         "compact" => {
             let force = args.iter().any(|a| a == "--force" || a == "-f" || a == "--yes" || a == "-y");
+            let include_cleaved = args.iter().any(|a| a == "--include-cleaved");
             let shrink_threshold = parse_flag_i64(&args, "--shrink-threshold", 100_000);
             let expansion_limit = parse_flag_i64(&args, "--expansion-limit", 500_000);
             let max_shrinking = parse_flag_i64(&args, "--max-shrinking", 1);
@@ -1162,7 +1265,12 @@ fn main() {
                 expansion_limit,
                 max_shrinking,
                 max_expanding,
+                include_cleaved,
             )
+        }
+        "activate_cleaved" | "activate-cleaved" => {
+            let force = args.iter().any(|a| a == "--force" || a == "-f" || a == "--yes" || a == "-y");
+            cmd_activate_cleaved(&mut broker, force)
         }
         "repair" => {
             let force = args.iter().any(|a| a == "--force" || a == "-f" || a == "--yes" || a == "-y");
@@ -1338,10 +1446,24 @@ mod tests {
         let mut b = ShardRange::new("a/c-1", "1", "m", "");
         b.state = shard_state::ACTIVE;
         b.object_count = 50;
-        let seqs = find_compactible_sequences(&[a, b], 20, 100, 1, -1);
+        let seqs = find_compactible_sequences(&[a, b], 20, 100, 1, -1, false);
         assert_eq!(seqs.len(), 1);
         assert_eq!(seqs[0].len(), 2);
         assert_eq!(seqs[0][1].name, "a/c-1");
+    }
+
+    #[test]
+    fn find_compactible_requires_include_cleaved_for_cleaved_ranges() {
+        let mut a = ShardRange::new("a/c-0", "1", "", "m");
+        a.state = shard_state::CLEAVED;
+        a.object_count = 10;
+        let mut b = ShardRange::new("a/c-1", "1", "m", "");
+        b.state = shard_state::CLEAVED;
+        b.object_count = 50;
+        assert!(find_compactible_sequences(&[a.clone(), b.clone()], 20, 100, 1, -1, false).is_empty());
+        let seqs = find_compactible_sequences(&[a, b], 20, 100, 1, -1, true);
+        assert_eq!(seqs.len(), 1);
+        assert_eq!(seqs[0][0].name, "a/c-0");
     }
 
     fn force_sharded(b: &mut ContainerBroker) {
@@ -1365,13 +1487,13 @@ mod tests {
         b.merge_shard_ranges(vec![donor, acc]).unwrap();
         force_sharded(&mut b);
         // dry-run
-        assert_eq!(cmd_compact(&mut b, false, 20, 100, 1, -1), EXIT_OK);
+        assert_eq!(cmd_compact(&mut b, false, 20, 100, 1, -1, false), EXIT_OK);
         let before = b
             .get_shard_ranges(&GetShardRangesArgs::default())
             .unwrap();
         assert!(before.iter().all(|r| r.state == shard_state::ACTIVE));
         // apply
-        assert_eq!(cmd_compact(&mut b, true, 20, 100, 1, -1), EXIT_OK);
+        assert_eq!(cmd_compact(&mut b, true, 20, 100, 1, -1, false), EXIT_OK);
         let after = b
             .get_shard_ranges(&GetShardRangesArgs {
                 include_deleted: false,

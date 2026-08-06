@@ -1,0 +1,10 @@
+=== 4KB wave2 on sharded l3bclean1786024121 (2026-08-06) ===
+pre HEAD object_count=80 bytes=82331
+put_ok=30 put_fail=0
+listed_new k4b-wave2=30
+GET 01 code=200 size=4096
+GET 15 code=200 size=4096
+GET 30 code=200 size=4096
+post HEAD object_count=80 (root stat lag; listing fan-out shows new keys)
+sync dst still count=5
+RESULT=LAB KEEP put/list/GET for 30×4KB post-shard
