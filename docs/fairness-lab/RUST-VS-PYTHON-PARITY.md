@@ -80,8 +80,8 @@
 | ListParts | ✅ | ✅ | part-number-marker + max-parts + IsTruncated (2026-08-06) |
 | Canned ACL + multi-rule CORS + object ?acl store | ✅ | ✅ | Object x-amz-acl → sysmeta + GET ?acl; IAM residual |
 | s3token → Keystone /v3/s3tokens | ✅ | ✅ | live EC2 GREEN 2026-08-06 |
-| SigV2 | ✅ | ❌ | WONTFIX |
-| aws-chunked | ✅ | ❌ | WONTFIX |
+| SigV2 | ✅ | ❌ | **WONTFIX** — stable **501 NotImplemented** (unit) |
+| aws-chunked | ✅ | ❌ | **WONTFIX** — stable **501** (unit) |
 | Versioning / tagging / lifecycle / object-lock | ✅ | ❌ | WONTFIX / 501 |
 | Full IAM-style ACL / ACP XML body | ✅ | ❌ | canned + object sysmeta store only |
 
@@ -158,7 +158,7 @@
 | S3 | SigV4 + MPU + ListParts + canned ACL + multi-rule CORS | SigV2, versioning, full IAM/object ACL, aws-chunked |
 | EC | Data path + heal | macOS/default build; some EC throttling niceties |
 | Sharding L3b | CLI + daemon ring HTTP create path + ×4 Contabo active | **multi-node KEEP product claim 未实现** (status≠KEEP) |
-| Crypto at-rest middleware | multi-root + listing + range/multipart GET decrypt + etag mask | KMIP, PUT materialize residual |
+| Crypto at-rest middleware | multi-root + listing + range GET + etag mask + **chunked PUT encrypt** | KMIP; ciphertext still buffered (footer residual) |
 | container-sync | filter + daemon + HTTPS + CA knobs | multi-cluster live soak |
 | Production go-live | ops TLS script ready | **未实现** (Contabo still lab self-signed; operator PEM not applied) |
 
@@ -181,6 +181,9 @@ Rust is a **strong core-path + lab-proven** Swift, **not** a drop-in “full Ope
 | L3b multi-node KEEP | **not claimed** |
 | Operator TLS PEM path (script) | **code GREEN**; Contabo **self-signed LAB** (probe 2026-08-06) |
 | container-sharder ×4 Contabo | **active** (status probe; KEEP not claimed) |
+| L3b drill 100-obj container | **PARTIAL** — API OK, DB on 3 nodes; CLI redeploy blocked enable (`l3b-keep-drill-20260806`) |
+| container-sync Contabo | **not deployed** (binary absent) |
+| TLS Contabo dry-run | **LAB self-signed** (`tls-dry-run-20260806`) |
 | Operator TLS PEM live apply | **deferred** |
 
 See `tools/test-results/PARALLEL-RUN-20260806/` and `PARALLEL-123-20260806/`.

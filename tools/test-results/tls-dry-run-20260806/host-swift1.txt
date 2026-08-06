@@ -1,0 +1,19 @@
+HOST=swift1
+DATE_UTC=2026-08-06T11:07:21Z
+--- PEM_PATH ---
+-rw-------. 1 root root 2933 Aug  5 09:51 /etc/haproxy/haproxyCA.pem
+PEM_PRESENT=yes
+--- OPENSSL ---
+subject=CN=10.0.0.10, O=Contabo-LAB, OU=Peregrine
+issuer=CN=10.0.0.10, O=Contabo-LAB, OU=Peregrine
+dates=notBefore=Aug  5 09:51:47 2026 GMT notAfter=Nov  7 09:51:47 2028 GMT 
+kind=self-signed
+lab_marker=yes
+--- HAPROXY_BIND_SSL ---
+27:    bind *:8085 ssl crt /etc/haproxy/haproxyCA.pem
+64:    bind *:35357 ssl crt /etc/haproxy/haproxyCA.pem
+74:    bind *:5000 ssl crt /etc/haproxy/haproxyCA.pem
+--- HAPROXY_UNIT ---
+active
+--- TLS_ROTATION ---
+TLS-GENERATED 2026-08-05T09:51:47Z CN=10.0.0.10 days=825 self-signed LAB

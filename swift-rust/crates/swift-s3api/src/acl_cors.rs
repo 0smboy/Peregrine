@@ -37,6 +37,9 @@
 //!   enforcement of object ACP on subsequent ops — we store a canned name only.
 //! * Object public-read does **not** grant anonymous Swift GET by itself
 //!   (container ACL still gates access); meta is for S3 GET `?acl` fidelity.
+//!   See [`object_canned_allows_anonymous_read`] for the *intended* S3 semantic
+//!   (pure helper; not wired into unauthenticated request paths — account
+//!   mapping without SigV4 is unsafe in multi-tenant proxy).
 //! * CORS `ExposeHeader` / `ID` fields not persisted in the compact encoding.
 
 use crate::xml::Element;
@@ -219,6 +222,22 @@ pub fn object_acl_xml_from_meta(owner_id: &str, canned: Option<&str>) -> Vec<u8>
         "public-read-write" => public_read_write_acl_xml(owner_id),
         _ => private_acl_xml(owner_id),
     }
+}
+
+/// Whether a stored object canned ACL *would* grant AllUsers READ under S3
+/// semantics (`public-read` / `public-read-write`).
+///
+/// Pure helper for tests and future S3Acl-style enforcement. **Not** used to
+/// authorize anonymous GETs today: without SigV4 we cannot safely map
+/// path-style `/bucket/key` to a Swift account in multi-tenant deployments,
+/// and stamping container `.r:*` from an object ACL would open the whole
+/// bucket. Operators who need anonymous object reads should set bucket
+/// `public-read` (container `X-Container-Read=.r:*,.rlistings`).
+pub fn object_canned_allows_anonymous_read(canned: Option<&str>) -> bool {
+    matches!(
+        normalize_object_canned_acl(canned.unwrap_or("private")),
+        "public-read" | "public-read-write"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +666,12 @@ mod tests {
         let priv_xml = String::from_utf8(object_acl_xml_from_meta("owner", None)).unwrap();
         assert!(priv_xml.contains("FULL_CONTROL"));
         assert!(!priv_xml.contains(ALL_USERS));
+
+        assert!(object_canned_allows_anonymous_read(Some("public-read")));
+        assert!(object_canned_allows_anonymous_read(Some("public-read-write")));
+        assert!(!object_canned_allows_anonymous_read(Some("private")));
+        assert!(!object_canned_allows_anonymous_read(None));
+        assert!(!object_canned_allows_anonymous_read(Some("authenticated-read")));
     }
 
     #[test]

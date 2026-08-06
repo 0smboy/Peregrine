@@ -90,8 +90,9 @@ pub use decrypter::{
 };
 pub use domain_remap::DomainRemap;
 pub use encrypter::{
-    encrypt_object_body, random_iv, random_key, EncryptedObject, Encrypter, BODY_META_HEADER,
-    ETAG_HEADER, ETAG_MAC_HEADER, OVERRIDE_ETAG_HEADER,
+    encrypt_object_body, encrypt_object_body_from_body, encrypt_object_body_from_reader, random_iv,
+    random_key, EncryptBodyError, EncryptedObject, Encrypter, BODY_META_HEADER, ETAG_HEADER,
+    ETAG_MAC_HEADER, OVERRIDE_ETAG_HEADER,
 };
 pub use etag_quoter::EtagQuoter;
 pub use keymaster::{CryptoKeys, KeyMaster, KeyMasterMw};

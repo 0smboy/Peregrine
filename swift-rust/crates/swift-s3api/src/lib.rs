@@ -23,14 +23,27 @@
 //! `pipeline = … s3api tempauth …` (or s3token + keystoneauth). Does **not**
 //! register on Swift `GET /info`.
 //!
-//! # Residuals
+//! # Residuals / stable rejections
 //!
-//! SigV2, aws-chunked streaming, full IAM / grant-header object ACL
-//! (canned private/public-read object ACL via sysmeta is claimable),
-//! authenticated-read / log-delivery-write canned ACLs (Python NotImplemented),
-//! CORS ExposeHeader edge cases in live preflight, versioning / tagging /
-//! lifecycle / object-lock (production stop-line: written WONTFIX unless
-//! reopened), clock-skew/expiry enforcement on every path.
+//! These return a **stable** S3 `501 NotImplemented` XML body (unit-tested)
+//! rather than falling through to non-S3 filters:
+//!
+//! * **SigV2** auth (`Authorization: AWS …` / `AWSAccessKeyId`) — WONTFIX
+//! * **aws-chunked** streaming (`STREAMING-*` / `Content-Encoding: aws-chunked`)
+//!   — WONTFIX
+//! * **versioning / tagging / lifecycle** (+ related subresources) — WONTFIX
+//!   production stop-line unless reopened
+//!
+//! Other residuals (not claimable as implemented):
+//!
+//! * full IAM / grant-header object ACL (canned private/public-read object ACL
+//!   via sysmeta **is** claimable for PUT/GET `?acl`; object public-read does
+//!   **not** by itself authorize anonymous Swift GET — container ACL still
+//!   gates access)
+//! * authenticated-read / log-delivery-write canned ACLs (Python NotImplemented)
+//! * CORS ExposeHeader edge cases in live preflight
+//! * clock-skew/expiry enforcement on every path
+//!
 //! Unknown access keys (EC2 / Keystone) are deferred via an optional
 //! [`swift_middleware::S3TokenClient`] on [`middleware::S3Api`] (inline
 //! `/v3/s3tokens` exchange with a real base64 string-to-sign). The

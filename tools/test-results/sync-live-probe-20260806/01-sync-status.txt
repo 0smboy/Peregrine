@@ -1,0 +1,20 @@
+host=swift1
+no container-sync binary
+/etc/swift/container-server.conf:21:rsync_ssh_opts = ssh -i /etc/swift/replication_key -o StrictHostKeyChecking=accept-new
+/etc/swift/container-server.conf:22:rsync_devices_root = /srv/node
+/etc/swift/container-server.conf.bak-l3b-20260806:21:rsync_ssh_opts = ssh -i /etc/swift/replication_key -o StrictHostKeyChecking=accept-new
+/etc/swift/container-server.conf.bak-l3b-20260806:22:rsync_devices_root = /srv/node
+/etc/swift/container-server.conf.wave0-bak:21:rsync_ssh_opts = ssh -i /etc/swift/replication_key -o StrictHostKeyChecking=accept-new
+/etc/swift/container-server.conf.wave0-bak:22:rsync_devices_root = /srv/node
+--- 10.0.0.1 ---
+swift1
+inactive
+--- 10.0.0.2 ---
+swift2
+inactive
+--- 10.0.0.3 ---
+swift3
+inactive
+--- 10.0.0.4 ---
+swift4
+inactive

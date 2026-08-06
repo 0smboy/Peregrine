@@ -1,0 +1,17 @@
+host=swift1
+Thu Aug  6 11:02:24 AM UTC 2026
+conf=/etc/swift/proxy-server.conf
+# Managed by P0 pipeline foundation deploy (2026-08-04)
+# P0 thin+cache pipeline (2026-08-04)
+[pipeline:main]
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+bind_port = 8080
+user_test_tester = azure-swift-2026.bench .admin
+active
+inactive
+vip_info=200
+local_info=200
+30b8717cd7d63c699d6346d5e5b2ea3d448e57edb7dad47be349b3999581c576  /usr/local/bin/swift-container-sharder
+-rwxr-xr-x. 1 root root 3123608 Aug  4 15:37 /usr/local/bin/swift-container-sharder
+-rwxr-xr-x. 1 root root 2751320 Aug  4 05:35 /usr/local/bin/swift-manage-shard-ranges
+/etc/swift/container.ring.gz

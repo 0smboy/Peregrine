@@ -48,7 +48,7 @@ Canonical long form in-repo:
 | keystoneauth + authtoken (lab Keystone) | yes | yes |
 | s3api + s3token (core path) + ListParts | yes | yes |
 | container-sync filter + daemon (HTTP/HTTPS + CA knobs) | yes | yes (unit; multi-cluster live not claimed) |
-| encrypter / decrypter / keymaster (multi-root, listing, range GET, etag mask) | yes | yes (on-by-config; KMIP residual) |
+| encrypter / decrypter / keymaster (multi-root, listing, range GET, etag mask, chunked PUT encrypt) | yes | yes (on-by-config; KMIP residual) |
 | Full arbitrary / unknown Paste filter names | yes | **no** |
 
 ## S3
@@ -58,7 +58,7 @@ Canonical long form in-repo:
 | SigV4 CRUD, List v1/v2, MultiDelete, MPU path, ListMPU, ListParts | yes | yes (lab) |
 | s3token / EC2 → Keystone | yes | yes (lab) |
 | Canned ACL + multi-rule CORS + object ?acl | yes | yes |
-| SigV2, aws-chunked, versioning/tagging/lifecycle | yes | **no** (wontfix) |
+| SigV2, aws-chunked, versioning/tagging/lifecycle | yes | **no** (wontfix; stable 501) |
 | Full IAM / object ACL XML | yes | **no** |
 
 ## EC & consistency

@@ -28,6 +28,12 @@
 #   ./tools/ops/apply-vip-tls-pem.sh --pem /secure/vip.pem \
 #       --ssh swift1 --print-commands --dry-run
 #
+#   # Contabo four-node (explicit host list only — no auto-discovery)
+#   ./tools/ops/apply-vip-tls-pem.sh --pem /secure/vip.pem \
+#       --ssh swift1,swift2,swift3,swift4 --reload --dry-run --print-commands
+#   # same with public IPs from tools/CONTABO-CLUSTER.md:
+#   #   --ssh 169.58.108.85,169.58.108.86,169.58.108.87,169.58.108.121
+#
 # Env:
 #   SWIFT_TLS_PEM       Default source PEM if --pem omitted
 #   HAPROXY_TLS_PEM     Default dest path (default /etc/haproxy/haproxyCA.pem)
@@ -57,6 +63,12 @@ warn() { printf '\033[1;33mWARN\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mERROR\033[0m %s\n' "$*" >&2; exit 1; }
 note() { printf '  %s\n' "$*"; }
 
+# mktemp templates must end in XXXXXX (macOS / BSD).
+mktemp_path() {
+  local prefix="${1:-tls-tmp}"
+  mktemp "${TMPDIR:-/tmp}/${prefix}.XXXXXX"
+}
+
 usage() {
   cat <<'EOF'
 Usage: apply-vip-tls-pem.sh [options]
@@ -68,12 +80,14 @@ Options:
   --dest PATH          Dest on target (default: /etc/haproxy/haproxyCA.pem
                        or env HAPROXY_TLS_PEM)
   --local              Install on this host
-  --ssh HOST[,HOST…]   Install via SSH to listed hosts (explicit only)
+  --ssh HOST[,HOST…]   Install via SSH to listed hosts (explicit only;
+                       Contabo: swift1,swift2,swift3,swift4 or public IPs
+                       from tools/CONTABO-CLUSTER.md — never auto-discovered)
   --reload             Reload/restart haproxy after install
   --check              Validate PEM only; no install
-  --dry-run            Print actions; do not write or restart
-  --print-commands     Print exact install/systemctl commands (implies no auto
-                       Contabo discovery; useful for remote runbooks)
+  --dry-run            Print actions; do not write, scp, or restart
+  --print-commands     Print exact install/systemctl commands (no mutation;
+                       combine with --ssh + --dry-run for Contabo runbooks)
   --no-backup          Skip timestamped backup of existing dest PEM
   --no-rotation-log    Skip /etc/haproxy/TLS-ROTATION.txt stamp
   -h, --help           This help
@@ -88,11 +102,17 @@ Examples:
   sudo SWIFT_TLS_PEM=./vip.fullchain.pem ./tools/ops/apply-vip-tls-pem.sh --local --reload
   ./tools/ops/apply-vip-tls-pem.sh --pem ./vip.fullchain.pem --ssh swift1,swift2 --reload
   ./tools/ops/apply-vip-tls-pem.sh --pem ./vip.fullchain.pem --ssh swift1 --print-commands
+  ./tools/ops/apply-vip-tls-pem.sh --pem /secure/vip.pem \
+      --ssh swift1,swift2,swift3,swift4 --reload --dry-run --print-commands
+  ./tools/ops/apply-vip-tls-pem.sh --pem /secure/vip.pem \
+      --ssh 169.58.108.85,169.58.108.86,169.58.108.87,169.58.108.121 \
+      --reload --dry-run --print-commands
 
 Safety:
   - No secrets are written into the repo.
   - Contabo is never touched unless you pass --ssh <hosts>.
-  - Prefer --check + --dry-run before live apply.
+  - Prefer --check + --dry-run + --print-commands before live apply.
+  - --dry-run never scp/ssh-mutates; --print-commands is documentation only.
 EOF
 }
 
@@ -146,10 +166,11 @@ validate_pem() {
 
   if command -v openssl >/dev/null 2>&1; then
     # Extract first cert for parse check
-    local tmp
-    tmp="$(mktemp "${TMPDIR:-/tmp}/tls-pem-cert.XXXXXX")"
+    local tmp ktmp
+    tmp="$(mktemp_path tls-pem-cert)"
+    ktmp="$(mktemp_path tls-pem-key)"
     # shellcheck disable=SC2064
-    trap "rm -f '$tmp'" RETURN
+    trap "rm -f '$tmp' '$ktmp'" RETURN
     awk '
       /BEGIN CERTIFICATE/ {p=1}
       p {print}
@@ -159,8 +180,6 @@ validate_pem() {
       || die "openssl x509 -noout failed (cert unreadable): $pem"
     # Optional: ensure private key parses (may be RSA/EC/PKCS8)
     if grep -q 'BEGIN.*PRIVATE KEY' "$pem"; then
-      local ktmp
-      ktmp="$(mktemp "${TMPDIR:-/tmp}/tls-pem-key.XXXXXX")"
       awk '
         /BEGIN .*PRIVATE KEY/ {p=1}
         p {print}
@@ -171,9 +190,8 @@ validate_pem() {
         && ! openssl ec -in "$ktmp" -check -noout 2>/dev/null; then
         warn "openssl could not fully verify private key format (continuing if PEM markers present)"
       fi
-      rm -f "$ktmp"
     fi
-    rm -f "$tmp"
+    rm -f "$tmp" "$ktmp"
     trap - RETURN
     ok "openssl x509 parse OK"
   else
@@ -188,15 +206,23 @@ print_cert_summary() {
   if ! command -v openssl >/dev/null 2>&1; then
     return 0
   fi
-  local tmp
-  tmp="$(mktemp "${TMPDIR:-/tmp}/tls-pem-cert.XXXXXX")"
+  local tmp subj iss
+  tmp="$(mktemp_path tls-pem-cert)"
   awk '
     /BEGIN CERTIFICATE/ {p=1}
     p {print}
     /END CERTIFICATE/ {exit}
   ' "$pem" >"$tmp"
-  note "subject: $(openssl x509 -in "$tmp" -noout -subject 2>/dev/null | sed 's/^subject=//')"
+  subj="$(openssl x509 -in "$tmp" -noout -subject 2>/dev/null | sed 's/^subject=//')"
+  iss="$(openssl x509 -in "$tmp" -noout -issuer 2>/dev/null | sed 's/^issuer=//')"
+  note "subject: $subj"
+  note "issuer:  $iss"
   note "dates:   $(openssl x509 -in "$tmp" -noout -dates 2>/dev/null | tr '\n' ' ')"
+  if [ -n "$subj" ] && [ "$subj" = "$iss" ]; then
+    note "kind:    self-signed (subject == issuer)"
+  else
+    note "kind:    not self-signed (subject != issuer) or chain leaf"
+  fi
   rm -f "$tmp"
 }
 
@@ -366,22 +392,32 @@ install_local() {
 install_ssh() {
   local pem="$1"
   local dest="$2"
-  local host staged remote_sh
+  local host remote_sh
   [ "${#SSH_HOSTS[@]}" -gt 0 ] || die "--ssh requires at least one host"
 
-  remote_sh="$(mktemp "${TMPDIR:-/tmp}/tls-remote.XXXXXX.sh")"
+  if [ "$DRY_RUN" = 1 ]; then
+    for host in "${SSH_HOSTS[@]}"; do
+      log "host $host (DRY-RUN — no scp/ssh mutation)"
+      note "would: scp $DEFAULT_SSH_OPTS $pem $host:/tmp/haproxyCA.pem.new"
+      note "would: scp $DEFAULT_SSH_OPTS <remote-install.sh> $host:/tmp/apply-vip-tls-pem.remote.sh"
+      note "would: ssh $DEFAULT_SSH_OPTS $host 'bash /tmp/apply-vip-tls-pem.remote.sh /tmp/haproxyCA.pem.new; rm -f /tmp/haproxyCA.pem.new /tmp/apply-vip-tls-pem.remote.sh'"
+      note "remote intent: dest=$dest reload=$DO_RELOAD backup=$BACKUP rotation=$WRITE_ROTATION"
+      if [ "$DO_RELOAD" = 1 ]; then
+        note "remote would: haproxy -c -f /etc/haproxy/haproxy.cfg"
+        note "remote would: systemctl reload haproxy || systemctl restart haproxy"
+      fi
+    done
+    ok "dry-run complete for ${#SSH_HOSTS[@]} host(s) — nothing applied"
+    return 0
+  fi
+
+  remote_sh="$(mktemp_path tls-remote)"
   # shellcheck disable=SC2064
   trap "rm -f '$remote_sh'" RETURN
   remote_install_script "$dest" "$DO_RELOAD" "$BACKUP" "$WRITE_ROTATION" "$DRY_RUN" >"$remote_sh"
 
   for host in "${SSH_HOSTS[@]}"; do
     log "host $host"
-    if [ "$DRY_RUN" = 1 ]; then
-      note "DRY-RUN scp $pem -> $host:/tmp/haproxyCA.pem.new"
-      note "DRY-RUN ssh $host apply script (dest=$dest reload=$DO_RELOAD)"
-      # Still show remote script intent
-      continue
-    fi
     # shellcheck disable=SC2086
     scp $DEFAULT_SSH_OPTS "$pem" "$host:/tmp/haproxyCA.pem.new"
     # shellcheck disable=SC2086
@@ -409,8 +445,9 @@ if [ "$PRINT_COMMANDS" = 1 ]; then
     local_hosts="localhost"
   fi
   print_operator_commands "$PEM_SRC" "$DEST" "$local_hosts"
-  if [ -z "$MODE" ] && [ "$DRY_RUN" = 0 ]; then
-    ok "printed commands only (pass --local or --ssh to apply)"
+  # print-only path: no --local/--ssh → documentation only
+  if [ -z "$MODE" ]; then
+    ok "printed commands only (pass --local or --ssh to apply; --dry-run never mutates)"
     exit 0
   fi
 fi
@@ -433,7 +470,12 @@ case "$MODE" in
     ;;
 esac
 
-ok "done"
+if [ "$DRY_RUN" = 1 ]; then
+  ok "done (dry-run — no PEM installed, no service restart)"
+else
+  ok "done"
+fi
 note "bundle-rust expects haproxy_tls_pem=$DEST and lb_mode=https"
 note "for full deploy-rs apply set haproxy_tls_pem_src on the controller (no secrets in git)"
 note "repo helper docs: $REPO_ROOT/tools/ops/README.md"
+note "Contabo inventory dry-run (read-only): $REPO_ROOT/tools/ops/contabo-tls-dry-run.sh"

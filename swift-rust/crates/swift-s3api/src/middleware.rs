@@ -28,13 +28,26 @@
 //! * MultiDelete (`POST ?delete`), basic ACL/CORS, multipart upload
 //! * Object: Put / Get / Head / Delete; Copy via `x-amz-copy-source`
 //!
-//! # Residuals
+//! # Residuals / stable rejections
 //!
-//! SigV2, aws-chunked, full IAM / grant-header object ACL (canned
-//! private/public-read stored as sysmeta is claimable), versioning/tagging/lifecycle
-//! (written WONTFIX for production stop-line unless reopened), clock-skew
-//! on every path, advertising `s3api` on Swift `GET /info`. Multipart
-//! includes ListMultipartUploads via `{bucket}+segments` upload markers.
+//! The following are **not implemented** and return a stable S3
+//! `501 NotImplemented` (`Code=NotImplemented`) so clients get predictable
+//! XML rather than fall-through 401/403/500 from other filters:
+//!
+//! * **SigV2** (`Authorization: AWS …` / `AWSAccessKeyId` query) — WONTFIX
+//!   unless reopened; only SigV4 is accepted.
+//! * **aws-chunked** streaming (`X-Amz-Content-SHA256` `STREAMING-*` values
+//!   and/or `Content-Encoding: aws-chunked`) — WONTFIX unless reopened.
+//! * **versioning / tagging / lifecycle** (and related subresources in
+//!   [`UNSUPPORTED_SUBRESOURCES`]) — production stop-line WONTFIX unless
+//!   reopened.
+//!
+//! Other residuals: full IAM / grant-header object ACL (canned
+//! private/public-read stored as sysmeta is claimable; object public-read
+//! does not by itself open anonymous Swift GET — container ACL still gates),
+//! clock-skew on every path, advertising `s3api` on Swift `GET /info`.
+//! Multipart includes ListMultipartUploads via `{bucket}+segments` upload
+//! markers.
 //!
 //! Unknown access keys (EC2) are deferred to Keystone via an optional
 //! [`S3TokenClient`] (`with_s3token_client`); without a client, unknown keys
@@ -182,7 +195,12 @@ fn credential_from_s3token(
     }
 }
 
-/// Subresources still rejected with `NotImplemented` (honest residual).
+/// Subresources rejected with stable `501 NotImplemented` (WONTFIX stop-line
+/// for production unless reopened). Clients must see `Code=NotImplemented`,
+/// not a backend 500 or empty body.
+///
+/// Core production-stop items: `lifecycle`, `tagging`, `versioning` (+
+/// `versions`). Remainder are equally unsupported S3 subresources.
 const UNSUPPORTED_SUBRESOURCES: &[&str] = &[
     "lifecycle",
     "tagging",
@@ -208,8 +226,63 @@ const UNSUPPORTED_SUBRESOURCES: &[&str] = &[
     "ownershipControls",
 ];
 
+/// Fixed client-facing messages for stable 501 responses (unit-tested).
+const MSG_SIGV2_NOT_IMPLEMENTED: &str =
+    "The AWS Signature Version 2 authentication method is not implemented.";
+const MSG_AWS_CHUNKED_NOT_IMPLEMENTED: &str =
+    "aws-chunked transfer encoding / streaming payload signing is not implemented.";
+
+/// `X-Amz-Content-SHA256` values that imply aws-chunked streaming (Python
+/// `s3request._is_streaming`). We reject these with 501 rather than attempt
+/// chunk/trailer signature verification.
+const AWS_CHUNKED_PAYLOAD_HASHES: &[&str] = &[
+    "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+    "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD",
+    "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER",
+];
+
+/// True when the request carries SigV2 auth (header `AWS …` or query
+/// `AWSAccessKeyId`). Mirrors Python `get_s3_access_key_id` v2 branch.
+fn is_sigv2_auth(req: &Request) -> bool {
+    if let Some(auth) = req.headers.get("Authorization") {
+        // SigV2: "AWS <accessKey>:<signature>" — not AWS4-HMAC-SHA256.
+        if auth.starts_with("AWS ") && !auth.starts_with("AWS4-") {
+            return true;
+        }
+    }
+    req.params()
+        .iter()
+        .any(|(k, _)| k == "AWSAccessKeyId")
+}
+
+/// True when the request asks for aws-chunked / streaming payload signing.
+fn is_aws_chunked_request(req: &Request) -> bool {
+    if let Some(hash) = req.headers.get("X-Amz-Content-SHA256") {
+        if AWS_CHUNKED_PAYLOAD_HASHES
+            .iter()
+            .any(|v| hash.eq_ignore_ascii_case(v))
+        {
+            return true;
+        }
+    }
+    // Content-Encoding may list multiple encodings; treat any aws-chunked token
+    // as streaming (case-insensitive token match).
+    if let Some(enc) = req.headers.get("Content-Encoding") {
+        for part in enc.split(',') {
+            if part.trim().eq_ignore_ascii_case("aws-chunked") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Detect S3-shaped auth so we intercept SigV2/SigV4 (and reject unsupported
+/// auth schemes with S3 XML) instead of falling through to Swift filters.
 fn is_s3_auth_request(req: &Request) -> bool {
-    parse_sigv4_auth(req).is_some()
+    parse_sigv4_auth(req).is_some() || is_sigv2_auth(req)
 }
 
 fn first_unsupported_subresource(params: &[(String, String)]) -> Option<&str> {
@@ -219,6 +292,26 @@ fn first_unsupported_subresource(params: &[(String, String)]) -> Option<&str> {
         }
     }
     None
+}
+
+fn not_implemented_subresource(sub: &str) -> Response {
+    s3_error_response(
+        "NotImplemented",
+        Some(&format!("subresource '{sub}' is not implemented")),
+        &[],
+    )
+}
+
+fn not_implemented_sigv2() -> Response {
+    s3_error_response("NotImplemented", Some(MSG_SIGV2_NOT_IMPLEMENTED), &[])
+}
+
+fn not_implemented_aws_chunked() -> Response {
+    s3_error_response(
+        "NotImplemented",
+        Some(MSG_AWS_CHUNKED_NOT_IMPLEMENTED),
+        &[],
+    )
 }
 
 fn owner_for(cred: &S3Credential) -> Owner {
@@ -714,6 +807,17 @@ impl Middleware for S3Api {
             return next(req);
         }
 
+        // SigV2: stable 501 (WONTFIX) — do not fall through to TempAuth HTML.
+        if is_sigv2_auth(&req) {
+            return not_implemented_sigv2();
+        }
+
+        // aws-chunked / STREAMING-* payload: stable 501 (WONTFIX) before
+        // signature verify so clients never see SignatureDoesNotMatch noise.
+        if is_aws_chunked_request(&req) {
+            return not_implemented_aws_chunked();
+        }
+
         let auth = match parse_sigv4_auth(&req) {
             Some(a) => a,
             None => return s3_error_response("AccessDenied", None, &[]),
@@ -729,11 +833,7 @@ impl Middleware for S3Api {
 
         let params = req.params();
         if let Some(sub) = first_unsupported_subresource(&params) {
-            return s3_error_response(
-                "NotImplemented",
-                Some(&format!("subresource '{sub}' is not implemented")),
-                &[],
-            );
+            return not_implemented_subresource(sub);
         }
 
         let (bucket, key) = extract_bucket_and_key(
@@ -2152,13 +2252,175 @@ mod tests {
         assert_eq!(api.handle(req, &next).status, 200);
     }
 
+    /// Assert stable S3 NotImplemented: 501 + Code + Message fragment.
+    fn assert_not_implemented(resp: Response, message_substr: &str) {
+        assert_eq!(resp.status, 501, "expected HTTP 501 NotImplemented");
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("application/xml")
+        );
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(
+            body.contains("<Code>NotImplemented</Code>"),
+            "body missing Code=NotImplemented: {body}"
+        );
+        assert!(
+            body.contains(message_substr),
+            "body missing message {message_substr:?}: {body}"
+        );
+    }
+
     #[test]
     fn unsupported_lifecycle_still_501() {
         let api = S3Api::new(cred_map());
         let req = sign_request(base_s3_req("GET", "/mybucket", "lifecycle"), "testing");
         let next: NextFn = Arc::new(|_| Response::new(500));
         let resp = api.handle(req, &next);
-        assert_eq!(resp.status, 501);
+        assert_not_implemented(resp, "lifecycle");
+    }
+
+    #[test]
+    fn unsupported_tagging_still_501() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/mybucket", "tagging"), "testing");
+        let next: NextFn = Arc::new(|_| Response::new(500));
+        assert_not_implemented(api.handle(req, &next), "tagging");
+    }
+
+    #[test]
+    fn unsupported_versioning_still_501() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/mybucket", "versioning"), "testing");
+        let next: NextFn = Arc::new(|_| Response::new(500));
+        assert_not_implemented(api.handle(req, &next), "versioning");
+    }
+
+    #[test]
+    fn unsupported_versions_list_still_501() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/mybucket", "versions"), "testing");
+        let next: NextFn = Arc::new(|_| Response::new(500));
+        assert_not_implemented(api.handle(req, &next), "versions");
+    }
+
+    #[test]
+    fn unsupported_object_lock_still_501() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/mybucket", "object-lock"), "testing");
+        let next: NextFn = Arc::new(|_| Response::new(500));
+        assert_not_implemented(api.handle(req, &next), "object-lock");
+    }
+
+    #[test]
+    fn sigv2_header_auth_returns_501() {
+        let api = S3Api::new(cred_map());
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Host", "localhost");
+        headers.set(
+            "Authorization",
+            "AWS test:tester:deadbeefsignature",
+        );
+        let req = Request {
+            method: "GET".into(),
+            path: "/mybucket/obj".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        };
+        let next: NextFn = Arc::new(|_| {
+            panic!("SigV2 must not fall through to next middleware");
+        });
+        assert_not_implemented(api.handle(req, &next), "Signature Version 2");
+    }
+
+    #[test]
+    fn sigv2_query_auth_returns_501() {
+        let api = S3Api::new(cred_map());
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Host", "localhost");
+        let req = Request {
+            method: "GET".into(),
+            path: "/mybucket/obj".into(),
+            query_string: "AWSAccessKeyId=test%3Atester&Expires=9999999999&Signature=abc".into(),
+            headers,
+            body: Body::empty(),
+        };
+        let next: NextFn = Arc::new(|_| {
+            panic!("SigV2 query auth must not fall through");
+        });
+        assert_not_implemented(api.handle(req, &next), "Signature Version 2");
+    }
+
+    #[test]
+    fn aws_chunked_streaming_payload_returns_501() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket/obj", "");
+        req.headers.set(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        );
+        // Signature would be wrong for streaming; rejection must happen
+        // before SignatureDoesNotMatch so clients see NotImplemented.
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|_| {
+            panic!("aws-chunked must not reach backend");
+        });
+        assert_not_implemented(api.handle(req, &next), "aws-chunked");
+    }
+
+    #[test]
+    fn aws_chunked_content_encoding_returns_501() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket/obj", "");
+        req.headers.set("Content-Encoding", "aws-chunked");
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|_| {
+            panic!("Content-Encoding aws-chunked must not reach backend");
+        });
+        assert_not_implemented(api.handle(req, &next), "aws-chunked");
+    }
+
+    #[test]
+    fn aws_chunked_trailer_unsigned_returns_501() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket/obj", "");
+        req.headers.set(
+            "x-amz-content-sha256",
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+        );
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|_| panic!("must not reach backend"));
+        assert_not_implemented(api.handle(req, &next), "aws-chunked");
+    }
+
+    #[test]
+    fn is_sigv2_detects_header_and_query() {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Authorization", "AWS AKID:sig");
+        let req = Request {
+            method: "GET".into(),
+            path: "/b".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        };
+        assert!(is_sigv2_auth(&req));
+        assert!(is_s3_auth_request(&req));
+
+        let mut headers = HeaderKeyDict::new();
+        headers.set(
+            "Authorization",
+            "AWS4-HMAC-SHA256 Credential=a/20130524/us-east-1/s3/aws4_request, \
+             SignedHeaders=host, Signature=00",
+        );
+        let req = Request {
+            method: "GET".into(),
+            path: "/b".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        };
+        assert!(!is_sigv2_auth(&req));
     }
 
     #[test]

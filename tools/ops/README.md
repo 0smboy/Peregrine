@@ -25,6 +25,12 @@ cd /path/to/Peregrine
 # 2) Dry-run + print exact remote commands (no SSH mutation)
 ./tools/ops/apply-vip-tls-pem.sh --pem /secure/vip.fullchain.pem \
   --ssh swift1,swift2,swift3,swift4 --reload --dry-run --print-commands
+# Contabo public IPs also OK (from tools/CONTABO-CLUSTER.md):
+#   --ssh 169.58.108.85,169.58.108.86,169.58.108.87,169.58.108.121
+
+# 2b) Live inventory only (subject/issuer + bind ssl; never applies)
+./tools/ops/contabo-tls-dry-run.sh \
+  --out tools/test-results/tls-dry-run-$(date -u +%Y%m%d)
 
 # 3) Live apply ONLY after operator confirms SSH targets
 ./tools/ops/apply-vip-tls-pem.sh --pem /secure/vip.fullchain.pem \

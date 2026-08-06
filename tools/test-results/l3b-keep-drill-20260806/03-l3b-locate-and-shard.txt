@@ -1,0 +1,18 @@
+head=204
+newest 0
+hits 0
+HTTP/1.1 204 No Content
+X-Container-Object-Count: 100
+X-Container-Bytes-Used: 1000
+X-Timestamp: 1786014208.52250
+X-Put-Timestamp: 1786014208.51811
+Content-Type: text/plain; charset=utf-8
+Last-Modified: Thu, 06 Aug 2026 11:03:29 GMT
+Content-Length: 0
+Accept-Ranges: bytes
+X-Storage-Policy: Policy-0
+Vary: Accept
+X-Trans-Id: tx3020be6af5a679cc04e87-006a746b9e
+X-Openstack-Request-Id: tx3020be6af5a679cc04e87-006a746b9e
+Connection: keep-alive
+

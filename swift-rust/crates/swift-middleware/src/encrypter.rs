@@ -22,12 +22,25 @@
 //!   container-listing etag override, user-meta → transient-sysmeta
 //! * object `POST` — user-meta encryption only
 //! * response `Etag` rewrite to plaintext on successful PUT
+//! * **chunked encrypt-while-read** on PUT: plaintext is never held as a
+//!   second full copy; AES-CTR + dual MD5 (pt/ct) advance in
+//!   [`STREAM_CHUNK`] windows. Ciphertext is still assembled in one
+//!   buffer so etag/crypto sysmeta can be stamped as *request headers*
+//!   before the proxy opens backend connections.
 //!
 //! Residuals (honest):
-//! * streaming PUT footers (`swift.callback.update_footers`) — body is
-//!   materialized before encrypt so etag/crypto sysmeta can be stamped as
-//!   request headers (Python uses MIME footers after the body stream)
-//! * full `swift.crypto.override` environ path (header stamp only)
+//! * **True zero-copy streaming PUT** is blocked without
+//!   `swift.callback.update_footers` on the replication object-PUT path
+//!   (Python's `EncInputWrapper` encrypts per-chunk as the body is
+//!   pulled, then stamps etag/crypto sysmeta as MIME/trailers *after*
+//!   the stream). Until the proxy putter gains a footer callback for
+//!   repl policy, the ciphertext must exist before `next(req)` so
+//!   `Etag` + crypto sysmeta travel as ordinary headers.
+//!   `// P1-leftover: ciphertext still fully buffered (footer residual)`.
+//! * full `swift.crypto.override` environ path — **incomplete**: only the
+//!   `Swift-Crypto-Override` request header is honoured (Python checks
+//!   `env['swift.crypto.override']`). `Request` has no WSGI environ map
+//!   yet, so middleware cannot set the override out-of-band.
 //! * **KMIP / KMS keymasters** — still deferred (keymaster residual)
 //!
 //! Multi-root secrets: writes use the keymaster's active root secret; the
@@ -37,6 +50,7 @@
 //! and set `X-Backend-Etag-Is-At: X-Object-Sysmeta-Crypto-Etag-Mac`
 //! (Python `_mask_conditional_etags` + `update_etag_is_at_header`).
 
+use std::io::Read;
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -45,10 +59,12 @@ use md5::{Digest, Md5};
 use swift_core::config::config_true_value;
 use swift_core::constraints::{MAX_FILE_SIZE, VALID_API_VERSIONS};
 use swift_crypto::{
-    append_crypto_meta, dump_crypto_meta, encrypt, encrypt_header_value, hmac_etag, wrap_key,
-    CryptoError, WrappedKey, CIPHER, IV_LENGTH, KEY_LENGTH,
+    append_crypto_meta, create_encryption_ctxt, dump_crypto_meta, encrypt_header_value, hmac_etag,
+    wrap_key, CryptoError, WrappedKey, CIPHER, IV_LENGTH, KEY_LENGTH,
 };
-use swift_http::{normalize_etag, split_path, Body, Match, Request, Response};
+use swift_http::{
+    body_too_large, normalize_etag, split_path, Body, Match, Request, Response, STREAM_CHUNK,
+};
 
 use crate::keymaster::KeyMaster;
 use crate::{Middleware, NextFn};
@@ -83,6 +99,9 @@ pub struct EncryptedObject {
 /// `body_iv` / `body_key` / `wrap_iv` / `etag_iv` are caller-supplied so
 /// unit tests can use known vectors; production passes
 /// [`random_iv`] / [`random_key`].
+///
+/// Internally delegates to [`encrypt_object_body_from_reader`] so the
+/// one-shot and streaming paths share the same CTR + dual-MD5 loop.
 pub fn encrypt_object_body(
     object_key: &[u8; KEY_LENGTH],
     container_key: &[u8; KEY_LENGTH],
@@ -93,11 +112,211 @@ pub fn encrypt_object_body(
     wrap_iv: [u8; IV_LENGTH],
     etag_iv: [u8; IV_LENGTH],
 ) -> Result<EncryptedObject, CryptoError> {
-    let wrapped = wrap_key(object_key, &body_key, wrap_iv)?;
-    let ciphertext = encrypt(&body_key, &body_iv, plaintext)?;
+    match encrypt_object_body_from_reader(
+        object_key,
+        container_key,
+        key_id,
+        &mut std::io::Cursor::new(plaintext),
+        Some(plaintext.len() as u64),
+        MAX_FILE_SIZE as u64,
+        body_iv,
+        body_key,
+        wrap_iv,
+        etag_iv,
+    ) {
+        Ok(enc) => Ok(enc),
+        Err(EncryptBodyError::Crypto(c)) => Err(c),
+        // In-memory slice under MAX_FILE_SIZE cannot hit IO / cap errors.
+        Err(EncryptBodyError::TooLarge | EncryptBodyError::Io(_)) => {
+            unreachable!("encrypt_object_body: in-memory body under cap")
+        }
+    }
+}
 
-    let plaintext_etag = md5_hex(plaintext);
-    let ciphertext_etag = md5_hex(&ciphertext);
+/// Errors from the chunked encrypt-while-read path.
+#[derive(Debug)]
+pub enum EncryptBodyError {
+    /// Body exceeded the materialize/encrypt cap (map to 413).
+    TooLarge,
+    /// Underlying reader failed (map to 400).
+    Io(std::io::Error),
+    /// Crypto primitive failure (map to 500).
+    Crypto(CryptoError),
+}
+
+impl From<CryptoError> for EncryptBodyError {
+    fn from(e: CryptoError) -> Self {
+        EncryptBodyError::Crypto(e)
+    }
+}
+
+impl From<std::io::Error> for EncryptBodyError {
+    fn from(e: std::io::Error) -> Self {
+        if body_too_large(&e) {
+            EncryptBodyError::TooLarge
+        } else {
+            EncryptBodyError::Io(e)
+        }
+    }
+}
+
+/// Chunked AES-256-CTR encrypt of a body reader (Python
+/// `EncInputWrapper.chunk_update` loop).
+///
+/// Reads at most `cap` bytes in [`STREAM_CHUNK`] windows, encrypts each
+/// window in place, and accumulates **ciphertext only**. Plaintext is
+/// never retained beyond the current window — dual MD5 (plaintext +
+/// ciphertext) advances per chunk so etags match the one-shot path.
+///
+/// Prefer [`encrypt_object_body_from_body`] when you already own a
+/// [`Body`]: the buffered branch encrypts **in place** (one allocation).
+///
+/// # Residual
+///
+/// The returned [`EncryptedObject::ciphertext`] is still a full buffer
+/// (`// P1-leftover: ciphertext still fully buffered (footer residual)`).
+/// True end-to-end streaming needs proxy PUT footers so crypto sysmeta
+/// can be stamped after the body stream (see module docs).
+pub fn encrypt_object_body_from_reader(
+    object_key: &[u8; KEY_LENGTH],
+    container_key: &[u8; KEY_LENGTH],
+    key_id: &serde_json::Value,
+    reader: &mut dyn Read,
+    declared_len: Option<u64>,
+    cap: u64,
+    body_iv: [u8; IV_LENGTH],
+    body_key: [u8; KEY_LENGTH],
+    wrap_iv: [u8; IV_LENGTH],
+    etag_iv: [u8; IV_LENGTH],
+) -> Result<EncryptedObject, EncryptBodyError> {
+    if let Some(len) = declared_len {
+        if len > cap {
+            return Err(EncryptBodyError::TooLarge);
+        }
+    }
+
+    let mut plaintext_md5 = Md5::new();
+    let mut ciphertext_md5 = Md5::new();
+    let mut ciphertext: Vec<u8> = match declared_len {
+        Some(len) => Vec::with_capacity(len as usize),
+        None => Vec::new(),
+    };
+    let mut ctxt = create_encryption_ctxt(&body_key, &body_iv)?;
+
+    let mut buf = [0u8; STREAM_CHUNK];
+    let mut total: u64 = 0;
+    loop {
+        let n = reader.read(&mut buf).map_err(EncryptBodyError::from)?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n as u64);
+        if total > cap {
+            return Err(EncryptBodyError::TooLarge);
+        }
+        let chunk = &mut buf[..n];
+        plaintext_md5.update(&*chunk);
+        ctxt.update_in_place(chunk);
+        ciphertext_md5.update(&*chunk);
+        ciphertext
+            .try_reserve(n)
+            .map_err(|e| EncryptBodyError::Io(std::io::Error::other(e)))?;
+        ciphertext.extend_from_slice(chunk);
+    }
+
+    finish_encrypted_object(
+        object_key,
+        container_key,
+        key_id,
+        body_iv,
+        body_key,
+        wrap_iv,
+        etag_iv,
+        ciphertext,
+        plaintext_md5,
+        ciphertext_md5,
+    )
+}
+
+/// Encrypt a [`Body`]: buffered bodies encrypt **in place** (peak ≈ body
+/// size); streamed bodies encrypt-while-read into a ciphertext buffer
+/// (peak ≈ body size + [`STREAM_CHUNK`]).
+///
+/// `// P1-leftover: ciphertext still fully buffered (footer residual)`.
+pub fn encrypt_object_body_from_body(
+    object_key: &[u8; KEY_LENGTH],
+    container_key: &[u8; KEY_LENGTH],
+    key_id: &serde_json::Value,
+    body: Body,
+    cap: u64,
+    body_iv: [u8; IV_LENGTH],
+    body_key: [u8; KEY_LENGTH],
+    wrap_iv: [u8; IV_LENGTH],
+    etag_iv: [u8; IV_LENGTH],
+) -> Result<EncryptedObject, EncryptBodyError> {
+    match body {
+        Body::Buffered(mut plaintext) => {
+            if plaintext.len() as u64 > cap {
+                return Err(EncryptBodyError::TooLarge);
+            }
+            let mut ctxt = create_encryption_ctxt(&body_key, &body_iv)?;
+            let mut plaintext_md5 = Md5::new();
+            let mut ciphertext_md5 = Md5::new();
+            // In-place CTR: MD5 plaintext, encrypt, MD5 ciphertext — all
+            // per STREAM_CHUNK window without a second full allocation.
+            for chunk in plaintext.chunks_mut(STREAM_CHUNK) {
+                plaintext_md5.update(&*chunk);
+                ctxt.update_in_place(chunk);
+                ciphertext_md5.update(&*chunk);
+            }
+            finish_encrypted_object(
+                object_key,
+                container_key,
+                key_id,
+                body_iv,
+                body_key,
+                wrap_iv,
+                etag_iv,
+                plaintext, // now ciphertext
+                plaintext_md5,
+                ciphertext_md5,
+            )
+        }
+        streamed @ Body::Streamed(_) => {
+            let declared = streamed.content_length();
+            let (mut reader, _) = streamed.into_reader();
+            encrypt_object_body_from_reader(
+                object_key,
+                container_key,
+                key_id,
+                &mut reader,
+                declared,
+                cap,
+                body_iv,
+                body_key,
+                wrap_iv,
+                etag_iv,
+            )
+        }
+    }
+}
+
+/// Wrap body key + stamp crypto-meta / etag headers after the CTR loop.
+fn finish_encrypted_object(
+    object_key: &[u8; KEY_LENGTH],
+    container_key: &[u8; KEY_LENGTH],
+    key_id: &serde_json::Value,
+    body_iv: [u8; IV_LENGTH],
+    body_key: [u8; KEY_LENGTH],
+    wrap_iv: [u8; IV_LENGTH],
+    etag_iv: [u8; IV_LENGTH],
+    ciphertext: Vec<u8>,
+    plaintext_md5: Md5,
+    ciphertext_md5: Md5,
+) -> Result<EncryptedObject, EncryptBodyError> {
+    let wrapped = wrap_key(object_key, &body_key, wrap_iv)?;
+    let plaintext_etag = format!("{:x}", plaintext_md5.finalize());
+    let ciphertext_etag = format!("{:x}", ciphertext_md5.finalize());
 
     let body_meta = body_crypto_meta_json(&body_iv, &wrapped, key_id);
     let body_meta_header = dump_crypto_meta(&body_meta);
@@ -270,37 +489,46 @@ impl Encrypter {
 
         encrypt_user_metadata(&mut req, &object_key, &keys.id);
 
-        // Materialize body so we can stamp etag/crypto sysmeta as headers
-        // before the proxy opens backend connections (footer residual).
-        let plaintext = match materialize_body(&mut req) {
-            Ok(b) => b,
-            Err(status) => return Response::error(status, "Error reading request body"),
-        };
-
+        // Chunked encrypt-while-read (Python EncInputWrapper.chunk_update).
+        // Buffered bodies encrypt in place; streamed bodies keep only a
+        // STREAM_CHUNK plaintext window. Ciphertext is still fully buffered
+        // so etag/crypto sysmeta can be stamped as request headers before
+        // the proxy opens backend connections.
+        // P1-leftover: ciphertext still fully buffered (footer residual).
         let client_etag = req
             .headers
             .remove("Etag")
             .or_else(|| req.headers.remove("ETag"));
-        if let Some(ref etag) = client_etag {
-            let norm = normalize_etag(etag);
-            if !norm.is_empty() && norm != md5_hex(&plaintext) {
-                return Response::error(422, "Etag Mismatch");
-            }
-        }
 
-        let enc = match encrypt_object_body(
+        let enc = match encrypt_object_body_from_body(
             &object_key,
             &container_key,
             &keys.id,
-            &plaintext,
+            req.body.take(),
+            MAX_FILE_SIZE as u64,
             random_iv(),
             random_key(),
             random_iv(),
             random_iv(),
         ) {
             Ok(e) => e,
-            Err(_) => return Response::error(500, "Error encrypting object"),
+            Err(EncryptBodyError::TooLarge) => {
+                return Response::error(413, "Request Entity Too Large");
+            }
+            Err(EncryptBodyError::Io(_)) => {
+                return Response::error(400, "Error reading request body");
+            }
+            Err(EncryptBodyError::Crypto(_)) => {
+                return Response::error(500, "Error encrypting object");
+            }
         };
+
+        if let Some(ref etag) = client_etag {
+            let norm = normalize_etag(etag);
+            if !norm.is_empty() && norm != enc.plaintext_etag {
+                return Response::error(422, "Etag Mismatch");
+            }
+        }
 
         req.headers.set(BODY_META_HEADER, &enc.body_meta_header);
         req.headers.set(ETAG_HEADER, &enc.crypto_etag_header);
@@ -479,15 +707,6 @@ fn encrypt_user_metadata(
     }
 }
 
-fn materialize_body(req: &mut Request) -> Result<Vec<u8>, u16> {
-    let mut body = req.body.take();
-    match body.materialize(MAX_FILE_SIZE as u64) {
-        Ok(slice) => Ok(slice.to_vec()),
-        Err(e) if swift_http::body_too_large(&e) => Err(413),
-        Err(_) => Err(400),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,13 +775,163 @@ mod tests {
         assert!(!enc.etag_mac_header.is_empty());
     }
 
+    /// In-place buffered encrypt must match the reader path for the same IVs.
     #[test]
-    fn middleware_put_get_roundtrip() {
+    fn buffered_in_place_matches_reader_path() {
         let km = root_km();
+        let keys = km.fetch_keys("acct", Some("cont"), Some("obj"));
+        let object_key = keys.object.unwrap();
+        let container_key = keys.container.unwrap();
+        let plaintext: Vec<u8> = (0..STREAM_CHUNK + 3).map(|i| (i % 200) as u8).collect();
+        let body_iv = [0x55u8; IV_LENGTH];
+        let body_key = [0x66u8; KEY_LENGTH];
+        let wrap_iv = [0x77u8; IV_LENGTH];
+        let etag_iv = [0x88u8; IV_LENGTH];
+
+        let from_body = encrypt_object_body_from_body(
+            &object_key,
+            &container_key,
+            &keys.id,
+            Body::from(plaintext.clone()),
+            MAX_FILE_SIZE as u64,
+            body_iv,
+            body_key,
+            wrap_iv,
+            etag_iv,
+        )
+        .unwrap();
+        let from_reader = encrypt_object_body_from_reader(
+            &object_key,
+            &container_key,
+            &keys.id,
+            &mut std::io::Cursor::new(&plaintext),
+            Some(plaintext.len() as u64),
+            MAX_FILE_SIZE as u64,
+            body_iv,
+            body_key,
+            wrap_iv,
+            etag_iv,
+        )
+        .unwrap();
+        assert_eq!(from_body.ciphertext, from_reader.ciphertext);
+        assert_eq!(from_body.plaintext_etag, from_reader.plaintext_etag);
+        assert_eq!(from_body.ciphertext_etag, from_reader.ciphertext_etag);
+        assert_eq!(from_body.body_meta_header, from_reader.body_meta_header);
+    }
+
+    /// Chunked encrypt-while-read must byte-match one-shot for the same IVs,
+    /// including bodies larger than STREAM_CHUNK (multi-window path).
+    #[test]
+    fn chunked_encrypt_matches_oneshot_across_stream_chunks() {
+        let km = root_km();
+        let keys = km.fetch_keys("acct", Some("cont"), Some("obj"));
+        let object_key = keys.object.unwrap();
+        let container_key = keys.container.unwrap();
+
+        // 3 * STREAM_CHUNK + 17 → exercises several full windows + a tail.
+        let mut plaintext = vec![0u8; STREAM_CHUNK * 3 + 17];
+        for (i, b) in plaintext.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+
+        let body_iv = [0x11u8; IV_LENGTH];
+        let body_key = [0x22u8; KEY_LENGTH];
+        let wrap_iv = [0x33u8; IV_LENGTH];
+        let etag_iv = [0x44u8; IV_LENGTH];
+
+        let oneshot = encrypt_object_body(
+            &object_key,
+            &container_key,
+            &keys.id,
+            &plaintext,
+            body_iv,
+            body_key,
+            wrap_iv,
+            etag_iv,
+        )
+        .unwrap();
+
+        // Feed the reader in small non-aligned reads to stress the loop.
+        struct PieceReader<'a> {
+            data: &'a [u8],
+            pos: usize,
+            piece: usize,
+        }
+        impl Read for PieceReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.pos >= self.data.len() {
+                    return Ok(0);
+                }
+                let n = self.piece.min(self.data.len() - self.pos).min(buf.len());
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+        let mut reader = PieceReader {
+            data: &plaintext,
+            pos: 0,
+            piece: 1000, // not STREAM_CHUNK-aligned
+        };
+        let chunked = encrypt_object_body_from_reader(
+            &object_key,
+            &container_key,
+            &keys.id,
+            &mut reader,
+            Some(plaintext.len() as u64),
+            MAX_FILE_SIZE as u64,
+            body_iv,
+            body_key,
+            wrap_iv,
+            etag_iv,
+        )
+        .unwrap();
+
+        assert_eq!(chunked.ciphertext, oneshot.ciphertext);
+        assert_eq!(chunked.plaintext_etag, oneshot.plaintext_etag);
+        assert_eq!(chunked.ciphertext_etag, oneshot.ciphertext_etag);
+        assert_eq!(chunked.body_meta_header, oneshot.body_meta_header);
+        assert_eq!(chunked.crypto_etag_header, oneshot.crypto_etag_header);
+        assert_eq!(chunked.etag_mac_header, oneshot.etag_mac_header);
+        assert_eq!(chunked.override_etag_header, oneshot.override_etag_header);
+
+        let recovered =
+            decrypt_object_body(&object_key, &chunked.body_meta_header, 0, &chunked.ciphertext)
+                .expect("decrypt");
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn chunked_encrypt_respects_cap() {
+        let km = root_km();
+        let keys = km.fetch_keys("a", Some("c"), Some("o"));
+        let object_key = keys.object.unwrap();
+        let container_key = keys.container.unwrap();
+        let data = vec![7u8; 100];
+        let err = encrypt_object_body_from_reader(
+            &object_key,
+            &container_key,
+            &keys.id,
+            &mut std::io::Cursor::new(&data),
+            Some(data.len() as u64),
+            50, // cap below body
+            [0u8; IV_LENGTH],
+            [1u8; KEY_LENGTH],
+            [2u8; IV_LENGTH],
+            [3u8; IV_LENGTH],
+        )
+        .unwrap_err();
+        assert!(matches!(err, EncryptBodyError::TooLarge));
+    }
+
+    fn put_get_pipeline(
+        km: Arc<KeyMaster>,
+    ) -> (
+        Arc<dyn Fn(Request) -> Response + Send + Sync>,
+        Arc<std::sync::Mutex<Option<(HeaderKeyDict, Vec<u8>)>>>,
+    ) {
         let encrypter = Encrypter::new(Arc::clone(&km), false);
         let decrypter = Decrypter::new(Arc::clone(&km));
-
-        // Backend store: capture PUT headers+body, serve them on GET.
         let store: Arc<std::sync::Mutex<Option<(HeaderKeyDict, Vec<u8>)>>> =
             Arc::new(std::sync::Mutex::new(None));
         let store_w = Arc::clone(&store);
@@ -570,7 +939,11 @@ mod tests {
             if req.method == "PUT" {
                 let body = match &req.body {
                     Body::Buffered(b) => b.clone(),
-                    _ => Vec::new(),
+                    Body::Streamed(_) => {
+                        // Encrypter always re-buffers ciphertext for header
+                        // stamp (footer residual); treat empty as bug.
+                        Vec::new()
+                    }
                 };
                 let etag = req.headers.get("Etag").unwrap_or("").to_string();
                 *store_w.lock().unwrap() = Some((req.headers.clone(), body.clone()));
@@ -594,7 +967,6 @@ mod tests {
                 resp
             }
         });
-
         let pipeline = crate::build_pipeline(
             vec![
                 Arc::new(decrypter) as Arc<dyn Middleware>,
@@ -602,6 +974,13 @@ mod tests {
             ],
             app,
         );
+        (pipeline, store)
+    }
+
+    #[test]
+    fn middleware_put_get_roundtrip() {
+        let km = root_km();
+        let (pipeline, store) = put_get_pipeline(Arc::clone(&km));
 
         let plaintext = b"hello encrypted world";
         let put = Request {
@@ -665,6 +1044,112 @@ mod tests {
         );
         // crypto sysmeta stripped from client response
         assert!(get_resp.headers.get(BODY_META_HEADER).is_none());
+    }
+
+    /// PUT body arrives as a stream (chunked / unknown length): encrypter
+    /// must still encrypt-while-read without requiring a pre-buffered body.
+    #[test]
+    fn middleware_put_streamed_body_roundtrip() {
+        let km = root_km();
+        let (pipeline, store) = put_get_pipeline(Arc::clone(&km));
+
+        let plaintext: Vec<u8> = (0..STREAM_CHUNK + 99).map(|i| (i % 256) as u8).collect();
+        let put = Request {
+            method: "PUT".into(),
+            path: "/v1/AUTH_test/c1/o_stream".into(),
+            query_string: String::new(),
+            headers: {
+                let mut h = HeaderKeyDict::new();
+                h.set("Content-Type", "application/octet-stream");
+                h
+            },
+            // No declared Content-Length — forces the unknown-length branch.
+            body: Body::from_reader(
+                Box::new(std::io::Cursor::new(plaintext.clone())),
+                None,
+            ),
+        };
+        let put_resp = pipeline(put);
+        assert_eq!(put_resp.status, 201, "streamed put failed");
+        let expected_etag = md5_hex(&plaintext);
+        assert_eq!(
+            put_resp.headers.get("Etag").map(normalize_etag),
+            Some(expected_etag.as_str())
+        );
+
+        {
+            let guard = store.lock().unwrap();
+            let (hdrs, body) = guard.as_ref().unwrap();
+            assert_ne!(body.as_slice(), plaintext.as_slice());
+            assert_eq!(body.len(), plaintext.len()); // CTR length-preserving
+            assert!(hdrs.get(BODY_META_HEADER).is_some());
+            assert_eq!(
+                hdrs.get("Content-Length").and_then(|s| s.parse().ok()),
+                Some(plaintext.len())
+            );
+        }
+
+        let get = Request {
+            method: "GET".into(),
+            path: "/v1/AUTH_test/c1/o_stream".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let mut get_resp = pipeline(get);
+        assert_eq!(get_resp.status, 200);
+        let got = get_resp
+            .body
+            .materialize(MAX_FILE_SIZE as u64)
+            .expect("materialize")
+            .to_vec();
+        assert_eq!(got, plaintext);
+    }
+
+    #[test]
+    fn middleware_put_client_etag_mismatch() {
+        let km = root_km();
+        let enc = Encrypter::new(km, false);
+        let app: NextFn = Arc::new(|_req: Request| Response::new(201));
+        let req = Request {
+            method: "PUT".into(),
+            path: "/v1/a/c/o".into(),
+            query_string: String::new(),
+            headers: {
+                let mut h = HeaderKeyDict::new();
+                h.set("Etag", "00000000000000000000000000000000");
+                h
+            },
+            body: Body::from(&b"not-matching"[..]),
+        };
+        assert_eq!(enc.handle(req, &app).status, 422);
+    }
+
+    #[test]
+    fn middleware_put_crypto_override_header_skips() {
+        let km = root_km();
+        let enc = Encrypter::new(km, false);
+        let app: NextFn = Arc::new(|req: Request| {
+            let body = match &req.body {
+                Body::Buffered(b) => b.clone(),
+                _ => Vec::new(),
+            };
+            assert_eq!(body, b"plain");
+            assert!(req.headers.get(BODY_META_HEADER).is_none());
+            Response::new(201)
+        });
+        let req = Request {
+            method: "PUT".into(),
+            path: "/v1/a/c/o".into(),
+            query_string: String::new(),
+            headers: {
+                let mut h = HeaderKeyDict::new();
+                h.set("Swift-Crypto-Override", "true");
+                h
+            },
+            body: Body::from(&b"plain"[..]),
+        };
+        assert_eq!(enc.handle(req, &app).status, 201);
     }
 
     #[test]
