@@ -644,8 +644,9 @@ impl ContainerBroker {
     }
 
     /// `set_sharded_state`: SHARDING → SHARDED. Unlinks the retiring (lower-
-    /// epoch) DB, leaving only the fresh epoch DB. Returns whether it
-    /// succeeded.
+    /// epoch) DB, leaving only the fresh epoch DB. Also bumps the own shard
+    /// range row to `SHARDED` so `info`/`show` match `get_db_state`.
+    /// Returns whether it succeeded.
     pub fn set_sharded_state(&mut self) -> Result<bool, DbError> {
         if self.get_db_state()? != DbState::Sharding {
             return Ok(false);
@@ -662,7 +663,21 @@ impl ContainerBroker {
             Err(e) => return Err(DbError::Connection(format!("unlink retiring db: {e}"))),
         }
         self.reload_db_files();
-        Ok(self.db_files().len() < 2)
+        if self.db_files().len() >= 2 {
+            return Ok(false);
+        }
+        // Align own-range state text with on-disk SHARDED (Python bumps own
+        // range when the epoch DB is the only remaining file).
+        if let Some(mut own) = self.get_own_shard_range(false)? {
+            if own.state != crate::shard::state::SHARDED {
+                own.state = crate::shard::state::SHARDED;
+                let ts = Timestamp::now().internal();
+                own.state_timestamp = ts.clone();
+                own.meta_timestamp = ts;
+                self.merge_shard_ranges(vec![own])?;
+            }
+        }
+        Ok(true)
     }
 
     /// Port of `DatabaseBroker.initialize` + `ContainerBroker._initialize`:
@@ -1877,6 +1892,12 @@ mod tests {
         assert!(b.set_sharded_state().unwrap());
         assert_eq!(b.db_files().len(), 1);
         assert_eq!(b.get_db_state().unwrap(), DbState::Sharded);
+        let own_after = b.get_own_shard_range(false).unwrap().unwrap();
+        assert_eq!(
+            own_after.state,
+            crate::shard::state::SHARDED,
+            "own range state_text should be sharded after set_sharded_state"
+        );
         // Epoch-only path: constructor `<hash>.db` is gone; is_deleted /
         // get_info_is_deleted must still see the container (listing fan-out).
         assert!(!b.db_file().exists(), "retiring base path unlinked");

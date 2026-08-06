@@ -2566,25 +2566,18 @@ impl ProxyApp {
             let mut headers = self.backend_headers(req, false, "container");
             // Shard containers live under the reserved `.shards_*` account.
             headers.set("X-Backend-Allow-Reserved-Names", "true");
-            let Some(resp) = self.get_or_head(
-                "container",
-                snodes,
+            // Walk primaries until a non-empty object listing is found —
+            // same lagging-replica empty-`[]` trap as range fetch.
+            let Some(items) = self.fetch_shard_object_listing_first_nonempty(
+                &snodes,
                 spart,
-                "GET",
                 &spath,
                 &qs_parts.join("&"),
                 &headers,
             ) else {
                 continue;
             };
-            if !(200..300).contains(&resp.status) {
-                continue;
-            }
-            let body = match resp.body.into_vec(16 * 1024 * 1024) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            if let Ok(serde_json::Value::Array(items)) = serde_json::from_slice(&body) {
+            if !items.is_empty() {
                 shard_listings.push(items);
             }
         }
@@ -2660,6 +2653,31 @@ impl ProxyApp {
         query: &str,
         shard_headers: &HeaderKeyDict,
     ) -> Option<Vec<serde_json::Value>> {
+        self.fetch_json_array_first_nonempty(nodes, part, path, query, shard_headers)
+    }
+
+    /// GET shard **object** listing JSON, walking nodes until non-empty.
+    fn fetch_shard_object_listing_first_nonempty(
+        &self,
+        nodes: &[Node],
+        part: u32,
+        path: &str,
+        query: &str,
+        headers: &HeaderKeyDict,
+    ) -> Option<Vec<serde_json::Value>> {
+        self.fetch_json_array_first_nonempty(nodes, part, path, query, headers)
+    }
+
+    /// Shared walk: first 2xx JSON array that is non-empty wins; if every
+    /// good response is `[]`, return that empty array; if none parse, None.
+    fn fetch_json_array_first_nonempty(
+        &self,
+        nodes: &[Node],
+        part: u32,
+        path: &str,
+        query: &str,
+        headers: &HeaderKeyDict,
+    ) -> Option<Vec<serde_json::Value>> {
         let mut last_empty: Option<Vec<serde_json::Value>> = None;
         for node in nodes {
             let Some(resp) = self.get_or_head(
@@ -2669,7 +2687,7 @@ impl ProxyApp {
                 "GET",
                 path,
                 query,
-                shard_headers,
+                headers,
             ) else {
                 continue;
             };

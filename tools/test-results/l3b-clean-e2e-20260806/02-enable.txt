@@ -1,0 +1,120 @@
+=== enable once swift2 ===
+No shard ranges found to delete.
+Injected 2 shard ranges.
+Run container-replicator to replicate them to other nodes.
+Created epoch DB for SHARDING state (set_sharding_state).
+Container moved to state 'sharding' with epoch 1786024284.59133.
+Run container-sharder on all nodes to shard the container.
+EXIT=0
+Sharding enabled = true
+Own shard range: {
+  "bytes_used": 0,
+  "deleted": 0,
+  "epoch": "1786024284.59133",
+  "lower": "",
+  "meta_timestamp": "1786024284.59466",
+  "name": "AUTH_test/l3bclean1786024121",
+  "object_count": 0,
+  "reported": 0,
+  "state": 60,
+  "state_text": "sharding",
+  "state_timestamp": "1786024284.59133",
+  "timestamp": "1786024284.59466",
+  "tombstones": -1,
+  "upper": ""
+}
+db_state = sharding
+object_count = 0
+bytes_used = 0
+Metadata:
+  X-Container-Sysmeta-Sharding = True
+analyze: root_container = true
+analyze: db_state = sharding
+analyze: sharding_enabled = true
+analyze: own_range state=sharding lower="" upper="" epoch=Some("1786024284.59133")
+analyze: shard_range_count = 2
+analyze: states = found=2
+analyze: total object_count = 60
+analyze: total row_count = 60
+analyze: overlapping_groups = 0
+analyze: gaps = 0 (continuous coverage of namespace)
+analyze: compactible_sequences (shrink_threshold=100000 expansion_limit=500000) = 0
+=== wait ranges 25s ===
+--- swift2 ---
+total 52
+drwxr-xr-x. 2 root root   130 Aug  6 13:51 .
+drwxr-xr-x. 3 root root    46 Aug  6 13:48 ..
+-rw-r--r--. 1 root root 53248 Aug  6 13:51 695c2176777150c5c73835e396470638_1786024284.59133.db
+-rw-r--r--. 1 root root     0 Aug  6 13:49 695c2176777150c5c73835e396470638.db.pending
+-rw-r--r--. 1 root root     0 Aug  6 13:48 .lock
+INFO_DB=/srv/node/d2/containers/6743/638/695c2176777150c5c73835e396470638/695c2176777150c5c73835e396470638_1786024284.59133.db
+Sharding enabled = true
+Own shard range: {
+  "bytes_used": 0,
+  "deleted": 0,
+  "epoch": "1786024284.59133",
+  "lower": "",
+  "meta_timestamp": "1786024284.59466",
+  "name": "AUTH_test/l3bclean1786024121",
+  "object_count": 0,
+  "reported": 0,
+  "state": 60,
+  "state_text": "sharding",
+  "state_timestamp": "1786024284.59133",
+  "timestamp": "1786024284.59466",
+  "tombstones": -1,
+  "upper": ""
+}
+db_state = sharded
+analyze: root_container = true
+analyze: db_state = sharded
+analyze: sharding_enabled = true
+analyze: own_range state=sharding lower="" upper="" epoch=Some("1786024284.59133")
+analyze: shard_range_count = 2
+analyze: states = cleaved=2
+analyze: total object_count = 60
+analyze: total row_count = 60
+analyze: overlapping_groups = 0
+analyze: gaps = 0 (continuous coverage of namespace)
+--- swift3 ---
+total 60
+drwxr-xr-x. 2 root root   113 Aug  6 13:51 .
+drwxr-xr-x. 3 root root    46 Aug  6 13:48 ..
+-rw-r--r--. 1 root root 61440 Aug  6 13:51 695c2176777150c5c73835e396470638.db
+-rw-r--r--. 1 root root     0 Aug  6 13:49 695c2176777150c5c73835e396470638.db.pending
+-rw-r--r--. 1 root root     0 Aug  6 13:48 .lock
+INFO_DB=/srv/node/d2/containers/6743/638/695c2176777150c5c73835e396470638/695c2176777150c5c73835e396470638.db
+Sharding enabled = true
+Own shard range: null
+db_state = unsharded
+object_count = 60
+bytes_used = 411
+Metadata:
+  X-Container-Sysmeta-Sharding = True
+analyze: root_container = true
+analyze: db_state = unsharded
+analyze: sharding_enabled = true
+analyze: own_range = null
+analyze: shard_range_count = 0
+analyze: no shard ranges stored
+--- swift4 ---
+total 60
+drwxr-xr-x. 2 root root   113 Aug  6 13:51 .
+drwxr-xr-x. 3 root root    46 Aug  6 13:48 ..
+-rw-r--r--. 1 root root 61440 Aug  6 13:51 695c2176777150c5c73835e396470638.db
+-rw-r--r--. 1 root root     0 Aug  6 13:49 695c2176777150c5c73835e396470638.db.pending
+-rw-r--r--. 1 root root     0 Aug  6 13:48 .lock
+INFO_DB=/srv/node/d2/containers/6743/638/695c2176777150c5c73835e396470638/695c2176777150c5c73835e396470638.db
+Sharding enabled = true
+Own shard range: null
+db_state = unsharded
+object_count = 60
+bytes_used = 411
+Metadata:
+  X-Container-Sysmeta-Sharding = True
+analyze: root_container = true
+analyze: db_state = unsharded
+analyze: sharding_enabled = true
+analyze: own_range = null
+analyze: shard_range_count = 0
+analyze: no shard ranges stored

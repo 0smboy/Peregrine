@@ -47,5 +47,5 @@ claimed**. See `tools/test-results/wave3-s3-l3b-prod-20260805/`.
 | 16MB_read formal ACCEPT | **DONE R8** — DIRECT+HA ACCEPT (oc=40/rt=180, n=8) |
 | 6h soak per impl | **DONE R8** — DIRECT 4KB_write_128 6h fail_total=0 |
 | P3-data X-Newest best-source | **PARTIAL DONE** — proxy collect+newest; resumable multi-GET still deferred |
-| P3-data / Wave 3 L3b sharder | **PARTIAL** — persist + auto_shard + fan-out code; live multi-node quorum / KEEP not claimed (`wave3-s3-l3b-20260805/`) |
+| P3-data / Wave 3 L3b sharder | **PARTIAL** — lab clean listing KEEP PASS (`l3b-clean-e2e-20260806` listed 60, ring-part, no relocate); product multi-node 4KB KEEP / Python对照 **not claimed** |
 | P3-data at-rest crypto middleware | **DONE path (2026-08-06)** — keymaster/encrypter/decrypter/encryption ON-BY-CONFIG; KMIP residual |

@@ -1,0 +1,23 @@
+Sharding enabled = true
+Own shard range: {
+  "bytes_used": 0,
+  "deleted": 0,
+  "epoch": "1786024284.59133",
+  "lower": "",
+  "meta_timestamp": "1786024284.59466",
+  "name": "AUTH_test/l3bclean1786024121",
+  "object_count": 0,
+  "reported": 0,
+  "state": 60,
+  "state_text": "sharding",
+  "state_timestamp": "1786024284.59133",
+  "timestamp": "1786024284.59466",
+  "tombstones": -1,
+  "upper": ""
+}
+db_state = sharded
+object_count = 60
+bytes_used = 411
+Metadata:
+  X-Container-Sysmeta-Sharding = True
+  X-Container-Sysmeta-Shard-Cleaving-Context = {"cursor":"obj-00030","ranges_done":2,"ranges_todo":1,"cleaving_done":true}

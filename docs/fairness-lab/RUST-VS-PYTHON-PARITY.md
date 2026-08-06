@@ -157,7 +157,7 @@
 | Auth | TempAuth + Keystone lab | Production-only ops polish |
 | S3 | SigV4 + MPU + ListParts + canned ACL + multi-rule CORS | SigV2, versioning, full IAM/object ACL, aws-chunked |
 | EC | Data path + heal | macOS/default build; some EC throttling niceties |
-| Sharding L3b | CLI + daemon ring HTTP create path + ×4 Contabo active | **lab listing KEEP demo** `l3b-keep-retest-20260806` (listed 59); **product KEEP vs Python对照 未宣称** |
+| Sharding L3b | CLI + daemon ring-part cleave + fan-out + ×4 Contabo | **lab clean listing KEEP** `l3b-clean-e2e-20260806` (listed 60, no relocate); **product KEEP vs Python对照 未宣称** |
 | Crypto at-rest middleware | multi-root + listing + range GET + etag mask + **chunked PUT encrypt** | KMIP; ciphertext still buffered (footer residual) |
 | container-sync | filter + daemon + HTTPS + CA knobs | multi-cluster live soak |
 | Production go-live | ops TLS script ready | **未实现** (Contabo still lab self-signed; operator PEM not applied) |
@@ -178,13 +178,13 @@ Rust is a **strong core-path + lab-proven** Swift, **not** a drop-in “full Ope
 | S3 MPU deep | 11/11 |
 | EC2 s3token | GREEN |
 | VIP failover | PASS |
-| L3b multi-node KEEP | **lab partial** (`l3b-keep-retest-20260806` listed 59 after epoch/is_deleted + fan-out + ring-part fixes); product claim **not claimed** |
+| L3b multi-node KEEP | **lab clean PASS** (`l3b-clean-e2e-20260806` listed 60, RIGHT partitions, no relocate); product claim **not claimed** |
 | Operator TLS PEM path (script) | **code GREEN**; Contabo **self-signed LAB** (probe 2026-08-06) |
 | container-sharder ×4 Contabo | **active** (status probe; KEEP not claimed) |
 | Linux redeploy L3b bins ×4 | **PASS** (`linux-redeploy-20260806`) |
 | L3b CLI enable + epoch DB | **PASS** after set_sharding_state fix |
 | L3b sharder cleave creates shard DBs | **PASS lab** (`l3bkeep…`, shard DBs present) |
-| L3b listing KEEP post-cleave | **LAB PASS** listed 59 (`l3b-keep-retest-20260806`); prior FAIL listed 0 documented in `l3b-keep-after-redeploy-20260806` |
+| L3b listing KEEP post-cleave | **LAB CLEAN PASS** listed 60 no relocate (`l3b-clean-e2e-20260806`); prior relocate path `l3b-keep-retest-20260806`; FAIL listed 0 in `l3b-keep-after-redeploy-20260806` |
 | container-sync binary on Contabo | **deployed** (multi-cluster soak not run) |
 | container-sync Contabo | **not deployed** (binary absent) |
 | TLS Contabo dry-run | **LAB self-signed** (`tls-dry-run-20260806`) |
