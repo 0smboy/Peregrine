@@ -294,6 +294,23 @@ fn cmd_enable(broker: &mut ContainerBroker) -> i32 {
 
     match broker.enable_sharding(&epoch) {
         Ok(updated) => {
+            // Python enable_sharding is followed by set_sharding_state when the
+            // sharder starts, but ops also need an epoch DB file so get_db_state
+            // reports SHARDING (single non-epoch file always looks UNSHARDED).
+            match broker.set_sharding_state() {
+                Ok(true) => {
+                    println!("Created epoch DB for SHARDING state (set_sharding_state).");
+                }
+                Ok(false) => {
+                    eprintln!(
+                        "warning: set_sharding_state returned false (missing epoch?); \
+                         sharder may not pick this container until epoch file exists"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("warning: set_sharding_state failed: {e}");
+                }
+            }
             let ts = Timestamp::now().normal();
             if let Err(e) = broker.update_metadata(&vec![(
                 "X-Container-Sysmeta-Sharding".into(),

@@ -1,0 +1,55 @@
+host=swift3
+ce3353ce1c3c461d6051b506f4628bb07183cbe340969c8f23cf43c10a060957  /usr/local/bin/swift-manage-shard-ranges
+DB_OK
+[
+  {
+    "index": 0,
+    "lower": "",
+    "object_count": 30,
+    "upper": "obj-00030"
+  },
+  {
+    "index": 1,
+    "lower": "obj-00030",
+    "object_count": 30,
+    "upper": ""
+  }
+]
+Found 2 ranges (complete: true, total object count 60)
+No shard ranges found to delete.
+Injected 2 shard ranges.
+Run container-replicator to replicate them to other nodes.
+Created epoch DB for SHARDING state (set_sharding_state).
+Container moved to state 'sharding' with epoch 1786018245.81363.
+Run container-sharder on all nodes to shard the container.
+EXIT=0
+Sharding enabled = true
+Own shard range: null
+db_state = sharding
+object_count = 0
+bytes_used = 0
+Metadata:
+  X-Container-Sysmeta-Sharding = True
+total 112
+drwxr-xr-x. 2 root root   173 Aug  6 12:10 .
+drwxr-xr-x. 3 root root    46 Aug  6 12:08 ..
+-rw-r--r--. 1 root root 53248 Aug  6 12:10 83aa700f8cb7826ba00b28ebb3c04fd0_1786018245.81363.db
+-rw-r--r--. 1 root root 61440 Aug  6 12:10 83aa700f8cb7826ba00b28ebb3c04fd0.db
+-rw-r--r--. 1 root root     0 Aug  6 12:09 83aa700f8cb7826ba00b28ebb3c04fd0.db.pending
+-rw-r--r--. 1 root root     0 Aug  6 12:08 .lock
+Sharding enabled = true
+Own shard range: null
+db_state = sharding
+object_count = 0
+bytes_used = 0
+Cleaving context: {"cursor":"obj-00030","ranges_done":2,"ranges_todo":1,"cleaving_done":true}
+Metadata:
+  X-Container-Sysmeta-Sharding = True
+  X-Container-Sysmeta-Shard-Cleaving-Context = {"cursor":"obj-00030","ranges_done":2,"ranges_todo":1,"cleaving_done":true}
+total 112
+drwxr-xr-x. 2 root root   173 Aug  6 12:11 .
+drwxr-xr-x. 3 root root    46 Aug  6 12:08 ..
+-rw-r--r--. 1 root root 53248 Aug  6 12:11 83aa700f8cb7826ba00b28ebb3c04fd0_1786018245.81363.db
+-rw-r--r--. 1 root root 61440 Aug  6 12:11 83aa700f8cb7826ba00b28ebb3c04fd0.db
+-rw-r--r--. 1 root root     0 Aug  6 12:11 83aa700f8cb7826ba00b28ebb3c04fd0.db.pending
+-rw-r--r--. 1 root root     0 Aug  6 12:08 .lock

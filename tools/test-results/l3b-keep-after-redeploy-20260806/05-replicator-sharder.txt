@@ -1,0 +1,32 @@
+=== db-replicator once ===
+active
+=== sharder long 1 ===
+=== sharder long 2 ===
+=== sharder long 3 ===
+=== sharder long 4 ===
+=== sharder long 5 ===
+Sharding enabled = true
+Own shard range: null
+db_state = unsharded
+object_count = 100
+bytes_used = 1000
+Metadata:
+  X-Container-Sysmeta-Sharding = True
+analyze: root_container = true
+analyze: db_state = unsharded
+analyze: sharding_enabled = true
+analyze: own_range = null
+analyze: shard_range_count = 3
+analyze: states = found=2 sharding=1
+analyze: total object_count = 100
+analyze: total row_count = 100
+analyze: overlapping_groups = 2
+  overlap[0]: .shards_AUTH_test/l3bdrill1786014205-84392330115fb1b09727c4637a9522eb-1786016735.43640-0, AUTH_test/l3bdrill1786014205
+  overlap[1]: .shards_AUTH_test/l3bdrill1786014205-84392330115fb1b09727c4637a9522eb-1786016735.43640-1, AUTH_test/l3bdrill1786014205
+analyze: gaps = 0 (continuous coverage of namespace)
+analyze: compactible_sequences (shrink_threshold=100000 expansion_limit=500000) = 0
+stat ('l3bdrill1786014205', 100, '')
+ranges [('', 'obj-00050', 10, '.shards_AUTH_test/l3bdrill1786014205-84392330115fb1b09727c4637a9522eb-1786016735.43640-0', 50), ('obj-00050', '', 10, '.shards_AUTH_test/l3bdrill1786014205-84392330115fb1b09727c4637a9522eb-1786016735.43640-1', 50), ('', '', 60, 'AUTH_test/l3bdrill1786014205', 0)]
+shard_like_dbs 0
+listed 100
+DONE

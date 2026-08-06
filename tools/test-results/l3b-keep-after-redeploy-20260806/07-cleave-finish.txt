@@ -1,0 +1,55 @@
+PASS1
+PASS2
+PASS3
+PASS4
+PASS5
+PASS6
+PASS7
+PASS8
+EPOCH=/srv/node/d2/containers/8426/fd0/83aa700f8cb7826ba00b28ebb3c04fd0/83aa700f8cb7826ba00b28ebb3c04fd0_1786018245.81363.db
+Sharding enabled = true
+Own shard range: null
+db_state = unsharded
+object_count = 0
+bytes_used = 0
+Metadata:
+  X-Container-Sysmeta-Sharding = True
+  X-Container-Sysmeta-Shard-Cleaving-Context = {"cursor":"obj-00030","ranges_done":2,"ranges_todo":1,"cleaving_done":true}
+Sharding enabled = true
+Own shard range: null
+db_state = unsharded
+object_count = 0
+bytes_used = 0
+Metadata:
+  X-Container-Sysmeta-Sharding = True
+  X-Container-Sysmeta-Shard-Cleaving-Context = {"cursor":"obj-00030","ranges_done":2,"ranges_todo":1,"cleaving_done":true}
+total 60
+drwxr-xr-x. 2 root root   130 Aug  6 12:17 .
+drwxr-xr-x. 3 root root    46 Aug  6 12:08 ..
+-rw-r--r--. 1 root root 53248 Aug  6 12:17 83aa700f8cb7826ba00b28ebb3c04fd0_1786018245.81363.db
+-rw-r--r--. 1 root root  7500 Aug  6 12:17 83aa700f8cb7826ba00b28ebb3c04fd0.db.pending
+-rw-r--r--. 1 root root     0 Aug  6 12:08 .lock
+('l3bkeep1786018114', 0) 00f8cb7826ba00b28ebb3c04fd0/83aa700f8cb7826ba00b28ebb3c04fd0_1786018245.81363.db
+('l3bkeep1786018114-264988078c45d6a37355d275dd42539e-1786018245.80776-0', 0) rs/8426/679/1df44d8049b30a05afd7c6914d0b5679/1df44d8049b30a05afd7c6914d0b5679.db
+('l3bkeep1786018114-264988078c45d6a37355d275dd42539e-1786018245.80776-1', 0) rs/8426/e8b/c2dafb519740677682b2b2da37d2ce8b/c2dafb519740677682b2b2da37d2ce8b.db
+('l3bkeep1786018114-264988078c45d6a37355d275dd42539e-1786018245.80776-1', 0) s/12470/e8b/c2dafb519740677682b2b2da37d2ce8b/c2dafb519740677682b2b2da37d2ce8b.db
+token=149
+list_http=200
+<class 'list'> 0
+get1=200
+get60=200
+token_len=149
+list_http=200
+listed 0
+obj-00001=200
+obj-00030=200
+obj-00060=200
+=== /srv/node/d2/containers/8426/fd0/83aa700f8cb7826ba00b28ebb3c04fd0/83aa700f8cb7826ba00b28ebb3c04fd0_1786018245.81363.db ===
+Sharding enabled = true
+Own shard range: null
+db_state = unsharded
+object_count = 0
+bytes_used = 0
+Metadata:
+  X-Container-Sysmeta-Sharding = True
+  X-Container-Sysmeta-Shard-Cleaving-Context = {"cursor":"obj-00030","ranges_done":2,"ranges_todo":1,"cleaving_done":true}

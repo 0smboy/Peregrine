@@ -1,0 +1,16 @@
+host=swift2
+usage: swift-manage-shard-ranges <container.db> <subcommand> [options]
+
+subcommands:
+find [shard_size] [min_shard_size]   Find ranges (JSON)
+show [--include-deleted] [--brief]  Print stored shard ranges
+info                                Print container db sharding info
+enable                              Enable sharding on own range
+delete --force                      Soft-delete all other shard ranges
+merge --force <ranges.json>         Merge ranges from JSON array file
+find_and_replace [shard_size] [--enable] [--force]
+Find, soft-delete old, inject new
+analyze                             Read-only shard state report
+compact [--force] [--shrink-threshold N] [--expansion-limit N]
+Find (and optionally apply) compactible sequences
+repair [--gaps] [--force]           Report/fix gaps or overlaps

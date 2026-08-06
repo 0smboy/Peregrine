@@ -181,7 +181,11 @@ Rust is a **strong core-path + lab-proven** Swift, **not** a drop-in “full Ope
 | L3b multi-node KEEP | **not claimed** |
 | Operator TLS PEM path (script) | **code GREEN**; Contabo **self-signed LAB** (probe 2026-08-06) |
 | container-sharder ×4 Contabo | **active** (status probe; KEEP not claimed) |
-| L3b drill 100-obj container | **PARTIAL** — API OK, DB on 3 nodes; CLI redeploy blocked enable (`l3b-keep-drill-20260806`) |
+| Linux redeploy L3b bins ×4 | **PASS** (`linux-redeploy-20260806`) |
+| L3b CLI enable + epoch DB | **PASS** after set_sharding_state fix |
+| L3b sharder cleave creates shard DBs | **PASS lab** (`l3bkeep…`, shard DBs present) |
+| L3b listing KEEP post-cleave | **FAIL** listed 0 while GET 200 (`l3b-keep-after-redeploy-20260806`) |
+| container-sync binary on Contabo | **deployed** (multi-cluster soak not run) |
 | container-sync Contabo | **not deployed** (binary absent) |
 | TLS Contabo dry-run | **LAB self-signed** (`tls-dry-run-20260806`) |
 | Operator TLS PEM live apply | **deferred** |

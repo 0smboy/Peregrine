@@ -1,0 +1,1 @@
+bin=50f4ca3969a0d7f54e75a37063ede02aed246bc1564a41b1af3591ba9ddd36be  /usr/local/bin/swift-container-sync

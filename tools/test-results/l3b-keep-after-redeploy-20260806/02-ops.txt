@@ -1,0 +1,84 @@
+host=swift2 bin=22d26ea8bb2c97976ce8f8d9b199aab98ff1f5792aee66228a4f9ce40d257766  /usr/local/bin/swift-manage-shard-ranges
+DB_OK
+Sharding enabled = false
+Own shard range: null
+db_state = unsharded
+object_count = 100
+bytes_used = 1000
+Metadata:
+EXIT_info=0
+[
+  {
+    "index": 0,
+    "lower": "",
+    "object_count": 50,
+    "upper": "obj-00050"
+  },
+  {
+    "index": 1,
+    "lower": "obj-00050",
+    "object_count": 50,
+    "upper": ""
+  }
+]
+Found 2 ranges (complete: true, total object count 100)
+EXIT_find=0
+No shard ranges found to delete.
+Injected 2 shard ranges.
+Run container-replicator to replicate them to other nodes.
+Container moved to state 'sharding' with epoch 1786016735.46399.
+Run container-sharder on all nodes to shard the container.
+EXIT_fr=0
+Sharding enabled = true
+Own shard range: null
+db_state = unsharded
+object_count = 100
+bytes_used = 1000
+Metadata:
+  X-Container-Sysmeta-Sharding = True
+EXIT_info2=0
+analyze: root_container = true
+analyze: db_state = unsharded
+analyze: sharding_enabled = true
+analyze: own_range = null
+analyze: shard_range_count = 3
+analyze: states = found=2 sharding=1
+analyze: total object_count = 100
+analyze: total row_count = 100
+analyze: overlapping_groups = 2
+  overlap[0]: .shards_AUTH_test/l3bdrill1786014205-84392330115fb1b09727c4637a9522eb-1786016735.43640-0, AUTH_test/l3bdrill1786014205
+  overlap[1]: .shards_AUTH_test/l3bdrill1786014205-84392330115fb1b09727c4637a9522eb-1786016735.43640-1, AUTH_test/l3bdrill1786014205
+analyze: gaps = 0 (continuous coverage of namespace)
+analyze: compactible_sequences (shrink_threshold=100000 expansion_limit=500000) = 0
+EXIT_an=0
+EXIT_sharder=124
+Sharding enabled = true
+Own shard range: null
+db_state = unsharded
+object_count = 100
+bytes_used = 1000
+Metadata:
+  X-Container-Sysmeta-Sharding = True
+stat ('AUTH_test', 'l3bdrill1786014205', 100, '')
+ranges 3
+('', 'obj-00050', 10, '.shards_AUTH_test/l3bdrill1786014205-84392330115fb1b09727c4637a9522eb-1786016735.43640-0', 50)
+('obj-00050', '', 10, '.shards_AUTH_test/l3bdrill1786014205-84392330115fb1b09727c4637a9522eb-1786016735.43640-1', 50)
+('', '', 60, 'AUTH_test/l3bdrill1786014205', 0)
+awk: cmd. line:1: tolower($1)==\"x-auth-token:\"{print $2}
+awk: cmd. line:1:              ^ backslash not last character on line
+awk: cmd. line:1: tolower($1)==\"x-auth-token:\"{print $2}
+awk: cmd. line:1:              ^ syntax error
+curl: (6) Could not resolve host: "
+HTTP/1.1 401 Unauthorized
+Www-Authenticate: Swift realm="AUTH_test"
+Content-Type: text/plain
+X-Trans-Id: tx92f5ddce6589034c054cc-006a74743b
+X-Openstack-Request-Id: tx92f5ddce6589034c054cc-006a74743b
+Content-Length: 16
+Connection: keep-alive
+
+401 UnauthorizedDONE
+  File "<string>", line 1
+    import json; d=json.load(open(\"/tmp/list.json\")); print(\"listed\", len(d) if isinstance(d,list) else d)
+                                   ^
+SyntaxError: unexpected character after line continuation character
