@@ -1823,10 +1823,16 @@ impl ObjectServer {
             .filter(|s| !s.is_empty())
             .collect();
         let partition = req.headers.get("X-Container-Partition").unwrap_or("");
+        // Sharded roots: proxy sets X-Backend-Container-Path to the owning
+        // shard's account/container so the update hits the shard DB, not the
+        // root (Python object-server container_update + Container-Path).
+        let (upd_account, upd_container) =
+            parse_backend_container_path(req.headers.get("X-Backend-Container-Path"))
+                .unwrap_or((account, container));
         let path = format!(
             "/{}/{}/{}",
-            percent_encode(account),
-            percent_encode(container),
+            percent_encode(upd_account),
+            percent_encode(upd_container),
             percent_encode(obj)
         );
         // A well-formed side channel gives matching host/device lists and a
@@ -2037,6 +2043,19 @@ impl ObjectServer {
             );
         }
     }
+}
+
+/// Parse `X-Backend-Container-Path` as `account/container` or `/account/container`.
+fn parse_backend_container_path(raw: Option<&str>) -> Option<(&str, &str)> {
+    let s = raw?.trim().trim_start_matches('/');
+    if s.is_empty() {
+        return None;
+    }
+    let (a, c) = s.split_once('/')?;
+    if a.is_empty() || c.is_empty() {
+        return None;
+    }
+    Some((a, c))
 }
 
 /// Fire one container-server update over a fresh TCP connection, honouring

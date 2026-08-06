@@ -2531,6 +2531,31 @@ impl ProxyApp {
             .unwrap_or(10000);
         let selected = select_listing_shard_ranges(&arr, &marker, &prefix);
         let mut shard_listings: Vec<Vec<serde_json::Value>> = Vec::new();
+        // Include residual root rows (misplaced / pre-redirect writes) when
+        // the root still reports object_count > 0 after cleave.
+        if object_count > 0 {
+            let mut root_headers = self.backend_headers(req, false, "container");
+            root_headers.set("X-Backend-Record-Type", "object");
+            let mut qs_parts = vec!["format=json".to_string()];
+            if !marker.is_empty() {
+                qs_parts.push(format!("marker={}", percent_encode(&marker)));
+            }
+            if !prefix.is_empty() {
+                qs_parts.push(format!("prefix={}", percent_encode(&prefix)));
+            }
+            qs_parts.push(format!("limit={limit}"));
+            if let Some(items) = self.fetch_shard_object_listing_first_nonempty(
+                &nodes,
+                part,
+                &path,
+                &qs_parts.join("&"),
+                &root_headers,
+            ) {
+                if !items.is_empty() {
+                    shard_listings.push(items);
+                }
+            }
+        }
         for sr in &selected {
             let name = sr.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let (shard_account, shard_container) = match name.split_once('/') {
@@ -2603,6 +2628,89 @@ impl ProxyApp {
             out.headers.set("X-Storage-Policy", name);
         }
         Some(out)
+    }
+
+    /// Resolve the container that should receive the object update for a
+    /// possibly-sharded root (Python `BaseObjectController._get_update_target`).
+    /// Returns `None` when the root is unsharded or no matching range exists.
+    fn resolve_updating_shard(
+        &self,
+        account: &str,
+        container: &str,
+        object: &str,
+    ) -> Option<(String, String)> {
+        let Ok((part, _)) = self.container_ring.get_nodes(account, Some(container), None) else {
+            return None;
+        };
+        let path = format!(
+            "/{}/{}",
+            percent_encode(account),
+            percent_encode(container)
+        );
+        let nodes = self.iter_nodes(&self.container_ring, part);
+        let head_headers = HeaderKeyDict::new();
+        let head = self.get_or_head(
+            "container",
+            nodes.clone(),
+            part,
+            "HEAD",
+            &path,
+            "",
+            &head_headers,
+        )?;
+        if !(200..300).contains(&head.status) {
+            return None;
+        }
+        let state = head
+            .headers
+            .get("X-Backend-Sharding-State")
+            .unwrap_or("unsharded")
+            .to_ascii_lowercase();
+        if state != "sharding" && state != "sharded" {
+            return None;
+        }
+        let mut shard_headers = HeaderKeyDict::new();
+        shard_headers.set("X-Backend-Record-Type", "shard");
+        // Prefer updating states (CREATED/CLEAVED/ACTIVE/SHARDING); fall back
+        // to listing states then any non-empty ranges.
+        let arr = self
+            .fetch_shard_ranges_first_nonempty(
+                &nodes,
+                part,
+                &path,
+                "states=updating&format=json",
+                &shard_headers,
+            )
+            .filter(|a| !a.is_empty())
+            .or_else(|| {
+                self.fetch_listing_shard_ranges(nodes, part, &path, &shard_headers)
+            })?;
+        // Pick the range that owns `object` (lower < name <= upper; empty bounds
+        // are open-ended). Prefer non-own (shard) names.
+        let mut best: Option<&serde_json::Value> = None;
+        for sr in &arr {
+            let name = sr.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if !name.contains('/') {
+                continue;
+            }
+            // Skip the root's own range (same account/container).
+            if name == format!("{account}/{container}") {
+                continue;
+            }
+            let lower = sr.get("lower").and_then(|v| v.as_str()).unwrap_or("");
+            let upper = sr.get("upper").and_then(|v| v.as_str()).unwrap_or("");
+            if !lower.is_empty() && object <= lower {
+                continue;
+            }
+            if !upper.is_empty() && object > upper {
+                continue;
+            }
+            best = Some(sr);
+            break;
+        }
+        let name = best?.get("name")?.as_str()?;
+        let (a, c) = name.split_once('/')?;
+        Some((a.to_string(), c.to_string()))
     }
 
     /// GET root container shard ranges for listing fan-out.
@@ -3015,9 +3123,17 @@ impl ProxyApp {
                         return r;
                     }
                 }
-                let Ok((container_part, _)) =
-                    self.container_ring.get_nodes(account, Some(container), None)
-                else {
+                // Container-update target: root by default; when the root is
+                // sharding/sharded, the owning updating-state shard range
+                // (Python `_get_update_target`).
+                let (upd_account, upd_container) = self
+                    .resolve_updating_shard(account, container, object)
+                    .unwrap_or_else(|| (account.to_string(), container.to_string()));
+                let Ok((container_part, _)) = self.container_ring.get_nodes(
+                    &upd_account,
+                    Some(&upd_container),
+                    None,
+                ) else {
                     return swob_response(503);
                 };
                 let container_nodes = self.iter_nodes(&self.container_ring, container_part);
@@ -3030,6 +3146,15 @@ impl ProxyApp {
                 base.set("X-Backend-Storage-Policy-Index", policy_index);
                 if req.method == "PUT" {
                     base.set("Content-Type", req.headers.get("Content-Type").unwrap_or("application/octet-stream"));
+                }
+                // Tell the object server which container DB to update (shard
+                // path differs from the client-visible account/container).
+                if upd_account != account || upd_container != container {
+                    base.set(
+                        "X-Backend-Container-Path",
+                        format!("{upd_account}/{upd_container}"),
+                    );
+                    base.set("X-Backend-Allow-Reserved-Names", "true");
                 }
                 let node_number = object_ring
                     .get_part_nodes(object_part)
@@ -4069,14 +4194,34 @@ pub(crate) fn select_listing_shard_ranges<'a>(
 }
 
 /// Merge per-shard object listing arrays, stopping at `limit`.
+/// Later sources overwrite same `name` (root residual then shards → shard wins).
 pub(crate) fn merge_sharded_object_listings(
     shard_listings: &[Vec<serde_json::Value>],
     limit: usize,
 ) -> Vec<serde_json::Value> {
-    let mut merged = Vec::new();
+    use std::collections::HashMap;
+    let mut by_name: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
     for items in shard_listings {
         for item in items {
-            merged.push(item.clone());
+            let name = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            if !by_name.contains_key(&name) {
+                order.push(name.clone());
+            }
+            by_name.insert(name, item.clone());
+        }
+    }
+    let mut merged = Vec::new();
+    for name in order {
+        if let Some(item) = by_name.remove(&name) {
+            merged.push(item);
             if merged.len() >= limit {
                 return merged;
             }

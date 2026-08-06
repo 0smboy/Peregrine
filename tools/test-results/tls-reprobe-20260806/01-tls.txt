@@ -1,0 +1,37 @@
+=== TLS re-probe Thu Aug  6 14:00:32 UTC 2026 ===
+--- swift1 ---
+subject=CN=10.0.0.10, O=Contabo-LAB, OU=Peregrine
+issuer=CN=10.0.0.10, O=Contabo-LAB, OU=Peregrine
+notBefore=Aug  5 09:51:47 2026 GMT
+notAfter=Nov  7 09:51:47 2028 GMT
+active
+    bind *:8085 ssl crt /etc/haproxy/haproxyCA.pem
+    bind *:35357 ssl crt /etc/haproxy/haproxyCA.pem
+    bind *:5000 ssl crt /etc/haproxy/haproxyCA.pem
+--- swift2 ---
+subject=CN=10.0.0.10, O=Contabo-LAB, OU=Peregrine
+issuer=CN=10.0.0.10, O=Contabo-LAB, OU=Peregrine
+notBefore=Aug  5 09:51:47 2026 GMT
+notAfter=Nov  7 09:51:47 2028 GMT
+active
+    bind *:8085 ssl crt /etc/haproxy/haproxyCA.pem
+    bind *:35357 ssl crt /etc/haproxy/haproxyCA.pem
+    bind *:5000 ssl crt /etc/haproxy/haproxyCA.pem
+--- swift3 ---
+subject=CN=10.0.0.10, O=Contabo-LAB, OU=Peregrine
+issuer=CN=10.0.0.10, O=Contabo-LAB, OU=Peregrine
+notBefore=Aug  5 09:51:47 2026 GMT
+notAfter=Nov  7 09:51:47 2028 GMT
+active
+    bind *:8085 ssl crt /etc/haproxy/haproxyCA.pem
+    bind *:35357 ssl crt /etc/haproxy/haproxyCA.pem
+    bind *:5000 ssl crt /etc/haproxy/haproxyCA.pem
+--- swift4 ---
+subject=CN=10.0.0.10, O=Contabo-LAB, OU=Peregrine
+issuer=CN=10.0.0.10, O=Contabo-LAB, OU=Peregrine
+notBefore=Aug  5 09:51:47 2026 GMT
+notAfter=Nov  7 09:51:47 2028 GMT
+active
+    bind *:8085 ssl crt /etc/haproxy/haproxyCA.pem
+    bind *:35357 ssl crt /etc/haproxy/haproxyCA.pem
+    bind *:5000 ssl crt /etc/haproxy/haproxyCA.pem

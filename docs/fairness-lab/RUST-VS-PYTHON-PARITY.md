@@ -184,7 +184,7 @@ Rust is a **strong core-path + lab-proven** Swift, **not** a drop-in “full Ope
 | Linux redeploy L3b bins ×4 | **PASS** (`linux-redeploy-20260806`) |
 | L3b CLI enable + epoch DB | **PASS** after set_sharding_state fix |
 | L3b sharder cleave creates shard DBs | **PASS lab** (`l3bkeep…`, shard DBs present) |
-| L3b listing KEEP post-cleave | **LAB CLEAN PASS** listed 60 no relocate (`l3b-clean-e2e-20260806`); prior relocate path `l3b-keep-retest-20260806`; FAIL listed 0 in `l3b-keep-after-redeploy-20260806` |
+| L3b listing KEEP post-cleave | **LAB CLEAN PASS** listed 60 no relocate (`l3b-clean-e2e-20260806`); post-shard 4KB PUT→list via shard update route (`l3b-4kb-keep-20260806`); product 4KB KEEP **not claimed** |
 | container-sync binary on Contabo | **deployed** (multi-cluster soak not run) |
 | container-sync Contabo | **not deployed** (binary absent) |
 | TLS Contabo dry-run | **LAB self-signed** (`tls-dry-run-20260806`) |

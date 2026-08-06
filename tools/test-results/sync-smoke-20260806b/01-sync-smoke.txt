@@ -1,0 +1,14 @@
+SRC=syncsrc1786024828 DST=syncdst1786024828
+src=201
+dst=201
+post_src=204
+post_dst=204
+src_count=5
+=== sync once ===
+SYNC_EXIT=0
+dst_count=0
+dst_listed 0
+[]
+HTTP/1.1 204 No Content
+X-Container-Object-Count: 5
+DONE_SYNC
