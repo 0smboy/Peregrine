@@ -1333,7 +1333,7 @@ fn spawn_ring_reload_thread(
 
 /// Render the `GET /info` capabilities document, reporting ONLY what this proxy
 /// actually serves. Advertise a filter capability only when it is in the
-/// configured pipeline (and wired). `bulk_upload` stays omitted (wontfix).
+/// configured pipeline (and wired). `bulk_upload` is advertised when `bulk` is on.
 fn build_info_json(
     swift_conf: &SwiftConfig,
     conf: &SwiftConfig,
@@ -1417,11 +1417,13 @@ fn build_info_json(
             .flatten()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(1000);
-        // bulk_upload intentionally omitted — extract-archive not implemented.
+        let bulk = build_bulk(conf);
         info["bulk_delete"] = serde_json::json!({
             "max_deletes_per_request": max_deletes,
             "max_failed_deletes": max_failed,
         });
+        // extract-archive is implemented (tar / tar.gz / tar.bz2).
+        info["bulk_upload"] = bulk.upload_info_dict();
     }
     if configured_pipeline_has(conf, "tempurl") {
         let no_keys: Arc<dyn swift_middleware::KeyProvider> = Arc::new(
@@ -2100,7 +2102,10 @@ mod startup_policy_tests {
         let v: serde_json::Value = serde_json::from_str(&info).unwrap();
         assert_eq!(v["tempauth"]["account_acls"], true);
         assert_eq!(v["bulk_delete"]["max_deletes_per_request"], 100);
-        assert!(v.get("bulk_upload").is_none(), "must not advertise upload");
+        assert!(
+            v.get("bulk_upload").is_some(),
+            "extract-archive is implemented; must advertise bulk_upload"
+        );
         assert!(v.get("formpost").is_none());
     }
 
@@ -2159,6 +2164,7 @@ mod startup_policy_tests {
             v["versioned_writes"]["allowed_flags"],
             serde_json::json!(["x-versions-location", "x-history-location"])
         );
+        // bulk not in this pipeline → no bulk_upload
         assert!(v.get("bulk_upload").is_none());
     }
 

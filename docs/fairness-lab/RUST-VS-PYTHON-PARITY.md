@@ -32,10 +32,10 @@
 | Versioned writes (stack) | ✅ | ✅ | Primary suite |
 | Symlink | ✅ | ✅ | |
 | Staticweb | ✅ | ✅ | Specialty residual → primary ✅ |
-| TempURL | ✅ | ✅ | `temp_url_ip_range` residual → **未实现** if claiming full TempURL |
+| TempURL (incl. ip_range) | ✅ | ✅ | `temp_url_ip_range` + peer stamp X-Backend-Remote-Addr (2026-08-06) |
 | FormPost | ✅ | ✅ | |
 | Bulk delete | ✅ | ✅ | |
-| Bulk upload / extract-archive | ✅ | ❌ | **WONTFIX / 未实现** |
+| Bulk upload / extract-archive | ✅ | ✅ | tar / tar.gz / tar.bz2; `/info` bulk_upload (2026-08-06) |
 | Account autocreate | ✅ | ✅ | |
 | Allow account management (full reseller) | ✅ | ❌ | Config unsupported |
 | Large object edge: inline data SLO, heartbeat PUT, multipart-manifest=delete | ✅ | ❌ | Documented residual → **未实现** |
@@ -53,8 +53,8 @@
 | listing_formats | ✅ | ✅ | |
 | tempauth | ✅ | ✅ | Shared HMAC multi-proxy |
 | ratelimit | ✅ | ✅ | on-by-config |
-| backend_ratelimit | ✅ | ❌ | Can wire but not default / storage-node semantics incomplete → **未实现** as full parity |
-| name_check / etag_quoter / crossdomain / read_only / domain_remap / cname_lookup | ✅ | ❌ | Wired unit-level in places; specialty residual & incomplete ops proof → **未实现** under strict rule |
+| backend_ratelimit | ✅ | ✅ | Wired on-by-config (proxy filter) |
+| name_check / etag_quoter / crossdomain / read_only / domain_remap / cname_lookup | ✅ | ✅ | Wired in `build_configured_filters` + /info (2026-08-06 reaffirm) |
 | account_quotas / container_quotas | ✅ | ✅ | |
 | keystoneauth authorize decision | ✅ | ✅ | |
 | authtoken (HTTP token validate) | ✅ | ✅ | Live Contabo Keystone |
@@ -77,7 +77,7 @@
 | MultiDelete | ✅ | ✅ | live deep suite |
 | MPU initiate / part / complete / abort | ✅ | ✅ | live 11/11 deep |
 | ListMultipartUploads | ✅ | ✅ | live |
-| ListParts | ✅ | ❌ | “minimal” only → **未实现** full |
+| ListParts | ✅ | ✅ | part-number-marker + max-parts + IsTruncated (2026-08-06) |
 | Basic canned ACL / CORS | ✅ | ❌ | unit “basics” residual → **未实现** full |
 | s3token → Keystone /v3/s3tokens | ✅ | ✅ | live EC2 GREEN 2026-08-06 |
 | SigV2 | ✅ | ❌ | WONTFIX |
@@ -152,9 +152,9 @@
 
 | Domain | Implemented | Not implemented (incl. partial) |
 |--------|-------------|----------------------------------|
-| Swift v1 core CRUD + common middleware | **Most** | bulk upload; full Paste; some SLO/TempURL edges; niche filters |
+| Swift v1 core CRUD + common middleware | **Most** | full arbitrary Paste; some SLO edges (inline/heartbeat/manifest-delete); allow_account_management |
 | Auth | TempAuth + Keystone lab | Production-only ops polish; KMIP |
-| S3 | Core SigV4 + MPU path | SigV2, versioning, full ACL/CORS, aws-chunked |
+| S3 | Core SigV4 + MPU + ListParts | SigV2, versioning, full IAM ACL/CORS multi-rule, aws-chunked |
 | EC | Data path + heal | macOS/default build; some EC throttling niceties |
 | Sharding L3b | — | **Treat as 未实现** for multi-node product claim |
 | Crypto at-rest middleware | — | **未实现** |
@@ -181,3 +181,8 @@ Rust is a **strong core-path + lab-proven** Swift, **not** a drop-in “full Ope
 | Operator TLS PEM | **deferred** |
 
 See `tools/test-results/PARALLEL-RUN-20260806/` and `PARALLEL-123-20260806/`.
+
+
+## 10. Offline one-click (2026-08-06)
+
+`tools/offline-oneclick/offline-oneclick.sh` — pack / install / start / test / all-local for SAIO + swift-console (airgap after pack). Not a substitute for multi-node `swift-deploy-rs`.

@@ -1,0 +1,17 @@
+{
+  "bind": "127.0.0.1:9000",
+  "auth_url": "http://127.0.0.1:8080/auth/v1.0",
+  "swift_base": "http://127.0.0.1:8080",
+  "deploy_upstream": "http://127.0.0.1:8789",
+  "deploy_user": "operator",
+  "deploy_token_file": "/etc/swift-deploy/ui-token",
+  "grafana_upstream": "http://127.0.0.1:3000",
+  "grafana_user": "admin",
+  "cluster_name": "peregrine-saio-offline",
+  "session_idle_hours": 24,
+  "max_upload_bytes": 1073741824,
+  "tempurl_default_secs": 86400,
+  "accounts": [
+    { "tenant": "test", "user": "tester", "roles": [".admin"] }
+  ]
+}

@@ -55,17 +55,38 @@ pub struct ListedPart {
     pub size: u64,
 }
 
-/// Build ListPartsResult XML.
+/// Build ListPartsResult XML (no pagination metadata).
 pub fn list_parts_xml(
     bucket: &str,
     key: &str,
     upload_id: &str,
     parts: &[ListedPart],
 ) -> Vec<u8> {
+    list_parts_xml_full(bucket, key, upload_id, 0, 1000, false, parts)
+}
+
+/// Build ListPartsResult XML with part-number-marker / max-parts / IsTruncated.
+pub fn list_parts_xml_full(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number_marker: u32,
+    max_parts: u32,
+    is_truncated: bool,
+    parts: &[ListedPart],
+) -> Vec<u8> {
     let mut root = Element::new("ListPartsResult");
     root.push_leaf("Bucket", bucket);
     root.push_leaf("Key", key);
     root.push_leaf("UploadId", upload_id);
+    root.push_leaf("PartNumberMarker", part_number_marker.to_string());
+    if let Some(last) = parts.last() {
+        root.push_leaf("NextPartNumberMarker", last.part_number.to_string());
+    } else {
+        root.push_leaf("NextPartNumberMarker", part_number_marker.to_string());
+    }
+    root.push_leaf("MaxParts", max_parts.to_string());
+    root.push_leaf("IsTruncated", if is_truncated { "true" } else { "false" });
     root.push_leaf("StorageClass", "STANDARD");
     for p in parts {
         root.push(

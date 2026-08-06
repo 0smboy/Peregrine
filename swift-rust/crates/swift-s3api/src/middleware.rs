@@ -52,7 +52,7 @@ use crate::acl_cors::{
 };
 use crate::delete::parse_multi_delete_body;
 use crate::mpu::{
-    complete_multipart_xml, initiate_response, list_multipart_uploads_xml, list_parts_xml,
+    complete_multipart_xml, initiate_response, list_multipart_uploads_xml, list_parts_xml_full,
     new_upload_id, parse_complete_body, parse_upload_marker_name, part_object_name,
     segments_container, slo_manifest_json, upload_marker_name, ListedPart, ListedUpload,
 };
@@ -819,7 +819,7 @@ impl Middleware for S3Api {
                     return handle_mpu_abort(&cred, &b, &k, &uid, &next);
                 }
                 if req.method == "GET" {
-                    return handle_mpu_list_parts(&cred, &b, &k, &uid, &next);
+                    return handle_mpu_list_parts(&cred, &b, &k, &uid, &params, &next);
                 }
             }
         }
@@ -1297,8 +1297,23 @@ fn handle_mpu_list_parts(
     bucket: &str,
     key: &str,
     upload_id: &str,
+    params: &[(String, String)],
     next: &NextFn,
 ) -> Response {
+    // part-number-marker + max-parts (S3 ListParts query params).
+    let param = |name: &str| -> Option<&str> {
+        params
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    };
+    let part_marker = param("part-number-marker")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0);
+    let max_parts = param("max-parts")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(1000)
+        .clamp(1, 1000);
     let segs = segments_container(bucket);
     let prefix = format!("{key}/{upload_id}/");
     let mut list =
@@ -1327,6 +1342,9 @@ fn handle_mpu_list_parts(
             let Ok(num) = num_str.parse::<u32>() else {
                 continue;
             };
+            if num <= part_marker {
+                continue;
+            }
             let etag = item
                 .get("hash")
                 .and_then(|v| v.as_str())
@@ -1345,7 +1363,23 @@ fn handle_mpu_list_parts(
             });
         }
     }
-    xml_response(200, list_parts_xml(bucket, key, upload_id, &parts))
+    parts.sort_by_key(|p| p.part_number);
+    let truncated = parts.len() as u32 > max_parts;
+    if truncated {
+        parts.truncate(max_parts as usize);
+    }
+    xml_response(
+        200,
+        list_parts_xml_full(
+            bucket,
+            key,
+            upload_id,
+            part_marker,
+            max_parts,
+            truncated,
+            &parts,
+        ),
+    )
 }
 
 /// Build credentials from TempAuth-style `user_<account>_<user> = <key> …`

@@ -33,8 +33,8 @@ Canonical long form in-repo:
 | Account / container / object CRUD | yes | yes |
 | Range, conditionals, COPY, expiry | yes | yes |
 | SLO / DLO (main path) | yes | yes |
-| TempURL / FormPost / bulk **delete** | yes | yes |
-| Bulk **upload** / extract-archive | yes | **no** |
+| TempURL (incl. ip_range) / FormPost / bulk **delete** | yes | yes |
+| Bulk **upload** / extract-archive (tar/tar.gz/tar.bz2) | yes | yes |
 | Full arbitrary Paste pipeline | yes | **no** |
 
 ## Middleware
@@ -43,20 +43,21 @@ Canonical long form in-repo:
 |--------|:------:|:----:|
 | catch_errors, gatekeeper, healthcheck, proxy_logging, cache, listing_formats | yes | yes |
 | tempauth, copy, slo, dlo, quotas, versioned_writes, symlink, staticweb, ratelimit | yes | yes |
+| name_check, etag_quoter, crossdomain, read_only, domain_remap, cname_lookup, backend_ratelimit | yes | yes (on-by-config) |
 | keystoneauth + authtoken (lab Keystone) | yes | yes |
-| s3api + s3token (core path) | yes | yes |
+| s3api + s3token (core path) + ListParts | yes | yes |
 | container-sync filter + daemon | yes | **no** |
-| encrypter / decrypter / keymaster | yes | **no** |
-| niche filters / full specialty residual | yes | **no** (strict) |
+| encrypter / decrypter / keymaster middleware | yes | **no** (crypto lib only) |
+| Full arbitrary / unknown Paste filter names | yes | **no** |
 
 ## S3
 
 | Capability | Python | Rust |
 |------------|:------:|:----:|
-| SigV4 CRUD, List v1/v2, MultiDelete, MPU path, ListMPU | yes | yes (lab) |
+| SigV4 CRUD, List v1/v2, MultiDelete, MPU path, ListMPU, ListParts | yes | yes (lab) |
 | s3token / EC2 → Keystone | yes | yes (lab) |
 | SigV2, aws-chunked, versioning/tagging/lifecycle | yes | **no** (wontfix) |
-| Full IAM ACL / CORS fidelity | yes | **no** |
+| Full IAM ACL / multi-rule CORS | yes | **no** (canned private/public-read only) |
 
 ## EC & consistency
 
@@ -74,6 +75,16 @@ Canonical long form in-repo:
 - S3 MPU deep **11/11**; EC2 SigV4 **green**
 - VIP failover **pass**; EC heal fragment restore **pass** after fix
 - Operator TLS PEM **deferred** → not production go-live
+
+## Offline one-click (SAIO + console)
+
+```sh
+./tools/offline-oneclick/offline-oneclick.sh all-local --console
+```
+
+Airgap: `pack` → copy tarball → `install` → `start` → `test`. See
+`tools/offline-oneclick/README.md`. Multi-node production still uses
+`swift-deploy-rs`.
 
 ## How to use this matrix
 

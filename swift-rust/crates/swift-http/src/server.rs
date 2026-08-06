@@ -768,6 +768,11 @@ fn handle_connection(
     config: &ServerConfig,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true).ok();
+    // REMOTE_ADDR equivalent for middleware (TempURL ip_range, logging).
+    let peer_ip = stream
+        .peer_addr()
+        .ok()
+        .map(|a| a.ip().to_string());
     let timeout = socket_timeout(config);
     stream.set_read_timeout(timeout)?;
     stream.set_write_timeout(timeout)?;
@@ -850,11 +855,19 @@ fn handle_connection(
             Body::empty()
         };
 
+        let mut headers = head.headers;
+        // Unspoofable peer: only set if client did not already supply a
+        // backend-stamped address (proxies may set X-Forwarded-For later).
+        if let Some(ref ip) = peer_ip {
+            if !headers.contains_key("X-Backend-Remote-Addr") {
+                headers.set("X-Backend-Remote-Addr", ip);
+            }
+        }
         let request = Request {
             method: head.method,
             path: unquote(&head.raw_path),
             query_string: head.query_string,
-            headers: head.headers,
+            headers,
             body,
         };
 

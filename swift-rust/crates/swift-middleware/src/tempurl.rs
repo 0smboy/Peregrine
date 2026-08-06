@@ -43,9 +43,12 @@
 //! `REMOTE_USER`). Account-vs-container key *scope* is not tracked: the
 //! [`KeyProvider`] returns a flat key list.
 //!
-//! Deferrals (documented; none block P1a wire + /info accuracy):
-//!   - `temp_url_ip_range`: needs `REMOTE_ADDR` (not on `Request`).
-//!   - `logger.increment('tempurl.digests.*')` metrics.
+//! `temp_url_ip_range` is supported: client address is taken from
+//! `X-Backend-Remote-Addr` (stamped by the HTTP server from the TCP peer),
+//! then `X-Forwarded-For` / `X-Real-IP`. The HMAC body becomes
+//! `ip={range}\n{method}\n{expires}\n{path}` (Python `get_hmac`).
+//!
+//! Deferrals: `logger.increment('tempurl.digests.*')` metrics.
 //!
 //! Wiring: the proxy supplies a [`KeyProvider`] that HEADs account/container
 //! metadata for `Temp-URL-Key[-2]`. `/info` advertising is done by the proxy
@@ -362,6 +365,7 @@ impl Middleware for TempUrl {
         let raw_expires = first("temp_url_expires");
         let prefix = first("temp_url_prefix");
         let filename = first("filename");
+        let ip_range = first("temp_url_ip_range");
         let inline = params.iter().any(|(k, _)| k == "inline");
 
         let expires = normalize_temp_url_expires(raw_expires.as_deref(), now_epoch());
@@ -399,6 +403,18 @@ impl Middleware for TempUrl {
                 None => return self.invalid(&req.method),
             };
 
+        // --- ip range gate (Python: REMOTE_ADDR ∈ temp_url_ip_range) ---
+        if let Some(ref range) = ip_range {
+            let client = client_remote_addr(&req);
+            if !client
+                .as_deref()
+                .map(|c| ip_in_range(c, range))
+                .unwrap_or(false)
+            {
+                return self.invalid(&req.method);
+            }
+        }
+
         // --- fetch keys and build the signed message path ---
         let keys = self.key_provider.keys_for(&account, &container);
         if keys.is_empty() {
@@ -422,7 +438,10 @@ impl Middleware for TempUrl {
         };
         let mut is_valid = false;
         'search: for m in &candidate_methods {
-            let message = format!("{m}\n{expires}\n{path}");
+            let message = match &ip_range {
+                Some(r) => format!("ip={r}\n{m}\n{expires}\n{path}"),
+                None => format!("{m}\n{expires}\n{path}"),
+            };
             for key in &keys {
                 if let Some(candidate) = hmac_hex(&algo, key.as_bytes(), message.as_bytes()) {
                     if streq_const_time(&sig_hex, &candidate) {
@@ -449,6 +468,9 @@ impl Middleware for TempUrl {
                 raw_expires_string(&params),
             ),
         ];
+        if let Some(r) = &ip_range {
+            qs_pairs.push(("temp_url_ip_range".to_string(), r.clone()));
+        }
         if let Some(pfx) = &prefix {
             qs_pairs.push(("temp_url_prefix".to_string(), pfx.clone()));
         }
@@ -686,6 +708,85 @@ fn b64_value(c: u8) -> Option<u8> {
         b'/' => Some(63),
         _ => None,
     }
+}
+
+/// Client IP for TempURL range checks (Python `REMOTE_ADDR`).
+fn client_remote_addr(req: &Request) -> Option<String> {
+    if let Some(v) = req.headers.get("X-Backend-Remote-Addr") {
+        let t = v.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    if let Some(v) = req.headers.get("X-Forwarded-For") {
+        // First hop is the original client.
+        if let Some(first) = v.split(',').next() {
+            let t = first.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    if let Some(v) = req.headers.get("X-Real-IP") {
+        let t = v.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    None
+}
+
+/// IPv4 address/CIDR membership (Python `ipaddress.ip_network`).
+fn ip_in_range(client: &str, range: &str) -> bool {
+    let client = client.trim();
+    let range = range.trim();
+    if range.is_empty() {
+        return false;
+    }
+    // Exact host match (also covers single-IP "network").
+    if !range.contains('/') {
+        return client == range;
+    }
+    let Some((net_s, pref_s)) = range.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = pref_s.parse::<u32>() else {
+        return false;
+    };
+    if prefix > 32 {
+        return false;
+    }
+    let Some(client_u) = parse_ipv4(client) else {
+        return false;
+    };
+    let Some(net_u) = parse_ipv4(net_s.trim()) else {
+        return false;
+    };
+    if prefix == 0 {
+        return true;
+    }
+    let mask = u32::MAX << (32 - prefix);
+    (client_u & mask) == (net_u & mask)
+}
+
+fn parse_ipv4(s: &str) -> Option<u32> {
+    let mut parts = [0u32; 4];
+    let mut i = 0;
+    for p in s.split('.') {
+        if i >= 4 {
+            return None;
+        }
+        let n: u32 = p.parse().ok()?;
+        if n > 255 {
+            return None;
+        }
+        parts[i] = n;
+        i += 1;
+    }
+    if i != 4 {
+        return None;
+    }
+    Some((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3])
 }
 
 /// HMAC-`algo` of `msg` under `key`, hex-encoded; `None` for an unsupported
@@ -1748,5 +1849,54 @@ mod tests {
         assert_eq!(basename("/v1/a/c/o".trim_end_matches('/')), "o");
         assert_eq!(basename("/v1/a/c/".trim_end_matches('/')), "c");
         assert_eq!(basename("solo"), "solo");
+    }
+
+    #[test]
+    fn test_ip_in_range_ipv4() {
+        assert!(ip_in_range("1.2.3.4", "1.2.3.4"));
+        assert!(!ip_in_range("1.2.3.5", "1.2.3.4"));
+        assert!(ip_in_range("1.2.3.50", "1.2.3.0/24"));
+        assert!(!ip_in_range("1.2.4.1", "1.2.3.0/24"));
+        assert!(ip_in_range("10.0.0.1", "0.0.0.0/0"));
+    }
+
+    #[test]
+    fn test_temp_url_ip_range_accepts_matching_client() {
+        let tu = tempurl(&[KEY]);
+        let message = format!("ip=1.2.3.0/24\nGET\n{EXPIRES}\n/v1/AUTH_account/container/object");
+        let sig = hmac_hex("sha256", KEY.as_bytes(), message.as_bytes()).unwrap();
+        let q = format!(
+            "temp_url_sig={sig}&temp_url_expires={EXPIRES}&temp_url_ip_range=1.2.3.0/24"
+        );
+        let resp = run(
+            &tu,
+            mk(
+                "GET",
+                "/v1/AUTH_account/container/object",
+                &q,
+                &[("X-Backend-Remote-Addr", "1.2.3.9")],
+            ),
+        );
+        assert_eq!(resp.status, 200, "body={:?}", body_bytes(&resp));
+    }
+
+    #[test]
+    fn test_temp_url_ip_range_rejects_outside() {
+        let tu = tempurl(&[KEY]);
+        let message = format!("ip=1.2.3.0/24\nGET\n{EXPIRES}\n/v1/AUTH_account/container/object");
+        let sig = hmac_hex("sha256", KEY.as_bytes(), message.as_bytes()).unwrap();
+        let q = format!(
+            "temp_url_sig={sig}&temp_url_expires={EXPIRES}&temp_url_ip_range=1.2.3.0/24"
+        );
+        let resp = run(
+            &tu,
+            mk(
+                "GET",
+                "/v1/AUTH_account/container/object",
+                &q,
+                &[("X-Backend-Remote-Addr", "9.9.9.9")],
+            ),
+        );
+        assert_eq!(resp.status, 401);
     }
 }
