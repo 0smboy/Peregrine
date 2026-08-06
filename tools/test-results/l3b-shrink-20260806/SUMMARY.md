@@ -1,22 +1,18 @@
-# Sharder shrink + sharded HEAD count (2026-08-06)
+# Sharder shrink KEEP (2026-08-06)
 
-## Code (unit KEEP)
-- `process_shrinking_donors`: move donor objects → covering ACTIVE acceptor,
-  mark donor **SHRUNK** + deleted (timestamp-bumped merge).
-- Only runs when the **donor shard DB already exists** on the local device
-  (no auto-create empty DB → no false SHRUNK on multi-primary).
-- Unit: `test_process_shrinking_donors_moves_objects_and_marks_shrunk` PASS.
+## Unit
+- `process_shrinking_donors` moves objects, marks SHRUNK (timestamp-bumped merge)
+- Skip when donor DB not local (no false SHRUNK)
 
-## Proxy HEAD count
-- `patch_sharded_head_counts`: for sharded/sharding HEAD, sum live object
-  counts from listing-state shard containers (skip SHRUNK).
-- Lab `l3bclean`: HEAD was stale 80; after patch HEAD=60 (shard sum).
-  List JSON len=80 (fan-out still includes residual root rows).
-  GET post-shard keys still 200 (k4b-wave2-01 size=4096).
+## Contabo lab KEEP (`02-shrinklab-KEEP.txt`)
+- Container `shrinklab1786029572`: 20 objects, 2 local shards
+- CLEAVED → ACTIVE → compact SHRINKING → sharder shrink
+- Donor **SHRUNK** live=0; acceptor live=20
+- Client HEAD count=20, list=20, GET 20/20
 
-## Live Contabo residual
-- Early deploy briefly auto-created empty local donor DBs and marked SHRUNK
-  without local data (fixed by open_existing). Root range table now shows
-  single ACTIVE acceptor on the replica that ran shrink.
-- Full multi-node shrink KEEP (quorum + all primaries) **not claimed**.
-- HEAD count still may lag list when root residual rows are listed.
+## Proxy HEAD counts
+- `patch_sharded_head_counts` sums shard HEADs for sharded roots
+
+## Not claimed
+- Multi-primary shrink when donor/acceptor on different nodes (needs remote move / replicate)
+- PRODUCTION-GO-LIVE

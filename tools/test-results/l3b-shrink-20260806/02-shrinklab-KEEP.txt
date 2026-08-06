@@ -1,0 +1,19 @@
+=== Contabo shrinklab KEEP 2026-08-06 ===
+Container: AUTH_test/shrinklab1786029572 (20 objects)
+Node: swift1 (donor+acceptor shard DBs both local)
+
+Pipeline:
+1. find_and_replace 10 --enable --force → 2 CLEAVED ranges
+2. sharder once → cleave done, 2 shard DBs live=10 each
+3. activate_cleaved --force → ACTIVE
+4. compact --force → donor SHRINKING, acceptor expanded full NS
+5. sharder once → process_shrinking_donors:
+   - donor live 10 → 0, state SHRUNK deleted=1
+   - acceptor live 10 → 20, object_count=20
+
+Client:
+- HEAD Object-Count: 20  Bytes: 120
+- listed=20 (obj01..obj20)
+- get_ok=20 get_fail=0
+
+RESULT=LAB KEEP full shrink object migration + SHRUNK + listing/GET intact

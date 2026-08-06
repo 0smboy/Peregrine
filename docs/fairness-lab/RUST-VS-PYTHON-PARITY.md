@@ -189,7 +189,7 @@ Rust is a **strong core-path + lab-proven** Swift, **not** a drop-in “full Ope
 | L3b listing KEEP post-cleave | **LAB CLEAN PASS** listed 60 no relocate (`l3b-clean-e2e-20260806`); post-shard 4KB PUT→list via shard update route (`l3b-4kb-keep-20260806`); wave2 30×4KB put_fail=0 list+GET (`l3b-4kb-wave2-20260806`); product long soak **not claimed** |
 | container-sync Contabo same-cluster | **KEEP** puts=28 fails=0 dst 5/5 GET (`sync-smoke-20260806d`); multi-cluster soak not run |
 | compact / activate_cleaved | CLI + unit; lab CLEAVED→ACTIVE→SHRINKING mark (`l3b-compact-20260806`) |
-| sharder shrink + HEAD counts | unit PASS object move+SHRUNK; Contabo HEAD sum + list residual (`l3b-shrink-20260806`); multi-node shrink KEEP residual |
+| sharder shrink + HEAD counts | **LAB KEEP** shrinklab 20→SHRUNK+acceptor 20 + GET 20/20 (`l3b-shrink-20260806`); multi-primary remote shrink residual |
 | TLS Contabo dry-run | **LAB self-signed** (`tls-dry-run-20260806`) |
 | Operator TLS PEM live apply | **deferred** |
 
