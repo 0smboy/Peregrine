@@ -1347,6 +1347,11 @@ impl ProxyApp {
                         "x-container-write",
                         "x-versions-location",
                         "content-type",
+                        // container-sync destination + shared key (Python
+                        // transfer_headers special-cases these; without them
+                        // POST Sync-To returns 204 but metadata stays empty).
+                        "x-container-sync-to",
+                        "x-container-sync-key",
                     ]
                     .contains(&kl.as_str())
                 {
@@ -2925,6 +2930,41 @@ impl ProxyApp {
                     resp.headers
                         .set("Content-Type", "text/plain; charset=UTF-8");
                     return Some(resp);
+                }
+            }
+        }
+
+        // Legacy container-sync (Python tempauth/keystoneauth): if the
+        // destination container's sync_key matches X-Container-Sync-Key and
+        // the request carries a timestamp, allow without a user token.
+        // Gatekeeper shunts client `X-Timestamp` → `X-Backend-Inbound-X-Timestamp`
+        // before we run, so accept either form (realm middleware restores too).
+        if let Some(c) = container {
+            if let Some(req_key) = req.headers.get("x-container-sync-key") {
+                let has_ts = req.headers.get("x-timestamp").is_some()
+                    || req
+                        .headers
+                        .get("x-backend-inbound-x-timestamp")
+                        .is_some();
+                if !req_key.is_empty() && has_ts {
+                    let info = self.container_info(account, c);
+                    if let Some(sk) = info.sync_key.as_deref() {
+                        if !sk.is_empty() && sk == req_key {
+                            // Restore timestamp for object servers (Python
+                            // container_sync / obj controller expectation).
+                            if req.headers.get("x-timestamp").is_none() {
+                                if let Some(ts) =
+                                    req.headers.get("x-backend-inbound-x-timestamp")
+                                {
+                                    let ts = ts.to_string();
+                                    req.headers.remove("X-Backend-Inbound-X-Timestamp");
+                                    req.headers.set("X-Timestamp", ts);
+                                }
+                            }
+                            req.headers.remove("X-Backend-Swift-Owner");
+                            return None;
+                        }
+                    }
                 }
             }
         }
@@ -4649,6 +4689,61 @@ mod p1a_wiring_tests {
             .authorize(&mut req, "AUTH_test", Some("container"), Some("object"))
             .is_none());
         assert!(req.headers.get("X-Backend-Swift-Owner").is_none());
+    }
+
+    #[test]
+    fn authorize_legacy_sync_key_allows_without_token() {
+        // Seed container info cache with a sync_key (no backend HEAD).
+        let app = app(true);
+        let info = ContainerInfo {
+            status: 204,
+            policy_index: 0,
+            read_acl: None,
+            write_acl: None,
+            temp_url_keys: Vec::new(),
+            sync_key: Some("lab-sync-key".into()),
+        };
+        app.info_cache
+            .set_container("AUTH_test/syncc".into(), info, 60.0);
+
+        // Gatekeeper-shunted timestamp form (production path).
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Container-Sync-Key", "lab-sync-key");
+        headers.set("X-Backend-Inbound-X-Timestamp", "1786026000.00000");
+        let mut req = Request {
+            method: "PUT".to_string(),
+            path: "/v1/AUTH_test/syncc/obj1".to_string(),
+            query_string: String::new(),
+            headers,
+            body: swift_http::Body::empty(),
+        };
+        assert!(
+            app.authorize(&mut req, "AUTH_test", Some("syncc"), Some("obj1"))
+                .is_none(),
+            "matching sync-key + inbound-x-timestamp must authorize"
+        );
+        assert_eq!(
+            req.headers.get("X-Timestamp").map(str::to_string),
+            Some("1786026000.00000".into()),
+            "must restore X-Timestamp for object servers"
+        );
+
+        // Wrong key → still denied (401/403 from ACL path with empty groups).
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Container-Sync-Key", "wrong");
+        headers.set("X-Backend-Inbound-X-Timestamp", "1786026000.00000");
+        let mut req = Request {
+            method: "PUT".to_string(),
+            path: "/v1/AUTH_test/syncc/obj1".to_string(),
+            query_string: String::new(),
+            headers,
+            body: swift_http::Body::empty(),
+        };
+        assert!(
+            app.authorize(&mut req, "AUTH_test", Some("syncc"), Some("obj1"))
+                .is_some(),
+            "mismatched sync-key must not authorize"
+        );
     }
 
     #[test]

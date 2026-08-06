@@ -1,0 +1,24 @@
+token_len=149
+=== 4KB burst 50 ===
+put_fail=0
+listed 140
+burst 50
+k4b 10
+GET_burst25=200 size=4096
+=== SYNC syncb1786025596 -> syncbdst1786025596 ===
+post_src=204
+post_dst=204
+=== HEAD src meta ===
+HTTP/1.1 204 No Content
+X-Container-Object-Count: 0
+X-Container-Sync-To: http://127.0.0.1:8080/v1/AUTH_test/syncbdst1786025596
+X-Container-Sync-Key: key1786025596
+META /srv/node/d2/containers/2858/719/2caac3945c54480b8bfc938eb39af719/2caac3945c54480b8bfc938eb39af719.db md_len 165 md_preview {"X-Container-Sync-To": ["http://127.0.0.1:8080/v1/AUTH_test/syncbdst1786025596", "1786025597.18570"], "X-Container-Sync-Key": ["key1786025596", "1786025597.18570"]}
+META /srv/node/d2/sync_containers/2858/719/2caac3945c54480b8bfc938eb39af719/2caac3945c54480b8bfc938eb39af719.db md_len 165 md_preview {"X-Container-Sync-To": ["http://127.0.0.1:8080/v1/AUTH_test/syncbdst1786025596", "1786025597.18570"], "X-Container-Sync-Key": ["key1786025596", "1786025597.18570"]}
+=== sync_containers ===
+/srv/node/d2/sync_containers/4018/72c/3ec98e42c91a7ae9a2f559287d31e72c/3ec98e42c91a7ae9a2f559287d31e72c.db
+/srv/node/d2/sync_containers/2858/719/2caac3945c54480b8bfc938eb39af719/2caac3945c54480b8bfc938eb39af719.db
+SYNC_EXIT=0
+dst_count=0
+[]
+ALL_DONE

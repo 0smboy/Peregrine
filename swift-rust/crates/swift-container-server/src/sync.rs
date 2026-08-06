@@ -845,11 +845,33 @@ impl SyncClient for HttpSyncClient {
                     return false;
                 };
                 let ts = row.ts_meta();
+                // Strip hop-by-hop / framing headers from the proxy GET.
+                // Forwarding Transfer-Encoding / Content-Length (we recompute
+                // CL from body) makes the remote PUT fail with 4xx/5xx and
+                // every row lands as a sync failure.
                 let mut extra: Vec<(String, String)> = obj_headers
                     .into_iter()
                     .filter(|(k, _)| {
                         let l = k.to_ascii_lowercase();
-                        l != "date" && l != "last-modified" && l != "x-timestamp"
+                        !matches!(
+                            l.as_str(),
+                            "date"
+                                | "last-modified"
+                                | "x-timestamp"
+                                | "transfer-encoding"
+                                | "content-length"
+                                | "connection"
+                                | "keep-alive"
+                                | "proxy-connection"
+                                | "te"
+                                | "trailer"
+                                | "upgrade"
+                                | "server"
+                                | "www-authenticate"
+                                | "x-trans-id"
+                                | "x-openstack-request-id"
+                                | "accept-ranges"
+                        )
                     })
                     .collect();
                 if !extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("etag"))

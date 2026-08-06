@@ -47,9 +47,60 @@ fn parse_conf_file(path: &str) -> SwiftConfig {
 }
 
 /// GET objects through the local proxy (InternalClient stand-in).
+///
+/// Lab TempAuth clusters require `X-Auth-Token` on proxy GETs (unauth → 401).
+/// Credentials come from `[container-sync] internal_client_auth_user/key` or a
+/// static `internal_client_auth_token`. Python's InternalClient uses a private
+/// pipeline (often no auth); we approximate with TempAuth token refresh.
 struct ProxyObjectSource {
     base: String,
+    /// e.g. `http://127.0.0.1:8080/auth/v1.0` — empty if token is static.
+    auth_url: String,
+    auth_user: String,
+    auth_key: String,
+    /// Cached token (Mutex so ObjectSource stays Sync via interior mutability).
+    token: std::sync::Mutex<Option<String>>,
     timeout: std::time::Duration,
+}
+
+impl ProxyObjectSource {
+    fn ensure_token(&self) -> Option<String> {
+        {
+            let guard = self.token.lock().ok()?;
+            if let Some(t) = guard.as_ref() {
+                if !t.is_empty() {
+                    return Some(t.clone());
+                }
+            }
+        }
+        if self.auth_user.is_empty() || self.auth_key.is_empty() || self.auth_url.is_empty() {
+            return None;
+        }
+        // TempAuth: GET auth_url with X-Auth-User / X-Auth-Key → X-Auth-Token
+        let headers = vec![
+            ("X-Auth-User".into(), self.auth_user.clone()),
+            ("X-Auth-Key".into(), self.auth_key.clone()),
+            ("Connection".into(), "close".into()),
+        ];
+        let (status, resp_headers, _) = http_exchange("GET", &self.auth_url, &headers, &[], self.timeout)?;
+        if !(200..300).contains(&status) {
+            return None;
+        }
+        let tok = resp_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("X-Auth-Token") || k.eq_ignore_ascii_case("X-Storage-Token"))
+            .map(|(_, v)| v.clone())?;
+        if let Ok(mut guard) = self.token.lock() {
+            *guard = Some(tok.clone());
+        }
+        Some(tok)
+    }
+
+    fn invalidate_token(&self) {
+        if let Ok(mut guard) = self.token.lock() {
+            *guard = None;
+        }
+    }
 }
 
 impl ObjectSource for ProxyObjectSource {
@@ -67,13 +118,32 @@ impl ObjectSource for ProxyObjectSource {
             pe(container),
             pe(name)
         );
-        // Prefer replication-style newest GET headers the proxy understands.
-        let headers = vec![
+        let mut headers = vec![
             ("X-Newest".into(), "True".into()),
             ("Connection".into(), "close".into()),
         ];
+        if let Some(tok) = self.ensure_token() {
+            headers.push(("X-Auth-Token".into(), tok));
+        }
         let (status, resp_headers, body) =
-            http_get(&url, &headers, self.timeout)?;
+            http_exchange("GET", &url, &headers, &[], self.timeout)?;
+        // One retry on 401 with a fresh token (expired / first static miss).
+        if status == 401 && !self.auth_user.is_empty() {
+            self.invalidate_token();
+            let mut headers = vec![
+                ("X-Newest".into(), "True".into()),
+                ("Connection".into(), "close".into()),
+            ];
+            if let Some(tok) = self.ensure_token() {
+                headers.push(("X-Auth-Token".into(), tok));
+            }
+            let (status, resp_headers, body) =
+                http_exchange("GET", &url, &headers, &[], self.timeout)?;
+            if !(200..300).contains(&status) {
+                return None;
+            }
+            return Some((resp_headers, body));
+        }
         if !(200..300).contains(&status) {
             return None;
         }
@@ -94,9 +164,12 @@ fn pe(s: &str) -> String {
     out
 }
 
-fn http_get(
+/// HTTP/1.1 request; returns (status, headers, body). HTTP only (lab proxy).
+fn http_exchange(
+    method: &str,
     url: &str,
     headers: &[(String, String)],
+    body: &[u8],
     timeout: std::time::Duration,
 ) -> Option<(u16, Vec<(String, String)>, Vec<u8>)> {
     use std::io::{Read, Write};
@@ -112,10 +185,16 @@ fn http_get(
     } else {
         (hostport, 80u16)
     };
-    let mut req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n"
-    );
+    // Omit Content-Length on empty GET/HEAD — some front-ends mishandle
+    // `GET … Content-Length: 0` and TempAuth token headers never appear.
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n");
+    if !body.is_empty() || matches!(method, "PUT" | "POST" | "PATCH") {
+        req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
     for (k, v) in headers {
+        if k.eq_ignore_ascii_case("Connection") || k.eq_ignore_ascii_case("Content-Length") {
+            continue;
+        }
         req.push_str(&format!("{k}: {v}\r\n"));
     }
     req.push_str("\r\n");
@@ -123,12 +202,28 @@ fn http_get(
     let _ = conn.set_read_timeout(Some(timeout));
     let _ = conn.set_write_timeout(Some(timeout));
     conn.write_all(req.as_bytes()).ok()?;
+    if !body.is_empty() {
+        conn.write_all(body).ok()?;
+    }
+    // Read until end-of-headers. Do NOT read_to_end: HAProxy/proxy often
+    // answers with Connection: keep-alive, so EOF never arrives and the
+    // TempAuth token headers are truncated mid-line under a short timeout.
     let mut buf = Vec::new();
-    let _ = conn.read_to_end(&mut buf);
+    let mut tmp = [0u8; 8192];
     let mut headers_end = None;
-    for i in 0..buf.len().saturating_sub(3) {
-        if &buf[i..i + 4] == b"\r\n\r\n" {
-            headers_end = Some(i);
+    while headers_end.is_none() {
+        let n = conn.read(&mut tmp).ok()?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        for i in 0..buf.len().saturating_sub(3) {
+            if &buf[i..i + 4] == b"\r\n\r\n" {
+                headers_end = Some(i);
+                break;
+            }
+        }
+        if buf.len() > 1024 * 1024 {
             break;
         }
     }
@@ -143,12 +238,86 @@ fn http_get(
         .ok()?;
     let mut resp_headers = Vec::new();
     for line in head.lines().skip(1) {
+        let line = line.trim_end_matches('\r');
         if let Some((k, v)) = line.split_once(':') {
             resp_headers.push((k.trim().to_string(), v.trim().to_string()));
         }
     }
-    let body = buf[end + 4..].to_vec();
+    let te_chunked = resp_headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("Transfer-Encoding") && v.to_ascii_lowercase().contains("chunked")
+    });
+    let content_len = resp_headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
+        .and_then(|(_, v)| v.parse::<usize>().ok());
+
+    // Finish body: Content-Length exact, or chunked until 0-chunk, or
+    // whatever already buffered when neither is present.
+    let mut body_buf = buf[end + 4..].to_vec();
+    if let Some(cl) = content_len {
+        while body_buf.len() < cl {
+            let n = conn.read(&mut tmp).ok()?;
+            if n == 0 {
+                break;
+            }
+            body_buf.extend_from_slice(&tmp[..n]);
+        }
+        body_buf.truncate(cl);
+    } else if te_chunked {
+        // Read until dechunk succeeds or stream ends.
+        loop {
+            if dechunk(&body_buf).is_some() {
+                break;
+            }
+            let n = match conn.read(&mut tmp) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            body_buf.extend_from_slice(&tmp[..n]);
+            if body_buf.len() > 64 * 1024 * 1024 {
+                break;
+            }
+        }
+    }
+
+    let body = if te_chunked {
+        dechunk(&body_buf).unwrap_or(body_buf)
+    } else {
+        body_buf
+    };
     Some((status, resp_headers, body))
+}
+
+/// Decode HTTP/1.1 chunked body; returns None if the framing is corrupt.
+fn dechunk(raw: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < raw.len() {
+        let line_end = raw[i..].iter().position(|&b| b == b'\n')? + i;
+        let hex = std::str::from_utf8(&raw[i..line_end])
+            .ok()?
+            .trim()
+            .trim_end_matches('\r')
+            .split(';')
+            .next()?;
+        let size = usize::from_str_radix(hex, 16).ok()?;
+        i = line_end + 1;
+        if size == 0 {
+            break;
+        }
+        if i + size > raw.len() {
+            return None;
+        }
+        out.extend_from_slice(&raw[i..i + size]);
+        i += size;
+        // trailing CRLF
+        if i + 1 < raw.len() && &raw[i..i + 2] == b"\r\n" {
+            i += 2;
+        } else if i < raw.len() && raw[i] == b'\n' {
+            i += 1;
+        }
+    }
+    Some(out)
 }
 
 fn main() {
@@ -187,6 +356,16 @@ fn main() {
         "internal_client_url",
         "http://127.0.0.1:8080/v1",
     );
+    // TempAuth (or static token) so proxy GETs succeed — unauth → 401 and
+    // PUT bodies never leave the node.
+    let auth_url = get(
+        "container-sync",
+        "internal_client_auth_url",
+        "http://127.0.0.1:8080/auth/v1.0",
+    );
+    let auth_user = get("container-sync", "internal_client_auth_user", "");
+    let auth_key = get("container-sync", "internal_client_auth_key", "");
+    let auth_token = get("container-sync", "internal_client_auth_token", "");
 
     let swift_conf_path =
         std::env::var("SWIFT_CONF").unwrap_or_else(|_| format!("{swift_dir}/swift.conf"));
@@ -211,8 +390,23 @@ fn main() {
     let object_source: Box<dyn ObjectSource> = if internal_url.is_empty() {
         Box::new(EmptyObjectSource)
     } else {
+        let initial = if auth_token.is_empty() {
+            None
+        } else {
+            Some(auth_token.clone())
+        };
+        if auth_user.is_empty() && initial.is_none() {
+            logger.warning(
+                "internal_client_url set but no internal_client_auth_user/key or \
+                 internal_client_auth_token — object GET will 401 under TempAuth",
+            );
+        }
         Box::new(ProxyObjectSource {
             base: internal_url.clone(),
+            auth_url: auth_url.clone(),
+            auth_user: auth_user.clone(),
+            auth_key: auth_key.clone(),
+            token: std::sync::Mutex::new(initial),
             timeout: std::time::Duration::from_secs_f64(cfg.conn_timeout.max(0.1)),
         })
     };

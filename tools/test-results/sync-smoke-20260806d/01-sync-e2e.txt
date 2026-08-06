@@ -1,0 +1,24 @@
+=== KEEP proof 2026-08-06T14:41:09Z ===
+proxy=005e740025077858f00234b530cce502  /usr/local/bin/swift-proxy-server
+sync=e933bed453ee2b40af2665a15b6608f3  /usr/local/bin/swift-container-sync
+HTTP/1.1 204 No Content
+X-Container-Object-Count: 5
+X-Container-Sync-To: http://127.0.0.1:8080/v1/AUTH_test/synclivedst1786027144
+X-Container-Sync-Key: key1786027144
+HTTP/1.1 204 No Content
+X-Container-Object-Count: 5
+X-Container-Sync-Key: key1786027144
+=== LIST dst ===
+obj1
+obj2
+obj3
+obj4
+obj5
+
+obj1 code=200 body=payload-1
+obj2 code=200 body=payload-2
+obj3 code=200 body=payload-3
+obj4 code=200 body=payload-4
+obj5 code=200 body=payload-5
+recon puts 28 fails 0 syncs 7
+RESULT=KEEP dst_count=5 put_fail=0

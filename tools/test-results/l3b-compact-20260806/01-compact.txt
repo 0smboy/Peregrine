@@ -1,0 +1,69 @@
+=== l3bclean db_state=sharded compact path ===
+Sharding enabled = true
+Own shard range: {
+  "bytes_used": 0,
+  "deleted": 0,
+  "epoch": "1786024284.59133",
+  "lower": "",
+  "meta_timestamp": "1786024495.82565",
+  "name": "AUTH_test/l3bclean1786024121",
+  "object_count": 0,
+  "reported": 0,
+  "state": 70,
+  "state_text": "sharded",
+  "state_timestamp": "1786024495.82565",
+  "timestamp": "1786024284.59466",
+  "tombstones": -1,
+  "upper": ""
+}
+db_state = sharded
+object_count = 80
+bytes_used = 82331
+Metadata:
+  X-Container-Sysmeta-Sharding = True
+  X-Container-Sysmeta-Shard-Cleaving-Context = {"cursor":"obj-00030","ranges_done":2,"ranges_todo":1,"cleaving_done":true}
+=== show full ===
+Existing shard ranges:
+[
+  {
+    "bytes_used": 0,
+    "deleted": 0,
+    "epoch": null,
+    "lower": "",
+    "meta_timestamp": "1786024284.57675",
+    "name": ".shards_AUTH_test/l3bclean1786024121-815a38031d52721fb04aab88c265a2d2-1786024284.57675-0",
+    "object_count": 30,
+    "reported": 0,
+    "state": 30,
+    "state_text": "cleaved",
+    "state_timestamp": "1786024284.57675",
+    "timestamp": "1786024284.57675",
+    "tombstones": -1,
+    "upper": "obj-00030"
+  },
+  {
+    "bytes_used": 0,
+    "deleted": 0,
+    "epoch": null,
+    "lower": "obj-00030",
+    "meta_timestamp": "1786024284.57675",
+    "name": ".shards_AUTH_test/l3bclean1786024121-815a38031d52721fb04aab88c265a2d2-1786024284.57675-1",
+    "object_count": 30,
+    "reported": 0,
+    "state": 30,
+    "state_text": "cleaved",
+    "state_timestamp": "1786024284.57675",
+    "timestamp": "1786024284.57675",
+    "tombstones": -1,
+    "upper": ""
+  }
+]
+=== compact dry threshold=100 ===
+No shards identified for compaction.
+=== l3bretest after dual-db cleanup db_state=sharded ===
+Sharding enabled = true
+  "object_count": 0,
+  "state_text": "sharded",
+db_state = sharding
+object_count = 0
+  X-Container-Sysmeta-Sharding = True
