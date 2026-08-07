@@ -1,0 +1,5 @@
+=== audit bundle-rust ===
+compatible=true task_files=20 tasks=101 modules=14 fingerprint=c0989055cdd23d754329a760b87a334656a0d660f5f87be9697ac73c82fc34e6
+
+=== audit bundle-monitoring ===
+compatible=true task_files=4 tasks=19 modules=6 fingerprint=11ca26d18b10f8c4ef9cd3afc5fc5f44480b57db98c0390426bc63895c07ff10

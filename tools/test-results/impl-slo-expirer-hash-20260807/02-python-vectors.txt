@@ -1,0 +1,21 @@
+Python ExpirerConfig.get_expirer_container known vectors (suffix=changeme)
+formula: day_bucket - (int(hash_path(a,c,o),16)%100)
+
+delete_at=1782000000 AUTH_test/c/o
+  hash_path=7363996f2cfb95eaa18df19ccc31aece
+  shard=38 cont=1781999962
+delete_at=1782000000 AUTH_test/c/other
+  hash_path=1bdea0dc9899ee384b19a6a6409cb392
+  shard=90 cont=1781999910
+delete_at=86400 a/c/o
+  hash_path=2f714cd91b0e5d803cde2012b01d7099
+  shard=37 cont=0000086363
+delete_at=1751500000 a/c/o
+  hash_path=2f714cd91b0e5d803cde2012b01d7099
+  shard=37 cont=1751414363
+delete_at=1751500000 AUTH_test/deltest/man-all-there
+  hash_path=d298ed55520c284f204b09ff626da2b3
+  shard=71 cont=1751414329
+delete_at=0 AUTH_test/c/o
+  hash_path=7363996f2cfb95eaa18df19ccc31aece
+  shard=38 cont=0000000000

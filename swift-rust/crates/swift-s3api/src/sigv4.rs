@@ -21,11 +21,14 @@
 //! verifies a client-presented signature (header auth and presigned-URL
 //! query auth).
 //!
-//! What is NOT here: SigV2 and aws-chunked streaming/trailer signature chains
-//! are intentionally **not** verified here — the gateway rejects them with a
-//! stable S3 `501 NotImplemented` (WONTFIX unless reopened; see
-//! `middleware`). Also deferred: clock-skew/expiry checks, and the
-//! Date-header-only timestamp fallback (only `X-Amz-Date` is read).
+//! aws-chunked body framing is decoded in [`crate::aws_chunked`] (middleware
+//! dechunks PUT/POST). Optional per-chunk HMAC verification lives there as a
+//! residual; this module only handles the **header** SigV4 signature (where
+//! `X-Amz-Content-SHA256` is the literal `STREAMING-*` token).
+//!
+//! What is NOT here: SigV2 (middleware returns stable `501 NotImplemented`).
+//! Also deferred: clock-skew/expiry checks, and the Date-header-only
+//! timestamp fallback (only `X-Amz-Date` is read).
 
 use crate::crypto::{hmac_sha256, hmac_sha256_hex, sha256_hex, streq_const_time};
 use swift_http::{parse_query, HeaderKeyDict, Request};

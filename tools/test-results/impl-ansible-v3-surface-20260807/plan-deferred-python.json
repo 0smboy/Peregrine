@@ -1,0 +1,155 @@
+{
+  "schema_version": 2,
+  "bundle_fingerprint": "c0989055cdd23d754329a760b87a334656a0d660f5f87be9697ac73c82fc34e6",
+  "inventory_fingerprint": "89464e280c8381afe88e523f98d42f284c466f298ebad80f463a59450b92c3ea",
+  "playbook": "deferred-python.yml",
+  "hosts": [
+    "10.0.0.11",
+    "10.0.0.12"
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "source": "roles/python_only_identity/tasks/main.yml#1",
+      "role": "python_only_identity",
+      "name": "refuse Keystone/MariaDB install via bundle-rust",
+      "host_pattern": "keystones",
+      "hosts": [],
+      "module": "fail",
+      "args": {
+        "msg": "bundle-rust does not provision MariaDB or Keystone. Use Python bundle/roles/mariadb_servers, keystone_install, keystones (or install_mariadb_keystone.yml) with config_contabo_identity, then enable identity_* 对接 flags on the rust stack. See roles/python_only_identity/README.md and docs/fairness-lab/KEYSTONE-LIVE.md."
+      },
+      "vars": {},
+      "when": [
+        "include_python_keystone_install | default(false)"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 2,
+      "source": "roles/python_only_identity/tasks/main.yml#1",
+      "role": "python_only_identity",
+      "name": "refuse Keystone/MariaDB install via bundle-rust",
+      "host_pattern": "mariadb_servers",
+      "hosts": [],
+      "module": "fail",
+      "args": {
+        "msg": "bundle-rust does not provision MariaDB or Keystone. Use Python bundle/roles/mariadb_servers, keystone_install, keystones (or install_mariadb_keystone.yml) with config_contabo_identity, then enable identity_* 对接 flags on the rust stack. See roles/python_only_identity/README.md and docs/fairness-lab/KEYSTONE-LIVE.md."
+      },
+      "vars": {},
+      "when": [
+        "include_python_keystone_install | default(false)"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 3,
+      "source": "roles/python_only_format_disks/tasks/main.yml#1",
+      "role": "python_only_format_disks",
+      "name": "refuse format_disks via bundle-rust (dual-guard)",
+      "host_pattern": "format_disk_servers",
+      "hosts": [],
+      "module": "fail",
+      "args": {
+        "msg": "bundle-rust never formats or wipes disks. Use out-of-band mounts + expand.yml, or Python bundle/roles/format_disks with an explicit ticket and --allow-disk-wipe on a non-rust plan. See docs/fairness-lab/ANSIBLE-V3-SURFACE.md and roles/python_only_format_disks/README.md."
+      },
+      "vars": {},
+      "when": [
+        "include_python_format_disks | default(false)"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 4,
+      "source": "roles/python_only_platform/tasks/main.yml#1",
+      "role": "python_only_platform",
+      "name": "refuse platform hardening roles via bundle-rust",
+      "host_pattern": "all",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "fail",
+      "args": {
+        "msg": "chrony / performance_tuning / security / system_tuning are Python-only. Use bundle/roles/* with a dedicated inventory or playbook; do not expect them from stack=rust. See roles/python_only_platform/README.md."
+      },
+      "vars": {},
+      "when": [
+        "include_python_platform | default(false)"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 5,
+      "source": "roles/python_only_extras/tasks/main.yml#1",
+      "role": "python_only_extras",
+      "name": "refuse cosbench/docker/proxyfs via bundle-rust",
+      "host_pattern": "all",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "fail",
+      "args": {
+        "msg": "docker / cosbench / proxyfs / dedicated new_ring plays are not part of bundle-rust. See roles/python_only_extras/README.md and docs/fairness-lab/ANSIBLE-V3-SURFACE.md."
+      },
+      "vars": {},
+      "when": [
+        "include_python_extras | default(false)"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    }
+  ],
+  "handlers": [],
+  "digest": "ecddcf0cae03083788ade0601244d4a080965cfbc451c1ac476a0c9a945545be"
+}

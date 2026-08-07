@@ -1,0 +1,83 @@
+=== bundle-rust playbooks ===
+-rw-r--r--@ 1 oboy  staff  2306 Aug  7 12:53 /Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/deferred-python.yml
+-rw-r--r--@ 1 oboy  staff  1424 Aug  7 12:53 /Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/expand.yml
+-rw-r--r--@ 1 oboy  staff  1464 Aug  7 12:53 /Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/identity.yml
+-rw-r--r--@ 1 oboy  staff  1141 Aug  7 12:53 /Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/monitoring.yml
+-rw-r--r--@ 1 oboy  staff  2767 Aug  7 12:53 /Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/swift.yml
+
+=== bundle-rust roles ===
+monitoring_overlay_path
+python_only_extras
+python_only_format_disks
+python_only_identity
+python_only_platform
+rust_common
+rust_config
+rust_disks
+rust_expand_mode
+rust_haproxy
+rust_identity_bridge
+rust_keepalived
+rust_payload
+rust_replication_key
+rust_rings
+rust_systemd
+rust_verify
+
+=== python bundle roles ===
+check
+chrony
+common
+cosbench
+docker
+example_structure
+finalize_installation
+format_disks
+format_new_disks
+haproxy_servers
+keepalived_servers
+keystone_install
+keystones
+mariadb_servers
+new_ring
+performance_tuning
+proxyfs
+ring_builder
+ring_utils
+security
+storage_nodes_common
+swift_account
+swift_container
+swift_object
+swift_proxy
+system_tuning
+
+=== bundle-monitoring roles ===
+mon_config
+mon_payload
+mon_systemd
+
+=== playbook tags ===
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-monitoring/swift.yml:17:  tags: [monitoring, mon_agents, mon_payload, mon_config, mon_systemd]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/identity.yml:20:  tags: [identity, identity_proxy, config]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/identity.yml:29:  tags: [identity, identity_haproxy, haproxy, lb]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/identity.yml:35:  tags: [identity]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/swift.yml:32:  tags: [common, payload]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/swift.yml:38:  tags: [disks, replication]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/swift.yml:44:  tags: [config, rings, systemd]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/swift.yml:51:  tags: [haproxy, lb]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/swift.yml:57:  tags: [keepalived, lb]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/swift.yml:66:  tags: [identity]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/swift.yml:76:  tags: [verify]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/deferred-python.yml:24:  tags: [deferred, python_only, keystone_install]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/deferred-python.yml:30:  tags: [deferred, python_only, mariadb_servers]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/deferred-python.yml:39:  tags: [deferred, python_only, format_disks]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/deferred-python.yml:46:  tags: [deferred, python_only, platform]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/deferred-python.yml:53:  tags: [deferred, python_only, extras]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/expand.yml:21:  tags: [expand]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/expand.yml:26:  tags: [expand, disks, replication]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/expand.yml:32:  tags: [expand, rings]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/expand.yml:37:  tags: [expand, haproxy, lb]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/expand.yml:43:  tags: [expand, keepalived, lb]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/expand.yml:49:  tags: [expand, verify]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/monitoring.yml:23:  tags: [monitoring, mon_agents]

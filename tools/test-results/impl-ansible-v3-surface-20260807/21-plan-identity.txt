@@ -1,0 +1,7 @@
+=== plan identity.yml ===
+plan=/Users/oboy/Downloads/Peregrine/tools/test-results/impl-ansible-v3-surface-20260807/plan-identity.json digest=71b0f9db309002fb7deaa221280df1e1b01d5bf964d56b54e331c2e9711403f8 hosts=2 tasks=22 risks=[HostReconfigure]
+tasks=22 hosts=2
+risk_counts= {'host_reconfigure': 3}
+disk_wipe_tasks=0
+roles= {'rust_config': 5, 'rust_haproxy': 14, 'rust_identity_bridge': 3}
+tasks_with_when=22

@@ -167,7 +167,7 @@ fn main() {
     // Large objects: reassemble SLO (X-Static-Large-Object) and DLO
     // (X-Object-Manifest) manifests on GET/HEAD. Below copy so their segment
     // subrequests are ACL-checked (they carry the authenticated identity).
-    filters.push(Arc::new(swift_middleware::Slo::new()));
+    filters.push(Arc::new(swift_middleware::Slo::with_hash_config(hash_config.clone())));
     filters.push(Arc::new(swift_middleware::DynamicLargeObject::new()));
     if let Err(e) = swift_proxy_server::serve_with_filters(listener, app, filters) {
         eprintln!("server error: {e}");

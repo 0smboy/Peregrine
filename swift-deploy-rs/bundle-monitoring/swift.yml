@@ -8,8 +8,13 @@
 # rust workspace emits; `storage_nodes` is the children group of
 # account/container/object servers, which on the target clusters covers
 # every node.
+#
+# Tags: monitoring, mon_agents, mon_payload, mon_config, mon_systemd
+# Companion pointer playbook under bundle-rust: monitoring.yml
+# Dual-guard: never format disks / wipe /srv/node.
 
 - hosts: storage_nodes
+  tags: [monitoring, mon_agents, mon_payload, mon_config, mon_systemd]
   roles:
     - mon_payload
     - mon_config

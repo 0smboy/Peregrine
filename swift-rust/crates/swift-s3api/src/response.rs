@@ -83,11 +83,20 @@ pub fn error_status_and_message(code: &str) -> (u16, &'static str) {
         "MissingContentLength" => (411, "You must provide the Content-Length HTTP header."),
         "NoSuchBucket" => (404, "The specified bucket does not exist."),
         "NoSuchKey" => (404, "The specified key does not exist."),
+        "NoSuchLifecycleConfiguration" => (
+            404,
+            "The lifecycle configuration does not exist.",
+        ),
+        "NoSuchTagSet" => (404, "The TagSet does not exist."),
         "NoSuchUpload" => (
             404,
             "The specified multipart upload does not exist. The upload ID might be invalid, or the multipart upload might have been aborted or completed.",
         ),
         "NoSuchVersion" => (404, "The specified version does not exist."),
+        "ObjectLockConfigurationNotFoundError" => (
+            404,
+            "Object Lock configuration does not exist for this bucket.",
+        ),
         "NotImplemented" => (501, "A header you provided implies functionality that is not implemented."),
         "PermanentRedirect" => (
             301,

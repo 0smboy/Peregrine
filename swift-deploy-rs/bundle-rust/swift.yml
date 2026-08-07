@@ -1,37 +1,78 @@
 ---
-# swift-deploy-rs "rust" stack playbook.
+# swift-deploy-rs "rust" stack playbook (greenfield).
 #
-# Deploys the Rust-version OpenStack Swift (tempauth, replication + optional
-# EC policy). Plays are roles-only: the planner reads `hosts:` + `roles:`.
-# Conditional roles use role-level `when:` (play-level keys other than
-# hosts/roles are not interpreted by the executor's planner).
+# Deploys the Rust-version OpenStack Swift (tempauth default; replication +
+# optional EC policy). Plays are roles-only: the planner reads `hosts:` +
+# `roles:`. Conditional roles use role-level `when:` (play-level keys other
+# than hosts/roles are not interpreted by the executor's planner).
+#
+# Companion playbooks / overlays (invoke separately — not inlined):
+#   expand.yml                         P3-ops add-disk / add-node (ring_expand)
+#   identity.yml                       optional Identity 对接 re-assert / re-render
+#   monitoring.yml                     docs + tags → sibling bundle-monitoring
+#   deferred-python.yml                Python-only paths with explicit when: (never default)
+#   ../bundle-monitoring/swift.yml     mon agents (node_exporter / statsd / Alloy)
+#   tools/ops/apply-vip-tls-pem.sh     operator TLS PEM on VIP (explicit --ssh)
+#
+# TLS: set lb_mode=https (+ haproxy_tls_pem_src or haproxy_tls_self_signed).
+# Keepalived: inventory keepalived_servers + use_lb (workspace ingress.mode).
+# Identity 对接 (no Keystone *install*): identity_* flags / auth_method keystone*
+#   — see IDENTITY.md, docs/fairness-lab/KEYSTONE-LIVE.md, ANSIBLE-V3-SURFACE.md.
+#
+# Dual-guard: never wipe /srv/node. rust_disks is mkdir-only; workspace rejects
+# node.disks for stack=rust. Contabo format requires ticket + Python path.
+#
+# Tags (documentation / real-Ansible operators; deploy-rs does not filter tags):
+#   common, payload, disks, config, rings, systemd, haproxy, keepalived,
+#   identity, verify
+#
+# Full role matrix: docs/fairness-lab/ANSIBLE-V3-SURFACE.md
 
 - hosts: all
+  tags: [common, payload]
   roles:
     - rust_common
     - rust_payload
 
 - hosts: storage_nodes
+  tags: [disks, replication]
   roles:
     - rust_disks
     - rust_replication_key
 
 - hosts: all
+  tags: [config, rings, systemd]
   roles:
     - rust_config
     - rust_rings
     - rust_systemd
 
 - hosts: haproxy_servers
+  tags: [haproxy, lb]
   roles:
     - role: rust_haproxy
       when: use_lb
 
 - hosts: keepalived_servers
+  tags: [keepalived, lb]
   roles:
     - role: rust_keepalived
       when: use_lb
 
+# Optional Identity 对接 marker only — never installs MariaDB/Keystone.
+# Triggers when operator enabled identity listeners/filters or keystone auth.
+# Provisioning stays on Python bundle/config_contabo_identity.
+- hosts: all
+  tags: [identity]
+  roles:
+    - role: rust_identity_bridge
+      when: >
+        identity_haproxy_enabled | default(false)
+        or identity_proxy_enabled | default(false)
+        or (auth_method | default('tempauth')) == 'keystone'
+        or (auth_method | default('tempauth')) == 'keystone_coexist'
+
 - hosts: proxy_servers
+  tags: [verify]
   roles:
     - rust_verify

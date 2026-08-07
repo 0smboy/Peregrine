@@ -1,0 +1,9 @@
+---
+# Fail-closed if this role is accidentally included in a rust playbook.
+- name: refuse format_disks via bundle-rust (dual-guard)
+  fail:
+    msg: >-
+      bundle-rust never formats or wipes disks. Use out-of-band mounts +
+      expand.yml, or Python bundle/roles/format_disks with an explicit ticket
+      and --allow-disk-wipe on a non-rust plan. See
+      docs/fairness-lab/ANSIBLE-V3-SURFACE.md and roles/python_only_format_disks/README.md.

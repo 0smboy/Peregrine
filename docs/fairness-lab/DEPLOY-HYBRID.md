@@ -3,7 +3,7 @@
 | Layer | What it is | What it is not |
 |-------|------------|----------------|
 | `swift-deploy-rs/bundle/` | Near-full Python ansible-v3 surface | Contabo’s entire truth today |
-| `swift-deploy-rs/bundle-rust/` | Deployable subset of **implemented** Rust Swift + HAProxy + Keepalived VIP | Full plugins / Keystone prod path / full S3 / Paste pipeline |
+| `swift-deploy-rs/bundle-rust/` | Deployable subset of **implemented** Rust Swift + HAProxy + Keepalived VIP | Full plugins / Keystone *provision* / full S3 / Paste pipeline — matrix [ANSIBLE-V3-SURFACE.md](ANSIBLE-V3-SURFACE.md) |
 | Contabo hybrid (transitional) | Was: binaries + manual Keepalived/monitoring/SAIO overlays | Target: pure `bundle-rust apply` for data-plane + LB; monitoring/SAIO remain overlays |
 
 ## Honest non-goals (bundle-rust)

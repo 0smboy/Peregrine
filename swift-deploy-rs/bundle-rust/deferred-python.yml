@@ -1,0 +1,56 @@
+---
+# Deferred Python-only paths — optional import / include_role documentation.
+#
+# deploy-rs cannot import_role across bundles. These plays map Python-only
+# surfaces (Keystone install, format_disks wipe, platform extras) with
+# explicit role-level `when:` defaults of false. Enabling a flag without
+# switching to the Python bundle fails closed via python_only_* roles.
+#
+# Contabo dual-guard:
+#   - Never set include_python_format_disks / force_disk_wipe on live data disks.
+#   - Wipe requires ticket + --allow-disk-wipe on a non-bundle-rust plan.
+#
+# Preferred operator paths (do not use this playbook for live Contabo wipe):
+#   Identity:  bundle/install_mariadb_keystone.yml  OR  bundle/swift.yml tags
+#              mariadb_servers,keystones_install,keystones_setup
+#   Disks:     OOB mount + expand.yml  (rust)  |  format_disks (python lab only)
+#   Platform:  chrony / security / performance_tuning via dedicated python plays
+#   Cosbench:  install_cosbench.yml or monorepo cosbench-rs / autocos
+#
+# Authority: docs/fairness-lab/ANSIBLE-V3-SURFACE.md §3
+
+# --- Keystone / MariaDB install (Python only) ---
+- hosts: keystones
+  tags: [deferred, python_only, keystone_install]
+  roles:
+    - role: python_only_identity
+      when: include_python_keystone_install | default(false)
+
+- hosts: mariadb_servers
+  tags: [deferred, python_only, mariadb_servers]
+  roles:
+    - role: python_only_identity
+      when: include_python_keystone_install | default(false)
+
+# --- format_disks wipe (Python only; dual-guard refuse on Contabo rust path) ---
+# Default when: false. Even if forced true, python_only_format_disks fails
+# closed and never runs mkfs — operators must use the Python bundle explicitly.
+- hosts: format_disk_servers
+  tags: [deferred, python_only, format_disks]
+  roles:
+    - role: python_only_format_disks
+      when: include_python_format_disks | default(false)
+
+# --- Platform hardening / NTP / performance (Python only) ---
+- hosts: all
+  tags: [deferred, python_only, platform]
+  roles:
+    - role: python_only_platform
+      when: include_python_platform | default(false)
+
+# --- Cosbench / docker / proxyfs extras (Python only) ---
+- hosts: all
+  tags: [deferred, python_only, extras]
+  roles:
+    - role: python_only_extras
+      when: include_python_extras | default(false)

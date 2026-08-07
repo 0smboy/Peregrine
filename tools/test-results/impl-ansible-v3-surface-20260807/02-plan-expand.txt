@@ -1,0 +1,1 @@
+plan=/Users/oboy/Downloads/Peregrine/tools/test-results/impl-ansible-v3-surface-20260807/plan-expand-sample.json digest=d021d02bd944ce73beac07662b4ac2d1dd9de596373252c37d6407f769d2ebff hosts=1 tasks=50 risks=[HostReconfigure]

@@ -14,30 +14,38 @@
 # Honest note: Rust ring builder rebalance rebuilds assignment from the
 # device list (no replica2part2dev persistence) — expect partition moves;
 # replicators heal. Schedule during a maintenance window.
+#
+# Tags: expand, disks, rings, haproxy, keepalived, verify
 
 - hosts: all
+  tags: [expand]
   roles:
     - rust_expand_mode
 
 - hosts: storage_nodes
+  tags: [expand, disks, replication]
   roles:
     - rust_disks
     - rust_replication_key
 
 - hosts: all
+  tags: [expand, rings]
   roles:
     - rust_rings
 
 - hosts: haproxy_servers
+  tags: [expand, haproxy, lb]
   roles:
     - role: rust_haproxy
       when: use_lb
 
 - hosts: keepalived_servers
+  tags: [expand, keepalived, lb]
   roles:
     - role: rust_keepalived
       when: use_lb
 
 - hosts: proxy_servers
+  tags: [expand, verify]
   roles:
     - rust_verify

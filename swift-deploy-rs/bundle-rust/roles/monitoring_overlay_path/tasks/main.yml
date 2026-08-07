@@ -1,0 +1,7 @@
+---
+- name: point operators at bundle-monitoring (no agents installed here)
+  fail:
+    msg: >-
+      Monitoring is not inlined into bundle-rust. Apply
+      swift-deploy-rs/bundle-monitoring/swift.yml (roles mon_payload,
+      mon_config, mon_systemd). See roles/monitoring_overlay_path/README.md.

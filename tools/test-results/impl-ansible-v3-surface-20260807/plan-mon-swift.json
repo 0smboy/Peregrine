@@ -1,0 +1,806 @@
+{
+  "schema_version": 2,
+  "bundle_fingerprint": "11ca26d18b10f8c4ef9cd3afc5fc5f44480b57db98c0390426bc63895c07ff10",
+  "inventory_fingerprint": "89464e280c8381afe88e523f98d42f284c466f298ebad80f463a59450b92c3ea",
+  "playbook": "swift.yml",
+  "hosts": [
+    "10.0.0.11",
+    "10.0.0.12"
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "source": "roles/mon_payload/tasks/main.yml#1",
+      "role": "mon_payload",
+      "name": "install node_exporter",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "copy",
+      "args": {
+        "dest": "/usr/local/bin/node_exporter",
+        "mode": "0755",
+        "src": "bin/node_exporter"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "mon_bin_node_exporter",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 2,
+      "source": "roles/mon_payload/tasks/main.yml#2",
+      "role": "mon_payload",
+      "name": "install statsd_exporter",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "copy",
+      "args": {
+        "dest": "/usr/local/bin/statsd_exporter",
+        "mode": "0755",
+        "src": "bin/statsd_exporter"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "mon_bin_statsd_exporter",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 3,
+      "source": "roles/mon_payload/tasks/main.yml#3",
+      "role": "mon_payload",
+      "name": "install alloy",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "copy",
+      "args": {
+        "dest": "/usr/local/bin/alloy",
+        "mode": "0755",
+        "src": "bin/alloy"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "mon_bin_alloy",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 4,
+      "source": "roles/mon_config/tasks/main.yml#1",
+      "role": "mon_config",
+      "name": "probe for the monitor user",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "shell",
+      "args": "id monitor >/dev/null 2>&1 && echo PRESENT || echo ABSENT",
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "mon_user_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 5,
+      "source": "roles/mon_config/tasks/main.yml#2",
+      "role": "mon_config",
+      "name": "create the monitor system user",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "user",
+      "args": {
+        "groups": "systemd-journal",
+        "home": "/var/lib/alloy",
+        "name": "monitor",
+        "shell": "/usr/sbin/nologin"
+      },
+      "vars": {},
+      "when": [
+        "mon_user_probe.stdout.find('PRESENT') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 6,
+      "source": "roles/mon_config/tasks/main.yml#3",
+      "role": "mon_config",
+      "name": "create the alloy configuration directory",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "file",
+      "args": {
+        "mode": "0755",
+        "path": "/etc/alloy",
+        "state": "directory"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 7,
+      "source": "roles/mon_config/tasks/main.yml#4",
+      "role": "mon_config",
+      "name": "create the alloy state directory",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "file",
+      "args": {
+        "group": "monitor",
+        "mode": "0750",
+        "owner": "monitor",
+        "path": "/var/lib/alloy",
+        "state": "directory"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 8,
+      "source": "roles/mon_config/tasks/main.yml#5",
+      "role": "mon_config",
+      "name": "render the statsd_exporter mapping",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/statsd-mapping.yml",
+        "mode": "0644",
+        "src": "statsd-mapping.yml.j2"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "mon_statsd_mapping",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 9,
+      "source": "roles/mon_config/tasks/main.yml#6",
+      "role": "mon_config",
+      "name": "render the alloy configuration",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/alloy/config.alloy",
+        "mode": "0644",
+        "src": "config.alloy.j2"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "mon_alloy_config",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 10,
+      "source": "roles/mon_systemd/tasks/agent.yml#1",
+      "role": "mon_systemd",
+      "name": "install the unit file",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/systemd/system/{{ unit_name }}.service",
+        "mode": "0644",
+        "src": "{{ unit_name }}.service.j2"
+      },
+      "vars": {
+        "unit_name": "node_exporter"
+      },
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "mon_unit_file",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 11,
+      "source": "roles/mon_systemd/tasks/agent.yml#2",
+      "role": "mon_systemd",
+      "name": "probe the unit state",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {
+        "unit_name": "node_exporter"
+      },
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "mon_unit_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 12,
+      "source": "roles/mon_systemd/tasks/agent.yml#3",
+      "role": "mon_systemd",
+      "name": "enable and start the agent",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "{{ unit_name }}",
+        "state": "started"
+      },
+      "vars": {
+        "unit_name": "node_exporter"
+      },
+      "when": [
+        "mon_unit_probe.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 13,
+      "source": "roles/mon_systemd/tasks/agent.yml#4",
+      "role": "mon_systemd",
+      "name": "restart the agent after a unit-file change",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "{{ unit_name }}",
+        "state": "restarted"
+      },
+      "vars": {
+        "unit_name": "node_exporter"
+      },
+      "when": [
+        "mon_unit_file.changed",
+        "mon_unit_probe.stdout.find('RUNNING') != -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 14,
+      "source": "roles/mon_systemd/tasks/agent.yml#1",
+      "role": "mon_systemd",
+      "name": "install the unit file",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/systemd/system/{{ unit_name }}.service",
+        "mode": "0644",
+        "src": "{{ unit_name }}.service.j2"
+      },
+      "vars": {
+        "unit_name": "statsd_exporter"
+      },
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "mon_unit_file",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 15,
+      "source": "roles/mon_systemd/tasks/agent.yml#2",
+      "role": "mon_systemd",
+      "name": "probe the unit state",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {
+        "unit_name": "statsd_exporter"
+      },
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "mon_unit_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 16,
+      "source": "roles/mon_systemd/tasks/agent.yml#3",
+      "role": "mon_systemd",
+      "name": "enable and start the agent",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "{{ unit_name }}",
+        "state": "started"
+      },
+      "vars": {
+        "unit_name": "statsd_exporter"
+      },
+      "when": [
+        "mon_unit_probe.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 17,
+      "source": "roles/mon_systemd/tasks/agent.yml#4",
+      "role": "mon_systemd",
+      "name": "restart the agent after a unit-file change",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "{{ unit_name }}",
+        "state": "restarted"
+      },
+      "vars": {
+        "unit_name": "statsd_exporter"
+      },
+      "when": [
+        "mon_unit_file.changed",
+        "mon_unit_probe.stdout.find('RUNNING') != -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 18,
+      "source": "roles/mon_systemd/tasks/agent.yml#1",
+      "role": "mon_systemd",
+      "name": "install the unit file",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/systemd/system/{{ unit_name }}.service",
+        "mode": "0644",
+        "src": "{{ unit_name }}.service.j2"
+      },
+      "vars": {
+        "unit_name": "alloy"
+      },
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "mon_unit_file",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 19,
+      "source": "roles/mon_systemd/tasks/agent.yml#2",
+      "role": "mon_systemd",
+      "name": "probe the unit state",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "shell",
+      "args": "if systemctl is-enabled {{ unit_name }} >/dev/null 2>&1 && systemctl is-active {{ unit_name }} >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {
+        "unit_name": "alloy"
+      },
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "mon_unit_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 20,
+      "source": "roles/mon_systemd/tasks/agent.yml#3",
+      "role": "mon_systemd",
+      "name": "enable and start the agent",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "{{ unit_name }}",
+        "state": "started"
+      },
+      "vars": {
+        "unit_name": "alloy"
+      },
+      "when": [
+        "mon_unit_probe.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 21,
+      "source": "roles/mon_systemd/tasks/agent.yml#4",
+      "role": "mon_systemd",
+      "name": "restart the agent after a unit-file change",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "{{ unit_name }}",
+        "state": "restarted"
+      },
+      "vars": {
+        "unit_name": "alloy"
+      },
+      "when": [
+        "mon_unit_file.changed",
+        "mon_unit_probe.stdout.find('RUNNING') != -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 22,
+      "source": "roles/mon_systemd/tasks/main.yml#4",
+      "role": "mon_systemd",
+      "name": "restart node_exporter after a binary change",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "systemd",
+      "args": {
+        "name": "node_exporter",
+        "state": "restarted"
+      },
+      "vars": {},
+      "when": [
+        "mon_bin_node_exporter.changed"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 23,
+      "source": "roles/mon_systemd/tasks/main.yml#5",
+      "role": "mon_systemd",
+      "name": "restart statsd_exporter after a mapping or binary change",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "systemd",
+      "args": {
+        "name": "statsd_exporter",
+        "state": "restarted"
+      },
+      "vars": {},
+      "when": [
+        "mon_statsd_mapping.changed or mon_bin_statsd_exporter.changed"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 24,
+      "source": "roles/mon_systemd/tasks/main.yml#6",
+      "role": "mon_systemd",
+      "name": "restart alloy after a config or binary change",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "systemd",
+      "args": {
+        "name": "alloy",
+        "state": "restarted"
+      },
+      "vars": {},
+      "when": [
+        "mon_alloy_config.changed or mon_bin_alloy.changed"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    }
+  ],
+  "handlers": [],
+  "digest": "8849904ff255e8ab54ca8588ab25b19b7efc24a8eb8fa598502a0d40c5be0503"
+}

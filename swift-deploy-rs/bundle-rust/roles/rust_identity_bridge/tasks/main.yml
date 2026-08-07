@@ -1,0 +1,35 @@
+---
+# Identity 对接 bridge (bundle-rust).
+#
+# This role does NOT install MariaDB, Galera, or Keystone packages.
+# It only runs when identity flags / keystone auth_method are set (see
+# swift.yml role-level when:). Fail-closed config checks + operator docs.
+#
+# Provisioning path: Python bundle install_mariadb_keystone.yml +
+# config_contabo_identity. Filters/listeners are rendered by rust_config /
+# rust_haproxy templates when flags are on.
+
+- name: document identity bridge path (no package install)
+  debug:
+    msg: >-
+      Identity 对接 active (auth_method={{ auth_method | default('tempauth') }},
+      identity_haproxy_enabled={{ identity_haproxy_enabled | default(false) }},
+      identity_proxy_enabled={{ identity_proxy_enabled | default(false) }}).
+      Keystone/MariaDB provisioning is Python-only
+      (bundle/roles/keystone_install, keystones, mariadb_servers;
+      docs/fairness-lab/KEYSTONE-LIVE.md). This role never wipes /srv/node.
+
+- name: require keystone backends when identity HAProxy listeners enabled
+  fail:
+    msg: >-
+      identity_haproxy_enabled=true but identity_keystone_backends is empty.
+      Set backends to the Galera/Keystone nodes provisioned via Python inventory,
+      or set identity_haproxy_enabled=false. See IDENTITY.md.
+  when: identity_haproxy_enabled and (identity_keystone_backends | length) == 0
+
+- name: require mariadb backends when identity HAProxy listeners enabled
+  fail:
+    msg: >-
+      identity_haproxy_enabled=true but identity_mariadb_backends is empty.
+      Set backends or disable identity_haproxy_enabled. See IDENTITY.md.
+  when: identity_haproxy_enabled and (identity_mariadb_backends | length) == 0

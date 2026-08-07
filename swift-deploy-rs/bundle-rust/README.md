@@ -106,20 +106,28 @@ Default Contabo remains TempAuth on VIP `:8085`.
 ## Layout
 
 ```
-swift.yml            greenfield roles-only plays
+swift.yml            greenfield (+ optional rust_identity_bridge when identity flags)
 expand.yml           P3-ops add-disk/add-node (ring_expand)
+identity.yml         optional Identity 对接 re-render (when flags)
+monitoring.yml       pointer + tags → sibling bundle-monitoring
+deferred-python.yml  Python-only surfaces; explicit when: default false
 ansible.cfg
 config_sample/       swift_hosts, group_vars/all, host_vars/<ip>.yml
 roles/
   rust_common/       timezone, dirs, rsync dep, stop legacy SAIO unit
-  rust_disks/        mkdir device dirs only (never mkfs)
+  rust_disks/        mkdir-only devices; refuse inventory wipe flags
   rust_payload/      binaries + libs
   rust_config/       swift.conf + per-server confs
   rust_replication_key/  ed25519 keypair
   rust_rings/        build_rings.sh.j2 (create / expand / force)
   rust_expand_mode/  set_fact ring_expand for expand.yml
   rust_systemd/      per-service units
-  rust_haproxy/      haproxy (+ optional TLS)
+  rust_haproxy/      haproxy (+ optional TLS + identity listeners)
   rust_keepalived/   Keepalived VIP
+  rust_identity_bridge/  optional Identity 对接 assert (never installs Keystone)
   rust_verify/       healthcheck + tempauth + PUT/GET
+  python_only_*/     docs + fail-closed wrappers for ABSENT Python roles
+  monitoring_overlay_path/  points at bundle-monitoring (not inlined)
 ```
+
+Full Python↔Rust role matrix: [ANSIBLE-V3-SURFACE.md](../../docs/fairness-lab/ANSIBLE-V3-SURFACE.md).

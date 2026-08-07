@@ -36,11 +36,25 @@
 //!
 //! * **SigV2** (`Authorization: AWS …` / `AWSAccessKeyId` query) — WONTFIX
 //!   unless reopened; only SigV4 is accepted.
-//! * **aws-chunked** streaming (`X-Amz-Content-SHA256` `STREAMING-*` values
-//!   and/or `Content-Encoding: aws-chunked`) — WONTFIX unless reopened.
-//! * **versioning / tagging / lifecycle** (and related subresources in
-//!   [`UNSUPPORTED_SUBRESOURCES`]) — production stop-line WONTFIX unless
-//!   reopened.
+//! * Other subresources in [`UNSUPPORTED_SUBRESOURCES`] (policy, website,
+//!   replication, legal-hold, retention, select, …).
+//!
+//! # Config subresources (meta round-trip — claimable unit surface)
+//!
+//! * **versioning** GET/PUT — `X-Container-Meta-S3-Versioning`
+//! * **tagging** GET/PUT/DELETE bucket + object
+//! * **lifecycle** GET/PUT/DELETE — raw XML in container meta
+//! * **object-lock** GET/PUT — raw XML in container meta
+//! * **versions** GET — empty `ListVersionsResult` (multi-version bodies residual)
+//!
+//! # aws-chunked / STREAMING-* (implemented)
+//!
+//! PUT/POST bodies with `Content-Encoding: aws-chunked` and/or
+//! `X-Amz-Content-SHA256: STREAMING-*` are dechunked after SigV4 verify
+//! (header signature uses the STREAMING-* token as payload hash). Chunk
+//! framing is stripped; trailers are discarded; decoded bytes are forwarded
+//! to Swift with fixed `Content-Length`. Per-chunk signature verification is
+//! best-effort residual (dechunk always runs).
 //!
 //! Other residuals: full IAM / grant-header object ACL (canned
 //! private/public-read stored as sysmeta is claimable; object public-read
@@ -64,6 +78,19 @@ use crate::acl_cors::{
     acl_xml_from_swift_headers, apply_canned_acl, apply_object_canned_acl,
     clear_cors_swift_headers, cors_config_to_swift_headers, cors_xml_from_swift_headers,
     object_acl_xml_from_meta, parse_cors_configuration, xml_ok, S3_OBJECT_ACL_META,
+};
+use crate::aws_chunked::{
+    cleanup_content_encoding, decode_aws_chunked, is_aws_chunked_request, is_ecdsa_streaming,
+    is_streaming_payload_hash, AwsChunkedError, ChunkSigContext,
+};
+use crate::bucket_config::{
+    apply_bucket_tagging_meta, apply_lifecycle_meta, apply_object_lock_meta,
+    apply_object_tagging_meta, apply_versioning_meta, clear_bucket_tagging_meta,
+    clear_lifecycle_meta, clear_object_tagging_meta, empty_list_versions_result_xml,
+    lifecycle_xml_from_headers, object_lock_xml_from_headers, parse_tagging_body,
+    parse_versioning_status, tagging_xml_from_meta, validate_lifecycle_xml,
+    validate_object_lock_xml, versioning_configuration_xml, versioning_status_from_headers,
+    S3_BUCKET_TAGGING_META, S3_OBJECT_TAGGING_META,
 };
 use crate::delete::parse_multi_delete_body;
 use crate::mpu::{
@@ -199,17 +226,12 @@ fn credential_from_s3token(
 /// for production unless reopened). Clients must see `Code=NotImplemented`,
 /// not a backend 500 or empty body.
 ///
-/// Core production-stop items: `lifecycle`, `tagging`, `versioning` (+
-/// `versions`). Remainder are equally unsupported S3 subresources.
+/// Implemented elsewhere (must **not** appear here): `lifecycle`, `tagging`,
+/// `versioning`, `versions`, `object-lock` — meta round-trip handlers.
 const UNSUPPORTED_SUBRESOURCES: &[&str] = &[
-    "lifecycle",
-    "tagging",
-    "versioning",
-    "versions",
     "policy",
     "website",
     "replication",
-    "object-lock",
     "legal-hold",
     "retention",
     "select",
@@ -229,19 +251,11 @@ const UNSUPPORTED_SUBRESOURCES: &[&str] = &[
 /// Fixed client-facing messages for stable 501 responses (unit-tested).
 const MSG_SIGV2_NOT_IMPLEMENTED: &str =
     "The AWS Signature Version 2 authentication method is not implemented.";
-const MSG_AWS_CHUNKED_NOT_IMPLEMENTED: &str =
-    "aws-chunked transfer encoding / streaming payload signing is not implemented.";
+const MSG_ECDSA_STREAMING_NOT_IMPLEMENTED: &str =
+    "ECDSA streaming payload signing (STREAMING-AWS4-ECDSA-P256-SHA256-*) is not implemented.";
 
-/// `X-Amz-Content-SHA256` values that imply aws-chunked streaming (Python
-/// `s3request._is_streaming`). We reject these with 501 rather than attempt
-/// chunk/trailer signature verification.
-const AWS_CHUNKED_PAYLOAD_HASHES: &[&str] = &[
-    "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
-    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
-    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
-    "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD",
-    "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER",
-];
+/// Cap for materializing aws-chunked wire bodies (~Swift max object size).
+const MAX_AWS_CHUNKED_BODY: u64 = 5_368_709_122;
 
 /// True when the request carries SigV2 auth (header `AWS …` or query
 /// `AWSAccessKeyId`). Mirrors Python `get_s3_access_key_id` v2 branch.
@@ -257,26 +271,140 @@ fn is_sigv2_auth(req: &Request) -> bool {
         .any(|(k, _)| k == "AWSAccessKeyId")
 }
 
-/// True when the request asks for aws-chunked / streaming payload signing.
-fn is_aws_chunked_request(req: &Request) -> bool {
-    if let Some(hash) = req.headers.get("X-Amz-Content-SHA256") {
-        if AWS_CHUNKED_PAYLOAD_HASHES
-            .iter()
-            .any(|v| hash.eq_ignore_ascii_case(v))
-        {
-            return true;
-        }
+/// Materialize, dechunk, and fix headers for an aws-chunked / STREAMING-* body.
+///
+/// Call **after** SigV4 header verification (payload hash is the STREAMING-*
+/// token). On success: body is raw decoded bytes, `Content-Length` matches
+/// decoded length, `aws-chunked` is stripped from `Content-Encoding`, and
+/// STREAMING `X-Amz-Content-SHA256` is replaced with `UNSIGNED-PAYLOAD`.
+///
+/// Optional HMAC per-chunk signature verification runs when `cred` has a
+/// secret and the mode is STREAMING-AWS4-HMAC-SHA256-PAYLOAD*; failure is
+/// residual (dechunk still succeeds).
+fn decode_and_fix_aws_chunked(
+    req: &mut Request,
+    cred: &S3Credential,
+    auth: &SigV4Auth,
+) -> Result<(), Response> {
+    let payload_hash = req
+        .headers
+        .get("X-Amz-Content-SHA256")
+        .unwrap_or("")
+        .to_string();
+
+    if is_ecdsa_streaming(&payload_hash) {
+        return Err(s3_error_response(
+            "NotImplemented",
+            Some(MSG_ECDSA_STREAMING_NOT_IMPLEMENTED),
+            &[],
+        ));
     }
-    // Content-Encoding may list multiple encodings; treat any aws-chunked token
-    // as streaming (case-insensitive token match).
-    if let Some(enc) = req.headers.get("Content-Encoding") {
-        for part in enc.split(',') {
-            if part.trim().eq_ignore_ascii_case("aws-chunked") {
-                return true;
-            }
-        }
+
+    let is_streaming = is_streaming_payload_hash(&payload_hash);
+    let decoded_len = req
+        .headers
+        .get("X-Amz-Decoded-Content-Length")
+        .and_then(|s| s.parse::<u64>().ok());
+
+    // STREAMING-* requires x-amz-decoded-content-length (Python MissingContentLength).
+    if is_streaming && decoded_len.is_none() {
+        return Err(s3_error_response(
+            "MissingContentLength",
+            Some("You must provide the x-amz-decoded-content-length header."),
+            &[("ArgumentName", "x-amz-decoded-content-length")],
+        ));
     }
-    false
+
+    let cap = req
+        .headers
+        .get("Content-Length")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(MAX_CONTROL_BODY)
+        .max(MAX_CONTROL_BODY)
+        .min(MAX_AWS_CHUNKED_BODY);
+    let framed = match req.body.take().into_vec(cap) {
+        Ok(b) => b,
+        Err(_) => {
+            return Err(s3_error_response(
+                "IncompleteBody",
+                Some("failed to read aws-chunked body"),
+                &[],
+            ));
+        }
+    };
+
+    // Content-Encoding: aws-chunked alone with empty body — strip encoding.
+    if framed.is_empty() && !is_streaming {
+        cleanup_content_encoding(&mut req.headers);
+        req.headers.set("Content-Length", "0");
+        req.body = Body::empty();
+        return Ok(());
+    }
+
+    let want_hmac = matches!(
+        payload_hash.as_str(),
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+            | "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+    ) && !cred.secret_key.is_empty();
+
+    let sig_ctx = if want_hmac {
+        crate::sigv4::amz_date(req).map(|ad| ChunkSigContext {
+            secret_key: cred.secret_key.clone(),
+            date: auth.scope.date.clone(),
+            region: auth.scope.region.clone(),
+            service: auth.scope.service.clone(),
+            amz_date: ad,
+            seed_signature: auth.signature.clone(),
+        })
+    } else {
+        None
+    };
+
+    let decoded = match decode_aws_chunked(&framed, decoded_len, sig_ctx.as_ref()) {
+        Ok(d) => d,
+        Err(AwsChunkedError::SizeMismatch { expected, provided }) => {
+            return Err(s3_error_response(
+                "IncompleteBody",
+                Some(&format!(
+                    "x-amz-decoded-content-length {expected} != decoded {provided}"
+                )),
+                &[],
+            ));
+        }
+        Err(AwsChunkedError::Incomplete) | Err(AwsChunkedError::InvalidChunkHeader) => {
+            return Err(s3_error_response(
+                "IncompleteBody",
+                Some("incomplete or invalid aws-chunked framing"),
+                &[],
+            ));
+        }
+        Err(AwsChunkedError::MissingDecodedContentLength) => {
+            return Err(s3_error_response("MissingContentLength", None, &[]));
+        }
+        Err(AwsChunkedError::EcdsaNotImplemented) => {
+            return Err(s3_error_response(
+                "NotImplemented",
+                Some(MSG_ECDSA_STREAMING_NOT_IMPLEMENTED),
+                &[],
+            ));
+        }
+    };
+    // Residual: chunk_signatures_valid == Some(false) does not abort.
+    let _ = decoded.chunk_signatures_valid;
+    let _ = decoded.trailers;
+
+    cleanup_content_encoding(&mut req.headers);
+    req.headers
+        .set("Content-Length", decoded.data.len().to_string());
+    req.headers.remove("X-Amz-Decoded-Content-Length");
+    if is_streaming {
+        // Downstream does not need STREAMING-*; UNSIGNED-PAYLOAD matches
+        // "payload not re-hashed for SigV4".
+        req.headers
+            .set("X-Amz-Content-SHA256", "UNSIGNED-PAYLOAD");
+    }
+    req.body = Body::from(decoded.data);
+    Ok(())
 }
 
 /// Detect S3-shaped auth so we intercept SigV2/SigV4 (and reject unsupported
@@ -304,14 +432,6 @@ fn not_implemented_subresource(sub: &str) -> Response {
 
 fn not_implemented_sigv2() -> Response {
     s3_error_response("NotImplemented", Some(MSG_SIGV2_NOT_IMPLEMENTED), &[])
-}
-
-fn not_implemented_aws_chunked() -> Response {
-    s3_error_response(
-        "NotImplemented",
-        Some(MSG_AWS_CHUNKED_NOT_IMPLEMENTED),
-        &[],
-    )
 }
 
 fn owner_for(cred: &S3Credential) -> Owner {
@@ -419,7 +539,12 @@ fn s3_to_swift_query(params: &[(String, String)], for_container_list: bool) -> S
             | "partNumber"
             | "acl"
             | "cors"
-            | "delete" => {}
+            | "delete"
+            | "versioning"
+            | "versions"
+            | "tagging"
+            | "lifecycle"
+            | "object-lock" => {}
             _ => {}
         }
     }
@@ -801,7 +926,7 @@ fn translate_bucket_success(method: &str, resp: Response) -> Response {
 }
 
 impl Middleware for S3Api {
-    fn handle(&self, req: Request, next: &NextFn) -> Response {
+    fn handle(&self, mut req: Request, next: &NextFn) -> Response {
         // Non-S3 traffic (Swift v1, /auth, /info, healthcheck) passes through.
         if !is_s3_auth_request(&req) {
             return next(req);
@@ -810,12 +935,6 @@ impl Middleware for S3Api {
         // SigV2: stable 501 (WONTFIX) — do not fall through to TempAuth HTML.
         if is_sigv2_auth(&req) {
             return not_implemented_sigv2();
-        }
-
-        // aws-chunked / STREAMING-* payload: stable 501 (WONTFIX) before
-        // signature verify so clients never see SignatureDoesNotMatch noise.
-        if is_aws_chunked_request(&req) {
-            return not_implemented_aws_chunked();
         }
 
         let auth = match parse_sigv4_auth(&req) {
@@ -827,8 +946,17 @@ impl Middleware for S3Api {
         };
         // Keystone `/v3/s3tokens` already validated the SigV4 signature against
         // the EC2 secret; local TempAuth keys still need verify_sigv4.
+        // Note: for STREAMING-* the payload hash is the STREAMING token itself
+        // (not the body), so verify happens *before* dechunk / header rewrite.
         if !keystone_verified && !verify_sigv4(&cred.access_key, &cred.secret_key, &req) {
             return s3_error_response("SignatureDoesNotMatch", None, &[]);
+        }
+
+        // aws-chunked / STREAMING-*: dechunk body after header SigV4 verify.
+        if matches!(req.method.as_str(), "PUT" | "POST") && is_aws_chunked_request(&req) {
+            if let Err(resp) = decode_and_fix_aws_chunked(&mut req, &cred, &auth) {
+                return resp;
+            }
         }
 
         let params = req.params();
@@ -861,6 +989,11 @@ impl Middleware for S3Api {
         let has_delete = params.iter().any(|(k, _)| k == "delete");
         let has_acl = params.iter().any(|(k, _)| k == "acl");
         let has_cors = params.iter().any(|(k, _)| k == "cors");
+        let has_versioning = params.iter().any(|(k, _)| k == "versioning");
+        let has_versions = params.iter().any(|(k, _)| k == "versions");
+        let has_tagging = params.iter().any(|(k, _)| k == "tagging");
+        let has_lifecycle = params.iter().any(|(k, _)| k == "lifecycle");
+        let has_object_lock = params.iter().any(|(k, _)| k == "object-lock");
         let has_uploads = params.iter().any(|(k, _)| k == "uploads");
         let upload_id = params
             .iter()
@@ -884,6 +1017,37 @@ impl Middleware for S3Api {
         // ---- CORS ----
         if has_cors && bucket.is_some() && key.is_none() {
             return handle_cors(req, &cred, bucket.as_deref().unwrap(), &next);
+        }
+
+        // ---- Versioning (bucket status) ----
+        if has_versioning && bucket.is_some() && key.is_none() {
+            return handle_versioning(req, &cred, bucket.as_deref().unwrap(), &next);
+        }
+
+        // ---- List object versions (empty residual) ----
+        if has_versions && bucket.is_some() && key.is_none() && req.method == "GET" {
+            return handle_list_versions(bucket.as_deref().unwrap(), &params);
+        }
+
+        // ---- Tagging (bucket + object) ----
+        if has_tagging && bucket.is_some() {
+            return handle_tagging(
+                req,
+                &cred,
+                bucket.as_deref().unwrap(),
+                key.as_deref(),
+                &next,
+            );
+        }
+
+        // ---- Lifecycle (bucket) ----
+        if has_lifecycle && bucket.is_some() && key.is_none() {
+            return handle_lifecycle(req, &cred, bucket.as_deref().unwrap(), &next);
+        }
+
+        // ---- Object Lock configuration (bucket) ----
+        if has_object_lock && bucket.is_some() && key.is_none() {
+            return handle_object_lock(req, &cred, bucket.as_deref().unwrap(), &next);
         }
 
         // ---- Multipart ----
@@ -1191,6 +1355,269 @@ fn handle_cors(req: Request, cred: &S3Credential, bucket: &str, next: &NextFn) -
             stamp_auth(&mut post, cred);
             let _ = next(post);
             Response::new(204)
+        }
+        _ => s3_error_response("MethodNotAllowed", None, &[]),
+    }
+}
+
+fn handle_versioning(req: Request, cred: &S3Credential, bucket: &str, next: &NextFn) -> Response {
+    match req.method.as_str() {
+        "GET" | "HEAD" => {
+            let mut head =
+                make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+            stamp_auth(&mut head, cred);
+            let resp = next(head);
+            if !(200..300).contains(&resp.status) {
+                return map_swift_error(resp.status, Some(bucket), None);
+            }
+            let status = versioning_status_from_headers(&resp.headers);
+            xml_ok(versioning_configuration_xml(status.as_deref()))
+        }
+        "PUT" => {
+            let body = match req.body.into_vec(MAX_CONTROL_BODY) {
+                Ok(b) => b,
+                Err(_) => return s3_error_response("IncompleteBody", None, &[]),
+            };
+            let status = match parse_versioning_status(&body) {
+                Ok(s) => s,
+                Err(_) => return s3_error_response("MalformedXML", None, &[]),
+            };
+            let mut post =
+                make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
+            apply_versioning_meta(&mut post.headers, status);
+            stamp_auth(&mut post, cred);
+            let resp = next(post);
+            if (200..300).contains(&resp.status) {
+                Response::new(200)
+            } else {
+                map_swift_error(resp.status, Some(bucket), None)
+            }
+        }
+        _ => s3_error_response("MethodNotAllowed", None, &[]),
+    }
+}
+
+fn handle_list_versions(bucket: &str, params: &[(String, String)]) -> Response {
+    let prefix = params
+        .iter()
+        .find(|(k, _)| k == "prefix")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let key_marker = params
+        .iter()
+        .find(|(k, _)| k == "key-marker")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let version_id_marker = params
+        .iter()
+        .find(|(k, _)| k == "version-id-marker")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let max_keys = params
+        .iter()
+        .find(|(k, _)| k == "max-keys")
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(1000u32);
+    xml_ok(empty_list_versions_result_xml(
+        bucket,
+        prefix,
+        key_marker,
+        version_id_marker,
+        max_keys,
+    ))
+}
+
+fn handle_tagging(
+    req: Request,
+    cred: &S3Credential,
+    bucket: &str,
+    key: Option<&str>,
+    next: &NextFn,
+) -> Response {
+    if let Some(obj) = key {
+        match req.method.as_str() {
+            "GET" | "HEAD" => {
+                let mut head = make_swift_req(
+                    "HEAD",
+                    &s3_to_swift_path(&cred.account, Some(bucket), Some(obj)),
+                );
+                stamp_auth(&mut head, cred);
+                let resp = next(head);
+                if !(200..300).contains(&resp.status) {
+                    return map_swift_error(resp.status, Some(bucket), Some(obj));
+                }
+                let meta = resp
+                    .headers
+                    .get(S3_OBJECT_TAGGING_META)
+                    .or_else(|| resp.headers.get("X-Object-Meta-S3-Tagging"));
+                xml_ok(tagging_xml_from_meta(meta))
+            }
+            "PUT" => {
+                let body = match req.body.into_vec(MAX_CONTROL_BODY) {
+                    Ok(b) => b,
+                    Err(_) => return s3_error_response("IncompleteBody", None, &[]),
+                };
+                let tags = match parse_tagging_body(&body) {
+                    Ok(t) => t,
+                    Err(_) => return s3_error_response("MalformedXML", None, &[]),
+                };
+                let mut post = make_swift_req(
+                    "POST",
+                    &s3_to_swift_path(&cred.account, Some(bucket), Some(obj)),
+                );
+                apply_object_tagging_meta(&mut post.headers, &tags);
+                stamp_auth(&mut post, cred);
+                let resp = next(post);
+                if (200..300).contains(&resp.status) {
+                    Response::new(200)
+                } else {
+                    map_swift_error(resp.status, Some(bucket), Some(obj))
+                }
+            }
+            "DELETE" => {
+                let mut post = make_swift_req(
+                    "POST",
+                    &s3_to_swift_path(&cred.account, Some(bucket), Some(obj)),
+                );
+                clear_object_tagging_meta(&mut post.headers);
+                stamp_auth(&mut post, cred);
+                let _ = next(post);
+                Response::new(204)
+            }
+            _ => s3_error_response("MethodNotAllowed", None, &[]),
+        }
+    } else {
+        match req.method.as_str() {
+            "GET" | "HEAD" => {
+                let mut head =
+                    make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+                stamp_auth(&mut head, cred);
+                let resp = next(head);
+                if !(200..300).contains(&resp.status) {
+                    return map_swift_error(resp.status, Some(bucket), None);
+                }
+                xml_ok(tagging_xml_from_meta(resp.headers.get(S3_BUCKET_TAGGING_META)))
+            }
+            "PUT" => {
+                let body = match req.body.into_vec(MAX_CONTROL_BODY) {
+                    Ok(b) => b,
+                    Err(_) => return s3_error_response("IncompleteBody", None, &[]),
+                };
+                let tags = match parse_tagging_body(&body) {
+                    Ok(t) => t,
+                    Err(_) => return s3_error_response("MalformedXML", None, &[]),
+                };
+                let mut post =
+                    make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
+                apply_bucket_tagging_meta(&mut post.headers, &tags);
+                stamp_auth(&mut post, cred);
+                let resp = next(post);
+                if (200..300).contains(&resp.status) {
+                    Response::new(200)
+                } else {
+                    map_swift_error(resp.status, Some(bucket), None)
+                }
+            }
+            "DELETE" => {
+                let mut post =
+                    make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
+                clear_bucket_tagging_meta(&mut post.headers);
+                stamp_auth(&mut post, cred);
+                let _ = next(post);
+                Response::new(204)
+            }
+            _ => s3_error_response("MethodNotAllowed", None, &[]),
+        }
+    }
+}
+
+fn handle_lifecycle(req: Request, cred: &S3Credential, bucket: &str, next: &NextFn) -> Response {
+    match req.method.as_str() {
+        "GET" | "HEAD" => {
+            let mut head =
+                make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+            stamp_auth(&mut head, cred);
+            let resp = next(head);
+            if !(200..300).contains(&resp.status) {
+                return map_swift_error(resp.status, Some(bucket), None);
+            }
+            match lifecycle_xml_from_headers(&resp.headers) {
+                Some(xml) => {
+                    let mut r = Response::with_body(200, xml);
+                    r.headers.set("Content-Type", "application/xml");
+                    r
+                }
+                None => s3_error_response("NoSuchLifecycleConfiguration", None, &[]),
+            }
+        }
+        "PUT" => {
+            let body = match req.body.into_vec(MAX_CONTROL_BODY) {
+                Ok(b) => b,
+                Err(_) => return s3_error_response("IncompleteBody", None, &[]),
+            };
+            if validate_lifecycle_xml(&body).is_err() {
+                return s3_error_response("MalformedXML", None, &[]);
+            }
+            let mut post =
+                make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
+            apply_lifecycle_meta(&mut post.headers, &body);
+            stamp_auth(&mut post, cred);
+            let resp = next(post);
+            if (200..300).contains(&resp.status) {
+                Response::new(200)
+            } else {
+                map_swift_error(resp.status, Some(bucket), None)
+            }
+        }
+        "DELETE" => {
+            let mut post =
+                make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
+            clear_lifecycle_meta(&mut post.headers);
+            stamp_auth(&mut post, cred);
+            let _ = next(post);
+            Response::new(204)
+        }
+        _ => s3_error_response("MethodNotAllowed", None, &[]),
+    }
+}
+
+fn handle_object_lock(req: Request, cred: &S3Credential, bucket: &str, next: &NextFn) -> Response {
+    match req.method.as_str() {
+        "GET" | "HEAD" => {
+            let mut head =
+                make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+            stamp_auth(&mut head, cred);
+            let resp = next(head);
+            if !(200..300).contains(&resp.status) {
+                return map_swift_error(resp.status, Some(bucket), None);
+            }
+            match object_lock_xml_from_headers(&resp.headers) {
+                Some(xml) => {
+                    let mut r = Response::with_body(200, xml);
+                    r.headers.set("Content-Type", "application/xml");
+                    r
+                }
+                None => s3_error_response("ObjectLockConfigurationNotFoundError", None, &[]),
+            }
+        }
+        "PUT" => {
+            let body = match req.body.into_vec(MAX_CONTROL_BODY) {
+                Ok(b) => b,
+                Err(_) => return s3_error_response("IncompleteBody", None, &[]),
+            };
+            if validate_object_lock_xml(&body).is_err() {
+                return s3_error_response("MalformedXML", None, &[]);
+            }
+            let mut post =
+                make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
+            apply_object_lock_meta(&mut post.headers, &body);
+            stamp_auth(&mut post, cred);
+            let resp = next(post);
+            if (200..300).contains(&resp.status) {
+                Response::new(200)
+            } else {
+                map_swift_error(resp.status, Some(bucket), None)
+            }
         }
         _ => s3_error_response("MethodNotAllowed", None, &[]),
     }
@@ -1570,6 +1997,9 @@ pub fn as_middleware(api: S3Api) -> Arc<dyn Middleware> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bucket_config::{
+        S3_LIFECYCLE_META, S3_OBJECT_LOCK_META, S3_VERSIONING_META,
+    };
     use crate::sigv4::{
         amz_date, canonical_query, canonical_request, canonical_uri, compute_signature,
         headers_to_sign, payload_hash, parse_authorization_header,
@@ -2271,44 +2701,275 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_lifecycle_still_501() {
+    fn versioning_put_get_round_trip() {
         let api = S3Api::new(cred_map());
-        let req = sign_request(base_s3_req("GET", "/mybucket", "lifecycle"), "testing");
-        let next: NextFn = Arc::new(|_| Response::new(500));
-        let resp = api.handle(req, &next);
-        assert_not_implemented(resp, "lifecycle");
+        let mut put_req = base_s3_req("PUT", "/mybucket", "versioning");
+        put_req
+            .headers
+            .set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put_req.body = Body::from(
+            br#"<VersioningConfiguration>
+              <Status>Enabled</Status>
+            </VersioningConfiguration>"#
+                .to_vec(),
+        );
+        let put_req = sign_request(put_req, "testing");
+        let stored = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let stored_c = stored.clone();
+        let put_next: NextFn = Arc::new(move |r| {
+            assert_eq!(r.method, "POST");
+            assert_eq!(r.path, "/v1/AUTH_test/mybucket");
+            assert_eq!(r.headers.get(S3_VERSIONING_META), Some("Enabled"));
+            *stored_c.lock().unwrap() = r.headers.get(S3_VERSIONING_META).map(str::to_string);
+            Response::new(204)
+        });
+        assert_eq!(api.handle(put_req, &put_next).status, 200);
+
+        let status = stored.lock().unwrap().clone().unwrap();
+        let get_req = sign_request(base_s3_req("GET", "/mybucket", "versioning"), "testing");
+        let get_next: NextFn = Arc::new(move |_| {
+            let mut r = Response::new(204);
+            r.headers.set(S3_VERSIONING_META, &status);
+            r
+        });
+        let resp = api.handle(get_req, &get_next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("VersioningConfiguration"));
+        assert!(body.contains("<Status>Enabled</Status>"));
     }
 
     #[test]
-    fn unsupported_tagging_still_501() {
+    fn versioning_get_unconfigured_empty_xml() {
         let api = S3Api::new(cred_map());
-        let req = sign_request(base_s3_req("GET", "/mybucket", "tagging"), "testing");
-        let next: NextFn = Arc::new(|_| Response::new(500));
-        assert_not_implemented(api.handle(req, &next), "tagging");
+        let get_req = sign_request(base_s3_req("GET", "/mybucket", "versioning"), "testing");
+        let get_next: NextFn = Arc::new(|_| Response::new(204));
+        let resp = api.handle(get_req, &get_next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("VersioningConfiguration"));
+        assert!(!body.contains("<Status>"));
     }
 
     #[test]
-    fn unsupported_versioning_still_501() {
-        let api = S3Api::new(cred_map());
-        let req = sign_request(base_s3_req("GET", "/mybucket", "versioning"), "testing");
-        let next: NextFn = Arc::new(|_| Response::new(500));
-        assert_not_implemented(api.handle(req, &next), "versioning");
-    }
-
-    #[test]
-    fn unsupported_versions_list_still_501() {
+    fn versions_list_returns_empty_list_versions_result() {
         let api = S3Api::new(cred_map());
         let req = sign_request(base_s3_req("GET", "/mybucket", "versions"), "testing");
-        let next: NextFn = Arc::new(|_| Response::new(500));
-        assert_not_implemented(api.handle(req, &next), "versions");
+        let next: NextFn = Arc::new(|_| panic!("versions list is local; no Swift hop"));
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("ListVersionsResult"));
+        assert!(body.contains("<Name>mybucket</Name>"));
+        assert!(body.contains("<IsTruncated>false</IsTruncated>"));
+        assert!(!body.contains("<Version>"));
     }
 
     #[test]
-    fn unsupported_object_lock_still_501() {
+    fn bucket_tagging_put_get_delete_round_trip() {
         let api = S3Api::new(cred_map());
-        let req = sign_request(base_s3_req("GET", "/mybucket", "object-lock"), "testing");
-        let next: NextFn = Arc::new(|_| Response::new(500));
-        assert_not_implemented(api.handle(req, &next), "object-lock");
+        let mut put_req = base_s3_req("PUT", "/mybucket", "tagging");
+        put_req
+            .headers
+            .set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put_req.body = Body::from(
+            br#"<Tagging><TagSet>
+              <Tag><Key>env</Key><Value>prod</Value></Tag>
+              <Tag><Key>team</Key><Value>s3</Value></Tag>
+            </TagSet></Tagging>"#
+                .to_vec(),
+        );
+        let put_req = sign_request(put_req, "testing");
+        let stored = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let stored_c = stored.clone();
+        let put_next: NextFn = Arc::new(move |r| {
+            assert_eq!(r.method, "POST");
+            let v = r.headers.get(S3_BUCKET_TAGGING_META).map(str::to_string);
+            assert!(v.as_ref().is_some_and(|s| s.contains("env")));
+            *stored_c.lock().unwrap() = v;
+            Response::new(204)
+        });
+        assert_eq!(api.handle(put_req, &put_next).status, 200);
+
+        let meta = stored.lock().unwrap().clone().unwrap();
+        let get_req = sign_request(base_s3_req("GET", "/mybucket", "tagging"), "testing");
+        let get_next: NextFn = Arc::new(move |_| {
+            let mut r = Response::new(204);
+            r.headers.set(S3_BUCKET_TAGGING_META, &meta);
+            r
+        });
+        let resp = api.handle(get_req, &get_next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Key>env</Key>"));
+        assert!(body.contains("<Value>prod</Value>"));
+        assert!(body.contains("<Key>team</Key>"));
+
+        let del_req = sign_request(base_s3_req("DELETE", "/mybucket", "tagging"), "testing");
+        let del_next: NextFn = Arc::new(|r| {
+            assert_eq!(r.headers.get(S3_BUCKET_TAGGING_META), Some(""));
+            Response::new(204)
+        });
+        assert_eq!(api.handle(del_req, &del_next).status, 204);
+    }
+
+    #[test]
+    fn object_tagging_put_get_round_trip() {
+        let api = S3Api::new(cred_map());
+        let mut put_req = base_s3_req("PUT", "/mybucket/obj1", "tagging");
+        put_req
+            .headers
+            .set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put_req.body = Body::from(
+            br#"<Tagging><TagSet>
+              <Tag><Key>color</Key><Value>blue</Value></Tag>
+            </TagSet></Tagging>"#
+                .to_vec(),
+        );
+        let put_req = sign_request(put_req, "testing");
+        let stored = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let stored_c = stored.clone();
+        let put_next: NextFn = Arc::new(move |r| {
+            assert_eq!(r.method, "POST");
+            assert_eq!(r.path, "/v1/AUTH_test/mybucket/obj1");
+            let v = r.headers.get(S3_OBJECT_TAGGING_META).map(str::to_string);
+            assert!(v.as_ref().is_some_and(|s| s.contains("color")));
+            *stored_c.lock().unwrap() = v;
+            Response::new(202)
+        });
+        assert_eq!(api.handle(put_req, &put_next).status, 200);
+
+        let meta = stored.lock().unwrap().clone().unwrap();
+        let get_req = sign_request(base_s3_req("GET", "/mybucket/obj1", "tagging"), "testing");
+        let get_next: NextFn = Arc::new(move |r| {
+            assert_eq!(r.method, "HEAD");
+            let mut resp = Response::new(200);
+            resp.headers.set(S3_OBJECT_TAGGING_META, &meta);
+            resp
+        });
+        let resp = api.handle(get_req, &get_next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Key>color</Key>"));
+        assert!(body.contains("<Value>blue</Value>"));
+    }
+
+    #[test]
+    fn lifecycle_put_get_delete_round_trip() {
+        let api = S3Api::new(cred_map());
+        let lifecycle_body = br#"<?xml version="1.0"?>
+<LifecycleConfiguration>
+  <Rule>
+    <ID>expire-logs</ID>
+    <Prefix>logs/</Prefix>
+    <Status>Enabled</Status>
+    <Expiration><Days>30</Days></Expiration>
+  </Rule>
+</LifecycleConfiguration>"#;
+        let mut put_req = base_s3_req("PUT", "/mybucket", "lifecycle");
+        put_req
+            .headers
+            .set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put_req.body = Body::from(lifecycle_body.to_vec());
+        let put_req = sign_request(put_req, "testing");
+        let stored = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let stored_c = stored.clone();
+        let put_next: NextFn = Arc::new(move |r| {
+            assert_eq!(r.method, "POST");
+            let v = r.headers.get(S3_LIFECYCLE_META).map(str::to_string);
+            assert!(v.as_ref().is_some_and(|s| !s.is_empty()));
+            *stored_c.lock().unwrap() = v;
+            Response::new(204)
+        });
+        assert_eq!(api.handle(put_req, &put_next).status, 200);
+
+        let meta = stored.lock().unwrap().clone().unwrap();
+        let get_req = sign_request(base_s3_req("GET", "/mybucket", "lifecycle"), "testing");
+        let get_next: NextFn = Arc::new(move |_| {
+            let mut r = Response::new(204);
+            r.headers.set(S3_LIFECYCLE_META, &meta);
+            r
+        });
+        let resp = api.handle(get_req, &get_next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("LifecycleConfiguration"));
+        assert!(body.contains("expire-logs"));
+        assert!(body.contains("<Days>30</Days>"));
+
+        // GET with no meta → NoSuchLifecycleConfiguration
+        let miss = sign_request(base_s3_req("GET", "/mybucket", "lifecycle"), "testing");
+        let miss_next: NextFn = Arc::new(|_| Response::new(204));
+        let miss_resp = api.handle(miss, &miss_next);
+        assert_eq!(miss_resp.status, 404);
+        let miss_body = String::from_utf8(miss_resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(miss_body.contains("NoSuchLifecycleConfiguration"));
+
+        let del_req = sign_request(base_s3_req("DELETE", "/mybucket", "lifecycle"), "testing");
+        let del_next: NextFn = Arc::new(|r| {
+            assert_eq!(r.headers.get(S3_LIFECYCLE_META), Some(""));
+            Response::new(204)
+        });
+        assert_eq!(api.handle(del_req, &del_next).status, 204);
+    }
+
+    #[test]
+    fn object_lock_put_get_round_trip() {
+        let api = S3Api::new(cred_map());
+        let lock_body = br#"<ObjectLockConfiguration>
+  <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+  <Rule>
+    <DefaultRetention>
+      <Mode>GOVERNANCE</Mode>
+      <Days>7</Days>
+    </DefaultRetention>
+  </Rule>
+</ObjectLockConfiguration>"#;
+        let mut put_req = base_s3_req("PUT", "/mybucket", "object-lock");
+        put_req
+            .headers
+            .set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put_req.body = Body::from(lock_body.to_vec());
+        let put_req = sign_request(put_req, "testing");
+        let stored = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let stored_c = stored.clone();
+        let put_next: NextFn = Arc::new(move |r| {
+            assert_eq!(r.method, "POST");
+            let v = r.headers.get(S3_OBJECT_LOCK_META).map(str::to_string);
+            assert!(v.as_ref().is_some_and(|s| !s.is_empty()));
+            *stored_c.lock().unwrap() = v;
+            Response::new(204)
+        });
+        assert_eq!(api.handle(put_req, &put_next).status, 200);
+
+        let meta = stored.lock().unwrap().clone().unwrap();
+        let get_req = sign_request(base_s3_req("GET", "/mybucket", "object-lock"), "testing");
+        let get_next: NextFn = Arc::new(move |_| {
+            let mut r = Response::new(204);
+            r.headers.set(S3_OBJECT_LOCK_META, &meta);
+            r
+        });
+        let resp = api.handle(get_req, &get_next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("ObjectLockConfiguration"));
+        assert!(body.contains("ObjectLockEnabled"));
+        assert!(body.contains("GOVERNANCE"));
+
+        let miss = sign_request(base_s3_req("GET", "/mybucket", "object-lock"), "testing");
+        let miss_next: NextFn = Arc::new(|_| Response::new(204));
+        let miss_resp = api.handle(miss, &miss_next);
+        assert_eq!(miss_resp.status, 404);
+        let miss_body = String::from_utf8(miss_resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(miss_body.contains("ObjectLockConfigurationNotFoundError"));
+    }
+
+    #[test]
+    fn unsupported_policy_still_501() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/mybucket", "policy"), "testing");
+        let next: NextFn = Arc::new(|_| panic!("unsupported subresource must not fall through"));
+        assert_not_implemented(api.handle(req, &next), "policy");
     }
 
     #[test]
@@ -2351,46 +3012,210 @@ mod tests {
         assert_not_implemented(api.handle(req, &next), "Signature Version 2");
     }
 
+    /// Build a minimal aws-chunked framed body for `payload` with optional
+    /// chunk-signature params (values are not verified).
+    fn frame_aws_chunked(payload: &[u8], with_sig: bool, trailers: &[(&str, &str)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        // Single data chunk + terminal 0 chunk (simple framing for unit tests).
+        if !payload.is_empty() {
+            if with_sig {
+                out.extend_from_slice(
+                    format!(
+                        "{:x};chunk-signature={}",
+                        payload.len(),
+                        "0".repeat(64)
+                    )
+                    .as_bytes(),
+                );
+            } else {
+                out.extend_from_slice(format!("{:x}", payload.len()).as_bytes());
+            }
+            out.extend_from_slice(b"\r\n");
+            out.extend_from_slice(payload);
+            out.extend_from_slice(b"\r\n");
+        }
+        if with_sig {
+            out.extend_from_slice(
+                format!("0;chunk-signature={}", "0".repeat(64)).as_bytes(),
+            );
+        } else {
+            out.extend_from_slice(b"0");
+        }
+        out.extend_from_slice(b"\r\n");
+        for (k, v) in trailers {
+            out.extend_from_slice(format!("{k}:{v}\r\n").as_bytes());
+        }
+        out.extend_from_slice(b"\r\n");
+        out
+    }
+
     #[test]
-    fn aws_chunked_streaming_payload_returns_501() {
+    fn decode_aws_chunked_pure_multi_chunk_and_trailers() {
+        // Multi-chunk: "hello" + " world" + trailers
+        let mut framed = Vec::new();
+        framed.extend_from_slice(b"5;chunk-signature=abc\r\nhello\r\n");
+        framed.extend_from_slice(b"6\r\n world\r\n");
+        framed.extend_from_slice(b"0\r\nx-amz-checksum-crc32:AAAAAA==\r\n\r\n");
+        let decoded = decode_aws_chunked(&framed, Some(11), None).unwrap();
+        assert_eq!(decoded.data, b"hello world");
+        assert_eq!(
+            decoded.trailers.get("x-amz-checksum-crc32").map(String::as_str),
+            Some("AAAAAA==")
+        );
+    }
+
+    #[test]
+    fn decode_aws_chunked_empty_payload() {
+        assert_eq!(
+            decode_aws_chunked(b"0\r\n\r\n", Some(0), None)
+                .unwrap()
+                .data,
+            b""
+        );
+        assert_eq!(
+            decode_aws_chunked(b"0\r\n", Some(0), None).unwrap().data,
+            b""
+        );
+    }
+
+    #[test]
+    fn aws_chunked_streaming_payload_dechunks_to_backend() {
+        let api = S3Api::new(cred_map());
+        let payload = b"streaming-hello";
+        let framed = frame_aws_chunked(payload, true, &[]);
+        let mut req = base_s3_req("PUT", "/mybucket/obj", "");
+        req.headers.set(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        );
+        req.headers.set("Content-Encoding", "aws-chunked");
+        req.headers
+            .set("x-amz-decoded-content-length", payload.len().to_string());
+        req.headers
+            .set("Content-Length", framed.len().to_string());
+        req.body = Body::from(framed);
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.path, "/v1/AUTH_test/mybucket/obj");
+            assert_eq!(r.method, "PUT");
+            let body = r.body.into_vec(u64::MAX).unwrap();
+            assert_eq!(body, b"streaming-hello", "backend must see dechunked body");
+            assert_eq!(
+                r.headers.get("Content-Length"),
+                Some("15"),
+                "Content-Length must match decoded"
+            );
+            // aws-chunked stripped; STREAMING-* cleared before strip_s3_only.
+            assert!(
+                r.headers
+                    .get("Content-Encoding")
+                    .map(|e| !e.to_ascii_lowercase().contains("aws-chunked"))
+                    .unwrap_or(true)
+            );
+            Response::new(201)
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200, "PUT object success maps to 200");
+    }
+
+    #[test]
+    fn aws_chunked_content_encoding_dechunks_to_backend() {
+        let api = S3Api::new(cred_map());
+        let payload = b"raw-via-encoding";
+        let framed = frame_aws_chunked(payload, false, &[]);
+        let mut req = base_s3_req("PUT", "/mybucket/obj", "");
+        // Content-Encoding alone (no STREAMING-* token) still dechunks.
+        req.headers.set("Content-Encoding", "aws-chunked, gzip");
+        // Keep a real payload hash so SigV4 signed-headers path stays valid;
+        // body hash is not re-checked by verify_sigv4 (deferred residual).
+        req.headers
+            .set("Content-Length", framed.len().to_string());
+        req.headers
+            .set("x-amz-decoded-content-length", payload.len().to_string());
+        req.body = Body::from(framed);
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|r| {
+            let body = r.body.into_vec(u64::MAX).unwrap();
+            assert_eq!(body, b"raw-via-encoding");
+            assert_eq!(r.headers.get("Content-Length"), Some("16"));
+            // Only aws-chunked stripped; other encodings retained.
+            assert_eq!(r.headers.get("Content-Encoding"), Some("gzip"));
+            Response::new(201)
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn aws_chunked_trailer_unsigned_dechunks_to_backend() {
+        let api = S3Api::new(cred_map());
+        let payload = b"with-trailers";
+        let framed = frame_aws_chunked(
+            payload,
+            false,
+            &[("x-amz-checksum-crc32", "AAAAAA==")],
+        );
+        let mut req = base_s3_req("PUT", "/mybucket/obj", "");
+        req.headers.set(
+            "x-amz-content-sha256",
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+        );
+        req.headers.set("Content-Encoding", "aws-chunked");
+        req.headers
+            .set("x-amz-decoded-content-length", payload.len().to_string());
+        req.headers
+            .set("Content-Length", framed.len().to_string());
+        req.body = Body::from(framed);
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|r| {
+            let body = r.body.into_vec(u64::MAX).unwrap();
+            assert_eq!(body, b"with-trailers");
+            assert_eq!(r.headers.get("Content-Length"), Some("13"));
+            Response::new(201)
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn aws_chunked_malformed_returns_incomplete_body() {
         let api = S3Api::new(cred_map());
         let mut req = base_s3_req("PUT", "/mybucket/obj", "");
         req.headers.set(
             "x-amz-content-sha256",
             "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
         );
-        // Signature would be wrong for streaming; rejection must happen
-        // before SignatureDoesNotMatch so clients see NotImplemented.
-        let req = sign_request(req, "testing");
-        let next: NextFn = Arc::new(|_| {
-            panic!("aws-chunked must not reach backend");
-        });
-        assert_not_implemented(api.handle(req, &next), "aws-chunked");
-    }
-
-    #[test]
-    fn aws_chunked_content_encoding_returns_501() {
-        let api = S3Api::new(cred_map());
-        let mut req = base_s3_req("PUT", "/mybucket/obj", "");
         req.headers.set("Content-Encoding", "aws-chunked");
+        req.headers.set("x-amz-decoded-content-length", "5");
+        // Truncated framing — no terminal 0 chunk.
+        req.body = Body::from(b"5\r\nhello".to_vec());
         let req = sign_request(req, "testing");
-        let next: NextFn = Arc::new(|_| {
-            panic!("Content-Encoding aws-chunked must not reach backend");
-        });
-        assert_not_implemented(api.handle(req, &next), "aws-chunked");
+        let next: NextFn = Arc::new(|_| panic!("malformed must not reach backend"));
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(
+            body.contains("IncompleteBody") || body.contains("incomplete"),
+            "expected IncompleteBody error, got {body}"
+        );
     }
 
     #[test]
-    fn aws_chunked_trailer_unsigned_returns_501() {
+    fn aws_chunked_streaming_missing_decoded_length_is_411() {
         let api = S3Api::new(cred_map());
         let mut req = base_s3_req("PUT", "/mybucket/obj", "");
         req.headers.set(
             "x-amz-content-sha256",
             "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
         );
+        req.headers.set("Content-Encoding", "aws-chunked");
+        req.body = Body::from(b"0\r\n\r\n".to_vec());
         let req = sign_request(req, "testing");
         let next: NextFn = Arc::new(|_| panic!("must not reach backend"));
-        assert_not_implemented(api.handle(req, &next), "aws-chunked");
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 411);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("MissingContentLength"), "got {body}");
     }
 
     #[test]

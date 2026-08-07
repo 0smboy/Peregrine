@@ -1,0 +1,44 @@
+warning: failed to auto-clean cache data
+
+failed to clean entries from the global cache
+
+Caused by:
+  failed to remove file `/Users/oboy/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-macro-0.3.31/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
+   Compiling swift-middleware v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-middleware)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.18s
+     Running unittests src/lib.rs (target/debug/deps/swift_middleware-7a92af109edbe29b)
+
+running 27 tests
+test slo::tests::test_expirer_task_container_hash_sharding ... ok
+test slo::tests::test_dlo_etag ... ok
+test slo::tests::test_manifest_etag ... ok
+test slo::tests::test_multipart_delete_async_manifest_missing ... ok
+test slo::tests::test_inline_data_only_rejected ... ok
+test slo::tests::test_async_delete_acl_probe_forbidden ... ok
+test slo::tests::test_async_delete_acl_probe_segment_container ... ok
+test slo::tests::test_heartbeat_put_returns_202 ... ok
+test slo::tests::test_multipart_delete_async_rejects_multi_container ... ok
+test slo::tests::test_multipart_delete_async_rejects_nested ... ok
+test slo::tests::test_heartbeat_put_yields_space_per_head ... ok
+test slo::tests::test_inline_data_put_and_get ... ok
+test slo::tests::test_normalize_etag ... ok
+test slo::tests::test_slo_etag_data_segment ... ok
+test slo::tests::test_slo_etag_ranged_segment ... ok
+test slo::tests::test_slo_etag_whole_segments ... ok
+test slo::tests::test_multipart_delete_async_enqueues_and_deletes_manifest ... ok
+test slo::tests::test_multipart_manifest_get_format_raw ... ok
+test slo::tests::test_multipart_manifest_delete ... ok
+test slo::tests::test_slo_head_uses_sysmeta_not_manifest_length ... ok
+test slo::tests::test_slo_non_manifest_passthrough ... ok
+test slo::tests::test_slo_full_get_reassembles ... ok
+test slo::tests::test_slo_get_is_lazy_and_aborts_midstream ... ok
+test slo::tests::test_slo_range_uses_per_segment_range ... ok
+test slo::tests::test_slo_range_get ... ok
+test slo::tests::test_slo_nested_sub_slo_get ... ok
+test slo::tests::test_multipart_delete_async_update_fallback_deletes_manifest ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 381 filtered out; finished in 0.02s
+

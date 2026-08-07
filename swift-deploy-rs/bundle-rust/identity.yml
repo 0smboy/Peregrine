@@ -1,0 +1,42 @@
+---
+# Optional Identity 对接 playbook (bundle-rust).
+#
+# Does NOT provision MariaDB/Keystone. Re-renders proxy filters + HAProxy
+# Identity listeners when flags are set, and runs rust_identity_bridge asserts.
+#
+# Prerequisites:
+#   1) Python inventory install (config_contabo_identity + install_mariadb_keystone.yml)
+#   2) group_vars identity_* / auth_method knobs (see IDENTITY.md)
+#
+# Apply:
+#   swift-deploy apply … --bundle bundle-rust --playbook identity.yml
+#
+# Default Contabo: leave flags false — this playbook is a no-op for 对接 roles
+# (when: false → tasks skipped). Dual-guard: no disk wipe.
+#
+# Tags: identity, identity_proxy, identity_haproxy, config, haproxy
+
+- hosts: all
+  tags: [identity, identity_proxy, config]
+  roles:
+    - role: rust_config
+      when: >
+        identity_proxy_enabled | default(false)
+        or (auth_method | default('tempauth')) == 'keystone'
+        or (auth_method | default('tempauth')) == 'keystone_coexist'
+
+- hosts: haproxy_servers
+  tags: [identity, identity_haproxy, haproxy, lb]
+  roles:
+    - role: rust_haproxy
+      when: use_lb and (identity_haproxy_enabled | default(false))
+
+- hosts: all
+  tags: [identity]
+  roles:
+    - role: rust_identity_bridge
+      when: >
+        identity_haproxy_enabled | default(false)
+        or identity_proxy_enabled | default(false)
+        or (auth_method | default('tempauth')) == 'keystone'
+        or (auth_method | default('tempauth')) == 'keystone_coexist'

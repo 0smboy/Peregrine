@@ -52,9 +52,14 @@ See evidence packs:
 - `tools/test-results/wave3-s3-l3b-prod-YYYYMMDD/S3-COMPAT-MATRIX.md`
 - Prior: `tools/test-results/wave3-s3-l3b-20260805/S3-COMPAT-MATRIX.md`
 
-**WONTFIX (written)** unless a later plan reopens: SigV2, aws-chunked streaming,
-bucket versioning / tagging / lifecycle / object-lock. Full IAM ACL fidelity
+**WONTFIX (written)** unless a later plan reopens: SigV2. Full IAM ACL fidelity
 remains residual (basic canned ACL + read ACL XML only).
+
+**Config subresources (unit meta round-trip, 2026-08-07):** versioning status
+GET/PUT, tagging GET/PUT/DELETE (bucket+object), lifecycle GET/PUT/DELETE,
+object-lock GET/PUT, empty `?versions` list — see
+`tools/test-results/impl-s3-versioning-surface-20260807/`. Multi-version object
+bodies, lifecycle expirer, and object-lock WORM remain **residual**.
 
 ## Claims discipline
 

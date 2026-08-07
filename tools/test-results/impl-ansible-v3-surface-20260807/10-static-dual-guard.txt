@@ -1,0 +1,21 @@
+=== dual-guard: executable (non-comment) lines with wipe tools ===
+PASS: no executable mkfs/wipefs/dd/parted wipe in role tasks
+
+=== plan DiskWipe across all sealed plans ===
+plan-deferred-python.json: tasks=5 disk_wipe=0
+plan-expand-sample.json: tasks=50 disk_wipe=0
+plan-expand.json: tasks=51 disk_wipe=0
+plan-identity.json: tasks=22 disk_wipe=0
+plan-mon-swift.json: tasks=24 disk_wipe=0
+plan-monitoring.json: tasks=1 disk_wipe=0
+plan-risk-summary.json: tasks=0 disk_wipe=0
+plan-swift-sample.json: tasks=139 disk_wipe=0
+plan-swift.json: tasks=140 disk_wipe=0
+
+=== rust_disks refuse flags present ===
+16:      bundle-rust dual-guard: refuse force_format_disks / include_python_format_disks
+17:      / allow_disk_wipe inventory vars. Prepare mounts out-of-band, then expand.yml.
+20:    (force_format_disks | default(false))
+21:    or (include_python_format_disks | default(false))
+22:    or (allow_disk_wipe | default(false))
+23:    or (use_format_disks | default(false))

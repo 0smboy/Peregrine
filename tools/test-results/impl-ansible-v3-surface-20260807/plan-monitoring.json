@@ -1,0 +1,44 @@
+{
+  "schema_version": 2,
+  "bundle_fingerprint": "c0989055cdd23d754329a760b87a334656a0d660f5f87be9697ac73c82fc34e6",
+  "inventory_fingerprint": "89464e280c8381afe88e523f98d42f284c466f298ebad80f463a59450b92c3ea",
+  "playbook": "monitoring.yml",
+  "hosts": [
+    "10.0.0.11",
+    "10.0.0.12"
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "source": "roles/monitoring_overlay_path/tasks/main.yml#1",
+      "role": "monitoring_overlay_path",
+      "name": "point operators at bundle-monitoring (no agents installed here)",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "fail",
+      "args": {
+        "msg": "Monitoring is not inlined into bundle-rust. Apply swift-deploy-rs/bundle-monitoring/swift.yml (roles mon_payload, mon_config, mon_systemd). See roles/monitoring_overlay_path/README.md."
+      },
+      "vars": {},
+      "when": [
+        "deploy_monitoring | default(false)"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    }
+  ],
+  "handlers": [],
+  "digest": "6074fb735e9bb8d2c6fb5bfeb979b2684432b5fb97d68c34563996b0e0ec0d30"
+}

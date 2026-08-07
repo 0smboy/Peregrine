@@ -1,0 +1,126 @@
+=== ANSIBLE-V3-SURFACE.md head ===
+# Ansible v3 surface — Python `bundle/` vs Rust `bundle-rust/`
+
+**As of:** 2026-08-07  
+**Authority for:** Platform row *Full ansible v3 surface* in [RUST-VS-PYTHON-PARITY.md](RUST-VS-PYTHON-PARITY.md)  
+**Evidence:** [`tools/test-results/impl-ansible-v3-surface-20260807/`](../../tools/test-results/impl-ansible-v3-surface-20260807/)  
+**Related:** [DEPLOY-HYBRID.md](DEPLOY-HYBRID.md) · [P3-OPS-CONTRACT.md](P3-OPS-CONTRACT.md) · [KEYSTONE-LIVE.md](KEYSTONE-LIVE.md) · [MULTI-REGION.md](MULTI-REGION.md)
+
+## Claim level (honest)
+
+| Stack | Path | Claim |
+|-------|------|-------|
+| Python ansible-v3 | `swift-deploy-rs/bundle/` | Near-full upstream-style surface (format disks, Keystone install, security, cosbench, …) |
+| Rust stack | `swift-deploy-rs/bundle-rust/` | **PARTIAL / GREEN** for *implemented* Rust Swift data-plane + LB + expand + Identity *对接* |
+| Monitoring agents | `swift-deploy-rs/bundle-monitoring/` | Separate bundle; not inlined into `bundle-rust/swift.yml` |
+
+**Do not claim** full Python ansible-v3 role parity for `bundle-rust`. Contabo production data-plane target is pure `bundle-rust apply`; wipe/format, Keystone *provisioning*, and platform hardening stay on explicit Python or out-of-band paths.
+
+---
+
+## 1. Full role matrix
+
+Status legend:
+
+| Status | Meaning |
+|--------|---------|
+| **DONE** | Implemented in `bundle-rust` and on the default or opt-in apply path |
+| **PARTIAL** | Covered only for a subset of Python behavior, or via config flags / composite roles |
+| **ABSENT** | Not implemented in `bundle-rust`; use Python bundle or OOB (documented) |
+| **N/A** | Scaffold / dead / not part of production Contabo claim |
+
+### 1.1 Roles used by `bundle/swift.yml`
+
+| Python role | Rust equivalent | Status | Notes |
+|-------------|-----------------|:------:|-------|
+| `check` | swift-deploy-rs preflight / workspace validation | **PARTIAL** | No SAIO-mode fail role; engine preflight + `deploy_stack=rust` gates |
+| `common` | `rust_common` | **PARTIAL** | timezone, dirs, rsync; no Keystone hosts-file, no REINSTALL kill-all, no hostname_modifiable |
+| `performance_tuning` | — / `python_only_platform` docs | **ABSENT** | limits/sysctl NIC tuning not in rust bundle |
+| `chrony` | groups kept empty-ok / `python_only_platform` | **ABSENT** | NTP groups exist for inventory validation only; not managed |
+| `haproxy_servers` | `rust_haproxy` | **DONE** | `when: use_lb`; TLS via `lb_mode=https` (operator PEM or self-signed) |
+| `keepalived_servers` | `rust_keepalived` | **DONE** | `when: use_lb`; VIP health tracks haproxy |
+| `swift_proxy` | `rust_payload` + `rust_config` + `rust_systemd` + `rust_verify` | **DONE** | TempAuth default; Keystone filters on-by-config only |
+| `storage_nodes_common` | `rust_common` + `rust_disks` + `rust_replication_key` | **PARTIAL** | pkgs subset; mkdir devices only |
+| `format_disks` | **never** / `python_only_format_disks` | **ABSENT** | Dual-guard (see §4). Python only + ticket |
+| `swift_account` | `rust_config` + `rust_systemd` (+ payload) | **DONE** | account server + reaper/auditor units as implemented |
+| `swift_container` | `rust_config` + `rust_systemd` (+ payload) | **DONE** | + sharder/updater/reconciler units as present |
+| `swift_object` | `rust_config` + `rust_systemd` (+ payload) | **DONE** | + replicator/reconstructor/expirer/auditor |
+| `ring_builder` | `rust_rings` | **DONE** | stamp rebuild; expand via `expand.yml` |
+| `ring_utils` | `rust_rings` (fetch/distribute) | **DONE** | controller `ring_fetch_dir` staging |
+| `finalize_installation` | `rust_systemd` + `rust_verify` | **PARTIAL** | no `/etc/.peregrine` backup dance; fail-closed health + tempauth PUT/GET |
+| `mariadb_servers` | Python only / `python_only_identity` | **ABSENT** | Galera not rewritten into rust (`KEYSTONE-LIVE.md`) |
+| `keystone_install` | Python only / `python_only_identity` | **ABSENT** | install packages via python inventory |
+| `keystones` | Identity 对接 flags + `rust_identity_bridge` | **PARTIAL** | No bootstrap role; proxy filters + optional HAProxy listeners only |
+| `proxyfs` | — / `python_only_extras` | **ABSENT** | not in Contabo rust claim |
+| `security` | — / `python_only_platform` | **ABSENT** | sshd bind + firewall intentionally not auto-applied |
+
+### 1.2 Roles only on other Python playbooks
+
+| Python role | Playbook(s) | Rust equivalent | Status | Notes |
+|-------------|-------------|-----------------|:------:|-------|
+| `format_new_disks` | `add_new_disks.yml` | OOB mount + `expand.yml` | **ABSENT** | no mkfs in rust; operator prepares XFS |
+| `new_ring` | `add_new_ring.yml` | multi-policy in `swift_policies` + ring rebuild | **PARTIAL** | no dedicated add-policy playbook; greenfield stamp / expand |
+| `docker` | `install_cosbench.yml` | — | **ABSENT** | |
+| `cosbench` | `install_cosbench.yml` | — / autocos-rs / cosbench-rs OOB | **ABSENT** | fairness tools live under monorepo `cosbench-rs` / `autocos` |
+| `system_tuning` | `system_tuning_deploy.yml` | — | **ABSENT** | |
+| `example_structure` | (scaffold) | — | **N/A** | |
+
+### 1.3 Rust-only roles (no Python 1:1)
+
+| Rust role | Purpose | Python nearest |
+|-----------|---------|----------------|
+| `rust_payload` | seal binaries + liberasurecode into bundle | yum packages under `swift_*` |
+| `rust_disks` | mkdir-only devices; dual-guard comments | `format_disks` (opposite: never wipe) |
+| `rust_replication_key` | ed25519 rsync-over-ssh | storage_nodes rsync setup |
+| `rust_expand_mode` | `set_fact ring_expand=true` for expand.yml | add_nodes / add_new_disks mode |
+| `rust_verify` | fail-closed healthcheck + tempauth CRUD | parts of finalize / manual smoke |
+| `rust_identity_bridge` | optional assert/docs when identity flags on; **never installs Keystone** | `keystones` bootstrap (docs only) |
+| `python_only_*` | README + fail-closed if mis-included | map ABSENT Python roles |
+| `monitoring_overlay_path` | points at `bundle-monitoring` | n/a in python v3 core |
+
+### 1.4 Monitoring (separate bundle)
+
+| Piece | Path | Status vs python v3 |
+|-------|------|---------------------|
+| mon agents playbook | `bundle-monitoring/swift.yml` | **DONE** as overlay; not a `bundle/` role |
+| roles | `mon_payload`, `mon_config`, `mon_systemd` | R0 node_exporter / statsd_exporter / Alloy |
+| Contabo Prom rules / textfile | `tools/monitoring/` | ops overlay |
+
+---
+
+## 2. Play coverage differences
+
+### 2.1 Greenfield
+
+| Python `bundle/swift.yml` plays | Rust `bundle-rust/swift.yml` |
+|---------------------------------|------------------------------|
+| all → check | (engine preflight) |
+| all → common | all → `rust_common`, `rust_payload` |
+| performance_tuning | **ABSENT** |
+| ntp_server/clients → chrony | **ABSENT** (groups may be empty) |
+| haproxy_servers | haproxy_servers → `rust_haproxy` `when: use_lb` |
+
+=== playbook tags grep ===
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/swift.yml:32:  tags: [common, payload]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/swift.yml:38:  tags: [disks, replication]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/swift.yml:44:  tags: [config, rings, systemd]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/swift.yml:51:  tags: [haproxy, lb]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/swift.yml:57:  tags: [keepalived, lb]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/swift.yml:66:  tags: [identity]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/swift.yml:76:  tags: [verify]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/expand.yml:21:  tags: [expand]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/expand.yml:26:  tags: [expand, disks, replication]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/expand.yml:32:  tags: [expand, rings]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/expand.yml:37:  tags: [expand, haproxy, lb]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/expand.yml:43:  tags: [expand, keepalived, lb]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/expand.yml:49:  tags: [expand, verify]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/identity.yml:20:  tags: [identity, identity_proxy, config]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/identity.yml:29:  tags: [identity, identity_haproxy, haproxy, lb]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/identity.yml:35:  tags: [identity]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/deferred-python.yml:24:  tags: [deferred, python_only, keystone_install]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/deferred-python.yml:30:  tags: [deferred, python_only, mariadb_servers]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/deferred-python.yml:39:  tags: [deferred, python_only, format_disks]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/deferred-python.yml:46:  tags: [deferred, python_only, platform]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/deferred-python.yml:53:  tags: [deferred, python_only, extras]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-rust/monitoring.yml:23:  tags: [monitoring, mon_agents]
+/Users/oboy/Downloads/Peregrine/swift-deploy-rs/bundle-monitoring/swift.yml:17:  tags: [monitoring, mon_agents, mon_payload, mon_config, mon_systemd]

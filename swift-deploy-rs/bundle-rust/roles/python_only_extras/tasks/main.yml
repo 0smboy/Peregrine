@@ -1,0 +1,7 @@
+---
+- name: refuse cosbench/docker/proxyfs via bundle-rust
+  fail:
+    msg: >-
+      docker / cosbench / proxyfs / dedicated new_ring plays are not part of
+      bundle-rust. See roles/python_only_extras/README.md and
+      docs/fairness-lab/ANSIBLE-V3-SURFACE.md.

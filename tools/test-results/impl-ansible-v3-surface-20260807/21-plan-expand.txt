@@ -1,0 +1,7 @@
+=== plan expand.yml ===
+plan=/Users/oboy/Downloads/Peregrine/tools/test-results/impl-ansible-v3-surface-20260807/plan-expand.json digest=abc08ba18b5eed2e91489c349dd3e0052d296ce41ca6f006c8b4637c17eb0364 hosts=2 tasks=51 risks=[HostReconfigure]
+tasks=51 hosts=2
+risk_counts= {'host_reconfigure': 9}
+disk_wipe_tasks=0
+roles= {'rust_expand_mode': 1, 'rust_disks': 3, 'rust_replication_key': 9, 'rust_rings': 7, 'rust_haproxy': 14, 'rust_keepalived': 12, 'rust_verify': 5}
+tasks_with_when=30

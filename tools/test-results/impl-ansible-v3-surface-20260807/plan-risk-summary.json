@@ -1,0 +1,93 @@
+{
+  "plan-swift.json": {
+    "tasks": 140,
+    "hosts": 2,
+    "disk_wipe": 0,
+    "risks": {
+      "host_reconfigure": 64
+    },
+    "roles": {
+      "rust_common": 6,
+      "rust_payload": 5,
+      "rust_disks": 3,
+      "rust_replication_key": 9,
+      "rust_config": 5,
+      "rust_rings": 7,
+      "rust_systemd": 71,
+      "rust_haproxy": 14,
+      "rust_keepalived": 12,
+      "rust_identity_bridge": 3,
+      "rust_verify": 5
+    },
+    "digest": "11ec04a1ab1e004667f4bed72509a434c61f17594970f2c371cec0dd64c9cef2"
+  },
+  "plan-expand.json": {
+    "tasks": 51,
+    "hosts": 2,
+    "disk_wipe": 0,
+    "risks": {
+      "host_reconfigure": 9
+    },
+    "roles": {
+      "rust_expand_mode": 1,
+      "rust_disks": 3,
+      "rust_replication_key": 9,
+      "rust_rings": 7,
+      "rust_haproxy": 14,
+      "rust_keepalived": 12,
+      "rust_verify": 5
+    },
+    "digest": "abc08ba18b5eed2e91489c349dd3e0052d296ce41ca6f006c8b4637c17eb0364"
+  },
+  "plan-identity.json": {
+    "tasks": 22,
+    "hosts": 2,
+    "disk_wipe": 0,
+    "risks": {
+      "host_reconfigure": 3
+    },
+    "roles": {
+      "rust_config": 5,
+      "rust_haproxy": 14,
+      "rust_identity_bridge": 3
+    },
+    "digest": "71b0f9db309002fb7deaa221280df1e1b01d5bf964d56b54e331c2e9711403f8"
+  },
+  "plan-monitoring.json": {
+    "tasks": 1,
+    "hosts": 2,
+    "disk_wipe": 0,
+    "risks": {},
+    "roles": {
+      "monitoring_overlay_path": 1
+    },
+    "digest": "6074fb735e9bb8d2c6fb5bfeb979b2684432b5fb97d68c34563996b0e0ec0d30"
+  },
+  "plan-deferred-python.json": {
+    "tasks": 5,
+    "hosts": 2,
+    "disk_wipe": 0,
+    "risks": {},
+    "roles": {
+      "python_only_identity": 2,
+      "python_only_format_disks": 1,
+      "python_only_platform": 1,
+      "python_only_extras": 1
+    },
+    "digest": "ecddcf0cae03083788ade0601244d4a080965cfbc451c1ac476a0c9a945545be"
+  },
+  "plan-mon-swift.json": {
+    "tasks": 24,
+    "hosts": 2,
+    "disk_wipe": 0,
+    "risks": {
+      "host_reconfigure": 13
+    },
+    "roles": {
+      "mon_payload": 3,
+      "mon_config": 6,
+      "mon_systemd": 15
+    },
+    "digest": "8849904ff255e8ab54ca8588ab25b19b7efc24a8eb8fa598502a0d40c5be0503"
+  }
+}

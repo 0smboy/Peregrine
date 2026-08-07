@@ -29,13 +29,28 @@
 //! rather than falling through to non-S3 filters:
 //!
 //! * **SigV2** auth (`Authorization: AWS …` / `AWSAccessKeyId`) — WONTFIX
-//! * **aws-chunked** streaming (`STREAMING-*` / `Content-Encoding: aws-chunked`)
-//!   — WONTFIX
-//! * **versioning / tagging / lifecycle** (+ related subresources) — WONTFIX
-//!   production stop-line unless reopened
+//!
+//! **aws-chunked / STREAMING-*** (`Content-Encoding: aws-chunked` and/or
+//! `X-Amz-Content-SHA256: STREAMING-*`) is **implemented**: framed PUT/POST
+//! bodies are dechunked after SigV4 header verify; decoded bytes go to the
+//! backend with fixed `Content-Length`. Per-chunk / trailer signature
+//! verification is residual (dechunk always works).
+//!
+//! # Subresource config APIs (meta round-trip; not full object versioning)
+//!
+//! Claimable unit surface (store/return XML via container or object meta):
+//!
+//! * **versioning** GET/PUT — `Enabled`|`Suspended` in container meta
+//! * **tagging** GET/PUT/DELETE on bucket and object
+//! * **lifecycle** GET/PUT/DELETE — raw LifecycleConfiguration XML round-trip
+//! * **object-lock** GET/PUT — raw ObjectLockConfiguration XML round-trip
+//! * **versions** list — empty `ListVersionsResult` (no multi-version bodies)
 //!
 //! Other residuals (not claimable as implemented):
 //!
+//! * multi-version object bodies / versionId GET-DELETE / delete-markers
+//! * lifecycle expirer enforcement from stored rules
+//! * object-lock WORM / retention / legal-hold object APIs
 //! * full IAM / grant-header object ACL (canned private/public-read object ACL
 //!   via sysmeta **is** claimable for PUT/GET `?acl`; object public-read does
 //!   **not** by itself authorize anonymous Swift GET — container ACL still
@@ -43,6 +58,7 @@
 //! * authenticated-read / log-delivery-write canned ACLs (Python NotImplemented)
 //! * CORS ExposeHeader edge cases in live preflight
 //! * clock-skew/expiry enforcement on every path
+//! * per-chunk / trailer signature chains for STREAMING-AWS4-HMAC-SHA256-*
 //!
 //! Unknown access keys (EC2 / Keystone) are deferred via an optional
 //! [`swift_middleware::S3TokenClient`] on [`middleware::S3Api`] (inline
@@ -51,6 +67,8 @@
 //! auth details.
 
 pub mod acl_cors;
+pub mod aws_chunked;
+pub mod bucket_config;
 pub mod crypto;
 pub mod delete;
 pub mod middleware;

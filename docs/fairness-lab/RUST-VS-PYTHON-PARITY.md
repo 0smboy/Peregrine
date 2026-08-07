@@ -38,7 +38,7 @@
 | Bulk upload / extract-archive | ✅ | ✅ | tar / tar.gz / tar.bz2; `/info` bulk_upload (2026-08-06) |
 | Account autocreate | ✅ | ✅ | |
 | Allow account management | ✅ | ✅ | `allow_account_management` conf; PUT/DELETE gated **405** when off; unit reaffirm 2026-08-07 (`residual-pipeline-account-20260807`: lib 19/19 + gate test) |
-| SLO residual: expirer hash sharding / async ACL probes | ✅ | ❌ | day-bucket enqueue without hash_path offset; authorize residual |
+| SLO residual: expirer hash sharding / async ACL probes | ✅ | ✅ | hash_path day-bucket offset + HEAD write probes (`impl-slo-expirer-hash-20260807`) |
 | Full Paste arbitrary pipeline (any filter name) | ✅ | partial | Unknown names **skip** by default; `strict_pipeline=true` hard-fails startup (Paste-like) — unit 2026-08-07 (`residual-pipeline-account-20260807`: pipeline/strict binary 15/15). Implementing every filter name still ❌ |
 
 ---
@@ -82,9 +82,13 @@
 | Object canned ACL store + GET `?acl` | ✅ | ✅ | `x-amz-acl` → `X-Object-Sysmeta-S3-Acl`; unit 2026-08-07; **not** anonymous Swift GET by itself |
 | Multi-rule CORS put/get | ✅ | ✅ | compact `X-Container-Meta-S3-Cors` + first-rule stamps; unit `cors_multi_rule_*` 2026-08-07 |
 | s3token → Keystone /v3/s3tokens | ✅ | ✅ | live EC2 GREEN 2026-08-06 |
-| SigV2 | ✅ | ❌ | **WONTFIX** — stable **501** `Code=NotImplemented` (unit header+query) `residual-s3-surface-20260807` |
-| aws-chunked / STREAMING-* | ✅ | ❌ | **WONTFIX** — stable **501** (streaming payload / Content-Encoding / trailer) unit |
-| Versioning / tagging / lifecycle / object-lock / versions | ✅ | ❌ | **WONTFIX** — stable **501** on `UNSUPPORTED_SUBRESOURCES` unit |
+| SigV2 | ✅ | ❌ | **WONTFIX** — stable **501** `Code=NotImplemented` (unit header+query) |
+| aws-chunked / STREAMING-* | ✅ | ✅ | dechunk after SigV4 header verify; per-chunk sig residual; unit `aws_chunked_*_dechunks_to_backend` |
+| Versioning status GET/PUT | ✅ | ✅ | meta `X-Container-Meta-S3-Versioning`; unit `versioning_put_get_round_trip` `impl-s3-versioning-surface-20260807` |
+| List object versions (`?versions`) | ✅ | ⚠️ | empty `ListVersionsResult` only — multi-version bodies **residual** |
+| Tagging GET/PUT/DELETE (bucket + object) | ⚠️ (GET empty / PUT NotImpl) | ✅ | meta TagSet round-trip; unit `*_tagging_*_round_trip` |
+| Lifecycle GET/PUT/DELETE | ❌ / limited | ✅ | raw XML in container meta; unit `lifecycle_put_get_delete_round_trip` (no expirer) |
+| Object-lock config GET/PUT | ❌ GET not-found / PUT NotImpl | ✅ | raw XML meta round-trip; unit `object_lock_put_get_round_trip` (no WORM) |
 | Full IAM / grant-header ACL / ACP XML body PUT | ✅ | ❌ | **RESIDUAL — not implemented**; canned only; do **not** claim KEEP |
 | authenticated-read / log-delivery-write canned | ❌ / NotImpl | ❌ | map to private; no AuthenticatedUsers Swift ACL |
 
@@ -148,7 +152,7 @@
 | `servers_per_port` process isolation | ✅ | ✅ | Contabo live 6211/6212 |
 | HAProxy + Keepalived | ✅ | ✅ | lab |
 | VIP TLS (operator PEM path) | ✅ | ⚠️ | Code+ops script GREEN; Contabo still **self-signed LAB** (2026-08-06 probe); production PEM apply not executed |
-| Full ansible v3 surface | ✅ | ❌ | deploy-rs subset + dual-guard |
+| Full ansible v3 surface | ✅ | ⚠️ | **PARTIAL/GREEN** for implemented subset (data-plane + LB/Keepalived + TLS knobs + `expand.yml` + Identity 对接 flags); **not** full Python role parity — matrix [`ANSIBLE-V3-SURFACE.md`](ANSIBLE-V3-SURFACE.md) + evidence `tools/test-results/impl-ansible-v3-surface-20260807/` |
 | Keystone + Galera | ✅ | ✅ | Contabo LAB (not prod PEM) |
 | Monitoring (Prom/Grafana/tombstone) | ✅ | ✅ | R0 wired |
 
@@ -160,12 +164,13 @@
 |--------|-------------|----------------------------------|
 | Swift v1 core CRUD + common middleware | **Most** | full arbitrary Paste; SLO async ACL/hash_path residual |
 | Auth | TempAuth + Keystone lab | Production-only ops polish |
-| S3 | SigV4 + MPU + ListParts + canned ACL + object ?acl store + multi-rule CORS (unit 93/93 `swift-s3api` `residual-s3-surface-20260807`) | SigV2 / aws-chunked / versioning+tagging+lifecycle **WONTFIX 501**; full IAM/grant-header ACP **residual (not KEEP)** |
+| S3 | SigV4 + MPU + canned ACL + multi-rule CORS + **aws-chunked dechunk** + versioning/tagging/lifecycle/object-lock **subresource APIs** (unit 117/117) | SigV2 **WONTFIX 501**; full multi-version object bodies residual; full IAM ACP residual |
 | EC | Data path + heal | macOS/default build; some EC throttling niceties |
 | Sharding L3b | CLI + daemon ring-part cleave + fan-out + ×4 Contabo; **product-style 40×4KB KEEP** on SHARDED `shrinklab` (HEAD=list, GET 5/5) `priority-wave-20260806` | Python对照 / multi-hour soak / multi-primary auto-shrink **未宣称** |
 | Crypto at-rest middleware | multi-root + listing + range GET + etag mask + **chunked PUT encrypt** | KMIP; ciphertext still buffered (footer residual) |
 | container-sync | filter + daemon + HTTPS + CA knobs + Contabo same-cluster object KEEP | multi-cluster realm live soak (no second cluster / realms conf) |
 | Production go-live | ops TLS script ready; VIP :8085 **lab SSL live** (self-signed) | **未实现** operator PEM + trust path (`priority-wave-20260806`) |
+| Full ansible v3 surface (deploy) | near-full `bundle/` | **PARTIAL** matrix [ANSIBLE-V3-SURFACE.md](ANSIBLE-V3-SURFACE.md); evidence `impl-ansible-v3-surface-20260807` — do **not** claim full role twin |
 
 **Bottom line under the user rule (“部分 = 未实现”):**  
 Rust is a **strong core-path + lab-proven** Swift, **not** a drop-in “full OpenStack Swift feature twin.” Fairness and product claims must stay **CORE-PATH / LAB-HARD-GREEN**, not “feature-complete vs Python.”

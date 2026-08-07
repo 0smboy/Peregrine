@@ -1,0 +1,39 @@
+=== deferred-python when: lines ===
+6:# explicit role-level `when:` defaults of false. Enabling a flag without
+7:# switching to the Python bundle fails closed via python_only_* roles.
+10:#   - Never set include_python_format_disks / force_disk_wipe on live data disks.
+24:  tags: [deferred, python_only, keystone_install]
+26:    - role: python_only_identity
+27:      when: include_python_keystone_install | default(false)
+30:  tags: [deferred, python_only, mariadb_servers]
+32:    - role: python_only_identity
+33:      when: include_python_keystone_install | default(false)
+36:# Default when: false. Even if forced true, python_only_format_disks fails
+39:  tags: [deferred, python_only, format_disks]
+41:    - role: python_only_format_disks
+42:      when: include_python_format_disks | default(false)
+46:  tags: [deferred, python_only, platform]
+48:    - role: python_only_platform
+49:      when: include_python_platform | default(false)
+53:  tags: [deferred, python_only, extras]
+55:    - role: python_only_extras
+56:      when: include_python_extras | default(false)
+
+=== identity when: lines ===
+5:# Identity listeners when flags are set, and runs rust_identity_bridge asserts.
+9:#   2) group_vars identity_* / auth_method knobs (see IDENTITY.md)
+15:# (when: false → tasks skipped). Dual-guard: no disk wipe.
+17:# Tags: identity, identity_proxy, identity_haproxy, config, haproxy
+20:  tags: [identity, identity_proxy, config]
+23:      when: >
+24:        identity_proxy_enabled | default(false)
+29:  tags: [identity, identity_haproxy, haproxy, lb]
+32:      when: use_lb and (identity_haproxy_enabled | default(false))
+37:    - role: rust_identity_bridge
+38:      when: >
+39:        identity_haproxy_enabled | default(false)
+40:        or identity_proxy_enabled | default(false)
+
+=== monitoring when: lines ===
+18:# When deploy_monitoring | default(false) is false (default), role-level when:
+26:      when: deploy_monitoring | default(false)

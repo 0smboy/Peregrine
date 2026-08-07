@@ -1,0 +1,61 @@
+python_roles:
+  - check
+  - chrony
+  - common
+  - cosbench
+  - docker
+  - example_structure
+  - finalize_installation
+  - format_disks
+  - format_new_disks
+  - haproxy_servers
+  - keepalived_servers
+  - keystone_install
+  - keystones
+  - mariadb_servers
+  - new_ring
+  - performance_tuning
+  - proxyfs
+  - ring_builder
+  - ring_utils
+  - security
+  - storage_nodes_common
+  - swift_account
+  - swift_container
+  - swift_object
+  - swift_proxy
+  - system_tuning
+rust_roles:
+  - monitoring_overlay_path
+  - python_only_extras
+  - python_only_format_disks
+  - python_only_identity
+  - python_only_platform
+  - rust_common
+  - rust_config
+  - rust_disks
+  - rust_expand_mode
+  - rust_haproxy
+  - rust_identity_bridge
+  - rust_keepalived
+  - rust_payload
+  - rust_replication_key
+  - rust_rings
+  - rust_systemd
+  - rust_verify
+python_playbooks:
+  - bundle/add_new_disks.yml
+  - bundle/add_new_ring.yml
+  - bundle/add_nodes.yml
+  - bundle/deploy_utils.yml
+  - bundle/install_cosbench.yml
+  - bundle/install_mariadb_keystone.yml
+  - bundle/swift.yml
+  - bundle/system_tuning_deploy.yml
+rust_playbooks:
+  - bundle-rust/expand.yml
+  - bundle-rust/swift.yml
+monitoring:
+  - mon_role: mon_config
+  - mon_role: mon_payload
+  - mon_role: mon_systemd

@@ -1,0 +1,750 @@
+{
+  "schema_version": 2,
+  "bundle_fingerprint": "c0989055cdd23d754329a760b87a334656a0d660f5f87be9697ac73c82fc34e6",
+  "inventory_fingerprint": "89464e280c8381afe88e523f98d42f284c466f298ebad80f463a59450b92c3ea",
+  "playbook": "identity.yml",
+  "hosts": [
+    "10.0.0.11",
+    "10.0.0.12"
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "source": "roles/rust_config/tasks/main.yml#1",
+      "role": "rust_config",
+      "name": "render swift.conf",
+      "host_pattern": "all",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/swift/swift.conf",
+        "mode": "0644",
+        "src": "swift.conf.j2"
+      },
+      "vars": {},
+      "when": [
+        "identity_proxy_enabled | default(false) or (auth_method | default('tempauth')) == 'keystone' or (auth_method | default('tempauth')) == 'keystone_coexist'\n"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [
+        "restart swift services"
+      ],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 2,
+      "source": "roles/rust_config/tasks/main.yml#2",
+      "role": "rust_config",
+      "name": "render proxy-server.conf",
+      "host_pattern": "all",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/swift/proxy-server.conf",
+        "mode": "0600",
+        "src": "proxy-server.conf.j2"
+      },
+      "vars": {},
+      "when": [
+        "identity_proxy_enabled | default(false) or (auth_method | default('tempauth')) == 'keystone' or (auth_method | default('tempauth')) == 'keystone_coexist'\n",
+        "'proxy_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [
+        "restart swift services"
+      ],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 3,
+      "source": "roles/rust_config/tasks/main.yml#3",
+      "role": "rust_config",
+      "name": "render account-server.conf",
+      "host_pattern": "all",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/swift/account-server.conf",
+        "mode": "0644",
+        "src": "account-server.conf.j2"
+      },
+      "vars": {},
+      "when": [
+        "identity_proxy_enabled | default(false) or (auth_method | default('tempauth')) == 'keystone' or (auth_method | default('tempauth')) == 'keystone_coexist'\n",
+        "'account_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [
+        "restart swift services"
+      ],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 4,
+      "source": "roles/rust_config/tasks/main.yml#4",
+      "role": "rust_config",
+      "name": "render container-server.conf",
+      "host_pattern": "all",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/swift/container-server.conf",
+        "mode": "0644",
+        "src": "container-server.conf.j2"
+      },
+      "vars": {},
+      "when": [
+        "identity_proxy_enabled | default(false) or (auth_method | default('tempauth')) == 'keystone' or (auth_method | default('tempauth')) == 'keystone_coexist'\n",
+        "'container_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [
+        "restart swift services"
+      ],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 5,
+      "source": "roles/rust_config/tasks/main.yml#5",
+      "role": "rust_config",
+      "name": "render object-server.conf",
+      "host_pattern": "all",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/swift/object-server.conf",
+        "mode": "0644",
+        "src": "object-server.conf.j2"
+      },
+      "vars": {},
+      "when": [
+        "identity_proxy_enabled | default(false) or (auth_method | default('tempauth')) == 'keystone' or (auth_method | default('tempauth')) == 'keystone_coexist'\n",
+        "'object_servers' in group_names"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [
+        "restart swift services"
+      ],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 6,
+      "source": "roles/rust_haproxy/tasks/main.yml#1",
+      "role": "rust_haproxy",
+      "name": "probe for haproxy",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "shell",
+      "args": "command -v haproxy >/dev/null 2>&1 && echo PRESENT || echo ABSENT",
+      "vars": {},
+      "when": [
+        "use_lb and (identity_haproxy_enabled | default(false))"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_haproxy_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 7,
+      "source": "roles/rust_haproxy/tasks/main.yml#2",
+      "role": "rust_haproxy",
+      "name": "install haproxy",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "package",
+      "args": {
+        "name": "haproxy",
+        "state": "present"
+      },
+      "vars": {},
+      "when": [
+        "use_lb and (identity_haproxy_enabled | default(false))",
+        "rust_haproxy_probe.stdout.find('PRESENT') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 8,
+      "source": "roles/rust_haproxy/tasks/main.yml#3",
+      "role": "rust_haproxy",
+      "name": "allow haproxy to connect to any port under SELinux",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "shell",
+      "args": "if command -v getsebool >/dev/null 2>&1 && getsebool haproxy_connect_any 2>/dev/null | grep -q ' off$'; then\n  setsebool -P haproxy_connect_any 1\n  echo TOGGLED\nelse\n  echo UNCHANGED\nfi\n",
+      "vars": {},
+      "when": [
+        "use_lb and (identity_haproxy_enabled | default(false))"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_haproxy_sebool",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "rust_haproxy_sebool.stdout.find('TOGGLED') != -1"
+      ],
+      "risk": []
+    },
+    {
+      "id": 9,
+      "source": "roles/rust_haproxy/tasks/main.yml#4",
+      "role": "rust_haproxy",
+      "name": "ensure haproxy TLS staging dir on controller",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "file",
+      "args": {
+        "mode": "0700",
+        "path": "{{ ring_fetch_dir }}/haproxy-tls",
+        "state": "directory"
+      },
+      "vars": {},
+      "when": [
+        "use_lb and (identity_haproxy_enabled | default(false))",
+        "lb_mode == \"https\""
+      ],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "localhost",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 10,
+      "source": "roles/rust_haproxy/tasks/main.yml#5",
+      "role": "rust_haproxy",
+      "name": "install operator-provided HAProxy TLS PEM",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "copy",
+      "args": {
+        "dest": "{{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}",
+        "mode": "0600",
+        "src": "{{ haproxy_tls_pem_src }}"
+      },
+      "vars": {},
+      "when": [
+        "use_lb and (identity_haproxy_enabled | default(false))",
+        "lb_mode == \"https\" and (haproxy_tls_pem_src | default('')) | length > 0"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 11,
+      "source": "roles/rust_haproxy/tasks/main.yml#6",
+      "role": "rust_haproxy",
+      "name": "generate self-signed HAProxy TLS material on first LB host",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "shell",
+      "args": "set -euo pipefail\nPEM=\"{{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}\"\nCRT=/etc/haproxy/haproxy.crt\nKEY=/etc/haproxy/haproxy.key\nDAYS=\"{{ haproxy_tls_days | default(825) }}\"\nCN=\"{{ auth_url_ip }}\"\nif [ -f \"$PEM\" ] && [ -s \"$PEM\" ]; then\n  echo TLS-PRESENT\n  exit 0\nfi\nopenssl req -new -x509 -nodes -days \"$DAYS\" -subj \"/CN=$CN\" -out \"$CRT\" -keyout \"$KEY\"\ncat \"$CRT\" \"$KEY\" > \"$PEM\"\nchmod 600 \"$PEM\" \"$KEY\"\nchmod 644 \"$CRT\"\necho TLS-GENERATED\n",
+      "vars": {},
+      "when": [
+        "use_lb and (identity_haproxy_enabled | default(false))",
+        "lb_mode == \"https\" and (haproxy_tls_pem_src | default('')) | length == 0 and (haproxy_tls_self_signed | default(true)) and inventory_hostname == groups['haproxy_servers'][0]\n"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_haproxy_tls_gen",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "rust_haproxy_tls_gen.stdout.find('TLS-GENERATED') != -1"
+      ],
+      "risk": []
+    },
+    {
+      "id": 12,
+      "source": "roles/rust_haproxy/tasks/main.yml#7",
+      "role": "rust_haproxy",
+      "name": "fetch self-signed PEM to controller staging",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "fetch",
+      "args": {
+        "dest": "{{ ring_fetch_dir }}/haproxy-tls/haproxyCA.pem",
+        "flat": "yes",
+        "src": "{{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}"
+      },
+      "vars": {},
+      "when": [
+        "use_lb and (identity_haproxy_enabled | default(false))",
+        "lb_mode == \"https\" and (haproxy_tls_pem_src | default('')) | length == 0 and (haproxy_tls_self_signed | default(true))\n"
+      ],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "{{ groups['haproxy_servers'][0] }}",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 13,
+      "source": "roles/rust_haproxy/tasks/main.yml#8",
+      "role": "rust_haproxy",
+      "name": "distribute self-signed PEM to all HAProxy hosts",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "copy",
+      "args": {
+        "dest": "{{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}",
+        "mode": "0600",
+        "src": "{{ ring_fetch_dir }}/haproxy-tls/haproxyCA.pem"
+      },
+      "vars": {},
+      "when": [
+        "use_lb and (identity_haproxy_enabled | default(false))",
+        "lb_mode == \"https\" and (haproxy_tls_pem_src | default('')) | length == 0 and (haproxy_tls_self_signed | default(true))\n"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 14,
+      "source": "roles/rust_haproxy/tasks/main.yml#9",
+      "role": "rust_haproxy",
+      "name": "refuse https without TLS material path",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "shell",
+      "args": "echo \"lb_mode=https requires haproxy_tls_pem_src or haproxy_tls_self_signed=true\" >&2\nexit 1\n",
+      "vars": {},
+      "when": [
+        "use_lb and (identity_haproxy_enabled | default(false))",
+        "lb_mode == \"https\" and (haproxy_tls_pem_src | default('')) | length == 0 and haproxy_tls_self_signed == false"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 15,
+      "source": "roles/rust_haproxy/tasks/main.yml#10",
+      "role": "rust_haproxy",
+      "name": "render haproxy.cfg",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "template",
+      "args": {
+        "dest": "/etc/haproxy/haproxy.cfg",
+        "mode": "0644",
+        "src": "haproxy.cfg.j2"
+      },
+      "vars": {},
+      "when": [
+        "use_lb and (identity_haproxy_enabled | default(false))"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_haproxy_cfg",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 16,
+      "source": "roles/rust_haproxy/tasks/main.yml#11",
+      "role": "rust_haproxy",
+      "name": "restart haproxy on configuration change",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "systemd",
+      "args": {
+        "name": "haproxy",
+        "state": "restarted"
+      },
+      "vars": {},
+      "when": [
+        "use_lb and (identity_haproxy_enabled | default(false))",
+        "rust_haproxy_cfg.changed"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 17,
+      "source": "roles/rust_haproxy/tasks/main.yml#12",
+      "role": "rust_haproxy",
+      "name": "probe the haproxy unit state",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "shell",
+      "args": "if systemctl is-enabled haproxy >/dev/null 2>&1 && systemctl is-active haproxy >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {},
+      "when": [
+        "use_lb and (identity_haproxy_enabled | default(false))"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_haproxy_state",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 18,
+      "source": "roles/rust_haproxy/tasks/main.yml#13",
+      "role": "rust_haproxy",
+      "name": "enable and start haproxy",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "haproxy",
+        "state": "started"
+      },
+      "vars": {},
+      "when": [
+        "use_lb and (identity_haproxy_enabled | default(false))",
+        "rust_haproxy_state.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 19,
+      "source": "roles/rust_haproxy/tasks/main.yml#14",
+      "role": "rust_haproxy",
+      "name": "validate haproxy can parse the rendered config",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "shell",
+      "args": "haproxy -c -f /etc/haproxy/haproxy.cfg",
+      "vars": {},
+      "when": [
+        "use_lb and (identity_haproxy_enabled | default(false))"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 20,
+      "source": "roles/rust_identity_bridge/tasks/main.yml#1",
+      "role": "rust_identity_bridge",
+      "name": "document identity bridge path (no package install)",
+      "host_pattern": "all",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "debug",
+      "args": {
+        "msg": "Identity 对接 active (auth_method={{ auth_method | default('tempauth') }}, identity_haproxy_enabled={{ identity_haproxy_enabled | default(false) }}, identity_proxy_enabled={{ identity_proxy_enabled | default(false) }}). Keystone/MariaDB provisioning is Python-only (bundle/roles/keystone_install, keystones, mariadb_servers; docs/fairness-lab/KEYSTONE-LIVE.md). This role never wipes /srv/node."
+      },
+      "vars": {},
+      "when": [
+        "identity_haproxy_enabled | default(false) or identity_proxy_enabled | default(false) or (auth_method | default('tempauth')) == 'keystone' or (auth_method | default('tempauth')) == 'keystone_coexist'\n"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 21,
+      "source": "roles/rust_identity_bridge/tasks/main.yml#2",
+      "role": "rust_identity_bridge",
+      "name": "require keystone backends when identity HAProxy listeners enabled",
+      "host_pattern": "all",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "fail",
+      "args": {
+        "msg": "identity_haproxy_enabled=true but identity_keystone_backends is empty. Set backends to the Galera/Keystone nodes provisioned via Python inventory, or set identity_haproxy_enabled=false. See IDENTITY.md."
+      },
+      "vars": {},
+      "when": [
+        "identity_haproxy_enabled | default(false) or identity_proxy_enabled | default(false) or (auth_method | default('tempauth')) == 'keystone' or (auth_method | default('tempauth')) == 'keystone_coexist'\n",
+        "identity_haproxy_enabled and (identity_keystone_backends | length) == 0"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 22,
+      "source": "roles/rust_identity_bridge/tasks/main.yml#3",
+      "role": "rust_identity_bridge",
+      "name": "require mariadb backends when identity HAProxy listeners enabled",
+      "host_pattern": "all",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "fail",
+      "args": {
+        "msg": "identity_haproxy_enabled=true but identity_mariadb_backends is empty. Set backends or disable identity_haproxy_enabled. See IDENTITY.md."
+      },
+      "vars": {},
+      "when": [
+        "identity_haproxy_enabled | default(false) or identity_proxy_enabled | default(false) or (auth_method | default('tempauth')) == 'keystone' or (auth_method | default('tempauth')) == 'keystone_coexist'\n",
+        "identity_haproxy_enabled and (identity_mariadb_backends | length) == 0"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    }
+  ],
+  "handlers": [
+    {
+      "id": 23,
+      "source": "roles/rust_config/handlers/main.yml#1",
+      "role": "rust_config",
+      "name": "restart swift services",
+      "host_pattern": "all",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "module": "shell",
+      "args": "units=$(systemctl list-units --type=service --state=running --no-legend --plain 'swift-*' 2>/dev/null | awk '{print $1}')\nfor unit in $units; do\n  systemctl try-restart \"$unit\"\ndone\necho \"restarted: $units\"\n",
+      "vars": {},
+      "when": [
+        "identity_proxy_enabled | default(false) or (auth_method | default('tempauth')) == 'keystone' or (auth_method | default('tempauth')) == 'keystone_coexist'\n"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 24,
+      "source": "roles/rust_haproxy/handlers/main.yml#1",
+      "role": "rust_haproxy",
+      "name": "restart haproxy",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "haproxy",
+        "state": "restarted"
+      },
+      "vars": {},
+      "when": [
+        "use_lb and (identity_haproxy_enabled | default(false))"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    }
+  ],
+  "digest": "71b0f9db309002fb7deaa221280df1e1b01d5bf964d56b54e331c2e9711403f8"
+}

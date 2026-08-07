@@ -1,0 +1,142 @@
+{
+  "as_of": "2026-08-07",
+  "claim": "PARTIAL/GREEN for implemented subset \u2014 not full ansible v3",
+  "counts": {
+    "PARTIAL": 6,
+    "ABSENT": 11,
+    "DONE": 8,
+    "N/A": 1
+  },
+  "roles": [
+    {
+      "python": "check",
+      "rust": "preflight/workspace",
+      "status": "PARTIAL"
+    },
+    {
+      "python": "common",
+      "rust": "rust_common",
+      "status": "PARTIAL"
+    },
+    {
+      "python": "performance_tuning",
+      "rust": "python_only_platform (docs)",
+      "status": "ABSENT"
+    },
+    {
+      "python": "chrony",
+      "rust": "python_only_platform (docs)",
+      "status": "ABSENT"
+    },
+    {
+      "python": "haproxy_servers",
+      "rust": "rust_haproxy",
+      "status": "DONE"
+    },
+    {
+      "python": "keepalived_servers",
+      "rust": "rust_keepalived",
+      "status": "DONE"
+    },
+    {
+      "python": "swift_proxy",
+      "rust": "rust_payload+rust_config+rust_systemd+rust_verify",
+      "status": "DONE"
+    },
+    {
+      "python": "storage_nodes_common",
+      "rust": "rust_common+rust_disks+rust_replication_key",
+      "status": "PARTIAL"
+    },
+    {
+      "python": "format_disks",
+      "rust": "NEVER (dual-guard) / python_only_format_disks",
+      "status": "ABSENT"
+    },
+    {
+      "python": "swift_account",
+      "rust": "rust_config+rust_systemd",
+      "status": "DONE"
+    },
+    {
+      "python": "swift_container",
+      "rust": "rust_config+rust_systemd",
+      "status": "DONE"
+    },
+    {
+      "python": "swift_object",
+      "rust": "rust_config+rust_systemd",
+      "status": "DONE"
+    },
+    {
+      "python": "ring_builder",
+      "rust": "rust_rings",
+      "status": "DONE"
+    },
+    {
+      "python": "ring_utils",
+      "rust": "rust_rings",
+      "status": "DONE"
+    },
+    {
+      "python": "finalize_installation",
+      "rust": "rust_systemd+rust_verify",
+      "status": "PARTIAL"
+    },
+    {
+      "python": "mariadb_servers",
+      "rust": "python_only_identity (docs)",
+      "status": "ABSENT"
+    },
+    {
+      "python": "keystone_install",
+      "rust": "python_only_identity (docs)",
+      "status": "ABSENT"
+    },
+    {
+      "python": "keystones",
+      "rust": "identity \u5bf9\u63a5 + rust_identity_bridge",
+      "status": "PARTIAL"
+    },
+    {
+      "python": "proxyfs",
+      "rust": "python_only_extras (docs)",
+      "status": "ABSENT"
+    },
+    {
+      "python": "security",
+      "rust": "python_only_platform (docs)",
+      "status": "ABSENT"
+    },
+    {
+      "python": "format_new_disks",
+      "rust": "OOB+expand.yml",
+      "status": "ABSENT"
+    },
+    {
+      "python": "new_ring",
+      "rust": "swift_policies+rings",
+      "status": "PARTIAL"
+    },
+    {
+      "python": "docker",
+      "rust": "python_only_extras (docs)",
+      "status": "ABSENT"
+    },
+    {
+      "python": "cosbench",
+      "rust": "python_only_extras (docs)",
+      "status": "ABSENT"
+    },
+    {
+      "python": "system_tuning",
+      "rust": "python_only_platform (docs)",
+      "status": "ABSENT"
+    },
+    {
+      "python": "example_structure",
+      "rust": "\u2014",
+      "status": "N/A"
+    }
+  ]
+}

@@ -1,0 +1,1559 @@
+{
+  "schema_version": 2,
+  "bundle_fingerprint": "9d46536b4f605edf8ad8fe446fc088cc4602cc0bce23edb69a266ba3e378888f",
+  "inventory_fingerprint": "f437c161b1db99505bd85e01efa306c18aee59106dad36c6d3b295b6f0bed556",
+  "playbook": "expand.yml",
+  "hosts": [
+    "10.0.0.11"
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "source": "roles/rust_expand_mode/tasks/main.yml#1",
+      "role": "rust_expand_mode",
+      "name": "enable ring expand mode for this apply",
+      "host_pattern": "all",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "set_fact",
+      "args": {
+        "ring_expand": true
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 2,
+      "source": "roles/rust_disks/tasks/main.yml#1",
+      "role": "rust_disks",
+      "name": "ensure srv_node_root exists",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "file",
+      "args": {
+        "mode": "0755",
+        "path": "{{ srv_node_root }}",
+        "state": "directory"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 3,
+      "source": "roles/rust_disks/tasks/main.yml#2",
+      "role": "rust_disks",
+      "name": "ensure swift device directories exist (mkdir only)",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "file",
+      "args": {
+        "mode": "0755",
+        "path": "{{ srv_node_root }}/{{ item }}",
+        "state": "directory"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [
+        {
+          "kind": "with_items",
+          "expression": "{{ swift_devices | default(['d1']) }}",
+          "loop_var": "item"
+        }
+      ],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 4,
+      "source": "roles/rust_replication_key/tasks/main.yml#1",
+      "role": "rust_replication_key",
+      "name": "generate the replication keypair on the first storage node",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "command",
+      "args": {
+        "_raw_params": "ssh-keygen -t ed25519 -N '' -C swift-replication -f /etc/swift/replication_key",
+        "creates": "/etc/swift/replication_key"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "{{ groups['storage_nodes'][0] }}",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 5,
+      "source": "roles/rust_replication_key/tasks/main.yml#2",
+      "role": "rust_replication_key",
+      "name": "ensure the controller staging directory exists",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "file",
+      "args": {
+        "mode": "0700",
+        "path": "{{ ring_fetch_dir }}",
+        "state": "directory"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "localhost",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 6,
+      "source": "roles/rust_replication_key/tasks/main.yml#3",
+      "role": "rust_replication_key",
+      "name": "fetch the private key to the controller",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "fetch",
+      "args": {
+        "dest": "{{ ring_fetch_dir }}/replication_key",
+        "flat": "yes",
+        "src": "/etc/swift/replication_key"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "{{ groups['storage_nodes'][0] }}",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 7,
+      "source": "roles/rust_replication_key/tasks/main.yml#4",
+      "role": "rust_replication_key",
+      "name": "fetch the public key to the controller",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "fetch",
+      "args": {
+        "dest": "{{ ring_fetch_dir }}/replication_key.pub",
+        "flat": "yes",
+        "src": "/etc/swift/replication_key.pub"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "{{ groups['storage_nodes'][0] }}",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 8,
+      "source": "roles/rust_replication_key/tasks/main.yml#5",
+      "role": "rust_replication_key",
+      "name": "install the private key on every storage node",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "copy",
+      "args": {
+        "dest": "/etc/swift/replication_key",
+        "mode": "0600",
+        "src": "{{ ring_fetch_dir }}/replication_key"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 9,
+      "source": "roles/rust_replication_key/tasks/main.yml#6",
+      "role": "rust_replication_key",
+      "name": "install the public key on every storage node",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "copy",
+      "args": {
+        "dest": "/etc/swift/replication_key.pub",
+        "mode": "0644",
+        "src": "{{ ring_fetch_dir }}/replication_key.pub"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 10,
+      "source": "roles/rust_replication_key/tasks/main.yml#7",
+      "role": "rust_replication_key",
+      "name": "read the public key",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "command",
+      "args": "cat /etc/swift/replication_key.pub",
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "{{ groups['storage_nodes'][0] }}",
+      "register": "rust_replication_pub",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 11,
+      "source": "roles/rust_replication_key/tasks/main.yml#8",
+      "role": "rust_replication_key",
+      "name": "ensure /root/.ssh exists",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "file",
+      "args": {
+        "mode": "0700",
+        "path": "/root/.ssh",
+        "state": "directory"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 12,
+      "source": "roles/rust_replication_key/tasks/main.yml#9",
+      "role": "rust_replication_key",
+      "name": "authorize the replication key on every storage node",
+      "host_pattern": "storage_nodes",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "lineinfile",
+      "args": {
+        "create": "yes",
+        "line": "{{ rust_replication_pub.stdout.strip() }}",
+        "mode": "0600",
+        "path": "/root/.ssh/authorized_keys"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 13,
+      "source": "roles/rust_rings/tasks/main.yml#1",
+      "role": "rust_rings",
+      "name": "render the ring build script on the first proxy node",
+      "host_pattern": "all",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "template",
+      "args": {
+        "dest": "/etc/swift/build_rings.sh",
+        "mode": "0755",
+        "src": "build_rings.sh.j2"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "{{ groups['proxy_servers'][0] }}",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 14,
+      "source": "roles/rust_rings/tasks/main.yml#2",
+      "role": "rust_rings",
+      "name": "build the rings on the first proxy node",
+      "host_pattern": "all",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "command",
+      "args": "bash /etc/swift/build_rings.sh",
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "{{ groups['proxy_servers'][0] }}",
+      "register": "rust_ring_build",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "rust_ring_build.stdout.find('RINGS-REBUILT') != -1 or rust_ring_build.stdout.find('RINGS-EXPANDED') != -1\n"
+      ],
+      "risk": []
+    },
+    {
+      "id": 15,
+      "source": "roles/rust_rings/tasks/main.yml#3",
+      "role": "rust_rings",
+      "name": "ensure the controller staging directory exists",
+      "host_pattern": "all",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "file",
+      "args": {
+        "mode": "0700",
+        "path": "{{ ring_fetch_dir }}",
+        "state": "directory"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "localhost",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 16,
+      "source": "roles/rust_rings/tasks/main.yml#4",
+      "role": "rust_rings",
+      "name": "fetch the base rings to the controller",
+      "host_pattern": "all",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "fetch",
+      "args": {
+        "dest": "{{ ring_fetch_dir }}/{{ item }}.ring.gz",
+        "flat": "yes",
+        "src": "/etc/swift/{{ item }}.ring.gz"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [
+        {
+          "kind": "with_items",
+          "expression": [
+            "account",
+            "container",
+            "object"
+          ],
+          "loop_var": "item"
+        }
+      ],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "{{ groups['proxy_servers'][0] }}",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 17,
+      "source": "roles/rust_rings/tasks/main.yml#5",
+      "role": "rust_rings",
+      "name": "fetch the extra policy rings to the controller",
+      "host_pattern": "all",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "fetch",
+      "args": {
+        "dest": "{{ ring_fetch_dir }}/object-{{ item.index }}.ring.gz",
+        "flat": "yes",
+        "src": "/etc/swift/object-{{ item.index }}.ring.gz"
+      },
+      "vars": {},
+      "when": [
+        "item.index != 0"
+      ],
+      "loops": [
+        {
+          "kind": "with_items",
+          "expression": "{{ swift_policies }}",
+          "loop_var": "item"
+        }
+      ],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "{{ groups['proxy_servers'][0] }}",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 18,
+      "source": "roles/rust_rings/tasks/main.yml#6",
+      "role": "rust_rings",
+      "name": "distribute the base rings to every node",
+      "host_pattern": "all",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "copy",
+      "args": {
+        "dest": "/etc/swift/{{ item }}.ring.gz",
+        "mode": "0644",
+        "src": "{{ ring_fetch_dir }}/{{ item }}.ring.gz"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [
+        {
+          "kind": "with_items",
+          "expression": [
+            "account",
+            "container",
+            "object"
+          ],
+          "loop_var": "item"
+        }
+      ],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 19,
+      "source": "roles/rust_rings/tasks/main.yml#7",
+      "role": "rust_rings",
+      "name": "distribute the extra policy rings to every node",
+      "host_pattern": "all",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "copy",
+      "args": {
+        "dest": "/etc/swift/object-{{ item.index }}.ring.gz",
+        "mode": "0644",
+        "src": "{{ ring_fetch_dir }}/object-{{ item.index }}.ring.gz"
+      },
+      "vars": {},
+      "when": [
+        "item.index != 0"
+      ],
+      "loops": [
+        {
+          "kind": "with_items",
+          "expression": "{{ swift_policies }}",
+          "loop_var": "item"
+        }
+      ],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 20,
+      "source": "roles/rust_haproxy/tasks/main.yml#1",
+      "role": "rust_haproxy",
+      "name": "probe for haproxy",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "shell",
+      "args": "command -v haproxy >/dev/null 2>&1 && echo PRESENT || echo ABSENT",
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_haproxy_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 21,
+      "source": "roles/rust_haproxy/tasks/main.yml#2",
+      "role": "rust_haproxy",
+      "name": "install haproxy",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "package",
+      "args": {
+        "name": "haproxy",
+        "state": "present"
+      },
+      "vars": {},
+      "when": [
+        "use_lb",
+        "rust_haproxy_probe.stdout.find('PRESENT') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 22,
+      "source": "roles/rust_haproxy/tasks/main.yml#3",
+      "role": "rust_haproxy",
+      "name": "allow haproxy to connect to any port under SELinux",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "shell",
+      "args": "if command -v getsebool >/dev/null 2>&1 && getsebool haproxy_connect_any 2>/dev/null | grep -q ' off$'; then\n  setsebool -P haproxy_connect_any 1\n  echo TOGGLED\nelse\n  echo UNCHANGED\nfi\n",
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_haproxy_sebool",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "rust_haproxy_sebool.stdout.find('TOGGLED') != -1"
+      ],
+      "risk": []
+    },
+    {
+      "id": 23,
+      "source": "roles/rust_haproxy/tasks/main.yml#4",
+      "role": "rust_haproxy",
+      "name": "ensure haproxy TLS staging dir on controller",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "file",
+      "args": {
+        "mode": "0700",
+        "path": "{{ ring_fetch_dir }}/haproxy-tls",
+        "state": "directory"
+      },
+      "vars": {},
+      "when": [
+        "use_lb",
+        "lb_mode == \"https\""
+      ],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "localhost",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 24,
+      "source": "roles/rust_haproxy/tasks/main.yml#5",
+      "role": "rust_haproxy",
+      "name": "install operator-provided HAProxy TLS PEM",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "copy",
+      "args": {
+        "dest": "{{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}",
+        "mode": "0600",
+        "src": "{{ haproxy_tls_pem_src }}"
+      },
+      "vars": {},
+      "when": [
+        "use_lb",
+        "lb_mode == \"https\" and (haproxy_tls_pem_src | default('')) | length > 0"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 25,
+      "source": "roles/rust_haproxy/tasks/main.yml#6",
+      "role": "rust_haproxy",
+      "name": "generate self-signed HAProxy TLS material on first LB host",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "shell",
+      "args": "set -euo pipefail\nPEM=\"{{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}\"\nCRT=/etc/haproxy/haproxy.crt\nKEY=/etc/haproxy/haproxy.key\nDAYS=\"{{ haproxy_tls_days | default(825) }}\"\nCN=\"{{ auth_url_ip }}\"\nif [ -f \"$PEM\" ] && [ -s \"$PEM\" ]; then\n  echo TLS-PRESENT\n  exit 0\nfi\nopenssl req -new -x509 -nodes -days \"$DAYS\" -subj \"/CN=$CN\" -out \"$CRT\" -keyout \"$KEY\"\ncat \"$CRT\" \"$KEY\" > \"$PEM\"\nchmod 600 \"$PEM\" \"$KEY\"\nchmod 644 \"$CRT\"\necho TLS-GENERATED\n",
+      "vars": {},
+      "when": [
+        "use_lb",
+        "lb_mode == \"https\" and (haproxy_tls_pem_src | default('')) | length == 0 and (haproxy_tls_self_signed | default(true)) and inventory_hostname == groups['haproxy_servers'][0]\n"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_haproxy_tls_gen",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "rust_haproxy_tls_gen.stdout.find('TLS-GENERATED') != -1"
+      ],
+      "risk": []
+    },
+    {
+      "id": 26,
+      "source": "roles/rust_haproxy/tasks/main.yml#7",
+      "role": "rust_haproxy",
+      "name": "fetch self-signed PEM to controller staging",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "fetch",
+      "args": {
+        "dest": "{{ ring_fetch_dir }}/haproxy-tls/haproxyCA.pem",
+        "flat": "yes",
+        "src": "{{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}"
+      },
+      "vars": {},
+      "when": [
+        "use_lb",
+        "lb_mode == \"https\" and (haproxy_tls_pem_src | default('')) | length == 0 and (haproxy_tls_self_signed | default(true))\n"
+      ],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": "{{ groups['haproxy_servers'][0] }}",
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 27,
+      "source": "roles/rust_haproxy/tasks/main.yml#8",
+      "role": "rust_haproxy",
+      "name": "distribute self-signed PEM to all HAProxy hosts",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "copy",
+      "args": {
+        "dest": "{{ haproxy_tls_pem | default('/etc/haproxy/haproxyCA.pem') }}",
+        "mode": "0600",
+        "src": "{{ ring_fetch_dir }}/haproxy-tls/haproxyCA.pem"
+      },
+      "vars": {},
+      "when": [
+        "use_lb",
+        "lb_mode == \"https\" and (haproxy_tls_pem_src | default('')) | length == 0 and (haproxy_tls_self_signed | default(true))\n"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 28,
+      "source": "roles/rust_haproxy/tasks/main.yml#9",
+      "role": "rust_haproxy",
+      "name": "refuse https without TLS material path",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "shell",
+      "args": "echo \"lb_mode=https requires haproxy_tls_pem_src or haproxy_tls_self_signed=true\" >&2\nexit 1\n",
+      "vars": {},
+      "when": [
+        "use_lb",
+        "lb_mode == \"https\" and (haproxy_tls_pem_src | default('')) | length == 0 and haproxy_tls_self_signed == false"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 29,
+      "source": "roles/rust_haproxy/tasks/main.yml#10",
+      "role": "rust_haproxy",
+      "name": "render haproxy.cfg",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "template",
+      "args": {
+        "dest": "/etc/haproxy/haproxy.cfg",
+        "mode": "0644",
+        "src": "haproxy.cfg.j2"
+      },
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_haproxy_cfg",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 30,
+      "source": "roles/rust_haproxy/tasks/main.yml#11",
+      "role": "rust_haproxy",
+      "name": "restart haproxy on configuration change",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "systemd",
+      "args": {
+        "name": "haproxy",
+        "state": "restarted"
+      },
+      "vars": {},
+      "when": [
+        "use_lb",
+        "rust_haproxy_cfg.changed"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 31,
+      "source": "roles/rust_haproxy/tasks/main.yml#12",
+      "role": "rust_haproxy",
+      "name": "probe the haproxy unit state",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "shell",
+      "args": "if systemctl is-enabled haproxy >/dev/null 2>&1 && systemctl is-active haproxy >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_haproxy_state",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 32,
+      "source": "roles/rust_haproxy/tasks/main.yml#13",
+      "role": "rust_haproxy",
+      "name": "enable and start haproxy",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "haproxy",
+        "state": "started"
+      },
+      "vars": {},
+      "when": [
+        "use_lb",
+        "rust_haproxy_state.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 33,
+      "source": "roles/rust_haproxy/tasks/main.yml#14",
+      "role": "rust_haproxy",
+      "name": "validate haproxy can parse the rendered config",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "shell",
+      "args": "haproxy -c -f /etc/haproxy/haproxy.cfg",
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 34,
+      "source": "roles/rust_keepalived/tasks/main.yml#1",
+      "role": "rust_keepalived",
+      "name": "probe for keepalived",
+      "host_pattern": "keepalived_servers",
+      "hosts": [],
+      "module": "shell",
+      "args": "command -v keepalived >/dev/null 2>&1 && echo PRESENT || echo ABSENT",
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_keepalived_probe",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 35,
+      "source": "roles/rust_keepalived/tasks/main.yml#2",
+      "role": "rust_keepalived",
+      "name": "install keepalived",
+      "host_pattern": "keepalived_servers",
+      "hosts": [],
+      "module": "package",
+      "args": {
+        "name": "keepalived",
+        "state": "present"
+      },
+      "vars": {},
+      "when": [
+        "use_lb",
+        "rust_keepalived_probe.stdout.find('PRESENT') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 36,
+      "source": "roles/rust_keepalived/tasks/main.yml#3",
+      "role": "rust_keepalived",
+      "name": "persist net.ipv4.ip_nonlocal_bind",
+      "host_pattern": "keepalived_servers",
+      "hosts": [],
+      "module": "copy",
+      "args": {
+        "dest": "/etc/sysctl.d/99-rust-keepalived.conf",
+        "mode": "0644",
+        "src": "99-rust-keepalived-sysctl.conf"
+      },
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_keepalived_sysctl",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 37,
+      "source": "roles/rust_keepalived/tasks/main.yml#4",
+      "role": "rust_keepalived",
+      "name": "apply ip_nonlocal_bind",
+      "host_pattern": "keepalived_servers",
+      "hosts": [],
+      "module": "shell",
+      "args": "sysctl -p /etc/sysctl.d/99-rust-keepalived.conf >/dev/null\nCURRENT=$(sysctl -n net.ipv4.ip_nonlocal_bind 2>/dev/null || echo 0)\nif [ \"$CURRENT\" = \"1\" ]; then\n  echo APPLIED\nelse\n  echo FAILED\n  exit 1\nfi\n",
+      "vars": {},
+      "when": [
+        "use_lb",
+        "rust_keepalived_sysctl.changed"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "true"
+      ],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 38,
+      "source": "roles/rust_keepalived/tasks/main.yml#5",
+      "role": "rust_keepalived",
+      "name": "ensure ip_nonlocal_bind is live",
+      "host_pattern": "keepalived_servers",
+      "hosts": [],
+      "module": "shell",
+      "args": "CURRENT=$(sysctl -n net.ipv4.ip_nonlocal_bind 2>/dev/null || echo 0)\nif [ \"$CURRENT\" = \"1\" ]; then\n  echo OK\nelse\n  sysctl -w net.ipv4.ip_nonlocal_bind=1 >/dev/null\n  echo TOGGLED\nfi\n",
+      "vars": {},
+      "when": [
+        "use_lb",
+        "not rust_keepalived_sysctl.changed"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_keepalived_nonlocal",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "rust_keepalived_nonlocal.stdout.find('TOGGLED') != -1"
+      ],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 39,
+      "source": "roles/rust_keepalived/tasks/main.yml#6",
+      "role": "rust_keepalived",
+      "name": "ensure keepalived config directory",
+      "host_pattern": "keepalived_servers",
+      "hosts": [],
+      "module": "file",
+      "args": {
+        "mode": "0755",
+        "path": "/etc/keepalived",
+        "state": "directory"
+      },
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 40,
+      "source": "roles/rust_keepalived/tasks/main.yml#7",
+      "role": "rust_keepalived",
+      "name": "render keepalived.conf",
+      "host_pattern": "keepalived_servers",
+      "hosts": [],
+      "module": "template",
+      "args": {
+        "dest": "/etc/keepalived/keepalived.conf",
+        "mode": "0644",
+        "src": "keepalived.conf.j2"
+      },
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_keepalived_cfg",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 41,
+      "source": "roles/rust_keepalived/tasks/main.yml#8",
+      "role": "rust_keepalived",
+      "name": "install check_haproxy.sh",
+      "host_pattern": "keepalived_servers",
+      "hosts": [],
+      "module": "copy",
+      "args": {
+        "dest": "/etc/keepalived/check_haproxy.sh",
+        "mode": "0755",
+        "src": "check_haproxy.sh"
+      },
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_keepalived_check",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 42,
+      "source": "roles/rust_keepalived/tasks/main.yml#9",
+      "role": "rust_keepalived",
+      "name": "set keepalived log facility",
+      "host_pattern": "keepalived_servers",
+      "hosts": [],
+      "module": "shell",
+      "args": "CONF=/etc/sysconfig/keepalived\nLINE='KEEPALIVED_OPTIONS=\"-D --log-facility=1\"'\nif [ ! -f \"$CONF\" ]; then\n  printf '%s\\n' \"$LINE\" > \"$CONF\"\n  echo TOGGLED\nelif grep -q '^KEEPALIVED_OPTIONS=' \"$CONF\"; then\n  if grep -qxF \"$LINE\" \"$CONF\"; then\n    echo UNCHANGED\n  else\n    sed -i 's|^KEEPALIVED_OPTIONS=.*|'\"$LINE\"'|' \"$CONF\"\n    echo TOGGLED\n  fi\nelse\n  printf '\\n%s\\n' \"$LINE\" >> \"$CONF\"\n  echo TOGGLED\nfi\n",
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_keepalived_log",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "rust_keepalived_log.stdout.find('TOGGLED') != -1"
+      ],
+      "risk": []
+    },
+    {
+      "id": 43,
+      "source": "roles/rust_keepalived/tasks/main.yml#10",
+      "role": "rust_keepalived",
+      "name": "restart keepalived on configuration change",
+      "host_pattern": "keepalived_servers",
+      "hosts": [],
+      "module": "systemd",
+      "args": {
+        "name": "keepalived",
+        "state": "restarted"
+      },
+      "vars": {},
+      "when": [
+        "use_lb",
+        "rust_keepalived_cfg.changed or rust_keepalived_check.changed or rust_keepalived_log.changed"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 44,
+      "source": "roles/rust_keepalived/tasks/main.yml#11",
+      "role": "rust_keepalived",
+      "name": "probe the keepalived unit state",
+      "host_pattern": "keepalived_servers",
+      "hosts": [],
+      "module": "shell",
+      "args": "if systemctl is-enabled keepalived >/dev/null 2>&1 && systemctl is-active keepalived >/dev/null 2>&1; then\n  echo RUNNING\nelse\n  echo STOPPED\nfi\n",
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": "rust_keepalived_state",
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 45,
+      "source": "roles/rust_keepalived/tasks/main.yml#12",
+      "role": "rust_keepalived",
+      "name": "enable and start keepalived",
+      "host_pattern": "keepalived_servers",
+      "hosts": [],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "enabled": "yes",
+        "name": "keepalived",
+        "state": "started"
+      },
+      "vars": {},
+      "when": [
+        "use_lb",
+        "rust_keepalived_state.stdout.find('RUNNING') == -1"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    },
+    {
+      "id": 46,
+      "source": "roles/rust_verify/tasks/main.yml#1",
+      "role": "rust_verify",
+      "name": "wait for the local proxy to come up",
+      "host_pattern": "proxy_servers",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "shell",
+      "args": "for _ in $(seq 30); do\n  code=$(curl -s -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:{{ proxy_bind_port }}/healthcheck || true)\n  if [ \"$code\" = \"200\" ]; then\n    echo UP\n    exit 0\n  fi\n  sleep 1\ndone\necho \"proxy did not answer /healthcheck within 30s\" >&2\nexit 1\n",
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 47,
+      "source": "roles/rust_verify/tasks/main.yml#2",
+      "role": "rust_verify",
+      "name": "proxy healthcheck answers 200",
+      "host_pattern": "proxy_servers",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "uri",
+      "args": {
+        "status_code": 200,
+        "url": "http://127.0.0.1:{{ proxy_bind_port }}/healthcheck"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 48,
+      "source": "roles/rust_verify/tasks/main.yml#3",
+      "role": "rust_verify",
+      "name": "tempauth issues a token for the first account",
+      "host_pattern": "proxy_servers",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "uri",
+      "args": {
+        "headers": {
+          "X-Auth-Key": "{{ swift_tempauth_users[0].key }}",
+          "X-Auth-User": "{{ swift_tempauth_users[0].account }}:{{ swift_tempauth_users[0].user }}"
+        },
+        "status_code": 200,
+        "url": "http://127.0.0.1:{{ proxy_bind_port }}/auth/v1.0"
+      },
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": []
+    },
+    {
+      "id": 49,
+      "source": "roles/rust_verify/tasks/main.yml#4",
+      "role": "rust_verify",
+      "name": "container PUT/GET round trip",
+      "host_pattern": "proxy_servers",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "shell",
+      "args": "set -e\nresp=$(curl -sf -m 10 -D - -o /dev/null http://127.0.0.1:{{ proxy_bind_port }}/auth/v1.0 \\\n  -H 'X-Auth-User: {{ swift_tempauth_users[0].account }}:{{ swift_tempauth_users[0].user }}' \\\n  -H 'X-Auth-Key: {{ swift_tempauth_users[0].key }}')\ntoken=$(printf '%s' \"$resp\" | tr -d '\\r' | awk 'tolower($1)==\"x-auth-token:\" {print $2}')\nurl=$(printf '%s' \"$resp\" | tr -d '\\r' | awk 'tolower($1)==\"x-storage-url:\" {print $2}')\ntest -n \"$token\"\ntest -n \"$url\"\ncurl -sf -m 10 -X PUT \"$url/swift-deploy-verify\" -H \"X-Auth-Token: $token\" -o /dev/null\ncurl -sf -m 10 \"$url?format=plain\" -H \"X-Auth-Token: $token\" | grep -q '^swift-deploy-verify$'\necho ROUND-TRIP-OK\n",
+      "vars": {},
+      "when": [],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    },
+    {
+      "id": 50,
+      "source": "roles/rust_verify/tasks/main.yml#5",
+      "role": "rust_verify",
+      "name": "HTTPS VIP healthcheck via HAProxy",
+      "host_pattern": "proxy_servers",
+      "hosts": [
+        "10.0.0.11"
+      ],
+      "module": "shell",
+      "args": "set -e\ncode=$(curl -sk -m 10 -o /dev/null -w '%{http_code}' \\\n  \"https://{{ auth_url_ip }}:{{ swift_lb_port }}/healthcheck\" || true)\nif [ \"$code\" != \"200\" ]; then\n  echo \"HTTPS VIP healthcheck failed: http_code=$code\" >&2\n  exit 1\nfi\necho HTTPS-VIP-OK\n",
+      "vars": {},
+      "when": [
+        "use_lb and lb_mode == \"https\""
+      ],
+      "loops": [],
+      "run_once": true,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [
+        "false"
+      ],
+      "risk": []
+    }
+  ],
+  "handlers": [
+    {
+      "id": 51,
+      "source": "roles/rust_haproxy/handlers/main.yml#1",
+      "role": "rust_haproxy",
+      "name": "restart haproxy",
+      "host_pattern": "haproxy_servers",
+      "hosts": [],
+      "module": "systemd",
+      "args": {
+        "daemon_reload": "yes",
+        "name": "haproxy",
+        "state": "restarted"
+      },
+      "vars": {},
+      "when": [
+        "use_lb"
+      ],
+      "loops": [],
+      "run_once": false,
+      "become": false,
+      "become_user": null,
+      "delegate_to": null,
+      "register": null,
+      "notify": [],
+      "ignore_errors": false,
+      "failed_when": [],
+      "changed_when": [],
+      "risk": [
+        "host_reconfigure"
+      ]
+    }
+  ],
+  "digest": "d021d02bd944ce73beac07662b4ac2d1dd9de596373252c37d6407f769d2ebff"
+}

@@ -336,6 +336,7 @@ fn main() {
         key_provider,
         sync_key_provider,
         &policies_for_filters,
+        hash_config.clone(),
     );
     let strict_pipeline = strict_pipeline_from_conf(&conf);
     let mut fatal = false;
@@ -981,6 +982,7 @@ fn build_configured_filters(
     key_provider: Arc<dyn swift_middleware::KeyProvider>,
     sync_key_provider: Arc<dyn swift_middleware::SyncKeyProvider>,
     policies: &StoragePolicyCollection,
+    hash_config: HashPathConfig,
 ) -> (Vec<Arc<dyn swift_middleware::Middleware>>, Vec<String>) {
     let mut notes = Vec::new();
     let pipeline_line = conf
@@ -1039,7 +1041,9 @@ fn build_configured_filters(
             }
             "slo" => {
                 notes.push("slo enabled".into());
-                filters.push(Arc::new(swift_middleware::Slo::new()));
+                filters.push(Arc::new(swift_middleware::Slo::with_hash_config(
+                    hash_config.clone(),
+                )));
             }
             "dlo" => {
                 notes.push("dlo enabled".into());
@@ -2343,7 +2347,7 @@ mod startup_policy_tests {
         let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
         let (filters, notes) =
-            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols);
+            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols, HashPathConfig::new("", "test").unwrap());
         assert!(
             notes.iter().any(|n| n.contains("container_sync enabled")),
             "{notes:?}"
@@ -2390,7 +2394,7 @@ mod startup_policy_tests {
         let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
         let (filters, notes) =
-            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols);
+            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols, HashPathConfig::new("", "test").unwrap());
         assert!(notes.iter().any(|n| n.contains("bulk enabled")), "{notes:?}");
         assert!(
             notes.iter().any(|n| n == "tempurl enabled"),
@@ -2440,7 +2444,7 @@ mod startup_policy_tests {
         let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
         let (filters, notes) =
-            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols);
+            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols, HashPathConfig::new("", "test").unwrap());
         assert!(notes.iter().any(|n| n == "formpost enabled"), "{notes:?}");
         assert!(notes.iter().any(|n| n == "staticweb enabled"), "{notes:?}");
         assert!(
@@ -2482,7 +2486,7 @@ mod startup_policy_tests {
         let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
         let (filters, notes) =
-            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols);
+            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols, HashPathConfig::new("", "test").unwrap());
         assert!(notes.iter().any(|n| n.contains("s3api enabled")), "{notes:?}");
         assert!(
             notes.iter().all(|n| !n.contains("EC2→s3token deferral")),
@@ -2521,7 +2525,7 @@ mod startup_policy_tests {
         let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
         let (_filters, notes) =
-            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols);
+            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols, HashPathConfig::new("", "test").unwrap());
         assert!(
             notes
                 .iter()
@@ -2549,7 +2553,7 @@ mod startup_policy_tests {
         let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
         let (filters, notes) =
-            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols);
+            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols, HashPathConfig::new("", "test").unwrap());
         assert_eq!(filters.len(), 2);
         assert!(notes
             .iter()
@@ -2581,7 +2585,7 @@ mod startup_policy_tests {
         assert!(ka.is_some());
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
         let (filters, notes) =
-            build_configured_filters(&conf, ta, ka, None, no_tempurl_keys(), no_sync_keys(), &pols);
+            build_configured_filters(&conf, ta, ka, None, no_tempurl_keys(), no_sync_keys(), &pols, HashPathConfig::new("", "test").unwrap());
         assert!(
             notes.iter().any(|n| n.contains("authtoken enabled")),
             "{notes:?}"
@@ -2622,7 +2626,7 @@ mod startup_policy_tests {
         let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
         let (filters, notes) =
-            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols);
+            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols, HashPathConfig::new("", "test").unwrap());
         assert!(
             notes.iter().any(|n| n == "keymaster enabled"),
             "{notes:?}"
@@ -2675,6 +2679,7 @@ mod startup_policy_tests {
             no_tempurl_keys(),
             no_sync_keys(),
             &pols,
+            HashPathConfig::new("", "test").unwrap(),
         );
         assert!(
             notes.iter().any(|n| n.contains("keymaster") && n.contains("skip")),
@@ -2724,6 +2729,7 @@ mod startup_policy_tests {
             no_tempurl_keys(),
             no_sync_keys(),
             &pols,
+            HashPathConfig::new("", "test").unwrap(),
         );
         assert!(
             notes.iter().any(|n| n == "keymaster enabled"),
@@ -2758,6 +2764,7 @@ mod startup_policy_tests {
             no_tempurl_keys(),
             no_sync_keys(),
             &pols,
+            HashPathConfig::new("", "test").unwrap(),
         );
         assert!(
             notes
@@ -2794,6 +2801,7 @@ mod startup_policy_tests {
             no_tempurl_keys(),
             no_sync_keys(),
             &pols,
+            HashPathConfig::new("", "test").unwrap(),
         );
         let fatals: Vec<_> = notes
             .iter()

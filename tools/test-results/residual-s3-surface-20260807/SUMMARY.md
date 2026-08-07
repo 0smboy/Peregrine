@@ -15,7 +15,7 @@
 | Multi-rule CORS put/get | **KEEP** unit | `cors_multi_rule_put_stamps_s3_cors_meta`, `parse_multi_rule_cors`, `multi_rule_meta_encode_decode_roundtrip` |
 | SigV2 auth | **WONTFIX** — stable **501** `Code=NotImplemented` | `sigv2_header_auth_returns_501`, `sigv2_query_auth_returns_501` |
 | aws-chunked / STREAMING-* | **WONTFIX** — stable **501** | `aws_chunked_streaming_payload_returns_501`, `aws_chunked_content_encoding_returns_501`, `aws_chunked_trailer_unsigned_returns_501` |
-| versioning / versions / tagging / lifecycle / object-lock | **WONTFIX** — stable **501** | `unsupported_versioning_still_501`, `unsupported_versions_list_still_501`, `unsupported_tagging_still_501`, `unsupported_lifecycle_still_501`, `unsupported_object_lock_still_501` |
+| versioning / versions / tagging / lifecycle / object-lock | **SUPERSEDED 2026-08-07** — meta API implemented (unit); see `impl-s3-versioning-surface-20260807/` | multi-version bodies still residual |
 | Full IAM / grant-header ACL / ACP XML body PUT | **RESIDUAL — not implemented** | only `x-amz-acl` canned; no `x-amz-grant-*`, no AccessControlPolicy body parse on PUT |
 | Object public-read → anonymous Swift GET | **RESIDUAL** | sysmeta for S3 GET `?acl` fidelity only; container ACL still gates access |
 | authenticated-read / log-delivery-write canned | **RESIDUAL** (Python NotImplemented-ish) | map to private; no AuthenticatedUsers Swift ACL |

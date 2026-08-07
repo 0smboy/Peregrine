@@ -1,0 +1,7 @@
+---
+- name: refuse platform hardening roles via bundle-rust
+  fail:
+    msg: >-
+      chrony / performance_tuning / security / system_tuning are Python-only.
+      Use bundle/roles/* with a dedicated inventory or playbook; do not expect
+      them from stack=rust. See roles/python_only_platform/README.md.

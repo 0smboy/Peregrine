@@ -10,6 +10,18 @@
 # Device names come from host_vars.swift_devices (default ["d1"]). Real block
 # devices must be prepared out-of-band and exposed as these directory names.
 
+- name: dual-guard refuse inventory wipe flags (Contabo safe)
+  fail:
+    msg: >-
+      bundle-rust dual-guard: refuse force_format_disks / include_python_format_disks
+      / allow_disk_wipe inventory vars. Prepare mounts out-of-band, then expand.yml.
+      Python format_disks requires a non-rust plan + ticket + --allow-disk-wipe.
+  when: >
+    (force_format_disks | default(false))
+    or (include_python_format_disks | default(false))
+    or (allow_disk_wipe | default(false))
+    or (use_format_disks | default(false))
+
 - name: ensure srv_node_root exists
   file:
     path: "{{ srv_node_root }}"

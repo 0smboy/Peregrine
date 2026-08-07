@@ -1,0 +1,9 @@
+---
+- name: refuse Keystone/MariaDB install via bundle-rust
+  fail:
+    msg: >-
+      bundle-rust does not provision MariaDB or Keystone. Use Python
+      bundle/roles/mariadb_servers, keystone_install, keystones (or
+      install_mariadb_keystone.yml) with config_contabo_identity, then enable
+      identity_* 对接 flags on the rust stack. See
+      roles/python_only_identity/README.md and docs/fairness-lab/KEYSTONE-LIVE.md.

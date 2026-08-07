@@ -1,0 +1,26 @@
+---
+# Monitoring overlay entrypoint (documentation + fail-closed hint).
+#
+# Real agents live in the sibling bundle:
+#   swift-deploy-rs/bundle-monitoring/swift.yml
+#   roles: mon_payload, mon_config, mon_systemd
+# Tags on that playbook: monitoring, mon_agents, mon_payload, mon_config, mon_systemd
+#
+# Apply path (deploy-rs — preferred):
+#   swift-deploy plan  --bundle ../bundle-monitoring --playbook ../bundle-monitoring/swift.yml …
+#   swift-deploy apply --bundle ../bundle-monitoring --playbook ../bundle-monitoring/swift.yml …
+#
+# Contabo Prom rules / recon textfile / Grafana JSON: tools/monitoring/
+#
+# Dual-guard: monitoring must never format disks or touch /srv/node data.
+#
+# This playbook under bundle-rust is intentionally a pointer role only.
+# When deploy_monitoring | default(false) is false (default), role-level when:
+# skips the fail task → safe dry-run / accidental apply is a no-op.
+# When true, fail closed with the correct apply path (agents not vendored here).
+
+- hosts: storage_nodes
+  tags: [monitoring, mon_agents]
+  roles:
+    - role: monitoring_overlay_path
+      when: deploy_monitoring | default(false)

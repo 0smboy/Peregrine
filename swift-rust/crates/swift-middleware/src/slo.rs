@@ -35,13 +35,18 @@
 //! `async=yes` expirer enqueue + manifest DELETE), and `heartbeat=on` PUT
 //! responses that stream whitespace during segment HEAD validation.
 //!
-//! **Deferred vs `slo.py`:** expirer task-container hash sharding
-//! (`hash_path` offset into the day bucket — we use the plain day bucket),
-//! concurrent HEAD pile + wall-clock `yield_frequency` (we yield after each
-//! HEAD instead), auth/ACL probes during async delete, SLO-etag
-//! container-listing refetch dance, bulk Accept negotiation on delete
-//! beyond JSON. When the expirer `UPDATE` enqueue fails, a best-effort
-//! background segment-DELETE thread is used instead of Python's bare 503.
+//! Async delete matches Python on:
+//! * **Expirer task container** — `ExpirerConfig.get_expirer_container`:
+//!   `day_bucket - (int(hash_path(acc, cont, obj), 16) % 100)`, zero-padded
+//!   via `normalize_delete_at_timestamp` (shard key = **manifest** a/c/o).
+//! * **Write ACL probes** — HEAD on the manifest container and (when different)
+//!   the segment container; 401/403 short-circuit like authorize + `write_acl`.
+//!
+//! **Still deferred vs `slo.py`:** concurrent HEAD pile + wall-clock
+//! `yield_frequency` (we yield after each HEAD), SLO-etag container-listing
+//! refetch dance, bulk Accept negotiation on delete beyond JSON. When the
+//! expirer `UPDATE` enqueue fails, a best-effort background segment-DELETE
+//! thread is used instead of Python's bare 503.
 
 use std::io::{Cursor, Read};
 use std::sync::Arc;
@@ -50,6 +55,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use md5::{Digest, Md5};
 use swift_core::config::config_true_value;
+use swift_core::hashing::HashPathConfig;
 use swift_core::timestamp::{normalize_delete_at_timestamp, Timestamp};
 use swift_http::{
     body_too_large, split_path, Body, FnReader, HeaderKeyDict, Range, Request, Response,
@@ -189,14 +195,33 @@ pub fn dlo_etag_and_size(segment_hashes: &[(String, i64)]) -> (String, i64) {
 /// setting `Content-Length` to the summed segment lengths and `Etag` to the
 /// SLO etag. A single top-level `Range` uses per-segment ranged subrequests.
 ///
-/// Residual vs. `slo.py` (see module docs): expirer hash sharding, async
-/// delete auth probes, container-listing slo_etag refetch.
-#[derive(Debug, Default, Clone)]
-pub struct Slo;
+/// Residual vs. `slo.py`: container-listing slo_etag refetch (optional).
+/// Async-delete uses expirer hash_path container sharding and write ACL probes.
+#[derive(Debug, Clone)]
+pub struct Slo {
+    /// Cluster hash path config for expirer task-container sharding (Python
+    /// `ExpirerConfig.get_expirer_container`). Default `suffix=changeme` for
+    /// unit tests / SAIO-shaped conf.
+    hash_config: HashPathConfig,
+}
+
+impl Default for Slo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Slo {
     pub fn new() -> Self {
-        Slo
+        Slo {
+            hash_config: HashPathConfig::new(b"".to_vec(), b"changeme".to_vec())
+                .expect("non-empty hash suffix"),
+        }
+    }
+
+    /// Construct with explicit `[swift-hash]` config (proxy/production path).
+    pub fn with_hash_config(hash_config: HashPathConfig) -> Self {
+        Slo { hash_config }
     }
 }
 
@@ -893,13 +918,14 @@ impl Slo {
     /// `?multipart-manifest=delete&async=yes`: Python `handle_async_delete`.
     ///
     /// Constraints (same as `slo.py`): all object-backed segments must share
-    /// one container and none may be nested SLOs. Segments are enqueued to
-    /// `.expiring_objects` via `UPDATE`; the manifest is then DELETEd through
-    /// the rest of the pipeline. Residual: task-container hash sharding is
-    /// the plain day bucket (no `hash_path` offset); no auth/ACL probe
-    /// subrequests. If the expirer UPDATE fails, falls back to a best-effort
-    /// detached-thread segment DELETE then still removes the manifest
-    /// (Python would return 503 and leave the manifest).
+    /// one container and none may be nested SLOs. Write ACL is probed via HEAD
+    /// on the manifest container (and segment container when different).
+    /// Segments are enqueued to `.expiring_objects` via `UPDATE` into the
+    /// hash-sharded task container for the **manifest** a/c/o; the manifest is
+    /// then DELETEd through the rest of the pipeline. If the expirer UPDATE
+    /// fails, falls back to a best-effort detached-thread segment DELETE then
+    /// still removes the manifest (Python would return 503 and leave the
+    /// manifest).
     fn handle_async_delete(&self, req: Request, next: &NextFn) -> Response {
         let parts = match split_path(&req.path, 4, 4, true) {
             Ok(p) => p,
@@ -908,7 +934,7 @@ impl Slo {
         let version = parts[0].clone().unwrap_or_default();
         let account = parts[1].clone().unwrap_or_default();
         let container = parts[2].clone().unwrap_or_default();
-        let _object = parts[3].clone().unwrap_or_default();
+        let object = parts[3].clone().unwrap_or_default();
 
         // Load SLO segments (top-level only; nested expansion is rejected).
         let mut get = req.clone_head();
@@ -996,6 +1022,17 @@ impl Slo {
             .next()
             .unwrap_or_else(|| container.clone());
 
+
+        // Auth/ACL probes (Python: authorize with write_acl on manifest +
+        // segment containers via get_container_info). Without a full authorize
+        // callback, HEAD with client Authorization/X-Auth-Token returns
+        // 401/403 the same way TempAuth/Keystone would.
+        if let Some(denied) =
+            probe_async_delete_write_acl(next, &req, &version, &account, &container, &segment_container)
+        {
+            return denied;
+        }
+
         // Build expirer jobs and UPDATE .expiring_objects.
         let ts = Timestamp::now();
         let delete_at_secs = ts.as_secs_f64();
@@ -1017,7 +1054,16 @@ impl Slo {
                 })
             })
             .collect();
-        let expirer_cont = expirer_task_container(delete_at_secs as i64);
+        // Python: get_expirer_account_and_container(ts, account, container, obj)
+        // uses the *manifest* a/c/o for the task-container shard (one container
+        // for the whole job, not per segment).
+        let expirer_cont = expirer_task_container(
+            delete_at_secs as i64,
+            &self.hash_config,
+            &account,
+            &container,
+            &object,
+        );
         let jobs_body = serde_json::to_vec(&jobs).unwrap_or_default();
         let mut enqueue = req.clone_head();
         enqueue.method = "UPDATE".to_string();
@@ -1498,10 +1544,79 @@ fn heartbeat_final_json(resp: &Response) -> Vec<u8> {
     summary.to_string().into_bytes()
 }
 
-/// Day-bucket expirer task container (Residual: no hash_path shard offset).
-fn expirer_task_container(delete_at: i64) -> String {
-    let bucket = delete_at.div_euclid(EXPIRER_CONTAINER_DIVISOR) * EXPIRER_CONTAINER_DIVISOR;
-    format!("{bucket:010}")
+/// Python `EXPIRER_CONTAINER_PER_DIVISOR` — hash shards per day bucket.
+const EXPIRER_CONTAINER_PER_DIVISOR: i64 = 100;
+
+/// Expirer task container — Python `ExpirerConfig.get_expirer_container`.
+///
+/// ```text
+/// shard_int = int(hash_path(acc, cont, obj), 16) % 100
+/// bucket    = (x_delete_at // 86400) * 86400 - shard_int
+/// return normalize_delete_at_timestamp(bucket)  # 10-digit zero-pad, clamped ≥ 0
+/// ```
+fn expirer_task_container(
+    delete_at: i64,
+    hash_config: &HashPathConfig,
+    account: &str,
+    container: &str,
+    object: &str,
+) -> String {
+    let day = delete_at.div_euclid(EXPIRER_CONTAINER_DIVISOR) * EXPIRER_CONTAINER_DIVISOR;
+    let shard = match hash_config.hash_path(account, Some(container), Some(object)) {
+        Ok(hex) => {
+            // MD5 hex is 128 bits; Python `int(hex, 16) % 100` — u128 is exact.
+            let v = u128::from_str_radix(&hex, 16).unwrap_or(0);
+            (v % (EXPIRER_CONTAINER_PER_DIVISOR as u128)) as i64
+        }
+        Err(_) => 0,
+    };
+    let bucket = day - shard;
+    // Python normalize_delete_at_timestamp clamps negatives to 0.
+    normalize_delete_at_timestamp(bucket as f64, false)
+}
+
+/// HEAD-probe write access for async-delete (Python authorize + get_container_info).
+///
+/// Always HEADs the manifest container with client auth headers; when
+/// `segment_container` differs, also HEADs that path. 401/403 stop the flow.
+fn probe_async_delete_write_acl(
+    next: &NextFn,
+    req: &Request,
+    version: &str,
+    account: &str,
+    manifest_container: &str,
+    segment_container: &str,
+) -> Option<Response> {
+    let probe_one = |container: &str| -> Option<Response> {
+        let mut probe = req.clone_head();
+        probe.method = "HEAD".to_string();
+        probe.path = format!("/{version}/{account}/{container}");
+        probe.query_string.clear();
+        probe.headers.remove("Content-Length");
+        probe.body = Body::empty();
+        let pr = next(probe);
+        if pr.status == 401 || pr.status == 403 {
+            Some(Response::error(
+                pr.status,
+                if pr.status == 401 {
+                    "401 Unauthorized"
+                } else {
+                    "403 Forbidden"
+                },
+            ))
+        } else {
+            None
+        }
+    };
+    if let Some(r) = probe_one(manifest_container) {
+        return Some(r);
+    }
+    if segment_container != manifest_container {
+        if let Some(r) = probe_one(segment_container) {
+            return Some(r);
+        }
+    }
+    None
 }
 
 impl Middleware for Slo {
@@ -2128,6 +2243,10 @@ mod tests {
                 r.headers.set("X-Static-Large-Object", "True");
                 return r;
             }
+            // ACL probes (HEAD) — allow.
+            if req.method == "HEAD" {
+                return Response::new(204);
+            }
             if req.method == "UPDATE" && req.path.starts_with("/v1/.expiring_objects/") {
                 if let Ok(b) = req.body.materialize(MAX_CONTROL_BODY) {
                     *ub2.lock().unwrap() = b.to_vec();
@@ -2139,6 +2258,7 @@ mod tests {
             }
             Response::new(404)
         });
+        let slo = Slo::new();
         let req = Request {
             method: "DELETE".into(),
             path: "/v1/a/c/manifest".into(),
@@ -2146,7 +2266,7 @@ mod tests {
             headers: HeaderKeyDict::new(),
             body: Body::empty(),
         };
-        let resp = Slo::new().handle(req, &be);
+        let resp = slo.handle(req, &be);
         // Python: response is the manifest DELETE (204).
         assert_eq!(resp.status, 204, "{resp:?}");
         let paths = calls.lock().unwrap().clone();
@@ -2156,11 +2276,40 @@ mod tests {
                 .any(|(m, p)| m == "GET" && p == "/v1/a/c/manifest"),
             "{paths:?}"
         );
+        // Write ACL probe on manifest container (segment container == same).
         assert!(
             paths
                 .iter()
-                .any(|(m, p)| m == "UPDATE" && p.starts_with("/v1/.expiring_objects/")),
-            "{paths:?}"
+                .any(|(m, p)| m == "HEAD" && p == "/v1/a/c"),
+            "missing ACL HEAD: {paths:?}"
+        );
+        let update_paths: Vec<_> = paths
+            .iter()
+            .filter(|(m, p)| m == "UPDATE" && p.starts_with("/v1/.expiring_objects/"))
+            .map(|(_, p)| p.clone())
+            .collect();
+        assert_eq!(update_paths.len(), 1, "{paths:?}");
+        // Task container = day_bucket - (hash_path(a,c,manifest)%100), not plain day.
+        let cont_part = update_paths[0]
+            .trim_start_matches("/v1/.expiring_objects/")
+            .to_string();
+        let n: i64 = cont_part.parse().expect("numeric expirer cont");
+        let day = Timestamp::now().as_secs_f64() as i64;
+        let day_bucket = day.div_euclid(86400) * 86400;
+        assert!(
+            day_bucket - 99 <= n && n <= day_bucket,
+            "cont={cont_part} day_bucket={day_bucket}"
+        );
+        let hc = HashPathConfig::new(b"".to_vec(), b"changeme".to_vec()).unwrap();
+        let expected = expirer_task_container(day, &hc, "a", "c", "manifest");
+        assert_eq!(
+            cont_part, expected,
+            "UPDATE path must use hash-sharded task container"
+        );
+        assert_ne!(
+            cont_part,
+            format!("{day_bucket:010}"),
+            "must not use plain day bucket"
         );
         assert!(
             paths
@@ -2328,5 +2477,139 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn test_expirer_task_container_hash_sharding() {
+        // Golden values vs CPython `hash_path` with suffix "changeme",
+        // empty prefix (see swift-core hashing tests).
+        let hc = HashPathConfig::new(b"".to_vec(), b"changeme".to_vec()).unwrap();
+
+        // hash_path('AUTH_test','c','o') = 7363996f2cfb95eaa18df19ccc31aece
+        // int(...,16) % 100 = 38
+        assert_eq!(
+            hc.hash_path("AUTH_test", Some("c"), Some("o")).unwrap(),
+            "7363996f2cfb95eaa18df19ccc31aece"
+        );
+        assert_eq!(
+            expirer_task_container(1_782_000_000, &hc, "AUTH_test", "c", "o"),
+            "1781999962" // day 1782000000 - 38
+        );
+        // hash_path('AUTH_test','c','other') % 100 = 90
+        assert_eq!(
+            expirer_task_container(1_782_000_000, &hc, "AUTH_test", "c", "other"),
+            "1781999910" // day - 90
+        );
+        // hash_path('a','c','o') % 100 = 37
+        assert_eq!(
+            expirer_task_container(86_400, &hc, "a", "c", "o"),
+            "0000086363"
+        );
+        assert_eq!(
+            expirer_task_container(1_751_500_000, &hc, "a", "c", "o"),
+            "1751414363"
+        );
+        // Python async-delete fixture path: manifest a/c/o drives the shard
+        // hash_path('AUTH_test','deltest','man-all-there') % 100 = 71
+        assert_eq!(
+            expirer_task_container(
+                1_751_500_000,
+                &hc,
+                "AUTH_test",
+                "deltest",
+                "man-all-there"
+            ),
+            "1751414329"
+        );
+        // Day-zero clamp: bucket negative → normalize to 0000000000
+        assert_eq!(
+            expirer_task_container(0, &hc, "AUTH_test", "c", "o"),
+            "0000000000"
+        );
+        // Must not be the plain day bucket
+        let plain = format!("{:010}", 1_782_000_000i64.div_euclid(86400) * 86400);
+        assert_ne!(
+            expirer_task_container(1_782_000_000, &hc, "AUTH_test", "c", "o"),
+            plain
+        );
+    }
+
+    #[test]
+    fn test_async_delete_acl_probe_forbidden() {
+        use std::sync::{Arc as SArc, Mutex};
+        let heads: SArc<Mutex<Vec<String>>> = SArc::new(Mutex::new(Vec::new()));
+        let h2 = heads.clone();
+        let backend: NextFn = Arc::new(move |req: Request| {
+            if req.method == "GET" && req.query_string.contains("multipart-manifest=get") {
+                let mut r = Response::with_body(
+                    200,
+                    br#"[{"name":"/segc/s1","bytes":1,"hash":"0"}]"#.to_vec(),
+                );
+                r.headers.set("X-Static-Large-Object", "True");
+                return r;
+            }
+            // HEAD probes → 403
+            if req.method == "HEAD" {
+                h2.lock().unwrap().push(req.path.clone());
+                return Response::error(403, "Forbidden");
+            }
+            Response::error(500, "unexpected")
+        });
+        let req = Request {
+            method: "DELETE".into(),
+            path: "/v1/AUTH_test/manic/manifest".into(),
+            query_string: "multipart-manifest=delete&async=yes".into(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let resp = Slo::new().handle(req, &backend);
+        assert_eq!(resp.status, 403, "expected ACL probe deny");
+        // First probe is the manifest container (Python write_acl on DELETE target).
+        let probed = heads.lock().unwrap().clone();
+        assert_eq!(probed, vec!["/v1/AUTH_test/manic".to_string()], "{probed:?}");
+    }
+
+    #[test]
+    fn test_async_delete_acl_probe_segment_container() {
+        use std::sync::{Arc as SArc, Mutex};
+        let heads: SArc<Mutex<Vec<String>>> = SArc::new(Mutex::new(Vec::new()));
+        let h2 = heads.clone();
+        let backend: NextFn = Arc::new(move |req: Request| {
+            if req.method == "GET" && req.query_string.contains("multipart-manifest=get") {
+                let mut r = Response::with_body(
+                    200,
+                    br#"[{"name":"/segc/s1","bytes":1,"hash":"0"}]"#.to_vec(),
+                );
+                r.headers.set("X-Static-Large-Object", "True");
+                return r;
+            }
+            if req.method == "HEAD" {
+                h2.lock().unwrap().push(req.path.clone());
+                // Manifest OK; segment container denied.
+                if req.path.ends_with("/segc") {
+                    return Response::error(401, "Unauthorized");
+                }
+                return Response::new(204);
+            }
+            Response::error(500, "unexpected")
+        });
+        let req = Request {
+            method: "DELETE".into(),
+            path: "/v1/AUTH_test/manic/manifest".into(),
+            query_string: "multipart-manifest=delete&async=yes".into(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let resp = Slo::new().handle(req, &backend);
+        assert_eq!(resp.status, 401);
+        let probed = heads.lock().unwrap().clone();
+        assert_eq!(
+            probed,
+            vec![
+                "/v1/AUTH_test/manic".to_string(),
+                "/v1/AUTH_test/segc".to_string(),
+            ],
+            "{probed:?}"
+        );
     }
 }
