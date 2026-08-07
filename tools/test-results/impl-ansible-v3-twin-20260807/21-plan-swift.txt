@@ -1,0 +1,6 @@
+=== plan swift.yml (default Contabo-safe) ===
+plan=/Users/oboy/Downloads/Peregrine/tools/test-results/impl-ansible-v3-twin-20260807/plan-swift.json digest=1a7ec19f3f7ee229f7da1a592b341a5afcaabc154e1bb3e77fc53c6875456763 hosts=2 tasks=140 risks=[HostReconfigure]
+tasks=140 hosts=2
+risk_counts={'host_reconfigure': 64}
+disk_wipe_tasks=0
+roles={'rust_common': 6, 'rust_payload': 5, 'rust_disks': 3, 'rust_replication_key': 9, 'rust_config': 5, 'rust_rings': 7, 'rust_systemd': 71, 'rust_haproxy': 14, 'rust_keepalived': 12, 'rust_identity_bridge': 3, 'rust_verify': 5}

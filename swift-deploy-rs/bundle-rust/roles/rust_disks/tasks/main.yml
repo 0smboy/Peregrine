@@ -4,8 +4,10 @@
 # Dual-guard:
 #   1) This role NEVER runs mkfs / wipefs / dd / parted.
 #   2) Workspace rejects node.disks for the rust stack, so no plan carries
-#      RiskClass::DiskWipe. Wiping Contabo /srv/node requires an explicit
-#      ticket + --allow-disk-wipe on a non-bundle-rust path.
+#      RiskClass::DiskWipe on the default swift.yml path.
+#   3) Opt-in swift-full-v3.yml may include Python format_disks ONLY when
+#      allow_disk_format | default(false) is true (empty lab devices + ticket).
+#   4) Contabo /srv/node wipe: ticket + --allow-disk-wipe on a non-default path.
 #
 # Device names come from host_vars.swift_devices (default ["d1"]). Real block
 # devices must be prepared out-of-band and exposed as these directory names.
@@ -14,8 +16,9 @@
   fail:
     msg: >-
       bundle-rust dual-guard: refuse force_format_disks / include_python_format_disks
-      / allow_disk_wipe inventory vars. Prepare mounts out-of-band, then expand.yml.
-      Python format_disks requires a non-rust plan + ticket + --allow-disk-wipe.
+      / allow_disk_wipe / use_format_disks inventory vars on rust_disks (mkdir-only).
+      Prepare mounts out-of-band, then expand.yml. Opt-in wipe is only via
+      swift-full-v3.yml format_disks when allow_disk_format=true (lab/empty devices).
   when: >
     (force_format_disks | default(false))
     or (include_python_format_disks | default(false))

@@ -1,0 +1,21 @@
+=== ansible.cfg roles_path ===
+56:roles_path = roles:../bundle/roles
+=== playbook hash ===
+MD5 (swift-deploy-rs/bundle-rust/swift-full-v3.yml) = f52866a9b72be78aebe15c4d2b3b12a5
+     214 swift-deploy-rs/bundle-rust/swift-full-v3.yml
+=== links ===
+swift-deploy-rs/bundle-rust/roles/check
+swift-deploy-rs/bundle-rust/roles/chrony
+swift-deploy-rs/bundle-rust/roles/cosbench
+swift-deploy-rs/bundle-rust/roles/docker
+swift-deploy-rs/bundle-rust/roles/example_structure
+swift-deploy-rs/bundle-rust/roles/format_disks
+swift-deploy-rs/bundle-rust/roles/format_new_disks
+swift-deploy-rs/bundle-rust/roles/keystone_install
+swift-deploy-rs/bundle-rust/roles/keystones
+swift-deploy-rs/bundle-rust/roles/mariadb_servers
+swift-deploy-rs/bundle-rust/roles/new_ring
+swift-deploy-rs/bundle-rust/roles/performance_tuning
+swift-deploy-rs/bundle-rust/roles/proxyfs
+swift-deploy-rs/bundle-rust/roles/security
+swift-deploy-rs/bundle-rust/roles/system_tuning

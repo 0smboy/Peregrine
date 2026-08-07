@@ -1,0 +1,89 @@
+{
+  "as_of": "2026-08-07",
+  "claim_default": "PARTIAL",
+  "claim_full_twin": "AVAILABLE (opt-in) 26/26 COVERED",
+  "plans": [
+    {
+      "label": "swift.yml default",
+      "playbook": "swift.yml",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "tasks": 140,
+      "digest": "1a7ec19f3f7ee229f7da1a592b341a5afcaabc154e1bb3e77fc53c6875456763",
+      "roles": {
+        "rust_common": 6,
+        "rust_payload": 5,
+        "rust_disks": 3,
+        "rust_replication_key": 9,
+        "rust_config": 5,
+        "rust_rings": 7,
+        "rust_systemd": 71,
+        "rust_haproxy": 14,
+        "rust_keepalived": 12,
+        "rust_identity_bridge": 3,
+        "rust_verify": 5
+      },
+      "risk_counts": {
+        "host_reconfigure": 64
+      },
+      "disk_wipe_tasks": 0,
+      "format_tasks": 0,
+      "format_when_has_allow_disk_format": true,
+      "format_when_sample": null
+    },
+    {
+      "label": "swift-full-v3.yml twin",
+      "playbook": "swift-full-v3.yml",
+      "hosts": [
+        "10.0.0.11",
+        "10.0.0.12"
+      ],
+      "tasks": 395,
+      "digest": "c1ee94c0e86c3d37f4ff17c96862a037c6271362db205c0a62c4db10140476d6",
+      "roles": {
+        "check": 1,
+        "rust_common": 6,
+        "rust_payload": 5,
+        "performance_tuning": 6,
+        "chrony": 4,
+        "rust_haproxy": 14,
+        "rust_keepalived": 12,
+        "rust_disks": 3,
+        "rust_replication_key": 9,
+        "format_disks": 42,
+        "rust_config": 5,
+        "rust_rings": 7,
+        "rust_systemd": 71,
+        "rust_verify": 5,
+        "mariadb_servers": 28,
+        "keystone_install": 22,
+        "keystones": 46,
+        "rust_identity_bridge": 3,
+        "proxyfs": 26,
+        "security": 11,
+        "format_new_disks": 16,
+        "new_ring": 25,
+        "docker": 2,
+        "cosbench": 13,
+        "system_tuning": 12,
+        "example_structure": 1
+      },
+      "risk_counts": {
+        "host_reconfigure": 102,
+        "disk_wipe": 9,
+        "ssh_reconfigure": 3,
+        "firewall": 8
+      },
+      "disk_wipe_tasks": 9,
+      "format_tasks": 58,
+      "format_when_has_allow_disk_format": true,
+      "format_when_sample": [
+        "allow_disk_format | default(false)",
+        "not use_custom_disks"
+      ]
+    }
+  ],
+  "coverage": "26/26"
+}

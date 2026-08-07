@@ -1,0 +1,20 @@
+=== plan-full-v3.json ===
+tasks=395 hosts=2 digest=8ef8cded3f3da1387f534e0ea213289fd9d847423a279c5e05a2dd2ed6cfd6a9
+risk_counts={'host_reconfigure': 102, 'ssh_reconfigure': 3, 'firewall': 8, 'disk_wipe': 9} disk_wipe_tasks=9
+roles={'check': 1, 'rust_common': 6, 'rust_payload': 5, 'rust_disks': 3, 'rust_replication_key': 9, 'rust_config': 5, 'rust_rings': 7, 'rust_systemd': 71, 'rust_haproxy': 14, 'rust_keepalived': 12, 'rust_identity_bridge': 3, 'rust_verify': 5, 'performance_tuning': 6, 'chrony': 4, 'security': 11, 'system_tuning': 12, 'format_disks': 42, 'format_new_disks': 16, 'mariadb_servers': 28, 'keystone_install': 22, 'keystones': 46, 'docker': 2, 'cosbench': 13, 'proxyfs': 26, 'new_ring': 25, 'example_structure': 1}
+  format_disks: when=['allow_disk_format | default(false)', 'not use_custom_disks'] hosts=[]
+  format_new_disks: when=['allow_disk_format | default(false)'] hosts=[]
+  mariadb_servers: when=['enable_identity_provision | default(false)'] hosts=[]
+  keystone_install: when=['enable_identity_provision | default(false)', 'not use_local_mariadbs'] hosts=[]
+  keystones: when=['enable_identity_provision | default(false)', "inventory_hostname == groups['mariadb_servers'][0]"] hosts=[]
+
+=== plan-swift-default.json ===
+tasks=140 hosts=2 digest=8c05bde59bad7e482bc69b9403cb43649191ac37385e973df1afab8183ebc5a4
+risk_counts={'host_reconfigure': 64} disk_wipe_tasks=0
+roles={'rust_common': 6, 'rust_payload': 5, 'rust_disks': 3, 'rust_replication_key': 9, 'rust_config': 5, 'rust_rings': 7, 'rust_systemd': 71, 'rust_haproxy': 14, 'rust_keepalived': 12, 'rust_identity_bridge': 3, 'rust_verify': 5}
+  format_disks: when=None hosts=None
+  format_new_disks: when=None hosts=None
+  mariadb_servers: when=None hosts=None
+  keystone_install: when=None hosts=None
+  keystones: when=None hosts=None
+

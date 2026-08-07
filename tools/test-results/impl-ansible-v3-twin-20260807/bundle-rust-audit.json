@@ -1,0 +1,34 @@
+{
+  "task_files": 21,
+  "tasks": 102,
+  "modules": {
+    "command": 4,
+    "copy": 12,
+    "debug": 2,
+    "fail": 8,
+    "fetch": 5,
+    "file": 8,
+    "include_tasks": 17,
+    "lineinfile": 1,
+    "package": 3,
+    "set_fact": 1,
+    "shell": 20,
+    "systemd": 8,
+    "template": 10,
+    "timezone": 1,
+    "uri": 2
+  },
+  "controls": {
+    "changed_when": 34,
+    "delegate_to": 12,
+    "failed_when": 2,
+    "notify": 5,
+    "register": 21,
+    "run_once": 14,
+    "when": 50,
+    "with_items": 8
+  },
+  "unsupported_modules": [],
+  "parse_errors": [],
+  "fingerprint": "3a1976a8e839424e22c5ef8a0adccfbfb7bd73b5140b1518aeca3553d7d7c18e"
+}

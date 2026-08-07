@@ -1,0 +1,214 @@
+---
+# =============================================================================
+# swift-full-v3.yml — OPT-IN full ansible v3 twin path (NOT Contabo default)
+# =============================================================================
+#
+# Default Contabo / production data-plane remains:
+#   bundle-rust/swift.yml   (safe: no disk wipe, no Keystone/MariaDB install)
+#
+# This playbook makes every Python `bundle/roles/*` name *reachable* from the
+# rust-stack entry surface:
+#   - Prefer the Rust equivalent when one exists (data plane / LB / rings)
+#   - Else include the Python role via roles_path (ansible.cfg:
+#       roles_path = roles:../bundle/roles)
+#
+# Dangerous / provisioning roles stay opt-in:
+#   format_disks / format_new_disks  → when: allow_disk_format | default(false)
+#   mariadb_servers / keystone_install / keystones
+#                                   → when: enable_identity_provision | default(false)
+#
+# Authority: docs/fairness-lab/ANSIBLE-V3-SURFACE.md § Full v3 twin path
+# Evidence:  tools/test-results/impl-ansible-v3-twin-20260807/
+#
+# -----------------------------------------------------------------------------
+# 26/26 role coverage map (each Python role name appears below)
+# -----------------------------------------------------------------------------
+# check                 → role: check                    (python-include)
+# chrony                → role: chrony                   (python-include)
+# common                → COVERED by rust_common
+# cosbench              → role: cosbench                 (python-include, when extras)
+# docker                → role: docker                   (python-include, when extras)
+# example_structure     → role: example_structure        (scaffold no-op)
+# finalize_installation → COVERED by rust_systemd + rust_verify
+# format_disks          → role: format_disks             (when allow_disk_format)
+# format_new_disks      → role: format_new_disks         (when allow_disk_format)
+# haproxy_servers       → COVERED by rust_haproxy
+# keepalived_servers    → COVERED by rust_keepalived
+# keystone_install      → role: keystone_install         (when enable_identity_provision)
+# keystones             → role: keystones                (when enable_identity_provision)
+# mariadb_servers       → role: mariadb_servers          (when enable_identity_provision)
+# new_ring              → role: new_ring                 (python-include, when extras)
+# performance_tuning    → role: performance_tuning       (python-include)
+# proxyfs               → role: proxyfs                  (python-include, when extras)
+# ring_builder          → COVERED by rust_rings
+# ring_utils            → COVERED by rust_rings
+# security              → role: security                 (python-include)
+# storage_nodes_common  → COVERED by rust_common + rust_disks + rust_replication_key
+# swift_account         → COVERED by rust_config + rust_systemd (+ payload)
+# swift_container       → COVERED by rust_config + rust_systemd (+ payload)
+# swift_object          → COVERED by rust_config + rust_systemd (+ payload)
+# swift_proxy           → COVERED by rust_payload + rust_config + rust_systemd + rust_verify
+# system_tuning         → role: system_tuning            (python-include)
+# -----------------------------------------------------------------------------
+
+# --- Preflight (python check) ---
+- hosts: all
+  tags: [full_v3, check]
+  roles:
+    - role: check
+
+# --- Data plane (rust preferred — covers common / storage_nodes_common /
+#     swift_proxy / swift_account / swift_container / swift_object /
+#     ring_builder / ring_utils / finalize_installation) ---
+- hosts: all
+  tags: [full_v3, common, payload]
+  roles:
+    # COVERED: common → rust_common
+    - rust_common
+    - rust_payload
+
+- hosts: storage_nodes
+  tags: [full_v3, disks, replication]
+  roles:
+    # COVERED: storage_nodes_common → rust_common + rust_disks + rust_replication_key
+    - rust_disks
+    - rust_replication_key
+
+- hosts: all
+  tags: [full_v3, config, rings, systemd]
+  roles:
+    # COVERED: swift_proxy / swift_account / swift_container / swift_object
+    #          → rust_config + rust_systemd (+ payload above)
+    # COVERED: ring_builder / ring_utils → rust_rings
+    - rust_config
+    - rust_rings
+    - rust_systemd
+
+- hosts: haproxy_servers
+  tags: [full_v3, haproxy, lb]
+  roles:
+    # COVERED: haproxy_servers → rust_haproxy
+    - role: rust_haproxy
+      when: use_lb
+
+- hosts: keepalived_servers
+  tags: [full_v3, keepalived, lb]
+  roles:
+    # COVERED: keepalived_servers → rust_keepalived
+    - role: rust_keepalived
+      when: use_lb
+
+# Optional Identity 对接 (not package install) — same as swift.yml
+- hosts: all
+  tags: [full_v3, identity]
+  roles:
+    - role: rust_identity_bridge
+      when: >
+        identity_haproxy_enabled | default(false)
+        or identity_proxy_enabled | default(false)
+        or (auth_method | default('tempauth')) == 'keystone'
+        or (auth_method | default('tempauth')) == 'keystone_coexist'
+
+- hosts: proxy_servers
+  tags: [full_v3, verify]
+  roles:
+    # COVERED: finalize_installation → rust_systemd + rust_verify
+    - rust_verify
+
+# --- Platform Python includes (roles_path → ../bundle/roles) ---
+- hosts: performance_tuning
+  tags: [full_v3, platform, performance_tuning]
+  roles:
+    - role: performance_tuning
+      when: enable_python_platform | default(false)
+
+- hosts: ntp_server
+  tags: [full_v3, platform, chrony]
+  roles:
+    - role: chrony
+      when: enable_python_platform | default(false)
+
+- hosts: ntp_clients
+  tags: [full_v3, platform, chrony]
+  roles:
+    - role: chrony
+      when: enable_python_platform | default(false)
+
+- hosts: all
+  tags: [full_v3, platform, security]
+  roles:
+    - role: security
+      when: enable_python_platform | default(false)
+
+- hosts: all
+  tags: [full_v3, platform, system_tuning]
+  roles:
+    - role: system_tuning
+      when: enable_python_platform | default(false)
+
+# --- Disk format (OPT-IN only; never Contabo default) ---
+# Dual-guard: allow_disk_format defaults false. Enabling requires operator intent
+# and (for apply) safety capability --allow-disk-wipe on non-default paths.
+- hosts: format_disk_servers
+  tags: [full_v3, format_disks, disk_format]
+  roles:
+    - role: format_disks
+      when: allow_disk_format | default(false)
+
+- hosts: format_disk_servers
+  tags: [full_v3, format_new_disks, disk_format]
+  roles:
+    - role: format_new_disks
+      when: allow_disk_format | default(false)
+
+# --- Identity provision (OPT-IN only — Python MariaDB/Keystone install) ---
+# Default Contabo uses Identity 对接 flags + rust_identity_bridge, not this path.
+- hosts: mariadb_servers
+  tags: [full_v3, identity_provision, mariadb_servers]
+  roles:
+    - role: mariadb_servers
+      when: enable_identity_provision | default(false)
+
+- hosts: keystones
+  tags: [full_v3, identity_provision, keystone_install]
+  roles:
+    - role: keystone_install
+      when: enable_identity_provision | default(false)
+
+- hosts: keystones
+  tags: [full_v3, identity_provision, keystones]
+  roles:
+    - role: keystones
+      when: enable_identity_provision | default(false)
+
+# --- Extras (OPT-IN Python) ---
+- hosts: all
+  tags: [full_v3, extras, docker]
+  roles:
+    - role: docker
+      when: enable_python_extras | default(false)
+
+- hosts: all
+  tags: [full_v3, extras, cosbench]
+  roles:
+    - role: cosbench
+      when: enable_python_extras | default(false)
+
+- hosts: proxyfs
+  tags: [full_v3, extras, proxyfs]
+  roles:
+    - role: proxyfs
+      when: enable_python_extras | default(false) or install_proxyfs | default(false)
+
+- hosts: all
+  tags: [full_v3, extras, new_ring]
+  roles:
+    - role: new_ring
+      when: enable_python_extras | default(false) or enable_new_ring | default(false)
+
+# --- Scaffold (N/A production) ---
+- hosts: all
+  tags: [full_v3, scaffold, example_structure]
+  roles:
+    - role: example_structure
+      when: enable_example_structure | default(false)

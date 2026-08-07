@@ -11,8 +11,13 @@
 #   identity.yml                       optional Identity 对接 re-assert / re-render
 #   monitoring.yml                     docs + tags → sibling bundle-monitoring
 #   deferred-python.yml                Python-only paths with explicit when: (never default)
+#   swift-full-v3.yml                  OPT-IN full ansible-v3 twin (every bundle/swift.yml
+#                                      role; ABSENT via roles_path/symlinks; NOT Contabo default)
 #   ../bundle-monitoring/swift.yml     mon agents (node_exporter / statsd / Alloy)
 #   tools/ops/apply-vip-tls-pem.sh     operator TLS PEM on VIP (explicit --ssh)
+#
+# Contabo / production data-plane: keep THIS playbook (swift.yml). Full twin is
+# opt-in only — never the default Contabo path.
 #
 # TLS: set lb_mode=https (+ haproxy_tls_pem_src or haproxy_tls_self_signed).
 # Keepalived: inventory keepalived_servers + use_lb (workspace ingress.mode).
@@ -20,7 +25,8 @@
 #   — see IDENTITY.md, docs/fairness-lab/KEYSTONE-LIVE.md, ANSIBLE-V3-SURFACE.md.
 #
 # Dual-guard: never wipe /srv/node. rust_disks is mkdir-only; workspace rejects
-# node.disks for stack=rust. Contabo format requires ticket + Python path.
+# node.disks for stack=rust. Contabo format requires ticket + Python path
+# (or opt-in swift-full-v3.yml with allow_disk_format=true on empty devices only).
 #
 # Tags (documentation / real-Ansible operators; deploy-rs does not filter tags):
 #   common, payload, disks, config, rings, systemd, haproxy, keepalived,

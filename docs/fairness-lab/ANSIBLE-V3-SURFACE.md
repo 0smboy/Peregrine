@@ -2,7 +2,8 @@
 
 **As of:** 2026-08-07  
 **Authority for:** Platform row *Full ansible v3 surface* in [RUST-VS-PYTHON-PARITY.md](RUST-VS-PYTHON-PARITY.md)  
-**Evidence:** [`tools/test-results/impl-ansible-v3-surface-20260807/`](../../tools/test-results/impl-ansible-v3-surface-20260807/)  
+**Evidence (default PARTIAL):** [`tools/test-results/impl-ansible-v3-surface-20260807/`](../../tools/test-results/impl-ansible-v3-surface-20260807/)  
+**Evidence (FULL TWIN PATH opt-in):** [`tools/test-results/impl-ansible-v3-twin-20260807/`](../../tools/test-results/impl-ansible-v3-twin-20260807/)  
 **Related:** [DEPLOY-HYBRID.md](DEPLOY-HYBRID.md) · [P3-OPS-CONTRACT.md](P3-OPS-CONTRACT.md) · [KEYSTONE-LIVE.md](KEYSTONE-LIVE.md) · [MULTI-REGION.md](MULTI-REGION.md)
 
 ## Claim level (honest)
@@ -10,10 +11,77 @@
 | Stack | Path | Claim |
 |-------|------|-------|
 | Python ansible-v3 | `swift-deploy-rs/bundle/` | Near-full upstream-style surface (format disks, Keystone install, security, cosbench, …) |
-| Rust stack | `swift-deploy-rs/bundle-rust/` | **PARTIAL / GREEN** for *implemented* Rust Swift data-plane + LB + expand + Identity *对接* |
+| Rust stack **default** | `bundle-rust/swift.yml` | **PARTIAL / GREEN** — data-plane + LB + expand + Identity *对接*; Contabo-safe (no format_disks) |
+| Rust stack **FULL TWIN PATH** | `bundle-rust/swift-full-v3.yml` | **AVAILABLE (opt-in)** — **26/26** role reachability; rust preferred else Python via `roles_path`/symlinks |
 | Monitoring agents | `swift-deploy-rs/bundle-monitoring/` | Separate bundle; not inlined into `bundle-rust/swift.yml` |
 
-**Do not claim** full Python ansible-v3 role parity for `bundle-rust`. Contabo production data-plane target is pure `bundle-rust apply`; wipe/format, Keystone *provisioning*, and platform hardening stay on explicit Python or out-of-band paths.
+**Default remains PARTIAL.** Contabo production data-plane target is pure `bundle-rust apply` via **`swift.yml`** (safe: no disk wipe).  
+
+**FULL TWIN PATH (opt-in only):** `bundle-rust/swift-full-v3.yml` reaches **26/26** Python `bundle/roles/*` names — rust preferred when implemented, else Python include via `roles_path = roles:../bundle/roles` and local symlinks. See [§ Full v3 twin path](#full-v3-twin-path-swift-full-v3yml).
+
+---
+
+## Full v3 twin path (`swift-full-v3.yml`)
+
+| Item | Value |
+|------|--------|
+| Playbook | `swift-deploy-rs/bundle-rust/swift-full-v3.yml` |
+| Default Contabo? | **No** — use `swift.yml` |
+| `ansible.cfg` | `roles_path = roles:../bundle/roles` |
+| Disk format | `format_disks` / `format_new_disks` only when `allow_disk_format \| default(false)` |
+| Keystone / MariaDB install | only when `enable_identity_provision \| default(false)` |
+| Platform extras | `enable_python_platform \| default(false)` (chrony, security, performance_tuning, system_tuning) |
+| Cosbench / docker / proxyfs / new_ring | `enable_python_extras \| default(false)` (and related flags) |
+| Evidence | [`tools/test-results/impl-ansible-v3-twin-20260807/`](../../tools/test-results/impl-ansible-v3-twin-20260807/) |
+
+### Coverage table — 26/26 COVERED
+
+| # | Python role (`bundle/roles/`) | Twin coverage | Mechanism |
+|--:|-------------------------------|---------------|-----------|
+| 1 | `check` | **COVERED** | python-include `check` |
+| 2 | `chrony` | **COVERED** | python-include `chrony` (`enable_python_platform`) |
+| 3 | `common` | **COVERED** | rust `rust_common` |
+| 4 | `cosbench` | **COVERED** | python-include `cosbench` (`enable_python_extras`) |
+| 5 | `docker` | **COVERED** | python-include `docker` (`enable_python_extras`) |
+| 6 | `example_structure` | **COVERED** | scaffold no-op role (`enable_example_structure`) |
+| 7 | `finalize_installation` | **COVERED** | rust `rust_systemd` + `rust_verify` |
+| 8 | `format_disks` | **COVERED** | python-include `format_disks` (`allow_disk_format`) |
+| 9 | `format_new_disks` | **COVERED** | python-include `format_new_disks` (`allow_disk_format`) |
+| 10 | `haproxy_servers` | **COVERED** | rust `rust_haproxy` |
+| 11 | `keepalived_servers` | **COVERED** | rust `rust_keepalived` |
+| 12 | `keystone_install` | **COVERED** | python-include (`enable_identity_provision`) |
+| 13 | `keystones` | **COVERED** | python-include (`enable_identity_provision`); 对接 also via `rust_identity_bridge` |
+| 14 | `mariadb_servers` | **COVERED** | python-include (`enable_identity_provision`) |
+| 15 | `new_ring` | **COVERED** | python-include (`enable_python_extras` / `enable_new_ring`) |
+| 16 | `performance_tuning` | **COVERED** | python-include (`enable_python_platform`) |
+| 17 | `proxyfs` | **COVERED** | python-include (`enable_python_extras` / `install_proxyfs`) |
+| 18 | `ring_builder` | **COVERED** | rust `rust_rings` |
+| 19 | `ring_utils` | **COVERED** | rust `rust_rings` |
+| 20 | `security` | **COVERED** | python-include (`enable_python_platform`) |
+| 21 | `storage_nodes_common` | **COVERED** | rust `rust_common` + `rust_disks` + `rust_replication_key` |
+| 22 | `swift_account` | **COVERED** | rust `rust_config` + `rust_systemd` (+ payload) |
+| 23 | `swift_container` | **COVERED** | rust `rust_config` + `rust_systemd` (+ payload) |
+| 24 | `swift_object` | **COVERED** | rust `rust_config` + `rust_systemd` (+ payload) |
+| 25 | `swift_proxy` | **COVERED** | rust `rust_payload` + `rust_config` + `rust_systemd` + `rust_verify` |
+| 26 | `system_tuning` | **COVERED** | python-include (`enable_python_platform`) |
+
+**Score: 26/26 COVERED** (rust equivalent preferred, else python-include via `roles_path`).
+
+Python-include roles are resolved either as symlinks under `bundle-rust/roles/<name> → ../../bundle/roles/<name>` (deploy-rs planner) or via `roles_path` for real Ansible.
+
+### Operator invoke (plan only recommended for Contabo)
+
+```sh
+# Safe default Contabo data-plane
+swift-deploy plan --bundle bundle-rust --playbook bundle-rust/swift.yml \
+  --inventory <inv> --output plan-swift.json
+
+# Opt-in full twin (flags default false → format/identity/platform skipped)
+swift-deploy plan --bundle bundle-rust --playbook bundle-rust/swift-full-v3.yml \
+  --inventory <inv> --output plan-full-v3.json
+# Never apply full-v3 against live Contabo disks without ticket + allow_disk_format
+# and independent safety caps (--allow-disk-wipe etc.).
+```
 
 ---
 
@@ -40,7 +108,7 @@ Status legend:
 | `keepalived_servers` | `rust_keepalived` | **DONE** | `when: use_lb`; VIP health tracks haproxy |
 | `swift_proxy` | `rust_payload` + `rust_config` + `rust_systemd` + `rust_verify` | **DONE** | TempAuth default; Keystone filters on-by-config only |
 | `storage_nodes_common` | `rust_common` + `rust_disks` + `rust_replication_key` | **PARTIAL** | pkgs subset; mkdir devices only |
-| `format_disks` | **never** / `python_only_format_disks` | **ABSENT** | Dual-guard (see §4). Python only + ticket |
+| `format_disks` | **never** on default / full-twin python-include | **ABSENT** (default) | Default `swift.yml` never includes. Full twin: `when: allow_disk_format \| default(false)` |
 | `swift_account` | `rust_config` + `rust_systemd` (+ payload) | **DONE** | account server + reaper/auditor units as implemented |
 | `swift_container` | `rust_config` + `rust_systemd` (+ payload) | **DONE** | + sharder/updater/reconciler units as present |
 | `swift_object` | `rust_config` + `rust_systemd` (+ payload) | **DONE** | + replicator/reconstructor/expirer/auditor |
@@ -121,6 +189,7 @@ Status legend:
 | — | **`identity.yml`** — optional Identity 对接 re-render (`when:` flags) |
 | — | **`monitoring.yml`** — pointer + tags → **`bundle-monitoring/swift.yml`** |
 | — | **`deferred-python.yml`** — Python-only surfaces with explicit `when:` default false |
+| — | **`swift-full-v3.yml`** — OPT-IN full twin (26/26 roles; rust preferred else python-include) |
 | — | **`bundle-monitoring/swift.yml`** for agents (tags: `monitoring`, `mon_*`) |
 | — | TLS operator scripts: `tools/ops/apply-vip-tls-pem.sh` |
 
@@ -133,6 +202,7 @@ Status legend:
 | `bundle-rust/identity.yml` | `identity`, `identity_proxy`, `identity_haproxy`, `config`, `haproxy`, `lb` |
 | `bundle-rust/monitoring.yml` | `monitoring`, `mon_agents` |
 | `bundle-rust/deferred-python.yml` | `deferred`, `python_only`, `keystone_install`, `mariadb_servers`, `format_disks`, `platform`, `extras` |
+| `bundle-rust/swift-full-v3.yml` | `full_v3`, plus data-plane + `format_disks` / `identity_provision` / `platform` / `extras` (opt-in `when:`) |
 | `bundle-monitoring/swift.yml` | `monitoring`, `mon_agents`, `mon_payload`, `mon_config`, `mon_systemd` |
 
 ### 2.3 Identity (对接, not provision)
@@ -155,9 +225,11 @@ Default Contabo: **TempAuth** on VIP; both `identity_*_enabled` flags **false**.
 ### 3.1 Dual-guard (hard rules)
 
 1. **`rust_disks` never** runs `mkfs` / `wipefs` / `dd` / `parted` — mkdir under `srv_node_root` only.  
-2. **Workspace** rejects non-empty `node.disks` for `stack: rust` (no `RiskClass::DiskWipe` on rust plans).  
-3. Contabo wipe of `/srv/node` requires an **explicit ticket** + `--allow-disk-wipe` on a **non-`bundle-rust`** path (Python `format_disks` / manual ops).  
-4. Do **not** put live Contabo hosts into Python `format_disk_servers` without a maintenance window and confirmed empty/new devices.
+2. **Workspace** rejects non-empty `node.disks` for `stack: rust` (no `RiskClass::DiskWipe` on default rust plans).  
+3. **Default path `swift.yml` never** lists `format_disks`.  
+4. **Full twin dual-guard:** `swift-full-v3.yml` includes Python `format_disks` / `format_new_disks` **only** when `allow_disk_format | default(false)` is true.  
+5. Contabo wipe of `/srv/node` requires an **explicit ticket** + `--allow-disk-wipe` + empty/new devices (never live object disks).  
+6. Do **not** put live Contabo hosts into `format_disk_servers` without a maintenance window.
 
 ### 3.2 Keystone + MariaDB (Identity provisioning)
 
@@ -195,20 +267,27 @@ Safe sequence for Contabo (data plane already on rust):
 
 ### 3.3 format_disks / new disks
 
-**Optional import / deferred pattern (bundle-rust):**  
-`deferred-python.yml` lists `python_only_format_disks` with:
+**Default path:** never present.
+
+**Deferred fail-closed wrapper:** `deferred-python.yml` → `python_only_format_disks` with
+`when: include_python_format_disks | default(false)` — even if forced true, **fails closed**.
+
+**Full twin opt-in:**
 
 ```yaml
-when: include_python_format_disks | default(false)
+# swift-full-v3.yml
+- hosts: format_disk_servers
+  roles:
+    - role: format_disks
+      when: allow_disk_format | default(false)
 ```
 
-Even if forced true, the role **fails closed** and never runs mkfs.  
-Additionally `rust_disks` refuses inventory wipe flags (`force_format_disks`,
+`rust_disks` refuses inventory wipe flags (`force_format_disks`,
 `include_python_format_disks`, `allow_disk_wipe`, `use_format_disks`).
 
 | Goal | Safe path |
 |------|-----------|
-| Greenfield empty lab disks | Python `format_disks` **only** on hosts listed in `format_disk_servers` with explicit `custom_disks` — **not** Contabo with live objects |
+| Greenfield empty lab disks | Full twin `allow_disk_format=true` **or** Python `format_disks` on `format_disk_servers` with `custom_disks` — **not** Contabo live objects |
 | Contabo add disk | (1) Partition/format/mount **OOB** to `/srv/node/<name>` (2) append to `swift_devices` (3) `expand.yml` |
 | Contabo add node | Inventory + ssh + empty device dirs → `expand.yml` |
 
@@ -235,19 +314,26 @@ Run **Python** playbooks/roles against the intended host groups **without** incl
 
 ---
 
-## 5. Residual list (honest — why not FULL)
+## 5. Residual list (honest)
 
-1. **No** `format_disks` / `format_new_disks` in rust (by design).  
-2. **No** MariaDB Galera / Keystone package install in rust.  
-3. **No** `security` (firewall/sshd), `chrony`, `performance_tuning`, `system_tuning` roles.  
-4. **No** `proxyfs`, `docker`, `cosbench` roles in rust.  
-5. **No** dedicated `add_new_ring.yml` equivalent playbook.  
-6. `common` / `finalize_installation` / `check` only partially mapped.  
-7. Ring expand semantics differ (Rust builder rebalance without replica2part2dev persistence) — ops honesty in P3 contract.  
-8. Monitoring is a **sibling** bundle, not full in-tree python-v3 monitoring roles.  
-9. Python `swift.yml` `any_errors_fatal` / tags surface not fully mirrored in executor.
+### Default Contabo path (`swift.yml`) — why not FULL without twin
 
-**Status for parity table:** Full ansible v3 surface → Rust **PARTIAL** (lab-green for implemented subset), **not** ✅ full.
+1. **No** `format_disks` / `format_new_disks` on default path (by design dual-guard).  
+2. **No** MariaDB Galera / Keystone package install on default path.  
+3. **No** `security` / `chrony` / `performance_tuning` / `system_tuning` on default path.  
+4. **No** `proxyfs` / `docker` / `cosbench` on default path.  
+5. Ring expand semantics differ (Rust builder rebalance without replica2part2dev persistence).  
+6. Monitoring is a **sibling** bundle.  
+7. Executor does not filter Ansible `tags:`.
+
+### Full twin path (`swift-full-v3.yml`)
+
+- **26/26** role names **COVERED** (rust preferred else python-include).  
+- Opt-in flags default **false** — safe dry plan does not schedule wipe/install unless inventory overrides.  
+- Python role body semantics (partial rust mapping fidelity) remain as in §1 matrix; twin = *reachability*, not 1:1 behavior clone.  
+- Contabo live: still prefer `swift.yml`; full-v3 is lab / hybrid / documented opt-in only.
+
+**Status for parity table:** Full ansible v3 surface → default **PARTIAL**; **FULL TWIN PATH available (opt-in)** via `swift-full-v3.yml` = **26/26 COVERED** (role reachability; not 1:1 behavior clone).
 
 ---
 

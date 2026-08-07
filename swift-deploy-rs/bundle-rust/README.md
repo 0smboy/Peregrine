@@ -106,12 +106,15 @@ Default Contabo remains TempAuth on VIP `:8085`.
 ## Layout
 
 ```
-swift.yml            greenfield (+ optional rust_identity_bridge when identity flags)
+swift.yml            DEFAULT Contabo/greenfield (PARTIAL; dual-guard, no format_disks)
+swift-full-v3.yml    OPT-IN full ansible-v3 twin (every bundle/swift.yml role;
+                     rust where present, Python ABSENT via roles_path/symlinks;
+                     format_disks only when allow_disk_format=true)
 expand.yml           P3-ops add-disk/add-node (ring_expand)
 identity.yml         optional Identity 对接 re-render (when flags)
 monitoring.yml       pointer + tags → sibling bundle-monitoring
 deferred-python.yml  Python-only surfaces; explicit when: default false
-ansible.cfg
+ansible.cfg          roles_path = roles:../bundle/roles
 config_sample/       swift_hosts, group_vars/all, host_vars/<ip>.yml
 roles/
   rust_common/       timezone, dirs, rsync dep, stop legacy SAIO unit
@@ -128,6 +131,7 @@ roles/
   rust_verify/       healthcheck + tempauth + PUT/GET
   python_only_*/     docs + fail-closed wrappers for ABSENT Python roles
   monitoring_overlay_path/  points at bundle-monitoring (not inlined)
+  <ABSENT python>/   symlinks → ../../bundle/roles/* for full-v3 / real Ansible
 ```
 
 Full Python↔Rust role matrix: [ANSIBLE-V3-SURFACE.md](../../docs/fairness-lab/ANSIBLE-V3-SURFACE.md).

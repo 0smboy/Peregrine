@@ -1,0 +1,33 @@
+python_roles_count=26
+ #  role                      present   how
+----------------------------------------------------------------------
+ 1  check                     YES       role_invoke
+ 2  chrony                    YES       role_invoke
+ 3  common                    YES       coverage_map
+ 4  cosbench                  YES       role_invoke
+ 5  docker                    YES       role_invoke
+ 6  example_structure         YES       role_invoke
+ 7  finalize_installation     YES       coverage_map
+ 8  format_disks              YES       role_invoke
+ 9  format_new_disks          YES       role_invoke
+10  haproxy_servers           YES       coverage_map
+11  keepalived_servers        YES       coverage_map
+12  keystone_install          YES       role_invoke
+13  keystones                 YES       role_invoke
+14  mariadb_servers           YES       role_invoke
+15  new_ring                  YES       role_invoke
+16  performance_tuning        YES       role_invoke
+17  proxyfs                   YES       role_invoke
+18  ring_builder              YES       coverage_map
+19  ring_utils                YES       coverage_map
+20  security                  YES       role_invoke
+21  storage_nodes_common      YES       coverage_map
+22  swift_account             YES       coverage_map
+23  swift_container           YES       coverage_map
+24  swift_object              YES       coverage_map
+25  swift_proxy               YES       coverage_map
+26  system_tuning             YES       role_invoke
+----------------------------------------------------------------------
+COVERED=26/26
+PASS: 26/26 role names appear in swift-full-v3.yml
+PASS: guards + roles_path + safe default

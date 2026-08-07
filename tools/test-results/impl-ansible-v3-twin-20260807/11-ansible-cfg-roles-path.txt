@@ -1,0 +1,2 @@
+# additional paths to search for roles in, colon separated
+roles_path = roles:../bundle/roles

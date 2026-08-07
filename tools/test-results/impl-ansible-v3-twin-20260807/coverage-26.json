@@ -1,0 +1,189 @@
+{
+  "score": "26/26",
+  "covered": 26,
+  "total": 26,
+  "roles": [
+    {
+      "n": 1,
+      "python": "check",
+      "status": "COVERED",
+      "coverage": "python-include `check`",
+      "resolution": "symlink \u2192 ../../bundle/roles/check"
+    },
+    {
+      "n": 2,
+      "python": "chrony",
+      "status": "COVERED",
+      "coverage": "python-include `chrony` (`enable_python_platform`)",
+      "resolution": "symlink \u2192 ../../bundle/roles/chrony"
+    },
+    {
+      "n": 3,
+      "python": "common",
+      "status": "COVERED",
+      "coverage": "rust `rust_common`",
+      "resolution": "roles_path only (../bundle/roles)"
+    },
+    {
+      "n": 4,
+      "python": "cosbench",
+      "status": "COVERED",
+      "coverage": "python-include `cosbench` (`enable_python_extras`)",
+      "resolution": "symlink \u2192 ../../bundle/roles/cosbench"
+    },
+    {
+      "n": 5,
+      "python": "docker",
+      "status": "COVERED",
+      "coverage": "python-include `docker` (`enable_python_extras`)",
+      "resolution": "symlink \u2192 ../../bundle/roles/docker"
+    },
+    {
+      "n": 6,
+      "python": "example_structure",
+      "status": "COVERED",
+      "coverage": "scaffold no-op (`enable_example_structure`)",
+      "resolution": "local role dir"
+    },
+    {
+      "n": 7,
+      "python": "finalize_installation",
+      "status": "COVERED",
+      "coverage": "rust `rust_systemd` + `rust_verify`",
+      "resolution": "roles_path only (../bundle/roles)"
+    },
+    {
+      "n": 8,
+      "python": "format_disks",
+      "status": "COVERED",
+      "coverage": "python-include `format_disks` (`allow_disk_format`)",
+      "resolution": "symlink \u2192 ../../bundle/roles/format_disks"
+    },
+    {
+      "n": 9,
+      "python": "format_new_disks",
+      "status": "COVERED",
+      "coverage": "python-include `format_new_disks` (`allow_disk_format`)",
+      "resolution": "symlink \u2192 ../../bundle/roles/format_new_disks"
+    },
+    {
+      "n": 10,
+      "python": "haproxy_servers",
+      "status": "COVERED",
+      "coverage": "rust `rust_haproxy`",
+      "resolution": "roles_path only (../bundle/roles)"
+    },
+    {
+      "n": 11,
+      "python": "keepalived_servers",
+      "status": "COVERED",
+      "coverage": "rust `rust_keepalived`",
+      "resolution": "roles_path only (../bundle/roles)"
+    },
+    {
+      "n": 12,
+      "python": "keystone_install",
+      "status": "COVERED",
+      "coverage": "python-include (`enable_identity_provision` / auth_method)",
+      "resolution": "symlink \u2192 ../../bundle/roles/keystone_install"
+    },
+    {
+      "n": 13,
+      "python": "keystones",
+      "status": "COVERED",
+      "coverage": "python-include + rust_identity_bridge \u5bf9\u63a5",
+      "resolution": "symlink \u2192 ../../bundle/roles/keystones"
+    },
+    {
+      "n": 14,
+      "python": "mariadb_servers",
+      "status": "COVERED",
+      "coverage": "python-include (`enable_identity_provision` / use_local_mariadbs)",
+      "resolution": "symlink \u2192 ../../bundle/roles/mariadb_servers"
+    },
+    {
+      "n": 15,
+      "python": "new_ring",
+      "status": "COVERED",
+      "coverage": "python-include (`enable_new_ring` / `enable_python_extras`)",
+      "resolution": "symlink \u2192 ../../bundle/roles/new_ring"
+    },
+    {
+      "n": 16,
+      "python": "performance_tuning",
+      "status": "COVERED",
+      "coverage": "python-include (`enable_python_platform`)",
+      "resolution": "symlink \u2192 ../../bundle/roles/performance_tuning"
+    },
+    {
+      "n": 17,
+      "python": "proxyfs",
+      "status": "COVERED",
+      "coverage": "python-include (`install_proxyfs` / `enable_python_extras`)",
+      "resolution": "symlink \u2192 ../../bundle/roles/proxyfs"
+    },
+    {
+      "n": 18,
+      "python": "ring_builder",
+      "status": "COVERED",
+      "coverage": "rust `rust_rings`",
+      "resolution": "roles_path only (../bundle/roles)"
+    },
+    {
+      "n": 19,
+      "python": "ring_utils",
+      "status": "COVERED",
+      "coverage": "rust `rust_rings`",
+      "resolution": "roles_path only (../bundle/roles)"
+    },
+    {
+      "n": 20,
+      "python": "security",
+      "status": "COVERED",
+      "coverage": "python-include (`enable_python_platform`)",
+      "resolution": "symlink \u2192 ../../bundle/roles/security"
+    },
+    {
+      "n": 21,
+      "python": "storage_nodes_common",
+      "status": "COVERED",
+      "coverage": "rust `rust_common`+`rust_disks`+`rust_replication_key`",
+      "resolution": "roles_path only (../bundle/roles)"
+    },
+    {
+      "n": 22,
+      "python": "swift_account",
+      "status": "COVERED",
+      "coverage": "rust `rust_config`+`rust_systemd`",
+      "resolution": "roles_path only (../bundle/roles)"
+    },
+    {
+      "n": 23,
+      "python": "swift_container",
+      "status": "COVERED",
+      "coverage": "rust `rust_config`+`rust_systemd`",
+      "resolution": "roles_path only (../bundle/roles)"
+    },
+    {
+      "n": 24,
+      "python": "swift_object",
+      "status": "COVERED",
+      "coverage": "rust `rust_config`+`rust_systemd`",
+      "resolution": "roles_path only (../bundle/roles)"
+    },
+    {
+      "n": 25,
+      "python": "swift_proxy",
+      "status": "COVERED",
+      "coverage": "rust payload+config+systemd+verify",
+      "resolution": "roles_path only (../bundle/roles)"
+    },
+    {
+      "n": 26,
+      "python": "system_tuning",
+      "status": "COVERED",
+      "coverage": "python-include (`enable_python_platform`)",
+      "resolution": "symlink \u2192 ../../bundle/roles/system_tuning"
+    }
+  ]
+}

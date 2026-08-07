@@ -1,0 +1,8 @@
+=== static dual-guard (bundle-rust native tasks) ===
+native_task_files_scanned=15
+dangerous_hits_excluding_guard_comments=0
+
+=== format_disks dual-guard in swift-full-v3.yml ===
+allow_disk_format_default_false=True
+format_disks_role_present=True
+default_swift_has_format_disks=False

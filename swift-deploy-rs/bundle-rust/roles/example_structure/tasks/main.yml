@@ -1,0 +1,5 @@
+---
+- name: example_structure scaffold (no-op)
+  debug:
+    msg: "example_structure is an empty Python scaffold; no tasks applied"
+  when: enable_example_structure | default(false)

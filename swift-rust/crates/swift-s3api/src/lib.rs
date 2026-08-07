@@ -36,21 +36,24 @@
 //! backend with fixed `Content-Length`. Per-chunk / trailer signature
 //! verification is residual (dechunk always works).
 //!
-//! # Subresource config APIs (meta round-trip; not full object versioning)
-//!
-//! Claimable unit surface (store/return XML via container or object meta):
+//! # Subresource config APIs (meta round-trip)
 //!
 //! * **versioning** GET/PUT — `Enabled`|`Suspended` in container meta
 //! * **tagging** GET/PUT/DELETE on bucket and object
 //! * **lifecycle** GET/PUT/DELETE — raw LifecycleConfiguration XML round-trip
+//! * **lifecycle execution** — object PUT stamps Swift `X-Delete-At` from
+//!   Enabled Expiration Days/Date (+ Prefix); see [`lifecycle_exec`]
 //! * **object-lock** GET/PUT — raw ObjectLockConfiguration XML round-trip
-//! * **versions** list — empty `ListVersionsResult` (no multi-version bodies)
+//! * **legal-hold** / **retention** object GET/PUT + WORM on DELETE/overwrite
+//!   (see [`object_lock_worm`])
+//! * **versions** list — `ListVersionsResult` from `{bucket}+versions` indexes
+//! * **multi-version object data plane** when versioning is **Enabled**
+//!   ([`versioning_store`]): archive, delete-markers, `?versionId=` GET/DELETE
 //!
 //! Other residuals (not claimable as implemented):
 //!
-//! * multi-version object bodies / versionId GET-DELETE / delete-markers
-//! * lifecycle expirer enforcement from stored rules
-//! * object-lock WORM / retention / legal-hold object APIs
+//! * lifecycle Transitions / AbortIncompleteMultipartUpload / tag filters
+//! * Object Lock governance bypass (`x-amz-bypass-governance-retention`)
 //! * full IAM / grant-header object ACL (canned private/public-read object ACL
 //!   via sysmeta **is** claimable for PUT/GET `?acl`; object public-read does
 //!   **not** by itself authorize anonymous Swift GET — container ACL still
@@ -71,11 +74,14 @@ pub mod aws_chunked;
 pub mod bucket_config;
 pub mod crypto;
 pub mod delete;
+pub mod lifecycle_exec;
 pub mod middleware;
 pub mod mpu;
+pub mod object_lock_worm;
 pub mod parse;
 pub mod response;
 pub mod sigv4;
+pub mod versioning_store;
 pub mod xml;
 
 pub use middleware::{

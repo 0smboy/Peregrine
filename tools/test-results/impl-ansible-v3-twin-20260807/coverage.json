@@ -1,0 +1,138 @@
+{
+  "covered": 26,
+  "total": 26,
+  "score": "26/26",
+  "pass": true,
+  "roles": [
+    {
+      "role": "check",
+      "present": true,
+      "how": "role_invoke"
+    },
+    {
+      "role": "chrony",
+      "present": true,
+      "how": "role_invoke"
+    },
+    {
+      "role": "common",
+      "present": true,
+      "how": "coverage_map"
+    },
+    {
+      "role": "cosbench",
+      "present": true,
+      "how": "role_invoke"
+    },
+    {
+      "role": "docker",
+      "present": true,
+      "how": "role_invoke"
+    },
+    {
+      "role": "example_structure",
+      "present": true,
+      "how": "role_invoke"
+    },
+    {
+      "role": "finalize_installation",
+      "present": true,
+      "how": "coverage_map"
+    },
+    {
+      "role": "format_disks",
+      "present": true,
+      "how": "role_invoke"
+    },
+    {
+      "role": "format_new_disks",
+      "present": true,
+      "how": "role_invoke"
+    },
+    {
+      "role": "haproxy_servers",
+      "present": true,
+      "how": "coverage_map"
+    },
+    {
+      "role": "keepalived_servers",
+      "present": true,
+      "how": "coverage_map"
+    },
+    {
+      "role": "keystone_install",
+      "present": true,
+      "how": "role_invoke"
+    },
+    {
+      "role": "keystones",
+      "present": true,
+      "how": "role_invoke"
+    },
+    {
+      "role": "mariadb_servers",
+      "present": true,
+      "how": "role_invoke"
+    },
+    {
+      "role": "new_ring",
+      "present": true,
+      "how": "role_invoke"
+    },
+    {
+      "role": "performance_tuning",
+      "present": true,
+      "how": "role_invoke"
+    },
+    {
+      "role": "proxyfs",
+      "present": true,
+      "how": "role_invoke"
+    },
+    {
+      "role": "ring_builder",
+      "present": true,
+      "how": "coverage_map"
+    },
+    {
+      "role": "ring_utils",
+      "present": true,
+      "how": "coverage_map"
+    },
+    {
+      "role": "security",
+      "present": true,
+      "how": "role_invoke"
+    },
+    {
+      "role": "storage_nodes_common",
+      "present": true,
+      "how": "coverage_map"
+    },
+    {
+      "role": "swift_account",
+      "present": true,
+      "how": "coverage_map"
+    },
+    {
+      "role": "swift_container",
+      "present": true,
+      "how": "coverage_map"
+    },
+    {
+      "role": "swift_object",
+      "present": true,
+      "how": "coverage_map"
+    },
+    {
+      "role": "swift_proxy",
+      "present": true,
+      "how": "coverage_map"
+    },
+    {
+      "role": "system_tuning",
+      "present": true,
+      "how": "role_invoke"
+    }
+  ]
+}

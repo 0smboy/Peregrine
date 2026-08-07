@@ -1,0 +1,16 @@
+=== rust no mkfs ===
+swift-deploy-rs/bundle-rust/roles/rust_disks/tasks/main.yml:5:#   1) This role NEVER runs mkfs / wipefs / dd / parted.
+=== guards ===
+16:#   format_disks / format_new_disks  → when: allow_disk_format | default(false)
+18:#                                   → when: enable_identity_provision | default(false)
+33:# format_disks          → role: format_disks             (when allow_disk_format)
+34:# format_new_disks      → role: format_new_disks         (when allow_disk_format)
+37:# keystone_install      → role: keystone_install         (when enable_identity_provision)
+38:# keystones             → role: keystones                (when enable_identity_provision)
+39:# mariadb_servers       → role: mariadb_servers          (when enable_identity_provision)
+150:# Dual-guard: allow_disk_format defaults false. Enabling requires operator intent
+156:      when: allow_disk_format | default(false)
+162:      when: allow_disk_format | default(false)
+170:      when: enable_identity_provision | default(false)
+176:      when: enable_identity_provision | default(false)
+182:      when: enable_identity_provision | default(false)

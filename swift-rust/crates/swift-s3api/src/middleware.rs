@@ -37,7 +37,7 @@
 //! * **SigV2** (`Authorization: AWS …` / `AWSAccessKeyId` query) — WONTFIX
 //!   unless reopened; only SigV4 is accepted.
 //! * Other subresources in [`UNSUPPORTED_SUBRESOURCES`] (policy, website,
-//!   replication, legal-hold, retention, select, …).
+//!   replication, select, …).
 //!
 //! # Config subresources (meta round-trip — claimable unit surface)
 //!
@@ -45,7 +45,12 @@
 //! * **tagging** GET/PUT/DELETE bucket + object
 //! * **lifecycle** GET/PUT/DELETE — raw XML in container meta
 //! * **object-lock** GET/PUT — raw XML in container meta
-//! * **versions** GET — empty `ListVersionsResult` (multi-version bodies residual)
+//! * **legal-hold** / **retention** GET/PUT on objects — sysmeta WORM;
+//!   DELETE → `403 AccessDenied` while hold ON or retain-until future.
+//!   PUT may stamp default retention from bucket ObjectLockConfiguration.
+//! * **versions** GET — `ListVersionsResult` from `{bucket}+versions` indexes
+//! * **multi-version object data plane** when versioning is `Enabled`
+//!   ([`crate::versioning_store`]): archive, delete-markers, `?versionId=`
 //!
 //! # aws-chunked / STREAMING-* (implemented)
 //!
@@ -55,6 +60,9 @@
 //! framing is stripped; trailers are discarded; decoded bytes are forwarded
 //! to Swift with fixed `Content-Length`. Per-chunk signature verification is
 //! best-effort residual (dechunk always runs).
+//!
+//! Object Lock **bypass** residual (`x-amz-bypass-governance-retention`)
+//! — **none by default**.
 //!
 //! Other residuals: full IAM / grant-header object ACL (canned
 //! private/public-read stored as sysmeta is claimable; object public-read
@@ -92,7 +100,14 @@ use crate::bucket_config::{
     validate_object_lock_xml, versioning_configuration_xml, versioning_status_from_headers,
     S3_BUCKET_TAGGING_META, S3_OBJECT_TAGGING_META,
 };
+use crate::object_lock_worm::{
+    apply_amz_object_lock_headers, apply_default_retention_headers,
+    default_retention_from_lock_xml, legal_hold_xml, parse_legal_hold_body,
+    parse_retention_body, retention_xml, worm_blocks_delete, SYS_LEGAL_HOLD, SYS_LOCK_MODE,
+    SYS_RETAIN_UNTIL,
+};
 use crate::delete::parse_multi_delete_body;
+use crate::lifecycle_exec::apply_lifecycle_delete_at_from_container;
 use crate::mpu::{
     complete_multipart_xml, initiate_response, list_multipart_uploads_xml, list_parts_xml_full,
     new_upload_id, parse_complete_body, parse_upload_marker_name, part_object_name,
@@ -105,6 +120,12 @@ use crate::response::{
     ListBucketResult, ListBucketResultV2, Owner, S3Object,
 };
 use crate::sigv4::{parse_sigv4_auth, string_to_sign_for_request, verify_sigv4, SigV4Auth};
+use crate::versioning_store::{
+    archive_object_name, bare_etag as vers_bare_etag, generate_version_id, index_object_name,
+    is_delete_marker_header, list_versions_result_xml, versioning_enabled, versions_container,
+    VersionIndex, VersionRecord, HDR_DELETE_MARKER, HDR_VERSION_ID, INDEX_NAME, SYS_DELETE_MARKER,
+    SYS_OBJECT_KEY, SYS_VERSION_ID,
+};
 use crate::xml::Element;
 
 /// One S3 credential mapped onto a Swift storage account.
@@ -227,13 +248,11 @@ fn credential_from_s3token(
 /// not a backend 500 or empty body.
 ///
 /// Implemented elsewhere (must **not** appear here): `lifecycle`, `tagging`,
-/// `versioning`, `versions`, `object-lock` — meta round-trip handlers.
+/// `versioning`, `versions`, `object-lock`, `legal-hold`, `retention`.
 const UNSUPPORTED_SUBRESOURCES: &[&str] = &[
     "policy",
     "website",
     "replication",
-    "legal-hold",
-    "retention",
     "select",
     "torrent",
     "requestPayment",
@@ -544,7 +563,9 @@ fn s3_to_swift_query(params: &[(String, String)], for_container_list: bool) -> S
             | "versions"
             | "tagging"
             | "lifecycle"
-            | "object-lock" => {}
+            | "object-lock"
+            | "legal-hold"
+            | "retention" => {}
             _ => {}
         }
     }
@@ -994,6 +1015,8 @@ impl Middleware for S3Api {
         let has_tagging = params.iter().any(|(k, _)| k == "tagging");
         let has_lifecycle = params.iter().any(|(k, _)| k == "lifecycle");
         let has_object_lock = params.iter().any(|(k, _)| k == "object-lock");
+        let has_legal_hold = params.iter().any(|(k, _)| k == "legal-hold");
+        let has_retention = params.iter().any(|(k, _)| k == "retention");
         let has_uploads = params.iter().any(|(k, _)| k == "uploads");
         let upload_id = params
             .iter()
@@ -1024,9 +1047,14 @@ impl Middleware for S3Api {
             return handle_versioning(req, &cred, bucket.as_deref().unwrap(), &next);
         }
 
-        // ---- List object versions (empty residual) ----
+        // ---- List object versions ----
         if has_versions && bucket.is_some() && key.is_none() && req.method == "GET" {
-            return handle_list_versions(bucket.as_deref().unwrap(), &params);
+            return handle_list_versions(
+                &cred,
+                bucket.as_deref().unwrap(),
+                &params,
+                &next,
+            );
         }
 
         // ---- Tagging (bucket + object) ----
@@ -1048,6 +1076,26 @@ impl Middleware for S3Api {
         // ---- Object Lock configuration (bucket) ----
         if has_object_lock && bucket.is_some() && key.is_none() {
             return handle_object_lock(req, &cred, bucket.as_deref().unwrap(), &next);
+        }
+
+        // ---- Object legal-hold / retention (WORM sysmeta) ----
+        if has_legal_hold && bucket.is_some() && key.is_some() {
+            return handle_legal_hold(
+                req,
+                &cred,
+                bucket.as_deref().unwrap(),
+                key.as_deref().unwrap(),
+                &next,
+            );
+        }
+        if has_retention && bucket.is_some() && key.is_some() {
+            return handle_retention(
+                req,
+                &cred,
+                bucket.as_deref().unwrap(),
+                key.as_deref().unwrap(),
+                &next,
+            );
         }
 
         // ---- Multipart ----
@@ -1092,6 +1140,32 @@ impl Middleware for S3Api {
 
         let method = req.method.clone();
         let is_copy = req.headers.get("X-Amz-Copy-Source").is_some();
+        let version_id_q = params
+            .iter()
+            .find(|(k, _)| k == "versionId")
+            .map(|(_, v)| v.clone());
+
+        // Multi-version object data plane (Enabled) or explicit ?versionId=.
+        if let (Some(b), Some(k)) = (bucket.clone(), key.clone()) {
+            if matches!(method.as_str(), "PUT" | "GET" | "HEAD" | "DELETE") {
+                let vstatus = probe_bucket_versioning(&cred, &b, &next);
+                let enabled = versioning_enabled(vstatus.as_deref());
+                if enabled || version_id_q.is_some() {
+                    return handle_versioned_object(
+                        req,
+                        &cred,
+                        &b,
+                        &k,
+                        &method,
+                        version_id_q.as_deref(),
+                        enabled,
+                        is_copy,
+                        &next,
+                    );
+                }
+            }
+        }
+
         let for_list = matches!(method.as_str(), "GET" | "HEAD") && key.is_none();
 
         let mut swift_req = req;
@@ -1121,12 +1195,36 @@ impl Middleware for S3Api {
                 apply_canned_acl(&mut swift_req.headers, &canned);
             }
         }
+        // Explicit x-amz-object-lock-* → sysmeta (before strip removes x-amz-*).
+        if method == "PUT" && key.is_some() {
+            apply_amz_object_lock_headers(&mut swift_req.headers);
+        }
         strip_s3_only_headers(&mut swift_req.headers);
         stamp_auth(&mut swift_req, &cred);
+
+        // Object Lock WORM: block DELETE and overwrite PUT (bypass residual).
+        if key.is_some() && matches!(method.as_str(), "DELETE" | "PUT") {
+            if let Some(blocked) = worm_check_object(
+                &cred,
+                bucket.as_deref().unwrap(),
+                key.as_deref().unwrap(),
+                &next,
+            ) {
+                return blocked;
+            }
+        }
 
         // Force JSON listings past any Accept noise.
         if for_list && method == "GET" {
             swift_req.headers.set("Accept", "application/json");
+        }
+
+        // Lifecycle EXECUTION + optional bucket default Object Lock retention.
+        if method == "PUT" {
+            if let (Some(b), Some(k)) = (bucket.as_deref(), key.as_deref()) {
+                maybe_apply_lifecycle_on_put(&mut swift_req, &cred, b, k, next);
+                apply_bucket_default_retention(&mut swift_req, &cred, b, next);
+            }
         }
 
         let resp = next(swift_req);
@@ -1192,6 +1290,208 @@ fn make_swift_req(method: &str, path: &str) -> Request {
     }
 }
 
+fn unix_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn worm_check_object(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    next: &NextFn,
+) -> Option<Response> {
+    if worm_blocks_key(cred, bucket, key, next) {
+        Some(s3_error_response("AccessDenied", None, &[]))
+    } else {
+        None
+    }
+}
+
+fn worm_blocks_key(cred: &S3Credential, bucket: &str, key: &str, next: &NextFn) -> bool {
+    let mut head = make_swift_req(
+        "HEAD",
+        &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
+    );
+    stamp_auth(&mut head, cred);
+    let resp = next(head);
+    if !(200..300).contains(&resp.status) {
+        return false;
+    }
+    worm_blocks_delete(&resp.headers, unix_now())
+}
+
+/// HEAD bucket lifecycle meta → stamp X-Delete-At on object PUT.
+fn maybe_apply_lifecycle_on_put(
+    swift_req: &mut Request,
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    next: &NextFn,
+) {
+    if swift_req.headers.get("X-Delete-At").is_some() {
+        return;
+    }
+    let mut head =
+        make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+    stamp_auth(&mut head, cred);
+    let head_resp = next(head);
+    if !(200..300).contains(&head_resp.status) {
+        return;
+    }
+    apply_lifecycle_delete_at_from_container(
+        &mut swift_req.headers,
+        &head_resp.headers,
+        key,
+        unix_now(),
+    );
+}
+
+fn apply_bucket_default_retention(
+    put_req: &mut Request,
+    cred: &S3Credential,
+    bucket: &str,
+    next: &NextFn,
+) {
+    if put_req.headers.get(SYS_RETAIN_UNTIL).is_some() {
+        return;
+    }
+    let mut head =
+        make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+    stamp_auth(&mut head, cred);
+    let resp = next(head);
+    if !(200..300).contains(&resp.status) {
+        return;
+    }
+    let Some(xml) = object_lock_xml_from_headers(&resp.headers) else {
+        return;
+    };
+    let Some(def) = default_retention_from_lock_xml(&xml) else {
+        return;
+    };
+    apply_default_retention_headers(&mut put_req.headers, &def, unix_now());
+}
+
+fn handle_legal_hold(
+    req: Request,
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    next: &NextFn,
+) -> Response {
+    match req.method.as_str() {
+        "GET" | "HEAD" => {
+            let mut head = make_swift_req(
+                "HEAD",
+                &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
+            );
+            stamp_auth(&mut head, cred);
+            let resp = next(head);
+            if !(200..300).contains(&resp.status) {
+                return map_swift_error(resp.status, Some(bucket), Some(key));
+            }
+            let on = resp
+                .headers
+                .get(SYS_LEGAL_HOLD)
+                .map(|s| s.eq_ignore_ascii_case("ON") || s.eq_ignore_ascii_case("true") || s == "1")
+                .unwrap_or(false);
+            xml_ok(legal_hold_xml(on))
+        }
+        "PUT" => {
+            let body = match req.body.into_vec(MAX_CONTROL_BODY) {
+                Ok(b) => b,
+                Err(_) => return s3_error_response("IncompleteBody", None, &[]),
+            };
+            let on = match parse_legal_hold_body(&body) {
+                Ok(v) => v,
+                Err(_) => return s3_error_response("MalformedXML", None, &[]),
+            };
+            let mut post = make_swift_req(
+                "POST",
+                &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
+            );
+            post.headers
+                .set(SYS_LEGAL_HOLD, if on { "ON" } else { "OFF" });
+            stamp_auth(&mut post, cred);
+            let resp = next(post);
+            if (200..300).contains(&resp.status) {
+                Response::new(200)
+            } else {
+                map_swift_error(resp.status, Some(bucket), Some(key))
+            }
+        }
+        _ => s3_error_response("MethodNotAllowed", None, &[]),
+    }
+}
+
+fn handle_retention(
+    req: Request,
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    next: &NextFn,
+) -> Response {
+    match req.method.as_str() {
+        "GET" | "HEAD" => {
+            let mut head = make_swift_req(
+                "HEAD",
+                &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
+            );
+            stamp_auth(&mut head, cred);
+            let resp = next(head);
+            if !(200..300).contains(&resp.status) {
+                return map_swift_error(resp.status, Some(bucket), Some(key));
+            }
+            let mode = resp.headers.get(SYS_LOCK_MODE).map(str::to_string);
+            let until = resp.headers.get(SYS_RETAIN_UNTIL).map(str::to_string);
+            match (mode, until) {
+                (Some(m), Some(u)) if !m.is_empty() && !u.is_empty() => {
+                    xml_ok(retention_xml(&m, &u))
+                }
+                _ => s3_error_response(
+                    "InvalidRequest",
+                    Some("Object is missing retention configuration"),
+                    &[],
+                ),
+            }
+        }
+        "PUT" => {
+            let body = match req.body.into_vec(MAX_CONTROL_BODY) {
+                Ok(b) => b,
+                Err(_) => return s3_error_response("IncompleteBody", None, &[]),
+            };
+            let (mode, until) = match parse_retention_body(&body) {
+                Ok(v) => v,
+                Err(_) => return s3_error_response("MalformedXML", None, &[]),
+            };
+            let mode_up = mode.to_ascii_uppercase();
+            if mode_up != "GOVERNANCE" && mode_up != "COMPLIANCE" {
+                return s3_error_response("MalformedXML", None, &[]);
+            }
+            if crate::object_lock_worm::parse_retain_until(&until).is_none() {
+                return s3_error_response("MalformedXML", None, &[]);
+            }
+            let mut post = make_swift_req(
+                "POST",
+                &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
+            );
+            post.headers.set(SYS_LOCK_MODE, mode_up);
+            post.headers.set(SYS_RETAIN_UNTIL, until);
+            stamp_auth(&mut post, cred);
+            let resp = next(post);
+            if (200..300).contains(&resp.status) {
+                Response::new(200)
+            } else {
+                map_swift_error(resp.status, Some(bucket), Some(key))
+            }
+        }
+        _ => s3_error_response("MethodNotAllowed", None, &[]),
+    }
+}
+
 fn handle_multi_delete(
     req: Request,
     cred: &S3Credential,
@@ -1209,6 +1509,14 @@ fn handle_multi_delete(
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
     for key in &parsed.keys {
+        if worm_blocks_key(cred, bucket, key, next) {
+            errors.push(DeleteError {
+                key: key.clone(),
+                code: "AccessDenied".into(),
+                message: "Access Denied.".into(),
+            });
+            continue;
+        }
         let mut del = make_swift_req(
             "DELETE",
             &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
@@ -1397,7 +1705,476 @@ fn handle_versioning(req: Request, cred: &S3Credential, bucket: &str, next: &Nex
     }
 }
 
-fn handle_list_versions(bucket: &str, params: &[(String, String)]) -> Response {
+// ---------------------------------------------------------------------------
+// Multi-version object data plane
+// ---------------------------------------------------------------------------
+
+fn probe_bucket_versioning(cred: &S3Credential, bucket: &str, next: &NextFn) -> Option<String> {
+    let mut head =
+        make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+    stamp_auth(&mut head, cred);
+    let resp = next(head);
+    if !(200..300).contains(&resp.status) {
+        return None;
+    }
+    versioning_status_from_headers(&resp.headers)
+}
+
+fn ensure_versions_container(cred: &S3Credential, bucket: &str, next: &NextFn) {
+    let vc = versions_container(bucket);
+    let mut put = make_swift_req("PUT", &s3_to_swift_path(&cred.account, Some(&vc), None));
+    stamp_auth(&mut put, cred);
+    let _ = next(put);
+}
+
+fn load_version_index(cred: &S3Credential, bucket: &str, key: &str, next: &NextFn) -> VersionIndex {
+    let vc = versions_container(bucket);
+    let iname = index_object_name(key);
+    let mut get =
+        make_swift_req("GET", &s3_to_swift_path(&cred.account, Some(&vc), Some(&iname)));
+    stamp_auth(&mut get, cred);
+    let resp = next(get);
+    if !(200..300).contains(&resp.status) {
+        return VersionIndex::new(key);
+    }
+    let body = resp.body.into_vec(MAX_CONTROL_BODY).unwrap_or_default();
+    VersionIndex::from_json(&body).unwrap_or_else(|| VersionIndex::new(key))
+}
+
+fn save_version_index(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    idx: &VersionIndex,
+    next: &NextFn,
+) {
+    ensure_versions_container(cred, bucket, next);
+    let vc = versions_container(bucket);
+    let iname = index_object_name(key);
+    let body = idx.to_json();
+    let mut put =
+        make_swift_req("PUT", &s3_to_swift_path(&cred.account, Some(&vc), Some(&iname)));
+    put.headers.set("Content-Length", body.len().to_string());
+    put.headers.set("Content-Type", "application/json");
+    put.headers.set(SYS_OBJECT_KEY, key);
+    put.body = Body::from(body);
+    stamp_auth(&mut put, cred);
+    let _ = next(put);
+}
+
+fn archive_current_version(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    next: &NextFn,
+) {
+    ensure_versions_container(cred, bucket, next);
+    let cur_path = s3_to_swift_path(&cred.account, Some(bucket), Some(key));
+    let mut get = make_swift_req("GET", &cur_path);
+    stamp_auth(&mut get, cred);
+    let got = next(get);
+    if !(200..300).contains(&got.status) {
+        return;
+    }
+    let ctype = got
+        .headers
+        .get("Content-Type")
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let body = got.body.into_vec(u64::MAX).unwrap_or_default();
+    let vc = versions_container(bucket);
+    let aname = archive_object_name(key, version_id);
+    let mut put =
+        make_swift_req("PUT", &s3_to_swift_path(&cred.account, Some(&vc), Some(&aname)));
+    put.headers.set("Content-Length", body.len().to_string());
+    put.headers.set("Content-Type", &ctype);
+    put.headers.set(SYS_VERSION_ID, version_id);
+    put.headers.set(SYS_OBJECT_KEY, key);
+    put.headers.set(SYS_DELETE_MARKER, "false");
+    put.body = Body::from(body);
+    stamp_auth(&mut put, cred);
+    let _ = next(put);
+}
+
+fn handle_versioned_object(
+    req: Request,
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    method: &str,
+    version_id_q: Option<&str>,
+    enabled: bool,
+    is_copy: bool,
+    next: &NextFn,
+) -> Response {
+    if !enabled {
+        let vid = version_id_q.unwrap_or("");
+        return s3_error_response(
+            "NoSuchVersion",
+            None,
+            &[("Key", key), ("VersionId", vid)],
+        );
+    }
+    match method {
+        "PUT" => handle_versioned_put(req, cred, bucket, key, is_copy, next),
+        "GET" | "HEAD" => {
+            handle_versioned_get_head(cred, bucket, key, method, version_id_q, next)
+        }
+        "DELETE" => handle_versioned_delete(cred, bucket, key, version_id_q, next),
+        _ => s3_error_response("MethodNotAllowed", None, &[]),
+    }
+}
+
+fn handle_versioned_put(
+    mut req: Request,
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    is_copy: bool,
+    next: &NextFn,
+) -> Response {
+    let cur_path = s3_to_swift_path(&cred.account, Some(bucket), Some(key));
+    let mut head = make_swift_req("HEAD", &cur_path);
+    stamp_auth(&mut head, cred);
+    let cur = next(head);
+
+    let mut idx = load_version_index(cred, bucket, key, next);
+
+    if (200..300).contains(&cur.status)
+        && !is_delete_marker_header(cur.headers.get(SYS_DELETE_MARKER))
+    {
+        let old_vid = cur
+            .headers
+            .get(SYS_VERSION_ID)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(generate_version_id);
+        let old_etag = cur
+            .headers
+            .get("ETag")
+            .map(vers_bare_etag)
+            .unwrap_or_default();
+        let old_size = cur
+            .headers
+            .get("Content-Length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0i64);
+        let old_lm = cur
+            .headers
+            .get("Last-Modified")
+            .map(|s| http_date_to_s3_approx(s))
+            .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
+
+        archive_current_version(cred, bucket, key, &old_vid, next);
+
+        if idx.find(&old_vid).is_none() {
+            idx.push_latest(VersionRecord {
+                version_id: old_vid,
+                is_delete_marker: false,
+                is_latest: true,
+                last_modified: old_lm,
+                etag: old_etag,
+                size: old_size,
+            });
+        }
+    }
+
+    let new_vid = generate_version_id();
+
+    req.method = "PUT".into();
+    req.path = cur_path;
+    req.query_string.clear();
+    map_amz_meta(&mut req);
+    apply_copy_source(&mut req);
+    if let Some(canned) = req.headers.get("X-Amz-Acl").map(str::to_string) {
+        apply_object_canned_acl(&mut req.headers, &canned);
+    }
+    strip_s3_only_headers(&mut req.headers);
+    req.headers.set(SYS_VERSION_ID, &new_vid);
+    req.headers.set(SYS_DELETE_MARKER, "false");
+    stamp_auth(&mut req, cred);
+
+    let resp = next(req);
+    if !(200..300).contains(&resp.status) {
+        return map_swift_error(resp.status, Some(bucket), Some(key));
+    }
+
+    let etag = resp
+        .headers
+        .get("ETag")
+        .map(vers_bare_etag)
+        .unwrap_or_default();
+    let size = resp
+        .headers
+        .get("Content-Length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0i64);
+    let lm = resp
+        .headers
+        .get("Last-Modified")
+        .map(|s| http_date_to_s3_approx(s))
+        .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
+
+    idx.push_latest(VersionRecord {
+        version_id: new_vid.clone(),
+        is_delete_marker: false,
+        is_latest: true,
+        last_modified: lm,
+        etag: etag.clone(),
+        size,
+    });
+    save_version_index(cred, bucket, key, &idx, next);
+
+    if is_copy {
+        let iso = resp
+            .headers
+            .get("Last-Modified")
+            .map(|s| http_date_to_s3_approx(s))
+            .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
+        let mut r = xml_response(200, copy_object_result_xml(&iso, &etag));
+        r.headers.set(HDR_VERSION_ID, &new_vid);
+        r
+    } else {
+        let mut r = put_object_response(&etag);
+        r.headers.set(HDR_VERSION_ID, &new_vid);
+        r
+    }
+}
+
+fn handle_versioned_get_head(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    method: &str,
+    version_id_q: Option<&str>,
+    next: &NextFn,
+) -> Response {
+    let cur_path = s3_to_swift_path(&cred.account, Some(bucket), Some(key));
+
+    if let Some(vid) = version_id_q {
+        if vid == "null" {
+            let mut op = make_swift_req(method, &cur_path);
+            stamp_auth(&mut op, cred);
+            let resp = next(op);
+            if (200..300).contains(&resp.status) {
+                if is_delete_marker_header(resp.headers.get(SYS_DELETE_MARKER)) {
+                    return nosuchkey_delete_marker(key, resp.headers.get(SYS_VERSION_ID));
+                }
+                return translate_object_success(method, resp, false);
+            }
+            return map_swift_error(resp.status, Some(bucket), Some(key));
+        }
+
+        let mut head = make_swift_req("HEAD", &cur_path);
+        stamp_auth(&mut head, cred);
+        let cur = next(head);
+        if (200..300).contains(&cur.status) && cur.headers.get(SYS_VERSION_ID) == Some(vid) {
+            if is_delete_marker_header(cur.headers.get(SYS_DELETE_MARKER)) {
+                return nosuchkey_delete_marker(key, Some(vid));
+            }
+            if method == "HEAD" {
+                let mut r = cur;
+                if let Some(etag) = r.headers.get("ETag").map(str::to_string) {
+                    r.headers.set("ETag", quote_etag(&etag));
+                }
+                r.headers.set(HDR_VERSION_ID, vid);
+                return r;
+            }
+            let mut get = make_swift_req("GET", &cur_path);
+            stamp_auth(&mut get, cred);
+            let mut resp = next(get);
+            if (200..300).contains(&resp.status) {
+                if let Some(etag) = resp.headers.get("ETag").map(str::to_string) {
+                    resp.headers.set("ETag", quote_etag(&etag));
+                }
+                resp.headers.set(HDR_VERSION_ID, vid);
+                return resp;
+            }
+            return map_swift_error(resp.status, Some(bucket), Some(key));
+        }
+
+        let vc = versions_container(bucket);
+        let aname = archive_object_name(key, vid);
+        let mut op =
+            make_swift_req(method, &s3_to_swift_path(&cred.account, Some(&vc), Some(&aname)));
+        stamp_auth(&mut op, cred);
+        let mut resp = next(op);
+        if (200..300).contains(&resp.status) {
+            if is_delete_marker_header(resp.headers.get(SYS_DELETE_MARKER)) {
+                return nosuchkey_delete_marker(key, Some(vid));
+            }
+            if let Some(etag) = resp.headers.get("ETag").map(str::to_string) {
+                resp.headers.set("ETag", quote_etag(&etag));
+            }
+            resp.headers.set(HDR_VERSION_ID, vid);
+            return resp;
+        }
+        return s3_error_response(
+            "NoSuchVersion",
+            None,
+            &[("Key", key), ("VersionId", vid)],
+        );
+    }
+
+    let mut op = make_swift_req(method, &cur_path);
+    stamp_auth(&mut op, cred);
+    let resp = next(op);
+    if !(200..300).contains(&resp.status) {
+        return map_swift_error(resp.status, Some(bucket), Some(key));
+    }
+    if is_delete_marker_header(resp.headers.get(SYS_DELETE_MARKER)) {
+        return nosuchkey_delete_marker(key, resp.headers.get(SYS_VERSION_ID));
+    }
+    let mut out = translate_object_success(method, resp, false);
+    if let Some(vid) = out.headers.get(SYS_VERSION_ID).map(str::to_string) {
+        out.headers.set(HDR_VERSION_ID, &vid);
+    }
+    out
+}
+
+fn nosuchkey_delete_marker(key: &str, version_id: Option<&str>) -> Response {
+    let mut resp = s3_error_response("NoSuchKey", None, &[("Key", key)]);
+    resp.headers.set(HDR_DELETE_MARKER, "true");
+    if let Some(v) = version_id {
+        resp.headers.set(HDR_VERSION_ID, v);
+    }
+    resp
+}
+
+fn handle_versioned_delete(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    version_id_q: Option<&str>,
+    next: &NextFn,
+) -> Response {
+    let cur_path = s3_to_swift_path(&cred.account, Some(bucket), Some(key));
+
+    if let Some(vid) = version_id_q {
+        if vid == "null" {
+            let mut del = make_swift_req("DELETE", &cur_path);
+            stamp_auth(&mut del, cred);
+            let resp = next(del);
+            if (200..300).contains(&resp.status) || resp.status == 404 {
+                let mut r = delete_object_response();
+                r.headers.set(HDR_VERSION_ID, "null");
+                return r;
+            }
+            return map_swift_error(resp.status, Some(bucket), Some(key));
+        }
+
+        let mut head = make_swift_req("HEAD", &cur_path);
+        stamp_auth(&mut head, cred);
+        let cur = next(head);
+        let mut idx = load_version_index(cred, bucket, key, next);
+
+        if (200..300).contains(&cur.status) && cur.headers.get(SYS_VERSION_ID) == Some(vid) {
+            let mut del = make_swift_req("DELETE", &cur_path);
+            stamp_auth(&mut del, cred);
+            let _ = next(del);
+            idx.remove_version(vid);
+            save_version_index(cred, bucket, key, &idx, next);
+            let mut r = delete_object_response();
+            r.headers.set(HDR_VERSION_ID, vid);
+            if is_delete_marker_header(cur.headers.get(SYS_DELETE_MARKER)) {
+                r.headers.set(HDR_DELETE_MARKER, "true");
+            }
+            return r;
+        }
+
+        let vc = versions_container(bucket);
+        let aname = archive_object_name(key, vid);
+        let mut del =
+            make_swift_req("DELETE", &s3_to_swift_path(&cred.account, Some(&vc), Some(&aname)));
+        stamp_auth(&mut del, cred);
+        let resp = next(del);
+        if (200..300).contains(&resp.status) || resp.status == 404 {
+            idx.remove_version(vid);
+            save_version_index(cred, bucket, key, &idx, next);
+            let mut r = delete_object_response();
+            r.headers.set(HDR_VERSION_ID, vid);
+            return r;
+        }
+        return map_swift_error(resp.status, Some(bucket), Some(key));
+    }
+
+    let mut head = make_swift_req("HEAD", &cur_path);
+    stamp_auth(&mut head, cred);
+    let cur = next(head);
+    let mut idx = load_version_index(cred, bucket, key, next);
+
+    if (200..300).contains(&cur.status)
+        && !is_delete_marker_header(cur.headers.get(SYS_DELETE_MARKER))
+    {
+        let old_vid = cur
+            .headers
+            .get(SYS_VERSION_ID)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(generate_version_id);
+        let old_etag = cur
+            .headers
+            .get("ETag")
+            .map(vers_bare_etag)
+            .unwrap_or_default();
+        let old_size = cur
+            .headers
+            .get("Content-Length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0i64);
+        let old_lm = cur
+            .headers
+            .get("Last-Modified")
+            .map(|s| http_date_to_s3_approx(s))
+            .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
+        archive_current_version(cred, bucket, key, &old_vid, next);
+        if idx.find(&old_vid).is_none() {
+            idx.push_latest(VersionRecord {
+                version_id: old_vid,
+                is_delete_marker: false,
+                is_latest: true,
+                last_modified: old_lm,
+                etag: old_etag,
+                size: old_size,
+            });
+        }
+    }
+
+    let dm_vid = generate_version_id();
+    let mut put = make_swift_req("PUT", &cur_path);
+    put.headers.set("Content-Length", "0");
+    put.headers.set(SYS_VERSION_ID, &dm_vid);
+    put.headers.set(SYS_DELETE_MARKER, "true");
+    put.body = Body::empty();
+    stamp_auth(&mut put, cred);
+    let resp = next(put);
+    if !(200..300).contains(&resp.status) {
+        return map_swift_error(resp.status, Some(bucket), Some(key));
+    }
+
+    idx.push_latest(VersionRecord {
+        version_id: dm_vid.clone(),
+        is_delete_marker: true,
+        is_latest: true,
+        last_modified: "1970-01-01T00:00:00.000Z".into(),
+        etag: String::new(),
+        size: 0,
+    });
+    save_version_index(cred, bucket, key, &idx, next);
+
+    let mut r = delete_object_response();
+    r.headers.set(HDR_VERSION_ID, &dm_vid);
+    r.headers.set(HDR_DELETE_MARKER, "true");
+    r
+}
+
+fn handle_list_versions(
+    cred: &S3Credential,
+    bucket: &str,
+    params: &[(String, String)],
+    next: &NextFn,
+) -> Response {
     let prefix = params
         .iter()
         .find(|(k, _)| k == "prefix")
@@ -1418,12 +2195,62 @@ fn handle_list_versions(bucket: &str, params: &[(String, String)]) -> Response {
         .find(|(k, _)| k == "max-keys")
         .and_then(|(_, v)| v.parse().ok())
         .unwrap_or(1000u32);
-    xml_ok(empty_list_versions_result_xml(
+
+    let vc = versions_container(bucket);
+    let mut list =
+        make_swift_req("GET", &s3_to_swift_path(&cred.account, Some(&vc), None));
+    list.query_string = "format=json".into();
+    list.headers.set("Accept", "application/json");
+    stamp_auth(&mut list, cred);
+    let resp = next(list);
+
+    if resp.status == 404 || !(200..300).contains(&resp.status) {
+        return xml_ok(empty_list_versions_result_xml(
+            bucket,
+            prefix,
+            key_marker,
+            version_id_marker,
+            max_keys,
+        ));
+    }
+
+    let body = match resp.body.into_vec(MAX_CONTROL_BODY) {
+        Ok(b) => b,
+        Err(_) => return s3_error_response("InternalError", Some("listing too large"), &[]),
+    };
+    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Array(vec![]));
+    let mut indexes: Vec<VersionIndex> = Vec::new();
+    if let Some(arr) = parsed.as_array() {
+        for item in arr {
+            let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if !(name.ends_with(INDEX_NAME) || name.ends_with("/index.json")) {
+                continue;
+            }
+            let mut get = make_swift_req(
+                "GET",
+                &s3_to_swift_path(&cred.account, Some(&vc), Some(name)),
+            );
+            stamp_auth(&mut get, cred);
+            let g = next(get);
+            if !(200..300).contains(&g.status) {
+                continue;
+            }
+            let b = g.body.into_vec(MAX_CONTROL_BODY).unwrap_or_default();
+            if let Some(idx) = VersionIndex::from_json(&b) {
+                indexes.push(idx);
+            }
+        }
+    }
+
+    xml_ok(list_versions_result_xml(
         bucket,
         prefix,
         key_marker,
         version_id_marker,
         max_keys,
+        &indexes,
     ))
 }
 
@@ -2172,6 +2999,9 @@ mod tests {
         req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
 
         let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                return Response::new(404);
+            }
             assert_eq!(r.path, "/v1/AUTH_proj123/ec2bucket/obj");
             assert_eq!(r.headers.get("X-Backend-Authorize-Override"), Some("true"));
             assert_eq!(r.headers.get("X-Auth-Token"), Some("subj-tok"));
@@ -2246,6 +3076,9 @@ mod tests {
         let api = S3Api::new(cred_map());
         let req = sign_request(base_s3_req("PUT", "/mybucket/dir/obj", ""), "testing");
         let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                return Response::new(404);
+            }
             assert_eq!(r.path, "/v1/AUTH_test/mybucket/dir/obj");
             let mut resp = Response::new(201);
             resp.headers.set("ETag", "abc123");
@@ -2345,6 +3178,9 @@ mod tests {
         );
         let req = sign_request(req, "testing");
         let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                return Response::new(404);
+            }
             assert_eq!(r.method, "DELETE");
             Response::new(204)
         });
@@ -2619,6 +3455,9 @@ mod tests {
         req.body = Body::from(b"hi".to_vec());
         let req = sign_request(req, "testing");
         let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                return Response::new(404);
+            }
             assert_eq!(r.method, "PUT");
             assert_eq!(r.path, "/v1/AUTH_test/mybucket/obj1");
             assert_eq!(
@@ -2755,7 +3594,7 @@ mod tests {
     fn versions_list_returns_empty_list_versions_result() {
         let api = S3Api::new(cred_map());
         let req = sign_request(base_s3_req("GET", "/mybucket", "versions"), "testing");
-        let next: NextFn = Arc::new(|_| panic!("versions list is local; no Swift hop"));
+        let next: NextFn = Arc::new(|_| Response::new(404));
         let resp = api.handle(req, &next);
         assert_eq!(resp.status, 200);
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
@@ -2763,6 +3602,271 @@ mod tests {
         assert!(body.contains("<Name>mybucket</Name>"));
         assert!(body.contains("<IsTruncated>false</IsTruncated>"));
         assert!(!body.contains("<Version>"));
+    }
+
+    fn versioning_mock_store(status: &str) -> NextFn {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        let store: Arc<Mutex<HashMap<String, (HeaderKeyDict, Vec<u8>)>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut h = HeaderKeyDict::new();
+            h.set(S3_VERSIONING_META, status);
+            store
+                .lock()
+                .unwrap()
+                .insert("/v1/AUTH_test/mybucket".into(), (h, Vec::new()));
+        }
+        let store_c = store.clone();
+        Arc::new(move |r: Request| {
+            let path = r.path.clone();
+            let method = r.method.clone();
+            let mut store = store_c.lock().unwrap();
+
+            // Container-level ops (bucket or +versions)
+            let is_container = path == "/v1/AUTH_test/mybucket"
+                || path == "/v1/AUTH_test/mybucket+versions";
+            if is_container {
+                if method == "HEAD" {
+                    if let Some((h, _)) = store.get(&path) {
+                        let mut resp = Response::new(204);
+                        for (k, v) in h.iter() {
+                            resp.headers.set(k, v);
+                        }
+                        return resp;
+                    }
+                    // +versions may not exist yet
+                    return if path.ends_with("+versions") {
+                        Response::new(404)
+                    } else {
+                        Response::new(404)
+                    };
+                }
+                if method == "PUT" {
+                    store
+                        .entry(path.clone())
+                        .or_insert_with(|| (HeaderKeyDict::new(), Vec::new()));
+                    return Response::new(201);
+                }
+                if method == "GET" {
+                    let prefix = path.clone();
+                    let mut items = Vec::new();
+                    for (p, (h, body)) in store.iter() {
+                        if p.starts_with(&(prefix.clone() + "/")) {
+                            let name = &p[prefix.len() + 1..];
+                            let hash = h.get("ETag").unwrap_or("deadbeef");
+                            items.push(format!(
+                                r#"{{"name":"{name}","hash":"{hash}","bytes":{},"last_modified":"2013-05-24T00:00:00.000000"}}"#,
+                                body.len()
+                            ));
+                        }
+                    }
+                    let body = format!("[{}]", items.join(","));
+                    return Response::with_body(200, body.into_bytes());
+                }
+                if method == "POST" {
+                    let entry = store
+                        .entry(path)
+                        .or_insert_with(|| (HeaderKeyDict::new(), Vec::new()));
+                    for (k, v) in r.headers.iter() {
+                        entry.0.set(k, v);
+                    }
+                    return Response::new(204);
+                }
+            }
+
+            match method.as_str() {
+                "HEAD" => {
+                    if let Some((h, body)) = store.get(&path) {
+                        let mut resp = Response::new(200);
+                        for (k, v) in h.iter() {
+                            resp.headers.set(k, v);
+                        }
+                        resp.headers.set("Content-Length", body.len().to_string());
+                        if resp.headers.get("ETag").is_none() {
+                            resp.headers.set("ETag", "deadbeef");
+                        }
+                        resp.headers
+                            .set("Last-Modified", "Thu, 01 Jan 1970 00:00:00 GMT");
+                        return resp;
+                    }
+                    Response::new(404)
+                }
+                "GET" => {
+                    if let Some((h, body)) = store.get(&path) {
+                        let mut resp = Response::with_body(200, body.clone());
+                        for (k, v) in h.iter() {
+                            resp.headers.set(k, v);
+                        }
+                        resp.headers.set("Content-Length", body.len().to_string());
+                        if resp.headers.get("ETag").is_none() {
+                            resp.headers.set("ETag", "deadbeef");
+                        }
+                        resp.headers
+                            .set("Last-Modified", "Thu, 01 Jan 1970 00:00:00 GMT");
+                        return resp;
+                    }
+                    Response::new(404)
+                }
+                "PUT" => {
+                    let body = r.body.into_vec(u64::MAX).unwrap_or_default();
+                    let mut h = HeaderKeyDict::new();
+                    for (k, v) in r.headers.iter() {
+                        let kl = k.to_ascii_lowercase();
+                        if kl.starts_with("x-object-") || kl == "content-type" {
+                            h.set(k, v);
+                        }
+                    }
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    body.hash(&mut hasher);
+                    let etag = format!("{:x}", hasher.finish());
+                    h.set("ETag", &etag);
+                    h.set("Content-Length", body.len().to_string());
+                    store.insert(path, (h, body));
+                    let mut resp = Response::new(201);
+                    resp.headers.set("ETag", etag);
+                    resp.headers.set("Content-Length", "0");
+                    resp
+                }
+                "DELETE" => {
+                    store.remove(&path);
+                    Response::new(204)
+                }
+                _ => Response::new(405),
+            }
+        })
+    }
+
+    #[test]
+    fn multiversion_double_put_two_version_ids_and_list() {
+        let api = S3Api::new(cred_map());
+        let next = versioning_mock_store("Enabled");
+
+        let mut req1 = base_s3_req("PUT", "/mybucket/obj", "");
+        req1.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req1.body = Body::from(b"v1".to_vec());
+        let r1 = api.handle(sign_request(req1, "testing"), &next);
+        assert_eq!(r1.status, 200);
+        let vid1 = r1.headers.get("x-amz-version-id").unwrap().to_string();
+        assert_eq!(vid1.len(), 32);
+
+        let mut req2 = base_s3_req("PUT", "/mybucket/obj", "");
+        req2.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req2.body = Body::from(b"v2-body".to_vec());
+        let r2 = api.handle(sign_request(req2, "testing"), &next);
+        assert_eq!(r2.status, 200);
+        let vid2 = r2.headers.get("x-amz-version-id").unwrap().to_string();
+        assert_ne!(vid1, vid2);
+
+        let list_req = sign_request(base_s3_req("GET", "/mybucket", "versions"), "testing");
+        let list_resp = api.handle(list_req, &next);
+        assert_eq!(list_resp.status, 200);
+        let body = String::from_utf8(list_resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains(&format!("<VersionId>{vid1}</VersionId>")), "{body}");
+        assert!(body.contains(&format!("<VersionId>{vid2}</VersionId>")), "{body}");
+        assert_eq!(body.matches("<Version>").count(), 2);
+    }
+
+    #[test]
+    fn multiversion_get_specific_version_id_returns_body() {
+        let api = S3Api::new(cred_map());
+        let next = versioning_mock_store("Enabled");
+
+        let mut req1 = base_s3_req("PUT", "/mybucket/obj", "");
+        req1.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req1.body = Body::from(b"alpha".to_vec());
+        let r1 = api.handle(sign_request(req1, "testing"), &next);
+        let vid1 = r1.headers.get("x-amz-version-id").unwrap().to_string();
+
+        let mut req2 = base_s3_req("PUT", "/mybucket/obj", "");
+        req2.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req2.body = Body::from(b"beta".to_vec());
+        let _ = api.handle(sign_request(req2, "testing"), &next);
+
+        let get = sign_request(
+            base_s3_req("GET", "/mybucket/obj", &format!("versionId={vid1}")),
+            "testing",
+        );
+        let resp = api.handle(get, &next);
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body.into_vec(u64::MAX).unwrap(), b"alpha");
+    }
+
+    #[test]
+    fn multiversion_delete_current_makes_delete_marker_get_404() {
+        let api = S3Api::new(cred_map());
+        let next = versioning_mock_store("Enabled");
+
+        let mut put = base_s3_req("PUT", "/mybucket/obj", "");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(b"data".to_vec());
+        let _ = api.handle(sign_request(put, "testing"), &next);
+
+        let del = sign_request(base_s3_req("DELETE", "/mybucket/obj", ""), "testing");
+        let dresp = api.handle(del, &next);
+        assert_eq!(dresp.status, 204);
+        assert_eq!(dresp.headers.get("x-amz-delete-marker"), Some("true"));
+
+        let get = sign_request(base_s3_req("GET", "/mybucket/obj", ""), "testing");
+        let gresp = api.handle(get, &next);
+        assert_eq!(gresp.status, 404);
+        let body = String::from_utf8(gresp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("NoSuchKey"));
+        assert_eq!(gresp.headers.get("x-amz-delete-marker"), Some("true"));
+    }
+
+    #[test]
+    fn multiversion_delete_version_id_removes_version() {
+        let api = S3Api::new(cred_map());
+        let next = versioning_mock_store("Enabled");
+
+        let mut req1 = base_s3_req("PUT", "/mybucket/obj", "");
+        req1.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req1.body = Body::from(b"one".to_vec());
+        let r1 = api.handle(sign_request(req1, "testing"), &next);
+        let vid1 = r1.headers.get("x-amz-version-id").unwrap().to_string();
+
+        let mut req2 = base_s3_req("PUT", "/mybucket/obj", "");
+        req2.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req2.body = Body::from(b"two".to_vec());
+        let _ = api.handle(sign_request(req2, "testing"), &next);
+
+        let del = sign_request(
+            base_s3_req("DELETE", "/mybucket/obj", &format!("versionId={vid1}")),
+            "testing",
+        );
+        assert_eq!(api.handle(del, &next).status, 204);
+
+        let get = sign_request(
+            base_s3_req("GET", "/mybucket/obj", &format!("versionId={vid1}")),
+            "testing",
+        );
+        let gresp = api.handle(get, &next);
+        assert_eq!(gresp.status, 404);
+        let body = String::from_utf8(gresp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("NoSuchVersion"));
+    }
+
+    #[test]
+    fn multiversion_suspended_no_multi_version() {
+        let api = S3Api::new(cred_map());
+        let next = versioning_mock_store("Suspended");
+
+        let mut put = base_s3_req("PUT", "/mybucket/obj", "");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(b"x".to_vec());
+        let r = api.handle(sign_request(put, "testing"), &next);
+        assert_eq!(r.status, 200);
+        assert!(r.headers.get("x-amz-version-id").is_none());
+
+        let mut put2 = base_s3_req("PUT", "/mybucket/obj", "");
+        put2.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put2.body = Body::from(b"y".to_vec());
+        let r2 = api.handle(sign_request(put2, "testing"), &next);
+        assert_eq!(r2.status, 200);
+        assert!(r2.headers.get("x-amz-version-id").is_none());
     }
 
     #[test]
@@ -3096,6 +4200,9 @@ mod tests {
         req.body = Body::from(framed);
         let req = sign_request(req, "testing");
         let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                return Response::new(404);
+            }
             assert_eq!(r.path, "/v1/AUTH_test/mybucket/obj");
             assert_eq!(r.method, "PUT");
             let body = r.body.into_vec(u64::MAX).unwrap();
@@ -3135,6 +4242,9 @@ mod tests {
         req.body = Body::from(framed);
         let req = sign_request(req, "testing");
         let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                return Response::new(404);
+            }
             let body = r.body.into_vec(u64::MAX).unwrap();
             assert_eq!(body, b"raw-via-encoding");
             assert_eq!(r.headers.get("Content-Length"), Some("16"));
@@ -3168,6 +4278,9 @@ mod tests {
         req.body = Body::from(framed);
         let req = sign_request(req, "testing");
         let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                return Response::new(404);
+            }
             let body = r.body.into_vec(u64::MAX).unwrap();
             assert_eq!(body, b"with-trailers");
             assert_eq!(r.headers.get("Content-Length"), Some("13"));
@@ -3291,6 +4404,9 @@ mod tests {
         // path rewrite we only need a valid SigV4 over the declared set.
         let req = sign_request(req, "testing");
         let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                return Response::new(404);
+            }
             assert_eq!(r.headers.get("X-Copy-From"), Some("src/obj"));
             let mut resp = Response::new(201);
             resp.headers.set("ETag", "ff");
@@ -3302,5 +4418,307 @@ mod tests {
         assert_eq!(resp.status, 200);
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
         assert!(body.contains("CopyObjectResult"));
+    }
+
+    #[test]
+    fn legal_hold_put_get_round_trip() {
+        let api = S3Api::new(cred_map());
+        let body = br#"<LegalHold><Status>ON</Status></LegalHold>"#;
+        let mut put = base_s3_req("PUT", "/mybucket/obj1", "legal-hold");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(body.to_vec());
+        let put = sign_request(put, "testing");
+        let put_next: NextFn = Arc::new(|r| {
+            assert_eq!(r.method, "POST");
+            assert_eq!(r.headers.get(SYS_LEGAL_HOLD), Some("ON"));
+            Response::new(202)
+        });
+        assert_eq!(api.handle(put, &put_next).status, 200);
+
+        let get = sign_request(base_s3_req("GET", "/mybucket/obj1", "legal-hold"), "testing");
+        let get_next: NextFn = Arc::new(|_| {
+            let mut r = Response::new(200);
+            r.headers.set(SYS_LEGAL_HOLD, "ON");
+            r
+        });
+        let resp = api.handle(get, &get_next);
+        assert_eq!(resp.status, 200);
+        let b = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(b.contains("LegalHold") && b.contains("<Status>ON</Status>"));
+    }
+
+    #[test]
+    fn retention_put_get_round_trip() {
+        let api = S3Api::new(cred_map());
+        let body = br#"<Retention>
+  <Mode>COMPLIANCE</Mode>
+  <RetainUntilDate>2035-01-01T00:00:00.000Z</RetainUntilDate>
+</Retention>"#;
+        let mut put = base_s3_req("PUT", "/mybucket/obj1", "retention");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(body.to_vec());
+        let put = sign_request(put, "testing");
+        let put_next: NextFn = Arc::new(|r| {
+            assert_eq!(r.method, "POST");
+            assert_eq!(r.headers.get(SYS_LOCK_MODE), Some("COMPLIANCE"));
+            assert!(r.headers.get(SYS_RETAIN_UNTIL).unwrap().contains("2035-01-01"));
+            Response::new(202)
+        });
+        assert_eq!(api.handle(put, &put_next).status, 200);
+
+        let get = sign_request(base_s3_req("GET", "/mybucket/obj1", "retention"), "testing");
+        let get_next: NextFn = Arc::new(|_| {
+            let mut r = Response::new(200);
+            r.headers.set(SYS_LOCK_MODE, "COMPLIANCE");
+            r.headers.set(SYS_RETAIN_UNTIL, "2035-01-01T00:00:00.000Z");
+            r
+        });
+        let resp = api.handle(get, &get_next);
+        assert_eq!(resp.status, 200);
+        let b = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(b.contains("Retention") && b.contains("COMPLIANCE"));
+    }
+
+    #[test]
+    fn legal_hold_blocks_delete() {
+        let api = S3Api::new(cred_map());
+        let del = sign_request(base_s3_req("DELETE", "/mybucket/locked", ""), "testing");
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                let mut resp = Response::new(200);
+                resp.headers.set(SYS_LEGAL_HOLD, "ON");
+                return resp;
+            }
+            panic!("DELETE must not reach backend under legal hold");
+        });
+        let resp = api.handle(del, &next);
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("AccessDenied"));
+    }
+
+    #[test]
+    fn retention_future_blocks_delete() {
+        let api = S3Api::new(cred_map());
+        let del = sign_request(base_s3_req("DELETE", "/mybucket/retained", ""), "testing");
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                let mut resp = Response::new(200);
+                resp.headers.set(SYS_LOCK_MODE, "GOVERNANCE");
+                resp.headers.set(SYS_RETAIN_UNTIL, "2099-12-31T00:00:00Z");
+                return resp;
+            }
+            panic!("DELETE must not reach backend under future retention");
+        });
+        let resp = api.handle(del, &next);
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("AccessDenied"));
+    }
+
+    #[test]
+    fn expired_retention_allows_delete() {
+        let api = S3Api::new(cred_map());
+        let del = sign_request(base_s3_req("DELETE", "/mybucket/old", ""), "testing");
+        let deleted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let deleted_c = deleted.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" {
+                let mut resp = Response::new(200);
+                resp.headers.set(SYS_LOCK_MODE, "GOVERNANCE");
+                resp.headers.set(SYS_RETAIN_UNTIL, "2000-01-01T00:00:00Z");
+                return resp;
+            }
+            if r.method == "DELETE" {
+                deleted_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Response::new(204);
+            }
+            Response::new(500)
+        });
+        let resp = api.handle(del, &next);
+        assert_eq!(resp.status, 204);
+        assert!(deleted.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn legal_hold_release_allows_delete() {
+        let api = S3Api::new(cred_map());
+        let del = sign_request(base_s3_req("DELETE", "/mybucket/released", ""), "testing");
+        let deleted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let deleted_c = deleted.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" {
+                let mut resp = Response::new(200);
+                resp.headers.set(SYS_LEGAL_HOLD, "OFF");
+                return resp;
+            }
+            if r.method == "DELETE" {
+                deleted_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Response::new(204);
+            }
+            Response::new(500)
+        });
+        let resp = api.handle(del, &next);
+        assert_eq!(resp.status, 204);
+        assert!(deleted.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn put_stamps_default_retention_from_bucket_object_lock() {
+        let api = S3Api::new(cred_map());
+        let lock_xml = br#"<ObjectLockConfiguration>
+  <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+  <Rule><DefaultRetention>
+    <Mode>GOVERNANCE</Mode><Days>3</Days>
+  </DefaultRetention></Rule>
+</ObjectLockConfiguration>"#;
+        let mut put = base_s3_req("PUT", "/mybucket/fresh", "");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(b"data".to_vec());
+        let put = sign_request(put, "testing");
+        let stamped = std::sync::Arc::new(std::sync::Mutex::new(None::<(String, String)>));
+        let stamped_c = stamped.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" {
+                let mut resp = Response::new(204);
+                apply_object_lock_meta(&mut resp.headers, lock_xml);
+                return resp;
+            }
+            if r.method == "PUT" {
+                let mode = r.headers.get(SYS_LOCK_MODE).map(str::to_string).unwrap_or_default();
+                let until = r.headers.get(SYS_RETAIN_UNTIL).map(str::to_string).unwrap_or_default();
+                *stamped_c.lock().unwrap() = Some((mode, until));
+                let mut resp = Response::new(201);
+                resp.headers.set("ETag", "abc");
+                return resp;
+            }
+            Response::new(500)
+        });
+        let resp = api.handle(put, &next);
+        assert_eq!(resp.status, 200);
+        let (mode, until) = stamped.lock().unwrap().clone().unwrap();
+        assert_eq!(mode, "GOVERNANCE");
+        assert!(!until.is_empty());
+        let ts = crate::object_lock_worm::parse_retain_until(&until).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!((ts - now - 3 * 86400).abs() < 5);
+    }
+
+
+    #[test]
+    fn put_object_stamps_x_delete_at_from_lifecycle() {
+        use crate::bucket_config::{apply_lifecycle_meta, S3_LIFECYCLE_META};
+        let api = S3Api::new(cred_map());
+        let lc = br#"<?xml version="1.0"?>
+<LifecycleConfiguration>
+  <Rule>
+    <Prefix>logs/</Prefix>
+    <Status>Enabled</Status>
+    <Expiration><Days>2</Days></Expiration>
+  </Rule>
+</LifecycleConfiguration>"#;
+        let mut lc_headers = HeaderKeyDict::new();
+        apply_lifecycle_meta(&mut lc_headers, lc);
+        let lc_meta = lc_headers.get(S3_LIFECYCLE_META).unwrap().to_string();
+
+        let mut put = base_s3_req("PUT", "/mybucket/logs/a.txt", "");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(b"data".to_vec());
+        let put = sign_request(put, "testing");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let seen_c = seen.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" {
+                if r.path.ends_with("/mybucket") {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(S3_LIFECYCLE_META, &lc_meta);
+                    return resp;
+                }
+                return Response::new(404);
+            }
+            if r.method == "PUT" {
+                *seen_c.lock().unwrap() = r.headers.get("X-Delete-At").map(str::to_string);
+                let mut resp = Response::new(201);
+                resp.headers.set("ETag", "abc");
+                return resp;
+            }
+            Response::new(500)
+        });
+        assert_eq!(api.handle(put, &next).status, 200);
+        let da: i64 = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("X-Delete-At stamped")
+            .parse()
+            .unwrap();
+        let now = unix_now();
+        assert!((da - (now + 2 * 86_400)).abs() < 5, "da={da} now={now}");
+    }
+
+    #[test]
+    fn put_object_no_x_delete_at_when_prefix_mismatch() {
+        use crate::bucket_config::{apply_lifecycle_meta, S3_LIFECYCLE_META};
+        let api = S3Api::new(cred_map());
+        let lc = br#"<LifecycleConfiguration>
+  <Rule><Prefix>logs/</Prefix><Status>Enabled</Status>
+  <Expiration><Days>1</Days></Expiration></Rule>
+</LifecycleConfiguration>"#;
+        let mut h = HeaderKeyDict::new();
+        apply_lifecycle_meta(&mut h, lc);
+        let meta = h.get(S3_LIFECYCLE_META).unwrap().to_string();
+        let mut put = base_s3_req("PUT", "/mybucket/other/a.txt", "");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(b"x".to_vec());
+        let put = sign_request(put, "testing");
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" {
+                if r.path.ends_with("/mybucket") {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(S3_LIFECYCLE_META, &meta);
+                    return resp;
+                }
+                return Response::new(404);
+            }
+            if r.method == "PUT" {
+                assert!(
+                    r.headers.get("X-Delete-At").is_none(),
+                    "prefix mismatch must not stamp X-Delete-At"
+                );
+                let mut resp = Response::new(201);
+                resp.headers.set("ETag", "e");
+                return resp;
+            }
+            Response::new(500)
+        });
+        assert_eq!(api.handle(put, &next).status, 200);
+    }
+
+    #[test]
+    fn legal_hold_blocks_overwrite_put() {
+        let api = S3Api::new(cred_map());
+        let mut put = base_s3_req("PUT", "/mybucket/locked", "");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(b"new".to_vec());
+        let put = sign_request(put, "testing");
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                if r.path.ends_with("/locked") {
+                    let mut resp = Response::new(200);
+                    resp.headers.set(SYS_LEGAL_HOLD, "ON");
+                    return resp;
+                }
+                // Bucket versioning / lifecycle / lock-config probes.
+                return Response::new(404);
+            }
+            panic!("overwrite PUT must not reach backend under legal hold: {} {}", r.method, r.path);
+        });
+        let resp = api.handle(put, &next);
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("AccessDenied"));
     }
 }

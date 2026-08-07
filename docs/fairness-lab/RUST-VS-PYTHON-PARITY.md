@@ -80,10 +80,13 @@
 | ListParts | ✅ | ✅ | part-number-marker + max-parts + IsTruncated (2026-08-06) |
 | Canned bucket ACL (`private` / `public-read` / `public-read-write`) | ✅ | ✅ | `x-amz-acl` → `X-Container-Read/Write`; unit |
 | Object canned ACL store + GET `?acl` | ✅ | ✅ | `x-amz-acl` → `X-Object-Sysmeta-S3-Acl`; unit 2026-08-07; **not** anonymous Swift GET by itself |
-| Multi-rule CORS put/get | ✅ | ✅ | compact `X-Container-Meta-S3-Cors` + first-rule stamps; unit `cors_multi_rule_*` 2026-08-07 |
+| Multi-rule CORS put/get | ✅ | ✅ |
+| Lifecycle Expiration **execution** | ✅ | ✅ | Enabled Days/Date → `X-Delete-At` on PUT (`impl-s3-lifecycle-exec-20260807`)
+| Object Lock WORM (legal-hold/retention) | ✅ | ✅ | blocks DELETE/overwrite (`impl-s3-object-lock-worm-20260807`) compact `X-Container-Meta-S3-Cors` + first-rule stamps; unit `cors_multi_rule_*` 2026-08-07 |
 | s3token → Keystone /v3/s3tokens | ✅ | ✅ | live EC2 GREEN 2026-08-06 |
 | SigV2 | ✅ | ❌ | **WONTFIX** — stable **501** `Code=NotImplemented` (unit header+query) |
 | aws-chunked / STREAMING-* | ✅ | ✅ | dechunk after SigV4 header verify; per-chunk sig residual; unit `aws_chunked_*_dechunks_to_backend` |
+| Multi-version object data plane | ✅ | ✅ | archive `{bucket}+versions`; versionId GET/DELETE; delete-marker; ListVersions (`impl-s3-multiversion-data-20260807`)
 | Versioning status GET/PUT | ✅ | ✅ | meta `X-Container-Meta-S3-Versioning`; unit `versioning_put_get_round_trip` `impl-s3-versioning-surface-20260807` |
 | List object versions (`?versions`) | ✅ | ⚠️ | empty `ListVersionsResult` only — multi-version bodies **residual** |
 | Tagging GET/PUT/DELETE (bucket + object) | ⚠️ (GET empty / PUT NotImpl) | ✅ | meta TagSet round-trip; unit `*_tagging_*_round_trip` |

@@ -18,6 +18,8 @@
 
 - `rust_disks` never mkfs/wipe.
 - Workspace rejects `node.disks` for `stack: rust`.
-- Wipe requires ticket + `--allow-disk-wipe` on a non-bundle-rust path.
+- Wipe requires ticket + `--allow-disk-wipe` on a non-default path.
+- Opt-in full twin: `swift-full-v3.yml` may run Python `format_disks` only when
+  `allow_disk_format | default(false)` is true (empty lab devices only).
 
 Authority: [ANSIBLE-V3-SURFACE.md](../../../../docs/fairness-lab/ANSIBLE-V3-SURFACE.md) §3.3.

@@ -1,0 +1,4 @@
+=== plan swift-full-v3.yml ===
+plan=tools/test-results/impl-ansible-v3-twin-20260807/plan-full-v3.json digest=8ef8cded3f3da1387f534e0ea213289fd9d847423a279c5e05a2dd2ed6cfd6a9 hosts=2 tasks=395 risks=[DiskWipe, Firewall, SshReconfigure, HostReconfigure]
+=== plan swift.yml default ===
+plan=tools/test-results/impl-ansible-v3-twin-20260807/plan-swift-default.json digest=8c05bde59bad7e482bc69b9403cb43649191ac37385e973df1afab8183ebc5a4 hosts=2 tasks=140 risks=[HostReconfigure]

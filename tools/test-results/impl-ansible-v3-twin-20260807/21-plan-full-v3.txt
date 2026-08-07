@@ -1,0 +1,8 @@
+=== plan swift-full-v3.yml (opt-in twin) ===
+plan=/Users/oboy/Downloads/Peregrine/tools/test-results/impl-ansible-v3-twin-20260807/plan-full-v3.json digest=c1ee94c0e86c3d37f4ff17c96862a037c6271362db205c0a62c4db10140476d6 hosts=2 tasks=395 risks=[DiskWipe, Firewall, SshReconfigure, HostReconfigure]
+tasks=395 hosts=2
+risk_counts={'host_reconfigure': 102, 'disk_wipe': 9, 'ssh_reconfigure': 3, 'firewall': 8}
+disk_wipe_tasks=9
+roles={'check': 1, 'rust_common': 6, 'rust_payload': 5, 'performance_tuning': 6, 'chrony': 4, 'rust_haproxy': 14, 'rust_keepalived': 12, 'rust_disks': 3, 'rust_replication_key': 9, 'format_disks': 42, 'rust_config': 5, 'rust_rings': 7, 'rust_systemd': 71, 'rust_verify': 5, 'mariadb_servers': 28, 'keystone_install': 22, 'keystones': 46, 'rust_identity_bridge': 3, 'proxyfs': 26, 'security': 11, 'format_new_disks': 16, 'new_ring': 25, 'docker': 2, 'cosbench': 13, 'system_tuning': 12, 'example_structure': 1}
+format_tasks=58 when_guard=True
+format_when_sample=['allow_disk_format | default(false)', 'not use_custom_disks']

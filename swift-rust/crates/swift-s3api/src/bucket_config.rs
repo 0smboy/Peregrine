@@ -22,16 +22,17 @@
 //!   [`S3_BUCKET_TAGGING_META`] / [`S3_OBJECT_TAGGING_META`]; Tagging XML.
 //! * **lifecycle** GET/PUT/DELETE — raw `LifecycleConfiguration` XML in
 //!   [`S3_LIFECYCLE_META`] (percent-encoded for header safety); round-trip.
+//! * **lifecycle execution** — see [`crate::lifecycle_exec`]
+//!   (`lifecycle_delete_at_for_object` → Swift `X-Delete-At` on object PUT).
 //! * **object-lock** GET/PUT — raw `ObjectLockConfiguration` XML in
 //!   [`S3_OBJECT_LOCK_META`].
-//! * **versions** list — empty `ListVersionsResult` (no multi-version bodies).
+//! * **legal-hold** / **retention** / WORM — see [`crate::object_lock_worm`].
+//! * **versions** list — empty-shell helper; full listing in
+//!   [`crate::versioning_store`] + middleware when versioning is Enabled.
 //!
 //! # Residuals
-//! * Multi-version object storage / versionId GET-DELETE / delete-markers are
-//!   **not** implemented — only the versioning *status* API surface.
-//! * Lifecycle rules are stored and returned; no expirer enforcement from this
-//!   meta alone.
-//! * Object Lock retention/legal-hold object APIs and WORM enforcement residual.
+//! * Lifecycle Transitions / AbortIncompleteMultipartUpload / tag filters.
+//! * Object Lock governance bypass residual.
 
 use crate::xml::Element;
 use swift_http::HeaderKeyDict;
