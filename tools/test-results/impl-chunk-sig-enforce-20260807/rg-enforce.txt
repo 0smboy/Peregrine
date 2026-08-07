@@ -1,0 +1,29 @@
+crates/swift-s3api/src/response.rs:115:        "SignatureDoesNotMatch" => (
+crates/swift-s3api/src/response.rs:432:        let resp = s3_error_response("SignatureDoesNotMatch", None, &[]);
+crates/swift-s3api/src/lib.rs:39://! `SignatureDoesNotMatch`). `STREAMING-UNSIGNED-PAYLOAD-TRAILER` dechunks
+crates/swift-s3api/src/sigv4.rs:238:/// is absent (which AWS reports as `SignatureDoesNotMatch`).
+crates/swift-s3api/src/middleware.rs:66://! `SignatureDoesNotMatch` (403), body not forwarded.
+crates/swift-s3api/src/middleware.rs:318:/// `SignatureDoesNotMatch` (403).
+crates/swift-s3api/src/middleware.rs:426:        Err(AwsChunkedError::InvalidChunkSignature) => {
+crates/swift-s3api/src/middleware.rs:428:                "SignatureDoesNotMatch",
+crates/swift-s3api/src/middleware.rs:435:    let _ = decoded.chunk_signatures_valid;
+crates/swift-s3api/src/middleware.rs:996:            return s3_error_response("SignatureDoesNotMatch", None, &[]);
+crates/swift-s3api/src/middleware.rs:3134:        assert!(body.contains("SignatureDoesNotMatch"));
+crates/swift-s3api/src/middleware.rs:4569:        assert_eq!(resp.status, 403, "expected 403 SignatureDoesNotMatch");
+crates/swift-s3api/src/middleware.rs:4572:            body.contains("SignatureDoesNotMatch"),
+crates/swift-s3api/src/middleware.rs:4573:            "expected SignatureDoesNotMatch XML, got {body}"
+crates/swift-s3api/src/aws_chunked.rs:33://! verification is **enforced**: mismatch → [`AwsChunkedError::InvalidChunkSignature`].
+crates/swift-s3api/src/aws_chunked.rs:69:    InvalidChunkSignature,
+crates/swift-s3api/src/aws_chunked.rs:79:    /// [`AwsChunkedError::InvalidChunkSignature`] rather than `Some(false)`.
+crates/swift-s3api/src/aws_chunked.rs:81:    pub chunk_signatures_valid: Option<bool>,
+crates/swift-s3api/src/aws_chunked.rs:86:/// fail the decode with [`AwsChunkedError::InvalidChunkSignature`].
+crates/swift-s3api/src/aws_chunked.rs:154:/// chunk-signature, return [`AwsChunkedError::InvalidChunkSignature`].
+crates/swift-s3api/src/aws_chunked.rs:216:                        return Err(AwsChunkedError::InvalidChunkSignature);
+crates/swift-s3api/src/aws_chunked.rs:222:                    return Err(AwsChunkedError::InvalidChunkSignature);
+crates/swift-s3api/src/aws_chunked.rs:234:                        return Err(AwsChunkedError::InvalidChunkSignature);
+crates/swift-s3api/src/aws_chunked.rs:239:                    return Err(AwsChunkedError::InvalidChunkSignature);
+crates/swift-s3api/src/aws_chunked.rs:278:        chunk_signatures_valid: all_sigs_ok,
+crates/swift-s3api/src/aws_chunked.rs:405:        assert_eq!(decoded.chunk_signatures_valid, None);
+crates/swift-s3api/src/aws_chunked.rs:468:        assert_eq!(decoded.chunk_signatures_valid, Some(true));
+crates/swift-s3api/src/aws_chunked.rs:486:        assert_eq!(err, AwsChunkedError::InvalidChunkSignature);
+crates/swift-s3api/src/aws_chunked.rs:502:        assert_eq!(err, AwsChunkedError::InvalidChunkSignature);

@@ -28,8 +28,9 @@
 //!
 //! Triggered by `X-Amz-Content-SHA256: STREAMING-*` and/or
 //! `Content-Encoding: aws-chunked`. Port of Python `StreamingInput` /
-//! `ChunkReader` dechunk path (`s3request.py`); chunk-signature verification
-//! is optional residual (HMAC chain) — dechunk succeeds without it.
+//! `ChunkReader` dechunk path (`s3request.py`). When `ChunkSigContext` is
+//! supplied for STREAMING-AWS4-HMAC-SHA256-PAYLOAD*, per-chunk HMAC chain
+//! verification is **enforced**: mismatch → [`AwsChunkedError::InvalidChunkSignature`].
 
 use std::collections::HashMap;
 
@@ -64,6 +65,8 @@ pub enum AwsChunkedError {
     SizeMismatch { expected: u64, provided: u64 },
     MissingDecodedContentLength,
     EcdsaNotImplemented,
+    /// Per-chunk HMAC chain failed or chunk-signature missing in signed mode.
+    InvalidChunkSignature,
 }
 
 /// Decoded payload + optional trailers after the terminal 0-chunk.
@@ -71,12 +74,16 @@ pub enum AwsChunkedError {
 pub struct DecodedChunkedBody {
     pub data: Vec<u8>,
     pub trailers: HashMap<String, String>,
-    /// `Some(true/false)` when HMAC chunk-sig verify was attempted.
+    /// `Some(true)` when HMAC chunk-sig verify was attempted and all chunks
+    /// validated. Invalid signatures fail with
+    /// [`AwsChunkedError::InvalidChunkSignature`] rather than `Some(false)`.
+    /// `None` when no [`ChunkSigContext`] was supplied.
     pub chunk_signatures_valid: Option<bool>,
 }
 
-/// Context for optional STREAMING-AWS4-HMAC-SHA256-PAYLOAD chunk signature
-/// chain verification (residual — dechunk works without it).
+/// Context for STREAMING-AWS4-HMAC-SHA256-PAYLOAD chunk signature chain
+/// verification. When passed to [`decode_aws_chunked`], invalid signatures
+/// fail the decode with [`AwsChunkedError::InvalidChunkSignature`].
 #[derive(Debug, Clone)]
 pub struct ChunkSigContext {
     pub secret_key: String,
@@ -143,11 +150,8 @@ pub fn cleanup_content_encoding(headers: &mut HeaderKeyDict) {
 /// the total payload length must match.
 ///
 /// `sig_ctx`: when `Some`, verify each `chunk-signature` against the
-/// STREAMING-AWS4-HMAC-SHA256-PAYLOAD chain. On mismatch, still return the
-/// decoded data with `chunk_signatures_valid = Some(false)` only if
-/// `strict_sig` is false — currently we report mismatch as
-/// `chunk_signatures_valid = Some(false)` but do **not** fail dechunk
-/// (optional residual; middleware may ignore).
+/// STREAMING-AWS4-HMAC-SHA256-PAYLOAD chain. On mismatch or missing
+/// chunk-signature, return [`AwsChunkedError::InvalidChunkSignature`].
 pub fn decode_aws_chunked(
     raw: &[u8],
     expected_decoded_len: Option<u64>,
@@ -209,26 +213,30 @@ pub fn decode_aws_chunked(
                     let data_hash = sha256_hex(data);
                     let valid = verify_chunk_signature(ctx, prev, &data_hash, &sig);
                     if !valid {
-                        *ok = false;
+                        return Err(AwsChunkedError::InvalidChunkSignature);
                     }
+                    *ok = true;
                     prev_sig = Some(sig.to_ascii_lowercase());
-                } else if params.is_some() || sig_ctx.is_some() {
-                    // Signed mode expected chunk-signature; missing → invalid.
-                    *ok = false;
+                } else {
+                    // Signed mode expected chunk-signature; missing → hard fail.
+                    return Err(AwsChunkedError::InvalidChunkSignature);
                 }
             }
 
             out.extend_from_slice(data);
         } else {
-            // Final chunk: optional signature + trailers until blank line.
+            // Final chunk: signature required in signed mode + trailers.
             if let (Some(ctx), Some(ok)) = (sig_ctx, all_sigs_ok.as_mut()) {
                 let chunk_sig = parse_chunk_signature(params);
                 if let (Some(sig), Some(prev)) = (chunk_sig, prev_sig.as_ref()) {
                     let valid = verify_chunk_signature(ctx, prev, EMPTY_SHA256, &sig);
                     if !valid {
-                        *ok = false;
+                        return Err(AwsChunkedError::InvalidChunkSignature);
                     }
+                    *ok = true;
                     prev_sig = Some(sig.to_ascii_lowercase());
+                } else {
+                    return Err(AwsChunkedError::InvalidChunkSignature);
                 }
                 let _ = chunk_number;
                 let _ = prev_sig;
@@ -299,12 +307,15 @@ fn parse_chunk_signature(params: Option<&[u8]>) -> Option<String> {
     None
 }
 
-fn verify_chunk_signature(
+/// Compute one STREAMING-AWS4-HMAC-SHA256-PAYLOAD chunk signature (lowercase hex).
+///
+/// `data_sha256` is the SHA-256 hex of the chunk payload, or the empty-payload
+/// SHA-256 (`e3b0c442…`) for the terminal 0-size chunk.
+pub fn compute_chunk_signature(
     ctx: &ChunkSigContext,
     previous_signature: &str,
     data_sha256: &str,
-    presented: &str,
-) -> bool {
+) -> String {
     // AWS4-HMAC-SHA256-PAYLOAD\n<amz_date>\n<scope>\n<prev_sig>\n<empty_sha>\n<data_sha>
     let scope = format!("{}/{}/{}/aws4_request", ctx.date, ctx.region, ctx.service);
     let sts = format!(
@@ -316,7 +327,16 @@ fn verify_chunk_signature(
         data_sha256.to_ascii_lowercase()
     );
     let key = signing_key(&ctx.secret_key, &ctx.date, &ctx.region, &ctx.service);
-    let expected = hmac_sha256_hex(&key, sts.as_bytes());
+    hmac_sha256_hex(&key, sts.as_bytes())
+}
+
+fn verify_chunk_signature(
+    ctx: &ChunkSigContext,
+    previous_signature: &str,
+    data_sha256: &str,
+    presented: &str,
+) -> bool {
+    let expected = compute_chunk_signature(ctx, previous_signature, data_sha256);
     streq_const_time(&expected, &presented.to_ascii_lowercase())
 }
 
@@ -446,6 +466,40 @@ ddfbbd21811de45491022c\r\n\r\n";
         let decoded = decode_aws_chunked(body, Some(25), Some(&ctx)).unwrap();
         assert_eq!(decoded.data, b"abcdefghijklmnopqrstuvwz\n");
         assert_eq!(decoded.chunk_signatures_valid, Some(true));
+    }
+
+    #[test]
+    fn dechunk_bad_chunk_signature_errors() {
+        let body = b"a;chunk-signature=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead\
+beefdeadbeefdeadbeefde\r\nabcdefghij\r\n0;chunk-signature=00\
+00000000000000000000000000000000000000000000000000000000000000\r\n\r\n";
+        let ctx = ChunkSigContext {
+            secret_key: "secret".into(),
+            date: "20220330".into(),
+            region: "us-east-1".into(),
+            service: "s3".into(),
+            amz_date: "20220330T095351Z".into(),
+            seed_signature: "aa1b67fc5bc4503d05a636e6e740dcb757d3aa2352f32e7493f261f71acbe1d5"
+                .into(),
+        };
+        let err = decode_aws_chunked(body, Some(10), Some(&ctx)).unwrap_err();
+        assert_eq!(err, AwsChunkedError::InvalidChunkSignature);
+    }
+
+    #[test]
+    fn dechunk_missing_chunk_signature_in_signed_mode_errors() {
+        let framed = frame_aws_chunked_unsigned(b"hello", 5);
+        let ctx = ChunkSigContext {
+            secret_key: "secret".into(),
+            date: "20220330".into(),
+            region: "us-east-1".into(),
+            service: "s3".into(),
+            amz_date: "20220330T095351Z".into(),
+            seed_signature: "aa1b67fc5bc4503d05a636e6e740dcb757d3aa2352f32e7493f261f71acbe1d5"
+                .into(),
+        };
+        let err = decode_aws_chunked(&framed, Some(5), Some(&ctx)).unwrap_err();
+        assert_eq!(err, AwsChunkedError::InvalidChunkSignature);
     }
 
     #[test]

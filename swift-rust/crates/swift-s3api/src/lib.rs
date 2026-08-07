@@ -33,8 +33,11 @@
 //! **aws-chunked / STREAMING-*** (`Content-Encoding: aws-chunked` and/or
 //! `X-Amz-Content-SHA256: STREAMING-*`) is **implemented**: framed PUT/POST
 //! bodies are dechunked after SigV4 header verify; decoded bytes go to the
-//! backend with fixed `Content-Length`. Per-chunk / trailer signature
-//! verification is residual (dechunk always works).
+//! backend with fixed `Content-Length`. When the mode is
+//! `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` / `*-TRAILER` and credentials are
+//! available, **per-chunk HMAC signatures are enforced** (mismatch →
+//! `SignatureDoesNotMatch`). `STREAMING-UNSIGNED-PAYLOAD-TRAILER` dechunks
+//! without requiring signatures.
 //!
 //! # Subresource config APIs (meta round-trip)
 //!
@@ -42,7 +45,11 @@
 //! * **tagging** GET/PUT/DELETE on bucket and object
 //! * **lifecycle** GET/PUT/DELETE — raw LifecycleConfiguration XML round-trip
 //! * **lifecycle execution** — object PUT stamps Swift `X-Delete-At` from
-//!   Enabled Expiration Days/Date (+ Prefix); see [`lifecycle_exec`]
+//!   Enabled Expiration Days/Date (+ Prefix); Transition stamps
+//!   `X-Object-Meta-S3-Storage-Class` + `X-Object-Sysmeta-S3-Transition-At`
+//!   (**metadata only**, no tiering backend — LAB-HARD-GREEN); MPU init stamps
+//!   `X-Delete-At` on the upload marker from AbortIncompleteMultipartUpload
+//!   DaysAfterInitiation; see [`lifecycle_exec`]
 //! * **object-lock** GET/PUT — raw ObjectLockConfiguration XML round-trip
 //! * **legal-hold** / **retention** object GET/PUT + WORM on DELETE/overwrite
 //!   (see [`object_lock_worm`])
@@ -50,18 +57,23 @@
 //! * **multi-version object data plane** when versioning is **Enabled**
 //!   ([`versioning_store`]): archive, delete-markers, `?versionId=` GET/DELETE
 //!
+//! **Object Lock governance bypass** (`x-amz-bypass-governance-retention`) is
+//! **IMPLEMENTED** for mode=`GOVERNANCE` only; COMPLIANCE + legal-hold still
+//! hard-block (see [`object_lock_worm::worm_blocks_delete_with_bypass`]).
+//!
 //! Other residuals (not claimable as implemented):
 //!
-//! * lifecycle Transitions / AbortIncompleteMultipartUpload / tag filters
-//! * Object Lock governance bypass (`x-amz-bypass-governance-retention`)
-//! * full IAM / grant-header object ACL (canned private/public-read object ACL
-//!   via sysmeta **is** claimable for PUT/GET `?acl`; object public-read does
-//!   **not** by itself authorize anonymous Swift GET — container ACL still
-//!   gates access)
+//! * lifecycle tag / And filters; real storage-class tiering backends
+//! * full IAM identity / emailAddress grantee resolution; **object ACP grant
+//!   enforcement** on subsequent ops (authz still Swift container ACL). Grant
+//!   headers + ACP XML body store/GET round-trip **is** claimable (JSON sysmeta
+//!   + container AllUsers mapping); canned `x-amz-acl` still works and wins if
+//!   both present. Object public-read / AllUsers READ does **not** by itself
+//!   authorize anonymous Swift GET — container ACL still gates access.
 //! * authenticated-read / log-delivery-write canned ACLs (Python NotImplemented)
 //! * CORS ExposeHeader edge cases in live preflight
 //! * clock-skew/expiry enforcement on every path
-//! * per-chunk / trailer signature chains for STREAMING-AWS4-HMAC-SHA256-*
+//! * trailer *content* signature verification (x-amz-trailer-signature)
 //!
 //! Unknown access keys (EC2 / Keystone) are deferred via an optional
 //! [`swift_middleware::S3TokenClient`] on [`middleware::S3Api`] (inline

@@ -22,8 +22,9 @@
 //!   [`S3_BUCKET_TAGGING_META`] / [`S3_OBJECT_TAGGING_META`]; Tagging XML.
 //! * **lifecycle** GET/PUT/DELETE — raw `LifecycleConfiguration` XML in
 //!   [`S3_LIFECYCLE_META`] (percent-encoded for header safety); round-trip.
-//! * **lifecycle execution** — see [`crate::lifecycle_exec`]
-//!   (`lifecycle_delete_at_for_object` → Swift `X-Delete-At` on object PUT).
+//! * **lifecycle execution** — see [`crate::lifecycle_exec`]:
+//!   Expiration → `X-Delete-At`; Transition → storage-class meta stamp
+//!   (no tiering backend); AbortIncomplete → `X-Delete-At` on MPU marker.
 //! * **object-lock** GET/PUT — raw `ObjectLockConfiguration` XML in
 //!   [`S3_OBJECT_LOCK_META`].
 //! * **legal-hold** / **retention** / WORM — see [`crate::object_lock_worm`].
@@ -31,8 +32,9 @@
 //!   [`crate::versioning_store`] + middleware when versioning is Enabled.
 //!
 //! # Residuals
-//! * Lifecycle Transitions / AbortIncompleteMultipartUpload / tag filters.
-//! * Object Lock governance bypass residual.
+//! * Lifecycle tag / And filters; real storage-class tiering backends.
+//! * Object Lock governance bypass is implemented in [`crate::object_lock_worm`]
+//!   (GOVERNANCE only) — not residual.
 
 use crate::xml::Element;
 use swift_http::HeaderKeyDict;

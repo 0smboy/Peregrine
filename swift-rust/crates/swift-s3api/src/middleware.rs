@@ -58,18 +58,30 @@
 //! `X-Amz-Content-SHA256: STREAMING-*` are dechunked after SigV4 verify
 //! (header signature uses the STREAMING-* token as payload hash). Chunk
 //! framing is stripped; trailers are discarded; decoded bytes are forwarded
-//! to Swift with fixed `Content-Length`. Per-chunk signature verification is
-//! best-effort residual (dechunk always runs).
+//! to Swift with fixed `Content-Length`.
 //!
-//! Object Lock **bypass** residual (`x-amz-bypass-governance-retention`)
-//! — **none by default**.
+//! **Per-chunk signatures are enforced** for
+//! `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` / `*-TRAILER` when credentials are
+//! available: invalid or missing `chunk-signature` →
+//! `SignatureDoesNotMatch` (403), body not forwarded.
+//! `STREAMING-UNSIGNED-PAYLOAD-TRAILER` dechunks without requiring signatures.
+//! ECDSA streaming modes remain 501 NotImplemented.
 //!
-//! Other residuals: full IAM / grant-header object ACL (canned
-//! private/public-read stored as sysmeta is claimable; object public-read
-//! does not by itself open anonymous Swift GET — container ACL still gates),
-//! clock-skew on every path, advertising `s3api` on Swift `GET /info`.
+//! Object Lock **governance bypass** (`x-amz-bypass-governance-retention`)
+//! is **IMPLEMENTED** for GOVERNANCE mode only (COMPLIANCE + legal-hold never
+//! bypassed). Wired on DELETE, overwrite PUT, and multi-delete.
+//!
+//! Other residuals: full IAM identity service / emailAddress grantee
+//! resolution; **object ACP grant enforcement** on subsequent ops (authz still
+//! Swift container ACL); object public-read / grant AllUsers READ does **not**
+//! by itself open anonymous Swift GET — container ACL still gates; clock-skew
+//! on every path; advertising `s3api` on Swift `GET /info`.
 //! Multipart includes ListMultipartUploads via `{bucket}+segments` upload
 //! markers.
+//!
+//! Grant headers (`x-amz-grant-*`) + ACP XML body PUT/GET `?acl` are claimable
+//! (structured JSON sysmeta + container AllUsers mapping); canned `x-amz-acl`
+//! still works and takes precedence when both are present.
 //!
 //! Unknown access keys (EC2) are deferred to Keystone via an optional
 //! [`S3TokenClient`] (`with_s3token_client`); without a client, unknown keys
@@ -83,9 +95,10 @@ use swift_http::{Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
 use swift_middleware::{Middleware, NextFn, S3TokenClient, S3TokenResult};
 
 use crate::acl_cors::{
-    acl_xml_from_swift_headers, apply_canned_acl, apply_object_canned_acl,
+    apply_bucket_acl_input, apply_object_acl_input, bucket_acl_xml_from_headers,
     clear_cors_swift_headers, cors_config_to_swift_headers, cors_xml_from_swift_headers,
-    object_acl_xml_from_meta, parse_cors_configuration, xml_ok, S3_OBJECT_ACL_META,
+    object_acl_xml_from_headers, parse_cors_configuration, resolve_acl_put_input, xml_ok,
+    AclPutInput,
 };
 use crate::aws_chunked::{
     cleanup_content_encoding, decode_aws_chunked, is_aws_chunked_request, is_ecdsa_streaming,
@@ -102,12 +115,14 @@ use crate::bucket_config::{
 };
 use crate::object_lock_worm::{
     apply_amz_object_lock_headers, apply_default_retention_headers,
-    default_retention_from_lock_xml, legal_hold_xml, parse_legal_hold_body,
-    parse_retention_body, retention_xml, worm_blocks_delete, SYS_LEGAL_HOLD, SYS_LOCK_MODE,
-    SYS_RETAIN_UNTIL,
+    bypass_governance_requested, default_retention_from_lock_xml, legal_hold_xml,
+    parse_legal_hold_body, parse_retention_body, retention_xml, worm_blocks_delete_with_bypass,
+    HDR_BYPASS_GOVERNANCE, SYS_LEGAL_HOLD, SYS_LOCK_MODE, SYS_RETAIN_UNTIL,
 };
 use crate::delete::parse_multi_delete_body;
-use crate::lifecycle_exec::apply_lifecycle_delete_at_from_container;
+use crate::lifecycle_exec::{
+    apply_abort_incomplete_from_container, apply_lifecycle_on_put_from_container,
+};
 use crate::mpu::{
     complete_multipart_xml, initiate_response, list_multipart_uploads_xml, list_parts_xml_full,
     new_upload_id, parse_complete_body, parse_upload_marker_name, part_object_name,
@@ -297,9 +312,9 @@ fn is_sigv2_auth(req: &Request) -> bool {
 /// decoded length, `aws-chunked` is stripped from `Content-Encoding`, and
 /// STREAMING `X-Amz-Content-SHA256` is replaced with `UNSIGNED-PAYLOAD`.
 ///
-/// Optional HMAC per-chunk signature verification runs when `cred` has a
-/// secret and the mode is STREAMING-AWS4-HMAC-SHA256-PAYLOAD*; failure is
-/// residual (dechunk still succeeds).
+/// HMAC per-chunk signature verification runs when `cred` has a secret and
+/// the mode is STREAMING-AWS4-HMAC-SHA256-PAYLOAD*; failure →
+/// `SignatureDoesNotMatch` (403).
 fn decode_and_fix_aws_chunked(
     req: &mut Request,
     cred: &S3Credential,
@@ -407,8 +422,15 @@ fn decode_and_fix_aws_chunked(
                 &[],
             ));
         }
+        Err(AwsChunkedError::InvalidChunkSignature) => {
+            return Err(s3_error_response(
+                "SignatureDoesNotMatch",
+                Some("The request signature we calculated does not match the signature you provided."),
+                &[],
+            ));
+        }
     };
-    // Residual: chunk_signatures_valid == Some(false) does not abort.
+    // Enforced above: Some(false) no longer soft-ignored.
     let _ = decoded.chunk_signatures_valid;
     let _ = decoded.trailers;
 
@@ -1168,6 +1190,13 @@ impl Middleware for S3Api {
 
         let for_list = matches!(method.as_str(), "GET" | "HEAD") && key.is_none();
 
+        // Capture bypass before moving req into swift_req.
+        let worm_bypass = bypass_governance_requested(
+            req.headers
+                .get(HDR_BYPASS_GOVERNANCE)
+                .or_else(|| req.headers.get("X-Amz-Bypass-Governance-Retention")),
+        );
+
         let mut swift_req = req;
         let swift_path = s3_to_swift_path(
             &cred.account,
@@ -1187,12 +1216,20 @@ impl Middleware for S3Api {
 
         map_amz_meta(&mut swift_req);
         apply_copy_source(&mut swift_req);
-        if let Some(canned) = swift_req.headers.get("X-Amz-Acl").map(str::to_string) {
-            if key.is_some() {
-                // Object PUT: store canned ACL as object sysmeta (not container ACL).
-                apply_object_canned_acl(&mut swift_req.headers, &canned);
-            } else {
-                apply_canned_acl(&mut swift_req.headers, &canned);
+        // ACL: canned x-amz-acl wins; else x-amz-grant-* (body empty on object PUT).
+        // ACP XML body is handled on PUT ?acl via handle_acl.
+        match resolve_acl_put_input(&swift_req.headers, None, &owner.id) {
+            Ok(input) => {
+                if !matches!(input, AclPutInput::None) {
+                    if key.is_some() {
+                        apply_object_acl_input(&mut swift_req.headers, &input);
+                    } else {
+                        apply_bucket_acl_input(&mut swift_req.headers, &input);
+                    }
+                }
+            }
+            Err(_) => {
+                return s3_error_response("InvalidArgument", None, &[]);
             }
         }
         // Explicit x-amz-object-lock-* → sysmeta (before strip removes x-amz-*).
@@ -1202,12 +1239,13 @@ impl Middleware for S3Api {
         strip_s3_only_headers(&mut swift_req.headers);
         stamp_auth(&mut swift_req, &cred);
 
-        // Object Lock WORM: block DELETE and overwrite PUT (bypass residual).
+        // Object Lock WORM: block DELETE and overwrite PUT (governance bypass).
         if key.is_some() && matches!(method.as_str(), "DELETE" | "PUT") {
             if let Some(blocked) = worm_check_object(
                 &cred,
                 bucket.as_deref().unwrap(),
                 key.as_deref().unwrap(),
+                worm_bypass,
                 &next,
             ) {
                 return blocked;
@@ -1302,16 +1340,23 @@ fn worm_check_object(
     cred: &S3Credential,
     bucket: &str,
     key: &str,
+    bypass_governance: bool,
     next: &NextFn,
 ) -> Option<Response> {
-    if worm_blocks_key(cred, bucket, key, next) {
+    if worm_blocks_key(cred, bucket, key, bypass_governance, next) {
         Some(s3_error_response("AccessDenied", None, &[]))
     } else {
         None
     }
 }
 
-fn worm_blocks_key(cred: &S3Credential, bucket: &str, key: &str, next: &NextFn) -> bool {
+fn worm_blocks_key(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    bypass_governance: bool,
+    next: &NextFn,
+) -> bool {
     let mut head = make_swift_req(
         "HEAD",
         &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
@@ -1321,10 +1366,11 @@ fn worm_blocks_key(cred: &S3Credential, bucket: &str, key: &str, next: &NextFn) 
     if !(200..300).contains(&resp.status) {
         return false;
     }
-    worm_blocks_delete(&resp.headers, unix_now())
+    worm_blocks_delete_with_bypass(&resp.headers, unix_now(), bypass_governance)
 }
 
-/// HEAD bucket lifecycle meta → stamp X-Delete-At on object PUT.
+/// HEAD bucket lifecycle meta → stamp Expiration X-Delete-At + Transition meta
+/// on object PUT (LAB-HARD-GREEN: Transition is metadata stamp only).
 fn maybe_apply_lifecycle_on_put(
     swift_req: &mut Request,
     cred: &S3Credential,
@@ -1332,9 +1378,6 @@ fn maybe_apply_lifecycle_on_put(
     key: &str,
     next: &NextFn,
 ) {
-    if swift_req.headers.get("X-Delete-At").is_some() {
-        return;
-    }
     let mut head =
         make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
     stamp_auth(&mut head, cred);
@@ -1342,7 +1385,7 @@ fn maybe_apply_lifecycle_on_put(
     if !(200..300).contains(&head_resp.status) {
         return;
     }
-    apply_lifecycle_delete_at_from_container(
+    apply_lifecycle_on_put_from_container(
         &mut swift_req.headers,
         &head_resp.headers,
         key,
@@ -1506,10 +1549,15 @@ fn handle_multi_delete(
         Ok(p) => p,
         Err(_) => return s3_error_response("MalformedXML", None, &[]),
     };
+    let bypass = bypass_governance_requested(
+        req.headers
+            .get(HDR_BYPASS_GOVERNANCE)
+            .or_else(|| req.headers.get("X-Amz-Bypass-Governance-Retention")),
+    );
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
     for key in &parsed.keys {
-        if worm_blocks_key(cred, bucket, key, next) {
+        if worm_blocks_key(cred, bucket, key, bypass, next) {
             errors.push(DeleteError {
                 key: key.clone(),
                 code: "AccessDenied".into(),
@@ -1539,7 +1587,7 @@ fn handle_multi_delete(
 }
 
 fn handle_acl(
-    req: Request,
+    mut req: Request,
     cred: &S3Credential,
     owner: &Owner,
     bucket: &str,
@@ -1547,7 +1595,7 @@ fn handle_acl(
     next: &NextFn,
 ) -> Response {
     if let Some(obj) = key {
-        // Object ACL: canned name in X-Object-Sysmeta-S3-Acl.
+        // Object ACL: JSON grants and/or canned name in object sysmeta.
         match req.method.as_str() {
             "GET" | "HEAD" => {
                 let mut head = make_swift_req(
@@ -1559,23 +1607,27 @@ fn handle_acl(
                 if !(200..300).contains(&resp.status) {
                     return map_swift_error(resp.status, Some(bucket), Some(obj));
                 }
-                let canned = resp
-                    .headers
-                    .get(S3_OBJECT_ACL_META)
-                    .or_else(|| resp.headers.get("X-Object-Meta-S3-Acl"));
-                xml_ok(object_acl_xml_from_meta(&owner.id, canned))
+                xml_ok(object_acl_xml_from_headers(&owner.id, &resp.headers))
             }
             "PUT" => {
-                let canned = req
-                    .headers
-                    .get("X-Amz-Acl")
-                    .unwrap_or("private")
-                    .to_string();
+                let body = match req.body.take().into_vec(MAX_CONTROL_BODY) {
+                    Ok(b) => b,
+                    Err(_) => return s3_error_response("InvalidRequest", None, &[]),
+                };
+                let input = match resolve_acl_put_input(
+                    &req.headers,
+                    if body.is_empty() { None } else { Some(&body) },
+                    &owner.id,
+                ) {
+                    Ok(AclPutInput::None) => AclPutInput::Canned("private".into()),
+                    Ok(i) => i,
+                    Err(_) => return s3_error_response("MalformedACLError", None, &[]),
+                };
                 let mut post = make_swift_req(
                     "POST",
                     &s3_to_swift_path(&cred.account, Some(bucket), Some(obj)),
                 );
-                apply_object_canned_acl(&mut post.headers, &canned);
+                apply_object_acl_input(&mut post.headers, &input);
                 stamp_auth(&mut post, cred);
                 let resp = next(post);
                 if (200..300).contains(&resp.status) {
@@ -1596,21 +1648,25 @@ fn handle_acl(
                 if !(200..300).contains(&resp.status) {
                     return map_swift_error(resp.status, Some(bucket), None);
                 }
-                xml_ok(acl_xml_from_swift_headers(
-                    &owner.id,
-                    resp.headers.get("X-Container-Read"),
-                    resp.headers.get("X-Container-Write"),
-                ))
+                xml_ok(bucket_acl_xml_from_headers(&owner.id, &resp.headers))
             }
             "PUT" => {
-                let canned = req
-                    .headers
-                    .get("X-Amz-Acl")
-                    .unwrap_or("private")
-                    .to_string();
+                let body = match req.body.take().into_vec(MAX_CONTROL_BODY) {
+                    Ok(b) => b,
+                    Err(_) => return s3_error_response("InvalidRequest", None, &[]),
+                };
+                let input = match resolve_acl_put_input(
+                    &req.headers,
+                    if body.is_empty() { None } else { Some(&body) },
+                    &owner.id,
+                ) {
+                    Ok(AclPutInput::None) => AclPutInput::Canned("private".into()),
+                    Ok(i) => i,
+                    Err(_) => return s3_error_response("MalformedACLError", None, &[]),
+                };
                 let mut post =
                     make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
-                apply_canned_acl(&mut post.headers, &canned);
+                apply_bucket_acl_input(&mut post.headers, &input);
                 stamp_auth(&mut post, cred);
                 let resp = next(post);
                 if (200..300).contains(&resp.status) {
@@ -1887,8 +1943,12 @@ fn handle_versioned_put(
     req.query_string.clear();
     map_amz_meta(&mut req);
     apply_copy_source(&mut req);
-    if let Some(canned) = req.headers.get("X-Amz-Acl").map(str::to_string) {
-        apply_object_canned_acl(&mut req.headers, &canned);
+    match resolve_acl_put_input(&req.headers, None, &cred.access_key) {
+        Ok(input) if !matches!(input, AclPutInput::None) => {
+            apply_object_acl_input(&mut req.headers, &input);
+        }
+        Ok(_) => {}
+        Err(_) => return s3_error_response("InvalidArgument", None, &[]),
     }
     strip_s3_only_headers(&mut req.headers);
     req.headers.set(SYS_VERSION_ID, &new_vid);
@@ -2465,12 +2525,37 @@ fn handle_mpu_init(cred: &S3Credential, bucket: &str, key: &str, next: &NextFn) 
     );
     put_m.body = Body::from(Vec::from(b"upload".as_slice()));
     put_m.headers.set("Content-Length", "6");
+    // AbortIncompleteMultipartUpload → X-Delete-At on marker (expirer reaps).
+    maybe_apply_abort_incomplete_on_marker(&mut put_m, cred, bucket, key, next);
     stamp_auth(&mut put_m, cred);
     let resp = next(put_m);
     if !(200..300).contains(&resp.status) {
         return map_swift_error(resp.status, Some(bucket), Some(key));
     }
     initiate_response(bucket, key, &upload_id)
+}
+
+/// HEAD data bucket lifecycle meta → stamp abort X-Delete-At on MPU marker PUT.
+fn maybe_apply_abort_incomplete_on_marker(
+    marker_req: &mut Request,
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    next: &NextFn,
+) {
+    let mut head =
+        make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+    stamp_auth(&mut head, cred);
+    let head_resp = next(head);
+    if !(200..300).contains(&head_resp.status) {
+        return;
+    }
+    apply_abort_incomplete_from_container(
+        &mut marker_req.headers,
+        &head_resp.headers,
+        key,
+        unix_now(),
+    );
 }
 
 fn handle_mpu_part(
@@ -2824,6 +2909,7 @@ pub fn as_middleware(api: S3Api) -> Arc<dyn Middleware> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acl_cors::{S3_OBJECT_ACL_JSON_META, S3_OBJECT_ACL_META};
     use crate::bucket_config::{
         S3_LIFECYCLE_META, S3_OBJECT_LOCK_META, S3_VERSIONING_META,
     };
@@ -3238,6 +3324,10 @@ mod tests {
         // returns an UploadId.
         let init_req = sign_request(base_s3_req("POST", "/mybucket/big/obj", "uploads"), "testing");
         let init_next: NextFn = Arc::new(|r| {
+            // HEAD data bucket for AbortIncomplete lifecycle (may 404).
+            if r.method == "HEAD" {
+                return Response::new(404);
+            }
             assert_eq!(r.method, "PUT");
             assert!(
                 r.path == "/v1/AUTH_test/mybucket+segments"
@@ -3519,6 +3609,131 @@ mod tests {
             Response::new(202)
         });
         assert_eq!(api.handle(req, &next).status, 200);
+    }
+
+    #[test]
+    fn put_bucket_acl_grant_read_allusers_stamps_container_read() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket", "acl");
+        req.headers.set(
+            "x-amz-grant-read",
+            "uri=http://acs.amazonaws.com/groups/global/AllUsers",
+        );
+        req.headers
+            .set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.method, "POST");
+            assert_eq!(
+                r.headers.get("X-Container-Read"),
+                Some(".r:*,.rlistings")
+            );
+            assert!(r
+                .headers
+                .get("X-Container-Meta-S3-Acl-Json")
+                .is_some_and(|v| v.contains("AllUsers")));
+            Response::new(204)
+        });
+        assert_eq!(api.handle(req, &next).status, 200);
+    }
+
+    #[test]
+    fn put_object_acl_acp_body_stores_json_and_get_roundtrip() {
+        let api = S3Api::new(cred_map());
+        let acp = br#"<?xml version="1.0" encoding="UTF-8"?>
+<AccessControlPolicy>
+  <Owner><ID>test:tester</ID><DisplayName>test:tester</DisplayName></Owner>
+  <AccessControlList>
+    <Grant>
+      <Grantee><ID>test:tester</ID><DisplayName>test:tester</DisplayName></Grantee>
+      <Permission>FULL_CONTROL</Permission>
+    </Grant>
+    <Grant>
+      <Grantee><URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee>
+      <Permission>READ</Permission>
+    </Grant>
+  </AccessControlList>
+</AccessControlPolicy>"#;
+        let mut put_req = base_s3_req("PUT", "/mybucket/obj1", "acl");
+        put_req
+            .headers
+            .set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put_req.body = Body::from(acp.to_vec());
+        let put_req = sign_request(put_req, "testing");
+        let stored = std::sync::Arc::new(std::sync::Mutex::new(None::<HeaderKeyDict>));
+        let stored_c = stored.clone();
+        let put_next: NextFn = Arc::new(move |r| {
+            assert_eq!(r.method, "POST");
+            let json = r.headers.get(S3_OBJECT_ACL_JSON_META).unwrap_or("");
+            assert!(
+                json.contains("AllUsers") && json.contains("FULL_CONTROL"),
+                "expected grant JSON, got {json}"
+            );
+            *stored_c.lock().unwrap() = Some(r.headers.clone());
+            Response::new(202)
+        });
+        assert_eq!(api.handle(put_req, &put_next).status, 200);
+
+        let hdrs = stored.lock().unwrap().clone().unwrap();
+        let get_req = sign_request(base_s3_req("GET", "/mybucket/obj1", "acl"), "testing");
+        let get_next: NextFn = Arc::new(move |_| {
+            let mut r = Response::new(200);
+            r.headers = hdrs.clone();
+            r
+        });
+        let resp = api.handle(get_req, &get_next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("AccessControlPolicy"));
+        assert!(body.contains("<Grant>"));
+        assert!(body.contains("<Permission>FULL_CONTROL</Permission>"));
+        assert!(body.contains("<Permission>READ</Permission>"));
+        assert!(body.contains("AllUsers"));
+    }
+
+    #[test]
+    fn put_bucket_acl_acp_body_roundtrip() {
+        let api = S3Api::new(cred_map());
+        let acp = br#"<AccessControlPolicy>
+  <Owner><ID>owner</ID></Owner>
+  <AccessControlList>
+    <Grant>
+      <Grantee><ID>owner</ID></Grantee>
+      <Permission>FULL_CONTROL</Permission>
+    </Grant>
+    <Grant>
+      <Grantee><URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee>
+      <Permission>WRITE</Permission>
+    </Grant>
+  </AccessControlList>
+</AccessControlPolicy>"#;
+        let mut put_req = base_s3_req("PUT", "/mybucket", "acl");
+        put_req
+            .headers
+            .set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put_req.body = Body::from(acp.to_vec());
+        let put_req = sign_request(put_req, "testing");
+        let stored = std::sync::Arc::new(std::sync::Mutex::new(None::<HeaderKeyDict>));
+        let stored_c = stored.clone();
+        let put_next: NextFn = Arc::new(move |r| {
+            assert_eq!(r.headers.get("X-Container-Write"), Some(".r:*"));
+            *stored_c.lock().unwrap() = Some(r.headers.clone());
+            Response::new(204)
+        });
+        assert_eq!(api.handle(put_req, &put_next).status, 200);
+
+        let hdrs = stored.lock().unwrap().clone().unwrap();
+        let get_req = sign_request(base_s3_req("GET", "/mybucket", "acl"), "testing");
+        let get_next: NextFn = Arc::new(move |_| {
+            let mut r = Response::new(204);
+            r.headers = hdrs.clone();
+            r
+        });
+        let resp = api.handle(get_req, &get_next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Permission>WRITE</Permission>"));
+        assert!(body.contains("AllUsers"));
     }
 
     /// Assert stable S3 NotImplemented: 501 + Code + Message fragment.
@@ -4116,8 +4331,12 @@ mod tests {
         assert_not_implemented(api.handle(req, &next), "Signature Version 2");
     }
 
+    /// Empty-payload SHA-256 hex (terminal streaming chunk).
+    const EMPTY_SHA256_HEX: &str =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
     /// Build a minimal aws-chunked framed body for `payload` with optional
-    /// chunk-signature params (values are not verified).
+    /// placeholder chunk-signature params (invalid HMAC — for negative tests).
     fn frame_aws_chunked(payload: &[u8], with_sig: bool, trailers: &[(&str, &str)]) -> Vec<u8> {
         let mut out = Vec::new();
         // Single data chunk + terminal 0 chunk (simple framing for unit tests).
@@ -4153,6 +4372,86 @@ mod tests {
         out
     }
 
+    /// Frame aws-chunked body with real STREAMING-AWS4-HMAC-SHA256-PAYLOAD
+    /// per-chunk signatures (seed = header SigV4 signature).
+    fn frame_aws_chunked_signed(
+        chunks: &[&[u8]],
+        secret: &str,
+        date: &str,
+        region: &str,
+        service: &str,
+        amz_date: &str,
+        seed_signature: &str,
+        trailers: &[(&str, &str)],
+    ) -> Vec<u8> {
+        use crate::aws_chunked::compute_chunk_signature;
+        use crate::crypto::sha256_hex;
+
+        let ctx = ChunkSigContext {
+            secret_key: secret.into(),
+            date: date.into(),
+            region: region.into(),
+            service: service.into(),
+            amz_date: amz_date.into(),
+            seed_signature: seed_signature.into(),
+        };
+        let mut out = Vec::new();
+        let mut prev = seed_signature.to_ascii_lowercase();
+        for data in chunks {
+            let data_hash = sha256_hex(data);
+            let sig = compute_chunk_signature(&ctx, &prev, &data_hash);
+            out.extend_from_slice(
+                format!("{:x};chunk-signature={sig}\r\n", data.len()).as_bytes(),
+            );
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\r\n");
+            prev = sig;
+        }
+        let sig0 = compute_chunk_signature(&ctx, &prev, EMPTY_SHA256_HEX);
+        out.extend_from_slice(format!("0;chunk-signature={sig0}\r\n").as_bytes());
+        for (k, v) in trailers {
+            out.extend_from_slice(format!("{k}:{v}\r\n").as_bytes());
+        }
+        out.extend_from_slice(b"\r\n");
+        out
+    }
+
+    /// Sign request headers first, then attach a correctly HMAC-signed
+    /// streaming body (seed = Authorization Signature).
+    fn sign_streaming_put(
+        mut req: Request,
+        secret: &str,
+        chunks: &[&[u8]],
+        trailers: &[(&str, &str)],
+    ) -> Request {
+        let decoded_len: usize = chunks.iter().map(|c| c.len()).sum();
+        req.headers
+            .set("x-amz-decoded-content-length", decoded_len.to_string());
+        // Content-Length not in signed headers for base_s3_req; set after frame.
+        req.body = Body::empty();
+        req.headers.set("Content-Length", "0");
+        let mut req = sign_request(req, secret);
+        let auth_hdr = req.headers.get("Authorization").unwrap().to_string();
+        let auth = parse_authorization_header(&auth_hdr).unwrap();
+        let amz = amz_date(&req).unwrap();
+        let framed = frame_aws_chunked_signed(
+            chunks,
+            secret,
+            &auth.scope.date,
+            &auth.scope.region,
+            &auth.scope.service,
+            &amz,
+            &auth.signature,
+            trailers,
+        );
+        req.headers
+            .set("Content-Length", framed.len().to_string());
+        req.headers
+            .set("x-amz-decoded-content-length", decoded_len.to_string());
+        req.body = Body::from(framed);
+        req
+    }
+
     #[test]
     fn decode_aws_chunked_pure_multi_chunk_and_trailers() {
         // Multi-chunk: "hello" + " world" + trailers
@@ -4186,19 +4485,13 @@ mod tests {
     fn aws_chunked_streaming_payload_dechunks_to_backend() {
         let api = S3Api::new(cred_map());
         let payload = b"streaming-hello";
-        let framed = frame_aws_chunked(payload, true, &[]);
         let mut req = base_s3_req("PUT", "/mybucket/obj", "");
         req.headers.set(
             "x-amz-content-sha256",
             "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
         );
         req.headers.set("Content-Encoding", "aws-chunked");
-        req.headers
-            .set("x-amz-decoded-content-length", payload.len().to_string());
-        req.headers
-            .set("Content-Length", framed.len().to_string());
-        req.body = Body::from(framed);
-        let req = sign_request(req, "testing");
+        let req = sign_streaming_put(req, "testing", &[payload.as_slice()], &[]);
         let next: NextFn = Arc::new(|r| {
             if r.method == "HEAD" {
                 return Response::new(404);
@@ -4223,6 +4516,61 @@ mod tests {
         });
         let resp = api.handle(req, &next);
         assert_eq!(resp.status, 200, "PUT object success maps to 200");
+    }
+
+    #[test]
+    fn aws_chunked_streaming_multi_chunk_signed_dechunks_to_backend() {
+        let api = S3Api::new(cred_map());
+        // Multi-chunk payload: "stream" + "ing-he" + "llo"
+        let chunks: &[&[u8]] = &[b"stream", b"ing-he", b"llo"];
+        let mut req = base_s3_req("PUT", "/mybucket/obj", "");
+        req.headers.set(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        );
+        req.headers.set("Content-Encoding", "aws-chunked");
+        let req = sign_streaming_put(req, "testing", chunks, &[]);
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                return Response::new(404);
+            }
+            let body = r.body.into_vec(u64::MAX).unwrap();
+            assert_eq!(body, b"streaming-hello");
+            assert_eq!(r.headers.get("Content-Length"), Some("15"));
+            Response::new(201)
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn aws_chunked_bad_chunk_signature_is_signature_does_not_match() {
+        let api = S3Api::new(cred_map());
+        let payload = b"bad-sig-body";
+        // Placeholder zeros — invalid under HMAC chain enforcement.
+        let framed = frame_aws_chunked(payload, true, &[]);
+        let mut req = base_s3_req("PUT", "/mybucket/obj", "");
+        req.headers.set(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        );
+        req.headers.set("Content-Encoding", "aws-chunked");
+        req.headers
+            .set("x-amz-decoded-content-length", payload.len().to_string());
+        req.headers
+            .set("Content-Length", framed.len().to_string());
+        req.body = Body::from(framed);
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|_| {
+            panic!("bad chunk-signature must not forward body to backend")
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 403, "expected 403 SignatureDoesNotMatch");
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(
+            body.contains("SignatureDoesNotMatch"),
+            "expected SignatureDoesNotMatch XML, got {body}"
+        );
     }
 
     #[test]
@@ -4698,6 +5046,153 @@ mod tests {
     }
 
     #[test]
+    fn put_object_stamps_transition_meta_from_lifecycle() {
+        use crate::bucket_config::{apply_lifecycle_meta, S3_LIFECYCLE_META};
+        use crate::lifecycle_exec::{META_STORAGE_CLASS, SYS_TRANSITION_AT};
+        let api = S3Api::new(cred_map());
+        let lc = br#"<?xml version="1.0"?>
+<LifecycleConfiguration>
+  <Rule>
+    <Filter><Prefix>logs/</Prefix></Filter>
+    <Status>Enabled</Status>
+    <Transition><Days>30</Days><StorageClass>GLACIER</StorageClass></Transition>
+    <Expiration><Days>90</Days></Expiration>
+  </Rule>
+</LifecycleConfiguration>"#;
+        let mut lc_headers = HeaderKeyDict::new();
+        apply_lifecycle_meta(&mut lc_headers, lc);
+        let lc_meta = lc_headers.get(S3_LIFECYCLE_META).unwrap().to_string();
+
+        let mut put = base_s3_req("PUT", "/mybucket/logs/a.txt", "");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(b"data".to_vec());
+        let put = sign_request(put, "testing");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(
+            None::<(Option<String>, Option<String>, Option<String>)>,
+        ));
+        let seen_c = seen.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" {
+                if r.path.ends_with("/mybucket") {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(S3_LIFECYCLE_META, &lc_meta);
+                    return resp;
+                }
+                return Response::new(404);
+            }
+            if r.method == "PUT" {
+                *seen_c.lock().unwrap() = Some((
+                    r.headers.get("X-Delete-At").map(str::to_string),
+                    r.headers.get(META_STORAGE_CLASS).map(str::to_string),
+                    r.headers.get(SYS_TRANSITION_AT).map(str::to_string),
+                ));
+                let mut resp = Response::new(201);
+                resp.headers.set("ETag", "abc");
+                return resp;
+            }
+            Response::new(500)
+        });
+        assert_eq!(api.handle(put, &next).status, 200);
+        let (da, sc, tr) = seen.lock().unwrap().clone().unwrap();
+        let now = unix_now();
+        let da: i64 = da.expect("expiration X-Delete-At").parse().unwrap();
+        assert!((da - (now + 90 * 86_400)).abs() < 5);
+        assert_eq!(sc.as_deref(), Some("GLACIER"));
+        let tr: i64 = tr.expect("transition-at").parse().unwrap();
+        assert!((tr - (now + 30 * 86_400)).abs() < 5);
+    }
+
+    #[test]
+    fn put_object_transition_skips_non_matching_prefix() {
+        use crate::bucket_config::{apply_lifecycle_meta, S3_LIFECYCLE_META};
+        use crate::lifecycle_exec::META_STORAGE_CLASS;
+        let api = S3Api::new(cred_map());
+        let lc = br#"<LifecycleConfiguration>
+  <Rule><Prefix>logs/</Prefix><Status>Enabled</Status>
+  <Transition><Days>1</Days><StorageClass>GLACIER</StorageClass></Transition>
+  </Rule>
+</LifecycleConfiguration>"#;
+        let mut h = HeaderKeyDict::new();
+        apply_lifecycle_meta(&mut h, lc);
+        let meta = h.get(S3_LIFECYCLE_META).unwrap().to_string();
+        let mut put = base_s3_req("PUT", "/mybucket/other/a.txt", "");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(b"x".to_vec());
+        let put = sign_request(put, "testing");
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" {
+                if r.path.ends_with("/mybucket") {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(S3_LIFECYCLE_META, &meta);
+                    return resp;
+                }
+                return Response::new(404);
+            }
+            if r.method == "PUT" {
+                assert!(r.headers.get(META_STORAGE_CLASS).is_none());
+                assert!(r.headers.get("X-Delete-At").is_none());
+                let mut resp = Response::new(201);
+                resp.headers.set("ETag", "e");
+                return resp;
+            }
+            Response::new(500)
+        });
+        assert_eq!(api.handle(put, &next).status, 200);
+    }
+
+    #[test]
+    fn mpu_init_stamps_abort_incomplete_x_delete_at() {
+        use crate::bucket_config::{apply_lifecycle_meta, S3_LIFECYCLE_META};
+        use crate::lifecycle_exec::SYS_ABORT_MPU_DAYS;
+        let api = S3Api::new(cred_map());
+        let lc = br#"<?xml version="1.0"?>
+<LifecycleConfiguration>
+  <Rule>
+    <Prefix>logs/</Prefix>
+    <Status>Enabled</Status>
+    <AbortIncompleteMultipartUpload>
+      <DaysAfterInitiation>7</DaysAfterInitiation>
+    </AbortIncompleteMultipartUpload>
+  </Rule>
+</LifecycleConfiguration>"#;
+        let mut lc_headers = HeaderKeyDict::new();
+        apply_lifecycle_meta(&mut lc_headers, lc);
+        let lc_meta = lc_headers.get(S3_LIFECYCLE_META).unwrap().to_string();
+
+        let mut init = base_s3_req("POST", "/mybucket/logs/big.bin", "uploads");
+        init.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        let init = sign_request(init, "testing");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(
+            None::<(Option<String>, Option<String>)>,
+        ));
+        let seen_c = seen.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" && r.path.ends_with("/mybucket") {
+                let mut resp = Response::new(204);
+                resp.headers.set(S3_LIFECYCLE_META, &lc_meta);
+                return resp;
+            }
+            if r.method == "PUT" {
+                // segments container create or marker
+                if r.path.contains("+segments") && !r.path.ends_with("+segments") {
+                    *seen_c.lock().unwrap() = Some((
+                        r.headers.get("X-Delete-At").map(str::to_string),
+                        r.headers.get(SYS_ABORT_MPU_DAYS).map(str::to_string),
+                    ));
+                }
+                return Response::new(201);
+            }
+            Response::new(500)
+        });
+        assert_eq!(api.handle(init, &next).status, 200);
+        let (da, days) = seen.lock().unwrap().clone().expect("marker PUT seen");
+        let now = unix_now();
+        let da: i64 = da.expect("X-Delete-At on marker").parse().unwrap();
+        assert!((da - (now + 7 * 86_400)).abs() < 5, "da={da} now={now}");
+        assert_eq!(days.as_deref(), Some("7"));
+    }
+
+    #[test]
     fn legal_hold_blocks_overwrite_put() {
         let api = S3Api::new(cred_map());
         let mut put = base_s3_req("PUT", "/mybucket/locked", "");
@@ -4720,5 +5215,102 @@ mod tests {
         assert_eq!(resp.status, 403);
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
         assert!(body.contains("AccessDenied"));
+    }
+
+    #[test]
+    fn governance_bypass_header_allows_delete() {
+        let api = S3Api::new(cred_map());
+        let mut del = sign_request(base_s3_req("DELETE", "/mybucket/gov", ""), "testing");
+        del.headers.set(HDR_BYPASS_GOVERNANCE, "true");
+        let deleted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let deleted_c = deleted.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" {
+                let mut resp = Response::new(200);
+                resp.headers.set(SYS_LOCK_MODE, "GOVERNANCE");
+                resp.headers.set(SYS_RETAIN_UNTIL, "2099-12-31T00:00:00Z");
+                return resp;
+            }
+            if r.method == "DELETE" {
+                deleted_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Response::new(204);
+            }
+            Response::new(500)
+        });
+        let resp = api.handle(del, &next);
+        assert_eq!(resp.status, 204);
+        assert!(deleted.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn compliance_bypass_header_still_denies_delete() {
+        let api = S3Api::new(cred_map());
+        let mut del = sign_request(base_s3_req("DELETE", "/mybucket/comp", ""), "testing");
+        del.headers.set(HDR_BYPASS_GOVERNANCE, "true");
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                let mut resp = Response::new(200);
+                resp.headers.set(SYS_LOCK_MODE, "COMPLIANCE");
+                resp.headers.set(SYS_RETAIN_UNTIL, "2099-12-31T00:00:00Z");
+                return resp;
+            }
+            panic!("COMPLIANCE + bypass must not reach backend DELETE");
+        });
+        let resp = api.handle(del, &next);
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("AccessDenied"));
+    }
+
+    #[test]
+    fn legal_hold_bypass_header_still_denies_delete() {
+        let api = S3Api::new(cred_map());
+        let mut del = sign_request(base_s3_req("DELETE", "/mybucket/hold", ""), "testing");
+        del.headers.set("X-Amz-Bypass-Governance-Retention", "1");
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                let mut resp = Response::new(200);
+                resp.headers.set(SYS_LEGAL_HOLD, "ON");
+                resp.headers.set(SYS_LOCK_MODE, "GOVERNANCE");
+                resp.headers.set(SYS_RETAIN_UNTIL, "2099-12-31T00:00:00Z");
+                return resp;
+            }
+            panic!("legal-hold + bypass must not reach backend DELETE");
+        });
+        let resp = api.handle(del, &next);
+        assert_eq!(resp.status, 403);
+    }
+
+    #[test]
+    fn governance_bypass_header_allows_overwrite_put() {
+        let api = S3Api::new(cred_map());
+        let mut put = base_s3_req("PUT", "/mybucket/gov", "");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(b"new".to_vec());
+        let mut put = sign_request(put, "testing");
+        put.headers.set(HDR_BYPASS_GOVERNANCE, "True");
+        let put_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let put_c = put_seen.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" {
+                if r.path.ends_with("/gov") {
+                    let mut resp = Response::new(200);
+                    resp.headers.set(SYS_LOCK_MODE, "GOVERNANCE");
+                    resp.headers.set(SYS_RETAIN_UNTIL, "2099-12-31T00:00:00Z");
+                    return resp;
+                }
+                return Response::new(404);
+            }
+            if r.method == "PUT" {
+                put_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                let mut resp = Response::new(201);
+                resp.headers.set("ETag", "abc");
+                return resp;
+            }
+            Response::new(500)
+        });
+        let resp = api.handle(put, &next);
+        assert_eq!(resp.status, 200);
+        assert!(put_seen.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

@@ -1,0 +1,174 @@
+=== worktree / package paths ===
+ROOT=/Users/oboy/Downloads/Peregrine
+PKG=/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api
+
+=== AccessControlPolicy / parse_acp / grant header symbols ===
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:26://!   reconstructs AccessControlPolicy XML from that meta (default private).
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:27://! * **Grant headers** (`x-amz-grant-read|write|full-control|read-acp|write-acp`)
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:28://!   and **AccessControlPolicy XML body** on PUT object/bucket `?acl` (and
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:30://!   compact JSON ([`S3_OBJECT_ACL_JSON_META`] /
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:31://!   [`S3_BUCKET_ACL_JSON_META`]). Bucket AllUsers READ/WRITE also map to
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:85:pub const S3_OBJECT_ACL_JSON_META: &str = "X-Object-Sysmeta-S3-Acl-Json";
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:88:pub const S3_BUCKET_ACL_JSON_META: &str = "X-Container-Meta-S3-Acl-Json";
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:111:    let mut root = Element::new("AccessControlPolicy");
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:189:    headers.set(S3_BUCKET_ACL_JSON_META, "");
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:249:    headers.set(S3_OBJECT_ACL_JSON_META, "");
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:252:/// Build AccessControlPolicy XML from stored object canned ACL meta.
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:278:// Structured grants (ACP XML + x-amz-grant-* headers)
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:302:/// Full AccessControlPolicy (owner + grants).
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:304:pub struct AccessControlPolicy {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:310:impl AccessControlPolicy {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:361:/// Serialize structured policy to AccessControlPolicy XML.
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:362:pub fn access_control_policy_xml(policy: &AccessControlPolicy) -> Vec<u8> {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:367:    let mut root = Element::new("AccessControlPolicy");
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:381:/// Parse AccessControlPolicy XML body into structured grants.
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:382:pub fn parse_acp_xml(body: &[u8]) -> Result<AccessControlPolicy, String> {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:384:    if !text.contains("AccessControlPolicy") {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:435:    Ok(AccessControlPolicy {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:473:pub fn parse_grant_header_value(value: &str, permission: &str) -> Result<Vec<Grant>, String> {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:492:/// Header name → permission mapping for `x-amz-grant-*`.
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:495:        "x-amz-grant-read" => Some("READ"),
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:496:        "x-amz-grant-write" => Some("WRITE"),
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:497:        "x-amz-grant-full-control" => Some("FULL_CONTROL"),
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:498:        "x-amz-grant-read-acp" => Some("READ_ACP"),
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:499:        "x-amz-grant-write-acp" => Some("WRITE_ACP"),
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:504:/// Whether any `x-amz-grant-*` headers are present.
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:511:/// Collect grants from `x-amz-grant-*` headers.
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:512:pub fn parse_grant_headers(headers: &HeaderKeyDict) -> Result<Vec<Grant>, String> {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:517:            grants.extend(parse_grant_header_value(v, perm)?);
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:524:pub fn encode_acl_json(policy: &AccessControlPolicy) -> String {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:558:pub fn decode_acl_json(raw: &str) -> Option<AccessControlPolicy> {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:611:    Some(AccessControlPolicy {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:650:pub fn apply_object_acl_policy(headers: &mut HeaderKeyDict, policy: &AccessControlPolicy) {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:651:    headers.set(S3_OBJECT_ACL_JSON_META, encode_acl_json(policy));
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:656:pub fn apply_bucket_acl_policy(headers: &mut HeaderKeyDict, policy: &AccessControlPolicy) {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:657:    headers.set(S3_BUCKET_ACL_JSON_META, encode_acl_json(policy));
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:664:        .get(S3_OBJECT_ACL_JSON_META)
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:682:    if let Some(raw) = headers.get(S3_BUCKET_ACL_JSON_META) {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:713:    Policy(AccessControlPolicy),
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:720:pub fn resolve_acl_put_input(
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:732:        grants.extend(parse_grant_headers(headers)?);
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:740:        let mut policy = parse_acp_xml(body.unwrap())?;
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:751:        return Ok(AclPutInput::Policy(AccessControlPolicy {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:765:        AclPutInput::Policy(p) => apply_object_acl_policy(headers, p),
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:774:        AclPutInput::Policy(p) => apply_bucket_acl_policy(headers, p),
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1332:<AccessControlPolicy>
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1358:</AccessControlPolicy>"#;
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1359:        let policy = parse_acp_xml(body).unwrap();
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1377:        assert!(xml.contains("AccessControlPolicy"));
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1390:            "x-amz-grant-read",
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1393:        let grants = parse_grant_headers(&h).unwrap();
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1397:        let policy = AccessControlPolicy {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1413:        apply_bucket_acl_policy(&mut out, &policy);
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1420:            .get(S3_BUCKET_ACL_JSON_META)
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1431:        let policy = parse_acp_xml(
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1432:            br#"<AccessControlPolicy>
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1444:</AccessControlPolicy>"#,
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1448:        apply_object_acl_policy(&mut h, &policy);
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1449:        assert!(h.get(S3_OBJECT_ACL_JSON_META).is_some_and(|v| !v.is_empty()));
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1464:            "x-amz-grant-read",
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1467:        let input = resolve_acl_put_input(&h, None, "owner").unwrap();
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1475:    fn parse_grant_header_list_form() {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1476:        let grants = parse_grant_header_value(
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1491:            "x-amz-grant-full-control",
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1495:            "x-amz-grant-read",
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1498:        let input = resolve_acl_put_input(&h, None, "owner").unwrap();
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:81://! Grant headers (`x-amz-grant-*`) + ACP XML body PUT/GET `?acl` are claimable
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:99:    object_acl_xml_from_headers, parse_cors_configuration, resolve_acl_put_input, xml_ok,
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:1220:        // ACL: canned x-amz-acl wins; else x-amz-grant-* (body empty on object PUT).
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:1222:        match resolve_acl_put_input(&swift_req.headers, None, &owner.id) {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:1618:                let input = match resolve_acl_put_input(
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:1659:                let input = match resolve_acl_put_input(
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:1947:    match resolve_acl_put_input(&req.headers, None, &cred.access_key) {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:2913:    use crate::acl_cors::{S3_OBJECT_ACL_JSON_META, S3_OBJECT_ACL_META};
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3235:        assert!(body.contains("AccessControlPolicy"));
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3581:        assert!(body.contains("AccessControlPolicy"));
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3620:            "x-amz-grant-read",
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3645:<AccessControlPolicy>
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3657:</AccessControlPolicy>"#;
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3668:            let json = r.headers.get(S3_OBJECT_ACL_JSON_META).unwrap_or("");
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3688:        assert!(body.contains("AccessControlPolicy"));
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3698:        let acp = br#"<AccessControlPolicy>
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3710:</AccessControlPolicy>"#;
+
+=== unit test names (acl/grant/acp) ===
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:110:fn acl_policy(owner_id: &str, grants: Vec<Element>) -> Vec<u8> {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:126:pub fn private_acl_xml(owner_id: &str) -> Vec<u8> {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:131:pub fn public_read_acl_xml(owner_id: &str) -> Vec<u8> {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:139:pub fn public_read_write_acl_xml(owner_id: &str) -> Vec<u8> {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:154:pub fn authenticated_read_acl_xml(owner_id: &str) -> Vec<u8> {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:166:pub fn apply_canned_acl(headers: &mut HeaderKeyDict, canned: &str) {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:193:pub fn is_supported_canned_acl(canned: &str) -> bool {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:206:pub fn acl_xml_from_swift_headers(
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:226:pub fn acl_xml_from_swift_read(owner_id: &str, read_acl: Option<&str>) -> Vec<u8> {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:236:pub fn normalize_object_canned_acl(canned: &str) -> &'static str {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:247:pub fn apply_object_canned_acl(headers: &mut HeaderKeyDict, canned: &str) {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:253:pub fn object_acl_xml_from_meta(owner_id: &str, canned: Option<&str>) -> Vec<u8> {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:340:fn grant_element(g: &Grant) -> Element {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:493:fn grant_header_permission(header_lower: &str) -> Option<&'static str> {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:524:pub fn encode_acl_json(policy: &AccessControlPolicy) -> String {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:558:pub fn decode_acl_json(raw: &str) -> Option<AccessControlPolicy> {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:650:pub fn apply_object_acl_policy(headers: &mut HeaderKeyDict, policy: &AccessControlPolicy) {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:656:pub fn apply_bucket_acl_policy(headers: &mut HeaderKeyDict, policy: &AccessControlPolicy) {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:662:pub fn object_acl_xml_from_headers(owner_id: &str, headers: &HeaderKeyDict) -> Vec<u8> {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:681:pub fn bucket_acl_xml_from_headers(owner_id: &str, headers: &HeaderKeyDict) -> Vec<u8> {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:720:pub fn resolve_acl_put_input(
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:762:pub fn apply_object_acl_input(headers: &mut HeaderKeyDict, input: &AclPutInput) {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:771:pub fn apply_bucket_acl_input(headers: &mut HeaderKeyDict, input: &AclPutInput) {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1104:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1105:    fn private_acl_contains_full_control() {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1111:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1112:    fn public_read_write_acl_xml_has_read_and_write() {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1120:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1131:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1142:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1150:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1158:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1159:    fn infer_acl_from_read_write_headers() {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1177:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1178:    fn object_canned_acl_private_and_public_read() {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1213:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1231:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1257:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1297:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1307:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1329:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1330:    fn acp_xml_roundtrip_structured_grants() {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1386:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1387:    fn grant_read_allusers_maps_public_read_container_headers() {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1429:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1459:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1474:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1487:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/acl_cors.rs:1488:    fn resolve_grant_headers_to_policy() {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:1590:fn handle_acl(
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:2998:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3016:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3035:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3107:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3125:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3137:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3161:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3179:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3190:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3211:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3223:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3224:    fn get_acl_returns_private_policy() {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3239:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3257:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3281:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3308:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3320:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3411:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3427:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3466:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3519:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3520:    fn put_bucket_acl_public_read_write() {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3539:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3540:    fn put_object_stores_canned_acl_sysmeta() {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3567:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3568:    fn get_object_acl_from_sysmeta() {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3586:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3587:    fn get_object_acl_defaults_private_when_no_meta() {
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3598:    #[test]
+/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api/src/middleware.rs:3599:    fn put_object_acl_posts_sysmeta() {

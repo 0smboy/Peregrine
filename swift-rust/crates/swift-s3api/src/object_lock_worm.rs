@@ -3,14 +3,19 @@
 //!
 //! Object subresources (`?legal-hold`, `?retention`) store sysmeta defined
 //! here. DELETE is denied when legal-hold is ON or retain-until is in the
-//! future. **Bypass:** none by default — `x-amz-bypass-governance-retention`
-//! and privileged override are residuals (not implemented).
+//! future.
+//!
+//! **Bypass:** `x-amz-bypass-governance-retention: true` allows DELETE /
+//! overwrite only when the lock mode is **GOVERNANCE** and the block reason
+//! is retention (not legal-hold). **COMPLIANCE** and legal-hold cannot be
+//! bypassed.
 
 use swift_http::HeaderKeyDict;
 
 pub const SYS_LEGAL_HOLD: &str = "X-Object-Sysmeta-S3-Legal-Hold";
 pub const SYS_LOCK_MODE: &str = "X-Object-Sysmeta-S3-Object-Lock-Mode";
 pub const SYS_RETAIN_UNTIL: &str = "X-Object-Sysmeta-S3-Retain-Until-Date";
+pub const HDR_BYPASS_GOVERNANCE: &str = "x-amz-bypass-governance-retention";
 
 /// Default retention extracted from bucket `ObjectLockConfiguration`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,21 +26,75 @@ pub struct DefaultRetention {
     pub years: Option<i64>,
 }
 
-/// True if DELETE must be denied (no bypass path).
-pub fn worm_blocks_delete(headers: &HeaderKeyDict, now_unix: i64) -> bool {
-    if let Some(h) = headers.get(SYS_LEGAL_HOLD) {
-        if h.eq_ignore_ascii_case("ON") || h.eq_ignore_ascii_case("true") || h == "1" {
-            return true;
-        }
-    }
+/// Parse AWS truthy values for bypass header.
+pub fn bypass_governance_requested(header_val: Option<&str>) -> bool {
+    matches!(
+        header_val.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("true") | Some("1") | Some("yes")
+    )
+}
+
+fn legal_hold_on(headers: &HeaderKeyDict) -> bool {
+    matches!(
+        headers
+            .get(SYS_LEGAL_HOLD)
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("on") | Some("true") | Some("1")
+    )
+}
+
+fn retention_active(headers: &HeaderKeyDict, now_unix: i64) -> bool {
     if let Some(until) = headers.get(SYS_RETAIN_UNTIL) {
         if let Some(ts) = parse_retain_until(until) {
-            if ts > now_unix {
-                return true;
-            }
+            return ts > now_unix;
         }
     }
     false
+}
+
+fn lock_mode(headers: &HeaderKeyDict) -> Option<String> {
+    headers
+        .get(SYS_LOCK_MODE)
+        .map(|s| s.trim().to_ascii_uppercase())
+}
+
+/// True if DELETE must be denied (no bypass path).
+pub fn worm_blocks_delete(headers: &HeaderKeyDict, now_unix: i64) -> bool {
+    worm_blocks_delete_with_bypass(headers, now_unix, false)
+}
+
+/// True if DELETE/overwrite must be denied, honouring governance bypass.
+///
+/// * Legal-hold ON → always block (bypass ignored)
+/// * Active retention + COMPLIANCE → always block
+/// * Active retention + GOVERNANCE → block unless `bypass_governance`
+/// * Active retention + missing mode → treat as COMPLIANCE-like (block; safe default)
+pub fn worm_blocks_delete_with_bypass(
+    headers: &HeaderKeyDict,
+    now_unix: i64,
+    bypass_governance: bool,
+) -> bool {
+    if legal_hold_on(headers) {
+        return true;
+    }
+    if !retention_active(headers, now_unix) {
+        return false;
+    }
+    let mode = lock_mode(headers).unwrap_or_else(|| "COMPLIANCE".into());
+    if mode == "GOVERNANCE" && bypass_governance {
+        return false;
+    }
+    true
+}
+
+/// Inverse of [`worm_blocks_delete_with_bypass`] — true when the operation is allowed.
+pub fn worm_allows_operation(
+    headers: &HeaderKeyDict,
+    now_unix: i64,
+    bypass_governance: bool,
+) -> bool {
+    !worm_blocks_delete_with_bypass(headers, now_unix, bypass_governance)
 }
 
 /// Parse ISO8601 or unix seconds.
@@ -257,6 +316,70 @@ mod tests {
         h.set(SYS_RETAIN_UNTIL, "2000000000"); // year 2033
         assert!(worm_blocks_delete(&h, 1_700_000_000));
         assert!(!worm_blocks_delete(&h, 2_100_000_000));
+    }
+
+    #[test]
+    fn governance_bypass_allows_delete() {
+        let mut h = HeaderKeyDict::new();
+        h.set(SYS_LOCK_MODE, "GOVERNANCE");
+        h.set(SYS_RETAIN_UNTIL, "2000000000");
+        let now = 1_700_000_000i64;
+        // Without bypass → deny.
+        assert!(worm_blocks_delete_with_bypass(&h, now, false));
+        assert!(!worm_allows_operation(&h, now, false));
+        // With bypass → allow (GOVERNANCE + retain-until only).
+        assert!(!worm_blocks_delete_with_bypass(&h, now, true));
+        assert!(worm_allows_operation(&h, now, true));
+        // Header truthy forms: true | True | 1
+        assert!(bypass_governance_requested(Some("true")));
+        assert!(bypass_governance_requested(Some("True")));
+        assert!(bypass_governance_requested(Some("1")));
+        assert!(!bypass_governance_requested(Some("false")));
+        assert!(!bypass_governance_requested(None));
+    }
+
+    #[test]
+    fn governance_without_bypass_denies() {
+        let mut h = HeaderKeyDict::new();
+        h.set(SYS_LOCK_MODE, "GOVERNANCE");
+        h.set(SYS_RETAIN_UNTIL, "2000000000");
+        let now = 1_700_000_000i64;
+        assert!(worm_blocks_delete(&h, now));
+        assert!(worm_blocks_delete_with_bypass(&h, now, false));
+        assert!(!worm_allows_operation(&h, now, false));
+    }
+
+    #[test]
+    fn compliance_bypass_denied() {
+        let mut h = HeaderKeyDict::new();
+        h.set(SYS_LOCK_MODE, "COMPLIANCE");
+        h.set(SYS_RETAIN_UNTIL, "2000000000");
+        let now = 1_700_000_000i64;
+        assert!(worm_blocks_delete_with_bypass(&h, now, true));
+        assert!(!worm_allows_operation(&h, now, true));
+    }
+
+    #[test]
+    fn legal_hold_ignores_governance_bypass() {
+        let mut h = HeaderKeyDict::new();
+        h.set(SYS_LEGAL_HOLD, "ON");
+        h.set(SYS_LOCK_MODE, "GOVERNANCE");
+        h.set(SYS_RETAIN_UNTIL, "2000000000");
+        assert!(worm_blocks_delete_with_bypass(&h, 1_700_000_000, true));
+        assert!(!worm_allows_operation(&h, 1_700_000_000, true));
+    }
+
+    #[test]
+    fn expired_retain_allows_even_without_bypass() {
+        let mut h = HeaderKeyDict::new();
+        h.set(SYS_LOCK_MODE, "GOVERNANCE");
+        h.set(SYS_RETAIN_UNTIL, "1000000000"); // 2001
+        let now = 1_700_000_000i64;
+        assert!(!worm_blocks_delete(&h, now));
+        assert!(worm_allows_operation(&h, now, false));
+        // COMPLIANCE expired also allows.
+        h.set(SYS_LOCK_MODE, "COMPLIANCE");
+        assert!(!worm_blocks_delete_with_bypass(&h, now, false));
     }
 
     #[test]

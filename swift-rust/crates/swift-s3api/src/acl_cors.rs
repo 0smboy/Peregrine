@@ -24,6 +24,15 @@
 //!   (and **public-read-write** as stored name) via
 //!   [`S3_OBJECT_ACL_META`] (`X-Object-Sysmeta-S3-Acl`); GET object `?acl`
 //!   reconstructs AccessControlPolicy XML from that meta (default private).
+//! * **Grant headers** (`x-amz-grant-read|write|full-control|read-acp|write-acp`)
+//!   and **AccessControlPolicy XML body** on PUT object/bucket `?acl` (and
+//!   grant headers on PUT object): parsed into structured grants, stored as
+//!   compact JSON ([`S3_OBJECT_ACL_JSON_META`] /
+//!   [`S3_BUCKET_ACL_JSON_META`]). Bucket AllUsers READ/WRITE also map to
+//!   `X-Container-Read` / `X-Container-Write`. GET `?acl` prefers JSON grants
+//!   when present, else canned / container-header inference.
+//! * **Precedence:** `x-amz-acl` canned wins if present alongside grant headers
+//!   or ACP body (AWS forbids both; we keep canned for operational safety).
 //! * Multi-rule CORSConfiguration put/get: rules stored as compact meta
 //!   (`X-Container-Meta-S3-Cors`) plus first-rule `Access-Control-*` stamps for
 //!   Swift CORS middleware interop.
@@ -32,21 +41,33 @@
 //! * **authenticated-read** / **log-delivery-write**: Python raises
 //!   `S3NotImplemented` in `swift_acl_translate` — we treat them as unsupported
 //!   (map to private on apply; no Swift ACL equivalent for AuthenticatedUsers).
-//! * Full IAM / grant-header ACL / ACL XML body PUT (only `x-amz-acl` canned).
-//! * Python `s3_acl=true` JSON sysmeta (`X-Object-Sysmeta-S3api-Acl`) and
-//!   enforcement of object ACP on subsequent ops — we store a canned name only.
-//! * Object public-read does **not** grant anonymous Swift GET by itself
-//!   (container ACL still gates access); meta is for S3 GET `?acl` fidelity.
-//!   See [`object_canned_allows_anonymous_read`] for the *intended* S3 semantic
-//!   (pure helper; not wired into unauthenticated request paths — account
-//!   mapping without SigV4 is unsafe in multi-tenant proxy).
+//! * Full IAM identity service / emailAddress grantee resolution (email stored
+//!   in JSON for GET fidelity only; not resolved to canonical user).
+//! * Enforcement of object ACP grants on subsequent ops (authz still via
+//!   Swift container ACL / tempauth — not S3 grant evaluation).
+//! * Object public-read / AllUsers READ does **not** grant anonymous Swift GET
+//!   by itself (container ACL still gates access); meta is for S3 GET `?acl`
+//!   fidelity. See [`object_canned_allows_anonymous_read`] /
+//!   [`grants_allow_anonymous_read`] (pure helpers; not wired into
+//!   unauthenticated request paths — account mapping without SigV4 is unsafe
+//!   in multi-tenant proxy).
 //! * CORS `ExposeHeader` / `ID` fields not persisted in the compact encoding.
 
 use crate::xml::Element;
+use serde_json::{json, Value};
 use swift_http::{HeaderKeyDict, Response};
 
 const ALL_USERS: &str = "http://acs.amazonaws.com/groups/global/AllUsers";
 const AUTH_USERS: &str = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers";
+
+/// S3 ACL permissions accepted in grant headers / ACP XML.
+pub const ACL_PERMISSIONS: &[&str] = &[
+    "FULL_CONTROL",
+    "READ",
+    "WRITE",
+    "READ_ACP",
+    "WRITE_ACP",
+];
 
 /// Meta header holding the compact multi-rule CORS encoding.
 pub const S3_CORS_META: &str = "X-Container-Meta-S3-Cors";
@@ -56,6 +77,15 @@ pub const S3_CORS_META: &str = "X-Container-Meta-S3-Cors";
 /// Minimal stand-in for Python `s3_acl` JSON in `X-Object-Sysmeta-S3api-Acl`.
 /// Sysmeta keeps the value off the public `x-amz-meta-*` surface.
 pub const S3_OBJECT_ACL_META: &str = "X-Object-Sysmeta-S3-Acl";
+
+/// Object sysmeta holding structured ACP grants as compact JSON.
+///
+/// Shape: `{"Owner":"id","Grant":[{"Permission":"READ","URI":"..."},…]}`.
+/// Prefer this over [`S3_OBJECT_ACL_META`] when present on GET `?acl`.
+pub const S3_OBJECT_ACL_JSON_META: &str = "X-Object-Sysmeta-S3-Acl-Json";
+
+/// Bucket meta holding structured ACP grants as compact JSON (same shape).
+pub const S3_BUCKET_ACL_JSON_META: &str = "X-Container-Meta-S3-Acl-Json";
 
 // ---------------------------------------------------------------------------
 // ACL
@@ -131,7 +161,8 @@ pub fn authenticated_read_acl_xml(owner_id: &str) -> Vec<u8> {
 /// Map `x-amz-acl` canned ACL name → Swift container read/write headers.
 ///
 /// Mirrors Python `swift.common.middleware.s3api.acl_utils.swift_acl_translate`
-/// for the canned names that Swift can express.
+/// for the canned names that Swift can express. Clears structured JSON policy
+/// so GET `?acl` uses the canned / container-header path.
 pub fn apply_canned_acl(headers: &mut HeaderKeyDict, canned: &str) {
     match canned {
         "public-read" => {
@@ -155,6 +186,7 @@ pub fn apply_canned_acl(headers: &mut HeaderKeyDict, canned: &str) {
             headers.set("X-Container-Write", "");
         }
     }
+    headers.set(S3_BUCKET_ACL_JSON_META, "");
 }
 
 /// Whether a canned ACL name is claimably supported for header translation.
@@ -211,8 +243,10 @@ pub fn normalize_object_canned_acl(canned: &str) -> &'static str {
 }
 
 /// Stamp object sysmeta for a canned `x-amz-acl` (does not set container ACL).
+/// Clears structured JSON grants so GET prefers canned reconstruction.
 pub fn apply_object_canned_acl(headers: &mut HeaderKeyDict, canned: &str) {
     headers.set(S3_OBJECT_ACL_META, normalize_object_canned_acl(canned));
+    headers.set(S3_OBJECT_ACL_JSON_META, "");
 }
 
 /// Build AccessControlPolicy XML from stored object canned ACL meta.
@@ -238,6 +272,508 @@ pub fn object_canned_allows_anonymous_read(canned: Option<&str>) -> bool {
         normalize_object_canned_acl(canned.unwrap_or("private")),
         "public-read" | "public-read-write"
     )
+}
+
+// ---------------------------------------------------------------------------
+// Structured grants (ACP XML + x-amz-grant-* headers)
+// ---------------------------------------------------------------------------
+
+/// Grantee identity in an S3 Grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Grantee {
+    /// Canonical user id (+ optional display name).
+    Id {
+        id: String,
+        display_name: Option<String>,
+    },
+    /// Predefined group URI (AllUsers, AuthenticatedUsers, LogDelivery, …).
+    Uri { uri: String },
+    /// emailAddress form (stored for fidelity; not resolved to canonical id).
+    Email { email: String },
+}
+
+/// One Grant: grantee + permission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grant {
+    pub grantee: Grantee,
+    pub permission: String,
+}
+
+/// Full AccessControlPolicy (owner + grants).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessControlPolicy {
+    pub owner_id: String,
+    pub owner_display_name: Option<String>,
+    pub grants: Vec<Grant>,
+}
+
+impl AccessControlPolicy {
+    /// Owner-only FULL_CONTROL private policy.
+    pub fn private(owner_id: &str) -> Self {
+        Self {
+            owner_id: owner_id.to_string(),
+            owner_display_name: Some(owner_id.to_string()),
+            grants: vec![Grant {
+                grantee: Grantee::Id {
+                    id: owner_id.to_string(),
+                    display_name: Some(owner_id.to_string()),
+                },
+                permission: "FULL_CONTROL".into(),
+            }],
+        }
+    }
+}
+
+fn normalize_permission(raw: &str) -> Option<String> {
+    let up = raw.trim().to_ascii_uppercase().replace('-', "_");
+    if ACL_PERMISSIONS.contains(&up.as_str()) {
+        Some(up)
+    } else {
+        None
+    }
+}
+
+fn first_tag_text(text: &str, tag: &str) -> Option<String> {
+    extract_tag_values(text, tag).into_iter().next()
+}
+
+fn grant_element(g: &Grant) -> Element {
+    let grantee_el = match &g.grantee {
+        Grantee::Id { id, display_name } => {
+            let mut el = Element::new("Grantee").with_leaf("ID", id.as_str());
+            if let Some(dn) = display_name {
+                el = el.with_leaf("DisplayName", dn.as_str());
+            } else {
+                el = el.with_leaf("DisplayName", id.as_str());
+            }
+            el
+        }
+        Grantee::Uri { uri } => Element::new("Grantee").with_leaf("URI", uri.as_str()),
+        Grantee::Email { email } => {
+            Element::new("Grantee").with_leaf("EmailAddress", email.as_str())
+        }
+    };
+    Element::new("Grant")
+        .with(grantee_el)
+        .with_leaf("Permission", g.permission.as_str())
+}
+
+/// Serialize structured policy to AccessControlPolicy XML.
+pub fn access_control_policy_xml(policy: &AccessControlPolicy) -> Vec<u8> {
+    let owner_dn = policy
+        .owner_display_name
+        .as_deref()
+        .unwrap_or(policy.owner_id.as_str());
+    let mut root = Element::new("AccessControlPolicy");
+    root.push(
+        Element::new("Owner")
+            .with_leaf("ID", policy.owner_id.as_str())
+            .with_leaf("DisplayName", owner_dn),
+    );
+    let mut acl = Element::new("AccessControlList");
+    for g in &policy.grants {
+        acl.push(grant_element(g));
+    }
+    root.push(acl);
+    root.to_xml(true)
+}
+
+/// Parse AccessControlPolicy XML body into structured grants.
+pub fn parse_acp_xml(body: &[u8]) -> Result<AccessControlPolicy, String> {
+    let text = std::str::from_utf8(body).map_err(|_| "MalformedACLError".to_string())?;
+    if !text.contains("AccessControlPolicy") {
+        return Err("MalformedACLError".into());
+    }
+    // Owner block (best-effort; default empty then filled by caller if needed).
+    let owner_section = text
+        .find("<Owner>")
+        .and_then(|s| {
+            let rest = &text[s..];
+            rest.find("</Owner>")
+                .map(|e| rest[..e + "</Owner>".len()].to_string())
+        })
+        .unwrap_or_default();
+    let owner_id = first_tag_text(&owner_section, "ID").unwrap_or_default();
+    let owner_display_name = first_tag_text(&owner_section, "DisplayName");
+
+    let mut grants = Vec::new();
+    let mut rest = text;
+    let open = "<Grant>";
+    let close = "</Grant>";
+    while let Some(s) = rest.find(open) {
+        let start = s + open.len();
+        let Some(end_rel) = rest[start..].find(close) else {
+            break;
+        };
+        let grant_body = &rest[start..start + end_rel];
+        rest = &rest[start + end_rel + close.len()..];
+
+        let Some(perm_raw) = first_tag_text(grant_body, "Permission") else {
+            continue;
+        };
+        let Some(permission) = normalize_permission(&perm_raw) else {
+            return Err("MalformedACLError".into());
+        };
+
+        let grantee = if let Some(id) = first_tag_text(grant_body, "ID") {
+            Grantee::Id {
+                display_name: first_tag_text(grant_body, "DisplayName"),
+                id,
+            }
+        } else if let Some(uri) = first_tag_text(grant_body, "URI") {
+            Grantee::Uri { uri }
+        } else if let Some(email) = first_tag_text(grant_body, "EmailAddress") {
+            Grantee::Email { email }
+        } else {
+            return Err("MalformedACLError".into());
+        };
+        grants.push(Grant {
+            grantee,
+            permission,
+        });
+    }
+    Ok(AccessControlPolicy {
+        owner_id,
+        owner_display_name,
+        grants,
+    })
+}
+
+/// Parse one grantee token from grant-header list form:
+/// `id=…`, `uri=…`, or `emailAddress=…` (optional quotes).
+pub fn parse_grantee_token(token: &str) -> Result<Grantee, String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("InvalidArgument".into());
+    }
+    let Some((kind, value)) = token.split_once('=') else {
+        return Err("InvalidArgument".into());
+    };
+    let kind = kind.trim().to_ascii_lowercase();
+    let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+    if value.is_empty() {
+        return Err("InvalidArgument".into());
+    }
+    match kind.as_str() {
+        "id" => Ok(Grantee::Id {
+            id: value.to_string(),
+            display_name: Some(value.to_string()),
+        }),
+        "uri" => Ok(Grantee::Uri {
+            uri: value.to_string(),
+        }),
+        "emailaddress" | "email" => Ok(Grantee::Email {
+            email: value.to_string(),
+        }),
+        _ => Err("InvalidArgument".into()),
+    }
+}
+
+/// Parse comma-separated grantee list for one permission header value.
+pub fn parse_grant_header_value(value: &str, permission: &str) -> Result<Vec<Grant>, String> {
+    let Some(permission) = normalize_permission(permission) else {
+        return Err("InvalidArgument".into());
+    };
+    let mut grants = Vec::new();
+    // Split on commas that separate grantees (values themselves rarely contain commas).
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        grants.push(Grant {
+            grantee: parse_grantee_token(part)?,
+            permission: permission.clone(),
+        });
+    }
+    Ok(grants)
+}
+
+/// Header name → permission mapping for `x-amz-grant-*`.
+fn grant_header_permission(header_lower: &str) -> Option<&'static str> {
+    match header_lower {
+        "x-amz-grant-read" => Some("READ"),
+        "x-amz-grant-write" => Some("WRITE"),
+        "x-amz-grant-full-control" => Some("FULL_CONTROL"),
+        "x-amz-grant-read-acp" => Some("READ_ACP"),
+        "x-amz-grant-write-acp" => Some("WRITE_ACP"),
+        _ => None,
+    }
+}
+
+/// Whether any `x-amz-grant-*` headers are present.
+pub fn has_grant_headers(headers: &HeaderKeyDict) -> bool {
+    headers.iter().any(|(k, _)| {
+        grant_header_permission(&k.to_ascii_lowercase()).is_some()
+    })
+}
+
+/// Collect grants from `x-amz-grant-*` headers.
+pub fn parse_grant_headers(headers: &HeaderKeyDict) -> Result<Vec<Grant>, String> {
+    let mut grants = Vec::new();
+    for (k, v) in headers.iter() {
+        let lower = k.to_ascii_lowercase();
+        if let Some(perm) = grant_header_permission(&lower) {
+            grants.extend(parse_grant_header_value(v, perm)?);
+        }
+    }
+    Ok(grants)
+}
+
+/// Encode policy to compact JSON for sysmeta / container meta.
+pub fn encode_acl_json(policy: &AccessControlPolicy) -> String {
+    let grants: Vec<Value> = policy
+        .grants
+        .iter()
+        .map(|g| {
+            let mut m = serde_json::Map::new();
+            m.insert("Permission".into(), json!(g.permission));
+            match &g.grantee {
+                Grantee::Id { id, display_name } => {
+                    m.insert("ID".into(), json!(id));
+                    if let Some(dn) = display_name {
+                        m.insert("DisplayName".into(), json!(dn));
+                    }
+                }
+                Grantee::Uri { uri } => {
+                    m.insert("URI".into(), json!(uri));
+                }
+                Grantee::Email { email } => {
+                    m.insert("EmailAddress".into(), json!(email));
+                }
+            }
+            Value::Object(m)
+        })
+        .collect();
+    let mut root = serde_json::Map::new();
+    root.insert("Owner".into(), json!(policy.owner_id));
+    if let Some(dn) = &policy.owner_display_name {
+        root.insert("OwnerDisplayName".into(), json!(dn));
+    }
+    root.insert("Grant".into(), Value::Array(grants));
+    Value::Object(root).to_string()
+}
+
+/// Decode compact JSON policy; `None` if empty / invalid.
+pub fn decode_acl_json(raw: &str) -> Option<AccessControlPolicy> {
+    if raw.is_empty() {
+        return None;
+    }
+    let v: Value = serde_json::from_str(raw).ok()?;
+    let obj = v.as_object()?;
+    let owner_id = obj
+        .get("Owner")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let owner_display_name = obj
+        .get("OwnerDisplayName")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    let mut grants = Vec::new();
+    if let Some(arr) = obj.get("Grant").and_then(|x| x.as_array()) {
+        for g in arr {
+            let Some(go) = g.as_object() else {
+                continue;
+            };
+            let perm = go
+                .get("Permission")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let Some(permission) = normalize_permission(perm) else {
+                continue;
+            };
+            let grantee = if let Some(id) = go.get("ID").and_then(|x| x.as_str()) {
+                Grantee::Id {
+                    id: id.to_string(),
+                    display_name: go
+                        .get("DisplayName")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string()),
+                }
+            } else if let Some(uri) = go.get("URI").and_then(|x| x.as_str()) {
+                Grantee::Uri {
+                    uri: uri.to_string(),
+                }
+            } else if let Some(email) = go.get("EmailAddress").and_then(|x| x.as_str()) {
+                Grantee::Email {
+                    email: email.to_string(),
+                }
+            } else {
+                continue;
+            };
+            grants.push(Grant {
+                grantee,
+                permission,
+            });
+        }
+    }
+    Some(AccessControlPolicy {
+        owner_id,
+        owner_display_name,
+        grants,
+    })
+}
+
+/// Map AllUsers READ/WRITE grants onto Swift container ACL headers.
+pub fn apply_grants_to_container(headers: &mut HeaderKeyDict, grants: &[Grant]) {
+    let mut public_read = false;
+    let mut public_write = false;
+    for g in grants {
+        let is_all_users = matches!(&g.grantee, Grantee::Uri { uri } if uri == ALL_USERS);
+        if !is_all_users {
+            continue;
+        }
+        match g.permission.as_str() {
+            "READ" | "READ_ACP" => public_read = true,
+            "WRITE" | "WRITE_ACP" => public_write = true,
+            "FULL_CONTROL" => {
+                public_read = true;
+                public_write = true;
+            }
+            _ => {}
+        }
+    }
+    if public_read {
+        headers.set("X-Container-Read", ".r:*,.rlistings");
+    } else {
+        headers.set("X-Container-Read", "");
+    }
+    if public_write {
+        headers.set("X-Container-Write", ".r:*");
+    } else {
+        headers.set("X-Container-Write", "");
+    }
+}
+
+/// Store structured object ACL JSON (clears canned name meta).
+pub fn apply_object_acl_policy(headers: &mut HeaderKeyDict, policy: &AccessControlPolicy) {
+    headers.set(S3_OBJECT_ACL_JSON_META, encode_acl_json(policy));
+    headers.set(S3_OBJECT_ACL_META, "");
+}
+
+/// Store structured bucket ACL JSON + map AllUsers to container read/write.
+pub fn apply_bucket_acl_policy(headers: &mut HeaderKeyDict, policy: &AccessControlPolicy) {
+    headers.set(S3_BUCKET_ACL_JSON_META, encode_acl_json(policy));
+    apply_grants_to_container(headers, &policy.grants);
+}
+
+/// Build object ACP XML from response headers (JSON grants preferred, else canned).
+pub fn object_acl_xml_from_headers(owner_id: &str, headers: &HeaderKeyDict) -> Vec<u8> {
+    if let Some(raw) = headers
+        .get(S3_OBJECT_ACL_JSON_META)
+        .or_else(|| headers.get("X-Object-Meta-S3-Acl-Json"))
+    {
+        if let Some(mut policy) = decode_acl_json(raw) {
+            if policy.owner_id.is_empty() {
+                policy.owner_id = owner_id.to_string();
+            }
+            return access_control_policy_xml(&policy);
+        }
+    }
+    let canned = headers
+        .get(S3_OBJECT_ACL_META)
+        .or_else(|| headers.get("X-Object-Meta-S3-Acl"));
+    object_acl_xml_from_meta(owner_id, canned)
+}
+
+/// Build bucket ACP XML from headers (JSON grants preferred, else container ACL).
+pub fn bucket_acl_xml_from_headers(owner_id: &str, headers: &HeaderKeyDict) -> Vec<u8> {
+    if let Some(raw) = headers.get(S3_BUCKET_ACL_JSON_META) {
+        if let Some(mut policy) = decode_acl_json(raw) {
+            if policy.owner_id.is_empty() {
+                policy.owner_id = owner_id.to_string();
+            }
+            return access_control_policy_xml(&policy);
+        }
+    }
+    acl_xml_from_swift_headers(
+        owner_id,
+        headers.get("X-Container-Read"),
+        headers.get("X-Container-Write"),
+    )
+}
+
+/// Whether grants include AllUsers READ / FULL_CONTROL (S3 anonymous-read intent).
+///
+/// Pure helper — **not** wired into unauthenticated authorization.
+pub fn grants_allow_anonymous_read(grants: &[Grant]) -> bool {
+    grants.iter().any(|g| {
+        matches!(&g.grantee, Grantee::Uri { uri } if uri == ALL_USERS)
+            && matches!(g.permission.as_str(), "READ" | "FULL_CONTROL")
+    })
+}
+
+/// Resolved ACL input for PUT object/bucket (canned takes precedence).
+#[derive(Debug, Clone)]
+pub enum AclPutInput {
+    /// `x-amz-acl` canned name (wins over grants / body).
+    Canned(String),
+    /// Structured policy from grant headers and/or ACP body.
+    Policy(AccessControlPolicy),
+    /// No ACL material; caller may default to private for `?acl` PUT.
+    None,
+}
+
+/// Resolve ACL PUT input with AWS-like precedence: canned first, then grants,
+/// then ACP XML body.
+pub fn resolve_acl_put_input(
+    headers: &HeaderKeyDict,
+    body: Option<&[u8]>,
+    default_owner_id: &str,
+) -> Result<AclPutInput, String> {
+    if let Some(canned) = headers.get("X-Amz-Acl") {
+        // Canned wins even if grant headers / body present.
+        return Ok(AclPutInput::Canned(canned.to_string()));
+    }
+
+    let mut grants = Vec::new();
+    if has_grant_headers(headers) {
+        grants.extend(parse_grant_headers(headers)?);
+    }
+
+    let body_nonempty = body.is_some_and(|b| {
+        let t = std::str::from_utf8(b).unwrap_or("").trim();
+        !t.is_empty()
+    });
+    if body_nonempty {
+        let mut policy = parse_acp_xml(body.unwrap())?;
+        if policy.owner_id.is_empty() {
+            policy.owner_id = default_owner_id.to_string();
+        }
+        // Merge grant-header grants into body policy (headers already forbid
+        // canned+grants; body+grants is unusual — append header grants).
+        policy.grants.extend(grants);
+        return Ok(AclPutInput::Policy(policy));
+    }
+
+    if !grants.is_empty() {
+        return Ok(AclPutInput::Policy(AccessControlPolicy {
+            owner_id: default_owner_id.to_string(),
+            owner_display_name: Some(default_owner_id.to_string()),
+            grants,
+        }));
+    }
+
+    Ok(AclPutInput::None)
+}
+
+/// Apply resolved ACL input to object headers (sysmeta only).
+pub fn apply_object_acl_input(headers: &mut HeaderKeyDict, input: &AclPutInput) {
+    match input {
+        AclPutInput::Canned(c) => apply_object_canned_acl(headers, c),
+        AclPutInput::Policy(p) => apply_object_acl_policy(headers, p),
+        AclPutInput::None => {}
+    }
+}
+
+/// Apply resolved ACL input to bucket/container headers.
+pub fn apply_bucket_acl_input(headers: &mut HeaderKeyDict, input: &AclPutInput) {
+    match input {
+        AclPutInput::Canned(c) => apply_canned_acl(headers, c),
+        AclPutInput::Policy(p) => apply_bucket_acl_policy(headers, p),
+        AclPutInput::None => apply_canned_acl(headers, "private"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -788,5 +1324,185 @@ mod tests {
         assert!(xml.contains("https://a"));
         assert!(xml.contains("https://b"));
         assert!(xml.contains("<MaxAgeSeconds>9</MaxAgeSeconds>"));
+    }
+
+    #[test]
+    fn acp_xml_roundtrip_structured_grants() {
+        let body = br#"<?xml version="1.0" encoding="UTF-8"?>
+<AccessControlPolicy>
+  <Owner>
+    <ID>owner1</ID>
+    <DisplayName>owner1</DisplayName>
+  </Owner>
+  <AccessControlList>
+    <Grant>
+      <Grantee>
+        <ID>owner1</ID>
+        <DisplayName>owner1</DisplayName>
+      </Grantee>
+      <Permission>FULL_CONTROL</Permission>
+    </Grant>
+    <Grant>
+      <Grantee>
+        <URI>http://acs.amazonaws.com/groups/global/AllUsers</URI>
+      </Grantee>
+      <Permission>READ</Permission>
+    </Grant>
+    <Grant>
+      <Grantee>
+        <URI>http://acs.amazonaws.com/groups/global/AllUsers</URI>
+      </Grantee>
+      <Permission>WRITE_ACP</Permission>
+    </Grant>
+  </AccessControlList>
+</AccessControlPolicy>"#;
+        let policy = parse_acp_xml(body).unwrap();
+        assert_eq!(policy.owner_id, "owner1");
+        assert_eq!(policy.grants.len(), 3);
+        assert_eq!(policy.grants[0].permission, "FULL_CONTROL");
+        assert!(matches!(&policy.grants[0].grantee, Grantee::Id { id, .. } if id == "owner1"));
+        assert_eq!(policy.grants[1].permission, "READ");
+        assert!(matches!(
+            &policy.grants[1].grantee,
+            Grantee::Uri { uri } if uri == ALL_USERS
+        ));
+        assert_eq!(policy.grants[2].permission, "WRITE_ACP");
+
+        let json = encode_acl_json(&policy);
+        let dec = decode_acl_json(&json).unwrap();
+        assert_eq!(dec.owner_id, "owner1");
+        assert_eq!(dec.grants.len(), 3);
+
+        let xml = String::from_utf8(access_control_policy_xml(&dec)).unwrap();
+        assert!(xml.contains("AccessControlPolicy"));
+        assert!(xml.contains("<Permission>FULL_CONTROL</Permission>"));
+        assert!(xml.contains("<Permission>READ</Permission>"));
+        assert!(xml.contains("<Permission>WRITE_ACP</Permission>"));
+        assert!(xml.contains(ALL_USERS));
+        assert!(xml.contains("<ID>owner1</ID>"));
+        assert!(xml.contains("<Grant>"));
+    }
+
+    #[test]
+    fn grant_read_allusers_maps_public_read_container_headers() {
+        let mut h = HeaderKeyDict::new();
+        h.set(
+            "x-amz-grant-read",
+            "uri=http://acs.amazonaws.com/groups/global/AllUsers",
+        );
+        let grants = parse_grant_headers(&h).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert!(grants_allow_anonymous_read(&grants));
+
+        let policy = AccessControlPolicy {
+            owner_id: "owner".into(),
+            owner_display_name: Some("owner".into()),
+            grants: {
+                let mut g = vec![Grant {
+                    grantee: Grantee::Id {
+                        id: "owner".into(),
+                        display_name: Some("owner".into()),
+                    },
+                    permission: "FULL_CONTROL".into(),
+                }];
+                g.extend(grants);
+                g
+            },
+        };
+        let mut out = HeaderKeyDict::new();
+        apply_bucket_acl_policy(&mut out, &policy);
+        assert_eq!(
+            out.get("X-Container-Read"),
+            Some(".r:*,.rlistings")
+        );
+        assert_eq!(out.get("X-Container-Write"), Some(""));
+        assert!(out
+            .get(S3_BUCKET_ACL_JSON_META)
+            .is_some_and(|v| v.contains("AllUsers")));
+
+        // GET reconstruction from stored meta.
+        let xml = String::from_utf8(bucket_acl_xml_from_headers("owner", &out)).unwrap();
+        assert!(xml.contains("<Permission>READ</Permission>"));
+        assert!(xml.contains(ALL_USERS));
+    }
+
+    #[test]
+    fn object_acp_json_store_and_get_xml() {
+        let policy = parse_acp_xml(
+            br#"<AccessControlPolicy>
+  <Owner><ID>o</ID><DisplayName>o</DisplayName></Owner>
+  <AccessControlList>
+    <Grant>
+      <Grantee><ID>o</ID></Grantee>
+      <Permission>FULL_CONTROL</Permission>
+    </Grant>
+    <Grant>
+      <Grantee><URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee>
+      <Permission>READ</Permission>
+    </Grant>
+  </AccessControlList>
+</AccessControlPolicy>"#,
+        )
+        .unwrap();
+        let mut h = HeaderKeyDict::new();
+        apply_object_acl_policy(&mut h, &policy);
+        assert!(h.get(S3_OBJECT_ACL_JSON_META).is_some_and(|v| !v.is_empty()));
+        assert_eq!(h.get(S3_OBJECT_ACL_META), Some(""));
+
+        let xml = String::from_utf8(object_acl_xml_from_headers("o", &h)).unwrap();
+        assert!(xml.contains("<Grant>"));
+        assert!(xml.contains("<Permission>FULL_CONTROL</Permission>"));
+        assert!(xml.contains("<Permission>READ</Permission>"));
+        assert!(xml.contains(ALL_USERS));
+    }
+
+    #[test]
+    fn canned_takes_precedence_over_grant_headers() {
+        let mut h = HeaderKeyDict::new();
+        h.set("x-amz-acl", "private");
+        h.set(
+            "x-amz-grant-read",
+            "uri=\"http://acs.amazonaws.com/groups/global/AllUsers\"",
+        );
+        let input = resolve_acl_put_input(&h, None, "owner").unwrap();
+        match input {
+            AclPutInput::Canned(c) => assert_eq!(c, "private"),
+            _ => panic!("expected canned"),
+        }
+    }
+
+    #[test]
+    fn parse_grant_header_list_form() {
+        let grants = parse_grant_header_value(
+            r#"id="user-a",uri="http://acs.amazonaws.com/groups/global/AllUsers""#,
+            "read",
+        )
+        .unwrap();
+        assert_eq!(grants.len(), 2);
+        assert!(matches!(&grants[0].grantee, Grantee::Id { id, .. } if id == "user-a"));
+        assert!(matches!(&grants[1].grantee, Grantee::Uri { uri } if uri == ALL_USERS));
+        assert_eq!(grants[0].permission, "READ");
+    }
+
+    #[test]
+    fn resolve_grant_headers_to_policy() {
+        let mut h = HeaderKeyDict::new();
+        h.set(
+            "x-amz-grant-full-control",
+            "id=owner",
+        );
+        h.set(
+            "x-amz-grant-read",
+            "uri=http://acs.amazonaws.com/groups/global/AllUsers",
+        );
+        let input = resolve_acl_put_input(&h, None, "owner").unwrap();
+        match input {
+            AclPutInput::Policy(p) => {
+                assert_eq!(p.owner_id, "owner");
+                assert!(p.grants.iter().any(|g| g.permission == "FULL_CONTROL"));
+                assert!(p.grants.iter().any(|g| g.permission == "READ"));
+            }
+            _ => panic!("expected policy"),
+        }
     }
 }

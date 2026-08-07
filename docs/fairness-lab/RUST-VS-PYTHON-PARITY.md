@@ -81,18 +81,18 @@
 | Canned bucket ACL (`private` / `public-read` / `public-read-write`) | ✅ | ✅ | `x-amz-acl` → `X-Container-Read/Write`; unit |
 | Object canned ACL store + GET `?acl` | ✅ | ✅ | `x-amz-acl` → `X-Object-Sysmeta-S3-Acl`; unit 2026-08-07; **not** anonymous Swift GET by itself |
 | Multi-rule CORS put/get | ✅ | ✅ |
-| Lifecycle Expiration **execution** | ✅ | ✅ | Enabled Days/Date → `X-Delete-At` on PUT (`impl-s3-lifecycle-exec-20260807`)
-| Object Lock WORM (legal-hold/retention) | ✅ | ✅ | blocks DELETE/overwrite (`impl-s3-object-lock-worm-20260807`) compact `X-Container-Meta-S3-Cors` + first-rule stamps; unit `cors_multi_rule_*` 2026-08-07 |
+| Lifecycle Expiration **execution** | ✅ | ✅ | Enabled Days/Date → `X-Delete-At` on PUT; **Transition** meta stamps + **AbortIncompleteMPU** marker delete-at (`impl-lifecycle-transitions-20260807`) |
+| Object Lock WORM (legal-hold/retention) | ✅ | ✅ | blocks DELETE/overwrite; **GOVERNANCE bypass** via `x-amz-bypass-governance-retention` (`impl-worm-governance-bypass`); COMPLIANCE/legal-hold still hard-block |
 | s3token → Keystone /v3/s3tokens | ✅ | ✅ | live EC2 GREEN 2026-08-06 |
 | SigV2 | ✅ | ❌ | **WONTFIX** — stable **501** `Code=NotImplemented` (unit header+query) |
-| aws-chunked / STREAMING-* | ✅ | ✅ | dechunk after SigV4 header verify; per-chunk sig residual; unit `aws_chunked_*_dechunks_to_backend` |
+| aws-chunked / STREAMING-* | ✅ | ✅ | dechunk after SigV4 header verify; **per-chunk HMAC enforced** → `SignatureDoesNotMatch` (`impl-chunk-sig-enforce` / priority-unimpl-wave-20260807) |
 | Multi-version object data plane | ✅ | ✅ | archive `{bucket}+versions`; versionId GET/DELETE; delete-marker; ListVersions (`impl-s3-multiversion-data-20260807`)
 | Versioning status GET/PUT | ✅ | ✅ | meta `X-Container-Meta-S3-Versioning`; unit `versioning_put_get_round_trip` `impl-s3-versioning-surface-20260807` |
-| List object versions (`?versions`) | ✅ | ⚠️ | empty `ListVersionsResult` only — multi-version bodies **residual** |
+| List object versions (`?versions`) | ✅ | ✅ | `ListVersionsResult` from `{bucket}+versions` indexes; empty only when versions container 404 |
 | Tagging GET/PUT/DELETE (bucket + object) | ⚠️ (GET empty / PUT NotImpl) | ✅ | meta TagSet round-trip; unit `*_tagging_*_round_trip` |
 | Lifecycle GET/PUT/DELETE | ❌ / limited | ✅ | raw XML in container meta; unit `lifecycle_put_get_delete_round_trip` (no expirer) |
 | Object-lock config GET/PUT | ❌ GET not-found / PUT NotImpl | ✅ | raw XML meta round-trip; unit `object_lock_put_get_round_trip` (no WORM) |
-| Full IAM / grant-header ACL / ACP XML body PUT | ✅ | ❌ | **RESIDUAL — not implemented**; canned only; do **not** claim KEEP |
+| Full IAM / grant-header ACL / ACP XML body PUT | ✅ | ⚠️ | **store/GET KEEP** (grant headers + ACP XML → JSON sysmeta + AllUsers→container ACL); grant **enforcement** residual; canned still wins (`impl-grant-acp-acl` / priority-unimpl-wave-20260807) |
 | authenticated-read / log-delivery-write canned | ❌ / NotImpl | ❌ | map to private; no AuthenticatedUsers Swift ACL |
 
 ---
@@ -167,7 +167,7 @@
 |--------|-------------|----------------------------------|
 | Swift v1 core CRUD + common middleware | **Most** | full arbitrary Paste; SLO async ACL/hash_path residual |
 | Auth | TempAuth + Keystone lab | Production-only ops polish |
-| S3 | SigV4 + MPU + canned ACL + multi-rule CORS + **aws-chunked dechunk** + versioning/tagging/lifecycle/object-lock **subresource APIs** (unit 117/117) | SigV2 **WONTFIX 501**; full multi-version object bodies residual; full IAM ACP residual |
+| S3 | SigV4 + MPU + canned ACL + multi-rule CORS + **aws-chunked + chunk-sig enforce** + versioning/lifecycle Transition/WORM governance bypass + grant/ACP store (unit **176/176**) | SigV2 **WONTFIX 501**; ACP grant **enforcement** residual; real Transition tiering residual |
 | EC | Data path + heal | macOS/default build; some EC throttling niceties |
 | Sharding L3b | CLI + daemon ring-part cleave + fan-out + ×4 Contabo; **product-style 40×4KB KEEP** on SHARDED `shrinklab` (HEAD=list, GET 5/5) `priority-wave-20260806` | Python对照 / multi-hour soak / multi-primary auto-shrink **未宣称** |
 | Crypto at-rest middleware | multi-root + listing + range GET + etag mask + **chunked PUT encrypt** | KMIP; ciphertext still buffered (footer residual) |

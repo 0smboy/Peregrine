@@ -22,8 +22,8 @@
 //! query auth).
 //!
 //! aws-chunked body framing is decoded in [`crate::aws_chunked`] (middleware
-//! dechunks PUT/POST). Optional per-chunk HMAC verification lives there as a
-//! residual; this module only handles the **header** SigV4 signature (where
+//! dechunks PUT/POST and enforces per-chunk HMAC for signed streaming modes).
+//! This module only handles the **header** SigV4 signature (where
 //! `X-Amz-Content-SHA256` is the literal `STREAMING-*` token).
 //!
 //! What is NOT here: SigV2 (middleware returns stable `501 NotImplemented`).

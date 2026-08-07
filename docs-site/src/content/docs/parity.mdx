@@ -13,7 +13,7 @@ implemented.** Product and fairness claims must stay inside what is green here.
 Canonical long form in-repo:
 [`docs/fairness-lab/RUST-VS-PYTHON-PARITY.md`](https://github.com/0smboy/Peregrine/blob/main/docs/fairness-lab/RUST-VS-PYTHON-PARITY.md).
 
-**As of 2026-08-06 · Contabo lab · LAB-HARD-GREEN · not PRODUCTION-GO-LIVE.**
+**As of 2026-08-07 · Contabo lab · LAB-HARD-GREEN · not PRODUCTION-GO-LIVE.**
 
 ## Headline
 
@@ -21,9 +21,10 @@ Canonical long form in-repo:
 |------|--------|
 | Swift v1 core CRUD + common middleware | **Mostly implemented** |
 | TempAuth + Keystone lab + EC + S3 core/MPU + bulk upload | **Implemented (lab-proven)** |
+| S3 aws-chunked (chunk-sig enforce) + multi-version + lifecycle Transition/AbortMPU + WORM governance bypass + grant/ACP store | **Implemented (unit 176/176)** |
 | container-sync filter+daemon / at-rest crypto middleware (on-by-config) | **Implemented (unit/path)** |
 | Multi-node container sharding KEEP (live product) | **Not implemented** (strict) |
-| Full arbitrary Paste / SigV2 / KMIP / operator TLS go-live | **Not implemented** |
+| Full arbitrary Paste / SigV2 / KMIP / operator TLS go-live / ACP grant enforcement | **Not implemented** |
 
 ## Swift REST (v1)
 
@@ -58,8 +59,13 @@ Canonical long form in-repo:
 | SigV4 CRUD, List v1/v2, MultiDelete, MPU path, ListMPU, ListParts | yes | yes (lab) |
 | s3token / EC2 → Keystone | yes | yes (lab) |
 | Canned ACL + multi-rule CORS + object ?acl | yes | yes |
-| SigV2, aws-chunked, versioning/tagging/lifecycle | yes | **no** (wontfix; stable 501) |
-| Full IAM / object ACL XML | yes | **no** |
+| aws-chunked / STREAMING-* (per-chunk HMAC enforced) | yes | yes (unit) |
+| Versioning + multi-version data plane + ListVersions | yes | yes (unit) |
+| Lifecycle Expiration exec + Transition meta + AbortIncompleteMPU | yes | yes (unit; no tiering backend) |
+| Object Lock WORM + GOVERNANCE bypass header | yes | yes (unit; COMPLIANCE/legal-hold hard-block) |
+| Grant-header + ACP XML body store/GET | yes | yes (store/GET; enforcement residual) |
+| SigV2 | yes | **no** (WONTFIX 501) |
+| Full IAM identity + ACP grant **enforcement** on ops | yes | **no** |
 
 ## EC & consistency
 
