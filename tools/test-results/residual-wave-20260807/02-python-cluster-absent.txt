@@ -1,0 +1,3 @@
+=== Python formal cluster residual 2026-08-07 ===
+PYTHON_CLUSTER_ABSENT — formal 4-node openstack-swift Performance cluster not deployed on Contabo
+Rust vs Python L3b product对照: NOT CLAIMABLE

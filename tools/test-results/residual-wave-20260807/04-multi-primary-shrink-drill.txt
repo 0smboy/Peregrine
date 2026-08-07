@@ -1,0 +1,25 @@
+# Multi-primary shrink residual drill · 2026-08-07
+
+## API health
+- shrinklab1786029572 head=100 list=100
+- l3bclean1786024121 head=170 list=170
+
+## shard_range (table name is singular, not shard_ranges)
+### swift1 (10.0.4.1) shrinklab root
+- STAT object_count=0 (sharded root empty of objects)
+- BY_STATE: ACTIVE(40)×1 obj=20, own SHARDED(70)×1; donor SHRUNK(80) deleted=1
+- Prior lab shrink already completed on this replica
+
+### peers 10.0.4.3 / 10.0.4.4 shrinklab root
+- STAT object_count=100 (stale root row counts — product objects live in shards)
+- BY_STATE for deleted=0: **empty** — range table not present/replicated on these replicas
+- Multi-primary residual: root shard_range rows not fully replicated to all primaries
+  → process_shrinking_donors cannot run on those nodes without co-locate/repair
+
+### l3bclean on swift1
+- ACTIVE acceptor 90 objs; donor SHRUNK; matches prior co-locate KEEP
+
+## VERDICT_MULTI_PRIMARY_AUTO_SHRINK=RESIDUAL
+- Local/co-locate shrink KEEP already claimed (l3b-shrink-20260806)
+- Automatic shrink when SHRINKING ranges only on nodes without donor data: still not claimed
+- New evidence: peer root replicas missing live range rows (04b-shard-range-inspect.txt)

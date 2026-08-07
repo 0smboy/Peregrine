@@ -1,0 +1,5 @@
+=== multi-cluster sync residual 2026-08-07 ===
+Same-cluster KEEP prior: sync-smoke-20260806d
+Realms conf: absent on Contabo (priority-wave-20260806/03)
+Requires second cluster endpoint + realm keys
+VERDICT=RESIDUAL_MULTI_CLUSTER

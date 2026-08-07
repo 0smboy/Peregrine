@@ -187,9 +187,9 @@ Rust is a **strong core-path + lab-proven** Swift, **not** a drop-in “full Ope
 | L3b CLI enable + epoch DB | **PASS** after set_sharding_state fix |
 | L3b sharder cleave creates shard DBs | **PASS lab** (`l3bkeep…`, shard DBs present) |
 | L3b listing KEEP post-cleave | **LAB CLEAN PASS** listed 60 no relocate (`l3b-clean-e2e-20260806`); post-shard 4KB PUT→list (`l3b-4kb-keep-20260806`); wave2 30×4KB (`l3b-4kb-wave2-20260806`); **priority-wave 40×4KB product KEEP** + VIP `-k` path (`priority-wave-20260806`); multi-hour soak **not claimed** |
-| container-sync Contabo same-cluster | **KEEP** puts=28 fails=0 dst 5/5 GET (`sync-smoke-20260806d`); multi-cluster soak **residual** (no realms conf / second cluster) |
+| container-sync Contabo same-cluster | **KEEP** puts=28 fails=0 (`sync-smoke-20260806d`); **re-verify KEEP 2026-08-07** when daemon runs on SRC primary (`residual-wave-20260807/08`); multi-cluster soak **residual** (no realms) |
 | compact / activate_cleaved | CLI + unit; lab CLEAVED→ACTIVE→SHRINKING mark (`l3b-compact-20260806`) |
-| sharder shrink + HEAD counts | **LAB KEEP** shrinklab 20→SHRUNK+acceptor 20 + GET 20/20 (`l3b-shrink-20260806`); multi-primary remote shrink residual (roots multi-node present — `priority-wave-20260806/04b`) |
+| sharder shrink + HEAD counts | **LAB KEEP** shrinklab 20→SHRUNK+acceptor 20 + GET 20/20 (`l3b-shrink-20260806`); multi-primary auto-shrink **residual** — peer roots can lack live `shard_range` rows (`residual-wave-20260807/04b`) |
 | TLS Contabo dry-run | **LAB self-signed** (`tls-dry-run-20260806` + `priority-wave-20260806`) |
 | Operator TLS PEM live apply | **deferred** → blocks PRODUCTION-GO-LIVE |
 

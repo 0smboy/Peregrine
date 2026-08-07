@@ -22,7 +22,7 @@ These items explain why Contabo/deploy cannot mirror full Python ansible.
 | Keystone / MariaDB on Contabo | Identity infra absent; VIP stays TempAuth | Medium — code path PARTIAL; live cutover FROZEN without external Keystone |
 | Full S3 API (SigV2 / aws-chunked / versioning WONTFIX; full IAM ACL; Contabo VIP enable) | Beyond unit stop-line | Medium — see wave3-s3-l3b-prod matrix; [S3-ON-BY-CONFIG.md](S3-ON-BY-CONFIG.md) |
 | Continuous auditor SLA | — | **DONE (P2b)** — continuous systemd daemons (object interval=30, DB=1800); nightly timer disabled; see `tools/test-results/p2b-audit-20260804/` + AUDITOR-SLA.md |
-| container-sync full proxy filter + daemon path | — | **DONE path (2026-08-06)** — proxy filter + `swift-container-sync` daemon; multi-cluster live soak not claimed |
+| container-sync full proxy filter + daemon path | — | **DONE path (2026-08-06)** + **re-verify KEEP 2026-08-07** on SRC primary (`residual-wave-20260807`); multi-cluster realm soak not claimed; ops: run daemon on all nodes holding containers |
 | `workers` prefork semantics | Integer knobs mislead A/B | **DONE (P2c)** — WORKERS-SEMANTICS.md + `swift-effective-concurrency` / `effective-concurrency.py` + library `effective_concurrency` |
 | Keepalived inside bundle-rust | Was Contabo-only overlay | **DONE (build/phase1)** — `rust_keepalived` + workspace allows `ingress.mode=keepalived` |
 | HAProxy TLS termination (`lb_mode=https`) | Client HTTPS at VIP | **DONE (P3-ops code)** — Contabo VIP **:8085 ssl live** with lab self-signed `haproxyCA.pem` (`priority-wave-20260806`); operator PEM still deferred → PRODUCTION-GO-LIVE blocked |

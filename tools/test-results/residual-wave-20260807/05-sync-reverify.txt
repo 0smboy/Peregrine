@@ -1,0 +1,23 @@
+# Same-cluster container-sync re-verify · 2026-08-07
+
+## Attempt 1 (FAIL — wrong Sync-To prefix //)
+SRC=syncrev1786075304 Sync-To=//127.0.0.1:8080/... → daemon skipped/invalid for full path.
+Also only ran sync on swift1 while SRC primary is multi-node.
+
+## Attempt 2 (meta OK, sync only on swift1 → FAIL)
+SRC=syncrev1786075406 Sync-To=http://127.0.0.1:8080/v1/AUTH_test/syncrevdst...
+Meta HEAD shows Sync-To+Key; puts=5; dst still 0 when sync only on swift1 (handoff).
+
+## Attempt 3 KEEP (08-sync-swift2-once.txt)
+SRC primaries: 10.0.4.2,3,4 (part 10395). Ran swift-container-sync once on **swift2**.
+- sync_links on swift2 include syncrev1786075406 (5 objs)
+- post-run: x_container_sync_point1=5 point2=-1
+- API dst Object-Count=5; GET obj1..obj5 all 200 body=payload-N
+VERDICT=SAME_CLUSTER_SYNC_REVERIFY_KEEP
+
+## Ops lesson
+container-sync must run on nodes that hold the source container DB
+(sync_containers index is local). Deploy continuous unit on all 4, not once-on-swift1.
+
+## Multi-cluster
+Still RESIDUAL: no container-sync-realms.conf; single LAB cluster.

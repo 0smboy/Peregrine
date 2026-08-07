@@ -1,0 +1,49 @@
+=== TLS operator path status 2026-08-07T03:56Z ===
+script: tools/ops/apply-vip-tls-pem.sh
+executable=YES
+Usage: apply-vip-tls-pem.sh [options]
+
+Install/validate HAProxy VIP TLS PEM (cert+key concatenated).
+
+Options:
+  --pem PATH           Source PEM (or env SWIFT_TLS_PEM)
+  --dest PATH          Dest on target (default: /etc/haproxy/haproxyCA.pem
+                       or env HAPROXY_TLS_PEM)
+  --local              Install on this host
+  --ssh HOST[,HOST…]   Install via SSH to listed hosts (explicit only;
+                       Contabo: swift1,swift2,swift3,swift4 or public IPs
+                       from tools/CONTABO-CLUSTER.md — never auto-discovered)
+  --reload             Reload/restart haproxy after install
+  --check              Validate PEM only; no install
+  --dry-run            Print actions; do not write, scp, or restart
+  --print-commands     Print exact install/systemctl commands (no mutation;
+                       combine with --ssh + --dry-run for Contabo runbooks)
+  --no-backup          Skip timestamped backup of existing dest PEM
+  --no-rotation-log    Skip /etc/haproxy/TLS-ROTATION.txt stamp
+  -h, --help           This help
+
+Env:
+  SWIFT_TLS_PEM    Source PEM path
+  HAPROXY_TLS_PEM  Dest PEM path
+  SSH_OPTS         Extra ssh/scp options
+
+Examples:
+  ./tools/ops/apply-vip-tls-pem.sh --pem ./vip.fullchain.pem --check
+  sudo SWIFT_TLS_PEM=./vip.fullchain.pem ./tools/ops/apply-vip-tls-pem.sh --local --reload
+  ./tools/ops/apply-vip-tls-pem.sh --pem ./vip.fullchain.pem --ssh swift1,swift2 --reload
+  ./tools/ops/apply-vip-tls-pem.sh --pem ./vip.fullchain.pem --ssh swift1 --print-commands
+  ./tools/ops/apply-vip-tls-pem.sh --pem /secure/vip.pem \
+      --ssh swift1,swift2,swift3,swift4 --reload --dry-run --print-commands
+  ./tools/ops/apply-vip-tls-pem.sh --pem /secure/vip.pem \
+      --ssh 169.58.108.85,169.58.108.86,169.58.108.87,169.58.108.121 \
+      --reload --dry-run --print-commands
+
+Safety:
+  - No secrets are written into the repo.
+  - Contabo is never touched unless you pass --ssh <hosts>.
+--- dry-run without PEM (expect error) ---
+[1;31mERROR[0m no PEM path (pass --pem or set SWIFT_TLS_PEM)
+--- with fake empty check ---
+[1;31mERROR[0m PEM missing BEGIN CERTIFICATE block: /tmp/fake-op.pem
+OPERATOR_PEM_PRESENT=NO
+PRODUCTION_GO_LIVE=BLOCKED

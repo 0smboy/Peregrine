@@ -1,0 +1,27 @@
+hostname=swift2
+sync_links=24
+SYNCED ('syncprobe1786025724', 2) md= {"X-Container-Sync-To": ["http://127.0.0.1:8080/v1/AUTH_test/syncprobedst1786025724", "1786025727.28996"], "X-Container-Sync-Key": ["key1786025724", "1786025727 path= /srv/node/d2/containers/3420/d5d/3570716baf1a2a32581187f383b46d5d/3570716baf1a2a32581187f383b46d5d.db
+SYNCED ('synce2e1786026210', 3) md= {"X-Container-Sync-To": ["http://127.0.0.1:8080/v1/AUTH_test/synce2edst1786026210", "1786026234.01604"], "X-Container-Sync-Key": ["key1786026210", "1786026234.0 path= /srv/node/d2/containers/3680/434/39830270c7c8be9f9c5e3ebbe073d434/39830270c7c8be9f9c5e3ebbe073d434.db
+SYNCED ('syncfix1786026418', 5) md= {"X-Container-Sync-To": ["http://127.0.0.1:8080/v1/AUTH_test/syncfixdst1786026418", "1786026419.55149"], "X-Container-Sync-Key": ["k1786026418", "1786026419.551 path= /srv/node/d2/containers/14277/d5c/df150f6ceff8d9b7a6ba01fda4ac8d5c/df150f6ceff8d9b7a6ba01fda4ac8d5c.db
+SYNCED ('syncok1786026888', 3) md= {"X-Container-Sync-To": ["http://127.0.0.1:8080/v1/AUTH_test/syncokdst1786026888", "1786026890.81806"], "X-Container-Sync-Key": ["k1786026888", "1786026890.8180 path= /srv/node/d2/containers/3184/259/31c10bca560b0d737e32402e1caa6259/31c10bca560b0d737e32402e1caa6259.db
+SYNCED ('syncrev1786075304', 5) md= {"X-Container-Sync-To": ["//127.0.0.1:8080/v1/AUTH_test/syncrevdst1786075304", "1786075308.45814"], "X-Container-Sync-Key": ["lab-sync-key-2026", "1786075308.45 path= /srv/node/d2/containers/12685/70c/c635f4f82883f3d9eb156244a76af70c/c635f4f82883f3d9eb156244a76af70c.db
+SYNCED ('syncrev1786075406', 5) md= {"X-Container-Sync-To": ["http://127.0.0.1:8080/v1/AUTH_test/syncrevdst1786075406", "1786075407.28866"], "X-Container-Sync-Key": ["key1786075406", "1786075407.2 path= /srv/node/d2/containers/10395/ce6/a26c4b09133ecb880909f1356b783ce6/a26c4b09133ecb880909f1356b783ce6.db
+=== run_once with stats print ===
+exit=0
+/tmp/swift-container-sync.new
+total 12
+drwxr-xr-x.  2 root root   70 Aug  7 04:10 .
+drwxr-xr-x. 11 root root  125 Aug  1 13:05 ..
+-rw-r--r--.  1 root root  528 Aug  7 04:10 account.recon
+-rw-r--r--.  1 root root 1117 Aug  7 04:10 container.recon
+-rw-r--r--.  1 root root  685 Aug  7 04:10 object.recon
+stat ('syncrev1786075406', 5, 5, -1)
+md {"X-Container-Sync-To": ["http://127.0.0.1:8080/v1/AUTH_test/syncrevdst1786075406", "1786075407.28866"], "X-Container-Sync-Key": ["key1786075406", "1786075407.28866"]}
+objs [('obj1', 0), ('obj2', 0), ('obj3', 0), ('obj4', 0), ('obj5', 0)]
+HTTP/1.1 204 No Content
+X-Container-Object-Count: 5
+GET obj1=200 body=payload-1
+GET obj2=200 body=payload-2
+GET obj3=200 body=payload-3
+GET obj4=200 body=payload-4
+GET obj5=200 body=payload-5

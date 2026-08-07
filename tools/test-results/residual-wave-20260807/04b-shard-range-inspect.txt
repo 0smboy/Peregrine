@@ -1,0 +1,25 @@
+=== shard_range table (singular) on known roots ===
+FILE /srv/node/d2/containers/7602/02f/76c9fdade2ec5b7a703159d5e3ed902f/76c9fdade2ec5b7a703159d5e3ed902f_1786029685.60302.db
+STAT ('shrinklab1786029572', 0)
+TABLES ['outgoing_sync', 'incoming_sync', 'object', 'sqlite_sequence', 'policy_stat', 'container_info', 'shard_range']
+BY_STATE [(40, 1, 20), (70, 1, 0)]
+R ('AUTH_test/shrinklab1786029572', 70, 0, 0, '', '')
+R ('.shards_AUTH_test/shrinklab1786029572-5cfca782b224051f99ff5ae103f9a779-1786029685.59828-0', 80, 0, 1, '', 'obj10')
+R ('.shards_AUTH_test/shrinklab1786029572-5cfca782b224051f99ff5ae103f9a779-1786029685.59828-1', 40, 20, 0, '', '')
+FILE /srv/node/d2/containers/6743/638/695c2176777150c5c73835e396470638/695c2176777150c5c73835e396470638_1786024284.59133.db
+STAT ('l3bclean1786024121', 80)
+TABLES ['outgoing_sync', 'incoming_sync', 'object', 'sqlite_sequence', 'policy_stat', 'container_info', 'shard_range']
+BY_STATE [(40, 1, 90), (70, 1, 0)]
+R ('AUTH_test/l3bclean1786024121', 70, 0, 0, '', '')
+R ('.shards_AUTH_test/l3bclean1786024121-815a38031d52721fb04aab88c265a2d2-1786024284.57675-0', 80, 0, 1, '', 'obj-00030')
+R ('.shards_AUTH_test/l3bclean1786024121-815a38031d52721fb04aab88c265a2d2-1786024284.57675-1', 40, 90, 0, '', '')
+=== peer 10.0.4.3 shrinklab root ===
+FILE /srv/node/d2/containers/7602/02f/76c9fdade2ec5b7a703159d5e3ed902f/76c9fdade2ec5b7a703159d5e3ed902f.db
+STAT ('shrinklab1786029572', 100)
+TABLES ['outgoing_sync', 'incoming_sync', 'object', 'sqlite_sequence', 'policy_stat', 'container_info', 'shard_range']
+BY_STATE []
+=== peer 10.0.4.4 shrinklab root ===
+FILE /srv/node/d2/containers/7602/02f/76c9fdade2ec5b7a703159d5e3ed902f/76c9fdade2ec5b7a703159d5e3ed902f.db
+STAT ('shrinklab1786029572', 100)
+TABLES ['outgoing_sync', 'incoming_sync', 'object', 'sqlite_sequence', 'policy_stat', 'container_info', 'shard_range']
+BY_STATE []

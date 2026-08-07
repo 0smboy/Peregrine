@@ -1,0 +1,37 @@
+=== sync_containers index local ===
+/srv/node/d2/sync_containers/4018/72c/3ec98e42c91a7ae9a2f559287d31e72c/3ec98e42c91a7ae9a2f559287d31e72c.db
+/srv/node/d2/sync_containers/2858/719/2caac3945c54480b8bfc938eb39af719/2caac3945c54480b8bfc938eb39af719.db
+/srv/node/d2/sync_containers/3420/d5d/3570716baf1a2a32581187f383b46d5d/3570716baf1a2a32581187f383b46d5d.db
+/srv/node/d2/sync_containers/3680/434/39830270c7c8be9f9c5e3ebbe073d434/39830270c7c8be9f9c5e3ebbe073d434.db
+/srv/node/d2/sync_containers/14277/d5c/df150f6ceff8d9b7a6ba01fda4ac8d5c/df150f6ceff8d9b7a6ba01fda4ac8d5c.db
+/srv/node/d2/sync_containers/9762/c57/988a46992d71784d5bb5d9e0a09fec57/988a46992d71784d5bb5d9e0a09fec57.db
+/srv/node/d2/sync_containers/3184/259/31c10bca560b0d737e32402e1caa6259/31c10bca560b0d737e32402e1caa6259.db
+/srv/node/d2/sync_containers/5934/bc5/5cbbb461c63fa340699b9136abe7bbc5/5cbbb461c63fa340699b9136abe7bbc5.db
+/srv/node/d2/sync_containers/12685/70c/c635f4f82883f3d9eb156244a76af70c/c635f4f82883f3d9eb156244a76af70c.db
+count=9
+Partition	10395
+Hash	a26c4b09133ecb880909f1356b783ce6
+Server:Port Device	10.0.4.2:6201 d2
+Server:Port Device	10.0.4.3:6201 d2
+Server:Port Device	10.0.4.4:6201 d2
+Server:Port Device	10.0.4.1:6201 d2	 # [Handoff]
+=== locate syncrev1786075406 on 10.0.4.1 ===
+SYNC_LINKS=36
+('AUTH_test', 'syncrevdst1786075406', 0) /srv/node/d2/containers/16018/01d/fa496808a799d941b4c031740708e01d/fa496808a799d941b4c031740708e01d.db
+META {"X-Container-Sync-Key": ["key1786075406", "1786075407.37447"]}
+=== locate syncrev1786075406 on 10.0.4.2 ===
+SYNC_LINKS=24
+('AUTH_test', 'syncrev1786075406', 5) /srv/node/d2/containers/10395/ce6/a26c4b09133ecb880909f1356b783ce6/a26c4b09133ecb880909f1356b783ce6.db
+META {"X-Container-Sync-To": ["http://127.0.0.1:8080/v1/AUTH_test/syncrevdst1786075406", "1786075407.28866"], "X-Container-Sync-Key": ["key1786075406", "1786075407.28866"]}
+=== locate syncrev1786075406 on 10.0.4.3 ===
+SYNC_LINKS=28
+('AUTH_test', 'syncrev1786075406', 5) /srv/node/d2/containers/10395/ce6/a26c4b09133ecb880909f1356b783ce6/a26c4b09133ecb880909f1356b783ce6.db
+META {"X-Container-Sync-To": ["http://127.0.0.1:8080/v1/AUTH_test/syncrevdst1786075406", "1786075407.28866"], "X-Container-Sync-Key": ["key1786075406", "1786075407.28866"]}
+('AUTH_test', 'syncrevdst1786075406', 0) /srv/node/d2/containers/16018/01d/fa496808a799d941b4c031740708e01d/fa496808a799d941b4c031740708e01d.db
+META {"X-Container-Sync-Key": ["key1786075406", "1786075407.37447"]}
+=== locate syncrev1786075406 on 10.0.4.4 ===
+SYNC_LINKS=24
+('AUTH_test', 'syncrev1786075406', 5) /srv/node/d2/containers/10395/ce6/a26c4b09133ecb880909f1356b783ce6/a26c4b09133ecb880909f1356b783ce6.db
+META {"X-Container-Sync-To": ["http://127.0.0.1:8080/v1/AUTH_test/syncrevdst1786075406", "1786075407.28866"], "X-Container-Sync-Key": ["key1786075406", "1786075407.28866"]}
+('AUTH_test', 'syncrevdst1786075406', 0) /srv/node/d2/containers/16018/01d/fa496808a799d941b4c031740708e01d/fa496808a799d941b4c031740708e01d.db
+META {"X-Container-Sync-Key": ["key1786075406", "1786075407.37447"]}
