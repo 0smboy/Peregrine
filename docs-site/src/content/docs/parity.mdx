@@ -80,12 +80,13 @@ Canonical long form in-repo:
 | Operator VIP TLS PEM ops path | yes | yes (script); Contabo still lab self-signed |
 | object/account/container replicators, expirer, auditors, recon | yes | yes |
 
-## Lab evidence (Contabo, 2026-08-06)
+## Lab evidence (Contabo, 2026-08-06 + residual wave 2026-08-07)
 
 - TempAuth func VIP **54/54**; soak **1h fail=0**
 - Python `:8090` ×3 **54/54** each
 - S3 MPU deep **11/11**; EC2 SigV4 **green**
 - VIP failover **pass**; EC heal fragment restore **pass** after fix
+- **2026-08-07 P0 residual wave:** `cargo test -p swift-s3api --lib` **176/176** (chunk-sig enforce, WORM governance bypass, grant/ACP store, lifecycle Transition + AbortIncompleteMPU). Evidence: `tools/test-results/priority-unimpl-wave-20260807/`
 - Operator TLS PEM **deferred** → not production go-live
 
 ## Offline one-click (SAIO + console)
