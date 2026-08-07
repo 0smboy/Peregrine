@@ -1,8 +1,16 @@
-    Blocking waiting for file lock on package cache
-    Blocking waiting for file lock on package cache
-    Blocking waiting for file lock on package cache
-    Blocking waiting for file lock on package cache
-    Blocking waiting for file lock on shared package cache
+=== cargo test -p swift-proxy-server --lib -- --nocapture ===
+cwd: /Users/oboy/Downloads/Peregrine/swift-rust
+date: 2026-08-07T04:35:33Z
+
+warning: failed to auto-clean cache data
+
+failed to clean entries from the global cache
+
+Caused by:
+  failed to remove file `/Users/oboy/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-macro-0.3.31/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
 warning: unused import: `HeaderKeyDict`
   --> crates/swift-middleware/src/versioned_writes.rs:39:36
    |
@@ -20,33 +28,151 @@ warning: function `md5_hex` is never used
     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
 
 warning: `swift-middleware` (lib) generated 2 warnings (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.47s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.44s
      Running unittests src/lib.rs (target/debug/deps/swift_proxy_server-019815eb911428e7)
 
-running 18 tests
+running 19 tests
 test info_cache_tests::test_info_cache_time_matches_set_info_cache ... ok
 test p1a_wiring_tests::tempurl_key_header_extraction_ignores_empty_values ... ok
 test p1a_wiring_tests::authorize_override_allows_as_non_owner ... ok
-test shard_listing_fanout_tests::empty_state_with_ranges_is_fanout_eligible ... ok
 test p1a_wiring_tests::cached_account_acls_are_loaded ... ok
+test shard_listing_fanout_tests::empty_state_with_ranges_is_fanout_eligible ... ok
 test policy_ring_tests::test_object_ring_for_selects_policy_ring ... ok
-test p1a_wiring_tests::account_acl_is_exposed_then_owner_headers_are_filtered ... ok
 test shard_listing_fanout_tests::merge_listings_respects_limit_across_shards ... ok
+test p1a_wiring_tests::account_acl_is_exposed_then_owner_headers_are_filtered ... ok
 test shard_listing_fanout_tests::prefer_listing_states_keeps_cleaved_drops_found ... ok
 test shard_listing_fanout_tests::select_ranges_skips_before_marker_and_prefix ... ok
-test stale_read_and_post_tests::test_backend_404_timestamp_absent_is_not_truthy ... ok
 test stale_read_and_post_tests::test_is_good_source_matches_python ... ok
-test stale_read_and_post_tests::test_source_timestamp_precedence_and_fallbacks ... ok
+test stale_read_and_post_tests::test_backend_404_timestamp_absent_is_not_truthy ... ok
 test stale_read_and_post_tests::test_post_mixed_result_resolution ... ok
+test stale_read_and_post_tests::test_source_timestamp_precedence_and_fallbacks ... ok
 test stale_read_and_post_tests::test_x_newest_picks_max_timestamp_after_tombstone_filter ... ok
 test info_cache_tests::test_account_map_hit_expiry_and_clear ... ok
 test info_cache_tests::test_container_hit_expiry_and_clear ... ok
+test p1a_wiring_tests::allow_account_management_gates_put_delete_405 ... ok
 test p1a_wiring_tests::authorize_legacy_sync_key_allows_without_token ... ok
 
-test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.47s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.17s
 
-error: unexpected argument 'allow_account' found
 
-Usage: cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]
+=== focus: allow_account_management (lib filter) ===
+warning: failed to auto-clean cache data
 
-For more information, try '--help'.
+failed to clean entries from the global cache
+
+Caused by:
+  failed to remove file `/Users/oboy/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-macro-0.3.31/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `md5_hex` is never used
+   --> crates/swift-middleware/src/encrypter.rs:378:4
+    |
+378 | fn md5_hex(data: &[u8]) -> String {
+    |    ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib) generated 2 warnings (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.28s
+     Running unittests src/lib.rs (target/debug/deps/swift_proxy_server-019815eb911428e7)
+
+running 1 test
+test p1a_wiring_tests::allow_account_management_gates_put_delete_405 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 3.08s
+
+
+=== focus: pipeline/strict (binary startup_policy_tests) ===
+warning: failed to auto-clean cache data
+
+failed to clean entries from the global cache
+
+Caused by:
+  failed to remove file `/Users/oboy/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-macro-0.3.31/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `md5_hex` is never used
+   --> crates/swift-middleware/src/encrypter.rs:378:4
+    |
+378 | fn md5_hex(data: &[u8]) -> String {
+    |    ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib) generated 2 warnings (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.58s
+     Running unittests src/main.rs (target/debug/deps/swift_proxy_server-60030a996cabac0d)
+
+running 15 tests
+test startup_policy_tests::pipeline_crypto_skips_without_root_secret ... ok
+test startup_policy_tests::pipeline_order_from_conf_reorders_implemented_filters ... ok
+test startup_policy_tests::no_pipeline_line_keeps_default_order ... ok
+test startup_policy_tests::pipeline_s3api_wires_ec2_s3token_deferral_when_auth_uri_set ... ok
+test startup_policy_tests::pipeline_strict_conf_parses_true ... ok
+test startup_policy_tests::pipeline_container_sync_wires_and_info ... ok
+test startup_policy_tests::pipeline_p3_auth_wires_authtoken_keystoneauth_and_info ... ok
+test startup_policy_tests::pipeline_crypto_wires_keymaster_encryption_and_info ... ok
+test startup_policy_tests::pipeline_crypto_multi_root_secret_conf ... ok
+test startup_policy_tests::pipeline_s3api_wires_without_info_pollution ... ok
+test startup_policy_tests::pipeline_unknown_filter_note_when_lenient ... ok
+test startup_policy_tests::pipeline_unknown_filter_still_skips ... ok
+test startup_policy_tests::pipeline_p1a_wires_bulk_tempurl ... ok
+test startup_policy_tests::pipeline_strict_true_surfaces_fatal_unknown_filter ... ok
+test startup_policy_tests::pipeline_p1b_wires_formpost_staticweb_quotas_symlink_vw ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.01s
+
+
+=== focus: allow_account_management (binary) ===
+warning: failed to auto-clean cache data
+
+failed to clean entries from the global cache
+
+Caused by:
+  failed to remove file `/Users/oboy/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-macro-0.3.31/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `md5_hex` is never used
+   --> crates/swift-middleware/src/encrypter.rs:378:4
+    |
+378 | fn md5_hex(data: &[u8]) -> String {
+    |    ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib) generated 2 warnings (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.41s
+     Running unittests src/main.rs (target/debug/deps/swift_proxy_server-60030a996cabac0d)
+
+running 1 test
+test startup_policy_tests::allow_account_management_defaults_false_and_can_enable ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s
+

@@ -37,9 +37,9 @@
 | Bulk delete | ✅ | ✅ | |
 | Bulk upload / extract-archive | ✅ | ✅ | tar / tar.gz / tar.bz2; `/info` bulk_upload (2026-08-06) |
 | Account autocreate | ✅ | ✅ | |
-| Allow account management | ✅ | ✅ | `allow_account_management` conf; PUT/DELETE gated 405 when off; unit reaffirm (`residual-pipeline-account-20260807`) |
+| Allow account management | ✅ | ✅ | `allow_account_management` conf; PUT/DELETE gated **405** when off; unit reaffirm 2026-08-07 (`residual-pipeline-account-20260807`: lib 19/19 + gate test) |
 | SLO residual: expirer hash sharding / async ACL probes | ✅ | ❌ | day-bucket enqueue without hash_path offset; authorize residual |
-| Full Paste arbitrary pipeline (any filter name) | ✅ | partial | Unknown names **skip** by default; `strict_pipeline=true` hard-fails startup (Paste-like) — `residual-pipeline-account-20260807`. Implementing every filter name still ❌ |
+| Full Paste arbitrary pipeline (any filter name) | ✅ | partial | Unknown names **skip** by default; `strict_pipeline=true` hard-fails startup (Paste-like) — unit 2026-08-07 (`residual-pipeline-account-20260807`: pipeline/strict binary 15/15). Implementing every filter name still ❌ |
 
 ---
 
