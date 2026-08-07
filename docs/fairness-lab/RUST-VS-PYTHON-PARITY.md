@@ -1,6 +1,6 @@
 # Rust Swift vs Python Swift — full-function parity matrix
 
-**As of:** 2026-08-06  
+**As of:** 2026-08-07  
 **Rule:** *partial implementation counts as **未实现 (NOT implemented)*** for this table.  
 **“已实现”** requires: wired into a deployable path **and** verified enough to claim (unit + live where applicable), without major Deferred semantics that change client-visible behavior.
 
@@ -70,7 +70,7 @@
 
 | Capability | Python (s3api) | Rust | Notes |
 |------------|:--------------:|:----:|-------|
-| SigV4 | ✅ | ✅ | Live VIP |
+| SigV4 | ✅ | ✅ | Live VIP; unit verify |
 | ListBuckets / bucket CRUD / object CRUD | ✅ | ✅ | |
 | ListObjects v1 / v2 | ✅ | ✅ | |
 | CopyObject | ✅ | ✅ | unit + path |
@@ -78,12 +78,15 @@
 | MPU initiate / part / complete / abort | ✅ | ✅ | live 11/11 deep |
 | ListMultipartUploads | ✅ | ✅ | live |
 | ListParts | ✅ | ✅ | part-number-marker + max-parts + IsTruncated (2026-08-06) |
-| Canned ACL + multi-rule CORS + object ?acl store | ✅ | ✅ | Object x-amz-acl → sysmeta + GET ?acl; IAM residual |
+| Canned bucket ACL (`private` / `public-read` / `public-read-write`) | ✅ | ✅ | `x-amz-acl` → `X-Container-Read/Write`; unit |
+| Object canned ACL store + GET `?acl` | ✅ | ✅ | `x-amz-acl` → `X-Object-Sysmeta-S3-Acl`; unit 2026-08-07; **not** anonymous Swift GET by itself |
+| Multi-rule CORS put/get | ✅ | ✅ | compact `X-Container-Meta-S3-Cors` + first-rule stamps; unit `cors_multi_rule_*` 2026-08-07 |
 | s3token → Keystone /v3/s3tokens | ✅ | ✅ | live EC2 GREEN 2026-08-06 |
-| SigV2 | ✅ | ❌ | **WONTFIX** — stable **501 NotImplemented** (unit) |
-| aws-chunked | ✅ | ❌ | **WONTFIX** — stable **501** (unit) |
-| Versioning / tagging / lifecycle / object-lock | ✅ | ❌ | WONTFIX / 501 |
-| Full IAM-style ACL / ACP XML body | ✅ | ❌ | canned + object sysmeta store only |
+| SigV2 | ✅ | ❌ | **WONTFIX** — stable **501** `Code=NotImplemented` (unit header+query) `residual-s3-surface-20260807` |
+| aws-chunked / STREAMING-* | ✅ | ❌ | **WONTFIX** — stable **501** (streaming payload / Content-Encoding / trailer) unit |
+| Versioning / tagging / lifecycle / object-lock / versions | ✅ | ❌ | **WONTFIX** — stable **501** on `UNSUPPORTED_SUBRESOURCES` unit |
+| Full IAM / grant-header ACL / ACP XML body PUT | ✅ | ❌ | **RESIDUAL — not implemented**; canned only; do **not** claim KEEP |
+| authenticated-read / log-delivery-write canned | ❌ / NotImpl | ❌ | map to private; no AuthenticatedUsers Swift ACL |
 
 ---
 
@@ -141,7 +144,7 @@
 
 | Area | Python | Rust | Notes |
 |------|:------:|:----:|-------|
-| eventlet multi-process workers | ✅ | partial | ISO-CONFIG tooling KEEP (`swift-effective-concurrency`, `residual-workers-semantics-20260807`); classic prefork process model **not equivalent** (documented) |
+| eventlet multi-process workers | ✅ | ⚠️ | **Tooling GREEN** (`swift-effective-concurrency` + unit mapping); classic prefork / proxy path still **process-model residual** (threads ≠ eventlet processes) — `residual-workers-semantics-20260807` |
 | `servers_per_port` process isolation | ✅ | ✅ | Contabo live 6211/6212 |
 | HAProxy + Keepalived | ✅ | ✅ | lab |
 | VIP TLS (operator PEM path) | ✅ | ⚠️ | Code+ops script GREEN; Contabo still **self-signed LAB** (2026-08-06 probe); production PEM apply not executed |
@@ -157,7 +160,7 @@
 |--------|-------------|----------------------------------|
 | Swift v1 core CRUD + common middleware | **Most** | full arbitrary Paste; SLO async ACL/hash_path residual |
 | Auth | TempAuth + Keystone lab | Production-only ops polish |
-| S3 | SigV4 + MPU + ListParts + canned ACL + multi-rule CORS (unit 93/93 `residual-s3-surface-20260807`) | SigV2/aws-chunked/versioning **WONTFIX 501**; full IAM grant-header ACL residual |
+| S3 | SigV4 + MPU + ListParts + canned ACL + object ?acl store + multi-rule CORS (unit 93/93 `swift-s3api` `residual-s3-surface-20260807`) | SigV2 / aws-chunked / versioning+tagging+lifecycle **WONTFIX 501**; full IAM/grant-header ACP **residual (not KEEP)** |
 | EC | Data path + heal | macOS/default build; some EC throttling niceties |
 | Sharding L3b | CLI + daemon ring-part cleave + fan-out + ×4 Contabo; **product-style 40×4KB KEEP** on SHARDED `shrinklab` (HEAD=list, GET 5/5) `priority-wave-20260806` | Python对照 / multi-hour soak / multi-primary auto-shrink **未宣称** |
 | Crypto at-rest middleware | multi-root + listing + range GET + etag mask + **chunked PUT encrypt** | KMIP; ciphertext still buffered (footer residual) |

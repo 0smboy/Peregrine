@@ -337,20 +337,10 @@ fn main() {
         sync_key_provider,
         &policies_for_filters,
     );
-    let strict_pipeline = matches!(
-        conf
-            .get("app:proxy-server", "strict_pipeline")
-            .ok()
-            .flatten()
-            .or_else(|| conf.get("DEFAULT", "strict_pipeline").ok().flatten())
-            .unwrap_or_else(|| "false".to_string())
-            .to_lowercase()
-            .as_str(),
-        "true" | "yes" | "on" | "1"
-    );
+    let strict_pipeline = strict_pipeline_from_conf(&conf);
     let mut fatal = false;
     for note in &notes {
-        if note.contains("unknown filter") || note.contains("not implemented in proxy wiring") {
+        if pipeline_note_is_strict_fatal(note) {
             if strict_pipeline {
                 logger.error(&format!("strict_pipeline: {note}"));
                 fatal = true;
@@ -701,6 +691,23 @@ fn configured_pipeline_has(conf: &SwiftConfig, name: &str) -> bool {
                 .any(|candidate| candidate.eq_ignore_ascii_case(name))
         })
         .unwrap_or_else(|| DEFAULT_CONFIGURED_FILTERS.contains(&name))
+}
+
+/// `[app:proxy-server] strict_pipeline` (DEFAULT fallback). Default **false**
+/// so Contabo / Python-shaped pipelines stay lab-safe; true is Paste-like.
+fn strict_pipeline_from_conf(conf: &SwiftConfig) -> bool {
+    let raw = conf
+        .get("app:proxy-server", "strict_pipeline")
+        .ok()
+        .flatten()
+        .or_else(|| conf.get("DEFAULT", "strict_pipeline").ok().flatten())
+        .unwrap_or_else(|| "false".to_string());
+    config_true_value(&raw)
+}
+
+/// Startup notes that are hard-fail candidates under `strict_pipeline=true`.
+fn pipeline_note_is_strict_fatal(note: &str) -> bool {
+    note.contains("unknown filter") || note.contains("not implemented in proxy wiring")
 }
 
 /// Build `formpost` around the same Temp-URL key provider as tempurl.
@@ -2741,6 +2748,7 @@ mod startup_policy_tests {
             false,
         )
         .unwrap();
+        assert!(!strict_pipeline_from_conf(&conf));
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
         let (_filters, notes) = build_configured_filters(
             &conf,
@@ -2757,29 +2765,91 @@ mod startup_policy_tests {
                 .any(|n| n.contains("unknown filter") && n.contains("totally_fake_filter")),
             "{notes:?}"
         );
+        // Lenient: fatal note is present but startup must not fail.
+        let fatal = notes.iter().any(|n| pipeline_note_is_strict_fatal(n));
+        assert!(fatal, "expected unknown-filter note: {notes:?}");
+        assert!(!strict_pipeline_from_conf(&conf));
+    }
+
+    #[test]
+    fn pipeline_strict_true_surfaces_fatal_unknown_filter() {
+        // When strict_pipeline=true, unknown / unwired names are fatal notes;
+        // main() exits 1 after logging — unit path stops at the pure decision.
+        let conf = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck totally_fake_filter list_endpoints proxy-server\n\
+             [app:proxy-server]\n\
+             strict_pipeline = true\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(strict_pipeline_from_conf(&conf));
+        let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
+        let (_filters, notes) = build_configured_filters(
+            &conf,
+            None,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            &pols,
+        );
+        let fatals: Vec<_> = notes
+            .iter()
+            .filter(|n| pipeline_note_is_strict_fatal(n))
+            .collect();
+        assert!(
+            fatals
+                .iter()
+                .any(|n| n.contains("unknown filter") && n.contains("totally_fake_filter")),
+            "{notes:?}"
+        );
+        assert!(
+            fatals
+                .iter()
+                .any(|n| n.contains("not implemented in proxy wiring")
+                    && n.contains("list_endpoints")),
+            "{notes:?}"
+        );
+        // Same gate main() uses before process::exit(1).
+        assert!(strict_pipeline_from_conf(&conf) && !fatals.is_empty());
     }
 
     #[test]
     fn pipeline_strict_conf_parses_true() {
-        // Conf parsing for strict_pipeline — main() enforces exit; here we only
-        // prove the same truthy set used at startup.
-        for raw in ["true", "TRUE", "yes", "on", "1"] {
+        for raw in ["true", "TRUE", "yes", "on", "1", "t", "y"] {
             let conf = SwiftConfig::parse_lenient(
                 &format!("[app:proxy-server]\nstrict_pipeline = {raw}\n"),
                 &[],
                 false,
             )
             .unwrap();
-            let v = conf
-                .get("app:proxy-server", "strict_pipeline")
-                .ok()
-                .flatten()
-                .unwrap_or_default();
             assert!(
-                matches!(v.to_lowercase().as_str(), "true" | "yes" | "on" | "1"),
-                "raw={raw} v={v}"
+                strict_pipeline_from_conf(&conf),
+                "raw={raw} should enable strict_pipeline"
             );
         }
+        for raw in ["false", "0", "no", "off", ""] {
+            let body = if raw.is_empty() {
+                "[app:proxy-server]\n".to_string()
+            } else {
+                format!("[app:proxy-server]\nstrict_pipeline = {raw}\n")
+            };
+            let conf = SwiftConfig::parse_lenient(&body, &[], false).unwrap();
+            assert!(
+                !strict_pipeline_from_conf(&conf),
+                "raw={raw:?} must stay lenient (Contabo default)"
+            );
+        }
+        // DEFAULT section fallback
+        let conf = SwiftConfig::parse_lenient(
+            "[DEFAULT]\nstrict_pipeline = yes\n[app:proxy-server]\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(strict_pipeline_from_conf(&conf));
     }
 
     #[test]

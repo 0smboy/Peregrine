@@ -7,19 +7,16 @@ Caused by:
 
 Caused by:
   Permission denied (os error 13)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.47s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
      Running unittests src/lib.rs (target/debug/deps/swift_object_server-5221fbadedf31f8a)
 
-running 9 tests
-test servers_per_port::tests::servers_per_port_one_does_not_collapse_threads ... ok
-test servers_per_port::tests::servers_per_port_ignores_workers ... ok
-test servers_per_port::tests::workers_times_max_clients_clamps_at_128 ... ok
-test servers_per_port::tests::bind_acceptors_reuseport_when_n_gt_1 ... ok
-test servers_per_port::tests::json_shape ... ok
-test servers_per_port::tests::port_worker_plan_covers_ports_times_spp ... ok
-test servers_per_port::tests::ports_for_local_devs_filters_by_ip ... ok
-test servers_per_port::tests::listen_ports_fallback_when_empty ... ok
-test servers_per_port::tests::discover_reads_ports_from_ring_files ... ok
+running 6 tests
+test servers_per_port::tests::effective_concurrency_max_clients_zero_treated_as_one ... ok
+test servers_per_port::tests::effective_concurrency_spp_gt_zero_ignores_workers ... ok
+test servers_per_port::tests::effective_concurrency_spp_one_clamps_max_clients ... ok
+test servers_per_port::tests::effective_concurrency_workers_times_max_clients_clamps_at_128 ... ok
+test servers_per_port::tests::effective_concurrency_workers_product_uncapped_when_small ... ok
+test servers_per_port::tests::effective_concurrency_workers_zero_uses_cpu_default ... ok
 
-test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 49 filtered out; finished in 0.02s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 55 filtered out; finished in 0.00s
 

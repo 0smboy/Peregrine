@@ -5006,6 +5006,54 @@ mod p1a_wiring_tests {
             vec!["second"]
         );
     }
+
+    #[test]
+    fn allow_account_management_gates_put_delete_405() {
+        // Live-style: account PUT/DELETE never reach backends when the conf
+        // gate is off (Python account.py removes those methods).
+        let gated = Arc::new(ProxyApp::new(
+            ring(0),
+            ring(0),
+            ProxyConfig {
+                allow_account_management: false,
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        for method in ["PUT", "DELETE"] {
+            let resp = gated.handle(Request {
+                method: method.to_string(),
+                path: "/v1/AUTH_test".to_string(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: swift_http::Body::empty(),
+            });
+            assert_eq!(resp.status, 405, "{method}");
+            assert_eq!(
+                resp.headers.get("Allow").map(str::to_string),
+                Some("GET, HEAD, POST, OPTIONS".into()),
+                "{method}"
+            );
+        }
+        // When enabled, the gate is open: unreachable backends yield 503, not 405.
+        let open = Arc::new(ProxyApp::new(
+            ring(0),
+            ring(0),
+            ProxyConfig {
+                allow_account_management: true,
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let resp = open.handle(Request {
+            method: "PUT".to_string(),
+            path: "/v1/AUTH_test".to_string(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        });
+        assert_ne!(resp.status, 405, "enabled path must not 405: {}", resp.status);
+    }
 }
 
 #[cfg(test)]

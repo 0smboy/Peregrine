@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn workers_times_max_clients_clamps_at_128() {
+    fn effective_concurrency_workers_times_max_clients_clamps_at_128() {
         let e = effective_concurrency(ConcurrencyInputs {
             workers: 4,
             max_clients: 1024,
@@ -426,10 +426,46 @@ mod tests {
         });
         assert_eq!(e.worker_threads, 128);
         assert_eq!(e.acceptors, 1);
+        assert!(e.notes.iter().any(|n| n.contains("NOT prefork")));
+        assert!(e.notes.iter().any(|n| n.contains("clamped to 128")));
     }
 
     #[test]
-    fn servers_per_port_ignores_workers() {
+    fn effective_concurrency_workers_product_uncapped_when_small() {
+        let e = effective_concurrency(ConcurrencyInputs {
+            workers: 2,
+            max_clients: 32,
+            servers_per_port: 0,
+            bind_ports: 1,
+        });
+        assert_eq!(e.worker_threads, 64);
+        assert_eq!(e.connection_queue, 32);
+        assert_eq!(e.acceptors, 1);
+        assert_eq!(e.formula, "workers * max_clients → worker_threads (cap 128)");
+        assert!(e.notes.iter().any(|n| n.contains("NOT prefork")));
+    }
+
+    #[test]
+    fn effective_concurrency_workers_zero_uses_cpu_default() {
+        let e = effective_concurrency(ConcurrencyInputs {
+            workers: 0,
+            max_clients: 1024,
+            servers_per_port: 0,
+            bind_ports: 1,
+        });
+        let cpus = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4);
+        let expect = cpus.saturating_mul(16).clamp(16, WORKER_THREADS_CAP);
+        assert_eq!(e.worker_threads, expect);
+        assert_eq!(e.acceptors, 1);
+        assert_eq!(e.connection_queue, 1024);
+        assert!(e.notes.iter().any(|n| n.contains("workers=0")));
+        assert!(e.formula.contains("cpus*16"));
+    }
+
+    #[test]
+    fn effective_concurrency_spp_gt_zero_ignores_workers() {
         let e = effective_concurrency(ConcurrencyInputs {
             workers: 99,
             max_clients: 8,
@@ -439,12 +475,14 @@ mod tests {
         assert_eq!(e.acceptors, 6);
         // Per-process pool sized to max_clients (not product).
         assert_eq!(e.worker_threads, 8);
+        assert_eq!(e.connection_queue, 8);
         assert!(e.notes.iter().any(|n| n.contains("workers knob ignored")));
         assert!(e.notes.iter().any(|n| n.contains("process-isolated")));
+        assert!(e.formula.contains("spp * n_ports"));
     }
 
     #[test]
-    fn servers_per_port_one_does_not_collapse_threads() {
+    fn effective_concurrency_spp_one_clamps_max_clients() {
         // Contabo-like: spp=1, max_clients=1024 → per-process 128 (clamped).
         let e = effective_concurrency(ConcurrencyInputs {
             workers: 0,
@@ -454,6 +492,19 @@ mod tests {
         });
         assert_eq!(e.worker_threads, 128);
         assert_eq!(e.acceptors, 1);
+        assert!(e.notes.iter().any(|n| n.contains("clamped to 128")));
+    }
+
+    #[test]
+    fn effective_concurrency_max_clients_zero_treated_as_one() {
+        let e = effective_concurrency(ConcurrencyInputs {
+            workers: 3,
+            max_clients: 0,
+            servers_per_port: 0,
+            bind_ports: 1,
+        });
+        assert_eq!(e.worker_threads, 3);
+        assert_eq!(e.connection_queue, 1);
     }
 
     #[test]
