@@ -1,0 +1,48 @@
+warning: failed to auto-clean cache data
+
+failed to clean entries from the global cache
+
+Caused by:
+  failed to remove file `/Users/oboy/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-macro-0.3.31/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `md5_hex` is never used
+   --> crates/swift-middleware/src/encrypter.rs:378:4
+    |
+378 | fn md5_hex(data: &[u8]) -> String {
+    |    ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib) generated 2 warnings (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+   Compiling swift-proxy-server v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-proxy-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.74s
+     Running unittests src/main.rs (target/debug/deps/swift_proxy_server-60030a996cabac0d)
+
+running 14 tests
+test startup_policy_tests::pipeline_order_from_conf_reorders_implemented_filters ... ok
+test startup_policy_tests::no_pipeline_line_keeps_default_order ... ok
+test startup_policy_tests::pipeline_crypto_skips_without_root_secret ... ok
+test startup_policy_tests::pipeline_container_sync_wires_and_info ... ok
+test startup_policy_tests::pipeline_p3_auth_wires_authtoken_keystoneauth_and_info ... ok
+test startup_policy_tests::pipeline_crypto_wires_keymaster_encryption_and_info ... ok
+test startup_policy_tests::pipeline_s3api_wires_ec2_s3token_deferral_when_auth_uri_set ... ok
+test startup_policy_tests::pipeline_strict_conf_parses_true ... ok
+test startup_policy_tests::pipeline_p1b_wires_formpost_staticweb_quotas_symlink_vw ... ok
+test startup_policy_tests::pipeline_crypto_multi_root_secret_conf ... ok
+test startup_policy_tests::pipeline_unknown_filter_note_when_lenient ... ok
+test startup_policy_tests::pipeline_unknown_filter_still_skips ... ok
+test startup_policy_tests::pipeline_s3api_wires_without_info_pollution ... ok
+test startup_policy_tests::pipeline_p1a_wires_bulk_tempurl ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.01s
+

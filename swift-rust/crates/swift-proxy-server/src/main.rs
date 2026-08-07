@@ -322,9 +322,8 @@ fn main() {
     // Optional `[pipeline:main] pipeline = ...` orders the *implemented*
     // filters (P0–P1b). Always-on catch_errors / gatekeeper / healthcheck
     // stay in serve_with_filters_and_config. Absent pipeline → today's
-    // default order. Unknown names are skipped (logged), never a startup
-    // hard-fail — so a Python-shaped pipeline line can be pasted without
-    // claiming full Paste parity.
+    // default order. Unknown names skip by default; set
+    // `strict_pipeline = true` for Paste-like hard-fail on unknown names.
     let key_provider: Arc<dyn swift_middleware::KeyProvider> =
         Arc::new(ProxyTempUrlKeys::new(Arc::clone(&app)));
     let sync_key_provider: Arc<dyn swift_middleware::SyncKeyProvider> =
@@ -338,8 +337,35 @@ fn main() {
         sync_key_provider,
         &policies_for_filters,
     );
+    let strict_pipeline = matches!(
+        conf
+            .get("app:proxy-server", "strict_pipeline")
+            .ok()
+            .flatten()
+            .or_else(|| conf.get("DEFAULT", "strict_pipeline").ok().flatten())
+            .unwrap_or_else(|| "false".to_string())
+            .to_lowercase()
+            .as_str(),
+        "true" | "yes" | "on" | "1"
+    );
+    let mut fatal = false;
     for note in &notes {
-        logger.info(note);
+        if note.contains("unknown filter") || note.contains("not implemented in proxy wiring") {
+            if strict_pipeline {
+                logger.error(&format!("strict_pipeline: {note}"));
+                fatal = true;
+            } else {
+                logger.info(note);
+            }
+        } else {
+            logger.info(note);
+        }
+    }
+    if fatal {
+        logger.error(
+            "strict_pipeline=true: refusing to start with unknown/unimplemented pipeline filters",
+        );
+        std::process::exit(1);
     }
     if let Err(e) =
         swift_proxy_server::serve_with_filters_and_config(listener, app, filters, server_config)
@@ -939,7 +965,7 @@ fn build_backend_ratelimit(conf: &SwiftConfig) -> swift_middleware::BackendRateL
 /// P0–P1b wires: cache/listing_formats/proxy_logging/bulk/tempurl plus
 /// formpost/staticweb/quotas/symlink/versioned_writes and the smaller L2
 /// filters. P3-s3 wires `s3api` (ON-BY-CONFIG; not on default pipeline).
-/// Unknown names still skip with a note — not a hard fail.
+/// Unknown names skip with a note; `strict_pipeline=true` hard-fails at main.
 fn build_configured_filters(
     conf: &SwiftConfig,
     tempauth: Option<swift_middleware::TempAuth>,
@@ -2702,6 +2728,77 @@ mod startup_policy_tests {
         );
         // keymaster + decrypter + encrypter + copy
         assert_eq!(filters.len(), 4, "notes={notes:?}");
+    }
+
+    #[test]
+    fn pipeline_unknown_filter_note_when_lenient() {
+        let conf = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck totally_fake_filter proxy-server\n\
+             [app:proxy-server]\n\
+             strict_pipeline = false\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
+        let (_filters, notes) = build_configured_filters(
+            &conf,
+            None,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            &pols,
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("unknown filter") && n.contains("totally_fake_filter")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn pipeline_strict_conf_parses_true() {
+        // Conf parsing for strict_pipeline — main() enforces exit; here we only
+        // prove the same truthy set used at startup.
+        for raw in ["true", "TRUE", "yes", "on", "1"] {
+            let conf = SwiftConfig::parse_lenient(
+                &format!("[app:proxy-server]\nstrict_pipeline = {raw}\n"),
+                &[],
+                false,
+            )
+            .unwrap();
+            let v = conf
+                .get("app:proxy-server", "strict_pipeline")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            assert!(
+                matches!(v.to_lowercase().as_str(), "true" | "yes" | "on" | "1"),
+                "raw={raw} v={v}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_account_management_defaults_false_and_can_enable() {
+        let off = proxy_config_from_conf(
+            &SwiftConfig::parse_lenient("[app:proxy-server]\n", &[], false).unwrap(),
+            true,
+        );
+        assert!(!off.allow_account_management);
+        let on = proxy_config_from_conf(
+            &SwiftConfig::parse_lenient(
+                "[app:proxy-server]\nallow_account_management = true\n",
+                &[],
+                false,
+            )
+            .unwrap(),
+            true,
+        );
+        assert!(on.allow_account_management);
     }
 
     #[test]

@@ -1,0 +1,34 @@
+=== CLI samples ===
+{
+  "workers": 2,
+  "max_clients": 64,
+  "servers_per_port": 0,
+  "bind_ports": 1,
+  "worker_threads": 128,
+  "connection_queue": 64,
+  "acceptors": 1,
+  "formula": "workers * max_clients → worker_threads (cap 128)",
+  "notes": ["Rust maps workers*max_clients → worker_threads (NOT prefork processes)"]
+}
+{
+  "workers": 0,
+  "max_clients": 1024,
+  "servers_per_port": 4,
+  "bind_ports": 1,
+  "worker_threads": 128,
+  "connection_queue": 1024,
+  "acceptors": 4,
+  "formula": "per-process: max_clients → worker_threads; children = spp * n_ports",
+  "notes": ["servers_per_port>0: workers knob ignored (Python parity)","Rust Wave2: one OS process per (port, worker) — process-isolated","per-process worker_threads clamped to 128","aggregate ≈ servers_per_port * n_ports * max_clients across children"]
+}
+{
+  "workers": 0,
+  "max_clients": 1024,
+  "servers_per_port": 0,
+  "bind_ports": 1,
+  "worker_threads": 128,
+  "connection_queue": 1024,
+  "acceptors": 1,
+  "formula": "default: cpus*16 → worker_threads (clamp 16..128)",
+  "notes": ["workers=0: use ServerConfig default (cpus*16, clamp 16..128)"]
+}

@@ -1,0 +1,70 @@
+=== 2026-08-07T04:32:09Z cargo test -p swift-middleware --lib slo:: -- --nocapture ===
+warning: failed to auto-clean cache data
+
+failed to clean entries from the global cache
+
+Caused by:
+  failed to remove file `/Users/oboy/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-macro-0.3.31/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.33s
+     Running unittests src/lib.rs (target/debug/deps/swift_middleware-7a92af109edbe29b)
+
+running 24 tests
+test slo::tests::test_manifest_etag ... ok
+test slo::tests::test_dlo_etag ... ok
+test slo::tests::test_multipart_delete_async_manifest_missing ... ok
+test slo::tests::test_inline_data_only_rejected ... ok
+test slo::tests::test_multipart_delete_async_rejects_nested ... ok
+test slo::tests::test_multipart_delete_async_enqueues_and_deletes_manifest ... ok
+test slo::tests::test_heartbeat_put_returns_202 ... ok
+test slo::tests::test_multipart_delete_async_rejects_multi_container ... ok
+test slo::tests::test_normalize_etag ... ok
+test slo::tests::test_heartbeat_put_yields_space_per_head ... ok
+test slo::tests::test_slo_etag_ranged_segment ... ok
+test slo::tests::test_slo_etag_whole_segments ... ok
+test slo::tests::test_slo_etag_data_segment ... ok
+test slo::tests::test_multipart_manifest_get_format_raw ... ok
+test slo::tests::test_slo_head_uses_sysmeta_not_manifest_length ... ok
+test slo::tests::test_multipart_manifest_delete ... ok
+test slo::tests::test_slo_full_get_reassembles ... ok
+test slo::tests::test_slo_range_get ... ok
+test slo::tests::test_inline_data_put_and_get ... ok
+test slo::tests::test_slo_non_manifest_passthrough ... ok
+test slo::tests::test_slo_nested_sub_slo_get ... ok
+test slo::tests::test_slo_range_uses_per_segment_range ... ok
+test slo::tests::test_slo_get_is_lazy_and_aborts_midstream ... ok
+test slo::tests::test_multipart_delete_async_update_fallback_deletes_manifest ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 381 filtered out; finished in 0.02s
+
+
+=== filter: heartbeat|multipart_delete|manifest_delete ===
+     Running unittests src/lib.rs (target/debug/deps/swift_middleware-7a92af109edbe29b)
+running 24 tests
+test slo::tests::test_heartbeat_put_returns_202 ... ok
+test slo::tests::test_heartbeat_put_yields_space_per_head ... ok
+test slo::tests::test_multipart_delete_async_manifest_missing ... ok
+test slo::tests::test_multipart_delete_async_enqueues_and_deletes_manifest ... ok
+test slo::tests::test_multipart_delete_async_rejects_multi_container ... ok
+test slo::tests::test_multipart_delete_async_rejects_nested ... ok
+test slo::tests::test_multipart_manifest_delete ... ok
+test slo::tests::test_multipart_delete_async_update_fallback_deletes_manifest ... ok
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 381 filtered out; finished in 0.01s
+
+=== Integration test scan (tests/ dirs + tools) ===
+No crates/*/tests/ integration files mention multipart-manifest=delete or heartbeat.
+Coverage lives in swift-middleware lib tests (slo::tests::*):
+1979:    fn test_heartbeat_put_returns_202() {
+2016:    fn test_heartbeat_put_yields_space_per_head() {
+2060:    fn test_multipart_manifest_delete() {
+2109:    fn test_multipart_delete_async_enqueues_and_deletes_manifest() {
+2194:    fn test_multipart_delete_async_rejects_nested() {
+2225:    fn test_multipart_delete_async_rejects_multi_container() {
+2254:    fn test_multipart_delete_async_manifest_missing() {
+2268:    fn test_multipart_delete_async_update_fallback_deletes_manifest() {
+
+=== workspace path ===
+/Users/oboy/Downloads/Peregrine/swift-rust
+crates/swift-middleware/Cargo.toml

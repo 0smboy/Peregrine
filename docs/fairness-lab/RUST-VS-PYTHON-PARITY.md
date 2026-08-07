@@ -27,7 +27,7 @@
 | Single + multi Range / multipart byteranges | ✅ | ✅ | |
 | Server-side COPY / X-Copy-From | ✅ | ✅ | |
 | Expiry `X-Delete-At` / `X-Delete-After` | ✅ | ✅ | Expirer daemon |
-| SLO (manifest PUT + GET reassembly) | ✅ | ✅ | Nested/streamed + inline + streaming heartbeat + sync/async multipart-delete (2026-08-06) |
+| SLO (manifest PUT + GET reassembly) | ✅ | ✅ | Nested/streamed + inline + streaming heartbeat + sync/async multipart-delete; **unit re-verify 24/24** (`residual-slo-edge-20260807`) |
 | DLO | ✅ | ✅ | Listing pagination beyond limit residual → main path ✅ |
 | Versioned writes (stack) | ✅ | ✅ | Primary suite |
 | Symlink | ✅ | ✅ | |
@@ -37,9 +37,9 @@
 | Bulk delete | ✅ | ✅ | |
 | Bulk upload / extract-archive | ✅ | ✅ | tar / tar.gz / tar.bz2; `/info` bulk_upload (2026-08-06) |
 | Account autocreate | ✅ | ✅ | |
-| Allow account management | ✅ | ✅ | `allow_account_management` conf; PUT/DELETE gated 405 when off (2026-08-06) |
+| Allow account management | ✅ | ✅ | `allow_account_management` conf; PUT/DELETE gated 405 when off; unit reaffirm (`residual-pipeline-account-20260807`) |
 | SLO residual: expirer hash sharding / async ACL probes | ✅ | ❌ | day-bucket enqueue without hash_path offset; authorize residual |
-| Full Paste arbitrary pipeline (any filter name) | ✅ | ❌ | Only known filter names |
+| Full Paste arbitrary pipeline (any filter name) | ✅ | partial | Unknown names **skip** by default; `strict_pipeline=true` hard-fails startup (Paste-like) — `residual-pipeline-account-20260807`. Implementing every filter name still ❌ |
 
 ---
 
@@ -141,7 +141,7 @@
 
 | Area | Python | Rust | Notes |
 |------|:------:|:----:|-------|
-| eventlet multi-process workers | ✅ | ❌ | thread pool mapping → **语义不等价** |
+| eventlet multi-process workers | ✅ | partial | ISO-CONFIG tooling KEEP (`swift-effective-concurrency`, `residual-workers-semantics-20260807`); classic prefork process model **not equivalent** (documented) |
 | `servers_per_port` process isolation | ✅ | ✅ | Contabo live 6211/6212 |
 | HAProxy + Keepalived | ✅ | ✅ | lab |
 | VIP TLS (operator PEM path) | ✅ | ⚠️ | Code+ops script GREEN; Contabo still **self-signed LAB** (2026-08-06 probe); production PEM apply not executed |
@@ -157,7 +157,7 @@
 |--------|-------------|----------------------------------|
 | Swift v1 core CRUD + common middleware | **Most** | full arbitrary Paste; SLO async ACL/hash_path residual |
 | Auth | TempAuth + Keystone lab | Production-only ops polish |
-| S3 | SigV4 + MPU + ListParts + canned ACL + multi-rule CORS | SigV2, versioning, full IAM/object ACL, aws-chunked |
+| S3 | SigV4 + MPU + ListParts + canned ACL + multi-rule CORS (unit 93/93 `residual-s3-surface-20260807`) | SigV2/aws-chunked/versioning **WONTFIX 501**; full IAM grant-header ACL residual |
 | EC | Data path + heal | macOS/default build; some EC throttling niceties |
 | Sharding L3b | CLI + daemon ring-part cleave + fan-out + ×4 Contabo; **product-style 40×4KB KEEP** on SHARDED `shrinklab` (HEAD=list, GET 5/5) `priority-wave-20260806` | Python对照 / multi-hour soak / multi-primary auto-shrink **未宣称** |
 | Crypto at-rest middleware | multi-root + listing + range GET + etag mask + **chunked PUT encrypt** | KMIP; ciphertext still buffered (footer residual) |
