@@ -57,8 +57,11 @@
 //! 2. **Durable multi-primary object cleave under concurrent load** — local
 //!    same-device row write is not a multi-node product claim; remote object
 //!    push / rsync of cleaved shard DBs remains open.
-//! 3. **Multi-node shrink KEEP** — local-device object move + SHRUNK on root
-//!    is unit-tested; Contabo quorum + concurrent shrink not claimed.
+//! 3. **Cross-node shrink over HTTP** — when the donor DB lives only on a
+//!    remote primary, this process skips (never fabricates empty donors).
+//!    Multi-device **same host** auto-shrink is KEEP (see
+//!    [`process_shrinking_donors`] + `auto_shrink`). Multi-hour soak harness:
+//!    `tools/soak/multi-primary-shrink-soak.sh`.
 //! 4. WAN / async container-sync (wontfix).
 
 use std::path::Path;
@@ -1220,6 +1223,11 @@ pub struct SharderRunOpts {
     /// When true, unsharded containers with `object_count >= shard_size`
     /// are transitioned into SHARDING.
     pub auto_shard: bool,
+    /// When true (default), SHARDED roots run
+    /// [`process_shrinking_donors`] for multi-primary/local multi-device
+    /// auto-shrink product path. Set false to skip shrink during soak
+    /// isolation tests.
+    pub auto_shrink: bool,
     pub shard_size: i64,
     pub minimum_shard_size: i64,
 }
@@ -1229,6 +1237,7 @@ impl Default for SharderRunOpts {
         Self {
             cleave_batch_size: 2,
             auto_shard: false,
+            auto_shrink: true,
             shard_size: 1_000_000,
             minimum_shard_size: 100_000,
         }
@@ -1382,8 +1391,13 @@ pub fn run_once_with_opts_replicator_and_ring(
                 }
             }
             DbState::Sharded => {
-                // Compact: move objects from SHRINKING donors into acceptors
-                // and mark donors SHRUNK on this root replica.
+                // Multi-primary auto-shrink product: move objects from
+                // SHRINKING donors into acceptors across local device
+                // siblings; mark donors SHRUNK. Skip when auto_shrink=false.
+                if !opts.auto_shrink {
+                    stats.skipped += 1;
+                    continue;
+                }
                 match process_shrinking_donors(
                     &mut broker,
                     device,
@@ -1661,6 +1675,7 @@ mod tests {
         let opts = SharderRunOpts {
             cleave_batch_size: 10,
             auto_shard: true,
+            auto_shrink: true,
             shard_size: 5,
             minimum_shard_size: 1,
         };
@@ -1952,6 +1967,7 @@ mod tests {
         let opts = SharderRunOpts {
             cleave_batch_size: 10,
             auto_shard: true,
+            auto_shrink: true,
             shard_size: 100,
             minimum_shard_size: 1,
         };
@@ -2001,6 +2017,7 @@ mod tests {
         let opts = SharderRunOpts {
             cleave_batch_size: 10,
             auto_shard: true,
+            auto_shrink: true,
             shard_size: 5,
             minimum_shard_size: 1,
         };
@@ -2243,6 +2260,7 @@ mod tests {
         let opts = SharderRunOpts {
             cleave_batch_size: 10,
             auto_shard: false,
+            auto_shrink: true,
             shard_size: 1_000_000,
             minimum_shard_size: 1,
         };
@@ -2484,5 +2502,82 @@ mod tests {
             "{moved:?}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Multi-device (same host) auto-shrink: donor DB on d2, root on d1.
+    #[test]
+    fn test_multi_device_auto_shrink_finds_donor_sibling() {
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharder-multidev-shrink-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let d1 = dir.join("d1");
+        let d2 = dir.join("d2");
+        let account = "AUTH_test";
+        let container = "root";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = d1.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let db = hd.join(format!("{hsh}.db"));
+        let mut source = ContainerBroker::new(&db, account, container);
+        source
+            .initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        let epoch = "1751500010.00000";
+        let mut donor = ShardRange::new(".shards_AUTH_test/c-d0", epoch, "", "m");
+        donor.state = shard_state::SHRINKING;
+        donor.object_count = 1;
+        let mut acceptor = ShardRange::new(".shards_AUTH_test/c-a0", epoch, "", "");
+        acceptor.state = shard_state::ACTIVE;
+        source
+            .merge_shard_ranges(vec![donor.clone(), acceptor.clone()])
+            .unwrap();
+        // Donor lives on sibling device d2 (multi-primary local topology).
+        let mut donor_b = local_shard_broker(&d2, &hash_config, "0", &donor.name);
+        donor_b
+            .merge_items(vec![swift_db::ObjectRecord {
+                name: "bbb".into(),
+                created_at: "1751500011.00000".into(),
+                size: 3,
+                content_type: "text/plain".into(),
+                etag: "d41d8cd98f00b204e9800998ecf8427e".into(),
+                deleted: 0,
+                storage_policy_index: 0,
+                ctype_timestamp: None,
+                meta_timestamp: None,
+            }])
+            .unwrap();
+
+        let n = process_shrinking_donors(&mut source, &d1, &hash_config, "0", None).unwrap();
+        assert_eq!(n, 1, "multi-device shrink should finish donor on sibling");
+
+        let after = source
+            .get_shard_ranges(&GetShardRangesArgs {
+                include_deleted: true,
+                include_own: false,
+                ..Default::default()
+            })
+            .unwrap();
+        let d = after.iter().find(|r| r.name == donor.name).unwrap();
+        assert_eq!(d.state, shard_state::SHRUNK);
+
+        // Acceptor got the row (created under donor device d2 path).
+        let mut acc_b = local_shard_broker(&d2, &hash_config, "0", &acceptor.name);
+        let moved = acc_b.object_records_in_range("", "").unwrap();
+        assert!(
+            moved.iter().any(|r| r.name == "bbb" && r.deleted == 0),
+            "{moved:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_auto_shrink_opt_default_true() {
+        assert!(SharderRunOpts::default().auto_shrink);
     }
 }

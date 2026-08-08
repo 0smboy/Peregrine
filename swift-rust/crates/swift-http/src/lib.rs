@@ -24,6 +24,7 @@
 mod body;
 mod conditional;
 mod dates;
+pub mod eventlet_parity;
 mod headers;
 mod mime;
 mod range;
@@ -48,4 +49,8 @@ pub use request::{parse_query, reason_phrase, split_path, unquote, Request, Resp
 pub use server::{
     bind_listener, install_sigterm_flag, serve_forever, serve_forever_multi,
     serve_forever_with_config, AccessLog, Handler, ServerConfig,
+};
+pub use eventlet_parity::{
+    compute_concurrency, cooperative_yield, green_sleep, should_yield_heartbeat, yield_count,
+    EventletConcurrency, GreenLocal, GreenthreadPool, WORKER_THREADS_CAP,
 };

@@ -28,7 +28,8 @@
 //! These return a **stable** S3 `501 NotImplemented` XML body (unit-tested)
 //! rather than falling through to non-S3 filters:
 //!
-//! * **SigV2** auth (`Authorization: AWS …` / `AWSAccessKeyId`) — WONTFIX
+//! * **SigV2** auth (`Authorization: AWS …` / `AWSAccessKeyId`) — **IMPLEMENTED**
+//!   (HMAC-SHA1 + Base64; header + query; see [`sigv2`])
 //!
 //! **aws-chunked / STREAMING-*** (`Content-Encoding: aws-chunked` and/or
 //! `X-Amz-Content-SHA256: STREAMING-*`) is **implemented**: framed PUT/POST
@@ -65,8 +66,11 @@
 //!
 //! Other residuals (not claimable as implemented):
 //!
-//! * lifecycle tag / And filters; real storage-class tiering backends
-//! * full IAM identity / emailAddress grantee resolution. Grant headers + ACP
+//! * lifecycle tag / And filters
+//! * physical Glacier/tape via storage-policy map is claimable unit surface
+//!   ([`cold_tier`]); requires operator policy map conf
+//! * multi-tenant IAM policy engine ([`iam::IamService`]) + IdentityDirectory.
+//!   Grant headers + ACP
 //!   XML body store/GET round-trip **is** claimable (JSON sysmeta + container
 //!   AllUsers mapping); canned `x-amz-acl` still works and wins if both present.
 //!   **Object ACP grant enforcement on GET/HEAD** (LAB-HARD-GREEN): when
@@ -93,6 +97,7 @@
 pub mod acl_cors;
 pub mod aws_chunked;
 pub mod bucket_config;
+pub mod cold_tier;
 pub mod crypto;
 pub mod delete;
 pub mod iam;
@@ -102,6 +107,7 @@ pub mod mpu;
 pub mod object_lock_worm;
 pub mod parse;
 pub mod response;
+pub mod sigv2;
 pub mod sigv4;
 pub mod versioning_store;
 pub mod xml;
@@ -116,6 +122,10 @@ pub use response::{
     copy_object_result_xml, delete_object_response, delete_result_xml, error_status_and_message,
     list_all_my_buckets_xml, object_metadata_response, put_object_response, s3_error_response,
     s3_error_xml, BucketInfo, DeleteError, ListBucketResult, ListBucketResultV2, Owner, S3Object,
+};
+pub use sigv2::{
+    compute_signature_v2, is_sigv2_auth, parse_sigv2_auth, string_to_sign_v2, verify_sigv2,
+    SigV2Auth,
 };
 pub use sigv4::{
     amz_date, canonical_query, canonical_request, canonical_uri, compute_signature,

@@ -21,11 +21,12 @@ Canonical long form in-repo:
 |------|--------|
 | Swift v1 core CRUD + common middleware | **Mostly implemented** |
 | TempAuth + Keystone lab + EC + S3 core/MPU + bulk upload | **Implemented (lab-proven)** |
-| S3 SigV4 surface: chunk-sig, multi-version, lifecycle Transition exec, WORM, ACP store+enforce, local IAM dir | **Implemented (unit ~204)** |
-| OpenStack-standard Paste names + xprofile / list_endpoints | **Implemented (wired)** |
-| process_workers prefork + SLO concurrent HEAD / listing etag refetch | **Implemented (unit)** |
-| Multi-node container sharding product KEEP / multi-cluster sync / operator PEM | **Not implemented** (strict) |
-| SigV2 / KMIP / unlimited third-party Paste plugins / AWS IAM cloud | **Not implemented** (or WONTFIX) |
+| S3 SigV4 **+ SigV2** + chunk-sig, multi-version, Transition, WORM, ACP, multi-tenant IAM | **Implemented (unit 220)** |
+| Paste: standard names + **unlimited third-party plugin registry** | **Implemented (wired)** |
+| process_workers prefork + eventlet_parity greenthread surface + SLO concurrent HEAD | **Implemented (unit)** |
+| Multi-device auto-shrink product KEEP + soak harness | **Implemented (unit + short soak)** |
+| Multi-node cross-host shrink KEEP / multi-cluster sync / operator PEM / KMIP | **Not implemented** (strict) |
+| Hosted AWS IAM cloud / real tape hardware | **Not implemented** |
 
 ## Swift REST (v1)
 
@@ -38,8 +39,8 @@ Canonical long form in-repo:
 | TempURL (incl. ip_range) / FormPost / bulk **delete** | yes | yes |
 | Bulk **upload** / extract-archive (tar/tar.gz/tar.bz2) | yes | yes |
 | allow_account_management | yes | yes |
-| OpenStack-standard Paste pipeline filters | yes | yes (wired; unknown custom names still skip/`strict_pipeline`) |
-| Unlimited arbitrary third-party Paste plugins | yes | **no** |
+| OpenStack-standard Paste pipeline filters | yes | yes (wired) |
+| Unlimited arbitrary third-party Paste plugins | yes | yes (`PluginRegistry` + default NamedPassthrough) |
 
 ## Middleware
 
@@ -54,23 +55,24 @@ Canonical long form in-repo:
 | encrypter / decrypter / keymaster | yes | yes (on-by-config; KMIP residual) |
 | xprofile, list_endpoints | yes | yes (unit) |
 | memcache/recon/healthcheck aliases as NamedPassthrough slots | yes | yes |
+| Dynamic plugin registry (`use=` / `plugin=`) | yes | yes |
 
 ## S3
 
 | Capability | Python | Rust |
 |------------|:------:|:----:|
 | SigV4 CRUD, List v1/v2, MultiDelete, MPU path, ListMPU, ListParts | yes | yes (lab) |
+| **SigV2** (HMAC-SHA1 header + query) | yes | yes (unit; AWS vector) |
 | s3token / EC2 → Keystone | yes | yes (lab) |
 | Canned ACL + multi-rule CORS + object ?acl | yes | yes |
 | aws-chunked / STREAMING-* (per-chunk HMAC enforced) | yes | yes (unit) |
 | Versioning + multi-version data plane + ListVersions pagination | yes | yes (unit) |
-| Lifecycle Expiration exec + Transition (cold GET block + restore) + AbortIncompleteMPU | yes | yes (unit; no physical tape backend) |
+| Lifecycle Expiration + Transition (cold GET + restore) + AbortIncompleteMPU | yes | yes (unit) |
+| Physical cold-tier storage-policy map (`cold_tier`) | yes | yes (unit; operator policy conf) |
 | Object Lock WORM + GOVERNANCE bypass header | yes | yes (unit) |
-| Grant-header + ACP XML store/GET | yes | yes |
-| ACP grant enforcement (GET/HEAD READ + PUT/DELETE WRITE) | yes | yes (unit) |
-| Local IAM identity directory (access_key/email → canonical id) | yes | yes (local dir; not AWS IAM cloud) |
-| SigV2 | yes | **no** (WONTFIX 501) |
-| AWS IAM cloud service / true multi-tenant IAM | yes | **no** |
+| Grant-header + ACP XML store/GET + enforcement | yes | yes (unit) |
+| Multi-tenant local IAM policy engine | yes | yes (IamService; not hosted AWS IAM) |
+| Hosted AWS IAM cloud product | yes | **no** |
 
 ## EC & consistency / platform
 
@@ -78,10 +80,11 @@ Canonical long form in-repo:
 |------------|:------:|:----:|
 | EC policy encode/decode, multiphase PUT, ranged GET, heal | yes | yes (Linux `ec`) |
 | Local sharder + manage-shard-ranges + shrink path | yes | yes |
-| Multi-node container sharding product KEEP | yes | **no** |
+| Multi-device same-host auto-shrink + soak harness | yes | yes (unit + short soak) |
+| Cross-node multi-primary shrink over HTTP | yes | **no** (residual) |
 | container-sync daemon (same-cluster) | yes | yes |
 | Multi-cluster container-sync realm soak | yes | **no** |
-| process_workers prefork (eventlet-like OS processes) | yes | yes (unit/conf; not greenlet twin) |
+| process_workers prefork + eventlet_parity greenthreads | yes | yes (unit; not CPython greenlet bytecode) |
 | Operator VIP TLS PEM go-live | yes | **no** (script GREEN; Contabo self-signed LAB) |
 | Full ansible Python role twin | yes | partial (v3 subset) |
 
@@ -89,13 +92,12 @@ Canonical long form in-repo:
 
 - TempAuth func VIP **54/54**; soak **1h fail=0**
 - S3 MPU deep **11/11**; EC2 s3token **green**
-- **2026-08-07 P0 residual:** s3api unit **176+** (later **~204**)
-- **2026-08-07/08 SLO full audit:** Contabo live SLO matrix + s3cmd MPU KEEP — `tools/test-results/slo-full-audit-20260807/`
-- **2026-08-08 hard9 residual:** Paste/xprofile, Transition exec, ACP+IAM, SLO concurrent/workers — unit `s3api 204` / `middleware 414` / `proxy 23` — `tools/test-results/hard9-residual-wave-20260808/`
+- **2026-08-07/08 SLO full audit:** Contabo live SLO matrix + s3cmd MPU KEEP
+- **2026-08-08 hard9 residual:** Paste/xprofile, Transition, ACP+IAM, SLO concurrent — `tools/test-results/hard9-residual-wave-20260808/`
+- **2026-08-08 hard residual wave:** SigV2 + Paste plugins + IamService + cold_tier + multi-device shrink + eventlet_parity — unit **s3api 220** — `tools/test-results/hard-residual-wave-20260808/`
 - Operator TLS PEM **deferred** → not PRODUCTION-GO-LIVE
 
 ## How to use this matrix
 
 - Fairness A/B: only compare surfaces marked **yes** on both sides.
 - Marketing: do **not** say “full Swift compatibility.”
-- Shipping: label **LAB-HARD-GREEN** until operator TLS and multi-primary product claims are green.

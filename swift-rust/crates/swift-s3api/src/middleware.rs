@@ -34,8 +34,8 @@
 //! `501 NotImplemented` (`Code=NotImplemented`) so clients get predictable
 //! XML rather than fall-through 401/403/500 from other filters:
 //!
-//! * **SigV2** (`Authorization: AWS …` / `AWSAccessKeyId` query) — WONTFIX
-//!   unless reopened; only SigV4 is accepted.
+//! * **SigV2** (`Authorization: AWS …` / `AWSAccessKeyId` query) — **IMPLEMENTED**
+//!   (HMAC-SHA1 Base64; header + query Expires). See [`crate::sigv2`].
 //! * Other subresources in [`UNSUPPORTED_SUBRESOURCES`] (policy, website,
 //!   replication, select, …).
 //!
@@ -143,6 +143,9 @@ use crate::response::{
     put_object_response, s3_error_response, xml_response, BucketInfo, DeleteError,
     ListBucketResult, ListBucketResultV2, Owner, S3Object,
 };
+use crate::sigv2::{
+    is_sigv2_auth, parse_sigv2_auth, string_to_sign_for_request_v2, verify_sigv2, SigV2Auth,
+};
 use crate::sigv4::{parse_sigv4_auth, string_to_sign_for_request, verify_sigv4, SigV4Auth};
 use crate::versioning_store::{
     archive_object_name, bare_etag as vers_bare_etag, generate_version_id, index_object_name,
@@ -178,6 +181,10 @@ pub struct S3Api {
     /// When set, unknown access keys are exchanged via Keystone `/v3/s3tokens`
     /// with a real base64 string-to-sign (EC2 deferral).
     pub s3token_client: Option<Arc<dyn S3TokenClient>>,
+    /// Multi-tenant IAM policy engine (optional; empty = no extra deny).
+    pub iam: crate::iam::IamService,
+    /// Physical cold-tier storage-policy map (optional; empty = meta-only).
+    pub cold_map: crate::cold_tier::ColdPolicyMap,
 }
 
 impl S3Api {
@@ -189,7 +196,19 @@ impl S3Api {
             location: "us-east-1".to_string(),
             reseller_prefix: "AUTH_".into(),
             s3token_client: None,
+            iam: crate::iam::IamService::new(),
+            cold_map: crate::cold_tier::ColdPolicyMap::new(),
         }
+    }
+
+    pub fn with_iam(mut self, iam: crate::iam::IamService) -> Self {
+        self.iam = iam;
+        self
+    }
+
+    pub fn with_cold_map(mut self, map: crate::cold_tier::ColdPolicyMap) -> Self {
+        self.cold_map = map;
+        self
     }
 
     pub fn with_location(mut self, location: impl Into<String>) -> Self {
@@ -235,6 +254,24 @@ impl S3Api {
         let sts = string_to_sign_for_request(req)?;
         let result = client.exchange(&auth.access_key, &auth.signature, &sts)?;
         Some((credential_from_s3token(&auth.access_key, &result, &self.reseller_prefix), true))
+    }
+
+    /// Resolve credential for SigV2 (local map or Keystone s3tokens with v2 STS).
+    fn resolve_credential_v2(
+        &self,
+        auth: &SigV2Auth,
+        req: &Request,
+    ) -> Option<(S3Credential, bool)> {
+        if let Some(cred) = self.credentials.get(&auth.access_key) {
+            return Some((cred.clone(), false));
+        }
+        let client = self.s3token_client.as_ref()?;
+        let sts = string_to_sign_for_request_v2(req)?;
+        let result = client.exchange(&auth.access_key, &auth.signature, &sts)?;
+        Some((
+            credential_from_s3token(&auth.access_key, &result, &self.reseller_prefix),
+            true,
+        ))
     }
 }
 
@@ -292,27 +329,11 @@ const UNSUPPORTED_SUBRESOURCES: &[&str] = &[
 ];
 
 /// Fixed client-facing messages for stable 501 responses (unit-tested).
-const MSG_SIGV2_NOT_IMPLEMENTED: &str =
-    "The AWS Signature Version 2 authentication method is not implemented.";
 const MSG_ECDSA_STREAMING_NOT_IMPLEMENTED: &str =
     "ECDSA streaming payload signing (STREAMING-AWS4-ECDSA-P256-SHA256-*) is not implemented.";
 
 /// Cap for materializing aws-chunked wire bodies (~Swift max object size).
 const MAX_AWS_CHUNKED_BODY: u64 = 5_368_709_122;
-
-/// True when the request carries SigV2 auth (header `AWS …` or query
-/// `AWSAccessKeyId`). Mirrors Python `get_s3_access_key_id` v2 branch.
-fn is_sigv2_auth(req: &Request) -> bool {
-    if let Some(auth) = req.headers.get("Authorization") {
-        // SigV2: "AWS <accessKey>:<signature>" — not AWS4-HMAC-SHA256.
-        if auth.starts_with("AWS ") && !auth.starts_with("AWS4-") {
-            return true;
-        }
-    }
-    req.params()
-        .iter()
-        .any(|(k, _)| k == "AWSAccessKeyId")
-}
 
 /// Materialize, dechunk, and fix headers for an aws-chunked / STREAMING-* body.
 ///
@@ -485,10 +506,6 @@ fn not_implemented_subresource(sub: &str) -> Response {
         Some(&format!("subresource '{sub}' is not implemented")),
         &[],
     )
-}
-
-fn not_implemented_sigv2() -> Response {
-    s3_error_response("NotImplemented", Some(MSG_SIGV2_NOT_IMPLEMENTED), &[])
 }
 
 fn owner_for(cred: &S3Credential) -> Owner {
@@ -1103,11 +1120,29 @@ impl Middleware for S3Api {
             return next(req);
         }
 
-        // SigV2: stable 501 (WONTFIX) — do not fall through to TempAuth HTML.
+        // ---- SigV2 auth path (HMAC-SHA1) ----
         if is_sigv2_auth(&req) {
-            return not_implemented_sigv2();
+            let auth_v2 = match parse_sigv2_auth(&req) {
+                Some(a) => a,
+                None => return s3_error_response("AccessDenied", None, &[]),
+            };
+            let Some((cred, keystone_verified)) = self.resolve_credential_v2(&auth_v2, &req) else {
+                return s3_error_response("InvalidAccessKeyId", None, &[]);
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .ok();
+            if !keystone_verified
+                && !verify_sigv2(&cred.access_key, &cred.secret_key, &req, now)
+            {
+                return s3_error_response("SignatureDoesNotMatch", None, &[]);
+            }
+            // No aws-chunked for SigV2 (AWS STREAMING is V4-only).
+            return self.dispatch_authorized(req, cred, next);
         }
 
+        // ---- SigV4 auth path ----
         let auth = match parse_sigv4_auth(&req) {
             Some(a) => a,
             None => return s3_error_response("AccessDenied", None, &[]),
@@ -1130,6 +1165,14 @@ impl Middleware for S3Api {
             }
         }
 
+        self.dispatch_authorized(req, cred, next)
+    }
+}
+
+impl S3Api {
+    /// Shared S3 operation dispatch after auth has succeeded (V2 or V4).
+    fn dispatch_authorized(&self, req: Request, cred: S3Credential, next: &NextFn) -> Response {
+
         let params = req.params();
         if let Some(sub) = first_unsupported_subresource(&params) {
             return not_implemented_subresource(sub);
@@ -1143,6 +1186,19 @@ impl Middleware for S3Api {
         if let Some(b) = &bucket {
             if !validate_bucket_name(b, self.dns_compliant_bucket_names) {
                 return s3_error_response("InvalidBucketName", None, &[("BucketName", b)]);
+            }
+        }
+
+        // Multi-tenant IAM policy gate (when policies attached for principal).
+        if let Some(b) = &bucket {
+            let action = crate::iam::IamService::s3_action(&req.method, key.is_some());
+            let resource = crate::iam::IamService::s3_resource(b, key.as_deref());
+            let principal = self
+                .iam
+                .identity
+                .canonical_id_for_access_key(&cred.access_key);
+            if let Some(false) = self.iam.evaluate(&principal, action, &resource) {
+                return s3_error_response("AccessDenied", Some("IAM policy denied"), &[]);
             }
         }
 
@@ -4709,11 +4765,33 @@ mod tests {
         assert_not_implemented(api.handle(req, &next), "policy");
     }
 
+    /// Sign a request with SigV2 (header Authorization).
+    fn sign_request_v2(mut req: Request, access_key: &str, secret: &str) -> Request {
+        use crate::sigv2::{compute_signature_v2, string_to_sign_v2, SigV2Auth};
+        // Ensure Date is present for STS when no x-amz-date.
+        if req.headers.get("Date").is_none() && req.headers.get("x-amz-date").is_none() {
+            req.headers
+                .set("Date", "Tue, 27 Mar 2007 19:36:42 +0000");
+        }
+        let auth = SigV2Auth {
+            access_key: access_key.into(),
+            signature: String::new(),
+            query_auth: false,
+            expires: None,
+        };
+        let sts = string_to_sign_v2(&req, &auth);
+        let sig = compute_signature_v2(secret, &sts);
+        req.headers
+            .set("Authorization", format!("AWS {access_key}:{sig}"));
+        req
+    }
+
     #[test]
-    fn sigv2_header_auth_returns_501() {
+    fn sigv2_header_auth_bad_sig_is_403() {
         let api = S3Api::new(cred_map());
         let mut headers = HeaderKeyDict::new();
         headers.set("Host", "localhost");
+        headers.set("Date", "Tue, 27 Mar 2007 19:36:42 +0000");
         headers.set(
             "Authorization",
             "AWS test:tester:deadbeefsignature",
@@ -4726,13 +4804,46 @@ mod tests {
             body: Body::empty(),
         };
         let next: NextFn = Arc::new(|_| {
-            panic!("SigV2 must not fall through to next middleware");
+            panic!("bad SigV2 must not fall through");
         });
-        assert_not_implemented(api.handle(req, &next), "Signature Version 2");
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(
+            body.contains("SignatureDoesNotMatch"),
+            "expected SignatureDoesNotMatch, got {body}"
+        );
     }
 
     #[test]
-    fn sigv2_query_auth_returns_501() {
+    fn sigv2_header_auth_good_sig_reaches_backend() {
+        let api = S3Api::new(cred_map());
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Host", "localhost");
+        let req = Request {
+            method: "GET".into(),
+            path: "/mybucket/obj".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        };
+        let req = sign_request_v2(req, "test:tester", "testing");
+        let next: NextFn = Arc::new(|r| {
+            assert!(
+                r.headers.get("X-Backend-Authorize-Override").is_some()
+                    || r.headers.get("X-Auth-Token").is_some()
+                    || r.path.contains("/v1/"),
+                "expected authorized swift subrequest, path={}",
+                r.path
+            );
+            Response::with_body(200, b"ok".to_vec())
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200, "SigV2 good auth must succeed");
+    }
+
+    #[test]
+    fn sigv2_query_auth_bad_sig_is_403() {
         let api = S3Api::new(cred_map());
         let mut headers = HeaderKeyDict::new();
         headers.set("Host", "localhost");
@@ -4744,9 +4855,12 @@ mod tests {
             body: Body::empty(),
         };
         let next: NextFn = Arc::new(|_| {
-            panic!("SigV2 query auth must not fall through");
+            panic!("bad SigV2 query must not fall through");
         });
-        assert_not_implemented(api.handle(req, &next), "Signature Version 2");
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("SignatureDoesNotMatch"), "got {body}");
     }
 
     /// Empty-payload SHA-256 hex (terminal streaming chunk).

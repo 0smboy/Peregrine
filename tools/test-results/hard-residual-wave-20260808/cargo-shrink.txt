@@ -1,0 +1,10 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running unittests src/lib.rs (target/debug/deps/swift_container_server-93655f0f5d847cad)
+
+running 3 tests
+test sharder::tests::test_auto_shrink_opt_default_true ... ok
+test sharder::tests::test_multi_device_auto_shrink_finds_donor_sibling ... ok
+test sharder::tests::test_process_shrinking_donors_moves_objects_and_marks_shrunk ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 0.06s
+

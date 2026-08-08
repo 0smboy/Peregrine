@@ -1,0 +1,30 @@
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `md5_hex` is never used
+   --> crates/swift-middleware/src/encrypter.rs:378:4
+    |
+378 | fn md5_hex(data: &[u8]) -> String {
+    |    ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib) generated 2 warnings (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+   Compiling swift-s3api v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.29s
+     Running unittests src/lib.rs (target/debug/deps/swift_s3api-cab4f9cdbd7ff286)
+
+running 5 tests
+test iam::tests::no_policy_returns_none ... ok
+test iam::tests::multi_tenant_isolation ... ok
+test iam::tests::s3_action_resource_helpers ... ok
+test iam::tests::policy_allow_get_deny_delete ... ok
+test iam::tests::email_map_and_access_key ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 215 filtered out; finished in 0.00s
+

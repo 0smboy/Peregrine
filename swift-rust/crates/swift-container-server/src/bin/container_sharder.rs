@@ -94,6 +94,7 @@ fn main() {
     let opts = SharderRunOpts {
         cleave_batch_size,
         auto_shard,
+        auto_shrink: true,
         shard_size,
         minimum_shard_size,
     };

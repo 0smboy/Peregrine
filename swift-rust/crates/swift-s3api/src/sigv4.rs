@@ -26,9 +26,9 @@
 //! This module only handles the **header** SigV4 signature (where
 //! `X-Amz-Content-SHA256` is the literal `STREAMING-*` token).
 //!
-//! What is NOT here: SigV2 (middleware returns stable `501 NotImplemented`).
-//! Also deferred: clock-skew/expiry checks, and the Date-header-only
-//! timestamp fallback (only `X-Amz-Date` is read).
+//! SigV2 lives in [`crate::sigv2`]. Also deferred here: clock-skew/expiry
+//! checks, and the Date-header-only timestamp fallback (only `X-Amz-Date`
+//! is read for V4).
 
 use crate::crypto::{hmac_sha256, hmac_sha256_hex, sha256_hex, streq_const_time};
 use swift_http::{parse_query, HeaderKeyDict, Request};

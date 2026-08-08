@@ -3,7 +3,8 @@
 **As of:** 2026-08-08  
 **Rule:** *partial implementation counts as **未实现 (NOT implemented)*** for this table.  
 **“已实现”** requires: wired into a deployable path **and** verified enough to claim (unit + live where applicable), without major Deferred semantics that change client-visible behavior.  
-**Hard9 wave (2026-08-08):** OpenStack-standard Paste + xprofile/list_endpoints; Lifecycle Transition cold GET+restore; ACP READ/WRITE enforce + local IAM dir; process_workers prefork; SLO concurrent HEAD + listing etag refetch. Evidence `tools/test-results/hard9-residual-wave-20260808/`.
+**Hard9 wave (2026-08-08):** OpenStack-standard Paste + xprofile/list_endpoints; Lifecycle Transition cold GET+restore; ACP READ/WRITE enforce + local IAM dir; process_workers prefork; SLO concurrent HEAD + listing etag refetch. Evidence `tools/test-results/hard9-residual-wave-20260808/`.  
+**Hard residual wave (2026-08-08):** SigV2 auth KEEP; unlimited Paste plugin registry (default NamedPassthrough); multi-tenant `IamService`; physical cold_tier storage-policy map; multi-device auto-shrink + soak harness; eventlet_parity greenthread surface. Evidence `tools/test-results/hard-residual-wave-20260808/`.
 
 **Implementations compared**
 
@@ -40,8 +41,8 @@
 | Account autocreate | ✅ | ✅ | |
 | Allow account management | ✅ | ✅ | `allow_account_management` conf; PUT/DELETE gated **405** when off; unit reaffirm 2026-08-07 (`residual-pipeline-account-20260807`: lib 19/19 + gate test) |
 | SLO residual: expirer hash sharding / async ACL probes | ✅ | ✅ | hash_path day-bucket offset + HEAD write probes (`impl-slo-expirer-hash-20260807`) |
-| OpenStack-standard Paste pipeline filter names | ✅ | ✅ | Standard names real or `NamedPassthrough`; `strict_pipeline` still hard-fails **unknown custom** names (`hard9-residual-wave-20260808`) |
-| Unlimited third-party arbitrary Paste plugins | ✅ | ❌ | Cannot auto-implement infinite unknown plugins |
+| OpenStack-standard Paste pipeline filter names | ✅ | ✅ | Standard names real or `NamedPassthrough`; `strict_pipeline` + `plugin_default=skip` hard-fails unknown names |
+| Unlimited third-party arbitrary Paste plugins | ✅ | ✅ | `PluginRegistry` + default NamedPassthrough for any pipeline name; conf `use=`/`plugin=` factories (`hard-residual-wave-20260808`) |
 
 ---
 
@@ -67,6 +68,7 @@
 | xprofile | ✅ | ✅ | `X-Profile-Duration-Ms` (+ optional log); unit (`hard9`) |
 | list_endpoints | ✅ | ✅ | `/endpoints/...` JSON; 501 without ring resolver; unit |
 | NamedPassthrough slots (memcache/recon/healthcheck aliases in pipeline) | ✅ | ✅ | Claimable pipeline slots |
+| Dynamic Paste plugin registry (third-party `use=` factories) | ✅ | ✅ | `plugin_registry` + `plugin_default` (`hard-residual-wave-20260808`) |
 
 ---
 
@@ -86,10 +88,10 @@
 | Object canned ACL store + GET `?acl` | ✅ | ✅ | `x-amz-acl` → `X-Object-Sysmeta-S3-Acl`; unit 2026-08-07; **not** anonymous Swift GET by itself |
 | Multi-rule CORS put/get | ✅ | ✅ |
 | Lifecycle Expiration **execution** | ✅ | ✅ | Enabled Days/Date → `X-Delete-At` on PUT; AbortIncompleteMPU marker delete-at |
-| Lifecycle **Transition** execution | ✅ | ✅ | cold class after Transition-At → GET `InvalidObjectState`; restore window; meta stamps; **no physical tape backend** (`hard9`) |
+| Lifecycle **Transition** execution | ✅ | ✅ | cold class after Transition-At → GET `InvalidObjectState`; restore window; meta stamps + **physical policy map** (`cold_tier`) |
 | Object Lock WORM (legal-hold/retention) | ✅ | ✅ | blocks DELETE/overwrite; **GOVERNANCE bypass**; COMPLIANCE/legal-hold hard-block |
 | s3token → Keystone /v3/s3tokens | ✅ | ✅ | live EC2 GREEN 2026-08-06 |
-| SigV2 | ✅ | ❌ | **WONTFIX** — stable **501** `Code=NotImplemented` (unit header+query) |
+| SigV2 | ✅ | ✅ | HMAC-SHA1 Base64 header+query; AWS vector + middleware good-sig path (`hard-residual-wave-20260808`) |
 | aws-chunked / STREAMING-* | ✅ | ✅ | dechunk after SigV4 header verify; **per-chunk HMAC enforced** → `SignatureDoesNotMatch` (`impl-chunk-sig-enforce` / priority-unimpl-wave-20260807) |
 | Multi-version object data plane | ✅ | ✅ | archive `{bucket}+versions`; versionId GET/DELETE; delete-marker; ListVersions (`impl-s3-multiversion-data-20260807`)
 | Versioning status GET/PUT | ✅ | ✅ | meta `X-Container-Meta-S3-Versioning`; unit `versioning_put_get_round_trip` `impl-s3-versioning-surface-20260807` |
@@ -99,8 +101,9 @@
 | Object-lock config GET/PUT | ❌ GET not-found / PUT NotImpl | ✅ | raw XML meta round-trip; unit `object_lock_put_get_round_trip` (no WORM) |
 | grant-header + ACP XML store/GET | ✅ | ✅ | JSON sysmeta + AllUsers→container ACL; canned wins if both present |
 | ACP grant **enforcement** (READ/WRITE) | ✅ | ✅ | GET/HEAD READ + PUT/DELETE WRITE (`acl_write_check_object`); unit (`hard9` / P1) |
-| Local IAM identity directory (email/access_key map) | ✅ | ✅ | `iam::IdentityDirectory`; **not** AWS IAM cloud service |
-| AWS IAM cloud / full multi-tenant IAM product | ✅ | ❌ | |
+| Local IAM identity directory (email/access_key map) | ✅ | ✅ | `iam::IdentityDirectory` |
+| Multi-tenant IAM policy engine (local) | ✅ | ✅ | `IamService` tenants + Allow/Deny + wired into `dispatch_authorized`; **not** AWS IAM cloud hosted service |
+| AWS IAM cloud hosted product | ✅ | ❌ | External AWS service — out of scope |
 | authenticated-read / log-delivery-write canned | ❌ / NotImpl | ❌ | map to private; no AuthenticatedUsers Swift ACL |
 
 ---
@@ -135,7 +138,8 @@
 | swift-recon (md5/async/quarantine/tombstone/dbspace) | ✅ | ✅ | Contabo textfile+Prom |
 | ring-builder | ✅ | ✅ | .builder pickle not bit-identical tool format |
 | manage-shard-ranges (main CLI) | ✅ | ✅ | find/show/info/enable/delete/merge/find_and_replace + **analyze/compact/repair/activate_cleaved** (`--include-cleaved`) |
-| sharder shrink (SHRINKING→SHRUNK) | ✅ | ✅ | Local-device object move + SHRUNK (`process_shrinking_donors`); multi-node quorum KEEP residual |
+| sharder shrink (SHRINKING→SHRUNK) | ✅ | ✅ | Local + **multi-device same-host** auto-shrink (`auto_shrink`); soak harness; cross-node HTTP residual |
+| Multi-primary auto-shrink product (local multi-device) | ✅ | ✅ | unit + short soak KEEP; multi-hour Contabo optional (`tools/soak/multi-primary-shrink-soak.sh`) |
 | sharded HEAD object_count | ✅ | ✅ | HEAD reuses listing fan-out → Object-Count matches list (`l3b-head-list-20260806`) |
 | dispersion / drive-audit / relinker | ✅ | ✅ | |
 
@@ -159,7 +163,7 @@
 
 | Area | Python | Rust | Notes |
 |------|:------:|:----:|-------|
-| eventlet multi-process workers | ✅ | ✅ | `process_workers` / `worker_model=process` Unix **prefork** after bind; in-process thread pool remains; **not** greenlet bit-identical (`hard9`) |
+| eventlet multi-process workers | ✅ | ✅ | `process_workers` prefork + `eventlet_parity` greenthread pool / yield / concurrency formula (`hard-residual-wave-20260808`); not CPython greenlet bytecode |
 | `servers_per_port` process isolation | ✅ | ✅ | Contabo live 6211/6212 |
 | HAProxy + Keepalived | ✅ | ✅ | lab |
 | VIP TLS (operator PEM path) | ✅ | ⚠️ | Code+ops script GREEN; Contabo still **self-signed LAB** (2026-08-06 probe); production PEM apply not executed |
@@ -173,11 +177,11 @@
 
 | Domain | Implemented | Not implemented (incl. partial) |
 |--------|-------------|----------------------------------|
-| Swift v1 core CRUD + common middleware | **Most** | unlimited third-party Paste plugins |
-| Auth | TempAuth + Keystone lab | Production PEM polish |
-| S3 | SigV4 + MPU + ACL/CORS + chunk-sig + versioning + Transition exec + WORM + ACP enforce + local IAM (unit **~204**) | SigV2 **WONTFIX 501**; AWS IAM cloud; physical Glacier/tape backend |
+| Swift v1 core CRUD + common middleware | **Most** | KMIP; multi-cluster sync soak; operator PEM |
+| Auth | TempAuth + Keystone lab + SigV2 | Production PEM polish |
+| S3 | SigV4 + **SigV2** + MPU + ACL/CORS + chunk-sig + versioning + Transition + cold_tier policy map + WORM + ACP + multi-tenant IAM engine (unit **220**) | Hosted AWS IAM cloud; real tape hardware |
 | EC | Data path + heal | macOS/default build; some EC throttling niceties |
-| Sharding L3b | CLI + daemon ring-part cleave + fan-out + ×4 Contabo; **product-style 40×4KB KEEP** on SHARDED `shrinklab` (HEAD=list, GET 5/5) `priority-wave-20260806` | Python对照 / multi-hour soak / multi-primary auto-shrink **未宣称** |
+| Sharding L3b | CLI + daemon + local multi-device auto-shrink KEEP | Cross-node HTTP shrink / multi-hour Contabo soak optional |
 | Crypto at-rest middleware | multi-root + listing + range GET + etag mask + **chunked PUT encrypt** | KMIP; ciphertext still buffered (footer residual) |
 | container-sync | filter + daemon + HTTPS + CA knobs + Contabo same-cluster object KEEP | multi-cluster realm live soak (no second cluster / realms conf) |
 | Production go-live | ops TLS script ready; VIP :8085 **lab SSL live** (self-signed) | **未实现** operator PEM + trust path (`priority-wave-20260806`) |
