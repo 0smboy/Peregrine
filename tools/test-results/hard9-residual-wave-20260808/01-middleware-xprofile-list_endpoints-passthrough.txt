@@ -1,0 +1,11 @@
+=== filter: xprofile ===
+(eval):18: permission denied: 
+EXIT_xprofile=126
+
+=== filter: list_endpoints ===
+(eval):22: permission denied: 
+EXIT_list_endpoints=126
+
+=== filter: passthrough ===
+(eval):26: permission denied: 
+EXIT_passthrough=126

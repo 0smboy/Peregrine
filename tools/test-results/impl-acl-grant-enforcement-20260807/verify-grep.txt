@@ -1,0 +1,30 @@
+crates/swift-s3api/src/acl_cors.rs:56://!   [`object_grants_allow_read`] / [`object_acl_denies_read`].
+crates/swift-s3api/src/acl_cors.rs:740:pub fn object_grants_allow_read(
+crates/swift-s3api/src/acl_cors.rs:793:pub fn object_acl_denies_read(
+crates/swift-s3api/src/acl_cors.rs:799:        object_grants_allow_read(headers, principal_access_key, principal_account),
+crates/swift-s3api/src/acl_cors.rs:1607:    fn object_grants_allow_read_enforcement_matrix() {
+crates/swift-s3api/src/acl_cors.rs:1611:            object_grants_allow_read(&empty, "foreign", "AUTH_x"),
+crates/swift-s3api/src/acl_cors.rs:1614:        assert!(!object_acl_denies_read(&empty, "foreign", "AUTH_x"));
+crates/swift-s3api/src/acl_cors.rs:1623:            object_grants_allow_read(&h_empty_grants, "foreign", "AUTH_x"),
+crates/swift-s3api/src/acl_cors.rs:1642:            object_grants_allow_read(&h, "owner-ak", "AUTH_owner"),
+crates/swift-s3api/src/acl_cors.rs:1651:            object_grants_allow_read(&h_acct, "other", "AUTH_owner"),
+crates/swift-s3api/src/acl_cors.rs:1655:            object_grants_allow_read(&h, "foreign-ak", "AUTH_foreign"),
+crates/swift-s3api/src/acl_cors.rs:1658:        assert!(object_acl_denies_read(&h, "foreign-ak", "AUTH_foreign"));
+crates/swift-s3api/src/acl_cors.rs:1684:            object_grants_allow_read(&h2, "friend-ak", "AUTH_friend"),
+crates/swift-s3api/src/acl_cors.rs:1687:        assert!(!object_acl_denies_read(&h2, "friend-ak", "AUTH_friend"));
+crates/swift-s3api/src/acl_cors.rs:1703:            object_grants_allow_read(&h3, "friend-ak", "AUTH_friend"),
+crates/swift-s3api/src/middleware.rs:108:    object_acl_denies_read, object_acl_xml_from_headers, parse_cors_configuration,
+crates/swift-s3api/src/middleware.rs:964:fn deny_if_object_acl_blocks_read(cred: &S3Credential, headers: &HeaderKeyDict) -> Option<Response> {
+crates/swift-s3api/src/middleware.rs:965:    if object_acl_denies_read(headers, &cred.access_key, &cred.account) {
+crates/swift-s3api/src/middleware.rs:973:fn translate_object_get_head(
+crates/swift-s3api/src/middleware.rs:978:    if let Some(denied) = deny_if_object_acl_blocks_read(cred, &resp.headers) {
+crates/swift-s3api/src/middleware.rs:1345:                    return translate_object_get_head(&method, resp, &cred);
+crates/swift-s3api/src/middleware.rs:2064:                return translate_object_get_head(method, resp, cred);
+crates/swift-s3api/src/middleware.rs:2077:                if let Some(denied) = deny_if_object_acl_blocks_read(cred, &cur.headers) {
+crates/swift-s3api/src/middleware.rs:2091:                if let Some(denied) = deny_if_object_acl_blocks_read(cred, &resp.headers) {
+crates/swift-s3api/src/middleware.rs:2113:            if let Some(denied) = deny_if_object_acl_blocks_read(cred, &resp.headers) {
+crates/swift-s3api/src/middleware.rs:2138:    let mut out = translate_object_get_head(method, resp, cred);
+crates/swift-s3api/src/middleware.rs:3885:    fn get_object_acl_grant_denies_foreign_principal() {
+crates/swift-s3api/src/middleware.rs:3916:    fn get_object_acl_grant_read_allows_principal() {
+crates/swift-s3api/src/middleware.rs:3930:    fn get_object_acl_owner_always_allowed() {
+crates/swift-s3api/src/middleware.rs:3943:    fn get_object_without_acl_json_not_denied() {

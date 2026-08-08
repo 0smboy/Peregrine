@@ -283,13 +283,22 @@ fn object_element(obj: &S3Object) -> Element {
     let mut contents = Element::new("Contents");
     contents.push_leaf("Key", &obj.key);
     contents.push_leaf("LastModified", &obj.last_modified);
-    contents.push_leaf("ETag", &obj.etag);
+    // AWS / Python s3api always emit a quote-wrapped ETag in ListBucketResult.
+    // s3cmd and other plain-XML clients expect `<ETag>"md5"</ETag>` (quotes inside).
+    let etag = ensure_quoted_etag(&obj.etag);
+    contents.push_leaf("ETag", etag);
     contents.push_leaf("Size", obj.size.to_string());
     if let Some(owner) = &obj.owner {
         contents.push(owner_element(owner));
     }
     contents.push_leaf("StorageClass", &obj.storage_class);
     contents
+}
+
+/// Ensure `etag` is wrapped in double quotes for S3 XML (and headers).
+fn ensure_quoted_etag(etag: &str) -> String {
+    let t = etag.trim().trim_matches('"');
+    format!("\"{t}\"")
 }
 
 fn owner_element(owner: &Owner) -> Element {
@@ -466,6 +475,79 @@ mod tests {
              <CommonPrefixes><Prefix>photos/</Prefix></CommonPrefixes>\
              </ListBucketResult>"
         );
+    }
+
+    /// s3cmd `ls` path: Content-Type + xmlns + quoted ETag on ListObjects v1.
+    #[test]
+    fn test_list_bucket_result_into_response_content_type_and_etag() {
+        let lbr = ListBucketResult {
+            name: "b".to_string(),
+            prefix: String::new(),
+            marker: String::new(),
+            next_marker: None,
+            max_keys: 1000,
+            delimiter: None,
+            encoding_type: None,
+            is_truncated: false,
+            contents: vec![S3Object {
+                key: "k".to_string(),
+                last_modified: "2013-05-24T00:00:00.000Z".to_string(),
+                // Unquoted input must still serialize as quoted (Python parity).
+                etag: "deadbeef".to_string(),
+                size: 1,
+                storage_class: "STANDARD".to_string(),
+                owner: None,
+            }],
+            common_prefixes: vec![],
+        };
+        let resp = lbr.into_response();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(
+            body.starts_with("<?xml version='1.0' encoding='UTF-8'?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"),
+            "root+xmlns missing: {body}"
+        );
+        assert!(body.contains("<ETag>\"deadbeef\"</ETag>"), "quoted ETag missing: {body}");
+        assert!(body.contains("<IsTruncated>false</IsTruncated>"));
+        assert!(body.contains("<Contents>"));
+        assert!(body.ends_with("</ListBucketResult>") || body.contains("</ListBucketResult>"));
+    }
+
+    /// ListObjectsV2: same Content-Type / xmlns / ETag contract as v1.
+    #[test]
+    fn test_list_bucket_result_v2_into_response_content_type_and_etag() {
+        let lbr = ListBucketResultV2 {
+            name: "b".to_string(),
+            prefix: String::new(),
+            start_after: String::new(),
+            continuation_token: None,
+            next_continuation_token: None,
+            key_count: 1,
+            max_keys: 1000,
+            delimiter: None,
+            encoding_type: None,
+            is_truncated: false,
+            contents: vec![S3Object {
+                key: "a".to_string(),
+                last_modified: "2013-05-24T00:00:00.000Z".to_string(),
+                etag: "\"aa\"".to_string(),
+                size: 1,
+                storage_class: "STANDARD".to_string(),
+                owner: None,
+            }],
+            common_prefixes: vec![],
+        };
+        let resp = lbr.into_response();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains(
+            "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+        ));
+        assert!(body.contains("<KeyCount>1</KeyCount>"));
+        assert!(body.contains("<ETag>\"aa\"</ETag>"));
+        assert!(body.contains("<Key>a</Key>"));
     }
 
     #[test]

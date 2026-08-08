@@ -1,0 +1,223 @@
+    Blocking waiting for file lock on artifact directory
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `md5_hex` is never used
+   --> crates/swift-middleware/src/encrypter.rs:378:4
+    |
+378 | fn md5_hex(data: &[u8]) -> String {
+    |    ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib) generated 2 warnings (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running unittests src/lib.rs (target/debug/deps/swift_s3api-69515649dacc0e5b)
+
+running 198 tests
+test acl_cors::tests::apply_canned_bucket_owner_collapses_to_private ... ok
+test acl_cors::tests::apply_canned_public_read_write ... ok
+test acl_cors::tests::authenticated_read_is_unsupported_maps_private ... ok
+test acl_cors::tests::canned_takes_precedence_over_grant_headers ... ok
+test acl_cors::tests::apply_canned_public_read ... ok
+test acl_cors::tests::infer_acl_from_read_write_headers ... ok
+test acl_cors::tests::grant_read_allusers_maps_public_read_container_headers ... ok
+test acl_cors::tests::acp_xml_roundtrip_structured_grants ... ok
+test acl_cors::tests::legacy_single_rule_headers_still_work ... ok
+test acl_cors::tests::multi_rule_xml_builder ... ok
+test acl_cors::tests::multi_rule_meta_encode_decode_roundtrip ... ok
+test acl_cors::tests::object_acp_json_store_and_get_xml ... ok
+test acl_cors::tests::parse_grant_header_list_form ... ok
+test acl_cors::tests::parse_cors_roundtrip_fields ... ok
+test acl_cors::tests::parse_multi_rule_cors ... ok
+test acl_cors::tests::object_canned_acl_private_and_public_read ... ok
+test acl_cors::tests::object_grants_allow_read_enforcement_matrix ... ok
+test acl_cors::tests::private_acl_contains_full_control ... ok
+test acl_cors::tests::public_read_write_acl_xml_has_read_and_write ... ok
+test acl_cors::tests::resolve_grant_headers_to_policy ... ok
+test aws_chunked::tests::cleanup_strips_aws_chunked_token ... ok
+test aws_chunked::tests::aws_doc_trailer_hash_vector ... ok
+test aws_chunked::tests::dechunk_missing_chunk_signature_in_signed_mode_errors ... ok
+test aws_chunked::tests::dechunk_bad_chunk_signature_errors ... ok
+test aws_chunked::tests::dechunk_python_hmac_vector_without_verify ... ok
+test aws_chunked::tests::dechunk_bad_trailer_signature_errors ... ok
+test aws_chunked::tests::dechunk_python_hmac_vector_with_verify ... ok
+test aws_chunked::tests::dechunk_trailer_mode_missing_trailer_sig_errors ... ok
+test aws_chunked::tests::dechunk_unsigned_simple ... ok
+test aws_chunked::tests::dechunk_unsigned_trailer_still_ok ... ok
+test aws_chunked::tests::dechunk_unsigned_single_chunk ... ok
+test aws_chunked::tests::dechunk_signed_trailer_signature_ok ... ok
+test aws_chunked::tests::dechunk_with_trailer ... ok
+test aws_chunked::tests::size_mismatch_errors ... ok
+test aws_chunked::tests::is_aws_chunked_detects_streaming_and_encoding ... ok
+test bucket_config::tests::empty_list_versions_shape ... ok
+test bucket_config::tests::meta_blob_encode_decode_binary_safe ... ok
+test bucket_config::tests::lifecycle_meta_blob_roundtrip ... ok
+test bucket_config::tests::object_lock_meta_blob_roundtrip ... ok
+test bucket_config::tests::tagging_empty_xml ... ok
+test bucket_config::tests::parse_versioning_roundtrip ... ok
+test bucket_config::tests::tagging_parse_encode_roundtrip ... ok
+test bucket_config::tests::versioning_meta_stamp ... ok
+test bucket_config::tests::versioning_xml_enabled_suspended_empty ... ok
+test crypto::tests::test_hmac_rfc4231_case2 ... ok
+test crypto::tests::test_streq_const_time ... ok
+test crypto::tests::test_sha256_empty ... ok
+test delete::tests::parses_keys_and_quiet ... ok
+test delete::tests::rejects_non_delete ... ok
+test crypto::tests::test_sha256_abc ... ok
+test lifecycle_exec::tests::abort_incomplete_stamps_delete_at_on_marker ... ok
+test lifecycle_exec::tests::apply_from_container_meta ... ok
+test lifecycle_exec::tests::apply_transition_meta_matching_key ... ok
+test lifecycle_exec::tests::apply_transition_meta_non_matching_prefix_skips ... ok
+test lifecycle_exec::tests::apply_sets_x_delete_at_header ... ok
+test lifecycle_exec::tests::compute_delete_at_days_one ... ok
+test lifecycle_exec::tests::compute_delete_at_prefix_filter ... ok
+test lifecycle_exec::tests::date_rule ... ok
+test lifecycle_exec::tests::disabled_rule_ignored ... ok
+test lifecycle_exec::tests::parse_enabled_only ... ok
+test lifecycle_exec::tests::expiration_still_works_alongside_transition ... ok
+test lifecycle_exec::tests::parse_transition_and_abort_from_sample_xml ... ok
+test lifecycle_exec::tests::top_level_prefix_legacy_shape ... ok
+test lifecycle_exec::tests::transition_date_rule ... ok
+test middleware::tests::aws_chunked_content_encoding_dechunks_to_backend ... ok
+test middleware::tests::aws_chunked_bad_chunk_signature_is_signature_does_not_match ... ok
+test middleware::tests::aws_chunked_malformed_returns_incomplete_body ... ok
+test middleware::tests::aws_chunked_bad_trailer_signature_is_signature_does_not_match ... ok
+test middleware::tests::aws_chunked_streaming_missing_decoded_length_is_411 ... ok
+test middleware::tests::aws_chunked_streaming_multi_chunk_signed_dechunks_to_backend ... ok
+test middleware::tests::aws_chunked_signed_trailer_ok_dechunks_to_backend ... ok
+test middleware::tests::aws_chunked_trailer_unsigned_dechunks_to_backend ... ok
+test middleware::tests::aws_chunked_streaming_payload_dechunks_to_backend ... ok
+test middleware::tests::compliance_bypass_header_still_denies_delete ... ok
+test middleware::tests::copy_object_sets_x_copy_from ... ok
+test middleware::tests::credentials_from_tempauth_admin ... ok
+test middleware::tests::decode_aws_chunked_empty_payload ... ok
+test middleware::tests::decode_aws_chunked_pure_multi_chunk_and_trailers ... ok
+test middleware::tests::cors_put_then_get_round_trips ... ok
+test middleware::tests::create_and_delete_bucket ... ok
+test middleware::tests::bucket_tagging_put_get_delete_round_trip ... ok
+test middleware::tests::expired_retention_allows_delete ... ok
+test middleware::tests::get_acl_returns_private_policy ... ok
+test middleware::tests::cors_multi_rule_put_stamps_s3_cors_meta ... ok
+test middleware::tests::get_object_404_is_nosuchkey ... ok
+test middleware::tests::get_object_acl_defaults_private_when_no_meta ... ok
+test middleware::tests::get_object_acl_grant_read_allows_principal ... ok
+test middleware::tests::get_object_acl_from_sysmeta ... ok
+test middleware::tests::get_object_acl_grant_denies_foreign_principal ... ok
+test middleware::tests::get_object_acl_owner_always_allowed ... ok
+test middleware::tests::get_object_without_acl_json_not_denied ... ok
+test middleware::tests::governance_bypass_header_allows_delete ... ok
+test middleware::tests::governance_bypass_header_allows_overwrite_put ... ok
+test middleware::tests::head_object_acl_grant_denies_foreign_principal ... ok
+test middleware::tests::is_sigv2_detects_header_and_query ... ok
+test middleware::tests::legal_hold_blocks_delete ... ok
+test middleware::tests::legal_hold_release_allows_delete ... ok
+test middleware::tests::legal_hold_blocks_overwrite_put ... ok
+test middleware::tests::legal_hold_put_get_round_trip ... ok
+test middleware::tests::legal_hold_bypass_header_still_denies_delete ... ok
+test middleware::tests::list_multipart_uploads_empty_when_segments_missing ... ok
+test middleware::tests::list_multipart_uploads_lists_markers ... ok
+test middleware::tests::list_buckets_translates_json ... ok
+test middleware::tests::lifecycle_put_get_delete_round_trip ... ok
+test middleware::tests::list_objects_translates ... ok
+test middleware::tests::list_objects_v2_emits_key_count ... ok
+test middleware::tests::mpu_init_stamps_abort_incomplete_x_delete_at ... ok
+test middleware::tests::location_subresource_local ... ok
+test middleware::tests::multipart_upload_abort_deletes_marker ... ok
+test middleware::tests::multi_delete_deletes_keys ... ok
+test middleware::tests::multipart_upload_initiate_part_and_complete_flow ... ok
+test middleware::tests::multiversion_delete_current_makes_delete_marker_get_404 ... ok
+test middleware::tests::multiversion_get_specific_version_id_returns_body ... ok
+test middleware::tests::multiversion_double_put_two_version_ids_and_list ... ok
+test middleware::tests::multiversion_delete_version_id_removes_version ... ok
+test middleware::tests::multiversion_suspended_no_multi_version ... ok
+test middleware::tests::passthrough_without_sigv4 ... ok
+test middleware::tests::put_bucket_acl_grant_read_allusers_stamps_container_read ... ok
+test middleware::tests::put_bucket_acl_public_read_write ... ok
+test middleware::tests::object_lock_put_get_round_trip ... ok
+test middleware::tests::object_tagging_put_get_round_trip ... ok
+test middleware::tests::put_bucket_acl_acp_body_roundtrip ... ok
+test middleware::tests::put_object_acl_posts_sysmeta ... ok
+test middleware::tests::put_object_acl_acp_body_stores_json_and_get_roundtrip ... ok
+test middleware::tests::put_object_maps_path_and_status ... ok
+test middleware::tests::put_object_no_x_delete_at_when_prefix_mismatch ... ok
+test middleware::tests::put_object_stamps_transition_meta_from_lifecycle ... ok
+test middleware::tests::put_object_stores_canned_acl_sysmeta ... ok
+test middleware::tests::put_object_transition_skips_non_matching_prefix ... ok
+test middleware::tests::put_object_stamps_x_delete_at_from_lifecycle ... ok
+test middleware::tests::put_stamps_default_retention_from_bucket_object_lock ... ok
+test middleware::tests::reject_bad_access_key ... ok
+test middleware::tests::reject_bad_signature ... ok
+test middleware::tests::sigv2_header_auth_returns_501 ... ok
+test middleware::tests::sigv2_query_auth_returns_501 ... ok
+test middleware::tests::retention_future_blocks_delete ... ok
+test middleware::tests::unknown_ec2_key_defers_to_s3token_client ... ok
+test middleware::tests::unknown_ec2_key_without_client_still_invalid ... ok
+test middleware::tests::unsupported_policy_still_501 ... ok
+test middleware::tests::retention_put_get_round_trip ... ok
+test mpu::tests::list_mpu_xml_shape ... ok
+test mpu::tests::parse_complete ... ok
+test middleware::tests::versioning_get_unconfigured_empty_xml ... ok
+test middleware::tests::versioning_put_get_round_trip ... ok
+test middleware::tests::versions_list_returns_empty_list_versions_result ... ok
+test mpu::tests::parse_marker_vs_part ... ok
+test mpu::tests::segments_and_part_names ... ok
+test object_lock_worm::tests::compliance_bypass_denied ... ok
+test mpu::tests::slo_json_shape ... ok
+test object_lock_worm::tests::default_retention_days_and_stamp ... ok
+test object_lock_worm::tests::expired_retain_allows_even_without_bypass ... ok
+test object_lock_worm::tests::format_iso_roundtrip_epoch ... ok
+test object_lock_worm::tests::governance_without_bypass_denies ... ok
+test object_lock_worm::tests::governance_bypass_allows_delete ... ok
+test object_lock_worm::tests::legal_hold_blocks ... ok
+test object_lock_worm::tests::legal_hold_ignores_governance_bypass ... ok
+test object_lock_worm::tests::retention_future_blocks ... ok
+test object_lock_worm::tests::legal_hold_xml_roundtrip ... ok
+test object_lock_worm::tests::retention_xml_roundtrip ... ok
+test parse::tests::test_path_style_bucket_and_key ... ok
+test parse::tests::test_invalid_path_style_bucket_name ... ok
+test parse::tests::test_path_style_bucket_only ... ok
+test parse::tests::test_path_style_service_request ... ok
+test parse::tests::test_validate_bucket_name_dns ... ok
+test parse::tests::test_s3_to_swift_path ... ok
+test parse::tests::test_validate_bucket_name_legacy ... ok
+test parse::tests::test_vhost_port_stripped ... ok
+test parse::tests::test_vhost_style ... ok
+test response::tests::test_copy_object_result ... ok
+test response::tests::test_delete_result ... ok
+test response::tests::test_error_response_signature_does_not_match ... ok
+test response::tests::test_error_response_status_and_default_message ... ok
+test response::tests::test_list_all_my_buckets ... ok
+test response::tests::test_list_bucket_result_shape ... ok
+test response::tests::test_error_xml_shape ... ok
+test response::tests::test_list_bucket_result_with_owner_and_delimiter ... ok
+test response::tests::test_object_responses ... ok
+test sigv4::tests::test_aws_vector_canonical_request ... ok
+test sigv4::tests::test_aws_vector_signing_key_and_signature ... ok
+test sigv4::tests::test_canonical_query_sorted_and_encoded ... ok
+test sigv4::tests::test_aws_vector_string_to_sign ... ok
+test sigv4::tests::test_parse_credential ... ok
+test sigv4::tests::test_verify_sigv4_header_auth ... ok
+test sigv4::tests::test_verify_sigv4_rejects_wrong_access_key ... ok
+test sigv4::tests::test_verify_sigv4_rejects_wrong_secret ... ok
+test sigv4::tests::test_verify_sigv4_rejects_tampered_path ... ok
+test sigv4::tests::test_verify_sigv4_query_auth ... ok
+test versioning_store::tests::archive_name_parse ... ok
+test versioning_store::tests::index_push_and_list_xml ... ok
+test versioning_store::tests::key_hex_roundtrip ... ok
+test versioning_store::tests::list_versions_empty_indexes_and_empty_versions ... ok
+test versioning_store::tests::list_versions_multi_key_pagination ... ok
+test versioning_store::tests::list_versions_prefix_filter ... ok
+test versioning_store::tests::version_id_unique_32_hex ... ok
+test versioning_store::tests::versioning_enabled_only_enabled ... ok
+test xml::tests::test_error_shape_no_ns ... ok
+test xml::tests::test_self_closing_empty_element ... ok
+test xml::tests::test_success_shape_with_ns_and_empty_leaf ... ok
+
+test result: ok. 198 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+

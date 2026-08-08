@@ -54,8 +54,10 @@ mod gatekeeper;
 mod healthcheck;
 mod keymaster;
 mod keystoneauth;
+mod list_endpoints;
 mod listing_formats;
 mod name_check;
+mod passthrough;
 mod proxy_logging;
 mod ratelimit;
 mod read_only;
@@ -66,6 +68,7 @@ mod symlink;
 mod tempauth;
 mod tempurl;
 mod versioned_writes;
+mod xprofile;
 
 pub use account_quotas::AccountQuotas;
 pub use acl::{
@@ -111,8 +114,10 @@ pub use keystoneauth::{
     authorize as keystone_authorize, cross_tenant_match, AccountRules, AuthRequest, AuthResult,
     Identity, KeystoneAuth, RoleConfig, AUTH_PLUGIN_HEADER, AUTH_PLUGIN_KEYSTONE,
 };
+pub use list_endpoints::{EndpointResolver, ListEndpoints, StaticEndpoints};
 pub use listing_formats::ListingFormats;
 pub use name_check::NameCheck;
+pub use passthrough::NamedPassthrough;
 pub use proxy_logging::{LogContext, LogSink, ProxyLogging};
 pub use ratelimit::{Clock, RateLimit, RateTier, SystemClock};
 pub use read_only::ReadOnly;
@@ -122,7 +127,8 @@ pub use s3token::{
     HDR_S3_STRING_TO_SIGN,
 };
 pub use slo::{
-    dlo_etag_and_size, manifest_etag, normalize_etag, slo_etag_and_size, Slo, SloSegment,
+    dlo_etag_and_size, manifest_etag, normalize_etag, refetch_listing_slo_etag, slo_etag_and_size,
+    Slo, SloSegment,
 };
 pub use staticweb::{
     build_listing_html, html_escape, human_readable, ListingItem, StaticWeb,
@@ -131,6 +137,7 @@ pub use symlink::Symlink;
 pub use tempauth::{TempAuth, UserRecord};
 pub use tempurl::{ClosureKeyProvider, KeyProvider, TempUrl};
 pub use versioned_writes::{versions_object_name, VersionedWrites};
+pub use xprofile::XProfile;
 
 use std::sync::Arc;
 

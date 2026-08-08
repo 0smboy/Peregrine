@@ -19,6 +19,7 @@ swift-memcache = { path = "../swift-memcache" }
 swift-ec = { path = "../swift-ec", optional = true }
 md-5 = { version = "0.10", optional = true }
 serde_json = "1"
+libc = "0.2"
 
 [features]
 ec = ["dep:swift-ec", "dep:md-5"]

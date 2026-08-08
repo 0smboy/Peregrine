@@ -1,0 +1,14 @@
+--- cargo summary ---
+test xml::tests::test_error_shape_no_ns ... ok
+test xml::tests::test_success_shape_with_ns_and_empty_leaf ... ok
+
+test result: ok. 201 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+list tests:
+test middleware::tests::list_objects_translates ... ok
+test middleware::tests::list_objects_truncation_and_common_prefixes ... ok
+test middleware::tests::list_objects_v2_emits_key_count ... ok
+test response::tests::test_list_bucket_result_into_response_content_type_and_etag ... ok
+test response::tests::test_list_bucket_result_shape ... ok
+test response::tests::test_list_bucket_result_v2_into_response_content_type_and_etag ... ok
+test response::tests::test_list_bucket_result_with_owner_and_delimiter ... ok

@@ -1,0 +1,162 @@
+=== cargo test -p swift-middleware --lib slo:: ===
+    Blocking waiting for file lock on artifact directory
+   Compiling swift-middleware v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-middleware)
+warning: variable does not need to be mutable
+    --> crates/swift-middleware/src/slo.rs:2675:13
+     |
+2675 |         let mut h2 = HeaderKeyDict::new();
+     |             ----^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib test) generated 1 warning (run `cargo fix --lib -p swift-middleware --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 20.04s
+     Running unittests src/lib.rs (target/debug/deps/swift_middleware-7a92af109edbe29b)
+
+running 28 tests
+test slo::tests::test_dlo_etag ... ok
+test slo::tests::test_async_delete_acl_probe_segment_container ... ok
+test slo::tests::test_expirer_task_container_hash_sharding ... ok
+test slo::tests::test_heartbeat_put_returns_202 ... ok
+test slo::tests::test_inline_data_only_rejected ... ok
+test slo::tests::test_heartbeat_put_yields_space_per_head ... ok
+test slo::tests::test_manifest_etag ... ok
+test slo::tests::test_async_delete_acl_probe_forbidden ... ok
+test slo::tests::test_inline_data_put_and_get ... ok
+test slo::tests::test_multipart_delete_async_manifest_missing ... ok
+test slo::tests::test_multipart_delete_async_rejects_nested ... ok
+test slo::tests::test_multipart_delete_async_enqueues_and_deletes_manifest ... ok
+test slo::tests::test_multipart_delete_async_rejects_multi_container ... ok
+test slo::tests::test_refetch_listing_slo_etag ... ok
+test slo::tests::test_multipart_manifest_get_format_raw ... ok
+test slo::tests::test_multipart_manifest_delete ... ok
+test slo::tests::test_normalize_etag ... ok
+test slo::tests::test_slo_etag_data_segment ... ok
+test slo::tests::test_slo_etag_ranged_segment ... ok
+test slo::tests::test_slo_etag_whole_segments ... ok
+test slo::tests::test_slo_full_get_reassembles ... ok
+test slo::tests::test_slo_get_is_lazy_and_aborts_midstream ... ok
+test slo::tests::test_slo_head_uses_sysmeta_not_manifest_length ... ok
+test slo::tests::test_slo_non_manifest_passthrough ... ok
+test slo::tests::test_slo_nested_sub_slo_get ... ok
+test slo::tests::test_slo_range_uses_per_segment_range ... ok
+test slo::tests::test_slo_range_get ... ok
+test slo::tests::test_multipart_delete_async_update_fallback_deletes_manifest ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 386 filtered out; finished in 0.02s
+
+EXIT_slo=0
+
+=== cargo test -p swift-middleware --lib refetch ===
+    Blocking waiting for file lock on artifact directory
+   Compiling swift-middleware v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-middleware)
+warning: variable does not need to be mutable
+    --> crates/swift-middleware/src/slo.rs:2675:13
+     |
+2675 |         let mut h2 = HeaderKeyDict::new();
+     |             ----^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib test) generated 1 warning (run `cargo fix --lib -p swift-middleware --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 20.05s
+     Running unittests src/lib.rs (target/debug/deps/swift_middleware-7a92af109edbe29b)
+
+running 1 test
+test slo::tests::test_refetch_listing_slo_etag ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 413 filtered out; finished in 0.00s
+
+EXIT_refetch=0
+
+=== cargo test -p swift-proxy-server --bin swift-proxy-server process_workers ===
+    Blocking waiting for file lock on artifact directory
+   Compiling serde_core v1.0.228
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.46
+   Compiling unicode-ident v1.0.24
+   Compiling zerocopy v0.8.54
+   Compiling ahash v0.8.12
+   Compiling serde v1.0.228
+   Compiling vcpkg v0.2.15
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling fallible-iterator v0.3.0
+   Compiling smallvec v1.15.2
+   Compiling libsqlite3-sys v0.30.1
+   Compiling syn v2.0.119
+   Compiling serde_json v1.0.150
+   Compiling serde_derive v1.0.228
+   Compiling swift-core v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-core)
+   Compiling swift-memcache v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-memcache)
+   Compiling swift-crypto v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-crypto)
+   Compiling hashbrown v0.14.5
+   Compiling swift-http v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-http)
+   Compiling swift-diskfile v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-diskfile)
+   Compiling hashlink v0.9.1
+   Compiling swift-middleware v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-middleware)
+   Compiling rusqlite v0.32.1
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `md5_hex` is never used
+   --> crates/swift-middleware/src/encrypter.rs:378:4
+    |
+378 | fn md5_hex(data: &[u8]) -> String {
+    |    ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling swift-s3api v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api)
+   Compiling swift-ring v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-ring)
+warning: `swift-middleware` (lib) generated 2 warnings (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+   Compiling swift-db v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-db)
+   Compiling swift-object-server v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-object-server)
+   Compiling swift-proxy-server v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-proxy-server)
+   Compiling swift-account-server v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-account-server)
+   Compiling swift-container-server v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-container-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 34.89s
+     Running unittests src/main.rs (target/debug/deps/swift_proxy_server-897321fab3902f52)
+
+running 1 test
+test startup_policy_tests::process_workers_conf_parses ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.00s
+
+EXIT_process_workers=0
+
+=== cargo test -p swift-proxy-server --bin swift-proxy-server server_options ===
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `md5_hex` is never used
+   --> crates/swift-middleware/src/encrypter.rs:378:4
+    |
+378 | fn md5_hex(data: &[u8]) -> String {
+    |    ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib) generated 2 warnings (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/main.rs (target/debug/deps/swift_proxy_server-897321fab3902f52)
+
+running 1 test
+test startup_policy_tests::server_options_read_workers_clients_timeout_and_log_conf ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.00s
+
+EXIT_server_options=0

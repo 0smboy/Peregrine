@@ -13,7 +13,7 @@ implemented.** Product and fairness claims must stay inside what is green here.
 Canonical long form in-repo:
 [`docs/fairness-lab/RUST-VS-PYTHON-PARITY.md`](https://github.com/0smboy/Peregrine/blob/main/docs/fairness-lab/RUST-VS-PYTHON-PARITY.md).
 
-**As of 2026-08-07 · Contabo lab · LAB-HARD-GREEN · not PRODUCTION-GO-LIVE.**
+**As of 2026-08-08 · Contabo lab · LAB-HARD-GREEN · not PRODUCTION-GO-LIVE.**
 
 ## Headline
 
@@ -21,10 +21,11 @@ Canonical long form in-repo:
 |------|--------|
 | Swift v1 core CRUD + common middleware | **Mostly implemented** |
 | TempAuth + Keystone lab + EC + S3 core/MPU + bulk upload | **Implemented (lab-proven)** |
-| S3 aws-chunked (chunk-sig enforce) + multi-version + lifecycle Transition/AbortMPU + WORM governance bypass + grant/ACP store | **Implemented (unit 176/176)** |
-| container-sync filter+daemon / at-rest crypto middleware (on-by-config) | **Implemented (unit/path)** |
-| Multi-node container sharding KEEP (live product) | **Not implemented** (strict) |
-| Full arbitrary Paste / SigV2 / KMIP / operator TLS go-live / ACP grant enforcement | **Not implemented** |
+| S3 SigV4 surface: chunk-sig, multi-version, lifecycle Transition exec, WORM, ACP store+enforce, local IAM dir | **Implemented (unit ~204)** |
+| OpenStack-standard Paste names + xprofile / list_endpoints | **Implemented (wired)** |
+| process_workers prefork + SLO concurrent HEAD / listing etag refetch | **Implemented (unit)** |
+| Multi-node container sharding product KEEP / multi-cluster sync / operator PEM | **Not implemented** (strict) |
+| SigV2 / KMIP / unlimited third-party Paste plugins / AWS IAM cloud | **Not implemented** (or WONTFIX) |
 
 ## Swift REST (v1)
 
@@ -33,11 +34,12 @@ Canonical long form in-repo:
 | TempAuth v1.0 | yes | yes |
 | Account / container / object CRUD | yes | yes |
 | Range, conditionals, COPY, expiry | yes | yes |
-| SLO / DLO (inline, streaming heartbeat, sync/async manifest-delete) | yes | yes |
+| SLO / DLO (inline, streaming heartbeat, sync/async manifest-delete, concurrent HEAD, listing etag refetch) | yes | yes |
 | TempURL (incl. ip_range) / FormPost / bulk **delete** | yes | yes |
 | Bulk **upload** / extract-archive (tar/tar.gz/tar.bz2) | yes | yes |
 | allow_account_management | yes | yes |
-| Full arbitrary Paste pipeline | yes | **no** |
+| OpenStack-standard Paste pipeline filters | yes | yes (wired; unknown custom names still skip/`strict_pipeline`) |
+| Unlimited arbitrary third-party Paste plugins | yes | **no** |
 
 ## Middleware
 
@@ -49,8 +51,9 @@ Canonical long form in-repo:
 | keystoneauth + authtoken (lab Keystone) | yes | yes |
 | s3api + s3token (core path) + ListParts | yes | yes |
 | container-sync filter + daemon (HTTP/HTTPS + CA knobs) | yes | yes (unit; multi-cluster live not claimed) |
-| encrypter / decrypter / keymaster (multi-root, listing, range GET, etag mask, chunked PUT encrypt) | yes | yes (on-by-config; KMIP residual) |
-| Full arbitrary / unknown Paste filter names | yes | **no** |
+| encrypter / decrypter / keymaster | yes | yes (on-by-config; KMIP residual) |
+| xprofile, list_endpoints | yes | yes (unit) |
+| memcache/recon/healthcheck aliases as NamedPassthrough slots | yes | yes |
 
 ## S3
 
@@ -60,47 +63,39 @@ Canonical long form in-repo:
 | s3token / EC2 → Keystone | yes | yes (lab) |
 | Canned ACL + multi-rule CORS + object ?acl | yes | yes |
 | aws-chunked / STREAMING-* (per-chunk HMAC enforced) | yes | yes (unit) |
-| Versioning + multi-version data plane + ListVersions | yes | yes (unit) |
-| Lifecycle Expiration exec + Transition meta + AbortIncompleteMPU | yes | yes (unit; no tiering backend) |
-| Object Lock WORM + GOVERNANCE bypass header | yes | yes (unit; COMPLIANCE/legal-hold hard-block) |
-| Grant-header + ACP XML body store/GET | yes | yes (store/GET; enforcement residual) |
+| Versioning + multi-version data plane + ListVersions pagination | yes | yes (unit) |
+| Lifecycle Expiration exec + Transition (cold GET block + restore) + AbortIncompleteMPU | yes | yes (unit; no physical tape backend) |
+| Object Lock WORM + GOVERNANCE bypass header | yes | yes (unit) |
+| Grant-header + ACP XML store/GET | yes | yes |
+| ACP grant enforcement (GET/HEAD READ + PUT/DELETE WRITE) | yes | yes (unit) |
+| Local IAM identity directory (access_key/email → canonical id) | yes | yes (local dir; not AWS IAM cloud) |
 | SigV2 | yes | **no** (WONTFIX 501) |
-| Full IAM identity + ACP grant **enforcement** on ops | yes | **no** |
+| AWS IAM cloud service / true multi-tenant IAM | yes | **no** |
 
-## EC & consistency
+## EC & consistency / platform
 
 | Capability | Python | Rust |
 |------------|:------:|:----:|
-| EC policy encode/decode, multiphase PUT, ranged GET | yes | yes (Linux `ec`) |
-| Degraded read + reconstructor heal | yes | yes (lab, after spp identity fix) |
-| Local sharder + manage-shard-ranges (incl. analyze/compact/repair) | yes | yes |
-| Sharder ring HTTP primary create path | yes | yes (unit; Contabo daemon ×4 active, KEEP not claimed) |
-| Multi-node container sharding KEEP (live product) | yes | **no** |
-| container-sync daemon | yes | yes |
-| Operator VIP TLS PEM ops path | yes | yes (script); Contabo still lab self-signed |
-| object/account/container replicators, expirer, auditors, recon | yes | yes |
+| EC policy encode/decode, multiphase PUT, ranged GET, heal | yes | yes (Linux `ec`) |
+| Local sharder + manage-shard-ranges + shrink path | yes | yes |
+| Multi-node container sharding product KEEP | yes | **no** |
+| container-sync daemon (same-cluster) | yes | yes |
+| Multi-cluster container-sync realm soak | yes | **no** |
+| process_workers prefork (eventlet-like OS processes) | yes | yes (unit/conf; not greenlet twin) |
+| Operator VIP TLS PEM go-live | yes | **no** (script GREEN; Contabo self-signed LAB) |
+| Full ansible Python role twin | yes | partial (v3 subset) |
 
-## Lab evidence (Contabo, 2026-08-06 + residual wave 2026-08-07)
+## Lab evidence anchors
 
 - TempAuth func VIP **54/54**; soak **1h fail=0**
-- Python `:8090` ×3 **54/54** each
-- S3 MPU deep **11/11**; EC2 SigV4 **green**
-- VIP failover **pass**; EC heal fragment restore **pass** after fix
-- **2026-08-07 P0 residual wave:** `cargo test -p swift-s3api --lib` **176/176** (chunk-sig enforce, WORM governance bypass, grant/ACP store, lifecycle Transition + AbortIncompleteMPU). Evidence: `tools/test-results/priority-unimpl-wave-20260807/`
-- Operator TLS PEM **deferred** → not production go-live
-
-## Offline one-click (SAIO + console)
-
-```sh
-./tools/offline-oneclick/offline-oneclick.sh all-local --console
-```
-
-Airgap: `pack` → copy tarball → `install` → `start` → `test`. See
-`tools/offline-oneclick/README.md`. Multi-node production still uses
-`swift-deploy-rs`.
+- S3 MPU deep **11/11**; EC2 s3token **green**
+- **2026-08-07 P0 residual:** s3api unit **176+** (later **~204**)
+- **2026-08-07/08 SLO full audit:** Contabo live SLO matrix + s3cmd MPU KEEP — `tools/test-results/slo-full-audit-20260807/`
+- **2026-08-08 hard9 residual:** Paste/xprofile, Transition exec, ACP+IAM, SLO concurrent/workers — unit `s3api 204` / `middleware 414` / `proxy 23` — `tools/test-results/hard9-residual-wave-20260808/`
+- Operator TLS PEM **deferred** → not PRODUCTION-GO-LIVE
 
 ## How to use this matrix
 
 - Fairness A/B: only compare surfaces marked **yes** on both sides.
 - Marketing: do **not** say “full Swift compatibility.”
-- Shipping: label **LAB-HARD-GREEN** until operator TLS and any claimed L3b/S3 extras are fully green.
+- Shipping: label **LAB-HARD-GREEN** until operator TLS and multi-primary product claims are green.

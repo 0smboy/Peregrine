@@ -64,6 +64,9 @@
 //! `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` / `*-TRAILER` when credentials are
 //! available: invalid or missing `chunk-signature` →
 //! `SignatureDoesNotMatch` (403), body not forwarded.
+//! For `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`, `x-amz-trailer-signature`
+//! is verified (`AWS4-HMAC-SHA256-TRAILER`); mismatch or missing trailer sig
+//! when trailers are present → `SignatureDoesNotMatch`.
 //! `STREAMING-UNSIGNED-PAYLOAD-TRAILER` dechunks without requiring signatures.
 //! ECDSA streaming modes remain 501 NotImplemented.
 //!
@@ -72,16 +75,21 @@
 //! bypassed). Wired on DELETE, overwrite PUT, and multi-delete.
 //!
 //! Other residuals: full IAM identity service / emailAddress grantee
-//! resolution; **object ACP grant enforcement** on subsequent ops (authz still
-//! Swift container ACL); object public-read / grant AllUsers READ does **not**
-//! by itself open anonymous Swift GET — container ACL still gates; clock-skew
-//! on every path; advertising `s3api` on Swift `GET /info`.
-//! Multipart includes ListMultipartUploads via `{bucket}+segments` upload
-//! markers.
+//! resolution; clock-skew on every path; advertising `s3api` on Swift
+//! `GET /info`. Multipart includes ListMultipartUploads via
+//! `{bucket}+segments` upload markers.
 //!
 //! Grant headers (`x-amz-grant-*`) + ACP XML body PUT/GET `?acl` are claimable
 //! (structured JSON sysmeta + container AllUsers mapping); canned `x-amz-acl`
 //! still works and takes precedence when both are present.
+//!
+//! **Object ACP grant enforcement (GET/HEAD, LAB-HARD-GREEN):** when
+//! `X-Object-Sysmeta-S3-Acl-Json` is present with non-empty grants, the SigV4
+//! principal (`access_key` / account) must be owner or hold READ/FULL_CONTROL
+//! — else `403 AccessDenied`. Owner always allowed. Missing/empty grants → no
+//! new denial (Swift container ACL path). AllUsers READ still does **not**
+//! open anonymous unauthenticated GET (no SigV4 → passthrough; container ACL
+//! still gates).
 //!
 //! Unknown access keys (EC2) are deferred to Keystone via an optional
 //! [`S3TokenClient`] (`with_s3token_client`); without a client, unknown keys
@@ -97,8 +105,8 @@ use swift_middleware::{Middleware, NextFn, S3TokenClient, S3TokenResult};
 use crate::acl_cors::{
     apply_bucket_acl_input, apply_object_acl_input, bucket_acl_xml_from_headers,
     clear_cors_swift_headers, cors_config_to_swift_headers, cors_xml_from_swift_headers,
-    object_acl_xml_from_headers, parse_cors_configuration, resolve_acl_put_input, xml_ok,
-    AclPutInput,
+    object_acl_denies_read, object_acl_denies_write, object_acl_xml_from_headers, parse_cors_configuration,
+    resolve_acl_put_input, xml_ok, AclPutInput,
 };
 use crate::aws_chunked::{
     cleanup_content_encoding, decode_aws_chunked, is_aws_chunked_request, is_ecdsa_streaming,
@@ -122,6 +130,7 @@ use crate::object_lock_worm::{
 use crate::delete::parse_multi_delete_body;
 use crate::lifecycle_exec::{
     apply_abort_incomplete_from_container, apply_lifecycle_on_put_from_container,
+    apply_due_transition_on_headers, transition_blocks_get,
 };
 use crate::mpu::{
     complete_multipart_xml, initiate_response, list_multipart_uploads_xml, list_parts_xml_full,
@@ -312,9 +321,10 @@ fn is_sigv2_auth(req: &Request) -> bool {
 /// decoded length, `aws-chunked` is stripped from `Content-Encoding`, and
 /// STREAMING `X-Amz-Content-SHA256` is replaced with `UNSIGNED-PAYLOAD`.
 ///
-/// HMAC per-chunk signature verification runs when `cred` has a secret and
-/// the mode is STREAMING-AWS4-HMAC-SHA256-PAYLOAD*; failure →
-/// `SignatureDoesNotMatch` (403).
+/// HMAC per-chunk (and trailer) signature verification runs when `cred` has a
+/// secret and the mode is STREAMING-AWS4-HMAC-SHA256-PAYLOAD*; failure →
+/// `SignatureDoesNotMatch` (403). Trailer HMAC is required for
+/// `*-PAYLOAD-TRAILER` when trailer content is present.
 fn decode_and_fix_aws_chunked(
     req: &mut Request,
     cred: &S3Credential,
@@ -380,6 +390,9 @@ fn decode_and_fix_aws_chunked(
         "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
             | "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
     ) && !cred.secret_key.is_empty();
+    let require_trailer_sig = payload_hash.eq_ignore_ascii_case(
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+    );
 
     let sig_ctx = if want_hmac {
         crate::sigv4::amz_date(req).map(|ad| ChunkSigContext {
@@ -389,6 +402,7 @@ fn decode_and_fix_aws_chunked(
             service: auth.scope.service.clone(),
             amz_date: ad,
             seed_signature: auth.signature.clone(),
+            require_trailer_signature: require_trailer_sig,
         })
     } else {
         None
@@ -422,7 +436,8 @@ fn decode_and_fix_aws_chunked(
                 &[],
             ));
         }
-        Err(AwsChunkedError::InvalidChunkSignature) => {
+        Err(AwsChunkedError::InvalidChunkSignature)
+        | Err(AwsChunkedError::InvalidTrailerSignature) => {
             return Err(s3_error_response(
                 "SignatureDoesNotMatch",
                 Some("The request signature we calculated does not match the signature you provided."),
@@ -432,6 +447,7 @@ fn decode_and_fix_aws_chunked(
     };
     // Enforced above: Some(false) no longer soft-ignored.
     let _ = decoded.chunk_signatures_valid;
+    let _ = decoded.trailer_signature_valid;
     let _ = decoded.trailers;
 
     cleanup_content_encoding(&mut req.headers);
@@ -552,6 +568,9 @@ fn s3_to_swift_query(params: &[(String, String)], for_container_list: bool) -> S
     if for_container_list {
         out.push(("format".into(), "json".into()));
     }
+    // Python s3api always requests `limit = max_keys + 1` so truncation is
+    // detectable (see controllers/bucket.py `_parse_request_options`).
+    let mut max_keys: Option<u32> = None;
     for (k, v) in params {
         match k.as_str() {
             "prefix" => out.push(("prefix".into(), v.clone())),
@@ -560,8 +579,7 @@ fn s3_to_swift_query(params: &[(String, String)], for_container_list: bool) -> S
             "continuation-token" => out.push(("marker".into(), v.clone())),
             "delimiter" => out.push(("delimiter".into(), v.clone())),
             "max-keys" => {
-                // Swift uses `limit`.
-                out.push(("limit".into(), v.clone()));
+                max_keys = v.parse().ok();
             }
             // Drop SigV4 query auth + S3-only keys from the Swift subrequest.
             "X-Amz-Algorithm"
@@ -590,6 +608,10 @@ fn s3_to_swift_query(params: &[(String, String)], for_container_list: bool) -> S
             | "retention" => {}
             _ => {}
         }
+    }
+    if for_container_list {
+        let mk = max_keys.unwrap_or(1000);
+        out.push(("limit".into(), mk.saturating_add(1).to_string()));
     }
     out.iter()
         .map(|(k, v)| format!("{}={}", encode_query(k), encode_query(v)))
@@ -740,17 +762,25 @@ fn translate_list_objects(
         .iter()
         .find(|(k, _)| k == "delimiter")
         .map(|(_, v)| v.clone());
+    let encoding_type = params
+        .iter()
+        .find(|(k, v)| k == "encoding-type" && v == "url")
+        .map(|(_, v)| v.clone());
     let max_keys = params
         .iter()
         .find(|(k, _)| k == "max-keys")
         .and_then(|(_, v)| v.parse().ok())
         .unwrap_or(1000u32);
 
-    let mut contents = Vec::new();
-    let mut common_prefixes = Vec::new();
+    // Ordered entries so max_keys truncation matches Python (objects + subdirs).
+    enum Entry {
+        Object(S3Object),
+        Prefix(String),
+    }
+    let mut entries: Vec<Entry> = Vec::new();
     for item in arr {
         if let Some(subdir) = item.get("subdir").and_then(|v| v.as_str()) {
-            common_prefixes.push(subdir.to_string());
+            entries.push(Entry::Prefix(subdir.to_string()));
             continue;
         }
         let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
@@ -768,7 +798,7 @@ fn translate_list_objects(
             .get("last_modified")
             .and_then(|v| v.as_str())
             .unwrap_or("1970-01-01T00:00:00.000000");
-        contents.push(S3Object {
+        entries.push(Entry::Object(S3Object {
             key: name.to_string(),
             last_modified: swift_ts_to_s3(last_modified),
             etag: quote_etag(hash),
@@ -778,15 +808,31 @@ fn translate_list_objects(
                 id: owner.id.clone(),
                 display_name: owner.display_name.clone(),
             }),
-        });
+        }));
     }
-    // Swift's limit truncates the JSON array; treat "hit max-keys" as truncated.
-    let is_truncated = contents.len() as u32 >= max_keys;
-    let next_marker = if is_truncated {
-        contents.last().map(|o| o.key.clone())
+    // Python: is_truncated = max_keys > 0 and len(objects) > max_keys; objects = objects[:max_keys]
+    let is_truncated = max_keys > 0 && entries.len() as u32 > max_keys;
+    if is_truncated {
+        entries.truncate(max_keys as usize);
+    }
+    // NextMarker only when delimiter present (Python bucket.py XXX note).
+    let next_marker = if is_truncated && delimiter.is_some() {
+        match entries.last() {
+            Some(Entry::Object(o)) => Some(o.key.clone()),
+            Some(Entry::Prefix(p)) => Some(p.clone()),
+            None => None,
+        }
     } else {
         None
     };
+    let mut contents = Vec::new();
+    let mut common_prefixes = Vec::new();
+    for e in entries {
+        match e {
+            Entry::Object(o) => contents.push(o),
+            Entry::Prefix(p) => common_prefixes.push(p),
+        }
+    }
     let lbr = ListBucketResult {
         name: bucket.to_string(),
         prefix,
@@ -794,11 +840,12 @@ fn translate_list_objects(
         next_marker,
         max_keys,
         delimiter,
-        encoding_type: None,
+        encoding_type,
         is_truncated,
         contents,
         common_prefixes,
     };
+    // into_response → Content-Type: application/xml + xmlns ListBucketResult.
     lbr.into_response()
 }
 
@@ -834,6 +881,10 @@ fn translate_list_objects_v2(
         .iter()
         .find(|(k, _)| k == "delimiter")
         .map(|(_, v)| v.clone());
+    let encoding_type = params
+        .iter()
+        .find(|(k, v)| k == "encoding-type" && v == "url")
+        .map(|(_, v)| v.clone());
     let max_keys = params
         .iter()
         .find(|(k, _)| k == "max-keys")
@@ -843,11 +894,14 @@ fn translate_list_objects_v2(
         .iter()
         .any(|(k, v)| k == "fetch-owner" && (v == "true" || v == "True" || v == "1"));
 
-    let mut contents = Vec::new();
-    let mut common_prefixes = Vec::new();
+    enum Entry {
+        Object(S3Object),
+        Prefix(String),
+    }
+    let mut entries: Vec<Entry> = Vec::new();
     for item in arr {
         if let Some(subdir) = item.get("subdir").and_then(|v| v.as_str()) {
-            common_prefixes.push(subdir.to_string());
+            entries.push(Entry::Prefix(subdir.to_string()));
             continue;
         }
         let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
@@ -859,7 +913,7 @@ fn translate_list_objects_v2(
             .get("last_modified")
             .and_then(|v| v.as_str())
             .unwrap_or("1970-01-01T00:00:00.000000");
-        contents.push(S3Object {
+        entries.push(Entry::Object(S3Object {
             key: name.to_string(),
             last_modified: swift_ts_to_s3(last_modified),
             etag: quote_etag(hash),
@@ -873,15 +927,30 @@ fn translate_list_objects_v2(
             } else {
                 None
             },
-        });
+        }));
     }
-    let key_count = (contents.len() + common_prefixes.len()) as u32;
-    let is_truncated = contents.len() as u32 >= max_keys;
+    let is_truncated = max_keys > 0 && entries.len() as u32 > max_keys;
+    if is_truncated {
+        entries.truncate(max_keys as usize);
+    }
     let next_continuation_token = if is_truncated {
-        contents.last().map(|o| o.key.clone())
+        match entries.last() {
+            Some(Entry::Object(o)) => Some(o.key.clone()),
+            Some(Entry::Prefix(p)) => Some(p.clone()),
+            None => None,
+        }
     } else {
         None
     };
+    let mut contents = Vec::new();
+    let mut common_prefixes = Vec::new();
+    for e in entries {
+        match e {
+            Entry::Object(o) => contents.push(o),
+            Entry::Prefix(p) => common_prefixes.push(p),
+        }
+    }
+    let key_count = (contents.len() + common_prefixes.len()) as u32;
     ListBucketResultV2 {
         name: bucket.to_string(),
         prefix,
@@ -891,11 +960,12 @@ fn translate_list_objects_v2(
         key_count,
         max_keys,
         delimiter,
-        encoding_type: None,
+        encoding_type,
         is_truncated,
         contents,
         common_prefixes,
     }
+    // into_response → Content-Type: application/xml + xmlns ListBucketResult.
     .into_response()
 }
 
@@ -942,6 +1012,64 @@ fn translate_object_success(
         }
         _ => resp,
     }
+}
+
+/// If object JSON ACL grants deny this principal READ, return AccessDenied.
+/// Missing/empty grants → `None` (no new denial).
+fn deny_if_object_acl_blocks_read(cred: &S3Credential, headers: &HeaderKeyDict) -> Option<Response> {
+    if object_acl_denies_read(headers, &cred.access_key, &cred.account) {
+        Some(s3_error_response("AccessDenied", None, &[]))
+    } else {
+        None
+    }
+}
+
+fn deny_if_object_acl_blocks_write(cred: &S3Credential, headers: &HeaderKeyDict) -> Option<Response> {
+    if object_acl_denies_write(headers, &cred.access_key, &cred.account) {
+        Some(s3_error_response("AccessDenied", None, &[]))
+    } else {
+        None
+    }
+}
+
+fn deny_if_transition_blocks_get(headers: &mut HeaderKeyDict, now: i64) -> Option<Response> {
+    apply_due_transition_on_headers(headers, now);
+    if transition_blocks_get(headers, now) {
+        Some(s3_error_response(
+            "InvalidObjectState",
+            Some("The operation is not valid for the object's storage class"),
+            &[],
+        ))
+    } else {
+        None
+    }
+}
+
+/// GET/HEAD object success path with structured ACP grant enforcement.
+fn translate_object_get_head(
+    method: &str,
+    mut resp: Response,
+    cred: &S3Credential,
+) -> Response {
+    if let Some(denied) = deny_if_object_acl_blocks_read(cred, &resp.headers) {
+        return denied;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if let Some(denied) = deny_if_transition_blocks_get(&mut resp.headers, now) {
+        return denied;
+    }
+    // Surface storage class to S3 clients when present.
+    if let Some(sc) = resp
+        .headers
+        .get("X-Object-Meta-S3-Storage-Class")
+        .map(str::to_string)
+    {
+        resp.headers.set("x-amz-storage-class", sc);
+    }
+    translate_object_success(method, resp, false)
 }
 
 fn http_date_to_s3_approx(http_date: &str) -> String {
@@ -1239,13 +1367,21 @@ impl Middleware for S3Api {
         strip_s3_only_headers(&mut swift_req.headers);
         stamp_auth(&mut swift_req, &cred);
 
-        // Object Lock WORM: block DELETE and overwrite PUT (governance bypass).
+        // Object Lock WORM + ACP WRITE enforcement on DELETE / overwrite PUT.
         if key.is_some() && matches!(method.as_str(), "DELETE" | "PUT") {
             if let Some(blocked) = worm_check_object(
                 &cred,
                 bucket.as_deref().unwrap(),
                 key.as_deref().unwrap(),
                 worm_bypass,
+                &next,
+            ) {
+                return blocked;
+            }
+            if let Some(blocked) = acl_write_check_object(
+                &cred,
+                bucket.as_deref().unwrap(),
+                key.as_deref().unwrap(),
                 &next,
             ) {
                 return blocked;
@@ -1304,6 +1440,9 @@ impl Middleware for S3Api {
 
         if key.is_some() {
             if (200..300).contains(&resp.status) {
+                if matches!(method.as_str(), "GET" | "HEAD") {
+                    return translate_object_get_head(&method, resp, &cred);
+                }
                 return translate_object_success(&method, resp, is_copy);
             }
             return map_swift_error(resp.status, bucket.as_deref(), key.as_deref());
@@ -1348,6 +1487,26 @@ fn worm_check_object(
     } else {
         None
     }
+}
+
+/// HEAD object; if structured ACP grants deny WRITE, AccessDenied.
+/// Missing object (404) → no denial (create path).
+fn acl_write_check_object(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    next: &NextFn,
+) -> Option<Response> {
+    let mut head = make_swift_req(
+        "HEAD",
+        &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
+    );
+    stamp_auth(&mut head, cred);
+    let resp = next(head);
+    if !(200..300).contains(&resp.status) {
+        return None;
+    }
+    deny_if_object_acl_blocks_write(cred, &resp.headers)
 }
 
 fn worm_blocks_key(
@@ -2021,7 +2180,7 @@ fn handle_versioned_get_head(
                 if is_delete_marker_header(resp.headers.get(SYS_DELETE_MARKER)) {
                     return nosuchkey_delete_marker(key, resp.headers.get(SYS_VERSION_ID));
                 }
-                return translate_object_success(method, resp, false);
+                return translate_object_get_head(method, resp, cred);
             }
             return map_swift_error(resp.status, Some(bucket), Some(key));
         }
@@ -2034,6 +2193,9 @@ fn handle_versioned_get_head(
                 return nosuchkey_delete_marker(key, Some(vid));
             }
             if method == "HEAD" {
+                if let Some(denied) = deny_if_object_acl_blocks_read(cred, &cur.headers) {
+                    return denied;
+                }
                 let mut r = cur;
                 if let Some(etag) = r.headers.get("ETag").map(str::to_string) {
                     r.headers.set("ETag", quote_etag(&etag));
@@ -2045,6 +2207,9 @@ fn handle_versioned_get_head(
             stamp_auth(&mut get, cred);
             let mut resp = next(get);
             if (200..300).contains(&resp.status) {
+                if let Some(denied) = deny_if_object_acl_blocks_read(cred, &resp.headers) {
+                    return denied;
+                }
                 if let Some(etag) = resp.headers.get("ETag").map(str::to_string) {
                     resp.headers.set("ETag", quote_etag(&etag));
                 }
@@ -2063,6 +2228,9 @@ fn handle_versioned_get_head(
         if (200..300).contains(&resp.status) {
             if is_delete_marker_header(resp.headers.get(SYS_DELETE_MARKER)) {
                 return nosuchkey_delete_marker(key, Some(vid));
+            }
+            if let Some(denied) = deny_if_object_acl_blocks_read(cred, &resp.headers) {
+                return denied;
             }
             if let Some(etag) = resp.headers.get("ETag").map(str::to_string) {
                 resp.headers.set("ETag", quote_etag(&etag));
@@ -2086,9 +2254,11 @@ fn handle_versioned_get_head(
     if is_delete_marker_header(resp.headers.get(SYS_DELETE_MARKER)) {
         return nosuchkey_delete_marker(key, resp.headers.get(SYS_VERSION_ID));
     }
-    let mut out = translate_object_success(method, resp, false);
-    if let Some(vid) = out.headers.get(SYS_VERSION_ID).map(str::to_string) {
-        out.headers.set(HDR_VERSION_ID, &vid);
+    let mut out = translate_object_get_head(method, resp, cred);
+    if (200..300).contains(&out.status) {
+        if let Some(vid) = out.headers.get(SYS_VERSION_ID).map(str::to_string) {
+            out.headers.set(HDR_VERSION_ID, &vid);
+        }
     }
     out
 }
@@ -2937,6 +3107,66 @@ mod tests {
         m
     }
 
+    /// Owner + foreign principals sharing one Swift account (grant enforcement).
+    fn multi_cred_map() -> HashMap<String, S3Credential> {
+        let mut m = cred_map();
+        m.insert(
+            "test:foreign".into(),
+            S3Credential {
+                access_key: "test:foreign".into(),
+                secret_key: "foreign-secret".into(),
+                account: "AUTH_test".into(),
+                groups: vec![
+                    "test".into(),
+                    "test:foreign".into(),
+                    "AUTH_test".into(),
+                ],
+                auth_token: None,
+            },
+        );
+        m.insert(
+            "test:friend".into(),
+            S3Credential {
+                access_key: "test:friend".into(),
+                secret_key: "friend-secret".into(),
+                account: "AUTH_test".into(),
+                groups: vec![
+                    "test".into(),
+                    "test:friend".into(),
+                    "AUTH_test".into(),
+                ],
+                auth_token: None,
+            },
+        );
+        m
+    }
+
+    fn base_s3_req_as(method: &str, path: &str, query: &str, access_key: &str) -> Request {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Host", "localhost");
+        headers.set(
+            "x-amz-content-sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        );
+        headers.set("x-amz-date", "20130524T000000Z");
+        headers.set(
+            "Authorization",
+            format!(
+                "AWS4-HMAC-SHA256 \
+                 Credential={access_key}/20130524/us-east-1/s3/aws4_request, \
+                 SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
+                 Signature=00"
+            ),
+        );
+        Request {
+            method: method.into(),
+            path: path.into(),
+            query_string: query.into(),
+            headers,
+            body: Body::empty(),
+        }
+    }
+
     fn sign_request(mut req: Request, secret: &str) -> Request {
         let auth_hdr = req.headers.get("Authorization").unwrap().to_string();
         let auth = parse_authorization_header(&auth_hdr).unwrap();
@@ -3194,6 +3424,12 @@ mod tests {
             assert_eq!(r.path, "/v1/AUTH_test/mybucket");
             assert!(r.query_string.contains("format=json"));
             assert!(r.query_string.contains("prefix=p"));
+            // Python-style limit = max_keys+1 (default 1000 → 1001).
+            assert!(
+                r.query_string.contains("limit=1001"),
+                "expected limit=max_keys+1, got {}",
+                r.query_string
+            );
             Response::with_body(
                 200,
                 br#"[{"name":"p/a","hash":"deadbeef","bytes":3,"last_modified":"2013-05-24T00:00:00.000000"}]"#.to_vec(),
@@ -3201,10 +3437,21 @@ mod tests {
         });
         let resp = api.handle(req, &next);
         assert_eq!(resp.status, 200);
+        // s3cmd requires application/xml (or text/xml), not text/plain / json.
+        assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
-        assert!(body.contains("ListBucketResult"));
+        assert!(
+            body.contains("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"),
+            "missing xmlns root: {body}"
+        );
         assert!(body.contains("<Key>p/a</Key>"));
-        assert!(body.contains("\"deadbeef\""));
+        // Quoted ETag shape inside XML (s3cmd / AWS clients).
+        assert!(
+            body.contains("<ETag>\"deadbeef\"</ETag>"),
+            "quoted ETag missing: {body}"
+        );
+        assert!(body.contains("<IsTruncated>false</IsTruncated>"));
+        assert!(body.contains("<Contents>"));
     }
 
     #[test]
@@ -3241,6 +3488,11 @@ mod tests {
         let req = sign_request(base_s3_req("GET", "/mybucket", "list-type=2"), "testing");
         let next: NextFn = Arc::new(|r| {
             assert!(r.query_string.contains("format=json"));
+            assert!(
+                r.query_string.contains("limit=1001"),
+                "expected limit=max_keys+1, got {}",
+                r.query_string
+            );
             Response::with_body(
                 200,
                 br#"[{"name":"a","hash":"aa","bytes":1,"last_modified":"2013-05-24T00:00:00.000000"}]"#.to_vec(),
@@ -3248,9 +3500,58 @@ mod tests {
         });
         let resp = api.handle(req, &next);
         assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains(
+            "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+        ));
         assert!(body.contains("<KeyCount>1</KeyCount>"));
         assert!(body.contains("<Key>a</Key>"));
+        assert!(
+            body.contains("<ETag>\"aa\"</ETag>"),
+            "quoted ETag missing: {body}"
+        );
+        assert!(body.contains("<IsTruncated>false</IsTruncated>"));
+    }
+
+    /// Truncation + CommonPrefixes shape (s3cmd non-recursive uses delimiter=/).
+    #[test]
+    fn list_objects_truncation_and_common_prefixes() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(
+            base_s3_req("GET", "/mybucket", "delimiter=/&max-keys=2"),
+            "testing",
+        );
+        let next: NextFn = Arc::new(|r| {
+            // max-keys=2 → limit=3
+            assert!(
+                r.query_string.contains("limit=3"),
+                "got {}",
+                r.query_string
+            );
+            assert!(r.query_string.contains("delimiter=%2F") || r.query_string.contains("delimiter=/"));
+            Response::with_body(
+                200,
+                br#"[
+                  {"name":"a","hash":"aa","bytes":1,"last_modified":"2013-05-24T00:00:00.000000"},
+                  {"subdir":"photos/"},
+                  {"name":"z","hash":"zz","bytes":1,"last_modified":"2013-05-24T00:00:00.000000"}
+                ]"#
+                .to_vec(),
+            )
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<IsTruncated>true</IsTruncated>"));
+        assert!(body.contains("<Key>a</Key>"));
+        assert!(body.contains("<CommonPrefixes><Prefix>photos/</Prefix></CommonPrefixes>"));
+        // Third entry dropped by max-keys=2.
+        assert!(!body.contains("<Key>z</Key>"));
+        // NextMarker present when delimiter + truncated.
+        assert!(body.contains("<NextMarker>"));
+        assert!(body.contains("<ETag>\"aa\"</ETag>"));
     }
 
     #[test]
@@ -3734,6 +4035,123 @@ mod tests {
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
         assert!(body.contains("<Permission>WRITE</Permission>"));
         assert!(body.contains("AllUsers"));
+    }
+
+    /// Mock next for object GET/HEAD grant tests: versioning probe HEAD on
+    /// container returns empty; object ops return private JSON ACL headers.
+    fn mock_object_with_acl_json(acl_json: &str) -> NextFn {
+        let json = acl_json.to_string();
+        Arc::new(move |r: Request| {
+            // Versioning probe: HEAD container (no object key segment after bucket).
+            if r.method == "HEAD" && r.path.ends_with("/mybucket") {
+                return Response::new(204);
+            }
+            if matches!(r.method.as_str(), "GET" | "HEAD")
+                && r.path.contains("/mybucket/private-obj")
+            {
+                let mut resp = Response::new(200);
+                resp.headers.set(S3_OBJECT_ACL_JSON_META, &json);
+                resp.headers.set("ETag", "\"deadbeef\"");
+                resp.headers.set("Content-Length", "2");
+                if r.method == "GET" {
+                    resp.body = Body::from(b"ok".to_vec());
+                }
+                return resp;
+            }
+            Response::new(404)
+        })
+    }
+
+    fn private_owner_acl_json() -> String {
+        // Owner FULL_CONTROL only — foreign principals denied on GET/HEAD.
+        r#"{"Owner":"test:tester","Grant":[{"Permission":"FULL_CONTROL","ID":"test:tester","DisplayName":"test:tester"}]}"#.into()
+    }
+
+    fn owner_plus_friend_read_acl_json() -> String {
+        r#"{"Owner":"test:tester","Grant":[{"Permission":"FULL_CONTROL","ID":"test:tester"},{"Permission":"READ","ID":"test:friend"}]}"#.into()
+    }
+
+    #[test]
+    fn get_object_acl_grant_denies_foreign_principal() {
+        let api = S3Api::new(multi_cred_map());
+        let next = mock_object_with_acl_json(&private_owner_acl_json());
+        let req = sign_request(
+            base_s3_req_as("GET", "/mybucket/private-obj", "", "test:foreign"),
+            "foreign-secret",
+        );
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(
+            body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied, got {body}"
+        );
+    }
+
+    #[test]
+    fn head_object_acl_grant_denies_foreign_principal() {
+        let api = S3Api::new(multi_cred_map());
+        let next = mock_object_with_acl_json(&private_owner_acl_json());
+        let req = sign_request(
+            base_s3_req_as("HEAD", "/mybucket/private-obj", "", "test:foreign"),
+            "foreign-secret",
+        );
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>AccessDenied</Code>"));
+    }
+
+    #[test]
+    fn get_object_acl_grant_read_allows_principal() {
+        let api = S3Api::new(multi_cred_map());
+        let next = mock_object_with_acl_json(&owner_plus_friend_read_acl_json());
+        let req = sign_request(
+            base_s3_req_as("GET", "/mybucket/private-obj", "", "test:friend"),
+            "friend-secret",
+        );
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        let body = resp.body.into_vec(u64::MAX).unwrap();
+        assert_eq!(body, b"ok");
+    }
+
+    #[test]
+    fn get_object_acl_owner_always_allowed() {
+        let api = S3Api::new(multi_cred_map());
+        let next = mock_object_with_acl_json(&private_owner_acl_json());
+        let req = sign_request(
+            base_s3_req_as("GET", "/mybucket/private-obj", "", "test:tester"),
+            "testing",
+        );
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body.into_vec(u64::MAX).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn get_object_without_acl_json_not_denied() {
+        // Missing structured grants → existing path (no new AccessDenied).
+        let api = S3Api::new(multi_cred_map());
+        let next: NextFn = Arc::new(|r: Request| {
+            if r.method == "HEAD" && r.path.ends_with("/mybucket") {
+                return Response::new(204);
+            }
+            if r.method == "GET" && r.path.contains("/mybucket/plain") {
+                let mut resp = Response::new(200);
+                resp.headers.set("ETag", "\"abc\"");
+                resp.body = Body::from(b"data".to_vec());
+                return resp;
+            }
+            Response::new(404)
+        });
+        let req = sign_request(
+            base_s3_req_as("GET", "/mybucket/plain", "", "test:foreign"),
+            "foreign-secret",
+        );
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body.into_vec(u64::MAX).unwrap(), b"data");
     }
 
     /// Assert stable S3 NotImplemented: 501 + Code + Message fragment.
@@ -4374,6 +4792,9 @@ mod tests {
 
     /// Frame aws-chunked body with real STREAMING-AWS4-HMAC-SHA256-PAYLOAD
     /// per-chunk signatures (seed = header SigV4 signature).
+    ///
+    /// When `sign_trailer` is true, append a valid (or deliberately bad)
+    /// `x-amz-trailer-signature` after content trailers.
     fn frame_aws_chunked_signed(
         chunks: &[&[u8]],
         secret: &str,
@@ -4383,9 +4804,12 @@ mod tests {
         amz_date: &str,
         seed_signature: &str,
         trailers: &[(&str, &str)],
+        sign_trailer: bool,
+        bad_trailer_sig: bool,
     ) -> Vec<u8> {
-        use crate::aws_chunked::compute_chunk_signature;
+        use crate::aws_chunked::{compute_chunk_signature, compute_trailer_signature};
         use crate::crypto::sha256_hex;
+        use std::collections::HashMap;
 
         let ctx = ChunkSigContext {
             secret_key: secret.into(),
@@ -4394,6 +4818,7 @@ mod tests {
             service: service.into(),
             amz_date: amz_date.into(),
             seed_signature: seed_signature.into(),
+            require_trailer_signature: sign_trailer,
         };
         let mut out = Vec::new();
         let mut prev = seed_signature.to_ascii_lowercase();
@@ -4409,20 +4834,45 @@ mod tests {
         }
         let sig0 = compute_chunk_signature(&ctx, &prev, EMPTY_SHA256_HEX);
         out.extend_from_slice(format!("0;chunk-signature={sig0}\r\n").as_bytes());
+        prev = sig0;
+        let mut trailer_map = HashMap::new();
         for (k, v) in trailers {
+            trailer_map.insert(k.to_ascii_lowercase(), (*v).to_string());
             out.extend_from_slice(format!("{k}:{v}\r\n").as_bytes());
+        }
+        if sign_trailer {
+            let trailer_sig = if bad_trailer_sig {
+                "0".repeat(64)
+            } else {
+                compute_trailer_signature(&ctx, &prev, &trailer_map)
+            };
+            out.extend_from_slice(
+                format!("x-amz-trailer-signature:{trailer_sig}\r\n").as_bytes(),
+            );
         }
         out.extend_from_slice(b"\r\n");
         out
     }
 
     /// Sign request headers first, then attach a correctly HMAC-signed
-    /// streaming body (seed = Authorization Signature).
+    /// streaming body (seed = Authorization Signature). No trailer HMAC.
     fn sign_streaming_put(
+        req: Request,
+        secret: &str,
+        chunks: &[&[u8]],
+        trailers: &[(&str, &str)],
+    ) -> Request {
+        sign_streaming_put_ex(req, secret, chunks, trailers, false, false)
+    }
+
+    /// Like [`sign_streaming_put`] with explicit trailer-signature options.
+    fn sign_streaming_put_ex(
         mut req: Request,
         secret: &str,
         chunks: &[&[u8]],
         trailers: &[(&str, &str)],
+        sign_trailer: bool,
+        bad_trailer_sig: bool,
     ) -> Request {
         let decoded_len: usize = chunks.iter().map(|c| c.len()).sum();
         req.headers
@@ -4443,6 +4893,8 @@ mod tests {
             &amz,
             &auth.signature,
             trailers,
+            sign_trailer,
+            bad_trailer_sig,
         );
         req.headers
             .set("Content-Length", framed.len().to_string());
@@ -4636,6 +5088,69 @@ mod tests {
         });
         let resp = api.handle(req, &next);
         assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn aws_chunked_signed_trailer_ok_dechunks_to_backend() {
+        let api = S3Api::new(cred_map());
+        let payload = b"signed-trailer-body";
+        let mut req = base_s3_req("PUT", "/mybucket/obj", "");
+        req.headers.set(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+        );
+        req.headers.set("Content-Encoding", "aws-chunked");
+        req.headers.set("x-amz-trailer", "x-amz-checksum-crc32");
+        let req = sign_streaming_put_ex(
+            req,
+            "testing",
+            &[payload.as_slice()],
+            &[("x-amz-checksum-crc32", "AAAAAA==")],
+            true,
+            false,
+        );
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                return Response::new(404);
+            }
+            let body = r.body.into_vec(u64::MAX).unwrap();
+            assert_eq!(body, b"signed-trailer-body");
+            assert_eq!(r.headers.get("Content-Length"), Some("19"));
+            Response::new(201)
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200, "valid trailer sig must succeed");
+    }
+
+    #[test]
+    fn aws_chunked_bad_trailer_signature_is_signature_does_not_match() {
+        let api = S3Api::new(cred_map());
+        let payload = b"bad-trailer-sig";
+        let mut req = base_s3_req("PUT", "/mybucket/obj", "");
+        req.headers.set(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+        );
+        req.headers.set("Content-Encoding", "aws-chunked");
+        req.headers.set("x-amz-trailer", "x-amz-checksum-crc32");
+        let req = sign_streaming_put_ex(
+            req,
+            "testing",
+            &[payload.as_slice()],
+            &[("x-amz-checksum-crc32", "AAAAAA==")],
+            true,
+            true, // deliberately wrong trailer signature
+        );
+        let next: NextFn = Arc::new(|_| {
+            panic!("bad trailer-signature must not forward body to backend")
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 403, "expected 403 SignatureDoesNotMatch");
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(
+            body.contains("SignatureDoesNotMatch"),
+            "expected SignatureDoesNotMatch XML, got {body}"
+        );
     }
 
     #[test]

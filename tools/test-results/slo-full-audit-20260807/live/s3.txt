@@ -1,0 +1,39 @@
+=== s3cmd MPU 5MB chunks ===
+Bucket 's3://slo-mpu2/' created
+e782bfd0695ad6288b1655bc5a9c5a2c  /tmp/slo15.bin
+ERROR: Error parsing xml: no element found: line 1, column 0
+ERROR: b''
+ERROR: Error parsing xml: no element found: line 1, column 0
+ERROR: b''
+ERROR: Error parsing xml: no element found: line 1, column 0
+ERROR: b''
+ERROR: Error parsing xml: no element found: line 1, column 0
+ERROR: b''
+ERROR: Error parsing xml: no element found: line 1, column 0
+ERROR: b''
+upload: '/tmp/slo15.bin' -> 's3://slo-mpu2/big.bin' (15728640 bytes in 1.8 seconds, 8.18 MB/s) [1 of 1]
+ERROR: Error parsing xml: syntax error: line 1, column 0
+ERROR: b'big.bin\n'
+ERROR: Error parsing xml: syntax error: line 1, column 0
+ERROR: b'big.bin\n'
+WARNING: MD5 signatures do not match: computed=e782bfd0695ad6288b1655bc5a9c5a2c, received=f7230793c7782538e8aafa37f85ef58e
+download: 's3://slo-mpu2/big.bin' -> '/tmp/slo15.get' (15728640 bytes in 0.7 seconds, 22.19 MB/s)
+e782bfd0695ad6288b1655bc5a9c5a2c  /tmp/slo15.get
+S3_MPU=PASS
+HTTP/2 200 
+content-type: application/json
+x-static-large-object: True
+last-modified: Fri, 07 Aug 2026 09:12:55 GMT
+x-timestamp: 1786093974.76680
+accept-ranges: bytes
+etag: f7230793c7782538e8aafa37f85ef58e
+content-length: 15728640
+x-trans-id: tx5a3dd487ed8da9b00c42c-006a75a197
+x-openstack-request-id: tx5a3dd487ed8da9b00c42c-006a75a197
+
+ERROR: Error parsing xml: syntax error: line 1, column 0
+ERROR: b'big.bin\n'
+delete: 's3://slo-mpu2/big.bin'
+ERROR: Error parsing xml: no element found: line 1, column 0
+ERROR: b''
+Bucket 's3://slo-mpu2/' removed

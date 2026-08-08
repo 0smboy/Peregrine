@@ -1,0 +1,45 @@
+    Blocking waiting for file lock on artifact directory
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `md5_hex` is never used
+   --> crates/swift-middleware/src/encrypter.rs:378:4
+    |
+378 | fn md5_hex(data: &[u8]) -> String {
+    |    ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib) generated 2 warnings (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 25.24s
+     Running unittests src/lib.rs (target/debug/deps/swift_s3api-69515649dacc0e5b)
+
+running 20 tests
+test lifecycle_exec::tests::apply_due_transition_stamps_transitioned ... ok
+test bucket_config::tests::lifecycle_meta_blob_roundtrip ... ok
+test lifecycle_exec::tests::apply_from_container_meta ... ok
+test lifecycle_exec::tests::apply_sets_x_delete_at_header ... ok
+test lifecycle_exec::tests::abort_incomplete_stamps_delete_at_on_marker ... ok
+test lifecycle_exec::tests::apply_transition_meta_non_matching_prefix_skips ... ok
+test lifecycle_exec::tests::apply_transition_meta_matching_key ... ok
+test lifecycle_exec::tests::compute_delete_at_days_one ... ok
+test lifecycle_exec::tests::cold_transition_blocks_get_and_restore ... ok
+test lifecycle_exec::tests::compute_delete_at_prefix_filter ... ok
+test lifecycle_exec::tests::disabled_rule_ignored ... ok
+test lifecycle_exec::tests::date_rule ... ok
+test lifecycle_exec::tests::parse_enabled_only ... ok
+test lifecycle_exec::tests::top_level_prefix_legacy_shape ... ok
+test lifecycle_exec::tests::transition_date_rule ... ok
+test lifecycle_exec::tests::expiration_still_works_alongside_transition ... ok
+test lifecycle_exec::tests::parse_transition_and_abort_from_sample_xml ... ok
+test middleware::tests::put_object_stamps_x_delete_at_from_lifecycle ... ok
+test middleware::tests::put_object_stamps_transition_meta_from_lifecycle ... ok
+test middleware::tests::lifecycle_put_get_delete_round_trip ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 184 filtered out; finished in 0.00s
+

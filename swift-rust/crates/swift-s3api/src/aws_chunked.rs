@@ -23,6 +23,7 @@
 //! …
 //! 0[;chunk-signature=<hex>]\r\n
 //! [trailers…]\r\n
+//! [x-amz-trailer-signature:<hex>\r\n]
 //! \r\n
 //! ```
 //!
@@ -31,6 +32,12 @@
 //! `ChunkReader` dechunk path (`s3request.py`). When `ChunkSigContext` is
 //! supplied for STREAMING-AWS4-HMAC-SHA256-PAYLOAD*, per-chunk HMAC chain
 //! verification is **enforced**: mismatch → [`AwsChunkedError::InvalidChunkSignature`].
+//!
+//! For `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER` (and whenever
+//! `x-amz-trailer-signature` is present under a signed HMAC context), trailer
+//! content is verified with `AWS4-HMAC-SHA256-TRAILER` (previous-sig = terminal
+//! 0-chunk signature). Mismatch → [`AwsChunkedError::InvalidTrailerSignature`].
+//! `STREAMING-UNSIGNED-PAYLOAD-TRAILER` accepts trailers without HMAC.
 
 use std::collections::HashMap;
 
@@ -67,6 +74,9 @@ pub enum AwsChunkedError {
     EcdsaNotImplemented,
     /// Per-chunk HMAC chain failed or chunk-signature missing in signed mode.
     InvalidChunkSignature,
+    /// Trailer HMAC (`AWS4-HMAC-SHA256-TRAILER` / `x-amz-trailer-signature`)
+    /// failed, or required trailer signature missing in signed trailer mode.
+    InvalidTrailerSignature,
 }
 
 /// Decoded payload + optional trailers after the terminal 0-chunk.
@@ -79,11 +89,18 @@ pub struct DecodedChunkedBody {
     /// [`AwsChunkedError::InvalidChunkSignature`] rather than `Some(false)`.
     /// `None` when no [`ChunkSigContext`] was supplied.
     pub chunk_signatures_valid: Option<bool>,
+    /// `Some(true)` when trailer signature was verified successfully.
+    /// `Some(false)` is not used (failure → error). `None` when trailer HMAC
+    /// was not applicable (unsigned mode / no trailer-sig present / not required).
+    pub trailer_signature_valid: Option<bool>,
 }
 
 /// Context for STREAMING-AWS4-HMAC-SHA256-PAYLOAD chunk signature chain
 /// verification. When passed to [`decode_aws_chunked`], invalid signatures
 /// fail the decode with [`AwsChunkedError::InvalidChunkSignature`].
+///
+/// When [`Self::require_trailer_signature`] is true (PAYLOAD-TRAILER mode) or
+/// trailers include `x-amz-trailer-signature`, trailer HMAC is also enforced.
 #[derive(Debug, Clone)]
 pub struct ChunkSigContext {
     pub secret_key: String,
@@ -93,6 +110,10 @@ pub struct ChunkSigContext {
     pub amz_date: String,
     /// Header (seed) signature; each chunk uses the previous signature.
     pub seed_signature: String,
+    /// When true (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`), trailers must
+    /// carry a valid `x-amz-trailer-signature` if any trailer content is present.
+    /// When false, trailer sig is still verified *if* the header is present.
+    pub require_trailer_signature: bool,
 }
 
 /// True when `X-Amz-Content-SHA256` is a STREAMING-* value.
@@ -152,6 +173,8 @@ pub fn cleanup_content_encoding(headers: &mut HeaderKeyDict) {
 /// `sig_ctx`: when `Some`, verify each `chunk-signature` against the
 /// STREAMING-AWS4-HMAC-SHA256-PAYLOAD chain. On mismatch or missing
 /// chunk-signature, return [`AwsChunkedError::InvalidChunkSignature`].
+/// When trailer signatures apply (see [`ChunkSigContext`]), also verify
+/// `x-amz-trailer-signature` → [`AwsChunkedError::InvalidTrailerSignature`].
 pub fn decode_aws_chunked(
     raw: &[u8],
     expected_decoded_len: Option<u64>,
@@ -234,12 +257,12 @@ pub fn decode_aws_chunked(
                         return Err(AwsChunkedError::InvalidChunkSignature);
                     }
                     *ok = true;
+                    // Keep terminal 0-chunk signature as prev for trailer HMAC.
                     prev_sig = Some(sig.to_ascii_lowercase());
                 } else {
                     return Err(AwsChunkedError::InvalidChunkSignature);
                 }
                 let _ = chunk_number;
-                let _ = prev_sig;
             }
 
             // Trailers: lines until empty line. Tolerate EOF after 0-chunk
@@ -272,11 +295,55 @@ pub fn decode_aws_chunked(
         }
     }
 
+    let trailer_signature_valid =
+        verify_trailers_if_needed(sig_ctx, prev_sig.as_deref(), &trailers)?;
+
     Ok(DecodedChunkedBody {
         data: out,
         trailers,
         chunk_signatures_valid: all_sigs_ok,
+        trailer_signature_valid,
     })
+}
+
+/// Verify trailer HMAC when signed streaming context applies.
+///
+/// * `require_trailer_signature` + non-empty trailers without
+///   `x-amz-trailer-signature` → error
+/// * `x-amz-trailer-signature` present (any signed mode) → HMAC check
+/// * Unsigned (`sig_ctx` None) → always `None` (accept)
+fn verify_trailers_if_needed(
+    sig_ctx: Option<&ChunkSigContext>,
+    prev_sig: Option<&str>,
+    trailers: &HashMap<String, String>,
+) -> Result<Option<bool>, AwsChunkedError> {
+    let Some(ctx) = sig_ctx else {
+        return Ok(None);
+    };
+    let has_trailer_sig = trailers.contains_key("x-amz-trailer-signature");
+    let has_any_trailer = !trailers.is_empty();
+
+    // PAYLOAD-TRAILER: if client sent trailer content, signature is required.
+    if ctx.require_trailer_signature && has_any_trailer && !has_trailer_sig {
+        return Err(AwsChunkedError::InvalidTrailerSignature);
+    }
+    if !has_trailer_sig {
+        // Residual: empty trailer block with require_trailer_signature still
+        // accepted (clients that omit trailers entirely after 0-chunk).
+        return Ok(None);
+    }
+
+    let Some(prev) = prev_sig else {
+        return Err(AwsChunkedError::InvalidTrailerSignature);
+    };
+    let presented = trailers
+        .get("x-amz-trailer-signature")
+        .map(String::as_str)
+        .unwrap_or("");
+    if !verify_trailer_signature(ctx, prev, trailers, presented) {
+        return Err(AwsChunkedError::InvalidTrailerSignature);
+    }
+    Ok(Some(true))
 }
 
 fn parse_hex_size(bytes: &[u8]) -> Result<usize, AwsChunkedError> {
@@ -337,6 +404,75 @@ fn verify_chunk_signature(
     presented: &str,
 ) -> bool {
     let expected = compute_chunk_signature(ctx, previous_signature, data_sha256);
+    streq_const_time(&expected, &presented.to_ascii_lowercase())
+}
+
+/// Build the AWS trailer string-to-sign payload hash input:
+/// sorted `key:value\n` lines excluding `x-amz-trailer-signature`, spaces
+/// stripped (Python `sign_trailer` / AWS no-whitespace rule). Empty trailers
+/// → a single `\n`.
+pub fn canonical_trailer_bytes(trailers: &HashMap<String, String>) -> Vec<u8> {
+    let mut keys: Vec<&str> = trailers
+        .keys()
+        .map(String::as_str)
+        .filter(|k| *k != "x-amz-trailer-signature")
+        .collect();
+    keys.sort_unstable();
+    let mut out = Vec::new();
+    for k in keys {
+        let v = trailers.get(k).map(String::as_str).unwrap_or("");
+        // AWS: no whitespace around colon; strip residual spaces from values.
+        let v_compact: String = v.chars().filter(|c| !c.is_whitespace()).collect();
+        out.extend_from_slice(k.as_bytes());
+        out.push(b':');
+        out.extend_from_slice(v_compact.as_bytes());
+        out.push(b'\n');
+    }
+    if out.is_empty() {
+        out.push(b'\n');
+    }
+    out
+}
+
+/// Compute `AWS4-HMAC-SHA256-TRAILER` signature (lowercase hex).
+///
+/// `previous_signature` is the terminal 0-byte chunk signature.
+/// `trailers` should include content trailers; `x-amz-trailer-signature` is
+/// ignored if present in the map.
+///
+/// String-to-sign (AWS / Python `SigV4Request._trailer_string_to_sign`):
+/// ```text
+/// AWS4-HMAC-SHA256-TRAILER
+/// <amz_date>
+/// <date>/<region>/<service>/aws4_request
+/// <previous_signature>
+/// hex(sha256(canonical_trailers))
+/// ```
+pub fn compute_trailer_signature(
+    ctx: &ChunkSigContext,
+    previous_signature: &str,
+    trailers: &HashMap<String, String>,
+) -> String {
+    let scope = format!("{}/{}/{}/aws4_request", ctx.date, ctx.region, ctx.service);
+    let trailer_hash = sha256_hex(&canonical_trailer_bytes(trailers));
+    let sts = format!(
+        "AWS4-HMAC-SHA256-TRAILER\n{}\n{}\n{}\n{}",
+        ctx.amz_date,
+        scope,
+        previous_signature.to_ascii_lowercase(),
+        trailer_hash
+    );
+    let key = signing_key(&ctx.secret_key, &ctx.date, &ctx.region, &ctx.service);
+    hmac_sha256_hex(&key, sts.as_bytes())
+}
+
+fn verify_trailer_signature(
+    ctx: &ChunkSigContext,
+    previous_signature: &str,
+    trailers: &HashMap<String, String>,
+    presented: &str,
+) -> bool {
+    let expected = compute_trailer_signature(ctx, previous_signature, trailers);
     streq_const_time(&expected, &presented.to_ascii_lowercase())
 }
 
@@ -444,6 +580,19 @@ ddfbbd21811de45491022c\r\n\r\n";
         assert_eq!(decoded.data, b"abcdefghijklmnopqrstuvwz\n");
     }
 
+    fn test_ctx(require_trailer: bool) -> ChunkSigContext {
+        ChunkSigContext {
+            secret_key: "secret".into(),
+            date: "20220330".into(),
+            region: "us-east-1".into(),
+            service: "s3".into(),
+            amz_date: "20220330T095351Z".into(),
+            seed_signature: "aa1b67fc5bc4503d05a636e6e740dcb757d3aa2352f32e7493f261f71acbe1d5"
+                .into(),
+            require_trailer_signature: require_trailer,
+        }
+    }
+
     #[test]
     fn dechunk_python_hmac_vector_with_verify() {
         let body = b"a;chunk-signature=4a397f01db2cd700402dc38931b462e789ae49911d\
@@ -454,18 +603,11 @@ a;chunk-signature=49177768ee3e9b77c6353ab9f3b9747d188adc11d4\
 6c73cc6d4ee057527a8c23\r\nuvwz\n\r\n\
 0;chunk-signature=50f7c470d6bf6c59126eecc2cb020d532a69c92322\
 ddfbbd21811de45491022c\r\n\r\n";
-        let ctx = ChunkSigContext {
-            secret_key: "secret".into(),
-            date: "20220330".into(),
-            region: "us-east-1".into(),
-            service: "s3".into(),
-            amz_date: "20220330T095351Z".into(),
-            seed_signature: "aa1b67fc5bc4503d05a636e6e740dcb757d3aa2352f32e7493f261f71acbe1d5"
-                .into(),
-        };
+        let ctx = test_ctx(false);
         let decoded = decode_aws_chunked(body, Some(25), Some(&ctx)).unwrap();
         assert_eq!(decoded.data, b"abcdefghijklmnopqrstuvwz\n");
         assert_eq!(decoded.chunk_signatures_valid, Some(true));
+        assert_eq!(decoded.trailer_signature_valid, None);
     }
 
     #[test]
@@ -473,15 +615,7 @@ ddfbbd21811de45491022c\r\n\r\n";
         let body = b"a;chunk-signature=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead\
 beefdeadbeefdeadbeefde\r\nabcdefghij\r\n0;chunk-signature=00\
 00000000000000000000000000000000000000000000000000000000000000\r\n\r\n";
-        let ctx = ChunkSigContext {
-            secret_key: "secret".into(),
-            date: "20220330".into(),
-            region: "us-east-1".into(),
-            service: "s3".into(),
-            amz_date: "20220330T095351Z".into(),
-            seed_signature: "aa1b67fc5bc4503d05a636e6e740dcb757d3aa2352f32e7493f261f71acbe1d5"
-                .into(),
-        };
+        let ctx = test_ctx(false);
         let err = decode_aws_chunked(body, Some(10), Some(&ctx)).unwrap_err();
         assert_eq!(err, AwsChunkedError::InvalidChunkSignature);
     }
@@ -489,17 +623,131 @@ beefdeadbeefdeadbeefde\r\nabcdefghij\r\n0;chunk-signature=00\
     #[test]
     fn dechunk_missing_chunk_signature_in_signed_mode_errors() {
         let framed = frame_aws_chunked_unsigned(b"hello", 5);
-        let ctx = ChunkSigContext {
-            secret_key: "secret".into(),
-            date: "20220330".into(),
-            region: "us-east-1".into(),
-            service: "s3".into(),
-            amz_date: "20220330T095351Z".into(),
-            seed_signature: "aa1b67fc5bc4503d05a636e6e740dcb757d3aa2352f32e7493f261f71acbe1d5"
-                .into(),
-        };
+        let ctx = test_ctx(false);
         let err = decode_aws_chunked(&framed, Some(5), Some(&ctx)).unwrap_err();
         assert_eq!(err, AwsChunkedError::InvalidChunkSignature);
+    }
+
+    /// Build signed body with trailers + valid x-amz-trailer-signature.
+    fn frame_signed_with_trailer(
+        payload: &[u8],
+        trailers: &[(&str, &str)],
+        require_trailer: bool,
+        bad_trailer_sig: bool,
+    ) -> (Vec<u8>, ChunkSigContext) {
+        let ctx = test_ctx(require_trailer);
+        let mut out = Vec::new();
+        let mut prev = ctx.seed_signature.clone();
+        let data_hash = sha256_hex(payload);
+        let sig = compute_chunk_signature(&ctx, &prev, &data_hash);
+        out.extend_from_slice(format!("{:x};chunk-signature={sig}\r\n", payload.len()).as_bytes());
+        out.extend_from_slice(payload);
+        out.extend_from_slice(b"\r\n");
+        prev = sig;
+        let sig0 = compute_chunk_signature(&ctx, &prev, EMPTY_SHA256);
+        out.extend_from_slice(format!("0;chunk-signature={sig0}\r\n").as_bytes());
+        prev = sig0;
+
+        let mut trailer_map = HashMap::new();
+        for (k, v) in trailers {
+            trailer_map.insert(k.to_ascii_lowercase(), (*v).to_string());
+            out.extend_from_slice(format!("{k}:{v}\r\n").as_bytes());
+        }
+        let trailer_sig = if bad_trailer_sig {
+            "deadbeef".repeat(8)
+        } else {
+            compute_trailer_signature(&ctx, &prev, &trailer_map)
+        };
+        out.extend_from_slice(format!("x-amz-trailer-signature:{trailer_sig}\r\n").as_bytes());
+        out.extend_from_slice(b"\r\n");
+        (out, ctx)
+    }
+
+    #[test]
+    fn dechunk_signed_trailer_signature_ok() {
+        let payload = b"trailer-payload";
+        let (framed, ctx) = frame_signed_with_trailer(
+            payload,
+            &[("x-amz-checksum-crc32", "AAAAAA==")],
+            true,
+            false,
+        );
+        let decoded = decode_aws_chunked(&framed, Some(payload.len() as u64), Some(&ctx)).unwrap();
+        assert_eq!(decoded.data, payload);
+        assert_eq!(decoded.chunk_signatures_valid, Some(true));
+        assert_eq!(decoded.trailer_signature_valid, Some(true));
+        assert_eq!(
+            decoded.trailers.get("x-amz-checksum-crc32").map(String::as_str),
+            Some("AAAAAA==")
+        );
+        assert!(decoded.trailers.contains_key("x-amz-trailer-signature"));
+    }
+
+    #[test]
+    fn dechunk_bad_trailer_signature_errors() {
+        let payload = b"trailer-payload";
+        let (framed, ctx) = frame_signed_with_trailer(
+            payload,
+            &[("x-amz-checksum-crc32", "AAAAAA==")],
+            true,
+            true,
+        );
+        let err = decode_aws_chunked(&framed, Some(payload.len() as u64), Some(&ctx)).unwrap_err();
+        assert_eq!(err, AwsChunkedError::InvalidTrailerSignature);
+    }
+
+    #[test]
+    fn dechunk_trailer_mode_missing_trailer_sig_errors() {
+        // PAYLOAD-TRAILER with content trailers but no x-amz-trailer-signature.
+        let ctx = test_ctx(true);
+        let mut out = Vec::new();
+        let mut prev = ctx.seed_signature.clone();
+        let payload = b"hello";
+        let data_hash = sha256_hex(payload);
+        let sig = compute_chunk_signature(&ctx, &prev, &data_hash);
+        out.extend_from_slice(format!("{:x};chunk-signature={sig}\r\n", payload.len()).as_bytes());
+        out.extend_from_slice(payload);
+        out.extend_from_slice(b"\r\n");
+        prev = sig;
+        let sig0 = compute_chunk_signature(&ctx, &prev, EMPTY_SHA256);
+        out.extend_from_slice(format!("0;chunk-signature={sig0}\r\n").as_bytes());
+        out.extend_from_slice(b"x-amz-checksum-crc32:AAAAAA==\r\n\r\n");
+        let err = decode_aws_chunked(&out, Some(5), Some(&ctx)).unwrap_err();
+        assert_eq!(err, AwsChunkedError::InvalidTrailerSignature);
+    }
+
+    #[test]
+    fn dechunk_unsigned_trailer_still_ok() {
+        // STREAMING-UNSIGNED-PAYLOAD-TRAILER: no sig_ctx, trailers accepted.
+        let mut framed = Vec::new();
+        framed.extend_from_slice(b"5\r\nhello\r\n");
+        framed.extend_from_slice(b"0\r\n");
+        framed.extend_from_slice(b"x-amz-checksum-crc32:AAAAAA==\r\n");
+        framed.extend_from_slice(b"\r\n");
+        let decoded = decode_aws_chunked(&framed, Some(5), None).unwrap();
+        assert_eq!(decoded.data, b"hello");
+        assert_eq!(decoded.trailer_signature_valid, None);
+        assert_eq!(
+            decoded.trailers.get("x-amz-checksum-crc32").map(String::as_str),
+            Some("AAAAAA==")
+        );
+    }
+
+    #[test]
+    fn aws_doc_trailer_hash_vector() {
+        // AWS docs: hash('x-amz-checksum-crc32c:sOO8/Q==\n') =
+        // 1e376db7e1a34a8ef1c4bcee131a2d60a1cb62503747488624e10995f448d774
+        let mut trailers = HashMap::new();
+        trailers.insert(
+            "x-amz-checksum-crc32c".into(),
+            "sOO8/Q==".into(),
+        );
+        let canon = canonical_trailer_bytes(&trailers);
+        assert_eq!(canon, b"x-amz-checksum-crc32c:sOO8/Q==\n");
+        assert_eq!(
+            sha256_hex(&canon),
+            "1e376db7e1a34a8ef1c4bcee131a2d60a1cb62503747488624e10995f448d774"
+        );
     }
 
     #[test]

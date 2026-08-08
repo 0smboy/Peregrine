@@ -1,8 +1,9 @@
 # Rust Swift vs Python Swift — full-function parity matrix
 
-**As of:** 2026-08-07  
+**As of:** 2026-08-08  
 **Rule:** *partial implementation counts as **未实现 (NOT implemented)*** for this table.  
-**“已实现”** requires: wired into a deployable path **and** verified enough to claim (unit + live where applicable), without major Deferred semantics that change client-visible behavior.
+**“已实现”** requires: wired into a deployable path **and** verified enough to claim (unit + live where applicable), without major Deferred semantics that change client-visible behavior.  
+**Hard9 wave (2026-08-08):** OpenStack-standard Paste + xprofile/list_endpoints; Lifecycle Transition cold GET+restore; ACP READ/WRITE enforce + local IAM dir; process_workers prefork; SLO concurrent HEAD + listing etag refetch. Evidence `tools/test-results/hard9-residual-wave-20260808/`.
 
 **Implementations compared**
 
@@ -27,7 +28,7 @@
 | Single + multi Range / multipart byteranges | ✅ | ✅ | |
 | Server-side COPY / X-Copy-From | ✅ | ✅ | |
 | Expiry `X-Delete-At` / `X-Delete-After` | ✅ | ✅ | Expirer daemon |
-| SLO (manifest PUT + GET reassembly) | ✅ | ✅ | Nested/streamed + inline + streaming heartbeat + sync/async multipart-delete; **unit re-verify 24/24** (`residual-slo-edge-20260807`) |
+| SLO (manifest PUT + GET reassembly) | ✅ | ✅ | Nested/streamed + inline + heartbeat + sync/async delete; **concurrent HEAD pile** + **yield_frequency**; **listing etag refetch**; Contabo live audit KEEP (`slo-full-audit-20260807` + hard9) |
 | DLO | ✅ | ✅ | Listing pagination beyond limit residual → main path ✅ |
 | Versioned writes (stack) | ✅ | ✅ | Primary suite |
 | Symlink | ✅ | ✅ | |
@@ -39,7 +40,8 @@
 | Account autocreate | ✅ | ✅ | |
 | Allow account management | ✅ | ✅ | `allow_account_management` conf; PUT/DELETE gated **405** when off; unit reaffirm 2026-08-07 (`residual-pipeline-account-20260807`: lib 19/19 + gate test) |
 | SLO residual: expirer hash sharding / async ACL probes | ✅ | ✅ | hash_path day-bucket offset + HEAD write probes (`impl-slo-expirer-hash-20260807`) |
-| Full Paste arbitrary pipeline (any filter name) | ✅ | partial | Unknown names **skip** by default; `strict_pipeline=true` hard-fails startup (Paste-like) — unit 2026-08-07 (`residual-pipeline-account-20260807`: pipeline/strict binary 15/15). Implementing every filter name still ❌ |
+| OpenStack-standard Paste pipeline filter names | ✅ | ✅ | Standard names real or `NamedPassthrough`; `strict_pipeline` still hard-fails **unknown custom** names (`hard9-residual-wave-20260808`) |
+| Unlimited third-party arbitrary Paste plugins | ✅ | ❌ | Cannot auto-implement infinite unknown plugins |
 
 ---
 
@@ -62,7 +64,9 @@
 | s3api / s3token | ✅ | ✅ | See S3 section; not full AWS |
 | container-sync middleware + daemon | ✅ | ✅ | Same-cluster object path Contabo **KEEP** (`sync-smoke-20260806d`); TempAuth GET + legacy sync-key authorize + hop-by-hop PUT header strip; multi-cluster realm soak not claimed |
 | encrypter / decrypter / keymaster / encryption | ✅ | ✅ | Multi-root + listing decrypt + multipart/range GET decrypt + conditional etag mask; KMIP residual |
-| xprofile / other niche Paste filters | ✅ | ❌ | |
+| xprofile | ✅ | ✅ | `X-Profile-Duration-Ms` (+ optional log); unit (`hard9`) |
+| list_endpoints | ✅ | ✅ | `/endpoints/...` JSON; 501 without ring resolver; unit |
+| NamedPassthrough slots (memcache/recon/healthcheck aliases in pipeline) | ✅ | ✅ | Claimable pipeline slots |
 
 ---
 
@@ -81,18 +85,22 @@
 | Canned bucket ACL (`private` / `public-read` / `public-read-write`) | ✅ | ✅ | `x-amz-acl` → `X-Container-Read/Write`; unit |
 | Object canned ACL store + GET `?acl` | ✅ | ✅ | `x-amz-acl` → `X-Object-Sysmeta-S3-Acl`; unit 2026-08-07; **not** anonymous Swift GET by itself |
 | Multi-rule CORS put/get | ✅ | ✅ |
-| Lifecycle Expiration **execution** | ✅ | ✅ | Enabled Days/Date → `X-Delete-At` on PUT; **Transition** meta stamps + **AbortIncompleteMPU** marker delete-at (`impl-lifecycle-transitions-20260807`) |
-| Object Lock WORM (legal-hold/retention) | ✅ | ✅ | blocks DELETE/overwrite; **GOVERNANCE bypass** via `x-amz-bypass-governance-retention` (`impl-worm-governance-bypass`); COMPLIANCE/legal-hold still hard-block |
+| Lifecycle Expiration **execution** | ✅ | ✅ | Enabled Days/Date → `X-Delete-At` on PUT; AbortIncompleteMPU marker delete-at |
+| Lifecycle **Transition** execution | ✅ | ✅ | cold class after Transition-At → GET `InvalidObjectState`; restore window; meta stamps; **no physical tape backend** (`hard9`) |
+| Object Lock WORM (legal-hold/retention) | ✅ | ✅ | blocks DELETE/overwrite; **GOVERNANCE bypass**; COMPLIANCE/legal-hold hard-block |
 | s3token → Keystone /v3/s3tokens | ✅ | ✅ | live EC2 GREEN 2026-08-06 |
 | SigV2 | ✅ | ❌ | **WONTFIX** — stable **501** `Code=NotImplemented` (unit header+query) |
 | aws-chunked / STREAMING-* | ✅ | ✅ | dechunk after SigV4 header verify; **per-chunk HMAC enforced** → `SignatureDoesNotMatch` (`impl-chunk-sig-enforce` / priority-unimpl-wave-20260807) |
 | Multi-version object data plane | ✅ | ✅ | archive `{bucket}+versions`; versionId GET/DELETE; delete-marker; ListVersions (`impl-s3-multiversion-data-20260807`)
 | Versioning status GET/PUT | ✅ | ✅ | meta `X-Container-Meta-S3-Versioning`; unit `versioning_put_get_round_trip` `impl-s3-versioning-surface-20260807` |
-| List object versions (`?versions`) | ✅ | ✅ | `ListVersionsResult` from `{bucket}+versions` indexes; empty only when versions container 404 |
+| List object versions (`?versions`) | ✅ | ✅ | `ListVersionsResult` from `{bucket}+versions` indexes; empty only when versions container 404; **pagination KEEP** `key-marker`/`version-id-marker`/`max-keys` → `IsTruncated`+`NextKeyMarker`+`NextVersionIdMarker` (`impl-listversions-pagination-20260807`) |
 | Tagging GET/PUT/DELETE (bucket + object) | ⚠️ (GET empty / PUT NotImpl) | ✅ | meta TagSet round-trip; unit `*_tagging_*_round_trip` |
 | Lifecycle GET/PUT/DELETE | ❌ / limited | ✅ | raw XML in container meta; unit `lifecycle_put_get_delete_round_trip` (no expirer) |
 | Object-lock config GET/PUT | ❌ GET not-found / PUT NotImpl | ✅ | raw XML meta round-trip; unit `object_lock_put_get_round_trip` (no WORM) |
-| Full IAM / grant-header ACL / ACP XML body PUT | ✅ | ⚠️ | **store/GET KEEP** (grant headers + ACP XML → JSON sysmeta + AllUsers→container ACL); grant **enforcement** residual; canned still wins (`impl-grant-acp-acl` / priority-unimpl-wave-20260807) |
+| grant-header + ACP XML store/GET | ✅ | ✅ | JSON sysmeta + AllUsers→container ACL; canned wins if both present |
+| ACP grant **enforcement** (READ/WRITE) | ✅ | ✅ | GET/HEAD READ + PUT/DELETE WRITE (`acl_write_check_object`); unit (`hard9` / P1) |
+| Local IAM identity directory (email/access_key map) | ✅ | ✅ | `iam::IdentityDirectory`; **not** AWS IAM cloud service |
+| AWS IAM cloud / full multi-tenant IAM product | ✅ | ❌ | |
 | authenticated-read / log-delivery-write canned | ❌ / NotImpl | ❌ | map to private; no AuthenticatedUsers Swift ACL |
 
 ---
@@ -151,7 +159,7 @@
 
 | Area | Python | Rust | Notes |
 |------|:------:|:----:|-------|
-| eventlet multi-process workers | ✅ | ⚠️ | **Tooling GREEN** (`swift-effective-concurrency` + unit mapping); classic prefork / proxy path still **process-model residual** (threads ≠ eventlet processes) — `residual-workers-semantics-20260807` |
+| eventlet multi-process workers | ✅ | ✅ | `process_workers` / `worker_model=process` Unix **prefork** after bind; in-process thread pool remains; **not** greenlet bit-identical (`hard9`) |
 | `servers_per_port` process isolation | ✅ | ✅ | Contabo live 6211/6212 |
 | HAProxy + Keepalived | ✅ | ✅ | lab |
 | VIP TLS (operator PEM path) | ✅ | ⚠️ | Code+ops script GREEN; Contabo still **self-signed LAB** (2026-08-06 probe); production PEM apply not executed |
@@ -165,9 +173,9 @@
 
 | Domain | Implemented | Not implemented (incl. partial) |
 |--------|-------------|----------------------------------|
-| Swift v1 core CRUD + common middleware | **Most** | full arbitrary Paste; SLO async ACL/hash_path residual |
-| Auth | TempAuth + Keystone lab | Production-only ops polish |
-| S3 | SigV4 + MPU + canned ACL + multi-rule CORS + **aws-chunked + chunk-sig enforce** + versioning/lifecycle Transition/WORM governance bypass + grant/ACP store (unit **176/176**) | SigV2 **WONTFIX 501**; ACP grant **enforcement** residual; real Transition tiering residual |
+| Swift v1 core CRUD + common middleware | **Most** | unlimited third-party Paste plugins |
+| Auth | TempAuth + Keystone lab | Production PEM polish |
+| S3 | SigV4 + MPU + ACL/CORS + chunk-sig + versioning + Transition exec + WORM + ACP enforce + local IAM (unit **~204**) | SigV2 **WONTFIX 501**; AWS IAM cloud; physical Glacier/tape backend |
 | EC | Data path + heal | macOS/default build; some EC throttling niceties |
 | Sharding L3b | CLI + daemon ring-part cleave + fan-out + ×4 Contabo; **product-style 40×4KB KEEP** on SHARDED `shrinklab` (HEAD=list, GET 5/5) `priority-wave-20260806` | Python对照 / multi-hour soak / multi-primary auto-shrink **未宣称** |
 | Crypto at-rest middleware | multi-root + listing + range GET + etag mask + **chunked PUT encrypt** | KMIP; ciphertext still buffered (footer residual) |

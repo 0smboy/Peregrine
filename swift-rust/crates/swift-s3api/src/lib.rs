@@ -36,7 +36,9 @@
 //! backend with fixed `Content-Length`. When the mode is
 //! `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` / `*-TRAILER` and credentials are
 //! available, **per-chunk HMAC signatures are enforced** (mismatch →
-//! `SignatureDoesNotMatch`). `STREAMING-UNSIGNED-PAYLOAD-TRAILER` dechunks
+//! `SignatureDoesNotMatch`). For `*-PAYLOAD-TRAILER`, **trailer HMAC**
+//! (`x-amz-trailer-signature` / `AWS4-HMAC-SHA256-TRAILER`) is enforced when
+//! trailer content is present. `STREAMING-UNSIGNED-PAYLOAD-TRAILER` dechunks
 //! without requiring signatures.
 //!
 //! # Subresource config APIs (meta round-trip)
@@ -64,16 +66,23 @@
 //! Other residuals (not claimable as implemented):
 //!
 //! * lifecycle tag / And filters; real storage-class tiering backends
-//! * full IAM identity / emailAddress grantee resolution; **object ACP grant
-//!   enforcement** on subsequent ops (authz still Swift container ACL). Grant
-//!   headers + ACP XML body store/GET round-trip **is** claimable (JSON sysmeta
-//!   + container AllUsers mapping); canned `x-amz-acl` still works and wins if
-//!   both present. Object public-read / AllUsers READ does **not** by itself
-//!   authorize anonymous Swift GET — container ACL still gates access.
+//! * full IAM identity / emailAddress grantee resolution. Grant headers + ACP
+//!   XML body store/GET round-trip **is** claimable (JSON sysmeta + container
+//!   AllUsers mapping); canned `x-amz-acl` still works and wins if both present.
+//!   **Object ACP grant enforcement on GET/HEAD** (LAB-HARD-GREEN): when
+//!   `S3_OBJECT_ACL_JSON_META` has non-empty grants, principal (`access_key` /
+//!   account) must be owner or hold READ/FULL_CONTROL else `AccessDenied`;
+//!   owner always OK; missing/empty grants → no new denial. AllUsers READ does
+//!   **not** by itself authorize anonymous unauthenticated Swift GET —
+//!   container ACL still gates; unauthenticated traffic never enters SigV4
+//!   grant evaluation.
 //! * authenticated-read / log-delivery-write canned ACLs (Python NotImplemented)
 //! * CORS ExposeHeader edge cases in live preflight
 //! * clock-skew/expiry enforcement on every path
-//! * trailer *content* signature verification (x-amz-trailer-signature)
+//! * requiring `x-amz-trailer-signature` when PAYLOAD-TRAILER mode has an
+//!   *empty* trailer block (we only enforce when trailer lines are present);
+//!   full AWS multi-chunk trailer golden-vector e2e against live S3 is not
+//!   re-run in CI (unit vector for trailer hash + round-trip HMAC is covered)
 //!
 //! Unknown access keys (EC2 / Keystone) are deferred via an optional
 //! [`swift_middleware::S3TokenClient`] on [`middleware::S3Api`] (inline
@@ -86,6 +95,7 @@ pub mod aws_chunked;
 pub mod bucket_config;
 pub mod crypto;
 pub mod delete;
+pub mod iam;
 pub mod lifecycle_exec;
 pub mod middleware;
 pub mod mpu;

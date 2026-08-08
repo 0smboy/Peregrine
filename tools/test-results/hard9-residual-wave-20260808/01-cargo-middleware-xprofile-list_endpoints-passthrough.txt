@@ -1,0 +1,267 @@
+=== cargo test -p swift-middleware --lib xprofile ===
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on artifact directory
+   Compiling libc v0.2.186
+   Compiling version_check v0.9.5
+   Compiling typenum v1.20.1
+   Compiling cfg-if v1.0.4
+   Compiling subtle v2.6.1
+   Compiling zmij v1.0.23
+   Compiling serde_core v1.0.228
+   Compiling rustix v1.1.4
+   Compiling bitflags v2.13.0
+   Compiling serde_json v1.0.150
+   Compiling generic-array v0.14.7
+   Compiling itoa v1.0.18
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.9
+   Compiling memchr v2.8.3
+   Compiling getrandom v0.4.3
+   Compiling pkg-config v0.3.33
+   Compiling crossbeam-utils v0.8.22
+   Compiling cc v1.2.67
+   Compiling errno v0.3.14
+   Compiling cpufeatures v0.2.17
+   Compiling core-foundation-sys v0.8.7
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling inout v0.1.4
+   Compiling digest v0.10.7
+   Compiling crc32fast v1.5.0
+   Compiling cipher v0.4.4
+   Compiling security-framework-sys v2.17.0
+   Compiling core-foundation v0.10.1
+   Compiling md-5 v0.10.6
+   Compiling simd-adler32 v0.3.10
+   Compiling bzip2-sys v0.1.13+1.0.8
+   Compiling once_cell v1.21.4
+   Compiling adler2 v2.0.1
+   Compiling native-tls v0.2.18
+   Compiling fastrand v2.5.0
+   Compiling xattr v1.6.1
+   Compiling miniz_oxide v0.8.9
+   Compiling crossbeam-channel v0.5.16
+   Compiling tempfile v3.27.0
+   Compiling security-framework v3.7.0
+   Compiling hmac v0.12.1
+   Compiling sha2 v0.10.9
+   Compiling swift-core v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-core)
+   Compiling aes v0.8.4
+   Compiling ctr v0.9.2
+   Compiling filetime v0.2.29
+   Compiling base64 v0.22.1
+   Compiling swift-memcache v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-memcache)
+   Compiling tar v0.4.46
+   Compiling flate2 v1.1.9
+   Compiling bzip2 v0.4.4
+   Compiling swift-crypto v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-crypto)
+   Compiling sha1 v0.10.7
+   Compiling swift-http v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-http)
+   Compiling swift-middleware v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-middleware)
+warning: variable does not need to be mutable
+    --> crates/swift-middleware/src/slo.rs:2675:13
+     |
+2675 |         let mut h2 = HeaderKeyDict::new();
+     |             ----^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib test) generated 1 warning (run `cargo fix --lib -p swift-middleware --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.45s
+     Running unittests src/lib.rs (target/debug/deps/swift_middleware-7a92af109edbe29b)
+
+running 2 tests
+test xprofile::tests::adds_duration_header ... ok
+test xprofile::tests::profile_path_prefix_filters ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 412 filtered out; finished in 0.00s
+
+EXIT_xprofile=0
+
+=== cargo test -p swift-middleware --lib list_endpoints ===
+    Blocking waiting for file lock on artifact directory
+   Compiling libc v0.2.186
+   Compiling version_check v0.9.5
+   Compiling typenum v1.20.1
+   Compiling cfg-if v1.0.4
+   Compiling subtle v2.6.1
+   Compiling zmij v1.0.23
+   Compiling serde_core v1.0.228
+   Compiling bitflags v2.13.0
+   Compiling serde_json v1.0.150
+   Compiling rustix v1.1.4
+   Compiling find-msvc-tools v0.1.9
+   Compiling generic-array v0.14.7
+   Compiling shlex v2.0.1
+   Compiling itoa v1.0.18
+   Compiling memchr v2.8.3
+   Compiling pkg-config v0.3.33
+   Compiling cc v1.2.67
+   Compiling core-foundation-sys v0.8.7
+   Compiling crossbeam-utils v0.8.22
+   Compiling errno v0.3.14
+   Compiling cpufeatures v0.2.17
+   Compiling getrandom v0.4.3
+   Compiling crc32fast v1.5.0
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling inout v0.1.4
+   Compiling digest v0.10.7
+   Compiling core-foundation v0.10.1
+   Compiling cipher v0.4.4
+   Compiling security-framework-sys v2.17.0
+   Compiling simd-adler32 v0.3.10
+   Compiling bzip2-sys v0.1.13+1.0.8
+   Compiling md-5 v0.10.6
+   Compiling once_cell v1.21.4
+   Compiling adler2 v2.0.1
+   Compiling fastrand v2.5.0
+   Compiling native-tls v0.2.18
+   Compiling security-framework v3.7.0
+   Compiling miniz_oxide v0.8.9
+   Compiling aes v0.8.4
+   Compiling xattr v1.6.1
+   Compiling tempfile v3.27.0
+   Compiling ctr v0.9.2
+   Compiling hmac v0.12.1
+   Compiling sha2 v0.10.9
+   Compiling crossbeam-channel v0.5.16
+   Compiling filetime v0.2.29
+   Compiling base64 v0.22.1
+   Compiling bzip2 v0.4.4
+   Compiling tar v0.4.46
+   Compiling flate2 v1.1.9
+   Compiling sha1 v0.10.7
+   Compiling swift-core v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-core)
+   Compiling swift-crypto v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-crypto)
+   Compiling swift-memcache v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-memcache)
+   Compiling swift-http v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-http)
+   Compiling swift-middleware v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-middleware)
+warning: variable does not need to be mutable
+    --> crates/swift-middleware/src/slo.rs:2675:13
+     |
+2675 |         let mut h2 = HeaderKeyDict::new();
+     |             ----^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib test) generated 1 warning (run `cargo fix --lib -p swift-middleware --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 29.81s
+     Running unittests src/lib.rs (target/debug/deps/swift_middleware-7a92af109edbe29b)
+
+running 2 tests
+test list_endpoints::tests::passthrough_other_paths ... ok
+test list_endpoints::tests::returns_json_endpoints ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 412 filtered out; finished in 0.01s
+
+EXIT_list_endpoints=0
+
+=== cargo test -p swift-middleware --lib passthrough ===
+    Blocking waiting for file lock on artifact directory
+   Compiling libc v0.2.186
+   Compiling version_check v0.9.5
+   Compiling typenum v1.20.1
+   Compiling cfg-if v1.0.4
+   Compiling subtle v2.6.1
+   Compiling zmij v1.0.23
+   Compiling serde_core v1.0.228
+   Compiling rustix v1.1.4
+   Compiling bitflags v2.13.0
+   Compiling serde_json v1.0.150
+   Compiling generic-array v0.14.7
+   Compiling find-msvc-tools v0.1.9
+   Compiling memchr v2.8.3
+   Compiling shlex v2.0.1
+   Compiling itoa v1.0.18
+   Compiling cc v1.2.67
+   Compiling pkg-config v0.3.33
+   Compiling getrandom v0.4.3
+   Compiling core-foundation-sys v0.8.7
+   Compiling errno v0.3.14
+   Compiling cpufeatures v0.2.17
+   Compiling crossbeam-utils v0.8.22
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling inout v0.1.4
+   Compiling crc32fast v1.5.0
+   Compiling digest v0.10.7
+   Compiling cipher v0.4.4
+   Compiling core-foundation v0.10.1
+   Compiling security-framework-sys v2.17.0
+   Compiling md-5 v0.10.6
+   Compiling adler2 v2.0.1
+   Compiling bzip2-sys v0.1.13+1.0.8
+   Compiling once_cell v1.21.4
+   Compiling fastrand v2.5.0
+   Compiling simd-adler32 v0.3.10
+   Compiling native-tls v0.2.18
+   Compiling crossbeam-channel v0.5.16
+   Compiling miniz_oxide v0.8.9
+   Compiling tempfile v3.27.0
+   Compiling xattr v1.6.1
+   Compiling security-framework v3.7.0
+   Compiling sha2 v0.10.9
+   Compiling hmac v0.12.1
+   Compiling swift-core v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-core)
+   Compiling aes v0.8.4
+   Compiling ctr v0.9.2
+   Compiling filetime v0.2.29
+   Compiling base64 v0.22.1
+   Compiling flate2 v1.1.9
+   Compiling swift-memcache v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-memcache)
+   Compiling tar v0.4.46
+   Compiling bzip2 v0.4.4
+   Compiling swift-crypto v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-crypto)
+   Compiling sha1 v0.10.7
+   Compiling swift-http v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-http)
+   Compiling swift-middleware v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-middleware)
+warning: variable does not need to be mutable
+    --> crates/swift-middleware/src/slo.rs:2675:13
+     |
+2675 |         let mut h2 = HeaderKeyDict::new();
+     |             ----^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib test) generated 1 warning (run `cargo fix --lib -p swift-middleware --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 21.78s
+     Running unittests src/lib.rs (target/debug/deps/swift_middleware-7a92af109edbe29b)
+
+running 24 tests
+test formpost::tests::test_non_multipart_passthrough ... ok
+test listing_formats::tests::test_array_of_non_objects_passthrough ... ok
+test dlo::tests::test_non_manifest_passthrough ... ok
+test container_sync::tests::test_no_auth_passthrough ... ok
+test cname_lookup::tests::test_passthrough_already_in_storage_domain ... ok
+test list_endpoints::tests::passthrough_other_paths ... ok
+test domain_remap::tests::test_passthrough ... ok
+test listing_formats::tests::test_bad_json_passthrough_with_vary ... ok
+test listing_formats::tests::test_invalid_api_version_passthrough ... ok
+test listing_formats::tests::test_missing_required_field_keyerror_passthrough ... ok
+test listing_formats::tests::test_non_2xx_status_passthrough ... ok
+test listing_formats::tests::test_non_array_json_passthrough ... ok
+test listing_formats::tests::test_object_request_passthrough_untouched ... ok
+test listing_formats::tests::test_non_json_content_type_passthrough_with_vary ... ok
+test listing_formats::tests::test_post_method_passthrough ... ok
+test listing_formats::tests::test_text_missing_name_and_subdir_keyerror_passthrough ... ok
+test passthrough::tests::passes_through ... ok
+test s3token::tests::passthrough_without_s3_auth ... ok
+test slo::tests::test_slo_non_manifest_passthrough ... ok
+test proxy_logging::tests::test_middleware_passthrough_is_unchanged ... ok
+test s3token::tests::passthrough_when_only_amz_date_no_sts_header ... ok
+test tempurl::tests::test_no_tempurl_params_passthrough ... ok
+test tempurl::tests::test_options_passthrough ... ok
+test listing_formats::tests::test_oversize_body_passthrough ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 390 filtered out; finished in 0.02s
+
+EXIT_passthrough=0

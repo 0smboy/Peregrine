@@ -1,0 +1,48 @@
+crates/swift-s3api/src/middleware.rs:67://! For `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`, `x-amz-trailer-signature`
+crates/swift-s3api/src/middleware.rs:68://! is verified (`AWS4-HMAC-SHA256-TRAILER`); mismatch or missing trailer sig
+crates/swift-s3api/src/middleware.rs:404:            require_trailer_signature: require_trailer_sig,
+crates/swift-s3api/src/middleware.rs:439:        | Err(AwsChunkedError::InvalidTrailerSignature) => {
+crates/swift-s3api/src/middleware.rs:4607:    /// `x-amz-trailer-signature` after content trailers.
+crates/swift-s3api/src/middleware.rs:4620:        use crate::aws_chunked::{compute_chunk_signature, compute_trailer_signature};
+crates/swift-s3api/src/middleware.rs:4631:            require_trailer_signature: sign_trailer,
+crates/swift-s3api/src/middleware.rs:4657:                compute_trailer_signature(&ctx, &prev, &trailer_map)
+crates/swift-s3api/src/middleware.rs:4660:                format!("x-amz-trailer-signature:{trailer_sig}\r\n").as_bytes(),
+crates/swift-s3api/src/aws_chunked.rs:26://! [x-amz-trailer-signature:<hex>\r\n]
+crates/swift-s3api/src/aws_chunked.rs:37://! `x-amz-trailer-signature` is present under a signed HMAC context), trailer
+crates/swift-s3api/src/aws_chunked.rs:38://! content is verified with `AWS4-HMAC-SHA256-TRAILER` (previous-sig = terminal
+crates/swift-s3api/src/aws_chunked.rs:39://! 0-chunk signature). Mismatch → [`AwsChunkedError::InvalidTrailerSignature`].
+crates/swift-s3api/src/aws_chunked.rs:77:    /// Trailer HMAC (`AWS4-HMAC-SHA256-TRAILER` / `x-amz-trailer-signature`)
+crates/swift-s3api/src/aws_chunked.rs:79:    InvalidTrailerSignature,
+crates/swift-s3api/src/aws_chunked.rs:102:/// When [`Self::require_trailer_signature`] is true (PAYLOAD-TRAILER mode) or
+crates/swift-s3api/src/aws_chunked.rs:103:/// trailers include `x-amz-trailer-signature`, trailer HMAC is also enforced.
+crates/swift-s3api/src/aws_chunked.rs:114:    /// carry a valid `x-amz-trailer-signature` if any trailer content is present.
+crates/swift-s3api/src/aws_chunked.rs:116:    pub require_trailer_signature: bool,
+crates/swift-s3api/src/aws_chunked.rs:177:/// `x-amz-trailer-signature` → [`AwsChunkedError::InvalidTrailerSignature`].
+crates/swift-s3api/src/aws_chunked.rs:311:/// * `require_trailer_signature` + non-empty trailers without
+crates/swift-s3api/src/aws_chunked.rs:312:///   `x-amz-trailer-signature` → error
+crates/swift-s3api/src/aws_chunked.rs:313:/// * `x-amz-trailer-signature` present (any signed mode) → HMAC check
+crates/swift-s3api/src/aws_chunked.rs:323:    let has_trailer_sig = trailers.contains_key("x-amz-trailer-signature");
+crates/swift-s3api/src/aws_chunked.rs:327:    if ctx.require_trailer_signature && has_any_trailer && !has_trailer_sig {
+crates/swift-s3api/src/aws_chunked.rs:328:        return Err(AwsChunkedError::InvalidTrailerSignature);
+crates/swift-s3api/src/aws_chunked.rs:331:        // Residual: empty trailer block with require_trailer_signature still
+crates/swift-s3api/src/aws_chunked.rs:337:        return Err(AwsChunkedError::InvalidTrailerSignature);
+crates/swift-s3api/src/aws_chunked.rs:340:        .get("x-amz-trailer-signature")
+crates/swift-s3api/src/aws_chunked.rs:344:        return Err(AwsChunkedError::InvalidTrailerSignature);
+crates/swift-s3api/src/aws_chunked.rs:411:/// sorted `key:value\n` lines excluding `x-amz-trailer-signature`, spaces
+crates/swift-s3api/src/aws_chunked.rs:418:        .filter(|k| *k != "x-amz-trailer-signature")
+crates/swift-s3api/src/aws_chunked.rs:437:/// Compute `AWS4-HMAC-SHA256-TRAILER` signature (lowercase hex).
+crates/swift-s3api/src/aws_chunked.rs:440:/// `trailers` should include content trailers; `x-amz-trailer-signature` is
+crates/swift-s3api/src/aws_chunked.rs:445:/// AWS4-HMAC-SHA256-TRAILER
+crates/swift-s3api/src/aws_chunked.rs:451:pub fn compute_trailer_signature(
+crates/swift-s3api/src/aws_chunked.rs:459:        "AWS4-HMAC-SHA256-TRAILER\n{}\n{}\n{}\n{}",
+crates/swift-s3api/src/aws_chunked.rs:475:    let expected = compute_trailer_signature(ctx, previous_signature, trailers);
+crates/swift-s3api/src/aws_chunked.rs:592:            require_trailer_signature: require_trailer,
+crates/swift-s3api/src/aws_chunked.rs:631:    /// Build signed body with trailers + valid x-amz-trailer-signature.
+crates/swift-s3api/src/aws_chunked.rs:659:            compute_trailer_signature(&ctx, &prev, &trailer_map)
+crates/swift-s3api/src/aws_chunked.rs:661:        out.extend_from_slice(format!("x-amz-trailer-signature:{trailer_sig}\r\n").as_bytes());
+crates/swift-s3api/src/aws_chunked.rs:683:        assert!(decoded.trailers.contains_key("x-amz-trailer-signature"));
+crates/swift-s3api/src/aws_chunked.rs:696:        assert_eq!(err, AwsChunkedError::InvalidTrailerSignature);
+crates/swift-s3api/src/aws_chunked.rs:701:        // PAYLOAD-TRAILER with content trailers but no x-amz-trailer-signature.
+crates/swift-s3api/src/aws_chunked.rs:716:        assert_eq!(err, AwsChunkedError::InvalidTrailerSignature);
+crates/swift-s3api/src/lib.rs:40://! (`x-amz-trailer-signature` / `AWS4-HMAC-SHA256-TRAILER`) is enforced when
+crates/swift-s3api/src/lib.rs:82://! * requiring `x-amz-trailer-signature` when PAYLOAD-TRAILER mode has an

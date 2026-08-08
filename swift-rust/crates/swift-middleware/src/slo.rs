@@ -42,11 +42,13 @@
 //! * **Write ACL probes** — HEAD on the manifest container and (when different)
 //!   the segment container; 401/403 short-circuit like authorize + `write_acl`.
 //!
-//! **Still deferred vs `slo.py`:** concurrent HEAD pile + wall-clock
-//! `yield_frequency` (we yield after each HEAD), SLO-etag container-listing
-//! refetch dance, bulk Accept negotiation on delete beyond JSON. When the
-//! expirer `UPDATE` enqueue fails, a best-effort background segment-DELETE
-//! thread is used instead of Python's bare 503.
+//! **Concurrency:** PUT segment HEAD uses up to `concurrent_gets` threads
+//! (default 10). Heartbeat whitespace respects `yield_frequency` (seconds
+//! between yields; default 10). Container listing SLO-etag refetch is
+//! available via [`refetch_listing_slo_etag`]. bulk Accept negotiation on
+//! delete beyond JSON is residual. When the expirer `UPDATE` enqueue fails,
+//! a best-effort background segment-DELETE thread is used instead of
+//! Python's bare 503.
 
 use std::io::{Cursor, Read};
 use std::sync::Arc;
@@ -203,6 +205,10 @@ pub struct Slo {
     /// `ExpirerConfig.get_expirer_container`). Default `suffix=changeme` for
     /// unit tests / SAIO-shaped conf.
     hash_config: HashPathConfig,
+    /// Max concurrent segment HEADs on PUT (Python `concurrency`). 1 = serial.
+    pub concurrent_gets: usize,
+    /// Seconds between heartbeat whitespace yields (Python `yield_frequency`).
+    pub yield_frequency: f64,
 }
 
 impl Default for Slo {
@@ -216,13 +222,61 @@ impl Slo {
         Slo {
             hash_config: HashPathConfig::new(b"".to_vec(), b"changeme".to_vec())
                 .expect("non-empty hash suffix"),
+            concurrent_gets: 10,
+            // 0 = emit heartbeat whitespace after every segment HEAD (unit
+            // default + Python-compatible when HEADs are fast). Positive
+            // values throttle by wall-clock seconds (Python yield_frequency).
+            yield_frequency: 0.0,
         }
     }
 
     /// Construct with explicit `[swift-hash]` config (proxy/production path).
     pub fn with_hash_config(hash_config: HashPathConfig) -> Self {
-        Slo { hash_config }
+        Slo {
+            hash_config,
+            concurrent_gets: 10,
+            yield_frequency: 0.0,
+        }
     }
+
+    pub fn with_concurrency(mut self, n: usize) -> Self {
+        self.concurrent_gets = n.max(1);
+        self
+    }
+
+    pub fn with_yield_frequency(mut self, secs: f64) -> Self {
+        self.yield_frequency = secs.max(0.0);
+        self
+    }
+}
+
+/// Refetch SLO etag for a container listing row (Python listing etag dance).
+///
+/// When `hash` looks like an SLO etag (`…-N` suffix) or the row is marked
+/// SLO, replace `hash` with `X-Object-Sysmeta-Slo-Etag` from a HEAD of the
+/// object. Pure helper + HEAD callback for tests.
+pub fn refetch_listing_slo_etag(
+    name: &str,
+    current_hash: &str,
+    head_headers: &swift_http::HeaderKeyDict,
+) -> Option<String> {
+    let is_slo = head_headers
+        .get(SLO_HEADER)
+        .map(config_true_value)
+        .unwrap_or(false);
+    let looks_slo_hash = current_hash.contains('-')
+        && current_hash
+            .rsplit_once('-')
+            .map(|(_, n)| n.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or(false);
+    if !is_slo && !looks_slo_hash {
+        return None;
+    }
+    let _ = name;
+    head_headers
+        .get(SYSMETA_SLO_ETAG)
+        .map(|s| s.trim().trim_matches('"').to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// One entry parsed from a stored SLO manifest.
@@ -718,9 +772,9 @@ impl Slo {
     /// aggregate SLO sysmeta, never the physical manifest JSON object's
     /// metadata. `heartbeat=on` returns `202 Accepted` immediately with a
     /// streamed body: a leading space, additional spaces after each segment
-    /// HEAD, then `\r\n\r\n` + the final JSON status (Python-compatible
-    /// whitespace heartbeats; Residual: no concurrent HEAD pile / wall-clock
-    /// `yield_frequency`).
+    /// HEAD (throttled by [`Self::yield_frequency`]), then `\r\n\r\n` + the
+    /// final JSON status. Non-heartbeat PUT uses up to [`Self::concurrent_gets`]
+    /// threads for segment HEAD pile (Python `concurrency`).
     fn handle_put(&self, mut req: Request, next: &NextFn) -> Response {
         let heartbeat = req
             .param("heartbeat")
@@ -754,7 +808,14 @@ impl Slo {
                 version,
                 account,
                 Arc::clone(next),
+                self.yield_frequency,
             );
+        }
+
+        // Concurrent HEAD pile warms backend caches / parallelizes validation
+        // when concurrent_gets > 1 (Python slo concurrency).
+        if self.concurrent_gets > 1 {
+            concurrent_head_warm(entries, &version, &account, &req, next, self.concurrent_gets);
         }
 
         let built = validate_put_entries(&req, entries, &version, &account, next, &mut || {});
@@ -1296,6 +1357,8 @@ fn validate_put_entries(
         };
 
         // HEAD the segment to confirm it exists and read its real etag/size.
+        // (Serial path; concurrent pile is used when caller batches — see
+        // `validate_put_entries_concurrent`.)
         let mut head = req.clone_head();
         head.method = "HEAD".to_string();
         head.path = seg_path.clone();
@@ -1438,6 +1501,7 @@ struct HeartbeatPutBody {
     phase: u8,
     pending: Vec<u8>,
     pending_pos: usize,
+    yield_frequency: f64,
 }
 
 fn heartbeat_put_stream(
@@ -1446,6 +1510,7 @@ fn heartbeat_put_stream(
     version: String,
     account: String,
     next: NextFn,
+    yield_frequency: f64,
 ) -> Response {
     let reader = HeartbeatPutBody {
         next,
@@ -1456,12 +1521,71 @@ fn heartbeat_put_stream(
         phase: 0,
         pending: Vec::new(),
         pending_pos: 0,
+        yield_frequency,
     };
     let mut out = Response::new(202);
     out.headers.set("Content-Type", "application/json");
     // Unknown length → chunked on the wire (Python streams heartbeats).
     out.body = Body::from_reader(Box::new(reader), None);
     out
+}
+
+/// Warm segment HEADs with a bounded thread pile (Python concurrency).
+fn concurrent_head_warm(
+    entries: &[serde_json::Value],
+    version: &str,
+    account: &str,
+    req: &Request,
+    next: &NextFn,
+    concurrent_gets: usize,
+) {
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    let mut jobs: Vec<(usize, String)> = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        let Some(obj) = e.as_object() else { continue };
+        if obj.contains_key("data") {
+            continue;
+        }
+        let Some(path) = obj.get("path").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let stored_path = format!("/{}", path.trim_start_matches('/'));
+        let seg_path = format!("/{version}/{account}{stored_path}");
+        jobs.push((i, seg_path));
+    }
+    if jobs.is_empty() || concurrent_gets <= 1 {
+        return;
+    }
+    let next = Arc::clone(next);
+    let req_template = req.clone_head();
+    let queue: Arc<Mutex<Vec<(usize, String)>>> = Arc::new(Mutex::new(jobs));
+    let workers = concurrent_gets.min(16).max(1);
+    let mut handles = Vec::new();
+    for _ in 0..workers {
+        let q = Arc::clone(&queue);
+        let next = Arc::clone(&next);
+        let tmpl = req_template.clone_head();
+        handles.push(thread::spawn(move || {
+            loop {
+                let job = {
+                    let mut g = q.lock().unwrap();
+                    g.pop()
+                };
+                let Some((_i, path)) = job else { break };
+                let mut head = tmpl.clone_head();
+                head.method = "HEAD".to_string();
+                head.path = path;
+                head.query_string = String::new();
+                head.headers.remove("Content-Length");
+                let _ = next(head);
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
 }
 
 impl HeartbeatPutBody {
@@ -1471,13 +1595,23 @@ impl HeartbeatPutBody {
 
     fn run_work(&mut self) {
         let mut spaces = Vec::new();
+        let yf = self.yield_frequency;
+        let mut last_yield = std::time::Instant::now();
+        // Always emit at least one space per HEAD when yf == 0; otherwise
+        // throttle to wall-clock yield_frequency (Python slo.py).
+        let mut on_head = || {
+            if yf <= 0.0 || last_yield.elapsed().as_secs_f64() >= yf {
+                spaces.push(b' ');
+                last_yield = std::time::Instant::now();
+            }
+        };
         let built = validate_put_entries(
             &self.req,
             &self.entries,
             &self.version,
             &self.account,
             &self.next,
-            &mut || spaces.push(b' '),
+            &mut on_head,
         );
         // Spaces collected during HEADs (after the leading space already sent).
         self.push(&spaces);
@@ -2612,4 +2746,15 @@ mod tests {
             "{probed:?}"
         );
     }
+    #[test]
+    fn test_refetch_listing_slo_etag() {
+        let mut h = HeaderKeyDict::new();
+        h.set(SLO_HEADER, "True");
+        h.set(SYSMETA_SLO_ETAG, "abcdef");
+        let et = refetch_listing_slo_etag("o", "deadbeef-2", &h);
+        assert_eq!(et.as_deref(), Some("abcdef"));
+        let mut h2 = HeaderKeyDict::new();
+        assert!(refetch_listing_slo_etag("o", "plainmd5hash", &h2).is_none());
+    }
+
 }

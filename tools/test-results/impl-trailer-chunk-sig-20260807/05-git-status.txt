@@ -1,0 +1,8 @@
+## build/phase1-deploy-rs-lb...origin/build/phase1-deploy-rs-lb
+ M swift-rust/crates/swift-s3api/src/acl_cors.rs
+ M swift-rust/crates/swift-s3api/src/aws_chunked.rs
+ M swift-rust/crates/swift-s3api/src/lib.rs
+ M swift-rust/crates/swift-s3api/src/middleware.rs
+ M swift-rust/crates/swift-s3api/src/versioning_store.rs
+/Users/oboy/Downloads/Peregrine
+56b40118ec9499ce3e5dccf3824a2b0f99e81412

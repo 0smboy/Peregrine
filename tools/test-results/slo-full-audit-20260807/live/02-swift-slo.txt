@@ -1,0 +1,90 @@
+mkc=201
+mksegs=201
+seg1=201
+seg2=201
+mput=201
+body=AAAABBBBCCCCDDDD
+GET_REASSEMBLE=PASS
+head=200
+HTTP/2 200 
+content-type: application/json
+x-static-large-object: True
+last-modified: Fri, 07 Aug 2026 09:10:56 GMT
+x-timestamp: 1786093855.60441
+accept-ranges: bytes
+etag: 47dcde9d17c730b8fd8197841d2d166b
+content-length: 16
+x-trans-id: tx4db662860b0d169d002b3-006a75a121
+x-openstack-request-id: tx4db662860b0d169d002b3-006a75a121
+
+HEAD_SLO_FLAG=PASS
+HEAD_CONTENT_LENGTH=PASS
+range_status=206 body=AAAA
+RANGE=PASS
+range2_status=206 body=BBCC
+RANGE_CROSS_SEG=PASS
+[{"etag":"9da4fc50e09e5eeb8ae8149ef4f23792","path":"/sloauditb3849_segs/seg1","size_bytes":8},{"etag":"05b48c79a68440d109149f6807c10bc5","path":"/sloauditb3849_segs/seg2","size_bytes":8}]
+raw=200
+
+RAW_MANIFEST=PASS
+hb_status=202
+HTTP/2 202 
+content-type: application/json
+x-trans-id: txcc66f1707b553fe2002b5-006a75a123
+x-openstack-request-id: txcc66f1707b553fe2002b5-006a75a123
+
+HEARTBEAT=PASS
+nest_manifest=[{"path":"/sloauditb3849/big","etag":"47dcde9d17c730b8fd8197841d2d166b","size_bytes":16}] et=47dcde9d17c730b8fd8197841d2d166b
+nest_put=201
+HTTP/2 201 
+etag: "acfd94c0fec7d87ebda662c2483fea18"
+content-type: text/html; charset=UTF-8
+last-modified: Fri, 07 Aug 2026 09:11:02 GMT
+x-trans-id: tx5db917adbd3c3e770c3c3-006a75a124
+x-openstack-request-id: tx5db917adbd3c3e770c3c3-006a75a124
+content-length: 0
+
+
+outer_get=200 body=AAAABBBBCCCCDDDD
+NESTED_GET=PASS
+inline_put=400 body=<html><h1>Not Found</h1><p>The resource could not be found.</p></html>
+INLINE=FAIL st=400 body=<html><h1>Not Found</h1><p>The resource could not be found.</p></html>
+delhb=200
+{"Errors":[],"Number Deleted":2,"Number Not Found":0,"Response Body":"","Response Status":"200 OK"}
+MULTIPART_DELETE=PASS
+async_del=404
+<html><h1>Not Found</h1><p>SLO manifest not found</p></html>
+ASYNC_DELETE=FAIL st=404
+copy_st=400
+HTTP/2 400 
+content-type: text/html; charset=UTF-8
+x-copied-from: sloauditb3849/big
+x-copied-from-account: AUTH_test
+x-trans-id: txa4b6cbf72cf0a66a0c3f6-006a75a12a
+x-openstack-request-id: txa4b6cbf72cf0a66a0c3f6-006a75a12a
+content-length: 91
+
+copy2_st=499
+HTTP/2 499 
+content-type: text/html; charset=UTF-8
+last-modified: Fri, 07 Aug 2026 09:11:10 GMT
+x-copied-from: sloauditb3849/big
+x-copied-from-account: AUTH_test
+x-trans-id: txee786f5dd601814b002c1-006a75a12d
+x-openstack-request-id: txee786f5dd601814b002c1-006a75a12d
+content-length: 0
+
+COPY_SLO=FAIL st=499
+---SCORE---
+GET_REASSEMBLE=PASS
+HEAD_SLO_FLAG=PASS
+HEAD_CONTENT_LENGTH=PASS
+RANGE=PASS
+RANGE_CROSS_SEG=PASS
+RAW_MANIFEST=PASS
+HEARTBEAT=PASS
+NESTED_GET=PASS
+INLINE=FAIL st=400 body=<html><h1>Not Found</h1><p>The resource could not be found.</p></html>
+MULTIPART_DELETE=PASS
+ASYNC_DELETE=FAIL st=404
+COPY_SLO=FAIL st=499

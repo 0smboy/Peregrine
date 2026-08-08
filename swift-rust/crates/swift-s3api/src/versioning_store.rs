@@ -193,6 +193,21 @@ impl VersionIndex {
     }
 }
 
+/// Build `ListVersionsResult` XML with S3-faithful pagination.
+///
+/// Ordering: keys ascending; within a key, version order follows each
+/// [`VersionIndex`] (latest-first via [`VersionIndex::push_latest`]).
+///
+/// Markers (`key-marker` / `version-id-marker`):
+/// * skip all keys lexicographically before `key_marker`
+/// * when `key == key_marker` and `version_id_marker` is non-empty, skip that
+///   version and all earlier positions in the key's version list (start *after*
+///   the marker pair — matches AWS continuation via Next* markers)
+/// * when `key == key_marker` and `version_id_marker` is empty, include versions
+///   of that key from the beginning
+///
+/// When `max-keys` cuts the flat listing, `IsTruncated=true` and both
+/// `NextKeyMarker` / `NextVersionIdMarker` are set to the last returned entry.
 pub fn list_versions_result_xml(
     bucket: &str,
     prefix: &str,
@@ -201,45 +216,60 @@ pub fn list_versions_result_xml(
     max_keys: u32,
     indexes: &[VersionIndex],
 ) -> Vec<u8> {
+    // Stable key order across multi-key indexes (listing order independent of
+    // how the versions container returned index.json objects).
+    let mut ordered: Vec<&VersionIndex> = indexes.iter().collect();
+    ordered.sort_by(|a, b| a.key.cmp(&b.key));
+
     let mut entries: Vec<(String, VersionRecord)> = Vec::new();
-    for idx in indexes {
+    for idx in ordered {
         if !prefix.is_empty() && !idx.key.starts_with(prefix) {
             continue;
         }
-        for v in &idx.versions {
-            if !key_marker.is_empty() {
-                if idx.key.as_str() < key_marker {
-                    continue;
-                }
-                if idx.key == key_marker && !version_id_marker.is_empty() {
-                    if let Some(pos) = idx
-                        .versions
-                        .iter()
-                        .position(|x| x.version_id == version_id_marker)
-                    {
-                        let this_pos = idx
-                            .versions
-                            .iter()
-                            .position(|x| x.version_id == v.version_id)
-                            .unwrap_or(0);
-                        if this_pos <= pos {
-                            continue;
-                        }
-                    }
-                }
+        if !key_marker.is_empty() && idx.key.as_str() < key_marker {
+            continue;
+        }
+
+        let start = if !key_marker.is_empty()
+            && idx.key == key_marker
+            && !version_id_marker.is_empty()
+        {
+            match idx
+                .versions
+                .iter()
+                .position(|x| x.version_id == version_id_marker)
+            {
+                // Start strictly after the marked version (continuation).
+                Some(pos) => pos.saturating_add(1),
+                // Unknown version-id-marker on this key: soft residual — start
+                // at beginning of the key (AWS would 400 InvalidArgument).
+                None => 0,
             }
+        } else {
+            0
+        };
+
+        for v in idx.versions.iter().skip(start) {
             entries.push((idx.key.clone(), v.clone()));
         }
     }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    let truncated = entries.len() as u32 > max_keys;
-    let slice: Vec<_> = entries.into_iter().take(max_keys as usize).collect();
+
+    let take_n = max_keys as usize;
+    let truncated = entries.len() > take_n;
+    let slice: Vec<_> = entries.into_iter().take(take_n).collect();
 
     let mut root = Element::new("ListVersionsResult");
     root.push_leaf("Name", bucket);
     root.push_leaf("Prefix", prefix);
     root.push_leaf("KeyMarker", key_marker);
     root.push_leaf("VersionIdMarker", version_id_marker);
+    // Schema order: Next* before MaxKeys / IsTruncated (list_versions_result.rnc).
+    if truncated {
+        if let Some((k, v)) = slice.last() {
+            root.push_leaf("NextKeyMarker", k);
+            root.push_leaf("NextVersionIdMarker", &v.version_id);
+        }
+    }
     root.push_leaf("MaxKeys", max_keys.to_string());
     root.push_leaf("IsTruncated", if truncated { "true" } else { "false" });
     for (key, v) in &slice {
@@ -323,6 +353,188 @@ mod tests {
         assert!(xml.contains("<Version>"));
         assert!(xml.contains("<VersionId>v1</VersionId>"));
         assert!(xml.contains("<VersionId>v2</VersionId>"));
+        assert!(!xml.contains("NextKeyMarker"));
+        assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
+    }
+
+    fn rec(vid: &str, latest: bool) -> VersionRecord {
+        VersionRecord {
+            version_id: vid.into(),
+            is_delete_marker: false,
+            is_latest: latest,
+            last_modified: "2020-01-01T00:00:00.000Z".into(),
+            etag: format!("e-{vid}"),
+            size: 1,
+        }
+    }
+
+    fn tag_text(xml: &str, tag: &str) -> Option<String> {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let s = xml.find(&open)?;
+        let start = s + open.len();
+        let end_rel = xml[start..].find(&close)?;
+        Some(xml[start..start + end_rel].to_string())
+    }
+
+    fn count_tag(xml: &str, tag: &str) -> usize {
+        xml.matches(&format!("<{tag}>")).count()
+    }
+
+    /// Multi-key, multi-version: max-keys cuts mid-list; Next* + marker page-2.
+    #[test]
+    fn list_versions_multi_key_pagination() {
+        // Intentionally reverse key order in the input slice — XML must still
+        // emit keys ascending (a then b then c).
+        let mut idx_c = VersionIndex::new("c");
+        idx_c.versions = vec![rec("c1", true)];
+        let mut idx_a = VersionIndex::new("a");
+        // latest-first order (as push_latest would leave it)
+        idx_a.versions = vec![rec("a2", true), rec("a1", false)];
+        let mut idx_b = VersionIndex::new("b");
+        idx_b.versions = vec![rec("b2", true), rec("b1", false)];
+        let indexes = [idx_c, idx_a, idx_b];
+
+        // Flat stream after sort: a2, a1, b2, b1, c1  (5 entries)
+        let page1 = String::from_utf8(list_versions_result_xml(
+            "bucket", "", "", "", 2, &indexes,
+        ))
+        .unwrap();
+        assert!(page1.contains("<IsTruncated>true</IsTruncated>"));
+        assert_eq!(tag_text(&page1, "NextKeyMarker").as_deref(), Some("a"));
+        assert_eq!(tag_text(&page1, "NextVersionIdMarker").as_deref(), Some("a1"));
+        assert_eq!(count_tag(&page1, "Version"), 2);
+        assert!(page1.contains("<VersionId>a2</VersionId>"));
+        assert!(page1.contains("<VersionId>a1</VersionId>"));
+        assert!(!page1.contains("<VersionId>b2</VersionId>"));
+        // Echo request markers
+        assert!(page1.contains("<KeyMarker></KeyMarker>") || page1.contains("<KeyMarker/>"));
+        assert_eq!(tag_text(&page1, "MaxKeys").as_deref(), Some("2"));
+
+        // Page 2: continue after (a, a1) → b2, b1  (max 2) still truncated
+        let page2 = String::from_utf8(list_versions_result_xml(
+            "bucket", "", "a", "a1", 2, &indexes,
+        ))
+        .unwrap();
+        assert!(page2.contains("<IsTruncated>true</IsTruncated>"));
+        assert_eq!(tag_text(&page2, "KeyMarker").as_deref(), Some("a"));
+        assert_eq!(tag_text(&page2, "VersionIdMarker").as_deref(), Some("a1"));
+        assert_eq!(tag_text(&page2, "NextKeyMarker").as_deref(), Some("b"));
+        assert_eq!(tag_text(&page2, "NextVersionIdMarker").as_deref(), Some("b1"));
+        assert_eq!(count_tag(&page2, "Version"), 2);
+        assert!(page2.contains("<VersionId>b2</VersionId>"));
+        assert!(page2.contains("<VersionId>b1</VersionId>"));
+        assert!(!page2.contains("<VersionId>a2</VersionId>"));
+        assert!(!page2.contains("<VersionId>c1</VersionId>"));
+
+        // Page 3: after (b, b1) → c1 only, not truncated, no Next*
+        let page3 = String::from_utf8(list_versions_result_xml(
+            "bucket", "", "b", "b1", 2, &indexes,
+        ))
+        .unwrap();
+        assert!(page3.contains("<IsTruncated>false</IsTruncated>"));
+        assert!(!page3.contains("NextKeyMarker"));
+        assert!(!page3.contains("NextVersionIdMarker"));
+        assert_eq!(count_tag(&page3, "Version"), 1);
+        assert!(page3.contains("<VersionId>c1</VersionId>"));
+
+        // Cut mid-key: max-keys=1 on key a → only a2, Next=(a,a2)
+        let mid = String::from_utf8(list_versions_result_xml(
+            "bucket", "", "", "", 1, &indexes,
+        ))
+        .unwrap();
+        assert!(mid.contains("<IsTruncated>true</IsTruncated>"));
+        assert_eq!(tag_text(&mid, "NextKeyMarker").as_deref(), Some("a"));
+        assert_eq!(tag_text(&mid, "NextVersionIdMarker").as_deref(), Some("a2"));
+        let mid2 = String::from_utf8(list_versions_result_xml(
+            "bucket", "", "a", "a2", 1, &indexes,
+        ))
+        .unwrap();
+        assert!(mid2.contains("<VersionId>a1</VersionId>"));
+        assert!(!mid2.contains("<VersionId>a2</VersionId>"));
+        assert_eq!(tag_text(&mid2, "NextKeyMarker").as_deref(), Some("a"));
+        assert_eq!(tag_text(&mid2, "NextVersionIdMarker").as_deref(), Some("a1"));
+    }
+
+    #[test]
+    fn list_versions_prefix_filter() {
+        let mut logs = VersionIndex::new("logs/2020");
+        logs.versions = vec![rec("l1", true)];
+        let mut other = VersionIndex::new("other/x");
+        other.versions = vec![rec("o1", true)];
+        let mut logs2 = VersionIndex::new("logs/2021");
+        logs2.versions = vec![rec("l2", true)];
+        let indexes = [logs, other, logs2];
+
+        let xml = String::from_utf8(list_versions_result_xml(
+            "b", "logs/", "", "", 1000, &indexes,
+        ))
+        .unwrap();
+        assert!(xml.contains("<Prefix>logs/</Prefix>"));
+        assert!(xml.contains("<VersionId>l1</VersionId>"));
+        assert!(xml.contains("<VersionId>l2</VersionId>"));
+        assert!(!xml.contains("<VersionId>o1</VersionId>"));
+        assert!(!xml.contains("other/x"));
+        assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
+        assert_eq!(count_tag(&xml, "Version"), 2);
+
+        // Prefix + max-keys truncation still emits Next* among filtered set
+        let page = String::from_utf8(list_versions_result_xml(
+            "b", "logs/", "", "", 1, &indexes,
+        ))
+        .unwrap();
+        assert!(page.contains("<IsTruncated>true</IsTruncated>"));
+        assert_eq!(tag_text(&page, "NextKeyMarker").as_deref(), Some("logs/2020"));
+        assert_eq!(tag_text(&page, "NextVersionIdMarker").as_deref(), Some("l1"));
+        assert!(!page.contains("<VersionId>l2</VersionId>"));
+    }
+
+    #[test]
+    fn list_versions_empty_indexes_and_empty_versions() {
+        // Empty container / no indexes → empty ListVersionsResult
+        let empty = String::from_utf8(list_versions_result_xml(
+            "b", "", "", "", 1000, &[],
+        ))
+        .unwrap();
+        assert!(empty.contains("ListVersionsResult"));
+        assert!(empty.contains("<Name>b</Name>"));
+        assert!(empty.contains("<IsTruncated>false</IsTruncated>"));
+        assert!(!empty.contains("<Version>"));
+        assert!(!empty.contains("<DeleteMarker>"));
+        assert!(!empty.contains("NextKeyMarker"));
+
+        // Index present but zero versions (and a sibling with versions filtered by prefix)
+        let mut hollow = VersionIndex::new("k");
+        hollow.versions = vec![];
+        let hollow_xml = String::from_utf8(list_versions_result_xml(
+            "b", "", "", "", 10, &[hollow],
+        ))
+        .unwrap();
+        assert!(hollow_xml.contains("<IsTruncated>false</IsTruncated>"));
+        assert!(!hollow_xml.contains("<Version>"));
+        assert_eq!(count_tag(&hollow_xml, "Version"), 0);
+
+        // DeleteMarker still counts toward max-keys / Next*
+        let mut dm_idx = VersionIndex::new("d");
+        dm_idx.versions = vec![VersionRecord {
+            version_id: "dm1".into(),
+            is_delete_marker: true,
+            is_latest: true,
+            last_modified: "2020-01-01T00:00:00.000Z".into(),
+            etag: String::new(),
+            size: 0,
+        }];
+        let mut ver_idx = VersionIndex::new("e");
+        ver_idx.versions = vec![rec("e1", true)];
+        let mixed = String::from_utf8(list_versions_result_xml(
+            "b", "", "", "", 1, &[dm_idx, ver_idx],
+        ))
+        .unwrap();
+        assert!(mixed.contains("<IsTruncated>true</IsTruncated>"));
+        assert!(mixed.contains("<DeleteMarker>"));
+        assert!(!mixed.contains("<Version>"));
+        assert_eq!(tag_text(&mixed, "NextKeyMarker").as_deref(), Some("d"));
+        assert_eq!(tag_text(&mixed, "NextVersionIdMarker").as_deref(), Some("dm1"));
     }
 
     #[test]

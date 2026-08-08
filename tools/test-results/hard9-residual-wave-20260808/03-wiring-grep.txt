@@ -1,0 +1,64 @@
+=== build_configured_filters match arms (xprofile / list_endpoints / NamedPassthrough) ===
+219:        memcache_servers: memcache_servers_csv(&conf),
+335:    // filters (P0–P1b). Always-on catch_errors / gatekeeper / healthcheck
+540:/// Resolve `memcache_servers` for `[filter:cache]`: section → app → DEFAULT
+542:fn memcache_servers_csv(conf: &SwiftConfig) -> String {
+543:    conf.get("filter:cache", "memcache_servers")
+547:            conf.get("app:proxy-server", "memcache_servers")
+551:        .or_else(|| conf.get("DEFAULT", "memcache_servers").ok().flatten())
+559:    swift_middleware::Cache::from_servers_csv(&memcache_servers_csv(conf))
+684:    "catch_errors",
+685:    "gatekeeper",
+686:    "healthcheck",
+1143:                        "cache enabled (memcache_servers={})",
+1408:            "list_endpoints" | "list-endpoints" => {
+1409:                let le = build_list_endpoints(conf);
+1411:                    "list_endpoints enabled (path_root={})",
+1416:            "xprofile" | "x-profile" => {
+1417:                let xp = build_xprofile(conf);
+1419:                    "xprofile enabled (enabled={}, profile_path={:?})",
+1425:            // NamedPassthrough so they are not "unknown/not implemented".
+1426:            "catch_errors" | "catch-errors" | "gatekeeper" | "healthcheck" | "health_check"
+1427:            | "health-check" | "memcache" | "mem_cache" | "swob" | "recon" => {
+1429:                    "pipeline: filter '{name}' registered as NamedPassthrough (claimable slot)"
+1431:                filters.push(Arc::new(swift_middleware::NamedPassthrough::new(
+1447:fn build_xprofile(conf: &SwiftConfig) -> swift_middleware::XProfile {
+1448:    let section = if conf.items("filter:xprofile").ok().is_some() {
+1449:        "filter:xprofile"
+1483:fn build_list_endpoints(conf: &SwiftConfig) -> swift_middleware::ListEndpoints {
+1484:    let section = if conf.items("filter:list_endpoints").ok().is_some() {
+1485:        "filter:list_endpoints"
+1490:        .get(section, "list_endpoints_path")
+1610:    /// Comma-separated memcache servers for shared info-cache L2 (P1c).
+1612:    memcache_servers: String,
+1654:            .memcache_servers
+1663:            // keeps L1-only — request path never depends on memcache up.
+1664:            if let Ok(client) = swift_memcache::MemcacheClient::connect(
+1666:                swift_memcache::MemcacheConfig::default(),
+1670:                app = app.with_info_memcache(client);
+2471:             pipeline = catch_errors gatekeeper healthcheck tempauth ratelimit copy slo dlo proxy-server\n\
+2488:             pipeline = catch_errors gatekeeper healthcheck container_sync tempauth proxy-server\n\
+2521:             pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl tempauth copy slo dlo proxy-logging proxy-server\n\
+2522:             [filter:cache]\nuse = egg:swift#memcache\nmemcache_servers = 127.0.0.1:11211\n\
+2572:             pipeline = catch_errors gatekeeper healthcheck formpost staticweb container_quotas account_quotas symlink versioned_writes name_check etag_quoter crossdomain tempauth copy proxy-server\n\
+2631:             pipeline = catch_errors gatekeeper healthcheck s3api tempauth copy proxy-server\n\
+2669:             pipeline = catch_errors gatekeeper healthcheck s3api s3token tempauth copy proxy-server\n\
+2699:             pipeline = catch_errors gatekeeper healthcheck tempauth not_a_real_filter copy proxy-server\n\
+2719:             pipeline = catch_errors gatekeeper healthcheck authtoken keystoneauth tempauth copy proxy-server\n\
+2765:                 pipeline = catch_errors gatekeeper healthcheck keymaster encryption tempauth copy proxy-server\n\
+2802:             pipeline = catch_errors gatekeeper healthcheck tempauth copy proxy-server\n\
+2820:             pipeline = catch_errors gatekeeper healthcheck keymaster encryption copy proxy-server\n",
+2858:                 pipeline = catch_errors gatekeeper healthcheck keymaster encryption copy proxy-server\n\
+2902:             pipeline = catch_errors gatekeeper healthcheck totally_fake_filter proxy-server\n\
+2939:             pipeline = catch_errors gatekeeper healthcheck totally_fake_filter list_endpoints proxy-server\n\
+2968:        // list_endpoints is now a wired filter (not a fatal residual).
+2970:            notes.iter().any(|n| n.contains("list_endpoints enabled")),
+3075:            memcache_servers: String::new(),
+
+=== module exports ===
+57:mod list_endpoints;
+60:mod passthrough;
+71:mod xprofile;
+117:pub use list_endpoints::{EndpointResolver, ListEndpoints, StaticEndpoints};
+120:pub use passthrough::NamedPassthrough;
+140:pub use xprofile::XProfile;

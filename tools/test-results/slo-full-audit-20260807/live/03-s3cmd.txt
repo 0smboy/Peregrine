@@ -1,0 +1,16 @@
+Bucket 's3://slo-mpu-audit/' created
+8df064a67f44ebf78d8fa0b3dbaec79c  /tmp/slo-mpu-5m.bin
+ERROR: Parameter problem: Chunk size 1 MB is too small, must be >= 5 MB. Please adjust --multipart-chunk-size-mb
+ERROR: Error parsing xml: no element found: line 1, column 0
+ERROR: b''
+ERROR: Parameter problem: Source object 's3://slo-mpu-audit/big.bin' does not exist.
+S3_MPU_ROUNDTRIP=FAIL
+S3_OBJECT_IS_SLO=NO_OR_UNKNOWN
+ERROR: Error parsing xml: no element found: line 1, column 0
+ERROR: b''
+ERROR: S3 error: 404 (NoSuchKey): The specified key does not exist.
+ERROR: Error parsing xml: no element found: line 1, column 0
+ERROR: b''
+Bucket 's3://slo-mpu-audit/' removed
+S3_MPU_ROUNDTRIP=FAIL
+S3_OBJECT_IS_SLO=NO_OR_UNKNOWN

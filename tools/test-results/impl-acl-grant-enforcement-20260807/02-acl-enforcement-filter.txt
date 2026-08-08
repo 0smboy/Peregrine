@@ -1,0 +1,129 @@
+=== object_grants / object_acl_denies pure helpers ===
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `md5_hex` is never used
+   --> crates/swift-middleware/src/encrypter.rs:378:4
+    |
+378 | fn md5_hex(data: &[u8]) -> String {
+    |    ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib) generated 2 warnings (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running unittests src/lib.rs (target/debug/deps/swift_s3api-69515649dacc0e5b)
+
+running 1 test
+test acl_cors::tests::object_grants_allow_read_enforcement_matrix ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 197 filtered out; finished in 0.00s
+
+
+=== middleware grant enforcement ===
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `md5_hex` is never used
+   --> crates/swift-middleware/src/encrypter.rs:378:4
+    |
+378 | fn md5_hex(data: &[u8]) -> String {
+    |    ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib) generated 2 warnings (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running unittests src/lib.rs (target/debug/deps/swift_s3api-69515649dacc0e5b)
+
+running 2 tests
+test middleware::tests::get_object_acl_grant_read_allows_principal ... ok
+test middleware::tests::get_object_acl_grant_denies_foreign_principal ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 196 filtered out; finished in 0.00s
+
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `md5_hex` is never used
+   --> crates/swift-middleware/src/encrypter.rs:378:4
+    |
+378 | fn md5_hex(data: &[u8]) -> String {
+    |    ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib) generated 2 warnings (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running unittests src/lib.rs (target/debug/deps/swift_s3api-69515649dacc0e5b)
+
+running 1 test
+test middleware::tests::head_object_acl_grant_denies_foreign_principal ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 197 filtered out; finished in 0.00s
+
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `md5_hex` is never used
+   --> crates/swift-middleware/src/encrypter.rs:378:4
+    |
+378 | fn md5_hex(data: &[u8]) -> String {
+    |    ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib) generated 2 warnings (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running unittests src/lib.rs (target/debug/deps/swift_s3api-69515649dacc0e5b)
+
+running 1 test
+test middleware::tests::get_object_acl_owner_always_allowed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 197 filtered out; finished in 0.00s
+
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `md5_hex` is never used
+   --> crates/swift-middleware/src/encrypter.rs:378:4
+    |
+378 | fn md5_hex(data: &[u8]) -> String {
+    |    ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `swift-middleware` (lib) generated 2 warnings (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running unittests src/lib.rs (target/debug/deps/swift_s3api-69515649dacc0e5b)
+
+running 1 test
+test middleware::tests::get_object_without_acl_json_not_denied ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 197 filtered out; finished in 0.00s
+

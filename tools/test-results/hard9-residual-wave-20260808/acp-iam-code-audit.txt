@@ -1,0 +1,173 @@
+=== object_acl_denies_write call sites ===
+crates/swift-s3api/src/middleware.rs:108:    object_acl_denies_read, object_acl_denies_write, object_acl_xml_from_headers, parse_cors_configuration,
+crates/swift-s3api/src/middleware.rs:1027:fn deny_if_object_acl_blocks_write(cred: &S3Credential, headers: &HeaderKeyDict) -> Option<Response> {
+crates/swift-s3api/src/middleware.rs:1028:    if object_acl_denies_write(headers, &cred.access_key, &cred.account) {
+crates/swift-s3api/src/middleware.rs:1381:            if let Some(blocked) = acl_write_check_object(
+crates/swift-s3api/src/middleware.rs:1494:fn acl_write_check_object(
+crates/swift-s3api/src/middleware.rs:1509:    deny_if_object_acl_blocks_write(cred, &resp.headers)
+crates/swift-s3api/src/acl_cors.rs:958:pub fn object_acl_denies_write(
+
+=== PUT/DELETE wiring block (middleware ~1370-1389) ===
+        // Object Lock WORM + ACP WRITE enforcement on DELETE / overwrite PUT.
+        if key.is_some() && matches!(method.as_str(), "DELETE" | "PUT") {
+            if let Some(blocked) = worm_check_object(
+                &cred,
+                bucket.as_deref().unwrap(),
+                key.as_deref().unwrap(),
+                worm_bypass,
+                &next,
+            ) {
+                return blocked;
+            }
+            if let Some(blocked) = acl_write_check_object(
+                &cred,
+                bucket.as_deref().unwrap(),
+                key.as_deref().unwrap(),
+                &next,
+            ) {
+                return blocked;
+            }
+        }
+
+=== IAM module presence ===
+crates/swift-s3api/src/iam.rs:12://! `iam_email_map = a@b.com:user1,c@d.com:user2`
+crates/swift-s3api/src/iam.rs:18:pub struct IdentityDirectory {
+crates/swift-s3api/src/iam.rs:27:impl IdentityDirectory {
+crates/swift-s3api/src/iam.rs:33:    pub fn with_email_map_csv(mut self, csv: &str) -> Self {
+crates/swift-s3api/src/iam.rs:111:        let d = IdentityDirectory::new()
+crates/swift-s3api/src/iam.rs:112:            .with_email_map_csv("a@x.com:alice,b@y.com:bob")
+crates/swift-s3api/src/acl_cors.rs:791:/// READ check with optional [`crate::iam::IdentityDirectory`] for email +
+crates/swift-s3api/src/acl_cors.rs:797:    iam: Option<&crate::iam::IdentityDirectory>,
+crates/swift-s3api/src/acl_cors.rs:882:    iam: Option<&crate::iam::IdentityDirectory>,
+
+=== S3Api fields (no iam field?) ===
+/// `s3api` filter — ON-BY-CONFIG via `[pipeline:main]`.
+pub struct S3Api {
+    pub credentials: HashMap<String, S3Credential>,
+    pub storage_domains: Vec<String>,
+    pub dns_compliant_bucket_names: bool,
+    /// Region reported by `?location` and accepted in SigV4 scope.
+    pub location: String,
+    /// Reseller prefix for Keystone project → Swift account (`AUTH_`).
+    pub reseller_prefix: String,
+    /// When set, unknown access keys are exchanged via Keystone `/v3/s3tokens`
+    /// with a real base64 string-to-sign (EC2 deferral).
+    pub s3token_client: Option<Arc<dyn S3TokenClient>>,
+}
+
+impl S3Api {
+    pub fn new(credentials: HashMap<String, S3Credential>) -> Self {
+        S3Api {
+            credentials,
+            storage_domains: Vec::new(),
+            dns_compliant_bucket_names: true,
+            location: "us-east-1".to_string(),
+            reseller_prefix: "AUTH_".into(),
+            s3token_client: None,
+        }
+    }
+
+    pub fn with_location(mut self, location: impl Into<String>) -> Self {
+        self.location = location.into();
+        self
+    }
+
+    pub fn with_storage_domains(mut self, domains: Vec<String>) -> Self {
+
+=== store/GET ACP handle_acl object branch ===
+    mut req: Request,
+    cred: &S3Credential,
+    owner: &Owner,
+    bucket: &str,
+    key: Option<&str>,
+    next: &NextFn,
+) -> Response {
+    if let Some(obj) = key {
+        // Object ACL: JSON grants and/or canned name in object sysmeta.
+        match req.method.as_str() {
+            "GET" | "HEAD" => {
+                let mut head = make_swift_req(
+                    "HEAD",
+                    &s3_to_swift_path(&cred.account, Some(bucket), Some(obj)),
+                );
+                stamp_auth(&mut head, cred);
+                let resp = next(head);
+                if !(200..300).contains(&resp.status) {
+                    return map_swift_error(resp.status, Some(bucket), Some(obj));
+                }
+                xml_ok(object_acl_xml_from_headers(&owner.id, &resp.headers))
+            }
+            "PUT" => {
+                let body = match req.body.take().into_vec(MAX_CONTROL_BODY) {
+                    Ok(b) => b,
+                    Err(_) => return s3_error_response("InvalidRequest", None, &[]),
+                };
+                let input = match resolve_acl_put_input(
+                    &req.headers,
+                    if body.is_empty() { None } else { Some(&body) },
+                    &owner.id,
+                ) {
+                    Ok(AclPutInput::None) => AclPutInput::Canned("private".into()),
+                    Ok(i) => i,
+                    Err(_) => return s3_error_response("MalformedACLError", None, &[]),
+                };
+                let mut post = make_swift_req(
+                    "POST",
+                    &s3_to_swift_path(&cred.account, Some(bucket), Some(obj)),
+                );
+                apply_object_acl_input(&mut post.headers, &input);
+                stamp_auth(&mut post, cred);
+                let resp = next(post);
+                if (200..300).contains(&resp.status) {
+                    Response::new(200)
+                } else {
+                    map_swift_error(resp.status, Some(bucket), Some(obj))
+                }
+            }
+
+=== object_acl_denies_write impl (passes iam None via object_grants_allow_write) ===
+/// Whether structured grants allow object WRITE (overwrite/delete).
+/// Same `None` / `Some` semantics as [`object_grants_allow_read`].
+pub fn object_grants_allow_write(
+    headers: &HeaderKeyDict,
+    principal_access_key: &str,
+    principal_account: &str,
+) -> Option<bool> {
+    object_grants_allow_write_with_iam(
+        headers,
+        principal_access_key,
+        principal_account,
+        None,
+    )
+}
+pub fn object_acl_denies_write(
+    headers: &HeaderKeyDict,
+    principal_access_key: &str,
+    principal_account: &str,
+) -> bool {
+    matches!(
+        object_grants_allow_write(headers, principal_access_key, principal_account),
+        Some(false)
+    )
+}
+
+=== write enforcement middleware tests? ===
+crates/swift-s3api/src/middleware.rs:28://! * MultiDelete (`POST ?delete`), basic ACL/CORS, multipart upload
+crates/swift-s3api/src/middleware.rs:108:    object_acl_denies_read, object_acl_denies_write, object_acl_xml_from_headers, parse_cors_configuration,
+crates/swift-s3api/src/middleware.rs:1027:fn deny_if_object_acl_blocks_write(cred: &S3Credential, headers: &HeaderKeyDict) -> Option<Response> {
+crates/swift-s3api/src/middleware.rs:1028:    if object_acl_denies_write(headers, &cred.access_key, &cred.account) {
+crates/swift-s3api/src/middleware.rs:1381:            if let Some(blocked) = acl_write_check_object(
+crates/swift-s3api/src/middleware.rs:1494:fn acl_write_check_object(
+crates/swift-s3api/src/middleware.rs:1509:    deny_if_object_acl_blocks_write(cred, &resp.headers)
+crates/swift-s3api/src/middleware.rs:3820:    fn put_bucket_acl_public_read_write() {
+crates/swift-s3api/src/middleware.rs:3823:        req.headers.set("x-amz-acl", "public-read-write");
+crates/swift-s3api/src/acl_cors.rs:19://! * Canned bucket ACLs: **private**, **public-read**, **public-read-write**
+crates/swift-s3api/src/acl_cors.rs:31://!   [`S3_BUCKET_ACL_JSON_META`]). Bucket AllUsers READ/WRITE also map to
+crates/swift-s3api/src/acl_cors.rs:145:/// Public-read-write ACL (owner FULL_CONTROL + AllUsers READ + WRITE).
+crates/swift-s3api/src/acl_cors.rs:168:/// Map `x-amz-acl` canned ACL name → Swift container read/write headers.
+crates/swift-s3api/src/acl_cors.rs:212:/// Infer canned ACL XML from Swift `X-Container-Read` / `X-Container-Write`.
+crates/swift-s3api/src/acl_cors.rs:662:/// Store structured bucket ACL JSON + map AllUsers to container read/write.
+crates/swift-s3api/src/acl_cors.rs:958:pub fn object_acl_denies_write(
+crates/swift-s3api/src/acl_cors.rs:1374:    fn public_read_write_acl_xml_has_read_and_write() {
+crates/swift-s3api/src/acl_cors.rs:1385:        apply_canned_acl(&mut h, "public-read-write");
+crates/swift-s3api/src/acl_cors.rs:1421:    fn infer_acl_from_read_write_headers() {

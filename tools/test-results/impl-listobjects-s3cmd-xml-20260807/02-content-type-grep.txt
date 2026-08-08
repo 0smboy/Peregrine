@@ -1,0 +1,84 @@
+=== response.rs: ListBucketResult / Content-Type / into_response ===
+19://! (`ListAllMyBucketsResult`), `controllers/bucket.py` (`ListBucketResult`)
+141:/// `application/xml` body carrying the error document. When `message` is
+148:    resp.headers.set("Content-Type", "application/xml");
+165:    /// The ETag as it should appear, including surrounding quotes.
+172:/// A `ListBucketResult` (S3 ListObjects v1) document builder.
+174:pub struct ListBucketResult {
+187:impl ListBucketResult {
+190:        let mut elem = Element::new("ListBucketResult");
+218:    /// A ready-to-send `200 OK` `application/xml` [`Response`].
+219:    pub fn into_response(self) -> Response {
+224:/// A `ListBucketResult` for ListObjectsV2 (`list-type=2`).
+226:pub struct ListBucketResultV2 {
+241:impl ListBucketResultV2 {
+243:        let mut elem = Element::new("ListBucketResult");
+277:    pub fn into_response(self) -> Response {
+286:    // AWS / Python s3api always emit a quote-wrapped ETag in ListBucketResult.
+287:    // s3cmd and other plain-XML clients expect `<ETag>"md5"</ETag>` (quotes inside).
+288:    let etag = ensure_quoted_etag(&obj.etag);
+289:    contents.push_leaf("ETag", etag);
+299:fn ensure_quoted_etag(etag: &str) -> String {
+339:        .with_leaf("ETag", format!("\"{etag}\""))
+369:/// Wrap XML bytes in an `application/xml` response with the given status.
+372:    resp.headers.set("Content-Type", "application/xml");
+376:/// A `PUT`-object success response: `200 OK`, `ETag` header set to the
+380:    resp.headers.set("ETag", format!("\"{etag}\""));
+401:    resp.headers.set("ETag", format!("\"{etag}\""));
+403:    resp.headers.set("Content-Type", content_type);
+432:        assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
+447:        let lbr = ListBucketResult {
+470:             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+474:             <ETag>\"0000\"</ETag><Size>42</Size><StorageClass>STANDARD</StorageClass></Contents>\
+476:             </ListBucketResult>"
+480:    /// s3cmd `ls` path: Content-Type + xmlns + quoted ETag on ListObjects v1.
+482:    fn test_list_bucket_result_into_response_content_type_and_etag() {
+483:        let lbr = ListBucketResult {
+503:        let resp = lbr.into_response();
+505:        assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
+508:            body.starts_with("<?xml version='1.0' encoding='UTF-8'?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"),
+511:        assert!(body.contains("<ETag>\"deadbeef\"</ETag>"), "quoted ETag missing: {body}");
+514:        assert!(body.ends_with("</ListBucketResult>") || body.contains("</ListBucketResult>"));
+517:    /// ListObjectsV2: same Content-Type / xmlns / ETag contract as v1.
+519:    fn test_list_bucket_result_v2_into_response_content_type_and_etag() {
+520:        let lbr = ListBucketResultV2 {
+541:        let resp = lbr.into_response();
+543:        assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
+546:            "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+549:        assert!(body.contains("<ETag>\"aa\"</ETag>"));
+555:        let lbr = ListBucketResult {
+639:        assert_eq!(put.headers.get("ETag"), Some("\"abc123\""));
+654:        assert_eq!(head.headers.get("ETag"), Some("\"abc123\""));
+655:        assert_eq!(head.headers.get("Content-Type"), Some("text/plain"));
+666:             <LastModified>2013-05-24T00:00:00.000Z</LastModified><ETag>\"abc\"</ETag>\
+
+=== middleware.rs: list translate + Content-Type asserts ===
+143:    ListBucketResult, ListBucketResultV2, Owner, S3Object,
+736:fn translate_list_objects(
+835:    let lbr = ListBucketResult {
+847:    // into_response → Content-Type: application/xml + xmlns ListBucketResult.
+851:fn translate_list_objects_v2(
+953:    ListBucketResultV2 {
+967:    // into_response → Content-Type: application/xml + xmlns ListBucketResult.
+1381:                    return translate_list_objects_v2(
+1388:                return translate_list_objects(&body, bucket.as_deref().unwrap(), &params, &owner);
+1908:    put.headers.set("Content-Type", "application/json");
+1932:        .get("Content-Type")
+1941:    put.headers.set("Content-Type", &ctype);
+2539:                    r.headers.set("Content-Type", "application/xml");
+2589:                    r.headers.set("Content-Type", "application/xml");
+2740:    put.headers.set("Content-Type", "application/json");
+3355:    fn list_objects_translates() {
+3375:        // s3cmd requires application/xml (or text/xml), not text/plain / json.
+3376:        assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
+3379:            body.contains("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"),
+3421:    fn list_objects_v2_emits_key_count() {
+3438:        assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
+3441:            "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+3454:    fn list_objects_truncation_and_common_prefixes() {
+3480:        assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
+3536:        assert!(!body.contains("ListBucketResult"));
+4096:            resp.headers.get("Content-Type"),
+4097:            Some("application/xml")
+
+=== cargo-test list-related lines ===

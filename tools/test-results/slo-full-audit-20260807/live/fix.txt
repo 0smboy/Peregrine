@@ -1,0 +1,62 @@
+=== INLINE pure data ===
+manifest=[{"data": "SU5MSU5FISE="}]
+st=400
+<html><h1>Bad Request</h1><p>Inline data segments require at least one object-backed segment.</p></html>
+HTTP/2 400 
+content-type: text/html; charset=UTF-8
+x-trans-id: tx3ec51c02b616fccb0c493-006a75a189
+x-openstack-request-id: tx3ec51c02b616fccb0c493-006a75a189
+content-length: 104
+
+=== INLINE mixed data+path ===
+mix=[{"path": "/slofix3960_segs/s1", "etag": "63f002b432657143aab00c10772656d9", "size_bytes": 8}, {"data": "WFk="}]
+st=201
+
+get=200
+ 53 45 47 44 41 54 41 31 58 59
+SEGDATA1XY
+mix_status_line=HTTP/2 201 
+mix_body=SEGDATA1XY
+=== SLO put for copy ===
+mput=201
+=== COPY via X-Copy-From ===
+st=201
+HTTP/2 201 
+etag: "63f002b432657143aab00c10772656d9"
+content-type: text/html; charset=UTF-8
+last-modified: Fri, 07 Aug 2026 09:12:50 GMT
+x-copied-from: slofix3960/big
+x-copied-from-account: AUTH_test
+x-trans-id: tx1fec17a7698ee66c0c44b-006a75a18e
+x-openstack-request-id: tx1fec17a7698ee66c0c44b-006a75a18e
+content-length: 0
+
+copy1_body=SEGDATA1
+=== COPY manifest-aware multipart-manifest=get ===
+st=201
+HTTP/2 201 
+etag: "2a07b295156d5ae2cc16771454c38973"
+content-type: text/html; charset=UTF-8
+last-modified: Fri, 07 Aug 2026 09:12:50 GMT
+x-copied-from: slofix3960/big
+x-copied-from-account: AUTH_test
+x-trans-id: tx9308e62e8911d0850c421-006a75a191
+x-openstack-request-id: tx9308e62e8911d0850c421-006a75a191
+content-length: 0
+
+
+HTTP/2 200 
+content-type: application/json
+x-static-large-object: True
+last-modified: Fri, 07 Aug 2026 09:12:50 GMT
+x-timestamp: 1786093969.72406
+accept-ranges: bytes
+etag: 8dad18e971db3af2ae6f7b6086c9087e
+content-length: 8
+x-trans-id: txb2fa21a7298995460c49d-006a75a191
+x-openstack-request-id: txb2fa21a7298995460c49d-006a75a191
+
+copy2_body=SEGDATA1
+=== ASYNC delete on mix ===
+st=204
+

@@ -751,6 +751,7 @@ dependencies = [
 name = "swift-proxy-server"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "md-5",
  "serde_json",
  "swift-account-server",

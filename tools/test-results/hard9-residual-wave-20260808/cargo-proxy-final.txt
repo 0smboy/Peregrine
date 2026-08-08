@@ -1,0 +1,78 @@
+   Compiling serde_core v1.0.228
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.46
+   Compiling unicode-ident v1.0.24
+   Compiling zerocopy v0.8.54
+   Compiling ahash v0.8.12
+   Compiling serde v1.0.228
+   Compiling vcpkg v0.2.15
+   Compiling smallvec v1.15.2
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling fallible-iterator v0.3.0
+   Compiling libsqlite3-sys v0.30.1
+   Compiling syn v2.0.119
+   Compiling serde_json v1.0.150
+   Compiling serde_derive v1.0.228
+   Compiling swift-core v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-core)
+   Compiling swift-memcache v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-memcache)
+   Compiling swift-crypto v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-crypto)
+   Compiling hashbrown v0.14.5
+   Compiling swift-http v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-http)
+   Compiling swift-diskfile v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-diskfile)
+   Compiling hashlink v0.9.1
+   Compiling swift-middleware v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-middleware)
+   Compiling rusqlite v0.32.1
+warning: unused import: `HeaderKeyDict`
+  --> crates/swift-middleware/src/versioned_writes.rs:39:36
+   |
+39 | use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+   |                                    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `md5_hex` is never used
+   --> crates/swift-middleware/src/encrypter.rs:378:4
+    |
+378 | fn md5_hex(data: &[u8]) -> String {
+    |    ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling swift-s3api v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-s3api)
+   Compiling swift-ring v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-ring)
+warning: `swift-middleware` (lib) generated 2 warnings (run `cargo fix --lib -p swift-middleware` to apply 1 suggestion)
+   Compiling swift-db v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-db)
+   Compiling swift-proxy-server v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-proxy-server)
+   Compiling swift-object-server v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-object-server)
+   Compiling swift-container-server v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-container-server)
+   Compiling swift-account-server v0.1.0 (/Users/oboy/Downloads/Peregrine/swift-rust/crates/swift-account-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.91s
+     Running unittests src/main.rs (target/debug/deps/swift_proxy_server-897321fab3902f52)
+
+running 23 tests
+test startup_policy_tests::allow_account_management_defaults_false_and_can_enable ... ok
+test startup_policy_tests::every_configured_policy_requires_its_own_ring ... ok
+test startup_policy_tests::ec_ring_replica_mismatch_is_rejected ... ok
+test startup_policy_tests::pipeline_crypto_skips_without_root_secret ... ok
+test startup_policy_tests::pipeline_order_from_conf_reorders_implemented_filters ... ok
+test startup_policy_tests::no_pipeline_line_keeps_default_order ... ok
+test startup_policy_tests::pipeline_container_sync_wires_and_info ... ok
+test startup_policy_tests::pipeline_s3api_wires_ec2_s3token_deferral_when_auth_uri_set ... ok
+test startup_policy_tests::pipeline_p3_auth_wires_authtoken_keystoneauth_and_info ... ok
+test startup_policy_tests::pipeline_s3api_wires_without_info_pollution ... ok
+test startup_policy_tests::pipeline_p1b_wires_formpost_staticweb_quotas_symlink_vw ... ok
+test startup_policy_tests::pipeline_crypto_multi_root_secret_conf ... ok
+test startup_policy_tests::pipeline_strict_true_surfaces_fatal_unknown_filter ... ok
+test startup_policy_tests::pipeline_unknown_filter_note_when_lenient ... ok
+test startup_policy_tests::pipeline_strict_conf_parses_true ... ok
+test startup_policy_tests::pipeline_unknown_filter_still_skips ... ok
+test startup_policy_tests::pipeline_crypto_wires_keymaster_encryption_and_info ... ok
+test startup_policy_tests::process_workers_conf_parses ... ok
+test startup_policy_tests::proxy_config_reads_tuning_knobs_with_default_fallback ... ok
+test startup_policy_tests::ratelimit_filter_is_built_only_when_configured ... ok
+test startup_policy_tests::server_options_read_workers_clients_timeout_and_log_conf ... ok
+test startup_policy_tests::pipeline_p1a_wires_bulk_tempurl ... ok
+test startup_policy_tests::startup_and_reload_share_one_build_path ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

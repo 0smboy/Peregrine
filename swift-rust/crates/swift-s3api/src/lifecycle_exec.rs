@@ -37,6 +37,10 @@ const SECONDS_PER_DAY: i64 = 86_400;
 pub const META_STORAGE_CLASS: &str = "X-Object-Meta-S3-Storage-Class";
 /// Object sysmeta: unix seconds at which Transition applies (observability).
 pub const SYS_TRANSITION_AT: &str = "X-Object-Sysmeta-S3-Transition-At";
+/// Set to `1` once transition has taken effect (GET may Glacier-block).
+pub const SYS_TRANSITIONED: &str = "X-Object-Sysmeta-S3-Transitioned";
+/// Restore flag: unix seconds until which a Glacier object is temporarily readable.
+pub const SYS_RESTORE_UNTIL: &str = "X-Object-Sysmeta-S3-Restore-Until";
 /// Object sysmeta on MPU marker: DaysAfterInitiation from abort rule.
 pub const SYS_ABORT_MPU_DAYS: &str = "X-Object-Sysmeta-S3-Abort-Mpu-Days";
 
@@ -365,10 +369,11 @@ pub fn apply_lifecycle_delete_at(
     }
 }
 
-/// Apply Transition metadata stamp (LAB-HARD-GREEN; no tiering backend).
+/// Apply Transition metadata stamp on PUT.
 ///
 /// Sets [`META_STORAGE_CLASS`] and [`SYS_TRANSITION_AT`] when a matching
-/// Enabled Transition rule exists. Does not move data.
+/// Enabled Transition rule exists. When `transition_at <= now`, also marks
+/// the object as already transitioned ([`SYS_TRANSITIONED`]).
 pub fn apply_lifecycle_transition_meta(
     headers: &mut HeaderKeyDict,
     lifecycle_xml: &[u8],
@@ -378,7 +383,85 @@ pub fn apply_lifecycle_transition_meta(
     if let Some((storage_class, at)) = compute_transition(lifecycle_xml, object_key, now_unix) {
         headers.set(META_STORAGE_CLASS, storage_class);
         headers.set(SYS_TRANSITION_AT, at.to_string());
+        if at <= now_unix {
+            headers.set(SYS_TRANSITIONED, "1");
+        }
     }
+}
+
+/// Storage classes that block cold GET until restore (AWS Glacier-like).
+pub fn is_cold_storage_class(sc: &str) -> bool {
+    matches!(
+        sc.trim().to_ascii_uppercase().as_str(),
+        "GLACIER" | "DEEP_ARCHIVE" | "GLACIER_IR" | "FLEXIBLE_RETRIEVAL" | "DEEP_ARCHIVE_IR"
+    )
+}
+
+/// Apply due transition on an existing object (e.g. HEAD refresh before GET).
+///
+/// If `SYS_TRANSITION_AT` is present and `<= now`, stamp [`SYS_TRANSITIONED`].
+pub fn apply_due_transition_on_headers(headers: &mut HeaderKeyDict, now_unix: i64) -> bool {
+    let Some(at_s) = headers.get(SYS_TRANSITION_AT) else {
+        return false;
+    };
+    let Ok(at) = at_s.parse::<i64>() else {
+        return false;
+    };
+    if at > now_unix {
+        return false;
+    }
+    if headers.get(SYS_TRANSITIONED).is_some() {
+        return true;
+    }
+    headers.set(SYS_TRANSITIONED, "1");
+    true
+}
+
+/// True when GET/HEAD of object content must be denied as cold archive
+/// (transitioned + cold class + no active restore window).
+pub fn transition_blocks_get(headers: &HeaderKeyDict, now_unix: i64) -> bool {
+    let transitioned = headers
+        .get(SYS_TRANSITIONED)
+        .map(|s| {
+            let t = s.trim();
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false);
+    if !transitioned {
+        // Also treat past TRANSITION_AT as effective even if TRANSITIONED missing.
+        if let Some(at_s) = headers.get(SYS_TRANSITION_AT) {
+            if let Ok(at) = at_s.parse::<i64>() {
+                if at > now_unix {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    let sc = headers
+        .get(META_STORAGE_CLASS)
+        .or_else(|| headers.get("X-Object-Meta-Storage-Class"))
+        .unwrap_or("");
+    if !is_cold_storage_class(sc) {
+        return false;
+    }
+    if let Some(until_s) = headers.get(SYS_RESTORE_UNTIL) {
+        if let Ok(until) = until_s.parse::<i64>() {
+            if until > now_unix {
+                return false; // temporary restore
+            }
+        }
+    }
+    true
+}
+
+/// Stamp a temporary restore window (days) for cold objects.
+pub fn apply_restore_days(headers: &mut HeaderKeyDict, days: i64, now_unix: i64) {
+    let until = now_unix.saturating_add(days.saturating_mul(SECONDS_PER_DAY).max(0));
+    headers.set(SYS_RESTORE_UNTIL, until.to_string());
 }
 
 /// Stamp `X-Delete-At` on an MPU upload marker from AbortIncomplete rules.
@@ -668,4 +751,24 @@ mod tests {
         // 2025-06-01T00:00:00Z
         assert_eq!(at, 1_748_736_000);
     }
+    #[test]
+    fn cold_transition_blocks_get_and_restore() {
+        let mut h = HeaderKeyDict::new();
+        h.set(META_STORAGE_CLASS, "GLACIER");
+        h.set(SYS_TRANSITION_AT, "100");
+        h.set(SYS_TRANSITIONED, "1");
+        assert!(transition_blocks_get(&h, 200));
+        apply_restore_days(&mut h, 1, 200);
+        assert!(!transition_blocks_get(&h, 200));
+        assert!(transition_blocks_get(&h, 200 + 86_400 + 1));
+    }
+
+    #[test]
+    fn apply_due_transition_stamps_transitioned() {
+        let mut h = HeaderKeyDict::new();
+        h.set(SYS_TRANSITION_AT, "50");
+        assert!(apply_due_transition_on_headers(&mut h, 100));
+        assert_eq!(h.get(SYS_TRANSITIONED), Some("1"));
+    }
+
 }

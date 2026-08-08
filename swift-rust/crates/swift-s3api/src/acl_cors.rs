@@ -33,6 +33,10 @@
 //!   when present, else canned / container-header inference.
 //! * **Precedence:** `x-amz-acl` canned wins if present alongside grant headers
 //!   or ACP body (AWS forbids both; we keep canned for operational safety).
+//! * **Object GET/HEAD grant enforcement** (LAB-HARD-GREEN): structured JSON
+//!   grants with non-empty `Grant` list require the SigV4 principal to be
+//!   owner or hold READ/FULL_CONTROL; else `AccessDenied`. Missing/empty
+//!   grants do not invent denials.
 //! * Multi-rule CORSConfiguration put/get: rules stored as compact meta
 //!   (`X-Container-Meta-S3-Cors`) plus first-rule `Access-Control-*` stamps for
 //!   Swift CORS middleware interop.
@@ -43,14 +47,17 @@
 //!   (map to private on apply; no Swift ACL equivalent for AuthenticatedUsers).
 //! * Full IAM identity service / emailAddress grantee resolution (email stored
 //!   in JSON for GET fidelity only; not resolved to canonical user).
-//! * Enforcement of object ACP grants on subsequent ops (authz still via
-//!   Swift container ACL / tempauth — not S3 grant evaluation).
+//! * **Object ACP grant enforcement on GET/HEAD** (LAB-HARD-GREEN subset):
+//!   when [`S3_OBJECT_ACL_JSON_META`] is present with non-empty grants, the
+//!   request principal (`access_key` / account id) must be the owner or hold
+//!   READ/FULL_CONTROL (or AllUsers/AuthenticatedUsers for **authenticated**
+//!   callers) — else `AccessDenied`. Owner always allowed. Missing/empty
+//!   grants → no new denial (existing canned/Swift path). See
+//!   [`object_grants_allow_read`] / [`object_acl_denies_read`].
 //! * Object public-read / AllUsers READ does **not** grant anonymous Swift GET
-//!   by itself (container ACL still gates access); meta is for S3 GET `?acl`
-//!   fidelity. See [`object_canned_allows_anonymous_read`] /
-//!   [`grants_allow_anonymous_read`] (pure helpers; not wired into
-//!   unauthenticated request paths — account mapping without SigV4 is unsafe
-//!   in multi-tenant proxy).
+//!   by itself (container ACL still gates access; unauthenticated traffic never
+//!   enters s3api SigV4 enforcement). Meta remains for S3 GET `?acl` fidelity.
+//!   See [`object_canned_allows_anonymous_read`] / [`grants_allow_anonymous_read`].
 //! * CORS `ExposeHeader` / `ID` fields not persisted in the compact encoding.
 
 use crate::xml::Element;
@@ -702,6 +709,261 @@ pub fn grants_allow_anonymous_read(grants: &[Grant]) -> bool {
         matches!(&g.grantee, Grantee::Uri { uri } if uri == ALL_USERS)
             && matches!(g.permission.as_str(), "READ" | "FULL_CONTROL")
     })
+}
+
+fn permission_allows_object_read(permission: &str) -> bool {
+    matches!(permission, "READ" | "FULL_CONTROL")
+}
+
+/// True when `id` matches the request principal (`access_key` and/or account).
+fn principal_matches(id: &str, principal_access_key: &str, principal_account: &str) -> bool {
+    !id.is_empty()
+        && (id == principal_access_key
+            || (!principal_account.is_empty() && id == principal_account))
+}
+
+/// Whether structured object ACL JSON grants allow this principal to READ
+/// object content (GET/HEAD).
+///
+/// # Return values
+/// * `None` — missing/empty JSON grants: **no enforcement** (keep canned/Swift
+///   path; do not invent denials).
+/// * `Some(true)` — principal is owner, or holds READ/FULL_CONTROL (Id grantee
+///   match on access_key/account, or AllUsers/AuthenticatedUsers URI for
+///   **authenticated** callers that reach this check).
+/// * `Some(false)` — non-empty grants present and principal is not authorized.
+///
+/// # Residuals
+/// * EmailAddress grantees are **not** resolved (never match).
+/// * AllUsers READ does **not** open the anonymous unauthenticated path:
+///   requests without SigV4 never enter s3api ACL evaluation.
+pub fn object_grants_allow_read(
+    headers: &HeaderKeyDict,
+    principal_access_key: &str,
+    principal_account: &str,
+) -> Option<bool> {
+    let raw = headers
+        .get(S3_OBJECT_ACL_JSON_META)
+        .or_else(|| headers.get("X-Object-Meta-S3-Acl-Json"))?;
+    if raw.is_empty() {
+        return None;
+    }
+    let policy = decode_acl_json(raw)?;
+    if policy.grants.is_empty() {
+        return None;
+    }
+
+    // Owner always allowed.
+    if principal_matches(
+        &policy.owner_id,
+        principal_access_key,
+        principal_account,
+    ) {
+        return Some(true);
+    }
+
+    for g in &policy.grants {
+        if !permission_allows_object_read(&g.permission) {
+            continue;
+        }
+        match &g.grantee {
+            Grantee::Id { id, .. } => {
+                if principal_matches(id, principal_access_key, principal_account) {
+                    return Some(true);
+                }
+            }
+            Grantee::Uri { uri } => {
+                // Authenticated SigV4 callers only invoke this helper.
+                if uri == ALL_USERS || uri == AUTH_USERS {
+                    return Some(true);
+                }
+            }
+            Grantee::Email { email } => {
+                // Without directory, email never matches (IAM residual closed
+                // via object_grants_allow_read_with_iam).
+                let _ = email;
+            }
+        }
+    }
+    Some(false)
+}
+
+/// READ check with optional [`crate::iam::IdentityDirectory`] for email +
+/// access_key → canonical id resolution.
+pub fn object_grants_allow_read_with_iam(
+    headers: &HeaderKeyDict,
+    principal_access_key: &str,
+    principal_account: &str,
+    iam: Option<&crate::iam::IdentityDirectory>,
+) -> Option<bool> {
+    let raw = headers
+        .get(S3_OBJECT_ACL_JSON_META)
+        .or_else(|| headers.get("X-Object-Meta-S3-Acl-Json"))?;
+    if raw.is_empty() {
+        return None;
+    }
+    let policy = decode_acl_json(raw)?;
+    if policy.grants.is_empty() {
+        return None;
+    }
+    let owner = if policy.owner_id.is_empty() {
+        principal_account
+    } else {
+        policy.owner_id.as_str()
+    };
+    if principal_matches(owner, principal_access_key, principal_account) {
+        return Some(true);
+    }
+    if let Some(dir) = iam {
+        if dir.principal_matches_id(owner, principal_access_key, principal_account) {
+            return Some(true);
+        }
+    }
+    for g in &policy.grants {
+        if !permission_allows_object_read(&g.permission) {
+            continue;
+        }
+        match &g.grantee {
+            Grantee::Id { id, .. } => {
+                if principal_matches(id, principal_access_key, principal_account) {
+                    return Some(true);
+                }
+                if let Some(dir) = iam {
+                    if dir.principal_matches_id(id, principal_access_key, principal_account) {
+                        return Some(true);
+                    }
+                }
+            }
+            Grantee::Uri { uri } => {
+                if uri == ALL_USERS || uri == AUTH_USERS {
+                    return Some(true);
+                }
+            }
+            Grantee::Email { email } => {
+                if let Some(dir) = iam {
+                    if let Some(id) = dir.resolve_email(email) {
+                        if dir.principal_matches_id(&id, principal_access_key, principal_account)
+                            || principal_matches(&id, principal_access_key, principal_account)
+                        {
+                            return Some(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some(false)
+}
+
+/// WRITE permission for object overwrite / DELETE / PUT.
+fn permission_allows_object_write(permission: &str) -> bool {
+    matches!(permission, "WRITE" | "FULL_CONTROL")
+}
+
+/// Whether structured grants allow object WRITE (overwrite/delete).
+/// Same `None` / `Some` semantics as [`object_grants_allow_read`].
+pub fn object_grants_allow_write(
+    headers: &HeaderKeyDict,
+    principal_access_key: &str,
+    principal_account: &str,
+) -> Option<bool> {
+    object_grants_allow_write_with_iam(
+        headers,
+        principal_access_key,
+        principal_account,
+        None,
+    )
+}
+
+pub fn object_grants_allow_write_with_iam(
+    headers: &HeaderKeyDict,
+    principal_access_key: &str,
+    principal_account: &str,
+    iam: Option<&crate::iam::IdentityDirectory>,
+) -> Option<bool> {
+    let raw = headers
+        .get(S3_OBJECT_ACL_JSON_META)
+        .or_else(|| headers.get("X-Object-Meta-S3-Acl-Json"))?;
+    if raw.is_empty() {
+        return None;
+    }
+    let policy = decode_acl_json(raw)?;
+    if policy.grants.is_empty() {
+        return None;
+    }
+    let owner = if policy.owner_id.is_empty() {
+        principal_account
+    } else {
+        policy.owner_id.as_str()
+    };
+    if principal_matches(owner, principal_access_key, principal_account) {
+        return Some(true);
+    }
+    if let Some(dir) = iam {
+        if dir.principal_matches_id(owner, principal_access_key, principal_account) {
+            return Some(true);
+        }
+    }
+    for g in &policy.grants {
+        if !permission_allows_object_write(&g.permission) {
+            continue;
+        }
+        match &g.grantee {
+            Grantee::Id { id, .. } => {
+                if principal_matches(id, principal_access_key, principal_account) {
+                    return Some(true);
+                }
+                if let Some(dir) = iam {
+                    if dir.principal_matches_id(id, principal_access_key, principal_account) {
+                        return Some(true);
+                    }
+                }
+            }
+            Grantee::Uri { uri } => {
+                if uri == ALL_USERS || uri == AUTH_USERS {
+                    return Some(true);
+                }
+            }
+            Grantee::Email { email } => {
+                if let Some(dir) = iam {
+                    if let Some(id) = dir.resolve_email(email) {
+                        if dir.principal_matches_id(&id, principal_access_key, principal_account)
+                            || principal_matches(&id, principal_access_key, principal_account)
+                        {
+                            return Some(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some(false)
+}
+
+/// True when object JSON ACL is present with non-empty grants and the
+/// principal is **denied** object READ (GET/HEAD → AccessDenied).
+///
+/// Missing/empty grants → `false` (no new denial).
+pub fn object_acl_denies_read(
+    headers: &HeaderKeyDict,
+    principal_access_key: &str,
+    principal_account: &str,
+) -> bool {
+    matches!(
+        object_grants_allow_read(headers, principal_access_key, principal_account),
+        Some(false)
+    )
+}
+
+pub fn object_acl_denies_write(
+    headers: &HeaderKeyDict,
+    principal_access_key: &str,
+    principal_account: &str,
+) -> bool {
+    matches!(
+        object_grants_allow_write(headers, principal_access_key, principal_account),
+        Some(false)
+    )
 }
 
 /// Resolved ACL input for PUT object/bucket (canned takes precedence).
@@ -1504,5 +1766,107 @@ mod tests {
             }
             _ => panic!("expected policy"),
         }
+    }
+
+    #[test]
+    fn object_grants_allow_read_enforcement_matrix() {
+        // Missing JSON → no enforcement.
+        let empty = HeaderKeyDict::new();
+        assert_eq!(
+            object_grants_allow_read(&empty, "foreign", "AUTH_x"),
+            None
+        );
+        assert!(!object_acl_denies_read(&empty, "foreign", "AUTH_x"));
+
+        // Empty grants → no enforcement.
+        let mut h_empty_grants = HeaderKeyDict::new();
+        h_empty_grants.set(
+            S3_OBJECT_ACL_JSON_META,
+            r#"{"Owner":"owner","Grant":[]}"#,
+        );
+        assert_eq!(
+            object_grants_allow_read(&h_empty_grants, "foreign", "AUTH_x"),
+            None
+        );
+
+        // Private (owner FULL_CONTROL only): owner OK, foreign denied.
+        let private = AccessControlPolicy {
+            owner_id: "owner-ak".into(),
+            owner_display_name: Some("owner-ak".into()),
+            grants: vec![Grant {
+                grantee: Grantee::Id {
+                    id: "owner-ak".into(),
+                    display_name: Some("owner-ak".into()),
+                },
+                permission: "FULL_CONTROL".into(),
+            }],
+        };
+        let mut h = HeaderKeyDict::new();
+        apply_object_acl_policy(&mut h, &private);
+        assert_eq!(
+            object_grants_allow_read(&h, "owner-ak", "AUTH_owner"),
+            Some(true)
+        );
+        // Owner match via account id when policy owner is account form.
+        let mut private_acct = private.clone();
+        private_acct.owner_id = "AUTH_owner".into();
+        let mut h_acct = HeaderKeyDict::new();
+        apply_object_acl_policy(&mut h_acct, &private_acct);
+        assert_eq!(
+            object_grants_allow_read(&h_acct, "other", "AUTH_owner"),
+            Some(true)
+        );
+        assert_eq!(
+            object_grants_allow_read(&h, "foreign-ak", "AUTH_foreign"),
+            Some(false)
+        );
+        assert!(object_acl_denies_read(&h, "foreign-ak", "AUTH_foreign"));
+
+        // Explicit READ grant to principal id → allowed.
+        let with_read = AccessControlPolicy {
+            owner_id: "owner-ak".into(),
+            owner_display_name: None,
+            grants: vec![
+                Grant {
+                    grantee: Grantee::Id {
+                        id: "owner-ak".into(),
+                        display_name: None,
+                    },
+                    permission: "FULL_CONTROL".into(),
+                },
+                Grant {
+                    grantee: Grantee::Id {
+                        id: "friend-ak".into(),
+                        display_name: None,
+                    },
+                    permission: "READ".into(),
+                },
+            ],
+        };
+        let mut h2 = HeaderKeyDict::new();
+        apply_object_acl_policy(&mut h2, &with_read);
+        assert_eq!(
+            object_grants_allow_read(&h2, "friend-ak", "AUTH_friend"),
+            Some(true)
+        );
+        assert!(!object_acl_denies_read(&h2, "friend-ak", "AUTH_friend"));
+        // READ_ACP alone does not authorize object GET.
+        let acp_only = AccessControlPolicy {
+            owner_id: "owner-ak".into(),
+            owner_display_name: None,
+            grants: vec![Grant {
+                grantee: Grantee::Id {
+                    id: "friend-ak".into(),
+                    display_name: None,
+                },
+                permission: "READ_ACP".into(),
+            }],
+        };
+        let mut h3 = HeaderKeyDict::new();
+        apply_object_acl_policy(&mut h3, &acp_only);
+        assert_eq!(
+            object_grants_allow_read(&h3, "friend-ak", "AUTH_friend"),
+            Some(false)
+        );
     }
 }

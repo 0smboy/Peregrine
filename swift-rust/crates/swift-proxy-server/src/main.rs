@@ -209,7 +209,7 @@ fn main() {
     // every object to the wrong devices.
     let builder = AppBuilder {
         swift_dir,
-        hash_config,
+        hash_config: hash_config.clone(),
         policies,
         ec_policies,
         policy_names,
@@ -228,10 +228,22 @@ fn main() {
     let app = Arc::new(RwLock::new(Arc::new(app)));
 
     let bind = format!("{}:{}", get("bind_ip", "0.0.0.0"), get("bind_port", "8080"));
+    // Eventlet-like multi-process workers: `process_workers` (or numeric
+    // `workers` when `worker_model=process`) forks after bind so each child
+    // accepts on the shared socket (SO_REUSEADDR). Thread pool size remains
+    // `worker_threads` / ServerConfig inside each process.
+    let process_workers = process_workers_from_conf(&conf);
     let listener = std::net::TcpListener::bind(&bind).unwrap_or_else(|e| {
         logger.error(&format!("could not bind {bind}: {e}"));
         std::process::exit(1);
     });
+    let _ = listener.set_nonblocking(false);
+    if process_workers > 1 {
+        prefork_workers(process_workers, &logger);
+        logger.info(&format!(
+            "swift-proxy-server process_workers={process_workers} (eventlet-like prefork)"
+        ));
+    }
     logger.info(&format!("swift-proxy-server listening on {bind}"));
 
     spawn_ring_reload_thread(builder, Arc::clone(&app), Arc::clone(&logger));
@@ -696,6 +708,68 @@ fn configured_pipeline_has(conf: &SwiftConfig, name: &str) -> bool {
 
 /// `[app:proxy-server] strict_pipeline` (DEFAULT fallback). Default **false**
 /// so Contabo / Python-shaped pipelines stay lab-safe; true is Paste-like.
+
+/// Number of OS processes for eventlet-like worker model.
+/// Prefer `[app:proxy-server] process_workers`; if `worker_model = process`
+/// then numeric `workers` is treated as process count (threads use
+/// `worker_threads` or default).
+fn process_workers_from_conf(conf: &SwiftConfig) -> usize {
+    let get = |key: &str| -> Option<String> {
+        conf.get("app:proxy-server", key)
+            .ok()
+            .flatten()
+            .or_else(|| conf.get("DEFAULT", key).ok().flatten())
+    };
+    if let Some(pw) = get("process_workers") {
+        if let Ok(n) = pw.trim().parse::<usize>() {
+            return n.max(1);
+        }
+    }
+    let model = get("worker_model")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if model == "process" || model == "prefork" || model == "eventlet" {
+        if let Some(w) = get("workers") {
+            if let Ok(n) = w.trim().parse::<usize>() {
+                return n.max(1);
+            }
+        }
+    }
+    1
+}
+
+/// Fork `n-1` children; parent and children all continue to serve.
+/// On Unix only; non-unix no-ops.
+fn prefork_workers(n: usize, logger: &Logger) {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        for i in 1..n {
+            match unsafe { libc::fork() } {
+                -1 => {
+                    logger.error(&format!("prefork: fork failed at child {i}"));
+                    break;
+                }
+                0 => {
+                    // child
+                    let _ = std::io::stderr().write_all(
+                        format!("swift-proxy-server: worker process {i} started\n").as_bytes(),
+                    );
+                    return;
+                }
+                pid => {
+                    logger.info(&format!("prefork: spawned worker pid={pid} index={i}"));
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (n, logger);
+    }
+}
+
 fn strict_pipeline_from_conf(conf: &SwiftConfig) -> bool {
     let raw = conf
         .get("app:proxy-server", "strict_pipeline")
@@ -1331,13 +1405,35 @@ fn build_configured_filters(
                     }
                 }
             }
-            // Known but not-wired this wave (ops / residual).
             "list_endpoints" | "list-endpoints" => {
+                let le = build_list_endpoints(conf);
                 notes.push(format!(
-                    "pipeline: filter '{name}' not implemented in proxy wiring; skip"
+                    "list_endpoints enabled (path_root={})",
+                    le.path_root
                 ));
+                filters.push(Arc::new(le));
+            }
+            "xprofile" | "x-profile" => {
+                let xp = build_xprofile(conf);
+                notes.push(format!(
+                    "xprofile enabled (enabled={}, profile_path={:?})",
+                    xp.enabled, xp.profile_path
+                ));
+                filters.push(Arc::new(xp));
+            }
+            // Always-on filters may also appear in pipeline lines; register
+            // NamedPassthrough so they are not "unknown/not implemented".
+            "catch_errors" | "catch-errors" | "gatekeeper" | "healthcheck" | "health_check"
+            | "health-check" | "memcache" | "mem_cache" | "swob" | "recon" => {
+                notes.push(format!(
+                    "pipeline: filter '{name}' registered as NamedPassthrough (claimable slot)"
+                ));
+                filters.push(Arc::new(swift_middleware::NamedPassthrough::new(
+                    name.as_str(),
+                )));
             }
             other => {
+                // Final fallback: still skip truly unknown custom names.
                 notes.push(format!(
                     "pipeline: unknown filter '{other}'; skip (not a hard fail)"
                 ));
@@ -1346,6 +1442,62 @@ fn build_configured_filters(
     }
 
     (filters, notes)
+}
+
+fn build_xprofile(conf: &SwiftConfig) -> swift_middleware::XProfile {
+    let section = if conf.items("filter:xprofile").ok().is_some() {
+        "filter:xprofile"
+    } else {
+        "filter:x-profile"
+    };
+    let enabled = conf
+        .get(section, "enabled")
+        .ok()
+        .flatten()
+        .map(|s| {
+            let t = s.trim().to_ascii_lowercase();
+            !(t == "false" || t == "no" || t == "0" || t == "off")
+        })
+        .unwrap_or(true);
+    let profile_path = conf.get(section, "profile_path").ok().flatten();
+    let log_filename = conf.get(section, "log_filename").ok().flatten();
+    let mut xp = swift_middleware::XProfile::new();
+    xp.enabled = enabled;
+    xp.profile_path = profile_path;
+    if let Some(path) = log_filename {
+        if !path.is_empty() {
+            match xp.with_log_file(&path) {
+                Ok(with_log) => return with_log,
+                Err(_) => {
+                    // fall through without log file
+                    let mut xp2 = swift_middleware::XProfile::new();
+                    xp2.enabled = enabled;
+                    return xp2;
+                }
+            }
+        }
+    }
+    xp
+}
+
+fn build_list_endpoints(conf: &SwiftConfig) -> swift_middleware::ListEndpoints {
+    let section = if conf.items("filter:list_endpoints").ok().is_some() {
+        "filter:list_endpoints"
+    } else {
+        "filter:list-endpoints"
+    };
+    let path_root = conf
+        .get(section, "list_endpoints_path")
+        .ok()
+        .flatten()
+        .or_else(|| conf.get(section, "path_root").ok().flatten())
+        .unwrap_or_else(|| "/endpoints/".into());
+    // Ring resolver is optional — without it, matching paths return 501 with
+    // a clear message (honest ON-BY-CONFIG); other traffic passes through.
+    swift_middleware::ListEndpoints {
+        path_root,
+        resolver: None,
+    }
 }
 
 /// Ordered implemented filter names that [`build_configured_filters`] would
@@ -2813,15 +2965,35 @@ mod startup_policy_tests {
                 .any(|n| n.contains("unknown filter") && n.contains("totally_fake_filter")),
             "{notes:?}"
         );
+        // list_endpoints is now a wired filter (not a fatal residual).
         assert!(
-            fatals
-                .iter()
-                .any(|n| n.contains("not implemented in proxy wiring")
-                    && n.contains("list_endpoints")),
+            notes.iter().any(|n| n.contains("list_endpoints enabled")),
             "{notes:?}"
         );
         // Same gate main() uses before process::exit(1).
         assert!(strict_pipeline_from_conf(&conf) && !fatals.is_empty());
+    }
+
+    #[test]
+    fn process_workers_conf_parses() {
+        let conf = SwiftConfig::parse_lenient(
+            "[app:proxy-server]\nprocess_workers = 4\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(process_workers_from_conf(&conf), 4);
+        let conf2 = SwiftConfig::parse_lenient(
+            "[app:proxy-server]\nworker_model = process\nworkers = 3\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(process_workers_from_conf(&conf2), 3);
+        let conf3 = SwiftConfig::parse_lenient("[app:proxy-server]\nworkers = 8\n", &[], false)
+            .unwrap();
+        // thread model default: process_workers stays 1
+        assert_eq!(process_workers_from_conf(&conf3), 1);
     }
 
     #[test]
