@@ -513,8 +513,9 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
     );
     assert_eq!(body, expected, "multipart body matches the oracle framing");
 
-    // Unsatisfiable range -> 416 with the total length.
-    let (status, headers, _) = http(
+    // Unsatisfiable range -> Python-compatible swob HTML plus the total
+    // length and the whole-object EC etag (never a fragment etag).
+    let (status, headers, body) = http(
         proxy_addr,
         "GET",
         "/v1/AUTH_ec/ecbox/big.bin",
@@ -525,13 +526,32 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
         b"",
     );
     assert_eq!(status, 416, "unsatisfiable EC range");
-    assert!(headers
-        .iter()
-        .any(|(k, v)| k.eq_ignore_ascii_case("Content-Range")
-            && v == &format!("bytes */{}", payload.len())));
-    assert!(headers.iter().any(|(k, v)| {
-        k.eq_ignore_ascii_case("Content-Type") && v == "application/octet-stream"
-    }));
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    };
+    let expected_body = concat!(
+        "<html><h1>Requested Range Not Satisfiable</h1>",
+        "<p>The Range requested is not available.</p></html>"
+    );
+    let expected_content_range = format!("bytes */{}", payload.len());
+    let expected_length = expected_body.len().to_string();
+    let expected_etag = md5_hex(&payload);
+    assert_eq!(body, expected_body.as_bytes());
+    assert_eq!(
+        header("Content-Range"),
+        Some(expected_content_range.as_str())
+    );
+    assert_eq!(header("Content-Type"), Some("text/html; charset=UTF-8"));
+    assert_eq!(header("Content-Length"), Some(expected_length.as_str()));
+    assert_eq!(header("Accept-Ranges"), Some("bytes"));
+    assert_eq!(
+        header("ETag").map(|value| value.trim_matches('"')),
+        Some(expected_etag.as_str()),
+        "416 ETag is the whole-object md5"
+    );
 
     // A client ETag that doesn't match the streamed md5 -> 422.
     let (status, _, _) = http(

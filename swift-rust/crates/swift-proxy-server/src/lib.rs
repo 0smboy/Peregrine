@@ -3890,9 +3890,8 @@ impl ProxyApp {
 
         if let Some(ranges) = &resolved_ranges {
             if ranges.is_empty() {
-                // Match Python object 416: Content-Range + Accept-Ranges plus
-                // the object's identifying headers (etag / last-modified /
-                // x-timestamp) and a short explanatory body.
+                // Match Python EC object 416: swob's HTML error media type,
+                // whole-object EC etag, and the usual range/object metadata.
                 let body = concat!(
                     "<html><h1>Requested Range Not Satisfiable</h1>",
                     "<p>The Range requested is not available.</p></html>"
@@ -3900,12 +3899,10 @@ impl ProxyApp {
                 let mut resp = Response::with_body(416, body.as_bytes().to_vec());
                 resp.headers
                     .set("Content-Range", format!("bytes */{orig_size}"));
-                resp.headers.set("Content-Type", &content_type);
+                resp.headers.set("Content-Type", "text/html; charset=UTF-8");
                 resp.headers.set("Accept-Ranges", "bytes");
-                if let Some(etag) =
-                    resp_header(&meta, "ETag").or_else(|| resp_header(&meta, "Etag"))
-                {
-                    resp.headers.set("Etag", etag.trim_matches('"'));
+                if !ec_etag.is_empty() {
+                    resp.headers.set("Etag", &ec_etag);
                 }
                 if let Some(lm) = resp_header(&meta, "Last-Modified") {
                     resp.headers.set("Last-Modified", lm);

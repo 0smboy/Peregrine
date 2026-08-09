@@ -679,6 +679,44 @@ fn build_proxy_logging(
     pl
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SloOptions {
+    concurrency: usize,
+    yield_frequency: i64,
+}
+
+/// Read SLO options with the Python Swift 2.33 runtime defaults. PasteDeploy
+/// merges `[DEFAULT]` into the filter's global configuration, so use it as a
+/// fallback when the option is absent from `[filter:slo]`.
+fn slo_options_from_conf(conf: &SwiftConfig) -> SloOptions {
+    let get = |key: &str| -> Option<String> {
+        conf.get("filter:slo", key)
+            .ok()
+            .flatten()
+            .or_else(|| conf.get("DEFAULT", key).ok().flatten())
+    };
+    let concurrency = get("concurrency")
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .map(|value| value.clamp(0, 1000) as usize)
+        .unwrap_or(2);
+    let yield_frequency = get("yield_frequency")
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(10);
+
+    SloOptions {
+        concurrency,
+        yield_frequency,
+    }
+}
+
+fn build_slo(conf: &SwiftConfig, hash_config: HashPathConfig) -> swift_middleware::Slo {
+    let options = slo_options_from_conf(conf);
+    let mut slo = swift_middleware::Slo::with_hash_config(hash_config);
+    slo.concurrent_gets = options.concurrency;
+    slo.yield_frequency = options.yield_frequency as f64;
+    slo
+}
+
 /// Names handled inside [`serve_with_filters_and_config`] (or the app itself).
 /// Dropped when reading `pipeline =` so a Python-shaped line can be reused.
 const ALWAYS_ON_OR_APP: &[&str] = &[
@@ -1115,10 +1153,12 @@ fn build_configured_filters(
                 filters.push(Arc::new(swift_middleware::Copy::new()));
             }
             "slo" => {
-                notes.push("slo enabled".into());
-                filters.push(Arc::new(swift_middleware::Slo::with_hash_config(
-                    hash_config.clone(),
-                )));
+                let slo = build_slo(conf, hash_config.clone());
+                notes.push(format!(
+                    "slo enabled (concurrency={}, yield_frequency={})",
+                    slo.concurrent_gets, slo.yield_frequency
+                ));
+                filters.push(Arc::new(slo));
             }
             "dlo" => {
                 notes.push("dlo enabled".into());
@@ -1762,6 +1802,14 @@ fn build_info_json(
     allow_account_management: bool,
     tempauth_on: bool,
 ) -> String {
+    let swift_compat_version = conf
+        .get("app:proxy-server", "swift_compat_version")
+        .ok()
+        .flatten()
+        .or_else(|| conf.get("DEFAULT", "swift_compat_version").ok().flatten())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "2.33.0".to_string());
+    let slo_options = slo_options_from_conf(conf);
     let c = swift_core::constraints::Constraints::from_swift_conf(swift_conf).unwrap_or_default();
     let policies: Vec<serde_json::Value> = parse_storage_policies(swift_conf)
         .ok()
@@ -1781,7 +1829,7 @@ fn build_info_json(
 
     let mut info = serde_json::json!({
         "swift": {
-            "version": "2.35.0",
+            "version": swift_compat_version,
             // NOTE: strict_cors_mode deliberately absent — CORS is not
             // implemented, so cors tests skip ("cors mode is unknown").
             "account_autocreate": account_autocreate,
@@ -1806,7 +1854,8 @@ fn build_info_json(
             "max_manifest_segments": 1000,
             "max_manifest_size": 8388608,
             "min_segment_size": 1,
-            "max_get_time": 86400,
+            "yield_frequency": slo_options.yield_frequency,
+            "allow_async_delete": true,
         },
         "dlo": {},
     });
@@ -2453,6 +2502,103 @@ mod startup_policy_tests {
         assert_eq!(opts.log_statsd_metric_prefix, "");
         assert_eq!(opts.trace_endpoint, "");
         assert_eq!(opts.trace_sample_ratio, 1.0);
+    }
+
+    #[test]
+    fn slo_runtime_options_match_python_2_33_defaults_and_filter_config() {
+        let conf = SwiftConfig::parse_lenient("[app:proxy-server]\n", &[], false).unwrap();
+        assert_eq!(
+            slo_options_from_conf(&conf),
+            SloOptions {
+                concurrency: 2,
+                yield_frequency: 10,
+            }
+        );
+
+        let conf = SwiftConfig::parse_lenient(
+            "[DEFAULT]\nconcurrency = 3\nyield_frequency = 11\n\
+             [filter:slo]\nuse = egg:swift#slo\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            slo_options_from_conf(&conf),
+            SloOptions {
+                concurrency: 3,
+                yield_frequency: 11,
+            }
+        );
+
+        let conf = SwiftConfig::parse_lenient(
+            "[filter:slo]\nuse = egg:swift#slo\nconcurrency = 7\nyield_frequency = 17\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let hash_config = HashPathConfig::new("", "test").unwrap();
+        let slo = build_slo(&conf, hash_config);
+        assert_eq!(slo.concurrent_gets, 7);
+        assert_eq!(slo.yield_frequency, 17.0);
+
+        let conf = SwiftConfig::parse_lenient(
+            "[filter:slo]\nconcurrency = -1\nyield_frequency = -2\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            slo_options_from_conf(&conf),
+            SloOptions {
+                concurrency: 0,
+                yield_frequency: -2,
+            },
+            "Python clamps concurrency to 0..1000 but does not clamp yield_frequency"
+        );
+    }
+
+    #[test]
+    fn info_matches_python_2_33_version_and_slo_contract() {
+        let conf = SwiftConfig::parse_lenient(
+            "[DEFAULT]\nswift_compat_version = 2.33.1\n\
+             [app:proxy-server]\nswift_compat_version = 2.33.7\n\
+             [filter:slo]\nyield_frequency = 17\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let info = build_info_json(&conf, &conf, true, false, false);
+        let value: serde_json::Value = serde_json::from_str(&info).unwrap();
+        assert_eq!(value["swift"]["version"], "2.33.7");
+        assert!(value["swift"].get("strict_cors_mode").is_none());
+        assert_eq!(
+            value["slo"],
+            serde_json::json!({
+                "allow_async_delete": true,
+                "yield_frequency": 17,
+                "max_manifest_segments": 1000,
+                "max_manifest_size": 8388608,
+                "min_segment_size": 1,
+            })
+        );
+        assert!(value["slo"].get("max_get_time").is_none());
+
+        let default_conf =
+            SwiftConfig::parse_lenient("[app:proxy-server]\n", &[], false).unwrap();
+        let default_info = build_info_json(&default_conf, &default_conf, true, false, false);
+        let default_value: serde_json::Value = serde_json::from_str(&default_info).unwrap();
+        assert_eq!(default_value["swift"]["version"], "2.33.0");
+        assert_eq!(default_value["slo"]["yield_frequency"], 10);
+
+        let fallback_conf = SwiftConfig::parse_lenient(
+            "[DEFAULT]\nswift_compat_version = 2.33.1\n[app:proxy-server]\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let fallback_info = build_info_json(&fallback_conf, &fallback_conf, true, false, false);
+        let fallback_value: serde_json::Value = serde_json::from_str(&fallback_info).unwrap();
+        assert_eq!(fallback_value["swift"]["version"], "2.33.1");
     }
 
     #[test]

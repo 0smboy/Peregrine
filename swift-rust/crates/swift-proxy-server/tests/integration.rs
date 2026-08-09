@@ -788,9 +788,24 @@ fn test_tempauth_end_to_end() {
     });
     std::thread::sleep(std::time::Duration::from_millis(250));
 
-    // unauthenticated container GET -> 401
-    let (status, _, _) = http(proxy_addr, "GET", "/v1/AUTH_test/box", "");
+    // Unauthenticated container GET -> Python TempAuth's exact 401 wire shape.
+    let (status, headers, body) = http(proxy_addr, "GET", "/v1/AUTH_test/box", "");
     assert_eq!(status, 401, "no token");
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    };
+    let expected_body = concat!(
+        "<html><h1>Unauthorized</h1>",
+        "<p>This server could not verify that you are authorized to access ",
+        "the document you requested.</p></html>"
+    );
+    assert_eq!(body, expected_body.as_bytes());
+    assert_eq!(header("Content-Type"), Some("text/html; charset=UTF-8"));
+    assert_eq!(header("Content-Length"), Some("131"));
+    assert_eq!(header("Www-Authenticate"), Some("Swift realm=\"AUTH_test\""));
 
     // get a token
     let mut conn = std::net::TcpStream::connect(proxy_addr).unwrap();

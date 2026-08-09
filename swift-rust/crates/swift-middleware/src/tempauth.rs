@@ -233,10 +233,12 @@ impl TempAuth {
     }
 
     fn unauthorized(realm: &str) -> Response {
-        let mut resp = Response::with_body(401, b"401 Unauthorized".to_vec());
+        let mut resp = Response::error(
+            401,
+            "This server could not verify that you are authorized to access the document you requested.",
+        );
         resp.headers
             .set("Www-Authenticate", format!("Swift realm=\"{realm}\""));
-        resp.headers.set("Content-Type", "text/plain");
         resp
     }
 }
@@ -634,6 +636,43 @@ mod tests {
         let resp = b.handle(mk("GET", "/v1/AUTH_test/c", &[("X-Auth-Token", &token)]), &app);
         assert_eq!(resp.status, 204, "peer proxy must accept HMAC token");
         assert!(seen.lock().unwrap().clone().unwrap().contains("AUTH_test"));
+    }
+
+    #[test]
+    fn test_anonymous_denial_matches_python_wire_contract() {
+        let mut swift_owner = false;
+        let mut denial = TempAuth::authorize_acl(
+            "GET",
+            "/v1/AUTH_test/c/o",
+            &[],
+            None,
+            None,
+            "AUTH_",
+            None,
+            &mut swift_owner,
+        )
+        .expect("anonymous request must be denied");
+        let expected_body = concat!(
+            "<html><h1>Unauthorized</h1>",
+            "<p>This server could not verify that you are authorized to access ",
+            "the document you requested.</p></html>"
+        );
+
+        assert_eq!(denial.status, 401);
+        assert_eq!(
+            denial.headers.get("Content-Type"),
+            Some("text/html; charset=UTF-8")
+        );
+        assert_eq!(
+            denial.headers.get("Www-Authenticate"),
+            Some("Swift realm=\"AUTH_test\"")
+        );
+        assert_eq!(expected_body.len(), 131);
+        assert_eq!(denial.body.content_length(), Some(131));
+        assert_eq!(
+            denial.body.materialize(u64::MAX).unwrap(),
+            expected_body.as_bytes()
+        );
     }
 
     #[test]

@@ -70,11 +70,17 @@ use crate::{Middleware, NextFn};
 /// `?multipart-manifest=put` may not exceed this.
 const MAX_MANIFEST_SIZE: u64 = 8 * 1024 * 1024;
 
+/// `max_manifest_segments` (Python slo.py default and the value advertised
+/// by `/info`). Inline-data entries are deliberately excluded from this
+/// limit; only entries that name an object-backed segment count.
+const MAX_MANIFEST_SEGMENTS: usize = 1000;
+
 /// Python `SloGetContext.max_slo_recursion_depth` — nested `sub_slo`
 /// expansion beyond this depth is a 409 Conflict.
 const MAX_SLO_RECURSION_DEPTH: usize = 10;
 
 const SLO_HEADER: &str = "X-Static-Large-Object";
+const MANIFEST_ETAG_HEADER: &str = "X-Manifest-Etag";
 const IGNORE_RANGE_HDR: &str = "X-Backend-Ignore-Range-If-Metadata-Present";
 const SYSMETA_SLO_ETAG: &str = "X-Object-Sysmeta-Slo-Etag";
 const SYSMETA_SLO_SIZE: &str = "X-Object-Sysmeta-Slo-Size";
@@ -552,6 +558,16 @@ impl Slo {
             return resp;
         }
 
+        // The backend Etag names the physical stored-manifest JSON.  Preserve
+        // it before replacing the public Etag with the aggregate SLO value;
+        // Python exposes this digest as X-Manifest-Etag on GET/HEAD/206.
+        let mut json_etag = resp
+            .headers
+            .get("Etag")
+            .map(normalize_etag)
+            .filter(|etag| !etag.is_empty())
+            .map(str::to_string);
+
         // Prefer sysmeta aggregate (Python `X-Backend-Etag-Is-At` path): a
         // HEAD returns an empty body, so we cannot parse the stored JSON.
         let sys_etag = resp
@@ -572,10 +588,13 @@ impl Slo {
         let (etag, total_len, segments) = if let (Some(e), Some(sz)) = (&sys_etag, sys_size) {
             if is_get {
                 // Still need the segment listing for reassembly.
-                if resp.body.materialize(MAX_CONTROL_BODY).is_err() {
-                    return resp;
+                let manifest_bytes = match resp.body.materialize(MAX_CONTROL_BODY) {
+                    Ok(body) => body,
+                    Err(_) => return resp,
+                };
+                if json_etag.is_none() {
+                    json_etag = Some(manifest_etag(manifest_bytes));
                 }
-                let manifest_bytes = resp.body.materialize(MAX_CONTROL_BODY).expect("buffered");
                 let Some(segments) = parse_stored_manifest(manifest_bytes) else {
                     return resp;
                 };
@@ -598,11 +617,21 @@ impl Slo {
                 {
                     return resp;
                 }
+                json_etag = resp
+                    .headers
+                    .get("Etag")
+                    .map(normalize_etag)
+                    .filter(|etag| !etag.is_empty())
+                    .map(str::to_string)
+                    .or(json_etag);
             }
-            if resp.body.materialize(MAX_CONTROL_BODY).is_err() {
-                return resp;
+            let manifest_bytes = match resp.body.materialize(MAX_CONTROL_BODY) {
+                Ok(body) => body,
+                Err(_) => return resp,
+            };
+            if json_etag.is_none() {
+                json_etag = Some(manifest_etag(manifest_bytes));
             }
-            let manifest_bytes = resp.body.materialize(MAX_CONTROL_BODY).expect("buffered");
             let Some(segments) = parse_stored_manifest(manifest_bytes) else {
                 return resp;
             };
@@ -668,7 +697,11 @@ impl Slo {
         headers.remove("Content-Range");
         headers.remove("Transfer-Encoding");
         headers.remove("Etag");
-        headers.set("Etag", etag);
+        headers.remove(MANIFEST_ETAG_HEADER);
+        headers.set("Etag", format!("\"{etag}\""));
+        if let Some(json_etag) = json_etag {
+            headers.set(MANIFEST_ETAG_HEADER, json_etag);
+        }
         headers.set("Accept-Ranges", "bytes");
 
         // Expand nested sub_slo manifests before committing the response
@@ -794,6 +827,28 @@ impl Slo {
         let Some(entries) = client.as_array() else {
             return Response::error(400, "Manifest must be a list.");
         };
+        let object_segment_count = entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .as_object()
+                    .map(|segment| segment.contains_key("path"))
+                    .unwrap_or(false)
+            })
+            .count();
+        if object_segment_count > MAX_MANIFEST_SEGMENTS {
+            // Python passes this text as HTTPRequestEntityTooLarge's body,
+            // so it is intentionally plain rather than Response::error's
+            // generated HTML document.
+            let body = format!(
+                "Number of object-backed segments must be <= {MAX_MANIFEST_SEGMENTS}"
+            );
+            let mut resp = Response::with_body(413, body.clone());
+            resp.headers
+                .set("Content-Type", "text/html; charset=UTF-8");
+            resp.headers.set("Content-Length", body.len());
+            return resp;
+        }
         let parts = match split_path(&req.path, 4, 4, true) {
             Ok(p) => p,
             Err(_) => return Response::error(400, "Invalid path"),
@@ -1227,6 +1282,24 @@ impl Slo {
         resp.body = body.into();
         resp
     }
+
+    /// `?multipart-manifest=get` returns the stored internal JSON.  Python
+    /// exposes that representation as JSON regardless of the large object's
+    /// original Content-Type; `format=raw` is handled separately and preserves
+    /// the original type for server-side copy.
+    fn handle_manifest_get(&self, req: Request, next: &NextFn) -> Response {
+        let mut resp = next(req);
+        let is_slo = resp
+            .headers
+            .get(SLO_HEADER)
+            .map(config_true_value)
+            .unwrap_or(false);
+        if is_slo {
+            resp.headers
+                .set("Content-Type", "application/json; charset=utf-8");
+        }
+        resp
+    }
 }
 
 /// Built internal manifest + etag inputs from a client PUT body.
@@ -1475,18 +1548,39 @@ fn finish_put(mut req: Request, next: &NextFn, built: PutManifestBuilt) -> Respo
     }
 
     let (slo_etag, total) = slo_etag_and_size(&built.slo_segs);
+    let client_etag = req
+        .headers
+        .get("Etag")
+        .map(normalize_etag)
+        .filter(|etag| !etag.is_empty())
+        .map(str::to_string);
+    if let Some(client_etag) = client_etag {
+        if client_etag != slo_etag {
+            return Response::error(422, "Unable to process the contained instructions");
+        }
+    }
     let body = serde_json::to_vec(&built.internal).unwrap_or_default();
+    let json_etag = manifest_etag(&body);
     req.method = "PUT".to_string();
     req.query_string = String::new();
     req.headers.set(SLO_HEADER, "True");
     req.headers.set("Content-Length", body.len().to_string());
     req.headers.set(SYSMETA_SLO_ETAG, slo_etag.trim_matches('"'));
     req.headers.set(SYSMETA_SLO_SIZE, total.to_string());
+    // The object server validates the transformed stored JSON, not the client
+    // manifest or the aggregate large-object representation.
+    req.headers.set("Etag", json_etag);
     if req.headers.get("Content-Type").is_none() {
         req.headers.set("Content-Type", "application/json");
     }
     req.body = body.into();
-    next(req)
+    let mut resp = next(req);
+    if (200..300).contains(&resp.status) {
+        // The client-visible PUT response names the aggregate SLO, while the
+        // backend response named the physical JSON bytes stored above.
+        resp.headers.set("Etag", format!("\"{slo_etag}\""));
+    }
+    resp
 }
 
 /// Streamed heartbeat PUT body (Python slo.py): leading space, per-HEAD
@@ -1773,7 +1867,7 @@ impl Middleware for Slo {
             if req.param("format").as_deref() == Some("raw") {
                 return self.handle_manifest_get_raw(req, next);
             }
-            return next(req);
+            return self.handle_manifest_get(req, next);
         }
         // GET/HEAD reassembles unless ?multipart-manifest=get asked for raw.
         if is_get_head {
@@ -1916,15 +2010,21 @@ mod tests {
         })
     }
 
-    fn slo_manifest_backend() -> NextFn {
-        let manifest_json = serde_json::to_vec(&serde_json::json!([
+    fn two_segment_manifest_json() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!([
             {"name": "/c/s1", "bytes": 3, "hash": md5_hex(b"one")},
             {"name": "/c/s2", "bytes": 3, "hash": md5_hex(b"two")},
         ]))
-        .unwrap();
+        .unwrap()
+    }
+
+    fn slo_manifest_backend() -> NextFn {
+        let manifest_json = two_segment_manifest_json();
+        let json_etag = manifest_etag(&manifest_json);
         let mut manifest = Response::with_body(200, manifest_json);
         manifest.headers.set("X-Static-Large-Object", "True");
         manifest.headers.set("Content-Type", "text/plain");
+        manifest.headers.set("Etag", json_etag);
         backend(vec![
             ("GET", "/v1/a/c/manifest", manifest),
             ("GET", "/v1/a/c/s1", Response::with_body(200, b"one".to_vec())),
@@ -1961,6 +2061,15 @@ mod tests {
         assert_eq!(body_of(&mut resp), b"onetwo");
         assert_eq!(resp.headers.get("Content-Length"), Some("6"));
         assert_eq!(resp.headers.get("Content-Type"), Some("text/plain"));
+        let aggregate = md5_hex(format!("{}{}", md5_hex(b"one"), md5_hex(b"two")).as_bytes());
+        assert_eq!(
+            resp.headers.get("Etag"),
+            Some(format!("\"{aggregate}\"").as_str())
+        );
+        assert_eq!(
+            resp.headers.get(MANIFEST_ETAG_HEADER),
+            Some(manifest_etag(&two_segment_manifest_json()).as_str())
+        );
     }
 
     #[test]
@@ -1971,6 +2080,10 @@ mod tests {
         assert_eq!(resp.status, 206);
         assert_eq!(body_of(&mut resp), b"etw");
         assert_eq!(resp.headers.get("Content-Range"), Some("bytes 2-4/6"));
+        assert_eq!(
+            resp.headers.get(MANIFEST_ETAG_HEADER),
+            Some(manifest_etag(&two_segment_manifest_json()).as_str())
+        );
     }
 
     #[test]
@@ -2093,12 +2206,14 @@ mod tests {
     #[test]
     fn test_slo_head_uses_sysmeta_not_manifest_length() {
         // HEAD body is empty; Content-Length/Etag must come from SLO sysmeta.
-        let be: NextFn = Arc::new(|req: Request| {
+        let physical_etag = md5_hex(b"stored-manifest-json");
+        let backend_physical_etag = physical_etag.clone();
+        let be: NextFn = Arc::new(move |req: Request| {
             assert_eq!(req.method, "HEAD");
             let mut resp = Response::new(200);
             resp.headers.set("X-Static-Large-Object", "True");
             resp.headers.set("Content-Length", "159"); // physical manifest
-            resp.headers.set("Etag", "manifestmd5xxxxxxxxxxxxxxxxxxxx");
+            resp.headers.set("Etag", &backend_physical_etag);
             resp.headers.set(SYSMETA_SLO_ETAG, "aabbccddeeff00112233445566778899");
             resp.headers.set(SYSMETA_SLO_SIZE, "6");
             resp.headers.set("Content-Type", "text/plain");
@@ -2116,8 +2231,41 @@ mod tests {
         assert_eq!(resp.headers.get("Content-Length"), Some("6"));
         assert_eq!(
             resp.headers.get("Etag"),
-            Some("aabbccddeeff00112233445566778899")
+            Some("\"aabbccddeeff00112233445566778899\"")
         );
+        assert_eq!(
+            resp.headers.get(MANIFEST_ETAG_HEADER),
+            Some(physical_etag.as_str())
+        );
+    }
+
+    #[test]
+    fn test_multipart_manifest_get_uses_json_content_type() {
+        let stored = two_segment_manifest_json();
+        let physical_etag = manifest_etag(&stored);
+        let mut manifest = Response::with_body(200, stored.clone());
+        manifest.headers.set(SLO_HEADER, "True");
+        manifest
+            .headers
+            .set("Content-Type", "application/octet-stream");
+        manifest.headers.set("Etag", &physical_etag);
+        let be = backend(vec![("GET", "/v1/a/c/manifest", manifest)]);
+        let req = Request {
+            method: "GET".to_string(),
+            path: "/v1/a/c/manifest".to_string(),
+            query_string: "multipart-manifest=get".to_string(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+
+        let mut resp = Slo::new().handle(req, &be);
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_of(&mut resp), stored);
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("application/json; charset=utf-8")
+        );
+        assert_eq!(resp.headers.get("Etag"), Some(physical_etag.as_str()));
     }
 
     #[test]
@@ -2131,7 +2279,8 @@ mod tests {
             assert!(req.query_string.contains("multipart-manifest=get"));
             let mut resp = Response::with_body(200, stored.clone());
             resp.headers.set("X-Static-Large-Object", "True");
-            resp.headers.set("Content-Type", "application/json");
+            resp.headers
+                .set("Content-Type", "application/octet-stream");
             resp
         });
         let req = Request {
@@ -2152,6 +2301,12 @@ mod tests {
         assert!(arr[0].get("sub_slo").is_none());
         assert_eq!(arr[1]["path"], "/c/s2");
         assert_eq!(arr[1]["range"], "0-1");
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("application/octet-stream")
+        );
+        assert_eq!(resp.headers.get("Etag"), Some(manifest_etag(&body).as_str()));
+        assert!(resp.headers.get(MANIFEST_ETAG_HEADER).is_none());
     }
 
     #[test]

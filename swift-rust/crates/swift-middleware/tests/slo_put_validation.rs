@@ -59,6 +59,14 @@ struct CapturedPut {
 }
 
 fn run_manifest_put(manifest: Value, heads: Vec<(&str, Response)>) -> (Response, Vec<CapturedPut>) {
+    run_manifest_put_with_client_etag(manifest, heads, None)
+}
+
+fn run_manifest_put_with_client_etag(
+    manifest: Value,
+    heads: Vec<(&str, Response)>,
+    client_etag: Option<&str>,
+) -> (Response, Vec<CapturedPut>) {
     // Canned HEAD responses likewise torn into Sync parts.
     let heads: Arc<HashMap<String, (u16, HeaderKeyDict)>> = Arc::new(
         heads
@@ -84,11 +92,16 @@ fn run_manifest_put(manifest: Value, heads: Vec<(&str, Response)>) -> (Response,
             && request.query_string.is_empty()
         {
             let body = request.body.materialize(u64::MAX).unwrap().to_vec();
+            let physical_etag = request.headers.get("Etag").map(str::to_string);
             writes_for_backend.lock().unwrap().push(CapturedPut {
                 headers: request.headers,
                 body,
             });
-            return Response::new(201);
+            let mut response = Response::new(201);
+            if let Some(physical_etag) = physical_etag {
+                response.headers.set("Etag", physical_etag);
+            }
+            return response;
         }
         Response::new(404)
     });
@@ -97,6 +110,9 @@ fn run_manifest_put(manifest: Value, heads: Vec<(&str, Response)>) -> (Response,
     let mut headers = HeaderKeyDict::new();
     headers.set("Content-Type", "application/json");
     headers.set("Content-Length", body.len().to_string());
+    if let Some(client_etag) = client_etag {
+        headers.set("Etag", client_etag);
+    }
     let request = Request {
         method: "PUT".to_string(),
         path: "/v1/a/c/manifest".to_string(),
@@ -105,7 +121,9 @@ fn run_manifest_put(manifest: Value, heads: Vec<(&str, Response)>) -> (Response,
         body: body.into(),
     };
 
-    let mut response = Slo::new().handle(request, &backend);
+    // Keep these contract tests deterministic and avoid the optional warm-up
+    // HEAD pile. The production default still validates with concurrency 10.
+    let mut response = Slo::new().with_concurrency(1).handle(request, &backend);
     response.body.materialize(u64::MAX).unwrap();
     let captured_writes = writes.lock().unwrap().clone();
     (response, captured_writes)
@@ -128,6 +146,7 @@ fn body_string(resp: &Response) -> String {
 #[test]
 fn ordinary_segment_uses_head_metadata() {
     let segment_etag = md5_hex(b"abc");
+    let slo_etag = md5_hex(segment_etag.as_bytes());
     let (response, writes) = run_manifest_put(
         json!([{
             "path": "/c/segment",
@@ -139,6 +158,10 @@ fn ordinary_segment_uses_head_metadata() {
 
     assert_eq!(response.status, 201);
     assert_eq!(
+        response.headers.get("Etag"),
+        Some(format!("\"{slo_etag}\"").as_str())
+    );
+    assert_eq!(
         stored_manifest(&writes),
         json!([{"name": "/c/segment", "bytes": 3, "hash": segment_etag}])
     );
@@ -149,6 +172,157 @@ fn ordinary_segment_uses_head_metadata() {
     assert_eq!(
         writes[0].headers.get("X-Object-Sysmeta-Slo-Size"),
         Some("3")
+    );
+    let physical_etag = md5_hex(&writes[0].body);
+    assert_eq!(writes[0].headers.get("Etag"), Some(physical_etag.as_str()));
+    assert_ne!(physical_etag, slo_etag);
+}
+
+#[test]
+fn matching_client_aggregate_etag_is_accepted_and_replaced_for_backend() {
+    let segment_etag = md5_hex(b"abc");
+    let slo_etag = md5_hex(segment_etag.as_bytes());
+    let (response, writes) = run_manifest_put_with_client_etag(
+        json!([{
+            "path": "/c/segment",
+            "etag": segment_etag,
+            "size_bytes": 3
+        }]),
+        vec![("/v1/a/c/segment", head_response(&segment_etag, 3))],
+        Some(&slo_etag),
+    );
+
+    assert_eq!(response.status, 201);
+    assert_eq!(writes.len(), 1);
+    let physical_etag = md5_hex(&writes[0].body);
+    assert_eq!(
+        writes[0].headers.get("Etag"),
+        Some(physical_etag.as_str())
+    );
+    assert_ne!(writes[0].headers.get("Etag"), Some(slo_etag.as_str()));
+    assert_eq!(
+        response.headers.get("Etag"),
+        Some(format!("\"{slo_etag}\"").as_str())
+    );
+}
+
+#[test]
+fn quoted_matching_client_aggregate_etag_is_accepted() {
+    let segment_etag = md5_hex(b"abc");
+    let slo_etag = md5_hex(segment_etag.as_bytes());
+    let quoted = format!("\"{slo_etag}\"");
+    let (response, writes) = run_manifest_put_with_client_etag(
+        json!([{
+            "path": "/c/segment",
+            "etag": segment_etag,
+            "size_bytes": 3
+        }]),
+        vec![("/v1/a/c/segment", head_response(&segment_etag, 3))],
+        Some(&quoted),
+    );
+
+    assert_eq!(response.status, 201);
+    assert_eq!(writes.len(), 1);
+    assert_eq!(response.headers.get("Etag"), Some(quoted.as_str()));
+}
+
+#[test]
+fn mismatching_client_aggregate_etag_is_rejected_before_backend_put() {
+    let segment_etag = md5_hex(b"abc");
+    let (response, writes) = run_manifest_put_with_client_etag(
+        json!([{
+            "path": "/c/segment",
+            "etag": segment_etag,
+            "size_bytes": 3
+        }]),
+        vec![("/v1/a/c/segment", head_response(&segment_etag, 3))],
+        Some("00000000000000000000000000000000"),
+    );
+
+    assert_eq!(response.status, 422);
+    assert_eq!(
+        body_string(&response),
+        concat!(
+            "<html><h1>Unprocessable Entity</h1><p>",
+            "Unable to process the contained instructions</p></html>"
+        )
+    );
+    assert_eq!(
+        response.headers.get("Content-Type"),
+        Some("text/html; charset=UTF-8")
+    );
+    assert!(writes.is_empty());
+}
+
+#[test]
+fn one_thousand_object_segments_plus_inline_data_is_accepted() {
+    let segment_etag = md5_hex(b"abc");
+    let mut entries = vec![
+        json!({
+            "path": "/c/segment",
+            "etag": segment_etag,
+            "size_bytes": 3
+        });
+        1000
+    ];
+    // Python's max_manifest_segments counts only entries with `path`.
+    entries.push(json!({"data": "eA=="}));
+
+    let (response, writes) = run_manifest_put(
+        Value::Array(entries),
+        vec![("/v1/a/c/segment", head_response(&segment_etag, 3))],
+    );
+
+    assert_eq!(response.status, 201);
+    assert_eq!(writes.len(), 1);
+    assert_eq!(stored_manifest(&writes).as_array().unwrap().len(), 1001);
+}
+
+#[test]
+fn one_thousand_and_one_object_segments_are_rejected_before_backend_calls() {
+    let entries = vec![
+        json!({
+            "path": "/c/segment",
+            "etag": "unused",
+            "size_bytes": 3
+        });
+        1001
+    ];
+
+    let backend_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let backend_calls_observer = Arc::clone(&backend_calls);
+    let backend: NextFn = Arc::new(move |_request: Request| {
+        backend_calls_observer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Response::new(500)
+    });
+    let body = serde_json::to_vec(&Value::Array(entries)).unwrap();
+    let mut headers = HeaderKeyDict::new();
+    headers.set("Content-Type", "application/json");
+    headers.set("Content-Length", body.len().to_string());
+    let request = Request {
+        method: "PUT".to_string(),
+        path: "/v1/a/c/manifest".to_string(),
+        query_string: "multipart-manifest=put".to_string(),
+        headers,
+        body: body.into(),
+    };
+
+    let mut response = Slo::new().handle(request, &backend);
+    response.body.materialize(u64::MAX).unwrap();
+
+    assert_eq!(response.status, 413);
+    assert_eq!(
+        body_string(&response),
+        "Number of object-backed segments must be <= 1000"
+    );
+    assert_eq!(
+        response.headers.get("Content-Type"),
+        Some("text/html; charset=UTF-8")
+    );
+    assert_eq!(response.headers.get("Content-Length"), Some("48"));
+    assert_eq!(
+        backend_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
     );
 }
 
