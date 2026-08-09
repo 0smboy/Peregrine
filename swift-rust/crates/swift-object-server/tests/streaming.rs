@@ -255,6 +255,29 @@ fn single_range_get_streams_the_window() {
 }
 
 #[test]
+fn unsatisfiable_range_preserves_object_content_type() {
+    let devices = TestDevices::new("range416");
+    let server = server(devices.path());
+    let payload = pattern(64);
+    assert_eq!(
+        server
+            .handle(request("PUT", "1", payload.clone().into()))
+            .status,
+        201
+    );
+
+    let mut req = request("GET", "1", Body::empty());
+    req.headers.set("Range", "bytes=999-1000");
+    let resp = server.handle(req);
+    assert_eq!(resp.status, 416);
+    assert_eq!(resp.headers.get("Content-Range"), Some("bytes */64"));
+    assert_eq!(
+        resp.headers.get("Content-Type"),
+        Some("application/octet-stream")
+    );
+}
+
+#[test]
 fn multi_range_get_matches_the_buffered_oracle() {
     let devices = TestDevices::new("rangen");
     let server = server(devices.path());

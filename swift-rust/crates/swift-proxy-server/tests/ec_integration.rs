@@ -529,6 +529,9 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
         .iter()
         .any(|(k, v)| k.eq_ignore_ascii_case("Content-Range")
             && v == &format!("bytes */{}", payload.len())));
+    assert!(headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("Content-Type") && v == "application/octet-stream"
+    }));
 
     // A client ETag that doesn't match the streamed md5 -> 422.
     let (status, _, _) = http(

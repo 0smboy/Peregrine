@@ -85,8 +85,21 @@ fn http(
     target: &str,
     body: &str,
 ) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    http_with_headers(addr, method, target, &[], body)
+}
+
+fn http_with_headers(
+    addr: std::net::SocketAddr,
+    method: &str,
+    target: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, Vec<(String, String)>, Vec<u8>) {
     let mut conn = std::net::TcpStream::connect(addr).unwrap();
     let mut req = format!("{method} {target} HTTP/1.1\r\nHost: t\r\n");
+    for (key, value) in headers {
+        req.push_str(&format!("{key}: {value}\r\n"));
+    }
     req.push_str(&format!(
         "Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -276,14 +289,23 @@ fn test_proxy_object_round_trip() {
     // PUT an object through the proxy: proxy -> object server -> writes
     // to disk and updates the container via the side channel
     let payload = b"the quick brown fox";
-    let (status, _) = body_http(
+    let (status, put_headers, _) = http_with_headers(
         proxy_addr,
         "PUT",
         "/v1/AUTH_full/docs/fox.txt",
         &[("Content-Type", "text/plain")],
-        payload,
+        std::str::from_utf8(payload).unwrap(),
     );
     assert_eq!(status, 201, "object PUT");
+    let put_etag = put_headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("Etag"))
+        .map(|(_, value)| value.as_str());
+    assert_eq!(
+        put_etag,
+        Some("30f3c93e46436deb58ba70816a8ec124"),
+        "client-facing PUT ETag must match Python's bare MD5"
+    );
 
     // A multipart PUT with null etag/size relies entirely on the internal
     // proxy HEAD. Both copies are intentional: the first segment is not the

@@ -1633,6 +1633,7 @@ impl ObjectServer {
                 let mut resp = Response::with_body(416, body.as_bytes().to_vec());
                 resp.headers
                     .set("Content-Range", format!("bytes */{obj_size}"));
+                resp.headers.set("Content-Type", &content_type);
                 resp.headers.set("Accept-Ranges", "bytes");
                 resp.headers.set("ETag", format!("\"{etag}\""));
                 resp.headers.set("Last-Modified", http_date(x_ts.ceil()));

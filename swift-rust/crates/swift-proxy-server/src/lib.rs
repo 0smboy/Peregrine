@@ -3434,6 +3434,12 @@ impl ProxyApp {
                     drop(_fan);
                     swift_core::stage::observe("proxy-server", "put", "quorum", 0.0);
                     swift_core::stage::observe("proxy-server", "put", "auth", 0.0);
+                    // The object server stores and returns an RFC-quoted ETag,
+                    // but Python's client-facing object PUT response exposes
+                    // the bare MD5 (the same normalization used by GET/HEAD).
+                    if let Some(etag) = resp.headers.get("ETag").map(str::to_string) {
+                        resp.headers.set("ETag", etag.trim_matches('"'));
+                    }
                     // obj.py:_store_object — every PUT answer (201 and 422
                     // alike) carries Last-Modified from the request timestamp.
                     resp.headers.set(
@@ -3894,6 +3900,7 @@ impl ProxyApp {
                 let mut resp = Response::with_body(416, body.as_bytes().to_vec());
                 resp.headers
                     .set("Content-Range", format!("bytes */{orig_size}"));
+                resp.headers.set("Content-Type", &content_type);
                 resp.headers.set("Accept-Ranges", "bytes");
                 if let Some(etag) =
                     resp_header(&meta, "ETag").or_else(|| resp_header(&meta, "Etag"))
