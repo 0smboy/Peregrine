@@ -3,20 +3,22 @@
 # Compares Python vs Rust endpoints with normalized headers.
 # Usage:
 #   PY=http://127.0.0.1:8090 RS=http://127.0.0.1:8081 \
-#   USER=test:tester KEY=azure-swift-2026.bench \
+#   ST_USER=test:tester ST_KEY=... \
 #   OUT=.../compat ./compat-diff.sh
 set -euo pipefail
+source "$(dirname "$0")/../../../swift-rust/tools/lib/lab-auth.sh"
+peregrine_load_lab_auth
 PY="${PY:-http://127.0.0.1:8090}"
 RS="${RS:-http://127.0.0.1:8081}"
-USER="${USER:-test:tester}"
-KEY="${KEY:-azure-swift-2026.bench}"
+AUTH_USER="${AUTH_USER:-$ST_USER}"
+KEY="${KEY:-$ST_KEY}"
 OUT="${OUT:-/tmp/fairness-compat}"
 mkdir -p "$OUT"
 
 auth() {
   local base=$1
   curl -sS -m 15 -D - -o /dev/null \
-    -H "X-Auth-User: $USER" -H "X-Auth-Key: $KEY" \
+    -H "X-Auth-User: $AUTH_USER" -H "X-Auth-Key: $KEY" \
     "$base/auth/v1.0" | awk 'tolower($1)=="x-auth-token:"{print $2}' | tr -d '\r'
 }
 

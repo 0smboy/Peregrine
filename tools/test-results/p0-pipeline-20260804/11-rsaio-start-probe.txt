@@ -39,7 +39,7 @@ drwxr-xr-x. 8 root root 125 Aug  4 05:09 ..
 /etc/rsaio/proxy-server.conf:pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth copy slo dlo proxy-server
 /etc/rsaio/proxy-server.conf:bind_ip = 10.0.0.3
 /etc/rsaio/proxy-server.conf:bind_port = 8081
-/etc/rsaio/proxy-server.conf:user_test_tester = azure-swift-2026.bench .admin
+/etc/rsaio/proxy-server.conf:user_test_tester = PEREGRINE_LAB_KEY_REQUIRED .admin
 /etc/rsaio/proxy-server.conf:user_admin_admin = admin .admin .reseller_admin
 --- prior start cmds from logs ---
 /etc/rsaio/account.ring.gz

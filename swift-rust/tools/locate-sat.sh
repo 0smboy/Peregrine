@@ -3,10 +3,12 @@
 # load and sample disk %util and per-service CPU on a backend node (swift2) and
 # the proxy/load node (swift1).
 set -u
+source "$(dirname "$0")/lib/lab-auth.sh"
+peregrine_load_lab_auth || exit $?
 K="-i /etc/swift/replication_key -o BatchMode=yes -o ConnectTimeout=8"
 echo "### starting sustained 4KB write load (4 containers, conc 64, 30000 objs)"
 source /root/work/pyswift-venv/bin/activate
-nohup python /root/work/cbench.py http://10.42.30.11:8085 test:tester azure-swift-2026.bench 4 64 30000 >/root/work/sat-load.log 2>&1 &
+nohup python /root/work/cbench.py http://10.42.30.11:8085 "$ST_USER" "$ST_KEY" 4 64 30000 >/root/work/sat-load.log 2>&1 &
 LOAD=$!
 sleep 4
 

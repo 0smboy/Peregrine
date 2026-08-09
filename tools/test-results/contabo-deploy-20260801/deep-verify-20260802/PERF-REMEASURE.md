@@ -2,7 +2,7 @@
 
 - **Client:** swift4 (not VIP MASTER)
 - **Target:** Keepalived VIP `http://10.0.0.10:8085`
-- **Auth:** `test:tester` / `azure-swift-2026.bench`
+- **Auth:** `test:tester` / `PEREGRINE_LAB_KEY_REQUIRED`
 - **Prod knobs:** workers=16, `container_update_mode=sync`, `fsync_on_close=true`, `reuse_port=false`
 - **Raw:** `cleanload-swift4/SUMMARY.json` (last rep per task log)
 

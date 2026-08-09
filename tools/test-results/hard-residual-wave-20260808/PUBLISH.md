@@ -1,5 +1,9 @@
 # Publish · hard residual wave · 2026-08-08
 
+> **Correction (2026-08-09):** the original KEEP rollup overstated several
+> unit-only surfaces. See [CORRECTION-20260809.md](CORRECTION-20260809.md) and
+> the current strict parity matrix before reusing these claims.
+
 | Channel | Value |
 |---------|--------|
 | Git tip | `028bc00` on `build/phase1-deploy-rs-lb` |

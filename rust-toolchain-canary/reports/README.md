@@ -8,6 +8,6 @@ On the cluster host, ensure toolchains exist:
 rustup install 1.96.1 1.97.0 1.97.1
 export SWIFT_AUTH_URL=http://10.42.30.10:8085/auth/v1.0
 export SWIFT_USER=test:tester
-export SWIFT_KEY=azure-swift-2026.bench
+export SWIFT_KEY="${ST_KEY:?load the operator-managed lab key first}"
 ./canary.sh
 ```

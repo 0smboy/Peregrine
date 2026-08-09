@@ -12,6 +12,8 @@
 #   SKIP_META_CHECK=1   skip META_DIRTY file probe (not recommended)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$ROOT/swift-rust/tools/lib/lab-auth.sh"
+peregrine_load_lab_auth
 EVID="${1:-$ROOT/tools/test-results/wave3-s3-l3b-prod-$(date -u +%Y%m%d)}"
 VIP="${VIP:-https://10.0.0.10:8085}"
 mkdir -p "$EVID"
@@ -70,8 +72,8 @@ if [[ "$META_BLOCK" -eq 1 ]]; then
 fi
 
 # --- TempAuth smoke (always; proves VIP alive) ---
-AUTH_USER="${AUTH_USER:-test:tester}"
-AUTH_KEY="${AUTH_KEY:-azure-swift-2026.bench}"
+AUTH_USER="${AUTH_USER:-$ST_USER}"
+AUTH_KEY="${AUTH_KEY:-$ST_KEY}"
 AUTH=$(curl -sS "${CURL_INSECURE[@]}" -D "$EVID/20-auth-headers.txt" -o /dev/null -w "%{http_code}" \
   -H "X-Auth-User: $AUTH_USER" -H "X-Auth-Key: $AUTH_KEY" \
   "$VIP/auth/v1.0" || echo "000")

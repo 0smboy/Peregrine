@@ -62,7 +62,7 @@ Keepalived VIP：`10.0.0.10`（优先级历史：swift1 MASTER 默认）。
 
 | 方式 | 用法 |
 |------|------|
-| TempAuth | 用户 `test:tester` / 密码 `azure-swift-2026.bench`（历史名）；account 常为 `AUTH_test` |
+| TempAuth | 用户 `test:tester`；密码已轮换并从 Git 删除；account 常为 `AUTH_test` |
 | Keystone | 项目/用户见 Contabo secrets；**Swift 账号路径是 `AUTH_<project_uuid>`**，不是字面 `AUTH_test`（对 `AUTH_test` 用 Keystone token 会 403，属预期） |
 | 共存 | Proxy `keystone_coexist`：TempAuth + `authtoken`/`keystoneauth` 同在；**勿再给无 identity 的请求盖 `X-Backend-Auth-Plugin: keystone`**（已修） |
 | S3 TempAuth | SigV4，access key 惯例 `account:user` |

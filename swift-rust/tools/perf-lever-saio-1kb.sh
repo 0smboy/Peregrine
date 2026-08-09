@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Phase0 SAIO gate: 1KB PUT @ c1 and c32, Rust(:8081) vs Python(:8090), 3× median.
 set -euo pipefail
+source "$(dirname "$0")/lib/lab-auth.sh"
+peregrine_load_lab_auth
 OUT=${OUT:-/root/contabo-deploy-20260801T125749Z/perf-levers/00-phase0-saio}
-USR=test:tester
-KEY=azure-swift-2026.bench
+USR=$ST_USER
+KEY=$ST_KEY
 WB=${WB:-/root/work/wbench.py}
 source /root/work/pyswift-venv/bin/activate
 mkdir -p "$OUT"

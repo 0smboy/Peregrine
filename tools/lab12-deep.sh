@@ -1,6 +1,8 @@
 #!/bin/bash
 # Contabo Lab12 deep harness — real dual Shadow, chaos×4, nodes last.
 set -uo pipefail
+source "$(dirname "$0")/../swift-rust/tools/lib/lab-auth.sh"
+peregrine_load_lab_auth || exit $?
 BASE=$(cat /tmp/contabo-out.txt 2>/dev/null || true)
 OUT=${OUT:-${BASE:+$BASE/lab12-deep}}
 OUT=${OUT:-/root/contabo-deploy-20260801T125749Z/lab12-deep}
@@ -11,8 +13,8 @@ echo "OUT=$OUT"
 CON=http://127.0.0.1:9000
 EP=http://10.0.0.1:8085
 VIP=http://10.0.0.10:8085
-USR=test:tester
-KEY=azure-swift-2026.bench
+USR=$ST_USER
+KEY=$ST_KEY
 TOOLS=/root/work/swift-rust/tools
 J=$OUT/session.jar
 rm -f "$J"

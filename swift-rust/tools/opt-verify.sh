@@ -1,9 +1,9 @@
 #!/bin/bash
 # Re-run the write tasks after raising object workers, to quantify the gain.
 set -u
+source "$(dirname "$0")/lib/lab-auth.sh"
+peregrine_load_lab_auth || exit $?
 export ST_AUTH=http://10.42.30.11:8085/auth/v1.0
-export ST_USER=test:tester
-export ST_KEY=azure-swift-2026.bench
 export ST_ENDPOINT=http://10.42.30.11:8085/v1/AUTH_test
 AUTOCOS=/root/work/autocos/target/release/autocos
 run() {

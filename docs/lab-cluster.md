@@ -57,7 +57,10 @@ nodes.
 
 ## Auth
 
-Harness credentials (unchanged): `test:tester` / `azure-swift-2026.bench`.
+Harness user: `test:tester`. The key is operator-managed and intentionally
+omitted from Git. On the Linux controller, store it in
+`/etc/swift/peregrine-lab.env` with mode `0600`; see
+[`swift-rust/tools/lab-auth.env.example`](../swift-rust/tools/lab-auth.env.example).
 
 ## Cutover / migration notes
 

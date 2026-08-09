@@ -41,6 +41,6 @@ trace_sample_ratio = 1.0
 
 [filter:tempauth]
 
-user_test_tester = azure-swift-2026.bench .admin
+user_test_tester = PEREGRINE_LAB_KEY_REQUIRED .admin
 
 

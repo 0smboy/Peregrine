@@ -50,7 +50,7 @@ every node.
 
 ## Auth
 
-Harness credentials: `test:tester` / `azure-swift-2026.bench` (key name is
+Harness credentials: `test:tester` / `PEREGRINE_LAB_KEY_REQUIRED` (key name is
 historical; cluster is Contabo).
 
 ## Build with erasure coding

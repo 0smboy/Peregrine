@@ -4,10 +4,10 @@
 5:[pipeline:main]
 6:pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
 38:[filter:tempauth]
-39:user_test_tester = azure-swift-2026.bench .admin
+39:user_test_tester = PEREGRINE_LAB_KEY_REQUIRED .admin
 68:[filter:authtoken]
 [filter:tempauth]
-user_test_tester = azure-swift-2026.bench .admin
+user_test_tester = PEREGRINE_LAB_KEY_REQUIRED .admin
 
 [filter:ratelimit]
 use = egg:swift#ratelimit

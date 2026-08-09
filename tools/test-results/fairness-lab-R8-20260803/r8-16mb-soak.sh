@@ -7,7 +7,7 @@ REPS=${REPS:-8}
 OC=${OC:-40}
 RT=${RT:-180}
 USER=test:tester
-KEY=azure-swift-2026.bench
+KEY=PEREGRINE_LAB_KEY_REQUIRED
 mkdir -p "$OUT/runs" "$OUT/logs" "$OUT/soak"
 echo "START $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee "$OUT/logs/runner.log"
 

@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Phase-2 chaos v2: create container first; inject on non-VIP backend.
 set -euo pipefail
+source "$(dirname "$0")/../../../swift-rust/tools/lib/lab-auth.sh"
+peregrine_load_lab_auth
 OUT="${OUT:-/tmp/phase2-20260804/chaos}"
 LB="${LB:-http://10.0.0.10:8085}"
-USR="${USR:-test:tester}"
-KEY="${KEY:-azure-swift-2026.bench}"
+USR="${USR:-$ST_USER}"
+KEY="${KEY:-$ST_KEY}"
 mkdir -p "$OUT"
 ssh_node() { ssh -o BatchMode=yes -o StrictHostKeyChecking=no "root@$1" "${@:2}"; }
 

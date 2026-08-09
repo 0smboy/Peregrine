@@ -3,6 +3,8 @@
 # Old and new VNets cannot talk; traffic relays through this Mac.
 set -Eeuo pipefail
 
+: "${ST_KEY:?set ST_KEY from an operator-managed secret before running migration smoke tests}"
+
 OLD=${OLD:-swift-old1}
 NEW=${NEW:-swift1}
 KEY_PUB=${KEY_PUB:-/Users/oboy/Documents/Codex/2026-07-25/b/work/ssh/id_ed25519.pub}
@@ -153,7 +155,7 @@ done
 
 log "auth smoke via new LB VIP from swift1"
 ssh_new 'curl -sS -m8 -D- -o /dev/null \
-  -H "X-Auth-User: test:tester" -H "X-Auth-Key: azure-swift-2026.bench" \
+  -H "X-Auth-User: test:tester" -H "X-Auth-Key: $ST_KEY" \
   http://10.42.30.10:8085/auth/v1.0 | head -20' || \
 ssh_new 'curl -sS -m8 -D- -o /dev/null \
   -H "X-Auth-User: test:tester" -H "X-Auth-Key: testing" \

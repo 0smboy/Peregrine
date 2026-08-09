@@ -67,9 +67,10 @@
 //! Other residuals (not claimable as implemented):
 //!
 //! * lifecycle tag / And filters
-//! * physical Glacier/tape via storage-policy map is claimable unit surface
-//!   ([`cold_tier`]); requires operator policy map conf
-//! * multi-tenant IAM policy engine ([`iam::IamService`]) + IdentityDirectory.
+//! * physical Glacier/tape routing is a library-only storage-policy map
+//!   ([`cold_tier`]); proxy configuration does not currently populate it
+//! * multi-tenant IAM policy evaluation ([`iam::IamService`]) and
+//!   IdentityDirectory are library-only until the proxy loads their config.
 //!   Grant headers + ACP
 //!   XML body store/GET round-trip **is** claimable (JSON sysmeta + container
 //!   AllUsers mapping); canned `x-amz-acl` still works and wins if both present.

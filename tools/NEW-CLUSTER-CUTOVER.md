@@ -10,7 +10,8 @@
 - SSH: `ssh swift1` … `swift4` (new). Old: `swift-old1` … `swift-old4`.
 - Public: `swift1` = `52.176.126.60`
 - API (node HAProxy): `http://<any-node>:8085` or Internal LB VIP `http://10.42.30.10:8085`
-- Auth: `test:tester` / `azure-swift-2026.bench`
+- Auth user: `test:tester`; inject the current key from the operator-managed
+  secret file, never from Git
 - Console (swift1 loopback): `ssh -L 9000:127.0.0.1:9000 swift1` → http://127.0.0.1:9000/
 
 ## Verified

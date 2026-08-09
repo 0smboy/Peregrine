@@ -12,7 +12,7 @@ for h in swift1 swift2 swift3 swift4; do ssh $h 'df -hP /srv/node/d1 /srv/node/d
 # need Use% << 70 and Avail >= 10G each
 
 # 2) META — listing must not be a ghost wall (W0′ done or operator waiver)
-ssh swift1 'TOKEN=$(curl -sS -D - -o /dev/null -H "X-Auth-User: test:tester" -H "X-Auth-Key: azure-swift-2026.bench" http://10.0.0.10:8085/auth/v1.0 | awk -F": " "tolower(\$1)==\"x-auth-token\"{print \$2}" | tr -d "\r"); curl -sS -H "X-Auth-Token: $TOKEN" http://10.0.0.10:8085/v1/AUTH_test | wc -l'
+ssh swift1 'TOKEN=$(curl -sS -D - -o /dev/null -H "X-Auth-User: test:tester" -H "X-Auth-Key: PEREGRINE_LAB_KEY_REQUIRED" http://10.0.0.10:8085/auth/v1.0 | awk -F": " "tolower(\$1)==\"x-auth-token\"{print \$2}" | tr -d "\r"); curl -sS -H "X-Auth-Token: $TOKEN" http://10.0.0.10:8085/v1/AUTH_test | wc -l'
 # expect near-zero ghosts, or signed residual
 
 # 3) No conflicting maintainers
@@ -105,7 +105,7 @@ python3 -m json.tool /etc/swift/object.ring.gz.builder.json | grep -E '"region"|
 
 ```bash
 scp Peregrine/swift-rust/tools/func-suite.sh swift1:/tmp/func-suite.sh
-ssh swift1 'bash /tmp/func-suite.sh http://10.0.0.10:8085 test:tester azure-swift-2026.bench vip-w2-spp'
+ssh swift1 'bash /tmp/func-suite.sh http://10.0.0.10:8085 test:tester PEREGRINE_LAB_KEY_REQUIRED vip-w2-spp'
 # need PASS=54 FAIL=0
 
 # spp smoke: PUT object, confirm process-per-port children

@@ -59,6 +59,9 @@ log_statsd_metric_prefix =
 interval = 30
 cleave_batch_size = 2
 auto_shard = false
+# Experimental same-host donor discovery only. Keep disabled until cross-node
+# quorum, crash recovery, and a sustained soak are proven for the target ring.
+auto_shrink = false
 log_statsd_host = 127.0.0.1
 log_statsd_port = 9125
 log_statsd_metric_prefix =

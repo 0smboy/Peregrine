@@ -6,9 +6,11 @@
 #   ec-heal-test.sh [EP] [user] [key]
 # Defaults: Contabo VIP http://10.0.0.10:8085 ; nodes 10.0.0.1–4
 set -u
+source "$(dirname "$0")/lib/lab-auth.sh"
 EP=${1:-http://10.0.0.10:8085}
 USR=${2:-test:tester}
-KEY=${3:-azure-swift-2026.bench}
+if [[ -z "${3:-}" ]]; then peregrine_load_lab_auth || exit $?; fi
+KEY=${3:-$ST_KEY}
 # Contabo storage/proxy plane node addresses (override with NODES="1 2 3 4" + NODE_FMT)
 NODE_FMT=${NODE_FMT:-10.0.0.%s}
 NODES=${NODES:-1 2 3 4}

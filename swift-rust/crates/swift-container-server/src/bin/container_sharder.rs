@@ -61,6 +61,12 @@ fn main() {
             .as_str(),
         "true" | "1" | "yes" | "on" | "t" | "y"
     );
+    let auto_shrink = matches!(
+        get("container-sharder", "auto_shrink", "false")
+            .to_lowercase()
+            .as_str(),
+        "true" | "1" | "yes" | "on" | "t" | "y"
+    );
     let shard_size: i64 = get("container-sharder", "shard_container_threshold", "1000000")
         .parse()
         .unwrap_or(1_000_000);
@@ -94,7 +100,7 @@ fn main() {
     let opts = SharderRunOpts {
         cleave_batch_size,
         auto_shard,
-        auto_shrink: true,
+        auto_shrink,
         shard_size,
         minimum_shard_size,
     };
@@ -125,6 +131,7 @@ fn main() {
     logger.info(&format!(
         "swift-container-sharder: devices={devices} interval={interval}s \
          cleave_batch_size={cleave_batch_size} auto_shard={auto_shard} \
+         auto_shrink={auto_shrink} \
          shard_size={shard_size} once={run_once_only} mode={mode} \
          (no Contabo KEEP claim without live quorum evidence)"
     ));

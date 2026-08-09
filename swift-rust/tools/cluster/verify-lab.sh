@@ -7,11 +7,13 @@
 # every claimed visual present in the served HTML rather than injected later by
 # JavaScript, and the cluster still intact underneath.
 set -u
+source "$(dirname "$0")/../lib/lab-auth.sh"
+peregrine_load_lab_auth || exit $?
 EP=http://127.0.0.1:9000
 J=/tmp/vlab.jar
 rm -f $J
 curl -s -m10 -c $J -o /dev/null -X POST \
-  -d 'tenant=test&user=tester&key=azure-swift-2026.bench' $EP/login
+  -d "tenant=test&user=tester&key=$ST_KEY" $EP/login
 
 get() { curl -s -m90 -b $J -b "sc_lang=$2" "$EP$1"; }
 code() { curl -s -m90 -b $J -b "sc_lang=$2" -o /dev/null -w '%{http_code}' "$EP$1"; }

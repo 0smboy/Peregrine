@@ -8,7 +8,7 @@
 /etc/swift/container-server.conf:63:internal_client_url = http://127.0.0.1:8080/v1
 /etc/swift/container-server.conf:64:internal_client_auth_url = http://127.0.0.1:8080/auth/v1.0
 /etc/swift/container-server.conf:65:internal_client_auth_user = test:tester
-/etc/swift/container-server.conf:66:internal_client_auth_key = azure-swift-2026.bench
+/etc/swift/container-server.conf:66:internal_client_auth_key = PEREGRINE_LAB_KEY_REQUIRED
 NO realms conf
 --- container-sync unit ---
 inactive

@@ -35,4 +35,4 @@ memcache_servers = 10.0.0.1:11211
 use = egg:swift#listing_formats
 
 [filter:tempauth]
-user_test_tester = azure-swift-2026.bench .admin
+user_test_tester = PEREGRINE_LAB_KEY_REQUIRED .admin

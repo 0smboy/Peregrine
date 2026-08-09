@@ -2753,7 +2753,7 @@ mod tests {
         h.set(SYSMETA_SLO_ETAG, "abcdef");
         let et = refetch_listing_slo_etag("o", "deadbeef-2", &h);
         assert_eq!(et.as_deref(), Some("abcdef"));
-        let mut h2 = HeaderKeyDict::new();
+        let h2 = HeaderKeyDict::new();
         assert!(refetch_listing_slo_etag("o", "plainmd5hash", &h2).is_none());
     }
 

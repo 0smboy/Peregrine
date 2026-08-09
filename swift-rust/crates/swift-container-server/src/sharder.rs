@@ -59,8 +59,9 @@
 //!    push / rsync of cleaved shard DBs remains open.
 //! 3. **Cross-node shrink over HTTP** — when the donor DB lives only on a
 //!    remote primary, this process skips (never fabricates empty donors).
-//!    Multi-device **same host** auto-shrink is KEEP (see
-//!    [`process_shrinking_donors`] + `auto_shrink`). Multi-hour soak harness:
+//!    Multi-device **same host** shrink has unit coverage (see
+//!    [`process_shrinking_donors`] + `auto_shrink`) but is disabled by default.
+//!    It is not a multi-primary product claim. Optional lab harness:
 //!    `tools/soak/multi-primary-shrink-soak.sh`.
 //! 4. WAN / async container-sync (wontfix).
 
@@ -1223,10 +1224,10 @@ pub struct SharderRunOpts {
     /// When true, unsharded containers with `object_count >= shard_size`
     /// are transitioned into SHARDING.
     pub auto_shard: bool,
-    /// When true (default), SHARDED roots run
+    /// When true, SHARDED roots run
     /// [`process_shrinking_donors`] for multi-primary/local multi-device
-    /// auto-shrink product path. Set false to skip shrink during soak
-    /// isolation tests.
+    /// auto-shrink. This is opt-in because cross-node donor discovery and
+    /// crash-safe handoff are not yet product-proven.
     pub auto_shrink: bool,
     pub shard_size: i64,
     pub minimum_shard_size: i64,
@@ -1237,7 +1238,7 @@ impl Default for SharderRunOpts {
         Self {
             cleave_batch_size: 2,
             auto_shard: false,
-            auto_shrink: true,
+            auto_shrink: false,
             shard_size: 1_000_000,
             minimum_shard_size: 100_000,
         }
@@ -2577,7 +2578,7 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_shrink_opt_default_true() {
-        assert!(SharderRunOpts::default().auto_shrink);
+    fn test_auto_shrink_opt_default_false() {
+        assert!(!SharderRunOpts::default().auto_shrink);
     }
 }

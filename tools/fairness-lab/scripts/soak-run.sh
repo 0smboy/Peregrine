@@ -2,6 +2,8 @@
 # P6: Soak at ~saturation-minus-20%. Default 6h; override SOAK_SECONDS.
 # Usage: ENTRY=ha SOAK_SECONDS=3600 ./soak-run.sh
 set -euo pipefail
+source "$(dirname "$0")/../../../swift-rust/tools/lib/lab-auth.sh"
+peregrine_load_lab_auth
 ENTRY="${ENTRY:-ha}"
 SOAK_SECONDS="${SOAK_SECONDS:-21600}"
 TASK="${TASK:-4KB_write_128}"
@@ -14,8 +16,6 @@ else
   export ST_AUTH="http://10.0.0.1:8085/auth/v1.0"
   LABEL=DIRECT-4PROXY
 fi
-export ST_USER="${ST_USER:-test:tester}"
-export ST_KEY="${ST_KEY:-azure-swift-2026.bench}"
 export ST_ENDPOINT="${ST_AUTH%/auth/v1.0}/v1/AUTH_test"
 
 cat >"$OUT/manifest.yml" <<EOF

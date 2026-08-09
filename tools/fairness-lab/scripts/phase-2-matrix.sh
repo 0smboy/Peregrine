@@ -2,10 +2,12 @@
 # Phase-2 Rust-only matrix: VIP vs DIRECT (single entry) — separate tables, no win/lose mix.
 # Client: swift1. Disk-safe: modest object_count on large sizes (nodes ~90% full).
 set -euo pipefail
+source "$(dirname "$0")/../../../swift-rust/tools/lib/lab-auth.sh"
+peregrine_load_lab_auth
 
 OUT="${OUT:-/tmp/phase2-20260804}"
-USR="${ST_USER:-test:tester}"
-KEY="${ST_KEY:-azure-swift-2026.bench}"
+USR="$ST_USER"
+KEY="$ST_KEY"
 RUNTIME_SMALL="${RUNTIME_SMALL:-45}"
 RUNTIME_1MB="${RUNTIME_1MB:-45}"
 RUNTIME_16MB="${RUNTIME_16MB:-90}"

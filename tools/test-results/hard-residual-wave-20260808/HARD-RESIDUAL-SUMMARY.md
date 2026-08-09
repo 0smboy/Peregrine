@@ -1,5 +1,10 @@
 # Hard residual wave 2026-08-08 — LAB-HARD-GREEN
 
+> **Superseded claim boundary (2026-08-09):** this wave proves library/unit
+> surfaces. It does not prove arbitrary plugin loading, runtime-configured IAM,
+> physical cold-tier routing, eventlet serving semantics, or production-safe
+> multi-primary auto-shrink. See [CORRECTION-20260809.md](CORRECTION-20260809.md).
+
 Scope: items **1,2,3,4,6,10** (excluded 5 KMIP, 7 multi-cluster soak, 8 Operator PEM, 9 Ansible twin).
 
 | # | Item | Verdict | Evidence |

@@ -26,7 +26,7 @@
 <table>
 <tr><th>动作</th><th>环境</th><th>为什么</th><th>效果</th></tr>
 <tr><td>核实 1A 布局</td><td>swift1/4 CLEAN；swift2 Py :8090；swift3 Rs :8081</td><td>1B 建立在 1A 上</td><td class="ok">布局未漂移</td></tr>
-<tr><td>func-suite 双侧</td><td>凭据 test:tester / azure-swift-2026.bench</td><td>已实现子集核心路径</td><td class="ok">Py 54/0；Rs 54/0</td></tr>
+<tr><td>func-suite 双侧</td><td>凭据 test:tester / PEREGRINE_LAB_KEY_REQUIRED</td><td>已实现子集核心路径</td><td class="ok">Py 54/0；Rs 54/0</td></tr>
 <tr><td>/info 对比</td><td>两侧 endpoint</td><td>能力广告诚实</td><td class="ok">共有 slo/swift/tempauth；Rs 多报 dlo；均未报 bulk/tempurl</td></tr>
 <tr><td>缺口探针</td><td>bulk / account-ACL / versions-location / healthcheck</td><td>区分「未实现」与 FAIL</td><td class="warn">见缺口表（非套件 FAIL）</td></tr>
 <tr><td>Python 管道</td><td>cache + listing_formats（tempauth 硬依赖 memcache）</td><td>可认证最小集</td><td class="warn">多出 cache/proxy-logging/listing_formats — Rust 跳过</td></tr>

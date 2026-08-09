@@ -375,6 +375,7 @@ fn encrypt_value_with_meta(
     Ok((enc, meta))
 }
 
+#[cfg(test)]
 fn md5_hex(data: &[u8]) -> String {
     let mut h = Md5::new();
     h.update(data);

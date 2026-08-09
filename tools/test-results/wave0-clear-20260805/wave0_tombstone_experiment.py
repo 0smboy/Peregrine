@@ -13,7 +13,7 @@ import urllib.request
 
 AUTH_URL = os.environ.get("SWIFT_AUTH_URL", "http://10.0.0.10:8085/auth/v1.0")
 USER = os.environ.get("ST_USER", "test:tester")
-KEY = os.environ.get("ST_KEY", "azure-swift-2026.bench")
+KEY = os.environ.get("ST_KEY", "PEREGRINE_LAB_KEY_REQUIRED")
 CONTAINER = os.environ.get("WAVE0_TS_CONTAINER", "wave0-tombstone-lab")
 N = int(os.environ.get("WAVE0_TS_OBJECTS", "200"))
 BODY = b"wave0-tombstone-payload-" + (b"x" * 256)

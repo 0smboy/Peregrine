@@ -36,7 +36,7 @@
 use swift_core::config::config_true_value;
 use swift_core::constraints::check_container_format;
 use swift_core::timestamp::Timestamp;
-use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+use swift_http::{split_path, Body, Request, Response, MAX_CONTROL_BODY};
 
 use crate::{Middleware, NextFn};
 
@@ -587,6 +587,7 @@ impl Middleware for VersionedWrites {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    use swift_http::HeaderKeyDict;
 
     #[test]
     fn test_versions_object_name_format() {

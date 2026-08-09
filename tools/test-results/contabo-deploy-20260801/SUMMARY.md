@@ -1,7 +1,7 @@
 # Contabo Swift full deploy — SUMMARY (2026-08-01)
 
 - **Deploy verdict:** ACCEPT
-- **Cluster:** Contabo 4-node greenfield; VIP `10.0.0.10:8085`; auth `test:tester` / `azure-swift-2026.bench`
+- **Cluster:** Contabo 4-node greenfield; VIP `10.0.0.10:8085`; auth `test:tester` / `PEREGRINE_LAB_KEY_REQUIRED`
 - **Cutover doc:** [`CONTABO-CLUSTER.md`](../../CONTABO-CLUSTER.md)
 - **On-host evidence:** `/root/contabo-deploy-20260801T125749Z/`
 

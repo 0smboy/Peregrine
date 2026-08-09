@@ -7,7 +7,7 @@ allowed_sync_hosts = 127.0.0.1,localhost
 internal_client_url = http://127.0.0.1:8080/v1
 internal_client_auth_url = http://127.0.0.1:8080/auth/v1.0
 internal_client_auth_user = test:tester
-internal_client_auth_key = azure-swift-2026.bench
+internal_client_auth_key = PEREGRINE_LAB_KEY_REQUIRED
 === which tables on root DBs (schema) ===
 76c9fdade2ec5b7a703159d5e3ed902f_1786029685.60302.db tables= ['outgoing_sync', 'incoming_sync', 'object', 'sqlite_sequence', 'policy_stat', 'container_info', 'shard_range'] n= 7
   container_stat cols ['account', 'container', 'created_at', 'put_timestamp', 'delete_timestamp', 'reported_put_timestamp', 'reported_delete_timestamp', 'reported_object_count', 'reported_bytes_used', 'hash', 'id', 'status', 'status_changed_at', 'metadata', 'x_container_sync_point1', 'x_container_sync_point2', 'reconciler_sync_point', 'storage_policy_index', 'object_count', 'bytes_used']

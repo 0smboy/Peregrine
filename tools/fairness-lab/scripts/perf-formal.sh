@@ -6,6 +6,8 @@
 #   ENTRY=direct IMPL=rust PROFILE=data-path TRACK=ISO-CONFIG \
 #     OUT=.../runs ./perf-formal.sh 4KB_write_128
 set -euo pipefail
+source "$(dirname "$0")/../../../swift-rust/tools/lib/lab-auth.sh"
+peregrine_load_lab_auth
 ENTRY="${ENTRY:-direct}"          # direct | ha
 IMPL="${IMPL:-rust}"              # rust | python
 PROFILE="${PROFILE:-data-path}"   # data-path | production-complete
@@ -37,8 +39,8 @@ case "$ENTRY" in
   *) echo "ENTRY must be direct|ha"; exit 2 ;;
 esac
 
-USER="${ST_USER:-test:tester}"
-KEY="${ST_KEY:-azure-swift-2026.bench}"
+AUTH_USER="$ST_USER"
+KEY="$ST_KEY"
 AUTOCOS="${AUTOCOS:-autocos}"
 
 MANIFEST="$OUT/manifest.yml"
@@ -58,7 +60,7 @@ note: >
   A single invocation runs REPS for one IMPL/ENTRY/PROFILE cell.
 EOF
 
-export ST_AUTH ST_USER="$USER" ST_KEY="$KEY"
+export ST_AUTH ST_USER="$AUTH_USER" ST_KEY="$KEY"
 export ST_ENDPOINT="${ST_AUTH%/auth/v1.0}/v1/AUTH_test"
 
 if ! command -v "$AUTOCOS" >/dev/null 2>&1; then

@@ -7,10 +7,12 @@
 #   ha-test.sh [LB_BASE] [user] [key]
 # Defaults: Contabo VIP http://10.0.0.10:8085
 set -u
+source "$(dirname "$0")/lib/lab-auth.sh"
 CON=${CON:-http://127.0.0.1:9000}
 LB=${1:-http://10.0.0.10:8085}
 USR=${2:-test:tester}
-KEY=${3:-azure-swift-2026.bench}
+if [[ -z "${3:-}" ]]; then peregrine_load_lab_auth || exit $?; fi
+KEY=${3:-$ST_KEY}
 DOWN_NODE=${DOWN_NODE:-swift2}
 J=/tmp/ha.jar; rm -f "$J"
 

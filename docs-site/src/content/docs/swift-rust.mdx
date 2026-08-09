@@ -1,15 +1,16 @@
 ---
 title: swift-rust
-description: The storage engine — a 17-crate Rust rewrite of OpenStack Swift, byte-compatible with Python on the wire and on disk.
+description: The 15-crate storage engine, with compatibility claims scoped to tested OpenStack Swift paths.
 sidebar:
   order: 10
 ---
 
 `swift-rust` is the storage engine: the proxy, object, container and account
 servers, every consistency daemon, erasure coding, the ring, the SQLite
-backends, and the middleware pipeline — a 17-crate Rust workspace. It is a
-*strangler* of Python Swift: because every format is byte-compatible, a Rust
-binary can join a live Python cluster and be validated one component at a time.
+backends, and the middleware pipeline: a 15-crate Rust workspace. It targets a
+*strangler* migration model, but only formats and paths with explicit golden or
+live evidence are claimable as compatible. It is not a general production
+drop-in replacement.
 
 ## The data path
 

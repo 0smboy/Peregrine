@@ -30,6 +30,10 @@ pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_forma
 bind_ip = 0.0.0.0
 bind_port = {{ proxy_bind_port }}
 account_autocreate = true
+# Fail closed if a configured filter has no Rust implementation. A deliberate
+# no-op requires both strict_pipeline=false and plugin_default=passthrough.
+strict_pipeline = true
+plugin_default = skip
 {% if use_lb %}
 storage_url = http://{{ auth_url_ip }}:{{ swift_lb_port }}
 {% else %}

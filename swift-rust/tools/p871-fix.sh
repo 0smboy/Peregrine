@@ -5,9 +5,11 @@
 # nodes, superseding the stale data everywhere; the reconstructor then stops
 # trying to revert a tombstoned partition.
 set -u
+source "$(dirname "$0")/lib/lab-auth.sh"
+peregrine_load_lab_auth || exit $?
 EP=http://10.42.30.11:8085
 K="-i /etc/swift/replication_key -o BatchMode=yes -o ConnectTimeout=8"
-TOK=$(curl -s -m10 -D - -o /dev/null -H "X-Auth-User: test:tester" -H "X-Auth-Key: azure-swift-2026.bench" "$EP/auth/v1.0" | awk 'tolower($1)=="x-auth-token:"{print $2}' | tr -d '\r')
+TOK=$(curl -s -m10 -D - -o /dev/null -H "X-Auth-User: $ST_USER" -H "X-Auth-Key: $ST_KEY" "$EP/auth/v1.0" | awk 'tolower($1)=="x-auth-token:"{print $2}' | tr -d '\r')
 B="$EP/v1/AUTH_test"
 
 echo "### container listing (find the deleted/debris object)"

@@ -6,6 +6,8 @@
 # source, NOT the stale deployed ones) and builds rings with the Python
 # ring-builder (ring .gz is byte-compatible) but at the Rust-SAIO ports.
 set -u
+source "$(dirname "$0")/lib/lab-auth.sh"
+peregrine_load_lab_auth || exit $?
 RBLD=/root/work/swift-rust/target/release          # current-source binaries
 PYBIN=/root/work/pyswift-venv/bin                  # for swift-ring-builder
 ETC=/etc/rsaio
@@ -43,7 +45,7 @@ account_autocreate = true
 storage_url = http://127.0.0.1:8081
 
 [filter:tempauth]
-user_test_tester = azure-swift-2026.bench .admin
+user_test_tester = $ST_KEY .admin
 user_admin_admin = admin .admin .reseller_admin
 EOF
 
@@ -87,6 +89,6 @@ for p in 6320 6321 6322 8081; do
   printf "  :%s /healthcheck -> %s\n" "$p" "$(curl -s -m5 -o /dev/null -w '%{http_code}' http://127.0.0.1:$p/healthcheck)"
 done
 echo "### auth smoke"
-curl -s -m10 -D - -o /dev/null -H "X-Auth-User: test:tester" -H "X-Auth-Key: azure-swift-2026.bench" \
+curl -s -m10 -D - -o /dev/null -H "X-Auth-User: $ST_USER" -H "X-Auth-Key: $ST_KEY" \
   http://127.0.0.1:8081/auth/v1.0 | grep -iE 'x-auth-token|x-storage-url' | sed 's/^/  /'
 echo "RUST-SAIO-SETUP-DONE"

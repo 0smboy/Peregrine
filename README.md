@@ -1,15 +1,14 @@
 # Peregrine
 
-A production object-storage platform: a ground-up **Rust rewrite of OpenStack
-Swift** together with everything needed to deploy it, drive it, and prove it —
-the storage engine, a Python-free deployer, a load generator, a benchmark
-automation harness, and a web console, in one repository.
+A Rust-first object-storage engineering platform built around a ground-up
+**Rust rewrite of OpenStack Swift**, together with a deployer, load generator,
+benchmark harness, and web console in one repository.
 
-Every on-disk and on-the-wire format is **byte-for-byte compatible** with
-Python Swift, so a Peregrine binary can be dropped onto a node in a live Python
-cluster and validated one component at a time. Format fidelity is the design
-constraint; the parity is proven against the real Python implementation as a
-golden oracle.
+Peregrine targets byte compatibility with Python Swift on the implemented,
+explicitly tested formats and request paths. It is an advanced lab system, not
+a feature-complete Swift twin or a production drop-in replacement. The strict
+[parity matrix](docs/fairness-lab/RUST-VS-PYTHON-PARITY.md) is the authority
+for what is currently claimable.
 
 **Documentation: <https://peregrine-docs-ochre.vercel.app>** — built with
 [Nimbus](https://nimbus-docs.com/) (agent-native: every page has a markdown
@@ -22,7 +21,7 @@ Source in [`docs-site/`](docs-site/).
 
 | Directory | What it is | Language | Status |
 |-----------|-----------|----------|--------|
-| [`swift-rust/`](swift-rust/) | The storage engine — proxy, object, container, account servers, all consistency daemons, erasure coding, the ring, the SQLite backends, the middleware pipeline. A 17-crate workspace. | Rust | Feature-complete data path; 946 workspace tests; runs a live 4-node cluster. |
+| [`swift-rust/`](swift-rust/) | The storage engine: proxy, object, container, account servers, consistency daemons, erasure coding, the ring, SQLite backends, and middleware. A 15-crate workspace. | Rust | Advanced core paths with unit and four-node lab evidence; strict residuals remain. |
 | [`swift-deploy-rs/`](swift-deploy-rs/) | A bounded, Python-free deployer. Executes the upstream Swift Ansible v3 plan natively — no Ansible, no `ansible-playbook` — with sealed, re-verified plans and per-action authorization for destructive steps. Ships its own web control console. | Rust | Covers v3's 57 task/handler files, 413 leaf tasks, 28 modules. |
 | [`cosbench-rs/`](cosbench-rs/) | A Rust rewrite of Intel's COSBench core: an S3/Swift load generator with prepare/main/cleanup workloads, hash-integrity checks, and JSON/CSV reports. | Rust | mock / S3 / Swift drivers, Keystone v3. |
 | [`autocos/`](autocos/) | Benchmark automation over `cosbench-rs`: submit workloads, track progress, list, collect, and archive results. | Rust | `run` / `list` / `remove` / `collect`. |
@@ -111,7 +110,7 @@ A one-command single-host cluster (SAIO) lives in
 
 ```
 Peregrine/
-├── swift-rust/         the storage engine (17-crate Rust workspace)
+├── swift-rust/         the storage engine (15-crate Rust workspace)
 ├── swift-deploy-rs/    Python-free native deployer + control console
 ├── cosbench-rs/        COSBench-compatible S3/Swift load generator
 ├── autocos/            benchmark automation over cosbench-rs

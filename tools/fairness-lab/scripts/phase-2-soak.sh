@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Phase-2 soak ≥1h via VIP, chunked 4KB write windows. Disk-aware object_count.
 set -euo pipefail
+source "$(dirname "$0")/../../../swift-rust/tools/lib/lab-auth.sh"
+peregrine_load_lab_auth
 OUT="${OUT:-/tmp/phase2-20260804/soak}"
 SOAK_SECONDS="${SOAK_SECONDS:-3600}"
 CHUNK="${CHUNK:-600}"
-USR="${ST_USER:-test:tester}"
-KEY="${ST_KEY:-azure-swift-2026.bench}"
+USR="$ST_USER"
+KEY="$ST_KEY"
 mkdir -p "$OUT"
 export ST_AUTH="http://10.0.0.10:8085/auth/v1.0" ST_USER="$USR" ST_KEY="$KEY"
 export ST_ENDPOINT="http://10.0.0.10:8085/v1/AUTH_test"

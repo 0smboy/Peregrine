@@ -2,6 +2,8 @@
 # Full swift-console functional test: login, every page, every read API, Files
 # CRUD, and the new node-down status. Run on the console host (loopback :9000).
 set -u
+source "$(dirname "$0")/lib/lab-auth.sh"
+peregrine_load_lab_auth || exit $?
 BASE=http://127.0.0.1:9000
 J=/tmp/sc.jar; rm -f "$J"
 PASS=0; FAIL=0; FAILED=()
@@ -12,7 +14,7 @@ ckc(){ local got; got=$(code "${@:3}"); [ "$got" = "$2" ] && ok "$1" || bad "$1"
 jget(){ curl -s -m30 -b "$J" "$@"; }
 
 echo "===== LOGIN ====="
-lc=$(code -X POST -d 'tenant=test&user=tester&key=azure-swift-2026.bench' "$BASE/login")
+lc=$(code -X POST -d "tenant=test&user=tester&key=$ST_KEY" "$BASE/login")
 { [ "$lc" = 303 ] || [ "$lc" = 302 ] || [ "$lc" = 200 ]; } && ok "login ($lc)" || { bad "login" "code $lc"; exit 1; }
 
 echo "===== PAGES (want 200) ====="

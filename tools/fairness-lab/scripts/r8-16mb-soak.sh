@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # R8: retune 16MB_read (object_count=40, runtime=180) DIRECT+HA ≥8 measured, then 6h soak.
 set -euo pipefail
+source "$(dirname "$0")/../../../swift-rust/tools/lib/lab-auth.sh"
+peregrine_load_lab_auth
 OUT=${OUT:-/tmp/fairness-R8}
 WARMUP=${WARMUP:-2}
 REPS=${REPS:-8}
 OC=${OC:-40}
 RT=${RT:-180}
-USER=test:tester
-KEY=azure-swift-2026.bench
+AUTH_USER=$ST_USER
+KEY=$ST_KEY
 mkdir -p "$OUT/runs" "$OUT/logs" "$OUT/soak"
 echo "START $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee "$OUT/logs/runner.log"
 
@@ -44,7 +46,7 @@ run_entry() {
   for i in $(seq 1 "$WARMUP"); do
     ep="${eps[$((epi % ${#eps[@]}))]}"
     epi=$((epi + 1))
-    export ST_AUTH="${ep}/auth/v1.0" ST_USER="$USER" ST_KEY="$KEY" ST_ENDPOINT="${ep}/v1/AUTH_test"
+    export ST_AUTH="${ep}/auth/v1.0" ST_USER="$AUTH_USER" ST_KEY="$KEY" ST_ENDPOINT="${ep}/v1/AUTH_test"
     log="$cell_dir/warmup-${i}.log"
     echo "RUN warmup $i ep=$ep $(date -u +%H:%M:%SZ)" | tee -a "$OUT/logs/runner.log"
     set +e
@@ -55,7 +57,7 @@ run_entry() {
   for i in $(seq 1 "$REPS"); do
     ep="${eps[$((epi % ${#eps[@]}))]}"
     epi=$((epi + 1))
-    export ST_AUTH="${ep}/auth/v1.0" ST_USER="$USER" ST_KEY="$KEY" ST_ENDPOINT="${ep}/v1/AUTH_test"
+    export ST_AUTH="${ep}/auth/v1.0" ST_USER="$AUTH_USER" ST_KEY="$KEY" ST_ENDPOINT="${ep}/v1/AUTH_test"
     log="$cell_dir/measured-${i}.log"
     echo "RUN measured $i ep=$ep $(date -u +%H:%M:%SZ)" | tee -a "$OUT/logs/runner.log"
     set +e

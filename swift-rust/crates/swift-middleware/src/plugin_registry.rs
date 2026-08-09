@@ -3,16 +3,16 @@
 //!
 //! Python Swift loads third-party middleware via Paste Deploy entry points
 //! (`egg:pkg#filter`). Rust cannot load arbitrary Python eggs; this module
-//! provides the **product surface** for unlimited filter names:
+//! provides an explicit registry for Rust-native filter factories:
 //!
 //! 1. **Built-in factories** — registered by name at startup.
 //! 2. **Conf map** — `[filter:name] use = paste.passthrough` or
 //!    `plugin = named_passthrough` / custom registered factory.
-//! 3. **Default for unknown pipeline names** — [`NamedPassthrough`] so any
-//!    third-party name is a claimable slot (never silently skipped when
-//!    `plugin_default = passthrough`).
+//! 3. **Optional passthrough** — [`NamedPassthrough`] is available only when
+//!    an operator explicitly selects `plugin_default = passthrough`.
 //!
 //! Operators register in-process factories via [`PluginRegistry::register`].
+//! This does not load Python eggs, shared libraries, or WASM modules.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -33,7 +33,8 @@ pub struct PluginRegistry {
 impl PluginRegistry {
     pub fn new() -> Self {
         let reg = Self::default();
-        // Built-in: named passthrough for any claimable third-party slot.
+        // Explicit no-op factories. They never stand in for an unknown plugin
+        // unless the operator opts into passthrough behavior.
         reg.register(
             "paste.passthrough",
             Arc::new(|name, _| Arc::new(NamedPassthrough::new(name)) as Arc<dyn Middleware>),
@@ -83,7 +84,7 @@ impl PluginRegistry {
                 let mw = factory(name, conf_items);
                 return Some((mw, format!("plugin '{name}' via use={use_key}")));
             }
-            // Unknown use= — still claimable passthrough if default on.
+            // Unknown use= may become an explicit no-op only when opted in.
             if default_passthrough {
                 return Some((
                     Arc::new(NamedPassthrough::new(name)),

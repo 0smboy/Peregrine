@@ -5,7 +5,7 @@
 # Usage:
 #   ST_ENDPOINT=http://10.0.0.1:8085/v1/AUTH_test \
 #   ST_AUTH=http://10.0.0.1:8085/auth/v1.0 \
-#   ST_USER=test:tester ST_KEY=azure-swift-2026.bench \
+#   ST_USER=test:tester ST_KEY="$(load-from-operator-secret)" \
 #   OUT=/path/to/dir LABEL=phase0-baseline \
 #   bash perf-lever-ab.sh 4KB_write_128 4000 1 60 3
 #

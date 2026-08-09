@@ -1,7 +1,9 @@
 #!/bin/bash
 set -u
+source "$(dirname "$0")/lib/lab-auth.sh"
+peregrine_load_lab_auth || exit $?
 LB=${LB:-http://10.0.0.10:8085}
-A=$(curl -s -m10 -D - -o /dev/null -H "X-Auth-User: test:tester" -H "X-Auth-Key: azure-swift-2026.bench" "$LB/auth/v1.0")
+A=$(curl -s -m10 -D - -o /dev/null -H "X-Auth-User: $ST_USER" -H "X-Auth-Key: $ST_KEY" "$LB/auth/v1.0")
 TOK=$(printf '%s' "$A" | awk 'tolower($1)=="x-auth-token:"{print $2}' | tr -d '\r')
 echo "token=${TOK:0:16}..."
 B="$LB/v1/AUTH_test"

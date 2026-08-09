@@ -6,7 +6,7 @@ conf=/etc/swift/proxy-server.conf
 [pipeline:main]
 pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
 bind_port = 8080
-user_test_tester = azure-swift-2026.bench .admin
+user_test_tester = PEREGRINE_LAB_KEY_REQUIRED .admin
 active
 inactive
 vip_info=200

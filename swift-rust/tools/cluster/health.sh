@@ -50,7 +50,13 @@ for n in 11 12 13 14; do
 done
 
 echo "ACCOUNTING (account rollup vs container truth)"
-TOK=$(curl -si -m15 -H "X-Auth-User: test:tester" -H "X-Auth-Key: azure-swift-2026.bench" "$EP/auth/v1.0" 2>/dev/null | tr -d '\r' | awk 'tolower($1)=="x-auth-token:"{print $2}')
+source "$(dirname "$0")/../lib/lab-auth.sh"
+if ! peregrine_load_lab_auth; then
+  echo "  UNKNOWN (lab credential unavailable)"
+  TOK=""
+else
+  TOK=$(curl -si -m15 -H "X-Auth-User: $ST_USER" -H "X-Auth-Key: $ST_KEY" "$EP/auth/v1.0" 2>/dev/null | tr -d '\r' | awk 'tolower($1)=="x-auth-token:"{print $2}')
+fi
 if [ -z "$TOK" ]; then
   echo "  UNKNOWN (auth failed against $EP)"
 else

@@ -12,7 +12,7 @@
 //! * **cooperative yield** — [`cooperative_yield`] / [`GreenthreadPool`] with
 //!   explicit yield counters for bit-level semantic tests
 //!
-//! # Bit-identical semantics (product KEEP for unit surface)
+//! # Lab-only scheduling model
 //!
 //! | Eventlet concept        | Rust parity                              |
 //! |-------------------------|------------------------------------------|
@@ -23,14 +23,18 @@
 //! | greenthread local       | [`GreenLocal`] thread_local-like map     |
 //! | `tpool.execute`         | same pool (blocking section)             |
 //!
-//! Full CPython eventlet bytecode identity is impossible; this module makes
-//! the **observable scheduling contract** testable and stable.
+//! Full CPython eventlet bytecode identity is impossible. This module provides
+//! a testable OS-thread model only; the HTTP serving path does not currently
+//! construct this pool or use this concurrency calculation.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+type JobQueue = Arc<(Mutex<VecDeque<Job>>, Condvar)>;
 
 /// Global cooperative yield counter (tests assert yield frequency).
 static YIELD_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -127,7 +131,7 @@ pub fn compute_concurrency(
 /// Greenthread-like pool: bounded worker threads executing spawn'd jobs
 /// cooperatively (each job may call [`cooperative_yield`]).
 pub struct GreenthreadPool {
-    jobs: Arc<(Mutex<VecDeque<Box<dyn FnOnce() + Send>>>, Condvar)>,
+    jobs: JobQueue,
     shutdown: Arc<Mutex<bool>>,
     handles: Vec<thread::JoinHandle<()>>,
 }
@@ -135,8 +139,7 @@ pub struct GreenthreadPool {
 impl GreenthreadPool {
     pub fn new(size: usize) -> Self {
         let size = size.clamp(1, WORKER_THREADS_CAP);
-        let jobs: Arc<(Mutex<VecDeque<Box<dyn FnOnce() + Send>>>, Condvar)> =
-            Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+        let jobs: JobQueue = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
         let shutdown = Arc::new(Mutex::new(false));
         let mut handles = Vec::with_capacity(size);
         for _ in 0..size {

@@ -2,6 +2,8 @@
 # Clean A/B of object-server worker count on the Rust SAIO (:8081), no Loki, no
 # load-host confound. 4KB writes, conc 64, across 4 containers.
 set -u
+source "$(dirname "$0")/lib/lab-auth.sh"
+peregrine_load_lab_auth || exit $?
 ETC=/etc/rsaio
 RBLD=/root/work/swift-rust/target/release
 EP=http://127.0.0.1:8081
@@ -15,7 +17,7 @@ restart_obj(){
 for W in 2 16 64; do
   set_workers "$W"; restart_obj
   printf 'object workers=%-3s: ' "$W"
-  python /root/work/wbench.py "$EP" test:tester azure-swift-2026.bench 4 64 6000 4096
+  python /root/work/wbench.py "$EP" "$ST_USER" "$ST_KEY" 4 64 6000 4096
 done
 set_workers 2; restart_obj   # leave SAIO at its baseline
 echo SAIO-WORKER-AB-DONE

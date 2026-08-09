@@ -56,7 +56,7 @@ RING_PARSE_FAIL ModuleNotFoundError No module named 'swift'
 ## sample account listing (meta dirtiness hint)
 pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server
 account_autocreate = true
-user_test_tester = azure-swift-2026.bench .admin
+user_test_tester = PEREGRINE_LAB_KEY_REQUIRED .admin
 account_ratelimit = 200
 [filter:account_quotas]
 use = egg:swift#account_quotas
@@ -118,7 +118,7 @@ RING_PARSE_FAIL ModuleNotFoundError No module named 'swift'
 ## sample account listing (meta dirtiness hint)
 pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server
 account_autocreate = true
-user_test_tester = azure-swift-2026.bench .admin
+user_test_tester = PEREGRINE_LAB_KEY_REQUIRED .admin
 account_ratelimit = 200
 [filter:account_quotas]
 use = egg:swift#account_quotas
@@ -180,7 +180,7 @@ RING_PARSE_FAIL ModuleNotFoundError No module named 'swift'
 ## sample account listing (meta dirtiness hint)
 pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server
 account_autocreate = true
-user_test_tester = azure-swift-2026.bench .admin
+user_test_tester = PEREGRINE_LAB_KEY_REQUIRED .admin
 account_ratelimit = 200
 [filter:account_quotas]
 use = egg:swift#account_quotas
@@ -244,7 +244,7 @@ RING_PARSE_FAIL ModuleNotFoundError No module named 'swift'
 ## sample account listing (meta dirtiness hint)
 pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes tempauth copy slo dlo proxy-logging proxy-server
 account_autocreate = true
-user_test_tester = azure-swift-2026.bench .admin
+user_test_tester = PEREGRINE_LAB_KEY_REQUIRED .admin
 account_ratelimit = 200
 [filter:account_quotas]
 use = egg:swift#account_quotas

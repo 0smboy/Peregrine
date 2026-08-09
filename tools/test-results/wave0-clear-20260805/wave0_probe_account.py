@@ -6,7 +6,7 @@ import urllib.request
 
 AUTH = os.environ.get("SWIFT_AUTH_URL", "http://10.0.0.10:8085/auth/v1.0")
 USER = os.environ.get("ST_USER", "test:tester")
-KEY = os.environ.get("ST_KEY", "azure-swift-2026.bench")
+KEY = os.environ.get("ST_KEY", "PEREGRINE_LAB_KEY_REQUIRED")
 
 req = urllib.request.Request(
     AUTH, headers={"X-Auth-User": USER, "X-Auth-Key": KEY}

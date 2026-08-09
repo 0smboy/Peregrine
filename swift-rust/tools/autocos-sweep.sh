@@ -9,10 +9,10 @@
 # Host sysctl (persistent on load node): /etc/sysctl.d/99-swift-bench.conf
 #   ip_local_port_range=1024 65535, tcp_tw_reuse=1, tcp_fin_timeout=15
 set -u
+source "$(dirname "$0")/lib/lab-auth.sh"
+peregrine_load_lab_auth || exit $?
 ulimit -n 65535 2>/dev/null || true
 export ST_AUTH=${ST_AUTH:-http://10.0.0.10:8085/auth/v1.0}
-export ST_USER=${ST_USER:-test:tester}
-export ST_KEY=${ST_KEY:-azure-swift-2026.bench}
 export ST_ENDPOINT=${ST_ENDPOINT:-http://10.0.0.10:8085/v1/AUTH_test}
 AUTOCOS=${AUTOCOS:-/usr/local/bin/autocos}
 if [[ ! -x "$AUTOCOS" ]]; then

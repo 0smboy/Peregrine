@@ -13,7 +13,7 @@ implemented.** Product and fairness claims must stay inside what is green here.
 Canonical long form in-repo:
 [`docs/fairness-lab/RUST-VS-PYTHON-PARITY.md`](https://github.com/0smboy/Peregrine/blob/main/docs/fairness-lab/RUST-VS-PYTHON-PARITY.md).
 
-**As of 2026-08-08 · Contabo lab · LAB-HARD-GREEN · not PRODUCTION-GO-LIVE.**
+**As of 2026-08-09 · Contabo lab · not PRODUCTION-GO-LIVE.**
 
 ## Headline
 
@@ -21,12 +21,13 @@ Canonical long form in-repo:
 |------|--------|
 | Swift v1 core CRUD + common middleware | **Mostly implemented** |
 | TempAuth + Keystone lab + EC + S3 core/MPU + bulk upload | **Implemented (lab-proven)** |
-| S3 SigV4 **+ SigV2** + chunk-sig, multi-version, Transition, WORM, ACP, multi-tenant IAM | **Implemented (unit 220)** |
-| Paste: standard names + **unlimited third-party plugin registry** | **Implemented (wired)** |
-| process_workers prefork + eventlet_parity greenthread surface + SLO concurrent HEAD | **Implemented (unit)** |
-| Multi-device auto-shrink product KEEP + soak harness | **Implemented (unit + short soak)** |
-| Multi-node cross-host shrink KEEP / multi-cluster sync / operator PEM / KMIP | **Not implemented** (strict) |
-| Hosted AWS IAM cloud / real tape hardware | **Not implemented** |
+| S3 SigV4 + SigV2 + chunk-sig, multi-version, Transition metadata, WORM, ACP | **Implemented at the stated test levels** |
+| Runtime-wired IAM and physical cold-tier routing | **Not implemented** (strict) |
+| Arbitrary third-party Paste plugin loading | **Not implemented**; unknown filters fail closed |
+| process_workers prefork | **Implemented** |
+| eventlet/greenlet serving semantics | **Not implemented**; helper module is not runtime-wired |
+| Multi-primary auto-shrink | **Not implemented**; disabled by default |
+| Multi-cluster sync / operator PEM / KMIP | **Not implemented** |
 
 ## Swift REST (v1)
 
@@ -39,8 +40,9 @@ Canonical long form in-repo:
 | TempURL (incl. ip_range) / FormPost / bulk **delete** | yes | yes |
 | Bulk **upload** / extract-archive (tar/tar.gz/tar.bz2) | yes | yes |
 | allow_account_management | yes | yes |
-| OpenStack-standard Paste pipeline filters | yes | yes (wired) |
-| Unlimited arbitrary third-party Paste plugins | yes | yes (`PluginRegistry` + default NamedPassthrough) |
+| Implemented Rust Paste pipeline filters | yes | yes |
+| Full standard-filter behavior | yes | **no** (some names are explicit no-op aliases) |
+| Unlimited arbitrary third-party Paste plugins | yes | **no** (no dynamic code loader) |
 
 ## Middleware
 
@@ -55,7 +57,7 @@ Canonical long form in-repo:
 | encrypter / decrypter / keymaster | yes | yes (on-by-config; KMIP residual) |
 | xprofile, list_endpoints | yes | yes (unit) |
 | memcache/recon/healthcheck aliases as NamedPassthrough slots | yes | yes |
-| Dynamic plugin registry (`use=` / `plugin=`) | yes | yes |
+| Dynamic third-party plugin loading (`use=` / `plugin=`) | yes | **no** |
 
 ## S3
 
@@ -67,11 +69,11 @@ Canonical long form in-repo:
 | Canned ACL + multi-rule CORS + object ?acl | yes | yes |
 | aws-chunked / STREAMING-* (per-chunk HMAC enforced) | yes | yes (unit) |
 | Versioning + multi-version data plane + ListVersions pagination | yes | yes (unit) |
-| Lifecycle Expiration + Transition (cold GET + restore) + AbortIncompleteMPU | yes | yes (unit) |
-| Physical cold-tier storage-policy map (`cold_tier`) | yes | yes (unit; operator policy conf) |
+| Lifecycle Expiration + Transition metadata (cold GET + restore) + AbortIncompleteMPU | yes | yes (unit) |
+| Physical cold-tier storage-policy routing | yes | **no** (library unit only; proxy does not load the map) |
 | Object Lock WORM + GOVERNANCE bypass header | yes | yes (unit) |
 | Grant-header + ACP XML store/GET + enforcement | yes | yes (unit) |
-| Multi-tenant local IAM policy engine | yes | yes (IamService; not hosted AWS IAM) |
+| Multi-tenant local IAM policy engine | yes | **no** (library unit only; proxy does not load policies) |
 | Hosted AWS IAM cloud product | yes | **no** |
 
 ## EC & consistency / platform
@@ -80,11 +82,13 @@ Canonical long form in-repo:
 |------------|:------:|:----:|
 | EC policy encode/decode, multiphase PUT, ranged GET, heal | yes | yes (Linux `ec`) |
 | Local sharder + manage-shard-ranges + shrink path | yes | yes |
-| Multi-device same-host auto-shrink + soak harness | yes | yes (unit + short soak) |
+| Multi-device same-host shrink helper | yes | yes (unit) |
+| Multi-primary auto-shrink product | yes | **no** (disabled by default; cross-node safety unproven) |
 | Cross-node multi-primary shrink over HTTP | yes | **no** (residual) |
 | container-sync daemon (same-cluster) | yes | yes |
 | Multi-cluster container-sync realm soak | yes | **no** |
-| process_workers prefork + eventlet_parity greenthreads | yes | yes (unit; not CPython greenlet bytecode) |
+| process_workers prefork | yes | yes |
+| eventlet/greenlet serving semantics | yes | **no** (isolated helper module only) |
 | Operator VIP TLS PEM go-live | yes | **no** (script GREEN; Contabo self-signed LAB) |
 | Full ansible Python role twin | yes | partial (v3 subset) |
 
@@ -94,7 +98,7 @@ Canonical long form in-repo:
 - S3 MPU deep **11/11**; EC2 s3token **green**
 - **2026-08-07/08 SLO full audit:** Contabo live SLO matrix + s3cmd MPU KEEP
 - **2026-08-08 hard9 residual:** Paste/xprofile, Transition, ACP+IAM, SLO concurrent — `tools/test-results/hard9-residual-wave-20260808/`
-- **2026-08-08 hard residual wave:** SigV2 + Paste plugins + IamService + cold_tier + multi-device shrink + eventlet_parity — unit **s3api 220** — `tools/test-results/hard-residual-wave-20260808/`
+- **2026-08-08 hard residual wave:** unit evidence for SigV2 and several helper/library surfaces; see the 2026-08-09 correction in `tools/test-results/hard-residual-wave-20260808/`
 - Operator TLS PEM **deferred** → not PRODUCTION-GO-LIVE
 
 ## How to use this matrix

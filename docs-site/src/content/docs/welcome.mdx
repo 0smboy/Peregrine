@@ -1,24 +1,22 @@
 ---
 title: Peregrine
-description: A Rust rewrite of OpenStack Swift — byte-compatible on the wire and on disk — with its deployer, load generator, benchmark automation, and web console, in one monorepo.
+description: A Rust-first OpenStack Swift rewrite with scoped compatibility evidence, deployment tooling, load generation, and a web console.
 sidebar:
   order: 0
 ---
 
-Peregrine is a production object-storage platform built around a **ground-up
-Rust rewrite of [OpenStack Swift](https://github.com/openstack/swift)**. Every
-on-disk and on-the-wire format is **byte-for-byte compatible** with Python
-Swift, so a Peregrine binary can be dropped onto a node in a live Python cluster
-and validated one component at a time. The repository ships everything needed to
-run the system in production: the storage engine, a Python-free deployer, a load
-generator, a benchmark harness, and a web console.
+Peregrine is a Rust-first object-storage engineering platform built around a
+**ground-up Rust rewrite of [OpenStack Swift](https://github.com/openstack/swift)**.
+It targets byte compatibility on implemented, explicitly tested paths. It is an
+advanced lab system, not a feature-complete Swift twin or a production drop-in
+replacement.
 
 <Aside type="note" title="Format fidelity over everything">
-Swift's correctness lives in its formats — the ring, the account and container
+Swift's correctness lives in its formats: the ring, the account and container
 SQLite databases, the on-disk diskfile layout, pickled hashes, crypto metadata,
-HMAC signatures, and erasure-coded fragment archives. Peregrine reproduces each
-one exactly, proven against the real Python implementation as a golden oracle.
-That is what makes a node-by-node rollout safe rather than a big-bang rewrite.
+HMAC signatures, and erasure-coded fragment archives. Peregrine uses Python
+Swift as the oracle for scoped golden and live proofs. Consult the strict parity
+matrix before planning any mixed rollout.
 </Aside>
 
 ## The components
@@ -27,7 +25,7 @@ That is what makes a node-by-node rollout safe rather than a big-bang rewrite.
   <Card title="swift-rust">
     The storage engine — proxy, object, container and account servers, every
     consistency daemon, erasure coding, the ring, the SQLite backends, and the
-    middleware pipeline. A 17-crate Rust workspace. [Read more →](/swift-rust)
+    middleware pipeline. A 15-crate Rust workspace. [Read more →](/swift-rust)
   </Card>
   <Card title="swift-deploy-rs">
     A bounded, Python-free deployer that executes the upstream Swift Ansible v3
@@ -71,11 +69,8 @@ That is what makes a node-by-node rollout safe rather than a big-bang rewrite.
 
 ## Status
 
-The data path is feature-complete and byte-compatible with Python Swift:
-replication and erasure coding, all four servers, every consistency daemon, the
-middleware pipeline, and container sharding. The workspace runs ~946 tests, and
-the system has been validated live on a four-node high-availability cluster —
-functional parity against Python, sustained load, and node-down failover. See
-[Testing](/testing) and [Performance](/performance) for the numbers.
+Core CRUD, replication, EC, and selected middleware paths have unit and
+four-node lab evidence. Important production and runtime-integration gaps remain.
+The [strict parity matrix](/parity) defines the current claim boundary.
 
 Licensed Apache-2.0, matching upstream OpenStack Swift.

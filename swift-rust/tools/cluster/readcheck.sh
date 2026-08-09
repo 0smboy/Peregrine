@@ -15,13 +15,15 @@
 #
 # usage: readcheck.sh [endpoint]        default: a direct node, never the VIP
 set -u
+source "$(dirname "$0")/../lib/lab-auth.sh"
+peregrine_load_lab_auth || exit $?
 EP=${1:-http://10.42.30.11:8085}
 ACCOUNT=AUTH_test
 RETRIES=2
 
 auth() {
   local r
-  r=$(curl -si -m15 -H "X-Auth-User: test:tester" -H "X-Auth-Key: azure-swift-2026.bench" \
+  r=$(curl -si -m15 -H "X-Auth-User: $ST_USER" -H "X-Auth-Key: $ST_KEY" \
         "$EP/auth/v1.0" 2>/dev/null | tr -d '\r')
   awk 'tolower($1)=="x-auth-token:"{print $2}' <<<"$r"
 }

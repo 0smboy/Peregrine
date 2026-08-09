@@ -4,9 +4,11 @@
 #   metadata value length limit (Swift MAX_META_VALUE_LENGTH=256 -> 400)
 # Usage: acl-meta-verify.sh <label> <endpoint>
 set -u
+source "$(dirname "$0")/lib/lab-auth.sh"
+peregrine_load_lab_auth || exit $?
 L=$1; EP=$2
 CO="-s -m10"
-A=$(curl $CO -D - -o /dev/null -H "X-Auth-User: test:tester" -H "X-Auth-Key: azure-swift-2026.bench" "$EP/auth/v1.0")
+A=$(curl $CO -D - -o /dev/null -H "X-Auth-User: $ST_USER" -H "X-Auth-Key: $ST_KEY" "$EP/auth/v1.0")
 TOK=$(printf '%s' "$A" | awk 'tolower($1)=="x-auth-token:"{print $2}' | tr -d '\r')
 P=$(printf '%s' "$A" | awk 'tolower($1)=="x-storage-url:"{print $2}' | tr -d '\r' | sed -E 's#https?://[^/]+##')
 B="$EP$P"; H=(-H "X-Auth-Token: $TOK")

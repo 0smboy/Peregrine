@@ -1,7 +1,7 @@
 # S3 Compatibility Matrix — Contabo live 2026-08-05
 
 VIP: `https://10.0.0.10:8085` (self-signed LAB, `curl -k`)  
-Credential model: TempAuth `test:tester` / `azure-swift-2026.bench` → SigV4 access key `test:tester`.  
+Credential model: TempAuth `test:tester` / `PEREGRINE_LAB_KEY_REQUIRED` → SigV4 access key `test:tester`.
 Pipeline (enabled this cycle): `… s3api s3token authtoken keystoneauth tempauth …`
 
 | Capability | Mechanism | Contabo live | Evidence |

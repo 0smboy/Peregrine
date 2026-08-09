@@ -362,10 +362,7 @@ pub fn serve_forever_multi(
                 Ok(Err(e)) if first_err.is_none() => first_err = Some(e),
                 Ok(Err(_)) => {}
                 Err(_) if first_err.is_none() => {
-                    first_err = Some(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "accept thread panicked",
-                    ));
+                    first_err = Some(std::io::Error::other("accept thread panicked"));
                 }
                 Err(_) => {}
             }
@@ -418,10 +415,7 @@ pub fn serve_forever_multi(
             Ok(Err(e)) if first_err.is_none() => first_err = Some(e),
             Ok(Err(_)) => {}
             Err(_) if first_err.is_none() => {
-                first_err = Some(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "accept thread panicked",
-                ));
+                first_err = Some(std::io::Error::other("accept thread panicked"));
             }
             Err(_) => {}
         }

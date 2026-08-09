@@ -334,8 +334,9 @@ fn main() {
     // Optional `[pipeline:main] pipeline = ...` orders the *implemented*
     // filters (P0–P1b). Always-on catch_errors / gatekeeper / healthcheck
     // stay in serve_with_filters_and_config. Absent pipeline → today's
-    // default order. Unknown names skip by default; set
-    // `strict_pipeline = true` for Paste-like hard-fail on unknown names.
+    // default order. Unknown names fail startup by default. Operators may set
+    // `strict_pipeline = false` to skip them or explicitly opt into a named
+    // no-op with `plugin_default = passthrough`.
     let key_provider: Arc<dyn swift_middleware::KeyProvider> =
         Arc::new(ProxyTempUrlKeys::new(Arc::clone(&app)));
     let sync_key_provider: Arc<dyn swift_middleware::SyncKeyProvider> =
@@ -706,8 +707,8 @@ fn configured_pipeline_has(conf: &SwiftConfig, name: &str) -> bool {
         .unwrap_or_else(|| DEFAULT_CONFIGURED_FILTERS.contains(&name))
 }
 
-/// `[app:proxy-server] strict_pipeline` (DEFAULT fallback). Default **false**
-/// so Contabo / Python-shaped pipelines stay lab-safe; true is Paste-like.
+/// `[app:proxy-server] strict_pipeline` (DEFAULT fallback). Default **true**
+/// so an unknown security or auth filter cannot silently disappear.
 
 /// Number of OS processes for eventlet-like worker model.
 /// Prefer `[app:proxy-server] process_workers`; if `worker_model = process`
@@ -776,7 +777,7 @@ fn strict_pipeline_from_conf(conf: &SwiftConfig) -> bool {
         .ok()
         .flatten()
         .or_else(|| conf.get("DEFAULT", "strict_pipeline").ok().flatten())
-        .unwrap_or_else(|| "false".to_string());
+        .unwrap_or_else(|| "true".to_string());
     config_true_value(&raw)
 }
 
@@ -1433,9 +1434,9 @@ fn build_configured_filters(
                 )));
             }
             other => {
-                // Unlimited third-party Paste plugins: conf [filter:name] +
-                // PluginRegistry (use=/plugin=) or NamedPassthrough default so
-                // any pipeline name is a claimable slot (not silently skipped).
+                // Rust-native plugins: conf [filter:name] + PluginRegistry
+                // (use=/plugin=). Unknown filters are skipped only when strict
+                // mode is disabled; passthrough requires explicit opt-in.
                 let section = format!("filter:{other}");
                 let conf_items: std::collections::HashMap<String, String> = conf
                     .items(&section)
@@ -1449,10 +1450,12 @@ fn build_configured_filters(
                     .flatten()
                     .or_else(|| conf.get("DEFAULT", "plugin_default").ok().flatten())
                     .map(|s| {
-                        let t = s.trim().to_ascii_lowercase();
-                        t != "skip" && t != "false" && t != "0" && t != "none"
+                        matches!(
+                            s.trim().to_ascii_lowercase().as_str(),
+                            "passthrough" | "true" | "1" | "yes" | "on"
+                        )
                     })
-                    .unwrap_or(true); // default: passthrough (unlimited plugins)
+                    .unwrap_or(false); // default: fail closed, no silent no-op
                 match swift_middleware::global_registry().build(
                     other,
                     &conf_items,
@@ -2724,11 +2727,12 @@ mod startup_policy_tests {
     }
 
     #[test]
-    fn pipeline_unknown_filter_registers_passthrough_plugin() {
-        // Unlimited third-party Paste plugins: unknown names → NamedPassthrough.
+    fn pipeline_unknown_filter_registers_passthrough_when_explicitly_enabled() {
+        // Operators may explicitly preserve an unknown name as a no-op.
         let conf = SwiftConfig::parse_lenient(
             "[pipeline:main]\n\
              pipeline = catch_errors gatekeeper healthcheck tempauth not_a_real_filter copy proxy-server\n\
+             [app:proxy-server]\nplugin_default = passthrough\n\
              [filter:tempauth]\nuser_test_tester = secret .admin\n",
             &[],
             false,
@@ -2763,6 +2767,35 @@ mod startup_policy_tests {
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
         let (filters, notes) =
             build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols, HashPathConfig::new("", "test").unwrap());
+        assert_eq!(filters.len(), 2, "notes={notes:?}");
+        assert!(notes
+            .iter()
+            .any(|n| n.contains("not_a_real_filter") && n.contains("skip")));
+    }
+
+    #[test]
+    fn pipeline_unknown_filter_invalid_plugin_default_fails_closed() {
+        let conf = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck tempauth not_a_real_filter copy proxy-server\n\
+             [app:proxy-server]\nstrict_pipeline = false\nplugin_default = typo\n\
+             [filter:tempauth]\nuser_test_tester = secret .admin\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
+        let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
+        let (filters, notes) = build_configured_filters(
+            &conf,
+            ta,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            &pols,
+            HashPathConfig::new("", "test").unwrap(),
+        );
         assert_eq!(filters.len(), 2, "notes={notes:?}");
         assert!(notes
             .iter()
@@ -2953,13 +2986,13 @@ mod startup_policy_tests {
     }
 
     #[test]
-    fn pipeline_unknown_filter_note_when_lenient() {
-        // Default plugin_default=passthrough: third-party names are claimable slots.
+    fn pipeline_unknown_filter_can_explicitly_use_passthrough() {
         let conf = SwiftConfig::parse_lenient(
             "[pipeline:main]\n\
              pipeline = catch_errors gatekeeper healthcheck totally_fake_filter proxy-server\n\
              [app:proxy-server]\n\
-             strict_pipeline = false\n",
+             strict_pipeline = false\n\
+             plugin_default = passthrough\n",
             &[],
             false,
         )
@@ -2990,14 +3023,11 @@ mod startup_policy_tests {
 
     #[test]
     fn pipeline_strict_true_surfaces_fatal_unknown_filter() {
-        // strict_pipeline + plugin_default=skip → unknown is fatal (old Paste hard-fail).
-        // With default passthrough, third-party slots are not fatal.
+        // Fail-closed defaults make an unknown filter fatal.
         let conf = SwiftConfig::parse_lenient(
             "[pipeline:main]\n\
              pipeline = catch_errors gatekeeper healthcheck totally_fake_filter list_endpoints proxy-server\n\
-             [app:proxy-server]\n\
-             strict_pipeline = true\n\
-             plugin_default = skip\n",
+             [app:proxy-server]\n",
             &[],
             false,
         )
@@ -3069,18 +3099,17 @@ mod startup_policy_tests {
                 "raw={raw} should enable strict_pipeline"
             );
         }
-        for raw in ["false", "0", "no", "off", ""] {
-            let body = if raw.is_empty() {
-                "[app:proxy-server]\n".to_string()
-            } else {
-                format!("[app:proxy-server]\nstrict_pipeline = {raw}\n")
-            };
+        for raw in ["false", "0", "no", "off"] {
+            let body = format!("[app:proxy-server]\nstrict_pipeline = {raw}\n");
             let conf = SwiftConfig::parse_lenient(&body, &[], false).unwrap();
             assert!(
                 !strict_pipeline_from_conf(&conf),
-                "raw={raw:?} must stay lenient (Contabo default)"
+                "raw={raw:?} should explicitly disable strict mode"
             );
         }
+        let default_conf =
+            SwiftConfig::parse_lenient("[app:proxy-server]\n", &[], false).unwrap();
+        assert!(strict_pipeline_from_conf(&default_conf));
         // DEFAULT section fallback
         let conf = SwiftConfig::parse_lenient(
             "[DEFAULT]\nstrict_pipeline = yes\n[app:proxy-server]\n",

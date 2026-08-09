@@ -4,6 +4,8 @@
 # same policies (0=3x repl default, 1=ec-2-1), same tempauth creds, on alternate
 # ports so it runs alongside the live Rust cluster without collision.
 set -u
+source "$(dirname "$0")/lib/lab-auth.sh"
+peregrine_load_lab_auth || exit $?
 VENV=/root/work/pyswift-venv
 BIN=$VENV/bin
 ETC=/etc/pyswift
@@ -57,7 +59,7 @@ account_autocreate = true
 
 [filter:tempauth]
 use = egg:swift#tempauth
-user_test_tester = azure-swift-2026.bench .admin
+user_test_tester = $ST_KEY .admin
 user_admin_admin = admin .admin .reseller_admin
 
 [filter:cache]
@@ -184,6 +186,6 @@ for p in 6310 6311 6312 8090; do
   printf "  :%s /healthcheck -> %s\n" "$p" "$(curl -s -m5 -o /dev/null -w '%{http_code}' http://127.0.0.1:$p/healthcheck)"
 done
 echo "### auth smoke"
-curl -s -m10 -D - -o /dev/null -H "X-Auth-User: test:tester" -H "X-Auth-Key: azure-swift-2026.bench" \
+curl -s -m10 -D - -o /dev/null -H "X-Auth-User: $ST_USER" -H "X-Auth-Key: $ST_KEY" \
   http://127.0.0.1:8090/auth/v1.0 | grep -iE 'x-auth-token|x-storage-url' | sed 's/^/  /'
 echo "PY-SAIO-SETUP-DONE"

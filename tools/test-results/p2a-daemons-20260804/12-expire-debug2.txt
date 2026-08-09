@@ -1,7 +1,7 @@
 + EP=http://10.0.0.10:8085
 + USR=test:tester
-+ KEY=azure-swift-2026.bench
-++ curl -s -m10 -H 'X-Auth-User: test:tester' -H 'X-Auth-Key: azure-swift-2026.bench' -D - -o /dev/null http://10.0.0.10:8085/auth/v1.0
++ KEY=PEREGRINE_LAB_KEY_REQUIRED
+++ curl -s -m10 -H 'X-Auth-User: test:tester' -H 'X-Auth-Key: PEREGRINE_LAB_KEY_REQUIRED' -D - -o /dev/null http://10.0.0.10:8085/auth/v1.0
 ++ awk 'tolower($1)=="x-auth-token:"{print $2}'
 ++ tr -d '\r'
 + TOK=AUTH_tkv1.313738353934313630311e746573741e746573743a7465737465721e415554485f74657374.b6d649185b763d8c8de8988acadb04031776c87c3073535165999cbf8a6bb36a

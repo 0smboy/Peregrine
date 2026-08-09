@@ -4,7 +4,8 @@ auth:
   type: temp_auth
   url: http://10.42.30.11:8085/auth/v1.0
   user: test:tester
-  key: azure-swift-2026.bench
+  # This sentinel is intentionally invalid. Render from the operator secret.
+  key: PEREGRINE_LAB_KEY_REQUIRED
 storage:
   type: swift
   # explicit endpoint (a specific HAProxy), NOT the .10 ILB VIP, since this runs

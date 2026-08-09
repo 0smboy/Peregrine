@@ -3,13 +3,15 @@
 # Usage: chaos-run.sh <scenario> [OUTDIR]
 # Scenarios: proxy-loss | vip-master-loss | object-loss | node-loss | dry-health
 set -euo pipefail
+source "$(dirname "$0")/../../../swift-rust/tools/lib/lab-auth.sh"
+peregrine_load_lab_auth
 SCEN="${1:-dry-health}"
 OUT="${2:-/tmp/fairness-chaos}"
 mkdir -p "$OUT"
 LB="${LB:-http://10.0.0.10:8085}"
 CON="${CON:-http://127.0.0.1:9000}"
-USR="${USR:-test:tester}"
-KEY="${KEY:-azure-swift-2026.bench}"
+USR="${USR:-$ST_USER}"
+KEY="${KEY:-$ST_KEY}"
 TOOLS="${TOOLS:-/root/work/swift-rust/tools}"
 # Contabo private IPs (hostnames often missing inside the cluster)
 SWIFT1_IP="${SWIFT1_IP:-10.0.0.1}"

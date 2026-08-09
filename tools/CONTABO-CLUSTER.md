@@ -42,7 +42,8 @@ Ops evidence of mid-flight LB fix (pre-gate): [`HA-LB-CORRECT-20260804.md`](test
 - Client API (preferred): `http://10.0.0.10:8085` (HAProxy → **round-robin** `10.0.0.1–4:8080`)
 - Per-node HAProxy: `http://10.0.0.N:8085` (same four-proxy pool)
 - Evidence of real LB + failover: [`HA-LB-CORRECT-20260804.md`](test-results/HA-LB-CORRECT-20260804.md)
-- Auth (tempauth): `test:tester` / `azure-swift-2026.bench` (name historical)
+- Auth (tempauth): user `test:tester`; key is operator-managed in the
+  root-readable `/etc/swift/peregrine-lab.env` and is never committed
 - Console / Prom / Loki (swift4 loopback):
   `ssh -L 9000:127.0.0.1:9000 -L 9090:127.0.0.1:9090 -L 3100:127.0.0.1:3100 swift4`
 - Shadow peer: Python SAIO `@swift3` → `http://10.0.0.3:8090` (Rust SAIO `:8081`)
