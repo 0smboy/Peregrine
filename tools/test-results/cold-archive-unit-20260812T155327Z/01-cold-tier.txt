@@ -1,0 +1,15 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running unittests src/lib.rs (target/debug/deps/swift_s3api-cf8ede0dd117bf18)
+
+running 8 tests
+test cold_tier::tests::due_transition_without_backend_meta_only_no_uri ... ok
+test cold_tier::tests::due_transition_with_memory_backend_stamps_uri ... ok
+test cold_tier::tests::restore_routes_to_hot ... ok
+test cold_tier::tests::csv_map_and_cold_meta_stamp ... ok
+test cold_tier::tests::stamp_meta_does_not_invent_backend_uri ... ok
+test cold_tier::tests::memory_backend_archive_restore ... ok
+test cold_tier::tests::localdir_backend_archive_restore ... ok
+test cold_tier::tests::unmapped_class_no_stamp ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 226 filtered out; finished in 0.00s
+

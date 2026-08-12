@@ -5,22 +5,21 @@
 //!
 //! **Physical cold backend (tape/Glacier cloud) is not implemented.** Lab
 //! adapters [`MemoryColdBackend`] / [`LocalDirColdBackend`] can archive bytes
-//! locally when wired. This module is primarily a policy map
-//! and metadata-stamp helper only. Lifecycle Transition stamps (see
-//! [`crate::lifecycle_exec`]) mark objects as intending a cold class. Helpers
-//! here can prepare headers an *external* mover would need:
+//! locally when wired via [`ColdBackend::archive`]. Without a backend, this
+//! module is a policy map + metadata-stamp helper only. Lifecycle Transition
+//! stamps (see [`crate::lifecycle_exec`]) mark objects as intending a cold
+//! class. Helpers here can prepare headers an *external* mover would need:
 //!
 //! 1. Map S3 StorageClass → Swift storage-policy index (`cold_policy_map`).
-//! 2. On due transition: stamp backend policy index + cold object path meta.
+//! 2. On due transition: stamp cold/hot policy indices (+ optional lab archive URI).
 //! 3. Restore: temporary rehydrate window via [`SYS_RESTORE_UNTIL`] plus
 //!    optional policy index restore target.
 //!
-//! It does **not** copy object bytes between policies, schedule a mover, talk
-//! to tape/Glacier, or guarantee later proxy reads honor per-object policy
-//! metadata. Proxy may populate [`ColdPolicyMap`] from conf; that still does
-//! not implement a physical cold store. Python Swift 2.33 rejects direct
-//! non-`STANDARD` storage classes and `?restore`. Do not claim physical cold
-//! media from this crate.
+//! Lab `archive` / `restore_stage` move **local** bytes only. This crate does
+//! **not** talk to tape/Glacier cloud or schedule a fleet mover. Proxy may
+//! populate [`ColdPolicyMap`] / `cold_backend_root` from conf. Python Swift
+//! 2.33 rejects direct non-`STANDARD` storage classes and `?restore`. Do not
+//! claim tape/Glacier cloud from this crate.
 
 use std::collections::HashMap;
 
@@ -112,36 +111,40 @@ pub type PhysicalTransition = ColdMetaStamp;
 
 /// Stamp cold-transition **metadata** when a policy map is configured.
 ///
-/// Sets [`SYS_TRANSITIONED`], cold/hot policy indices, a URI *hint*, and
-/// `X-Backend-Storage-Policy-Index`. Does **not** move object bytes or invoke
-/// a physical cold backend (none is implemented). Returns `None` if class is
-/// not cold or no policy mapping exists.
+/// Sets [`SYS_TRANSITIONED`], cold/hot policy indices, and
+/// `X-Backend-Storage-Policy-Index`. Does **not** set [`SYS_COLD_BACKEND_URI`]
+/// (that requires [`ColdBackend::archive`] — see
+/// [`maybe_stamp_and_archive_due_cold`]). Without a backend this is meta-only
+/// honesty. Returns `None` if class is not cold or no policy mapping exists.
 pub fn stamp_cold_policy_meta(
     headers: &mut HeaderKeyDict,
     map: &ColdPolicyMap,
     storage_class: &str,
     hot_policy_index: Option<i64>,
-    object_account: &str,
-    object_container: &str,
-    object_key: &str,
+    _object_account: &str,
+    _object_container: &str,
+    _object_key: &str,
 ) -> Option<ColdMetaStamp> {
     if !is_cold_storage_class(storage_class) {
         return None;
     }
     let cold = map.policy_for_class(storage_class)?;
     let hot = hot_policy_index.unwrap_or(map.default_hot_policy);
-    let uri = format!("swift-policy://{cold}/{object_account}/{object_container}/{object_key}");
     headers.set(META_STORAGE_CLASS, storage_class);
     headers.set(SYS_TRANSITIONED, "1");
     headers.set(SYS_COLD_POLICY_INDEX, cold.to_string());
     headers.set(SYS_HOT_POLICY_INDEX, hot.to_string());
-    headers.set(SYS_COLD_BACKEND_URI, &uri);
     headers.set(HDR_BACKEND_STORAGE_POLICY_INDEX, cold.to_string());
+    // Preserve any URI already set (e.g. prior archive); never invent one.
+    let backend_uri = headers
+        .get(SYS_COLD_BACKEND_URI)
+        .unwrap_or("")
+        .to_string();
     Some(ColdMetaStamp {
         storage_class: storage_class.to_string(),
         cold_policy_index: cold,
         hot_policy_index: hot,
-        backend_uri: uri,
+        backend_uri,
     })
 }
 
@@ -191,6 +194,40 @@ pub fn maybe_stamp_due_cold_transition(
         });
     }
     stamp_cold_policy_meta(headers, map, &sc, None, account, container, key)
+}
+
+/// Stamp due cold meta; when a lab [`ColdBackend`] + body are provided and
+/// [`SYS_COLD_BACKEND_URI`] is empty, call [`ColdBackend::archive`] and stamp
+/// the returned URI. Without a backend, meta-only (no URI) — honest boundary.
+///
+/// Returns `Ok(None)` when no due cold transition applies. Archive errors
+/// surface as `Err` (callers map to S3 errors; do not panic).
+pub fn maybe_stamp_and_archive_due_cold(
+    headers: &mut HeaderKeyDict,
+    map: &ColdPolicyMap,
+    now_unix: i64,
+    account: &str,
+    container: &str,
+    key: &str,
+    backend: Option<&dyn ColdBackend>,
+    body: Option<&[u8]>,
+) -> Result<Option<ColdMetaStamp>, String> {
+    let Some(mut stamp) =
+        maybe_stamp_due_cold_transition(headers, map, now_unix, account, container, key)
+    else {
+        return Ok(None);
+    };
+    if let (Some(be), Some(bytes)) = (backend, body) {
+        let existing = headers.get(SYS_COLD_BACKEND_URI).unwrap_or("");
+        if existing.is_empty() {
+            let uri = be.archive(stamp.cold_policy_index, account, container, key, bytes)?;
+            headers.set(SYS_COLD_BACKEND_URI, &uri);
+            stamp.backend_uri = uri;
+        } else if stamp.backend_uri.is_empty() {
+            stamp.backend_uri = existing.to_string();
+        }
+    }
+    Ok(Some(stamp))
 }
 
 /// Apply restore **stamps**: set restore-until and optionally route GETs to hot
@@ -424,5 +461,67 @@ mod tests {
         let map = ColdPolicyMap::new();
         let mut h = HeaderKeyDict::new();
         assert!(stamp_cold_policy_meta(&mut h, &map, "GLACIER", None, "a", "c", "k").is_none());
+    }
+
+    #[test]
+    fn stamp_meta_does_not_invent_backend_uri() {
+        let map = ColdPolicyMap::from_csv("GLACIER:2,HOT:0");
+        let mut h = HeaderKeyDict::new();
+        let t = stamp_cold_policy_meta(&mut h, &map, "GLACIER", Some(0), "a", "c", "k").unwrap();
+        assert!(t.backend_uri.is_empty());
+        assert!(h.get(SYS_COLD_BACKEND_URI).is_none());
+        assert_eq!(h.get(SYS_COLD_POLICY_INDEX), Some("2"));
+    }
+
+    #[test]
+    fn due_transition_with_memory_backend_stamps_uri() {
+        use crate::lifecycle_exec::{META_STORAGE_CLASS, SYS_TRANSITION_AT};
+        let map = ColdPolicyMap::from_csv("GLACIER:2,HOT:0");
+        let be = MemoryColdBackend::default();
+        let mut h = HeaderKeyDict::new();
+        h.set(META_STORAGE_CLASS, "GLACIER");
+        h.set(SYS_TRANSITION_AT, "50");
+        let stamp = maybe_stamp_and_archive_due_cold(
+            &mut h,
+            &map,
+            100,
+            "AUTH_test",
+            "bkt",
+            "obj",
+            Some(&be),
+            Some(b"payload"),
+        )
+        .unwrap()
+        .expect("due cold stamp");
+        assert!(stamp.backend_uri.starts_with("memory://"));
+        assert_eq!(h.get(SYS_COLD_BACKEND_URI).unwrap(), stamp.backend_uri);
+        assert_eq!(h.get(SYS_COLD_POLICY_INDEX), Some("2"));
+        assert_eq!(h.get(SYS_TRANSITIONED), Some("1"));
+        be.restore_stage(&stamp.backend_uri, 1).unwrap();
+    }
+
+    #[test]
+    fn due_transition_without_backend_meta_only_no_uri() {
+        use crate::lifecycle_exec::{META_STORAGE_CLASS, SYS_TRANSITION_AT};
+        let map = ColdPolicyMap::from_csv("GLACIER:2,HOT:0");
+        let mut h = HeaderKeyDict::new();
+        h.set(META_STORAGE_CLASS, "GLACIER");
+        h.set(SYS_TRANSITION_AT, "50");
+        let stamp = maybe_stamp_and_archive_due_cold(
+            &mut h,
+            &map,
+            100,
+            "AUTH_test",
+            "bkt",
+            "obj",
+            None,
+            Some(b"payload"),
+        )
+        .unwrap()
+        .expect("due cold stamp");
+        assert!(stamp.backend_uri.is_empty());
+        assert!(h.get(SYS_COLD_BACKEND_URI).is_none());
+        assert_eq!(h.get(SYS_COLD_POLICY_INDEX), Some("2"));
+        assert_eq!(h.get(SYS_TRANSITIONED), Some("1"));
     }
 }
