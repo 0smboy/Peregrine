@@ -62,8 +62,7 @@ fn hash_cfg() -> swift_core::hashing::HashPathConfig {
 }
 
 fn md5_hex(data: &[u8]) -> String {
-    use md5::{Digest, Md5};
-    format!("{:x}", Md5::digest(data))
+    swift_middleware::manifest_etag(data)
 }
 
 fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
