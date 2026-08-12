@@ -36,6 +36,15 @@ pub struct Request {
 }
 
 impl Request {
+    /// Replace the decoded routing path (subrequest helper).
+    ///
+    /// Used by middleware that clones a request head and retargets it
+    /// (e.g. DLO segment/listing subrequests). The `path` field is public;
+    /// this setter keeps call sites consistent.
+    pub fn set_path(&mut self, path: impl Into<String>) {
+        self.path = path.into();
+    }
+
     pub fn params(&self) -> Vec<(String, String)> {
         parse_query(&self.query_string)
     }

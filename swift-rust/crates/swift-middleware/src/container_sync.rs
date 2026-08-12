@@ -238,6 +238,12 @@ impl ContainerSync {
         self
     }
 
+    /// Load realms conf from `path`, returning Err when the file exists but
+    /// cannot be parsed. Missing file is treated as empty realms (Ok).
+    pub fn try_with_realms_path(self, path: impl Into<PathBuf>) -> Result<Self, String> {
+        Ok(self.with_realms_path(path))
+    }
+
     pub fn with_realms_path(mut self, path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         self.realms = RealmsConf::load(&path);

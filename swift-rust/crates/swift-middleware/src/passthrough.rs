@@ -1,10 +1,18 @@
 // Copyright (c) 2026 OpenStack Foundation
-//! Named no-op middleware for Paste pipeline names that are registered and
-//! claimable as "wired" without changing request semantics.
+//! Named no-op middleware for **known** pipeline filter names that should
+//! occupy a slot without changing request semantics.
 //!
-//! Used so OpenStack-standard pipeline filter names are **not** "unknown /
-//! not implemented" — they occupy a pipeline slot and pass through. Real
-//! behaviour may live elsewhere (e.g. always-on filters, ops tools).
+//! # Honesty
+//!
+//! [`NamedPassthrough`] is **not** a third-party PasteDeploy / egg / shared-library
+//! ABI. Unknown filter names are skipped (or fail closed under
+//! `strict_pipeline=true` + `plugin_default=skip`). Deliberate no-op for a
+//! *configured* alias requires an explicit passthrough path — it is still an
+//! in-process Rust stub, not Python Paste plugin loading.
+//!
+//! Used so selected OpenStack-standard names can sit in `pipeline=` without
+//! being reported as unknown. Real behaviour may live elsewhere (always-on
+//! filters, ops tools).
 
 use swift_http::{Request, Response};
 

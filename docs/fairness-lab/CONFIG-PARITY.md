@@ -1,6 +1,6 @@
 # CONFIG-PARITY — Rust honored knobs vs Python surface
 
-Generated from `main.rs` `get()` scans. Rows=73; unsupported=10 (P2c: `servers_per_port` upgraded).
+Generated from `main.rs` `get()` scans. Rows=73; unsupported=9 (P2c: `servers_per_port` upgraded).
 
 ## Workers semantics (critical)
 
@@ -33,7 +33,6 @@ See [WORKERS-SEMANTICS.md](WORKERS-SEMANTICS.md). Tool: `swift-effective-concurr
 | object | `node_timeout` | unsupported |
 | object | `replication_server` | unsupported |
 | object | `use_splice` | unsupported |
-| proxy | `allow_account_management` | unsupported |
 | proxy | `pipeline` (full Paste arbitrary filters) | unsupported |
 | proxy | `pipeline` (P0+P1a+P1b primary: proxy-logging/cache/listing_formats/tempauth/tempurl/bulk/formpost/staticweb/container_quotas/account_quotas/symlink/versioned_writes/ratelimit/copy/slo/dlo + smaller on-by-config) | iso-config-partial |
 | proxy | `memcache_servers` (`[filter:cache]`) | iso-config-partial — parsed; client constructed; **P1c:** account/container info-cache L2 shared when set (L1-only without) |
@@ -64,6 +63,7 @@ See [WORKERS-SEMANTICS.md](WORKERS-SEMANTICS.md). Tool: `swift-effective-concurr
 | object | `ring_ip` | iso-config |
 | object | `workers` | iso-config-with-semantic-mapping |
 | proxy | `account_autocreate` | iso-config |
+| proxy | `allow_account_management` | iso-config — supported; gates account PUT/DELETE with **405** when false; `/info` advertises the flag; code default **false** when unset; Rust lab templates set `true` |
 | proxy | `bind_ip` | iso-config |
 | proxy | `bind_port` | iso-config |
 | proxy | `client_timeout` | iso-config |

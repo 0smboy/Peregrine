@@ -44,10 +44,10 @@ pub struct StreamedBody {
 }
 
 /// A handle for sending interim `100 Continue` responses mid-request —
-/// the backend multiphase-PUT handshake (eventlet's
+/// the backend multiphase-PUT handshake (Python Swift's
 /// `send_hundred_continue_response` with optional headers). Sending one
 /// also re-arms a finished chunked request body so a NEW chunked
-/// sequence can follow (eventlet parity: it reinitializes
+/// sequence can follow (Python swob semantics: it reinitializes
 /// `chunk_length` on every send, which is how the commit phase of a
 /// two-phase PUT travels after the data phase's 0-chunk terminator).
 #[derive(Clone)]
@@ -57,7 +57,7 @@ pub struct InterimResponder {
 
 pub(crate) struct InterimShared {
     /// `None` when the client did not send `Expect: 100-continue`
-    /// (writes become no-ops, matching eventlet's absent `wfile`).
+    /// (writes become no-ops, matching Python Swift's absent `wfile`).
     writer: Option<Box<dyn std::io::Write + Send>>,
     sent_any: bool,
     resume_chunked: bool,

@@ -218,10 +218,10 @@
     {
       "service": "proxy",
       "knob": "allow_account_management",
-      "rust_parsed": false,
-      "rust_behavior": "not parsed / not deployable as Python Paste knob",
-      "deploy_template_likely": false,
-      "fairness_class": "unsupported"
+      "rust_parsed": true,
+      "rust_behavior": "parsed; default false; PUT/DELETE account gated 405 when off; /info advertises flag",
+      "deploy_template_likely": true,
+      "fairness_class": "iso-config"
     },
     {
       "service": "proxy",

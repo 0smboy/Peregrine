@@ -1,5 +1,5 @@
 // Copyright (c) 2026 OpenStack Foundation
-//! `list_endpoints` middleware — advertise ring endpoints for an object path.
+//! `list_endpoints` middleware — advertise ring endpoints for a path.
 //!
 //! Python: `swift.common.middleware.list_endpoints`. On `GET
 //! /endpoints/<account>/<container>/<object>` (or configured path root),
@@ -8,6 +8,9 @@
 //! Without a ring resolver, returns `501 Not Implemented` with a clear body
 //! when the path matches the endpoints prefix; other paths pass through.
 //! Tests inject a fixed resolver.
+//!
+//! The [`EndpointResolver`] signature matches the proxy tip (`Option` container
+//! / object + policy index) so `ProxyEndpointResolver` can implement it.
 
 use std::sync::Arc;
 
@@ -16,16 +19,28 @@ use swift_http::{Request, Response};
 use crate::{Middleware, NextFn};
 
 /// Resolve account/container/object → backend endpoint URL strings.
+///
+/// The optional integer is the container storage-policy index (object paths).
 pub trait EndpointResolver: Send + Sync {
-    fn endpoints(&self, account: &str, container: &str, object: &str) -> Vec<String>;
+    fn endpoints(
+        &self,
+        account: &str,
+        container: Option<&str>,
+        object: Option<&str>,
+    ) -> Result<(Vec<String>, Option<i64>), String>;
 }
 
 /// Fixed list for tests / offline.
 pub struct StaticEndpoints(pub Vec<String>);
 
 impl EndpointResolver for StaticEndpoints {
-    fn endpoints(&self, _a: &str, _c: &str, _o: &str) -> Vec<String> {
-        self.0.clone()
+    fn endpoints(
+        &self,
+        _account: &str,
+        _container: Option<&str>,
+        _object: Option<&str>,
+    ) -> Result<(Vec<String>, Option<i64>), String> {
+        Ok((self.0.clone(), None))
     }
 }
 
@@ -46,8 +61,16 @@ impl Default for ListEndpoints {
 }
 
 impl ListEndpoints {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(resolver: Arc<dyn EndpointResolver>) -> Self {
+        Self {
+            path_root: "/endpoints/".into(),
+            resolver: Some(resolver),
+        }
+    }
+
+    pub fn with_path_root(mut self, path_root: impl Into<String>) -> Self {
+        self.path_root = path_root.into();
+        self
     }
 
     pub fn with_resolver(mut self, r: Arc<dyn EndpointResolver>) -> Self {
@@ -81,7 +104,10 @@ impl Middleware for ListEndpoints {
                 "list_endpoints: no ring resolver configured on this proxy",
             );
         };
-        let eps = resolver.endpoints(account, container, object);
+        let eps = match resolver.endpoints(account, Some(container), Some(object)) {
+            Ok((eps, _)) => eps,
+            Err(err) => return Response::error(400, &err),
+        };
         let body = serde_json::to_vec(&eps).unwrap_or_else(|_| b"[]".to_vec());
         let mut r = Response::with_body(200, body);
         r.headers.set("Content-Type", "application/json");
@@ -96,7 +122,7 @@ mod tests {
 
     #[test]
     fn returns_json_endpoints() {
-        let le = ListEndpoints::new().with_resolver(Arc::new(StaticEndpoints(vec![
+        let le = ListEndpoints::new(Arc::new(StaticEndpoints(vec![
             "http://127.0.0.1:6200/sdb1".into(),
             "http://127.0.0.1:6200/sdb2".into(),
         ])));
@@ -117,7 +143,7 @@ mod tests {
 
     #[test]
     fn passthrough_other_paths() {
-        let le = ListEndpoints::new();
+        let le = ListEndpoints::default();
         let next: NextFn = Arc::new(|_r| Response::new(204));
         let req = Request {
             method: "GET".into(),

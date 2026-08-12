@@ -67,8 +67,9 @@
 //! Other residuals (not claimable as implemented):
 //!
 //! * lifecycle tag / And filters
-//! * physical Glacier/tape routing is a library-only storage-policy map
-//!   ([`cold_tier`]); proxy configuration does not currently populate it
+//! * physical Glacier/tape **backend** is **not implemented** — [`cold_tier`]
+//!   is a policy map + metadata stamps only (proxy may load `cold_policy_map`
+//!   conf; that still does not move bytes to cold media)
 //! * multi-tenant IAM policy evaluation ([`iam::IamService`]) and
 //!   IdentityDirectory are library-only until the proxy loads their config.
 //!   Grant headers + ACP

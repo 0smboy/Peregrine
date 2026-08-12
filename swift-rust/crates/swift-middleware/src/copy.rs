@@ -40,11 +40,27 @@ use crate::{Middleware, NextFn};
 
 /// The `copy` middleware.
 #[derive(Default)]
-pub struct Copy;
+#[derive(Debug, Clone)]
+pub struct Copy {
+    /// Seconds between cooperative yield points during large copies
+    /// (`[filter:copy] yield_frequency`, default 10).
+    pub yield_frequency: f64,
+}
 
 impl Copy {
     pub fn new() -> Self {
-        Copy
+        Copy {
+            yield_frequency: 10.0,
+        }
+    }
+
+    pub fn with_yield_frequency(mut self, seconds: f64) -> Self {
+        self.yield_frequency = if seconds.is_finite() && seconds >= 0.0 {
+            seconds
+        } else {
+            10.0
+        };
+        self
     }
 }
 

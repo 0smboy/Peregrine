@@ -39,7 +39,7 @@
 | Bulk delete | ✅ | ✅ | |
 | Bulk upload / extract-archive | ✅ | ✅ | tar / tar.gz / tar.bz2; `/info` bulk_upload (2026-08-06) |
 | Account autocreate | ✅ | ✅ | |
-| Allow account management | ✅ | ✅ | `allow_account_management` conf; PUT/DELETE gated **405** when off; unit reaffirm 2026-08-07 (`residual-pipeline-account-20260807`: lib 19/19 + gate test) |
+| Allow account management | ✅ | ✅ | supported; `allow_account_management` conf (code default **false**); PUT/DELETE gated **405** when off; `/info` advertises flag; Rust lab templates set `true`; unit reaffirm 2026-08-07 |
 | SLO residual: expirer hash sharding / async ACL probes | ✅ | ✅ | hash_path day-bucket offset + HEAD write probes (`impl-slo-expirer-hash-20260807`) |
 | OpenStack-standard Paste pipeline filter behavior | ✅ | ❌ | Implemented Rust filters work; several names are explicit no-op aliases rather than Python-equivalent middleware |
 | Unlimited third-party arbitrary Paste plugins | ✅ | ❌ | In-process Rust factories can be registered in code; no Python egg, shared-library, or WASM loader. Unknown names fail closed by default |
@@ -89,7 +89,7 @@
 | Multi-rule CORS put/get | ✅ | ✅ |
 | Lifecycle Expiration **execution** | ✅ | ✅ | Enabled Days/Date → `X-Delete-At` on PUT; AbortIncompleteMPU marker delete-at |
 | Lifecycle **Transition** metadata execution | ✅ | ✅ | cold class after Transition-At → GET `InvalidObjectState`; restore window and metadata stamps |
-| Physical cold-tier storage-policy routing | ✅ | ❌ | `ColdPolicyMap` and memory backend are unit-only; proxy config does not populate `S3Api.cold_map`; no physical adapter |
+| Physical cold-tier storage-policy routing | ✅ | ❌ | **Not implemented:** `ColdPolicyMap` is a policy map + meta stamps only; proxy may load `cold_policy_map` conf but there is **no** physical cold/Glacier/tape backend that moves bytes |
 | Object Lock WORM (legal-hold/retention) | ✅ | ✅ | blocks DELETE/overwrite; **GOVERNANCE bypass**; COMPLIANCE/legal-hold hard-block |
 | s3token → Keystone /v3/s3tokens | ✅ | ✅ | live EC2 GREEN 2026-08-06 |
 | SigV2 | ✅ | ✅ | HMAC-SHA1 Base64 header+query; AWS vector + middleware good-sig path (`hard-residual-wave-20260808`) |
@@ -165,7 +165,7 @@
 | Area | Python | Rust | Notes |
 |------|:------:|:----:|-------|
 | process worker prefork | ✅ | ✅ | `process_workers` is wired into proxy startup |
-| eventlet/greenlet scheduling semantics | ✅ | ❌ | `eventlet_parity` is an isolated OS-thread helper module and is not used by the serving path |
+| eventlet/greenlet scheduling semantics | ✅ | ❌ | `thread_concurrency` (formerly `eventlet_parity`) is an isolated OS-thread/prefork helper; **not** greenlet and **not** wired into the HTTP serve path as eventlet |
 | `servers_per_port` process isolation | ✅ | ✅ | Contabo live 6211/6212 |
 | HAProxy + Keepalived | ✅ | ✅ | lab |
 | VIP TLS (operator PEM path) | ✅ | ⚠️ | Code+ops script GREEN; Contabo still **self-signed LAB** (2026-08-06 probe); production PEM apply not executed |

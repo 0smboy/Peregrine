@@ -190,6 +190,23 @@ impl Symlink {
     /// Build from raw config, mirroring `filter_factory`: parse
     /// `symloop_max` as an int (default 2 on absence or a parse failure),
     /// and clamp any value below 1 up to the default.
+    /// Fail closed on malformed `symloop_max` (non-integer).
+    pub fn try_from_conf(symloop_max: Option<&str>) -> Result<Self, String> {
+        match symloop_max {
+            None => Ok(Self::from_conf(None)),
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return Ok(Self::from_conf(None));
+                }
+                let parsed: i64 = trimmed
+                    .parse()
+                    .map_err(|_| format!("invalid symlink symloop_max {raw:?}: expected an integer"))?;
+                Ok(Self::from_conf(Some(&parsed.to_string())))
+            }
+        }
+    }
+
     pub fn from_conf(symloop_max: Option<&str>) -> Self {
         let parsed = symloop_max
             .and_then(|s| s.trim().parse::<i64>().ok())

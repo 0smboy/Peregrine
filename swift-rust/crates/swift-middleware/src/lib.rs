@@ -138,7 +138,10 @@ pub use staticweb::{
 pub use symlink::Symlink;
 pub use tempauth::{TempAuth, UserRecord};
 pub use tempurl::{ClosureKeyProvider, KeyProvider, TempUrl};
-pub use versioned_writes::{versions_object_name, VersionedWrites};
+pub use versioned_writes::{
+    versions_object_name, VersionedWrites,
+    AUTHORIZE_ONLY_HEADER as VERSIONED_WRITES_AUTHORIZE_ONLY_HEADER,
+};
 pub use xprofile::XProfile;
 
 use std::sync::Arc;

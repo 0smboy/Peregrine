@@ -1,31 +1,31 @@
 // Copyright (c) 2026 OpenStack Foundation
-//! Eventlet / greenlet cooperative-concurrency parity surface.
+//! OS-thread / prefork concurrency **adapter** (lab helpers).
 //!
-//! Python Swift proxy uses **eventlet** greenthreads: many lightweight
-//! cooperatively scheduled coroutines per OS process, with explicit yield
-//! points (`eventlet.sleep(0)`, hub switch on I/O).
+//! # Honesty
 //!
-//! Rust maps this to:
-//! * **process_workers** — OS-level prefork (Python `workers` under eventlet)
-//! * **worker_threads** — threads per process ≈ greenthread pool capacity
-//! * **max_clients** — connection queue / accept backlog per worker
-//! * **cooperative yield** — [`cooperative_yield`] / [`GreenthreadPool`] with
-//!   explicit yield counters for bit-level semantic tests
+//! This module is **not** eventlet, **not** greenlet, and is **not** wired into
+//! the HTTP serve path as an eventlet substitute. Python Swift may use eventlet
+//! greenthreads; Rust Swift serves with a threaded HTTP server plus optional
+//! OS-process prefork (`process_workers`). The helpers here exist for:
 //!
-//! # Lab-only scheduling model
+//! * computing prefork × thread-pool sizing from conf-like inputs
+//! * a small OS-thread job pool for lab / unit tests
+//! * explicit yield counters for tests that want sched-point accounting
 //!
-//! | Eventlet concept        | Rust parity                              |
-//! |-------------------------|------------------------------------------|
-//! | `eventlet.spawn(f)`     | [`GreenthreadPool::spawn`]               |
-//! | `eventlet.sleep(0)`     | [`cooperative_yield`] (sched point)      |
-//! | `hub.switch()` on I/O   | thread park / channel recv               |
-//! | `monkey_patch` sockets  | std::net + thread pool (no monkey patch) |
-//! | greenthread local       | [`GreenLocal`] thread_local-like map     |
-//! | `tpool.execute`         | same pool (blocking section)             |
+//! Historical type names (`EventletConcurrency`, `GreenthreadPool`, …) are kept
+//! for low API churn; they describe OS threads, not greenlets.
 //!
-//! Full CPython eventlet bytecode identity is impossible. This module provides
-//! a testable OS-thread model only; the HTTP serving path does not currently
-//! construct this pool or use this concurrency calculation.
+//! # Mapping (conceptual only)
+//!
+//! | Conf / concept            | Rust meaning                                      |
+//! |---------------------------|---------------------------------------------------|
+//! | `process_workers`         | OS-level prefork (shared listen socket)           |
+//! | `worker_threads`          | threads per process (thread pool capacity)        |
+//! | `max_clients`             | connection queue / accept backlog per worker      |
+//! | cooperative yield helper  | [`cooperative_yield`] — `thread::yield_now` only  |
+//! | job pool                  | [`GreenthreadPool`] — OS threads, despite the name|
+//!
+//! Do **not** claim eventlet parity for production serving from this module.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,16 +48,15 @@ pub fn yield_count() -> u64 {
     YIELD_COUNT.load(Ordering::SeqCst)
 }
 
-/// Cooperative yield point — eventlet.sleep(0) analogue.
+/// Explicit sched yield for tests — records a counter then `thread::yield_now`.
 ///
-/// Records a yield and gives the OS scheduler a chance to run peers
-/// (`thread::yield_now`). Does **not** sleep wall-clock time.
+/// Does **not** emulate eventlet hubs or greenlet switching.
 pub fn cooperative_yield() {
     YIELD_COUNT.fetch_add(1, Ordering::SeqCst);
     thread::yield_now();
 }
 
-/// Optional timed sleep with yield accounting (eventlet.sleep(secs)).
+/// Timed sleep with yield accounting (lab helper; not an eventlet sleep).
 pub fn green_sleep(secs: f64) {
     YIELD_COUNT.fetch_add(1, Ordering::SeqCst);
     if secs <= 0.0 {
@@ -68,10 +67,10 @@ pub fn green_sleep(secs: f64) {
     thread::sleep(dur);
 }
 
-/// Effective concurrency formula matching Python eventlet wsgi.
+/// Effective concurrency formula for prefork + per-process thread pool.
 ///
 /// * `process_workers` OS processes (prefork)
-/// * each process: `worker_threads` ≈ greenthreads (capped)
+/// * each process: `worker_threads` OS threads (capped)
 /// * `max_clients` bounds accept queue
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventletConcurrency {
@@ -86,7 +85,7 @@ pub struct EventletConcurrency {
 /// Cap matching existing Swift-Rust servers (avoid unbounded thread spawn).
 pub const WORKER_THREADS_CAP: usize = 128;
 
-/// Compute concurrency from conf-like inputs (eventlet parity).
+/// Compute concurrency from conf-like inputs (prefork / thread adapter).
 pub fn compute_concurrency(
     process_workers: usize,
     workers: usize,
@@ -101,12 +100,13 @@ pub fn compute_concurrency(
         || model == "eventlet"
         || process_workers > 1
     {
-        // Per-process greenthread pool ≈ max_clients (Python eventlet).
+        // Per-process thread pool sized from max_clients (prefork model).
+        // `worker_model=eventlet` is accepted as an alias for prefork sizing only.
         let wt = max_clients.clamp(1, WORKER_THREADS_CAP);
         (
             wt,
             format!(
-                "eventlet: process_workers={process_workers} × max_clients→threads={wt} (cap {WORKER_THREADS_CAP})"
+                "prefork: process_workers={process_workers} × max_clients→threads={wt} (cap {WORKER_THREADS_CAP})"
             ),
         )
     } else {
@@ -128,8 +128,9 @@ pub fn compute_concurrency(
     }
 }
 
-/// Greenthread-like pool: bounded worker threads executing spawn'd jobs
-/// cooperatively (each job may call [`cooperative_yield`]).
+/// Bounded OS-thread job pool (name is historical; not greenlets).
+///
+/// Each finished job calls [`cooperative_yield`] for test accounting only.
 pub struct GreenthreadPool {
     jobs: JobQueue,
     shutdown: Arc<Mutex<bool>>,
@@ -170,7 +171,7 @@ impl GreenthreadPool {
         }
     }
 
-    /// eventlet.spawn — queue a job.
+    /// Queue a job onto the OS-thread pool.
     pub fn spawn<F>(&self, f: F)
     where
         F: FnOnce() + Send + 'static,
@@ -208,7 +209,7 @@ impl Drop for GreenthreadPool {
     }
 }
 
-/// Greenlet-local storage keyed by greenthread id (thread id here).
+/// Thread-local-ish map keyed by OS thread id (name is historical).
 #[derive(Debug, Default)]
 pub struct GreenLocal<T: Clone + Send> {
     map: Mutex<std::collections::HashMap<thread::ThreadId, T>>,
@@ -255,7 +256,7 @@ mod tests {
         assert_eq!(c.process_workers, 4);
         assert_eq!(c.worker_threads, WORKER_THREADS_CAP); // 1024 capped
         assert_eq!(c.connection_queue, 1024);
-        assert!(c.formula.contains("eventlet"));
+        assert!(c.formula.contains("prefork"));
     }
 
     #[test]

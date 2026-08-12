@@ -44,18 +44,28 @@ const DELETE_MARKER_CONTENT_TYPE: &str = "application/x-deleted;swift_versions_d
 const SYSMETA_VERSIONS_LOC: &str = "X-Container-Sysmeta-Versions-Location";
 const SYSMETA_VERSIONS_MODE: &str = "X-Container-Sysmeta-Versions-Mode";
 
+/// Trusted, internal authorization probe understood by the terminal proxy.
+///
+/// Gatekeeper must strip this header from client requests. The terminal app
+/// authorizes then returns without backend I/O (normally 204).
+pub const AUTHORIZE_ONLY_HEADER: &str = "X-Backend-Versioned-Writes-Authorize-Only";
+
 /// The `versioned_writes` middleware.
 pub struct VersionedWrites {
     /// When set (true/false), this middleware owns enablement. When `None`,
     /// object versioning still runs if the container already has a location
     /// (legacy container-server `allow_versions` compatibility).
     pub allow_versioned_writes: Option<bool>,
+    /// Whether the terminal proxy implements [`AUTHORIZE_ONLY_HEADER`].
+    /// False is the only safe default.
+    authorization_probe_supported: bool,
 }
 
 impl Default for VersionedWrites {
     fn default() -> Self {
         VersionedWrites {
             allow_versioned_writes: Some(true),
+            authorization_probe_supported: false,
         }
     }
 }
@@ -68,7 +78,13 @@ impl VersionedWrites {
     pub fn from_conf(allow: Option<&str>) -> Self {
         VersionedWrites {
             allow_versioned_writes: allow.map(config_true_value),
+            authorization_probe_supported: false,
         }
+    }
+
+    pub fn with_authorization_probe(mut self, supported: bool) -> Self {
+        self.authorization_probe_supported = supported;
+        self
     }
 }
 

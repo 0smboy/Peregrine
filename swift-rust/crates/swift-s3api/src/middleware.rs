@@ -178,6 +178,10 @@ pub struct S3Api {
     pub location: String,
     /// Reseller prefix for Keystone project → Swift account (`AUTH_`).
     pub reseller_prefix: String,
+    /// Max SigV2/SigV4 clock skew tolerance in seconds (default 900).
+    pub allowable_clock_skew: u64,
+    /// Enable lab-only extended S3 subresources when true.
+    pub extended_subresources: bool,
     /// When set, unknown access keys are exchanged via Keystone `/v3/s3tokens`
     /// with a real base64 string-to-sign (EC2 deferral).
     pub s3token_client: Option<Arc<dyn S3TokenClient>>,
@@ -195,6 +199,8 @@ impl S3Api {
             dns_compliant_bucket_names: true,
             location: "us-east-1".to_string(),
             reseller_prefix: "AUTH_".into(),
+            allowable_clock_skew: 15 * 60,
+            extended_subresources: false,
             s3token_client: None,
             iam: crate::iam::IamService::new(),
             cold_map: crate::cold_tier::ColdPolicyMap::new(),
@@ -235,7 +241,17 @@ impl S3Api {
         self
     }
 
-    pub fn with_s3token_client(mut self, client: Arc<dyn S3TokenClient>) -> Self {
+    pub fn with_allowable_clock_skew(mut self, seconds: u64) -> Self {
+        self.allowable_clock_skew = seconds;
+        self
+    }
+
+    pub fn with_extended_subresources(mut self, enabled: bool) -> Self {
+        self.extended_subresources = enabled;
+        self
+    }
+
+        pub fn with_s3token_client(mut self, client: Arc<dyn S3TokenClient>) -> Self {
         self.s3token_client = Some(client);
         self
     }

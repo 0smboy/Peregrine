@@ -307,6 +307,15 @@ impl RateLimit {
     }
 
     /// Build from raw config strings, mirroring `RateLimitMiddleware.__init__`.
+    /// Validating constructor used by the proxy builder. Currently wraps
+    /// [`Self::from_conf`] (no extra fail-closed checks beyond parse defaults).
+    pub fn try_from_conf(
+        conf: &HashMap<String, String>,
+        clock: Box<dyn Clock>,
+    ) -> Result<Self, String> {
+        Ok(Self::from_conf(conf, clock))
+    }
+
     pub fn from_conf(conf: &HashMap<String, String>, clock: Box<dyn Clock>) -> Self {
         let get_float = |key: &str, default: f64| {
             conf.get(key)

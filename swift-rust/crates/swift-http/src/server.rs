@@ -624,7 +624,7 @@ impl Read for ConnBodyReader {
                     ChunkState::Finished => {
                         // An interim response re-arms the body: a fresh
                         // chunked sequence follows the previous terminator
-                        // (eventlet's multiphase-PUT semantics).
+                        // (Python Swift's multiphase-PUT semantics).
                         if self.interim.take_resume() {
                             *state = ChunkState::Size;
                             continue;
@@ -817,7 +817,7 @@ fn handle_connection(
             };
             // Interim (`100 Continue`) writes go out only when the client
             // asked for them; otherwise the handle's sends are no-ops
-            // (eventlet parity). The hijack half is always available — a
+            // (Python swob semantics). The hijack half is always available — a
             // full-duplex handler (SSYNC) may take the wire over.
             let interim = InterimResponder::with_hijack(
                 if head.expect_continue {
@@ -1598,7 +1598,7 @@ mod tests {
         // The backend two-phase PUT wire shape: the handler advertises
         // capabilities on the first 100, reads chunked sequence #1
         // (data), sends a second 100, then reads the commit from a NEW
-        // chunked sequence (eventlet's chunk_length reset).
+        // chunked sequence (Python Swift's chunk_length reset).
         let handler: Handler = Arc::new(|mut request: Request| {
             let interim = request.body.interim_responder().expect("interim handle");
             interim

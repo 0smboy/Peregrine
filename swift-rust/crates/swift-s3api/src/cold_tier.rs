@@ -1,22 +1,24 @@
 // Copyright (c) 2026 OpenStack Foundation
-//! Cold-tier / Glacier-like storage-policy transition **staging helpers**.
+//! Cold-tier / Glacier-like storage-policy transition **policy map + meta stamps**.
 //!
 //! # Honest boundary
 //!
-//! Lifecycle Transition stamps (see [`crate::lifecycle_exec`]) mark objects
-//! as intending a cold class. This module can prepare the metadata and backend
-//! policy headers needed by an external mover:
+//! **Physical cold backend is not implemented.** This module is a policy map
+//! and metadata-stamp helper only. Lifecycle Transition stamps (see
+//! [`crate::lifecycle_exec`]) mark objects as intending a cold class. Helpers
+//! here can prepare headers an *external* mover would need:
 //!
 //! 1. Map S3 StorageClass → Swift storage-policy index (`cold_policy_map`).
 //! 2. On due transition: stamp backend policy index + cold object path meta.
 //! 3. Restore: temporary rehydrate window via [`SYS_RESTORE_UNTIL`] plus
 //!    optional policy index restore target.
 //!
-//! It does **not** copy object bytes between policies, schedule a mover, or
-//! make later proxy reads discover per-object policy metadata. `S3Api` does
-//! not currently call these helpers, and Python Swift 2.33 rejects direct
-//! non-`STANDARD` storage classes and `?restore`. Therefore this is a tested
-//! library primitive, not a deployable physical Glacier claim.
+//! It does **not** copy object bytes between policies, schedule a mover, talk
+//! to tape/Glacier, or guarantee later proxy reads honor per-object policy
+//! metadata. Proxy may populate [`ColdPolicyMap`] from conf; that still does
+//! not implement a physical cold store. Python Swift 2.33 rejects direct
+//! non-`STANDARD` storage classes and `?restore`. Do not claim physical cold
+//! media from this crate.
 
 use std::collections::HashMap;
 
@@ -93,7 +95,7 @@ impl ColdPolicyMap {
     }
 }
 
-/// Result of applying a physical cold transition.
+/// Metadata-stamp result only — **not** proof that bytes moved to cold media.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhysicalTransition {
     pub storage_class: String,
@@ -102,11 +104,12 @@ pub struct PhysicalTransition {
     pub backend_uri: String,
 }
 
-/// Prepare cold-transition stamps when a policy map is configured.
+/// Stamp cold-transition **metadata** when a policy map is configured.
 ///
-/// Sets [`SYS_TRANSITIONED`], cold/hot policy indices, optional backend URI,
-/// and `X-Backend-Storage-Policy-Index` for subsequent object writes/moves.
-/// Returns `None` if class is not cold or no policy mapping exists.
+/// Sets [`SYS_TRANSITIONED`], cold/hot policy indices, a URI *hint*, and
+/// `X-Backend-Storage-Policy-Index`. Does **not** move object bytes or invoke
+/// a physical cold backend (none is implemented). Returns `None` if class is
+/// not cold or no policy mapping exists.
 pub fn apply_physical_transition(
     headers: &mut HeaderKeyDict,
     map: &ColdPolicyMap,
@@ -136,7 +139,7 @@ pub fn apply_physical_transition(
     })
 }
 
-/// If transition is due and a policy map is configured, prepare policy stamps.
+/// If transition is due and a policy map is configured, prepare **meta** stamps only.
 pub fn maybe_physicalize_due_transition(
     headers: &mut HeaderKeyDict,
     map: &ColdPolicyMap,
@@ -184,8 +187,8 @@ pub fn maybe_physicalize_due_transition(
     apply_physical_transition(headers, map, &sc, None, account, container, key)
 }
 
-/// Apply restore: set restore-until and optionally route GETs to hot policy
-/// during the window (backend index → hot).
+/// Apply restore **stamps**: set restore-until and optionally route GETs to hot
+/// policy index during the window. Does not rehydrate bytes from cold media.
 pub fn apply_physical_restore(
     headers: &mut HeaderKeyDict,
     map: &ColdPolicyMap,

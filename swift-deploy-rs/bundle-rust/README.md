@@ -102,6 +102,8 @@ Default Contabo remains TempAuth on VIP `:8085`.
 - No managed block-device wipe/format (dual-guard).
 - Rocky 9 x86_64 only (prebuilt binaries; glibc >= 2.34).
 - NTP/chrony groups kept for validation only (not managed here).
+- No third-party Paste plugin ABI: unknown filters skip/fail-closed (`strict_pipeline=true`, `plugin_default=skip`); `NamedPassthrough` is an in-process stub only — see [PIPELINE-PLUGINS.md](../../docs/fairness-lab/PIPELINE-PLUGINS.md).
+- No physical cold / Glacier backend: `cold_policy_map` is policy metadata only.
 
 ## Layout
 

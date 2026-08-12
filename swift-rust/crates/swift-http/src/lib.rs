@@ -24,7 +24,7 @@
 mod body;
 mod conditional;
 mod dates;
-pub mod eventlet_parity;
+pub mod thread_concurrency;
 mod headers;
 mod mime;
 mod range;
@@ -50,7 +50,7 @@ pub use server::{
     bind_listener, install_sigterm_flag, serve_forever, serve_forever_multi,
     serve_forever_with_config, AccessLog, Handler, ServerConfig,
 };
-pub use eventlet_parity::{
+pub use thread_concurrency::{
     compute_concurrency, cooperative_yield, green_sleep, should_yield_heartbeat, yield_count,
     EventletConcurrency, GreenLocal, GreenthreadPool, WORKER_THREADS_CAP,
 };

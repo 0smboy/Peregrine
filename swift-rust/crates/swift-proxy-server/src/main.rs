@@ -227,10 +227,11 @@ fn main() {
     let app = Arc::new(RwLock::new(Arc::new(app)));
 
     let bind = format!("{}:{}", get("bind_ip", "0.0.0.0"), get("bind_port", "8080"));
-    // Eventlet-like multi-process workers: `process_workers` (or numeric
-    // `workers` when `worker_model=process`) forks after bind so each child
-    // accepts on the shared socket (SO_REUSEADDR). Thread pool size remains
-    // `worker_threads` / ServerConfig inside each process.
+    // Prefork multi-process workers: `process_workers` (or numeric
+    // `workers` when `worker_model=process|prefork|eventlet-alias`) forks after
+    // bind so each child accepts on the shared socket (SO_REUSEADDR). Thread
+    // pool size remains `worker_threads` / ServerConfig inside each process.
+    // This is OS prefork — not eventlet/greenlet concurrency.
     let process_workers = process_workers_from_conf(&conf);
     let listener = std::net::TcpListener::bind(&bind).unwrap_or_else(|e| {
         logger.error(&format!("could not bind {bind}: {e}"));
@@ -240,7 +241,7 @@ fn main() {
     if process_workers > 1 {
         prefork_workers(process_workers, &logger);
         logger.info(&format!(
-            "swift-proxy-server process_workers={process_workers} (eventlet-like prefork)"
+            "swift-proxy-server process_workers={process_workers} (prefork workers)"
         ));
     }
     logger.info(&format!("swift-proxy-server listening on {bind}"));
@@ -795,7 +796,7 @@ fn configured_pipeline_has(conf: &SwiftConfig, name: &str) -> bool {
         .unwrap_or_else(|| DEFAULT_CONFIGURED_FILTERS.contains(&name))
 }
 
-/// Number of OS processes for eventlet-like worker model.
+/// Number of OS processes for prefork worker model.
 /// Prefer `[app:proxy-server] process_workers`; if `worker_model = process`
 /// then numeric `workers` is treated as process count (threads use
 /// `worker_threads` or default).
