@@ -294,7 +294,7 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
         "PUT",
         "/v1/AUTH_ec/ecbox/big.bin",
         &[
-            ("Content-Type", "application/octet-stream"),
+            ("Content-Type", "text/plain"),
             ("X-Backend-Storage-Policy-Index", "1"),
         ],
         &payload,
@@ -508,7 +508,7 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
         &boundary,
         &[(0, 100), (1200, 1300), (3400, 3500)],
         &payload,
-        "application/octet-stream",
+        "text/plain",
         payload.len() as u64,
     );
     assert_eq!(body, expected, "multipart body matches the oracle framing");
@@ -530,7 +530,7 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
         .any(|(k, v)| k.eq_ignore_ascii_case("Content-Range")
             && v == &format!("bytes */{}", payload.len())));
     assert!(headers.iter().any(|(k, v)| {
-        k.eq_ignore_ascii_case("Content-Type") && v == "application/octet-stream"
+        k.eq_ignore_ascii_case("Content-Type") && v == "text/plain"
     }));
     assert!(headers.iter().any(|(k, v)| {
         k.eq_ignore_ascii_case("Etag") && v.trim_matches('"') == md5_hex(&payload)
