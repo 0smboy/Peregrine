@@ -226,7 +226,7 @@ pub fn canonicalized_resource(req: &Request) -> String {
         }
     }
     // Also include override response headers already covered above.
-    subs.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
+    subs.sort_by_key(|a| a.0.to_ascii_lowercase());
     if !subs.is_empty() {
         resource.push('?');
         for (i, (k, v)) in subs.iter().enumerate() {
@@ -263,7 +263,7 @@ pub fn date_for_string_to_sign(req: &Request, auth: &SigV2Auth) -> String {
     // Header: if x-amz-date present, Date slot is empty.
     let has_amz_date = req.headers.iter().any(|(k, _)| {
         let kl = k.to_ascii_lowercase();
-        kl == "x-amz-date" || kl == "x-amz-date".to_string()
+        kl == "x-amz-date"
     }) || req.headers.get("x-amz-date").is_some()
         || req.headers.get("X-Amz-Date").is_some();
     // Check any x-amz-date via iter (case-insensitive get may work too).
@@ -327,7 +327,7 @@ pub fn hmac_sha1(key: &[u8], msg: &[u8]) -> [u8; 20] {
 /// Standard Base64 encode (no line wraps).
 pub fn base64_encode(data: &[u8]) -> String {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= data.len() {
         let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);

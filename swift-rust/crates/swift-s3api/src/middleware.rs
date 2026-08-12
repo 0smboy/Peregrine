@@ -400,8 +400,7 @@ fn decode_and_fix_aws_chunked(
         .get("Content-Length")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(MAX_CONTROL_BODY)
-        .max(MAX_CONTROL_BODY)
-        .min(MAX_AWS_CHUNKED_BODY);
+        .clamp(MAX_CONTROL_BODY, MAX_AWS_CHUNKED_BODY);
     let framed = match req.body.take().into_vec(cap) {
         Ok(b) => b,
         Err(_) => {
@@ -1218,7 +1217,7 @@ impl S3Api {
 
         // ---- MultiDelete ----
         if has_delete && req.method == "POST" && bucket.is_some() && key.is_none() {
-            return handle_multi_delete(req, &cred, bucket.as_deref().unwrap(), &next);
+            return handle_multi_delete(req, &cred, bucket.as_deref().unwrap(), next);
         }
 
         // ---- ACL ----
@@ -1229,23 +1228,23 @@ impl S3Api {
                 &owner,
                 bucket.as_deref().unwrap(),
                 key.as_deref(),
-                &next,
+                next,
             );
         }
 
         // ---- CORS ----
         if has_cors && bucket.is_some() && key.is_none() {
-            return handle_cors(req, &cred, bucket.as_deref().unwrap(), &next);
+            return handle_cors(req, &cred, bucket.as_deref().unwrap(), next);
         }
 
         // ---- Versioning (bucket status) ----
         if has_versioning && bucket.is_some() && key.is_none() {
-            return handle_versioning(req, &cred, bucket.as_deref().unwrap(), &next);
+            return handle_versioning(req, &cred, bucket.as_deref().unwrap(), next);
         }
 
         // ---- List object versions ----
         if has_versions && bucket.is_some() && key.is_none() && req.method == "GET" {
-            return handle_list_versions(&cred, bucket.as_deref().unwrap(), &params, &next);
+            return handle_list_versions(&cred, bucket.as_deref().unwrap(), &params, next);
         }
 
         // ---- Tagging (bucket + object) ----
@@ -1255,18 +1254,18 @@ impl S3Api {
                 &cred,
                 bucket.as_deref().unwrap(),
                 key.as_deref(),
-                &next,
+                next,
             );
         }
 
         // ---- Lifecycle (bucket) ----
         if has_lifecycle && bucket.is_some() && key.is_none() {
-            return handle_lifecycle(req, &cred, bucket.as_deref().unwrap(), &next);
+            return handle_lifecycle(req, &cred, bucket.as_deref().unwrap(), next);
         }
 
         // ---- Object Lock configuration (bucket) ----
         if has_object_lock && bucket.is_some() && key.is_none() {
-            return handle_object_lock(req, &cred, bucket.as_deref().unwrap(), &next);
+            return handle_object_lock(req, &cred, bucket.as_deref().unwrap(), next);
         }
 
         // ---- Object legal-hold / retention (WORM sysmeta) ----
@@ -1276,7 +1275,7 @@ impl S3Api {
                 &cred,
                 bucket.as_deref().unwrap(),
                 key.as_deref().unwrap(),
-                &next,
+                next,
             );
         }
         if has_retention && bucket.is_some() && key.is_some() {
@@ -1285,7 +1284,7 @@ impl S3Api {
                 &cred,
                 bucket.as_deref().unwrap(),
                 key.as_deref().unwrap(),
-                &next,
+                next,
             );
         }
 
@@ -1295,7 +1294,7 @@ impl S3Api {
                 &cred,
                 bucket.as_deref().unwrap(),
                 key.as_deref().unwrap(),
-                &next,
+                next,
             );
         }
         // ListMultipartUploads (`GET /bucket?uploads`, no key): list upload
@@ -1305,7 +1304,7 @@ impl S3Api {
                 &cred,
                 bucket.as_deref().unwrap(),
                 &params,
-                &next,
+                next,
             );
         }
         if has_uploads && bucket.is_some() && key.is_none() {
@@ -1319,17 +1318,17 @@ impl S3Api {
             if let (Some(b), Some(k)) = (bucket.clone(), key.clone()) {
                 if req.method == "PUT" {
                     if let Some(pn) = part_number {
-                        return handle_mpu_part(&cred, &b, &k, &uid, pn, req, &next);
+                        return handle_mpu_part(&cred, &b, &k, &uid, pn, req, next);
                     }
                 }
                 if req.method == "POST" {
-                    return handle_mpu_complete(&cred, &b, &k, &uid, req, &next);
+                    return handle_mpu_complete(&cred, &b, &k, &uid, req, next);
                 }
                 if req.method == "DELETE" {
-                    return handle_mpu_abort(&cred, &b, &k, &uid, &next);
+                    return handle_mpu_abort(&cred, &b, &k, &uid, next);
                 }
                 if req.method == "GET" {
-                    return handle_mpu_list_parts(&cred, &b, &k, &uid, &params, &next);
+                    return handle_mpu_list_parts(&cred, &b, &k, &uid, &params, next);
                 }
             }
         }
@@ -1344,7 +1343,7 @@ impl S3Api {
         // Multi-version object data plane (Enabled) or explicit ?versionId=.
         if let (Some(b), Some(k)) = (bucket.clone(), key.clone()) {
             if matches!(method.as_str(), "PUT" | "GET" | "HEAD" | "DELETE") {
-                let vstatus = probe_bucket_versioning(&cred, &b, &next);
+                let vstatus = probe_bucket_versioning(&cred, &b, next);
                 let enabled = versioning_enabled(vstatus.as_deref());
                 if enabled || version_id_q.is_some() {
                     return handle_versioned_object(
@@ -1356,7 +1355,7 @@ impl S3Api {
                         version_id_q.as_deref(),
                         enabled,
                         is_copy,
-                        &next,
+                        next,
                     );
                 }
             }
@@ -1416,7 +1415,7 @@ impl S3Api {
                 bucket.as_deref().unwrap(),
                 key.as_deref().unwrap(),
                 worm_bypass,
-                &next,
+                next,
             ) {
                 return blocked;
             }
@@ -1424,7 +1423,7 @@ impl S3Api {
                 &cred,
                 bucket.as_deref().unwrap(),
                 key.as_deref().unwrap(),
-                &next,
+                next,
             ) {
                 return blocked;
             }
@@ -2112,7 +2111,7 @@ fn handle_versioned_put(
         let old_lm = cur
             .headers
             .get("Last-Modified")
-            .map(|s| http_date_to_s3_approx(s))
+            .map(http_date_to_s3_approx)
             .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
 
         archive_current_version(cred, bucket, key, &old_vid, next);
@@ -2166,7 +2165,7 @@ fn handle_versioned_put(
     let lm = resp
         .headers
         .get("Last-Modified")
-        .map(|s| http_date_to_s3_approx(s))
+        .map(http_date_to_s3_approx)
         .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
 
     idx.push_latest(VersionRecord {
@@ -2183,7 +2182,7 @@ fn handle_versioned_put(
         let iso = resp
             .headers
             .get("Last-Modified")
-            .map(|s| http_date_to_s3_approx(s))
+            .map(http_date_to_s3_approx)
             .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
         let mut r = xml_response(200, copy_object_result_xml(&iso, &etag));
         r.headers.set(HDR_VERSION_ID, &new_vid);
@@ -2390,7 +2389,7 @@ fn handle_versioned_delete(
         let old_lm = cur
             .headers
             .get("Last-Modified")
-            .map(|s| http_date_to_s3_approx(s))
+            .map(http_date_to_s3_approx)
             .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
         archive_current_version(cred, bucket, key, &old_vid, next);
         if idx.find(&old_vid).is_none() {
@@ -4280,11 +4279,7 @@ mod tests {
                         return resp;
                     }
                     // +versions may not exist yet
-                    return if path.ends_with("+versions") {
-                        Response::new(404)
-                    } else {
-                        Response::new(404)
-                    };
+                    return Response::new(404);
                 }
                 if method == "PUT" {
                     store

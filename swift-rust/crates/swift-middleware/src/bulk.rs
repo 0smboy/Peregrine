@@ -632,8 +632,6 @@ mod tests {
                 .push((r.method.clone(), r.path.clone()));
             if r.method == "HEAD" {
                 Response::new(404)
-            } else if r.method == "PUT" && r.path.ends_with("/cont") {
-                Response::new(201)
             } else if r.method == "PUT" {
                 Response::new(201)
             } else {

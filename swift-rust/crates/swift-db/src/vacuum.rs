@@ -107,13 +107,16 @@ pub fn sample_device_db_space(device_path: &Path) -> Vec<Result<DbSpaceSample, D
 }
 
 /// VACUUM every DB on a device. Returns before/after pairs for each path.
-pub fn vacuum_device_dbs(
-    device_path: &Path,
-) -> Vec<(
+/// One vacuum_device_dbs row: path + before/after samples.
+type VacuumDeviceRow = (
     PathBuf,
     Result<DbSpaceSample, DbError>,
     Result<DbSpaceSample, DbError>,
-)> {
+);
+
+pub fn vacuum_device_dbs(
+    device_path: &Path,
+) -> Vec<VacuumDeviceRow> {
     let mut paths = db_locations(device_path, "accounts");
     paths.extend(db_locations(device_path, "containers"));
     let mut out = Vec::new();

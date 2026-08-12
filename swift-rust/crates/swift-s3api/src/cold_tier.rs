@@ -97,12 +97,15 @@ impl ColdPolicyMap {
 
 /// Metadata-stamp result only — **not** proof that bytes moved to cold media.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PhysicalTransition {
+pub struct ColdMetaStamp {
     pub storage_class: String,
     pub cold_policy_index: i64,
     pub hot_policy_index: i64,
     pub backend_uri: String,
 }
+
+#[deprecated(note = "renamed to ColdMetaStamp — meta stamp only, not physical media move")]
+pub type PhysicalTransition = ColdMetaStamp;
 
 /// Stamp cold-transition **metadata** when a policy map is configured.
 ///
@@ -110,7 +113,7 @@ pub struct PhysicalTransition {
 /// `X-Backend-Storage-Policy-Index`. Does **not** move object bytes or invoke
 /// a physical cold backend (none is implemented). Returns `None` if class is
 /// not cold or no policy mapping exists.
-pub fn apply_physical_transition(
+pub fn stamp_cold_policy_meta(
     headers: &mut HeaderKeyDict,
     map: &ColdPolicyMap,
     storage_class: &str,
@@ -118,7 +121,7 @@ pub fn apply_physical_transition(
     object_account: &str,
     object_container: &str,
     object_key: &str,
-) -> Option<PhysicalTransition> {
+) -> Option<ColdMetaStamp> {
     if !is_cold_storage_class(storage_class) {
         return None;
     }
@@ -131,7 +134,7 @@ pub fn apply_physical_transition(
     headers.set(SYS_HOT_POLICY_INDEX, hot.to_string());
     headers.set(SYS_COLD_BACKEND_URI, &uri);
     headers.set(HDR_BACKEND_STORAGE_POLICY_INDEX, cold.to_string());
-    Some(PhysicalTransition {
+    Some(ColdMetaStamp {
         storage_class: storage_class.to_string(),
         cold_policy_index: cold,
         hot_policy_index: hot,
@@ -140,14 +143,14 @@ pub fn apply_physical_transition(
 }
 
 /// If transition is due and a policy map is configured, prepare **meta** stamps only.
-pub fn maybe_physicalize_due_transition(
+pub fn maybe_stamp_due_cold_transition(
     headers: &mut HeaderKeyDict,
     map: &ColdPolicyMap,
     now_unix: i64,
     account: &str,
     container: &str,
     key: &str,
-) -> Option<PhysicalTransition> {
+) -> Option<ColdMetaStamp> {
     if !map.is_configured() {
         return None;
     }
@@ -177,19 +180,19 @@ pub fn maybe_physicalize_due_transition(
             .get(SYS_HOT_POLICY_INDEX)
             .and_then(|s| s.parse().ok())
             .unwrap_or(map.default_hot_policy);
-        return Some(PhysicalTransition {
+        return Some(ColdMetaStamp {
             storage_class: sc,
             cold_policy_index: cold,
             hot_policy_index: hot,
             backend_uri: headers.get(SYS_COLD_BACKEND_URI).unwrap_or("").to_string(),
         });
     }
-    apply_physical_transition(headers, map, &sc, None, account, container, key)
+    stamp_cold_policy_meta(headers, map, &sc, None, account, container, key)
 }
 
 /// Apply restore **stamps**: set restore-until and optionally route GETs to hot
 /// policy index during the window. Does not rehydrate bytes from cold media.
-pub fn apply_physical_restore(
+pub fn stamp_cold_restore_meta(
     headers: &mut HeaderKeyDict,
     map: &ColdPolicyMap,
     days: i64,
@@ -287,12 +290,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn csv_map_and_physical_transition() {
+    fn csv_map_and_cold_meta_stamp() {
         let map = ColdPolicyMap::from_csv("GLACIER:2,DEEP_ARCHIVE:3,HOT:0");
         assert_eq!(map.policy_for_class("glacier"), Some(2));
         assert_eq!(map.default_hot_policy, 0);
         let mut h = HeaderKeyDict::new();
-        let t = apply_physical_transition(
+        let t = stamp_cold_policy_meta(
             &mut h,
             &map,
             "GLACIER",
@@ -312,8 +315,8 @@ mod tests {
     fn restore_routes_to_hot() {
         let map = ColdPolicyMap::from_csv("GLACIER:2,HOT:0");
         let mut h = HeaderKeyDict::new();
-        apply_physical_transition(&mut h, &map, "GLACIER", Some(0), "a", "c", "k").unwrap();
-        apply_physical_restore(&mut h, &map, 1, 1000);
+        stamp_cold_policy_meta(&mut h, &map, "GLACIER", Some(0), "a", "c", "k").unwrap();
+        stamp_cold_restore_meta(&mut h, &map, 1, 1000);
         assert_eq!(read_policy_index(&h, &map, 1000), Some(0));
         assert_eq!(read_policy_index(&h, &map, 1000 + 86_400 + 1), Some(2));
     }
@@ -328,9 +331,9 @@ mod tests {
     }
 
     #[test]
-    fn unmapped_class_no_physical() {
+    fn unmapped_class_no_stamp() {
         let map = ColdPolicyMap::new();
         let mut h = HeaderKeyDict::new();
-        assert!(apply_physical_transition(&mut h, &map, "GLACIER", None, "a", "c", "k").is_none());
+        assert!(stamp_cold_policy_meta(&mut h, &map, "GLACIER", None, "a", "c", "k").is_none());
     }
 }

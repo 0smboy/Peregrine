@@ -225,8 +225,8 @@ pub fn validate_sync_to(
     if value.is_empty() {
         return Ok(None);
     }
-    if value.starts_with("//") {
-        let data: Vec<&str> = value[2..].split('/').collect();
+    if let Some(rest) = value.strip_prefix("//") {
+        let data: Vec<&str> = rest.split('/').collect();
         if data.len() != 4 {
             return Err(format!("Invalid X-Container-Sync-To format {orig:?}"));
         }
@@ -254,10 +254,7 @@ pub fn validate_sync_to(
         .strip_prefix("https://")
         .or_else(|| value.strip_prefix("http://"))
         .ok_or_else(|| {
-            format!(
-                "Invalid scheme in X-Container-Sync-To, must be \"//\", \
-                 \"http\", or \"https\"."
-            )
+            "Invalid scheme in X-Container-Sync-To, must be \"//\",                  \"http\", or \"https\".".to_string()
         })?;
     let scheme = if value.starts_with("https://") {
         "https"
@@ -612,10 +609,9 @@ fn percent_encode_path(s: &str) -> String {
 pub fn parse_http_url(url: &str) -> Option<(String, u16, String, bool)> {
     let (rest, tls) = if let Some(r) = url.strip_prefix("https://") {
         (r, true)
-    } else if let Some(r) = url.strip_prefix("http://") {
-        (r, false)
     } else {
-        return None;
+        let r = url.strip_prefix("http://")?;
+        (r, false)
     };
     let (hostport, path) = match rest.split_once('/') {
         Some((h, p)) => (h, format!("/{p}")),

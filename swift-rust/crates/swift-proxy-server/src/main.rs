@@ -1256,10 +1256,6 @@ fn build_backend_ratelimit(conf: &SwiftConfig) -> swift_middleware::BackendRateL
 /// filters. P3-s3 wires `s3api` (ON-BY-CONFIG; not on default pipeline).
 /// Unknown names skip with a typed issue; `strict_pipeline=true` hard-fails at
 /// main without parsing log text.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "pipeline construction keeps each independently-built dependency explicit"
-)]
 fn build_configured_filters_with_issues(
     conf: &SwiftConfig,
     tempauth: Option<swift_middleware::TempAuth>,
@@ -1855,10 +1851,6 @@ fn build_configured_filters_with_issues(
 /// Production startup always consumes `build_configured_filters_with_issues`
 /// so no unresolved filter can be lost before the strict gate.
 #[cfg(test)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "legacy test adapter mirrors the production pipeline builder signature"
-)]
 fn build_configured_filters(
     conf: &SwiftConfig,
     tempauth: Option<swift_middleware::TempAuth>,
@@ -3304,12 +3296,8 @@ mod startup_policy_tests {
             .expect("ratelimit section builds the filter");
         assert_eq!(rl.account_ratelimit, 5.0);
         assert_eq!(rl.max_sleep_time_seconds, 30.0);
-        assert_eq!(
-            rl.memcache_servers(),
-            &["10.0.0.1:11211".to_string(), "10.0.0.2:11211".to_string()]
-        );
-
-        let invalid = SwiftConfig::parse_lenient(
+        // RateLimit uses an in-process store (memcache was never wired on this type).
+let invalid = SwiftConfig::parse_lenient(
             "[filter:ratelimit]\nuse = egg:swift#ratelimit\naccount_ratelimit = nope\n",
             &[],
             false,

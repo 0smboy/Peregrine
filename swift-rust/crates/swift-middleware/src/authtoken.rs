@@ -68,7 +68,7 @@ const IDENTITY_HEADERS: &[&str] = &[
 #[derive(Debug, Clone)]
 pub enum TokenOutcome {
     /// Token valid; identity fields lowercased roles already.
-    Confirmed(ValidatedToken),
+    Confirmed(Box<ValidatedToken>),
     /// Token present but rejected (unknown, expired, revoked).
     Invalid,
     /// No token / network skip when delay is allowed.
@@ -112,7 +112,7 @@ impl MapTokenValidator {
 impl TokenValidator for MapTokenValidator {
     fn validate(&self, token: &str) -> TokenOutcome {
         match self.tokens.get(token) {
-            Some(v) => TokenOutcome::Confirmed(v.clone()),
+            Some(v) => TokenOutcome::Confirmed(Box::new(v.clone())),
             None => TokenOutcome::Invalid,
         }
     }
@@ -246,7 +246,7 @@ impl TokenValidator for HttpTokenValidator {
             return TokenOutcome::Invalid;
         }
         match parse_token_body(&body) {
-            Some(v) => TokenOutcome::Confirmed(v),
+            Some(v) => TokenOutcome::Confirmed(Box::new(v)),
             None => TokenOutcome::Invalid,
         }
     }
@@ -533,7 +533,7 @@ impl Middleware for AuthToken {
                     },
                     _ => None,
                 };
-                Self::stamp(&mut req, &validated, service.as_ref());
+                Self::stamp(&mut req, &validated, service.as_deref());
             }
         }
 

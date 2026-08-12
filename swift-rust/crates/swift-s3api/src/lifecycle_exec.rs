@@ -226,7 +226,7 @@ fn parse_iso8601_date(s: &str) -> Option<i64> {
 }
 
 fn days_from_civil(y: i32, m: u32, d: u32) -> Option<i64> {
-    if m < 1 || m > 12 || d < 1 || d > 31 {
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return None;
     }
     let y = y as i64;

@@ -32,7 +32,7 @@ pub fn key_hex(key: &str) -> String {
 }
 
 pub fn key_from_hex(enc: &str) -> Option<String> {
-    if enc.is_empty() || enc.len() % 2 != 0 {
+    if enc.is_empty() || !enc.len().is_multiple_of(2) {
         return None;
     }
     let mut bytes = Vec::with_capacity(enc.len() / 2);

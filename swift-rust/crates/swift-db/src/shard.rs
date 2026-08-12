@@ -257,13 +257,8 @@ impl ShardRange {
 
     /// True if this range's lower is strictly less than `upper` (empty upper = MAX).
     fn lower_lt_upper(lower: &str, upper: &str) -> bool {
-        if upper.is_empty() {
-            true // anything < MAX (including MIN lower)
-        } else if lower.is_empty() {
-            true // MIN < any real upper
-        } else {
-            lower < upper
-        }
+        // Empty bounds are MIN/MAX sentinels: either empty ⇒ strictly less.
+        upper.is_empty() || lower.is_empty() || lower < upper
     }
 
     /// `Namespace.overlaps`: `max(lower) < min(upper)` with empty = MIN/MAX.
@@ -638,7 +633,7 @@ mod tests {
         assert!(a.overlaps(&c));
         assert!(b.overlaps(&c));
         let mut acc = b.clone();
-        assert!(acc.expand(&[a.clone()]));
+        assert!(acc.expand(std::slice::from_ref(&a)));
         assert_eq!(acc.lower, "");
         assert_eq!(acc.upper, "");
         assert_eq!(a.row_count(), 0);

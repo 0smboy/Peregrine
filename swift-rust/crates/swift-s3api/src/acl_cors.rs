@@ -1105,11 +1105,13 @@ fn extract_tag_values(text: &str, tag: &str) -> Vec<String> {
 }
 
 fn parse_one_rule_xml(rule_xml: &str) -> CorsRule {
-    let mut rule = CorsRule::default();
-    rule.allowed_origins = extract_tag_values(rule_xml, "AllowedOrigin");
-    rule.allowed_methods = extract_tag_values(rule_xml, "AllowedMethod");
-    rule.allowed_headers = extract_tag_values(rule_xml, "AllowedHeader");
-    rule.expose_headers = extract_tag_values(rule_xml, "ExposeHeader");
+    let mut rule = CorsRule {
+        allowed_origins: extract_tag_values(rule_xml, "AllowedOrigin"),
+        allowed_methods: extract_tag_values(rule_xml, "AllowedMethod"),
+        allowed_headers: extract_tag_values(rule_xml, "AllowedHeader"),
+        expose_headers: extract_tag_values(rule_xml, "ExposeHeader"),
+        ..Default::default()
+    };
     if let Some(s) = rule_xml.find("<MaxAgeSeconds>") {
         let start = s + "<MaxAgeSeconds>".len();
         if let Some(end_rel) = rule_xml[start..].find("</MaxAgeSeconds>") {

@@ -72,7 +72,7 @@ pub fn decrypt_object_body(
     offset: u64,
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let meta = load_crypto_meta(body_meta_header).map_err(|e| e)?;
+    let meta = load_crypto_meta(body_meta_header)?;
     check_crypto_meta(&meta)?;
     let body_key = unwrap_body_key(object_key, &meta)?;
     let iv = meta_iv(&meta)?;

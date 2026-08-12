@@ -1664,7 +1664,7 @@ fn concurrent_head_warm(
     let next = Arc::clone(next);
     let req_template = req.clone_head();
     let queue: Arc<Mutex<Vec<(usize, String)>>> = Arc::new(Mutex::new(jobs));
-    let workers = concurrent_gets.min(16).max(1);
+    let workers = concurrent_gets.clamp(1, 16);
     let mut handles = Vec::new();
     for _ in 0..workers {
         let q = Arc::clone(&queue);

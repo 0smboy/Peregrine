@@ -922,6 +922,7 @@ mod tests {
         assert!(matches!(err, EncryptBodyError::TooLarge));
     }
 
+    #[allow(clippy::type_complexity)]
     fn put_get_pipeline(
         km: Arc<KeyMaster>,
     ) -> (

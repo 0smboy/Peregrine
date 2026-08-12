@@ -1,0 +1,4 @@
+# Structural thresholds for Swift-shaped middleware/DB APIs.
+# Mechanical lints remain deny-by-default via `cargo clippy -- -D warnings`.
+too-many-arguments-threshold = 12
+type-complexity-threshold = 500

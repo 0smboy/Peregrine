@@ -828,7 +828,7 @@ mod tests {
                     resp.headers.set(SYSMETA_VERSIONS_MODE, "history");
                     resp
                 }
-                ("GET", p) if p == "/v1/AUTH_test/c/obj" => {
+                ("GET", "/v1/AUTH_test/c/obj") => {
                     let mut resp = Response::with_body(200, b"cur".to_vec());
                     resp.headers.set("X-Timestamp", "1751500000.00000");
                     resp.headers.set("Content-Type", "text/plain");

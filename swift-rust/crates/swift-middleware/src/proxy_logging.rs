@@ -309,7 +309,7 @@ impl Middleware for ProxyLogging {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
-        let bytes_recvd = req.body.content_length().unwrap_or(0) as u64;
+        let bytes_recvd = req.body.content_length().unwrap_or(0);
         let remote_addr = req
             .headers
             .get("x-real-ip")
@@ -323,7 +323,7 @@ impl Middleware for ProxyLogging {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(start_time);
-            let bytes_sent = resp.body.content_length().unwrap_or(0) as u64;
+            let bytes_sent = resp.body.content_length().unwrap_or(0);
             let ctx = LogContext {
                 remote_addr,
                 protocol: "HTTP/1.0".to_string(),

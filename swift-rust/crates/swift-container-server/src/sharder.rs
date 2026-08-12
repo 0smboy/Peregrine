@@ -419,6 +419,7 @@ pub fn ring_get_nodes_for_shard(
 
 /// Build a [`LookupHttpShardReplicator`] backed by a live [`swift_ring::Ring`]
 /// and TCP transport (daemon default multi-node path).
+#[allow(clippy::type_complexity)]
 pub fn lookup_replicator_for_ring(
     ring: &swift_ring::Ring,
 ) -> LookupHttpShardReplicator<
@@ -1457,7 +1458,7 @@ pub fn maybe_auto_shard(
         &epoch,
     )?;
     broker.enable_sharding(&epoch)?;
-    Ok(broker.set_sharding_state()?)
+    broker.set_sharding_state()
 }
 
 #[cfg(test)]
