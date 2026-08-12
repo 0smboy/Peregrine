@@ -13,7 +13,7 @@
 //!
 //! Configure via conf under `[filter:s3api]`:
 //! * `iam_email_map = a@b.com:user1,...`
-//! * `iam_access_key_map = AKIA:alice,...`
+//! * `iam_access_key_map = AKIA=alice,test:tester=bob,...`
 //! * `iam_policy_json = {...}` or path via `iam_policy_file`
 //! * `iam_tenants = tenantA:alice,bob;tenantB:carol`
 
@@ -53,14 +53,19 @@ impl IdentityDirectory {
         self
     }
 
-    /// Parse `access_key:id,...`.
+    /// Parse `access_key=id,...` (preferred) or legacy `access_key:id,...`.
+    ///
+    /// TempAuth access keys themselves contain `:` (`account:user`), so the
+    /// legacy form splits at the *last* colon. This makes
+    /// `test:tester:alice` resolve `test:tester` to canonical id `alice`
+    /// instead of accidentally registering access key `test`.
     pub fn with_access_key_map_csv(mut self, csv: &str) -> Self {
         for part in csv.split(',') {
             let part = part.trim();
             if part.is_empty() {
                 continue;
             }
-            if let Some((ak, id)) = part.split_once(':') {
+            if let Some((ak, id)) = part.split_once('=').or_else(|| part.rsplit_once(':')) {
                 let ak = ak.trim().to_string();
                 let id = id.trim().to_string();
                 if !ak.is_empty() && !id.is_empty() {
@@ -83,12 +88,7 @@ impl IdentityDirectory {
     }
 
     /// Whether grantee id matches principal (access_key, account, or mapped ids).
-    pub fn principal_matches_id(
-        &self,
-        grantee_id: &str,
-        access_key: &str,
-        account: &str,
-    ) -> bool {
+    pub fn principal_matches_id(&self, grantee_id: &str, access_key: &str, account: &str) -> bool {
         if grantee_id.is_empty() {
             return false;
         }
@@ -405,10 +405,11 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
             return after_pre.ends_with(post.trim_start_matches('*'))
                 || wildcard_match(post, after_pre);
         }
-        return value[pre.len()..].ends_with(post) || value[pre.len()..].contains(post) && {
-            // prefix*suffix
-            value.starts_with(pre) && value.ends_with(post)
-        };
+        return value[pre.len()..].ends_with(post)
+            || value[pre.len()..].contains(post) && {
+                // prefix*suffix
+                value.starts_with(pre) && value.ends_with(post)
+            };
     }
     false
 }
@@ -421,9 +422,10 @@ mod tests {
     fn email_map_and_access_key() {
         let d = IdentityDirectory::new()
             .with_email_map_csv("a@x.com:alice,b@y.com:bob")
-            .with_access_key_map_csv("AKIA:alice");
+            .with_access_key_map_csv("AKIA=alice,test:tester:bob");
         assert_eq!(d.resolve_email("A@X.COM").as_deref(), Some("alice"));
         assert_eq!(d.canonical_id_for_access_key("AKIA"), "alice");
+        assert_eq!(d.canonical_id_for_access_key("test:tester"), "bob");
         assert!(d.principal_matches_id("alice", "AKIA", "AUTH_test"));
         assert!(!d.principal_matches_id("bob", "AKIA", "AUTH_test"));
     }

@@ -1,29 +1,30 @@
 // Copyright (c) 2026 OpenStack Foundation
-//! Physical cold-tier / Glacier-like storage-policy transition.
+//! Cold-tier / Glacier-like storage-policy transition **staging helpers**.
 //!
-//! # Product surface (LAB-HARD-GREEN → claimable unit)
+//! # Honest boundary
 //!
 //! Lifecycle Transition stamps (see [`crate::lifecycle_exec`]) mark objects
-//! as intending a cold class. This module implements the **physical** move:
+//! as intending a cold class. This module can prepare the metadata and backend
+//! policy headers needed by an external mover:
 //!
 //! 1. Map S3 StorageClass → Swift storage-policy index (`cold_policy_map`).
-//! 2. On due transition: stamp backend policy index + cold object path meta so
-//!    the proxy/object path can serve from the cold policy (or refuse GET
-//!    until restore).
+//! 2. On due transition: stamp backend policy index + cold object path meta.
 //! 3. Restore: temporary rehydrate window via [`SYS_RESTORE_UNTIL`] plus
 //!    optional policy index restore target.
 //!
-//! This is **not** a fake: it uses real Swift storage-policy indices that
-//! operators configure for glacier/tape rings. Without a mapped policy the
-//! module keeps metadata-only semantics (honest residual).
+//! It does **not** copy object bytes between policies, schedule a mover, or
+//! make later proxy reads discover per-object policy metadata. `S3Api` does
+//! not currently call these helpers, and Python Swift 2.33 rejects direct
+//! non-`STANDARD` storage classes and `?restore`. Therefore this is a tested
+//! library primitive, not a deployable physical Glacier claim.
 
 use std::collections::HashMap;
 
 use swift_http::HeaderKeyDict;
 
 use crate::lifecycle_exec::{
-    is_cold_storage_class, META_STORAGE_CLASS, SYS_RESTORE_UNTIL, SYS_TRANSITION_AT,
-    SYS_TRANSITIONED,
+    is_cold_storage_class, META_STORAGE_CLASS, SYS_RESTORE_UNTIL, SYS_TRANSITIONED,
+    SYS_TRANSITION_AT,
 };
 
 /// Sysmeta: storage policy index of the cold tier holding object bytes.
@@ -101,7 +102,7 @@ pub struct PhysicalTransition {
     pub backend_uri: String,
 }
 
-/// Apply physical cold transition stamps when policy map is configured.
+/// Prepare cold-transition stamps when a policy map is configured.
 ///
 /// Sets [`SYS_TRANSITIONED`], cold/hot policy indices, optional backend URI,
 /// and `X-Backend-Storage-Policy-Index` for subsequent object writes/moves.
@@ -120,9 +121,7 @@ pub fn apply_physical_transition(
     }
     let cold = map.policy_for_class(storage_class)?;
     let hot = hot_policy_index.unwrap_or(map.default_hot_policy);
-    let uri = format!(
-        "swift-policy://{cold}/{object_account}/{object_container}/{object_key}"
-    );
+    let uri = format!("swift-policy://{cold}/{object_account}/{object_container}/{object_key}");
     headers.set(META_STORAGE_CLASS, storage_class);
     headers.set(SYS_TRANSITIONED, "1");
     headers.set(SYS_COLD_POLICY_INDEX, cold.to_string());
@@ -137,7 +136,7 @@ pub fn apply_physical_transition(
     })
 }
 
-/// If transition is due and a policy map is configured, perform physical stamp.
+/// If transition is due and a policy map is configured, prepare policy stamps.
 pub fn maybe_physicalize_due_transition(
     headers: &mut HeaderKeyDict,
     map: &ColdPolicyMap,
@@ -158,7 +157,10 @@ pub fn maybe_physicalize_due_transition(
     }
     // Due?
     let due = if let Some(at_s) = headers.get(SYS_TRANSITION_AT) {
-        at_s.parse::<i64>().ok().map(|at| at <= now_unix).unwrap_or(false)
+        at_s.parse::<i64>()
+            .ok()
+            .map(|at| at <= now_unix)
+            .unwrap_or(false)
     } else {
         headers.get(SYS_TRANSITIONED).is_some()
     };
@@ -167,10 +169,7 @@ pub fn maybe_physicalize_due_transition(
     }
     // Already physical?
     if headers.get(SYS_COLD_POLICY_INDEX).is_some() {
-        let cold = headers
-            .get(SYS_COLD_POLICY_INDEX)?
-            .parse()
-            .ok()?;
+        let cold = headers.get(SYS_COLD_POLICY_INDEX)?.parse().ok()?;
         let hot = headers
             .get(SYS_HOT_POLICY_INDEX)
             .and_then(|s| s.parse().ok())
@@ -179,10 +178,7 @@ pub fn maybe_physicalize_due_transition(
             storage_class: sc,
             cold_policy_index: cold,
             hot_policy_index: hot,
-            backend_uri: headers
-                .get(SYS_COLD_BACKEND_URI)
-                .unwrap_or("")
-                .to_string(),
+            backend_uri: headers.get(SYS_COLD_BACKEND_URI).unwrap_or("").to_string(),
         });
     }
     apply_physical_transition(headers, map, &sc, None, account, container, key)
@@ -211,7 +207,11 @@ pub fn apply_physical_restore(
 ///
 /// Cold + not restored → cold policy (GET may still be blocked by
 /// [`crate::lifecycle_exec::transition_blocks_get`]). Restored → hot.
-pub fn read_policy_index(headers: &HeaderKeyDict, map: &ColdPolicyMap, now_unix: i64) -> Option<i64> {
+pub fn read_policy_index(
+    headers: &HeaderKeyDict,
+    map: &ColdPolicyMap,
+    now_unix: i64,
+) -> Option<i64> {
     let cold = headers
         .get(SYS_COLD_POLICY_INDEX)
         .and_then(|s| s.parse().ok());
@@ -234,14 +234,16 @@ pub fn read_policy_index(headers: &HeaderKeyDict, map: &ColdPolicyMap, now_unix:
 /// Tape / glacier adapter trait (LAB product boundary).
 pub trait ColdBackend: Send + Sync {
     /// Archive object bytes to cold media; return backend URI.
-    fn archive(&self, policy_index: i64, account: &str, container: &str, key: &str, body: &[u8])
-        -> Result<String, String>;
-    /// Stage restore from cold media into hot policy path.
-    fn restore_stage(
+    fn archive(
         &self,
-        backend_uri: &str,
-        days: i64,
-    ) -> Result<(), String>;
+        policy_index: i64,
+        account: &str,
+        container: &str,
+        key: &str,
+        body: &[u8],
+    ) -> Result<String, String>;
+    /// Stage restore from cold media into hot policy path.
+    fn restore_stage(&self, backend_uri: &str, days: i64) -> Result<(), String>;
 }
 
 /// In-process lab backend: stores archived blobs in memory (tests / SAIO).

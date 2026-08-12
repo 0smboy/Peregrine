@@ -142,6 +142,15 @@ pub struct ProxyConfig {
     /// When `Some`, Keystone authorize is used for requests stamped by the
     /// keystoneauth middleware (`X-Backend-Auth-Plugin: keystone`).
     pub keystone_auth: Option<swift_middleware::KeystoneAuth>,
+    /// Python's `strict_cors_mode`: simple CORS responses are emitted only
+    /// for an allowed Origin when true. Preflight always requires an allowed
+    /// Origin, regardless of this setting.
+    pub strict_cors_mode: bool,
+    /// Operator-wide origins from `cors_allow_origin`. Container metadata is
+    /// combined with these values when validating an Origin.
+    pub cors_allow_origin: Vec<String>,
+    /// Operator-wide additions to `Access-Control-Expose-Headers`.
+    pub cors_expose_headers: Vec<String>,
 }
 
 impl Default for ProxyConfig {
@@ -159,8 +168,20 @@ impl Default for ProxyConfig {
             recheck_account_existence: 60.0,
             auth_enabled: false,
             keystone_auth: None,
+            strict_cors_mode: true,
+            cors_allow_origin: Vec::new(),
+            cors_expose_headers: Vec::new(),
         }
     }
+}
+
+/// CORS values persisted as container user metadata. Python exposes these as
+/// `container_info['cors']` after reading the container HEAD response.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+struct CorsInfo {
+    allow_origin: Option<String>,
+    expose_headers: Option<String>,
+    max_age: Option<String>,
 }
 
 /// A container's cached info: its storage policy index, read/write ACLs,
@@ -175,6 +196,7 @@ struct ContainerInfo {
     temp_url_keys: Vec<String>,
     /// Destination container's `X-Container-Sync-Key` (for inbound sync auth).
     sync_key: Option<String>,
+    cors: CorsInfo,
 }
 
 impl ContainerInfo {
@@ -360,6 +382,11 @@ fn container_info_to_json(info: &ContainerInfo) -> serde_json::Value {
         "write_acl": info.write_acl,
         "temp_url_keys": info.temp_url_keys,
         "sync_key": info.sync_key,
+        "cors": {
+            "allow_origin": info.cors.allow_origin,
+            "expose_headers": info.cors.expose_headers,
+            "max_age": info.cors.max_age,
+        },
     })
 }
 
@@ -388,6 +415,23 @@ fn container_info_from_json(v: &serde_json::Value) -> Option<ContainerInfo> {
             .get("sync_key")
             .and_then(|x| x.as_str())
             .map(str::to_string),
+        cors: CorsInfo {
+            allow_origin: v
+                .get("cors")
+                .and_then(|cors| cors.get("allow_origin"))
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
+            expose_headers: v
+                .get("cors")
+                .and_then(|cors| cors.get("expose_headers"))
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
+            max_age: v
+                .get("cors")
+                .and_then(|cors| cors.get("max_age"))
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
+        },
     })
 }
 
@@ -521,6 +565,40 @@ fn swob_response(status: u16) -> Response {
     };
     resp.headers.set("Content-Type", "text/html; charset=UTF-8");
     resp
+}
+
+fn method_not_allowed(allow: &str) -> Response {
+    let mut resp = swob_response(405);
+    resp.headers.set("Allow", allow);
+    resp
+}
+
+/// Python `list_from_csv`: trim comma-separated values, omit empties, and
+/// return each distinct value once. Preserve first-seen order for a stable
+/// wire response.
+fn csv_header_values(value: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    for item in value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        if !values.iter().any(|seen: &String| seen.as_str() == item) {
+            values.push(item.to_string());
+        }
+    }
+    values
+}
+
+fn append_vary(headers: &mut HeaderKeyDict, token: &str) {
+    let mut values = headers
+        .get("Vary")
+        .map(csv_header_values)
+        .unwrap_or_default();
+    if !values.iter().any(|value| value.eq_ignore_ascii_case(token)) {
+        values.push(token.to_string());
+    }
+    headers.set("Vary", values.join(", "));
 }
 
 /// A parsed backend response head with the connection still open at the
@@ -695,8 +773,8 @@ fn backend_request_head(
     }
     let mut reader = std::io::BufReader::new(conn);
     let (status, reason, resp_headers) = read_backend_head(&mut reader)?;
-    let content_length = resp_header(&resp_headers, "content-length")
-        .and_then(|v| v.parse::<u64>().ok());
+    let content_length =
+        resp_header(&resp_headers, "content-length").and_then(|v| v.parse::<u64>().ok());
     Ok(BackendHead {
         status,
         reason,
@@ -754,7 +832,10 @@ fn backend_request(
     // EC paths still fetch whole fragment archives through this function
     // (P1-leftover: still buffered), and the old implementation read to
     // EOF unbounded.
-    head.into_buffered(swift_core::constraints::MAX_FILE_SIZE as u64, method != "HEAD")
+    head.into_buffered(
+        swift_core::constraints::MAX_FILE_SIZE as u64,
+        method != "HEAD",
+    )
 }
 
 /// A live object-PUT backend connection that answered `100 Continue`
@@ -799,8 +880,13 @@ fn connect_putter(
     let mut out = format!("PUT {target} HTTP/1.1\r\nHost: {addr}\r\n");
     for (k, v) in headers.iter() {
         // The framing and connection lifecycle belong to this function.
-        if ["content-length", "transfer-encoding", "connection", "expect"]
-            .contains(&k.to_ascii_lowercase().as_str())
+        if [
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "expect",
+        ]
+        .contains(&k.to_ascii_lowercase().as_str())
         {
             continue;
         }
@@ -823,8 +909,8 @@ fn connect_putter(
             reader,
         }));
     }
-    let content_length = resp_header(&resp_headers, "content-length")
-        .and_then(|v| v.parse::<u64>().ok());
+    let content_length =
+        resp_header(&resp_headers, "content-length").and_then(|v| v.parse::<u64>().ok());
     let head = BackendHead {
         status,
         reason,
@@ -832,10 +918,9 @@ fn connect_putter(
         reader,
         content_length,
     };
-    Ok(PutterOutcome::EarlyFinal(head.into_buffered(
-        swift_http::MAX_CONTROL_BODY,
-        true,
-    )?))
+    Ok(PutterOutcome::EarlyFinal(
+        head.into_buffered(swift_http::MAX_CONTROL_BODY, true)?,
+    ))
 }
 
 fn write_chunk_framed<W: Write>(writer: &mut W, chunk: &[u8]) -> std::io::Result<()> {
@@ -1083,8 +1168,13 @@ fn connect_mime_putter(
     let target = format!("/{}/{}{}", node.device, part, path);
     let mut out = format!("PUT {target} HTTP/1.1\r\nHost: {addr}\r\n");
     for (k, v) in headers.iter() {
-        if ["content-length", "transfer-encoding", "connection", "expect"]
-            .contains(&k.to_ascii_lowercase().as_str())
+        if [
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "expect",
+        ]
+        .contains(&k.to_ascii_lowercase().as_str())
         {
             continue;
         }
@@ -1132,10 +1222,9 @@ fn connect_mime_putter(
         reader,
         content_length,
     };
-    Ok(MimeConnectOutcome::EarlyFinal(head.into_buffered(
-        swift_http::MAX_CONTROL_BODY,
-        true,
-    )?))
+    Ok(MimeConnectOutcome::EarlyFinal(
+        head.into_buffered(swift_http::MAX_CONTROL_BODY, true)?,
+    ))
 }
 
 /// `swift.common.utils.quorum_size` is in swift-core.
@@ -1239,10 +1328,7 @@ impl ProxyApp {
 
     /// Set the storage-policy name→index table (used to resolve a container
     /// PUT's `X-Storage-Policy` header). Builder-style so `main` can chain it.
-    pub fn with_policy_names(
-        mut self,
-        names: std::collections::HashMap<String, i64>,
-    ) -> Self {
+    pub fn with_policy_names(mut self, names: std::collections::HashMap<String, i64>) -> Self {
         self.policy_name_to_index = names
             .into_iter()
             .map(|(k, v)| (k.to_lowercase(), v))
@@ -1262,12 +1348,74 @@ impl ProxyApp {
         }
     }
 
+    /// Resolve Python `list_endpoints` account/container/object lookups.
+    ///
+    /// Only primary nodes are advertised, in ring order. Object lookups first
+    /// obtain the container's current storage-policy index through the same
+    /// live/cache-backed `container_info` path as the object data plane, then
+    /// select that policy's object ring. The returned policy is present only
+    /// for object paths and becomes v2's
+    /// `X-Backend-Storage-Policy-Index` request header.
+    pub fn list_endpoints(
+        &self,
+        account: &str,
+        container: Option<&str>,
+        object: Option<&str>,
+    ) -> Result<(Vec<String>, Option<i64>), String> {
+        if object.is_some() && container.is_none() {
+            return Err("object endpoint lookup requires a container".to_string());
+        }
+
+        let storage_policy_index = match object {
+            Some(_) => Some(
+                self.container_policy_index(
+                    account,
+                    container
+                        .ok_or_else(|| "object endpoint lookup requires a container".to_string())?,
+                ),
+            ),
+            None => None,
+        };
+        let ring = if let Some(policy_index) = storage_policy_index {
+            self.object_ring_for(policy_index).ok_or_else(|| {
+                format!("no object ring configured for storage policy {policy_index}")
+            })?
+        } else if container.is_some() {
+            &self.container_ring
+        } else {
+            &self.account_ring
+        };
+
+        let (partition, nodes) = ring
+            .get_nodes(account, container, object)
+            .map_err(|error| error.to_string())?;
+        let mut resource = percent_encode(account);
+        if let Some(container) = container {
+            resource.push('/');
+            resource.push_str(&percent_encode(container));
+        }
+        if let Some(object) = object {
+            resource.push('/');
+            resource.push_str(&percent_encode_path(object));
+        }
+
+        let endpoints = nodes
+            .into_iter()
+            .map(|node| {
+                format!(
+                    "http://{}:{}/{}/{partition}/{resource}",
+                    node.dev.ip, node.dev.port, node.dev.device
+                )
+            })
+            .collect();
+        Ok((endpoints, storage_policy_index))
+    }
+
     /// NodeIter: primaries then handoffs, skipping error-limited nodes,
     /// bounded by request_node_count.
     fn iter_nodes(&self, ring: &Ring, part: u32) -> Vec<Node> {
         let primaries = ring.get_part_nodes(part).unwrap_or_default();
-        let limit =
-            (self.config.request_node_count_factor as usize) * primaries.len().max(1);
+        let limit = (self.config.request_node_count_factor as usize) * primaries.len().max(1);
         let to_node = |dev: &swift_ring::RingDevice, handoff: bool| Node {
             ip: dev.ip.clone(),
             port: dev.port,
@@ -1308,8 +1456,8 @@ impl ProxyApp {
                 let sys = format!("x-{server_type}-sysmeta-");
                 // Object transient sysmeta (crypto user-meta, etc.) must reach
                 // the object server so at-rest encryption can persist it.
-                let object_transient = server_type == "object"
-                    && kl.starts_with("x-object-transient-sysmeta-");
+                let object_transient =
+                    server_type == "object" && kl.starts_with("x-object-transient-sysmeta-");
                 // Object write requests also pass conditional, expiry and
                 // content headers through to the object server, which owns their
                 // validation (X-Delete-At/After -> 400, If-None-Match: * -> 412).
@@ -1335,8 +1483,8 @@ impl ProxyApp {
                     .contains(&kl.as_str());
                 // X-Remove-Container-* is translated to empty ACL/meta
                 // updates on the container server (P1c ACL revoke path).
-                let container_remove = server_type == "container"
-                    && kl.starts_with("x-remove-container-");
+                let container_remove =
+                    server_type == "container" && kl.starts_with("x-remove-container-");
                 if kl.starts_with(&user)
                     || kl.starts_with(&sys)
                     || object_transient
@@ -1557,7 +1705,11 @@ impl ProxyApp {
                     // configured size limit (413). Backend connections are
                     // dropped mid-body; their object servers abort without
                     // committing.
-                    let status = if swift_http::body_too_large(&e) { 413 } else { 499 };
+                    let status = if swift_http::body_too_large(&e) {
+                        413
+                    } else {
+                        499
+                    };
                     return swob_response(status);
                 }
             };
@@ -1599,18 +1751,19 @@ impl ProxyApp {
         let mut results = earlies;
         for mut p in putters {
             let _ = p.stream.flush();
-            let final_resp = read_backend_head(&mut p.reader).and_then(|(status, reason, headers)| {
-                let content_length = resp_header(&headers, "content-length")
-                    .and_then(|v| v.parse::<u64>().ok());
-                BackendHead {
-                    status,
-                    reason,
-                    headers,
-                    reader: p.reader,
-                    content_length,
-                }
-                .into_buffered(swift_http::MAX_CONTROL_BODY, true)
-            });
+            let final_resp =
+                read_backend_head(&mut p.reader).and_then(|(status, reason, headers)| {
+                    let content_length =
+                        resp_header(&headers, "content-length").and_then(|v| v.parse::<u64>().ok());
+                    BackendHead {
+                        status,
+                        reason,
+                        headers,
+                        reader: p.reader,
+                        content_length,
+                    }
+                    .into_buffered(swift_http::MAX_CONTROL_BODY, true)
+                });
             match final_resp {
                 Ok(resp) => results.push(resp),
                 Err(_) => self.error_limiter.increment(&p.node),
@@ -1749,8 +1902,7 @@ impl ProxyApp {
         // NodeIter equivalent (obj.py:921-922): primaries then handoffs;
         // round one consumes handoffs only for errored/5xx primaries.
         let node_pool = Arc::new(Mutex::new(self.iter_nodes(ring, part)));
-        let mut slots =
-            self.post_fan_out(&node_pool, part, path, query, per_node_headers.clone());
+        let mut slots = self.post_fan_out(&node_pool, part, path, query, per_node_headers.clone());
         let count_real = |slots: &[Option<BackendResponse>], status: u16| -> usize {
             // `_collect_status_map` (obj.py:904-910) skips the padded
             // no-node entries, which here are the `None` slots.
@@ -1880,7 +2032,9 @@ impl ProxyApp {
             // HEAD/empty 2xx: Python always emits Content-Length (0 when there
             // is no body). Some backends omit it; without this the client-facing
             // contract header disappears.
-            if is_head && (200..300).contains(&out.status) && out.headers.get("Content-Length").is_none()
+            if is_head
+                && (200..300).contains(&out.status)
+                && out.headers.get("Content-Length").is_none()
             {
                 out.headers.set("Content-Length", 0);
             }
@@ -2059,6 +2213,153 @@ impl ProxyApp {
         }
     }
 
+    fn allowed_methods(&self, has_container: bool) -> &'static str {
+        if has_container || self.config.allow_account_management {
+            "GET, HEAD, PUT, POST, DELETE, OPTIONS"
+        } else {
+            "GET, HEAD, POST, OPTIONS"
+        }
+    }
+
+    fn is_origin_allowed(&self, cors: &CorsInfo, origin: &str) -> bool {
+        cors.allow_origin
+            .as_deref()
+            .into_iter()
+            .flat_map(|value| value.split(' '))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .chain(
+                self.config
+                    .cors_allow_origin
+                    .iter()
+                    .map(String::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty()),
+            )
+            .any(|allowed| allowed == "*" || allowed == origin)
+    }
+
+    /// Python `Controller.OPTIONS`: ordinary OPTIONS is a local 200 with
+    /// `Allow`; account-level Origin requests remain ordinary OPTIONS. A
+    /// container/object preflight additionally validates the container CORS
+    /// metadata, Origin, and requested public method.
+    fn options_response(&self, req: &Request, account: &str, container: Option<&str>) -> Response {
+        let allow = self.allowed_methods(container.is_some());
+        let mut resp = Response::new(200);
+        resp.headers.set("Allow", allow);
+        resp.headers.set("Content-Type", "text/html; charset=UTF-8");
+
+        let Some(origin) = req.headers.get("Origin").filter(|value| !value.is_empty()) else {
+            return resp;
+        };
+        let Some(container) = container else {
+            return resp;
+        };
+
+        let cors = self.container_info(account, container).cors;
+        let requested_method = req.headers.get("Access-Control-Request-Method");
+        let method_allowed = requested_method
+            .map(|method| allow.split(", ").any(|allowed| allowed == method))
+            .unwrap_or(false);
+        if !self.is_origin_allowed(&cors, origin) || !method_allowed {
+            let mut denied = Response::new(401);
+            denied.headers.set("Allow", allow);
+            denied
+                .headers
+                .set("Content-Type", "text/html; charset=UTF-8");
+            return denied;
+        }
+
+        if cors.allow_origin.as_deref().map(str::trim) == Some("*") {
+            resp.headers.set("Access-Control-Allow-Origin", "*");
+        } else {
+            resp.headers.set("Access-Control-Allow-Origin", origin);
+            append_vary(&mut resp.headers, "Origin");
+        }
+        if let Some(max_age) = cors.max_age {
+            resp.headers.set("Access-Control-Max-Age", max_age);
+        }
+        resp.headers.set("Access-Control-Allow-Methods", allow);
+
+        let requested_headers = req
+            .headers
+            .get("Access-Control-Request-Headers")
+            .map(csv_header_values)
+            .unwrap_or_default();
+        if !requested_headers.is_empty() {
+            resp.headers
+                .set("Access-Control-Allow-Headers", requested_headers.join(", "));
+            append_vary(&mut resp.headers, "Access-Control-Request-Headers");
+        }
+        resp
+    }
+
+    /// Python `cors_validation` simple-response behavior for container and
+    /// object handlers. The business response status/body is never changed.
+    fn apply_simple_cors(&self, req: &Request, cors: &CorsInfo, resp: &mut Response) {
+        let Some(origin) = req.headers.get("Origin").filter(|value| !value.is_empty()) else {
+            return;
+        };
+        if self.config.strict_cors_mode && !self.is_origin_allowed(cors, origin) {
+            return;
+        }
+
+        if !resp.headers.contains_key("Access-Control-Expose-Headers") {
+            let mut exposed = std::collections::BTreeSet::new();
+            for name in [
+                "cache-control",
+                "content-language",
+                "content-type",
+                "expires",
+                "last-modified",
+                "pragma",
+                "etag",
+                "x-timestamp",
+                "x-trans-id",
+                "x-openstack-request-id",
+            ] {
+                exposed.insert(name.to_string());
+            }
+            exposed.extend(
+                self.config
+                    .cors_expose_headers
+                    .iter()
+                    .map(String::as_str)
+                    .map(str::trim)
+                    .filter(|header| !header.is_empty())
+                    .map(str::to_string),
+            );
+            for (name, _) in resp.headers.iter() {
+                let lower = name.to_ascii_lowercase();
+                if lower.starts_with("x-container-meta-") || lower.starts_with("x-object-meta-") {
+                    exposed.insert(lower);
+                }
+            }
+            if let Some(extra) = cors.expose_headers.as_deref() {
+                exposed.extend(
+                    extra
+                        .split(' ')
+                        .map(str::trim)
+                        .filter(|header| !header.is_empty())
+                        .map(str::to_ascii_lowercase),
+                );
+            }
+            resp.headers.set(
+                "Access-Control-Expose-Headers",
+                exposed.into_iter().collect::<Vec<_>>().join(", "),
+            );
+        }
+
+        if !resp.headers.contains_key("Access-Control-Allow-Origin") {
+            if cors.allow_origin.as_deref().map(str::trim) == Some("*") {
+                resp.headers.set("Access-Control-Allow-Origin", "*");
+            } else {
+                resp.headers.set("Access-Control-Allow-Origin", origin);
+                append_vary(&mut resp.headers, "Origin");
+            }
+        }
+    }
+
     pub fn handle(self: &Arc<Self>, req: Request) -> Response {
         // Reject a decoded path carrying a NUL byte (invalid UTF-8 can't reach a
         // Rust String), mirroring Python's `check_utf8` at request entry:
@@ -2110,6 +2411,16 @@ impl ProxyApp {
         let account = segs[2].to_string();
         let container = segs.get(3).map(|s| s.to_string()).filter(|s| !s.is_empty());
         let object = segs.get(4).map(|s| s.to_string()).filter(|s| !s.is_empty());
+        // Python validates the controller's public methods before invoking
+        // auth or any handler. This also guarantees that an unsupported CORS
+        // method cannot trigger metadata lookup or receive CORS headers.
+        let allowed = self.allowed_methods(container.is_some());
+        if !allowed
+            .split(", ")
+            .any(|method| method == req.method.as_str())
+        {
+            return method_not_allowed(allowed);
+        }
         // Authorize against the container/account ACL BEFORE dispatch — one
         // central gate so no verb path can skip it (a skipped path would be a
         // bypass, since tempauth now only authenticates). No-op when auth is
@@ -2120,12 +2431,44 @@ impl ProxyApp {
         {
             return denied;
         }
+        // Trusted, internal authorization-only probe used by
+        // versioned_writes before it mutates the archive or live object. The
+        // outer Gatekeeper strips every client-supplied X-Backend-* header;
+        // an authorized probe must never reach a storage node.
+        if req
+            .headers
+            .remove(swift_middleware::VERSIONED_WRITES_AUTHORIZE_ONLY_HEADER)
+            .is_some()
+        {
+            return Response::new(204);
+        }
+        if req.method == "OPTIONS" {
+            return self.options_response(&req, &account, container.as_deref());
+        }
+        // Like the Python decorator, resolve CORS metadata before the actual
+        // container/object handler. The HEAD subrequest deliberately carries
+        // no client Origin header.
+        let cors = if matches!(
+            req.method.as_str(),
+            "GET" | "HEAD" | "PUT" | "POST" | "DELETE"
+        ) && req
+            .headers
+            .get("Origin")
+            .map(|value| !value.is_empty())
+            .unwrap_or(false)
+        {
+            container
+                .as_deref()
+                .map(|name| self.container_info(&account, name).cors)
+        } else {
+            None
+        };
         let swift_owner = req
             .headers
             .get("X-Backend-Swift-Owner")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        match (container, object) {
+        let mut resp = match (container, object) {
             (Some(container), Some(object)) => {
                 self.object_request(&mut req, &account, &container, &object)
             }
@@ -2140,7 +2483,11 @@ impl ProxyApp {
                 strip_owner_headers(&mut resp, swift_owner);
                 resp
             }
+        };
+        if let Some(cors) = cors.as_ref() {
+            self.apply_simple_cors(&req, cors, &mut resp);
         }
+        resp
     }
 
     fn account_request(self: &Arc<Self>, req: &Request, account: &str) -> Response {
@@ -2161,9 +2508,7 @@ impl ProxyApp {
                     &req.query_string,
                     &headers,
                 ) {
-                    Some(resp)
-                        if resp.status == 404 && self.config.account_autocreate =>
-                    {
+                    Some(resp) if resp.status == 404 && self.config.account_autocreate => {
                         // synthesize an empty account listing
                         synthesized_account_listing(req)
                     }
@@ -2174,9 +2519,7 @@ impl ProxyApp {
             "PUT" | "DELETE" if !self.config.allow_account_management => {
                 // account.py:37-39,112-115,170: remove PUT/DELETE from allowed
                 // methods when allow_account_management is off.
-                let mut resp = swob_response(405);
-                resp.headers.set("Allow", "GET, HEAD, POST, OPTIONS");
-                resp
+                method_not_allowed(self.allowed_methods(false))
             }
             "PUT" | "POST" | "DELETE" => {
                 // account.py:128,150,177: clear the cached account info
@@ -2206,10 +2549,7 @@ impl ProxyApp {
                 // account.py:154-158: a POST to a not-yet-created account on
                 // an autocreate cluster creates the account and retries, so
                 // the first metadata POST after a wipe is not lost.
-                if resp.status == 404
-                    && req.method == "POST"
-                    && self.config.account_autocreate
-                {
+                if resp.status == 404 && req.method == "POST" && self.config.account_autocreate {
                     self.autocreate_account(account);
                     let nodes = self.iter_nodes(&self.account_ring, part);
                     return self.make_requests(
@@ -2225,7 +2565,7 @@ impl ProxyApp {
                 }
                 resp
             }
-            _ => swob_response(405),
+            _ => method_not_allowed(self.allowed_methods(false)),
         }
     }
 
@@ -2235,17 +2575,13 @@ impl ProxyApp {
         account: &str,
         container: &str,
     ) -> Response {
-        let Ok((container_part, _)) =
-            self.container_ring
-                .get_nodes(account, Some(container), None)
+        let Ok((container_part, _)) = self
+            .container_ring
+            .get_nodes(account, Some(container), None)
         else {
             return swob_response(503);
         };
-        let path = format!(
-            "/{}/{}",
-            percent_encode(account),
-            percent_encode(container)
-        );
+        let path = format!("/{}/{}", percent_encode(account), percent_encode(container));
         match req.method.as_str() {
             "GET" | "HEAD" => {
                 // Wave 3 L3b: shard-range listing fan-out for sharded containers.
@@ -2313,20 +2649,14 @@ impl ProxyApp {
                     // Fallback when listing fan-out did not run: sum shard
                     // HEADs (+ residual heuristic).
                     if req.method == "HEAD" {
-                        self.patch_sharded_head_counts(
-                            req,
-                            account,
-                            container,
-                            &mut resp,
-                        );
+                        self.patch_sharded_head_counts(req, account, container, &mut resp);
                     }
                 }
                 resp
             }
             "PUT" | "POST" | "DELETE" => {
                 // account existence / autocreate
-                let Ok((account_part, _)) = self.account_ring.get_nodes(account, None, None)
-                else {
+                let Ok((account_part, _)) = self.account_ring.get_nodes(account, None, None) else {
                     return swob_response(503);
                 };
                 // Python resolves account existence via the cached
@@ -2380,14 +2710,10 @@ impl ProxyApp {
                 let mut per_node = Vec::with_capacity(node_number);
                 for i in 0..node_number {
                     let mut headers = base.clone();
-                    if matches!(req.method.as_str(), "PUT" | "DELETE")
-                        && !account_nodes.is_empty()
+                    if matches!(req.method.as_str(), "PUT" | "DELETE") && !account_nodes.is_empty()
                     {
                         let acct = &account_nodes[i % account_nodes.len()];
-                        headers.set(
-                            "X-Account-Host",
-                            format!("{}:{}", acct.ip, acct.port),
-                        );
+                        headers.set("X-Account-Host", format!("{}:{}", acct.ip, acct.port));
                         headers.set("X-Account-Partition", account_part);
                         headers.set("X-Account-Device", &acct.device);
                     }
@@ -2418,7 +2744,7 @@ impl ProxyApp {
                 }
                 resp
             }
-            _ => swob_response(405),
+            _ => method_not_allowed(self.allowed_methods(true)),
         }
     }
 
@@ -2444,14 +2770,19 @@ impl ProxyApp {
             write_acl: None,
             temp_url_keys: Vec::new(),
             sync_key: None,
+            cors: CorsInfo::default(),
         };
-        let Ok((part, _)) = self.container_ring.get_nodes(account, Some(container), None) else {
+        let Ok((part, _)) = self
+            .container_ring
+            .get_nodes(account, Some(container), None)
+        else {
             return info;
         };
         let path = format!("/{}/{}", percent_encode(account), percent_encode(container));
         let nodes = self.iter_nodes(&self.container_ring, part);
         let headers = HeaderKeyDict::new();
-        if let Some(resp) = self.get_or_head("container", nodes, part, "HEAD", &path, "", &headers) {
+        if let Some(resp) = self.get_or_head("container", nodes, part, "HEAD", &path, "", &headers)
+        {
             info.status = resp.status;
             if let Some(idx) = resp
                 .headers
@@ -2468,6 +2799,20 @@ impl ProxyApp {
                 .get("X-Container-Sync-Key")
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
+            info.cors = CorsInfo {
+                allow_origin: resp
+                    .headers
+                    .get("X-Container-Meta-Access-Control-Allow-Origin")
+                    .map(str::to_string),
+                expose_headers: resp
+                    .headers
+                    .get("X-Container-Meta-Access-Control-Expose-Headers")
+                    .map(str::to_string),
+                max_age: resp
+                    .headers
+                    .get("X-Container-Meta-Access-Control-Max-Age")
+                    .map(str::to_string),
+            };
             if let Some(ttl) = info_cache_time(
                 resp.status,
                 resp.headers.get("X-Backend-Recheck-Container-Existence"),
@@ -2503,20 +2848,18 @@ impl ProxyApp {
         if state != "sharding" && state != "sharded" {
             return;
         }
-        let Ok((part, _)) = self.container_ring.get_nodes(account, Some(container), None) else {
+        let Ok((part, _)) = self
+            .container_ring
+            .get_nodes(account, Some(container), None)
+        else {
             return;
         };
-        let path = format!(
-            "/{}/{}",
-            percent_encode(account),
-            percent_encode(container)
-        );
+        let path = format!("/{}/{}", percent_encode(account), percent_encode(container));
         let nodes = self.iter_nodes(&self.container_ring, part);
         let mut shard_headers = self.backend_headers(req, false, "container");
         shard_headers.set("X-Backend-Record-Type", "shard");
         shard_headers.set("X-Backend-Allow-Reserved-Names", "true");
-        let Some(arr) =
-            self.fetch_listing_shard_ranges(nodes.clone(), part, &path, &shard_headers)
+        let Some(arr) = self.fetch_listing_shard_ranges(nodes.clone(), part, &path, &shard_headers)
         else {
             return;
         };
@@ -2530,10 +2873,7 @@ impl ProxyApp {
             // Skip soft-deleted / SHRUNK donors so we do not double-count
             // during shrink (objects already live on the acceptor).
             let st = sr.get("state").and_then(|v| v.as_i64()).unwrap_or(0);
-            let deleted = sr
-                .get("deleted")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
+            let deleted = sr.get("deleted").and_then(|v| v.as_i64()).unwrap_or(0);
             if st == 80 || deleted != 0 {
                 // SHRUNK or soft-deleted
                 continue;
@@ -2652,14 +2992,13 @@ impl ProxyApp {
         account: &str,
         container: &str,
     ) -> Option<Response> {
-        let Ok((part, _)) = self.container_ring.get_nodes(account, Some(container), None) else {
+        let Ok((part, _)) = self
+            .container_ring
+            .get_nodes(account, Some(container), None)
+        else {
             return None;
         };
-        let path = format!(
-            "/{}/{}",
-            percent_encode(account),
-            percent_encode(container)
-        );
+        let path = format!("/{}/{}", percent_encode(account), percent_encode(container));
         let nodes = self.iter_nodes(&self.container_ring, part);
         // Probe HEAD for sharding state + object count. Use backend_headers so
         // internal requests carry the same baseline as other container hops
@@ -2761,9 +3100,8 @@ impl ProxyApp {
                 percent_encode(shard_container)
             );
             let snodes = self.iter_nodes(&self.container_ring, spart);
-            let remaining = limit.saturating_sub(
-                shard_listings.iter().map(|v| v.len()).sum::<usize>(),
-            );
+            let remaining =
+                limit.saturating_sub(shard_listings.iter().map(|v| v.len()).sum::<usize>());
             if remaining == 0 {
                 break;
             }
@@ -2796,7 +3134,8 @@ impl ProxyApp {
         let merged = merge_sharded_object_listings(&shard_listings, limit);
         let bytes = serde_json::to_vec(&merged).unwrap_or_else(|_| b"[]".to_vec());
         let mut out = Response::with_body(200, bytes);
-        out.headers.set("Content-Type", "application/json; charset=utf-8");
+        out.headers
+            .set("Content-Type", "application/json; charset=utf-8");
         out.headers.set("X-Backend-Sharding-State", state);
         out.headers.set("X-Backend-Record-Type", "object");
         // Root object_count is often 0 after cleave; report the merged listing
@@ -2826,14 +3165,13 @@ impl ProxyApp {
         container: &str,
         object: &str,
     ) -> Option<(String, String)> {
-        let Ok((part, _)) = self.container_ring.get_nodes(account, Some(container), None) else {
+        let Ok((part, _)) = self
+            .container_ring
+            .get_nodes(account, Some(container), None)
+        else {
             return None;
         };
-        let path = format!(
-            "/{}/{}",
-            percent_encode(account),
-            percent_encode(container)
-        );
+        let path = format!("/{}/{}", percent_encode(account), percent_encode(container));
         let nodes = self.iter_nodes(&self.container_ring, part);
         let head_headers = HeaderKeyDict::new();
         let head = self.get_or_head(
@@ -2869,9 +3207,7 @@ impl ProxyApp {
                 &shard_headers,
             )
             .filter(|a| !a.is_empty())
-            .or_else(|| {
-                self.fetch_listing_shard_ranges(nodes, part, &path, &shard_headers)
-            })?;
+            .or_else(|| self.fetch_listing_shard_ranges(nodes, part, &path, &shard_headers))?;
         // Pick the range that owns `object` (lower < name <= upper; empty bounds
         // are open-ended). Prefer non-own (shard) names.
         let mut best: Option<&serde_json::Value> = None;
@@ -3019,8 +3355,7 @@ impl ProxyApp {
         let path = format!("/{}", percent_encode(account));
         let nodes = self.iter_nodes(&self.account_ring, part);
         let headers = HeaderKeyDict::new();
-        if let Some(resp) = self.get_or_head("account", nodes, part, "HEAD", &path, "", &headers)
-        {
+        if let Some(resp) = self.get_or_head("account", nodes, part, "HEAD", &path, "", &headers) {
             info = account_info_from_response(&resp);
             if let Some(ttl) = info_cache_time(
                 resp.status,
@@ -3104,9 +3439,7 @@ impl ProxyApp {
                 Err(msg) => {
                     let body = format!(
                         "X-Account-Access-Control invalid: {msg}\n\nInput: {}\n",
-                        req.headers
-                            .get("X-Account-Access-Control")
-                            .unwrap_or("")
+                        req.headers.get("X-Account-Access-Control").unwrap_or("")
                     );
                     let mut resp = Response::with_body(400, body);
                     resp.headers
@@ -3114,6 +3447,15 @@ impl ProxyApp {
                     return Some(resp);
                 }
             }
+        }
+
+        // Both Python TempAuth and KeystoneAuth allow OPTIONS without user
+        // credentials. Keep the owner marker clear: preflight may inspect
+        // container CORS metadata, but it is never an owner-authorized
+        // management request.
+        if req.method == "OPTIONS" {
+            req.headers.remove("X-Backend-Swift-Owner");
+            return None;
         }
 
         // Legacy container-sync (Python tempauth/keystoneauth): if the
@@ -3124,10 +3466,7 @@ impl ProxyApp {
         if let Some(c) = container {
             if let Some(req_key) = req.headers.get("x-container-sync-key") {
                 let has_ts = req.headers.get("x-timestamp").is_some()
-                    || req
-                        .headers
-                        .get("x-backend-inbound-x-timestamp")
-                        .is_some();
+                    || req.headers.get("x-backend-inbound-x-timestamp").is_some();
                 if !req_key.is_empty() && has_ts {
                     let info = self.container_info(account, c);
                     if let Some(sk) = info.sync_key.as_deref() {
@@ -3135,9 +3474,7 @@ impl ProxyApp {
                             // Restore timestamp for object servers (Python
                             // container_sync / obj controller expectation).
                             if req.headers.get("x-timestamp").is_none() {
-                                if let Some(ts) =
-                                    req.headers.get("x-backend-inbound-x-timestamp")
-                                {
+                                if let Some(ts) = req.headers.get("x-backend-inbound-x-timestamp") {
                                     let ts = ts.to_string();
                                     req.headers.remove("X-Backend-Inbound-X-Timestamp");
                                     req.headers.set("X-Timestamp", ts);
@@ -3255,8 +3592,7 @@ impl ProxyApp {
                 &format!("No object ring configured for storage policy {policy_index}"),
             );
         };
-        let Ok((object_part, _)) =
-            object_ring.get_nodes(account, Some(container), Some(object))
+        let Ok((object_part, _)) = object_ring.get_nodes(account, Some(container), Some(object))
         else {
             return swob_response(503);
         };
@@ -3351,11 +3687,10 @@ impl ProxyApp {
                 let (upd_account, upd_container) = self
                     .resolve_updating_shard(account, container, object)
                     .unwrap_or_else(|| (account.to_string(), container.to_string()));
-                let Ok((container_part, _)) = self.container_ring.get_nodes(
-                    &upd_account,
-                    Some(&upd_container),
-                    None,
-                ) else {
+                let Ok((container_part, _)) =
+                    self.container_ring
+                        .get_nodes(&upd_account, Some(&upd_container), None)
+                else {
                     return swob_response(503);
                 };
                 let container_nodes = self.iter_nodes(&self.container_ring, container_part);
@@ -3367,7 +3702,12 @@ impl ProxyApp {
                 // 404 and leave the fragments orphaned.
                 base.set("X-Backend-Storage-Policy-Index", policy_index);
                 if req.method == "PUT" {
-                    base.set("Content-Type", req.headers.get("Content-Type").unwrap_or("application/octet-stream"));
+                    base.set(
+                        "Content-Type",
+                        req.headers
+                            .get("Content-Type")
+                            .unwrap_or("application/octet-stream"),
+                    );
                 }
                 // Tell the object server which container DB to update (shard
                 // path differs from the client-visible account/container).
@@ -3442,10 +3782,8 @@ impl ProxyApp {
                     }
                     // obj.py:_store_object — every PUT answer (201 and 422
                     // alike) carries Last-Modified from the request timestamp.
-                    resp.headers.set(
-                        "Last-Modified",
-                        swift_http::http_date(put_ts.ceil()),
-                    );
+                    resp.headers
+                        .set("Last-Modified", swift_http::http_date(put_ts.ceil()));
                     return resp;
                 }
                 // DELETE carries no body.
@@ -3460,7 +3798,7 @@ impl ProxyApp {
                     Vec::new(),
                 )
             }
-            _ => swob_response(405),
+            _ => method_not_allowed(self.allowed_methods(true)),
         }
     }
 
@@ -3518,11 +3856,7 @@ impl ProxyApp {
         if primaries.len() != n {
             return text_response(
                 500,
-                &format!(
-                    "EC ring replica count {} != k+m {}",
-                    primaries.len(),
-                    n
-                ),
+                &format!("EC ring replica count {} != k+m {}", primaries.len(), n),
             );
         }
         let handoffs = match object_ring.get_more_nodes(object_part) {
@@ -3539,7 +3873,9 @@ impl ProxyApp {
         };
 
         // The container-update side channel (each fragment PUT drives one).
-        let Ok((container_part, _)) = self.container_ring.get_nodes(account, Some(container), None)
+        let Ok((container_part, _)) = self
+            .container_ring
+            .get_nodes(account, Some(container), None)
         else {
             return swob_response(503);
         };
@@ -3774,7 +4110,6 @@ impl ProxyApp {
         }
     }
 
-
     /// EC GET/HEAD, streaming: gather `ndata` DISTINCT fragment sources
     /// (headers only — bodies stay on their sockets), then decode segment
     /// by segment as the client reads. Content-Length and ETag come from
@@ -3973,7 +4308,10 @@ impl ProxyApp {
                 || kl == "last-modified"
                 || kl == "x-backend-timestamp"
                 || (kl.starts_with("x-object-meta-") && kl.len() > "x-object-meta-".len());
-            if keep && !(kl == "content-type" && resp.status == 206 && resp.headers.get("Content-Type").is_some())
+            if keep
+                && !(kl == "content-type"
+                    && resp.status == 206
+                    && resp.headers.get("Content-Type").is_some())
             {
                 resp.headers.set(k, v);
             }
@@ -4027,9 +4365,8 @@ impl ProxyApp {
         }
         // multipart/byteranges, byte-compatible with
         // swift_http::multipart_byteranges' framing.
-        let boundary = md5_hex(
-            format!("{path}:{orig_size}:{}:{}", ranges.len(), ec_etag).as_bytes(),
-        );
+        let boundary =
+            md5_hex(format!("{path}:{orig_size}:{}:{}", ranges.len(), ec_etag).as_bytes());
         let mut part_heads: Vec<Vec<u8>> = Vec::with_capacity(ranges.len());
         let mut total_len: u64 = 0;
         for &(start, stop) in ranges {
@@ -4077,8 +4414,9 @@ impl ProxyApp {
             }
             if !sent_terminator {
                 sent_terminator = true;
-                return Some(Ok(Box::new(std::io::Cursor::new(terminator.clone()))
-                    as Box<dyn Read + Send>));
+                return Some(Ok(
+                    Box::new(std::io::Cursor::new(terminator.clone())) as Box<dyn Read + Send>
+                ));
             }
             None
         });
@@ -4297,7 +4635,8 @@ fn md5_hex(data: &[u8]) -> String {
 /// A `status + text/plain body` response (EC error/diagnostic replies).
 fn text_response(status: u16, body: &str) -> Response {
     let mut resp = Response::with_body(status, body.as_bytes().to_vec());
-    resp.headers.set("Content-Type", "text/plain; charset=utf-8");
+    resp.headers
+        .set("Content-Type", "text/plain; charset=utf-8");
     resp
 }
 
@@ -4469,6 +4808,21 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
+/// `urllib.parse.quote(value)` with its default `safe='/'`, used for object
+/// names in list_endpoints URLs so nested object path separators survive.
+fn percent_encode_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'/' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            b => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Python `get_tempurl_keys_from_metadata` for account/container user meta.
 fn temp_url_keys_from_headers(headers: &HeaderKeyDict, server_type: &str) -> Vec<String> {
     let prefix = format!("x-{server_type}-meta-");
@@ -4476,10 +4830,8 @@ fn temp_url_keys_from_headers(headers: &HeaderKeyDict, server_type: &str) -> Vec
     for (name, value) in headers.iter() {
         let lower = name.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix(&prefix) {
-            if rest == "temp-url-key" || rest == "temp-url-key-2" {
-                if !value.is_empty() {
-                    keys.push(value.to_string());
-                }
+            if (rest == "temp-url-key" || rest == "temp-url-key-2") && !value.is_empty() {
+                keys.push(value.to_string());
             }
         }
     }
@@ -4501,8 +4853,10 @@ fn account_info_from_response(resp: &Response) -> AccountInfo {
 fn expose_account_acl_header(resp: &mut Response) {
     if let Some(sys) = resp.headers.remove("X-Account-Sysmeta-Core-Access-Control") {
         if let Some(acls) = swift_middleware::acls_from_sysmeta(Some(&sys)) {
-            resp.headers
-                .set("X-Account-Access-Control", swift_middleware::format_acl_v2(&acls));
+            resp.headers.set(
+                "X-Account-Access-Control",
+                swift_middleware::format_acl_v2(&acls),
+            );
         } else if let Some(raw) = swift_middleware::parse_acl_v2(Some(&sys)) {
             // Empty dict / clear — still surface an empty JSON object when
             // sysmeta was explicitly set to {}.
@@ -4538,6 +4892,37 @@ fn strip_owner_headers(resp: &mut Response, swift_owner: bool) {
 pub fn serve(listener: std::net::TcpListener, app: Arc<ProxyApp>) -> std::io::Result<()> {
     let handler: swift_http::Handler = Arc::new(move |req| app.handle(req));
     swift_http::serve_forever(listener, handler)
+}
+
+/// Ring resolver used by `list_endpoints` in the configured middleware
+/// pipeline. Every lookup snapshots the current app from the shared slot, so
+/// a successful ring reload is visible without rebuilding the middleware.
+pub struct ProxyEndpointResolver {
+    app: Arc<RwLock<Arc<ProxyApp>>>,
+}
+
+impl ProxyEndpointResolver {
+    pub fn new(app: Arc<RwLock<Arc<ProxyApp>>>) -> Self {
+        Self { app }
+    }
+}
+
+impl swift_middleware::EndpointResolver for ProxyEndpointResolver {
+    fn endpoints(
+        &self,
+        account: &str,
+        container: Option<&str>,
+        object: Option<&str>,
+    ) -> Result<(Vec<String>, Option<i64>), String> {
+        let current = {
+            let guard = self
+                .app
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(&guard)
+        };
+        current.list_endpoints(account, container, object)
+    }
 }
 
 /// Serve behind the always-on middleware pipeline
@@ -4640,6 +5025,89 @@ mod policy_ring_tests {
         assert_eq!(dev_id(app.object_ring_for(0)), 0);
         assert!(app.object_ring_for(9).is_none());
     }
+
+    #[test]
+    fn list_endpoints_selects_scope_ring_policy_and_primary_nodes() {
+        let mut rings = std::collections::HashMap::new();
+        rings.insert(1i64, ring(11));
+        let app = ProxyApp::with_policy_object_rings(
+            ring(1),
+            ring(2),
+            ring(10),
+            rings,
+            ProxyConfig::default(),
+        );
+        app.info_cache.set_container(
+            "a/c".to_string(),
+            ContainerInfo {
+                status: 204,
+                policy_index: 1,
+                ..Default::default()
+            },
+            60.0,
+        );
+
+        let (account, account_policy) = app.list_endpoints("a", None, None).unwrap();
+        assert_eq!(account_policy, None);
+        assert_eq!(account, ["http://10.0.0.1:6200/sda/0/a"]);
+
+        let (container, container_policy) = app.list_endpoints("a", Some("c"), None).unwrap();
+        assert_eq!(container_policy, None);
+        assert_eq!(container, ["http://10.0.0.2:6200/sda/0/a/c"]);
+
+        let (encoded_container, _) = app
+            .list_endpoints("ac count", Some("con+tainer"), None)
+            .unwrap();
+        assert_eq!(
+            encoded_container,
+            ["http://10.0.0.2:6200/sda/0/ac%20count/con%2Btainer"]
+        );
+
+        let (object, object_policy) = app
+            .list_endpoints("a", Some("c"), Some("dir/part name+尾"))
+            .unwrap();
+        assert_eq!(object_policy, Some(1));
+        assert_eq!(
+            object,
+            ["http://10.0.0.11:6200/sda/0/a/c/dir/part%20name%2B%E5%B0%BE"]
+        );
+    }
+
+    #[test]
+    fn list_endpoints_unknown_object_policy_fails_closed() {
+        let app = ProxyApp::with_object_ring(ring(1), ring(2), ring(10), ProxyConfig::default());
+        app.info_cache.set_container(
+            "a/c".to_string(),
+            ContainerInfo {
+                status: 204,
+                policy_index: 9,
+                ..Default::default()
+            },
+            60.0,
+        );
+        assert_eq!(
+            app.list_endpoints("a", Some("c"), Some("o")).unwrap_err(),
+            "no object ring configured for storage policy 9"
+        );
+    }
+
+    #[test]
+    fn endpoint_resolver_reads_the_reloaded_proxy_app_each_time() {
+        let slot = Arc::new(RwLock::new(Arc::new(ProxyApp::new(
+            ring(1),
+            ring(2),
+            ProxyConfig::default(),
+        ))));
+        let resolver = ProxyEndpointResolver::new(Arc::clone(&slot));
+        let (before, _) =
+            swift_middleware::EndpointResolver::endpoints(&resolver, "a", None, None).unwrap();
+        assert_eq!(before, ["http://10.0.0.1:6200/sda/0/a"]);
+
+        *slot.write().unwrap() = Arc::new(ProxyApp::new(ring(7), ring(8), ProxyConfig::default()));
+        let (after, _) =
+            swift_middleware::EndpointResolver::endpoints(&resolver, "a", None, None).unwrap();
+        assert_eq!(after, ["http://10.0.0.7:6200/sda/0/a"]);
+    }
 }
 
 #[cfg(test)]
@@ -4680,7 +5148,10 @@ mod stale_read_and_post_tests {
         assert!(!backend_404_timestamp(&hdrs(&[])).is_truthy());
         let h = hdrs(&[("X-Backend-Timestamp", "1000000000.00000")]);
         assert!(backend_404_timestamp(&h).is_truthy());
-        assert_eq!(backend_404_timestamp(&h), "1000000000.00000".parse().unwrap());
+        assert_eq!(
+            backend_404_timestamp(&h),
+            "1000000000.00000".parse().unwrap()
+        );
     }
 
     #[test]
@@ -4758,6 +5229,7 @@ mod info_cache_tests {
             write_acl: None,
             temp_url_keys: Vec::new(),
             sync_key: None,
+            cors: CorsInfo::default(),
         }
     }
 
@@ -4842,6 +5314,564 @@ mod info_cache_tests {
 }
 
 #[cfg(test)]
+mod cors_tests {
+    use super::policy_ring_tests::ring;
+    use super::*;
+
+    fn app(config: ProxyConfig) -> Arc<ProxyApp> {
+        Arc::new(ProxyApp::new(ring(0), ring(0), config))
+    }
+
+    fn request(method: &str, path: &str, headers: &[(&str, &str)]) -> Request {
+        let mut request_headers = HeaderKeyDict::new();
+        for (name, value) in headers {
+            request_headers.set(name, value);
+        }
+        Request {
+            method: method.to_string(),
+            path: path.to_string(),
+            query_string: String::new(),
+            headers: request_headers,
+            body: swift_http::Body::empty(),
+        }
+    }
+
+    fn seed_container(app: &ProxyApp, account: &str, container: &str, cors: CorsInfo) {
+        app.info_cache.set_container(
+            format!("{account}/{container}"),
+            ContainerInfo {
+                status: 204,
+                policy_index: 9,
+                read_acl: None,
+                write_acl: None,
+                temp_url_keys: Vec::new(),
+                sync_key: None,
+                cors,
+            },
+            60.0,
+        );
+    }
+
+    fn assert_no_access_control(headers: &HeaderKeyDict) {
+        assert!(
+            headers
+                .iter()
+                .all(|(name, _)| !name.to_ascii_lowercase().starts_with("access-control-")),
+            "CORS header leaked: {headers:?}"
+        );
+    }
+
+    fn assert_no_cors(headers: &HeaderKeyDict) {
+        assert_no_access_control(headers);
+        assert!(headers.get("Vary").is_none(), "Vary leaked: {headers:?}");
+    }
+
+    fn header_set(headers: &HeaderKeyDict, name: &str) -> std::collections::BTreeSet<String> {
+        headers
+            .get(name)
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    }
+
+    #[test]
+    fn proxy_config_cors_defaults_match_python() {
+        let config = ProxyConfig::default();
+        assert!(config.strict_cors_mode);
+        assert!(config.cors_allow_origin.is_empty());
+        assert!(config.cors_expose_headers.is_empty());
+    }
+
+    #[test]
+    fn container_cors_info_round_trips_and_old_cache_values_default_empty() {
+        let info = ContainerInfo {
+            status: 204,
+            policy_index: 3,
+            read_acl: None,
+            write_acl: None,
+            temp_url_keys: Vec::new(),
+            sync_key: None,
+            cors: CorsInfo {
+                allow_origin: Some("https://allowed.example".into()),
+                expose_headers: Some("X-Object-Meta-Color".into()),
+                max_age: Some("999".into()),
+            },
+        };
+        let decoded = container_info_from_json(&container_info_to_json(&info)).unwrap();
+        assert_eq!(decoded.cors, info.cors);
+
+        let old_value = serde_json::json!({
+            "status": 204,
+            "policy_index": 0,
+            "read_acl": null,
+            "write_acl": null,
+            "temp_url_keys": [],
+            "sync_key": null,
+        });
+        assert_eq!(
+            container_info_from_json(&old_value).unwrap().cors,
+            CorsInfo::default()
+        );
+    }
+
+    #[test]
+    fn ordinary_options_covers_account_container_and_object_without_cors() {
+        let app = app(ProxyConfig::default());
+        for (path, expected) in [
+            ("/v1/AUTH_test", "GET, HEAD, POST, OPTIONS"),
+            ("/v1/AUTH_test/c", "GET, HEAD, PUT, POST, DELETE, OPTIONS"),
+            ("/v1/AUTH_test/c/o", "GET, HEAD, PUT, POST, DELETE, OPTIONS"),
+        ] {
+            let resp = app.handle(request("OPTIONS", path, &[]));
+            assert_eq!(resp.status, 200, "{path}");
+            assert_eq!(resp.headers.get("Allow"), Some(expected), "{path}");
+            assert_eq!(
+                resp.headers.get("Content-Type"),
+                Some("text/html; charset=UTF-8")
+            );
+            assert_no_cors(&resp.headers);
+        }
+
+        let account_cors = app.handle(request(
+            "OPTIONS",
+            "/v1/AUTH_test",
+            &[
+                ("Origin", "https://allowed.example"),
+                ("Access-Control-Request-Method", "GET"),
+            ],
+        ));
+        assert_eq!(account_cors.status, 200);
+        assert_eq!(
+            account_cors.headers.get("Allow"),
+            Some("GET, HEAD, POST, OPTIONS")
+        );
+        assert_no_cors(&account_cors.headers);
+    }
+
+    #[test]
+    fn options_bypasses_auth_for_ordinary_and_preflight_requests() {
+        let app = app(ProxyConfig {
+            auth_enabled: true,
+            ..Default::default()
+        });
+        seed_container(
+            &app,
+            "AUTH_test",
+            "c",
+            CorsInfo {
+                allow_origin: Some("https://allowed.example".into()),
+                expose_headers: None,
+                max_age: None,
+            },
+        );
+
+        for path in ["/v1/AUTH_test", "/v1/AUTH_test/c", "/v1/AUTH_test/c/o"] {
+            let resp = app.handle(request("OPTIONS", path, &[]));
+            assert_eq!(resp.status, 200, "anonymous OPTIONS failed for {path}");
+        }
+
+        let preflight = app.handle(request(
+            "OPTIONS",
+            "/v1/AUTH_test/c/o",
+            &[
+                ("Origin", "https://allowed.example"),
+                ("Access-Control-Request-Method", "GET"),
+            ],
+        ));
+        assert_eq!(preflight.status, 200);
+        assert_eq!(
+            preflight.headers.get("Access-Control-Allow-Origin"),
+            Some("https://allowed.example")
+        );
+    }
+
+    #[test]
+    fn account_options_allow_reflects_account_management_setting() {
+        let app = app(ProxyConfig {
+            allow_account_management: true,
+            ..Default::default()
+        });
+        let resp = app.handle(request("OPTIONS", "/v1/AUTH_test", &[]));
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.headers.get("Allow"),
+            Some("GET, HEAD, PUT, POST, DELETE, OPTIONS")
+        );
+        assert_no_cors(&resp.headers);
+    }
+
+    #[test]
+    fn container_and_object_preflight_emit_python_headers() {
+        let app = app(ProxyConfig::default());
+        seed_container(
+            &app,
+            "AUTH_test",
+            "c",
+            CorsInfo {
+                allow_origin: Some("http://foo.bar:8080 https://allowed.example".to_string()),
+                expose_headers: None,
+                max_age: Some("999".to_string()),
+            },
+        );
+
+        for path in ["/v1/AUTH_test/c", "/v1/AUTH_test/c/o"] {
+            let resp = app.handle(request(
+                "OPTIONS",
+                path,
+                &[
+                    ("Origin", "https://allowed.example"),
+                    ("Access-Control-Request-Method", "GET"),
+                    (
+                        "Access-Control-Request-Headers",
+                        "X-Auth-Token, X-Object-Meta-Test, X-Auth-Token",
+                    ),
+                ],
+            ));
+            assert_eq!(resp.status, 200, "{path}");
+            assert_eq!(
+                resp.headers.get("Access-Control-Allow-Origin"),
+                Some("https://allowed.example")
+            );
+            assert_eq!(
+                resp.headers.get("Access-Control-Allow-Methods"),
+                Some("GET, HEAD, PUT, POST, DELETE, OPTIONS")
+            );
+            assert_eq!(resp.headers.get("Access-Control-Max-Age"), Some("999"));
+            assert_eq!(
+                resp.headers.get("Access-Control-Allow-Headers"),
+                Some("X-Auth-Token, X-Object-Meta-Test")
+            );
+            assert_eq!(
+                resp.headers.get("Vary"),
+                Some("Origin, Access-Control-Request-Headers")
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_rejects_origin_or_method_without_leaking_cors() {
+        let strict_app = app(ProxyConfig::default());
+        seed_container(
+            &strict_app,
+            "AUTH_test",
+            "c",
+            CorsInfo {
+                allow_origin: Some("https://allowed.example".into()),
+                expose_headers: None,
+                max_age: Some("999".into()),
+            },
+        );
+
+        for headers in [
+            vec![
+                ("Origin", "https://denied.example"),
+                ("Access-Control-Request-Method", "GET"),
+            ],
+            vec![("Origin", "https://allowed.example")],
+            vec![
+                ("Origin", "https://allowed.example"),
+                ("Access-Control-Request-Method", "PATCH"),
+                ("Access-Control-Request-Headers", "X-Must-Not-Leak"),
+            ],
+        ] {
+            let resp = strict_app.handle(request("OPTIONS", "/v1/AUTH_test/c/o", &headers));
+            assert_eq!(resp.status, 401, "{headers:?}");
+            assert_eq!(
+                resp.headers.get("Allow"),
+                Some("GET, HEAD, PUT, POST, DELETE, OPTIONS")
+            );
+            assert_eq!(
+                resp.headers.get("Content-Type"),
+                Some("text/html; charset=UTF-8")
+            );
+            assert!(resp.headers.get("Www-Authenticate").is_none());
+            assert_no_cors(&resp.headers);
+        }
+
+        let non_strict = app(ProxyConfig {
+            strict_cors_mode: false,
+            ..Default::default()
+        });
+        seed_container(
+            &non_strict,
+            "AUTH_test",
+            "c",
+            CorsInfo {
+                allow_origin: Some("https://allowed.example".into()),
+                expose_headers: None,
+                max_age: None,
+            },
+        );
+        let resp = non_strict.handle(request(
+            "OPTIONS",
+            "/v1/AUTH_test/c/o",
+            &[
+                ("Origin", "https://denied.example"),
+                ("Access-Control-Request-Method", "GET"),
+            ],
+        ));
+        assert_eq!(resp.status, 401);
+        assert_no_cors(&resp.headers);
+    }
+
+    #[test]
+    fn preflight_wildcard_and_operator_origin_match_python() {
+        let wildcard_app = app(ProxyConfig::default());
+        seed_container(
+            &wildcard_app,
+            "AUTH_test",
+            "wild",
+            CorsInfo {
+                allow_origin: Some("*".into()),
+                expose_headers: None,
+                max_age: None,
+            },
+        );
+        let resp = wildcard_app.handle(request(
+            "OPTIONS",
+            "/v1/AUTH_test/wild/o",
+            &[
+                ("Origin", "https://any.example"),
+                ("Access-Control-Request-Method", "HEAD"),
+                ("Access-Control-Request-Headers", "X-Arbitrary-Header"),
+            ],
+        ));
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("Access-Control-Allow-Origin"), Some("*"));
+        assert_eq!(
+            resp.headers.get("Vary"),
+            Some("Access-Control-Request-Headers")
+        );
+        assert_eq!(
+            resp.headers.get("Access-Control-Allow-Headers"),
+            Some("X-Arbitrary-Header")
+        );
+
+        let blank_headers = wildcard_app.handle(request(
+            "OPTIONS",
+            "/v1/AUTH_test/wild/o",
+            &[
+                ("Origin", "https://any.example"),
+                ("Access-Control-Request-Method", "GET"),
+                ("Access-Control-Request-Headers", " , ,,"),
+            ],
+        ));
+        assert_eq!(blank_headers.status, 200);
+        assert!(blank_headers
+            .headers
+            .get("Access-Control-Allow-Headers")
+            .is_none());
+        assert!(blank_headers.headers.get("Vary").is_none());
+
+        let operator_app = app(ProxyConfig {
+            cors_allow_origin: vec!["https://operator.example".into()],
+            ..Default::default()
+        });
+        seed_container(&operator_app, "AUTH_test", "c", CorsInfo::default());
+        let resp = operator_app.handle(request(
+            "OPTIONS",
+            "/v1/AUTH_test/c/o",
+            &[
+                ("Origin", "https://operator.example"),
+                ("Access-Control-Request-Method", "GET"),
+            ],
+        ));
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.headers.get("Access-Control-Allow-Origin"),
+            Some("https://operator.example")
+        );
+        assert_eq!(resp.headers.get("Vary"), Some("Origin"));
+    }
+
+    #[test]
+    fn simple_cors_strict_and_non_strict_match_python_without_leaks() {
+        let non_strict = app(ProxyConfig {
+            strict_cors_mode: false,
+            cors_expose_headers: vec!["X-Custom-Operator".into()],
+            ..Default::default()
+        });
+        let cors = CorsInfo {
+            allow_origin: Some("https://other.example".into()),
+            expose_headers: Some("X-Custom-User".into()),
+            max_age: None,
+        };
+        let req = request(
+            "GET",
+            "/v1/AUTH_test/c/o",
+            &[("Origin", "https://request.example")],
+        );
+        let mut resp = Response::new(404);
+        resp.headers.set("X-Object-Meta-Color", "red");
+        resp.headers.set("X-Super-Secret", "hush");
+        resp.headers.set("Vary", "Accept-Encoding");
+        non_strict.apply_simple_cors(&req, &cors, &mut resp);
+        assert_eq!(resp.status, 404);
+        assert_eq!(
+            resp.headers.get("Access-Control-Allow-Origin"),
+            Some("https://request.example")
+        );
+        assert_eq!(resp.headers.get("Vary"), Some("Accept-Encoding, Origin"));
+        assert!(
+            resp.headers
+                .get("Access-Control-Expose-Headers")
+                .unwrap_or("")
+                .split(',')
+                .map(str::trim)
+                .any(|header| header == "X-Custom-Operator"),
+            "operator-configured header spelling must be preserved"
+        );
+        let exposed = header_set(&resp.headers, "Access-Control-Expose-Headers");
+        for expected in [
+            "cache-control",
+            "content-language",
+            "content-type",
+            "expires",
+            "last-modified",
+            "pragma",
+            "etag",
+            "x-timestamp",
+            "x-trans-id",
+            "x-openstack-request-id",
+            "x-object-meta-color",
+            "x-custom-operator",
+            "x-custom-user",
+        ] {
+            assert!(
+                exposed.contains(expected),
+                "missing {expected}: {exposed:?}"
+            );
+        }
+        assert!(!exposed.contains("x-super-secret"));
+
+        let strict = app(ProxyConfig::default());
+        let mut denied = Response::new(404);
+        denied.headers.set("Vary", "Accept-Encoding");
+        strict.apply_simple_cors(&req, &cors, &mut denied);
+        assert_eq!(denied.status, 404);
+        assert_no_access_control(&denied.headers);
+        assert_eq!(denied.headers.get("Vary"), Some("Accept-Encoding"));
+
+        let allowed_cors = CorsInfo {
+            allow_origin: Some("https://request.example".into()),
+            expose_headers: None,
+            max_age: None,
+        };
+        let mut object_owned = Response::new(200);
+        object_owned
+            .headers
+            .set("Access-Control-Allow-Origin", "https://object.example");
+        object_owned
+            .headers
+            .set("Access-Control-Expose-Headers", "x-trans-id");
+        strict.apply_simple_cors(&req, &allowed_cors, &mut object_owned);
+        assert_eq!(
+            object_owned.headers.get("Access-Control-Allow-Origin"),
+            Some("https://object.example")
+        );
+        assert_eq!(
+            object_owned.headers.get("Access-Control-Expose-Headers"),
+            Some("x-trans-id")
+        );
+        assert!(object_owned.headers.get("Vary").is_none());
+
+        let wildcard_cors = CorsInfo {
+            allow_origin: Some("*".into()),
+            expose_headers: None,
+            max_age: None,
+        };
+        let mut wildcard = Response::new(200);
+        strict.apply_simple_cors(&req, &wildcard_cors, &mut wildcard);
+        assert_eq!(
+            wildcard.headers.get("Access-Control-Allow-Origin"),
+            Some("*")
+        );
+        assert!(wildcard.headers.get("Vary").is_none());
+    }
+
+    #[test]
+    fn simple_cors_runs_on_container_and_object_handle_paths() {
+        let non_strict = app(ProxyConfig {
+            strict_cors_mode: false,
+            ..Default::default()
+        });
+        seed_container(
+            &non_strict,
+            "AUTH_test",
+            "c",
+            CorsInfo {
+                allow_origin: Some("https://different.example".into()),
+                expose_headers: None,
+                max_age: None,
+            },
+        );
+        non_strict.info_cache.set_account(
+            "AUTH_test".into(),
+            AccountInfo {
+                status: 404,
+                ..Default::default()
+            },
+            60.0,
+        );
+        let container_resp = non_strict.handle(request(
+            "PUT",
+            "/v1/AUTH_test/c",
+            &[("Origin", "https://request.example")],
+        ));
+        assert_eq!(container_resp.status, 404);
+        assert_eq!(
+            container_resp.headers.get("Access-Control-Allow-Origin"),
+            Some("https://request.example")
+        );
+
+        let strict = app(ProxyConfig::default());
+        seed_container(
+            &strict,
+            "AUTH_test",
+            "c",
+            CorsInfo {
+                allow_origin: Some("https://allowed.example".into()),
+                expose_headers: None,
+                max_age: None,
+            },
+        );
+        let allowed = strict.handle(request(
+            "GET",
+            "/v1/AUTH_test/c/o",
+            &[("Origin", "https://allowed.example")],
+        ));
+        assert_eq!(allowed.status, 503);
+        assert_eq!(
+            allowed.headers.get("Access-Control-Allow-Origin"),
+            Some("https://allowed.example")
+        );
+
+        let denied = strict.handle(request(
+            "GET",
+            "/v1/AUTH_test/c/o",
+            &[("Origin", "https://denied.example")],
+        ));
+        assert_eq!(denied.status, 503);
+        assert_no_cors(&denied.headers);
+
+        let unsupported = strict.handle(request(
+            "PATCH",
+            "/v1/AUTH_test/c",
+            &[("Origin", "https://allowed.example")],
+        ));
+        assert_eq!(unsupported.status, 405);
+        assert_eq!(
+            unsupported.headers.get("Allow"),
+            Some("GET, HEAD, PUT, POST, DELETE, OPTIONS")
+        );
+        assert_no_cors(&unsupported.headers);
+    }
+}
+
+#[cfg(test)]
 mod p1a_wiring_tests {
     use super::policy_ring_tests::ring;
     use super::*;
@@ -4888,6 +5918,7 @@ mod p1a_wiring_tests {
             write_acl: None,
             temp_url_keys: Vec::new(),
             sync_key: Some("lab-sync-key".into()),
+            cors: CorsInfo::default(),
         };
         app.info_cache
             .set_container("AUTH_test/syncc".into(), info, 60.0);
@@ -4930,6 +5961,48 @@ mod p1a_wiring_tests {
                 .is_some(),
             "mismatched sync-key must not authorize"
         );
+    }
+
+    #[test]
+    fn versioned_write_authorize_only_probe_stops_before_backend_dispatch() {
+        let allowed = app(false);
+        let mut headers = HeaderKeyDict::new();
+        headers.set(
+            swift_middleware::VERSIONED_WRITES_AUTHORIZE_ONLY_HEADER,
+            "true",
+        );
+        let req = Request {
+            method: "PUT".to_string(),
+            path: "/v1/AUTH_test/container/object".to_string(),
+            query_string: String::new(),
+            headers,
+            body: swift_http::Body::empty(),
+        };
+        assert_eq!(allowed.handle(req).status, 204);
+
+        let denied = app(true);
+        denied.info_cache.set_container(
+            "AUTH_test/container".to_string(),
+            ContainerInfo {
+                status: 204,
+                policy_index: 0,
+                ..Default::default()
+            },
+            60.0,
+        );
+        let mut headers = HeaderKeyDict::new();
+        headers.set(
+            swift_middleware::VERSIONED_WRITES_AUTHORIZE_ONLY_HEADER,
+            "true",
+        );
+        let req = Request {
+            method: "DELETE".to_string(),
+            path: "/v1/AUTH_test/container/object".to_string(),
+            query_string: String::new(),
+            headers,
+            body: swift_http::Body::empty(),
+        };
+        assert_eq!(denied.handle(req).status, 401);
     }
 
     #[test]
@@ -5056,7 +6129,11 @@ mod p1a_wiring_tests {
             headers: HeaderKeyDict::new(),
             body: swift_http::Body::empty(),
         });
-        assert_ne!(resp.status, 405, "enabled path must not 405: {}", resp.status);
+        assert_ne!(
+            resp.status, 405,
+            "enabled path must not 405: {}",
+            resp.status
+        );
     }
 }
 

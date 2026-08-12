@@ -66,12 +66,13 @@ impl PluginRegistry {
 
     /// Build filter for pipeline `name` using conf `use` / `plugin` keys.
     ///
-    /// Falls back to NamedPassthrough when `default_passthrough` is true.
+    /// Falls back to NamedPassthrough only when
+    /// `allow_unknown_passthrough` is an explicit operator opt-in.
     pub fn build(
         &self,
         name: &str,
         conf_items: &HashMap<String, String>,
-        default_passthrough: bool,
+        allow_unknown_passthrough: bool,
     ) -> Option<(Arc<dyn Middleware>, String)> {
         let use_key = conf_items
             .get("use")
@@ -85,17 +86,15 @@ impl PluginRegistry {
                 return Some((mw, format!("plugin '{name}' via use={use_key}")));
             }
             // Unknown use= may become an explicit no-op only when opted in.
-            if default_passthrough {
+            if allow_unknown_passthrough {
                 return Some((
                     Arc::new(NamedPassthrough::new(name)),
-                    format!(
-                        "plugin '{name}' unknown use={use_key}; NamedPassthrough fallback"
-                    ),
+                    format!("plugin '{name}' unknown use={use_key}; NamedPassthrough fallback"),
                 ));
             }
             return None;
         }
-        if default_passthrough {
+        if allow_unknown_passthrough {
             return Some((
                 Arc::new(NamedPassthrough::new(name)),
                 format!("plugin '{name}' registered as NamedPassthrough (third-party slot)"),
@@ -124,7 +123,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unknown_name_default_passthrough() {
+    fn unknown_name_requires_explicit_passthrough_opt_in() {
         let reg = PluginRegistry::new();
         let conf = HashMap::new();
         let (_mw, note) = reg.build("my_custom_filter", &conf, true).unwrap();
@@ -165,5 +164,15 @@ mod tests {
     fn no_default_returns_none() {
         let reg = PluginRegistry::new();
         assert!(reg.build("nope", &HashMap::new(), false).is_none());
+    }
+
+    #[test]
+    fn unknown_use_is_rejected_without_passthrough_opt_in() {
+        let reg = PluginRegistry::new();
+        let mut conf = HashMap::new();
+        conf.insert("use".into(), "egg:not-installed#filter".into());
+        assert!(reg.build("nope", &conf, false).is_none());
+        let (_mw, note) = reg.build("nope", &conf, true).unwrap();
+        assert!(note.contains("NamedPassthrough fallback"));
     }
 }

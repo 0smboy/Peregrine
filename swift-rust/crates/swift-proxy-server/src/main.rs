@@ -34,7 +34,7 @@ use swift_core::obslog::{LogLevel, Logger};
 use swift_core::otlp::{self, AttrValue, TraceExporter, TraceSpan};
 use swift_core::statsd::StatsdClient;
 use swift_core::storage_policy::{parse_storage_policies, StoragePolicyCollection};
-use swift_proxy_server::{EcPolicyParams, ProxyApp, ProxyConfig};
+use swift_proxy_server::{EcPolicyParams, ProxyApp, ProxyConfig, ProxyEndpointResolver};
 use swift_ring::{Ring, RingData};
 
 /// How often the reload thread re-stats the ring files (Python
@@ -117,13 +117,12 @@ fn main() {
         Arc::clone(&logger),
     );
 
-    let swift_conf_path =
-        std::env::var("SWIFT_CONF").unwrap_or_else(|_| {
-            format!(
-                "{}/swift.conf",
-                std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string())
-            )
-        });
+    let swift_conf_path = std::env::var("SWIFT_CONF").unwrap_or_else(|_| {
+        format!(
+            "{}/swift.conf",
+            std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string())
+        )
+    });
     let swift_conf = parse_conf_file(&swift_conf_path).unwrap_or_else(|e| {
         logger.error(&format!("could not read {swift_conf_path}: {e}"));
         std::process::exit(1);
@@ -341,34 +340,35 @@ fn main() {
         Arc::new(ProxyTempUrlKeys::new(Arc::clone(&app)));
     let sync_key_provider: Arc<dyn swift_middleware::SyncKeyProvider> =
         Arc::new(ProxySyncKeys::new(Arc::clone(&app)));
-    let (filters, notes) = build_configured_filters(
+    let endpoint_resolver: Arc<dyn swift_middleware::EndpointResolver> =
+        Arc::new(ProxyEndpointResolver::new(Arc::clone(&app)));
+    let (filters, notes, issues) = build_configured_filters_with_issues(
         &conf,
         tempauth,
         keystoneauth,
         Some(Arc::clone(&logger)),
         key_provider,
         sync_key_provider,
+        endpoint_resolver,
         &policies_for_filters,
         hash_config.clone(),
     );
     let strict_pipeline = strict_pipeline_from_conf(&conf);
-    let mut fatal = false;
     for note in &notes {
-        if pipeline_note_is_strict_fatal(note) {
-            if strict_pipeline {
-                logger.error(&format!("strict_pipeline: {note}"));
-                fatal = true;
-            } else {
-                logger.info(note);
-            }
+        logger.info(note);
+    }
+    for issue in &issues {
+        if strict_pipeline {
+            logger.error(&format!("strict_pipeline: {issue}"));
         } else {
-            logger.info(note);
+            logger.info(&format!("non-strict pipeline compatibility: {issue}"));
         }
     }
-    if fatal {
-        logger.error(
-            "strict_pipeline=true: refusing to start with unknown/unimplemented pipeline filters",
-        );
+    if strict_pipeline_rejects(&conf, &issues) {
+        logger.error(&format!(
+            "strict_pipeline=true: refusing to start with {} unresolved pipeline filter(s)",
+            issues.len()
+        ));
         std::process::exit(1);
     }
     if let Err(e) =
@@ -416,6 +416,19 @@ fn proxy_config_from_conf(conf: &SwiftConfig, auth_enabled: bool) -> ProxyConfig
                 .as_str(),
             "true" | "1" | "yes" | "on" | "t" | "y"
         ),
+        strict_cors_mode: config_true_value(&get("strict_cors_mode", "true")),
+        cors_allow_origin: get("cors_allow_origin", "")
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect(),
+        cors_expose_headers: get("cors_expose_headers", "")
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect(),
         // server.py:235-246: TTLs for the proxy's account/container info
         // cache (DEFAULT_RECHECK_{CONTAINER,ACCOUNT}_EXISTENCE = 60).
         recheck_container_existence: get("recheck_container_existence", "")
@@ -528,14 +541,27 @@ fn server_options_from_conf(conf: &SwiftConfig) -> ServerOptions {
 /// the conf has no such section. Presence is probed via the section's
 /// `use =` line (the paste marker every real filter section carries), the
 /// way `build_tempauth` keys off its section's `user_*` records.
-fn build_ratelimit(conf: &SwiftConfig) -> Option<swift_middleware::RateLimit> {
-    conf.get("filter:ratelimit", "use").ok().flatten()?;
-    let options: std::collections::HashMap<String, String> =
-        conf.items("filter:ratelimit").ok()?.into_iter().collect();
-    Some(swift_middleware::RateLimit::from_conf(
+fn build_ratelimit(conf: &SwiftConfig) -> Result<Option<swift_middleware::RateLimit>, String> {
+    if conf
+        .get("filter:ratelimit", "use")
+        .map_err(|error| format!("could not read [filter:ratelimit] use: {error}"))?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let mut options: std::collections::HashMap<String, String> = conf
+        .items("filter:ratelimit")
+        .map_err(|error| format!("could not read [filter:ratelimit]: {error}"))?
+        .into_iter()
+        .collect();
+    options
+        .entry("memcache_servers".to_string())
+        .or_insert_with(|| memcache_servers_csv(conf));
+    swift_middleware::RateLimit::try_from_conf(
         &options,
         Box::new(swift_middleware::SystemClock::new()),
-    ))
+    )
+    .map(Some)
 }
 
 /// Resolve `memcache_servers` for `[filter:cache]`: section → app → DEFAULT
@@ -717,12 +743,35 @@ fn build_slo(conf: &SwiftConfig, hash_config: HashPathConfig) -> swift_middlewar
     slo
 }
 
+fn build_dlo(conf: &SwiftConfig) -> Result<swift_middleware::DynamicLargeObject, String> {
+    let parse = |key: &str, default: i64| -> Result<i64, String> {
+        conf.get("filter:dlo", key)
+            .ok()
+            .flatten()
+            .or_else(|| conf.get("app:proxy-server", key).ok().flatten())
+            .or_else(|| conf.get("DEFAULT", key).ok().flatten())
+            .map(|raw| {
+                raw.trim()
+                    .parse::<i64>()
+                    .map_err(|_| format!("dlo: {key} has invalid integer {raw:?}"))
+            })
+            .unwrap_or(Ok(default))
+    };
+    Ok(swift_middleware::DynamicLargeObject::new()
+        .with_max_get_time(parse("max_get_time", 86_400)?)
+        .with_rate_limit_after_segment(parse("rate_limit_after_segment", 10)?)
+        .with_rate_limit_segments_per_sec(parse("rate_limit_segments_per_sec", 1)?))
+}
+
 /// Names handled inside [`serve_with_filters_and_config`] (or the app itself).
 /// Dropped when reading `pipeline =` so a Python-shaped line can be reused.
 const ALWAYS_ON_OR_APP: &[&str] = &[
     "catch_errors",
+    "catch-errors",
     "gatekeeper",
     "healthcheck",
+    "health_check",
+    "health-check",
     "proxy-server",
     "proxy_server",
 ];
@@ -744,9 +793,6 @@ fn configured_pipeline_has(conf: &SwiftConfig, name: &str) -> bool {
         })
         .unwrap_or_else(|| DEFAULT_CONFIGURED_FILTERS.contains(&name))
 }
-
-/// `[app:proxy-server] strict_pipeline` (DEFAULT fallback). Default **true**
-/// so an unknown security or auth filter cannot silently disappear.
 
 /// Number of OS processes for eventlet-like worker model.
 /// Prefer `[app:proxy-server] process_workers`; if `worker_model = process`
@@ -809,6 +855,8 @@ fn prefork_workers(n: usize, logger: &Logger) {
     }
 }
 
+/// `[app:proxy-server] strict_pipeline` (DEFAULT fallback). Default **true**
+/// so an unknown security or auth filter cannot silently disappear.
 fn strict_pipeline_from_conf(conf: &SwiftConfig) -> bool {
     let raw = conf
         .get("app:proxy-server", "strict_pipeline")
@@ -819,32 +867,136 @@ fn strict_pipeline_from_conf(conf: &SwiftConfig) -> bool {
     config_true_value(&raw)
 }
 
-/// Startup notes that are hard-fail candidates under `strict_pipeline=true`.
-fn pipeline_note_is_strict_fatal(note: &str) -> bool {
-    note.contains("unknown filter") || note.contains("not implemented in proxy wiring")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipelineBuildIssueKind {
+    MissingConfiguration,
+    BuildFailure,
+    NotImplemented,
+    UnknownFilter,
+}
+
+impl PipelineBuildIssueKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingConfiguration => "missing_configuration",
+            Self::BuildFailure => "build_failure",
+            Self::NotImplemented => "not_implemented",
+            Self::UnknownFilter => "unknown_filter",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PipelineBuildIssue {
+    filter: String,
+    kind: PipelineBuildIssueKind,
+    detail: String,
+}
+
+impl PipelineBuildIssue {
+    fn new(
+        filter: impl AsRef<str>,
+        kind: PipelineBuildIssueKind,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            filter: filter.as_ref().to_string(),
+            kind,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for PipelineBuildIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "filter={} kind={} detail={}",
+            self.filter,
+            self.kind.as_str(),
+            self.detail
+        )
+    }
+}
+
+/// Fail closed on any configured filter that could not be built. The gate
+/// consumes typed build issues only; human-readable startup notes are never
+/// interpreted as policy.
+fn strict_pipeline_rejects(conf: &SwiftConfig, issues: &[PipelineBuildIssue]) -> bool {
+    strict_pipeline_from_conf(conf) && !issues.is_empty()
+}
+
+fn build_copy(conf: &SwiftConfig) -> Result<swift_middleware::Copy, String> {
+    let raw = conf
+        .get("filter:copy", "yield_frequency")
+        .ok()
+        .flatten()
+        .or_else(|| conf.get("DEFAULT", "yield_frequency").ok().flatten())
+        .unwrap_or_else(|| "10".to_string());
+    let seconds = raw
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| format!("invalid copy yield_frequency {raw:?}: expected an integer"))?;
+    Ok(swift_middleware::Copy::new().with_yield_frequency(seconds as f64))
+}
+
+/// Allowed, deprecated, and unsupported configured digest names.
+type FormPostDigestOptions = (Vec<String>, Vec<String>, Vec<String>);
+
+fn formpost_digest_options(conf: &SwiftConfig) -> Result<FormPostDigestOptions, String> {
+    let configured = conf
+        .get("filter:formpost", "allowed_digests")
+        .ok()
+        .flatten()
+        .or_else(|| conf.get("DEFAULT", "allowed_digests").ok().flatten());
+    let requested = configured
+        .as_deref()
+        .map(str::split_whitespace)
+        .into_iter()
+        .flatten()
+        .map(str::to_ascii_lowercase)
+        .collect::<std::collections::BTreeSet<_>>();
+    let requested = if requested.is_empty() {
+        ["sha1", "sha256", "sha512"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>()
+    } else {
+        requested
+    };
+    let supported = ["sha1", "sha256", "sha512"]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let allowed = requested
+        .iter()
+        .filter(|digest| supported.contains(digest.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let unsupported = requested
+        .iter()
+        .filter(|digest| !supported.contains(digest.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if allowed.is_empty() {
+        return Err("No valid digest algorithms are configured".to_string());
+    }
+    let deprecated = allowed
+        .iter()
+        .filter(|digest| digest.as_str() == "sha1")
+        .cloned()
+        .collect();
+    Ok((allowed, deprecated, unsupported))
 }
 
 /// Build `formpost` around the same Temp-URL key provider as tempurl.
 fn build_formpost(
     conf: &SwiftConfig,
     key_provider: Arc<dyn swift_middleware::KeyProvider>,
-) -> swift_middleware::FormPost {
+) -> Result<(swift_middleware::FormPost, Vec<String>, Vec<String>), String> {
+    let (allowed, deprecated, unsupported) = formpost_digest_options(conf)?;
     let mut fp = swift_middleware::FormPost::new(key_provider);
-    if let Some(allowed_digests) = conf
-        .get("filter:formpost", "allowed_digests")
-        .ok()
-        .flatten()
-        .map(|value| {
-            value
-                .split_whitespace()
-                .map(str::to_ascii_lowercase)
-                .collect::<Vec<_>>()
-        })
-        .filter(|values| !values.is_empty())
-    {
-        fp.allowed_digests = allowed_digests;
-    }
-    fp
+    fp.allowed_digests = allowed;
+    Ok((fp, deprecated, unsupported))
 }
 
 fn build_versioned_writes(conf: &SwiftConfig) -> swift_middleware::VersionedWrites {
@@ -857,15 +1009,14 @@ fn build_versioned_writes(conf: &SwiftConfig) -> swift_middleware::VersionedWrit
                 .ok()
                 .flatten()
         });
-    swift_middleware::VersionedWrites::from_conf(allow.as_deref())
+    swift_middleware::VersionedWrites::from_conf(allow.as_deref()).with_authorization_probe(true)
 }
 
-fn build_symlink(conf: &SwiftConfig) -> swift_middleware::Symlink {
+fn build_symlink(conf: &SwiftConfig) -> Result<swift_middleware::Symlink, String> {
     let symloop = conf
         .get("filter:symlink", "symloop_max")
-        .ok()
-        .flatten();
-    swift_middleware::Symlink::from_conf(symloop.as_deref())
+        .map_err(|error| format!("could not read [filter:symlink] symloop_max: {error}"))?;
+    swift_middleware::Symlink::try_from_conf(symloop.as_deref())
 }
 
 fn build_read_only(conf: &SwiftConfig) -> swift_middleware::ReadOnly {
@@ -977,7 +1128,10 @@ fn build_domain_remap(conf: &SwiftConfig) -> swift_middleware::DomainRemap {
         "filter:domain-remap"
     };
     swift_middleware::DomainRemap::from_conf(
-        conf.get(section, "storage_domain").ok().flatten().as_deref(),
+        conf.get(section, "storage_domain")
+            .ok()
+            .flatten()
+            .as_deref(),
         conf.get(section, "path_root").ok().flatten().as_deref(),
         conf.get(section, "reseller_prefixes")
             .ok()
@@ -1057,8 +1211,19 @@ fn build_backend_ratelimit(conf: &SwiftConfig) -> swift_middleware::BackendRateL
     {
         brl = brl.with_device_rate(rate);
     }
-    for method in ["GET", "HEAD", "PUT", "POST", "DELETE", "UPDATE", "REPLICATE"] {
-        let key = format!("{}_requests_per_device_per_second", method.to_ascii_lowercase());
+    for method in [
+        "GET",
+        "HEAD",
+        "PUT",
+        "POST",
+        "DELETE",
+        "UPDATE",
+        "REPLICATE",
+    ] {
+        let key = format!(
+            "{}_requests_per_device_per_second",
+            method.to_ascii_lowercase()
+        );
         if let Some(rate) = conf
             .get(section, &key)
             .ok()
@@ -1080,24 +1245,36 @@ fn build_backend_ratelimit(conf: &SwiftConfig) -> swift_middleware::BackendRateL
 }
 
 /// Read optional `[pipeline:main] pipeline = ...` and assemble the
-/// implemented configurable filters in that order. Returns the filter list
-/// plus human-readable notes (enabled / skipped) for the startup log.
+/// implemented configurable filters in that order. Returns the filter list,
+/// human-readable startup notes, and typed issues for every configured filter
+/// that could not be built faithfully.
 ///
 /// P0–P1b wires: cache/listing_formats/proxy_logging/bulk/tempurl plus
 /// formpost/staticweb/quotas/symlink/versioned_writes and the smaller L2
 /// filters. P3-s3 wires `s3api` (ON-BY-CONFIG; not on default pipeline).
-/// Unknown names skip with a note; `strict_pipeline=true` hard-fails at main.
-fn build_configured_filters(
+/// Unknown names skip with a typed issue; `strict_pipeline=true` hard-fails at
+/// main without parsing log text.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "pipeline construction keeps each independently-built dependency explicit"
+)]
+fn build_configured_filters_with_issues(
     conf: &SwiftConfig,
     tempauth: Option<swift_middleware::TempAuth>,
     keystoneauth: Option<swift_middleware::KeystoneAuth>,
     access_logger: Option<Arc<Logger>>,
     key_provider: Arc<dyn swift_middleware::KeyProvider>,
     sync_key_provider: Arc<dyn swift_middleware::SyncKeyProvider>,
+    endpoint_resolver: Arc<dyn swift_middleware::EndpointResolver>,
     policies: &StoragePolicyCollection,
     hash_config: HashPathConfig,
-) -> (Vec<Arc<dyn swift_middleware::Middleware>>, Vec<String>) {
+) -> (
+    Vec<Arc<dyn swift_middleware::Middleware>>,
+    Vec<String>,
+    Vec<PipelineBuildIssue>,
+) {
     let mut notes = Vec::new();
+    let mut issues = Vec::new();
     let pipeline_line = conf
         .get("pipeline:main", "pipeline")
         .ok()
@@ -1128,30 +1305,65 @@ fn build_configured_filters(
 
     for name in &names {
         match name.as_str() {
-            "ratelimit" => {
-                if let Some(rl) = build_ratelimit(conf) {
+            "ratelimit" => match build_ratelimit(conf) {
+                Ok(Some(rl)) => {
                     notes.push("ratelimit enabled".into());
                     filters.push(Arc::new(rl));
-                } else if pipeline_line.is_some() {
+                }
+                Ok(None) if pipeline_line.is_some() => {
                     notes.push(
                         "pipeline: ratelimit listed but [filter:ratelimit] absent; skip".into(),
                     );
+                    issues.push(PipelineBuildIssue::new(
+                        name,
+                        PipelineBuildIssueKind::MissingConfiguration,
+                        "[filter:ratelimit] is absent",
+                    ));
                 }
-            }
+                Ok(None) => {}
+                Err(error) => {
+                    notes.push(format!(
+                        "pipeline: ratelimit listed but configuration failed validation ({error}); skip"
+                    ));
+                    issues.push(PipelineBuildIssue::new(
+                        name,
+                        PipelineBuildIssueKind::BuildFailure,
+                        error,
+                    ));
+                }
+            },
             "tempauth" => {
                 if let Some(auth) = tempauth.take() {
                     notes.push("tempauth enabled".into());
                     filters.push(Arc::new(auth));
                 } else if pipeline_line.is_some() {
-                    notes.push(
-                        "pipeline: tempauth listed but no user_* credentials; skip".into(),
-                    );
+                    notes.push("pipeline: tempauth listed but no user_* credentials; skip".into());
+                    issues.push(PipelineBuildIssue::new(
+                        name,
+                        PipelineBuildIssueKind::MissingConfiguration,
+                        "no TempAuth user_* credentials were built",
+                    ));
                 }
             }
-            "copy" => {
-                notes.push("copy enabled".into());
-                filters.push(Arc::new(swift_middleware::Copy::new()));
-            }
+            "copy" => match build_copy(conf) {
+                Ok(copy) => {
+                    notes.push(format!(
+                        "copy enabled (yield_frequency={})",
+                        copy.yield_frequency
+                    ));
+                    filters.push(Arc::new(copy));
+                }
+                Err(error) => {
+                    notes.push(format!(
+                        "pipeline: copy listed but configuration failed validation ({error}); skip"
+                    ));
+                    issues.push(PipelineBuildIssue::new(
+                        name,
+                        PipelineBuildIssueKind::BuildFailure,
+                        error,
+                    ));
+                }
+            },
             "slo" => {
                 let slo = build_slo(conf, hash_config.clone());
                 notes.push(format!(
@@ -1160,13 +1372,25 @@ fn build_configured_filters(
                 ));
                 filters.push(Arc::new(slo));
             }
-            "dlo" => {
-                notes.push("dlo enabled".into());
-                filters.push(Arc::new(swift_middleware::DynamicLargeObject::new()));
-            }
+            "dlo" => match build_dlo(conf) {
+                Ok(dlo) => {
+                    notes.push("dlo enabled".into());
+                    filters.push(Arc::new(dlo));
+                }
+                Err(error) => {
+                    notes.push(format!(
+                        "pipeline: dlo listed but configuration failed validation ({error}); skip"
+                    ));
+                    issues.push(PipelineBuildIssue::new(
+                        name,
+                        PipelineBuildIssueKind::BuildFailure,
+                        error,
+                    ));
+                }
+            },
             "listing_formats" | "listing-formats" => {
                 notes.push("listing_formats enabled".into());
-                filters.push(Arc::new(swift_middleware::ListingFormats::default()));
+                filters.push(Arc::new(swift_middleware::ListingFormats));
             }
             "proxy-logging" | "proxy_logging" => {
                 let has_sink = access_logger.is_some();
@@ -1187,7 +1411,14 @@ fn build_configured_filters(
                     filters.push(Arc::new(cache));
                 }
                 Err(e) => {
-                    notes.push(format!("pipeline: cache listed but failed to build ({e}); skip"));
+                    notes.push(format!(
+                        "pipeline: cache listed but failed to build ({e}); skip"
+                    ));
+                    issues.push(PipelineBuildIssue::new(
+                        name,
+                        PipelineBuildIssueKind::BuildFailure,
+                        e,
+                    ));
                 }
             },
             "bulk" => {
@@ -1203,11 +1434,34 @@ fn build_configured_filters(
                 notes.push("tempurl enabled".into());
                 filters.push(Arc::new(tempurl));
             }
-            "formpost" => {
-                let fp = build_formpost(conf, Arc::clone(&key_provider));
-                notes.push("formpost enabled".into());
-                filters.push(Arc::new(fp));
-            }
+            "formpost" => match build_formpost(conf, Arc::clone(&key_provider)) {
+                Ok((fp, deprecated, unsupported)) => {
+                    if !unsupported.is_empty() {
+                        notes.push(format!(
+                            "formpost ignored unsupported digests: {}",
+                            unsupported.join(", ")
+                        ));
+                    }
+                    if !deprecated.is_empty() {
+                        notes.push(format!(
+                            "formpost deprecated digests configured: {}",
+                            deprecated.join(", ")
+                        ));
+                    }
+                    notes.push("formpost enabled".into());
+                    filters.push(Arc::new(fp));
+                }
+                Err(error) => {
+                    notes.push(format!(
+                        "pipeline: formpost listed but configuration failed validation ({error}); skip"
+                    ));
+                    issues.push(PipelineBuildIssue::new(
+                        name,
+                        PipelineBuildIssueKind::BuildFailure,
+                        error,
+                    ));
+                }
+            },
             "staticweb" => {
                 notes.push("staticweb enabled".into());
                 filters.push(Arc::new(swift_middleware::StaticWeb::new()));
@@ -1230,11 +1484,22 @@ fn build_configured_filters(
                 ));
                 filters.push(Arc::new(vw));
             }
-            "symlink" => {
-                let sl = build_symlink(conf);
-                notes.push(format!("symlink enabled (symloop_max={})", sl.symloop_max));
-                filters.push(Arc::new(sl));
-            }
+            "symlink" => match build_symlink(conf) {
+                Ok(sl) => {
+                    notes.push(format!("symlink enabled (symloop_max={})", sl.symloop_max));
+                    filters.push(Arc::new(sl));
+                }
+                Err(error) => {
+                    notes.push(format!(
+                        "pipeline: symlink listed but configuration failed validation ({error}); skip"
+                    ));
+                    issues.push(PipelineBuildIssue::new(
+                        name,
+                        PipelineBuildIssueKind::BuildFailure,
+                        error,
+                    ));
+                }
+            },
             "read_only" | "read-only" => {
                 let ro = build_read_only(conf);
                 notes.push(format!(
@@ -1272,6 +1537,11 @@ fn build_configured_filters(
                     notes.push(
                         "pipeline: cname_lookup listed but storage_domain empty; skip".into(),
                     );
+                    issues.push(PipelineBuildIssue::new(
+                        name,
+                        PipelineBuildIssueKind::MissingConfiguration,
+                        "storage_domain is empty",
+                    ));
                 }
             },
             "backend_ratelimit" | "backend-ratelimit" => {
@@ -1290,6 +1560,11 @@ fn build_configured_filters(
                     notes.push(format!(
                         "pipeline: authtoken listed but failed to build ({e}); skip"
                     ));
+                    issues.push(PipelineBuildIssue::new(
+                        name,
+                        PipelineBuildIssueKind::BuildFailure,
+                        e,
+                    ));
                 }
             },
             "keystoneauth" => {
@@ -1304,10 +1579,15 @@ fn build_configured_filters(
                         "pipeline: keystoneauth listed but [filter:keystoneauth] absent; skip"
                             .into(),
                     );
+                    issues.push(PipelineBuildIssue::new(
+                        name,
+                        PipelineBuildIssueKind::MissingConfiguration,
+                        "[filter:keystoneauth] is absent",
+                    ));
                 }
-            },
+            }
             "s3api" => match build_s3api(conf) {
-                Some(api) => {
+                Ok(Some(api)) => {
                     let defer = if api.s3token_client.is_some() {
                         " + EC2→s3token deferral"
                     } else {
@@ -1318,16 +1598,33 @@ fn build_configured_filters(
                     ));
                     filters.push(swift_s3api::as_middleware(api));
                 }
-                None => {
+                Ok(None) => {
                     notes.push(
-                        "pipeline: s3api listed but no TempAuth user_* credentials; skip".into(),
+                        "pipeline: s3api listed but no TempAuth or Keystone S3 credential source; skip"
+                            .into(),
                     );
+                    issues.push(PipelineBuildIssue::new(
+                        name,
+                        PipelineBuildIssueKind::MissingConfiguration,
+                        "no TempAuth user_* credentials or [filter:s3token] auth_uri are available",
+                    ));
+                }
+                Err(e) => {
+                    notes.push(format!(
+                        "pipeline: s3api listed but configuration failed validation ({e}); skip"
+                    ));
+                    issues.push(PipelineBuildIssue::new(
+                        name,
+                        PipelineBuildIssueKind::BuildFailure,
+                        e,
+                    ));
                 }
             },
             "s3token" => {
                 // Wave 3 hook: exchange S3 creds → Keystone token headers.
                 // Requires [filter:s3token] auth_uri (or auth_url). Without it,
-                // MapS3TokenClient is empty → passthrough (honest ON-BY-CONFIG).
+                // MapS3TokenClient cannot authenticate. It is retained only
+                // for non-strict compatibility, with a typed startup issue.
                 // EC2 unknown-key deferral is also injected into s3api via
                 // build_s3api (inline /v3/s3tokens with base64 string-to-sign).
                 let auth_uri = s3token_auth_uri(conf).unwrap_or_default();
@@ -1338,9 +1635,14 @@ fn build_configured_filters(
                     .unwrap_or_else(|| "AUTH_".into());
                 if auth_uri.is_empty() {
                     notes.push(
-                        "pipeline: s3token listed but no auth_uri; wiring passthrough Map client"
+                        "pipeline: s3token listed but no auth_uri; compatibility Map client only"
                             .into(),
                     );
+                    issues.push(PipelineBuildIssue::new(
+                        name,
+                        PipelineBuildIssueKind::MissingConfiguration,
+                        "auth_uri/auth_url is absent; Map client cannot authenticate S3 tokens",
+                    ));
                     let client = std::sync::Arc::new(swift_middleware::MapS3TokenClient::new());
                     filters.push(std::sync::Arc::new(
                         swift_middleware::S3Token::new(client).with_reseller_prefix(reseller),
@@ -1355,13 +1657,26 @@ fn build_configured_filters(
                 }
             }
             "container_sync" | "container-sync" => {
-                let cs = build_container_sync(conf, Arc::clone(&sync_key_provider));
-                notes.push(format!(
-                    "container_sync enabled (allow_full_urls={}, realms={})",
-                    cs.allow_full_urls,
-                    cs.realms.realms.len()
-                ));
-                filters.push(Arc::new(cs));
+                match build_container_sync(conf, Arc::clone(&sync_key_provider)) {
+                    Ok(cs) => {
+                        notes.push(format!(
+                            "container_sync enabled (allow_full_urls={}, realms={})",
+                            cs.allow_full_urls,
+                            cs.realms.realms.len()
+                        ));
+                        filters.push(Arc::new(cs));
+                    }
+                    Err(error) => {
+                        notes.push(format!(
+                            "pipeline: container_sync listed but realms configuration failed validation ({error}); skip"
+                        ));
+                        issues.push(PipelineBuildIssue::new(
+                            name,
+                            PipelineBuildIssueKind::BuildFailure,
+                            error,
+                        ));
+                    }
+                }
             }
             // At-rest crypto (ON-BY-CONFIG). Typical order:
             //   ... keymaster encryption ...  or
@@ -1378,6 +1693,11 @@ fn build_configured_filters(
                     notes.push(format!(
                         "pipeline: keymaster listed but failed to build ({e}); skip"
                     ));
+                    issues.push(PipelineBuildIssue::new(
+                        name,
+                        PipelineBuildIssueKind::BuildFailure,
+                        e,
+                    ));
                 }
             },
             "encrypter" => {
@@ -1388,16 +1708,18 @@ fn build_configured_filters(
                     Some(arc) => {
                         keymaster_state.get_or_insert_with(|| Arc::clone(&arc));
                         let disable = encryption_disabled(conf);
-                        notes.push(format!(
-                            "encrypter enabled (disable_encryption={disable})"
-                        ));
+                        notes.push(format!("encrypter enabled (disable_encryption={disable})"));
                         filters.push(Arc::new(swift_middleware::Encrypter::new(arc, disable)));
                     }
                     None => {
                         notes.push(
-                            "pipeline: encrypter listed but no encryption_root_secret; skip"
-                                .into(),
+                            "pipeline: encrypter listed but no encryption_root_secret; skip".into(),
                         );
+                        issues.push(PipelineBuildIssue::new(
+                            name,
+                            PipelineBuildIssueKind::MissingConfiguration,
+                            "no usable encryption_root_secret",
+                        ));
                     }
                 }
             }
@@ -1413,9 +1735,13 @@ fn build_configured_filters(
                     }
                     None => {
                         notes.push(
-                            "pipeline: decrypter listed but no encryption_root_secret; skip"
-                                .into(),
+                            "pipeline: decrypter listed but no encryption_root_secret; skip".into(),
                         );
+                        issues.push(PipelineBuildIssue::new(
+                            name,
+                            PipelineBuildIssueKind::MissingConfiguration,
+                            "no usable encryption_root_secret",
+                        ));
                     }
                 }
             }
@@ -1433,9 +1759,7 @@ fn build_configured_filters(
                         notes.push(format!(
                             "encryption enabled (decrypter+encrypter; disable_encryption={disable})"
                         ));
-                        filters.push(Arc::new(swift_middleware::Decrypter::new(Arc::clone(
-                            &arc,
-                        ))));
+                        filters.push(Arc::new(swift_middleware::Decrypter::new(Arc::clone(&arc))));
                         filters.push(Arc::new(swift_middleware::Encrypter::new(arc, disable)));
                     }
                     None => {
@@ -1443,11 +1767,16 @@ fn build_configured_filters(
                             "pipeline: encryption listed but no encryption_root_secret; skip"
                                 .into(),
                         );
+                        issues.push(PipelineBuildIssue::new(
+                            name,
+                            PipelineBuildIssueKind::MissingConfiguration,
+                            "no usable encryption_root_secret",
+                        ));
                     }
                 }
             }
             "list_endpoints" | "list-endpoints" => {
-                let le = build_list_endpoints(conf);
+                let le = build_list_endpoints(conf, Arc::clone(&endpoint_resolver));
                 notes.push(format!(
                     "list_endpoints enabled (path_root={})",
                     le.path_root
@@ -1462,29 +1791,26 @@ fn build_configured_filters(
                 ));
                 filters.push(Arc::new(xp));
             }
-            // Always-on filters may also appear in pipeline lines; register
-            // NamedPassthrough so they are not "unknown/not implemented".
-            "catch_errors" | "catch-errors" | "gatekeeper" | "healthcheck" | "health_check"
-            | "health-check" | "memcache" | "mem_cache" | "swob" | "recon" => {
+            // These Python pipeline names do not have a Rust middleware
+            // implementation. Never disguise them as a successful no-op.
+            "memcache" | "mem_cache" | "swob" | "recon" => {
                 notes.push(format!(
-                    "pipeline: filter '{name}' registered as NamedPassthrough (claimable slot)"
+                    "pipeline: filter '{name}' is not implemented; omitted in non-strict compatibility mode"
                 ));
-                filters.push(Arc::new(swift_middleware::NamedPassthrough::new(
-                    name.as_str(),
-                )));
+                issues.push(PipelineBuildIssue::new(
+                    name,
+                    PipelineBuildIssueKind::NotImplemented,
+                    "no Rust middleware implementation is registered",
+                ));
             }
             other => {
                 // Rust-native plugins: conf [filter:name] + PluginRegistry
                 // (use=/plugin=). Unknown filters are skipped only when strict
                 // mode is disabled; passthrough requires explicit opt-in.
                 let section = format!("filter:{other}");
-                let conf_items: std::collections::HashMap<String, String> = conf
-                    .items(&section)
-                    .ok()
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                let default_passthrough = conf
+                let conf_items: std::collections::HashMap<String, String> =
+                    conf.items(&section).ok().into_iter().flatten().collect();
+                let allow_unknown_passthrough = conf
                     .get("app:proxy-server", "plugin_default")
                     .ok()
                     .flatten()
@@ -1499,7 +1825,7 @@ fn build_configured_filters(
                 match swift_middleware::global_registry().build(
                     other,
                     &conf_items,
-                    default_passthrough,
+                    allow_unknown_passthrough,
                 ) {
                     Some((mw, note)) => {
                         notes.push(format!("pipeline: {note}"));
@@ -1509,12 +1835,49 @@ fn build_configured_filters(
                         notes.push(format!(
                             "pipeline: unknown filter '{other}'; skip (plugin_default=skip)"
                         ));
+                        issues.push(PipelineBuildIssue::new(
+                            other,
+                            PipelineBuildIssueKind::UnknownFilter,
+                            "no registered Rust plugin; passthrough was not explicitly enabled",
+                        ));
                     }
                 }
             }
         }
     }
 
+    (filters, notes, issues)
+}
+
+/// Legacy two-part view retained for focused middleware-construction tests.
+/// Production startup always consumes `build_configured_filters_with_issues`
+/// so no unresolved filter can be lost before the strict gate.
+#[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "legacy test adapter mirrors the production pipeline builder signature"
+)]
+fn build_configured_filters(
+    conf: &SwiftConfig,
+    tempauth: Option<swift_middleware::TempAuth>,
+    keystoneauth: Option<swift_middleware::KeystoneAuth>,
+    access_logger: Option<Arc<Logger>>,
+    key_provider: Arc<dyn swift_middleware::KeyProvider>,
+    sync_key_provider: Arc<dyn swift_middleware::SyncKeyProvider>,
+    policies: &StoragePolicyCollection,
+    hash_config: HashPathConfig,
+) -> (Vec<Arc<dyn swift_middleware::Middleware>>, Vec<String>) {
+    let (filters, notes, _issues) = build_configured_filters_with_issues(
+        conf,
+        tempauth,
+        keystoneauth,
+        access_logger,
+        key_provider,
+        sync_key_provider,
+        Arc::new(swift_middleware::StaticEndpoints(Vec::new())),
+        policies,
+        hash_config,
+    );
     (filters, notes)
 }
 
@@ -1554,7 +1917,10 @@ fn build_xprofile(conf: &SwiftConfig) -> swift_middleware::XProfile {
     xp
 }
 
-fn build_list_endpoints(conf: &SwiftConfig) -> swift_middleware::ListEndpoints {
+fn build_list_endpoints(
+    conf: &SwiftConfig,
+    resolver: Arc<dyn swift_middleware::EndpointResolver>,
+) -> swift_middleware::ListEndpoints {
     let section = if conf.items("filter:list_endpoints").ok().is_some() {
         "filter:list_endpoints"
     } else {
@@ -1565,16 +1931,12 @@ fn build_list_endpoints(conf: &SwiftConfig) -> swift_middleware::ListEndpoints {
         .ok()
         .flatten()
         .or_else(|| conf.get(section, "path_root").ok().flatten())
+        .or_else(|| conf.get("DEFAULT", "list_endpoints_path").ok().flatten())
         .unwrap_or_else(|| "/endpoints/".into());
-    // Ring resolver is optional — without it, matching paths return 501 with
-    // a clear message (honest ON-BY-CONFIG); other traffic passes through.
-    swift_middleware::ListEndpoints {
-        path_root,
-        resolver: None,
-    }
+    swift_middleware::ListEndpoints::new(resolver).with_path_root(path_root)
 }
 
-/// Ordered implemented filter names that [`build_configured_filters`] would
+/// Ordered implemented filter names that [`build_configured_filters_with_issues`] would
 /// wire (unit-test helper; does not construct middleware).
 #[cfg(test)]
 fn configured_filter_names(conf: &SwiftConfig, has_tempauth: bool) -> Vec<&'static str> {
@@ -1597,11 +1959,11 @@ fn configured_filter_names(conf: &SwiftConfig, has_tempauth: bool) -> Vec<&'stat
     let mut out = Vec::new();
     for name in &names {
         match name.as_str() {
-            "ratelimit" if build_ratelimit(conf).is_some() => out.push("ratelimit"),
+            "ratelimit" if matches!(build_ratelimit(conf), Ok(Some(_))) => out.push("ratelimit"),
             "tempauth" if has_tempauth => out.push("tempauth"),
             "copy" => out.push("copy"),
             "slo" => out.push("slo"),
-            "dlo" => out.push("dlo"),
+            "dlo" if build_dlo(conf).is_ok() => out.push("dlo"),
             "listing_formats" | "listing-formats" => out.push("listing_formats"),
             "proxy-logging" | "proxy_logging" => out.push("proxy_logging"),
             "cache" if build_cache(conf).is_ok() => out.push("cache"),
@@ -1624,8 +1986,16 @@ fn configured_filter_names(conf: &SwiftConfig, has_tempauth: bool) -> Vec<&'stat
             "backend_ratelimit" | "backend-ratelimit" => out.push("backend_ratelimit"),
             "authtoken" if build_authtoken(conf).is_ok() => out.push("authtoken"),
             "keystoneauth" => out.push("keystoneauth"),
-            "s3api" if build_s3api(conf).is_some() => out.push("s3api"),
-            "container_sync" | "container-sync" => out.push("container_sync"),
+            "s3api" if matches!(build_s3api(conf), Ok(Some(_))) => out.push("s3api"),
+            "container_sync" | "container-sync"
+                if build_container_sync(
+                    conf,
+                    Arc::new(swift_middleware::ClosureSyncKeyProvider::new(|_, _| None)),
+                )
+                .is_ok() =>
+            {
+                out.push("container_sync")
+            }
             "keymaster" if build_keymaster(conf).is_ok() => out.push("keymaster"),
             "encrypter" if build_keymaster(conf).is_ok() => out.push("encrypter"),
             "decrypter" if build_keymaster(conf).is_ok() => out.push("decrypter"),
@@ -1642,30 +2012,29 @@ fn configured_filter_names(conf: &SwiftConfig, has_tempauth: bool) -> Vec<&'stat
 fn build_container_sync(
     conf: &SwiftConfig,
     sync_keys: Arc<dyn swift_middleware::SyncKeyProvider>,
-) -> swift_middleware::ContainerSync {
+) -> Result<swift_middleware::ContainerSync, String> {
     let swift_dir = conf
         .get("DEFAULT", "swift_dir")
         .ok()
         .flatten()
-        .or_else(|| conf.get("filter:container_sync", "swift_dir").ok().flatten())
-        .unwrap_or_else(|| {
-            std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string())
-        });
+        .or_else(|| {
+            conf.get("filter:container_sync", "swift_dir")
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_else(|| std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string()));
     let allow_full = conf
         .get("filter:container_sync", "allow_full_urls")
         .ok()
         .flatten()
         .map(|v| config_true_value(&v))
         .unwrap_or(true);
-    let current = conf
-        .get("filter:container_sync", "current")
-        .ok()
-        .flatten();
+    let current = conf.get("filter:container_sync", "current").ok().flatten();
     let realms_path = format!("{swift_dir}/container-sync-realms.conf");
-    swift_middleware::ContainerSync::new(sync_keys)
-        .with_realms_path(realms_path)
+    Ok(swift_middleware::ContainerSync::new(sync_keys)
+        .try_with_realms_path(realms_path)?
         .with_allow_full_urls(allow_full)
-        .with_current(current.as_deref())
+        .with_current(current.as_deref()))
 }
 
 /// Every input a [`ProxyApp`] is constructed from — ring locations
@@ -1809,6 +2178,20 @@ fn build_info_json(
         .or_else(|| conf.get("DEFAULT", "swift_compat_version").ok().flatten())
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "2.33.0".to_string());
+    let strict_cors_mode = conf
+        .get("app:proxy-server", "strict_cors_mode")
+        .ok()
+        .flatten()
+        .or_else(|| conf.get("DEFAULT", "strict_cors_mode").ok().flatten())
+        .map(|value| config_true_value(&value))
+        .unwrap_or(true);
+    let allow_open_expired = conf
+        .get("app:proxy-server", "allow_open_expired")
+        .ok()
+        .flatten()
+        .or_else(|| conf.get("DEFAULT", "allow_open_expired").ok().flatten())
+        .map(|value| config_true_value(&value))
+        .unwrap_or(false);
     let slo_options = slo_options_from_conf(conf);
     let c = swift_core::constraints::Constraints::from_swift_conf(swift_conf).unwrap_or_default();
     let policies: Vec<serde_json::Value> = parse_storage_policies(swift_conf)
@@ -1830,11 +2213,12 @@ fn build_info_json(
     let mut info = serde_json::json!({
         "swift": {
             "version": swift_compat_version,
-            // NOTE: strict_cors_mode deliberately absent — CORS is not
-            // implemented, so cors tests skip ("cors mode is unknown").
+            "strict_cors_mode": strict_cors_mode,
             "account_autocreate": account_autocreate,
             "allow_account_management": allow_account_management,
+            "allow_open_expired": allow_open_expired,
             "max_file_size": c.max_file_size,
+            "max_request_line": c.max_request_line,
             "max_meta_name_length": c.max_meta_name_length,
             "max_meta_value_length": c.max_meta_value_length,
             "max_meta_count": c.max_meta_count,
@@ -1850,15 +2234,16 @@ fn build_info_json(
             "auto_create_account_prefix": c.auto_create_account_prefix,
             "policies": policies,
         },
-        "slo": {
+    });
+    if configured_pipeline_has(conf, "slo") {
+        info["slo"] = serde_json::json!({
             "max_manifest_segments": 1000,
             "max_manifest_size": 8388608,
             "min_segment_size": 1,
             "yield_frequency": slo_options.yield_frequency,
             "allow_async_delete": true,
-        },
-        "dlo": {},
-    });
+        });
+    }
     if tempauth_on {
         // P1a: account ACL (X-Account-Access-Control) is enforced.
         info["tempauth"] = serde_json::json!({ "account_acls": true });
@@ -1880,6 +2265,26 @@ fn build_info_json(
                 .operator_roles,
         });
     }
+    if configured_pipeline_has(conf, "ratelimit") {
+        if let Ok(Some(ratelimit)) = build_ratelimit(conf) {
+            let container_ratelimits: Vec<serde_json::Value> = ratelimit
+                .container_ratelimits
+                .iter()
+                .map(|tier| serde_json::json!([tier.size, tier.rate]))
+                .collect();
+            let container_listing_ratelimits: Vec<serde_json::Value> = ratelimit
+                .container_listing_ratelimits
+                .iter()
+                .map(|tier| serde_json::json!([tier.size, tier.rate]))
+                .collect();
+            info["ratelimit"] = serde_json::json!({
+                "account_ratelimit": ratelimit.account_ratelimit,
+                "max_sleep_time_seconds": ratelimit.max_sleep_time_seconds,
+                "container_ratelimits": container_ratelimits,
+                "container_listing_ratelimits": container_listing_ratelimits,
+            });
+        }
+    }
     if configured_pipeline_has(conf, "bulk") {
         let max_deletes = build_bulk(conf).max_deletes_per_request;
         let max_failed = conf
@@ -1897,9 +2302,8 @@ fn build_info_json(
         info["bulk_upload"] = bulk.upload_info_dict();
     }
     if configured_pipeline_has(conf, "tempurl") {
-        let no_keys: Arc<dyn swift_middleware::KeyProvider> = Arc::new(
-            swift_middleware::ClosureKeyProvider::new(|_, _| Vec::new()),
-        );
+        let no_keys: Arc<dyn swift_middleware::KeyProvider> =
+            Arc::new(swift_middleware::ClosureKeyProvider::new(|_, _| Vec::new()));
         let tempurl = build_tempurl(conf, no_keys);
         let mut allowed_digests = tempurl.allowed_digests;
         allowed_digests.sort();
@@ -1909,15 +2313,17 @@ fn build_info_json(
         });
     }
     if configured_pipeline_has(conf, "formpost") {
-        let no_keys: Arc<dyn swift_middleware::KeyProvider> = Arc::new(
-            swift_middleware::ClosureKeyProvider::new(|_, _| Vec::new()),
-        );
-        let fp = build_formpost(conf, no_keys);
-        let mut allowed_digests = fp.allowed_digests;
-        allowed_digests.sort();
-        info["formpost"] = serde_json::json!({
-            "allowed_digests": allowed_digests,
-        });
+        let no_keys: Arc<dyn swift_middleware::KeyProvider> =
+            Arc::new(swift_middleware::ClosureKeyProvider::new(|_, _| Vec::new()));
+        if let Ok((fp, deprecated_digests, _)) = build_formpost(conf, no_keys) {
+            let mut value = serde_json::json!({
+                "allowed_digests": fp.allowed_digests,
+            });
+            if !deprecated_digests.is_empty() {
+                value["deprecated_digests"] = serde_json::json!(deprecated_digests);
+            }
+            info["formpost"] = value;
+        }
     }
     if configured_pipeline_has(conf, "staticweb") {
         info["staticweb"] = serde_json::json!({});
@@ -1933,11 +2339,12 @@ fn build_info_json(
         info["account_quotas"] = serde_json::json!({});
     }
     if configured_pipeline_has(conf, "symlink") {
-        let sl = build_symlink(conf);
-        info["symlink"] = serde_json::json!({
-            "symloop_max": sl.symloop_max,
-            "static_links": true,
-        });
+        if let Ok(sl) = build_symlink(conf) {
+            info["symlink"] = serde_json::json!({
+                "symloop_max": sl.symloop_max,
+                "static_links": true,
+            });
+        }
     }
     if configured_pipeline_has(conf, "versioned_writes")
         || configured_pipeline_has(conf, "versioned-writes")
@@ -1953,9 +2360,7 @@ fn build_info_json(
             "allowed_flags": flags,
         });
     }
-    if configured_pipeline_has(conf, "name_check")
-        || configured_pipeline_has(conf, "name-check")
-    {
+    if configured_pipeline_has(conf, "name_check") || configured_pipeline_has(conf, "name-check") {
         let nc = build_name_check(conf);
         info["name_check"] = serde_json::json!({
             "forbidden_chars": nc.forbidden_chars.iter().collect::<String>(),
@@ -1963,8 +2368,7 @@ fn build_info_json(
             "forbidden_regexp": nc.forbidden_regexp,
         });
     }
-    if configured_pipeline_has(conf, "etag_quoter")
-        || configured_pipeline_has(conf, "etag-quoter")
+    if configured_pipeline_has(conf, "etag_quoter") || configured_pipeline_has(conf, "etag-quoter")
     {
         info["etag_quoter"] = serde_json::json!({
             "enable_by_default": build_etag_quoter(conf).enable_by_default,
@@ -1991,9 +2395,7 @@ fn build_info_json(
         }
     }
     // read_only: Python only registers when cluster-wide read_only=true.
-    if configured_pipeline_has(conf, "read_only")
-        || configured_pipeline_has(conf, "read-only")
-    {
+    if configured_pipeline_has(conf, "read_only") || configured_pipeline_has(conf, "read-only") {
         let ro = build_read_only(conf);
         if ro.read_only {
             info["read_only"] = serde_json::json!({});
@@ -2005,8 +2407,9 @@ fn build_info_json(
     {
         let empty_keys: Arc<dyn swift_middleware::SyncKeyProvider> =
             Arc::new(swift_middleware::ClosureSyncKeyProvider::new(|_, _| None));
-        let cs = build_container_sync(conf, empty_keys);
-        info["container_sync"] = cs.info_json();
+        if let Ok(cs) = build_container_sync(conf, empty_keys) {
+            info["container_sync"] = cs.info_json();
+        }
     }
     // encryption: Python register_swift_info('encryption', admin=True,
     // enabled=not disable_encryption) when the encryption filter loads.
@@ -2181,12 +2584,15 @@ fn build_authtoken(conf: &SwiftConfig) -> Result<swift_middleware::AuthToken, St
         .filter(|v| *v > 0.0)
         .unwrap_or(5.0);
 
-    let validator = swift_middleware::HttpTokenValidator::new(auth_url, username, password, project)
-        .with_domains(user_domain, project_domain)
-        .with_timeout(std::time::Duration::from_secs_f64(timeout_secs));
-    Ok(swift_middleware::AuthToken::new(std::sync::Arc::new(validator))
-        .with_delay(delay)
-        .with_www_authenticate_uri(www))
+    let validator =
+        swift_middleware::HttpTokenValidator::new(auth_url, username, password, project)
+            .with_domains(user_domain, project_domain)
+            .with_timeout(std::time::Duration::from_secs_f64(timeout_secs));
+    Ok(
+        swift_middleware::AuthToken::new(std::sync::Arc::new(validator))
+            .with_delay(delay)
+            .with_www_authenticate_uri(www),
+    )
 }
 
 fn s3token_auth_uri(conf: &SwiftConfig) -> Option<String> {
@@ -2197,6 +2603,14 @@ fn s3token_auth_uri(conf: &SwiftConfig) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
+fn strict_config_bool(option: &str, raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" | "t" | "y" => Ok(true),
+        "false" | "0" | "no" | "off" | "f" | "n" => Ok(false),
+        _ => Err(format!("invalid {option} boolean {raw:?}")),
+    }
+}
+
 /// Build the P3-s3 `s3api` filter from TempAuth `user_*` records plus optional
 /// `[filter:s3api]` knobs. Credentials use access key `account:user` and the
 /// TempAuth secret (Swift/tempauth + s3api convention). Returns `None` when
@@ -2205,8 +2619,13 @@ fn s3token_auth_uri(conf: &SwiftConfig) -> Option<String> {
 /// When `[filter:s3token] auth_uri` is set, attaches [`HttpS3TokenClient`] so
 /// unknown EC2 access keys defer to Keystone `/v3/s3tokens` with a real
 /// base64 string-to-sign (instead of immediate `InvalidAccessKeyId`).
-fn build_s3api(conf: &SwiftConfig) -> Option<swift_s3api::S3Api> {
-    let items = conf.items("filter:tempauth").ok()?;
+fn build_s3api(conf: &SwiftConfig) -> Result<Option<swift_s3api::S3Api>, String> {
+    let items = if conf.has_section("filter:tempauth") {
+        conf.items("filter:tempauth")
+            .map_err(|e| format!("could not read [filter:tempauth]: {e}"))?
+    } else {
+        Vec::new()
+    };
     let mut users: Vec<(String, String, String, Vec<String>)> = Vec::new();
     for (key, val) in &items {
         let Some(rest) = key.strip_prefix("user_") else {
@@ -2218,10 +2637,16 @@ fn build_s3api(conf: &SwiftConfig) -> Option<swift_s3api::S3Api> {
         let mut toks = val.split_whitespace();
         let Some(secret) = toks.next() else { continue };
         let groups: Vec<String> = toks.map(str::to_string).collect();
-        users.push((account.to_string(), user.to_string(), secret.to_string(), groups));
+        users.push((
+            account.to_string(),
+            user.to_string(),
+            secret.to_string(),
+            groups,
+        ));
     }
-    if users.is_empty() {
-        return None;
+    let external_s3token = s3token_auth_uri(conf);
+    if users.is_empty() && external_s3token.is_none() {
+        return Ok(None);
     }
     let reseller = conf
         .get("filter:tempauth", "reseller_prefix")
@@ -2251,10 +2676,14 @@ fn build_s3api(conf: &SwiftConfig) -> Option<swift_s3api::S3Api> {
             )
         })
         .unwrap_or(true);
+    // Python Swift names this option `storage_domain` (singular) even though
+    // it accepts a comma-separated list.  Keep the historical Rust plural as
+    // a compatibility alias, but never let it override the Python spelling.
     let storage_domains = conf
-        .get("filter:s3api", "storage_domains")
+        .get("filter:s3api", "storage_domain")
         .ok()
         .flatten()
+        .or_else(|| conf.get("filter:s3api", "storage_domains").ok().flatten())
         .map(|s| {
             s.split(',')
                 .map(str::trim)
@@ -2263,6 +2692,25 @@ fn build_s3api(conf: &SwiftConfig) -> Option<swift_s3api::S3Api> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let allowable_clock_skew = conf
+        .get("filter:s3api", "allowable_clock_skew")
+        .map_err(|e| e.to_string())?
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            value
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| format!("invalid allowable_clock_skew {value:?}"))
+        })
+        .transpose()?
+        .unwrap_or(15 * 60);
+    let extended_subresources = conf
+        .get("filter:s3api", "enable_extended_subresources")
+        .map_err(|error| error.to_string())?
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| strict_config_bool("enable_extended_subresources", &value))
+        .transpose()?
+        .unwrap_or(false);
 
     let s3_reseller = conf
         .get("filter:s3token", "reseller_prefix")
@@ -2274,14 +2722,170 @@ fn build_s3api(conf: &SwiftConfig) -> Option<swift_s3api::S3Api> {
         .with_location(location)
         .with_dns_compliant(dns)
         .with_storage_domains(storage_domains)
+        .with_allowable_clock_skew(allowable_clock_skew)
+        .with_extended_subresources(extended_subresources)
         .with_reseller_prefix(s3_reseller);
+
+    // IAM used to exist only as a library surface. Load it here so configured
+    // identity maps, tenants, and policies participate in the live S3 request
+    // path. Reject malformed input instead of silently dropping entries: an
+    // operator must never believe a deny policy is active when it was ignored.
+    let email_map = conf
+        .get("filter:s3api", "iam_email_map")
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    let mut email_keys = std::collections::HashSet::new();
+    for entry in email_map
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let Some((email, principal)) = entry.split_once(':') else {
+            return Err(format!("invalid iam_email_map entry {entry:?}"));
+        };
+        if email.trim().is_empty()
+            || principal.trim().is_empty()
+            || !email_keys.insert(email.trim().to_ascii_lowercase())
+        {
+            return Err(format!("invalid iam_email_map entry {entry:?}"));
+        }
+    }
+
+    let access_key_map = conf
+        .get("filter:s3api", "iam_access_key_map")
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    let mut access_key_keys = std::collections::HashSet::new();
+    for entry in access_key_map
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let pair = entry.split_once('=').or_else(|| entry.rsplit_once(':'));
+        let Some((access_key, principal)) = pair else {
+            return Err(format!("invalid iam_access_key_map entry {entry:?}"));
+        };
+        if access_key.trim().is_empty()
+            || principal.trim().is_empty()
+            || !access_key_keys.insert(access_key.trim().to_string())
+        {
+            return Err(format!("invalid iam_access_key_map entry {entry:?}"));
+        }
+    }
+
+    let tenants = conf
+        .get("filter:s3api", "iam_tenants")
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    let mut tenant_keys = std::collections::HashSet::new();
+    let mut tenant_members = std::collections::HashSet::new();
+    for entry in tenants.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let Some((tenant, members)) = entry.split_once(':') else {
+            return Err(format!("invalid iam_tenants entry {entry:?}"));
+        };
+        let member_list: Vec<&str> = members.split(',').map(str::trim).collect();
+        if tenant.trim().is_empty()
+            || !tenant_keys.insert(tenant.trim().to_string())
+            || member_list.is_empty()
+            || member_list.iter().any(|member| member.is_empty())
+            || member_list
+                .iter()
+                .any(|member| !tenant_members.insert((*member).to_string()))
+        {
+            return Err(format!("invalid iam_tenants entry {entry:?}"));
+        }
+    }
+
+    let identity = swift_s3api::iam::IdentityDirectory::new()
+        .with_email_map_csv(&email_map)
+        .with_access_key_map_csv(&access_key_map);
+    let mut iam = swift_s3api::iam::IamService::new()
+        .with_identity(identity)
+        .with_tenants_csv(&tenants);
+
+    let inline_policy = conf
+        .get("filter:s3api", "iam_policy_json")
+        .map_err(|e| e.to_string())?
+        .filter(|value| !value.trim().is_empty());
+    let policy_file = conf
+        .get("filter:s3api", "iam_policy_file")
+        .map_err(|e| e.to_string())?
+        .filter(|value| !value.trim().is_empty());
+    if inline_policy.is_some() && policy_file.is_some() {
+        return Err("iam_policy_json and iam_policy_file are mutually exclusive".into());
+    }
+    let policy_json = match (inline_policy, policy_file) {
+        (Some(json), None) => {
+            if json.len() > 1_048_576 {
+                return Err("iam_policy_json exceeds 1 MiB".into());
+            }
+            Some(json)
+        }
+        (None, Some(path)) => {
+            let metadata = std::fs::metadata(&path)
+                .map_err(|e| format!("could not stat iam_policy_file {path:?}: {e}"))?;
+            if !metadata.is_file() {
+                return Err(format!("iam_policy_file is not a regular file: {path:?}"));
+            }
+            if metadata.len() > 1_048_576 {
+                return Err("iam_policy_file exceeds 1 MiB".into());
+            }
+            Some(
+                std::fs::read_to_string(&path)
+                    .map_err(|e| format!("could not read iam_policy_file {path:?}: {e}"))?,
+            )
+        }
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("mutual exclusion checked above"),
+    };
+    if let Some(json) = policy_json {
+        let policy = swift_s3api::iam::IamService::parse_policy_json(&json)
+            .filter(|doc| !doc.statements.is_empty())
+            .ok_or_else(|| {
+                "iam policy is invalid or contains no enforceable statements".to_string()
+            })?;
+        // A configured document is evaluated for every authenticated
+        // principal. Its own Principal/Action/Resource fields select the
+        // applicable requests, and explicit Deny wins inside IamService.
+        iam.attach_policy("*", "configured", policy);
+    }
+    api = api.with_iam(iam);
+
+    let cold_policy_map = conf
+        .get("filter:s3api", "cold_policy_map")
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    let mut cold_keys = std::collections::HashSet::new();
+    for entry in cold_policy_map
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let Some((class, policy)) = entry.split_once(':') else {
+            return Err(format!("invalid cold_policy_map entry {entry:?}"));
+        };
+        let class = class.trim().to_ascii_uppercase();
+        let policy = policy
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| format!("invalid cold_policy_map policy index in {entry:?}"))?;
+        if class.is_empty() || policy < 0 || !cold_keys.insert(class) {
+            return Err(format!(
+                "invalid or duplicate cold_policy_map entry {entry:?}"
+            ));
+        }
+    }
+    api = api.with_cold_map(swift_s3api::cold_tier::ColdPolicyMap::from_csv(
+        &cold_policy_map,
+    ));
+
     // EC2 deferral: inline /v3/s3tokens on s3api (does not wait for s3token filter).
-    if let Some(uri) = s3token_auth_uri(conf) {
+    if let Some(uri) = external_s3token {
         api = api.with_s3token_client(std::sync::Arc::new(
             swift_middleware::HttpS3TokenClient::new(uri),
         ));
     }
-    Some(api)
+    Ok(Some(api))
 }
 
 /// Build a `TempAuth` from a `[filter:tempauth]` section, or `None` if there are
@@ -2341,6 +2945,10 @@ mod startup_policy_tests {
 
     fn no_sync_keys() -> Arc<dyn swift_middleware::SyncKeyProvider> {
         Arc::new(swift_middleware::ClosureSyncKeyProvider::new(|_, _| None))
+    }
+
+    fn no_endpoints() -> Arc<dyn swift_middleware::EndpointResolver> {
+        Arc::new(swift_middleware::StaticEndpoints(Vec::new()))
     }
 
     fn policies(conf: &str) -> StoragePolicyCollection {
@@ -2408,6 +3016,9 @@ mod startup_policy_tests {
              [app:proxy-server]\nconn_timeout = 1.5\n\
              error_suppression_interval = 90\nerror_suppression_limit = 3\n\
              account_autocreate = yes\n\
+             strict_cors_mode = no\n\
+             cors_allow_origin = https://one.example, , https://two.example\n\
+             cors_expose_headers = X-Trace, X-Custom\n\
              recheck_container_existence = 120\n\
              recheck_account_existence = 30\n",
             &[],
@@ -2422,6 +3033,12 @@ mod startup_policy_tests {
         assert_eq!(config.error_suppression_limit, 3);
         assert!(config.account_autocreate);
         assert!(!config.allow_account_management);
+        assert!(!config.strict_cors_mode);
+        assert_eq!(
+            config.cors_allow_origin,
+            ["https://one.example", "https://two.example"]
+        );
+        assert_eq!(config.cors_expose_headers, ["X-Trace", "X-Custom"]);
         assert!(config.auth_enabled);
         assert_eq!(config.recheck_container_existence, 120.0);
         assert_eq!(config.recheck_account_existence, 30.0);
@@ -2442,6 +3059,9 @@ mod startup_policy_tests {
         assert_eq!(config.error_suppression_interval, 60.0);
         assert_eq!(config.error_suppression_limit, 10);
         assert!(!config.account_autocreate);
+        assert!(config.strict_cors_mode);
+        assert!(config.cors_allow_origin.is_empty());
+        assert!(config.cors_expose_headers.is_empty());
         assert!(!config.auth_enabled);
         // garbage / missing recheck values keep the Python default of 60
         assert_eq!(config.recheck_container_existence, 60.0);
@@ -2570,7 +3190,13 @@ mod startup_policy_tests {
         let info = build_info_json(&conf, &conf, true, false, false);
         let value: serde_json::Value = serde_json::from_str(&info).unwrap();
         assert_eq!(value["swift"]["version"], "2.33.7");
-        assert!(value["swift"].get("strict_cors_mode").is_none());
+        assert_eq!(value["swift"]["strict_cors_mode"], true);
+        assert_eq!(value["swift"]["allow_open_expired"], false);
+        assert_eq!(value["swift"]["max_request_line"], 8192);
+        assert!(
+            value.get("dlo").is_none(),
+            "Python Swift 2.33 DLO does not register a /info section"
+        );
         assert_eq!(
             value["slo"],
             serde_json::json!({
@@ -2583,11 +3209,11 @@ mod startup_policy_tests {
         );
         assert!(value["slo"].get("max_get_time").is_none());
 
-        let default_conf =
-            SwiftConfig::parse_lenient("[app:proxy-server]\n", &[], false).unwrap();
+        let default_conf = SwiftConfig::parse_lenient("[app:proxy-server]\n", &[], false).unwrap();
         let default_info = build_info_json(&default_conf, &default_conf, true, false, false);
         let default_value: serde_json::Value = serde_json::from_str(&default_info).unwrap();
         assert_eq!(default_value["swift"]["version"], "2.33.0");
+        assert_eq!(default_value["swift"]["strict_cors_mode"], true);
         assert_eq!(default_value["slo"]["yield_frequency"], 10);
 
         let fallback_conf = SwiftConfig::parse_lenient(
@@ -2599,23 +3225,137 @@ mod startup_policy_tests {
         let fallback_info = build_info_json(&fallback_conf, &fallback_conf, true, false, false);
         let fallback_value: serde_json::Value = serde_json::from_str(&fallback_info).unwrap();
         assert_eq!(fallback_value["swift"]["version"], "2.33.1");
+
+        let non_strict_conf = SwiftConfig::parse_lenient(
+            "[DEFAULT]\nstrict_cors_mode = false\n[app:proxy-server]\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let non_strict_info =
+            build_info_json(&non_strict_conf, &non_strict_conf, true, false, false);
+        let non_strict_value: serde_json::Value = serde_json::from_str(&non_strict_info).unwrap();
+        assert_eq!(non_strict_value["swift"]["strict_cors_mode"], false);
+
+        let without_slo = SwiftConfig::parse_lenient(
+            "[pipeline:main]\npipeline = catch_errors gatekeeper proxy-server\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let without_slo_info: serde_json::Value = serde_json::from_str(&build_info_json(
+            &without_slo,
+            &without_slo,
+            true,
+            false,
+            false,
+        ))
+        .unwrap();
+        assert!(without_slo_info.get("slo").is_none());
+    }
+
+    #[test]
+    fn dlo_config_reads_filter_and_legacy_app_values_and_fails_closed() {
+        let filter_conf = SwiftConfig::parse_lenient(
+            "[filter:dlo]\nmax_get_time = 123\nrate_limit_after_segment = 4\n\
+             rate_limit_segments_per_sec = 7\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(build_dlo(&filter_conf).is_ok());
+
+        let legacy_conf = SwiftConfig::parse_lenient(
+            "[app:proxy-server]\nmax_get_time = 321\nrate_limit_after_segment = -1\n\
+             rate_limit_segments_per_sec = 0\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(build_dlo(&legacy_conf).is_ok());
+
+        let invalid =
+            SwiftConfig::parse_lenient("[filter:dlo]\nmax_get_time = forever\n", &[], false)
+                .unwrap();
+        let error = match build_dlo(&invalid) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid DLO integer must fail closed"),
+        };
+        assert!(error.contains("max_get_time"), "{error}");
     }
 
     #[test]
     fn ratelimit_filter_is_built_only_when_configured() {
         let conf = SwiftConfig::parse_lenient("[app:proxy-server]\n", &[], false).unwrap();
-        assert!(build_ratelimit(&conf).is_none());
+        assert!(matches!(build_ratelimit(&conf), Ok(None)));
 
         let conf = SwiftConfig::parse_lenient(
             "[filter:ratelimit]\nuse = egg:swift#ratelimit\n\
-             account_ratelimit = 5\nmax_sleep_time_seconds = 30\n",
+             account_ratelimit = 5\nmax_sleep_time_seconds = 30\n\
+             [filter:cache]\nmemcache_servers = 10.0.0.1:11211,10.0.0.2:11211\n",
             &[],
             false,
         )
         .unwrap();
-        let rl = build_ratelimit(&conf).expect("ratelimit section builds the filter");
+        let rl = build_ratelimit(&conf)
+            .expect("valid ratelimit configuration")
+            .expect("ratelimit section builds the filter");
         assert_eq!(rl.account_ratelimit, 5.0);
         assert_eq!(rl.max_sleep_time_seconds, 30.0);
+        assert_eq!(
+            rl.memcache_servers(),
+            &["10.0.0.1:11211".to_string(), "10.0.0.2:11211".to_string()]
+        );
+
+        let invalid = SwiftConfig::parse_lenient(
+            "[filter:ratelimit]\nuse = egg:swift#ratelimit\naccount_ratelimit = nope\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let error = match build_ratelimit(&invalid) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid numeric configuration must fail closed"),
+        };
+        assert!(error.contains("account_ratelimit"), "{error}");
+    }
+
+    #[test]
+    fn info_registers_only_built_ratelimit_with_python_shape() {
+        let conf = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper ratelimit proxy-server\n\
+             [filter:cache]\nmemcache_servers = 10.0.0.1:11211,10.0.0.2:11211\n\
+             [filter:ratelimit]\nuse = egg:swift#ratelimit\n\
+             account_ratelimit = 5\nmax_sleep_time_seconds = 30\n\
+             container_ratelimit_0 = 100\ncontainer_ratelimit_1000 = 50\n\
+             container_listing_ratelimit_0 = 200\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let info: serde_json::Value =
+            serde_json::from_str(&build_info_json(&conf, &conf, true, false, false)).unwrap();
+        assert_eq!(
+            info["ratelimit"],
+            serde_json::json!({
+                "account_ratelimit": 5.0,
+                "max_sleep_time_seconds": 30.0,
+                "container_ratelimits": [[0, 100.0], [1000, 50.0]],
+                "container_listing_ratelimits": [[0, 200.0]],
+            })
+        );
+
+        let invalid = SwiftConfig::parse_lenient(
+            "[pipeline:main]\npipeline = ratelimit proxy-server\n\
+             [filter:ratelimit]\nuse = egg:swift#ratelimit\naccount_ratelimit = nope\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let invalid_info: serde_json::Value =
+            serde_json::from_str(&build_info_json(&invalid, &invalid, true, false, false)).unwrap();
+        assert!(invalid_info.get("ratelimit").is_none());
     }
 
     #[test]
@@ -2664,7 +3404,8 @@ mod startup_policy_tests {
     #[test]
     fn pipeline_container_sync_wires_and_info() {
         let conf = SwiftConfig::parse_lenient(
-            "[pipeline:main]\n\
+            "[DEFAULT]\nswift_dir = /nonexistent-peregrine-container-sync-test\n\
+             [pipeline:main]\n\
              pipeline = catch_errors gatekeeper healthcheck container_sync tempauth proxy-server\n\
              [filter:tempauth]\nuser_test_tester = secret .admin\n\
              [filter:container_sync]\nallow_full_urls = true\n",
@@ -2678,8 +3419,16 @@ mod startup_policy_tests {
         );
         let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
-        let (filters, notes) =
-            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols, HashPathConfig::new("", "test").unwrap());
+        let (filters, notes) = build_configured_filters(
+            &conf,
+            ta,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            &pols,
+            HashPathConfig::new("", "test").unwrap(),
+        );
         assert!(
             notes.iter().any(|n| n.contains("container_sync enabled")),
             "{notes:?}"
@@ -2692,6 +3441,57 @@ mod startup_policy_tests {
             "must advertise container_sync on /info when filter is wired: {v}"
         );
         assert!(v["container_sync"].get("realms").is_some());
+    }
+
+    #[test]
+    fn pipeline_container_sync_malformed_realms_is_typed_failure() {
+        let serial = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let swift_dir = std::env::temp_dir().join(format!(
+            "peregrine-proxy-container-sync-{}-{serial}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&swift_dir).unwrap();
+        std::fs::write(
+            swift_dir.join("container-sync-realms.conf"),
+            "[LOCAL]\nkey = one\nkey = two\n",
+        )
+        .unwrap();
+        let conf = SwiftConfig::parse_lenient(
+            &format!(
+                "[DEFAULT]\nswift_dir = {}\n\
+                 [pipeline:main]\npipeline = container_sync tempauth proxy-server\n\
+                 [filter:tempauth]\nuser_test_tester = secret .admin\n\
+                 [filter:container_sync]\nallow_full_urls = false\n",
+                swift_dir.display()
+            ),
+            &[],
+            false,
+        )
+        .unwrap();
+        let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
+        let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
+        let (filters, _notes, issues) = build_configured_filters_with_issues(
+            &conf,
+            ta,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            no_endpoints(),
+            &pols,
+            HashPathConfig::new("", "test").unwrap(),
+        );
+        std::fs::remove_dir_all(&swift_dir).unwrap();
+        assert_eq!(filters.len(), 1, "only tempauth may be built");
+        assert!(issues.iter().any(|issue| {
+            issue.filter == "container_sync"
+                && issue.kind == PipelineBuildIssueKind::BuildFailure
+                && issue.detail.contains("duplicate option")
+        }));
+        assert!(strict_pipeline_rejects(&conf, &issues));
     }
 
     #[test]
@@ -2725,13 +3525,21 @@ mod startup_policy_tests {
         );
         let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
-        let (filters, notes) =
-            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols, HashPathConfig::new("", "test").unwrap());
-        assert!(notes.iter().any(|n| n.contains("bulk enabled")), "{notes:?}");
+        let (filters, notes) = build_configured_filters(
+            &conf,
+            ta,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            &pols,
+            HashPathConfig::new("", "test").unwrap(),
+        );
         assert!(
-            notes.iter().any(|n| n == "tempurl enabled"),
+            notes.iter().any(|n| n.contains("bulk enabled")),
             "{notes:?}"
         );
+        assert!(notes.iter().any(|n| n == "tempurl enabled"), "{notes:?}");
         assert_eq!(filters.len(), 10, "notes={notes:?}");
 
         let info = build_info_json(&conf, &conf, true, false, true);
@@ -2775,8 +3583,16 @@ mod startup_policy_tests {
         );
         let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
-        let (filters, notes) =
-            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols, HashPathConfig::new("", "test").unwrap());
+        let (filters, notes) = build_configured_filters(
+            &conf,
+            ta,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            &pols,
+            HashPathConfig::new("", "test").unwrap(),
+        );
         assert!(notes.iter().any(|n| n == "formpost enabled"), "{notes:?}");
         assert!(notes.iter().any(|n| n == "staticweb enabled"), "{notes:?}");
         assert!(
@@ -2805,6 +3621,112 @@ mod startup_policy_tests {
     }
 
     #[test]
+    fn copy_yield_frequency_is_strict_and_honors_filter_precedence() {
+        let defaults = SwiftConfig::parse_lenient(
+            "[DEFAULT]\nyield_frequency = 11\n[filter:copy]\nuse = egg:swift#copy\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(build_copy(&defaults).unwrap().yield_frequency, 11.0);
+
+        let local = SwiftConfig::parse_lenient(
+            "[DEFAULT]\nyield_frequency = 11\n[filter:copy]\nyield_frequency = -2\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(build_copy(&local).unwrap().yield_frequency, 0.0);
+
+        let invalid =
+            SwiftConfig::parse_lenient("[filter:copy]\nyield_frequency = 1.5\n", &[], false)
+                .unwrap();
+        assert!(build_copy(&invalid).is_err());
+    }
+
+    #[test]
+    fn symlink_symloop_max_is_strict_and_invalid_config_is_not_advertised() {
+        let conf = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck symlink proxy-server\n\
+             [app:proxy-server]\nstrict_pipeline = true\n\
+             [filter:symlink]\nsymloop_max = not-an-integer\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(build_symlink(&conf).is_err());
+
+        let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
+        let (filters, notes, issues) = build_configured_filters_with_issues(
+            &conf,
+            None,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            no_endpoints(),
+            &pols,
+            HashPathConfig::new("", "test").unwrap(),
+        );
+        assert!(filters.is_empty(), "notes={notes:?}");
+        assert!(issues.iter().any(|issue| {
+            issue.filter == "symlink" && issue.kind == PipelineBuildIssueKind::BuildFailure
+        }));
+        assert!(strict_pipeline_rejects(&conf, &issues));
+
+        let info = build_info_json(&conf, &conf, false, false, true);
+        let value: serde_json::Value = serde_json::from_str(&info).unwrap();
+        assert!(value.get("symlink").is_none(), "{value}");
+    }
+
+    #[test]
+    fn formpost_filters_digests_and_advertises_deprecation_exactly() {
+        let defaults = SwiftConfig::parse_lenient("[filter:formpost]\n", &[], false).unwrap();
+        let (allowed, deprecated, unsupported) = formpost_digest_options(&defaults).unwrap();
+        assert_eq!(allowed, vec!["sha1", "sha256", "sha512"]);
+        assert_eq!(deprecated, vec!["sha1"]);
+        assert!(unsupported.is_empty());
+
+        let mixed = SwiftConfig::parse_lenient(
+            "[pipeline:main]\npipeline = formpost proxy-server\n\
+             [filter:formpost]\nallowed_digests = sha1 sha512 md5 not-a-valid-digest\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let (allowed, deprecated, unsupported) = formpost_digest_options(&mixed).unwrap();
+        assert_eq!(allowed, vec!["sha1", "sha512"]);
+        assert_eq!(deprecated, vec!["sha1"]);
+        assert_eq!(unsupported, vec!["md5", "not-a-valid-digest"]);
+        let info: serde_json::Value =
+            serde_json::from_str(&build_info_json(&mixed, &mixed, true, false, true)).unwrap();
+        assert_eq!(
+            info["formpost"]["allowed_digests"],
+            serde_json::json!(allowed)
+        );
+        assert_eq!(
+            info["formpost"]["deprecated_digests"],
+            serde_json::json!(deprecated)
+        );
+
+        let invalid = SwiftConfig::parse_lenient(
+            "[pipeline:main]\npipeline = formpost proxy-server\n\
+             [filter:formpost]\nallowed_digests = md4 md5\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            formpost_digest_options(&invalid).unwrap_err(),
+            "No valid digest algorithms are configured"
+        );
+        let invalid_info: serde_json::Value =
+            serde_json::from_str(&build_info_json(&invalid, &invalid, true, false, true)).unwrap();
+        assert!(invalid_info.get("formpost").is_none());
+    }
+
+    #[test]
     fn pipeline_s3api_wires_without_info_pollution() {
         let conf = SwiftConfig::parse_lenient(
             "[pipeline:main]\n\
@@ -2817,9 +3739,20 @@ mod startup_policy_tests {
         .unwrap();
         let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
-        let (filters, notes) =
-            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols, HashPathConfig::new("", "test").unwrap());
-        assert!(notes.iter().any(|n| n.contains("s3api enabled")), "{notes:?}");
+        let (filters, notes) = build_configured_filters(
+            &conf,
+            ta,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            &pols,
+            HashPathConfig::new("", "test").unwrap(),
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("s3api enabled")),
+            "{notes:?}"
+        );
         assert!(
             notes.iter().all(|n| !n.contains("EC2→s3token deferral")),
             "without s3token auth_uri, deferral must stay OFF: {notes:?}"
@@ -2856,8 +3789,16 @@ mod startup_policy_tests {
         .unwrap();
         let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
-        let (_filters, notes) =
-            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols, HashPathConfig::new("", "test").unwrap());
+        let (_filters, notes) = build_configured_filters(
+            &conf,
+            ta,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            &pols,
+            HashPathConfig::new("", "test").unwrap(),
+        );
         assert!(
             notes
                 .iter()
@@ -2868,8 +3809,157 @@ mod startup_policy_tests {
             notes.iter().any(|n| n.contains("s3token enabled")),
             "{notes:?}"
         );
-        let api = build_s3api(&conf).expect("s3api");
+        let api = build_s3api(&conf)
+            .expect("valid s3api configuration")
+            .expect("s3api credentials");
         assert!(api.s3token_client.is_some());
+    }
+
+    #[test]
+    fn pipeline_s3api_keystone_mode_does_not_require_tempauth_users() {
+        let conf = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck s3api s3token authtoken keystoneauth proxy-server\n\
+             [filter:s3api]\nlocation = RegionOne\n\
+             [filter:s3token]\nauth_uri = http://127.0.0.1:5001\nreseller_prefix = AUTH_\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let api = build_s3api(&conf)
+            .expect("valid Keystone-backed s3api configuration")
+            .expect("external s3token is a usable credential source");
+        assert!(api.s3token_client.is_some());
+    }
+
+    #[test]
+    fn pipeline_s3api_uses_python_storage_domain_and_clock_skew_names() {
+        let conf = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck s3api tempauth copy proxy-server\n\
+             [filter:tempauth]\nuser_test_tester = testing .admin\n\
+             [filter:s3api]\n\
+             storage_domain = s3.example.test, objects.example.test\n\
+             storage_domains = ignored.compat.example\n\
+             allowable_clock_skew = 37\n\
+             enable_extended_subresources = true\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let api = build_s3api(&conf)
+            .expect("valid s3api configuration")
+            .expect("s3api credentials");
+        assert_eq!(
+            api.storage_domains,
+            vec!["s3.example.test", "objects.example.test"]
+        );
+        assert_eq!(api.allowable_clock_skew, 37);
+        assert!(api.extended_subresources);
+    }
+
+    #[test]
+    fn pipeline_s3api_invalid_clock_skew_fails_closed() {
+        let conf = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck s3api tempauth copy proxy-server\n\
+             [filter:tempauth]\nuser_test_tester = testing .admin\n\
+             [filter:s3api]\nallowable_clock_skew = -1\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let error = match build_s3api(&conf) {
+            Err(error) => error,
+            Ok(_) => panic!("negative allowable_clock_skew must fail closed"),
+        };
+        assert!(error.contains("allowable_clock_skew"), "{error}");
+    }
+
+    #[test]
+    fn pipeline_s3api_extended_subresources_default_off_and_invalid_fails_closed() {
+        let default_conf = SwiftConfig::parse_lenient(
+            "[filter:tempauth]\nuser_test_tester = testing .admin\n[filter:s3api]\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let api = build_s3api(&default_conf)
+            .expect("valid default s3api configuration")
+            .expect("tempauth credentials");
+        assert!(!api.extended_subresources);
+
+        let invalid = SwiftConfig::parse_lenient(
+            "[filter:tempauth]\nuser_test_tester = testing .admin\n\
+             [filter:s3api]\nenable_extended_subresources = sometimes\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let error = match build_s3api(&invalid) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid extended-subresource boolean must fail closed"),
+        };
+        assert!(error.contains("enable_extended_subresources"), "{error}");
+    }
+
+    #[test]
+    fn pipeline_s3api_wires_iam_identity_policy_and_cold_map() {
+        let conf = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck s3api tempauth copy proxy-server\n\
+             [filter:tempauth]\nuser_test_tester = testing .admin\n\
+             [filter:s3api]\n\
+             iam_email_map = alice@example.com:alice\n\
+             iam_access_key_map = test:tester=alice\n\
+             iam_tenants = tenant-a:alice,bob\n\
+             iam_policy_json = {\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::bucket/*\",\"Principal\":\"alice\"}]}\n\
+             cold_policy_map = GLACIER:2,HOT:0\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let api = build_s3api(&conf)
+            .expect("valid s3api configuration")
+            .expect("s3api credentials");
+        assert_eq!(
+            api.iam.identity.canonical_id_for_access_key("test:tester"),
+            "alice"
+        );
+        assert_eq!(
+            api.iam.identity.resolve_email("ALICE@example.com"),
+            Some("alice".to_string())
+        );
+        assert_eq!(api.iam.tenant_of("alice"), Some("tenant-a"));
+        assert_eq!(
+            api.iam
+                .evaluate("alice", "s3:GetObject", "arn:aws:s3:::bucket/object"),
+            Some(true)
+        );
+        assert_eq!(api.cold_map.policy_for_class("GLACIER"), Some(2));
+        assert_eq!(api.cold_map.default_hot_policy, 0);
+    }
+
+    #[test]
+    fn pipeline_s3api_invalid_security_config_fails_closed() {
+        let conf = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck s3api tempauth copy proxy-server\n\
+             [filter:tempauth]\nuser_test_tester = testing .admin\n\
+             [filter:s3api]\niam_policy_json = definitely-not-json\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let error = match build_s3api(&conf) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid policy must fail closed"),
+        };
+        assert!(error.contains("invalid"), "{error}");
+        assert!(
+            !configured_filter_names(&conf, true).contains(&"s3api"),
+            "invalid filter must not be reported as configured"
+        );
     }
 
     #[test]
@@ -2886,16 +3976,28 @@ mod startup_policy_tests {
         .unwrap();
         let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
-        let (filters, notes) =
-            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols, HashPathConfig::new("", "test").unwrap());
+        let (filters, notes, issues) = build_configured_filters_with_issues(
+            &conf,
+            ta,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            no_endpoints(),
+            &pols,
+            HashPathConfig::new("", "test").unwrap(),
+        );
         // tempauth + not_a_real_filter (passthrough) + copy
         assert_eq!(filters.len(), 3, "notes={notes:?}");
         assert!(
-            notes.iter().any(|n| {
-                n.contains("not_a_real_filter") && n.contains("NamedPassthrough")
-            }),
+            notes
+                .iter()
+                .any(|n| { n.contains("not_a_real_filter") && n.contains("NamedPassthrough") }),
             "{notes:?}"
         );
+        assert!(issues.is_empty(), "issues={issues:?}");
+        assert!(strict_pipeline_from_conf(&conf));
+        assert!(!strict_pipeline_rejects(&conf, &issues));
     }
 
     #[test]
@@ -2904,27 +4006,6 @@ mod startup_policy_tests {
             "[pipeline:main]\n\
              pipeline = catch_errors gatekeeper healthcheck tempauth not_a_real_filter copy proxy-server\n\
              [app:proxy-server]\nplugin_default = skip\n\
-             [filter:tempauth]\nuser_test_tester = secret .admin\n",
-            &[],
-            false,
-        )
-        .unwrap();
-        let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
-        let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
-        let (filters, notes) =
-            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols, HashPathConfig::new("", "test").unwrap());
-        assert_eq!(filters.len(), 2, "notes={notes:?}");
-        assert!(notes
-            .iter()
-            .any(|n| n.contains("not_a_real_filter") && n.contains("skip")));
-    }
-
-    #[test]
-    fn pipeline_unknown_filter_invalid_plugin_default_fails_closed() {
-        let conf = SwiftConfig::parse_lenient(
-            "[pipeline:main]\n\
-             pipeline = catch_errors gatekeeper healthcheck tempauth not_a_real_filter copy proxy-server\n\
-             [app:proxy-server]\nstrict_pipeline = false\nplugin_default = typo\n\
              [filter:tempauth]\nuser_test_tester = secret .admin\n",
             &[],
             false,
@@ -2946,6 +4027,40 @@ mod startup_policy_tests {
         assert!(notes
             .iter()
             .any(|n| n.contains("not_a_real_filter") && n.contains("skip")));
+    }
+
+    #[test]
+    fn pipeline_unknown_filter_invalid_plugin_default_fails_closed() {
+        let conf = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck tempauth not_a_real_filter copy proxy-server\n\
+             [app:proxy-server]\nstrict_pipeline = false\nplugin_default = typo\n\
+             [filter:tempauth]\nuser_test_tester = secret .admin\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
+        let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
+        let (filters, notes, issues) = build_configured_filters_with_issues(
+            &conf,
+            ta,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            no_endpoints(),
+            &pols,
+            HashPathConfig::new("", "test").unwrap(),
+        );
+        assert_eq!(filters.len(), 2, "notes={notes:?}");
+        assert!(notes
+            .iter()
+            .any(|n| n.contains("not_a_real_filter") && n.contains("skip")));
+        assert!(issues.iter().any(|issue| {
+            issue.filter == "not_a_real_filter"
+                && issue.kind == PipelineBuildIssueKind::UnknownFilter
+        }));
     }
 
     #[test]
@@ -2972,8 +4087,16 @@ mod startup_policy_tests {
         let ka = build_keystoneauth(&conf);
         assert!(ka.is_some());
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
-        let (filters, notes) =
-            build_configured_filters(&conf, ta, ka, None, no_tempurl_keys(), no_sync_keys(), &pols, HashPathConfig::new("", "test").unwrap());
+        let (filters, notes) = build_configured_filters(
+            &conf,
+            ta,
+            ka,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            &pols,
+            HashPathConfig::new("", "test").unwrap(),
+        );
         assert!(
             notes.iter().any(|n| n.contains("authtoken enabled")),
             "{notes:?}"
@@ -3013,12 +4136,17 @@ mod startup_policy_tests {
         );
         let ta = build_tempauth(&conf, &conf, "http://127.0.0.1:8081");
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
-        let (filters, notes) =
-            build_configured_filters(&conf, ta, None, None, no_tempurl_keys(), no_sync_keys(), &pols, HashPathConfig::new("", "test").unwrap());
-        assert!(
-            notes.iter().any(|n| n == "keymaster enabled"),
-            "{notes:?}"
+        let (filters, notes) = build_configured_filters(
+            &conf,
+            ta,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            &pols,
+            HashPathConfig::new("", "test").unwrap(),
         );
+        assert!(notes.iter().any(|n| n == "keymaster enabled"), "{notes:?}");
         assert!(
             notes
                 .iter()
@@ -3070,7 +4198,9 @@ mod startup_policy_tests {
             HashPathConfig::new("", "test").unwrap(),
         );
         assert!(
-            notes.iter().any(|n| n.contains("keymaster") && n.contains("skip")),
+            notes
+                .iter()
+                .any(|n| n.contains("keymaster") && n.contains("skip")),
             "{notes:?}"
         );
         assert!(
@@ -3119,10 +4249,7 @@ mod startup_policy_tests {
             &pols,
             HashPathConfig::new("", "test").unwrap(),
         );
-        assert!(
-            notes.iter().any(|n| n == "keymaster enabled"),
-            "{notes:?}"
-        );
+        assert!(notes.iter().any(|n| n == "keymaster enabled"), "{notes:?}");
         assert!(
             notes.iter().any(|n| n.contains("encryption enabled")),
             "{notes:?}"
@@ -3145,13 +4272,14 @@ mod startup_policy_tests {
         .unwrap();
         assert!(!strict_pipeline_from_conf(&conf));
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
-        let (filters, notes) = build_configured_filters(
+        let (filters, notes, issues) = build_configured_filters_with_issues(
             &conf,
             None,
             None,
             None,
             no_tempurl_keys(),
             no_sync_keys(),
+            no_endpoints(),
             &pols,
             HashPathConfig::new("", "test").unwrap(),
         );
@@ -3162,8 +4290,9 @@ mod startup_policy_tests {
             "{notes:?}"
         );
         assert_eq!(filters.len(), 1, "passthrough plugin registered");
-        // Passthrough is not a strict-fatal unknown skip.
-        assert!(!notes.iter().any(|n| pipeline_note_is_strict_fatal(n)));
+        // Explicit operator opt-in is a real compatibility decision, not an
+        // unresolved build issue.
+        assert!(issues.is_empty(), "issues={issues:?}");
         assert!(!strict_pipeline_from_conf(&conf));
     }
 
@@ -3180,25 +4309,23 @@ mod startup_policy_tests {
         .unwrap();
         assert!(strict_pipeline_from_conf(&conf));
         let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
-        let (_filters, notes) = build_configured_filters(
+        let (_filters, notes, issues) = build_configured_filters_with_issues(
             &conf,
             None,
             None,
             None,
             no_tempurl_keys(),
             no_sync_keys(),
+            no_endpoints(),
             &pols,
             HashPathConfig::new("", "test").unwrap(),
         );
-        let fatals: Vec<_> = notes
-            .iter()
-            .filter(|n| pipeline_note_is_strict_fatal(n))
-            .collect();
         assert!(
-            fatals
+            issues
                 .iter()
-                .any(|n| n.contains("unknown filter") && n.contains("totally_fake_filter")),
-            "{notes:?}"
+                .any(|issue| issue.filter == "totally_fake_filter"
+                    && issue.kind == PipelineBuildIssueKind::UnknownFilter),
+            "issues={issues:?}; notes={notes:?}"
         );
         // list_endpoints is now a wired filter (not a fatal residual).
         assert!(
@@ -3206,17 +4333,216 @@ mod startup_policy_tests {
             "{notes:?}"
         );
         // Same gate main() uses before process::exit(1).
-        assert!(strict_pipeline_from_conf(&conf) && !fatals.is_empty());
+        assert!(strict_pipeline_rejects(&conf, &issues));
     }
 
     #[test]
-    fn process_workers_conf_parses() {
+    fn list_endpoints_pipeline_uses_supplied_resolver_and_configured_path() {
         let conf = SwiftConfig::parse_lenient(
-            "[app:proxy-server]\nprocess_workers = 4\n",
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck list_endpoints proxy-server\n\
+             [filter:list_endpoints]\nlist_endpoints_path = /where\n",
             &[],
             false,
         )
         .unwrap();
+        let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
+        let resolver: Arc<dyn swift_middleware::EndpointResolver> =
+            Arc::new(swift_middleware::StaticEndpoints(vec![
+                "http://10.0.0.1:6200/sda/1/a".to_string(),
+            ]));
+        let (filters, notes, issues) = build_configured_filters_with_issues(
+            &conf,
+            None,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            resolver,
+            &pols,
+            HashPathConfig::new("", "test").unwrap(),
+        );
+        assert!(issues.is_empty(), "issues={issues:?}");
+        assert!(
+            notes.iter().any(|note| note.contains("path_root=/where/")),
+            "notes={notes:?}"
+        );
+        assert_eq!(filters.len(), 1);
+
+        let inner: swift_middleware::NextFn = Arc::new(|_| swift_http::Response::new(503));
+        let pipeline = swift_middleware::build_pipeline(filters, inner);
+        let mut response = pipeline(swift_http::Request {
+            method: "GET".to_string(),
+            path: "/where/v2/a".to_string(),
+            query_string: String::new(),
+            headers: swift_http::HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        });
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.headers.get("Content-Type"),
+            Some("application/json")
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(response.body.materialize(u64::MAX).unwrap()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "endpoints": ["http://10.0.0.1:6200/sda/1/a"],
+                "headers": {},
+            })
+        );
+    }
+
+    #[test]
+    fn pipeline_strict_rejects_every_known_configured_but_unbuilt_filter() {
+        let cases = [
+            ("ratelimit", PipelineBuildIssueKind::MissingConfiguration),
+            ("tempauth", PipelineBuildIssueKind::MissingConfiguration),
+            ("cname_lookup", PipelineBuildIssueKind::MissingConfiguration),
+            ("authtoken", PipelineBuildIssueKind::BuildFailure),
+            ("keystoneauth", PipelineBuildIssueKind::MissingConfiguration),
+            ("s3api", PipelineBuildIssueKind::MissingConfiguration),
+            ("s3token", PipelineBuildIssueKind::MissingConfiguration),
+            ("keymaster", PipelineBuildIssueKind::BuildFailure),
+            ("encrypter", PipelineBuildIssueKind::MissingConfiguration),
+            ("decrypter", PipelineBuildIssueKind::MissingConfiguration),
+            ("encryption", PipelineBuildIssueKind::MissingConfiguration),
+            ("memcache", PipelineBuildIssueKind::NotImplemented),
+            ("recon", PipelineBuildIssueKind::NotImplemented),
+            ("swob", PipelineBuildIssueKind::NotImplemented),
+        ];
+        let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
+
+        for (filter_name, expected_kind) in cases {
+            let conf = SwiftConfig::parse_lenient(
+                &format!(
+                    "[pipeline:main]\npipeline = catch_errors gatekeeper healthcheck {filter_name} proxy-server\n\
+                     [app:proxy-server]\n"
+                ),
+                &[],
+                false,
+            )
+            .unwrap();
+            let (_filters, notes, issues) = build_configured_filters_with_issues(
+                &conf,
+                None,
+                None,
+                None,
+                no_tempurl_keys(),
+                no_sync_keys(),
+                no_endpoints(),
+                &pols,
+                HashPathConfig::new("", "test").unwrap(),
+            );
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| { issue.filter == filter_name && issue.kind == expected_kind }),
+                "filter={filter_name}; issues={issues:?}; notes={notes:?}"
+            );
+            assert!(
+                strict_pipeline_rejects(&conf, &issues),
+                "strict pipeline accepted unresolved filter={filter_name}; issues={issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pipeline_non_strict_omits_unimplemented_builtin_without_passthrough() {
+        let conf = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck memcache recon swob copy proxy-server\n\
+             [app:proxy-server]\nstrict_pipeline = false\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
+        let (filters, notes, issues) = build_configured_filters_with_issues(
+            &conf,
+            None,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            no_endpoints(),
+            &pols,
+            HashPathConfig::new("", "test").unwrap(),
+        );
+        assert_eq!(filters.len(), 1, "only copy may be instantiated: {notes:?}");
+        assert_eq!(
+            issues
+                .iter()
+                .filter(|issue| issue.kind == PipelineBuildIssueKind::NotImplemented)
+                .count(),
+            3,
+            "issues={issues:?}"
+        );
+        assert!(notes.iter().all(|note| !note.contains("NamedPassthrough")));
+        assert!(!strict_pipeline_rejects(&conf, &issues));
+        let info: serde_json::Value =
+            serde_json::from_str(&build_info_json(&conf, &conf, false, false, true)).unwrap();
+        for name in ["memcache", "recon", "swob"] {
+            assert!(
+                info.get(name).is_none(),
+                "unimplemented filter {name} must not be advertised: {info}"
+            );
+        }
+    }
+
+    #[test]
+    fn pipeline_default_and_repository_live_pipeline_have_no_build_issues() {
+        let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
+        let default_conf = SwiftConfig::parse_lenient("[app:proxy-server]\n", &[], false).unwrap();
+        let (default_filters, default_notes, default_issues) = build_configured_filters_with_issues(
+            &default_conf,
+            None,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            no_endpoints(),
+            &pols,
+            HashPathConfig::new("", "test").unwrap(),
+        );
+        assert_eq!(default_filters.len(), 3, "notes={default_notes:?}");
+        assert!(default_issues.is_empty(), "issues={default_issues:?}");
+        assert!(!strict_pipeline_rejects(&default_conf, &default_issues));
+
+        // Keep this in lock-step with swift-rust/tools/py-saio-setup.sh.
+        let live_conf = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats tempauth copy slo dlo versioned_writes symlink proxy-server\n\
+             [app:proxy-server]\n\
+             [filter:cache]\nmemcache_servers = 127.0.0.1:11211\n\
+             [filter:tempauth]\nuser_test_tester = secret .admin\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let tempauth = build_tempauth(&live_conf, &live_conf, "http://127.0.0.1:8081");
+        let (live_filters, live_notes, live_issues) = build_configured_filters_with_issues(
+            &live_conf,
+            tempauth,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            no_endpoints(),
+            &pols,
+            HashPathConfig::new("", "test").unwrap(),
+        );
+        assert_eq!(live_filters.len(), 9, "notes={live_notes:?}");
+        assert!(live_issues.is_empty(), "issues={live_issues:?}");
+        assert!(!strict_pipeline_rejects(&live_conf, &live_issues));
+    }
+
+    #[test]
+    fn process_workers_conf_parses() {
+        let conf =
+            SwiftConfig::parse_lenient("[app:proxy-server]\nprocess_workers = 4\n", &[], false)
+                .unwrap();
         assert_eq!(process_workers_from_conf(&conf), 4);
         let conf2 = SwiftConfig::parse_lenient(
             "[app:proxy-server]\nworker_model = process\nworkers = 3\n",
@@ -3225,8 +4551,8 @@ mod startup_policy_tests {
         )
         .unwrap();
         assert_eq!(process_workers_from_conf(&conf2), 3);
-        let conf3 = SwiftConfig::parse_lenient("[app:proxy-server]\nworkers = 8\n", &[], false)
-            .unwrap();
+        let conf3 =
+            SwiftConfig::parse_lenient("[app:proxy-server]\nworkers = 8\n", &[], false).unwrap();
         // thread model default: process_workers stays 1
         assert_eq!(process_workers_from_conf(&conf3), 1);
     }
@@ -3253,8 +4579,7 @@ mod startup_policy_tests {
                 "raw={raw:?} should explicitly disable strict mode"
             );
         }
-        let default_conf =
-            SwiftConfig::parse_lenient("[app:proxy-server]\n", &[], false).unwrap();
+        let default_conf = SwiftConfig::parse_lenient("[app:proxy-server]\n", &[], false).unwrap();
         assert!(strict_pipeline_from_conf(&default_conf));
         // DEFAULT section fallback
         let conf = SwiftConfig::parse_lenient(
