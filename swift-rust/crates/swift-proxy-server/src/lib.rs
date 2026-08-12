@@ -2062,6 +2062,14 @@ impl ProxyApp {
                 out.headers.set("Accept-Ranges", "bytes");
             }
             out.body = head.into_body();
+            // Middleware subrequests (DLO/SLO segment GETs) inspect response
+            // headers before write_response re-derives Content-Length from Body.
+            // Keep the declared length visible on the in-process Response.
+            if out.headers.get("Content-Length").is_none() {
+                if let Some(n) = out.body.content_length() {
+                    out.headers.set("Content-Length", n);
+                }
+            }
             out
         };
         let buffered =
