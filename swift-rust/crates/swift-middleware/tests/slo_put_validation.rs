@@ -150,6 +150,18 @@ fn ordinary_segment_uses_head_metadata() {
         writes[0].headers.get("X-Object-Sysmeta-Slo-Size"),
         Some("3")
     );
+    let aggregate_etag = md5_hex(segment_etag.as_bytes());
+    let physical_manifest_etag = md5_hex(&writes[0].body);
+    assert_eq!(
+        writes[0].headers.get("Etag"),
+        Some(physical_manifest_etag.as_str()),
+        "the object server must validate the stored JSON digest"
+    );
+    assert_eq!(
+        response.headers.get("Etag"),
+        Some(aggregate_etag.as_str()),
+        "the client-facing PUT ETag is the aggregate segment ETag"
+    );
 }
 
 #[test]

@@ -3902,7 +3902,12 @@ impl ProxyApp {
                     .set("Content-Range", format!("bytes */{orig_size}"));
                 resp.headers.set("Content-Type", &content_type);
                 resp.headers.set("Accept-Ranges", "bytes");
-                if let Some(etag) =
+                // Fragment archives have their own physical ETags. Python's
+                // EC controller always exposes the original object's ETag
+                // from EC sysmeta, including on a locally synthesized 416.
+                if !ec_etag.is_empty() {
+                    resp.headers.set("Etag", &ec_etag);
+                } else if let Some(etag) =
                     resp_header(&meta, "ETag").or_else(|| resp_header(&meta, "Etag"))
                 {
                     resp.headers.set("Etag", etag.trim_matches('"'));

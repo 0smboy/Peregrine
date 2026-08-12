@@ -61,6 +61,18 @@ fn hash_cfg() -> swift_core::hashing::HashPathConfig {
     swift_core::hashing::HashPathConfig::new(b"".to_vec(), b"changeme".to_vec()).unwrap()
 }
 
+fn md5_hex(data: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    format!("{:x}", Md5::digest(data))
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
 fn single_device_ring(port: u32) -> Ring {
     let dev = RingDevice {
         id: 0,
@@ -316,12 +328,12 @@ fn test_proxy_object_round_trip() {
         {"path": "/docs/fox.txt", "etag": null, "size_bytes": null}
     ]))
     .unwrap();
-    let (status, body) = body_http(
+    let (status, slo_put_headers, body) = http_with_headers(
         proxy_addr,
         "PUT",
         "/v1/AUTH_full/docs/manifest?multipart-manifest=put",
         &[("Content-Type", "application/json")],
-        &manifest,
+        std::str::from_utf8(&manifest).unwrap(),
     );
     assert_eq!(
         status,
@@ -329,23 +341,99 @@ fn test_proxy_object_round_trip() {
         "SLO PUT must receive HEAD metadata: {}",
         String::from_utf8_lossy(&body)
     );
+    let segment_etag = "30f3c93e46436deb58ba70816a8ec124";
+    let aggregate_etag = md5_hex(format!("{segment_etag}{segment_etag}").as_bytes());
+    assert_eq!(
+        header_value(&slo_put_headers, "Etag"),
+        Some(aggregate_etag.as_str()),
+        "SLO PUT exposes the aggregate segment ETag"
+    );
 
-    // Inspect the raw normalized manifest. Null client values must be filled
-    // from the real object HEAD, including the backend ETag.
-    let (status, body) = body_http(
+    // Inspect the stored normalized manifest. Null client values must be
+    // filled from the real object HEAD, including the backend ETag. The
+    // non-raw endpoint always identifies this representation as JSON.
+    let (status, stored_headers, stored_body) = http_with_headers(
         proxy_addr,
         "GET",
         "/v1/AUTH_full/docs/manifest?multipart-manifest=get",
         &[],
-        b"",
+        "",
     );
-    assert_eq!(status, 200, "raw SLO GET");
-    let stored: Json = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 200, "stored SLO manifest GET");
+    assert_eq!(
+        header_value(&stored_headers, "Content-Type"),
+        Some("application/json; charset=utf-8")
+    );
+    let stored_manifest_etag = md5_hex(&stored_body);
+    assert_eq!(
+        header_value(&stored_headers, "Etag"),
+        Some(stored_manifest_etag.as_str())
+    );
+    let stored: Json = serde_json::from_slice(&stored_body).unwrap();
     assert_eq!(stored.as_array().unwrap().len(), 2);
     for segment in stored.as_array().unwrap() {
         assert_eq!(segment["bytes"], payload.len());
-        assert_eq!(segment["hash"], "30f3c93e46436deb58ba70816a8ec124");
+        assert_eq!(segment["hash"], segment_etag);
     }
+
+    // format=raw converts keys back to the client PUT shape while preserving
+    // the manifest object's original Content-Type.
+    let (status, raw_headers, raw_body) = http_with_headers(
+        proxy_addr,
+        "GET",
+        "/v1/AUTH_full/docs/manifest?multipart-manifest=get&format=raw",
+        &[],
+        "",
+    );
+    assert_eq!(status, 200, "raw-format SLO GET");
+    assert_eq!(
+        header_value(&raw_headers, "Content-Type"),
+        Some("application/json")
+    );
+    let raw: Json = serde_json::from_slice(&raw_body).unwrap();
+    assert_eq!(raw[0]["path"], "/docs/fox.txt");
+
+    let aggregate_payload = [payload.as_slice(), payload.as_slice()].concat();
+    let (status, slo_get_headers, slo_body) =
+        http(proxy_addr, "GET", "/v1/AUTH_full/docs/manifest", "");
+    assert_eq!(status, 200, "reassembled SLO GET");
+    assert_eq!(slo_body, aggregate_payload);
+    assert_eq!(
+        header_value(&slo_get_headers, "Etag"),
+        Some(aggregate_etag.as_str())
+    );
+    assert_eq!(
+        header_value(&slo_get_headers, "X-Manifest-Etag"),
+        Some(stored_manifest_etag.as_str())
+    );
+
+    let (status, slo_head_headers, slo_head_body) =
+        http(proxy_addr, "HEAD", "/v1/AUTH_full/docs/manifest", "");
+    assert_eq!(status, 200, "reassembled SLO HEAD");
+    assert!(slo_head_body.is_empty());
+    assert_eq!(
+        header_value(&slo_head_headers, "X-Manifest-Etag"),
+        Some(stored_manifest_etag.as_str())
+    );
+    let aggregate_length = aggregate_payload.len().to_string();
+    assert_eq!(
+        header_value(&slo_head_headers, "Content-Length"),
+        Some(aggregate_length.as_str())
+    );
+
+    let (status, slo_range_headers, slo_range_body) = http_with_headers(
+        proxy_addr,
+        "GET",
+        "/v1/AUTH_full/docs/manifest",
+        &[("Range", "bytes=10-25")],
+        "",
+    );
+    assert_eq!(status, 206, "reassembled SLO range GET");
+    assert_eq!(slo_range_body, aggregate_payload[10..=25]);
+    assert_eq!(
+        header_value(&slo_range_headers, "X-Manifest-Etag"),
+        Some(stored_manifest_etag.as_str())
+    );
 
     // The same metadata must survive a client-facing HEAD. The HTTP writer
     // must not replace the backend object length with the empty HEAD body size.
@@ -788,9 +876,25 @@ fn test_tempauth_end_to_end() {
     });
     std::thread::sleep(std::time::Duration::from_millis(250));
 
-    // unauthenticated container GET -> 401
-    let (status, _, _) = http(proxy_addr, "GET", "/v1/AUTH_test/box", "");
+    // An anonymous ACL denial is Python swob's full 401 wire response.
+    let (status, denied_headers, denied_body) =
+        http(proxy_addr, "GET", "/v1/AUTH_test/box", "");
     assert_eq!(status, 401, "no token");
+    let expected_denial = b"<html><h1>Unauthorized</h1><p>This server could not verify that you are authorized to access the document you requested.</p></html>";
+    assert_eq!(denied_body, expected_denial);
+    assert_eq!(
+        header_value(&denied_headers, "Content-Type"),
+        Some("text/html; charset=UTF-8")
+    );
+    let expected_denial_length = expected_denial.len().to_string();
+    assert_eq!(
+        header_value(&denied_headers, "Content-Length"),
+        Some(expected_denial_length.as_str())
+    );
+    assert_eq!(
+        header_value(&denied_headers, "Www-Authenticate"),
+        Some("Swift realm=\"AUTH_test\"")
+    );
 
     // get a token
     let mut conn = std::net::TcpStream::connect(proxy_addr).unwrap();

@@ -78,6 +78,7 @@ const SLO_HEADER: &str = "X-Static-Large-Object";
 const IGNORE_RANGE_HDR: &str = "X-Backend-Ignore-Range-If-Metadata-Present";
 const SYSMETA_SLO_ETAG: &str = "X-Object-Sysmeta-Slo-Etag";
 const SYSMETA_SLO_SIZE: &str = "X-Object-Sysmeta-Slo-Size";
+const MANIFEST_ETAG_HEADER: &str = "X-Manifest-Etag";
 
 /// Default expirer account (Python `EXPIRER_ACCOUNT_NAME`).
 const EXPIRER_ACCOUNT: &str = ".expiring_objects";
@@ -564,72 +565,87 @@ impl Slo {
             .headers
             .get(SYSMETA_SLO_SIZE)
             .and_then(|s| s.parse::<i64>().ok());
+        // The backend Etag identifies the physical stored JSON object. SLO
+        // replaces the client-facing Etag with the aggregate segment Etag,
+        // but exposes this digest separately as X-Manifest-Etag.
+        let backend_manifest_etag = resp
+            .headers
+            .get("Etag")
+            .map(normalize_etag)
+            .filter(|etag| !etag.is_empty())
+            .map(str::to_string);
 
         let is_get = orig.method == "GET";
 
         // Resolve segments when we need them for streaming, or when sysmeta
         // is missing (legacy manifests). HEAD with sysmeta skips the body.
-        let (etag, total_len, segments) = if let (Some(e), Some(sz)) = (&sys_etag, sys_size) {
-            if is_get {
-                // Still need the segment listing for reassembly.
+        let (etag, total_len, segments, stored_manifest_etag) =
+            if let (Some(e), Some(sz)) = (&sys_etag, sys_size) {
+                if is_get {
+                    // Still need the segment listing for reassembly. Hash the
+                    // bytes actually returned by the object server rather than
+                    // deriving a digest from re-serialized JSON.
+                    if resp.body.materialize(MAX_CONTROL_BODY).is_err() {
+                        return resp;
+                    }
+                    let manifest_bytes =
+                        resp.body.materialize(MAX_CONTROL_BODY).expect("buffered");
+                    let stored_manifest_etag = manifest_etag(manifest_bytes);
+                    let Some(segments) = parse_stored_manifest(manifest_bytes) else {
+                        return resp;
+                    };
+                    (e.clone(), sz, segments, Some(stored_manifest_etag))
+                } else {
+                    (e.clone(), sz, Vec::new(), backend_manifest_etag)
+                }
+            } else {
+                // No sysmeta: need the manifest body. HEAD → refetch as GET.
+                if !is_get {
+                    let mut get_req = orig.clone_head();
+                    get_req.method = "GET".to_string();
+                    ignore_range(&mut get_req.headers, SLO_HEADER);
+                    resp = next(get_req);
+                    if !resp
+                        .headers
+                        .get(SLO_HEADER)
+                        .map(config_true_value)
+                        .unwrap_or(false)
+                    {
+                        return resp;
+                    }
+                }
                 if resp.body.materialize(MAX_CONTROL_BODY).is_err() {
                     return resp;
                 }
                 let manifest_bytes = resp.body.materialize(MAX_CONTROL_BODY).expect("buffered");
+                let stored_manifest_etag = manifest_etag(manifest_bytes);
                 let Some(segments) = parse_stored_manifest(manifest_bytes) else {
                     return resp;
                 };
-                (e.clone(), sz, segments)
-            } else {
-                (e.clone(), sz, Vec::new())
-            }
-        } else {
-            // No sysmeta: need the manifest body. HEAD → refetch as GET.
-            if !is_get {
-                let mut get_req = orig.clone_head();
-                get_req.method = "GET".to_string();
-                ignore_range(&mut get_req.headers, SLO_HEADER);
-                resp = next(get_req);
-                if !resp
-                    .headers
-                    .get(SLO_HEADER)
-                    .map(config_true_value)
-                    .unwrap_or(false)
-                {
-                    return resp;
-                }
-            }
-            if resp.body.materialize(MAX_CONTROL_BODY).is_err() {
-                return resp;
-            }
-            let manifest_bytes = resp.body.materialize(MAX_CONTROL_BODY).expect("buffered");
-            let Some(segments) = parse_stored_manifest(manifest_bytes) else {
-                return resp;
+                let slo_segs: Vec<SloSegment> = segments
+                    .iter()
+                    .map(|s| {
+                        if let Some(b64) = &s.data_b64 {
+                            let raw = B64.decode(b64.as_bytes()).unwrap_or_default();
+                            SloSegment {
+                                hash: String::new(),
+                                segment_length: raw.len() as i64,
+                                range: None,
+                                raw_data: Some(raw),
+                            }
+                        } else {
+                            SloSegment {
+                                hash: s.hash.clone(),
+                                segment_length: contrib_length(s),
+                                range: s.range.clone(),
+                                raw_data: None,
+                            }
+                        }
+                    })
+                    .collect();
+                let (etag, total_len) = slo_etag_and_size(&slo_segs);
+                (etag, total_len, segments, Some(stored_manifest_etag))
             };
-            let slo_segs: Vec<SloSegment> = segments
-                .iter()
-                .map(|s| {
-                    if let Some(b64) = &s.data_b64 {
-                        let raw = B64.decode(b64.as_bytes()).unwrap_or_default();
-                        SloSegment {
-                            hash: String::new(),
-                            segment_length: raw.len() as i64,
-                            range: None,
-                            raw_data: Some(raw),
-                        }
-                    } else {
-                        SloSegment {
-                            hash: s.hash.clone(),
-                            segment_length: contrib_length(s),
-                            range: s.range.clone(),
-                            raw_data: None,
-                        }
-                    }
-                })
-                .collect();
-            let (etag, total_len) = slo_etag_and_size(&slo_segs);
-            (etag, total_len, segments)
-        };
 
         // version, account from the manifest object's path.
         let parts = match split_path(&orig.path, 2, 3, true) {
@@ -660,6 +676,10 @@ impl Slo {
             r.headers.set("Accept-Ranges", "bytes");
             r.headers
                 .set("Content-Range", format!("bytes */{}", total_len.max(0)));
+            r.headers.set("Etag", &etag);
+            if let Some(manifest_etag) = stored_manifest_etag {
+                r.headers.set(MANIFEST_ETAG_HEADER, manifest_etag);
+            }
             return r;
         }
 
@@ -669,6 +689,9 @@ impl Slo {
         headers.remove("Transfer-Encoding");
         headers.remove("Etag");
         headers.set("Etag", etag);
+        if let Some(manifest_etag) = stored_manifest_etag {
+            headers.set(MANIFEST_ETAG_HEADER, manifest_etag);
+        }
         headers.set("Accept-Ranges", "bytes");
 
         // Expand nested sub_slo manifests before committing the response
@@ -1227,6 +1250,22 @@ impl Slo {
         resp.body = body.into();
         resp
     }
+
+    /// A non-raw `?multipart-manifest=get` returns the stored internal JSON
+    /// verbatim, but Python SLO overrides the object's metadata Content-Type.
+    fn handle_manifest_get(&self, req: Request, next: &NextFn) -> Response {
+        let mut resp = next(req);
+        let is_slo = resp
+            .headers
+            .get(SLO_HEADER)
+            .map(config_true_value)
+            .unwrap_or(false);
+        if is_slo {
+            resp.headers
+                .set("Content-Type", "application/json; charset=utf-8");
+        }
+        resp
+    }
 }
 
 /// Built internal manifest + etag inputs from a client PUT body.
@@ -1475,18 +1514,35 @@ fn finish_put(mut req: Request, next: &NextFn, built: PutManifestBuilt) -> Respo
     }
 
     let (slo_etag, total) = slo_etag_and_size(&built.slo_segs);
+    if req
+        .headers
+        .get("Etag")
+        .map(normalize_etag)
+        .filter(|etag| !etag.is_empty())
+        .is_some_and(|etag| !etag.eq_ignore_ascii_case(&slo_etag))
+    {
+        return Response::error(422, "Unable to process the contained instructions");
+    }
     let body = serde_json::to_vec(&built.internal).unwrap_or_default();
+    let stored_manifest_etag = manifest_etag(&body);
     req.method = "PUT".to_string();
     req.query_string = String::new();
     req.headers.set(SLO_HEADER, "True");
     req.headers.set("Content-Length", body.len().to_string());
     req.headers.set(SYSMETA_SLO_ETAG, slo_etag.trim_matches('"'));
     req.headers.set(SYSMETA_SLO_SIZE, total.to_string());
+    // The object server validates and persists the physical JSON digest.
+    // Rewrite only the successful client response to the aggregate SLO Etag.
+    req.headers.set("Etag", stored_manifest_etag);
     if req.headers.get("Content-Type").is_none() {
         req.headers.set("Content-Type", "application/json");
     }
     req.body = body.into();
-    next(req)
+    let mut resp = next(req);
+    if (200..300).contains(&resp.status) {
+        resp.headers.set("Etag", slo_etag);
+    }
+    resp
 }
 
 /// Streamed heartbeat PUT body (Python slo.py): leading space, per-HEAD
@@ -1773,7 +1829,7 @@ impl Middleware for Slo {
             if req.param("format").as_deref() == Some("raw") {
                 return self.handle_manifest_get_raw(req, next);
             }
-            return next(req);
+            return self.handle_manifest_get(req, next);
         }
         // GET/HEAD reassembles unless ?multipart-manifest=get asked for raw.
         if is_get_head {
@@ -1916,15 +1972,21 @@ mod tests {
         })
     }
 
-    fn slo_manifest_backend() -> NextFn {
-        let manifest_json = serde_json::to_vec(&serde_json::json!([
+    fn slo_manifest_json() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!([
             {"name": "/c/s1", "bytes": 3, "hash": md5_hex(b"one")},
             {"name": "/c/s2", "bytes": 3, "hash": md5_hex(b"two")},
         ]))
-        .unwrap();
+        .unwrap()
+    }
+
+    fn slo_manifest_backend() -> NextFn {
+        let manifest_json = slo_manifest_json();
+        let physical_etag = manifest_etag(&manifest_json);
         let mut manifest = Response::with_body(200, manifest_json);
         manifest.headers.set("X-Static-Large-Object", "True");
         manifest.headers.set("Content-Type", "text/plain");
+        manifest.headers.set("Etag", physical_etag);
         backend(vec![
             ("GET", "/v1/a/c/manifest", manifest),
             ("GET", "/v1/a/c/s1", Response::with_body(200, b"one".to_vec())),
@@ -1961,6 +2023,10 @@ mod tests {
         assert_eq!(body_of(&mut resp), b"onetwo");
         assert_eq!(resp.headers.get("Content-Length"), Some("6"));
         assert_eq!(resp.headers.get("Content-Type"), Some("text/plain"));
+        assert_eq!(
+            resp.headers.get(MANIFEST_ETAG_HEADER),
+            Some(manifest_etag(&slo_manifest_json()).as_str())
+        );
     }
 
     #[test]
@@ -1971,6 +2037,10 @@ mod tests {
         assert_eq!(resp.status, 206);
         assert_eq!(body_of(&mut resp), b"etw");
         assert_eq!(resp.headers.get("Content-Range"), Some("bytes 2-4/6"));
+        assert_eq!(
+            resp.headers.get(MANIFEST_ETAG_HEADER),
+            Some(manifest_etag(&slo_manifest_json()).as_str())
+        );
     }
 
     #[test]
@@ -2118,6 +2188,34 @@ mod tests {
             resp.headers.get("Etag"),
             Some("aabbccddeeff00112233445566778899")
         );
+        assert_eq!(
+            resp.headers.get(MANIFEST_ETAG_HEADER),
+            Some("manifestmd5xxxxxxxxxxxxxxxxxxxx")
+        );
+    }
+
+    #[test]
+    fn test_multipart_manifest_get_sets_json_content_type() {
+        let stored = slo_manifest_json();
+        let be: NextFn = Arc::new(move |_req: Request| {
+            let mut resp = Response::with_body(200, stored.clone());
+            resp.headers.set("X-Static-Large-Object", "True");
+            resp.headers.set("Content-Type", "text/plain");
+            resp
+        });
+        let req = Request {
+            method: "GET".to_string(),
+            path: "/v1/a/c/manifest".to_string(),
+            query_string: "multipart-manifest=get".to_string(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let resp = Slo::new().handle(req, &be);
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("application/json; charset=utf-8")
+        );
     }
 
     #[test]
@@ -2131,7 +2229,7 @@ mod tests {
             assert!(req.query_string.contains("multipart-manifest=get"));
             let mut resp = Response::with_body(200, stored.clone());
             resp.headers.set("X-Static-Large-Object", "True");
-            resp.headers.set("Content-Type", "application/json");
+            resp.headers.set("Content-Type", "text/plain");
             resp
         });
         let req = Request {
@@ -2152,6 +2250,7 @@ mod tests {
         assert!(arr[0].get("sub_slo").is_none());
         assert_eq!(arr[1]["path"], "/c/s2");
         assert_eq!(arr[1]["range"], "0-1");
+        assert_eq!(resp.headers.get("Content-Type"), Some("text/plain"));
     }
 
     #[test]

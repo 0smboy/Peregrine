@@ -233,10 +233,12 @@ impl TempAuth {
     }
 
     fn unauthorized(realm: &str) -> Response {
-        let mut resp = Response::with_body(401, b"401 Unauthorized".to_vec());
+        let mut resp = Response::error(
+            401,
+            "This server could not verify that you are authorized to access the document you requested.",
+        );
         resp.headers
             .set("Www-Authenticate", format!("Swift realm=\"{realm}\""));
-        resp.headers.set("Content-Type", "text/plain");
         resp
     }
 }
@@ -542,6 +544,24 @@ mod tests {
             Response::new(204)
         });
         (seen, app)
+    }
+
+    #[test]
+    fn test_unauthorized_matches_swob_response() {
+        let mut resp = TempAuth::unauthorized("AUTH_test");
+        assert_eq!(resp.status, 401);
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("text/html; charset=UTF-8")
+        );
+        assert_eq!(
+            resp.headers.get("Www-Authenticate"),
+            Some("Swift realm=\"AUTH_test\"")
+        );
+        assert_eq!(
+            resp.body.materialize(u64::MAX).unwrap(),
+            b"<html><h1>Unauthorized</h1><p>This server could not verify that you are authorized to access the document you requested.</p></html>"
+        );
     }
 
     #[test]
