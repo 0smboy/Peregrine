@@ -294,7 +294,7 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
         "PUT",
         "/v1/AUTH_ec/ecbox/big.bin",
         &[
-            ("Content-Type", "application/octet-stream"),
+            ("Content-Type", "text/plain"),
             ("X-Backend-Storage-Policy-Index", "1"),
         ],
         &payload,
@@ -508,7 +508,7 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
         &boundary,
         &[(0, 100), (1200, 1300), (3400, 3500)],
         &payload,
-        "application/octet-stream",
+        "text/plain",
         payload.len() as u64,
     );
     assert_eq!(body, expected, "multipart body matches the oracle framing");
