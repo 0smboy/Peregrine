@@ -1,0 +1,92 @@
+start 2026-08-12T15:32:51Z
+rc_cold_tier=0 rc_restore=0 rc_proxy=0
+==== 01-cold-tier.txt ====
+   Compiling hmac v0.12.1
+   Compiling base64 v0.22.1
+   Compiling log v0.4.33
+   Compiling openssl-probe v0.2.1
+   Compiling swift-crypto v0.1.0 (/root/work/peregrine-cold-physical-77dd9f4/swift-rust/crates/swift-crypto)
+   Compiling tar v0.4.46
+   Compiling swift-http v0.1.0 (/root/work/peregrine-cold-physical-77dd9f4/swift-rust/crates/swift-http)
+   Compiling flate2 v1.1.9
+   Compiling bzip2 v0.4.4
+   Compiling swift-memcache v0.1.0 (/root/work/peregrine-cold-physical-77dd9f4/swift-rust/crates/swift-memcache)
+   Compiling sha1 v0.10.7
+   Compiling swift-middleware v0.1.0 (/root/work/peregrine-cold-physical-77dd9f4/swift-rust/crates/swift-middleware)
+   Compiling swift-s3api v0.1.0 (/root/work/peregrine-cold-physical-77dd9f4/swift-rust/crates/swift-s3api)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.47s
+     Running unittests src/lib.rs (target/debug/deps/swift_s3api-cf8ede0dd117bf18)
+
+running 5 tests
+test cold_tier::tests::csv_map_and_cold_meta_stamp ... ok
+test cold_tier::tests::memory_backend_archive_restore ... ok
+test cold_tier::tests::restore_routes_to_hot ... ok
+test cold_tier::tests::localdir_backend_archive_restore ... ok
+test cold_tier::tests::unmapped_class_no_stamp ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 223 filtered out; finished in 0.00s
+
+==== 02-restore.txt ====
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/swift_s3api-cf8ede0dd117bf18)
+
+running 2 tests
+test middleware::tests::restore_object_meta_only_without_backend ... ok
+test middleware::tests::restore_object_stamps_meta_and_calls_backend ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 226 filtered out; finished in 0.00s
+
+==== 03-proxy-cold-wire.txt ====
+   Compiling smallvec v1.15.2
+   Compiling hashbrown v0.14.5
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling fallible-iterator v0.3.0
+   Compiling swift-crypto v0.1.0 (/root/work/peregrine-cold-physical-77dd9f4/swift-rust/crates/swift-crypto)
+   Compiling hashlink v0.9.1
+   Compiling swift-memcache v0.1.0 (/root/work/peregrine-cold-physical-77dd9f4/swift-rust/crates/swift-memcache)
+   Compiling swift-http v0.1.0 (/root/work/peregrine-cold-physical-77dd9f4/swift-rust/crates/swift-http)
+   Compiling swift-ring v0.1.0 (/root/work/peregrine-cold-physical-77dd9f4/swift-rust/crates/swift-ring)
+   Compiling swift-middleware v0.1.0 (/root/work/peregrine-cold-physical-77dd9f4/swift-rust/crates/swift-middleware)
+   Compiling swift-diskfile v0.1.0 (/root/work/peregrine-cold-physical-77dd9f4/swift-rust/crates/swift-diskfile)
+   Compiling rusqlite v0.32.1
+   Compiling swift-object-server v0.1.0 (/root/work/peregrine-cold-physical-77dd9f4/swift-rust/crates/swift-object-server)
+   Compiling swift-db v0.1.0 (/root/work/peregrine-cold-physical-77dd9f4/swift-rust/crates/swift-db)
+   Compiling swift-s3api v0.1.0 (/root/work/peregrine-cold-physical-77dd9f4/swift-rust/crates/swift-s3api)
+   Compiling swift-container-server v0.1.0 (/root/work/peregrine-cold-physical-77dd9f4/swift-rust/crates/swift-container-server)
+   Compiling swift-account-server v0.1.0 (/root/work/peregrine-cold-physical-77dd9f4/swift-rust/crates/swift-account-server)
+   Compiling swift-proxy-server v0.1.0 (/root/work/peregrine-cold-physical-77dd9f4/swift-rust/crates/swift-proxy-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16.09s
+     Running unittests src/lib.rs (target/debug/deps/swift_proxy_server-21c3d56414529b8c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 33 filtered out; finished in 0.00s
+
+rc_proxy_bin=0
+   Compiling swift-proxy-server v0.1.0 (/root/work/peregrine-cold-physical-77dd9f4/swift-rust/crates/swift-proxy-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.35s
+     Running unittests src/lib.rs (target/debug/deps/swift_proxy_server-21c3d56414529b8c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 33 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/swift_proxy_server-4623f4232f62760a)
+
+running 1 test
+test startup_policy_tests::pipeline_s3api_wires_cold_backend_when_root_set ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.00s
+
+     Running tests/ec_integration.rs (target/debug/deps/ec_integration-861b1c7d0290868d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-41d285dbe80ac23f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+

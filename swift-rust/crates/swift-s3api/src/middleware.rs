@@ -126,9 +126,11 @@ use crate::bucket_config::{
     S3_BUCKET_TAGGING_META, S3_OBJECT_TAGGING_META,
 };
 use crate::delete::parse_multi_delete_body;
+use crate::cold_tier::{stamp_cold_restore_meta, ColdBackend, SYS_COLD_BACKEND_URI};
 use crate::lifecycle_exec::{
     apply_abort_incomplete_from_container, apply_due_transition_on_headers,
-    apply_lifecycle_on_put_from_container, transition_blocks_get,
+    apply_lifecycle_on_put_from_container, apply_restore_days, is_cold_storage_class,
+    transition_blocks_get, META_STORAGE_CLASS, SYS_RESTORE_UNTIL, SYS_TRANSITIONED,
 };
 use crate::mpu::{
     complete_multipart_xml, initiate_response, list_multipart_uploads_xml, list_parts_xml_full,
@@ -191,8 +193,10 @@ pub struct S3Api {
     pub s3token_client: Option<Arc<dyn S3TokenClient>>,
     /// Multi-tenant IAM policy engine (optional; empty = no extra deny).
     pub iam: crate::iam::IamService,
-    /// Physical cold-tier storage-policy map (optional; empty = meta-only).
+    /// Cold-tier storage-policy map (optional; empty = meta-only stamps).
     pub cold_map: crate::cold_tier::ColdPolicyMap,
+    /// Optional lab cold backend (local dir / memory). Not tape/Glacier cloud.
+    pub cold_backend: Option<Arc<dyn ColdBackend>>,
     /// When set, unsigned S3 GET/HEAD for path-/vhost-style buckets map to this
     /// Swift account **without** auth override so container `.r:*` can allow
     /// anonymous reads. Multi-tenant deployments must set this explicitly.
@@ -212,6 +216,7 @@ impl S3Api {
             s3token_client: None,
             iam: crate::iam::IamService::new(),
             cold_map: crate::cold_tier::ColdPolicyMap::new(),
+            cold_backend: None,
             anonymous_account: None,
         }
     }
@@ -223,6 +228,12 @@ impl S3Api {
 
     pub fn with_cold_map(mut self, map: crate::cold_tier::ColdPolicyMap) -> Self {
         self.cold_map = map;
+        self
+    }
+
+    /// Wire a lab cold backend (e.g. [`crate::LocalDirColdBackend`]). Not production tape.
+    pub fn with_cold_backend(mut self, backend: Arc<dyn ColdBackend>) -> Self {
+        self.cold_backend = Some(backend);
         self
     }
 
@@ -339,7 +350,7 @@ fn credential_from_s3token(
 /// not a backend 500 or empty body.
 ///
 /// Implemented elsewhere (must **not** appear here): `lifecycle`, `tagging`,
-/// `versioning`, `versions`, `object-lock`, `legal-hold`, `retention`.
+/// `versioning`, `versions`, `object-lock`, `legal-hold`, `retention`, `restore`.
 const UNSUPPORTED_SUBRESOURCES: &[&str] = &[
     "policy",
     "website",
@@ -1355,6 +1366,20 @@ impl S3Api {
                 &cred,
                 bucket.as_deref().unwrap(),
                 key.as_deref().unwrap(),
+                next,
+            );
+        }
+
+        // ---- RestoreObject (?restore) — meta stamp + optional lab cold backend ----
+        let has_restore = params.iter().any(|(k, _)| k == "restore");
+        if has_restore && bucket.is_some() && key.is_some() {
+            return handle_restore(
+                req,
+                &cred,
+                bucket.as_deref().unwrap(),
+                key.as_deref().unwrap(),
+                &self.cold_map,
+                self.cold_backend.as_ref(),
                 next,
             );
         }
@@ -2813,6 +2838,169 @@ fn handle_lifecycle(req: Request, cred: &S3Credential, bucket: &str, next: &Next
             stamp_auth(&mut post, cred);
             let _ = next(post);
             Response::new(204)
+        }
+        _ => s3_error_response("MethodNotAllowed", None, &[]),
+    }
+}
+
+/// Parse `<Days>` from a RestoreRequest XML body (default 1 if absent/empty).
+fn parse_restore_days(body: &[u8]) -> Result<i64, ()> {
+    if body.is_empty() {
+        return Ok(1);
+    }
+    let s = std::str::from_utf8(body).map_err(|_| ())?;
+    // Minimal extract: first <Days>...</Days>
+    let lower = s; // keep original for slice
+    let start = lower.find("<Days>").or_else(|| lower.find("<days>"));
+    let Some(start) = start else {
+        return Ok(1);
+    };
+    let after = start + 6; // len("<Days>")
+    let end = lower[after..]
+        .find("</Days>")
+        .or_else(|| lower[after..].find("</days>"))
+        .ok_or(())?;
+    let raw = lower[after..after + end].trim();
+    let days: i64 = raw.parse().map_err(|_| ())?;
+    if days < 1 {
+        return Err(());
+    }
+    Ok(days)
+}
+
+fn object_is_cold_archive(headers: &HeaderKeyDict) -> bool {
+    let sc = headers
+        .get(META_STORAGE_CLASS)
+        .or_else(|| headers.get("X-Object-Meta-Storage-Class"))
+        .unwrap_or("");
+    if !is_cold_storage_class(sc) {
+        return false;
+    }
+    let transitioned = headers
+        .get(SYS_TRANSITIONED)
+        .map(|s| {
+            let t = s.trim();
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false);
+    transitioned || headers.get(SYS_COLD_BACKEND_URI).is_some()
+}
+
+/// S3 RestoreObject (`POST/GET ?restore`): stamp restore-until meta; if a lab
+/// [`ColdBackend`] is wired and `SYS_COLD_BACKEND_URI` is present, call
+/// `restore_stage`. Without a backend, policy/meta stamps only (honest boundary).
+fn handle_restore(
+    req: Request,
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    cold_map: &crate::cold_tier::ColdPolicyMap,
+    cold_backend: Option<&Arc<dyn ColdBackend>>,
+    next: &NextFn,
+) -> Response {
+    let now = unix_now();
+    match req.method.as_str() {
+        "GET" | "HEAD" => {
+            let mut head = make_swift_req(
+                "HEAD",
+                &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
+            );
+            stamp_auth(&mut head, cred);
+            let resp = next(head);
+            if !(200..300).contains(&resp.status) {
+                return map_swift_error(resp.status, Some(bucket), Some(key));
+            }
+            let until = resp.headers.get(SYS_RESTORE_UNTIL).unwrap_or("");
+            let ongoing = until
+                .parse::<i64>()
+                .map(|u| u > now)
+                .unwrap_or(false);
+            // Minimal status XML (not full AWS RestoreOutput).
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <RestoreStatus>\
+                 <OngoingRequest>{}</OngoingRequest>\
+                 <RestoreExpiry>{}</RestoreExpiry>\
+                 </RestoreStatus>",
+                if ongoing { "false" } else { "true" },
+                until
+            );
+            // ongoing-request=false means restore complete / available
+            let mut r = Response::with_body(200, xml.into_bytes());
+            r.headers.set("Content-Type", "application/xml");
+            if ongoing {
+                r.headers.set(
+                    "x-amz-restore",
+                    format!("ongoing-request=\"false\", expiry-date=\"{until}\""),
+                );
+            } else if object_is_cold_archive(&resp.headers) {
+                r.headers
+                    .set("x-amz-restore", "ongoing-request=\"true\"");
+            }
+            r
+        }
+        "POST" => {
+            let body = match req.body.into_vec(MAX_CONTROL_BODY) {
+                Ok(b) => b,
+                Err(_) => return s3_error_response("IncompleteBody", None, &[]),
+            };
+            let days = match parse_restore_days(&body) {
+                Ok(d) => d,
+                Err(_) => {
+                    return s3_error_response(
+                        "MalformedXML",
+                        Some("RestoreRequest Days must be a positive integer"),
+                        &[],
+                    )
+                }
+            };
+            let mut head = make_swift_req(
+                "HEAD",
+                &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
+            );
+            stamp_auth(&mut head, cred);
+            let head_resp = next(head);
+            if !(200..300).contains(&head_resp.status) {
+                return map_swift_error(head_resp.status, Some(bucket), Some(key));
+            }
+            if !object_is_cold_archive(&head_resp.headers) {
+                return s3_error_response(
+                    "InvalidObjectState",
+                    Some("Restore is not allowed for the object's current storage class"),
+                    &[],
+                );
+            }
+            // Lab cold backend: stage if URI present; else meta-only honesty.
+            if let Some(be) = cold_backend {
+                if let Some(uri) = head_resp.headers.get(SYS_COLD_BACKEND_URI) {
+                    if !uri.is_empty() {
+                        if let Err(e) = be.restore_stage(uri, days) {
+                            return s3_error_response(
+                                "InvalidObjectState",
+                                Some(&format!("cold restore_stage failed: {e}")),
+                                &[],
+                            );
+                        }
+                    }
+                }
+            }
+            let mut post = make_swift_req(
+                "POST",
+                &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
+            );
+            if cold_map.is_configured() {
+                stamp_cold_restore_meta(&mut post.headers, cold_map, days, now);
+            } else {
+                apply_restore_days(&mut post.headers, days, now);
+            }
+            stamp_auth(&mut post, cred);
+            let resp = next(post);
+            if (200..300).contains(&resp.status) {
+                // AWS RestoreObject → 202 Accepted when restore initiated.
+                Response::new(202)
+            } else {
+                map_swift_error(resp.status, Some(bucket), Some(key))
+            }
         }
         _ => s3_error_response("MethodNotAllowed", None, &[]),
     }
@@ -6112,5 +6300,91 @@ mod tests {
         let resp = api.handle(put, &next);
         assert_eq!(resp.status, 200);
         assert!(put_seen.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn restore_object_stamps_meta_and_calls_backend() {
+        use crate::cold_tier::{MemoryColdBackend, SYS_COLD_BACKEND_URI};
+        use crate::lifecycle_exec::{META_STORAGE_CLASS, SYS_RESTORE_UNTIL, SYS_TRANSITIONED};
+
+        let be = Arc::new(MemoryColdBackend::default());
+        let uri = be
+            .archive(2, "AUTH_test", "mybucket", "coldobj", b"payload")
+            .unwrap();
+        let api = S3Api::new(cred_map())
+            .with_cold_map(crate::cold_tier::ColdPolicyMap::from_csv("GLACIER:2,HOT:0"))
+            .with_cold_backend(be.clone());
+
+        let mut post = base_s3_req("POST", "/mybucket/coldobj", "restore");
+        post.body = Body::from(
+            b"<RestoreRequest><Days>2</Days></RestoreRequest>".to_vec(),
+        );
+        post.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        let post = sign_request(post, "testing");
+
+        let stamped = Arc::new(std::sync::Mutex::new(None::<String>));
+        let stamped_c = stamped.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" {
+                let mut resp = Response::new(200);
+                resp.headers.set(META_STORAGE_CLASS, "GLACIER");
+                resp.headers.set(SYS_TRANSITIONED, "1");
+                resp.headers.set(SYS_COLD_BACKEND_URI, &uri);
+                return resp;
+            }
+            if r.method == "POST" {
+                let until = r
+                    .headers
+                    .get(SYS_RESTORE_UNTIL)
+                    .map(str::to_string);
+                *stamped_c.lock().unwrap() = until;
+                return Response::new(202);
+            }
+            Response::new(500)
+        });
+        let resp = api.handle(post, &next);
+        assert_eq!(resp.status, 202, "RestoreObject should return 202");
+        let until = stamped.lock().unwrap().clone();
+        assert!(until.is_some(), "restore must stamp SYS_RESTORE_UNTIL");
+    }
+
+    #[test]
+    fn restore_object_meta_only_without_backend() {
+        use crate::lifecycle_exec::{META_STORAGE_CLASS, SYS_RESTORE_UNTIL, SYS_TRANSITIONED};
+
+        let api = S3Api::new(cred_map());
+        let mut post = base_s3_req("POST", "/mybucket/coldobj", "restore");
+        post.body = Body::from(b"<RestoreRequest><Days>1</Days></RestoreRequest>".to_vec());
+        post.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        let post = sign_request(post, "testing");
+        let stamped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stamped_c = stamped.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" {
+                let mut resp = Response::new(200);
+                resp.headers.set(META_STORAGE_CLASS, "GLACIER");
+                resp.headers.set(SYS_TRANSITIONED, "1");
+                return resp;
+            }
+            if r.method == "POST" {
+                assert!(r.headers.get(SYS_RESTORE_UNTIL).is_some());
+                stamped_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Response::new(202);
+            }
+            Response::new(500)
+        });
+        let resp = api.handle(post, &next);
+        assert_eq!(resp.status, 202);
+        assert!(stamped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn parse_restore_days_helpers() {
+        assert_eq!(parse_restore_days(b"").unwrap(), 1);
+        assert_eq!(
+            parse_restore_days(b"<RestoreRequest><Days>3</Days></RestoreRequest>").unwrap(),
+            3
+        );
+        assert!(parse_restore_days(b"<RestoreRequest><Days>0</Days></RestoreRequest>").is_err());
     }
 }

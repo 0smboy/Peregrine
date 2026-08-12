@@ -67,9 +67,9 @@
 //! Other residuals (not claimable as implemented):
 //!
 //! * lifecycle tag / And filters
-//! * physical Glacier/tape **backend** is **not implemented** — [`cold_tier`]
-//!   is a policy map + metadata stamps only (proxy may load `cold_policy_map`
-//!   conf; that still does not move bytes to cold media)
+//! * physical Glacier/tape **cloud** backend is **not implemented** — [`cold_tier`]
+//!   is a policy map + metadata stamps; lab [`LocalDirColdBackend`] / [`MemoryColdBackend`]
+//!   can hold local bytes when wired via proxy `cold_backend_root` / `filecold_root`
 //! * multi-tenant IAM policy evaluation ([`iam::IamService`]) and
 //!   IdentityDirectory are library-only until the proxy loads their config.
 //!   Grant headers + ACP
@@ -115,6 +115,7 @@ pub mod versioning_store;
 pub mod xml;
 
 pub use middleware::{as_middleware, credentials_from_tempauth_users, S3Api, S3Credential};
+pub use cold_tier::{ColdBackend, ColdMetaStamp, ColdPolicyMap, LocalDirColdBackend, MemoryColdBackend};
 pub use parse::{
     extract_bucket_and_key, parse_host, s3_to_swift_path, validate_bucket_name, MULTIUPLOAD_SUFFIX,
 };

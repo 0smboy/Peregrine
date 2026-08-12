@@ -1,0 +1,7 @@
+access <redacted> project <redacted>
+ListBuckets region=us-east-1 HTTP 200 body=b'<?xml version=\'1.0\' encoding=\'UTF-8\'?>\n<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Owner><ID>1371713510fb45e98ab1e26b694d55d3</ID><'
+CreateBucket HTTP 200 body=b''
+PutObject HTTP 200 etag="6d56fe7f2743f77b2fd657151142df5a" body=b''
+GetObject HTTP 200 body=b'ec2-sigv4-put-get-ok'
+cleanup delobj=204 delbucket=204
+VERDICT GREEN region=us-east-1

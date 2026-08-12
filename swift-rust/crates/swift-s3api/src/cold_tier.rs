@@ -3,7 +3,9 @@
 //!
 //! # Honest boundary
 //!
-//! **Physical cold backend is not implemented.** This module is a policy map
+//! **Physical cold backend (tape/Glacier cloud) is not implemented.** Lab
+//! adapters [`MemoryColdBackend`] / [`LocalDirColdBackend`] can archive bytes
+//! locally when wired. This module is primarily a policy map
 //! and metadata-stamp helper only. Lifecycle Transition stamps (see
 //! [`crate::lifecycle_exec`]) mark objects as intending a cold class. Helpers
 //! here can prepare headers an *external* mover would need:
@@ -22,6 +24,7 @@
 
 use std::collections::HashMap;
 
+use std::path::PathBuf;
 use swift_http::HeaderKeyDict;
 
 use crate::lifecycle_exec::{
@@ -285,6 +288,77 @@ impl ColdBackend for MemoryColdBackend {
     }
 }
 
+/// Local directory cold backend — archives object bytes under `root/`.
+///
+/// URI form: `filecold://{policy}/{account}/{container}/{key_hex}`
+/// This is a **lab/physical-bytes** adapter (not tape/Glacier cloud). Production
+/// tape/object-lock media backends remain residual.
+#[derive(Debug, Clone)]
+pub struct LocalDirColdBackend {
+    pub root: PathBuf,
+}
+
+impl LocalDirColdBackend {
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self, String> {
+        let root = root.into();
+        std::fs::create_dir_all(&root).map_err(|e| format!("cold root mkdir: {e}"))?;
+        Ok(Self { root })
+    }
+
+    fn path_for_uri(&self, backend_uri: &str) -> Result<PathBuf, String> {
+        let rest = backend_uri
+            .strip_prefix("filecold://")
+            .ok_or_else(|| format!("not a filecold uri: {backend_uri}"))?;
+        // policy/account/container/key_hex — reject traversal
+        if rest.contains("..") || rest.starts_with('/') {
+            return Err("invalid filecold uri path".into());
+        }
+        Ok(self.root.join(rest))
+    }
+
+    /// Read archived bytes back (lab rehydrate helper).
+    pub fn fetch(&self, backend_uri: &str) -> Result<Vec<u8>, String> {
+        let path = self.path_for_uri(backend_uri)?;
+        std::fs::read(&path).map_err(|e| format!("cold read: {e}"))
+    }
+}
+
+impl ColdBackend for LocalDirColdBackend {
+    fn archive(
+        &self,
+        policy_index: i64,
+        account: &str,
+        container: &str,
+        key: &str,
+        body: &[u8],
+    ) -> Result<String, String> {
+        let key_hex = key
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let rel = format!("{policy_index}/{account}/{container}/{key_hex}");
+        if rel.contains("..") {
+            return Err("refusing path traversal in cold archive key".into());
+        }
+        let path = self.root.join(&rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("cold mkdir: {e}"))?;
+        }
+        std::fs::write(&path, body).map_err(|e| format!("cold write: {e}"))?;
+        Ok(format!("filecold://{rel}"))
+    }
+
+    fn restore_stage(&self, backend_uri: &str, _days: i64) -> Result<(), String> {
+        let path = self.path_for_uri(backend_uri)?;
+        if path.is_file() {
+            Ok(())
+        } else {
+            Err(format!("cold object missing at {}", path.display()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +402,21 @@ mod tests {
         assert!(uri.starts_with("memory://"));
         be.restore_stage(&uri, 1).unwrap();
         assert!(be.restore_stage("memory://missing", 1).is_err());
+    }
+
+    #[test]
+    fn localdir_backend_archive_restore() {
+        let dir = std::env::temp_dir().join(format!(
+            "peregrine-cold-test-{}",
+            std::process::id()
+        ));
+        let be = LocalDirColdBackend::new(&dir).unwrap();
+        let uri = be.archive(2, "AUTH_test", "bkt", "dir/obj", b"payload").unwrap();
+        assert!(uri.starts_with("filecold://"));
+        be.restore_stage(&uri, 1).unwrap();
+        assert_eq!(be.fetch(&uri).unwrap(), b"payload");
+        assert!(be.restore_stage("filecold://2/AUTH_test/bkt/dead", 1).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1,0 +1,8 @@
+Contabo live S3 SigV4 (VIP) @ 77dd9f4 / binary 117d7b08…
+VERDICT=GREEN
+Ops: ListBuckets/CreateBucket/PutObject/GetObject HTTP 200; cleanup 204
+Region: us-east-1
+Claim boundary: short EC2 SigV4 smoke on Contabo VIP with s3api+s3token in pipeline.
+NOT claimed: multi-hour matrix, full strict-s3-parity live suite, AWS IAM cloud.
+Evidence: tools/test-results/wave3-s3-contabo-sigv4-77dd9f4-20260812T153101Z/
+Remote: host=swift1 tip_sha=117d7b088e691be6826cca0fca067353bfc52c76f96b25aec1882f1d80d3052c evid=/root/work/peregrine-artifacts/wave3-s3-contabo-sigv4-77dd9f4-20260812T153101Z

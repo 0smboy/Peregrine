@@ -2893,6 +2893,24 @@ fn build_s3api(conf: &SwiftConfig) -> Result<Option<swift_s3api::S3Api>, String>
         &cold_policy_map,
     ));
 
+    // Lab local-dir cold backend (filecold://). NOT tape/Glacier cloud.
+    // Config: cold_backend_root or alias filecold_root under [filter:s3api].
+    let cold_root = conf
+        .get("filter:s3api", "cold_backend_root")
+        .map_err(|e| e.to_string())?
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            conf.get("filter:s3api", "filecold_root")
+                .ok()
+                .flatten()
+                .filter(|s| !s.trim().is_empty())
+        });
+    if let Some(root) = cold_root {
+        let be = swift_s3api::LocalDirColdBackend::new(root.trim())
+            .map_err(|e| format!("cold_backend_root: {e}"))?;
+        api = api.with_cold_backend(std::sync::Arc::new(be));
+    }
+
     // EC2 deferral: inline /v3/s3tokens on s3api (does not wait for s3token filter).
     if let Some(uri) = external_s3token {
         api = api.with_s3token_client(std::sync::Arc::new(
@@ -3948,6 +3966,74 @@ let invalid = SwiftConfig::parse_lenient(
         );
         assert_eq!(api.cold_map.policy_for_class("GLACIER"), Some(2));
         assert_eq!(api.cold_map.default_hot_policy, 0);
+        assert!(api.cold_backend.is_none(), "no root → no cold backend");
+    }
+
+    #[test]
+    fn pipeline_s3api_wires_cold_backend_when_root_set() {
+        let dir = std::env::temp_dir().join(format!(
+            "peregrine-proxy-cold-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let conf = SwiftConfig::parse_lenient(
+            &format!(
+                "[pipeline:main]\n\
+                 pipeline = catch_errors gatekeeper healthcheck s3api tempauth copy proxy-server\n\
+                 [filter:tempauth]\nuser_test_tester = testing .admin\n\
+                 [filter:s3api]\n\
+                 cold_policy_map = GLACIER:2,HOT:0\n\
+                 cold_backend_root = {}\n",
+                dir.display()
+            ),
+            &[],
+            false,
+        )
+        .unwrap();
+        let api = build_s3api(&conf)
+            .expect("valid s3api configuration")
+            .expect("s3api credentials");
+        assert!(
+            api.cold_backend.is_some(),
+            "cold_backend_root must wire LocalDirColdBackend"
+        );
+        // Unset → None
+        let conf2 = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck s3api tempauth copy proxy-server\n\
+             [filter:tempauth]\nuser_test_tester = testing .admin\n\
+             [filter:s3api]\n\
+             cold_policy_map = GLACIER:2\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let api2 = build_s3api(&conf2)
+            .expect("valid")
+            .expect("creds");
+        assert!(api2.cold_backend.is_none());
+        // Alias filecold_root
+        let conf3 = SwiftConfig::parse_lenient(
+            &format!(
+                "[pipeline:main]\n\
+                 pipeline = catch_errors gatekeeper healthcheck s3api tempauth copy proxy-server\n\
+                 [filter:tempauth]\nuser_test_tester = testing .admin\n\
+                 [filter:s3api]\n\
+                 filecold_root = {}\n",
+                dir.display()
+            ),
+            &[],
+            false,
+        )
+        .unwrap();
+        let api3 = build_s3api(&conf3)
+            .expect("valid")
+            .expect("creds");
+        assert!(
+            api3.cold_backend.is_some(),
+            "filecold_root alias must wire backend"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

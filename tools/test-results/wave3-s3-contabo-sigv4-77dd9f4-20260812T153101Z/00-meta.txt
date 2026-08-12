@@ -1,0 +1,3 @@
+host=swift1 tip_sha=117d7b088e691be6826cca0fca067353bfc52c76f96b25aec1882f1d80d3052c evid=/root/work/peregrine-artifacts/wave3-s3-contabo-sigv4-77dd9f4-20260812T153101Z
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+probe_rc=0
