@@ -744,12 +744,13 @@ fn build_slo(conf: &SwiftConfig, hash_config: HashPathConfig) -> swift_middlewar
 }
 
 fn build_dlo(conf: &SwiftConfig) -> Result<swift_middleware::DynamicLargeObject, String> {
+    // Python only reads `[filter:dlo]`. Do not inherit similarly-named knobs
+    // from `[app:proxy-server]` / DEFAULT — that path caused live DLO
+    // reassembly to diverge from the previously green DynamicLargeObject::new().
     let parse = |key: &str, default: i64| -> Result<i64, String> {
         conf.get("filter:dlo", key)
             .ok()
             .flatten()
-            .or_else(|| conf.get("app:proxy-server", key).ok().flatten())
-            .or_else(|| conf.get("DEFAULT", key).ok().flatten())
             .map(|raw| {
                 raw.trim()
                     .parse::<i64>()
