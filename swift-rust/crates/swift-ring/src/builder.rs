@@ -145,7 +145,11 @@ impl RingBuilder {
     /// `set_dev_weight`: change a device's weight (0 removes it from
     /// assignment on the next rebalance).
     pub fn set_dev_weight(&mut self, dev_id: u64, weight: f64) -> bool {
-        match self.devices.get_mut(dev_id as usize).and_then(|d| d.as_mut()) {
+        match self
+            .devices
+            .get_mut(dev_id as usize)
+            .and_then(|d| d.as_mut())
+        {
             Some(dev) => {
                 dev.weight = weight;
                 true
@@ -156,7 +160,11 @@ impl RingBuilder {
 
     /// `set_info`: update a device's network location (ip/port/device name).
     pub fn set_dev_info(&mut self, dev_id: u64, ip: &str, port: u32, device: &str) -> bool {
-        match self.devices.get_mut(dev_id as usize).and_then(|d| d.as_mut()) {
+        match self
+            .devices
+            .get_mut(dev_id as usize)
+            .and_then(|d| d.as_mut())
+        {
             Some(dev) => {
                 dev.ip = ip.to_string();
                 dev.port = port;
@@ -278,8 +286,7 @@ impl RingBuilder {
             row_lengths.push(parts); // at least one replica
         }
 
-        let mut rows: Vec<Vec<u32>> =
-            row_lengths.iter().map(|&len| vec![0u32; len]).collect();
+        let mut rows: Vec<Vec<u32>> = row_lengths.iter().map(|&len| vec![0u32; len]).collect();
 
         // id -> device for dispersion lookups
         let dev_by_id: std::collections::HashMap<u64, &BuilderDevice> =
@@ -485,7 +492,14 @@ mod tests {
         let mut b = RingBuilder::new(4, 3.0); // 16 parts
         for region in 1..=2u64 {
             for zone in 1..=2u64 {
-                b.add_dev(region, zone, &format!("10.0.{region}.{zone}"), 6200, "sda", 100.0);
+                b.add_dev(
+                    region,
+                    zone,
+                    &format!("10.0.{region}.{zone}"),
+                    6200,
+                    "sda",
+                    100.0,
+                );
             }
         }
         b.rebalance().unwrap();
@@ -516,7 +530,7 @@ mod tests {
     #[test]
     fn test_rebalance_produces_valid_dispersed_ring() {
         let mut b = RingBuilder::new(6, 3.0); // 64 parts, 3 replicas
-        // 2 regions x 2 zones x 2 devices
+                                              // 2 regions x 2 zones x 2 devices
         for region in 1..=2u64 {
             for zone in 1..=2u64 {
                 for d in 0..2 {
@@ -555,7 +569,7 @@ mod tests {
     #[test]
     fn test_weighted_balance() {
         let mut b = RingBuilder::new(8, 3.0); // 256 parts
-        // one heavy device (weight 300) and three light (100)
+                                              // one heavy device (weight 300) and three light (100)
         let heavy = b.add_dev(1, 1, "10.0.0.1", 6200, "sda", 300.0);
         b.add_dev(1, 2, "10.0.0.2", 6200, "sda", 100.0);
         b.add_dev(2, 1, "10.0.1.1", 6200, "sda", 100.0);

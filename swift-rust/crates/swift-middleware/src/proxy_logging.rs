@@ -186,7 +186,8 @@ impl ProxyLogging {
                             match c.next() {
                                 None => String::new(),
                                 Some(f) => {
-                                    f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase()
+                                    f.to_uppercase().collect::<String>()
+                                        + &c.as_str().to_lowercase()
                                 }
                             }
                         })
@@ -348,7 +349,11 @@ impl Middleware for ProxyLogging {
 /// `swift.common.utils.get_remote_client`: prefer `X-Cluster-Client-Ip`,
 /// then the first element of `X-Forwarded-For`, then `REMOTE_ADDR`.
 fn get_remote_client(req: &Request, remote_addr: &str) -> String {
-    let mut client = req.headers.get("x-cluster-client-ip").unwrap_or("").to_string();
+    let mut client = req
+        .headers
+        .get("x-cluster-client-ip")
+        .unwrap_or("")
+        .to_string();
     if client.is_empty() {
         if let Some(xff) = req.headers.get("x-forwarded-for") {
             client = xff.split(',').next().unwrap_or("").trim().to_string();
@@ -389,7 +394,8 @@ fn url_quote(s: &str, safe: &str) -> String {
     let safe = safe.as_bytes();
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'~') || safe.contains(&b) {
+        if b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'~') || safe.contains(&b)
+        {
             out.push(b as char);
         } else {
             out.push('%');
@@ -534,7 +540,12 @@ mod tests {
 
     fn assert_fields(line: &str, expect: &[(usize, &str)]) {
         let fields: Vec<&str> = line.split(' ').collect();
-        assert_eq!(fields.len(), 21, "expected 21 fields, got {}: {line}", fields.len());
+        assert_eq!(
+            fields.len(),
+            21,
+            "expected 21 fields, got {}: {line}",
+            fields.len()
+        );
         for (idx, want) in expect {
             assert_eq!(fields[*idx], *want, "field {idx} of: {line}");
         }
@@ -582,7 +593,10 @@ mod tests {
         // -> quote(':/{}') -> '%' => %25, '?' => %3F, '=' => %3D, '&' => %26
         assert_fields(
             &pl.get_log_line(&req, &resp, &base_ctx()),
-            &[(4, "/v1/AUTH_test/obj%2520name%3Fprefix%3Da%2520b%26limit%3D1")],
+            &[(
+                4,
+                "/v1/AUTH_test/obj%2520name%3Fprefix%3Da%2520b%26limit%3D1",
+            )],
         );
     }
 
@@ -592,7 +606,12 @@ mod tests {
         let ctx = base_ctx();
 
         // response header wins over the request header
-        let req = make_req("GET", "/v1/a/c/o", "", &[("X-Backend-Storage-Policy-Index", "1")]);
+        let req = make_req(
+            "GET",
+            "/v1/a/c/o",
+            "",
+            &[("X-Backend-Storage-Policy-Index", "1")],
+        );
         let resp = make_resp(200, &[("X-Backend-Storage-Policy-Index", "2")]);
         assert_fields(&pl.get_log_line(&req, &resp, &ctx), &[(20, "2")]);
 
@@ -613,7 +632,7 @@ mod tests {
     #[test]
     fn test_auth_token_is_capped() {
         let pl = ProxyLogging::default(); // reveal_sensitive_prefix = 16
-        // 23 chars -> first 16 + "..."
+                                          // 23 chars -> first 16 + "..."
         let token = "AUTH_tk0123456789abcdef";
         let req = make_req("GET", "/v1/a", "", &[("X-Auth-Token", token)]);
         let resp = make_resp(200, &[]);
@@ -719,10 +738,10 @@ mod tests {
         assert_fields(
             &pl.get_log_line(&req, &resp, &ctx),
             &[
-                (2, "01/Jan/1970/00/00/00"),  // end_time.datetime
-                (15, "0.0000"),               // request_time
-                (18, "0.000000000"),          // start_time
-                (19, "0.000000000"),          // end_time
+                (2, "01/Jan/1970/00/00/00"), // end_time.datetime
+                (15, "0.0000"),              // request_time
+                (18, "0.000000000"),         // start_time
+                (19, "0.000000000"),         // end_time
             ],
         );
     }
@@ -737,8 +756,10 @@ mod tests {
             // untouched
             let mut resp = Response::new(204);
             resp.headers.set("Echo-Method", &r.method);
-            resp.headers
-                .set("Echo-Meta", r.headers.get("x-object-meta-foo").unwrap_or(""));
+            resp.headers.set(
+                "Echo-Meta",
+                r.headers.get("x-object-meta-foo").unwrap_or(""),
+            );
             resp
         });
         let resp = pl.handle(req, &app);

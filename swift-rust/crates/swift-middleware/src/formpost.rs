@@ -123,7 +123,9 @@ pub fn verify_signature(
 
 /// Parse `Content-Disposition` / `Content-Type` attribute lists
 /// (`swift.common.utils.parse_content_disposition`).
-pub fn parse_content_disposition(header: &str) -> (String, std::collections::HashMap<String, String>) {
+pub fn parse_content_disposition(
+    header: &str,
+) -> (String, std::collections::HashMap<String, String>) {
     let mut attributes = std::collections::HashMap::new();
     let (main, attrs) = match header.split_once(';') {
         Some((h, a)) => (h.trim().to_string(), a.trim()),
@@ -151,9 +153,7 @@ pub fn parse_content_disposition(header: &str) -> (String, std::collections::Has
                 (stripped.to_string(), "")
             }
         } else {
-            let end = after
-                .find(';')
-                .unwrap_or(after.len());
+            let end = after.find(';').unwrap_or(after.len());
             let value = after[..end].trim().to_string();
             let next = after[end..].trim_start_matches(';').trim_start();
             (value, next)
@@ -367,10 +367,7 @@ impl FormPost {
                 while mime.read(&mut sink).unwrap_or(0) > 0 {}
                 let mut text = String::from_utf8_lossy(&data).into_owned();
                 // Python: data.rstrip('\r\n--')
-                while text.ends_with('\r')
-                    || text.ends_with('\n')
-                    || text.ends_with('-')
-                {
+                while text.ends_with('\r') || text.ends_with('\n') || text.ends_with('-') {
                     text.pop();
                 }
                 if let Some(name) = attrs.get("name") {
@@ -501,9 +498,8 @@ impl FormPost {
             .unwrap_or_else(|| "0".into());
 
         // HMAC over the string form fields (matches Python %s formatting).
-        let hmac_body = format!(
-            "{orig_path}\n{redirect}\n{max_file_size_s}\n{max_file_count}\n{expires_s}"
-        );
+        let hmac_body =
+            format!("{orig_path}\n{redirect}\n{max_file_size_s}\n{max_file_count}\n{expires_s}");
         let signature = attributes.get("signature").cloned().unwrap_or_default();
         let (algo, sig_hex) = extract_digest_and_algorithm(&signature)
             .map_err(|_| FormError::Unauthorized("invalid signature".into()))?;
@@ -530,18 +526,13 @@ impl FormPost {
             headers: HeaderKeyDict::new(),
             body: Body::from(file_data),
         };
-        put.headers
-            .set("X-Backend-Authorize-Override", "true");
+        put.headers.set("X-Backend-Authorize-Override", "true");
         put.headers.set("X-Backend-Remote-User", ".wsgi.formpost");
         put.headers.set("X-Backend-Source", "FP");
         if let Some(v) = attributes.get("x_delete_at") {
-            let _: i64 = v
-                .parse()
-                .map_err(|_| {
-                    FormError::Invalid(
-                        "x_delete_at not an integer: Unix timestamp required.".into(),
-                    )
-                })?;
+            let _: i64 = v.parse().map_err(|_| {
+                FormError::Invalid("x_delete_at not an integer: Unix timestamp required.".into())
+            })?;
             put.headers.set("X-Delete-At", v);
         }
         if let Some(v) = attributes.get("x_delete_after") {
@@ -567,11 +558,7 @@ impl FormPost {
         }
 
         let mut resp = next(put);
-        let body = resp
-            .body
-            .take()
-            .into_vec(64 * 1024)
-            .unwrap_or_default();
+        let body = resp.body.take().into_vec(64 * 1024).unwrap_or_default();
         Ok((resp.status, resp.headers, body))
     }
 }
@@ -628,7 +615,10 @@ mod tests {
     fn test_verify_valid_and_invalid() {
         let key: &[u8] = b"mykey";
         let sig = formpost_hmac("sha256", key, &attrs()).unwrap();
-        let allowed: Vec<String> = DEFAULT_ALLOWED_DIGESTS.iter().map(|s| s.to_string()).collect();
+        let allowed: Vec<String> = DEFAULT_ALLOWED_DIGESTS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(
             verify_signature(&[key], &attrs(), &sig, 0, &allowed),
             FormPostVerify::Valid
@@ -655,9 +645,8 @@ mod tests {
 
     #[test]
     fn test_parse_content_disposition() {
-        let (main, attrs) = parse_content_disposition(
-            r#"form-data; name="file1"; filename="test.html""#,
-        );
+        let (main, attrs) =
+            parse_content_disposition(r#"form-data; name="file1"; filename="test.html""#);
         assert_eq!(main, "form-data");
         assert_eq!(attrs.get("name").map(String::as_str), Some("file1"));
         assert_eq!(attrs.get("filename").map(String::as_str), Some("test.html"));
@@ -717,7 +706,9 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
         let app: NextFn = Arc::new(move |r: Request| {
-            log2.lock().unwrap().push((r.method.clone(), r.path.clone()));
+            log2.lock()
+                .unwrap()
+                .push((r.method.clone(), r.path.clone()));
             Response::new(201)
         });
         let provider = Arc::new(ClosureKeyProvider::new(|_, _| vec![key.to_string()]));
@@ -746,7 +737,10 @@ mod tests {
         assert_eq!(resp.status, 201, "got {}", resp.status);
         let calls = log.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0], ("PUT".into(), "/v1/AUTH_test/c/prefix_hello.txt".into()));
+        assert_eq!(
+            calls[0],
+            ("PUT".into(), "/v1/AUTH_test/c/prefix_hello.txt".into())
+        );
 
         // Tampered signature → 401
         let body = multipart_body(

@@ -47,7 +47,6 @@ pub struct EtagQuoter {
     pub enable_by_default: bool,
 }
 
-
 impl Middleware for EtagQuoter {
     fn handle(&self, mut req: Request, next: &NextFn) -> Response {
         // Parse `/<version>/<account>/<container>/<object>`. A path that
@@ -249,8 +248,7 @@ mod tests {
         let eq = EtagQuoter {
             enable_by_default: true,
         };
-        let app: Arc<dyn Fn(Request) -> Response + Send + Sync> =
-            Arc::new(|_r| Response::new(204));
+        let app: Arc<dyn Fn(Request) -> Response + Send + Sync> = Arc::new(|_r| Response::new(204));
         let resp = eq.handle(req("/v1/a/c/o"), &app);
         assert!(resp.headers.get("Etag").is_none());
         assert_eq!(resp.status, 204);
@@ -346,7 +344,8 @@ mod tests {
     fn test_container_remove_header_clears_sysmeta() {
         let eq = EtagQuoter::default();
         let mut r = req("/v1/a/c");
-        r.headers.set("X-Remove-Container-Rfc-Compliant-Etags", "on");
+        r.headers
+            .set("X-Remove-Container-Rfc-Compliant-Etags", "on");
         let app = echo_app();
         let resp = eq.handle(r, &app);
         assert_eq!(

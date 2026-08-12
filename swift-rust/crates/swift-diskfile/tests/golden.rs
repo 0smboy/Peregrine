@@ -31,9 +31,8 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn expectations() -> Json {
-    let raw = std::fs::read(fixture("expectations.json")).expect(
-        "missing fixtures; run rust/crates/swift-diskfile/tests/fixtures/generate.py",
-    );
+    let raw = std::fs::read(fixture("expectations.json"))
+        .expect("missing fixtures; run rust/crates/swift-diskfile/tests/fixtures/generate.py");
     serde_json::from_slice(&raw).unwrap()
 }
 
@@ -84,14 +83,15 @@ fn test_metadata_pickles_match_python() {
         let expected_meta = meta_from_case(case);
 
         // decoding Python's pickle yields the logical dict, in order
-        let decoded = metadata_from_pickle(&blob)
-            .unwrap_or_else(|e| panic!("{desc}: decode failed: {e}"));
+        let decoded =
+            metadata_from_pickle(&blob).unwrap_or_else(|e| panic!("{desc}: decode failed: {e}"));
         assert_eq!(decoded, expected_meta, "{desc}: decoded metadata");
 
         // encoding is byte-identical with pickle.dumps(..., 2)
         let encoded = metadata_to_pickle(&expected_meta).unwrap();
         assert_eq!(
-            encoded, blob,
+            encoded,
+            blob,
             "{desc}: canonical pickle bytes (lens {} vs {})",
             encoded.len(),
             blob.len()
@@ -198,11 +198,7 @@ fn test_ondisk_selection_matches_python() {
             ("ts_file", opt_basename(&results.ts_file)),
             ("ctype_file", opt_basename(&results.ctype_file)),
         ] {
-            assert_eq!(
-                got,
-                want[key].as_str().map(str::to_string),
-                "{desc}: {key}"
-            );
+            assert_eq!(got, want[key].as_str().map(str::to_string), "{desc}: {key}");
         }
         assert_eq!(
             sorted_filenames(&results.obsolete),
@@ -424,14 +420,9 @@ fn test_partition_hashing_matches_python() {
         assert_eq!(case["desc"], "repl-basic");
         build_tree(&dev.join("objects"), &case["tree"]);
         let partition_path = dev.join("objects/1234");
-        let (hashed, hashes) = get_partition_hashes(
-            &partition_path,
-            PolicyKind::Replication,
-            &[],
-            false,
-            &cfg,
-        )
-        .unwrap();
+        let (hashed, hashes) =
+            get_partition_hashes(&partition_path, PolicyKind::Replication, &[], false, &cfg)
+                .unwrap();
         assert_partition_case("repl-basic", case, &partition_path, hashed, &hashes);
     }
     {
@@ -445,14 +436,9 @@ fn test_partition_hashing_matches_python() {
             }
             invalidate_hash(hd.parent().unwrap()).unwrap();
         }
-        let (hashed, hashes) = get_partition_hashes(
-            &partition_path,
-            PolicyKind::Replication,
-            &[],
-            false,
-            &cfg,
-        )
-        .unwrap();
+        let (hashed, hashes) =
+            get_partition_hashes(&partition_path, PolicyKind::Replication, &[], false, &cfg)
+                .unwrap();
         assert_partition_case(
             "repl-invalidate-rehash",
             case,
@@ -579,11 +565,7 @@ fn metadata_from_pairs(pairs: &Json) -> Metadata {
         .collect()
 }
 
-fn build_lifecycle_diskfile(
-    device: &Path,
-    case: &Json,
-    acco_key: &str,
-) -> DiskFile {
+fn build_lifecycle_diskfile(device: &Path, case: &Json, acco_key: &str) -> DiskFile {
     let (policy, policy_index) = scenario_policy(case);
     let acco = json_str_list(&case[acco_key]);
     let df = DiskFile::new(
@@ -655,12 +637,7 @@ fn assert_metadata_matches(desc: &str, field: &str, got: &Metadata, want: &Json)
     }
 }
 
-fn assert_open_result(
-    desc: &str,
-    df: &mut DiskFile,
-    current_time: f64,
-    want: &Json,
-) {
+fn assert_open_result(desc: &str, df: &mut DiskFile, current_time: f64, want: &Json) {
     match df.open(Some(current_time)) {
         Err(e) => {
             let got = match e {
@@ -691,7 +668,12 @@ fn assert_open_result(
                 "{desc}: expected error {:?}, opened fine",
                 want["error"]
             );
-            assert_metadata_matches(desc, "metadata", df.get_metadata().unwrap(), &want["metadata"]);
+            assert_metadata_matches(
+                desc,
+                "metadata",
+                df.get_metadata().unwrap(),
+                &want["metadata"],
+            );
             assert_metadata_matches(
                 desc,
                 "datafile_metadata",
@@ -760,7 +742,9 @@ fn test_diskfile_lifecycle_matches_python() {
             match op["op"].as_str().unwrap() {
                 "put" => {
                     let mut writer = df.create(".data").unwrap();
-                    writer.write(op["body"].as_str().unwrap().as_bytes()).unwrap();
+                    writer
+                        .write(op["body"].as_str().unwrap().as_bytes())
+                        .unwrap();
                     writer.put(metadata_from_pairs(&op["metadata"])).unwrap();
                     if op["commit"].as_bool() == Some(true) {
                         let ts: swift_core::Timestamp =
@@ -770,7 +754,8 @@ fn test_diskfile_lifecycle_matches_python() {
                     writer.close();
                 }
                 "post" => {
-                    df.write_metadata(&metadata_from_pairs(&op["metadata"])).unwrap();
+                    df.write_metadata(&metadata_from_pairs(&op["metadata"]))
+                        .unwrap();
                 }
                 "delete" => {
                     let ts: swift_core::Timestamp =
@@ -828,7 +813,12 @@ fn test_diskfile_lifecycle_matches_python() {
 
         if let Some(want) = case.get("open_before_expiry").filter(|v| !v.is_null()) {
             let mut opener = build_lifecycle_diskfile(&device, case, "acco");
-            assert_open_result(&format!("{desc}/before-expiry"), &mut opener, 999999999.0, want);
+            assert_open_result(
+                &format!("{desc}/before-expiry"),
+                &mut opener,
+                999999999.0,
+                want,
+            );
         }
         if let Some(want) = case.get("open_with_prefs").filter(|v| !v.is_null()) {
             let mut opener =
@@ -880,10 +870,16 @@ fn test_reader_verifies_etag_and_size() {
         format!("{:x}", Md5::digest(body))
     };
     let meta: Metadata = vec![
-        ("X-Timestamp".into(), MetaValue::Str("3286000000.00000".into())),
+        (
+            "X-Timestamp".into(),
+            MetaValue::Str("3286000000.00000".into()),
+        ),
         ("Content-Type".into(), "text/plain".into()),
         ("ETag".into(), MetaValue::Str(etag)),
-        ("Content-Length".into(), MetaValue::Str(body.len().to_string())),
+        (
+            "Content-Length".into(),
+            MetaValue::Str(body.len().to_string()),
+        ),
     ];
     let mut writer = df.create(".data").unwrap();
     writer.write(body).unwrap();
@@ -923,11 +919,7 @@ fn test_reader_verifies_etag_and_size() {
     df3.open(Some(3286000001.0)).unwrap();
     let data_file = df3.get_metadata().unwrap().len(); // force open state use
     let _ = data_file;
-    std::fs::write(
-        df3.datadir().join("3286000000.00000.data"),
-        b"corrupt body",
-    )
-    .unwrap();
+    std::fs::write(df3.datadir().join("3286000000.00000.data"), b"corrupt body").unwrap();
     let mut df4 = DiskFile::new(
         &device,
         7,
@@ -943,9 +935,6 @@ fn test_reader_verifies_etag_and_size() {
     df4.open(Some(3286000001.0)).unwrap();
     let mut reader = df4.reader().unwrap();
     reader.read_all().unwrap();
-    assert!(matches!(
-        reader.close(),
-        Err(DiskFileError::Quarantined(_))
-    ));
+    assert!(matches!(reader.close(), Err(DiskFileError::Quarantined(_))));
     std::fs::remove_dir_all(&device).unwrap();
 }

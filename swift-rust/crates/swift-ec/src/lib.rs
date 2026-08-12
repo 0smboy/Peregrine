@@ -176,9 +176,8 @@ impl EcDriver {
             priv_args2: ptr::null_mut(),
             ct: CHKSUM_NONE,
         };
-        let desc = unsafe {
-            liberasurecode_instance_create(EC_BACKEND_LIBERASURECODE_RS_VAND, &mut args)
-        };
+        let desc =
+            unsafe { liberasurecode_instance_create(EC_BACKEND_LIBERASURECODE_RS_VAND, &mut args) };
         if desc <= 0 {
             return Err(EcError::InstanceCreate(desc));
         }
@@ -245,8 +244,10 @@ impl EcDriver {
             return Err(EcError::NotEnoughFragments);
         }
         let frag_len = fragments[0].len() as u64;
-        let mut ptrs: Vec<*mut c_char> =
-            fragments.iter().map(|f| f.as_ptr() as *mut c_char).collect();
+        let mut ptrs: Vec<*mut c_char> = fragments
+            .iter()
+            .map(|f| f.as_ptr() as *mut c_char)
+            .collect();
         let mut out_data: *mut c_char = ptr::null_mut();
         let mut out_len: u64 = 0;
         let rc = unsafe {
@@ -282,8 +283,10 @@ impl EcDriver {
             return Err(EcError::NotEnoughFragments);
         }
         let frag_len = fragments[0].len();
-        let mut ptrs: Vec<*mut c_char> =
-            fragments.iter().map(|f| f.as_ptr() as *mut c_char).collect();
+        let mut ptrs: Vec<*mut c_char> = fragments
+            .iter()
+            .map(|f| f.as_ptr() as *mut c_char)
+            .collect();
         let mut out = vec![0u8; frag_len];
         let rc = unsafe {
             liberasurecode_reconstruct_fragment(
@@ -335,11 +338,7 @@ impl EcDriver {
     /// Swift's EC PUT stores, where node `j`'s archive is `j`'s fragment for
     /// every segment concatenated. The object is split into `segment_size`
     /// segments, each encoded into `k + m` fragments.
-    pub fn encode_object(
-        &self,
-        data: &[u8],
-        segment_size: usize,
-    ) -> Result<Vec<Vec<u8>>, EcError> {
+    pub fn encode_object(&self, data: &[u8], segment_size: usize) -> Result<Vec<Vec<u8>>, EcError> {
         let n = self.k + self.m;
         let mut archives: Vec<Vec<u8>> = vec![Vec::new(); n];
         // Zero-byte objects store zero-byte archives (Python parity:
@@ -474,17 +473,14 @@ mod tests {
         assert_eq!(recon, frags[2]);
 
         // fewer than k fragments cannot decode
-        assert_eq!(
-            d.decode(&frags[..1]),
-            Err(EcError::NotEnoughFragments)
-        );
+        assert_eq!(d.decode(&frags[..1]), Err(EcError::NotEnoughFragments));
     }
 
     #[test]
     fn test_encode_decode_object_multi_segment() {
         let d = EcDriver::new(4, 2).unwrap();
         let seg = 1000usize; // small segments to force several
-        // 3.5 segments so the last one is partial
+                             // 3.5 segments so the last one is partial
         let data: Vec<u8> = (0..3500u32).map(|i| (i * 13 % 256) as u8).collect();
         let archives = d.encode_object(&data, seg).unwrap();
         assert_eq!(archives.len(), 6); // k + m
@@ -519,9 +515,7 @@ mod tests {
                 .take(4) // any k peers
                 .map(|i| archives[i].clone())
                 .collect();
-            let rebuilt = d
-                .reconstruct_object(&peers, data.len(), seg, dest)
-                .unwrap();
+            let rebuilt = d.reconstruct_object(&peers, data.len(), seg, dest).unwrap();
             assert_eq!(rebuilt, archives[dest], "rebuilt archive {dest} matches");
         }
     }
@@ -529,7 +523,9 @@ mod tests {
     #[test]
     fn test_fragment_index_metadata() {
         let d = EcDriver::new(4, 2).unwrap();
-        let frags = d.encode(b"metadata index check padding padding padding").unwrap();
+        let frags = d
+            .encode(b"metadata index check padding padding padding")
+            .unwrap();
         for (i, f) in frags.iter().enumerate() {
             assert_eq!(EcDriver::fragment_index(f), Some(i as i32));
         }

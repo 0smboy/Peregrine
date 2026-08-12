@@ -476,10 +476,8 @@ mod tests {
         let sig = compute_signature_v2(SECRET, &sts);
         assert_eq!(sig, "bWq2s1WEIj+Ydj0vQ697zp+IXMU=");
         // Attach Authorization and verify end-to-end.
-        req.headers.set(
-            "Authorization",
-            format!("AWS {ACCESS}:{sig}"),
-        );
+        req.headers
+            .set("Authorization", format!("AWS {ACCESS}:{sig}"));
         assert!(verify_sigv2(ACCESS, SECRET, &req, None));
     }
 
@@ -508,8 +506,10 @@ mod tests {
     fn rejected_signature() {
         let mut req = aws_vector_req();
         req.path = "/johnsmith/photos/puppy.jpg".into();
-        req.headers
-            .set("Authorization", format!("AWS {ACCESS}:wrongsig============"));
+        req.headers.set(
+            "Authorization",
+            format!("AWS {ACCESS}:wrongsig============"),
+        );
         assert!(!verify_sigv2(ACCESS, SECRET, &req, None));
     }
 

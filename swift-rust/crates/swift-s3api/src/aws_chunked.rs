@@ -69,7 +69,10 @@ const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495
 pub enum AwsChunkedError {
     Incomplete,
     InvalidChunkHeader,
-    SizeMismatch { expected: u64, provided: u64 },
+    SizeMismatch {
+        expected: u64,
+        provided: u64,
+    },
     MissingDecodedContentLength,
     EcdsaNotImplemented,
     /// Per-chunk HMAC chain failed or chunk-signature missing in signed mode.
@@ -125,9 +128,7 @@ pub fn is_streaming_payload_hash(hash: &str) -> bool {
 
 /// True when the value is an ECDSA streaming mode we do not implement.
 pub fn is_ecdsa_streaming(hash: &str) -> bool {
-    ECDSA_STREAMING
-        .iter()
-        .any(|v| hash.eq_ignore_ascii_case(v))
+    ECDSA_STREAMING.iter().any(|v| hash.eq_ignore_ascii_case(v))
 }
 
 /// True when the request asks for aws-chunked / streaming payload framing.
@@ -560,7 +561,10 @@ mod tests {
         let decoded = decode_aws_chunked(&framed, Some(5), None).unwrap();
         assert_eq!(decoded.data, b"hello");
         assert_eq!(
-            decoded.trailers.get("x-amz-checksum-crc32").map(String::as_str),
+            decoded
+                .trailers
+                .get("x-amz-checksum-crc32")
+                .map(String::as_str),
             Some("AAAAAA==")
         );
     }
@@ -677,7 +681,10 @@ beefdeadbeefdeadbeefde\r\nabcdefghij\r\n0;chunk-signature=00\
         assert_eq!(decoded.chunk_signatures_valid, Some(true));
         assert_eq!(decoded.trailer_signature_valid, Some(true));
         assert_eq!(
-            decoded.trailers.get("x-amz-checksum-crc32").map(String::as_str),
+            decoded
+                .trailers
+                .get("x-amz-checksum-crc32")
+                .map(String::as_str),
             Some("AAAAAA==")
         );
         assert!(decoded.trailers.contains_key("x-amz-trailer-signature"));
@@ -686,12 +693,8 @@ beefdeadbeefdeadbeefde\r\nabcdefghij\r\n0;chunk-signature=00\
     #[test]
     fn dechunk_bad_trailer_signature_errors() {
         let payload = b"trailer-payload";
-        let (framed, ctx) = frame_signed_with_trailer(
-            payload,
-            &[("x-amz-checksum-crc32", "AAAAAA==")],
-            true,
-            true,
-        );
+        let (framed, ctx) =
+            frame_signed_with_trailer(payload, &[("x-amz-checksum-crc32", "AAAAAA==")], true, true);
         let err = decode_aws_chunked(&framed, Some(payload.len() as u64), Some(&ctx)).unwrap_err();
         assert_eq!(err, AwsChunkedError::InvalidTrailerSignature);
     }
@@ -728,7 +731,10 @@ beefdeadbeefdeadbeefde\r\nabcdefghij\r\n0;chunk-signature=00\
         assert_eq!(decoded.data, b"hello");
         assert_eq!(decoded.trailer_signature_valid, None);
         assert_eq!(
-            decoded.trailers.get("x-amz-checksum-crc32").map(String::as_str),
+            decoded
+                .trailers
+                .get("x-amz-checksum-crc32")
+                .map(String::as_str),
             Some("AAAAAA==")
         );
     }
@@ -738,10 +744,7 @@ beefdeadbeefdeadbeefde\r\nabcdefghij\r\n0;chunk-signature=00\
         // AWS docs: hash('x-amz-checksum-crc32c:sOO8/Q==\n') =
         // 1e376db7e1a34a8ef1c4bcee131a2d60a1cb62503747488624e10995f448d774
         let mut trailers = HashMap::new();
-        trailers.insert(
-            "x-amz-checksum-crc32c".into(),
-            "sOO8/Q==".into(),
-        );
+        trailers.insert("x-amz-checksum-crc32c".into(), "sOO8/Q==".into());
         let canon = canonical_trailer_bytes(&trailers);
         assert_eq!(canon, b"x-amz-checksum-crc32c:sOO8/Q==\n");
         assert_eq!(

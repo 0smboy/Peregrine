@@ -177,7 +177,8 @@ pub fn replicate_partition(
     stats: &mut ReplicatorStats,
 ) {
     let local = {
-        let _scan = swift_core::stage::StageTimer::start("object-replicator", "replication", "scan");
+        let _scan =
+            swift_core::stage::StageTimer::start("object-replicator", "replication", "scan");
         local_hashes(partition_path, policy, cleanup)
     };
     for peer in peers {
@@ -210,8 +211,11 @@ pub fn replicate_partition(
         }
         // Only ask the peer to rehash once the pushes it depends on succeeded.
         {
-            let _fin =
-                swift_core::stage::StageTimer::start("object-replicator", "replication", "finalize");
+            let _fin = swift_core::stage::StageTimer::start(
+                "object-replicator",
+                "replication",
+                "finalize",
+            );
             if ok && !hash_client.peer_rehash(peer, device, partition, &diff, policy_index) {
                 ok = false;
             }
@@ -337,8 +341,8 @@ pub fn run_once(
     } else {
         0.0
     };
-    if let Some(cutoff) = std::time::SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs_f64(reclaim_age))
+    if let Some(cutoff) =
+        std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs_f64(reclaim_age))
     {
         unlink_older_than(&device_dir.join(get_tmp_dir(policy_index)), cutoff);
     }
@@ -365,8 +369,11 @@ pub fn run_once(
         };
         let primaries: Vec<&RingDevice> = nodes.iter().map(|n| n.dev).collect();
         if primaries.iter().any(|d| d.id == local_id) {
-            let peers: Vec<&RingDevice> =
-                primaries.iter().copied().filter(|d| d.id != local_id).collect();
+            let peers: Vec<&RingDevice> = primaries
+                .iter()
+                .copied()
+                .filter(|d| d.id != local_id)
+                .collect();
             replicate_partition(
                 &path,
                 device,
@@ -452,7 +459,10 @@ mod tests {
             suffixes: &[String],
             _policy_index: u32,
         ) -> bool {
-            self.rehashed.lock().unwrap().push((peer.id, suffixes.to_vec()));
+            self.rehashed
+                .lock()
+                .unwrap()
+                .push((peer.id, suffixes.to_vec()));
             true
         }
     }
@@ -471,7 +481,10 @@ mod tests {
             suffix: &str,
             _policy_index: u32,
         ) -> bool {
-            self.synced.lock().unwrap().push((peer.id, suffix.to_string()));
+            self.synced
+                .lock()
+                .unwrap()
+                .push((peer.id, suffix.to_string()));
             self.fail_peer != Some(peer.id)
         }
     }
@@ -503,7 +516,10 @@ mod tests {
         )]);
         let body = pickle::dumps(&value).unwrap();
         let map = hashes_from_pickle(&body).unwrap();
-        assert_eq!(map.get("abc").map(String::as_str), Some("0123456789abcdef0123456789abcdef"));
+        assert_eq!(
+            map.get("abc").map(String::as_str),
+            Some("0123456789abcdef0123456789abcdef")
+        );
     }
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
@@ -521,7 +537,10 @@ mod tests {
         let part = root.join("sdb1/objects/0");
         std::fs::create_dir_all(&part).unwrap();
         let hc = FakeHashClient::default();
-        let sy = FakeSyncer { synced: Mutex::new(Vec::new()), fail_peer: None };
+        let sy = FakeSyncer {
+            synced: Mutex::new(Vec::new()),
+            fail_peer: None,
+        };
         let stats = run_once(
             &root.join("sdb1"),
             "sdb1",
@@ -535,7 +554,13 @@ mod tests {
         );
         assert_eq!(stats.partitions, 1);
         assert_eq!(stats.reverts, 0);
-        let queried: Vec<u64> = hc.hashed.lock().unwrap().iter().map(|(id, _)| *id).collect();
+        let queried: Vec<u64> = hc
+            .hashed
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
         assert_eq!(queried, vec![1, 2]); // both peer primaries, not self
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -549,7 +574,10 @@ mod tests {
         std::fs::create_dir_all(&suffix).unwrap();
         std::fs::write(suffix.join("1700000000.00000.data"), b"x").unwrap();
         let hc = FakeHashClient::default();
-        let sy = FakeSyncer { synced: Mutex::new(Vec::new()), fail_peer: None };
+        let sy = FakeSyncer {
+            synced: Mutex::new(Vec::new()),
+            fail_peer: None,
+        };
         let stats = run_once(
             &root.join("sdb9"),
             "sdb9",
@@ -563,7 +591,13 @@ mod tests {
         );
         assert_eq!(stats.reverts, 1);
         // synced the suffix to all 3 primaries
-        let peers: Vec<u64> = sy.synced.lock().unwrap().iter().map(|(id, _)| *id).collect();
+        let peers: Vec<u64> = sy
+            .synced
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
         assert_eq!(peers, vec![0, 1, 2]);
         // local partition removed after a full revert
         assert!(!part.exists());
@@ -617,7 +651,10 @@ mod tests {
         age_file(&old, 10_000);
 
         let hc = FakeHashClient::default();
-        let sy = FakeSyncer { synced: Mutex::new(Vec::new()), fail_peer: None };
+        let sy = FakeSyncer {
+            synced: Mutex::new(Vec::new()),
+            fail_peer: None,
+        };
         let cleanup = CleanupConfig {
             reclaim_age: 5_000.0,
             ..CleanupConfig::default()
@@ -646,7 +683,10 @@ mod tests {
         std::fs::create_dir_all(&suffix).unwrap();
         std::fs::write(suffix.join("1700000000.00000.data"), b"x").unwrap();
         let hc = FakeHashClient::default();
-        let sy = FakeSyncer { synced: Mutex::new(Vec::new()), fail_peer: Some(2) };
+        let sy = FakeSyncer {
+            synced: Mutex::new(Vec::new()),
+            fail_peer: Some(2),
+        };
         let stats = run_once(
             &root.join("sdb9"),
             "sdb9",

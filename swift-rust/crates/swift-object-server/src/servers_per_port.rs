@@ -441,7 +441,10 @@ mod tests {
         assert_eq!(e.worker_threads, 64);
         assert_eq!(e.connection_queue, 32);
         assert_eq!(e.acceptors, 1);
-        assert_eq!(e.formula, "workers * max_clients → worker_threads (cap 128)");
+        assert_eq!(
+            e.formula,
+            "workers * max_clients → worker_threads (cap 128)"
+        );
         assert!(e.notes.iter().any(|n| n.contains("NOT prefork")));
     }
 

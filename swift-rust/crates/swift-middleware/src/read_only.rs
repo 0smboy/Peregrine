@@ -58,7 +58,6 @@ pub struct ReadOnly {
     pub allow_deletes: bool,
 }
 
-
 impl ReadOnly {
     pub fn new(read_only: bool, allow_deletes: bool) -> Self {
         ReadOnly {
@@ -93,10 +92,7 @@ impl ReadOnly {
     /// is sourced from the request header (see the module deferral note)
     /// rather than a per-account `get_info` lookup.
     fn account_read_only(&self, req: &Request, _account: &str) -> bool {
-        let read_only = req
-            .headers
-            .get("X-Account-Sysmeta-Read-Only")
-            .unwrap_or("");
+        let read_only = req.headers.get("X-Account-Sysmeta-Read-Only").unwrap_or("");
         if read_only.is_empty() {
             return self.read_only;
         }
@@ -328,10 +324,7 @@ mod tests {
         // A malformed Destination-Account is rejected with 412 before any
         // read-only decision, regardless of the cluster setting.
         let ro = ReadOnly::new(false, false);
-        let resp = run(
-            &ro,
-            mk("COPY", "/v1/a", &[("Destination-Account", "b/c")]),
-        );
+        let resp = run(&ro, mk("COPY", "/v1/a", &[("Destination-Account", "b/c")]));
         assert_eq!(resp.status, 412);
         assert_eq!(
             String::from_utf8_lossy(body_bytes(&resp)),
@@ -339,10 +332,7 @@ mod tests {
         );
 
         // An empty Destination-Account is likewise a 412.
-        let resp = run(
-            &ro,
-            mk("COPY", "/v1/a", &[("Destination-Account", "")]),
-        );
+        let resp = run(&ro, mk("COPY", "/v1/a", &[("Destination-Account", "")]));
         assert_eq!(resp.status, 412);
         assert_eq!(
             String::from_utf8_lossy(body_bytes(&resp)),

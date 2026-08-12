@@ -28,27 +28,26 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub mod daemonutil;
-pub mod localdev;
-pub mod servers_per_port;
 pub mod expirer;
-pub mod replicator;
-pub mod ssync;
-pub mod ssync_sender;
+pub mod localdev;
 /// The EC object reconstructor: ssync-driven SYNC/REVERT partition jobs
 /// (feature-independent) plus the fragment rebuild path, which links
 /// liberasurecode and is behind the `ec` feature.
 pub mod reconstructor;
+pub mod replicator;
+pub mod servers_per_port;
+pub mod ssync;
+pub mod ssync_sender;
 pub mod updater;
 pub use expirer::{
     build_task_obj, get_expirer_container, iter_due_tasks, parse_task_obj, process_task,
-    recon_update as expirer_recon_update, run_once as expirer_run_once, DeleteResult,
-    ExpirerStats, ExpiryClient, HttpExpiryClient, TaskInfo, ASYNC_DELETE_TYPE,
-    EXPIRER_ACCOUNT_NAME, EXPIRER_CONTAINER_DIVISOR,
+    recon_update as expirer_recon_update, run_once as expirer_run_once, DeleteResult, ExpirerStats,
+    ExpiryClient, HttpExpiryClient, TaskInfo, ASYNC_DELETE_TYPE, EXPIRER_ACCOUNT_NAME,
+    EXPIRER_CONTAINER_DIVISOR,
 };
 pub use updater::{
     iter_async_pendings, process_update, run_once, run_once_with_concurrency, AsyncUpdate,
-    ContainerNodeClient,
-    HttpContainerClient, NodeResult, UpdateOutcome, UpdaterStats,
+    ContainerNodeClient, HttpContainerClient, NodeResult, UpdateOutcome, UpdaterStats,
 };
 
 use swift_core::config::{config_true_value, FallocateReserve};
@@ -57,8 +56,8 @@ use swift_core::pickle::{self, Value as PickleValue};
 use swift_core::timestamp::{normalize_delete_at_timestamp, Timestamp};
 use swift_diskfile::{
     get_data_dir, get_partition_hashes, invalidate_hash, make_ec_ondisk_filename,
-    storage_directory, valid_suffix, DiskFile, DiskFileConfig, DiskFileError, MetaValue,
-    Metadata, PolicyKind,
+    storage_directory, valid_suffix, DiskFile, DiskFileConfig, DiskFileError, MetaValue, Metadata,
+    PolicyKind,
 };
 use swift_http::{
     http_date, split_path, unquote, Body, ChainReader, HeaderKeyDict, MimeDocs, Range, Request,
@@ -757,7 +756,8 @@ impl ObjectServer {
     fn put(&self, req: &mut Request) -> Response {
         let _meta_stage =
             swift_core::stage::StageTimer::start("object-server", "put", "metadata_parse");
-        let (drive, part, account, container, obj, policy_index, policy) = match self.obj_path(req) {
+        let (drive, part, account, container, obj, policy_index, policy) = match self.obj_path(req)
+        {
             Ok(v) => v,
             Err(resp) => return resp,
         };
@@ -839,7 +839,14 @@ impl ObjectServer {
             .get("X-Backend-Ssync-Frag-Index")
             .and_then(|raw| raw.trim().parse().ok());
         let (orig_exists, orig_timestamp) = match self
-            .diskfile_for(&drive, part, &account, &container, &obj, (policy_index, policy))
+            .diskfile_for(
+                &drive,
+                part,
+                &account,
+                &container,
+                &obj,
+                (policy_index, policy),
+            )
             .map(|df| df.with_frag_index(ssync_frag_index))
         {
             Ok(mut pre) => match pre.open(None) {
@@ -891,7 +898,14 @@ impl ObjectServer {
             }
         }
 
-        let df = match self.diskfile_for(&drive, part, &account, &container, &obj, (policy_index, policy)) {
+        let df = match self.diskfile_for(
+            &drive,
+            part,
+            &account,
+            &container,
+            &obj,
+            (policy_index, policy),
+        ) {
             Ok(df) => df,
             Err(e) => return plain_response(500, &e.to_string()),
         };
@@ -1014,7 +1028,10 @@ impl ObjectServer {
             return swob_response(422);
         }
         let mut metadata: Metadata = vec![
-            ("X-Timestamp".into(), MetaValue::Str(req_timestamp.internal())),
+            (
+                "X-Timestamp".into(),
+                MetaValue::Str(req_timestamp.internal()),
+            ),
             ("Content-Type".into(), MetaValue::Str(content_type.clone())),
             (
                 "Content-Length".into(),
@@ -1135,14 +1152,29 @@ impl ObjectServer {
         update.set("x-timestamp", req_timestamp.internal());
         update.set("x-etag", &etag);
         apply_container_override(&mut update, &req.headers, &footers);
-        self.container_update("PUT", &drive, &account, &container, &obj, req, &update, policy_index);
+        self.container_update(
+            "PUT",
+            &drive,
+            &account,
+            &container,
+            &obj,
+            req,
+            &update,
+            policy_index,
+        );
         // enqueue expiry if the object has an X-Delete-At
         if let Some(delete_at) = resolved_delete_at
             .as_deref()
             .and_then(|v| v.parse::<i64>().ok())
         {
             self.delete_at_update(
-                delete_at, &drive, &account, &container, &obj, req, policy_index,
+                delete_at,
+                &drive,
+                &account,
+                &container,
+                &obj,
+                req,
+                policy_index,
             );
         }
 
@@ -1152,7 +1184,8 @@ impl ObjectServer {
     }
 
     fn post(&self, req: &Request) -> Response {
-        let (drive, part, account, container, obj, policy_index, policy) = match self.obj_path(req) {
+        let (drive, part, account, container, obj, policy_index, policy) = match self.obj_path(req)
+        {
             Ok(v) => v,
             Err(resp) => return resp,
         };
@@ -1173,8 +1206,14 @@ impl ObjectServer {
                 }
             }
         }
-        let mut df = match self.diskfile_for(&drive, part, &account, &container, &obj, (policy_index, policy))
-        {
+        let mut df = match self.diskfile_for(
+            &drive,
+            part,
+            &account,
+            &container,
+            &obj,
+            (policy_index, policy),
+        ) {
             Ok(df) => df,
             Err(e) => return plain_response(500, &e.to_string()),
         };
@@ -1207,21 +1246,22 @@ impl ObjectServer {
         // Content-Type gets Timestamp zero so it can never displace the
         // on-disk content-type. (Python truthiness: an empty Content-Type
         // counts as absent.)
-        let req_ctype_timestamp: Timestamp =
-            if req.headers.get("Content-Type").is_some_and(|c| !c.is_empty()) {
-                match req.headers.get("Content-Type-Timestamp") {
-                    Some(raw) => match raw.parse() {
-                        Ok(t) => t,
-                        // Python's Timestamp() raises out of the handler: 500.
-                        Err(_) => {
-                            return plain_response(500, "invalid Content-Type-Timestamp")
-                        }
-                    },
-                    None => req_timestamp,
-                }
-            } else {
-                "0".parse().unwrap()
-            };
+        let req_ctype_timestamp: Timestamp = if req
+            .headers
+            .get("Content-Type")
+            .is_some_and(|c| !c.is_empty())
+        {
+            match req.headers.get("Content-Type-Timestamp") {
+                Some(raw) => match raw.parse() {
+                    Ok(t) => t,
+                    // Python's Timestamp() raises out of the handler: 500.
+                    Err(_) => return plain_response(500, "invalid Content-Type-Timestamp"),
+                },
+                None => req_timestamp,
+            }
+        } else {
+            "0".parse().unwrap()
+        };
         // server.py 703-707: conflict only when BOTH the metadata timestamp
         // and the content-type timestamp are older-or-equal; a POST that lost
         // the metadata race may still deliver a newer content-type.
@@ -1248,12 +1288,7 @@ impl ObjectServer {
             .unwrap_or_else(|_| "0".parse().unwrap());
         // the merged current content-type (from the newest .meta carrying one,
         // else the datafile)
-        let orig_content_type = orig
-            .content_type()
-            .ok()
-            .flatten()
-            .unwrap_or("")
-            .to_string();
+        let orig_content_type = orig.content_type().ok().flatten().unwrap_or("").to_string();
         // the datafile's own content-type, for the swift_bytes carry-over on
         // the container update below
         let datafile_content_type = orig
@@ -1326,7 +1361,9 @@ impl ObjectServer {
             };
         // server.py 775-776: x-meta-timestamp is metadata['X-Timestamp'] — the
         // PRESERVED original .meta timestamp when this POST lost the meta race.
-        let meta_timestamp = meta_get(&metadata, "X-Timestamp").unwrap_or("0").to_string();
+        let meta_timestamp = meta_get(&metadata, "X-Timestamp")
+            .unwrap_or("0")
+            .to_string();
 
         // The .meta filename encodes (metadata timestamp, content-type
         // timestamp): write_metadata → finalize_put → make_ondisk_filename
@@ -1366,19 +1403,30 @@ impl ObjectServer {
         );
         update.set("x-meta-timestamp", &meta_timestamp);
         update.set("x-etag", &etag);
-        self.container_update("PUT", &drive, &account, &container, &obj, req, &update, policy_index);
+        self.container_update(
+            "PUT",
+            &drive,
+            &account,
+            &container,
+            &obj,
+            req,
+            &update,
+            policy_index,
+        );
 
         // swob HTTPAccepted default body
         let mut resp = Response::with_body(
             202,
-            b"<html><h1>Accepted</h1><p>The request is accepted for processing.</p></html>".to_vec(),
+            b"<html><h1>Accepted</h1><p>The request is accepted for processing.</p></html>"
+                .to_vec(),
         );
         resp.headers.set("Content-Type", "text/html; charset=UTF-8");
         resp
     }
 
     fn delete(&self, req: &Request) -> Response {
-        let (drive, part, account, container, obj, policy_index, policy) = match self.obj_path(req) {
+        let (drive, part, account, container, obj, policy_index, policy) = match self.obj_path(req)
+        {
             Ok(v) => v,
             Err(resp) => return resp,
         };
@@ -1399,8 +1447,14 @@ impl ObjectServer {
                 Err(_) => return plain_response(400, "Bad X-If-Delete-At header value"),
             },
         };
-        let mut df = match self.diskfile_for(&drive, part, &account, &container, &obj, (policy_index, policy))
-        {
+        let mut df = match self.diskfile_for(
+            &drive,
+            part,
+            &account,
+            &container,
+            &obj,
+            (policy_index, policy),
+        ) {
             Ok(df) => df,
             Err(e) => return plain_response(500, &e.to_string()),
         };
@@ -1413,9 +1467,7 @@ impl ObjectServer {
         // though a fresh tombstone is still written when we win.
         let (orig_timestamp, was_live, orig_delete_at) = match df.open(None) {
             Ok(_) => {
-                let ts = df
-                    .data_timestamp()
-                    .unwrap_or_else(|_| "0".parse().unwrap());
+                let ts = df.data_timestamp().unwrap_or_else(|_| "0".parse().unwrap());
                 let delete_at = df
                     .get_metadata()
                     .ok()
@@ -1476,14 +1528,18 @@ impl ObjectServer {
         if let Some(req_if) = if_delete_at {
             if !was_live {
                 let mut resp = swob_response(404);
-                resp.headers
-                    .set("X-Backend-Timestamp", orig_timestamp.max(req_timestamp).internal());
+                resp.headers.set(
+                    "X-Backend-Timestamp",
+                    orig_timestamp.max(req_timestamp).internal(),
+                );
                 return resp;
             }
             if orig_timestamp >= req_timestamp {
                 let mut resp = swob_response(409);
-                resp.headers
-                    .set("X-Backend-Timestamp", orig_timestamp.max(req_timestamp).internal());
+                resp.headers.set(
+                    "X-Backend-Timestamp",
+                    orig_timestamp.max(req_timestamp).internal(),
+                );
                 return resp;
             }
             if orig_delete_at != req_if {
@@ -1499,11 +1555,17 @@ impl ObjectServer {
             409
         };
         if orig_timestamp < req_timestamp {
-            let fresh =
-                match self.diskfile_for(&drive, part, &account, &container, &obj, (policy_index, policy)) {
-                    Ok(df) => df,
-                    Err(e) => return plain_response(500, &e.to_string()),
-                };
+            let fresh = match self.diskfile_for(
+                &drive,
+                part,
+                &account,
+                &container,
+                &obj,
+                (policy_index, policy),
+            ) {
+                Ok(df) => df,
+                Err(e) => return plain_response(500, &e.to_string()),
+            };
             if let Err(e) = fresh.delete(&req_timestamp) {
                 return match e {
                     DiskFileError::NoSpace => swob_response(507),
@@ -1513,7 +1575,14 @@ impl ObjectServer {
             let mut update = HeaderKeyDict::new();
             update.set("x-timestamp", req_timestamp.internal());
             self.container_update(
-                "DELETE", &drive, &account, &container, &obj, req, &update, policy_index,
+                "DELETE",
+                &drive,
+                &account,
+                &container,
+                &obj,
+                req,
+                &update,
+                policy_index,
             );
         }
         let mut resp = match response_class {
@@ -1527,15 +1596,22 @@ impl ObjectServer {
     }
 
     fn get(&self, req: &Request, include_body: bool) -> Response {
-        let (drive, part, account, container, obj, policy_index, policy) = match self.obj_path(req) {
+        let (drive, part, account, container, obj, policy_index, policy) = match self.obj_path(req)
+        {
             Ok(v) => v,
             Err(resp) => return resp,
         };
         if let Err(resp) = self.check_drive(&drive) {
             return resp;
         }
-        let mut df = match self.diskfile_for(&drive, part, &account, &container, &obj, (policy_index, policy))
-        {
+        let mut df = match self.diskfile_for(
+            &drive,
+            part,
+            &account,
+            &container,
+            &obj,
+            (policy_index, policy),
+        ) {
             Ok(df) => df,
             Err(e) => return plain_response(500, &e.to_string()),
         };
@@ -1551,7 +1627,8 @@ impl ObjectServer {
             Ok(df) => df,
             Err(DiskFileError::Deleted { timestamp, .. }) => {
                 let mut resp = swob_response(404);
-                resp.headers.set("X-Backend-Timestamp", timestamp.internal());
+                resp.headers
+                    .set("X-Backend-Timestamp", timestamp.internal());
                 return resp;
             }
             // An object past its X-Delete-At reads as expired: Python treats
@@ -1657,7 +1734,9 @@ impl ObjectServer {
                 (
                     206,
                     body,
-                    Some(swift_http::content_range_header_value(start, stop, obj_size)),
+                    Some(swift_http::content_range_header_value(
+                        start, stop, obj_size,
+                    )),
                 )
             }
             // multiple ranges -> a multipart/byteranges 206 body
@@ -1690,9 +1769,7 @@ impl ObjectServer {
                 let terminator = format!("--{boundary}--");
                 let total: u64 = ranges
                     .iter()
-                    .map(|&(start, stop)| {
-                        part_head(start, stop).len() as u64 + (stop - start) + 2
-                    })
+                    .map(|&(start, stop)| part_head(start, stop).len() as u64 + (stop - start) + 2)
                     .sum::<u64>()
                     + terminator.len() as u64;
                 let body = if include_body {
@@ -1886,8 +1963,10 @@ impl ObjectServer {
             return;
         }
         let task_account = crate::expirer::EXPIRER_ACCOUNT_NAME;
-        let task_container =
-            crate::expirer::get_expirer_container(delete_at, crate::expirer::EXPIRER_CONTAINER_DIVISOR);
+        let task_container = crate::expirer::get_expirer_container(
+            delete_at,
+            crate::expirer::EXPIRER_CONTAINER_DIVISOR,
+        );
         let task_obj = crate::expirer::build_task_obj(delete_at, account, container, obj);
 
         // the expiry queue entry: an empty object marking the deletion
@@ -1895,10 +1974,7 @@ impl ObjectServer {
         update.set("x-size", "0");
         update.set("x-content-type", "text/plain"); // X_DELETE_TYPE
         update.set("x-etag", "d41d8cd98f00b204e9800998ecf8427e"); // md5("")
-        update.set(
-            "x-timestamp",
-            req.headers.get("X-Timestamp").unwrap_or("0"),
-        );
+        update.set("x-timestamp", req.headers.get("X-Timestamp").unwrap_or("0"));
 
         let hosts: Vec<&str> = req
             .headers
@@ -1992,7 +2068,11 @@ impl ObjectServer {
             }
         };
         // Python normalizes the filename timestamp: Timestamp(timestamp).internal
-        let timestamp = match update.get("x-timestamp").unwrap_or("0").parse::<Timestamp>() {
+        let timestamp = match update
+            .get("x-timestamp")
+            .unwrap_or("0")
+            .parse::<Timestamp>()
+        {
             Ok(t) => t.internal(),
             Err(_) => {
                 eprintln!(
@@ -2013,7 +2093,10 @@ impl ObjectServer {
         ));
         let data = Value::Dict(vec![
             (Value::Str("op".into()), Value::Str(op.to_string())),
-            (Value::Str("account".into()), Value::Str(account.to_string())),
+            (
+                Value::Str("account".into()),
+                Value::Str(account.to_string()),
+            ),
             (
                 Value::Str("container".into()),
                 Value::Str(container.to_string()),
@@ -2153,9 +2236,7 @@ fn fanout_container_http(
                 )
             }));
         }
-        handles
-            .into_iter()
-            .all(|h| h.join().unwrap_or(false))
+        handles.into_iter().all(|h| h.join().unwrap_or(false))
     })
 }
 
@@ -2234,7 +2315,10 @@ fn encode_wanted(remote: &MissingOffer, local: &LocalSsyncTimestamps) -> Option<
             if remote.ts_data > local_data {
                 want_data = true;
             }
-            if local.meta.is_some_and(|local_meta| remote.ts_meta > local_meta) {
+            if local
+                .meta
+                .is_some_and(|local_meta| remote.ts_meta > local_meta)
+            {
                 want_meta = true;
             }
             if local.ctype.is_some_and(|local_ctype| {
@@ -2343,15 +2427,12 @@ impl SsyncSession<'_> {
                         }
                         if failures >= REPLICATION_FAILURE_THRESHOLD
                             && (successes == 0
-                                || failures as f64 / successes as f64
-                                    > REPLICATION_FAILURE_RATIO)
+                                || failures as f64 / successes as f64 > REPLICATION_FAILURE_RATIO)
                         {
                             return self.in_band_error(
                                 wire,
                                 0,
-                                &format!(
-                                    "Too many {failures} failures to {successes} successes"
-                                ),
+                                &format!("Too many {failures} failures to {successes} successes"),
                             );
                         }
                     }
@@ -2380,10 +2461,12 @@ impl SsyncSession<'_> {
         if failures != 0 {
             // Python raises HTTPInternalServerError; __call__ formats the
             // response's *byte* body with %r, hence the b'...' repr.
-            let body = format!(
-                "ERROR: With :UPDATES: {failures} failures to {successes} successes"
-            );
-            write_chunk(wire, format!(":ERROR: 500 b{}\n", python_repr(&body)).as_bytes())?;
+            let body =
+                format!("ERROR: With :UPDATES: {failures} failures to {successes} successes");
+            write_chunk(
+                wire,
+                format!(":ERROR: 500 b{}\n", python_repr(&body)).as_bytes(),
+            )?;
             write_chunk(wire, b"")?;
             return Ok(());
         }
@@ -2651,7 +2734,10 @@ mod fast_post_helper_tests {
 
     #[test]
     fn test_extract_swift_bytes() {
-        assert_eq!(extract_swift_bytes("text/plain"), ("text/plain".into(), None));
+        assert_eq!(
+            extract_swift_bytes("text/plain"),
+            ("text/plain".into(), None)
+        );
         assert_eq!(
             extract_swift_bytes("text/plain;swift_bytes=123"),
             ("text/plain".into(), Some("123".into()))
@@ -2690,15 +2776,26 @@ mod fallocate_reserve_tests {
             "free-after-write equal to the reserve fails (Python: free <= reserve)"
         );
         assert!(fallocate_reserve_breached(120, 50, &reserve));
-        assert!(fallocate_reserve_breached(10, 50, &reserve), "write larger than free");
+        assert!(
+            fallocate_reserve_breached(10, 50, &reserve),
+            "write larger than free"
+        );
         assert!(!fallocate_reserve_breached(151, 50, &reserve));
         assert!(
             !fallocate_reserve_breached(0, 0, &reserve),
             "zero-length writes skip the check"
         );
-        assert!(!fallocate_reserve_breached(0, 10, &FallocateReserve::Bytes(0)));
+        assert!(!fallocate_reserve_breached(
+            0,
+            10,
+            &FallocateReserve::Bytes(0)
+        ));
         // percent mode needs the device's total capacity; not enforced yet
-        assert!(!fallocate_reserve_breached(1, 1, &FallocateReserve::Percent(99.0)));
+        assert!(!fallocate_reserve_breached(
+            1,
+            1,
+            &FallocateReserve::Percent(99.0)
+        ));
     }
 
     fn tiny_server(devices: &Path, reserve: FallocateReserve) -> ObjectServer {

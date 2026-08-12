@@ -106,10 +106,7 @@ pub fn ips_for_ring_lookup(ring_ip: &str) -> std::collections::BTreeSet<String> 
             }
         }
     }
-    local_addrs()
-        .into_iter()
-        .map(|a| a.to_string())
-        .collect()
+    local_addrs().into_iter().map(|a| a.to_string()).collect()
 }
 
 /// The id of the ring device this host serves at `(bind_port, dev_name)`.
@@ -145,12 +142,7 @@ pub fn ring_device_id(ring: &Ring, bind_port: u32, dev_name: &str) -> Option<u64
 
     candidates
         .iter()
-        .find(|d| {
-            is_local_addr(&d.ip)
-                || d.replication_ip
-                    .as_deref()
-                    .is_some_and(is_local_addr)
-        })
+        .find(|d| is_local_addr(&d.ip) || d.replication_ip.as_deref().is_some_and(is_local_addr))
         .map(|d| d.id)
 }
 
@@ -167,10 +159,7 @@ pub fn ring_device_id_local_name(ring: &Ring, dev_name: &str) -> Option<u64> {
         .flatten()
         .filter(|d| {
             d.device == dev_name
-                && (is_local_addr(&d.ip)
-                    || d.replication_ip
-                        .as_deref()
-                        .is_some_and(is_local_addr))
+                && (is_local_addr(&d.ip) || d.replication_ip.as_deref().is_some_and(is_local_addr))
         })
         .collect();
     if local.is_empty() {
@@ -206,7 +195,10 @@ mod tests {
         let addrs = local_addrs();
         assert!(!addrs.is_empty(), "a host always has at least a loopback");
         for addr in addrs {
-            assert!(is_local_addr(&addr.to_string()), "{addr} is on an interface");
+            assert!(
+                is_local_addr(&addr.to_string()),
+                "{addr} is on an interface"
+            );
         }
     }
 

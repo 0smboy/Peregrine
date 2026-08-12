@@ -502,9 +502,14 @@ impl RateLimit {
             .and_then(|s| s.trim().parse::<i64>().ok())
             .unwrap_or(0);
 
-        for (key, max_rate) in
-            self.ratelimitable_key_tuples(&req.method, account, container, obj, container_size, global)
-        {
+        for (key, max_rate) in self.ratelimitable_key_tuples(
+            &req.method,
+            account,
+            container,
+            obj,
+            container_size,
+            global,
+        ) {
             match self.get_sleep_time(&key, max_rate) {
                 Ok(need_to_sleep) => {
                     if need_to_sleep > 0.0 {
@@ -680,8 +685,10 @@ mod tests {
         let clock = Arc::new(ManualClock::new(0.0));
         let mut rl = RateLimit::new(Box::new(clock));
         rl.account_ratelimit = 13.0;
-        rl.container_ratelimits =
-            interpret_conf_limits(&conf(&[("container_ratelimit_3", "200")]), "container_ratelimit_");
+        rl.container_ratelimits = interpret_conf_limits(
+            &conf(&[("container_ratelimit_3", "200")]),
+            "container_ratelimit_",
+        );
         let size = 5;
 
         let tup = |m, a, c, o, g| rl.ratelimitable_key_tuples(m, a, c, o, size, g);
@@ -722,8 +729,10 @@ mod tests {
         // object write to an empty container is not size-limited.
         let clock = Arc::new(ManualClock::new(0.0));
         let mut rl = RateLimit::new(Box::new(clock));
-        rl.container_ratelimits =
-            interpret_conf_limits(&conf(&[("container_ratelimit_0", "2")]), "container_ratelimit_");
+        rl.container_ratelimits = interpret_conf_limits(
+            &conf(&[("container_ratelimit_0", "2")]),
+            "container_ratelimit_",
+        );
         assert_eq!(
             rl.ratelimitable_key_tuples("PUT", Some("a"), Some("c"), Some("o"), 0, None)
                 .len(),
@@ -780,8 +789,10 @@ mod tests {
         let clock = Arc::new(ManualClock::new(0.0));
         let mut rl = double_rate_rl(clock.clone());
         rl.account_ratelimit = 0.0;
-        rl.container_ratelimits =
-            interpret_conf_limits(&conf(&[("container_ratelimit_0", "2")]), "container_ratelimit_");
+        rl.container_ratelimits = interpret_conf_limits(
+            &conf(&[("container_ratelimit_0", "2")]),
+            "container_ratelimit_",
+        );
         let req = || mk("PUT", "/v1/a/c/o", &[(CONTAINER_COUNT_HEADER, "1")]);
 
         clock.set(0.0);
@@ -954,7 +965,10 @@ mod tests {
         assert_eq!(rl.clock_accuracy, 100);
         assert_eq!(rl.rate_buffer_seconds, 7);
         // CSV trims whitespace and drops empty entries.
-        assert_eq!(rl.ratelimit_whitelist, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            rl.ratelimit_whitelist,
+            vec!["a".to_string(), "b".to_string()]
+        );
         assert_eq!(rl.ratelimit_blacklist, vec!["c".to_string()]);
         assert_eq!(rl.container_ratelimits.len(), 1);
         assert_eq!(rl.container_ratelimits[0].size, 10);

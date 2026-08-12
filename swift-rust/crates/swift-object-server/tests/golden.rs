@@ -20,7 +20,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use serde_json::Value as Json;
-use swift_object_server::{ContainerUpdateMode, serve, ObjectServerConfig};
+use swift_object_server::{serve, ContainerUpdateMode, ObjectServerConfig};
 
 fn expectations() -> Json {
     let raw = std::fs::read(
@@ -88,10 +88,7 @@ fn object_config(devices: &std::path::Path, hash_suffix: &str) -> ObjectServerCo
         )
         .unwrap(),
         diskfile: swift_diskfile::DiskFileConfig::default(),
-        policies: std::collections::HashMap::from([(
-            0,
-            swift_diskfile::PolicyKind::Replication,
-        )]),
+        policies: std::collections::HashMap::from([(0, swift_diskfile::PolicyKind::Replication)]),
         container_update_timeout: std::time::Duration::from_secs(1),
         container_update_mode: ContainerUpdateMode::Sync,
     }
@@ -176,9 +173,8 @@ fn test_object_put_updates_container_server() {
     let tmp = std::env::temp_dir().join(format!("swift-o2c-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(tmp.join("sda1")).unwrap();
-    let hash_cfg = || {
-        swift_core::hashing::HashPathConfig::new(b"".to_vec(), b"changeme".to_vec()).unwrap()
-    };
+    let hash_cfg =
+        || swift_core::hashing::HashPathConfig::new(b"".to_vec(), b"changeme".to_vec()).unwrap();
 
     // container server
     let cont_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

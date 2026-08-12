@@ -25,10 +25,7 @@ use swift_container_server::{serve, ContainerServerConfig};
 use swift_db::{ContainerBroker, DbValue};
 
 fn tmpdir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "swift-cont-golden-{name}-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("swift-cont-golden-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("sda1")).unwrap();
     dir
@@ -123,10 +120,7 @@ fn container_config(devices: &std::path::Path, hash_suffix: &str) -> ContainerSe
 #[test]
 fn test_container_server_matches_python_oracle() {
     let exp = expectations();
-    let tmp = std::env::temp_dir().join(format!(
-        "swift-container-golden-{}",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("swift-container-golden-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(tmp.join("sda1")).unwrap();
 
@@ -190,9 +184,8 @@ fn test_container_put_updates_account_server() {
     let tmp = std::env::temp_dir().join(format!("swift-c2a-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(tmp.join("sda1")).unwrap();
-    let hash_cfg = || {
-        swift_core::hashing::HashPathConfig::new(b"".to_vec(), b"changeme".to_vec()).unwrap()
-    };
+    let hash_cfg =
+        || swift_core::hashing::HashPathConfig::new(b"".to_vec(), b"changeme".to_vec()).unwrap();
 
     // account server
     let acct_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -277,8 +270,13 @@ fn test_replicate_rpc_matches_python() {
         .join(hsh)
         .join(format!("{hsh}.db"));
     let mut init = ContainerBroker::new(&db_path, account, container);
-    init.initialize("1751500000.00000", 0, "1751500000.00000", "fixed-db-id-0001")
-        .unwrap();
+    init.initialize(
+        "1751500000.00000",
+        0,
+        "1751500000.00000",
+        "fixed-db-id-0001",
+    )
+    .unwrap();
     init.get_info().unwrap();
 
     let config = container_config(&tmp, root["hash_suffix"].as_str().unwrap());
@@ -290,8 +288,14 @@ fn test_replicate_rpc_matches_python() {
     let rpc_path = format!("/sda1/{partition}/{hsh}");
 
     let body = serde_json::to_string(&exp["merge_items"]["op"]).unwrap();
-    let (status, _, _) =
-        http_request(addr, "REPLICATE", &rpc_path, "", &serde_json::json!({}), &body);
+    let (status, _, _) = http_request(
+        addr,
+        "REPLICATE",
+        &rpc_path,
+        "",
+        &serde_json::json!({}),
+        &body,
+    );
     assert_eq!(
         status,
         exp["merge_items"]["status"].as_u64().unwrap() as u16,
@@ -343,10 +347,30 @@ fn test_usync_push_replication_between_two_servers() {
         .initialize("1751500000.00000", 0, "1751500000.00000", "src-db-id")
         .unwrap();
     local
-        .put_object("obj-a", "1751500002.00000", 5, "text/a", "ea", 0, 0, None, None)
+        .put_object(
+            "obj-a",
+            "1751500002.00000",
+            5,
+            "text/a",
+            "ea",
+            0,
+            0,
+            None,
+            None,
+        )
         .unwrap();
     local
-        .put_object("obj-b", "1751500003.00000", 7, "text/b", "eb", 0, 0, None, None)
+        .put_object(
+            "obj-b",
+            "1751500003.00000",
+            7,
+            "text/b",
+            "eb",
+            0,
+            0,
+            None,
+            None,
+        )
         .unwrap();
     local.get_info().unwrap();
 
@@ -404,7 +428,11 @@ fn test_usync_push_replication_between_two_servers() {
             _ => String::new(),
         })
         .collect();
-    assert_eq!(names, vec!["obj-a".to_string(), "obj-b".to_string()], "replicated names");
+    assert_eq!(
+        names,
+        vec!["obj-a".to_string(), "obj-b".to_string()],
+        "replicated names"
+    );
     // and the source sync point was recorded
     assert_eq!(remote2.get_sync("src-db-id", true).unwrap(), 2);
     std::fs::remove_dir_all(&tmp).unwrap();

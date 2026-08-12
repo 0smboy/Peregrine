@@ -42,12 +42,7 @@ impl std::fmt::Display for LockTimeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.io {
             Some(e) => write!(f, "{} lock error: {e}", self.lockpath.display()),
-            None => write!(
-                f,
-                "{} seconds: {}",
-                self.timeout,
-                self.lockpath.display()
-            ),
+            None => write!(f, "{} seconds: {}", self.timeout, self.lockpath.display()),
         }
     }
 }

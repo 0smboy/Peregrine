@@ -121,9 +121,7 @@ impl Constraints {
         let get_int = |name: &str, target: &mut i64| -> Result<(), ConfigError> {
             if let Some(v) = config.get("swift-constraints", name)? {
                 *target = v.trim().parse().map_err(|_| {
-                    ConfigError(format!(
-                        "invalid literal for int() with base 10: {v:?}"
-                    ))
+                    ConfigError(format!("invalid literal for int() with base 10: {v:?}"))
                 })?;
             }
             Ok(())
@@ -139,7 +137,10 @@ impl Constraints {
         get_int("container_listing_limit", &mut c.container_listing_limit)?;
         get_int("account_listing_limit", &mut c.account_listing_limit)?;
         get_int("max_account_name_length", &mut c.max_account_name_length)?;
-        get_int("max_container_name_length", &mut c.max_container_name_length)?;
+        get_int(
+            "max_container_name_length",
+            &mut c.max_container_name_length,
+        )?;
         get_int("extra_header_count", &mut c.extra_header_count)?;
         if let Some(v) = config.get("swift-constraints", "valid_api_versions")? {
             c.valid_api_versions = list_from_csv(&v);
@@ -299,7 +300,11 @@ fn valid_drive_name(drive: &str) -> bool {
 
 /// Validate that `root/drive` is a valid existing directory, optionally
 /// requiring it to be a mount point (Python `check_drive`).
-pub fn check_drive(root: &Path, drive: &str, mount_check: bool) -> Result<PathBuf, ConstraintError> {
+pub fn check_drive(
+    root: &Path,
+    drive: &str,
+    mount_check: bool,
+) -> Result<PathBuf, ConstraintError> {
     if !valid_drive_name(drive) {
         return Err(ConstraintError(format!(
             "{drive} is not a valid drive name"
@@ -417,8 +422,7 @@ auto_create_account_prefix = !
 
         // bad int errors
         let config =
-            SwiftConfig::parse("[swift-constraints]\nmax_file_size = lots\n", &[], false)
-                .unwrap();
+            SwiftConfig::parse("[swift-constraints]\nmax_file_size = lots\n", &[], false).unwrap();
         assert!(Constraints::from_swift_conf(&config).is_err());
 
         // no section: all defaults
@@ -461,7 +465,9 @@ auto_create_account_prefix = !
         let name = format!("X-Account-Meta-{}", "k".repeat(128));
         assert!(check_metadata([(name.as_str(), "v")], "account").is_ok());
         let long_val = "k".repeat(256);
-        assert!(check_metadata([("X-Account-Meta-Too-Long", long_val.as_str())], "account").is_ok());
+        assert!(
+            check_metadata([("X-Account-Meta-Too-Long", long_val.as_str())], "account").is_ok()
+        );
 
         // name one over the limit -> 400
         let name = format!("X-Account-Meta-{}", "k".repeat(129));
@@ -473,9 +479,12 @@ auto_create_account_prefix = !
         // value one over the limit -> 400
         let long_val = "k".repeat(257);
         assert_eq!(
-            check_metadata([("X-Container-Meta-Too-Long", long_val.as_str())], "container")
-                .unwrap_err()
-                .0,
+            check_metadata(
+                [("X-Container-Meta-Too-Long", long_val.as_str())],
+                "container"
+            )
+            .unwrap_err()
+            .0,
             "Metadata value longer than 256: x-container-meta-Too-Long"
         );
 
@@ -488,7 +497,9 @@ auto_create_account_prefix = !
         );
 
         // non-meta headers are ignored
-        assert!(check_metadata([("X-Timestamp", "123"), ("Content-Length", "0")], "account").is_ok());
+        assert!(
+            check_metadata([("X-Timestamp", "123"), ("Content-Length", "0")], "account").is_ok()
+        );
 
         // overall size boundary: keys count after the prefix strip
         let val = "k".repeat(256);
@@ -504,14 +515,21 @@ auto_create_account_prefix = !
         let under = 4096 - size - 1;
         let mut ok_headers = headers.clone();
         ok_headers.push(("X-Account-Meta-k".to_string(), "v".repeat(under as usize)));
-        let pairs: Vec<(&str, &str)> =
-            ok_headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let pairs: Vec<(&str, &str)> = ok_headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         assert!(check_metadata(pairs, "account").is_ok());
         // just over -> 400
         let mut over_headers = headers;
-        over_headers.push(("X-Account-Meta-k".to_string(), "x".repeat((4096 - size) as usize)));
-        let pairs: Vec<(&str, &str)> =
-            over_headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        over_headers.push((
+            "X-Account-Meta-k".to_string(),
+            "x".repeat((4096 - size) as usize),
+        ));
+        let pairs: Vec<(&str, &str)> = over_headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         assert_eq!(
             check_metadata(pairs, "account").unwrap_err().0,
             "Total metadata too large; max 4096"
@@ -553,9 +571,15 @@ auto_create_account_prefix = !
         // existing dir passes check_dir
         assert_eq!(check_dir(&tmp, "sdb1").unwrap(), tmp.join("sdb1"));
         // missing dir fails
-        assert!(check_dir(&tmp, "nope").unwrap_err().0.ends_with("is not a directory"));
+        assert!(check_dir(&tmp, "nope")
+            .unwrap_err()
+            .0
+            .ends_with("is not a directory"));
         // a plain temp dir is not a mount point
-        assert!(check_mount(&tmp, "sdb1").unwrap_err().0.ends_with("is not mounted"));
+        assert!(check_mount(&tmp, "sdb1")
+            .unwrap_err()
+            .0
+            .ends_with("is not mounted"));
         // ...unless a .ismount stub is present
         std::fs::write(tmp.join("sdb1").join(".ismount"), b"").unwrap();
         assert_eq!(check_mount(&tmp, "sdb1").unwrap(), tmp.join("sdb1"));

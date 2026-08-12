@@ -56,12 +56,7 @@ pub struct ListedPart {
 }
 
 /// Build ListPartsResult XML (no pagination metadata).
-pub fn list_parts_xml(
-    bucket: &str,
-    key: &str,
-    upload_id: &str,
-    parts: &[ListedPart],
-) -> Vec<u8> {
+pub fn list_parts_xml(bucket: &str, key: &str, upload_id: &str, parts: &[ListedPart]) -> Vec<u8> {
     list_parts_xml_full(bucket, key, upload_id, 0, 1000, false, parts)
 }
 
@@ -262,10 +257,7 @@ mod tests {
     #[test]
     fn segments_and_part_names() {
         assert_eq!(segments_container("b"), "b+segments");
-        assert_eq!(
-            part_object_name("k", "uid", 3),
-            "k/uid/00000003"
-        );
+        assert_eq!(part_object_name("k", "uid", 3), "k/uid/00000003");
     }
 
     #[test]
@@ -291,10 +283,9 @@ mod tests {
         let (k, u) = parse_upload_marker_name("big/obj/abcdef0123456789abcdef0123456789").unwrap();
         assert_eq!(k, "big/obj");
         assert_eq!(u, "abcdef0123456789abcdef0123456789");
-        assert!(parse_upload_marker_name(
-            "big/obj/abcdef0123456789abcdef0123456789/00000001"
-        )
-        .is_none());
+        assert!(
+            parse_upload_marker_name("big/obj/abcdef0123456789abcdef0123456789/00000001").is_none()
+        );
     }
 
     #[test]

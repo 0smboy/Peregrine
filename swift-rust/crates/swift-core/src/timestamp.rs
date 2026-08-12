@@ -519,14 +519,8 @@ mod tests {
 
     #[test]
     fn test_bounds() {
-        assert_eq!(
-            Timestamp::from_secs(-1.0),
-            Err(TimestampError::Negative)
-        );
-        assert_eq!(
-            Timestamp::from_secs(1e10),
-            Err(TimestampError::TooLarge)
-        );
+        assert_eq!(Timestamp::from_secs(-1.0), Err(TimestampError::Negative));
+        assert_eq!(Timestamp::from_secs(1e10), Err(TimestampError::TooLarge));
         // largest valid value
         let ts = Timestamp::from_secs(9999999999.99999).unwrap();
         assert_eq!(ts.raw(), MAX_RAW_TIME);
@@ -557,14 +551,8 @@ mod tests {
     #[test]
     fn test_delta() {
         let ts = Timestamp::from_secs(1402464677.04188).unwrap();
-        assert_eq!(
-            ts.apply_delta(1).unwrap().normal(),
-            "1402464677.04189"
-        );
-        assert_eq!(
-            ts.apply_delta(-1).unwrap().normal(),
-            "1402464677.04187"
-        );
+        assert_eq!(ts.apply_delta(1).unwrap().normal(), "1402464677.04189");
+        assert_eq!(ts.apply_delta(-1).unwrap().normal(), "1402464677.04187");
         assert!(Timestamp::zero().apply_delta(-1).is_err());
     }
 
@@ -596,10 +584,7 @@ mod tests {
 
     #[test]
     fn test_isoformat() {
-        assert_eq!(
-            Timestamp::zero().isoformat(),
-            "1970-01-01T00:00:00.000000"
-        );
+        assert_eq!(Timestamp::zero().isoformat(), "1970-01-01T00:00:00.000000");
         let ts = Timestamp::from_secs(1402466346.38836).unwrap();
         // value verified against the Python implementation
         assert_eq!(ts.isoformat(), "2014-06-11T05:59:06.388360");
@@ -625,7 +610,10 @@ mod tests {
     #[test]
     fn test_normalize_delete_at_timestamp() {
         assert_eq!(normalize_delete_at_timestamp(-1.0, false), "0000000000");
-        assert_eq!(normalize_delete_at_timestamp(-1.0, true), "0000000000.00000");
+        assert_eq!(
+            normalize_delete_at_timestamp(-1.0, true),
+            "0000000000.00000"
+        );
         assert_eq!(
             normalize_delete_at_timestamp(1402464677.04188, false),
             "1402464677"
@@ -634,10 +622,7 @@ mod tests {
             normalize_delete_at_timestamp(1402464677.04188, true),
             "1402464677.04188"
         );
-        assert_eq!(
-            normalize_delete_at_timestamp(1e11, false),
-            "9999999999"
-        );
+        assert_eq!(normalize_delete_at_timestamp(1e11, false), "9999999999");
         assert_eq!(
             normalize_delete_at_timestamp(1e11, true),
             "9999999999.99999"

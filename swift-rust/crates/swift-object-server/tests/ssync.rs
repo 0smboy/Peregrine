@@ -179,11 +179,8 @@ fn dechunk(mut raw: &[u8]) -> Vec<u8> {
             assert!(raw.is_empty(), "trailing garbage after chunks: {raw:?}");
             return out;
         };
-        let size = usize::from_str_radix(
-            std::str::from_utf8(&raw[..line_end]).unwrap().trim(),
-            16,
-        )
-        .expect("chunk size hex");
+        let size = usize::from_str_radix(std::str::from_utf8(&raw[..line_end]).unwrap().trim(), 16)
+            .expect("chunk size hex");
         raw = &raw[line_end + 2..];
         if size == 0 {
             return out;
@@ -218,7 +215,8 @@ fn ssync_request(
         .expect("response head");
     let head = String::from_utf8_lossy(&raw[..split]).into_owned();
     assert!(
-        head.to_ascii_lowercase().contains("transfer-encoding: chunked"),
+        head.to_ascii_lowercase()
+            .contains("transfer-encoding: chunked"),
         "duplex response must be chunked: {head}"
     );
     SsyncReply::Wire {
@@ -370,7 +368,13 @@ fn ssync_encode_missing_matches_python_wire_format() {
     // ts_meta equal to ts_data suppresses the deltas (including ctype, as in
     // Python where t: is nested under the m: branch) but not durable
     assert_eq!(
-        encode_missing(hash, t0, Some(t0), Some(ts("1751500009.00000")), Some(false)),
+        encode_missing(
+            hash,
+            t0,
+            Some(t0),
+            Some(ts("1751500009.00000")),
+            Some(false)
+        ),
         format!("{hash} 1751500000.00000 durable:False")
     );
 }
@@ -657,7 +661,11 @@ fn unknown_policy_get_post_and_delete_fail_closed() {
             &[],
         ));
         assert_eq!(response.status, 503, "{method}");
-        assert_eq!(body_bytes(&mut response), b"No policy with index 999", "{method}");
+        assert_eq!(
+            body_bytes(&mut response),
+            b"No policy with index 999",
+            "{method}"
+        );
     }
 
     assert!(!tree.root.join("sda1/objects-999").exists());
@@ -724,8 +732,5 @@ fn python_stdlib_batch_fixture_can_generate_request_and_parse_response() {
         !tree.root.join("sda1/async_pending").exists(),
         "backend replication must not enqueue a container update"
     );
-    assert_eq!(
-        reply.lines()[1],
-        format!("{offered_hash} dm").into_bytes()
-    );
+    assert_eq!(reply.lines()[1], format!("{offered_hash} dm").into_bytes());
 }

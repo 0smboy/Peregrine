@@ -31,8 +31,8 @@ mod writer;
 
 use std::fmt;
 
-pub use crate::io::{IndexEntry, RingFile};
 pub use crate::builder::{BuilderDevice, RingBuilder};
+pub use crate::io::{IndexEntry, RingFile};
 pub use crate::ring::{calc_replica_count, HandoffNode, PartNode, Ring, RingData, RingDevice};
 
 /// Error loading or querying a ring.

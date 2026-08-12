@@ -199,9 +199,9 @@ impl Symlink {
                 if trimmed.is_empty() {
                     return Ok(Self::from_conf(None));
                 }
-                let parsed: i64 = trimmed
-                    .parse()
-                    .map_err(|_| format!("invalid symlink symloop_max {raw:?}: expected an integer"))?;
+                let parsed: i64 = trimmed.parse().map_err(|_| {
+                    format!("invalid symlink symloop_max {raw:?}: expected an integer")
+                })?;
                 Ok(Self::from_conf(Some(&parsed.to_string())))
             }
         }
@@ -284,7 +284,10 @@ impl Symlink {
         let mut loop_count: usize = 0;
         loop {
             let resp = next(cur.clone_head());
-            let symlink_target = resp.headers.get(TGT_OBJ_SYSMETA_SYMLINK_HDR).map(str::to_string);
+            let symlink_target = resp
+                .headers
+                .get(TGT_OBJ_SYSMETA_SYMLINK_HDR)
+                .map(str::to_string);
             let resp_etag = resp
                 .headers
                 .get(TGT_ETAG_SYSMETA_SYMLINK_HDR)
@@ -348,7 +351,11 @@ impl Symlink {
         // Symlinks must be zero-byte objects. Python reads the body when no
         // Content-Length was declared (chunked upload); a body over the
         // control cap is certainly non-empty.
-        let has_body = match req.headers.get("Content-Length").map(|s| s.trim().parse::<i64>()) {
+        let has_body = match req
+            .headers
+            .get("Content-Length")
+            .map(|s| s.trim().parse::<i64>())
+        {
             Some(Ok(cl)) => cl != 0,
             _ => match req.body.materialize(MAX_CONTROL_BODY) {
                 Ok(bytes) => !bytes.is_empty(),
@@ -386,10 +393,18 @@ impl Symlink {
                 req.headers.get(TGT_OBJ_SYSMETA_SYMLINK_HDR).unwrap_or("")
             ),
         ];
-        if let Some(acct) = req.headers.get(TGT_ACCT_SYSMETA_SYMLINK_HDR).map(str::to_string) {
+        if let Some(acct) = req
+            .headers
+            .get(TGT_ACCT_SYSMETA_SYMLINK_HDR)
+            .map(str::to_string)
+        {
             etag_override.push(format!("symlink_target_account={acct}"));
         }
-        if let Some(tgt_etag) = req.headers.get(TGT_ETAG_SYSMETA_SYMLINK_HDR).map(str::to_string) {
+        if let Some(tgt_etag) = req
+            .headers
+            .get(TGT_ETAG_SYSMETA_SYMLINK_HDR)
+            .map(str::to_string)
+        {
             // Whoever set the target etag sysmeta must also set the bytes
             // sysmeta; treat a missing value as empty.
             let tgt_bytes = req
@@ -573,13 +588,19 @@ fn build_traversal_req(
 /// normalises them on `req`, and returns the fully-qualified target path
 /// plus the optional (normalised) target etag. On failure returns the error
 /// response to send.
-fn validate_and_prep_request_headers(req: &mut Request) -> Result<(String, Option<String>), Response> {
+fn validate_and_prep_request_headers(
+    req: &mut Request,
+) -> Result<(String, Option<String>), Response> {
     const ERROR_BODY: &str =
         "X-Symlink-Target header must be of the form <container name>/<object name>";
 
     // The caller guarantees X-Symlink-Target is present. (wsgi_unquote is
     // simplified: the value is treated as already decoded.)
-    let raw_target = req.headers.get(TGT_OBJ_SYMLINK_HDR).unwrap_or("").to_string();
+    let raw_target = req
+        .headers
+        .get(TGT_OBJ_SYMLINK_HDR)
+        .unwrap_or("")
+        .to_string();
     if raw_target.starts_with('/') {
         return Err(err_text(412, ERROR_BODY));
     }
@@ -773,10 +794,7 @@ mod tests {
         let resp = run(&mw, req("GET", "/v1/a/c/link", &[]), be);
         assert_eq!(resp.status, 200);
         assert_eq!(body_bytes(&resp), b"payload");
-        assert_eq!(
-            resp.headers.get("Content-Location"),
-            Some("/v1/a/c2/obj")
-        );
+        assert_eq!(resp.headers.get("Content-Location"), Some("/v1/a/c2/obj"));
     }
 
     #[test]
@@ -793,10 +811,7 @@ mod tests {
         let resp = run(&mw, req("GET", "/v1/a/c/link", &[]), be);
         assert_eq!(resp.status, 200);
         assert_eq!(body_bytes(&resp), b"xacct");
-        assert_eq!(
-            resp.headers.get("Content-Location"),
-            Some("/v1/a2/c2/obj")
-        );
+        assert_eq!(resp.headers.get("Content-Location"), Some("/v1/a2/c2/obj"));
     }
 
     #[test]
@@ -869,10 +884,7 @@ mod tests {
             String::from_utf8_lossy(body_bytes(&resp)),
             "Object Etag 'got' does not match X-Symlink-Target-Etag header 'want'"
         );
-        assert_eq!(
-            resp.headers.get("Content-Location"),
-            Some("/v1/a/c2/obj")
-        );
+        assert_eq!(resp.headers.get("Content-Location"), Some("/v1/a/c2/obj"));
     }
 
     // ---- PUT (symlink creation) -----------------------------------------
@@ -888,7 +900,8 @@ mod tests {
         assert_eq!(resp.status, 201);
         // The client header was moved into sysmeta.
         assert_eq!(
-            resp.headers.get(&format!("Echo-{TGT_OBJ_SYSMETA_SYMLINK_HDR}")),
+            resp.headers
+                .get(&format!("Echo-{TGT_OBJ_SYSMETA_SYMLINK_HDR}")),
             Some("c2/obj")
         );
         assert!(resp
@@ -896,7 +909,10 @@ mod tests {
             .get(&format!("Echo-{TGT_OBJ_SYMLINK_HDR}"))
             .is_none());
         // Content-Type defaulted to application/symlink.
-        assert_eq!(resp.headers.get("Echo-Content-Type"), Some("application/symlink"));
+        assert_eq!(
+            resp.headers.get("Echo-Content-Type"),
+            Some("application/symlink")
+        );
         // The container-update override etag encodes the symlink target.
         assert_eq!(
             resp.headers
@@ -957,7 +973,11 @@ mod tests {
         // No slash -> not a container/object pair.
         let resp = run(
             &mw,
-            req("PUT", "/v1/a/c/link", &[(TGT_OBJ_SYMLINK_HDR, "onlycontainer")]),
+            req(
+                "PUT",
+                "/v1/a/c/link",
+                &[(TGT_OBJ_SYMLINK_HDR, "onlycontainer")],
+            ),
             echo_backend(201),
         );
         assert_eq!(resp.status, 412);
@@ -1021,7 +1041,8 @@ mod tests {
         );
         assert_eq!(resp.status, 201);
         assert_eq!(
-            resp.headers.get(&format!("Echo-{TGT_ETAG_SYSMETA_SYMLINK_HDR}")),
+            resp.headers
+                .get(&format!("Echo-{TGT_ETAG_SYSMETA_SYMLINK_HDR}")),
             Some("abc123")
         );
         assert_eq!(
@@ -1064,10 +1085,7 @@ mod tests {
             String::from_utf8_lossy(body_bytes(&resp)),
             "X-Symlink-Target does not exist"
         );
-        assert_eq!(
-            resp.headers.get("Content-Location"),
-            Some("/v1/a/c2/obj")
-        );
+        assert_eq!(resp.headers.get("Content-Location"), Some("/v1/a/c2/obj"));
     }
 
     #[test]
@@ -1160,7 +1178,11 @@ mod tests {
         // Container listing augmentation is deferred; the request passes
         // straight through.
         let mw = Symlink::default();
-        let be = backend(vec![("GET", "/v1/a/c", Response::with_body(200, b"[]".to_vec()))]);
+        let be = backend(vec![(
+            "GET",
+            "/v1/a/c",
+            Response::with_body(200, b"[]".to_vec()),
+        )]);
         let resp = run(&mw, req("GET", "/v1/a/c", &[]), be);
         assert_eq!(resp.status, 200);
         assert_eq!(body_bytes(&resp), b"[]");
@@ -1169,7 +1191,11 @@ mod tests {
     #[test]
     fn test_non_swift_path_passes_through() {
         let mw = Symlink::default();
-        let be = backend(vec![("GET", "/healthcheck", Response::with_body(200, b"OK".to_vec()))]);
+        let be = backend(vec![(
+            "GET",
+            "/healthcheck",
+            Response::with_body(200, b"OK".to_vec()),
+        )]);
         let resp = run(&mw, req("GET", "/healthcheck", &[]), be);
         assert_eq!(resp.status, 200);
         assert_eq!(body_bytes(&resp), b"OK");

@@ -78,14 +78,17 @@ pub fn chexor(old: &str, name: &str, timestamp: &str) -> Result<String, DbError>
     Ok(format!("{:032x}", old_val ^ new_val))
 }
 
-const B64_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Standard padded base64, as `base64.b64encode` produces.
 pub fn b64encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
         out.push(B64_ALPHABET[(n >> 18) as usize & 63] as char);
         out.push(B64_ALPHABET[(n >> 12) as usize & 63] as char);
@@ -167,7 +170,9 @@ pub fn lock_parent_directory(filename: &Path, timeout: f64) -> Result<DirLock, D
             Err(std::fs::TryLockError::Error(e)) => return Err(DbError::Io(e)),
         }
         if start.elapsed().as_secs_f64() > timeout {
-            return Err(DbError::LockTimeout(lockpath.to_string_lossy().into_owned()));
+            return Err(DbError::LockTimeout(
+                lockpath.to_string_lossy().into_owned(),
+            ));
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -185,9 +190,8 @@ pub(crate) fn register_chexor(conn: &rusqlite::Connection) -> Result<(), DbError
             let old: String = ctx.get(0)?;
             let name: String = ctx.get(1)?;
             let timestamp: String = ctx.get(2)?;
-            chexor(&old, &name, &timestamp).map_err(|e| {
-                rusqlite::Error::UserFunctionError(format!("chexor: {e}").into())
-            })
+            chexor(&old, &name, &timestamp)
+                .map_err(|e| rusqlite::Error::UserFunctionError(format!("chexor: {e}").into()))
         },
     )?;
     Ok(())
@@ -417,12 +421,22 @@ mod tests {
     #[test]
     fn test_chexor() {
         // seeded from the python implementation
-        let h = chexor("00000000000000000000000000000000", "obj1", "1751500001.00000").unwrap();
+        let h = chexor(
+            "00000000000000000000000000000000",
+            "obj1",
+            "1751500001.00000",
+        )
+        .unwrap();
         let h = chexor(&h, "obj2", "1751500002.00000").unwrap();
         let back = chexor(&h, "obj2", "1751500002.00000").unwrap();
         assert_eq!(
             back,
-            chexor("00000000000000000000000000000000", "obj1", "1751500001.00000").unwrap()
+            chexor(
+                "00000000000000000000000000000000",
+                "obj1",
+                "1751500001.00000"
+            )
+            .unwrap()
         );
     }
 
@@ -483,7 +497,12 @@ mod tests {
         let root = std::env::temp_dir().join(format!("swift-quar-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         // <device>/containers/<part>/<suffix>/<hash>/<hash>.db with garbage
-        let db_dir = root.join("sda1").join("containers").join("0").join("abc").join("hash");
+        let db_dir = root
+            .join("sda1")
+            .join("containers")
+            .join("0")
+            .join("abc")
+            .join("hash");
         std::fs::create_dir_all(&db_dir).unwrap();
         let db_path = db_dir.join("hash.db");
         std::fs::write(&db_path, b"this is not a sqlite database").unwrap();
@@ -492,7 +511,10 @@ mod tests {
         // hash dir name, and the original dir is gone
         assert_eq!(
             quar_path,
-            root.join("sda1").join("quarantined").join("containers").join("hash")
+            root.join("sda1")
+                .join("quarantined")
+                .join("containers")
+                .join("hash")
         );
         assert!(quar_path.join("hash.db").exists());
         assert!(!db_dir.exists());
@@ -531,7 +553,14 @@ mod tests {
 
     #[test]
     fn test_base64_round_trip() {
-        for data in [b"".as_slice(), b"f", b"fo", b"foo", b"foob", b"\xff\x00\x80"] {
+        for data in [
+            b"".as_slice(),
+            b"f",
+            b"fo",
+            b"foo",
+            b"foob",
+            b"\xff\x00\x80",
+        ] {
             let enc = b64encode(data);
             assert_eq!(b64decode(enc.as_bytes()).unwrap(), data, "{enc}");
         }

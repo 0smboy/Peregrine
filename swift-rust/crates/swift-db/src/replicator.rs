@@ -565,9 +565,15 @@ mod tests {
         .to_string();
         let (addr, handle) = spawn_fake_peer(body);
 
-        let outcome =
-            replicate_container_db(&mut broker, "local-id", &addr.to_string(), "sdb", "0", "hash")
-                .unwrap();
+        let outcome = replicate_container_db(
+            &mut broker,
+            "local-id",
+            &addr.to_string(),
+            "sdb",
+            "0",
+            "hash",
+        )
+        .unwrap();
         handle.join().unwrap();
         assert!(!outcome.needs_rsync);
         assert!(!outcome.usync_incomplete);
@@ -669,9 +675,15 @@ mod tests {
         })
         .to_string();
         let (addr, handle) = spawn_fake_peer(body);
-        let outcome =
-            replicate_container_db(&mut broker, "local-id", &addr.to_string(), "sdb", "0", "hash")
-                .unwrap();
+        let outcome = replicate_container_db(
+            &mut broker,
+            "local-id",
+            &addr.to_string(),
+            "sdb",
+            "0",
+            "hash",
+        )
+        .unwrap();
         handle.join().unwrap();
         assert!(outcome.usync_incomplete);
         assert!(!outcome.needs_rsync);

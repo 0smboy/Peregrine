@@ -89,8 +89,7 @@ impl DomainRemap {
         let path_root = format!("{}/", path_root.unwrap_or("v1").trim_matches('/'));
 
         let reseller_prefixes = list_from_csv(reseller_prefixes.unwrap_or("AUTH"));
-        let reseller_prefixes_lower =
-            reseller_prefixes.iter().map(|p| p.to_lowercase()).collect();
+        let reseller_prefixes_lower = reseller_prefixes.iter().map(|p| p.to_lowercase()).collect();
 
         DomainRemap {
             storage_domain,
@@ -98,9 +97,7 @@ impl DomainRemap {
             reseller_prefixes,
             reseller_prefixes_lower,
             default_reseller_prefix: default_reseller_prefix.map(str::to_string),
-            mangle_client_paths: mangle_client_paths
-                .map(config_true_value)
-                .unwrap_or(false),
+            mangle_client_paths: mangle_client_paths.map(config_true_value).unwrap_or(false),
         }
     }
 }
@@ -150,8 +147,7 @@ impl Middleware for DomainRemap {
             if !account.contains('_') && account.contains('-') {
                 account = account.replacen('-', "_", 1);
             }
-            let account_reseller_prefix =
-                account.split('_').next().unwrap_or("").to_lowercase();
+            let account_reseller_prefix = account.split('_').next().unwrap_or("").to_lowercase();
 
             if let Some(idx) = self
                 .reseller_prefixes_lower
@@ -185,11 +181,13 @@ impl Middleware for DomainRemap {
             chars.as_str().to_string()
         };
         // path_root[:-1] — drop the trailing '/'.
-        let path_root_no_slash =
-            self.path_root.strip_suffix('/').unwrap_or(&self.path_root).to_string();
+        let path_root_no_slash = self
+            .path_root
+            .strip_suffix('/')
+            .unwrap_or(&self.path_root)
+            .to_string();
 
-        let mut new_path_parts: Vec<String> =
-            vec![String::new(), path_root_no_slash, account];
+        let mut new_path_parts: Vec<String> = vec![String::new(), path_root_no_slash, account];
         if let Some(c) = container {
             // Python `if container:` — falsy for None or empty string.
             if !c.is_empty() {
@@ -328,7 +326,10 @@ mod tests {
     #[test]
     fn test_account_container_with_path_root_obj() {
         let app = DomainRemap::default();
-        assert_eq!(remap(&app, "c.AUTH_a.example.com", "/v1"), "/v1/AUTH_a/c/v1");
+        assert_eq!(
+            remap(&app, "c.AUTH_a.example.com", "/v1"),
+            "/v1/AUTH_a/c/v1"
+        );
     }
 
     #[test]
@@ -361,7 +362,10 @@ mod tests {
     #[test]
     fn test_account_container_with_path() {
         let app = DomainRemap::default();
-        assert_eq!(remap(&app, "c.AUTH_a.example.com", "/obj"), "/v1/AUTH_a/c/obj");
+        assert_eq!(
+            remap(&app, "c.AUTH_a.example.com", "/obj"),
+            "/v1/AUTH_a/c/obj"
+        );
     }
 
     #[test]
@@ -426,13 +430,19 @@ mod tests {
     fn test_configured_with_no_prefixes() {
         let app = DomainRemap::from_conf(None, None, Some(""), None, None);
         assert!(app.reseller_prefixes.is_empty());
-        assert_eq!(remap(&app, "c.uuid.example.com", "/test"), "/v1/uuid/c/test");
+        assert_eq!(
+            remap(&app, "c.uuid.example.com", "/test"),
+            "/v1/uuid/c/test"
+        );
     }
 
     #[test]
     fn test_add_prefix() {
         let app = DomainRemap::from_conf(None, None, None, Some("FOO"), None);
-        assert_eq!(remap(&app, "uuid.example.com", "/test"), "/v1/FOO_uuid/test");
+        assert_eq!(
+            remap(&app, "uuid.example.com", "/test"),
+            "/v1/FOO_uuid/test"
+        );
     }
 
     #[test]
@@ -448,8 +458,14 @@ mod tests {
     fn test_multiple_storage_domains() {
         let app =
             DomainRemap::from_conf(Some("storage1.com, storage2.com"), None, None, None, None);
-        assert_eq!(remap(&app, "auth-uuid.storage1.com", "/test"), "/v1/AUTH_uuid/test");
-        assert_eq!(remap(&app, "auth-uuid.storage2.com", "/test"), "/v1/AUTH_uuid/test");
+        assert_eq!(
+            remap(&app, "auth-uuid.storage1.com", "/test"),
+            "/v1/AUTH_uuid/test"
+        );
+        assert_eq!(
+            remap(&app, "auth-uuid.storage2.com", "/test"),
+            "/v1/AUTH_uuid/test"
+        );
         // not one of the configured domains -> passthrough
         assert_eq!(remap(&app, "auth-uuid.storage3.com", "/test"), "/test");
     }
@@ -467,7 +483,10 @@ mod tests {
         });
         let run = |host: &str, path: &str| {
             let resp = app.handle(req(host, path), &redirect);
-            (resp.status, resp.headers.get("Location").unwrap().to_string())
+            (
+                resp.status,
+                resp.headers.get("Location").unwrap().to_string(),
+            )
         };
 
         assert_eq!(
@@ -492,12 +511,18 @@ mod tests {
 
     #[test]
     fn test_mangle_account_with_path_root_container() {
-        assert_eq!(remap(&mangling(), "AUTH_a.example.com", "/v1"), "/v1/AUTH_a/");
+        assert_eq!(
+            remap(&mangling(), "AUTH_a.example.com", "/v1"),
+            "/v1/AUTH_a/"
+        );
     }
 
     #[test]
     fn test_mangle_account_container_with_path_root_obj() {
-        assert_eq!(remap(&mangling(), "c.AUTH_a.example.com", "/v1"), "/v1/AUTH_a/c/");
+        assert_eq!(
+            remap(&mangling(), "c.AUTH_a.example.com", "/v1"),
+            "/v1/AUTH_a/c/"
+        );
     }
 
     #[test]

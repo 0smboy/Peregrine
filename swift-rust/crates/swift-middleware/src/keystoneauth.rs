@@ -103,7 +103,6 @@ pub fn cross_tenant_match(id: &Identity, groups: &[String], allow_names: bool) -
     None
 }
 
-
 fn intersects(a: &[String], b: &[String]) -> bool {
     a.iter().any(|x| b.contains(x))
 }
@@ -141,9 +140,7 @@ pub fn authorize(id: &Identity, cfg: &RoleConfig, req: &AuthRequest) -> AuthResu
     }
 
     // Cross-tenant ACL grant.
-    if !groups.is_empty()
-        && cross_tenant_match(id, &groups, req.allow_names).is_some()
-    {
+    if !groups.is_empty() && cross_tenant_match(id, &groups, req.allow_names).is_some() {
         return AuthResult::Allow { swift_owner: false };
     }
 
@@ -549,12 +546,7 @@ impl Middleware for KeystoneAuth {
             && req
                 .headers
                 .get("X-Backend-Authorize-Override")
-                .map(|v| {
-                    matches!(
-                        v.to_ascii_lowercase().as_str(),
-                        "true" | "1" | "yes" | "on"
-                    )
-                })
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
                 .unwrap_or(false)
         {
             return next(req);
@@ -635,7 +627,10 @@ mod tests {
         );
         // a write falls through to deny (no operator role, tenant matches but
         // no operator role) -> Deny
-        assert_eq!(authorize(&id(&["sysreader"]), &cfg(), &objreq("PUT")), AuthResult::Deny);
+        assert_eq!(
+            authorize(&id(&["sysreader"]), &cfg(), &objreq("PUT")),
+            AuthResult::Deny
+        );
     }
 
     #[test]
@@ -644,12 +639,18 @@ mod tests {
             authorize(&id(&["projreader"]), &cfg(), &objreq("HEAD")),
             AuthResult::Allow { swift_owner: false }
         );
-        assert_eq!(authorize(&id(&["projreader"]), &cfg(), &objreq("PUT")), AuthResult::Deny);
+        assert_eq!(
+            authorize(&id(&["projreader"]), &cfg(), &objreq("PUT")),
+            AuthResult::Deny
+        );
     }
 
     #[test]
     fn test_no_role_denied() {
-        assert_eq!(authorize(&id(&["member"]), &cfg(), &objreq("GET")), AuthResult::Deny);
+        assert_eq!(
+            authorize(&id(&["member"]), &cfg(), &objreq("GET")),
+            AuthResult::Deny
+        );
     }
 
     #[test]
@@ -677,10 +678,19 @@ mod tests {
             authorize(&id(&["member"]), &cfg(), &req),
             AuthResult::Allow { swift_owner: false }
         );
-        assert_eq!(cross_tenant_match(&id(&["member"]), &["t1:u1".to_string()], true), Some("t1:u1".to_string()));
+        assert_eq!(
+            cross_tenant_match(&id(&["member"]), &["t1:u1".to_string()], true),
+            Some("t1:u1".to_string())
+        );
         // name-based grant only when allow_names
-        assert_eq!(cross_tenant_match(&id(&[]), &["proj:alice".to_string()], true), Some("proj:alice".to_string()));
-        assert_eq!(cross_tenant_match(&id(&[]), &["proj:alice".to_string()], false), None);
+        assert_eq!(
+            cross_tenant_match(&id(&[]), &["proj:alice".to_string()], true),
+            Some("proj:alice".to_string())
+        );
+        assert_eq!(
+            cross_tenant_match(&id(&[]), &["proj:alice".to_string()], false),
+            None
+        );
     }
 
     #[test]
@@ -710,7 +720,10 @@ mod tests {
         let mut c = cfg();
         c.service_roles = vec!["svc".into()];
         // operator role but no service role -> deny
-        assert_eq!(authorize(&id(&["admin"]), &c, &objreq("PUT")), AuthResult::Deny);
+        assert_eq!(
+            authorize(&id(&["admin"]), &c, &objreq("PUT")),
+            AuthResult::Deny
+        );
         // with the service role -> owner
         let mut who = id(&["admin"]);
         who.service_roles = vec!["svc".into()];
@@ -783,7 +796,8 @@ mod tests {
             headers: h,
             body: swift_http::Body::empty(),
         };
-        let (denied, _) = ka.authorize_request(&req, "AUTH_other", Some("c"), Some("o"), None, None);
+        let (denied, _) =
+            ka.authorize_request(&req, "AUTH_other", Some("c"), Some("o"), None, None);
         assert_eq!(denied.map(|r| r.status), Some(403));
     }
 
@@ -806,14 +820,7 @@ mod tests {
             Some("http://ok.example.com/"),
         );
         assert!(denied.is_none());
-        let (denied2, _) = ka.authorize_request(
-            &req,
-            "AUTH_t1",
-            Some("c"),
-            Some("o"),
-            None,
-            None,
-        );
+        let (denied2, _) = ka.authorize_request(&req, "AUTH_t1", Some("c"), Some("o"), None, None);
         assert_eq!(denied2.map(|r| r.status), Some(401));
     }
 

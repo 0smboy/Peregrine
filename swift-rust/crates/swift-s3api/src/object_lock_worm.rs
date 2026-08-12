@@ -184,10 +184,7 @@ pub fn apply_default_retention_headers(
 
 /// Apply explicit `x-amz-object-lock-*` request headers → sysmeta.
 pub fn apply_amz_object_lock_headers(headers: &mut HeaderKeyDict) {
-    if let Some(mode) = headers
-        .get("X-Amz-Object-Lock-Mode")
-        .map(str::to_string)
-    {
+    if let Some(mode) = headers.get("X-Amz-Object-Lock-Mode").map(str::to_string) {
         if !mode.is_empty() {
             headers.set(SYS_LOCK_MODE, mode.to_ascii_uppercase());
         }

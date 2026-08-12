@@ -50,8 +50,8 @@ pub fn get_sig(
     realm_key: &str,
     user_key: &str,
 ) -> String {
-    let mut mac = HmacSha1::new_from_slice(realm_key.as_bytes())
-        .expect("HMAC accepts a key of any length");
+    let mut mac =
+        HmacSha1::new_from_slice(realm_key.as_bytes()).expect("HMAC accepts a key of any length");
     let msg = format!("{request_method}\n{path}\n{x_timestamp}\n{nonce}\n{user_key}");
     mac.update(msg.as_bytes());
     let digest = mac.finalize().into_bytes();
@@ -85,9 +85,7 @@ pub struct MapSyncKeyProvider {
 
 impl SyncKeyProvider for MapSyncKeyProvider {
     fn sync_key(&self, account: &str, container: &str) -> Option<String> {
-        self.keys
-            .get(&format!("{account}/{container}"))
-            .cloned()
+        self.keys.get(&format!("{account}/{container}")).cloned()
     }
 }
 
@@ -101,9 +99,7 @@ impl ClosureSyncKeyProvider {
     where
         F: Fn(&str, &str) -> Option<String> + Send + Sync + 'static,
     {
-        ClosureSyncKeyProvider {
-            inner: Arc::new(f),
-        }
+        ClosureSyncKeyProvider { inner: Arc::new(f) }
     }
 }
 
@@ -160,9 +156,7 @@ impl RealmsConf {
             } else if k == "key2" {
                 entry.key2 = Some(v);
             } else if let Some(cluster) = k.strip_prefix("cluster_") {
-                entry
-                    .clusters
-                    .insert(cluster.to_ascii_uppercase(), v);
+                entry.clusters.insert(cluster.to_ascii_uppercase(), v);
             }
         }
         RealmsConf { realms }
@@ -202,10 +196,7 @@ impl RealmsConf {
                 }
                 clusters.insert(c.clone(), serde_json::Value::Object(entry));
             }
-            dct.insert(
-                realm.clone(),
-                serde_json::json!({ "clusters": clusters }),
-            );
+            dct.insert(realm.clone(), serde_json::json!({ "clusters": clusters }));
         }
         serde_json::Value::Object(dct)
     }
@@ -286,10 +277,8 @@ impl ContainerSync {
                 .to_vec(),
         );
         resp.headers.set("Content-Type", "text/plain");
-        resp.headers.set(
-            "Www-Authenticate",
-            "SwiftContainerSync realm=\"unknown\"",
-        );
+        resp.headers
+            .set("Www-Authenticate", "SwiftContainerSync realm=\"unknown\"");
         resp
     }
 
@@ -386,7 +375,8 @@ impl Middleware for ContainerSync {
 
         // Valid: authorize override + SLO/symlink overrides (header stamps).
         req.headers.set("X-Backend-Authorize-Override", "true");
-        req.headers.set("X-Backend-Remote-User", ".wsgi.container_sync");
+        req.headers
+            .set("X-Backend-Remote-User", ".wsgi.container_sync");
         req.headers.set("X-Backend-Slo-Override", "true");
         req.headers.set("X-Backend-Symlink-Override", "true");
         next(req)
@@ -455,8 +445,7 @@ mod tests {
         let mw = ContainerSync::new(Arc::new(MapSyncKeyProvider { keys })).with_realms(realms);
         let mut r = req("PUT", "/v1/AUTH_a/c/obj");
         r.headers.set("X-Timestamp", "1");
-        r.headers
-            .set("X-Container-Sync-Auth", "US nonce badbadbad");
+        r.headers.set("X-Container-Sync-Auth", "US nonce badbadbad");
         let resp = mw.handle(r, &app_ok());
         assert_eq!(resp.status, 401);
     }
@@ -468,8 +457,7 @@ mod tests {
         }))
         .with_allow_full_urls(false);
         let mut r = req("POST", "/v1/AUTH_a/c");
-        r.headers
-            .set("X-Container-Sync-To", "http://other/v1/a/c");
+        r.headers.set("X-Container-Sync-To", "http://other/v1/a/c");
         let resp = mw.handle(r, &app_ok());
         assert_eq!(resp.status, 400);
     }

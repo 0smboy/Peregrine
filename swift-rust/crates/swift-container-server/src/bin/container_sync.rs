@@ -82,13 +82,16 @@ impl ProxyObjectSource {
             ("X-Auth-Key".into(), self.auth_key.clone()),
             ("Connection".into(), "close".into()),
         ];
-        let (status, resp_headers, _) = http_exchange("GET", &self.auth_url, &headers, &[], self.timeout)?;
+        let (status, resp_headers, _) =
+            http_exchange("GET", &self.auth_url, &headers, &[], self.timeout)?;
         if !(200..300).contains(&status) {
             return None;
         }
         let tok = resp_headers
             .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("X-Auth-Token") || k.eq_ignore_ascii_case("X-Storage-Token"))
+            .find(|(k, _)| {
+                k.eq_ignore_ascii_case("X-Auth-Token") || k.eq_ignore_ascii_case("X-Storage-Token")
+            })
             .map(|(_, v)| v.clone())?;
         if let Ok(mut guard) = self.token.lock() {
             *guard = Some(tok.clone());
@@ -125,8 +128,7 @@ impl ObjectSource for ProxyObjectSource {
         if let Some(tok) = self.ensure_token() {
             headers.push(("X-Auth-Token".into(), tok));
         }
-        let (status, resp_headers, body) =
-            http_exchange("GET", &url, &headers, &[], self.timeout)?;
+        let (status, resp_headers, body) = http_exchange("GET", &url, &headers, &[], self.timeout)?;
         // One retry on 401 with a fresh token (expired / first static miss).
         if status == 401 && !self.auth_user.is_empty() {
             self.invalidate_token();
@@ -321,8 +323,9 @@ fn dechunk(raw: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn main() {
-    let conf_path =
-        std::env::args().nth(1).unwrap_or_else(|| "/etc/swift/container-server.conf".to_string());
+    let conf_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/etc/swift/container-server.conf".to_string());
     let run_once_only = std::env::args().nth(2).as_deref() == Some("once");
     let conf = parse_conf_file(&conf_path);
     let swift_dir = std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string());
@@ -410,8 +413,7 @@ fn main() {
             timeout: std::time::Duration::from_secs_f64(cfg.conn_timeout.max(0.1)),
         })
     };
-    let client =
-        HttpSyncClient::with_tls(object_source, cfg.conn_timeout, cfg.tls_options());
+    let client = HttpSyncClient::with_tls(object_source, cfg.conn_timeout, cfg.tls_options());
     let stop = swift_http::install_sigterm_flag();
 
     // Local bind identity for primary-node ordinal (Python is_local_device).

@@ -30,9 +30,8 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn expectations() -> Value {
-    let raw = std::fs::read(fixture("expectations.json")).expect(
-        "missing fixtures; run rust/crates/swift-ring/tests/fixtures/generate.py",
-    );
+    let raw = std::fs::read(fixture("expectations.json"))
+        .expect("missing fixtures; run rust/crates/swift-ring/tests/fixtures/generate.py");
     serde_json::from_slice(&raw).unwrap()
 }
 

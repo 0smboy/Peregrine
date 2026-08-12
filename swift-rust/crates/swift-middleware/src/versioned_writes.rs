@@ -197,9 +197,14 @@ impl VersionedWrites {
         versions_cont: &str,
         next: &NextFn,
     ) -> Response {
-        let req = match self
-            .copy_current_then_continue(req, version, account, object, versions_cont, next)
-        {
+        let req = match self.copy_current_then_continue(
+            req,
+            version,
+            account,
+            object,
+            versions_cont,
+            next,
+        ) {
             Ok(r) => r,
             Err(resp) => return resp,
         };
@@ -237,8 +242,7 @@ impl VersionedWrites {
             &format!("/{version}/{account}/{versions_cont}"),
             &req,
         );
-        list_req.query_string =
-            format!("prefix={}&reverse=on&format=json", quote_path(&prefix));
+        list_req.query_string = format!("prefix={}&reverse=on&format=json", quote_path(&prefix));
         let mut list_resp = next(list_req);
         if list_resp.status == 404 {
             return next(req);
@@ -438,7 +442,10 @@ impl VersionedWrites {
             }
         }
 
-        if req.headers.get("X-Remove-Versions-Location").is_some_and(|v| !v.is_empty())
+        if req
+            .headers
+            .get("X-Remove-Versions-Location")
+            .is_some_and(|v| !v.is_empty())
             || req
                 .headers
                 .get("X-Remove-History-Location")
@@ -560,7 +567,10 @@ impl Middleware for VersionedWrites {
         if !container.is_empty()
             && object.is_empty()
             && self.allow_versioned_writes.is_some()
-            && (req.method == "PUT" || req.method == "POST" || req.method == "GET" || req.method == "HEAD")
+            && (req.method == "PUT"
+                || req.method == "POST"
+                || req.method == "GET"
+                || req.method == "HEAD")
         {
             return self.handle_container(req, next);
         }
@@ -569,11 +579,7 @@ impl Middleware for VersionedWrites {
             return next(req);
         }
 
-        let head = pre_authed(
-            "HEAD",
-            &format!("/{version}/{account}/{container}"),
-            &req,
-        );
+        let head = pre_authed("HEAD", &format!("/{version}/{account}/{container}"), &req);
         let cinfo = next(head);
         let Some(cfg) = self.read_version_cfg(&cinfo) else {
             return next(req);
@@ -633,13 +639,14 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
         let app: NextFn = Arc::new(move |r: Request| {
-            log2.lock().unwrap().push((r.method.clone(), r.path.clone()));
+            log2.lock()
+                .unwrap()
+                .push((r.method.clone(), r.path.clone()));
             match r.method.as_str() {
                 "HEAD" if r.path.ends_with("/c") || r.path.contains("/c?") => {
                     let mut resp = Response::new(204);
                     if versioned {
-                        resp.headers
-                            .set(SYSMETA_VERSIONS_LOC, "versions");
+                        resp.headers.set(SYSMETA_VERSIONS_LOC, "versions");
                         resp.headers.set(SYSMETA_VERSIONS_MODE, "stack");
                     }
                     resp
@@ -680,7 +687,9 @@ mod tests {
         let calls = log.lock().unwrap();
         assert!(calls.len() >= 4, "{calls:?}");
         assert_eq!(calls[0].0, "HEAD");
-        assert!(calls.iter().any(|(m, p)| m == "PUT" && p.contains("/versions/003obj/")));
+        assert!(calls
+            .iter()
+            .any(|(m, p)| m == "PUT" && p.contains("/versions/003obj/")));
     }
 
     #[test]
@@ -690,7 +699,9 @@ mod tests {
         let resp = vw.handle(req("PUT", "/v1/AUTH_test/c/obj"), &app);
         assert_eq!(resp.status, 201);
         let calls = log.lock().unwrap();
-        assert!(calls.iter().all(|(_, p)| !p.contains("/versions/") || p.ends_with("/versions")));
+        assert!(calls
+            .iter()
+            .all(|(_, p)| !p.contains("/versions/") || p.ends_with("/versions")));
     }
 
     #[test]
@@ -710,7 +721,9 @@ mod tests {
         let log2 = log.clone();
         let archive_name = "003obj/1751500000.00000";
         let app: NextFn = Arc::new(move |r: Request| {
-            log2.lock().unwrap().push((r.method.clone(), r.path.clone()));
+            log2.lock()
+                .unwrap()
+                .push((r.method.clone(), r.path.clone()));
             match (r.method.as_str(), r.path.as_str()) {
                 ("HEAD", p) if p.ends_with("/c") => {
                     let mut resp = Response::new(204);
@@ -783,10 +796,7 @@ mod tests {
         r.headers.set("X-Versions-Location", "versions");
         let resp = vw.handle(r, &app);
         assert_eq!(resp.status, 204);
-        assert_eq!(
-            resp.headers.get("X-Versions-Location"),
-            Some("versions")
-        );
+        assert_eq!(resp.headers.get("X-Versions-Location"), Some("versions"));
         let calls = log.lock().unwrap();
         assert_eq!(calls[0].1, "versions");
     }
@@ -844,9 +854,7 @@ mod tests {
         );
         assert!(
             calls.iter().any(|(m, p, ct)| {
-                m == "PUT"
-                    && p.contains("/versions/")
-                    && ct == DELETE_MARKER_CONTENT_TYPE
+                m == "PUT" && p.contains("/versions/") && ct == DELETE_MARKER_CONTENT_TYPE
             }),
             "delete marker missing: {calls:?}"
         );

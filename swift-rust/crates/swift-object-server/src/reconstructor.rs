@@ -126,9 +126,9 @@ pub fn local_frag_index(
     my_device: &str,
 ) -> Option<usize> {
     let nodes = ring.get_part_nodes(part).ok()?;
-    nodes.iter().position(|pn| {
-        pn.dev.ip == my_ip && pn.dev.port == my_port && pn.dev.device == my_device
-    })
+    nodes
+        .iter()
+        .position(|pn| pn.dev.ip == my_ip && pn.dev.port == my_port && pn.dev.device == my_device)
 }
 
 /// Gather `ndata` fragment archives for one object from its peers. Keeps
@@ -229,8 +229,8 @@ impl crate::ssync_sender::SyncDiskfileBuilder for EcSyncRebuilder<'_> {
                 chosen.timestamp
             ));
         }
-        let driver = EcDriver::new(self.scheme.ndata, self.scheme.nparity)
-            .map_err(|e| format!("{e:?}"))?;
+        let driver =
+            EcDriver::new(self.scheme.ndata, self.scheme.nparity).map_err(|e| format!("{e:?}"))?;
         let rebuilt = driver
             .reconstruct_object(
                 &archives,
@@ -272,8 +272,8 @@ pub fn rebuild_job(
     job: &ReconstructJob,
     fetcher: &dyn FragmentFetcher,
 ) -> Result<(), ReconstructError> {
-    let driver =
-        EcDriver::new(scheme.ndata, scheme.nparity).map_err(|e| ReconstructError::Ec(format!("{e:?}")))?;
+    let driver = EcDriver::new(scheme.ndata, scheme.nparity)
+        .map_err(|e| ReconstructError::Ec(format!("{e:?}")))?;
 
     let (chosen, archives) = gather_coherent_archives(
         &job.peers,
@@ -331,7 +331,10 @@ pub fn rebuild_job(
             MetaValue::Str("Content-Length".into()),
             MetaValue::Str(rebuilt.len().to_string()),
         ),
-        (MetaValue::Str("ETag".into()), MetaValue::Str(md5_hex(&rebuilt))),
+        (
+            MetaValue::Str("ETag".into()),
+            MetaValue::Str(md5_hex(&rebuilt)),
+        ),
         (
             MetaValue::Str("X-Object-Sysmeta-Ec-Etag".into()),
             MetaValue::Str(chosen.ec_etag.clone()),
@@ -376,7 +379,15 @@ pub fn run_jobs(
 ) -> ReconstructorStats {
     let mut stats = ReconstructorStats::default();
     for job in jobs {
-        match rebuild_job(device_path, policy_index, scheme, hash_config, cfg, job, fetcher) {
+        match rebuild_job(
+            device_path,
+            policy_index,
+            scheme,
+            hash_config,
+            cfg,
+            job,
+            fetcher,
+        ) {
             Ok(()) => stats.rebuilt += 1,
             Err(_) => stats.failed += 1,
         }
@@ -403,7 +414,8 @@ pub fn discover_jobs(
         let Some(part) = partition_of(&hash_dir, policy_index) else {
             continue;
         };
-        let Some(dest_index) = local_frag_index(ring, part as u32, my_ip, my_port, my_device) else {
+        let Some(dest_index) = local_frag_index(ring, part as u32, my_ip, my_port, my_device)
+        else {
             continue; // not a primary for this partition
         };
         let mut df = DiskFile::from_hash_dir(
@@ -430,7 +442,8 @@ pub fn discover_jobs(
         if have_local {
             continue;
         }
-        let Some((account, container, object)) = df.get_metadata().ok().and_then(object_name) else {
+        let Some((account, container, object)) = df.get_metadata().ok().and_then(object_name)
+        else {
             continue;
         };
         let peers: Vec<RingDevice> = ring
@@ -485,7 +498,15 @@ pub fn run_once(
         hash_config,
         cfg,
     );
-    run_jobs(device_path, policy_index, scheme, hash_config, cfg, &jobs, fetcher)
+    run_jobs(
+        device_path,
+        policy_index,
+        scheme,
+        hash_config,
+        cfg,
+        &jobs,
+        fetcher,
+    )
 }
 
 /// Parse `/{account}/{container}/{object}` out of the diskfile `name` metadata.
@@ -582,9 +603,7 @@ impl FragmentFetcher for HttpFragmentFetcher {
             let (k, v) = (k.trim(), v.trim());
             match k.to_ascii_lowercase().as_str() {
                 "x-object-sysmeta-ec-etag" => ec_etag = v.to_string(),
-                "x-object-sysmeta-ec-content-length" => {
-                    ec_content_length = v.parse().unwrap_or(0)
-                }
+                "x-object-sysmeta-ec-content-length" => ec_content_length = v.parse().unwrap_or(0),
                 "x-object-sysmeta-ec-frag-index" => frag_index = v.parse().unwrap_or(-1),
                 "x-backend-data-timestamp" | "x-backend-timestamp" => {
                     if timestamp.is_empty() {
@@ -683,10 +702,7 @@ fn suffixes_claiming_frag(hashes: &Hashes, frag_index: i64) -> Vec<String> {
 
 fn ssync_node(dev: &RingDevice, backend_index: i64) -> SsyncNode {
     SsyncNode {
-        replication_ip: dev
-            .replication_ip
-            .clone()
-            .unwrap_or_else(|| dev.ip.clone()),
+        replication_ip: dev.replication_ip.clone().unwrap_or_else(|| dev.ip.clone()),
         replication_port: dev.replication_port.unwrap_or(dev.port),
         device: dev.device.clone(),
         backend_index: Some(backend_index),
@@ -716,8 +732,7 @@ pub fn build_part_jobs(
     let local_node = part_nodes.iter().find(|node| node.dev.id == local_dev_id);
     let primary_frag_index: Option<i64> = local_node.map(|node| node.index as i64);
 
-    let Ok((_hashed, hashes)) = get_partition_hashes(part_path, policy, &[], true, cleanup)
-    else {
+    let Ok((_hashed, hashes)) = get_partition_hashes(part_path, policy, &[], true, cleanup) else {
         return Vec::new();
     };
     // The suffix hash cache is only ever refreshed by what goes through the
@@ -774,7 +789,10 @@ pub fn build_part_jobs(
             non_data_suffixes.push(suffix.clone());
         } else {
             for fi in data_fis {
-                data_fi_to_suffixes.entry(fi).or_default().push(suffix.clone());
+                data_fi_to_suffixes
+                    .entry(fi)
+                    .or_default()
+                    .push(suffix.clone());
             }
         }
     }
@@ -856,11 +874,8 @@ pub fn build_part_jobs(
 /// Runs one ssync exchange against a node; pluggable so job processing is
 /// testable without TCP (the real pusher dials [`TcpSsyncWire`]).
 pub trait SsyncPusher {
-    fn push(
-        &self,
-        sender: &Sender<'_>,
-        node: &SsyncNode,
-    ) -> Result<SenderReport, SsyncSenderError>;
+    fn push(&self, sender: &Sender<'_>, node: &SsyncNode)
+        -> Result<SenderReport, SsyncSenderError>;
 }
 
 /// The real TCP pusher: connect, run the exchange, terminate the request.
@@ -957,12 +972,7 @@ pub fn get_suffix_delta(
 pub trait SuffixHashFetcher {
     /// REPLICATE `/<device>/<partition>`: the partner's pickled per-suffix
     /// hash dict, decoded; `None` on any transport/HTTP/parse failure.
-    fn fetch_hashes(
-        &self,
-        node: &SsyncNode,
-        partition: u64,
-        policy_index: u32,
-    ) -> Option<Value>;
+    fn fetch_hashes(&self, node: &SsyncNode, partition: u64, policy_index: u32) -> Option<Value>;
 }
 
 /// Real REPLICATE-verb client (the request shape of the object replicator's
@@ -982,12 +992,7 @@ impl Default for HttpSuffixHashFetcher {
 }
 
 impl SuffixHashFetcher for HttpSuffixHashFetcher {
-    fn fetch_hashes(
-        &self,
-        node: &SsyncNode,
-        partition: u64,
-        policy_index: u32,
-    ) -> Option<Value> {
+    fn fetch_hashes(&self, node: &SsyncNode, partition: u64, policy_index: u32) -> Option<Value> {
         let addr = format!("{}:{}", node.replication_ip, node.replication_port);
         let sock: std::net::SocketAddr = addr.parse().ok()?;
         let conn = std::net::TcpStream::connect_timeout(&sock, self.conn_timeout).ok()?;
@@ -1209,7 +1214,15 @@ pub fn process_part_job(
                 }
             }
             if !job.sync_to.is_empty() && synced_with >= job.sync_to.len() {
-                delete_reverted_objs(devices, hash_config, cfg, policy_index, policy, job, &reverted);
+                delete_reverted_objs(
+                    devices,
+                    hash_config,
+                    cfg,
+                    policy_index,
+                    policy,
+                    job,
+                    &reverted,
+                );
                 stats.reverts += 1;
             }
         }
@@ -1252,8 +1265,7 @@ fn delete_reverted_objs(
         } else {
             cfg.cleanup.commit_window
         };
-        let data_files: Vec<&String> =
-            filenames.iter().filter(|f| f.ends_with(".data")).collect();
+        let data_files: Vec<&String> = filenames.iter().filter(|f| f.ends_with(".data")).collect();
         let purgable: Vec<&&String> = data_files
             .iter()
             .filter(|f| f.starts_with(&timestamps.ts_data.internal()))
@@ -1492,12 +1504,16 @@ mod suffix_sync_tests {
     /// Re-key every `Int(1)` frag entry to the partner's backend index and
     /// optionally corrupt one suffix's data hash.
     fn rekeyed_remote(local: &Value, remote_index: i64, corrupt_suffix: Option<&str>) -> Value {
-        let Value::Dict(suffixes) = local else { panic!("dict") };
+        let Value::Dict(suffixes) = local else {
+            panic!("dict")
+        };
         Value::Dict(
             suffixes
                 .iter()
                 .map(|(suffix, sub)| {
-                    let Value::Dict(sub) = sub else { panic!("sub dict") };
+                    let Value::Dict(sub) = sub else {
+                        panic!("sub dict")
+                    };
                     let corrupt = matches!(
                         (suffix, corrupt_suffix),
                         (Value::Str(s), Some(c)) if s == c
@@ -1546,7 +1562,11 @@ mod suffix_sync_tests {
             by_port: HashMap::from([(1111, remote)]),
         };
         let pusher = RecordingPusher::default();
-        let job = sync_job(&part_path, &["abc", "def"], vec![node(1111, 2), node(2222, 2)]);
+        let job = sync_job(
+            &part_path,
+            &["abc", "def"],
+            vec![node(1111, 2), node(2222, 2)],
+        );
 
         let hc = HashPathConfig::new("", "changeme").unwrap();
         let cfg = DiskFileConfig::default();
@@ -1683,7 +1703,11 @@ mod suffix_sync_tests {
         assert_eq!(jobs.len(), 1, "{jobs:?}");
         assert_eq!(jobs[0].job_type, EcJobType::Sync);
         assert_eq!(jobs[0].frag_index, Some(1));
-        assert_eq!(jobs[0].suffixes, ["def"], "an empty suffix is not ours to offer");
+        assert_eq!(
+            jobs[0].suffixes,
+            ["def"],
+            "an empty suffix is not ours to offer"
+        );
 
         // the point of the exercise: what a partner now reads over REPLICATE
         // no longer claims a fragment at our index for the emptied suffix, so
@@ -1896,7 +1920,10 @@ mod tests {
 
         // Rebuild fragment index 2 (this node lost it) from the other nodes.
         let dest = 2usize;
-        let peers: Vec<RingDevice> = (0..(k + m) as u64).filter(|i| *i != dest as u64).map(dev).collect();
+        let peers: Vec<RingDevice> = (0..(k + m) as u64)
+            .filter(|i| *i != dest as u64)
+            .map(dev)
+            .collect();
         let fetcher = FakeFetcher {
             archives: archives.clone(),
             ec_etag: ec_etag.clone(),

@@ -147,10 +147,16 @@ impl DbRsync {
                 let root = peer_map.get(&port)?;
                 Some((format!("{}/{rel}", root.display()), None))
             }
-            DbRsyncDest::Ssh { devices_root, ssh_opts } => {
+            DbRsyncDest::Ssh {
+                devices_root,
+                ssh_opts,
+            } => {
                 // peer_host is "ip:port"; the rsync target is root@ip:<root>/<rel>.
                 let ip = peer_host.split(':').next().unwrap_or(peer_host);
-                Some((format!("root@{ip}:{devices_root}/{rel}"), Some(ssh_opts.as_str())))
+                Some((
+                    format!("root@{ip}:{devices_root}/{rel}"),
+                    Some(ssh_opts.as_str()),
+                ))
             }
         }
     }
@@ -355,8 +361,12 @@ fn main() {
         ServerType::Account => "6012",
         ServerType::Container => "6011",
     };
-    let bind_port: u32 = get(server.section(), "bind_port", default_port).parse().unwrap_or(0);
-    let interval: u64 = get(server.repl_section(), "interval", "30").parse().unwrap_or(30);
+    let bind_port: u32 = get(server.section(), "bind_port", default_port)
+        .parse()
+        .unwrap_or(0);
+    let interval: u64 = get(server.repl_section(), "interval", "30")
+        .parse()
+        .unwrap_or(30);
     let log_name = get(server.repl_section(), "log_name", server.repl_section());
     let log_level = get(server.repl_section(), "log_level", "INFO")
         .parse::<LogLevel>()
@@ -372,14 +382,20 @@ fn main() {
             server.repl_section(),
         ),
     );
-    let recon_cache_path = get(server.repl_section(), "recon_cache_path", "/var/cache/swift");
+    let recon_cache_path = get(
+        server.repl_section(),
+        "recon_cache_path",
+        "/var/cache/swift",
+    );
     // Cross-machine rsync-over-ssh when `rsync_ssh_opts` is set; otherwise the
     // single-host local `peer_map = port:/local/root` model.
     let rsync_ssh_opts = get(server.repl_section(), "rsync_ssh_opts", "");
     let rsync_dest = if rsync_ssh_opts.is_empty() {
         let peer_map = parse_peer_map(&get(server.repl_section(), "peer_map", ""));
-        let port_of: HashMap<String, u32> =
-            peer_map.keys().map(|p| (format!("127.0.0.1:{p}"), *p)).collect();
+        let port_of: HashMap<String, u32> = peer_map
+            .keys()
+            .map(|p| (format!("127.0.0.1:{p}"), *p))
+            .collect();
         DbRsyncDest::Local { peer_map, port_of }
     } else {
         DbRsyncDest::Ssh {
@@ -485,10 +501,12 @@ mod tests {
         // Local mode stages into <peer root>/<device>/tmp/<stage_name>
         // (_rsync_db's rsync_path, db_replicator.py:394-395), never onto
         // the peer's live db path.
-        let peer_map: HashMap<u32, PathBuf> =
-            [(6011u32, PathBuf::from("/srv/node2"))].into_iter().collect();
-        let port_of: HashMap<String, u32> =
-            [("127.0.0.1:6011".to_string(), 6011u32)].into_iter().collect();
+        let peer_map: HashMap<u32, PathBuf> = [(6011u32, PathBuf::from("/srv/node2"))]
+            .into_iter()
+            .collect();
+        let port_of: HashMap<String, u32> = [("127.0.0.1:6011".to_string(), 6011u32)]
+            .into_iter()
+            .collect();
         let rsync = DbRsync {
             dest: DbRsyncDest::Local { peer_map, port_of },
         };

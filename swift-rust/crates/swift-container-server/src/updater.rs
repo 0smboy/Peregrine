@@ -121,7 +121,10 @@ impl AccountNodeClient for HttpAccountClient {
         container: &str,
         stat: &ContainerStat,
     ) -> ReportStatus {
-        let rep_ip = node.replication_ip.clone().unwrap_or_else(|| node.ip.clone());
+        let rep_ip = node
+            .replication_ip
+            .clone()
+            .unwrap_or_else(|| node.ip.clone());
         let rep_port = node.replication_port.unwrap_or(node.port);
         let host = format!("{rep_ip}:{rep_port}");
         let path = format!("/{}/{}", pe(account), pe(container));
@@ -374,22 +377,23 @@ mod tests {
         let mut broker = make_container(&device, "AUTH_test", "c");
         // put_timestamp advanced over reported (initialize sets reported to 0)
         let stat = ContainerStat::from_info(&broker.get_info().unwrap()).unwrap();
-        assert!(stat.needs_report(), "fresh container needs its first report");
+        assert!(
+            stat.needs_report(),
+            "fresh container needs its first report"
+        );
 
         let client = FakeAccount {
             calls: Mutex::new(Vec::new()),
             status: 204,
         };
         let mut stats = ContainerUpdaterStats::default();
-        let out =
-            process_container(&mut broker, &ring3(), &client, &mut stats).unwrap();
+        let out = process_container(&mut broker, &ring3(), &client, &mut stats).unwrap();
         assert_eq!(out, ContainerOutcome::Reported);
         assert_eq!(client.calls.lock().unwrap().len(), 3);
         assert_eq!(stats.successes, 1);
 
         // after reporting, stats now match -> no change on the next pass
-        let out2 =
-            process_container(&mut broker, &ring3(), &client, &mut stats).unwrap();
+        let out2 = process_container(&mut broker, &ring3(), &client, &mut stats).unwrap();
         assert_eq!(out2, ContainerOutcome::NoChange);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -405,8 +409,7 @@ mod tests {
             status: 500,
         };
         let mut stats = ContainerUpdaterStats::default();
-        let out =
-            process_container(&mut broker, &ring3(), &client, &mut stats).unwrap();
+        let out = process_container(&mut broker, &ring3(), &client, &mut stats).unwrap();
         assert_eq!(out, ContainerOutcome::Failed);
         assert_eq!(stats.failures, 1);
         // still needs report next time (reported_* untouched)

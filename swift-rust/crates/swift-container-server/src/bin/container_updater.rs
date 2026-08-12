@@ -23,8 +23,8 @@
 use std::path::Path;
 
 use swift_container_server::updater::{self, run_once, HttpAccountClient};
-use swift_core::daemon;
 use swift_core::config::SwiftConfig;
+use swift_core::daemon;
 use swift_core::hashing::HashPathConfig;
 use swift_core::obslog::{LogLevel, Logger};
 use swift_core::statsd::StatsdClient;
@@ -39,8 +39,9 @@ fn parse_conf_file(path: &str) -> SwiftConfig {
 }
 
 fn main() {
-    let conf_path =
-        std::env::args().nth(1).unwrap_or_else(|| "/etc/swift/container-server.conf".to_string());
+    let conf_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/etc/swift/container-server.conf".to_string());
     let run_once_only = std::env::args().nth(2).as_deref() == Some("once");
     let conf = parse_conf_file(&conf_path);
     let get = |section: &str, key: &str, default: &str| -> String {
@@ -52,7 +53,9 @@ fn main() {
     };
     let devices = get("app:container-server", "devices", "/srv/node");
     // Python parity: swift/container/updater.py defaults interval to 300 seconds.
-    let interval: u64 = get("container-updater", "interval", "300").parse().unwrap_or(300);
+    let interval: u64 = get("container-updater", "interval", "300")
+        .parse()
+        .unwrap_or(300);
     let log_name = get("container-updater", "log_name", "container-updater");
     let log_level = get("container-updater", "log_level", "INFO")
         .parse::<LogLevel>()

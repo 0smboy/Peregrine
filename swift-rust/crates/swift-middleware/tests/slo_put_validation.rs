@@ -195,10 +195,7 @@ fn matching_client_aggregate_etag_is_accepted_and_replaced_for_backend() {
     assert_eq!(response.status, 201);
     assert_eq!(writes.len(), 1);
     let physical_etag = md5_hex(&writes[0].body);
-    assert_eq!(
-        writes[0].headers.get("Etag"),
-        Some(physical_etag.as_str())
-    );
+    assert_eq!(writes[0].headers.get("Etag"), Some(physical_etag.as_str()));
     assert_ne!(writes[0].headers.get("Etag"), Some(slo_etag.as_str()));
     assert_eq!(
         response.headers.get("Etag"),
@@ -320,10 +317,7 @@ fn one_thousand_and_one_object_segments_are_rejected_before_backend_calls() {
         Some("text/html; charset=UTF-8")
     );
     assert_eq!(response.headers.get("Content-Length"), Some("48"));
-    assert_eq!(
-        backend_calls.load(std::sync::atomic::Ordering::SeqCst),
-        0
-    );
+    assert_eq!(backend_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 #[test]

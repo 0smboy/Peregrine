@@ -63,10 +63,7 @@ fn server(devices: &Path) -> ObjectServer {
         )
         .unwrap(),
         diskfile: swift_diskfile::DiskFileConfig::default(),
-        policies: std::collections::HashMap::from([(
-            0,
-            swift_diskfile::PolicyKind::Replication,
-        )]),
+        policies: std::collections::HashMap::from([(0, swift_diskfile::PolicyKind::Replication)]),
         container_update_timeout: std::time::Duration::from_secs(1),
         container_update_mode: ContainerUpdateMode::Sync,
     })
@@ -150,10 +147,7 @@ fn short_body_is_a_499_and_commits_nothing() {
     let devices = TestDevices::new("short");
     let server = server(devices.path());
     // Declares 1000 bytes but the stream ends after 400.
-    let body = Body::from_reader(
-        Box::new(std::io::Cursor::new(pattern(400))),
-        Some(1000),
-    );
+    let body = Body::from_reader(Box::new(std::io::Cursor::new(pattern(400))), Some(1000));
     let put = server.handle(request("PUT", "1", body));
     assert_eq!(put.status, 499);
     // Nothing was committed: no data file anywhere under objects/, and
@@ -313,5 +307,9 @@ fn multi_range_get_matches_the_buffered_oracle() {
         resp.headers.get("Content-Length").unwrap(),
         expected.len().to_string()
     );
-    assert_eq!(got, &expected[..], "multipart body diverged from the oracle");
+    assert_eq!(
+        got,
+        &expected[..],
+        "multipart body diverged from the oracle"
+    );
 }

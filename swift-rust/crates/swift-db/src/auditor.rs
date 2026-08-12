@@ -148,11 +148,7 @@ fn is_mountpoint(path: &Path) -> bool {
 }
 
 /// Audit account or container DBs on every local device.
-pub fn audit_dbs_on_devices(
-    devices_root: &Path,
-    mount_check: bool,
-    kind: &str,
-) -> DbAuditReport {
+pub fn audit_dbs_on_devices(devices_root: &Path, mount_check: bool, kind: &str) -> DbAuditReport {
     let mut report = DbAuditReport::default();
     for device in list_db_devices(devices_root, mount_check) {
         let one = match kind {
@@ -178,7 +174,8 @@ mod tests {
         std::fs::create_dir_all(&hd).unwrap();
         let good = hd.join("00000000000000000000000000000abc.db");
         let mut b = ContainerBroker::new(&good, "a", "c");
-        b.initialize("1751500000.00000", 0, "1751500000.00000", "id").unwrap();
+        b.initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
         b.get_info().unwrap();
 
         // a corrupt DB

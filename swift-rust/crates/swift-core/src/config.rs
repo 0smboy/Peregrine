@@ -319,9 +319,7 @@ impl AffinityLocalityPredicate {
         for piece in affinity_str.split(',').map(str::trim) {
             match parse_r_z(piece) {
                 Some(rz) => matchers.push(rz),
-                None => {
-                    return err(format!("Invalid write-affinity value: {affinity_str:?}"))
-                }
+                None => return err(format!("Invalid write-affinity value: {affinity_str:?}")),
             }
         }
         Ok(Some(AffinityLocalityPredicate { matchers }))
@@ -490,7 +488,10 @@ impl SwiftConfig {
             cur_option = None;
             if let Some(rest) = stripped.strip_prefix('[') {
                 let end = rest.find(']').ok_or_else(|| {
-                    ConfigError(format!("line {}: invalid section header: {line:?}", lineno + 1))
+                    ConfigError(format!(
+                        "line {}: invalid section header: {line:?}",
+                        lineno + 1
+                    ))
                 })?;
                 let name = &rest[..end];
                 if name.is_empty() {
@@ -511,16 +512,16 @@ impl SwiftConfig {
                     })
                 };
                 if self.strict && seen_sections.contains(&sect) {
-                    return err(format!("While reading from config: section {name:?} already exists"));
+                    return err(format!(
+                        "While reading from config: section {name:?} already exists"
+                    ));
                 }
                 seen_sections.push(sect);
                 cur_section = Some(sect);
                 continue;
             }
             let Some(sect) = cur_section else {
-                return err(format!(
-                    "File contains no section headers.\nline: {line:?}"
-                ));
+                return err(format!("File contains no section headers.\nline: {line:?}"));
             };
             // option line: first '=' or ':' is the delimiter
             let delim = stripped
@@ -535,9 +536,7 @@ impl SwiftConfig {
             };
             let key = stripped[..delim].trim().to_string();
             let value = stripped[delim + 1..].trim().to_string();
-            if self.strict
-                && pending.iter().any(|(s, k, _)| *s == sect && *k == key)
-            {
+            if self.strict && pending.iter().any(|(s, k, _)| *s == sect && *k == key) {
                 return err(format!(
                     "While reading from config: option {key:?} in section already exists"
                 ));
@@ -657,7 +656,9 @@ impl SwiftConfig {
                             Some(')') => break,
                             Some(ch) => name.push(ch),
                             None => {
-                                return err(format!("bad interpolation variable reference {value:?}"))
+                                return err(format!(
+                                    "bad interpolation variable reference {value:?}"
+                                ))
                             }
                         }
                     }
@@ -772,10 +773,7 @@ mod tests {
 
     #[test]
     fn test_request_node_count() {
-        assert_eq!(
-            config_request_node_count_value("3").unwrap().get(4),
-            3
-        );
+        assert_eq!(config_request_node_count_value("3").unwrap().get(4), 3);
         assert_eq!(
             config_request_node_count_value("2 * replicas")
                 .unwrap()
@@ -877,15 +875,9 @@ escaped = 100%%
     #[test]
     fn test_parse_sections_and_defaults() {
         let c = SwiftConfig::parse(SAMPLE, &[], false).unwrap();
-        assert_eq!(
-            c.section_names(),
-            vec!["pipeline:main", "app:proxy-server"]
-        );
+        assert_eq!(c.section_names(), vec!["pipeline:main", "app:proxy-server"]);
         // DEFAULT options visible in every section
-        assert_eq!(
-            c.get("pipeline:main", "user").unwrap().unwrap(),
-            "swift"
-        );
+        assert_eq!(c.get("pipeline:main", "user").unwrap().unwrap(), "swift");
         assert_eq!(
             c.get("app:proxy-server", "bind_port").unwrap().unwrap(),
             "8080"
@@ -943,7 +935,10 @@ escaped = 100%%
         // defaults come first, then section options
         assert_eq!(items[0].0, "user");
         assert_eq!(items[1].0, "swift_dir");
-        assert_eq!(items[2], ("pipeline".into(), "catch_errors proxy-server".into()));
+        assert_eq!(
+            items[2],
+            ("pipeline".into(), "catch_errors proxy-server".into())
+        );
     }
 
     #[test]

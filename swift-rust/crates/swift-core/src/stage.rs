@@ -50,11 +50,13 @@ pub fn observe(service: &'static str, path: &'static str, stage: &'static str, s
         return;
     }
     if let Ok(mut g) = reg().lock() {
-        let e = g.entry(Key {
-            service,
-            path,
-            stage,
-        }).or_default();
+        let e = g
+            .entry(Key {
+                service,
+                path,
+                stage,
+            })
+            .or_default();
         e.sum_secs += secs;
         e.count = e.count.saturating_add(1);
     }
@@ -69,10 +71,7 @@ pub fn observe_statsd(
     secs: f64,
 ) {
     observe(service, path, stage, secs);
-    statsd.timing(
-        &format!("stage.{service}.{path}.{stage}"),
-        secs * 1000.0,
-    );
+    statsd.timing(&format!("stage.{service}.{path}.{stage}"), secs * 1000.0);
 }
 
 /// RAII timer that calls [`observe`] on drop.
@@ -144,9 +143,8 @@ pub fn snapshot() -> Vec<serde_json::Value> {
 }
 
 pub fn snapshot_json() -> String {
-    serde_json::to_string(&serde_json::json!({ "stages": snapshot() })).unwrap_or_else(|_| {
-        "{\"stages\":[]}".into()
-    })
+    serde_json::to_string(&serde_json::json!({ "stages": snapshot() }))
+        .unwrap_or_else(|_| "{\"stages\":[]}".into())
 }
 
 #[cfg(test)]
@@ -157,9 +155,9 @@ mod tests {
     fn observe_accumulates() {
         observe("proxy-server", "put", "test_stage_unit", 0.01);
         observe("proxy-server", "put", "test_stage_unit", 0.02);
-        let hit = snapshot().into_iter().find(|v| {
-            v.get("stage").and_then(|x| x.as_str()) == Some("test_stage_unit")
-        });
+        let hit = snapshot()
+            .into_iter()
+            .find(|v| v.get("stage").and_then(|x| x.as_str()) == Some("test_stage_unit"));
         let hit = hit.expect("stage present");
         assert_eq!(hit.get("count").and_then(|x| x.as_u64()), Some(2));
         let sum = hit.get("sum_seconds").and_then(|x| x.as_f64()).unwrap();

@@ -223,8 +223,7 @@ impl Match {
     }
 
     pub fn matches(&self, val: &str) -> bool {
-        self.tags.iter().any(|t| t == "*")
-            || self.tags.iter().any(|t| t == normalize_etag(val))
+        self.tags.iter().any(|t| t == "*") || self.tags.iter().any(|t| t == normalize_etag(val))
     }
 }
 

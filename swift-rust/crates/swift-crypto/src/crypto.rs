@@ -242,7 +242,11 @@ pub fn encrypt_header_value(key: &[u8], iv: &[u8], value: &[u8]) -> Result<Strin
 /// `decrypter.decrypt_value`).
 ///
 /// Metadata values are never ranged, so decryption always starts at offset 0.
-pub fn decrypt_header_value(key: &[u8], iv: &[u8], b64_value: &str) -> Result<Vec<u8>, CryptoError> {
+pub fn decrypt_header_value(
+    key: &[u8],
+    iv: &[u8],
+    b64_value: &str,
+) -> Result<Vec<u8>, CryptoError> {
     let ciphertext = B64
         .decode(b64_value.as_bytes())
         .map_err(|e| CryptoError::Base64(e.to_string()))?;
@@ -274,8 +278,7 @@ mod tests {
     // interoperability of the core cipher with the Python implementation. The
     // counter starts at f0f1...feff and increments over the full 128-bit block,
     // exercising the carry that both modes.CTR and Ctr128BE perform.
-    const NIST_KEY: &str =
-        "603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4";
+    const NIST_KEY: &str = "603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4";
     const NIST_IV: &str = "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff";
     const NIST_PT: &str = "6bc1bee22e409f96e93d7e117393172a\
                            ae2d8a571e03ac9c9eb76fac45af8e51\
@@ -301,8 +304,7 @@ mod tests {
     // ---- Known-answer vector generated directly from crypto_utils.py's exact
     // construction (pyca cryptography 49.0.0), see the crate's test notes. ----
     // key = bytes(range(32)); iv = 00..00ff (chosen to force a counter carry).
-    const PY_KEY: &str =
-        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const PY_KEY: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     const PY_IV: &str = "000000000000000000000000000000ff";
     const PY_PT: &str = "54686520717569636b2062726f776e20666f78206a756d7073206f\
                          76657220746865206c617a7920646f672e203132333435363738393021";
@@ -404,8 +406,7 @@ mod tests {
 
     // ---- Metadata value helper, generated from Python encrypt_header_val:
     // key = 0xAA*32; iv = 00..0f; value = "Hello, 世界" (utf-8). ----
-    const META_KEY: &str =
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const META_KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const META_IV: &str = "000102030405060708090a0b0c0d0e0f";
     const META_VALUE_UTF8: &str = "Hello, 世界";
     const META_ENC_B64: &str = "qU/Kk5d/J8URxRcgvQ==";

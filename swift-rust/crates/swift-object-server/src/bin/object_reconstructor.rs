@@ -315,11 +315,13 @@ fn sweep_policy(
                     fetcher: &frag_fetcher,
                 };
                 #[cfg(feature = "ec")]
-                let diskfile_builder: Option<&dyn swift_object_server::ssync_sender::SyncDiskfileBuilder> =
-                    Some(&rebuilder);
+                let diskfile_builder: Option<
+                    &dyn swift_object_server::ssync_sender::SyncDiskfileBuilder,
+                > = Some(&rebuilder);
                 #[cfg(not(feature = "ec"))]
-                let diskfile_builder: Option<&dyn swift_object_server::ssync_sender::SyncDiskfileBuilder> =
-                    None;
+                let diskfile_builder: Option<
+                    &dyn swift_object_server::ssync_sender::SyncDiskfileBuilder,
+                > = None;
                 process_part_job(
                     devices_path,
                     hash_config,

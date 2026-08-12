@@ -298,7 +298,10 @@ mod tests {
             container_head(204, &[]),
         );
         assert_created(&resp);
-        assert_eq!(log.lock().unwrap().as_slice(), &[("PUT".into(), "/v1/a/c".into())]);
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &[("PUT".into(), "/v1/a/c".into())]
+        );
     }
 
     #[test]
@@ -308,7 +311,10 @@ mod tests {
             container_head(204, &[]),
         );
         assert_eq!(resp.status, 400);
-        assert_eq!(String::from_utf8_lossy(body_bytes(&resp)), "Invalid bytes quota.");
+        assert_eq!(
+            String::from_utf8_lossy(body_bytes(&resp)),
+            "Invalid bytes quota."
+        );
         // rejected before ever reaching the backend
         assert!(log.lock().unwrap().is_empty());
     }
@@ -320,7 +326,10 @@ mod tests {
             container_head(204, &[]),
         );
         assert_eq!(resp.status, 400);
-        assert_eq!(String::from_utf8_lossy(body_bytes(&resp)), "Invalid count quota.");
+        assert_eq!(
+            String::from_utf8_lossy(body_bytes(&resp)),
+            "Invalid count quota."
+        );
     }
 
     #[test]
@@ -374,7 +383,10 @@ mod tests {
             ),
         );
         assert_eq!(resp.status, 413);
-        assert_eq!(String::from_utf8_lossy(body_bytes(&resp)), "Upload exceeds quota.");
+        assert_eq!(
+            String::from_utf8_lossy(body_bytes(&resp)),
+            "Upload exceeds quota."
+        );
         // only the HEAD subrequest happened; the object PUT was blocked
         assert_eq!(
             log.lock().unwrap().as_slice(),
@@ -428,7 +440,10 @@ mod tests {
             ),
         );
         assert_eq!(resp.status, 413);
-        assert_eq!(String::from_utf8_lossy(body_bytes(&resp)), "Upload exceeds quota.");
+        assert_eq!(
+            String::from_utf8_lossy(body_bytes(&resp)),
+            "Upload exceeds quota."
+        );
     }
 
     #[test]

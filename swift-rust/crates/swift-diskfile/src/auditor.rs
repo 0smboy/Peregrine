@@ -137,7 +137,14 @@ pub fn audit_device(
 ) -> AuditReport {
     let mut report = AuditReport::default();
     for hash_dir in audit_locations(device_path, policy_index) {
-        match audit_object(device_path, &hash_dir, policy, policy_index, hash_config, cfg) {
+        match audit_object(
+            device_path,
+            &hash_dir,
+            policy,
+            policy_index,
+            hash_config,
+            cfg,
+        ) {
             AuditOutcome::Passed => report.passed += 1,
             AuditOutcome::Quarantined => {
                 report.quarantined += 1;
@@ -256,7 +263,10 @@ mod tests {
             format!("{:x}", Md5::digest(body))
         };
         let meta: crate::metadata::Metadata = vec![
-            ("X-Timestamp".into(), MetaValue::Str("3286000000.00000".into())),
+            (
+                "X-Timestamp".into(),
+                MetaValue::Str("3286000000.00000".into()),
+            ),
             ("Content-Type".into(), "text/plain".into()),
             ("ETag".into(), MetaValue::Str(etag)),
             (
@@ -283,7 +293,10 @@ mod tests {
         )
         .unwrap();
         let meta: crate::metadata::Metadata = vec![
-            ("X-Timestamp".into(), MetaValue::Str("3286000000.00000".into())),
+            (
+                "X-Timestamp".into(),
+                MetaValue::Str("3286000000.00000".into()),
+            ),
             ("Content-Type".into(), "text/plain".into()),
             (
                 "ETag".into(),
@@ -303,13 +316,7 @@ mod tests {
         assert_eq!(audit_locations(&device, 0).len(), 1);
 
         // Multi-device pass sees the same device under devices_root.
-        let multi = audit_devices(
-            &dir,
-            false,
-            &[(0, PolicyKind::Replication)],
-            &hc(),
-            &cfg,
-        );
+        let multi = audit_devices(&dir, false, &[(0, PolicyKind::Replication)], &hc(), &cfg);
         assert_eq!(multi.passed, 1);
         assert_eq!(list_devices(&dir, false), vec![device]);
         std::fs::remove_dir_all(&dir).unwrap();

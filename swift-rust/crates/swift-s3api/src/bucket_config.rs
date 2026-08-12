@@ -376,7 +376,10 @@ mod tests {
         </VersioningConfiguration>"#;
         assert_eq!(parse_versioning_status(body2).unwrap(), "Suspended");
         assert!(parse_versioning_status(br"<VersioningConfiguration/>").is_err());
-        assert!(parse_versioning_status(br"<VersioningConfiguration><Status>Bogus</Status></VersioningConfiguration>").is_err());
+        assert!(parse_versioning_status(
+            br"<VersioningConfiguration><Status>Bogus</Status></VersioningConfiguration>"
+        )
+        .is_err());
     }
 
     #[test]
@@ -463,10 +466,8 @@ mod tests {
 
     #[test]
     fn empty_list_versions_shape() {
-        let xml = String::from_utf8(empty_list_versions_result_xml(
-            "mybucket", "", "", "", 1000,
-        ))
-        .unwrap();
+        let xml = String::from_utf8(empty_list_versions_result_xml("mybucket", "", "", "", 1000))
+            .unwrap();
         assert!(xml.contains("ListVersionsResult"));
         assert!(xml.contains("<Name>mybucket</Name>"));
         assert!(xml.contains("<IsTruncated>false</IsTruncated>"));

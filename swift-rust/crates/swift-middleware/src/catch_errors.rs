@@ -86,8 +86,7 @@ mod tests {
     #[test]
     fn test_stamps_trans_id() {
         let ce = CatchErrors::new("-suffix");
-        let app: Arc<dyn Fn(Request) -> Response + Send + Sync> =
-            Arc::new(|_r| Response::new(204));
+        let app: Arc<dyn Fn(Request) -> Response + Send + Sync> = Arc::new(|_r| Response::new(204));
         let req = Request {
             method: "GET".into(),
             path: "/v1/a".into(),

@@ -223,7 +223,9 @@ impl<C: MemcacheConn> MemcacheClient<C> {
             .collect();
 
         let tries = config.tries.clamp(1, servers.len());
-        let errors = (0..servers.len()).map(|_| ServerErrors::default()).collect();
+        let errors = (0..servers.len())
+            .map(|_| ServerErrors::default())
+            .collect();
         let conns = (0..servers.len()).map(|_| None).collect();
 
         Ok(MemcacheClient {
@@ -476,9 +478,7 @@ impl<C: MemcacheConn> MemcacheClient<C> {
     fn candidate_indices(&self, hash_key: &[u8]) -> Vec<usize> {
         let n = self.ring.len();
         // bisect_right: number of ring entries whose hash <= hash_key.
-        let mut pos = self
-            .ring
-            .partition_point(|e| e.hash.as_slice() <= hash_key);
+        let mut pos = self.ring.partition_point(|e| e.hash.as_slice() <= hash_key);
         let mut served: Vec<usize> = Vec::with_capacity(self.tries);
         while served.len() < self.tries {
             pos = (pos + 1) % n;
@@ -611,7 +611,10 @@ fn parse_get(resp: &[u8], hash_key: &[u8]) -> Result<Option<(u32, Vec<u8>)>, Mem
         let line = trim_crlf(&resp[pos..line_end]);
         pos = line_end + 1;
 
-        let fields: Vec<&[u8]> = line.split(|&b| b == b' ').filter(|f| !f.is_empty()).collect();
+        let fields: Vec<&[u8]> = line
+            .split(|&b| b == b' ')
+            .filter(|f| !f.is_empty())
+            .collect();
         if fields.is_empty() {
             return Err(incomplete());
         }
@@ -620,7 +623,9 @@ fn parse_get(resp: &[u8], hash_key: &[u8]) -> Result<Option<(u32, Vec<u8>)>, Mem
         }
         if fields[0].eq_ignore_ascii_case(b"VALUE") {
             if fields.len() < 4 {
-                return Err(MemcacheError::Connection("malformed VALUE header".to_string()));
+                return Err(MemcacheError::Connection(
+                    "malformed VALUE header".to_string(),
+                ));
             }
             let flags = ascii_u64(fields[2])? as u32;
             let size = ascii_u64(fields[3])? as usize;
@@ -717,12 +722,14 @@ mod tests {
                     "dead server",
                 ));
             }
-            let nl = cmd
-                .iter()
-                .position(|&b| b == b'\n')
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no newline"))?;
+            let nl = cmd.iter().position(|&b| b == b'\n').ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "no newline")
+            })?;
             let line = trim_crlf(&cmd[..nl]);
-            let f: Vec<&[u8]> = line.split(|&b| b == b' ').filter(|p| !p.is_empty()).collect();
+            let f: Vec<&[u8]> = line
+                .split(|&b| b == b' ')
+                .filter(|p| !p.is_empty())
+                .collect();
             let data_start = nl + 1;
 
             let out = match f[0] {
@@ -903,7 +910,10 @@ mod tests {
         // A small TTL is passed through verbatim into the set command.
         h.client.set_raw("ttl", b"v", 0, 120).unwrap();
         let key = md5hash(b"ttl");
-        assert_eq!(h.stores["10.0.0.1:11211"].lock().unwrap().items[&key].exptime, 120);
+        assert_eq!(
+            h.stores["10.0.0.1:11211"].lock().unwrap().items[&key].exptime,
+            120
+        );
 
         // A TTL beyond 30 days is converted to an absolute time using the
         // clock (sanitize_timeout).
@@ -929,11 +939,21 @@ mod tests {
             // Routing is stable across calls.
             assert_eq!(h.client.primary_server(&key), h.client.primary_server(&key));
             let primary = h.client.primary_server(&key);
-            h.client.set_raw(&key, format!("v{i}").as_bytes(), 0, 0).unwrap();
+            h.client
+                .set_raw(&key, format!("v{i}").as_bytes(), 0, 0)
+                .unwrap();
             let hk = md5hash(key.as_bytes());
             // The value lands in exactly the primary's store.
-            let in_a = h.stores["10.0.0.1:11211"].lock().unwrap().items.contains_key(&hk);
-            let in_b = h.stores["10.0.0.2:11211"].lock().unwrap().items.contains_key(&hk);
+            let in_a = h.stores["10.0.0.1:11211"]
+                .lock()
+                .unwrap()
+                .items
+                .contains_key(&hk);
+            let in_b = h.stores["10.0.0.2:11211"]
+                .lock()
+                .unwrap()
+                .items
+                .contains_key(&hk);
             assert_ne!(in_a, in_b, "key must live on exactly one server");
             if primary == "10.0.0.1:11211" {
                 assert!(in_a);
@@ -987,7 +1007,10 @@ mod tests {
         for _ in 0..5 {
             h.client.set_raw(&key, b"v", 0, 0).unwrap();
         }
-        assert_eq!(h.stores[dead].lock().unwrap().connects, connects_when_limited);
+        assert_eq!(
+            h.stores[dead].lock().unwrap().connects,
+            connects_when_limited
+        );
 
         // Suppression expires once the clock passes limited_until.
         *now.lock().unwrap() = 1_000.0 + 61.0;

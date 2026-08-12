@@ -305,7 +305,10 @@ pub fn list_account_containers(account_ring: &Ring, account: &str) -> Option<Vec
             &host,
             "GET",
             &path,
-            &[("Accept", "application/json"), ("X-Backend-Allow-Reserved-Names", "true")],
+            &[
+                ("Accept", "application/json"),
+                ("X-Backend-Allow-Reserved-Names", "true"),
+            ],
         ) else {
             continue;
         };
@@ -608,15 +611,9 @@ mod tests {
     fn test_iter_due_stops_at_future() {
         let now = 1751500000;
         let objs = vec![
-            (
-                build_task_obj(now - 100, "a", "c", "past1"),
-                String::new(),
-            ),
+            (build_task_obj(now - 100, "a", "c", "past1"), String::new()),
             (build_task_obj(now, "a", "c", "now"), String::new()),
-            (
-                build_task_obj(now + 100, "a", "c", "future"),
-                String::new(),
-            ),
+            (build_task_obj(now + 100, "a", "c", "future"), String::new()),
             (build_task_obj(now + 200, "a", "c", "later"), String::new()),
         ];
         let due = iter_due_tasks(".expiring_objects", "0000000000", &objs, now);

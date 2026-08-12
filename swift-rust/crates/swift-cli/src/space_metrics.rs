@@ -81,9 +81,9 @@ pub fn scan_tombstones(devices_root: &Path) -> TombstoneReport {
             });
         }
     }
-    report.buckets.sort_by(|a, b| {
-        (&a.device, &a.policy).cmp(&(&b.device, &b.policy))
-    });
+    report
+        .buckets
+        .sort_by(|a, b| (&a.device, &a.policy).cmp(&(&b.device, &b.policy)));
     report
 }
 

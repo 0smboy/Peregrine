@@ -95,10 +95,7 @@ fn validate_fragment_index(
     n_unique_fragments: Option<u32>,
 ) -> Result<i64, DiskFileError> {
     let frag_index = raw.and_then(python_int).ok_or_else(|| {
-        DiskFileError::BadFragmentIndex(format!(
-            "Bad fragment index: {}",
-            raw.unwrap_or("None")
-        ))
+        DiskFileError::BadFragmentIndex(format!("Bad fragment index: {}", raw.unwrap_or("None")))
     })?;
     if frag_index < 0 {
         return Err(DiskFileError::BadFragmentIndex(format!(
@@ -129,8 +126,7 @@ pub fn parse_ondisk_filename(
                     "Invalid Timestamp value in filename {filename:?}"
                 ))
             })?;
-            let frag_index =
-                validate_fragment_index(parts.get(1).copied(), n_unique_fragments)?;
+            let frag_index = validate_fragment_index(parts.get(1).copied(), n_unique_fragments)?;
             let durable = parts.get(2) == Some(&"d");
             return Ok(FileInfo {
                 timestamp,
@@ -191,8 +187,7 @@ pub fn make_ec_ondisk_filename(
     frag_index: i64,
     durable: bool,
 ) -> Result<String, DiskFileError> {
-    let frag_index =
-        validate_fragment_index(Some(&frag_index.to_string()), None)?;
+    let frag_index = validate_fragment_index(Some(&frag_index.to_string()), None)?;
     let mut rv = format!("{}#{}", timestamp.internal(), frag_index);
     if durable {
         rv.push_str("#d");
@@ -240,8 +235,7 @@ mod tests {
             Err(DiskFileError::BadFragmentIndex(_))
         ));
         // extra parts after the durable marker are tolerated, as in Python
-        let info =
-            parse_ondisk_filename("1751500001.00000#3#d#x.data", policy).unwrap();
+        let info = parse_ondisk_filename("1751500001.00000#3#d#x.data", policy).unwrap();
         assert_eq!(info.durable, Some(true));
         let info = parse_ondisk_filename("1751500001.00000#3#x.data", policy).unwrap();
         assert_eq!(info.durable, Some(false));
@@ -251,7 +245,10 @@ mod tests {
     fn test_make_filenames() {
         let t1: Timestamp = "1751500001.00000".parse().unwrap();
         let t2: Timestamp = "1751500002.00000".parse().unwrap();
-        assert_eq!(make_ondisk_filename(&t1, Some(".ts"), None), "1751500001.00000.ts");
+        assert_eq!(
+            make_ondisk_filename(&t1, Some(".ts"), None),
+            "1751500001.00000.ts"
+        );
         assert_eq!(
             make_ondisk_filename(&t1, Some(".meta"), Some(&t2)),
             "1751500001.00000+186a0.meta"

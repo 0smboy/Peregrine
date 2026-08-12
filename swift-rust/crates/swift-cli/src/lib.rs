@@ -120,7 +120,11 @@ impl GetNodesReport {
             .map(|n| placed(n.dev, n.index, false))
             .collect();
         let handoffs = ring.get_more_nodes(part)?;
-        let take = if all_handoffs { handoffs.len() } else { nodes.len() };
+        let take = if all_handoffs {
+            handoffs.len()
+        } else {
+            nodes.len()
+        };
         for h in handoffs.iter().take(take) {
             out.push(placed(h.dev, h.handoff_index, true));
         }

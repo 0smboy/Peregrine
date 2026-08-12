@@ -39,8 +39,7 @@ use swift_http::{split_path, Body, HeaderKeyDict, Request, Response};
 use crate::{Middleware, NextFn};
 
 /// The `copy` middleware.
-#[derive(Default)]
-#[derive(Debug, Clone)]
+#[derive(Default, Debug, Clone)]
 pub struct Copy {
     /// Seconds between cooperative yield points during large copies
     /// (`[filter:copy] yield_frequency`, default 10).
@@ -118,13 +117,7 @@ fn set_multipart_manifest_param(query: &str, value: Option<&str>) -> String {
     }
     parts
         .into_iter()
-        .map(|(k, v)| {
-            if v.is_empty() {
-                k
-            } else {
-                format!("{k}={v}")
-            }
-        })
+        .map(|(k, v)| if v.is_empty() { k } else { format!("{k}={v}") })
         .collect::<Vec<_>>()
         .join("&")
 }
@@ -142,7 +135,10 @@ impl Copy {
 
         let copy_from = req.headers.get("X-Copy-From").unwrap_or("").to_string();
         let Some((src_container, src_object)) = parse_container_object(&copy_from) else {
-            return Response::error(412, "X-Copy-From header must be of the form /container/object");
+            return Response::error(
+                412,
+                "X-Copy-From header must be of the form /container/object",
+            );
         };
         let src_account = req
             .headers
@@ -208,10 +204,7 @@ impl Copy {
             .get("X-Static-Large-Object")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let source_dlo_manifest = source
-            .headers
-            .get("X-Object-Manifest")
-            .map(str::to_string);
+        let source_dlo_manifest = source.headers.get("X-Object-Manifest").map(str::to_string);
 
         // 2) build the destination PUT: source body, merged headers.
         let mut put_headers = HeaderKeyDict::new();
@@ -306,7 +299,8 @@ impl Middleware for Copy {
             // rewrite as a PUT-with-X-Copy-From to the destination
             req.method = "PUT".to_string();
             req.path = format!("/{version}/{dst_account}/{dst_container}/{dst_object}");
-            req.headers.set("X-Copy-From", format!("/{container}/{object}"));
+            req.headers
+                .set("X-Copy-From", format!("/{container}/{object}"));
             req.headers.set("X-Copy-From-Account", account.clone());
             req.headers.remove("Destination");
             req.headers.remove("Destination-Account");
@@ -399,7 +393,10 @@ mod tests {
         assert_eq!(resp.status, 201);
         let calls = log.lock().unwrap();
         assert_eq!(calls[0].path, "/v1/AUTH_test/srcc/srco", "GET the source");
-        assert_eq!(calls[1].path, "/v1/AUTH_test/dstc/dsto", "PUT the destination");
+        assert_eq!(
+            calls[1].path, "/v1/AUTH_test/dstc/dsto",
+            "PUT the destination"
+        );
     }
 
     #[test]
@@ -495,10 +492,7 @@ mod tests {
                 resp.headers.set("X-Static-Large-Object", "True");
                 resp.headers.set("Content-Type", "application/json");
                 // Source GET must ask for the raw manifest.
-                assert!(
-                    qs.contains("multipart-manifest=get"),
-                    "source GET qs={qs}"
-                );
+                assert!(qs.contains("multipart-manifest=get"), "source GET qs={qs}");
                 resp
             } else {
                 Response::new(201)
@@ -549,9 +543,6 @@ mod tests {
         assert_eq!(resp.status, 201);
         let calls = log.lock().unwrap();
         assert!(!calls[1].query_string.contains("multipart-manifest"));
-        assert_eq!(
-            calls[1].headers.get("X-Object-Manifest"),
-            Some("c/segs/")
-        );
+        assert_eq!(calls[1].headers.get("X-Object-Manifest"), Some("c/segs/"));
     }
 }

@@ -487,7 +487,11 @@ mod tests {
         // Account has usage but no quota metadata: the object PUT sails
         // through after both HEAD subrequests.
         let next = backend(vec![
-            ("HEAD", "/v1/a", resp(200, &[("x-account-bytes-used", "1000")])),
+            (
+                "HEAD",
+                "/v1/a",
+                resp(200, &[("x-account-bytes-used", "1000")]),
+            ),
             (
                 "HEAD",
                 "/v1/a/c",
@@ -548,7 +552,10 @@ mod tests {
                 ],
             ),
         )]);
-        assert_over_quota(&run(mk("PUT", "/v1/a/c/o", &[]), next), "Upload exceeds quota.");
+        assert_over_quota(
+            &run(mk("PUT", "/v1/a/c/o", &[]), next),
+            "Upload exceeds quota.",
+        );
     }
 
     #[test]
@@ -566,7 +573,10 @@ mod tests {
                 ],
             ),
         )]);
-        assert_over_quota(&run(mk("PUT", "/v1/a/c/o", &[]), next), "Upload exceeds quota.");
+        assert_over_quota(
+            &run(mk("PUT", "/v1/a/c/o", &[]), next),
+            "Upload exceeds quota.",
+        );
     }
 
     #[test]
@@ -604,7 +614,10 @@ mod tests {
                 ],
             ),
         )]);
-        assert_over_quota(&run(mk("PUT", "/v1/a/c/o", &[]), next), "Upload exceeds quota.");
+        assert_over_quota(
+            &run(mk("PUT", "/v1/a/c/o", &[]), next),
+            "Upload exceeds quota.",
+        );
     }
 
     // ---- per-policy quotas (needs the policy-name mapping) ----------------
@@ -732,7 +745,10 @@ mod tests {
         let r = run(mk("GET", "/v1/a", &[]), next);
         assert_eq!(r.status, 200);
         assert_eq!(r.headers.get("X-Account-Quota-Bytes"), Some("1000"));
-        assert_eq!(r.headers.get("X-Account-Quota-Bytes-Policy-Unu"), Some("10"));
+        assert_eq!(
+            r.headers.get("X-Account-Quota-Bytes-Policy-Unu"),
+            Some("10")
+        );
         // sysmeta is preserved alongside the exposed public header
         assert_eq!(r.headers.get("X-Account-Sysmeta-Quota-Bytes"), Some("1000"));
     }

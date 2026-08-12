@@ -97,7 +97,8 @@ pub fn cleanup_ondisk_files(
     policy: PolicyKind,
     cfg: &CleanupConfig,
 ) -> Result<CleanupResult, DiskFileError> {
-    let is_reclaimable = |ts: &swift_core::Timestamp| now_secs() - ts.as_secs_f64() > cfg.reclaim_age;
+    let is_reclaimable =
+        |ts: &swift_core::Timestamp| now_secs() - ts.as_secs_f64() > cfg.reclaim_age;
 
     let mut files = match listdir(hsh_path) {
         Ok(files) => files,
@@ -236,9 +237,7 @@ fn hash_suffix_dir(
         let hsh_path = suffix_path.join(&hsh);
         let ondisk_info = match cleanup_ondisk_files(&hsh_path, policy, cfg) {
             Ok(result) => result,
-            Err(DiskFileError::Io(e))
-                if e.kind() == std::io::ErrorKind::NotADirectory =>
-            {
+            Err(DiskFileError::Io(e)) if e.kind() == std::io::ErrorKind::NotADirectory => {
                 // an object dir that is somehow a file: quarantine it
                 let _ = quarantine_renamer(&device_path, &hsh_path.join("made-up-filename"));
                 continue;
@@ -295,11 +294,7 @@ pub fn hash_suffix_repl(
 ) -> Result<Option<String>, DiskFileError> {
     match hash_suffix_dir(suffix_path, PolicyKind::Replication, cfg) {
         Ok(mut hashers) => {
-            let digest = match hashers
-                .buckets
-                .iter_mut()
-                .find(|(k, _)| k.is_none())
-            {
+            let digest = match hashers.buckets.iter_mut().find(|(k, _)| k.is_none()) {
                 Some((_, md5)) => format!("{:x}", md5.clone().finalize()),
                 None => format!("{:x}", Md5::new().finalize()),
             };

@@ -38,8 +38,7 @@ use crate::error::DiskFileError;
 use crate::hashes::invalidate_hash;
 use crate::layout::{get_data_dir, get_tmp_dir, quarantine_renamer, renamer, storage_directory};
 use crate::metadata::{
-    read_file_metadata, write_file_metadata, MetaValue, Metadata, XattrSource,
-    DEFAULT_XATTR_SIZE,
+    read_file_metadata, write_file_metadata, MetaValue, Metadata, XattrSource, DEFAULT_XATTR_SIZE,
 };
 use crate::naming::{make_ec_ondisk_filename, make_ondisk_filename, PolicyKind};
 use crate::ondisk::{get_ondisk_files, FragPref, OndiskFiles};
@@ -276,7 +275,10 @@ impl DiskFile {
             Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => {
                 return Err(self.quarantine(
                     &self.datadir.join("made-up-filename"),
-                    &format!("Expected directory, found file at {}", self.datadir.display()),
+                    &format!(
+                        "Expected directory, found file at {}",
+                        self.datadir.display()
+                    ),
                 ))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -303,22 +305,16 @@ impl DiskFile {
             }
             Err(e) => return Err(DiskFileError::Io(e)),
         };
-        let datafile_metadata =
-            self.read_and_validate(XattrSource::File(&fp), &data_file)?;
+        let datafile_metadata = self.read_and_validate(XattrSource::File(&fp), &data_file)?;
         let data_timestamp = parse_ts(meta_get(&datafile_metadata, "X-Timestamp"));
 
         let mut metadata = Metadata::new();
         let mut metafile_metadata: Option<Metadata> = None;
         if let Some(meta_file) = &ondisk.meta_file {
-            let mut mf_meta =
-                self.read_and_validate(XattrSource::Path(meta_file), meta_file)?;
+            let mut mf_meta = self.read_and_validate(XattrSource::Path(meta_file), meta_file)?;
             if let Some(ctype_file) = &ondisk.ctype_file {
                 if ctype_file != meta_file {
-                    self.merge_content_type_metadata(
-                        ctype_file,
-                        &mut mf_meta,
-                        data_timestamp,
-                    )?;
+                    self.merge_content_type_metadata(ctype_file, &mut mf_meta, data_timestamp)?;
                 }
             }
             let sys_metadata: Metadata = datafile_metadata
@@ -346,7 +342,9 @@ impl DiskFile {
                 meta_set(
                     &mut metadata,
                     "Content-Type",
-                    meta_get(&datafile_metadata, "Content-Type").unwrap().clone(),
+                    meta_get(&datafile_metadata, "Content-Type")
+                        .unwrap()
+                        .clone(),
                 );
                 meta_remove(&mut metadata, "Content-Type-Timestamp");
             }
@@ -368,16 +366,14 @@ impl DiskFile {
         if self.name.is_none() {
             // given only a hash dir: learn the name, then verify it
             // hashes back to this directory
-            let name = meta_get_str(&self.state.as_ref().unwrap().metadata, "name")
-                .map(str::to_string);
+            let name =
+                meta_get_str(&self.state.as_ref().unwrap().metadata, "name").map(str::to_string);
             match name {
                 Some(name) => {
                     let hash_from_name = self
                         .hash_config
                         .as_ref()
-                        .and_then(|hc| {
-                            hc.hash_path(name.trim_start_matches('/'), None, None).ok()
-                        })
+                        .and_then(|hc| hc.hash_path(name.trim_start_matches('/'), None, None).ok())
                         .unwrap_or_default();
                     let hash_from_fs = self
                         .datadir
@@ -492,9 +488,7 @@ impl DiskFile {
             }
         }
         let metadata_size = match meta_get(metadata, "Content-Length") {
-            None => {
-                return Err(self.quarantine(data_file, "missing content-length in metadata"))
-            }
+            None => return Err(self.quarantine(data_file, "missing content-length in metadata")),
             Some(MetaValue::Int(i)) => Some(*i),
             Some(MetaValue::Str(s)) => crate::naming::python_int(s),
             Some(MetaValue::Bytes(_)) => None,
@@ -544,8 +538,7 @@ impl DiskFile {
     }
 
     pub fn timestamp(&self) -> Result<Timestamp, DiskFileError> {
-        parse_ts(meta_get(&self.opened()?.metadata, "X-Timestamp"))
-            .ok_or(DiskFileError::NotOpen)
+        parse_ts(meta_get(&self.opened()?.metadata, "X-Timestamp")).ok_or(DiskFileError::NotOpen)
     }
 
     pub fn data_timestamp(&self) -> Result<Timestamp, DiskFileError> {
@@ -557,9 +550,7 @@ impl DiskFile {
     pub fn durable_timestamp(&self) -> Result<Option<Timestamp>, DiskFileError> {
         let state = self.opened()?;
         Ok(match self.policy {
-            PolicyKind::Replication => {
-                parse_ts(meta_get(&state.datafile_metadata, "X-Timestamp"))
-            }
+            PolicyKind::Replication => parse_ts(meta_get(&state.datafile_metadata, "X-Timestamp")),
             PolicyKind::Ec { .. } => state.ondisk.durable_frag_set_ts,
         })
     }
@@ -659,9 +650,15 @@ impl DiskFile {
         let remove = |p: PathBuf| {
             let _ = std::fs::remove_file(p);
         };
-        remove(self.datadir.join(make_ondisk_filename(timestamp, Some(".ts"), None)));
+        remove(
+            self.datadir
+                .join(make_ondisk_filename(timestamp, Some(".ts"), None)),
+        );
         if let Some(mts) = meta_timestamp {
-            remove(self.datadir.join(make_ondisk_filename(mts, Some(".meta"), None)));
+            remove(
+                self.datadir
+                    .join(make_ondisk_filename(mts, Some(".meta"), None)),
+            );
         }
         if let Some(fi) = frag_index {
             let nondurable = self
@@ -701,9 +698,7 @@ fn mkstemp(dir: &Path) -> Result<(std::fs::File, PathBuf), DiskFileError> {
         {
             Ok(file) => return Ok((file, path)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) if matches!(e.raw_os_error(), Some(28)) => {
-                return Err(DiskFileError::NoSpace)
-            }
+            Err(e) if matches!(e.raw_os_error(), Some(28)) => return Err(DiskFileError::NoSpace),
             Err(e) => return Err(DiskFileError::Io(e)),
         }
     }
@@ -746,7 +741,10 @@ impl DiskFileWriter<'_> {
     }
 
     pub fn chunks_finished(&self) -> (u64, String) {
-        (self.upload_size, format!("{:x}", self.md5.clone().finalize()))
+        (
+            self.upload_size,
+            format!("{:x}", self.md5.clone().finalize()),
+        )
     }
 
     /// `put()`: finalize on disk. For EC `.data` files the fragment index
@@ -817,11 +815,9 @@ impl DiskFileWriter<'_> {
         let ctype_timestamp = parse_ts(meta_get(&metadata, "Content-Type-Timestamp"));
         let filename = match frag_index {
             Some(fi) => make_ec_ondisk_filename(&timestamp, fi, false)?,
-            None => make_ondisk_filename(
-                &timestamp,
-                Some(&self.extension),
-                ctype_timestamp.as_ref(),
-            ),
+            None => {
+                make_ondisk_filename(&timestamp, Some(&self.extension), ctype_timestamp.as_ref())
+            }
         };
         meta_set(&mut metadata, "name", MetaValue::Str(self.name.clone()));
         let target_path = self.df.datadir.join(&filename);
@@ -854,9 +850,9 @@ impl DiskFileWriter<'_> {
         if !matches!(self.df.policy, PolicyKind::Ec { .. }) {
             return Ok(()); // replication commit is a no-op
         }
-        let fi = self.frag_index.ok_or_else(|| {
-            DiskFileError::BadFragmentIndex("Bad fragment index: None".into())
-        })?;
+        let fi = self
+            .frag_index
+            .ok_or_else(|| DiskFileError::BadFragmentIndex("Bad fragment index: None".into()))?;
         let data_file_path = self
             .df
             .datadir
@@ -868,11 +864,8 @@ impl DiskFileWriter<'_> {
         match std::fs::rename(&data_file_path, &durable_data_file_path) {
             Ok(()) => {
                 std::fs::File::open(&self.df.datadir)?.sync_all()?;
-                let _ = cleanup_ondisk_files(
-                    &self.df.datadir,
-                    self.df.policy,
-                    &self.df.cfg.cleanup,
-                );
+                let _ =
+                    cleanup_ondisk_files(&self.df.datadir, self.df.policy, &self.df.cfg.cleanup);
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

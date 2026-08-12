@@ -37,9 +37,7 @@ use swift_ring::RingBuilder;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
-        eprintln!(
-            "usage: swift-ring-builder <ring.gz> <create|add|search|list|rebalance> ..."
-        );
+        eprintln!("usage: swift-ring-builder <ring.gz> <create|add|search|list|rebalance> ...");
         std::process::exit(1);
     }
     let ring_path = &args[0];

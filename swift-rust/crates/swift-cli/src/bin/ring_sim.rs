@@ -57,8 +57,16 @@ fn b64(bytes: &[u8]) -> String {
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(T[(n >> 18) as usize & 63] as char);
         out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -86,10 +94,13 @@ fn dispersion_json(b: &RingBuilder) -> serde_json::Value {
     })
 }
 
-fn devices_json(b: &RingBuilder, load_before: &std::collections::BTreeMap<u32, usize>,
-                load_after: &std::collections::BTreeMap<u32, usize>,
-                states: &std::collections::HashMap<u64, &'static str>,
-                total_slots: usize) -> serde_json::Value {
+fn devices_json(
+    b: &RingBuilder,
+    load_before: &std::collections::BTreeMap<u32, usize>,
+    load_after: &std::collections::BTreeMap<u32, usize>,
+    states: &std::collections::HashMap<u64, &'static str>,
+    total_slots: usize,
+) -> serde_json::Value {
     let total_weight: f64 = b.devices().iter().flatten().map(|d| d.weight).sum();
     let devs: Vec<serde_json::Value> = b
         .devices()
@@ -185,7 +196,11 @@ fn parse_ops(scenario: &serde_json::Value, data: &RingData) -> (Vec<Op>, Vec<u64
         let zone = o.get("zone").and_then(|v| v.as_u64());
         match op {
             "fail_device" | "fail_node" | "fail_zone" | "remove_device" => {
-                let (r, z) = if op == "fail_zone" { (region, zone) } else { (None, None) };
+                let (r, z) = if op == "fail_zone" {
+                    (region, zone)
+                } else {
+                    (None, None)
+                };
                 let sel = match op {
                     "fail_node" => select_devices(&data.devs, dev_id, ip, None, None, None),
                     "fail_zone" => select_devices(&data.devs, None, None, None, r, z),
@@ -206,14 +221,22 @@ fn parse_ops(scenario: &serde_json::Value, data: &RingData) -> (Vec<Op>, Vec<u64
                 }
             }
             "set_weight" => {
-                let w = o.get("weight").and_then(|v| v.as_f64()).unwrap_or(0.0).clamp(0.0, 10000.0);
+                let w = o
+                    .get("weight")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 10000.0);
                 match select_devices(&data.devs, dev_id, ip, device, None, None) {
                     Ok(ids) => ops.extend(ids.into_iter().map(|id| Op::SetWeight(id, w))),
                     Err(e) => warnings.push(format!("set_weight: {e}")),
                 }
             }
             "add_device" => {
-                let w = o.get("weight").and_then(|v| v.as_f64()).unwrap_or(100.0).clamp(0.0, 10000.0);
+                let w = o
+                    .get("weight")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(100.0)
+                    .clamp(0.0, 10000.0);
                 let ipa = ip.unwrap_or("").to_string();
                 if ipa.is_empty() {
                     warnings.push("add_device: ip is required".into());
@@ -224,8 +247,14 @@ fn parse_ops(scenario: &serde_json::Value, data: &RingData) -> (Vec<Op>, Vec<u64
                     zone: zone.unwrap_or(1),
                     ip: ipa,
                     port: o.get("port").and_then(|v| v.as_u64()).unwrap_or(6200) as u32,
-                    replication_ip: o.get("replication_ip").and_then(|v| v.as_str()).map(String::from),
-                    replication_port: o.get("replication_port").and_then(|v| v.as_u64()).map(|v| v as u32),
+                    replication_ip: o
+                        .get("replication_ip")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    replication_port: o
+                        .get("replication_port")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as u32),
                     device: device.unwrap_or("d1").to_string(),
                     weight: w,
                 });
@@ -258,12 +287,24 @@ fn apply(b: &mut RingBuilder, ops: &[Op]) -> Vec<String> {
                 }
             }
             Op::AddDev {
-                region, zone, ip, port, replication_ip, replication_port, device, weight,
+                region,
+                zone,
+                ip,
+                port,
+                replication_ip,
+                replication_port,
+                device,
+                weight,
             } => {
                 b.add_dev_full(
-                    *region, *zone, ip, *port,
-                    replication_ip.as_deref(), *replication_port,
-                    device, *weight,
+                    *region,
+                    *zone,
+                    ip,
+                    *port,
+                    replication_ip.as_deref(),
+                    *replication_port,
+                    device,
+                    *weight,
                 );
             }
         }
@@ -359,7 +400,8 @@ fn main() {
             let scenario: serde_json::Value = if buf.trim().is_empty() {
                 serde_json::json!({})
             } else {
-                serde_json::from_str(&buf).unwrap_or_else(|e| die(&format!("bad scenario JSON: {e}")))
+                serde_json::from_str(&buf)
+                    .unwrap_or_else(|e| die(&format!("bad scenario JSON: {e}")))
             };
             let min_readable = scenario
                 .get("min_readable")
@@ -434,14 +476,17 @@ fn main() {
             } else {
                 tol_before.clone()
             };
-            let tiers: Vec<serde_json::Value> = tier_loads(&baseline, &after, &sim.to_ring_data().devs)
-                .into_iter()
-                .map(|t| serde_json::json!({
-                    "tier": t.tier, "kind": t.kind, "weight": t.weight,
-                    "parts_before": t.parts_before, "parts_after": t.parts_after,
-                    "ideal_after": t.ideal_after, "balance_pct": t.balance_pct,
-                }))
-                .collect();
+            let tiers: Vec<serde_json::Value> =
+                tier_loads(&baseline, &after, &sim.to_ring_data().devs)
+                    .into_iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "tier": t.tier, "kind": t.kind, "weight": t.weight,
+                            "parts_before": t.parts_before, "parts_after": t.parts_after,
+                            "ideal_after": t.ideal_after, "balance_pct": t.balance_pct,
+                        })
+                    })
+                    .collect();
 
             if !faithful {
                 warnings.push(

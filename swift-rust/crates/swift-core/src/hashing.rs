@@ -75,7 +75,10 @@ impl HashPathConfig {
                 .unwrap_or_default()
                 .into_bytes())
         };
-        Self::new(get("swift_hash_path_prefix")?, get("swift_hash_path_suffix")?)
+        Self::new(
+            get("swift_hash_path_prefix")?,
+            get("swift_hash_path_suffix")?,
+        )
     }
 
     /// Get the canonical raw MD5 digest for an account/container/object

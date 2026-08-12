@@ -24,23 +24,21 @@
 mod body;
 mod conditional;
 mod dates;
-pub mod thread_concurrency;
 mod headers;
 mod mime;
 mod range;
 mod request;
 pub mod server;
+pub mod thread_concurrency;
 
 pub use body::{
-    body_too_large, Body, ChainReader, FnReader, InterimResponder, SharedBytesReader,
-    StreamedBody, MAX_CONTROL_BODY, STREAM_CHUNK,
+    body_too_large, Body, ChainReader, FnReader, InterimResponder, SharedBytesReader, StreamedBody,
+    MAX_CONTROL_BODY, STREAM_CHUNK,
 };
-pub use mime::MimeDocs;
-pub use conditional::{
-    apply_conditional, conditional_response_status, resolve_etag_is_at,
-};
+pub use conditional::{apply_conditional, conditional_response_status, resolve_etag_is_at};
 pub use dates::{http_date, parse_http_date};
 pub use headers::{title_case, HeaderKeyDict};
+pub use mime::MimeDocs;
 pub use range::{
     content_range_header_value, multipart_byteranges, multipart_byteranges_content_type,
     normalize_etag, Match, Range,

@@ -111,7 +111,9 @@ pub fn compute_concurrency(
         )
     } else {
         // Thread-only model: workers * max_clients → threads (legacy Rust map).
-        let product = workers.saturating_mul(max_clients).clamp(1, WORKER_THREADS_CAP);
+        let product = workers
+            .saturating_mul(max_clients)
+            .clamp(1, WORKER_THREADS_CAP);
         (
             product,
             format!("thread: workers×max_clients={product} (cap {WORKER_THREADS_CAP})"),
@@ -238,7 +240,11 @@ impl<T: Clone + Send> GreenLocal<T> {
 /// Heartbeat yield policy matching SLO `yield_frequency` semantics.
 ///
 /// Returns true when a yield should occur given elapsed time and frequency.
-pub fn should_yield_heartbeat(elapsed_secs: f64, yield_frequency: f64, last_yield_secs: f64) -> bool {
+pub fn should_yield_heartbeat(
+    elapsed_secs: f64,
+    yield_frequency: f64,
+    last_yield_secs: f64,
+) -> bool {
     if yield_frequency <= 0.0 {
         return false; // 0 = no throttle yield (emit every time caller decides)
     }

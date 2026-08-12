@@ -22,8 +22,8 @@
 use std::path::Path;
 
 use swift_container_server::sharder::{self, run_once_with_opts_and_ring, SharderRunOpts};
-use swift_core::daemon;
 use swift_core::config::SwiftConfig;
+use swift_core::daemon;
 use swift_core::hashing::HashPathConfig;
 use swift_core::obslog::{LogLevel, Logger};
 use swift_core::statsd::StatsdClient;
@@ -38,8 +38,9 @@ fn parse_conf_file(path: &str) -> SwiftConfig {
 }
 
 fn main() {
-    let conf_path =
-        std::env::args().nth(1).unwrap_or_else(|| "/etc/swift/container-server.conf".to_string());
+    let conf_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/etc/swift/container-server.conf".to_string());
     let run_once_only = std::env::args().nth(2).as_deref() == Some("once");
     let conf = parse_conf_file(&conf_path);
     let get = |section: &str, key: &str, default: &str| -> String {
@@ -51,7 +52,9 @@ fn main() {
     };
     let devices = get("app:container-server", "devices", "/srv/node");
     // Python container/sharder.py defaults interval to 30s.
-    let interval: u64 = get("container-sharder", "interval", "30").parse().unwrap_or(30);
+    let interval: u64 = get("container-sharder", "interval", "30")
+        .parse()
+        .unwrap_or(30);
     let cleave_batch_size: usize = get("container-sharder", "cleave_batch_size", "2")
         .parse()
         .unwrap_or(2);

@@ -155,10 +155,7 @@ fn default_forbidden_regexp_matches(path: &str) -> bool {
 /// trailing `\n`. So `suffix$` matches when `path` ends with `suffix`, or
 /// ends with `suffix` followed by exactly one `\n`.
 fn ends_at_line_end(path: &str, suffix: &str) -> bool {
-    path.ends_with(suffix)
-        || path
-            .strip_suffix('\n')
-            .is_some_and(|p| p.ends_with(suffix))
+    path.ends_with(suffix) || path.strip_suffix('\n').is_some_and(|p| p.ends_with(suffix))
 }
 
 #[cfg(test)]

@@ -37,7 +37,9 @@ fn test_replicate_container_db_converges() {
     let tmp = tmpdir();
     let account = "a";
     let container = "sync";
-    let hsh = hash_cfg().hash_path(account, Some(container), None).unwrap();
+    let hsh = hash_cfg()
+        .hash_path(account, Some(container), None)
+        .unwrap();
     let suffix = &hsh[hsh.len() - 3..];
     let db_rel = format!("containers/0/{suffix}/{hsh}/{hsh}.db");
 
@@ -47,10 +49,30 @@ fn test_replicate_container_db_converges() {
     let mut src = ContainerBroker::new(&src_db, account, container);
     src.initialize("1751500000.00000", 0, "1751500000.00000", "src-id-xyz")
         .unwrap();
-    src.put_object("a1", "1751500002.00000", 5, "text/a", "ea", 0, 0, None, None)
-        .unwrap();
-    src.put_object("a2", "1751500003.00000", 7, "text/b", "eb", 0, 0, None, None)
-        .unwrap();
+    src.put_object(
+        "a1",
+        "1751500002.00000",
+        5,
+        "text/a",
+        "ea",
+        0,
+        0,
+        None,
+        None,
+    )
+    .unwrap();
+    src.put_object(
+        "a2",
+        "1751500003.00000",
+        7,
+        "text/b",
+        "eb",
+        0,
+        0,
+        None,
+        None,
+    )
+    .unwrap();
     src.delete_object("gone", "1751500004.00000", 0).unwrap();
     src.get_info().unwrap();
 
@@ -76,15 +98,9 @@ fn test_replicate_container_db_converges() {
     std::thread::sleep(std::time::Duration::from_millis(120));
 
     // run the replication pass source -> peer
-    let outcome = replicate_container_db(
-        &mut src,
-        "src-id-xyz",
-        &addr.to_string(),
-        "sdb1",
-        "0",
-        &hsh,
-    )
-    .unwrap();
+    let outcome =
+        replicate_container_db(&mut src, "src-id-xyz", &addr.to_string(), "sdb1", "0", &hsh)
+            .unwrap();
     assert_eq!(outcome.rows_pushed, 3, "all three rows pushed");
     assert_eq!(outcome.diffs, 1);
 
@@ -99,20 +115,17 @@ fn test_replicate_container_db_converges() {
             _ => String::new(),
         })
         .collect();
-    assert_eq!(names, vec!["a1".to_string(), "a2".to_string(), "gone".to_string()]);
+    assert_eq!(
+        names,
+        vec!["a1".to_string(), "a2".to_string(), "gone".to_string()]
+    );
     // ...and recorded the source's high-water mark
     assert_eq!(peer2.get_sync("src-id-xyz", true).unwrap(), 3);
 
     // a second pass is a no-op (nothing new to push)
-    let outcome2 = replicate_container_db(
-        &mut src,
-        "src-id-xyz",
-        &addr.to_string(),
-        "sdb1",
-        "0",
-        &hsh,
-    )
-    .unwrap();
+    let outcome2 =
+        replicate_container_db(&mut src, "src-id-xyz", &addr.to_string(), "sdb1", "0", &hsh)
+            .unwrap();
     assert_eq!(outcome2.rows_pushed, 0, "idempotent second pass");
     assert_eq!(outcome2.diffs, 0);
     std::fs::remove_dir_all(&tmp).unwrap();

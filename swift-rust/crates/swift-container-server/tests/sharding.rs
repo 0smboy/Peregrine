@@ -124,7 +124,10 @@ fn test_shard_put_get_and_redirect() {
         resp.headers.get("Location"),
         Some("/.shards_AUTH_test/c-2/p")
     );
-    assert_eq!(resp.headers.get("X-Backend-Redirect-Timestamp"), Some("1751500010.00000"));
+    assert_eq!(
+        resp.headers.get("X-Backend-Redirect-Timestamp"),
+        Some("1751500010.00000")
+    );
 
     // without accept-redirect, the object PUT is applied normally (201)
     let r = req(

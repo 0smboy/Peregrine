@@ -203,10 +203,7 @@ mod tests {
         let mac = "dGVzdC1obWFjLXZhbHVl"; // any opaque token
         let r = req(&[
             ("If-None-Match", &format!("\"{mac}\"")),
-            (
-                "X-Backend-Etag-Is-At",
-                "X-Object-Sysmeta-Crypto-Etag-Mac",
-            ),
+            ("X-Backend-Etag-Is-At", "X-Object-Sysmeta-Crypto-Etag-Mac"),
         ]);
         let resp = resp_ok(&[
             ("ETag", "ciphertext-md5-hex"),

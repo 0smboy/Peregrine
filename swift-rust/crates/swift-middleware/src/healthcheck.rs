@@ -30,10 +30,7 @@ pub struct HealthCheck {
 impl Middleware for HealthCheck {
     fn handle(&self, req: Request, next: &NextFn) -> Response {
         if req.path == "/healthcheck" {
-            let disabled = self
-                .disable_path
-                .as_ref()
-                .is_some_and(|p| p.exists());
+            let disabled = self.disable_path.as_ref().is_some_and(|p| p.exists());
             let mut resp = if disabled {
                 Response::with_body(503, b"DISABLED BY FILE".to_vec())
             } else {
@@ -65,16 +62,14 @@ mod tests {
     #[test]
     fn test_healthcheck() {
         let hc = HealthCheck::default();
-        let app: Arc<dyn Fn(Request) -> Response + Send + Sync> =
-            Arc::new(|_r| Response::new(404));
+        let app: Arc<dyn Fn(Request) -> Response + Send + Sync> = Arc::new(|_r| Response::new(404));
         let mut resp = hc.handle(req("/healthcheck"), &app);
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body.materialize(u64::MAX).unwrap(), b"OK");
         assert_eq!(resp.headers.get("Content-Type"), Some("text/plain"));
 
         // non-healthcheck passes through
-        let app: Arc<dyn Fn(Request) -> Response + Send + Sync> =
-            Arc::new(|_r| Response::new(204));
+        let app: Arc<dyn Fn(Request) -> Response + Send + Sync> = Arc::new(|_r| Response::new(204));
         let resp = hc.handle(req("/v1/a"), &app);
         assert_eq!(resp.status, 204);
     }
@@ -88,11 +83,13 @@ mod tests {
         let hc = HealthCheck {
             disable_path: Some(flag),
         };
-        let app: Arc<dyn Fn(Request) -> Response + Send + Sync> =
-            Arc::new(|_r| Response::new(404));
+        let app: Arc<dyn Fn(Request) -> Response + Send + Sync> = Arc::new(|_r| Response::new(404));
         let mut resp = hc.handle(req("/healthcheck"), &app);
         assert_eq!(resp.status, 503);
-        assert_eq!(resp.body.materialize(u64::MAX).unwrap(), b"DISABLED BY FILE");
+        assert_eq!(
+            resp.body.materialize(u64::MAX).unwrap(),
+            b"DISABLED BY FILE"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

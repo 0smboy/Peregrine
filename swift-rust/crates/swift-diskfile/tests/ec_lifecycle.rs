@@ -33,7 +33,10 @@ fn ec_meta(ts: &str, frag_index: i64) -> Metadata {
             MetaValue::Str("name".into()),
             MetaValue::Str("/AUTH_test/c/o".into()),
         ),
-        (MetaValue::Str("X-Timestamp".into()), MetaValue::Str(ts.into())),
+        (
+            MetaValue::Str("X-Timestamp".into()),
+            MetaValue::Str(ts.into()),
+        ),
         (
             MetaValue::Str("Content-Length".into()),
             MetaValue::Str("5".into()),
@@ -80,7 +83,9 @@ fn test_ec_put_then_commit_becomes_durable_via_metadata_frag_index() {
     // put() must persist the frag index (3) from the metadata so commit() works
     writer.put(ec_meta(ts, 3)).unwrap();
     let tsp = ts.parse::<Timestamp>().unwrap();
-    writer.commit(&tsp).expect("commit must succeed and make the fragment durable");
+    writer
+        .commit(&tsp)
+        .expect("commit must succeed and make the fragment durable");
     writer.close();
 
     // the durable fragment file <ts>#3#d.data must now exist

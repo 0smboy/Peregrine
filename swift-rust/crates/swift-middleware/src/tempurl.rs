@@ -143,7 +143,10 @@ impl HeaderRules {
 
     fn matches(&self, name_lower: &str) -> bool {
         self.exact.iter().any(|e| e == name_lower)
-            || self.prefix.iter().any(|p| name_lower.starts_with(p.as_str()))
+            || self
+                .prefix
+                .iter()
+                .any(|p| name_lower.starts_with(p.as_str()))
     }
 }
 
@@ -463,10 +466,7 @@ impl Middleware for TempUrl {
 
         let mut qs_pairs: Vec<(String, String)> = vec![
             ("temp_url_sig".to_string(), sig_hex.clone()),
-            (
-                "temp_url_expires".to_string(),
-                raw_expires_string(&params),
-            ),
+            ("temp_url_expires".to_string(), raw_expires_string(&params)),
         ];
         if let Some(r) = &ip_range {
             qs_pairs.push(("temp_url_ip_range".to_string(), r.clone()));
@@ -605,7 +605,12 @@ fn iso8601_to_epoch(s: &str) -> Option<i64> {
     if hour > 23 || minute > 59 || second > 61 {
         return None;
     }
-    Some(days_from_civil(year, month as u32, day as u32) * 86400 + hour * 3600 + minute * 60 + second)
+    Some(
+        days_from_civil(year, month as u32, day as u32) * 86400
+            + hour * 3600
+            + minute * 60
+            + second,
+    )
 }
 
 /// Days since 1970-01-01 for a proleptic-Gregorian date (Howard Hinnant's
@@ -652,7 +657,9 @@ pub(crate) fn extract_digest_and_algorithm(value: &str) -> Result<(String, Strin
 /// Even-length string of hex digits, matching what `binascii.unhexlify`
 /// accepts.
 fn is_valid_hex(value: &str) -> bool {
-    !value.is_empty() && value.len().is_multiple_of(2) && value.bytes().all(|c| c.is_ascii_hexdigit())
+    !value.is_empty()
+        && value.len().is_multiple_of(2)
+        && value.bytes().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Lowercase hex encoding of `bytes`.
@@ -917,14 +924,12 @@ mod tests {
     const CONT: &str = "container";
 
     const SIG_GET_SHA1: &str = "dcc8453074ac52d0d2c3edba7d543b96f194e8d7";
-    const SIG_GET_SHA256: &str =
-        "beb29507e95de0350c1076f7671d128cc02120c3186c0ba7c70d4d3a1bba6bfe";
+    const SIG_GET_SHA256: &str = "beb29507e95de0350c1076f7671d128cc02120c3186c0ba7c70d4d3a1bba6bfe";
     const SIG_GET_SHA512: &str = "1cdf6d963eab46dd1634a3bd02ea5f4092fb79491425a6a030c44fd1da14e76002afe0e46cb6f639aaa8a4b1f49f2f70b8207972e26525de15a5f6516e1c854f";
     const SIG_GET_SHA512_B64: &str =
         "sha512:HN9tlj6rRt0WNKO9AupfQJL7eUkUJaagMMRP0doU52ACr-DkbLb2OaqopLH0ny9wuCB5cuJlJd4VpfZRbhyFTw==";
     const SIG_GET_SHA256_B64: &str = "sha256:vrKVB-ld4DUMEHb3Zx0SjMAhIMMYbAunxw1NOhu6a_4=";
-    const SIG_PUT_SHA256: &str =
-        "075253051197618a0ba40c0cb27954ab7774acea82b34cb7ffb6198c64f7e6cb";
+    const SIG_PUT_SHA256: &str = "075253051197618a0ba40c0cb27954ab7774acea82b34cb7ffb6198c64f7e6cb";
     const SIG_POST_SHA256: &str =
         "47ba39ae5b07dde742ab515bb632b910eaa9a0b1343acde4face2efda13982a9";
     const SIG_PREFIX_SHA256: &str =
@@ -970,9 +975,7 @@ mod tests {
     // headers into the response so tests can inspect what reached the app,
     // plus a couple of headers to prove the outbound scrub. Extra response
     // headers requested by the test are added on top.
-    fn echo_app(
-        extra: Vec<(&'static str, &'static str)>,
-    ) -> crate::NextFn {
+    fn echo_app(extra: Vec<(&'static str, &'static str)>) -> crate::NextFn {
         std::sync::Arc::new(move |req: Request| {
             let mut resp = Response::with_body(200, b"BODY".to_vec());
             resp.headers.set("Echo-Query", &req.query_string);
@@ -995,11 +998,7 @@ mod tests {
         resp
     }
 
-    fn run_with(
-        tu: &TempUrl,
-        req: Request,
-        extra: Vec<(&'static str, &'static str)>,
-    ) -> Response {
+    fn run_with(tu: &TempUrl, req: Request, extra: Vec<(&'static str, &'static str)>) -> Response {
         let mut resp = tu.handle(req, &echo_app(extra));
         resp.body.materialize(u64::MAX).unwrap();
         resp
@@ -1219,12 +1218,7 @@ mod tests {
         );
         let resp = run(
             &tu,
-            mk(
-                "GET",
-                "/v1/AUTH_account/container/pre/sub/obj",
-                &q,
-                &[],
-            ),
+            mk("GET", "/v1/AUTH_account/container/pre/sub/obj", &q, &[]),
         );
         assert_eq!(resp.status, 200);
         // The prefix parameter is preserved in the rewritten query.
@@ -1246,10 +1240,7 @@ mod tests {
         let q = format!(
             "temp_url_sig={SIG_PREFIX_SHA256}&temp_url_expires={EXPIRES}&temp_url_prefix=pre"
         );
-        let resp = run(
-            &tu,
-            mk("GET", "/v1/AUTH_account/container/other", &q, &[]),
-        );
+        let resp = run(&tu, mk("GET", "/v1/AUTH_account/container/other", &q, &[]));
         assert_eq!(resp.status, 401);
     }
 
@@ -1258,7 +1249,10 @@ mod tests {
     #[test]
     fn test_options_passthrough() {
         let tu = tempurl(&[KEY]);
-        let resp = run(&tu, mk("OPTIONS", "/v1/AUTH_account/container/object", "", &[]));
+        let resp = run(
+            &tu,
+            mk("OPTIONS", "/v1/AUTH_account/container/object", "", &[]),
+        );
         assert_eq!(resp.status, 200);
         // No query rewrite happened.
         assert_eq!(resp.headers.get("Echo-Query"), Some(""));
@@ -1269,7 +1263,12 @@ mod tests {
         let tu = tempurl(&[KEY]);
         let resp = run(
             &tu,
-            mk("GET", "/v1/AUTH_account/container/object", "format=json", &[]),
+            mk(
+                "GET",
+                "/v1/AUTH_account/container/object",
+                "format=json",
+                &[],
+            ),
         );
         assert_eq!(resp.status, 200);
         // Untouched query reaches the app.
@@ -1585,10 +1584,7 @@ mod tests {
         let q = format!(
             "temp_url_sig={SIG_GET_SHA256}&temp_url_expires={EXPIRES}&filename=My+Test+File.pdf"
         );
-        let resp = run(
-            &tu,
-            mk("GET", "/v1/AUTH_account/container/object", &q, &[]),
-        );
+        let resp = run(&tu, mk("GET", "/v1/AUTH_account/container/object", &q, &[]));
         assert_eq!(resp.status, 200);
         assert_eq!(
             resp.headers.get("Content-Disposition"),
@@ -1612,10 +1608,7 @@ mod tests {
     fn test_inline_disposition() {
         let tu = tempurl(&[KEY]);
         let q = format!("temp_url_sig={SIG_GET_SHA256}&temp_url_expires={EXPIRES}&inline");
-        let resp = run(
-            &tu,
-            mk("GET", "/v1/AUTH_account/container/object", &q, &[]),
-        );
+        let resp = run(&tu, mk("GET", "/v1/AUTH_account/container/object", &q, &[]));
         assert_eq!(resp.status, 200);
         assert_eq!(resp.headers.get("Content-Disposition"), Some("inline"));
         assert_eq!(
@@ -1633,10 +1626,7 @@ mod tests {
         let q = format!(
             "temp_url_sig={SIG_GET_SHA256}&temp_url_expires={EXPIRES}&inline&filename=doc.pdf"
         );
-        let resp = run(
-            &tu,
-            mk("GET", "/v1/AUTH_account/container/object", &q, &[]),
-        );
+        let resp = run(&tu, mk("GET", "/v1/AUTH_account/container/object", &q, &[]));
         assert_eq!(resp.status, 200);
         assert_eq!(
             resp.headers.get("Content-Disposition"),
@@ -1681,10 +1671,7 @@ mod tests {
         )
         .unwrap();
         let q = format!("temp_url_sig={sig}&temp_url_expires={EXPIRES}&temp_url_prefix=");
-        let resp = run(
-            &tu,
-            mk("GET", "/v1/AUTH_account/container", &q, &[]),
-        );
+        let resp = run(&tu, mk("GET", "/v1/AUTH_account/container", &q, &[]));
         assert_eq!(resp.status, 401);
     }
 
@@ -1722,10 +1709,7 @@ mod tests {
         let tu = tempurl(&[KEY]);
         // sig is computed over the numeric form, exactly as SIG_GET_SHA256.
         let q = format!("temp_url_sig={SIG_GET_SHA256}&temp_url_expires={iso}");
-        let resp = run(
-            &tu,
-            mk("GET", "/v1/AUTH_account/container/object", &q, &[]),
-        );
+        let resp = run(&tu, mk("GET", "/v1/AUTH_account/container/object", &q, &[]));
         assert_eq!(resp.status, 200);
         // The original ISO string is preserved (quote_plus-encoded) in the
         // rewritten query.
@@ -1865,9 +1849,8 @@ mod tests {
         let tu = tempurl(&[KEY]);
         let message = format!("ip=1.2.3.0/24\nGET\n{EXPIRES}\n/v1/AUTH_account/container/object");
         let sig = hmac_hex("sha256", KEY.as_bytes(), message.as_bytes()).unwrap();
-        let q = format!(
-            "temp_url_sig={sig}&temp_url_expires={EXPIRES}&temp_url_ip_range=1.2.3.0/24"
-        );
+        let q =
+            format!("temp_url_sig={sig}&temp_url_expires={EXPIRES}&temp_url_ip_range=1.2.3.0/24");
         let resp = run(
             &tu,
             mk(
@@ -1885,9 +1868,8 @@ mod tests {
         let tu = tempurl(&[KEY]);
         let message = format!("ip=1.2.3.0/24\nGET\n{EXPIRES}\n/v1/AUTH_account/container/object");
         let sig = hmac_hex("sha256", KEY.as_bytes(), message.as_bytes()).unwrap();
-        let q = format!(
-            "temp_url_sig={sig}&temp_url_expires={EXPIRES}&temp_url_ip_range=1.2.3.0/24"
-        );
+        let q =
+            format!("temp_url_sig={sig}&temp_url_expires={EXPIRES}&temp_url_ip_range=1.2.3.0/24");
         let resp = run(
             &tu,
             mk(

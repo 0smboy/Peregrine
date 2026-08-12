@@ -178,7 +178,8 @@ impl RingData {
         let meta: Value = serde_json::from_slice(&data[10..10 + json_len])?;
         let part_shift = meta["part_shift"]
             .as_u64()
-            .ok_or_else(|| RingError("missing part_shift".to_string()))? as u32;
+            .ok_or_else(|| RingError("missing part_shift".to_string()))?
+            as u32;
         let replica_count = meta["replica_count"]
             .as_u64()
             .ok_or_else(|| RingError("missing replica_count".to_string()))?;
@@ -238,10 +239,12 @@ impl RingData {
         let meta: Value = serde_json::from_slice(file.read_section("swift/ring/metadata")?)?;
         let part_shift = meta["part_shift"]
             .as_u64()
-            .ok_or_else(|| RingError("missing part_shift".to_string()))? as u32;
+            .ok_or_else(|| RingError("missing part_shift".to_string()))?
+            as u32;
         let dev_id_bytes = meta["dev_id_bytes"]
             .as_u64()
-            .ok_or_else(|| RingError("missing dev_id_bytes".to_string()))? as u8;
+            .ok_or_else(|| RingError("missing dev_id_bytes".to_string()))?
+            as u8;
         if !matches!(dev_id_bytes, 2 | 4) {
             return Err(RingError(format!(
                 "unsupported dev_id_bytes: {dev_id_bytes}"
@@ -507,8 +510,7 @@ impl Ring {
     pub fn get_more_nodes(&self, part: u32) -> Result<Vec<HandoffNode<'_>>, RingError> {
         let primary_nodes = self.get_part_nodes(part)?;
         let mut used: HashSet<u32> = primary_nodes.iter().map(|n| n.dev.id as u32).collect();
-        let mut same_regions: HashSet<u64> =
-            primary_nodes.iter().map(|n| n.dev.region).collect();
+        let mut same_regions: HashSet<u64> = primary_nodes.iter().map(|n| n.dev.region).collect();
         let mut same_zones: HashSet<(u64, u64)> = primary_nodes
             .iter()
             .map(|n| (n.dev.region, n.dev.zone))
@@ -644,7 +646,12 @@ mod tests {
     fn test_handoff_sequence_matches_python() {
         // expected sequences computed with the Python expression
         let cases: &[(usize, usize, usize, &[usize])] = &[
-            (5, 16, 1, &[5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 1, 2, 3, 4]),
+            (
+                5,
+                16,
+                1,
+                &[5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 1, 2, 3, 4],
+            ),
             (0, 8, 1, &[0, 1, 2, 3, 4, 5, 6, 7]),
             (7, 32, 4, &[7, 11, 15, 19, 23, 27, 31, 3]),
             (0, 32, 4, &[0, 4, 8, 12, 16, 20, 24, 28]),
@@ -661,8 +668,14 @@ mod tests {
     fn test_calc_replica_count() {
         assert_eq!(calc_replica_count(&[]), 0.0);
         assert_eq!(calc_replica_count(&[vec![0; 4]]), 1.0);
-        assert_eq!(calc_replica_count(&[vec![0; 4], vec![0; 4], vec![0; 4]]), 3.0);
+        assert_eq!(
+            calc_replica_count(&[vec![0; 4], vec![0; 4], vec![0; 4]]),
+            3.0
+        );
         // fractional final replica
-        assert_eq!(calc_replica_count(&[vec![0; 4], vec![0; 4], vec![0; 2]]), 2.5);
+        assert_eq!(
+            calc_replica_count(&[vec![0; 4], vec![0; 4], vec![0; 2]]),
+            2.5
+        );
     }
 }

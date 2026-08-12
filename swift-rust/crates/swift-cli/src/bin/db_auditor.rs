@@ -37,7 +37,13 @@ fn parse_conf_file(path: &str) -> SwiftConfig {
     })
 }
 
-fn conf_get(conf: &SwiftConfig, section: &str, app_section: &str, key: &str, default: &str) -> String {
+fn conf_get(
+    conf: &SwiftConfig,
+    section: &str,
+    app_section: &str,
+    key: &str,
+    default: &str,
+) -> String {
     conf.get(section, key)
         .ok()
         .flatten()
@@ -91,8 +97,13 @@ fn run_daemon(kind: &str, conf_path: &str, run_once_only: bool) {
             .as_str(),
         "true" | "yes" | "1" | "on"
     );
-    let recon_cache_path =
-        conf_get(&conf, section, app_section, "recon_cache_path", "/var/cache/swift");
+    let recon_cache_path = conf_get(
+        &conf,
+        section,
+        app_section,
+        "recon_cache_path",
+        "/var/cache/swift",
+    );
     let log_name = conf_get(&conf, section, app_section, "log_name", section);
     let log_level = conf_get(&conf, section, app_section, "log_level", "INFO")
         .parse::<LogLevel>()

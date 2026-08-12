@@ -43,6 +43,11 @@ pub use auditor::{
     DbAuditReport,
 };
 pub use broker::{py_json_dumps_metadata, py_json_parse_metadata, BrokerMetadata};
+pub use container::{
+    get_db_files, hash_container_name, make_db_file_path, make_shard_name, parse_db_filename,
+    shards_account_name, ContainerBroker, DbState, DbValue, FoundShardRange, GetShardRangesArgs,
+    ListObjectsArgs, ObjectRecord,
+};
 pub use repl_loop::{
     iter_db_partitions, repl_peers, run_once as replicator_run_once, DbPartition,
     DbReplicateClient, ReplLoopStats,
@@ -54,11 +59,6 @@ pub use replicator::{
 pub use shard::{
     find_namespace_gaps, find_overlapping_ranges, merge_shards, resolve_shard_range_states,
     sift_shard_ranges, state as shard_state, ShardRange, SHARD_RANGE_KEYS, SHARD_UPDATE_STATES,
-};
-pub use container::{
-    get_db_files, hash_container_name, make_db_file_path, make_shard_name, parse_db_filename,
-    shards_account_name, ContainerBroker, DbState, DbValue, FoundShardRange, GetShardRangesArgs,
-    ListObjectsArgs, ObjectRecord,
 };
 pub use util::{chexor, is_corruption_error, quarantine_db, renamer, DbError};
 pub use vacuum::{

@@ -69,12 +69,20 @@ pub mod state {
 }
 
 /// `SHARD_UPDATE_STATES`: states valid for redirecting an object update.
-pub const SHARD_UPDATE_STATES: [i64; 4] =
-    [state::CREATED, state::CLEAVED, state::ACTIVE, state::SHARDING];
+pub const SHARD_UPDATE_STATES: [i64; 4] = [
+    state::CREATED,
+    state::CLEAVED,
+    state::ACTIVE,
+    state::SHARDING,
+];
 
 /// `SHARD_LISTING_STATES`: states valid when listing objects.
-pub const SHARD_LISTING_STATES: [i64; 4] =
-    [state::ACTIVE, state::SHARDING, state::SHRINKING, state::CLEAVED];
+pub const SHARD_LISTING_STATES: [i64; 4] = [
+    state::ACTIVE,
+    state::SHARDING,
+    state::SHRINKING,
+    state::CLEAVED,
+];
 
 /// `SHARD_AUDITING_STATES`: every state except FOUND.
 pub const SHARD_AUDITING_STATES: [i64; 7] = [
@@ -357,7 +365,8 @@ pub fn find_namespace_gaps(shard_ranges: &[ShardRange]) -> Vec<(String, String)>
         .filter(|r| r.deleted == 0 && r.state != state::SHRINKING)
         .collect();
     ranges.sort_by(|a, b| {
-        ShardRange::lower_cmp(&a.lower, &b.lower).then_with(|| ShardRange::upper_cmp(&a.upper, &b.upper))
+        ShardRange::lower_cmp(&a.lower, &b.lower)
+            .then_with(|| ShardRange::upper_cmp(&a.upper, &b.upper))
     });
     let mut gaps = Vec::new();
     if ranges.is_empty() {
@@ -563,7 +572,10 @@ mod tests {
         assert_eq!(new.object_count, 9);
         assert_eq!(new.bytes_used, 90);
         assert_eq!(new.meta_timestamp, "1751500003.00000");
-        assert!(!has_new, "existing had newer meta and equal state -> no new content");
+        assert!(
+            !has_new,
+            "existing had newer meta and equal state -> no new content"
+        );
     }
 
     #[test]
@@ -585,13 +597,11 @@ mod tests {
     fn test_sift_supersedes() {
         let mut existing = HashMap::new();
         existing.insert("a".to_string(), sr("a", "1751500001.00000"));
-        let (to_add, to_delete) =
-            sift_shard_ranges(vec![sr("a", "1751500002.00000")], &existing);
+        let (to_add, to_delete) = sift_shard_ranges(vec![sr("a", "1751500002.00000")], &existing);
         assert_eq!(to_add.len(), 1);
         assert_eq!(to_delete, vec!["a".to_string()]);
         // an older range against a newer existing is dropped
-        let (to_add2, to_delete2) =
-            sift_shard_ranges(vec![sr("a", "1751500000.00000")], &existing);
+        let (to_add2, to_delete2) = sift_shard_ranges(vec![sr("a", "1751500000.00000")], &existing);
         assert!(to_add2.is_empty());
         assert!(to_delete2.is_empty());
     }

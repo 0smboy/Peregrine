@@ -48,8 +48,6 @@ pub enum LogLevel {
     Error,
 }
 
-
-
 impl FromStr for LogLevel {
     type Err = std::convert::Infallible;
 

@@ -80,11 +80,8 @@ mod tests {
 
     #[test]
     fn looks_like_conf_arg_distinguishes_dir_and_conf() {
-        let dir = std::env::temp_dir().join(format!(
-            "swift-aud-mode-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("swift-aud-mode-{}-{}", std::process::id(), line!()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(!looks_like_conf_arg(dir.to_str().unwrap()));
@@ -100,7 +97,14 @@ mod tests {
     fn recon_updates_carry_pass_keys() {
         let o = object_auditor_recon_update(1.5, 2, 0, 0, 100.0);
         assert_eq!(o["object_auditor_stats_ALL"]["passes"], 2);
-        assert!((o["object_auditor_stats_ALL"]["audit_time"].as_f64().unwrap() - 1.5).abs() < 1e-9);
+        assert!(
+            (o["object_auditor_stats_ALL"]["audit_time"]
+                .as_f64()
+                .unwrap()
+                - 1.5)
+                .abs()
+                < 1e-9
+        );
 
         let d = db_auditor_recon_update("account", 0.25, 3, 1, 200.0);
         assert_eq!(d["account_auditor_stats"]["failures"], 1);

@@ -23,11 +23,11 @@
 //! copies to the socket in 64KB chunks. Nothing object-sized is
 //! buffered here.
 
+use crossbeam_channel::{bounded, Sender, TrySendError};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use crossbeam_channel::{bounded, Sender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -178,14 +178,16 @@ pub fn bind_listener(addr: &str, reuse_port: bool) -> std::io::Result<TcpListene
         }
     }
 
-    let fd = unsafe { libc::socket(
-        match sock_addr {
-            SocketAddr::V4(_) => libc::AF_INET,
-            SocketAddr::V6(_) => libc::AF_INET6,
-        },
-        libc::SOCK_STREAM,
-        0,
-    )};
+    let fd = unsafe {
+        libc::socket(
+            match sock_addr {
+                SocketAddr::V4(_) => libc::AF_INET,
+                SocketAddr::V6(_) => libc::AF_INET6,
+            },
+            libc::SOCK_STREAM,
+            0,
+        )
+    };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -497,7 +499,9 @@ impl Read for TimedStream {
         let armed = *self.deadline.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(deadline) = armed {
             let now = Instant::now();
-            let Some(remaining) = deadline.checked_duration_since(now).filter(|d| !d.is_zero())
+            let Some(remaining) = deadline
+                .checked_duration_since(now)
+                .filter(|d| !d.is_zero())
             else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -763,10 +767,7 @@ fn handle_connection(
 ) -> std::io::Result<()> {
     stream.set_nodelay(true).ok();
     // REMOTE_ADDR equivalent for middleware (TempURL ip_range, logging).
-    let peer_ip = stream
-        .peer_addr()
-        .ok()
-        .map(|a| a.ip().to_string());
+    let peer_ip = stream.peer_addr().ok().map(|a| a.ip().to_string());
     let timeout = socket_timeout(config);
     stream.set_read_timeout(timeout)?;
     stream.set_write_timeout(timeout)?;
@@ -1282,14 +1283,16 @@ mod tests {
     /// way a real control-plane handler would, mapping the too-large
     /// error to 413.
     fn echo_handler() -> Handler {
-        Arc::new(|mut request: Request| match request.body.materialize(u64::MAX) {
-            Ok(_) => {
-                let bytes = request.body.into_vec(u64::MAX).unwrap();
-                Response::with_body(200, bytes)
-            }
-            Err(e) if body_too_large(&e) => Response::error(413, "body too large"),
-            Err(e) => Response::error(500, &e.to_string()),
-        })
+        Arc::new(
+            |mut request: Request| match request.body.materialize(u64::MAX) {
+                Ok(_) => {
+                    let bytes = request.body.into_vec(u64::MAX).unwrap();
+                    Response::with_body(200, bytes)
+                }
+                Err(e) if body_too_large(&e) => Response::error(413, "body too large"),
+                Err(e) => Response::error(500, &e.to_string()),
+            },
+        )
     }
 
     fn round_trip(config: ServerConfig, request: &[u8]) -> Vec<u8> {
@@ -1412,10 +1415,7 @@ mod tests {
         let handler: Handler = Arc::new(|_request: Request| {
             let payload = vec![b'x'; 200_000];
             let mut resp = Response::new(200);
-            resp.body = Body::from_reader(
-                Box::new(std::io::Cursor::new(payload)),
-                Some(200_000),
-            );
+            resp.body = Body::from_reader(Box::new(std::io::Cursor::new(payload)), Some(200_000));
             resp
         });
         let response = round_trip_with(
@@ -1433,8 +1433,7 @@ mod tests {
     fn streamed_response_with_unknown_length_is_close_delimited() {
         let handler: Handler = Arc::new(|_request: Request| {
             let mut resp = Response::new(200);
-            resp.body =
-                Body::from_reader(Box::new(std::io::Cursor::new(b"stream".to_vec())), None);
+            resp.body = Body::from_reader(Box::new(std::io::Cursor::new(b"stream".to_vec())), None);
             resp
         });
         let response = round_trip_with(
@@ -1705,7 +1704,9 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         client
-            .write_all(b"SSYNC / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+            .write_all(
+                b"SSYNC / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
             .unwrap();
         // First body line as a chunk; the response head + first echo must
         // arrive BEFORE we send the second line (true duplex).
@@ -1722,7 +1723,10 @@ mod tests {
         client.read_to_end(&mut rest).unwrap();
         server.join().unwrap();
         let text = String::from_utf8_lossy(&rest);
-        assert_eq!(text, "got:beta\n", "server must write nothing after the handler");
+        assert_eq!(
+            text, "got:beta\n",
+            "server must write nothing after the handler"
+        );
     }
 
     #[test]

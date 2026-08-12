@@ -35,10 +35,7 @@ fn main() {
     let prometheus = args.iter().any(|a| a == "--prometheus");
     args.retain(|a| a != "--prometheus");
     let check = args.first().cloned().unwrap_or_default();
-    let path = args
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| ".".to_string());
+    let path = args.get(1).cloned().unwrap_or_else(|| ".".to_string());
     let p = Path::new(&path);
     let node = hostname();
     match check.as_str() {

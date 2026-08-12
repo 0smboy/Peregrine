@@ -55,8 +55,7 @@ impl TcpConn {
         io_timeout: Duration,
     ) -> io::Result<TcpConn> {
         let (host, port) = parse_socket_string(server, DEFAULT_MEMCACHED_PORT)?;
-        let mut last_err =
-            io::Error::new(io::ErrorKind::AddrNotAvailable, "no addresses resolved");
+        let mut last_err = io::Error::new(io::ErrorKind::AddrNotAvailable, "no addresses resolved");
         for addr in (host.as_str(), port).to_socket_addrs()? {
             match TcpStream::connect_timeout(&addr, connect_timeout) {
                 Ok(stream) => {

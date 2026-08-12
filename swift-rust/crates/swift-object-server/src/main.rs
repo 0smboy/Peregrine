@@ -95,13 +95,12 @@ fn main() {
         &statsd_prefix,
     );
 
-    let swift_conf_path =
-        std::env::var("SWIFT_CONF").unwrap_or_else(|_| {
-            format!(
-                "{}/swift.conf",
-                std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string())
-            )
-        });
+    let swift_conf_path = std::env::var("SWIFT_CONF").unwrap_or_else(|_| {
+        format!(
+            "{}/swift.conf",
+            std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string())
+        )
+    });
     let swift_conf = parse_conf_file(&swift_conf_path).unwrap_or_else(|e| {
         logger.error(&format!("could not read {swift_conf_path}: {e}"));
         std::process::exit(1);
@@ -114,8 +113,8 @@ fn main() {
         logger.error(&format!("bad swift.conf storage policies: {e}"));
         std::process::exit(1);
     });
-    let fallocate_reserve = config_fallocate_value(&get("fallocate_reserve", "1%"))
-        .unwrap_or_else(|e| {
+    let fallocate_reserve =
+        config_fallocate_value(&get("fallocate_reserve", "1%")).unwrap_or_else(|e| {
             logger.error(&e.to_string());
             std::process::exit(1);
         });
@@ -166,21 +165,20 @@ fn main() {
     };
     let access_logger = Arc::clone(&logger);
     let access_statsd = Arc::clone(&statsd);
-    let access_log: swift_http::AccessLog =
-        Arc::new(move |req, status, elapsed| {
-            access_statsd.increment(&format!("{}.{status}", req.method));
-            access_statsd.timing(
-                &format!("{}.timing", req.method),
-                elapsed.as_secs_f64() * 1000.0,
-            );
-            access_logger.info(&format!(
-                "{} {} {} {:.4}s",
-                req.method,
-                req.path,
-                status,
-                elapsed.as_secs_f64()
-            ));
-        });
+    let access_log: swift_http::AccessLog = Arc::new(move |req, status, elapsed| {
+        access_statsd.increment(&format!("{}.{status}", req.method));
+        access_statsd.timing(
+            &format!("{}.timing", req.method),
+            elapsed.as_secs_f64() * 1000.0,
+        );
+        access_logger.info(&format!(
+            "{} {} {} {:.4}s",
+            req.method,
+            req.path,
+            status,
+            elapsed.as_secs_f64()
+        ));
+    });
 
     // Wave 2: discover ring ports; parent supervises one OS child per
     // (port, worker_index); child binds a single port (REUSEPORT when spp>1).

@@ -226,7 +226,13 @@ mod tests {
         let stats = run_once(&device, "containers", &ring3(), 0, &client);
         assert_eq!(stats.attempted, 1);
         assert_eq!(stats.successes, 1);
-        let pushed: Vec<u64> = client.pushes.lock().unwrap().iter().map(|(_, id)| *id).collect();
+        let pushed: Vec<u64> = client
+            .pushes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, id)| *id)
+            .collect();
         assert_eq!(pushed, vec![1, 2]);
         std::fs::remove_dir_all(&dir).unwrap();
     }

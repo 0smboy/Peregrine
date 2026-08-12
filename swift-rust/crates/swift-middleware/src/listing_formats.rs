@@ -79,8 +79,7 @@ impl Middleware for ListingFormats {
         let cont = parts[2].clone().filter(|c| !c.is_empty());
 
         let method = req.method.clone();
-        if !VALID_API_VERSIONS.contains(&version.as_str())
-            || (method != "GET" && method != "HEAD")
+        if !VALID_API_VERSIONS.contains(&version.as_str()) || (method != "GET" && method != "HEAD")
         {
             return next(req);
         }
@@ -661,8 +660,7 @@ impl Parser<'_> {
                                     self.i += 2;
                                     let lo = self.parse_hex4()?;
                                     if (0xDC00..=0xDFFF).contains(&lo) {
-                                        let c =
-                                            0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                        let c = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                                         char::from_u32(c).unwrap_or('\u{FFFD}')
                                     } else {
                                         '\u{FFFD}'
@@ -828,7 +826,10 @@ mod tests {
             resp.headers.get("Content-Type"),
             Some("application/json; charset=utf-8")
         );
-        assert_eq!(resp.headers.get("Content-Length"), Some(body.len().to_string().as_str()));
+        assert_eq!(
+            resp.headers.get("Content-Length"),
+            Some(body.len().to_string().as_str())
+        );
         assert!(resp.headers.get("Vary").is_none());
     }
 
@@ -1160,7 +1161,8 @@ mod tests {
 
     #[test]
     fn test_xml_field_empty_self_closes() {
-        let body = br#"[{"name": "", "hash": "h", "bytes": 0, "content_type": "", "last_modified": ""}]"#;
+        let body =
+            br#"[{"name": "", "hash": "h", "bytes": 0, "content_type": "", "last_modified": ""}]"#;
         let resp = call(req("GET", "/v1/a/c", "format=xml"), move |_| {
             json_backend(body)
         });

@@ -20,8 +20,8 @@
 use std::path::Path;
 
 use swift_container_server::reconciler::{recon_update, run_once};
-use swift_core::daemon;
 use swift_core::config::SwiftConfig;
+use swift_core::daemon;
 use swift_core::hashing::HashPathConfig;
 use swift_core::obslog::{LogLevel, Logger};
 use swift_core::statsd::StatsdClient;
@@ -81,7 +81,11 @@ fn main() {
             "container-reconciler",
         ),
     );
-    let recon_cache_path = get("container-reconciler", "recon_cache_path", "/var/cache/swift");
+    let recon_cache_path = get(
+        "container-reconciler",
+        "recon_cache_path",
+        "/var/cache/swift",
+    );
 
     let swift_conf_path =
         std::env::var("SWIFT_CONF").unwrap_or_else(|_| "/etc/swift/swift.conf".to_string());

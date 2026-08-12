@@ -344,9 +344,7 @@ impl Middleware for StaticWeb {
                 body: Body::empty(),
             };
             let index_resp = next(index_req);
-            if (200..300).contains(&index_resp.status)
-                || (300..400).contains(&index_resp.status)
-            {
+            if (200..300).contains(&index_resp.status) || (300..400).contains(&index_resp.status) {
                 return index_resp;
             }
             // index not found -> fall to listing (if enabled)
@@ -409,7 +407,9 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
         let app: crate::NextFn = Arc::new(move |r: Request| {
-            log2.lock().unwrap().push((r.method.clone(), r.path.clone()));
+            log2.lock()
+                .unwrap()
+                .push((r.method.clone(), r.path.clone()));
             if r.method == "HEAD" {
                 let mut resp = Response::new(204);
                 if let Some(i) = index {

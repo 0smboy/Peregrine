@@ -61,7 +61,10 @@ pub fn storage_directory(datadir: &Path, partition: u64, name_hash: &str) -> Pat
 
 /// Port of `valid_suffix`.
 pub fn valid_suffix(value: &str) -> bool {
-    value.len() == 3 && value.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    value.len() == 3
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 /// Port of `extract_policy`, returning the policy index parsed from the
@@ -76,8 +79,7 @@ pub fn extract_policy_index(obj_path: &str) -> Option<u32> {
     let suffix = dirname.strip_prefix(DATADIR_BASE)?.strip_prefix('-')?;
     // reject leading zeros / empty / non-digits, as split_policy_string
     // does via PolicyError
-    if suffix.is_empty() || suffix.starts_with('0') || !suffix.bytes().all(|b| b.is_ascii_digit())
-    {
+    if suffix.is_empty() || suffix.starts_with('0') || !suffix.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     suffix.parse().ok()
@@ -175,8 +177,7 @@ pub fn quarantine_renamer(
     device_path: &Path,
     corrupted_file_path: &Path,
 ) -> Result<PathBuf, DiskFileError> {
-    let policy_index =
-        extract_policy_index(&corrupted_file_path.to_string_lossy()).unwrap_or(0);
+    let policy_index = extract_policy_index(&corrupted_file_path.to_string_lossy()).unwrap_or(0);
     let from_dir = corrupted_file_path
         .parent()
         .ok_or_else(|| DiskFileError::InvalidFilename("no parent".into()))?;
@@ -233,7 +234,11 @@ mod tests {
     #[test]
     fn test_storage_directory() {
         assert_eq!(
-            storage_directory(Path::new("objects"), 1234, "abcdef0123456789abcdef0123456789"),
+            storage_directory(
+                Path::new("objects"),
+                1234,
+                "abcdef0123456789abcdef0123456789"
+            ),
             PathBuf::from("objects/1234/789/abcdef0123456789abcdef0123456789")
         );
     }

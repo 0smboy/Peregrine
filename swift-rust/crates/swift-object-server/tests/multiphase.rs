@@ -272,7 +272,10 @@ fn full_multiphase_put_stores_data_footers_and_overrides() {
     client.read_to_end(&mut resp).unwrap();
     let text = String::from_utf8_lossy(&resp);
     assert!(text.starts_with("HTTP/1.1 200"), "{text}");
-    assert!(text.contains("X-Object-Sysmeta-From-Footer: yes-indeed"), "{text}");
+    assert!(
+        text.contains("X-Object-Sysmeta-From-Footer: yes-indeed"),
+        "{text}"
+    );
     assert!(resp.ends_with(data), "body mismatch");
 
     // The async_pending carries the override etag, not the fragment md5.
@@ -302,7 +305,10 @@ fn full_multiphase_put_stores_data_footers_and_overrides() {
         }
     }
     assert!(saw_pending, "an async_pending should have been written");
-    assert!(found_override, "async_pending should carry the override etag");
+    assert!(
+        found_override,
+        "async_pending should carry the override etag"
+    );
 }
 
 #[test]
@@ -330,7 +336,11 @@ fn ec_policy_put_is_durable_only_after_commit() {
         .into_iter()
         .filter(|p| p.to_string_lossy().contains("#3#d.data"))
         .collect();
-    assert_eq!(durable.len(), 1, "expected one durable fragment: {durable:?}");
+    assert_eq!(
+        durable.len(),
+        1,
+        "expected one durable fragment: {durable:?}"
+    );
 
     // No commit doc: 500 per server.py:1020-1021, and the fragment stays
     // NON-durable (#3.data without the #d marker).

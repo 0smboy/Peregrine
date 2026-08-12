@@ -156,7 +156,11 @@ impl HttpTokenValidator {
         }
     }
 
-    pub fn with_domains(mut self, user_domain: impl Into<String>, project_domain: impl Into<String>) -> Self {
+    pub fn with_domains(
+        mut self,
+        user_domain: impl Into<String>,
+        project_domain: impl Into<String>,
+    ) -> Self {
         self.user_domain_name = user_domain.into();
         self.project_domain_name = project_domain.into();
         self
@@ -227,10 +231,7 @@ impl TokenValidator for HttpTokenValidator {
         let result = http_json(
             "GET",
             &url,
-            &[
-                ("X-Auth-Token", admin.as_str()),
-                ("X-Subject-Token", token),
-            ],
+            &[("X-Auth-Token", admin.as_str()), ("X-Subject-Token", token)],
             None,
             self.timeout,
         );
@@ -323,9 +324,7 @@ fn http_json(
     } else if let Some(r) = url.strip_prefix("http://") {
         (false, r)
     } else {
-        return Err(format!(
-            "auth_url must be http:// or https:// (got {url})"
-        ));
+        return Err(format!("auth_url must be http:// or https:// (got {url})"));
     };
     let (hostport, path) = match rest.split_once('/') {
         Some((hp, p)) => (hp.to_string(), format!("/{p}")),
@@ -379,7 +378,9 @@ fn http_json(
         tls.read_to_end(&mut buf).map_err(|e| e.to_string())?;
     } else {
         let mut stream = stream;
-        stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+        stream
+            .write_all(req.as_bytes())
+            .map_err(|e| e.to_string())?;
         if let Some(b) = body {
             stream.write_all(b).map_err(|e| e.to_string())?;
         }
@@ -448,13 +449,13 @@ impl AuthToken {
         req.headers.set("X-User-Id", &token.identity.user_id);
         req.headers.set("X-User-Name", &token.identity.user_name);
         req.headers.set("X-Project-Id", &token.identity.tenant_id);
-        req.headers.set("X-Project-Name", &token.identity.tenant_name);
+        req.headers
+            .set("X-Project-Name", &token.identity.tenant_name);
         req.headers.set("X-Tenant-Id", &token.identity.tenant_id);
-        req.headers.set("X-Tenant-Name", &token.identity.tenant_name);
         req.headers
-            .set("X-Roles", token.identity.roles.join(","));
-        req.headers
-            .set("X-User-Domain-Id", &token.user_domain_id);
+            .set("X-Tenant-Name", &token.identity.tenant_name);
+        req.headers.set("X-Roles", token.identity.roles.join(","));
+        req.headers.set("X-User-Domain-Id", &token.user_domain_id);
         req.headers
             .set("X-User-Domain-Name", &token.user_domain_name);
         req.headers
@@ -491,12 +492,7 @@ impl Middleware for AuthToken {
         if req
             .headers
             .get("X-Backend-Authorize-Override")
-            .map(|v| {
-                matches!(
-                    v.to_ascii_lowercase().as_str(),
-                    "true" | "1" | "yes" | "on"
-                )
-            })
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
             .unwrap_or(false)
         {
             return next(req);
@@ -507,10 +503,7 @@ impl Middleware for AuthToken {
             .get("X-Auth-Token")
             .or_else(|| req.headers.get("X-Storage-Token"))
             .map(|s| s.to_string());
-        let service_token = req
-            .headers
-            .get("X-Service-Token")
-            .map(|s| s.to_string());
+        let service_token = req.headers.get("X-Service-Token").map(|s| s.to_string());
 
         let user_check = match user_token.as_deref() {
             Some(t) if !t.is_empty() => self.validator.validate(t),
@@ -615,10 +608,7 @@ mod tests {
             );
             Response::new(204)
         });
-        assert_eq!(
-            at.handle(mk(&[("X-Auth-Token", "good")]), &app).status,
-            204
-        );
+        assert_eq!(at.handle(mk(&[("X-Auth-Token", "good")]), &app).status, 204);
     }
 
     #[test]

@@ -84,7 +84,12 @@ fn as_wire_string(v: &Value) -> Option<String> {
 
 impl AsyncUpdate {
     /// Parse a pickled async_pending payload.
-    pub fn parse(raw_bytes: &[u8], path: PathBuf, policy_index: u32, timestamp: String) -> Option<AsyncUpdate> {
+    pub fn parse(
+        raw_bytes: &[u8],
+        path: PathBuf,
+        policy_index: u32,
+        timestamp: String,
+    ) -> Option<AsyncUpdate> {
         let value = pickle::loads(raw_bytes).ok()?;
         let pairs = value.as_dict()?.to_vec();
         let op = as_wire_string(dict_get(&pairs, "op")?)?;
@@ -279,7 +284,10 @@ pub fn process_update(
 ) -> std::io::Result<UpdateOutcome> {
     let mut headers = update.headers.clone();
     // The updater always stamps the policy index; keep any existing value.
-    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-backend-storage-policy-index")) {
+    if !headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("x-backend-storage-policy-index"))
+    {
         headers.push((
             "X-Backend-Storage-Policy-Index".to_string(),
             update.policy_index.to_string(),
@@ -359,7 +367,11 @@ pub fn iter_async_pendings(device: &Path, stats: &mut UpdaterStats) -> Vec<Async
                 if !file.is_file() {
                     continue;
                 }
-                let fname = file.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let fname = file
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 // Python updater.py 722-731 accepts only names that split into
                 // exactly `<ohash>-<timestamp>` (`update_file.split('-')` must
                 // yield two parts); anything else is counted as an error and
@@ -393,7 +405,8 @@ pub fn iter_async_pendings(device: &Path, stats: &mut UpdaterStats) -> Vec<Async
                 let Ok(bytes) = std::fs::read(&file) else {
                     continue;
                 };
-                match AsyncUpdate::parse(&bytes, file.clone(), policy_index, timestamp.to_string()) {
+                match AsyncUpdate::parse(&bytes, file.clone(), policy_index, timestamp.to_string())
+                {
                     Some(u) => out.push(u),
                     None => stats.errors += 1,
                 }
@@ -457,8 +470,7 @@ pub fn run_once_with_concurrency(
                         stats.lock().unwrap().errors += 1;
                         return;
                     };
-                    let devs: Vec<&swift_ring::RingDevice> =
-                        nodes.iter().map(|n| n.dev).collect();
+                    let devs: Vec<&swift_ring::RingDevice> = nodes.iter().map(|n| n.dev).collect();
                     let mut local = UpdaterStats::default();
                     let _ = process_update(update, part, &devs, client, &mut local);
                     let mut g = stats.lock().unwrap();
@@ -488,10 +500,7 @@ mod tests {
                 Value::Str("x-timestamp".into()),
                 Value::Str("1751500000.00000".into()),
             ),
-            (
-                Value::Str("x-size".into()),
-                Value::Str("4".into()),
-            ),
+            (Value::Str("x-size".into()), Value::Str("4".into())),
         ]);
         let dict = Value::Dict(vec![
             (Value::Str("op".into()), Value::Str(op.into())),
@@ -575,8 +584,7 @@ mod tests {
         };
         let nodes = [dev(1), dev(2), dev(3)];
         let refs: Vec<&swift_ring::RingDevice> = nodes.iter().collect();
-        let outcome =
-            process_update(&updates[0], 5, &refs, &client, &mut stats).unwrap();
+        let outcome = process_update(&updates[0], 5, &refs, &client, &mut stats).unwrap();
         assert_eq!(outcome, UpdateOutcome::Unlinked);
         assert!(!file.exists(), "async file unlinked on full success");
         assert_eq!(client.calls.lock().unwrap().len(), 3);
@@ -604,8 +612,7 @@ mod tests {
         };
         let nodes = [dev(1), dev(2), dev(3)];
         let refs: Vec<&swift_ring::RingDevice> = nodes.iter().collect();
-        let outcome =
-            process_update(&updates[0], 5, &refs, &client, &mut stats).unwrap();
+        let outcome = process_update(&updates[0], 5, &refs, &client, &mut stats).unwrap();
         assert_eq!(outcome, UpdateOutcome::Failed);
         assert!(file.exists(), "async file kept when nothing succeeded");
         std::fs::remove_dir_all(&dir).unwrap();

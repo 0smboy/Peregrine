@@ -39,11 +39,11 @@ mod backend_ratelimit;
 mod bulk;
 mod cache;
 mod catch_errors;
+mod cname_lookup;
 mod container_quotas;
 mod container_sync;
 mod copy;
 mod crossdomain;
-mod cname_lookup;
 mod decrypter;
 mod dlo;
 mod domain_remap;
@@ -76,22 +76,26 @@ pub use acl::{
     acls_from_sysmeta, format_acl_v2, parse_acl_v1, parse_acl_v2, referrer_allowed,
     validate_account_acl_header, AccountAcls,
 };
+pub use authtoken::{
+    AuthToken, HttpKeystoneValidator, HttpTokenValidator, MapTokenValidator, StaticTokenMap,
+    TokenOutcome, TokenValidator, ValidatedToken,
+};
 pub use backend_ratelimit::BackendRateLimit;
 pub use bulk::{parse_delete_body, Bulk, BulkDeleteResult};
 pub use cache::{Cache, DEFAULT_MEMCACHE_SERVERS};
 pub use catch_errors::CatchErrors;
+pub use cname_lookup::{CnameLookup, Resolver};
 pub use container_quotas::ContainerQuotas;
 pub use container_sync::{
     get_sig as container_sync_get_sig, ClosureSyncKeyProvider, ContainerSync, MapSyncKeyProvider,
     RealmInfo, RealmsConf, SyncKeyProvider,
 };
 pub use copy::Copy;
-pub use dlo::DynamicLargeObject;
 pub use crossdomain::Crossdomain;
-pub use cname_lookup::{CnameLookup, Resolver};
 pub use decrypter::{
     decrypt_container_listing_json, decrypt_listing_hash, decrypt_object_body, Decrypter,
 };
+pub use dlo::DynamicLargeObject;
 pub use domain_remap::DomainRemap;
 pub use encrypter::{
     encrypt_object_body, encrypt_object_body_from_body, encrypt_object_body_from_reader, random_iv,
@@ -99,18 +103,14 @@ pub use encrypter::{
     ETAG_MAC_HEADER, OVERRIDE_ETAG_HEADER,
 };
 pub use etag_quoter::EtagQuoter;
-pub use keymaster::{CryptoKeys, KeyMaster, KeyMasterMw};
 pub use formpost::{
     formpost_hmac, multipart_boundary, parse_content_disposition,
     verify_signature as formpost_verify, FormPost, FormPostAttributes, FormPostVerify,
     DEFAULT_ALLOWED_DIGESTS as FORMPOST_DEFAULT_DIGESTS,
 };
-pub use authtoken::{
-    AuthToken, HttpKeystoneValidator, HttpTokenValidator, MapTokenValidator, StaticTokenMap,
-    TokenOutcome, TokenValidator, ValidatedToken,
-};
 pub use gatekeeper::Gatekeeper;
 pub use healthcheck::HealthCheck;
+pub use keymaster::{CryptoKeys, KeyMaster, KeyMasterMw};
 pub use keystoneauth::{
     authorize as keystone_authorize, cross_tenant_match, AccountRules, AuthRequest, AuthResult,
     Identity, KeystoneAuth, RoleConfig, AUTH_PLUGIN_HEADER, AUTH_PLUGIN_KEYSTONE,
@@ -132,9 +132,7 @@ pub use slo::{
     dlo_etag_and_size, manifest_etag, normalize_etag, refetch_listing_slo_etag, slo_etag_and_size,
     Slo, SloSegment,
 };
-pub use staticweb::{
-    build_listing_html, html_escape, human_readable, ListingItem, StaticWeb,
-};
+pub use staticweb::{build_listing_html, html_escape, human_readable, ListingItem, StaticWeb};
 pub use symlink::Symlink;
 pub use tempauth::{TempAuth, UserRecord};
 pub use tempurl::{ClosureKeyProvider, KeyProvider, TempUrl};

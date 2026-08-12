@@ -508,7 +508,10 @@ mod tests {
             body.starts_with("<?xml version='1.0' encoding='UTF-8'?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"),
             "root+xmlns missing: {body}"
         );
-        assert!(body.contains("<ETag>\"deadbeef\"</ETag>"), "quoted ETag missing: {body}");
+        assert!(
+            body.contains("<ETag>\"deadbeef\"</ETag>"),
+            "quoted ETag missing: {body}"
+        );
         assert!(body.contains("<IsTruncated>false</IsTruncated>"));
         assert!(body.contains("<Contents>"));
         assert!(body.ends_with("</ListBucketResult>") || body.contains("</ListBucketResult>"));
@@ -542,9 +545,9 @@ mod tests {
         assert_eq!(resp.status, 200);
         assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
-        assert!(body.contains(
-            "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
-        ));
+        assert!(
+            body.contains("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">")
+        );
         assert!(body.contains("<KeyCount>1</KeyCount>"));
         assert!(body.contains("<ETag>\"aa\"</ETag>"));
         assert!(body.contains("<Key>a</Key>"));

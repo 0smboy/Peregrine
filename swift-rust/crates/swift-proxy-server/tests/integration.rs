@@ -198,7 +198,6 @@ fn test_proxy_end_to_end_account_and_container() {
     std::fs::remove_dir_all(&tmp).unwrap();
 }
 
-
 #[test]
 fn test_proxy_object_round_trip() {
     let tmp = std::env::temp_dir().join(format!("swift-proxy-obj-{}", std::process::id()));
@@ -534,7 +533,13 @@ fn test_get_stale_handoff_data_loses_to_newer_tombstones() {
     assert_eq!(body, b"stale body");
 
     // the proxy must prefer the newer tombstones over the stale source
-    let (status, body) = body_http(proxy_addr, "GET", &format!("/v1/AUTH_stale/c/{obj}"), &[], b"");
+    let (status, body) = body_http(
+        proxy_addr,
+        "GET",
+        &format!("/v1/AUTH_stale/c/{obj}"),
+        &[],
+        b"",
+    );
     assert_eq!(
         status,
         404,
@@ -603,7 +608,8 @@ fn test_post_mixed_results_falls_back_to_handoff() {
 
     // a real container server: object POST requires the container to exist
     // (obj.py:469), so the proxy's container HEAD must succeed
-    let cont_tmp = std::env::temp_dir().join(format!("swift-proxy-postmix-c-{}", std::process::id()));
+    let cont_tmp =
+        std::env::temp_dir().join(format!("swift-proxy-postmix-c-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&cont_tmp);
     std::fs::create_dir_all(cont_tmp.join("sda1")).unwrap();
     let cont_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -678,9 +684,9 @@ fn test_post_mixed_results_falls_back_to_handoff() {
         let (status, headers, _) = http(addr, "HEAD", &target, "");
         assert_eq!(status, 200);
         assert!(
-            headers.iter().any(|(k, v)| {
-                k.eq_ignore_ascii_case("X-Object-Meta-Color") && v == "teal"
-            }),
+            headers
+                .iter()
+                .any(|(k, v)| { k.eq_ignore_ascii_case("X-Object-Meta-Color") && v == "teal" }),
             "POST metadata visible on {addr}: {headers:?}"
         );
     }
@@ -714,13 +720,17 @@ fn test_pipeline_healthcheck_gatekeeper_transid() {
     assert_eq!(status, 200);
     assert_eq!(body, b"OK");
     // catch_errors stamped a trans id even on the healthcheck path
-    assert!(headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("X-Trans-Id")));
+    assert!(headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("X-Trans-Id")));
 
     // an object GET to a dead backend still returns (503) with a trans id,
     // and the response carries no leaked backend headers
     let (_status, headers, _) = http(addr, "GET", "/v1/AUTH_x/c/o", "");
     assert!(
-        headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("X-Trans-Id")),
+        headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("X-Trans-Id")),
         "trans id present: {headers:?}"
     );
     assert!(
@@ -805,7 +815,10 @@ fn test_tempauth_end_to_end() {
     assert_eq!(body, expected_body.as_bytes());
     assert_eq!(header("Content-Type"), Some("text/html; charset=UTF-8"));
     assert_eq!(header("Content-Length"), Some("131"));
-    assert_eq!(header("Www-Authenticate"), Some("Swift realm=\"AUTH_test\""));
+    assert_eq!(
+        header("Www-Authenticate"),
+        Some("Swift realm=\"AUTH_test\"")
+    );
 
     // get a token
     let mut conn = std::net::TcpStream::connect(proxy_addr).unwrap();
@@ -844,7 +857,15 @@ fn test_tempauth_end_to_end() {
         .unwrap()
         .parse()
         .unwrap();
-    assert_eq!(status, 201, "authenticated container PUT: {}", String::from_utf8_lossy(&raw));
+    assert_eq!(
+        status,
+        201,
+        "authenticated container PUT: {}",
+        String::from_utf8_lossy(&raw)
+    );
 
-    std::fs::remove_dir_all(std::env::temp_dir().join(format!("swift-auth-{}", std::process::id()))).ok();
+    std::fs::remove_dir_all(
+        std::env::temp_dir().join(format!("swift-auth-{}", std::process::id())),
+    )
+    .ok();
 }

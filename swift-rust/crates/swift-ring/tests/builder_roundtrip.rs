@@ -60,8 +60,7 @@ fn test_v1_write_read_roundtrip() {
     let reloaded = RingData::load(&path).unwrap();
     assert_eq!(reloaded.format_version, 1);
     assert_eq!(
-        reloaded.replica2part2dev_id,
-        ring_data.replica2part2dev_id,
+        reloaded.replica2part2dev_id, ring_data.replica2part2dev_id,
         "assignment table round-trips"
     );
     assert_eq!(reloaded.part_shift, ring_data.part_shift);

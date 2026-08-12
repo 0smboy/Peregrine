@@ -143,11 +143,7 @@ impl KeyMaster {
         for (k, v) in items {
             let kl = k.to_ascii_lowercase();
             if kl == "active_root_secret_id" {
-                active = if v.is_empty() {
-                    None
-                } else {
-                    Some(v.clone())
-                };
+                active = if v.is_empty() { None } else { Some(v.clone()) };
             } else if kl == "meta_version_to_write" && !v.is_empty() {
                 meta_version = v.clone();
             } else if kl == PREFIX {
@@ -312,14 +308,9 @@ impl KeyMaster {
         self.root_secret_ids()
             .into_iter()
             .filter_map(|id| {
-                self.fetch_keys_for_secret(
-                    account,
-                    Some(container),
-                    Some(object),
-                    id.as_deref(),
-                )
-                .ok()
-                .and_then(|k| k.object)
+                self.fetch_keys_for_secret(account, Some(container), Some(object), id.as_deref())
+                    .ok()
+                    .and_then(|k| k.object)
             })
             .collect()
     }
@@ -400,14 +391,8 @@ mod tests {
         let root_a = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
         let root_b = vec![0xffu8; 32];
         let items = vec![
-            (
-                "encryption_root_secret".into(),
-                b64_of(&root_a),
-            ),
-            (
-                "encryption_root_secret_old".into(),
-                b64_of(&root_b),
-            ),
+            ("encryption_root_secret".into(), b64_of(&root_a)),
+            ("encryption_root_secret_old".into(), b64_of(&root_b)),
             ("active_root_secret_id".into(), "old".into()),
             ("meta_version_to_write".into(), "2".into()),
         ];

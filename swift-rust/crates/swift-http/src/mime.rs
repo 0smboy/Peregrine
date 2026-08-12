@@ -266,7 +266,10 @@ mod tests {
                        \r\n--bnd--";
         let mut m = docs(stream, b"bnd");
         let h1 = m.next_document().unwrap().unwrap();
-        assert_eq!(h1, vec![("X-Document".to_string(), "object body".to_string())]);
+        assert_eq!(
+            h1,
+            vec![("X-Document".to_string(), "object body".to_string())]
+        );
         assert_eq!(read_body(&mut m), b"OBJECT DATA");
 
         let h2 = m.next_document().unwrap().unwrap();

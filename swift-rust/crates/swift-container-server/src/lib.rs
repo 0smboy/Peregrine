@@ -32,26 +32,25 @@ pub mod reconciler;
 pub mod sharder;
 pub mod sync;
 pub mod updater;
+pub use reconciler::{
+    decide as reconciler_decide, parse_reconciler_obj_name, reconcile, reconciler_container_name,
+    reconciler_content_type, reconciler_obj_name, run_once as reconciler_run_once, QueueEntry,
+    QueueOp, ReconcileClient, ReconcileDecision, ReconcileOutcome, ReconcilerStats,
+    MISPLACED_OBJECTS_ACCOUNT,
+};
 pub use sharder::{
     cleave, cleave_shard_range, default_shard_quorum, find_and_merge_found_ranges,
     find_shrink_acceptor, find_shrinking_donors, http_replicator_for_primaries,
     load_cleaving_context, lookup_replicator_for_ring, maybe_auto_shard,
     move_misplaced_from_retiring, primary_shard_replica_nodes, process_sharding_container,
     process_sharding_container_detailed, process_sharding_container_with_replicator,
-    process_shrinking_donors, process_shrinking_donors_stub, put_shard_quorum,
-    range_covers, recon_update as sharder_recon_update,
-    ring_get_nodes_for_shard, run_once as sharder_run_once,
+    process_shrinking_donors, process_shrinking_donors_stub, put_shard_quorum, range_covers,
+    recon_update as sharder_recon_update, ring_get_nodes_for_shard, run_once as sharder_run_once,
     run_once_with_opts as sharder_run_once_with_opts, run_once_with_opts_and_replicator,
     run_once_with_opts_and_ring, save_cleaving_context, shard_replicas_from_ring_devices,
     CleavingContext, HttpShardReplicator, LocalShardReplicator, LookupHttpShardReplicator,
     MapShardHttpTransport, ProcessShardingOutcome, ShardHttpTransport, ShardReplicaNode,
     ShardReplicator, SharderRunOpts, SharderStats, TcpShardHttpTransport, CLEAVING_CONTEXT_KEY,
-};
-pub use reconciler::{
-    decide as reconciler_decide, parse_reconciler_obj_name, reconcile, reconciler_container_name,
-    reconciler_content_type, reconciler_obj_name, run_once as reconciler_run_once, QueueEntry,
-    QueueOp, ReconcileClient, ReconcilerStats,
-    ReconcileDecision, ReconcileOutcome, MISPLACED_OBJECTS_ACCOUNT,
 };
 pub use sync::{
     build_sync_headers, get_sig, owns_object, process_container_db, run_once as sync_run_once,
@@ -66,9 +65,7 @@ pub use updater::{
 
 use swift_core::hashing::HashPathConfig;
 use swift_core::timestamp::Timestamp;
-use swift_db::{
-    BrokerMetadata, ContainerBroker, DbError, DbValue, ListObjectsArgs, ObjectRecord,
-};
+use swift_db::{BrokerMetadata, ContainerBroker, DbError, DbValue, ListObjectsArgs, ObjectRecord};
 use swift_http::{http_date, split_path, HeaderKeyDict, Request, Response};
 
 pub const CONTAINER_LISTING_LIMIT: i64 = 10000;
@@ -505,13 +502,9 @@ impl ContainerServer {
         // Shared constraint: quote_plus name validity + mount check when
         // configured (Python check_drive); mount_check is the production
         // default and must be enforced.
-        swift_core::constraints::check_drive(
-            &self.config.devices,
-            drive,
-            self.config.mount_check,
-        )
-        .map(|_| ())
-        .map_err(|_| swob_response(507, Some(drive)))
+        swift_core::constraints::check_drive(&self.config.devices, drive, self.config.mount_check)
+            .map(|_| ())
+            .map_err(|_| swob_response(507, Some(drive)))
     }
 
     /// Port of `possibly_quarantine` (swift/common/db.py:502-522): a
@@ -526,7 +519,13 @@ impl ContainerServer {
         error_response(500, &e.to_string())
     }
 
-    fn broker_for(&self, drive: &str, part: &str, account: &str, container: &str) -> ContainerBroker {
+    fn broker_for(
+        &self,
+        drive: &str,
+        part: &str,
+        account: &str,
+        container: &str,
+    ) -> ContainerBroker {
         let hsh = self
             .config
             .hash_config
@@ -554,9 +553,7 @@ impl ContainerServer {
         // render quoted
         let index: Option<i64> = raw.trim().parse().ok();
         match index {
-            Some(index) if self.config.policies.iter().any(|(i, _)| *i == index) => {
-                Ok(Some(index))
-            }
+            Some(index) if self.config.policies.iter().any(|(i, _)| *i == index) => Ok(Some(index)),
             Some(index) => Err(plain_response(
                 400,
                 &format!("Invalid X-Backend-Storage-Policy-Index {index}"),
@@ -1028,10 +1025,7 @@ impl ContainerServer {
         // the aggregate stored metadata over the limits.
         let mut merged = broker.metadata().unwrap_or_default();
         for (k, vt) in &metadata {
-            match merged
-                .iter_mut()
-                .find(|(mk, _)| mk.eq_ignore_ascii_case(k))
-            {
+            match merged.iter_mut().find(|(mk, _)| mk.eq_ignore_ascii_case(k)) {
                 Some((_, mvt)) => {
                     if vt.1 > mvt.1 {
                         *mvt = vt.clone();
@@ -1096,7 +1090,14 @@ impl ContainerServer {
         {
             return self.put_shard(req, &mut broker, &account, &req_timestamp, &drive);
         }
-        self.put_container(req, &mut broker, &account, &container, &req_timestamp, &drive)
+        self.put_container(
+            req,
+            &mut broker,
+            &account,
+            &container,
+            &req_timestamp,
+            &drive,
+        )
     }
 
     fn put_object(
@@ -1172,21 +1173,20 @@ impl ContainerServer {
             Ok(body) => body,
             Err(resp) => return resp,
         };
-        let ranges: Vec<swift_db::ShardRange> = match serde_json::from_slice::<serde_json::Value>(
-            body,
-        ) {
-            Ok(serde_json::Value::Array(arr)) => {
-                let mut v = Vec::with_capacity(arr.len());
-                for item in &arr {
-                    match swift_db::ShardRange::from_json(item) {
-                        Some(sr) => v.push(sr),
-                        None => return error_response(400, "Invalid body: bad shard range"),
+        let ranges: Vec<swift_db::ShardRange> =
+            match serde_json::from_slice::<serde_json::Value>(body) {
+                Ok(serde_json::Value::Array(arr)) => {
+                    let mut v = Vec::with_capacity(arr.len());
+                    for item in &arr {
+                        match swift_db::ShardRange::from_json(item) {
+                            Some(sr) => v.push(sr),
+                            None => return error_response(400, "Invalid body: bad shard range"),
+                        }
                     }
+                    v
                 }
-                v
-            }
-            _ => return error_response(400, "Invalid body: expected a JSON array"),
-        };
+                _ => return error_response(400, "Invalid body: expected a JSON array"),
+            };
         let created = match self.maybe_autocreate(
             broker,
             req_timestamp,
@@ -1273,8 +1273,7 @@ impl ContainerServer {
             Ok(r) => r,
             Err(e) => return self.db_error_response(&e, broker.db_file()),
         };
-        let body =
-            serde_json::Value::Array(ranges.iter().map(|r| r.to_json()).collect::<Vec<_>>());
+        let body = serde_json::Value::Array(ranges.iter().map(|r| r.to_json()).collect::<Vec<_>>());
         let bytes = serde_json::to_vec(&body).unwrap_or_default();
         headers.set("X-Backend-Record-Type", "shard");
         headers.set("Content-Type", format!("{out_content_type}; charset=utf-8"));
@@ -1446,7 +1445,11 @@ impl ContainerServer {
                 ) {
                     return resp;
                 }
-                let raw_ts = req.headers.get("x-timestamp").unwrap_or_default().to_string();
+                let raw_ts = req
+                    .headers
+                    .get("x-timestamp")
+                    .unwrap_or_default()
+                    .to_string();
                 if let Err(e) = broker.delete_object(&obj, &raw_ts, obj_policy_index) {
                     return error_response(500, &e.to_string());
                 }
@@ -1548,12 +1551,13 @@ impl ContainerServer {
         let mut broker = ContainerBroker::new(&db_path, "", "");
         match op {
             "merge_items" => {
-                let items = args.get(1).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let items = args
+                    .get(1)
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
                 let source = args.get(2).and_then(|v| v.as_str()).map(str::to_string);
-                let max_rowid = items
-                    .iter()
-                    .filter_map(|o| o["ROWID"].as_i64())
-                    .max();
+                let max_rowid = items.iter().filter_map(|o| o["ROWID"].as_i64()).max();
                 let mut records = Vec::with_capacity(items.len());
                 for obj in &items {
                     records.push(ObjectRecord {
@@ -1582,7 +1586,11 @@ impl ContainerServer {
                 swob_response(202, None)
             }
             "merge_syncs" => {
-                let syncs = args.get(1).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let syncs = args
+                    .get(1)
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
                 let points: Vec<(i64, String)> = syncs
                     .iter()
                     .map(|s| {
@@ -1600,7 +1608,12 @@ impl ContainerServer {
             "sync" => {
                 // args: remote_sync, hash, id, created_at, put_timestamp,
                 // delete_timestamp, metadata
-                let s = |i: usize| args.get(i).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let s = |i: usize| {
+                    args.get(i)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
                 let remote_point = args.get(1).and_then(|v| v.as_i64()).unwrap_or(-1);
                 let remote_hash = s(2);
                 let remote_id = s(3);
@@ -1668,10 +1681,7 @@ impl ContainerServer {
         // optional final basename (db_replicator.py:1086-1088), sent by
         // Python for epoch-suffixed dbs; defaults to `<hsh>.db` from the URL
         let db_file = match args.get(2).and_then(|v| v.as_str()) {
-            Some(name) => db_path
-                .parent()
-                .unwrap_or_else(|| Path::new(""))
-                .join(name),
+            Some(name) => db_path.parent().unwrap_or_else(|| Path::new("")).join(name),
             None => db_path.to_path_buf(),
         };
         if db_file.exists() {
@@ -1713,7 +1723,12 @@ impl ContainerServer {
     /// DB's object rows, sync points, shard ranges
     /// (container/replicator.py:431-437) and metadata into the staged DB,
     /// re-id it, then rename it over the existing DB.
-    fn rsync_then_merge(&self, drive: &str, db_path: &Path, args: &[serde_json::Value]) -> Response {
+    fn rsync_then_merge(
+        &self,
+        drive: &str,
+        db_path: &Path,
+        args: &[serde_json::Value],
+    ) -> Response {
         let Some(tmp_name) = args.get(1).and_then(|v| v.as_str()) else {
             return plain_response(400, "Invalid object type");
         };
@@ -1736,8 +1751,7 @@ impl ContainerServer {
                     break;
                 }
                 point = items.last().map(|(rowid, _)| *rowid).unwrap();
-                let records: Vec<ObjectRecord> =
-                    items.into_iter().map(|(_, rec)| rec).collect();
+                let records: Vec<ObjectRecord> = items.into_iter().map(|(_, rec)| rec).collect();
                 if let Err(e) = new_broker.merge_items(records) {
                     return error_response(500, &e.to_string());
                 }
@@ -1801,7 +1815,9 @@ impl ContainerServer {
         };
         let objs: Vec<serde_json::Value> = match serde_json::from_slice(body) {
             Ok(serde_json::Value::Array(objs)) => objs,
-            Ok(_) | Err(_) => return plain_response(400, "Expecting value: line 1 column 1 (char 0)"),
+            Ok(_) | Err(_) => {
+                return plain_response(400, "Expecting value: line 1 column 1 (char 0)")
+            }
         };
         let mut records = Vec::with_capacity(objs.len());
         for obj in &objs {

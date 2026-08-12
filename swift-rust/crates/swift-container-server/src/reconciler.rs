@@ -57,8 +57,8 @@ pub fn reconciler_container_name(obj_timestamp: &str) -> Option<String> {
     // non-explicit decode yields Some(data) when the meta part is absent
     let meta = meta.unwrap_or(data);
     let secs = meta.as_secs_f64() as i64; // int(Timestamp)
-    let bucket = secs.div_euclid(MISPLACED_OBJECTS_CONTAINER_DIVISOR)
-        * MISPLACED_OBJECTS_CONTAINER_DIVISOR;
+    let bucket =
+        secs.div_euclid(MISPLACED_OBJECTS_CONTAINER_DIVISOR) * MISPLACED_OBJECTS_CONTAINER_DIVISOR;
     Some(bucket.to_string())
 }
 
@@ -437,11 +437,10 @@ pub struct HttpReconcileClient<'a> {
 
 impl ReconcileClient for HttpReconcileClient<'_> {
     fn move_object(&self, entry: &QueueEntry, from_policy: i64, to_policy: i64) -> bool {
-        let Ok((part, nodes)) = self.object_ring.get_nodes(
-            &entry.account,
-            Some(&entry.container),
-            Some(&entry.obj),
-        ) else {
+        let Ok((part, nodes)) =
+            self.object_ring
+                .get_nodes(&entry.account, Some(&entry.container), Some(&entry.obj))
+        else {
             return false;
         };
         let from_pi = from_policy.to_string();
@@ -563,7 +562,12 @@ impl ReconcileClient for HttpReconcileClient<'_> {
     }
 
     fn pop_queue(&self, entry: &QueueEntry) -> bool {
-        let qname = reconciler_obj_name(entry.policy_index, &entry.account, &entry.container, &entry.obj);
+        let qname = reconciler_obj_name(
+            entry.policy_index,
+            &entry.account,
+            &entry.container,
+            &entry.obj,
+        );
         let Ok((part, nodes)) = self.container_ring.get_nodes(
             MISPLACED_OBJECTS_ACCOUNT,
             Some(&self.queue_container),
@@ -619,11 +623,7 @@ pub struct ReconcilerStats {
 }
 
 /// One full pass over `.misplaced_objects`.
-pub fn run_once(
-    account_ring: &Ring,
-    container_ring: &Ring,
-    object_ring: &Ring,
-) -> ReconcilerStats {
+pub fn run_once(account_ring: &Ring, container_ring: &Ring, object_ring: &Ring) -> ReconcilerStats {
     let mut stats = ReconcilerStats::default();
     let Some(containers) = list_account_containers(account_ring, MISPLACED_OBJECTS_ACCOUNT) else {
         stats.errors += 1;
@@ -745,7 +745,6 @@ mod tests {
         assert!(client.popped.lock().unwrap().is_empty());
     }
 
-
     #[test]
     fn test_reconciler_obj_name_and_parse() {
         let name = reconciler_obj_name(1, "AUTH_test", "c", "o/deep");
@@ -760,9 +759,15 @@ mod tests {
     #[test]
     fn test_content_type_roundtrip() {
         assert_eq!(reconciler_content_type("put"), Some("application/x-put"));
-        assert_eq!(reconciler_content_type("DELETE"), Some("application/x-delete"));
+        assert_eq!(
+            reconciler_content_type("DELETE"),
+            Some("application/x-delete")
+        );
         assert_eq!(reconciler_content_type("bogus"), None);
-        assert_eq!(op_from_content_type("application/x-put"), Some(QueueOp::Put));
+        assert_eq!(
+            op_from_content_type("application/x-put"),
+            Some(QueueOp::Put)
+        );
         assert_eq!(
             op_from_content_type("application/x-delete"),
             Some(QueueOp::Delete)
@@ -786,7 +791,13 @@ mod tests {
             container: "c".into(),
             obj: "o".into(),
         };
-        assert_eq!(decide(&e, 0), ReconcileDecision::Move { from_policy: 1, to_policy: 0 });
+        assert_eq!(
+            decide(&e, 0),
+            ReconcileDecision::Move {
+                from_policy: 1,
+                to_policy: 0
+            }
+        );
         assert_eq!(decide(&e, 1), ReconcileDecision::AlreadyCorrect);
     }
 }

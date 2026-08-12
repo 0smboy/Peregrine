@@ -82,13 +82,12 @@ fn main() {
         &statsd_prefix,
     );
 
-    let swift_conf_path =
-        std::env::var("SWIFT_CONF").unwrap_or_else(|_| {
-            format!(
-                "{}/swift.conf",
-                std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string())
-            )
-        });
+    let swift_conf_path = std::env::var("SWIFT_CONF").unwrap_or_else(|_| {
+        format!(
+            "{}/swift.conf",
+            std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string())
+        )
+    });
     let swift_conf = parse_conf_file(&swift_conf_path).unwrap_or_else(|e| {
         logger.error(&format!("could not read {swift_conf_path}: {e}"));
         std::process::exit(1);
@@ -121,21 +120,20 @@ fn main() {
     let client_timeout_secs: u64 = get("client_timeout", "60").parse().unwrap_or(60);
     let access_logger = Arc::clone(&logger);
     let access_statsd = Arc::clone(&statsd);
-    let access_log: swift_http::AccessLog =
-        Arc::new(move |req, status, elapsed| {
-            access_statsd.increment(&format!("{}.{status}", req.method));
-            access_statsd.timing(
-                &format!("{}.timing", req.method),
-                elapsed.as_secs_f64() * 1000.0,
-            );
-            access_logger.info(&format!(
-                "{} {} {} {:.4}s",
-                req.method,
-                req.path,
-                status,
-                elapsed.as_secs_f64()
-            ));
-        });
+    let access_log: swift_http::AccessLog = Arc::new(move |req, status, elapsed| {
+        access_statsd.increment(&format!("{}.{status}", req.method));
+        access_statsd.timing(
+            &format!("{}.timing", req.method),
+            elapsed.as_secs_f64() * 1000.0,
+        );
+        access_logger.info(&format!(
+            "{} {} {} {:.4}s",
+            req.method,
+            req.path,
+            status,
+            elapsed.as_secs_f64()
+        ));
+    });
     let mut http_config = swift_http::ServerConfig {
         client_timeout_secs,
         access_log: Some(access_log),

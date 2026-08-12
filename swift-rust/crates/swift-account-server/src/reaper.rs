@@ -51,7 +51,12 @@ pub struct ReaperStats {
 pub trait ReaperClient {
     /// List the object names in a container (None => listing failed; the
     /// container is left for a later pass).
-    fn list_objects(&self, account: &str, container: &str, policy_index: i64) -> Option<Vec<String>>;
+    fn list_objects(
+        &self,
+        account: &str,
+        container: &str,
+        policy_index: i64,
+    ) -> Option<Vec<String>>;
     /// DELETE one object across the object ring. Returns success.
     fn reap_object(
         &self,
@@ -239,7 +244,12 @@ pub struct HttpReaperClient<'a> {
 }
 
 impl ReaperClient for HttpReaperClient<'_> {
-    fn list_objects(&self, account: &str, container: &str, policy_index: i64) -> Option<Vec<String>> {
+    fn list_objects(
+        &self,
+        account: &str,
+        container: &str,
+        policy_index: i64,
+    ) -> Option<Vec<String>> {
         let (part, nodes) = self
             .container_ring
             .get_nodes(account, Some(container), None)
@@ -332,7 +342,9 @@ impl ReaperClient for HttpReaperClient<'_> {
     }
 
     fn reap_container(&self, account: &str, container: &str, timestamp: &str) -> bool {
-        let Ok((part, nodes)) = self.container_ring.get_nodes(account, Some(container), None)
+        let Ok((part, nodes)) = self
+            .container_ring
+            .get_nodes(account, Some(container), None)
         else {
             return false;
         };
@@ -457,7 +469,10 @@ mod tests {
             true
         }
         fn reap_container(&self, _a: &str, container: &str, _ts: &str) -> bool {
-            self.deleted_containers.lock().unwrap().push(container.to_string());
+            self.deleted_containers
+                .lock()
+                .unwrap()
+                .push(container.to_string());
             true
         }
     }
@@ -470,7 +485,8 @@ mod tests {
         let db = hd.join(format!("{h}.db"));
         let mut b = AccountBroker::new(&db, "AUTH_gone");
         // account put at t=100, two live containers, then marked deleted at t=200
-        b.initialize("0000000100.00000", "0000000100.00000", "id").unwrap();
+        b.initialize("0000000100.00000", "0000000100.00000", "id")
+            .unwrap();
         b.put_container("c1", "0000000050.00000", "0", PV::Int(0), PV::Int(0), 0)
             .unwrap();
         b.put_container("c2", "0000000050.00000", "0", PV::Int(0), PV::Int(0), 0)
@@ -504,8 +520,11 @@ mod tests {
         // a fresh (non-deleted) account is not reapable
         let db2 = dir.join("live.db");
         let mut live = AccountBroker::new(&db2, "AUTH_live");
-        live.initialize("0000000100.00000", "0000000100.00000", "id").unwrap();
-        assert!(reap_account(&mut live, 1e12, 0.0, "0", &client).unwrap().is_none());
+        live.initialize("0000000100.00000", "0000000100.00000", "id")
+            .unwrap();
+        assert!(reap_account(&mut live, 1e12, 0.0, "0", &client)
+            .unwrap()
+            .is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

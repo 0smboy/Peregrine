@@ -68,7 +68,12 @@ pub struct S3TokenResult {
 
 /// Pluggable Keystone `/v3/s3tokens` client.
 pub trait S3TokenClient: Send + Sync {
-    fn exchange(&self, access_key: &str, signature: &str, string_to_sign: &str) -> Option<S3TokenResult>;
+    fn exchange(
+        &self,
+        access_key: &str,
+        signature: &str,
+        string_to_sign: &str,
+    ) -> Option<S3TokenResult>;
 }
 
 /// In-memory map for unit tests (access_key → result).
@@ -88,7 +93,12 @@ impl MapS3TokenClient {
 }
 
 impl S3TokenClient for MapS3TokenClient {
-    fn exchange(&self, access_key: &str, _signature: &str, _string_to_sign: &str) -> Option<S3TokenResult> {
+    fn exchange(
+        &self,
+        access_key: &str,
+        _signature: &str,
+        _string_to_sign: &str,
+    ) -> Option<S3TokenResult> {
         self.map.get(access_key).cloned()
     }
 }
@@ -119,7 +129,12 @@ impl HttpS3TokenClient {
 }
 
 impl S3TokenClient for HttpS3TokenClient {
-    fn exchange(&self, access_key: &str, signature: &str, string_to_sign: &str) -> Option<S3TokenResult> {
+    fn exchange(
+        &self,
+        access_key: &str,
+        signature: &str,
+        string_to_sign: &str,
+    ) -> Option<S3TokenResult> {
         // Body matches Python s3token (`credentials.access/token/signature`).
         // `token` is urlsafe-base64 of the raw SigV4 string-to-sign bytes.
         let token = encode_s3tokens_token(string_to_sign.as_bytes());
@@ -211,7 +226,9 @@ fn http_post_json(
         tls.read_to_end(&mut buf).map_err(|e| e.to_string())?;
     } else {
         let mut stream = stream;
-        stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+        stream
+            .write_all(req.as_bytes())
+            .map_err(|e| e.to_string())?;
         stream.read_to_end(&mut buf).map_err(|e| e.to_string())?;
     }
 
@@ -347,7 +364,10 @@ impl Middleware for S3Token {
         let Some((access_key, signature, string_to_sign)) = auth_details_from_request(&req) else {
             return next(req);
         };
-        let Some(result) = self.client.exchange(&access_key, &signature, &string_to_sign) else {
+        let Some(result) = self
+            .client
+            .exchange(&access_key, &signature, &string_to_sign)
+        else {
             return next(req);
         };
         strip_s3_auth_detail_headers(&mut req);
@@ -404,7 +424,10 @@ mod tests {
             "AWS4-HMAC-SHA256 Credential=AKIA/20130524/us-east-1/s3/aws4_request, \
              SignedHeaders=host, Signature=deadbeef",
         );
-        headers.set(HDR_S3_STRING_TO_SIGN, "AWS4-HMAC-SHA256\n20130524T000000Z\nscope\nhash");
+        headers.set(
+            HDR_S3_STRING_TO_SIGN,
+            "AWS4-HMAC-SHA256\n20130524T000000Z\nscope\nhash",
+        );
         headers.set(HDR_S3_ACCESS_KEY, "AKIA");
         headers.set(HDR_S3_SIGNATURE, "deadbeef");
         let req = Request {

@@ -230,24 +230,22 @@ pub fn list_versions_result_xml(
             continue;
         }
 
-        let start = if !key_marker.is_empty()
-            && idx.key == key_marker
-            && !version_id_marker.is_empty()
-        {
-            match idx
-                .versions
-                .iter()
-                .position(|x| x.version_id == version_id_marker)
-            {
-                // Start strictly after the marked version (continuation).
-                Some(pos) => pos.saturating_add(1),
-                // Unknown version-id-marker on this key: soft residual — start
-                // at beginning of the key (AWS would 400 InvalidArgument).
-                None => 0,
-            }
-        } else {
-            0
-        };
+        let start =
+            if !key_marker.is_empty() && idx.key == key_marker && !version_id_marker.is_empty() {
+                match idx
+                    .versions
+                    .iter()
+                    .position(|x| x.version_id == version_id_marker)
+                {
+                    // Start strictly after the marked version (continuation).
+                    Some(pos) => pos.saturating_add(1),
+                    // Unknown version-id-marker on this key: soft residual — start
+                    // at beginning of the key (AWS would 400 InvalidArgument).
+                    None => 0,
+                }
+            } else {
+                0
+            };
 
         for v in idx.versions.iter().skip(start) {
             entries.push((idx.key.clone(), v.clone()));
@@ -349,7 +347,8 @@ mod tests {
             etag: "e2".into(),
             size: 5,
         });
-        let xml = String::from_utf8(list_versions_result_xml("b", "", "", "", 1000, &[idx])).unwrap();
+        let xml =
+            String::from_utf8(list_versions_result_xml("b", "", "", "", 1000, &[idx])).unwrap();
         assert!(xml.contains("<Version>"));
         assert!(xml.contains("<VersionId>v1</VersionId>"));
         assert!(xml.contains("<VersionId>v2</VersionId>"));
@@ -396,13 +395,14 @@ mod tests {
         let indexes = [idx_c, idx_a, idx_b];
 
         // Flat stream after sort: a2, a1, b2, b1, c1  (5 entries)
-        let page1 = String::from_utf8(list_versions_result_xml(
-            "bucket", "", "", "", 2, &indexes,
-        ))
-        .unwrap();
+        let page1 =
+            String::from_utf8(list_versions_result_xml("bucket", "", "", "", 2, &indexes)).unwrap();
         assert!(page1.contains("<IsTruncated>true</IsTruncated>"));
         assert_eq!(tag_text(&page1, "NextKeyMarker").as_deref(), Some("a"));
-        assert_eq!(tag_text(&page1, "NextVersionIdMarker").as_deref(), Some("a1"));
+        assert_eq!(
+            tag_text(&page1, "NextVersionIdMarker").as_deref(),
+            Some("a1")
+        );
         assert_eq!(count_tag(&page1, "Version"), 2);
         assert!(page1.contains("<VersionId>a2</VersionId>"));
         assert!(page1.contains("<VersionId>a1</VersionId>"));
@@ -420,7 +420,10 @@ mod tests {
         assert_eq!(tag_text(&page2, "KeyMarker").as_deref(), Some("a"));
         assert_eq!(tag_text(&page2, "VersionIdMarker").as_deref(), Some("a1"));
         assert_eq!(tag_text(&page2, "NextKeyMarker").as_deref(), Some("b"));
-        assert_eq!(tag_text(&page2, "NextVersionIdMarker").as_deref(), Some("b1"));
+        assert_eq!(
+            tag_text(&page2, "NextVersionIdMarker").as_deref(),
+            Some("b1")
+        );
         assert_eq!(count_tag(&page2, "Version"), 2);
         assert!(page2.contains("<VersionId>b2</VersionId>"));
         assert!(page2.contains("<VersionId>b1</VersionId>"));
@@ -439,10 +442,8 @@ mod tests {
         assert!(page3.contains("<VersionId>c1</VersionId>"));
 
         // Cut mid-key: max-keys=1 on key a → only a2, Next=(a,a2)
-        let mid = String::from_utf8(list_versions_result_xml(
-            "bucket", "", "", "", 1, &indexes,
-        ))
-        .unwrap();
+        let mid =
+            String::from_utf8(list_versions_result_xml("bucket", "", "", "", 1, &indexes)).unwrap();
         assert!(mid.contains("<IsTruncated>true</IsTruncated>"));
         assert_eq!(tag_text(&mid, "NextKeyMarker").as_deref(), Some("a"));
         assert_eq!(tag_text(&mid, "NextVersionIdMarker").as_deref(), Some("a2"));
@@ -453,7 +454,10 @@ mod tests {
         assert!(mid2.contains("<VersionId>a1</VersionId>"));
         assert!(!mid2.contains("<VersionId>a2</VersionId>"));
         assert_eq!(tag_text(&mid2, "NextKeyMarker").as_deref(), Some("a"));
-        assert_eq!(tag_text(&mid2, "NextVersionIdMarker").as_deref(), Some("a1"));
+        assert_eq!(
+            tag_text(&mid2, "NextVersionIdMarker").as_deref(),
+            Some("a1")
+        );
     }
 
     #[test]
@@ -479,23 +483,25 @@ mod tests {
         assert_eq!(count_tag(&xml, "Version"), 2);
 
         // Prefix + max-keys truncation still emits Next* among filtered set
-        let page = String::from_utf8(list_versions_result_xml(
-            "b", "logs/", "", "", 1, &indexes,
-        ))
-        .unwrap();
+        let page =
+            String::from_utf8(list_versions_result_xml("b", "logs/", "", "", 1, &indexes)).unwrap();
         assert!(page.contains("<IsTruncated>true</IsTruncated>"));
-        assert_eq!(tag_text(&page, "NextKeyMarker").as_deref(), Some("logs/2020"));
-        assert_eq!(tag_text(&page, "NextVersionIdMarker").as_deref(), Some("l1"));
+        assert_eq!(
+            tag_text(&page, "NextKeyMarker").as_deref(),
+            Some("logs/2020")
+        );
+        assert_eq!(
+            tag_text(&page, "NextVersionIdMarker").as_deref(),
+            Some("l1")
+        );
         assert!(!page.contains("<VersionId>l2</VersionId>"));
     }
 
     #[test]
     fn list_versions_empty_indexes_and_empty_versions() {
         // Empty container / no indexes → empty ListVersionsResult
-        let empty = String::from_utf8(list_versions_result_xml(
-            "b", "", "", "", 1000, &[],
-        ))
-        .unwrap();
+        let empty =
+            String::from_utf8(list_versions_result_xml("b", "", "", "", 1000, &[])).unwrap();
         assert!(empty.contains("ListVersionsResult"));
         assert!(empty.contains("<Name>b</Name>"));
         assert!(empty.contains("<IsTruncated>false</IsTruncated>"));
@@ -506,10 +512,8 @@ mod tests {
         // Index present but zero versions (and a sibling with versions filtered by prefix)
         let mut hollow = VersionIndex::new("k");
         hollow.versions = vec![];
-        let hollow_xml = String::from_utf8(list_versions_result_xml(
-            "b", "", "", "", 10, &[hollow],
-        ))
-        .unwrap();
+        let hollow_xml =
+            String::from_utf8(list_versions_result_xml("b", "", "", "", 10, &[hollow])).unwrap();
         assert!(hollow_xml.contains("<IsTruncated>false</IsTruncated>"));
         assert!(!hollow_xml.contains("<Version>"));
         assert_eq!(count_tag(&hollow_xml, "Version"), 0);
@@ -527,14 +531,22 @@ mod tests {
         let mut ver_idx = VersionIndex::new("e");
         ver_idx.versions = vec![rec("e1", true)];
         let mixed = String::from_utf8(list_versions_result_xml(
-            "b", "", "", "", 1, &[dm_idx, ver_idx],
+            "b",
+            "",
+            "",
+            "",
+            1,
+            &[dm_idx, ver_idx],
         ))
         .unwrap();
         assert!(mixed.contains("<IsTruncated>true</IsTruncated>"));
         assert!(mixed.contains("<DeleteMarker>"));
         assert!(!mixed.contains("<Version>"));
         assert_eq!(tag_text(&mixed, "NextKeyMarker").as_deref(), Some("d"));
-        assert_eq!(tag_text(&mixed, "NextVersionIdMarker").as_deref(), Some("dm1"));
+        assert_eq!(
+            tag_text(&mixed, "NextVersionIdMarker").as_deref(),
+            Some("dm1")
+        );
     }
 
     #[test]

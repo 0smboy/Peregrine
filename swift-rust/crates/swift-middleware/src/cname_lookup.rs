@@ -327,7 +327,10 @@ mod tests {
 
         let mut resp = cn.handle(req_with_host(Some("mysite.com")), &fake_app());
         assert_eq!(body_of(&mut resp), b"FAKE APP");
-        assert_eq!(resp.headers.get("X-Echo-Host"), Some("mysite.com.example.com"));
+        assert_eq!(
+            resp.headers.get("X-Echo-Host"),
+            Some("mysite.com.example.com")
+        );
     }
 
     #[test]
@@ -338,7 +341,10 @@ mod tests {
         let resp = cn.handle(req_with_host(Some("mysite.com:8080")), &fake_app());
         // the port is stripped before lookup (resolver sees "mysite.com") and
         // re-appended to the rewritten host afterwards
-        assert_eq!(resp.headers.get("X-Echo-Host"), Some("mysite.com.example.com:8080"));
+        assert_eq!(
+            resp.headers.get("X-Echo-Host"),
+            Some("mysite.com.example.com:8080")
+        );
     }
 
     #[test]
@@ -370,7 +376,10 @@ mod tests {
         let cn = make("c.badtest.com");
         let mut resp = cn.handle(req_with_host(Some("c.a.example.com")), &fake_app());
         assert_eq!(resp.status, 400);
-        assert_eq!(body_of(&mut resp), b"CNAME lookup failed to resolve to a valid domain");
+        assert_eq!(
+            body_of(&mut resp),
+            b"CNAME lookup failed to resolve to a valid domain"
+        );
     }
 
     // ----- rejections -----
@@ -405,7 +414,10 @@ mod tests {
 
         let mut resp = cn.handle(req_with_host(Some("mysite.com")), &fake_app());
         assert_eq!(resp.status, 400);
-        assert_eq!(body_of(&mut resp), b"CNAME lookup failed to resolve to a valid domain");
+        assert_eq!(
+            body_of(&mut resp),
+            b"CNAME lookup failed to resolve to a valid domain"
+        );
     }
 
     #[test]
@@ -415,7 +427,10 @@ mod tests {
 
         let mut resp = cn.handle(req_with_host(Some("mysite.com")), &fake_app());
         assert_eq!(resp.status, 400);
-        assert_eq!(body_of(&mut resp), b"CNAME lookup failed to resolve to a valid domain");
+        assert_eq!(
+            body_of(&mut resp),
+            b"CNAME lookup failed to resolve to a valid domain"
+        );
     }
 
     #[test]
@@ -427,7 +442,10 @@ mod tests {
 
         let mut resp = cn.handle(req_with_host(Some("foo.com")), &fake_app());
         assert_eq!(resp.status, 400);
-        assert_eq!(body_of(&mut resp), b"CNAME lookup failed to resolve to a valid domain");
+        assert_eq!(
+            body_of(&mut resp),
+            b"CNAME lookup failed to resolve to a valid domain"
+        );
     }
 
     #[test]
@@ -437,7 +455,10 @@ mod tests {
         let cn = CnameLookup::new("storage.example.com", 2, r.clone());
         let mut resp = cn.handle(req_with_host(Some("c.badtest.com")), &fake_app());
         assert_eq!(resp.status, 400);
-        assert_eq!(body_of(&mut resp), b"CNAME lookup failed to resolve to a valid domain");
+        assert_eq!(
+            body_of(&mut resp),
+            b"CNAME lookup failed to resolve to a valid domain"
+        );
         assert_eq!(r.calls.load(Ordering::SeqCst), 1);
 
         // The host itself IS the storage domain -> passthrough, zero lookups.
@@ -465,7 +486,10 @@ mod tests {
 
         let resp = cn.handle(req_with_host(Some("mysite.com")), &redirect_app);
         assert_eq!(resp.status, 301);
-        assert_eq!(resp.headers.get("Location"), Some("http://mysite.com/test/"));
+        assert_eq!(
+            resp.headers.get("Location"),
+            Some("http://mysite.com/test/")
+        );
     }
 
     #[test]

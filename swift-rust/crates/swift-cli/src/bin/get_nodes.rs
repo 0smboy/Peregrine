@@ -75,7 +75,14 @@ fn main() {
         let account = args.first().cloned().unwrap_or_default();
         let container = args.get(1).map(String::as_str);
         let object = args.get(2).map(String::as_str);
-        GetNodesReport::for_item(&ring, hash_config, &account, container, object, all_handoffs)
+        GetNodesReport::for_item(
+            &ring,
+            hash_config,
+            &account,
+            container,
+            object,
+            all_handoffs,
+        )
     };
     match report {
         Ok(r) if as_json => println!("{}", r.to_json()),

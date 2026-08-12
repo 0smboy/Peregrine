@@ -264,10 +264,7 @@ mod tests {
     #[test]
     fn test_split_path() {
         assert_eq!(sp("/a", 1, 1, false).unwrap(), vec![Some("a".into())]);
-        assert_eq!(
-            sp("/a", 1, 2, false).unwrap(),
-            vec![Some("a".into()), None]
-        );
+        assert_eq!(sp("/a", 1, 2, false).unwrap(), vec![Some("a".into()), None]);
         assert_eq!(
             sp("/a/c", 1, 2, false).unwrap(),
             vec![Some("a".into()), Some("c".into())]

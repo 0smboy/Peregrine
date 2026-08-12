@@ -69,9 +69,7 @@ fn word_tokens(line: &str) -> Vec<(usize, &str)> {
     while i < bytes.len() {
         if bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' {
             let start = i;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-            {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
             out.push((start, &line[start..i]));

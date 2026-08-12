@@ -54,11 +54,7 @@ pub fn create_key(root_secret: &[u8], path: &str) -> [u8; KEY_LENGTH] {
 ///
 /// This mirrors the container path built in
 /// `KeyMasterContext.fetch_crypto_keys` (`'/' + account + '/' + container`).
-pub fn container_key(
-    root_secret: &[u8],
-    account: &str,
-    container: &str,
-) -> [u8; KEY_LENGTH] {
+pub fn container_key(root_secret: &[u8], account: &str, container: &str) -> [u8; KEY_LENGTH] {
     create_key(root_secret, &format!("/{account}/{container}"))
 }
 
@@ -113,8 +109,7 @@ mod tests {
 
     // ---- Known-answer vectors generated directly from keymaster.py's
     // create_key with root_secret = bytes(range(32)). ----
-    const ROOT: &str =
-        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const ROOT: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
     #[test]
     fn create_key_known_answers() {

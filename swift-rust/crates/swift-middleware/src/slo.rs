@@ -840,12 +840,10 @@ impl Slo {
             // Python passes this text as HTTPRequestEntityTooLarge's body,
             // so it is intentionally plain rather than Response::error's
             // generated HTML document.
-            let body = format!(
-                "Number of object-backed segments must be <= {MAX_MANIFEST_SEGMENTS}"
-            );
+            let body =
+                format!("Number of object-backed segments must be <= {MAX_MANIFEST_SEGMENTS}");
             let mut resp = Response::with_body(413, body.clone());
-            resp.headers
-                .set("Content-Type", "text/html; charset=UTF-8");
+            resp.headers.set("Content-Type", "text/html; charset=UTF-8");
             resp.headers.set("Content-Length", body.len());
             return resp;
         }
@@ -870,7 +868,14 @@ impl Slo {
         // Concurrent HEAD pile warms backend caches / parallelizes validation
         // when concurrent_gets > 1 (Python slo concurrency).
         if self.concurrent_gets > 1 {
-            concurrent_head_warm(entries, &version, &account, &req, next, self.concurrent_gets);
+            concurrent_head_warm(
+                entries,
+                &version,
+                &account,
+                &req,
+                next,
+                self.concurrent_gets,
+            );
         }
 
         let built = validate_put_entries(&req, entries, &version, &account, next, &mut || {});
@@ -931,10 +936,7 @@ impl Slo {
 
         // Depth-first expand sub_slo; delete leaves first, then manifests.
         let mut to_delete: Vec<String> = Vec::new();
-        let mut stack: Vec<(StoredSeg, bool)> = root_segs
-            .into_iter()
-            .map(|s| (s, false))
-            .collect();
+        let mut stack: Vec<(StoredSeg, bool)> = root_segs.into_iter().map(|s| (s, false)).collect();
         // Also delete the top-level manifest last.
         let mut pending_manifests: Vec<String> = vec![manifest_name];
         let mut expanded = 0usize;
@@ -1138,14 +1140,18 @@ impl Slo {
             .next()
             .unwrap_or_else(|| container.clone());
 
-
         // Auth/ACL probes (Python: authorize with write_acl on manifest +
         // segment containers via get_container_info). Without a full authorize
         // callback, HEAD with client Authorization/X-Auth-Token returns
         // 401/403 the same way TempAuth/Keystone would.
-        if let Some(denied) =
-            probe_async_delete_write_acl(next, &req, &version, &account, &container, &segment_container)
-        {
+        if let Some(denied) = probe_async_delete_write_acl(
+            next,
+            &req,
+            &version,
+            &account,
+            &container,
+            &segment_container,
+        ) {
             return denied;
         }
 
@@ -1187,9 +1193,13 @@ impl Slo {
         // Keep the original query string on the wire (Python pre-authed request
         // inherits environ query); harmless for container UPDATE.
         enqueue.headers.set("Content-Type", "application/json");
-        enqueue.headers.set("Content-Length", jobs_body.len().to_string());
+        enqueue
+            .headers
+            .set("Content-Length", jobs_body.len().to_string());
         enqueue.headers.set("X-Backend-Storage-Policy-Index", "0");
-        enqueue.headers.set("X-Backend-Allow-Private-Methods", "True");
+        enqueue
+            .headers
+            .set("X-Backend-Allow-Private-Methods", "True");
         enqueue.body = jobs_body.into();
         let enq_resp = next(enqueue);
         if !(200..300).contains(&enq_resp.status) {
@@ -1388,9 +1398,7 @@ fn validate_put_entries(
 
         let client_etag = match e.get("etag") {
             None | Some(serde_json::Value::Null) => None,
-            Some(serde_json::Value::String(etag)) => {
-                Some(normalize_etag(etag).to_string())
-            }
+            Some(serde_json::Value::String(etag)) => Some(normalize_etag(etag).to_string()),
             Some(_) => {
                 errors.push(format!(
                     "Index {i}: etag must be a string or null (if provided)"
@@ -1565,7 +1573,8 @@ fn finish_put(mut req: Request, next: &NextFn, built: PutManifestBuilt) -> Respo
     req.query_string = String::new();
     req.headers.set(SLO_HEADER, "True");
     req.headers.set("Content-Length", body.len().to_string());
-    req.headers.set(SYSMETA_SLO_ETAG, slo_etag.trim_matches('"'));
+    req.headers
+        .set(SYSMETA_SLO_ETAG, slo_etag.trim_matches('"'));
     req.headers.set(SYSMETA_SLO_SIZE, total.to_string());
     // The object server validates the transformed stored JSON, not the client
     // manifest or the aggregate large-object representation.
@@ -1661,20 +1670,18 @@ fn concurrent_head_warm(
         let q = Arc::clone(&queue);
         let next = Arc::clone(&next);
         let tmpl = req_template.clone_head();
-        handles.push(thread::spawn(move || {
-            loop {
-                let job = {
-                    let mut g = q.lock().unwrap();
-                    g.pop()
-                };
-                let Some((_i, path)) = job else { break };
-                let mut head = tmpl.clone_head();
-                head.method = "HEAD".to_string();
-                head.path = path;
-                head.query_string = String::new();
-                head.headers.remove("Content-Length");
-                let _ = next(head);
-            }
+        handles.push(thread::spawn(move || loop {
+            let job = {
+                let mut g = q.lock().unwrap();
+                g.pop()
+            };
+            let Some((_i, path)) = job else { break };
+            let mut head = tmpl.clone_head();
+            head.method = "HEAD".to_string();
+            head.path = path;
+            head.query_string = String::new();
+            head.headers.remove("Content-Length");
+            let _ = next(head);
         }));
     }
     for h in handles {
@@ -1733,8 +1740,7 @@ impl Read for HeartbeatPutBody {
         loop {
             if self.pending_pos < self.pending.len() {
                 let n = (self.pending.len() - self.pending_pos).min(buf.len());
-                buf[..n]
-                    .copy_from_slice(&self.pending[self.pending_pos..self.pending_pos + n]);
+                buf[..n].copy_from_slice(&self.pending[self.pending_pos..self.pending_pos + n]);
                 self.pending_pos += n;
                 if self.pending_pos >= self.pending.len() {
                     self.pending.clear();
@@ -1938,10 +1944,7 @@ mod tests {
     #[test]
     fn test_dlo_etag() {
         // md5("h1" + "h2") wrapped in quotes; quotes on inputs are stripped
-        let (etag, size) = dlo_etag_and_size(&[
-            ("\"h1\"".to_string(), 10),
-            ("h2".to_string(), 20),
-        ]);
+        let (etag, size) = dlo_etag_and_size(&[("\"h1\"".to_string(), 10), ("h2".to_string(), 20)]);
         assert_eq!(size, 30);
         assert_eq!(etag, format!("\"{}\"", md5_hex(b"h1h2")));
     }
@@ -1967,10 +1970,7 @@ mod tests {
                     let ignore = req
                         .headers
                         .get(IGNORE_RANGE_HDR)
-                        .map(|v| {
-                            v.split(',')
-                                .any(|n| headers.get(n.trim()).is_some())
-                        })
+                        .map(|v| v.split(',').any(|n| headers.get(n.trim()).is_some()))
                         .unwrap_or(false);
                     let (status, slice) = if !ignore {
                         if let Some(rh) = req.headers.get("Range") {
@@ -2027,8 +2027,16 @@ mod tests {
         manifest.headers.set("Etag", json_etag);
         backend(vec![
             ("GET", "/v1/a/c/manifest", manifest),
-            ("GET", "/v1/a/c/s1", Response::with_body(200, b"one".to_vec())),
-            ("GET", "/v1/a/c/s2", Response::with_body(200, b"two".to_vec())),
+            (
+                "GET",
+                "/v1/a/c/s1",
+                Response::with_body(200, b"one".to_vec()),
+            ),
+            (
+                "GET",
+                "/v1/a/c/s2",
+                Response::with_body(200, b"two".to_vec()),
+            ),
         ])
     }
 
@@ -2112,7 +2120,11 @@ mod tests {
         manifest.headers.set("X-Static-Large-Object", "True");
         let be = backend(vec![
             ("GET", "/v1/a/c/manifest", manifest),
-            ("GET", "/v1/a/c/s1", Response::with_body(200, b"one".to_vec())),
+            (
+                "GET",
+                "/v1/a/c/s1",
+                Response::with_body(200, b"one".to_vec()),
+            ),
         ]);
         let resp = Slo::new().handle(slo_get("/v1/a/c/manifest", None), &be);
         assert_eq!(resp.status, 200);
@@ -2214,7 +2226,8 @@ mod tests {
             resp.headers.set("X-Static-Large-Object", "True");
             resp.headers.set("Content-Length", "159"); // physical manifest
             resp.headers.set("Etag", &backend_physical_etag);
-            resp.headers.set(SYSMETA_SLO_ETAG, "aabbccddeeff00112233445566778899");
+            resp.headers
+                .set(SYSMETA_SLO_ETAG, "aabbccddeeff00112233445566778899");
             resp.headers.set(SYSMETA_SLO_SIZE, "6");
             resp.headers.set("Content-Type", "text/plain");
             resp
@@ -2279,8 +2292,7 @@ mod tests {
             assert!(req.query_string.contains("multipart-manifest=get"));
             let mut resp = Response::with_body(200, stored.clone());
             resp.headers.set("X-Static-Large-Object", "True");
-            resp.headers
-                .set("Content-Type", "application/octet-stream");
+            resp.headers.set("Content-Type", "application/octet-stream");
             resp
         });
         let req = Request {
@@ -2305,7 +2317,10 @@ mod tests {
             resp.headers.get("Content-Type"),
             Some("application/octet-stream")
         );
-        assert_eq!(resp.headers.get("Etag"), Some(manifest_etag(&body).as_str()));
+        assert_eq!(
+            resp.headers.get("Etag"),
+            Some(manifest_etag(&body).as_str())
+        );
         assert!(resp.headers.get(MANIFEST_ETAG_HEADER).is_none());
     }
 
@@ -2501,10 +2516,7 @@ mod tests {
         let paths = deleted.lock().unwrap().clone();
         assert!(paths.iter().any(|p| p.ends_with("/c/s1")), "{paths:?}");
         assert!(paths.iter().any(|p| p.ends_with("/c/s2")), "{paths:?}");
-        assert!(
-            paths.iter().any(|p| p == "/v1/a/c/manifest"),
-            "{paths:?}"
-        );
+        assert!(paths.iter().any(|p| p == "/v1/a/c/manifest"), "{paths:?}");
         // manifest last
         assert_eq!(paths.last().map(String::as_str), Some("/v1/a/c/manifest"));
     }
@@ -2523,7 +2535,9 @@ mod tests {
         ]))
         .unwrap();
         let be: NextFn = Arc::new(move |mut req: Request| {
-            c2.lock().unwrap().push((req.method.clone(), req.path.clone()));
+            c2.lock()
+                .unwrap()
+                .push((req.method.clone(), req.path.clone()));
             if req.method == "GET"
                 && req.path == "/v1/a/c/manifest"
                 && req.query_string.contains("multipart-manifest=get")
@@ -2567,9 +2581,7 @@ mod tests {
         );
         // Write ACL probe on manifest container (segment container == same).
         assert!(
-            paths
-                .iter()
-                .any(|(m, p)| m == "HEAD" && p == "/v1/a/c"),
+            paths.iter().any(|(m, p)| m == "HEAD" && p == "/v1/a/c"),
             "missing ACL HEAD: {paths:?}"
         );
         let update_paths: Vec<_> = paths
@@ -2608,7 +2620,9 @@ mod tests {
         );
         // No synchronous segment DELETEs on the happy path.
         assert!(
-            !paths.iter().any(|(m, p)| m == "DELETE" && p.ends_with("/c/s1")),
+            !paths
+                .iter()
+                .any(|(m, p)| m == "DELETE" && p.ends_with("/c/s1")),
             "segments must not be deleted synchronously: {paths:?}"
         );
         let body = update_body.lock().unwrap().clone();
@@ -2653,10 +2667,7 @@ mod tests {
         assert_eq!(resp.status, 400);
         let raw = body_of(&mut resp);
         let body = String::from_utf8_lossy(&raw);
-        assert!(
-            body.contains("No segments may be large objects"),
-            "{body}"
-        );
+        assert!(body.contains("No segments may be large objects"), "{body}");
     }
 
     #[test]
@@ -2685,7 +2696,10 @@ mod tests {
         assert_eq!(resp.status, 400);
         let raw = body_of(&mut resp);
         let body = String::from_utf8_lossy(&raw);
-        assert!(body.contains("All segments must be in one container"), "{body}");
+        assert!(
+            body.contains("All segments must be in one container"),
+            "{body}"
+        );
     }
 
     #[test]
@@ -2750,12 +2764,7 @@ mod tests {
         // Best-effort background segment delete eventually runs.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            if deleted
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|p| p.ends_with("/c/s1"))
-            {
+            if deleted.lock().unwrap().iter().any(|p| p.ends_with("/c/s1")) {
                 break;
             }
             if std::time::Instant::now() > deadline {
@@ -2801,13 +2810,7 @@ mod tests {
         // Python async-delete fixture path: manifest a/c/o drives the shard
         // hash_path('AUTH_test','deltest','man-all-there') % 100 = 71
         assert_eq!(
-            expirer_task_container(
-                1_751_500_000,
-                &hc,
-                "AUTH_test",
-                "deltest",
-                "man-all-there"
-            ),
+            expirer_task_container(1_751_500_000, &hc, "AUTH_test", "deltest", "man-all-there"),
             "1751414329"
         );
         // Day-zero clamp: bucket negative → normalize to 0000000000
@@ -2855,7 +2858,11 @@ mod tests {
         assert_eq!(resp.status, 403, "expected ACL probe deny");
         // First probe is the manifest container (Python write_acl on DELETE target).
         let probed = heads.lock().unwrap().clone();
-        assert_eq!(probed, vec!["/v1/AUTH_test/manic".to_string()], "{probed:?}");
+        assert_eq!(
+            probed,
+            vec!["/v1/AUTH_test/manic".to_string()],
+            "{probed:?}"
+        );
     }
 
     #[test]
@@ -2911,5 +2918,4 @@ mod tests {
         let h2 = HeaderKeyDict::new();
         assert!(refetch_listing_slo_etag("o", "plainmd5hash", &h2).is_none());
     }
-
 }

@@ -281,11 +281,7 @@ pub fn compute_delete_at_from_rules(
 }
 
 /// Pure: parse lifecycle XML then compute delete-at for the object key.
-pub fn compute_delete_at(
-    lifecycle_xml: &[u8],
-    object_key: &str,
-    now_unix: i64,
-) -> Option<i64> {
+pub fn compute_delete_at(lifecycle_xml: &[u8], object_key: &str, now_unix: i64) -> Option<i64> {
     let rules = parse_expiration_rules(lifecycle_xml);
     compute_delete_at_from_rules(&rules, object_key, now_unix)
 }
@@ -770,5 +766,4 @@ mod tests {
         assert!(apply_due_transition_on_headers(&mut h, 100));
         assert_eq!(h.get(SYS_TRANSITIONED), Some("1"));
     }
-
 }

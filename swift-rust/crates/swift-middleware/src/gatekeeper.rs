@@ -189,7 +189,10 @@ mod tests {
         let resp = gk.handle(req, &echo_headers());
 
         // backend/sysmeta/host inbound headers must NOT have reached the app
-        assert!(resp.headers.get("Echo-X-Backend-Storage-Policy-Index").is_none());
+        assert!(resp
+            .headers
+            .get("Echo-X-Backend-Storage-Policy-Index")
+            .is_none());
         assert!(resp.headers.get("Echo-X-Object-Sysmeta-Evil").is_none());
         assert!(resp.headers.get("Echo-X-Container-Host").is_none());
         // user meta survives

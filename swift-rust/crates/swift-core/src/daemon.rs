@@ -82,7 +82,10 @@ mod tests {
         let stop = AtomicBool::new(true);
         let started = Instant::now();
         assert!(sleep_unless_stopped(30, &stop));
-        assert!(started.elapsed() < Duration::from_secs(1), "did not wait out the interval");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "did not wait out the interval"
+        );
     }
 
     #[test]
@@ -94,7 +97,10 @@ mod tests {
     #[test]
     fn statsd_prefix_matches_python_get_logger() {
         assert_eq!(statsd_prefix("", "container-updater"), "container-updater");
-        assert_eq!(statsd_prefix("swift", "container-updater"), "swift.container-updater");
+        assert_eq!(
+            statsd_prefix("swift", "container-updater"),
+            "swift.container-updater"
+        );
     }
 
     #[test]

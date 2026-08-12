@@ -118,10 +118,7 @@ pub fn decrypt_multipart_byteranges(
                 content_range = Some(v.clone());
             }
         }
-        let (first, last, total) = match content_range
-            .as_deref()
-            .and_then(parse_content_range)
-        {
+        let (first, last, total) = match content_range.as_deref().and_then(parse_content_range) {
             Some(t) => t,
             None => {
                 return Err("multipart part missing Content-Range".into());
@@ -190,9 +187,7 @@ pub fn multipart_boundary_from_content_type(content_type: &str) -> Option<String
         let part = part.trim();
         let lower = part.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("boundary=") {
-            let v = part[part.len() - rest.len()..]
-                .trim()
-                .trim_matches('"');
+            let v = part[part.len() - rest.len()..].trim().trim_matches('"');
             if !v.is_empty() {
                 return Some(v.to_string());
             }
@@ -321,7 +316,10 @@ impl Middleware for Decrypter {
             Some(a) => a.to_string(),
             None => return next(req),
         };
-        let container = parts[2].as_deref().filter(|s| !s.is_empty()).map(str::to_string);
+        let container = parts[2]
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         let object = parts
             .get(3)
             .and_then(|p| p.as_deref())
@@ -488,11 +486,11 @@ pub fn decrypt_container_listing_json(
             continue;
         };
 
-        let new_hash = match decrypt_one_listing_hash(keymaster, account, container, &ciphertext, &meta)
-        {
-            Ok(pt) => pt,
-            Err(_) => UNKNOWN_ETAG.to_string(),
-        };
+        let new_hash =
+            match decrypt_one_listing_hash(keymaster, account, container, &ciphertext, &meta) {
+                Ok(pt) => pt,
+                Err(_) => UNKNOWN_ETAG.to_string(),
+            };
         if let Some(obj) = obj_dict.as_object_mut() {
             obj.insert("hash".into(), serde_json::Value::String(new_hash));
         }
@@ -511,14 +509,12 @@ fn decrypt_one_listing_hash(
 ) -> Result<String, String> {
     check_crypto_meta(crypto_meta)?;
     let key_id = crypto_meta.get("key_id");
-    let keys =
-        keymaster.fetch_keys_with_key_id(account, Some(container), None, key_id)?;
+    let keys = keymaster.fetch_keys_with_key_id(account, Some(container), None, key_id)?;
     let container_key = keys
         .container
         .ok_or_else(|| "missing container key".to_string())?;
     let iv = meta_iv(crypto_meta)?;
-    let pt =
-        decrypt_header_value(&container_key, &iv, ciphertext).map_err(|e| e.to_string())?;
+    let pt = decrypt_header_value(&container_key, &iv, ciphertext).map_err(|e| e.to_string())?;
     String::from_utf8(pt).map_err(|e| e.to_string())
 }
 
@@ -557,8 +553,7 @@ fn decrypt_user_metadata(resp: &mut Response, object_key: &[u8; KEY_LENGTH]) {
         match decrypt_value_with_meta(&val, object_key) {
             Ok(pt) => {
                 if let Ok(s) = String::from_utf8(pt) {
-                    resp.headers
-                        .set(&format!("{USER_META_PREFIX}{short}"), s);
+                    resp.headers.set(&format!("{USER_META_PREFIX}{short}"), s);
                 }
                 resp.headers.remove(&name);
             }
@@ -613,13 +608,9 @@ fn decrypt_response_body(
     if resp.status == 206 {
         if let Some(boundary) = multipart_boundary_from_content_type(&content_type) {
             let ciphertext = materialize_body(resp).map_err(|_| "Error decrypting object")?;
-            let pt = decrypt_multipart_byteranges(
-                object_key,
-                body_meta_header,
-                &boundary,
-                &ciphertext,
-            )
-            .map_err(|_| "Error decrypting object")?;
+            let pt =
+                decrypt_multipart_byteranges(object_key, body_meta_header, &boundary, &ciphertext)
+                    .map_err(|_| "Error decrypting object")?;
             resp.headers.set("Content-Length", pt.len());
             resp.body = Body::from(pt);
             return Ok(());
@@ -676,9 +667,7 @@ mod tests {
 
     #[test]
     fn offset_decrypt_slice() {
-        let root = unhex(
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        );
+        let root = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
         let km = KeyMaster::new(root).unwrap();
         let keys = km.fetch_keys("a", Some("c"), Some("o"));
         let ok = keys.object.unwrap();
@@ -706,9 +695,7 @@ mod tests {
 
     #[test]
     fn listing_hash_decrypt_roundtrip() {
-        let root = unhex(
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        );
+        let root = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
         let km = KeyMaster::new(root).unwrap();
         let keys = km.fetch_keys("acct", Some("cont"), None);
         let ck = keys.container.unwrap();
@@ -745,9 +732,13 @@ mod tests {
         }
         let bad_hash = append_crypto_meta(&enc, &meta);
         let listing2 = serde_json::json!([{"name": "x", "hash": bad_hash}]);
-        let out2 =
-            decrypt_container_listing_json(&km, "acct", "cont", &serde_json::to_vec(&listing2).unwrap())
-                .unwrap();
+        let out2 = decrypt_container_listing_json(
+            &km,
+            "acct",
+            "cont",
+            &serde_json::to_vec(&listing2).unwrap(),
+        )
+        .unwrap();
         let p2: Vec<serde_json::Value> = serde_json::from_slice(&out2).unwrap();
         assert_eq!(p2[0]["hash"], UNKNOWN_ETAG);
     }
@@ -757,15 +748,10 @@ mod tests {
         use std::sync::Arc;
         use swift_http::HeaderKeyDict;
 
-        let root_new = unhex(
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        );
+        let root_new = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
         let root_old = vec![0x55u8; 32];
         let items = vec![
-            (
-                "encryption_root_secret".into(),
-                B64.encode(&root_new),
-            ),
+            ("encryption_root_secret".into(), B64.encode(&root_new)),
             (
                 "encryption_root_secret_legacy".into(),
                 B64.encode(&root_old),
@@ -828,9 +814,7 @@ mod tests {
     fn multipart_byteranges_decrypt_two_ranges() {
         use swift_http::multipart_byteranges;
 
-        let root = unhex(
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        );
+        let root = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
         let km = KeyMaster::new(root).unwrap();
         let keys = km.fetch_keys("a", Some("c"), Some("o"));
         let ok = keys.object.unwrap();
@@ -860,13 +844,8 @@ mod tests {
             "application/octet-stream",
             pt.len() as u64,
         );
-        let got = decrypt_multipart_byteranges(
-            &ok,
-            &enc.body_meta_header,
-            "BOUND42",
-            &multi,
-        )
-        .unwrap();
+        let got =
+            decrypt_multipart_byteranges(&ok, &enc.body_meta_header, "BOUND42", &multi).unwrap();
         let expected = multipart_byteranges(
             "BOUND42",
             &ranges,
@@ -888,10 +867,8 @@ mod tests {
             resp.headers.set(BODY_META_HEADER, &meta);
             resp.headers.set(ETAG_HEADER, &crypto_etag);
             resp.headers.set("Etag", &ct_etag);
-            resp.headers.set(
-                "Content-Type",
-                "multipart/byteranges;boundary=BOUND42",
-            );
+            resp.headers
+                .set("Content-Type", "multipart/byteranges;boundary=BOUND42");
             resp
         });
         let req = Request {
@@ -916,9 +893,7 @@ mod tests {
         use std::sync::Arc;
         use swift_http::{content_range_header_value, HeaderKeyDict};
 
-        let root = unhex(
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        );
+        let root = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
         let km = KeyMaster::new(root).unwrap();
         let keys = km.fetch_keys("a", Some("c"), Some("o"));
         let ok = keys.object.unwrap();
@@ -959,28 +934,24 @@ mod tests {
         };
         let mut resp = decrypter.handle(req, &app);
         assert_eq!(resp.status, 206);
-        let got = resp.body.materialize(MAX_FILE_SIZE as u64).unwrap().to_vec();
+        let got = resp
+            .body
+            .materialize(MAX_FILE_SIZE as u64)
+            .unwrap()
+            .to_vec();
         assert_eq!(got, pt[start as usize..stop as usize]);
     }
 
     #[test]
     fn parse_content_range_and_boundary() {
-        assert_eq!(
-            parse_content_range("bytes 0-2/10"),
-            Some((0, 2, 10))
-        );
-        assert_eq!(
-            parse_content_range("bytes 5-99/*"),
-            Some((5, 99, 0))
-        );
+        assert_eq!(parse_content_range("bytes 0-2/10"), Some((0, 2, 10)));
+        assert_eq!(parse_content_range("bytes 5-99/*"), Some((5, 99, 0)));
         assert_eq!(
             multipart_boundary_from_content_type("multipart/byteranges;boundary=BOUND"),
             Some("BOUND".into())
         );
         assert_eq!(
-            multipart_boundary_from_content_type(
-                "multipart/byteranges; boundary=\"xyz\""
-            ),
+            multipart_boundary_from_content_type("multipart/byteranges; boundary=\"xyz\""),
             Some("xyz".into())
         );
         assert!(multipart_boundary_from_content_type("text/plain").is_none());

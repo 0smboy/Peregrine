@@ -143,16 +143,10 @@ fn sharding_enabled(broker: &mut ContainerBroker) -> bool {
         .metadata()
         .ok()
         .and_then(|md| {
-            md.into_iter().find(|(k, _)| {
-                k.eq_ignore_ascii_case("X-Container-Sysmeta-Sharding")
-            })
+            md.into_iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("X-Container-Sysmeta-Sharding"))
         })
-        .map(|(_, (v, _))| {
-            matches!(
-                v.to_ascii_lowercase().as_str(),
-                "true" | "yes" | "1" | "on"
-            )
-        })
+        .map(|(_, (v, _))| matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "1" | "on"))
         .unwrap_or(false)
 }
 
@@ -170,7 +164,10 @@ fn cmd_find(broker: &mut ContainerBroker, shard_size: i64, min_size: i64) -> i32
                     })
                 })
                 .collect();
-            println!("{}", serde_json::to_string_pretty(&data).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&data).unwrap_or_default()
+            );
             let total: i64 = ranges.iter().map(|r| r.object_count).sum();
             eprintln!(
                 "Found {} ranges (complete: {done}, total object count {total})",
@@ -600,8 +597,7 @@ fn cmd_analyze(broker: &mut ContainerBroker) -> i32 {
 
     // Compactible preview (defaults matching common Python conf)
     let sequences = find_compactible_sequences(&ranges, 100_000, 500_000, 1, -1, false);
-    let sequences_cleaved =
-        find_compactible_sequences(&ranges, 100_000, 500_000, 1, -1, true);
+    let sequences_cleaved = find_compactible_sequences(&ranges, 100_000, 500_000, 1, -1, true);
     println!(
         "analyze: compactible_sequences (shrink_threshold=100000 expansion_limit=500000) = {}",
         sequences.len()
@@ -791,11 +787,7 @@ fn cmd_compact(
     );
     if compactible.is_empty() {
         println!("No shards identified for compaction.");
-        if !include_cleaved
-            && ranges
-                .iter()
-                .any(|r| r.state == shard_state::CLEAVED)
-        {
+        if !include_cleaved && ranges.iter().any(|r| r.state == shard_state::CLEAVED) {
             println!(
                 "Hint: {} range(s) are CLEAVED (not ACTIVE). Re-run with \
                  --include-cleaved, or `activate_cleaved --force` first.",
@@ -1079,7 +1071,10 @@ fn repair_overlaps(broker: &mut ContainerBroker, ranges: &[ShardRange], force: b
     if overlaps.is_empty() {
         let gaps = find_namespace_gaps(ranges);
         if !gaps.is_empty() {
-            println!("Found no overlapping shard ranges but {} gap(s).", gaps.len());
+            println!(
+                "Found no overlapping shard ranges but {} gap(s).",
+                gaps.len()
+            );
             println!("Use: … repair --gaps  to plan gap fills.");
             return EXIT_OK;
         }
@@ -1202,10 +1197,7 @@ fn main() {
 
     let code = match cmd.as_str() {
         "find" => {
-            let shard_size: i64 = args
-                .first()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(500_000);
+            let shard_size: i64 = args.first().and_then(|s| s.parse().ok()).unwrap_or(500_000);
             let min_size: i64 = args
                 .get(1)
                 .and_then(|s| s.parse().ok())
@@ -1252,7 +1244,9 @@ fn main() {
         }
         "analyze" => cmd_analyze(&mut broker),
         "compact" => {
-            let force = args.iter().any(|a| a == "--force" || a == "-f" || a == "--yes" || a == "-y");
+            let force = args
+                .iter()
+                .any(|a| a == "--force" || a == "-f" || a == "--yes" || a == "-y");
             let include_cleaved = args.iter().any(|a| a == "--include-cleaved");
             let shrink_threshold = parse_flag_i64(&args, "--shrink-threshold", 100_000);
             let expansion_limit = parse_flag_i64(&args, "--expansion-limit", 500_000);
@@ -1269,11 +1263,15 @@ fn main() {
             )
         }
         "activate_cleaved" | "activate-cleaved" => {
-            let force = args.iter().any(|a| a == "--force" || a == "-f" || a == "--yes" || a == "-y");
+            let force = args
+                .iter()
+                .any(|a| a == "--force" || a == "-f" || a == "--yes" || a == "-y");
             cmd_activate_cleaved(&mut broker, force)
         }
         "repair" => {
-            let force = args.iter().any(|a| a == "--force" || a == "-f" || a == "--yes" || a == "-y");
+            let force = args
+                .iter()
+                .any(|a| a == "--force" || a == "-f" || a == "--yes" || a == "-y");
             let gaps_mode = args.iter().any(|a| a == "--gaps");
             cmd_repair(&mut broker, gaps_mode, force)
         }
@@ -1397,10 +1395,7 @@ mod tests {
     #[test]
     fn find_and_replace_injects_and_optionally_enables() {
         let (dir, mut b) = tmp_db("far");
-        assert_eq!(
-            cmd_find_and_replace(&mut b, 3, 1, true, true),
-            EXIT_OK
-        );
+        assert_eq!(cmd_find_and_replace(&mut b, 3, 1, true, true), EXIT_OK);
         let db = dir.join("c.db");
         let mut check = ContainerBroker::new(&db, "AUTH_test", "big");
         let ranges = check
@@ -1460,7 +1455,9 @@ mod tests {
         let mut b = ShardRange::new("a/c-1", "1", "m", "");
         b.state = shard_state::CLEAVED;
         b.object_count = 50;
-        assert!(find_compactible_sequences(&[a.clone(), b.clone()], 20, 100, 1, -1, false).is_empty());
+        assert!(
+            find_compactible_sequences(&[a.clone(), b.clone()], 20, 100, 1, -1, false).is_empty()
+        );
         let seqs = find_compactible_sequences(&[a, b], 20, 100, 1, -1, true);
         assert_eq!(seqs.len(), 1);
         assert_eq!(seqs[0][0].name, "a/c-0");
@@ -1488,9 +1485,7 @@ mod tests {
         force_sharded(&mut b);
         // dry-run
         assert_eq!(cmd_compact(&mut b, false, 20, 100, 1, -1, false), EXIT_OK);
-        let before = b
-            .get_shard_ranges(&GetShardRangesArgs::default())
-            .unwrap();
+        let before = b.get_shard_ranges(&GetShardRangesArgs::default()).unwrap();
         assert!(before.iter().all(|r| r.state == shard_state::ACTIVE));
         // apply
         assert_eq!(cmd_compact(&mut b, true, 20, 100, 1, -1, false), EXIT_OK);
@@ -1526,9 +1521,7 @@ mod tests {
         b.merge_shard_ranges(vec![lo, hi]).unwrap();
         assert_eq!(cmd_repair(&mut b, true, false), EXIT_OK);
         assert_eq!(cmd_repair(&mut b, true, true), EXIT_OK);
-        let fixed = b
-            .get_shard_ranges(&GetShardRangesArgs::default())
-            .unwrap();
+        let fixed = b.get_shard_ranges(&GetShardRangesArgs::default()).unwrap();
         assert!(
             find_namespace_gaps(&fixed).is_empty(),
             "gaps remain: {:?}",
@@ -1544,9 +1537,7 @@ mod tests {
         c.object_count = 9;
         b.merge_shard_ranges(vec![a, c]).unwrap();
         assert_eq!(cmd_repair(&mut b, false, true), EXIT_OK);
-        let after = b
-            .get_shard_ranges(&GetShardRangesArgs::default())
-            .unwrap();
+        let after = b.get_shard_ranges(&GetShardRangesArgs::default()).unwrap();
         assert!(
             after.iter().any(|r| r.state == shard_state::SHRINKING),
             "{after:?}"

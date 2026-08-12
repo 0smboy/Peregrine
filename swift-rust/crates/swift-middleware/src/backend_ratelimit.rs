@@ -62,8 +62,15 @@ use crate::{Middleware, NextFn};
 
 /// Methods that are subject to backend rate limiting
 /// (`RATE_LIMITED_METHODS`).
-const RATE_LIMITED_METHODS: [&str; 7] =
-    ["GET", "HEAD", "PUT", "POST", "DELETE", "UPDATE", "REPLICATE"];
+const RATE_LIMITED_METHODS: [&str; 7] = [
+    "GET",
+    "HEAD",
+    "PUT",
+    "POST",
+    "DELETE",
+    "UPDATE",
+    "REPLICATE",
+];
 
 /// swob `HTTPTooManyBackendRequests`.
 const TOO_MANY_BACKEND_REQUESTS: u16 = 529;
@@ -440,9 +447,7 @@ mod tests {
         let mw = BackendRateLimit::new().with_device_rate(1.0);
         // OPTIONS is not in RATE_LIMITED_METHODS -> never limited.
         for _ in 0..5 {
-            assert!(mw
-                .evaluate(&req("OPTIONS", "/sda1/1/a"), 1000.0)
-                .is_none());
+            assert!(mw.evaluate(&req("OPTIONS", "/sda1/1/a"), 1000.0).is_none());
         }
     }
 
@@ -506,7 +511,8 @@ mod tests {
         assert!(mw.evaluate(&req("GET", "/sda1/1/a"), 1000.0).is_none());
         // second GET at same instant -> 529
         assert_eq!(
-            mw.evaluate(&req("GET", "/sda1/1/a"), 1000.0).map(|r| r.status),
+            mw.evaluate(&req("GET", "/sda1/1/a"), 1000.0)
+                .map(|r| r.status),
             Some(529)
         );
         // HEAD is not limited (rate 0) even though GET is exhausted
@@ -525,7 +531,8 @@ mod tests {
             .with_rate_buffer(0.0);
         assert!(mw.evaluate(&req("GET", "/sda1/1/a"), 1000.0).is_none());
         assert_eq!(
-            mw.evaluate(&req("GET", "/sda1/1/a"), 1000.0).map(|r| r.status),
+            mw.evaluate(&req("GET", "/sda1/1/a"), 1000.0)
+                .map(|r| r.status),
             Some(529)
         );
     }
@@ -541,7 +548,8 @@ mod tests {
         assert!(mw.evaluate(&req("GET", "/sda1/1/a"), 1000.0).is_none());
         assert!(mw.evaluate(&req("GET", "/sda1/1/a"), 1000.0).is_none());
         assert_eq!(
-            mw.evaluate(&req("GET", "/sda1/1/a"), 1000.0).map(|r| r.status),
+            mw.evaluate(&req("GET", "/sda1/1/a"), 1000.0)
+                .map(|r| r.status),
             Some(529)
         );
     }
@@ -574,7 +582,8 @@ mod tests {
             .with_status(503);
         assert!(mw.evaluate(&req("GET", "/sda1/1/a"), 1000.0).is_none());
         assert_eq!(
-            mw.evaluate(&req("GET", "/sda1/1/a"), 1000.0).map(|r| r.status),
+            mw.evaluate(&req("GET", "/sda1/1/a"), 1000.0)
+                .map(|r| r.status),
             Some(503)
         );
     }

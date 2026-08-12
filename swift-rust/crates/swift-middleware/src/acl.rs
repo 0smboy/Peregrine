@@ -86,7 +86,10 @@ fn hostname_of(url: &str) -> Option<String> {
         // [ipv6]:port -> ipv6
         stripped.split_once(']').map(|(h, _)| h).unwrap_or(stripped)
     } else {
-        host_port.split_once(':').map(|(h, _)| h).unwrap_or(host_port)
+        host_port
+            .split_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(host_port)
     };
     if host.is_empty() {
         None
@@ -126,7 +129,9 @@ impl AccountAcls {
 }
 
 fn intersects(user_groups: &[String], acl_groups: &[String]) -> bool {
-    user_groups.iter().any(|ug| acl_groups.iter().any(|ag| ag == ug))
+    user_groups
+        .iter()
+        .any(|ug| acl_groups.iter().any(|ag| ag == ug))
 }
 
 /// `parse_acl_v2`: parse a JSON ACL string into a raw map, or `None` when
@@ -149,7 +154,13 @@ pub fn format_acl_v2(acl: &AccountAcls) -> String {
     if !acl.admin.is_empty() {
         map.insert(
             "admin".into(),
-            serde_json::Value::Array(acl.admin.iter().cloned().map(serde_json::Value::String).collect()),
+            serde_json::Value::Array(
+                acl.admin
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
         );
     }
     if !acl.read_only.is_empty() {
@@ -308,8 +319,14 @@ mod tests {
 
     #[test]
     fn test_hostname_extraction() {
-        assert_eq!(hostname_of("http://Www.Example.com:8080/p"), Some("www.example.com".into()));
-        assert_eq!(hostname_of("https://user:pw@host.com/p"), Some("host.com".into()));
+        assert_eq!(
+            hostname_of("http://Www.Example.com:8080/p"),
+            Some("www.example.com".into())
+        );
+        assert_eq!(
+            hostname_of("https://user:pw@host.com/p"),
+            Some("host.com".into())
+        );
         assert_eq!(hostname_of("notaurl"), None);
         assert_eq!(hostname_of(""), None);
     }

@@ -114,10 +114,7 @@ mod tests {
         let resp = xp.handle(req, &next);
         assert_eq!(resp.status, 200);
         assert!(resp.headers.get("X-Profile-Duration-Ms").is_some());
-        assert_eq!(
-            resp.headers.get("X-Profile-Path"),
-            Some("/v1/a/c/o")
-        );
+        assert_eq!(resp.headers.get("X-Profile-Path"), Some("/v1/a/c/o"));
     }
 
     #[test]

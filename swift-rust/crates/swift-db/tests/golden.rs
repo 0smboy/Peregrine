@@ -47,9 +47,8 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn expectations() -> Json {
-    let raw = std::fs::read(fixture("expectations.json")).expect(
-        "missing fixtures; run rust/crates/swift-db/tests/fixtures/generate.py",
-    );
+    let raw = std::fs::read(fixture("expectations.json"))
+        .expect("missing fixtures; run rust/crates/swift-db/tests/fixtures/generate.py");
     let root: Json = serde_json::from_slice(&raw).unwrap();
     root["container"].clone()
 }
@@ -61,21 +60,14 @@ fn account_expectations() -> Json {
 }
 
 fn tmpdir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "swift-db-golden-{name}-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("swift-db-golden-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
 fn broker_in(tmp: &Path, exp: &Json) -> ContainerBroker {
-    let mut broker = ContainerBroker::new(
-        &tmp.join("containers").join("ctest.db"),
-        "a",
-        "c",
-    );
+    let mut broker = ContainerBroker::new(&tmp.join("containers").join("ctest.db"), "a", "c");
     broker
         .initialize(
             exp["put_timestamp"].as_str().unwrap(),
@@ -121,7 +113,11 @@ fn assert_objects_match(desc: &str, got: &[Vec<DbValue>], want: &Json) {
     assert_eq!(got.len(), want.len(), "{desc}: row count {got:?}");
     for (row_index, (got_row, want_row)) in got.iter().zip(want).enumerate() {
         let want_row = want_row.as_array().unwrap();
-        assert_eq!(got_row.len(), want_row.len(), "{desc}: row {row_index} width");
+        assert_eq!(
+            got_row.len(),
+            want_row.len(),
+            "{desc}: row {row_index} width"
+        );
         for (col, (g, w)) in got_row.iter().zip(want_row).enumerate() {
             match (w, g) {
                 (Json::String(s), DbValue::Text(t)) => {
@@ -183,7 +179,11 @@ fn test_pending_file_and_merge_match_python() {
     // the pending file must be byte-identical with Python's
     let pending = std::fs::read(broker.pending_file()).unwrap();
     let pending_hex: String = pending.iter().map(|b| format!("{b:02x}")).collect();
-    assert_eq!(pending_hex, case["pending_hex"].as_str().unwrap(), "pending bytes");
+    assert_eq!(
+        pending_hex,
+        case["pending_hex"].as_str().unwrap(),
+        "pending bytes"
+    );
 
     let info = broker.get_info().unwrap(); // commits pending
     assert_info_matches("puts-and-merge", &info, &case["info"]);
@@ -206,11 +206,25 @@ fn test_overwrite_and_delete_matches_python() {
     let case = scenario(&exp, "overwrite-and-delete");
     let tmp = tmpdir("overwrite");
     let mut broker = broker_in(&tmp, &exp);
-    broker.put_object("o", T1, 5, "text/plain", "e1", 0, 0, None, None).unwrap();
-    broker.put_object("o", T0, 99, "stale/ct", "e0", 0, 0, None, None).unwrap();
+    broker
+        .put_object("o", T1, 5, "text/plain", "e1", 0, 0, None, None)
+        .unwrap();
+    broker
+        .put_object("o", T0, 99, "stale/ct", "e0", 0, 0, None, None)
+        .unwrap();
     broker.delete_object("gone", T2, 0).unwrap();
     broker
-        .put_object("o2", T1, 7, "text/plain;swift_bytes=3", "e2", 0, 0, None, None)
+        .put_object(
+            "o2",
+            T1,
+            7,
+            "text/plain;swift_bytes=3",
+            "e2",
+            0,
+            0,
+            None,
+            None,
+        )
         .unwrap();
     broker.get_info().unwrap();
     broker.delete_object("o", T4, 0).unwrap();
@@ -231,7 +245,17 @@ fn test_ctype_meta_merge_matches_python() {
     let tmp = tmpdir("ctype");
     let mut broker = broker_in(&tmp, &exp);
     broker
-        .put_object("x", T1, 10, "text/plain;swift_bytes=99", "ex", 0, 0, None, None)
+        .put_object(
+            "x",
+            T1,
+            10,
+            "text/plain;swift_bytes=99",
+            "ex",
+            0,
+            0,
+            None,
+            None,
+        )
         .unwrap();
     broker.get_info().unwrap();
     broker
@@ -257,9 +281,15 @@ fn test_batch_duplicates_match_python() {
     let case = scenario(&exp, "batch-duplicates");
     let tmp = tmpdir("dups");
     let mut broker = broker_in(&tmp, &exp);
-    broker.put_object("dup", T2, 2, "ct/2", "e2", 0, 0, None, None).unwrap();
-    broker.put_object("dup", T1, 1, "ct/1", "e1", 0, 0, None, None).unwrap();
-    broker.put_object("dup", T3, 3, "ct/3", "e3", 0, 0, None, None).unwrap();
+    broker
+        .put_object("dup", T2, 2, "ct/2", "e2", 0, 0, None, None)
+        .unwrap();
+    broker
+        .put_object("dup", T1, 1, "ct/1", "e1", 0, 0, None, None)
+        .unwrap();
+    broker
+        .put_object("dup", T3, 3, "ct/3", "e3", 0, 0, None, None)
+        .unwrap();
     let info = broker.get_info().unwrap();
     assert_info_matches("batch-duplicates", &info, &case["info"]);
     assert_objects_match(
@@ -281,11 +311,7 @@ fn test_reads_python_created_database() {
     std::fs::copy(fixture("container_sc2.db"), &db_path).unwrap();
 
     let mut broker = ContainerBroker::new(&db_path, "a", "c");
-    assert_info_matches(
-        "python-db info",
-        &broker.get_info().unwrap(),
-        &case["info"],
-    );
+    assert_info_matches("python-db info", &broker.get_info().unwrap(), &case["info"]);
     assert_objects_match(
         "python-db objects",
         &broker.object_rows().unwrap(),
@@ -302,7 +328,9 @@ fn test_reads_python_created_database() {
     }
 
     // and the Rust broker can keep writing to a Python-created DB
-    broker.put_object("added-by-rust", T4, 1, "x/y", "er", 0, 0, None, None).unwrap();
+    broker
+        .put_object("added-by-rust", T4, 1, "x/y", "er", 0, 0, None, None)
+        .unwrap();
     broker.get_info().unwrap();
     assert_eq!(broker.object_rows().unwrap().len(), 4);
     std::fs::remove_dir_all(&tmp).unwrap();
@@ -316,10 +344,7 @@ use swift_core::pickle::Value as PValue;
 use swift_db::AccountBroker;
 
 fn account_broker_in(tmp: &Path, exp: &Json) -> AccountBroker {
-    let mut broker = AccountBroker::new(
-        &tmp.join("accounts").join("atest.db"),
-        "AUTH_test",
-    );
+    let mut broker = AccountBroker::new(&tmp.join("accounts").join("atest.db"), "AUTH_test");
     broker
         .initialize(
             exp["put_timestamp"].as_str().unwrap(),
@@ -420,7 +445,14 @@ fn test_account_merge_semantics_match_python() {
     broker.get_info().unwrap();
     // resurrect with a newer put (str counts)
     broker
-        .put_container("c", T3, "0", PValue::Str("7".into()), PValue::Str("70".into()), 0)
+        .put_container(
+            "c",
+            T3,
+            "0",
+            PValue::Str("7".into()),
+            PValue::Str("70".into()),
+            0,
+        )
         .unwrap();
     let info = broker.get_info().unwrap();
     assert_info_matches("a-merge-semantics", &info, &case["info"]);
@@ -481,7 +513,10 @@ fn list_objects_args(call: &Json) -> ListObjectsArgs {
         end_marker: call["end_marker"].as_str().unwrap_or("").to_string(),
         prefix: call["prefix"].as_str().map(str::to_string),
         delimiter: call["delimiter"].as_str().map(str::to_string),
-        path: call.get("path").and_then(|p| p.as_str()).map(str::to_string),
+        path: call
+            .get("path")
+            .and_then(|p| p.as_str())
+            .map(str::to_string),
         storage_policy_index: 0,
         reverse: call["reverse"].as_bool().unwrap_or(false),
         include_deleted: Some(call["include_deleted"].as_bool().unwrap_or(false)),
@@ -532,10 +567,7 @@ fn test_container_metadata_reclaim_delete_match_python() {
     let mut broker = broker_in(&tmp, &exp);
     let steps = meta_case["steps"].as_array().unwrap();
     let raw_for = |steps: &[Json], name: &str| -> String {
-        steps
-            .iter()
-            .find(|s| s[0] == name)
-            .unwrap()[1]
+        steps.iter().find(|s| s[0] == name).unwrap()[1]
             .as_str()
             .unwrap()
             .to_string()
@@ -547,7 +579,10 @@ fn test_container_metadata_reclaim_delete_match_python() {
             ("blue".to_string(), T1.to_string()),
         )])
         .unwrap();
-    assert_eq!(broker.get_raw_metadata().unwrap(), raw_for(steps, "set-color"));
+    assert_eq!(
+        broker.get_raw_metadata().unwrap(),
+        raw_for(steps, "set-color")
+    );
 
     broker
         .update_metadata(&vec![
@@ -577,7 +612,10 @@ fn test_container_metadata_reclaim_delete_match_python() {
             ("green".to_string(), T2.to_string()),
         )])
         .unwrap();
-    assert_eq!(broker.get_raw_metadata().unwrap(), raw_for(steps, "older-ignored"));
+    assert_eq!(
+        broker.get_raw_metadata().unwrap(),
+        raw_for(steps, "older-ignored")
+    );
 
     broker
         .update_metadata(&vec![(
@@ -585,21 +623,49 @@ fn test_container_metadata_reclaim_delete_match_python() {
             (String::new(), T2.to_string()),
         )])
         .unwrap();
-    assert_eq!(broker.get_raw_metadata().unwrap(), raw_for(steps, "delete-key"));
+    assert_eq!(
+        broker.get_raw_metadata().unwrap(),
+        raw_for(steps, "delete-key")
+    );
 
     broker
-        .put_object("old-tomb", "1000000000.00000", 0, "application/deleted",
-                    "noetag", 1, 0, None, None)
+        .put_object(
+            "old-tomb",
+            "1000000000.00000",
+            0,
+            "application/deleted",
+            "noetag",
+            1,
+            0,
+            None,
+            None,
+        )
         .unwrap();
     broker
-        .put_object("new-tomb", T2, 0, "application/deleted", "noetag", 1, 0, None, None)
+        .put_object(
+            "new-tomb",
+            T2,
+            0,
+            "application/deleted",
+            "noetag",
+            1,
+            0,
+            None,
+            None,
+        )
         .unwrap();
-    broker.put_object("live", T2, 5, "text/x", "el", 0, 0, None, None).unwrap();
+    broker
+        .put_object("live", T2, 5, "text/x", "el", 0, 0, None, None)
+        .unwrap();
     broker.get_info().unwrap();
 
     let age = meta_case["reclaim_age_timestamp"].as_f64().unwrap();
     let reclaimed = broker.reclaim(age, age).unwrap();
-    assert_eq!(reclaimed, meta_case["reclaimed"].as_u64().unwrap(), "reclaimed count");
+    assert_eq!(
+        reclaimed,
+        meta_case["reclaimed"].as_u64().unwrap(),
+        "reclaimed count"
+    );
     assert_eq!(
         broker.get_raw_metadata().unwrap(),
         raw_for(steps, "post-reclaim-metadata")

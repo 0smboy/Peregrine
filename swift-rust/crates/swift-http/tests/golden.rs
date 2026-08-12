@@ -131,7 +131,8 @@ fn test_server_round_trip() {
                 String::from_utf8_lossy(&body)
             ),
         );
-        resp.headers.set("X-Echo", req.headers.get("x-test").unwrap_or(""));
+        resp.headers
+            .set("X-Echo", req.headers.get("x-test").unwrap_or(""));
         resp
     });
     std::thread::spawn(move || serve_forever(listener, handler));
@@ -144,7 +145,8 @@ fn test_server_round_trip() {
     )
     .unwrap();
     let mut buf = Vec::new();
-    conn.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
     // read until both responses arrive
     let mut tmp = [0u8; 4096];
     while buf.windows(4).filter(|w| w == b"\r\n\r\n").count() < 2

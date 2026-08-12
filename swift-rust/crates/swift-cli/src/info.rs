@@ -45,10 +45,7 @@ pub fn container_info(db_file: &Path) -> Result<String, String> {
     out.push_str(&format!("  Account: {account}\n"));
     out.push_str(&format!("  Container: {container}\n"));
     out.push_str(&format!("  Deleted: {deleted}\n"));
-    out.push_str(&format!(
-        "  Object Count: {}\n",
-        v(&info, "object_count")
-    ));
+    out.push_str(&format!("  Object Count: {}\n", v(&info, "object_count")));
     out.push_str(&format!("  Bytes Used: {}\n", v(&info, "bytes_used")));
     out.push_str(&format!(
         "  Storage Policy Index: {}\n",
@@ -79,10 +76,7 @@ pub fn account_info(db_file: &Path) -> Result<String, String> {
         "  Container Count: {}\n",
         v(&info, "container_count")
     ));
-    out.push_str(&format!(
-        "  Object Count: {}\n",
-        v(&info, "object_count")
-    ));
+    out.push_str(&format!("  Object Count: {}\n", v(&info, "object_count")));
     out.push_str(&format!("  Bytes Used: {}\n", v(&info, "bytes_used")));
     out.push_str(&format!("  Put Timestamp: {}\n", v(&info, "put_timestamp")));
     out.push_str(&format!("  Hash: {}\n", v(&info, "hash")));
@@ -162,7 +156,6 @@ pub fn object_info(data_file: &Path) -> Result<String, String> {
     Ok(out)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,9 +168,20 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("c.db");
         let mut b = ContainerBroker::new(&db, "AUTH_x", "box");
-        b.initialize("1751500000.00000", 0, "1751500000.00000", "id-1").unwrap();
-        b.put_object("o1", "1751500001.00000", 5, "text/plain", "e", 0, 0, None, None)
+        b.initialize("1751500000.00000", 0, "1751500000.00000", "id-1")
             .unwrap();
+        b.put_object(
+            "o1",
+            "1751500001.00000",
+            5,
+            "text/plain",
+            "e",
+            0,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
         b.update_metadata(&vec![(
             "X-Container-Meta-Color".to_string(),
             ("blue".to_string(), "1751500001.00000".to_string()),

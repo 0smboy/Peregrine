@@ -6,9 +6,16 @@ fn main() {
     if let Ok(dir) = std::env::var("LIBERASURECODE_LIB_DIR") {
         println!("cargo:rustc-link-search=native={dir}");
     }
-    for dir in ["/usr/lib64", "/usr/local/lib64", "/usr/local/lib", "/usr/lib"] {
+    for dir in [
+        "/usr/lib64",
+        "/usr/local/lib64",
+        "/usr/local/lib",
+        "/usr/lib",
+    ] {
         if std::path::Path::new(dir).join("liberasurecode.so").exists()
-            || std::path::Path::new(dir).join("liberasurecode.so.1").exists()
+            || std::path::Path::new(dir)
+                .join("liberasurecode.so.1")
+                .exists()
         {
             println!("cargo:rustc-link-search=native={dir}");
         }

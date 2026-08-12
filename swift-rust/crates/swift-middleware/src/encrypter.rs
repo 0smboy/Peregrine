@@ -423,9 +423,7 @@ impl Encrypter {
     pub fn from_conf(keymaster: Arc<KeyMaster>, disable_encryption: Option<&str>) -> Self {
         Encrypter {
             keymaster,
-            disable_encryption: disable_encryption
-                .map(config_true_value)
-                .unwrap_or(false),
+            disable_encryption: disable_encryption.map(config_true_value).unwrap_or(false),
         }
     }
 }
@@ -464,9 +462,7 @@ impl Middleware for Encrypter {
         match req.method.as_str() {
             "PUT" => self.handle_put(req, next, &account, &container, &object),
             "POST" => self.handle_post(req, next, &account, &container, &object),
-            "GET" | "HEAD" => {
-                self.handle_get_or_head(req, next, &account, &container, &object)
-            }
+            "GET" | "HEAD" => self.handle_get_or_head(req, next, &account, &container, &object),
             _ => next(req),
         }
     }
@@ -661,9 +657,7 @@ fn encrypt_user_metadata(
     let user_metas: Vec<(String, String)> = req
         .headers
         .iter()
-        .filter(|(k, v)| {
-            k.to_ascii_lowercase().starts_with("x-object-meta-") && !v.is_empty()
-        })
+        .filter(|(k, v)| k.to_ascii_lowercase().starts_with("x-object-meta-") && !v.is_empty())
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
 
@@ -674,7 +668,11 @@ fn encrypt_user_metadata(
         let lower = name.to_ascii_lowercase();
         let short = name
             .get("x-object-meta-".len()..)
-            .or_else(|| lower.strip_prefix("x-object-meta-").map(|_| &name["x-object-meta-".len()..]))
+            .or_else(|| {
+                lower
+                    .strip_prefix("x-object-meta-")
+                    .map(|_| &name["x-object-meta-".len()..])
+            })
             .unwrap_or(name.as_str());
         // Prefer original casing after the fixed-length prefix when present.
         let short = if name.len() > "X-Object-Meta-".len()
@@ -688,8 +686,7 @@ fn encrypt_user_metadata(
         let iv = random_iv();
         if let Ok((enc, meta)) = encrypt_value_with_meta(object_key, iv, val.as_bytes()) {
             let new_name = format!("{TRANSIENT_META_PREFIX}{short}");
-            req.headers
-                .set(&new_name, append_crypto_meta(&enc, &meta));
+            req.headers.set(&new_name, append_crypto_meta(&enc, &meta));
             req.headers.remove(&name);
             last_cipher = meta
                 .get("cipher")
@@ -724,9 +721,7 @@ mod tests {
     }
 
     fn root_km() -> Arc<KeyMaster> {
-        let root = unhex(
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        );
+        let root = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
         Arc::new(KeyMaster::new(root).unwrap())
     }
 
@@ -744,9 +739,7 @@ mod tests {
             iv
         };
         let body_key: [u8; KEY_LENGTH] = {
-            let v = unhex(
-                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-            );
+            let v = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
             v.try_into().unwrap()
         };
         let wrap_iv = [0x22u8; IV_LENGTH];
@@ -896,9 +889,13 @@ mod tests {
         assert_eq!(chunked.etag_mac_header, oneshot.etag_mac_header);
         assert_eq!(chunked.override_etag_header, oneshot.override_etag_header);
 
-        let recovered =
-            decrypt_object_body(&object_key, &chunked.body_meta_header, 0, &chunked.ciphertext)
-                .expect("decrypt");
+        let recovered = decrypt_object_body(
+            &object_key,
+            &chunked.body_meta_header,
+            0,
+            &chunked.ciphertext,
+        )
+        .expect("decrypt");
         assert_eq!(recovered, plaintext);
     }
 
@@ -1013,11 +1010,9 @@ mod tests {
             assert!(hdrs.get(ETAG_HEADER).is_some());
             // user meta moved to transient sysmeta
             assert!(hdrs.get("X-Object-Meta-Color").is_none());
-            assert!(hdrs
-                .iter()
-                .any(|(k, _)| k
-                    .to_ascii_lowercase()
-                    .starts_with("x-object-transient-sysmeta-crypto-meta-color")));
+            assert!(hdrs.iter().any(|(k, _)| k
+                .to_ascii_lowercase()
+                .starts_with("x-object-transient-sysmeta-crypto-meta-color")));
         }
 
         let get = Request {
@@ -1039,10 +1034,7 @@ mod tests {
             get_resp.headers.get("Etag").map(normalize_etag),
             Some(expected_etag.as_str())
         );
-        assert_eq!(
-            get_resp.headers.get("X-Object-Meta-Color"),
-            Some("blue")
-        );
+        assert_eq!(get_resp.headers.get("X-Object-Meta-Color"), Some("blue"));
         // crypto sysmeta stripped from client response
         assert!(get_resp.headers.get(BODY_META_HEADER).is_none());
     }
@@ -1065,10 +1057,7 @@ mod tests {
                 h
             },
             // No declared Content-Length — forces the unknown-length branch.
-            body: Body::from_reader(
-                Box::new(std::io::Cursor::new(plaintext.clone())),
-                None,
-            ),
+            body: Body::from_reader(Box::new(std::io::Cursor::new(plaintext.clone())), None),
         };
         let put_resp = pipeline(put);
         assert_eq!(put_resp.status, 201, "streamed put failed");
@@ -1180,19 +1169,11 @@ mod tests {
 
     #[test]
     fn mask_conditional_etags_appends_hmac_all_secrets() {
-        let root_a = unhex(
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        );
+        let root_a = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
         let root_b = vec![0xffu8; 32];
         let items = vec![
-            (
-                "encryption_root_secret".into(),
-                B64.encode(&root_a),
-            ),
-            (
-                "encryption_root_secret_old".into(),
-                B64.encode(&root_b),
-            ),
+            ("encryption_root_secret".into(), B64.encode(&root_a)),
+            ("encryption_root_secret_old".into(), B64.encode(&root_b)),
         ];
         let km = Arc::new(KeyMaster::from_conf_items(&items).unwrap());
         let keys = km.fetch_all_object_keys("a", "c", "o");
@@ -1210,11 +1191,7 @@ mod tests {
             },
             body: Body::empty(),
         };
-        assert!(mask_conditional_etags(
-            &mut req,
-            "If-None-Match",
-            &keys
-        ));
+        assert!(mask_conditional_etags(&mut req, "If-None-Match", &keys));
         let val = req.headers.get("If-None-Match").unwrap();
         // Original plaintext etag preserved (unencrypted objects).
         assert!(val.contains(plaintext_etag), "{val}");

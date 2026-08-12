@@ -56,10 +56,7 @@ fn server(devices: &Path, mount_check: bool) -> ObjectServer {
         )
         .unwrap(),
         diskfile: swift_diskfile::DiskFileConfig::default(),
-        policies: std::collections::HashMap::from([(
-            0,
-            swift_diskfile::PolicyKind::Replication,
-        )]),
+        policies: std::collections::HashMap::from([(0, swift_diskfile::PolicyKind::Replication)]),
         container_update_timeout: std::time::Duration::from_secs(1),
         container_update_mode: ContainerUpdateMode::Sync,
     })

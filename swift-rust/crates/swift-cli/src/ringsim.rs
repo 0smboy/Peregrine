@@ -65,7 +65,10 @@ pub struct MoveDiff {
 }
 
 fn replica_set(assign: &[Vec<u32>], part: usize) -> Vec<u32> {
-    let mut v: Vec<u32> = assign.iter().filter_map(|row| row.get(part).copied()).collect();
+    let mut v: Vec<u32> = assign
+        .iter()
+        .filter_map(|row| row.get(part).copied())
+        .collect();
     v.sort_unstable();
     v
 }
@@ -140,7 +143,8 @@ pub fn diff_assignments(before: &[Vec<u32>], after: &[Vec<u32>]) -> MoveDiff {
         });
     }
     d.flows = {
-        let mut f: Vec<(u64, u64, usize)> = flows.into_iter().map(|((a, b), n)| (a, b, n)).collect();
+        let mut f: Vec<(u64, u64, usize)> =
+            flows.into_iter().map(|((a, b), n)| (a, b, n)).collect();
         f.sort_by(|x, y| y.2.cmp(&x.2).then(x.0.cmp(&y.0)).then(x.1.cmp(&y.1)));
         f
     };
@@ -497,7 +501,10 @@ mod tests {
         let before = vec![vec![0], vec![1], vec![2]];
         let after = vec![vec![2], vec![0], vec![1]];
         let d = diff_assignments(&before, &after);
-        assert_eq!(d.slots_moved, 0, "a row permutation must not count as movement");
+        assert_eq!(
+            d.slots_moved, 0,
+            "a row permutation must not count as movement"
+        );
         assert_eq!(d.slot_permutations, 1);
     }
 
@@ -532,14 +539,20 @@ mod tests {
         let s = survival(&a, &down, 2, 1);
         assert_eq!(s.parts_total, 2);
         assert_eq!(s.parts_full, 0);
-        assert_eq!(s.parts_degraded, 2, "2 of 3 alive is degraded but at quorum");
+        assert_eq!(
+            s.parts_degraded, 2,
+            "2 of 3 alive is degraded but at quorum"
+        );
         assert_eq!(s.parts_below_quorum, 0);
         assert_eq!(s.parts_lost, 0);
         assert_eq!(s.min_surviving_replicas, 2);
 
         let down2: HashSet<u64> = [0u64, 1u64].into_iter().collect();
         let s2 = survival(&a, &down2, 2, 1);
-        assert_eq!(s2.parts_below_quorum, 2, "1 of 3 is readable but below quorum");
+        assert_eq!(
+            s2.parts_below_quorum, 2,
+            "1 of 3 is readable but below quorum"
+        );
         assert_eq!(s2.parts_lost, 0);
 
         let down3: HashSet<u64> = [0u64, 1u64, 2u64].into_iter().collect();
@@ -621,10 +634,16 @@ mod tests {
         let before = vec![vec![0, 0]];
         let after = vec![vec![0, 1]];
         let t = tier_loads(&before, &after, &devs);
-        let z1 = t.iter().find(|x| x.kind == "zone" && x.tier == "r1z1").unwrap();
+        let z1 = t
+            .iter()
+            .find(|x| x.kind == "zone" && x.tier == "r1z1")
+            .unwrap();
         assert_eq!(z1.parts_before, 2);
         assert_eq!(z1.parts_after, 1);
-        assert!(z1.balance_pct.abs() < 1e-6, "equal weights, equal load => balanced");
+        assert!(
+            z1.balance_pct.abs() < 1e-6,
+            "equal weights, equal load => balanced"
+        );
     }
 
     #[test]

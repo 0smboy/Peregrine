@@ -109,13 +109,7 @@ impl TempAuth {
     }
 
     /// Add a `user_<account>_<user>` record.
-    pub fn add_user(
-        &mut self,
-        account: &str,
-        user: &str,
-        key: &str,
-        groups: &[&str],
-    ) -> &mut Self {
+    pub fn add_user(&mut self, account: &str, user: &str, key: &str, groups: &[&str]) -> &mut Self {
         self.users.insert(
             format!("{account}:{user}"),
             UserRecord {
@@ -290,12 +284,11 @@ impl TempAuth {
         let segs: Vec<&str> = req.path.trim_start_matches('/').split('/').collect();
         // support /auth/v1.0, /auth/, /auth/v1/<act>/auth: only the last
         // form carries an account in the path that must match creds
-        let account: Option<String> =
-            if segs.len() >= 4 && segs[1] == "v1" && segs[3] == "auth" {
-                Some(segs[2].to_string())
-            } else {
-                None
-            };
+        let account: Option<String> = if segs.len() >= 4 && segs[1] == "v1" && segs[3] == "auth" {
+            Some(segs[2].to_string())
+        } else {
+            None
+        };
 
         let x_auth_user = req
             .headers
@@ -376,9 +369,7 @@ impl TempAuth {
             *swift_owner = true;
             return None;
         }
-        if user_groups.iter().any(|g| g == ".reseller_reader")
-            && matches!(method, "GET" | "HEAD")
-        {
+        if user_groups.iter().any(|g| g == ".reseller_reader") && matches!(method, "GET" | "HEAD") {
             return None;
         }
         // account owner (the reseller-prefixed account name is one of the user's
@@ -441,12 +432,7 @@ impl Middleware for TempAuth {
         if req
             .headers
             .get("X-Backend-Authorize-Override")
-            .map(|v| {
-                matches!(
-                    v.to_ascii_lowercase().as_str(),
-                    "true" | "1" | "yes" | "on"
-                )
-            })
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
             .unwrap_or(false)
         {
             return next(req);
@@ -493,9 +479,7 @@ impl Middleware for TempAuth {
                 Err(msg) => {
                     let body = format!(
                         "X-Account-Access-Control invalid: {msg}\n\nInput: {}\n",
-                        req.headers
-                            .get("X-Account-Access-Control")
-                            .unwrap_or("")
+                        req.headers.get("X-Account-Access-Control").unwrap_or("")
                     );
                     let mut resp = Response::with_body(400, body);
                     resp.headers
@@ -540,7 +524,10 @@ mod tests {
         let seen = Arc::new(Mutex::new(None));
         let s2 = seen.clone();
         let app: Arc<dyn Fn(Request) -> Response + Send + Sync> = Arc::new(move |r: Request| {
-            *s2.lock().unwrap() = r.headers.get("X-Backend-Remote-User").map(|s| s.to_string());
+            *s2.lock().unwrap() = r
+                .headers
+                .get("X-Backend-Remote-User")
+                .map(|s| s.to_string());
             Response::new(204)
         });
         (seen, app)
@@ -554,7 +541,11 @@ mod tests {
         // wrong key -> 401
         assert_eq!(
             ta.handle(
-                mk("GET", "/auth/v1.0", &[("X-Auth-User", "test:tester"), ("X-Auth-Key", "wrong")]),
+                mk(
+                    "GET",
+                    "/auth/v1.0",
+                    &[("X-Auth-User", "test:tester"), ("X-Auth-Key", "wrong")]
+                ),
                 &(std::sync::Arc::new(|_r| Response::new(500)) as crate::NextFn),
             )
             .status,
@@ -562,21 +553,34 @@ mod tests {
         );
         // right key -> token + storage url
         let resp = ta.handle(
-            mk("GET", "/auth/v1.0", &[("X-Auth-User", "test:tester"), ("X-Auth-Key", "testing")]),
+            mk(
+                "GET",
+                "/auth/v1.0",
+                &[("X-Auth-User", "test:tester"), ("X-Auth-Key", "testing")],
+            ),
             &(std::sync::Arc::new(|_r| Response::new(500)) as crate::NextFn),
         );
         assert_eq!(resp.status, 200);
         let token = resp.headers.get("X-Auth-Token").unwrap().to_string();
         assert!(token.starts_with("AUTH_tk"), "{token}");
-        assert_eq!(resp.headers.get("X-Storage-Url"), Some("http://h:8080/v1/AUTH_test"));
+        assert_eq!(
+            resp.headers.get("X-Storage-Url"),
+            Some("http://h:8080/v1/AUTH_test")
+        );
 
         // valid token: handle forwards, stamping the user's groups
         let (seen, app) = recording_app();
-        let resp = ta.handle(mk("GET", "/v1/AUTH_test/c", &[("X-Auth-Token", &token)]), &app);
+        let resp = ta.handle(
+            mk("GET", "/v1/AUTH_test/c", &[("X-Auth-Token", &token)]),
+            &app,
+        );
         assert_eq!(resp.status, 204);
         // a .admin user owns AUTH_test (storage account added, .admin consumed)
         let groups = seen.lock().unwrap().clone().unwrap();
-        assert!(groups.contains("AUTH_test") && !groups.contains(".admin"), "{groups}");
+        assert!(
+            groups.contains("AUTH_test") && !groups.contains(".admin"),
+            "{groups}"
+        );
 
         // a forged inbound X-Backend-Remote-User is overwritten by the real one
         let (seen, app) = recording_app();
@@ -584,19 +588,31 @@ mod tests {
             mk(
                 "GET",
                 "/v1/AUTH_test/c",
-                &[("X-Auth-Token", &token), ("X-Backend-Remote-User", ".reseller_admin")],
+                &[
+                    ("X-Auth-Token", &token),
+                    ("X-Backend-Remote-User", ".reseller_admin"),
+                ],
             ),
             &app,
         );
         assert!(
-            !seen.lock().unwrap().clone().unwrap().contains(".reseller_admin"),
+            !seen
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap()
+                .contains(".reseller_admin"),
             "forged group must be dropped"
         );
 
         // bad token -> 401 (not anonymous)
         assert_eq!(
             ta.handle(
-                mk("GET", "/v1/AUTH_test/c", &[("X-Auth-Token", "AUTH_tkbogus")]),
+                mk(
+                    "GET",
+                    "/v1/AUTH_test/c",
+                    &[("X-Auth-Token", "AUTH_tkbogus")]
+                ),
                 &(std::sync::Arc::new(|_r| Response::new(500)) as crate::NextFn),
             )
             .status,
@@ -633,7 +649,10 @@ mod tests {
         assert!(token.contains("tkv1."), "{token}");
 
         let (seen, app) = recording_app();
-        let resp = b.handle(mk("GET", "/v1/AUTH_test/c", &[("X-Auth-Token", &token)]), &app);
+        let resp = b.handle(
+            mk("GET", "/v1/AUTH_test/c", &[("X-Auth-Token", &token)]),
+            &app,
+        );
         assert_eq!(resp.status, 204, "peer proxy must accept HMAC token");
         assert!(seen.lock().unwrap().clone().unwrap().contains("AUTH_test"));
     }
@@ -677,7 +696,11 @@ mod tests {
 
     #[test]
     fn test_authorize_acl() {
-        let owner = vec!["test:tester".into(), ".admin".into(), "AUTH_test".to_string()];
+        let owner = vec![
+            "test:tester".into(),
+            ".admin".into(),
+            "AUTH_test".to_string(),
+        ];
         let other = vec!["other:u".into(), "AUTH_other".to_string()];
         let admin = vec!["a:b".into(), ".reseller_admin".to_string()];
         let anon: Vec<String> = vec![];
@@ -688,8 +711,7 @@ mod tests {
                   rf: Option<&str>,
                   acct: Option<&AccountAcls>| {
             let mut owner_flag = false;
-            let denied =
-                TempAuth::authorize_acl(m, p, g, acl, rf, "AUTH_", acct, &mut owner_flag);
+            let denied = TempAuth::authorize_acl(m, p, g, acl, rf, "AUTH_", acct, &mut owner_flag);
             (denied, owner_flag)
         };
 
@@ -726,9 +748,11 @@ mod tests {
         let (d, own) = az("DELETE", "/v1/AUTH_test/c/o", &admin, None, None, None);
         assert!(d.is_none() && own);
         // public read (.r:*) allows anonymous OBJECT GET
-        assert!(az("GET", "/v1/AUTH_test/c/o", &anon, Some(".r:*"), None, None)
-            .0
-            .is_none());
+        assert!(
+            az("GET", "/v1/AUTH_test/c/o", &anon, Some(".r:*"), None, None)
+                .0
+                .is_none()
+        );
         // .r:* on a container LISTING needs .rlistings
         assert_eq!(
             az("GET", "/v1/AUTH_test/c", &anon, Some(".r:*"), None, None)

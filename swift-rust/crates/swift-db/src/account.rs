@@ -27,8 +27,7 @@ use swift_core::timestamp::Timestamp;
 
 use crate::container::DbValue;
 use crate::util::{
-    b64decode, b64encode, configure_connection, initialize_database, lock_parent_directory,
-    DbError,
+    b64decode, b64encode, configure_connection, initialize_database, lock_parent_directory, DbError,
 };
 use crate::PENDING_CAP;
 
@@ -301,9 +300,7 @@ impl AccountBroker {
     fn record_from_pickle_value(value: &Value) -> Result<ContainerRecord, DbError> {
         let items = match value {
             Value::Tuple(items) | Value::List(items) => items,
-            other => {
-                return Err(DbError::Connection(format!("bad pending entry: {other:?}")))
-            }
+            other => return Err(DbError::Connection(format!("bad pending entry: {other:?}"))),
         };
         if items.len() < 6 {
             return Err(DbError::Connection("short pending entry".to_string()));
@@ -401,9 +398,7 @@ impl AccountBroker {
     pub fn merge_items(&mut self, item_list: Vec<ContainerRecord>) -> Result<(), DbError> {
         let conn = self.conn()?;
         let has_index: bool = conn
-            .prepare(
-                "SELECT name FROM sqlite_master WHERE name = 'ix_container_deleted_name'",
-            )?
+            .prepare("SELECT name FROM sqlite_master WHERE name = 'ix_container_deleted_name'")?
             .exists([])?;
 
         for mut rec in item_list {
@@ -507,10 +502,7 @@ impl AccountBroker {
             .ok_or_else(|| DbError::Connection("no account_stat row".to_string()))?;
         let mut out = Vec::with_capacity(names.len());
         for (i, name) in names.iter().enumerate() {
-            out.push((
-                name.clone(),
-                DbValue::from_sql(row.get_ref(i)?),
-            ));
+            out.push((name.clone(), DbValue::from_sql(row.get_ref(i)?)));
         }
         Ok(out)
     }
@@ -765,8 +757,7 @@ impl AccountBroker {
             let mut params: Vec<rusqlite::types::Value> = Vec::new();
             let prefix_nonempty = prefix.as_deref().is_some_and(|p| !p.is_empty());
             if !end_marker.is_empty()
-                && (!prefix_nonempty
-                    || end_marker.as_str() < end_prefix.as_deref().unwrap_or(""))
+                && (!prefix_nonempty || end_marker.as_str() < end_prefix.as_deref().unwrap_or(""))
             {
                 conditions.push("name < ?".into());
                 params.push(end_marker.clone().into());
@@ -840,9 +831,7 @@ impl AccountBroker {
                     if args.reverse {
                         end_marker = name[..end + delimiter.len()].to_string();
                     } else {
-                        marker = crate::container::bump_delimiter_marker(
-                            &name, end, &delimiter,
-                        );
+                        marker = crate::container::bump_delimiter_marker(&name, end, &delimiter);
                         delim_force_gte = true;
                     }
                     let dir_name = name[..end + delimiter.len()].to_string();
@@ -894,7 +883,11 @@ impl AccountBroker {
 impl AccountBroker {
     /// `get_sync`: last incoming/outgoing sync point for a remote id.
     pub fn get_sync(&mut self, remote_id: &str, incoming: bool) -> Result<i64, DbError> {
-        let table = if incoming { "incoming_sync" } else { "outgoing_sync" };
+        let table = if incoming {
+            "incoming_sync"
+        } else {
+            "outgoing_sync"
+        };
         let conn = self.conn()?;
         conn.query_row(
             &format!("SELECT sync_point FROM {table} WHERE remote_id=?"),
@@ -916,7 +909,11 @@ impl AccountBroker {
         sync_points: &[(i64, String)],
         incoming: bool,
     ) -> Result<(), DbError> {
-        let table = if incoming { "incoming_sync" } else { "outgoing_sync" };
+        let table = if incoming {
+            "incoming_sync"
+        } else {
+            "outgoing_sync"
+        };
         let conn = self.conn()?;
         for (sync_point, remote_id) in sync_points {
             let inserted = conn.execute(
@@ -925,9 +922,7 @@ impl AccountBroker {
             )?;
             if inserted == 0 {
                 conn.execute(
-                    &format!(
-                        "UPDATE {table} SET sync_point=max(?, sync_point) WHERE remote_id=?"
-                    ),
+                    &format!("UPDATE {table} SET sync_point=max(?, sync_point) WHERE remote_id=?"),
                     rusqlite::params![sync_point, remote_id],
                 )?;
             }
@@ -938,7 +933,11 @@ impl AccountBroker {
     /// `get_syncs` (db.py:726-745): the whole incoming (or outgoing) sync
     /// table, as the `(sync_point, remote_id)` pairs `merge_syncs` accepts.
     pub fn get_syncs(&mut self, incoming: bool) -> Result<Vec<(i64, String)>, DbError> {
-        let table = if incoming { "incoming_sync" } else { "outgoing_sync" };
+        let table = if incoming {
+            "incoming_sync"
+        } else {
+            "outgoing_sync"
+        };
         let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!("SELECT sync_point, remote_id FROM {table}"))?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;

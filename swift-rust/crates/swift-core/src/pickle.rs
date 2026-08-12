@@ -140,9 +140,8 @@ fn decode_pickled_str(raw: &[u8]) -> Value {
                 // lone surrogate U+DC80..U+DCFF encoded via surrogatepass:
                 // ED B2 80 .. ED B3 BF -> original byte 0x80..0xFF
                 if b == 0xed && i + 2 < raw.len() && (raw[i + 1] & 0xfe) == 0xb2 {
-                    let cp = 0xd000
-                        | ((raw[i + 1] as u32 & 0x3f) << 6)
-                        | (raw[i + 2] as u32 & 0x3f);
+                    let cp =
+                        0xd000 | ((raw[i + 1] as u32 & 0x3f) << 6) | (raw[i + 2] as u32 & 0x3f);
                     if (0xdc80..=0xdcff).contains(&cp) {
                         out.push((cp - 0xdc00) as u8);
                         i += 3;
@@ -224,7 +223,9 @@ impl<'a> Reader<'a> {
     }
 
     fn pop(&mut self) -> Result<Value, PickleError> {
-        self.stack.pop().ok_or(PickleError("stack underflow".into()))
+        self.stack
+            .pop()
+            .ok_or(PickleError("stack underflow".into()))
     }
 
     fn pop_to_mark(&mut self) -> Result<Vec<Value>, PickleError> {
@@ -587,9 +588,7 @@ impl Writer {
                 }
                 self.memoize();
             }
-            Value::Global(m, n) => {
-                return err(format!("cannot serialize global '{m}.{n}'"))
-            }
+            Value::Global(m, n) => return err(format!("cannot serialize global '{m}.{n}'")),
         }
         Ok(())
     }
@@ -755,7 +754,10 @@ mod tests {
             unhex("80027d71002858020000006f7071015803000000505554710258070000006163636f756e7471035809000000415554485f74657374710458070000006865616465727371057d71065806000000782d73697a657107580100000034710873752e")
         );
         let list = Value::List(vec![Value::Int(1), Value::Str("two".into()), Value::Int(3)]);
-        assert_eq!(dumps(&list).unwrap(), unhex("80025d7100284b01580300000074776f71014b03652e"));
+        assert_eq!(
+            dumps(&list).unwrap(),
+            unhex("80025d7100284b01580300000074776f71014b03652e")
+        );
     }
 
     #[test]
@@ -770,7 +772,10 @@ mod tests {
         ]));
         rt(Value::Dict(vec![
             (Value::Str("valid".into()), Value::Bool(true)),
-            (Value::Str("updated".into()), Value::Float(1751512345.678901)),
+            (
+                Value::Str("updated".into()),
+                Value::Float(1751512345.678901),
+            ),
             (Value::Str("abc".into()), Value::None),
             (
                 Value::Str("07f".into()),

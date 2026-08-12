@@ -5,6 +5,9 @@ fn main() {
     });
     match swift_cli::info::account_info(std::path::Path::new(&path)) {
         Ok(out) => print!("{}", out),
-        Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
     }
 }

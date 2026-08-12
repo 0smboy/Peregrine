@@ -21,9 +21,7 @@
 //!
 //! See docs/fairness-lab/WORKERS-SEMANTICS.md.
 
-use swift_object_server::servers_per_port::{
-    effective_concurrency_json, ConcurrencyInputs,
-};
+use swift_object_server::servers_per_port::{effective_concurrency_json, ConcurrencyInputs};
 
 fn usage() -> ! {
     eprintln!(
@@ -45,7 +43,10 @@ fn main() {
         match arg.as_str() {
             "-h" | "--help" => usage(),
             "--workers" => {
-                workers = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())
+                workers = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage())
             }
             "--max-clients" => {
                 max_clients = args
@@ -60,7 +61,10 @@ fn main() {
                     .unwrap_or_else(|| usage())
             }
             "--ports" => {
-                ports = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())
+                ports = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage())
             }
             _ => usage(),
         }

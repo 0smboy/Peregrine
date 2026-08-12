@@ -70,11 +70,7 @@ pub fn encode_metadata(meta: &Metadata) -> Value {
             MetaValue::Int(i) => Value::Int(*i),
         }
     }
-    Value::Dict(
-        meta.iter()
-            .map(|(k, v)| (enc(k), enc(v)))
-            .collect(),
-    )
+    Value::Dict(meta.iter().map(|(k, v)| (enc(k), enc(v))).collect())
 }
 
 /// Port of `_decode_metadata`: convert unpickled keys/values to their
@@ -297,10 +293,7 @@ mod tests {
 
     #[test]
     fn test_xattr_round_trip() {
-        let dir = std::env::temp_dir().join(format!(
-            "swift-diskfile-meta-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("swift-diskfile-meta-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("obj.data");
         std::fs::write(&path, b"body").unwrap();

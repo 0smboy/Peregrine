@@ -21,8 +21,8 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use swift_account_server::reaper::{recon_update, run_once};
-use swift_core::daemon;
 use swift_core::config::SwiftConfig;
+use swift_core::daemon;
 use swift_core::hashing::HashPathConfig;
 use swift_core::obslog::{LogLevel, Logger};
 use swift_core::statsd::StatsdClient;
@@ -47,8 +47,9 @@ fn load_ring(path: &str, hash_config: &HashPathConfig, logger: &Logger) -> Ring 
 }
 
 fn main() {
-    let conf_path =
-        std::env::args().nth(1).unwrap_or_else(|| "/etc/swift/account-server.conf".to_string());
+    let conf_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/etc/swift/account-server.conf".to_string());
     let run_once_only = std::env::args().nth(2).as_deref() == Some("once");
     let conf = parse_conf_file(&conf_path);
     let get = |section: &str, key: &str, default: &str| -> String {
@@ -59,7 +60,9 @@ fn main() {
             .unwrap_or_else(|| default.to_string())
     };
     let devices = get("app:account-server", "devices", "/srv/node");
-    let interval: u64 = get("account-reaper", "interval", "3600").parse().unwrap_or(3600);
+    let interval: u64 = get("account-reaper", "interval", "3600")
+        .parse()
+        .unwrap_or(3600);
     let delay_reaping: f64 = get("account-reaper", "delay_reaping", "0")
         .parse()
         .unwrap_or(0.0);
@@ -108,13 +111,7 @@ fn main() {
         if let Ok(entries) = std::fs::read_dir(&devices) {
             for e in entries.flatten() {
                 if e.path().is_dir() {
-                    let s = run_once(
-                        &e.path(),
-                        now,
-                        delay_reaping,
-                        &object_ring,
-                        &container_ring,
-                    );
+                    let s = run_once(&e.path(), now, delay_reaping, &object_ring, &container_ring);
                     pass.accounts_reaped += s.accounts_reaped;
                     pass.accounts_skipped += s.accounts_skipped;
                     pass.containers_deleted += s.containers_deleted;

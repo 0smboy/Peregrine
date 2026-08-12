@@ -135,7 +135,10 @@ mod tests {
             "suffix_sync",
             "failure_nodes",
         ] {
-            assert!(stats_obj.contains_key(key), "missing replication_stats.{key}");
+            assert!(
+                stats_obj.contains_key(key),
+                "missing replication_stats.{key}"
+            );
         }
         assert_eq!(update["replication_stats"]["attempted"], 4);
         assert_eq!(update["replication_stats"]["failure"], 1);
@@ -147,7 +150,10 @@ mod tests {
     fn updater_recon_update_dumps_python_recon_keys() {
         let update = updater_recon_update(Duration::from_secs(7), 1_700_000_100.0);
         assert_eq!(update["object_updater_sweep"].as_f64().unwrap(), 7.0);
-        assert_eq!(update["object_updater_last"].as_f64().unwrap(), 1_700_000_100.0);
+        assert_eq!(
+            update["object_updater_last"].as_f64().unwrap(),
+            1_700_000_100.0
+        );
 
         // round-trip through the dump helper into a temp cache path
         let dir = std::env::temp_dir().join(format!(

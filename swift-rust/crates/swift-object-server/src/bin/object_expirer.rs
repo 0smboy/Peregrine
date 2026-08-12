@@ -47,8 +47,9 @@ fn load_ring(path: &str, hash_config: &HashPathConfig, logger: &Logger) -> Ring 
 }
 
 fn main() {
-    let conf_path =
-        std::env::args().nth(1).unwrap_or_else(|| "/etc/swift/object-expirer.conf".to_string());
+    let conf_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/etc/swift/object-expirer.conf".to_string());
     // Also accept object-server.conf (section [object-expirer]) for single-file
     // deployments that fold the expirer into the object conf.
     let conf_path = if Path::new(&conf_path).exists() {
@@ -65,7 +66,9 @@ fn main() {
             .or_else(|| conf.get("DEFAULT", key).ok().flatten())
             .unwrap_or_else(|| default.to_string())
     };
-    let interval: u64 = get("object-expirer", "interval", "300").parse().unwrap_or(300);
+    let interval: u64 = get("object-expirer", "interval", "300")
+        .parse()
+        .unwrap_or(300);
     let reclaim_age: i64 = get("object-expirer", "reclaim_age", "604800")
         .parse()
         .unwrap_or(604800);

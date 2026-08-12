@@ -57,7 +57,11 @@ fn dev(id: u32, port: u32) -> RingDevice {
 }
 
 fn single_device_ring(port: u32) -> Ring {
-    let data = RingData::from_parts(vec![Some(dev(0, port))], 32, vec![vec![0], vec![0], vec![0]]);
+    let data = RingData::from_parts(
+        vec![Some(dev(0, port))],
+        32,
+        vec![vec![0], vec![0], vec![0]],
+    );
     Ring::new(data, hash_cfg())
 }
 
@@ -286,7 +290,9 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
     assert_eq!(status, 201, "container PUT");
 
     // a multi-segment payload (deterministic, spans several 1 KiB segments)
-    let payload: Vec<u8> = (0..3500u32).map(|i| (i.wrapping_mul(31) % 251) as u8).collect();
+    let payload: Vec<u8> = (0..3500u32)
+        .map(|i| (i.wrapping_mul(31) % 251) as u8)
+        .collect();
 
     // EC PUT through the proxy: encode -> fan k+m fragments out to the nodes
     let (status, _, _) = http(
@@ -311,7 +317,10 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
         );
         durable += frags.len();
     }
-    assert_eq!(durable, N, "all {N} fragments landed durable, got {durable}");
+    assert_eq!(
+        durable, N,
+        "all {N} fragments landed durable, got {durable}"
+    );
 
     // EC GET through the proxy: gather ndata fragments and decode
     let (status, headers, body) = http(
@@ -328,7 +337,11 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
         .find(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
         .map(|(_, v)| v.as_str())
         .unwrap_or("");
-    assert_eq!(cl, payload.len().to_string(), "Content-Length is the object size");
+    assert_eq!(
+        cl,
+        payload.len().to_string(),
+        "Content-Length is the object size"
+    );
 
     // EC redundancy: destroy nparity fragments and confirm the object still
     // decodes from the surviving ndata.
@@ -349,13 +362,7 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
 
     // The container listing records the WHOLE OBJECT's etag/size (the
     // footers' container-update overrides), not the fragment archive's.
-    let (status, _, listing) = http(
-        proxy_addr,
-        "GET",
-        "/v1/AUTH_ec/ecbox?format=json",
-        &[],
-        b"",
-    );
+    let (status, _, listing) = http(proxy_addr, "GET", "/v1/AUTH_ec/ecbox?format=json", &[], b"");
     assert_eq!(status, 200, "container listing");
     let entries: serde_json::Value = serde_json::from_slice(&listing).unwrap();
     let entry = entries

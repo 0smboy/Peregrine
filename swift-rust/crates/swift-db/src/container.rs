@@ -30,8 +30,9 @@ use rusqlite::Connection;
 use swift_core::pickle::{self, Value};
 use swift_core::timestamp::{decode_timestamps, encode_timestamps, Timestamp};
 
-use crate::util::{b64decode, b64encode, configure_connection, initialize_database,
-    lock_parent_directory, DbError};
+use crate::util::{
+    b64decode, b64encode, configure_connection, initialize_database, lock_parent_directory, DbError,
+};
 use crate::PENDING_CAP;
 
 const SQLITE_ARG_LIMIT: usize = 999;
@@ -49,7 +50,6 @@ pub(crate) fn now_internal() -> String {
 const PENDING_TIMEOUT: f64 = 10.0;
 
 // ---- SQL scripts, verbatim from the Python source ----
-
 
 const POLICY_STAT_TABLE_CREATE: &str = "
     CREATE TABLE policy_stat (
@@ -537,9 +537,7 @@ impl ContainerBroker {
 
     /// All shard range records, including own and deleted
     /// (`get_all_shard_range_data`).
-    pub fn get_all_shard_range_data(
-        &mut self,
-    ) -> Result<Vec<crate::shard::ShardRange>, DbError> {
+    pub fn get_all_shard_range_data(&mut self) -> Result<Vec<crate::shard::ShardRange>, DbError> {
         self.get_shard_ranges(&GetShardRangesArgs {
             include_own: true,
             include_deleted: true,
@@ -549,10 +547,7 @@ impl ContainerBroker {
 
     /// `enable_sharding`: set the own shard range to SHARDING with the given
     /// epoch and persist it, returning the updated range.
-    pub fn enable_sharding(
-        &mut self,
-        epoch: &str,
-    ) -> Result<crate::shard::ShardRange, DbError> {
+    pub fn enable_sharding(&mut self, epoch: &str) -> Result<crate::shard::ShardRange, DbError> {
         let mut own = self.get_own_shard_range(false)?.expect("default own range");
         // update_state(SHARDING, epoch): state, state_timestamp, reported=0
         own.state = crate::shard::state::SHARDING;
@@ -571,10 +566,7 @@ impl ContainerBroker {
     /// Deferred vs Python: copying replication sync points into the fresh DB
     /// (a replication-convergence optimisation, not required for correctness).
     pub fn set_sharding_state(&mut self) -> Result<bool, DbError> {
-        let Some(epoch) = self
-            .get_own_shard_range(false)?
-            .and_then(|sr| sr.epoch)
-        else {
+        let Some(epoch) = self.get_own_shard_range(false)?.and_then(|sr| sr.epoch) else {
             return Ok(false); // missing epoch
         };
         if self.get_db_state()? != DbState::Unsharded {
@@ -842,11 +834,7 @@ impl ContainerBroker {
     fn record_from_pickle_value(value: &Value) -> Result<ObjectRecord, DbError> {
         let items = match value {
             Value::Tuple(items) | Value::List(items) => items,
-            other => {
-                return Err(DbError::Connection(format!(
-                    "bad pending entry: {other:?}"
-                )))
-            }
+            other => return Err(DbError::Connection(format!("bad pending entry: {other:?}"))),
         };
         if items.len() < 6 {
             return Err(DbError::Connection("short pending entry".to_string()));
@@ -958,11 +946,13 @@ impl ContainerBroker {
         let conn = self.conn()?;
         // fresh schemas always have ix_object_deleted_name (db version 1)
         let has_index: bool = conn
-            .prepare(
-                "SELECT name FROM sqlite_master WHERE name = 'ix_object_deleted_name'",
-            )?
+            .prepare("SELECT name FROM sqlite_master WHERE name = 'ix_object_deleted_name'")?
             .exists([])?;
-        let query_mod = if has_index { " deleted IN (0, 1) AND " } else { "" };
+        let query_mod = if has_index {
+            " deleted IN (0, 1) AND "
+        } else {
+            ""
+        };
 
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<(), DbError> {
@@ -1434,8 +1424,7 @@ impl ContainerBroker {
     /// Test/tooling helper: `SELECT name, sql FROM sqlite_master`.
     pub fn schema_dump(&mut self) -> Result<Vec<(String, Option<String>)>, DbError> {
         let conn = self.conn()?;
-        let mut stmt =
-            conn.prepare("SELECT name, sql FROM sqlite_master ORDER BY name")?;
+        let mut stmt = conn.prepare("SELECT name, sql FROM sqlite_master ORDER BY name")?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
@@ -1523,11 +1512,10 @@ fn update_new_item_from_existing(
     existing: Option<&ObjectRecord>,
 ) -> bool {
     let data_timestamp = new_item.created_at.clone();
-    let (mut item_ts_data, ts_ctype, ts_meta) =
-        match decode_timestamps(&data_timestamp, false) {
-            Ok(parts) => parts,
-            Err(_) => return true, // unparseable: treat as new (unreachable)
-        };
+    let (mut item_ts_data, ts_ctype, ts_meta) = match decode_timestamps(&data_timestamp, false) {
+        Ok(parts) => parts,
+        Err(_) => return true, // unparseable: treat as new (unreachable)
+    };
     let mut item_ts_ctype = ts_ctype.unwrap_or(item_ts_data);
     let mut item_ts_meta = ts_meta.unwrap_or(item_ts_data);
 
@@ -1613,9 +1601,15 @@ mod tests {
         );
         assert_eq!(
             extract_swift_bytes("text/plain; charset=UTF-8;swift_bytes=1"),
-            ("text/plain;charset=UTF-8".to_string(), Some("1".to_string()))
+            (
+                "text/plain;charset=UTF-8".to_string(),
+                Some("1".to_string())
+            )
         );
-        assert_eq!(extract_swift_bytes("text/plain"), ("text/plain".to_string(), None));
+        assert_eq!(
+            extract_swift_bytes("text/plain"),
+            ("text/plain".to_string(), None)
+        );
     }
 
     #[test]
@@ -1683,7 +1677,10 @@ mod tests {
         assert_ne!(new_id, "id");
         // (max_row, remote_id) landed in the incoming sync table
         assert_eq!(b.get_sync("remote-abc", true).unwrap(), 2);
-        assert_eq!(b.get_syncs(true).unwrap(), vec![(2, "remote-abc".to_string())]);
+        assert_eq!(
+            b.get_syncs(true).unwrap(),
+            vec![(2, "remote-abc".to_string())]
+        );
         assert_eq!(b.get_syncs(false).unwrap(), vec![]);
         // ContainerBroker._newid (container/backend.py:684-688) reset the
         // reported_* stats
@@ -1726,9 +1723,7 @@ mod tests {
             .unwrap();
 
         // get_shard_ranges (others only) returns the three shards sorted by upper
-        let all = b
-            .get_shard_ranges(&GetShardRangesArgs::default())
-            .unwrap();
+        let all = b.get_shard_ranges(&GetShardRangesArgs::default()).unwrap();
         assert_eq!(all.len(), 3, "{all:?}");
         assert_eq!(all[0].upper, "m");
         assert_eq!(all[1].upper, "t");
@@ -1823,7 +1818,11 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(got.len(), 1, "FOUND must be excluded from states=listing: {got:?}");
+        assert_eq!(
+            got.len(),
+            1,
+            "FOUND must be excluded from states=listing: {got:?}"
+        );
         assert_eq!(got[0].name, ".shards_a/c-1");
         assert_eq!(got[0].state, state::CLEAVED);
 
@@ -1837,12 +1836,19 @@ mod tests {
         let p2 = std::path::Path::new("/x/ab2134_1234567890.12345.db");
         assert_eq!(
             parse_db_filename(p2),
-            ("ab2134".into(), Some("1234567890.12345".into()), ".db".into())
+            (
+                "ab2134".into(),
+                Some("1234567890.12345".into()),
+                ".db".into()
+            )
         );
         // make_db_file_path normalizes the epoch to Timestamp.normal
         let made = make_db_file_path(p, Some("1234567890.12345")).unwrap();
         assert_eq!(made, std::path::Path::new("/x/ab2134_1234567890.12345.db"));
-        assert_eq!(make_db_file_path(p2, None).unwrap(), std::path::Path::new("/x/ab2134.db"));
+        assert_eq!(
+            make_db_file_path(p2, None).unwrap(),
+            std::path::Path::new("/x/ab2134.db")
+        );
     }
 
     #[test]
@@ -1858,8 +1864,18 @@ mod tests {
             .unwrap();
         // put a couple of objects so max_row > 0
         for i in 0..3 {
-            b.put_object(&format!("o{i}"), "1751500001.00000", 1, "text/plain", "e", 0, 0, None, None)
-                .unwrap();
+            b.put_object(
+                &format!("o{i}"),
+                "1751500001.00000",
+                1,
+                "text/plain",
+                "e",
+                0,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
         }
         assert_eq!(b.get_db_state().unwrap(), DbState::Unsharded);
 
@@ -2010,9 +2026,10 @@ fn pct_decode(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(h), Some(l)) =
-                ((b[i + 1] as char).to_digit(16), (b[i + 2] as char).to_digit(16))
-            {
+            if let (Some(h), Some(l)) = (
+                (b[i + 1] as char).to_digit(16),
+                (b[i + 2] as char).to_digit(16),
+            ) {
                 out.push((h * 16 + l) as u8);
                 i += 3;
                 continue;
@@ -2226,8 +2243,7 @@ impl ContainerBroker {
             let mut params: Vec<rusqlite::types::Value> = Vec::new();
             let prefix_nonempty = prefix.as_deref().is_some_and(|p| !p.is_empty());
             if !end_marker.is_empty()
-                && (!prefix_nonempty
-                    || end_marker.as_str() < end_prefix.as_deref().unwrap_or(""))
+                && (!prefix_nonempty || end_marker.as_str() < end_prefix.as_deref().unwrap_or(""))
             {
                 conditions.push("name < ?".into());
                 params.push(end_marker.clone().into());
@@ -2389,11 +2405,10 @@ impl ContainerBroker {
     pub fn empty(&mut self) -> Result<bool, DbError> {
         self.commit_pending()?;
         let conn = self.conn()?;
-        let max_count: Option<i64> = conn.query_row(
-            "SELECT max(object_count) from policy_stat",
-            [],
-            |row| row.get(0),
-        )?;
+        let max_count: Option<i64> =
+            conn.query_row("SELECT max(object_count) from policy_stat", [], |row| {
+                row.get(0)
+            })?;
         Ok(matches!(max_count, None | Some(0)))
     }
 
@@ -2402,9 +2417,7 @@ impl ContainerBroker {
     ///
     /// Must use [`Self::db_files`], not the constructor `<hash>.db` path —
     /// SHARDED roots keep only `<hash>_<epoch>.db` after retiring is unlinked.
-    pub fn get_info_is_deleted(
-        &mut self,
-    ) -> Result<(Vec<(String, DbValue)>, bool), DbError> {
+    pub fn get_info_is_deleted(&mut self) -> Result<(Vec<(String, DbValue)>, bool), DbError> {
         if self.db_files().is_empty() {
             return Ok((Vec::new(), true));
         }
@@ -2428,8 +2441,8 @@ impl ContainerBroker {
             };
             matches!((parse(a), parse(b)), (Some(x), Some(y)) if x > y)
         };
-        let is_deleted = zero(&get("object_count"))
-            && newer(&get("delete_timestamp"), &get("put_timestamp"));
+        let is_deleted =
+            zero(&get("object_count")) && newer(&get("delete_timestamp"), &get("put_timestamp"));
         Ok((info, is_deleted))
     }
 
@@ -2509,7 +2522,11 @@ impl ContainerBroker {
     /// `get_sync`: the last sync point recorded for a remote id in the
     /// incoming (or outgoing) sync table, or -1.
     pub fn get_sync(&mut self, remote_id: &str, incoming: bool) -> Result<i64, DbError> {
-        let table = if incoming { "incoming_sync" } else { "outgoing_sync" };
+        let table = if incoming {
+            "incoming_sync"
+        } else {
+            "outgoing_sync"
+        };
         let conn = self.conn()?;
         conn.query_row(
             &format!("SELECT sync_point FROM {table} WHERE remote_id=?"),
@@ -2532,7 +2549,11 @@ impl ContainerBroker {
         sync_points: &[(i64, String)],
         incoming: bool,
     ) -> Result<(), DbError> {
-        let table = if incoming { "incoming_sync" } else { "outgoing_sync" };
+        let table = if incoming {
+            "incoming_sync"
+        } else {
+            "outgoing_sync"
+        };
         let conn = self.conn()?;
         for (sync_point, remote_id) in sync_points {
             let inserted = conn.execute(
@@ -2541,9 +2562,7 @@ impl ContainerBroker {
             )?;
             if inserted == 0 {
                 conn.execute(
-                    &format!(
-                        "UPDATE {table} SET sync_point=max(?, sync_point) WHERE remote_id=?"
-                    ),
+                    &format!("UPDATE {table} SET sync_point=max(?, sync_point) WHERE remote_id=?"),
                     rusqlite::params![sync_point, remote_id],
                 )?;
             }
@@ -2554,7 +2573,11 @@ impl ContainerBroker {
     /// `get_syncs` (db.py:726-745): the whole incoming (or outgoing) sync
     /// table, as the `(sync_point, remote_id)` pairs `merge_syncs` accepts.
     pub fn get_syncs(&mut self, incoming: bool) -> Result<Vec<(i64, String)>, DbError> {
-        let table = if incoming { "incoming_sync" } else { "outgoing_sync" };
+        let table = if incoming {
+            "incoming_sync"
+        } else {
+            "outgoing_sync"
+        };
         let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!("SELECT sync_point, remote_id FROM {table}"))?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;

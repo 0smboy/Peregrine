@@ -114,11 +114,7 @@ fn test_account_server_matches_python_oracle() {
                 .iter()
                 .find(|(hk, _)| hk.eq_ignore_ascii_case(k))
                 .map(|(_, v)| v.as_str());
-            assert_eq!(
-                got,
-                want.as_str(),
-                "{label}: header {k}"
-            );
+            assert_eq!(got, want.as_str(), "{label}: header {k}");
         }
         // no stray x-account-* headers the oracle didn't produce
         for (k, _) in &headers {

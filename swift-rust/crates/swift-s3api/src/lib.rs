@@ -114,9 +114,7 @@ pub mod sigv4;
 pub mod versioning_store;
 pub mod xml;
 
-pub use middleware::{
-    as_middleware, credentials_from_tempauth_users, S3Api, S3Credential,
-};
+pub use middleware::{as_middleware, credentials_from_tempauth_users, S3Api, S3Credential};
 pub use parse::{
     extract_bucket_and_key, parse_host, s3_to_swift_path, validate_bucket_name, MULTIUPLOAD_SUFFIX,
 };

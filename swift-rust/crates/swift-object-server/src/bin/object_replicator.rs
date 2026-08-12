@@ -134,7 +134,10 @@ impl SuffixHashClient for HttpSuffixHashClient {
 /// `root@<peer-ip>:<devices-root>` and rsyncs over ssh.
 enum RsyncDest {
     Local(HashMap<u32, PathBuf>),
-    Ssh { devices_root: String, ssh_opts: String },
+    Ssh {
+        devices_root: String,
+        ssh_opts: String,
+    },
 }
 
 /// Real rsync-over-Command syncer (local path or ssh).
@@ -159,7 +162,10 @@ impl SuffixSyncer for RsyncSuffixSyncer {
         let (dest, ssh): (String, Option<&str>) = match &self.dest {
             RsyncDest::Local(map) => {
                 let Some(root) = map.get(&peer.port) else {
-                    eprintln!("object-replicator: no peer_map entry for port {}", peer.port);
+                    eprintln!(
+                        "object-replicator: no peer_map entry for port {}",
+                        peer.port
+                    );
                     return false;
                 };
                 (
@@ -167,8 +173,14 @@ impl SuffixSyncer for RsyncSuffixSyncer {
                     None,
                 )
             }
-            RsyncDest::Ssh { devices_root, ssh_opts } => (
-                format!("root@{}:{devices_root}/{}/{datadir}/{partition}/", peer.ip, peer.device),
+            RsyncDest::Ssh {
+                devices_root,
+                ssh_opts,
+            } => (
+                format!(
+                    "root@{}:{devices_root}/{}/{datadir}/{partition}/",
+                    peer.ip, peer.device
+                ),
                 Some(ssh_opts.as_str()),
             ),
         };
@@ -211,8 +223,12 @@ fn main() {
             .unwrap_or_else(|| default.to_string())
     };
     let devices = get("app:object-server", "devices", "/srv/node");
-    let bind_port: u32 = get("app:object-server", "bind_port", "6010").parse().unwrap_or(6010);
-    let interval: u64 = get("object-replicator", "interval", "30").parse().unwrap_or(30);
+    let bind_port: u32 = get("app:object-server", "bind_port", "6010")
+        .parse()
+        .unwrap_or(6010);
+    let interval: u64 = get("object-replicator", "interval", "30")
+        .parse()
+        .unwrap_or(30);
     let log_name = get("object-replicator", "log_name", "object-replicator");
     let log_level = get("object-replicator", "log_level", "INFO")
         .parse::<LogLevel>()

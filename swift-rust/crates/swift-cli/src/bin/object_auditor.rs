@@ -93,12 +93,14 @@ fn run_oneshot(device: &str, policy_index: u32) {
         .as_ref()
         .and_then(|c| parse_storage_policies(c).ok())
         .and_then(|policies| {
-            policies.get_by_index_num(policy_index).map(|p| match p.ec() {
-                Some(ec) => PolicyKind::Ec {
-                    n_unique_fragments: Some(ec.ec_n_unique_fragments() as u32),
-                },
-                None => PolicyKind::Replication,
-            })
+            policies
+                .get_by_index_num(policy_index)
+                .map(|p| match p.ec() {
+                    Some(ec) => PolicyKind::Ec {
+                        n_unique_fragments: Some(ec.ec_n_unique_fragments() as u32),
+                    },
+                    None => PolicyKind::Replication,
+                })
         })
         .unwrap_or(PolicyKind::Replication);
 
@@ -127,10 +129,17 @@ fn run_daemon(conf_path: &str, run_once_only: bool) {
         .unwrap_or(30);
     let devices = conf_get(&conf, "object-auditor", "devices", "/srv/node");
     let mount_check = matches!(
-        conf_get(&conf, "object-auditor", "mount_check", "true").to_ascii_lowercase().as_str(),
+        conf_get(&conf, "object-auditor", "mount_check", "true")
+            .to_ascii_lowercase()
+            .as_str(),
         "true" | "yes" | "1" | "on"
     );
-    let recon_cache_path = conf_get(&conf, "object-auditor", "recon_cache_path", "/var/cache/swift");
+    let recon_cache_path = conf_get(
+        &conf,
+        "object-auditor",
+        "recon_cache_path",
+        "/var/cache/swift",
+    );
     let log_name = conf_get(&conf, "object-auditor", "log_name", "object-auditor");
     let log_level = conf_get(&conf, "object-auditor", "log_level", "INFO")
         .parse::<LogLevel>()
@@ -198,10 +207,7 @@ fn main() {
     }
     let first = args.remove(0);
     if Path::new(&first).is_dir() {
-        let policy_index: u32 = args
-            .first()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let policy_index: u32 = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
         run_oneshot(&first, policy_index);
         return;
     }

@@ -37,8 +37,9 @@ fn parse_conf_file(path: &str) -> SwiftConfig {
 }
 
 fn main() {
-    let conf_path =
-        std::env::args().nth(1).unwrap_or_else(|| "/etc/swift/object-server.conf".to_string());
+    let conf_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/etc/swift/object-server.conf".to_string());
     let run_once_only = std::env::args().nth(2).as_deref() == Some("once");
     let conf = parse_conf_file(&conf_path);
     let get = |section: &str, key: &str, default: &str| -> String {
@@ -50,7 +51,9 @@ fn main() {
     };
     let devices = get("app:object-server", "devices", "/srv/node");
     // Python parity: swift/obj/updater.py defaults interval to 300 seconds.
-    let interval: u64 = get("object-updater", "interval", "300").parse().unwrap_or(300);
+    let interval: u64 = get("object-updater", "interval", "300")
+        .parse()
+        .unwrap_or(300);
     // Python uses eventlet concurrency; default 10. Raise under L1b async mode
     // so the pending backlog drains faster than it accumulates.
     let concurrency: usize = get("object-updater", "concurrency", "10")
@@ -105,12 +108,8 @@ fn main() {
         if let Ok(entries) = std::fs::read_dir(&devices) {
             for e in entries.flatten() {
                 if e.path().is_dir() {
-                    let s = run_once_with_concurrency(
-                        &e.path(),
-                        &container_ring,
-                        &client,
-                        concurrency,
-                    );
+                    let s =
+                        run_once_with_concurrency(&e.path(), &container_ring, &client, concurrency);
                     ok += s.successes;
                     fail += s.failures;
                     unlink += s.unlinks + s.outdated_unlinks;
@@ -126,10 +125,8 @@ fn main() {
         statsd.update_stats("successes", ok as i64);
         statsd.update_stats("failures", fail as i64);
         statsd.update_stats("unlinks", unlink as i64);
-        let update = daemonutil::updater_recon_update(
-            sweep_start.elapsed(),
-            daemonutil::epoch_secs_now(),
-        );
+        let update =
+            daemonutil::updater_recon_update(sweep_start.elapsed(), daemonutil::epoch_secs_now());
         if let Err(e) = daemonutil::dump_recon(&recon_cache_path, "object.recon", &update) {
             logger.warning(&format!(
                 "could not dump recon cache to {recon_cache_path}/object.recon: {e}"

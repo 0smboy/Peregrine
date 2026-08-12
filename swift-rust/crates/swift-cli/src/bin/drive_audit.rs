@@ -24,7 +24,10 @@ fn main() {
         eprintln!("usage: swift-drive-audit <logfile> [error_limit]");
         std::process::exit(1);
     });
-    let limit: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let limit: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
     let contents = std::fs::read_to_string(&logfile).unwrap_or_else(|e| {
         eprintln!("cannot read {logfile}: {e}");
         std::process::exit(1);

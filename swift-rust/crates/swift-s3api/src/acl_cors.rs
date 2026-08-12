@@ -68,13 +68,7 @@ const ALL_USERS: &str = "http://acs.amazonaws.com/groups/global/AllUsers";
 const AUTH_USERS: &str = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers";
 
 /// S3 ACL permissions accepted in grant headers / ACP XML.
-pub const ACL_PERMISSIONS: &[&str] = &[
-    "FULL_CONTROL",
-    "READ",
-    "WRITE",
-    "READ_ACP",
-    "WRITE_ACP",
-];
+pub const ACL_PERMISSIONS: &[&str] = &["FULL_CONTROL", "READ", "WRITE", "READ_ACP", "WRITE_ACP"];
 
 /// Meta header holding the compact multi-rule CORS encoding.
 pub const S3_CORS_META: &str = "X-Container-Meta-S3-Cors";
@@ -510,9 +504,9 @@ fn grant_header_permission(header_lower: &str) -> Option<&'static str> {
 
 /// Whether any `x-amz-grant-*` headers are present.
 pub fn has_grant_headers(headers: &HeaderKeyDict) -> bool {
-    headers.iter().any(|(k, _)| {
-        grant_header_permission(&k.to_ascii_lowercase()).is_some()
-    })
+    headers
+        .iter()
+        .any(|(k, _)| grant_header_permission(&k.to_ascii_lowercase()).is_some())
 }
 
 /// Collect grants from `x-amz-grant-*` headers.
@@ -583,10 +577,7 @@ pub fn decode_acl_json(raw: &str) -> Option<AccessControlPolicy> {
             let Some(go) = g.as_object() else {
                 continue;
             };
-            let perm = go
-                .get("Permission")
-                .and_then(|x| x.as_str())
-                .unwrap_or("");
+            let perm = go.get("Permission").and_then(|x| x.as_str()).unwrap_or("");
             let Some(permission) = normalize_permission(perm) else {
                 continue;
             };
@@ -754,11 +745,7 @@ pub fn object_grants_allow_read(
     }
 
     // Owner always allowed.
-    if principal_matches(
-        &policy.owner_id,
-        principal_access_key,
-        principal_account,
-    ) {
+    if principal_matches(&policy.owner_id, principal_access_key, principal_account) {
         return Some(true);
     }
 
@@ -867,12 +854,7 @@ pub fn object_grants_allow_write(
     principal_access_key: &str,
     principal_account: &str,
 ) -> Option<bool> {
-    object_grants_allow_write_with_iam(
-        headers,
-        principal_access_key,
-        principal_account,
-        None,
-    )
+    object_grants_allow_write_with_iam(headers, principal_access_key, principal_account, None)
 }
 
 pub fn object_grants_allow_write_with_iam(
@@ -1285,10 +1267,7 @@ pub fn cors_to_swift_headers(headers: &mut HeaderKeyDict, rule: &CorsRule) {
         );
     }
     if let Some(age) = rule.max_age {
-        headers.set(
-            "X-Container-Meta-Access-Control-Max-Age",
-            age.to_string(),
-        );
+        headers.set("X-Container-Meta-Access-Control-Max-Age", age.to_string());
     }
 }
 
@@ -1383,10 +1362,7 @@ mod tests {
     fn apply_canned_public_read_write() {
         let mut h = HeaderKeyDict::new();
         apply_canned_acl(&mut h, "public-read-write");
-        assert_eq!(
-            h.get("X-Container-Read"),
-            Some(".r:*,.rlistings")
-        );
+        assert_eq!(h.get("X-Container-Read"), Some(".r:*,.rlistings"));
         assert_eq!(h.get("X-Container-Write"), Some(".r:*"));
     }
 
@@ -1394,10 +1370,7 @@ mod tests {
     fn apply_canned_public_read() {
         let mut h = HeaderKeyDict::new();
         apply_canned_acl(&mut h, "public-read");
-        assert_eq!(
-            h.get("X-Container-Read"),
-            Some(".r:*,.rlistings")
-        );
+        assert_eq!(h.get("X-Container-Read"), Some(".r:*,.rlistings"));
         assert_eq!(h.get("X-Container-Write"), Some(""));
     }
 
@@ -1441,14 +1414,8 @@ mod tests {
         assert_eq!(normalize_object_canned_acl("private"), "private");
         assert_eq!(normalize_object_canned_acl(""), "private");
         assert_eq!(normalize_object_canned_acl("public-read"), "public-read");
-        assert_eq!(
-            normalize_object_canned_acl("bucket-owner-read"),
-            "private"
-        );
-        assert_eq!(
-            normalize_object_canned_acl("authenticated-read"),
-            "private"
-        );
+        assert_eq!(normalize_object_canned_acl("bucket-owner-read"), "private");
+        assert_eq!(normalize_object_canned_acl("authenticated-read"), "private");
 
         let mut h = HeaderKeyDict::new();
         apply_object_canned_acl(&mut h, "public-read");
@@ -1456,7 +1423,8 @@ mod tests {
         // Must not stamp container ACL headers on objects.
         assert!(h.get("X-Container-Read").is_none());
 
-        let xml = String::from_utf8(object_acl_xml_from_meta("owner", Some("public-read"))).unwrap();
+        let xml =
+            String::from_utf8(object_acl_xml_from_meta("owner", Some("public-read"))).unwrap();
         assert!(xml.contains(ALL_USERS));
         assert!(xml.contains("<Permission>READ</Permission>"));
         assert!(!xml.contains("<Permission>WRITE</Permission>"));
@@ -1466,10 +1434,14 @@ mod tests {
         assert!(!priv_xml.contains(ALL_USERS));
 
         assert!(object_canned_allows_anonymous_read(Some("public-read")));
-        assert!(object_canned_allows_anonymous_read(Some("public-read-write")));
+        assert!(object_canned_allows_anonymous_read(Some(
+            "public-read-write"
+        )));
         assert!(!object_canned_allows_anonymous_read(Some("private")));
         assert!(!object_canned_allows_anonymous_read(None));
-        assert!(!object_canned_allows_anonymous_read(Some("authenticated-read")));
+        assert!(!object_canned_allows_anonymous_read(Some(
+            "authenticated-read"
+        )));
     }
 
     #[test]
@@ -1673,10 +1645,7 @@ mod tests {
         };
         let mut out = HeaderKeyDict::new();
         apply_bucket_acl_policy(&mut out, &policy);
-        assert_eq!(
-            out.get("X-Container-Read"),
-            Some(".r:*,.rlistings")
-        );
+        assert_eq!(out.get("X-Container-Read"), Some(".r:*,.rlistings"));
         assert_eq!(out.get("X-Container-Write"), Some(""));
         assert!(out
             .get(S3_BUCKET_ACL_JSON_META)
@@ -1708,7 +1677,9 @@ mod tests {
         .unwrap();
         let mut h = HeaderKeyDict::new();
         apply_object_acl_policy(&mut h, &policy);
-        assert!(h.get(S3_OBJECT_ACL_JSON_META).is_some_and(|v| !v.is_empty()));
+        assert!(h
+            .get(S3_OBJECT_ACL_JSON_META)
+            .is_some_and(|v| !v.is_empty()));
         assert_eq!(h.get(S3_OBJECT_ACL_META), Some(""));
 
         let xml = String::from_utf8(object_acl_xml_from_headers("o", &h)).unwrap();
@@ -1749,10 +1720,7 @@ mod tests {
     #[test]
     fn resolve_grant_headers_to_policy() {
         let mut h = HeaderKeyDict::new();
-        h.set(
-            "x-amz-grant-full-control",
-            "id=owner",
-        );
+        h.set("x-amz-grant-full-control", "id=owner");
         h.set(
             "x-amz-grant-read",
             "uri=http://acs.amazonaws.com/groups/global/AllUsers",
@@ -1772,18 +1740,12 @@ mod tests {
     fn object_grants_allow_read_enforcement_matrix() {
         // Missing JSON → no enforcement.
         let empty = HeaderKeyDict::new();
-        assert_eq!(
-            object_grants_allow_read(&empty, "foreign", "AUTH_x"),
-            None
-        );
+        assert_eq!(object_grants_allow_read(&empty, "foreign", "AUTH_x"), None);
         assert!(!object_acl_denies_read(&empty, "foreign", "AUTH_x"));
 
         // Empty grants → no enforcement.
         let mut h_empty_grants = HeaderKeyDict::new();
-        h_empty_grants.set(
-            S3_OBJECT_ACL_JSON_META,
-            r#"{"Owner":"owner","Grant":[]}"#,
-        );
+        h_empty_grants.set(S3_OBJECT_ACL_JSON_META, r#"{"Owner":"owner","Grant":[]}"#);
         assert_eq!(
             object_grants_allow_read(&h_empty_grants, "foreign", "AUTH_x"),
             None

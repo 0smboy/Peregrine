@@ -68,8 +68,8 @@ pub fn get_sig(
     realm_key: &str,
     user_key: &str,
 ) -> String {
-    let mut mac = HmacSha1::new_from_slice(realm_key.as_bytes())
-        .expect("HMAC accepts a key of any length");
+    let mut mac =
+        HmacSha1::new_from_slice(realm_key.as_bytes()).expect("HMAC accepts a key of any length");
     let msg = format!("{request_method}\n{path}\n{x_timestamp}\n{nonce}\n{user_key}");
     mac.update(msg.as_bytes());
     let digest = mac.finalize().into_bytes();
@@ -138,9 +138,7 @@ impl ContainerSyncRealms {
             } else if k == "key2" {
                 entry.key2 = Some(v);
             } else if let Some(cluster) = k.strip_prefix("cluster_") {
-                entry
-                    .clusters
-                    .insert(cluster.to_ascii_uppercase(), v);
+                entry.clusters.insert(cluster.to_ascii_uppercase(), v);
             }
         }
         ContainerSyncRealms { realms }
@@ -198,10 +196,7 @@ impl ContainerSyncRealms {
                 }
                 clusters.insert(c.clone(), serde_json::Value::Object(entry));
             }
-            dct.insert(
-                realm.clone(),
-                serde_json::json!({ "clusters": clusters }),
-            );
+            dct.insert(realm.clone(), serde_json::json!({ "clusters": clusters }));
         }
         serde_json::Value::Object(dct)
     }
@@ -240,9 +235,9 @@ pub fn validate_sync_to(
             .key(realm)
             .ok_or_else(|| format!("No realm key for {realm:?}"))?
             .to_string();
-        let endpoint = realms.endpoint(realm, cluster).ok_or_else(|| {
-            format!("No cluster endpoint for {realm:?} {cluster:?}")
-        })?;
+        let endpoint = realms
+            .endpoint(realm, cluster)
+            .ok_or_else(|| format!("No cluster endpoint for {realm:?} {cluster:?}"))?;
         return Ok(Some(ValidatedSyncTo {
             endpoint: format!(
                 "{}/{}/{}",
@@ -274,10 +269,7 @@ pub fn validate_sync_to(
         .map(|(h, p)| (h, format!("/{p}")))
         .ok_or_else(|| "Path required in X-Container-Sync-To".to_string())?;
     if path.contains('?') || path.contains('#') || path.contains(';') {
-        return Err(
-            "Params, queries, and fragments not allowed in X-Container-Sync-To"
-                .into(),
-        );
+        return Err("Params, queries, and fragments not allowed in X-Container-Sync-To".into());
     }
     let hostname = hostport
         .split(':')
@@ -286,9 +278,7 @@ pub fn validate_sync_to(
         .trim_start_matches('[')
         .trim_end_matches(']');
     if !allowed_sync_hosts.iter().any(|h| h == hostname) {
-        return Err(format!(
-            "Invalid host {hostname:?} in X-Container-Sync-To"
-        ));
+        return Err(format!("Invalid host {hostname:?} in X-Container-Sync-To"));
     }
     Ok(Some(ValidatedSyncTo {
         endpoint: format!("{scheme}://{hostport}{path}"),
@@ -579,11 +569,7 @@ pub fn build_sync_headers(
     let mut headers: Vec<(String, String)> = vec![("x-timestamp".into(), x_timestamp.into())];
     headers.extend(extra.iter().cloned());
     if let (Some(realm), Some(realm_key)) = (realm, realm_key) {
-        let path = format!(
-            "{}/{}",
-            url_path(sync_to),
-            percent_encode_path(object_name)
-        );
+        let path = format!("{}/{}", url_path(sync_to), percent_encode_path(object_name));
         let sig = get_sig(method, &path, x_timestamp, nonce, realm_key, user_key);
         headers.push((
             "x-container-sync-auth".into(),
@@ -682,7 +668,8 @@ pub fn build_tls_connector(opts: &TlsOptions) -> Result<native_tls::TlsConnector
         builder.danger_accept_invalid_hostnames(true);
     }
     if let Some(path) = &opts.ssl_ca_file {
-        let pem = std::fs::read(path).map_err(|e| format!("ssl_ca_file read {}: {e}", path.display()))?;
+        let pem =
+            std::fs::read(path).map_err(|e| format!("ssl_ca_file read {}: {e}", path.display()))?;
         let cert = native_tls::Certificate::from_pem(&pem)
             .map_err(|e| format!("ssl_ca_file parse {}: {e}", path.display()))?;
         builder.add_root_certificate(cert);
@@ -824,14 +811,8 @@ impl SyncClient for HttpSyncClient {
                     &nonce,
                     &[],
                 );
-                let status = http_request_with_tls(
-                    "DELETE",
-                    &url,
-                    &headers,
-                    &[],
-                    self.timeout,
-                    &self.tls,
-                );
+                let status =
+                    http_request_with_tls("DELETE", &url, &headers, &[], self.timeout, &self.tls);
                 // Python treats 404/409 as success for DELETE.
                 matches!(status, 200..=299 | 404 | 409)
             }
@@ -897,14 +878,8 @@ impl SyncClient for HttpSyncClient {
                     &nonce,
                     &extra,
                 );
-                let status = http_request_with_tls(
-                    "PUT",
-                    &url,
-                    &headers,
-                    &body,
-                    self.timeout,
-                    &self.tls,
-                );
+                let status =
+                    http_request_with_tls("PUT", &url, &headers, &body, self.timeout, &self.tls);
                 (200..300).contains(&status)
             }
         }
@@ -1242,10 +1217,7 @@ impl Default for ContainerSyncConfig {
 
 impl ContainerSyncConfig {
     /// Load from a parsed conf: `[container-sync]` with DEFAULT fallbacks.
-    pub fn from_swift_conf(
-        conf: &swift_core::config::SwiftConfig,
-        swift_dir: &str,
-    ) -> Self {
+    pub fn from_swift_conf(conf: &swift_core::config::SwiftConfig, swift_dir: &str) -> Self {
         let get = |section: &str, key: &str, default: &str| -> String {
             conf.get(section, key)
                 .ok()
@@ -1513,7 +1485,9 @@ cluster_c1 = http://127.0.0.1:8080/v1/
             "n",
             &[],
         );
-        assert!(h2.iter().any(|(k, v)| k == "x-container-sync-key" && v == "uk"));
+        assert!(h2
+            .iter()
+            .any(|(k, v)| k == "x-container-sync-key" && v == "uk"));
     }
 
     #[test]
@@ -1566,10 +1540,7 @@ cluster_c1 = http://127.0.0.1:8080/v1/
                     "X-Container-Sync-To".into(),
                     ("http://127.0.0.1:9/v1/dst/c".into(), ts.into()),
                 ),
-                (
-                    "X-Container-Sync-Key".into(),
-                    ("secret".into(), ts.into()),
-                ),
+                ("X-Container-Sync-Key".into(), ("secret".into(), ts.into())),
             ])
             .unwrap();
         for (i, name) in ["o1", "o2", "o3"].iter().enumerate() {
@@ -1636,22 +1607,19 @@ cluster_west = http://west/v1/
 
     #[test]
     fn test_parse_http_url_scheme_and_ports() {
-        let (h, p, path, tls) =
-            parse_http_url("https://sync.example.com/v1/a/c/obj").unwrap();
+        let (h, p, path, tls) = parse_http_url("https://sync.example.com/v1/a/c/obj").unwrap();
         assert_eq!(h, "sync.example.com");
         assert_eq!(p, 443);
         assert_eq!(path, "/v1/a/c/obj");
         assert!(tls);
 
-        let (h, p, path, tls) =
-            parse_http_url("http://sync.example.com/v1/a/c").unwrap();
+        let (h, p, path, tls) = parse_http_url("http://sync.example.com/v1/a/c").unwrap();
         assert_eq!(h, "sync.example.com");
         assert_eq!(p, 80);
         assert_eq!(path, "/v1/a/c");
         assert!(!tls);
 
-        let (h, p, _, tls) =
-            parse_http_url("https://sync.example.com:8443/v1/a").unwrap();
+        let (h, p, _, tls) = parse_http_url("https://sync.example.com:8443/v1/a").unwrap();
         assert_eq!(h, "sync.example.com");
         assert_eq!(p, 8443);
         assert!(tls);

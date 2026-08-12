@@ -20,7 +20,9 @@
 //! own parser).
 
 use swift_http::{HeaderKeyDict, Request};
-use swift_object_server::{ContainerUpdateMode, iter_async_pendings, ObjectServer, ObjectServerConfig, UpdaterStats};
+use swift_object_server::{
+    iter_async_pendings, ContainerUpdateMode, ObjectServer, ObjectServerConfig, UpdaterStats,
+};
 
 fn config(devices: &std::path::Path) -> ObjectServerConfig {
     ObjectServerConfig {
@@ -29,10 +31,7 @@ fn config(devices: &std::path::Path) -> ObjectServerConfig {
         hash_config: swift_core::hashing::HashPathConfig::new(b"".to_vec(), b"changeme".to_vec())
             .unwrap(),
         diskfile: swift_diskfile::DiskFileConfig::default(),
-        policies: std::collections::HashMap::from([(
-            0,
-            swift_diskfile::PolicyKind::Replication,
-        )]),
+        policies: std::collections::HashMap::from([(0, swift_diskfile::PolicyKind::Replication)]),
         container_update_timeout: std::time::Duration::from_secs(1),
         container_update_mode: swift_object_server::ContainerUpdateMode::Sync,
     }
@@ -73,7 +72,10 @@ fn test_put_without_container_hosts_writes_async_pending() {
     assert_eq!(u.obj, "o");
     // the update headers were carried (x-size / x-timestamp), case-insensitively
     // (HeaderKeyDict title-cases keys, as Python's does)
-    assert!(u.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-size")));
+    assert!(u
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("x-size")));
     assert!(u
         .headers
         .iter()

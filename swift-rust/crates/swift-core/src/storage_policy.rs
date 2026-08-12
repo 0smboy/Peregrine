@@ -244,17 +244,8 @@ impl StoragePolicy {
                 )));
             }
             let parse_positive = |value: Option<&str>, what: &str| -> Result<u64, PolicyError> {
-                let fail = || {
-                    PolicyError::for_index(
-                        format!("Invalid {what} {value:?}"),
-                        idx,
-                    )
-                };
-                let v: i64 = value
-                    .ok_or_else(fail)?
-                    .trim()
-                    .parse()
-                    .map_err(|_| fail())?;
+                let fail = || PolicyError::for_index(format!("Invalid {what} {value:?}"), idx);
+                let v: i64 = value.ok_or_else(fail)?.trim().parse().map_err(|_| fail())?;
                 if v <= 0 {
                     return Err(fail());
                 }
@@ -269,13 +260,16 @@ impl StoragePolicy {
             };
             let ec_duplication_factor = match get("ec_duplication_factor") {
                 None => 1,
-                Some(v) => v.trim().parse::<i64>().ok().filter(|&n| n >= 1).ok_or_else(
-                    || {
+                Some(v) => v
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|&n| n >= 1)
+                    .ok_or_else(|| {
                         PolicyError::new(format!(
                             "Config option must be an positive int number, not \"{v}\"."
                         ))
-                    },
-                )? as u64,
+                    })? as u64,
             };
             PolicySpecifics::ErasureCoding(ECPolicyConfig {
                 ec_type,
@@ -293,7 +287,9 @@ impl StoragePolicy {
             alias_list: Vec::new(),
             is_default: get("default").is_some_and(config_true_value),
             is_deprecated: get("deprecated").is_some_and(config_true_value),
-            diskfile_module: get("diskfile_module").unwrap_or(default_diskfile).to_string(),
+            diskfile_module: get("diskfile_module")
+                .unwrap_or(default_diskfile)
+                .to_string(),
             ring_name: get_zero_indexed_base_string("object", idx),
             specifics,
         };
@@ -463,8 +459,7 @@ impl StoragePolicy {
         match &self.specifics {
             PolicySpecifics::Replication => quorum_size(replica_count),
             PolicySpecifics::ErasureCoding(ec) => {
-                (ec.ec_ndata + min_parity_fragments_needed(&ec.ec_type))
-                    * ec.ec_duplication_factor
+                (ec.ec_ndata + min_parity_fragments_needed(&ec.ec_type)) * ec.ec_duplication_factor
             }
         }
     }
@@ -491,8 +486,7 @@ impl StoragePolicy {
     /// Backend fragment index for a node index (Python
     /// `get_backend_index`); `None` for replication policies.
     pub fn get_backend_index(&self, node_index: u64) -> Option<u64> {
-        self.ec()
-            .map(|ec| node_index % ec.ec_n_unique_fragments())
+        self.ec().map(|ec| node_index % ec.ec_n_unique_fragments())
     }
 }
 
@@ -525,11 +519,10 @@ impl StoragePolicyCollection {
                 )));
             }
             for name in &policy.alias_list {
-                if let Some(existing) = validated.iter().find(|p| {
-                    p.alias_list
-                        .iter()
-                        .any(|n| n.eq_ignore_ascii_case(name))
-                }) {
+                if let Some(existing) = validated
+                    .iter()
+                    .find(|p| p.alias_list.iter().any(|n| n.eq_ignore_ascii_case(name)))
+                {
                     return Err(PolicyError::new(format!(
                         "Duplicate name {} conflicts with policy {}",
                         name, existing.idx
@@ -605,11 +598,9 @@ impl StoragePolicyCollection {
 
     /// Find a policy by name or alias (case-insensitive).
     pub fn get_by_name(&self, name: &str) -> Option<&StoragePolicy> {
-        self.policies.iter().find(|p| {
-            p.alias_list
-                .iter()
-                .any(|n| n.eq_ignore_ascii_case(name))
-        })
+        self.policies
+            .iter()
+            .find(|p| p.alias_list.iter().any(|n| n.eq_ignore_ascii_case(name)))
     }
 
     /// Find a policy by numeric index.
@@ -687,10 +678,7 @@ impl StoragePolicyCollection {
         };
         let policy = self.get_by_index(policy_index);
         // round-trip check: the reconstructed string must match
-        let reconstructed = get_zero_indexed_base_string(
-            base,
-            policy.map_or(0, |p| p.idx),
-        );
+        let reconstructed = get_zero_indexed_base_string(base, policy.map_or(0, |p| p.idx));
         if policy.is_none() || reconstructed != policy_string {
             return Err(unknown());
         }
@@ -715,9 +703,7 @@ impl StoragePolicyCollection {
                 .policies
                 .iter_mut()
                 .find(|p| p.idx == policy_index)
-                .ok_or_else(|| {
-                    PolicyError::new(format!("No policy with index {policy_index}"))
-                })?;
+                .ok_or_else(|| PolicyError::new(format!("No policy with index {policy_index}")))?;
             policy.add_name(alias)?;
         }
         Ok(())
@@ -727,11 +713,11 @@ impl StoragePolicyCollection {
     /// a primary name is removed the next alias becomes primary.
     pub fn remove_policy_alias(&mut self, aliases: &[&str]) -> Result<(), PolicyError> {
         for alias in aliases {
-            let Some(pos) = self.policies.iter().position(|p| {
-                p.alias_list
-                    .iter()
-                    .any(|n| n.eq_ignore_ascii_case(alias))
-            }) else {
+            let Some(pos) = self
+                .policies
+                .iter()
+                .position(|p| p.alias_list.iter().any(|n| n.eq_ignore_ascii_case(alias)))
+            else {
                 return Err(PolicyError::new(format!(
                     "No policy with name {alias} exists."
                 )));
@@ -777,9 +763,7 @@ impl StoragePolicyCollection {
 /// `parse_storage_policies`). Remember that Python reads `swift.conf`
 /// with `strict=False`; use [`SwiftConfig::parse_lenient`] /
 /// [`SwiftConfig::read_path_lenient`] for full fidelity.
-pub fn parse_storage_policies(
-    conf: &SwiftConfig,
-) -> Result<StoragePolicyCollection, PolicyError> {
+pub fn parse_storage_policies(conf: &SwiftConfig) -> Result<StoragePolicyCollection, PolicyError> {
     let mut policies = Vec::new();
     for section in conf.section_names() {
         let Some(policy_index) = section.strip_prefix("storage-policy:") else {
@@ -1014,36 +998,40 @@ ec_num_parity_fragments = 3
         .0
         .contains("Duplicate default"));
         // no default among multiple policies
-        assert!(collection(
-            "[storage-policy:0]\nname = a\n[storage-policy:1]\nname = b\n"
-        )
-        .unwrap_err()
-        .0
-        .contains("Unable to find default"));
+        assert!(
+            collection("[storage-policy:0]\nname = a\n[storage-policy:1]\nname = b\n")
+                .unwrap_err()
+                .0
+                .contains("Unable to find default")
+        );
         // missing policy 0 with other policies defined
-        assert!(collection("[storage-policy:1]\nname = one\ndefault = yes\n")
-            .unwrap_err()
-            .0
-            .contains("policy index 0"));
+        assert!(
+            collection("[storage-policy:1]\nname = one\ndefault = yes\n")
+                .unwrap_err()
+                .0
+                .contains("policy index 0")
+        );
         // all deprecated
-        assert!(collection(
-            "[storage-policy:0]\nname = a\ndeprecated = yes\n"
-        )
-        .unwrap_err()
-        .0
-        .contains("not deprecated"));
+        assert!(
+            collection("[storage-policy:0]\nname = a\ndeprecated = yes\n")
+                .unwrap_err()
+                .0
+                .contains("not deprecated")
+        );
         // deprecated default
-        assert!(collection(
-            "[storage-policy:0]\nname = a\ndefault = yes\ndeprecated = yes\n"
-        )
-        .unwrap_err()
-        .0
-        .contains("Deprecated policy can not be default"));
+        assert!(
+            collection("[storage-policy:0]\nname = a\ndefault = yes\ndeprecated = yes\n")
+                .unwrap_err()
+                .0
+                .contains("Deprecated policy can not be default")
+        );
         // bad name characters
-        assert!(collection("[storage-policy:0]\nname = spaces not allowed\n")
-            .unwrap_err()
-            .0
-            .contains("Invalid name"));
+        assert!(
+            collection("[storage-policy:0]\nname = spaces not allowed\n")
+                .unwrap_err()
+                .0
+                .contains("Invalid name")
+        );
         // Policy-0 reserved for index 0
         assert!(collection(
             "[storage-policy:0]\nname = zero\ndefault = yes\n\
@@ -1063,12 +1051,12 @@ ec_num_parity_fragments = 3
             .0
             .contains("Invalid option"));
         // unknown policy type
-        assert!(collection(
-            "[storage-policy:0]\nname = a\npolicy_type = lazy\n"
-        )
-        .unwrap_err()
-        .0
-        .contains("Invalid type"));
+        assert!(
+            collection("[storage-policy:0]\nname = a\npolicy_type = lazy\n")
+                .unwrap_err()
+                .0
+                .contains("Invalid type")
+        );
         // EC option on a replication policy is invalid
         assert!(collection("[storage-policy:0]\nname = a\nec_type = rs\n")
             .unwrap_err()
@@ -1160,10 +1148,8 @@ ec_num_parity_fragments = 3
     fn test_lenient_duplicate_sections() {
         // Python reads swift.conf with strict=False: duplicate options
         // take the last value
-        let c = collection(
-            "[storage-policy:0]\nname = zero\nname = zilch\ndefault = yes\n",
-        )
-        .unwrap();
+        let c =
+            collection("[storage-policy:0]\nname = zero\nname = zilch\ndefault = yes\n").unwrap();
         assert_eq!(c.get_by_index_num(0).unwrap().name(), "zilch");
     }
 }

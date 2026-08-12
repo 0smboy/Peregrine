@@ -23,9 +23,7 @@ use swift_object_server::reconstructor::{
     build_part_jobs, process_part_job, EcJobType, EcSsyncStats, HttpSuffixHashFetcher,
     TcpSsyncPusher,
 };
-use swift_object_server::ssync_sender::{
-    Sender, SsyncJob, SsyncNode, SsyncWire, TcpSsyncWire,
-};
+use swift_object_server::ssync_sender::{Sender, SsyncJob, SsyncNode, SsyncWire, TcpSsyncWire};
 use swift_object_server::{ContainerUpdateMode, ObjectServer, ObjectServerConfig};
 use swift_ring::{Ring, RingData, RingDevice};
 
@@ -67,10 +65,7 @@ fn ec_kind() -> PolicyKind {
 }
 
 fn object_server(devices: &Path) -> ObjectServer {
-    let policies = HashMap::from([
-        (0, PolicyKind::Replication),
-        (EC_POLICY, ec_kind()),
-    ]);
+    let policies = HashMap::from([(0, PolicyKind::Replication), (EC_POLICY, ec_kind())]);
     ObjectServer::new(ObjectServerConfig {
         devices: devices.to_path_buf(),
         mount_check: false,
@@ -206,8 +201,13 @@ fn connect(address: SocketAddr, partition: u64, frag_index: Option<i64>) -> TcpS
         policy: ec_kind(),
         frag_index,
     };
-    TcpSsyncWire::connect(&node, &job, std::time::Duration::from_secs(5),
-        std::time::Duration::from_secs(10)).expect("connect")
+    TcpSsyncWire::connect(
+        &node,
+        &job,
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(10),
+    )
+    .expect("connect")
 }
 
 #[test]
@@ -280,8 +280,10 @@ fn duplex_ec_frag_index_missing_check_and_fragment_puts_over_a_real_socket() {
     //    must land as <ts>#3.data.
     let mut wire = connect(address, partition, Some(3));
     wire.send(&chunk(b":MISSING_CHECK: START\r\n")).unwrap();
-    wire.send(&chunk(format!("{object_hash} {ts} durable:False\r\n").as_bytes()))
-        .unwrap();
+    wire.send(&chunk(
+        format!("{object_hash} {ts} durable:False\r\n").as_bytes(),
+    ))
+    .unwrap();
     wire.send(&chunk(b":MISSING_CHECK: END\r\n")).unwrap();
     let lines = read_until(&mut wire, b":MISSING_CHECK: END");
     assert!(
@@ -420,7 +422,13 @@ fn rust_sender_moves_a_fragment_to_the_rust_receiver() {
     assert!(report.can_delete_objs.contains_key(&object_hash));
     assert_eq!(
         report.send_map,
-        vec![(object_hash, swift_object_server::ssync_sender::Wanted { data: true, meta: true })]
+        vec![(
+            object_hash,
+            swift_object_server::ssync_sender::Wanted {
+                data: true,
+                meta: true
+            }
+        )]
     );
     // The fragment arrived durable and byte-identical.
     let dir = hash_dir(&dest.root, partition, "obj");
@@ -484,7 +492,11 @@ fn reconstructor_revert_moves_a_handoff_fragment_and_purges_it() {
         .map(|i| {
             Some(dev(
                 i,
-                if i == 2 { address.port() as u32 } else { 1 + i as u32 },
+                if i == 2 {
+                    address.port() as u32
+                } else {
+                    1 + i as u32
+                },
             ))
         })
         .collect();
@@ -596,7 +608,14 @@ fn sync_job_rebuilds_the_fragment_at_the_receivers_index() {
     let partition = 9;
     let ts = "1700000600.00000";
     // The local participating fragment is index 1; the receiver wants 4.
-    put_fragment(&object_server(&source.root), partition, "obj", ts, 1, b"local-frag-index-1");
+    put_fragment(
+        &object_server(&source.root),
+        partition,
+        "obj",
+        ts,
+        1,
+        b"local-frag-index-1",
+    );
     let address = spawn_server(&dest.root);
     let hc = hash_config();
     let cfg = DiskFileConfig::default();
@@ -681,7 +700,14 @@ fn suffix_delta_fires_against_an_emptied_victim_partition() {
     let victim = TestTree::new("delta-victim");
     let partition = 89;
     let ts = "1700000700.00000";
-    put_fragment(&object_server(&partner.root), partition, "obj", ts, 3, b"partner frag 3");
+    put_fragment(
+        &object_server(&partner.root),
+        partition,
+        "obj",
+        ts,
+        3,
+        b"partner frag 3",
+    );
     // Victim: same object existed and was lost — partition dir exists with
     // empty suffix remains after invalidation/cleanup.
     let vict_server = object_server(&victim.root);
@@ -721,7 +747,13 @@ fn suffix_delta_fires_against_an_emptied_victim_partition() {
         &HttpSuffixHashFetcher::default(),
     )
     .expect("delta must not error");
-    let object_hash = hash_config().hash_path("a", Some("c"), Some("obj")).unwrap();
+    let object_hash = hash_config()
+        .hash_path("a", Some("c"), Some("obj"))
+        .unwrap();
     let suffix = object_hash[object_hash.len() - 3..].to_string();
-    assert_eq!(suffixes, vec![suffix], "the lost fragment's suffix must be flagged");
+    assert_eq!(
+        suffixes,
+        vec![suffix],
+        "the lost fragment's suffix must be flagged"
+    );
 }

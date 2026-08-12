@@ -194,9 +194,7 @@ pub fn get_ondisk_files(
         if !metas.is_empty() {
             results.meta_info = Some(metas[0].clone());
             let ctype_info = metas.pop().unwrap();
-            if ctype_info.ctype_timestamp
-                > results.data_info.as_ref().map(|i| i.timestamp)
-            {
+            if ctype_info.ctype_timestamp > results.data_info.as_ref().map(|i| i.timestamp) {
                 results.ctype_info = Some(ctype_info.clone());
             }
             metas.push(ctype_info);
@@ -417,8 +415,8 @@ fn verify_ondisk_files(
             if !base_ok {
                 return false;
             }
-            let have_durable = results.durable_frag_set_ts.is_some()
-                || (data && frag_prefs.is_some());
+            let have_durable =
+                results.durable_frag_set_ts.is_some() || (data && frag_prefs.is_some());
             data == have_durable
         }
     }

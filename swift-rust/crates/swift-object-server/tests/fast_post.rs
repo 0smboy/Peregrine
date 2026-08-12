@@ -22,8 +22,9 @@
 
 use swift_diskfile::{DiskFileConfig, MetaValue, Metadata, PolicyKind};
 use swift_http::{HeaderKeyDict, Request, Response};
-use swift_object_server::{ContainerUpdateMode, 
-    iter_async_pendings, AsyncUpdate, ObjectServer, ObjectServerConfig, UpdaterStats,
+use swift_object_server::{
+    iter_async_pendings, AsyncUpdate, ContainerUpdateMode, ObjectServer, ObjectServerConfig,
+    UpdaterStats,
 };
 
 const T0: &str = "1751500000.00000";
@@ -38,10 +39,7 @@ fn config(devices: &std::path::Path) -> ObjectServerConfig {
         hash_config: swift_core::hashing::HashPathConfig::new(b"".to_vec(), b"changeme".to_vec())
             .unwrap(),
         diskfile: swift_diskfile::DiskFileConfig::default(),
-        policies: std::collections::HashMap::from([(
-            0,
-            swift_diskfile::PolicyKind::Replication,
-        )]),
+        policies: std::collections::HashMap::from([(0, swift_diskfile::PolicyKind::Replication)]),
         container_update_timeout: std::time::Duration::from_secs(1),
         container_update_mode: ContainerUpdateMode::Sync,
     }
@@ -152,7 +150,10 @@ fn test_post_without_content_type_keeps_original_ctype_timestamp() {
     assert_eq!(o.timestamp().unwrap().internal(), T2);
     assert_eq!(o.content_type().unwrap(), Some("text/plain"));
     assert_eq!(o.content_type_timestamp().unwrap().internal(), T0);
-    assert_eq!(meta(o.get_metadata().unwrap(), "X-Object-Meta-Color"), Some("red"));
+    assert_eq!(
+        meta(o.get_metadata().unwrap(), "X-Object-Meta-Color"),
+        Some("red")
+    );
     assert_eq!(
         meta(o.get_metafile_metadata().unwrap().unwrap(), "Content-Type"),
         None,
@@ -240,17 +241,26 @@ fn test_409_only_when_both_timestamps_are_stale() {
     assert_eq!(resp.headers.get("X-Backend-Timestamp"), Some(T0));
     // equal meta timestamp and a content-type implicitly stamped with that
     // same timestamp: still both older-or-equal -> 409
-    assert_eq!(post(&server, T0, &[("Content-Type", "text/x-any")]).status, 409);
+    assert_eq!(
+        post(&server, T0, &[("Content-Type", "text/x-any")]).status,
+        409
+    );
 
     // set up a .meta at t1
-    assert_eq!(post(&server, T1, &[("X-Object-Meta-Color", "red")]).status, 202);
+    assert_eq!(
+        post(&server, T1, &[("X-Object-Meta-Color", "red")]).status,
+        202
+    );
     // equal meta timestamp BUT a newer explicit content-type timestamp: NOT a
     // conflict — only the content-type is applied, the .meta metadata is
     // preserved verbatim (server.py 703-707, 731-748)
     let resp = post(
         &server,
         T1,
-        &[("Content-Type", "text/x-new"), ("Content-Type-Timestamp", T2)],
+        &[
+            ("Content-Type", "text/x-new"),
+            ("Content-Type-Timestamp", T2),
+        ],
     );
     assert_eq!(resp.status, 202);
 

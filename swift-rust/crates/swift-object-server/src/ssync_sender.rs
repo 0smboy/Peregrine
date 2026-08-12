@@ -32,8 +32,7 @@ use swift_core::hashing::HashPathConfig;
 use swift_core::timestamp::Timestamp;
 use swift_diskfile::{
     get_data_dir, get_ondisk_files, storage_directory, DiskFile, DiskFileConfig, DiskFileError,
-    Metadata,
-    FragPref, MetaValue, PolicyKind,
+    FragPref, MetaValue, Metadata, PolicyKind,
 };
 
 use crate::percent_encode;
@@ -219,7 +218,10 @@ impl TcpSsyncWire {
                 break;
             }
             if let Some((name, value)) = line.split_once(':') {
-                if name.trim().eq_ignore_ascii_case("x-backend-accept-no-commit") {
+                if name
+                    .trim()
+                    .eq_ignore_ascii_case("x-backend-accept-no-commit")
+                {
                     accept_no_commit = config_true_value(value.trim());
                 }
             }
@@ -385,10 +387,7 @@ impl Sender<'_> {
 
     /// `DiskFileManager.yield_hashes`: (hash, timestamps) for each object in
     /// the given suffixes that matches the job's frag index.
-    fn yield_local_hashes(
-        &self,
-        include_non_durable: bool,
-    ) -> Vec<(String, ObjectTimestamps)> {
+    fn yield_local_hashes(&self, include_non_durable: bool) -> Vec<(String, ObjectTimestamps)> {
         let partition_path = self.partition_path();
         let suffixes: Vec<String> = match self.suffixes {
             Some(list) => list.to_vec(),
@@ -625,13 +624,11 @@ impl Sender<'_> {
                             .durable_timestamp()
                             .ok()
                             .flatten()
-                            .is_some_and(|durable_ts| {
-                                df.data_timestamp().ok() == Some(durable_ts)
-                            });
+                            .is_some_and(|durable_ts| df.data_timestamp().ok() == Some(durable_ts));
                         match &rebuilt {
-                            Some((metadata, body)) => self.send_put_rebuilt(
-                                wire, &url_path, metadata, body, is_durable,
-                            )?,
+                            Some((metadata, body)) => {
+                                self.send_put_rebuilt(wire, &url_path, metadata, body, is_durable)?
+                            }
                             None => self.send_put(wire, &url_path, &mut df, is_durable)?,
                         }
                     }
@@ -639,7 +636,10 @@ impl Sender<'_> {
                         self.send_post(wire, &url_path, &df)?;
                     }
                 }
-                Err(DiskFileError::Deleted { timestamp, metadata }) => {
+                Err(DiskFileError::Deleted {
+                    timestamp,
+                    metadata,
+                }) => {
                     if want.data {
                         // The tombstone carries no name metadata we can trust
                         // for the path; Python reads df.account/container/obj
@@ -915,12 +915,42 @@ mod tests {
 
     #[test]
     fn test_decode_wanted() {
-        assert_eq!(decode_wanted(&["dm"]), Wanted { data: true, meta: true });
-        assert_eq!(decode_wanted(&["d"]), Wanted { data: true, meta: false });
-        assert_eq!(decode_wanted(&["m"]), Wanted { data: false, meta: true });
+        assert_eq!(
+            decode_wanted(&["dm"]),
+            Wanted {
+                data: true,
+                meta: true
+            }
+        );
+        assert_eq!(
+            decode_wanted(&["d"]),
+            Wanted {
+                data: true,
+                meta: false
+            }
+        );
+        assert_eq!(
+            decode_wanted(&["m"]),
+            Wanted {
+                data: false,
+                meta: true
+            }
+        );
         // legacy receiver: no parts token means data only
-        assert_eq!(decode_wanted(&[]), Wanted { data: true, meta: false });
-        assert_eq!(decode_wanted(&["x"]), Wanted { data: true, meta: false });
+        assert_eq!(
+            decode_wanted(&[]),
+            Wanted {
+                data: true,
+                meta: false
+            }
+        );
+        assert_eq!(
+            decode_wanted(&["x"]),
+            Wanted {
+                data: true,
+                meta: false
+            }
+        );
     }
 
     #[test]

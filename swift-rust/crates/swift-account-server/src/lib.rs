@@ -31,7 +31,9 @@ pub use reaper::{
 
 use swift_core::hashing::HashPathConfig;
 use swift_core::timestamp::Timestamp;
-use swift_db::{AccountBroker, BrokerMetadata, ContainerRecord, DbError, DbValue, ListContainersArgs};
+use swift_db::{
+    AccountBroker, BrokerMetadata, ContainerRecord, DbError, DbValue, ListContainersArgs,
+};
 use swift_http::{split_path, HeaderKeyDict, Request, Response};
 
 pub const ACCOUNT_LISTING_LIMIT: i64 = 10000;
@@ -397,12 +399,8 @@ impl AccountServer {
         // mount check when configured (Python check_drive). Enforcing
         // mount_check (the production default) prevents reading/writing DBs on
         // an unmounted-but-existing device dir where Python would 507.
-        swift_core::constraints::check_drive(
-            &self.config.devices,
-            drive,
-            self.config.mount_check,
-        )
-        .map_err(|_| swob_response(507, Some(drive)))
+        swift_core::constraints::check_drive(&self.config.devices, drive, self.config.mount_check)
+            .map_err(|_| swob_response(507, Some(drive)))
     }
 
     /// Port of `possibly_quarantine` (swift/common/db.py:502-522): a
@@ -504,7 +502,11 @@ impl AccountServer {
         let mut broker = AccountBroker::new(&db_path, "");
         match op {
             "merge_items" => {
-                let items = args.get(1).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let items = args
+                    .get(1)
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
                 let source = args.get(2).and_then(|v| v.as_str()).map(str::to_string);
                 let max_rowid = items.iter().filter_map(|o| o["ROWID"].as_i64()).max();
                 let mut records = Vec::with_capacity(items.len());
@@ -513,9 +515,7 @@ impl AccountServer {
                         serde_json::Value::Number(n) if n.is_i64() => {
                             swift_core::pickle::Value::Int(n.as_i64().unwrap())
                         }
-                        serde_json::Value::String(s) => {
-                            swift_core::pickle::Value::Str(s.clone())
-                        }
+                        serde_json::Value::String(s) => swift_core::pickle::Value::Str(s.clone()),
                         _ => swift_core::pickle::Value::Int(0),
                     };
                     records.push(ContainerRecord {
@@ -545,7 +545,12 @@ impl AccountServer {
                 // args: remote_sync, hash, id, created_at, put_timestamp,
                 // delete_timestamp, metadata (the db_replicator negotiation;
                 // mirrors the container-server `sync` op).
-                let s = |i: usize| args.get(i).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let s = |i: usize| {
+                    args.get(i)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
                 let remote_point = args.get(1).and_then(|v| v.as_i64()).unwrap_or(-1);
                 let remote_hash = s(2);
                 let remote_id = s(3);
@@ -596,7 +601,11 @@ impl AccountServer {
                 resp
             }
             "merge_syncs" => {
-                let syncs = args.get(1).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let syncs = args
+                    .get(1)
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
                 let points: Vec<(i64, String)> = syncs
                     .iter()
                     .map(|s| {
@@ -627,10 +636,7 @@ impl AccountServer {
         // optional final basename (db_replicator.py:1086-1088); defaults
         // to `<hsh>.db` from the URL
         let db_file = match args.get(2).and_then(|v| v.as_str()) {
-            Some(name) => db_path
-                .parent()
-                .unwrap_or_else(|| Path::new(""))
-                .join(name),
+            Some(name) => db_path.parent().unwrap_or_else(|| Path::new("")).join(name),
             None => db_path.to_path_buf(),
         };
         if db_file.exists() {
@@ -659,7 +665,12 @@ impl AccountServer {
     /// re-id it, then rename it over the existing DB. 404 unless both the
     /// existing DB and the staged file exist (`_abort_rsync_then_merge`,
     /// db_replicator.py:1098-1100).
-    fn rsync_then_merge(&self, drive: &str, db_path: &Path, args: &[serde_json::Value]) -> Response {
+    fn rsync_then_merge(
+        &self,
+        drive: &str,
+        db_path: &Path,
+        args: &[serde_json::Value],
+    ) -> Response {
         let Some(tmp_name) = args.get(1).and_then(|v| v.as_str()) else {
             return plain_response(400, "Invalid object type");
         };
@@ -682,8 +693,7 @@ impl AccountServer {
                     break;
                 }
                 point = items.last().map(|(rowid, _)| *rowid).unwrap();
-                let records: Vec<ContainerRecord> =
-                    items.into_iter().map(|(_, rec)| rec).collect();
+                let records: Vec<ContainerRecord> = items.into_iter().map(|(_, rec)| rec).collect();
                 if let Err(e) = new_broker.merge_items(records) {
                     return error_response(500, &e.to_string());
                 }
@@ -722,10 +732,8 @@ impl AccountServer {
             "REPLICATE" => self.replicate(&mut req),
             "OPTIONS" => {
                 let mut resp = Response::new(200);
-                resp.headers.set(
-                    "Allow",
-                    "DELETE, GET, HEAD, OPTIONS, POST, PUT, REPLICATE",
-                );
+                resp.headers
+                    .set("Allow", "DELETE, GET, HEAD, OPTIONS, POST, PUT, REPLICATE");
                 resp
             }
             _ => {
@@ -742,8 +750,7 @@ impl AccountServer {
     }
 
     fn account_path(&self, req: &Request) -> Result<(String, String, String), Response> {
-        let segs = split_path(&req.path, 3, 3, false)
-            .map_err(|e| plain_response(400, &e))?;
+        let segs = split_path(&req.path, 3, 3, false).map_err(|e| plain_response(400, &e))?;
         let (drive, part, account) = (
             segs[0].clone().unwrap_or_default(),
             segs[1].clone().unwrap_or_default(),
@@ -932,10 +939,7 @@ impl AccountServer {
             for row in stats {
                 if matches!(&row[0], DbValue::Int(i) if i == idx) {
                     let prefix = format!("X-Account-Storage-Policy-{name}");
-                    headers.set(
-                        &format!("{prefix}-Container-Count"),
-                        value_str(&row[1]),
-                    );
+                    headers.set(&format!("{prefix}-Container-Count"), value_str(&row[1]));
                     headers.set(&format!("{prefix}-Object-Count"), value_str(&row[2]));
                     headers.set(&format!("{prefix}-Bytes-Used"), value_str(&row[3]));
                 }
@@ -999,11 +1003,7 @@ impl AccountServer {
             .unwrap_or(0);
         let mut broker = self.broker_for(drive, part, account);
         if account.starts_with(AUTO_CREATE_ACCOUNT_PREFIX) && !broker.db_file().exists() {
-            match broker.initialize(
-                &timestamp.internal(),
-                &self.created_at(),
-                &new_db_id(drive),
-            ) {
+            match broker.initialize(&timestamp.internal(), &self.created_at(), &new_db_id(drive)) {
                 Ok(()) | Err(DbError::AlreadyExists(_)) => {}
                 Err(e) => return error_response(500, &e.to_string()),
             }
@@ -1104,10 +1104,7 @@ impl AccountServer {
         // the aggregate stored metadata over the limits.
         let mut merged = broker.metadata().unwrap_or_default();
         for (k, vt) in &metadata {
-            match merged
-                .iter_mut()
-                .find(|(mk, _)| mk.eq_ignore_ascii_case(k))
-            {
+            match merged.iter_mut().find(|(mk, _)| mk.eq_ignore_ascii_case(k)) {
                 Some((_, mvt)) => {
                     if vt.1 > mvt.1 {
                         *mvt = vt.clone();

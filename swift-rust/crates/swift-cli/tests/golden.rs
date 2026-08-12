@@ -52,15 +52,9 @@ fn test_get_nodes_matches_ring_expectations() {
         let account = get["account"].as_str().unwrap();
         let container = get["container"].as_str();
         let object = get["obj"].as_str();
-        let report = GetNodesReport::for_item(
-            &ring,
-            &hash_config,
-            account,
-            container,
-            object,
-            false,
-        )
-        .unwrap();
+        let report =
+            GetNodesReport::for_item(&ring, &hash_config, account, container, object, false)
+                .unwrap();
         assert_eq!(
             report.partition as u64,
             get["part"].as_u64().unwrap(),
@@ -69,8 +63,7 @@ fn test_get_nodes_matches_ring_expectations() {
         // the report's primary nodes (device names) must line up with the
         // expected node ids resolved through the ring
         let (_, ring_nodes) = ring.get_nodes(account, container, object).unwrap();
-        let want_devices: Vec<String> =
-            ring_nodes.iter().map(|n| n.dev.device.clone()).collect();
+        let want_devices: Vec<String> = ring_nodes.iter().map(|n| n.dev.device.clone()).collect();
         let primaries: Vec<String> = report
             .nodes
             .iter()

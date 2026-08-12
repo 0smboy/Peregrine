@@ -168,8 +168,7 @@ impl JsonParser<'_> {
                         .map_err(|_| DbError::Connection("bad \\u escape".into()))?;
                     if let Some(high) = pending_surrogate.take() {
                         if (0xdc00..=0xdfff).contains(&cp) {
-                            let combined =
-                                0x10000 + ((high - 0xd800) << 10) + (cp - 0xdc00);
+                            let combined = 0x10000 + ((high - 0xd800) << 10) + (cp - 0xdc00);
                             out.push(char::from_u32(combined).unwrap_or('\u{fffd}'));
                             continue;
                         }
@@ -256,11 +255,10 @@ pub(crate) fn new_db_id() -> String {
 }
 
 pub(crate) fn get_raw_metadata(conn: &Connection, db_type: &str) -> Result<String, DbError> {
-    let raw: String = conn.query_row(
-        &format!("SELECT metadata FROM {db_type}_stat"),
-        [],
-        |row| row.get(0),
-    )?;
+    let raw: String =
+        conn.query_row(&format!("SELECT metadata FROM {db_type}_stat"), [], |row| {
+            row.get(0)
+        })?;
     Ok(raw)
 }
 
@@ -409,11 +407,7 @@ pub(crate) fn reclaim_other_stuff(
     let kept: BrokerMetadata = md
         .iter()
         .filter(|(_, (value, ts))| {
-            !(value.is_empty()
-                && ts
-                    .parse::<Timestamp>()
-                    .map(|t| t < age)
-                    .unwrap_or(false))
+            !(value.is_empty() && ts.parse::<Timestamp>().map(|t| t < age).unwrap_or(false))
         })
         .cloned()
         .collect();

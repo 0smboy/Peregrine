@@ -204,10 +204,7 @@ impl Bulk {
             .trim_matches('/')
             .to_string();
 
-        let archive_bytes = match req
-            .body
-            .materialize(MAX_FILE_SIZE as u64)
-        {
+        let archive_bytes = match req.body.materialize(MAX_FILE_SIZE as u64) {
             Ok(b) => b.to_vec(),
             Err(_) => return Response::error(413, "Request Entity Too Large"),
         };
@@ -322,7 +319,8 @@ impl Bulk {
                                 ),
                                 "Errors": errors.iter().map(|(p,e)| vec![p.clone(), e.clone()]).collect::<Vec<_>>(),
                             });
-                            let mut out = Response::with_body(200, summary.to_string().into_bytes());
+                            let mut out =
+                                Response::with_body(200, summary.to_string().into_bytes());
                             out.headers.set("Content-Type", "application/json");
                             return out;
                         }
@@ -468,7 +466,12 @@ fn status_line(code: u16) -> String {
 
 /// Map `?extract-archive=` value to tar compress mode (`""`, `"gz"`, `"bz2"`).
 fn extract_compress_type(raw: &str) -> Option<&'static str> {
-    match raw.trim().trim_start_matches('.').to_ascii_lowercase().as_str() {
+    match raw
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "tar" => Some(""),
         "tar.gz" | "tgz" => Some("gz"),
         "tar.bz2" | "tbz2" | "tbz" => Some("bz2"),
@@ -486,8 +489,8 @@ impl Middleware for Bulk {
                 };
             }
         }
-        let is_bulk_delete = req.param("bulk-delete").is_some()
-            && (req.method == "POST" || req.method == "DELETE");
+        let is_bulk_delete =
+            req.param("bulk-delete").is_some() && (req.method == "POST" || req.method == "DELETE");
         if is_bulk_delete {
             self.handle_delete(req, next)
         } else {
@@ -554,10 +557,7 @@ mod tests {
                 r.headers.get("X-Backend-Remote-User"),
                 Some("AUTH_test,AUTH_test:user")
             );
-            assert_eq!(
-                r.headers.get("X-Backend-Authorize-Override"),
-                Some("true")
-            );
+            assert_eq!(r.headers.get("X-Backend-Authorize-Override"), Some("true"));
             Response::new(204)
         });
         let mut request = req("/c/a\n");
@@ -566,9 +566,7 @@ mod tests {
         request
             .headers
             .set("X-Backend-Remote-User", "AUTH_test,AUTH_test:user");
-        request
-            .headers
-            .set("X-Backend-Authorize-Override", "true");
+        request.headers.set("X-Backend-Authorize-Override", "true");
 
         assert_eq!(b.handle(request, &app).status, 200);
     }
