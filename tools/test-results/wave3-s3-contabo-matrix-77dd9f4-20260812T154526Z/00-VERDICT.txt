@@ -1,0 +1,6 @@
+Contabo live S3 extended matrix @ tip 117d7b088e69…
+VERDICT=GREEN
+passed=29 failed=0
+lanes=tempauth-sigv4,ec2-sigv4
+Claim boundary: bounded extended ops vs VIP; NOT multi-hour; NOT full strict-s3-parity.
+Evidence: /root/work/peregrine-artifacts/wave3-s3-contabo-matrix-77dd9f4-20260812T154526Z

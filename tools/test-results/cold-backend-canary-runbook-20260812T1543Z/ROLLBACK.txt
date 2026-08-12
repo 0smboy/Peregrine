@@ -1,0 +1,10 @@
+1. systemctl stop swift-proxy on swift3; wait HAProxy proxy3 DOWN (show stat read-only).
+2. Restore /etc/swift/proxy-server.conf from bak-pre-cold-c716103-* (drop cold_backend_root).
+3. Restore /usr/local/bin/swift-proxy-server from:
+   - /root/peregrine-proxy-rollback-c716103-swift3-*/swift-proxy-server  (if created), OR
+   - sealed 77dd9f4 artifact peregrine-proxy-77dd9f4-ec.tar.gz
+     artifact sha256=215f4d81a7bab1b373abc86c7e77f478f04b382878db01a8b00dde62c61825a2
+     expect installed sha256=117d7b088e691be6826cca0fca067353bfc52c76f96b25aec1882f1d80d3052c
+4. restorecon if needed; systemctl start swift-proxy; healthcheck 200.
+5. Confirm peers untouched; VIP still round-robin stock 77dd9f4.
+6. Optional: rm -rf /var/cache/peregrine-cold

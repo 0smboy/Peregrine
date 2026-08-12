@@ -1,0 +1,4 @@
+tip_sha=117d7b088e691be6826cca0fca067353bfc52c76f96b25aec1882f1d80d3052c
+pipeline=pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+info_http=200
+probe_rc=0

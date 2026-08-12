@@ -1,0 +1,33 @@
+matrix_start tip_sha=117d7b088e69… vip=https://10.0.0.10:8085 region_start=us-east-1
+tempauth_access_prefix=<redacted>… (secret redacted)
+PASS  tempauth-sigv4:ListBuckets  http=200    <?xml version='1.0' encoding='UTF-8'?> <ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/20
+PASS  tempauth-sigv4:CreateBucket  http=200    
+PASS  tempauth-sigv4:PutObject  http=200    
+PASS  tempauth-sigv4:HeadObject  http=200  cl=26  
+PASS  tempauth-sigv4:GetObject  http=200    contabo-matrix-tempauth-ok
+PASS  tempauth-sigv4:GetObjectRange  http=206    contabo
+PASS  tempauth-sigv4:ListObjectsV1  http=200    <?xml version='1.0' encoding='UTF-8'?> <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-
+PASS  tempauth-sigv4:ListObjectsV2  http=200    <?xml version='1.0' encoding='UTF-8'?> <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-
+PASS  tempauth-sigv4:GetBucketLocation  http=200    <?xml version='1.0' encoding='UTF-8'?> <LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-0
+PASS  tempauth-sigv4:GetBucketAcl  http=200    <?xml version='1.0' encoding='UTF-8'?> <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-
+PASS  tempauth-sigv4:GetObjectAcl  http=200    <?xml version='1.0' encoding='UTF-8'?> <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-
+PASS  tempauth-sigv4:CopyObject  http=200    <?xml version='1.0' encoding='UTF-8'?> <CopyObjectResult xmlns="http://s3.amazonaws.com/doc/2006-03-
+PASS  tempauth-sigv4:GetCopiedObject  http=200    contabo-matrix-tempauth-ok
+PASS  tempauth-sigv4:MultiDelete  http=200    <?xml version='1.0' encoding='UTF-8'?> <DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"
+PASS  tempauth-sigv4:CreateMultipartUpload  http=200  upload_id_len=32  <?xml version='1.0' encoding='UTF-8'?> <InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com
+PASS  tempauth-sigv4:UploadPart  http=200  etag_set=True  
+PASS  tempauth-sigv4:ListParts  http=200    <?xml version='1.0' encoding='UTF-8'?> <ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-0
+PASS  tempauth-sigv4:ListMultipartUploads  http=200    <?xml version='1.0' encoding='UTF-8'?> <ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/do
+PASS  tempauth-sigv4:AbortMultipartUpload  http=204    
+PASS  tempauth-sigv4:DeleteObject  http=204    
+PASS  tempauth-sigv4:DeleteBucket  http=204    
+ec2_access_prefix=<redacted>… (secret redacted)
+PASS  ec2-sigv4:ListBuckets  http=200    <?xml version='1.0' encoding='UTF-8'?> <ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/20
+PASS  ec2-sigv4:CreateBucket  http=200    
+PASS  ec2-sigv4:PutObject  http=200    
+PASS  ec2-sigv4:HeadObject  http=200  cl=21  
+PASS  ec2-sigv4:GetObject  http=200    contabo-matrix-ec2-ok
+PASS  ec2-sigv4:ListObjectsV1  http=200    <?xml version='1.0' encoding='UTF-8'?> <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-
+PASS  ec2-sigv4:DeleteObject  http=204    
+PASS  ec2-sigv4:DeleteBucket  http=204    
+VERDICT=GREEN passed=29 failed=0

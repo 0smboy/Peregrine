@@ -1,0 +1,244 @@
+{
+  "verdict": "GREEN",
+  "tip_sha": "117d7b088e691be6826cca0fca067353bfc52c76f96b25aec1882f1d80d3052c",
+  "vip": "https://10.0.0.10:8085",
+  "region": "us-east-1",
+  "passed": 29,
+  "failed": 0,
+  "ops": [
+    {
+      "lane": "tempauth-sigv4",
+      "op": "ListBuckets",
+      "http": 200,
+      "ok": true,
+      "note": "",
+      "body_snip": "<?xml version='1.0' encoding='UTF-8'?> <ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Owner><I"
+    },
+    {
+      "lane": "tempauth-sigv4",
+      "op": "CreateBucket",
+      "http": 200,
+      "ok": true,
+      "note": "",
+      "body_snip": ""
+    },
+    {
+      "lane": "tempauth-sigv4",
+      "op": "PutObject",
+      "http": 200,
+      "ok": true,
+      "note": "",
+      "body_snip": ""
+    },
+    {
+      "lane": "tempauth-sigv4",
+      "op": "HeadObject",
+      "http": 200,
+      "ok": true,
+      "note": "cl=26",
+      "body_snip": ""
+    },
+    {
+      "lane": "tempauth-sigv4",
+      "op": "GetObject",
+      "http": 200,
+      "ok": true,
+      "note": "",
+      "body_snip": "contabo-matrix-tempauth-ok"
+    },
+    {
+      "lane": "tempauth-sigv4",
+      "op": "GetObjectRange",
+      "http": 206,
+      "ok": true,
+      "note": "",
+      "body_snip": "contabo"
+    },
+    {
+      "lane": "tempauth-sigv4",
+      "op": "ListObjectsV1",
+      "http": 200,
+      "ok": true,
+      "note": "",
+      "body_snip": "<?xml version='1.0' encoding='UTF-8'?> <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>w3mx-1786"
+    },
+    {
+      "lane": "tempauth-sigv4",
+      "op": "ListObjectsV2",
+      "http": 200,
+      "ok": true,
+      "note": "",
+      "body_snip": "<?xml version='1.0' encoding='UTF-8'?> <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>w3mx-1786"
+    },
+    {
+      "lane": "tempauth-sigv4",
+      "op": "GetBucketLocation",
+      "http": 200,
+      "ok": true,
+      "note": "",
+      "body_snip": "<?xml version='1.0' encoding='UTF-8'?> <LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">RegionOne</Lo"
+    },
+    {
+      "lane": "tempauth-sigv4",
+      "op": "GetBucketAcl",
+      "http": 200,
+      "ok": true,
+      "note": "",
+      "body_snip": "<?xml version='1.0' encoding='UTF-8'?> <AccessControlPolicy xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Owner><ID>t"
+    },
+    {
+      "lane": "tempauth-sigv4",
+      "op": "GetObjectAcl",
+      "http": 200,
+      "ok": true,
+      "note": "",
+      "body_snip": "<?xml version='1.0' encoding='UTF-8'?> <AccessControlPolicy xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Owner><ID>t"
+    },
+    {
+      "lane": "tempauth-sigv4",
+      "op": "CopyObject",
+      "http": 200,
+      "ok": true,
+      "note": "",
+      "body_snip": "<?xml version='1.0' encoding='UTF-8'?> <CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>W"
+    },
+    {
+      "lane": "tempauth-sigv4",
+      "op": "GetCopiedObject",
+      "http": 200,
+      "ok": true,
+      "note": "",
+      "body_snip": "contabo-matrix-tempauth-ok"
+    },
+    {
+      "lane": "tempauth-sigv4",
+      "op": "MultiDelete",
+      "http": 200,
+      "ok": true,
+      "note": "",
+      "body_snip": "<?xml version='1.0' encoding='UTF-8'?> <DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>"
+    },
+    {
+      "lane": "tempauth-sigv4",
+      "op": "CreateMultipartUpload",
+      "http": 200,
+      "ok": true,
+      "note": "upload_id_len=32",
+      "body_snip": "<?xml version='1.0' encoding='UTF-8'?> <InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><B"
+    },
+    {
+      "lane": "tempauth-sigv4",
+      "op": "UploadPart",
+      "http": 200,
+      "ok": true,
+      "note": "etag_set=True",
+      "body_snip": ""
+    },
+    {
+      "lane": "tempauth-sigv4",
+      "op": "ListParts",
+      "http": 200,
+      "ok": true,
+      "note": "",
+      "body_snip": "<?xml version='1.0' encoding='UTF-8'?> <ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>w3mx-178"
+    },
+    {
+      "lane": "tempauth-sigv4",
+      "op": "ListMultipartUploads",
+      "http": 200,
+      "ok": true,
+      "note": "",
+      "body_snip": "<?xml version='1.0' encoding='UTF-8'?> <ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Buck"
+    },
+    {
+      "lane": "tempauth-sigv4",
+      "op": "AbortMultipartUpload",
+      "http": 204,
+      "ok": true,
+      "note": "",
+      "body_snip": ""
+    },
+    {
+      "lane": "tempauth-sigv4",
+      "op": "DeleteObject",
+      "http": 204,
+      "ok": true,
+      "note": "",
+      "body_snip": ""
+    },
+    {
+      "lane": "tempauth-sigv4",
+      "op": "DeleteBucket",
+      "http": 204,
+      "ok": true,
+      "note": "",
+      "body_snip": ""
+    },
+    {
+      "lane": "ec2-sigv4",
+      "op": "ListBuckets",
+      "http": 200,
+      "ok": true,
+      "note": "",
+      "body_snip": "<?xml version='1.0' encoding='UTF-8'?> <ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Owner><I"
+    },
+    {
+      "lane": "ec2-sigv4",
+      "op": "CreateBucket",
+      "http": 200,
+      "ok": true,
+      "note": "",
+      "body_snip": ""
+    },
+    {
+      "lane": "ec2-sigv4",
+      "op": "PutObject",
+      "http": 200,
+      "ok": true,
+      "note": "",
+      "body_snip": ""
+    },
+    {
+      "lane": "ec2-sigv4",
+      "op": "HeadObject",
+      "http": 200,
+      "ok": true,
+      "note": "cl=21",
+      "body_snip": ""
+    },
+    {
+      "lane": "ec2-sigv4",
+      "op": "GetObject",
+      "http": 200,
+      "ok": true,
+      "note": "",
+      "body_snip": "contabo-matrix-ec2-ok"
+    },
+    {
+      "lane": "ec2-sigv4",
+      "op": "ListObjectsV1",
+      "http": 200,
+      "ok": true,
+      "note": "",
+      "body_snip": "<?xml version='1.0' encoding='UTF-8'?> <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>ec2mx-178"
+    },
+    {
+      "lane": "ec2-sigv4",
+      "op": "DeleteObject",
+      "http": 204,
+      "ok": true,
+      "note": "",
+      "body_snip": ""
+    },
+    {
+      "lane": "ec2-sigv4",
+      "op": "DeleteBucket",
+      "http": 204,
+      "ok": true,
+      "note": "",
+      "body_snip": ""
+    }
+  ],
+  "claim_boundary": "Bounded Contabo live extended matrix: TempAuth SigV4 CRUD+list+acl+location+range+copy+multidelete+MPU abort path; EC2 SigV4 List/Put/Get/Head/Delete. NOT full strict-s3-parity dual-oracle; NOT multi-hour soak; NOT versioning/WORM live.",
+  "utc": "20260812T154605Z"
+}

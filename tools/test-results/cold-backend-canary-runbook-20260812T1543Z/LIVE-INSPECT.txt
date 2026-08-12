@@ -1,0 +1,25 @@
+## swift3 [filter:s3api] (live)
+[filter:s3api]
+use = egg:swift#s3api
+location = RegionOne
+# NO cold_backend_root / filecold_root
+
+## swift1 peer
+same: location=RegionOne only; NO cold_backend*
+
+## binaries (all four nodes)
+sha256=/usr/local/bin/swift-proxy-server
+  = 117d7b088e691be6826cca0fca067353bfc52c76f96b25aec1882f1d80d3052c
+strings probe (swift3): no cold_backend_root / LocalDir / filecold in LIVE binary
+  (anonymous_account present → stock 77dd9f4 wiring)
+
+## HAProxy (swift3 local stats socket, read-only)
+swift_proxy_back/proxy1=UP
+swift_proxy_back/proxy2=UP
+swift_proxy_back/proxy3=UP
+swift_proxy_back/proxy4=UP
+healthcheck http://127.0.0.1:8080/healthcheck → 200
+
+## VIP path
+Client VIP 10.0.0.10:8085 → round-robin 10.0.0.1-4:8080
+Public SSH aliases swift1..swift4 = 169.58.108.x (NOT 10.0.0.x from Mac)

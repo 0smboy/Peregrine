@@ -1,0 +1,3 @@
+VERDICT=BLOCKED_NEED_CANARY_APPROVAL
+REASON=proxy-only binary canary pattern exists, but this canary also mutates [filter:s3api] (outside sealed deploy-script contract) and archive-on-transition is still OPEN so full filecold restore E2E needs manual sysmeta plant or archive landing. Prefer explicit operator OK before mutating swift3.
+FLEET_MUTATED=no

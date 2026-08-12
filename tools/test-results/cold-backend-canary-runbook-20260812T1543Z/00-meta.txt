@@ -1,0 +1,16 @@
+when_utc=2026-08-12T15:46:36Z
+when_sgt=2026-08-12T23:46:36+08
+mac_repo=/Users/oboy/Downloads/Peregrine-clippy
+branch=feat/cold-localdir-restore-77dd9f4
+tip=c716103
+base_fleet_commit=77dd9f4
+fleet_binary_sha256=117d7b088e691be6826cca0fca067353bfc52c76f96b25aec1882f1d80d3052c
+nodes_checked=swift1,swift2,swift3,swift4
+cold_backend_root_live=absent (swift3 + swift1)
+archive_on_transition=OPEN (commit message + SUMMARY)
+unit_evidence=tools/test-results/cold-physical-unit-77dd9f4-20260812T153251Z (GREEN)
+on_node_cold_src=/root/work/peregrine-cold-physical-77dd9f4/swift-rust
+on_node_src_md5_match=yes (cold_tier.rs + main.rs match Mac tip)
+prior_canary_pattern=/root/work/peregrine-acceptance-20260810/canary-77dd9f4-20260812T151834Z APPLY_OK
+prior_deploy_script=/root/work/peregrine-artifacts/deploy-peregrine-proxy-only-77dd9f4.sh
+prior_deploy_contract=binary-only; never changes Swift configuration
