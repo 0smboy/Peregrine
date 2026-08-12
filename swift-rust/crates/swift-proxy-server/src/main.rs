@@ -2712,6 +2712,23 @@ fn build_s3api(conf: &SwiftConfig) -> Result<Option<swift_s3api::S3Api>, String>
         .flatten()
         .unwrap_or_else(|| reseller.clone());
 
+    let anon_cfg = conf
+        .get("filter:s3api", "anonymous_account")
+        .map_err(|e| e.to_string())?
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let anon_inferred = {
+        let mut accounts: Vec<String> = creds.values().map(|c| c.account.clone()).collect();
+        accounts.sort();
+        accounts.dedup();
+        if accounts.len() == 1 {
+            Some(accounts.remove(0))
+        } else {
+            None
+        }
+    };
+    let anonymous_account = anon_cfg.or(anon_inferred);
+
     let mut api = swift_s3api::S3Api::new(creds)
         .with_location(location)
         .with_dns_compliant(dns)
@@ -2719,6 +2736,9 @@ fn build_s3api(conf: &SwiftConfig) -> Result<Option<swift_s3api::S3Api>, String>
         .with_allowable_clock_skew(allowable_clock_skew)
         .with_extended_subresources(extended_subresources)
         .with_reseller_prefix(s3_reseller);
+    if let Some(account) = anonymous_account {
+        api = api.with_anonymous_account(account);
+    }
 
     // IAM used to exist only as a library surface. Load it here so configured
     // identity maps, tenants, and policies participate in the live S3 request

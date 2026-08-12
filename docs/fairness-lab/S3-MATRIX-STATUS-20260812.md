@@ -15,8 +15,10 @@ Tip reference: `build/phase1-deploy-rs-lb` @ `48fa98e` (+).
 - Multi-version data plane (`{bucket}+versions`, versionId GET/DELETE, delete-marker, ListVersions) — unit path
 - ECDSA streaming modes → stable **501 NotImplemented** (intentional stop-line)
 
+## KEEP (anon path — ON-BY-CONFIG)
+- Unsigned S3 GET/HEAD when `anonymous_account` is set (or inferred from a single TempAuth account): maps to `/v1/<account>/…` **without** auth override so bucket `public-read` (`.r:*`) works; object ACL AllUsers/canned still enforced
+
 ## OPEN / non-claim (honest)
-- Anonymous unauthenticated GET for AllUsers/`public-read` (SigV4 missing → passthrough; container ACL still gates — **no** open anon S3 GET)
 - Physical cold/tape backend (meta stamps only)
 - Contabo production multi-hour live S3 / full live matrix vs Python oracle
 - AWS IAM cloud (local directory only)

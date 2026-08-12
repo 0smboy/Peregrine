@@ -88,8 +88,10 @@
 //! principal (`access_key` / account) must be owner or hold READ/FULL_CONTROL
 //! — else `403 AccessDenied`. Owner always allowed. Missing/empty grants → no
 //! new denial (Swift container ACL path). AllUsers READ still does **not**
-//! open anonymous unauthenticated GET (no SigV4 → passthrough; container ACL
-//! still gates).
+//! open anonymous unauthenticated GET by itself. When `anonymous_account` is
+//! configured, unsigned S3 GET/HEAD map to that account without auth override
+//! so bucket `public-read` (container `.r:*`) can succeed; object ACL still
+//! gates AllUsers.
 //!
 //! Unknown access keys (EC2) are deferred to Keystone via an optional
 //! [`S3TokenClient`] (`with_s3token_client`); without a client, unknown keys
@@ -105,8 +107,10 @@ use swift_middleware::{Middleware, NextFn, S3TokenClient, S3TokenResult};
 use crate::acl_cors::{
     apply_bucket_acl_input, apply_object_acl_input, bucket_acl_xml_from_headers,
     clear_cors_swift_headers, cors_config_to_swift_headers, cors_xml_from_swift_headers,
-    object_acl_denies_read, object_acl_denies_write, object_acl_xml_from_headers,
-    parse_cors_configuration, resolve_acl_put_input, xml_ok, AclPutInput,
+    decode_acl_json, grants_allow_anonymous_read, object_acl_denies_read,
+    object_acl_denies_write, object_acl_xml_from_headers, object_canned_allows_anonymous_read,
+    parse_cors_configuration, resolve_acl_put_input, xml_ok, AclPutInput, S3_OBJECT_ACL_JSON_META,
+    S3_OBJECT_ACL_META,
 };
 use crate::aws_chunked::{
     cleanup_content_encoding, decode_aws_chunked, is_aws_chunked_request, is_ecdsa_streaming,
@@ -189,6 +193,10 @@ pub struct S3Api {
     pub iam: crate::iam::IamService,
     /// Physical cold-tier storage-policy map (optional; empty = meta-only).
     pub cold_map: crate::cold_tier::ColdPolicyMap,
+    /// When set, unsigned S3 GET/HEAD for path-/vhost-style buckets map to this
+    /// Swift account **without** auth override so container `.r:*` can allow
+    /// anonymous reads. Multi-tenant deployments must set this explicitly.
+    pub anonymous_account: Option<String>,
 }
 
 impl S3Api {
@@ -204,6 +212,7 @@ impl S3Api {
             s3token_client: None,
             iam: crate::iam::IamService::new(),
             cold_map: crate::cold_tier::ColdPolicyMap::new(),
+            anonymous_account: None,
         }
     }
 
@@ -248,6 +257,12 @@ impl S3Api {
 
     pub fn with_extended_subresources(mut self, enabled: bool) -> Self {
         self.extended_subresources = enabled;
+        self
+    }
+
+    pub fn with_anonymous_account(mut self, account: impl Into<String>) -> Self {
+        let a = account.into().trim().to_string();
+        self.anonymous_account = if a.is_empty() { None } else { Some(a) };
         self
     }
 
@@ -500,6 +515,52 @@ fn decode_and_fix_aws_chunked(
 /// auth schemes with S3 XML) instead of falling through to Swift filters.
 fn is_s3_auth_request(req: &Request) -> bool {
     parse_sigv4_auth(req).is_some() || is_sigv2_auth(req)
+}
+
+/// Paths that are never unsigned S3 (Swift v1 / auth / info / health).
+fn is_swift_native_path(path: &str) -> bool {
+    path == "/info"
+        || path.starts_with("/info/")
+        || path.starts_with("/v1/")
+        || path == "/v1"
+        || path.starts_with("/auth")
+        || path.starts_with("/healthcheck")
+}
+
+/// Unsigned S3 GET/HEAD candidate: not Swift-native, has a bucket, GET/HEAD.
+fn is_s3_unsigned_read_candidate(
+    req: &Request,
+    storage_domains: &[String],
+    dns_compliant: bool,
+) -> bool {
+    if !matches!(req.method.as_str(), "GET" | "HEAD") {
+        return false;
+    }
+    if is_swift_native_path(&req.path) {
+        return false;
+    }
+    let (bucket, _) = extract_bucket_and_key(req, storage_domains, dns_compliant);
+    bucket.is_some()
+}
+
+/// Object ACL must not block AllUsers when Swift returned 200 via container ACL.
+fn object_acl_blocks_anonymous(headers: &HeaderKeyDict) -> bool {
+    if let Some(raw) = headers
+        .get(S3_OBJECT_ACL_JSON_META)
+        .or_else(|| headers.get("X-Object-Meta-S3-Acl-Json"))
+    {
+        if !raw.is_empty() {
+            if let Some(policy) = decode_acl_json(raw) {
+                if !policy.grants.is_empty() {
+                    return !grants_allow_anonymous_read(&policy.grants);
+                }
+            }
+        }
+    }
+    if let Some(canned) = headers.get(S3_OBJECT_ACL_META).filter(|s| !s.is_empty()) {
+        return !object_canned_allows_anonymous_read(Some(canned));
+    }
+    false
 }
 
 fn first_unsupported_subresource(params: &[(String, String)]) -> Option<&str> {
@@ -1104,7 +1165,17 @@ fn translate_bucket_success(method: &str, resp: Response) -> Response {
 impl Middleware for S3Api {
     fn handle(&self, mut req: Request, next: &NextFn) -> Response {
         // Non-S3 traffic (Swift v1, /auth, /info, healthcheck) passes through.
+        // Optional unsigned S3 GET/HEAD → anonymous_account (bucket public-read).
         if !is_s3_auth_request(&req) {
+            if let Some(account) = self.anonymous_account.clone() {
+                if is_s3_unsigned_read_candidate(
+                    &req,
+                    &self.storage_domains,
+                    self.dns_compliant_bucket_names,
+                ) {
+                    return self.dispatch_anonymous(req, account, next);
+                }
+            }
             return next(req);
         }
 
@@ -1496,7 +1567,82 @@ impl S3Api {
             map_swift_error(resp.status, bucket.as_deref(), key.as_deref())
         }
     }
+
+    /// Unsigned S3 GET/HEAD using `anonymous_account` without auth override.
+    /// Relies on Swift container ACL (`.r:*` / `.rlistings`) plus object ACL
+    /// AllUsers checks when object ACL meta is present.
+    fn dispatch_anonymous(&self, req: Request, account: String, next: &NextFn) -> Response {
+        let params = req.params();
+        if let Some(sub) = first_unsupported_subresource(&params) {
+            return not_implemented_subresource(sub);
+        }
+        let (bucket, key) =
+            extract_bucket_and_key(&req, &self.storage_domains, self.dns_compliant_bucket_names);
+        let Some(bucket) = bucket else {
+            return next(req);
+        };
+        if !validate_bucket_name(&bucket, self.dns_compliant_bucket_names) {
+            return s3_error_response("InvalidBucketName", None, &[("BucketName", &bucket)]);
+        }
+        let method = req.method.clone();
+        let for_list = matches!(method.as_str(), "GET" | "HEAD") && key.is_none();
+        let mut swift_req = req;
+        swift_req.path = s3_to_swift_path(&account, Some(&bucket), key.as_deref());
+        if for_list && method == "GET" {
+            swift_req.query_string = s3_to_swift_query(&params, true);
+            swift_req.headers.set("Accept", "application/json");
+        } else {
+            swift_req.query_string = s3_to_swift_query(&params, false);
+        }
+        strip_s3_only_headers(&mut swift_req.headers);
+        // Intentionally no stamp_auth — container `.r:*` must authorize.
+        let resp = next(swift_req);
+        if key.is_none() {
+            if method == "GET" && (200..300).contains(&resp.status) {
+                let body = match resp.body.into_vec(MAX_CONTROL_BODY) {
+                    Ok(b) => b,
+                    Err(_) => return s3_error_response("InternalError", None, &[]),
+                };
+                let owner = Owner {
+                    id: "anonymous".into(),
+                    display_name: "anonymous".into(),
+                };
+                let list_v2 = params.iter().any(|(k, v)| k == "list-type" && v == "2");
+                if list_v2 {
+                    return translate_list_objects_v2(&body, &bucket, &params, &owner);
+                }
+                return translate_list_objects(&body, &bucket, &params, &owner);
+            }
+            if (200..300).contains(&resp.status) {
+                return translate_bucket_success(&method, resp);
+            }
+            return map_swift_error(resp.status, Some(&bucket), None);
+        }
+        if (200..300).contains(&resp.status) {
+            if object_acl_blocks_anonymous(&resp.headers) {
+                return s3_error_response("AccessDenied", None, &[]);
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let mut resp = resp;
+            if let Some(denied) = deny_if_transition_blocks_get(&mut resp.headers, now) {
+                return denied;
+            }
+            if let Some(sc) = resp
+                .headers
+                .get("X-Object-Meta-S3-Storage-Class")
+                .map(str::to_string)
+            {
+                resp.headers.set("x-amz-storage-class", sc);
+            }
+            return translate_object_success(&method, resp, false);
+        }
+        map_swift_error(resp.status, Some(&bucket), key.as_deref())
+    }
 }
+
 
 fn make_swift_req(method: &str, path: &str) -> Request {
     Request {
@@ -3263,6 +3409,93 @@ mod tests {
         let resp = api.handle(req, &next);
         assert_eq!(resp.status, 200);
     }
+
+    #[test]
+    fn anonymous_get_object_maps_without_auth_override() {
+        let api = S3Api::new(cred_map()).with_anonymous_account("AUTH_test");
+        let req = Request {
+            method: "GET".into(),
+            path: "/pubbucket/obj1".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.path, "/v1/AUTH_test/pubbucket/obj1");
+            assert!(r.headers.get("X-Backend-Authorize-Override").is_none());
+            let mut resp = Response::new(200);
+            resp.body = Body::from(b"hello-anon".to_vec());
+            resp.headers.set("ETag", "abc");
+            resp
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert_eq!(body, "hello-anon");
+    }
+
+    #[test]
+    fn anonymous_get_private_object_acl_denied_even_if_backend_200() {
+        let api = S3Api::new(cred_map()).with_anonymous_account("AUTH_test");
+        let req = Request {
+            method: "GET".into(),
+            path: "/pubbucket/secret".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.path, "/v1/AUTH_test/pubbucket/secret");
+            let mut resp = Response::new(200);
+            resp.body = Body::from(b"nope".to_vec());
+            resp.headers.set(S3_OBJECT_ACL_META, "private");
+            resp
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("AccessDenied"), "{body}");
+    }
+
+    #[test]
+    fn anonymous_get_public_read_object_acl_allowed() {
+        let api = S3Api::new(cred_map()).with_anonymous_account("AUTH_test");
+        let req = Request {
+            method: "GET".into(),
+            path: "/pubbucket/pub".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let next: NextFn = Arc::new(|_| {
+            let mut resp = Response::new(200);
+            resp.body = Body::from(b"ok".to_vec());
+            resp.headers.set(S3_OBJECT_ACL_META, "public-read");
+            resp
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn anonymous_get_without_account_config_passthrough() {
+        let api = S3Api::new(cred_map()); // no anonymous_account
+        let req = Request {
+            method: "GET".into(),
+            path: "/pubbucket/obj1".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.path, "/pubbucket/obj1"); // unchanged
+            Response::new(200)
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+    }
+
+
 
     #[test]
     fn reject_bad_access_key() {

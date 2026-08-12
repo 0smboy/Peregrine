@@ -262,12 +262,11 @@ pub fn object_acl_xml_from_meta(owner_id: &str, canned: Option<&str>) -> Vec<u8>
 /// Whether a stored object canned ACL *would* grant AllUsers READ under S3
 /// semantics (`public-read` / `public-read-write`).
 ///
-/// Pure helper for tests and future S3Acl-style enforcement. **Not** used to
-/// authorize anonymous GETs today: without SigV4 we cannot safely map
-/// path-style `/bucket/key` to a Swift account in multi-tenant deployments,
-/// and stamping container `.r:*` from an object ACL would open the whole
-/// bucket. Operators who need anonymous object reads should set bucket
-/// `public-read` (container `X-Container-Read=.r:*,.rlistings`).
+/// Used by unsigned GET/HEAD when [`crate::middleware::S3Api::anonymous_account`]
+/// is configured: object `public-read` / AllUsers READ may pass after the
+/// Swift container `.r:*` hop succeeds. Without `anonymous_account`, unsigned
+/// traffic never enters this check (passthrough). Multi-tenant deployments
+/// must set the account explicitly — path-style alone cannot infer it.
 pub fn object_canned_allows_anonymous_read(canned: Option<&str>) -> bool {
     matches!(
         normalize_object_canned_acl(canned.unwrap_or("private")),
