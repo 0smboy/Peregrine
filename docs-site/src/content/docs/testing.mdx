@@ -58,6 +58,10 @@ Against the four-node Contabo HA lab (VIP `10.0.0.10:8085` — see
 <Step>after replacing VMs: re-run `ha-test.sh`, `ec-heal-test.sh`, and confirm Prometheus `nodes_up=4`.</Step>
 </Steps>
 
+## Recent delivery — cold + Contabo S3
+
+Lab LocalDir cold + restore + archive-on-transition units GREEN; Contabo S3 extended matrix 29/29 GREEN (bounded); canary runbook only. See [Cold + Contabo S3 delivery](/cold-contabo-delivery) (**IMPLEMENTED_SUBSET_ONLY**).
+
 ## The harnesses
 
 `swift-rust/tools/` ships every harness used above, each runnable against any

@@ -1,0 +1,40 @@
+---
+title: Cold + Contabo S3 delivery
+description: Honest delivery note for LocalDir cold/restore and Contabo S3 matrix at tip 8663d11 — IMPLEMENTED_SUBSET_ONLY.
+sidebar:
+  order: 25
+---
+
+Short delivery note for the **2026-08-12 / 2026-08-13** cold-backend and Contabo S3 work. Stance: **IMPLEMENTED_SUBSET_ONLY**.
+
+## Tip & fleet
+
+| Item | Value |
+|------|-------|
+| Branch | `feat/cold-localdir-restore-77dd9f4` @ `8663d11` |
+| Fleet tip | still **`77dd9f4`** (binary `117d7b08…`) — cold enable not fleet-redeployed |
+| Claim stance | **IMPLEMENTED_SUBSET_ONLY** |
+
+## What is GREEN
+
+- **Contabo S3 (VIP)** — extended matrix **29/29 GREEN (bounded)** at fleet tip `77dd9f4` / binary `117d7b08…`. Short EC2 SigV4 smoke also GREEN. Not a multi-hour soak; not full AWS IAM cloud.
+- **Lab LocalDir cold** — `LocalDirColdBackend` (`filecold://…`) + `?restore` RestoreObject + **archive-on-transition** unit suite **GREEN** on swift3 (physical cold unit + archive unit).
+- **Cold canary** — **runbook only**; no fleet mutate / no Contabo cold enable. Verdict previously `BLOCKED_NEED_CANARY_APPROVAL`.
+
+## Explicitly not claimed
+
+- Tape / Glacier / Contabo object-lock media
+- Fleet `cold_backend_root` / `filecold_root` enable or canary mutate
+- Multi-hour S3 soak, anonymous/versioned archive paths, hot-byte delete after archive
+
+## Evidence pack
+
+Drive folder (handoffs + evidence dirs):
+
+[https://drive.google.com/drive/folders/12aIrbaAgTEJwifyfcQBDFxxqZ2cTbsHp](https://drive.google.com/drive/folders/12aIrbaAgTEJwifyfcQBDFxxqZ2cTbsHp)
+
+Related ops / verification: [Operations](/operations), [Testing & verification](/testing), [Lab cluster](/lab-cluster).
+
+<Aside type="caution" title="IMPLEMENTED_SUBSET_ONLY">
+Do not treat this page as tape/Glacier readiness or as a fleet cold cutover. Lab LocalDir units and bounded Contabo S3 matrix only.
+</Aside>
