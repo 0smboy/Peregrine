@@ -1,0 +1,100 @@
+    Checking typenum v1.20.1
+    Checking cfg-if v1.0.4
+    Checking subtle v2.6.1
+    Checking libc v0.2.186
+    Checking serde_core v1.0.228
+    Checking zmij v1.0.23
+    Checking memchr v2.8.3
+    Checking generic-array v0.14.7
+    Checking itoa v1.0.18
+    Checking bitflags v2.13.0
+    Checking cpufeatures v0.2.17
+    Checking linux-raw-sys v0.12.1
+    Checking foreign-types-shared v0.1.1
+    Checking foreign-types v0.3.2
+    Checking crossbeam-utils v0.8.22
+    Checking rustix v1.1.4
+    Checking crypto-common v0.1.7
+    Checking block-buffer v0.10.4
+    Checking digest v0.10.7
+    Checking inout v0.1.4
+    Checking cipher v0.4.4
+    Checking md-5 v0.10.6
+    Checking openssl-sys v0.9.117
+    Checking adler2 v2.0.1
+    Checking simd-adler32 v0.3.10
+    Checking miniz_oxide v0.8.9
+    Checking openssl v0.10.81
+    Checking serde_json v1.0.150
+    Checking aes v0.8.4
+    Checking ctr v0.9.2
+    Checking sha2 v0.10.9
+    Checking xattr v1.6.1
+    Checking hmac v0.12.1
+    Checking crossbeam-channel v0.5.16
+    Checking bzip2-sys v0.1.13+1.0.8
+    Checking crc32fast v1.5.0
+    Checking filetime v0.2.29
+    Checking base64 v0.22.1
+    Checking openssl-probe v0.2.1
+    Checking swift-core v0.1.0 (/root/work/peregrine-anon-ver-cold/swift-rust/crates/swift-core)
+    Checking log v0.4.33
+    Checking swift-crypto v0.1.0 (/root/work/peregrine-anon-ver-cold/swift-rust/crates/swift-crypto)
+    Checking swift-memcache v0.1.0 (/root/work/peregrine-anon-ver-cold/swift-rust/crates/swift-memcache)
+    Checking tar v0.4.46
+    Checking flate2 v1.1.9
+    Checking bzip2 v0.4.4
+    Checking sha1 v0.10.7
+    Checking swift-http v0.1.0 (/root/work/peregrine-anon-ver-cold/swift-rust/crates/swift-http)
+    Checking native-tls v0.2.18
+    Checking swift-middleware v0.1.0 (/root/work/peregrine-anon-ver-cold/swift-rust/crates/swift-middleware)
+    Checking swift-s3api v0.1.0 (/root/work/peregrine-anon-ver-cold/swift-rust/crates/swift-s3api)
+error: this `let...else` may be rewritten with the `?` operator
+    --> crates/swift-s3api/src/middleware.rs:1286:5
+     |
+1286 | /     let Some(stamp) = stamped else {
+1287 | |         return None;
+1288 | |     };
+     | |______^ help: replace it with: `let stamp = stamped?;`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#question_mark
+     = note: `-D clippy::question-mark` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::question_mark)]`
+
+error: this `if` statement can be collapsed
+    --> crates/swift-s3api/src/middleware.rs:2218:13
+     |
+2218 | /             if (200..300).contains(&head_resp.status) {
+2219 | |                 if worm_blocks_retention_put(
+2220 | |                     &head_resp.headers,
+2221 | |                     &mode_up,
+...    |
+2228 | |             }
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#collapsible_if
+     = note: `-D clippy::collapsible-if` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::collapsible_if)]`
+help: collapse nested if block
+     |
+2218 ~             if (200..300).contains(&head_resp.status)
+2219 ~                 && worm_blocks_retention_put(
+2220 |                     &head_resp.headers,
+ ...
+2226 |                     return s3_error_response("AccessDenied", None, &[]);
+2227 ~                 }
+     |
+
+error: redundant closure
+   --> crates/swift-s3api/src/object_lock_worm.rs:125:19
+    |
+125 |         .and_then(|s| parse_retain_until(s))
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace the closure with the function itself: `parse_retain_until`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#redundant_closure
+    = note: `-D clippy::redundant-closure` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::redundant_closure)]`
+
+error: could not compile `swift-s3api` (lib) due to 3 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `swift-s3api` (lib test) due to 3 previous errors

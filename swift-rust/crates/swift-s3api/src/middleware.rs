@@ -144,8 +144,8 @@ use crate::mpu::{
 use crate::object_lock_worm::{
     apply_amz_object_lock_headers, apply_default_retention_headers, bypass_governance_requested,
     default_retention_from_lock_xml, legal_hold_xml, parse_legal_hold_body, parse_retention_body,
-    retention_xml, worm_blocks_delete_with_bypass, HDR_BYPASS_GOVERNANCE, SYS_LEGAL_HOLD,
-    SYS_LOCK_MODE, SYS_RETAIN_UNTIL,
+    retention_xml, worm_blocks_delete_with_bypass, worm_blocks_retention_put, HDR_BYPASS_GOVERNANCE,
+    SYS_LEGAL_HOLD, SYS_LOCK_MODE, SYS_RETAIN_UNTIL,
 };
 use crate::parse::{extract_bucket_and_key, s3_to_swift_path, validate_bucket_name};
 use crate::response::{
@@ -201,6 +201,12 @@ pub struct S3Api {
     pub cold_map: crate::cold_tier::ColdPolicyMap,
     /// Optional lab cold backend (local dir / memory). Not tape/Glacier cloud.
     pub cold_backend: Option<Arc<dyn ColdBackend>>,
+    /// Lab: after successful archive + URI stamp, overwrite the hot object
+    /// body with empty bytes. Default false so fleet behavior is unchanged.
+    /// Metadata is kept so GET remains InvalidObjectState until restore.
+    /// Does **not** delete the cold copy (`restore_stage` still needs it).
+    /// LocalDir/Memory only — not tape/Glacier cloud.
+    pub cold_delete_hot_after_archive: bool,
     /// When set, unsigned S3 GET/HEAD for path-/vhost-style buckets map to this
     /// Swift account **without** auth override so container `.r:*` can allow
     /// anonymous reads. Multi-tenant deployments must set this explicitly.
@@ -221,6 +227,7 @@ impl S3Api {
             iam: crate::iam::IamService::new(),
             cold_map: crate::cold_tier::ColdPolicyMap::new(),
             cold_backend: None,
+            cold_delete_hot_after_archive: false,
             anonymous_account: None,
         }
     }
@@ -238,6 +245,13 @@ impl S3Api {
     /// Wire a lab cold backend (e.g. [`crate::LocalDirColdBackend`]). Not production tape.
     pub fn with_cold_backend(mut self, backend: Arc<dyn ColdBackend>) -> Self {
         self.cold_backend = Some(backend);
+        self
+    }
+
+    /// Lab knob: drop hot bytes after a successful archive+URI stamp.
+    /// Default false. Not tape/Glacier cloud.
+    pub fn with_cold_delete_hot_after_archive(mut self, enabled: bool) -> Self {
+        self.cold_delete_hot_after_archive = enabled;
         self
     }
 
@@ -1133,10 +1147,45 @@ fn deny_if_transition_blocks_get(headers: &mut HeaderKeyDict, now: i64) -> Optio
 /// Cap for materializing object bytes to lab-archive on due cold transition.
 const MAX_COLD_ARCHIVE_BODY: u64 = MAX_CONTROL_BODY;
 
+/// Headers persisted after due-cold archive (POST meta / optional PUT empty).
+const COLD_PERSIST_HEADERS: &[&str] = &[
+    META_STORAGE_CLASS,
+    SYS_TRANSITIONED,
+    SYS_COLD_POLICY_INDEX,
+    SYS_HOT_POLICY_INDEX,
+    SYS_COLD_BACKEND_URI,
+    HDR_BACKEND_STORAGE_POLICY_INDEX,
+];
+
+fn copy_cold_persist_headers(src: &HeaderKeyDict, dst: &mut HeaderKeyDict) {
+    for hdr in COLD_PERSIST_HEADERS {
+        if let Some(v) = src.get(hdr) {
+            dst.set(hdr, v);
+        }
+    }
+}
+
+fn archived_uri_from_stamp(stamp: Option<&crate::cold_tier::ColdMetaStamp>) -> Option<&str> {
+    stamp
+        .map(|s| s.backend_uri.as_str())
+        .filter(|u| !u.is_empty())
+}
+
+/// Replace hot body with empty bytes. Call only after a successful archive
+/// that stamped [`SYS_COLD_BACKEND_URI`]. Metadata on `headers` is left
+/// intact (caller keeps cold stamps). Lab LocalDir/Memory — not tape.
+fn replace_hot_body_empty(headers: &mut HeaderKeyDict, body: &mut Body) {
+    *body = Body::empty();
+    headers.set("Content-Length", "0");
+    headers.remove("Transfer-Encoding");
+}
+
 /// On GET/HEAD success: if a cold transition is due and `cold_map` is set,
 /// stamp cold meta; if `cold_backend` is wired, archive bytes and stamp
 /// [`SYS_COLD_BACKEND_URI`], then POST meta to persist. Without a backend,
-/// meta-only (no URI). Errors → S3 error response (no panic).
+/// meta-only (no URI). When `delete_hot` is true and archive stamped a URI,
+/// overwrite the hot object with an empty body (metadata kept). Errors →
+/// S3 error response (no panic).
 fn maybe_archive_due_cold_on_get_head(
     resp: &mut Response,
     method: &str,
@@ -1145,6 +1194,7 @@ fn maybe_archive_due_cold_on_get_head(
     key: &str,
     cold_map: &crate::cold_tier::ColdPolicyMap,
     cold_backend: Option<&Arc<dyn ColdBackend>>,
+    delete_hot: bool,
     next: &NextFn,
 ) -> Option<Response> {
     if !cold_map.is_configured() {
@@ -1234,7 +1284,7 @@ fn maybe_archive_due_cold_on_get_head(
             ));
         }
     };
-    let Some(_) = stamped else {
+    let Some(stamp) = stamped else {
         return None;
     };
 
@@ -1243,29 +1293,39 @@ fn maybe_archive_due_cold_on_get_head(
         "POST",
         &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
     );
-    for hdr in [
-        META_STORAGE_CLASS,
-        SYS_TRANSITIONED,
-        SYS_COLD_POLICY_INDEX,
-        SYS_HOT_POLICY_INDEX,
-        SYS_COLD_BACKEND_URI,
-        HDR_BACKEND_STORAGE_POLICY_INDEX,
-    ] {
-        if let Some(v) = resp.headers.get(hdr) {
-            post.headers.set(hdr, v);
-        }
-    }
+    copy_cold_persist_headers(&resp.headers, &mut post.headers);
     stamp_auth(&mut post, cred);
     let post_resp = next(post);
     if !(200..300).contains(&post_resp.status) {
         return Some(map_swift_error(post_resp.status, Some(bucket), Some(key)));
+    }
+
+    // Optional lab: drop hot bytes after a successful archive+URI stamp.
+    // Cold copy is untouched so restore_stage still works.
+    if delete_hot && body_owned.is_some() && !stamp.backend_uri.is_empty() {
+        let mut put = make_swift_req(
+            "PUT",
+            &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
+        );
+        copy_cold_persist_headers(&resp.headers, &mut put.headers);
+        if let Some(ct) = resp.headers.get("Content-Type") {
+            put.headers.set("Content-Type", ct);
+        }
+        replace_hot_body_empty(&mut put.headers, &mut put.body);
+        stamp_auth(&mut put, cred);
+        let put_resp = next(put);
+        if !(200..300).contains(&put_resp.status) {
+            return Some(map_swift_error(put_resp.status, Some(bucket), Some(key)));
+        }
     }
     None
 }
 
 /// On PUT: if lifecycle stamped an immediate cold transition and a lab backend
 /// is wired, archive the put body and stamp [`SYS_COLD_BACKEND_URI`] onto the
-/// outgoing Swift request (persists with the object write).
+/// outgoing Swift request (persists with the object write). When `delete_hot`
+/// is true and archive stamped a URI, the hot PUT body is replaced with empty
+/// bytes (metadata kept). Cold copy is untouched.
 fn maybe_archive_due_cold_on_put(
     swift_req: &mut Request,
     cred: &S3Credential,
@@ -1273,6 +1333,7 @@ fn maybe_archive_due_cold_on_put(
     key: &str,
     cold_map: &crate::cold_tier::ColdPolicyMap,
     cold_backend: Option<&Arc<dyn ColdBackend>>,
+    delete_hot: bool,
 ) -> Option<Response> {
     if !cold_map.is_configured() {
         return None;
@@ -1313,7 +1374,15 @@ fn maybe_archive_due_cold_on_put(
         be_ref,
         body_owned.as_deref(),
     ) {
-        Ok(_) => None,
+        Ok(stamp) => {
+            if delete_hot
+                && body_owned.is_some()
+                && archived_uri_from_stamp(stamp.as_ref()).is_some()
+            {
+                replace_hot_body_empty(&mut swift_req.headers, &mut swift_req.body);
+            }
+            None
+        }
         Err(e) => Some(s3_error_response(
             "InternalError",
             Some(&format!("cold archive failed: {e}")),
@@ -1738,6 +1807,7 @@ impl S3Api {
                     k,
                     &self.cold_map,
                     self.cold_backend.as_ref(),
+                    self.cold_delete_hot_after_archive,
                 ) {
                     return err;
                 }
@@ -1796,6 +1866,7 @@ impl S3Api {
                         k,
                         &self.cold_map,
                         self.cold_backend.as_ref(),
+                        self.cold_delete_hot_after_archive,
                         next,
                     ) {
                         return err;
@@ -2107,6 +2178,28 @@ fn handle_retention(
             }
             if crate::object_lock_worm::parse_retain_until(&until).is_none() {
                 return s3_error_response("MalformedXML", None, &[]);
+            }
+            let bypass = bypass_governance_requested(
+                req.headers
+                    .get(HDR_BYPASS_GOVERNANCE)
+                    .or_else(|| req.headers.get("X-Amz-Bypass-Governance-Retention")),
+            );
+            let mut head = make_swift_req(
+                "HEAD",
+                &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
+            );
+            stamp_auth(&mut head, cred);
+            let head_resp = next(head);
+            if (200..300).contains(&head_resp.status) {
+                if worm_blocks_retention_put(
+                    &head_resp.headers,
+                    &mode_up,
+                    &until,
+                    unix_now(),
+                    bypass,
+                ) {
+                    return s3_error_response("AccessDenied", None, &[]);
+                }
             }
             let mut post = make_swift_req(
                 "POST",
@@ -6003,6 +6096,10 @@ mod tests {
         put.body = Body::from(body.to_vec());
         let put = sign_request(put, "testing");
         let put_next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                // Object exists, no retention yet.
+                return Response::new(200);
+            }
             assert_eq!(r.method, "POST");
             assert_eq!(r.headers.get(SYS_LOCK_MODE), Some("COMPLIANCE"));
             assert!(r
@@ -6428,6 +6525,92 @@ mod tests {
     }
 
     #[test]
+    fn governance_retention_blocks_overwrite_put() {
+        let api = S3Api::new(cred_map());
+        let mut put = base_s3_req("PUT", "/mybucket/gov", "");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(b"new".to_vec());
+        let put = sign_request(put, "testing");
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                if r.path.ends_with("/gov") {
+                    let mut resp = Response::new(200);
+                    resp.headers.set(SYS_LOCK_MODE, "GOVERNANCE");
+                    resp.headers.set(SYS_RETAIN_UNTIL, "2099-12-31T00:00:00Z");
+                    return resp;
+                }
+                return Response::new(404);
+            }
+            panic!(
+                "overwrite PUT must not reach backend under GOVERNANCE retain-until: {} {}",
+                r.method, r.path
+            );
+        });
+        let resp = api.handle(put, &next);
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("AccessDenied"));
+    }
+
+    #[test]
+    fn compliance_retention_blocks_overwrite_put() {
+        let api = S3Api::new(cred_map());
+        let mut put = base_s3_req("PUT", "/mybucket/comp", "");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(b"new".to_vec());
+        let put = sign_request(put, "testing");
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                if r.path.ends_with("/comp") {
+                    let mut resp = Response::new(200);
+                    resp.headers.set(SYS_LOCK_MODE, "COMPLIANCE");
+                    resp.headers.set(SYS_RETAIN_UNTIL, "2099-12-31T00:00:00Z");
+                    return resp;
+                }
+                return Response::new(404);
+            }
+            panic!(
+                "overwrite PUT must not reach backend under COMPLIANCE retain-until: {} {}",
+                r.method, r.path
+            );
+        });
+        let resp = api.handle(put, &next);
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("AccessDenied"));
+    }
+
+    #[test]
+    fn compliance_retention_put_cannot_shorten() {
+        let api = S3Api::new(cred_map());
+        let body = br#"<Retention>
+  <Mode>COMPLIANCE</Mode>
+  <RetainUntilDate>2028-01-01T00:00:00Z</RetainUntilDate>
+</Retention>"#;
+        let mut put = base_s3_req("PUT", "/mybucket/obj1", "retention");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(body.to_vec());
+        let mut put = sign_request(put, "testing");
+        put.headers.set(HDR_BYPASS_GOVERNANCE, "true");
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                let mut resp = Response::new(200);
+                resp.headers.set(SYS_LOCK_MODE, "COMPLIANCE");
+                resp.headers.set(SYS_RETAIN_UNTIL, "2030-01-01T00:00:00Z");
+                return resp;
+            }
+            panic!(
+                "COMPLIANCE shorten PUT ?retention must not POST sysmeta: {} {}",
+                r.method, r.path
+            );
+        });
+        let resp = api.handle(put, &next);
+        assert_eq!(resp.status, 403);
+        let b = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(b.contains("AccessDenied"));
+    }
+
+    #[test]
     fn governance_bypass_header_allows_delete() {
         let api = S3Api::new(cred_map());
         let mut del = sign_request(base_s3_req("DELETE", "/mybucket/gov", ""), "testing");
@@ -6729,7 +6912,9 @@ mod tests {
         let lc_meta = lc_headers.get(S3_LIFECYCLE_META).unwrap().to_string();
 
         let put_uri = Arc::new(std::sync::Mutex::new(None::<String>));
+        let put_body = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
         let put_c = put_uri.clone();
+        let put_b = put_body.clone();
         let next: NextFn = Arc::new(move |r| {
             if r.method == "HEAD" {
                 if r.path.ends_with("/mybucket") {
@@ -6742,6 +6927,7 @@ mod tests {
             if r.method == "PUT" && r.path.ends_with("/imm") {
                 *put_c.lock().unwrap() =
                     r.headers.get(SYS_COLD_BACKEND_URI).map(str::to_string);
+                *put_b.lock().unwrap() = Some(r.body.into_vec(u64::MAX).unwrap());
                 assert_eq!(r.headers.get(META_STORAGE_CLASS), Some("GLACIER"));
                 assert_eq!(r.headers.get(SYS_TRANSITIONED), Some("1"));
                 assert_eq!(r.headers.get(SYS_COLD_POLICY_INDEX), Some("2"));
@@ -6759,6 +6945,157 @@ mod tests {
         assert_eq!(api.handle(put, &next).status, 200);
         let uri = put_uri.lock().unwrap().clone().expect("PUT stamps URI");
         assert!(uri.starts_with("memory://"), "uri={uri}");
+        let hot = put_body.lock().unwrap().clone().expect("PUT body");
+        assert_eq!(
+            hot, b"payload",
+            "default cold_delete_hot_after_archive=false must keep hot bytes"
+        );
         be.restore_stage(&uri, 1).unwrap();
+    }
+
+    #[test]
+    fn put_immediate_cold_transition_deletes_hot_when_configured() {
+        use crate::bucket_config::{apply_lifecycle_meta, S3_LIFECYCLE_META};
+        use crate::cold_tier::{MemoryColdBackend, SYS_COLD_BACKEND_URI, SYS_COLD_POLICY_INDEX};
+        use crate::lifecycle_exec::META_STORAGE_CLASS;
+
+        let be = Arc::new(MemoryColdBackend::default());
+        let api = S3Api::new(cred_map())
+            .with_cold_map(crate::cold_tier::ColdPolicyMap::from_csv("GLACIER:2,HOT:0"))
+            .with_cold_backend(be.clone())
+            .with_cold_delete_hot_after_archive(true);
+
+        let lc = br#"<?xml version="1.0"?>
+<LifecycleConfiguration>
+  <Rule>
+    <Filter><Prefix></Prefix></Filter>
+    <Status>Enabled</Status>
+    <Transition><Days>0</Days><StorageClass>GLACIER</StorageClass></Transition>
+  </Rule>
+</LifecycleConfiguration>"#;
+        let mut lc_headers = HeaderKeyDict::new();
+        apply_lifecycle_meta(&mut lc_headers, lc);
+        let lc_meta = lc_headers.get(S3_LIFECYCLE_META).unwrap().to_string();
+
+        let put_uri = Arc::new(std::sync::Mutex::new(None::<String>));
+        let put_body = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+        let put_c = put_uri.clone();
+        let put_b = put_body.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" {
+                if r.path.ends_with("/mybucket") {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(S3_LIFECYCLE_META, &lc_meta);
+                    return resp;
+                }
+                return Response::new(404);
+            }
+            if r.method == "PUT" && r.path.ends_with("/imm") {
+                *put_c.lock().unwrap() =
+                    r.headers.get(SYS_COLD_BACKEND_URI).map(str::to_string);
+                *put_b.lock().unwrap() = Some(r.body.into_vec(u64::MAX).unwrap());
+                assert_eq!(r.headers.get(META_STORAGE_CLASS), Some("GLACIER"));
+                assert_eq!(r.headers.get(SYS_TRANSITIONED), Some("1"));
+                assert_eq!(r.headers.get(SYS_COLD_POLICY_INDEX), Some("2"));
+                assert_eq!(r.headers.get("Content-Length"), Some("0"));
+                let mut resp = Response::new(201);
+                resp.headers.set("ETag", "abc");
+                return resp;
+            }
+            Response::new(500)
+        });
+
+        let mut put = base_s3_req("PUT", "/mybucket/imm", "");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(b"payload".to_vec());
+        let put = sign_request(put, "testing");
+        assert_eq!(api.handle(put, &next).status, 200);
+        let uri = put_uri.lock().unwrap().clone().expect("PUT stamps URI");
+        assert!(uri.starts_with("memory://"), "uri={uri}");
+        let hot = put_body.lock().unwrap().clone().expect("PUT body");
+        assert!(
+            hot.is_empty(),
+            "hot body must be empty after archive when knob is true, got {} bytes",
+            hot.len()
+        );
+        // restore_stage still works from the MemoryColdBackend copy
+        be.restore_stage(&uri, 1).unwrap();
+        assert_eq!(
+            be.blobs.lock().unwrap().get(&uri).map(|v| v.as_slice()),
+            Some(b"payload".as_slice()),
+            "cold copy must remain so restore_stage can succeed"
+        );
+    }
+
+    #[test]
+    fn get_due_cold_transition_deletes_hot_when_configured() {
+        use crate::cold_tier::{MemoryColdBackend, SYS_COLD_BACKEND_URI, SYS_COLD_POLICY_INDEX};
+        use crate::lifecycle_exec::{META_STORAGE_CLASS, SYS_TRANSITION_AT};
+
+        let be = Arc::new(MemoryColdBackend::default());
+        let api = S3Api::new(cred_map())
+            .with_cold_map(crate::cold_tier::ColdPolicyMap::from_csv("GLACIER:2,HOT:0"))
+            .with_cold_backend(be.clone())
+            .with_cold_delete_hot_after_archive(true);
+
+        let posted_uri = Arc::new(std::sync::Mutex::new(None::<String>));
+        let put_body = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+        let posted_c = posted_uri.clone();
+        let put_b = put_body.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" && r.path.ends_with("/mybucket") {
+                return Response::new(204); // versioning probe
+            }
+            if r.method == "GET" && r.path.ends_with("/coldobj") {
+                let mut resp = Response::new(200);
+                resp.headers.set(META_STORAGE_CLASS, "GLACIER");
+                resp.headers.set(SYS_TRANSITION_AT, "1");
+                resp.headers.set("ETag", "e");
+                resp.headers.set("Content-Length", "7");
+                resp.headers.set("Content-Type", "application/octet-stream");
+                resp.body = Body::from(b"payload".to_vec());
+                return resp;
+            }
+            if r.method == "POST" && r.path.ends_with("/coldobj") {
+                *posted_c.lock().unwrap() =
+                    r.headers.get(SYS_COLD_BACKEND_URI).map(str::to_string);
+                assert_eq!(r.headers.get(SYS_COLD_POLICY_INDEX), Some("2"));
+                assert_eq!(r.headers.get(SYS_TRANSITIONED), Some("1"));
+                return Response::new(202);
+            }
+            if r.method == "PUT" && r.path.ends_with("/coldobj") {
+                *put_b.lock().unwrap() = Some(r.body.into_vec(u64::MAX).unwrap());
+                assert_eq!(r.headers.get(SYS_COLD_POLICY_INDEX), Some("2"));
+                assert_eq!(r.headers.get(SYS_TRANSITIONED), Some("1"));
+                assert!(r.headers.get(SYS_COLD_BACKEND_URI).is_some());
+                assert_eq!(r.headers.get("Content-Length"), Some("0"));
+                let mut resp = Response::new(201);
+                resp.headers.set("ETag", "empty");
+                return resp;
+            }
+            Response::new(500)
+        });
+
+        let req = sign_request(base_s3_req("GET", "/mybucket/coldobj", ""), "testing");
+        let resp = api.handle(req, &next);
+        assert_eq!(
+            resp.status, 400,
+            "cold GET must be InvalidObjectState after archive"
+        );
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("InvalidObjectState"), "{body}");
+        let uri = posted_uri.lock().unwrap().clone();
+        let uri = uri.expect("POST must stamp SYS_COLD_BACKEND_URI");
+        assert!(uri.starts_with("memory://"), "uri={uri}");
+        let hot = put_body.lock().unwrap().clone().expect("hot overwrite PUT");
+        assert!(
+            hot.is_empty(),
+            "GET persist path must overwrite hot body when knob is true"
+        );
+        be.restore_stage(&uri, 1).unwrap();
+        assert_eq!(
+            be.blobs.lock().unwrap().get(&uri).map(|v| v.as_slice()),
+            Some(b"payload".as_slice())
+        );
     }
 }

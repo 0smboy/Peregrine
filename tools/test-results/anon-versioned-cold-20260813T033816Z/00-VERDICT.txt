@@ -1,0 +1,10 @@
+VERDICT=GREEN
+host=swift3
+CARGO_HOME=/root/work/peregrine-cargo-home
+tree=/root/work/peregrine-anon-ver-cold/swift-rust
+stamp=20260813T033816Z
+utc=2026-08-13T03:38:16Z
+sgt=2026-08-13 11:38:16 SGT
+suite=cargo test -p swift-s3api --lib
+result=247 passed; 0 failed
+fleet_mutate=NO
