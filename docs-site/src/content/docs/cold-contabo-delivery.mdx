@@ -1,6 +1,6 @@
 ---
 title: Cold + Contabo S3 delivery
-description: Honest delivery note for LocalDir cold/restore and Contabo S3 matrix at tip 8663d11 — IMPLEMENTED_SUBSET_ONLY.
+description: Honest delivery note for LocalDir cold/restore and Contabo S3 matrix at tip 8663d11 — IMPLEMENTED_SUBSET_ONLY. swift3-only cold canary GREEN (Smoke A).
 sidebar:
   order: 25
 ---
@@ -11,20 +11,22 @@ Short delivery note for the **2026-08-12 / 2026-08-13** cold-backend and Contabo
 
 | Item | Value |
 |------|-------|
-| Branch | `feat/cold-localdir-restore-77dd9f4` @ `8663d11` |
-| Fleet tip | still **`77dd9f4`** (binary `117d7b08…`) — cold enable not fleet-redeployed |
+| Branch | `feat/cold-localdir-restore-77dd9f4` (canary code tip `8663d11`) |
+| Fleet peers | **swift1/2/4 still `77dd9f4`** (binary `117d7b08…`) — not rolled |
+| swift3 canary | **GREEN (Smoke A)** · binary `b64deec2…` from `8663d11` · `[filter:s3api] cold_backend_root=/var/cache/peregrine-cold` |
+| VIP | mixed **~25%** canary (proxy3 UP among proxy1–4) |
 | Claim stance | **IMPLEMENTED_SUBSET_ONLY** |
 
 ## What is GREEN
 
-- **Contabo S3 (VIP)** — extended matrix **29/29 GREEN (bounded)** at fleet tip `77dd9f4` / binary `117d7b08…`. Short EC2 SigV4 smoke also GREEN. Not a multi-hour soak; not full AWS IAM cloud.
+- **Contabo S3 (VIP)** — extended matrix **29/29 GREEN (bounded)** at fleet tip `77dd9f4` / binary `117d7b08…`. Short EC2 SigV4 smoke also GREEN. Not a multi-hour soak; not full AWS IAM cloud. VIP is now mixed ~25% `8663d11` (swift3) / ~75% `77dd9f4` (peers).
 - **Lab LocalDir cold** — `LocalDirColdBackend` (`filecold://…`) + `?restore` RestoreObject + **archive-on-transition** unit suite **GREEN** on swift3 (physical cold unit + archive unit).
-- **Cold canary** — **runbook only**; no fleet mutate / no Contabo cold enable. Verdict previously `BLOCKED_NEED_CANARY_APPROVAL`.
+- **Cold canary (swift3 only)** — **GREEN (Smoke A)**. APPLY_OK, not rolled back. TempAuth PUT/GET 201/200; S3 POST `?restore` on a warm object returns HTTP 400 `InvalidObjectState` (handler live). Validated on localhost:8080, not via VIP. Peers unchanged.
 
 ## Explicitly not claimed
 
 - Tape / Glacier / Contabo object-lock media
-- Fleet `cold_backend_root` / `filecold_root` enable or canary mutate
+- Fleet-wide `cold_backend_root` / `filecold_root` enable (swift3 canary only; do not roll swift1/2/4)
 - Multi-hour S3 soak, anonymous/versioned archive paths, hot-byte delete after archive
 
 ## Evidence pack
@@ -33,8 +35,10 @@ Drive folder (handoffs + evidence dirs):
 
 [https://drive.google.com/drive/folders/12aIrbaAgTEJwifyfcQBDFxxqZ2cTbsHp](https://drive.google.com/drive/folders/12aIrbaAgTEJwifyfcQBDFxxqZ2cTbsHp)
 
+Canary evidence: Mac `tools/test-results/canary-8663d11-cold-20260813T025339Z/` and swift3 `/root/work/peregrine-acceptance-20260810/canary-8663d11-cold-20260813T025339Z`. Artifact `/root/work/peregrine-artifacts/peregrine-proxy-8663d11-ec.tar.gz` sha `50c0245d030409b230ad6ccaa0577a769954d185a7c0b05715aae2eaedf362c0`.
+
 Related ops / verification: [Operations](/operations), [Testing & verification](/testing), [Lab cluster](/lab-cluster).
 
 <Aside type="caution" title="IMPLEMENTED_SUBSET_ONLY">
-Do not treat this page as tape/Glacier readiness or as a fleet cold cutover. Lab LocalDir units and bounded Contabo S3 matrix only.
+Do not treat this page as tape/Glacier readiness or as a fleet cold cutover. Lab LocalDir units, bounded Contabo S3 matrix, and a **swift3-only** cold canary (Smoke A) only. Peers remain `77dd9f4`.
 </Aside>
