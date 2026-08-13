@@ -1,0 +1,11 @@
+# live reconfirm (box) 2026-08-13 10:56:02 SGT / 2026-08-13T02:56:02Z UTC
+
+swift3 installed SHA b64deec239833c567604d9efe0211b3bd20b543b570de675cc40fd7fe4785148
+swift3 /proc/MainPID exe same SHA (running canary, started 2026-08-13 02:53:52 UTC)
+healthcheck localhost:8080 = 200
+HAProxy swift3: proxy1=UP proxy2=UP proxy3=UP proxy4=UP
+cold_backend_root present on swift3 only
+/var/cache/peregrine-cold mode 750
+peers swift1/2/4 SHA 117d7b088e691be6826cca0fca067353bfc52c76f96b25aec1882f1d80d3052c, cold_backend_root_count=0, health=200
+rolled_back=no
+overlap: canary-8663d11-cold-20260813T025437Z aborted at pre-state (already canary); no extra mutation

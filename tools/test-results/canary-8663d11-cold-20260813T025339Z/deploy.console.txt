@@ -1,0 +1,2 @@
+bin/swift-proxy-server: OK
+APPLY_OK commit=8663d11 node=swift3 rollback=/root/peregrine-proxy-rollback-8663d11-swift3-20260813T025352Z-2q7Ob4 evidence=/root/work/peregrine-acceptance-20260810/canary-8663d11-cold-20260813T025339Z

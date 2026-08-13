@@ -1,0 +1,30 @@
+Aug 13 02:53:39 swift3 systemd[1]: swift-proxy.service: Deactivated successfully.
+Aug 13 02:53:39 swift3 systemd[1]: Stopped Swift proxy server (rust).
+Aug 13 02:53:39 swift3 systemd[1]: swift-proxy.service: Consumed 1.220s CPU time, 5.4M memory peak.
+Aug 13 02:53:52 swift3 systemd[1]: Started Swift proxy server (rust).
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO swift-proxy-server listening on 0.0.0.0:8080
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO proxy_logging enabled (logger sink)
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO cache enabled (memcache_servers=10.0.0.1:11211)
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO listing_formats enabled
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO bulk enabled (delete; max_deletes_per_request=10000)
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO tempurl enabled
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO formpost deprecated digests configured: sha1
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO formpost enabled
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO staticweb enabled
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO container_quotas enabled
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO account_quotas enabled
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO symlink enabled (symloop_max=2)
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO versioned_writes enabled (allow=Some(true))
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO s3api enabled (SigV4+CRUD+list + EC2→s3token deferral; not advertised on Swift /info)
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO s3token enabled (auth_uri=http://127.0.0.1:5001)
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO authtoken enabled (delay_auth_decision=true)
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO keystoneauth enabled (reseller_prefix=AUTH_)
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO tempauth enabled
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO copy enabled (yield_frequency=10)
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO slo enabled (concurrency=2, yield_frequency=10)
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO dlo enabled
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO proxy_logging enabled (logger sink)
+Aug 13 02:53:52 swift3 proxy-server[1017645]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 13 02:53:53 swift3 proxy-server[1017645]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 02:53:53 swift3 proxy-server[1017645]: INFO - GET /healthcheck 200 0 0.0004 -

@@ -1,0 +1,10 @@
+commit=8663d11
+git_tip=8663d11 feat(s3api): archive-on-transition via optional ColdBackend
+builder=swift3
+rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo=cargo 1.97.1 (c980f4866 2026-06-30)
+features=swift-proxy-server/ec
+source_tree=/root/work/peregrine-cold-physical-77dd9f4/swift-rust
+built_at=2026-08-13T02:50:46Z
+note=on-node tree MD5-matches Mac Peregrine-clippy 8663d11 (HEAD rust identical; later df9280e docs-only)
+CARGO_HOME=/root/work/peregrine-cargo-home

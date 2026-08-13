@@ -1,0 +1,10 @@
+stamp=20260813T025339Z
+apply=APPLY_OK
+smoke=SMOKE_A_PASS
+rolled_back=no
+built_sha=b64deec239833c567604d9efe0211b3bd20b543b570de675cc40fd7fe4785148
+installed_sha=b64deec239833c567604d9efe0211b3bd20b543b570de675cc40fd7fe4785148
+conf_bak=/etc/swift/proxy-server.conf.bak-pre-cold-8663d11-20260813T025339Z
+rollback_dir=/root/peregrine-proxy-rollback-8663d11-swift3-20260813T025352Z-2q7Ob4
+evidence=/root/work/peregrine-acceptance-20260810/canary-8663d11-cold-20260813T025339Z
+note=proxy3 will rejoin VIP once healthy (~25% canary). validated on localhost:8080.

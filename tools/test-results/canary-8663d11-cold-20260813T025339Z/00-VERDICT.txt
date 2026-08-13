@@ -1,0 +1,14 @@
+VERDICT=GREEN
+SCOPE=swift3-only
+APPLY=APPLY_OK
+SMOKE_A=PASS
+ROLLED_BACK=no
+FLEET_PEERS=77dd9f4 (swift1/2/4 binary 117d7b08…)
+CANARY_COMMIT=8663d11
+CANARY_SHA=b64deec239833c567604d9efe0211b3bd20b543b570de675cc40fd7fe4785148
+ARTIFACT=/root/work/peregrine-artifacts/peregrine-proxy-8663d11-ec.tar.gz
+ARTIFACT_SHA=50c0245d030409b230ad6ccaa0577a769954d185a7c0b05715aae2eaedf362c0
+COLD_BACKEND_ROOT=/var/cache/peregrine-cold
+VIP=mixed ~25% canary (proxy3 UP among proxy1-4)
+STANCE=IMPLEMENTED_SUBSET_ONLY
+NOTE=Smoke A on localhost:8080 (not VIP). Peers not rolled. Do not fleet-mutate.

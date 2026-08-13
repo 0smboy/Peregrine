@@ -1,0 +1,7 @@
+90:[filter:s3api]
+91-use = egg:swift#s3api
+92-location = RegionOne
+93-cold_backend_root = /var/cache/peregrine-cold
+94-
+95-
+96-[filter:s3token]

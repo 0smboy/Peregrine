@@ -1,0 +1,2 @@
+SMOKE_A_PASS
+put_get=200 restore_http=400 InvalidObjectState=yes
