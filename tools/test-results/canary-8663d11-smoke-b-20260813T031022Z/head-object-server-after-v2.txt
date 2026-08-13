@@ -1,0 +1,13 @@
+http=200
+sysmeta_uri_present=True
+sysmeta_transitioned_present=True
+header_names=Accept-Ranges,Connection,Content-Length,Content-Type,Etag,Last-Modified,X-Backend-Data-Timestamp,X-Backend-Durable-Timestamp,X-Backend-Timestamp,X-Object-Meta-S3-Storage-Class,X-Object-Sysmeta-S3-Cold-Backend-Uri,X-Object-Sysmeta-S3-Cold-Policy-Index,X-Object-Sysmeta-S3-Hot-Policy-Index,X-Object-Sysmeta-S3-Transitioned,X-Timestamp
+value:Content-Type=application/x-www-form-urlencoded
+value:X-Object-Meta-S3-Storage-Class=GLACIER
+value:X-Object-Sysmeta-S3-Transitioned=1
+value:X-Object-Sysmeta-S3-Cold-Backend-Uri=filecold://0/AUTH_test/pg-smokeb-8663d11-20260813t031022z/636f6c642d6f626a6563742e747874
+value:X-Object-Sysmeta-S3-Cold-Policy-Index=0
+value:X-Object-Sysmeta-S3-Hot-Policy-Index=0
+value:Etag="12b740336cf38f60f9f569f785fa12fc"
+value:X-Timestamp=1786590623.99062
+value:Content-Length=37

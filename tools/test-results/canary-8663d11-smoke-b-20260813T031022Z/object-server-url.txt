@@ -1,0 +1,1 @@
+http://127.0.0.1:6211/d2/7174/AUTH_test/pg-smokeb-8663d11-20260813t031022z/cold-object.txt

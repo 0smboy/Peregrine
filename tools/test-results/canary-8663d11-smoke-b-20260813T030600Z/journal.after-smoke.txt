@@ -1,0 +1,80 @@
+Aug 13 03:05:21 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:24 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:25 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:26 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0005 -
+Aug 13 03:05:26 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:29 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0006 -
+Aug 13 03:05:30 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:31 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 13 03:05:31 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:34 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:35 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:36 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:36 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:39 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:40 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:41 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 13 03:05:41 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:44 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0000 -
+Aug 13 03:05:45 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:46 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 13 03:05:46 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:49 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:51 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:51 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:51 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0000 -
+Aug 13 03:05:54 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:56 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:56 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:56 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:05:59 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:06:00 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0004 -
+Aug 13 03:06:00 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/00 GET /auth/v1.0 HTTP/1.0 200 - Python-urllib/3.9 - - - - tx550a83408d7b5ad3000b3-006a7d3498 - 0.0000 - - 1786590360.741721630 1786590360.741768599 -
+Aug 13 03:06:00 swift3 proxy-server[1029564]: INFO - GET /auth/v1.0 200 0 0.0005 -
+Aug 13 03:06:00 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/00 PUT /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z HTTP/1.0 201 - Python-urllib/3.9 <redacted> - - - tx73a0be0899d337ac000b4-006a7d3498 - 0.0280 - - 1786590360.766294003 1786590360.794252157 0
+Aug 13 03:06:00 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/00 PUT /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z HTTP/1.0 201 - Python-urllib/3.9 <redacted> - - - tx73a0be0899d337ac000b4-006a7d3498 - 0.0487 - - 1786590360.745615959 1786590360.794325590 0
+Aug 13 03:06:00 swift3 proxy-server[1029564]: INFO - PUT /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z 201 0 0.0489 -
+Aug 13 03:06:00 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/00 POST /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z HTTP/1.0 400 - - - - 61 - - - 0.0332 - - 1786590360.796535969 1786590360.829731226 -
+Aug 13 03:06:00 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/00 PUT /pg-smokeb-8663d11-20260813t030600z%3Flifecycle%3D HTTP/1.0 400 - Python-urllib/3.9 - 210 116 - txb448768f59eec282000b5-006a7d3498 - 0.0334 - - 1786590360.796442986 1786590360.829796314 -
+Aug 13 03:06:00 swift3 proxy-server[1029564]: INFO - PUT /pg-smokeb-8663d11-20260813t030600z?lifecycle= 400 0 0.0336 -
+Aug 13 03:06:00 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/00 POST /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z HTTP/1.0 204 - Python-urllib/3.9 <redacted> - - - txf2514cff6da75ec7000b6-006a7d3498 - 0.0601 - - 1786590360.855048656 1786590360.915107965 -
+Aug 13 03:06:00 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/00 POST /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z HTTP/1.0 204 - Python-urllib/3.9 <redacted> - - - txf2514cff6da75ec7000b6-006a7d3498 - 0.0837 - - 1786590360.831473827 1786590360.915177822 -
+Aug 13 03:06:00 swift3 proxy-server[1029564]: INFO - POST /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z 204 0 0.0839 -
+Aug 13 03:06:01 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/01 HEAD /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z HTTP/1.0 204 - Python-urllib/3.9 <redacted> - - - tx32f90572558973ab000b7-006a7d3498 - 0.1045 - - 1786590360.939797640 1786590361.044248819 0
+Aug 13 03:06:01 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0000 -
+Aug 13 03:06:01 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/01 HEAD /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z%3Fformat%3Djson HTTP/1.0 204 - Python-urllib/3.9 <redacted> - - - tx32f90572558973ab000b7-006a7d3498 - 0.0817 - - 1786590361.071566105 1786590361.153292179 0
+Aug 13 03:06:01 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/01 HEAD /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z HTTP/1.0 204 - Python-urllib/3.9 <redacted> - - - tx32f90572558973ab000b7-006a7d3498 - 0.2355 - - 1786590360.917889833 1786590361.153382063 0
+Aug 13 03:06:01 swift3 proxy-server[1029564]: INFO - HEAD /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z 204 0 0.2360 -
+Aug 13 03:06:01 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/01 HEAD /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z HTTP/1.0 204 - - - - - - - - 0.1239 - - 1786590361.156331301 1786590361.280202866 0
+Aug 13 03:06:01 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/01 HEAD /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z/cold-object.txt HTTP/1.0 404 - - - - - - - - 0.0573 - - 1786590361.280290604 1786590361.337583303 -
+Aug 13 03:06:01 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/01 HEAD /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z/cold-object.txt HTTP/1.0 404 - - - - - - - - 0.0363 - - 1786590361.337670088 1786590361.373924017 -
+Aug 13 03:06:01 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:06:01 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/01 HEAD /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z HTTP/1.0 204 - - - - - - - - 0.1587 - - 1786590361.373996019 1786590361.532673836 0
+Aug 13 03:06:01 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:06:01 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/01 HEAD /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z HTTP/1.0 204 - - - - - - - - 0.1337 - - 1786590361.533034801 1786590361.666728020 0
+Aug 13 03:06:01 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/01 PUT /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z/cold-object.txt HTTP/1.0 201 - Python-urllib/3.9 - 37 - - txb1a9945871412154000b9-006a7d3499 - 0.0656 - - 1786590361.668776751 1786590361.734423876 0
+Aug 13 03:06:01 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/01 PUT /pg-smokeb-8663d11-20260813t030600z/cold-object.txt HTTP/1.0 200 - Python-urllib/3.9 - 37 - - txb1a9945871412154000b9-006a7d3499 - 0.5788 - - 1786590361.156242847 1786590361.735014439 -
+Aug 13 03:06:01 swift3 proxy-server[1029564]: INFO - PUT /pg-smokeb-8663d11-20260813t030600z/cold-object.txt 200 0 0.5792 -
+Aug 13 03:06:01 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/01 HEAD /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z HTTP/1.0 204 - Python-urllib/3.9 <redacted> - - - tx78de82911d4d9a69000bc-006a7d3499 - 0.0390 - - 1786590361.779980898 1786590361.819017172 0
+Aug 13 03:06:01 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/01 HEAD /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z/cold-object.txt HTTP/1.0 200 - Python-urllib/3.9 <redacted> - - - tx78de82911d4d9a69000bc-006a7d3499 - 0.0087 - - 1786590361.856909275 1786590361.865616083 -
+Aug 13 03:06:01 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/01 HEAD /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z/cold-object.txt HTTP/1.0 200 - Python-urllib/3.9 <redacted> - - - tx78de82911d4d9a69000bc-006a7d3499 - 0.1287 - - 1786590361.737272263 1786590361.865925550 -
+Aug 13 03:06:01 swift3 proxy-server[1029564]: INFO - HEAD /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z/cold-object.txt 200 0 0.1320 -
+Aug 13 03:06:01 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/01 HEAD /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z/cold-object.txt HTTP/1.0 200 - - - - - - - - 0.0048 - - 1786590361.871355534 1786590361.876163960 -
+Aug 13 03:06:02 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/02 POST /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z/cold-object.txt HTTP/1.0 202 - - - - 76 - - - 0.4186 - - 1786590361.876257181 1786590362.294882774 0
+Aug 13 03:06:02 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/02 POST /pg-smokeb-8663d11-20260813t030600z/cold-object.txt%3Frestore%3D HTTP/1.0 202 - Python-urllib/3.9 - 47 - - txb9863b27d97f85ed000bd-006a7d3499 - 0.4237 - - 1786590361.871221304 1786590362.294962883 -
+Aug 13 03:06:02 swift3 proxy-server[1029564]: INFO - POST /pg-smokeb-8663d11-20260813t030600z/cold-object.txt?restore= 202 0 0.4239 -
+Aug 13 03:06:02 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/02 HEAD /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z/cold-object.txt HTTP/1.0 200 - - - - - - - - 0.0139 - - 1786590362.325539827 1786590362.339431524 -
+Aug 13 03:06:02 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/02 GET /pg-smokeb-8663d11-20260813t030600z/cold-object.txt%3Frestore%3D HTTP/1.0 200 - Python-urllib/3.9 - - 148 - txf78f1166b185ba13000be-006a7d349a - 0.0141 - - 1786590362.325453758 1786590362.339504004 -
+Aug 13 03:06:02 swift3 proxy-server[1029564]: INFO - GET /pg-smokeb-8663d11-20260813t030600z/cold-object.txt?restore= 200 0 0.0189 -
+Aug 13 03:06:02 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/02 HEAD /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z HTTP/1.0 204 - Python-urllib/3.9 <redacted> - - - tx3836ca0c255bee06000bf-006a7d349a - 0.0625 - - 1786590362.369029522 1786590362.431480408 0
+Aug 13 03:06:02 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/02 HEAD /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z/cold-object.txt HTTP/1.0 200 - Python-urllib/3.9 <redacted> - - - tx3836ca0c255bee06000bf-006a7d349a - 0.0297 - - 1786590362.503371239 1786590362.533021927 -
+Aug 13 03:06:02 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/02 HEAD /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z/cold-object.txt HTTP/1.0 200 - Python-urllib/3.9 <redacted> - - - tx3836ca0c255bee06000bf-006a7d349a - 0.1947 - - 1786590362.345678568 1786590362.540335894 -
+Aug 13 03:06:02 swift3 proxy-server[1029564]: INFO - HEAD /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z/cold-object.txt 200 0 0.1973 -
+Aug 13 03:06:02 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/02 HEAD /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z HTTP/1.0 204 - Python-urllib/3.9 <redacted> - - - tx763fa05cbdc56ac2000c0-006a7d349a - 0.0145 - - 1786590362.546924829 1786590362.561465263 0
+Aug 13 03:06:02 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/02 DELETE /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z/cold-object.txt HTTP/1.0 204 - Python-urllib/3.9 <redacted> - - - tx763fa05cbdc56ac2000c0-006a7d349a - 0.1960 - - 1786590362.631567717 1786590362.827557087 -
+Aug 13 03:06:02 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/02 DELETE /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z/cold-object.txt HTTP/1.0 204 - Python-urllib/3.9 <redacted> - - - tx763fa05cbdc56ac2000c0-006a7d349a - 0.2807 - - 1786590362.546887398 1786590362.827633381 -
+Aug 13 03:06:02 swift3 proxy-server[1029564]: INFO - DELETE /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z/cold-object.txt 204 0 0.2809 -
+Aug 13 03:06:03 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/03 DELETE /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z HTTP/1.0 204 - Python-urllib/3.9 <redacted> - - - txb6e758f381a7667f000c1-006a7d349a - 0.2486 - - 1786590362.895951986 1786590363.144547701 -
+Aug 13 03:06:03 swift3 proxy-server[1029564]: INFO - - 13/Aug/2026/03/06/03 DELETE /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z HTTP/1.0 204 - Python-urllib/3.9 <redacted> - - - txb6e758f381a7667f000c1-006a7d349a - 0.3132 - - 1786590362.831392050 1786590363.144613504 -
+Aug 13 03:06:03 swift3 proxy-server[1029564]: INFO - DELETE /v1/AUTH_test/pg-smokeb-8663d11-20260813t030600z 204 0 0.3148 -
+Aug 13 03:06:03 swift3 proxy-server[1029564]: INFO - GET /healthcheck 200 0 0.0002 -

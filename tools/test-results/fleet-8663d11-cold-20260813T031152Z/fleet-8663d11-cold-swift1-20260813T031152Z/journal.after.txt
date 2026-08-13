@@ -1,0 +1,50 @@
+Aug 13 03:11:30 swift1 proxy-server[861176]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:11:31 swift1 proxy-server[861176]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:11:32 swift1 proxy-server[861176]: INFO - GET /healthcheck 200 0 0.0003 -
+Aug 13 03:11:35 swift1 proxy-server[861176]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:11:35 swift1 proxy-server[861176]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:11:36 swift1 proxy-server[861176]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:11:37 swift1 proxy-server[861176]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:11:40 swift1 proxy-server[861176]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:11:40 swift1 proxy-server[861176]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:11:41 swift1 proxy-server[861176]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:11:42 swift1 proxy-server[861176]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:11:45 swift1 proxy-server[861176]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:11:45 swift1 proxy-server[861176]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:11:46 swift1 proxy-server[861176]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:11:47 swift1 proxy-server[861176]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 13 03:11:50 swift1 proxy-server[861176]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:11:50 swift1 proxy-server[861176]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:11:51 swift1 proxy-server[861176]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:11:52 swift1 proxy-server[861176]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 13 03:11:53 swift1 proxy-server[861176]: INFO - GET /healthcheck 200 0 0.0003 -
+Aug 13 03:11:53 swift1 systemd[1]: Stopping Swift proxy server (rust)...
+Aug 13 03:11:53 swift1 proxy-server[861176]: INFO exiting
+Aug 13 03:11:53 swift1 systemd[1]: swift-proxy.service: Deactivated successfully.
+Aug 13 03:11:53 swift1 systemd[1]: Stopped Swift proxy server (rust).
+Aug 13 03:11:53 swift1 systemd[1]: swift-proxy.service: Consumed 48min 32.995s CPU time, 29.1M memory peak.
+Aug 13 03:12:08 swift1 systemd[1]: Started Swift proxy server (rust).
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO swift-proxy-server listening on 0.0.0.0:8080
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO proxy_logging enabled (logger sink)
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO cache enabled (memcache_servers=10.0.0.1:11211)
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO listing_formats enabled
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO bulk enabled (delete; max_deletes_per_request=10000)
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO tempurl enabled
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO formpost deprecated digests configured: sha1
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO formpost enabled
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO staticweb enabled
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO container_quotas enabled
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO account_quotas enabled
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO symlink enabled (symloop_max=2)
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO versioned_writes enabled (allow=Some(true))
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO s3api enabled (SigV4+CRUD+list + EC2→s3token deferral; not advertised on Swift /info)
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO s3token enabled (auth_uri=http://127.0.0.1:5001)
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO authtoken enabled (delay_auth_decision=true)
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO keystoneauth enabled (reseller_prefix=AUTH_)
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO tempauth enabled
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO copy enabled (yield_frequency=10)
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO slo enabled (concurrency=2, yield_frequency=10)
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO dlo enabled
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO proxy_logging enabled (logger sink)
+Aug 13 03:12:08 swift1 proxy-server[1812867]: INFO - GET /healthcheck 200 0 0.0003 -

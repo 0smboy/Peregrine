@@ -1,0 +1,10 @@
+GREEN
+method=archive-on-put
+lifecycle_via=swift_container_meta
+planted=False
+restore_post_http=202
+restore_get_http=200
+filecold_existed_before_restore=True
+x_amz_restore=ongoing-request="false", expiry-date="1786676761"
+has_restore_status_xml=True
+uri=filecold://0/AUTH_test/pg-smokeb-8663d11-20260813t030600z/636f6c642d6f626a6563742e747874

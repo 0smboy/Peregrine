@@ -1,0 +1,50 @@
+Aug 13 03:13:17 swift4 proxy-server[415009]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 13 03:13:18 swift4 proxy-server[415009]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 13 03:13:21 swift4 proxy-server[415009]: INFO - GET /healthcheck 200 0 0.0003 -
+Aug 13 03:13:22 swift4 proxy-server[415009]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:13:22 swift4 proxy-server[415009]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:13:23 swift4 proxy-server[415009]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:13:26 swift4 proxy-server[415009]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:13:27 swift4 proxy-server[415009]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:13:27 swift4 proxy-server[415009]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:13:28 swift4 proxy-server[415009]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 13 03:13:31 swift4 proxy-server[415009]: INFO - GET /healthcheck 200 0 0.0050 -
+Aug 13 03:13:32 swift4 proxy-server[415009]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:13:32 swift4 proxy-server[415009]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:13:33 swift4 proxy-server[415009]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:13:36 swift4 proxy-server[415009]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:13:37 swift4 proxy-server[415009]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:13:37 swift4 proxy-server[415009]: INFO - GET /healthcheck 200 0 0.0001 -
+Aug 13 03:13:38 swift4 proxy-server[415009]: INFO - GET /healthcheck 200 0 0.0002 -
+Aug 13 03:13:39 swift4 proxy-server[415009]: INFO - GET /healthcheck 200 0 0.0003 -
+Aug 13 03:13:39 swift4 systemd[1]: Stopping Swift proxy server (rust)...
+Aug 13 03:13:39 swift4 proxy-server[415009]: INFO exiting
+Aug 13 03:13:39 swift4 systemd[1]: swift-proxy.service: Deactivated successfully.
+Aug 13 03:13:39 swift4 systemd[1]: Stopped Swift proxy server (rust).
+Aug 13 03:13:39 swift4 systemd[1]: swift-proxy.service: Consumed 1h 18min 2.917s CPU time, 16.0M memory peak.
+Aug 13 03:13:55 swift4 systemd[1]: Started Swift proxy server (rust).
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO swift-proxy-server listening on 0.0.0.0:8080
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO pipeline from conf: catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO proxy_logging enabled (logger sink)
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO cache enabled (memcache_servers=10.0.0.1:11211)
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO listing_formats enabled
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO bulk enabled (delete; max_deletes_per_request=10000)
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO tempurl enabled
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO formpost deprecated digests configured: sha1
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO formpost enabled
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO staticweb enabled
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO container_quotas enabled
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO account_quotas enabled
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO symlink enabled (symloop_max=2)
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO versioned_writes enabled (allow=Some(true))
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO s3api enabled (SigV4+CRUD+list + EC2→s3token deferral; not advertised on Swift /info)
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO s3token enabled (auth_uri=http://10.0.0.1:5001)
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO authtoken enabled (delay_auth_decision=true)
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO keystoneauth enabled (reseller_prefix=AUTH_)
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO tempauth enabled
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO copy enabled (yield_frequency=10)
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO slo enabled (concurrency=2, yield_frequency=10)
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO dlo enabled
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO proxy_logging enabled (logger sink)
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO - GET /healthcheck 200 0 0.0016 -
+Aug 13 03:13:56 swift4 proxy-server[626401]: INFO - GET /healthcheck 200 0 0.0022 -

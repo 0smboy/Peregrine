@@ -1,0 +1,5 @@
+exists=True
+uri=filecold://0/AUTH_test/pg-smokeb-8663d11-20260813t030600z/636f6c642d6f626a6563742e747874
+path=/var/cache/peregrine-cold/0/AUTH_test/pg-smokeb-8663d11-20260813t030600z/636f6c642d6f626a6563742e747874
+method=archive-on-put
+planted=False

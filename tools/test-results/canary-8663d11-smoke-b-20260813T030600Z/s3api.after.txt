@@ -1,0 +1,7 @@
+[filter:s3api]
+use = egg:swift#s3api
+location = RegionOne
+cold_backend_root = /var/cache/peregrine-cold
+cold_policy_map = GLACIER:0
+
+

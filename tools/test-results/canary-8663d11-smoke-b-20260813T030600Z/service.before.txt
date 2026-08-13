@@ -1,0 +1,5 @@
+MainPID=1029564
+Id=swift-proxy.service
+LoadState=loaded
+ActiveState=active
+SubState=running

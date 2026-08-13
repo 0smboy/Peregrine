@@ -1,0 +1,2 @@
+93:cold_backend_root = /var/cache/peregrine-cold
+94:cold_policy_map = GLACIER:0

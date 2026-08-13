@@ -1,0 +1,1 @@
+APPLY_OK commit=8663d11 node=swift2 target_sha=b64deec239833c567604d9efe0211b3bd20b543b570de675cc40fd7fe4785148 rollback=/root/peregrine-proxy-rollback-8663d11-swift2-20260813T031243Z-EUgIna evidence=/root/work/peregrine-acceptance-20260810/fleet-8663d11-cold-swift2-20260813T031243Z

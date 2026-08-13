@@ -1,0 +1,1 @@
+93:cold_backend_root = /var/cache/peregrine-cold

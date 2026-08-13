@@ -1,0 +1,4 @@
+partition=7174
+10.0.4.2:6211 d2 local=False
+10.0.4.3:6211 d2 local=True
+10.0.4.4:6211 d2 local=False

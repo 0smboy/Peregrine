@@ -1,0 +1,8 @@
+Partition	7174
+Hash	7018d24e83f22d6addb5c1e1498db48f
+Server:Port Device	10.0.4.2:6211 d2
+Server:Port Device	10.0.4.3:6211 d2
+Server:Port Device	10.0.4.4:6211 d2
+Server:Port Device	10.0.4.1:6211 d2	 # [Handoff]
+Server:Port Device	10.0.4.1:6212 d3	 # [Handoff]
+Server:Port Device	10.0.4.3:6212 d3	 # [Handoff]

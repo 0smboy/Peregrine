@@ -1,0 +1,5 @@
+proxy1=UP proxy2=UP proxy3=UP proxy4=DOWN 1/2
+proxy1=UP proxy2=UP proxy3=UP proxy4=DOWN 1/2
+proxy1=UP proxy2=UP proxy3=UP proxy4=DOWN 1/2
+proxy1=UP proxy2=UP proxy3=UP proxy4=DOWN 1/2
+proxy1=UP proxy2=UP proxy3=UP proxy4=UP

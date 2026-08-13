@@ -1,0 +1,8 @@
+META_STORAGE_CLASS=X-Object-Meta-S3-Storage-Class
+SYS_TRANSITIONED=X-Object-Sysmeta-S3-Transitioned
+SYS_COLD_BACKEND_URI=X-Object-Sysmeta-S3-Cold-Backend-Uri
+SYS_COLD_POLICY_INDEX=X-Object-Sysmeta-S3-Cold-Policy-Index
+SYS_HOT_POLICY_INDEX=X-Object-Sysmeta-S3-Hot-Policy-Index
+SYS_RESTORE_UNTIL=X-Object-Sysmeta-S3-Restore-Until
+SYS_TRANSITION_AT=X-Object-Sysmeta-S3-Transition-At
+source=Mac Peregrine-clippy lifecycle_exec.rs + cold_tier.rs /workspace/cold_tier.rs

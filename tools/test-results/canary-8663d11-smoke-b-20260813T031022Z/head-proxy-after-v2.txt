@@ -1,0 +1,9 @@
+http=200
+sysmeta_uri_present=False
+sysmeta_transitioned_present=False
+header_names=Accept-Ranges,Connection,Content-Length,Content-Type,Etag,Last-Modified,X-Object-Meta-S3-Storage-Class,X-Openstack-Request-Id,X-Timestamp,X-Trans-Id
+value:Content-Type=application/x-www-form-urlencoded
+value:X-Object-Meta-S3-Storage-Class=GLACIER
+value:Etag=12b740336cf38f60f9f569f785fa12fc
+value:X-Timestamp=1786590623.99062
+value:Content-Length=37

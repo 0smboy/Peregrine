@@ -1,0 +1,98 @@
+# Managed by P1b L2 deploy (2026-08-04)
+# Managed by P1a L2 deploy (2026-08-04)
+# Managed by P0 pipeline foundation deploy (2026-08-04)
+# P0 thin+cache pipeline (2026-08-04)
+[pipeline:main]
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats bulk tempurl formpost staticweb container_quotas account_quotas symlink versioned_writes s3api s3token authtoken keystoneauth tempauth copy slo dlo proxy-logging proxy-server
+
+[app:proxy-server]
+bind_ip = 0.0.0.0
+bind_port = 8080
+allow_account_management = true
+account_autocreate = true
+storage_url = https://10.0.0.10:8085
+log_statsd_host = 127.0.0.1
+log_statsd_port = 9125
+log_statsd_metric_prefix =
+trace_endpoint =
+trace_sample_ratio = 1.0
+
+[filter:proxy-logging]
+use = egg:swift#proxy_logging
+
+[filter:cache]
+use = egg:swift#memcache
+memcache_servers = 10.0.0.1:11211
+
+[filter:listing_formats]
+use = egg:swift#listing_formats
+
+
+[filter:bulk]
+use = egg:swift#bulk
+max_deletes_per_request = 10000
+max_failed_deletes = 1000
+
+[filter:tempurl]
+use = egg:swift#tempurl
+
+[filter:tempauth]
+user_test_tester = <redacted>
+
+[filter:ratelimit]
+use = egg:swift#ratelimit
+account_ratelimit = 200
+max_sleep_time_seconds = 60
+container_ratelimits = 0 , 0
+container_listing_ratelimits = 0 , 0
+
+[filter:formpost]
+use = egg:swift#formpost
+
+[filter:staticweb]
+use = egg:swift#staticweb
+
+[filter:container_quotas]
+use = egg:swift#container_quotas
+
+[filter:account_quotas]
+use = egg:swift#account_quotas
+
+[filter:symlink]
+use = egg:swift#symlink
+symloop_max = 2
+
+[filter:versioned_writes]
+use = egg:swift#versioned_writes
+allow_versioned_writes = true
+
+[filter:authtoken]
+use = egg:swift#authtoken
+delay_auth_decision = true
+auth_url = http://10.0.4.1:5001/v3
+username = swift
+password = <redacted>
+project_name = service
+user_domain_name = <redacted>
+project_domain_name = Default
+www_authenticate_uri = https://10.0.0.10:5000
+http_connect_timeout = 5
+
+[filter:keystoneauth]
+use = egg:swift#keystoneauth
+operator_roles = admin,swiftoperator
+reseller_prefix = AUTH
+reseller_admin_role = ResellerAdmin
+allow_overrides = true
+allow_names_in_acls = true
+
+
+[filter:s3api]
+use = egg:swift#s3api
+location = RegionOne
+
+
+[filter:s3token]
+use = egg:swift#s3token
+auth_uri = http://10.0.0.1:5001
+reseller_prefix = AUTH_

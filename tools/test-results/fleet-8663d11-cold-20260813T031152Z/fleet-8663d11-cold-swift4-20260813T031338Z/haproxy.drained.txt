@@ -1,0 +1,15 @@
+proxy1=UP proxy2=UP proxy3=UP proxy4=UP
+proxy1=UP proxy2=UP proxy3=UP proxy4=UP
+proxy1=UP proxy2=UP proxy3=UP proxy4=UP
+proxy1=UP proxy2=UP proxy3=UP proxy4=UP
+proxy1=UP proxy2=UP proxy3=UP proxy4=UP 2/3
+proxy1=UP proxy2=UP proxy3=UP proxy4=UP 2/3
+proxy1=UP proxy2=UP proxy3=UP proxy4=UP 2/3
+proxy1=UP proxy2=UP proxy3=UP proxy4=UP 2/3
+proxy1=UP proxy2=UP proxy3=UP proxy4=UP 2/3
+proxy1=UP proxy2=UP proxy3=UP proxy4=UP 1/3
+proxy1=UP proxy2=UP proxy3=UP proxy4=UP 1/3
+proxy1=UP proxy2=UP proxy3=UP proxy4=UP 1/3
+proxy1=UP proxy2=UP proxy3=UP proxy4=UP 1/3
+proxy1=UP proxy2=UP proxy3=UP proxy4=UP 1/3
+proxy1=UP proxy2=UP proxy3=UP proxy4=DOWN

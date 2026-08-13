@@ -1,0 +1,13 @@
+GREEN
+method=v2-object-server-internal
+planted=True
+restore_post=202
+restore_get=200
+uri_visible_on_head=True
+proxy_head_uri_present=False
+object_server_head_uri_present=True
+filecold_existed=True
+has_restore_status_xml=True
+uri=filecold://0/AUTH_test/pg-smokeb-8663d11-20260813t031022z/636f6c642d6f626a6563742e747874
+proxy_head_header_names=Accept-Ranges,Connection,Content-Length,Content-Type,Etag,Last-Modified,X-Object-Meta-S3-Storage-Class,X-Openstack-Request-Id,X-Timestamp,X-Trans-Id
+object_server_head_header_names=Accept-Ranges,Connection,Content-Length,Content-Type,Etag,Last-Modified,X-Backend-Data-Timestamp,X-Backend-Durable-Timestamp,X-Backend-Timestamp,X-Object-Meta-S3-Storage-Class,X-Object-Sysmeta-S3-Cold-Backend-Uri,X-Object-Sysmeta-S3-Cold-Policy-Index,X-Object-Sysmeta-S3-Hot-Policy-Index,X-Object-Sysmeta-S3-Transitioned,X-Timestamp

@@ -1,0 +1,1 @@
+proxy1=UP proxy2=UP proxy3=UP proxy4=DOWN

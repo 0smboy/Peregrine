@@ -1,0 +1,18 @@
+VERDICT=GREEN
+SCOPE=fleet-all-four
+APPLY=APPLY_OK swift1/swift2/swift4; swift3 untouched (already canary)
+SMOKE_B=GREEN (swift3 20260813T031022Z)
+TINY_PUTGET=PASS (swift1 localhost:8080)
+ROLLED_BACK=no
+FLEET=ALL FOUR on 8663d11 canary binary
+CANARY_COMMIT=8663d11
+CANARY_SHA=b64deec239833c567604d9efe0211b3bd20b543b570de675cc40fd7fe4785148
+ARTIFACT=/root/work/peregrine-artifacts/peregrine-proxy-8663d11-ec.tar.gz
+ARTIFACT_SHA=50c0245d030409b230ad6ccaa0577a769954d185a7c0b05715aae2eaedf362c0
+COLD_BACKEND_ROOT=/var/cache/peregrine-cold
+COLD_POLICY_MAP=GLACIER:0
+HEALTH=:8080 200 all four
+HAPROXY=proxy1=UP proxy2=UP proxy3=UP proxy4=UP
+VIP=100% 8663d11 (no longer mixed)
+STANCE=IMPLEMENTED_SUBSET_ONLY
+NOTE=Lab LocalDir only, not tape/Glacier. Fleet already rolled; do not mutate. Do not merge PR.

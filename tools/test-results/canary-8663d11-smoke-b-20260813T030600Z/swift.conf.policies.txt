@@ -1,0 +1,6 @@
+10:[storage-policy:0]
+11:name = Policy-0
+14:default = yes
+18:[storage-policy:1]
+19:name = ec-2-1
+21:policy_type = erasure_coding

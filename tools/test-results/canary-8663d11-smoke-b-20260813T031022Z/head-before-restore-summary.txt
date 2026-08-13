@@ -1,0 +1,6 @@
+variant_used=v2-object-server-internal
+proxy_head_uri_present=False
+object_server_head_uri_present=True
+uri_visible_on_head=True
+proxy_head_header_names=Accept-Ranges,Connection,Content-Length,Content-Type,Etag,Last-Modified,X-Object-Meta-S3-Storage-Class,X-Openstack-Request-Id,X-Timestamp,X-Trans-Id
+object_server_head_header_names=Accept-Ranges,Connection,Content-Length,Content-Type,Etag,Last-Modified,X-Backend-Data-Timestamp,X-Backend-Durable-Timestamp,X-Backend-Timestamp,X-Object-Meta-S3-Storage-Class,X-Object-Sysmeta-S3-Cold-Backend-Uri,X-Object-Sysmeta-S3-Cold-Policy-Index,X-Object-Sysmeta-S3-Hot-Policy-Index,X-Object-Sysmeta-S3-Transitioned,X-Timestamp

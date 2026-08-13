@@ -1,0 +1,2 @@
+http=202
+headers_sent=X-Auth-Token,X-Object-Meta-S3-Storage-Class,X-Object-Sysmeta-S3-Cold-Backend-Uri,X-Object-Sysmeta-S3-Cold-Policy-Index,X-Object-Sysmeta-S3-Hot-Policy-Index,X-Object-Sysmeta-S3-Transitioned

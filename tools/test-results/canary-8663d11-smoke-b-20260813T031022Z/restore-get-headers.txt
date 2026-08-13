@@ -1,0 +1,2 @@
+http=200
+header_names=Connection,Content-Length,Content-Type,X-Amz-Restore,X-Openstack-Request-Id,X-Trans-Id
