@@ -199,6 +199,86 @@ fn test_proxy_end_to_end_account_and_container() {
 }
 
 #[test]
+fn test_container_put_does_not_mutate_when_account_autocreate_fails() {
+    let tmp = std::env::temp_dir().join(format!(
+        "swift-proxy-autocreate-fail-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("sda1")).unwrap();
+
+    let acct_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let acct_addr = acct_listener.local_addr().unwrap();
+    let acct_config = swift_account_server::AccountServerConfig {
+        devices: tmp.clone(),
+        mount_check: false,
+        hash_config: hash_cfg(),
+        policies: vec![(0, "Policy-0".to_string())],
+        fixed_created_at: None,
+    };
+    std::thread::spawn(move || swift_account_server::serve(acct_listener, acct_config));
+
+    let cont_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let cont_addr = cont_listener.local_addr().unwrap();
+    let cont_config = swift_container_server::ContainerServerConfig {
+        devices: tmp.clone(),
+        mount_check: false,
+        hash_config: hash_cfg(),
+        policies: vec![(0, "Policy-0".to_string())],
+        default_policy_index: 0,
+        fixed_created_at: None,
+    };
+    std::thread::spawn(move || swift_container_server::serve(cont_listener, cont_config));
+
+    let account_ring = single_device_ring(acct_addr.port() as u32);
+    let (account_part, _) = account_ring
+        .get_nodes("AUTH_deleted", None, None)
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let account_path = format!("/sda1/{account_part}/AUTH_deleted");
+    let (status, _, _) = http_with_headers(
+        acct_addr,
+        "PUT",
+        &account_path,
+        &[("X-Timestamp", "1751500000.00000")],
+        "",
+    );
+    assert_eq!(status, 201, "account setup PUT");
+    let (status, _, _) = http_with_headers(
+        acct_addr,
+        "DELETE",
+        &account_path,
+        &[("X-Timestamp", "1751500001.00000")],
+        "",
+    );
+    assert_eq!(status, 204, "account setup DELETE");
+
+    let proxy_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let app = Arc::new(ProxyApp::new(
+        account_ring,
+        single_device_ring(cont_addr.port() as u32),
+        ProxyConfig {
+            account_autocreate: true,
+            ..Default::default()
+        },
+    ));
+    std::thread::spawn(move || swift_proxy_server::serve(proxy_listener, app));
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    // A recently-deleted account rejects autocreate with 403. Python's
+    // container controller converts that failure to 503 and never fans out
+    // the container PUT; the old Rust path ignored it, returned 404 from the
+    // account-update side channel, but had already created the container DB.
+    let (status, _, _) = http(proxy_addr, "PUT", "/v1/AUTH_deleted/ghost", "");
+    assert_eq!(status, 503, "failed account autocreate must stop container PUT");
+    let (status, _, _) = http(proxy_addr, "HEAD", "/v1/AUTH_deleted/ghost", "");
+    assert_eq!(status, 404, "failed PUT must not leave a container behind");
+
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
 fn test_proxy_object_round_trip() {
     let tmp = std::env::temp_dir().join(format!("swift-proxy-obj-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
