@@ -1234,9 +1234,7 @@ fn maybe_archive_due_cold_on_get_head(
             ));
         }
     };
-    let Some(_) = stamped else {
-        return None;
-    };
+    let _ = stamped?;
 
     // Persist cold meta (+ URI when archived) onto the object.
     let mut post = make_swift_req(
@@ -5919,6 +5917,30 @@ mod tests {
             Response::new(204)
         });
         assert_eq!(api.handle(del, &next_del).status, 204);
+    }
+
+    #[test]
+    fn s3cmd_trailing_slash_create_bucket_is_one_container_put() {
+        let api = S3Api::new(cred_map());
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&calls);
+        let next: NextFn = Arc::new(move |r| {
+            seen.lock()
+                .unwrap()
+                .push((r.method.clone(), r.path.clone()));
+            assert_eq!(r.method, "PUT");
+            assert_eq!(r.path, "/v1/AUTH_test/mytest");
+            Response::new(201)
+        });
+
+        // s3cmd 2.4.0 path-style BUCKET_CREATE sends `PUT /bucket/`.
+        let put = sign_request(base_s3_req("PUT", "/mytest/", ""), "testing");
+        assert_eq!(api.handle(put, &next).status, 200);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[("PUT".to_string(), "/v1/AUTH_test/mytest".to_string())],
+            "CreateBucket must not run object version/WORM/ACL/lifecycle probes"
+        );
     }
 
     #[test]

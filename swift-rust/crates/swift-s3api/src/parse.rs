@@ -146,7 +146,16 @@ pub fn extract_bucket_and_key(
         Err(_) => return (None, None),
     };
     let bucket = parts.first().cloned().flatten().filter(|b| !b.is_empty());
-    let key = parts.get(1).cloned().flatten();
+    // Python Swift classifies `/bucket/` as a bucket request because the
+    // parsed object name is an empty string and the controller uses string
+    // truthiness. Represent that empty object segment as `None` so every Rust
+    // dispatch decision (IAM, WORM, lifecycle and error mapping) agrees with
+    // the already bucket-only backend path.
+    let key = parts
+        .get(1)
+        .cloned()
+        .flatten()
+        .filter(|key| !key.is_empty());
 
     if let Some(b) = &bucket {
         if !validate_bucket_name(b, dns_compliant) {
@@ -205,6 +214,12 @@ mod tests {
     #[test]
     fn test_path_style_bucket_only() {
         let r = req("GET", "/mybucket", None);
+        let (b, k) = extract_bucket_and_key(&r, &[], true);
+        assert_eq!(b.as_deref(), Some("mybucket"));
+        assert_eq!(k, None);
+
+        // s3cmd 2.4.0 path-style CreateBucket uses `PUT /bucket/`.
+        let r = req("PUT", "/mybucket/", None);
         let (b, k) = extract_bucket_and_key(&r, &[], true);
         assert_eq!(b.as_deref(), Some("mybucket"));
         assert_eq!(k, None);
