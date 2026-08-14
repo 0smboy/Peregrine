@@ -121,6 +121,7 @@ run_case no_oracle_skipped 6 SKIPPED OPS_ONLY
 run_case reachability_partial 5 PARTIAL OPS_ONLY \
   FORCE_S3_SMOKE=1 MOCK_ROOT_CODE=403
 run_case health_blocked 3 BLOCKED OPS_ONLY MOCK_INFO_CODE=503
+run_case invalid_vip_config 2 CONFIG_ERROR OPS_ONLY VIP=https://
 run_case config_incomplete_oracle 2 CONFIG_ERROR OPS_ONLY \
   PYTHON_S3_ENDPOINT=https://python.example.test:8090
 run_case parity_failed 1 FAIL PARITY_ATTEMPTED \

@@ -71,6 +71,16 @@ REQUIRED_OPS = frozenset(
         ("ec2-sigv4", "DeleteBucket"),
     }
 )
+CLEANUP_OPS = frozenset(
+    {
+        ("tempauth-sigv4", "MultiDelete"),
+        ("tempauth-sigv4", "AbortMultipartUpload"),
+        ("tempauth-sigv4", "DeleteObject"),
+        ("tempauth-sigv4", "DeleteBucket"),
+        ("ec2-sigv4", "DeleteObject"),
+        ("ec2-sigv4", "DeleteBucket"),
+    }
+)
 
 S3_SUBRESOURCES = frozenset(
     {
@@ -489,6 +499,30 @@ def _load_ec2_credentials(path: str) -> Tuple[str, str]:
     return access, secret
 
 
+def _expected_cleanup_ops(rows: Sequence[dict]) -> frozenset:
+    succeeded = {(row["lane"], row["op"]) for row in rows if row["ok"]}
+    expected = set()
+    if ("tempauth-sigv4", "CreateBucket") in succeeded:
+        expected.update(
+            {
+                ("tempauth-sigv4", "DeleteObject"),
+                ("tempauth-sigv4", "DeleteBucket"),
+            }
+        )
+    if ("tempauth-sigv4", "CopyObject") in succeeded:
+        expected.add(("tempauth-sigv4", "MultiDelete"))
+    if ("tempauth-sigv4", "CreateMultipartUpload") in succeeded:
+        expected.add(("tempauth-sigv4", "AbortMultipartUpload"))
+    if ("ec2-sigv4", "CreateBucket") in succeeded:
+        expected.update(
+            {
+                ("ec2-sigv4", "DeleteObject"),
+                ("ec2-sigv4", "DeleteBucket"),
+            }
+        )
+    return frozenset(expected)
+
+
 def classify_ops(rows: Sequence[dict]) -> Tuple[str, int, int, int, int]:
     """Return verdict, exit code, pass, fail, cleanup-fail counts.
 
@@ -499,8 +533,11 @@ def classify_ops(rows: Sequence[dict]) -> Tuple[str, int, int, int, int]:
         return "PARTIAL", EXIT_PARTIAL, 0, 0, 0
     passed = sum(1 for row in rows if row["ok"])
     failed_rows = [row for row in rows if not row["ok"]]
-    cleanup_failed = sum(1 for row in failed_rows if row.get("cleanup"))
     present = {(row["lane"], row["op"]) for row in rows}
+    missing_cleanup = _expected_cleanup_ops(rows) - present
+    cleanup_failed = (
+        sum(1 for row in failed_rows if row.get("cleanup")) + len(missing_cleanup)
+    )
     missing_required = REQUIRED_OPS - present
     critical_ops = {
         "ListBuckets",
@@ -555,10 +592,14 @@ def _write_early_verdict(verdict: str, reason: str, exit_code: int) -> None:
 def _write_results(verdict: str, exit_code: int) -> None:
     passed = sum(1 for row in results if row["ok"])
     failed = sum(1 for row in results if not row["ok"])
-    cleanup_failed = sum(
-        1 for row in results if (not row["ok"]) and row.get("cleanup")
-    )
     present = {(row["lane"], row["op"]) for row in results}
+    missing_cleanup_ops = sorted(
+        f"{lane}:{op}" for lane, op in _expected_cleanup_ops(results) - present
+    )
+    cleanup_failed = (
+        sum(1 for row in results if (not row["ok"]) and row.get("cleanup"))
+        + len(missing_cleanup_ops)
+    )
     missing_ops = sorted(f"{lane}:{op}" for lane, op in REQUIRED_OPS - present)
     summary = {
         "verdict": verdict,
@@ -572,6 +613,7 @@ def _write_results(verdict: str, exit_code: int) -> None:
         "passed": passed,
         "failed": failed,
         "cleanup_failed": cleanup_failed,
+        "missing_cleanup_ops": missing_cleanup_ops,
         "required_ops": len(REQUIRED_OPS),
         "missing_ops": missing_ops,
         "ops": results,
@@ -618,6 +660,19 @@ def _write_results(verdict: str, exit_code: int) -> None:
         )
 
 
+def _safe_write_results(verdict: str, exit_code: int) -> bool:
+    try:
+        _write_results(verdict, exit_code)
+        return True
+    except OSError as exc:
+        print(
+            f"VERDICT=CONFIG_ERROR CLAIM=OPS_ONLY "
+            f"reason=evidence_write_{type(exc).__name__} exit_code={EXIT_CONFIG_ERROR}",
+            file=sys.stderr,
+        )
+        return False
+
+
 def main() -> int:
     global results
     results = []
@@ -658,7 +713,7 @@ def main() -> int:
             note="interrupted; cleanup completion is not proven",
             cleanup=True,
         )
-        _write_results("INTERRUPTED", 130)
+        _safe_write_results("INTERRUPTED", 130)
         return 130
     except Exception as exc:  # noqa: BLE001
         record(
@@ -669,11 +724,13 @@ def main() -> int:
             note=f"unexpected {type(exc).__name__}; cleanup completion is not proven",
             cleanup=True,
         )
-        _write_results("FAIL", EXIT_FAIL)
+        if not _safe_write_results("FAIL", EXIT_FAIL):
+            return EXIT_CONFIG_ERROR
         return EXIT_FAIL
 
     verdict, exit_code, passed, failed, cleanup_failed = classify_ops(results)
-    _write_results(verdict, exit_code)
+    if not _safe_write_results(verdict, exit_code):
+        return EXIT_CONFIG_ERROR
     print(
         f"VERDICT={verdict} CLAIM=OPS_ONLY PARITY_ORACLE=NOT_RUN "
         f"passed={passed} failed={failed} cleanup_failed={cleanup_failed} "

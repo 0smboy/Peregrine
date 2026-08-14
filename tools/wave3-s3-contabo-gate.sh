@@ -43,7 +43,10 @@ readonly EXIT_SKIPPED=6
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 EVID="${1:-$ROOT/tools/test-results/wave3-s3-l3b-prod-$(date -u +%Y%m%d)}"
 VIP="${VIP:-https://10.0.0.10:8085}"
-mkdir -p "$EVID"
+if ! mkdir -p "$EVID"; then
+  echo "VERDICT=CONFIG_ERROR CLAIM=OPS_ONLY reason=evidence_directory_unwritable exit_code=$EXIT_CONFIG" >&2
+  exit "$EXIT_CONFIG"
+fi
 OUT="$EVID/20-contabo-s3-gate.txt"
 : >"$OUT"
 
@@ -70,15 +73,17 @@ log "Contabo S3 gate @ $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 log "VIP=$VIP"
 log "ZERO_EXIT_POLICY=strict_two_origin_parity_only"
 
-case "$VIP" in
-  http://*|https://*) ;;
-  *) finish "CONFIG_ERROR" "OPS_ONLY" "invalid_vip_origin" "$EXIT_CONFIG" ;;
-esac
+if [[ ! "$VIP" =~ ^https?://[^/?#[:space:]]+/?$ ]]; then
+  finish "CONFIG_ERROR" "OPS_ONLY" "invalid_vip_origin" "$EXIT_CONFIG"
+fi
 if ! is_bool01 "${FORCE_S3_SMOKE:-0}"; then
   finish "CONFIG_ERROR" "OPS_ONLY" "invalid_FORCE_S3_SMOKE" "$EXIT_CONFIG"
 fi
 if ! is_bool01 "${SKIP_META_CHECK:-0}"; then
   finish "CONFIG_ERROR" "OPS_ONLY" "invalid_SKIP_META_CHECK" "$EXIT_CONFIG"
+fi
+if ! command -v curl >/dev/null 2>&1; then
+  finish "CONFIG_ERROR" "OPS_ONLY" "curl_runtime_missing" "$EXIT_CONFIG"
 fi
 
 # Load lab credentials without allowing set -e to bypass the verdict contract.

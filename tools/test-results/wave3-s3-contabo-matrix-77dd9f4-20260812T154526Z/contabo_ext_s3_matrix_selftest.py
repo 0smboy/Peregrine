@@ -56,6 +56,14 @@ def assert_classification() -> None:
     missing = rows[:-1]
     assert matrix.classify_ops(missing)[0:2] == ("PARTIAL", matrix.EXIT_PARTIAL)
 
+    missing_cleanup = [
+        r
+        for r in complete_rows()
+        if not (r["lane"] == "tempauth-sigv4" and r["op"] == "DeleteBucket")
+    ]
+    verdict, rc, _, _, cleanup_failed = matrix.classify_ops(missing_cleanup)
+    assert (verdict, rc, cleanup_failed) == ("FAIL", matrix.EXIT_FAIL, 1)
+
     noncritical = complete_rows()
     row = next(r for r in noncritical if r["op"] == "GetObjectAcl")
     row["ok"] = False
@@ -73,7 +81,15 @@ def assert_classification() -> None:
     assert (verdict, rc, cleanup_failed) == ("FAIL", matrix.EXIT_FAIL, 1)
 
     # No bounded one-origin result, complete or otherwise, may return zero.
-    for candidate in (rows, [], missing, noncritical, critical, cleanup):
+    for candidate in (
+        rows,
+        [],
+        missing,
+        missing_cleanup,
+        noncritical,
+        critical,
+        cleanup,
+    ):
         assert matrix.classify_ops(candidate)[1] != matrix.EXIT_PARITY_GREEN
 
 
