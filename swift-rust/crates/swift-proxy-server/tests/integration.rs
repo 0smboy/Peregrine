@@ -18,6 +18,7 @@
 //! in-memory ring.
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use serde_json::Value as Json;
@@ -125,6 +126,68 @@ fn http_with_headers(
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
         .collect();
     (status, headers, body)
+}
+
+#[derive(Default)]
+struct BackendRequestCounts {
+    head: AtomicUsize,
+    put: AtomicUsize,
+    post: AtomicUsize,
+    delete: AtomicUsize,
+}
+
+/// Minimal HTTP backend whose status is selected by method. It records every
+/// request so account-gate tests can prove the container ring saw zero fan-out.
+fn spawn_counting_backend(
+    head_status: u16,
+    put_status: u16,
+) -> (std::net::SocketAddr, Arc<BackendRequestCounts>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let counts = Arc::new(BackendRequestCounts::default());
+    let thread_counts = Arc::clone(&counts);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 8192];
+            let Ok(n) = stream.read(&mut buf) else {
+                continue;
+            };
+            let first = String::from_utf8_lossy(&buf[..n]);
+            let method = first.split_whitespace().next().unwrap_or("");
+            let status = match method {
+                "HEAD" => {
+                    thread_counts.head.fetch_add(1, Ordering::SeqCst);
+                    head_status
+                }
+                "PUT" => {
+                    thread_counts.put.fetch_add(1, Ordering::SeqCst);
+                    put_status
+                }
+                "POST" => {
+                    thread_counts.post.fetch_add(1, Ordering::SeqCst);
+                    204
+                }
+                "DELETE" => {
+                    thread_counts.delete.fetch_add(1, Ordering::SeqCst);
+                    204
+                }
+                _ => 405,
+            };
+            let reason = match status {
+                201 => "Created",
+                204 => "No Content",
+                404 => "Not Found",
+                503 => "Service Unavailable",
+                _ => "Response",
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (addr, counts)
 }
 
 #[test]
@@ -276,6 +339,88 @@ fn test_container_put_does_not_mutate_when_account_autocreate_fails() {
     assert_eq!(status, 404, "failed PUT must not leave a container behind");
 
     std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn test_container_account_gate_handles_all_non_success_and_only_put_autocreates() {
+    let (account_addr, account_counts) = spawn_counting_backend(503, 503);
+    let (container_addr, container_counts) = spawn_counting_backend(204, 201);
+    let proxy_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let app = Arc::new(ProxyApp::new(
+        single_device_ring(account_addr.port() as u32),
+        single_device_ring(container_addr.port() as u32),
+        ProxyConfig {
+            account_autocreate: true,
+            ..Default::default()
+        },
+    ));
+    std::thread::spawn(move || swift_proxy_server::serve(proxy_listener, app));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let (status, _, _) = http(proxy_addr, "POST", "/v1/AUTH_down/c", "");
+    assert_eq!(status, 404, "POST must not autocreate an unavailable account");
+    let (status, _, _) = http(proxy_addr, "DELETE", "/v1/AUTH_down/c", "");
+    assert_eq!(status, 404, "DELETE must not autocreate an unavailable account");
+    assert_eq!(
+        account_counts.put.load(Ordering::SeqCst),
+        0,
+        "POST/DELETE must not send account PUT"
+    );
+    assert_eq!(
+        container_counts.post.load(Ordering::SeqCst)
+            + container_counts.delete.load(Ordering::SeqCst),
+        0,
+        "non-2xx account_info must stop container fan-out"
+    );
+
+    let (status, _, _) = http(proxy_addr, "PUT", "/v1/AUTH_down/c", "");
+    assert_eq!(status, 503, "failed PUT autocreate is service unavailable");
+    assert!(
+        account_counts.put.load(Ordering::SeqCst) > 0,
+        "only PUT attempts account autocreate"
+    );
+    assert_eq!(
+        container_counts.put.load(Ordering::SeqCst),
+        0,
+        "failed autocreate must stop container fan-out"
+    );
+}
+
+#[test]
+fn test_container_put_rechecks_account_after_successful_autocreate() {
+    // Account PUT reports success, but every HEAD remains 404. Python retries
+    // account_info and returns 404 without touching the container ring.
+    let (account_addr, account_counts) = spawn_counting_backend(404, 201);
+    let (container_addr, container_counts) = spawn_counting_backend(204, 201);
+    let proxy_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let app = Arc::new(ProxyApp::new(
+        single_device_ring(account_addr.port() as u32),
+        single_device_ring(container_addr.port() as u32),
+        ProxyConfig {
+            account_autocreate: true,
+            ..Default::default()
+        },
+    ));
+    std::thread::spawn(move || swift_proxy_server::serve(proxy_listener, app));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let (status, _, _) = http(proxy_addr, "PUT", "/v1/AUTH_invisible/c", "");
+    assert_eq!(status, 404, "unobservable account after autocreate");
+    assert!(
+        account_counts.put.load(Ordering::SeqCst) > 0,
+        "account autocreate must have run"
+    );
+    assert!(
+        account_counts.head.load(Ordering::SeqCst) >= 2,
+        "account_info must be checked before and after autocreate"
+    );
+    assert_eq!(
+        container_counts.put.load(Ordering::SeqCst),
+        0,
+        "failed refreshed account_info must stop container fan-out"
+    );
 }
 
 #[test]

@@ -2676,8 +2676,8 @@ impl ProxyApp {
                 // semantics. An unreachable ring (None → 503) is never
                 // cached, like Python's synthesized 503 info.
                 let acct_status = self.account_info(account).status;
-                if acct_status == 404 {
-                    if self.config.account_autocreate && req.method != "DELETE" {
+                if !(200..300).contains(&acct_status) {
+                    if self.config.account_autocreate && req.method == "PUT" {
                         // Python container PUT stops with 503 when account
                         // autocreation fails. Continuing would let container
                         // servers create their local DBs and then return 404
@@ -2685,6 +2685,14 @@ impl ProxyApp {
                         // yielding the contradictory "PUT 404, HEAD 204".
                         if !self.autocreate_account(account) {
                             return swob_response(503);
+                        }
+                        // Python immediately resolves account_info again after
+                        // a successful autocreate. A nominal 2xx create is not
+                        // enough: if the account still cannot be observed, the
+                        // container fan-out must not start.
+                        let refreshed = self.account_info(account).status;
+                        if !(200..300).contains(&refreshed) {
+                            return swob_response(404);
                         }
                     } else {
                         return swob_response(404);
