@@ -2911,6 +2911,17 @@ fn build_s3api(conf: &SwiftConfig) -> Result<Option<swift_s3api::S3Api>, String>
         api = api.with_cold_backend(std::sync::Arc::new(be));
     }
 
+    // Lab: drop hot object bytes after successful archive+URI stamp.
+    // Default false — fleet unchanged until explicitly enabled.
+    let cold_delete_hot_after_archive = conf
+        .get("filter:s3api", "cold_delete_hot_after_archive")
+        .map_err(|e| e.to_string())?
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| strict_config_bool("cold_delete_hot_after_archive", &value))
+        .transpose()?
+        .unwrap_or(false);
+    api = api.with_cold_delete_hot_after_archive(cold_delete_hot_after_archive);
+
     // EC2 deferral: inline /v3/s3tokens on s3api (does not wait for s3token filter).
     if let Some(uri) = external_s3token {
         api = api.with_s3token_client(std::sync::Arc::new(
@@ -3335,7 +3346,7 @@ mod startup_policy_tests {
         assert_eq!(rl.account_ratelimit, 5.0);
         assert_eq!(rl.max_sleep_time_seconds, 30.0);
         // RateLimit uses an in-process store (memcache was never wired on this type).
-let invalid = SwiftConfig::parse_lenient(
+        let invalid = SwiftConfig::parse_lenient(
             "[filter:ratelimit]\nuse = egg:swift#ratelimit\naccount_ratelimit = nope\n",
             &[],
             false,
@@ -3967,14 +3978,15 @@ let invalid = SwiftConfig::parse_lenient(
         assert_eq!(api.cold_map.policy_for_class("GLACIER"), Some(2));
         assert_eq!(api.cold_map.default_hot_policy, 0);
         assert!(api.cold_backend.is_none(), "no root → no cold backend");
+        assert!(
+            !api.cold_delete_hot_after_archive,
+            "cold_delete_hot_after_archive defaults false"
+        );
     }
 
     #[test]
     fn pipeline_s3api_wires_cold_backend_when_root_set() {
-        let dir = std::env::temp_dir().join(format!(
-            "peregrine-proxy-cold-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("peregrine-proxy-cold-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let conf = SwiftConfig::parse_lenient(
             &format!(
@@ -3997,6 +4009,10 @@ let invalid = SwiftConfig::parse_lenient(
             api.cold_backend.is_some(),
             "cold_backend_root must wire LocalDirColdBackend"
         );
+        assert!(
+            !api.cold_delete_hot_after_archive,
+            "cold_delete_hot_after_archive defaults false"
+        );
         // Unset → None
         let conf2 = SwiftConfig::parse_lenient(
             "[pipeline:main]\n\
@@ -4008,9 +4024,7 @@ let invalid = SwiftConfig::parse_lenient(
             false,
         )
         .unwrap();
-        let api2 = build_s3api(&conf2)
-            .expect("valid")
-            .expect("creds");
+        let api2 = build_s3api(&conf2).expect("valid").expect("creds");
         assert!(api2.cold_backend.is_none());
         // Alias filecold_root
         let conf3 = SwiftConfig::parse_lenient(
@@ -4026,14 +4040,31 @@ let invalid = SwiftConfig::parse_lenient(
             false,
         )
         .unwrap();
-        let api3 = build_s3api(&conf3)
-            .expect("valid")
-            .expect("creds");
+        let api3 = build_s3api(&conf3).expect("valid").expect("creds");
         assert!(
             api3.cold_backend.is_some(),
             "filecold_root alias must wire backend"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pipeline_s3api_wires_cold_delete_hot_after_archive() {
+        let conf = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck s3api tempauth copy proxy-server\n\
+             [filter:tempauth]\nuser_test_tester = testing .admin\n\
+             [filter:s3api]\n\
+             cold_policy_map = GLACIER:2,HOT:0\n\
+             cold_delete_hot_after_archive = true\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let api = build_s3api(&conf)
+            .expect("valid s3api configuration")
+            .expect("s3api credentials");
+        assert!(api.cold_delete_hot_after_archive);
     }
 
     #[test]

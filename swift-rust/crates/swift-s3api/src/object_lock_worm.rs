@@ -97,6 +97,51 @@ pub fn worm_allows_operation(
     !worm_blocks_delete_with_bypass(headers, now_unix, bypass_governance)
 }
 
+/// True if PUT `?retention` must be denied given existing object sysmeta.
+///
+/// Subset of AWS Object Lock retention-update rules (unversioned Swift path):
+/// * No existing (or expired) retention → allow
+/// * **COMPLIANCE**: cannot shorten retain-until; cannot switch to GOVERNANCE;
+///   bypass is ignored
+/// * **GOVERNANCE**: cannot shorten unless `bypass_governance`; may upgrade
+///   to COMPLIANCE
+/// * Unparseable `new_until` or unknown mode → block (safe default)
+pub fn worm_blocks_retention_put(
+    existing: &HeaderKeyDict,
+    new_mode: &str,
+    new_until: &str,
+    now_unix: i64,
+    bypass_governance: bool,
+) -> bool {
+    let new_mode = new_mode.trim().to_ascii_uppercase();
+    if new_mode != "GOVERNANCE" && new_mode != "COMPLIANCE" {
+        return true;
+    }
+    let Some(new_ts) = parse_retain_until(new_until) else {
+        return true;
+    };
+    let Some(old_ts) = existing
+        .get(SYS_RETAIN_UNTIL)
+        .and_then(parse_retain_until)
+    else {
+        return false;
+    };
+    if old_ts <= now_unix {
+        return false;
+    }
+    let old_mode = lock_mode(existing).unwrap_or_else(|| "COMPLIANCE".into());
+    if old_mode == "COMPLIANCE" && new_mode == "GOVERNANCE" {
+        return true;
+    }
+    if new_ts < old_ts {
+        if old_mode == "GOVERNANCE" && bypass_governance {
+            return false;
+        }
+        return true;
+    }
+    false
+}
+
 /// Parse ISO8601 or unix seconds.
 pub fn parse_retain_until(s: &str) -> Option<i64> {
     let s = s.trim();
@@ -377,6 +422,104 @@ mod tests {
         // COMPLIANCE expired also allows.
         h.set(SYS_LOCK_MODE, "COMPLIANCE");
         assert!(!worm_blocks_delete_with_bypass(&h, now, false));
+    }
+
+    #[test]
+    fn retention_put_compliance_cannot_shorten_or_downgrade() {
+        let mut h = HeaderKeyDict::new();
+        h.set(SYS_LOCK_MODE, "COMPLIANCE");
+        h.set(SYS_RETAIN_UNTIL, "2030-01-01T00:00:00Z");
+        let now = 1_700_000_000i64;
+        // Shorten → deny (bypass ignored).
+        assert!(worm_blocks_retention_put(
+            &h,
+            "COMPLIANCE",
+            "2028-01-01T00:00:00Z",
+            now,
+            true
+        ));
+        // Mode downgrade → deny.
+        assert!(worm_blocks_retention_put(
+            &h,
+            "GOVERNANCE",
+            "2035-01-01T00:00:00Z",
+            now,
+            true
+        ));
+        // Extend same mode → allow.
+        assert!(!worm_blocks_retention_put(
+            &h,
+            "COMPLIANCE",
+            "2035-01-01T00:00:00Z",
+            now,
+            false
+        ));
+    }
+
+    #[test]
+    fn retention_put_governance_shorten_needs_bypass() {
+        let mut h = HeaderKeyDict::new();
+        h.set(SYS_LOCK_MODE, "GOVERNANCE");
+        h.set(SYS_RETAIN_UNTIL, "2030-01-01T00:00:00Z");
+        let now = 1_700_000_000i64;
+        assert!(worm_blocks_retention_put(
+            &h,
+            "GOVERNANCE",
+            "2028-01-01T00:00:00Z",
+            now,
+            false
+        ));
+        assert!(!worm_blocks_retention_put(
+            &h,
+            "GOVERNANCE",
+            "2028-01-01T00:00:00Z",
+            now,
+            true
+        ));
+        // Upgrade to COMPLIANCE (same or later date) → allow.
+        assert!(!worm_blocks_retention_put(
+            &h,
+            "COMPLIANCE",
+            "2030-01-01T00:00:00Z",
+            now,
+            false
+        ));
+    }
+
+    #[test]
+    fn retention_put_no_existing_or_expired_allows() {
+        let mut h = HeaderKeyDict::new();
+        let now = 1_700_000_000i64;
+        assert!(!worm_blocks_retention_put(
+            &h,
+            "COMPLIANCE",
+            "2030-01-01T00:00:00Z",
+            now,
+            false
+        ));
+        h.set(SYS_LOCK_MODE, "COMPLIANCE");
+        h.set(SYS_RETAIN_UNTIL, "2000-01-01T00:00:00Z");
+        assert!(!worm_blocks_retention_put(
+            &h,
+            "GOVERNANCE",
+            "2030-01-01T00:00:00Z",
+            now,
+            false
+        ));
+        assert!(worm_blocks_retention_put(
+            &h,
+            "COMPLIANCE",
+            "not-a-date",
+            now,
+            false
+        ));
+        assert!(worm_blocks_retention_put(
+            &h,
+            "BOGUS",
+            "2030-01-01T00:00:00Z",
+            now,
+            false
+        ));
     }
 
     #[test]

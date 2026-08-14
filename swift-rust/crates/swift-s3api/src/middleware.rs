@@ -1283,9 +1283,7 @@ fn maybe_archive_due_cold_on_get_head(
             ));
         }
     };
-    let Some(stamp) = stamped else {
-        return None;
-    };
+    let stamp = stamped?;
 
     // Persist cold meta (+ URI when archived) onto the object.
     let mut post = make_swift_req(
@@ -2215,16 +2213,16 @@ fn handle_retention(
             );
             stamp_auth(&mut head, cred);
             let head_resp = next(head);
-            if (200..300).contains(&head_resp.status) {
-                if worm_blocks_retention_put(
+            if (200..300).contains(&head_resp.status)
+                && worm_blocks_retention_put(
                     &head_resp.headers,
                     &mode_up,
                     &until,
                     unix_now(),
                     bypass,
-                ) {
-                    return s3_error_response("AccessDenied", None, &[]);
-                }
+                )
+            {
+                return s3_error_response("AccessDenied", None, &[]);
             }
             let mut post = make_swift_req(
                 "POST",

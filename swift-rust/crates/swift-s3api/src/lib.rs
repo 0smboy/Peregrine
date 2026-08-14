@@ -63,6 +63,10 @@
 //! **Object Lock governance bypass** (`x-amz-bypass-governance-retention`) is
 //! **IMPLEMENTED** for mode=`GOVERNANCE` only; COMPLIANCE + legal-hold still
 //! hard-block (see [`object_lock_worm::worm_blocks_delete_with_bypass`]).
+//! **PUT `?retention` shorten/downgrade** is **IMPLEMENTED** (COMPLIANCE cannot
+//! shorten or switch to GOVERNANCE; GOVERNANCE shorten requires bypass).
+//! Versioned-object WORM, MPU-complete overwrite lock, and native Swift v1
+//! bypass of s3api remain residual — not full AWS WORM.
 //!
 //! Other residuals (not claimable as implemented):
 //!
@@ -70,7 +74,9 @@
 //! * physical Glacier/tape **cloud** backend is **not implemented** — [`cold_tier`]
 //!   is a policy map + metadata stamps; lab [`LocalDirColdBackend`] / [`MemoryColdBackend`]
 //!   can hold local bytes when wired via proxy `cold_backend_root` / `filecold_root`
-//!   (archive-on-due-transition stamps `SYS_COLD_BACKEND_URI` when backend present)
+//!   (archive-on-due-transition stamps `SYS_COLD_BACKEND_URI` when backend present;
+//!   optional `[filter:s3api] cold_delete_hot_after_archive` drops hot bytes after
+//!   that stamp — default false; lab LocalDir only, not tape/Glacier cloud)
 //! * multi-tenant IAM policy evaluation ([`iam::IamService`]) and
 //!   IdentityDirectory are library-only until the proxy loads their config.
 //!   Grant headers + ACP
@@ -115,8 +121,11 @@ pub mod sigv4;
 pub mod versioning_store;
 pub mod xml;
 
+pub use cold_tier::{
+    maybe_stamp_and_archive_due_cold, ColdBackend, ColdMetaStamp, ColdPolicyMap,
+    LocalDirColdBackend, MemoryColdBackend,
+};
 pub use middleware::{as_middleware, credentials_from_tempauth_users, S3Api, S3Credential};
-pub use cold_tier::{maybe_stamp_and_archive_due_cold, ColdBackend, ColdMetaStamp, ColdPolicyMap, LocalDirColdBackend, MemoryColdBackend};
 pub use parse::{
     extract_bucket_and_key, parse_host, s3_to_swift_path, validate_bucket_name, MULTIUPLOAD_SUFFIX,
 };

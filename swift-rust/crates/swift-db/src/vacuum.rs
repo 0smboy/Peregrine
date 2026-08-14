@@ -114,9 +114,7 @@ type VacuumDeviceRow = (
     Result<DbSpaceSample, DbError>,
 );
 
-pub fn vacuum_device_dbs(
-    device_path: &Path,
-) -> Vec<VacuumDeviceRow> {
+pub fn vacuum_device_dbs(device_path: &Path) -> Vec<VacuumDeviceRow> {
     let mut paths = db_locations(device_path, "accounts");
     paths.extend(db_locations(device_path, "containers"));
     let mut out = Vec::new();

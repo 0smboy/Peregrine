@@ -136,10 +136,7 @@ pub fn stamp_cold_policy_meta(
     headers.set(SYS_HOT_POLICY_INDEX, hot.to_string());
     headers.set(HDR_BACKEND_STORAGE_POLICY_INDEX, cold.to_string());
     // Preserve any URI already set (e.g. prior archive); never invent one.
-    let backend_uri = headers
-        .get(SYS_COLD_BACKEND_URI)
-        .unwrap_or("")
-        .to_string();
+    let backend_uri = headers.get(SYS_COLD_BACKEND_URI).unwrap_or("").to_string();
     Some(ColdMetaStamp {
         storage_class: storage_class.to_string(),
         cold_policy_index: cold,
@@ -443,16 +440,17 @@ mod tests {
 
     #[test]
     fn localdir_backend_archive_restore() {
-        let dir = std::env::temp_dir().join(format!(
-            "peregrine-cold-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("peregrine-cold-test-{}", std::process::id()));
         let be = LocalDirColdBackend::new(&dir).unwrap();
-        let uri = be.archive(2, "AUTH_test", "bkt", "dir/obj", b"payload").unwrap();
+        let uri = be
+            .archive(2, "AUTH_test", "bkt", "dir/obj", b"payload")
+            .unwrap();
         assert!(uri.starts_with("filecold://"));
         be.restore_stage(&uri, 1).unwrap();
         assert_eq!(be.fetch(&uri).unwrap(), b"payload");
-        assert!(be.restore_stage("filecold://2/AUTH_test/bkt/dead", 1).is_err());
+        assert!(be
+            .restore_stage("filecold://2/AUTH_test/bkt/dead", 1)
+            .is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

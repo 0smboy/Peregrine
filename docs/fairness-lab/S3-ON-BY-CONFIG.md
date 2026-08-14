@@ -59,7 +59,10 @@ remains residual (basic canned ACL + read ACL XML only).
 GET/PUT, tagging GET/PUT/DELETE (bucket+object), lifecycle GET/PUT/DELETE,
 object-lock GET/PUT, empty `?versions` list — see
 `tools/test-results/impl-s3-versioning-surface-20260807/`. Multi-version object
-bodies, lifecycle expirer, and object-lock WORM remain **residual**.
+bodies and lifecycle expirer remain **residual**. Object-lock WORM
+(DELETE/overwrite + GOVERNANCE bypass + PUT `?retention` shorten/downgrade
+guard) is **unit-wired**; not full AWS WORM (versioned path, MPU-complete,
+Swift v1 bypass). Live Contabo lock smoke is a bounded check, not a soak.
 
 ## Claims discipline
 
