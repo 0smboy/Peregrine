@@ -939,7 +939,7 @@ fn build_copy(conf: &SwiftConfig) -> Result<swift_middleware::Copy, String> {
         .trim()
         .parse::<i64>()
         .map_err(|_| format!("invalid copy yield_frequency {raw:?}: expected an integer"))?;
-    Ok(swift_middleware::Copy::new().with_yield_frequency(seconds as f64))
+    Ok(swift_middleware::Copy::new().with_yield_frequency(seconds.max(0) as f64))
 }
 
 /// Allowed, deprecated, and unsupported configured digest names.

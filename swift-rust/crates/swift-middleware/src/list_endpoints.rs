@@ -69,7 +69,8 @@ impl ListEndpoints {
     }
 
     pub fn with_path_root(mut self, path_root: impl Into<String>) -> Self {
-        self.path_root = path_root.into();
+        let path_root = path_root.into();
+        self.path_root = format!("{}/", path_root.trim_end_matches('/'));
         self
     }
 
@@ -93,22 +94,48 @@ impl Middleware for ListEndpoints {
             return Response::error(405, "Method Not Allowed");
         }
         let rest = &req.path[root.len()..];
-        let parts: Vec<&str> = rest.splitn(3, '/').filter(|s| !s.is_empty()).collect();
-        if parts.len() < 3 {
-            return Response::error(400, "Usage: /endpoints/<account>/<container>/<object>");
-        }
-        let (account, container, object) = (parts[0], parts[1], parts[2]);
+        let parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+        let (version, offset) = match parts.first().copied() {
+            Some("1" | "v1" | "1.0" | "v1.0") => (1, 1),
+            Some("2" | "v2" | "2.0" | "v2.0") => (2, 1),
+            Some(candidate) if candidate.starts_with('v') && !candidate.contains('_') => {
+                return Response::error(400, &format!("Unsupported version {candidate:?}"));
+            }
+            Some(_) => (1, 0),
+            None => return Response::error(400, "No account specified"),
+        };
+        let Some(account) = parts.get(offset).copied() else {
+            return Response::error(400, "No account specified");
+        };
+        let container = parts.get(offset + 1).copied();
+        let object = if parts.len() > offset + 2 {
+            Some(parts[offset + 2..].join("/"))
+        } else {
+            None
+        };
         let Some(resolver) = &self.resolver else {
             return Response::error(
                 501,
                 "list_endpoints: no ring resolver configured on this proxy",
             );
         };
-        let eps = match resolver.endpoints(account, Some(container), Some(object)) {
-            Ok((eps, _)) => eps,
+        let (eps, policy) = match resolver.endpoints(account, container, object.as_deref()) {
+            Ok(result) => result,
             Err(err) => return Response::error(400, &err),
         };
-        let body = serde_json::to_vec(&eps).unwrap_or_else(|_| b"[]".to_vec());
+        let body = if version == 2 {
+            let mut response = serde_json::json!({
+                "endpoints": eps,
+                "headers": {},
+            });
+            if let Some(policy) = policy {
+                response["headers"]["X-Backend-Storage-Policy-Index"] =
+                    serde_json::json!(policy.to_string());
+            }
+            serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec())
+        } else {
+            serde_json::to_vec(&eps).unwrap_or_else(|_| b"[]".to_vec())
+        };
         let mut r = Response::with_body(200, body);
         r.headers.set("Content-Type", "application/json");
         r
@@ -153,5 +180,51 @@ mod tests {
             body: swift_http::Body::empty(),
         };
         assert_eq!(le.handle(req, &next).status, 204);
+    }
+
+    #[test]
+    fn configured_path_root_is_canonical_and_routes() {
+        let le = ListEndpoints::new(Arc::new(StaticEndpoints(vec![
+            "http://127.0.0.1:6200/sdb1".into(),
+        ])))
+        .with_path_root("/where//");
+        assert_eq!(le.path_root, "/where/");
+
+        let next: NextFn = Arc::new(|_r| Response::new(500));
+        let req = Request {
+            method: "GET".into(),
+            path: "/where/a/c/o".into(),
+            query_string: String::new(),
+            headers: swift_http::HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        };
+        assert_eq!(le.handle(req, &next).status, 200);
+    }
+
+    #[test]
+    fn v2_account_response_has_endpoints_and_headers_shape() {
+        let le = ListEndpoints::new(Arc::new(StaticEndpoints(vec![
+            "http://127.0.0.1:6200/sdb1".into(),
+        ])))
+        .with_path_root("/where");
+        let next: NextFn = Arc::new(|_r| Response::new(500));
+        let req = Request {
+            method: "GET".into(),
+            path: "/where/v2/a".into(),
+            query_string: String::new(),
+            headers: swift_http::HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        };
+        let mut response = le.handle(req, &next);
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_slice(response.body.materialize(u64::MAX).unwrap()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "endpoints": ["http://127.0.0.1:6200/sdb1"],
+                "headers": {},
+            })
+        );
     }
 }

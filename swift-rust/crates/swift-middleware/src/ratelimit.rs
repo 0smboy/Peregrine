@@ -307,12 +307,51 @@ impl RateLimit {
     }
 
     /// Build from raw config strings, mirroring `RateLimitMiddleware.__init__`.
-    /// Validating constructor used by the proxy builder. Currently wraps
-    /// [`Self::from_conf`] (no extra fail-closed checks beyond parse defaults).
+    /// Validating constructor used by the proxy builder. Python's `float()` /
+    /// `int()` configuration coercions abort filter construction on malformed
+    /// values, so reject them here instead of silently applying defaults.
     pub fn try_from_conf(
         conf: &HashMap<String, String>,
         clock: Box<dyn Clock>,
     ) -> Result<Self, String> {
+        for key in [
+            "account_ratelimit",
+            "max_sleep_time_seconds",
+            "log_sleep_time_seconds",
+        ] {
+            if let Some(raw) = conf.get(key) {
+                let value = raw
+                    .trim()
+                    .parse::<f64>()
+                    .map_err(|_| format!("invalid {key} {raw:?}: expected a float"))?;
+                if !value.is_finite() {
+                    return Err(format!("invalid {key} {raw:?}: expected a finite float"));
+                }
+            }
+        }
+        for key in ["clock_accuracy", "rate_buffer_seconds"] {
+            if let Some(raw) = conf.get(key) {
+                raw.trim()
+                    .parse::<i64>()
+                    .map_err(|_| format!("invalid {key} {raw:?}: expected an integer"))?;
+            }
+        }
+        for (key, raw) in conf {
+            for prefix in ["container_ratelimit_", "container_listing_ratelimit_"] {
+                if let Some(suffix) = key.strip_prefix(prefix) {
+                    suffix.parse::<i64>().map_err(|_| {
+                        format!("invalid {key}: rate-limit tier suffix must be an integer")
+                    })?;
+                    let value = raw
+                        .trim()
+                        .parse::<f64>()
+                        .map_err(|_| format!("invalid {key} {raw:?}: expected a float"))?;
+                    if !value.is_finite() {
+                        return Err(format!("invalid {key} {raw:?}: expected a finite float"));
+                    }
+                }
+            }
+        }
         Ok(Self::from_conf(conf, clock))
     }
 
@@ -984,5 +1023,22 @@ mod tests {
         assert_eq!(rl.rate_buffer_seconds, 5);
         assert!(rl.ratelimit_whitelist.is_empty());
         assert!(rl.container_ratelimits.is_empty());
+    }
+
+    #[test]
+    fn test_try_from_conf_rejects_invalid_numeric_options_and_tiers() {
+        for (key, value) in [
+            ("account_ratelimit", "nope"),
+            ("max_sleep_time_seconds", "NaN"),
+            ("clock_accuracy", "1.5"),
+            ("container_ratelimit_bad", "2"),
+            ("container_listing_ratelimit_10", "fast"),
+        ] {
+            let invalid = conf(&[(key, value)]);
+            let error = RateLimit::try_from_conf(&invalid, Box::new(SystemClock::new()))
+                .err()
+                .expect("invalid numeric configuration must fail closed");
+            assert!(error.contains(key), "key={key} error={error}");
+        }
     }
 }
