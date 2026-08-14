@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import ssl
 import sys
 import time
@@ -23,10 +24,53 @@ from typing import Dict, List, Optional, Sequence, Tuple
 VIP = os.environ.get("VIP", "https://10.0.0.10:8085")
 HOST = os.environ.get("S3_HOST", "10.0.0.10:8085")
 REGION = os.environ.get("S3_REGION", "us-east-1")
-EVID_DIR = os.environ["EVID_DIR"]
+EVID_DIR = os.environ.get("EVID_DIR", "")
 TIP_SHA = os.environ.get("TIP_SHA", "")
 CTX = ssl._create_unverified_context()
 SERVICE = "s3"
+
+EXIT_PARITY_GREEN = 0
+EXIT_FAIL = 1
+EXIT_CONFIG_ERROR = 2
+EXIT_BLOCKED = 3
+EXIT_OPS_ONLY = 4
+EXIT_PARTIAL = 5
+EXIT_SKIPPED = 6
+TIP_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+
+REQUIRED_OPS = frozenset(
+    {
+        ("tempauth-sigv4", "ListBuckets"),
+        ("tempauth-sigv4", "CreateBucket"),
+        ("tempauth-sigv4", "PutObject"),
+        ("tempauth-sigv4", "HeadObject"),
+        ("tempauth-sigv4", "GetObject"),
+        ("tempauth-sigv4", "GetObjectRange"),
+        ("tempauth-sigv4", "ListObjectsV1"),
+        ("tempauth-sigv4", "ListObjectsV2"),
+        ("tempauth-sigv4", "GetBucketLocation"),
+        ("tempauth-sigv4", "GetBucketAcl"),
+        ("tempauth-sigv4", "GetObjectAcl"),
+        ("tempauth-sigv4", "CopyObject"),
+        ("tempauth-sigv4", "GetCopiedObject"),
+        ("tempauth-sigv4", "MultiDelete"),
+        ("tempauth-sigv4", "CreateMultipartUpload"),
+        ("tempauth-sigv4", "UploadPart"),
+        ("tempauth-sigv4", "ListParts"),
+        ("tempauth-sigv4", "ListMultipartUploads"),
+        ("tempauth-sigv4", "AbortMultipartUpload"),
+        ("tempauth-sigv4", "DeleteObject"),
+        ("tempauth-sigv4", "DeleteBucket"),
+        ("ec2-sigv4", "ListBuckets"),
+        ("ec2-sigv4", "CreateBucket"),
+        ("ec2-sigv4", "PutObject"),
+        ("ec2-sigv4", "HeadObject"),
+        ("ec2-sigv4", "GetObject"),
+        ("ec2-sigv4", "ListObjectsV1"),
+        ("ec2-sigv4", "DeleteObject"),
+        ("ec2-sigv4", "DeleteBucket"),
+    }
+)
 
 S3_SUBRESOURCES = frozenset(
     {
@@ -141,7 +185,15 @@ def _normalize(v: str) -> str:
     return " ".join(v.strip().split())
 
 
-def record(lane: str, op: str, code: int, ok: bool, note: str = "", body: bytes = b"") -> None:
+def record(
+    lane: str,
+    op: str,
+    code: int,
+    ok: bool,
+    note: str = "",
+    body: bytes = b"",
+    cleanup: bool = False,
+) -> None:
     snippet = body[:120].decode("utf-8", "replace").replace("\n", " ")
     # redact common secret-ish patterns
     for tok in ("Signature=", "Credential=", "AWSAccessKeyId="):
@@ -154,17 +206,27 @@ def record(lane: str, op: str, code: int, ok: bool, note: str = "", body: bytes 
         "ok": bool(ok),
         "note": note,
         "body_snip": snippet,
+        "cleanup": bool(cleanup),
     }
     results.append(row)
     status = "PASS" if ok else "FAIL"
     print(f"{status}  {lane}:{op}  http={code}  {note}  {snippet[:100]}")
 
 
-def expect(lane, op, code, ok_codes, body=b"", note="", extra_ok=None):
+def expect(
+    lane,
+    op,
+    code,
+    ok_codes,
+    body=b"",
+    note="",
+    extra_ok=None,
+    cleanup=False,
+):
     ok = code in ok_codes
     if extra_ok is not None:
         ok = ok and extra_ok
-    record(lane, op, code, ok, note=note, body=body)
+    record(lane, op, code, ok, note=note, body=body, cleanup=cleanup)
     return ok
 
 
@@ -282,7 +344,7 @@ def run_tempauth(access: str, secret: str) -> None:
         extra_headers={"Content-MD5": __import__("base64").b64encode(hashlib.md5(md_body).digest()).decode(),
                        "Content-Type": "application/xml"},
     )
-    expect(lane, "MultiDelete", code, (200,), body)
+    expect(lane, "MultiDelete", code, (200,), body, cleanup=True)
 
     # MPU initiate / upload / list / abort (not full complete path — keep bounded)
     code, _, body = sigv4(access, secret, "POST", f"/{bucket}/mpu.bin", query=[("uploads", "")])
@@ -314,13 +376,22 @@ def run_tempauth(access: str, secret: str) -> None:
             access, secret, "DELETE", f"/{bucket}/mpu.bin",
             query=[("uploadId", upload_id)],
         )
-        expect(lane, "AbortMultipartUpload", code, (204, 200), body)
+        expect(lane, "AbortMultipartUpload", code, (204, 200), body, cleanup=True)
+    elif code in (200, 201):
+        record(
+            lane,
+            "AbortMultipartUpload",
+            0,
+            False,
+            note="cleanup impossible: successful initiate returned no upload id",
+            cleanup=True,
+        )
 
     # cleanup
     code, _, body = sigv4(access, secret, "DELETE", f"/{bucket}/{key}")
-    expect(lane, "DeleteObject", code, (204, 200, 404), body)
+    expect(lane, "DeleteObject", code, (204, 200, 404), body, cleanup=True)
     code, _, body = sigv4(access, secret, "DELETE", f"/{bucket}")
-    expect(lane, "DeleteBucket", code, (204, 200), body)
+    expect(lane, "DeleteBucket", code, (204, 200, 404), body, cleanup=True)
 
 
 def run_ec2(access: str, secret: str) -> None:
@@ -361,85 +432,254 @@ def run_ec2(access: str, secret: str) -> None:
     expect(lane, "ListObjectsV1", code, (200,), body)
 
     code, _, body = sigv4(access, secret, "DELETE", f"/{bucket}/{key}")
-    expect(lane, "DeleteObject", code, (204, 200), body)
+    expect(lane, "DeleteObject", code, (204, 200, 404), body, cleanup=True)
 
     code, _, body = sigv4(access, secret, "DELETE", f"/{bucket}")
-    expect(lane, "DeleteBucket", code, (204, 200), body)
+    expect(lane, "DeleteBucket", code, (204, 200, 404), body, cleanup=True)
 
 
-def main() -> int:
-    os.makedirs(EVID_DIR, exist_ok=True)
-    # TempAuth from env
-    ta_access = os.environ.get("ST_USER", "")
-    ta_secret = os.environ.get("ST_KEY", "")
-    if not ta_access or not ta_secret:
-        print("FATAL: ST_USER/ST_KEY not set", file=sys.stderr)
-        return 2
+def _utc_stamp() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
-    print(f"matrix_start tip_sha={TIP_SHA[:12]}… vip={VIP} region_start={REGION}")
-    print(f"tempauth_access_prefix={ta_access[:8]}… (secret redacted)")
 
-    run_tempauth(ta_access, ta_secret)
+def _configuration_errors() -> List[str]:
+    errors: List[str] = []
+    if not EVID_DIR:
+        errors.append("EVID_DIR is required")
+    parsed = urllib.parse.urlsplit(VIP)
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        errors.append("VIP must be an absolute HTTP(S) origin without credentials or path")
+    try:
+        _ = parsed.port
+    except ValueError:
+        errors.append("VIP has an invalid port")
+    if not HOST or any(c.isspace() for c in HOST) or "/" in HOST:
+        errors.append("S3_HOST must be a non-empty host[:port]")
+    if not REGION or any(c.isspace() for c in REGION):
+        errors.append("S3_REGION must be a non-empty token")
+    if not TIP_SHA_RE.fullmatch(TIP_SHA):
+        errors.append("TIP_SHA must be a 7-64 character hexadecimal commit id")
+    if not os.environ.get("ST_USER", "") or not os.environ.get("ST_KEY", ""):
+        errors.append("ST_USER and ST_KEY are required")
+    return errors
 
-    ec2_path = os.environ.get("EC2_CREDS_JSON", "/root/contabo-s3-ec2-tester.json")
-    if os.path.isfile(ec2_path):
-        cred = json.loads(open(ec2_path).read())
-        ec2_access = cred["access"]
-        ec2_secret = cred["secret"]
-        print(f"ec2_access_prefix={ec2_access[:8]}… (secret redacted)")
-        run_ec2(ec2_access, ec2_secret)
-    else:
-        record("ec2-sigv4", "creds_missing", 0, False, note=ec2_path)
 
-    passed = sum(1 for r in results if r["ok"])
-    failed = sum(1 for r in results if not r["ok"])
-    crit = [r for r in results if (not r["ok"]) and r["op"] in {
-        "ListBuckets", "CreateBucket", "PutObject", "GetObject", "DeleteObject", "DeleteBucket",
+def _load_ec2_credentials(path: str) -> Tuple[str, str]:
+    if not os.path.isfile(path):
+        raise ValueError("EC2_CREDS_JSON does not exist")
+    try:
+        with open(path, encoding="utf-8") as f:
+            value = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("EC2_CREDS_JSON is not readable valid JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError("EC2_CREDS_JSON must contain an object")
+    access = value.get("access")
+    secret = value.get("secret")
+    if not isinstance(access, str) or not access or not isinstance(secret, str) or not secret:
+        raise ValueError("EC2_CREDS_JSON requires non-empty access and secret strings")
+    return access, secret
+
+
+def classify_ops(rows: Sequence[dict]) -> Tuple[str, int, int, int, int]:
+    """Return verdict, exit code, pass, fail, cleanup-fail counts.
+
+    This one-origin matrix can never return PARITY_GREEN. Complete operations
+    are OPS_ONLY/4 until the independent strict-s3-parity gate runs.
+    """
+    if not rows:
+        return "PARTIAL", EXIT_PARTIAL, 0, 0, 0
+    passed = sum(1 for row in rows if row["ok"])
+    failed_rows = [row for row in rows if not row["ok"]]
+    cleanup_failed = sum(1 for row in failed_rows if row.get("cleanup"))
+    present = {(row["lane"], row["op"]) for row in rows}
+    missing_required = REQUIRED_OPS - present
+    critical_ops = {
+        "ListBuckets",
+        "CreateBucket",
+        "PutObject",
+        "GetObject",
+        "DeleteObject",
+        "DeleteBucket",
         "HeadObject",
-    }]
-    if failed == 0:
-        verdict = "GREEN"
-    elif not crit and passed > 0:
-        verdict = "PARTIAL"
-    else:
-        verdict = "FAIL"
+    }
+    critical_failed = any(row["op"] in critical_ops for row in failed_rows)
+    if cleanup_failed or critical_failed:
+        return "FAIL", EXIT_FAIL, passed, len(failed_rows), cleanup_failed
+    if failed_rows or missing_required:
+        return "PARTIAL", EXIT_PARTIAL, passed, len(failed_rows), cleanup_failed
+    return "OPS_ONLY", EXIT_OPS_ONLY, passed, 0, 0
 
+
+def _write_early_verdict(verdict: str, reason: str, exit_code: int) -> None:
+    message = (
+        f"VERDICT={verdict} CLAIM=OPS_ONLY reason={reason} "
+        f"exit_code={exit_code} parity_oracle=NOT_RUN"
+    )
+    print(message, file=sys.stderr)
+    if not EVID_DIR:
+        return
+    try:
+        os.makedirs(EVID_DIR, exist_ok=True)
+        with open(os.path.join(EVID_DIR, "00-VERDICT.txt"), "w", encoding="utf-8") as f:
+            f.write(message + "\n")
+        with open(
+            os.path.join(EVID_DIR, "30-matrix-results.json"), "w", encoding="utf-8"
+        ) as f:
+            json.dump(
+                {
+                    "verdict": verdict,
+                    "claim": "OPS_ONLY",
+                    "exit_code": exit_code,
+                    "reason": reason,
+                    "parity_oracle": "NOT_RUN",
+                    "tip_sha": TIP_SHA,
+                    "utc": _utc_stamp(),
+                },
+                f,
+                indent=2,
+            )
+            f.write("\n")
+    except OSError as exc:
+        print(f"FATAL: unable to write evidence: {type(exc).__name__}", file=sys.stderr)
+
+
+def _write_results(verdict: str, exit_code: int) -> None:
+    passed = sum(1 for row in results if row["ok"])
+    failed = sum(1 for row in results if not row["ok"])
+    cleanup_failed = sum(
+        1 for row in results if (not row["ok"]) and row.get("cleanup")
+    )
+    present = {(row["lane"], row["op"]) for row in results}
+    missing_ops = sorted(f"{lane}:{op}" for lane, op in REQUIRED_OPS - present)
     summary = {
         "verdict": verdict,
+        "claim": "OPS_ONLY",
+        "exit_code": exit_code,
+        "parity_oracle": "NOT_RUN",
+        "parity_green": False,
         "tip_sha": TIP_SHA,
         "vip": VIP,
         "region": REGION,
         "passed": passed,
         "failed": failed,
+        "cleanup_failed": cleanup_failed,
+        "required_ops": len(REQUIRED_OPS),
+        "missing_ops": missing_ops,
         "ops": results,
         "claim_boundary": (
-            "Bounded Contabo live extended matrix: TempAuth SigV4 CRUD+list+acl+location+"
-            "range+copy+multidelete+MPU abort path; EC2 SigV4 List/Put/Get/Head/Delete. "
-            "NOT full strict-s3-parity dual-oracle; NOT multi-hour soak; NOT versioning/WORM live."
+            "OPS_ONLY bounded Contabo live extended matrix: TempAuth SigV4 CRUD+list+acl+"
+            "location+range+copy+multidelete+MPU abort path; EC2 SigV4 "
+            "List/Put/Get/Head/Delete. Python S3 oracle NOT_RUN, therefore this result is "
+            "never parity GREEN. NOT multi-hour soak; NOT versioning/WORM live."
         ),
-        "utc": datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ"),
+        "zero_exit_policy": (
+            "Exit 0 is reserved for a separate successful strict-s3-parity two-origin gate."
+        ),
+        "utc": _utc_stamp(),
     }
-    with open(os.path.join(EVID_DIR, "30-matrix-results.json"), "w") as f:
+    with open(
+        os.path.join(EVID_DIR, "30-matrix-results.json"), "w", encoding="utf-8"
+    ) as f:
         json.dump(summary, f, indent=2)
         f.write("\n")
-    with open(os.path.join(EVID_DIR, "30-matrix-suite.txt"), "w") as f:
-        for r in results:
+    with open(os.path.join(EVID_DIR, "30-matrix-suite.txt"), "w", encoding="utf-8") as f:
+        for row in results:
             f.write(
-                f"{'PASS' if r['ok'] else 'FAIL'}  {r['lane']}:{r['op']}  "
-                f"http={r['http']}  {r['note']}  {r['body_snip']}\n"
+                f"{'PASS' if row['ok'] else 'FAIL'}  {row['lane']}:{row['op']}  "
+                f"http={row['http']} cleanup={str(row.get('cleanup', False)).lower()}  "
+                f"{row['note']}  {row['body_snip']}\n"
             )
-        f.write(f"SUMMARY pass={passed} fail={failed} verdict={verdict}\n")
-    with open(os.path.join(EVID_DIR, "00-VERDICT.txt"), "w") as f:
+        f.write(
+            f"SUMMARY claim=OPS_ONLY parity_oracle=NOT_RUN pass={passed} fail={failed} "
+            f"cleanup_fail={cleanup_failed} missing={len(missing_ops)} "
+            f"verdict={verdict} exit_code={exit_code}\n"
+        )
+    with open(os.path.join(EVID_DIR, "00-VERDICT.txt"), "w", encoding="utf-8") as f:
         f.write(
             f"Contabo live S3 extended matrix @ tip {TIP_SHA[:12]}…\n"
             f"VERDICT={verdict}\n"
-            f"passed={passed} failed={failed}\n"
+            f"CLAIM=OPS_ONLY\n"
+            f"PARITY_ORACLE=NOT_RUN\n"
+            f"EXIT_CODE={exit_code}\n"
+            f"passed={passed} failed={failed} cleanup_failed={cleanup_failed} "
+            f"missing={len(missing_ops)}\n"
             f"lanes=tempauth-sigv4,ec2-sigv4\n"
-            f"Claim boundary: bounded extended ops vs VIP; NOT multi-hour; NOT full strict-s3-parity.\n"
+            f"Claim boundary: bounded one-origin extended ops vs VIP; not parity GREEN.\n"
             f"Evidence: {EVID_DIR}\n"
         )
-    print(f"VERDICT={verdict} passed={passed} failed={failed}")
-    return 0 if verdict == "GREEN" else (1 if verdict == "FAIL" else 0)
+
+
+def main() -> int:
+    global results
+    results = []
+    config_errors = _configuration_errors()
+    if config_errors:
+        _write_early_verdict("CONFIG_ERROR", "; ".join(config_errors), EXIT_CONFIG_ERROR)
+        return EXIT_CONFIG_ERROR
+
+    try:
+        os.makedirs(EVID_DIR, exist_ok=True)
+    except OSError as exc:
+        print(f"FATAL: unable to create EVID_DIR: {type(exc).__name__}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+
+    ec2_path = os.environ.get("EC2_CREDS_JSON", "/root/contabo-s3-ec2-tester.json")
+    try:
+        ec2_access, ec2_secret = _load_ec2_credentials(ec2_path)
+    except ValueError as exc:
+        _write_early_verdict("CONFIG_ERROR", str(exc), EXIT_CONFIG_ERROR)
+        return EXIT_CONFIG_ERROR
+
+    ta_access = os.environ["ST_USER"]
+    ta_secret = os.environ["ST_KEY"]
+    print(f"matrix_start tip_sha={TIP_SHA[:12]}… vip={VIP} region_start={REGION}")
+    print("CLAIM=OPS_ONLY parity_oracle=NOT_RUN zero_exit_allowed=false")
+    print(f"tempauth_access_prefix={ta_access[:8]}… (secret redacted)")
+
+    try:
+        run_tempauth(ta_access, ta_secret)
+        print(f"ec2_access_prefix={ec2_access[:8]}… (secret redacted)")
+        run_ec2(ec2_access, ec2_secret)
+    except KeyboardInterrupt:
+        record(
+            "runner",
+            "cleanup_completion",
+            0,
+            False,
+            note="interrupted; cleanup completion is not proven",
+            cleanup=True,
+        )
+        _write_results("INTERRUPTED", 130)
+        return 130
+    except Exception as exc:  # noqa: BLE001
+        record(
+            "runner",
+            "cleanup_completion",
+            0,
+            False,
+            note=f"unexpected {type(exc).__name__}; cleanup completion is not proven",
+            cleanup=True,
+        )
+        _write_results("FAIL", EXIT_FAIL)
+        return EXIT_FAIL
+
+    verdict, exit_code, passed, failed, cleanup_failed = classify_ops(results)
+    _write_results(verdict, exit_code)
+    print(
+        f"VERDICT={verdict} CLAIM=OPS_ONLY PARITY_ORACLE=NOT_RUN "
+        f"passed={passed} failed={failed} cleanup_failed={cleanup_failed} "
+        f"exit_code={exit_code}"
+    )
+    return exit_code
 
 
 if __name__ == "__main__":
