@@ -26,6 +26,13 @@ use swift_http::{split_path, Request};
 /// reference; multipart is otherwise deferred.
 pub const MULTIUPLOAD_SUFFIX: &str = "+segments";
 
+/// S3 path parsing errors that must not be collapsed into a service request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum S3PathError {
+    InvalidBucketName(String),
+    InvalidUri(String),
+}
+
 /// Validate an S3 bucket name.
 ///
 /// Port of `validate_bucket_name`. Returns true if valid. With
@@ -117,9 +124,9 @@ pub fn parse_host(host: Option<&str>, storage_domains: &[String]) -> Option<Stri
 /// Extract `(bucket, key)` from a request, supporting both virtual-host style
 /// (bucket in `Host`) and path style (`/bucket/key`).
 ///
-/// Port of `extract_bucket_and_key` + `parse_path`. Returns `(None, None)` if
-/// the path is unparseable or the path-style bucket name is invalid (the
-/// Python swallows `InvalidBucketNameParseError`/`InvalidURIParseError`).
+/// Port of the strict `parse_path` used to construct Python S3 requests.
+/// Parsing errors are returned explicitly: treating them as `(None, None)`
+/// would turn a malformed bucket operation into an account operation.
 ///
 /// The returned bucket is `None` for a service request (path `/`); the key is
 /// `None` when only a bucket is addressed.
@@ -127,23 +134,26 @@ pub fn extract_bucket_and_key(
     req: &Request,
     storage_domains: &[String],
     dns_compliant: bool,
-) -> (Option<String>, Option<String>) {
+) -> Result<(Option<String>, Option<String>), S3PathError> {
     // Virtual-host style: a non-empty bucket label on the host wins.
     let bucket_in_host =
         parse_host(req.headers.get("Host"), storage_domains).filter(|b| !b.is_empty());
     if let Some(bucket) = bucket_in_host {
+        if !validate_bucket_name(&bucket, dns_compliant) {
+            return Err(S3PathError::InvalidBucketName(bucket));
+        }
         let obj = if req.path.len() > 1 {
             Some(req.path[1..].to_string())
         } else {
             None
         };
-        return (Some(bucket), obj);
+        return Ok((Some(bucket), obj));
     }
 
     // Path style: split_path(path, 0, 2, rest_with_last=True).
     let parts = match split_path(&req.path, 0, 2, true) {
         Ok(p) => p,
-        Err(_) => return (None, None),
+        Err(_) => return Err(S3PathError::InvalidUri(req.path.clone())),
     };
     let bucket = parts.first().cloned().flatten().filter(|b| !b.is_empty());
     // Python Swift classifies `/bucket/` as a bucket request because the
@@ -159,10 +169,10 @@ pub fn extract_bucket_and_key(
 
     if let Some(b) = &bucket {
         if !validate_bucket_name(b, dns_compliant) {
-            return (None, None);
+            return Err(S3PathError::InvalidBucketName(b.clone()));
         }
     }
-    (bucket, key)
+    Ok((bucket, key))
 }
 
 /// Map an S3 `(account, bucket, key)` to the Swift back-end path.
@@ -206,7 +216,7 @@ mod tests {
     #[test]
     fn test_path_style_bucket_and_key() {
         let r = req("GET", "/mybucket/path/to/obj", None);
-        let (b, k) = extract_bucket_and_key(&r, &[], true);
+        let (b, k) = extract_bucket_and_key(&r, &[], true).unwrap();
         assert_eq!(b.as_deref(), Some("mybucket"));
         assert_eq!(k.as_deref(), Some("path/to/obj"));
     }
@@ -214,13 +224,13 @@ mod tests {
     #[test]
     fn test_path_style_bucket_only() {
         let r = req("GET", "/mybucket", None);
-        let (b, k) = extract_bucket_and_key(&r, &[], true);
+        let (b, k) = extract_bucket_and_key(&r, &[], true).unwrap();
         assert_eq!(b.as_deref(), Some("mybucket"));
         assert_eq!(k, None);
 
         // s3cmd 2.4.0 path-style CreateBucket uses `PUT /bucket/`.
         let r = req("PUT", "/mybucket/", None);
-        let (b, k) = extract_bucket_and_key(&r, &[], true);
+        let (b, k) = extract_bucket_and_key(&r, &[], true).unwrap();
         assert_eq!(b.as_deref(), Some("mybucket"));
         assert_eq!(k, None);
     }
@@ -228,7 +238,7 @@ mod tests {
     #[test]
     fn test_path_style_service_request() {
         let r = req("GET", "/", None);
-        let (b, k) = extract_bucket_and_key(&r, &[], true);
+        let (b, k) = extract_bucket_and_key(&r, &[], true).unwrap();
         assert_eq!(b, None);
         assert_eq!(k, None);
     }
@@ -238,19 +248,19 @@ mod tests {
         let domains = vec!["s3.example.com".to_string()];
         // bucket + key
         let r = req("GET", "/path/to/obj", Some("mybucket.s3.example.com"));
-        let (b, k) = extract_bucket_and_key(&r, &domains, true);
+        let (b, k) = extract_bucket_and_key(&r, &domains, true).unwrap();
         assert_eq!(b.as_deref(), Some("mybucket"));
         assert_eq!(k.as_deref(), Some("path/to/obj"));
 
         // bucket only (root path)
         let r = req("GET", "/", Some("mybucket.s3.example.com"));
-        let (b, k) = extract_bucket_and_key(&r, &domains, true);
+        let (b, k) = extract_bucket_and_key(&r, &domains, true).unwrap();
         assert_eq!(b.as_deref(), Some("mybucket"));
         assert_eq!(k, None);
 
         // host == storage domain -> no vhost bucket, falls back to path style
         let r = req("GET", "/pathbucket/o", Some("s3.example.com"));
-        let (b, k) = extract_bucket_and_key(&r, &domains, true);
+        let (b, k) = extract_bucket_and_key(&r, &domains, true).unwrap();
         assert_eq!(b.as_deref(), Some("pathbucket"));
         assert_eq!(k.as_deref(), Some("o"));
     }
@@ -259,22 +269,32 @@ mod tests {
     fn test_vhost_port_stripped() {
         let domains = vec![".s3.example.com".to_string()];
         let r = req("GET", "/o", Some("bkt.s3.example.com:8080"));
-        let (b, _k) = extract_bucket_and_key(&r, &domains, true);
+        let (b, _k) = extract_bucket_and_key(&r, &domains, true).unwrap();
         assert_eq!(b.as_deref(), Some("bkt"));
     }
 
     #[test]
     fn test_invalid_path_style_bucket_name() {
-        // Upper-case is invalid under DNS-compliant rules -> (None, None).
+        // Upper-case is invalid under DNS-compliant rules.
         let r = req("GET", "/BadBucket/o", None);
-        let (b, k) = extract_bucket_and_key(&r, &[], true);
-        assert_eq!(b, None);
-        assert_eq!(k, None);
+        assert_eq!(
+            extract_bucket_and_key(&r, &[], true),
+            Err(S3PathError::InvalidBucketName("BadBucket".into()))
+        );
         // ...but valid under legacy rules.
         let r = req("GET", "/BadBucket/o", None);
-        let (b, k) = extract_bucket_and_key(&r, &[], false);
+        let (b, k) = extract_bucket_and_key(&r, &[], false).unwrap();
         assert_eq!(b.as_deref(), Some("BadBucket"));
         assert_eq!(k.as_deref(), Some("o"));
+    }
+
+    #[test]
+    fn test_invalid_uri_is_not_a_service_request() {
+        let r = req("DELETE", "not-an-absolute-path", None);
+        assert_eq!(
+            extract_bucket_and_key(&r, &[], true),
+            Err(S3PathError::InvalidUri("not-an-absolute-path".into()))
+        );
     }
 
     #[test]

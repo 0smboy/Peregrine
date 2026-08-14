@@ -118,7 +118,8 @@ pub mod xml;
 pub use middleware::{as_middleware, credentials_from_tempauth_users, S3Api, S3Credential};
 pub use cold_tier::{maybe_stamp_and_archive_due_cold, ColdBackend, ColdMetaStamp, ColdPolicyMap, LocalDirColdBackend, MemoryColdBackend};
 pub use parse::{
-    extract_bucket_and_key, parse_host, s3_to_swift_path, validate_bucket_name, MULTIUPLOAD_SUFFIX,
+    extract_bucket_and_key, parse_host, s3_to_swift_path, validate_bucket_name, S3PathError,
+    MULTIUPLOAD_SUFFIX,
 };
 pub use response::{
     copy_object_result_xml, delete_object_response, delete_result_xml, error_status_and_message,

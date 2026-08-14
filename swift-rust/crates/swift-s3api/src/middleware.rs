@@ -147,7 +147,7 @@ use crate::object_lock_worm::{
     retention_xml, worm_blocks_delete_with_bypass, HDR_BYPASS_GOVERNANCE, SYS_LEGAL_HOLD,
     SYS_LOCK_MODE, SYS_RETAIN_UNTIL,
 };
-use crate::parse::{extract_bucket_and_key, s3_to_swift_path, validate_bucket_name};
+use crate::parse::{extract_bucket_and_key, s3_to_swift_path, S3PathError};
 use crate::response::{
     copy_object_result_xml, delete_object_response, delete_result_xml, list_all_my_buckets_xml,
     put_object_response, s3_error_response, xml_response, BucketInfo, DeleteError,
@@ -554,8 +554,19 @@ fn is_s3_unsigned_read_candidate(
     if is_swift_native_path(&req.path) {
         return false;
     }
-    let (bucket, _) = extract_bucket_and_key(req, storage_domains, dns_compliant);
-    bucket.is_some()
+    extract_bucket_and_key(req, storage_domains, dns_compliant)
+        .ok()
+        .and_then(|(bucket, _)| bucket)
+        .is_some()
+}
+
+fn path_error_response(error: S3PathError) -> Response {
+    match error {
+        S3PathError::InvalidBucketName(bucket) => {
+            s3_error_response("InvalidBucketName", None, &[("BucketName", &bucket)])
+        }
+        S3PathError::InvalidUri(uri) => s3_error_response("InvalidURI", None, &[("URI", &uri)]),
+    }
 }
 
 /// Object ACL must not block AllUsers when Swift returned 200 via container ACL.
@@ -1439,12 +1450,18 @@ impl S3Api {
             return not_implemented_subresource(sub);
         }
 
-        let (bucket, key) =
-            extract_bucket_and_key(&req, &self.storage_domains, self.dns_compliant_bucket_names);
-        if let Some(b) = &bucket {
-            if !validate_bucket_name(b, self.dns_compliant_bucket_names) {
-                return s3_error_response("InvalidBucketName", None, &[("BucketName", b)]);
-            }
+        let (bucket, key) = match extract_bucket_and_key(
+            &req,
+            &self.storage_domains,
+            self.dns_compliant_bucket_names,
+        ) {
+            Ok(parsed) => parsed,
+            Err(error) => return path_error_response(error),
+        };
+        // The only valid account-level S3 operation is ListBuckets. Never
+        // translate a destructive empty-bucket request to `/v1/<account>`.
+        if bucket.is_none() && !(req.method == "GET" && req.path == "/") {
+            return path_error_response(S3PathError::InvalidUri(req.path.clone()));
         }
 
         // Multi-tenant IAM policy gate (when policies attached for principal).
@@ -1821,14 +1838,17 @@ impl S3Api {
         if let Some(sub) = first_unsupported_subresource(&params) {
             return not_implemented_subresource(sub);
         }
-        let (bucket, key) =
-            extract_bucket_and_key(&req, &self.storage_domains, self.dns_compliant_bucket_names);
+        let (bucket, key) = match extract_bucket_and_key(
+            &req,
+            &self.storage_domains,
+            self.dns_compliant_bucket_names,
+        ) {
+            Ok(parsed) => parsed,
+            Err(error) => return path_error_response(error),
+        };
         let Some(bucket) = bucket else {
             return next(req);
         };
-        if !validate_bucket_name(&bucket, self.dns_compliant_bucket_names) {
-            return s3_error_response("InvalidBucketName", None, &[("BucketName", &bucket)]);
-        }
         let method = req.method.clone();
         let for_list = matches!(method.as_str(), "GET" | "HEAD") && key.is_none();
         let mut swift_req = req;
@@ -4045,6 +4065,58 @@ mod tests {
         assert!(body.contains("ListAllMyBucketsResult"));
         assert!(body.contains("<Name>b1</Name>"));
         assert!(body.contains("2013-05-24T00:00:00.000Z"));
+    }
+
+    #[test]
+    fn destructive_invalid_encoded_segments_bucket_never_reaches_swift() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let api = S3Api::new(cred_map());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let next: NextFn = Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Response::new(500)
+        });
+
+        // The live raw path ends in `%252Bsegments`; swift-http has decoded
+        // one layer by the time S3Api receives this `%2Bsegments` path.
+        let path = "/w3ex-hotfix%2Bsegments";
+        for method in ["PUT", "DELETE"] {
+            let req = sign_request(base_s3_req(method, path, ""), "testing");
+            let resp = api.handle(req, &next);
+            assert_eq!(resp.status, 400, "method={method}");
+            let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+            assert!(body.contains("<Code>InvalidBucketName</Code>"), "{body}");
+            assert!(
+                body.contains("<BucketName>w3ex-hotfix%2Bsegments</BucketName>"),
+                "{body}"
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn destructive_empty_bucket_never_reaches_swift_account_path() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let api = S3Api::new(cred_map());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let next: NextFn = Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Response::new(500)
+        });
+
+        for method in ["PUT", "DELETE"] {
+            let req = sign_request(base_s3_req(method, "/", ""), "testing");
+            let resp = api.handle(req, &next);
+            assert_eq!(resp.status, 400, "method={method}");
+            let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+            assert!(body.contains("<Code>InvalidURI</Code>"), "{body}");
+            assert!(body.contains("<URI>/</URI>"), "{body}");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
