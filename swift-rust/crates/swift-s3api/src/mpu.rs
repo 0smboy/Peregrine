@@ -23,9 +23,13 @@
 //!   with `?multipart-manifest=put`.
 //! * Abort → DELETE marker + parts under the segments path prefix.
 
+use crate::crypto::md5_hex;
 use crate::parse::MULTIUPLOAD_SUFFIX;
 use crate::xml::Element;
 use swift_http::Response;
+
+/// Python `sysmeta_header('object', 'etag')` — stored unquoted `md5hex-N`.
+pub const SYS_S3API_ETAG: &str = "X-Object-Sysmeta-S3Api-Etag";
 
 /// Build an InitiateMultipartUploadResult XML body.
 pub fn initiate_multipart_xml(bucket: &str, key: &str, upload_id: &str) -> Vec<u8> {
@@ -185,6 +189,47 @@ pub fn new_upload_id() -> String {
     format!("{nanos:032x}")
 }
 
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_decode_16(s: &str) -> Option<[u8; 16]> {
+    if s.len() != 32 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = (hex_val(bytes[i * 2])? << 4) | hex_val(bytes[i * 2 + 1])?;
+    }
+    Some(out)
+}
+
+/// AWS CompleteMultipartUpload / GET ETag: `MD5(MD5(part1)||…||MD5(partN))-N`.
+/// Each part ETag must be 32 hex (quoted or bare). `None` if empty or any
+/// part is not a 32-hex MD5 (runner `_etag` then cannot match the composite).
+pub fn aws_multipart_etag<'a, I>(part_etags: I) -> Option<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut concat = Vec::new();
+    let mut n = 0u32;
+    for e in part_etags {
+        let bare = e.trim().trim_matches('"');
+        concat.extend_from_slice(&hex_decode_16(bare)?);
+        n += 1;
+    }
+    if n == 0 {
+        return None;
+    }
+    Some(format!("{}-{n}", md5_hex(&concat)))
+}
+
 /// Parse `<CompleteMultipartUpload><Part>…` into ordered part numbers + etags.
 pub fn parse_complete_body(body: &[u8]) -> Result<Vec<(u32, String)>, String> {
     let text = std::str::from_utf8(body).map_err(|_| "MalformedXML".to_string())?;
@@ -258,6 +303,19 @@ mod tests {
     fn segments_and_part_names() {
         assert_eq!(segments_container("b"), "b+segments");
         assert_eq!(part_object_name("k", "uid", 3), "k/uid/00000003");
+    }
+
+    #[test]
+    fn aws_multipart_etag_is_md5_of_part_md5s_n() {
+        // Runner multipart_etag for 5 MiB `A` + `tail-v2`.
+        let got = aws_multipart_etag([
+            "b8fc857a25e7958868c2f003d5e0952d",
+            "\"973f488aa4a5df5ae05e8e73c63432e0\"",
+        ])
+        .unwrap();
+        assert_eq!(got, "b4b77f5320cfe9ce9c0c70c35e84d511-2");
+        assert!(aws_multipart_etag(["partetag1"]).is_none());
+        assert!(aws_multipart_etag(Vec::<&str>::new()).is_none());
     }
 
     #[test]

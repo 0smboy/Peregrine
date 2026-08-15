@@ -19,6 +19,10 @@
 
 use std::collections::HashMap;
 
+pub const S3_ACTION_BYPASS_GOVERNANCE_RETENTION: &str = "s3:BypassGovernanceRetention";
+pub const S3_ACTION_PUT_OBJECT_RETENTION: &str = "s3:PutObjectRetention";
+pub const S3_ACTION_PUT_OBJECT_LEGAL_HOLD: &str = "s3:PutObjectLegalHold";
+
 /// Local IAM identity directory for grant matching.
 #[derive(Debug, Clone, Default)]
 pub struct IdentityDirectory {
@@ -267,6 +271,29 @@ impl IamService {
         }
     }
 
+    /// Require every IAM action in one S3 operation.
+    ///
+    /// `Some(true)` is returned only when every action is explicitly allowed;
+    /// an explicit/default deny on any action wins. `None` means this local IAM
+    /// service has no applicable policy and the caller may continue to its
+    /// existing Swift/ACL authorization path.
+    pub fn evaluate_all_actions(
+        &self,
+        principal: &str,
+        actions: &[&str],
+        resource: &str,
+    ) -> Option<bool> {
+        let mut saw_policy = false;
+        for action in actions {
+            match self.evaluate(principal, action, resource) {
+                Some(true) => saw_policy = true,
+                Some(false) => return Some(false),
+                None => {}
+            }
+        }
+        saw_policy.then_some(true)
+    }
+
     /// Convenience: S3 action from HTTP method + object presence.
     pub fn s3_action(method: &str, has_key: bool) -> &'static str {
         match (method.to_ascii_uppercase().as_str(), has_key) {
@@ -278,6 +305,34 @@ impl IamService {
             ("DELETE", false) => "s3:DeleteBucket",
             _ => "s3:*",
         }
+    }
+
+    /// Additional object-lock actions conditionally required by one request.
+    ///
+    /// The ordinary `s3:PutObject`/`s3:DeleteObject` action remains the
+    /// caller's responsibility. This returns only Object Lock additions:
+    /// subresource PUT permissions, explicit lock headers on PutObject, and
+    /// the separately authorized governance bypass action.
+    pub fn s3_object_lock_actions(
+        method: &str,
+        subresource: Option<&str>,
+        has_retention_headers: bool,
+        has_legal_hold_header: bool,
+        bypass_requested: bool,
+    ) -> Vec<&'static str> {
+        let method = method.to_ascii_uppercase();
+        let subresource = subresource.unwrap_or("").trim();
+        let mut actions = Vec::with_capacity(3);
+        if method == "PUT" && (subresource == "retention" || has_retention_headers) {
+            actions.push(S3_ACTION_PUT_OBJECT_RETENTION);
+        }
+        if method == "PUT" && (subresource == "legal-hold" || has_legal_hold_header) {
+            actions.push(S3_ACTION_PUT_OBJECT_LEGAL_HOLD);
+        }
+        if bypass_requested {
+            actions.push(S3_ACTION_BYPASS_GOVERNANCE_RETENTION);
+        }
+        actions
     }
 
     pub fn s3_resource(bucket: &str, key: Option<&str>) -> String {
@@ -481,6 +536,78 @@ mod tests {
         assert_eq!(
             IamService::s3_resource("buck", Some("k")),
             "arn:aws:s3:::buck/k"
+        );
+    }
+
+    #[test]
+    fn object_lock_action_mapping_is_additive() {
+        assert_eq!(
+            IamService::s3_object_lock_actions(
+                "PUT",
+                Some("retention"),
+                false,
+                false,
+                true,
+            ),
+            vec![
+                S3_ACTION_PUT_OBJECT_RETENTION,
+                S3_ACTION_BYPASS_GOVERNANCE_RETENTION,
+            ]
+        );
+        assert_eq!(
+            IamService::s3_object_lock_actions(
+                "PUT",
+                Some("legal-hold"),
+                false,
+                false,
+                false,
+            ),
+            vec![S3_ACTION_PUT_OBJECT_LEGAL_HOLD]
+        );
+        assert_eq!(
+            IamService::s3_object_lock_actions("PUT", None, true, true, false),
+            vec![
+                S3_ACTION_PUT_OBJECT_RETENTION,
+                S3_ACTION_PUT_OBJECT_LEGAL_HOLD,
+            ]
+        );
+        assert_eq!(
+            IamService::s3_object_lock_actions("DELETE", None, false, false, true),
+            vec![S3_ACTION_BYPASS_GOVERNANCE_RETENTION]
+        );
+    }
+
+    #[test]
+    fn every_object_lock_action_must_be_allowed() {
+        let mut iam = IamService::new();
+        let doc = IamService::parse_policy_json(
+            r#"{
+              "Statement":[
+                {"Effect":"Allow","Action":"s3:PutObjectRetention","Resource":"arn:aws:s3:::b/*","Principal":"alice"},
+                {"Effect":"Deny","Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::b/*","Principal":"alice"}
+              ]
+            }"#,
+        )
+        .unwrap();
+        iam.attach_policy("alice", "worm", doc);
+        assert_eq!(
+            iam.evaluate_all_actions(
+                "alice",
+                &[
+                    S3_ACTION_PUT_OBJECT_RETENTION,
+                    S3_ACTION_BYPASS_GOVERNANCE_RETENTION,
+                ],
+                "arn:aws:s3:::b/key",
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            iam.evaluate_all_actions(
+                "alice",
+                &[S3_ACTION_PUT_OBJECT_RETENTION],
+                "arn:aws:s3:::b/key",
+            ),
+            Some(true)
         );
     }
 }

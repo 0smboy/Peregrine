@@ -1,6 +1,6 @@
 # Rust Swift vs Python Swift — full-function parity matrix
 
-**As of:** 2026-08-09
+**As of:** 2026-08-09 (S3 live align addendum: 2026-08-15, see `S3-ALIGN-20260815.md`)
 **Rule:** *partial implementation counts as **未实现 (NOT implemented)*** for this table.  
 **“已实现”** requires: wired into a deployable path **and** verified enough to claim (unit + live where applicable), without major Deferred semantics that change client-visible behavior.  
 **Hard9 wave (2026-08-08):** OpenStack-standard Paste + xprofile/list_endpoints; Lifecycle Transition cold GET+restore; ACP READ/WRITE enforce + local IAM dir; process_workers prefork; SLO concurrent HEAD + listing etag refetch. Evidence `tools/test-results/hard9-residual-wave-20260808/`.  

@@ -21,7 +21,87 @@
 //! v2 shapes; ACL/CORS/MPU live in sibling modules.
 
 use crate::xml::Element;
-use swift_http::Response;
+use swift_http::{parse_http_date, Response};
+
+/// Howard Hinnant civil-from-days / days-from-civil (same as `swift_http::dates`).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn epoch_secs_to_s3_xml(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
+    let sod = secs.rem_euclid(86400);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.000Z",
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60
+    )
+}
+
+fn parse_iso_like_to_epoch(value: &str) -> Option<i64> {
+    let mut s = value.trim();
+    if let Some(rest) = s.strip_suffix('Z').or_else(|| s.strip_suffix('z')) {
+        s = rest.trim_end();
+    } else if let Some(idx) = s.rfind(|c: char| c == '+' || c == '-').filter(|&i| i >= 10) {
+        s = s[..idx].trim_end();
+    }
+    let (date, time) = s.split_once('T').or_else(|| s.split_once(' '))?;
+    let mut dparts = date.split('-');
+    let y: i64 = dparts.next()?.parse().ok()?;
+    let mo: u32 = dparts.next()?.parse().ok()?;
+    let da: u32 = dparts.next()?.parse().ok()?;
+    if dparts.next().is_some() {
+        return None;
+    }
+    let time = time.split('.').next().unwrap_or(time);
+    let mut tparts = time.split(':');
+    let h: i64 = tparts.next()?.parse().ok()?;
+    let mi: i64 = tparts.next()?.parse().ok()?;
+    let se: i64 = tparts.next()?.parse().ok()?;
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&da) || !(0..=23).contains(&h)
+        || !(0..=59).contains(&mi)
+        || se > 60
+    {
+        return None;
+    }
+    Some(days_from_civil(y, mo, da) * 86400 + h * 3600 + mi * 60 + se)
+}
+
+/// S3 XML `LastModified` / `Initiated`: `YYYY-MM-DDTHH:MM:SS.000Z`.
+///
+/// Python `S3Timestamp.s3xmlformat`. Parses RFC 1123 (`Last-Modified`) and
+/// Swift listing ISO (`2013-05-24T00:00:00.000000`). Always returns a string
+/// that Python 3.9 `datetime.fromisoformat` accepts after the runner's
+/// trailing-`Z` → `+00:00` rewrite. Unparseable input → epoch, never the raw
+/// HTTP date (that is the CopyObject / ListVersions `_iso_time` hole).
+pub fn s3_xml_timestamp(value: &str) -> String {
+    let value = value.trim();
+    if let Some(secs) = parse_http_date(value).or_else(|| parse_iso_like_to_epoch(value)) {
+        return epoch_secs_to_s3_xml(secs);
+    }
+    "1970-01-01T00:00:00.000Z".to_string()
+}
 
 /// Look up the HTTP status and default message for a known S3 error code.
 ///
@@ -122,15 +202,54 @@ pub fn error_status_and_message(code: &str) -> (u16, &'static str) {
     }
 }
 
+/// Python `generate_trans_id('')`: `tx{21 hex}-{10 hex unix time}` (34 chars).
+///
+/// grok-merge `_normalize_error` rewrites the value to `"<dynamic-id>"` when
+/// the element is present. Empty extras must still emit the child — that is
+/// the post-F1 delta vs Python `ErrorResponse._body_iter`.
+fn default_request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let pid = u64::from(std::process::id());
+    let mixed = pid
+        .wrapping_mul(0x9e3779b97f4a7c15)
+        .wrapping_add(seq)
+        .wrapping_mul(0xbf58476d1ce4e5b9);
+    let rand21 = format!("{:016x}{:05x}", mixed, seq & 0xfffff);
+    format!("tx{}-{:010x}", &rand21[..21], now)
+}
+
 /// Build an S3 error document (no XML namespace on the root).
 ///
 /// `extras` are appended as child elements (e.g. `("BucketName", "b")`,
 /// `("Resource", "/b/o")`), matching the `info` dict rendered by
-/// `ErrorResponse._body_iter`.
+/// `ErrorResponse._body_iter`. A `RequestId` child is always present
+/// (inserted after `Message` when `extras` does not already carry one).
+/// Do not auto-emit `HostId` / `Resource` / `RequestTime` / `ServerTime` /
+/// `MaxAllowedSkew` — Python 2.33 did not, and `_normalize_error` would
+/// keep the allowed ones as a dict mismatch.
 pub fn s3_error_xml(code: &str, message: &str, extras: &[(&str, &str)]) -> Vec<u8> {
     let mut error = Element::new("Error");
     error.push_leaf("Code", code);
     error.push_leaf("Message", message);
+    let generated_id = if extras
+        .iter()
+        .any(|(tag, _)| tag.eq_ignore_ascii_case("RequestId"))
+    {
+        None
+    } else {
+        Some(default_request_id())
+    };
+    if let Some(ref rid) = generated_id {
+        error.push_leaf("RequestId", rid.as_str());
+    }
     for (tag, value) in extras {
         error.push_leaf(*tag, *value);
     }
@@ -147,6 +266,63 @@ pub fn s3_error_response(code: &str, message: Option<&str>, extras: &[(&str, &st
     let mut resp = Response::with_body(status, body);
     resp.headers.set("Content-Type", "application/xml");
     resp
+}
+
+/// Child text of `<tag>…</tag>` in compact S3 Error XML (no attributes).
+#[cfg(test)]
+pub(crate) fn error_xml_leaf<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = body.find(&open)? + open.len();
+    let rest = &body[start..];
+    let end = rest.find(&close)?;
+    Some(&rest[..end])
+}
+
+/// Whether `value` would survive grok-merge `_normalize_error` for RequestId.
+#[cfg(test)]
+pub(crate) fn request_id_survives_normalize(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 2048
+        && !value.chars().any(|c| {
+            let o = c as u32;
+            o < 32 || o == 127
+        })
+}
+
+/// Code + Message + RequestId only — the post-`_normalize_error` shape of
+/// the five F1 deny bodies (invalid-storage-class, two clock-skew, two
+/// query-expired). Status is not checked here.
+#[cfg(test)]
+pub(crate) fn assert_error_xml_matches_normalize(body: &str, code: &str, message: &str) {
+    assert_eq!(error_xml_leaf(body, "Code"), Some(code), "Code in {body}");
+    assert_eq!(
+        error_xml_leaf(body, "Message"),
+        Some(message),
+        "Message in {body}"
+    );
+    let rid = error_xml_leaf(body, "RequestId").expect("RequestId required after _normalize_error");
+    assert!(
+        request_id_survives_normalize(rid),
+        "RequestId {rid:?} would fail _normalize_error"
+    );
+    for tag in [
+        "Resource",
+        "HostId",
+        "Endpoint",
+        "BucketName",
+        "Key",
+        "ArgumentName",
+        "ArgumentValue",
+        "RequestTime",
+        "ServerTime",
+        "MaxAllowedSkew",
+    ] {
+        assert!(
+            error_xml_leaf(body, tag).is_none(),
+            "unexpected <{tag}> in {body}"
+        );
+    }
 }
 
 /// An object owner (`ID`/`DisplayName`).
@@ -335,8 +511,8 @@ pub fn list_all_my_buckets_xml(owner: &Owner, buckets: &[BucketInfo]) -> Vec<u8>
 /// Build a `CopyObjectResult` document (used for PUT-copy and MPU part-copy).
 pub fn copy_object_result_xml(last_modified: &str, etag: &str) -> Vec<u8> {
     Element::new("CopyObjectResult")
-        .with_leaf("LastModified", last_modified)
-        .with_leaf("ETag", format!("\"{etag}\""))
+        .with_leaf("LastModified", s3_xml_timestamp(last_modified))
+        .with_leaf("ETag", format!("\"{}\"", etag.trim().trim_matches('"')))
         .to_xml(true)
 }
 
@@ -344,24 +520,45 @@ pub fn copy_object_result_xml(last_modified: &str, etag: &str) -> Vec<u8> {
 #[derive(Debug, Clone)]
 pub struct DeleteError {
     pub key: String,
+    pub version_id: Option<String>,
     pub code: String,
     pub message: String,
 }
 
+/// One successful multi-delete entry, including version/delete-marker detail.
+#[derive(Debug, Clone)]
+pub struct DeletedObject {
+    pub key: String,
+    pub version_id: Option<String>,
+    pub delete_marker: bool,
+    pub delete_marker_version_id: Option<String>,
+}
+
 /// Build a `DeleteResult` document for `POST /bucket?delete`.
 /// Port of `MultiObjectDeleteController`.
-pub fn delete_result_xml(deleted: &[String], errors: &[DeleteError]) -> Vec<u8> {
+pub fn delete_result_xml(deleted: &[DeletedObject], errors: &[DeleteError]) -> Vec<u8> {
     let mut root = Element::new("DeleteResult");
-    for key in deleted {
-        root.push(Element::new("Deleted").with_leaf("Key", key));
+    for deleted in deleted {
+        let mut item = Element::new("Deleted").with_leaf("Key", &deleted.key);
+        if let Some(version_id) = &deleted.version_id {
+            item.push_leaf("VersionId", version_id);
+        }
+        if deleted.delete_marker {
+            item.push_leaf("DeleteMarker", "true");
+        }
+        if let Some(version_id) = &deleted.delete_marker_version_id {
+            item.push_leaf("DeleteMarkerVersionId", version_id);
+        }
+        root.push(item);
     }
     for err in errors {
-        root.push(
-            Element::new("Error")
-                .with_leaf("Key", &err.key)
-                .with_leaf("Code", &err.code)
-                .with_leaf("Message", &err.message),
-        );
+        let mut item = Element::new("Error").with_leaf("Key", &err.key);
+        if let Some(version_id) = &err.version_id {
+            item.push_leaf("VersionId", version_id);
+        }
+        item.push_leaf("Code", &err.code);
+        item.push_leaf("Message", &err.message);
+        root.push(item);
     }
     root.to_xml(true)
 }
@@ -413,7 +610,7 @@ mod tests {
         let body = s3_error_xml(
             "NoSuchBucket",
             "The specified bucket does not exist.",
-            &[("BucketName", "faux-bucket")],
+            &[("RequestId", "txfixed"), ("BucketName", "faux-bucket")],
         );
         let got = String::from_utf8(body).unwrap();
         assert_eq!(
@@ -421,8 +618,58 @@ mod tests {
             "<?xml version='1.0' encoding='UTF-8'?>\n\
              <Error><Code>NoSuchBucket</Code>\
              <Message>The specified bucket does not exist.</Message>\
+             <RequestId>txfixed</RequestId>\
              <BucketName>faux-bucket</BucketName></Error>"
         );
+    }
+
+    #[test]
+    fn test_error_xml_inserts_request_id_when_missing() {
+        let body = s3_error_xml(
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+            &[("BucketName", "faux-bucket")],
+        );
+        let got = String::from_utf8(body).unwrap();
+        let rid = error_xml_leaf(&got, "RequestId").expect("auto RequestId");
+        assert!(request_id_survives_normalize(rid));
+        assert_eq!(rid.len(), 34, "{rid}");
+        assert!(rid.starts_with("tx"), "{rid}");
+        assert!(got.contains("<BucketName>faux-bucket</BucketName>"));
+        assert_eq!(got.matches("<RequestId>").count(), 1);
+    }
+
+    #[test]
+    fn five_deny_error_xml_bodies_match_normalize_for_skew_and_storage_class() {
+        // Three Code/Message pairs cover the five runner cases
+        // (v2/v4 share codes). Status stays 403/400.
+        let cases: &[(&str, Option<&str>, &str, u16)] = &[
+            (
+                "InvalidStorageClass",
+                None,
+                "The storage class you specified is not valid.",
+                400,
+            ),
+            (
+                "RequestTimeTooSkewed",
+                None,
+                "The difference between the request time and the current time is too large.",
+                403,
+            ),
+            (
+                "AccessDenied",
+                Some("Request has expired"),
+                "Request has expired",
+                403,
+            ),
+        ];
+        for (code, msg, expected_msg, status) in cases {
+            let resp = s3_error_response(code, *msg, &[]);
+            assert_eq!(resp.status, *status, "{code} status");
+            assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
+            let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+            assert_error_xml_matches_normalize(&body, code, expected_msg);
+        }
     }
 
     #[test]
@@ -434,12 +681,17 @@ mod tests {
         assert!(body.contains("<Code>NoSuchKey</Code>"));
         assert!(body.contains("<Message>The specified key does not exist.</Message>"));
         assert!(body.contains("<Key>obj</Key>"));
+        let rid = error_xml_leaf(&body, "RequestId").expect("RequestId");
+        assert!(request_id_survives_normalize(rid));
     }
 
     #[test]
     fn test_error_response_signature_does_not_match() {
         let resp = s3_error_response("SignatureDoesNotMatch", None, &[]);
         assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        let rid = error_xml_leaf(&body, "RequestId").expect("RequestId");
+        assert!(request_id_survives_normalize(rid));
     }
 
     #[test]
@@ -617,9 +869,23 @@ mod tests {
     #[test]
     fn test_delete_result() {
         let got = String::from_utf8(delete_result_xml(
-            &["a".to_string(), "b".to_string()],
+            &[
+                DeletedObject {
+                    key: "a".to_string(),
+                    version_id: None,
+                    delete_marker: false,
+                    delete_marker_version_id: None,
+                },
+                DeletedObject {
+                    key: "b".to_string(),
+                    version_id: Some("v1".to_string()),
+                    delete_marker: false,
+                    delete_marker_version_id: None,
+                },
+            ],
             &[DeleteError {
                 key: "c".to_string(),
+                version_id: None,
                 code: "AccessDenied".to_string(),
                 message: "Access Denied.".to_string(),
             }],
@@ -629,7 +895,7 @@ mod tests {
             got,
             "<?xml version='1.0' encoding='UTF-8'?>\n\
              <DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-             <Deleted><Key>a</Key></Deleted><Deleted><Key>b</Key></Deleted>\
+             <Deleted><Key>a</Key></Deleted><Deleted><Key>b</Key><VersionId>v1</VersionId></Deleted>\
              <Error><Key>c</Key><Code>AccessDenied</Code><Message>Access Denied.</Message></Error>\
              </DeleteResult>"
         );
@@ -669,5 +935,27 @@ mod tests {
              <LastModified>2013-05-24T00:00:00.000Z</LastModified><ETag>\"abc\"</ETag>\
              </CopyObjectResult>"
         );
+    }
+
+    #[test]
+    fn s3_xml_timestamp_http_date_and_swift_iso_parse_as_iso() {
+        assert_eq!(
+            s3_xml_timestamp("Fri, 24 May 2013 00:00:00 GMT"),
+            "2013-05-24T00:00:00.000Z"
+        );
+        assert_eq!(
+            s3_xml_timestamp("2013-05-24T00:00:00.000000"),
+            "2013-05-24T00:00:00.000Z"
+        );
+        assert_eq!(
+            s3_xml_timestamp("2013-05-24T00:00:00+00:00"),
+            "2013-05-24T00:00:00.000Z"
+        );
+        assert_eq!(s3_xml_timestamp("not-a-date"), "1970-01-01T00:00:00.000Z");
+        let http_copy =
+            String::from_utf8(copy_object_result_xml("Fri, 24 May 2013 00:00:00 GMT", "ff"))
+                .unwrap();
+        assert!(http_copy.contains("<LastModified>2013-05-24T00:00:00.000Z</LastModified>"));
+        assert!(!http_copy.contains("Fri, 24 May"));
     }
 }

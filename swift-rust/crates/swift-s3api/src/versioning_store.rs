@@ -6,7 +6,13 @@
 //! * archive container `{bucket}+versions`
 //! * archive name `{hex(key)}/{version_id}` (hex is reversible UTF-8 encoding)
 //! * index at `{hex(key)}/index.json` for ListVersions
+//!
+//! [`VersionIndex::apply_if_match`] / [`VersionIndex::cas_etag`] are
+//! **in-process** CAS helpers only. This module is **not** a distributed
+//! CAS coordinator. Cross-proxy linearization is still BLOCKED.
 
+use crate::crypto::sha256_hex;
+use crate::response::s3_xml_timestamp;
 use crate::xml::Element;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +24,76 @@ pub const SYS_OBJECT_KEY: &str = "X-Object-Sysmeta-S3-Object-Key";
 pub const HDR_VERSION_ID: &str = "x-amz-version-id";
 pub const HDR_DELETE_MARKER: &str = "x-amz-delete-marker";
 pub const INDEX_NAME: &str = "index.json";
+
+/// Hard cap on `versions[]` accepted by [`VersionIndex::from_json`].
+/// Larger indexes fail closed so a single `index.json` cannot boundlessly
+/// allocate.
+pub const MAX_INDEX_VERSIONS: usize = 10_000;
+
+/// S3 null version-id written by a Suspended PUT.
+pub const NULL_VERSION_ID: &str = "null";
+
+/// Bucket versioning configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersioningStatus {
+    Unversioned,
+    Enabled,
+    Suspended,
+}
+
+impl VersioningStatus {
+    /// Suspended PUT writes the null version. Hidden versions stay hidden
+    /// unless the caller supplies an explicit record.
+    pub const fn suspended_put_overwrites_null(self) -> bool {
+        matches!(self, Self::Suspended)
+    }
+}
+
+/// Map container versioning sysmeta to [`VersioningStatus`].
+///
+/// Only the exact tokens `Enabled` / `Suspended` are recognized (same as
+/// [`versioning_enabled`]). Anything else is Unversioned.
+pub fn versioning_status(status: Option<&str>) -> VersioningStatus {
+    match status.map(str::trim) {
+        Some("Enabled") => VersioningStatus::Enabled,
+        Some("Suspended") => VersioningStatus::Suspended,
+        _ => VersioningStatus::Unversioned,
+    }
+}
+
+/// Archive / index path segment check for a version-id.
+///
+/// `false` for empty, `index.json`, `.`, `..`, any `/`, or any NUL.
+pub fn is_safe_version_id(s: &str) -> bool {
+    if s.is_empty() || s == INDEX_NAME || s == "." || s == ".." {
+        return false;
+    }
+    if s.contains('/') || s.contains('\0') {
+        return false;
+    }
+    true
+}
+
+/// In-process compare-and-swap denial.
+///
+/// This is **not** a distributed CAS coordinator. Cross-proxy
+/// linearization is still BLOCKED.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CasDenied {
+    /// `expected_generation` did not equal [`VersionIndex::generation`].
+    Mismatch,
+    /// `expected_generation` was `None` while `generation > 0`.
+    MissingExpected,
+}
+
+/// [`VersionIndex::remove_version_checked`] failure.
+///
+/// `Missing` must not be treated as success — MultiDelete cannot hide a
+/// lost update behind a silent no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveVersionError {
+    Missing,
+}
 
 pub fn versions_container(bucket: &str) -> String {
     format!("{bucket}+versions")
@@ -56,7 +132,8 @@ pub fn index_object_name(key: &str) -> String {
 
 pub fn parse_archive_object_name(name: &str) -> Option<(String, String)> {
     let (enc, vid) = name.rsplit_once('/')?;
-    if enc.is_empty() || vid.is_empty() || vid == INDEX_NAME {
+    // INDEX_NAME / `?versionId=index.json` cannot be an archive object.
+    if enc.is_empty() || !is_safe_version_id(vid) {
         return None;
     }
     if !vid.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -108,6 +185,11 @@ pub struct VersionRecord {
 pub struct VersionIndex {
     pub key: String,
     pub versions: Vec<VersionRecord>,
+    /// In-process CAS generation. Optional on the wire (`generation`).
+    ///
+    /// Default `0`. This is **not** a distributed CAS coordinator.
+    /// Cross-proxy linearization is still BLOCKED.
+    pub generation: u64,
 }
 
 impl VersionIndex {
@@ -115,6 +197,7 @@ impl VersionIndex {
         Self {
             key: key.into(),
             versions: Vec::new(),
+            generation: 0,
         }
     }
 
@@ -133,17 +216,41 @@ impl VersionIndex {
                 })
             })
             .collect();
-        serde_json::to_vec(&json!({ "key": self.key, "versions": versions })).unwrap_or_default()
+        // Existing shape is `key` + `versions`. `generation` is optional
+        // and omitted at the default of 0.
+        let mut obj = serde_json::Map::new();
+        obj.insert("key".to_string(), json!(self.key));
+        obj.insert("versions".to_string(), Value::Array(versions));
+        if self.generation != 0 {
+            obj.insert("generation".to_string(), json!(self.generation));
+        }
+        serde_json::to_vec(&Value::Object(obj)).unwrap_or_default()
     }
 
     pub fn from_json(data: &[u8]) -> Option<Self> {
         let v: Value = serde_json::from_slice(data).ok()?;
         let key = v.get("key")?.as_str()?.to_string();
-        let arr = v.get("versions")?.as_array()?;
+        let versions_val = v.get("versions")?;
+        if !versions_val.is_array() {
+            return None;
+        }
+        let arr = versions_val.as_array()?;
+        if arr.len() > MAX_INDEX_VERSIONS {
+            return None;
+        }
+        let generation = match v.get("generation") {
+            None | Some(Value::Null) => 0,
+            Some(g) => g.as_u64()?,
+        };
         let mut versions = Vec::with_capacity(arr.len());
         for item in arr {
+            let version_id = item.get("version_id")?.as_str()?.to_string();
+            // Reject index.json and any id that cannot be an archive name.
+            if !is_safe_version_id(&version_id) {
+                return None;
+            }
             versions.push(VersionRecord {
-                version_id: item.get("version_id")?.as_str()?.to_string(),
+                version_id,
                 is_delete_marker: item
                     .get("is_delete_marker")
                     .and_then(|x| x.as_bool())
@@ -165,7 +272,11 @@ impl VersionIndex {
                 size: item.get("size").and_then(|x| x.as_i64()).unwrap_or(0),
             });
         }
-        Some(Self { key, versions })
+        Some(Self {
+            key,
+            versions,
+            generation,
+        })
     }
 
     pub fn push_latest(&mut self, mut rec: VersionRecord) {
@@ -176,10 +287,71 @@ impl VersionIndex {
         self.versions.insert(0, rec);
     }
 
+    /// Suspended PUT: overwrite the null version as latest.
+    ///
+    /// Hidden versions stay in the index and are **not** resurrected as
+    /// latest. Resurrection requires an explicit [`VersionRecord`] via
+    /// [`Self::push_latest`] / [`Self::apply_if_match`].
+    pub fn suspended_put_overwrites_null(&mut self, mut rec: VersionRecord) {
+        rec.version_id = NULL_VERSION_ID.to_string();
+        self.versions.retain(|v| v.version_id != NULL_VERSION_ID);
+        self.push_latest(rec);
+    }
+
     pub fn find(&self, version_id: &str) -> Option<&VersionRecord> {
         self.versions.iter().find(|v| v.version_id == version_id)
     }
 
+    fn latest_version_id(&self) -> &str {
+        self.versions
+            .iter()
+            .find(|v| v.is_latest)
+            .or_else(|| self.versions.first())
+            .map(|v| v.version_id.as_str())
+            .unwrap_or("")
+    }
+
+    /// Opaque hex of `generation` + latest `version_id` + `key`.
+    ///
+    /// In-process identity only. This is **not** a distributed CAS
+    /// coordinator. Cross-proxy linearization is still BLOCKED.
+    pub fn cas_etag(&self) -> String {
+        let latest = self.latest_version_id();
+        let mut material = Vec::with_capacity(8 + latest.len() + self.key.len() + 2);
+        material.extend_from_slice(&self.generation.to_be_bytes());
+        material.push(0);
+        material.extend_from_slice(latest.as_bytes());
+        material.push(0);
+        material.extend_from_slice(self.key.as_bytes());
+        sha256_hex(&material)
+    }
+
+    /// In-process CAS write: accept `rec` as latest iff `expected_generation`
+    /// matches, then increment [`Self::generation`].
+    ///
+    /// * `Some(g)` must equal the current generation.
+    /// * `None` is allowed only when `generation == 0` (uninitialized).
+    /// * `None` when `generation > 0` is denied.
+    ///
+    /// This is **not** a distributed CAS coordinator. Cross-proxy
+    /// linearization is still BLOCKED.
+    pub fn apply_if_match(
+        &mut self,
+        expected_generation: Option<u64>,
+        rec: VersionRecord,
+    ) -> Result<(), CasDenied> {
+        match expected_generation {
+            Some(g) if g == self.generation => {}
+            None if self.generation == 0 => {}
+            Some(_) => return Err(CasDenied::Mismatch),
+            None => return Err(CasDenied::MissingExpected),
+        }
+        self.push_latest(rec);
+        self.generation = self.generation.saturating_add(1);
+        Ok(())
+    }
+
+    /// Existing behaviour: missing target is a silent no-op (`None`).
     pub fn remove_version(&mut self, version_id: &str) -> Option<String> {
         let was_latest = self.find(version_id).map(|v| v.is_latest).unwrap_or(false);
         self.versions.retain(|v| v.version_id != version_id);
@@ -190,6 +362,20 @@ impl VersionIndex {
             }
         }
         None
+    }
+
+    /// Like [`Self::remove_version`], but a missing target is
+    /// [`RemoveVersionError::Missing`] rather than success.
+    ///
+    /// MultiDelete must opt into this so a lost update cannot be hidden.
+    pub fn remove_version_checked(
+        &mut self,
+        version_id: &str,
+    ) -> Result<Option<String>, RemoveVersionError> {
+        if self.find(version_id).is_none() {
+            return Err(RemoveVersionError::Missing);
+        }
+        Ok(self.remove_version(version_id))
     }
 }
 
@@ -205,6 +391,10 @@ impl VersionIndex {
 ///   the marker pair — matches AWS continuation via Next* markers)
 /// * when `key == key_marker` and `version_id_marker` is empty, include versions
 ///   of that key from the beginning
+/// * when `key == key_marker` and `version_id_marker` is unknown: AWS would
+///   400 InvalidArgument. Residual: this helper has no error channel, so it
+///   does not emit that 400. Fail closed by skipping the whole key (do not
+///   start at 0). Cross-proxy listing linearization is still BLOCKED.
 ///
 /// When `max-keys` cuts the flat listing, `IsTruncated=true` and both
 /// `NextKeyMarker` / `NextVersionIdMarker` are set to the last returned entry.
@@ -239,9 +429,13 @@ pub fn list_versions_result_xml(
                 {
                     // Start strictly after the marked version (continuation).
                     Some(pos) => pos.saturating_add(1),
-                    // Unknown version-id-marker on this key: soft residual — start
-                    // at beginning of the key (AWS would 400 InvalidArgument).
-                    None => 0,
+                    // Unknown version-id-marker: AWS ListObjectVersions returns
+                    // 400 InvalidArgument. Residual: this helper has no error
+                    // channel, so we do not emit that 400. Fail closed by
+                    // skipping the whole key — do not start at 0 (a stale
+                    // marker must not replay the key from the beginning).
+                    // Cross-proxy listing linearization is still BLOCKED.
+                    None => continue,
                 }
             } else {
                 0
@@ -276,14 +470,14 @@ pub fn list_versions_result_xml(
             dm.push_leaf("Key", key);
             dm.push_leaf("VersionId", &v.version_id);
             dm.push_leaf("IsLatest", if v.is_latest { "true" } else { "false" });
-            dm.push_leaf("LastModified", &v.last_modified);
+            dm.push_leaf("LastModified", s3_xml_timestamp(&v.last_modified));
             root.push(dm);
         } else {
             let mut ver = Element::new("Version");
             ver.push_leaf("Key", key);
             ver.push_leaf("VersionId", &v.version_id);
             ver.push_leaf("IsLatest", if v.is_latest { "true" } else { "false" });
-            ver.push_leaf("LastModified", &v.last_modified);
+            ver.push_leaf("LastModified", s3_xml_timestamp(&v.last_modified));
             let etag = if v.etag.starts_with('"') {
                 v.etag.clone()
             } else {
@@ -354,6 +548,33 @@ mod tests {
         assert!(xml.contains("<VersionId>v2</VersionId>"));
         assert!(!xml.contains("NextKeyMarker"));
         assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
+        assert!(xml.contains("<LastModified>2020-01-01T00:00:00.000Z</LastModified>"));
+    }
+
+    #[test]
+    fn list_versions_http_date_last_modified_emits_iso() {
+        let mut idx = VersionIndex::new("k");
+        idx.push_latest(VersionRecord {
+            version_id: "v1".into(),
+            is_delete_marker: false,
+            is_latest: true,
+            last_modified: "Fri, 24 May 2013 00:00:00 GMT".into(),
+            etag: "e1".into(),
+            size: 3,
+        });
+        idx.push_latest(VersionRecord {
+            version_id: "dm".into(),
+            is_delete_marker: true,
+            is_latest: true,
+            last_modified: "2013-05-24T00:00:00.000000".into(),
+            etag: String::new(),
+            size: 0,
+        });
+        let xml =
+            String::from_utf8(list_versions_result_xml("b", "", "", "", 1000, &[idx])).unwrap();
+        assert_eq!(xml.matches("<LastModified>2013-05-24T00:00:00.000Z</LastModified>").count(), 2);
+        assert!(!xml.contains("Fri, 24 May"));
+        assert!(!xml.contains("00:00:00.000000"));
     }
 
     fn rec(vid: &str, latest: bool) -> VersionRecord {
@@ -554,5 +775,303 @@ mod tests {
         assert!(versioning_enabled(Some("Enabled")));
         assert!(!versioning_enabled(Some("Suspended")));
         assert!(!versioning_enabled(None));
+    }
+
+    #[test]
+    fn versioning_status_unversioned_enabled_suspended() {
+        assert_eq!(versioning_status(None), VersioningStatus::Unversioned);
+        assert_eq!(versioning_status(Some("")), VersioningStatus::Unversioned);
+        assert_eq!(
+            versioning_status(Some("Disabled")),
+            VersioningStatus::Unversioned
+        );
+        assert_eq!(
+            versioning_status(Some("Enabled")),
+            VersioningStatus::Enabled
+        );
+        assert_eq!(
+            versioning_status(Some(" Suspended ")),
+            VersioningStatus::Suspended
+        );
+        assert!(VersioningStatus::Suspended.suspended_put_overwrites_null());
+        assert!(!VersioningStatus::Enabled.suspended_put_overwrites_null());
+        assert!(!VersioningStatus::Unversioned.suspended_put_overwrites_null());
+    }
+
+    #[test]
+    fn suspended_put_overwrites_null_does_not_resurrect_hidden() {
+        let mut idx = VersionIndex::new("k");
+        idx.push_latest(rec("v1", true));
+        idx.push_latest(rec("v2", true));
+        // v1 is hidden; Suspended PUT must write null, not promote v1.
+        idx.suspended_put_overwrites_null(rec("ignored", true));
+        assert_eq!(idx.versions.len(), 3);
+        assert_eq!(idx.versions[0].version_id, NULL_VERSION_ID);
+        assert!(idx.versions[0].is_latest);
+        assert_eq!(idx.find("v1").map(|v| v.is_latest), Some(false));
+        assert_eq!(idx.find("v2").map(|v| v.is_latest), Some(false));
+
+        // Second Suspended PUT overwrites the existing null version.
+        let mut over = rec("also-ignored", true);
+        over.etag = "e-null-2".into();
+        idx.suspended_put_overwrites_null(over);
+        assert_eq!(
+            idx.versions
+                .iter()
+                .filter(|v| v.version_id == NULL_VERSION_ID)
+                .count(),
+            1
+        );
+        assert_eq!(idx.versions[0].etag, "e-null-2");
+        assert_eq!(idx.versions.len(), 3);
+        assert!(idx.find("v1").is_some());
+        assert!(idx.find("v2").is_some());
+    }
+
+    #[test]
+    fn is_safe_version_id_rejects_path_and_index_tokens() {
+        assert!(!is_safe_version_id(""));
+        assert!(!is_safe_version_id(INDEX_NAME));
+        assert!(!is_safe_version_id("index.json"));
+        assert!(!is_safe_version_id("."));
+        assert!(!is_safe_version_id(".."));
+        assert!(!is_safe_version_id("a/b"));
+        assert!(!is_safe_version_id("/abc"));
+        assert!(!is_safe_version_id("abc/"));
+        assert!(!is_safe_version_id("ab\0c"));
+        assert!(is_safe_version_id("0123456789abcdef0123456789abcdef"));
+        assert!(is_safe_version_id(NULL_VERSION_ID));
+    }
+
+    #[test]
+    fn parse_archive_rejects_version_id_index_json() {
+        // `?versionId=index.json` must not address `{hex}/index.json`.
+        let as_query = "index.json";
+        assert!(!is_safe_version_id(as_query));
+        assert_eq!(
+            parse_archive_object_name(&archive_object_name("obj", "index.json")),
+            None
+        );
+        assert_eq!(
+            parse_archive_object_name(&format!("{}/index.json", key_hex("obj"))),
+            None
+        );
+        assert_eq!(
+            parse_archive_object_name(&format!("{}/?versionId=index.json", key_hex("obj"))),
+            None
+        );
+        // Control: a real hex version-id still parses.
+        let ok = archive_object_name("obj", "0123456789abcdef0123456789abcdef");
+        assert!(parse_archive_object_name(&ok).is_some());
+    }
+
+    #[test]
+    fn from_json_keeps_key_versions_generation_optional() {
+        let old = br#"{"key":"k","versions":[{"version_id":"v1","is_delete_marker":false,"is_latest":true,"last_modified":"t","etag":"e","size":1}]}"#;
+        let idx = VersionIndex::from_json(old).unwrap();
+        assert_eq!(idx.key, "k");
+        assert_eq!(idx.generation, 0);
+        assert_eq!(idx.versions.len(), 1);
+        assert_eq!(idx.versions[0].version_id, "v1");
+
+        let empty_shape = VersionIndex::new("k");
+        let v: Value = serde_json::from_slice(&empty_shape.to_json()).unwrap();
+        assert_eq!(v.get("key").and_then(|x| x.as_str()), Some("k"));
+        assert!(v.get("versions").and_then(|x| x.as_array()).is_some());
+        assert!(v.get("generation").is_none());
+
+        let mut with_gen = VersionIndex::new("k");
+        with_gen.generation = 7;
+        let v2: Value = serde_json::from_slice(&with_gen.to_json()).unwrap();
+        assert_eq!(v2.get("generation").and_then(|x| x.as_u64()), Some(7));
+        let back = VersionIndex::from_json(&with_gen.to_json()).unwrap();
+        assert_eq!(back.generation, 7);
+
+        let explicit_zero = br#"{"key":"k","versions":[],"generation":0}"#;
+        assert_eq!(
+            VersionIndex::from_json(explicit_zero).unwrap().generation,
+            0
+        );
+    }
+
+    #[test]
+    fn from_json_fail_closed_malformed_and_unsafe_ids() {
+        assert!(VersionIndex::from_json(b"not-json").is_none());
+        assert!(VersionIndex::from_json(br#"{"key":"k"}"#).is_none());
+        assert!(VersionIndex::from_json(br#"{"key":"k","versions":{}}"#).is_none());
+        assert!(VersionIndex::from_json(br#"{"key":"k","versions":"nope"}"#).is_none());
+        assert!(VersionIndex::from_json(br#"{"key":"k","versions":null}"#).is_none());
+        assert!(VersionIndex::from_json(
+            br#"{"key":"k","versions":[{"version_id":"index.json"}]}"#
+        )
+        .is_none());
+        assert!(
+            VersionIndex::from_json(br#"{"key":"k","versions":[{"version_id":"a/b"}]}"#)
+                .is_none()
+        );
+        assert!(VersionIndex::from_json(
+            br#"{"key":"k","versions":[{"version_id":"ab\u0000c"}]}"#
+        )
+        .is_none());
+        assert!(
+            VersionIndex::from_json(br#"{"key":"k","versions":[{"version_id":""}]}"#)
+                .is_none()
+        );
+        assert!(
+            VersionIndex::from_json(br#"{"key":"k","versions":[{"version_id":"."}]}"#)
+                .is_none()
+        );
+        assert!(
+            VersionIndex::from_json(br#"{"key":"k","versions":[{"version_id":".."}]}"#)
+                .is_none()
+        );
+        assert!(VersionIndex::from_json(
+            br#"{"key":"k","versions":[],"generation":"1"}"#
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn from_json_fail_closed_extra_large_index() {
+        assert_eq!(MAX_INDEX_VERSIONS, 10_000);
+        fn body(n: usize) -> String {
+            let mut s = String::from(r#"{"key":"k","versions":["#);
+            for i in 0..n {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&format!(r#"{{"version_id":"{i:x}"}}"#));
+            }
+            s.push_str("]}");
+            s
+        }
+        assert!(VersionIndex::from_json(body(MAX_INDEX_VERSIONS).as_bytes()).is_some());
+        assert!(VersionIndex::from_json(body(MAX_INDEX_VERSIONS + 1).as_bytes()).is_none());
+    }
+
+    #[test]
+    fn cas_etag_opaque_hex_of_generation_latest_and_key() {
+        let mut idx = VersionIndex::new("k");
+        idx.push_latest(rec("v1", true));
+        let e1 = idx.cas_etag();
+        assert_eq!(e1.len(), 64);
+        assert!(e1.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(idx.cas_etag(), e1);
+
+        idx.generation = 1;
+        let e_gen = idx.cas_etag();
+        assert_ne!(e1, e_gen);
+
+        idx.generation = 0;
+        idx.push_latest(rec("v2", true));
+        let e_latest = idx.cas_etag();
+        assert_ne!(e1, e_latest);
+
+        let mut other_key = VersionIndex::new("other");
+        other_key.push_latest(rec("v1", true));
+        assert_ne!(e1, other_key.cas_etag());
+    }
+
+    #[test]
+    fn apply_if_match_is_in_process_cas() {
+        let mut idx = VersionIndex::new("k");
+        assert_eq!(idx.generation, 0);
+        assert_eq!(idx.apply_if_match(None, rec("v1", true)), Ok(()));
+        assert_eq!(idx.generation, 1);
+        assert_eq!(idx.versions[0].version_id, "v1");
+        let etag_after_first = idx.cas_etag();
+
+        assert_eq!(
+            idx.apply_if_match(None, rec("v2", true)),
+            Err(CasDenied::MissingExpected)
+        );
+        assert_eq!(idx.generation, 1);
+        assert_eq!(idx.cas_etag(), etag_after_first);
+
+        assert_eq!(
+            idx.apply_if_match(Some(0), rec("v2", true)),
+            Err(CasDenied::Mismatch)
+        );
+        assert_eq!(idx.generation, 1);
+        assert_eq!(idx.versions.len(), 1);
+
+        assert_eq!(idx.apply_if_match(Some(1), rec("v2", true)), Ok(()));
+        assert_eq!(idx.generation, 2);
+        assert_eq!(idx.versions[0].version_id, "v2");
+        assert!(idx.versions[0].is_latest);
+        assert!(!idx.versions[1].is_latest);
+        assert_ne!(idx.cas_etag(), etag_after_first);
+
+        // Some(0) on a fresh index is a match.
+        let mut fresh = VersionIndex::new("k");
+        assert_eq!(fresh.apply_if_match(Some(0), rec("v0", true)), Ok(()));
+        assert_eq!(fresh.generation, 1);
+    }
+
+    #[test]
+    fn remove_version_silent_missing_checked_reports_missing() {
+        let mut idx = VersionIndex::new("k");
+        idx.push_latest(rec("v1", true));
+        idx.push_latest(rec("v2", true));
+
+        // Existing caller behaviour: missing target is a silent no-op.
+        let before = idx.clone();
+        assert_eq!(idx.remove_version("no-such"), None);
+        assert_eq!(idx, before);
+
+        // Opt-in: Missing so MultiDelete cannot hide a lost update.
+        assert_eq!(
+            idx.remove_version_checked("no-such"),
+            Err(RemoveVersionError::Missing)
+        );
+        assert_eq!(idx, before);
+
+        assert_eq!(
+            idx.remove_version_checked("v2"),
+            Ok(Some("v1".to_string()))
+        );
+        assert!(idx.find("v2").is_none());
+        assert_eq!(idx.find("v1").map(|v| v.is_latest), Some(true));
+
+        assert_eq!(idx.remove_version_checked("v1"), Ok(None));
+        assert!(idx.versions.is_empty());
+        assert_eq!(
+            idx.remove_version_checked("v1"),
+            Err(RemoveVersionError::Missing)
+        );
+    }
+
+    #[test]
+    fn list_versions_unknown_version_id_marker_skips_key() {
+        let mut idx_a = VersionIndex::new("a");
+        idx_a.versions = vec![rec("a2", true), rec("a1", false)];
+        let mut idx_b = VersionIndex::new("b");
+        idx_b.versions = vec![rec("b1", true)];
+        let indexes = [idx_a, idx_b];
+
+        // AWS-400 residual: unknown marker does not 400 here; fail closed
+        // by skipping key `a` instead of the old start-at-0 replay.
+        let xml = String::from_utf8(list_versions_result_xml(
+            "bucket",
+            "",
+            "a",
+            "does-not-exist",
+            100,
+            &indexes,
+        ))
+        .unwrap();
+        assert!(!xml.contains("<VersionId>a2</VersionId>"));
+        assert!(!xml.contains("<VersionId>a1</VersionId>"));
+        assert!(xml.contains("<VersionId>b1</VersionId>"));
+        assert_eq!(count_tag(&xml, "Version"), 1);
+
+        // Known marker still continues after that version on the same key.
+        let cont = String::from_utf8(list_versions_result_xml(
+            "bucket", "", "a", "a2", 100, &indexes,
+        ))
+        .unwrap();
+        assert!(cont.contains("<VersionId>a1</VersionId>"));
+        assert!(!cont.contains("<VersionId>a2</VersionId>"));
+        assert!(cont.contains("<VersionId>b1</VersionId>"));
     }
 }

@@ -26,6 +26,7 @@ pub mod constraints;
 pub mod daemon;
 pub mod fsutil;
 pub mod hashing;
+pub mod localdev;
 pub mod lockutil;
 pub mod obslog;
 pub mod otlp;

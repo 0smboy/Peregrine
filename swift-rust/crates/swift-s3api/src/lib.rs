@@ -91,7 +91,10 @@
 //!   grant evaluation.
 //! * authenticated-read / log-delivery-write canned ACLs (Python NotImplemented)
 //! * CORS ExposeHeader edge cases in live preflight
-//! * clock-skew/expiry enforcement on every path
+//! * clock-skew/expiry enforcement is **experimental** (header + query
+//!   skew → `RequestTimeTooSkewed`; query expiry → `AccessDenied`) — not
+//!   live-proven, not AWS-complete (no Date-only V4 fallback, no Expires
+//!   range/overflow codes)
 //! * requiring `x-amz-trailer-signature` when PAYLOAD-TRAILER mode has an
 //!   *empty* trailer block (we only enforce when trailer lines are present);
 //!   full AWS multi-chunk trailer golden-vector e2e against live S3 is not
@@ -135,13 +138,14 @@ pub use response::{
     s3_error_xml, BucketInfo, DeleteError, ListBucketResult, ListBucketResultV2, Owner, S3Object,
 };
 pub use sigv2::{
-    compute_signature_v2, is_sigv2_auth, parse_sigv2_auth, string_to_sign_v2, verify_sigv2,
-    SigV2Auth,
+    check_sigv2_time, compute_signature_v2, is_sigv2_auth, parse_sigv2_auth, string_to_sign_v2,
+    verify_sigv2, SigV2Auth,
 };
 pub use sigv4::{
-    amz_date, canonical_query, canonical_request, canonical_uri, compute_signature,
-    headers_to_sign, parse_authorization_header, parse_credential, parse_query_authentication,
-    parse_sigv4_auth, payload_hash, signing_key, string_to_sign, string_to_sign_for_request,
-    verify_sigv4, CredentialScope, SigV4Auth, ALGORITHM, SERVICE,
+    amz_date, canonical_query, canonical_request, canonical_uri, check_sigv4_time,
+    compute_signature, format_amz_date, headers_to_sign, parse_amz_date, parse_authorization_header,
+    parse_credential, parse_query_authentication, parse_sigv4_auth, payload_hash, signing_key,
+    string_to_sign, string_to_sign_for_request, verify_sigv4, CredentialScope, SigAuthError,
+    SigV4Auth, ALGORITHM, SERVICE,
 };
 pub use xml::{Element, XMLNS_S3};

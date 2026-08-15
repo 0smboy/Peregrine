@@ -26,9 +26,11 @@
 //! This module only handles the **header** SigV4 signature (where
 //! `X-Amz-Content-SHA256` is the literal `STREAMING-*` token).
 //!
-//! SigV2 lives in [`crate::sigv2`]. Also deferred here: clock-skew/expiry
-//! checks, and the Date-header-only timestamp fallback (only `X-Amz-Date`
-//! is read for V4).
+//! SigV2 lives in [`crate::sigv2`]. Clock-skew and query-expiry checks are
+//! **experimental** (not live-proven, not AWS-complete). Still deferred:
+//! Date-header-only V4 timestamp fallback (only `X-Amz-Date` is read),
+//! `x-amz-content-sha256` payload validation, and Expires range/overflow
+//! codes.
 
 use crate::crypto::{hmac_sha256, hmac_sha256_hex, sha256_hex, streq_const_time};
 use swift_http::{parse_query, HeaderKeyDict, Request};
@@ -37,6 +39,35 @@ use swift_http::{parse_query, HeaderKeyDict, Request};
 pub const SERVICE: &str = "s3";
 /// The SigV4 algorithm identifier.
 pub const ALGORITHM: &str = "AWS4-HMAC-SHA256";
+
+/// Distinct auth failures so middleware can emit the matching S3 `Code`.
+///
+/// Experimental: not live-proven. Not AWS-complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigAuthError {
+    SignatureDoesNotMatch,
+    RequestTimeTooSkewed,
+    /// Query auth past `X-Amz-Expires` / `Expires` (not a bad HMAC).
+    AccessDenied,
+}
+
+impl SigAuthError {
+    pub fn s3_code(self) -> &'static str {
+        match self {
+            Self::SignatureDoesNotMatch => "SignatureDoesNotMatch",
+            Self::RequestTimeTooSkewed => "RequestTimeTooSkewed",
+            Self::AccessDenied => "AccessDenied",
+        }
+    }
+
+    /// Override message; `None` uses [`crate::response::error_status_and_message`].
+    pub fn s3_message(self) -> Option<&'static str> {
+        match self {
+            Self::AccessDenied => Some("Request has expired"),
+            Self::SignatureDoesNotMatch | Self::RequestTimeTooSkewed => None,
+        }
+    }
+}
 
 /// The `<date>/<region>/<service>/<terminal>` credential scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +205,97 @@ pub fn amz_date(req: &Request) -> Option<String> {
         return Some(d.to_string());
     }
     req.param("X-Amz-Date")
+}
+
+/// Parse `YYYYMMDDThhmmssZ` to unix seconds. Experimental; not AWS-complete.
+pub fn parse_amz_date(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let b = s.as_bytes();
+    if b.len() != 16 || b[8] != b'T' || b[15] != b'Z' {
+        return None;
+    }
+    let y: i64 = s[0..4].parse().ok()?;
+    let mo: u32 = s[4..6].parse().ok()?;
+    let d: u32 = s[6..8].parse().ok()?;
+    let h: i64 = s[9..11].parse().ok()?;
+    let mi: i64 = s[11..13].parse().ok()?;
+    let se: i64 = s[13..15].parse().ok()?;
+    if !(1..=12).contains(&mo)
+        || !(1..=31).contains(&d)
+        || !(0..24).contains(&h)
+        || !(0..60).contains(&mi)
+        || !(0..61).contains(&se)
+    {
+        return None;
+    }
+    Some(days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se)
+}
+
+/// Format unix seconds as `YYYYMMDDThhmmssZ`. Experimental; not AWS-complete.
+pub fn format_amz_date(unix: i64) -> String {
+    let days = unix.div_euclid(86400);
+    let sod = unix.rem_euclid(86400);
+    let (y, mo, d) = civil_from_days(days);
+    let h = sod / 3600;
+    let mi = (sod % 3600) / 60;
+    let se = sod % 60;
+    format!("{y:04}{mo:02}{d:02}T{h:02}{mi:02}{se:02}Z")
+}
+
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Clock-skew + V4 query expiry. Experimental: not live-proven. Not AWS-complete.
+///
+/// Query expiry (`signed_at + X-Amz-Expires < now` → `AccessDenied`) is
+/// checked before skew so an expired presigned URL is not remapped to
+/// `RequestTimeTooSkewed`. Header and query both apply
+/// `abs(signing_ts - now) > allowable_clock_skew`.
+pub fn check_sigv4_time(
+    req: &Request,
+    now_unix: i64,
+    allowable_clock_skew: u64,
+) -> Result<(), SigAuthError> {
+    let Some(date) = amz_date(req) else {
+        return Ok(());
+    };
+    let Some(signing_ts) = parse_amz_date(&date) else {
+        return Ok(());
+    };
+    let query_auth = parse_sigv4_auth(req).is_some_and(|a| a.query_auth);
+    if query_auth {
+        if let Some(exp_s) = req.param("X-Amz-Expires") {
+            if let Ok(expires) = exp_s.parse::<i64>() {
+                if signing_ts.saturating_add(expires) < now_unix {
+                    return Err(SigAuthError::AccessDenied);
+                }
+            }
+        }
+    }
+    if signing_ts.abs_diff(now_unix) > allowable_clock_skew {
+        return Err(SigAuthError::RequestTimeTooSkewed);
+    }
+    Ok(())
 }
 
 /// `urllib.parse.quote(value, safe)` — RFC 3986 unreserved characters
@@ -347,28 +469,37 @@ pub fn string_to_sign_for_request(req: &Request) -> Option<String> {
 /// Verify a client-presented AWS Signature V4 against the given credentials.
 ///
 /// `access_key` / `secret_key` are the credentials the caller looked up for
-/// the presented access key. Returns true iff the request carries SigV4 auth,
-/// its presented access key matches `access_key`, and the recomputed
-/// signature matches the presented one (constant-time comparison).
+/// the presented access key. HMAC match is required. When `now_unix` is
+/// `Some`, also applies experimental clock-skew / query-expiry checks
+/// (`RequestTimeTooSkewed` / `AccessDenied`). `allowable_clock_skew` is
+/// ignored when `now_unix` is `None` (HMAC-only, for golden vectors).
 ///
-/// Supports header auth and presigned-URL query auth. Does NOT perform
-/// clock-skew, expiry, or `x-amz-content-sha256` payload validation — those
-/// are separate checks in the full request lifecycle (deferred).
-pub fn verify_sigv4(access_key: &str, secret_key: &str, req: &Request) -> bool {
+/// Supports header auth and presigned-URL query auth. Does **not** validate
+/// `x-amz-content-sha256` payload bytes. Not live-proven. Not AWS-complete.
+pub fn verify_sigv4(
+    access_key: &str,
+    secret_key: &str,
+    req: &Request,
+    now_unix: Option<i64>,
+    allowable_clock_skew: Option<u64>,
+) -> Result<(), SigAuthError> {
     let auth = match parse_sigv4_auth(req) {
         Some(a) => a,
-        None => return false,
+        None => return Err(SigAuthError::SignatureDoesNotMatch),
     };
     if auth.access_key != access_key {
-        return false;
+        return Err(SigAuthError::SignatureDoesNotMatch);
+    }
+    if let Some(now) = now_unix {
+        check_sigv4_time(req, now, allowable_clock_skew.unwrap_or(u64::MAX))?;
     }
     let date = match amz_date(req) {
         Some(d) => d,
-        None => return false,
+        None => return Err(SigAuthError::SignatureDoesNotMatch),
     };
     let hts = match headers_to_sign(&req.headers, &auth.signed_headers) {
         Some(h) => h,
-        None => return false,
+        None => return Err(SigAuthError::SignatureDoesNotMatch),
     };
     let cr = canonical_request(
         &req.method,
@@ -378,7 +509,11 @@ pub fn verify_sigv4(access_key: &str, secret_key: &str, req: &Request) -> bool {
         &payload_hash(req),
     );
     let expected = compute_signature(secret_key, &auth.scope, &date, &cr);
-    streq_const_time(&expected, &auth.signature)
+    if streq_const_time(&expected, &auth.signature) {
+        Ok(())
+    } else {
+        Err(SigAuthError::SignatureDoesNotMatch)
+    }
 }
 
 #[cfg(test)]
@@ -390,6 +525,16 @@ mod tests {
     // Source: AWS S3 API reference, "Examples of signature calculations".
     const ACCESS: &str = "AKIAIOSFODNN7EXAMPLE";
     const SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+
+    fn assert_sig_error_xml_matches_normalize(err: SigAuthError, status: u16) {
+        let resp = crate::response::s3_error_response(err.s3_code(), err.s3_message(), &[]);
+        assert_eq!(resp.status, status, "{}", err.s3_code());
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        let msg = err
+            .s3_message()
+            .unwrap_or(crate::response::error_status_and_message(err.s3_code()).1);
+        crate::response::assert_error_xml_matches_normalize(&body, err.s3_code(), msg);
+    }
 
     fn header_auth_request() -> Request {
         let mut headers = HeaderKeyDict::new();
@@ -489,32 +634,42 @@ mod tests {
 
     #[test]
     fn test_verify_sigv4_header_auth() {
-        assert!(verify_sigv4(ACCESS, SECRET, &header_auth_request()));
+        assert_eq!(
+            verify_sigv4(ACCESS, SECRET, &header_auth_request(), None, None),
+            Ok(())
+        );
     }
 
     #[test]
     fn test_verify_sigv4_rejects_wrong_secret() {
-        assert!(!verify_sigv4(
-            ACCESS,
-            "not-the-secret",
-            &header_auth_request()
-        ));
+        assert_eq!(
+            verify_sigv4(
+                ACCESS,
+                "not-the-secret",
+                &header_auth_request(),
+                None,
+                None
+            ),
+            Err(SigAuthError::SignatureDoesNotMatch)
+        );
     }
 
     #[test]
     fn test_verify_sigv4_rejects_wrong_access_key() {
-        assert!(!verify_sigv4(
-            "SOMEONE_ELSE",
-            SECRET,
-            &header_auth_request()
-        ));
+        assert_eq!(
+            verify_sigv4("SOMEONE_ELSE", SECRET, &header_auth_request(), None, None),
+            Err(SigAuthError::SignatureDoesNotMatch)
+        );
     }
 
     #[test]
     fn test_verify_sigv4_rejects_tampered_path() {
         let mut req = header_auth_request();
         req.path = "/tampered.txt".to_string();
-        assert!(!verify_sigv4(ACCESS, SECRET, &req));
+        assert_eq!(
+            verify_sigv4(ACCESS, SECRET, &req, None, None),
+            Err(SigAuthError::SignatureDoesNotMatch)
+        );
     }
 
     // The AWS documented presigned-URL (query auth) vector for the same
@@ -537,8 +692,82 @@ mod tests {
 
     #[test]
     fn test_verify_sigv4_query_auth() {
-        assert!(verify_sigv4(ACCESS, SECRET, &query_auth_request()));
-        assert!(!verify_sigv4(ACCESS, "wrong", &query_auth_request()));
+        assert_eq!(
+            verify_sigv4(ACCESS, SECRET, &query_auth_request(), None, None),
+            Ok(())
+        );
+        assert_eq!(
+            verify_sigv4(ACCESS, "wrong", &query_auth_request(), None, None),
+            Err(SigAuthError::SignatureDoesNotMatch)
+        );
+    }
+
+    #[test]
+    fn parse_format_amz_date_roundtrip() {
+        let ts = parse_amz_date("20130524T000000Z").unwrap();
+        assert_eq!(format_amz_date(ts), "20130524T000000Z");
+        assert_eq!(parse_amz_date(&format_amz_date(ts)), Some(ts));
+        assert!(parse_amz_date("garbage").is_none());
+    }
+
+    #[test]
+    fn verify_sigv4_header_clock_skew_rejects() {
+        let signed = parse_amz_date("20130524T000000Z").unwrap();
+        assert_eq!(
+            verify_sigv4(
+                ACCESS,
+                SECRET,
+                &header_auth_request(),
+                Some(signed + 3600),
+                Some(900)
+            ),
+            Err(SigAuthError::RequestTimeTooSkewed)
+        );
+        assert_eq!(
+            verify_sigv4(
+                ACCESS,
+                SECRET,
+                &header_auth_request(),
+                Some(signed + 900),
+                Some(900)
+            ),
+            Ok(())
+        );
+        assert_sig_error_xml_matches_normalize(SigAuthError::RequestTimeTooSkewed, 403);
+    }
+
+    #[test]
+    fn verify_sigv4_query_clock_skew_rejects() {
+        let signed = parse_amz_date("20130524T000000Z").unwrap();
+        // Still inside X-Amz-Expires=86400; only skew fires.
+        assert_eq!(
+            verify_sigv4(
+                ACCESS,
+                SECRET,
+                &query_auth_request(),
+                Some(signed + 3600),
+                Some(900)
+            ),
+            Err(SigAuthError::RequestTimeTooSkewed)
+        );
+        assert_sig_error_xml_matches_normalize(SigAuthError::RequestTimeTooSkewed, 403);
+    }
+
+    #[test]
+    fn verify_sigv4_query_expired_access_denied() {
+        let signed = parse_amz_date("20130524T000000Z").unwrap();
+        // signed_at + 86400 < now, but |signed_at - now| is still < 900.
+        assert_eq!(
+            verify_sigv4(
+                ACCESS,
+                SECRET,
+                &query_auth_request(),
+                Some(signed + 86401),
+                Some(90_000)
+            ),
+            Err(SigAuthError::AccessDenied)
+        );
+        assert_sig_error_xml_matches_normalize(SigAuthError::AccessDenied, 403);
     }
 
     #[test]

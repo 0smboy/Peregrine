@@ -39,6 +39,14 @@ pub mod servers_per_port;
 pub mod ssync;
 pub mod ssync_sender;
 pub mod updater;
+/// Experimental native `/v1` lock gate. Wired on PUT/POST/DELETE of an
+/// existing object (not REPLICATE/SSYNC). Not live-proven, not deployed,
+/// not a compliance claim.
+pub mod worm_native_gate;
+pub use worm_native_gate::{
+    is_s3_lock_control_plane_post, native_mutation_allowed, native_mutation_allowed_for,
+    NativeGovernanceBypass,
+};
 pub use expirer::{
     build_task_obj, get_expirer_container, iter_due_tasks, parse_task_obj, process_task,
     recon_update as expirer_recon_update, run_once as expirer_run_once, DeleteResult, ExpirerStats,
@@ -60,8 +68,8 @@ use swift_diskfile::{
     PolicyKind,
 };
 use swift_http::{
-    http_date, split_path, unquote, Body, ChainReader, HeaderKeyDict, MimeDocs, Range, Request,
-    Response, STREAM_CHUNK,
+    http_date, split_path, unquote, Body, ChainReader, HeaderKeyDict, Match, MimeDocs, Range,
+    Request, Response, STREAM_CHUNK,
 };
 
 use crate::ssync::{MissingOffer, SsyncEvent, SsyncParser, SsyncSubrequest};
@@ -112,6 +120,11 @@ fn meta_get<'m>(meta: &'m Metadata, key: &str) -> Option<&'m str> {
     meta.iter()
         .find(|(k, _)| matches!(k, MetaValue::Str(s) if s.eq_ignore_ascii_case(key)))
         .and_then(|(_, v)| v.as_str())
+}
+
+/// Stored object ETag used by GET/HEAD and PUT `If-Match`.
+fn object_etag(meta: &Metadata) -> &str {
+    meta_get(meta, "ETag").unwrap_or("")
 }
 
 /// Python `dict.update` semantics on the ordered metadata pairs: replace the
@@ -377,6 +390,83 @@ fn check_delete_headers(req: &Request, now: f64) -> Result<Option<String>, Respo
         return Err(plain_response(400, "X-Delete-At in past"));
     }
     Ok(Some(normalized))
+}
+
+/// Copy on-disk object metadata into request-style headers for the native
+/// lock gate. Only string pairs are needed (lock sysmeta is stored as text).
+fn metadata_as_headers(meta: &Metadata) -> HeaderKeyDict {
+    let mut headers = HeaderKeyDict::new();
+    for (k, v) in meta {
+        if let (Some(key), Some(value)) = (k.as_str(), v.as_str()) {
+            headers.set(key, value);
+        }
+    }
+    headers
+}
+
+/// Experimental native lock gate on PUT/POST/DELETE of an existing object.
+/// Not live-proven, not deployed, not a compliance claim.
+///
+/// Missing object → allow (PUT create). Replicate/ssync
+/// (`X-Backend-Replication`) skip this gate. Lock-sysmeta-only POST is not
+/// a data overwrite and is not denied. Malformed lock headers deny
+/// inside [`native_mutation_allowed`]. A live object whose metadata cannot
+/// be read fails closed (500) instead of treating the object as unlocked.
+fn deny_locked_native_mutation(
+    req: &Request,
+    existing: Option<Result<&Metadata, DiskFileError>>,
+) -> Option<Response> {
+    if req
+        .headers
+        .get("X-Backend-Replication")
+        .is_some_and(config_true_value)
+    {
+        return None;
+    }
+    let meta = match existing {
+        None => return None,
+        Some(Ok(meta)) => meta,
+        Some(Err(e)) => return Some(plain_response(500, &e.to_string())),
+    };
+    let headers = metadata_as_headers(meta);
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // clock_ok stays true until a clock-health signal exists.
+    if native_mutation_allowed_for(
+        &req.method,
+        &headers,
+        Some(&req.headers),
+        now_unix,
+        true,
+        NativeGovernanceBypass::NONE,
+    ) {
+        None
+    } else {
+        Some(plain_response(403, "object is locked"))
+    }
+}
+
+/// PUT `If-Match` against the current object ETag (same value GET emits).
+/// Missing object or mismatch → 412. Header absent → no precondition.
+fn put_if_match_precondition(
+    req: &Request,
+    orig_exists: bool,
+    orig_metadata: Option<&Metadata>,
+) -> Option<Response> {
+    let Some(if_match) = req.headers.get("If-Match") else {
+        return None;
+    };
+    if !orig_exists {
+        return Some(swob_response(412));
+    }
+    let etag = orig_metadata.map(object_etag).unwrap_or("");
+    if Match::parse(if_match).matches(etag) {
+        None
+    } else {
+        Some(swob_response(412))
+    }
 }
 
 /// Python `fallocate()`'s FALLOCATE_RESERVE check, absolute-bytes mode: would
@@ -826,11 +916,12 @@ impl ObjectServer {
             Err(resp) => return resp,
         };
 
-        // Pre-create checks against any existing object: If-None-Match and the
-        // timestamp-conflict guard. A live object yields a non-empty
-        // orig_metadata (here just its existence); a tombstone/missing object
-        // yields no metadata but still carries a timestamp for the conflict
-        // guard.
+        // Pre-create checks against any existing object: If-None-Match,
+        // If-Match, the timestamp-conflict guard, and the experimental native
+        // lock gate. A live object yields its metadata (sysmeta included); an
+        // expired object is absent for If-* but still carries lock sysmeta.
+        // A tombstone/missing object yields no metadata but still carries a
+        // timestamp for the conflict guard.
         // SSYNC subrequests carry a Frag-Index header, in which case the
         // pre-open ignores non-matching on-disk data files so a primary
         // holding a different fragment does not 409 (server.py:833).
@@ -838,7 +929,7 @@ impl ObjectServer {
             .headers
             .get("X-Backend-Ssync-Frag-Index")
             .and_then(|raw| raw.trim().parse().ok());
-        let (orig_exists, orig_timestamp) = match self
+        let (orig_exists, orig_timestamp, orig_metadata) = match self
             .diskfile_for(
                 &drive,
                 part,
@@ -850,23 +941,28 @@ impl ObjectServer {
             .map(|df| df.with_frag_index(ssync_frag_index))
         {
             Ok(mut pre) => match pre.open(None) {
-                Ok(opened) => (
-                    true,
-                    opened
+                Ok(opened) => {
+                    let ts = opened
                         .data_timestamp()
-                        .unwrap_or_else(|_| "0".parse().unwrap()),
-                ),
-                Err(DiskFileError::Deleted { timestamp, .. }) => (false, timestamp),
-                // An expired object counts as absent for If-None-Match, but its
-                // timestamp still guards against an out-of-order overwrite.
+                        .unwrap_or_else(|_| "0".parse().unwrap());
+                    // Live object: metadata read failure is not "unlocked".
+                    match opened.get_metadata() {
+                        Ok(meta) => (true, ts, Some(meta.clone())),
+                        Err(e) => return plain_response(500, &e.to_string()),
+                    }
+                }
+                Err(DiskFileError::Deleted { timestamp, .. }) => (false, timestamp, None),
+                // An expired object counts as absent for If-None-Match / If-Match,
+                // but its timestamp still guards against an out-of-order
+                // overwrite and its lock sysmeta still feeds the lock gate.
                 Err(DiskFileError::Expired { metadata }) => {
                     let ts = meta_get(&metadata, "X-Timestamp")
                         .and_then(|s| s.parse::<Timestamp>().ok())
                         .unwrap_or_else(|| "0".parse().unwrap());
-                    (false, ts)
+                    (false, ts, Some(metadata))
                 }
                 Err(DiskFileError::NotExist) | Err(DiskFileError::Quarantined(_)) => {
-                    (false, "0".parse().unwrap())
+                    (false, "0".parse().unwrap(), None)
                 }
                 Err(e) => return plain_response(500, &e.to_string()),
             },
@@ -882,6 +978,21 @@ impl ObjectServer {
             resp.headers
                 .set("X-Backend-Timestamp", orig_timestamp.internal());
             return resp;
+        }
+        if let Some(resp) = put_if_match_precondition(req, orig_exists, orig_metadata.as_ref()) {
+            return resp;
+        }
+        // Experimental native lock: live or expired metadata bag. No object →
+        // allow PUT. Replicate/ssync skip inside the helper. Not live-proven.
+        if orig_exists || orig_metadata.is_some() {
+            if let Some(resp) = deny_locked_native_mutation(
+                req,
+                orig_metadata
+                    .as_ref()
+                    .map(|meta| Ok::<_, DiskFileError>(meta)),
+            ) {
+                return resp;
+            }
         }
 
         // fallocate_reserve: refuse the write before any data lands when it
@@ -1271,6 +1382,12 @@ impl ObjectServer {
                 .set("X-Backend-Timestamp", orig_timestamp.internal());
             return resp;
         }
+        // Experimental native lock on existing-object POST. Replicate/ssync
+        // skip. Lock-sysmeta-only POST is not denied. Unreadable metadata
+        // fails closed (500).
+        if let Some(resp) = deny_locked_native_mutation(req, Some(orig.get_metadata())) {
+            return resp;
+        }
         let content_length = orig
             .get_metadata()
             .ok()
@@ -1465,12 +1582,15 @@ impl ObjectServer {
         // A live object yields 204 (if we win the timestamp race) or 409;
         // a missing or already-deleted object always yields 404 even
         // though a fresh tombstone is still written when we win.
-        let (orig_timestamp, was_live, orig_delete_at) = match df.open(None) {
+        let (orig_timestamp, was_live, orig_delete_at, orig_metadata) = match df.open(None) {
             Ok(_) => {
                 let ts = df.data_timestamp().unwrap_or_else(|_| "0".parse().unwrap());
-                let delete_at = df
-                    .get_metadata()
-                    .ok()
+                let metadata = match df.get_metadata() {
+                    Ok(m) => Some(m.clone()),
+                    Err(e) => return plain_response(500, &e.to_string()),
+                };
+                let delete_at = metadata
+                    .as_ref()
                     .and_then(|m| {
                         m.iter().find_map(|(k, v)| {
                             if k.as_str() != Some("X-Delete-At") {
@@ -1484,13 +1604,13 @@ impl ObjectServer {
                         })
                     })
                     .unwrap_or_else(|| "0".parse().unwrap());
-                (ts, true, delete_at)
+                (ts, true, delete_at, metadata)
             }
             Err(DiskFileError::Deleted { timestamp, .. }) => {
-                (timestamp, false, "0".parse().unwrap())
+                (timestamp, false, "0".parse().unwrap(), None)
             }
             Err(DiskFileError::NotExist) | Err(DiskFileError::Quarantined(_)) => {
-                ("0".parse().unwrap(), false, "0".parse().unwrap())
+                ("0".parse().unwrap(), false, "0".parse().unwrap(), None)
             }
             Err(DiskFileError::Expired { metadata }) => {
                 // open_expired=false path; treat as live-but-expired for
@@ -1518,7 +1638,7 @@ impl ObjectServer {
                         }
                     })
                     .unwrap_or_else(|| "0".parse().unwrap());
-                (ts, true, delete_at)
+                (ts, true, delete_at, Some(metadata))
             }
             Err(e) => return plain_response(500, &e.to_string()),
         };
@@ -1554,6 +1674,18 @@ impl ObjectServer {
         } else {
             409
         };
+        // Experimental native lock: existing object only. Replicate/ssync skip.
+        // Not live-proven, not deployed. Live metadata read failure is 500.
+        if was_live && orig_timestamp < req_timestamp {
+            if let Some(resp) = deny_locked_native_mutation(
+                req,
+                orig_metadata
+                    .as_ref()
+                    .map(|meta| Ok::<_, DiskFileError>(meta)),
+            ) {
+                return resp;
+            }
+        }
         if orig_timestamp < req_timestamp {
             let fresh = match self.diskfile_for(
                 &drive,
@@ -1656,7 +1788,7 @@ impl ObjectServer {
         let x_ts: Timestamp = meta_get(&metadata, "X-Timestamp")
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| "0".parse().unwrap());
-        let etag = meta_get(&metadata, "ETag").unwrap_or("").to_string();
+        let etag = object_etag(&metadata).to_string();
         let content_type = meta_get(&metadata, "Content-Type")
             .unwrap_or("application/octet-stream")
             .to_string();
@@ -2840,6 +2972,211 @@ mod fallocate_reserve_tests {
         // a tiny reserve passes and the object lands
         let ok = tiny_server(&dir, FallocateReserve::Bytes(1));
         assert_eq!(ok.handle(put_request(b"body")).status, 201);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod native_worm_gate_wiring_tests {
+    use super::*;
+    use crate::worm_native_gate::{
+        SYS_LEGAL_HOLD, SYS_LOCK_MODE, SYS_LOCK_REVISION, SYS_RETAIN_UNTIL,
+    };
+
+    fn server(devices: &Path) -> ObjectServer {
+        ObjectServer::new(ObjectServerConfig {
+            devices: devices.to_path_buf(),
+            mount_check: false,
+            hash_config: HashPathConfig::new(Vec::new(), b"worm-gate-tests".to_vec()).unwrap(),
+            diskfile: DiskFileConfig::default(),
+            policies: std::collections::HashMap::from([(0, PolicyKind::Replication)]),
+            container_update_timeout: std::time::Duration::from_secs(1),
+            container_update_mode: ContainerUpdateMode::Sync,
+        })
+    }
+
+    fn temp_devices() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-worm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        dir
+    }
+
+    fn put_req(ts: &str, extra: &[(&str, &str)], body: &[u8]) -> Request {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Timestamp", ts);
+        headers.set("Content-Type", "application/octet-stream");
+        headers.set("Content-Length", body.len());
+        for (k, v) in extra {
+            headers.set(k, *v);
+        }
+        Request {
+            method: "PUT".into(),
+            path: "/sda1/0/AUTH_test/c/o".into(),
+            query_string: String::new(),
+            headers,
+            body: body.to_vec().into(),
+        }
+    }
+
+    fn method_req(method: &str, ts: &str) -> Request {
+        method_req_headers(method, ts, &[])
+    }
+
+    fn method_req_headers(method: &str, ts: &str, extra: &[(&str, &str)]) -> Request {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Timestamp", ts);
+        for (k, v) in extra {
+            headers.set(k, *v);
+        }
+        Request {
+            method: method.into(),
+            path: "/sda1/0/AUTH_test/c/o".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        }
+    }
+
+    #[test]
+    fn unlocked_put_and_missing_headers_allow() {
+        let dir = temp_devices();
+        let srv = server(&dir);
+        assert_eq!(srv.handle(put_req("1", &[], b"a")).status, 201);
+        assert_eq!(srv.handle(put_req("2", &[], b"b")).status, 201);
+        assert_eq!(srv.handle(method_req("DELETE", "3")).status, 204);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legal_hold_and_compliance_deny_existing_mutations() {
+        let dir = temp_devices();
+        let srv = server(&dir);
+        assert_eq!(
+            srv.handle(put_req("1", &[(SYS_LEGAL_HOLD, "ON")], b"held"))
+                .status,
+            201
+        );
+        let mut overwrite = srv.handle(put_req("2", &[], b"nope"));
+        assert_eq!(overwrite.status, 403);
+        assert_eq!(
+            String::from_utf8_lossy(overwrite.body.materialize(u64::MAX).unwrap()),
+            "object is locked"
+        );
+        assert_eq!(srv.handle(method_req("POST", "3")).status, 403);
+        assert_eq!(srv.handle(method_req("DELETE", "4")).status, 403);
+        assert_eq!(srv.handle(method_req("GET", "5")).status, 200);
+
+        let dir2 = temp_devices();
+        let srv2 = server(&dir2);
+        assert_eq!(
+            srv2.handle(put_req(
+                "1",
+                &[
+                    (SYS_LOCK_MODE, "COMPLIANCE"),
+                    (SYS_RETAIN_UNTIL, "2033-05-18T03:33:20Z"),
+                ],
+                b"locked"
+            ))
+            .status,
+            201
+        );
+        assert_eq!(srv2.handle(method_req("DELETE", "2")).status, 403);
+        let mut repl = put_req("3", &[], b"replica");
+        repl.headers.set("X-Backend-Replication", "True");
+        assert_eq!(srv2.handle(repl).status, 201);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn lock_sysmeta_post_allowed_overwrite_put_still_403() {
+        let dir = temp_devices();
+        let srv = server(&dir);
+        assert_eq!(srv.handle(put_req("1", &[], b"plain")).status, 201);
+        let lock_post = method_req_headers(
+            "POST",
+            "2",
+            &[
+                (SYS_LEGAL_HOLD, "ON"),
+                (SYS_LOCK_MODE, "COMPLIANCE"),
+                (SYS_RETAIN_UNTIL, "2033-05-18T03:33:20Z"),
+                (SYS_LOCK_REVISION, "1"),
+            ],
+        );
+        assert_eq!(srv.handle(lock_post).status, 202);
+        assert_eq!(srv.handle(put_req("3", &[], b"nope")).status, 403);
+        assert_eq!(srv.handle(method_req("POST", "4")).status, 403);
+        assert_eq!(
+            srv.handle(method_req_headers(
+                "POST",
+                "5",
+                &[(SYS_LEGAL_HOLD, "ON"), ("X-Object-Meta-Color", "blue")]
+            ))
+            .status,
+            403
+        );
+        let mut repl = put_req("6", &[], b"replica");
+        repl.headers.set("X-Backend-Replication", "True");
+        assert_eq!(srv.handle(repl).status, 201);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn put_if_match_mismatch_412_match_allows() {
+        let dir = temp_devices();
+        let srv = server(&dir);
+        let mut missing = put_req("1", &[], b"abc");
+        missing.headers.set("If-Match", "\"deadbeef\"");
+        assert_eq!(srv.handle(missing).status, 412);
+
+        let created = srv.handle(put_req("1", &[], b"abc"));
+        assert_eq!(created.status, 201);
+        let etag = created
+            .headers
+            .get("ETag")
+            .expect("PUT 201 carries ETag")
+            .to_string();
+
+        let mut star = put_req("2", &[], b"star");
+        star.headers.set("If-None-Match", "*");
+        assert_eq!(srv.handle(star).status, 412);
+
+        let mut mismatch = put_req("2", &[], b"nope");
+        mismatch.headers.set("If-Match", "\"deadbeef\"");
+        assert_eq!(srv.handle(mismatch).status, 412);
+
+        let mut matched = put_req("2", &[], b"ok");
+        matched.headers.set("If-Match", &etag);
+        assert_eq!(srv.handle(matched).status, 201);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expired_locked_put_overwrite_still_denied() {
+        let dir = temp_devices();
+        let srv = server(&dir);
+        assert_eq!(
+            srv.handle(put_req(
+                "1",
+                &[
+                    (SYS_LEGAL_HOLD, "ON"),
+                    ("X-Delete-At", "1"),
+                    ("X-Backend-Replication", "True"),
+                ],
+                b"held"
+            ))
+            .status,
+            201
+        );
+        assert_eq!(srv.handle(put_req("2", &[], b"nope")).status, 403);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

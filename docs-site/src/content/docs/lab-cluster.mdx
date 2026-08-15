@@ -25,9 +25,11 @@ ansible parity. SAIO on swift1 is **NOISY** for performance; VIP path is
 | Storage | `10.0.4.1–4` | account / container / object data path |
 | Replication | `10.0.8.1–4` | replicator / reconstructor |
 
-Nodes: `swift1`–`swift4` (swift1 = hub + VIP MASTER). Prefer the **real VIP**
-`http://10.0.0.10:8085` for clients and gates. Per-node
-`http://10.0.0.N:8085` remains valid (local HAProxy).
+Nodes: `swift1`–`swift4`. Keepalived VIP `10.0.0.10` is currently on
+**swift2** (`eth1` secondary). Prefer the **real VIP**
+`https://10.0.0.10:8085` for clients and gates. Per-node
+`http://10.0.0.N:8085` remains valid (local HAProxy). Account / container /
+object daemons are peer-equivalent and do not follow the VIP.
 
 Devices: `/srv/node/{d1,d2,d3}` XFS per node (12 total). **Never format** them
 from deploy tooling.

@@ -359,17 +359,24 @@ fn main() {
         logger.info(note);
     }
     for issue in &issues {
-        if strict_pipeline {
+        if issue.kind == PipelineBuildIssueKind::FatalLoad {
+            logger.error(&format!(
+                "account_freeze: refusing to start: {}",
+                issue.detail
+            ));
+        } else if strict_pipeline {
             logger.error(&format!("strict_pipeline: {issue}"));
         } else {
             logger.info(&format!("non-strict pipeline compatibility: {issue}"));
         }
     }
-    if strict_pipeline_rejects(&conf, &issues) {
-        logger.error(&format!(
-            "strict_pipeline=true: refusing to start with {} unresolved pipeline filter(s)",
-            issues.len()
-        ));
+    if pipeline_start_rejects(&conf, &issues) {
+        if strict_pipeline_rejects(&conf, &issues) {
+            logger.error(&format!(
+                "strict_pipeline=true: refusing to start with {} unresolved pipeline filter(s)",
+                issues.len()
+            ));
+        }
         std::process::exit(1);
     }
     if let Err(e) =
@@ -875,6 +882,8 @@ enum PipelineBuildIssueKind {
     BuildFailure,
     NotImplemented,
     UnknownFilter,
+    /// Load error that aborts startup even when `strict_pipeline=false`.
+    FatalLoad,
 }
 
 impl PipelineBuildIssueKind {
@@ -884,6 +893,7 @@ impl PipelineBuildIssueKind {
             Self::BuildFailure => "build_failure",
             Self::NotImplemented => "not_implemented",
             Self::UnknownFilter => "unknown_filter",
+            Self::FatalLoad => "fatal_load",
         }
     }
 }
@@ -926,6 +936,15 @@ impl std::fmt::Display for PipelineBuildIssue {
 /// interpreted as policy.
 fn strict_pipeline_rejects(conf: &SwiftConfig, issues: &[PipelineBuildIssue]) -> bool {
     strict_pipeline_from_conf(conf) && !issues.is_empty()
+}
+
+/// Startup gate used by `main`. `FatalLoad` (empty `account_freeze`) always
+/// refuses; other issues still honor `strict_pipeline`.
+fn pipeline_start_rejects(conf: &SwiftConfig, issues: &[PipelineBuildIssue]) -> bool {
+    issues
+        .iter()
+        .any(|issue| issue.kind == PipelineBuildIssueKind::FatalLoad)
+        || strict_pipeline_rejects(conf, issues)
 }
 
 fn build_copy(conf: &SwiftConfig) -> Result<swift_middleware::Copy, String> {
@@ -1032,6 +1051,22 @@ fn build_read_only(conf: &SwiftConfig) -> swift_middleware::ReadOnly {
     let read_only = conf.get(section, "read_only").ok().flatten();
     let allow_deletes = conf.get(section, "allow_deletes").ok().flatten();
     swift_middleware::ReadOnly::from_conf(read_only.as_deref(), allow_deletes.as_deref())
+}
+
+/// `[filter:account_freeze]` items, falling back to the hyphen alias.
+fn account_freeze_conf_items(conf: &SwiftConfig) -> std::collections::HashMap<String, String> {
+    conf.items("filter:account_freeze")
+        .ok()
+        .or_else(|| conf.items("filter:account-freeze").ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+/// Build `AccountFreeze` from the filter section. Empty / missing
+/// `frozen_accounts` is a hard error (`from_conf` Err); never a skip.
+fn build_account_freeze(conf: &SwiftConfig) -> Result<swift_middleware::AccountFreeze, String> {
+    swift_middleware::AccountFreeze::from_conf(&account_freeze_conf_items(conf))
 }
 
 fn build_name_check(conf: &SwiftConfig) -> swift_middleware::NameCheck {
@@ -1254,6 +1289,9 @@ fn build_backend_ratelimit(conf: &SwiftConfig) -> swift_middleware::BackendRateL
 /// P0–P1b wires: cache/listing_formats/proxy_logging/bulk/tempurl plus
 /// formpost/staticweb/quotas/symlink/versioned_writes and the smaller L2
 /// filters. P3-s3 wires `s3api` (ON-BY-CONFIG; not on default pipeline).
+/// `account_freeze` is also ON-BY-CONFIG: not in DEFAULT_CONFIGURED_FILTERS,
+/// not a PluginRegistry factory. `from_conf` Err is `FatalLoad` (start
+/// refuse even when `strict_pipeline=false`); the instance is appended last.
 /// Unknown names skip with a typed issue; `strict_pipeline=true` hard-fails at
 /// main without parsing log text.
 fn build_configured_filters_with_issues(
@@ -1300,6 +1338,8 @@ fn build_configured_filters_with_issues(
     let mut keystoneauth = keystoneauth;
     // Shared across keymaster / encrypter / decrypter / encryption filters.
     let mut keymaster_state: Option<Arc<swift_middleware::KeyMaster>> = None;
+    // Forced last extra so copy/s3api `next()` subrequests still hit freeze.
+    let mut account_freeze: Option<swift_middleware::AccountFreeze> = None;
 
     for name in &names {
         match name.as_str() {
@@ -1789,6 +1829,22 @@ fn build_configured_filters_with_issues(
                 ));
                 filters.push(Arc::new(xp));
             }
+            "account_freeze" | "account-freeze" => match build_account_freeze(conf) {
+                Ok(freeze) => {
+                    notes.push("account_freeze enabled".into());
+                    account_freeze = Some(freeze);
+                }
+                Err(error) => {
+                    // Propagate from_conf Err as an always-fatal load error.
+                    // Do not skip: empty frozen_accounts must refuse start.
+                    notes.push(format!("account_freeze: refusing to start: {error}"));
+                    issues.push(PipelineBuildIssue::new(
+                        name,
+                        PipelineBuildIssueKind::FatalLoad,
+                        error,
+                    ));
+                }
+            },
             // These Python pipeline names do not have a Rust middleware
             // implementation. Never disguise them as a successful no-op.
             "memcache" | "mem_cache" | "swob" | "recon" => {
@@ -1842,6 +1898,10 @@ fn build_configured_filters_with_issues(
                 }
             }
         }
+    }
+
+    if let Some(freeze) = account_freeze {
+        filters.push(Arc::new(freeze));
     }
 
     (filters, notes, issues)
@@ -1996,6 +2056,9 @@ fn configured_filter_names(conf: &SwiftConfig, has_tempauth: bool) -> Vec<&'stat
             // Composite egg name expands to two filters at build time; report
             // the name as listed in the pipeline for test helpers.
             "encryption" if build_keymaster(conf).is_ok() => out.push("encryption"),
+            "account_freeze" | "account-freeze" if build_account_freeze(conf).is_ok() => {
+                out.push("account_freeze")
+            }
             _ => {}
         }
     }
@@ -2905,7 +2968,8 @@ fn build_s3api(conf: &SwiftConfig) -> Result<Option<swift_s3api::S3Api>, String>
                 .flatten()
                 .filter(|s| !s.trim().is_empty())
         });
-    if let Some(root) = cold_root {
+    let cold_backend_configured = cold_root.is_some();
+    if let Some(root) = cold_root.as_deref() {
         let be = swift_s3api::LocalDirColdBackend::new(root.trim())
             .map_err(|e| format!("cold_backend_root: {e}"))?;
         api = api.with_cold_backend(std::sync::Arc::new(be));
@@ -2920,7 +2984,36 @@ fn build_s3api(conf: &SwiftConfig) -> Result<Option<swift_s3api::S3Api>, String>
         .map(|value| strict_config_bool("cold_delete_hot_after_archive", &value))
         .transpose()?
         .unwrap_or(false);
+    let cold_backend_shared = conf
+        .get("filter:s3api", "cold_backend_shared")
+        .map_err(|e| e.to_string())?
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| strict_config_bool("cold_backend_shared", &value))
+        .transpose()?
+        .unwrap_or(false);
+    if cold_delete_hot_after_archive && !cold_backend_configured {
+        return Err(
+            "cold_delete_hot_after_archive requires a configured cold_backend_root".into(),
+        );
+    }
+    if cold_delete_hot_after_archive && !cold_backend_shared {
+        return Err(
+            "cold_delete_hot_after_archive requires cold_backend_shared=true; node-local cold data is unsafe behind multiple proxies"
+                .into(),
+        );
+    }
     api = api.with_cold_delete_hot_after_archive(cold_delete_hot_after_archive);
+
+    // Same CSV as [filter:account_freeze] / [filter:account-freeze]. Empty list
+    // is already FatalLoad when the freeze arm is built; do not fail or default
+    // AUTH_test here (that would skip s3api as BuildFailure).
+    let freeze_items = account_freeze_conf_items(conf);
+    if let Some(raw) = freeze_items.get("frozen_accounts") {
+        let accounts = swift_core::config::list_from_csv(raw);
+        if !accounts.is_empty() {
+            api = api.with_frozen_accounts(accounts);
+        }
+    }
 
     // EC2 deferral: inline /v3/s3tokens on s3api (does not wait for s3token filter).
     if let Some(uri) = external_s3token {
@@ -4050,13 +4143,31 @@ mod startup_policy_tests {
 
     #[test]
     fn pipeline_s3api_wires_cold_delete_hot_after_archive() {
+        let missing_backend = SwiftConfig::parse_lenient(
+            "[filter:tempauth]\nuser_test_tester = testing .admin\n\
+             [filter:s3api]\ncold_delete_hot_after_archive = true\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(build_s3api(&missing_backend).is_err());
+
+        let dir = std::env::temp_dir().join(format!(
+            "peregrine-cold-hot-delete-config-{}",
+            std::process::id()
+        ));
         let conf = SwiftConfig::parse_lenient(
-            "[pipeline:main]\n\
-             pipeline = catch_errors gatekeeper healthcheck s3api tempauth copy proxy-server\n\
-             [filter:tempauth]\nuser_test_tester = testing .admin\n\
-             [filter:s3api]\n\
-             cold_policy_map = GLACIER:2,HOT:0\n\
-             cold_delete_hot_after_archive = true\n",
+            &format!(
+                "[pipeline:main]\n\
+                 pipeline = catch_errors gatekeeper healthcheck s3api tempauth copy proxy-server\n\
+                 [filter:tempauth]\nuser_test_tester = testing .admin\n\
+                 [filter:s3api]\n\
+                 cold_policy_map = GLACIER:2,HOT:0\n\
+                 cold_backend_root = {}\n\
+                 cold_backend_shared = true\n\
+                 cold_delete_hot_after_archive = true\n",
+                dir.display()
+            ),
             &[],
             false,
         )
@@ -4065,6 +4176,7 @@ mod startup_policy_tests {
             .expect("valid s3api configuration")
             .expect("s3api credentials");
         assert!(api.cold_delete_hot_after_archive);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -4614,6 +4726,211 @@ mod startup_policy_tests {
             assert!(
                 info.get(name).is_none(),
                 "unimplemented filter {name} must not be advertised: {info}"
+            );
+        }
+    }
+
+    fn run_extra_filters(
+        filters: Vec<Arc<dyn swift_middleware::Middleware>>,
+        method: &str,
+        path: &str,
+    ) -> swift_http::Response {
+        let inner: swift_middleware::NextFn =
+            Arc::new(|_| swift_http::Response::with_body(200, b"Some Content".to_vec()));
+        let pipeline = swift_middleware::build_pipeline(filters, inner);
+        let mut response = pipeline(swift_http::Request {
+            method: method.to_string(),
+            path: path.to_string(),
+            query_string: String::new(),
+            headers: swift_http::HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        });
+        response.body.materialize(u64::MAX).unwrap();
+        response
+    }
+
+    fn filter_body(resp: &swift_http::Response) -> &[u8] {
+        match &resp.body {
+            swift_http::Body::Buffered(b) => b,
+            swift_http::Body::Streamed(_) => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn pipeline_account_freeze_auth_test_builds_empty_is_hard_error() {
+        assert!(!DEFAULT_CONFIGURED_FILTERS.contains(&"account_freeze"));
+        assert!(!DEFAULT_CONFIGURED_FILTERS.contains(&"account-freeze"));
+        let pols = policies("[swift-hash]\nswift_hash_path_suffix = test\n");
+        let hash = HashPathConfig::new("", "test").unwrap();
+
+        let good = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck copy account_freeze proxy-server\n\
+             [filter:account_freeze]\n\
+             use = egg:swift#account_freeze\n\
+             frozen_accounts = AUTH_test\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(build_account_freeze(&good).is_ok());
+        assert_eq!(
+            configured_filter_names(&good, false),
+            vec!["copy", "account_freeze"]
+        );
+        let (filters, notes, issues) = build_configured_filters_with_issues(
+            &good,
+            None,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            no_endpoints(),
+            &pols,
+            hash.clone(),
+        );
+        assert!(issues.is_empty(), "issues={issues:?}");
+        assert!(
+            notes.iter().any(|n| n == "account_freeze enabled"),
+            "{notes:?}"
+        );
+        assert_eq!(filters.len(), 2, "copy + last-extra freeze; notes={notes:?}");
+        assert!(!pipeline_start_rejects(&good, &issues));
+        let denied = run_extra_filters(filters.clone(), "PUT", "/v1/AUTH_test/c/o");
+        assert_eq!(denied.status, 403);
+        assert_eq!(filter_body(&denied), b"Account is frozen.");
+        let allowed = run_extra_filters(filters, "PUT", "/v1/AUTH_s3test/c/o");
+        assert_eq!(allowed.status, 200);
+        let info: serde_json::Value =
+            serde_json::from_str(&build_info_json(&good, &good, false, false, false)).unwrap();
+        assert!(
+            info.get("account_freeze").is_none(),
+            "must not advertise account_freeze on /info: {info}"
+        );
+
+        let hyphen = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck account-freeze proxy-server\n\
+             [filter:account-freeze]\nfrozen_accounts = AUTH_test\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(build_account_freeze(&hyphen).is_ok());
+        assert_eq!(
+            configured_filter_names(&hyphen, false),
+            vec!["account_freeze"]
+        );
+
+        let passthrough = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck account_freeze proxy-server\n\
+             [app:proxy-server]\nplugin_default = passthrough\n\
+             [filter:account_freeze]\n\
+             use = egg:swift#account_freeze\n\
+             frozen_accounts = AUTH_test\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let (pt_filters, pt_notes, pt_issues) = build_configured_filters_with_issues(
+            &passthrough,
+            None,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            no_endpoints(),
+            &pols,
+            hash.clone(),
+        );
+        assert!(pt_issues.is_empty(), "issues={pt_issues:?}");
+        assert!(
+            pt_notes.iter().any(|n| n == "account_freeze enabled"),
+            "{pt_notes:?}"
+        );
+        assert!(pt_notes.iter().all(|n| !n.contains("NamedPassthrough")));
+        let pt_denied = run_extra_filters(pt_filters, "GET", "/v1/AUTH_test");
+        assert_eq!(pt_denied.status, 403);
+
+        let section_only = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck copy proxy-server\n\
+             [filter:account_freeze]\nfrozen_accounts = AUTH_test\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(!configured_filter_names(&section_only, false).contains(&"account_freeze"));
+        let (so_filters, so_notes, so_issues) = build_configured_filters_with_issues(
+            &section_only,
+            None,
+            None,
+            None,
+            no_tempurl_keys(),
+            no_sync_keys(),
+            no_endpoints(),
+            &pols,
+            hash.clone(),
+        );
+        assert!(so_issues.is_empty(), "issues={so_issues:?}");
+        assert!(so_notes.iter().all(|n| !n.contains("account_freeze")));
+        assert_eq!(so_filters.len(), 1);
+        let so_pass = run_extra_filters(so_filters, "PUT", "/v1/AUTH_test/c/o");
+        assert_eq!(so_pass.status, 200);
+
+        for empty_body in [
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck account_freeze copy proxy-server\n\
+             [app:proxy-server]\nstrict_pipeline = false\n\
+             [filter:account_freeze]\nfrozen_accounts =\n",
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck account_freeze copy proxy-server\n\
+             [app:proxy-server]\nstrict_pipeline = false\n\
+             [filter:account_freeze]\nuse = egg:swift#account_freeze\n",
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck account-freeze copy proxy-server\n\
+             [app:proxy-server]\nstrict_pipeline = false\n\
+             [filter:account-freeze]\nfrozen_accounts =  ,  , \n",
+        ] {
+            let empty = SwiftConfig::parse_lenient(empty_body, &[], false).unwrap();
+            let err = build_account_freeze(&empty).unwrap_err();
+            assert!(err.contains("empty"), "{err}");
+            assert!(err.contains("fail closed"), "{err}");
+            assert!(!configured_filter_names(&empty, false).contains(&"account_freeze"));
+            assert!(!strict_pipeline_from_conf(&empty));
+            let (filters, notes, issues) = build_configured_filters_with_issues(
+                &empty,
+                None,
+                None,
+                None,
+                no_tempurl_keys(),
+                no_sync_keys(),
+                no_endpoints(),
+                &pols,
+                hash.clone(),
+            );
+            assert!(
+                issues.iter().any(|issue| {
+                    (issue.filter == "account_freeze" || issue.filter == "account-freeze")
+                        && issue.kind == PipelineBuildIssueKind::FatalLoad
+                        && issue.detail.contains("empty")
+                        && issue.detail.contains("fail closed")
+                }),
+                "issues={issues:?}; notes={notes:?}"
+            );
+            assert!(
+                !strict_pipeline_rejects(&empty, &issues),
+                "empty freeze must not rely on strict_pipeline"
+            );
+            assert!(
+                pipeline_start_rejects(&empty, &issues),
+                "empty frozen_accounts must refuse start"
+            );
+            assert_eq!(
+                filters.len(),
+                1,
+                "freeze must not be skipped-as-wired; only copy: {notes:?}"
             );
         }
     }

@@ -1,0 +1,18 @@
+# {{ ansible_managed }}
+# Optional realm-to-cluster mappings for swift-container-sync.
+#
+# [REALM]
+# key = replace-with-a-secret
+# key2 = optional-rotation-secret
+# cluster_NAME = https://swift.example/v1/
+{% for realm in container_sync_realms | default([]) %}
+
+[{{ realm.name }}]
+key = {{ realm.key }}
+{% if realm.key2 | default('') %}
+key2 = {{ realm.key2 }}
+{% endif %}
+{% for cluster in realm.clusters | default([]) %}
+cluster_{{ cluster.name }} = {{ cluster.endpoint }}
+{% endfor %}
+{% endfor %}

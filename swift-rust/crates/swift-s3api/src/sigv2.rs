@@ -37,9 +37,10 @@
 //! Signature = Base64(HMAC-SHA1(SecretAccessKey, UTF-8(StringToSign))).
 
 use sha1::{Digest, Sha1};
-use swift_http::Request;
+use swift_http::{parse_http_date, Request};
 
 use crate::crypto::streq_const_time;
+use crate::sigv4::{parse_amz_date, SigAuthError};
 
 /// Parsed SigV2 auth material.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -360,38 +361,81 @@ pub fn compute_signature_v2(secret: &str, string_to_sign: &str) -> String {
     base64_encode(&dig)
 }
 
+/// Header Date / `X-Amz-Date` used as the V2 signing timestamp.
+///
+/// Experimental: RFC 1123 first, then `YYYYMMDDThhmmssZ`. Not AWS-complete.
+pub fn signing_ts_v2_header(req: &Request) -> Option<i64> {
+    let raw = req
+        .headers
+        .get("X-Amz-Date")
+        .or_else(|| req.headers.get("Date"))?;
+    parse_http_date(raw).or_else(|| parse_amz_date(raw))
+}
+
+/// Clock-skew (header) + query `Expires`. Experimental: not live-proven.
+///
+/// Query `Expires < now` → `AccessDenied` (not `SignatureDoesNotMatch`).
+/// Header `abs(signing_ts - now) > allowable_clock_skew` →
+/// `RequestTimeTooSkewed`. Query auth does **not** reuse `Expires` as a
+/// clock-skew timestamp.
+pub fn check_sigv2_time(
+    req: &Request,
+    now_unix: i64,
+    allowable_clock_skew: u64,
+) -> Result<(), SigAuthError> {
+    let Some(auth) = parse_sigv2_auth(req) else {
+        return Ok(());
+    };
+    if auth.query_auth {
+        if let Some(exp) = auth.expires {
+            if exp < now_unix {
+                return Err(SigAuthError::AccessDenied);
+            }
+        }
+        return Ok(());
+    }
+    if let Some(ts) = signing_ts_v2_header(req) {
+        if ts.abs_diff(now_unix) > allowable_clock_skew {
+            return Err(SigAuthError::RequestTimeTooSkewed);
+        }
+    }
+    Ok(())
+}
+
 /// Verify SigV2 signature against credentials.
 ///
-/// When `now_unix` is `Some`, query auth with `Expires < now` fails.
+/// When `now_unix` is `Some`, query `Expires < now` is `AccessDenied` and
+/// header clock skew is `RequestTimeTooSkewed`. Experimental: not
+/// live-proven. Not AWS-complete.
 pub fn verify_sigv2(
     access_key: &str,
     secret_key: &str,
     req: &Request,
     now_unix: Option<i64>,
-) -> bool {
+    allowable_clock_skew: Option<u64>,
+) -> Result<(), SigAuthError> {
     let auth = match parse_sigv2_auth(req) {
         Some(a) => a,
-        None => return false,
+        None => return Err(SigAuthError::SignatureDoesNotMatch),
     };
     if auth.access_key != access_key {
-        return false;
+        return Err(SigAuthError::SignatureDoesNotMatch);
     }
-    if auth.query_auth {
-        if let Some(exp) = auth.expires {
-            if let Some(now) = now_unix {
-                if exp < now {
-                    return false;
-                }
-            }
-        }
+    if let Some(now) = now_unix {
+        check_sigv2_time(req, now, allowable_clock_skew.unwrap_or(u64::MAX))?;
     }
     let sts = string_to_sign_v2(req, &auth);
     let expected = compute_signature_v2(secret_key, &sts);
     // Clients may URL-encode `+` / `/` in query signatures; compare both raw
     // and a lightly unescaped form.
     let presented = auth.signature.replace(' ', "+");
-    streq_const_time(&expected, &presented)
+    if streq_const_time(&expected, &presented)
         || streq_const_time(&expected, &url_decode_basic(&presented))
+    {
+        Ok(())
+    } else {
+        Err(SigAuthError::SignatureDoesNotMatch)
+    }
 }
 
 fn url_decode_basic(s: &str) -> String {
@@ -438,6 +482,16 @@ mod tests {
     use super::*;
     use swift_http::{Body, HeaderKeyDict};
 
+    fn assert_sig_error_xml_matches_normalize(err: SigAuthError, status: u16) {
+        let resp = crate::response::s3_error_response(err.s3_code(), err.s3_message(), &[]);
+        assert_eq!(resp.status, status, "{}", err.s3_code());
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        let msg = err
+            .s3_message()
+            .unwrap_or(crate::response::error_status_and_message(err.s3_code()).1);
+        crate::response::assert_error_xml_matches_normalize(&body, err.s3_code(), msg);
+    }
+
     // AWS documented SigV2 example (GET Object):
     // https://docs.aws.amazon.com/AmazonS3/latest/userguide/RESTAuthentication.html
     const SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
@@ -478,7 +532,7 @@ mod tests {
         // Attach Authorization and verify end-to-end.
         req.headers
             .set("Authorization", format!("AWS {ACCESS}:{sig}"));
-        assert!(verify_sigv2(ACCESS, SECRET, &req, None));
+        assert_eq!(verify_sigv2(ACCESS, SECRET, &req, None, None), Ok(()));
     }
 
     #[test]
@@ -510,7 +564,10 @@ mod tests {
             "Authorization",
             format!("AWS {ACCESS}:wrongsig============"),
         );
-        assert!(!verify_sigv2(ACCESS, SECRET, &req, None));
+        assert_eq!(
+            verify_sigv2(ACCESS, SECRET, &req, None, None),
+            Err(SigAuthError::SignatureDoesNotMatch)
+        );
     }
 
     #[test]
@@ -533,7 +590,60 @@ mod tests {
         // Rebuild with raw signature in params via header path alternative:
         req.query_string = format!("AWSAccessKeyId={ACCESS}&Expires=100&Signature={sig}");
         // parse may leave + as-is
-        assert!(!verify_sigv2(ACCESS, SECRET, &req, Some(200)));
+        assert_eq!(
+            verify_sigv2(ACCESS, SECRET, &req, Some(200), None),
+            Err(SigAuthError::AccessDenied)
+        );
+    }
+
+    #[test]
+    fn verify_sigv2_header_clock_skew_rejects() {
+        let mut req = aws_vector_req();
+        req.path = "/johnsmith/photos/puppy.jpg".into();
+        let auth = SigV2Auth {
+            access_key: ACCESS.into(),
+            signature: String::new(),
+            query_auth: false,
+            expires: None,
+        };
+        let sts = string_to_sign_v2(&req, &auth);
+        let sig = compute_signature_v2(SECRET, &sts);
+        req.headers
+            .set("Authorization", format!("AWS {ACCESS}:{sig}"));
+        let signed = parse_http_date("Tue, 27 Mar 2007 19:36:42 +0000").unwrap();
+        assert_eq!(
+            verify_sigv2(ACCESS, SECRET, &req, Some(signed + 3600), Some(900)),
+            Err(SigAuthError::RequestTimeTooSkewed)
+        );
+        assert_eq!(
+            verify_sigv2(ACCESS, SECRET, &req, Some(signed), Some(900)),
+            Ok(())
+        );
+        assert_sig_error_xml_matches_normalize(SigAuthError::RequestTimeTooSkewed, 403);
+    }
+
+    #[test]
+    fn verify_sigv2_query_expired_is_access_denied_not_bad_hmac() {
+        let mut req = aws_vector_req();
+        req.path = "/johnsmith/photos/puppy.jpg".into();
+        let auth = SigV2Auth {
+            access_key: ACCESS.into(),
+            signature: String::new(),
+            query_auth: true,
+            expires: Some(100),
+        };
+        let sts = string_to_sign_v2(&req, &auth);
+        let sig = compute_signature_v2(SECRET, &sts);
+        req.query_string = format!("AWSAccessKeyId={ACCESS}&Expires=100&Signature={sig}");
+        assert_eq!(
+            verify_sigv2(ACCESS, SECRET, &req, Some(200), Some(900)),
+            Err(SigAuthError::AccessDenied)
+        );
+        assert_ne!(
+            verify_sigv2(ACCESS, SECRET, &req, Some(200), Some(900)),
+            Err(SigAuthError::SignatureDoesNotMatch)
+        );
+        assert_sig_error_xml_matches_normalize(SigAuthError::AccessDenied, 403);
     }
 
     #[test]

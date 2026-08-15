@@ -13,11 +13,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! S3 bucket/object config subresources stored as Swift container/object meta.
+//! S3 bucket/object config subresources stored as Swift container/object metadata.
 //!
 //! # Claimable (this module + middleware handlers)
-//! * **versioning** GET/PUT — status `Enabled`|`Suspended` in
-//!   [`S3_VERSIONING_META`]; GET returns AWS `VersioningConfiguration` XML.
+//! * **versioning** GET/PUT — status `Enabled`|`Suspended` in protected
+//!   [`S3_VERSIONING_META`] sysmeta; GET returns AWS `VersioningConfiguration`
+//!   XML. The former public-meta key is accepted read-only for migration.
 //! * **tagging** GET/PUT/DELETE on bucket and object — TagSet in
 //!   [`S3_BUCKET_TAGGING_META`] / [`S3_OBJECT_TAGGING_META`]; Tagging XML.
 //! * **lifecycle** GET/PUT/DELETE — raw `LifecycleConfiguration` XML in
@@ -25,8 +26,9 @@
 //! * **lifecycle execution** — see [`crate::lifecycle_exec`]:
 //!   Expiration → `X-Delete-At`; Transition → storage-class meta stamp
 //!   (no tiering backend); AbortIncomplete → `X-Delete-At` on MPU marker.
-//! * **object-lock** GET/PUT — raw `ObjectLockConfiguration` XML in
-//!   [`S3_OBJECT_LOCK_META`].
+//! * **object-lock** GET/PUT — raw `ObjectLockConfiguration` XML in protected
+//!   [`S3_OBJECT_LOCK_META`] sysmeta. The former public-meta key is accepted
+//!   read-only for migration.
 //! * **legal-hold** / **retention** / WORM — see [`crate::object_lock_worm`].
 //! * **versions** list — empty-shell helper; full listing in
 //!   [`crate::versioning_store`] + middleware when versioning is Enabled.
@@ -39,8 +41,11 @@
 use crate::xml::Element;
 use swift_http::HeaderKeyDict;
 
-/// Bucket versioning status (`Enabled` / `Suspended`).
-pub const S3_VERSIONING_META: &str = "X-Container-Meta-S3-Versioning";
+/// Protected bucket versioning status (`Enabled` / `Suspended`).
+pub const S3_VERSIONING_META: &str = "X-Container-Sysmeta-S3-Versioning";
+
+/// Historical public-meta versioning key. Never write this key.
+pub const S3_VERSIONING_LEGACY_META: &str = "X-Container-Meta-S3-Versioning";
 
 /// Compact bucket TagSet encoding (sysmeta — off public container meta listing).
 pub const S3_BUCKET_TAGGING_META: &str = "X-Container-Sysmeta-S3-Tagging";
@@ -51,8 +56,11 @@ pub const S3_OBJECT_TAGGING_META: &str = "X-Object-Sysmeta-S3-Tagging";
 /// Percent-encoded raw LifecycleConfiguration XML.
 pub const S3_LIFECYCLE_META: &str = "X-Container-Meta-S3-Lifecycle";
 
-/// Percent-encoded raw ObjectLockConfiguration XML.
-pub const S3_OBJECT_LOCK_META: &str = "X-Container-Meta-S3-Object-Lock";
+/// Percent-encoded raw ObjectLockConfiguration XML in protected sysmeta.
+pub const S3_OBJECT_LOCK_META: &str = "X-Container-Sysmeta-S3-Object-Lock";
+
+/// Historical public-meta Object Lock key. Never write this key.
+pub const S3_OBJECT_LOCK_LEGACY_META: &str = "X-Container-Meta-S3-Object-Lock";
 
 const TAG_SEP: &str = "||";
 const KV_SEP: char = '\u{1f}';
@@ -131,17 +139,37 @@ pub fn parse_versioning_status(body: &[u8]) -> Result<&'static str, String> {
     Err("MalformedXML".into())
 }
 
-/// Stamp versioning status onto container meta headers.
+/// Stamp versioning status onto protected container sysmeta headers.
+///
+/// The legacy public-meta key is removed from the outbound header map so this
+/// helper can never create or refresh legacy state.
 pub fn apply_versioning_meta(headers: &mut HeaderKeyDict, status: &str) {
+    headers.remove(S3_VERSIONING_LEGACY_META);
     headers.set(S3_VERSIONING_META, status);
 }
 
-/// Read stored versioning status (`Enabled` / `Suspended` / None).
-pub fn versioning_status_from_headers(headers: &HeaderKeyDict) -> Option<String> {
-    headers
-        .get(S3_VERSIONING_META)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+/// Read and strictly validate stored versioning status.
+///
+/// Protected sysmeta always wins when present. A malformed sysmeta value is an
+/// error and never falls back to the legacy public-meta value. Legacy metadata
+/// is accepted only when sysmeta is absent, and is validated just as strictly.
+pub fn versioning_status_from_headers(
+    headers: &HeaderKeyDict,
+) -> Result<Option<String>, String> {
+    if let Some(status) = headers.get(S3_VERSIONING_META) {
+        return validate_stored_versioning_status(status).map(Some);
+    }
+    if let Some(status) = headers.get(S3_VERSIONING_LEGACY_META) {
+        return validate_stored_versioning_status(status).map(Some);
+    }
+    Ok(None)
+}
+
+fn validate_stored_versioning_status(status: &str) -> Result<String, String> {
+    match status {
+        "Enabled" | "Suspended" => Ok(status.to_string()),
+        _ => Err("InvalidVersioningMetadata".to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -295,22 +323,99 @@ pub fn lifecycle_xml_from_headers(headers: &HeaderKeyDict) -> Option<Vec<u8>> {
 
 /// Validate ObjectLockConfiguration body.
 pub fn validate_object_lock_xml(body: &[u8]) -> Result<(), String> {
-    let text = std::str::from_utf8(body).map_err(|_| "MalformedXML".to_string())?;
-    if !text.contains("ObjectLockConfiguration") {
-        return Err("MalformedXML".into());
-    }
-    Ok(())
+    crate::object_lock_worm::parse_object_lock_configuration(body).map(|_| ())
 }
 
-/// Store raw object-lock XML on container meta.
+/// Store raw object-lock XML on protected container sysmeta.
+///
+/// The legacy public-meta key is removed from the outbound header map so this
+/// helper can never create or refresh legacy state.
 pub fn apply_object_lock_meta(headers: &mut HeaderKeyDict, body: &[u8]) {
+    headers.remove(S3_OBJECT_LOCK_LEGACY_META);
     headers.set(S3_OBJECT_LOCK_META, encode_meta_blob(body));
 }
 
-/// Recover stored object-lock XML bytes.
-pub fn object_lock_xml_from_headers(headers: &HeaderKeyDict) -> Option<Vec<u8>> {
-    let raw = headers.get(S3_OBJECT_LOCK_META).filter(|s| !s.is_empty())?;
-    decode_meta_blob(raw).ok()
+/// Recover and validate stored Object Lock XML bytes.
+///
+/// This is a strict API: corrupt persisted security metadata is returned as an
+/// error rather than being confused with an unconfigured bucket.
+pub fn object_lock_xml_from_headers(
+    headers: &HeaderKeyDict,
+) -> Result<Option<Vec<u8>>, String> {
+    validated_object_lock_xml_from_headers(headers)
+}
+
+/// Recover and validate persisted Object Lock configuration.
+///
+/// Protected sysmeta always wins when present. Corrupt sysmeta is an error and
+/// never falls back to the legacy public-meta value. Legacy metadata is
+/// accepted only when sysmeta is absent, and is decoded and validated strictly.
+pub fn validated_object_lock_xml_from_headers(
+    headers: &HeaderKeyDict,
+) -> Result<Option<Vec<u8>>, String> {
+    let raw = if let Some(raw) = headers.get(S3_OBJECT_LOCK_META) {
+        raw
+    } else if let Some(raw) = headers.get(S3_OBJECT_LOCK_LEGACY_META) {
+        raw
+    } else {
+        return Ok(None);
+    };
+    let xml = decode_meta_blob(raw).map_err(|_| "InvalidObjectLockMetadata".to_string())?;
+    validate_object_lock_xml(&xml).map_err(|_| "InvalidObjectLockMetadata".to_string())?;
+    Ok(Some(xml))
+}
+
+// ---------------------------------------------------------------------------
+// Legacy bucket-security metadata migration
+// ---------------------------------------------------------------------------
+
+/// Copy valid legacy versioning/Object Lock state into protected sysmeta.
+///
+/// `source` is normally the container HEAD response and `target` a fresh POST
+/// header map. Only sysmeta is added to `target`; legacy keys are never copied.
+/// Existing sysmeta is validated and takes precedence. Malformed sysmeta fails
+/// closed and is never replaced with a legacy value.
+///
+/// Returns `true` when at least one legacy value was staged for migration.
+pub fn apply_legacy_bucket_security_sysmeta_migration(
+    source: &HeaderKeyDict,
+    target: &mut HeaderKeyDict,
+) -> Result<bool, String> {
+    let versioning_migration = if source.get(S3_VERSIONING_META).is_some() {
+        versioning_status_from_headers(source)?;
+        None
+    } else if source.get(S3_VERSIONING_LEGACY_META).is_some() {
+        Some(
+            versioning_status_from_headers(source)?
+                .ok_or_else(|| "InvalidVersioningMetadata".to_string())?,
+        )
+    } else {
+        None
+    };
+
+    let object_lock_migration = if source.get(S3_OBJECT_LOCK_META).is_some() {
+        validated_object_lock_xml_from_headers(source)?;
+        None
+    } else if source.get(S3_OBJECT_LOCK_LEGACY_META).is_some() {
+        Some(
+            validated_object_lock_xml_from_headers(source)?
+                .ok_or_else(|| "InvalidObjectLockMetadata".to_string())?,
+        )
+    } else {
+        None
+    };
+
+    let changed = versioning_migration.is_some() || object_lock_migration.is_some();
+    target.remove(S3_VERSIONING_LEGACY_META);
+    target.remove(S3_OBJECT_LOCK_LEGACY_META);
+    if let Some(status) = versioning_migration {
+        target.set(S3_VERSIONING_META, status);
+    }
+    if let Some(xml) = object_lock_migration {
+        target.set(S3_OBJECT_LOCK_META, encode_meta_blob(&xml));
+    }
+
+    Ok(changed)
 }
 
 // ---------------------------------------------------------------------------
@@ -385,11 +490,52 @@ mod tests {
     #[test]
     fn versioning_meta_stamp() {
         let mut h = HeaderKeyDict::new();
+        h.set(S3_VERSIONING_LEGACY_META, "Suspended");
         apply_versioning_meta(&mut h, "Enabled");
         assert_eq!(h.get(S3_VERSIONING_META), Some("Enabled"));
+        assert!(h.get(S3_VERSIONING_LEGACY_META).is_none());
         assert_eq!(
-            versioning_status_from_headers(&h).as_deref(),
+            versioning_status_from_headers(&h).unwrap().as_deref(),
             Some("Enabled")
+        );
+    }
+
+    #[test]
+    fn versioning_sysmeta_precedence_and_legacy_read_are_strict() {
+        let mut legacy = HeaderKeyDict::new();
+        legacy.set(S3_VERSIONING_LEGACY_META, "Suspended");
+        assert_eq!(
+            versioning_status_from_headers(&legacy).unwrap().as_deref(),
+            Some("Suspended")
+        );
+
+        let mut preferred = legacy.clone();
+        preferred.set(S3_VERSIONING_LEGACY_META, "not-valid");
+        preferred.set(S3_VERSIONING_META, "Enabled");
+        assert_eq!(
+            versioning_status_from_headers(&preferred)
+                .unwrap()
+                .as_deref(),
+            Some("Enabled")
+        );
+
+        let mut fail_closed = legacy.clone();
+        fail_closed.set(S3_VERSIONING_META, "");
+        assert_eq!(
+            versioning_status_from_headers(&fail_closed),
+            Err("InvalidVersioningMetadata".to_string())
+        );
+        fail_closed.set(S3_VERSIONING_META, "enabled");
+        assert_eq!(
+            versioning_status_from_headers(&fail_closed),
+            Err("InvalidVersioningMetadata".to_string())
+        );
+
+        let mut malformed_legacy = HeaderKeyDict::new();
+        malformed_legacy.set(S3_VERSIONING_LEGACY_META, "Enabled ");
+        assert_eq!(
+            versioning_status_from_headers(&malformed_legacy),
+            Err("InvalidVersioningMetadata".to_string())
         );
     }
 
@@ -456,12 +602,128 @@ mod tests {
 </ObjectLockConfiguration>"#;
         validate_object_lock_xml(body).unwrap();
         let mut h = HeaderKeyDict::new();
+        h.set(S3_OBJECT_LOCK_LEGACY_META, "%GG");
         apply_object_lock_meta(&mut h, body);
-        let got = object_lock_xml_from_headers(&h).unwrap();
+        assert!(h.get(S3_OBJECT_LOCK_LEGACY_META).is_none());
+        let got = object_lock_xml_from_headers(&h).unwrap().unwrap();
         assert_eq!(got, body);
         assert!(std::str::from_utf8(&got)
             .unwrap()
             .contains("ObjectLockEnabled"));
+    }
+
+    #[test]
+    fn object_lock_validation_rejects_ambiguous_or_corrupt_config() {
+        assert!(validate_object_lock_xml(
+            br#"<ObjectLockConfiguration>
+  <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+  <Rule><DefaultRetention>
+    <Mode>GOVERNANCE</Mode><Days>1</Days><Years>1</Years>
+  </DefaultRetention></Rule>
+</ObjectLockConfiguration>"#
+        )
+        .is_err());
+        assert!(validate_object_lock_xml(
+            br#"<ObjectLockConfiguration><ObjectLockEnabled>Disabled</ObjectLockEnabled></ObjectLockConfiguration>"#
+        )
+        .is_err());
+
+        let mut h = HeaderKeyDict::new();
+        h.set(S3_OBJECT_LOCK_META, "%GG");
+        assert_eq!(
+            validated_object_lock_xml_from_headers(&h),
+            Err("InvalidObjectLockMetadata".to_string())
+        );
+        assert_eq!(
+            object_lock_xml_from_headers(&h),
+            Err("InvalidObjectLockMetadata".to_string())
+        );
+    }
+
+    #[test]
+    fn object_lock_sysmeta_precedence_and_legacy_read_are_strict() {
+        let body = br#"<ObjectLockConfiguration>
+  <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+  <Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Days>7</Days></DefaultRetention></Rule>
+</ObjectLockConfiguration>"#;
+        let encoded = encode_meta_blob(body);
+
+        let mut legacy = HeaderKeyDict::new();
+        legacy.set(S3_OBJECT_LOCK_LEGACY_META, &encoded);
+        assert_eq!(
+            object_lock_xml_from_headers(&legacy).unwrap().as_deref(),
+            Some(body.as_slice())
+        );
+
+        let mut preferred = legacy.clone();
+        preferred.set(S3_OBJECT_LOCK_LEGACY_META, "%GG");
+        preferred.set(S3_OBJECT_LOCK_META, &encoded);
+        assert_eq!(
+            validated_object_lock_xml_from_headers(&preferred)
+                .unwrap()
+                .as_deref(),
+            Some(body.as_slice())
+        );
+
+        let mut fail_closed = legacy.clone();
+        fail_closed.set(S3_OBJECT_LOCK_META, "%GG");
+        assert_eq!(
+            validated_object_lock_xml_from_headers(&fail_closed),
+            Err("InvalidObjectLockMetadata".to_string())
+        );
+        fail_closed.set(
+            S3_OBJECT_LOCK_META,
+            encode_meta_blob(b"<ObjectLockConfiguration>"),
+        );
+        assert_eq!(
+            validated_object_lock_xml_from_headers(&fail_closed),
+            Err("InvalidObjectLockMetadata".to_string())
+        );
+    }
+
+    #[test]
+    fn legacy_bucket_security_migration_writes_only_validated_sysmeta() {
+        let lock_body = br#"<ObjectLockConfiguration>
+  <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+  <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Years>2</Years></DefaultRetention></Rule>
+</ObjectLockConfiguration>"#;
+        let mut source = HeaderKeyDict::new();
+        source.set(S3_VERSIONING_LEGACY_META, "Enabled");
+        source.set(
+            S3_OBJECT_LOCK_LEGACY_META,
+            encode_meta_blob(lock_body),
+        );
+        let mut target = HeaderKeyDict::new();
+        target.set(S3_VERSIONING_LEGACY_META, "Suspended");
+        target.set(S3_OBJECT_LOCK_LEGACY_META, "stale");
+
+        assert!(apply_legacy_bucket_security_sysmeta_migration(&source, &mut target).unwrap());
+        assert_eq!(target.get(S3_VERSIONING_META), Some("Enabled"));
+        assert!(target.get(S3_VERSIONING_LEGACY_META).is_none());
+        assert!(target.get(S3_OBJECT_LOCK_LEGACY_META).is_none());
+        assert_eq!(
+            validated_object_lock_xml_from_headers(&target)
+                .unwrap()
+                .as_deref(),
+            Some(lock_body.as_slice())
+        );
+
+        let mut poisoned_source = source.clone();
+        poisoned_source.set(S3_VERSIONING_META, "broken");
+        let mut untouched_target = HeaderKeyDict::new();
+        untouched_target.set(S3_VERSIONING_LEGACY_META, "keep-until-error");
+        assert_eq!(
+            apply_legacy_bucket_security_sysmeta_migration(
+                &poisoned_source,
+                &mut untouched_target,
+            ),
+            Err("InvalidVersioningMetadata".to_string())
+        );
+        assert_eq!(
+            untouched_target.get(S3_VERSIONING_LEGACY_META),
+            Some("keep-until-error")
+        );
+        assert!(untouched_target.get(S3_VERSIONING_META).is_none());
     }
 
     #[test]

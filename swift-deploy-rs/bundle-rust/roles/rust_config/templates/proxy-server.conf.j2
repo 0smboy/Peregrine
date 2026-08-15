@@ -184,6 +184,14 @@ allow_names_in_acls = true
 # location = us-east-1
 # dns_compliant_bucket_names = true
 # storage_domains =
+# enable_extended_subresources = false
+# cold_policy_map = GLACIER:2,HOT:0
+# cold_backend_root = /srv/shared/peregrine-cold
+# cold_backend_shared = false
+# cold_delete_hot_after_archive = false
 # Access key = <account>:<user> from [filter:tempauth] user_* lines;
 # secret = the TempAuth key. Minimal surface: SigV4 + bucket/object CRUD +
-# ListBuckets/ListObjects v1 + GetBucketLocation. Residuals: MPU, ACL, v2 list.
+# ListBuckets/ListObjects, versions, MPU, ACL, lifecycle and Object Lock.
+# Hot-byte reclamation requires both a durable backend and an operator-audited
+# shared mount reachable at the identical path from every proxy. Never set
+# cold_backend_shared=true for a node-local directory.

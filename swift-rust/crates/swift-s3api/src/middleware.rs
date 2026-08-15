@@ -41,10 +41,12 @@
 //!
 //! # Config subresources (meta round-trip — claimable unit surface)
 //!
-//! * **versioning** GET/PUT — `X-Container-Meta-S3-Versioning`
+//! * **versioning** GET/PUT — protected container sysmeta, with strict
+//!   read-only compatibility for the historical public-meta key
 //! * **tagging** GET/PUT/DELETE bucket + object
 //! * **lifecycle** GET/PUT/DELETE — raw XML in container meta
-//! * **object-lock** GET/PUT — raw XML in container meta
+//! * **object-lock** GET/PUT — protected container sysmeta, with strict
+//!   read-only compatibility for the historical public-meta key
 //! * **legal-hold** / **retention** GET/PUT on objects — sysmeta WORM;
 //!   DELETE → `403 AccessDenied` while hold ON or retain-until future.
 //!   PUT may stamp default retention from bucket ObjectLockConfiguration.
@@ -75,8 +77,9 @@
 //! bypassed). Wired on DELETE, overwrite PUT, and multi-delete.
 //!
 //! Other residuals: full IAM identity service / emailAddress grantee
-//! resolution; clock-skew on every path; advertising `s3api` on Swift
-//! `GET /info`. Multipart includes ListMultipartUploads via
+//! resolution; advertising `s3api` on Swift `GET /info`. Clock-skew and
+//! query-expiry checks are **experimental** (not live-proven, not
+//! AWS-complete). Multipart includes ListMultipartUploads via
 //! `{bucket}+segments` upload markers.
 //!
 //! Grant headers (`x-amz-grant-*`) + ACP XML body PUT/GET `?acl` are claimable
@@ -97,7 +100,7 @@
 //! [`S3TokenClient`] (`with_s3token_client`); without a client, unknown keys
 //! still return `InvalidAccessKeyId`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -119,15 +122,20 @@ use crate::bucket_config::{
     apply_bucket_tagging_meta, apply_lifecycle_meta, apply_object_lock_meta,
     apply_object_tagging_meta, apply_versioning_meta, clear_bucket_tagging_meta,
     clear_lifecycle_meta, clear_object_tagging_meta, empty_list_versions_result_xml,
-    lifecycle_xml_from_headers, object_lock_xml_from_headers, parse_tagging_body,
+    lifecycle_xml_from_headers, parse_tagging_body,
     parse_versioning_status, tagging_xml_from_meta, validate_lifecycle_xml,
-    validate_object_lock_xml, versioning_configuration_xml, versioning_status_from_headers,
-    S3_BUCKET_TAGGING_META, S3_OBJECT_TAGGING_META,
+    validate_object_lock_xml, validated_object_lock_xml_from_headers,
+    versioning_configuration_xml, versioning_status_from_headers, S3_BUCKET_TAGGING_META,
+    S3_OBJECT_TAGGING_META,
 };
 use crate::cold_tier::{
-    maybe_stamp_and_archive_due_cold, stamp_cold_restore_meta, ColdBackend,
-    HDR_BACKEND_STORAGE_POLICY_INDEX, SYS_COLD_BACKEND_URI, SYS_COLD_POLICY_INDEX,
-    SYS_HOT_POLICY_INDEX,
+    archive_commit, begin_restore, complete_restore, hot_reclamation_allowed,
+    maybe_stamp_and_archive_due_cold, reject_partial_body, stamp_cold_restore_meta,
+    ColdArchiveReceipt, ColdArchiveState, ColdBackend, ColdStateMachine,
+    COLD_DELETE_HOT_AFTER_ARCHIVE_DEFAULT, HDR_BACKEND_STORAGE_POLICY_INDEX,
+    SYS_COLD_ARCHIVE_GENERATION, SYS_COLD_ARCHIVE_STATE, SYS_COLD_BACKEND_URI,
+    SYS_COLD_CONTENT_LENGTH, SYS_COLD_CONTENT_SHA256, SYS_COLD_POLICY_INDEX,
+    SYS_COLD_RESTORE_GENERATION, SYS_HOT_POLICY_INDEX,
 };
 use crate::delete::parse_multi_delete_body;
 use crate::lifecycle_exec::{
@@ -136,31 +144,42 @@ use crate::lifecycle_exec::{
     transition_blocks_get, META_STORAGE_CLASS, SYS_RESTORE_UNTIL, SYS_TRANSITIONED,
 };
 use crate::mpu::{
-    complete_multipart_xml, initiate_response, list_multipart_uploads_xml, list_parts_xml_full,
-    new_upload_id, parse_complete_body, parse_upload_marker_name, part_object_name,
-    segments_container, slo_manifest_json, upload_marker_name, ListedPart, ListedUpload,
+    aws_multipart_etag, complete_multipart_xml, initiate_response, list_multipart_uploads_xml,
+    list_parts_xml_full, new_upload_id, parse_complete_body, parse_upload_marker_name,
+    part_object_name, segments_container, slo_manifest_json, upload_marker_name, ListedPart,
+    ListedUpload, SYS_S3API_ETAG,
 };
 use crate::object_lock_worm::{
-    apply_amz_object_lock_headers, apply_default_retention_headers, bypass_governance_requested,
-    default_retention_from_lock_xml, legal_hold_xml, parse_legal_hold_body, parse_retention_body,
-    retention_xml, worm_blocks_delete_with_bypass, worm_blocks_retention_put,
-    HDR_BYPASS_GOVERNANCE, SYS_LEGAL_HOLD, SYS_LOCK_MODE, SYS_RETAIN_UNTIL,
+    apply_default_retention_headers, bypass_governance_requested,
+    evaluate_object_version_worm, evaluate_retention_update, legal_hold_xml,
+    object_version_lock_state,
+    parse_bypass_governance_header, parse_legal_hold_body, parse_object_lock_configuration,
+    parse_object_retention, parse_retention_body, retention_date_is_valid_for_put, retention_xml,
+    validate_and_apply_amz_object_lock_headers, GovernanceBypass, RetentionUpdateDecision,
+    RetentionUpdateDenyReason, WormDecision, WormDenyReason, HDR_BYPASS_GOVERNANCE,
+    SYS_LEGAL_HOLD, SYS_LOCK_MODE, SYS_RETAIN_UNTIL,
 };
 use crate::parse::{extract_bucket_and_key, s3_to_swift_path, validate_bucket_name};
 use crate::response::{
     copy_object_result_xml, delete_object_response, delete_result_xml, list_all_my_buckets_xml,
-    put_object_response, s3_error_response, xml_response, BucketInfo, DeleteError,
-    ListBucketResult, ListBucketResultV2, Owner, S3Object,
+    put_object_response, s3_error_response, s3_xml_timestamp, xml_response, BucketInfo,
+    DeleteError, DeletedObject, ListBucketResult, ListBucketResultV2, Owner, S3Object,
 };
 use crate::sigv2::{
-    is_sigv2_auth, parse_sigv2_auth, string_to_sign_for_request_v2, verify_sigv2, SigV2Auth,
+    check_sigv2_time, is_sigv2_auth, parse_sigv2_auth, string_to_sign_for_request_v2, verify_sigv2,
+    SigV2Auth,
 };
-use crate::sigv4::{parse_sigv4_auth, string_to_sign_for_request, verify_sigv4, SigV4Auth};
+use crate::sigv4::{
+    check_sigv4_time, parse_sigv4_auth, string_to_sign_for_request, verify_sigv4, SigAuthError,
+    SigV4Auth,
+};
 use crate::versioning_store::{
-    archive_object_name, bare_etag as vers_bare_etag, generate_version_id, index_object_name,
-    is_delete_marker_header, list_versions_result_xml, versioning_enabled, versions_container,
-    VersionIndex, VersionRecord, HDR_DELETE_MARKER, HDR_VERSION_ID, INDEX_NAME, SYS_DELETE_MARKER,
-    SYS_OBJECT_KEY, SYS_VERSION_ID,
+    archive_object_name, bare_etag as vers_bare_etag, generate_version_id,
+    index_object_name, is_delete_marker_header, is_safe_version_id,
+    list_versions_result_xml, versioning_status, versions_container,
+    CasDenied, RemoveVersionError, VersionIndex, VersionRecord, VersioningStatus,
+    HDR_DELETE_MARKER, HDR_VERSION_ID, INDEX_NAME, NULL_VERSION_ID,
+    SYS_DELETE_MARKER, SYS_OBJECT_KEY, SYS_VERSION_ID,
 };
 use crate::xml::Element;
 
@@ -210,6 +229,10 @@ pub struct S3Api {
     /// Swift account **without** auth override so container `.r:*` can allow
     /// anonymous reads. Multi-tenant deployments must set this explicitly.
     pub anonymous_account: Option<String>,
+    /// Swift accounts that S3 dispatch denies with `403 AccessDenied` XML
+    /// before any local answer, probe, cold stamp, or `next()`. Default empty.
+    /// ListBuckets / no-bucket requests are not denied here.
+    pub frozen_accounts: HashSet<String>,
 }
 
 impl S3Api {
@@ -228,6 +251,7 @@ impl S3Api {
             cold_backend: None,
             cold_delete_hot_after_archive: false,
             anonymous_account: None,
+            frozen_accounts: HashSet::new(),
         }
     }
 
@@ -292,6 +316,41 @@ impl S3Api {
         let a = account.into().trim().to_string();
         self.anonymous_account = if a.is_empty() { None } else { Some(a) };
         self
+    }
+
+    /// Exact Swift-account names. Empty iterator clears the set.
+    pub fn with_frozen_accounts(
+        mut self,
+        accounts: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.frozen_accounts = accounts.into_iter().map(Into::into).collect();
+        self
+    }
+
+    fn is_frozen(&self, account: &str) -> bool {
+        self.frozen_accounts.contains(account)
+    }
+
+    /// Deny every S3 method for a frozen Swift account except ListBuckets /
+    /// service `/` (no bucket). Must run before GetBucketLocation, probes,
+    /// cold, or `next()`. Invalid bucket names are still denied.
+    fn frozen_account_denied(&self, account: &str, req: &Request) -> Option<Response> {
+        if !self.is_frozen(account) {
+            return None;
+        }
+        let (bucket, key) = extract_bucket_and_key(
+            req,
+            &self.storage_domains,
+            self.dns_compliant_bucket_names,
+        );
+        let is_list_buckets = bucket.is_none()
+            && key.is_none()
+            && matches!(req.method.as_str(), "GET" | "HEAD")
+            && (req.path == "/" || req.path.is_empty());
+        if is_list_buckets {
+            return None;
+        }
+        Some(s3_error_response("AccessDenied", None, &[]))
     }
 
     pub fn with_s3token_client(mut self, client: Arc<dyn S3TokenClient>) -> Self {
@@ -577,13 +636,13 @@ fn object_acl_blocks_anonymous(headers: &HeaderKeyDict) -> bool {
         .get(S3_OBJECT_ACL_JSON_META)
         .or_else(|| headers.get("X-Object-Meta-S3-Acl-Json"))
     {
-        if !raw.is_empty() {
-            if let Some(policy) = decode_acl_json(raw) {
-                if !policy.grants.is_empty() {
-                    return !grants_allow_anonymous_read(&policy.grants);
-                }
+        return match decode_acl_json(raw) {
+            Some(policy) if !policy.grants.is_empty() => {
+                !grants_allow_anonymous_read(&policy.grants)
             }
-        }
+            // Malformed / empty JSON ACL: fail closed (deny). Never allow.
+            _ => true,
+        };
     }
     if let Some(canned) = headers.get(S3_OBJECT_ACL_META).filter(|s| !s.is_empty()) {
         return !object_canned_allows_anonymous_read(Some(canned));
@@ -625,6 +684,23 @@ fn stamp_auth(req: &mut Request, cred: &S3Credential) {
     if let Some(tok) = &cred.auth_token {
         req.headers.set("X-Auth-Token", tok);
         req.headers.set("X-Identity-Status", "Confirmed");
+    }
+}
+
+fn s3_auth_error(err: SigAuthError) -> Response {
+    // RequestId is injected by s3_error_xml (Python ErrorResponse._body_iter).
+    s3_error_response(err.s3_code(), err.s3_message(), &[])
+}
+
+/// Experimental: only `STANDARD` is accepted on PUT/copy. Not live-proven.
+/// Not AWS-complete (no Glacier/INTELLIGENT_TIERING). Must run **before**
+/// [`strip_s3_only_headers`] so a non-STANDARD class is not persisted.
+fn reject_unknown_storage_class(req: &Request) -> Option<Response> {
+    let sc = req.headers.get("x-amz-storage-class")?;
+    if sc == "STANDARD" {
+        None
+    } else {
+        Some(s3_error_response("InvalidStorageClass", None, &[]))
     }
 }
 
@@ -775,6 +851,17 @@ fn quote_etag(etag: &str) -> String {
 
 fn bare_etag(etag: &str) -> String {
     etag.trim().trim_matches('"').to_string()
+}
+
+fn apply_s3api_etag_override(resp: &mut Response) {
+    if let Some(v) = resp
+        .headers
+        .get(SYS_S3API_ETAG)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+    {
+        resp.headers.set("ETag", v);
+    }
 }
 
 fn location_constraint_xml(location: &str) -> Vec<u8> {
@@ -1094,6 +1181,7 @@ fn translate_object_success(method: &str, mut resp: Response, is_copy: bool) -> 
         "DELETE" => delete_object_response(),
         "GET" | "HEAD" => {
             // S3 uses 200 for HEAD/GET; quote ETag if present.
+            apply_s3api_etag_override(&mut resp);
             if let Some(etag) = resp.headers.get("ETag").map(str::to_string) {
                 resp.headers.set("ETag", quote_etag(&etag));
             }
@@ -1130,14 +1218,19 @@ fn deny_if_object_acl_blocks_write(
     }
 }
 
+/// S3 GET/HEAD of a cold object (due transition / successful lab archive).
+fn invalid_object_state_response() -> Response {
+    s3_error_response(
+        "InvalidObjectState",
+        Some("The operation is not valid for the object's storage class"),
+        &[],
+    )
+}
+
 fn deny_if_transition_blocks_get(headers: &mut HeaderKeyDict, now: i64) -> Option<Response> {
     apply_due_transition_on_headers(headers, now);
     if transition_blocks_get(headers, now) {
-        Some(s3_error_response(
-            "InvalidObjectState",
-            Some("The operation is not valid for the object's storage class"),
-            &[],
-        ))
+        Some(invalid_object_state_response())
     } else {
         None
     }
@@ -1147,14 +1240,24 @@ fn deny_if_transition_blocks_get(headers: &mut HeaderKeyDict, now: i64) -> Optio
 const MAX_COLD_ARCHIVE_BODY: u64 = MAX_CONTROL_BODY;
 
 /// Headers persisted after due-cold archive (POST meta / optional PUT empty).
+/// PROTOTYPE / DEFAULT OFF / NOT ACCEPTED. Not Glacier.
 const COLD_PERSIST_HEADERS: &[&str] = &[
     META_STORAGE_CLASS,
     SYS_TRANSITIONED,
     SYS_COLD_POLICY_INDEX,
     SYS_HOT_POLICY_INDEX,
     SYS_COLD_BACKEND_URI,
+    SYS_COLD_ARCHIVE_STATE,
+    SYS_COLD_CONTENT_LENGTH,
+    SYS_COLD_CONTENT_SHA256,
+    SYS_COLD_ARCHIVE_GENERATION,
+    SYS_COLD_RESTORE_GENERATION,
+    SYS_RESTORE_UNTIL,
+    SYS_HOT_RECLAIMED,
     HDR_BACKEND_STORAGE_POLICY_INDEX,
 ];
+
+const SYS_HOT_RECLAIMED: &str = "X-Object-Sysmeta-S3-Hot-Reclaimed";
 
 fn copy_cold_persist_headers(src: &HeaderKeyDict, dst: &mut HeaderKeyDict) {
     for hdr in COLD_PERSIST_HEADERS {
@@ -1162,12 +1265,6 @@ fn copy_cold_persist_headers(src: &HeaderKeyDict, dst: &mut HeaderKeyDict) {
             dst.set(hdr, v);
         }
     }
-}
-
-fn archived_uri_from_stamp(stamp: Option<&crate::cold_tier::ColdMetaStamp>) -> Option<&str> {
-    stamp
-        .map(|s| s.backend_uri.as_str())
-        .filter(|u| !u.is_empty())
 }
 
 /// Replace hot body with empty bytes. Call only after a successful archive
@@ -1179,12 +1276,101 @@ fn replace_hot_body_empty(headers: &mut HeaderKeyDict, body: &mut Body) {
     headers.remove("Transfer-Encoding");
 }
 
+fn is_range_or_206_response(status: u16, headers: &HeaderKeyDict) -> bool {
+    status == 206 || headers.get("Content-Range").is_some()
+}
+
+fn parse_cold_generation(headers: &HeaderKeyDict, name: &str) -> u64 {
+    headers.get(name).and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+/// In-process reconstruct. There is no `from_headers` in `cold_tier`.
+/// Receipt stays `None` until `fetch_verified` / `archive_durable` proves Durable.
+fn reconstruct_cold_state_machine(headers: &HeaderKeyDict, now: i64) -> ColdStateMachine {
+    let archive_generation = parse_cold_generation(headers, SYS_COLD_ARCHIVE_GENERATION);
+    let restore_generation = parse_cold_generation(headers, SYS_COLD_RESTORE_GENERATION);
+    let uri = headers.get(SYS_COLD_BACKEND_URI).unwrap_or("");
+    let restore_until = headers
+        .get(SYS_RESTORE_UNTIL)
+        .and_then(|s| s.parse::<i64>().ok());
+    let state = if let Some(until) = restore_until {
+        if now < until || !uri.is_empty() {
+            ColdArchiveState::Restored {
+                restore_until_unix: until,
+            }
+        } else {
+            ColdArchiveState::MetadataOnly
+        }
+    } else if !uri.is_empty() {
+        ColdArchiveState::UnverifiedReference
+    } else {
+        ColdArchiveState::MetadataOnly
+    };
+    ColdStateMachine {
+        state,
+        receipt: None,
+        archive_generation,
+        restore_generation,
+    }
+}
+
+fn persist_cold_object_meta(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    src: &HeaderKeyDict,
+    next: &NextFn,
+) -> Option<Response> {
+    let mut post = make_swift_req(
+        "POST",
+        &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
+    );
+    copy_cold_persist_headers(src, &mut post.headers);
+    stamp_auth(&mut post, cred);
+    let post_resp = next(post);
+    if !(200..300).contains(&post_resp.status) {
+        Some(map_swift_error(post_resp.status, Some(bucket), Some(key)))
+    } else {
+        None
+    }
+}
+
+fn reclaim_hot_object_empty(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    src: &HeaderKeyDict,
+    next: &NextFn,
+) -> Option<Response> {
+    let mut put = make_swift_req(
+        "PUT",
+        &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
+    );
+    copy_cold_persist_headers(src, &mut put.headers);
+    if let Some(ct) = src.get("Content-Type") {
+        put.headers.set("Content-Type", ct);
+    }
+    put.headers.set(SYS_HOT_RECLAIMED, "true");
+    replace_hot_body_empty(&mut put.headers, &mut put.body);
+    stamp_auth(&mut put, cred);
+    let put_resp = next(put);
+    if !(200..300).contains(&put_resp.status) {
+        Some(map_swift_error(put_resp.status, Some(bucket), Some(key)))
+    } else {
+        None
+    }
+}
+
 /// On GET/HEAD success: if a cold transition is due and `cold_map` is set,
 /// stamp cold meta; if `cold_backend` is wired, archive bytes and stamp
 /// [`SYS_COLD_BACKEND_URI`], then POST meta to persist. Without a backend,
-/// meta-only (no URI). When `delete_hot` is true and archive stamped a URI,
-/// overwrite the hot object with an empty body (metadata kept). Errors →
-/// S3 error response (no panic).
+/// meta-only (no URI). Reclaim hot bytes only via [`hot_reclamation_allowed`]
+/// (`delete_hot` from config; conceptual default
+/// [`COLD_DELETE_HOT_AFTER_ARCHIVE_DEFAULT`]). 206 / `Content-Range` bodies
+/// are never archived. Restore window is not re-archived.
+/// A successful due-cold stamp returns 400 InvalidObjectState; persist or
+/// reclaim 5xx after that stamp must not leak `map_swift_error` InternalError.
+/// PROTOTYPE / DEFAULT OFF / NOT ACCEPTED. Not Glacier.
 fn maybe_archive_due_cold_on_get_head(
     resp: &mut Response,
     method: &str,
@@ -1202,17 +1388,51 @@ fn maybe_archive_due_cold_on_get_head(
     let now = unix_now();
     apply_due_transition_on_headers(&mut resp.headers, now);
 
+    let is_range_or_206 = is_range_or_206_response(resp.status, &resp.headers);
+    if reject_partial_body(is_range_or_206).is_err() {
+        // Do not archive a range/206 body, POST a slice URI, or empty-PUT.
+        return None;
+    }
+
     let already_cold_meta = resp.headers.get(SYS_COLD_POLICY_INDEX).is_some();
     let already_uri = resp
         .headers
         .get(SYS_COLD_BACKEND_URI)
         .map(|s| !s.is_empty())
         .unwrap_or(false);
-    // Already stamped (and archived if backend wired) — nothing to persist.
-    if already_cold_meta && (cold_backend.is_none() || already_uri) {
+    let hot_reclaimed = resp
+        .headers
+        .get(SYS_HOT_RECLAIMED)
+        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or(false);
+
+    let mut machine = reconstruct_cold_state_machine(&resp.headers, now);
+    machine = match machine.apply_maybe_rearchive(now, delete_hot) {
+        Ok(m) => m,
+        Err(e) => {
+            return Some(s3_error_response(
+                "InternalError",
+                Some(&format!("cold rearchive failed: {e}")),
+                &[],
+            ));
+        }
+    };
+    if machine.state.is_restore_window() {
         return None;
     }
-    let needs_body = cold_backend.is_some() && !already_uri;
+
+    if already_uri && matches!(machine.state, ColdArchiveState::Durable) {
+        // Expired Restored → Durable metadata only. Do not archive_durable.
+        let prev_agen = parse_cold_generation(&resp.headers, SYS_COLD_ARCHIVE_GENERATION);
+        if machine.archive_generation != prev_agen {
+            machine.stamp_generation_headers(&mut resp.headers);
+            // Persist 5xx must not leak InternalError: object is already cold.
+            let _ = persist_cold_object_meta(cred, bucket, key, &resp.headers, next);
+        }
+        return Some(invalid_object_state_response());
+    }
+
+    let needs_body = cold_backend.is_some() && (!already_uri || (delete_hot && !hot_reclaimed));
 
     let body_owned: Option<Vec<u8>> = if needs_body {
         if method == "GET" {
@@ -1247,6 +1467,10 @@ fn maybe_archive_due_cold_on_get_head(
             let got = next(get);
             if !(200..300).contains(&got.status) {
                 return Some(map_swift_error(got.status, Some(bucket), Some(key)));
+            }
+            if reject_partial_body(is_range_or_206_response(got.status, &got.headers)).is_err()
+            {
+                return None;
             }
             match got.body.into_vec(MAX_COLD_ARCHIVE_BODY) {
                 Ok(b) => Some(b),
@@ -1285,37 +1509,39 @@ fn maybe_archive_due_cold_on_get_head(
     };
     let stamp = stamped?;
 
-    // Persist cold meta (+ URI when archived) onto the object.
-    let mut post = make_swift_req(
-        "POST",
-        &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
-    );
-    copy_cold_persist_headers(&resp.headers, &mut post.headers);
-    stamp_auth(&mut post, cred);
-    let post_resp = next(post);
-    if !(200..300).contains(&post_resp.status) {
-        return Some(map_swift_error(post_resp.status, Some(bucket), Some(key)));
+    if let (Some(receipt), Some(body)) = (stamp.archive_receipt.clone(), body_owned.as_deref()) {
+        match machine.apply_archive_commit(receipt, body, false) {
+            Ok(next_machine) => machine = next_machine,
+            Err(e) => {
+                return Some(s3_error_response(
+                    "InternalError",
+                    Some(&format!("cold archive failed: {e}")),
+                    &[],
+                ));
+            }
+        }
+    }
+    machine.stamp_generation_headers(&mut resp.headers);
+
+    if !already_cold_meta || stamp.archive_receipt.is_some() {
+        // Persist 5xx after a successful stamp must not leak InternalError.
+        let _ = persist_cold_object_meta(cred, bucket, key, &resp.headers, next);
     }
 
-    // Optional lab: drop hot bytes after a successful archive+URI stamp.
-    // Cold copy is untouched so restore_stage still works.
-    if delete_hot && body_owned.is_some() && !stamp.backend_uri.is_empty() {
-        let mut put = make_swift_req(
-            "PUT",
-            &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
-        );
-        copy_cold_persist_headers(&resp.headers, &mut put.headers);
-        if let Some(ct) = resp.headers.get("Content-Type") {
-            put.headers.set("Content-Type", ct);
-        }
-        replace_hot_body_empty(&mut put.headers, &mut put.body);
-        stamp_auth(&mut put, cred);
-        let put_resp = next(put);
-        if !(200..300).contains(&put_resp.status) {
-            return Some(map_swift_error(put_resp.status, Some(bucket), Some(key)));
+    if let Some(body) = body_owned.as_deref() {
+        if hot_reclamation_allowed(
+            machine.state,
+            machine.receipt.as_ref(),
+            body,
+            delete_hot,
+            false,
+        ) {
+            // Reclaim is lab cleanup; archive already succeeded.
+            let _ = reclaim_hot_object_empty(cred, bucket, key, &resp.headers, next);
         }
     }
-    None
+    // Do not fall through to translate_object_get_head / further next() calls.
+    Some(invalid_object_state_response())
 }
 
 /// Anonymous GET/HEAD cannot persist cold meta: this path never `stamp_auth`
@@ -1335,6 +1561,19 @@ fn maybe_stamp_due_cold_on_anonymous_get_head(
     }
     let now = unix_now();
     apply_due_transition_on_headers(&mut resp.headers, now);
+    let is_range_or_206 = is_range_or_206_response(resp.status, &resp.headers);
+    if reject_partial_body(is_range_or_206).is_err() {
+        return;
+    }
+    // Never reclaim on unsigned GET even if the process flag is true.
+    let machine = reconstruct_cold_state_machine(&resp.headers, now);
+    let machine = match machine.apply_maybe_rearchive(now, COLD_DELETE_HOT_AFTER_ARCHIVE_DEFAULT) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    if machine.state.is_restore_window() {
+        return;
+    }
     let _ = maybe_stamp_and_archive_due_cold(
         &mut resp.headers,
         cold_map,
@@ -1349,9 +1588,10 @@ fn maybe_stamp_due_cold_on_anonymous_get_head(
 
 /// On PUT: if lifecycle stamped an immediate cold transition and a lab backend
 /// is wired, archive the put body and stamp [`SYS_COLD_BACKEND_URI`] onto the
-/// outgoing Swift request (persists with the object write). When `delete_hot`
-/// is true and archive stamped a URI, the hot PUT body is replaced with empty
-/// bytes (metadata kept). Cold copy is untouched.
+/// outgoing Swift request (persists with the object write). Reclaim only via
+/// [`hot_reclamation_allowed`] (`delete_hot` from config, default
+/// [`COLD_DELETE_HOT_AFTER_ARCHIVE_DEFAULT`]). A `Content-Range` body is not
+/// archived. PROTOTYPE / DEFAULT OFF / NOT ACCEPTED. Not Glacier.
 fn maybe_archive_due_cold_on_put(
     swift_req: &mut Request,
     cred: &S3Credential,
@@ -1372,6 +1612,27 @@ fn maybe_archive_due_cold_on_put(
         .get(SYS_COLD_BACKEND_URI)
         .map(|s| !s.is_empty())
         .unwrap_or(false);
+    let is_range_put = swift_req.headers.get("Content-Range").is_some();
+    if reject_partial_body(is_range_put).is_err() {
+        let be_ref = cold_backend.map(|a| a.as_ref() as &dyn ColdBackend);
+        return match maybe_stamp_and_archive_due_cold(
+            &mut swift_req.headers,
+            cold_map,
+            now,
+            &cred.account,
+            bucket,
+            key,
+            be_ref,
+            None,
+        ) {
+            Ok(_) => None,
+            Err(e) => Some(s3_error_response(
+                "InternalError",
+                Some(&format!("cold archive failed: {e}")),
+                &[],
+            )),
+        };
+    }
     let needs_body = cold_backend.is_some() && !already_uri;
 
     let body_owned: Option<Vec<u8>> = if needs_body {
@@ -1401,11 +1662,24 @@ fn maybe_archive_due_cold_on_put(
         body_owned.as_deref(),
     ) {
         Ok(stamp) => {
-            if delete_hot
-                && body_owned.is_some()
-                && archived_uri_from_stamp(stamp.as_ref()).is_some()
-            {
-                replace_hot_body_empty(&mut swift_req.headers, &mut swift_req.body);
+            if let (Some(stamp), Some(body)) = (stamp.as_ref(), body_owned.as_deref()) {
+                if let Some(receipt) = stamp.archive_receipt.clone() {
+                    if let Ok(machine) =
+                        ColdStateMachine::new().apply_archive_commit(receipt, body, false)
+                    {
+                        machine.stamp_generation_headers(&mut swift_req.headers);
+                        if hot_reclamation_allowed(
+                            machine.state,
+                            machine.receipt.as_ref(),
+                            body,
+                            delete_hot,
+                            false,
+                        ) {
+                            swift_req.headers.set(SYS_HOT_RECLAIMED, "true");
+                            replace_hot_body_empty(&mut swift_req.headers, &mut swift_req.body);
+                        }
+                    }
+                }
             }
             None
         }
@@ -1441,11 +1715,7 @@ fn translate_object_get_head(method: &str, mut resp: Response, cred: &S3Credenti
 }
 
 fn http_date_to_s3_approx(http_date: &str) -> String {
-    // Best-effort: if already ISO-ish, normalise; else epoch placeholder.
-    if http_date.contains('T') {
-        return swift_ts_to_s3(http_date);
-    }
-    "1970-01-01T00:00:00.000Z".into()
+    s3_xml_timestamp(http_date)
 }
 
 fn translate_bucket_success(method: &str, resp: Response) -> Response {
@@ -1490,12 +1760,21 @@ impl Middleware for S3Api {
             let Some((cred, keystone_verified)) = self.resolve_credential_v2(&auth_v2, &req) else {
                 return s3_error_response("InvalidAccessKeyId", None, &[]);
             };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .ok();
-            if !keystone_verified && !verify_sigv2(&cred.access_key, &cred.secret_key, &req, now) {
-                return s3_error_response("SignatureDoesNotMatch", None, &[]);
+            let now = unix_now();
+            // Time/expiry even when Keystone already checked HMAC.
+            if let Err(err) = check_sigv2_time(&req, now, self.allowable_clock_skew) {
+                return s3_auth_error(err);
+            }
+            if !keystone_verified {
+                if let Err(err) = verify_sigv2(
+                    &cred.access_key,
+                    &cred.secret_key,
+                    &req,
+                    Some(now),
+                    Some(self.allowable_clock_skew),
+                ) {
+                    return s3_auth_error(err);
+                }
             }
             // No aws-chunked for SigV2 (AWS STREAMING is V4-only).
             return self.dispatch_authorized(req, cred, next);
@@ -1513,8 +1792,21 @@ impl Middleware for S3Api {
         // the EC2 secret; local TempAuth keys still need verify_sigv4.
         // Note: for STREAMING-* the payload hash is the STREAMING token itself
         // (not the body), so verify happens *before* dechunk / header rewrite.
-        if !keystone_verified && !verify_sigv4(&cred.access_key, &cred.secret_key, &req) {
-            return s3_error_response("SignatureDoesNotMatch", None, &[]);
+        // Clock-skew / query-expiry run even on the Keystone path.
+        let now = unix_now();
+        if let Err(err) = check_sigv4_time(&req, now, self.allowable_clock_skew) {
+            return s3_auth_error(err);
+        }
+        if !keystone_verified {
+            if let Err(err) = verify_sigv4(
+                &cred.access_key,
+                &cred.secret_key,
+                &req,
+                Some(now),
+                Some(self.allowable_clock_skew),
+            ) {
+                return s3_auth_error(err);
+            }
         }
 
         // aws-chunked / STREAMING-*: dechunk body after header SigV4 verify.
@@ -1531,6 +1823,9 @@ impl Middleware for S3Api {
 impl S3Api {
     /// Shared S3 operation dispatch after auth has succeeded (V2 or V4).
     fn dispatch_authorized(&self, req: Request, cred: S3Credential, next: &NextFn) -> Response {
+        if let Some(denied) = self.frozen_account_denied(&cred.account, &req) {
+            return denied;
+        }
         let params = req.params();
         if let Some(sub) = first_unsupported_subresource(&params) {
             return not_implemented_subresource(sub);
@@ -1543,17 +1838,10 @@ impl S3Api {
                 return s3_error_response("InvalidBucketName", None, &[("BucketName", b)]);
             }
         }
-
-        // Multi-tenant IAM policy gate (when policies attached for principal).
-        if let Some(b) = &bucket {
-            let action = crate::iam::IamService::s3_action(&req.method, key.is_some());
-            let resource = crate::iam::IamService::s3_resource(b, key.as_deref());
-            let principal = self
-                .iam
-                .identity
-                .canonical_id_for_access_key(&cred.access_key);
-            if let Some(false) = self.iam.evaluate(&principal, action, &resource) {
-                return s3_error_response("AccessDenied", Some("IAM policy denied"), &[]);
+        // PUT/copy: unknown x-amz-storage-class must 400 before any persist.
+        if req.method == "PUT" {
+            if let Some(resp) = reject_unknown_storage_class(&req) {
+                return resp;
             }
         }
 
@@ -1578,6 +1866,25 @@ impl S3Api {
         let has_object_lock = params.iter().any(|(k, _)| k == "object-lock");
         let has_legal_hold = params.iter().any(|(k, _)| k == "legal-hold");
         let has_retention = params.iter().any(|(k, _)| k == "retention");
+        let has_restore = params.iter().any(|(k, _)| k == "restore");
+        let version_id_q = params
+            .iter()
+            .find(|(k, _)| k == "versionId")
+            .map(|(_, v)| v.clone());
+        if version_id_q
+            .as_deref()
+            .is_some_and(|version_id| !valid_version_id(version_id))
+        {
+            return s3_error_response("InvalidArgument", None, &[]);
+        }
+        let bypass_requested = match parse_bypass_governance_header(
+            req.headers
+                .get(HDR_BYPASS_GOVERNANCE)
+                .or_else(|| req.headers.get("X-Amz-Bypass-Governance-Retention")),
+        ) {
+            Ok(value) => value,
+            Err(_) => return s3_error_response("InvalidArgument", None, &[]),
+        };
         let has_uploads = params.iter().any(|(k, _)| k == "uploads");
         let upload_id = params
             .iter()
@@ -1588,9 +1895,102 @@ impl S3Api {
             .find(|(k, _)| k == "partNumber")
             .and_then(|(_, v)| v.parse::<u32>().ok());
 
+        // Multi-tenant IAM gate. Subresource and version operations replace
+        // the generic object action; combined version+subresource requests
+        // require every applicable permission.
+        if let Some(bucket) = bucket.as_deref() {
+            let mut actions = Vec::new();
+            if key.is_some() && version_id_q.is_some() {
+                match req.method.as_str() {
+                    "GET" | "HEAD" => actions.push("s3:GetObjectVersion"),
+                    "DELETE" => actions.push("s3:DeleteObjectVersion"),
+                    _ => {}
+                }
+            }
+            if key.is_some() && has_retention {
+                actions.push(if req.method == "PUT" {
+                    "s3:PutObjectRetention"
+                } else {
+                    "s3:GetObjectRetention"
+                });
+            }
+            if key.is_some() && has_legal_hold {
+                actions.push(if req.method == "PUT" {
+                    "s3:PutObjectLegalHold"
+                } else {
+                    "s3:GetObjectLegalHold"
+                });
+            }
+            if key.is_some() && has_restore {
+                actions.push("s3:RestoreObject");
+            }
+            if actions.is_empty() {
+                actions.push(crate::iam::IamService::s3_action(
+                    &req.method,
+                    key.is_some(),
+                ));
+            }
+            let principal = self
+                .iam
+                .identity
+                .canonical_id_for_access_key(&cred.access_key);
+            let resource = crate::iam::IamService::s3_resource(bucket, key.as_deref());
+            if let Some(false) =
+                self.iam
+                    .evaluate_all_actions(&principal, &actions, &resource)
+            {
+                return s3_error_response("AccessDenied", Some("IAM policy denied"), &[]);
+            }
+        }
+
+        if req.method == "PUT" {
+            if let (Some(bucket), Some(key)) = (bucket.as_deref(), key.as_deref()) {
+                let has_retention_headers = req.headers.get("X-Amz-Object-Lock-Mode").is_some()
+                    || req
+                        .headers
+                        .get("X-Amz-Object-Lock-Retain-Until-Date")
+                        .is_some();
+                let has_legal_hold_header =
+                    req.headers.get("X-Amz-Object-Lock-Legal-Hold").is_some();
+                if has_retention_headers || has_legal_hold_header {
+                    if let Err(resp) = require_bucket_object_lock(&cred, bucket, next) {
+                        return resp;
+                    }
+                }
+                if has_retention_headers {
+                    if let Some(denied) = iam_action_check(
+                        &self.iam,
+                        &cred,
+                        "s3:PutObjectRetention",
+                        bucket,
+                        key,
+                    ) {
+                        return denied;
+                    }
+                }
+                if has_legal_hold_header {
+                    if let Some(denied) = iam_action_check(
+                        &self.iam,
+                        &cred,
+                        "s3:PutObjectLegalHold",
+                        bucket,
+                        key,
+                    ) {
+                        return denied;
+                    }
+                }
+            }
+        }
+
         // ---- MultiDelete ----
         if has_delete && req.method == "POST" && bucket.is_some() && key.is_none() {
-            return handle_multi_delete(req, &cred, bucket.as_deref().unwrap(), next);
+            return handle_multi_delete(
+                req,
+                &cred,
+                bucket.as_deref().unwrap(),
+                &self.iam,
+                next,
+            );
         }
 
         // ---- ACL ----
@@ -1637,32 +2037,81 @@ impl S3Api {
 
         // ---- Object legal-hold / retention (WORM sysmeta) ----
         if has_legal_hold && bucket.is_some() && key.is_some() {
+            if req.method == "PUT" {
+                if let Err(resp) =
+                    require_bucket_object_lock(&cred, bucket.as_deref().unwrap(), next)
+                {
+                    return resp;
+                }
+                if let Some(denied) = iam_action_check(
+                    &self.iam,
+                    &cred,
+                    "s3:PutObjectLegalHold",
+                    bucket.as_deref().unwrap(),
+                    key.as_deref().unwrap(),
+                ) {
+                    return denied;
+                }
+            }
             return handle_legal_hold(
                 req,
                 &cred,
                 bucket.as_deref().unwrap(),
                 key.as_deref().unwrap(),
+                version_id_q.as_deref(),
                 next,
             );
         }
         if has_retention && bucket.is_some() && key.is_some() {
+            let retention_bypass = if req.method == "PUT" {
+                match governance_bypass_context(
+                    &self.iam,
+                    &cred,
+                    bucket.as_deref().unwrap(),
+                    key.as_deref().unwrap(),
+                    bypass_requested,
+                ) {
+                    Ok(context) => context,
+                    Err(resp) => return resp,
+                }
+            } else {
+                GovernanceBypass::NONE
+            };
+            if req.method == "PUT" {
+                if let Err(resp) =
+                    require_bucket_object_lock(&cred, bucket.as_deref().unwrap(), next)
+                {
+                    return resp;
+                }
+                if let Some(denied) = iam_action_check(
+                    &self.iam,
+                    &cred,
+                    "s3:PutObjectRetention",
+                    bucket.as_deref().unwrap(),
+                    key.as_deref().unwrap(),
+                ) {
+                    return denied;
+                }
+            }
             return handle_retention(
                 req,
                 &cred,
                 bucket.as_deref().unwrap(),
                 key.as_deref().unwrap(),
+                version_id_q.as_deref(),
+                retention_bypass,
                 next,
             );
         }
 
         // ---- RestoreObject (?restore) — meta stamp + optional lab cold backend ----
-        let has_restore = params.iter().any(|(k, _)| k == "restore");
         if has_restore && bucket.is_some() && key.is_some() {
             return handle_restore(
                 req,
                 &cred,
                 bucket.as_deref().unwrap(),
                 key.as_deref().unwrap(),
+                version_id_q.as_deref(),
                 &self.cold_map,
                 self.cold_backend.as_ref(),
                 next,
@@ -1672,9 +2121,11 @@ impl S3Api {
         // ---- Multipart ----
         if has_uploads && req.method == "POST" && bucket.is_some() && key.is_some() {
             return handle_mpu_init(
+                req,
                 &cred,
                 bucket.as_deref().unwrap(),
                 key.as_deref().unwrap(),
+                self,
                 next,
             );
         }
@@ -1698,7 +2149,7 @@ impl S3Api {
                     }
                 }
                 if req.method == "POST" {
-                    return handle_mpu_complete(&cred, &b, &k, &uid, req, next);
+                    return handle_mpu_complete(&cred, &b, &k, &uid, req, next, self);
                 }
                 if req.method == "DELETE" {
                     return handle_mpu_abort(&cred, &b, &k, &uid, next);
@@ -1711,17 +2162,33 @@ impl S3Api {
 
         let method = req.method.clone();
         let is_copy = req.headers.get("X-Amz-Copy-Source").is_some();
-        let version_id_q = params
-            .iter()
-            .find(|(k, _)| k == "versionId")
-            .map(|(_, v)| v.clone());
-
-        // Multi-version object data plane (Enabled) or explicit ?versionId=.
+        let worm_bypass = if matches!(method.as_str(), "PUT" | "DELETE") {
+            match (bucket.as_deref(), key.as_deref()) {
+                (Some(bucket), Some(key)) => match governance_bypass_context(
+                    &self.iam,
+                    &cred,
+                    bucket,
+                    key,
+                    bypass_requested,
+                ) {
+                    Ok(context) => context,
+                    Err(resp) => return resp,
+                },
+                _ => GovernanceBypass::NONE,
+            }
+        } else {
+            GovernanceBypass::NONE
+        };
+        // Multi-version object data plane (Enabled/Suspended) or explicit
+        // ?versionId=. Suspended writes replace only the null version.
         if let (Some(b), Some(k)) = (bucket.clone(), key.clone()) {
             if matches!(method.as_str(), "PUT" | "GET" | "HEAD" | "DELETE") {
-                let vstatus = probe_bucket_versioning(&cred, &b, next);
-                let enabled = versioning_enabled(vstatus.as_deref());
-                if enabled || version_id_q.is_some() {
+                let vstatus = match probe_bucket_versioning(&cred, &b, next) {
+                    Ok(status) => status,
+                    Err(resp) => return resp,
+                };
+                let versioning_mode = bucket_versioning_mode(vstatus.as_deref());
+                if versioning_mode.is_some() || version_id_q.is_some() {
                     return handle_versioned_object(
                         req,
                         &cred,
@@ -1729,8 +2196,9 @@ impl S3Api {
                         &k,
                         &method,
                         version_id_q.as_deref(),
-                        enabled,
+                        versioning_mode,
                         is_copy,
+                        worm_bypass,
                         next,
                         self,
                     );
@@ -1739,13 +2207,6 @@ impl S3Api {
         }
 
         let for_list = matches!(method.as_str(), "GET" | "HEAD") && key.is_none();
-
-        // Capture bypass before moving req into swift_req.
-        let worm_bypass = bypass_governance_requested(
-            req.headers
-                .get(HDR_BYPASS_GOVERNANCE)
-                .or_else(|| req.headers.get("X-Amz-Bypass-Governance-Retention")),
-        );
 
         let mut swift_req = req;
         let swift_path = s3_to_swift_path(&cred.account, bucket.as_deref(), key.as_deref());
@@ -1780,7 +2241,9 @@ impl S3Api {
         }
         // Explicit x-amz-object-lock-* → sysmeta (before strip removes x-amz-*).
         if method == "PUT" && key.is_some() {
-            apply_amz_object_lock_headers(&mut swift_req.headers);
+            if let Err(resp) = apply_request_object_lock_headers(&mut swift_req.headers) {
+                return resp;
+            }
         }
         strip_s3_only_headers(&mut swift_req.headers);
         stamp_auth(&mut swift_req, &cred);
@@ -1827,7 +2290,11 @@ impl S3Api {
                 ) {
                     return err;
                 }
-                apply_bucket_default_retention(&mut swift_req, &cred, b, next);
+                if let Err(resp) =
+                    apply_bucket_default_retention(&mut swift_req, &cred, b, next)
+                {
+                    return resp;
+                }
             }
         }
 
@@ -1874,6 +2341,9 @@ impl S3Api {
                     let b = bucket.as_deref().unwrap();
                     let k = key.as_deref().unwrap();
                     let mut resp = resp;
+                    if let Some(denied) = deny_if_object_acl_blocks_read(&cred, &resp.headers) {
+                        return denied;
+                    }
                     if let Some(err) = maybe_archive_due_cold_on_get_head(
                         &mut resp,
                         &method,
@@ -1906,6 +2376,9 @@ impl S3Api {
     /// Relies on Swift container ACL (`.r:*` / `.rlistings`) plus object ACL
     /// AllUsers checks when object ACL meta is present.
     fn dispatch_anonymous(&self, req: Request, account: String, next: &NextFn) -> Response {
+        if let Some(denied) = self.frozen_account_denied(&account, &req) {
+            return denied;
+        }
         let params = req.params();
         if let Some(sub) = first_unsupported_subresource(&params) {
             return not_implemented_subresource(sub);
@@ -1920,6 +2393,26 @@ impl S3Api {
         }
         let method = req.method.clone();
         let for_list = matches!(method.as_str(), "GET" | "HEAD") && key.is_none();
+        if let (Some(key), Some(version_id)) = (
+            key.as_deref(),
+            params
+                .iter()
+                .find(|(name, _)| name == "versionId")
+                .map(|(_, value)| value.as_str()),
+        ) {
+            if !valid_version_id(version_id) {
+                return s3_error_response("InvalidArgument", None, &[]);
+            }
+            return handle_anonymous_versioned_get_head(
+                self,
+                &method,
+                &account,
+                &bucket,
+                key,
+                version_id,
+                next,
+            );
+        }
         let mut swift_req = req;
         swift_req.path = s3_to_swift_path(&account, Some(&bucket), key.as_deref());
         if for_list && method == "GET" {
@@ -1985,6 +2478,81 @@ impl S3Api {
     }
 }
 
+fn handle_anonymous_versioned_get_head(
+    api: &S3Api,
+    method: &str,
+    account: &str,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    next: &NextFn,
+) -> Response {
+    // Prove the logical object path is anonymously readable before using the
+    // internal owner identity needed to access the private versions container.
+    // A public missing object returns 404; private TempAuth paths return 401/403.
+    let public_probe = next(make_swift_req(
+        "HEAD",
+        &s3_to_swift_path(account, Some(bucket), Some(key)),
+    ));
+    if !((200..300).contains(&public_probe.status) || public_probe.status == 404) {
+        return map_swift_error(public_probe.status, Some(bucket), Some(key));
+    }
+
+    let internal = S3Credential {
+        access_key: "anonymous-internal-version-reader".into(),
+        secret_key: String::new(),
+        account: account.to_string(),
+        groups: vec![account.to_string()],
+        auth_token: None,
+    };
+    let target = match resolve_object_version(&internal, bucket, key, Some(version_id), next) {
+        Ok(Some(target)) => target,
+        Ok(None) => return missing_object_version_response(key, Some(version_id)),
+        Err(resp) => return resp,
+    };
+    if is_delete_marker_header(target.head.headers.get(SYS_DELETE_MARKER)) {
+        return nosuchkey_delete_marker(key, Some(version_id));
+    }
+
+    let mut resp = if method == "HEAD" {
+        target.head
+    } else {
+        let mut get = make_swift_req(
+            "GET",
+            &s3_to_swift_path(
+                account,
+                Some(&target.container),
+                Some(&target.key),
+            ),
+        );
+        stamp_auth(&mut get, &internal);
+        let got = next(get);
+        if !(200..300).contains(&got.status) {
+            return map_swift_error(got.status, Some(&target.container), Some(&target.key));
+        }
+        got
+    };
+    if object_acl_blocks_anonymous(&resp.headers) {
+        return s3_error_response("AccessDenied", None, &[]);
+    }
+
+    maybe_stamp_due_cold_on_anonymous_get_head(
+        &mut resp,
+        account,
+        &target.container,
+        &target.key,
+        &api.cold_map,
+    );
+    if let Some(denied) = deny_if_transition_blocks_get(&mut resp.headers, unix_now()) {
+        return denied;
+    }
+    let mut out = translate_object_success(method, resp, false);
+    if (200..300).contains(&out.status) {
+        out.headers.set(HDR_VERSION_ID, version_id);
+    }
+    out
+}
+
 fn make_swift_req(method: &str, path: &str) -> Request {
     Request {
         method: method.into(),
@@ -2003,17 +2571,55 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+enum ObjectHead {
+    Present(Response),
+    Missing,
+}
+
+fn control_head_object(
+    cred: &S3Credential,
+    container: &str,
+    key: &str,
+    next: &NextFn,
+) -> Result<ObjectHead, Response> {
+    let mut head = make_swift_req(
+        "HEAD",
+        &s3_to_swift_path(&cred.account, Some(container), Some(key)),
+    );
+    stamp_auth(&mut head, cred);
+    let resp = next(head);
+    if (200..300).contains(&resp.status) {
+        Ok(ObjectHead::Present(resp))
+    } else if resp.status == 404 {
+        Ok(ObjectHead::Missing)
+    } else {
+        Err(map_swift_error(resp.status, Some(container), Some(key)))
+    }
+}
+
+fn worm_guard(headers: &HeaderKeyDict, bypass: GovernanceBypass) -> Option<Response> {
+    match evaluate_object_version_worm(headers, unix_now(), bypass) {
+        WormDecision::Allow => None,
+        WormDecision::Deny(WormDenyReason::InvalidPersistedState(_)) => Some(s3_error_response(
+            "InternalError",
+            Some("object lock metadata is invalid"),
+            &[],
+        )),
+        WormDecision::Deny(_) => Some(s3_error_response("AccessDenied", None, &[])),
+    }
+}
+
 fn worm_check_object(
     cred: &S3Credential,
     bucket: &str,
     key: &str,
-    bypass_governance: bool,
+    bypass: GovernanceBypass,
     next: &NextFn,
 ) -> Option<Response> {
-    if worm_blocks_key(cred, bucket, key, bypass_governance, next) {
-        Some(s3_error_response("AccessDenied", None, &[]))
-    } else {
-        None
+    match control_head_object(cred, bucket, key, next) {
+        Ok(ObjectHead::Missing) => None,
+        Ok(ObjectHead::Present(resp)) => worm_guard(&resp.headers, bypass),
+        Err(resp) => Some(resp),
     }
 }
 
@@ -2025,35 +2631,183 @@ fn acl_write_check_object(
     key: &str,
     next: &NextFn,
 ) -> Option<Response> {
-    let mut head = make_swift_req(
-        "HEAD",
-        &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
-    );
-    stamp_auth(&mut head, cred);
-    let resp = next(head);
-    if !(200..300).contains(&resp.status) {
-        return None;
+    match control_head_object(cred, bucket, key, next) {
+        Ok(ObjectHead::Missing) => None,
+        Ok(ObjectHead::Present(resp)) => deny_if_object_acl_blocks_write(cred, &resp.headers),
+        Err(resp) => Some(resp),
     }
-    deny_if_object_acl_blocks_write(cred, &resp.headers)
 }
 
-fn worm_blocks_key(
+fn iam_action_check(
+    iam: &crate::iam::IamService,
+    cred: &S3Credential,
+    action: &str,
+    bucket: &str,
+    key: &str,
+) -> Option<Response> {
+    let principal = iam.identity.canonical_id_for_access_key(&cred.access_key);
+    let resource = crate::iam::IamService::s3_resource(bucket, Some(key));
+    if let Some(false) = iam.evaluate(&principal, action, &resource) {
+        Some(s3_error_response(
+            "AccessDenied",
+            Some("IAM policy denied"),
+            &[],
+        ))
+    } else {
+        None
+    }
+}
+
+fn iam_action_explicitly_allowed(
+    iam: &crate::iam::IamService,
+    cred: &S3Credential,
+    action: &str,
+    bucket: &str,
+    key: &str,
+) -> bool {
+    let principal = iam.identity.canonical_id_for_access_key(&cred.access_key);
+    let resource = crate::iam::IamService::s3_resource(bucket, Some(key));
+    iam.evaluate(&principal, action, &resource) == Some(true)
+}
+
+fn governance_bypass_context(
+    iam: &crate::iam::IamService,
     cred: &S3Credential,
     bucket: &str,
     key: &str,
-    bypass_governance: bool,
-    next: &NextFn,
-) -> bool {
-    let mut head = make_swift_req(
-        "HEAD",
-        &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
-    );
-    stamp_auth(&mut head, cred);
-    let resp = next(head);
-    if !(200..300).contains(&resp.status) {
-        return false;
+    requested: bool,
+) -> Result<GovernanceBypass, Response> {
+    if !requested {
+        return Ok(GovernanceBypass::NONE);
     }
-    worm_blocks_delete_with_bypass(&resp.headers, unix_now(), bypass_governance)
+    if !iam_action_explicitly_allowed(
+        iam,
+        cred,
+        "s3:BypassGovernanceRetention",
+        bucket,
+        key,
+    ) {
+        return Err(s3_error_response(
+            "AccessDenied",
+            Some("IAM policy denied"),
+            &[],
+        ));
+    }
+    Ok(GovernanceBypass {
+        requested: true,
+        authorized: true,
+    })
+}
+
+fn valid_version_id(version_id: &str) -> bool {
+    version_id == "null"
+        || (version_id.len() == 32
+            && version_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+}
+
+struct ResolvedObjectVersion {
+    container: String,
+    key: String,
+    head: Response,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BucketVersioningMode {
+    Enabled,
+    Suspended,
+}
+
+fn bucket_versioning_mode(status: Option<&str>) -> Option<BucketVersioningMode> {
+    match versioning_status(status) {
+        VersioningStatus::Enabled => Some(BucketVersioningMode::Enabled),
+        VersioningStatus::Suspended => Some(BucketVersioningMode::Suspended),
+        VersioningStatus::Unversioned => None,
+    }
+}
+
+fn resolve_object_version(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    next: &NextFn,
+) -> Result<Option<ResolvedObjectVersion>, Response> {
+    if let Some(version_id) = version_id {
+        if !valid_version_id(version_id) {
+            return Err(s3_error_response("InvalidArgument", None, &[]));
+        }
+    }
+    let current = control_head_object(cred, bucket, key, next)?;
+    match (version_id, current) {
+        (None, ObjectHead::Present(head)) => {
+            return Ok(Some(ResolvedObjectVersion {
+                container: bucket.to_string(),
+                key: key.to_string(),
+                head,
+            }))
+        }
+        (None, ObjectHead::Missing) => return Ok(None),
+        (Some(NULL_VERSION_ID), ObjectHead::Present(head))
+            if matches!(
+                head.headers.get(SYS_VERSION_ID),
+                None | Some("") | Some(NULL_VERSION_ID)
+            ) =>
+        {
+            return Ok(Some(ResolvedObjectVersion {
+                container: bucket.to_string(),
+                key: key.to_string(),
+                head,
+            }));
+        }
+        (Some(version_id), ObjectHead::Present(head))
+            if head.headers.get(SYS_VERSION_ID) == Some(version_id) =>
+        {
+            return Ok(Some(ResolvedObjectVersion {
+                container: bucket.to_string(),
+                key: key.to_string(),
+                head,
+            }));
+        }
+        _ => {}
+    }
+
+    let version_id = version_id.expect("version id was handled above");
+
+    // Hidden archive objects are implementation details, not an independent
+    // source of truth.  Require the version index record before owner-auth
+    // access so a failed archive/promotion cannot resurrect an orphan copy.
+    let index = load_version_index(cred, bucket, key, next)?;
+    if index.find(version_id).is_none() {
+        return Ok(None);
+    }
+    if !is_safe_version_id(version_id) {
+        return Err(unsafe_version_id_error());
+    }
+
+    let container = versions_container(bucket);
+    let archived_key = archive_object_name(key, version_id);
+    match control_head_object(cred, &container, &archived_key, next)? {
+        ObjectHead::Present(head) => Ok(Some(ResolvedObjectVersion {
+            container,
+            key: archived_key,
+            head,
+        })),
+        ObjectHead::Missing => Ok(None),
+    }
+}
+
+fn missing_object_version_response(key: &str, version_id: Option<&str>) -> Response {
+    if let Some(version_id) = version_id.filter(|v| *v != NULL_VERSION_ID) {
+        s3_error_response(
+            "NoSuchVersion",
+            None,
+            &[("Key", key), ("VersionId", version_id)],
+        )
+    } else {
+        s3_error_response("NoSuchKey", None, &[("Key", key)])
+    }
 }
 
 /// HEAD bucket lifecycle meta → stamp Expiration X-Delete-At + Transition meta
@@ -2079,28 +2833,89 @@ fn maybe_apply_lifecycle_on_put(
     );
 }
 
+fn require_bucket_object_lock(
+    cred: &S3Credential,
+    bucket: &str,
+    next: &NextFn,
+) -> Result<(), Response> {
+    let mut head = make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+    stamp_auth(&mut head, cred);
+    let resp = next(head);
+    if !(200..300).contains(&resp.status) {
+        return Err(map_swift_error(resp.status, Some(bucket), None));
+    }
+    match validated_object_lock_xml_from_headers(&resp.headers) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(s3_error_response(
+            "InvalidRequest",
+            Some("Bucket is missing Object Lock Configuration"),
+            &[],
+        )),
+        Err(_) => Err(s3_error_response(
+            "InternalError",
+            Some("bucket object lock metadata is invalid"),
+            &[],
+        )),
+    }
+}
+
 fn apply_bucket_default_retention(
     put_req: &mut Request,
     cred: &S3Credential,
     bucket: &str,
     next: &NextFn,
-) {
+) -> Result<(), Response> {
     if put_req.headers.get(SYS_RETAIN_UNTIL).is_some() {
-        return;
+        return Ok(());
     }
     let mut head = make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
     stamp_auth(&mut head, cred);
     let resp = next(head);
-    if !(200..300).contains(&resp.status) {
-        return;
+    if resp.status == 404 {
+        return Ok(());
     }
-    let Some(xml) = object_lock_xml_from_headers(&resp.headers) else {
-        return;
+    if !(200..300).contains(&resp.status) {
+        return Err(map_swift_error(resp.status, Some(bucket), None));
+    }
+    let xml = validated_object_lock_xml_from_headers(&resp.headers).map_err(|_| {
+        s3_error_response(
+            "InternalError",
+            Some("bucket object lock metadata is invalid"),
+            &[],
+        )
+    })?;
+    let Some(xml) = xml else {
+        return Ok(());
     };
-    let Some(def) = default_retention_from_lock_xml(&xml) else {
-        return;
+    let def = parse_object_lock_configuration(&xml).map_err(|_| {
+        s3_error_response(
+            "InternalError",
+            Some("bucket object lock metadata is invalid"),
+            &[],
+        )
+    })?;
+    let Some(def) = def else {
+        return Ok(());
     };
     apply_default_retention_headers(&mut put_req.headers, &def, unix_now());
+    Ok(())
+}
+
+fn apply_request_object_lock_headers(headers: &mut HeaderKeyDict) -> Result<(), Response> {
+    validate_and_apply_amz_object_lock_headers(headers)
+        .map_err(|_| s3_error_response("InvalidRequest", None, &[]))?;
+    if let (Some(mode), Some(until)) = (
+        headers.get(SYS_LOCK_MODE),
+        headers.get(SYS_RETAIN_UNTIL),
+    ) {
+        let Some(retention) = parse_object_retention(mode, until) else {
+            return Err(s3_error_response("InvalidRequest", None, &[]));
+        };
+        if !retention_date_is_valid_for_put(&retention, unix_now()) {
+            return Err(s3_error_response("InvalidRequest", None, &[]));
+        }
+    }
+    Ok(())
 }
 
 fn handle_legal_hold(
@@ -2108,25 +2923,32 @@ fn handle_legal_hold(
     cred: &S3Credential,
     bucket: &str,
     key: &str,
+    version_id: Option<&str>,
     next: &NextFn,
 ) -> Response {
+    let target = match resolve_object_version(cred, bucket, key, version_id, next) {
+        Ok(Some(target)) => target,
+        Ok(None) => return missing_object_version_response(key, version_id),
+        Err(resp) => return resp,
+    };
+    let acl_denied = if req.method == "PUT" {
+        deny_if_object_acl_blocks_write(cred, &target.head.headers)
+    } else {
+        deny_if_object_acl_blocks_read(cred, &target.head.headers)
+    };
+    if let Some(denied) = acl_denied {
+        return denied;
+    }
     match req.method.as_str() {
         "GET" | "HEAD" => {
-            let mut head = make_swift_req(
-                "HEAD",
-                &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
-            );
-            stamp_auth(&mut head, cred);
-            let resp = next(head);
-            if !(200..300).contains(&resp.status) {
-                return map_swift_error(resp.status, Some(bucket), Some(key));
+            match object_version_lock_state(&target.head.headers) {
+                Ok(state) => xml_ok(legal_hold_xml(state.legal_hold_on)),
+                Err(_) => s3_error_response(
+                    "InternalError",
+                    Some("object lock metadata is invalid"),
+                    &[],
+                ),
             }
-            let on = resp
-                .headers
-                .get(SYS_LEGAL_HOLD)
-                .map(|s| s.eq_ignore_ascii_case("ON") || s.eq_ignore_ascii_case("true") || s == "1")
-                .unwrap_or(false);
-            xml_ok(legal_hold_xml(on))
         }
         "PUT" => {
             let body = match req.body.into_vec(MAX_CONTROL_BODY) {
@@ -2139,7 +2961,11 @@ fn handle_legal_hold(
             };
             let mut post = make_swift_req(
                 "POST",
-                &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
+                &s3_to_swift_path(
+                    &cred.account,
+                    Some(&target.container),
+                    Some(&target.key),
+                ),
             );
             post.headers
                 .set(SYS_LEGAL_HOLD, if on { "ON" } else { "OFF" });
@@ -2148,7 +2974,7 @@ fn handle_legal_hold(
             if (200..300).contains(&resp.status) {
                 Response::new(200)
             } else {
-                map_swift_error(resp.status, Some(bucket), Some(key))
+                map_swift_error(resp.status, Some(&target.container), Some(&target.key))
             }
         }
         _ => s3_error_response("MethodNotAllowed", None, &[]),
@@ -2160,28 +2986,40 @@ fn handle_retention(
     cred: &S3Credential,
     bucket: &str,
     key: &str,
+    version_id: Option<&str>,
+    bypass: GovernanceBypass,
     next: &NextFn,
 ) -> Response {
+    let target = match resolve_object_version(cred, bucket, key, version_id, next) {
+        Ok(Some(target)) => target,
+        Ok(None) => return missing_object_version_response(key, version_id),
+        Err(resp) => return resp,
+    };
+    let acl_denied = if req.method == "PUT" {
+        deny_if_object_acl_blocks_write(cred, &target.head.headers)
+    } else {
+        deny_if_object_acl_blocks_read(cred, &target.head.headers)
+    };
+    if let Some(denied) = acl_denied {
+        return denied;
+    }
     match req.method.as_str() {
         "GET" | "HEAD" => {
-            let mut head = make_swift_req(
-                "HEAD",
-                &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
-            );
-            stamp_auth(&mut head, cred);
-            let resp = next(head);
-            if !(200..300).contains(&resp.status) {
-                return map_swift_error(resp.status, Some(bucket), Some(key));
-            }
-            let mode = resp.headers.get(SYS_LOCK_MODE).map(str::to_string);
-            let until = resp.headers.get(SYS_RETAIN_UNTIL).map(str::to_string);
-            match (mode, until) {
-                (Some(m), Some(u)) if !m.is_empty() && !u.is_empty() => {
-                    xml_ok(retention_xml(&m, &u))
-                }
-                _ => s3_error_response(
-                    "InvalidRequest",
-                    Some("Object is missing retention configuration"),
+            match object_version_lock_state(&target.head.headers) {
+                Ok(state) => match state.retention {
+                    Some(retention) => xml_ok(retention_xml(
+                        retention.mode.as_str(),
+                        &retention.retain_until,
+                    )),
+                    None => s3_error_response(
+                        "InvalidRequest",
+                        Some("Object is missing retention configuration"),
+                        &[],
+                    ),
+                },
+                Err(_) => s3_error_response(
+                    "InternalError",
+                    Some("object lock metadata is invalid"),
                     &[],
                 ),
             }
@@ -2195,54 +3033,62 @@ fn handle_retention(
                 Ok(v) => v,
                 Err(_) => return s3_error_response("MalformedXML", None, &[]),
             };
-            let mode_up = mode.to_ascii_uppercase();
-            if mode_up != "GOVERNANCE" && mode_up != "COMPLIANCE" {
+            let Some(requested) = parse_object_retention(&mode, &until) else {
                 return s3_error_response("MalformedXML", None, &[]);
-            }
-            if crate::object_lock_worm::parse_retain_until(&until).is_none() {
-                return s3_error_response("MalformedXML", None, &[]);
-            }
-            let bypass = bypass_governance_requested(
-                req.headers
-                    .get(HDR_BYPASS_GOVERNANCE)
-                    .or_else(|| req.headers.get("X-Amz-Bypass-Governance-Retention")),
-            );
-            let mut head = make_swift_req(
-                "HEAD",
-                &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
-            );
-            stamp_auth(&mut head, cred);
-            let head_resp = next(head);
-            if (200..300).contains(&head_resp.status)
-                && worm_blocks_retention_put(
-                    &head_resp.headers,
-                    &mode_up,
-                    &until,
-                    unix_now(),
-                    bypass,
-                )
-            {
-                return s3_error_response("AccessDenied", None, &[]);
+            };
+            match evaluate_retention_update(
+                &target.head.headers,
+                &requested,
+                unix_now(),
+                bypass,
+            ) {
+                RetentionUpdateDecision::Allow => {}
+                RetentionUpdateDecision::Deny(
+                    RetentionUpdateDenyReason::InvalidPersistedState(_),
+                ) => {
+                    return s3_error_response(
+                        "InternalError",
+                        Some("object lock metadata is invalid"),
+                        &[],
+                    )
+                }
+                RetentionUpdateDecision::Deny(RetentionUpdateDenyReason::InvalidRequest) => {
+                    return s3_error_response("InvalidRequest", None, &[])
+                }
+                RetentionUpdateDecision::Deny(_) => {
+                    return s3_error_response("AccessDenied", None, &[])
+                }
             }
             let mut post = make_swift_req(
                 "POST",
-                &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
+                &s3_to_swift_path(
+                    &cred.account,
+                    Some(&target.container),
+                    Some(&target.key),
+                ),
             );
-            post.headers.set(SYS_LOCK_MODE, mode_up);
-            post.headers.set(SYS_RETAIN_UNTIL, until);
+            post.headers.set(SYS_LOCK_MODE, requested.mode.as_str());
+            post.headers
+                .set(SYS_RETAIN_UNTIL, &requested.retain_until);
             stamp_auth(&mut post, cred);
             let resp = next(post);
             if (200..300).contains(&resp.status) {
                 Response::new(200)
             } else {
-                map_swift_error(resp.status, Some(bucket), Some(key))
+                map_swift_error(resp.status, Some(&target.container), Some(&target.key))
             }
         }
         _ => s3_error_response("MethodNotAllowed", None, &[]),
     }
 }
 
-fn handle_multi_delete(req: Request, cred: &S3Credential, bucket: &str, next: &NextFn) -> Response {
+fn handle_multi_delete(
+    req: Request,
+    cred: &S3Credential,
+    bucket: &str,
+    iam: &crate::iam::IamService,
+    next: &NextFn,
+) -> Response {
     let body = match req.body.into_vec(MAX_CONTROL_BODY) {
         Ok(b) => b,
         Err(_) => return s3_error_response("IncompleteBody", None, &[]),
@@ -2251,35 +3097,130 @@ fn handle_multi_delete(req: Request, cred: &S3Credential, bucket: &str, next: &N
         Ok(p) => p,
         Err(_) => return s3_error_response("MalformedXML", None, &[]),
     };
-    let bypass = bypass_governance_requested(
+    if parsed.objects.len() > 1000 {
+        return s3_error_response("MalformedXML", None, &[]);
+    }
+    let bypass_requested = match parse_bypass_governance_header(
         req.headers
             .get(HDR_BYPASS_GOVERNANCE)
             .or_else(|| req.headers.get("X-Amz-Bypass-Governance-Retention")),
-    );
+    ) {
+        Ok(value) => value,
+        Err(_) => return s3_error_response("InvalidArgument", None, &[]),
+    };
+    let versioning_mode = match probe_bucket_versioning(cred, bucket, next) {
+        Ok(status) => bucket_versioning_mode(status.as_deref()),
+        Err(resp) => return resp,
+    };
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
-    for key in &parsed.keys {
-        if worm_blocks_key(cred, bucket, key, bypass, next) {
+    for object in &parsed.objects {
+        let key = &object.key;
+        if object
+            .version_id
+            .as_deref()
+            .is_some_and(|version_id| !valid_version_id(version_id))
+        {
             errors.push(DeleteError {
                 key: key.clone(),
+                version_id: object.version_id.clone(),
+                code: "InvalidArgument".into(),
+                message: "Invalid Argument.".into(),
+            });
+            continue;
+        }
+        let action = if object.version_id.is_some() {
+            "s3:DeleteObjectVersion"
+        } else {
+            "s3:DeleteObject"
+        };
+        if iam_action_check(iam, cred, action, bucket, key).is_some() {
+            errors.push(DeleteError {
+                key: key.clone(),
+                version_id: object.version_id.clone(),
                 code: "AccessDenied".into(),
                 message: "Access Denied.".into(),
             });
             continue;
         }
-        let mut del = make_swift_req(
-            "DELETE",
-            &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
-        );
-        stamp_auth(&mut del, cred);
-        let resp = next(del);
-        if (200..300).contains(&resp.status) || resp.status == 404 {
-            deleted.push(key.clone());
+        let bypass = match governance_bypass_context(
+            iam,
+            cred,
+            bucket,
+            key,
+            bypass_requested,
+        ) {
+            Ok(context) => context,
+            Err(_) => {
+                errors.push(DeleteError {
+                    key: key.clone(),
+                    version_id: object.version_id.clone(),
+                    code: "AccessDenied".into(),
+                    message: "Access Denied.".into(),
+                });
+                continue;
+            }
+        };
+
+        let resp = if versioning_mode.is_some() || object.version_id.is_some() {
+            handle_versioned_delete(
+                cred,
+                bucket,
+                key,
+                object.version_id.as_deref(),
+                match versioning_mode {
+                    Some(BucketVersioningMode::Suspended) if object.version_id.is_none() => {
+                        Some(NULL_VERSION_ID)
+                    }
+                    _ => None,
+                },
+                bypass,
+                next,
+            )
         } else {
+            if let Some(blocked) = worm_check_object(cred, bucket, key, bypass, next) {
+                blocked
+            } else if let Some(blocked) = acl_write_check_object(cred, bucket, key, next) {
+                blocked
+            } else {
+                let mut del = make_swift_req(
+                    "DELETE",
+                    &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
+                );
+                stamp_auth(&mut del, cred);
+                next(del)
+            }
+        };
+        if (200..300).contains(&resp.status) || resp.status == 404 {
+            let delete_marker = resp.headers.get(HDR_DELETE_MARKER) == Some("true");
+            let response_version = resp.headers.get(HDR_VERSION_ID).map(str::to_string);
+            deleted.push(DeletedObject {
+                key: key.clone(),
+                version_id: object.version_id.clone(),
+                delete_marker,
+                delete_marker_version_id: delete_marker.then(|| {
+                    response_version
+                        .clone()
+                        .or_else(|| object.version_id.clone())
+                        .unwrap_or_else(|| NULL_VERSION_ID.to_string())
+                }),
+            });
+        } else {
+            let (code, message) = if matches!(resp.status, 401 | 403) {
+                ("AccessDenied", "Access Denied.".to_string())
+            } else if resp.status == 400 {
+                ("InvalidArgument", "Invalid Argument.".to_string())
+            } else {
+                (
+                    "InternalError",
+                    format!("backend status {}", resp.status),
+                )
+            };
             errors.push(DeleteError {
                 key: key.clone(),
-                code: "InternalError".into(),
-                message: format!("backend status {}", resp.status),
+                version_id: object.version_id.clone(),
+                code: code.into(),
+                message,
             });
         }
     }
@@ -2372,7 +3313,11 @@ fn handle_acl(
                 stamp_auth(&mut post, cred);
                 let resp = next(post);
                 if (200..300).contains(&resp.status) {
-                    Response::new(200)
+                    // Python `AclController.PUT` bucket: Location = container_name.
+                    // Runner `put-bucket-acl-private` header rule is exact-bucket.
+                    let mut out = Response::new(200);
+                    out.headers.set("Location", bucket);
+                    out
                 } else {
                     map_swift_error(resp.status, Some(bucket), None)
                 }
@@ -2436,8 +3381,14 @@ fn handle_versioning(req: Request, cred: &S3Credential, bucket: &str, next: &Nex
             if !(200..300).contains(&resp.status) {
                 return map_swift_error(resp.status, Some(bucket), None);
             }
-            let status = versioning_status_from_headers(&resp.headers);
-            xml_ok(versioning_configuration_xml(status.as_deref()))
+            match versioning_status_from_headers(&resp.headers) {
+                Ok(status) => xml_ok(versioning_configuration_xml(status.as_deref())),
+                Err(_) => s3_error_response(
+                    "InternalError",
+                    Some("bucket versioning metadata is invalid"),
+                    &[],
+                ),
+            }
         }
         "PUT" => {
             let body = match req.body.into_vec(MAX_CONTROL_BODY) {
@@ -2448,6 +3399,32 @@ fn handle_versioning(req: Request, cred: &S3Credential, bucket: &str, next: &Nex
                 Ok(s) => s,
                 Err(_) => return s3_error_response("MalformedXML", None, &[]),
             };
+            if status == "Suspended" {
+                let mut head =
+                    make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+                stamp_auth(&mut head, cred);
+                let current = next(head);
+                if !(200..300).contains(&current.status) {
+                    return map_swift_error(current.status, Some(bucket), None);
+                }
+                match validated_object_lock_xml_from_headers(&current.headers) {
+                    Ok(Some(_)) => {
+                        return s3_error_response(
+                            "InvalidBucketState",
+                            Some("Object Lock requires versioning to remain enabled"),
+                            &[],
+                        )
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        return s3_error_response(
+                            "InternalError",
+                            Some("bucket object lock metadata is invalid"),
+                            &[],
+                        )
+                    }
+                }
+            }
             let mut post =
                 make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
             apply_versioning_meta(&mut post.headers, status);
@@ -2467,24 +3444,124 @@ fn handle_versioning(req: Request, cred: &S3Credential, bucket: &str, next: &Nex
 // Multi-version object data plane
 // ---------------------------------------------------------------------------
 
-fn probe_bucket_versioning(cred: &S3Credential, bucket: &str, next: &NextFn) -> Option<String> {
+fn probe_bucket_versioning(
+    cred: &S3Credential,
+    bucket: &str,
+    next: &NextFn,
+) -> Result<Option<String>, Response> {
     let mut head = make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
     stamp_auth(&mut head, cred);
     let resp = next(head);
-    if !(200..300).contains(&resp.status) {
-        return None;
+    if resp.status == 404 {
+        return Ok(None);
     }
-    versioning_status_from_headers(&resp.headers)
+    if !(200..300).contains(&resp.status) {
+        return Err(map_swift_error(resp.status, Some(bucket), None));
+    }
+    versioning_status_from_headers(&resp.headers).map_err(|_| {
+        s3_error_response(
+            "InternalError",
+            Some("bucket versioning metadata is invalid"),
+            &[],
+        )
+    })
 }
 
-fn ensure_versions_container(cred: &S3Credential, bucket: &str, next: &NextFn) {
+fn ensure_versions_container(
+    cred: &S3Credential,
+    bucket: &str,
+    next: &NextFn,
+) -> Result<(), Response> {
     let vc = versions_container(bucket);
     let mut put = make_swift_req("PUT", &s3_to_swift_path(&cred.account, Some(&vc), None));
     stamp_auth(&mut put, cred);
-    let _ = next(put);
+    let resp = next(put);
+    if (200..300).contains(&resp.status) {
+        Ok(())
+    } else {
+        Err(map_swift_error(resp.status, Some(&vc), None))
+    }
 }
 
-fn load_version_index(cred: &S3Credential, bucket: &str, key: &str, next: &NextFn) -> VersionIndex {
+fn swift_write_applied(status: u16) -> bool {
+    (200..300).contains(&status) && status != 202
+}
+
+fn version_index_persist_conflict() -> Response {
+    s3_error_response(
+        "InternalError",
+        Some("version index persist conflict"),
+        &[],
+    )
+}
+
+fn cas_denied_response(_denied: CasDenied) -> Response {
+    s3_error_response(
+        "InternalError",
+        Some("version index generation mismatch"),
+        &[],
+    )
+}
+
+fn unsafe_version_id_error() -> Response {
+    s3_error_response(
+        "InternalError",
+        Some("object version id is unsafe"),
+        &[],
+    )
+}
+
+fn version_index_lost_update() -> Response {
+    s3_error_response(
+        "InternalError",
+        Some("version index lost update"),
+        &[],
+    )
+}
+
+/// Same three-arm check as [`VersionIndex::apply_if_match`].
+fn check_index_generation(idx: &VersionIndex, expect: Option<u64>) -> Result<(), CasDenied> {
+    match expect {
+        Some(g) if g == idx.generation => Ok(()),
+        None if idx.generation == 0 => Ok(()),
+        Some(_) => Err(CasDenied::Mismatch),
+        None => Err(CasDenied::MissingExpected),
+    }
+}
+
+fn archive_name_checked(key: &str, version_id: &str) -> Result<String, Response> {
+    if !is_safe_version_id(version_id) {
+        return Err(unsafe_version_id_error());
+    }
+    Ok(archive_object_name(key, version_id))
+}
+
+/// Load-time view of `{hex}/index.json`. `exists` is GET 2xx, not 404.
+/// `etag` is the Swift object ETag (bare), never [`VersionIndex::cas_etag`].
+/// In-process generation only — not a distributed CAS coordinator.
+struct VersionIndexSnapshot {
+    index: VersionIndex,
+    exists: bool,
+    etag: Option<String>,
+}
+
+fn expect_generation(snap: &VersionIndexSnapshot) -> Option<u64> {
+    // Legacy index.json has no `generation` field → from_json sets 0.
+    // apply_if_match(None, _) is only legal on first create. A 2xx load
+    // must pass Some(0) or two writers both treat a live index as new.
+    if snap.exists {
+        Some(snap.index.generation)
+    } else {
+        None
+    }
+}
+
+fn load_version_index_snapshot(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    next: &NextFn,
+) -> Result<VersionIndexSnapshot, Response> {
     let vc = versions_container(bucket);
     let iname = index_object_name(key);
     let mut get = make_swift_req(
@@ -2493,21 +3570,54 @@ fn load_version_index(cred: &S3Credential, bucket: &str, key: &str, next: &NextF
     );
     stamp_auth(&mut get, cred);
     let resp = next(get);
-    if !(200..300).contains(&resp.status) {
-        return VersionIndex::new(key);
+    if resp.status == 404 {
+        return Ok(VersionIndexSnapshot {
+            index: VersionIndex::new(key),
+            exists: false,
+            etag: None,
+        });
     }
-    let body = resp.body.into_vec(MAX_CONTROL_BODY).unwrap_or_default();
-    VersionIndex::from_json(&body).unwrap_or_else(|| VersionIndex::new(key))
+    if !(200..300).contains(&resp.status) {
+        return Err(map_swift_error(resp.status, Some(&vc), Some(&iname)));
+    }
+    let etag = resp
+        .headers
+        .get("ETag")
+        .map(vers_bare_etag)
+        .filter(|s| !s.is_empty());
+    let body = resp.body.into_vec(MAX_CONTROL_BODY).map_err(|_| {
+        s3_error_response("InternalError", Some("version index is too large"), &[])
+    })?;
+    let index = VersionIndex::from_json(&body)
+        .filter(|index| index.key == key)
+        .ok_or_else(|| {
+            s3_error_response("InternalError", Some("version index is invalid"), &[])
+        })?;
+    Ok(VersionIndexSnapshot {
+        index,
+        exists: true,
+        etag,
+    })
 }
 
-fn save_version_index(
+fn load_version_index(
     cred: &S3Credential,
     bucket: &str,
     key: &str,
+    next: &NextFn,
+) -> Result<VersionIndex, Response> {
+    Ok(load_version_index_snapshot(cred, bucket, key, next)?.index)
+}
+
+fn cas_save_version_index(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    snap: &VersionIndexSnapshot,
     idx: &VersionIndex,
     next: &NextFn,
-) {
-    ensure_versions_container(cred, bucket, next);
+) -> Result<(), Response> {
+    ensure_versions_container(cred, bucket, next)?;
     let vc = versions_container(bucket);
     let iname = index_object_name(key);
     let body = idx.to_json();
@@ -2518,9 +3628,48 @@ fn save_version_index(
     put.headers.set("Content-Length", body.len().to_string());
     put.headers.set("Content-Type", "application/json");
     put.headers.set(SYS_OBJECT_KEY, key);
+    // Swift body ETag from GET. Do not send cas_etag() as If-Match
+    // (object-server compares If-Match to MD5, not sha256(gen||latest||key)).
+    // Header is a no-op until object-server honors If-Match. Persist 202 is
+    // the proxy remap of object-server 409 — not Applied. Not distributed CAS.
+    if snap.exists {
+        if let Some(etag) = snap.etag.as_deref() {
+            put.headers.set("If-Match", etag);
+        }
+    } else {
+        put.headers.set("If-None-Match", "*");
+    }
     put.body = Body::from(body);
     stamp_auth(&mut put, cred);
-    let _ = next(put);
+    let resp = next(put);
+    if swift_write_applied(resp.status) {
+        Ok(())
+    } else if resp.status == 202 || resp.status == 412 {
+        Err(version_index_persist_conflict())
+    } else {
+        Err(map_swift_error(resp.status, Some(&vc), Some(&iname)))
+    }
+}
+
+fn copy_version_payload_headers(src: &HeaderKeyDict, dst: &mut HeaderKeyDict) {
+    for (name, value) in src.iter() {
+        let lower = name.to_ascii_lowercase();
+        if lower.starts_with("x-object-meta-")
+            || lower.starts_with("x-object-sysmeta-")
+            || matches!(
+                lower.as_str(),
+                "content-type"
+                    | "content-encoding"
+                    | "content-disposition"
+                    | "content-language"
+                    | "cache-control"
+                    | "expires"
+                    | "content-length"
+            )
+        {
+            dst.set(name, value);
+        }
+    }
 }
 
 fn archive_current_version(
@@ -2529,35 +3678,149 @@ fn archive_current_version(
     key: &str,
     version_id: &str,
     next: &NextFn,
-) {
-    ensure_versions_container(cred, bucket, next);
+) -> Result<(), Response> {
+    let vc = versions_container(bucket);
+    let mut ensure = make_swift_req(
+        "PUT",
+        &s3_to_swift_path(&cred.account, Some(&vc), None),
+    );
+    stamp_auth(&mut ensure, cred);
+    let ensure_resp = next(ensure);
+    if !(200..300).contains(&ensure_resp.status) {
+        return Err(map_swift_error(ensure_resp.status, Some(&vc), None));
+    }
+
     let cur_path = s3_to_swift_path(&cred.account, Some(bucket), Some(key));
     let mut get = make_swift_req("GET", &cur_path);
     stamp_auth(&mut get, cred);
     let got = next(get);
     if !(200..300).contains(&got.status) {
-        return;
+        return Err(map_swift_error(got.status, Some(bucket), Some(key)));
     }
-    let ctype = got
-        .headers
-        .get("Content-Type")
-        .unwrap_or("application/octet-stream")
-        .to_string();
-    let body = got.body.into_vec(u64::MAX).unwrap_or_default();
-    let vc = versions_container(bucket);
-    let aname = archive_object_name(key, version_id);
+    let aname = archive_name_checked(key, version_id)?;
     let mut put = make_swift_req(
         "PUT",
         &s3_to_swift_path(&cred.account, Some(&vc), Some(&aname)),
     );
-    put.headers.set("Content-Length", body.len().to_string());
-    put.headers.set("Content-Type", &ctype);
+    copy_version_payload_headers(&got.headers, &mut put.headers);
     put.headers.set(SYS_VERSION_ID, version_id);
     put.headers.set(SYS_OBJECT_KEY, key);
-    put.headers.set(SYS_DELETE_MARKER, "false");
-    put.body = Body::from(body);
+    if put.headers.get(SYS_DELETE_MARKER).is_none() {
+        put.headers.set(SYS_DELETE_MARKER, "false");
+    }
+    put.headers.set("If-None-Match", "*");
+    put.body = got.body;
     stamp_auth(&mut put, cred);
-    let _ = next(put);
+    let stored = next(put);
+    if swift_write_applied(stored.status) {
+        Ok(())
+    } else if stored.status == 202 {
+        Err(s3_error_response(
+            "InternalError",
+            Some("backend write was not applied"),
+            &[],
+        ))
+    } else {
+        Err(map_swift_error(stored.status, Some(&vc), Some(&aname)))
+    }
+}
+
+fn archived_null_replacement_required(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    bypass: GovernanceBypass,
+    next: &NextFn,
+) -> Result<bool, Response> {
+    let vc = versions_container(bucket);
+    let aname = archive_name_checked(key, NULL_VERSION_ID)?;
+    match control_head_object(cred, &vc, &aname, next)? {
+        ObjectHead::Missing => Ok(false),
+        ObjectHead::Present(head) => {
+            if let Some(blocked) = worm_guard(&head.headers, bypass) {
+                return Err(blocked);
+            }
+            if let Some(blocked) = deny_if_object_acl_blocks_write(cred, &head.headers) {
+                return Err(blocked);
+            }
+            Ok(true)
+        }
+    }
+}
+
+fn delete_archived_version_copy(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    next: &NextFn,
+) -> Result<(), Response> {
+    let vc = versions_container(bucket);
+    let aname = archive_name_checked(key, version_id)?;
+    let mut del = make_swift_req(
+        "DELETE",
+        &s3_to_swift_path(&cred.account, Some(&vc), Some(&aname)),
+    );
+    stamp_auth(&mut del, cred);
+    let deleted = next(del);
+    if swift_write_applied(deleted.status) || deleted.status == 404 {
+        Ok(())
+    } else if deleted.status == 202 {
+        Err(s3_error_response(
+            "InternalError",
+            Some("backend write was not applied"),
+            &[],
+        ))
+    } else {
+        Err(map_swift_error(deleted.status, Some(&vc), Some(&aname)))
+    }
+}
+
+fn promote_archived_version(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    next: &NextFn,
+) -> Result<(), Response> {
+    let vc = versions_container(bucket);
+    let aname = archive_name_checked(key, version_id)?;
+    let mut get = make_swift_req(
+        "GET",
+        &s3_to_swift_path(&cred.account, Some(&vc), Some(&aname)),
+    );
+    stamp_auth(&mut get, cred);
+    let archived = next(get);
+    if !(200..300).contains(&archived.status) {
+        return Err(map_swift_error(archived.status, Some(&vc), Some(&aname)));
+    }
+
+    let mut put = make_swift_req(
+        "PUT",
+        &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
+    );
+    copy_version_payload_headers(&archived.headers, &mut put.headers);
+    put.headers.set(SYS_VERSION_ID, version_id);
+    put.headers.set(SYS_OBJECT_KEY, key);
+    put.body = archived.body;
+    stamp_auth(&mut put, cred);
+    let stored = next(put);
+    if !swift_write_applied(stored.status) {
+        return Err(if stored.status == 202 {
+            s3_error_response(
+                "InternalError",
+                Some("backend write was not applied"),
+                &[],
+            )
+        } else {
+            map_swift_error(stored.status, Some(bucket), Some(key))
+        });
+    }
+
+    // Promotion moves the archived copy back to the current slot. Keeping the
+    // hidden duplicate would let a later exact-version delete find and revive
+    // a version that had already been removed.
+    delete_archived_version_copy(cred, bucket, key, version_id, next)
 }
 
 fn handle_versioned_object(
@@ -2567,22 +3830,161 @@ fn handle_versioned_object(
     key: &str,
     method: &str,
     version_id_q: Option<&str>,
-    enabled: bool,
+    versioning_mode: Option<BucketVersioningMode>,
     is_copy: bool,
+    bypass: GovernanceBypass,
     next: &NextFn,
     api: &S3Api,
 ) -> Response {
-    if !enabled {
-        let vid = version_id_q.unwrap_or("");
-        return s3_error_response("NoSuchVersion", None, &[("Key", key), ("VersionId", vid)]);
+    if versioning_mode.is_none() && version_id_q.is_none() {
+        return s3_error_response("InvalidRequest", None, &[]);
     }
     match method {
-        "PUT" => handle_versioned_put(req, cred, bucket, key, is_copy, next),
+        "PUT" if version_id_q.is_none() => {
+            let version_id = match versioning_mode {
+                Some(BucketVersioningMode::Enabled) => None,
+                Some(BucketVersioningMode::Suspended) => Some(NULL_VERSION_ID),
+                None => return s3_error_response("InvalidRequest", None, &[]),
+            };
+            handle_versioned_put(
+                req,
+                cred,
+                bucket,
+                key,
+                is_copy,
+                None,
+                version_id,
+                bypass,
+                next,
+                api,
+            )
+        }
+        "PUT" => s3_error_response("InvalidArgument", None, &[]),
         "GET" | "HEAD" => {
             handle_versioned_get_head(cred, bucket, key, method, version_id_q, next, api)
         }
-        "DELETE" => handle_versioned_delete(cred, bucket, key, version_id_q, next),
+        "DELETE" => handle_versioned_delete(
+            cred,
+            bucket,
+            key,
+            version_id_q,
+            match versioning_mode {
+                Some(BucketVersioningMode::Suspended) if version_id_q.is_none() => {
+                    Some(NULL_VERSION_ID)
+                }
+                _ => None,
+            },
+            bypass,
+            next,
+        ),
         _ => s3_error_response("MethodNotAllowed", None, &[]),
+    }
+}
+
+fn current_object_version_id(headers: &HeaderKeyDict) -> Result<String, Response> {
+    let old_vid = headers
+        .get(SYS_VERSION_ID)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| NULL_VERSION_ID.to_string());
+    if !is_safe_version_id(&old_vid) {
+        return Err(unsafe_version_id_error());
+    }
+    Ok(old_vid)
+}
+
+fn maybe_archive_current_for_write(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    cur: &Response,
+    overwrite_null: bool,
+    bypass: GovernanceBypass,
+    idx: &mut VersionIndex,
+    next: &NextFn,
+) -> Result<(), Response> {
+    let old_vid = current_object_version_id(&cur.headers)?;
+    let old_etag = cur
+        .headers
+        .get("ETag")
+        .map(vers_bare_etag)
+        .unwrap_or_default();
+    let old_size = cur
+        .headers
+        .get("Content-Length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0i64);
+    let old_lm = cur
+        .headers
+        .get("Last-Modified")
+        .map(http_date_to_s3_approx)
+        .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
+    let old_is_delete_marker = is_delete_marker_header(cur.headers.get(SYS_DELETE_MARKER));
+    if overwrite_null && old_vid == NULL_VERSION_ID {
+        if let Some(blocked) = worm_guard(&cur.headers, bypass) {
+            return Err(blocked);
+        }
+        return Ok(());
+    }
+    archive_current_version(cred, bucket, key, &old_vid, next)?;
+    if idx.find(&old_vid).is_none() {
+        // Repair-insert of the current vid is not its own generation.
+        idx.push_latest(VersionRecord {
+            version_id: old_vid,
+            is_delete_marker: old_is_delete_marker,
+            is_latest: true,
+            last_modified: old_lm,
+            etag: old_etag,
+            size: old_size,
+        });
+    }
+    Ok(())
+}
+
+fn commit_new_version_record(
+    idx: &mut VersionIndex,
+    expect: Option<u64>,
+    overwrite_null: bool,
+    rec: VersionRecord,
+) -> Result<(), Response> {
+    if overwrite_null {
+        check_index_generation(idx, expect).map_err(cas_denied_response)?;
+        idx.suspended_put_overwrites_null(rec);
+        idx.generation = idx.generation.saturating_add(1);
+        Ok(())
+    } else {
+        idx.apply_if_match(expect, rec)
+            .map_err(cas_denied_response)
+    }
+}
+
+fn stamp_object_write_precondition(headers: &mut HeaderKeyDict, current: Option<&Response>) {
+    match current {
+        Some(cur) => {
+            if let Some(etag) = cur
+                .headers
+                .get("ETag")
+                .map(vers_bare_etag)
+                .filter(|s| !s.is_empty())
+            {
+                headers.set("If-Match", etag);
+            }
+        }
+        None => {
+            headers.set("If-None-Match", "*");
+        }
+    }
+}
+
+fn backend_write_not_applied(status: u16, bucket: Option<&str>, key: Option<&str>) -> Response {
+    if status == 202 {
+        s3_error_response(
+            "InternalError",
+            Some("backend write was not applied"),
+            &[],
+        )
+    } else {
+        map_swift_error(status, bucket, key)
     }
 }
 
@@ -2592,59 +3994,70 @@ fn handle_versioned_put(
     bucket: &str,
     key: &str,
     is_copy: bool,
+    backend_query: Option<&str>,
+    fixed_version_id: Option<&str>,
+    bypass: GovernanceBypass,
     next: &NextFn,
+    api: &S3Api,
 ) -> Response {
+    let snap = match load_version_index_snapshot(cred, bucket, key, next) {
+        Ok(snap) => snap,
+        Err(resp) => return resp,
+    };
+    let expect = expect_generation(&snap);
+    let mut idx = snap.index.clone();
+
     let cur_path = s3_to_swift_path(&cred.account, Some(bucket), Some(key));
     let mut head = make_swift_req("HEAD", &cur_path);
     stamp_auth(&mut head, cred);
     let cur = next(head);
 
-    let mut idx = load_version_index(cred, bucket, key, next);
+    // Suspended still writes (versioning_enabled("Suspended") is false).
+    let overwrite_null = fixed_version_id == Some(NULL_VERSION_ID)
+        && VersioningStatus::Suspended.suspended_put_overwrites_null();
+    let archived_null_exists = if overwrite_null {
+        match archived_null_replacement_required(cred, bucket, key, bypass, next) {
+            Ok(exists) => exists,
+            Err(resp) => return resp,
+        }
+    } else {
+        false
+    };
 
-    if (200..300).contains(&cur.status)
-        && !is_delete_marker_header(cur.headers.get(SYS_DELETE_MARKER))
-    {
-        let old_vid = cur
-            .headers
-            .get(SYS_VERSION_ID)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(generate_version_id);
-        let old_etag = cur
-            .headers
-            .get("ETag")
-            .map(vers_bare_etag)
-            .unwrap_or_default();
-        let old_size = cur
-            .headers
-            .get("Content-Length")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0i64);
-        let old_lm = cur
-            .headers
-            .get("Last-Modified")
-            .map(http_date_to_s3_approx)
-            .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
-
-        archive_current_version(cred, bucket, key, &old_vid, next);
-
-        if idx.find(&old_vid).is_none() {
-            idx.push_latest(VersionRecord {
-                version_id: old_vid,
-                is_delete_marker: false,
-                is_latest: true,
-                last_modified: old_lm,
-                etag: old_etag,
-                size: old_size,
-            });
+    if !(200..300).contains(&cur.status) && cur.status != 404 {
+        return map_swift_error(cur.status, Some(bucket), Some(key));
+    }
+    let current_exists = (200..300).contains(&cur.status);
+    if current_exists {
+        if let Some(blocked) = deny_if_object_acl_blocks_write(cred, &cur.headers) {
+            return blocked;
+        }
+        if let Err(resp) = maybe_archive_current_for_write(
+            cred,
+            bucket,
+            key,
+            &cur,
+            overwrite_null,
+            bypass,
+            &mut idx,
+            next,
+        ) {
+            return resp;
         }
     }
 
-    let new_vid = generate_version_id();
+    let new_vid = if overwrite_null {
+        NULL_VERSION_ID.to_string()
+    } else {
+        generate_version_id()
+    };
+    if !is_safe_version_id(&new_vid) {
+        return unsafe_version_id_error();
+    }
 
     req.method = "PUT".into();
     req.path = cur_path;
-    req.query_string.clear();
+    req.query_string = backend_query.unwrap_or("").to_string();
     map_amz_meta(&mut req);
     apply_copy_source(&mut req);
     match resolve_acl_put_input(&req.headers, None, &cred.access_key) {
@@ -2654,14 +4067,41 @@ fn handle_versioned_put(
         Ok(_) => {}
         Err(_) => return s3_error_response("InvalidArgument", None, &[]),
     }
+    if let Err(resp) = apply_request_object_lock_headers(&mut req.headers) {
+        return resp;
+    }
     strip_s3_only_headers(&mut req.headers);
     req.headers.set(SYS_VERSION_ID, &new_vid);
     req.headers.set(SYS_DELETE_MARKER, "false");
     stamp_auth(&mut req, cred);
 
+    maybe_apply_lifecycle_on_put(&mut req, cred, bucket, key, next);
+    if let Some(err) = maybe_archive_due_cold_on_put(
+        &mut req,
+        cred,
+        bucket,
+        key,
+        &api.cold_map,
+        api.cold_backend.as_ref(),
+        api.cold_delete_hot_after_archive,
+    ) {
+        return err;
+    }
+    if let Err(resp) = apply_bucket_default_retention(&mut req, cred, bucket, next) {
+        return resp;
+    }
+    stamp_object_write_precondition(&mut req.headers, current_exists.then_some(&cur));
+
     let resp = next(req);
-    if !(200..300).contains(&resp.status) {
-        return map_swift_error(resp.status, Some(bucket), Some(key));
+    if !swift_write_applied(resp.status) {
+        return backend_write_not_applied(resp.status, Some(bucket), Some(key));
+    }
+    if archived_null_exists {
+        if let Err(resp) =
+            delete_archived_version_copy(cred, bucket, key, NULL_VERSION_ID, next)
+        {
+            return resp;
+        }
     }
 
     let etag = resp
@@ -2680,15 +4120,24 @@ fn handle_versioned_put(
         .map(http_date_to_s3_approx)
         .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
 
-    idx.push_latest(VersionRecord {
-        version_id: new_vid.clone(),
-        is_delete_marker: false,
-        is_latest: true,
-        last_modified: lm,
-        etag: etag.clone(),
-        size,
-    });
-    save_version_index(cred, bucket, key, &idx, next);
+    if let Err(resp) = commit_new_version_record(
+        &mut idx,
+        expect,
+        overwrite_null,
+        VersionRecord {
+            version_id: new_vid.clone(),
+            is_delete_marker: false,
+            is_latest: true,
+            last_modified: lm,
+            etag: etag.clone(),
+            size,
+        },
+    ) {
+        return resp;
+    }
+    if let Err(resp) = cas_save_version_index(cred, bucket, key, &snap, &idx, next) {
+        return resp;
+    }
 
     if is_copy {
         let iso = resp
@@ -2706,9 +4155,11 @@ fn handle_versioned_put(
     }
 }
 
-/// Auth-present versioned GET/HEAD: archive+POST (optional hot-delete) then
-/// ACL / InvalidObjectState. `persist_bucket`/`persist_key` are the Swift
-/// object the POST targets (current object or `{bucket}+versions` archive).
+/// Auth-present versioned GET/HEAD: ACL, then archive+POST (optional
+/// hot-delete). A successful due-cold stamp returns 400 InvalidObjectState
+/// from the helper and must not fall through to `map_swift_error`.
+/// `persist_bucket`/`persist_key` are the Swift object the POST targets
+/// (current object or `{bucket}+versions` archive).
 fn finish_versioned_get_head(
     mut resp: Response,
     method: &str,
@@ -2719,6 +4170,9 @@ fn finish_versioned_get_head(
     next: &NextFn,
     api: &S3Api,
 ) -> Response {
+    if let Some(denied) = deny_if_object_acl_blocks_read(cred, &resp.headers) {
+        return denied;
+    }
     if let Some(err) = maybe_archive_due_cold_on_get_head(
         &mut resp,
         method,
@@ -2750,98 +4204,48 @@ fn handle_versioned_get_head(
     next: &NextFn,
     api: &S3Api,
 ) -> Response {
-    let cur_path = s3_to_swift_path(&cred.account, Some(bucket), Some(key));
-
-    if let Some(vid) = version_id_q {
-        if vid == "null" {
-            let mut op = make_swift_req(method, &cur_path);
-            stamp_auth(&mut op, cred);
-            let resp = next(op);
-            if (200..300).contains(&resp.status) {
-                if is_delete_marker_header(resp.headers.get(SYS_DELETE_MARKER)) {
-                    return nosuchkey_delete_marker(key, resp.headers.get(SYS_VERSION_ID));
-                }
-                return finish_versioned_get_head(resp, method, cred, bucket, key, None, next, api);
-            }
-            return map_swift_error(resp.status, Some(bucket), Some(key));
-        }
-
-        let mut head = make_swift_req("HEAD", &cur_path);
-        stamp_auth(&mut head, cred);
-        let cur = next(head);
-        if (200..300).contains(&cur.status) && cur.headers.get(SYS_VERSION_ID) == Some(vid) {
-            if is_delete_marker_header(cur.headers.get(SYS_DELETE_MARKER)) {
-                return nosuchkey_delete_marker(key, Some(vid));
-            }
-            if method == "HEAD" {
-                return finish_versioned_get_head(
-                    cur,
-                    method,
-                    cred,
-                    bucket,
-                    key,
-                    Some(vid),
-                    next,
-                    api,
-                );
-            }
-            let mut get = make_swift_req("GET", &cur_path);
-            stamp_auth(&mut get, cred);
-            let resp = next(get);
-            if (200..300).contains(&resp.status) {
-                return finish_versioned_get_head(
-                    resp,
-                    method,
-                    cred,
-                    bucket,
-                    key,
-                    Some(vid),
-                    next,
-                    api,
-                );
-            }
-            return map_swift_error(resp.status, Some(bucket), Some(key));
-        }
-
-        let vc = versions_container(bucket);
-        let aname = archive_object_name(key, vid);
-        let mut op = make_swift_req(
-            method,
-            &s3_to_swift_path(&cred.account, Some(&vc), Some(&aname)),
+    let target = match resolve_object_version(cred, bucket, key, version_id_q, next) {
+        Ok(Some(target)) => target,
+        Ok(None) => return missing_object_version_response(key, version_id_q),
+        Err(resp) => return resp,
+    };
+    let response_version = version_id_q
+        .map(str::to_string)
+        .or_else(|| target.head.headers.get(SYS_VERSION_ID).map(str::to_string));
+    if is_delete_marker_header(target.head.headers.get(SYS_DELETE_MARKER)) {
+        return nosuchkey_delete_marker(key, response_version.as_deref());
+    }
+    let resp = if method == "HEAD" {
+        target.head
+    } else {
+        let mut get = make_swift_req(
+            "GET",
+            &s3_to_swift_path(
+                &cred.account,
+                Some(&target.container),
+                Some(&target.key),
+            ),
         );
-        stamp_auth(&mut op, cred);
-        let resp = next(op);
-        if (200..300).contains(&resp.status) {
-            if is_delete_marker_header(resp.headers.get(SYS_DELETE_MARKER)) {
-                return nosuchkey_delete_marker(key, Some(vid));
-            }
-            return finish_versioned_get_head(
-                resp,
-                method,
-                cred,
-                &vc,
-                &aname,
-                Some(vid),
-                next,
-                api,
-            );
+        stamp_auth(&mut get, cred);
+        let resp = next(get);
+        if !(200..300).contains(&resp.status) {
+            return map_swift_error(resp.status, Some(&target.container), Some(&target.key));
         }
-        return s3_error_response("NoSuchVersion", None, &[("Key", key), ("VersionId", vid)]);
-    }
-
-    let mut op = make_swift_req(method, &cur_path);
-    stamp_auth(&mut op, cred);
-    let resp = next(op);
-    if !(200..300).contains(&resp.status) {
-        return map_swift_error(resp.status, Some(bucket), Some(key));
-    }
-    if is_delete_marker_header(resp.headers.get(SYS_DELETE_MARKER)) {
-        return nosuchkey_delete_marker(key, resp.headers.get(SYS_VERSION_ID));
-    }
-    let mut out = finish_versioned_get_head(resp, method, cred, bucket, key, None, next, api);
+        resp
+    };
+    let mut out = finish_versioned_get_head(
+        resp,
+        method,
+        cred,
+        &target.container,
+        &target.key,
+        response_version.as_deref(),
+        next,
+        api,
+    );
     if (200..300).contains(&out.status) {
-        if let Some(vid) = out.headers.get(SYS_VERSION_ID).map(str::to_string) {
-            out.headers.set(HDR_VERSION_ID, &vid);
+        if let Some(version_id) = response_version {
+            out.headers.set(HDR_VERSION_ID, version_id);
         }
     }
     out
@@ -2861,123 +4265,190 @@ fn handle_versioned_delete(
     bucket: &str,
     key: &str,
     version_id_q: Option<&str>,
+    fixed_delete_marker_id: Option<&str>,
+    bypass: GovernanceBypass,
     next: &NextFn,
 ) -> Response {
     let cur_path = s3_to_swift_path(&cred.account, Some(bucket), Some(key));
 
     if let Some(vid) = version_id_q {
-        if vid == "null" {
-            let mut del = make_swift_req("DELETE", &cur_path);
-            stamp_auth(&mut del, cred);
-            let resp = next(del);
-            if (200..300).contains(&resp.status) || resp.status == 404 {
+        let target = match resolve_object_version(cred, bucket, key, Some(vid), next) {
+            Ok(Some(target)) => target,
+            Ok(None) => {
                 let mut r = delete_object_response();
-                r.headers.set(HDR_VERSION_ID, "null");
+                r.headers.set(HDR_VERSION_ID, vid);
                 return r;
             }
-            return map_swift_error(resp.status, Some(bucket), Some(key));
+            Err(resp) => return resp,
+        };
+        if let Some(blocked) = worm_guard(&target.head.headers, bypass) {
+            return blocked;
+        }
+        if let Some(blocked) = deny_if_object_acl_blocks_write(cred, &target.head.headers) {
+            return blocked;
         }
 
-        let mut head = make_swift_req("HEAD", &cur_path);
-        stamp_auth(&mut head, cred);
-        let cur = next(head);
-        let mut idx = load_version_index(cred, bucket, key, next);
+        let was_delete_marker =
+            is_delete_marker_header(target.head.headers.get(SYS_DELETE_MARKER));
+        let target_is_current = target.container == bucket && target.key == key;
+        let snap = match load_version_index_snapshot(cred, bucket, key, next) {
+            Ok(snap) => snap,
+            Err(resp) => return resp,
+        };
+        let expect = expect_generation(&snap);
+        let mut idx = snap.index.clone();
+        if let Err(denied) = check_index_generation(&idx, expect) {
+            return cas_denied_response(denied);
+        }
+        let next_version = match idx.remove_version_checked(vid) {
+            Ok(next) => next,
+            Err(RemoveVersionError::Missing) => return version_index_lost_update(),
+        };
 
-        if (200..300).contains(&cur.status) && cur.headers.get(SYS_VERSION_ID) == Some(vid) {
-            let mut del = make_swift_req("DELETE", &cur_path);
-            stamp_auth(&mut del, cred);
-            let _ = next(del);
-            idx.remove_version(vid);
-            save_version_index(cred, bucket, key, &idx, next);
-            let mut r = delete_object_response();
-            r.headers.set(HDR_VERSION_ID, vid);
-            if is_delete_marker_header(cur.headers.get(SYS_DELETE_MARKER)) {
-                r.headers.set(HDR_DELETE_MARKER, "true");
+        if target_is_current {
+            if let Some(next_version) = next_version.as_deref() {
+                if !is_safe_version_id(next_version) {
+                    return unsafe_version_id_error();
+                }
+                if let Err(resp) = promote_archived_version(cred, bucket, key, next_version, next)
+                {
+                    return resp;
+                }
+            } else {
+                let mut del = make_swift_req("DELETE", &cur_path);
+                stamp_object_write_precondition(&mut del.headers, Some(&target.head));
+                stamp_auth(&mut del, cred);
+                let resp = next(del);
+                if !swift_write_applied(resp.status) && resp.status != 404 {
+                    return backend_write_not_applied(resp.status, Some(bucket), Some(key));
+                }
             }
-            return r;
+        } else {
+            let mut del = make_swift_req("DELETE", &cur_path);
+            del.path = s3_to_swift_path(
+                &cred.account,
+                Some(&target.container),
+                Some(&target.key),
+            );
+            stamp_object_write_precondition(&mut del.headers, Some(&target.head));
+            stamp_auth(&mut del, cred);
+            let resp = next(del);
+            if !swift_write_applied(resp.status) && resp.status != 404 {
+                return backend_write_not_applied(
+                    resp.status,
+                    Some(&target.container),
+                    Some(&target.key),
+                );
+            }
         }
 
-        let vc = versions_container(bucket);
-        let aname = archive_object_name(key, vid);
-        let mut del = make_swift_req(
-            "DELETE",
-            &s3_to_swift_path(&cred.account, Some(&vc), Some(&aname)),
-        );
-        stamp_auth(&mut del, cred);
-        let resp = next(del);
-        if (200..300).contains(&resp.status) || resp.status == 404 {
-            idx.remove_version(vid);
-            save_version_index(cred, bucket, key, &idx, next);
-            let mut r = delete_object_response();
-            r.headers.set(HDR_VERSION_ID, vid);
-            return r;
+        idx.generation = idx.generation.saturating_add(1);
+        if let Err(resp) = cas_save_version_index(cred, bucket, key, &snap, &idx, next) {
+            return resp;
         }
-        return map_swift_error(resp.status, Some(bucket), Some(key));
+        let mut r = delete_object_response();
+        r.headers.set(HDR_VERSION_ID, vid);
+        if was_delete_marker {
+            r.headers.set(HDR_DELETE_MARKER, "true");
+        }
+        return r;
     }
+
+    let snap = match load_version_index_snapshot(cred, bucket, key, next) {
+        Ok(snap) => snap,
+        Err(resp) => return resp,
+    };
+    let expect = expect_generation(&snap);
+    let mut idx = snap.index.clone();
 
     let mut head = make_swift_req("HEAD", &cur_path);
     stamp_auth(&mut head, cred);
     let cur = next(head);
-    let mut idx = load_version_index(cred, bucket, key, next);
+    if !(200..300).contains(&cur.status) && cur.status != 404 {
+        return map_swift_error(cur.status, Some(bucket), Some(key));
+    }
+    let current_exists = (200..300).contains(&cur.status);
+    if current_exists {
+        if let Some(blocked) = deny_if_object_acl_blocks_write(cred, &cur.headers) {
+            return blocked;
+        }
+    }
+    let overwrite_null = fixed_delete_marker_id == Some(NULL_VERSION_ID)
+        && VersioningStatus::Suspended.suspended_put_overwrites_null();
+    let archived_null_exists = if overwrite_null {
+        match archived_null_replacement_required(cred, bucket, key, bypass, next) {
+            Ok(exists) => exists,
+            Err(resp) => return resp,
+        }
+    } else {
+        false
+    };
 
-    if (200..300).contains(&cur.status)
-        && !is_delete_marker_header(cur.headers.get(SYS_DELETE_MARKER))
-    {
-        let old_vid = cur
-            .headers
-            .get(SYS_VERSION_ID)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(generate_version_id);
-        let old_etag = cur
-            .headers
-            .get("ETag")
-            .map(vers_bare_etag)
-            .unwrap_or_default();
-        let old_size = cur
-            .headers
-            .get("Content-Length")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0i64);
-        let old_lm = cur
-            .headers
-            .get("Last-Modified")
-            .map(http_date_to_s3_approx)
-            .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
-        archive_current_version(cred, bucket, key, &old_vid, next);
-        if idx.find(&old_vid).is_none() {
-            idx.push_latest(VersionRecord {
-                version_id: old_vid,
-                is_delete_marker: false,
-                is_latest: true,
-                last_modified: old_lm,
-                etag: old_etag,
-                size: old_size,
-            });
+    if current_exists {
+        if let Err(resp) = maybe_archive_current_for_write(
+            cred,
+            bucket,
+            key,
+            &cur,
+            overwrite_null,
+            bypass,
+            &mut idx,
+            next,
+        ) {
+            return resp;
         }
     }
 
-    let dm_vid = generate_version_id();
+    let dm_vid = if overwrite_null {
+        NULL_VERSION_ID.to_string()
+    } else {
+        generate_version_id()
+    };
+    if !is_safe_version_id(&dm_vid) {
+        return unsafe_version_id_error();
+    }
     let mut put = make_swift_req("PUT", &cur_path);
     put.headers.set("Content-Length", "0");
     put.headers.set(SYS_VERSION_ID, &dm_vid);
     put.headers.set(SYS_DELETE_MARKER, "true");
     put.body = Body::empty();
+    stamp_object_write_precondition(&mut put.headers, current_exists.then_some(&cur));
     stamp_auth(&mut put, cred);
     let resp = next(put);
-    if !(200..300).contains(&resp.status) {
-        return map_swift_error(resp.status, Some(bucket), Some(key));
+    if !swift_write_applied(resp.status) {
+        return backend_write_not_applied(resp.status, Some(bucket), Some(key));
+    }
+    if archived_null_exists {
+        if let Err(resp) =
+            delete_archived_version_copy(cred, bucket, key, NULL_VERSION_ID, next)
+        {
+            return resp;
+        }
     }
 
-    idx.push_latest(VersionRecord {
-        version_id: dm_vid.clone(),
-        is_delete_marker: true,
-        is_latest: true,
-        last_modified: "1970-01-01T00:00:00.000Z".into(),
-        etag: String::new(),
-        size: 0,
-    });
-    save_version_index(cred, bucket, key, &idx, next);
+    let lm = resp
+        .headers
+        .get("Last-Modified")
+        .map(http_date_to_s3_approx)
+        .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
+    if let Err(resp) = commit_new_version_record(
+        &mut idx,
+        expect,
+        overwrite_null,
+        VersionRecord {
+            version_id: dm_vid.clone(),
+            is_delete_marker: true,
+            is_latest: true,
+            last_modified: lm,
+            etag: String::new(),
+            size: 0,
+        },
+    ) {
+        return resp;
+    }
+    if let Err(resp) = cas_save_version_index(cred, bucket, key, &snap, &idx, next) {
+        return resp;
+    }
 
     let mut r = delete_object_response();
     r.headers.set(HDR_VERSION_ID, &dm_vid);
@@ -3268,31 +4739,36 @@ fn object_is_cold_archive(headers: &HeaderKeyDict) -> bool {
     transitioned || headers.get(SYS_COLD_BACKEND_URI).is_some()
 }
 
-/// S3 RestoreObject (`POST/GET ?restore`): stamp restore-until meta; if a lab
-/// [`ColdBackend`] is wired and `SYS_COLD_BACKEND_URI` is present, call
-/// `restore_stage`. Without a backend, policy/meta stamps only (honest boundary).
+/// S3 RestoreObject (`POST/GET ?restore`): Durable receipt → `begin_restore`
+/// → PUT bytes + `stamp_cold_restore_meta` → `complete_restore`. GET/HEAD is
+/// status only. PROTOTYPE / DEFAULT OFF / NOT ACCEPTED. Not Glacier.
 fn handle_restore(
     req: Request,
     cred: &S3Credential,
     bucket: &str,
     key: &str,
+    version_id: Option<&str>,
     cold_map: &crate::cold_tier::ColdPolicyMap,
     cold_backend: Option<&Arc<dyn ColdBackend>>,
     next: &NextFn,
 ) -> Response {
     let now = unix_now();
+    let target = match resolve_object_version(cred, bucket, key, version_id, next) {
+        Ok(Some(target)) => target,
+        Ok(None) => return missing_object_version_response(key, version_id),
+        Err(resp) => return resp,
+    };
+    let acl_denied = if req.method == "POST" {
+        deny_if_object_acl_blocks_write(cred, &target.head.headers)
+    } else {
+        deny_if_object_acl_blocks_read(cred, &target.head.headers)
+    };
+    if let Some(denied) = acl_denied {
+        return denied;
+    }
     match req.method.as_str() {
         "GET" | "HEAD" => {
-            let mut head = make_swift_req(
-                "HEAD",
-                &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
-            );
-            stamp_auth(&mut head, cred);
-            let resp = next(head);
-            if !(200..300).contains(&resp.status) {
-                return map_swift_error(resp.status, Some(bucket), Some(key));
-            }
-            let until = resp.headers.get(SYS_RESTORE_UNTIL).unwrap_or("");
+            let until = target.head.headers.get(SYS_RESTORE_UNTIL).unwrap_or("");
             let ongoing = until.parse::<i64>().map(|u| u > now).unwrap_or(false);
             // Minimal status XML (not full AWS RestoreOutput).
             let xml = format!(
@@ -3312,7 +4788,7 @@ fn handle_restore(
                     "x-amz-restore",
                     format!("ongoing-request=\"false\", expiry-date=\"{until}\""),
                 );
-            } else if object_is_cold_archive(&resp.headers) {
+            } else if object_is_cold_archive(&target.head.headers) {
                 r.headers.set("x-amz-restore", "ongoing-request=\"true\"");
             }
             r
@@ -3332,52 +4808,143 @@ fn handle_restore(
                     )
                 }
             };
-            let mut head = make_swift_req(
-                "HEAD",
-                &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
-            );
-            stamp_auth(&mut head, cred);
-            let head_resp = next(head);
-            if !(200..300).contains(&head_resp.status) {
-                return map_swift_error(head_resp.status, Some(bucket), Some(key));
-            }
-            if !object_is_cold_archive(&head_resp.headers) {
+            if !object_is_cold_archive(&target.head.headers) {
                 return s3_error_response(
                     "InvalidObjectState",
                     Some("Restore is not allowed for the object's current storage class"),
                     &[],
                 );
             }
-            // Lab cold backend: stage if URI present; else meta-only honesty.
-            if let Some(be) = cold_backend {
-                if let Some(uri) = head_resp.headers.get(SYS_COLD_BACKEND_URI) {
-                    if !uri.is_empty() {
-                        if let Err(e) = be.restore_stage(uri, days) {
-                            return s3_error_response(
-                                "InvalidObjectState",
-                                Some(&format!("cold restore_stage failed: {e}")),
-                                &[],
-                            );
-                        }
-                    }
+            let Some(be) = cold_backend else {
+                return s3_error_response(
+                    "InvalidObjectState",
+                    Some("cold backend is not configured"),
+                    &[],
+                );
+            };
+            let Some(uri) = target
+                .head
+                .headers
+                .get(SYS_COLD_BACKEND_URI)
+                .filter(|uri| !uri.is_empty())
+            else {
+                return s3_error_response(
+                    "InvalidObjectState",
+                    Some("cold archive has no durable backend reference"),
+                    &[],
+                );
+            };
+            let (payload, receipt): (Vec<u8>, ColdArchiveReceipt) = match be.fetch_verified(uri) {
+                Ok(result) => result,
+                Err(e) => {
+                    return s3_error_response(
+                        "InvalidObjectState",
+                        Some(&format!("cold restore verification failed: {e}")),
+                        &[],
+                    )
                 }
+            };
+            if archive_commit(&receipt, &payload, false).is_err() {
+                return s3_error_response(
+                    "InvalidObjectState",
+                    Some("cold archive receipt does not verify payload"),
+                    &[],
+                );
             }
-            let mut post = make_swift_req(
-                "POST",
-                &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
+            let persisted_receipt_matches = target.head.headers.get(SYS_COLD_ARCHIVE_STATE)
+                == Some("durable")
+                && target
+                    .head
+                    .headers
+                    .get(SYS_COLD_CONTENT_LENGTH)
+                    .and_then(|value| value.parse::<u64>().ok())
+                    == Some(receipt.content_length)
+                && target
+                    .head
+                    .headers
+                    .get(SYS_COLD_CONTENT_SHA256)
+                    .map(|value| value.eq_ignore_ascii_case(&receipt.content_sha256))
+                    .unwrap_or(false)
+                && receipt.backend_uri == uri;
+            if !persisted_receipt_matches {
+                return s3_error_response(
+                    "InvalidObjectState",
+                    Some("cold archive receipt does not match object metadata"),
+                    &[],
+                );
+            }
+            if begin_restore(ColdArchiveState::Durable, now, days).is_err() {
+                return s3_error_response(
+                    "InvalidObjectState",
+                    Some("Restore is not allowed for the object's current storage class"),
+                    &[],
+                );
+            }
+            let machine = ColdStateMachine {
+                state: ColdArchiveState::Durable,
+                receipt: Some(receipt.clone()),
+                archive_generation: parse_cold_generation(
+                    &target.head.headers,
+                    SYS_COLD_ARCHIVE_GENERATION,
+                ),
+                restore_generation: parse_cold_generation(
+                    &target.head.headers,
+                    SYS_COLD_RESTORE_GENERATION,
+                ),
+            };
+            let machine = match machine.apply_begin_restore(now, days) {
+                Ok(m) => m,
+                Err(_) => {
+                    return s3_error_response(
+                        "InvalidObjectState",
+                        Some("Restore is not allowed for the object's current storage class"),
+                        &[],
+                    )
+                }
+            };
+
+            let mut put = make_swift_req(
+                "PUT",
+                &s3_to_swift_path(
+                    &cred.account,
+                    Some(&target.container),
+                    Some(&target.key),
+                ),
             );
+            copy_version_payload_headers(&target.head.headers, &mut put.headers);
             if cold_map.is_configured() {
-                stamp_cold_restore_meta(&mut post.headers, cold_map, days, now);
+                stamp_cold_restore_meta(&mut put.headers, cold_map, days, now);
             } else {
-                apply_restore_days(&mut post.headers, days, now);
+                apply_restore_days(&mut put.headers, days, now);
             }
-            stamp_auth(&mut post, cred);
-            let resp = next(post);
+            if let Some(until) = machine.state.restore_until_unix() {
+                put.headers.set(SYS_RESTORE_UNTIL, until.to_string());
+            }
+            put.headers.set("Content-Length", payload.len().to_string());
+            put.headers.remove("Transfer-Encoding");
+            put.headers.set(SYS_HOT_RECLAIMED, "false");
+            machine.stamp_generation_headers(&mut put.headers);
+            put.body = Body::from(payload);
+            stamp_auth(&mut put, cred);
+            let resp = next(put);
             if (200..300).contains(&resp.status) {
-                // AWS RestoreObject → 202 Accepted when restore initiated.
+                if complete_restore(machine.state, now).is_err() {
+                    return s3_error_response(
+                        "InternalError",
+                        Some("cold restore complete failed after payload write"),
+                        &[],
+                    );
+                }
+                if machine.apply_complete_restore(now).is_err() {
+                    return s3_error_response(
+                        "InternalError",
+                        Some("cold restore complete failed after payload write"),
+                        &[],
+                    );
+                }
                 Response::new(202)
             } else {
-                map_swift_error(resp.status, Some(bucket), Some(key))
+                map_swift_error(resp.status, Some(&target.container), Some(&target.key))
             }
         }
         _ => s3_error_response("MethodNotAllowed", None, &[]),
@@ -3394,13 +4961,18 @@ fn handle_object_lock(req: Request, cred: &S3Credential, bucket: &str, next: &Ne
             if !(200..300).contains(&resp.status) {
                 return map_swift_error(resp.status, Some(bucket), None);
             }
-            match object_lock_xml_from_headers(&resp.headers) {
-                Some(xml) => {
+            match validated_object_lock_xml_from_headers(&resp.headers) {
+                Ok(Some(xml)) => {
                     let mut r = Response::with_body(200, xml);
                     r.headers.set("Content-Type", "application/xml");
                     r
                 }
-                None => s3_error_response("ObjectLockConfigurationNotFoundError", None, &[]),
+                Ok(None) => s3_error_response("ObjectLockConfigurationNotFoundError", None, &[]),
+                Err(_) => s3_error_response(
+                    "InternalError",
+                    Some("bucket object lock metadata is invalid"),
+                    &[],
+                ),
             }
         }
         "PUT" => {
@@ -3413,6 +4985,9 @@ fn handle_object_lock(req: Request, cred: &S3Credential, bucket: &str, next: &Ne
             }
             let mut post =
                 make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
+            // Object Lock and versioning are one container metadata update so
+            // no observer can see a locked bucket with versioning disabled.
+            apply_versioning_meta(&mut post.headers, "Enabled");
             apply_object_lock_meta(&mut post.headers, &body);
             stamp_auth(&mut post, cred);
             let resp = next(post);
@@ -3426,18 +5001,91 @@ fn handle_object_lock(req: Request, cred: &S3Credential, bucket: &str, next: &Ne
     }
 }
 
-fn handle_mpu_init(cred: &S3Credential, bucket: &str, key: &str, next: &NextFn) -> Response {
+fn copy_mpu_object_headers(src: &HeaderKeyDict, dst: &mut HeaderKeyDict) {
+    for (name, value) in src.iter() {
+        let lower = name.to_ascii_lowercase();
+        if lower.starts_with("x-object-meta-")
+            || matches!(
+                lower.as_str(),
+                "content-type"
+                    | "content-encoding"
+                    | "content-disposition"
+                    | "content-language"
+                    | "cache-control"
+                    | "expires"
+                    | "x-object-sysmeta-s3-acl"
+                    | "x-object-sysmeta-s3-acl-json"
+                    | "x-object-sysmeta-s3-object-lock-mode"
+                    | "x-object-sysmeta-s3-retain-until-date"
+                    | "x-object-sysmeta-s3-legal-hold"
+            )
+        {
+            dst.set(name, value);
+        }
+    }
+}
+
+fn handle_mpu_init(
+    mut req: Request,
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    api: &S3Api,
+    next: &NextFn,
+) -> Response {
+    let has_retention = req.headers.get("X-Amz-Object-Lock-Mode").is_some()
+        || req
+            .headers
+            .get("X-Amz-Object-Lock-Retain-Until-Date")
+            .is_some();
+    let has_legal_hold = req.headers.get("X-Amz-Object-Lock-Legal-Hold").is_some();
+    if has_retention || has_legal_hold {
+        if let Err(resp) = require_bucket_object_lock(cred, bucket, next) {
+            return resp;
+        }
+    }
+    if has_retention {
+        if let Some(denied) =
+            iam_action_check(&api.iam, cred, "s3:PutObjectRetention", bucket, key)
+        {
+            return denied;
+        }
+    }
+    if has_legal_hold {
+        if let Some(denied) =
+            iam_action_check(&api.iam, cred, "s3:PutObjectLegalHold", bucket, key)
+        {
+            return denied;
+        }
+    }
+
+    map_amz_meta(&mut req);
+    match resolve_acl_put_input(&req.headers, None, &owner_for(cred).id) {
+        Ok(input) if !matches!(input, AclPutInput::None) => {
+            apply_object_acl_input(&mut req.headers, &input);
+        }
+        Ok(_) => {}
+        Err(_) => return s3_error_response("InvalidArgument", None, &[]),
+    }
+    if let Err(resp) = apply_request_object_lock_headers(&mut req.headers) {
+        return resp;
+    }
+
     let segs = segments_container(bucket);
     // Ensure segments container exists.
     let mut put_c = make_swift_req("PUT", &s3_to_swift_path(&cred.account, Some(&segs), None));
     stamp_auth(&mut put_c, cred);
-    let _ = next(put_c);
+    let container_resp = next(put_c);
+    if !(200..300).contains(&container_resp.status) {
+        return map_swift_error(container_resp.status, Some(&segs), None);
+    }
     let upload_id = new_upload_id();
     let marker = upload_marker_name(key, &upload_id);
     let mut put_m = make_swift_req(
         "PUT",
         &s3_to_swift_path(&cred.account, Some(&segs), Some(&marker)),
     );
+    copy_mpu_object_headers(&req.headers, &mut put_m.headers);
     put_m.body = Body::from(Vec::from(b"upload".as_slice()));
     put_m.headers.set("Content-Length", "6");
     // AbortIncompleteMultipartUpload → X-Delete-At on marker (expirer reaps).
@@ -3509,7 +5157,23 @@ fn handle_mpu_complete(
     upload_id: &str,
     req: Request,
     next: &NextFn,
+    api: &S3Api,
 ) -> Response {
+    let bypass_requested = bypass_governance_requested(
+        req.headers
+            .get(HDR_BYPASS_GOVERNANCE)
+            .or_else(|| req.headers.get("X-Amz-Bypass-Governance-Retention")),
+    );
+    let bypass = match governance_bypass_context(
+        &api.iam,
+        cred,
+        bucket,
+        key,
+        bypass_requested,
+    ) {
+        Ok(context) => context,
+        Err(resp) => return resp,
+    };
     let body = match req.body.into_vec(MAX_CONTROL_BODY) {
         Ok(b) => b,
         Err(_) => return s3_error_response("IncompleteBody", None, &[]),
@@ -3519,6 +5183,12 @@ fn handle_mpu_complete(
         Err(code) => return s3_error_response(&code, None, &[]),
     };
     let segs = segments_container(bucket);
+    let marker = upload_marker_name(key, upload_id);
+    let marker_head = match control_head_object(cred, &segs, &marker, next) {
+        Ok(ObjectHead::Present(head)) => head,
+        Ok(ObjectHead::Missing) => return s3_error_response("NoSuchUpload", None, &[]),
+        Err(resp) => return resp,
+    };
     // HEAD each part for size.
     let mut sized: Vec<(u32, String, u64)> = Vec::new();
     for (num, etag) in &parts {
@@ -3539,28 +5209,109 @@ fn handle_mpu_complete(
             .unwrap_or(0);
         sized.push((*num, etag.clone(), size));
     }
+    let s3_etag = aws_multipart_etag(sized.iter().map(|(_, e, _)| e.as_str()));
     let manifest = slo_manifest_json(&segs, key, upload_id, &sized);
     let mut put = make_swift_req(
         "PUT",
         &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
     );
+    copy_mpu_object_headers(&marker_head.headers, &mut put.headers);
+    if let Some(ref etag) = s3_etag {
+        put.headers.set(SYS_S3API_ETAG, etag);
+    }
     put.query_string = "multipart-manifest=put".into();
-    put.body = Body::from(manifest.into_bytes());
-    put.headers.set("Content-Type", "application/json");
-    stamp_auth(&mut put, cred);
-    let resp = next(put);
+    let manifest = manifest.into_bytes();
+    put.headers.set("Content-Length", manifest.len().to_string());
+    put.body = Body::from(manifest);
+
+    if put.headers.get(SYS_LOCK_MODE).is_some() || put.headers.get(SYS_RETAIN_UNTIL).is_some()
+    {
+        if let Some(denied) = iam_action_check(
+            &api.iam,
+            cred,
+            "s3:PutObjectRetention",
+            bucket,
+            key,
+        ) {
+            return denied;
+        }
+    }
+    if put.headers.get(SYS_LEGAL_HOLD).is_some() {
+        if let Some(denied) = iam_action_check(
+            &api.iam,
+            cred,
+            "s3:PutObjectLegalHold",
+            bucket,
+            key,
+        ) {
+            return denied;
+        }
+    }
+    if put.headers.get(SYS_LOCK_MODE).is_some()
+        || put.headers.get(SYS_RETAIN_UNTIL).is_some()
+        || put.headers.get(SYS_LEGAL_HOLD).is_some()
+    {
+        if let Err(resp) = require_bucket_object_lock(cred, bucket, next) {
+            return resp;
+        }
+    }
+
+    let versioning_mode = match probe_bucket_versioning(cred, bucket, next) {
+        Ok(status) => bucket_versioning_mode(status.as_deref()),
+        Err(resp) => return resp,
+    };
+    let resp = if let Some(versioning_mode) = versioning_mode {
+        handle_versioned_put(
+            put,
+            cred,
+            bucket,
+            key,
+            false,
+            Some("multipart-manifest=put"),
+            match versioning_mode {
+                BucketVersioningMode::Enabled => None,
+                BucketVersioningMode::Suspended => Some(NULL_VERSION_ID),
+            },
+            bypass,
+            next,
+            api,
+        )
+    } else {
+        if let Some(blocked) = worm_check_object(cred, bucket, key, bypass, next) {
+            return blocked;
+        }
+        if let Some(blocked) = acl_write_check_object(cred, bucket, key, next) {
+            return blocked;
+        }
+        if let Err(resp) = apply_request_object_lock_headers(&mut put.headers) {
+            return resp;
+        }
+        strip_s3_only_headers(&mut put.headers);
+        maybe_apply_lifecycle_on_put(&mut put, cred, bucket, key, next);
+        if let Err(resp) = apply_bucket_default_retention(&mut put, cred, bucket, next) {
+            return resp;
+        }
+        stamp_auth(&mut put, cred);
+        next(put)
+    };
     if !(200..300).contains(&resp.status) {
         return map_swift_error(resp.status, Some(bucket), Some(key));
     }
-    let etag = resp
-        .headers
-        .get("ETag")
-        .map(|e| e.trim().trim_matches('"').to_string())
-        .unwrap_or_else(|| "multipart".into());
-    xml_response(
+    let etag = s3_etag.unwrap_or_else(|| {
+        resp.headers
+            .get("ETag")
+            .map(|e| e.trim().trim_matches('"').to_string())
+            .unwrap_or_else(|| "multipart".into())
+    });
+    let version_id = resp.headers.get(HDR_VERSION_ID).map(str::to_string);
+    let mut out = xml_response(
         200,
         complete_multipart_xml(bucket, key, &etag, &format!("/{bucket}/{key}")),
-    )
+    );
+    if let Some(version_id) = version_id {
+        out.headers.set(HDR_VERSION_ID, version_id);
+    }
+    out
 }
 
 fn handle_mpu_abort(
@@ -3833,7 +5584,8 @@ mod tests {
     use crate::bucket_config::{S3_LIFECYCLE_META, S3_OBJECT_LOCK_META, S3_VERSIONING_META};
     use crate::sigv4::{
         amz_date, canonical_query, canonical_request, canonical_uri, compute_signature,
-        headers_to_sign, parse_authorization_header, payload_hash,
+        format_amz_date, headers_to_sign, parse_authorization_header, parse_query_authentication,
+        payload_hash,
     };
 
     fn cred_map() -> HashMap<String, S3Credential> {
@@ -3849,6 +5601,16 @@ mod tests {
             },
         );
         m
+    }
+
+    fn api_with_worm_bypass_permission() -> S3Api {
+        let mut iam = crate::iam::IamService::new();
+        let policy = crate::iam::IamService::parse_policy_json(
+            r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*","Resource":"arn:aws:s3:::mybucket/*","Principal":"*"}}"#,
+        )
+        .expect("valid WORM IAM fixture");
+        iam.attach_policy("*", "worm-test", policy);
+        S3Api::new(cred_map()).with_iam(iam)
     }
 
     /// Owner + foreign principals sharing one Swift account (grant enforcement).
@@ -3877,19 +5639,27 @@ mod tests {
         m
     }
 
-    fn base_s3_req_as(method: &str, path: &str, query: &str, access_key: &str) -> Request {
+    fn base_s3_req_as_at(
+        method: &str,
+        path: &str,
+        query: &str,
+        access_key: &str,
+        signed_at: i64,
+    ) -> Request {
+        let amz = crate::sigv4::format_amz_date(signed_at);
+        let scope = &amz[..8];
         let mut headers = HeaderKeyDict::new();
         headers.set("Host", "localhost");
         headers.set(
             "x-amz-content-sha256",
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         );
-        headers.set("x-amz-date", "20130524T000000Z");
+        headers.set("x-amz-date", &amz);
         headers.set(
             "Authorization",
             format!(
                 "AWS4-HMAC-SHA256 \
-                 Credential={access_key}/20130524/us-east-1/s3/aws4_request, \
+                 Credential={access_key}/{scope}/us-east-1/s3/aws4_request, \
                  SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
                  Signature=00"
             ),
@@ -3901,6 +5671,10 @@ mod tests {
             headers,
             body: Body::empty(),
         }
+    }
+
+    fn base_s3_req_as(method: &str, path: &str, query: &str, access_key: &str) -> Request {
+        base_s3_req_as_at(method, path, query, access_key, unix_now())
     }
 
     fn sign_request(mut req: Request, secret: &str) -> Request {
@@ -3933,29 +5707,12 @@ mod tests {
         req
     }
 
+    fn base_s3_req_at(method: &str, path: &str, query: &str, signed_at: i64) -> Request {
+        base_s3_req_as_at(method, path, query, "test:tester", signed_at)
+    }
+
     fn base_s3_req(method: &str, path: &str, query: &str) -> Request {
-        let mut headers = HeaderKeyDict::new();
-        headers.set("Host", "localhost");
-        headers.set(
-            "x-amz-content-sha256",
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        );
-        headers.set("x-amz-date", "20130524T000000Z");
-        // Placeholder signature — replaced by sign_request.
-        headers.set(
-            "Authorization",
-            "AWS4-HMAC-SHA256 \
-             Credential=test:tester/20130524/us-east-1/s3/aws4_request, \
-             SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
-             Signature=00",
-        );
-        Request {
-            method: method.into(),
-            path: path.into(),
-            query_string: query.into(),
-            headers,
-            body: Body::empty(),
-        }
+        base_s3_req_at(method, path, query, unix_now())
     }
 
     #[test]
@@ -4132,6 +5889,7 @@ mod tests {
         // Signature is verified by Keystone on the deferral path; local verify skipped.
         req.body = Body::from(b"hello-ec2".to_vec());
         req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        let date = amz_date(&req).unwrap();
 
         let next: NextFn = Arc::new(|r| {
             if r.method == "HEAD" {
@@ -4148,8 +5906,8 @@ mod tests {
         assert_eq!(resp.status, 200);
         let sts = client.seen_sts.lock().unwrap().clone().unwrap();
         assert!(sts.starts_with("AWS4-HMAC-SHA256\n"), "sts={sts}");
-        assert!(sts.contains("20130524T000000Z"));
-        assert_ne!(sts, "20130524T000000Z");
+        assert!(sts.contains(&date), "sts={sts} date={date}");
+        assert_ne!(sts, date);
     }
 
     #[test]
@@ -4219,6 +5977,30 @@ mod tests {
         let resp = api.handle(req, &next);
         assert_eq!(resp.status, 200);
         assert_eq!(resp.headers.get("ETag"), Some("\"abc123\""));
+    }
+
+    #[test]
+    fn get_object_uses_s3api_composite_etag() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/mybucket/multipart/assembled.bin", ""), "testing");
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                return Response::new(404);
+            }
+            assert_eq!(r.method, "GET");
+            let mut resp = Response::with_body(200, b"assembled".to_vec());
+            resp.headers.set("ETag", "slo-manifest-md5-not-aws");
+            resp.headers
+                .set(SYS_S3API_ETAG, "b4b77f5320cfe9ce9c0c70c35e84d511-2");
+            resp.headers.set("Content-Length", "9");
+            resp
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.headers.get("ETag"),
+            Some("\"b4b77f5320cfe9ce9c0c70c35e84d511-2\"")
+        );
     }
 
     #[test]
@@ -4494,7 +6276,7 @@ mod tests {
         assert_eq!(part_resp.headers.get("ETag"), Some("\"partetag1\""));
 
         // 3) Complete: HEADs each listed part for size, then PUTs the SLO
-        // manifest and returns the (Swift-computed) composite ETag.
+        // manifest and returns the AWS composite MD5(part-MD5s)-N (not SLO).
         let mut complete_req = base_s3_req(
             "POST",
             "/mybucket/big/obj",
@@ -4504,11 +6286,13 @@ mod tests {
             .headers
             .set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         complete_req.body = Body::from(
-            br#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"partetag1"</ETag></Part></CompleteMultipartUpload>"#
+            br#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"b8fc857a25e7958868c2f003d5e0952d"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>"973f488aa4a5df5ae05e8e73c63432e0"</ETag></Part></CompleteMultipartUpload>"#
                 .to_vec(),
         );
         let complete_req = sign_request(complete_req, "testing");
-        let complete_next: NextFn = Arc::new(|r| {
+        let stamped = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let stamped_c = stamped.clone();
+        let complete_next: NextFn = Arc::new(move |r| {
             if r.method == "HEAD" {
                 let mut resp = Response::new(200);
                 resp.headers.set("Content-Length", "14");
@@ -4517,8 +6301,9 @@ mod tests {
             assert_eq!(r.method, "PUT");
             assert_eq!(r.path, "/v1/AUTH_test/mybucket/big/obj");
             assert!(r.query_string.contains("multipart-manifest=put"));
+            *stamped_c.lock().unwrap() = r.headers.get(SYS_S3API_ETAG).map(str::to_string);
             let mut resp = Response::new(201);
-            resp.headers.set("ETag", "compositeetag-1");
+            resp.headers.set("ETag", "slo-manifest-md5-not-aws");
             resp
         });
         let complete_resp = api.handle(complete_req, &complete_next);
@@ -4526,7 +6311,12 @@ mod tests {
         let complete_body =
             String::from_utf8(complete_resp.body.into_vec(u64::MAX).unwrap()).unwrap();
         assert!(complete_body.contains("CompleteMultipartUploadResult"));
-        assert!(complete_body.contains("compositeetag-1"));
+        assert!(complete_body.contains("\"b4b77f5320cfe9ce9c0c70c35e84d511-2\""));
+        assert!(!complete_body.contains("slo-manifest-md5-not-aws"));
+        assert_eq!(
+            stamped.lock().unwrap().as_deref(),
+            Some("b4b77f5320cfe9ce9c0c70c35e84d511-2")
+        );
     }
 
     #[test]
@@ -4652,7 +6442,26 @@ mod tests {
             assert_eq!(r.headers.get("X-Container-Write"), Some(".r:*"));
             Response::new(204)
         });
-        assert_eq!(api.handle(req, &next).status, 200);
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("Location"), Some("mybucket"));
+    }
+
+    #[test]
+    fn put_bucket_acl_private_sets_exact_bucket_location() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket", "acl");
+        req.headers.set("x-amz-acl", "private");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.method, "POST");
+            Response::new(204)
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("Location"), Some("mybucket"));
+        assert!(resp.body.is_definitely_empty());
     }
 
     #[test]
@@ -5311,6 +7120,242 @@ mod tests {
         assert!(r2.headers.get("x-amz-version-id").is_none());
     }
 
+    fn version_rec(version_id: &str) -> VersionRecord {
+        VersionRecord {
+            version_id: version_id.into(),
+            is_delete_marker: false,
+            is_latest: true,
+            last_modified: "1970-01-01T00:00:00.000Z".into(),
+            etag: "e".into(),
+            size: 1,
+        }
+    }
+
+    #[test]
+    fn expect_generation_some_zero_on_existing_legacy_index() {
+        let existing = VersionIndexSnapshot {
+            index: VersionIndex::new("obj"),
+            exists: true,
+            etag: Some("deadbeef".into()),
+        };
+        assert_eq!(expect_generation(&existing), Some(0));
+        let missing = VersionIndexSnapshot {
+            index: VersionIndex::new("obj"),
+            exists: false,
+            etag: None,
+        };
+        assert_eq!(expect_generation(&missing), None);
+    }
+
+    #[test]
+    fn overlapping_put_stale_generation_is_cas_denied() {
+        let mut idx = VersionIndex::new("obj");
+        idx.apply_if_match(None, version_rec("v1")).unwrap();
+        let err = commit_new_version_record(
+            &mut idx,
+            Some(0),
+            false,
+            version_rec("v2"),
+        );
+        assert!(err.is_err());
+        assert_eq!(idx.generation, 1);
+        assert_eq!(idx.versions[0].version_id, "v1");
+    }
+
+    #[test]
+    fn version_index_persist_202_is_not_success() {
+        let api = S3Api::new(cred_map());
+        let inner = versioning_mock_store("Enabled");
+        let next: NextFn = Arc::new(move |r: Request| {
+            if r.method == "PUT" && r.path.ends_with("/index.json") {
+                return Response::new(202);
+            }
+            inner(r)
+        });
+        let mut put = base_s3_req("PUT", "/mybucket/obj", "");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(b"v1".to_vec());
+        let resp = api.handle(sign_request(put, "testing"), &next);
+        assert_ne!(resp.status, 200);
+        assert!(resp.status >= 400, "status={}", resp.status);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("InternalError"), "{body}");
+    }
+
+    #[test]
+    fn version_index_persist_412_is_conflict_not_200() {
+        let api = S3Api::new(cred_map());
+        let inner = versioning_mock_store("Enabled");
+        let next: NextFn = Arc::new(move |r: Request| {
+            if r.method == "PUT" && r.path.ends_with("/index.json") {
+                return Response::new(412);
+            }
+            inner(r)
+        });
+        let mut put = base_s3_req("PUT", "/mybucket/obj", "");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(b"v1".to_vec());
+        let resp = api.handle(sign_request(put, "testing"), &next);
+        assert_ne!(resp.status, 200);
+        assert!(resp.status >= 400, "status={}", resp.status);
+    }
+
+    #[test]
+    fn cas_save_does_not_send_cas_etag_as_if_match() {
+        let api = S3Api::new(cred_map());
+        let inner = versioning_mock_store("Enabled");
+        let seen: Arc<std::sync::Mutex<Vec<(Option<String>, Option<String>)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_c = seen.clone();
+        let next: NextFn = Arc::new(move |r: Request| {
+            if r.method == "PUT" && r.path.ends_with("/index.json") {
+                seen_c.lock().unwrap().push((
+                    r.headers.get("If-Match").map(str::to_string),
+                    r.headers.get("If-None-Match").map(str::to_string),
+                ));
+            }
+            inner(r)
+        });
+        for body in [b"v1".as_slice(), b"v2".as_slice()] {
+            let mut put = base_s3_req("PUT", "/mybucket/obj", "");
+            put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+            put.body = Body::from(body.to_vec());
+            assert_eq!(api.handle(sign_request(put, "testing"), &next).status, 200);
+        }
+        let headers = seen.lock().unwrap().clone();
+        assert_eq!(headers[0].1.as_deref(), Some("*"));
+        assert!(headers[0].0.is_none());
+        let second_if_match = headers[1].0.as_deref().expect("second persist If-Match");
+        assert_ne!(second_if_match.len(), 64, "If-Match must be Swift ETag, not cas_etag()");
+    }
+
+    #[test]
+    fn unsafe_sys_version_id_does_not_archive_index_json() {
+        let api = S3Api::new(cred_map());
+        let puts: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let puts_c = puts.clone();
+        let next: NextFn = Arc::new(move |r: Request| {
+            if r.method == "PUT" {
+                puts_c.lock().unwrap().push(r.path.clone());
+            }
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                let mut resp = Response::new(204);
+                resp.headers.set(S3_VERSIONING_META, "Enabled");
+                return resp;
+            }
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket/obj" {
+                let mut resp = Response::new(200);
+                resp.headers.set(SYS_VERSION_ID, INDEX_NAME);
+                resp.headers.set("ETag", "deadbeef");
+                resp.headers.set("Content-Length", "1");
+                return resp;
+            }
+            if r.method == "GET" && r.path.ends_with("/index.json") {
+                return Response::new(404);
+            }
+            if r.method == "PUT" && r.path == "/v1/AUTH_test/mybucket+versions" {
+                return Response::new(201);
+            }
+            Response::new(404)
+        });
+        let mut put = base_s3_req("PUT", "/mybucket/obj", "");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(b"x".to_vec());
+        let resp = api.handle(sign_request(put, "testing"), &next);
+        assert!(resp.status >= 400, "status={}", resp.status);
+        let puts = puts.lock().unwrap().clone();
+        assert!(
+            puts.iter()
+                .all(|p| !p.contains("+versions/") || !p.ends_with("/index.json")),
+            "archived onto index.json: {puts:?}"
+        );
+    }
+
+    #[test]
+    fn exact_version_delete_checked_miss_is_not_204() {
+        let api = S3Api::new(cred_map());
+        let vid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let next: NextFn = Arc::new(move |r: Request| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                let mut resp = Response::new(204);
+                resp.headers.set(S3_VERSIONING_META, "Enabled");
+                return resp;
+            }
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket/obj" {
+                let mut resp = Response::new(200);
+                resp.headers.set(SYS_VERSION_ID, vid);
+                resp.headers.set("ETag", "deadbeef");
+                resp.headers.set("Content-Length", "1");
+                return resp;
+            }
+            if r.method == "GET" && r.path.ends_with("/index.json") {
+                return Response::new(404);
+            }
+            Response::new(404)
+        });
+        let del = sign_request(
+            base_s3_req("DELETE", "/mybucket/obj", &format!("versionId={vid}")),
+            "testing",
+        );
+        let resp = api.handle(del, &next);
+        assert_ne!(resp.status, 204);
+        assert!(resp.status >= 400, "status={}", resp.status);
+    }
+
+    #[test]
+    fn multi_delete_checked_miss_is_error_not_deleted() {
+        let api = S3Api::new(cred_map());
+        let vid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let next: NextFn = Arc::new(move |r: Request| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                let mut resp = Response::new(204);
+                resp.headers.set(S3_VERSIONING_META, "Enabled");
+                return resp;
+            }
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket/obj" {
+                let mut resp = Response::new(200);
+                resp.headers.set(SYS_VERSION_ID, vid);
+                resp.headers.set("ETag", "deadbeef");
+                resp.headers.set("Content-Length", "1");
+                return resp;
+            }
+            if r.method == "GET" && r.path.ends_with("/index.json") {
+                return Response::new(404);
+            }
+            Response::new(404)
+        });
+        let mut req = base_s3_req("POST", "/mybucket", "delete");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.body = Body::from(
+            format!(
+                "<Delete><Object><Key>obj</Key><VersionId>{vid}</VersionId></Object></Delete>"
+            )
+            .into_bytes(),
+        );
+        let resp = api.handle(sign_request(req, "testing"), &next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Error>"), "{body}");
+        assert!(body.contains("InternalError"), "{body}");
+        assert!(!body.contains("<Deleted>"), "{body}");
+    }
+
+    #[test]
+    fn suspended_put_overwrites_null_does_not_apply_if_match() {
+        let mut idx = VersionIndex::new("obj");
+        idx.push_latest(version_rec("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        idx.generation = 1;
+        commit_new_version_record(&mut idx, Some(1), true, version_rec("ignored"))
+            .expect("suspended overwrite");
+        assert_eq!(idx.generation, 2);
+        assert_eq!(idx.versions.len(), 2);
+        assert_eq!(idx.versions[0].version_id, NULL_VERSION_ID);
+        assert_eq!(idx.versions[1].version_id, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert!(idx.versions[0].is_latest);
+        assert!(!idx.versions[1].is_latest);
+    }
+
     #[test]
     fn bucket_tagging_put_get_delete_round_trip() {
         let api = S3Api::new(cred_map());
@@ -5523,7 +7568,7 @@ mod tests {
         use crate::sigv2::{compute_signature_v2, string_to_sign_v2, SigV2Auth};
         // Ensure Date is present for STS when no x-amz-date.
         if req.headers.get("Date").is_none() && req.headers.get("x-amz-date").is_none() {
-            req.headers.set("Date", "Tue, 27 Mar 2007 19:36:42 +0000");
+            req.headers.set("Date", swift_http::http_date(unix_now()));
         }
         let auth = SigV2Auth {
             access_key: access_key.into(),
@@ -5543,7 +7588,7 @@ mod tests {
         let api = S3Api::new(cred_map());
         let mut headers = HeaderKeyDict::new();
         headers.set("Host", "localhost");
-        headers.set("Date", "Tue, 27 Mar 2007 19:36:42 +0000");
+        headers.set("Date", swift_http::http_date(unix_now()));
         headers.set("Authorization", "AWS test:tester:deadbeefsignature");
         let req = Request {
             method: "GET".into(),
@@ -6113,6 +8158,30 @@ mod tests {
         assert_eq!(resp.status, 200);
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
         assert!(body.contains("CopyObjectResult"));
+        assert!(body.contains("<LastModified>2013-05-24T00:00:00.000Z</LastModified>"));
+    }
+
+    #[test]
+    fn copy_object_http_last_modified_emits_iso() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/dst/obj", "");
+        req.headers.set("x-amz-copy-source", "/src/obj");
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                return Response::new(404);
+            }
+            let mut resp = Response::new(201);
+            resp.headers.set("ETag", "ff");
+            resp.headers
+                .set("Last-Modified", "Fri, 24 May 2013 00:00:00 GMT");
+            resp
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<LastModified>2013-05-24T00:00:00.000Z</LastModified>"));
+        assert!(!body.contains("Fri, 24 May"));
     }
 
     #[test]
@@ -6643,7 +8712,7 @@ mod tests {
 
     #[test]
     fn compliance_retention_put_cannot_shorten() {
-        let api = S3Api::new(cred_map());
+        let api = api_with_worm_bypass_permission();
         let body = br#"<Retention>
   <Mode>COMPLIANCE</Mode>
   <RetainUntilDate>2028-01-01T00:00:00Z</RetainUntilDate>
@@ -6673,7 +8742,7 @@ mod tests {
 
     #[test]
     fn governance_bypass_header_allows_delete() {
-        let api = S3Api::new(cred_map());
+        let api = api_with_worm_bypass_permission();
         let mut del = sign_request(base_s3_req("DELETE", "/mybucket/gov", ""), "testing");
         del.headers.set(HDR_BYPASS_GOVERNANCE, "true");
         let deleted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -6698,7 +8767,7 @@ mod tests {
 
     #[test]
     fn compliance_bypass_header_still_denies_delete() {
-        let api = S3Api::new(cred_map());
+        let api = api_with_worm_bypass_permission();
         let mut del = sign_request(base_s3_req("DELETE", "/mybucket/comp", ""), "testing");
         del.headers.set(HDR_BYPASS_GOVERNANCE, "true");
         let next: NextFn = Arc::new(|r| {
@@ -6717,7 +8786,7 @@ mod tests {
     }
 
     #[test]
-    fn legal_hold_bypass_header_still_denies_delete() {
+    fn invalid_governance_bypass_header_is_rejected_before_delete() {
         let api = S3Api::new(cred_map());
         let mut del = sign_request(base_s3_req("DELETE", "/mybucket/hold", ""), "testing");
         del.headers.set("X-Amz-Bypass-Governance-Retention", "1");
@@ -6729,15 +8798,15 @@ mod tests {
                 resp.headers.set(SYS_RETAIN_UNTIL, "2099-12-31T00:00:00Z");
                 return resp;
             }
-            panic!("legal-hold + bypass must not reach backend DELETE");
+            panic!("invalid bypass must not reach backend");
         });
         let resp = api.handle(del, &next);
-        assert_eq!(resp.status, 403);
+        assert_eq!(resp.status, 400);
     }
 
     #[test]
     fn governance_bypass_header_allows_overwrite_put() {
-        let api = S3Api::new(cred_map());
+        let api = api_with_worm_bypass_permission();
         let mut put = base_s3_req("PUT", "/mybucket/gov", "");
         put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         put.body = Body::from(b"new".to_vec());
@@ -6770,13 +8839,17 @@ mod tests {
 
     #[test]
     fn restore_object_stamps_meta_and_calls_backend() {
-        use crate::cold_tier::{MemoryColdBackend, SYS_COLD_BACKEND_URI};
+        use crate::cold_tier::{
+            MemoryColdBackend, SYS_COLD_ARCHIVE_STATE, SYS_COLD_BACKEND_URI,
+            SYS_COLD_CONTENT_LENGTH, SYS_COLD_CONTENT_SHA256, SYS_COLD_RESTORE_GENERATION,
+        };
         use crate::lifecycle_exec::{META_STORAGE_CLASS, SYS_RESTORE_UNTIL, SYS_TRANSITIONED};
 
         let be = Arc::new(MemoryColdBackend::default());
         let uri = be
             .archive(2, "AUTH_test", "mybucket", "coldobj", b"payload")
             .unwrap();
+        let receipt = be.verify_archive(&uri).unwrap();
         let api = S3Api::new(cred_map())
             .with_cold_map(crate::cold_tier::ColdPolicyMap::from_csv("GLACIER:2,HOT:0"))
             .with_cold_backend(be.clone());
@@ -6794,12 +8867,24 @@ mod tests {
                 resp.headers.set(META_STORAGE_CLASS, "GLACIER");
                 resp.headers.set(SYS_TRANSITIONED, "1");
                 resp.headers.set(SYS_COLD_BACKEND_URI, &uri);
+                resp.headers.set(SYS_COLD_ARCHIVE_STATE, "durable");
+                resp.headers
+                    .set(SYS_COLD_CONTENT_LENGTH, receipt.content_length.to_string());
+                resp.headers
+                    .set(SYS_COLD_CONTENT_SHA256, &receipt.content_sha256);
                 return resp;
             }
-            if r.method == "POST" {
+            if r.method == "PUT" {
                 let until = r.headers.get(SYS_RESTORE_UNTIL).map(str::to_string);
                 *stamped_c.lock().unwrap() = until;
-                return Response::new(202);
+                assert_eq!(r.headers.get(SYS_HOT_RECLAIMED), Some("false"));
+                assert_eq!(
+                    r.headers.get(SYS_COLD_RESTORE_GENERATION),
+                    Some("1"),
+                    "begin_restore must stamp restore generation"
+                );
+                assert_eq!(r.body.into_vec(u64::MAX).unwrap(), b"payload");
+                return Response::new(201);
             }
             Response::new(500)
         });
@@ -6810,16 +8895,14 @@ mod tests {
     }
 
     #[test]
-    fn restore_object_meta_only_without_backend() {
-        use crate::lifecycle_exec::{META_STORAGE_CLASS, SYS_RESTORE_UNTIL, SYS_TRANSITIONED};
+    fn restore_object_without_backend_fails_closed() {
+        use crate::lifecycle_exec::{META_STORAGE_CLASS, SYS_TRANSITIONED};
 
         let api = S3Api::new(cred_map());
         let mut post = base_s3_req("POST", "/mybucket/coldobj", "restore");
         post.body = Body::from(b"<RestoreRequest><Days>1</Days></RestoreRequest>".to_vec());
         post.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         let post = sign_request(post, "testing");
-        let stamped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stamped_c = stamped.clone();
         let next: NextFn = Arc::new(move |r| {
             if r.method == "HEAD" {
                 let mut resp = Response::new(200);
@@ -6827,16 +8910,10 @@ mod tests {
                 resp.headers.set(SYS_TRANSITIONED, "1");
                 return resp;
             }
-            if r.method == "POST" {
-                assert!(r.headers.get(SYS_RESTORE_UNTIL).is_some());
-                stamped_c.store(true, std::sync::atomic::Ordering::SeqCst);
-                return Response::new(202);
-            }
-            Response::new(500)
+            panic!("restore without a backend must not mutate Swift")
         });
         let resp = api.handle(post, &next);
-        assert_eq!(resp.status, 202);
-        assert!(stamped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(resp.status, 403);
     }
 
     #[test]
@@ -7312,6 +9389,17 @@ mod tests {
                 resp.headers.set(S3_VERSIONING_META, "Enabled");
                 return resp;
             }
+            // resolve_object_version HEADs current before the archive GET.
+            if r.method == "HEAD" && r.path.ends_with("/coldobj") {
+                let mut resp = Response::new(200);
+                resp.headers.set(META_STORAGE_CLASS, "GLACIER");
+                resp.headers.set(SYS_TRANSITION_AT, "1");
+                resp.headers
+                    .set(SYS_VERSION_ID, "aabbccddeeff00112233445566778899");
+                resp.headers.set("ETag", "e");
+                resp.headers.set("Content-Length", "7");
+                return resp;
+            }
             if r.method == "GET" && r.path.ends_with("/coldobj") {
                 let mut resp = Response::new(200);
                 resp.headers.set(META_STORAGE_CLASS, "GLACIER");
@@ -7398,5 +9486,691 @@ mod tests {
         assert!(body.contains("InvalidObjectState"), "{body}");
         let uri = posted_uri.lock().unwrap().clone().expect("POST persist");
         assert!(uri.starts_with("memory://"), "uri={uri}");
+    }
+
+    #[test]
+    fn get_range_206_does_not_archive_or_reclaim() {
+        use crate::lifecycle_exec::{META_STORAGE_CLASS, SYS_TRANSITION_AT};
+
+        let be = Arc::new(crate::cold_tier::MemoryColdBackend::default());
+        let api = S3Api::new(cred_map())
+            .with_cold_map(crate::cold_tier::ColdPolicyMap::from_csv("GLACIER:2,HOT:0"))
+            .with_cold_backend(be.clone())
+            .with_cold_delete_hot_after_archive(true);
+
+        let post_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let put_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let post_c = post_seen.clone();
+        let put_c = put_seen.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" && r.path.ends_with("/mybucket") {
+                return Response::new(204);
+            }
+            if r.method == "POST" {
+                post_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Response::new(202);
+            }
+            if r.method == "PUT" {
+                put_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Response::new(201);
+            }
+            if r.method == "GET" && r.path.ends_with("/coldobj") {
+                let mut resp = Response::new(206);
+                resp.headers.set(META_STORAGE_CLASS, "GLACIER");
+                resp.headers.set(SYS_TRANSITION_AT, "1");
+                resp.headers.set("ETag", "e");
+                resp.headers.set("Content-Range", "bytes 0-3/7");
+                resp.headers.set("Content-Length", "4");
+                resp.body = Body::from(b"payl".to_vec());
+                return resp;
+            }
+            Response::new(500)
+        });
+
+        let mut req = base_s3_req("GET", "/mybucket/coldobj", "");
+        req.headers.set("Range", "bytes=0-3");
+        let req = sign_request(req, "testing");
+        let _resp = api.handle(req, &next);
+        assert!(
+            !post_seen.load(std::sync::atomic::Ordering::SeqCst),
+            "206 body must not POST an archive URI"
+        );
+        assert!(
+            !put_seen.load(std::sync::atomic::Ordering::SeqCst),
+            "206 body must not empty-PUT"
+        );
+        assert!(be.blobs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn head_content_range_does_not_followup_get_for_archive() {
+        use crate::lifecycle_exec::{META_STORAGE_CLASS, SYS_TRANSITION_AT};
+
+        let be = Arc::new(crate::cold_tier::MemoryColdBackend::default());
+        let api = S3Api::new(cred_map())
+            .with_cold_map(crate::cold_tier::ColdPolicyMap::from_csv("GLACIER:2,HOT:0"))
+            .with_cold_backend(be.clone())
+            .with_cold_delete_hot_after_archive(true);
+
+        let get_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let post_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let put_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let get_c = get_seen.clone();
+        let post_c = post_seen.clone();
+        let put_c = put_seen.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" && r.path.ends_with("/mybucket") {
+                return Response::new(204);
+            }
+            if r.method == "GET" {
+                get_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Response::new(500);
+            }
+            if r.method == "POST" {
+                post_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Response::new(202);
+            }
+            if r.method == "PUT" {
+                put_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Response::new(201);
+            }
+            if r.method == "HEAD" && r.path.ends_with("/coldobj") {
+                let mut resp = Response::new(200);
+                resp.headers.set(META_STORAGE_CLASS, "GLACIER");
+                resp.headers.set(SYS_TRANSITION_AT, "1");
+                resp.headers.set("ETag", "e");
+                resp.headers.set("Content-Range", "bytes 0-3/7");
+                resp.headers.set("Content-Length", "4");
+                return resp;
+            }
+            Response::new(500)
+        });
+
+        let req = sign_request(base_s3_req("HEAD", "/mybucket/coldobj", ""), "testing");
+        let _resp = api.handle(req, &next);
+        assert!(
+            !get_seen.load(std::sync::atomic::Ordering::SeqCst),
+            "HEAD Content-Range must not follow-up GET for archive"
+        );
+        assert!(!post_seen.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!put_seen.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn restore_then_get_does_not_immediately_rearchive() {
+        use crate::cold_tier::{
+            MemoryColdBackend, SYS_COLD_ARCHIVE_STATE, SYS_COLD_BACKEND_URI,
+            SYS_COLD_CONTENT_LENGTH, SYS_COLD_CONTENT_SHA256,
+        };
+        use crate::lifecycle_exec::{META_STORAGE_CLASS, SYS_RESTORE_UNTIL, SYS_TRANSITIONED};
+
+        let be = Arc::new(MemoryColdBackend::default());
+        let uri = be
+            .archive(2, "AUTH_test", "mybucket", "coldobj", b"payload")
+            .unwrap();
+        let receipt = be.verify_archive(&uri).unwrap();
+        let api = S3Api::new(cred_map())
+            .with_cold_map(crate::cold_tier::ColdPolicyMap::from_csv("GLACIER:2,HOT:0"))
+            .with_cold_backend(be.clone())
+            .with_cold_delete_hot_after_archive(true);
+
+        let until = Arc::new(std::sync::Mutex::new(None::<String>));
+        let put_bodies = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let until_c = until.clone();
+        let puts_c = put_bodies.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" && r.path.ends_with("/mybucket") {
+                return Response::new(204);
+            }
+            if r.method == "HEAD" && r.path.ends_with("/coldobj") {
+                let mut resp = Response::new(200);
+                resp.headers.set(META_STORAGE_CLASS, "GLACIER");
+                resp.headers.set(SYS_TRANSITIONED, "1");
+                resp.headers.set(SYS_COLD_BACKEND_URI, &uri);
+                resp.headers.set(SYS_COLD_ARCHIVE_STATE, "durable");
+                resp.headers
+                    .set(SYS_COLD_CONTENT_LENGTH, receipt.content_length.to_string());
+                resp.headers
+                    .set(SYS_COLD_CONTENT_SHA256, &receipt.content_sha256);
+                if let Some(u) = until_c.lock().unwrap().clone() {
+                    resp.headers.set(SYS_RESTORE_UNTIL, u);
+                    resp.headers.set(SYS_HOT_RECLAIMED, "false");
+                }
+                return resp;
+            }
+            if r.method == "PUT" && r.path.ends_with("/coldobj") {
+                let body = r.body.into_vec(u64::MAX).unwrap();
+                if let Some(u) = r.headers.get(SYS_RESTORE_UNTIL) {
+                    *until_c.lock().unwrap() = Some(u.to_string());
+                }
+                puts_c.lock().unwrap().push(body);
+                return Response::new(201);
+            }
+            if r.method == "GET" && r.path.ends_with("/coldobj") {
+                let mut resp = Response::new(200);
+                resp.headers.set(META_STORAGE_CLASS, "GLACIER");
+                resp.headers.set(SYS_TRANSITIONED, "1");
+                resp.headers.set(SYS_COLD_BACKEND_URI, &uri);
+                resp.headers.set(SYS_COLD_ARCHIVE_STATE, "durable");
+                resp.headers
+                    .set(SYS_COLD_CONTENT_LENGTH, receipt.content_length.to_string());
+                resp.headers
+                    .set(SYS_COLD_CONTENT_SHA256, &receipt.content_sha256);
+                resp.headers.set(SYS_HOT_RECLAIMED, "false");
+                if let Some(u) = until_c.lock().unwrap().clone() {
+                    resp.headers.set(SYS_RESTORE_UNTIL, u);
+                }
+                resp.headers.set("ETag", "e");
+                resp.headers.set("Content-Length", "7");
+                resp.body = Body::from(b"payload".to_vec());
+                return resp;
+            }
+            if r.method == "POST" {
+                return Response::new(202);
+            }
+            Response::new(500)
+        });
+
+        let mut post = base_s3_req("POST", "/mybucket/coldobj", "restore");
+        post.body = Body::from(b"<RestoreRequest><Days>2</Days></RestoreRequest>".to_vec());
+        post.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        let post = sign_request(post, "testing");
+        assert_eq!(api.handle(post, &next).status, 202);
+
+        let get = sign_request(base_s3_req("GET", "/mybucket/coldobj", ""), "testing");
+        let resp = api.handle(get, &next);
+        assert_eq!(resp.status, 200, "restored GET must not be InvalidObjectState");
+        let puts = put_bodies.lock().unwrap();
+        assert_eq!(puts.len(), 1, "restore PUT only; GET must not empty-PUT");
+        assert_eq!(puts[0], b"payload");
+    }
+
+    #[test]
+    fn restore_metadata_only_without_uri_is_invalid_object_state() {
+        use crate::lifecycle_exec::{META_STORAGE_CLASS, SYS_TRANSITIONED};
+
+        let be = Arc::new(crate::cold_tier::MemoryColdBackend::default());
+        let api = S3Api::new(cred_map())
+            .with_cold_map(crate::cold_tier::ColdPolicyMap::from_csv("GLACIER:2,HOT:0"))
+            .with_cold_backend(be);
+
+        let put_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let put_c = put_seen.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" {
+                let mut resp = Response::new(200);
+                resp.headers.set(META_STORAGE_CLASS, "GLACIER");
+                resp.headers.set(SYS_TRANSITIONED, "1");
+                return resp;
+            }
+            if r.method == "PUT" {
+                put_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Response::new(201);
+            }
+            Response::new(500)
+        });
+
+        let mut post = base_s3_req("POST", "/mybucket/coldobj", "restore");
+        post.body = Body::from(b"<RestoreRequest><Days>1</Days></RestoreRequest>".to_vec());
+        post.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        let post = sign_request(post, "testing");
+        let resp = api.handle(post, &next);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("InvalidObjectState"), "{body}");
+        assert!(!put_seen.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn restore_put_failure_does_not_complete() {
+        use crate::cold_tier::{
+            MemoryColdBackend, SYS_COLD_ARCHIVE_STATE, SYS_COLD_BACKEND_URI,
+            SYS_COLD_CONTENT_LENGTH, SYS_COLD_CONTENT_SHA256,
+        };
+        use crate::lifecycle_exec::{META_STORAGE_CLASS, SYS_TRANSITIONED};
+
+        let be = Arc::new(MemoryColdBackend::default());
+        let uri = be
+            .archive(2, "AUTH_test", "mybucket", "coldobj", b"payload")
+            .unwrap();
+        let receipt = be.verify_archive(&uri).unwrap();
+        let api = S3Api::new(cred_map())
+            .with_cold_map(crate::cold_tier::ColdPolicyMap::from_csv("GLACIER:2,HOT:0"))
+            .with_cold_backend(be);
+
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" {
+                let mut resp = Response::new(200);
+                resp.headers.set(META_STORAGE_CLASS, "GLACIER");
+                resp.headers.set(SYS_TRANSITIONED, "1");
+                resp.headers.set(SYS_COLD_BACKEND_URI, &uri);
+                resp.headers.set(SYS_COLD_ARCHIVE_STATE, "durable");
+                resp.headers
+                    .set(SYS_COLD_CONTENT_LENGTH, receipt.content_length.to_string());
+                resp.headers
+                    .set(SYS_COLD_CONTENT_SHA256, &receipt.content_sha256);
+                return resp;
+            }
+            if r.method == "PUT" {
+                return Response::new(500);
+            }
+            Response::new(500)
+        });
+
+        let mut post = base_s3_req("POST", "/mybucket/coldobj", "restore");
+        post.body = Body::from(b"<RestoreRequest><Days>2</Days></RestoreRequest>".to_vec());
+        post.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        let post = sign_request(post, "testing");
+        let resp = api.handle(post, &next);
+        assert_ne!(resp.status, 202, "failed PUT must not 202");
+        assert_eq!(resp.status, 500);
+    }
+
+    #[test]
+    fn anonymous_malformed_json_acl_fail_closed_no_persist() {
+        use crate::lifecycle_exec::{META_STORAGE_CLASS, SYS_TRANSITION_AT};
+
+        let be = Arc::new(crate::cold_tier::MemoryColdBackend::default());
+        let api = S3Api::new(cred_map())
+            .with_anonymous_account("AUTH_test")
+            .with_cold_map(crate::cold_tier::ColdPolicyMap::from_csv("GLACIER:2,HOT:0"))
+            .with_cold_backend(be)
+            .with_cold_delete_hot_after_archive(true);
+
+        for raw in ["{", "", r#"{"Owner":"x","Grant":[]}"#] {
+            let post_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let put_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let post_c = post_seen.clone();
+            let put_c = put_seen.clone();
+            let acl = raw.to_string();
+            let next: NextFn = Arc::new(move |r| {
+                if r.method == "POST" {
+                    post_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return Response::new(202);
+                }
+                if r.method == "PUT" {
+                    put_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return Response::new(201);
+                }
+                if r.method == "GET" && r.path.ends_with("/pub") {
+                    let mut resp = Response::new(200);
+                    resp.headers.set(S3_OBJECT_ACL_JSON_META, &acl);
+                    resp.headers.set(META_STORAGE_CLASS, "GLACIER");
+                    resp.headers.set(SYS_TRANSITION_AT, "1");
+                    resp.body = Body::from(b"payload".to_vec());
+                    return resp;
+                }
+                Response::new(500)
+            });
+            let req = Request {
+                method: "GET".into(),
+                path: "/pubbucket/pub".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: Body::empty(),
+            };
+            let resp = api.handle(req, &next);
+            assert_eq!(resp.status, 403, "malformed ACL {raw:?} must deny");
+            let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+            assert!(body.contains("AccessDenied"), "{raw:?} {body}");
+            assert_eq!(
+                post_seen.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "malformed ACL {raw:?} must not POST"
+            );
+            assert_eq!(
+                put_seen.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "malformed ACL {raw:?} must not PUT"
+            );
+        }
+    }
+
+    #[test]
+    fn cold_delete_hot_default_stays_off() {
+        assert!(!COLD_DELETE_HOT_AFTER_ARCHIVE_DEFAULT);
+        assert!(!S3Api::new(cred_map()).cold_delete_hot_after_archive);
+        assert_eq!(
+            S3Api::new(cred_map()).cold_delete_hot_after_archive,
+            COLD_DELETE_HOT_AFTER_ARCHIVE_DEFAULT
+        );
+    }
+
+    fn cred_map_with_s3test() -> HashMap<String, S3Credential> {
+        let mut m = cred_map();
+        m.insert(
+            "s3test:tester".into(),
+            S3Credential {
+                access_key: "s3test:tester".into(),
+                secret_key: "testing".into(),
+                account: "AUTH_s3test".into(),
+                groups: vec!["s3test".into(), "s3test:tester".into(), "AUTH_s3test".into()],
+                auth_token: None,
+            },
+        );
+        m
+    }
+
+    fn frozen_api() -> S3Api {
+        S3Api::new(cred_map_with_s3test()).with_frozen_accounts(["AUTH_test"])
+    }
+
+    fn assert_s3_access_denied(resp: Response) {
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(
+            body.contains("<Code>AccessDenied</Code>"),
+            "expected S3 AccessDenied XML, got {body}"
+        );
+        assert!(
+            !body.contains("Account is frozen"),
+            "must be S3 shape, not Swift freeze text: {body}"
+        );
+    }
+
+    #[test]
+    fn frozen_accounts_denies_auth_test_allows_s3test_and_list_buckets() {
+        assert!(S3Api::new(cred_map()).frozen_accounts.is_empty());
+        let api = frozen_api();
+        assert!(api.is_frozen("AUTH_test"));
+        assert!(!api.is_frozen("AUTH_s3test"));
+
+        let next_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits = next_hits.clone();
+        let deny_next: NextFn = Arc::new(move |_| {
+            hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Response::with_body(200, b"Some Content".to_vec())
+        });
+
+        assert_s3_access_denied(api.handle(
+            sign_request(base_s3_req("GET", "/mybucket/obj", ""), "testing"),
+            &deny_next,
+        ));
+        assert_s3_access_denied(api.handle(
+            sign_request(base_s3_req("PUT", "/mybucket/obj", ""), "testing"),
+            &deny_next,
+        ));
+        assert_s3_access_denied(
+            api.handle(
+                sign_request(base_s3_req("GET", "/mybucket", "location"), "testing"),
+                &deny_next,
+            ),
+        );
+        assert_eq!(
+            next_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "frozen AUTH_test must not call next()"
+        );
+
+        let s3test_next: NextFn = Arc::new(|r| {
+            assert!(
+                r.path.starts_with("/v1/AUTH_s3test/"),
+                "AUTH_s3test must not be remapped as AUTH_test: {}",
+                r.path
+            );
+            if r.method == "HEAD" {
+                return Response::new(404);
+            }
+            if r.method == "PUT" {
+                let mut resp = Response::new(201);
+                resp.headers.set("ETag", "abc123");
+                return resp;
+            }
+            let mut resp = Response::new(200);
+            resp.body = Body::from(b"ok-s3test".to_vec());
+            resp.headers.set("ETag", "abc123");
+            resp
+        });
+        let get_s3test = sign_request(
+            base_s3_req_as("GET", "/mybucket/obj", "", "s3test:tester"),
+            "testing",
+        );
+        let get_resp = api.handle(get_s3test, &s3test_next);
+        assert_eq!(get_resp.status, 200, "AUTH_s3test GET must not be freeze-denied");
+        let get_body = String::from_utf8(get_resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert_eq!(get_body, "ok-s3test");
+        assert!(!get_body.contains("AccessDenied"));
+
+        let put_s3test = sign_request(
+            base_s3_req_as("PUT", "/mybucket/obj", "", "s3test:tester"),
+            "testing",
+        );
+        let put_resp = api.handle(put_s3test, &s3test_next);
+        assert_eq!(put_resp.status, 200, "AUTH_s3test PUT must not be freeze-denied");
+
+        let list_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let list_c = list_hits.clone();
+        let list_next: NextFn = Arc::new(move |r| {
+            list_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(r.path, "/v1/AUTH_test");
+            Response::with_body(
+                200,
+                br#"[{"name":"b1","count":0,"bytes":0,"last_modified":"2013-05-24T00:00:00.000000"}]"#.to_vec(),
+            )
+        });
+        let list_resp = api.handle(
+            sign_request(base_s3_req("GET", "/", ""), "testing"),
+            &list_next,
+        );
+        assert_eq!(list_resp.status, 200, "ListBuckets must stay allowed");
+        let list_body = String::from_utf8(list_resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(list_body.contains("ListAllMyBucketsResult"), "{list_body}");
+        assert!(list_body.contains("<Name>b1</Name>"), "{list_body}");
+        assert!(!list_body.contains("AccessDenied"), "{list_body}");
+        assert_eq!(list_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let anon = frozen_api().with_anonymous_account("AUTH_test");
+        let anon_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let anon_c = anon_hits.clone();
+        let anon_next: NextFn = Arc::new(move |_| {
+            anon_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Response::with_body(200, b"hello-anon".to_vec())
+        });
+        let anon_req = Request {
+            method: "GET".into(),
+            path: "/pubbucket/obj1".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        assert_s3_access_denied(anon.handle(anon_req, &anon_next));
+        assert_eq!(
+            anon_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "frozen anonymous AUTH_test must not call next()"
+        );
+    }
+
+    fn sign_v4_query(
+        mut req: Request,
+        access: &str,
+        secret: &str,
+        signed_at: i64,
+        expires: i64,
+    ) -> Request {
+        let amz = format_amz_date(signed_at);
+        let scope = &amz[..8];
+        let cred = format!("{access}/{scope}/us-east-1/s3/aws4_request");
+        let cred_q = cred.replace('/', "%2F");
+        req.query_string = format!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={cred_q}\
+             &X-Amz-Date={amz}&X-Amz-Expires={expires}&X-Amz-SignedHeaders=host\
+             &X-Amz-Signature=00"
+        );
+        let auth = parse_query_authentication(&req.params()).unwrap();
+        let hts = headers_to_sign(&req.headers, &auth.signed_headers).unwrap();
+        let cr = canonical_request(
+            &req.method,
+            &canonical_uri(&req.path),
+            &canonical_query(&req.query_string),
+            &hts,
+            &payload_hash(&req),
+        );
+        let sig = compute_signature(secret, &auth.scope, &amz, &cr);
+        req.query_string = format!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={cred_q}\
+             &X-Amz-Date={amz}&X-Amz-Expires={expires}&X-Amz-SignedHeaders=host\
+             &X-Amz-Signature={sig}"
+        );
+        req
+    }
+
+    fn sign_v2_query(mut req: Request, access: &str, secret: &str, expires: i64) -> Request {
+        use crate::sigv2::{compute_signature_v2, string_to_sign_v2, SigV2Auth};
+        let auth = SigV2Auth {
+            access_key: access.into(),
+            signature: String::new(),
+            query_auth: true,
+            expires: Some(expires),
+        };
+        req.query_string = format!("AWSAccessKeyId={access}&Expires={expires}&Signature=x");
+        let sts = string_to_sign_v2(&req, &auth);
+        let sig = compute_signature_v2(secret, &sts);
+        req.query_string = format!("AWSAccessKeyId={access}&Expires={expires}&Signature={sig}");
+        req
+    }
+
+    fn assert_s3_code(resp: Response, status: u16, code: &str, message: &str) {
+        assert_eq!(resp.status, status, "status");
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        crate::response::assert_error_xml_matches_normalize(&body, code, message);
+    }
+
+    #[test]
+    fn handle_sigv4_header_clock_skew_is_403() {
+        let api = S3Api::new(cred_map());
+        let now = unix_now();
+        let req = sign_request(
+            base_s3_req_at("GET", "/mybucket/obj", "", now - 3600),
+            "testing",
+        );
+        let next: NextFn = Arc::new(|_| panic!("skewed SigV4 must not be served"));
+        assert_s3_code(
+            api.handle(req, &next),
+            403,
+            "RequestTimeTooSkewed",
+            "The difference between the request time and the current time is too large.",
+        );
+    }
+
+    #[test]
+    fn handle_sigv2_header_clock_skew_is_403() {
+        let api = S3Api::new(cred_map());
+        let now = unix_now();
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Host", "localhost");
+        headers.set("Date", swift_http::http_date(now - 3600));
+        let req = Request {
+            method: "GET".into(),
+            path: "/mybucket/obj".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        };
+        let req = sign_request_v2(req, "test:tester", "testing");
+        let next: NextFn = Arc::new(|_| panic!("skewed SigV2 must not be served"));
+        assert_s3_code(
+            api.handle(req, &next),
+            403,
+            "RequestTimeTooSkewed",
+            "The difference between the request time and the current time is too large.",
+        );
+    }
+
+    #[test]
+    fn handle_sigv4_query_expired_is_access_denied() {
+        let api = S3Api::new(cred_map());
+        let now = unix_now();
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Host", "localhost");
+        let req = Request {
+            method: "GET".into(),
+            path: "/mybucket/obj".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        };
+        let req = sign_v4_query(req, "test:tester", "testing", now - 120, 1);
+        let next: NextFn = Arc::new(|_| panic!("expired V4 query must not be served"));
+        assert_s3_code(
+            api.handle(req, &next),
+            403,
+            "AccessDenied",
+            "Request has expired",
+        );
+    }
+
+    #[test]
+    fn handle_sigv2_query_expired_is_access_denied() {
+        let api = S3Api::new(cred_map());
+        let now = unix_now();
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Host", "localhost");
+        let req = Request {
+            method: "GET".into(),
+            path: "/mybucket/obj".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        };
+        let req = sign_v2_query(req, "test:tester", "testing", now - 10);
+        let next: NextFn = Arc::new(|_| panic!("expired V2 query must not be served"));
+        assert_s3_code(
+            api.handle(req, &next),
+            403,
+            "AccessDenied",
+            "Request has expired",
+        );
+    }
+
+    #[test]
+    fn put_unknown_storage_class_is_400() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket/negative/invalid-storage-class", "");
+        req.headers.set("x-amz-storage-class", "GLACIER");
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|_| panic!("unknown storage_class must not persist"));
+        assert_s3_code(
+            api.handle(req, &next),
+            400,
+            "InvalidStorageClass",
+            "The storage class you specified is not valid.",
+        );
+    }
+
+    #[test]
+    fn copy_unknown_storage_class_is_400() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket/dst", "");
+        req.headers.set("x-amz-copy-source", "/src/obj");
+        req.headers.set("x-amz-storage-class", "GLACIER");
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|_| panic!("copy unknown storage_class must not persist"));
+        assert_s3_code(
+            api.handle(req, &next),
+            400,
+            "InvalidStorageClass",
+            "The storage class you specified is not valid.",
+        );
+    }
+
+    #[test]
+    fn put_standard_storage_class_reaches_backend() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket/obj", "");
+        req.headers.set("x-amz-storage-class", "STANDARD");
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                return Response::new(404);
+            }
+            assert!(
+                r.headers.get("x-amz-storage-class").is_none(),
+                "x-amz-storage-class must be stripped before persist"
+            );
+            let mut resp = Response::new(201);
+            resp.headers.set("ETag", "abc123");
+            resp
+        });
+        assert_eq!(api.handle(req, &next).status, 200);
     }
 }

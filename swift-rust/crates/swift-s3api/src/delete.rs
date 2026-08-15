@@ -19,7 +19,16 @@
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MultiDeleteRequest {
     pub quiet: bool,
-    pub keys: Vec<String>,
+    pub objects: Vec<MultiDeleteObject>,
+}
+
+/// One object entry in a multi-delete request.  `version_id` is significant:
+/// omitting it creates a delete marker in a versioned bucket, while supplying
+/// it deletes exactly that version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiDeleteObject {
+    pub key: String,
+    pub version_id: Option<String>,
 }
 
 /// Extract text between `<Tag>` and `</Tag>` (first occurrence), unescaping
@@ -47,7 +56,7 @@ pub fn parse_multi_delete_body(body: &[u8]) -> Result<MultiDeleteRequest, String
         return Err("MalformedXML".into());
     }
     let quiet = text.contains("<Quiet>true</Quiet>") || text.contains("<Quiet>True</Quiet>");
-    let mut keys = Vec::new();
+    let mut objects = Vec::new();
     let mut rest = text;
     while let Some(obj_start) = rest.find("<Object>") {
         let after = &rest[obj_start..];
@@ -57,12 +66,15 @@ pub fn parse_multi_delete_body(body: &[u8]) -> Result<MultiDeleteRequest, String
         let obj = &after[..obj_end_rel + "</Object>".len()];
         if let Some(key) = xml_tag_text(obj, "Key") {
             if !key.is_empty() {
-                keys.push(key);
+                objects.push(MultiDeleteObject {
+                    key,
+                    version_id: xml_tag_text(obj, "VersionId").filter(|value| !value.is_empty()),
+                });
             }
         }
         rest = &after[obj_end_rel + "</Object>".len()..];
     }
-    Ok(MultiDeleteRequest { quiet, keys })
+    Ok(MultiDeleteRequest { quiet, objects })
 }
 
 #[cfg(test)]
@@ -75,11 +87,23 @@ mod tests {
 <Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Quiet>true</Quiet>
   <Object><Key>a</Key></Object>
-  <Object><Key>b/c</Key></Object>
+  <Object><Key>b/c</Key><VersionId>abc123</VersionId></Object>
 </Delete>"#;
         let req = parse_multi_delete_body(body).unwrap();
         assert!(req.quiet);
-        assert_eq!(req.keys, vec!["a".to_string(), "b/c".to_string()]);
+        assert_eq!(
+            req.objects,
+            vec![
+                MultiDeleteObject {
+                    key: "a".to_string(),
+                    version_id: None,
+                },
+                MultiDeleteObject {
+                    key: "b/c".to_string(),
+                    version_id: Some("abc123".to_string()),
+                },
+            ]
+        );
     }
 
     #[test]
