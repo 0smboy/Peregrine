@@ -4092,6 +4092,16 @@ fn handle_versioned_put(
     }
     stamp_object_write_precondition(&mut req.headers, current_exists.then_some(&cur));
 
+    // Index Size is the object length, not the Swift PUT response
+    // Content-Length (empty body → 0). ListVersions compares Size.
+    let request_size: i64 = req
+        .headers
+        .get("Content-Length")
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n >= 0)
+        .or_else(|| req.body.content_length().map(|n| n as i64))
+        .unwrap_or(0);
+
     let resp = next(req);
     if !swift_write_applied(resp.status) {
         return backend_write_not_applied(resp.status, Some(bucket), Some(key));
@@ -4109,11 +4119,7 @@ fn handle_versioned_put(
         .get("ETag")
         .map(vers_bare_etag)
         .unwrap_or_default();
-    let size = resp
-        .headers
-        .get("Content-Length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0i64);
+    let size = request_size;
     let lm = resp
         .headers
         .get("Last-Modified")
@@ -7018,6 +7024,15 @@ mod tests {
             "{body}"
         );
         assert_eq!(body.matches("<Version>").count(), 2);
+        // Request body length, not Swift PUT response Content-Length 0.
+        assert!(
+            body.contains("<Size>2</Size>"),
+            "v1 size missing: {body}"
+        );
+        assert!(
+            body.contains("<Size>7</Size>"),
+            "v2 size missing: {body}"
+        );
     }
 
     #[test]
