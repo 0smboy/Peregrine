@@ -13,13 +13,14 @@ implemented.** Product and fairness claims must stay inside what is green here.
 Canonical long form in-repo:
 [`docs/fairness-lab/RUST-VS-PYTHON-PARITY.md`](https://github.com/0smboy/Peregrine/blob/main/docs/fairness-lab/RUST-VS-PYTHON-PARITY.md).
 
-**As of 2026-08-15 · Contabo lab · not PRODUCTION-GO-LIVE.**
-Claim: **IMPLEMENTED_SUBSET_ONLY**. Dual-oracle 57-case last run (post-XML)
-`37/20` (`rc=1`). Python-implemented S3 negatives (skew / StorageClass /
-`RequestId`) are live on the VIP. Rust extras Python 2.33 does not implement
-(object-ACL write, tagging/CORS mutate, RestoreObject) stay implemented and
-are **not** forced to 501. Details:
-[`docs/fairness-lab/S3-ALIGN-20260815.md`](https://github.com/0smboy/Peregrine/blob/build/phase1-deploy-rs-lb/docs/fairness-lab/S3-ALIGN-20260815.md).
+**As of 2026-08-16 · Contabo lab · not PRODUCTION-GO-LIVE.**
+Claim: **IMPLEMENTED_SUBSET_ONLY**. Dual-oracle 57-case last run (post-SIZE)
+`42/15` (`rc=1`). Schema (ISO / MPU ETag / PUT-ACL `Location`) and ListVersions
+`Size` are live on the VIP (`69d22629…`). Rust extras Python 2.33 does not
+implement (object-ACL write, tagging/CORS mutate, RestoreObject) stay
+implemented and are **not** forced to 501. Remaining 15 = 7 extras + 7 header
+noise + 1 Python residual (`x-amz-delete-marker`). Not GREEN. Details:
+[`docs/fairness-lab/S3-ALIGN-20260815.md`](https://github.com/0smboy/Peregrine/blob/main/docs/fairness-lab/S3-ALIGN-20260815.md).
 
 ## Headline
 
