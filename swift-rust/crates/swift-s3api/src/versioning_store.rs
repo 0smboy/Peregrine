@@ -5,11 +5,17 @@
 //! * current object at normal path with SYS_VERSION_ID / SYS_DELETE_MARKER
 //! * archive container `{bucket}+versions`
 //! * archive name `{hex(key)}/{version_id}` (hex is reversible UTF-8 encoding)
-//! * index at `{hex(key)}/index.json` for ListVersions
+//! * index mirror at `{hex(key)}/index.json` for ListVersions and readers
+//! * one immutable fence per committed generation at
+//!   `{hex(key)}/index.g{N:020}.json` (see [`index_generation_object_name`])
 //!
 //! [`VersionIndex::apply_if_match`] / [`VersionIndex::cas_etag`] are
-//! **in-process** CAS helpers only. This module is **not** a distributed
-//! CAS coordinator. Cross-proxy linearization is still BLOCKED.
+//! **in-process** CAS helpers only. Cross-proxy serialization is provided
+//! by the backend fence protocol in `middleware::cas_save_version_index`:
+//! each committed generation is created exactly once with
+//! `If-None-Match: *` (enforced by every object-server generation since the
+//! monorepo import), so two proxies can never both apply the same
+//! generation. See docs/fairness-lab/VERSION-CAS-DESIGN-20260817.md.
 
 use crate::crypto::sha256_hex;
 use crate::response::s3_xml_timestamp;
@@ -63,9 +69,15 @@ pub fn versioning_status(status: Option<&str>) -> VersioningStatus {
 
 /// Archive / index path segment check for a version-id.
 ///
-/// `false` for empty, `index.json`, `.`, `..`, any `/`, or any NUL.
+/// `false` for empty, `.`, `..`, any `/`, any NUL, and the whole reserved
+/// `index.*` namespace: `index.json` (the mirror) and `index.g<N>.json`
+/// (per-generation CAS fence objects) must never be addressable as archive
+/// objects.
 pub fn is_safe_version_id(s: &str) -> bool {
-    if s.is_empty() || s == INDEX_NAME || s == "." || s == ".." {
+    if s.is_empty() || s == "." || s == ".." {
+        return false;
+    }
+    if s == INDEX_NAME || s.starts_with("index.") {
         return false;
     }
     if s.contains('/') || s.contains('\0') {
@@ -74,10 +86,9 @@ pub fn is_safe_version_id(s: &str) -> bool {
     true
 }
 
-/// In-process compare-and-swap denial.
-///
-/// This is **not** a distributed CAS coordinator. Cross-proxy
-/// linearization is still BLOCKED.
+/// In-process compare-and-swap denial (the fast path). The backend fence in
+/// `middleware::cas_save_version_index` serializes across proxies; conflicts
+/// there surface the same client-visible class as this denial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CasDenied {
     /// `expected_generation` did not equal [`VersionIndex::generation`].
@@ -128,6 +139,19 @@ pub fn archive_object_name(key: &str, version_id: &str) -> String {
 
 pub fn index_object_name(key: &str) -> String {
     format!("{}/{}", key_hex(key), INDEX_NAME)
+}
+
+/// Immutable fence object for one committed index generation:
+/// `{hex(key)}/index.g{generation:020}.json`.
+///
+/// Zero-padded to 20 digits (u64 max) so lexicographic order equals numeric
+/// order. Fences are created with `If-None-Match: *` and never overwritten
+/// or deleted: exactly one writer can own a generation, which is what makes
+/// the index CAS hold across proxies. Reusing a generation name after a
+/// delete would fork history, so fences are permanent until an offline
+/// compactor with its own safety proof (follow-up window).
+pub fn index_generation_object_name(key: &str, generation: u64) -> String {
+    format!("{}/index.g{generation:020}.json", key_hex(key))
 }
 
 pub fn parse_archive_object_name(name: &str) -> Option<(String, String)> {
@@ -185,10 +209,10 @@ pub struct VersionRecord {
 pub struct VersionIndex {
     pub key: String,
     pub versions: Vec<VersionRecord>,
-    /// In-process CAS generation. Optional on the wire (`generation`).
-    ///
-    /// Default `0`. This is **not** a distributed CAS coordinator.
-    /// Cross-proxy linearization is still BLOCKED.
+    /// Index CAS generation. Optional on the wire (`generation`, default
+    /// `0` for legacy mirrors). In-process it gates [`Self::apply_if_match`]
+    /// (fast path); across proxies each committed generation is fenced by a
+    /// create-only backend object (see [`index_generation_object_name`]).
     pub generation: u64,
 }
 
@@ -313,8 +337,8 @@ impl VersionIndex {
 
     /// Opaque hex of `generation` + latest `version_id` + `key`.
     ///
-    /// In-process identity only. This is **not** a distributed CAS
-    /// coordinator. Cross-proxy linearization is still BLOCKED.
+    /// In-process identity only — never sent to the backend (the backend
+    /// CAS is the create-only generation fence, not this digest).
     pub fn cas_etag(&self) -> String {
         let latest = self.latest_version_id();
         let mut material = Vec::with_capacity(8 + latest.len() + self.key.len() + 2);
@@ -333,8 +357,9 @@ impl VersionIndex {
     /// * `None` is allowed only when `generation == 0` (uninitialized).
     /// * `None` when `generation > 0` is denied.
     ///
-    /// This is **not** a distributed CAS coordinator. Cross-proxy
-    /// linearization is still BLOCKED.
+    /// This is the in-process fast path; the resulting generation is then
+    /// committed across proxies by the backend fence in
+    /// `middleware::cas_save_version_index`.
     pub fn apply_if_match(
         &mut self,
         expected_generation: Option<u64>,
@@ -841,6 +866,44 @@ mod tests {
         assert!(!is_safe_version_id("ab\0c"));
         assert!(is_safe_version_id("0123456789abcdef0123456789abcdef"));
         assert!(is_safe_version_id(NULL_VERSION_ID));
+    }
+
+    #[test]
+    fn is_safe_version_id_reserves_generation_fence_namespace() {
+        // A poisoned index listing a fence name as a version-id could make
+        // an exact-version DELETE remove the fence and fork history.
+        assert!(!is_safe_version_id("index.g00000000000000000001.json"));
+        assert!(!is_safe_version_id("index.g1.json"));
+        assert!(!is_safe_version_id("index."));
+        assert!(!is_safe_version_id("index.anything"));
+        // Bare "index" without the dot stays a (weird but) legal id.
+        assert!(is_safe_version_id("index"));
+    }
+
+    #[test]
+    fn index_generation_object_name_orders_and_never_parses_as_archive() {
+        let g1 = index_generation_object_name("obj", 1);
+        assert_eq!(
+            g1,
+            format!("{}/index.g00000000000000000001.json", key_hex("obj"))
+        );
+        // Zero-padding: lexicographic order equals numeric order, including
+        // across digit-count boundaries and at u64::MAX.
+        let g9 = index_generation_object_name("obj", 9);
+        let g10 = index_generation_object_name("obj", 10);
+        let gmax = index_generation_object_name("obj", u64::MAX);
+        assert!(g1 < g9 && g9 < g10 && g10 < gmax);
+        // Fences are not archives and must never resolve as one.
+        assert_eq!(parse_archive_object_name(&g1), None);
+        assert_eq!(parse_archive_object_name(&gmax), None);
+        // Fences sort between hex archives and the mirror, and the
+        // ListVersions mirror filter (`ends_with("index.json")`) skips them.
+        assert!(!g1.ends_with(INDEX_NAME));
+        // A fence read back as a full index snapshot round-trips.
+        let mut idx = VersionIndex::new("obj");
+        idx.generation = 7;
+        let parsed = VersionIndex::from_json(&idx.to_json()).unwrap();
+        assert_eq!(parsed.generation, 7);
     }
 
     #[test]
