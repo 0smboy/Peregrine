@@ -558,6 +558,111 @@ mod tests {
     }
 
     #[test]
+    fn native_clock_ok_false_expired_compliance_still_denied() {
+        // Wave-9 fault injection: with an untrusted clock, an apparently
+        // expired COMPLIANCE lock cannot be treated as expired.
+        let mut headers = HeaderKeyDict::new();
+        headers.set(SYS_LOCK_MODE, "COMPLIANCE");
+        headers.set(SYS_RETAIN_UNTIL, "2000-01-01T00:00:00Z");
+        assert!(!native_mutation_allowed(
+            "DELETE",
+            &headers,
+            1_700_000_000,
+            false,
+            NativeGovernanceBypass::NONE,
+        ));
+        // Healthy clock: the same expired COMPLIANCE lock allows.
+        assert!(native_mutation_allowed(
+            "DELETE",
+            &headers,
+            1_700_000_000,
+            true,
+            NativeGovernanceBypass::NONE,
+        ));
+        // GOVERNANCE is unaffected by clock health: effective bypass still
+        // allows with clock_ok=false.
+        let mut gov = HeaderKeyDict::new();
+        gov.set(SYS_LOCK_MODE, "GOVERNANCE");
+        gov.set(SYS_RETAIN_UNTIL, "2033-05-18T03:33:20Z");
+        assert!(native_mutation_allowed(
+            "DELETE",
+            &gov,
+            1_700_000_000,
+            false,
+            NativeGovernanceBypass {
+                requested: true,
+                authorized: true,
+            },
+        ));
+    }
+
+    #[test]
+    fn native_half_lock_fields_deny() {
+        // Retain-until without mode is corrupt persisted state → deny.
+        let mut headers = HeaderKeyDict::new();
+        headers.set(SYS_RETAIN_UNTIL, "2033-05-18T03:33:20Z");
+        for method in ["PUT", "POST", "DELETE"] {
+            assert!(!native_mutation_allowed(
+                method,
+                &headers,
+                1_700_000_000,
+                true,
+                NativeGovernanceBypass::NONE,
+            ));
+        }
+        // Unknown mode string with a valid date is also corrupt → deny.
+        let mut bogus = HeaderKeyDict::new();
+        bogus.set(SYS_LOCK_MODE, "BOGUS");
+        bogus.set(SYS_RETAIN_UNTIL, "2033-05-18T03:33:20Z");
+        assert!(!native_mutation_allowed(
+            "DELETE",
+            &bogus,
+            1_700_000_000,
+            true,
+            NativeGovernanceBypass::NONE,
+        ));
+    }
+
+    /// BUG (Wave-9 WORM audit, 2026-08-17): the native gate classifies every
+    /// POST carrying non-lock sysmeta as a data overwrite, so S3
+    /// PutObjectTagging / DeleteObjectTagging (POST with
+    /// `X-Object-Sysmeta-S3-Tagging`) and RestoreObject
+    /// (POST with `X-Object-Sysmeta-S3-Restore-Until`) return 403 on a
+    /// locked object wherever the Rust object-server is in the path.
+    /// AWS allows all three on locked objects: Object Lock protects object
+    /// data and lock state, not tags or restore status. Swift-native POST is
+    /// metadata-only and never rewrites data.
+    ///
+    /// This test asserts the DESIRED (AWS) behaviour and is ignored until the
+    /// control-plane classifier learns non-destructive metadata POSTs. Fix
+    /// belongs to a code window, not this test-only audit branch.
+    #[test]
+    #[ignore = "records native-gate over-blocking of tagging/restore POST on locked objects; un-ignore with the fix"]
+    fn native_gate_should_allow_tagging_only_post_on_locked_object() {
+        let object = locked_compliance();
+        let mut tagging_only = HeaderKeyDict::new();
+        tagging_only.set("X-Object-Sysmeta-S3-Tagging", "env=prod");
+        assert!(native_mutation_allowed_for(
+            "POST",
+            &object,
+            Some(&tagging_only),
+            1_700_000_000,
+            true,
+            NativeGovernanceBypass::NONE,
+        ));
+        let mut restore_only = HeaderKeyDict::new();
+        restore_only.set("X-Object-Sysmeta-S3-Restore-Until", "1893456000");
+        assert!(native_mutation_allowed_for(
+            "POST",
+            &object,
+            Some(&restore_only),
+            1_700_000_000,
+            true,
+            NativeGovernanceBypass::NONE,
+        ));
+    }
+
+    #[test]
     fn lock_control_plane_post_is_not_denied() {
         let object = locked_compliance();
         let mut lock_only = HeaderKeyDict::new();

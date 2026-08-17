@@ -8889,6 +8889,768 @@ mod tests {
         assert!(put_seen.load(std::sync::atomic::Ordering::SeqCst));
     }
 
+    // ---- Wave-9 WORM fault-injection: malformed persisted lock state ----
+
+    /// DELETE against corrupt persisted lock sysmeta must be InternalError
+    /// (fail-closed), never reinterpreted as an unlocked object.
+    #[test]
+    fn malformed_persisted_lock_delete_fails_closed_internal_error() {
+        let cases: &[(&str, &str)] = &[
+            ("BOGUS", "2099-12-31T00:00:00Z"), // unknown mode, valid date
+            ("COMPLIANCE", "not-a-date"),      // valid mode, corrupt date
+            ("COMPLIANCE", ""),                // half record: mode only
+            ("", "2099-12-31T00:00:00Z"),      // half record: date only
+        ];
+        for (mode, until) in cases {
+            let api = S3Api::new(cred_map());
+            let del = sign_request(base_s3_req("DELETE", "/mybucket/corrupt", ""), "testing");
+            let mode_c = mode.to_string();
+            let until_c = until.to_string();
+            let next: NextFn = Arc::new(move |r| {
+                if r.method == "HEAD" {
+                    if r.path.ends_with("/corrupt") {
+                        let mut resp = Response::new(200);
+                        if !mode_c.is_empty() {
+                            resp.headers.set(SYS_LOCK_MODE, &mode_c);
+                        }
+                        if !until_c.is_empty() {
+                            resp.headers.set(SYS_RETAIN_UNTIL, &until_c);
+                        }
+                        return resp;
+                    }
+                    return Response::new(204);
+                }
+                panic!(
+                    "corrupt lock metadata must fail closed, backend saw: {} {}",
+                    r.method, r.path
+                );
+            });
+            let resp = api.handle(del, &next);
+            assert_eq!(resp.status, 500, "mode={mode:?} until={until:?}");
+            let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+            assert!(body.contains("InternalError"), "{body}");
+        }
+    }
+
+    /// A legal-hold value that is neither ON nor OFF is corrupt persisted
+    /// state: DELETE fails closed with InternalError.
+    #[test]
+    fn malformed_legal_hold_value_blocks_delete_fail_closed() {
+        let api = S3Api::new(cred_map());
+        let del = sign_request(base_s3_req("DELETE", "/mybucket/heldish", ""), "testing");
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                if r.path.ends_with("/heldish") {
+                    let mut resp = Response::new(200);
+                    resp.headers.set(SYS_LEGAL_HOLD, "maybe");
+                    return resp;
+                }
+                return Response::new(204);
+            }
+            panic!("corrupt legal hold must not reach backend DELETE");
+        });
+        let resp = api.handle(del, &next);
+        assert_eq!(resp.status, 500);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("InternalError"));
+    }
+
+    /// Overwrite PUT against corrupt persisted lock sysmeta fails closed.
+    #[test]
+    fn malformed_persisted_lock_overwrite_put_fails_closed() {
+        let api = S3Api::new(cred_map());
+        let mut put = base_s3_req("PUT", "/mybucket/corrupt", "");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(b"new".to_vec());
+        let put = sign_request(put, "testing");
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                if r.path.ends_with("/corrupt") {
+                    let mut resp = Response::new(200);
+                    resp.headers.set(SYS_LOCK_MODE, "COMPLIANCE");
+                    resp.headers.set(SYS_RETAIN_UNTIL, "junk");
+                    return resp;
+                }
+                return Response::new(404);
+            }
+            panic!(
+                "overwrite of corrupt-locked object must fail closed: {} {}",
+                r.method, r.path
+            );
+        });
+        let resp = api.handle(put, &next);
+        assert_eq!(resp.status, 500);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("InternalError"));
+    }
+
+    /// GET ?retention over corrupt persisted lock state answers InternalError,
+    /// not "no retention" and not a reinterpreted record.
+    #[test]
+    fn retention_get_on_malformed_persisted_lock_is_internal_error() {
+        let api = S3Api::new(cred_map());
+        let get = sign_request(base_s3_req("GET", "/mybucket/corrupt", "retention"), "testing");
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.method, "HEAD");
+            let mut resp = Response::new(200);
+            resp.headers.set(SYS_LOCK_MODE, "GOVERNANCE");
+            resp.headers.set(SYS_RETAIN_UNTIL, "2030-13-45T99:99:99Z");
+            resp
+        });
+        let resp = api.handle(get, &next);
+        assert_eq!(resp.status, 500);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("InternalError"), "{body}");
+        assert!(!body.contains("GOVERNANCE"), "must not echo corrupt state: {body}");
+    }
+
+    /// PUT ?retention over a half-persisted lock record (mode without date)
+    /// fails closed with InternalError and never POSTs new sysmeta.
+    #[test]
+    fn retention_put_on_malformed_persisted_lock_fails_closed() {
+        let api = S3Api::new(cred_map());
+        let body = br#"<Retention>
+  <Mode>COMPLIANCE</Mode>
+  <RetainUntilDate>2099-01-01T00:00:00Z</RetainUntilDate>
+</Retention>"#;
+        let mut put = base_s3_req("PUT", "/mybucket/corrupt", "retention");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(body.to_vec());
+        let put = sign_request(put, "testing");
+        let lock_meta = mock_bucket_lock_meta();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" && r.path.ends_with("/mybucket") {
+                let mut resp = Response::new(204);
+                resp.headers.set(S3_OBJECT_LOCK_META, &lock_meta);
+                return resp;
+            }
+            if r.method == "HEAD" {
+                let mut resp = Response::new(200);
+                resp.headers.set(SYS_LOCK_MODE, "COMPLIANCE"); // date missing
+                return resp;
+            }
+            panic!(
+                "retention PUT over corrupt state must not POST: {} {}",
+                r.method, r.path
+            );
+        });
+        let resp = api.handle(put, &next);
+        assert_eq!(resp.status, 500);
+        let b = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(b.contains("InternalError"));
+    }
+
+    // ---- Wave-9 WORM fault-injection: persist-layer backend failures ----
+
+    /// A 5xx on the lock-state HEAD is not "no lock": DELETE must fail closed
+    /// with the mapped backend error and never reach the backend DELETE.
+    #[test]
+    fn delete_backend_head_5xx_fails_closed_without_delete() {
+        let api = S3Api::new(cred_map());
+        let del = sign_request(base_s3_req("DELETE", "/mybucket/flaky", ""), "testing");
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                if r.path.ends_with("/flaky") {
+                    return Response::new(503);
+                }
+                return Response::new(204);
+            }
+            panic!("HEAD 5xx must not fall through to DELETE: {} {}", r.method, r.path);
+        });
+        let resp = api.handle(del, &next);
+        assert_eq!(resp.status, 500);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("InternalError"), "{body}");
+    }
+
+    /// Backend failures on PUT ?retention surface as errors: a 5xx on the
+    /// resolve HEAD aborts before evaluation, and a 5xx on the sysmeta POST
+    /// must not be reported as success.
+    #[test]
+    fn retention_put_backend_failures_do_not_succeed() {
+        let body = br#"<Retention>
+  <Mode>GOVERNANCE</Mode>
+  <RetainUntilDate>2099-01-01T00:00:00Z</RetainUntilDate>
+</Retention>"#;
+        let make_put = || {
+            let mut put = base_s3_req("PUT", "/mybucket/flaky", "retention");
+            put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+            put.body = Body::from(body.to_vec());
+            sign_request(put, "testing")
+        };
+
+        // (a) resolve HEAD 5xx → error, nothing else contacted.
+        let api = S3Api::new(cred_map());
+        let lock_meta = mock_bucket_lock_meta();
+        let next_head_5xx: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" && r.path.ends_with("/mybucket") {
+                let mut resp = Response::new(204);
+                resp.headers.set(S3_OBJECT_LOCK_META, &lock_meta);
+                return resp;
+            }
+            if r.method == "HEAD" {
+                return Response::new(502);
+            }
+            panic!("resolve HEAD 5xx must abort retention PUT: {} {}", r.method, r.path);
+        });
+        let resp = api.handle(make_put(), &next_head_5xx);
+        assert_eq!(resp.status, 500);
+
+        // (b) sysmeta POST 5xx → mapped error, not 200.
+        let api = S3Api::new(cred_map());
+        let lock_meta = mock_bucket_lock_meta();
+        let next_post_5xx: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" && r.path.ends_with("/mybucket") {
+                let mut resp = Response::new(204);
+                resp.headers.set(S3_OBJECT_LOCK_META, &lock_meta);
+                return resp;
+            }
+            if r.method == "HEAD" {
+                return Response::new(200); // object exists, unlocked
+            }
+            assert_eq!(r.method, "POST");
+            Response::new(503)
+        });
+        let resp = api.handle(make_put(), &next_post_5xx);
+        assert_eq!(resp.status, 500);
+        let b = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(b.contains("InternalError"), "{b}");
+    }
+
+    // ---- Wave-9 WORM fault-injection: governance bypass permission matrix ----
+
+    /// Bypass header without the IAM grant: GOVERNANCE delete stays denied
+    /// (header alone is never enough).
+    #[test]
+    fn governance_bypass_header_without_iam_grant_denies_delete() {
+        let api = S3Api::new(cred_map()); // no s3:BypassGovernanceRetention grant
+        let mut del = sign_request(base_s3_req("DELETE", "/mybucket/gov", ""), "testing");
+        del.headers.set(HDR_BYPASS_GOVERNANCE, "true");
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                let mut resp = Response::new(200);
+                resp.headers.set(SYS_LOCK_MODE, "GOVERNANCE");
+                resp.headers.set(SYS_RETAIN_UNTIL, "2099-12-31T00:00:00Z");
+                return resp;
+            }
+            panic!("header-only bypass must not reach backend DELETE");
+        });
+        let resp = api.handle(del, &next);
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("AccessDenied"));
+    }
+
+    /// IAM grant without the bypass header: GOVERNANCE delete stays denied
+    /// (permission alone is never enough).
+    #[test]
+    fn governance_iam_grant_without_header_denies_delete() {
+        let api = api_with_worm_bypass_permission();
+        let del = sign_request(base_s3_req("DELETE", "/mybucket/gov", ""), "testing");
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                let mut resp = Response::new(200);
+                resp.headers.set(SYS_LOCK_MODE, "GOVERNANCE");
+                resp.headers.set(SYS_RETAIN_UNTIL, "2099-12-31T00:00:00Z");
+                return resp;
+            }
+            panic!("grant-only (no header) must not reach backend DELETE");
+        });
+        let resp = api.handle(del, &next);
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("AccessDenied"));
+    }
+
+    /// COMPLIANCE ignores bypass in every partial combination: header without
+    /// grant and grant without header both stay denied.
+    #[test]
+    fn compliance_bypass_partial_bits_deny_delete() {
+        let compliance_head: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                let mut resp = Response::new(200);
+                resp.headers.set(SYS_LOCK_MODE, "COMPLIANCE");
+                resp.headers.set(SYS_RETAIN_UNTIL, "2099-12-31T00:00:00Z");
+                return resp;
+            }
+            panic!("COMPLIANCE must never reach backend DELETE");
+        });
+
+        // Header without grant.
+        let api = S3Api::new(cred_map());
+        let mut del = sign_request(base_s3_req("DELETE", "/mybucket/comp", ""), "testing");
+        del.headers.set(HDR_BYPASS_GOVERNANCE, "true");
+        let resp = api.handle(del, &compliance_head);
+        assert_eq!(resp.status, 403);
+
+        // Grant without header.
+        let api = api_with_worm_bypass_permission();
+        let del = sign_request(base_s3_req("DELETE", "/mybucket/comp", ""), "testing");
+        let resp = api.handle(del, &compliance_head);
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("AccessDenied"));
+    }
+
+    // ---- Wave-9 WORM × versioning interaction locks ----
+
+    /// Seed the versioning mock store's bucket with Object Lock config so
+    /// explicit x-amz-object-lock-* PUT headers pass the bucket gate.
+    fn seed_bucket_object_lock(next: &NextFn) {
+        let mut post = make_swift_req("POST", "/v1/AUTH_test/mybucket");
+        post.headers
+            .set(S3_OBJECT_LOCK_META, mock_bucket_lock_meta());
+        assert_eq!(next(post).status, 204);
+    }
+
+    /// Enabled versioning: a PUT over a COMPLIANCE-locked current version is
+    /// allowed (the lock protects the version, not the key), the locked
+    /// version survives as a retrievable non-current version, and the new
+    /// unlocked version does not inherit the lock.
+    #[test]
+    fn versioned_put_over_compliance_locked_current_creates_new_version() {
+        let api = S3Api::new(cred_map());
+        let next = versioning_mock_store("Enabled");
+        seed_bucket_object_lock(&next);
+
+        let mut p1 = base_s3_req("PUT", "/mybucket/obj", "");
+        p1.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        p1.body = Body::from(b"one".to_vec());
+        let mut p1 = sign_request(p1, "testing");
+        p1.headers.set("X-Amz-Object-Lock-Mode", "COMPLIANCE");
+        p1.headers
+            .set("X-Amz-Object-Lock-Retain-Until-Date", "2099-12-31T00:00:00Z");
+        let r1 = api.handle(p1, &next);
+        assert_eq!(r1.status, 200);
+        let vid1 = r1.headers.get("x-amz-version-id").unwrap().to_string();
+
+        let mut p2 = base_s3_req("PUT", "/mybucket/obj", "");
+        p2.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        p2.body = Body::from(b"two".to_vec());
+        let r2 = api.handle(sign_request(p2, "testing"), &next);
+        assert_eq!(r2.status, 200, "PUT over locked current must be allowed");
+        let vid2 = r2.headers.get("x-amz-version-id").unwrap().to_string();
+        assert_ne!(vid1, vid2);
+
+        // The locked version is archived, not destroyed.
+        let g1 = sign_request(
+            base_s3_req("GET", "/mybucket/obj", &format!("versionId={vid1}")),
+            "testing",
+        );
+        let g1 = api.handle(g1, &next);
+        assert_eq!(g1.status, 200);
+        assert_eq!(g1.body.into_vec(u64::MAX).unwrap(), b"one");
+
+        // The new version carries no lock: exact-version delete succeeds and
+        // promotes the locked version back to current.
+        let d2 = sign_request(
+            base_s3_req("DELETE", "/mybucket/obj", &format!("versionId={vid2}")),
+            "testing",
+        );
+        assert_eq!(api.handle(d2, &next).status, 204);
+        let cur = sign_request(base_s3_req("GET", "/mybucket/obj", ""), "testing");
+        let cur = api.handle(cur, &next);
+        assert_eq!(cur.status, 200);
+        assert_eq!(cur.body.into_vec(u64::MAX).unwrap(), b"one");
+    }
+
+    /// Enabled versioning: DELETE without versionId on a legal-hold object
+    /// only writes a delete marker; the held version stays retrievable.
+    #[test]
+    fn versioned_delete_marker_allowed_over_legal_hold_version() {
+        let api = S3Api::new(cred_map());
+        let next = versioning_mock_store("Enabled");
+        seed_bucket_object_lock(&next);
+
+        let mut p1 = base_s3_req("PUT", "/mybucket/obj", "");
+        p1.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        p1.body = Body::from(b"held".to_vec());
+        let mut p1 = sign_request(p1, "testing");
+        p1.headers.set("X-Amz-Object-Lock-Legal-Hold", "ON");
+        let r1 = api.handle(p1, &next);
+        assert_eq!(r1.status, 200);
+        let vid1 = r1.headers.get("x-amz-version-id").unwrap().to_string();
+
+        let del = sign_request(base_s3_req("DELETE", "/mybucket/obj", ""), "testing");
+        let dresp = api.handle(del, &next);
+        assert_eq!(dresp.status, 204, "delete marker must be allowed under legal hold");
+        assert_eq!(dresp.headers.get("x-amz-delete-marker"), Some("true"));
+
+        let g1 = sign_request(
+            base_s3_req("GET", "/mybucket/obj", &format!("versionId={vid1}")),
+            "testing",
+        );
+        let g1 = api.handle(g1, &next);
+        assert_eq!(g1.status, 200, "held version must survive the delete marker");
+        assert_eq!(g1.body.into_vec(u64::MAX).unwrap(), b"held");
+    }
+
+    /// DELETE ?versionId against a COMPLIANCE-protected version is denied both
+    /// while it is the current version and after it was archived by a newer
+    /// PUT (the lock sysmeta must survive archival).
+    #[test]
+    fn versioned_delete_compliance_version_denied_current_and_archived() {
+        let api = S3Api::new(cred_map());
+        let next = versioning_mock_store("Enabled");
+        seed_bucket_object_lock(&next);
+
+        let mut p1 = base_s3_req("PUT", "/mybucket/obj", "");
+        p1.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        p1.body = Body::from(b"keep".to_vec());
+        let mut p1 = sign_request(p1, "testing");
+        p1.headers.set("X-Amz-Object-Lock-Mode", "COMPLIANCE");
+        p1.headers
+            .set("X-Amz-Object-Lock-Retain-Until-Date", "2099-12-31T00:00:00Z");
+        let r1 = api.handle(p1, &next);
+        assert_eq!(r1.status, 200);
+        let vid1 = r1.headers.get("x-amz-version-id").unwrap().to_string();
+
+        // Current version: exact-version delete denied.
+        let d1 = sign_request(
+            base_s3_req("DELETE", "/mybucket/obj", &format!("versionId={vid1}")),
+            "testing",
+        );
+        let resp = api.handle(d1, &next);
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("AccessDenied"));
+
+        // Archive it under a newer version, then try again.
+        let mut p2 = base_s3_req("PUT", "/mybucket/obj", "");
+        p2.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        p2.body = Body::from(b"newer".to_vec());
+        assert_eq!(api.handle(sign_request(p2, "testing"), &next).status, 200);
+
+        let d1_again = sign_request(
+            base_s3_req("DELETE", "/mybucket/obj", &format!("versionId={vid1}")),
+            "testing",
+        );
+        let resp = api.handle(d1_again, &next);
+        assert_eq!(
+            resp.status, 403,
+            "lock must survive archival of the version"
+        );
+
+        let g1 = sign_request(
+            base_s3_req("GET", "/mybucket/obj", &format!("versionId={vid1}")),
+            "testing",
+        );
+        let g1 = api.handle(g1, &next);
+        assert_eq!(g1.status, 200);
+        assert_eq!(g1.body.into_vec(u64::MAX).unwrap(), b"keep");
+    }
+
+    /// Exact-version DELETE of a GOVERNANCE-locked version succeeds only with
+    /// the bypass header AND the IAM grant, on the versioned path too.
+    #[test]
+    fn versioned_governance_bypass_delete_removes_version() {
+        let api = api_with_worm_bypass_permission();
+        let next = versioning_mock_store("Enabled");
+        seed_bucket_object_lock(&next);
+
+        let mut p1 = base_s3_req("PUT", "/mybucket/obj", "");
+        p1.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        p1.body = Body::from(b"gov".to_vec());
+        let mut p1 = sign_request(p1, "testing");
+        p1.headers.set("X-Amz-Object-Lock-Mode", "GOVERNANCE");
+        p1.headers
+            .set("X-Amz-Object-Lock-Retain-Until-Date", "2099-12-31T00:00:00Z");
+        let r1 = api.handle(p1, &next);
+        assert_eq!(r1.status, 200);
+        let vid1 = r1.headers.get("x-amz-version-id").unwrap().to_string();
+
+        // Without the header: denied even though the IAM grant exists.
+        let plain = sign_request(
+            base_s3_req("DELETE", "/mybucket/obj", &format!("versionId={vid1}")),
+            "testing",
+        );
+        assert_eq!(api.handle(plain, &next).status, 403);
+
+        // Header + grant: the governance-locked version is removed.
+        let mut del = sign_request(
+            base_s3_req("DELETE", "/mybucket/obj", &format!("versionId={vid1}")),
+            "testing",
+        );
+        del.headers.set(HDR_BYPASS_GOVERNANCE, "true");
+        assert_eq!(api.handle(del, &next).status, 204);
+
+        let get = sign_request(
+            base_s3_req("GET", "/mybucket/obj", &format!("versionId={vid1}")),
+            "testing",
+        );
+        let got = api.handle(get, &next);
+        assert_eq!(got.status, 404);
+    }
+
+    /// Suspending versioning on a bucket that carries an Object Lock
+    /// configuration is rejected (AWS: InvalidBucketState).
+    #[test]
+    fn versioning_suspend_on_lock_bucket_is_invalid_bucket_state() {
+        let api = S3Api::new(cred_map());
+        let mut put = base_s3_req("PUT", "/mybucket", "versioning");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(
+            br#"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>"#
+                .to_vec(),
+        );
+        let put = sign_request(put, "testing");
+        let lock_meta = mock_bucket_lock_meta();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" {
+                let mut resp = Response::new(204);
+                resp.headers.set(S3_OBJECT_LOCK_META, &lock_meta);
+                return resp;
+            }
+            panic!("suspend on a lock bucket must not reach the backend POST");
+        });
+        let resp = api.handle(put, &next);
+        assert_eq!(resp.status, 409);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("InvalidBucketState"), "{body}");
+    }
+
+    /// Suspended versioning destroys the null version on overwrite, so a
+    /// locked null version blocks both PUT and the delete-marker DELETE.
+    #[test]
+    fn suspended_overwrite_and_delete_of_locked_null_version_denied() {
+        let api = S3Api::new(cred_map());
+        let next = versioning_mock_store("Suspended");
+        seed_bucket_object_lock(&next);
+
+        let mut p1 = base_s3_req("PUT", "/mybucket/obj", "");
+        p1.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        p1.body = Body::from(b"null-locked".to_vec());
+        let mut p1 = sign_request(p1, "testing");
+        p1.headers.set("X-Amz-Object-Lock-Mode", "COMPLIANCE");
+        p1.headers
+            .set("X-Amz-Object-Lock-Retain-Until-Date", "2099-12-31T00:00:00Z");
+        let r1 = api.handle(p1, &next);
+        assert_eq!(r1.status, 200);
+        assert_eq!(r1.headers.get("x-amz-version-id"), Some("null"));
+
+        // Overwrite would destroy the locked null version → denied.
+        let mut p2 = base_s3_req("PUT", "/mybucket/obj", "");
+        p2.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        p2.body = Body::from(b"clobber".to_vec());
+        let resp = api.handle(sign_request(p2, "testing"), &next);
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("AccessDenied"));
+
+        // Suspended DELETE replaces the null version with a null delete
+        // marker (destructive) → denied as well.
+        let del = sign_request(base_s3_req("DELETE", "/mybucket/obj", ""), "testing");
+        let resp = api.handle(del, &next);
+        assert_eq!(resp.status, 403);
+
+        // Locked null version is still intact.
+        let get = sign_request(base_s3_req("GET", "/mybucket/obj", ""), "testing");
+        let got = api.handle(get, &next);
+        assert_eq!(got.status, 200);
+        assert_eq!(got.body.into_vec(u64::MAX).unwrap(), b"null-locked");
+    }
+
+    // ---- Wave-9 WORM × MPU and cold-tier interaction locks ----
+
+    /// CompleteMultipartUpload into a bucket with a default retention rule
+    /// stamps the default lock sysmeta onto the manifest PUT.
+    #[test]
+    fn mpu_complete_stamps_bucket_default_retention() {
+        let api = S3Api::new(cred_map());
+        let lock_xml: &[u8] = br#"<ObjectLockConfiguration>
+  <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+  <Rule><DefaultRetention>
+    <Mode>COMPLIANCE</Mode><Days>2</Days>
+  </DefaultRetention></Rule>
+</ObjectLockConfiguration>"#;
+
+        let init_req = sign_request(base_s3_req("POST", "/mybucket/obj", "uploads"), "testing");
+        let init_next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                return Response::new(404);
+            }
+            assert_eq!(r.method, "PUT");
+            Response::new(201)
+        });
+        let init_resp = api.handle(init_req, &init_next);
+        assert_eq!(init_resp.status, 200);
+        let init_body = String::from_utf8(init_resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        let upload_id = init_body
+            .split("<UploadId>")
+            .nth(1)
+            .and_then(|s| s.split("</UploadId>").next())
+            .unwrap()
+            .to_string();
+
+        let mut complete_req = base_s3_req(
+            "POST",
+            "/mybucket/obj",
+            &format!("uploadId={upload_id}"),
+        );
+        complete_req
+            .headers
+            .set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        complete_req.body = Body::from(
+            br#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"b8fc857a25e7958868c2f003d5e0952d"</ETag></Part></CompleteMultipartUpload>"#
+                .to_vec(),
+        );
+        let complete_req = sign_request(complete_req, "testing");
+        let stamped = std::sync::Arc::new(std::sync::Mutex::new(
+            None::<(Option<String>, Option<String>)>,
+        ));
+        let stamped_c = stamped.clone();
+        let complete_next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" {
+                if r.path == "/v1/AUTH_test/mybucket" {
+                    let mut resp = Response::new(204);
+                    apply_object_lock_meta(&mut resp.headers, lock_xml);
+                    return resp;
+                }
+                if r.path.starts_with("/v1/AUTH_test/mybucket+segments/") {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("Content-Length", "14");
+                    return resp;
+                }
+                // Data object does not exist yet (no overwrite in play).
+                return Response::new(404);
+            }
+            assert_eq!(r.method, "PUT");
+            assert_eq!(r.path, "/v1/AUTH_test/mybucket/obj");
+            *stamped_c.lock().unwrap() = Some((
+                r.headers.get(SYS_LOCK_MODE).map(str::to_string),
+                r.headers.get(SYS_RETAIN_UNTIL).map(str::to_string),
+            ));
+            let mut resp = Response::new(201);
+            resp.headers.set("ETag", "manifest");
+            resp
+        });
+        let resp = api.handle(complete_req, &complete_next);
+        assert_eq!(resp.status, 200);
+        let (mode, until) = stamped.lock().unwrap().clone().expect("manifest PUT seen");
+        assert_eq!(mode.as_deref(), Some("COMPLIANCE"));
+        let until = until.expect("default retain-until stamped");
+        let ts = crate::object_lock_worm::parse_retain_until(&until).unwrap();
+        let now = unix_now();
+        assert!((ts - now - 2 * 86_400).abs() < 5, "until={until} now={now}");
+    }
+
+    /// CompleteMultipartUpload landing on a retention-locked existing key in
+    /// an unversioned bucket is an overwrite and must be denied before the
+    /// manifest PUT.
+    #[test]
+    fn mpu_complete_over_locked_object_denied() {
+        let api = S3Api::new(cred_map());
+        let complete_req = {
+            let mut req = base_s3_req("POST", "/mybucket/locked", "uploadId=deadbeefcafe");
+            req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+            req.body = Body::from(
+                br#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"b8fc857a25e7958868c2f003d5e0952d"</ETag></Part></CompleteMultipartUpload>"#
+                    .to_vec(),
+            );
+            sign_request(req, "testing")
+        };
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                if r.path == "/v1/AUTH_test/mybucket" {
+                    return Response::new(204); // unversioned, no lock config
+                }
+                if r.path.starts_with("/v1/AUTH_test/mybucket+segments/") {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("Content-Length", "14");
+                    return resp;
+                }
+                // The destination key is COMPLIANCE-locked.
+                let mut resp = Response::new(200);
+                resp.headers.set(SYS_LOCK_MODE, "COMPLIANCE");
+                resp.headers.set(SYS_RETAIN_UNTIL, "2099-12-31T00:00:00Z");
+                return resp;
+            }
+            panic!(
+                "complete over a locked key must not write the manifest: {} {}",
+                r.method, r.path
+            );
+        });
+        let resp = api.handle(complete_req, &next);
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("AccessDenied"));
+    }
+
+    /// Object Lock subresources stay available on a cold (transitioned)
+    /// object: GET ?retention answers the record and PUT ?retention can
+    /// extend it, while the data GET stays InvalidObjectState.
+    #[test]
+    fn retention_ops_allowed_on_cold_transitioned_object() {
+        let api = S3Api::new(cred_map());
+        let cold_get_next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" && r.path.ends_with("/mybucket") {
+                return Response::new(204);
+            }
+            let mut resp = if r.method == "GET" {
+                Response::with_body(200, b"payload".to_vec())
+            } else {
+                Response::new(200)
+            };
+            resp.headers.set(SYS_TRANSITIONED, "1");
+            resp.headers.set(META_STORAGE_CLASS, "GLACIER");
+            resp.headers.set(SYS_LOCK_MODE, "COMPLIANCE");
+            resp.headers.set(SYS_RETAIN_UNTIL, "2099-12-31T00:00:00Z");
+            resp.headers.set("ETag", "abc");
+            resp
+        });
+
+        // Metadata read works on the cold object.
+        let get_ret = sign_request(base_s3_req("GET", "/mybucket/cold", "retention"), "testing");
+        let resp = api.handle(get_ret, &cold_get_next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("COMPLIANCE") && body.contains("2099-12-31"), "{body}");
+
+        // Data read is blocked as cold.
+        let get_data = sign_request(base_s3_req("GET", "/mybucket/cold", ""), "testing");
+        let resp = api.handle(get_data, &cold_get_next);
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("InvalidObjectState"), "{body}");
+
+        // Retention extend on the cold object still works (metadata POST).
+        let ext = br#"<Retention>
+  <Mode>GOVERNANCE</Mode>
+  <RetainUntilDate>2040-01-01T00:00:00Z</RetainUntilDate>
+</Retention>"#;
+        let mut put = base_s3_req("PUT", "/mybucket/cold", "retention");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(ext.to_vec());
+        let put = sign_request(put, "testing");
+        let lock_meta = mock_bucket_lock_meta();
+        let posted = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let posted_c = posted.clone();
+        let cold_put_next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" && r.path.ends_with("/mybucket") {
+                let mut resp = Response::new(204);
+                resp.headers.set(S3_OBJECT_LOCK_META, &lock_meta);
+                return resp;
+            }
+            if r.method == "HEAD" {
+                let mut resp = Response::new(200);
+                resp.headers.set(SYS_TRANSITIONED, "1");
+                resp.headers.set(META_STORAGE_CLASS, "GLACIER");
+                resp.headers.set(SYS_LOCK_MODE, "GOVERNANCE");
+                resp.headers.set(SYS_RETAIN_UNTIL, "2030-01-01T00:00:00Z");
+                return resp;
+            }
+            assert_eq!(r.method, "POST");
+            *posted_c.lock().unwrap() = r.headers.get(SYS_RETAIN_UNTIL).map(str::to_string);
+            Response::new(202)
+        });
+        let resp = api.handle(put, &cold_put_next);
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            posted.lock().unwrap().as_deref(),
+            Some("2040-01-01T00:00:00Z")
+        );
+    }
+
     #[test]
     fn restore_object_stamps_meta_and_calls_backend() {
         use crate::cold_tier::{
