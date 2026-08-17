@@ -21,9 +21,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Ubuntu installs liberasurecode into the multiarch dir; give the swift-ec
-  # build script an explicit hint in addition to the linker's default path.
-  LIBERASURECODE_LIB_DIR: /usr/lib/x86_64-linux-gnu
+  # Hint for swift-ec's build.rs; matches the source-built install below.
+  LIBERASURECODE_LIB_DIR: /usr/local/lib
 
 jobs:
   test:
@@ -37,8 +36,22 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt
           rustup default stable
 
-      - name: Install liberasurecode
-        run: sudo apt-get update && sudo apt-get install -y liberasurecode-dev
+      # Ubuntu 24.04 packages liberasurecode 1.6.2, whose get_fragment_partition
+      # bounds bug causes intermittent SIGSEGV in swift-ec's multi-segment test
+      # (fixed upstream in 1.6.4, per its ChangeLog). The lab environment builds
+      # from source too, so CI matches it: build and install 1.6.4.
+      - name: Build liberasurecode 1.6.4 from source
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential autoconf automake libtool zlib1g-dev
+          curl -sSL -o liberasurecode.tar.gz https://github.com/openstack/liberasurecode/archive/refs/tags/1.6.4.tar.gz
+          tar xf liberasurecode.tar.gz
+          cd liberasurecode-1.6.4
+          ./autogen.sh
+          ./configure --prefix=/usr/local
+          make -j"$(nproc)"
+          sudo make install
+          sudo ldconfig
 
       - uses: Swatinem/rust-cache@v2
         with:
