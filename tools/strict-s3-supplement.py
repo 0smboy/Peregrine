@@ -1284,6 +1284,18 @@ def _scenario(runner: Runner) -> None:
     _case_delete_bucket_cors(runner, bucket)
     _case_restore_standard(runner, bucket, RESTORE_KEY)
 
+    # Tear down the Section A namespace BEFORE the destructive account-root
+    # negatives.  When the Rust proxy runs with allow_account_management=true
+    # (the live fleet posture until the S3-face account guard deploys), the
+    # signed DELETE / in Section B performs a genuine Swift account delete;
+    # doing it while the temp container still exists tombstones the account
+    # and orphans the (now unlisted) empty container.  Deleting the temp
+    # bucket first means the account tombstone -- which account_autocreate
+    # immediately heals -- has nothing left to orphan.  The finally-block
+    # safety net (_run_cleanup) is a no-op once this pass records a clean
+    # ledger, and still runs if Section A aborted before reaching here.
+    _run_cleanup(runner)
+
     # Section B -- account-root negatives, dual-oracle.
     _case_account_root(runner, "PUT", "negative-account-root-put")
     _case_account_root(runner, "DELETE", "negative-account-root-delete")
@@ -1352,6 +1364,11 @@ def _cleanup_rust(target: Target, bucket: str) -> Dict[str, Any]:
 
 
 def _run_cleanup(runner: Runner) -> None:
+    # Idempotent: the scenario tears the namespace down before Section B and
+    # records a clean ledger; the finally-block call must then be a no-op
+    # rather than re-running teardown against the just-tombstoned account.
+    if runner.cleanup.get("rust", {}).get("passed"):
+        return
     try:
         runner.cleanup["rust"] = _cleanup_rust(runner.rust, runner.namespace)
     except Exception as exc:
@@ -2016,6 +2033,9 @@ def _selftest_body() -> None:
     _expect(all(c.passed for c in runner.results), "happy-path case failed")
     _expect(runner.cleanup["rust"]["final_status"] == 404,
             "happy-path cleanup did not end at 404")
+    _expect(runner.cleanup["rust"]["attempted"] is True
+            and runner.cleanup["rust"]["passed"] is True,
+            "namespace teardown before Section B did not record a clean ledger")
     tagging_case = next(c for c in runner.results
                         if c.name == "extras-delete-bucket-tagging-and-get-after")
     _expect(tagging_case.observed.get("get_after_delete_semantics")
