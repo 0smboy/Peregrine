@@ -36,17 +36,18 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt
           rustup default stable
 
-      # Ubuntu 24.04 packages liberasurecode 1.6.2, whose get_fragment_partition
-      # bounds bug causes intermittent SIGSEGV in swift-ec's multi-segment test
-      # (fixed upstream in 1.6.4, per its ChangeLog). The lab environment builds
-      # from source too, so CI matches it: build and install 1.6.4.
-      - name: Build liberasurecode 1.6.4 from source
+      # Ubuntu 24.04 packages liberasurecode 1.6.2, which (like 1.6.4) segfaults
+      # when multiple rs_vand descriptors exist and one is destroyed; the
+      # parallel swift-ec tests hit that constantly. Fixed upstream in 1.6.5,
+      # and 1.8.0 added thread-safety locks on top (see upstream ChangeLog).
+      # The lab builds from source as well, so CI matches it with 1.8.0.
+      - name: Build liberasurecode 1.8.0 from source
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential autoconf automake libtool zlib1g-dev
-          curl -sSL -o liberasurecode.tar.gz https://github.com/openstack/liberasurecode/archive/refs/tags/1.6.4.tar.gz
+          curl -sSL -o liberasurecode.tar.gz https://github.com/openstack/liberasurecode/archive/refs/tags/1.8.0.tar.gz
           tar xf liberasurecode.tar.gz
-          cd liberasurecode-1.6.4
+          cd liberasurecode-1.8.0
           ./autogen.sh
           ./configure --prefix=/usr/local
           make -j"$(nproc)"
