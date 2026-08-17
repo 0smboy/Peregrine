@@ -150,7 +150,9 @@ impl ClockHealth {
             cache.fetched_at = Some(Instant::now());
         }
         match cache.offset_ms {
-            Some(offset_ms) => offset_ms.is_finite() && offset_ms.abs() <= self.max_offset_ms as f64,
+            Some(offset_ms) => {
+                offset_ms.is_finite() && offset_ms.abs() <= self.max_offset_ms as f64
+            }
             None => false,
         }
     }
@@ -177,7 +179,8 @@ pub fn parse_chronyc_tracking_csv(output: &str) -> Option<f64> {
         return None;
     }
     let leap = fields[fields.len() - 1].trim();
-    if leap.eq_ignore_ascii_case("not synchronised") || leap.eq_ignore_ascii_case("not synchronized")
+    if leap.eq_ignore_ascii_case("not synchronised")
+        || leap.eq_ignore_ascii_case("not synchronized")
     {
         return None;
     }
@@ -223,7 +226,10 @@ mod tests {
         let unsynced = "7F7F0101,,0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,Not synchronised\n";
         assert_eq!(parse_chronyc_tracking_csv(unsynced), None);
         assert_eq!(parse_chronyc_tracking_csv(""), None);
-        assert_eq!(parse_chronyc_tracking_csv("506 Cannot talk to daemon\n"), None);
+        assert_eq!(
+            parse_chronyc_tracking_csv("506 Cannot talk to daemon\n"),
+            None
+        );
         let short = "2D5AA2FD,1.2.3.4,4,1.0,-0.001\n";
         assert_eq!(parse_chronyc_tracking_csv(short), None);
         let bad_correction = "2D5AA2FD,1.2.3.4,4,1.0,abc,0,0,0,0,0,0,0,0,Normal\n";
@@ -251,19 +257,16 @@ mod tests {
 
     #[test]
     fn enabled_healthy_within_threshold_is_ok() {
-        let clock =
-            ClockHealth::with_reader(50, Duration::ZERO, Box::new(|| Some(-12.5)));
+        let clock = ClockHealth::with_reader(50, Duration::ZERO, Box::new(|| Some(-12.5)));
         assert!(clock.enabled());
         assert!(clock.clock_ok());
     }
 
     #[test]
     fn enabled_over_threshold_is_fail_closed() {
-        let clock =
-            ClockHealth::with_reader(50, Duration::ZERO, Box::new(|| Some(50.1)));
+        let clock = ClockHealth::with_reader(50, Duration::ZERO, Box::new(|| Some(50.1)));
         assert!(!clock.clock_ok());
-        let negative =
-            ClockHealth::with_reader(50, Duration::ZERO, Box::new(|| Some(-51.0)));
+        let negative = ClockHealth::with_reader(50, Duration::ZERO, Box::new(|| Some(-51.0)));
         assert!(!negative.clock_ok());
         let nan = ClockHealth::with_reader(50, Duration::ZERO, Box::new(|| Some(f64::NAN)));
         assert!(!nan.clock_ok());
@@ -277,8 +280,7 @@ mod tests {
 
     #[test]
     fn boundary_offset_equal_to_threshold_is_ok() {
-        let clock =
-            ClockHealth::with_reader(50, Duration::ZERO, Box::new(|| Some(50.0)));
+        let clock = ClockHealth::with_reader(50, Duration::ZERO, Box::new(|| Some(50.0)));
         assert!(clock.clock_ok());
     }
 
@@ -314,7 +316,11 @@ mod tests {
         for _ in 0..10 {
             assert!(!failing.clock_ok());
         }
-        assert_eq!(fail_calls.load(Ordering::SeqCst), 1, "failure must be cached");
+        assert_eq!(
+            fail_calls.load(Ordering::SeqCst),
+            1,
+            "failure must be cached"
+        );
     }
 
     #[test]
