@@ -1,0 +1,79 @@
+# Full-workspace test gate for swift-rust/.
+#
+# Motivation: tests used to be run manually (and filtered) on lab nodes only,
+# which let the proxy-server bin test target stay broken for weeks. This
+# workflow makes the FULL suite an automatic gate on every push and PR.
+#
+# docs-site publishing is handled separately by deploy-docs.yml; this workflow
+# deliberately does not touch docs-site/.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "ci/**"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Ubuntu installs liberasurecode into the multiarch dir; give the swift-ec
+  # build script an explicit hint in addition to the linker's default path.
+  LIBERASURECODE_LIB_DIR: /usr/lib/x86_64-linux-gnu
+
+jobs:
+  test:
+    name: fmt + workspace tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - name: Install liberasurecode
+        run: sudo apt-get update && sudo apt-get install -y liberasurecode-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: swift-rust
+
+      - name: cargo fmt --check
+        working-directory: swift-rust
+        run: cargo fmt --all --check
+
+      - name: cargo test (full workspace)
+        working-directory: swift-rust
+        run: cargo test --workspace --locked
+
+      - name: cargo test (EC slice)
+        working-directory: swift-rust
+        run: cargo test -p swift-ec -p swift-object-server -p swift-proxy-server --features swift-proxy-server/ec,swift-object-server/ec --locked
+
+  clippy:
+    name: clippy (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+
+      - name: Install liberasurecode
+        run: sudo apt-get update && sudo apt-get install -y liberasurecode-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: swift-rust
+
+      - name: cargo clippy -D warnings
+        working-directory: swift-rust
+        run: cargo clippy --workspace --locked -- -D warnings
