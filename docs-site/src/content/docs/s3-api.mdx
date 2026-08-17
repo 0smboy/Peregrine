@@ -54,8 +54,8 @@ Time-based rejection is real, not a dead config knob:
 | ListObjectVersions `?versions` | yes | pagination; `Size` semantics in [versioning](/versioning-worm) |
 | Bucket tagging `?tagging` | read: yes · write: **Rust extra** | Python 2.33 answers 501 on write |
 | Bucket CORS `?cors` | **Rust extra** | GET/PUT/DELETE (200/200/204); Python 2.33 answers 501 |
-| Lifecycle `?lifecycle` | yes | Expiration + Transition metadata + AbortIncompleteMultipartUpload |
-| Object Lock config `?object-lock` | yes | validated XML stored on protected container sysmeta |
+| Lifecycle `?lifecycle` | yes (unit level) | Expiration + Transition metadata + AbortIncompleteMultipartUpload; outside the 57-case suite |
+| Object Lock config `?object-lock` | yes (unit level) | validated XML stored on protected container sysmeta; outside the 57-case suite |
 | Unsupported subresources (`?policy`, `?website`, `?inventory`, …) | no | explicit `501 NotImplemented` |
 
 ## Object operations
@@ -68,7 +68,7 @@ Time-based rejection is real, not a dead config knob:
 | Multi-delete (`POST /bucket?delete`) | yes | per-key `<Deleted>` / `<Error>` result; missing keys are errors, not silent deletes |
 | Object ACL `?acl` | read: yes · write: **Rust extra** | Python 2.33 answers 501 on write |
 | Object tagging `?tagging` | read: yes · delete: **Rust extra** | |
-| Legal hold / retention / lock | yes | see [WORM](/versioning-worm) — bucket lock config is required first (`400 InvalidRequest` otherwise) |
+| Legal hold / retention / lock | yes (unit + 2026-08-14 live canaries) | see [WORM](/versioning-worm) — bucket lock config is required first (`400 InvalidRequest` otherwise) |
 | RestoreObject `?restore` | honest reject | cold backend disabled → `400 InvalidObjectState`; with a lab backend → `202` and a restore window |
 | Versioned GET/DELETE (`?versionId=`) | yes | `null` and 32-hex ids; malformed id → `400 InvalidArgument` |
 
