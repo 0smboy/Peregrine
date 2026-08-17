@@ -1,0 +1,8 @@
+/var/log/peregrine-alerts.jsonl {
+    weekly
+    rotate 8
+    compress
+    missingok
+    notifempty
+    create 0640 root root
+}

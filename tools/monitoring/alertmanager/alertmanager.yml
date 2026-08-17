@@ -1,0 +1,31 @@
+# Peregrine Alertmanager (swift1, 127.0.0.1:9093).
+# Default sink: local webhook receiver on 127.0.0.1:9094 which appends every
+# delivery to /var/log/peregrine-alerts.jsonl (peregrine-alert-sink.service).
+
+route:
+  receiver: local-sink
+  group_by: [alertname, severity]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: local-sink
+    webhook_configs:
+      - url: http://127.0.0.1:9094/
+        send_resolved: true
+
+  # ---- Feishu webhook 换装位 ------------------------------------------
+  # 用户提供飞书机器人 webhook URL 后：
+  #   1) 取消注释下面的 receiver 并填入真实 URL（飞书自定义机器人需要
+  #      卡片格式，最简做法是经一个本地格式化桥转发，或直接替换
+  #      peregrine-alert-sink 为转发脚本）。
+  #   2) 把 route.receiver 从 local-sink 改成 feishu（或加子路由按
+  #      severity 分流）。
+  #   3) amtool check-config /etc/alertmanager/alertmanager.yml 通过后
+  #      systemctl reload alertmanager。
+  # - name: feishu
+  #   webhook_configs:
+  #     - url: https://open.feishu.cn/open-apis/bot/v2/hook/<TOKEN>
+  #       send_resolved: true
+  # ----------------------------------------------------------------------

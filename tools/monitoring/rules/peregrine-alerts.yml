@@ -14,6 +14,12 @@
 # disk-governance task brought all roots to ~74% minutes before these rules
 # went live, so the fleet deployed all-green. The evaluate->fire pipeline was
 # proven with a temporary self-test rule instead (see W10 evidence).
+#
+# 12/13 alignment (2026-08-17 evening): swift-object-expirer was unfrozen with
+# surgery and is now a normal daemon on all four nodes. SwiftDaemonDown and
+# SwiftDaemonSetIncomplete watch 12 daemons (expirer added); FrozenDaemonStarted
+# keeps only swift-account-reaper, which stays frozen (AUTH_test ring majority
+# carries status=DELETED; starting the reaper would destroy data).
 
 groups:
   - name: peregrine_w10_infra
@@ -94,7 +100,7 @@ groups:
 
       - alert: SwiftDaemonDown
         expr: |
-          node_systemd_unit_state{name=~"swift-(account-auditor|account-replicator|container-auditor|container-reconciler|container-replicator|container-sharder|container-updater|object-auditor|object-reconstructor|object-replicator|object-updater)\\.service",state="active"} == 0
+          node_systemd_unit_state{name=~"swift-(account-auditor|account-replicator|container-auditor|container-reconciler|container-replicator|container-sharder|container-updater|object-auditor|object-expirer|object-reconstructor|object-replicator|object-updater)\\.service",state="active"} == 0
         for: 10m
         labels:
           severity: warning
@@ -105,23 +111,23 @@ groups:
       - alert: SwiftDaemonSetIncomplete
         expr: |
           sum by (instance) (
-            node_systemd_unit_state{name=~"swift-(account-auditor|account-replicator|container-auditor|container-reconciler|container-replicator|container-sharder|container-updater|object-auditor|object-reconstructor|object-replicator|object-updater)\\.service",state="active"}
-          ) < 11
+            node_systemd_unit_state{name=~"swift-(account-auditor|account-replicator|container-auditor|container-reconciler|container-replicator|container-sharder|container-updater|object-auditor|object-expirer|object-reconstructor|object-replicator|object-updater)\\.service",state="active"}
+          ) < 12
         for: 10m
         labels:
           severity: warning
           wave: w10
         annotations:
-          summary: "{{ $labels.instance }} reports fewer than 11 active Swift daemons for 10m; a unit stopped or was unloaded from systemd."
+          summary: "{{ $labels.instance }} reports fewer than 12 active Swift daemons for 10m; a unit stopped or was unloaded from systemd."
 
       - alert: FrozenDaemonStarted
         expr: |
-          node_systemd_unit_state{name=~"swift-(account-reaper|object-expirer)\\.service",state="active"} == 1
+          node_systemd_unit_state{name="swift-account-reaper.service",state="active"} == 1
         labels:
           severity: critical
           wave: w10
         annotations:
-          summary: "Frozen unit {{ $labels.name }} is ACTIVE on {{ $labels.instance }}; reaper/expirer are deliberately frozen, so any start is an incident signal."
+          summary: "Frozen unit {{ $labels.name }} is ACTIVE on {{ $labels.instance }}; swift-account-reaper is deliberately frozen (ring majority carries DELETED accounts), so any start is an incident signal."
 
   - name: peregrine_w10_swift_health
     interval: 30s
