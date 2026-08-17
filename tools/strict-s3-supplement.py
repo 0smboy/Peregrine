@@ -48,6 +48,21 @@ Section B -- supplement negatives, dual-oracle, both endpoints (3 cases):
   honestly -- and becomes the baseline that turns green once the account-face
   guard deploys.
 
+  !! OPERATIONAL WARNING -- Section B is DESTRUCTIVE against a fleet that runs
+  the Rust proxy with allow_account_management=true (the live posture until
+  the S3-face account guard deploys).  The r1 live run proved the signed
+  DELETE / does NOT merely touch a timestamp: it performs a genuine Swift
+  account DELETE, leaving the tenant's account in status=DELETED.  Because a
+  recently-deleted account cannot be recreated through the API (the
+  account-server returns 403 "Recently deleted", and account_autocreate then
+  500s on the next bucket PUT), and because the swift-account-reaper is frozen
+  in this lab, the account must be recovered out-of-band after each run (remove
+  the empty deleted account DB on the primaries + handoff, then let
+  account_autocreate rebuild it fresh).  Run Section B ONLY against a
+  throwaway automation tenant you are prepared to recover, NEVER a tenant
+  holding real data.  This severity is itself the finding: it is the strongest
+  argument for the S3-face account guard.
+
 Credentials are read from four distinctly named environment variables and
 are never printed, included in URLs, or written to the report:
 
@@ -1202,9 +1217,11 @@ def _case_account_root(runner: Runner, method: str, case_name: str) -> None:
     Python 2.33 s3api answers 405 MethodNotAllowed (ServiceController has no
     such handler).  Scoring is dual-oracle: status equality + S3 error Code
     equality, plus a security check that neither side answers 2xx.  A Rust
-    2xx means the request was translated onto the Swift account face (in this
-    lab a harmless dev-tenant account-metadata touch, but the S3 face must
-    reject it); it is recorded as FAIL with the observed behavior described.
+    2xx means the request was translated onto the Swift account face and the
+    S3 layer failed to reject it; it is recorded as FAIL with the observed
+    behavior described.  For DELETE this is not a benign touch -- it deletes
+    the whole tenant account (see the module docstring's OPERATIONAL WARNING);
+    the account must be recovered out-of-band afterwards.
     """
     def fn(case: Case) -> None:
         sides: Dict[str, Dict[str, Any]] = {}
