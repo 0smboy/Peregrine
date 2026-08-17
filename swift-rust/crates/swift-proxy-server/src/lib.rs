@@ -2189,9 +2189,9 @@ impl ProxyApp {
     }
 
     /// `autocreate_account`: PUT the account directly on its ring nodes.
-    fn autocreate_account(self: &Arc<Self>, account: &str) {
+    fn autocreate_account(self: &Arc<Self>, account: &str) -> bool {
         let Ok((part, _nodes)) = self.account_ring.get_nodes(account, None, None) else {
-            return;
+            return false;
         };
         let path = format!("/{}", percent_encode(account));
         let now = Timestamp::now().internal();
@@ -2216,9 +2216,11 @@ impl ProxyApp {
         );
         // base.py:2340-2343: a successful autocreate clears the cached (404)
         // account info so the caller's next existence check re-HEADs.
-        if (200..300).contains(&resp.status) {
+        let created = (200..300).contains(&resp.status);
+        if created {
             self.info_cache.clear_account(account);
         }
+        created
     }
 
     fn allowed_methods(&self, has_container: bool) -> &'static str {
@@ -2558,7 +2560,7 @@ impl ProxyApp {
                 // an autocreate cluster creates the account and retries, so
                 // the first metadata POST after a wipe is not lost.
                 if resp.status == 404 && req.method == "POST" && self.config.account_autocreate {
-                    self.autocreate_account(account);
+                    let _ = self.autocreate_account(account);
                     let nodes = self.iter_nodes(&self.account_ring, part);
                     return self.make_requests(
                         nodes,
@@ -2674,9 +2676,24 @@ impl ProxyApp {
                 // semantics. An unreachable ring (None → 503) is never
                 // cached, like Python's synthesized 503 info.
                 let acct_status = self.account_info(account).status;
-                if acct_status == 404 {
-                    if self.config.account_autocreate && req.method != "DELETE" {
-                        self.autocreate_account(account);
+                if !(200..300).contains(&acct_status) {
+                    if self.config.account_autocreate && req.method == "PUT" {
+                        // Python container PUT stops with 503 when account
+                        // autocreation fails. Continuing would let container
+                        // servers create their local DBs and then return 404
+                        // when every account-update target rejects the update,
+                        // yielding the contradictory "PUT 404, HEAD 204".
+                        if !self.autocreate_account(account) {
+                            return swob_response(503);
+                        }
+                        // Python immediately resolves account_info again after
+                        // a successful autocreate. A nominal 2xx create is not
+                        // enough: if the account still cannot be observed, the
+                        // container fan-out must not start.
+                        let refreshed = self.account_info(account).status;
+                        if !(200..300).contains(&refreshed) {
+                            return swob_response(404);
+                        }
                     } else {
                         return swob_response(404);
                     }

@@ -167,6 +167,88 @@ impl RealmsConf {
         Self::parse(&content)
     }
 
+    /// Strict parser for production filter construction. Configuration names
+    /// are case-insensitive, matching Python ConfigParser, and duplicate or
+    /// malformed options fail closed instead of silently overwriting secrets.
+    pub fn try_parse(content: &str) -> Result<Self, String> {
+        let mut realms: HashMap<String, RealmInfo> = HashMap::new();
+        let mut current: Option<String> = None;
+        let mut seen_sections = std::collections::HashSet::new();
+        let mut seen_options = std::collections::HashSet::new();
+
+        for (index, raw) in content.lines().enumerate() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.is_empty() || line.starts_with(';') {
+                continue;
+            }
+            if line.starts_with('[') {
+                if !line.ends_with(']') {
+                    return Err(format!(
+                        "line {}: malformed section header {line:?}",
+                        index + 1
+                    ));
+                }
+                let name = line[1..line.len() - 1].trim().to_ascii_uppercase();
+                if name.is_empty() || !seen_sections.insert(name.clone()) {
+                    return Err(format!(
+                        "line {}: duplicate or empty section {name:?}",
+                        index + 1
+                    ));
+                }
+                current = Some(name.clone());
+                if name != "DEFAULT" {
+                    realms.entry(name).or_default();
+                }
+                continue;
+            }
+
+            let section = current
+                .as_ref()
+                .ok_or_else(|| format!("line {}: option appears before any section", index + 1))?;
+            let (key, value) = line
+                .split_once('=')
+                .or_else(|| line.split_once(':'))
+                .ok_or_else(|| format!("line {}: malformed option {line:?}", index + 1))?;
+            let key = key.trim().to_ascii_lowercase();
+            if key.is_empty() {
+                return Err(format!(
+                    "line {}: empty option in section {section:?}",
+                    index + 1
+                ));
+            }
+            if !seen_options.insert((section.clone(), key.clone())) {
+                return Err(format!(
+                    "line {}: duplicate option {key:?} in section {section:?}",
+                    index + 1
+                ));
+            }
+            if section == "DEFAULT" {
+                continue;
+            }
+
+            let value = value.trim().to_string();
+            let entry = realms.entry(section.clone()).or_default();
+            if key == "key" {
+                entry.key = Some(value);
+            } else if key == "key2" {
+                entry.key2 = Some(value);
+            } else if let Some(cluster) = key.strip_prefix("cluster_") {
+                entry.clusters.insert(cluster.to_ascii_uppercase(), value);
+            }
+        }
+        Ok(RealmsConf { realms })
+    }
+
+    /// Missing files match Python's empty-realms startup behavior; existing
+    /// unreadable or malformed files are explicit construction failures.
+    pub fn try_load(path: &Path) -> Result<Self, String> {
+        match std::fs::read_to_string(path) {
+            Ok(content) => Self::try_parse(&content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(format!("could not read {}: {error}", path.display())),
+        }
+    }
+
     pub fn key(&self, realm: &str) -> Option<&str> {
         self.realms
             .get(&realm.to_ascii_uppercase())
@@ -232,7 +314,13 @@ impl ContainerSync {
     /// Load realms conf from `path`, returning Err when the file exists but
     /// cannot be parsed. Missing file is treated as empty realms (Ok).
     pub fn try_with_realms_path(self, path: impl Into<PathBuf>) -> Result<Self, String> {
-        Ok(self.with_realms_path(path))
+        let path = path.into();
+        let realms = RealmsConf::try_load(&path)?;
+        Ok(Self {
+            realms,
+            realms_path: Some(path),
+            ..self
+        })
     }
 
     pub fn with_realms_path(mut self, path: impl Into<PathBuf>) -> Self {
@@ -482,5 +570,30 @@ mod tests {
             "userkey",
         );
         assert_eq!(sig, "21f83a6e560fea0436cafaa95c1042449b45f4e6");
+    }
+
+    #[test]
+    fn strict_realms_parser_rejects_duplicate_and_malformed_options() {
+        for invalid in [
+            "[LOCAL]\nkey = one\nKEY = two\n",
+            "[LOCAL]\nkey = one\nthis is not an option\n",
+            "key = before-section\n",
+        ] {
+            assert!(RealmsConf::try_parse(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn strict_realms_parser_accepts_valid_and_missing_file() {
+        let parsed = RealmsConf::try_parse(
+            "[DEFAULT]\nmtime_check_interval = 300\n[local]\nkey = one\ncluster_dfw1 = https://sync\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.key("LOCAL"), Some("one"));
+        assert!(parsed.realms["LOCAL"].clusters.contains_key("DFW1"));
+
+        let missing =
+            std::env::temp_dir().join(format!("peregrine-missing-realms-{}", std::process::id()));
+        assert!(RealmsConf::try_load(&missing).unwrap().realms.is_empty());
     }
 }
