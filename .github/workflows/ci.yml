@@ -45,7 +45,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential autoconf automake libtool zlib1g-dev
-          curl -sSL -o liberasurecode.tar.gz https://github.com/openstack/liberasurecode/archive/refs/tags/1.8.0.tar.gz
+          # --fail so an HTTP error page is never written out as the tarball
+          # (a 429 during the 2026-08-17 GitHub degradation did exactly that:
+          # "tar: This does not look like a tar archive"); generous retries
+          # ride out transient codeload errors.
+          curl -sSL --fail --retry 8 --retry-delay 15 --retry-all-errors \
+            -o liberasurecode.tar.gz \
+            https://github.com/openstack/liberasurecode/archive/refs/tags/1.8.0.tar.gz
           tar xf liberasurecode.tar.gz
           cd liberasurecode-1.8.0
           ./autogen.sh
