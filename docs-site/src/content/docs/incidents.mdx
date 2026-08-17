@@ -33,16 +33,32 @@ verified S3-side by the 2026-08-14 `s3api-frozen-accounts` run.
 - The write-side forensic loop was **not** closed to a tidy conclusion and
   is recorded that way. Unfinished is written as unfinished.
 
-## The 13 frozen daemons
+## The frozen daemons — 11/13 recovered (2026-08-17)
 
 During incident response, 13 consistency daemons across the fleet were set
 `disabled + inactive` (`ENABLE=NONE`) to stop background mutation while the
-data path stayed up. They are **still frozen**. Re-enabling is a planned,
-separate wave with its own recovery plan
-(`daemon-recovery-plan`, 2026-08-14 workflow records) — it is never done
-"while we're in there" during S3 or proxy work. The replication /
-reconstruction claims on [Operations](/operations) describe capabilities
-proven in earlier passes, not daemons currently running in the lab.
+data path stayed up.
+
+The dedicated Wave-6 recovery (2026-08-17) re-enabled **11 of 13** across
+all four nodes in staged batches — auditors first (read-only), then
+replicators and the EC reconstructor, then updaters, sharder and
+reconciler — canary node first, one full pass observed per unit, fleet
+after. Result: zero quarantine growth, zero object loss, zero crash-loops,
+disk flat, a ~55-minute quiet window to close. Evidence:
+`/root/work/peregrine-daemon-unfreeze-20260817/` (swift3, 56 files).
+
+Two units remain deliberately frozen:
+
+| Unit | Why it stays frozen |
+|------|---------------------|
+| `swift-account-reaper` | the incident's destructive actor (`delay_reaping=0`); re-enabling is a user-gated decision, not an ops default |
+| `swift-object-expirer` | its due queue holds an `AUTH_test` entry (`fsuite-10720/willexpire`) — starting it would delete protected-account data. Unfreeze requires disposition of that entry plus explicit authorization |
+
+Known steady state after recovery, recorded rather than hidden: 357
+incident-era async pendings pointed at deleted `AUTH_test` containers retry
+flat (correct Swift semantics, zero growth); four legacy test containers
+oscillate their shard-cleave epoch with zero failures and are queued for a
+reconciliation ticket.
 
 ## Leftover-resource policy
 
@@ -60,7 +76,8 @@ kept deliberately:
 ## Hard boundaries (all still in force)
 
 1. Do not restart HAProxy or Keepalived; do not move the VIP.
-2. Do not enable frozen daemons outside the dedicated recovery wave.
+2. Do not enable `swift-account-reaper` or `swift-object-expirer` outside
+   an explicitly authorized wave.
 3. Do not touch `AUTH_lab`, `AUTH_test`, or `s3://mytest`.
 4. Do not edit the dual-oracle runner's assertions or case set; do not
    downgrade Rust extras to 501 ([why](/dual-oracle#the-runner-is-part-of-the-contract)).

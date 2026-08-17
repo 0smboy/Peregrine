@@ -43,7 +43,11 @@ every node.
 - Full daemon set + HAProxy on each node; Keepalived for the VIP.
 - Schedule the object auditor with a **timer** unit.
 - Ship EC plugin libraries (`libnullcode`, `liberasurecode_rs_vand`) with a
-  working `liberasurecode_rs_vand.so.1.0.1` link.
+  working `liberasurecode_rs_vand.so.1.0.1` link. **liberasurecode must be
+  ≥ 1.6.5**: older releases segfault when concurrent `rs_vand` descriptors
+  are destroyed (reproduced deterministically in CI on Ubuntu's 1.6.2; fixed
+  upstream in 1.6.5, hardened in 1.8.0). The fleet loads 1.8.0 from
+  `/usr/local/lib` — verified 2026-08-17 on all four nodes.
 - Build release binaries **with the `ec` cargo features**. Without them the
   proxy returns HTTP 501 for EC puts.
 - On swift1: Prometheus, Loki, Alloy, statsd_exporter, `swift-console`,

@@ -66,11 +66,14 @@ Python header patches on the oracle. Full narrative:
 | post-XML (error `RequestId`) | XML | 57/57/37/20/0 | 0 |
 | post-SCHEMA (MPU ETag, ISO times, PUT-ACL `Location`) | Schema | 57/57/41/16/0 | 0 |
 | post-SIZE (ListVersions `Size`) | Size | 57/57/42/15/0 | 0 |
-| **post-PY-XML-CT (current)** | Size | **57/57/49/8/0** | **0** |
+| post-PY-XML-CT | Size | **57/57/49/8/0** | 0 |
+| **post-GATE (current; proxy-side fixes, S3 surface unchanged)** | Gate | **57/57/49/8/0** | **0** |
 
-Current report: `strict-s3-dual-20260816-postpyhdr.json`, SHA-256
-`58595702ae301828cc2a8003e9702f9baa4dfd0ce41ad4206cf18b82aefc3025`
-(lab evidence root `/root/work/evidence/` on swift3).
+Current report: `strict-s3-dual-20260817-postgate.json`, SHA-256
+`50f0c8608b4d0b8a08f03813ac8587a0cecddcef76c586e3a6dc9a4d44421d77`;
+its failing-case set and per-case issues are identical to the
+post-PY-XML-CT baseline (`…-20260816-postpyhdr.json`, SHA-256
+`58595702ae301828…`). Lab evidence root `/root/work/evidence/` on swift3.
 
 ## Failure taxonomy
 

@@ -7,10 +7,14 @@ sidebar:
 
 ## Current fleet state
 
-As of 2026-08-16 (`docs/fairness-lab/S3-ALIGN-20260815.md`): proxies 4/4 +
-VIP run the **Size** generation (`69d22629…`), object servers remain Wave-2
-(`e1d4f1cc…`), drain 0, VIP on swift2. S3 dual-oracle stands at **49/8, not
-GREEN**. Stance **IMPLEMENTED_SUBSET_ONLY**. Binary genealogy:
+As of 2026-08-17 (`docs/fairness-lab/S3-ALIGN-20260815.md`): proxies 4/4 +
+VIP run the **Gate** generation (`671bcbaf…`), object servers remain Wave-2
+(`e1d4f1cc…`), drain 0, VIP on swift2. Consistency daemons are **11/13
+enabled + active** after the staged Wave-6 recovery;
+`swift-account-reaper` and `swift-object-expirer` stay frozen
+([why](/incidents#the-frozen-daemons--1113-recovered-2026-08-17)). S3
+dual-oracle stands at **49/8, not GREEN** (post-GATE run identical to
+baseline). Stance **IMPLEMENTED_SUBSET_ONLY**. Binary genealogy:
 [Releases](/releases) · upgrade/rollback recipes: [Runbooks](/runbooks) ·
 scoring: [Dual-oracle](/dual-oracle).
 
@@ -32,11 +36,12 @@ Lab topology, EC binary requirements, and subscription cutover rules:
 
 ## Replication & reconstruction
 
-<Aside type="caution" title="Lab daemon freeze in force">
-The capabilities below are proven by earlier passes. On the current lab
-fleet, 13 consistency daemons remain deliberately frozen after the
-2026-08-14 incident and are re-enabled only by the dedicated recovery wave —
-see [Incidents & freezes](/incidents#the-13-frozen-daemons).
+<Aside type="note" title="Daemon state (2026-08-17)">
+The consistency plane is live again: auditors, replicators, the EC
+reconstructor, updaters, sharder and reconciler run fleet-wide after the
+staged Wave-6 recovery (zero quarantine growth, zero loss). Only
+`swift-account-reaper` and `swift-object-expirer` remain frozen — see
+[Incidents & freezes](/incidents#the-frozen-daemons--1113-recovered-2026-08-17).
 </Aside>
 
 - **Object replicator** — suffix-hash push, handoff revert, rsync /

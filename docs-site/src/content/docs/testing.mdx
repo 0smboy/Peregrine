@@ -5,16 +5,26 @@ sidebar:
   order: 22
 ---
 
-Peregrine is verified at four levels, and a change is only done when the
-workspace tests are green, clippy is clean, the functional suite matches the
-Python oracle, and — for anything on the data path — the behavior is confirmed
-live on the cluster.
+Peregrine is verified at five levels, and a change is only done when CI is
+green, the functional suite matches the Python oracle, and — for anything on
+the data path — the behavior is confirmed live on the cluster.
+
+## 0. CI — every push, the full suite
+
+Since 2026-08-17 (`.github/workflows/ci.yml`) every push and pull request
+runs the **entire** workspace test suite plus the EC slice on GitHub
+Actions, with liberasurecode pinned ≥ 1.6.5
+([why](/lab-cluster#install-checklist)). `cargo fmt` and `cargo clippy` run
+as report boards over the known pre-existing debt. This gate exists because
+filtered, manual test runs let a broken test target rot unnoticed for two
+weeks — that class of debt is now structurally closed.
 
 ## 1. Unit + golden (format fidelity)
 
 Every serialized format has a golden round-trip: the real Python Swift writes a
 fixture, `swift-rust` must read it and reproduce it byte-for-byte, then Rust
-writes and Python reads back. The workspace runs ~946 tests.
+writes and Python reads back. The workspace runs 1 422 tests across 83
+targets (2026-08-17, zero failures).
 
 ```sh
 cargo test --workspace --exclude swift-ec
@@ -57,6 +67,13 @@ Against the four-node Contabo HA lab (VIP `10.0.0.10:8085` — see
 <Step>large-object streaming-memory checks (a multi-GB PUT/GET while sampling RSS);</Step>
 <Step>after replacing VMs: re-run `ha-test.sh`, `ec-heal-test.sh`, and confirm Prometheus `nodes_up=4`.</Step>
 </Steps>
+
+## 5. Strict S3 dual-oracle
+
+The S3 surface has its own scored gate: the frozen 57-case runner sends
+identical requests to the live Rust fleet and a stock Python Swift 2.33
+oracle and compares what a client sees. Methodology, the GREEN contract, and
+the current 49/8 scoreboard: [Dual-oracle verification](/dual-oracle).
 
 ## Recent delivery — cold + Contabo S3
 

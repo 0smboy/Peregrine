@@ -24,7 +24,13 @@ owner last), verified by SHA + health, then scored by one
 | F1 | `29acb863…` | clock-skew / expiry / InvalidStorageClass as real rejections | superseded |
 | XML | `2ecabc45…` | `RequestId` in every error body | superseded |
 | Schema | `a6b386e6…` | MPU composite ETag, ISO timestamps, PUT-ACL `Location` | superseded, kept as rollback target |
-| **Size** | **`69d22629dbf8c8c6…`** | ListVersions `Size` stamped from the PUT request length (source `1151a88`) | **live on 4/4 proxies + VIP since 2026-08-16T00:23Z** |
+| Size | `69d22629…` | ListVersions `Size` stamped from the PUT request length (source `1151a88`) | superseded 2026-08-17, kept as rollback target |
+| **Gate** | **`671bcbaf2a1d195a…`** | container-PUT account gate fails closed (`503` on failed autocreate + re-check), fail-closed ratelimit / container-sync / account-freeze config parsing, `list_endpoints` v1/v2 (merge `a48a2b2`) | **live on 4/4 proxies + VIP since 2026-08-17** |
+
+Gate rolled 1→4→3→2 (VIP owner last), post-roll dual-oracle
+`strict-s3-dual-20260817-postgate.json` (SHA-256 `50f0c860…`): **49/8 with a
+failing-case set identical to the baseline** — the S3 surface is
+byte-equivalent to Size, as intended.
 
 Object servers fleet-wide remain Wave-2
 (`e1d4f1ccf6f01a18…`) — the honest sibling reconstructor build; nothing in
@@ -35,21 +41,19 @@ the S3 alignment required rolling the object layer.
 `main` is deliberately allowed to be ahead of the fleet, and the difference
 is tracked here rather than blurred:
 
-- Live proxy = Size generation, built from source commit `1151a88` plus the
-  docs commits that followed.
-- Merge `a48a2b2` (2026-08-17) retired the last unmerged branch,
+- Live proxy = Gate generation (built 2026-08-17 from the merge-verified
+  tree; source through commit `babb9c4`).
+- Merge `a48a2b2` retired the last unmerged branch,
   `codex/hotfix-s3cmd-mb-live-8663-20260814`, into `main` with a verified
   resolution: the S3 layer was kept **byte-identical to main** (the hotfix's
   s3api rework was superseded by the F1→Size generations, which are
   dual-oracle verified live), while the proxy-side improvements were
-  adopted — the container-PUT account gate now fails closed with `503` when
-  account autocreate fails and re-checks account visibility before fan-out,
-  plus fail-closed ratelimit/container-sync/account-freeze config parsing
-  and `list_endpoints` v1/v2 handling, with their tests.
-- These proxy-side fixes are **merged but not yet rolled**; they ship with
-  the next proxy generation through the standard
-  [rolling runbook](/runbooks#rolling-proxy-upgrade-slim). Until then the
-  live fleet does not contain them, and no claim pretends otherwise.
+  adopted and are now live in Gate.
+- CI (`e78469a`): every push and pull request now runs the full workspace
+  suite plus the EC slice on GitHub Actions; fmt/clippy debt is surfaced as
+  report boards. The CI work also pinned liberasurecode ≥ 1.6.5 after
+  reproducing a real upstream concurrency segfault
+  ([lab notes](/lab-cluster#install-checklist)).
 
 One recorded candidate for the next S3 window: an account-level guard that
 rejects non-GET requests with no bucket (`PUT /` etc.) at the S3 layer with
