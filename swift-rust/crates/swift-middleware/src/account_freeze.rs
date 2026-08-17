@@ -39,6 +39,7 @@ use crate::{Middleware, NextFn};
 const FROZEN_BODY: &str = "Account is frozen.";
 
 /// Deny all methods for configured Swift accounts.
+#[derive(Debug)]
 pub struct AccountFreeze {
     frozen_accounts: HashSet<String>,
 }

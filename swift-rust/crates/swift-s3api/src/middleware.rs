@@ -7120,19 +7120,22 @@ mod tests {
         let api = S3Api::new(cred_map());
         let next = versioning_mock_store("Suspended");
 
+        // AWS: PUT on a versioning-suspended bucket overwrites the "null"
+        // version and answers `x-amz-version-id: null`. No unique version ids
+        // may be minted while suspended.
         let mut put = base_s3_req("PUT", "/mybucket/obj", "");
         put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         put.body = Body::from(b"x".to_vec());
         let r = api.handle(sign_request(put, "testing"), &next);
         assert_eq!(r.status, 200);
-        assert!(r.headers.get("x-amz-version-id").is_none());
+        assert_eq!(r.headers.get("x-amz-version-id"), Some("null"));
 
         let mut put2 = base_s3_req("PUT", "/mybucket/obj", "");
         put2.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         put2.body = Body::from(b"y".to_vec());
         let r2 = api.handle(sign_request(put2, "testing"), &next);
         assert_eq!(r2.status, 200);
-        assert!(r2.headers.get("x-amz-version-id").is_none());
+        assert_eq!(r2.headers.get("x-amz-version-id"), Some("null"));
     }
 
     fn version_rec(version_id: &str) -> VersionRecord {
@@ -8199,6 +8202,16 @@ mod tests {
         assert!(!body.contains("Fri, 24 May"));
     }
 
+    /// Bucket object-lock sysmeta blob for mocks: PUT ?legal-hold / ?retention
+    /// require the bucket lock config (`require_bucket_object_lock`) first.
+    fn mock_bucket_lock_meta() -> String {
+        crate::bucket_config::encode_meta_blob(
+            br#"<ObjectLockConfiguration>
+  <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+</ObjectLockConfiguration>"#,
+        )
+    }
+
     #[test]
     fn legal_hold_put_get_round_trip() {
         let api = S3Api::new(cred_map());
@@ -8207,7 +8220,18 @@ mod tests {
         put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         put.body = Body::from(body.to_vec());
         let put = sign_request(put, "testing");
-        let put_next: NextFn = Arc::new(|r| {
+        // Flow: container HEAD (bucket lock gate), object HEAD (version
+        // resolve), then the sysmeta POST.
+        let lock_meta = mock_bucket_lock_meta();
+        let put_next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" && r.path.ends_with("/mybucket") {
+                let mut resp = Response::new(204);
+                resp.headers.set(S3_OBJECT_LOCK_META, &lock_meta);
+                return resp;
+            }
+            if r.method == "HEAD" {
+                return Response::new(200);
+            }
             assert_eq!(r.method, "POST");
             assert_eq!(r.headers.get(SYS_LEGAL_HOLD), Some("ON"));
             Response::new(202)
@@ -8240,7 +8264,14 @@ mod tests {
         put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         put.body = Body::from(body.to_vec());
         let put = sign_request(put, "testing");
-        let put_next: NextFn = Arc::new(|r| {
+        let lock_meta = mock_bucket_lock_meta();
+        let put_next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" && r.path.ends_with("/mybucket") {
+                // Bucket has object lock enabled (PUT ?retention gate).
+                let mut resp = Response::new(204);
+                resp.headers.set(S3_OBJECT_LOCK_META, &lock_meta);
+                return resp;
+            }
             if r.method == "HEAD" {
                 // Object exists, no retention yet.
                 return Response::new(200);
@@ -8737,7 +8768,13 @@ mod tests {
         put.body = Body::from(body.to_vec());
         let mut put = sign_request(put, "testing");
         put.headers.set(HDR_BYPASS_GOVERNANCE, "true");
-        let next: NextFn = Arc::new(|r| {
+        let lock_meta = mock_bucket_lock_meta();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" && r.path.ends_with("/mybucket") {
+                let mut resp = Response::new(204);
+                resp.headers.set(S3_OBJECT_LOCK_META, &lock_meta);
+                return resp;
+            }
             if r.method == "HEAD" {
                 let mut resp = Response::new(200);
                 resp.headers.set(SYS_LOCK_MODE, "COMPLIANCE");
@@ -8928,7 +8965,12 @@ mod tests {
             panic!("restore without a backend must not mutate Swift")
         });
         let resp = api.handle(post, &next);
-        assert_eq!(resp.status, 403);
+        // Honest rejection when the cold backend is disabled: 400
+        // InvalidObjectState (dual-oracle case `restore-not-implemented`),
+        // never a fake success and never a mutation.
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("InvalidObjectState"), "{body}");
     }
 
     #[test]
