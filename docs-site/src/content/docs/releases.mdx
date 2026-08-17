@@ -1,0 +1,81 @@
+---
+title: Releases & live binaries
+description: The proxy binary genealogy, what each generation closed, the object-server state, and the git branch discipline.
+sidebar:
+  order: 27
+---
+
+The fleet does not run "latest main"; it runs **named binary generations**
+with recorded SHA-256s, and the docs state which one is live. If a node
+disagrees with this page, reconcile before touching anything
+([health checklist](/runbooks#health-checklist-first-hour-of-any-shift)).
+
+## Proxy generations
+
+Each generation was built once on the lab build node, rolled 1→4→3→2 (VIP
+owner last), verified by SHA + health, then scored by one
+[dual-oracle round](/dual-oracle#score-timeline). Source:
+`docs/fairness-lab/S3-ALIGN-20260815.md`.
+
+| Generation | Binary SHA-256 (prefix) | What it closed | Status |
+|------------|------------------------|----------------|--------|
+| 887be hotfix | `b3dfb5c8…` (then) | empty-key `PUT /bucket/` → NoSuchKey; invalid buckets no longer routed into Swift accounts | superseded |
+| Wave-2 | `e291ea61…` | 887be-era ops; empty-key mb | superseded (proxy); **still live for object servers** |
+| F1 | `29acb863…` | clock-skew / expiry / InvalidStorageClass as real rejections | superseded |
+| XML | `2ecabc45…` | `RequestId` in every error body | superseded |
+| Schema | `a6b386e6…` | MPU composite ETag, ISO timestamps, PUT-ACL `Location` | superseded, kept as rollback target |
+| **Size** | **`69d22629dbf8c8c6…`** | ListVersions `Size` stamped from the PUT request length (source `1151a88`) | **live on 4/4 proxies + VIP since 2026-08-16T00:23Z** |
+
+Object servers fleet-wide remain Wave-2
+(`e1d4f1ccf6f01a18…`) — the honest sibling reconstructor build; nothing in
+the S3 alignment required rolling the object layer.
+
+## Code tip vs live binary
+
+`main` is deliberately allowed to be ahead of the fleet, and the difference
+is tracked here rather than blurred:
+
+- Live proxy = Size generation, built from source commit `1151a88` plus the
+  docs commits that followed.
+- Merge `a48a2b2` (2026-08-17) retired the last unmerged branch,
+  `codex/hotfix-s3cmd-mb-live-8663-20260814`, into `main` with a verified
+  resolution: the S3 layer was kept **byte-identical to main** (the hotfix's
+  s3api rework was superseded by the F1→Size generations, which are
+  dual-oracle verified live), while the proxy-side improvements were
+  adopted — the container-PUT account gate now fails closed with `503` when
+  account autocreate fails and re-checks account visibility before fan-out,
+  plus fail-closed ratelimit/container-sync/account-freeze config parsing
+  and `list_endpoints` v1/v2 handling, with their tests.
+- These proxy-side fixes are **merged but not yet rolled**; they ship with
+  the next proxy generation through the standard
+  [rolling runbook](/runbooks#rolling-proxy-upgrade-slim). Until then the
+  live fleet does not contain them, and no claim pretends otherwise.
+
+One recorded candidate for the next S3 window: an account-level guard that
+rejects non-GET requests with no bucket (`PUT /` etc.) at the S3 layer with
+`InvalidURI`, instead of relying on Swift-side account semantics — the
+strict 57 does not currently exercise that path.
+
+## Git branches
+
+Product repo: `github.com/0smboy/Peregrine`.
+
+| Branch | Role |
+|--------|------|
+| `main` | the line of record |
+| `build/phase1-deploy-rs-lb` | deploy line — kept at the same tip as `main` |
+| `codex/s3-align-20260815` | S3 alignment line — same tip |
+| `codex/finish-cold-worm-20260814` | cold/WORM line — same tip |
+| `codex/hotfix-s3cmd-mb-live-8663-20260814` | retired into `main` by merge `a48a2b2`; kept for history |
+| `feat/cold…`, `cursor/…`, `honesty/…`, `chore/clippy…`, `chore/fmt…` | ancestors already contained in `main` — never re-merge |
+
+The four product branches are pushed together so every line sees the same
+history. Work starts from the current `main` tip; the historical dirty
+working tree outside the product repo is never a merge source.
+
+## Provenance strings
+
+Every scored run names both binaries, e.g.
+`peregrine@size+sha256:69d22629…` vs
+`python-swift@2.33.0+s3api+object_versioning+xml-ct@10.0.0.3:8090` — reports
+without provenance are not evidence.

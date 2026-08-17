@@ -1,0 +1,146 @@
+---
+title: Dual-oracle verification
+description: The strict 57-case S3 harness — methodology, the GREEN gate contract, the score timeline, and the eight explained residuals.
+sidebar:
+  order: 17
+---
+
+Peregrine's S3 claims are not self-graded. Every scored run sends the same
+request to **two live backends** and compares what a client would see:
+
+- **Python oracle** — stock OpenStack Swift **2.33.0** proxy with `s3api`,
+  `versioned_writes` (`allow_object_versioning = true`) and `symlink`, on the
+  lab node swift3 (`http://10.0.0.3:8090`).
+- **Rust under test** — the Peregrine fleet behind the Keepalived VIP
+  (`https://10.0.0.10:8085`), running the live proxy generation
+  ([releases](/releases)).
+
+The runner asserts status codes, the headers a client depends on, and XML
+body shape. A case passes only when both sides agree — or when the runner's
+expectation for a deliberate divergence (a [Rust-ahead
+extra](/s3-api#the-rust-ahead-extras)) is met exactly.
+
+## The runner is part of the contract
+
+| Property | Value |
+|----------|-------|
+| Source | `tools/strict-s3-parity.py` (in-repo) |
+| Frozen SHA-256 | `f622b336ae3aec2a057fd3b9a0c8314bcfb834e5083b0bfcb61e4786bfccaec5` (93 838 bytes) |
+| Self-test | `tools/strict-s3-parity-selftest.py` |
+| Cases | 57 required, spanning auth (SigV4/SigV2, header+query, skew/expiry), bucket lifecycle, ACL, tagging, CORS, storage class, multipart, multi-delete, versioning, delete markers, restore |
+
+Three standing prohibitions, set after real incidents of score-gaming:
+
+1. **Never edit assertions or delete cases** to make a run pass.
+2. **Never downgrade Rust extras to 501** to convert explained FAILs into
+   PASSes.
+3. **Never overwrite an existing JSON report** — every run gets a new
+   filename; existing reports are the baseline.
+
+## The GREEN gate
+
+"GREEN" is a protected word. It may only be claimed when a run satisfies all
+of:
+
+```text
+runner exit code == 0
+JSON gate == "PASS"
+failed == missing == skipped == cleanup_failed == 0
+executed == required == 57
+```
+
+Anything else is reported as the FAIL it is. The current standing is
+**49/8 — not GREEN**, and the stance stays `IMPLEMENTED_SUBSET_ONLY`.
+
+## Score timeline
+
+Each row is one deployed proxy generation plus, in the last row, lab-only
+Python header patches on the oracle. Full narrative:
+`docs/fairness-lab/S3-ALIGN-20260815.md`.
+
+| Run | Rust generation | required/exec/pass/fail/missing | cleanup_failed |
+|-----|-----------------|:-------------------------------:|:--------------:|
+| first (no versioning on oracle) | Wave-2 | 57/45/18/27/12 | 1 |
+| post-VW (oracle gained object versioning) | Wave-2 | 57/57/28/29/0 | 1 |
+| post-F1 (skew/expiry/storage-class statuses) | F1 | 57/57/32/25/0 | 0 |
+| post-XML (error `RequestId`) | XML | 57/57/37/20/0 | 0 |
+| post-SCHEMA (MPU ETag, ISO times, PUT-ACL `Location`) | Schema | 57/57/41/16/0 | 0 |
+| post-SIZE (ListVersions `Size`) | Size | 57/57/42/15/0 | 0 |
+| **post-PY-XML-CT (current)** | Size | **57/57/49/8/0** | **0** |
+
+Current report: `strict-s3-dual-20260816-postpyhdr.json`, SHA-256
+`58595702ae301828cc2a8003e9702f9baa4dfd0ce41ad4206cf18b82aefc3025`
+(lab evidence root `/root/work/evidence/` on swift3).
+
+## Failure taxonomy
+
+Every FAIL is classified before anyone reaches for a fix. Partial counts as
+not implemented; "basically compatible" is not a category.
+
+| Class | Meaning | Handling |
+|-------|---------|----------|
+| `PYTHON_MISSING` | Python has no such surface at all | Rust extra allowed; runner may not compare |
+| `ABORT_CASCADE` | an early abort made later cases missing | fix the abort first |
+| `RUST_AHEAD` | Rust implements what Python 2.33 does not | **keep** — never 501 |
+| `RUST_BUG` | both sides implement it; Rust disagrees | fix Rust |
+| `HEADER_NOISE` | same function, different header literals | eliminated (0 as of 2026-08-16) |
+| `PYTHON_RESIDUAL` | Python implements the surface incompletely | do not break Rust to match |
+
+## The eight residuals, explained
+
+**RUST_AHEAD × 7** — the [extras table](/s3-api#the-rust-ahead-extras):
+object-ACL write, bucket-tagging write, object-tagging delete, CORS
+GET/PUT/DELETE, and RestoreObject's honest `400 InvalidObjectState`.
+
+**PYTHON_RESIDUAL × 1** — `get-current-delete-marker`. Both sides answer
+`404` for a GET whose current version is a delete marker. Rust also answers
+`x-amz-delete-marker: true` plus the marker's `x-amz-version-id` (the
+AWS-documented shape). Python 2.33 cannot: Swift's backend 404 carries no
+`x-backend-content-type`, so its s3api layer has nothing to translate. The
+Rust headers stay; the Python gap is recorded rather than papered over.
+
+Escalation beyond 49/8 is a decision, not a default. The recorded options:
+accept 49/8 as the ceiling for this runner + policy (current default), change
+the runner contract (currently forbidden), or extend the Python oracle's
+object data plane (large, and it changes the oracle's meaning).
+
+## Lab-only oracle patches
+
+The HEADER_NOISE class was closed by patching the **lab** Python 2.33 s3api
+on swift3 only — GET ACL/tagging/versioning and multi-delete responses now
+send `Content-Type: application/xml`, and the 404 translation preserves
+already-translated `x-amz-*` headers. This is **not upstream 2.33**:
+
+- Backups: `/root/work/peregrine-py-s3api-header-20260816/` and
+  `*.bak-20260816-header` beside each patched file.
+- Rollback: restore the `.bak` files, clear `__pycache__`, restart
+  `pyswift-proxy` — the Rust fleet is untouched.
+- swift2/swift4's Python `:8090` instances are unpatched; the dual-oracle
+  runs against swift3 only.
+
+## Running a round
+
+Runs execute on the lab (Linux); a round takes about 80 seconds. Credentials
+are loaded by the wrapper scripts on swift3 and never live in the repo.
+
+```bash
+python3 tools/strict-s3-parity.py \
+  --python http://10.0.0.3:8090 \
+  --rust   https://10.0.0.10:8085 \
+  --rust-insecure \
+  --python-provenance 'python-swift@2.33.0+s3api+object_versioning+xml-ct@10.0.0.3:8090' \
+  --rust-provenance   'peregrine@size+sha256:69d22629…' \
+  --json-report /root/work/evidence/strict-s3-dual-<NEW-NAME>.json
+```
+
+Rules of engagement: a new filename per run, provenance strings that name
+both binaries, and the result is recorded **as scored** — a non-zero exit is
+written up as FAIL, never narrated into a pass. Run one round after any
+change to the S3 path; do not loop rounds on an unchanged system.
+
+<Aside type="note" title="Why the oracle is Python">
+Correctness is defined as "what stock Swift 2.33 + s3api does", not as
+"what the Rust implementation expects of itself". When Python is wrong or
+incomplete (the delete-marker header), the gap is documented as
+PYTHON_RESIDUAL instead of being copied.
+</Aside>

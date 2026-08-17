@@ -1,0 +1,123 @@
+---
+title: Configuration reference
+description: Fail-closed configuration semantics, worker model, the honored proxy and s3api knobs, and what is deliberately unsupported.
+sidebar:
+  order: 19
+---
+
+Peregrine reads standard Swift INI configuration (`proxy-server.conf`,
+`swift.conf`, per-service confs) so a Python cluster's files carry over. The
+semantics differ in one deliberate way: **malformed configuration refuses to
+start instead of silently defaulting.**
+
+Canonical knob-by-knob table (73 rows, generated from the parser):
+[`docs/fairness-lab/CONFIG-PARITY.md`](https://github.com/0smboy/Peregrine/blob/main/docs/fairness-lab/CONFIG-PARITY.md).
+
+## Fail-closed startup
+
+Where Python's Paste/ConfigParser stack coerces or ignores bad values, the
+Rust proxy treats them as fatal load errors:
+
+| Surface | Fail-closed behavior |
+|---------|----------------------|
+| Unknown pipeline filter names | refuse to start — there is no dynamic plugin loader to hand them to |
+| `[filter:account_freeze] frozen_accounts` empty or comma-only | hard error; an accidentally-empty freeze list must not load as "freeze nothing" |
+| `[filter:ratelimit]` numeric options (`account_ratelimit`, `max_sleep_time_seconds`, `log_sleep_time_seconds`, tiers) | malformed numbers abort construction instead of applying defaults |
+| container-sync realms conf | strict parse: duplicate sections/options and malformed lines are load errors, so a typo cannot silently overwrite a realm secret |
+| `[filter:copy] yield_frequency` | strict integer; negative values clamp to 0 |
+| Storage policies / rings / hash prefix | parse errors exit(1) before any socket is bound |
+
+<Aside type="note" title="Why">
+A proxy that starts with a half-understood security or rate-limit config is
+worse than one that refuses to start. The 2026-08-14 lab incident
+([incidents](/incidents)) traces to a request-routing hole of exactly this
+family.
+</Aside>
+
+## Worker model
+
+`workers` does **not** mean what it means in Python, and iso-config
+comparisons must account for it:
+
+- Python: `workers` = eventlet prefork **process** count.
+- Rust: `workers × max_clients` → a **thread** pool clamped to 128 per
+  process.
+- `servers_per_port ≥ 1` (object) restores Python-parity process isolation:
+  ring ports are discovered and one OS process is supervised per
+  (port, worker). Details:
+  [`docs/fairness-lab/WORKERS-SEMANTICS.md`](https://github.com/0smboy/Peregrine/blob/main/docs/fairness-lab/WORKERS-SEMANTICS.md).
+
+The Contabo lab object servers listen per-device on `:6211/:6212` via
+`servers_per_port` — the conf's nominal `6210` is the base, not the bound
+port. Recon and the ops kit use `/recon/stage`.
+
+## `[app:proxy-server]`
+
+| Knob | Default | Notes |
+|------|---------|-------|
+| `account_autocreate` | `false` | when `true`, a container PUT on a missing account creates the account first — and **fails closed with `503`** if that autocreate fails, then re-checks visibility (`404` if still unobservable) before any container fan-out |
+| `allow_account_management` | off | account PUT/DELETE require it, as in Python |
+| `workers` / `max_clients` | see above | thread-pool sizing |
+| node/ring paths, policies | Swift-standard | per-policy rings; `ec` feature required for EC policies |
+
+Production posture on the lab fleet (perf-lever program, CLOSED,
+`tools/test-results/contabo-deploy-20260801/perf-levers/SUMMARY.json`):
+
+```ini
+workers = 16
+container_update_mode = sync
+container_update_timeout = 1.0
+fsync_on_close = true
+reuse_port = false
+```
+
+## `[filter:s3api]` and friends
+
+| Knob | Meaning |
+|------|---------|
+| `location` | the region answered by GetBucketLocation |
+| `storage_domain` (or `storage_domains`) | virtual-host–style bucket domains; Python spells it singular |
+| `dns_compliant_bucket_names` | bucket-name strictness for create/validate |
+| `allowable_clock_skew` | SigV4/SigV2 time window — a real rejection (`403 RequestTimeTooSkewed`) since the F1 generation, not a dead knob |
+| `enable_extended_subresources` | gates the extended subresource set |
+| `anonymous_account` | when set, unsigned S3-shaped GET/HEAD map to this Swift account (no auth override) so container `.r:*` ACLs can serve public reads; unset = off |
+| `[filter:s3token] reseller_prefix` | EC2-credential → Keystone path |
+
+## `[filter:account_freeze]`
+
+Deny-all for named Swift accounts, used to fence incident accounts:
+
+```ini
+[filter:account_freeze]
+use = egg:swift#account_freeze
+frozen_accounts = AUTH_test
+```
+
+Every method on a frozen account answers `403` with a body that cannot be
+mistaken for success. S3 dispatch honors the same list. An empty list is a
+startup error, and the S3-side denial is covered by the 2026-08-14
+`s3api-frozen-accounts` lab run.
+
+## Middleware pipeline
+
+Implemented filters are listed in the [parity matrix](/parity#middleware).
+Pipeline names resolve to the Rust implementations; memcache/recon aliases
+ride NamedPassthrough slots; unknown names fail closed. There is **no**
+`use = egg:…` dynamic code loading — third-party Paste plugins are
+deliberately unsupported.
+
+## Deliberately unsupported knobs
+
+High-signal rows from CONFIG-PARITY (the parser sees and ignores nothing —
+these are documented as unsupported):
+
+| Service | Knob | Why |
+|---------|------|-----|
+| object | `use_splice`, `eventlet_tpool_num_threads` | eventlet-specific I/O model; the Rust server does not emulate it |
+| object | `conn_timeout`, `node_timeout`, `replication_server` | not parsed at the object layer |
+| account | `databases_per_node` | not parsed |
+| container | `allow_versions` | legacy versioning; use `versioned_writes` / S3 versioning |
+| proxy | arbitrary Paste `pipeline` entries | no dynamic loader, fail closed |
+
+If a knob you rely on is not in CONFIG-PARITY as parsed, assume it is
+ignored and verify before rollout.

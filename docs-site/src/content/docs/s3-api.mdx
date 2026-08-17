@@ -1,0 +1,146 @@
+---
+title: S3 API reference
+description: The implemented S3 surface — authentication, bucket and object operations, multipart, versioning, object lock, errors, and the Rust-ahead extras.
+sidebar:
+  order: 16
+---
+
+This page documents the S3 surface Peregrine's `swift-s3api` middleware
+actually implements, at the behavior level a client sees. Scope discipline:
+everything here is **IMPLEMENTED_SUBSET_ONLY**, verified against the Python
+Swift 2.33 s3api oracle by the [strict dual-oracle harness](/dual-oracle)
+(49/8 as of 2026-08-16, `docs/fairness-lab/S3-ALIGN-20260815.md`). It is not
+"full S3", and it is not a production compatibility promise.
+
+<Aside type="caution" title="Claim boundary">
+The live lab binary is the Size generation
+(`69d22629…`, [releases](/releases)). Anything not listed here — or listed as
+an unsupported subresource — answers `501 NotImplemented` rather than
+pretending. Partial counts as not implemented.
+</Aside>
+
+## Authentication
+
+| Scheme | Support | Notes |
+|--------|---------|-------|
+| SigV4 header (`Authorization: AWS4-HMAC-SHA256 …`) | yes | canonical request + signed headers verified |
+| SigV4 presigned query (`X-Amz-Signature=…`) | yes | expiry enforced (below) |
+| SigV2 header (HMAC-SHA1) | yes | AWS test-vector verified |
+| SigV2 presigned query | yes | `Expires` enforced |
+| `aws-chunked` / `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` | yes | per-chunk HMAC and trailer signature enforced; bad chunk or trailer signature fails the upload |
+| `UNSIGNED-PAYLOAD` | yes | header-signed requests with unsigned body |
+| s3token / EC2 credentials → Keystone | yes (lab) | see the [parity matrix](/parity) |
+
+Time-based rejection is real, not a dead config knob:
+
+| Condition | Response |
+|-----------|----------|
+| SigV4/SigV2 clock skew beyond the allowed window | `403 RequestTimeTooSkewed` |
+| Presigned URL past its expiry | `403 AccessDenied` ("Request has expired") |
+| Unknown `x-amz-storage-class` on PUT/copy | `400 InvalidStorageClass`, rejected before any persist |
+
+## Bucket operations
+
+| Operation | Status | Behavior notes |
+|-----------|--------|----------------|
+| `PUT /bucket` (create) | yes | answers `Location: /<bucket>`; invalid names → `InvalidBucketName` before any Swift routing |
+| `DELETE /bucket` | yes | non-empty → `BucketNotEmpty` |
+| `HEAD /bucket` | yes | |
+| `GET /` (ListBuckets) | yes | the only account-level operation |
+| ListObjects v1 / v2 | yes | `list-type=2` continuation semantics |
+| GetBucketLocation | yes | answered locally from `location` config, no Swift hop |
+| Bucket ACL (canned + `x-amz-grant-*` + ACP XML) | yes | `?acl` GET/PUT |
+| Bucket versioning `?versioning` | yes | Enabled / Suspended, see [versioning](/versioning-worm) |
+| ListObjectVersions `?versions` | yes | pagination; `Size` semantics in [versioning](/versioning-worm) |
+| Bucket tagging `?tagging` | read: yes · write: **Rust extra** | Python 2.33 answers 501 on write |
+| Bucket CORS `?cors` | **Rust extra** | GET/PUT/DELETE (200/200/204); Python 2.33 answers 501 |
+| Lifecycle `?lifecycle` | yes | Expiration + Transition metadata + AbortIncompleteMultipartUpload |
+| Object Lock config `?object-lock` | yes | validated XML stored on protected container sysmeta |
+| Unsupported subresources (`?policy`, `?website`, `?inventory`, …) | no | explicit `501 NotImplemented` |
+
+## Object operations
+
+| Operation | Status | Behavior notes |
+|-----------|--------|----------------|
+| PUT / GET / HEAD / DELETE object | yes | streaming bodies, no full-object buffering |
+| Range and conditional requests | yes | |
+| CopyObject (`x-amz-copy-source`) | yes | `LastModified` in the result XML is ISO `…T…Z`, never HTTP-date |
+| Multi-delete (`POST /bucket?delete`) | yes | per-key `<Deleted>` / `<Error>` result; missing keys are errors, not silent deletes |
+| Object ACL `?acl` | read: yes · write: **Rust extra** | Python 2.33 answers 501 on write |
+| Object tagging `?tagging` | read: yes · delete: **Rust extra** | |
+| Legal hold / retention / lock | yes | see [WORM](/versioning-worm) — bucket lock config is required first (`400 InvalidRequest` otherwise) |
+| RestoreObject `?restore` | honest reject | cold backend disabled → `400 InvalidObjectState`; with a lab backend → `202` and a restore window |
+| Versioned GET/DELETE (`?versionId=`) | yes | `null` and 32-hex ids; malformed id → `400 InvalidArgument` |
+
+## Multipart upload
+
+The full MPU path is implemented and dual-oracle covered: initiate, upload
+part, list parts, list uploads, complete, abort.
+
+- **Composite ETag** is AWS-shaped: `MD5(part-MD5s)-N`
+  (unit vector `"b4b77f5320cfe9ce9c0c70c35e84d511-2"`).
+- ListMultipartUploads requires `GET`; other verbs on `?uploads` answer
+  `405 MethodNotAllowed`.
+- Part storage uses the `+segments` companion container, compatible with
+  Swift's SLO layout.
+
+## Error responses
+
+Error XML is aligned with the Python 2.33 oracle shape:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>NoSuchKey</Code>
+  <Message>The specified key does not exist.</Message>
+  <RequestId>tx000000000000000000005-0068a01c22</RequestId>
+  <Key>missing.txt</Key>
+</Error>
+```
+
+- `RequestId` is `tx{21 hex}-{10-hex unix time}`, present on every error.
+- Timestamps in listing/result XML are `YYYY-MM-DDTHH:MM:SS.000Z`.
+- Common codes: `NoSuchBucket`, `NoSuchKey`, `NoSuchVersion`,
+  `InvalidBucketName`, `InvalidArgument`, `InvalidStorageClass`,
+  `RequestTimeTooSkewed`, `AccessDenied`, `BucketNotEmpty`, `MalformedXML`,
+  `InvalidRequest`, `InvalidObjectState`, `MethodNotAllowed`,
+  `NotImplemented`, `InternalError`.
+
+## The Rust-ahead extras
+
+Seven surfaces are implemented in Rust that stock Python 2.33 s3api answers
+`501` to. Policy (2026-08-15, `docs/fairness-lab/S3-ALIGN-20260815.md`): they
+**stay implemented** — they are never downgraded to 501 to mint dual-oracle
+PASSes, so they are permanent, explained FAILs in the strict runner:
+
+| Case | Python 2.33 | Rust |
+|------|:-----------:|:----:|
+| `put-object-acl-not-implemented` | 501 | 200 |
+| `put-bucket-tagging-not-implemented` | 501 | 200 |
+| `delete-object-tagging-not-implemented` | 501 | 204 |
+| `get-bucket-cors-not-implemented` | 501 | 200 (CORS XML) |
+| `put-bucket-cors-not-implemented` | 501 | 200 |
+| `delete-bucket-cors-not-implemented` | 501 | 204 |
+| `restore-not-implemented` | 501 | 400 `InvalidObjectState` (honest reject while cold is off) |
+
+## Anonymous and unsigned requests
+
+- Unsigned S3-shaped reads can map to a configured `anonymous_account`
+  (GET/HEAD only) so container `.r:*` ACLs can serve public reads — off unless
+  configured. Everything else unsigned answers `403 AccessDenied`.
+- Unsigned `GET /` is only ListBuckets-shaped when it matches the S3 form; a
+  bare unsigned `/bucket` probe on the Python oracle is `412 NotS3Request`,
+  and the harness signs existence gates accordingly.
+
+## Not implemented / not claimable
+
+- Physical cold-tier storage-policy routing (the proxy does not load the cold
+  policy map in the fleet build; the LocalDir backend is a lab prototype,
+  **default off** — [details](/versioning-worm#cold-tier)).
+- Runtime-wired multi-tenant IAM policy enforcement (library-level only).
+- Bucket policy, website hosting, inventory, analytics, replication config,
+  and every other subresource not listed above: `501 NotImplemented`.
+- Hosted-AWS behaviors that Swift itself does not have.
+
+Full strict matrix: [Rust vs Python parity](/parity) ·
+methodology and current scoreboard: [dual-oracle](/dual-oracle).

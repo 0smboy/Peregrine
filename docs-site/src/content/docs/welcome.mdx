@@ -56,21 +56,52 @@ matrix before planning any mixed rollout.
   <Card title="Architecture">
     How the data, control, and test planes fit together. [Architecture →](/architecture)
   </Card>
+  <Card title="S3 API reference">
+    The implemented S3 surface — auth, buckets, objects, MPU, errors, and
+    the Rust-ahead extras. [S3 API →](/s3-api)
+  </Card>
+  <Card title="Dual-oracle verification">
+    The strict 57-case harness, the GREEN gate, and the current 49/8
+    scoreboard. [Dual-oracle →](/dual-oracle)
+  </Card>
   <Card title="Testing & verification">
     Golden fixtures, functional parity, load, and live HA drills. [Testing →](/testing)
   </Card>
   <Card title="Lab cluster">
     Four-node Contabo HA topology, EC build rules, and cutover. [Lab cluster →](/lab-cluster)
   </Card>
-  <Card title="Philosophy">
-    Why Peregrine is built the way it is. [Philosophy →](/philosophy)
+</CardGrid>
+
+## Operating it
+
+<CardGrid>
+  <Card title="Configuration">
+    Fail-closed config semantics, the worker model, and every honored knob.
+    [Configuration →](/configuration)
+  </Card>
+  <Card title="Runbooks">
+    The slim rolling upgrade, drain hygiene, rollback, and post-change
+    gates. [Runbooks →](/runbooks)
+  </Card>
+  <Card title="Releases & live binaries">
+    Which binary generation is live, and the git branch discipline.
+    [Releases →](/releases)
+  </Card>
+  <Card title="Incidents & freezes">
+    What broke, what is frozen, and the standing hard boundaries.
+    [Incidents →](/incidents)
   </Card>
 </CardGrid>
 
 ## Status
 
 Core CRUD, replication, EC, and selected middleware paths have unit and
-four-node lab evidence. Important production and runtime-integration gaps remain.
-The [strict parity matrix](/parity) defines the current claim boundary.
+four-node lab evidence. The S3 surface is scored by a strict
+[dual-oracle harness](/dual-oracle) against Python Swift 2.33 — **49/8 as of
+2026-08-16, not GREEN** (`docs/fairness-lab/S3-ALIGN-20260815.md`).
+Important production and runtime-integration gaps remain. The
+[strict parity matrix](/parity) defines the current claim boundary; the
+stance is **IMPLEMENTED_SUBSET_ONLY**, and this documentation never claims
+"full Swift compatibility" or production readiness.
 
 Licensed Apache-2.0, matching upstream OpenStack Swift.

@@ -1,0 +1,79 @@
+---
+title: Incidents & freezes
+description: The AUTH_test routing incident, the frozen daemon set, leftover-resource policy, and the standing hard boundaries.
+sidebar:
+  order: 28
+audience: human
+---
+
+Production credibility comes from what a project writes down about its
+failures. These are Peregrine's, with their current containment state.
+
+## 2026-08-14 — AUTH_test invalid-bucket routing
+
+**What happened.** A historical S3 routing hole translated requests carrying
+invalid bucket names into Swift-native requests against the internal
+`AUTH_test` account. The account-reaper subsequently unlinked affected
+`.data` files under that account. The damaged data was test data.
+
+**Containment and fix.** The routing hole was closed the same day by the
+`887be43` hotfix generation (invalid buckets rejected before any Swift
+routing; empty-key writes answered honestly) and the fix was carried
+forward — superseded, not reverted — by the Wave-2 → Size generations that
+are dual-oracle verified live. The account itself is fenced by the
+`account_freeze` middleware ([configuration](/configuration#filteraccount_freeze)),
+verified S3-side by the 2026-08-14 `s3api-frozen-accounts` run.
+
+**Standing decisions.**
+
+- Forensic evidence stays: `/root/work/peregrine-auth-test-incident-20260814/`
+  on the build node. No database resurrection, no disk carving, no
+  provider snapshot — the data was test data; the *evidence* is what is
+  preserved.
+- The write-side forensic loop was **not** closed to a tidy conclusion and
+  is recorded that way. Unfinished is written as unfinished.
+
+## The 13 frozen daemons
+
+During incident response, 13 consistency daemons across the fleet were set
+`disabled + inactive` (`ENABLE=NONE`) to stop background mutation while the
+data path stayed up. They are **still frozen**. Re-enabling is a planned,
+separate wave with its own recovery plan
+(`daemon-recovery-plan`, 2026-08-14 workflow records) — it is never done
+"while we're in there" during S3 or proxy work. The replication /
+reconstruction claims on [Operations](/operations) describe capabilities
+proven in earlier passes, not daemons currently running in the lab.
+
+## Leftover-resource policy
+
+Scored runs create real buckets and objects; cleanup failures are tracked in
+every report (`cleanup_failed`, 0 in the current runs). What remains is
+kept deliberately:
+
+| Resource | Policy |
+|----------|--------|
+| `worm-base-*` buckets | KEEP — WORM evidence |
+| `peregrine-s3-<date>-<hex>` + `+segments` / `+versions` companions | KEEP — run companions; the primary bucket is often already deleted |
+| Human/FUSE tenants (`AUTH_lab`, `s3://mytest`) | never touched by automation |
+| Rollback binaries and prior generation build dirs | KEEP — they are the rollback path |
+
+## Hard boundaries (all still in force)
+
+1. Do not restart HAProxy or Keepalived; do not move the VIP.
+2. Do not enable frozen daemons outside the dedicated recovery wave.
+3. Do not touch `AUTH_lab`, `AUTH_test`, or `s3://mytest`.
+4. Do not edit the dual-oracle runner's assertions or case set; do not
+   downgrade Rust extras to 501 ([why](/dual-oracle#the-runner-is-part-of-the-contract)).
+5. Do not delete evidence — reports, rollback binaries, incident trees,
+   prior build dirs.
+6. Do not format or wipe `/srv/node` devices, ever.
+
+## Lab-only divergence disclosure
+
+The Python oracle on the lab's swift3 node carries small, documented,
+reversible s3api header patches (XML `Content-Type` on four GET paths and
+404 header preservation) used to eliminate HEADER_NOISE from the strict
+comparison. This is disclosed wherever scores are published: the oracle is
+**2.33 + lab patches**, not pristine upstream, and the other nodes'
+Python instances are unpatched.
+[Details and rollback](/dual-oracle#lab-only-oracle-patches).

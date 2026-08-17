@@ -5,9 +5,17 @@ sidebar:
   order: 21
 ---
 
-## Recent delivery — cold + Contabo S3
+## Current fleet state
 
-Honest closeout for LocalDir cold/restore + Contabo S3 matrix (fleet still `77dd9f4`, code tip `8663d11`): [Cold + Contabo S3 delivery](/cold-contabo-delivery). Stance **IMPLEMENTED_SUBSET_ONLY** — not tape/Glacier, not fleet cold enable.
+As of 2026-08-16 (`docs/fairness-lab/S3-ALIGN-20260815.md`): proxies 4/4 +
+VIP run the **Size** generation (`69d22629…`), object servers remain Wave-2
+(`e1d4f1cc…`), drain 0, VIP on swift2. S3 dual-oracle stands at **49/8, not
+GREEN**. Stance **IMPLEMENTED_SUBSET_ONLY**. Binary genealogy:
+[Releases](/releases) · upgrade/rollback recipes: [Runbooks](/runbooks) ·
+scoring: [Dual-oracle](/dual-oracle).
+
+Earlier cold/restore closeout (LocalDir, not tape/Glacier, default off):
+[Cold + Contabo S3 delivery](/cold-contabo-delivery).
 
 ## Health at a glance
 
@@ -23,6 +31,13 @@ Lab topology, EC binary requirements, and subscription cutover rules:
 [Lab cluster](/lab-cluster).
 
 ## Replication & reconstruction
+
+<Aside type="caution" title="Lab daemon freeze in force">
+The capabilities below are proven by earlier passes. On the current lab
+fleet, 13 consistency daemons remain deliberately frozen after the
+2026-08-14 incident and are re-enabled only by the dedicated recovery wave —
+see [Incidents & freezes](/incidents#the-13-frozen-daemons).
+</Aside>
 
 - **Object replicator** — suffix-hash push, handoff revert, rsync /
   rsync-over-ssh.

@@ -48,7 +48,10 @@ every node.
   proxy returns HTTP 501 for EC puts.
 - On swift1: Prometheus, Loki, Alloy, statsd_exporter, `swift-console`,
   `cabt` / `autocos`; `node_exporter` on every node (`nodes_up` should be 4).
-- Python SAIO `:8090` + Rust SAIO `:8081` on swift1 for Lab Shadow.
+- Python SAIO `:8090` + Rust SAIO `:8081` on swift1 for Lab Shadow. The
+  **dual-oracle** Python instance is a separate concern: Swift 2.33 + s3api +
+  object versioning on **swift3** `:8090` (with documented lab-only header
+  patches — see [Dual-oracle](/dual-oracle#lab-only-oracle-patches)).
 - After copying binaries under SELinux, run `restorecon` so labels stay
   executable (`bin_t`); `haproxy_connect_any=1`, `ip_nonlocal_bind=1`.
 

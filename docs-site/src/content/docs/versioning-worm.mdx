@@ -1,0 +1,131 @@
+---
+title: Versioning, WORM & cold tier
+description: Object versioning semantics, delete markers, the version index, Object Lock legal hold and retention, and the honest state of the cold tier.
+sidebar:
+  order: 18
+---
+
+User-facing semantics of the three S3 data-protection surfaces, with their
+exact verification level. Everything here is dual-oracle or unit covered;
+nothing here upgrades the [claim boundary](/parity).
+
+## Object versioning
+
+A bucket is unversioned until `PUT ?versioning` sets `Enabled` or
+`Suspended` (validated XML; state is stored on container sysmeta).
+
+| Mode | PUT behavior | Response header |
+|------|--------------|-----------------|
+| unversioned | overwrite in place | no `x-amz-version-id` |
+| `Enabled` | current object is archived, a new 32-hex version id is minted | `x-amz-version-id: <32 hex>` |
+| `Suspended` | overwrites the single `null` version; no new ids are minted | `x-amz-version-id: null` |
+
+Version ids are either `null` or 32 lowercase hex characters; anything else
+in `?versionId=` answers `400 InvalidArgument`.
+
+### Delete markers
+
+`DELETE` on a versioning-enabled bucket writes a delete marker instead of
+destroying data:
+
+- The response carries `x-amz-delete-marker: true` and the marker's version
+  id.
+- A subsequent GET of the key answers `404` **with**
+  `x-amz-delete-marker: true` and the marker's `x-amz-version-id` — the
+  AWS-documented shape. (Stock Python 2.33 omits these headers on the 404;
+  that gap is the one `PYTHON_RESIDUAL` in the [dual-oracle
+  scoreboard](/dual-oracle#the-eight-residuals-explained).)
+- `DELETE ?versionId=<id>` permanently removes exactly that version.
+
+### ListObjectVersions
+
+`GET /bucket?versions` lists `<Version>` and `<DeleteMarker>` entries with
+pagination. Two semantics worth knowing:
+
+- **`Size` is the PUT request length** — stamped when the version is written
+  (Swift's PUT response has an empty body, so its `Content-Length` would
+  always be 0). Fixed in the Size generation, source commit `1151a88`,
+  locked by the `multiversion_double_put_two_version_ids_and_list` unit test
+  (`<Size>2</Size>` / `<Size>7</Size>`).
+- Delete markers list with `Size` 0.
+
+### The version data plane
+
+Archived versions are real Swift objects, not magic:
+
+- Archives live in a `<bucket>+versions` companion container, named
+  `<hex(key)>/<version-id>`.
+- Per-key state lives in a version index object (`…/index.json`) guarded by
+  a compare-and-swap generation. A stale-generation commit is denied, a
+  persist answering `202` is **not** treated as success, and an oversized
+  index fails closed (unit-locked: `version_index_persist_202_is_not_success`,
+  `from_json_fail_closed_extra_large_index`).
+- Hidden archive objects are never an independent source of truth: version
+  reads require the index record first, so a failed archive can not
+  resurrect an orphan copy.
+
+<Aside type="caution" title="Scope">
+The version-index CAS is **in-process** — it serializes concurrent writers
+inside one proxy, not across the fleet. This is a recorded limitation, not a
+distributed lock.
+</Aside>
+
+## Object Lock (WORM)
+
+Object Lock follows the AWS model: the bucket must carry a validated lock
+configuration before any per-object lock write is accepted.
+
+| Operation | Behavior |
+|-----------|----------|
+| `PUT /bucket?object-lock` | validates the XML (`ObjectLockEnabled` required; `Rule/DefaultRetention` optional with `Mode` + exactly one of `Days`/`Years`) and stores it on protected container sysmeta |
+| `GET /bucket?object-lock` | returns the stored config; unconfigured → `404 ObjectLockConfigurationNotFoundError` |
+| `PUT ?legal-hold` / `PUT ?retention` on a bucket without lock config | `400 InvalidRequest` ("Bucket is missing Object Lock Configuration") |
+| `PUT ?legal-hold` (`ON`/`OFF`) | stamped as sysmeta below the gatekeeper |
+| `GET ?retention` on an object without retention | `400 InvalidRequest` ("Object is missing retention configuration") |
+
+### Retention rules
+
+Retention dates must be RFC3339, in the future, and within 100 years.
+Updates are evaluated against the persisted state — malformed persisted lock
+metadata fails closed as `InternalError` rather than being reinterpreted:
+
+| Existing | Requested | Decision |
+|----------|-----------|----------|
+| none, or already expired | anything valid | allow |
+| `GOVERNANCE` | shorten without bypass | deny (`403`) |
+| `GOVERNANCE` | shorten with `x-amz-bypass-governance-retention: true` + permission | allow |
+| `COMPLIANCE` | any shortening, or mode downgrade to GOVERNANCE | **deny (`403 AccessDenied`) — the bypass header does not apply** |
+| `COMPLIANCE` | extend | allow |
+
+DELETE of an object under unexpired retention is denied the same way:
+GOVERNANCE yields to a permitted bypass, COMPLIANCE never does. An unhealthy
+node clock additionally denies COMPLIANCE claims (new or existing) rather
+than trusting a broken clock.
+
+<Aside type="caution" title="Not a compliance product">
+Sysmeta travels below the gatekeeper (clients cannot forge
+`X-Object-Sysmeta-*`), and the WORM checks are unit- and dual-oracle-case
+covered. But native WORM here is **not** a certified regulatory-compliance
+feature, and no such claim is made. See the [parity matrix](/parity).
+</Aside>
+
+## Cold tier
+
+The cold tier is a **prototype, default off, not tape and not Glacier**:
+
+- The lab backends are `LocalDir` (`/var/cache/peregrine-cold`) and an
+  in-memory test backend; the mapping is a storage-class map like
+  `GLACIER:0`. The fleet build does not load a cold policy map — physical
+  cold routing stays **not implemented** in the strict matrix.
+- Lifecycle Transition stamps due-cold metadata; GET/HEAD of a due-cold
+  object answers `400 InvalidObjectState` (the S3 shape for "not restorable
+  yet / wrong storage class").
+- `POST ?restore` with a configured lab backend answers `202` and stamps a
+  restore window; without one it answers `400 InvalidObjectState` — the
+  honest reject, deliberately not `501` and not a fake success.
+- `delete_hot` after archive is config-gated and **defaults to false**;
+  partial-content responses are never archived; an open restore window is
+  not re-archived.
+
+Delivery record: [Cold + Contabo S3 delivery](/cold-contabo-delivery) ·
+evidence tree `tools/test-results/` (`cold-*-2026081*`).

@@ -1,0 +1,143 @@
+---
+title: Runbooks
+description: The slim rolling proxy upgrade, drain hygiene, rollback, post-change gates, and the publish checklist — as actually executed on the fleet.
+sidebar:
+  order: 26
+---
+
+Operational recipes as they are actually executed on the four-node lab
+fleet. Canonical ops source in-repo:
+[`docs/fairness-lab/HANDOFF-20260816.md`](https://github.com/0smboy/Peregrine/blob/main/docs/fairness-lab/HANDOFF-20260816.md).
+Generic patterns (SAIO, generic node upgrade) are on [Deploy](/deploy); this
+page is the fleet-specific discipline.
+
+## Standing rules
+
+1. **Compile on Linux only.** Never copy a macOS Mach-O binary to the
+   cluster; builds happen on a lab node with `--offline --locked`.
+2. **Nodes are peers.** Build once, verify SHA + health on each node, then
+   run one scored gate — do not re-run the full canary suite per node
+   (the Size rollout took 81 seconds end to end this way).
+3. **Do not restart HAProxy or Keepalived, and do not move the VIP.** The
+   VIP-owning node is upgraded last, explicitly.
+4. **Never format storage devices** from any tooling.
+5. Frozen daemons stay frozen ([incidents](/incidents)); an upgrade window
+   is not a license to `systemctl enable` anything.
+
+## Rolling proxy upgrade (slim)
+
+<Steps>
+<Step>
+Sync the source to the build node into a fresh, dated work dir; reuse the
+previous generation's `target/` for an incremental build.
+
+```sh
+rsync -a --exclude target/ --exclude .git/ swift-rust/ \
+  <buildnode>:/root/work/peregrine-<tag>/swift-rust/
+```
+</Step>
+<Step>
+Build and unit-test offline with a pinned cargo home, low priority:
+
+```sh
+CARGO_HOME=/root/work/peregrine-cargo-home CARGO_INCREMENTAL=0 \
+nice -n 19 cargo test  --offline --locked -p swift-s3api --lib -j2
+nice -n 19 cargo build --offline --locked --release \
+  -p swift-proxy-server --features ec -j2
+```
+
+If the offline build cannot resolve, **stop** — do not `cargo update`, do
+not build elsewhere.
+</Step>
+<Step>
+Record `sha256sum` of the artifact and check `ldd` resolves
+`liberasurecode`. The SHA must differ from the live one; copy the same
+artifact to every node.
+</Step>
+<Step>
+Apply per node with the rolling kit — non-VIP nodes first, the VIP owner
+last with its explicit flag:
+
+```sh
+bash rolling-apply-proxy-node.sh <ARTIFACT> <node> <EVIDENCE_DIR>
+# VIP owner only:
+bash rolling-apply-proxy-node.sh <ARTIFACT> <node> <EVIDENCE_DIR> --allow-vip
+```
+</Step>
+<Step>
+**Undrain immediately.** The kit drains the node (two iptables comment
+rules) and does not undrain it. Remove both rules with separated arguments —
+a forgotten drain leaves the node DOWN in HAProxy:
+
+```sh
+iptables -D INPUT  … -m comment --comment <tag>-drain
+iptables -D OUTPUT … -m comment --comment <tag>-drain-self
+```
+</Step>
+<Step>
+Verify per node: live binary SHA matches the artifact, `/healthcheck` 200,
+`/info` 200. Then confirm fleet-wide drain count is 0.
+</Step>
+<Step>
+Run **one** [dual-oracle round](/dual-oracle#running-a-round) against the
+VIP with a new JSON report name. Record the result as scored — with the
+Rust-ahead extras in place the expected exit is non-zero (49/8), and that is
+what gets written down.
+</Step>
+</Steps>
+
+## Rollback
+
+Every generation leaves a timestamped rollback copy beside the live binary
+(`/usr/local/bin/swift-proxy-server.rollback.<node>.<ts>.<sha12>`), and each
+build dir keeps its installed artifact. To roll back: install the rollback
+copy per node with the same kit + undrain + SHA/health verification, VIP
+last, then run one dual-oracle round and record it. Build directories of
+prior generations (`peregrine-s3-{f1,xml,schema,size}-*`) are evidence —
+do not delete them to free space.
+
+## Health checklist (first hour of any shift)
+
+```text
+per node:  sha256sum /usr/local/bin/swift-proxy-server   → expected generation
+           curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/healthcheck  → 200
+VIP owner: ip addr show eth1 | grep 10.0.0.10            → present on expected node
+VIP path:  curl -sk https://10.0.0.10:8085/healthcheck   → 200
+oracle:    curl -s  http://10.0.0.3:8090/healthcheck     → 200
+drain:     iptables -L INPUT -n | grep -c drain          → 0
+```
+
+Expected values live in [releases](/releases); if reality disagrees with the
+releases page, stop and reconcile before changing anything.
+
+## Post-change gates
+
+| Change | Required gate |
+|--------|---------------|
+| Rust S3 path | one dual-oracle round, new report name, result recorded as scored |
+| Proxy outside S3 | unit + integration tests on the build node; roll only what the change needs |
+| Python oracle (lab patches) | one dual-oracle round; document as lab-only, never as upstream 2.33 |
+| Docs only | no cluster action — see the publish checklist |
+
+There is no gate that converts a FAIL into a PASS by prose.
+"Expected FAIL" is still written as FAIL.
+
+## Publish checklist (docs)
+
+1. Update **every** surface that states a changed fact in one commit —
+   docs-site page, the fairness-lab long form, and README where applicable.
+2. `bash tools/docs-claim-audit.sh` must exit 0.
+3. Push `main` touching `docs-site/**` → the `Deploy docs-site` GitHub
+   Action publishes to Vercel; or `cd docs-site && npm run deploy:prod`
+   from an operator machine.
+4. Verify the live pages actually changed (fetch the deployed URL, check
+   the new tokens), then sync evidence bundles to the archive drive —
+   no keys, no ELF binaries, no live artifacts.
+
+<Aside type="caution" title="Anti-patterns, recorded from real waste">
+Re-running identical multi-phase canaries on all four peer nodes (hours for
+minutes of signal); leaving a node drained after apply; claiming GREEN on a
+non-zero runner exit; editing runner assertions to pass; deploying docs that
+update one paragraph while a table two sections down still states the old
+fleet. Each of these has happened once; none should happen twice.
+</Aside>
