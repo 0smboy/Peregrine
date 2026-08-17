@@ -10230,4 +10230,514 @@ mod tests {
         });
         assert_eq!(api.handle(req, &next).status, 200);
     }
+
+    // ===================== cross-proxy version-index CAS =====================
+    //
+    // Hermetic model of the LIVE fleet: several `S3Api` instances (one per
+    // proxy) share ONE backend store with the deployed conditional-write
+    // semantics:
+    //   * object PUT enforces `If-None-Match: *` (412 when the object exists)
+    //     — the Wave-2 object-server has carried this since the monorepo
+    //     import (swift-object-server/src/lib.rs, `if_none_match_has_star`).
+    //   * object PUT IGNORES `If-Match` — `put_if_match_precondition` only
+    //     exists from 414b76e (2026-08-16); the deployed Wave-2 object layer
+    //     (`e1d4f1cc…`) predates it, so the header is a silent no-op there.
+    //
+    // The gate mechanism gives tests deterministic interleavings without
+    // touching product code: a gated (method, path) parks inside the backend
+    // until released, exactly like a proxy stalling mid-flight.
+
+    struct GateState {
+        held: std::collections::HashSet<String>,
+        arrived: std::collections::HashSet<String>,
+    }
+
+    struct SharedSwiftBackend {
+        store: std::sync::Mutex<HashMap<String, (HeaderKeyDict, Vec<u8>)>>,
+        /// Applied (2xx) PUTs of version-index objects, in arrival order:
+        /// `(object path, generation parsed from the body)`.
+        index_commits: std::sync::Mutex<Vec<(String, u64)>>,
+        gates: std::sync::Mutex<GateState>,
+        gates_cv: std::sync::Condvar,
+    }
+
+    impl SharedSwiftBackend {
+        fn new(versioning_status: &str) -> Arc<Self> {
+            let be = Arc::new(Self {
+                store: std::sync::Mutex::new(HashMap::new()),
+                index_commits: std::sync::Mutex::new(Vec::new()),
+                gates: std::sync::Mutex::new(GateState {
+                    held: std::collections::HashSet::new(),
+                    arrived: std::collections::HashSet::new(),
+                }),
+                gates_cv: std::sync::Condvar::new(),
+            });
+            let mut h = HeaderKeyDict::new();
+            h.set(S3_VERSIONING_META, versioning_status);
+            be.store
+                .lock()
+                .unwrap()
+                .insert("/v1/AUTH_test/mybucket".into(), (h, Vec::new()));
+            be
+        }
+
+        fn next_fn(self: &Arc<Self>) -> NextFn {
+            let be = self.clone();
+            Arc::new(move |r: Request| be.handle(r))
+        }
+
+        fn gate_key(method: &str, path: &str) -> String {
+            format!("{method} {path}")
+        }
+
+        /// Park the next request matching (method, path) until released.
+        fn hold(&self, method: &str, path: &str) {
+            self.gates
+                .lock()
+                .unwrap()
+                .held
+                .insert(Self::gate_key(method, path));
+        }
+
+        /// Block until a gated request has arrived and is parked.
+        fn wait_arrival(&self, method: &str, path: &str) {
+            let key = Self::gate_key(method, path);
+            let deadline = std::time::Duration::from_secs(30);
+            let guard = self.gates.lock().unwrap();
+            let (guard, timeout) = self
+                .gates_cv
+                .wait_timeout_while(guard, deadline, |g| !g.arrived.contains(&key))
+                .unwrap();
+            drop(guard);
+            assert!(!timeout.timed_out(), "gated request never arrived: {key}");
+        }
+
+        fn release(&self, method: &str, path: &str) {
+            let key = Self::gate_key(method, path);
+            self.gates.lock().unwrap().held.remove(&key);
+            self.gates_cv.notify_all();
+        }
+
+        fn pass_gate(&self, method: &str, path: &str) {
+            let key = Self::gate_key(method, path);
+            let mut guard = self.gates.lock().unwrap();
+            if !guard.held.contains(&key) {
+                return;
+            }
+            guard.arrived.insert(key.clone());
+            self.gates_cv.notify_all();
+            let deadline = std::time::Duration::from_secs(30);
+            let (guard, timeout) = self
+                .gates_cv
+                .wait_timeout_while(guard, deadline, |g| g.held.contains(&key))
+                .unwrap();
+            drop(guard);
+            assert!(!timeout.timed_out(), "gate never released: {key}");
+        }
+
+        /// Applied index-authority commit log (mirror `…/index.json` PUTs).
+        fn mirror_generations(&self) -> Vec<u64> {
+            self.index_commits
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(name, _)| name.ends_with("/index.json"))
+                .map(|(_, generation)| *generation)
+                .collect()
+        }
+
+        fn final_index(&self, container_path: &str, key: &str) -> VersionIndex {
+            let path = format!("{container_path}/{}", index_object_name(key));
+            let store = self.store.lock().unwrap();
+            let (_, body) = store
+                .get(&path)
+                .unwrap_or_else(|| panic!("index.json missing at {path}"));
+            VersionIndex::from_json(body).expect("final index parses")
+        }
+
+        /// Version-ids of archive objects present under `{hex(key)}/`.
+        fn archived_version_ids(&self, container_path: &str, key: &str) -> Vec<String> {
+            let prefix = format!(
+                "{container_path}/{}/",
+                crate::versioning_store::key_hex(key)
+            );
+            let store = self.store.lock().unwrap();
+            let mut out = Vec::new();
+            for name in store.keys() {
+                if let Some(rest) = name.strip_prefix(&prefix) {
+                    if rest.chars().all(|c| c.is_ascii_hexdigit()) && !rest.is_empty() {
+                        out.push(rest.to_string());
+                    }
+                }
+            }
+            out
+        }
+
+        fn current_version_id(&self, object_path: &str) -> Option<String> {
+            let store = self.store.lock().unwrap();
+            store
+                .get(object_path)
+                .and_then(|(h, _)| h.get(SYS_VERSION_ID).map(str::to_string))
+        }
+
+        fn handle(&self, r: Request) -> Response {
+            let method = r.method.clone();
+            let path = r.path.clone();
+            self.pass_gate(&method, &path);
+
+            let is_container = path == "/v1/AUTH_test/mybucket"
+                || path == "/v1/AUTH_test/mybucket+versions";
+            if is_container {
+                let mut store = self.store.lock().unwrap();
+                match method.as_str() {
+                    "HEAD" => {
+                        return match store.get(&path) {
+                            Some((h, _)) => {
+                                let mut resp = Response::new(204);
+                                for (k, v) in h.iter() {
+                                    resp.headers.set(k, v);
+                                }
+                                resp
+                            }
+                            None => Response::new(404),
+                        };
+                    }
+                    "PUT" => {
+                        store
+                            .entry(path)
+                            .or_insert_with(|| (HeaderKeyDict::new(), Vec::new()));
+                        return Response::new(201);
+                    }
+                    "GET" => {
+                        let prefix = format!("{path}/");
+                        let mut items = Vec::new();
+                        for (p, (h, body)) in store.iter() {
+                            if let Some(name) = p.strip_prefix(&prefix) {
+                                let hash = h.get("ETag").unwrap_or("deadbeef");
+                                items.push(format!(
+                                    r#"{{"name":"{name}","hash":"{hash}","bytes":{},"last_modified":"2013-05-24T00:00:00.000000"}}"#,
+                                    body.len()
+                                ));
+                            }
+                        }
+                        return Response::with_body(200, format!("[{}]", items.join(",")).into_bytes());
+                    }
+                    "POST" => {
+                        let entry = store
+                            .entry(path)
+                            .or_insert_with(|| (HeaderKeyDict::new(), Vec::new()));
+                        for (k, v) in r.headers.iter() {
+                            entry.0.set(k, v);
+                        }
+                        return Response::new(204);
+                    }
+                    _ => return Response::new(405),
+                }
+            }
+
+            match method.as_str() {
+                "HEAD" | "GET" => {
+                    let store = self.store.lock().unwrap();
+                    match store.get(&path) {
+                        Some((h, body)) => {
+                            let mut resp = if method == "GET" {
+                                Response::with_body(200, body.clone())
+                            } else {
+                                Response::new(200)
+                            };
+                            for (k, v) in h.iter() {
+                                resp.headers.set(k, v);
+                            }
+                            resp.headers.set("Content-Length", body.len().to_string());
+                            if resp.headers.get("ETag").is_none() {
+                                resp.headers.set("ETag", "deadbeef");
+                            }
+                            resp.headers
+                                .set("Last-Modified", "Thu, 01 Jan 1970 00:00:00 GMT");
+                            resp
+                        }
+                        None => Response::new(404),
+                    }
+                }
+                "PUT" => {
+                    let body = r.body.into_vec(u64::MAX).unwrap_or_default();
+                    let mut store = self.store.lock().unwrap();
+                    // Wave-2 object-server semantics: `If-None-Match: *` is
+                    // enforced (412 on existing object) …
+                    if let Some(inm) = r.headers.get("If-None-Match") {
+                        if inm.split(',').any(|tok| tok.trim() == "*")
+                            && store.contains_key(&path)
+                        {
+                            return Response::new(412);
+                        }
+                    }
+                    // … while `If-Match` on PUT is silently ignored (the
+                    // deployed object layer predates 414b76e).
+                    let mut h = HeaderKeyDict::new();
+                    for (k, v) in r.headers.iter() {
+                        let kl = k.to_ascii_lowercase();
+                        if kl.starts_with("x-object-") || kl == "content-type" {
+                            h.set(k, v);
+                        }
+                    }
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    body.hash(&mut hasher);
+                    let etag = format!("{:x}", hasher.finish());
+                    h.set("ETag", &etag);
+                    h.set("Content-Length", body.len().to_string());
+                    if path.contains("/index.")
+                        && path.ends_with(".json")
+                        && VersionIndex::from_json(&body).is_some()
+                    {
+                        let generation = VersionIndex::from_json(&body)
+                            .map(|i| i.generation)
+                            .unwrap_or(0);
+                        self.index_commits
+                            .lock()
+                            .unwrap()
+                            .push((path.clone(), generation));
+                    }
+                    store.insert(path, (h, body));
+                    let mut resp = Response::new(201);
+                    resp.headers.set("ETag", etag);
+                    resp.headers.set("Content-Length", "0");
+                    resp
+                }
+                "DELETE" => {
+                    let mut store = self.store.lock().unwrap();
+                    if store.remove(&path).is_some() {
+                        Response::new(204)
+                    } else {
+                        Response::new(404)
+                    }
+                }
+                _ => Response::new(405),
+            }
+        }
+    }
+
+    fn versioned_put_ok(api: &S3Api, next: &NextFn, key: &str, body: &[u8]) -> String {
+        let mut req = base_s3_req("PUT", &format!("/mybucket/{key}"), "");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.body = Body::from(body.to_vec());
+        let resp = api.handle(sign_request(req, "testing"), next);
+        assert_eq!(resp.status, 200, "seed PUT must succeed");
+        resp.headers
+            .get("x-amz-version-id")
+            .expect("versioned PUT answers x-amz-version-id")
+            .to_string()
+    }
+
+    /// Invariants a cross-proxy backend CAS must uphold. Every violation is a
+    /// silent lost update today.
+    fn assert_version_index_invariants(
+        be: &SharedSwiftBackend,
+        key: &str,
+        acked_puts: &[String],
+        acked_deletes: &[String],
+    ) {
+        // (1) The backend must never have APPLIED two index writes claiming
+        //     the same generation — that is the definition of a lost update.
+        let gens = be.mirror_generations();
+        for pair in gens.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "backend applied two index writes without cross-proxy CAS \
+                 (generation sequence not strictly increasing): {gens:?}"
+            );
+        }
+
+        let index = be.final_index("/v1/AUTH_test/mybucket+versions", key);
+        let listed: Vec<&str> = index
+            .versions
+            .iter()
+            .map(|v| v.version_id.as_str())
+            .collect();
+
+        // (2) Every version-id acknowledged 200 to a client survives in the
+        //     committed index unless a later acknowledged delete removed it.
+        for vid in acked_puts {
+            if acked_deletes.contains(vid) {
+                continue;
+            }
+            assert!(
+                listed.contains(&vid.as_str()),
+                "version {vid} was acknowledged 200 to the client but is \
+                 missing from the committed index (lost update): {listed:?}"
+            );
+        }
+
+        // (3) Every version-id whose delete was acknowledged 2xx stays gone.
+        for vid in acked_deletes {
+            assert!(
+                !listed.contains(&vid.as_str()),
+                "version {vid} was acknowledged deleted but resurrected in \
+                 the committed index: {listed:?}"
+            );
+        }
+
+        // (4) No orphan archives: every archived object is indexed.
+        for vid in be.archived_version_ids("/v1/AUTH_test/mybucket+versions", key) {
+            assert!(
+                listed.contains(&vid.as_str()),
+                "archive object for version {vid} exists but the committed \
+                 index does not list it (orphan archive): {listed:?}"
+            );
+        }
+
+        // (5) The current object's version-id is indexed.
+        if let Some(cur) = be.current_version_id(&format!("/v1/AUTH_test/mybucket/{key}")) {
+            assert!(
+                listed.contains(&cur.as_str()),
+                "current object carries version {cur} but the committed index \
+                 does not list it: {listed:?}"
+            );
+        }
+    }
+
+    /// Two proxies race a versioned PUT against `DELETE ?versionId` on the
+    /// same key. Deterministic interleaving (no timing): proxy B loads the
+    /// generation-2 snapshot, parks at its archive DELETE; proxy A commits
+    /// generation 3 end-to-end; B is released and persists its own
+    /// generation-3 index over A's.
+    ///
+    /// On an in-process-only CAS the backend accepts both generation-3
+    /// writes: A's acknowledged version vanishes from the index and the
+    /// generation sequence stalls. A cross-proxy backend CAS must instead
+    /// fail one writer with the existing CAS-denied surface (InternalError).
+    #[test]
+    fn concurrent_put_and_delete_must_not_lose_acknowledged_writes() {
+        let be = SharedSwiftBackend::new("Enabled");
+        let api_a = S3Api::new(cred_map());
+        let next_a = be.next_fn();
+
+        // Seed sequentially: index generation 2, versions [v2, v1],
+        // current = v2, archived = {v1}.
+        let v1 = versioned_put_ok(&api_a, &next_a, "obj", b"seed-1");
+        let v2 = versioned_put_ok(&api_a, &next_a, "obj", b"seed-2");
+
+        // Proxy B: DELETE ?versionId=v1 — parked at its destructive archive
+        // DELETE, after it loaded the generation-2 snapshot.
+        let v1_archive = format!(
+            "/v1/AUTH_test/mybucket+versions/{}",
+            archive_object_name("obj", &v1)
+        );
+        be.hold("DELETE", &v1_archive);
+        let be_b = be.clone();
+        let v1_b = v1.clone();
+        let thread_b = std::thread::spawn(move || {
+            let api_b = S3Api::new(cred_map());
+            let next_b = be_b.next_fn();
+            let req = sign_request(
+                base_s3_req("DELETE", "/mybucket/obj", &format!("versionId={v1_b}")),
+                "testing",
+            );
+            let resp = api_b.handle(req, &next_b);
+            let status = resp.status;
+            let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap_or_default())
+                .unwrap_or_default();
+            (status, body)
+        });
+        be.wait_arrival("DELETE", &v1_archive);
+
+        // Proxy A: full versioned PUT — archives v2, writes the new current,
+        // commits index generation 3.
+        let va = versioned_put_ok(&api_a, &next_a, "obj", b"concurrent-a");
+
+        // Release proxy B: its index write is now stale (generation 3 again).
+        be.release("DELETE", &v1_archive);
+        let (status_b, body_b) = thread_b.join().expect("proxy B thread");
+
+        // The loser must keep today's client surface: either it won cleanly
+        // (204) or it surfaces the existing CAS-denied class (InternalError).
+        assert!(
+            status_b == 204 || (status_b == 500 && body_b.contains("InternalError")),
+            "DELETE conflict surface changed: status={status_b} body={body_b}"
+        );
+
+        let acked_deletes = if status_b == 204 { vec![v1.clone()] } else { Vec::new() };
+        assert_version_index_invariants(&be, "obj", &[v1, v2, va], &acked_deletes);
+    }
+
+    /// N writers race versioned PUTs against exact-version deletes of
+    /// distinct seed versions, one racing pair per round with a start
+    /// barrier. No injected schedule: any interleaving must uphold the
+    /// invariants; with an in-process-only CAS the stale index persists
+    /// overwrite committed writes.
+    #[test]
+    fn concurrent_writers_uphold_version_index_invariants() {
+        let be = SharedSwiftBackend::new("Enabled");
+        let api = S3Api::new(cred_map());
+        let next = be.next_fn();
+
+        const ROUNDS: usize = 6;
+        let mut seeds = Vec::new();
+        for i in 0..=ROUNDS {
+            seeds.push(versioned_put_ok(
+                &api,
+                &next,
+                "obj",
+                format!("seed-{i}").as_bytes(),
+            ));
+        }
+
+        let acked_puts: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(seeds.clone()));
+        let acked_deletes: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        for (round, target) in seeds.iter().take(ROUNDS).enumerate() {
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+
+            let be_put = be.clone();
+            let barrier_put = barrier.clone();
+            let acked_puts_c = acked_puts.clone();
+            let put_thread = std::thread::spawn(move || {
+                let api = S3Api::new(cred_map());
+                let next = be_put.next_fn();
+                let mut req = base_s3_req("PUT", "/mybucket/obj", "");
+                req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+                req.body = Body::from(format!("round-{round}").into_bytes());
+                let req = sign_request(req, "testing");
+                barrier_put.wait();
+                let resp = api.handle(req, &next);
+                if resp.status == 200 {
+                    if let Some(vid) = resp.headers.get("x-amz-version-id") {
+                        acked_puts_c.lock().unwrap().push(vid.to_string());
+                    }
+                }
+            });
+
+            let be_del = be.clone();
+            let barrier_del = barrier.clone();
+            let acked_deletes_c = acked_deletes.clone();
+            let target_c = target.clone();
+            let del_thread = std::thread::spawn(move || {
+                let api = S3Api::new(cred_map());
+                let next = be_del.next_fn();
+                let req = sign_request(
+                    base_s3_req(
+                        "DELETE",
+                        "/mybucket/obj",
+                        &format!("versionId={target_c}"),
+                    ),
+                    "testing",
+                );
+                barrier_del.wait();
+                let resp = api.handle(req, &next);
+                if resp.status == 204 {
+                    acked_deletes_c.lock().unwrap().push(target_c);
+                }
+            });
+
+            put_thread.join().expect("PUT thread");
+            del_thread.join().expect("DELETE thread");
+        }
+
+        let puts = acked_puts.lock().unwrap().clone();
+        let deletes = acked_deletes.lock().unwrap().clone();
+        assert_version_index_invariants(&be, "obj", &puts, &deletes);
+    }
 }
