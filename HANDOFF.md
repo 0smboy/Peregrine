@@ -1,5 +1,10 @@
 # Peregrine — session handoff
 
+> **2026-08-16 现行交接：** [`docs/fairness-lab/HANDOFF-20260816.md`](docs/fairness-lab/HANDOFF-20260816.md)
+> Live proxy Size `69d22629…` · dual-oracle **49/8 FAIL** · not GREEN.
+> 下文 2026-07-31 条目是更早的 console/cutover 史实。
+
+
 **Date:** 2026-07-31  
 **Repo:** https://github.com/0smboy/Peregrine  
 **Engine repo:** https://github.com/0smboy/swift-rust (`claude/object-replicator`)
