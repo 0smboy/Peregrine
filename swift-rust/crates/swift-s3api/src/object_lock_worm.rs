@@ -1561,6 +1561,163 @@ mod tests {
     }
 
     #[test]
+    fn clock_unhealthy_denies_updates_touching_existing_compliance() {
+        // Wave-9 fault injection: any retention update that touches an
+        // existing COMPLIANCE record must deny when the clock is untrusted,
+        // regardless of the requested mode or of apparent expiry.
+        let mut existing = HeaderKeyDict::new();
+        existing.set(SYS_LOCK_MODE, "COMPLIANCE");
+        existing.set(SYS_RETAIN_UNTIL, "2030-01-01T00:00:00Z");
+        let now = 1_700_000_000i64;
+
+        // Requested GOVERNANCE over existing COMPLIANCE → ClockUnhealthy,
+        // not ComplianceProtected (deny happens before mode comparison).
+        let gov = parse_object_retention("GOVERNANCE", "2035-01-01T00:00:00Z").unwrap();
+        assert_eq!(
+            evaluate_retention_update_with_clock(
+                &existing,
+                &gov,
+                now,
+                false,
+                GovernanceBypass::NONE,
+            ),
+            RetentionUpdateDecision::Deny(RetentionUpdateDenyReason::ClockUnhealthy)
+        );
+
+        // Extending COMPLIANCE (normally Allow) also denies with a bad clock.
+        let extend = parse_object_retention("COMPLIANCE", "2040-01-01T00:00:00Z").unwrap();
+        assert_eq!(
+            evaluate_retention_update_with_clock(
+                &existing,
+                &extend,
+                now,
+                false,
+                GovernanceBypass::NONE,
+            ),
+            RetentionUpdateDecision::Deny(RetentionUpdateDenyReason::ClockUnhealthy)
+        );
+
+        // An apparently expired COMPLIANCE record cannot be trusted as
+        // expired when the clock is unhealthy: requested GOVERNANCE would
+        // normally be allowed (old lock expired), but must deny here.
+        existing.set(SYS_RETAIN_UNTIL, "2000-01-01T00:00:00Z");
+        assert_eq!(
+            evaluate_retention_update_with_clock(
+                &existing,
+                &gov,
+                now,
+                false,
+                GovernanceBypass::NONE,
+            ),
+            RetentionUpdateDecision::Deny(RetentionUpdateDenyReason::ClockUnhealthy)
+        );
+    }
+
+    #[test]
+    fn clock_unhealthy_leaves_governance_paths_intact() {
+        // clock_ok=false must only affect COMPLIANCE claims. GOVERNANCE
+        // decisions (allow and deny) stay exactly as with a healthy clock.
+        let now = 1_700_000_000i64;
+        let both = GovernanceBypass {
+            requested: true,
+            authorized: true,
+        };
+
+        // New GOVERNANCE retention on an unlocked object → Allow.
+        let gov = parse_object_retention("GOVERNANCE", "2035-01-01T00:00:00Z").unwrap();
+        assert_eq!(
+            evaluate_retention_update_with_clock(
+                &HeaderKeyDict::new(),
+                &gov,
+                now,
+                false,
+                GovernanceBypass::NONE,
+            ),
+            RetentionUpdateDecision::Allow
+        );
+
+        // GOVERNANCE shorten with effective bypass → Allow even clock-bad.
+        let mut existing = HeaderKeyDict::new();
+        existing.set(SYS_LOCK_MODE, "GOVERNANCE");
+        existing.set(SYS_RETAIN_UNTIL, "2035-01-01T00:00:00Z");
+        let shorten = parse_object_retention("GOVERNANCE", "2030-01-01T00:00:00Z").unwrap();
+        assert_eq!(
+            evaluate_retention_update_with_clock(&existing, &shorten, now, false, both),
+            RetentionUpdateDecision::Allow
+        );
+        // Same shorten without bypass → GovernanceBypassRequired (unchanged).
+        assert_eq!(
+            evaluate_retention_update_with_clock(
+                &existing,
+                &shorten,
+                now,
+                false,
+                GovernanceBypass::NONE,
+            ),
+            RetentionUpdateDecision::Deny(RetentionUpdateDenyReason::GovernanceBypassRequired)
+        );
+
+        // Destructive-op eval: expired GOVERNANCE allows, active GOVERNANCE
+        // with effective bypass allows — all with clock_ok=false.
+        let mut expired = HeaderKeyDict::new();
+        expired.set(SYS_LOCK_MODE, "GOVERNANCE");
+        expired.set(SYS_RETAIN_UNTIL, "2000-01-01T00:00:00Z");
+        assert_eq!(
+            evaluate_object_version_worm_with_clock(&expired, now, false, GovernanceBypass::NONE),
+            WormDecision::Allow
+        );
+        assert_eq!(
+            evaluate_object_version_worm_with_clock(&existing, now, false, both),
+            WormDecision::Allow
+        );
+    }
+
+    #[test]
+    fn backend_eval_clock_unhealthy_denies_compliance_only() {
+        // The backend-status entry point honours the same clock rule.
+        let now = 1_700_000_000i64;
+        let mut comp = HeaderKeyDict::new();
+        comp.set(SYS_LOCK_MODE, "COMPLIANCE");
+        comp.set(SYS_RETAIN_UNTIL, "2033-05-18T03:33:20Z");
+        assert_eq!(
+            evaluate_object_version_worm_from_backend(
+                200,
+                Some(&comp),
+                now,
+                false,
+                GovernanceBypass::NONE,
+            ),
+            WormDecision::Deny(WormDenyReason::ClockUnhealthy)
+        );
+
+        let mut gov = HeaderKeyDict::new();
+        gov.set(SYS_LOCK_MODE, "GOVERNANCE");
+        gov.set(SYS_RETAIN_UNTIL, "2033-05-18T03:33:20Z");
+        assert_eq!(
+            evaluate_object_version_worm_from_backend(
+                200,
+                Some(&gov),
+                now,
+                false,
+                GovernanceBypass::NONE,
+            ),
+            WormDecision::Deny(WormDenyReason::GovernanceRetention)
+        );
+
+        // 404 (no object) stays Allow: nothing locked, clock irrelevant.
+        assert_eq!(
+            evaluate_object_version_worm_from_backend(
+                404,
+                None,
+                now,
+                false,
+                GovernanceBypass::NONE,
+            ),
+            WormDecision::Allow
+        );
+    }
+
+    #[test]
     fn lock_if_match_token_is_opaque_hex_from_tuple_and_revision() {
         let mut h = HeaderKeyDict::new();
         h.set(SYS_LEGAL_HOLD, "OFF");
