@@ -1,0 +1,3 @@
+# W10: quarantine/async-pending gap metrics for node_exporter textfile collector.
+# Install as /etc/cron.d/peregrine-textfile-metrics (mode 0644, must end with newline).
+*/5 * * * * root /usr/local/bin/peregrine-textfile-metrics.sh >/dev/null 2>&1

@@ -1,0 +1,155 @@
+# Peregrine W10 observability alerts (Contabo swift1-4).
+# Deploy target: swift1:/etc/prometheus/rules/peregrine-alerts.yml
+#   (prometheus.yml already globs /etc/prometheus/rules/*.yml; no config edit needed)
+# Complements the existing R0 rules (swift-ops-alerts.yml); does not replace them.
+#   - SwiftDeviceUsePctHigh (R0) keeps the /srv/node >85% critical tier.
+# Depends on W10 gap collectors on all four nodes:
+#   - node_exporter systemd collector (drop-in: node_exporter-peregrine-collectors.conf)
+#     -> node_systemd_unit_state{name=~"swift-.*"}
+#   - /usr/local/bin/peregrine-textfile-metrics.sh (cron */5)
+#     -> peregrine_quarantined_objects, peregrine_async_pendings
+#
+# Deploy-time note (2026-08-17): at inventory time swift1 root was at 94% and
+# swift3 at 83%; both tiers of RootDiskHigh would have fired. The parallel
+# disk-governance task brought all roots to ~74% minutes before these rules
+# went live, so the fleet deployed all-green. The evaluate->fire pipeline was
+# proven with a temporary self-test rule instead (see W10 evidence).
+
+groups:
+  - name: peregrine_w10_infra
+    interval: 30s
+    rules:
+      - alert: NodeExporterDown
+        expr: up{job="node"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          wave: w10
+        annotations:
+          summary: "node_exporter target {{ $labels.instance }} has been unreachable for 5m; the node is unobserved."
+
+      - alert: NodeExporterFleetIncomplete
+        expr: count(up{job="node"}) < 4
+        for: 5m
+        labels:
+          severity: critical
+          wave: w10
+        annotations:
+          summary: "Node scrape job has fewer than 4 targets; a node vanished from Prometheus configuration or service discovery."
+
+      - alert: StatsdExporterDown
+        expr: up{job="statsd"} == 0
+        for: 10m
+        labels:
+          severity: warning
+          wave: w10
+        annotations:
+          summary: "statsd_exporter target {{ $labels.instance }} unreachable for 10m; Swift service request metrics are blind on that node."
+
+      - alert: RootDiskHigh
+        expr: |
+          100 * (1 - node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}
+            / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}) > 88
+        for: 15m
+        labels:
+          severity: warning
+          wave: w10
+        annotations:
+          summary: "Root filesystem on {{ $labels.instance }} is above 88% for 15m; plan cleanup before it reaches the critical tier."
+
+      - alert: RootDiskHigh
+        expr: |
+          100 * (1 - node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}
+            / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}) > 93
+        for: 5m
+        labels:
+          severity: critical
+          wave: w10
+        annotations:
+          summary: "Root filesystem on {{ $labels.instance }} is above 93%; services on this node are at imminent risk of ENOSPC."
+
+      - alert: SrvNodeDiskHigh
+        expr: |
+          100 * (1 - node_filesystem_avail_bytes{mountpoint=~"/srv/node/d[0-9]+"}
+            / node_filesystem_size_bytes{mountpoint=~"/srv/node/d[0-9]+"}) > 80
+        for: 15m
+        labels:
+          severity: warning
+          wave: w10
+        annotations:
+          summary: "Swift device {{ $labels.mountpoint }} on {{ $labels.instance }} is above 80% for 15m (R0 critical tier fires at 85%)."
+
+  - name: peregrine_w10_swift_units
+    interval: 30s
+    rules:
+      - alert: SwiftCoreServiceDown
+        expr: |
+          node_systemd_unit_state{name=~"swift-(proxy|object|container|account)\\.service",state="active"} == 0
+        for: 3m
+        labels:
+          severity: critical
+          wave: w10
+        annotations:
+          summary: "Data-path service {{ $labels.name }} on {{ $labels.instance }} is not active for 3m; requests to this node are failing or failing over."
+
+      - alert: SwiftDaemonDown
+        expr: |
+          node_systemd_unit_state{name=~"swift-(account-auditor|account-replicator|container-auditor|container-reconciler|container-replicator|container-sharder|container-updater|object-auditor|object-reconstructor|object-replicator|object-updater)\\.service",state="active"} == 0
+        for: 10m
+        labels:
+          severity: warning
+          wave: w10
+        annotations:
+          summary: "Background daemon {{ $labels.name }} on {{ $labels.instance }} is not active for 10m; consistency work is stalling on this node."
+
+      - alert: SwiftDaemonSetIncomplete
+        expr: |
+          sum by (instance) (
+            node_systemd_unit_state{name=~"swift-(account-auditor|account-replicator|container-auditor|container-reconciler|container-replicator|container-sharder|container-updater|object-auditor|object-reconstructor|object-replicator|object-updater)\\.service",state="active"}
+          ) < 11
+        for: 10m
+        labels:
+          severity: warning
+          wave: w10
+        annotations:
+          summary: "{{ $labels.instance }} reports fewer than 11 active Swift daemons for 10m; a unit stopped or was unloaded from systemd."
+
+      - alert: FrozenDaemonStarted
+        expr: |
+          node_systemd_unit_state{name=~"swift-(account-reaper|object-expirer)\\.service",state="active"} == 1
+        labels:
+          severity: critical
+          wave: w10
+        annotations:
+          summary: "Frozen unit {{ $labels.name }} is ACTIVE on {{ $labels.instance }}; reaper/expirer are deliberately frozen, so any start is an incident signal."
+
+  - name: peregrine_w10_swift_health
+    interval: 30s
+    rules:
+      - alert: QuarantineGrowth
+        expr: increase(peregrine_quarantined_objects[1h]) > 0
+        labels:
+          severity: warning
+          wave: w10
+        annotations:
+          summary: "Quarantined file count on {{ $labels.instance }} grew in the last hour; the auditor is finding corrupt data."
+
+      - alert: AsyncPendingGrowth
+        expr: increase(peregrine_async_pendings[2h]) > 50
+        labels:
+          severity: warning
+          wave: w10
+        annotations:
+          summary: "async_pending backlog on {{ $labels.instance }} grew by more than 50 in 2h (steady state is flat); container updates are falling behind."
+
+      - alert: SwiftProxyErrorRateHigh
+        expr: |
+          sum by (instance) (rate(swift_request_total{service="proxy-server",status=~"5.."}[10m]))
+            /
+          sum by (instance) (rate(swift_request_total{service="proxy-server"}[10m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          wave: w10
+        annotations:
+          summary: "Proxy 5xx ratio on {{ $labels.instance }} exceeded 5% of requests for 10m (statsd-derived; blind to requests that never reach a proxy worker)."
