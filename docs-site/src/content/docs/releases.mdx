@@ -55,10 +55,28 @@ is tracked here rather than blurred:
   reproducing a real upstream concurrency segfault
   ([lab notes](/lab-cluster#install-checklist)).
 
-One recorded candidate for the next S3 window: an account-level guard that
-rejects non-GET requests with no bucket (`PUT /` etc.) at the S3 layer with
-`InvalidURI`, instead of relying on Swift-side account semantics — the
-strict 57 does not currently exercise that path.
+### Merged on `main`, awaiting the next proxy roll
+
+- **Cross-proxy version-index CAS** (2026-08-17): generation-fence
+  create-only commit protocol; activation prerequisite is zero (works
+  against the live Wave-2 object layer, which enforces
+  `If-None-Match: *`). Red/green concurrency proof in CI;
+  `docs/fairness-lab/VERSION-CAS-DESIGN-20260817.md`.
+
+### Recorded gaps, next code windows
+
+- `clock_ok` is **dead wiring**: every production caller pins the WORM
+  clock-health bit to `true`; no runtime clock-health source exists (all
+  four nodes' chrony are healthy, but the signal is not consumed). Design
+  proposal in `docs/fairness-lab/WORM-VERSIONING-EC-MATRIX-20260817.md`.
+- **BUG-1**: the object-server native WORM gate wrongly denies tagging-only
+  / restore-only metadata POSTs on locked objects (AWS allows them). An
+  `#[ignore]` repro test records the desired behavior.
+- Account-level guard rejecting non-GET requests with no bucket (`PUT /`
+  etc.) at the S3 layer with `InvalidURI` — the strict 57 does not exercise
+  that path.
+- Fence-object offline compactor with a safety proof (fences are permanent
+  in v1 by design).
 
 ## Git branches
 

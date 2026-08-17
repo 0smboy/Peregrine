@@ -21,6 +21,23 @@ scoring: [Dual-oracle](/dual-oracle).
 Earlier cold/restore closeout (LocalDir, not tape/Glacier, default off):
 [Cold + Contabo S3 delivery](/cold-contabo-delivery).
 
+## Alerting & DR (2026-08-17)
+
+- **Alerting**: 13 Prometheus alert rules are live on the monitoring node —
+  fleet/exporter presence, disk watermarks, the 11 recovered daemons down,
+  **frozen daemons started** (immediate, severity critical), quarantine and
+  async-pending growth, proxy 5xx rate. systemd + quarantine/async gap
+  metrics were added on all four nodes. Rules are versioned in
+  `tools/monitoring/`; alerts evaluate on the node but are not yet routed —
+  the notification channel is an open decision, so check
+  `/api/v1/alerts` (or the Prometheus UI) until it lands.
+- **DR**: the config plane (rings, confs, unit files — secrets included) is
+  backed up by `tools/dr/dr-backup.sh` with three verified copies and a
+  zero-diff restore drill; procedure in `tools/dr/DR-RESTORE.md`. Bundles
+  contain secrets and never enter git or cloud storage. Disk posture after
+  the 2026-08-17 cleanup: all four root disks ≤ 76%, journald capped at
+  500 MB fleet-wide (ledger: `tools/dr/DISK-LEDGER-20260817.md`).
+
 ## Health at a glance
 
 A cluster health check should report services, the load balancer, rings,

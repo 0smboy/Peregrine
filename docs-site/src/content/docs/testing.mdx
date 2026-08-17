@@ -23,8 +23,10 @@ weeks — that class of debt is now structurally closed.
 
 Every serialized format has a golden round-trip: the real Python Swift writes a
 fixture, `swift-rust` must read it and reproduce it byte-for-byte, then Rust
-writes and Python reads back. The workspace runs 1 422 tests across 83
-targets (2026-08-17, zero failures).
+writes and Python reads back. The workspace runs 1 400+ tests across 83
+targets and grows with every fault-injection wave (2026-08-17 baseline:
+1 422 passed, zero failures; the WORM and version-CAS waves added ~60 more
+the same day).
 
 ```sh
 cargo test --workspace --exclude swift-ec

@@ -65,9 +65,15 @@ Archived versions are real Swift objects, not magic:
   resurrect an orphan copy.
 
 <Aside type="caution" title="Scope">
-The version-index CAS is **in-process** — it serializes concurrent writers
-inside one proxy, not across the fleet. This is a recorded limitation, not a
-distributed lock.
+On the **live fleet** (Gate generation) the version-index CAS is
+**in-process** — it serializes concurrent writers inside one proxy, not
+across the fleet. A cross-proxy CAS is merged on `main`
+(2026-08-17): every committed index generation is fenced by an immutable
+`index.g<N>.json` object created with `If-None-Match: *`, so two proxies can
+never both apply the same generation
+(`docs/fairness-lab/VERSION-CAS-DESIGN-20260817.md`, with a red/green
+concurrency proof in CI). It activates with the next proxy roll; until then
+the live limitation stands as written.
 </Aside>
 
 ## Object Lock (WORM)
