@@ -1,20 +1,23 @@
 ---
 title: Production contract
-description: Written subset a named tenant may use — 49/8 acceptance, in-scope S3, extras kept, operator-filled tenant and SLO. Stance IMPLEMENTED_SUBSET_ONLY.
+description: Written subset for in-scope Keystone projects — 49/8 acceptance, in-scope S3, extras kept. Stance IMPLEMENTED_SUBSET_ONLY.
 sidebar:
   order: 18.5
 audience: human
 ---
 
-This page is the one-page contract for a **named tenant** on the
-implemented S3 / Swift subset. Stance: **IMPLEMENTED_SUBSET_ONLY**.
-It is not a drop-in for every S3 client, and it is not a Swift twin.
+This page is the one-page contract for the implemented S3 / Swift subset
+on this fleet. The isolation unit is a **Keystone project** (historical
+“tenant”), not a single invented customer name. Stance:
+**IMPLEMENTED_SUBSET_ONLY**. It is not a drop-in for every S3 client, and
+it is not a Swift twin.
 
 <Aside type="caution" title="Lab contract, not a production go-live">
 Live proxies and the VIP run Guard (`3d0138d5…`,
 [releases](/releases)). Stance remains **IMPLEMENTED_SUBSET_ONLY**.
 49/8 is the acceptance pass, not GREEN. Gate `671bcbaf…` is the
-rollback copy on each node.
+rollback copy on each node. Live object servers remain Wave-2
+(`e1d4f1cc…`); BUG-1 is not claimed live.
 </Aside>
 
 Scoreboard evidence: post-GUARD
@@ -23,6 +26,22 @@ Scoreboard evidence: post-GUARD
 [Dual-oracle](/dual-oracle). Client behavior: [S3 API](/s3-api).
 Claim boundary: [parity](/parity).
 
+## 为什么以前要填「真正租户」
+
+之前合同页上的「真正租户 / TBD tenant」**不是**技术上只能开一个账号。
+那是法律和 SLO 标签：防止有人把实验室残留（`AUTH_dev`、`AUTH_test`、
+`AUTH_lab`）当成客户。
+
+Keystone 里隔离单位是 **project**（历史上也叫 tenant）。一个用户可以对
+多个 project 有角色；一个 project 也可以有多个用户或组。Swift 账号通常
+是 `AUTH_<project_id>`。S3（EC2）凭证按用户发放，经 `s3token` 落到某个
+project。
+
+系统本身已经允许多 project、多用户。本合同写的是：**本舰队书面子集覆盖
+哪些 Keystone project**（可以是一列），以及在这些 project 上有角色的已
+认证用户，可以使用已实现的 S3 / Swift 子集。不编造一个强制的唯一客户名。
+也不把 `AUTH_dev` 写成生产用户——它仍是自动化残留。
+
 ## Binding
 
 | Item | Value |
@@ -30,19 +49,20 @@ Claim boundary: [parity](/parity).
 | Stance | `IMPLEMENTED_SUBSET_ONLY` |
 | Frozen 57-case scoreboard | **49/8 is the acceptance pass** (`rc=1` is expected) |
 | 57/57 zero-fail runner | not a go-live condition |
-| Live now (2026-08-18) | Guard `3d0138d5…` ×4 + VIP |
+| Live now (2026-08-18) | Guard `3d0138d5…` ×4 + VIP; object still Wave-2 `e1d4f1cc…` |
 | Binds the VIP | yes, on the Guard generation |
-| Tenant | `TBD — operator fills` |
-
-Do not list lab accounts as the tenant. `AUTH_dev` is not a production user.
+| Isolation unit | Keystone **project** (Swift account `AUTH_<project_id>`) |
+| In-scope projects | operator-listed project IDs (may be several). No mandatory customer name. Lab leftovers `AUTH_dev` / `AUTH_test` / `AUTH_lab` are out of scope. |
+| Who may use the subset | any authenticated user or group with a role on an in-scope project |
+| S3 credentials | per-user EC2 keys, scoped through `s3token` to a project |
 
 ## Parties
 
 | Role | Value |
 |------|--------|
 | Provider | Peregrine lab fleet (Contabo VIP `10.0.0.10:8085`) |
-| Tenant account | `TBD — operator fills` |
-| Tenant principals / keys | `TBD — operator fills` |
+| In-scope Keystone projects | operator lists project IDs; this page does not invent one |
+| Principals | users / groups with a role on those projects |
 | Allowed clients | `TBD — operator fills` |
 
 ## In scope (after Guard)
@@ -59,7 +79,7 @@ Do not list lab accounts as the tenant. `AUTH_dev` is not a production user.
 | Versioning, ListVersions, versioned GET/DELETE | yes (cross-proxy CAS binds with Guard) |
 | Multi-delete | yes |
 | Bucket ACL read/write; object ACL **read** | yes |
-| Account-root `PUT/DELETE/POST/HEAD /` | 405 `MethodNotAllowed` (supplement B 3/3; `AUTH_dev` stayed active) |
+| Account-root `PUT/DELETE/POST/HEAD /` | 405 `MethodNotAllowed` (supplement B 3/3; `AUTH_dev` stayed active as leftover evidence, not as a customer) |
 | EC | liberasurecode **1.8.0** |
 | Consistency daemons | **12/13**; `swift-account-reaper` excluded |
 
@@ -90,15 +110,16 @@ residuals). Second scoreboard: `tools/strict-s3-supplement.py`.
 | eventlet / greenlet serving | not wired |
 | Multi-primary auto-shrink | disabled by default |
 | `swift-account-reaper` | stays frozen |
-| `AUTH_test` leftover cleanup | evidence; do not silently delete |
+| Lab leftover accounts | `AUTH_dev` / `AUTH_test` / `AUTH_lab` are not customers; leftover cleanup is evidence, do not silently delete |
 
 ## Platform
 
 | Item | Contract |
 |------|----------|
-| TLS | lab self-signed, **not public**, until the operator supplies a certificate and name |
-| Alerts | lab JSONL on swift1 until a human receiver is connected |
-| Object servers | Wave-2 `e1d4f1cc…` unless a later contract names a roll |
+| Intended public name | `causalhelix.com` (sibling TLS agent). Not a live HTTPS claim. |
+| Live client path | lab self-signed VIP `https://10.0.0.10:8085` |
+| Alerts | mailbox named `74511.lab@gmail.com`; channel being connected. Proven sink remains lab JSONL on swift1. |
+| Object servers | Wave-2 `e1d4f1cc…` (re-checked 2026-08-18 on swift1). BUG-1 not live. |
 | DR config-plane backup | lab weekly cron; passphrase stays with the operator |
 | HAProxy / Keepalived / VIP | do not restart or move in this contract |
 
@@ -110,8 +131,8 @@ residuals). Second scoreboard: `tools/strict-s3-supplement.py`.
 | PUT / GET / LIST latency | `TBD — operator fills` |
 | Durability target | `TBD — operator fills` |
 | Support hours / on-call | `TBD — operator fills` |
-| Public hostname | `TBD — operator fills` |
-| Alert receiver | `TBD — operator fills` |
+| Public hostname | intended `causalhelix.com`; HTTPS not live |
+| Alert receiver | `74511.lab@gmail.com` — mailbox named, channel being connected |
 
 ## Rollback
 
@@ -123,13 +144,13 @@ Rollback target is Gate (`671bcbaf…`) on each node's
 
 | Field | Value |
 |-------|--------|
-| Tenant account | `TBD — operator fills` |
-| Tenant principals / keys | `TBD — operator fills` |
+| In-scope Keystone project IDs | list (may be several); no invented customer name |
+| Principals | any authenticated user / group with a role on those projects |
 | Allowed clients | `TBD — operator fills` |
 | Availability SLO | `TBD — operator fills` |
 | Latency SLO | `TBD — operator fills` |
 | Durability target | `TBD — operator fills` |
 | Support hours / on-call | `TBD — operator fills` |
-| Public hostname + certificate | `TBD — operator fills` |
-| Alert receiver (webhook / mail) | `TBD — operator fills` |
+| Public hostname + certificate | intended `causalhelix.com`; certificate and HTTPS not live |
+| Alert receiver | `74511.lab@gmail.com` — mailbox named, channel being connected |
 | Post-Guard rollback SHA | Gate `671bcbaf2a1d195ad532a00d6132e12b6665486d7117451aa130c5dd603346c9` |
