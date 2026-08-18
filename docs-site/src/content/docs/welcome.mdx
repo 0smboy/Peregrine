@@ -64,6 +64,10 @@ matrix before planning any mixed rollout.
     The strict 57-case harness, the GREEN gate, and the current 49/8
     scoreboard. [Dual-oracle →](/dual-oracle)
   </Card>
+  <Card title="Production contract">
+    In-scope subset, 49/8 as acceptance, operator-filled tenant and SLO.
+    [Production contract →](/production-contract)
+  </Card>
   <Card title="Testing & verification">
     Golden fixtures, functional parity, load, and live HA drills. [Testing →](/testing)
   </Card>
@@ -98,10 +102,9 @@ matrix before planning any mixed rollout.
 Core CRUD, replication, EC, and selected middleware paths have unit and
 four-node lab evidence, and every push runs the full workspace suite in CI.
 The S3 surface is scored by a strict [dual-oracle harness](/dual-oracle)
-against Python Swift 2.33 — **49/8 as of 2026-08-17 (post-GATE), not GREEN**
-(`docs/fairness-lab/S3-ALIGN-20260815.md`). `main` as of 2026-08-18 carries
-the account-level 405 guard, version-index CAS, and the second scoreboard;
-the live fleet is still Gate.
+against Python Swift 2.33 — **49/8 as of 2026-08-18 (post-GUARD), not GREEN**
+(`docs/fairness-lab/S3-ALIGN-20260815.md`). Live proxies are Guard
+(`3d0138d5…`): account-level 405 and version-index CAS are on the VIP.
 Important production and runtime-integration gaps remain. The
 [strict parity matrix](/parity) defines the current claim boundary; the
 stance is **IMPLEMENTED_SUBSET_ONLY**, and this documentation never claims

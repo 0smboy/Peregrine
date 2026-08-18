@@ -13,11 +13,11 @@ Swift 2.33 s3api oracle by the [strict dual-oracle harness](/dual-oracle)
 "full S3", and it is not a production compatibility promise.
 
 <Aside type="caution" title="Claim boundary">
-The live lab binary is the Gate generation
-(`671bcbaf…`, [releases](/releases)). `main` is ahead of that binary
-(account-level 405 guard, version-index CAS). Anything not listed here —
-or listed as an unsupported subresource — answers `501 NotImplemented`
-rather than pretending. Partial counts as not implemented.
+The live lab binary is the Guard generation
+(`3d0138d5…`, [releases](/releases)). Account-root 405 and version-index
+CAS are on the VIP. Anything not listed here — or listed as an
+unsupported subresource — answers `501 NotImplemented` rather than
+pretending. Partial counts as not implemented.
 </Aside>
 
 ## Authentication
@@ -48,7 +48,7 @@ Time-based rejection is real, not a dead config knob:
 | `DELETE /bucket` | yes | non-empty → `BucketNotEmpty` |
 | `HEAD /bucket` | yes | |
 | `GET /` (ListBuckets) | yes | the only account-level **success** path |
-| `PUT /` `DELETE /` `POST /` `HEAD /` | **tip: 405** · **live Gate: unsafe** | Python 2.33 rejects with `405 MethodNotAllowed` (`ResourceType=SERVICE`). That guard is on `main` (PR #7), not rolled. Live Gate translates these into Swift `/v1/<account>` — a signed `DELETE /` with `allow_account_management=true` deletes the tenant |
+| `PUT /` `DELETE /` `POST /` `HEAD /` | **405 live** | Python-aligned `405 MethodNotAllowed` (`ResourceType=SERVICE`) on Guard. Supplement Section B **3/3**. Do not treat Gate rollback copies as safe for these verbs |
 | ListObjects v1 / v2 | yes | `list-type=2` continuation semantics |
 | GetBucketLocation | yes | answered locally from `location` config, no Swift hop |
 | Bucket ACL (canned + `x-amz-grant-*` + ACP XML) | yes | `?acl` GET/PUT |

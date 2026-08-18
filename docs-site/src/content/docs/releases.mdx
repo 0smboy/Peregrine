@@ -25,13 +25,13 @@ owner last), verified by SHA + health, then scored by one
 | XML | `2ecabc45…` | `RequestId` in every error body | superseded |
 | Schema | `a6b386e6…` | MPU composite ETag, ISO timestamps, PUT-ACL `Location` | superseded, kept as rollback target |
 | Size | `69d22629…` | ListVersions `Size` stamped from the PUT request length (source `1151a88`) | superseded 2026-08-17, kept as rollback target |
-| **Gate** | **`671bcbaf2a1d195a…`** | container-PUT account gate fails closed (`503` on failed autocreate + re-check), fail-closed ratelimit / container-sync / account-freeze config parsing, `list_endpoints` v1/v2 (merge `a48a2b2`) | **live on 4/4 proxies + VIP since 2026-08-17** |
-| S3 window (tip) | not built | account-level `PUT/DELETE/POST/HEAD /` → 405 `MethodNotAllowed` (Python-aligned); native-gate tagging/restore POST fix (BUG-1); `worm_clock_max_offset_ms` default off (PR #7, `6958fae`) | **on `main`, not rolled** |
+| Gate | `671bcbaf2a1d195a…` | container-PUT account gate fails closed (`503` on failed autocreate + re-check), fail-closed ratelimit / container-sync / account-freeze config parsing, `list_endpoints` v1/v2 (merge `a48a2b2`) | superseded 2026-08-18, kept as rollback target |
+| **Guard** | **`3d0138d5e9970a5e…`** | account-level `PUT/DELETE/POST/HEAD /` → 405 `MethodNotAllowed` (Python-aligned); version-index CAS live; `worm_clock_max_offset_ms` default 0 (PR #7, source `5992932`) | **live on 4/4 proxies + VIP since 2026-08-18** |
 
-Gate rolled 1→4→3→2 (VIP owner last), post-roll dual-oracle
-`strict-s3-dual-20260817-postgate.json` (SHA-256 `50f0c860…`): **49/8 with a
-failing-case set identical to the baseline** — the S3 surface is
-byte-equivalent to Size, as intended.
+Guard rolled 1→4→3→2 (VIP owner last), post-roll dual-oracle
+`strict-s3-dual-20260818-postguard.json` (SHA-256 `52588c82…`): **49/8 with a
+failing-case set identical to post-GATE** (`50f0c860…`). The frozen 57
+surface did not regress. Supplement Section B moved **0/3 → 3/3**.
 
 Object servers fleet-wide remain Wave-2
 (`e1d4f1ccf6f01a18…`) — the honest sibling reconstructor build; nothing in
@@ -42,8 +42,10 @@ the S3 alignment required rolling the object layer.
 `main` is deliberately allowed to be ahead of the fleet, and the difference
 is tracked here rather than blurred:
 
-- Live proxy = Gate generation (built 2026-08-17 from the merge-verified
-  tree; source through commit `babb9c4`).
+- Live proxy = Guard generation (built 2026-08-18 from `main` @
+  `5992932`; artifact SHA-256
+  `3d0138d5e9970a5e39e22616c7bd4e3850f207ff8046f749aef0998164a9bcda`).
+  Gate `671bcbaf…` remains the rollback copy on each node.
 - Merge `a48a2b2` retired the last unmerged branch,
   `codex/hotfix-s3cmd-mb-live-8663-20260814`, into `main` with a verified
   resolution: the S3 layer was kept **byte-identical to main** (the hotfix's
@@ -56,36 +58,34 @@ is tracked here rather than blurred:
   reproducing a real upstream concurrency segfault
   ([lab notes](/lab-cluster#install-checklist)).
 
-### Merged on `main`, awaiting the next proxy / object roll
+### Live on Guard (2026-08-18 proxy roll)
 
-- **Cross-proxy version-index CAS** (2026-08-17, PR #3): generation-fence
-  create-only commit protocol; activation prerequisite is zero (works
-  against the live Wave-2 object layer, which enforces
-  `If-None-Match: *`). Red/green concurrency proof in CI;
-  `docs/fairness-lab/VERSION-CAS-DESIGN-20260817.md`.
-- **Account-level 405 guard** (2026-08-17, PR #7): signed `PUT /`,
-  `DELETE /`, `POST /`, `HEAD /` now reject at the S3 layer with Python
-  2.33's `405 MethodNotAllowed` (`ResourceType=SERVICE`). Live Gate
-  still translates those into Swift `/v1/<account>` — a signed
-  `DELETE /` with `allow_account_management=true` **deletes the tenant
-  account**. Roll the proxy before exposing this path to anyone.
+- **Cross-proxy version-index CAS** (PR #3): generation-fence create-only
+  commit; Wave-2 object already enforces `If-None-Match: *`.
+- **Account-level 405 guard** (PR #7): signed `PUT /`, `DELETE /`,
+  `POST /`, `HEAD /` reject with Python 2.33's `405 MethodNotAllowed`
+  (`ResourceType=SERVICE`). Post-roll supplement Section B is **3/3**;
+  `AUTH_dev` stayed active (`delete_timestamp=0`) after the signed
+  `DELETE /` probe.
+
+### Still awaiting an object-server roll / knob
+
 - **BUG-1 native-gate metadata POST** (PR #7): tagging-only / restore-only
-  / transition-only sysmeta POST on a locked object is allowed. Mixed
-  payloads that also carry lock keys stay denied. Needs an **object-server**
-  roll; the live Wave-2 binary still has the mis-deny.
+  / transition-only sysmeta POST on a locked object is allowed in the
+  Guard-era object source. The live Wave-2 object binary still has the
+  mis-deny. Needs a separate object-server roll.
 - **`clock_ok` wired, default off** (PR #7): `[filter:s3api]
-  worm_clock_max_offset_ms` and the matching object-server knob. `0`
-  (default) keeps historical `clock_ok=true`. `>0` is fail-closed against
-  cached `chronyc -c tracking`. No behavior change until the knob is set
-  after the next roll.
+  worm_clock_max_offset_ms` stays `0` (historical `clock_ok=true`). `>0`
+  is fail-closed against cached `chronyc -c tracking`. No behavior change
+  until the knob is set.
 
 ### Recorded gaps, next code windows
 
 - Fence-object offline compactor with a safety proof (fences are permanent
   in v1 by design).
-- Second scoreboard `tools/strict-s3-supplement.py` (PR #8) is in-tree:
-  extras 7/7 vs AWS semantics; account-root negatives 0/3 on live Gate
-  (turns green only after the 405-guard proxy roll).
+- Second scoreboard `tools/strict-s3-supplement.py` (PR #8): extras **7/7**
+  vs AWS; account-root negatives **3/3** on live Guard
+  (`strict-s3-supplement-20260818-postguard.json`, SHA-256 `7ef42b96…`).
 
 ## Git branches
 

@@ -7,15 +7,16 @@ sidebar:
 
 ## Current fleet state
 
-As of 2026-08-18: proxies 4/4 + VIP still run the **Gate** generation
-(`671bcbaf…`), object servers remain Wave-2 (`e1d4f1cc…`), drain 0, VIP on
+As of 2026-08-18: proxies 4/4 + VIP run the **Guard** generation
+(`3d0138d5…`), object servers remain Wave-2 (`e1d4f1cc…`), drain 0, VIP on
 swift2. Consistency daemons are **12/13 enabled + active** — expirer was
 unfrozen 2026-08-17 after `AUTH_test` queue surgery;
 `swift-account-reaper` stays frozen
 ([why](/incidents#the-frozen-daemons--1213-as-of-2026-08-17)). S3
-dual-oracle stands at **49/8, not GREEN** (post-GATE run identical to
-baseline). Stance **IMPLEMENTED_SUBSET_ONLY**. `main` is ahead of the
-fleet (CAS + account-level 405 guard + BUG-1 + clock source, not rolled).
+dual-oracle stands at **49/8, not GREEN** (post-GUARD fail set identical to
+post-GATE). Stance **IMPLEMENTED_SUBSET_ONLY**. Account-root 405 and
+version-index CAS are live. Still not rolled: object-server BUG-1,
+`worm_clock_max_offset_ms` stays 0.
 Binary genealogy: [Releases](/releases) · upgrade/rollback recipes:
 [Runbooks](/runbooks) · scoring: [Dual-oracle](/dual-oracle).
 

@@ -54,8 +54,8 @@ Anything else is reported as the FAIL it is. The current standing is
 
 A **second scoreboard**, `tools/strict-s3-supplement.py` (PR #8), scores
 the seven Rust-ahead extras against AWS semantics (live r3: **7/7 PASS**)
-and three account-root negatives the frozen 57 never covers (live Gate:
-**0/3 FAIL** — the honest baseline until the 405-guard proxy rolls).
+and three account-root negatives the frozen 57 never covers (live Guard:
+**3/3 PASS**, report SHA-256 `7ef42b96…`).
 The frozen 57-case runner is not edited.
 
 ## Score timeline
@@ -73,12 +73,15 @@ Python header patches on the oracle. Full narrative:
 | post-SCHEMA (MPU ETag, ISO times, PUT-ACL `Location`) | Schema | 57/57/41/16/0 | 0 |
 | post-SIZE (ListVersions `Size`) | Size | 57/57/42/15/0 | 0 |
 | post-PY-XML-CT | Size | **57/57/49/8/0** | 0 |
-| **post-GATE (current; proxy-side fixes, S3 surface unchanged)** | Gate | **57/57/49/8/0** | **0** |
+| post-GATE (proxy-side fixes, S3 surface unchanged) | Gate | **57/57/49/8/0** | **0** |
+| **post-GUARD (current; 405 + CAS live, fail set unchanged)** | Guard | **57/57/49/8/0** | **0** |
 
-Current report: `strict-s3-dual-20260817-postgate.json`, SHA-256
-`50f0c8608b4d0b8a08f03813ac8587a0cecddcef76c586e3a6dc9a4d44421d77`;
-its failing-case set and per-case issues are identical to the
-post-PY-XML-CT baseline (`…-20260816-postpyhdr.json`, SHA-256
+Current report: `strict-s3-dual-20260818-postguard.json`, SHA-256
+`52588c824c37b34338eeb2e40bcf8dc38c5d8df6ce4056738e55e3ac975ce7c9`;
+failing-case set identical to post-GATE
+(`strict-s3-dual-20260817-postgate.json`, SHA-256
+`50f0c8608b4d0b8a08f03813ac8587a0cecddcef76c586e3a6dc9a4d44421d77`)
+and to post-PY-XML-CT (`…-20260816-postpyhdr.json`, SHA-256
 `58595702ae301828…`). Lab evidence root `/root/work/evidence/` on swift3.
 
 ## Failure taxonomy

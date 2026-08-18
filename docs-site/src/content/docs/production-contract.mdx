@@ -1,0 +1,135 @@
+---
+title: Production contract
+description: Written subset a named tenant may use — 49/8 acceptance, in-scope S3, extras kept, operator-filled tenant and SLO. Stance IMPLEMENTED_SUBSET_ONLY.
+sidebar:
+  order: 18.5
+audience: human
+---
+
+This page is the one-page contract for a **named tenant** on the
+implemented S3 / Swift subset. Stance: **IMPLEMENTED_SUBSET_ONLY**.
+It is not a drop-in for every S3 client, and it is not a Swift twin.
+
+<Aside type="caution" title="Lab contract, not a production go-live">
+Live proxies and the VIP run Guard (`3d0138d5…`,
+[releases](/releases)). Stance remains **IMPLEMENTED_SUBSET_ONLY**.
+49/8 is the acceptance pass, not GREEN. Gate `671bcbaf…` is the
+rollback copy on each node.
+</Aside>
+
+Scoreboard evidence: post-GUARD
+`strict-s3-dual-20260818-postguard.json` (2026-08-18, SHA-256
+`52588c82…`), failing set identical to post-GATE (`50f0c860…`). Method:
+[Dual-oracle](/dual-oracle). Client behavior: [S3 API](/s3-api).
+Claim boundary: [parity](/parity).
+
+## Binding
+
+| Item | Value |
+|------|--------|
+| Stance | `IMPLEMENTED_SUBSET_ONLY` |
+| Frozen 57-case scoreboard | **49/8 is the acceptance pass** (`rc=1` is expected) |
+| 57/57 zero-fail runner | not a go-live condition |
+| Live now (2026-08-18) | Guard `3d0138d5…` ×4 + VIP |
+| Binds the VIP | yes, on the Guard generation |
+| Tenant | `TBD — operator fills` |
+
+Do not list lab accounts as the tenant. `AUTH_dev` is not a production user.
+
+## Parties
+
+| Role | Value |
+|------|--------|
+| Provider | Peregrine lab fleet (Contabo VIP `10.0.0.10:8085`) |
+| Tenant account | `TBD — operator fills` |
+| Tenant principals / keys | `TBD — operator fills` |
+| Allowed clients | `TBD — operator fills` |
+
+## In scope (after Guard)
+
+| Surface | Contract |
+|---------|----------|
+| SigV4 header + presign (skew / expiry enforced) | yes |
+| SigV2 header + presign | yes |
+| `aws-chunked` / `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` | yes |
+| Bucket CRUD, `GET /` ListBuckets, GetBucketLocation | yes |
+| Object PUT / GET / HEAD / DELETE, copy, Range | yes |
+| ListObjects v1 / v2 | yes |
+| MPU (initiate, part, list, complete, abort) + composite ETag | yes |
+| Versioning, ListVersions, versioned GET/DELETE | yes (cross-proxy CAS binds with Guard) |
+| Multi-delete | yes |
+| Bucket ACL read/write; object ACL **read** | yes |
+| Account-root `PUT/DELETE/POST/HEAD /` | 405 `MethodNotAllowed` (supplement B 3/3; `AUTH_dev` stayed active) |
+| EC | liberasurecode **1.8.0** |
+| Consistency daemons | **12/13**; `swift-account-reaper` excluded |
+
+## Rust extras (kept)
+
+These stay implemented. They are **not** turned into `501`. They are
+**not** a Python-parity PASS on the frozen 57 (seven of the eight
+residuals). Second scoreboard: `tools/strict-s3-supplement.py`.
+
+| Extra | Rust behavior |
+|-------|----------------|
+| Object ACL write `?acl` | 200 |
+| Bucket tagging write `?tagging` | 200 |
+| Object tagging delete `?tagging` | 204 |
+| Bucket CORS GET / PUT / DELETE | 200 / 200 / 204 |
+| RestoreObject `?restore` | honest `400 InvalidObjectState` while cold routing is off |
+
+## Out of scope
+
+| Surface | Notes |
+|---------|-------|
+| Physical cold-tier / storage-policy routing | proxy does not load the map; LocalDir is lab-only, default off |
+| Runtime multi-tenant IAM | library only; proxy does not load policies |
+| `?policy` `?website` `?inventory` and other unlisted subresources | `501 NotImplemented` |
+| Certified object-lock product | lab canary only; not an attested retention product |
+| Multi-cluster container-sync | same-cluster unit only |
+| KMIP | residual |
+| eventlet / greenlet serving | not wired |
+| Multi-primary auto-shrink | disabled by default |
+| `swift-account-reaper` | stays frozen |
+| `AUTH_test` leftover cleanup | evidence; do not silently delete |
+
+## Platform
+
+| Item | Contract |
+|------|----------|
+| TLS | lab self-signed, **not public**, until the operator supplies a certificate and name |
+| Alerts | lab JSONL on swift1 until a human receiver is connected |
+| Object servers | Wave-2 `e1d4f1cc…` unless a later contract names a roll |
+| DR config-plane backup | lab weekly cron; passphrase stays with the operator |
+| HAProxy / Keepalived / VIP | do not restart or move in this contract |
+
+## SLO
+
+| Metric | Value |
+|--------|--------|
+| Availability | `TBD — operator fills` |
+| PUT / GET / LIST latency | `TBD — operator fills` |
+| Durability target | `TBD — operator fills` |
+| Support hours / on-call | `TBD — operator fills` |
+| Public hostname | `TBD — operator fills` |
+| Alert receiver | `TBD — operator fills` |
+
+## Rollback
+
+Rollback target is Gate (`671bcbaf…`) on each node's
+`swift-proxy-server.rollback.swiftN.*` copy. Recipe:
+[Runbooks](/runbooks).
+
+## Operator fills
+
+| Field | Value |
+|-------|--------|
+| Tenant account | `TBD — operator fills` |
+| Tenant principals / keys | `TBD — operator fills` |
+| Allowed clients | `TBD — operator fills` |
+| Availability SLO | `TBD — operator fills` |
+| Latency SLO | `TBD — operator fills` |
+| Durability target | `TBD — operator fills` |
+| Support hours / on-call | `TBD — operator fills` |
+| Public hostname + certificate | `TBD — operator fills` |
+| Alert receiver (webhook / mail) | `TBD — operator fills` |
+| Post-Guard rollback SHA | Gate `671bcbaf2a1d195ad532a00d6132e12b6665486d7117451aa130c5dd603346c9` |

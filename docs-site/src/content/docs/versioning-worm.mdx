@@ -65,15 +65,13 @@ Archived versions are real Swift objects, not magic:
   resurrect an orphan copy.
 
 <Aside type="caution" title="Scope">
-On the **live fleet** (Gate generation) the version-index CAS is
-**in-process** — it serializes concurrent writers inside one proxy, not
-across the fleet. A cross-proxy CAS is merged on `main`
-(2026-08-17): every committed index generation is fenced by an immutable
+On the **live fleet** (Guard generation) the version-index CAS is
+**cross-proxy**: every committed index generation is fenced by an immutable
 `index.g<N>.json` object created with `If-None-Match: *`, so two proxies can
 never both apply the same generation
-(`docs/fairness-lab/VERSION-CAS-DESIGN-20260817.md`, with a red/green
-concurrency proof in CI). It activates with the next proxy roll; until then
-the live limitation stands as written.
+(`docs/fairness-lab/VERSION-CAS-DESIGN-20260817.md`). Wave-2 object already
+enforced that create-only predicate. The previous in-process-only
+limitation was the Gate generation.
 </Aside>
 
 ## Object Lock (WORM)
@@ -107,8 +105,9 @@ DELETE of an object under unexpired retention is denied the same way:
 GOVERNANCE yields to a permitted bypass, COMPLIANCE never does. An unhealthy
 node clock additionally denies COMPLIANCE claims (new or existing) rather
 than trusting a broken clock. On `main` that signal is wired through
-`worm_clock_max_offset_ms` (default `0` = off, historical `clock_ok=true`);
-the live Gate binary still pins `clock_ok=true` with no reader.
+`worm_clock_max_offset_ms` (default `0` = off, historical `clock_ok=true`).
+Live Guard keeps the knob at `0`; no fail-closed chrony check until it is
+set `>0`.
 
 <Aside type="caution" title="Not a compliance product">
 Sysmeta travels below the gatekeeper (clients cannot forge
