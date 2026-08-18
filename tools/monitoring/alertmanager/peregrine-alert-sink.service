@@ -1,0 +1,9 @@
+[Unit]
+Description=Peregrine alert sink (Alertmanager webhook -> /var/log/peregrine-alerts.jsonl)
+After=network.target
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/peregrine-alert-sink.py
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=multi-user.target

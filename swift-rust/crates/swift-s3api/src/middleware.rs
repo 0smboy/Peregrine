@@ -104,7 +104,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::Value;
-use swift_http::{Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+use swift_http::{Body, ClockHealth, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
 use swift_middleware::{Middleware, NextFn, S3TokenClient, S3TokenResult};
 
 use crate::acl_cors::{
@@ -151,8 +151,8 @@ use crate::mpu::{
 };
 use crate::object_lock_worm::{
     apply_default_retention_headers, bypass_governance_requested,
-    evaluate_object_version_worm, evaluate_retention_update, legal_hold_xml,
-    object_version_lock_state,
+    evaluate_object_version_worm_with_clock, evaluate_retention_update_with_clock,
+    legal_hold_xml, object_version_lock_state,
     parse_bypass_governance_header, parse_legal_hold_body, parse_object_lock_configuration,
     parse_object_retention, parse_retention_body, retention_date_is_valid_for_put, retention_xml,
     validate_and_apply_amz_object_lock_headers, GovernanceBypass, RetentionUpdateDecision,
@@ -232,6 +232,11 @@ pub struct S3Api {
     /// before any local answer, probe, cold stamp, or `next()`. Default empty.
     /// ListBuckets / no-bucket requests are not denied here.
     pub frozen_accounts: HashSet<String>,
+    /// WORM clock-health source (`worm_clock_max_offset_ms`). Default
+    /// disabled: every WORM evaluation sees `clock_ok=true`, exactly the
+    /// historical behavior. Enabled (>0) it is fail-closed — see
+    /// [`swift_http::clock_health`].
+    pub worm_clock: Arc<ClockHealth>,
 }
 
 impl S3Api {
@@ -251,7 +256,14 @@ impl S3Api {
             cold_delete_hot_after_archive: false,
             anonymous_account: None,
             frozen_accounts: HashSet::new(),
+            worm_clock: Arc::new(ClockHealth::disabled()),
         }
+    }
+
+    /// Wire a WORM clock-health source (default: disabled, `clock_ok=true`).
+    pub fn with_worm_clock(mut self, clock: Arc<ClockHealth>) -> Self {
+        self.worm_clock = clock;
+        self
     }
 
     pub fn with_iam(mut self, iam: crate::iam::IamService) -> Self {
@@ -1837,6 +1849,18 @@ impl S3Api {
                 return s3_error_response("InvalidBucketName", None, &[("BucketName", b)]);
             }
         }
+        // Account-level (bucket=None) guard. Python 2.33 s3api's
+        // ServiceController implements GET only; PUT/DELETE/POST/HEAD on `/`
+        // are rejected at the s3api layer with 405 MethodNotAllowed
+        // (probed on the live oracle 2026-08-17, evidence
+        // s3win-20260817-account-probe.json). Without this guard those
+        // methods translated into Swift `/v1/<account>` requests — the
+        // 887be s3cmd-mb incident family. GET stays ListBuckets.
+        if bucket.is_none() {
+            if let Some(denied) = service_method_not_allowed(&req.method) {
+                return denied;
+            }
+        }
         // PUT/copy: unknown x-amz-storage-class must 400 before any persist.
         if req.method == "PUT" {
             if let Some(resp) = reject_unknown_storage_class(&req) {
@@ -1981,6 +2005,10 @@ impl S3Api {
             }
         }
 
+        // One clock-health sample per dispatched request; every WORM
+        // evaluation below sees the same bit. Disabled source → `true`.
+        let worm_clock_ok = self.worm_clock.clock_ok();
+
         // ---- MultiDelete ----
         if has_delete && req.method == "POST" && bucket.is_some() && key.is_none() {
             return handle_multi_delete(
@@ -1988,6 +2016,7 @@ impl S3Api {
                 &cred,
                 bucket.as_deref().unwrap(),
                 &self.iam,
+                worm_clock_ok,
                 next,
             );
         }
@@ -2098,6 +2127,7 @@ impl S3Api {
                 bucket.as_deref().unwrap(),
                 key.as_deref().unwrap(),
                 version_id_q.as_deref(),
+                worm_clock_ok,
                 retention_bypass,
                 next,
             );
@@ -2253,6 +2283,7 @@ impl S3Api {
                 &cred,
                 bucket.as_deref().unwrap(),
                 key.as_deref().unwrap(),
+                worm_clock_ok,
                 worm_bypass,
                 next,
             ) {
@@ -2596,8 +2627,37 @@ fn control_head_object(
     }
 }
 
-fn worm_guard(headers: &HeaderKeyDict, bypass: GovernanceBypass) -> Option<Response> {
-    match evaluate_object_version_worm(headers, unix_now(), bypass) {
+/// Account-level (bucket=None) request with a method the Python s3api
+/// ServiceController does not implement → the byte-aligned Python reject.
+///
+/// Python 2.33 (probed live 2026-08-17): `PUT|DELETE|POST /` → 405 with
+/// `<Error><Code>MethodNotAllowed</Code><Message>The specified method is not
+/// allowed against this resource.</Message><RequestId>…</RequestId>
+/// <Method>{METHOD}</Method><ResourceType>SERVICE</ResourceType></Error>`;
+/// `HEAD /` → the same 405 with an empty body (`Content-Type:
+/// application/xml`, `Content-Length: 0`). `GET /` (ListBuckets) is not
+/// touched here; other verbs keep their existing paths.
+fn service_method_not_allowed(method: &str) -> Option<Response> {
+    if !matches!(method, "PUT" | "DELETE" | "POST" | "HEAD") {
+        return None;
+    }
+    let mut resp = s3_error_response(
+        "MethodNotAllowed",
+        None,
+        &[("Method", method), ("ResourceType", "SERVICE")],
+    );
+    if method == "HEAD" {
+        resp.body = Body::empty();
+    }
+    Some(resp)
+}
+
+fn worm_guard(
+    headers: &HeaderKeyDict,
+    clock_ok: bool,
+    bypass: GovernanceBypass,
+) -> Option<Response> {
+    match evaluate_object_version_worm_with_clock(headers, unix_now(), clock_ok, bypass) {
         WormDecision::Allow => None,
         WormDecision::Deny(WormDenyReason::InvalidPersistedState(_)) => Some(s3_error_response(
             "InternalError",
@@ -2612,12 +2672,13 @@ fn worm_check_object(
     cred: &S3Credential,
     bucket: &str,
     key: &str,
+    clock_ok: bool,
     bypass: GovernanceBypass,
     next: &NextFn,
 ) -> Option<Response> {
     match control_head_object(cred, bucket, key, next) {
         Ok(ObjectHead::Missing) => None,
-        Ok(ObjectHead::Present(resp)) => worm_guard(&resp.headers, bypass),
+        Ok(ObjectHead::Present(resp)) => worm_guard(&resp.headers, clock_ok, bypass),
         Err(resp) => Some(resp),
     }
 }
@@ -2986,6 +3047,7 @@ fn handle_retention(
     bucket: &str,
     key: &str,
     version_id: Option<&str>,
+    clock_ok: bool,
     bypass: GovernanceBypass,
     next: &NextFn,
 ) -> Response {
@@ -3035,10 +3097,11 @@ fn handle_retention(
             let Some(requested) = parse_object_retention(&mode, &until) else {
                 return s3_error_response("MalformedXML", None, &[]);
             };
-            match evaluate_retention_update(
+            match evaluate_retention_update_with_clock(
                 &target.head.headers,
                 &requested,
                 unix_now(),
+                clock_ok,
                 bypass,
             ) {
                 RetentionUpdateDecision::Allow => {}
@@ -3086,6 +3149,7 @@ fn handle_multi_delete(
     cred: &S3Credential,
     bucket: &str,
     iam: &crate::iam::IamService,
+    clock_ok: bool,
     next: &NextFn,
 ) -> Response {
     let body = match req.body.into_vec(MAX_CONTROL_BODY) {
@@ -3173,11 +3237,12 @@ fn handle_multi_delete(
                     }
                     _ => None,
                 },
+                clock_ok,
                 bypass,
                 next,
             )
         } else {
-            if let Some(blocked) = worm_check_object(cred, bucket, key, bypass, next) {
+            if let Some(blocked) = worm_check_object(cred, bucket, key, clock_ok, bypass, next) {
                 blocked
             } else if let Some(blocked) = acl_write_check_object(cred, bucket, key, next) {
                 blocked
@@ -3875,6 +3940,7 @@ fn archived_null_replacement_required(
     cred: &S3Credential,
     bucket: &str,
     key: &str,
+    clock_ok: bool,
     bypass: GovernanceBypass,
     next: &NextFn,
 ) -> Result<bool, Response> {
@@ -3883,7 +3949,7 @@ fn archived_null_replacement_required(
     match control_head_object(cred, &vc, &aname, next)? {
         ObjectHead::Missing => Ok(false),
         ObjectHead::Present(head) => {
-            if let Some(blocked) = worm_guard(&head.headers, bypass) {
+            if let Some(blocked) = worm_guard(&head.headers, clock_ok, bypass) {
                 return Err(blocked);
             }
             if let Some(blocked) = deny_if_object_acl_blocks_write(cred, &head.headers) {
@@ -4020,6 +4086,7 @@ fn handle_versioned_object(
                 }
                 _ => None,
             },
+            api.worm_clock.clock_ok(),
             bypass,
             next,
         ),
@@ -4045,6 +4112,7 @@ fn maybe_archive_current_for_write(
     key: &str,
     cur: &Response,
     overwrite_null: bool,
+    clock_ok: bool,
     bypass: GovernanceBypass,
     idx: &mut VersionIndex,
     next: &NextFn,
@@ -4067,7 +4135,7 @@ fn maybe_archive_current_for_write(
         .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
     let old_is_delete_marker = is_delete_marker_header(cur.headers.get(SYS_DELETE_MARKER));
     if overwrite_null && old_vid == NULL_VERSION_ID {
-        if let Some(blocked) = worm_guard(&cur.headers, bypass) {
+        if let Some(blocked) = worm_guard(&cur.headers, clock_ok, bypass) {
             return Err(blocked);
         }
         return Ok(());
@@ -4146,6 +4214,7 @@ fn handle_versioned_put(
     next: &NextFn,
     api: &S3Api,
 ) -> Response {
+    let clock_ok = api.worm_clock.clock_ok();
     let snap = match load_version_index_snapshot(cred, bucket, key, next) {
         Ok(snap) => snap,
         Err(resp) => return resp,
@@ -4162,7 +4231,7 @@ fn handle_versioned_put(
     let overwrite_null = fixed_version_id == Some(NULL_VERSION_ID)
         && VersioningStatus::Suspended.suspended_put_overwrites_null();
     let archived_null_exists = if overwrite_null {
-        match archived_null_replacement_required(cred, bucket, key, bypass, next) {
+        match archived_null_replacement_required(cred, bucket, key, clock_ok, bypass, next) {
             Ok(exists) => exists,
             Err(resp) => return resp,
         }
@@ -4184,6 +4253,7 @@ fn handle_versioned_put(
             key,
             &cur,
             overwrite_null,
+            clock_ok,
             bypass,
             &mut idx,
             next,
@@ -4418,6 +4488,7 @@ fn handle_versioned_delete(
     key: &str,
     version_id_q: Option<&str>,
     fixed_delete_marker_id: Option<&str>,
+    clock_ok: bool,
     bypass: GovernanceBypass,
     next: &NextFn,
 ) -> Response {
@@ -4433,7 +4504,7 @@ fn handle_versioned_delete(
             }
             Err(resp) => return resp,
         };
-        if let Some(blocked) = worm_guard(&target.head.headers, bypass) {
+        if let Some(blocked) = worm_guard(&target.head.headers, clock_ok, bypass) {
             return blocked;
         }
         if let Some(blocked) = deny_if_object_acl_blocks_write(cred, &target.head.headers) {
@@ -4528,7 +4599,7 @@ fn handle_versioned_delete(
     let overwrite_null = fixed_delete_marker_id == Some(NULL_VERSION_ID)
         && VersioningStatus::Suspended.suspended_put_overwrites_null();
     let archived_null_exists = if overwrite_null {
-        match archived_null_replacement_required(cred, bucket, key, bypass, next) {
+        match archived_null_replacement_required(cred, bucket, key, clock_ok, bypass, next) {
             Ok(exists) => exists,
             Err(resp) => return resp,
         }
@@ -4543,6 +4614,7 @@ fn handle_versioned_delete(
             key,
             &cur,
             overwrite_null,
+            clock_ok,
             bypass,
             &mut idx,
             next,
@@ -5429,7 +5501,9 @@ fn handle_mpu_complete(
             api,
         )
     } else {
-        if let Some(blocked) = worm_check_object(cred, bucket, key, bypass, next) {
+        if let Some(blocked) =
+            worm_check_object(cred, bucket, key, api.worm_clock.clock_ok(), bypass, next)
+        {
             return blocked;
         }
         if let Some(blocked) = acl_write_check_object(cred, bucket, key, next) {
@@ -5734,6 +5808,7 @@ mod tests {
     use super::*;
     use crate::acl_cors::{S3_OBJECT_ACL_JSON_META, S3_OBJECT_ACL_META};
     use crate::bucket_config::{S3_LIFECYCLE_META, S3_OBJECT_LOCK_META, S3_VERSIONING_META};
+    use crate::response::{error_xml_leaf, request_id_survives_normalize};
     use crate::sigv4::{
         amz_date, canonical_query, canonical_request, canonical_uri, compute_signature,
         format_amz_date, headers_to_sign, parse_authorization_header, parse_query_authentication,
@@ -8981,6 +9056,215 @@ mod tests {
         assert_eq!(resp.status, 403);
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
         assert!(body.contains("AccessDenied"));
+    }
+
+    /// Injectable clock source: `offset` = one fixed reading (ms), `None` =
+    /// unreadable. TTL zero so every call re-reads.
+    fn test_worm_clock(max_offset_ms: u64, offset: Option<f64>) -> Arc<ClockHealth> {
+        Arc::new(ClockHealth::with_reader(
+            max_offset_ms,
+            std::time::Duration::ZERO,
+            Box::new(move || offset),
+        ))
+    }
+
+    #[test]
+    fn account_level_put_delete_post_are_method_not_allowed() {
+        // Python 2.33 ServiceController implements GET only. Live-oracle
+        // probe (s3win-20260817-account-probe.json, 2026-08-17): signed
+        // PUT/DELETE/POST on `/` → 405 MethodNotAllowed with the SERVICE
+        // resource type. The Swift backend must never see the request —
+        // this is the 887be `/v1/<account>` translation family.
+        let api = S3Api::new(cred_map());
+        for method in ["PUT", "DELETE", "POST"] {
+            let req = sign_request(base_s3_req(method, "/", ""), "testing");
+            let hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let hit_c = hit.clone();
+            let next: NextFn = Arc::new(move |_| {
+                hit_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                Response::new(500)
+            });
+            let resp = api.handle(req, &next);
+            assert_eq!(resp.status, 405, "{method} / must 405");
+            assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
+            assert!(
+                !hit.load(std::sync::atomic::Ordering::SeqCst),
+                "{method} / must not reach the Swift backend"
+            );
+            let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+            // Byte-aligned to the probed Python reject (RequestId dynamic).
+            assert!(
+                body.starts_with("<?xml version='1.0' encoding='UTF-8'?>\n"),
+                "{body}"
+            );
+            assert_eq!(error_xml_leaf(&body, "Code"), Some("MethodNotAllowed"));
+            assert_eq!(
+                error_xml_leaf(&body, "Message"),
+                Some("The specified method is not allowed against this resource.")
+            );
+            let rid = error_xml_leaf(&body, "RequestId").expect("RequestId child");
+            assert!(request_id_survives_normalize(rid), "{rid:?}");
+            assert_eq!(error_xml_leaf(&body, "Method"), Some(method));
+            assert_eq!(error_xml_leaf(&body, "ResourceType"), Some("SERVICE"));
+            // Python element order: Code, Message, RequestId, Method,
+            // ResourceType.
+            let order = ["<Code>", "<Message>", "<RequestId>", "<Method>", "<ResourceType>"];
+            let mut last = 0;
+            for tag in order {
+                let at = body.find(tag).unwrap_or_else(|| panic!("{tag} in {body}"));
+                assert!(at >= last, "{tag} out of order in {body}");
+                last = at;
+            }
+        }
+    }
+
+    #[test]
+    fn account_level_head_is_method_not_allowed_with_empty_body() {
+        // Probed Python: HEAD / → 405, Content-Type application/xml,
+        // empty body (Content-Length 0).
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("HEAD", "/", ""), "testing");
+        let next: NextFn = Arc::new(|_| panic!("HEAD / must not reach the Swift backend"));
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 405);
+        assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
+        let body = resp.body.into_vec(u64::MAX).unwrap();
+        assert!(body.is_empty(), "HEAD 405 must carry no body");
+    }
+
+    #[test]
+    fn account_level_get_stays_list_buckets_with_guard() {
+        // GET / is ListBuckets and must keep translating to the account GET.
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/", ""), "testing");
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.method, "GET");
+            assert_eq!(r.path, "/v1/AUTH_test");
+            Response::with_body(200, br#"[]"#.to_vec())
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("ListAllMyBucketsResult"), "{body}");
+    }
+
+    #[test]
+    fn worm_clock_gates_expired_compliance_delete() {
+        // Expired COMPLIANCE lock: with a healthy (or disabled) clock the
+        // DELETE proceeds; with the knob on and the source over-threshold or
+        // unreadable, COMPLIANCE claims fail closed (403, no backend DELETE).
+        let run = |api: S3Api, expect_deleted: bool| {
+            let del = sign_request(base_s3_req("DELETE", "/mybucket/expired", ""), "testing");
+            let deleted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let deleted_c = deleted.clone();
+            let next: NextFn = Arc::new(move |r| {
+                if r.method == "HEAD" && r.path.ends_with("/mybucket") {
+                    return Response::new(204);
+                }
+                if r.method == "HEAD" {
+                    let mut resp = Response::new(200);
+                    resp.headers.set(SYS_LOCK_MODE, "COMPLIANCE");
+                    resp.headers.set(SYS_RETAIN_UNTIL, "2000-01-01T00:00:00Z");
+                    return resp;
+                }
+                if r.method == "DELETE" {
+                    deleted_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Response::new(204);
+                }
+                Response::new(500)
+            });
+            let resp = api.handle(del, &next);
+            if expect_deleted {
+                assert_eq!(resp.status, 204);
+            } else {
+                assert_eq!(resp.status, 403);
+            }
+            assert_eq!(
+                deleted.load(std::sync::atomic::Ordering::SeqCst),
+                expect_deleted
+            );
+        };
+
+        // Knob off (default): identical to the historical pinned true.
+        run(S3Api::new(cred_map()), true);
+        // Enabled + healthy reading within threshold.
+        run(
+            S3Api::new(cred_map()).with_worm_clock(test_worm_clock(50, Some(-12.0))),
+            true,
+        );
+        // Enabled + offset over threshold → fail closed.
+        run(
+            S3Api::new(cred_map()).with_worm_clock(test_worm_clock(50, Some(75.0))),
+            false,
+        );
+        // Enabled + unreadable source → fail closed.
+        run(
+            S3Api::new(cred_map()).with_worm_clock(test_worm_clock(50, None)),
+            false,
+        );
+    }
+
+    #[test]
+    fn worm_clock_unhealthy_denies_compliance_retention_put() {
+        // PUT ?retention with a COMPLIANCE claim is a COMPLIANCE mutation:
+        // enabled + unhealthy source must 403 before any sysmeta POST.
+        let body = br#"<Retention xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Mode>COMPLIANCE</Mode>
+  <RetainUntilDate>2099-01-01T00:00:00Z</RetainUntilDate>
+</Retention>"#;
+        let run = |api: S3Api, expect_status: u16| {
+            let mut put = base_s3_req("PUT", "/mybucket/obj1", "retention");
+            put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+            put.body = Body::from(body.to_vec());
+            let put = sign_request(put, "testing");
+            let lock_meta = mock_bucket_lock_meta();
+            let posted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let posted_c = posted.clone();
+            let next: NextFn = Arc::new(move |r| {
+                if r.method == "HEAD" && r.path.ends_with("/mybucket") {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(S3_OBJECT_LOCK_META, &lock_meta);
+                    return resp;
+                }
+                if r.method == "HEAD" {
+                    return Response::new(200);
+                }
+                if r.method == "POST" {
+                    posted_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Response::new(202);
+                }
+                Response::new(500)
+            });
+            let resp = api.handle(put, &next);
+            assert_eq!(resp.status, expect_status);
+            assert_eq!(
+                posted.load(std::sync::atomic::Ordering::SeqCst),
+                expect_status == 200,
+                "sysmeta POST gating"
+            );
+            if expect_status == 403 {
+                let b = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+                assert!(b.contains("AccessDenied"), "{b}");
+            }
+        };
+
+        let iam_api = || {
+            let mut iam = crate::iam::IamService::new();
+            let policy = crate::iam::IamService::parse_policy_json(
+                r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*","Resource":"arn:aws:s3:::mybucket/*","Principal":"*"}}"#,
+            )
+            .expect("valid WORM IAM fixture");
+            iam.attach_policy("*", "worm-clock-test", policy);
+            S3Api::new(cred_map()).with_iam(iam)
+        };
+
+        // Knob off (default): COMPLIANCE claim on an unlocked object stores.
+        run(iam_api(), 200);
+        // Enabled + healthy: unchanged.
+        run(iam_api().with_worm_clock(test_worm_clock(50, Some(3.5))), 200);
+        // Enabled + over threshold / unreadable: COMPLIANCE claim denied.
+        run(iam_api().with_worm_clock(test_worm_clock(50, Some(1e6))), 403);
+        run(iam_api().with_worm_clock(test_worm_clock(50, None)), 403);
     }
 
     #[test]

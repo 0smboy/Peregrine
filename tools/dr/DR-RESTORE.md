@@ -37,10 +37,9 @@ Bundles contain `swift_hash_path_prefix`/`suffix` and tempauth credentials.
   2. aggregation: swift3 `/root/work/dr-backups/20260817/` (all 4 bundles)
   3. cross copy: swift2 `/root/work/dr-backups/20260817/` (all 4 bundles)
   4. operator offline copy on the Mac workstation, outside any git worktree
-- **PENDING (user decision required):** an off-site encrypted copy (e.g.
-  `age`/`gpg` symmetric) is planned but waits for the user to supply a
-  passphrase. Until then the newest bundles exist only on lab hosts + the
-  operator's Mac.
+  5. **off-site encrypted copy on Google Drive** -- ciphertext only, see
+     section 6. Plaintext bundles still never leave the lab hosts + the
+     operator's Mac.
 
 ## 3. Restore procedure (per node)
 
@@ -92,40 +91,83 @@ zero differences. A destructive full-node restore has NOT been rehearsed.
 
 ## 4. RPO / RTO (honest statement, 2026-08-17)
 
-- **RPO = the manual backup timestamp.** There is no automation yet; the only
-  guaranteed restore point is stamp `20260817T130925Z`. Config changes after a
-  stamp are unprotected until the next manual run.
+- **RPO = the newest weekly stamp (<= 7 days once the cron has run).** Weekly
+  automation was installed 2026-08-17 (section 5); first automated run is
+  Monday 2026-08-24. Until then the only guaranteed restore point remains the
+  manual stamp `20260817T130925Z`. Config changes between weekly stamps are
+  unprotected.
 - **RTO = untested for a real restore.** Only the read-only drill (extract +
   verify + diff, zero differences) has been performed. A live restore
   additionally needs steps 4-7 (daemon-reload, ordered restarts, ring check,
   smoke), estimated minutes-not-hours for a single node, but **no measured
   number exists and none is claimed.**
 
-## 5. Proposed weekly automation (NOT installed -- user decision)
+## 5. Weekly backup cron (INSTALLED 2026-08-17)
 
-Proposed crontab entry per node (root), if/when the user opts in. Install by
-copying `tools/dr/dr-backup.sh` to `/usr/local/bin/dr-backup.sh` first:
+`tools/dr/dr-backup.sh` is deployed on all four nodes as
+`/usr/local/bin/peregrine-dr-backup.sh` (mode 0755). Each node carries
+`/etc/cron.d/peregrine-dr-backup`; all nodes run in UTC. Runs are staggered
+Mondays: swift1 03:05, swift2 03:10, swift3 03:15, swift4 03:20 UTC.
+File content (only the minute differs per node):
 
 ```cron
-# weekly config-plane DR backup, Mondays 03:17 UTC (proposed, not installed)
-17 3 * * 1 /usr/local/bin/dr-backup.sh --outdir /root/dr-backups/$(date -u +\%Y\%m\%d) >> /var/log/dr-backup.log 2>&1
+# Peregrine DR weekly config-plane backup (installed 2026-08-17).
+# Runs every Monday at 03:05 UTC (nodes staggered: swift1=03:05 ... swift4=03:20).
+# Retention: after a successful backup, prune bundle dirs older than 35 days (~5 weeks kept).
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=""
+5 3 * * 1 root { /usr/local/bin/peregrine-dr-backup.sh --outdir /root/dr-backups/$(date +\%Y\%m\%d) && find /root/dr-backups -mindepth 1 -maxdepth 1 -type d -mtime +35 -exec rm -rf {} + ; } >> /var/log/peregrine-dr-backup.log 2>&1
 ```
 
-Companion suggestions (also not installed):
-- retention: keep the last 8 weekly dirs under `/root/dr-backups/`
-  (`ls -1d /root/dr-backups/2* | head -n -8 | xargs -r rm -rf` as a follow-up
-  cron line, or manual).
+Retention policy: the `find ... -mtime +35 -exec rm -rf` prune runs only after
+a **successful** backup (`&&`), keeping roughly the last 4-5 weekly dirs under
+`/root/dr-backups/`. `-mindepth 1` protects the parent directory itself.
+
+Still open (unchanged from the first wave):
 - aggregation to swift3/swift2 requires inter-node ssh trust which does NOT
   currently exist (host-key verification fails node-to-node as of 2026-08-17);
   either provision `/root/.ssh/known_hosts` + keys, or keep pulling bundles
   from the operator workstation as done in this wave.
-- the off-site encrypted copy (section 2) remains the standing pending item.
 
-## 6. Evidence for this wave
+## 6. Offsite encrypted copy (INSTALLED 2026-08-17)
+
+The 2026-08-17 bundles have an encrypted off-site copy on Google Drive.
+**Only ciphertext goes to the cloud; plaintext bundles never do.**
+
+- **Cipher:** `openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt`, one
+  `.enc` per bundle plus a `.enc.sha256` sidecar (sha256 of the ciphertext).
+- **Passphrase:** generated with `openssl rand -base64 32`, stored ONLY in the
+  operator Mac's login Keychain. The value appears in no command line, log,
+  file, or document.
+  - Keychain entry: account `peregrine`, service **`peregrine-dr-backup`**
+  - Retrieve (never echo): `security find-generic-password -a peregrine -s peregrine-dr-backup -w`
+- **Offsite path:** `gdrive:Peregrine/dr-offsite/20260817/` (rclone remote on
+  the operator Mac), holding the four `.enc` files + four `.enc.sha256`.
+- **Decrypt template** (run on the operator Mac, or anywhere after fetching
+  the `.enc` and reading the passphrase from Keychain):
+  ```
+  openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+    -in dr-config-<node>-<stamp>.tar.gz.enc \
+    -out dr-config-<node>-<stamp>.tar.gz \
+    -pass file:<(security find-generic-password -a peregrine -s peregrine-dr-backup -w)
+  ```
+  Then verify against the plaintext sidecar from section 2 storage
+  (`sha256sum -c dr-config-<node>-<stamp>.tar.gz.sha256`) before restoring.
+- **Loopback proven 2026-08-17:** swift1's `.enc` was decrypted to /tmp and
+  its sha256 matched the original bundle exactly; the temp file was deleted.
+- Losing the Keychain entry makes the offsite copies unreadable; the
+  passphrase exists nowhere else. Treat Keychain backup as part of DR.
+
+## 7. Evidence for this wave
 
 Operator-side evidence (drill output, sha256 tables, df before/after, disk
 surveys) is archived outside the repo under
-`.agent-handoff/workflow-runs/20260817/dr-capacity/`. Bundles themselves live
-under `.agent-handoff/dr-backups/20260817/` on the operator Mac -- also outside
-any git worktree. The repo carries only this runbook, the backup script, and
-the disk ledger (`tools/dr/DISK-LEDGER-20260817.md`).
+`.agent-handoff/workflow-runs/20260817/dr-capacity/`. Evidence for the weekly
+cron install, the encryption loopback, and the Drive offsite listing lives
+under `.agent-handoff/workflow-runs/20260817/alerting-offsite/` (no passphrase
+values anywhere). Bundles themselves live under
+`.agent-handoff/dr-backups/20260817/` on the operator Mac -- also outside any
+git worktree; their `.enc` ciphertext copies are the only cloud artifacts. The
+repo carries only this runbook, the backup script, and the disk ledger
+(`tools/dr/DISK-LEDGER-20260817.md`).

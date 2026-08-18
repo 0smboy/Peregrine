@@ -22,6 +22,7 @@
 //! (golden-tested against the Python implementation).
 
 mod body;
+pub mod clock_health;
 mod conditional;
 mod dates;
 mod headers;
@@ -35,6 +36,7 @@ pub use body::{
     body_too_large, Body, ChainReader, FnReader, InterimResponder, SharedBytesReader, StreamedBody,
     MAX_CONTROL_BODY, STREAM_CHUNK,
 };
+pub use clock_health::{parse_chronyc_tracking_csv, ClockHealth, ClockOffsetReader};
 pub use conditional::{apply_conditional, conditional_response_status, resolve_etag_is_at};
 pub use dates::{http_date, parse_http_date};
 pub use headers::{title_case, HeaderKeyDict};
