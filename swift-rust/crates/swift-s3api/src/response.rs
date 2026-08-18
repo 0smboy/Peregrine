@@ -629,79 +629,31 @@ pub enum SelectStarPlan {
     Limit(usize),
 }
 
-/// `SELECT * FROM S3Object` only, optional single-token alias and `LIMIT n`.
+/// Star + optional LIMIT only. Projection/WHERE live in [`crate::select`].
 pub fn parse_select_star(body: &[u8]) -> Option<SelectStarPlan> {
-    parse_select_star_expr(&extract_select_expression(body))
+    let plan = crate::select::parse_select_expression(body)?;
+    match plan.projection {
+        crate::select::SelectProjection::Star if plan.predicates.is_empty() => match plan.limit {
+            None => Some(SelectStarPlan::All),
+            Some(n) => Some(SelectStarPlan::Limit(n)),
+        },
+        _ => None,
+    }
 }
 
 pub fn select_expression_is_star(body: &[u8]) -> bool {
     parse_select_star(body).is_some()
 }
 
-fn extract_select_expression(body: &[u8]) -> String {
-    let text = String::from_utf8_lossy(body);
-    let lower = text.to_ascii_lowercase();
-    if let Some(start) = lower.find("<expression>") {
-        let rest = &text[start + "<expression>".len()..];
-        let rest_l = rest.to_ascii_lowercase();
-        if let Some(end) = rest_l.find("</expression>") {
-            return rest[..end].trim().to_string();
-        }
-    }
-    text.trim().to_string()
-}
-
-fn parse_select_star_expr(expr: &str) -> Option<SelectStarPlan> {
-    let tokens: Vec<String> = expr
-        .split_whitespace()
-        .map(|t| t.trim_matches(|c: char| c == ';' || c == ',').to_ascii_uppercase())
-        .filter(|t| !t.is_empty())
-        .collect();
-    let t: Vec<&str> = tokens.iter().map(String::as_str).collect();
-    match t.as_slice() {
-        ["SELECT", "*", "FROM", "S3OBJECT"] => Some(SelectStarPlan::All),
-        ["SELECT", "*", "FROM", "S3OBJECT", "LIMIT", n] => parse_select_limit(n),
-        ["SELECT", "*", "FROM", "S3OBJECT", alias]
-            if is_select_alias(alias) =>
-        {
-            Some(SelectStarPlan::All)
-        }
-        ["SELECT", "*", "FROM", "S3OBJECT", alias, "LIMIT", n]
-            if is_select_alias(alias) =>
-        {
-            parse_select_limit(n)
-        }
-        _ => None,
-    }
-}
-
-fn is_select_alias(alias: &str) -> bool {
-    !alias.is_empty()
-        && alias != "LIMIT"
-        && alias
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-fn parse_select_limit(n: &str) -> Option<SelectStarPlan> {
-    let v: usize = n.parse().ok()?;
-    if v == 0 || v > 1_000_000 {
-        return None;
-    }
-    Some(SelectStarPlan::Limit(v))
-}
-
 pub fn apply_select_limit(payload: &[u8], limit: usize) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut taken = 0usize;
-    for line in payload.split_inclusive(|&b| b == b'\n') {
-        if taken >= limit {
-            break;
-        }
-        out.extend_from_slice(line);
-        taken += 1;
-    }
-    out
+    crate::select::apply_select_plan(
+        payload,
+        &crate::select::SelectPlan {
+            projection: crate::select::SelectProjection::Star,
+            predicates: Vec::new(),
+            limit: Some(limit),
+        },
+    )
 }
 
 /// Single-file BitTorrent metainfo for `GetObjectTorrent` (one piece = whole object).

@@ -159,6 +159,17 @@ SELECT_NOT_STAR_XML = (
     b"<InputSerialization><CSV/></InputSerialization>"
     b"<OutputSerialization><CSV/></OutputSerialization></SelectRequest>"
 )
+SELECT_WHERE_XML = (
+    b"<SelectRequest><Expression>SELECT _1 FROM S3Object WHERE _2 = '2'</Expression>"
+    b"<InputSerialization><CSV/></InputSerialization>"
+    b"<OutputSerialization><CSV/></OutputSerialization></SelectRequest>"
+)
+SELECT_UNSUPPORTED_XML = (
+    b"<SelectRequest><Expression>SELECT * FROM S3Object JOIN x</Expression>"
+    b"<InputSerialization><CSV/></InputSerialization>"
+    b"<OutputSerialization><CSV/></OutputSerialization></SelectRequest>"
+)
+ROWS_CSV = b"red,1\nblue,2\ngreen,3\n"
 STORED_QUERY_NAMES = frozenset(item[0] for item in STORED_BUCKET_CONFIGS)
 
 RESTORE_XML = (
@@ -234,6 +245,8 @@ def _declared_cases() -> Tuple[str, ...]:
         "select-star",
         "select-limit",
         "select-not-star",
+        "select-where",
+        "select-unsupported",
         "get-object-torrent",
         "write-get-object-response-501",
         "list-directory-buckets",
@@ -1072,8 +1085,31 @@ def _run_matrix(runner: Runner) -> None:
             case.issue("select-limit empty body")
 
     def select_not_star(case: Case) -> None:
-        snap = runner.req(case, "POST", _path(main, "probe.txt"),
+        put = runner.req(case, "PUT", _path(main, "rows.csv"), (), ROWS_CSV,
+                         {"Content-Type": "text/csv"})
+        runner.expect_status(case, put, (200, 201))
+        if case.passed:
+            runner.objects.setdefault(main, []).append("rows.csv")
+        snap = runner.req(case, "POST", _path(main, "rows.csv"),
                           (("select", ""), ("select-type", "2")), SELECT_NOT_STAR_XML)
+        runner.expect_status(case, snap, (200,))
+        if not snap.body:
+            case.issue("select-not-star empty body")
+        if b"red" not in snap.body:
+            case.issue("select-not-star missing red")
+
+    def select_where(case: Case) -> None:
+        snap = runner.req(case, "POST", _path(main, "rows.csv"),
+                          (("select", ""), ("select-type", "2")), SELECT_WHERE_XML)
+        runner.expect_status(case, snap, (200,))
+        if not snap.body:
+            case.issue("select-where empty body")
+        if b"blue" not in snap.body:
+            case.issue("select-where missing blue")
+
+    def select_unsupported(case: Case) -> None:
+        snap = runner.req(case, "POST", _path(main, "probe.txt"),
+                          (("select", ""), ("select-type", "2")), SELECT_UNSUPPORTED_XML)
         runner.expect_error(case, snap, 400, "InvalidRequest")
 
     def get_object_torrent(case: Case) -> None:
@@ -1280,6 +1316,8 @@ def _run_matrix(runner: Runner) -> None:
     runner.run_case("select-star", select_star)
     runner.run_case("select-limit", select_limit)
     runner.run_case("select-not-star", select_not_star)
+    runner.run_case("select-where", select_where)
+    runner.run_case("select-unsupported", select_unsupported)
     runner.run_case("get-object-torrent", get_object_torrent)
     runner.run_case("write-get-object-response-501", write_get_object_response_501)
     runner.run_case("list-directory-buckets", list_directory_buckets)
@@ -1304,6 +1342,9 @@ def _run_matrix(runner: Runner) -> None:
     runner.run_case("s3cmd-get", s3cmd_get)
     runner.run_case("s3cmd-del", s3cmd_del)
     runner.run_case("s3cmd-rb", s3cmd_rb)
+    runner.target.request("DELETE", _path(main, "rows.csv"))
+    if "rows.csv" in runner.objects.get(main, []):
+        runner.objects[main].remove("rows.csv")
     _empty_bucket(runner.target, main)
     _empty_bucket(runner.target, slash)
     runner.objects[main] = []
@@ -1508,11 +1549,17 @@ class _MockClient:
                                 b"<Error><Code>ServerSideEncryptionConfigurationNotFoundError"
                                 b"</Code></Error>")
         if method == "POST" and q0 == "select":
-            if b"SELECT *" not in body.upper():
+            upper = body.upper()
+            if b"JOIN" in upper or b" OR " in upper:
                 return Snapshot(400, {"content-type": ("application/xml",)},
                                 b"<Error><Code>InvalidRequest</Code></Error>")
-            return Snapshot(200, {"content-type": ("application/vnd.amazon.eventstream",)},
-                            b"\x00\x00\x00\x20eventstream")
+            if b"SELECT *" in upper or b"SELECT _" in upper:
+                return Snapshot(
+                    200, {"content-type": ("application/vnd.amazon.eventstream",)},
+                    b"\x00\x00\x00\x20eventstream red blue",
+                )
+            return Snapshot(400, {"content-type": ("application/xml",)},
+                            b"<Error><Code>InvalidRequest</Code></Error>")
         if method == "GET" and q0 == "torrent":
             return Snapshot(200, {"content-type": ("application/x-bittorrent",)},
                             b"d8:announce0:4:infoe")
@@ -1631,7 +1678,9 @@ def _selftest_body() -> None:
     _expect("rename-object" in ALL_CASES, "RenameObject missing")
     _expect("select-star" in ALL_CASES, "SelectObjectContent missing")
     _expect("select-limit" in ALL_CASES, "Select LIMIT missing")
-    _expect("select-not-star" in ALL_CASES, "Select projection 400 missing")
+    _expect("select-not-star" in ALL_CASES, "Select projection missing")
+    _expect("select-where" in ALL_CASES, "Select WHERE missing")
+    _expect("select-unsupported" in ALL_CASES, "Select unsupported 400 missing")
     _expect("get-object-torrent" in ALL_CASES, "GetObjectTorrent missing")
     _expect("write-get-object-response-501" in ALL_CASES, "WGOR 501 missing")
     _expect("put-cfg-abac" in ALL_CASES, "stored abac PUT missing")

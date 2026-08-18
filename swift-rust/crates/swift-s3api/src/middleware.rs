@@ -161,13 +161,14 @@ use crate::object_lock_worm::{
     SYS_LEGAL_HOLD, SYS_LOCK_MODE, SYS_RETAIN_UNTIL,
 };
 use crate::parse::{extract_bucket_and_key, s3_to_swift_path, validate_bucket_name};
+use crate::select::{apply_select_plan, parse_select_expression};
 use crate::response::{
     copy_object_result_xml, copy_part_result_xml, create_session_result_xml,
     delete_object_response, delete_result_xml, get_object_attributes_xml,
     list_all_my_buckets_xml, list_directory_buckets_xml, object_torrent_bytes,
     policy_status_xml, put_object_response, s3_error_response, s3_xml_timestamp,
-    apply_select_limit, parse_select_star, select_star_event_stream, unix_secs_to_s3_iso,
-    xml_response, SelectStarPlan,
+    select_star_event_stream, unix_secs_to_s3_iso,
+    xml_response,
     BucketInfo, DeleteError, DeletedObject, ListBucketResult, ListBucketResultV2, Owner,
     S3Object,
 };
@@ -5791,22 +5792,19 @@ fn handle_select_object_content(
         Ok(b) => b,
         Err(_) => return s3_error_response("IncompleteBody", None, &[]),
     };
-    let plan = match parse_select_star(&body) {
+    let plan = match parse_select_expression(&body) {
         Some(plan) => plan,
         None => {
             return s3_error_response(
                 "InvalidRequest",
-                Some("only SELECT * FROM S3Object [LIMIT n] is implemented"),
+                Some("only CSV SELECT *|_N FROM S3Object [WHERE _N = lit] [LIMIT n] is implemented"),
                 &[],
             )
         }
     };
     match control_get_object_bytes(cred, bucket, key, next) {
         Ok(data) => {
-            let payload = match plan {
-                SelectStarPlan::All => data,
-                SelectStarPlan::Limit(n) => apply_select_limit(&data, n),
-            };
+            let payload = apply_select_plan(&data, &plan);
             let mut resp = Response::with_body(200, select_star_event_stream(&payload));
             resp.headers
                 .set("Content-Type", "application/vnd.amazon.eventstream");
@@ -7234,11 +7232,46 @@ mod tests {
         );
         req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         let req = sign_request(req, "testing");
-        let next: NextFn = Arc::new(|_| panic!("projection must not hop Swift"));
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.method, "GET");
+            Response::with_body(200, b"red,1\nblue,2\n".to_vec())
+        });
         let resp = api.handle(req, &next);
-        assert_eq!(resp.status, 400);
-        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
-        assert!(body.contains("InvalidRequest"), "{body}");
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("application/vnd.amazon.eventstream")
+        );
+        let body = resp.body.into_vec(u64::MAX).unwrap();
+        assert!(body.windows(3).any(|w| w == b"red"), "missing red in {body:?}");
+    }
+
+    #[test]
+    fn select_where_filters_rows() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("POST", "/mybucket/probe.txt", "select&select-type=2");
+        req.body = Body::from(
+            b"<SelectRequest><Expression>SELECT _1 FROM S3Object WHERE _1 = 'blue'</Expression></SelectRequest>"
+                .to_vec(),
+        );
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.method, "GET");
+            Response::with_body(200, b"red,1\nblue,2\n".to_vec())
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("application/vnd.amazon.eventstream")
+        );
+        let body = resp.body.into_vec(u64::MAX).unwrap();
+        assert!(body.windows(4).any(|w| w == b"blue"), "missing blue in {body:?}");
+        assert!(
+            !body.windows(3).any(|w| w == b"red"),
+            "records should not include red: {body:?}"
+        );
     }
 
     #[test]

@@ -119,6 +119,7 @@ pub mod mpu;
 pub mod object_lock_worm;
 pub mod parse;
 pub mod response;
+pub mod select;
 pub mod sigv2;
 pub mod sigv4;
 pub mod versioning_store;

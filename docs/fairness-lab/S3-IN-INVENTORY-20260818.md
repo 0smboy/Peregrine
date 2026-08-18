@@ -3,8 +3,8 @@
 - Date: 2026-08-18
 - Official source: [Amazon S3 API Operations](https://docs.aws.amazon.com/AmazonS3/latest/API/API_Operations.html) — **Amazon S3 section only** (lines 7–122; excludes S3 Control, Outposts, Tables, Vectors, Files)
 - Rust truth: `swift-rust/crates/swift-s3api/src/middleware.rs` (`UNSUPPORTED_SUBRESOURCES` empty after W3; WriteGetObjectResponse 501 via `x-amz-request-route`), `parse.rs` `extract_bucket_and_key` (empty key → `None`, slash-fix in tree)
-- Live reference binary: proxy **catalog W3.1** `70405da7…` (W3 + select star/LIMIT only; projection/WHERE → 400). Frozen 57-case runner untouched. Live client matrix 2026-08-18 W3.1: **169/169 gate=PASS**.
-- Score legend: **LIVE_PASS** = VIP client path (stored XML/JSON round-trip counts; select is `SELECT * FROM S3Object` plus optional `LIMIT n`; torrent is a generated single-file .torrent; CreateSession echoes TempAuth keys; RenameObject is copy+delete). **HONEST_501** = 501 NotImplemented non-empty XML; **FAIL** = fallthrough / no live case; **UNTESTED** = implemented, no live case
+- Live reference binary: proxy **catalog W4** `1628418c…` (W3.1 + CSV Select `_N` projection / AND-equality WHERE / LIMIT). Frozen 57-case runner untouched. Live client matrix 2026-08-18 W4: **171/171 gate=PASS**.
+- Score legend: **LIVE_PASS** = VIP client path (stored XML/JSON round-trip counts; select is CSV `*` / `_N` / WHERE `_N = lit` / LIMIT; torrent is a generated single-file .torrent; CreateSession echoes TempAuth keys; RenameObject is copy+delete). **HONEST_501** = 501 NotImplemented non-empty XML; **FAIL** = fallthrough / no live case; **UNTESTED** = implemented, no live case
 
 ## Summary counts (after W3 live)
 
@@ -130,7 +130,7 @@ W3 moved metadata*, ABAC, annotation, CreateSession, RenameObject, SelectObjectC
 | PutPublicAccessBlock | PUT `/?publicAccessBlock` | `handle_stored_bucket_config` | LIVE_PASS | W2 sysmeta round-trip |
 | RenameObject | POST `/{Key}` + `x-amz-rename-source` | `handle_rename_object` | LIVE_PASS | Copy then delete; 204; not atomic S3 Express |
 | RestoreObject | POST `/{Key}?restore` | `handle_restore` | LIVE_PASS | Honest `400 InvalidObjectState` when cold off |
-| SelectObjectContent | POST `/{Key}?select` | `handle_select_object` | LIVE_PASS | `SELECT * FROM S3Object` [LIMIT n] event-stream; projection/WHERE → 400 |
+| SelectObjectContent | POST `/{Key}?select` | `handle_select_object_content` | LIVE_PASS | CSV `*` / `_N` / WHERE `_N = lit` / LIMIT; JOIN/OR/LIKE/JSON → 400 |
 | UpdateBucketMetadataAnnotationTableConfiguration | PUT `/{Bucket}?metadataAnnotationTableConfiguration` | `handle_stored_bucket_config` | LIVE_PASS | W3 sysmeta round-trip |
 | UpdateBucketMetadataInventoryTableConfiguration | PUT `/{Bucket}?metadataInventoryTableConfiguration` | `handle_stored_bucket_config` | LIVE_PASS | W3 sysmeta round-trip |
 | UpdateBucketMetadataJournalTableConfiguration | PUT `/{Bucket}?metadataJournalTableConfiguration` | `handle_stored_bucket_config` | LIVE_PASS | W3 sysmeta round-trip |
@@ -146,7 +146,7 @@ W3 moved metadata*, ABAC, annotation, CreateSession, RenameObject, SelectObjectC
 ### Honesty notes
 
 - Bucket configs (including metadata*/ABAC) are **sysmeta XML/JSON round-trip**, not SSE, replication, website hosting, analytics jobs, or S3 Metadata tables.
-- Select is **`SELECT * FROM S3Object` plus optional `LIMIT n`**, not a SQL engine. Projection and WHERE return 400.
+- Select is a **CSV subset**: `SELECT *|_N` plus AND-equality `WHERE` and `LIMIT`. Not SQL/JSON/Parquet. JOIN/OR/LIKE/header names return 400.
 - Torrent is a generated single-file `.torrent` with no tracker.
 - CreateSession echoes existing TempAuth keys plus a 15-minute `peregrine-session` token.
 - RenameObject is GET+PUT+DELETE, not an atomic S3 Express rename.
