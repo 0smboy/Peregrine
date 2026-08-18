@@ -146,7 +146,9 @@ pub fn extract_bucket_and_key(
         Err(_) => return (None, None),
     };
     let bucket = parts.first().cloned().flatten().filter(|b| !b.is_empty());
-    let key = parts.get(1).cloned().flatten();
+    // s3cmd 2.4 path-style List/Create uses `/bucket/` (empty object name).
+    // That is a bucket request, not GetObject of "". Empty key → None.
+    let key = parts.get(1).cloned().flatten().filter(|k| !k.is_empty());
 
     if let Some(b) = &bucket {
         if !validate_bucket_name(b, dns_compliant) {
@@ -205,6 +207,15 @@ mod tests {
     #[test]
     fn test_path_style_bucket_only() {
         let r = req("GET", "/mybucket", None);
+        let (b, k) = extract_bucket_and_key(&r, &[], true);
+        assert_eq!(b.as_deref(), Some("mybucket"));
+        assert_eq!(k, None);
+    }
+
+    #[test]
+    fn test_path_style_bucket_trailing_slash_is_bucket_only() {
+        // s3cmd 2.4.0: GET /mytest/ must list, not GetObject "".
+        let r = req("GET", "/mybucket/", None);
         let (b, k) = extract_bucket_and_key(&r, &[], true);
         assert_eq!(b.as_deref(), Some("mybucket"));
         assert_eq!(k, None);

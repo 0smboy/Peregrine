@@ -508,12 +508,53 @@ pub fn list_all_my_buckets_xml(owner: &Owner, buckets: &[BucketInfo]) -> Vec<u8>
     root.to_xml(true)
 }
 
-/// Build a `CopyObjectResult` document (used for PUT-copy and MPU part-copy).
+/// Build a `CopyObjectResult` document (used for PUT-copy).
 pub fn copy_object_result_xml(last_modified: &str, etag: &str) -> Vec<u8> {
     Element::new("CopyObjectResult")
         .with_leaf("LastModified", s3_xml_timestamp(last_modified))
         .with_leaf("ETag", format!("\"{}\"", etag.trim().trim_matches('"')))
         .to_xml(true)
+}
+
+/// Build a `CopyPartResult` document for UploadPartCopy.
+pub fn copy_part_result_xml(last_modified: &str, etag: &str) -> Vec<u8> {
+    Element::new("CopyPartResult")
+        .with_leaf("LastModified", s3_xml_timestamp(last_modified))
+        .with_leaf("ETag", format!("\"{}\"", etag.trim().trim_matches('"')))
+        .to_xml(true)
+}
+
+/// `GetBucketPolicyStatus`: no stored policy means the bucket is not public.
+pub fn policy_status_xml(is_public: bool) -> Vec<u8> {
+    Element::new("PolicyStatus")
+        .with_leaf("IsPublic", if is_public { "true" } else { "false" })
+        .to_xml(true)
+}
+
+/// `GetObjectAttributes` subset from object HEAD (ETag / ObjectSize / StorageClass).
+pub fn get_object_attributes_xml(
+    requested: &str,
+    etag: &str,
+    object_size: &str,
+    storage_class: &str,
+) -> Vec<u8> {
+    let wanted: Vec<String> = requested
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let want = |name: &str| wanted.iter().any(|w| w == name);
+    let mut root = Element::new("GetObjectAttributesOutput");
+    if want("etag") {
+        root.push_leaf("ETag", etag.trim().trim_matches('"'));
+    }
+    if want("objectsize") {
+        root.push_leaf("ObjectSize", object_size);
+    }
+    if want("storageclass") {
+        root.push_leaf("StorageClass", storage_class);
+    }
+    root.to_xml(true)
 }
 
 /// One error entry in a multi-object delete result.

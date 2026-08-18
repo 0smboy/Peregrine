@@ -161,9 +161,10 @@ use crate::object_lock_worm::{
 };
 use crate::parse::{extract_bucket_and_key, s3_to_swift_path, validate_bucket_name};
 use crate::response::{
-    copy_object_result_xml, delete_object_response, delete_result_xml, list_all_my_buckets_xml,
-    put_object_response, s3_error_response, s3_xml_timestamp, xml_response, BucketInfo,
-    DeleteError, DeletedObject, ListBucketResult, ListBucketResultV2, Owner, S3Object,
+    copy_object_result_xml, copy_part_result_xml, delete_object_response, delete_result_xml,
+    get_object_attributes_xml, list_all_my_buckets_xml, policy_status_xml, put_object_response,
+    s3_error_response, s3_xml_timestamp, xml_response, BucketInfo, DeleteError, DeletedObject,
+    ListBucketResult, ListBucketResultV2, Owner, S3Object,
 };
 use crate::sigv2::{
     check_sigv2_time, is_sigv2_auth, parse_sigv2_auth, string_to_sign_for_request_v2, verify_sigv2,
@@ -454,6 +455,12 @@ const UNSUPPORTED_SUBRESOURCES: &[&str] = &[
     "inventory",
     "publicAccessBlock",
     "ownershipControls",
+    "intelligent-tiering",
+    "metadataConfiguration",
+    "metadataTableConfiguration",
+    "session",
+    "abac",
+    "annotation",
 ];
 
 /// Fixed client-facing messages for stable 501 responses (unit-tested).
@@ -758,6 +765,48 @@ fn apply_copy_source(req: &mut Request) {
             req.headers.remove("Content-Length");
         }
     }
+}
+
+fn percent_decode_component(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(value) = u8::from_str_radix(hex, 16) {
+                    out.push(value);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse `X-Amz-Copy-Source` as `(bucket, key, version_id)`.
+fn parse_copy_source(raw: &str) -> Option<(String, String, Option<String>)> {
+    let trimmed = raw.trim().trim_start_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (path, query) = trimmed.split_once('?').unwrap_or((trimmed, ""));
+    let decoded = percent_decode_component(path);
+    let slash = decoded.find('/')?;
+    let bucket = decoded[..slash].to_string();
+    let key = decoded[slash + 1..].to_string();
+    if bucket.is_empty() || key.is_empty() {
+        return None;
+    }
+    let version_id = query.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == "versionId" && !value.is_empty())
+            .then(|| percent_decode_component(value))
+    });
+    Some((bucket, key, version_id))
 }
 
 fn s3_to_swift_query(params: &[(String, String)], for_container_list: bool) -> String {
@@ -1729,9 +1778,16 @@ fn http_date_to_s3_approx(http_date: &str) -> String {
     s3_xml_timestamp(http_date)
 }
 
-fn translate_bucket_success(method: &str, resp: Response) -> Response {
+fn translate_bucket_success(method: &str, resp: Response, bucket: Option<&str>) -> Response {
     match method {
-        "PUT" => Response::new(200),
+        "PUT" => {
+            // Python BucketController.PUT: HTTP 200 + Location=/<container>.
+            let mut r = Response::new(200);
+            if let Some(b) = bucket {
+                r.headers.set("Location", format!("/{b}"));
+            }
+            r
+        }
         "DELETE" => Response::new(204),
         "HEAD" => {
             let mut r = Response::new(200);
@@ -1840,6 +1896,16 @@ impl S3Api {
         let params = req.params();
         if let Some(sub) = first_unsupported_subresource(&params) {
             return not_implemented_subresource(sub);
+        }
+        if req.headers.get("X-Amz-Rename-Source").is_some()
+            || req.headers.get("x-amz-rename-source").is_some()
+        {
+            return not_implemented_subresource("rename");
+        }
+        if req.headers.get("X-Amz-Request-Route").is_some()
+            || req.headers.get("x-amz-request-route").is_some()
+        {
+            return not_implemented_subresource("WriteGetObjectResponse");
         }
 
         let (bucket, key) =
@@ -2051,6 +2117,30 @@ impl S3Api {
         // ---- Tagging (bucket + object) ----
         if has_tagging && bucket.is_some() {
             return handle_tagging(req, &cred, bucket.as_deref().unwrap(), key.as_deref(), next);
+        }
+
+        // ---- GetBucketPolicyStatus (no stored policy → not public) ----
+        if bucket.is_some()
+            && key.is_none()
+            && params.iter().any(|(k, _)| k == "policyStatus")
+            && matches!(req.method.as_str(), "GET" | "HEAD")
+        {
+            return xml_ok(policy_status_xml(false));
+        }
+
+        // ---- GetObjectAttributes (HEAD-backed subset) ----
+        if bucket.is_some()
+            && key.is_some()
+            && params.iter().any(|(k, _)| k == "attributes")
+            && matches!(req.method.as_str(), "GET" | "HEAD")
+        {
+            return handle_object_attributes(
+                req,
+                &cred,
+                bucket.as_deref().unwrap(),
+                key.as_deref().unwrap(),
+                next,
+            );
         }
 
         // ---- Lifecycle (bucket) ----
@@ -2360,7 +2450,7 @@ impl S3Api {
                 return translate_list_objects(&body, bucket.as_deref().unwrap(), &params, &owner);
             }
             if (200..300).contains(&resp.status) {
-                return translate_bucket_success(&method, resp);
+                return translate_bucket_success(&method, resp, bucket.as_deref());
             }
             return map_swift_error(resp.status, bucket.as_deref(), None);
         }
@@ -2471,7 +2561,7 @@ impl S3Api {
                 return translate_list_objects(&body, &bucket, &params, &owner);
             }
             if (200..300).contains(&resp.status) {
-                return translate_bucket_success(&method, resp);
+                return translate_bucket_success(&method, resp, Some(&bucket));
             }
             return map_swift_error(resp.status, Some(&bucket), None);
         }
@@ -5353,6 +5443,11 @@ fn handle_mpu_part(
     req: Request,
     next: &NextFn,
 ) -> Response {
+    if req.headers.get("X-Amz-Copy-Source").is_some()
+        || req.headers.get("x-amz-copy-source").is_some()
+    {
+        return handle_mpu_part_copy(cred, bucket, key, upload_id, part_number, req, next);
+    }
     let segs = segments_container(bucket);
     let part_name = part_object_name(key, upload_id, part_number);
     let mut put = req;
@@ -5371,6 +5466,128 @@ fn handle_mpu_part(
         put_object_response(&etag)
     } else {
         map_swift_error(resp.status, Some(bucket), Some(key))
+    }
+}
+
+fn handle_mpu_part_copy(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: u32,
+    req: Request,
+    next: &NextFn,
+) -> Response {
+    let raw = match req
+        .headers
+        .get("X-Amz-Copy-Source")
+        .or_else(|| req.headers.get("x-amz-copy-source"))
+    {
+        Some(src) => src.to_string(),
+        None => return s3_error_response("InvalidArgument", Some("X-Amz-Copy-Source"), &[]),
+    };
+    let (src_bucket, src_key, _version_id) = match parse_copy_source(&raw) {
+        Some(parsed) => parsed,
+        None => {
+            return s3_error_response("InvalidArgument", Some("X-Amz-Copy-Source"), &[])
+        }
+    };
+    let range = req
+        .headers
+        .get("X-Amz-Copy-Source-Range")
+        .or_else(|| req.headers.get("x-amz-copy-source-range"))
+        .map(str::to_string);
+    let segs = segments_container(bucket);
+    let part_name = part_object_name(key, upload_id, part_number);
+    let mut put = make_swift_req(
+        "PUT",
+        &s3_to_swift_path(&cred.account, Some(&segs), Some(&part_name)),
+    );
+    if let Some(range) = range {
+        let mut get = make_swift_req(
+            "GET",
+            &s3_to_swift_path(&cred.account, Some(&src_bucket), Some(&src_key)),
+        );
+        let range_hdr = if range.to_ascii_lowercase().starts_with("bytes=") {
+            range
+        } else {
+            format!("bytes={range}")
+        };
+        get.headers.set("Range", range_hdr);
+        stamp_auth(&mut get, cred);
+        let src = next(get);
+        if !(200..300).contains(&src.status) {
+            return map_swift_error(src.status, Some(&src_bucket), Some(&src_key));
+        }
+        let data = match src.body.into_vec(MAX_AWS_CHUNKED_BODY) {
+            Ok(bytes) => bytes,
+            Err(_) => return s3_error_response("EntityTooLarge", None, &[]),
+        };
+        put.headers.set("Content-Length", data.len().to_string());
+        put.body = Body::from(data);
+    } else {
+        put.headers
+            .set("X-Copy-From", format!("{src_bucket}/{src_key}"));
+    }
+    stamp_auth(&mut put, cred);
+    let resp = next(put);
+    if !(200..300).contains(&resp.status) {
+        return map_swift_error(resp.status, Some(bucket), Some(key));
+    }
+    let etag = resp
+        .headers
+        .get("ETag")
+        .map(|e| e.trim().trim_matches('"').to_string())
+        .unwrap_or_default();
+    let lm = resp
+        .headers
+        .get("Last-Modified")
+        .unwrap_or("Thu, 01 Jan 1970 00:00:00 GMT")
+        .to_string();
+    xml_response(200, copy_part_result_xml(&http_date_to_s3_approx(&lm), &etag))
+}
+
+fn handle_object_attributes(
+    req: Request,
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    next: &NextFn,
+) -> Response {
+    let requested = req
+        .headers
+        .get("X-Amz-Object-Attributes")
+        .or_else(|| req.headers.get("x-amz-object-attributes"))
+        .unwrap_or("")
+        .to_string();
+    if requested.trim().is_empty() {
+        return s3_error_response(
+            "InvalidRequest",
+            Some("x-amz-object-attributes is required"),
+            &[],
+        );
+    }
+    match control_head_object(cred, bucket, key, next) {
+        Ok(ObjectHead::Present(head)) => {
+            let etag = head.headers.get("ETag").unwrap_or("").to_string();
+            let size = head
+                .headers
+                .get("Content-Length")
+                .unwrap_or("0")
+                .to_string();
+            let storage = head
+                .headers
+                .get("X-Amz-Storage-Class")
+                .or_else(|| head.headers.get("X-Object-Meta-Storage-Class"))
+                .unwrap_or("STANDARD")
+                .to_string();
+            xml_response(
+                200,
+                get_object_attributes_xml(&requested, &etag, &size, &storage),
+            )
+        }
+        Ok(ObjectHead::Missing) => s3_error_response("NoSuchKey", None, &[]),
+        Err(resp) => resp,
     }
 }
 
@@ -6277,6 +6494,255 @@ mod tests {
         );
         assert!(body.contains("<IsTruncated>false</IsTruncated>"));
         assert!(body.contains("<Contents>"));
+    }
+
+    #[test]
+    fn list_objects_trailing_slash_is_not_empty_object_get() {
+        // Live miss 2026-08-18: s3cmd ls s3://mytest → GET /mytest/ → 204
+        // empty body (object path). Trailing slash must list.
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/mybucket/", ""), "testing");
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.path, "/v1/AUTH_test/mybucket");
+            assert!(
+                r.query_string.contains("format=json"),
+                "list query missing: {}",
+                r.query_string
+            );
+            Response::with_body(200, br#"[]"#.to_vec())
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(
+            body.contains("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"),
+            "missing list xml: {body}"
+        );
+    }
+
+    #[test]
+    fn head_bucket_trailing_slash_is_not_empty_object_head() {
+        // HEAD /mybucket/ is HeadBucket, not HeadObject "".
+        // Object HEAD of a Swift 204 would stay 204; bucket HEAD is 200.
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("HEAD", "/mybucket/", ""), "testing");
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.method, "HEAD");
+            assert_eq!(r.path, "/v1/AUTH_test/mybucket");
+            assert_ne!(
+                r.path, "/v1/AUTH_test/mybucket/",
+                "empty-key object HEAD path"
+            );
+            Response::new(204)
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200, "HeadBucket must be 200, not object 204");
+    }
+
+    #[test]
+    fn put_bucket_trailing_slash_is_create_bucket() {
+        // PUT /newbucket/ is CreateBucket (200 + Location), not object PUT.
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("PUT", "/newbucket/", ""), "testing");
+        let hops = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let hops_c = hops.clone();
+        let next: NextFn = Arc::new(move |r| {
+            hops_c
+                .lock()
+                .unwrap()
+                .push((r.method.clone(), r.path.clone()));
+            assert_eq!(r.method, "PUT");
+            assert_eq!(r.path, "/v1/AUTH_test/newbucket");
+            assert_ne!(r.path, "/v1/AUTH_test/newbucket/");
+            Response::new(201)
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("Location"), Some("/newbucket"));
+        let hops = hops.lock().unwrap().clone();
+        assert!(
+            hops.iter()
+                .any(|(m, p)| m == "PUT" && p == "/v1/AUTH_test/newbucket"),
+            "missing container PUT: {hops:?}"
+        );
+        assert!(
+            hops.iter().all(|(_, p)| p != "/v1/AUTH_test/newbucket/"),
+            "object PUT path: {hops:?}"
+        );
+    }
+
+    #[test]
+    fn list_objects_v2_trailing_slash_lists() {
+        // GET /mybucket/?list-type=2 must list, not GetObject "".
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/mybucket/", "list-type=2"), "testing");
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.path, "/v1/AUTH_test/mybucket");
+            assert_ne!(r.path, "/v1/AUTH_test/mybucket/");
+            assert!(
+                r.query_string.contains("format=json"),
+                "list query missing: {}",
+                r.query_string
+            );
+            Response::with_body(200, br#"[]"#.to_vec())
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(
+            body.contains("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"),
+            "missing list xml: {body}"
+        );
+        assert!(body.contains("<KeyCount>0</KeyCount>"), "v2 KeyCount: {body}");
+    }
+
+    #[test]
+    fn unsupported_subresources_each_get_is_501_xml() {
+        // Empty 501 body was a live miss: clients need Code=NotImplemented XML.
+        let api = S3Api::new(cred_map());
+        for name in UNSUPPORTED_SUBRESOURCES {
+            let req = sign_request(base_s3_req("GET", "/mybucket", name), "testing");
+            let next: NextFn = Arc::new({
+                let name = (*name).to_string();
+                move |_| panic!("unsupported {name} must not fall through")
+            });
+            let resp = api.handle(req, &next);
+            assert_eq!(resp.status, 501, "{name}");
+            assert_eq!(
+                resp.headers.get("Content-Type"),
+                Some("application/xml"),
+                "{name}"
+            );
+            let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+            assert!(!body.is_empty(), "{name} empty 501 body");
+            assert!(
+                body.contains("<Code>NotImplemented</Code>"),
+                "{name} body={body}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_key_get_must_not_use_object_swift_path() {
+        // FAILS if empty key is routed through translate_object_get_head:
+        // that concatenates key="" → /v1/AUTH_test/mybucket/ and returns
+        // 204 empty (s3cmd ls GET /bucket/ bug).
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/mybucket/", ""), "testing");
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(
+                r.path, "/v1/AUTH_test/mybucket",
+                "empty key must map to container, not {}",
+                r.path
+            );
+            assert_ne!(
+                r.path, "/v1/AUTH_test/mybucket/",
+                "translate_object_get_head empty-key path"
+            );
+            assert!(
+                r.query_string.contains("format=json"),
+                "object GET would omit format=json: {}",
+                r.query_string
+            );
+            Response::with_body(200, br#"[]"#.to_vec())
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(!body.is_empty(), "204-empty object GET regression");
+        assert!(
+            body.contains("<ListBucketResult"),
+            "expected list xml, got {body}"
+        );
+    }
+
+    #[test]
+    fn get_bucket_policy_status_is_not_public() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/mybucket", "policyStatus"), "testing");
+        let next: NextFn = Arc::new(|_| panic!("policyStatus must not fall through"));
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<PolicyStatus"), "{body}");
+        assert!(body.contains("<IsPublic>false</IsPublic>"), "{body}");
+    }
+
+    #[test]
+    fn get_object_attributes_from_head() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("GET", "/mybucket/probe.txt", "attributes");
+        req.headers
+            .set("x-amz-object-attributes", "ETag,ObjectSize,StorageClass");
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.method, "HEAD");
+            assert_eq!(r.path, "/v1/AUTH_test/mybucket/probe.txt");
+            let mut resp = Response::new(200);
+            resp.headers.set("ETag", "\"abc\"");
+            resp.headers.set("Content-Length", "12");
+            resp
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<GetObjectAttributesOutput"), "{body}");
+        assert!(body.contains("<ETag>abc</ETag>"), "{body}");
+        assert!(body.contains("<ObjectSize>12</ObjectSize>"), "{body}");
+        assert!(
+            body.contains("<StorageClass>STANDARD</StorageClass>"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn upload_part_copy_returns_copy_part_result() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req(
+            "PUT",
+            "/mybucket/dest.bin",
+            "partNumber=1&uploadId=deadbeefcafe",
+        );
+        req.headers.set("X-Amz-Copy-Source", "/mybucket/src.bin");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.method, "PUT");
+            assert!(
+                r.path.starts_with("/v1/AUTH_test/mybucket+segments/dest.bin/"),
+                "part path {}",
+                r.path
+            );
+            assert_eq!(r.headers.get("X-Copy-From"), Some("mybucket/src.bin"));
+            let mut resp = Response::new(201);
+            resp.headers.set("ETag", "partcopy1");
+            resp.headers
+                .set("Last-Modified", "Thu, 01 Jan 1970 00:00:00 GMT");
+            resp
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<CopyPartResult"), "{body}");
+        assert!(body.contains("partcopy1"), "{body}");
+        assert!(!body.contains("<CopyObjectResult>"), "{body}");
+    }
+
+    #[test]
+    fn rename_object_header_is_honest_501() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket/new-name.txt", "");
+        req.headers
+            .set("X-Amz-Rename-Source", "/mybucket/old-name.txt");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|_| panic!("rename must not fall through"));
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 501);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>NotImplemented</Code>"), "{body}");
     }
 
     #[test]
