@@ -48,11 +48,16 @@
 //! * **tagging** GET/PUT/DELETE on bucket and object
 //! * **lifecycle** GET/PUT/DELETE — raw LifecycleConfiguration XML round-trip
 //! * **lifecycle execution** — object PUT stamps Swift `X-Delete-At` from
-//!   Enabled Expiration Days/Date (+ Prefix); Transition stamps
+//!   Enabled Expiration Days/Date (+ Prefix); GET/HEAD/PUT surface AWS
+//!   `x-amz-expiration` from that stamp; Transition stamps
 //!   `X-Object-Meta-S3-Storage-Class` + `X-Object-Sysmeta-S3-Transition-At`
 //!   (**metadata only**, no tiering backend — LAB-HARD-GREEN); MPU init stamps
 //!   `X-Delete-At` on the upload marker from AbortIncompleteMultipartUpload
 //!   DaysAfterInitiation; see [`lifecycle_exec`]
+//! * **website hosting** — stored `WebsiteConfiguration`; GET/HEAD on a
+//!   website endpoint (`Host` contains `s3-website` or `x-amz-website-endpoint`)
+//!   serves IndexDocument / ErrorDocument. REST ListObjects on the normal
+//!   S3 host is unchanged; see [`website`]
 //! * **object-lock** GET/PUT — raw ObjectLockConfiguration XML round-trip
 //! * **legal-hold** / **retention** object GET/PUT + WORM on DELETE/overwrite
 //!   (see [`object_lock_worm`])
@@ -123,6 +128,7 @@ pub mod select;
 pub mod sigv2;
 pub mod sigv4;
 pub mod versioning_store;
+pub mod website;
 pub mod xml;
 
 pub use cold_tier::{

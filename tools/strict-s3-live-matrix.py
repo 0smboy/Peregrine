@@ -182,6 +182,19 @@ VERSIONING_ENABLED_XML = (
 )
 OBJECT_BODY = b"s3-matrix-probe-object\n"
 COPY_BODY = b"s3-matrix-copy-source\n"
+INDEX_HTML = b"<html>matrix-index</html>\n"
+ERROR_HTML = b"<html>matrix-error</html>\n"
+WEBSITE_HOSTING_XML = (
+    b"<WebsiteConfiguration>"
+    b"<IndexDocument><Suffix>index.html</Suffix></IndexDocument>"
+    b"<ErrorDocument><Key>error.html</Key></ErrorDocument>"
+    b"</WebsiteConfiguration>"
+)
+LIFECYCLE_XML = (
+    b"<LifecycleConfiguration><Rule><ID>matrix-expire</ID>"
+    b"<Prefix>expire-</Prefix><Status>Enabled</Status>"
+    b"<Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>"
+)
 TAG_XML = (
     b'<Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><TagSet>'
     b"<Tag><Key>matrix</Key><Value>w0</Value></Tag></TagSet></Tagging>"
@@ -212,7 +225,13 @@ def _declared_cases() -> Tuple[str, ...]:
         "get-bucket-location-slash",
         "multi-delete",
         "mpu-initiate",
+        "list-parts",
+        "list-multipart-uploads",
         "mpu-abort",
+        "mpu-initiate-complete",
+        "upload-part",
+        "complete-multipart",
+        "get-mpu-object",
         "get-bucket-versioning",
         "get-bucket-versioning-slash",
         "put-bucket-versioning",
@@ -228,8 +247,23 @@ def _declared_cases() -> Tuple[str, ...]:
         "get-bucket-cors-slash",
         "restore-standard",
         "put-bucket-tagging",
+        "get-bucket-tagging-after-put",
+        "delete-bucket-tagging",
         "put-object-tagging",
+        "get-object-tagging",
         "delete-object-tagging",
+        "put-lifecycle",
+        "get-lifecycle",
+        "put-lifecycle-object",
+        "head-lifecycle-expiration",
+        "get-lifecycle-expiration",
+        "delete-lifecycle",
+        "get-lifecycle-after-delete",
+        "put-website-index",
+        "put-website-error",
+        "put-website-hosting",
+        "website-get-index",
+        "website-get-error",
         "put-object-acl",
         "upload-part-copy",
         "get-bucket-policy-status",
@@ -591,6 +625,7 @@ class Runner:
         self.owned: List[str] = []
         self.objects: Dict[str, List[str]] = {}
         self.upload_id: Optional[str] = None
+        self.part_etag: Optional[str] = None
 
     def run_case(self, name: str, fn: Callable[[Case], None]) -> Case:
         case = Case(name)
@@ -793,7 +828,10 @@ def _empty_bucket(target: Target, bucket: str) -> None:
         if root is not None:
             for child in root.iter():
                 if _tag(child) == "Key" and child.text:
-                    target.request("DELETE", _path(bucket, child.text))
+                    gone = target.request("DELETE", _path(bucket, child.text))
+                    if gone.status == 412:
+                        target.request("PUT", _path(bucket, child.text), (), b"x")
+                        target.request("DELETE", _path(bucket, child.text))
                     remaining += 1
         if remaining == 0:
             return
@@ -855,9 +893,9 @@ def _run_matrix(runner: Runner) -> None:
     def get_range(case: Case) -> None:
         snap = runner.req(case, "GET", _path(main, "probe.txt"), (), b"",
                           {"Range": "bytes=0-8"})
-        runner.expect_status(case, snap, (206, 200))
-        if snap.body and not OBJECT_BODY.startswith(snap.body):
-            case.issue("range body is not a prefix of the object")
+        runner.expect_status(case, snap, (206,))
+        if snap.body != OBJECT_BODY[:9]:
+            case.issue("range body is not bytes 0-8 of the object")
 
     def copy_object(case: Case) -> None:
         put = runner.req(case, "PUT", _path(main, "copy-src.txt"), (), COPY_BODY)
@@ -919,6 +957,59 @@ def _run_matrix(runner: Runner) -> None:
                           (("uploadId", runner.upload_id),))
         runner.expect_status(case, snap, (204, 200))
         runner.upload_id = None
+
+    def list_parts(case: Case) -> None:
+        if not runner.upload_id:
+            case.issue("list-parts missing upload_id")
+            return
+        snap = runner.req(case, "GET", _path(main, "mpu.bin"),
+                          (("uploadId", runner.upload_id),))
+        runner.expect_2xx_xml(case, snap, "ListPartsResult")
+
+    def list_multipart_uploads(case: Case) -> None:
+        snap = runner.req(case, "GET", _path(main), (("uploads", ""),))
+        runner.expect_2xx_xml(case, snap, "ListMultipartUploadsResult")
+
+    def upload_part(case: Case) -> None:
+        if not runner.upload_id:
+            case.issue("upload-part missing upload_id")
+            return
+        snap = runner.req(
+            case, "PUT", _path(main, "mpu.bin"),
+            (("partNumber", "1"), ("uploadId", runner.upload_id)),
+            OBJECT_BODY, {"Content-Type": "application/octet-stream"})
+        runner.expect_status(case, snap, (200,))
+        runner.part_etag = snap.first("etag") or '"part1"'
+
+    def complete_multipart(case: Case) -> None:
+        if not runner.upload_id:
+            case.issue("complete-multipart missing upload_id")
+            return
+        etag = runner.part_etag or '"part1"'
+        body = (
+            b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"
+            + etag.encode("ascii", "replace")
+            + b"</ETag></Part></CompleteMultipartUpload>"
+        )
+        snap = runner.req(case, "POST", _path(main, "mpu.bin"),
+                          (("uploadId", runner.upload_id),), body,
+                          {"Content-Type": "application/xml"})
+        runner.expect_2xx_xml(case, snap, "CompleteMultipartUploadResult")
+        if case.passed:
+            runner.objects.setdefault(main, []).append("mpu.bin")
+            runner.upload_id = None
+
+    def get_mpu_object(case: Case) -> None:
+        snap = runner.req(case, "GET", _path(main, "mpu.bin"))
+        runner.expect_status(case, snap, (200,))
+        if snap.body != OBJECT_BODY:
+            case.issue("completed MPU body mismatch")
+        # W5d: unversioned object DELETE sends multipart-manifest=delete.
+        dele = runner.req(case, "DELETE", _path(main, "mpu.bin"))
+        if dele.status not in (200, 204):
+            case.issue("completed MPU SLO delete failed status={}".format(dele.status))
+        elif "mpu.bin" in runner.objects.get(main, []):
+            runner.objects[main].remove("mpu.bin")
 
     def get_versioning(trailing: bool):
         def fn(case: Case) -> None:
@@ -984,11 +1075,103 @@ def _run_matrix(runner: Runner) -> None:
                           {"Content-Type": "application/xml"})
         runner.expect_status(case, snap, (200,))
 
+    def get_bucket_tagging_after_put(case: Case) -> None:
+        snap = runner.req(case, "GET", _path(main), (("tagging", ""),))
+        runner.expect_2xx_xml(case, snap, "Tagging")
+        if b"<Key>matrix</Key>" not in snap.body:
+            case.issue("bucket tagging missing matrix key")
+
+    def delete_bucket_tagging(case: Case) -> None:
+        snap = runner.req(case, "DELETE", _path(main), (("tagging", ""),))
+        runner.expect_status(case, snap, (204, 200))
+
     def put_object_tagging(case: Case) -> None:
         snap = runner.req(case, "PUT", _path(main, "probe.txt"),
                           (("tagging", ""),), TAG_XML,
                           {"Content-Type": "application/xml"})
         runner.expect_status(case, snap, (200,))
+
+    def get_object_tagging(case: Case) -> None:
+        snap = runner.req(case, "GET", _path(main, "probe.txt"), (("tagging", ""),))
+        runner.expect_2xx_xml(case, snap, "Tagging")
+        if b"<Key>matrix</Key>" not in snap.body:
+            case.issue("object tagging missing matrix key")
+
+    def put_lifecycle(case: Case) -> None:
+        snap = runner.req(case, "PUT", _path(main), (("lifecycle", ""),),
+                          LIFECYCLE_XML, {"Content-Type": "application/xml"})
+        runner.expect_status(case, snap, (200,))
+
+    def get_lifecycle(case: Case) -> None:
+        snap = runner.req(case, "GET", _path(main), (("lifecycle", ""),))
+        runner.expect_2xx_xml(case, snap, "LifecycleConfiguration")
+
+    def put_lifecycle_object(case: Case) -> None:
+        snap = runner.req(case, "PUT", _path(main, "expire-me.txt"), (),
+                          OBJECT_BODY, {"Content-Type": "text/plain"})
+        runner.expect_status(case, snap, (200,))
+        if case.passed:
+            runner.objects.setdefault(main, []).append("expire-me.txt")
+        exp = snap.first("x-amz-expiration") or ""
+        if "expiry-date=" not in exp:
+            case.issue("PUT missing x-amz-expiration")
+
+    def head_lifecycle_expiration(case: Case) -> None:
+        snap = runner.req(case, "HEAD", _path(main, "expire-me.txt"))
+        runner.expect_status(case, snap, (200,))
+        exp = snap.first("x-amz-expiration") or ""
+        if "expiry-date=" not in exp:
+            case.issue("HEAD missing x-amz-expiration")
+
+    def get_lifecycle_expiration(case: Case) -> None:
+        snap = runner.req(case, "GET", _path(main, "expire-me.txt"))
+        runner.expect_status(case, snap, (200,))
+        if snap.body != OBJECT_BODY:
+            case.issue("lifecycle object body mismatch")
+        exp = snap.first("x-amz-expiration") or ""
+        if "expiry-date=" not in exp:
+            case.issue("GET missing x-amz-expiration")
+
+    def delete_lifecycle(case: Case) -> None:
+        snap = runner.req(case, "DELETE", _path(main), (("lifecycle", ""),))
+        runner.expect_status(case, snap, (204, 200))
+
+    def get_lifecycle_after_delete(case: Case) -> None:
+        snap = runner.req(case, "GET", _path(main), (("lifecycle", ""),))
+        runner.expect_error(case, snap, 404, "NoSuchLifecycleConfiguration")
+
+    def put_website_index(case: Case) -> None:
+        snap = runner.req(case, "PUT", _path(main, "index.html"), (), INDEX_HTML,
+                          {"Content-Type": "text/html"})
+        runner.expect_status(case, snap, (200,))
+        if case.passed:
+            runner.objects.setdefault(main, []).append("index.html")
+
+    def put_website_error(case: Case) -> None:
+        snap = runner.req(case, "PUT", _path(main, "error.html"), (), ERROR_HTML,
+                          {"Content-Type": "text/html"})
+        runner.expect_status(case, snap, (200,))
+        if case.passed:
+            runner.objects.setdefault(main, []).append("error.html")
+
+    def put_website_hosting(case: Case) -> None:
+        snap = runner.req(case, "PUT", _path(main), (("website", ""),),
+                          WEBSITE_HOSTING_XML, {"Content-Type": "application/xml"})
+        runner.expect_status(case, snap, (200,))
+
+    def website_get_index(case: Case) -> None:
+        snap = runner.req(case, "GET", _path(main, trailing_slash=True), (),
+                          b"", {"x-amz-website-endpoint": "1"})
+        runner.expect_status(case, snap, (200,))
+        if snap.body != INDEX_HTML:
+            case.issue("website index body mismatch")
+
+    def website_get_error(case: Case) -> None:
+        snap = runner.req(case, "GET", _path(main, "no-such-page"), (),
+                          b"", {"x-amz-website-endpoint": "1"})
+        runner.expect_status(case, snap, (404,))
+        if ERROR_HTML not in snap.body:
+            case.issue("website error document missing")
 
     def delete_object_tagging(case: Case) -> None:
         snap = runner.req(case, "DELETE", _path(main, "probe.txt"),
@@ -1022,6 +1205,10 @@ def _run_matrix(runner: Runner) -> None:
             case, "GET", _path(main, "probe.txt"), (("attributes", ""),),
             b"", {"x-amz-object-attributes": "ETag,ObjectSize,StorageClass"})
         runner.expect_2xx_xml(case, snap, "GetObjectAttributesOutput")
+        if b"<ETag>" not in snap.body:
+            case.issue("attributes missing ETag")
+        if b"<ObjectSize>" not in snap.body:
+            case.issue("attributes missing ObjectSize")
 
     def rename_object(case: Case) -> None:
         snap = runner.req(
@@ -1076,6 +1263,8 @@ def _run_matrix(runner: Runner) -> None:
             case.issue("select missing event stream")
         if not snap.body:
             case.issue("select empty body")
+        if OBJECT_BODY.strip() not in snap.body and b"s3-matrix-probe-object" not in snap.body:
+            case.issue("select-star missing object bytes")
 
     def select_limit(case: Case) -> None:
         snap = runner.req(case, "POST", _path(main, "probe.txt"),
@@ -1284,7 +1473,25 @@ def _run_matrix(runner: Runner) -> None:
     runner.run_case("multi-delete", multi_delete)
     runner.run_case("mpu-initiate", mpu_init)
     runner.run_case("upload-part-copy", upload_part_copy)
+    runner.run_case("list-parts", list_parts)
+    runner.run_case("list-multipart-uploads", list_multipart_uploads)
     runner.run_case("mpu-abort", mpu_abort)
+    runner.run_case("mpu-initiate-complete", mpu_init)
+    runner.run_case("upload-part", upload_part)
+    runner.run_case("complete-multipart", complete_multipart)
+    runner.run_case("get-mpu-object", get_mpu_object)
+    runner.run_case("put-lifecycle", put_lifecycle)
+    runner.run_case("get-lifecycle", get_lifecycle)
+    runner.run_case("put-lifecycle-object", put_lifecycle_object)
+    runner.run_case("head-lifecycle-expiration", head_lifecycle_expiration)
+    runner.run_case("get-lifecycle-expiration", get_lifecycle_expiration)
+    runner.run_case("delete-lifecycle", delete_lifecycle)
+    runner.run_case("get-lifecycle-after-delete", get_lifecycle_after_delete)
+    runner.run_case("put-website-index", put_website_index)
+    runner.run_case("put-website-error", put_website_error)
+    runner.run_case("put-website-hosting", put_website_hosting)
+    runner.run_case("website-get-index", website_get_index)
+    runner.run_case("website-get-error", website_get_error)
     runner.run_case("get-bucket-versioning", get_versioning(False))
     runner.run_case("get-bucket-versioning-slash", get_versioning(True))
     runner.run_case("put-bucket-versioning", put_versioning(False))
@@ -1300,7 +1507,10 @@ def _run_matrix(runner: Runner) -> None:
     runner.run_case("get-bucket-cors-slash", get_cors(True))
     runner.run_case("restore-standard", restore_standard)
     runner.run_case("put-bucket-tagging", put_bucket_tagging)
+    runner.run_case("get-bucket-tagging-after-put", get_bucket_tagging_after_put)
+    runner.run_case("delete-bucket-tagging", delete_bucket_tagging)
     runner.run_case("put-object-tagging", put_object_tagging)
+    runner.run_case("get-object-tagging", get_object_tagging)
     runner.run_case("delete-object-tagging", delete_object_tagging)
     runner.run_case("put-object-acl", put_object_acl)
     runner.run_case("get-bucket-policy-status", policy_status(False))
@@ -1478,6 +1688,23 @@ class _MockClient:
         if self.mode == "empty-xml":
             return Snapshot(200, {"content-type": ("application/xml",)}, b"")
         hdrs = {k.lower(): v for k, v in headers.items()}
+        if "x-amz-website-endpoint" in hdrs and method in ("GET", "HEAD"):
+            if path.endswith("/no-such-page"):
+                return Snapshot(404, {"content-type": ("text/html",)}, ERROR_HTML)
+            if path.endswith("/") or path.endswith("/index.html"):
+                return Snapshot(200, {"content-type": ("text/html",)}, INDEX_HTML)
+        if path.endswith("/expire-me.txt"):
+            exp = {
+                "x-amz-expiration": (
+                    'expiry-date="Tue, 14 Nov 2023 22:13:20 GMT", rule-id="Lifecycle"',
+                ),
+            }
+            if method == "PUT":
+                return Snapshot(200, exp, b"")
+            if method == "HEAD":
+                return Snapshot(200, exp, b"")
+            if method == "GET":
+                return Snapshot(200, exp, OBJECT_BODY)
         if "x-amz-request-route" in hdrs:
             return Snapshot(501, {"content-type": ("application/xml",)},
                             b"<Error><Code>NotImplemented</Code></Error>")
@@ -1521,6 +1748,34 @@ class _MockClient:
                     200, {"content-type": ("application/xml",)},
                     "<{}/>".format(empty_marker).encode("ascii"),
                 )
+        if q0 == "tagging":
+            key = (path.rstrip("/") or "/", "tagging")
+            if method == "PUT":
+                self.stored[key] = body
+                return Snapshot(200, {}, b"")
+            if method == "DELETE":
+                self.stored.pop(key, None)
+                return Snapshot(204, {}, b"")
+            if method == "GET":
+                if key in self.stored:
+                    return Snapshot(200, {"content-type": ("application/xml",)},
+                                    self.stored[key])
+                return Snapshot(404, {"content-type": ("application/xml",)},
+                                b"<Error><Code>NoSuchTagSet</Code></Error>")
+        if q0 == "lifecycle":
+            key = (path.rstrip("/") or "/", "lifecycle")
+            if method == "PUT":
+                self.stored[key] = body
+                return Snapshot(200, {}, b"")
+            if method == "DELETE":
+                self.stored.pop(key, None)
+                return Snapshot(204, {}, b"")
+            if method == "GET":
+                if key in self.stored:
+                    return Snapshot(200, {"content-type": ("application/xml",)},
+                                    self.stored[key])
+                return Snapshot(404, {"content-type": ("application/xml",)},
+                                b"<Error><Code>NoSuchLifecycleConfiguration</Code></Error>")
         if q0 == "session":
             return Snapshot(200, {"content-type": ("application/xml",)},
                             b"<CreateSessionResult><Credentials><AccessKeyId>ak"
@@ -1556,7 +1811,7 @@ class _MockClient:
             if b"SELECT *" in upper or b"SELECT _" in upper:
                 return Snapshot(
                     200, {"content-type": ("application/vnd.amazon.eventstream",)},
-                    b"\x00\x00\x00\x20eventstream red blue",
+                    b"\x00\x00\x00\x20eventstream " + OBJECT_BODY + b" red blue",
                 )
             return Snapshot(400, {"content-type": ("application/xml",)},
                             b"<Error><Code>InvalidRequest</Code></Error>")
@@ -1588,7 +1843,19 @@ class _MockClient:
             if "x-amz-copy-source" in hdrs:
                 return Snapshot(200, {"content-type": ("application/xml",)},
                                 b"<CopyPartResult><ETag>\"p\"</ETag></CopyPartResult>")
-            return Snapshot(200, {}, b"")
+            return Snapshot(200, {"etag": ('"part1"',)}, b"")
+        if method == "GET" and "uploadId" in query:
+            return Snapshot(200, {"content-type": ("application/xml",)},
+                            b"<ListPartsResult><UploadId>u1</UploadId></ListPartsResult>")
+        if method == "GET" and q0 == "uploads":
+            return Snapshot(200, {"content-type": ("application/xml",)},
+                            b"<ListMultipartUploadsResult><Uploads/></ListMultipartUploadsResult>")
+        if method == "POST" and "uploadId" in query:
+            return Snapshot(200, {"content-type": ("application/xml",)},
+                            b"<CompleteMultipartUploadResult><ETag>\"x\"</ETag>"
+                            b"</CompleteMultipartUploadResult>")
+        if method == "GET" and path.endswith("/mpu.bin"):
+            return Snapshot(200, {}, OBJECT_BODY)
         if method == "PUT" and "tagging" in query:
             return Snapshot(200, {}, b"")
         if method == "PUT" and "acl" in query:
@@ -1687,6 +1954,15 @@ def _selftest_body() -> None:
     _expect("put-cfg-metadataConfiguration" in ALL_CASES, "stored metadata PUT missing")
     _expect("list-directory-buckets" in ALL_CASES, "ListDirectoryBuckets missing")
     _expect("put-cfg-website" in ALL_CASES, "stored website PUT missing")
+    _expect("complete-multipart" in ALL_CASES, "CompleteMultipartUpload missing")
+    _expect("upload-part" in ALL_CASES, "UploadPart missing")
+    _expect("list-parts" in ALL_CASES, "ListParts missing")
+    _expect("list-multipart-uploads" in ALL_CASES, "ListMultipartUploads missing")
+    _expect("put-lifecycle" in ALL_CASES, "PutBucketLifecycle missing")
+    _expect("head-lifecycle-expiration" in ALL_CASES, "lifecycle expiration missing")
+    _expect("get-object-tagging" in ALL_CASES, "GetObjectTagging missing")
+    _expect("website-get-index" in ALL_CASES, "website index missing")
+    _expect("website-get-error" in ALL_CASES, "website error missing")
     _expect("put-cfg-policy" in ALL_CASES, "stored policy PUT missing")
     _expect("get-unsupported-policy" not in ALL_CASES, "policy must not stay 501")
     for sub in UNSUPPORTED_SUBRESOURCES:

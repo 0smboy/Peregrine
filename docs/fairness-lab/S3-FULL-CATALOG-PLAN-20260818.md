@@ -66,10 +66,15 @@ Select 收紧为 `SELECT * FROM S3Object` 加可选 `LIMIT n`。投影和 WHERE 
 
 CSV Select：`*` / `_N` 投影、AND 等值 WHERE、LIMIT。JOIN/OR/LIKE/JSON 仍 400。现场矩阵 **171/171 gate=PASS**。纸面仍 **115 LIVE / 1 HONEST_501**。
 
+### W5 — 已完成（2026-08-18）
+
+Lifecycle PUT 打 `X-Delete-At`，GET/HEAD/PUT 回 `x-amz-expiration`。Website 在 `s3-website` Host 或 `x-amz-website-endpoint` 上提供 Index/Error。完成的 MPU（SLO）DELETE：先普通删，412 再 `multipart-manifest=delete`。现场矩阵 **192/192 gate=PASS**（W5e）。纸面仍 **115 LIVE / 1 HONEST_501**。
+
 ### 剩余
 
 - WriteGetObjectResponse 保持 Object Lambda 501（无 Lambda 运行时）。
 - 桶配置 / torrent / session / rename 仍是子集，不是完整 AWS 引擎。
+- Lifecycle 不是完整 AWS 引擎（无 tag/And 过滤）。Website 不是独立 DNS 站点。
 
 ## 5. 现场约束（所有 agent 必须遵守）
 

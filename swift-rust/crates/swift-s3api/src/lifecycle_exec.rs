@@ -505,6 +505,55 @@ pub fn apply_lifecycle_on_put_from_container(
     }
 }
 
+/// AWS `x-amz-expiration` value from a Swift `X-Delete-At` unix timestamp.
+pub fn amz_expiration_header(delete_at_unix: i64, rule_id: &str) -> String {
+    format!(
+        "expiry-date=\"{}\", rule-id=\"{}\"",
+        unix_to_http_date(delete_at_unix),
+        rule_id
+    )
+}
+
+/// Parse `X-Delete-At` and emit `x-amz-expiration`, or `None` if unusable.
+pub fn amz_expiration_from_delete_at(value: &str) -> Option<String> {
+    let unix: i64 = value.trim().parse().ok()?;
+    if unix <= 0 {
+        return None;
+    }
+    Some(amz_expiration_header(unix, "Lifecycle"))
+}
+
+/// RFC 7231 IMF-fixdate in UTC (`Thu, 01 Jan 1970 00:00:00 GMT`).
+fn unix_to_http_date(unix: i64) -> String {
+    let ts = unix.max(0) as u64;
+    let days = ts / 86_400;
+    let secs = ts % 86_400;
+    let hour = secs / 3600;
+    let min = (secs % 3600) / 60;
+    let sec = secs % 60;
+    let (year, month, day) = civil_from_unix_days(days as i64);
+    let wday = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][(days % 7) as usize];
+    let mon = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ][(month - 1) as usize];
+    format!("{wday}, {day:02} {mon} {year} {hour:02}:{min:02}:{sec:02} GMT")
+}
+
+/// Howard Hinnant civil-from-days; `z` is days since 1970-01-01.
+fn civil_from_unix_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = (y + if m <= 2 { 1 } else { 0 }) as i32;
+    (y, m, d)
+}
+
 /// Apply AbortIncomplete from container HEAD onto MPU marker headers.
 pub fn apply_abort_incomplete_from_container(
     marker_headers: &mut HeaderKeyDict,
@@ -757,6 +806,20 @@ mod tests {
         apply_restore_days(&mut h, 1, 200);
         assert!(!transition_blocks_get(&h, 200));
         assert!(transition_blocks_get(&h, 200 + 86_400 + 1));
+    }
+
+    #[test]
+    fn amz_expiration_epoch_and_parse() {
+        assert_eq!(
+            amz_expiration_header(0, "Lifecycle"),
+            "expiry-date=\"Thu, 01 Jan 1970 00:00:00 GMT\", rule-id=\"Lifecycle\""
+        );
+        assert_eq!(
+            amz_expiration_from_delete_at("1700000000").unwrap(),
+            "expiry-date=\"Tue, 14 Nov 2023 22:13:20 GMT\", rule-id=\"Lifecycle\""
+        );
+        assert!(amz_expiration_from_delete_at("0").is_none());
+        assert!(amz_expiration_from_delete_at("x").is_none());
     }
 
     #[test]

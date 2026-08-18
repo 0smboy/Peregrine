@@ -140,9 +140,10 @@ use crate::cold_tier::{
 };
 use crate::delete::parse_multi_delete_body;
 use crate::lifecycle_exec::{
-    apply_abort_incomplete_from_container, apply_due_transition_on_headers,
-    apply_lifecycle_on_put_from_container, apply_restore_days, is_cold_storage_class,
-    transition_blocks_get, META_STORAGE_CLASS, SYS_RESTORE_UNTIL, SYS_TRANSITIONED,
+    amz_expiration_from_delete_at, apply_abort_incomplete_from_container,
+    apply_due_transition_on_headers, apply_lifecycle_on_put_from_container, apply_restore_days,
+    is_cold_storage_class, transition_blocks_get, META_STORAGE_CLASS, SYS_RESTORE_UNTIL,
+    SYS_TRANSITIONED,
 };
 use crate::mpu::{
     aws_multipart_etag, complete_multipart_xml, initiate_response, list_multipart_uploads_xml,
@@ -162,6 +163,10 @@ use crate::object_lock_worm::{
 };
 use crate::parse::{extract_bucket_and_key, s3_to_swift_path, validate_bucket_name};
 use crate::select::{apply_select_plan, parse_select_expression};
+use crate::website::{
+    is_website_endpoint, parse_website_configuration, resolve_website_key, website_object_params,
+    WebsiteConfig,
+};
 use crate::response::{
     copy_object_result_xml, copy_part_result_xml, create_session_result_xml,
     delete_object_response, delete_result_xml, get_object_attributes_xml,
@@ -1756,7 +1761,19 @@ fn translate_object_get_head(method: &str, mut resp: Response, cred: &S3Credenti
     {
         resp.headers.set("x-amz-storage-class", sc);
     }
+    apply_amz_expiration_header(&mut resp);
     translate_object_success(method, resp, false)
+}
+
+fn apply_amz_expiration_header(resp: &mut Response) {
+    if let Some(exp) = resp
+        .headers
+        .get("X-Delete-At")
+        .and_then(amz_expiration_from_delete_at)
+    {
+        resp.headers.set("x-amz-expiration", exp);
+    }
+    resp.headers.remove("X-Delete-At");
 }
 
 fn http_date_to_s3_approx(http_date: &str) -> String {
@@ -2356,6 +2373,15 @@ impl S3Api {
             }
         }
 
+        let mut key = key;
+        let website_error_key = maybe_apply_website_index(
+            &req,
+            &cred,
+            bucket.as_deref(),
+            &mut key,
+            &params,
+            next,
+        );
         let method = req.method.clone();
         let is_copy = req.headers.get("X-Amz-Copy-Source").is_some();
         let worm_bypass = if matches!(method.as_str(), "PUT" | "DELETE") {
@@ -2385,7 +2411,7 @@ impl S3Api {
                 };
                 let versioning_mode = bucket_versioning_mode(vstatus.as_deref());
                 if versioning_mode.is_some() || version_id_q.is_some() {
-                    return handle_versioned_object(
+                    let resp = handle_versioned_object(
                         req,
                         &cred,
                         &b,
@@ -2398,6 +2424,16 @@ impl S3Api {
                         next,
                         self,
                     );
+                    if resp.status == 404 && matches!(method.as_str(), "GET" | "HEAD") {
+                        if let Some(err_key) = website_error_key.as_deref() {
+                            if let Some(err) =
+                                website_error_document(&cred, &b, err_key, &method, next)
+                            {
+                                return err;
+                            }
+                        }
+                    }
+                    return resp;
                 }
             }
         }
@@ -2412,6 +2448,12 @@ impl S3Api {
         } else if method == "GET" && bucket.is_none() {
             // ListBuckets
             swift_req.query_string = "format=json".into();
+        } else if method == "DELETE" && key.is_some() {
+            // Regular object DELETE must stay query-empty. Completed MPU is an
+            // SLO: Swift returns 412 unless the follow-up uses
+            // multipart-manifest=delete. Always sending that query 400s a
+            // non-manifest (s3cmd del / probe.txt).
+            swift_req.query_string.clear();
         } else {
             // Drop SigV4 query crumbs; keep empty for object ops.
             swift_req.query_string = s3_to_swift_query(&params, false);
@@ -2495,7 +2537,23 @@ impl S3Api {
             }
         }
 
-        let resp = next(swift_req);
+        let stamped_delete_at = swift_req
+            .headers
+            .get("X-Delete-At")
+            .map(str::to_string);
+        let resp = if method == "DELETE" && key.is_some() {
+            let retry = swift_req.clone_head();
+            let first = next(swift_req);
+            if first.status == 412 {
+                let mut retry = retry;
+                retry.query_string = "multipart-manifest=delete".into();
+                next(retry)
+            } else {
+                first
+            }
+        } else {
+            next(swift_req)
+        };
 
         // Success path translations.
         if bucket.is_none() && method == "GET" && (200..300).contains(&resp.status) {
@@ -2556,7 +2614,23 @@ impl S3Api {
                     }
                     return translate_object_get_head(&method, resp, &cred);
                 }
-                return translate_object_success(&method, resp, is_copy);
+                let mut out = translate_object_success(&method, resp, is_copy);
+                if method == "PUT" {
+                    if let Some(exp) = stamped_delete_at
+                        .as_deref()
+                        .and_then(amz_expiration_from_delete_at)
+                    {
+                        out.headers.set("x-amz-expiration", exp);
+                    }
+                }
+                return out;
+            }
+            if matches!(method.as_str(), "GET" | "HEAD") {
+                if let (Some(b), Some(err_key)) = (bucket.as_deref(), website_error_key.as_deref()) {
+                    if let Some(err) = website_error_document(&cred, b, err_key, &method, next) {
+                        return err;
+                    }
+                }
             }
             return map_swift_error(resp.status, bucket.as_deref(), key.as_deref());
         }
@@ -3035,6 +3109,75 @@ fn missing_object_version_response(key: &str, version_id: Option<&str>) -> Respo
     } else {
         s3_error_response("NoSuchKey", None, &[("Key", key)])
     }
+}
+
+fn maybe_apply_website_index(
+    req: &Request,
+    cred: &S3Credential,
+    bucket: Option<&str>,
+    key: &mut Option<String>,
+    params: &[(String, String)],
+    next: &NextFn,
+) -> Option<String> {
+    if !matches!(req.method.as_str(), "GET" | "HEAD") {
+        return None;
+    }
+    let Some(bucket) = bucket else {
+        return None;
+    };
+    if !website_object_params(params) {
+        return None;
+    }
+    if !is_website_endpoint(
+        req.headers.get("Host"),
+        req.headers
+            .get("x-amz-website-endpoint")
+            .or_else(|| req.headers.get("X-Amz-Website-Endpoint")),
+    ) {
+        return None;
+    }
+    let cfg = load_website_config(cred, bucket, next)?;
+    let rewrite = key
+        .as_deref()
+        .map(|k| k.is_empty() || k.ends_with('/'))
+        .unwrap_or(true);
+    if rewrite {
+        *key = Some(resolve_website_key(key.as_deref(), &cfg));
+    }
+    cfg.error_key
+}
+
+fn load_website_config(cred: &S3Credential, bucket: &str, next: &NextFn) -> Option<WebsiteConfig> {
+    let spec = stored_bucket_config(&[("website".into(), String::new())])?;
+    let mut head = make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+    stamp_auth(&mut head, cred);
+    let resp = next(head);
+    if !(200..300).contains(&resp.status) {
+        return None;
+    }
+    let xml = stored_bucket_config_xml(&resp.headers, spec)?;
+    parse_website_configuration(&xml)
+}
+
+fn website_error_document(
+    cred: &S3Credential,
+    bucket: &str,
+    error_key: &str,
+    method: &str,
+    next: &NextFn,
+) -> Option<Response> {
+    let mut get = make_swift_req(
+        if method == "HEAD" { "HEAD" } else { "GET" },
+        &s3_to_swift_path(&cred.account, Some(bucket), Some(error_key)),
+    );
+    stamp_auth(&mut get, cred);
+    let resp = next(get);
+    if !(200..300).contains(&resp.status) {
+        return None;
+    }
+    let mut out = resp;
+    out.status = 404;
+    Some(out)
 }
 
 /// HEAD bucket lifecycle meta → stamp Expiration X-Delete-At + Transition meta
@@ -4459,6 +4602,7 @@ fn handle_versioned_put(
     stamp_auth(&mut req, cred);
 
     maybe_apply_lifecycle_on_put(&mut req, cred, bucket, key, next);
+    let stamped_delete_at = req.headers.get("X-Delete-At").map(str::to_string);
     if let Some(err) = maybe_archive_due_cold_on_put(
         &mut req,
         cred,
@@ -4540,6 +4684,12 @@ fn handle_versioned_put(
     } else {
         let mut r = put_object_response(&etag);
         r.headers.set(HDR_VERSION_ID, &new_vid);
+        if let Some(exp) = stamped_delete_at
+            .as_deref()
+            .and_then(amz_expiration_from_delete_at)
+        {
+            r.headers.set("x-amz-expiration", exp);
+        }
         r
     }
 }
@@ -6788,6 +6938,47 @@ mod tests {
     }
 
     #[test]
+    fn delete_object_retries_slo_on_412() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("DELETE", "/mybucket/slo.bin", ""), "testing");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_c = seen.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" {
+                return Response::new(404);
+            }
+            seen_c.lock().unwrap().push(r.query_string.clone());
+            if r.query_string == "multipart-manifest=delete" {
+                Response::new(204)
+            } else {
+                Response::new(412)
+            }
+        });
+        assert_eq!(api.handle(req, &next).status, 204);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [String::new(), "multipart-manifest=delete".into()]
+        );
+    }
+
+    #[test]
+    fn delete_regular_object_does_not_send_manifest_query() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("DELETE", "/mybucket/probe.txt", ""), "testing");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let seen_c = seen.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" {
+                return Response::new(404);
+            }
+            *seen_c.lock().unwrap() = r.query_string.clone();
+            Response::new(204)
+        });
+        assert_eq!(api.handle(req, &next).status, 204);
+        assert_eq!(seen.lock().unwrap().as_str(), "");
+    }
+
+    #[test]
     fn list_objects_translates() {
         let api = S3Api::new(cred_map());
         let req = sign_request(base_s3_req("GET", "/mybucket", "prefix=p"), "testing");
@@ -7111,6 +7302,59 @@ mod tests {
             miss_body.contains("<Code>NoSuchWebsiteConfiguration</Code>"),
             "{miss_body}"
         );
+    }
+
+    #[test]
+    fn website_endpoint_serves_index_and_error() {
+        use crate::bucket_config::{apply_stored_bucket_config, stored_bucket_config};
+        let api = S3Api::new(cred_map());
+        let xml = b"<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument><ErrorDocument><Key>error.html</Key></ErrorDocument></WebsiteConfiguration>";
+        let spec = stored_bucket_config(&[("website".into(), String::new())]).unwrap();
+        let mut meta = HeaderKeyDict::new();
+        apply_stored_bucket_config(&mut meta, spec, xml);
+        let blob = meta.get(spec.header).unwrap().to_string();
+
+        let mut req = base_s3_req("GET", "/mybucket/", "");
+        req.headers.set("x-amz-website-endpoint", "1");
+        let req = sign_request(req, "testing");
+        let blob_c = blob.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.path.ends_with("/mybucket") {
+                let mut resp = Response::new(200);
+                resp.headers
+                    .set("X-Container-Sysmeta-S3-Cfg-Website", blob_c.clone());
+                return resp;
+            }
+            if r.path.ends_with("/index.html") {
+                return Response::with_body(200, b"<html>home</html>".to_vec());
+            }
+            Response::new(404)
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.body.into_vec(u64::MAX).unwrap(),
+            b"<html>home</html>"
+        );
+
+        let mut miss = base_s3_req("GET", "/mybucket/no-such", "");
+        miss.headers.set("x-amz-website-endpoint", "1");
+        let miss = sign_request(miss, "testing");
+        let next2: NextFn = Arc::new(move |r| {
+            if r.path.ends_with("/mybucket") {
+                let mut resp = Response::new(200);
+                resp.headers
+                    .set("X-Container-Sysmeta-S3-Cfg-Website", blob.clone());
+                return resp;
+            }
+            if r.path.ends_with("/error.html") {
+                return Response::with_body(200, b"<html>err</html>".to_vec());
+            }
+            Response::new(404)
+        });
+        let err = api.handle(miss, &next2);
+        assert_eq!(err.status, 404);
+        assert_eq!(err.body.into_vec(u64::MAX).unwrap(), b"<html>err</html>");
     }
 
     #[test]
@@ -9729,7 +9973,14 @@ mod tests {
             }
             Response::new(500)
         });
-        assert_eq!(api.handle(put, &next).status, 200);
+        let put_resp = api.handle(put, &next);
+        assert_eq!(put_resp.status, 200);
+        let exp = put_resp
+            .headers
+            .get("x-amz-expiration")
+            .expect("PUT x-amz-expiration");
+        assert!(exp.contains("expiry-date="), "{exp}");
+        assert!(exp.contains("rule-id=\"Lifecycle\""), "{exp}");
         let da: i64 = seen
             .lock()
             .unwrap()
@@ -9739,6 +9990,28 @@ mod tests {
             .unwrap();
         let now = unix_now();
         assert!((da - (now + 2 * 86_400)).abs() < 5, "da={da} now={now}");
+    }
+
+    #[test]
+    fn get_object_surfaces_x_amz_expiration() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/mybucket/logs/a.txt", ""), "testing");
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                return Response::new(404);
+            }
+            let mut resp = Response::with_body(200, b"data".to_vec());
+            resp.headers.set("ETag", "abc");
+            resp.headers.set("X-Delete-At", "1700000000");
+            resp
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.headers.get("x-amz-expiration"),
+            Some("expiry-date=\"Tue, 14 Nov 2023 22:13:20 GMT\", rule-id=\"Lifecycle\"")
+        );
+        assert!(resp.headers.get("X-Delete-At").is_none());
     }
 
     #[test]

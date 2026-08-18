@@ -3,8 +3,8 @@
 - Date: 2026-08-18
 - Official source: [Amazon S3 API Operations](https://docs.aws.amazon.com/AmazonS3/latest/API/API_Operations.html) — **Amazon S3 section only** (lines 7–122; excludes S3 Control, Outposts, Tables, Vectors, Files)
 - Rust truth: `swift-rust/crates/swift-s3api/src/middleware.rs` (`UNSUPPORTED_SUBRESOURCES` empty after W3; WriteGetObjectResponse 501 via `x-amz-request-route`), `parse.rs` `extract_bucket_and_key` (empty key → `None`, slash-fix in tree)
-- Live reference binary: proxy **catalog W4** `1628418c…` (W3.1 + CSV Select `_N` projection / AND-equality WHERE / LIMIT). Frozen 57-case runner untouched. Live client matrix 2026-08-18 W4: **171/171 gate=PASS**.
-- Score legend: **LIVE_PASS** = VIP client path (stored XML/JSON round-trip counts; select is CSV `*` / `_N` / WHERE `_N = lit` / LIMIT; torrent is a generated single-file .torrent; CreateSession echoes TempAuth keys; RenameObject is copy+delete). **HONEST_501** = 501 NotImplemented non-empty XML; **FAIL** = fallthrough / no live case; **UNTESTED** = implemented, no live case
+- Live reference binary: proxy **catalog W5e** `2c63aa3f…` (lifecycle `x-amz-expiration`, website Index/Error, SLO DELETE retry-on-412). Frozen 57-case runner untouched. Live client matrix 2026-08-18 W5e: **192/192 gate=PASS**.
+- Score legend: **LIVE_PASS** = VIP client path (stored XML/JSON round-trip counts; select is CSV `*` / `_N` / WHERE `_N = lit` / LIMIT; torrent is a generated single-file .torrent; CreateSession echoes TempAuth keys; RenameObject is copy+delete; lifecycle stamps Swift `X-Delete-At` and surfaces `x-amz-expiration`; website serves Index/Error on website-endpoint signal). **HONEST_501** = 501 NotImplemented non-empty XML; **FAIL** = fallthrough / no live case; **UNTESTED** = implemented, no live case
 
 ## Summary counts (after W3 live)
 
@@ -45,7 +45,7 @@ W3 moved metadata*, ABAC, annotation, CreateSession, RenameObject, SelectObjectC
 | DeleteBucketReplication | DELETE `/{Bucket}?replication` | `handle_stored_bucket_config` | LIVE_PASS | W2 sysmeta round-trip |
 | DeleteBucketTagging | DELETE `/{Bucket}?tagging` | `handle_tagging` (bucket) | LIVE_PASS | 57 read path; DELETE implemented |
 | DeleteBucketWebsite | DELETE `/{Bucket}?website` | `handle_stored_bucket_config` | LIVE_PASS | W2 sysmeta round-trip |
-| DeleteObject | DELETE `/{Key}` [`?versionId=`] | fallthrough or `handle_versioned_delete` | LIVE_PASS | 57 |
+| DeleteObject | DELETE `/{Key}` [`?versionId=`] | fallthrough or `handle_versioned_delete` | LIVE_PASS | 57; W5e SLO retry-on-412 |
 | DeleteObjectAnnotation | DELETE `/{Key}?annotation` | object sysmeta blob | LIVE_PASS | W3 object sysmeta |
 | DeleteObjects | POST `/{Bucket}?delete` | `handle_multi_delete` | LIVE_PASS | 57 multi-delete |
 | DeleteObjectTagging | DELETE `/{Key}?tagging` | `handle_tagging` (object DELETE) | LIVE_PASS | Implemented; not in frozen 57 |
@@ -145,7 +145,9 @@ W3 moved metadata*, ABAC, annotation, CreateSession, RenameObject, SelectObjectC
 
 ### Honesty notes
 
-- Bucket configs (including metadata*/ABAC) are **sysmeta XML/JSON round-trip**, not SSE, replication, website hosting, analytics jobs, or S3 Metadata tables.
+- Bucket configs (including metadata*/ABAC) are **sysmeta XML/JSON round-trip**, not SSE, replication, analytics jobs, or S3 Metadata tables. Website **hosting** is a subset: Index/Error on `s3-website` Host or `x-amz-website-endpoint`; not a separate website hostname.
+- Lifecycle **stamps** Swift `X-Delete-At` and surfaces `x-amz-expiration`; expirer reaps. Not a full AWS lifecycle engine (no tag/And filters).
+- Completed MPU DELETE: regular object DELETE first; Swift 412 retries with `multipart-manifest=delete`. Always sending that query 400s a non-manifest.
 - Select is a **CSV subset**: `SELECT *|_N` plus AND-equality `WHERE` and `LIMIT`. Not SQL/JSON/Parquet. JOIN/OR/LIKE/header names return 400.
 - Torrent is a generated single-file `.torrent` with no tracker.
 - CreateSession echoes existing TempAuth keys plus a 15-minute `peregrine-session` token.
