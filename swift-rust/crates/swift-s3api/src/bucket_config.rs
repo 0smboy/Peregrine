@@ -453,6 +453,125 @@ fn extract_first_tag(text: &str, tag: &str) -> Option<String> {
     Some(text[start..start + end_rel].to_string())
 }
 
+/// Bucket config subresources stored as one XML blob in container sysmeta.
+#[derive(Clone, Copy, Debug)]
+pub struct StoredBucketConfig {
+    pub query: &'static str,
+    pub header: &'static str,
+    /// `None` → GET of missing config returns 200 + [`empty_xml`].
+    pub missing_code: Option<&'static str>,
+    pub empty_xml: &'static [u8],
+}
+
+pub const STORED_BUCKET_CONFIGS: &[StoredBucketConfig] = &[
+    StoredBucketConfig {
+        query: "policy",
+        header: "X-Container-Sysmeta-S3-Cfg-Policy",
+        missing_code: Some("NoSuchBucketPolicy"),
+        empty_xml: b"",
+    },
+    StoredBucketConfig {
+        query: "website",
+        header: "X-Container-Sysmeta-S3-Cfg-Website",
+        missing_code: Some("NoSuchWebsiteConfiguration"),
+        empty_xml: b"",
+    },
+    StoredBucketConfig {
+        query: "logging",
+        header: "X-Container-Sysmeta-S3-Cfg-Logging",
+        missing_code: None,
+        empty_xml: b"<BucketLoggingStatus/>",
+    },
+    StoredBucketConfig {
+        query: "notification",
+        header: "X-Container-Sysmeta-S3-Cfg-Notification",
+        missing_code: None,
+        empty_xml: b"<NotificationConfiguration/>",
+    },
+    StoredBucketConfig {
+        query: "encryption",
+        header: "X-Container-Sysmeta-S3-Cfg-Encryption",
+        missing_code: Some("ServerSideEncryptionConfigurationNotFoundError"),
+        empty_xml: b"",
+    },
+    StoredBucketConfig {
+        query: "publicAccessBlock",
+        header: "X-Container-Sysmeta-S3-Cfg-PublicAccessBlock",
+        missing_code: Some("NoSuchPublicAccessBlockConfiguration"),
+        empty_xml: b"",
+    },
+    StoredBucketConfig {
+        query: "ownershipControls",
+        header: "X-Container-Sysmeta-S3-Cfg-OwnershipControls",
+        missing_code: Some("OwnershipControlsNotFoundError"),
+        empty_xml: b"",
+    },
+    StoredBucketConfig {
+        query: "requestPayment",
+        header: "X-Container-Sysmeta-S3-Cfg-RequestPayment",
+        missing_code: None,
+        empty_xml: b"<RequestPaymentConfiguration><Payer>BucketOwner</Payer></RequestPaymentConfiguration>",
+    },
+    StoredBucketConfig {
+        query: "accelerate",
+        header: "X-Container-Sysmeta-S3-Cfg-Accelerate",
+        missing_code: None,
+        empty_xml: b"<AccelerateConfiguration/>",
+    },
+    StoredBucketConfig {
+        query: "analytics",
+        header: "X-Container-Sysmeta-S3-Cfg-Analytics",
+        missing_code: Some("NoSuchConfiguration"),
+        empty_xml: b"",
+    },
+    StoredBucketConfig {
+        query: "inventory",
+        header: "X-Container-Sysmeta-S3-Cfg-Inventory",
+        missing_code: Some("NoSuchConfiguration"),
+        empty_xml: b"",
+    },
+    StoredBucketConfig {
+        query: "metrics",
+        header: "X-Container-Sysmeta-S3-Cfg-Metrics",
+        missing_code: Some("NoSuchConfiguration"),
+        empty_xml: b"",
+    },
+    StoredBucketConfig {
+        query: "intelligent-tiering",
+        header: "X-Container-Sysmeta-S3-Cfg-IntelligentTiering",
+        missing_code: Some("NoSuchConfiguration"),
+        empty_xml: b"",
+    },
+    StoredBucketConfig {
+        query: "replication",
+        header: "X-Container-Sysmeta-S3-Cfg-Replication",
+        missing_code: Some("ReplicationConfigurationNotFoundError"),
+        empty_xml: b"",
+    },
+];
+
+pub fn stored_bucket_config(params: &[(String, String)]) -> Option<&'static StoredBucketConfig> {
+    STORED_BUCKET_CONFIGS
+        .iter()
+        .find(|cfg| params.iter().any(|(k, _)| k == cfg.query))
+}
+
+pub fn apply_stored_bucket_config(headers: &mut HeaderKeyDict, cfg: &StoredBucketConfig, body: &[u8]) {
+    headers.set(cfg.header, encode_meta_blob(body));
+}
+
+pub fn clear_stored_bucket_config(headers: &mut HeaderKeyDict, cfg: &StoredBucketConfig) {
+    headers.set(cfg.header, "");
+}
+
+pub fn stored_bucket_config_xml(
+    headers: &HeaderKeyDict,
+    cfg: &StoredBucketConfig,
+) -> Option<Vec<u8>> {
+    let raw = headers.get(cfg.header).filter(|s| !s.is_empty())?;
+    decode_meta_blob(raw).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

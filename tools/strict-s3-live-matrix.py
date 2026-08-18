@@ -58,28 +58,69 @@ S3CFG_KEYS = re.compile(r"^(access_key|secret_key|host_base|host_bucket|"
                         r"bucket_location)\s*=\s*(.*)$")
 
 UNSUPPORTED_SUBRESOURCES = (
-    "policy",
-    "website",
-    "replication",
     "select",
     "torrent",
-    "requestPayment",
-    "accelerate",
-    "logging",
-    "notification",
-    "encryption",
-    "metrics",
-    "analytics",
-    "inventory",
-    "publicAccessBlock",
-    "ownershipControls",
-    "intelligent-tiering",
     "metadataConfiguration",
     "metadataTableConfiguration",
+    "metadataJournalTableConfiguration",
+    "metadataInventoryTableConfiguration",
+    "metadataAnnotationTableConfiguration",
     "session",
     "abac",
     "annotation",
 )
+
+# query, kind xml|json, body, success marker, missing error (None = 200 empty XML)
+STORED_BUCKET_CONFIGS = (
+    ("policy", "json",
+     b'{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"*"}]}',
+     "Version", "NoSuchBucketPolicy"),
+    ("website", "xml",
+     b"<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument></WebsiteConfiguration>",
+     "WebsiteConfiguration", "NoSuchWebsiteConfiguration"),
+    ("logging", "xml", b"<BucketLoggingStatus/>",
+     "BucketLoggingStatus", None),
+    ("notification", "xml", b"<NotificationConfiguration/>",
+     "NotificationConfiguration", None),
+    ("encryption", "xml",
+     b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>"
+     b"<SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault>"
+     b"</Rule></ServerSideEncryptionConfiguration>",
+     "ServerSideEncryptionConfiguration", "ServerSideEncryptionConfigurationNotFoundError"),
+    ("publicAccessBlock", "xml",
+     b"<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls>"
+     b"<IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy>"
+     b"<RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+     "PublicAccessBlockConfiguration", "NoSuchPublicAccessBlockConfiguration"),
+    ("ownershipControls", "xml",
+     b"<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+     "OwnershipControls", "OwnershipControlsNotFoundError"),
+    ("requestPayment", "xml",
+     b"<RequestPaymentConfiguration><Payer>BucketOwner</Payer></RequestPaymentConfiguration>",
+     "RequestPaymentConfiguration", None),
+    ("accelerate", "xml",
+     b"<AccelerateConfiguration><Status>Suspended</Status></AccelerateConfiguration>",
+     "AccelerateConfiguration", None),
+    ("analytics", "xml",
+     b"<AnalyticsConfiguration><Id>matrix</Id></AnalyticsConfiguration>",
+     "AnalyticsConfiguration", "NoSuchConfiguration"),
+    ("inventory", "xml",
+     b"<InventoryConfiguration><Id>matrix</Id><IsEnabled>false</IsEnabled></InventoryConfiguration>",
+     "InventoryConfiguration", "NoSuchConfiguration"),
+    ("metrics", "xml",
+     b"<MetricsConfiguration><Id>matrix</Id></MetricsConfiguration>",
+     "MetricsConfiguration", "NoSuchConfiguration"),
+    ("intelligent-tiering", "xml",
+     b"<IntelligentTieringConfiguration><Id>matrix</Id><Status>Disabled</Status>"
+     b"</IntelligentTieringConfiguration>",
+     "IntelligentTieringConfiguration", "NoSuchConfiguration"),
+    ("replication", "xml",
+     b"<ReplicationConfiguration><Role>arn:aws:iam::1:role/r</Role><Rule><ID>r1</ID>"
+     b"<Status>Disabled</Status><Destination><Bucket>arn:aws:s3:::dest</Bucket></Destination>"
+     b"</Rule></ReplicationConfiguration>",
+     "ReplicationConfiguration", "ReplicationConfigurationNotFoundError"),
+)
+STORED_QUERY_NAMES = frozenset(item[0] for item in STORED_BUCKET_CONFIGS)
 
 RESTORE_XML = (
     b'<RestoreRequest xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
@@ -145,6 +186,7 @@ def _declared_cases() -> Tuple[str, ...]:
         "get-bucket-policy-status-slash",
         "get-object-attributes",
         "rename-object-501",
+        "list-directory-buckets",
         "delete-object",
         "delete-bucket",
         "delete-bucket-slash",
@@ -157,6 +199,14 @@ def _declared_cases() -> Tuple[str, ...]:
         "s3cmd-del",
         "s3cmd-rb",
     ]
+    for query, _kind, _body, _marker, _missing in STORED_BUCKET_CONFIGS:
+        names.extend([
+            "put-cfg-{}".format(query),
+            "get-cfg-{}".format(query),
+            "get-cfg-{}-slash".format(query),
+            "delete-cfg-{}".format(query),
+            "get-cfg-{}-after-delete".format(query),
+        ])
     for sub in UNSUPPORTED_SUBRESOURCES:
         names.append("get-unsupported-{}".format(sub))
         names.append("get-unsupported-{}-slash".format(sub))
@@ -535,6 +585,12 @@ class Runner:
         if 200 <= snap.status < 300:
             self.expect_xml(case, snap, root)
 
+    def expect_body_contains(self, case: Case, snap: Snapshot, marker: str,
+                             allowed: Sequence[int] = (200,)) -> None:
+        self.expect_status(case, snap, allowed)
+        if marker.encode("utf-8") not in snap.body:
+            case.issue("body missing {}".format(marker))
+
     def s3cmd_run(self, args: Sequence[str]) -> Tuple[int, str]:
         if self.s3cmd_runner is not None:
             return self.s3cmd_runner(*args)
@@ -911,6 +967,39 @@ def _run_matrix(runner: Runner) -> None:
                   "Content-Length": "0"})
         runner.expect_error(case, snap, 501, "NotImplemented")
 
+    def list_directory_buckets(case: Case) -> None:
+        snap = runner.req(case, "GET", "/", (("max-directory-buckets", "100"),))
+        runner.expect_2xx_xml(case, snap, "ListDirectoryBucketsResult")
+
+    def stored_put(query: str, body: bytes):
+        def fn(case: Case) -> None:
+            snap = runner.req(case, "PUT", _path(main), ((query, ""),), body)
+            runner.expect_status(case, snap, (200,))
+        return fn
+
+    def stored_get(query: str, kind: str, marker: str, trailing: bool,
+                   missing: Optional[str], after_delete: bool):
+        def fn(case: Case) -> None:
+            snap = runner.req(case, "GET", _path(main, trailing_slash=trailing),
+                              ((query, ""),))
+            if after_delete:
+                if missing:
+                    runner.expect_error(case, snap, 404, missing)
+                else:
+                    runner.expect_2xx_xml(case, snap, marker)
+                return
+            if kind == "json":
+                runner.expect_body_contains(case, snap, marker)
+            else:
+                runner.expect_2xx_xml(case, snap, marker)
+        return fn
+
+    def stored_delete(query: str):
+        def fn(case: Case) -> None:
+            snap = runner.req(case, "DELETE", _path(main), ((query, ""),))
+            runner.expect_status(case, snap, (204, 200))
+        return fn
+
     def delete_object(case: Case) -> None:
         snap = runner.req(case, "DELETE", _path(main, "probe.txt"))
         runner.expect_status(case, snap, (204, 200))
@@ -1063,6 +1152,16 @@ def _run_matrix(runner: Runner) -> None:
     runner.run_case("get-bucket-policy-status-slash", policy_status(True))
     runner.run_case("get-object-attributes", object_attributes)
     runner.run_case("rename-object-501", rename_object_501)
+    runner.run_case("list-directory-buckets", list_directory_buckets)
+    for query, kind, body, marker, missing in STORED_BUCKET_CONFIGS:
+        runner.run_case("put-cfg-{}".format(query), stored_put(query, body))
+        runner.run_case("get-cfg-{}".format(query),
+                        stored_get(query, kind, marker, False, missing, False))
+        runner.run_case("get-cfg-{}-slash".format(query),
+                        stored_get(query, kind, marker, True, missing, False))
+        runner.run_case("delete-cfg-{}".format(query), stored_delete(query))
+        runner.run_case("get-cfg-{}-after-delete".format(query),
+                        stored_get(query, kind, marker, False, missing, True))
     runner.run_case("delete-object", delete_object)
     for sub in UNSUPPORTED_SUBRESOURCES:
         runner.run_case("get-unsupported-{}".format(sub), unsupported(sub, False))
@@ -1196,12 +1295,14 @@ class _MockClient:
     def __init__(self, mode: str = "ok") -> None:
         self.mode = mode
         self.calls: List[Tuple[str, str]] = []
+        self.stored: Dict[Tuple[str, str], bytes] = {}
 
     def request(self, method: str, url: str, body: bytes,
                 headers: Mapping[str, str]) -> Snapshot:
         parsed = urlsplit(url)
         path = parsed.path
         query = parsed.query
+        q0 = query.split("&")[0].split("=")[0] if query else ""
         self.calls.append((method, path + (("?" + query) if query else "")))
         if self.mode == "empty-xml":
             return Snapshot(200, {"content-type": ("application/xml",)}, b"")
@@ -1214,9 +1315,37 @@ class _MockClient:
             return Snapshot(405, {"content-type": ("application/xml",)}, xml)
         if path == "/" and method == "HEAD":
             return Snapshot(405, {"content-type": ("application/xml",)}, b"")
+        if path == "/" and method == "GET" and q0 == "max-directory-buckets":
+            return Snapshot(200, {"content-type": ("application/xml",)},
+                            b"<ListDirectoryBucketsResult><Buckets/></ListDirectoryBucketsResult>")
         if path == "/" and method == "GET":
             return Snapshot(200, {"content-type": ("application/xml",)},
                             b"<ListAllMyBucketsResult><Buckets/></ListAllMyBucketsResult>")
+        if q0 in STORED_QUERY_NAMES:
+            key = (path.rstrip("/") or "/", q0)
+            spec = next(item for item in STORED_BUCKET_CONFIGS if item[0] == q0)
+            _kind, empty_marker, missing = spec[1], spec[3], spec[4]
+            if method == "PUT":
+                self.stored[key] = body
+                return Snapshot(200, {}, b"")
+            if method == "DELETE":
+                self.stored.pop(key, None)
+                return Snapshot(204, {}, b"")
+            if method == "GET":
+                if key in self.stored:
+                    payload = self.stored[key]
+                    ctype = "application/json" if payload[:1] == b"{" else "application/xml"
+                    return Snapshot(200, {"content-type": (ctype,)}, payload)
+                if missing:
+                    xml = (
+                        b"<Error><Code>" + missing.encode("ascii")
+                        + b"</Code><Message>x</Message></Error>"
+                    )
+                    return Snapshot(404, {"content-type": ("application/xml",)}, xml)
+                return Snapshot(
+                    200, {"content-type": ("application/xml",)},
+                    "<{}/>".format(empty_marker).encode("ascii"),
+                )
         hdrs = {k.lower(): v for k, v in headers.items()}
         if "x-amz-rename-source" in hdrs:
             return Snapshot(501, {"content-type": ("application/xml",)},
@@ -1332,9 +1461,17 @@ def _selftest_body() -> None:
     _expect("get-object-attributes" in ALL_CASES, "GetObjectAttributes missing")
     _expect("put-object-tagging" in ALL_CASES, "PutObjectTagging missing")
     _expect("rename-object-501" in ALL_CASES, "RenameObject 501 missing")
+    _expect("list-directory-buckets" in ALL_CASES, "ListDirectoryBuckets missing")
+    _expect("put-cfg-website" in ALL_CASES, "stored website PUT missing")
+    _expect("put-cfg-policy" in ALL_CASES, "stored policy PUT missing")
+    _expect("get-unsupported-policy" not in ALL_CASES, "policy must not stay 501")
     for sub in UNSUPPORTED_SUBRESOURCES:
         _expect("get-unsupported-{}".format(sub) in ALL_CASES, "missing " + sub)
         _expect("get-unsupported-{}-slash".format(sub) in ALL_CASES, "missing slash " + sub)
+    for query, _kind, _body, _marker, _missing in STORED_BUCKET_CONFIGS:
+        _expect("put-cfg-{}".format(query) in ALL_CASES, "missing put " + query)
+        _expect("get-cfg-{}-after-delete".format(query) in ALL_CASES,
+                "missing after-delete " + query)
 
     headers, query = _signed_request(
         method="GET", path="/test.txt", query=(), body=b"",

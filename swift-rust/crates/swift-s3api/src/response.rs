@@ -159,6 +159,7 @@ pub fn error_status_and_message(code: &str) -> (u16, &'static str) {
             400,
             "The XML you provided was not well-formed or did not validate against our published schema",
         ),
+        "MalformedPolicy" => (400, "The bucket policy is malformed."),
         "MethodNotAllowed" => (405, "The specified method is not allowed against this resource."),
         "MissingContentLength" => (411, "You must provide the Content-Length HTTP header."),
         "NoSuchBucket" => (404, "The specified bucket does not exist."),
@@ -167,6 +168,19 @@ pub fn error_status_and_message(code: &str) -> (u16, &'static str) {
             404,
             "The lifecycle configuration does not exist.",
         ),
+        "NoSuchBucketPolicy" => (404, "The bucket policy does not exist."),
+        "NoSuchWebsiteConfiguration" => (404, "The specified bucket does not have a website configuration."),
+        "NoSuchPublicAccessBlockConfiguration" => {
+            (404, "The public access block configuration does not exist.")
+        }
+        "NoSuchConfiguration" => (404, "The specified configuration does not exist."),
+        "ServerSideEncryptionConfigurationNotFoundError" => {
+            (404, "The server side encryption configuration was not found.")
+        }
+        "OwnershipControlsNotFoundError" => (404, "The bucket ownership controls were not found."),
+        "ReplicationConfigurationNotFoundError" => {
+            (404, "The replication configuration was not found.")
+        }
         "NoSuchTagSet" => (404, "The TagSet does not exist."),
         "NoSuchUpload" => (
             404,
@@ -522,6 +536,13 @@ pub fn copy_part_result_xml(last_modified: &str, etag: &str) -> Vec<u8> {
         .with_leaf("LastModified", s3_xml_timestamp(last_modified))
         .with_leaf("ETag", format!("\"{}\"", etag.trim().trim_matches('"')))
         .to_xml(true)
+}
+
+/// Empty `ListDirectoryBuckets` document (no Express/directory buckets here).
+pub fn list_directory_buckets_xml() -> Vec<u8> {
+    let mut root = Element::new("ListDirectoryBucketsResult");
+    root.push(Element::new("Buckets"));
+    root.to_xml(true)
 }
 
 /// `GetBucketPolicyStatus`: no stored policy means the bucket is not public.

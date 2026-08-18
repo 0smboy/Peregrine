@@ -36,8 +36,8 @@
 //!
 //! * **SigV2** (`Authorization: AWS …` / `AWSAccessKeyId` query) — **IMPLEMENTED**
 //!   (HMAC-SHA1 Base64; header + query Expires). See [`crate::sigv2`].
-//! * Other subresources in [`UNSUPPORTED_SUBRESOURCES`] (policy, website,
-//!   replication, select, …).
+//! * Other subresources in [`UNSUPPORTED_SUBRESOURCES`] (select, torrent,
+//!   metadata*, session, abac, annotation).
 //!
 //! # Config subresources (meta round-trip — claimable unit surface)
 //!
@@ -120,13 +120,14 @@ use crate::aws_chunked::{
 };
 use crate::bucket_config::{
     apply_bucket_tagging_meta, apply_lifecycle_meta, apply_object_lock_meta,
-    apply_object_tagging_meta, apply_versioning_meta, clear_bucket_tagging_meta,
-    clear_lifecycle_meta, clear_object_tagging_meta, empty_list_versions_result_xml,
-    lifecycle_xml_from_headers, parse_tagging_body,
-    parse_versioning_status, tagging_xml_from_meta, validate_lifecycle_xml,
+    apply_object_tagging_meta, apply_stored_bucket_config, apply_versioning_meta,
+    clear_bucket_tagging_meta, clear_lifecycle_meta, clear_object_tagging_meta,
+    clear_stored_bucket_config, empty_list_versions_result_xml, lifecycle_xml_from_headers,
+    parse_tagging_body, parse_versioning_status, stored_bucket_config,
+    stored_bucket_config_xml, tagging_xml_from_meta, validate_lifecycle_xml,
     validate_object_lock_xml, validated_object_lock_xml_from_headers,
-    versioning_configuration_xml, versioning_status_from_headers, S3_BUCKET_TAGGING_META,
-    S3_OBJECT_TAGGING_META,
+    versioning_configuration_xml, versioning_status_from_headers, StoredBucketConfig,
+    S3_BUCKET_TAGGING_META, S3_OBJECT_TAGGING_META,
 };
 use crate::cold_tier::{
     archive_commit, begin_restore, complete_restore, hot_reclamation_allowed,
@@ -162,7 +163,8 @@ use crate::object_lock_worm::{
 use crate::parse::{extract_bucket_and_key, s3_to_swift_path, validate_bucket_name};
 use crate::response::{
     copy_object_result_xml, copy_part_result_xml, delete_object_response, delete_result_xml,
-    get_object_attributes_xml, list_all_my_buckets_xml, policy_status_xml, put_object_response,
+    get_object_attributes_xml, list_all_my_buckets_xml, list_directory_buckets_xml,
+    policy_status_xml, put_object_response,
     s3_error_response, s3_xml_timestamp, xml_response, BucketInfo, DeleteError, DeletedObject,
     ListBucketResult, ListBucketResultV2, Owner, S3Object,
 };
@@ -440,24 +442,13 @@ fn credential_from_s3token(
 /// Implemented elsewhere (must **not** appear here): `lifecycle`, `tagging`,
 /// `versioning`, `versions`, `object-lock`, `legal-hold`, `retention`, `restore`.
 const UNSUPPORTED_SUBRESOURCES: &[&str] = &[
-    "policy",
-    "website",
-    "replication",
     "select",
     "torrent",
-    "requestPayment",
-    "accelerate",
-    "logging",
-    "notification",
-    "encryption",
-    "metrics",
-    "analytics",
-    "inventory",
-    "publicAccessBlock",
-    "ownershipControls",
-    "intelligent-tiering",
     "metadataConfiguration",
     "metadataTableConfiguration",
+    "metadataJournalTableConfiguration",
+    "metadataInventoryTableConfiguration",
+    "metadataAnnotationTableConfiguration",
     "session",
     "abac",
     "annotation",
@@ -1926,6 +1917,13 @@ impl S3Api {
             if let Some(denied) = service_method_not_allowed(&req.method) {
                 return denied;
             }
+            if req.method == "GET"
+                && params
+                    .iter()
+                    .any(|(k, _)| k == "max-directory-buckets")
+            {
+                return xml_response(200, list_directory_buckets_xml());
+            }
         }
         // PUT/copy: unknown x-amz-storage-class must 400 before any persist.
         if req.method == "PUT" {
@@ -2146,6 +2144,19 @@ impl S3Api {
         // ---- Lifecycle (bucket) ----
         if has_lifecycle && bucket.is_some() && key.is_none() {
             return handle_lifecycle(req, &cred, bucket.as_deref().unwrap(), next);
+        }
+
+        // ---- Stored bucket configs (policy/website/encryption/…) ----
+        if key.is_none() && bucket.is_some() {
+            if let Some(cfg) = stored_bucket_config(&params) {
+                return handle_stored_bucket_config(
+                    req,
+                    &cred,
+                    bucket.as_deref().unwrap(),
+                    cfg,
+                    next,
+                );
+            }
         }
 
         // ---- Object Lock configuration (bucket) ----
@@ -5547,6 +5558,76 @@ fn handle_mpu_part_copy(
     xml_response(200, copy_part_result_xml(&http_date_to_s3_approx(&lm), &etag))
 }
 
+fn handle_stored_bucket_config(
+    req: Request,
+    cred: &S3Credential,
+    bucket: &str,
+    cfg: &StoredBucketConfig,
+    next: &NextFn,
+) -> Response {
+    match req.method.as_str() {
+        "GET" | "HEAD" => {
+            let mut head =
+                make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+            stamp_auth(&mut head, cred);
+            let resp = next(head);
+            if !(200..300).contains(&resp.status) {
+                return map_swift_error(resp.status, Some(bucket), None);
+            }
+            match stored_bucket_config_xml(&resp.headers, cfg) {
+                Some(xml) if cfg.query == "policy" && xml.first() == Some(&b'{') => {
+                    let mut r = Response::with_body(200, xml);
+                    r.headers.set("Content-Type", "application/json");
+                    r
+                }
+                Some(xml) => xml_ok(xml),
+                None => match cfg.missing_code {
+                    Some(code) => s3_error_response(code, None, &[]),
+                    None => xml_ok(cfg.empty_xml.to_vec()),
+                },
+            }
+        }
+        "PUT" => {
+            let body = match req.body.into_vec(MAX_CONTROL_BODY) {
+                Ok(b) => b,
+                Err(_) => return s3_error_response("IncompleteBody", None, &[]),
+            };
+            let looks_xml = body.iter().any(|b| *b == b'<');
+            let looks_json = cfg.query == "policy" && body.iter().any(|b| *b == b'{');
+            if !looks_xml && !looks_json {
+                return s3_error_response(
+                    if cfg.query == "policy" {
+                        "MalformedPolicy"
+                    } else {
+                        "MalformedXML"
+                    },
+                    None,
+                    &[],
+                );
+            }
+            let mut post =
+                make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
+            apply_stored_bucket_config(&mut post.headers, cfg, &body);
+            stamp_auth(&mut post, cred);
+            let resp = next(post);
+            if (200..300).contains(&resp.status) {
+                Response::new(200)
+            } else {
+                map_swift_error(resp.status, Some(bucket), None)
+            }
+        }
+        "DELETE" => {
+            let mut post =
+                make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
+            clear_stored_bucket_config(&mut post.headers, cfg);
+            stamp_auth(&mut post, cred);
+            let _ = next(post);
+            Response::new(204)
+        }
+        _ => s3_error_response("MethodNotAllowed", None, &[]),
+    }
+}
+
 fn handle_object_attributes(
     req: Request,
     cred: &S3Credential,
@@ -6728,6 +6809,113 @@ mod tests {
         assert!(body.contains("<CopyPartResult"), "{body}");
         assert!(body.contains("partcopy1"), "{body}");
         assert!(!body.contains("<CopyObjectResult>"), "{body}");
+    }
+
+    #[test]
+    fn stored_website_put_get_delete_roundtrip() {
+        let api = S3Api::new(cred_map());
+        let xml = b"<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument></WebsiteConfiguration>";
+        let stored = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let put_store = stored.clone();
+        let mut put = base_s3_req("PUT", "/mybucket", "website");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(xml.to_vec());
+        let put = sign_request(put, "testing");
+        let put_next: NextFn = Arc::new(move |r| {
+            assert_eq!(r.method, "POST");
+            let blob = r
+                .headers
+                .get("X-Container-Sysmeta-S3-Cfg-Website")
+                .expect("website meta")
+                .to_string();
+            *put_store.lock().unwrap() = Some(blob);
+            Response::new(204)
+        });
+        assert_eq!(api.handle(put, &put_next).status, 200);
+
+        let blob = stored.lock().unwrap().clone().unwrap();
+        let get = sign_request(base_s3_req("GET", "/mybucket", "website"), "testing");
+        let get_next: NextFn = Arc::new(move |r| {
+            assert_eq!(r.method, "HEAD");
+            let mut resp = Response::new(200);
+            resp.headers.set("X-Container-Sysmeta-S3-Cfg-Website", blob.clone());
+            resp
+        });
+        let get_resp = api.handle(get, &get_next);
+        assert_eq!(get_resp.status, 200);
+        let body = String::from_utf8(get_resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("WebsiteConfiguration"), "{body}");
+        assert!(body.contains("index.html"), "{body}");
+
+        let del = sign_request(base_s3_req("DELETE", "/mybucket", "website"), "testing");
+        let del_next: NextFn = Arc::new(|r| {
+            assert_eq!(r.method, "POST");
+            Response::new(204)
+        });
+        assert_eq!(api.handle(del, &del_next).status, 204);
+
+        let missing = sign_request(base_s3_req("GET", "/mybucket", "website"), "testing");
+        let miss_next: NextFn = Arc::new(|_| Response::new(200));
+        let miss = api.handle(missing, &miss_next);
+        assert_eq!(miss.status, 404);
+        let miss_body = String::from_utf8(miss.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(
+            miss_body.contains("<Code>NoSuchWebsiteConfiguration</Code>"),
+            "{miss_body}"
+        );
+    }
+
+    #[test]
+    fn stored_policy_json_put_get_roundtrip() {
+        let api = S3Api::new(cred_map());
+        let json = br#"{"Version":"2012-10-17","Statement":[]}"#;
+        let stored = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let put_store = stored.clone();
+        let mut put = base_s3_req("PUT", "/mybucket", "policy");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(json.to_vec());
+        let put = sign_request(put, "testing");
+        let put_next: NextFn = Arc::new(move |r| {
+            assert_eq!(r.method, "POST");
+            let blob = r
+                .headers
+                .get("X-Container-Sysmeta-S3-Cfg-Policy")
+                .expect("policy meta")
+                .to_string();
+            *put_store.lock().unwrap() = Some(blob);
+            Response::new(204)
+        });
+        assert_eq!(api.handle(put, &put_next).status, 200);
+
+        let blob = stored.lock().unwrap().clone().unwrap();
+        let get = sign_request(base_s3_req("GET", "/mybucket", "policy"), "testing");
+        let get_next: NextFn = Arc::new(move |_| {
+            let mut resp = Response::new(200);
+            resp.headers.set("X-Container-Sysmeta-S3-Cfg-Policy", blob.clone());
+            resp
+        });
+        let get_resp = api.handle(get, &get_next);
+        assert_eq!(get_resp.status, 200);
+        assert_eq!(
+            get_resp.headers.get("Content-Type"),
+            Some("application/json")
+        );
+        let body = String::from_utf8(get_resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("2012-10-17"), "{body}");
+    }
+
+    #[test]
+    fn list_directory_buckets_is_empty_result() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(
+            base_s3_req("GET", "/", "max-directory-buckets=100"),
+            "testing",
+        );
+        let next: NextFn = Arc::new(|_| panic!("directory list must not hop to Swift"));
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<ListDirectoryBucketsResult"), "{body}");
     }
 
     #[test]
@@ -8261,11 +8449,17 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_policy_still_501() {
+    fn missing_bucket_policy_is_404_not_501() {
         let api = S3Api::new(cred_map());
         let req = sign_request(base_s3_req("GET", "/mybucket", "policy"), "testing");
-        let next: NextFn = Arc::new(|_| panic!("unsupported subresource must not fall through"));
-        assert_not_implemented(api.handle(req, &next), "policy");
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.method, "HEAD");
+            Response::new(200)
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 404);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>NoSuchBucketPolicy</Code>"), "{body}");
     }
 
     /// Sign a request with SigV2 (header Authorization).
