@@ -68,8 +68,8 @@ use swift_diskfile::{
     PolicyKind,
 };
 use swift_http::{
-    http_date, split_path, unquote, Body, ChainReader, HeaderKeyDict, Match, MimeDocs, Range,
-    Request, Response, STREAM_CHUNK,
+    http_date, split_path, unquote, Body, ChainReader, ClockHealth, HeaderKeyDict, Match,
+    MimeDocs, Range, Request, Response, STREAM_CHUNK,
 };
 
 use crate::ssync::{MissingOffer, SsyncEvent, SsyncParser, SsyncSubrequest};
@@ -114,6 +114,11 @@ pub struct ObjectServer {
     /// (`swift/common/utils`), surfacing as DiskFileNoSpace -> 507; the
     /// config default is `1%`.
     pub fallocate_reserve: FallocateReserve,
+    /// WORM clock-health source for the native lock gate
+    /// (`worm_clock_max_offset_ms`). Default disabled: the gate sees
+    /// `clock_ok=true` exactly as before. Enabled (>0) it is fail-closed —
+    /// see [`swift_http::clock_health`].
+    pub worm_clock: std::sync::Arc<ClockHealth>,
 }
 
 fn meta_get<'m>(meta: &'m Metadata, key: &str) -> Option<&'m str> {
@@ -412,9 +417,14 @@ fn metadata_as_headers(meta: &Metadata) -> HeaderKeyDict {
 /// a data overwrite and is not denied. Malformed lock headers deny
 /// inside [`native_mutation_allowed`]. A live object whose metadata cannot
 /// be read fails closed (500) instead of treating the object as unlocked.
+///
+/// `clock_ok` comes from the server's [`ClockHealth`] source
+/// (`worm_clock_max_offset_ms`); with the knob at its default 0 it is
+/// constant `true`, the historical behavior.
 fn deny_locked_native_mutation(
     req: &Request,
     existing: Option<Result<&Metadata, DiskFileError>>,
+    clock_ok: bool,
 ) -> Option<Response> {
     if req
         .headers
@@ -433,13 +443,12 @@ fn deny_locked_native_mutation(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    // clock_ok stays true until a clock-health signal exists.
     if native_mutation_allowed_for(
         &req.method,
         &headers,
         Some(&req.headers),
         now_unix,
-        true,
+        clock_ok,
         NativeGovernanceBypass::NONE,
     ) {
         None
@@ -494,6 +503,7 @@ impl ObjectServer {
             config,
             // swift.common.utils: fallocate_reserve defaults to "1%".
             fallocate_reserve: FallocateReserve::Percent(1.0),
+            worm_clock: std::sync::Arc::new(ClockHealth::disabled()),
         }
     }
 
@@ -501,6 +511,13 @@ impl ObjectServer {
     /// `swift_core::config::config_fallocate_value`.
     pub fn with_fallocate_reserve(mut self, reserve: FallocateReserve) -> Self {
         self.fallocate_reserve = reserve;
+        self
+    }
+
+    /// Wire a WORM clock-health source for the native lock gate
+    /// (default: disabled, `clock_ok=true`).
+    pub fn with_worm_clock(mut self, clock: std::sync::Arc<ClockHealth>) -> Self {
+        self.worm_clock = clock;
         self
     }
 
@@ -990,6 +1007,7 @@ impl ObjectServer {
                 orig_metadata
                     .as_ref()
                     .map(|meta| Ok::<_, DiskFileError>(meta)),
+                self.worm_clock.clock_ok(),
             ) {
                 return resp;
             }
@@ -1385,7 +1403,9 @@ impl ObjectServer {
         // Experimental native lock on existing-object POST. Replicate/ssync
         // skip. Lock-sysmeta-only POST is not denied. Unreadable metadata
         // fails closed (500).
-        if let Some(resp) = deny_locked_native_mutation(req, Some(orig.get_metadata())) {
+        if let Some(resp) =
+            deny_locked_native_mutation(req, Some(orig.get_metadata()), self.worm_clock.clock_ok())
+        {
             return resp;
         }
         let content_length = orig
@@ -1682,6 +1702,7 @@ impl ObjectServer {
                 orig_metadata
                     .as_ref()
                     .map(|meta| Ok::<_, DiskFileError>(meta)),
+                self.worm_clock.clock_ok(),
             ) {
                 return resp;
             }

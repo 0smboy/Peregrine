@@ -2768,6 +2768,21 @@ fn build_s3api(conf: &SwiftConfig) -> Result<Option<swift_s3api::S3Api>, String>
         .map(|value| strict_config_bool("enable_extended_subresources", &value))
         .transpose()?
         .unwrap_or(false);
+    // WORM clock-health knob. 0 (default) = disabled: clock_ok stays the
+    // historical constant `true`. >0 = enabled fail-closed against chrony
+    // tracking (docs/fairness-lab/WORM-VERSIONING-EC-MATRIX-20260817.md).
+    let worm_clock_max_offset_ms = conf
+        .get("filter:s3api", "worm_clock_max_offset_ms")
+        .map_err(|e| e.to_string())?
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            value
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| format!("invalid worm_clock_max_offset_ms {value:?}"))
+        })
+        .transpose()?
+        .unwrap_or(0);
 
     let s3_reseller = conf
         .get("filter:s3token", "reseller_prefix")
@@ -2801,6 +2816,11 @@ fn build_s3api(conf: &SwiftConfig) -> Result<Option<swift_s3api::S3Api>, String>
         .with_reseller_prefix(s3_reseller);
     if let Some(account) = anonymous_account {
         api = api.with_anonymous_account(account);
+    }
+    if worm_clock_max_offset_ms > 0 {
+        api = api.with_worm_clock(std::sync::Arc::new(swift_http::ClockHealth::chrony(
+            worm_clock_max_offset_ms,
+        )));
     }
 
     // IAM used to exist only as a library surface. Load it here so configured
@@ -3988,6 +4008,69 @@ mod startup_policy_tests {
         );
         assert_eq!(api.allowable_clock_skew, 37);
         assert!(api.extended_subresources);
+    }
+
+    #[test]
+    fn pipeline_s3api_worm_clock_knob_default_off_enabled_and_invalid() {
+        // Default: knob absent → disabled source, clock_ok constant true.
+        let default_conf = SwiftConfig::parse_lenient(
+            "[filter:tempauth]\nuser_test_tester = testing .admin\n[filter:s3api]\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let api = build_s3api(&default_conf)
+            .expect("valid default s3api configuration")
+            .expect("s3api credentials");
+        assert!(!api.worm_clock.enabled());
+        assert_eq!(api.worm_clock.max_offset_ms(), 0);
+        assert!(api.worm_clock.clock_ok());
+
+        // Explicit 0 keeps it disabled (deploy-safe spelling).
+        let zero_conf = SwiftConfig::parse_lenient(
+            "[filter:tempauth]\nuser_test_tester = testing .admin\n\
+             [filter:s3api]\nworm_clock_max_offset_ms = 0\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let api = build_s3api(&zero_conf)
+            .expect("valid s3api configuration")
+            .expect("s3api credentials");
+        assert!(!api.worm_clock.enabled());
+        assert!(api.worm_clock.clock_ok());
+
+        // Enabled wires the chrony-backed source with the threshold.
+        let on_conf = SwiftConfig::parse_lenient(
+            "[filter:tempauth]\nuser_test_tester = testing .admin\n\
+             [filter:s3api]\nworm_clock_max_offset_ms = 500\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let api = build_s3api(&on_conf)
+            .expect("valid s3api configuration")
+            .expect("s3api credentials");
+        assert!(api.worm_clock.enabled());
+        assert_eq!(api.worm_clock.max_offset_ms(), 500);
+
+        // Invalid spellings fail closed at startup, like allowable_clock_skew.
+        for bad in ["-1", "abc", "1.5"] {
+            let bad_conf = SwiftConfig::parse_lenient(
+                &format!(
+                    "[filter:tempauth]\nuser_test_tester = testing .admin\n\
+                     [filter:s3api]\nworm_clock_max_offset_ms = {bad}\n"
+                ),
+                &[],
+                false,
+            )
+            .unwrap();
+            let error = match build_s3api(&bad_conf) {
+                Err(error) => error,
+                Ok(_) => panic!("invalid worm_clock_max_offset_ms {bad:?} must fail closed"),
+            };
+            assert!(error.contains("worm_clock_max_offset_ms"), "{error}");
+        }
     }
 
     #[test]

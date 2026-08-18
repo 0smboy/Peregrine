@@ -18,6 +18,20 @@ health source anywhere in the workspace. Every production call path reaches
 the `_with_clock` decision functions through a wrapper or literal that pins
 `clock_ok = true`. The `false` branch is reachable only from unit tests.
 
+> **Update 2026-08-17 (branch `codex/s3-window-20260817`): 已接线（默认关）.**
+> GD-1 is closed at the wiring layer. A shared TTL-cached reader
+> (`swift-http/src/clock_health.rs`, `chronyc -c tracking` CSV, lazy refresh
+> ≤1 exec per 30 s, fail-closed on unreadable/unsynchronised/over-threshold)
+> now feeds every production entry listed in §1.2: `worm_guard`,
+> `worm_check_object`, `?versionId` DELETE, archived-null / suspended-null
+> overwrite, MPU complete, `handle_retention` PUT (all via
+> `S3Api.worm_clock`), and the native gate `deny_locked_native_mutation`
+> (via `ObjectServer.worm_clock`, replacing the literal at the old
+> `lib.rs:442`). Knob: `worm_clock_max_offset_ms` in `[filter:s3api]` and
+> `[app:object-server]` — **default `0` = disabled**, byte-for-byte today's
+> `clock_ok=true` behavior; `>0` enables fail-closed enforcement. The §1
+> audit text below describes the pre-window state and is kept as-is.
+
 ### 1.1 Decision layer (swift-s3api / object_lock_worm.rs)
 
 | Entry | clock deny points | Wrapper pinning `true` |

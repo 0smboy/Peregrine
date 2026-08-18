@@ -2,10 +2,11 @@
 //! Native `/v1` object-mutation lock gate (experimental).
 //!
 //! Wired on object-server PUT/POST/DELETE of an existing object. A POST
-//! that updates only lock sysmeta is not treated as a data overwrite.
-//! Not live-proven, not deployed, not a compliance claim. CAS and
-//! clock-health are still missing; the write path passes `clock_ok=true`
-//! until a clock-health signal exists.
+//! that updates only lock sysmeta, or only non-destructive S3 metadata
+//! sysmeta (tagging / restore / transition), is not treated as a data
+//! overwrite. Not live-proven, not deployed, not a compliance claim. CAS is
+//! still missing; `clock_ok` comes from the server's `ClockHealth` source
+//! (`worm_clock_max_offset_ms`, default off = constant `true`).
 //!
 //! This crate cannot depend on `swift-s3api`. The parser here is an
 //! independent fail-closed copy of the lock sysmeta rules:
@@ -23,6 +24,24 @@ const LOCK_SYS_META: &[&str] = &[
     SYS_LOCK_MODE,
     SYS_RETAIN_UNTIL,
     SYS_LOCK_REVISION,
+];
+
+/// S3 control-plane metadata sysmeta that never rewrites object data or
+/// lock state. AWS allows PutObjectTagging / DeleteObjectTagging /
+/// RestoreObject (and lifecycle transition stamps) on locked objects:
+/// Object Lock protects data and lock state, not tags or restore status.
+/// Independent fail-closed copy of the `swift-s3api` key names
+/// (`bucket_config::S3_OBJECT_TAGGING_META`, `lifecycle_exec::SYS_*`).
+pub const SYS_TAGGING: &str = "X-Object-Sysmeta-S3-Tagging";
+pub const SYS_RESTORE_UNTIL: &str = "X-Object-Sysmeta-S3-Restore-Until";
+pub const SYS_TRANSITION_AT: &str = "X-Object-Sysmeta-S3-Transition-At";
+pub const SYS_TRANSITIONED: &str = "X-Object-Sysmeta-S3-Transitioned";
+
+const METADATA_ONLY_SYS_META: &[&str] = &[
+    SYS_TAGGING,
+    SYS_RESTORE_UNTIL,
+    SYS_TRANSITION_AT,
+    SYS_TRANSITIONED,
 ];
 
 /// Governance bypass on the native path still needs both bits.
@@ -51,14 +70,19 @@ impl NativeGovernanceBypass {
 /// * GET/HEAD/OPTIONS → allow (not a mutation)
 /// * lock-sysmeta-only POST → allow (not a data overwrite; see
 ///   [`is_s3_lock_control_plane_post`])
+/// * metadata-only POST (pure tagging/restore/transition sysmeta, no lock
+///   keys) → allow (see [`is_s3_metadata_only_post`])
 /// * missing lock headers → allow
 /// * malformed lock headers → deny
 /// * legal-hold ON → deny (bypass ignored)
 /// * COMPLIANCE + `clock_ok=false` → deny
 /// * active GOVERNANCE → allow only when `bypass` is header AND authorized
 ///
-/// Lock-sysmeta-only POST is allowed via [`native_mutation_allowed_for`].
-/// PUT overwrite and DELETE stay denied when the object is locked.
+/// Lock-sysmeta-only and metadata-only POSTs are allowed via
+/// [`native_mutation_allowed_for`]. A POST mixing metadata sysmeta with
+/// lock sysmeta, user metadata, or any other persistable header keeps the
+/// original gate semantics (denied on a locked object). PUT overwrite and
+/// DELETE stay denied when the object is locked.
 pub fn native_mutation_allowed(
     method: &str,
     object_headers: &HeaderKeyDict,
@@ -80,6 +104,9 @@ pub fn native_mutation_allowed_for(
     bypass: NativeGovernanceBypass,
 ) -> bool {
     if request_headers.is_some_and(|headers| is_s3_lock_control_plane_post(method, headers)) {
+        return true;
+    }
+    if request_headers.is_some_and(|headers| is_s3_metadata_only_post(method, headers)) {
         return true;
     }
     if !is_mutation_method(method) {
@@ -142,8 +169,49 @@ pub fn is_s3_lock_control_plane_post(method: &str, request_headers: &HeaderKeyDi
     saw_lock
 }
 
+/// True when `request_headers` is a non-destructive S3 metadata POST: only
+/// tagging / restore / transition sysmeta (see [`METADATA_ONLY_SYS_META`])
+/// plus transport headers, at least one such key, and **no** lock sysmeta.
+///
+/// These POSTs update S3 control-plane metadata that AWS Object Lock does
+/// not protect, so they pass the gate on a locked object. Any mix with lock
+/// sysmeta (retention / legal-hold / revision), user metadata, or another
+/// persistable header disqualifies the POST and the original gate semantics
+/// apply unchanged.
+pub fn is_s3_metadata_only_post(method: &str, request_headers: &HeaderKeyDict) -> bool {
+    if !method.eq_ignore_ascii_case("POST") {
+        return false;
+    }
+    let mut saw_metadata = false;
+    for (key, value) in request_headers.iter() {
+        if value.trim().is_empty() {
+            continue;
+        }
+        if is_lock_sysmeta_key(key) {
+            return false;
+        }
+        if is_metadata_only_sysmeta_key(key) {
+            saw_metadata = true;
+            continue;
+        }
+        if is_lock_post_transport_header(key) {
+            continue;
+        }
+        if is_object_persistable_header(key) {
+            return false;
+        }
+    }
+    saw_metadata
+}
+
 fn is_lock_sysmeta_key(key: &str) -> bool {
     LOCK_SYS_META
+        .iter()
+        .any(|name| key.eq_ignore_ascii_case(name))
+}
+
+fn is_metadata_only_sysmeta_key(key: &str) -> bool {
+    METADATA_ONLY_SYS_META
         .iter()
         .any(|name| key.eq_ignore_ascii_case(name))
 }
@@ -623,21 +691,15 @@ mod tests {
         ));
     }
 
-    /// BUG (Wave-9 WORM audit, 2026-08-17): the native gate classifies every
-    /// POST carrying non-lock sysmeta as a data overwrite, so S3
-    /// PutObjectTagging / DeleteObjectTagging (POST with
-    /// `X-Object-Sysmeta-S3-Tagging`) and RestoreObject
-    /// (POST with `X-Object-Sysmeta-S3-Restore-Until`) return 403 on a
-    /// locked object wherever the Rust object-server is in the path.
+    /// BUG-1 (Wave-9 WORM audit, 2026-08-17), fixed in this window: the
+    /// native gate used to classify every POST carrying non-lock sysmeta as
+    /// a data overwrite, so S3 PutObjectTagging / DeleteObjectTagging (POST
+    /// with `X-Object-Sysmeta-S3-Tagging`) and RestoreObject (POST with
+    /// `X-Object-Sysmeta-S3-Restore-Until`) returned 403 on a locked object.
     /// AWS allows all three on locked objects: Object Lock protects object
     /// data and lock state, not tags or restore status. Swift-native POST is
     /// metadata-only and never rewrites data.
-    ///
-    /// This test asserts the DESIRED (AWS) behaviour and is ignored until the
-    /// control-plane classifier learns non-destructive metadata POSTs. Fix
-    /// belongs to a code window, not this test-only audit branch.
     #[test]
-    #[ignore = "records native-gate over-blocking of tagging/restore POST on locked objects; un-ignore with the fix"]
     fn native_gate_should_allow_tagging_only_post_on_locked_object() {
         let object = locked_compliance();
         let mut tagging_only = HeaderKeyDict::new();
@@ -656,6 +718,107 @@ mod tests {
             "POST",
             &object,
             Some(&restore_only),
+            1_700_000_000,
+            true,
+            NativeGovernanceBypass::NONE,
+        ));
+    }
+
+    #[test]
+    fn metadata_only_post_classifier_families_and_transport() {
+        // Transition stamps are metadata-class too, alone or together with
+        // the other metadata families, and transport headers do not
+        // disqualify the POST.
+        let object = locked_compliance();
+        let mut transition_only = HeaderKeyDict::new();
+        transition_only.set(SYS_TRANSITION_AT, "1893456000");
+        transition_only.set(SYS_TRANSITIONED, "1");
+        transition_only.set("X-Timestamp", "1700000000.00000");
+        transition_only.set("Content-Type", "application/octet-stream");
+        assert!(is_s3_metadata_only_post("POST", &transition_only));
+        assert!(native_mutation_allowed_for(
+            "POST",
+            &object,
+            Some(&transition_only),
+            1_700_000_000,
+            true,
+            NativeGovernanceBypass::NONE,
+        ));
+
+        // Same headers on a PUT are not a metadata POST: locked object PUT
+        // stays denied.
+        assert!(!is_s3_metadata_only_post("PUT", &transition_only));
+        assert!(!native_mutation_allowed_for(
+            "PUT",
+            &object,
+            Some(&transition_only),
+            1_700_000_000,
+            true,
+            NativeGovernanceBypass::NONE,
+        ));
+
+        // Empty-valued metadata keys do not count as a metadata payload.
+        let mut empty_only = HeaderKeyDict::new();
+        empty_only.set(SYS_TAGGING, "   ");
+        assert!(!is_s3_metadata_only_post("POST", &empty_only));
+    }
+
+    #[test]
+    fn mixed_metadata_and_lock_post_still_denied() {
+        // BUG-1 negative: a POST carrying both metadata sysmeta and lock
+        // sysmeta is neither a lock control-plane POST nor a metadata-only
+        // POST — on a locked object the original gate semantics deny it.
+        let object = locked_compliance();
+        let mut mixed = HeaderKeyDict::new();
+        mixed.set(SYS_TAGGING, "env=prod");
+        mixed.set(SYS_LEGAL_HOLD, "ON");
+        assert!(!is_s3_metadata_only_post("POST", &mixed));
+        assert!(!is_s3_lock_control_plane_post("POST", &mixed));
+        assert!(!native_mutation_allowed_for(
+            "POST",
+            &object,
+            Some(&mixed),
+            1_700_000_000,
+            true,
+            NativeGovernanceBypass::NONE,
+        ));
+
+        // Metadata sysmeta + retention keys is equally disqualified.
+        let mut with_retention = HeaderKeyDict::new();
+        with_retention.set(SYS_RESTORE_UNTIL, "1893456000");
+        with_retention.set(SYS_LOCK_MODE, "COMPLIANCE");
+        with_retention.set(SYS_RETAIN_UNTIL, "2033-05-18T03:33:20Z");
+        assert!(!is_s3_metadata_only_post("POST", &with_retention));
+        assert!(!native_mutation_allowed_for(
+            "POST",
+            &object,
+            Some(&with_retention),
+            1_700_000_000,
+            true,
+            NativeGovernanceBypass::NONE,
+        ));
+
+        // Metadata sysmeta + user metadata (a real POST payload) is a data
+        // plane touch: still denied on a locked object.
+        let mut with_user_meta = HeaderKeyDict::new();
+        with_user_meta.set(SYS_TAGGING, "env=prod");
+        with_user_meta.set("X-Object-Meta-Color", "blue");
+        assert!(!is_s3_metadata_only_post("POST", &with_user_meta));
+        assert!(!native_mutation_allowed_for(
+            "POST",
+            &object,
+            Some(&with_user_meta),
+            1_700_000_000,
+            true,
+            NativeGovernanceBypass::NONE,
+        ));
+
+        // Unlocked object: the same mixed POST is allowed (no lock headers).
+        let unlocked = HeaderKeyDict::new();
+        assert!(native_mutation_allowed_for(
+            "POST",
+            &unlocked,
+            Some(&with_user_meta),
             1_700_000_000,
             true,
             NativeGovernanceBypass::NONE,

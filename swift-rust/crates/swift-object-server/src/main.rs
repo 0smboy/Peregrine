@@ -118,6 +118,17 @@ fn main() {
             logger.error(&e.to_string());
             std::process::exit(1);
         });
+    // WORM clock-health knob for the native lock gate. 0 (default) =
+    // disabled: clock_ok stays the historical constant `true`. >0 = enabled
+    // fail-closed against chrony tracking. Invalid values refuse startup
+    // rather than silently disabling a safety signal.
+    let worm_clock_max_offset_ms = {
+        let raw = get("worm_clock_max_offset_ms", "0");
+        raw.trim().parse::<u64>().unwrap_or_else(|_| {
+            logger.error(&format!("invalid worm_clock_max_offset_ms {raw:?}"));
+            std::process::exit(1);
+        })
+    };
     let config = ObjectServerConfig {
         devices: get("devices", "/srv/node").into(),
         mount_check: matches!(
@@ -271,7 +282,12 @@ fn main() {
         ));
     }
 
-    let server = ObjectServer::new(config).with_fallocate_reserve(fallocate_reserve);
+    let mut server = ObjectServer::new(config).with_fallocate_reserve(fallocate_reserve);
+    if worm_clock_max_offset_ms > 0 {
+        server = server.with_worm_clock(std::sync::Arc::new(swift_http::ClockHealth::chrony(
+            worm_clock_max_offset_ms,
+        )));
+    }
     match serve_with_config_multi(listeners, server, http_config) {
         Ok(()) => logger.info("exiting"),
         Err(e) => {
