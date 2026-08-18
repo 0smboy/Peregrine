@@ -623,9 +623,85 @@ pub fn select_star_event_stream(payload: &[u8]) -> Vec<u8> {
     out
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectStarPlan {
+    All,
+    Limit(usize),
+}
+
+/// `SELECT * FROM S3Object` only, optional single-token alias and `LIMIT n`.
+pub fn parse_select_star(body: &[u8]) -> Option<SelectStarPlan> {
+    parse_select_star_expr(&extract_select_expression(body))
+}
+
 pub fn select_expression_is_star(body: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(body).to_ascii_uppercase();
-    text.contains("SELECT") && text.contains("S3OBJECT")
+    parse_select_star(body).is_some()
+}
+
+fn extract_select_expression(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let lower = text.to_ascii_lowercase();
+    if let Some(start) = lower.find("<expression>") {
+        let rest = &text[start + "<expression>".len()..];
+        let rest_l = rest.to_ascii_lowercase();
+        if let Some(end) = rest_l.find("</expression>") {
+            return rest[..end].trim().to_string();
+        }
+    }
+    text.trim().to_string()
+}
+
+fn parse_select_star_expr(expr: &str) -> Option<SelectStarPlan> {
+    let tokens: Vec<String> = expr
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| c == ';' || c == ',').to_ascii_uppercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let t: Vec<&str> = tokens.iter().map(String::as_str).collect();
+    match t.as_slice() {
+        ["SELECT", "*", "FROM", "S3OBJECT"] => Some(SelectStarPlan::All),
+        ["SELECT", "*", "FROM", "S3OBJECT", "LIMIT", n] => parse_select_limit(n),
+        ["SELECT", "*", "FROM", "S3OBJECT", alias]
+            if is_select_alias(alias) =>
+        {
+            Some(SelectStarPlan::All)
+        }
+        ["SELECT", "*", "FROM", "S3OBJECT", alias, "LIMIT", n]
+            if is_select_alias(alias) =>
+        {
+            parse_select_limit(n)
+        }
+        _ => None,
+    }
+}
+
+fn is_select_alias(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias != "LIMIT"
+        && alias
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn parse_select_limit(n: &str) -> Option<SelectStarPlan> {
+    let v: usize = n.parse().ok()?;
+    if v == 0 || v > 1_000_000 {
+        return None;
+    }
+    Some(SelectStarPlan::Limit(v))
+}
+
+pub fn apply_select_limit(payload: &[u8], limit: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut taken = 0usize;
+    for line in payload.split_inclusive(|&b| b == b'\n') {
+        if taken >= limit {
+            break;
+        }
+        out.extend_from_slice(line);
+        taken += 1;
+    }
+    out
 }
 
 /// Single-file BitTorrent metainfo for `GetObjectTorrent` (one piece = whole object).
@@ -1124,5 +1200,25 @@ mod tests {
                 .unwrap();
         assert!(http_copy.contains("<LastModified>2013-05-24T00:00:00.000Z</LastModified>"));
         assert!(!http_copy.contains("Fri, 24 May"));
+    }
+
+    #[test]
+    fn parse_select_star_accepts_star_and_limit_only() {
+        assert_eq!(
+            parse_select_star(
+                b"<SelectRequest><Expression>SELECT * FROM S3Object</Expression></SelectRequest>"
+            ),
+            Some(SelectStarPlan::All)
+        );
+        assert_eq!(
+            parse_select_star(b"SELECT * FROM S3Object s LIMIT 2"),
+            Some(SelectStarPlan::Limit(2))
+        );
+        assert_eq!(parse_select_star(b"SELECT _1 FROM S3Object"), None);
+        assert_eq!(parse_select_star(b"SELECT * FROM S3Object WHERE a=1"), None);
+        assert_eq!(
+            apply_select_limit(b"a\nb\nc\n", 2),
+            b"a\nb\n".to_vec()
+        );
     }
 }

@@ -149,6 +149,16 @@ SELECT_XML = (
     b"<InputSerialization><CSV/></InputSerialization>"
     b"<OutputSerialization><CSV/></OutputSerialization></SelectRequest>"
 )
+SELECT_LIMIT_XML = (
+    b"<SelectRequest><Expression>SELECT * FROM S3Object LIMIT 1</Expression>"
+    b"<InputSerialization><CSV/></InputSerialization>"
+    b"<OutputSerialization><CSV/></OutputSerialization></SelectRequest>"
+)
+SELECT_NOT_STAR_XML = (
+    b"<SelectRequest><Expression>SELECT _1 FROM S3Object</Expression>"
+    b"<InputSerialization><CSV/></InputSerialization>"
+    b"<OutputSerialization><CSV/></OutputSerialization></SelectRequest>"
+)
 STORED_QUERY_NAMES = frozenset(item[0] for item in STORED_BUCKET_CONFIGS)
 
 RESTORE_XML = (
@@ -222,6 +232,8 @@ def _declared_cases() -> Tuple[str, ...]:
         "put-object-encryption",
         "get-object-encryption",
         "select-star",
+        "select-limit",
+        "select-not-star",
         "get-object-torrent",
         "write-get-object-response-501",
         "list-directory-buckets",
@@ -1052,6 +1064,18 @@ def _run_matrix(runner: Runner) -> None:
         if not snap.body:
             case.issue("select empty body")
 
+    def select_limit(case: Case) -> None:
+        snap = runner.req(case, "POST", _path(main, "probe.txt"),
+                          (("select", ""), ("select-type", "2")), SELECT_LIMIT_XML)
+        runner.expect_status(case, snap, (200,))
+        if not snap.body:
+            case.issue("select-limit empty body")
+
+    def select_not_star(case: Case) -> None:
+        snap = runner.req(case, "POST", _path(main, "probe.txt"),
+                          (("select", ""), ("select-type", "2")), SELECT_NOT_STAR_XML)
+        runner.expect_error(case, snap, 400, "InvalidRequest")
+
     def get_object_torrent(case: Case) -> None:
         snap = runner.req(case, "GET", _path(main, "probe.txt"), (("torrent", ""),))
         runner.expect_body_contains(case, snap, "4:info")
@@ -1254,6 +1278,8 @@ def _run_matrix(runner: Runner) -> None:
     runner.run_case("put-object-encryption", put_object_encryption)
     runner.run_case("get-object-encryption", get_object_encryption)
     runner.run_case("select-star", select_star)
+    runner.run_case("select-limit", select_limit)
+    runner.run_case("select-not-star", select_not_star)
     runner.run_case("get-object-torrent", get_object_torrent)
     runner.run_case("write-get-object-response-501", write_get_object_response_501)
     runner.run_case("list-directory-buckets", list_directory_buckets)
@@ -1482,6 +1508,9 @@ class _MockClient:
                                 b"<Error><Code>ServerSideEncryptionConfigurationNotFoundError"
                                 b"</Code></Error>")
         if method == "POST" and q0 == "select":
+            if b"SELECT *" not in body.upper():
+                return Snapshot(400, {"content-type": ("application/xml",)},
+                                b"<Error><Code>InvalidRequest</Code></Error>")
             return Snapshot(200, {"content-type": ("application/vnd.amazon.eventstream",)},
                             b"\x00\x00\x00\x20eventstream")
         if method == "GET" and q0 == "torrent":
@@ -1601,6 +1630,8 @@ def _selftest_body() -> None:
     _expect("put-object-tagging" in ALL_CASES, "PutObjectTagging missing")
     _expect("rename-object" in ALL_CASES, "RenameObject missing")
     _expect("select-star" in ALL_CASES, "SelectObjectContent missing")
+    _expect("select-limit" in ALL_CASES, "Select LIMIT missing")
+    _expect("select-not-star" in ALL_CASES, "Select projection 400 missing")
     _expect("get-object-torrent" in ALL_CASES, "GetObjectTorrent missing")
     _expect("write-get-object-response-501" in ALL_CASES, "WGOR 501 missing")
     _expect("put-cfg-abac" in ALL_CASES, "stored abac PUT missing")

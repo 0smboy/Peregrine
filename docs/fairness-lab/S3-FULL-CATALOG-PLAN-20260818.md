@@ -58,10 +58,14 @@ policy, website, logging, notification, encryption, publicAccessBlock, ownership
 
 metadata*, ABAC, annotation, CreateSession, RenameObject, SelectObjectContent (`SELECT *` only), GetObjectTorrent, UpdateObjectEncryption。现场矩阵 **167/167 gate=PASS**。纸面 **115 LIVE / 1 HONEST_501 / 0 FAIL**。
 
+### W3.1 — 已完成（2026-08-18）
+
+Select 收紧为 `SELECT * FROM S3Object` 加可选 `LIMIT n`。投影和 WHERE 回 400，不再把任意 SELECT 当整对象返回。现场矩阵 **169/169 gate=PASS**。纸面仍 **115 / 1**。
+
 ### W4 — 剩余诚实 501 + 引擎诚实
 
 - WriteGetObjectResponse 保持 Object Lambda 501（无 Lambda 运行时）。
-- 已 LIVE 的配置/select/torrent 仍是子集：sysmeta 往返、`SELECT *`、生成 .torrent。加深引擎另开窗，禁止把子集装成完整 AWS。
+- 已 LIVE 的配置/select/torrent 仍是子集：sysmeta 往返、`SELECT *` + LIMIT、生成 .torrent。WHERE/列投影另开窗，禁止把子集装成完整 AWS。
 
 ## 5. 现场约束（所有 agent 必须遵守）
 

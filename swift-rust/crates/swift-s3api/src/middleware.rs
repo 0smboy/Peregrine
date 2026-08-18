@@ -166,7 +166,8 @@ use crate::response::{
     delete_object_response, delete_result_xml, get_object_attributes_xml,
     list_all_my_buckets_xml, list_directory_buckets_xml, object_torrent_bytes,
     policy_status_xml, put_object_response, s3_error_response, s3_xml_timestamp,
-    select_expression_is_star, select_star_event_stream, unix_secs_to_s3_iso, xml_response,
+    apply_select_limit, parse_select_star, select_star_event_stream, unix_secs_to_s3_iso,
+    xml_response, SelectStarPlan,
     BucketInfo, DeleteError, DeletedObject, ListBucketResult, ListBucketResultV2, Owner,
     S3Object,
 };
@@ -5790,16 +5791,23 @@ fn handle_select_object_content(
         Ok(b) => b,
         Err(_) => return s3_error_response("IncompleteBody", None, &[]),
     };
-    if !select_expression_is_star(&body) {
-        return s3_error_response(
-            "InvalidRequest",
-            Some("only SELECT * FROM S3Object is implemented"),
-            &[],
-        );
-    }
+    let plan = match parse_select_star(&body) {
+        Some(plan) => plan,
+        None => {
+            return s3_error_response(
+                "InvalidRequest",
+                Some("only SELECT * FROM S3Object [LIMIT n] is implemented"),
+                &[],
+            )
+        }
+    };
     match control_get_object_bytes(cred, bucket, key, next) {
         Ok(data) => {
-            let mut resp = Response::with_body(200, select_star_event_stream(&data));
+            let payload = match plan {
+                SelectStarPlan::All => data,
+                SelectStarPlan::Limit(n) => apply_select_limit(&data, n),
+            };
+            let mut resp = Response::with_body(200, select_star_event_stream(&payload));
             resp.headers
                 .set("Content-Type", "application/vnd.amazon.eventstream");
             resp
@@ -7214,6 +7222,42 @@ mod tests {
         );
         let body = resp.body.into_vec(u64::MAX).unwrap();
         assert!(body.len() > 16, "event stream too short");
+    }
+
+    #[test]
+    fn select_projection_is_invalid_request() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("POST", "/mybucket/probe.txt", "select&select-type=2");
+        req.body = Body::from(
+            b"<SelectRequest><Expression>SELECT _1 FROM S3Object</Expression></SelectRequest>"
+                .to_vec(),
+        );
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|_| panic!("projection must not hop Swift"));
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("InvalidRequest"), "{body}");
+    }
+
+    #[test]
+    fn select_star_limit_returns_event_stream() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("POST", "/mybucket/probe.txt", "select&select-type=2");
+        req.body = Body::from(
+            b"<SelectRequest><Expression>SELECT * FROM S3Object LIMIT 1</Expression></SelectRequest>"
+                .to_vec(),
+        );
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.method, "GET");
+            Response::with_body(200, b"a\nb\n".to_vec())
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.into_vec(u64::MAX).unwrap().len() > 16);
     }
 
     #[test]
