@@ -36,8 +36,7 @@
 //!
 //! * **SigV2** (`Authorization: AWS …` / `AWSAccessKeyId` query) — **IMPLEMENTED**
 //!   (HMAC-SHA1 Base64; header + query Expires). See [`crate::sigv2`].
-//! * Other subresources in [`UNSUPPORTED_SUBRESOURCES`] (select, torrent,
-//!   metadata*, session, abac, annotation).
+//! * WriteGetObjectResponse (Object Lambda `x-amz-request-route`) stays 501.
 //!
 //! # Config subresources (meta round-trip — claimable unit surface)
 //!
@@ -120,14 +119,15 @@ use crate::aws_chunked::{
 };
 use crate::bucket_config::{
     apply_bucket_tagging_meta, apply_lifecycle_meta, apply_object_lock_meta,
-    apply_object_tagging_meta, apply_stored_bucket_config, apply_versioning_meta,
-    clear_bucket_tagging_meta, clear_lifecycle_meta, clear_object_tagging_meta,
-    clear_stored_bucket_config, empty_list_versions_result_xml, lifecycle_xml_from_headers,
-    parse_tagging_body, parse_versioning_status, stored_bucket_config,
-    stored_bucket_config_xml, tagging_xml_from_meta, validate_lifecycle_xml,
-    validate_object_lock_xml, validated_object_lock_xml_from_headers,
-    versioning_configuration_xml, versioning_status_from_headers, StoredBucketConfig,
-    S3_BUCKET_TAGGING_META, S3_OBJECT_TAGGING_META,
+    apply_object_tagging_meta,     apply_object_blob_meta, apply_stored_bucket_config, apply_versioning_meta,
+    clear_bucket_tagging_meta, clear_lifecycle_meta, clear_object_blob_meta,
+    clear_object_tagging_meta, clear_stored_bucket_config, empty_list_versions_result_xml,
+    lifecycle_xml_from_headers, object_blob_from_headers, parse_tagging_body,
+    parse_versioning_status, stored_bucket_config, stored_bucket_config_xml,
+    tagging_xml_from_meta, validate_lifecycle_xml, validate_object_lock_xml,
+    validated_object_lock_xml_from_headers, versioning_configuration_xml,
+    versioning_status_from_headers, StoredBucketConfig, S3_BUCKET_TAGGING_META,
+    S3_OBJECT_ANNOTATION_META, S3_OBJECT_ENCRYPTION_META, S3_OBJECT_TAGGING_META,
 };
 use crate::cold_tier::{
     archive_commit, begin_restore, complete_restore, hot_reclamation_allowed,
@@ -162,11 +162,13 @@ use crate::object_lock_worm::{
 };
 use crate::parse::{extract_bucket_and_key, s3_to_swift_path, validate_bucket_name};
 use crate::response::{
-    copy_object_result_xml, copy_part_result_xml, delete_object_response, delete_result_xml,
-    get_object_attributes_xml, list_all_my_buckets_xml, list_directory_buckets_xml,
-    policy_status_xml, put_object_response,
-    s3_error_response, s3_xml_timestamp, xml_response, BucketInfo, DeleteError, DeletedObject,
-    ListBucketResult, ListBucketResultV2, Owner, S3Object,
+    copy_object_result_xml, copy_part_result_xml, create_session_result_xml,
+    delete_object_response, delete_result_xml, get_object_attributes_xml,
+    list_all_my_buckets_xml, list_directory_buckets_xml, object_torrent_bytes,
+    policy_status_xml, put_object_response, s3_error_response, s3_xml_timestamp,
+    select_expression_is_star, select_star_event_stream, unix_secs_to_s3_iso, xml_response,
+    BucketInfo, DeleteError, DeletedObject, ListBucketResult, ListBucketResultV2, Owner,
+    S3Object,
 };
 use crate::sigv2::{
     check_sigv2_time, is_sigv2_auth, parse_sigv2_auth, string_to_sign_for_request_v2, verify_sigv2,
@@ -441,18 +443,8 @@ fn credential_from_s3token(
 ///
 /// Implemented elsewhere (must **not** appear here): `lifecycle`, `tagging`,
 /// `versioning`, `versions`, `object-lock`, `legal-hold`, `retention`, `restore`.
-const UNSUPPORTED_SUBRESOURCES: &[&str] = &[
-    "select",
-    "torrent",
-    "metadataConfiguration",
-    "metadataTableConfiguration",
-    "metadataJournalTableConfiguration",
-    "metadataInventoryTableConfiguration",
-    "metadataAnnotationTableConfiguration",
-    "session",
-    "abac",
-    "annotation",
-];
+const UNSUPPORTED_SUBRESOURCES: &[&str] = &[];
+const MAX_SELECT_TORRENT_BODY: u64 = 16 * 1024 * 1024;
 
 /// Fixed client-facing messages for stable 501 responses (unit-tested).
 const MSG_ECDSA_STREAMING_NOT_IMPLEMENTED: &str =
@@ -1888,11 +1880,6 @@ impl S3Api {
         if let Some(sub) = first_unsupported_subresource(&params) {
             return not_implemented_subresource(sub);
         }
-        if req.headers.get("X-Amz-Rename-Source").is_some()
-            || req.headers.get("x-amz-rename-source").is_some()
-        {
-            return not_implemented_subresource("rename");
-        }
         if req.headers.get("X-Amz-Request-Route").is_some()
             || req.headers.get("x-amz-request-route").is_some()
         {
@@ -1925,6 +1912,21 @@ impl S3Api {
                 return xml_response(200, list_directory_buckets_xml());
             }
         }
+        if req.headers.get("X-Amz-Rename-Source").is_some()
+            || req.headers.get("x-amz-rename-source").is_some()
+        {
+            match (bucket.as_deref(), key.as_deref()) {
+                (Some(b), Some(k)) => return handle_rename_object(req, &cred, b, k, next),
+                _ => {
+                    return s3_error_response(
+                        "InvalidRequest",
+                        Some("RenameObject requires a destination object key"),
+                        &[],
+                    )
+                }
+            }
+        }
+
         // PUT/copy: unknown x-amz-storage-class must 400 before any persist.
         if req.method == "PUT" {
             if let Some(resp) = reject_unknown_storage_class(&req) {
@@ -2157,6 +2159,68 @@ impl S3Api {
                     next,
                 );
             }
+        }
+
+        if bucket.is_some()
+            && key.is_none()
+            && params.iter().any(|(k, _)| k == "session")
+            && matches!(req.method.as_str(), "GET" | "HEAD" | "POST")
+        {
+            return handle_create_session(&cred);
+        }
+
+        if bucket.is_some() && key.is_some() && params.iter().any(|(k, _)| k == "annotation") {
+            return handle_object_stored_blob(
+                req,
+                &cred,
+                bucket.as_deref().unwrap(),
+                key.as_deref().unwrap(),
+                S3_OBJECT_ANNOTATION_META,
+                "NoSuchConfiguration",
+                next,
+            );
+        }
+
+        if bucket.is_some()
+            && key.is_some()
+            && params.iter().any(|(k, _)| k == "encryption")
+        {
+            return handle_object_stored_blob(
+                req,
+                &cred,
+                bucket.as_deref().unwrap(),
+                key.as_deref().unwrap(),
+                S3_OBJECT_ENCRYPTION_META,
+                "ServerSideEncryptionConfigurationNotFoundError",
+                next,
+            );
+        }
+
+        if bucket.is_some()
+            && key.is_some()
+            && params.iter().any(|(k, _)| k == "select")
+            && req.method == "POST"
+        {
+            return handle_select_object_content(
+                req,
+                &cred,
+                bucket.as_deref().unwrap(),
+                key.as_deref().unwrap(),
+                next,
+            );
+        }
+
+        if bucket.is_some()
+            && key.is_some()
+            && params.iter().any(|(k, _)| k == "torrent")
+            && matches!(req.method.as_str(), "GET" | "HEAD")
+        {
+            return handle_get_object_torrent(
+                &cred,
+                bucket.as_deref().unwrap(),
+                key.as_deref().unwrap(),
+                next,
+            );
         }
 
         // ---- Object Lock configuration (bucket) ----
@@ -5628,6 +5692,184 @@ fn handle_stored_bucket_config(
     }
 }
 
+fn handle_create_session(cred: &S3Credential) -> Response {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    xml_ok(create_session_result_xml(
+        &cred.access_key,
+        &cred.secret_key,
+        "peregrine-session",
+        &unix_secs_to_s3_iso(now + 900),
+    ))
+}
+
+fn handle_object_stored_blob(
+    req: Request,
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    header: &str,
+    missing_code: &str,
+    next: &NextFn,
+) -> Response {
+    match req.method.as_str() {
+        "GET" | "HEAD" => {
+            let mut head =
+                make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), Some(key)));
+            stamp_auth(&mut head, cred);
+            let resp = next(head);
+            if !(200..300).contains(&resp.status) {
+                return map_swift_error(resp.status, Some(bucket), Some(key));
+            }
+            match object_blob_from_headers(&resp.headers, header) {
+                Some(xml) => xml_ok(xml),
+                None => s3_error_response(missing_code, None, &[]),
+            }
+        }
+        "PUT" => {
+            let body = match req.body.into_vec(MAX_CONTROL_BODY) {
+                Ok(b) => b,
+                Err(_) => return s3_error_response("IncompleteBody", None, &[]),
+            };
+            if !body.iter().any(|b| *b == b'<' || *b == b'{') {
+                return s3_error_response("MalformedXML", None, &[]);
+            }
+            let mut post =
+                make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), Some(key)));
+            apply_object_blob_meta(&mut post.headers, header, &body);
+            stamp_auth(&mut post, cred);
+            let resp = next(post);
+            if (200..300).contains(&resp.status) {
+                Response::new(200)
+            } else {
+                map_swift_error(resp.status, Some(bucket), Some(key))
+            }
+        }
+        "DELETE" => {
+            let mut post =
+                make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), Some(key)));
+            clear_object_blob_meta(&mut post.headers, header);
+            stamp_auth(&mut post, cred);
+            let _ = next(post);
+            Response::new(204)
+        }
+        _ => s3_error_response("MethodNotAllowed", None, &[]),
+    }
+}
+
+fn control_get_object_bytes(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    next: &NextFn,
+) -> Result<Vec<u8>, Response> {
+    let mut get = make_swift_req("GET", &s3_to_swift_path(&cred.account, Some(bucket), Some(key)));
+    stamp_auth(&mut get, cred);
+    let resp = next(get);
+    if resp.status == 404 {
+        return Err(s3_error_response("NoSuchKey", None, &[]));
+    }
+    if !(200..300).contains(&resp.status) {
+        return Err(map_swift_error(resp.status, Some(bucket), Some(key)));
+    }
+    resp.body
+        .into_vec(MAX_SELECT_TORRENT_BODY)
+        .map_err(|_| s3_error_response("EntityTooLarge", None, &[]))
+}
+
+fn handle_select_object_content(
+    req: Request,
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    next: &NextFn,
+) -> Response {
+    let body = match req.body.into_vec(MAX_CONTROL_BODY) {
+        Ok(b) => b,
+        Err(_) => return s3_error_response("IncompleteBody", None, &[]),
+    };
+    if !select_expression_is_star(&body) {
+        return s3_error_response(
+            "InvalidRequest",
+            Some("only SELECT * FROM S3Object is implemented"),
+            &[],
+        );
+    }
+    match control_get_object_bytes(cred, bucket, key, next) {
+        Ok(data) => {
+            let mut resp = Response::with_body(200, select_star_event_stream(&data));
+            resp.headers
+                .set("Content-Type", "application/vnd.amazon.eventstream");
+            resp
+        }
+        Err(resp) => resp,
+    }
+}
+
+fn handle_get_object_torrent(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    next: &NextFn,
+) -> Response {
+    match control_get_object_bytes(cred, bucket, key, next) {
+        Ok(data) => {
+            let name = key.rsplit('/').next().unwrap_or(key);
+            let mut resp = Response::with_body(200, object_torrent_bytes(name, &data));
+            resp.headers.set("Content-Type", "application/x-bittorrent");
+            resp
+        }
+        Err(resp) => resp,
+    }
+}
+
+fn handle_rename_object(
+    req: Request,
+    cred: &S3Credential,
+    dest_bucket: &str,
+    dest_key: &str,
+    next: &NextFn,
+) -> Response {
+    let raw = req
+        .headers
+        .get("X-Amz-Rename-Source")
+        .or_else(|| req.headers.get("x-amz-rename-source"))
+        .unwrap_or("");
+    let Some((src_bucket, src_key, _)) = parse_copy_source(raw) else {
+        return s3_error_response("InvalidArgument", Some("invalid x-amz-rename-source"), &[]);
+    };
+    if src_bucket == dest_bucket && src_key == dest_key {
+        return s3_error_response("InvalidRequest", Some("rename source equals destination"), &[]);
+    }
+    let data = match control_get_object_bytes(cred, &src_bucket, &src_key, next) {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    let mut put = make_swift_req(
+        "PUT",
+        &s3_to_swift_path(&cred.account, Some(dest_bucket), Some(dest_key)),
+    );
+    put.headers.set("Content-Length", data.len().to_string());
+    put.body = Body::from(data);
+    stamp_auth(&mut put, cred);
+    let put_resp = next(put);
+    if !(200..300).contains(&put_resp.status) {
+        return map_swift_error(put_resp.status, Some(dest_bucket), Some(dest_key));
+    }
+    let mut del = make_swift_req(
+        "DELETE",
+        &s3_to_swift_path(&cred.account, Some(&src_bucket), Some(&src_key)),
+    );
+    stamp_auth(&mut del, cred);
+    let del_resp = next(del);
+    if !(200..300).contains(&del_resp.status) && del_resp.status != 404 {
+        return map_swift_error(del_resp.status, Some(&src_bucket), Some(&src_key));
+    }
+    Response::new(204)
+}
+
 fn handle_object_attributes(
     req: Request,
     cred: &S3Credential,
@@ -6919,18 +7161,72 @@ mod tests {
     }
 
     #[test]
-    fn rename_object_header_is_honest_501() {
+    fn rename_object_copies_then_deletes() {
         let api = S3Api::new(cred_map());
         let mut req = base_s3_req("PUT", "/mybucket/new-name.txt", "");
         req.headers
             .set("X-Amz-Rename-Source", "/mybucket/old-name.txt");
         req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         let req = sign_request(req, "testing");
-        let next: NextFn = Arc::new(|_| panic!("rename must not fall through"));
+        let next: NextFn = Arc::new(|r| match (r.method.as_str(), r.path.as_str()) {
+            ("GET", "/v1/AUTH_test/mybucket/old-name.txt") => {
+                Response::with_body(200, b"renamed-body".to_vec())
+            }
+            ("PUT", "/v1/AUTH_test/mybucket/new-name.txt") => Response::new(201),
+            ("DELETE", "/v1/AUTH_test/mybucket/old-name.txt") => Response::new(204),
+            _ => panic!("unexpected {} {}", r.method, r.path),
+        });
         let resp = api.handle(req, &next);
-        assert_eq!(resp.status, 501);
+        assert_eq!(resp.status, 204);
+    }
+
+    #[test]
+    fn create_session_returns_caller_credentials() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/mybucket", "session"), "testing");
+        let next: NextFn = Arc::new(|_| panic!("session must not hop Swift"));
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
-        assert!(body.contains("<Code>NotImplemented</Code>"), "{body}");
+        assert!(body.contains("<CreateSessionResult"), "{body}");
+        assert!(body.contains("<AccessKeyId>"), "{body}");
+    }
+
+    #[test]
+    fn select_star_returns_event_stream() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("POST", "/mybucket/probe.txt", "select&select-type=2");
+        req.body = Body::from(
+            b"<SelectRequest><Expression>SELECT * FROM S3Object</Expression></SelectRequest>"
+                .to_vec(),
+        );
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|r| {
+            assert_eq!(r.method, "GET");
+            Response::with_body(200, b"row1\n".to_vec())
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("application/vnd.amazon.eventstream")
+        );
+        let body = resp.body.into_vec(u64::MAX).unwrap();
+        assert!(body.len() > 16, "event stream too short");
+    }
+
+    #[test]
+    fn get_object_torrent_is_bencode() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/mybucket/probe.txt", "torrent"), "testing");
+        let next: NextFn = Arc::new(|_| Response::with_body(200, b"abc".to_vec()));
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        let body = resp.body.into_vec(u64::MAX).unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("4:info"), "{text}");
+        assert!(text.contains("8:announce"), "{text}");
     }
 
     #[test]

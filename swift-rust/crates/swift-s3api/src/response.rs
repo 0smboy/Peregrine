@@ -21,6 +21,7 @@
 //! v2 shapes; ACL/CORS/MPU live in sibling modules.
 
 use crate::xml::Element;
+use sha1::{Digest, Sha1};
 use swift_http::{parse_http_date, Response};
 
 /// Howard Hinnant civil-from-days / days-from-civil (same as `swift_http::dates`).
@@ -543,6 +544,110 @@ pub fn list_directory_buckets_xml() -> Vec<u8> {
     let mut root = Element::new("ListDirectoryBucketsResult");
     root.push(Element::new("Buckets"));
     root.to_xml(true)
+}
+
+/// `CreateSession` credentials the caller already holds (TempAuth mapped).
+pub fn create_session_result_xml(
+    access_key: &str,
+    secret_key: &str,
+    session_token: &str,
+    expiration: &str,
+) -> Vec<u8> {
+    let mut creds = Element::new("Credentials");
+    creds.push_leaf("AccessKeyId", access_key);
+    creds.push_leaf("SecretAccessKey", secret_key);
+    creds.push_leaf("SessionToken", session_token);
+    creds.push_leaf("Expiration", expiration);
+    let mut root = Element::new("CreateSessionResult");
+    root.push(creds);
+    root.to_xml(true)
+}
+
+pub fn unix_secs_to_s3_iso(secs: i64) -> String {
+    let (y, m, d) = civil_from_days(secs.div_euclid(86400));
+    let rem = secs.rem_euclid(86400) as u32;
+    let hh = rem / 3600;
+    let mm = (rem % 3600) / 60;
+    let ss = rem % 60;
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.000Z")
+}
+
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+fn eventstream_string_header(out: &mut Vec<u8>, name: &str, value: &str) {
+    out.push(name.len() as u8);
+    out.extend_from_slice(name.as_bytes());
+    out.push(7);
+    out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn eventstream_message(event_type: &str, payload: &[u8]) -> Vec<u8> {
+    let mut headers = Vec::new();
+    eventstream_string_header(&mut headers, ":message-type", "event");
+    eventstream_string_header(&mut headers, ":event-type", event_type);
+    if !payload.is_empty() {
+        eventstream_string_header(&mut headers, ":content-type", "application/octet-stream");
+    }
+    let total = 12 + headers.len() + payload.len() + 4;
+    let mut prelude = Vec::with_capacity(12);
+    prelude.extend_from_slice(&(total as u32).to_be_bytes());
+    prelude.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+    let prelude_crc = crc32_ieee(&prelude);
+    prelude.extend_from_slice(&prelude_crc.to_be_bytes());
+    let mut msg = prelude;
+    msg.extend_from_slice(&headers);
+    msg.extend_from_slice(payload);
+    let message_crc = crc32_ieee(&msg);
+    msg.extend_from_slice(&message_crc.to_be_bytes());
+    msg
+}
+
+/// Minimal SelectObjectContent event stream: Records (object bytes) + End.
+pub fn select_star_event_stream(payload: &[u8]) -> Vec<u8> {
+    let mut out = eventstream_message("Records", payload);
+    out.extend_from_slice(&eventstream_message("End", b""));
+    out
+}
+
+pub fn select_expression_is_star(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(body).to_ascii_uppercase();
+    text.contains("SELECT") && text.contains("S3OBJECT")
+}
+
+/// Single-file BitTorrent metainfo for `GetObjectTorrent` (one piece = whole object).
+pub fn object_torrent_bytes(name: &str, data: &[u8]) -> Vec<u8> {
+    let digest = Sha1::digest(data);
+    let name_bytes = name.as_bytes();
+    let mut info = Vec::new();
+    info.extend_from_slice(b"d6:lengthi");
+    info.extend_from_slice(data.len().to_string().as_bytes());
+    info.extend_from_slice(b"e4:name");
+    info.extend_from_slice(name_bytes.len().to_string().as_bytes());
+    info.push(b':');
+    info.extend_from_slice(name_bytes);
+    info.extend_from_slice(b"12:piece lengthi");
+    info.extend_from_slice(data.len().max(1).to_string().as_bytes());
+    info.extend_from_slice(b"e6:pieces20:");
+    info.extend_from_slice(&digest);
+    info.push(b'e');
+    let mut out = Vec::from(*b"d8:announce0:4:info");
+    out.extend_from_slice(&info);
+    out.push(b'e');
+    out
 }
 
 /// `GetBucketPolicyStatus`: no stored policy means the bucket is not public.

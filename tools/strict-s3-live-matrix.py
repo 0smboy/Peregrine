@@ -58,16 +58,7 @@ S3CFG_KEYS = re.compile(r"^(access_key|secret_key|host_base|host_bucket|"
                         r"bucket_location)\s*=\s*(.*)$")
 
 UNSUPPORTED_SUBRESOURCES = (
-    "select",
-    "torrent",
-    "metadataConfiguration",
-    "metadataTableConfiguration",
-    "metadataJournalTableConfiguration",
-    "metadataInventoryTableConfiguration",
-    "metadataAnnotationTableConfiguration",
-    "session",
-    "abac",
-    "annotation",
+    # WriteGetObjectResponse is header-only (x-amz-request-route), not a query.
 )
 
 # query, kind xml|json, body, success marker, missing error (None = 200 empty XML)
@@ -119,6 +110,44 @@ STORED_BUCKET_CONFIGS = (
      b"<Status>Disabled</Status><Destination><Bucket>arn:aws:s3:::dest</Bucket></Destination>"
      b"</Rule></ReplicationConfiguration>",
      "ReplicationConfiguration", "ReplicationConfigurationNotFoundError"),
+    ("metadataConfiguration", "xml",
+     b"<MetadataConfiguration><JournalTableConfiguration><RecordExpiration>"
+     b"<Expiration>NONE</Expiration></RecordExpiration></JournalTableConfiguration>"
+     b"</MetadataConfiguration>",
+     "MetadataConfiguration", "NoSuchConfiguration"),
+    ("metadataTableConfiguration", "xml",
+     b"<MetadataTableConfiguration><S3TablesDestination><TableBucketArn>"
+     b"arn:aws:s3tables:us-east-1:1:bucket/b</TableBucketArn>"
+     b"<TableName>t</TableName></S3TablesDestination></MetadataTableConfiguration>",
+     "MetadataTableConfiguration", "NoSuchConfiguration"),
+    ("metadataJournalTableConfiguration", "xml",
+     b"<JournalTableConfiguration><RecordExpiration><Expiration>NONE</Expiration>"
+     b"</RecordExpiration></JournalTableConfiguration>",
+     "JournalTableConfiguration", "NoSuchConfiguration"),
+    ("metadataInventoryTableConfiguration", "xml",
+     b"<InventoryTableConfiguration><ConfigurationState>DISABLED</ConfigurationState>"
+     b"</InventoryTableConfiguration>",
+     "InventoryTableConfiguration", "NoSuchConfiguration"),
+    ("metadataAnnotationTableConfiguration", "xml",
+     b"<AnnotationTableConfiguration><ConfigurationState>DISABLED</ConfigurationState>"
+     b"</AnnotationTableConfiguration>",
+     "AnnotationTableConfiguration", "NoSuchConfiguration"),
+    ("abac", "xml",
+     b"<AbacStatus><Status>Disabled</Status></AbacStatus>",
+     "AbacStatus", "NoSuchConfiguration"),
+)
+ANNOTATION_XML = (
+    b"<ObjectAnnotation><Annotation>matrix</Annotation></ObjectAnnotation>"
+)
+OBJECT_ENCRYPTION_XML = (
+    b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>"
+    b"<SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault>"
+    b"</Rule></ServerSideEncryptionConfiguration>"
+)
+SELECT_XML = (
+    b"<SelectRequest><Expression>SELECT * FROM S3Object</Expression>"
+    b"<InputSerialization><CSV/></InputSerialization>"
+    b"<OutputSerialization><CSV/></OutputSerialization></SelectRequest>"
 )
 STORED_QUERY_NAMES = frozenset(item[0] for item in STORED_BUCKET_CONFIGS)
 
@@ -185,7 +214,16 @@ def _declared_cases() -> Tuple[str, ...]:
         "get-bucket-policy-status",
         "get-bucket-policy-status-slash",
         "get-object-attributes",
-        "rename-object-501",
+        "rename-object",
+        "create-session",
+        "put-object-annotation",
+        "get-object-annotation",
+        "delete-object-annotation",
+        "put-object-encryption",
+        "get-object-encryption",
+        "select-star",
+        "get-object-torrent",
+        "write-get-object-response-501",
         "list-directory-buckets",
         "delete-object",
         "delete-bucket",
@@ -960,11 +998,68 @@ def _run_matrix(runner: Runner) -> None:
             b"", {"x-amz-object-attributes": "ETag,ObjectSize,StorageClass"})
         runner.expect_2xx_xml(case, snap, "GetObjectAttributesOutput")
 
-    def rename_object_501(case: Case) -> None:
+    def rename_object(case: Case) -> None:
         snap = runner.req(
             case, "PUT", _path(main, "renamed.txt"), (),
             b"", {"X-Amz-Rename-Source": "/{}/probe.txt".format(main),
                   "Content-Length": "0"})
+        runner.expect_status(case, snap, (204, 200))
+        if case.passed:
+            runner.objects.setdefault(main, []).append("renamed.txt")
+            if "probe.txt" in runner.objects.get(main, []):
+                runner.objects[main].remove("probe.txt")
+            # restore probe so later object cases still work
+            put = runner.target.request("PUT", _path(main, "probe.txt"), (), OBJECT_BODY)
+            if put.status in (200, 201):
+                runner.objects.setdefault(main, []).append("probe.txt")
+
+    def create_session(case: Case) -> None:
+        snap = runner.req(case, "GET", _path(main), (("session", ""),))
+        runner.expect_2xx_xml(case, snap, "CreateSessionResult")
+
+    def put_object_annotation(case: Case) -> None:
+        snap = runner.req(case, "PUT", _path(main, "probe.txt"),
+                          (("annotation", ""),), ANNOTATION_XML)
+        runner.expect_status(case, snap, (200,))
+
+    def get_object_annotation(case: Case) -> None:
+        snap = runner.req(case, "GET", _path(main, "probe.txt"), (("annotation", ""),))
+        runner.expect_2xx_xml(case, snap, "ObjectAnnotation")
+
+    def delete_object_annotation(case: Case) -> None:
+        snap = runner.req(case, "DELETE", _path(main, "probe.txt"), (("annotation", ""),))
+        runner.expect_status(case, snap, (204, 200))
+
+    def put_object_encryption(case: Case) -> None:
+        snap = runner.req(case, "PUT", _path(main, "probe.txt"),
+                          (("encryption", ""),), OBJECT_ENCRYPTION_XML)
+        runner.expect_status(case, snap, (200,))
+
+    def get_object_encryption(case: Case) -> None:
+        snap = runner.req(case, "GET", _path(main, "probe.txt"), (("encryption", ""),))
+        runner.expect_2xx_xml(case, snap, "ServerSideEncryptionConfiguration")
+
+    def select_star(case: Case) -> None:
+        snap = runner.req(case, "POST", _path(main, "probe.txt"),
+                          (("select", ""), ("select-type", "2")), SELECT_XML)
+        runner.expect_status(case, snap, (200,))
+        ctype = ""
+        for key, value in snap.headers.items():
+            if key.lower() == "content-type":
+                ctype = value[0] if isinstance(value, tuple) else str(value)
+        if "eventstream" not in ctype and snap.body[:4] == b"":
+            case.issue("select missing event stream")
+        if not snap.body:
+            case.issue("select empty body")
+
+    def get_object_torrent(case: Case) -> None:
+        snap = runner.req(case, "GET", _path(main, "probe.txt"), (("torrent", ""),))
+        runner.expect_body_contains(case, snap, "4:info")
+
+    def write_get_object_response_501(case: Case) -> None:
+        snap = runner.req(
+            case, "POST", "/", (), b"",
+            {"x-amz-request-route": "route", "x-amz-request-token": "tok"})
         runner.expect_error(case, snap, 501, "NotImplemented")
 
     def list_directory_buckets(case: Case) -> None:
@@ -1151,7 +1246,16 @@ def _run_matrix(runner: Runner) -> None:
     runner.run_case("get-bucket-policy-status", policy_status(False))
     runner.run_case("get-bucket-policy-status-slash", policy_status(True))
     runner.run_case("get-object-attributes", object_attributes)
-    runner.run_case("rename-object-501", rename_object_501)
+    runner.run_case("rename-object", rename_object)
+    runner.run_case("create-session", create_session)
+    runner.run_case("put-object-annotation", put_object_annotation)
+    runner.run_case("get-object-annotation", get_object_annotation)
+    runner.run_case("delete-object-annotation", delete_object_annotation)
+    runner.run_case("put-object-encryption", put_object_encryption)
+    runner.run_case("get-object-encryption", get_object_encryption)
+    runner.run_case("select-star", select_star)
+    runner.run_case("get-object-torrent", get_object_torrent)
+    runner.run_case("write-get-object-response-501", write_get_object_response_501)
     runner.run_case("list-directory-buckets", list_directory_buckets)
     for query, kind, body, marker, missing in STORED_BUCKET_CONFIGS:
         runner.run_case("put-cfg-{}".format(query), stored_put(query, body))
@@ -1306,6 +1410,10 @@ class _MockClient:
         self.calls.append((method, path + (("?" + query) if query else "")))
         if self.mode == "empty-xml":
             return Snapshot(200, {"content-type": ("application/xml",)}, b"")
+        hdrs = {k.lower(): v for k, v in headers.items()}
+        if "x-amz-request-route" in hdrs:
+            return Snapshot(501, {"content-type": ("application/xml",)},
+                            b"<Error><Code>NotImplemented</Code></Error>")
         if path == "/" and method in ("PUT", "DELETE", "POST"):
             xml = (
                 b"<Error><Code>MethodNotAllowed</Code><Message>x</Message><Method>"
@@ -1346,10 +1454,41 @@ class _MockClient:
                     200, {"content-type": ("application/xml",)},
                     "<{}/>".format(empty_marker).encode("ascii"),
                 )
-        hdrs = {k.lower(): v for k, v in headers.items()}
+        if q0 == "session":
+            return Snapshot(200, {"content-type": ("application/xml",)},
+                            b"<CreateSessionResult><Credentials><AccessKeyId>ak"
+                            b"</AccessKeyId></Credentials></CreateSessionResult>")
+        if q0 == "annotation":
+            key = (path, "annotation")
+            if method == "PUT":
+                self.stored[key] = body
+                return Snapshot(200, {}, b"")
+            if method == "DELETE":
+                self.stored.pop(key, None)
+                return Snapshot(204, {}, b"")
+            if key in self.stored:
+                return Snapshot(200, {"content-type": ("application/xml",)}, self.stored[key])
+            return Snapshot(404, {"content-type": ("application/xml",)},
+                            b"<Error><Code>NoSuchConfiguration</Code></Error>")
+        if q0 == "encryption" and path.count("/") >= 2:
+            key = (path, "obj-encryption")
+            if method == "PUT":
+                self.stored[key] = body
+                return Snapshot(200, {}, b"")
+            if method == "GET":
+                if key in self.stored:
+                    return Snapshot(200, {"content-type": ("application/xml",)}, self.stored[key])
+                return Snapshot(404, {"content-type": ("application/xml",)},
+                                b"<Error><Code>ServerSideEncryptionConfigurationNotFoundError"
+                                b"</Code></Error>")
+        if method == "POST" and q0 == "select":
+            return Snapshot(200, {"content-type": ("application/vnd.amazon.eventstream",)},
+                            b"\x00\x00\x00\x20eventstream")
+        if method == "GET" and q0 == "torrent":
+            return Snapshot(200, {"content-type": ("application/x-bittorrent",)},
+                            b"d8:announce0:4:infoe")
         if "x-amz-rename-source" in hdrs:
-            return Snapshot(501, {"content-type": ("application/xml",)},
-                            b"<Error><Code>NotImplemented</Code></Error>")
+            return Snapshot(204, {}, b"")
         if method == "PUT" and path.count("/") == 1:
             return Snapshot(200, {}, b"")
         if method == "HEAD" and "/probe.txt" in path:
@@ -1460,7 +1599,12 @@ def _selftest_body() -> None:
     _expect("get-bucket-policy-status" in ALL_CASES, "policyStatus missing")
     _expect("get-object-attributes" in ALL_CASES, "GetObjectAttributes missing")
     _expect("put-object-tagging" in ALL_CASES, "PutObjectTagging missing")
-    _expect("rename-object-501" in ALL_CASES, "RenameObject 501 missing")
+    _expect("rename-object" in ALL_CASES, "RenameObject missing")
+    _expect("select-star" in ALL_CASES, "SelectObjectContent missing")
+    _expect("get-object-torrent" in ALL_CASES, "GetObjectTorrent missing")
+    _expect("write-get-object-response-501" in ALL_CASES, "WGOR 501 missing")
+    _expect("put-cfg-abac" in ALL_CASES, "stored abac PUT missing")
+    _expect("put-cfg-metadataConfiguration" in ALL_CASES, "stored metadata PUT missing")
     _expect("list-directory-buckets" in ALL_CASES, "ListDirectoryBuckets missing")
     _expect("put-cfg-website" in ALL_CASES, "stored website PUT missing")
     _expect("put-cfg-policy" in ALL_CASES, "stored policy PUT missing")

@@ -548,7 +548,62 @@ pub const STORED_BUCKET_CONFIGS: &[StoredBucketConfig] = &[
         missing_code: Some("ReplicationConfigurationNotFoundError"),
         empty_xml: b"",
     },
+    StoredBucketConfig {
+        query: "metadataConfiguration",
+        header: "X-Container-Sysmeta-S3-Cfg-Metadata",
+        missing_code: Some("NoSuchConfiguration"),
+        empty_xml: b"",
+    },
+    StoredBucketConfig {
+        query: "metadataTableConfiguration",
+        header: "X-Container-Sysmeta-S3-Cfg-MetadataTable",
+        missing_code: Some("NoSuchConfiguration"),
+        empty_xml: b"",
+    },
+    StoredBucketConfig {
+        query: "metadataJournalTableConfiguration",
+        header: "X-Container-Sysmeta-S3-Cfg-MetadataJournal",
+        missing_code: Some("NoSuchConfiguration"),
+        empty_xml: b"",
+    },
+    StoredBucketConfig {
+        query: "metadataInventoryTableConfiguration",
+        header: "X-Container-Sysmeta-S3-Cfg-MetadataInventory",
+        missing_code: Some("NoSuchConfiguration"),
+        empty_xml: b"",
+    },
+    StoredBucketConfig {
+        query: "metadataAnnotationTableConfiguration",
+        header: "X-Container-Sysmeta-S3-Cfg-MetadataAnnotation",
+        missing_code: Some("NoSuchConfiguration"),
+        empty_xml: b"",
+    },
+    StoredBucketConfig {
+        query: "abac",
+        header: "X-Container-Sysmeta-S3-Cfg-Abac",
+        missing_code: Some("NoSuchConfiguration"),
+        empty_xml: b"",
+    },
 ];
+
+/// Object annotation XML blob (Get/Put/Delete/List ObjectAnnotation).
+pub const S3_OBJECT_ANNOTATION_META: &str = "X-Object-Sysmeta-S3-Annotation";
+
+/// Object encryption XML blob (UpdateObjectEncryption).
+pub const S3_OBJECT_ENCRYPTION_META: &str = "X-Object-Sysmeta-S3-Encryption";
+
+pub fn apply_object_blob_meta(headers: &mut HeaderKeyDict, header: &str, body: &[u8]) {
+    headers.set(header, encode_meta_blob(body));
+}
+
+pub fn clear_object_blob_meta(headers: &mut HeaderKeyDict, header: &str) {
+    headers.set(header, "");
+}
+
+pub fn object_blob_from_headers(headers: &HeaderKeyDict, header: &str) -> Option<Vec<u8>> {
+    let raw = headers.get(header).filter(|s| !s.is_empty())?;
+    decode_meta_blob(raw).ok()
+}
 
 pub fn stored_bucket_config(params: &[(String, String)]) -> Option<&'static StoredBucketConfig> {
     STORED_BUCKET_CONFIGS

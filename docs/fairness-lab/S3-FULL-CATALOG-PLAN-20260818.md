@@ -54,13 +54,14 @@ W0 完成定义：JSON 里 IN 每条都有结果；`executed == required`；`FAI
 
 policy, website, logging, notification, encryption, publicAccessBlock, ownershipControls, requestPayment, accelerate。每条：先加红测，再实现，再 VIP 绿。
 
-### W3 — 分析 / 复制 / 选择
+### W3 — 已完成（2026-08-18）
 
-analytics, inventory, metrics, intelligent-tiering, replication, select, torrent。同上：红测 → 实现 → 绿。
+metadata*, ABAC, annotation, CreateSession, RenameObject, SelectObjectContent (`SELECT *` only), GetObjectTorrent, UpdateObjectEncryption。现场矩阵 **167/167 gate=PASS**。纸面 **115 LIVE / 1 HONEST_501 / 0 FAIL**。
 
-### W4 — 新 AWS 面（Metadata / ABAC / Annotations / Rename / Directory / Session / Object Lambda）
+### W4 — 剩余诚实 501 + 引擎诚实
 
-默认 HONEST_501，直到单独开窗。禁止静默落到 Swift。
+- WriteGetObjectResponse 保持 Object Lambda 501（无 Lambda 运行时）。
+- 已 LIVE 的配置/select/torrent 仍是子集：sysmeta 往返、`SELECT *`、生成 .torrent。加深引擎另开窗，禁止把子集装成完整 AWS。
 
 ## 5. 现场约束（所有 agent 必须遵守）
 
