@@ -20,7 +20,7 @@ owner last), verified by SHA + health, then scored by one
 | Generation | Binary SHA-256 (prefix) | What it closed | Status |
 |------------|------------------------|----------------|--------|
 | 887be hotfix | `b3dfb5c8…` (then) | empty-key `PUT /bucket/` → NoSuchKey; invalid buckets no longer routed into Swift accounts | superseded |
-| Wave-2 | `e291ea61…` | 887be-era ops; empty-key mb | superseded (proxy); **still live for object servers** |
+| Wave-2 | `e291ea61…` | 887be-era ops; empty-key mb | superseded (proxy). Object Wave-2 `e1d4f1cc…` superseded 2026-08-18 |
 | F1 | `29acb863…` | clock-skew / expiry / InvalidStorageClass as real rejections | superseded |
 | XML | `2ecabc45…` | `RequestId` in every error body | superseded |
 | Schema | `a6b386e6…` | MPU composite ETag, ISO timestamps, PUT-ACL `Location` | superseded, kept as rollback target |
@@ -33,9 +33,9 @@ Guard rolled 1→4→3→2 (VIP owner last), post-roll dual-oracle
 failing-case set identical to post-GATE** (`50f0c860…`). The frozen 57
 surface did not regress. Supplement Section B moved **0/3 → 3/3**.
 
-Object servers fleet-wide remain Wave-2
-(`e1d4f1ccf6f01a18…`) — the honest sibling reconstructor build; nothing in
-the S3 alignment required rolling the object layer.
+Object servers fleet-wide are the 2026-08-18 BUG-1 build
+(`471e8b73340178c0…`, source `5992932`). Wave-2 `e1d4f1cc…` remains the
+rollback copy on each node.
 
 ## Code tip vs live binary
 
@@ -68,12 +68,15 @@ is tracked here rather than blurred:
   `AUTH_dev` stayed active (`delete_timestamp=0`) after the signed
   `DELETE /` probe.
 
-### Still awaiting an object-server roll / knob
+### Live on the 2026-08-18 object roll
 
 - **BUG-1 native-gate metadata POST** (PR #7): tagging-only / restore-only
-  / transition-only sysmeta POST on a locked object is allowed in the
-  Guard-era object source. The live Wave-2 object binary still has the
-  mis-deny. Needs a separate object-server roll.
+  / transition-only sysmeta POST on a locked object is allowed. Mixed
+  payloads that also carry lock keys stay denied. Canary on the existing
+  AUTH_dev leftover: tagging/restore-only object POST 202, mixed 403.
+
+### Still awaiting a knob
+
 - **`clock_ok` wired, default off** (PR #7): `[filter:s3api]
   worm_clock_max_offset_ms` stays `0` (historical `clock_ok=true`). `>0`
   is fail-closed against cached `chronyc -c tracking`. No behavior change

@@ -16,8 +16,8 @@ it is not a Swift twin.
 Live proxies and the VIP run Guard (`3d0138d5…`,
 [releases](/releases)). Stance remains **IMPLEMENTED_SUBSET_ONLY**.
 49/8 is the acceptance pass, not GREEN. Gate `671bcbaf…` is the
-rollback copy on each node. Live object servers remain Wave-2
-(`e1d4f1cc…`); BUG-1 is not claimed live.
+rollback copy on each node. Live object servers are the 2026-08-18
+BUG-1 build (`471e8b73…`).
 </Aside>
 
 Scoreboard evidence: post-GUARD
@@ -49,7 +49,7 @@ project。
 | Stance | `IMPLEMENTED_SUBSET_ONLY` |
 | Frozen 57-case scoreboard | **49/8 is the acceptance pass** (`rc=1` is expected) |
 | 57/57 zero-fail runner | not a go-live condition |
-| Live now (2026-08-18) | Guard `3d0138d5…` ×4 + VIP; object still Wave-2 `e1d4f1cc…` |
+| Live now (2026-08-18) | Guard `3d0138d5…` ×4 + VIP; object `471e8b73…` ×4 |
 | Binds the VIP | yes, on the Guard generation |
 | Isolation unit | Keystone **project** (Swift account `AUTH_<project_id>`) |
 | In-scope projects | operator-listed project IDs (may be several). No mandatory customer name. Lab leftovers `AUTH_dev` / `AUTH_test` / `AUTH_lab` are out of scope. |
@@ -119,7 +119,7 @@ residuals). Second scoreboard: `tools/strict-s3-supplement.py`.
 | Intended public name | `causalhelix.com` (sibling TLS agent). Not a live HTTPS claim. |
 | Live client path | lab self-signed VIP `https://10.0.0.10:8085` |
 | Alerts | mailbox named `74511.lab@gmail.com`; channel being connected. Proven sink remains lab JSONL on swift1. |
-| Object servers | Wave-2 `e1d4f1cc…` (re-checked 2026-08-18 on swift1). BUG-1 not live. |
+| Object servers | BUG-1 build `471e8b73…` (rolled 2026-08-18). Wave-2 is the rollback copy. |
 | DR config-plane backup | lab weekly cron; passphrase stays with the operator |
 | HAProxy / Keepalived / VIP | do not restart or move in this contract |
 
