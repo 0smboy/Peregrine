@@ -26,6 +26,7 @@ owner last), verified by SHA + health, then scored by one
 | Schema | `a6b386e6…` | MPU composite ETag, ISO timestamps, PUT-ACL `Location` | superseded, kept as rollback target |
 | Size | `69d22629…` | ListVersions `Size` stamped from the PUT request length (source `1151a88`) | superseded 2026-08-17, kept as rollback target |
 | **Gate** | **`671bcbaf2a1d195a…`** | container-PUT account gate fails closed (`503` on failed autocreate + re-check), fail-closed ratelimit / container-sync / account-freeze config parsing, `list_endpoints` v1/v2 (merge `a48a2b2`) | **live on 4/4 proxies + VIP since 2026-08-17** |
+| S3 window (tip) | not built | account-level `PUT/DELETE/POST/HEAD /` → 405 `MethodNotAllowed` (Python-aligned); native-gate tagging/restore POST fix (BUG-1); `worm_clock_max_offset_ms` default off (PR #7, `6958fae`) | **on `main`, not rolled** |
 
 Gate rolled 1→4→3→2 (VIP owner last), post-roll dual-oracle
 `strict-s3-dual-20260817-postgate.json` (SHA-256 `50f0c860…`): **49/8 with a
@@ -55,28 +56,36 @@ is tracked here rather than blurred:
   reproducing a real upstream concurrency segfault
   ([lab notes](/lab-cluster#install-checklist)).
 
-### Merged on `main`, awaiting the next proxy roll
+### Merged on `main`, awaiting the next proxy / object roll
 
-- **Cross-proxy version-index CAS** (2026-08-17): generation-fence
+- **Cross-proxy version-index CAS** (2026-08-17, PR #3): generation-fence
   create-only commit protocol; activation prerequisite is zero (works
   against the live Wave-2 object layer, which enforces
   `If-None-Match: *`). Red/green concurrency proof in CI;
   `docs/fairness-lab/VERSION-CAS-DESIGN-20260817.md`.
+- **Account-level 405 guard** (2026-08-17, PR #7): signed `PUT /`,
+  `DELETE /`, `POST /`, `HEAD /` now reject at the S3 layer with Python
+  2.33's `405 MethodNotAllowed` (`ResourceType=SERVICE`). Live Gate
+  still translates those into Swift `/v1/<account>` — a signed
+  `DELETE /` with `allow_account_management=true` **deletes the tenant
+  account**. Roll the proxy before exposing this path to anyone.
+- **BUG-1 native-gate metadata POST** (PR #7): tagging-only / restore-only
+  / transition-only sysmeta POST on a locked object is allowed. Mixed
+  payloads that also carry lock keys stay denied. Needs an **object-server**
+  roll; the live Wave-2 binary still has the mis-deny.
+- **`clock_ok` wired, default off** (PR #7): `[filter:s3api]
+  worm_clock_max_offset_ms` and the matching object-server knob. `0`
+  (default) keeps historical `clock_ok=true`. `>0` is fail-closed against
+  cached `chronyc -c tracking`. No behavior change until the knob is set
+  after the next roll.
 
 ### Recorded gaps, next code windows
 
-- `clock_ok` is **dead wiring**: every production caller pins the WORM
-  clock-health bit to `true`; no runtime clock-health source exists (all
-  four nodes' chrony are healthy, but the signal is not consumed). Design
-  proposal in `docs/fairness-lab/WORM-VERSIONING-EC-MATRIX-20260817.md`.
-- **BUG-1**: the object-server native WORM gate wrongly denies tagging-only
-  / restore-only metadata POSTs on locked objects (AWS allows them). An
-  `#[ignore]` repro test records the desired behavior.
-- Account-level guard rejecting non-GET requests with no bucket (`PUT /`
-  etc.) at the S3 layer with `InvalidURI` — the strict 57 does not exercise
-  that path.
 - Fence-object offline compactor with a safety proof (fences are permanent
   in v1 by design).
+- Second scoreboard `tools/strict-s3-supplement.py` (PR #8) is in-tree:
+  extras 7/7 vs AWS semantics; account-root negatives 0/3 on live Gate
+  (turns green only after the 405-guard proxy roll).
 
 ## Git branches
 

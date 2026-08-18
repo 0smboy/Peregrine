@@ -33,7 +33,7 @@ verified S3-side by the 2026-08-14 `s3api-frozen-accounts` run.
 - The write-side forensic loop was **not** closed to a tidy conclusion and
   is recorded that way. Unfinished is written as unfinished.
 
-## The frozen daemons — 11/13 recovered (2026-08-17)
+## The frozen daemons — 12/13 as of 2026-08-17
 
 During incident response, 13 consistency daemons across the fleet were set
 `disabled + inactive` (`ENABLE=NONE`) to stop background mutation while the
@@ -47,12 +47,13 @@ after. Result: zero quarantine growth, zero object loss, zero crash-loops,
 disk flat, a ~55-minute quiet window to close. Evidence:
 `/root/work/peregrine-daemon-unfreeze-20260817/` (swift3, 56 files).
 
-Two units remain deliberately frozen:
+`swift-object-expirer` was unfrozen the same evening after the
+`AUTH_test/fsuite-10720/willexpire` queue row was deleted on all three
+container replicas (object hashdir untouched). One unit stays frozen:
 
 | Unit | Why it stays frozen |
 |------|---------------------|
-| `swift-account-reaper` | the incident's destructive actor (`delay_reaping=0`); re-enabling is a user-gated decision, not an ops default |
-| `swift-object-expirer` | its due queue holds an `AUTH_test` entry (`fsuite-10720/willexpire`) — starting it would delete protected-account data. Unfreeze requires disposition of that entry plus explicit authorization |
+| `swift-account-reaper` | ring majority for `AUTH_test` still carries `DELETED`; `delay_reaping` was raised to 604800 on-node as defense in depth, but starting the reaper remains a user-gated decision |
 
 Known steady state after recovery, recorded rather than hidden: 357
 incident-era async pendings pointed at deleted `AUTH_test` containers retry
@@ -76,8 +77,9 @@ kept deliberately:
 ## Hard boundaries (all still in force)
 
 1. Do not restart HAProxy or Keepalived; do not move the VIP.
-2. Do not enable `swift-account-reaper` or `swift-object-expirer` outside
-   an explicitly authorized wave.
+2. Do not enable `swift-account-reaper` outside an explicitly authorized
+   wave. The expirer is live; do not put `AUTH_test` entries back on its
+   queue.
 3. Do not touch `AUTH_lab`, `AUTH_test`, or `s3://mytest`.
 4. Do not edit the dual-oracle runner's assertions or case set; do not
    downgrade Rust extras to 501 ([why](/dual-oracle#the-runner-is-part-of-the-contract)).

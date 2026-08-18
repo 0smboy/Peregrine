@@ -7,36 +7,35 @@ sidebar:
 
 ## Current fleet state
 
-As of 2026-08-17 (`docs/fairness-lab/S3-ALIGN-20260815.md`): proxies 4/4 +
-VIP run the **Gate** generation (`671bcbaf…`), object servers remain Wave-2
-(`e1d4f1cc…`), drain 0, VIP on swift2. Consistency daemons are **11/13
-enabled + active** after the staged Wave-6 recovery;
-`swift-account-reaper` and `swift-object-expirer` stay frozen
-([why](/incidents#the-frozen-daemons--1113-recovered-2026-08-17)). S3
+As of 2026-08-18: proxies 4/4 + VIP still run the **Gate** generation
+(`671bcbaf…`), object servers remain Wave-2 (`e1d4f1cc…`), drain 0, VIP on
+swift2. Consistency daemons are **12/13 enabled + active** — expirer was
+unfrozen 2026-08-17 after `AUTH_test` queue surgery;
+`swift-account-reaper` stays frozen
+([why](/incidents#the-frozen-daemons--1213-as-of-2026-08-17)). S3
 dual-oracle stands at **49/8, not GREEN** (post-GATE run identical to
-baseline). Stance **IMPLEMENTED_SUBSET_ONLY**. Binary genealogy:
-[Releases](/releases) · upgrade/rollback recipes: [Runbooks](/runbooks) ·
-scoring: [Dual-oracle](/dual-oracle).
+baseline). Stance **IMPLEMENTED_SUBSET_ONLY**. `main` is ahead of the
+fleet (CAS + account-level 405 guard + BUG-1 + clock source, not rolled).
+Binary genealogy: [Releases](/releases) · upgrade/rollback recipes:
+[Runbooks](/runbooks) · scoring: [Dual-oracle](/dual-oracle).
 
 Earlier cold/restore closeout (LocalDir, not tape/Glacier, default off):
 [Cold + Contabo S3 delivery](/cold-contabo-delivery).
 
 ## Alerting & DR (2026-08-17)
 
-- **Alerting**: 13 Prometheus alert rules are live on the monitoring node —
-  fleet/exporter presence, disk watermarks, the 11 recovered daemons down,
-  **frozen daemons started** (immediate, severity critical), quarantine and
-  async-pending growth, proxy 5xx rate. systemd + quarantine/async gap
-  metrics were added on all four nodes. Rules are versioned in
-  `tools/monitoring/`; alerts evaluate on the node but are not yet routed —
-  the notification channel is an open decision, so check
-  `/api/v1/alerts` (or the Prometheus UI) until it lands.
-- **DR**: the config plane (rings, confs, unit files — secrets included) is
-  backed up by `tools/dr/dr-backup.sh` with three verified copies and a
-  zero-diff restore drill; procedure in `tools/dr/DR-RESTORE.md`. Bundles
-  contain secrets and never enter git or cloud storage. Disk posture after
-  the 2026-08-17 cleanup: all four root disks ≤ 76%, journald capped at
-  500 MB fleet-wide (ledger: `tools/dr/DISK-LEDGER-20260817.md`).
+- **Alerting**: Prometheus rules are live on swift1 and aligned to the
+  12/13 daemon set (`FrozenDaemonStarted` watches only the still-frozen
+  reaper). Alertmanager + a local JSONL sink
+  (`/var/log/peregrine-alerts.jsonl`) are running on loopback; a Feishu /
+  human receiver is a documented swap-in, not yet connected. Rules are
+  versioned in `tools/monitoring/`.
+- **DR**: weekly cron is installed on all four nodes (Mondays 03:05–03:20
+  UTC, 35-day retention). Config-plane bundles stay off git; encrypted
+  offsite copies of the 2026-08-17 set live on Drive with the passphrase
+  only in the operator Keychain. Procedure: `tools/dr/DR-RESTORE.md`.
+  Disk posture after the 2026-08-17 cleanup: all four root disks ≤ 76%,
+  journald capped at 500 MB fleet-wide.
 
 ## Health at a glance
 
@@ -55,10 +54,9 @@ Lab topology, EC binary requirements, and subscription cutover rules:
 
 <Aside type="note" title="Daemon state (2026-08-17)">
 The consistency plane is live again: auditors, replicators, the EC
-reconstructor, updaters, sharder and reconciler run fleet-wide after the
-staged Wave-6 recovery (zero quarantine growth, zero loss). Only
-`swift-account-reaper` and `swift-object-expirer` remain frozen — see
-[Incidents & freezes](/incidents#the-frozen-daemons--1113-recovered-2026-08-17).
+reconstructor, updaters, sharder, reconciler, and (after queue surgery)
+the object expirer. Only `swift-account-reaper` remains frozen — see
+[Incidents & freezes](/incidents#the-frozen-daemons--1213-as-of-2026-08-17).
 </Aside>
 
 - **Object replicator** — suffix-hash push, handoff revert, rsync /

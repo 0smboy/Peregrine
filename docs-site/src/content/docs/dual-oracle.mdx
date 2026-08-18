@@ -52,6 +52,12 @@ executed == required == 57
 Anything else is reported as the FAIL it is. The current standing is
 **49/8 — not GREEN**, and the stance stays `IMPLEMENTED_SUBSET_ONLY`.
 
+A **second scoreboard**, `tools/strict-s3-supplement.py` (PR #8), scores
+the seven Rust-ahead extras against AWS semantics (live r3: **7/7 PASS**)
+and three account-root negatives the frozen 57 never covers (live Gate:
+**0/3 FAIL** — the honest baseline until the 405-guard proxy rolls).
+The frozen 57-case runner is not edited.
+
 ## Score timeline
 
 Each row is one deployed proxy generation plus, in the last row, lab-only

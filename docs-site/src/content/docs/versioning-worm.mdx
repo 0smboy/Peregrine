@@ -106,7 +106,9 @@ metadata fails closed as `InternalError` rather than being reinterpreted:
 DELETE of an object under unexpired retention is denied the same way:
 GOVERNANCE yields to a permitted bypass, COMPLIANCE never does. An unhealthy
 node clock additionally denies COMPLIANCE claims (new or existing) rather
-than trusting a broken clock.
+than trusting a broken clock. On `main` that signal is wired through
+`worm_clock_max_offset_ms` (default `0` = off, historical `clock_ok=true`);
+the live Gate binary still pins `clock_ok=true` with no reader.
 
 <Aside type="caution" title="Not a compliance product">
 Sysmeta travels below the gatekeeper (clients cannot forge

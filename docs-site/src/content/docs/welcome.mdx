@@ -99,7 +99,9 @@ Core CRUD, replication, EC, and selected middleware paths have unit and
 four-node lab evidence, and every push runs the full workspace suite in CI.
 The S3 surface is scored by a strict [dual-oracle harness](/dual-oracle)
 against Python Swift 2.33 — **49/8 as of 2026-08-17 (post-GATE), not GREEN**
-(`docs/fairness-lab/S3-ALIGN-20260815.md`).
+(`docs/fairness-lab/S3-ALIGN-20260815.md`). `main` as of 2026-08-18 carries
+the account-level 405 guard, version-index CAS, and the second scoreboard;
+the live fleet is still Gate.
 Important production and runtime-integration gaps remain. The
 [strict parity matrix](/parity) defines the current claim boundary; the
 stance is **IMPLEMENTED_SUBSET_ONLY**, and this documentation never claims
