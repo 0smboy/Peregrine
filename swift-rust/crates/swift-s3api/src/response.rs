@@ -89,16 +89,86 @@ fn parse_iso_like_to_epoch(value: &str) -> Option<i64> {
     Some(days_from_civil(y, mo, da) * 86400 + h * 3600 + mi * 60 + se)
 }
 
+/// Swift `Timestamp.normal()` / `internal()` (`1402464677.04188` or
+/// `1402464677.04188_deadbeef`). Floor to the second, matching listing
+/// `isoformat` then `S3Timestamp`. HTTP `Last-Modified` is `ceil` and
+/// lands one second later whenever the fractional part is nonzero.
+fn parse_swift_normal_to_epoch(value: &str) -> Option<i64> {
+    let head = value.split('_').next().unwrap_or(value).trim();
+    if head.is_empty()
+        || !head.as_bytes()[0].is_ascii_digit()
+        || head.contains('-')
+        || head.contains('T')
+        || head.contains(':')
+    {
+        return None;
+    }
+    let n: f64 = head.parse().ok()?;
+    if !n.is_finite() || !(1_000_000.0..4_102_444_800.0).contains(&n) {
+        return None;
+    }
+    Some(n.floor() as i64)
+}
+
+fn fractional_part_nonzero(value: &str) -> bool {
+    let Some((_, rest)) = value.split_once('.') else {
+        return false;
+    };
+    rest.chars().take_while(|c| c.is_ascii_digit()).any(|c| c != '0')
+}
+
+fn parse_iso_like_to_epoch_ceil(value: &str) -> Option<i64> {
+    let floor = parse_iso_like_to_epoch(value)?;
+    if fractional_part_nonzero(value) {
+        Some(floor.saturating_add(1))
+    } else {
+        Some(floor)
+    }
+}
+
+fn parse_swift_normal_to_epoch_ceil(value: &str) -> Option<i64> {
+    let head = value.split('_').next().unwrap_or(value).trim();
+    if head.is_empty()
+        || !head.as_bytes()[0].is_ascii_digit()
+        || head.contains('-')
+        || head.contains('T')
+        || head.contains(':')
+    {
+        return None;
+    }
+    let n: f64 = head.parse().ok()?;
+    if !n.is_finite() || !(1_000_000.0..4_102_444_800.0).contains(&n) {
+        return None;
+    }
+    Some(n.ceil() as i64)
+}
+
+/// Listing / copy LastModified aligned to HTTP `Last-Modified` (`ceil`).
+pub fn s3_xml_timestamp_ceil(value: &str) -> String {
+    let value = value.trim();
+    if let Some(secs) = parse_http_date(value)
+        .or_else(|| parse_iso_like_to_epoch_ceil(value))
+        .or_else(|| parse_swift_normal_to_epoch_ceil(value))
+    {
+        return epoch_secs_to_s3_xml(secs);
+    }
+    "1970-01-01T00:00:00.000Z".to_string()
+}
+
 /// S3 XML `LastModified` / `Initiated`: `YYYY-MM-DDTHH:MM:SS.000Z`.
 ///
-/// Python `S3Timestamp.s3xmlformat`. Parses RFC 1123 (`Last-Modified`) and
-/// Swift listing ISO (`2013-05-24T00:00:00.000000`). Always returns a string
-/// that Python 3.9 `datetime.fromisoformat` accepts after the runner's
-/// trailing-`Z` → `+00:00` rewrite. Unparseable input → epoch, never the raw
-/// HTTP date (that is the CopyObject / ListVersions `_iso_time` hole).
+/// Python `S3Timestamp.s3xmlformat`. Parses RFC 1123 (`Last-Modified`),
+/// Swift listing ISO (`2013-05-24T00:00:00.000000`), and Swift
+/// `X-Timestamp` normal form. Always returns a string that Python 3.9
+/// `datetime.fromisoformat` accepts after the runner's trailing-`Z` →
+/// `+00:00` rewrite. Unparseable input → epoch, never the raw HTTP date
+/// (that is the CopyObject / ListVersions `_iso_time` hole).
 pub fn s3_xml_timestamp(value: &str) -> String {
     let value = value.trim();
-    if let Some(secs) = parse_http_date(value).or_else(|| parse_iso_like_to_epoch(value)) {
+    if let Some(secs) = parse_http_date(value)
+        .or_else(|| parse_iso_like_to_epoch(value))
+        .or_else(|| parse_swift_normal_to_epoch(value))
+    {
         return epoch_secs_to_s3_xml(secs);
     }
     "1970-01-01T00:00:00.000Z".to_string()
@@ -190,8 +260,9 @@ pub fn error_status_and_message(code: &str) -> (u16, &'static str) {
         "NoSuchVersion" => (404, "The specified version does not exist."),
         "ObjectLockConfigurationNotFoundError" => (
             404,
-            "Object Lock configuration does not exist for this bucket.",
+            "Object Lock configuration does not exist for this bucket",
         ),
+        "KeyTooLongError" => (400, "Your key is too long"),
         "NotImplemented" => (501, "A header you provided implies functionality that is not implemented."),
         "PermanentRedirect" => (
             301,
@@ -222,6 +293,84 @@ pub fn error_status_and_message(code: &str) -> (u16, &'static str) {
 /// grok-merge `_normalize_error` rewrites the value to `"<dynamic-id>"` when
 /// the element is present. Empty extras must still emit the child — that is
 /// the post-F1 delta vs Python `ErrorResponse._body_iter`.
+/// AWS `encoding-type=url`: same codec as Python `urllib.parse.quote`
+/// (unreserved `A-Za-z0-9-_.` plus `/`). `+` becomes `%2B`.
+pub fn s3_uri_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for &b in value.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'/' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn maybe_uri_encode(encoding_type: Option<&str>, value: &str) -> String {
+    if encoding_type == Some("url") {
+        s3_uri_encode(value)
+    } else {
+        value.to_string()
+    }
+}
+
+/// Stamp `x-amz-request-id` / `x-amz-id-2` / `Date` like Python s3api.
+///
+/// Each header is filled only when missing. An existing request-id must not
+/// skip `x-amz-id-2` or `Date` (official functests KeyError both).
+pub fn apply_s3_amz_ids(resp: &mut Response) {
+    let request_id = resp
+        .headers
+        .get("x-amz-request-id")
+        .or_else(|| resp.headers.get("X-Amz-Request-Id"))
+        .map(str::to_string)
+        .unwrap_or_else(default_request_id);
+    if resp.headers.get("x-amz-request-id").is_none()
+        && resp.headers.get("X-Amz-Request-Id").is_none()
+    {
+        resp.headers.set("x-amz-request-id", &request_id);
+    }
+    if resp.headers.get("x-amz-id-2").is_none() && resp.headers.get("X-Amz-Id-2").is_none() {
+        resp.headers.set("x-amz-id-2", &request_id);
+    }
+    if resp.headers.get("date").is_none() && resp.headers.get("Date").is_none() {
+        resp.headers.set("Date", http_date_now());
+    }
+}
+
+fn http_date_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    http_date_from_unix(secs)
+}
+
+fn http_date_from_unix(secs: i64) -> String {
+    const WDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let days = secs.div_euclid(86400);
+    let sod = secs.rem_euclid(86400) as u64;
+    let (y, m, d) = civil_from_days(days);
+    // Unix day 0 is Thursday; WDAYS is Monday-first.
+    let wday = ((days + 3).rem_euclid(7)) as usize;
+    format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        WDAYS[wday],
+        d,
+        MONTHS[(m.saturating_sub(1) as usize).min(11)],
+        y,
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60
+    )
+}
+
 fn default_request_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -277,9 +426,24 @@ pub fn s3_error_xml(code: &str, message: &str, extras: &[(&str, &str)]) -> Vec<u
 pub fn s3_error_response(code: &str, message: Option<&str>, extras: &[(&str, &str)]) -> Response {
     let (status, default_msg) = error_status_and_message(code);
     let msg = message.unwrap_or(default_msg);
-    let body = s3_error_xml(code, msg, extras);
+    let generated = default_request_id();
+    let mut extras_vec: Vec<(&str, &str)> = extras.to_vec();
+    if !extras_vec
+        .iter()
+        .any(|(tag, _)| tag.eq_ignore_ascii_case("RequestId"))
+    {
+        extras_vec.push(("RequestId", generated.as_str()));
+    }
+    let rid = extras_vec
+        .iter()
+        .find(|(tag, _)| tag.eq_ignore_ascii_case("RequestId"))
+        .map(|(_, v)| *v)
+        .unwrap_or(generated.as_str());
+    let body = s3_error_xml(code, msg, &extras_vec);
     let mut resp = Response::with_body(status, body);
     resp.headers.set("Content-Type", "application/xml");
+    resp.headers.set("x-amz-request-id", rid);
+    apply_s3_amz_ids(&mut resp);
     resp
 }
 
@@ -378,16 +542,17 @@ pub struct ListBucketResult {
 impl ListBucketResult {
     /// Serialize to the S3 XML bytes (with the S3 namespace on the root).
     pub fn to_xml(&self) -> Vec<u8> {
+        let enc = self.encoding_type.as_deref();
         let mut elem = Element::new("ListBucketResult");
         elem.push_leaf("Name", &self.name);
-        elem.push_leaf("Prefix", &self.prefix);
-        elem.push_leaf("Marker", &self.marker);
+        elem.push_leaf("Prefix", maybe_uri_encode(enc, &self.prefix));
+        elem.push_leaf("Marker", maybe_uri_encode(enc, &self.marker));
         if let Some(nm) = &self.next_marker {
-            elem.push_leaf("NextMarker", nm);
+            elem.push_leaf("NextMarker", maybe_uri_encode(enc, nm));
         }
         elem.push_leaf("MaxKeys", self.max_keys.to_string());
         if let Some(d) = &self.delimiter {
-            elem.push_leaf("Delimiter", d);
+            elem.push_leaf("Delimiter", maybe_uri_encode(enc, d));
         }
         if let Some(e) = &self.encoding_type {
             elem.push_leaf("EncodingType", e);
@@ -397,10 +562,10 @@ impl ListBucketResult {
             if self.is_truncated { "true" } else { "false" },
         );
         for obj in &self.contents {
-            elem.push(object_element(obj));
+            elem.push(object_element(obj, enc));
         }
         for prefix in &self.common_prefixes {
-            let cp = Element::new("CommonPrefixes").with_leaf("Prefix", prefix);
+            let cp = Element::new("CommonPrefixes").with_leaf("Prefix", maybe_uri_encode(enc, prefix));
             elem.push(cp);
         }
         elem.to_xml(true)
@@ -431,12 +596,11 @@ pub struct ListBucketResultV2 {
 
 impl ListBucketResultV2 {
     pub fn to_xml(&self) -> Vec<u8> {
+        let enc = self.encoding_type.as_deref();
         let mut elem = Element::new("ListBucketResult");
         elem.push_leaf("Name", &self.name);
-        elem.push_leaf("Prefix", &self.prefix);
-        if !self.start_after.is_empty() {
-            elem.push_leaf("StartAfter", &self.start_after);
-        }
+        elem.push_leaf("Prefix", maybe_uri_encode(enc, &self.prefix));
+        elem.push_leaf("StartAfter", maybe_uri_encode(enc, &self.start_after));
         if let Some(ct) = &self.continuation_token {
             elem.push_leaf("ContinuationToken", ct);
         }
@@ -446,7 +610,7 @@ impl ListBucketResultV2 {
         elem.push_leaf("KeyCount", self.key_count.to_string());
         elem.push_leaf("MaxKeys", self.max_keys.to_string());
         if let Some(d) = &self.delimiter {
-            elem.push_leaf("Delimiter", d);
+            elem.push_leaf("Delimiter", maybe_uri_encode(enc, d));
         }
         if let Some(e) = &self.encoding_type {
             elem.push_leaf("EncodingType", e);
@@ -456,10 +620,10 @@ impl ListBucketResultV2 {
             if self.is_truncated { "true" } else { "false" },
         );
         for obj in &self.contents {
-            elem.push(object_element(obj));
+            elem.push(object_element(obj, enc));
         }
         for prefix in &self.common_prefixes {
-            let cp = Element::new("CommonPrefixes").with_leaf("Prefix", prefix);
+            let cp = Element::new("CommonPrefixes").with_leaf("Prefix", maybe_uri_encode(enc, prefix));
             elem.push(cp);
         }
         elem.to_xml(true)
@@ -470,9 +634,9 @@ impl ListBucketResultV2 {
     }
 }
 
-fn object_element(obj: &S3Object) -> Element {
+fn object_element(obj: &S3Object, encoding_type: Option<&str>) -> Element {
     let mut contents = Element::new("Contents");
-    contents.push_leaf("Key", &obj.key);
+    contents.push_leaf("Key", maybe_uri_encode(encoding_type, &obj.key));
     contents.push_leaf("LastModified", &obj.last_modified);
     // AWS / Python s3api always emit a quote-wrapped ETag in ListBucketResult.
     // s3cmd and other plain-XML clients expect `<ETag>"md5"</ETag>` (quotes inside).
@@ -762,6 +926,7 @@ pub fn delete_result_xml(deleted: &[DeletedObject], errors: &[DeleteError]) -> V
 pub fn xml_response(status: u16, body: Vec<u8>) -> Response {
     let mut resp = Response::with_body(status, body);
     resp.headers.set("Content-Type", "application/xml");
+    apply_s3_amz_ids(&mut resp);
     resp
 }
 
@@ -770,12 +935,17 @@ pub fn xml_response(status: u16, body: Vec<u8>) -> Response {
 pub fn put_object_response(etag: &str) -> Response {
     let mut resp = Response::new(200);
     resp.headers.set("ETag", format!("\"{etag}\""));
+    // Official MPU UploadPart asserts the Eventlet empty-body default.
+    resp.headers.set("Content-Type", "text/html; charset=UTF-8");
+    apply_s3_amz_ids(&mut resp);
     resp
 }
 
 /// A `DELETE` success response: `204 No Content`.
 pub fn delete_object_response() -> Response {
-    Response::new(204)
+    let mut resp = Response::new(204);
+    apply_s3_amz_ids(&mut resp);
+    resp
 }
 
 /// A `HEAD`/`GET`-object metadata response: `200 OK` with the standard object
@@ -799,6 +969,25 @@ pub fn object_metadata_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_date_unix_epoch_is_thursday() {
+        assert_eq!(http_date_from_unix(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(
+            http_date_from_unix(1_703_000_000),
+            "Tue, 19 Dec 2023 15:33:20 GMT"
+        );
+    }
+
+    #[test]
+    fn apply_s3_amz_ids_fills_date_and_id2_when_request_id_exists() {
+        let mut resp = Response::new(200);
+        resp.headers.set("x-amz-request-id", "txalready");
+        apply_s3_amz_ids(&mut resp);
+        assert_eq!(resp.headers.get("x-amz-request-id"), Some("txalready"));
+        assert_eq!(resp.headers.get("x-amz-id-2"), Some("txalready"));
+        assert!(resp.headers.get("Date").is_some() || resp.headers.get("date").is_some());
+    }
 
     #[test]
     fn test_error_xml_shape() {
@@ -832,6 +1021,20 @@ mod tests {
         assert!(rid.starts_with("tx"), "{rid}");
         assert!(got.contains("<BucketName>faux-bucket</BucketName>"));
         assert_eq!(got.matches("<RequestId>").count(), 1);
+    }
+
+    #[test]
+    fn s3_error_response_request_id_matches_header() {
+        let resp = s3_error_response("NoSuchKey", None, &[("Key", "bar")]);
+        let header = resp
+            .headers
+            .get("x-amz-request-id")
+            .expect("x-amz-request-id")
+            .to_string();
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        let xml = error_xml_leaf(&body, "RequestId").expect("RequestId in body");
+        assert_eq!(header, xml, "header={header} xml={xml} body={body}");
+        assert!(!header.is_empty());
     }
 
     #[test]
@@ -1033,6 +1236,41 @@ mod tests {
     }
 
     #[test]
+    fn test_s3_uri_encode_plus_and_slash() {
+        assert_eq!(s3_uri_encode("asdf+b"), "asdf%2Bb");
+        assert_eq!(s3_uri_encode("a/b"), "a/b");
+        assert_eq!(s3_uri_encode("a b"), "a%20b");
+    }
+
+    #[test]
+    fn test_list_v2_encoding_type_url_encodes_plus() {
+        let lbr = ListBucketResultV2 {
+            name: "b".to_string(),
+            prefix: String::new(),
+            start_after: String::new(),
+            continuation_token: None,
+            next_continuation_token: None,
+            key_count: 1,
+            max_keys: 1000,
+            delimiter: None,
+            encoding_type: Some("url".to_string()),
+            is_truncated: false,
+            contents: vec![S3Object {
+                key: "asdf+b".to_string(),
+                last_modified: "2013-05-24T00:00:00.000Z".to_string(),
+                etag: "\"e\"".to_string(),
+                size: 1,
+                storage_class: "STANDARD".to_string(),
+                owner: None,
+            }],
+            common_prefixes: vec![],
+        };
+        let got = String::from_utf8(lbr.to_xml()).unwrap();
+        assert!(got.contains("<Key>asdf%2Bb</Key>"), "{got}");
+        assert!(got.contains("<EncodingType>url</EncodingType>"));
+    }
+
+    #[test]
     fn test_list_all_my_buckets() {
         let owner = Owner {
             id: "acct".to_string(),
@@ -1101,6 +1339,10 @@ mod tests {
         let put = put_object_response("abc123");
         assert_eq!(put.status, 200);
         assert_eq!(put.headers.get("ETag"), Some("\"abc123\""));
+        assert_eq!(
+            put.headers.get("Content-Type"),
+            Some("text/html; charset=UTF-8")
+        );
         assert!(put.body.is_definitely_empty());
 
         let del = delete_object_response();
@@ -1152,6 +1394,22 @@ mod tests {
                 .unwrap();
         assert!(http_copy.contains("<LastModified>2013-05-24T00:00:00.000Z</LastModified>"));
         assert!(!http_copy.contains("Fri, 24 May"));
+    }
+
+    #[test]
+    fn s3_xml_timestamp_ceil_matches_http_last_modified() {
+        assert_eq!(
+            s3_xml_timestamp_ceil("2013-05-24T00:00:00.400000"),
+            "2013-05-24T00:00:01.000Z"
+        );
+        assert_eq!(
+            s3_xml_timestamp_ceil("2013-05-24T00:00:00.000000"),
+            "2013-05-24T00:00:00.000Z"
+        );
+        assert_eq!(
+            s3_xml_timestamp("2013-05-24T00:00:00.400000"),
+            "2013-05-24T00:00:00.000Z"
+        );
     }
 
     #[test]

@@ -58,21 +58,27 @@ pub fn parse_multi_delete_body(body: &[u8]) -> Result<MultiDeleteRequest, String
     let quiet = text.contains("<Quiet>true</Quiet>") || text.contains("<Quiet>True</Quiet>");
     let mut objects = Vec::new();
     let mut rest = text;
+    let mut saw_object = false;
     while let Some(obj_start) = rest.find("<Object>") {
+        saw_object = true;
         let after = &rest[obj_start..];
         let Some(obj_end_rel) = after.find("</Object>") else {
-            break;
+            return Err("MalformedXML".into());
         };
         let obj = &after[..obj_end_rel + "</Object>".len()];
-        if let Some(key) = xml_tag_text(obj, "Key") {
-            if !key.is_empty() {
+        match xml_tag_text(obj, "Key") {
+            Some(key) if !key.is_empty() => {
                 objects.push(MultiDeleteObject {
                     key,
                     version_id: xml_tag_text(obj, "VersionId").filter(|value| !value.is_empty()),
                 });
             }
+            _ => return Err("UserKeyMustBeSpecified".into()),
         }
         rest = &after[obj_end_rel + "</Object>".len()..];
+    }
+    if !saw_object {
+        return Err("MalformedXML".into());
     }
     Ok(MultiDeleteRequest { quiet, objects })
 }
@@ -109,5 +115,21 @@ mod tests {
     #[test]
     fn rejects_non_delete() {
         assert!(parse_multi_delete_body(b"<Hello/>").is_err());
+    }
+
+    #[test]
+    fn empty_object_list_is_malformed() {
+        assert_eq!(
+            parse_multi_delete_body(b"<Delete></Delete>").unwrap_err(),
+            "MalformedXML"
+        );
+    }
+
+    #[test]
+    fn empty_key_is_user_key_must_be_specified() {
+        assert_eq!(
+            parse_multi_delete_body(b"<Delete><Object><Key></Key></Object></Delete>").unwrap_err(),
+            "UserKeyMustBeSpecified"
+        );
     }
 }

@@ -33,7 +33,7 @@
 //! codes.
 
 use crate::crypto::{hmac_sha256, hmac_sha256_hex, sha256_hex, streq_const_time};
-use swift_http::{parse_query, HeaderKeyDict, Request};
+use swift_http::{parse_http_date, parse_query, HeaderKeyDict, Request};
 
 /// The AWS service name this endpoint signs for.
 pub const SERVICE: &str = "s3";
@@ -49,6 +49,8 @@ pub enum SigAuthError {
     RequestTimeTooSkewed,
     /// Query auth past `X-Amz-Expires` / `Expires` (not a bad HMAC).
     AccessDenied,
+    /// Header auth with empty/missing Date and x-amz-date (Python s3request).
+    InvalidDate,
 }
 
 impl SigAuthError {
@@ -56,7 +58,7 @@ impl SigAuthError {
         match self {
             Self::SignatureDoesNotMatch => "SignatureDoesNotMatch",
             Self::RequestTimeTooSkewed => "RequestTimeTooSkewed",
-            Self::AccessDenied => "AccessDenied",
+            Self::AccessDenied | Self::InvalidDate => "AccessDenied",
         }
     }
 
@@ -64,6 +66,9 @@ impl SigAuthError {
     pub fn s3_message(self) -> Option<&'static str> {
         match self {
             Self::AccessDenied => Some("Request has expired"),
+            Self::InvalidDate => {
+                Some("AWS authentication requires a valid Date or x-amz-date header")
+            }
             Self::SignatureDoesNotMatch | Self::RequestTimeTooSkewed => None,
         }
     }
@@ -199,12 +204,21 @@ pub fn parse_sigv4_auth(req: &Request) -> Option<SigV4Auth> {
 }
 
 /// The signing timestamp in `YYYYMMDDThhmmssZ` form. Read from the
-/// `X-Amz-Date` header, else the `X-Amz-Date` query parameter.
+/// `X-Amz-Date` header, else the `X-Amz-Date` query parameter, else `Date`.
+/// Empty values count as missing (Python `s3request` InvalidDate).
 pub fn amz_date(req: &Request) -> Option<String> {
     if let Some(d) = req.headers.get("X-Amz-Date") {
-        return Some(d.to_string());
+        if !d.trim().is_empty() {
+            return Some(d.to_string());
+        }
     }
-    req.param("X-Amz-Date")
+    if let Some(d) = req.param("X-Amz-Date").filter(|d| !d.trim().is_empty()) {
+        return Some(d);
+    }
+    req.headers
+        .get("Date")
+        .filter(|d| !d.trim().is_empty())
+        .map(str::to_string)
 }
 
 /// Parse `YYYYMMDDThhmmssZ` to unix seconds. Experimental; not AWS-complete.
@@ -271,24 +285,59 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// checked before skew so an expired presigned URL is not remapped to
 /// `RequestTimeTooSkewed`. Header and query both apply
 /// `abs(signing_ts - now) > allowable_clock_skew`.
+/// boto2 SigV4 still lists `date` in SignedHeaders when the client passed
+/// `Date: ""` (official `test_service_error_no_date_header`). The empty
+/// Date may be dropped in transit; a later `X-Amz-Date` from the signer
+/// must not hide that. Python raises InvalidDate / AccessDenied.
+fn empty_date_header_is_invalid(req: &Request) -> bool {
+    let auth = parse_sigv4_auth(req);
+    if auth.as_ref().is_some_and(|a| a.query_auth) {
+        return false;
+    }
+    let date = req.headers.get("Date").unwrap_or("");
+    let amz = req.headers.get("X-Amz-Date").unwrap_or("");
+    if !date.trim().is_empty() {
+        return false;
+    }
+    if amz.trim().is_empty() {
+        return true;
+    }
+    auth.is_some_and(|auth| {
+        auth.signed_headers
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case("date"))
+    })
+}
+
 pub fn check_sigv4_time(
     req: &Request,
     now_unix: i64,
     allowable_clock_skew: u64,
 ) -> Result<(), SigAuthError> {
+    if empty_date_header_is_invalid(req) {
+        return Err(SigAuthError::InvalidDate);
+    }
     let Some(date) = amz_date(req) else {
-        return Ok(());
+        let query_auth = parse_sigv4_auth(req).is_some_and(|a| a.query_auth);
+        if query_auth {
+            return Ok(());
+        }
+        return Err(SigAuthError::InvalidDate);
     };
-    let Some(signing_ts) = parse_amz_date(&date) else {
-        return Ok(());
+    let Some(signing_ts) = parse_amz_date(&date).or_else(|| parse_http_date(&date)) else {
+        // Empty or unparseable Date / X-Amz-Date: Python InvalidDate, not
+        // SignatureDoesNotMatch (official test_service_error_no_date_header).
+        return Err(SigAuthError::InvalidDate);
     };
     let query_auth = parse_sigv4_auth(req).is_some_and(|a| a.query_auth);
     if query_auth {
         if let Some(exp_s) = req.param("X-Amz-Expires") {
-            if let Ok(expires) = exp_s.parse::<i64>() {
-                if signing_ts.saturating_add(expires) < now_unix {
+            match exp_s.parse::<i64>() {
+                Ok(expires) if expires <= 0 => return Err(SigAuthError::AccessDenied),
+                Ok(expires) if signing_ts.saturating_add(expires) <= now_unix => {
                     return Err(SigAuthError::AccessDenied);
                 }
+                _ => {}
             }
         }
     }
@@ -495,7 +544,12 @@ pub fn verify_sigv4(
     }
     let date = match amz_date(req) {
         Some(d) => d,
-        None => return Err(SigAuthError::SignatureDoesNotMatch),
+        None => {
+            if auth.query_auth {
+                return Err(SigAuthError::SignatureDoesNotMatch);
+            }
+            return Err(SigAuthError::InvalidDate);
+        }
     };
     let hts = match headers_to_sign(&req.headers, &auth.signed_headers) {
         Some(h) => h,
@@ -711,6 +765,43 @@ mod tests {
     }
 
     #[test]
+    fn empty_date_with_auto_amz_date_is_invalid_date() {
+        // Official TestS3ApiServiceSigV4.test_service_error_no_date_header:
+        // client sends Date="" / x-amz-date=""; boto2 still adds X-Amz-Date
+        // and lists `date` in SignedHeaders.
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Host", "10.0.0.10:8080");
+        headers.set("X-Amz-Date", "20260818T160951Z");
+        headers.set(
+            "x-amz-content-sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        );
+        headers.set(
+            "Authorization",
+            "AWS4-HMAC-SHA256 \
+             Credential=AKIAIOSFODNN7EXAMPLE/20260818/us-east-1/s3/aws4_request, \
+             SignedHeaders=date;host;x-amz-content-sha256;x-amz-date, \
+             Signature=deadbeef",
+        );
+        let req = Request {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query_string: String::new(),
+            headers,
+            body: swift_http::Body::empty(),
+        };
+        assert_eq!(
+            check_sigv4_time(&req, 1_776_553_000, 900),
+            Err(SigAuthError::InvalidDate)
+        );
+        assert_eq!(SigAuthError::InvalidDate.s3_code(), "AccessDenied");
+        assert_eq!(
+            SigAuthError::InvalidDate.s3_message(),
+            Some("AWS authentication requires a valid Date or x-amz-date header")
+        );
+    }
+
+    #[test]
     fn verify_sigv4_header_clock_skew_rejects() {
         let signed = parse_amz_date("20130524T000000Z").unwrap();
         assert_eq!(
@@ -751,6 +842,19 @@ mod tests {
             Err(SigAuthError::RequestTimeTooSkewed)
         );
         assert_sig_error_xml_matches_normalize(SigAuthError::RequestTimeTooSkewed, 403);
+    }
+
+    #[test]
+    fn query_expires_zero_is_access_denied_even_in_the_same_second() {
+        let mut req = query_auth_request();
+        req.query_string = req
+            .query_string
+            .replace("X-Amz-Expires=86400", "X-Amz-Expires=0");
+        let signed = parse_amz_date("20130524T000000Z").unwrap();
+        assert_eq!(
+            check_sigv4_time(&req, signed, 900),
+            Err(SigAuthError::AccessDenied)
+        );
     }
 
     #[test]

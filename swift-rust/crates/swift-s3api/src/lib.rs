@@ -61,7 +61,9 @@
 //! * **object-lock** GET/PUT — raw ObjectLockConfiguration XML round-trip
 //! * **legal-hold** / **retention** object GET/PUT + WORM on DELETE/overwrite
 //!   (see [`object_lock_worm`])
-//! * **versions** list — `ListVersionsResult` from `{bucket}+versions` indexes
+//! * **versions** list — `ListVersionsResult` from `{bucket}+versions` indexes,
+//!   plus current data-container objects with no index as `VersionId=null`
+//!   (AWS never-versioned / pre-versioning keys)
 //! * **multi-version object data plane** when versioning is **Enabled**
 //!   ([`versioning_store`]): archive, delete-markers, `?versionId=` GET/DELETE
 //!
@@ -150,9 +152,9 @@ pub use sigv2::{
 };
 pub use sigv4::{
     amz_date, canonical_query, canonical_request, canonical_uri, check_sigv4_time,
-    compute_signature, format_amz_date, headers_to_sign, parse_amz_date, parse_authorization_header,
-    parse_credential, parse_query_authentication, parse_sigv4_auth, payload_hash, signing_key,
-    string_to_sign, string_to_sign_for_request, verify_sigv4, CredentialScope, SigAuthError,
-    SigV4Auth, ALGORITHM, SERVICE,
+    compute_signature, format_amz_date, headers_to_sign, parse_amz_date,
+    parse_authorization_header, parse_credential, parse_query_authentication, parse_sigv4_auth,
+    payload_hash, signing_key, string_to_sign, string_to_sign_for_request, verify_sigv4,
+    CredentialScope, SigAuthError, SigV4Auth, ALGORITHM, SERVICE,
 };
 pub use xml::{Element, XMLNS_S3};

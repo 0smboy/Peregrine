@@ -63,9 +63,37 @@ impl Copy {
     }
 }
 
+/// Python `urllib.parse.unquote` for a single path/header component.
+/// Invalid `%` sequences are left intact (`%-sign` stays `%-sign`).
+fn percent_decode_component(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(value) = u8::from_str_radix(hex, 16) {
+                    out.push(value);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Parse a `/<container>/<object>` header value into its two parts.
+///
+/// Python `copy.py` does `split_path(unquote(copy_from), 1, 2, True)`.
+/// Request.path is already decoded; if we keep the quoted object name here
+/// the proxy `percent_encode_path`s it again and the source GET 404s
+/// (`object%20name` → `object%2520name`).
 fn parse_container_object(value: &str) -> Option<(String, String)> {
-    let v = value.strip_prefix('/').unwrap_or(value);
+    let decoded = percent_decode_component(value);
+    let v = decoded.strip_prefix('/').unwrap_or(decoded.as_str());
     let (container, object) = v.split_once('/')?;
     if container.is_empty() || object.is_empty() {
         return None;
@@ -378,6 +406,27 @@ mod tests {
         assert_eq!(put.headers.get("X-Object-Meta-Color"), Some("red"));
         assert_eq!(put.headers.get("Content-Length"), Some("5"));
         assert_eq!(resp.headers.get("X-Copied-From"), Some("srcc/srco"));
+    }
+
+    #[test]
+    fn test_put_x_copy_from_unquotes_percent_encoded_object() {
+        let (log, app) = backend(b"hello", "text/plain");
+        let c = Copy::new();
+        let r = req(
+            "PUT",
+            "/v1/AUTH_test/dstc/dsto",
+            &[(
+                "X-Copy-From",
+                "/srcc/object%20name%20with%20%25-sign%20%F0%9F%99%82",
+            )],
+        );
+        let resp = c.handle(r, &app);
+        assert_eq!(resp.status, 201);
+        let calls = log.lock().unwrap();
+        assert_eq!(
+            calls[0].path,
+            "/v1/AUTH_test/srcc/object name with %-sign 🙂"
+        );
     }
 
     #[test]

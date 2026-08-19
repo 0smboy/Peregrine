@@ -117,12 +117,11 @@ pub fn parse_host(host: Option<&str>, storage_domains: &[String]) -> Option<Stri
 /// Extract `(bucket, key)` from a request, supporting both virtual-host style
 /// (bucket in `Host`) and path style (`/bucket/key`).
 ///
-/// Port of `extract_bucket_and_key` + `parse_path`. Returns `(None, None)` if
-/// the path is unparseable or the path-style bucket name is invalid (the
-/// Python swallows `InvalidBucketNameParseError`/`InvalidURIParseError`).
-///
-/// The returned bucket is `None` for a service request (path `/`); the key is
-/// `None` when only a bucket is addressed.
+/// Returns `(None, None)` only when the path is unparseable or is a service
+/// request (`/`). An invalid bucket name is still returned so the caller can
+/// emit `InvalidBucketName` (400). Swallowing it as "no bucket" made
+/// PUT/DELETE/HEAD `/bucket+invalid` look like a service request and return
+/// 405 `MethodNotAllowed`.
 pub fn extract_bucket_and_key(
     req: &Request,
     storage_domains: &[String],
@@ -149,12 +148,9 @@ pub fn extract_bucket_and_key(
     // s3cmd 2.4 path-style List/Create uses `/bucket/` (empty object name).
     // That is a bucket request, not GetObject of "". Empty key → None.
     let key = parts.get(1).cloned().flatten().filter(|k| !k.is_empty());
-
-    if let Some(b) = &bucket {
-        if !validate_bucket_name(b, dns_compliant) {
-            return (None, None);
-        }
-    }
+    // Name rules are enforced by the caller (`InvalidBucketName`). The flag
+    // stays on the signature so vhost and path-style share one extract site.
+    let _ = dns_compliant;
     (bucket, key)
 }
 
@@ -202,6 +198,21 @@ mod tests {
         let (b, k) = extract_bucket_and_key(&r, &[], true);
         assert_eq!(b.as_deref(), Some("mybucket"));
         assert_eq!(k.as_deref(), Some("path/to/obj"));
+        assert_eq!(
+            s3_to_swift_path("AUTH_test", b.as_deref(), k.as_deref()),
+            "/v1/AUTH_test/mybucket/path/to/obj"
+        );
+        // Decoded name stays in Request.path. Proxy percent_encode_path
+        // quotes the request-line; quoting here double-encodes and listing
+        // then returns object2-%D8%AA instead of object2-ت.
+        assert_eq!(
+            s3_to_swift_path(
+                "AUTH_test",
+                Some("b"),
+                Some("object name with %-sign 🙂")
+            ),
+            "/v1/AUTH_test/b/object name with %-sign 🙂"
+        );
     }
 
     #[test]
@@ -261,12 +272,18 @@ mod tests {
 
     #[test]
     fn test_invalid_path_style_bucket_name() {
-        // Upper-case is invalid under DNS-compliant rules -> (None, None).
+        // Still extracted so dispatch can return InvalidBucketName, not 405.
         let r = req("GET", "/BadBucket/o", None);
         let (b, k) = extract_bucket_and_key(&r, &[], true);
-        assert_eq!(b, None);
+        assert_eq!(b.as_deref(), Some("BadBucket"));
+        assert_eq!(k.as_deref(), Some("o"));
+        assert!(!validate_bucket_name("BadBucket", true));
+        let r = req("PUT", "/bucket+invalid", None);
+        let (b, k) = extract_bucket_and_key(&r, &[], true);
+        assert_eq!(b.as_deref(), Some("bucket+invalid"));
         assert_eq!(k, None);
-        // ...but valid under legacy rules.
+        assert!(!validate_bucket_name("bucket+invalid", true));
+        // Legacy still accepts upper-case and underscore.
         let r = req("GET", "/BadBucket/o", None);
         let (b, k) = extract_bucket_and_key(&r, &[], false);
         assert_eq!(b.as_deref(), Some("BadBucket"));

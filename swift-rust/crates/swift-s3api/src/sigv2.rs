@@ -40,7 +40,7 @@ use sha1::{Digest, Sha1};
 use swift_http::{parse_http_date, Request};
 
 use crate::crypto::streq_const_time;
-use crate::sigv4::{parse_amz_date, SigAuthError};
+use crate::sigv4::{canonical_uri, parse_amz_date, SigAuthError};
 
 /// Parsed SigV2 auth material.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,10 +205,11 @@ fn normalize_header_value(v: &str) -> String {
 
 /// CanonicalizedResource for SigV2.
 ///
-/// Uses the request path as-is (Swift/s3api path-style or virtual-host
-/// already rewritten by the proxy). Appends sorted signed subresources.
+/// Python s3api uses `wsgi_quote(PATH_INFO, safe='-_.~/')` — the decoded
+/// path re-encoded. Spaces / `%` / unicode must match boto's URI encoding
+/// or `test_object` 403s with SignatureDoesNotMatch.
 pub fn canonicalized_resource(req: &Request) -> String {
-    let mut resource = req.path.clone();
+    let mut resource = canonical_uri(&req.path);
     if resource.is_empty() {
         resource = "/".into();
     }
@@ -394,12 +395,28 @@ pub fn check_sigv2_time(
         }
         return Ok(());
     }
+    if header_date_missing(req) {
+        return Err(SigAuthError::InvalidDate);
+    }
     if let Some(ts) = signing_ts_v2_header(req) {
         if ts.abs_diff(now_unix) > allowable_clock_skew {
             return Err(SigAuthError::RequestTimeTooSkewed);
         }
     }
     Ok(())
+}
+
+fn header_date_missing(req: &Request) -> bool {
+    let date_empty = req
+        .headers
+        .get("Date")
+        .or_else(|| req.headers.get("date"))
+        .map(|v| v.trim().is_empty())
+        .unwrap_or(true);
+    let amz_empty = !req.headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("x-amz-date") && !v.trim().is_empty()
+    });
+    date_empty && amz_empty
 }
 
 /// Verify SigV2 signature against credentials.
@@ -644,6 +661,16 @@ mod tests {
             Err(SigAuthError::SignatureDoesNotMatch)
         );
         assert_sig_error_xml_matches_normalize(SigAuthError::AccessDenied, 403);
+    }
+
+    #[test]
+    fn canonical_resource_quotes_space_percent_and_unicode() {
+        let mut req = aws_vector_req();
+        req.path = "/bucket/object name with %-sign 🙂".into();
+        assert_eq!(
+            canonicalized_resource(&req),
+            "/bucket/object%20name%20with%20%25-sign%20%F0%9F%99%82"
+        );
     }
 
     #[test]

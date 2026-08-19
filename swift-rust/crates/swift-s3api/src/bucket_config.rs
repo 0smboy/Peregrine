@@ -429,15 +429,18 @@ pub fn empty_list_versions_result_xml(
     key_marker: &str,
     version_id_marker: &str,
     max_keys: u32,
+    delimiter: Option<&str>,
 ) -> Vec<u8> {
-    Element::new("ListVersionsResult")
+    let mut elem = Element::new("ListVersionsResult")
         .with_leaf("Name", bucket)
         .with_leaf("Prefix", prefix)
         .with_leaf("KeyMarker", key_marker)
         .with_leaf("VersionIdMarker", version_id_marker)
-        .with_leaf("MaxKeys", max_keys.to_string())
-        .with_leaf("IsTruncated", "false")
-        .to_xml(true)
+        .with_leaf("MaxKeys", max_keys.to_string());
+    if let Some(d) = delimiter {
+        elem = elem.with_leaf("Delimiter", d);
+    }
+    elem.with_leaf("IsTruncated", "false").to_xml(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -902,7 +905,7 @@ mod tests {
 
     #[test]
     fn empty_list_versions_shape() {
-        let xml = String::from_utf8(empty_list_versions_result_xml("mybucket", "", "", "", 1000))
+        let xml = String::from_utf8(empty_list_versions_result_xml("mybucket", "", "", "", 1000, None))
             .unwrap();
         assert!(xml.contains("ListVersionsResult"));
         assert!(xml.contains("<Name>mybucket</Name>"));

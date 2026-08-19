@@ -21,6 +21,7 @@ use crate::crypto::sha256_hex;
 use crate::response::s3_xml_timestamp;
 use crate::xml::Element;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -404,6 +405,46 @@ impl VersionIndex {
     }
 }
 
+/// One current object that never entered `{bucket}+versions`.
+///
+/// AWS ListObjectVersions still emits these as `VersionId=null` /
+/// `IsLatest=true` on never-versioned and pre-versioning keys.
+pub fn null_version_index(
+    key: impl Into<String>,
+    last_modified: impl Into<String>,
+    etag: impl Into<String>,
+    size: i64,
+) -> VersionIndex {
+    VersionIndex {
+        key: key.into(),
+        versions: vec![VersionRecord {
+            version_id: NULL_VERSION_ID.to_string(),
+            is_delete_marker: false,
+            is_latest: true,
+            last_modified: last_modified.into(),
+            etag: etag.into(),
+            size,
+        }],
+        generation: 0,
+    }
+}
+
+/// Fold data-container objects into the version listing when they have no
+/// index row. Keys already present in `indexes` stay index-authored so an
+/// Enabled current copy is not duplicated as a second `null`.
+pub fn merge_unindexed_current_objects(
+    indexes: &mut Vec<VersionIndex>,
+    current: &[(String, String, i64, String)],
+) {
+    let have: HashSet<String> = indexes.iter().map(|idx| idx.key.clone()).collect();
+    for (key, etag, size, last_modified) in current {
+        if have.contains(key) {
+            continue;
+        }
+        indexes.push(null_version_index(key, last_modified, etag, *size));
+    }
+}
+
 /// Build `ListVersionsResult` XML with S3-faithful pagination.
 ///
 /// Ordering: keys ascending; within a key, version order follows each
@@ -429,6 +470,7 @@ pub fn list_versions_result_xml(
     key_marker: &str,
     version_id_marker: &str,
     max_keys: u32,
+    delimiter: &str,
     indexes: &[VersionIndex],
 ) -> Vec<u8> {
     // Stable key order across multi-key indexes (listing order independent of
@@ -488,6 +530,7 @@ pub fn list_versions_result_xml(
         }
     }
     root.push_leaf("MaxKeys", max_keys.to_string());
+    root.push_leaf("Delimiter", delimiter);
     root.push_leaf("IsTruncated", if truncated { "true" } else { "false" });
     for (key, v) in &slice {
         if v.is_delete_marker {
@@ -567,7 +610,7 @@ mod tests {
             size: 5,
         });
         let xml =
-            String::from_utf8(list_versions_result_xml("b", "", "", "", 1000, &[idx])).unwrap();
+            String::from_utf8(list_versions_result_xml("b", "", "", "", 1000, "", &[idx])).unwrap();
         assert!(xml.contains("<Version>"));
         assert!(xml.contains("<VersionId>v1</VersionId>"));
         assert!(xml.contains("<VersionId>v2</VersionId>"));
@@ -596,8 +639,12 @@ mod tests {
             size: 0,
         });
         let xml =
-            String::from_utf8(list_versions_result_xml("b", "", "", "", 1000, &[idx])).unwrap();
-        assert_eq!(xml.matches("<LastModified>2013-05-24T00:00:00.000Z</LastModified>").count(), 2);
+            String::from_utf8(list_versions_result_xml("b", "", "", "", 1000, "", &[idx])).unwrap();
+        assert_eq!(
+            xml.matches("<LastModified>2013-05-24T00:00:00.000Z</LastModified>")
+                .count(),
+            2
+        );
         assert!(!xml.contains("Fri, 24 May"));
         assert!(!xml.contains("00:00:00.000000"));
     }
@@ -642,7 +689,7 @@ mod tests {
 
         // Flat stream after sort: a2, a1, b2, b1, c1  (5 entries)
         let page1 =
-            String::from_utf8(list_versions_result_xml("bucket", "", "", "", 2, &indexes)).unwrap();
+            String::from_utf8(list_versions_result_xml("bucket", "", "", "", 2, "", &indexes)).unwrap();
         assert!(page1.contains("<IsTruncated>true</IsTruncated>"));
         assert_eq!(tag_text(&page1, "NextKeyMarker").as_deref(), Some("a"));
         assert_eq!(
@@ -659,7 +706,7 @@ mod tests {
 
         // Page 2: continue after (a, a1) → b2, b1  (max 2) still truncated
         let page2 = String::from_utf8(list_versions_result_xml(
-            "bucket", "", "a", "a1", 2, &indexes,
+            "bucket", "", "a", "a1", 2, "", &indexes,
         ))
         .unwrap();
         assert!(page2.contains("<IsTruncated>true</IsTruncated>"));
@@ -678,7 +725,7 @@ mod tests {
 
         // Page 3: after (b, b1) → c1 only, not truncated, no Next*
         let page3 = String::from_utf8(list_versions_result_xml(
-            "bucket", "", "b", "b1", 2, &indexes,
+            "bucket", "", "b", "b1", 2, "", &indexes,
         ))
         .unwrap();
         assert!(page3.contains("<IsTruncated>false</IsTruncated>"));
@@ -689,12 +736,12 @@ mod tests {
 
         // Cut mid-key: max-keys=1 on key a → only a2, Next=(a,a2)
         let mid =
-            String::from_utf8(list_versions_result_xml("bucket", "", "", "", 1, &indexes)).unwrap();
+            String::from_utf8(list_versions_result_xml("bucket", "", "", "", 1, "", &indexes)).unwrap();
         assert!(mid.contains("<IsTruncated>true</IsTruncated>"));
         assert_eq!(tag_text(&mid, "NextKeyMarker").as_deref(), Some("a"));
         assert_eq!(tag_text(&mid, "NextVersionIdMarker").as_deref(), Some("a2"));
         let mid2 = String::from_utf8(list_versions_result_xml(
-            "bucket", "", "a", "a2", 1, &indexes,
+            "bucket", "", "a", "a2", 1, "", &indexes,
         ))
         .unwrap();
         assert!(mid2.contains("<VersionId>a1</VersionId>"));
@@ -717,7 +764,7 @@ mod tests {
         let indexes = [logs, other, logs2];
 
         let xml = String::from_utf8(list_versions_result_xml(
-            "b", "logs/", "", "", 1000, &indexes,
+            "b", "logs/", "", "", 1000, "", &indexes,
         ))
         .unwrap();
         assert!(xml.contains("<Prefix>logs/</Prefix>"));
@@ -730,7 +777,7 @@ mod tests {
 
         // Prefix + max-keys truncation still emits Next* among filtered set
         let page =
-            String::from_utf8(list_versions_result_xml("b", "logs/", "", "", 1, &indexes)).unwrap();
+            String::from_utf8(list_versions_result_xml("b", "logs/", "", "", 1, "", &indexes)).unwrap();
         assert!(page.contains("<IsTruncated>true</IsTruncated>"));
         assert_eq!(
             tag_text(&page, "NextKeyMarker").as_deref(),
@@ -744,10 +791,55 @@ mod tests {
     }
 
     #[test]
+    fn merge_unindexed_current_objects_emits_null_and_skips_indexed() {
+        let mut indexed = VersionIndex::new("already");
+        indexed.push_latest(VersionRecord {
+            version_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            is_delete_marker: false,
+            is_latest: true,
+            last_modified: "2020-01-02T00:00:00.000Z".into(),
+            etag: "e2".into(),
+            size: 2,
+        });
+        let mut indexes = vec![indexed];
+        merge_unindexed_current_objects(
+            &mut indexes,
+            &[
+                (
+                    "already".into(),
+                    "ignored".into(),
+                    9,
+                    "2020-01-03T00:00:00.000Z".into(),
+                ),
+                (
+                    "foo".into(),
+                    "abc".into(),
+                    3,
+                    "2020-01-01T00:00:00.000Z".into(),
+                ),
+            ],
+        );
+        assert_eq!(indexes.len(), 2);
+        assert_eq!(indexes[0].key, "already");
+        assert_eq!(
+            indexes[0].versions[0].version_id,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(indexes[1].key, "foo");
+        assert_eq!(indexes[1].versions[0].version_id, NULL_VERSION_ID);
+        assert!(indexes[1].versions[0].is_latest);
+        let xml =
+            String::from_utf8(list_versions_result_xml("b", "", "", "", 1000, "", &indexes)).unwrap();
+        assert!(xml.contains("<Key>foo</Key>"));
+        assert!(xml.contains("<VersionId>null</VersionId>"));
+        assert_eq!(xml.matches("<Version>").count(), 2);
+    }
+
+    #[test]
     fn list_versions_empty_indexes_and_empty_versions() {
         // Empty container / no indexes → empty ListVersionsResult
         let empty =
-            String::from_utf8(list_versions_result_xml("b", "", "", "", 1000, &[])).unwrap();
+            String::from_utf8(list_versions_result_xml("b", "", "", "", 1000, "", &[])).unwrap();
         assert!(empty.contains("ListVersionsResult"));
         assert!(empty.contains("<Name>b</Name>"));
         assert!(empty.contains("<IsTruncated>false</IsTruncated>"));
@@ -759,7 +851,7 @@ mod tests {
         let mut hollow = VersionIndex::new("k");
         hollow.versions = vec![];
         let hollow_xml =
-            String::from_utf8(list_versions_result_xml("b", "", "", "", 10, &[hollow])).unwrap();
+            String::from_utf8(list_versions_result_xml("b", "", "", "", 10, "", &[hollow])).unwrap();
         assert!(hollow_xml.contains("<IsTruncated>false</IsTruncated>"));
         assert!(!hollow_xml.contains("<Version>"));
         assert_eq!(count_tag(&hollow_xml, "Version"), 0);
@@ -782,6 +874,7 @@ mod tests {
             "",
             "",
             1,
+            "",
             &[dm_idx, ver_idx],
         ))
         .unwrap();
@@ -969,29 +1062,24 @@ mod tests {
         )
         .is_none());
         assert!(
-            VersionIndex::from_json(br#"{"key":"k","versions":[{"version_id":"a/b"}]}"#)
-                .is_none()
+            VersionIndex::from_json(br#"{"key":"k","versions":[{"version_id":"a/b"}]}"#).is_none()
         );
-        assert!(VersionIndex::from_json(
-            br#"{"key":"k","versions":[{"version_id":"ab\u0000c"}]}"#
-        )
-        .is_none());
         assert!(
-            VersionIndex::from_json(br#"{"key":"k","versions":[{"version_id":""}]}"#)
+            VersionIndex::from_json(br#"{"key":"k","versions":[{"version_id":"ab\u0000c"}]}"#)
                 .is_none()
         );
         assert!(
-            VersionIndex::from_json(br#"{"key":"k","versions":[{"version_id":"."}]}"#)
-                .is_none()
+            VersionIndex::from_json(br#"{"key":"k","versions":[{"version_id":""}]}"#).is_none()
         );
         assert!(
-            VersionIndex::from_json(br#"{"key":"k","versions":[{"version_id":".."}]}"#)
-                .is_none()
+            VersionIndex::from_json(br#"{"key":"k","versions":[{"version_id":"."}]}"#).is_none()
         );
-        assert!(VersionIndex::from_json(
-            br#"{"key":"k","versions":[],"generation":"1"}"#
-        )
-        .is_none());
+        assert!(
+            VersionIndex::from_json(br#"{"key":"k","versions":[{"version_id":".."}]}"#).is_none()
+        );
+        assert!(
+            VersionIndex::from_json(br#"{"key":"k","versions":[],"generation":"1"}"#).is_none()
+        );
     }
 
     #[test]
@@ -1089,10 +1177,7 @@ mod tests {
         );
         assert_eq!(idx, before);
 
-        assert_eq!(
-            idx.remove_version_checked("v2"),
-            Ok(Some("v1".to_string()))
-        );
+        assert_eq!(idx.remove_version_checked("v2"), Ok(Some("v1".to_string())));
         assert!(idx.find("v2").is_none());
         assert_eq!(idx.find("v1").map(|v| v.is_latest), Some(true));
 
@@ -1120,6 +1205,7 @@ mod tests {
             "a",
             "does-not-exist",
             100,
+            "",
             &indexes,
         ))
         .unwrap();
@@ -1130,7 +1216,7 @@ mod tests {
 
         // Known marker still continues after that version on the same key.
         let cont = String::from_utf8(list_versions_result_xml(
-            "bucket", "", "a", "a2", 100, &indexes,
+            "bucket", "", "a", "a2", 100, "", &indexes,
         ))
         .unwrap();
         assert!(cont.contains("<VersionId>a1</VersionId>"));

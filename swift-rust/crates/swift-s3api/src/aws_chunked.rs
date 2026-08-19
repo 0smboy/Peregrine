@@ -27,8 +27,11 @@
 //! \r\n
 //! ```
 //!
-//! Triggered by `X-Amz-Content-SHA256: STREAMING-*` and/or
-//! `Content-Encoding: aws-chunked`. Port of Python `StreamingInput` /
+//! Triggered only by `X-Amz-Content-SHA256: STREAMING-*`.
+//! `Content-Encoding: aws-chunked` alone is not a dechunk signal (a client
+//! may advertise the encoding while the payload hash is a regular SHA256 /
+//! UNSIGNED-PAYLOAD, in which case the body is already raw). Port of Python
+//! `StreamingInput` /
 //! `ChunkReader` dechunk path (`s3request.py`). When `ChunkSigContext` is
 //! supplied for STREAMING-AWS4-HMAC-SHA256-PAYLOAD*, per-chunk HMAC chain
 //! verification is **enforced**: mismatch → [`AwsChunkedError::InvalidChunkSignature`].
@@ -132,20 +135,14 @@ pub fn is_ecdsa_streaming(hash: &str) -> bool {
 }
 
 /// True when the request asks for aws-chunked / streaming payload framing.
+///
+/// Only `X-Amz-Content-SHA256: STREAMING-*` is authoritative. Encoding-only
+/// `aws-chunked` must not dechunk: that would corrupt a raw body that
+/// happens to carry the encoding token.
 pub fn is_aws_chunked_request(req: &Request) -> bool {
-    if let Some(hash) = req.headers.get("X-Amz-Content-SHA256") {
-        if is_streaming_payload_hash(hash) {
-            return true;
-        }
-    }
-    if let Some(enc) = req.headers.get("Content-Encoding") {
-        for part in enc.split(',') {
-            if part.trim().eq_ignore_ascii_case("aws-chunked") {
-                return true;
-            }
-        }
-    }
-    false
+    req.headers
+        .get("X-Amz-Content-SHA256")
+        .is_some_and(is_streaming_payload_hash)
 }
 
 /// Strip `aws-chunked` tokens from `Content-Encoding` (Python
@@ -774,7 +771,7 @@ beefdeadbeefdeadbeefde\r\nabcdefghij\r\n0;chunk-signature=00\
     }
 
     #[test]
-    fn is_aws_chunked_detects_streaming_and_encoding() {
+    fn is_aws_chunked_requires_streaming_hash() {
         let mut headers = HeaderKeyDict::new();
         headers.set("X-Amz-Content-SHA256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER");
         let req = Request {
@@ -795,6 +792,18 @@ beefdeadbeefdeadbeefde\r\nabcdefghij\r\n0;chunk-signature=00\
             headers,
             body: swift_http::Body::empty(),
         };
-        assert!(is_aws_chunked_request(&req));
+        assert!(!is_aws_chunked_request(&req));
+
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Encoding", "aws-chunked");
+        headers.set("X-Amz-Content-SHA256", "UNSIGNED-PAYLOAD");
+        let req = Request {
+            method: "PUT".into(),
+            path: "/b/o".into(),
+            query_string: String::new(),
+            headers,
+            body: swift_http::Body::empty(),
+        };
+        assert!(!is_aws_chunked_request(&req));
     }
 }

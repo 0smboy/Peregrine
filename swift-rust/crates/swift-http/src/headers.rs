@@ -17,6 +17,17 @@
 //! (`swift/common/header_key_dict.py`). Iteration order is insertion
 //! order, which Python's dict also guarantees.
 
+/// Store key for `HeaderKeyDict`. Swift title-cases; S3 clients (boto3
+/// `Metadata`) require lowercase `x-amz-*` on the wire, matching Python
+/// `s3api.s3response.HeaderKeyDict`.
+pub fn header_store_key(key: &str) -> String {
+    if key.to_ascii_lowercase().starts_with("x-amz-") {
+        key.to_ascii_lowercase()
+    } else {
+        title_case(key)
+    }
+}
+
 /// Python `bytes.title()` over the latin-1 encoding of the key: the
 /// first letter of every alphabetic run is uppercased, the rest
 /// lowercased. Only ASCII letters are affected.
@@ -49,7 +60,7 @@ impl HeaderKeyDict {
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
-        let key = title_case(key);
+        let key = header_store_key(key);
         self.pairs
             .iter()
             .find(|(k, _)| *k == key)
@@ -64,7 +75,7 @@ impl HeaderKeyDict {
     ///
     /// [`remove`]: HeaderKeyDict::remove
     pub fn set(&mut self, key: &str, value: impl ToString) {
-        let key = title_case(key);
+        let key = header_store_key(key);
         let value = value.to_string();
         match self.pairs.iter_mut().find(|(k, _)| *k == key) {
             Some((_, v)) => *v = value,
@@ -79,7 +90,7 @@ impl HeaderKeyDict {
     }
 
     pub fn remove(&mut self, key: &str) -> Option<String> {
-        let key = title_case(key);
+        let key = header_store_key(key);
         let pos = self.pairs.iter().position(|(k, _)| *k == key)?;
         Some(self.pairs.remove(pos).1)
     }
@@ -116,10 +127,7 @@ mod tests {
         assert_eq!(title_case("content-length"), "Content-Length");
         assert_eq!(title_case("X-OBJECT-META-foo_bar"), "X-Object-Meta-Foo_Bar");
         assert_eq!(title_case("etag"), "Etag");
-        assert_eq!(
-            title_case("x-container-sysmeta-a b"),
-            "X-Container-Sysmeta-A B"
-        );
+        assert_eq!(title_case("x-container-sysmeta-a b"), "X-Container-Sysmeta-A B");
     }
 
     #[test]
@@ -131,5 +139,18 @@ mod tests {
         assert_eq!(h.len(), 1);
         assert_eq!(h.remove("content-LENGTH"), Some("7".to_string()));
         assert!(h.is_empty());
+    }
+
+    #[test]
+    fn x_amz_headers_stay_lowercase() {
+        let mut h = HeaderKeyDict::new();
+        h.set("X-Amz-Meta-Meta1", "mymeta");
+        h.set("x-amz-request-id", "rid");
+        let keys: Vec<&str> = h.iter().map(|(k, _)| k).collect();
+        assert!(keys.contains(&"x-amz-meta-meta1"), "{keys:?}");
+        assert!(keys.contains(&"x-amz-request-id"), "{keys:?}");
+        assert!(!keys.iter().any(|k| *k == "X-Amz-Meta-Meta1"), "{keys:?}");
+        assert_eq!(h.get("X-Amz-Meta-Meta1"), Some("mymeta"));
+        assert_eq!(h.get("x-amz-meta-meta1"), Some("mymeta"));
     }
 }

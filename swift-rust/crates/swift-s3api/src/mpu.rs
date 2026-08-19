@@ -31,6 +31,16 @@ use swift_http::Response;
 /// Python `sysmeta_header('object', 'etag')` — stored unquoted `md5hex-N`.
 pub const SYS_S3API_ETAG: &str = "X-Object-Sysmeta-S3Api-Etag";
 
+/// Python `get_container_update_override_key('etag')`. Live object-server
+/// may ignore it; listing still HEADs [`SYS_S3API_ETAG`] as fallback.
+pub const SYS_CONTAINER_UPDATE_OVERRIDE_ETAG: &str =
+    "X-Object-Sysmeta-Container-Update-Override-Etag";
+
+/// Python `get_container_update_override_key('size')`. Listing `bytes`
+/// otherwise stays the SLO manifest length (137) instead of assembled size.
+pub const SYS_CONTAINER_UPDATE_OVERRIDE_SIZE: &str =
+    "X-Object-Sysmeta-Container-Update-Override-Size";
+
 /// Build an InitiateMultipartUploadResult XML body.
 pub fn initiate_multipart_xml(bucket: &str, key: &str, upload_id: &str) -> Vec<u8> {
     Element::new("InitiateMultipartUploadResult")
@@ -61,10 +71,11 @@ pub struct ListedPart {
 
 /// Build ListPartsResult XML (no pagination metadata).
 pub fn list_parts_xml(bucket: &str, key: &str, upload_id: &str, parts: &[ListedPart]) -> Vec<u8> {
-    list_parts_xml_full(bucket, key, upload_id, 0, 1000, false, parts)
+    list_parts_xml_full(bucket, key, upload_id, 0, 1000, false, parts, "")
 }
 
 /// Build ListPartsResult XML with part-number-marker / max-parts / IsTruncated.
+/// Element order matches OpenStack Python s3api (Owner/Initiator before markers).
 pub fn list_parts_xml_full(
     bucket: &str,
     key: &str,
@@ -73,11 +84,23 @@ pub fn list_parts_xml_full(
     max_parts: u32,
     is_truncated: bool,
     parts: &[ListedPart],
+    owner_id: &str,
 ) -> Vec<u8> {
     let mut root = Element::new("ListPartsResult");
     root.push_leaf("Bucket", bucket);
     root.push_leaf("Key", key);
     root.push_leaf("UploadId", upload_id);
+    root.push(
+        Element::new("Initiator")
+            .with_leaf("ID", owner_id)
+            .with_leaf("DisplayName", owner_id),
+    );
+    root.push(
+        Element::new("Owner")
+            .with_leaf("ID", owner_id)
+            .with_leaf("DisplayName", owner_id),
+    );
+    root.push_leaf("StorageClass", "STANDARD");
     root.push_leaf("PartNumberMarker", part_number_marker.to_string());
     if let Some(last) = parts.last() {
         root.push_leaf("NextPartNumberMarker", last.part_number.to_string());
@@ -86,7 +109,6 @@ pub fn list_parts_xml_full(
     }
     root.push_leaf("MaxParts", max_parts.to_string());
     root.push_leaf("IsTruncated", if is_truncated { "true" } else { "false" });
-    root.push_leaf("StorageClass", "STANDARD");
     for p in parts {
         root.push(
             Element::new("Part")
@@ -128,6 +150,11 @@ pub fn parse_upload_marker_name(name: &str) -> Option<(String, String)> {
 }
 
 /// Build ListMultipartUploadsResult XML.
+///
+/// Child order is the OpenStack `list_multipart_uploads_result.rng` order:
+/// Bucket, markers, optional Prefix, MaxUploads, IsTruncated, then Upload
+/// (Key, UploadId, Initiator, Owner, StorageClass, Initiated). Prefix before
+/// KeyMarker is a schema miss (`Did not expect element Prefix`).
 pub fn list_multipart_uploads_xml(
     bucket: &str,
     prefix: &str,
@@ -136,19 +163,26 @@ pub fn list_multipart_uploads_xml(
     max_uploads: u32,
     is_truncated: bool,
     uploads: &[ListedUpload],
+    owner_id: &str,
 ) -> Vec<u8> {
     let mut root = Element::new("ListMultipartUploadsResult");
     root.push_leaf("Bucket", bucket);
-    root.push_leaf("Prefix", prefix);
     root.push_leaf("KeyMarker", key_marker);
     root.push_leaf("UploadIdMarker", upload_id_marker);
-    if let Some(last) = uploads.last() {
-        root.push_leaf("NextKeyMarker", &last.key);
-        root.push_leaf("NextUploadIdMarker", &last.upload_id);
+    // Official test_object_multi_upload: Next*Marker.text is the last
+    // listed key/id when the result has more than one Upload, even if
+    // IsTruncated is false. A single-upload (prefix) list uses <Tag/> so
+    // `.text` is None.
+    if uploads.len() > 1 {
+        if let Some(last) = uploads.last() {
+            root.push_leaf("NextKeyMarker", &last.key);
+            root.push_leaf("NextUploadIdMarker", &last.upload_id);
+        }
     } else {
-        root.push_leaf("NextKeyMarker", "");
-        root.push_leaf("NextUploadIdMarker", "");
+        root.push(Element::new("NextKeyMarker"));
+        root.push(Element::new("NextUploadIdMarker"));
     }
+    root.push_leaf("Prefix", prefix);
     root.push_leaf("MaxUploads", max_uploads.to_string());
     root.push_leaf("IsTruncated", if is_truncated { "true" } else { "false" });
     for u in uploads {
@@ -156,8 +190,18 @@ pub fn list_multipart_uploads_xml(
             Element::new("Upload")
                 .with_leaf("Key", &u.key)
                 .with_leaf("UploadId", &u.upload_id)
-                .with_leaf("Initiated", &u.initiated)
-                .with_leaf("StorageClass", "STANDARD"),
+                .with(
+                    Element::new("Initiator")
+                        .with_leaf("ID", owner_id)
+                        .with_leaf("DisplayName", owner_id),
+                )
+                .with(
+                    Element::new("Owner")
+                        .with_leaf("ID", owner_id)
+                        .with_leaf("DisplayName", owner_id),
+                )
+                .with_leaf("StorageClass", "STANDARD")
+                .with_leaf("Initiated", &u.initiated),
         );
     }
     root.to_xml(true)
@@ -255,6 +299,9 @@ pub fn parse_complete_body(body: &[u8]) -> Result<Vec<(u32, String)>, String> {
         parts.push((num, etag));
         rest = &after[end_rel + "</Part>".len()..];
     }
+    if parts.is_empty() {
+        return Err("MalformedXML".into());
+    }
     parts.sort_by_key(|(n, _)| *n);
     Ok(parts)
 }
@@ -327,6 +374,10 @@ mod tests {
 </CompleteMultipartUpload>"#;
         let parts = parse_complete_body(body).unwrap();
         assert_eq!(parts, vec![(1, "aa".into()), (2, "bb".into())]);
+        assert_eq!(
+            parse_complete_body(br#"<CompleteMultipartUpload></CompleteMultipartUpload>"#),
+            Err("MalformedXML".into())
+        );
     }
 
     #[test]
@@ -350,7 +401,7 @@ mod tests {
     fn list_mpu_xml_shape() {
         let xml = String::from_utf8(list_multipart_uploads_xml(
             "b",
-            "",
+            "pre",
             "",
             "",
             1000,
@@ -360,11 +411,43 @@ mod tests {
                 upload_id: "uid".into(),
                 initiated: "2026-08-05T00:00:00.000Z".into(),
             }],
+            "owner",
         ))
         .unwrap();
         assert!(xml.contains("ListMultipartUploadsResult"));
         assert!(xml.contains("<Key>k</Key>"));
         assert!(xml.contains("<UploadId>uid</UploadId>"));
         assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
+        assert!(xml.contains("<Initiator><ID>owner</ID>"));
+        assert!(xml.contains("<NextKeyMarker/>"), "{xml}");
+        assert!(xml.contains("<NextUploadIdMarker/>"), "{xml}");
+        // Prefix must sit after the marker fields (OpenStack RNG).
+        let markers_end = xml.find("<NextUploadIdMarker/>").unwrap();
+        let prefix_at = xml.find("<Prefix>pre</Prefix>").unwrap();
+        assert!(prefix_at > markers_end, "{xml}");
+        let xml2 = String::from_utf8(list_multipart_uploads_xml(
+            "b",
+            "",
+            "",
+            "",
+            1000,
+            false,
+            &[
+                ListedUpload {
+                    key: "a".into(),
+                    upload_id: "u1".into(),
+                    initiated: "2026-08-05T00:00:00.000Z".into(),
+                },
+                ListedUpload {
+                    key: "obj3".into(),
+                    upload_id: "u2".into(),
+                    initiated: "2026-08-05T00:00:01.000Z".into(),
+                },
+            ],
+            "owner",
+        ))
+        .unwrap();
+        assert!(xml2.contains("<NextKeyMarker>obj3</NextKeyMarker>"), "{xml2}");
+        assert!(xml2.contains("<NextUploadIdMarker>u2</NextUploadIdMarker>"), "{xml2}");
     }
 }

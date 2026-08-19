@@ -520,7 +520,7 @@ pub fn amz_expiration_from_delete_at(value: &str) -> Option<String> {
     if unix <= 0 {
         return None;
     }
-    Some(amz_expiration_header(unix, "Lifecycle"))
+    Some(amz_expiration_header(unix, "swift-object-expiration"))
 }
 
 /// RFC 7231 IMF-fixdate in UTC (`Thu, 01 Jan 1970 00:00:00 GMT`).
@@ -816,7 +816,7 @@ mod tests {
         );
         assert_eq!(
             amz_expiration_from_delete_at("1700000000").unwrap(),
-            "expiry-date=\"Tue, 14 Nov 2023 22:13:20 GMT\", rule-id=\"Lifecycle\""
+            "expiry-date=\"Tue, 14 Nov 2023 22:13:20 GMT\", rule-id=\"swift-object-expiration\""
         );
         assert!(amz_expiration_from_delete_at("0").is_none());
         assert!(amz_expiration_from_delete_at("x").is_none());
