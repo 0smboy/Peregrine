@@ -156,6 +156,10 @@ pub struct ProxyConfig {
     pub cors_allow_origin: Vec<String>,
     /// Operator-wide additions to `Access-Control-Expose-Headers`.
     pub cors_expose_headers: Vec<String>,
+    /// Python `allow_open_expired`. When false the proxy must not forward
+    /// `X-Open-Expired` (the object server treats that header as sufficient
+    /// to open a not-yet-reaped expired object).
+    pub allow_open_expired: bool,
 }
 
 impl Default for ProxyConfig {
@@ -176,6 +180,7 @@ impl Default for ProxyConfig {
             strict_cors_mode: true,
             cors_allow_origin: Vec::new(),
             cors_expose_headers: Vec::new(),
+            allow_open_expired: false,
         }
     }
 }
@@ -2861,6 +2866,13 @@ impl ProxyApp {
                 )
                 .await;
         }
+        // Python validates controller public methods before 404: LICK /
+        // GETorHEAD_base on a /v1 path is 405, not 404.
+        let segs: Vec<&str> = areq.path.splitn(5, '/').collect();
+        if segs.len() >= 3 && segs[0].is_empty() && segs[1] == "v1" && !segs[2].is_empty() {
+            let allowed = self.allowed_methods(segs.get(3).is_some_and(|s| !s.is_empty()));
+            return method_not_allowed(allowed);
+        }
         swob_response(404)
     }
 
@@ -2944,6 +2956,7 @@ impl ProxyApp {
         else {
             return swob_response(503);
         };
+        apply_content_type_guess(req);
         if let Some(err) = check_object_creation(req, object) {
             return err;
         }
@@ -4324,9 +4337,6 @@ impl ProxyApp {
                     "If-Modified-Since",
                     "If-Unmodified-Since",
                     "X-Newest",
-                    // Recoverable-ghost reads: object server opens past
-                    // X-Delete-At when this is true (see DiskFile::with_open_expired).
-                    "X-Open-Expired",
                     // set by DLO/SLO (below gatekeeper, so client-supplied
                     // copies are stripped): the object server drops the Range
                     // when the object carries the named manifest metadata.
@@ -4336,6 +4346,7 @@ impl ProxyApp {
                         headers.set(h, v.to_string());
                     }
                 }
+                self.forward_open_expired(req, &mut headers);
                 let nodes = self.iter_nodes(object_ring, object_part);
                 self.get_or_head(
                     "object",
@@ -4349,6 +4360,9 @@ impl ProxyApp {
                 .unwrap_or_else(|| swob_response(503))
             }
             "PUT" | "POST" | "DELETE" => {
+                if req.method == "PUT" {
+                    apply_content_type_guess(req);
+                }
                 // Enforce the metadata constraints (name/value length, count,
                 // overall size) on writes, as Python's proxy does via
                 // check_metadata — the object server does not, so without this
@@ -4513,6 +4527,7 @@ impl ProxyApp {
         ec: EcPolicyParams,
     ) -> Response {
         use swift_ec::EcDriver;
+        apply_content_type_guess(req);
         let driver = match EcDriver::new(ec.ndata, ec.nparity) {
             Ok(d) => d,
             Err(e) => return text_response(500, &format!("EC init failed: {e:?}")),
@@ -4811,9 +4826,7 @@ impl ProxyApp {
         let is_head = req.method == "HEAD";
         let mut headers = self.backend_headers(req, false, "object");
         headers.set("X-Backend-Storage-Policy-Index", policy_index);
-        if let Some(v) = req.headers.get("X-Open-Expired") {
-            headers.set("X-Open-Expired", v.to_string());
-        }
+        self.forward_open_expired(req, &mut headers);
         let nodes = self.iter_nodes(object_ring, object_part);
 
         let (tx, rx) = mpsc::sync_channel(nodes.len().max(1));
@@ -5386,6 +5399,45 @@ fn apply_check_delete_headers(req: &mut Request, now: f64) -> Result<(), Respons
     Ok(())
 }
 
+/// Python `ObjectController._update_content_type`: guess from the path
+/// when the client omitted Content-Type or sent `X-Detect-Content-Type`.
+pub(crate) fn apply_content_type_guess(req: &mut Request) {
+    let detect = req
+        .headers
+        .get("X-Detect-Content-Type")
+        .is_some_and(config_true_value);
+    let missing = req
+        .headers
+        .get("Content-Type")
+        .map(|v| v.is_empty())
+        .unwrap_or(true);
+    if detect || missing {
+        req.headers
+            .set("Content-Type", swift_http::guess_content_type(&req.path));
+        if detect {
+            req.headers.remove("X-Detect-Content-Type");
+        }
+    }
+}
+
+impl ProxyApp {
+    /// Forward `X-Open-Expired` only when `allow_open_expired` is on.
+    /// Python also stamps `X-Backend-Open-Expired` in that case; the object
+    /// server currently honours the client header, so omitting it when the
+    /// config is false is what makes expired GET 404.
+    fn forward_open_expired(&self, req: &Request, headers: &mut HeaderKeyDict) {
+        if !self.config.allow_open_expired {
+            return;
+        }
+        if let Some(v) = req.headers.get("X-Open-Expired") {
+            headers.set("X-Open-Expired", v.to_string());
+            if config_true_value(v) {
+                headers.set("X-Backend-Open-Expired", "true");
+            }
+        }
+    }
+}
+
 /// Proxy half of Python `check_object_creation` (length / transfer-encoding
 /// / delete-at). Content-Type is not required here: functional tests PUT
 /// without it and expect 201, matching the object-server default.
@@ -5779,13 +5831,16 @@ async fn dispatch_remaining(
             Err(_) => resp.body = swift_http::Body::empty(),
         }
     }
-    for filter in filters[start..].iter().rev() {
-        if filter.intercepts_response() {
+    for j in (start..filters.len()).rev() {
+        if filters[j].intercepts_response() {
+            // First next() is the captured app response. Later next()s
+            // (SLO/DLO segment GET, symlink follow) must still hit the
+            // remaining filters — not skip to the app and drop symlink.
+            let rest = remaining_async_next(Arc::clone(&filters), j + 1, Arc::clone(&app));
             let captured = Arc::new(Mutex::new(Some(resp)));
-            let app2 = Arc::clone(&app);
             let next: swift_middleware::AsyncNextFn = Arc::new(move |r| {
                 let captured = Arc::clone(&captured);
-                let app2 = Arc::clone(&app2);
+                let rest = Arc::clone(&rest);
                 Box::pin(async move {
                     if let Some(inner) = captured
                         .lock()
@@ -5794,12 +5849,14 @@ async fn dispatch_remaining(
                     {
                         return inner;
                     }
-                    app2.handle_async(request_to_async(r)).await
+                    rest(r).await
                 })
             });
-            resp = filter.reassemble_async(head.clone_head(), next).await;
+            resp = filters[j]
+                .reassemble_async(head.clone_head(), next)
+                .await;
         } else {
-            resp = filter.finish(&head, resp);
+            resp = filters[j].finish(&head, resp);
         }
     }
     app.apply_pipeline_cors(
@@ -5948,25 +6005,32 @@ impl AsyncService for ProxyAsyncService {
                     Err(_) => resp.body = swift_http::Body::empty(),
                 }
             }
-            for filter in filters.iter().rev() {
-                if filter.intercepts_response() {
+            let filters_arc = Arc::new(filters);
+            for j in (0..filters_arc.len()).rev() {
+                if filters_arc[j].intercepts_response() {
+                    let rest = remaining_async_next(
+                        Arc::clone(&filters_arc),
+                        j + 1,
+                        Arc::clone(&app),
+                    );
                     let captured = Arc::new(Mutex::new(Some(resp)));
-                    let app2 = Arc::clone(&app);
                     let next: swift_middleware::AsyncNextFn = Arc::new(move |r| {
                         let captured = Arc::clone(&captured);
-                        let app2 = Arc::clone(&app2);
+                        let rest = Arc::clone(&rest);
                         Box::pin(async move {
                             if let Some(inner) =
                                 captured.lock().unwrap_or_else(|p| p.into_inner()).take()
                             {
                                 return inner;
                             }
-                            app2.handle_async(request_to_async(r)).await
+                            rest(r).await
                         })
                     });
-                    resp = filter.reassemble_async(head.clone_head(), next).await;
+                    resp = filters_arc[j]
+                        .reassemble_async(head.clone_head(), next)
+                        .await;
                 } else {
-                    resp = filter.finish(&head, resp);
+                    resp = filters_arc[j].finish(&head, resp);
                 }
             }
             app.apply_pipeline_cors(
@@ -6744,6 +6808,105 @@ mod cors_tests {
             })
             .await;
         assert_eq!(unknown.status, 404);
+        let lick = app
+            .handle_async(swift_http::AsyncRequest {
+                method: "LICK".into(),
+                path: "/v1/AUTH_test".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(lick.status, 405, "LICK on /v1 must be 405, got {}", lick.status);
+        assert!(
+            lick.headers.get("Allow").is_some(),
+            "405 must advertise Allow"
+        );
+    }
+
+    #[test]
+    fn content_type_guess_matches_python_mimetypes_for_func_tests() {
+        let mut req = Request {
+            method: "PUT".into(),
+            path: "/v1/a/c/foo.txt".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        };
+        apply_content_type_guess(&mut req);
+        assert_eq!(req.headers.get("Content-Type"), Some("text/plain"));
+        req.headers.remove("Content-Type");
+        req.path = "/v1/a/c/foo.wav".into();
+        apply_content_type_guess(&mut req);
+        assert_eq!(req.headers.get("Content-Type"), Some("audio/x-wav"));
+        req.headers.remove("Content-Type");
+        req.path = "/v1/a/c/foo.zip".into();
+        apply_content_type_guess(&mut req);
+        assert_eq!(req.headers.get("Content-Type"), Some("application/zip"));
+        req.headers.set("Content-Type", "application/custom");
+        apply_content_type_guess(&mut req);
+        assert_eq!(req.headers.get("Content-Type"), Some("application/custom"));
+    }
+
+    struct InnerSegmentIntercept;
+    impl swift_middleware::Middleware for InnerSegmentIntercept {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.ends_with("/segment")
+        }
+        fn handle_request_async(
+            &self,
+            _req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async { Response::new(209) })
+        }
+    }
+
+    struct OuterReassemble;
+    impl swift_middleware::Middleware for OuterReassemble {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_response(&self) -> bool {
+            true
+        }
+        fn reassemble_async(
+            &self,
+            req: Request,
+            next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                let _first = next(req.clone_head()).await;
+                let mut sub = req.clone_head();
+                sub.path = "/v1/AUTH_test/c/segment".into();
+                next(sub).await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn intercepts_response_subsequent_next_hits_remaining_filters() {
+        let app = app(ProxyConfig::default());
+        let filters: Arc<Vec<Arc<dyn swift_middleware::Middleware>>> = Arc::new(vec![
+            Arc::new(OuterReassemble),
+            Arc::new(InnerSegmentIntercept),
+        ]);
+        let req = Request {
+            method: "GET".into(),
+            path: "/v1/AUTH_test/c/manifest".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        };
+        let resp = dispatch_remaining(filters, 0, app, req).await;
+        assert_eq!(
+            resp.status, 209,
+            "SLO-style subsequent next() must reach remaining filters, got {}",
+            resp.status
+        );
     }
 
     #[test]

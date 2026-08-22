@@ -1152,13 +1152,13 @@ impl ProxyApp {
             "If-Modified-Since",
             "If-Unmodified-Since",
             "X-Newest",
-            "X-Open-Expired",
             "X-Backend-Ignore-Range-If-Metadata-Present",
         ] {
             if let Some(v) = req.headers.get(h) {
                 headers.set(h, v.to_string());
             }
         }
+        self.forward_open_expired(req, &mut headers);
         if self.ec_policies.contains_key(&policy_index) {
             return self
                 .ec_get_async(req, &path, policy_index, object_ring, object_part)
@@ -1210,11 +1210,12 @@ impl ProxyApp {
             // object. Range and conditionals are applied after decode against
             // the reconstructed ETag / Last-Modified. Ignore-Range is
             // evaluated against fragment sysmeta locally.
-            for h in ["X-Newest", "X-Open-Expired"] {
+            for h in ["X-Newest"] {
                 if let Some(v) = req.headers.get(h) {
                     headers.set(h, v.to_string());
                 }
             }
+            self.forward_open_expired(req, &mut headers);
             let range_hdr = req.headers.get("Range").map(str::to_string);
             let ignore_hdr = req
                 .headers
@@ -1541,6 +1542,7 @@ impl ProxyApp {
         let archive_len = client_len.map(|total| super::ec_archive_size(&driver, ec.segment_size, total));
         let put_ts = Timestamp::now();
         let ts = put_ts.internal();
+        super::apply_content_type_guess(req);
         let content_type = req
             .headers
             .get("Content-Type")

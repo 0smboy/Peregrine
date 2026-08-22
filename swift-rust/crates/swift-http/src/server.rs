@@ -291,7 +291,10 @@ impl Default for ServerConfig {
             max_request_line_bytes: 8 * 1024,
             max_header_line_bytes: 8 * 1024,
             max_header_bytes: 64 * 1024,
-            max_header_count: 128,
+            // High enough that `check_metadata` can 400 "Too many metadata
+            // items" (Python Eventlet has no tight parser cap). 128 431s
+            // TestFile.testMetadataNumberLimit before the app sees the PUT.
+            max_header_count: 1024,
             max_body_bytes: swift_core::constraints::MAX_FILE_SIZE as u64,
             access_log: None,
             shutdown: None,

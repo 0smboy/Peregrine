@@ -458,6 +458,7 @@ fn proxy_config_from_conf(conf: &SwiftConfig, auth_enabled: bool) -> ProxyConfig
             .filter(|v| v.is_finite())
             .unwrap_or(60.0),
         auth_enabled,
+        allow_open_expired: config_true_value(&get("allow_open_expired", "false")),
         ..Default::default()
     }
 }

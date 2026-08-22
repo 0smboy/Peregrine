@@ -144,6 +144,33 @@ pub fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
+/// Percent-decode a path or query component (no `+` handling) to raw bytes.
+pub fn percent_decode_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Python `check_utf8(wsgi_to_str(PATH_INFO))` on the percent-decoded bytes.
+/// Lossy UTF-8 replacement would hide InvalidUTF8Path as a 400.
+pub fn decoded_path_is_utf8(s: &[u8]) -> bool {
+    swift_core::constraints::check_utf8_bytes(&percent_decode_bytes(s), false)
+}
+
 /// Percent-decode a path or query component (no `+` handling).
 ///
 /// The Swift server pipeline is `wsgi_unquote` (latin-1) then `wsgi_to_str`
@@ -161,26 +188,43 @@ pub fn reason_phrase(status: u16) -> &'static str {
 /// (`U+FFFD`); fully matching Python here would require carrying names as
 /// bytes through the whole stack rather than as `String`.
 pub fn unquote(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (
-                (bytes[i + 1] as char).to_digit(16),
-                (bytes[i + 2] as char).to_digit(16),
-            ) {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
     // utf-8 decode of the percent-decoded bytes == Python wsgi_to_str for
     // valid UTF-8 (the common case), which is the form hash_path/DB use.
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8_lossy(&percent_decode_bytes(s.as_bytes())).into_owned()
+}
+
+/// Python `mimetypes.guess_type(path)` used by proxy `_update_content_type`
+/// when the client omits Content-Type (or sends `X-Detect-Content-Type`).
+/// Unknown extensions become `application/octet-stream`.
+pub fn guess_content_type(path: &str) -> &'static str {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let ext = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() && !ext.contains('/') => ext,
+        _ => return "application/octet-stream",
+    };
+    match ext.to_ascii_lowercase().as_str() {
+        "txt" | "text" | "pot" | "brf" | "srt" => "text/plain",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "csv" => "text/csv",
+        "js" | "mjs" => "text/javascript",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "gz" | "gzip" => "application/gzip",
+        "tar" => "application/x-tar",
+        "wav" => "audio/x-wav",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        "mp4" => "video/mp4",
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        _ => "application/octet-stream",
+    }
 }
 
 /// Parse a query string: percent-decoding plus `+` as space, preserving
@@ -299,6 +343,16 @@ mod tests {
                 ("delimiter".into(), "/".into()),
                 ("plus".into(), "a b".into()),
             ]
+        );
+        assert!(decoded_path_is_utf8(b"/v1/AUTH_test/%E4%B8%AD"));
+        assert!(!decoded_path_is_utf8(b"/v1/AUTH_test/%FF%FE"));
+        assert!(!decoded_path_is_utf8(&[0xff, 0xfe]));
+        assert_eq!(guess_content_type("/v1/a/c/file.txt"), "text/plain");
+        assert_eq!(guess_content_type("/v1/a/c/file.WAV"), "audio/x-wav");
+        assert_eq!(guess_content_type("/v1/a/c/file.zip"), "application/zip");
+        assert_eq!(
+            guess_content_type("/v1/a/c/noext"),
+            "application/octet-stream"
         );
     }
 }

@@ -2970,9 +2970,13 @@ impl ObjectServer {
         // is past X-Delete-At but has not been reaped yet. Default remains 404.
         let open_expired = req
             .headers
-            .get("X-Open-Expired")
-            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-            .unwrap_or(false);
+            .get("X-Backend-Open-Expired")
+            .is_some_and(config_true_value)
+            || req
+                .headers
+                .get("X-Open-Expired")
+                .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+                .unwrap_or(false);
         df = df.with_open_expired(open_expired);
         let opened = match df.open(None) {
             Ok(df) => df,

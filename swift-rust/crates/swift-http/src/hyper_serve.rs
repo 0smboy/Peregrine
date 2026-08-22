@@ -43,7 +43,8 @@ use swift_runtime::{
 
 use crate::body::Body;
 use crate::headers::HeaderKeyDict;
-use crate::request::{reason_phrase, unquote, Response};
+use crate::dates::http_date;
+use crate::request::{decoded_path_is_utf8, reason_phrase, unquote, Response};
 use crate::server::{AsyncRequest, AsyncService, IncomingBody, ServerConfig};
 
 /// Decode a Hyper header value the way WSGI/Swift does: UTF-8 when the
@@ -89,6 +90,9 @@ pub async fn serve_http1_connection(
         }
         Err(e) => return Err(e),
     };
+    if let Some(body) = request_line_precondition(&peeked) {
+        return write_precondition_failed(&mut stream, body).await;
+    }
     if request_line_is_ssync(&peeked) {
         let more = if peeked.windows(4).any(|w| w == b"\r\n\r\n") {
             peeked
@@ -269,6 +273,65 @@ impl AsyncWrite for PrefixedIo {
 fn request_line_is_ssync(buf: &[u8]) -> bool {
     let line = buf.split(|&b| b == b'\r' || b == b'\n').next().unwrap_or(buf);
     line.len() >= 6 && line[..6].eq_ignore_ascii_case(b"SSYNC ")
+}
+
+/// Python proxy `check_utf8(PATH_INFO)` / `get_controller is None` → 412.
+/// Hyper rejects a space in the request-target (`GET /info asdf`) as 404 and
+/// lossy-unquote hides invalid UTF-8 as 400; catch both on the peeked line.
+fn request_line_precondition(buf: &[u8]) -> Option<&'static str> {
+    let line = buf.split(|&b| b == b'\r' || b == b'\n').next().unwrap_or(buf);
+    if request_line_is_ssync(line) {
+        return None;
+    }
+    let mut parts = line.split(|&b| b == b' ');
+    let Some(method) = parts.next() else {
+        return Some("Bad URL");
+    };
+    if method.is_empty() {
+        return Some("Bad URL");
+    }
+    let Some(target) = parts.next() else {
+        return Some("Bad URL");
+    };
+    let Some(version) = parts.next() else {
+        return Some("Bad URL");
+    };
+    if parts.next().is_some() || !version.starts_with(b"HTTP/") {
+        return Some("Bad URL");
+    }
+    let path = target.split(|&b| b == b'?').next().unwrap_or(target);
+    if !decoded_path_is_utf8(path) {
+        return Some("Invalid UTF8 or contains NULL");
+    }
+    None
+}
+
+fn fresh_trans_id() -> String {
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("tx{n:x}")
+}
+
+async fn write_precondition_failed(
+    stream: &mut tokio::net::TcpStream,
+    body: &str,
+) -> std::io::Result<()> {
+    let trans = fresh_trans_id();
+    let msg = format!(
+        "HTTP/1.1 412 Precondition Failed\r\n\
+         Content-Type: text/plain\r\n\
+         Content-Length: {}\r\n\
+         X-Trans-Id: {trans}\r\n\
+         X-Openstack-Request-Id: {trans}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(msg.as_bytes()).await;
+    let _ = stream.flush().await;
+    let _ = stream.shutdown().await;
+    Ok(())
 }
 
 async fn read_until_marker(
@@ -720,6 +783,7 @@ impl Service<HyperRequest<Incoming>> for HyperToSwift {
             let path = unquote(parts.uri.path());
             let query_string = parts.uri.query().unwrap_or("").to_string();
             let head_request = method == "HEAD";
+            let client_connection = headers.get("Connection").map(str::to_string);
             let close_after = n + 1 >= config.max_requests_per_connection.max(1);
             if matches!(method.as_str(), "GET" | "HEAD") && path == "/recon/concurrency" {
                 let body = metrics.render();
@@ -727,6 +791,7 @@ impl Service<HyperRequest<Incoming>> for HyperToSwift {
                     crate::request::Response::with_body(200, body),
                     !close_after,
                     head_request,
+                    client_connection.as_deref(),
                 ));
             }
 
@@ -763,19 +828,25 @@ impl Service<HyperRequest<Incoming>> for HyperToSwift {
                 body,
             };
             let response = inner.call(areq).await;
-            Ok(to_hyper_response(response, !close_after, head_request))
+            Ok(to_hyper_response(
+                response,
+                !close_after,
+                head_request,
+                client_connection.as_deref(),
+            ))
         })
     }
 }
 
 fn error_hyper(status: u16, message: &str, keep_alive: bool) -> HyperResponse<SwiftHttpBody> {
-    to_hyper_response(Response::error(status, message), keep_alive, false)
+    to_hyper_response(Response::error(status, message), keep_alive, false, None)
 }
 
 fn to_hyper_response(
     mut response: Response,
     keep_alive: bool,
     head_request: bool,
+    client_connection: Option<&str>,
 ) -> HyperResponse<SwiftHttpBody> {
     if response.reason.contains(['\r', '\n']) {
         response.reason = reason_phrase(response.status).to_string();
@@ -786,6 +857,13 @@ fn to_hyper_response(
         if let Some(n) = response.body.content_length() {
             response.headers.set("Content-Length", n);
         }
+    }
+    if response.headers.get("Date").is_none() {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        response.headers.set("Date", http_date(secs));
     }
     let mut builder = HyperResponse::builder().status(status);
     for (name, value) in response.headers.iter() {
@@ -805,10 +883,17 @@ fn to_hyper_response(
         };
         builder = builder.header(name, hv);
     }
-    builder = builder.header(
-        "Connection",
-        if keep_alive { "keep-alive" } else { "close" },
-    );
+    // HTTP/1.1 keep-alive is the default; TestFile.testGetResponseHeaders
+    // treats an unsolicited `Connection: keep-alive` as unexpected.
+    let client_ka = client_connection.is_some_and(|v| {
+        v.split(',')
+            .any(|t| t.trim().eq_ignore_ascii_case("keep-alive"))
+    });
+    if !keep_alive {
+        builder = builder.header("Connection", "close");
+    } else if client_ka {
+        builder = builder.header("Connection", "keep-alive");
+    }
     let body = if head_request {
         SwiftHttpBody::empty()
     } else {
@@ -978,10 +1063,48 @@ mod tests {
         let mut resp = Response::new(200);
         resp.headers.set("X-Object-Meta-Color", "красный");
         resp.headers.set("Content-Type", "text/Ω");
-        let hyper = to_hyper_response(resp, true, true);
+        let hyper = to_hyper_response(resp, true, true, None);
         let color = hyper.headers().get("X-Object-Meta-Color").unwrap();
         assert_eq!(color.as_bytes(), "красный".as_bytes());
         let ct = hyper.headers().get("Content-Type").unwrap();
         assert_eq!(ct.as_bytes(), "text/Ω".as_bytes());
+        assert!(hyper.headers().get("Date").is_some());
+        assert!(hyper.headers().get("Connection").is_none());
+    }
+
+    #[test]
+    fn to_hyper_response_connection_only_when_client_asked() {
+        let resp = Response::new(200);
+        let hyper = to_hyper_response(resp, true, true, Some("keep-alive"));
+        assert_eq!(
+            hyper.headers().get("Connection").unwrap().as_bytes(),
+            b"keep-alive"
+        );
+        let resp = Response::new(200);
+        let hyper = to_hyper_response(resp, false, true, None);
+        assert_eq!(
+            hyper.headers().get("Connection").unwrap().as_bytes(),
+            b"close"
+        );
+    }
+
+    #[test]
+    fn request_line_precondition_info_space_and_invalid_utf8() {
+        assert_eq!(
+            request_line_precondition(b"GET /info asdf HTTP/1.1\r\n"),
+            Some("Bad URL")
+        );
+        assert_eq!(
+            request_line_precondition(b"GET /v1/AUTH_test/%FF HTTP/1.1\r\n"),
+            Some("Invalid UTF8 or contains NULL")
+        );
+        assert_eq!(
+            request_line_precondition(b"GET /v1/AUTH_test/c/o HTTP/1.1\r\n"),
+            None
+        );
+        assert_eq!(
+            request_line_precondition(b"GET /info HTTP/1.1\r\n"),
+            None
+        );
     }
 }
