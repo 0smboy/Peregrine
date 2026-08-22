@@ -43,10 +43,18 @@
 //! `STREAMING-UNSIGNED-PAYLOAD-TRAILER` accepts trailers without HMAC.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::io;
+use std::sync::{Arc, Mutex};
 
 use crate::crypto::{hmac_sha256_hex, sha256_hex, streq_const_time};
 use crate::sigv4::signing_key;
-use swift_http::{HeaderKeyDict, Request};
+use swift_http::{BodyTransform, HeaderKeyDict, Request};
+
+/// Max aws-chunked *chunk* (not object) we will buffer for HMAC.
+/// Memory is O(chunk), not O(object).
+pub const MAX_STREAMING_CHUNK: usize = 16 * 1024 * 1024;
+const MAX_HEADER_LINE: usize = 4096;
 
 /// `X-Amz-Content-SHA256` values that imply aws-chunked streaming
 /// (Python `s3request._is_streaming`).
@@ -84,6 +92,14 @@ pub enum AwsChunkedError {
     /// failed, or required trailer signature missing in signed trailer mode.
     InvalidTrailerSignature,
 }
+
+impl fmt::Display for AwsChunkedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "aws-chunked:{self:?}")
+    }
+}
+
+impl std::error::Error for AwsChunkedError {}
 
 /// Decoded payload + optional trailers after the terminal 0-chunk.
 #[derive(Debug, Clone)]
@@ -163,144 +179,380 @@ pub fn cleanup_content_encoding(headers: &mut HeaderKeyDict) {
     }
 }
 
+/// Incremental aws-chunked decoder. Buffer is O(current chunk), not O(object).
+pub struct AwsChunkedDecoder {
+    buf: Vec<u8>,
+    pos: usize,
+    state: DecState,
+    expected: Option<u64>,
+    decoded: u64,
+    sig_ctx: Option<ChunkSigContext>,
+    prev_sig: Option<String>,
+    trailers: HashMap<String, String>,
+    all_sigs_ok: Option<bool>,
+    trailer_ok: Option<bool>,
+    last_chunk_size: Option<usize>,
+}
+
+enum DecState {
+    Header,
+    Body {
+        remaining: usize,
+        chunk: Vec<u8>,
+        chunk_sig: Option<String>,
+    },
+    BodyCrlf {
+        chunk: Vec<u8>,
+        chunk_sig: Option<String>,
+        got: u8,
+    },
+    Trailers,
+    Done,
+}
+
+impl AwsChunkedDecoder {
+    pub fn new(expected: Option<u64>, sig_ctx: Option<ChunkSigContext>) -> Self {
+        let all_sigs_ok = sig_ctx.as_ref().map(|_| true);
+        let prev_sig = sig_ctx
+            .as_ref()
+            .map(|c| c.seed_signature.to_ascii_lowercase());
+        Self {
+            buf: Vec::new(),
+            pos: 0,
+            state: DecState::Header,
+            expected,
+            decoded: 0,
+            sig_ctx,
+            prev_sig,
+            trailers: HashMap::new(),
+            all_sigs_ok,
+            trailer_ok: None,
+            last_chunk_size: None,
+        }
+    }
+
+    /// Wire bytes currently held (header remnant + in-progress chunk).
+    pub fn buffered_wire_bytes(&self) -> usize {
+        let pending = self.buf.len().saturating_sub(self.pos);
+        pending
+            + match &self.state {
+                DecState::Body { chunk, .. } | DecState::BodyCrlf { chunk, .. } => chunk.len(),
+                _ => 0,
+            }
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>, AwsChunkedError> {
+        self.buf.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        self.drain(&mut out, false)?;
+        self.compact();
+        Ok(out)
+    }
+
+    pub fn finish_payload(&mut self) -> Result<Vec<u8>, AwsChunkedError> {
+        let mut out = Vec::new();
+        self.drain(&mut out, true)?;
+        if let Some(expected) = self.expected {
+            if self.decoded != expected {
+                return Err(AwsChunkedError::SizeMismatch {
+                    expected,
+                    provided: self.decoded,
+                });
+            }
+        }
+        self.trailer_ok = verify_trailers_if_needed(
+            self.sig_ctx.as_ref(),
+            self.prev_sig.as_deref(),
+            &self.trailers,
+        )?;
+        Ok(out)
+    }
+
+    fn compact(&mut self) {
+        if self.pos > 0 {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
+    }
+
+    fn remaining(&self) -> &[u8] {
+        &self.buf[self.pos..]
+    }
+
+    fn drain(&mut self, out: &mut Vec<u8>, eof: bool) -> Result<(), AwsChunkedError> {
+        loop {
+            match &mut self.state {
+                DecState::Done => {
+                    if eof && !self.remaining().is_empty() {
+                        // stray bytes after terminal blank line
+                    }
+                    return Ok(());
+                }
+                DecState::Header => {
+                    let rem = self.remaining();
+                    let Some(nl) = rem.iter().position(|&b| b == b'\n') else {
+                        if rem.len() > MAX_HEADER_LINE {
+                            return Err(AwsChunkedError::InvalidChunkHeader);
+                        }
+                        if eof {
+                            return Err(AwsChunkedError::Incomplete);
+                        }
+                        return Ok(());
+                    };
+                    let mut line = rem[..nl].to_vec();
+                    self.pos += nl + 1;
+                    if line.ends_with(&[b'\r']) {
+                        line.pop();
+                    }
+                    let (size_str, params) = match line.iter().position(|&b| b == b';') {
+                        Some(i) => (&line[..i], Some(&line[i + 1..])),
+                        None => (line.as_slice(), None),
+                    };
+                    let size = parse_hex_size(size_str)?;
+                    let _ = self.last_chunk_size.replace(size);
+                    if size > MAX_STREAMING_CHUNK {
+                        return Err(AwsChunkedError::InvalidChunkHeader);
+                    }
+                    if let Some(expected) = self.expected {
+                        if self.decoded + size as u64 > expected {
+                            return Err(AwsChunkedError::SizeMismatch {
+                                expected,
+                                provided: self.decoded + size as u64,
+                            });
+                        }
+                    }
+                    let chunk_sig = parse_chunk_signature(params);
+                    if size == 0 {
+                        if let Some(ctx) = self.sig_ctx.clone() {
+                            match (chunk_sig, self.prev_sig.as_ref()) {
+                                (Some(sig), Some(prev)) => {
+                                    if !verify_chunk_signature(&ctx, prev, EMPTY_SHA256, &sig) {
+                                        return Err(AwsChunkedError::InvalidChunkSignature);
+                                    }
+                                    self.all_sigs_ok = Some(true);
+                                    self.prev_sig = Some(sig.to_ascii_lowercase());
+                                }
+                                _ => return Err(AwsChunkedError::InvalidChunkSignature),
+                            }
+                        }
+                        self.state = DecState::Trailers;
+                        continue;
+                    }
+                    self.state = DecState::Body {
+                        remaining: size,
+                        chunk: Vec::with_capacity(size),
+                        chunk_sig,
+                    };
+                }
+                DecState::Body { .. } => {
+                    let (mut remaining, mut chunk, chunk_sig) = match &mut self.state {
+                        DecState::Body {
+                            remaining,
+                            chunk,
+                            chunk_sig,
+                        } => (*remaining, std::mem::take(chunk), chunk_sig.take()),
+                        _ => unreachable!(),
+                    };
+                    let avail = self.buf.len().saturating_sub(self.pos);
+                    if avail == 0 {
+                        self.state = DecState::Body {
+                            remaining,
+                            chunk,
+                            chunk_sig,
+                        };
+                        if eof {
+                            return Err(AwsChunkedError::Incomplete);
+                        }
+                        return Ok(());
+                    }
+                    let take = remaining.min(avail);
+                    chunk.extend_from_slice(&self.buf[self.pos..self.pos + take]);
+                    self.pos += take;
+                    remaining -= take;
+                    if remaining == 0 {
+                        self.state = DecState::BodyCrlf {
+                            chunk,
+                            chunk_sig,
+                            got: 0,
+                        };
+                    } else {
+                        self.state = DecState::Body {
+                            remaining,
+                            chunk,
+                            chunk_sig,
+                        };
+                    }
+                }
+                DecState::BodyCrlf { .. } => {
+                    let (chunk, chunk_sig, mut got) = match &mut self.state {
+                        DecState::BodyCrlf {
+                            chunk,
+                            chunk_sig,
+                            got,
+                        } => (std::mem::take(chunk), chunk_sig.take(), *got),
+                        _ => unreachable!(),
+                    };
+                    let avail = self.buf.len().saturating_sub(self.pos);
+                    if avail == 0 {
+                        self.state = DecState::BodyCrlf {
+                            chunk,
+                            chunk_sig,
+                            got,
+                        };
+                        if eof {
+                            return Err(AwsChunkedError::Incomplete);
+                        }
+                        return Ok(());
+                    }
+                    let b = self.buf[self.pos];
+                    self.pos += 1;
+                    got = match (got, b) {
+                        (0, b'\n') => 2,
+                        (0, b'\r') => 1,
+                        (1, b'\n') => 2,
+                        _ => return Err(AwsChunkedError::InvalidChunkHeader),
+                    };
+                    if got < 2 {
+                        self.state = DecState::BodyCrlf {
+                            chunk,
+                            chunk_sig,
+                            got,
+                        };
+                        continue;
+                    }
+                    if let Some(ctx) = self.sig_ctx.clone() {
+                        match (chunk_sig, self.prev_sig.as_ref()) {
+                            (Some(sig), Some(prev)) => {
+                                let data_hash = sha256_hex(&chunk);
+                                if !verify_chunk_signature(&ctx, prev, &data_hash, &sig) {
+                                    return Err(AwsChunkedError::InvalidChunkSignature);
+                                }
+                                self.all_sigs_ok = Some(true);
+                                self.prev_sig = Some(sig.to_ascii_lowercase());
+                            }
+                            _ => return Err(AwsChunkedError::InvalidChunkSignature),
+                        }
+                    }
+                    self.decoded += chunk.len() as u64;
+                    out.extend_from_slice(&chunk);
+                    self.state = DecState::Header;
+                }
+                DecState::Trailers => {
+                    let rem = self.remaining();
+                    let Some(nl) = rem.iter().position(|&b| b == b'\n') else {
+                        if rem.is_empty() && eof {
+                            self.state = DecState::Done;
+                            return Ok(());
+                        }
+                        if rem.len() > MAX_HEADER_LINE {
+                            return Err(AwsChunkedError::InvalidChunkHeader);
+                        }
+                        if eof {
+                            if !rem.is_empty() {
+                                let line = rem.to_vec();
+                                self.pos += rem.len();
+                                self.take_trailer_line(&line);
+                            }
+                            self.state = DecState::Done;
+                            return Ok(());
+                        }
+                        return Ok(());
+                    };
+                    let mut line = rem[..nl].to_vec();
+                    self.pos += nl + 1;
+                    if line.ends_with(&[b'\r']) {
+                        line.pop();
+                    }
+                    if line.is_empty() {
+                        self.state = DecState::Done;
+                        continue;
+                    }
+                    self.take_trailer_line(&line);
+                }
+            }
+        }
+    }
+
+    fn take_trailer_line(&mut self, line: &[u8]) {
+        if let Some(colon) = line.iter().position(|&b| b == b':') {
+            let key = String::from_utf8_lossy(&line[..colon])
+                .trim()
+                .to_ascii_lowercase();
+            let value = String::from_utf8_lossy(&line[colon + 1..])
+                .trim()
+                .to_string();
+            self.trailers.insert(key, value);
+        }
+    }
+}
+
+/// Body transform for Hyper IncomingBody. Errors are stored on [`Self::error`]
+/// so the S3 layer can return SignatureDoesNotMatch instead of a Swift 499.
+pub struct AwsChunkedTransform {
+    inner: AwsChunkedDecoder,
+    finished: bool,
+    /// Last decoder error (fail-closed).
+    pub error: Arc<Mutex<Option<AwsChunkedError>>>,
+}
+
+impl AwsChunkedTransform {
+    pub fn new(
+        expected: Option<u64>,
+        sig_ctx: Option<ChunkSigContext>,
+        error: Arc<Mutex<Option<AwsChunkedError>>>,
+    ) -> Self {
+        Self {
+            inner: AwsChunkedDecoder::new(expected, sig_ctx),
+            finished: false,
+            error,
+        }
+    }
+
+    pub fn buffered_wire_bytes(&self) -> usize {
+        self.inner.buffered_wire_bytes()
+    }
+}
+
+impl BodyTransform for AwsChunkedTransform {
+    fn push(&mut self, input: Option<&[u8]>) -> io::Result<Vec<u8>> {
+        let r = match input {
+            Some(b) => self.inner.push(b),
+            None => {
+                if self.finished {
+                    return Ok(Vec::new());
+                }
+                self.finished = true;
+                self.inner.finish_payload()
+            }
+        };
+        match r {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                *self.error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e.clone());
+                Err(io::Error::new(io::ErrorKind::InvalidData, e))
+            }
+        }
+    }
+}
+
 /// Decode an aws-chunked wire body into raw payload bytes.
 ///
-/// `expected_decoded_len`: when set (from `x-amz-decoded-content-length`),
-/// the total payload length must match.
-///
-/// `sig_ctx`: when `Some`, verify each `chunk-signature` against the
-/// STREAMING-AWS4-HMAC-SHA256-PAYLOAD chain. On mismatch or missing
-/// chunk-signature, return [`AwsChunkedError::InvalidChunkSignature`].
-/// When trailer signatures apply (see [`ChunkSigContext`]), also verify
-/// `x-amz-trailer-signature` → [`AwsChunkedError::InvalidTrailerSignature`].
+/// Incremental: [`AwsChunkedDecoder`] holds at most one chunk. This helper
+/// still concatenates the payload for callers that need the full object
+/// (sync `handle()` path).
 pub fn decode_aws_chunked(
     raw: &[u8],
     expected_decoded_len: Option<u64>,
     sig_ctx: Option<&ChunkSigContext>,
 ) -> Result<DecodedChunkedBody, AwsChunkedError> {
-    let mut pos = 0usize;
-    let mut out: Vec<u8> = Vec::new();
-    if let Some(n) = expected_decoded_len {
-        if n > 0 {
-            out.try_reserve(n as usize).ok();
-        }
-    }
-    let mut trailers = HashMap::new();
-    let mut prev_sig = sig_ctx.map(|c| c.seed_signature.to_ascii_lowercase());
-    let mut all_sigs_ok: Option<bool> = sig_ctx.map(|_| true);
-    let mut last_chunk_size: Option<usize> = None;
-    let mut chunk_number = 0usize;
-
-    loop {
-        chunk_number += 1;
-        let header_line = read_line(raw, &mut pos)?;
-        // header_line includes no trailing CRLF
-        let (size_str, params) = match header_line.iter().position(|&b| b == b';') {
-            Some(i) => (&header_line[..i], Some(&header_line[i + 1..])),
-            None => (header_line.as_slice(), None),
-        };
-        let size = parse_hex_size(size_str)?;
-        if let Some(prev) = last_chunk_size {
-            // AWS enforces 8 KiB min for non-final chunks (Python
-            // SIGV4_CHUNK_MIN_SIZE). Soft residual: we do not reject small
-            // non-final chunks so unit vectors with 10-byte chunks work.
-            let _ = prev;
-        }
-        last_chunk_size = Some(size);
-
-        if let Some(expected) = expected_decoded_len {
-            if out.len() as u64 + size as u64 > expected {
-                return Err(AwsChunkedError::SizeMismatch {
-                    expected,
-                    provided: out.len() as u64 + size as u64,
-                });
-            }
-        }
-
-        if size > 0 {
-            if pos + size > raw.len() {
-                return Err(AwsChunkedError::Incomplete);
-            }
-            let data = &raw[pos..pos + size];
-            pos += size;
-            // trailing CRLF after chunk data
-            if !consume_crlf(raw, &mut pos) {
-                return Err(AwsChunkedError::Incomplete);
-            }
-
-            if let (Some(ctx), Some(ok)) = (sig_ctx, all_sigs_ok.as_mut()) {
-                let chunk_sig = parse_chunk_signature(params);
-                if let (Some(sig), Some(prev)) = (chunk_sig, prev_sig.as_ref()) {
-                    let data_hash = sha256_hex(data);
-                    let valid = verify_chunk_signature(ctx, prev, &data_hash, &sig);
-                    if !valid {
-                        return Err(AwsChunkedError::InvalidChunkSignature);
-                    }
-                    *ok = true;
-                    prev_sig = Some(sig.to_ascii_lowercase());
-                } else {
-                    // Signed mode expected chunk-signature; missing → hard fail.
-                    return Err(AwsChunkedError::InvalidChunkSignature);
-                }
-            }
-
-            out.extend_from_slice(data);
-        } else {
-            // Final chunk: signature required in signed mode + trailers.
-            if let (Some(ctx), Some(ok)) = (sig_ctx, all_sigs_ok.as_mut()) {
-                let chunk_sig = parse_chunk_signature(params);
-                if let (Some(sig), Some(prev)) = (chunk_sig, prev_sig.as_ref()) {
-                    let valid = verify_chunk_signature(ctx, prev, EMPTY_SHA256, &sig);
-                    if !valid {
-                        return Err(AwsChunkedError::InvalidChunkSignature);
-                    }
-                    *ok = true;
-                    // Keep terminal 0-chunk signature as prev for trailer HMAC.
-                    prev_sig = Some(sig.to_ascii_lowercase());
-                } else {
-                    return Err(AwsChunkedError::InvalidChunkSignature);
-                }
-                let _ = chunk_number;
-            }
-
-            // Trailers: lines until empty line. Tolerate EOF after 0-chunk
-            // with no extra CRLF (some clients omit the final blank).
-            while pos < raw.len() {
-                let line = read_line(raw, &mut pos)?;
-                if line.is_empty() {
-                    break;
-                }
-                if let Some(colon) = line.iter().position(|&b| b == b':') {
-                    let key = String::from_utf8_lossy(&line[..colon])
-                        .trim()
-                        .to_ascii_lowercase();
-                    let value = String::from_utf8_lossy(&line[colon + 1..])
-                        .trim()
-                        .to_string();
-                    trailers.insert(key, value);
-                }
-            }
-            break;
-        }
-    }
-
-    if let Some(expected) = expected_decoded_len {
-        if out.len() as u64 != expected {
-            return Err(AwsChunkedError::SizeMismatch {
-                expected,
-                provided: out.len() as u64,
-            });
-        }
-    }
-
-    let trailer_signature_valid =
-        verify_trailers_if_needed(sig_ctx, prev_sig.as_deref(), &trailers)?;
-
+    let mut dec = AwsChunkedDecoder::new(expected_decoded_len, sig_ctx.cloned());
+    let mut data = dec.push(raw)?;
+    data.extend(dec.finish_payload()?);
     Ok(DecodedChunkedBody {
-        data: out,
-        trailers,
-        chunk_signatures_valid: all_sigs_ok,
-        trailer_signature_valid,
+        data,
+        trailers: dec.trailers,
+        chunk_signatures_valid: dec.all_sigs_ok,
+        trailer_signature_valid: dec.trailer_ok,
     })
 }
 
@@ -474,6 +726,7 @@ fn verify_trailer_signature(
     streq_const_time(&expected, &presented.to_ascii_lowercase())
 }
 
+#[allow(dead_code)]
 fn read_line(raw: &[u8], pos: &mut usize) -> Result<Vec<u8>, AwsChunkedError> {
     if *pos >= raw.len() {
         return Err(AwsChunkedError::Incomplete);
@@ -495,6 +748,7 @@ fn read_line(raw: &[u8], pos: &mut usize) -> Result<Vec<u8>, AwsChunkedError> {
     Err(AwsChunkedError::Incomplete)
 }
 
+#[allow(dead_code)]
 fn consume_crlf(raw: &[u8], pos: &mut usize) -> bool {
     if *pos + 1 < raw.len() && raw[*pos] == b'\r' && raw[*pos + 1] == b'\n' {
         *pos += 2;
@@ -537,6 +791,28 @@ mod tests {
         assert_eq!(decoded.data, payload);
         assert!(decoded.trailers.is_empty());
         assert_eq!(decoded.chunk_signatures_valid, None);
+    }
+
+    #[test]
+    fn incremental_push_peak_is_one_chunk() {
+        let payload = vec![b'x'; 50_000];
+        let framed = frame_aws_chunked_unsigned(&payload, 1024);
+        let full = decode_aws_chunked(&framed, Some(payload.len() as u64), None)
+            .unwrap()
+            .data;
+        let mut dec = AwsChunkedDecoder::new(Some(payload.len() as u64), None);
+        let mut out = Vec::new();
+        let mut peak = 0usize;
+        for piece in framed.chunks(19) {
+            out.extend(dec.push(piece).unwrap());
+            peak = peak.max(dec.buffered_wire_bytes());
+        }
+        out.extend(dec.finish_payload().unwrap());
+        assert_eq!(out, full);
+        assert!(
+            peak <= 1024 + 128,
+            "decoder window must be O(chunk) not O(object): peak={peak}"
+        );
     }
 
     #[test]

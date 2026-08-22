@@ -52,7 +52,7 @@ pub use request::{parse_query, reason_phrase, split_path, unquote, Request, Resp
 pub use server::{
     bind_listener, install_sigterm_flag, serve_forever, serve_forever_multi,
     serve_forever_multi_service, serve_forever_with_config, AccessLog, AsyncRequest, AsyncService,
-    Handler, IncomingBody, LegacyService, ServerConfig, PRODUCTION_HTTP1_ENGINE,
+    BodyTransform, Handler, IncomingBody, LegacyService, ServerConfig, PRODUCTION_HTTP1_ENGINE,
     reject_legacy_server_runtime,
 };
 pub use thread_concurrency::{

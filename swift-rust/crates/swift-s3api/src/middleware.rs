@@ -123,7 +123,7 @@ use crate::acl_cors::{
 };
 use crate::aws_chunked::{
     cleanup_content_encoding, decode_aws_chunked, is_aws_chunked_request, is_ecdsa_streaming,
-    is_streaming_payload_hash, AwsChunkedError, ChunkSigContext,
+    is_streaming_payload_hash, AwsChunkedError, AwsChunkedTransform, ChunkSigContext,
 };
 use crate::bucket_config::{
     apply_bucket_tagging_meta, apply_lifecycle_meta, apply_object_blob_meta,
@@ -633,40 +633,7 @@ fn decode_and_fix_aws_chunked(
 
     let decoded = match decode_aws_chunked(&framed, decoded_len, sig_ctx.as_ref()) {
         Ok(d) => d,
-        Err(AwsChunkedError::SizeMismatch { expected, provided }) => {
-            return Err(s3_error_response(
-                "IncompleteBody",
-                Some(&format!(
-                    "x-amz-decoded-content-length {expected} != decoded {provided}"
-                )),
-                &[],
-            ));
-        }
-        Err(AwsChunkedError::Incomplete) | Err(AwsChunkedError::InvalidChunkHeader) => {
-            return Err(s3_error_response(
-                "IncompleteBody",
-                Some("incomplete or invalid aws-chunked framing"),
-                &[],
-            ));
-        }
-        Err(AwsChunkedError::MissingDecodedContentLength) => {
-            return Err(s3_error_response("MissingContentLength", None, &[]));
-        }
-        Err(AwsChunkedError::EcdsaNotImplemented) => {
-            return Err(s3_error_response(
-                "NotImplemented",
-                Some(MSG_ECDSA_STREAMING_NOT_IMPLEMENTED),
-                &[],
-            ));
-        }
-        Err(AwsChunkedError::InvalidChunkSignature)
-        | Err(AwsChunkedError::InvalidTrailerSignature) => {
-            return Err(s3_error_response(
-                "SignatureDoesNotMatch",
-                Some("The request signature we calculated does not match the signature you provided."),
-                &[],
-            ));
-        }
+        Err(e) => return Err(aws_chunked_error_to_response(e)),
     };
     // Enforced above: Some(false) no longer soft-ignored.
     let _ = decoded.chunk_signatures_valid;
@@ -686,6 +653,103 @@ fn decode_and_fix_aws_chunked(
     Ok(())
 }
 
+fn aws_chunked_error_to_response(err: AwsChunkedError) -> Response {
+    match err {
+        AwsChunkedError::SizeMismatch { expected, provided } => s3_error_response(
+            "IncompleteBody",
+            Some(&format!(
+                "x-amz-decoded-content-length {expected} != decoded {provided}"
+            )),
+            &[],
+        ),
+        AwsChunkedError::Incomplete | AwsChunkedError::InvalidChunkHeader => s3_error_response(
+            "IncompleteBody",
+            Some("incomplete or invalid aws-chunked framing"),
+            &[],
+        ),
+        AwsChunkedError::MissingDecodedContentLength => {
+            s3_error_response("MissingContentLength", None, &[])
+        }
+        AwsChunkedError::EcdsaNotImplemented => s3_error_response(
+            "NotImplemented",
+            Some(MSG_ECDSA_STREAMING_NOT_IMPLEMENTED),
+            &[],
+        ),
+        AwsChunkedError::InvalidChunkSignature | AwsChunkedError::InvalidTrailerSignature => {
+            s3_error_response(
+                "SignatureDoesNotMatch",
+                Some(
+                    "The request signature we calculated does not match the signature you provided.",
+                ),
+                &[],
+            )
+        }
+    }
+}
+
+/// S3-2: wrap IncomingBody with incremental aws-chunked decode. Header
+/// `Content-Length` becomes the decoded size. Errors are recorded on `slot`.
+fn wrap_aws_chunked_streaming(
+    areq: &mut AsyncRequest,
+    head: &mut Request,
+    cred: &S3Credential,
+    auth: &SigV4Auth,
+    payload_hash: &str,
+    decoded_len: Option<u64>,
+    amz_date: Option<String>,
+    slot: Arc<Mutex<Option<AwsChunkedError>>>,
+) -> Result<(), Response> {
+    if is_ecdsa_streaming(payload_hash) {
+        return Err(s3_error_response(
+            "NotImplemented",
+            Some(MSG_ECDSA_STREAMING_NOT_IMPLEMENTED),
+            &[],
+        ));
+    }
+    if is_streaming_payload_hash(payload_hash) && decoded_len.is_none() {
+        return Err(s3_error_response(
+            "MissingContentLength",
+            Some("You must provide the x-amz-decoded-content-length header."),
+            &[("ArgumentName", "x-amz-decoded-content-length")],
+        ));
+    }
+    let want_hmac = matches!(
+        payload_hash,
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" | "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+    ) && !cred.secret_key.is_empty();
+    let require_trailer_sig =
+        payload_hash.eq_ignore_ascii_case("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER");
+    let sig_ctx = if want_hmac {
+        amz_date.map(|ad| ChunkSigContext {
+            secret_key: cred.secret_key.clone(),
+            date: auth.scope.date.clone(),
+            region: auth.scope.region.clone(),
+            service: auth.scope.service.clone(),
+            amz_date: ad,
+            seed_signature: auth.signature.clone(),
+            require_trailer_signature: require_trailer_sig,
+        })
+    } else {
+        None
+    };
+    let xform = AwsChunkedTransform::new(decoded_len, sig_ctx, slot);
+    let inner = std::mem::replace(
+        &mut areq.body,
+        IncomingBody::from_bytes(Vec::new(), 1),
+    );
+    areq.body = inner.with_transform(Box::new(xform), decoded_len);
+    if let Some(n) = decoded_len {
+        head.headers.set("Content-Length", n.to_string());
+        areq.headers.set("Content-Length", n.to_string());
+    }
+    head.headers.remove("X-Amz-Decoded-Content-Length");
+    cleanup_content_encoding(&mut head.headers);
+    if is_streaming_payload_hash(payload_hash) {
+        head.headers.set("X-Amz-Content-SHA256", "UNSIGNED-PAYLOAD");
+    }
+    Ok(())
+}
+
 /// Detect S3-shaped auth so we intercept SigV2/SigV4 (and reject unsupported
 /// auth schemes with S3 XML) instead of falling through to Swift filters.
 fn is_s3_auth_request(req: &Request) -> bool {
@@ -695,7 +759,7 @@ fn is_s3_auth_request(req: &Request) -> bool {
 /// PutObject / UploadPart: body is object bytes, not control XML.
 /// CreateMultipartUpload (`POST ?uploads`) and Complete (`POST ?uploadId` without
 /// partNumber) stay on the control intercept + materialize path.
-/// aws-chunked / copy stay off this path until S3-2 / the copy translator.
+/// Copy stays off this path. aws-chunked PutObject/UploadPart stream here (S3-2).
 fn is_s3_streaming_object_put(
     req: &Request,
     storage_domains: &[String],
@@ -707,9 +771,6 @@ fn is_s3_streaming_object_put(
     if req.headers.get("x-amz-copy-source").is_some()
         || req.headers.get("X-Amz-Copy-Source").is_some()
     {
-        return false;
-    }
-    if is_aws_chunked_request(req) {
         return false;
     }
     let params = req.params();
@@ -2734,7 +2795,7 @@ impl S3Api {
     /// the buffered control path (same 64 MiB cap as before this slice).
     async fn put_object_streaming(
         &self,
-        areq: AsyncRequest,
+        mut areq: AsyncRequest,
         next: StreamingAsyncNextFn,
     ) -> Response {
         let method = areq.method.clone();
@@ -2841,8 +2902,34 @@ impl S3Api {
                 Ok(ctx) => ctx,
                 Err(resp) => return finish(resp),
             };
+        let payload_hash = head
+            .headers
+            .get("X-Amz-Content-SHA256")
+            .unwrap_or("")
+            .to_string();
+        let aws_chunked = is_streaming_payload_hash(&payload_hash);
+        let decoded_len = head
+            .headers
+            .get("X-Amz-Decoded-Content-Length")
+            .and_then(|s| s.parse::<u64>().ok());
+        let amz_date = crate::sigv4::amz_date(&head);
+        let chunk_err = Arc::new(Mutex::new(None));
         strip_s3_only_headers(&mut head.headers);
         stamp_auth(&mut head, &cred);
+        if aws_chunked {
+            if let Err(resp) = wrap_aws_chunked_streaming(
+                &mut areq,
+                &mut head,
+                &cred,
+                &auth,
+                &payload_hash,
+                decoded_len,
+                amz_date,
+                Arc::clone(&chunk_err),
+            ) {
+                return finish(resp);
+            }
+        }
 
         if is_mpu_part {
             let segs = segments_container(&bucket);
@@ -2855,6 +2942,13 @@ impl S3Api {
                 body: areq.body,
             };
             let resp = next(swift).await;
+            if let Some(e) = chunk_err
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                return finish(aws_chunked_error_to_response(e));
+            }
             return if (200..300).contains(&resp.status) {
                 finish(translate_object_success("PUT", resp, false))
             } else {
@@ -2934,6 +3028,13 @@ impl S3Api {
             body: areq.body,
         };
         let resp = next(swift).await;
+        if let Some(e) = chunk_err
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            return finish(aws_chunked_error_to_response(e));
+        }
         if (200..300).contains(&resp.status) {
             let mut out = translate_object_success("PUT", resp, false);
             if let Some(exp) = stamped_delete_at
@@ -8608,19 +8709,20 @@ mod tests {
     }
 
     #[test]
-    fn aws_chunked_put_is_not_streaming() {
+    fn aws_chunked_put_is_streaming() {
         let api = S3Api::new(cred_map());
         let mut req = unsigned_signed_put("/mybucket/obj", "");
         req.headers.set(
             "x-amz-content-sha256",
             "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
         );
+        req.headers.set("x-amz-decoded-content-length", "10");
         req.headers.set("Content-Encoding", "aws-chunked");
         assert!(
-            !api.streams_request(&req),
-            "aws-chunked stays on the control path until S3-2"
+            api.streams_request(&req),
+            "S3-2: aws-chunked PutObject must use the streaming ABI"
         );
-        assert!(api.intercepts_request(&req));
+        assert!(!api.intercepts_request(&req));
     }
 
     #[test]
@@ -8718,6 +8820,105 @@ mod tests {
         let resp = block_on_s3(api.put_object_streaming(areq, next));
         assert_eq!(resp.status, 200);
         assert_eq!(resp.headers.get("ETag"), Some("\"part-etag\""));
+    }
+
+    #[test]
+    fn streaming_aws_chunked_put_dechunks_without_control_cap() {
+        let api = S3Api::new(cred_map());
+        let payload = vec![b'z'; 128 * 1024];
+        let framed = crate::aws_chunked::frame_aws_chunked_unsigned(&payload, 4096);
+        let mut req = base_s3_req("PUT", "/mybucket/obj", "");
+        req.headers
+            .set("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER");
+        req.headers
+            .set("x-amz-decoded-content-length", payload.len().to_string());
+        req.headers.set("Content-Encoding", "aws-chunked");
+        req.headers.set("Content-Length", framed.len().to_string());
+        let req = sign_request(req, "testing");
+        let areq = async_from_signed(req, framed);
+        let expected = payload.len();
+        let next: StreamingAsyncNextFn = Arc::new(move |areq| {
+            Box::pin(async move {
+                if areq.method == "HEAD" {
+                    return Response::new(204);
+                }
+                let exp = expected.to_string();
+                assert_eq!(areq.headers.get("Content-Length"), Some(exp.as_str()));
+                let mut n = 0usize;
+                let mut body = areq.body;
+                while let Some(c) = body.next_chunk().await.unwrap() {
+                    n += c.len();
+                }
+                assert_eq!(n, expected);
+                let mut resp = Response::new(201);
+                resp.headers.set("ETag", "chunked");
+                resp
+            })
+        });
+        let resp = block_on_s3(api.put_object_streaming(areq, next));
+        assert_eq!(resp.status, 200, "aws-chunked streaming PUT must succeed");
+        assert_eq!(resp.headers.get("ETag"), Some("\"chunked\""));
+    }
+
+    #[test]
+    fn streaming_aws_chunked_bad_signature_is_fail_closed() {
+        let api = S3Api::new(cred_map());
+        let payload = b"hello";
+        let framed = format!(
+            "{:x};chunk-signature={}\r\n{}\r\n0;chunk-signature={}\r\n\r\n",
+            payload.len(),
+            "aa".repeat(32),
+            "hello",
+            "bb".repeat(32),
+        )
+        .into_bytes();
+        let mut req = base_s3_req("PUT", "/mybucket/obj", "");
+        req.headers
+            .set("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
+        req.headers.set("x-amz-decoded-content-length", "5");
+        req.headers.set("Content-Encoding", "aws-chunked");
+        let req = sign_request(req, "testing");
+        let areq = async_from_signed(req, framed);
+        let saw_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_c = saw_complete.clone();
+        let next: StreamingAsyncNextFn = Arc::new(move |areq| {
+            let saw_c = saw_c.clone();
+            Box::pin(async move {
+                if areq.method == "HEAD" {
+                    return Response::new(204);
+                }
+                let mut body = areq.body;
+                let mut n = 0usize;
+                loop {
+                    match body.next_chunk().await {
+                        Ok(Some(c)) => n += c.len(),
+                        Ok(None) => {
+                            saw_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if n == 5 {
+                    let mut resp = Response::new(201);
+                    resp.headers.set("ETag", "should-not-commit");
+                    resp
+                } else {
+                    Response::new(499)
+                }
+            })
+        });
+        let resp = block_on_s3(api.put_object_streaming(areq, next));
+        assert_eq!(resp.status, 403, "bad chunk-signature must fail closed: {}", resp.status);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(
+            body.contains("SignatureDoesNotMatch"),
+            "{body}"
+        );
+        assert!(
+            !saw_complete.load(std::sync::atomic::Ordering::SeqCst),
+            "backend PUT must not see a complete authenticated body"
+        );
     }
 
     #[test]
@@ -12161,29 +12362,26 @@ mod tests {
     }
 
     #[test]
-    fn aws_chunked_content_encoding_dechunks_to_backend() {
+    fn aws_chunked_content_encoding_alone_does_not_dechunk() {
         let api = S3Api::new(cred_map());
         let payload = b"raw-via-encoding";
         let framed = frame_aws_chunked(payload, false, &[]);
         let mut req = base_s3_req("PUT", "/mybucket/obj", "");
-        // Content-Encoding alone (no STREAMING-* token) still dechunks.
+        // Python `_is_streaming`: only STREAMING-* dechunks. Encoding-only
+        // aws-chunked is a raw body that happens to carry the token.
         req.headers.set("Content-Encoding", "aws-chunked, gzip");
-        // Keep a real payload hash so SigV4 signed-headers path stays valid;
-        // body hash is not re-checked by verify_sigv4 (deferred residual).
         req.headers.set("Content-Length", framed.len().to_string());
         req.headers
             .set("x-amz-decoded-content-length", payload.len().to_string());
-        req.body = Body::from(framed);
+        req.body = Body::from(framed.clone());
         let req = sign_request(req, "testing");
-        let next: NextFn = Arc::new(|r| {
+        let framed_c = framed.clone();
+        let next: NextFn = Arc::new(move |r| {
             if r.method == "HEAD" {
                 return Response::new(404);
             }
             let body = r.body.into_vec(u64::MAX).unwrap();
-            assert_eq!(body, b"raw-via-encoding");
-            assert_eq!(r.headers.get("Content-Length"), Some("16"));
-            // Only aws-chunked stripped; other encodings retained.
-            assert_eq!(r.headers.get("Content-Encoding"), Some("gzip"));
+            assert_eq!(body, framed_c, "must not dechunk without STREAMING-*");
             Response::new(201)
         });
         let resp = api.handle(req, &next);

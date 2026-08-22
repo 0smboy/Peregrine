@@ -85,27 +85,20 @@ fn s3_1_handle_streaming_request_takes_incoming_body() {
 }
 
 #[test]
-fn s3_1_aws_chunked_excluded_from_streaming_put() {
+fn s3_2_aws_chunked_uses_incremental_transform() {
     let mw = read("src/middleware.rs");
-    let start = mw
-        .find("fn is_s3_streaming_object_put")
-        .expect("is_s3_streaming_object_put missing");
-    let src = &mw[start..];
-    let end = src.find("/// Paths that are never unsigned S3").unwrap_or(src.len());
-    let src = &src[..end];
     assert!(
-        src.contains("is_aws_chunked_request"),
-        "G3 S3-1 FAIL: streaming PUT must refuse aws-chunked (S3-2)"
+        mw.contains("wrap_aws_chunked_streaming") && mw.contains("AwsChunkedTransform"),
+        "G3 S3-2 FAIL: streaming PUT must wrap IncomingBody with AwsChunkedTransform"
     );
-}
-
-#[test]
-fn s3_2_remaining_aws_chunked_decode_is_still_buffered() {
-    let mw = read("src/middleware.rs");
-    let still = mw.contains("decode_and_fix_aws_chunked") && mw.contains("block_in_place");
     assert!(
-        still,
-        "S3-2 tracker inverted: aws-chunked left the sync adapter; convert this test to assert absence"
+        mw.contains("with_transform"),
+        "G3 S3-2 FAIL: must use IncomingBody::with_transform, not materialize-then-dechunk"
+    );
+    let ac = read("src/aws_chunked.rs");
+    assert!(
+        ac.contains("struct AwsChunkedDecoder"),
+        "G3 S3-2 FAIL: incremental AwsChunkedDecoder missing"
     );
 }
 

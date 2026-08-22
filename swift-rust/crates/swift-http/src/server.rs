@@ -763,6 +763,15 @@ impl AsyncBufRead for ConnRead {
     }
 }
 
+/// Pull-based wire-to-payload transform (S3 aws-chunked, etc.).
+///
+/// `push(Some(bytes))` consumes a source chunk. `push(None)` is source EOF.
+/// Return payload bytes (possibly empty if more wire is needed). Memory must
+/// not grow with total object size — only with the current transform window.
+pub trait BodyTransform: Send {
+    fn push(&mut self, input: Option<&[u8]>) -> std::io::Result<Vec<u8>>;
+}
+
 /// Async incoming body. `next_chunk` awaits the client socket (L1).
 /// Owned so Hyper can hand the body to the service without borrowing the
 /// connection task.
@@ -784,6 +793,13 @@ enum IncomingInner {
         rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
         _scope: Option<swift_runtime::TaskScope>,
         content_length: Option<u64>,
+    },
+    Transform {
+        source: Box<IncomingBody>,
+        xform: Box<dyn BodyTransform>,
+        pending: Vec<u8>,
+        source_eof: bool,
+        decoded_len: Option<u64>,
     },
 }
 
@@ -848,6 +864,34 @@ impl IncomingBody {
         }
     }
 
+    /// Decode/transform `self` as `next_chunk` is pulled. Does not spawn a
+    /// task: backpressure is the consumer, and the transform window is owned
+    /// by [`BodyTransform`].
+    pub fn with_transform(
+        self,
+        xform: Box<dyn BodyTransform>,
+        decoded_len: Option<u64>,
+    ) -> Self {
+        let max_body = decoded_len.unwrap_or(self.max_body);
+        let metrics = self.metrics.clone();
+        Self {
+            inner: IncomingInner::Transform {
+                source: Box::new(self),
+                xform,
+                pending: Vec::new(),
+                source_eof: false,
+                decoded_len,
+            },
+            max_body,
+            decoded: 0,
+            body_idle: None,
+            upload_lifetime: None,
+            on_upgrade: None,
+            metrics,
+            buffered: 0,
+        }
+    }
+
     pub fn set_upgrade(&mut self, on_upgrade: hyper::upgrade::OnUpgrade) {
         self.on_upgrade = Some(on_upgrade);
     }
@@ -873,6 +917,7 @@ impl IncomingBody {
             IncomingInner::Memory { data, pos } => Some((data.len().saturating_sub(*pos)) as u64),
             IncomingInner::Hyper(incoming) => http_body::Body::size_hint(incoming).exact(),
             IncomingInner::Channel { content_length, .. } => *content_length,
+            IncomingInner::Transform { decoded_len, .. } => *decoded_len,
         }
     }
 
@@ -988,6 +1033,43 @@ impl IncomingBody {
                 }
                 Some(Err(e)) => Err(e),
                 None => Ok(None),
+            },
+            IncomingInner::Transform {
+                source,
+                xform,
+                pending,
+                source_eof,
+                decoded_len: _,
+            } => loop {
+                if !pending.is_empty() {
+                    let n = pending.len().min(STREAM_CHUNK);
+                    let chunk: Vec<u8> = pending.drain(..n).collect();
+                    self.decoded = self.decoded.saturating_add(chunk.len() as u64);
+                    if self.decoded > self.max_body {
+                        return Err(too_large_error());
+                    }
+                    return Ok(Some(chunk));
+                }
+                if *source_eof {
+                    return Ok(None);
+                }
+                match Box::pin(source.next_chunk()).await? {
+                    Some(wire) => {
+                        let out = xform.push(Some(&wire))?;
+                        if out.is_empty() {
+                            continue;
+                        }
+                        *pending = out;
+                    }
+                    None => {
+                        *source_eof = true;
+                        let out = xform.push(None)?;
+                        if out.is_empty() {
+                            return Ok(None);
+                        }
+                        *pending = out;
+                    }
+                }
             },
         }
     }
