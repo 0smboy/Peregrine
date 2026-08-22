@@ -2568,11 +2568,19 @@ impl ProxyApp {
         self: &Arc<Self>,
         mut areq: swift_http::AsyncRequest,
     ) -> Response {
-        // Keep-alive requests skip the connection peek. `/info asdf` (and any
-        // path with an unencoded space) is 412 Bad URL like Python
-        // `get_controller is None`.
+        // Keep-alive requests skip the connection peek. `/info asdf` is 412
+        // Bad URL (Python `get_controller is None`). Object names may contain
+        // spaces after unquote (`testCopy`); only non-/v1 paths with a space
+        // are 412.
         if areq.path.contains(' ') {
-            return text_response(412, "Bad URL");
+            let segs: Vec<&str> = areq.path.splitn(5, '/').collect();
+            let v1 = segs.len() >= 3
+                && segs[0].is_empty()
+                && matches!(segs[1], "v1" | "v1.0")
+                && !segs[2].is_empty();
+            if !v1 {
+                return text_response(412, "Bad URL");
+            }
         }
         let segs: Vec<&str> = areq.path.splitn(5, '/').collect();
         if matches!(segs.get(1), Some(&"v1") | Some(&"v1.0"))
@@ -6841,6 +6849,20 @@ mod cors_tests {
             info_space.status, 412,
             "/info asdf must be 412, got {}",
             info_space.status
+        );
+        let spaced_obj = app
+            .handle_async(swift_http::AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/l04 011e".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_ne!(
+            spaced_obj.status, 412,
+            "spaces in object names must not be Bad URL, got {}",
+            spaced_obj.status
         );
     }
 
