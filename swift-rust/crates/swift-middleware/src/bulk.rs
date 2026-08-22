@@ -450,16 +450,7 @@ impl Bulk {
             (200, "")
         };
 
-        let summary = serde_json::json!({
-            "Number Deleted": result.number_deleted,
-            "Number Not Found": result.number_not_found,
-            "Response Status": status_line(status),
-            "Response Body": body_note,
-            "Errors": result.errors.iter().map(|(p, e)| vec![p.clone(), e.clone()]).collect::<Vec<_>>(),
-        });
-        let mut out = Response::with_body(200, summary.to_string().into_bytes());
-        out.headers.set("Content-Type", "application/json");
-        out
+        bulk_delete_response(status, body_note, &result, req.headers.get("Accept"))
     }
 
     async fn handle_delete_async(&self, mut req: Request, next: AsyncNextFn) -> Response {
@@ -511,21 +502,96 @@ impl Bulk {
         } else {
             (200, "")
         };
-        let summary = serde_json::json!({
-            "Number Deleted": result.number_deleted,
-            "Number Not Found": result.number_not_found,
-            "Response Status": status_line(status),
-            "Response Body": body_note,
-            "Errors": result.errors.iter().map(|(p, e)| vec![p.clone(), e.clone()]).collect::<Vec<_>>(),
-        });
-        let mut out = Response::with_body(200, summary.to_string().into_bytes());
-        out.headers.set("Content-Type", "application/json");
-        out
+        bulk_delete_response(status, body_note, &result, req.headers.get("Accept"))
     }
 }
 
 fn status_line(code: u16) -> String {
     format!("{code} {}", swift_http::reason_phrase(code))
+}
+
+fn negotiate_bulk_format(accept: Option<&str>) -> &'static str {
+    let a = accept.unwrap_or("").to_ascii_lowercase();
+    if a.split(',').any(|part| {
+        let t = part.split(';').next().unwrap_or("").trim();
+        t == "application/xml" || t == "text/xml"
+    }) {
+        "application/xml"
+    } else if a.split(',').any(|part| {
+        part.split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            == "text/plain"
+    }) {
+        "text/plain"
+    } else {
+        "application/json"
+    }
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn bulk_delete_response(
+    status: u16,
+    body_note: &str,
+    result: &BulkDeleteResult,
+    accept: Option<&str>,
+) -> Response {
+    let ctype = negotiate_bulk_format(accept);
+    let status_s = status_line(status);
+    let body = match ctype {
+        "application/xml" | "text/xml" => {
+            let mut out = String::from("<delete>\n");
+            for (key, val) in [
+                ("number_deleted", result.number_deleted.to_string()),
+                ("number_not_found", result.number_not_found.to_string()),
+                ("response_body", body_note.to_string()),
+                ("response_status", status_s),
+            ] {
+                out.push_str(&format!(
+                    "<{key}>{}</{key}>\n",
+                    xml_escape(&val)
+                ));
+            }
+            out.push_str("<errors>\n");
+            for (name, err) in &result.errors {
+                out.push_str(&format!(
+                    "<object><name>{}</name><status>{}</status></object>\n",
+                    xml_escape(name),
+                    xml_escape(err)
+                ));
+            }
+            out.push_str("</errors>\n</delete>\n");
+            out.into_bytes()
+        }
+        "text/plain" => {
+            let mut out = format!(
+                "Number Deleted: {}\nNumber Not Found: {}\nResponse Body: {body_note}\nResponse Status: {status_s}\nErrors:\n",
+                result.number_deleted, result.number_not_found
+            );
+            for (name, err) in &result.errors {
+                out.push_str(&format!("{name}, {err}\n"));
+            }
+            out.into_bytes()
+        }
+        _ => serde_json::json!({
+            "Number Deleted": result.number_deleted,
+            "Number Not Found": result.number_not_found,
+            "Response Status": status_s,
+            "Response Body": body_note,
+            "Errors": result.errors.iter().map(|(p, e)| vec![p.clone(), e.clone()]).collect::<Vec<_>>(),
+        })
+        .to_string()
+        .into_bytes(),
+    };
+    let mut out = Response::with_body(200, body);
+    out.headers.set("Content-Type", ctype);
+    out
 }
 
 /// Map `?extract-archive=` value to tar compress mode (`""`, `"gz"`, `"bz2"`).
@@ -653,6 +719,21 @@ mod tests {
         request.headers.set("X-Backend-Authorize-Override", "true");
 
         assert_eq!(b.handle(request, &app).status, 200);
+    }
+
+    #[test]
+    fn test_bulk_delete_accept_xml() {
+        let b = Bulk::new();
+        let app: crate::NextFn = Arc::new(|_r: Request| Response::new(204));
+        let mut request = req("/c/a\n");
+        request.headers.set("Accept", "application/xml");
+        let mut resp = b.handle(request, &app);
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
+        let body = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap());
+        assert!(body.contains("<delete>"), "{body}");
+        assert!(body.contains("<number_deleted>1</number_deleted>"), "{body}");
+        assert!(body.contains("<response_status>200 OK</response_status>"), "{body}");
     }
 
     #[test]

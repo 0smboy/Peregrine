@@ -105,7 +105,7 @@ async fn ingest_mime_object_async(
     mut writer: swift_diskfile::DiskFileWriter,
     body: &mut swift_http::IncomingBody,
     boundary: &[u8],
-) -> Result<swift_diskfile::DiskFileWriter, Response> {
+) -> Result<(swift_diskfile::DiskFileWriter, Vec<u8>), Response> {
     let mut delim = b"\r\n--".to_vec();
     delim.extend_from_slice(boundary);
     let start = delim[2..].to_vec();
@@ -139,7 +139,7 @@ async fn ingest_mime_object_async(
         if phase == 2 {
             if let Some(i) = find_bytes(&buf, &delim) {
                 let piece = buf[..i].to_vec();
-                buf.clear();
+                let leftover = buf[i + delim.len()..].to_vec();
                 if !piece.is_empty() {
                     writer = storage
                         .run_finite(device.clone(), TrafficClass::Foreground, move || {
@@ -150,7 +150,7 @@ async fn ingest_mime_object_async(
                         .map_err(|e| plain_response(500, &e.to_string()))?
                         .map_err(|e| plain_response(500, &e.to_string()))?;
                 }
-                return Ok(writer);
+                return Ok((writer, leftover));
             }
             if buf.len() > delim.len() {
                 let keep = delim.len() - 1;
@@ -178,9 +178,98 @@ async fn ingest_mime_object_async(
                 .map_err(|e| plain_response(500, &e.to_string()))?
                 .map_err(|e| plain_response(500, &e.to_string()))?;
         }
-        return Ok(writer);
+        return Ok((writer, Vec::new()));
     }
     Err(plain_response(400, "no object body MIME doc"))
+}
+
+async fn ingest_mime_footer_async(
+    body: &mut swift_http::IncomingBody,
+    mut buf: Vec<u8>,
+    boundary: &[u8],
+) -> Result<Vec<(String, String)>, Response> {
+    let mut delim = b"\r\n--".to_vec();
+    delim.extend_from_slice(boundary);
+    loop {
+        if let Some(hdr_end) = find_bytes(&buf, b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&buf[..hdr_end]).into_owned();
+            buf.drain(..hdr_end + 4);
+            let expected_md5 = headers.lines().find_map(|line| {
+                let (k, v) = line.split_once(':')?;
+                k.eq_ignore_ascii_case("Content-MD5")
+                    .then(|| v.trim().to_string())
+            });
+            loop {
+                if let Some(i) = find_bytes(&buf, &delim) {
+                    let json_body = buf[..i].to_vec();
+                    if let Some(expected) = expected_md5 {
+                        let computed = {
+                            use md5::{Digest, Md5};
+                            format!("{:x}", Md5::digest(&json_body))
+                        };
+                        if computed != expected {
+                            return Err(plain_response(422, "footer MD5 mismatch"));
+                        }
+                    }
+                    return parse_footer_json(&json_body);
+                }
+                match body.next_chunk().await {
+                    Ok(Some(c)) => buf.extend_from_slice(&c),
+                    Ok(None) => {
+                        return if buf.is_empty() {
+                            Ok(Vec::new())
+                        } else {
+                            parse_footer_json(&buf)
+                        };
+                    }
+                    Err(e) if swift_http::body_too_large(&e) => {
+                        return Err(plain_response(413, "Your request is too large."))
+                    }
+                    Err(_) => return Err(swob_response(499)),
+                }
+                if buf.len() > 1024 * 1024 {
+                    return Err(plain_response(400, "footer too large"));
+                }
+            }
+        }
+        match body.next_chunk().await {
+            Ok(Some(c)) => buf.extend_from_slice(&c),
+            Ok(None) => return Ok(Vec::new()),
+            Err(e) if swift_http::body_too_large(&e) => {
+                return Err(plain_response(413, "Your request is too large."))
+            }
+            Err(_) => return Err(swob_response(499)),
+        }
+        if buf.len() > 64 * 1024 {
+            return Err(plain_response(400, "mime headers too large"));
+        }
+    }
+}
+
+fn parse_footer_json(body: &[u8]) -> Result<Vec<(String, String)>, Response> {
+    let trimmed = body
+        .iter()
+        .copied()
+        .skip_while(|b| b.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_slice::<serde_json::Value>(&trimmed)
+    else {
+        return Err(plain_response(400, "invalid JSON for footer doc"));
+    };
+    let mut out = Vec::with_capacity(map.len());
+    for (k, v) in map {
+        let value = match v {
+            serde_json::Value::String(s) => s,
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            _ => return Err(plain_response(400, "invalid JSON for footer doc")),
+        };
+        out.push((k, value));
+    }
+    Ok(out)
 }
 
 fn ssync_check_missing_owned(
@@ -773,6 +862,74 @@ fn put_if_match_precondition(
     }
 }
 
+/// Shared PUT pre-body checks (If-None-Match, X-Delete-*, timestamp, lock).
+fn evaluate_put_preconditions(
+    req: &Request,
+    req_timestamp: &Timestamp,
+    orig_exists: bool,
+    orig_timestamp: Timestamp,
+    orig_metadata: Option<&Metadata>,
+    clock_ok: bool,
+) -> Result<Option<String>, Response> {
+    if let Some(inm) = req.headers.get("If-None-Match") {
+        if !if_none_match_has_star(inm) {
+            return Err(plain_response(400, "If-None-Match only supports *"));
+        }
+    }
+    let resolved_delete_at = check_delete_headers(req, req_timestamp.as_secs_f64())?;
+    if orig_exists && req.headers.get("If-None-Match").is_some() {
+        return Err(swob_response(412));
+    }
+    if orig_timestamp >= *req_timestamp {
+        let mut resp = swob_response(409);
+        resp.headers
+            .set("X-Backend-Timestamp", orig_timestamp.internal());
+        return Err(resp);
+    }
+    if let Some(resp) = put_if_match_precondition(req, orig_exists, orig_metadata) {
+        return Err(resp);
+    }
+    if orig_exists || orig_metadata.is_some() {
+        if let Some(resp) = deny_locked_native_mutation(
+            req,
+            orig_metadata.map(|meta| Ok::<_, DiskFileError>(meta)),
+            clock_ok,
+        ) {
+            return Err(resp);
+        }
+    }
+    Ok(resolved_delete_at)
+}
+
+fn open_put_original(
+    df: DiskFile,
+    ssync_frag_index: Option<i64>,
+) -> Result<(bool, Timestamp, Option<Metadata>), Response> {
+    let mut pre = df.with_frag_index(ssync_frag_index);
+    match pre.open(None) {
+        Ok(opened) => {
+            let ts = opened
+                .data_timestamp()
+                .unwrap_or_else(|_| "0".parse().unwrap());
+            match opened.get_metadata() {
+                Ok(meta) => Ok((true, ts, Some(meta.clone()))),
+                Err(e) => Err(plain_response(500, &e.to_string())),
+            }
+        }
+        Err(DiskFileError::Deleted { timestamp, .. }) => Ok((false, timestamp, None)),
+        Err(DiskFileError::Expired { metadata }) => {
+            let ts = meta_get(&metadata, "X-Timestamp")
+                .and_then(|s| s.parse::<Timestamp>().ok())
+                .unwrap_or_else(|| "0".parse().unwrap());
+            Ok((false, ts, Some(metadata)))
+        }
+        Err(DiskFileError::NotExist) | Err(DiskFileError::Quarantined(_)) => {
+            Ok((false, "0".parse().unwrap(), None))
+        }
+        Err(e) => Err(plain_response(500, &e.to_string())),
+    }
+}
+
 /// Python `fallocate()`'s FALLOCATE_RESERVE check, absolute-bytes mode: would
 /// writing `size` bytes leave the device's filesystem with `free` bytes
 /// available at or below the reserve? Zero-length writes never trip the
@@ -974,12 +1131,63 @@ impl ObjectServer {
         if declared_len.is_some_and(|len| len > MAX_FILE_SIZE as u64) {
             return plain_response(413, "Your request is too large.");
         }
+        if let Some(inm) = req.headers.get("If-None-Match") {
+            if !if_none_match_has_star(inm) {
+                return plain_response(400, "If-None-Match only supports *");
+            }
+        }
         if let Ok(free) = swift_core::fsutil::free_bytes(&self.config.devices.join(&drive)) {
             if fallocate_reserve_breached(free, declared_len.unwrap_or(0), &self.fallocate_reserve)
             {
                 return swob_response(507);
             }
         }
+        let device = DeviceId::new(drive.clone());
+        let pre_df = match self.diskfile_for(
+            &drive,
+            part,
+            &account,
+            &container,
+            &obj,
+            (policy_index, policy),
+        ) {
+            Ok(df) => df,
+            Err(e) => return plain_response(500, &e.to_string()),
+        };
+        let ssync_frag_index: Option<i64> = req
+            .headers
+            .get("X-Backend-Ssync-Frag-Index")
+            .and_then(|raw| raw.trim().parse().ok());
+        let clock_ok = self.worm_clock.clock_ok();
+        let headers_for_pre = req.headers.clone();
+        let ts_for_pre = req_timestamp.clone();
+        let resolved_delete_at = match self
+            .storage()
+            .run_finite(device.clone(), TrafficClass::Foreground, move || {
+                let (exists, orig_ts, orig_meta) =
+                    open_put_original(pre_df, ssync_frag_index)?;
+                let pre_req = Request {
+                    method: "PUT".into(),
+                    path: String::new(),
+                    query_string: String::new(),
+                    headers: headers_for_pre,
+                    body: Body::empty(),
+                };
+                evaluate_put_preconditions(
+                    &pre_req,
+                    &ts_for_pre,
+                    exists,
+                    orig_ts,
+                    orig_meta.as_ref(),
+                    clock_ok,
+                )
+            })
+            .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(resp)) => return resp,
+            Err(e) => return plain_response(500, &e.to_string()),
+        };
         let df = match self.diskfile_for(
             &drive,
             part,
@@ -991,7 +1199,6 @@ impl ObjectServer {
             Ok(df) => df,
             Err(e) => return plain_response(500, &e.to_string()),
         };
-        let device = DeviceId::new(drive.clone());
         let mut writer = match self
             .storage()
             .run_finite(device.clone(), TrafficClass::Foreground, move || {
@@ -1004,6 +1211,7 @@ impl ObjectServer {
             Ok(Err(e)) => return plain_response(500, &e.to_string()),
             Err(e) => return plain_response(500, &e.to_string()),
         };
+        let mut footers: Vec<(String, String)> = Vec::new();
         if mime {
             let Some(boundary) = req
                 .headers
@@ -1021,7 +1229,19 @@ impl ObjectServer {
             )
             .await
             {
-                Ok(w) => w,
+                Ok((w, leftover)) => {
+                    match ingest_mime_footer_async(
+                        &mut areq.body,
+                        leftover,
+                        boundary.as_bytes(),
+                    )
+                    .await
+                    {
+                        Ok(f) => footers = f,
+                        Err(resp) => return resp,
+                    }
+                    w
+                }
                 Err(resp) => return resp,
             };
         } else {
@@ -1059,7 +1279,12 @@ impl ObjectServer {
         if declared_len.is_some_and(|declared| declared != upload_size) {
             return swob_response(499);
         }
-        let received_etag = req.headers.get("ETag").unwrap_or("");
+        let received_etag = footers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
+            .map(|(_, v)| v.as_str())
+            .or_else(|| req.headers.get("ETag"))
+            .unwrap_or("");
         let normalized = received_etag.trim_matches('"');
         if !normalized.is_empty() && !normalized.eq_ignore_ascii_case(&etag) {
             return swob_response(422);
@@ -1091,6 +1316,17 @@ impl ObjectServer {
                 metadata.push((MetaValue::Str(k.to_string()), MetaValue::Str(v.to_string())));
             }
         }
+        for (k, v) in &footers {
+            if is_sys_or_user_meta(k) || is_object_transient_sysmeta(k) {
+                meta_upsert(&mut metadata, k, v.clone());
+            }
+        }
+        if let Some(delete_at) = &resolved_delete_at {
+            metadata.push((
+                MetaValue::Str("X-Delete-At".into()),
+                MetaValue::Str(delete_at.clone()),
+            ));
+        }
         let durable = match writer.into_durable() {
             Ok(d) => d,
             Err(e) => return plain_response(500, &e.to_string()),
@@ -1103,8 +1339,8 @@ impl ObjectServer {
             upload_size,
             content_type,
             req_timestamp,
-            footers: Vec::new(),
-            resolved_delete_at: None,
+            footers,
+            resolved_delete_at,
             account,
             container,
             obj,
@@ -4626,6 +4862,93 @@ mod fallocate_reserve_tests {
             "DELETE status {}",
             del.status
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn handle_async_put_if_none_match_and_delete_at() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-inm-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let put = |ts: &str, name: &str, extra: &[(&str, &str)]| {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Timestamp", ts);
+            headers.set("Content-Type", "application/octet-stream");
+            headers.set("Content-Length", 0);
+            for (k, v) in extra {
+                headers.set(*k, *v);
+            }
+            AsyncRequest {
+                method: "PUT".into(),
+                path: format!("/sda1/0/AUTH_test/c/{name}"),
+                query_string: String::new(),
+                headers,
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            }
+        };
+        let first = server
+            .handle_async(put("3001", "inm-o", &[("If-None-Match", "*")]))
+            .await;
+        assert_eq!(first.status, 201, "{}", first.reason);
+        let second = server
+            .handle_async(put("3002", "inm-o", &[("If-None-Match", "*")]))
+            .await;
+        assert_eq!(second.status, 412, "existing object must 412");
+        let bad = server
+            .handle_async(put("3003", "inm-o", &[("If-None-Match", "abc")]))
+            .await;
+        assert_eq!(bad.status, 400);
+        let past = server
+            .handle_async(put("3004", "past-o", &[("X-Delete-At", "1")]))
+            .await;
+        assert_eq!(past.status, 400, "past X-Delete-At must 400");
+        let non_int = server
+            .handle_async(put("3005", "ni-o", &[("X-Delete-At", "*")]))
+            .await;
+        assert_eq!(non_int.status, 400);
+        let soon = server
+            .handle_async(put("3006", "exp-o", &[("X-Delete-At", "1")]))
+            .await;
+        // timestamp 3006 > delete-at 1 → still 400 (delete-at in the past vs req ts)
+        assert_eq!(soon.status, 400);
+        let future = server
+            .handle_async(put(
+                "3007",
+                "exp-o",
+                &[("X-Delete-At", "9999999999")],
+            ))
+            .await;
+        assert_eq!(future.status, 201, "{}", future.reason);
+        let head = server
+            .handle_async(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/sda1/0/AUTH_test/c/exp-o".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(head.status, 200);
+        assert_eq!(head.headers.get("X-Delete-At"), Some("9999999999"));
+        let expired_put = server
+            .handle_async(put("1000", "gone-o", &[("X-Delete-At", "1001")]))
+            .await;
+        assert_eq!(expired_put.status, 201, "{}", expired_put.reason);
+        let expired_get = server
+            .handle_async(AsyncRequest {
+                method: "GET".into(),
+                path: "/sda1/0/AUTH_test/c/gone-o".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(expired_get.status, 404, "past X-Delete-At must 404 on GET");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -31,6 +31,7 @@ use http_body::Frame;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::Service;
+use hyper::header::HeaderValue;
 use hyper::{Request as HyperRequest, Response as HyperResponse, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -44,6 +45,18 @@ use crate::body::Body;
 use crate::headers::HeaderKeyDict;
 use crate::request::{reason_phrase, unquote, Response};
 use crate::server::{AsyncRequest, AsyncService, IncomingBody, ServerConfig};
+
+/// Decode a Hyper header value the way WSGI/Swift does: UTF-8 when the
+/// octets are valid UTF-8 (Python `str_to_wsgi` puts UTF-8 on the wire),
+/// otherwise latin-1 so a non-ASCII header is not dropped. `HeaderValue::to_str`
+/// requires visible ASCII and would silently discard TestFileUTF8 metadata.
+fn header_value_to_string(value: &HeaderValue) -> String {
+    let bytes = value.as_bytes();
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => bytes.iter().map(|&b| char::from(b)).collect(),
+    }
+}
 
 pub async fn serve_http1_connection(
     mut stream: tokio::net::TcpStream,
@@ -696,8 +709,7 @@ impl Service<HyperRequest<Incoming>> for HyperToSwift {
             let (parts, incoming) = req.into_parts();
             let mut headers = HeaderKeyDict::new();
             for (name, value) in parts.headers.iter() {
-                let Ok(v) = value.to_str() else { continue };
-                headers.set(name.as_str(), v);
+                headers.set(name.as_str(), header_value_to_string(value));
             }
             if let Some(ref ip) = peer_ip {
                 if !headers.contains_key("X-Backend-Remote-Addr") {
@@ -785,7 +797,13 @@ fn to_hyper_response(
         if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
             continue;
         }
-        builder = builder.header(name, value);
+        // HTTP/1.1 field values are octets. Python WSGI smuggles UTF-8
+        // through latin-1; `HeaderValue::from_str` rejects non-ASCII and
+        // would drop unicode Content-Type / metadata on the way out.
+        let Ok(hv) = HeaderValue::from_bytes(value.as_bytes()) else {
+            continue;
+        };
+        builder = builder.header(name, hv);
     }
     builder = builder.header(
         "Connection",
@@ -940,5 +958,30 @@ impl http_body::Body for SwiftHttpBody {
             SwiftBodyInner::Once(None) => http_body::SizeHint::with_exact(0),
             SwiftBodyInner::Channel { .. } => http_body::SizeHint::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_value_to_string_keeps_utf8_and_latin1() {
+        let utf8 = HeaderValue::from_bytes("café".as_bytes()).unwrap();
+        assert_eq!(header_value_to_string(&utf8), "café");
+        let latin1 = HeaderValue::from_bytes(&[0xfc]).unwrap();
+        assert_eq!(header_value_to_string(&latin1), "ü");
+    }
+
+    #[test]
+    fn to_hyper_response_emits_non_ascii_metadata() {
+        let mut resp = Response::new(200);
+        resp.headers.set("X-Object-Meta-Color", "красный");
+        resp.headers.set("Content-Type", "text/Ω");
+        let hyper = to_hyper_response(resp, true, true);
+        let color = hyper.headers().get("X-Object-Meta-Color").unwrap();
+        assert_eq!(color.as_bytes(), "красный".as_bytes());
+        let ct = hyper.headers().get("Content-Type").unwrap();
+        assert_eq!(ct.as_bytes(), "text/Ω".as_bytes());
     }
 }

@@ -46,8 +46,8 @@ use std::time::{Duration, Instant};
 
 use md5::{Digest, Md5};
 use swift_http::{
-    split_path, unquote, Body, ChainReader, FnReader, HeaderKeyDict, Range, Request, Response,
-    MAX_CONTROL_BODY, STREAM_CHUNK,
+    apply_conditional, split_path, unquote, Body, ChainReader, FnReader, HeaderKeyDict, Range,
+    Request, Response, MAX_CONTROL_BODY, STREAM_CHUNK,
 };
 
 use crate::slo::{dlo_etag_and_size, normalize_etag};
@@ -1012,6 +1012,41 @@ impl DynamicLargeObject {
             .map(|s| (s.hash.clone(), s.bytes as i64))
             .collect();
         let (dlo_etag, total_len) = dlo_etag_and_size(&pairs);
+        let total_u = total_len.max(0) as u64;
+        let have_complete_listing = segments.len() < self.listing_limit;
+        let mut byte_range: Option<(u64, u64)> = None;
+        let mut unsatisfiable = false;
+        let range = orig
+            .headers
+            .get("Range")
+            .and_then(|h| Range::parse(h).ok())
+            .filter(|r| r.ranges.len() == 1);
+        if let Some(range) = range {
+            let known_from_first_page = match range.ranges[0] {
+                (Some(_), Some(end)) => end
+                    .checked_add(1)
+                    .is_some_and(|exclusive_end| exclusive_end < total_u),
+                _ => false,
+            };
+            if have_complete_listing || known_from_first_page {
+                match single_range_for_length(&range, total_u) {
+                    Some(ranges) if ranges.is_empty() || ranges[0].0 >= ranges[0].1 => {
+                        unsatisfiable = true
+                    }
+                    Some(ranges) => byte_range = Some(ranges[0]),
+                    None => {}
+                }
+            }
+        }
+        if unsatisfiable {
+            let mut resp = Response::error(416, "Requested Range Not Satisfiable");
+            resp.headers.set("Accept-Ranges", "bytes");
+            if have_complete_listing {
+                resp.headers
+                    .set("Content-Range", format!("bytes */{total_u}"));
+            }
+            return resp;
+        }
         let mut headers = resp.headers.clone();
         headers.remove("Content-Length");
         headers.remove("Content-Range");
@@ -1019,19 +1054,37 @@ impl DynamicLargeObject {
         headers.remove("Etag");
         headers.set("Etag", &dlo_etag);
         headers.set("Accept-Ranges", "bytes");
-        headers.set("Content-Length", total_len.max(0).to_string());
-        let mut out = Response::new(200);
+        let status = if byte_range.is_some() { 206 } else { 200 };
+        let response_length = byte_range
+            .map(|(first, last_exclusive)| last_exclusive - first)
+            .unwrap_or(total_u);
+        if let Some((first, last_exclusive)) = byte_range {
+            headers.set(
+                "Content-Range",
+                format!("bytes {}-{}/{total_u}", first, last_exclusive - 1),
+            );
+        }
+        headers.set("Content-Length", response_length.to_string());
+        let mut out = Response::new(status);
         out.headers = headers;
         if orig.method != "GET" {
             out.body = Body::empty();
-            return out;
+            return apply_conditional(&orig, out);
         }
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let scope = swift_runtime::TaskScope::bounded(1);
         let orig_head = orig.clone_head();
         let container = container.to_string();
         let _ = scope.spawn(async move {
+            let (skip, take) = byte_range
+                .map(|(s, e)| (s, e.saturating_sub(s)))
+                .unwrap_or((0, u64::MAX));
+            let mut skipped = 0u64;
+            let mut sent = 0u64;
             for seg in segments {
+                if sent >= take {
+                    break;
+                }
                 let path = format!("/{version}/{account}/{container}/{}", seg.name);
                 let sub = make_subreq(&orig_head, "GET", path, String::new());
                 let sresp = next(sub).await;
@@ -1046,7 +1099,20 @@ impl DynamicLargeObject {
                 }
                 match sresp.body.collect_async().await {
                     Ok(b) => {
-                        if tx.send(Ok(b)).await.is_err() {
+                        let mut slice = b;
+                        if skipped < skip {
+                            let drop = (skip - skipped).min(slice.len() as u64) as usize;
+                            skipped += drop as u64;
+                            if drop >= slice.len() {
+                                continue;
+                            }
+                            slice = slice[drop..].to_vec();
+                        }
+                        if sent + slice.len() as u64 > take {
+                            slice.truncate((take - sent) as usize);
+                        }
+                        sent += slice.len() as u64;
+                        if tx.send(Ok(slice)).await.is_err() {
                             return;
                         }
                     }
@@ -1057,8 +1123,8 @@ impl DynamicLargeObject {
                 }
             }
         });
-        out.body = Body::from_channel(rx, Some(total_len.max(0) as u64), scope);
-        out
+        out.body = Body::from_channel(rx, Some(response_length), scope);
+        apply_conditional(&orig, out)
     }
 }
 
@@ -1142,7 +1208,7 @@ impl Middleware for DynamicLargeObject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     /// A programmable backend: matches (method, path) to responses. Canned
     /// responses are torn into Sync parts (a `Body` reader is only `Send`)
@@ -1299,6 +1365,31 @@ mod tests {
         let mut resp = dlo.handle(get_req("/v1/a/c/manifest", Some("bytes=5-10")), &be);
         assert_eq!(resp.status, 206);
         assert_eq!(body_of(&mut resp), b"othree");
+    }
+
+    #[tokio::test]
+    async fn test_async_range_out_of_range_and_if_match() {
+        let dlo = DynamicLargeObject::new();
+        let sync = manifest_backend();
+        let next: crate::AsyncNextFn = Arc::new(move |r| {
+            let sync = Arc::clone(&sync);
+            Box::pin(async move { sync(r) })
+        });
+        let unsat = dlo
+            .reassemble_async(get_req("/v1/a/c/manifest", Some("bytes=100-200")), next.clone())
+            .await;
+        assert_eq!(unsat.status, 416, "{}", unsat.reason);
+        let mut ranged = dlo
+            .reassemble_async(get_req("/v1/a/c/manifest", Some("bytes=3-")), next.clone())
+            .await;
+        assert_eq!(ranged.status, 206);
+        let body = ranged.body.collect_async().await.unwrap();
+        assert_eq!(body, b"twothree");
+        let etag = ranged.headers.get("Etag").unwrap_or("").to_string();
+        let mut inm = get_req("/v1/a/c/manifest", None);
+        inm.headers.set("If-None-Match", etag);
+        let cond = dlo.reassemble_async(inm, next).await;
+        assert_eq!(cond.status, 304, "{}", cond.reason);
     }
 
     #[test]

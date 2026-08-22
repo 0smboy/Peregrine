@@ -339,6 +339,158 @@ async fn write_chunk_framed_async(stream: &mut TcpStream, chunk: &[u8]) -> io::R
     Ok(())
 }
 
+#[cfg(feature = "ec")]
+struct AsyncMimePutter {
+    #[allow(dead_code)]
+    node: Node,
+    stream: TcpStream,
+    leftover: Vec<u8>,
+    boundary: String,
+    frag_index: usize,
+    frag_hasher: md5::Md5,
+    started_data: bool,
+}
+
+#[cfg(feature = "ec")]
+enum AsyncMimeOutcome {
+    Live(AsyncMimePutter),
+    EarlyFinal(u16),
+}
+
+#[cfg(feature = "ec")]
+impl AsyncMimePutter {
+    fn frag_md5(&self) -> String {
+        use md5::Digest;
+        format!("{:x}", self.frag_hasher.clone().finalize())
+    }
+
+    async fn start_object_data(&mut self) -> io::Result<()> {
+        if !self.started_data {
+            let preamble = format!("--{}\r\nX-Document: object body\r\n\r\n", self.boundary);
+            write_chunk_framed_async(&mut self.stream, preamble.as_bytes()).await?;
+            self.started_data = true;
+        }
+        Ok(())
+    }
+
+    async fn send_data_chunk(&mut self, fragment: &[u8]) -> io::Result<()> {
+        if fragment.is_empty() {
+            return Ok(());
+        }
+        self.start_object_data().await?;
+        {
+            use md5::Digest;
+            self.frag_hasher.update(fragment);
+        }
+        write_chunk_framed_async(&mut self.stream, fragment).await
+    }
+
+    async fn end_of_object_data(&mut self, footers_json: &str) -> io::Result<()> {
+        use md5::Digest;
+        self.start_object_data().await?;
+        let footer_md5 = format!("{:x}", md5::Md5::digest(footers_json.as_bytes()));
+        let message = format!(
+            "\r\n--{b}\r\nX-Document: object metadata\r\nContent-MD5: {footer_md5}\r\n\r\n{footers_json}\r\n--{b}\r\n",
+            b = self.boundary
+        );
+        write_chunk_framed_async(&mut self.stream, message.as_bytes()).await?;
+        self.stream.write_all(b"0\r\n\r\n").await?;
+        self.stream.flush().await
+    }
+
+    async fn read_final(mut self, idle: Duration) -> io::Result<u16> {
+        let (status, _, _) = read_http_head(&mut self.stream, &mut self.leftover, idle).await?;
+        Ok(status)
+    }
+}
+
+#[cfg(feature = "ec")]
+async fn connect_mime_putter_async(
+    node: &Node,
+    part: u32,
+    path: &str,
+    headers: &HeaderKeyDict,
+    boundary: &str,
+    obj_content_length: Option<u64>,
+    conn_timeout: Duration,
+    node_timeout: Duration,
+) -> io::Result<AsyncMimeOutcome> {
+    let mut stream = connect_node_async(node, conn_timeout).await?;
+    let addr = format!("{}:{}", node.ip, node.port);
+    let target = format!("/{}/{}{}", node.device, part, path);
+    let mut out = format!("PUT {target} HTTP/1.1\r\nHost: {addr}\r\n");
+    for (k, v) in headers.iter() {
+        if [
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "expect",
+        ]
+        .contains(&k.to_ascii_lowercase().as_str())
+        {
+            continue;
+        }
+        out.push_str(&format!("{k}: {v}\r\n"));
+    }
+    out.push_str(&format!(
+        "X-Backend-Obj-Multipart-Mime-Boundary: {boundary}\r\n"
+    ));
+    out.push_str("X-Backend-Obj-Metadata-Footer: yes\r\n");
+    if let Some(n) = obj_content_length {
+        out.push_str(&format!("X-Backend-Obj-Content-Length: {n}\r\n"));
+    }
+    out.push_str("Transfer-Encoding: chunked\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n");
+    tokio::time::timeout(node_timeout, stream.write_all(out.as_bytes()))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "backend write timeout"))??;
+    tokio::time::timeout(node_timeout, stream.flush())
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "backend flush timeout"))??;
+    let mut leftover = Vec::new();
+    let (status, _, _) = read_http_head(&mut stream, &mut leftover, node_timeout).await?;
+    if status == 100 {
+        use md5::Digest;
+        return Ok(AsyncMimeOutcome::Live(AsyncMimePutter {
+            node: node.clone(),
+            stream,
+            leftover,
+            boundary: boundary.to_string(),
+            frag_index: 0,
+            frag_hasher: md5::Md5::new(),
+            started_data: false,
+        }));
+    }
+    Ok(AsyncMimeOutcome::EarlyFinal(status))
+}
+
+#[cfg(feature = "ec")]
+async fn tee_ec_segment(
+    putters: &mut Vec<AsyncMimePutter>,
+    driver: &swift_ec::EcDriver,
+    segment: &[u8],
+    node_timeout: Duration,
+) -> Result<(), Response> {
+    let frags = match driver.encode(segment) {
+        Ok(f) => f,
+        Err(e) => {
+            return Err(Response::with_body(
+                500,
+                format!("EC encode failed: {e:?}").into_bytes(),
+            ))
+        }
+    };
+    let mut live = Vec::new();
+    for mut p in putters.drain(..) {
+        let frag = frags.get(p.frag_index).cloned().unwrap_or_default();
+        match tokio::time::timeout(node_timeout, p.send_data_chunk(&frag)).await {
+            Ok(Ok(())) => live.push(p),
+            _ => {}
+        }
+    }
+    *putters = live;
+    Ok(())
+}
+
 /// Write one object chunk to every live replica concurrently. A replica whose
 /// window is full or whose write times out is dropped (bounded pending bytes).
 async fn tee_one_chunk(
@@ -1195,6 +1347,229 @@ impl ProxyApp {
         });
         resp.body = Body::from_channel(rx, Some(orig_size as u64), scope);
         resp
+    }
+
+    /// EC object PUT: encode client bytes into fragment archives, MIME-PUT
+    /// each fragment with a metadata footer (no multiphase). Hyper object
+    /// servers auto-100-continue; we treat any 100 as live.
+    pub(crate) async fn ec_put_async(
+        self: &Arc<Self>,
+        req: &mut swift_http::Request,
+        account: &str,
+        container: &str,
+        _object: &str,
+        path: &str,
+        policy_index: i64,
+        object_ring: &swift_ring::Ring,
+        object_part: u32,
+        body: &mut IncomingBody,
+    ) -> Response {
+        #[cfg(not(feature = "ec"))]
+        {
+            let _ = (req, account, container, path, policy_index, object_ring, object_part, body);
+            return Response::with_body(
+                501,
+                b"erasure coding not built (compile with --features ec)".to_vec(),
+            );
+        }
+        #[cfg(feature = "ec")]
+        {
+            self.ec_put_async_inner(
+                req,
+                account,
+                container,
+                path,
+                policy_index,
+                object_ring,
+                object_part,
+                body,
+            )
+            .await
+        }
+    }
+
+    #[cfg(feature = "ec")]
+    async fn ec_put_async_inner(
+        self: &Arc<Self>,
+        req: &mut swift_http::Request,
+        account: &str,
+        container: &str,
+        path: &str,
+        policy_index: i64,
+        object_ring: &swift_ring::Ring,
+        object_part: u32,
+        body: &mut IncomingBody,
+    ) -> Response {
+        use md5::{Digest, Md5};
+        use swift_ec::EcDriver;
+        let Some(&ec) = self.ec_policies.get(&policy_index) else {
+            return swob_response(503);
+        };
+        let driver = match EcDriver::new(ec.ndata, ec.nparity) {
+            Ok(d) => d,
+            Err(e) => {
+                return Response::with_body(500, format!("EC init failed: {e:?}").into_bytes())
+            }
+        };
+        let n = ec.n_unique();
+        let client_len = body.content_length();
+        let archive_len = client_len.map(|total| super::ec_archive_size(&driver, ec.segment_size, total));
+        let put_ts = Timestamp::now();
+        let ts = put_ts.internal();
+        let content_type = req
+            .headers
+            .get("Content-Type")
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let Ok((container_part, _)) = self
+            .container_ring
+            .get_nodes(account, Some(container), None)
+        else {
+            return swob_response(503);
+        };
+        let container_nodes = self.iter_nodes(&self.container_ring, container_part);
+        let mut base = self.backend_headers(req, true, "object");
+        base.set("X-Timestamp", &ts);
+        base.set("Content-Type", &content_type);
+        base.set("X-Backend-Storage-Policy-Index", policy_index);
+        let mut per_node = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut h = base.clone();
+            if !container_nodes.is_empty() {
+                let cont = &container_nodes[i % container_nodes.len()];
+                h.set("X-Container-Host", format!("{}:{}", cont.ip, cont.port));
+                h.set("X-Container-Partition", container_part);
+                h.set("X-Container-Device", &cont.device);
+            }
+            per_node.push(h);
+        }
+        let boundary = {
+            let a = format!("{path}:{ts}:head");
+            let b = format!("{path}:{ts}:tail");
+            format!(
+                "{:x}{:x}",
+                Md5::digest(a.as_bytes()),
+                Md5::digest(b.as_bytes())
+            )
+        };
+        let nodes = self.iter_nodes(object_ring, object_part);
+        let mut putters: Vec<AsyncMimePutter> = Vec::new();
+        let mut earlies: Vec<u16> = Vec::new();
+        let wait = self.config.conn_timeout + self.config.node_timeout;
+        let node_timeout = self.config.node_timeout;
+        let conn_timeout = self.config.conn_timeout;
+        for (i, node) in nodes.into_iter().take(n).enumerate() {
+            match connect_mime_putter_async(
+                &node,
+                object_part,
+                path,
+                &per_node[i.min(per_node.len().saturating_sub(1))],
+                &boundary,
+                archive_len,
+                conn_timeout,
+                node_timeout,
+            )
+            .await
+            {
+                Ok(AsyncMimeOutcome::Live(mut p)) => {
+                    p.frag_index = i;
+                    putters.push(p);
+                }
+                Ok(AsyncMimeOutcome::EarlyFinal(status)) => earlies.push(status),
+                Err(_) => self.error_limiter.increment(&node),
+            }
+        }
+        if earlies.contains(&412) {
+            return swob_response(412);
+        }
+        if earlies.contains(&409) {
+            return swob_response(202);
+        }
+        if putters.len() < ec.write_quorum() {
+            return swob_response(503);
+        }
+        let mut etag_hasher = Md5::new();
+        let mut seg_buf: Vec<u8> = Vec::with_capacity(ec.segment_size);
+        let mut total: u64 = 0;
+        let quorum = ec.write_quorum();
+        loop {
+            let chunk = match body.next_chunk().await {
+                Ok(Some(c)) => c,
+                Ok(None) => break,
+                Err(e) if swift_http::body_too_large(&e) => return swob_response(413),
+                Err(_) => return swob_response(499),
+            };
+            etag_hasher.update(&chunk);
+            total += chunk.len() as u64;
+            if total > swift_core::constraints::MAX_FILE_SIZE as u64 {
+                return swob_response(413);
+            }
+            seg_buf.extend_from_slice(&chunk);
+            while seg_buf.len() >= ec.segment_size {
+                let rest = seg_buf.split_off(ec.segment_size);
+                let segment = std::mem::replace(&mut seg_buf, rest);
+                if let Err(resp) = tee_ec_segment(&mut putters, &driver, &segment, node_timeout).await
+                {
+                    return resp;
+                }
+                if putters.len() < quorum {
+                    return swob_response(503);
+                }
+            }
+        }
+        if client_len.is_some_and(|declared| declared != total) {
+            return swob_response(499);
+        }
+        if !seg_buf.is_empty() {
+            if let Err(resp) = tee_ec_segment(&mut putters, &driver, &seg_buf, node_timeout).await
+            {
+                return resp;
+            }
+        }
+        let _ = wait;
+        let ec_etag = format!("{:x}", etag_hasher.finalize());
+        if let Some(client_etag) = req.headers.get("ETag") {
+            let norm = client_etag.trim_matches('"');
+            if !norm.is_empty() && !norm.eq_ignore_ascii_case(&ec_etag) {
+                let mut resp = swob_response(422);
+                resp.headers
+                    .set("Last-Modified", swift_http::http_date(put_ts.ceil()));
+                return resp;
+            }
+        }
+        let mut successes = 0usize;
+        for mut p in putters {
+            let footers = serde_json::json!({
+                "X-Object-Sysmeta-Ec-Etag": ec_etag,
+                "X-Object-Sysmeta-Ec-Content-Length": total.to_string(),
+                "X-Backend-Container-Update-Override-Etag": ec_etag,
+                "X-Backend-Container-Update-Override-Size": total.to_string(),
+                "X-Object-Sysmeta-Ec-Frag-Index": p.frag_index.to_string(),
+                "X-Object-Sysmeta-Ec-Scheme": format!("{}+{}", ec.ndata, ec.nparity),
+                "X-Object-Sysmeta-Ec-Segment-Size": ec.segment_size.to_string(),
+                "Etag": p.frag_md5(),
+            })
+            .to_string();
+            if p.end_of_object_data(&footers).await.is_err() {
+                continue;
+            }
+            match p.read_final(node_timeout).await {
+                Ok(status) if (200..300).contains(&status) => successes += 1,
+                _ => {}
+            }
+        }
+        if successes >= ec.write_quorum() {
+            let mut resp = Response::new(201);
+            resp.headers.set("ETag", &ec_etag);
+            resp.headers.set("Content-Type", &content_type);
+            resp.headers.set("X-Timestamp", &ts);
+            resp.headers.set("Content-Length", 0);
+            resp.headers
+                .set("Last-Modified", swift_http::http_date(put_ts.ceil()));
+            resp
+        } else {
+            swob_response(503)
+        }
     }
 
     pub(crate) async fn object_post_async(

@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use swift_core::config::config_true_value;
 use swift_core::timestamp::Timestamp;
 use swift_http::{
-    HeaderKeyDict, Request, Response, AsyncRequest, AsyncService,
+    split_path, HeaderKeyDict, Request, Response, AsyncRequest, AsyncService,
 };
 use swift_memcache::{MemcacheClient, TcpConn};
 use swift_ring::Ring;
@@ -2376,6 +2376,52 @@ impl ProxyApp {
         }
     }
 
+    /// Hyper-pipeline CORS: same rules as the sync `handle` decorator,
+    /// applied after middleware reassembly so DLO/SLO GET still gets ACAO.
+    pub(crate) async fn apply_pipeline_cors(
+        self: &Arc<Self>,
+        method: String,
+        path: String,
+        origin: Option<String>,
+        resp: &mut Response,
+    ) {
+        if !matches!(method.as_str(), "GET" | "HEAD" | "PUT" | "POST" | "DELETE") {
+            return;
+        }
+        let Some(origin) = origin.filter(|value| !value.is_empty()) else {
+            return;
+        };
+        let Ok(parts) = split_path(&path, 2, 4, true) else {
+            return;
+        };
+        let Some(account) = parts
+            .get(1)
+            .and_then(|s| s.as_deref())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let Some(container) = parts
+            .get(2)
+            .and_then(|s| s.as_deref())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let cors = self.container_info_async(&account, &container).await.cors;
+        let mut head = Request {
+            method,
+            path,
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        };
+        head.headers.set("Origin", origin);
+        self.apply_simple_cors(&head, &cors, resp);
+    }
+
     pub fn handle(self: &Arc<Self>, req: Request) -> Response {
         // Reject a decoded path carrying a NUL byte (invalid UTF-8 can't reach a
         // Rust String), mirroring Python's `check_utf8` at request entry:
@@ -2882,6 +2928,21 @@ impl ProxyApp {
             percent_encode(container),
             percent_encode(object)
         );
+        if self.ec_policies.contains_key(&policy_index) {
+            return self
+                .ec_put_async(
+                    req,
+                    account,
+                    container,
+                    object,
+                    &path,
+                    policy_index,
+                    object_ring,
+                    object_part,
+                    body,
+                )
+                .await;
+        }
         let (upd_account, upd_container) = self
             .resolve_updating_shard_async(account, container, object)
             .await
@@ -5583,6 +5644,13 @@ async fn dispatch_remaining(
             resp = filter.finish(&head, resp);
         }
     }
+    app.apply_pipeline_cors(
+                head.method.clone(),
+                head.path.clone(),
+                head.headers.get("Origin").map(str::to_string),
+                &mut resp,
+            )
+            .await;
     resp
 }
 
@@ -5604,7 +5672,22 @@ impl AsyncService for ProxyAsyncService {
         Box::pin(async move {
             let mut req = req;
             if filters.is_empty() {
-                return app.handle_async(req).await;
+                let head = Request {
+                    method: req.method.clone(),
+                    path: req.path.clone(),
+                    query_string: req.query_string.clone(),
+                    headers: req.headers.clone(),
+                    body: swift_http::Body::empty(),
+                };
+                let mut resp = app.handle_async(req).await;
+                app.apply_pipeline_cors(
+                head.method.clone(),
+                head.path.clone(),
+                head.headers.get("Origin").map(str::to_string),
+                &mut resp,
+            )
+            .await;
+                return resp;
             }
             let mut head = Request {
                 method: req.method.clone(),
@@ -5637,10 +5720,26 @@ impl AsyncService for ProxyAsyncService {
                 };
                 for filter in filters.iter().rev() {
                     if filter.streams_request(&head) {
-                        return filter.handle_streaming_request(req, next).await;
+                        let mut resp = filter.handle_streaming_request(req, next).await;
+                        app.apply_pipeline_cors(
+                head.method.clone(),
+                head.path.clone(),
+                head.headers.get("Origin").map(str::to_string),
+                &mut resp,
+            )
+            .await;
+                        return resp;
                     }
                 }
-                return next(req).await;
+                let mut resp = next(req).await;
+                app.apply_pipeline_cors(
+                head.method.clone(),
+                head.path.clone(),
+                head.headers.get("Origin").map(str::to_string),
+                &mut resp,
+            )
+            .await;
+                return resp;
             }
             if filters.iter().any(|f| f.intercepts_request(&head)) {
                 let body = match req.body.materialize(swift_http::MAX_CONTROL_BODY).await {
@@ -5665,7 +5764,15 @@ impl AsyncService for ProxyAsyncService {
                             i + 1,
                             Arc::clone(&app),
                         );
-                        return filter.handle_request_async(request, next).await;
+                        let mut resp = filter.handle_request_async(request, next).await;
+                        app.apply_pipeline_cors(
+                head.method.clone(),
+                head.path.clone(),
+                head.headers.get("Origin").map(str::to_string),
+                &mut resp,
+            )
+            .await;
+                        return resp;
                     }
                 }
                 return remaining_async_next(filters_arc, 0, Arc::clone(&app))(request).await;
@@ -5704,6 +5811,13 @@ impl AsyncService for ProxyAsyncService {
                     resp = filter.finish(&head, resp);
                 }
             }
+            app.apply_pipeline_cors(
+                head.method.clone(),
+                head.path.clone(),
+                head.headers.get("Origin").map(str::to_string),
+                &mut resp,
+            )
+            .await;
             resp
         })
     }
@@ -6359,6 +6473,43 @@ mod cors_tests {
         assert_eq!(
             preflight.headers.get("Access-Control-Allow-Origin"),
             Some("https://allowed.example")
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_async_applies_simple_cors_via_pipeline_helper() {
+        let app = Arc::new(app(ProxyConfig {
+            strict_cors_mode: true,
+            ..Default::default()
+        }));
+        seed_container(
+            app.as_ref(),
+            "AUTH_test",
+            "c",
+            CorsInfo {
+                allow_origin: Some("*".into()),
+                expose_headers: None,
+                max_age: None,
+            },
+        );
+        let req = request("GET", "/v1/AUTH_test/c/o", &[("Origin", "http://m.com")]);
+        let mut resp = Response::new(200);
+        resp.headers.set("X-Object-Meta-Color", "red");
+        app.apply_pipeline_cors(
+            req.method.clone(),
+            req.path.clone(),
+            req.headers.get("Origin").map(str::to_string),
+            &mut resp,
+        )
+        .await;
+        assert_eq!(resp.headers.get("Access-Control-Allow-Origin"), Some("*"));
+        assert!(
+            resp.headers
+                .get("Access-Control-Expose-Headers")
+                .unwrap_or("")
+                .contains("x-object-meta-color"),
+            "{:?}",
+            resp.headers.get("Access-Control-Expose-Headers")
         );
     }
 
