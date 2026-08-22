@@ -1527,6 +1527,9 @@ fn map_swift_error(status: u16, bucket: Option<&str>, key: Option<&str>) -> Resp
         412 => ("PreconditionFailed", Vec::new()),
         416 => ("InvalidRange", Vec::new()),
         507 | 413 => ("EntityTooLarge", Vec::new()),
+        // Client hung up / short body (Swift 499). Not a commit. S3-3:
+        // cancellation is not a successful PUT and not an InternalError.
+        408 | 499 => ("IncompleteBody", Vec::new()),
         500..=599 => ("InternalError", Vec::new()),
         _ => ("InvalidRequest", Vec::new()),
     };
@@ -8919,6 +8922,102 @@ mod tests {
             !saw_complete.load(std::sync::atomic::Ordering::SeqCst),
             "backend PUT must not see a complete authenticated body"
         );
+    }
+
+    #[test]
+    fn streaming_put_client_disconnect_is_incomplete_not_commit() {
+        let api = S3Api::new(cred_map());
+        let req = unsigned_signed_put("/mybucket/obj", "");
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(4);
+        let areq = AsyncRequest {
+            method: req.method,
+            path: req.path,
+            query_string: req.query_string,
+            headers: req.headers,
+            body: IncomingBody::from_channel(rx, Some(1_048_576), None, u64::MAX),
+        };
+        let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let committed_c = committed.clone();
+        let next: StreamingAsyncNextFn = Arc::new(move |areq| {
+            let committed_c = committed_c.clone();
+            Box::pin(async move {
+                if areq.method == "HEAD" {
+                    return Response::new(204);
+                }
+                let mut n = 0usize;
+                let mut body = areq.body;
+                loop {
+                    match body.next_chunk().await {
+                        Ok(Some(c)) => n += c.len(),
+                        Ok(None) => {
+                            if n == 1_048_576 {
+                                committed_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                                let mut resp = Response::new(201);
+                                resp.headers.set("ETag", "committed");
+                                return resp;
+                            }
+                            return Response::new(499);
+                        }
+                        Err(_) => return Response::new(499),
+                    }
+                }
+            })
+        });
+        let resp = block_on_s3(async move {
+            let put = tokio::spawn(async move { api.put_object_streaming(areq, next).await });
+            tx.send(Ok(b"partial".to_vec())).await.unwrap();
+            drop(tx);
+            put.await.unwrap()
+        });
+        assert_eq!(
+            resp.status, 400,
+            "S3-3: client disconnect must not look like a successful PUT: {}",
+            resp.status
+        );
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(
+            body.contains("IncompleteBody"),
+            "expected IncompleteBody, got {body}"
+        );
+        assert!(
+            !committed.load(std::sync::atomic::Ordering::SeqCst),
+            "S3-3: disconnect must not commit"
+        );
+    }
+
+    #[test]
+    fn streaming_put_retry_overwrites_same_key() {
+        let api = S3Api::new(cred_map());
+        let etags = Arc::new(Mutex::new(Vec::<String>::new()));
+        let etags_c = etags.clone();
+        let next: StreamingAsyncNextFn = Arc::new(move |areq| {
+            let etags_c = etags_c.clone();
+            Box::pin(async move {
+                if areq.method == "HEAD" {
+                    return Response::new(204);
+                }
+                let mut data = Vec::new();
+                let mut body = areq.body;
+                while let Some(c) = body.next_chunk().await.unwrap() {
+                    data.extend_from_slice(&c);
+                }
+                let etag = crate::crypto::sha256_hex(&data);
+                etags_c.lock().unwrap().push(etag.clone());
+                let mut resp = Response::new(201);
+                resp.headers.set("ETag", &etag);
+                resp
+            })
+        });
+        for payload in [b"first".as_slice(), b"second".as_slice()] {
+            let req = unsigned_signed_put("/mybucket/obj", "");
+            let areq = async_from_signed(req, payload.to_vec());
+            let next = Arc::clone(&next);
+            let resp = block_on_s3(api.put_object_streaming(areq, next));
+            assert_eq!(resp.status, 200);
+        }
+        let got = etags.lock().unwrap().clone();
+        assert_eq!(got.len(), 2);
+        assert_ne!(got[0], got[1], "retry must replace bytes, not fork a version");
     }
 
     #[test]

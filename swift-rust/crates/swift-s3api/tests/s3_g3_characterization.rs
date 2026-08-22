@@ -103,12 +103,25 @@ fn s3_2_aws_chunked_uses_incremental_transform() {
 }
 
 #[test]
+fn s3_3_client_disconnect_maps_to_incomplete_body() {
+    let mw = read("src/middleware.rs");
+    assert!(
+        mw.contains("408 | 499 => (\"IncompleteBody\""),
+        "G3 S3-3 FAIL: Swift 499/408 must map to S3 IncompleteBody, not success or InternalError"
+    );
+    assert!(
+        mw.contains("streaming_put_client_disconnect_is_incomplete_not_commit"),
+        "G3 S3-3 FAIL: missing disconnect-does-not-commit behavior test"
+    );
+}
+
+#[test]
 fn s3_3_remaining_control_path_still_uses_sync_handle() {
     let mw = read("src/middleware.rs");
     let still = mw.contains("self.handle(req, &next_sync)")
         && mw.contains("tokio::task::block_in_place");
     assert!(
         still,
-        "S3-3 tracker inverted: control handle_request_async is native async; convert this test to assert absence"
+        "control handle_request_async is native async; convert this test to assert absence"
     );
 }
