@@ -3434,7 +3434,7 @@ impl S3Api {
 
     async fn dispatch_s3_async(
         &self,
-        req: Request,
+        mut req: Request,
         cred: S3Credential,
         next: AsyncNextFn,
     ) -> Response {
@@ -3576,18 +3576,58 @@ impl S3Api {
             return self.dispatch_legacy_blocking(req, cred, next).await;
         }
         if let (Some(b), Some(_)) = (bucket.as_deref(), key.as_deref()) {
-            // SigV2 object PUT is not Hyper-streaming (V4-only). Without
-            // this, versioned SigV2 PUTs skip SYS_VERSION_ID and
-            // GET ?versionId=null returns the current object.
-            if matches!(req.method.as_str(), "GET" | "HEAD" | "DELETE" | "PUT") {
-                match probe_bucket_versioning_async(&cred, b, &next, &self.container_heads).await
-                {
-                    Ok(Some(_)) => {
-                        return self.dispatch_legacy_blocking(req, cred, next).await;
+            let method = req.method.clone();
+            match method.as_str() {
+                "GET" | "HEAD" | "DELETE" => {
+                    match probe_bucket_versioning_async(
+                        &cred,
+                        b,
+                        &next,
+                        &self.container_heads,
+                    )
+                    .await
+                    {
+                        Ok(Some(_)) => {
+                            return self.dispatch_legacy_blocking(req, cred, next).await;
+                        }
+                        Ok(None) => {}
+                        Err(resp) => return resp,
                     }
-                    Ok(None) => {}
-                    Err(resp) => return resp,
                 }
+                "PUT" => {
+                    match probe_bucket_versioning_async(
+                        &cred,
+                        b,
+                        &next,
+                        &self.container_heads,
+                    )
+                    .await
+                    {
+                        Ok(Some(_)) => {
+                            // SigV2 PUT is intercept-buffered, not Hyper
+                            // streaming. dispatch_legacy_blocking panics on
+                            // the live runtime (`Body::Channel.blocking_recv`
+                            // inside block_in_place). Stamp SYS_VERSION_ID
+                            // so GET ?versionId=null is NoSuchKey.
+                            let vid = generate_version_id();
+                            if is_safe_version_id(&vid) {
+                                req.headers.set(SYS_VERSION_ID, &vid);
+                                req.headers.set(SYS_DELETE_MARKER, "false");
+                            }
+                            let mut out = self
+                                .forward_s3_async(req, cred, bucket, key, params, next)
+                                .await;
+                            if (200..300).contains(&out.status) && is_safe_version_id(&vid)
+                            {
+                                out.headers.set(HDR_VERSION_ID, vid);
+                            }
+                            return out;
+                        }
+                        Ok(None) => {}
+                        Err(resp) => return resp,
+                    }
+                }
+                _ => {}
             }
         }
         self.forward_s3_async(req, cred, bucket, key, params, next)

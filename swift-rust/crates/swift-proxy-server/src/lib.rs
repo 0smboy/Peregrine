@@ -6041,7 +6041,22 @@ impl AsyncService for ProxyAsyncService {
                     Err(e) if swift_http::body_too_large(&e) => {
                         return Response::error(413, "Your request is too large.")
                     }
-                    Err(_) => return swob_response(499),
+                    Err(_) => {
+                        // Python s3api PUT maps Swift 499 (short body /
+                        // client hangup) to RequestTimeout 400. The
+                        // intercept path never reaches s3api if Hyper
+                        // fails the body read (Content-Length mismatch).
+                        if head.method == "PUT" {
+                            let mut resp = swift_s3api::s3_error_response(
+                                "RequestTimeout",
+                                None,
+                                &[],
+                            );
+                            resp.headers.set("Connection", "close");
+                            return resp;
+                        }
+                        return swob_response(499);
+                    }
                 };
                 let request = Request {
                     method: req.method,
