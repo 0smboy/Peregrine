@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use md5::{Digest, Md5};
 use serde_json::{json, Value};
 use swift_http::{HeaderKeyDict, Request, Response};
-use swift_middleware::{Middleware, NextFn, Slo};
+use swift_middleware::{AsyncNextFn, Middleware, NextFn, Slo};
 
 fn md5_hex(data: &[u8]) -> String {
     let digest = Md5::digest(data);
@@ -434,4 +434,68 @@ fn path_must_identify_a_container_and_object() {
     assert_eq!(response.status, 400);
     assert!(body_string(&response).contains("path does not refer to an object"));
     assert!(writes.is_empty());
+}
+
+/// Production Hyper uses `handle_put_async`, which prefetches segment HEADs
+/// into a path-keyed cache. A ranged manifest (Python `TestSloEnv`) names
+/// the same sub-SLO three times; the cache must not be consumed on first use.
+#[tokio::test]
+async fn async_put_reuses_head_for_duplicate_ranged_paths() {
+    let sub_slo_etag = md5_hex(b"sub-slo");
+    let writes: Arc<Mutex<Vec<CapturedPut>>> = Arc::new(Mutex::new(Vec::new()));
+    let writes_for_backend = Arc::clone(&writes);
+    let etag_for_backend = sub_slo_etag.clone();
+    let backend: AsyncNextFn = Arc::new(move |mut request: Request| {
+        let writes_for_backend = Arc::clone(&writes_for_backend);
+        let etag_for_backend = etag_for_backend.clone();
+        Box::pin(async move {
+            if request.method == "HEAD" && request.path == "/v1/a/c/submanifest" {
+                return sub_slo_head_response("physical-json-etag", 149, &etag_for_backend, 10);
+            }
+            if request.method == "PUT"
+                && request.path == "/v1/a/c/manifest"
+                && request.query_string.is_empty()
+            {
+                let body = request.body.materialize(u64::MAX).unwrap().to_vec();
+                writes_for_backend.lock().unwrap().push(CapturedPut {
+                    headers: request.headers,
+                    body,
+                });
+                return Response::new(201);
+            }
+            Response::new(404)
+        })
+    });
+
+    let manifest = json!([
+        {"path": "/c/submanifest", "etag": sub_slo_etag, "size_bytes": 10, "range": "-4"},
+        {"path": "/c/submanifest", "etag": sub_slo_etag, "size_bytes": 10, "range": "0-3"},
+        {"path": "/c/submanifest", "etag": sub_slo_etag, "size_bytes": 10, "range": "6-9"}
+    ]);
+    let body = serde_json::to_vec(&manifest).unwrap();
+    let mut headers = HeaderKeyDict::new();
+    headers.set("Content-Type", "application/json");
+    headers.set("Content-Length", body.len().to_string());
+    let request = Request {
+        method: "PUT".to_string(),
+        path: "/v1/a/c/manifest".to_string(),
+        query_string: "multipart-manifest=put".to_string(),
+        headers,
+        body: body.into(),
+    };
+
+    let mut response = Slo::new()
+        .handle_request_async(request, backend)
+        .await;
+    response.body.materialize(u64::MAX).unwrap();
+    assert_eq!(response.status, 201, "{}", body_string(&response));
+    let captured = writes.lock().unwrap().clone();
+    assert_eq!(
+        stored_manifest(&captured),
+        json!([
+            {"name": "/c/submanifest", "bytes": 10, "hash": sub_slo_etag, "range": "6-9", "sub_slo": true},
+            {"name": "/c/submanifest", "bytes": 10, "hash": sub_slo_etag, "range": "0-3", "sub_slo": true},
+            {"name": "/c/submanifest", "bytes": 10, "hash": sub_slo_etag, "range": "6-9", "sub_slo": true}
+        ])
+    );
 }

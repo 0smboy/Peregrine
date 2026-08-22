@@ -1325,7 +1325,11 @@ impl Slo {
         };
         let version = parts[0].clone().unwrap_or_default();
         let account = parts[1].clone().unwrap_or_default();
-        let mut heads: std::collections::HashMap<String, Response> =
+        // Cache HEAD status+headers per unique segment path. Response is not
+        // Clone (body may be a stream); a ranged SLO often names the same
+        // object several times (`TestSloEnv` ranged-manifest). Consuming the
+        // cache with `remove` 404s the second range of that path.
+        let mut heads: std::collections::HashMap<String, (u16, HeaderKeyDict)> =
             std::collections::HashMap::new();
         for e in entries {
             let Some(path) = e.get("path").and_then(|v| v.as_str()) else {
@@ -1333,20 +1337,28 @@ impl Slo {
             };
             let stored_path = format!("/{}", path.trim_start_matches('/'));
             let seg_path = format!("/{version}/{account}{stored_path}");
+            if heads.contains_key(&seg_path) {
+                continue;
+            }
             let mut head = req.clone_head();
             head.method = "HEAD".to_string();
             head.path = seg_path.clone();
             head.query_string = String::new();
             head.headers.remove("Content-Length");
-            heads.insert(seg_path, next(head).await);
+            let hr = next(head).await;
+            heads.insert(seg_path, (hr.status, hr.headers));
         }
         let heads = std::sync::Mutex::new(heads);
         let next_heads: NextFn = Arc::new(move |r| {
-            heads
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&r.path)
-                .unwrap_or_else(|| Response::error(404, "Segment Not Found"))
+            let guard = heads.lock().unwrap_or_else(|p| p.into_inner());
+            match guard.get(&r.path) {
+                Some((status, headers)) => {
+                    let mut response = Response::new(*status);
+                    response.headers = headers.clone();
+                    response
+                }
+                None => Response::error(404, "Segment Not Found"),
+            }
         });
         let built = validate_put_entries(&req, entries, &version, &account, &next_heads, &mut || {});
         finish_put_async(req, next, built).await
