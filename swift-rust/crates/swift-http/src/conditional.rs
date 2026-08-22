@@ -185,6 +185,11 @@ mod tests {
         // Last-Modified newer than If-Unmodified-Since -> 412
         let r = req(&[("If-Unmodified-Since", "Sat, 05 Nov 1994 08:49:37 GMT")]);
         assert_eq!(conditional_response_status(&r, &resp), Some(412));
+        // Functional tests send RFC 850 and asctime, not only IMF-fixdate.
+        let rfc850 = req(&[("If-Unmodified-Since", "Saturday, 05-Nov-94 08:49:37 GMT")]);
+        assert_eq!(conditional_response_status(&rfc850, &resp), Some(412));
+        let asctime = req(&[("If-Unmodified-Since", "Sat Nov 5 08:49:37 1994")]);
+        assert_eq!(conditional_response_status(&asctime, &resp), Some(412));
     }
 
     #[test]

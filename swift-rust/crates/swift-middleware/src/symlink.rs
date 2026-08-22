@@ -357,8 +357,9 @@ impl Symlink {
                         ),
                     ));
                 }
-                let new_req = build_traversal_req(&cur, &resp, &symlink_target, orig_req);
-                last_target_path = Some(new_req.path.clone());
+                let (new_req, quoted_path) =
+                    build_traversal_req(&cur, &resp, &symlink_target, orig_req);
+                last_target_path = Some(quoted_path);
                 // An extended symloop (e.g. from versioned_writes) is not
                 // counted against the limit.
                 if !config_true_value(resp.headers.get(SYMLOOP_EXTEND).unwrap_or("")) {
@@ -653,8 +654,9 @@ impl Symlink {
                         ),
                     ));
                 }
-                let new_req = build_traversal_req(&cur, &resp, &symlink_target, &orig_req);
-                last_target_path = Some(new_req.path.clone());
+                let (new_req, quoted_path) =
+                    build_traversal_req(&cur, &resp, &symlink_target, &orig_req);
+                last_target_path = Some(quoted_path);
                 if !config_true_value(resp.headers.get(SYMLOOP_EXTEND).unwrap_or("")) {
                     loop_count += 1;
                 }
@@ -1079,7 +1081,7 @@ fn build_traversal_req(
     resp: &Response,
     symlink_target: &str,
     orig_req: &Request,
-) -> Request {
+) -> (Request, String) {
     let parts = split_path(&cur.path, 2, 3, true).unwrap_or_default();
     let version = parts.first().and_then(|o| o.clone()).unwrap_or_default();
     let account_from_path = parts.get(1).and_then(|o| o.clone()).unwrap_or_default();
@@ -1089,18 +1091,16 @@ fn build_traversal_req(
         .map(str::to_string)
         .unwrap_or(account_from_path);
     let target = symlink_target.trim_start_matches('/');
-    let target_path = format!("/{version}/{account}/{target}");
-
-    // make_subrequest(orig_req.environ, path=..., method=req.method,
-    // headers=dict(req.headers)): base on the original request, adopt the
-    // current hop's method and headers, drop any storage-policy pin.
+    // Sysmeta is stored wsgi_quote'd (Content-Location keeps %20). Request.path
+    // is already-decoded, so the follow hop must unquote or object lookup 404s.
+    let quoted_path = format!("/{version}/{account}/{target}");
     let mut new_req = orig_req.clone_head();
     new_req.method = cur.method.clone();
-    new_req.path = target_path;
+    new_req.path = wsgi_unquote(&quoted_path);
     new_req.query_string = String::new();
     new_req.headers = cur.headers.clone();
     new_req.headers.remove("X-Backend-Storage-Policy-Index");
-    new_req
+    (new_req, quoted_path)
 }
 
 /// Port of `_validate_and_prep_request_headers`. Validates the
@@ -1469,6 +1469,34 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(body_bytes(&resp)),
             "Symlink cannot target itself"
+        );
+    }
+
+    #[test]
+    fn test_get_follows_quoted_symlink_target() {
+        // Stored sysmeta is wsgi_quote'd (`%20`); Request.path is decoded.
+        let mw = Symlink::default();
+        let mut link = Response::new(200);
+        link.headers.set(
+            TGT_OBJ_SYSMETA_SYMLINK_HDR,
+            "c2/dealde/l04%20011e%204c8df/flash.png",
+        );
+        let mut tgt = Response::with_body(200, b"png".to_vec());
+        tgt.headers.set("ETag", "abc");
+        let be = backend(vec![
+            ("GET", "/v1/a/c/link", link),
+            (
+                "GET",
+                "/v1/a/c2/dealde/l04 011e 4c8df/flash.png",
+                tgt,
+            ),
+        ]);
+        let resp = run(&mw, req("GET", "/v1/a/c/link", &[]), be);
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_bytes(&resp), b"png");
+        assert_eq!(
+            resp.headers.get("Content-Location"),
+            Some("/v1/a/c2/dealde/l04%20011e%204c8df/flash.png")
         );
     }
 

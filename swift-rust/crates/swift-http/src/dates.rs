@@ -64,35 +64,73 @@ pub fn http_date(epoch_secs: i64) -> String {
     )
 }
 
-/// Parse an RFC 1123 date (with tolerance for RFC 850 long day names)
-/// back to epoch seconds; `None` on anything unparseable.
-pub fn parse_http_date(value: &str) -> Option<i64> {
-    let value = value.trim();
-    // strip the day-of-week prefix through the comma if present
-    let rest = match value.split_once(',') {
-        Some((_, rest)) => rest.trim(),
-        None => value,
-    };
-    let mut parts = rest.split_whitespace();
-    let day: u32 = parts.next()?.parse().ok()?;
-    let month_name = parts.next()?;
-    let month = MONTHS.iter().position(|m| month_name.starts_with(m))? as u32 + 1;
-    let year: i64 = parts.next()?.parse().ok()?;
-    let year = if year < 70 {
+fn normalize_year(year: i64) -> i64 {
+    if year < 70 {
         year + 2000
     } else if year < 100 {
         year + 1900
     } else {
         year
-    };
-    let mut hms = parts.next()?.split(':');
+    }
+}
+
+fn month_num(name: &str) -> Option<u32> {
+    MONTHS
+        .iter()
+        .position(|m| name.eq_ignore_ascii_case(m) || name.starts_with(m))
+        .map(|i| i as u32 + 1)
+}
+
+fn hms_epoch(year: i64, month: u32, day: u32, time: &str) -> Option<i64> {
+    let mut hms = time.split(':');
     let h: i64 = hms.next()?.parse().ok()?;
     let m: i64 = hms.next()?.parse().ok()?;
     let s: i64 = hms.next()?.parse().ok()?;
-    if !((1..=31).contains(&day) && h < 24 && m < 60 && s < 61) {
+    if !((1..=31).contains(&day) && (1..=12).contains(&month) && h < 24 && m < 60 && s < 61) {
         return None;
     }
     Some(days_from_civil(year, month, day) * 86400 + h * 3600 + m * 60 + s)
+}
+
+/// Parse RFC 7231 HTTP-date: IMF-fixdate, RFC 850, or asctime.
+/// `None` on anything unparseable.
+///
+/// Functional tests send `If-Unmodified-Since` as RFC 850 (`%A, %d-%b-%y`)
+/// and asctime (`%a %b %d %H:%M:%S %Y`); only IMF-fixdate was accepted.
+pub fn parse_http_date(value: &str) -> Option<i64> {
+    let value = value.trim();
+    if let Some((_, rest)) = value.split_once(',') {
+        let rest = rest.trim();
+        let mut parts = rest.split_whitespace();
+        let first = parts.next()?;
+        let (day, month_name, year) = if first.contains('-') {
+            // RFC 850: `06-Nov-94 08:49:37 GMT`
+            let mut dmy = first.split('-');
+            let day: u32 = dmy.next()?.parse().ok()?;
+            let month_name = dmy.next()?;
+            let year: i64 = dmy.next()?.parse().ok()?;
+            (day, month_name, year)
+        } else {
+            // IMF-fixdate: `06 Nov 1994 08:49:37 GMT`
+            let day: u32 = first.parse().ok()?;
+            let month_name = parts.next()?;
+            let year: i64 = parts.next()?.parse().ok()?;
+            (day, month_name, year)
+        };
+        let month = month_num(month_name)?;
+        let time = parts.next()?;
+        hms_epoch(normalize_year(year), month, day, time)
+    } else {
+        // asctime: `Sun Nov  6 08:49:37 1994` (optional extra space before day)
+        let mut parts = value.split_whitespace();
+        let _dow = parts.next()?;
+        let month_name = parts.next()?;
+        let day: u32 = parts.next()?.parse().ok()?;
+        let time = parts.next()?;
+        let year: i64 = parts.next()?.parse().ok()?;
+        let month = month_num(month_name)?;
+        hms_epoch(normalize_year(year), month, day, time)
+    }
 }
 
 #[cfg(test)]
@@ -107,5 +145,24 @@ mod tests {
             assert_eq!(parse_http_date(&http_date(secs)), Some(secs));
         }
         assert_eq!(parse_http_date("garbage"), None);
+        let imf = parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT");
+        assert_eq!(
+            parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT"),
+            imf,
+            "RFC 850"
+        );
+        assert_eq!(
+            parse_http_date("Sun Nov  6 08:49:37 1994"),
+            imf,
+            "asctime padded day"
+        );
+        assert_eq!(
+            parse_http_date("Sun Nov 6 08:49:37 1994"),
+            imf,
+            "asctime unpadded day"
+        );
+        // Functional TestFileComparison.time_old_f2 / time_old_f3 shapes.
+        assert!(parse_http_date("Saturday, 21-Aug-26 12:00:00 GMT").is_some());
+        assert!(parse_http_date("Sat Aug 21 12:00:00 2026").is_some());
     }
 }

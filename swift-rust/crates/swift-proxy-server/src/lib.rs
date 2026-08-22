@@ -2470,6 +2470,11 @@ impl ProxyApp {
         if segs.len() < 3 || !segs[0].is_empty() || segs[1] != "v1" || segs[2].is_empty() {
             return swob_response(404);
         }
+        // `/v1/account//object` (empty container) is 404, not an account GET
+        // that would 403 against a foreign account name.
+        if segs.get(3) == Some(&"") {
+            return swob_response(404);
+        }
         let account = segs[2].to_string();
         let container = segs.get(3).map(|s| s.to_string()).filter(|s| !s.is_empty());
         let object = segs.get(4).map(|s| s.to_string()).filter(|s| !s.is_empty());
@@ -2687,6 +2692,9 @@ impl ProxyApp {
                 body: swift_http::Body::empty(),
             };
             let account = segs[2].to_string();
+            if segs.get(3) == Some(&"") {
+                return swob_response(404);
+            }
             let container = segs
                 .get(3)
                 .map(|s| s.to_string())
@@ -6702,6 +6710,20 @@ mod cors_tests {
             })
             .await;
         assert_ne!(empty_acct.status, 412, "empty-account object path must not be Bad URL");
+        let empty_cont = app
+            .handle_async(swift_http::AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/testa//testo".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            empty_cont.status, 404,
+            "empty-container object path must be 404, got {}",
+            empty_cont.status
+        );
         let info = app
             .handle_async(swift_http::AsyncRequest {
                 method: "GET".into(),

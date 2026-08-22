@@ -235,6 +235,31 @@ impl TempAuth {
             .set("Www-Authenticate", format!("Swift realm=\"{realm}\""));
         resp
     }
+
+    fn realm_from_path(path: &str) -> String {
+        let raw = path
+            .trim_start_matches('/')
+            .split('/')
+            .nth(1)
+            .unwrap_or("unknown");
+        // Python PATH_INFO is WSGI-quoted; Request.path is decoded. Quote so
+        // `Swift realm="AUTH_haxx%22%0A..."` matches TestAccount quoted WWW-Authenticate.
+        wsgi_quote_realm(raw)
+    }
+}
+
+/// `urllib.parse.quote(s, safe='/')` for the WWW-Authenticate realm.
+fn wsgi_quote_realm(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'/' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            b => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 fn hex_encode(data: &[u8]) -> String {
@@ -444,13 +469,9 @@ impl Middleware for TempAuth {
                 match self.validate_token(token) {
                     Some(groups) => groups,
                     None => {
-                        let realm = req
-                            .path
-                            .trim_start_matches('/')
-                            .split('/')
-                            .nth(1)
-                            .unwrap_or("unknown");
-                        return MwPrep::ShortCircuit(Self::unauthorized(realm));
+                        return MwPrep::ShortCircuit(Self::unauthorized(&Self::realm_from_path(
+                            &req.path,
+                        )));
                     }
                 }
             }
@@ -485,8 +506,27 @@ impl Middleware for TempAuth {
     fn handle(&self, mut req: Request, next: &NextFn) -> Response {
         match self.prepare(&mut req) {
             MwPrep::ShortCircuit(resp) => resp,
-            MwPrep::Continue => next(req),
+            MwPrep::Continue => {
+                let head = req.clone_head();
+                self.finish(&head, next(req))
+            }
         }
+    }
+
+    fn finish(&self, req: &Request, mut resp: Response) -> Response {
+        if resp.status == 401
+            && resp
+                .headers
+                .get("Www-Authenticate")
+                .map(|s| s.is_empty())
+                .unwrap_or(true)
+        {
+            resp.headers.set(
+                "Www-Authenticate",
+                format!("Swift realm=\"{}\"", Self::realm_from_path(&req.path)),
+            );
+        }
+        resp
     }
 }
 
@@ -686,6 +726,17 @@ mod tests {
         assert_eq!(
             denial.body.materialize(u64::MAX).unwrap(),
             expected_body.as_bytes()
+        );
+    }
+
+    #[test]
+    fn test_finish_quotes_www_authenticate_realm() {
+        let auth = TempAuth::new("http://127.0.0.1:8081");
+        let req = mk("GET", "/v1/AUTH_haxx\"\nContent-Length: 14", &[]);
+        let resp = auth.finish(&req, Response::new(401));
+        assert_eq!(
+            resp.headers.get("Www-Authenticate"),
+            Some("Swift realm=\"AUTH_haxx%22%0AContent-Length%3A%2014\"")
         );
     }
 
