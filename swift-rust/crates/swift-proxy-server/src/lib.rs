@@ -1428,6 +1428,69 @@ impl ProxyApp {
         Ok((endpoints, storage_policy_index))
     }
 
+    fn part_nodes(ring: &Ring, part: u32) -> Vec<Node> {
+        ring.get_part_nodes(part)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|n| Node {
+                ip: n.dev.ip.clone(),
+                port: n.dev.port,
+                device: n.dev.device.clone(),
+                handoff: false,
+            })
+            .collect()
+    }
+
+    /// Python `ContainerController._backend_requests`: round-robin
+    /// `csv_append` of account *primaries* (`get_part_nodes`) onto each
+    /// container replica's `X-Account-*` headers. `iter_nodes` includes
+    /// handoffs; a 404ing handoff as a replica's only account-update
+    /// target 404s that replica after creating the container DB
+    /// (PUT 404 / HEAD 204).
+    fn stamp_account_update_headers(
+        per_node: &mut [HeaderKeyDict],
+        account_part: u32,
+        account_primaries: &[Node],
+    ) {
+        if per_node.is_empty() {
+            return;
+        }
+        for (i, acct) in account_primaries.iter().enumerate() {
+            let headers = &mut per_node[i % per_node.len()];
+            headers.set("X-Account-Partition", account_part);
+            let host = format!("{}:{}", acct.ip, acct.port);
+            headers.set(
+                "X-Account-Host",
+                csv_append(headers.get("X-Account-Host"), &host),
+            );
+            headers.set(
+                "X-Account-Device",
+                csv_append(headers.get("X-Account-Device"), &acct.device),
+            );
+        }
+    }
+
+    fn container_write_headers(
+        &self,
+        base: &HeaderKeyDict,
+        container_part: u32,
+        account_part: u32,
+        stamp_account: bool,
+    ) -> (usize, Vec<HeaderKeyDict>) {
+        let node_number = self
+            .container_ring
+            .get_part_nodes(container_part)
+            .map(|n| n.len())
+            .unwrap_or(1)
+            .max(1);
+        let mut per_node = vec![base.clone(); node_number];
+        if stamp_account {
+            let primaries = Self::part_nodes(&self.account_ring, account_part);
+            Self::stamp_account_update_headers(&mut per_node, account_part, &primaries);
+        }
+        (node_number, per_node)
+    }
+
     /// NodeIter: primaries then handoffs, skipping error-limited nodes,
     /// bounded by request_node_count.
     fn iter_nodes(&self, ring: &Ring, part: u32) -> Vec<Node> {
@@ -3297,31 +3360,18 @@ impl ProxyApp {
                         }
                     }
                 }
-                // distribute account nodes across the container backend
-                // requests (the account-update side channel). Fan-out is sized
-                // to the container replica count (get_part_nodes), NOT the full
-                // primaries+handoffs node iterator — otherwise quorum is
-                // computed over 2R nodes and healthy primaries can fail to
-                // reach it (503 where Python 201). Handoffs are still used as
-                // fallback via the node iterator inside make_requests.
-                let account_nodes = self.iter_nodes(&self.account_ring, account_part);
-                let node_number = self
-                    .container_ring
-                    .get_part_nodes(container_part)
-                    .map(|n| n.len())
-                    .unwrap_or(1);
-                let mut per_node = Vec::with_capacity(node_number);
-                for i in 0..node_number {
-                    let mut headers = base.clone();
-                    if matches!(req.method.as_str(), "PUT" | "DELETE") && !account_nodes.is_empty()
-                    {
-                        let acct = &account_nodes[i % account_nodes.len()];
-                        headers.set("X-Account-Host", format!("{}:{}", acct.ip, acct.port));
-                        headers.set("X-Account-Partition", account_part);
-                        headers.set("X-Account-Device", &acct.device);
-                    }
-                    per_node.push(headers);
-                }
+                // Account-update side channel: Python `_backend_requests`
+                // stamps account *primaries* (`get_part_nodes`) by csv_append
+                // round-robin. Fan-out is sized to the container replica
+                // count, NOT the primaries+handoffs iterator — otherwise
+                // quorum is computed over 2R nodes (503 where Python 201).
+                // Handoffs are still the fallback inside make_requests.
+                let (node_number, per_node) = self.container_write_headers(
+                    &base,
+                    container_part,
+                    account_part,
+                    matches!(req.method.as_str(), "PUT" | "DELETE"),
+                );
                 let cont_nodes = self.iter_nodes(&self.container_ring, container_part);
                 // _clear_container_info_cache: POST and DELETE clear the
                 // cached container info BEFORE the backend fan-out
@@ -5672,6 +5722,14 @@ pub(crate) fn merge_sharded_object_listings(
     merged
 }
 
+/// Python `swift.common.utils.csv_append`.
+fn csv_append(existing: Option<&str>, item: &str) -> String {
+    match existing {
+        Some(s) if !s.is_empty() => format!("{s},{item}"),
+        _ => item.to_string(),
+    }
+}
+
 pub(crate) fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -7763,5 +7821,52 @@ mod shard_listing_fanout_tests {
         let fallback = prefer_listing_state_ranges(&only_found);
         assert_eq!(fallback.len(), 1);
         assert_eq!(fallback[0]["name"], ".shards/f");
+    }
+}
+
+#[cfg(test)]
+mod account_update_headers_tests {
+    use super::*;
+
+    fn node(device: &str, port: u32) -> Node {
+        Node {
+            ip: "10.0.0.1".into(),
+            port,
+            device: device.into(),
+            handoff: false,
+        }
+    }
+
+    #[test]
+    fn csv_append_round_robin_matches_python_backend_requests() {
+        let mut per_node = vec![HeaderKeyDict::new(); 3];
+        let primaries = vec![node("sda", 1000), node("sdb", 1001), node("sdc", 1002)];
+        ProxyApp::stamp_account_update_headers(&mut per_node, 7, &primaries);
+        assert_eq!(per_node[0].get("X-Account-Host"), Some("10.0.0.1:1000"));
+        assert_eq!(per_node[0].get("X-Account-Device"), Some("sda"));
+        assert_eq!(per_node[1].get("X-Account-Host"), Some("10.0.0.1:1001"));
+        assert_eq!(per_node[1].get("X-Account-Device"), Some("sdb"));
+        assert_eq!(per_node[2].get("X-Account-Host"), Some("10.0.0.1:1002"));
+        assert_eq!(per_node[2].get("X-Account-Device"), Some("sdc"));
+        assert_eq!(per_node[0].get("X-Account-Partition"), Some("7"));
+    }
+
+    #[test]
+    fn extra_account_primary_csv_appends_onto_first_replica() {
+        let mut per_node = vec![HeaderKeyDict::new(); 3];
+        let primaries = vec![
+            node("sda", 1000),
+            node("sdb", 1001),
+            node("sdc", 1002),
+            node("sdd", 1003),
+        ];
+        ProxyApp::stamp_account_update_headers(&mut per_node, 7, &primaries);
+        assert_eq!(
+            per_node[0].get("X-Account-Host"),
+            Some("10.0.0.1:1000,10.0.0.1:1003")
+        );
+        assert_eq!(per_node[0].get("X-Account-Device"), Some("sda,sdd"));
+        assert_eq!(per_node[1].get("X-Account-Device"), Some("sdb"));
+        assert_eq!(per_node[2].get("X-Account-Device"), Some("sdc"));
     }
 }

@@ -2279,23 +2279,8 @@ impl ProxyApp {
                 }
             }
         }
-        let account_nodes = self.iter_nodes(&self.account_ring, account_part);
-        let node_number = self
-            .container_ring
-            .get_part_nodes(container_part)
-            .map(|n| n.len())
-            .unwrap_or(1);
-        let mut per_node = Vec::with_capacity(node_number);
-        for i in 0..node_number {
-            let mut headers = base.clone();
-            if !account_nodes.is_empty() {
-                let acct = &account_nodes[i % account_nodes.len()];
-                headers.set("X-Account-Host", format!("{}:{}", acct.ip, acct.port));
-                headers.set("X-Account-Partition", account_part);
-                headers.set("X-Account-Device", &acct.device);
-            }
-            per_node.push(headers);
-        }
+        let (node_number, per_node) =
+            self.container_write_headers(&base, container_part, account_part, true);
         let cache_key = format!("{account}/{container}");
         let cont_nodes = self.iter_nodes(&self.container_ring, container_part);
         let path = format!("/{}/{}", percent_encode(account), percent_encode(container));
@@ -2669,23 +2654,8 @@ impl ProxyApp {
         }
         let mut base = self.backend_headers(&req, true, "container");
         base.set("X-Timestamp", Timestamp::now().internal());
-        let account_nodes = self.iter_nodes(&self.account_ring, account_part);
-        let node_number = self
-            .container_ring
-            .get_part_nodes(container_part)
-            .map(|n| n.len())
-            .unwrap_or(1);
-        let mut per_node = Vec::with_capacity(node_number);
-        for i in 0..node_number {
-            let mut headers = base.clone();
-            if !account_nodes.is_empty() {
-                let acct = &account_nodes[i % account_nodes.len()];
-                headers.set("X-Account-Host", format!("{}:{}", acct.ip, acct.port));
-                headers.set("X-Account-Partition", account_part);
-                headers.set("X-Account-Device", &acct.device);
-            }
-            per_node.push(headers);
-        }
+        let (node_number, per_node) =
+            self.container_write_headers(&base, container_part, account_part, true);
         let cache_key = format!("{account}/{container}");
         self.info_cache.clear_container(&cache_key);
         let cont_nodes = self.iter_nodes(&self.container_ring, container_part);

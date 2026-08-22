@@ -80,6 +80,32 @@ fn single_device_ring(port: u32) -> Ring {
     Ring::new(data, hash_cfg())
 }
 
+fn replica_ring(ports: &[u32], devices: &[&str]) -> Ring {
+    let devs: Vec<Option<RingDevice>> = ports
+        .iter()
+        .zip(devices.iter())
+        .enumerate()
+        .map(|(i, (port, device))| {
+            Some(RingDevice {
+                id: i as u64,
+                region: 1,
+                zone: (i as u64) + 1,
+                ip: "127.0.0.1".to_string(),
+                port: *port,
+                replication_ip: None,
+                replication_port: None,
+                device: (*device).to_string(),
+                weight: 100.0,
+                meta: String::new(),
+                extra: serde_json::Map::new(),
+            })
+        })
+        .collect();
+    let replica2part2dev_id: Vec<Vec<u32>> = (0..ports.len() as u32).map(|i| vec![i]).collect();
+    let data = RingData::from_parts(devs, 32, replica2part2dev_id);
+    Ring::new(data, hash_cfg())
+}
+
 fn http(
     addr: std::net::SocketAddr,
     method: &str,
@@ -421,6 +447,94 @@ fn test_container_put_rechecks_account_after_successful_autocreate() {
         0,
         "failed refreshed account_info must stop container fan-out"
     );
+}
+
+#[test]
+fn test_container_put_succeeds_when_one_account_replica_404s() {
+    // RSAIO-style replica=3: AUTH exists on two devices, the third 404s.
+    // Python `_backend_requests` still reaches write quorum (201).
+    let tmp = std::env::temp_dir().join(format!(
+        "swift-proxy-acct-partial-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    for dev in ["sda1", "sda2", "sda3"] {
+        std::fs::create_dir_all(tmp.join(dev)).unwrap();
+    }
+
+    let acct_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let acct_addr = acct_listener.local_addr().unwrap();
+    let acct_config = swift_account_server::AccountServerConfig {
+        devices: tmp.clone(),
+        mount_check: false,
+        hash_config: hash_cfg(),
+        policies: vec![(0, "Policy-0".to_string())],
+        fixed_created_at: None,
+    };
+    std::thread::spawn(move || swift_account_server::serve(acct_listener, acct_config));
+
+    let cont_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let cont_addr = cont_listener.local_addr().unwrap();
+    let cont_config = swift_container_server::ContainerServerConfig {
+        devices: tmp.clone(),
+        mount_check: false,
+        hash_config: hash_cfg(),
+        policies: vec![(0, "Policy-0".to_string())],
+        default_policy_index: 0,
+        fixed_created_at: None,
+    };
+    std::thread::spawn(move || swift_container_server::serve(cont_listener, cont_config));
+
+    let account_ring = replica_ring(
+        &[
+            u32::from(acct_addr.port()),
+            u32::from(acct_addr.port()),
+            u32::from(acct_addr.port()),
+        ],
+        &["sda1", "sda2", "sda3"],
+    );
+    let (account_part, _) = account_ring.get_nodes("AUTH_e2e", None, None).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    for device in ["sda1", "sda2"] {
+        let (status, _, _) = http_with_headers(
+            acct_addr,
+            "PUT",
+            &format!("/{device}/{account_part}/AUTH_e2e"),
+            &[("X-Timestamp", "1751500000.00000")],
+            "",
+        );
+        assert_eq!(status, 201, "account setup on {device}");
+    }
+
+    let proxy_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let app = Arc::new(ProxyApp::new(
+        account_ring,
+        replica_ring(
+            &[
+                u32::from(cont_addr.port()),
+                u32::from(cont_addr.port()),
+                u32::from(cont_addr.port()),
+            ],
+            &["sda1", "sda2", "sda3"],
+        ),
+        ProxyConfig {
+            account_autocreate: false,
+            ..Default::default()
+        },
+    ));
+    std::thread::spawn(move || swift_proxy_server::serve(proxy_listener, app));
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    let (status, _, _) = http(proxy_addr, "PUT", "/v1/AUTH_e2e/box", "");
+    assert_eq!(
+        status, 201,
+        "one account replica 404 must not fail container PUT"
+    );
+    let (status, _, _) = http(proxy_addr, "HEAD", "/v1/AUTH_e2e/box", "");
+    assert_eq!(status, 204);
+
+    std::fs::remove_dir_all(&tmp).unwrap();
 }
 
 #[test]

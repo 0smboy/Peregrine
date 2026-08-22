@@ -123,12 +123,8 @@ fn main() {
         Arc::clone(&logger),
     );
 
-    let swift_conf_path = std::env::var("SWIFT_CONF").unwrap_or_else(|_| {
-        format!(
-            "{}/swift.conf",
-            std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string())
-        )
-    });
+    let swift_dir = resolve_swift_dir(&conf);
+    let swift_conf_path = resolve_swift_conf_path(&conf);
     let swift_conf = parse_conf_file(&swift_conf_path).unwrap_or_else(|e| {
         logger.error(&format!("could not read {swift_conf_path}: {e}"));
         std::process::exit(1);
@@ -141,8 +137,6 @@ fn main() {
         logger.error(&format!("bad swift.conf storage policies: {e}"));
         std::process::exit(1);
     });
-
-    let swift_dir = std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string());
 
     // Storage policies from swift.conf: EC schemes (by index) and the
     // name→index table for resolving container X-Storage-Policy.
@@ -2073,6 +2067,46 @@ fn configured_filter_names(conf: &SwiftConfig, has_tempauth: bool) -> Vec<&'stat
     out
 }
 
+/// Python `conf.get('swift_dir', '/etc/swift')` from the launched server
+/// conf. Env `SWIFT_DIR` is an override only when the conf omits the key.
+/// Defaulting to `/etc/swift` *before* reading conf made RSAIO `:8081`
+/// load production rings/hash whenever a deploy forgot the env (native
+/// container PUT 404 / HEAD 204).
+fn resolve_swift_dir(conf: &SwiftConfig) -> String {
+    let lookup = |section: &str| {
+        conf.get(section, "swift_dir")
+            .ok()
+            .flatten()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    // ConfigParser.get(section) falls back to DEFAULT keys only when
+    // `section` exists. `get("DEFAULT", ...)` does not read the defaults
+    // map, so look up through app:proxy-server (or any real section).
+    lookup("app:proxy-server")
+        .or_else(|| lookup("DEFAULT"))
+        .or_else(|| {
+            conf.section_names()
+                .into_iter()
+                .find_map(|name| lookup(name))
+        })
+        .or_else(|| {
+            std::env::var("SWIFT_DIR")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "/etc/swift".to_string())
+}
+
+fn resolve_swift_conf_path(conf: &SwiftConfig) -> String {
+    std::env::var("SWIFT_CONF")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("{}/swift.conf", resolve_swift_dir(conf)))
+}
+
 /// Build proxy `container_sync` middleware from `[filter:container_sync]`.
 fn build_container_sync(
     conf: &SwiftConfig,
@@ -3148,6 +3182,31 @@ fn build_tempauth(
 mod startup_policy_tests {
     use super::*;
     use swift_ring::RingDevice;
+
+    #[test]
+    fn swift_dir_comes_from_proxy_conf_not_etc_swift_default() {
+        let conf = SwiftConfig::parse_lenient(
+            "[DEFAULT]\nswift_dir = /etc/rsaio\n[app:proxy-server]\nbind_port = 8081\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(resolve_swift_dir(&conf), "/etc/rsaio");
+        if std::env::var("SWIFT_CONF").is_err() {
+            assert_eq!(resolve_swift_conf_path(&conf), "/etc/rsaio/swift.conf");
+        }
+    }
+
+    #[test]
+    fn swift_dir_falls_back_to_app_section() {
+        let conf = SwiftConfig::parse_lenient(
+            "[app:proxy-server]\nswift_dir = /opt/saio/swift\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(resolve_swift_dir(&conf), "/opt/saio/swift");
+    }
 
     fn no_tempurl_keys() -> Arc<dyn swift_middleware::KeyProvider> {
         Arc::new(swift_middleware::ClosureKeyProvider::new(|_, _| Vec::new()))
