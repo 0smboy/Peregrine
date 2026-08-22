@@ -88,12 +88,27 @@ fn percent_decode_component(raw: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// `urllib.parse.quote(s, safe='/')` / Python `wsgi_quote` with default
+/// `safe='/'`. COPY rewrites `X-Copy-From` through this so a later unquote
+/// keeps a literal `%2F` in the object name instead of turning it into `/`.
+fn wsgi_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'/' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            b => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Parse a `/<container>/<object>` header value into its two parts.
 ///
 /// Python `copy.py` does `split_path(unquote(copy_from), 1, 2, True)`.
-/// Request.path is already decoded; if we keep the quoted object name here
-/// the proxy `percent_encode_path`s it again and the source GET 404s
-/// (`object%20name` → `object%2520name`).
+/// `X-Copy-From` is stored `wsgi_quote`d so `%` in the object name survives
+/// the unquote (`%2F` stays the three characters `%2F`, not a slash).
 fn parse_container_object(value: &str) -> Option<(String, String)> {
     let decoded = percent_decode_component(value);
     let v = decoded.strip_prefix('/').unwrap_or(decoded.as_str());
@@ -318,9 +333,12 @@ impl Copy {
             .unwrap_or_else(|| account.clone());
         req.method = "PUT".to_string();
         req.path = format!("/{version}/{dst_account}/{dst_container}/{dst_object}");
+        // Python `handle_COPY`: `req.headers['X-Copy-From'] = wsgi_quote(source)`
+        // so a later `unquote` + `split_path(..., rest_with_last=True)` keeps
+        // a literal `%2F` in the object name (`TestFile.testCopy`).
         req.headers
-            .set("X-Copy-From", format!("/{container}/{object}"));
-        req.headers.set("X-Copy-From-Account", account);
+            .set("X-Copy-From", wsgi_quote(&format!("/{container}/{object}")));
+        req.headers.set("X-Copy-From-Account", wsgi_quote(&account));
         req.headers.remove("Destination");
         req.headers.remove("Destination-Account");
         Ok(req)
@@ -574,6 +592,28 @@ mod tests {
             calls[0].path,
             "/v1/AUTH_test/srcc/object name with %-sign 🙂"
         );
+    }
+
+    #[test]
+    fn test_copy_method_keeps_percent_encoded_slash_in_object_name() {
+        // TestFile.testCopy source: 'dealde%2Fl04 011e%204c8df/flash.png'
+        // Python wsgi_quote's X-Copy-From so unquote does not turn %2F into /.
+        let (log, app) = backend(b"png", "image/png");
+        let c = Copy::new();
+        let r = req(
+            "COPY",
+            "/v1/AUTH_test/srcc/dealde%2Fl04 011e%204c8df/flash.png",
+            &[("Destination", "/dstc/dsto")],
+        );
+        let resp = c.handle(r, &app);
+        assert_eq!(resp.status, 201);
+        let calls = log.lock().unwrap();
+        assert_eq!(
+            calls[0].path,
+            "/v1/AUTH_test/srcc/dealde%2Fl04 011e%204c8df/flash.png",
+            "GET source must keep literal %2F and the real slash"
+        );
+        assert_eq!(calls[1].path, "/v1/AUTH_test/dstc/dsto");
     }
 
     #[test]

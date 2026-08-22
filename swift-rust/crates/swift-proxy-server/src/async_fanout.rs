@@ -764,6 +764,7 @@ impl ProxyApp {
                     let content_length =
                         resp_header(&headers, "content-length").and_then(|v| v.parse::<u64>().ok());
                     let mut reader = BufReader::new(stream);
+                    let saved = leftover.clone();
                     let body = leftover_then_read(
                         &mut leftover,
                         &mut reader,
@@ -771,7 +772,7 @@ impl ProxyApp {
                         node_timeout,
                     )
                     .await
-                    .unwrap_or_default();
+                    .unwrap_or(saved);
                     results.push(BackendResponse {
                         status,
                         reason,
@@ -1925,8 +1926,12 @@ impl ProxyApp {
         req: swift_http::Request,
         account: &str,
     ) -> Response {
-        if !self.config.allow_account_management {
-            return swob_response(405);
+        // Python account.py POST is always allowed; allow_account_management
+        // only removes PUT/DELETE from the method set.
+        if let Err(e) = swift_core::constraints::check_metadata(req.headers.iter(), "account") {
+            let mut r = Response::with_body(400, e.0);
+            r.headers.set("Content-Type", "text/plain");
+            return r;
         }
         let Ok((part, _)) = self.account_ring.get_nodes(account, None, None) else {
             return swob_response(503);
@@ -1979,6 +1984,11 @@ impl ProxyApp {
         account: &str,
         container: &str,
     ) -> Response {
+        if let Err(e) = swift_core::constraints::check_metadata(req.headers.iter(), "container") {
+            let mut r = Response::with_body(400, e.0);
+            r.headers.set("Content-Type", "text/plain");
+            return r;
+        }
         let Ok((container_part, _)) = self
             .container_ring
             .get_nodes(account, Some(container), None)
@@ -2021,6 +2031,11 @@ impl ProxyApp {
         account: &str,
         container: &str,
     ) -> Response {
+        if let Err(e) = swift_core::constraints::check_metadata(req.headers.iter(), "container") {
+            let mut r = Response::with_body(400, e.0);
+            r.headers.set("Content-Type", "text/plain");
+            return r;
+        }
         let Ok((container_part, _)) = self
             .container_ring
             .get_nodes(account, Some(container), None)

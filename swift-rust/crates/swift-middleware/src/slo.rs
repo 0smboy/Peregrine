@@ -66,7 +66,7 @@ use swift_http::{
     MAX_CONTROL_BODY,
 };
 
-use crate::{AsyncNextFn, Middleware, NextFn};
+use crate::{AsyncNextFn, Middleware, MwPrep, NextFn};
 
 /// `max_manifest_size` (Python slo.py default): the client manifest on a
 /// `?multipart-manifest=put` may not exceed this.
@@ -2424,6 +2424,16 @@ fn probe_async_delete_write_acl(
 }
 
 impl Middleware for Slo {
+    fn prepare(&self, req: &mut Request) -> MwPrep {
+        if matches!(req.method.as_str(), "GET" | "HEAD")
+            && split_path(&req.path, 4, 4, true).is_ok()
+            && req.param("multipart-manifest").as_deref() != Some("get")
+        {
+            ignore_range(&mut req.headers, SLO_HEADER);
+        }
+        MwPrep::Continue
+    }
+
     fn intercepts_request(&self, req: &Request) -> bool {
         if split_path(&req.path, 4, 4, true).is_err() {
             return false;

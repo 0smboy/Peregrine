@@ -51,7 +51,7 @@ use swift_http::{
 };
 
 use crate::slo::{dlo_etag_and_size, normalize_etag};
-use crate::{AsyncNextFn, Middleware, NextFn};
+use crate::{AsyncNextFn, Middleware, MwPrep, NextFn};
 
 /// `swift.common.constraints.CONTAINER_LISTING_LIMIT`.
 const CONTAINER_LISTING_LIMIT: usize = 10000;
@@ -1155,6 +1155,20 @@ fn validate_x_object_manifest_header(req: &Request) -> Option<Response> {
 }
 
 impl Middleware for DynamicLargeObject {
+    fn prepare(&self, req: &mut Request) -> MwPrep {
+        // Stamp ignore-range *before* the async app GET. intercepts_response
+        // reassembly's first `next()` is the already-completed backend
+        // response: without this stamp a client Range on a tiny manifest
+        // 416s at the object server and DLO never sees X-Object-Manifest.
+        if matches!(req.method.as_str(), "GET" | "HEAD")
+            && split_path(&req.path, 4, 4, true).is_ok()
+            && req.param("multipart-manifest").as_deref() != Some("get")
+        {
+            update_ignore_range_header(&mut req.headers, X_OBJECT_MANIFEST);
+        }
+        MwPrep::Continue
+    }
+
     fn intercepts_request(&self, req: &Request) -> bool {
         req.method == "PUT"
             && req.headers.get(X_OBJECT_MANIFEST).is_some()
@@ -1256,6 +1270,22 @@ mod tests {
             })
             .collect();
         serde_json::to_vec(&items).unwrap()
+    }
+
+    #[test]
+    fn test_prepare_stamps_ignore_range_on_get() {
+        let dlo = DynamicLargeObject::new();
+        let mut req = get_req("/v1/a/c/manifest", Some("bytes=100-200"));
+        assert!(matches!(dlo.prepare(&mut req), crate::MwPrep::Continue));
+        assert_eq!(
+            req.headers.get(IGNORE_RANGE_HDR),
+            Some(X_OBJECT_MANIFEST)
+        );
+        // Raw-manifest GET must still honour Range on the stored object.
+        let mut raw = get_req("/v1/a/c/manifest", Some("bytes=0-0"));
+        raw.query_string = "multipart-manifest=get".into();
+        assert!(matches!(dlo.prepare(&mut raw), crate::MwPrep::Continue));
+        assert!(raw.headers.get(IGNORE_RANGE_HDR).is_none());
     }
 
     fn get_req(path: &str, range: Option<&str>) -> Request {

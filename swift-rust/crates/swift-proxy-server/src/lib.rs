@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use swift_core::config::config_true_value;
-use swift_core::timestamp::Timestamp;
+use swift_core::timestamp::{normalize_delete_at_timestamp, Timestamp};
 use swift_http::{
     split_path, HeaderKeyDict, Request, Response, AsyncRequest, AsyncService,
 };
@@ -2620,9 +2620,12 @@ impl ProxyApp {
                     .unwrap_or_else(|| account.clone());
                 req.method = "PUT".into();
                 req.path = format!("/v1/{dst_account}/{dst_c}/{dst_o}");
+                req.headers.set(
+                    "X-Copy-From",
+                    percent_encode_path(&format!("/{container}/{object}")),
+                );
                 req.headers
-                    .set("X-Copy-From", format!("/{container}/{object}"));
-                req.headers.set("X-Copy-From-Account", account.clone());
+                    .set("X-Copy-From-Account", percent_encode_path(&account));
                 req.headers.remove("Destination");
                 req.headers.remove("Destination-Account");
                 if let Some(denied) = self
@@ -2722,6 +2725,10 @@ impl ProxyApp {
                 };
                 req.body = body;
             }
+            let swift_owner = req
+                .headers
+                .get("X-Backend-Swift-Owner")
+                .is_some_and(config_true_value);
             return match (req.method.as_str(), container.as_deref(), object.as_deref()) {
                 ("GET" | "HEAD", Some(c), Some(o)) => {
                     let (c, o) = (c.to_string(), o.to_string());
@@ -2733,14 +2740,26 @@ impl ProxyApp {
                 }
                 ("GET" | "HEAD", Some(c), None) => {
                     let c = c.to_string();
-                    self.container_get_head_async(req, &account, &c).await
+                    finish_container_resp(
+                        swift_owner,
+                        self.container_get_head_async(req, &account, &c).await,
+                    )
                 }
                 ("POST", Some(c), None) => {
                     let c = c.to_string();
-                    self.container_post_async(req, &account, &c).await
+                    finish_container_resp(
+                        swift_owner,
+                        self.container_post_async(req, &account, &c).await,
+                    )
                 }
-                ("GET" | "HEAD", None, _) => self.account_get_head_async(req, &account).await,
-                ("POST", None, _) => self.account_post_async(req, &account).await,
+                ("GET" | "HEAD", None, _) => finish_account_resp(
+                    swift_owner,
+                    self.account_get_head_async(req, &account).await,
+                ),
+                ("POST", None, _) => finish_account_resp(
+                    swift_owner,
+                    self.account_post_async(req, &account).await,
+                ),
                 ("DELETE", Some(c), Some(o)) => {
                     let (c, o) = (c.to_string(), o.to_string());
                     self.object_delete_async(&mut req, &account, &c, &o).await
@@ -2752,9 +2771,15 @@ impl ProxyApp {
                 ("DELETE", None, _) => self.account_delete_async(req, &account).await,
                 ("PUT", Some(c), None) => {
                     let c = c.to_string();
-                    self.container_put_async(req, &account, &c).await
+                    finish_container_resp(
+                        swift_owner,
+                        self.container_put_async(req, &account, &c).await,
+                    )
                 }
-                ("PUT", None, _) => self.account_put_async(req, &account).await,
+                ("PUT", None, _) => finish_account_resp(
+                    swift_owner,
+                    self.account_put_async(req, &account).await,
+                ),
                 _ => swob_response(405),
             };
         }
@@ -2911,9 +2936,12 @@ impl ProxyApp {
         else {
             return swob_response(503);
         };
+        if let Some(err) = check_object_creation(req, object) {
+            return err;
+        }
         if let Err(e) = swift_core::constraints::check_metadata(req.headers.iter(), "object") {
             let mut r = Response::with_body(400, e.0);
-            r.headers.set("Content-Type", "text/html; charset=UTF-8");
+            r.headers.set("Content-Type", "text/plain");
             return r;
         }
         if object.len() as i64 > swift_core::constraints::MAX_OBJECT_NAME_LENGTH {
@@ -3001,8 +3029,10 @@ impl ProxyApp {
         if let Some(etag) = resp.headers.get("ETag").map(str::to_string) {
             resp.headers.set("ETag", etag.trim_matches('"'));
         }
-        resp.headers
-            .set("Last-Modified", swift_http::http_date(put_ts.ceil()));
+        if (200..300).contains(&resp.status) {
+            resp.headers
+                .set("Last-Modified", swift_http::http_date(put_ts.ceil()));
+        }
         resp
     }
 
@@ -5283,6 +5313,124 @@ fn text_response(status: u16, body: &str) -> Response {
     resp
 }
 
+fn constraint_plain(status: u16, body: &str) -> Response {
+    let mut resp = Response::with_body(status, body.as_bytes().to_vec());
+    resp.headers.set("Content-Type", "text/plain");
+    resp
+}
+
+fn finish_account_resp(swift_owner: bool, mut resp: Response) -> Response {
+    expose_account_acl_header(&mut resp);
+    strip_owner_headers(&mut resp, swift_owner);
+    resp
+}
+
+fn finish_container_resp(swift_owner: bool, mut resp: Response) -> Response {
+    strip_owner_headers(&mut resp, swift_owner);
+    resp
+}
+
+/// Python `int()`-like parse used by `check_delete_headers`.
+fn parse_int_like(s: &str) -> Option<f64> {
+    let t = s.trim();
+    let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    t.parse::<f64>().ok()
+}
+
+/// Port of `swift.common.constraints.check_delete_headers` for the proxy
+/// PUT path. Python runs this in `check_object_creation` *before* the
+/// backend 100-continue handshake, so a 400 body is never dropped.
+fn apply_check_delete_headers(req: &mut Request, now: f64) -> Result<(), Response> {
+    let backend_replication = req
+        .headers
+        .get("X-Backend-Replication")
+        .is_some_and(config_true_value);
+    if let Some(raw) = req.headers.get("X-Delete-After").map(str::to_string) {
+        let Some(after) = parse_int_like(&raw) else {
+            return Err(constraint_plain(400, "Non-integer X-Delete-After"));
+        };
+        let actual = normalize_delete_at_timestamp(now + after, false);
+        if actual.parse::<i64>().unwrap_or(0) as f64 <= now {
+            return Err(constraint_plain(400, "X-Delete-After in past"));
+        }
+        req.headers.set("X-Delete-At", actual);
+        req.headers.remove("X-Delete-After");
+    }
+    if let Some(raw) = req.headers.get("X-Delete-At").map(str::to_string) {
+        let Some(value) = parse_int_like(&raw) else {
+            return Err(constraint_plain(400, "Non-integer X-Delete-At"));
+        };
+        let normalized = normalize_delete_at_timestamp(value, false);
+        let x_delete_at = normalized.parse::<i64>().unwrap_or(0);
+        if (x_delete_at as f64) <= now && !backend_replication {
+            return Err(constraint_plain(400, "X-Delete-At in past"));
+        }
+        req.headers.set("X-Delete-At", normalized);
+    }
+    Ok(())
+}
+
+/// Proxy half of Python `check_object_creation` (length / transfer-encoding
+/// / delete-at). Content-Type is not required here: functional tests PUT
+/// without it and expect 201, matching the object-server default.
+fn check_object_creation(req: &mut Request, object_name: &str) -> Option<Response> {
+    if object_name.len() as i64 > swift_core::constraints::MAX_OBJECT_NAME_LENGTH {
+        return Some(constraint_plain(
+            400,
+            &format!(
+                "Object name length of {} longer than {}",
+                object_name.len(),
+                swift_core::constraints::MAX_OBJECT_NAME_LENGTH
+            ),
+        ));
+    }
+    let te = req.headers.get("Transfer-Encoding").map(str::to_string);
+    let chunked = if let Some(te) = te.as_deref() {
+        let encodings: Vec<&str> = te
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if encodings.len() > 1 {
+            return Some(constraint_plain(
+                501,
+                "Unsupported Transfer-Coding header value specified in Transfer-Encoding header",
+            ));
+        }
+        match encodings.last() {
+            Some(last) if last.eq_ignore_ascii_case("chunked") => true,
+            Some(_) => {
+                return Some(constraint_plain(
+                    400,
+                    "Invalid Transfer-Encoding header value",
+                ))
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+    if let Some(cl) = req.headers.get("Content-Length") {
+        if !chunked {
+            let Some(n) = parse_int_like(cl) else {
+                return Some(constraint_plain(400, "Invalid Content-Length header value"));
+            };
+            if n as i64 > swift_core::constraints::MAX_FILE_SIZE {
+                return Some(text_response(413, "Your request is too large."));
+            }
+        }
+    } else if !chunked {
+        return Some(constraint_plain(411, "Missing Content-Length header."));
+    }
+    if let Err(resp) = apply_check_delete_headers(req, Timestamp::now().as_secs_f64()) {
+        return Some(resp);
+    }
+    None
+}
+
 /// The synthesized empty-account response for autocreate accounts
 /// (`account_listing_response` with a `FakeAccountBroker`).
 pub(crate) fn synthesized_account_listing(req: &Request) -> Response {
@@ -7198,6 +7346,15 @@ mod p1a_wiring_tests {
                 "{method}"
             );
         }
+        // POST (metadata) stays allowed when account management is off.
+        let post = gated.handle(Request {
+            method: "POST".to_string(),
+            path: "/v1/AUTH_test".to_string(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        });
+        assert_ne!(post.status, 405, "account POST must not 405: {}", post.status);
         // When enabled, the gate is open: unreachable backends yield 503, not 405.
         let open = Arc::new(ProxyApp::new(
             ring(0),
@@ -7219,6 +7376,60 @@ mod p1a_wiring_tests {
             resp.status, 405,
             "enabled path must not 405: {}",
             resp.status
+        );
+    }
+
+    fn req_with(headers: &[(&str, &str)]) -> Request {
+        let mut h = HeaderKeyDict::new();
+        for (k, v) in headers {
+            h.set(k, v);
+        }
+        Request {
+            method: "PUT".into(),
+            path: "/v1/a/c/o".into(),
+            query_string: String::new(),
+            headers: h,
+            body: swift_http::Body::empty(),
+        }
+    }
+
+    #[test]
+    fn check_object_creation_delete_at_bodies() {
+        let mut bad = req_with(&[("Content-Length", "0"), ("X-Delete-At", "*")]);
+        let mut err = check_object_creation(&mut bad, "o").unwrap();
+        assert_eq!(err.status, 400);
+        assert_eq!(
+            String::from_utf8_lossy(err.body.materialize(u64::MAX).unwrap()),
+            "Non-integer X-Delete-At"
+        );
+        let mut past = req_with(&[("Content-Length", "0"), ("X-Delete-At", "0")]);
+        let mut err = check_object_creation(&mut past, "o").unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(err.body.materialize(u64::MAX).unwrap()),
+            "X-Delete-At in past"
+        );
+        let mut after = req_with(&[("Content-Length", "0"), ("X-Delete-After", "*")]);
+        let mut err = check_object_creation(&mut after, "o").unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(err.body.materialize(u64::MAX).unwrap()),
+            "Non-integer X-Delete-After"
+        );
+        let mut missing = req_with(&[]);
+        let mut err = check_object_creation(&mut missing, "o").unwrap();
+        assert_eq!(err.status, 411);
+        assert_eq!(
+            String::from_utf8_lossy(err.body.materialize(u64::MAX).unwrap()),
+            "Missing Content-Length header."
+        );
+        let mut te = req_with(&[("Transfer-Encoding", "gzip,chunked")]);
+        let err = check_object_creation(&mut te, "o").unwrap();
+        assert_eq!(err.status, 501);
+        let mut cl = req_with(&[("Content-Length", "X")]);
+        let mut err = check_object_creation(&mut cl, "o").unwrap();
+        assert_eq!(err.status, 400);
+        assert_eq!(
+            String::from_utf8_lossy(err.body.materialize(u64::MAX).unwrap()),
+            "Invalid Content-Length header value"
         );
     }
 }

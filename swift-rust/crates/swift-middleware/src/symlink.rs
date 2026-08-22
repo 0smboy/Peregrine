@@ -76,7 +76,7 @@ use swift_http::{
     MAX_CONTROL_BODY,
 };
 
-use crate::{AsyncNextFn, Middleware, NextFn};
+use crate::{AsyncNextFn, Middleware, MwPrep, NextFn};
 
 const DEFAULT_SYMLOOP_MAX: usize = 2;
 
@@ -812,6 +812,16 @@ impl Symlink {
 }
 
 impl Middleware for Symlink {
+    fn prepare(&self, req: &mut Request) -> MwPrep {
+        if matches!(req.method.as_str(), "GET" | "HEAD")
+            && Self::is_object_path(req)
+            && req.param("symlink").as_deref() != Some("get")
+        {
+            update_ignore_range_header(&mut req.headers, TGT_OBJ_SYSMETA_SYMLINK_HDR);
+        }
+        MwPrep::Continue
+    }
+
     fn handle(&self, req: Request, next: &NextFn) -> Response {
         // Only container and object requests (3 or 4 path segments) are
         // handled; anything else passes through.
@@ -822,9 +832,14 @@ impl Middleware for Symlink {
         let obj = parts.get(3).and_then(|o| o.clone());
         match obj {
             Some(o) if !o.is_empty() => self.handle_object(req, next),
-            // Container context (listing symlink_path augmentation) is
-            // deferred; pass the request through.
-            _ => next(req),
+            _ => {
+                if req.method == "GET" {
+                    let orig = req.clone_head();
+                    process_container_listing_sync(&orig, next(req))
+                } else {
+                    next(req)
+                }
+            }
         }
     }
 
@@ -852,6 +867,11 @@ impl Middleware for Symlink {
         next: AsyncNextFn,
     ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
         Box::pin(async move {
+            if req.method == "GET" && is_container_listing_path(&req) {
+                let (version, account) = listing_version_account(&req);
+                let resp = next(req).await;
+                return process_container_listing_async(version, account, resp).await;
+            }
             if req.method == "GET" || req.method == "HEAD" {
                 if !Self::is_object_path(&req) {
                     return next(req).await;
@@ -862,6 +882,147 @@ impl Middleware for Symlink {
             }
         })
     }
+}
+
+fn is_container_listing_path(req: &Request) -> bool {
+    match split_path(&req.path, 3, 4, true) {
+        Ok(parts) => {
+            parts
+                .get(2)
+                .and_then(|c| c.as_deref())
+                .is_some_and(|c| !c.is_empty())
+                && parts
+                    .get(3)
+                    .and_then(|o| o.as_deref())
+                    .is_none_or(str::is_empty)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Python `utils.parse_header` for a container-listing `hash` field:
+/// `etag; symlink_target=c/o; symlink_target_bytes=N`.
+fn parse_etag_params(raw: &str) -> (String, Vec<(String, String)>) {
+    let mut parts = raw.split(';');
+    let etag = parts.next().unwrap_or("").trim().to_string();
+    let mut params = Vec::new();
+    for part in parts {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = part.split_once('=') {
+            params.push((k.trim().to_string(), v.trim().to_string()));
+        } else {
+            params.push((part.to_string(), String::new()));
+        }
+    }
+    (etag, params)
+}
+
+/// `SymlinkContainerContext._extract_symlink_path_json`.
+fn extract_symlink_path_json(obj: &mut serde_json::Value, version: &str, account: &str) {
+    let Some(map) = obj.as_object_mut() else {
+        return;
+    };
+    let Some(hash) = map.get("hash").and_then(|v| v.as_str()).map(str::to_string) else {
+        return;
+    };
+    let (etag, params) = parse_etag_params(&hash);
+    map.insert("hash".into(), serde_json::Value::String(etag));
+    let mut account = account.to_string();
+    let mut target: Option<String> = None;
+    for (key, value) in params {
+        match key.as_str() {
+            "symlink_target" => target = Some(value),
+            "symlink_target_account" => account = value,
+            "symlink_target_etag" => {
+                map.insert("symlink_etag".into(), serde_json::Value::String(value));
+            }
+            "symlink_target_bytes" => {
+                if let Ok(n) = value.parse::<i64>() {
+                    map.insert(
+                        "symlink_bytes".into(),
+                        serde_json::Value::Number(n.into()),
+                    );
+                }
+            }
+            _ => {
+                let current = map
+                    .get("hash")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                map.insert(
+                    "hash".into(),
+                    serde_json::Value::String(format!("{current}; {key}={value}")),
+                );
+            }
+        }
+    }
+    if let Some(target) = target {
+        map.insert(
+            "symlink_path".into(),
+            serde_json::Value::String(format!("/{version}/{account}/{target}")),
+        );
+    }
+}
+
+fn rewrite_listing_json(body: &[u8], version: &str, account: &str) -> Option<Vec<u8>> {
+    let mut items: Vec<serde_json::Value> = serde_json::from_slice(body).ok()?;
+    for item in &mut items {
+        extract_symlink_path_json(item, version, account);
+    }
+    serde_json::to_vec(&items).ok()
+}
+
+fn listing_version_account(req: &Request) -> (String, String) {
+    let parts = split_path(&req.path, 2, 3, true).unwrap_or_default();
+    let version = parts.first().and_then(|o| o.clone()).unwrap_or_default();
+    let account = parts.get(1).and_then(|o| o.clone()).unwrap_or_default();
+    (version, account)
+}
+
+fn apply_listing_rewrite(version: &str, account: &str, mut resp: Response, body: Vec<u8>) -> Response {
+    match rewrite_listing_json(&body, version, account) {
+        Some(new_body) => {
+            resp.headers.set("Content-Length", new_body.len().to_string());
+            resp.body = Body::Buffered(new_body);
+            resp
+        }
+        None => {
+            resp.body = Body::Buffered(body);
+            resp
+        }
+    }
+}
+
+fn process_container_listing_sync(req: &Request, mut resp: Response) -> Response {
+    if req.method != "GET" || !(200..300).contains(&resp.status) {
+        return resp;
+    }
+    let (version, account) = listing_version_account(req);
+    let body = match resp.body.materialize(MAX_CONTROL_BODY) {
+        Ok(b) => b.to_vec(),
+        Err(_) => return resp,
+    };
+    apply_listing_rewrite(&version, &account, resp, body)
+}
+
+async fn process_container_listing_async(
+    version: String,
+    account: String,
+    mut resp: Response,
+) -> Response {
+    if !(200..300).contains(&resp.status) {
+        return resp;
+    }
+    let taken = std::mem::replace(&mut resp.body, Body::empty());
+    let body = match taken.collect_async().await {
+        Ok(b) => b,
+        Err(_) => return resp,
+    };
+    apply_listing_rewrite(&version, &account, resp, body)
 }
 
 /// Build the subrequest that follows a symlink to its target, mirroring
@@ -1432,6 +1593,35 @@ mod tests {
     }
 
     // ---- POST ------------------------------------------------------------
+
+    #[test]
+    fn test_container_listing_exposes_symlink_path() {
+        let mw = Symlink::default();
+        let listing = serde_json::json!([
+            {
+                "name": "link",
+                "bytes": 0,
+                "hash": "d41d8cd98f00b204e9800998ecf8427e; symlink_target=c2/obj"
+            },
+            {"name": "plain", "bytes": 3, "hash": "abc"}
+        ]);
+        let mut listed = Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+        listed.headers.set("Content-Type", "application/json");
+        let be = backend(vec![("GET", "/v1/AUTH_a/c", listed)]);
+        let resp = run(&mw, req("GET", "/v1/AUTH_a/c", &[]), be);
+        assert_eq!(resp.status, 200);
+        let items: Vec<serde_json::Value> = serde_json::from_slice(body_bytes(&resp)).unwrap();
+        assert_eq!(
+            items[0]["symlink_path"].as_str(),
+            Some("/v1/AUTH_a/c2/obj")
+        );
+        assert_eq!(
+            items[0]["hash"].as_str(),
+            Some("d41d8cd98f00b204e9800998ecf8427e")
+        );
+        assert!(items[1].get("symlink_path").is_none());
+        assert_eq!(items[1]["hash"].as_str(), Some("abc"));
+    }
 
     #[test]
     fn test_post_with_symlink_target_rejected() {
