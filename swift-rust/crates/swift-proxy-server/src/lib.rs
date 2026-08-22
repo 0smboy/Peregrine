@@ -5499,6 +5499,74 @@ fn request_to_async(req: Request) -> AsyncRequest {
     }
 }
 
+/// Pipeline after the current intercepting filter.
+///
+/// S3 `handle_request_async` issues Swift subrequests (`PUT ?multipart-manifest=put`,
+/// object GET). Those must still hit SLO/copy/DLO, not skip to the app.
+fn remaining_async_next(
+    filters: Arc<Vec<Arc<dyn swift_middleware::Middleware>>>,
+    start: usize,
+    app: Arc<ProxyApp>,
+) -> swift_middleware::AsyncNextFn {
+    Arc::new(move |req| {
+        let filters = Arc::clone(&filters);
+        let app = Arc::clone(&app);
+        Box::pin(async move { dispatch_remaining(filters, start, app, req).await })
+    })
+}
+
+async fn dispatch_remaining(
+    filters: Arc<Vec<Arc<dyn swift_middleware::Middleware>>>,
+    start: usize,
+    app: Arc<ProxyApp>,
+    req: Request,
+) -> Response {
+    let head = req.clone_head();
+    for j in start..filters.len() {
+        if filters[j].intercepts_request(&head) {
+            let next = remaining_async_next(Arc::clone(&filters), j + 1, Arc::clone(&app));
+            return filters[j].handle_request_async(req, next).await;
+        }
+    }
+    let mut resp = app.handle_async(request_to_async(req)).await;
+    let slo = resp
+        .headers
+        .get("X-Static-Large-Object")
+        .is_some_and(config_true_value);
+    let dlo = resp.headers.get("X-Object-Manifest").is_some();
+    if (slo || dlo) && matches!(resp.body, swift_http::Body::Channel(_)) {
+        let body = std::mem::replace(&mut resp.body, swift_http::Body::empty());
+        match body.collect_async().await {
+            Ok(bytes) => resp.body = swift_http::Body::Buffered(bytes),
+            Err(_) => resp.body = swift_http::Body::empty(),
+        }
+    }
+    for filter in filters[start..].iter().rev() {
+        if filter.intercepts_response() {
+            let captured = Arc::new(Mutex::new(Some(resp)));
+            let app2 = Arc::clone(&app);
+            let next: swift_middleware::AsyncNextFn = Arc::new(move |r| {
+                let captured = Arc::clone(&captured);
+                let app2 = Arc::clone(&app2);
+                Box::pin(async move {
+                    if let Some(inner) = captured
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take()
+                    {
+                        return inner;
+                    }
+                    app2.handle_async(request_to_async(r)).await
+                })
+            });
+            resp = filter.reassemble_async(head.clone_head(), next).await;
+        } else {
+            resp = filter.finish(&head, resp);
+        }
+    }
+    resp
+}
+
 struct ProxyAsyncService {
     app: Arc<RwLock<Arc<ProxyApp>>>,
     filters: Vec<Arc<dyn swift_middleware::Middleware>>,
@@ -5570,19 +5638,18 @@ impl AsyncService for ProxyAsyncService {
                     headers: req.headers,
                     body,
                 };
-                let next: swift_middleware::AsyncNextFn = {
-                    let app = Arc::clone(&app);
-                    Arc::new(move |r| {
-                        let app = Arc::clone(&app);
-                        Box::pin(async move { app.handle_async(request_to_async(r)).await })
-                    })
-                };
-                for filter in filters.iter().rev() {
+                let filters_arc = Arc::new(filters.clone());
+                for (i, filter) in filters.iter().enumerate() {
                     if filter.intercepts_request(&head) {
+                        let next = remaining_async_next(
+                            Arc::clone(&filters_arc),
+                            i + 1,
+                            Arc::clone(&app),
+                        );
                         return filter.handle_request_async(request, next).await;
                     }
                 }
-                return next(request).await;
+                return remaining_async_next(filters_arc, 0, Arc::clone(&app))(request).await;
             }
             let mut resp = app.handle_async(req).await;
             let slo = resp
