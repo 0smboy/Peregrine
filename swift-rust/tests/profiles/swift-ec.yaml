@@ -1,0 +1,25 @@
+name: swift-ec
+purpose: native Swift API plus EC storage policy
+pipeline:
+  - catch_errors
+  - gatekeeper
+  - healthcheck
+  - proxy-logging
+  - cache
+  - listing_formats
+  - tempauth
+  - copy
+  - slo
+  - dlo
+  - versioned_writes
+  - symlink
+app: proxy-server
+storage_policies:
+  - name: default
+    default: true
+    type: replication
+  - name: ec-2-1
+    type: erasure_coding
+    ec_type: liberasurecode_rs_vand
+    ec_ndata: 2
+    ec_nparity: 1

@@ -1,0 +1,54 @@
+{
+  "phase": 0,
+  "architecture": "sync-thread-pool",
+  "captured_at": "2026-08-20T02:26:37Z",
+  "fsync_on_close": true,
+  "notes": "SAIO workers=64 is an ops workaround for L1 violation, not the architecture. Do not treat 14m08 as Gate 1 pass.",
+  "saio_rust": {
+    "host": "swift2",
+    "endpoint": "127.0.0.1:8081",
+    "devices": "/srv/node/d1/rsaio-xfs",
+    "suite": "s3tests/functional/test_s3.py --assert=plain",
+    "workers_2": {
+      "evidence": "swift2:/root/work/evidence/evidence-rsaio-full-20260819T1522Z/",
+      "passed": 194,
+      "failed": 174,
+      "error": 470,
+      "skipped": 1,
+      "wall_seconds": 18671.8,
+      "pass_avg_seconds": 35.98,
+      "pass_ge_30s": "all_passes",
+      "starvation": "3rd boto keep-alive waits head_deadline ~30s"
+    },
+    "workers_64": {
+      "evidence": "swift2:/root/work/evidence/evidence-rsaio-w64-20260820T021227Z/",
+      "passed": 246,
+      "failed": 256,
+      "error": 318,
+      "skipped": 20,
+      "wall_seconds": 848.51,
+      "pass_avg_seconds": 2.17,
+      "pass_ge_30s": 4,
+      "starvation": "masked by extra threads; L1 still violated"
+    }
+  },
+  "saio_python": {
+    "host": "swift1",
+    "endpoint": "127.0.0.1:8090",
+    "workers": 2,
+    "model": "eventlet-prefork",
+    "passed": 241,
+    "failed": 503,
+    "error": 0,
+    "skipped": 94,
+    "wall_seconds": 2000,
+    "pass_avg_seconds": 3.33
+  },
+  "micro_workers_2_keepalive": {
+    "main_list_buckets_s": 0.023,
+    "alt_list_buckets_s": 0.015,
+    "tenant_list_buckets_s": 16.359,
+    "tenant_result": "ReadTimeoutError",
+    "same_connection_three_lists_s": 0.056
+  }
+}

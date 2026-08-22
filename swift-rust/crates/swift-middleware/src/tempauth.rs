@@ -47,7 +47,7 @@ use sha2::Sha256;
 use swift_http::{Request, Response};
 
 use crate::acl::{parse_acl_v1, referrer_allowed, AccountAcls};
-use crate::{Middleware, NextFn};
+use crate::{Middleware, MwPrep, NextFn};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -422,30 +422,23 @@ impl TempAuth {
 }
 
 impl Middleware for TempAuth {
-    fn handle(&self, req: Request, next: &NextFn) -> Response {
-        // auth endpoint: issue tokens
+    fn prepare(&self, req: &mut Request) -> MwPrep {
         if req.path.starts_with(&self.auth_prefix) {
-            return self.handle_get_token(&req);
+            return MwPrep::ShortCircuit(self.handle_get_token(req));
         }
-        // TempURL (and peers) set authorize_override after validating a
-        // signature; skip re-auth so we do not wipe their Remote-User stamp.
         if req
             .headers
             .get("X-Backend-Authorize-Override")
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
             .unwrap_or(false)
         {
-            return next(req);
+            return MwPrep::Continue;
         }
 
         let token = req
             .headers
             .get("X-Auth-Token")
             .or_else(|| req.headers.get("X-Storage-Token"));
-        // Authenticate only. A valid token yields the user's groups; an invalid
-        // one of ours is a hard 401; anything else (incl. no token) is
-        // anonymous. Authorization is deferred to the proxy, which knows the
-        // container/account ACL.
         let groups: Vec<String> = match token {
             Some(token) if token.starts_with(&self.reseller_prefix) => {
                 match self.validate_token(token) {
@@ -457,15 +450,12 @@ impl Middleware for TempAuth {
                             .split('/')
                             .nth(1)
                             .unwrap_or("unknown");
-                        return Self::unauthorized(realm);
+                        return MwPrep::ShortCircuit(Self::unauthorized(realm));
                     }
                 }
             }
             _ => Vec::new(),
         };
-        let mut req = req;
-        // Translate client X-Account-Access-Control → sysmeta (TempAuth
-        // extract_acl_and_report_errors). Invalid syntax → 400 before the app.
         if req.headers.contains_key("X-Account-Access-Control") {
             match crate::acl::validate_account_acl_header(
                 req.headers.get("X-Account-Access-Control"),
@@ -484,14 +474,19 @@ impl Middleware for TempAuth {
                     let mut resp = Response::with_body(400, body);
                     resp.headers
                         .set("Content-Type", "text/plain; charset=UTF-8");
-                    return resp;
+                    return MwPrep::ShortCircuit(resp);
                 }
             }
         }
-        // Stamp the group list for the proxy's authorize. gatekeeper strips
-        // inbound x-backend* headers, so a client cannot forge this.
         req.headers.set("X-Backend-Remote-User", groups.join(","));
-        next(req)
+        MwPrep::Continue
+    }
+
+    fn handle(&self, mut req: Request, next: &NextFn) -> Response {
+        match self.prepare(&mut req) {
+            MwPrep::ShortCircuit(resp) => resp,
+            MwPrep::Continue => next(req),
+        }
     }
 }
 

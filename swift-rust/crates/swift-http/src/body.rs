@@ -29,16 +29,60 @@ pub const MAX_CONTROL_BODY: u64 = 64 * 1024 * 1024;
 /// The copy-loop chunk size used across the streaming data path.
 pub const STREAM_CHUNK: usize = 64 * 1024;
 
-/// A body: fully buffered, or a stream consumed at most once.
+/// A body: fully buffered, a blocking stream, or a bounded async channel
+/// (GET disk chunks pulled independently of the client write).
 pub enum Body {
     Buffered(Vec<u8>),
     Streamed(StreamedBody),
+    /// Producer is a [`swift_runtime::TaskScope`] child; capacity is 1 chunk.
+    Channel(ChannelBody),
+}
+
+/// Bounded response-body channel. The producer reads the next disk chunk
+/// only after the previous chunk is taken (slow client does not pin a
+/// storage worker).
+pub struct ChannelBody {
+    rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+    content_length: Option<u64>,
+    _scope: Option<swift_runtime::TaskScope>,
+}
+
+impl ChannelBody {
+    pub fn new(
+        rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+        content_length: Option<u64>,
+        scope: swift_runtime::TaskScope,
+    ) -> Self {
+        Self {
+            rx,
+            content_length,
+            _scope: Some(scope),
+        }
+    }
+
+    pub fn into_rx(
+        self,
+    ) -> (
+        tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+        Option<swift_runtime::TaskScope>,
+        Option<u64>,
+    ) {
+        (self.rx, self._scope, self.content_length)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn poll_recv(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Vec<u8>, std::io::Error>>> {
+        self.rx.poll_recv(cx)
+    }
 }
 
 /// A streaming body: a reader plus the declared length (`None` when the
 /// length is unknown until EOF, e.g. chunked transfer encoding).
 pub struct StreamedBody {
-    reader: Box<dyn Read + Send>,
+    pub(crate) reader: Box<dyn Read + Send>,
     content_length: Option<u64>,
     pub(crate) interim: Option<InterimResponder>,
 }
@@ -200,6 +244,33 @@ impl Body {
         })
     }
 
+    /// Bounded async body. `scope` retains the producer task.
+    pub fn from_channel(
+        rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+        content_length: Option<u64>,
+        scope: swift_runtime::TaskScope,
+    ) -> Body {
+        Body::Channel(ChannelBody::new(rx, content_length, scope))
+    }
+
+    /// Drain a [`Body::Channel`] without `blocking_recv` (Gate 2: caller is
+    /// a Tokio task). Buffered bodies return as-is. Streamed bodies still
+    /// use the blocking reader.
+    pub async fn collect_async(self) -> std::io::Result<Vec<u8>> {
+        match self {
+            Body::Buffered(b) => Ok(b),
+            Body::Channel(ch) => {
+                let (mut rx, _scope, _) = ch.into_rx();
+                let mut out = Vec::new();
+                while let Some(chunk) = rx.recv().await {
+                    out.extend_from_slice(&chunk?);
+                }
+                Ok(out)
+            }
+            Body::Streamed(s) => Body::Streamed(s).into_vec(u64::MAX),
+        }
+    }
+
     /// Attach an interim-response handle (the server does this for real
     /// connections; tests may too).
     pub fn attach_interim(&mut self, interim: InterimResponder) {
@@ -212,7 +283,7 @@ impl Body {
     /// this body came off a real server connection.
     pub fn interim_responder(&self) -> Option<InterimResponder> {
         match self {
-            Body::Buffered(_) => None,
+            Body::Buffered(_) | Body::Channel(_) => None,
             Body::Streamed(s) => s.interim.clone(),
         }
     }
@@ -226,7 +297,7 @@ impl Body {
     /// already hijacked.
     pub fn hijack(&self) -> Option<Box<dyn std::io::Write + Send>> {
         match self {
-            Body::Buffered(_) => None,
+            Body::Buffered(_) | Body::Channel(_) => None,
             Body::Streamed(s) => s.interim.as_ref().and_then(|i| i.take_hijack()),
         }
     }
@@ -237,6 +308,7 @@ impl Body {
         match self {
             Body::Buffered(b) => Some(b.len() as u64),
             Body::Streamed(s) => s.content_length,
+            Body::Channel(c) => c.content_length,
         }
     }
 
@@ -271,10 +343,20 @@ impl Body {
                 out.extend_from_slice(&buf[..n]);
             }
             *self = Body::Buffered(out);
+        } else if let Body::Channel(ch) = self {
+            let mut out: Vec<u8> = Vec::new();
+            while let Some(chunk) = ch.rx.blocking_recv() {
+                let bytes = chunk?;
+                if out.len() as u64 + bytes.len() as u64 > cap {
+                    return Err(too_large_error());
+                }
+                out.extend_from_slice(&bytes);
+            }
+            *self = Body::Buffered(out);
         }
         match self {
             Body::Buffered(b) => Ok(b),
-            Body::Streamed(_) => unreachable!(),
+            Body::Streamed(_) | Body::Channel(_) => unreachable!(),
         }
     }
 
@@ -283,7 +365,7 @@ impl Body {
         self.materialize(cap)?;
         match self {
             Body::Buffered(b) => Ok(b),
-            Body::Streamed(_) => unreachable!(),
+            Body::Streamed(_) | Body::Channel(_) => unreachable!(),
         }
     }
 
@@ -295,6 +377,16 @@ impl Body {
                 (Box::new(Cursor::new(b)), Some(len))
             }
             Body::Streamed(s) => (s.reader, s.content_length),
+            Body::Channel(mut ch) => {
+                let mut out = Vec::new();
+                while let Some(chunk) = ch.rx.blocking_recv() {
+                    if let Ok(bytes) = chunk {
+                        out.extend_from_slice(&bytes);
+                    }
+                }
+                let len = out.len() as u64;
+                (Box::new(Cursor::new(out)), Some(len))
+            }
         }
     }
 
@@ -310,6 +402,9 @@ impl std::fmt::Debug for Body {
             Body::Buffered(b) => write!(f, "Body::Buffered({} bytes)", b.len()),
             Body::Streamed(s) => {
                 write!(f, "Body::Streamed(content_length: {:?})", s.content_length)
+            }
+            Body::Channel(c) => {
+                write!(f, "Body::Channel(content_length: {:?})", c.content_length)
             }
         }
     }

@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use swift_http::{Request, Response};
 
-use crate::{Middleware, NextFn};
+use crate::{Middleware, MwPrep, NextFn};
 
 #[derive(Default)]
 pub struct HealthCheck {
@@ -28,18 +28,25 @@ pub struct HealthCheck {
 }
 
 impl Middleware for HealthCheck {
-    fn handle(&self, req: Request, next: &NextFn) -> Response {
-        if req.path == "/healthcheck" {
-            let disabled = self.disable_path.as_ref().is_some_and(|p| p.exists());
-            let mut resp = if disabled {
-                Response::with_body(503, b"DISABLED BY FILE".to_vec())
-            } else {
-                Response::with_body(200, b"OK".to_vec())
-            };
-            resp.headers.set("Content-Type", "text/plain");
-            return resp;
+    fn prepare(&self, req: &mut Request) -> MwPrep {
+        if req.path != "/healthcheck" {
+            return MwPrep::Continue;
         }
-        next(req)
+        let disabled = self.disable_path.as_ref().is_some_and(|p| p.exists());
+        let mut resp = if disabled {
+            Response::with_body(503, b"DISABLED BY FILE".to_vec())
+        } else {
+            Response::with_body(200, b"OK".to_vec())
+        };
+        resp.headers.set("Content-Type", "text/plain");
+        MwPrep::ShortCircuit(resp)
+    }
+
+    fn handle(&self, mut req: Request, next: &NextFn) -> Response {
+        match self.prepare(&mut req) {
+            MwPrep::ShortCircuit(resp) => resp,
+            MwPrep::Continue => next(req),
+        }
     }
 }
 

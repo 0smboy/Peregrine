@@ -1,0 +1,16 @@
+name: swift-core
+purpose: native Swift API (no S3)
+pipeline:
+  - catch_errors
+  - gatekeeper
+  - healthcheck
+  - proxy-logging
+  - cache
+  - listing_formats
+  - tempauth
+  - copy
+  - slo
+  - dlo
+  - versioned_writes
+  - symlink
+app: proxy-server

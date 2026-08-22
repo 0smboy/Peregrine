@@ -745,7 +745,7 @@ mod tests {
     fn body_bytes(resp: &Response) -> &[u8] {
         match &resp.body {
             Body::Buffered(b) => b,
-            Body::Streamed(_) => unreachable!(),
+            Body::Streamed(_) | Body::Channel(_) => unreachable!(),
         }
     }
 

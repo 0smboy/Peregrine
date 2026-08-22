@@ -20,7 +20,7 @@
 
 use swift_http::{Request, Response};
 
-use crate::{Middleware, NextFn};
+use crate::{Middleware, MwPrep, NextFn};
 
 /// The header-name prefixes/exact-matches gatekeeper removes, matching
 /// `gatekeeper.inbound_exclusions` (which equals `outbound_exclusions`).
@@ -88,8 +88,7 @@ impl Default for Gatekeeper {
 }
 
 impl Middleware for Gatekeeper {
-    fn handle(&self, mut req: Request, next: &NextFn) -> Response {
-        // strip excluded inbound headers
+    fn prepare(&self, req: &mut Request) -> MwPrep {
         let to_remove: Vec<String> = req
             .headers
             .iter()
@@ -99,8 +98,6 @@ impl Middleware for Gatekeeper {
         for name in to_remove {
             req.headers.remove(&name);
         }
-        // shunt an inbound X-Timestamp into a backend header so clients
-        // cannot forge the storage timestamp
         if self.shunt_x_timestamp {
             if let Some(ts) = req.headers.remove("X-Timestamp") {
                 req.headers.set("X-Backend-Inbound-X-Timestamp", ts);
@@ -111,10 +108,10 @@ impl Middleware for Gatekeeper {
                 req.headers.set("X-Backend-Allow-Reserved-Names", v);
             }
         }
+        MwPrep::Continue
+    }
 
-        let mut resp = next(req);
-
-        // strip excluded outbound headers
+    fn finish(&self, _req: &Request, mut resp: Response) -> Response {
         let to_remove: Vec<String> = resp
             .headers
             .iter()
@@ -125,6 +122,12 @@ impl Middleware for Gatekeeper {
             resp.headers.remove(&name);
         }
         resp
+    }
+
+    fn handle(&self, mut req: Request, next: &NextFn) -> Response {
+        let _ = self.prepare(&mut req);
+        let head = req.clone_head();
+        self.finish(&head, next(req))
     }
 }
 

@@ -14,8 +14,10 @@
 // limitations under the License.
 
 //! swob-compatible HTTP primitives (`swift/common/swob.py`,
-//! `header_key_dict.py`) and a small threaded HTTP/1.1 server used by the
-//! Rust account/container/object servers.
+//! `header_key_dict.py`) and an HTTP/1.1 server used by the Rust
+//! account/container/object servers. Production serve is a Tokio
+//! multi-thread runtime (one task per connection; idle keep-alive is a
+//! pending Future).
 //!
 //! The parsing semantics here are compatibility contracts: `Range` and
 //! `Match` reproduce swob's RFC-2616-plus-quirks behavior exactly
@@ -26,6 +28,7 @@ pub mod clock_health;
 mod conditional;
 mod dates;
 mod headers;
+mod hyper_serve;
 mod mime;
 mod range;
 mod request;
@@ -48,9 +51,18 @@ pub use range::{
 pub use request::{parse_query, reason_phrase, split_path, unquote, Request, Response};
 pub use server::{
     bind_listener, install_sigterm_flag, serve_forever, serve_forever_multi,
-    serve_forever_with_config, AccessLog, Handler, ServerConfig,
+    serve_forever_multi_service, serve_forever_with_config, AccessLog, AsyncRequest, AsyncService,
+    Handler, IncomingBody, LegacyService, ServerConfig, PRODUCTION_HTTP1_ENGINE,
+    reject_legacy_server_runtime,
 };
 pub use thread_concurrency::{
     compute_concurrency, cooperative_yield, green_sleep, should_yield_heartbeat, yield_count,
     EventletConcurrency, GreenLocal, GreenthreadPool, WORKER_THREADS_CAP,
 };
+
+/// G3: count a `tokio::task::block_in_place` on the current request metrics.
+/// S3 `handle_request_async` is the known production caller; any increment on
+/// a path declared migrated is an architecture-activation failure.
+pub fn record_block_in_place() {
+    swift_runtime::ConcurrencyMetrics::record_block_in_place_current();
+}

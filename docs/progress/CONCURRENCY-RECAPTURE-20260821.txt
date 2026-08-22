@@ -1,0 +1,60 @@
+PEREGRINE AGENTS.md recapture packet  2026-08-21
+product=.agent-handoff/peregrine-grok-merge-20260814/swift-rust
+notes=.agent-handoff/peregrine-grok-merge-20260814/docs/progress/CONCURRENCY-PHASE-00.md .. 14.md
+verdict=docs/progress/phase-gogo.txt  (copy in this directory)
+occupancy bar=spawn_server(2) / worker_threads=2  — raising workers fails the bar
+engine=hyper/http1 only (Cargo.toml features=["http1","server"]; no http2)
+spawn_blocking unique=crates/swift-runtime/src/blocking.rs:577
+unbounded_channel prod=0
+
+PLAN STEP 1  occupancy + isolation + Gate 5
+  gate12-occupancy.log     6 tests ×2 = 12 ok, 0 failed
+  gate3-isolation.log      storage_isolation 2×2, db_isolation 4×2,
+                           two_concurrent_puts ×2, fsync_storm PUT ×2
+  gate5-python-wire.log    13/13 ×2 plus
+                           async_fanout::tests::hyper_serve_copy_is_get_then_put_on_shipped_proxy ×2
+                           (handle_async COPY + Hyper serve_with_filters_and_config;
+                            dest PUT gets source bytes — not copy.py include_str)
+  gate5-copy-shipped.log   same COPY shipped test ×2 (sibling)
+  gate5-saio-unavailable.log  no pyeclib, no /etc/swift, no swift-init
+
+PLAN STEP 2  Hyper HTTP/1.1 + CI + overload
+  ci-boundaries.log        ×2 PASS  spawn_blocking FAIL:0  unbounded FAIL:0
+                           std::net FAIL:0 (ALLOW bind/edge ×2)
+  gate4-overload.log       extra_connection_is_503 ×2
+  rg-blocking-unbounded.log  spawn_blocking 1 hit; unbounded_channel 0 hits
+
+PLAN STEP 3  snapshot
+  phase11-metrics.log      HTTP 5/5 ×2
+                           storage_and_db_gauges_move_then_return_to_zero ×2
+                             (device_ops_active + db_ops_active move then 0)
+                           fanout_inflight_and_cancel_reason_move ×2
+                             (backend_requests_inflight move then 0)
+                           REQUIRED_METRIC_NAMES present; forbidden labels rejected
+
+PLAN STEP 4  interleaving + malicious A–F + sanitizer
+  phase13-loom.log         shipped_device_db_commit_shutdown_machines ×2
+                           run_shielded_survives_drop_of_waiter ×2
+                           run_shielded_increments_connection_local_counter ×2
+  phase13-malicious.log    B–E occupancy ×2 + F make_requests_async_quorum_cancels_blackhole ×2
+  idle-50k.log             test ok; OS stopped at 4091 Connection refused
+  idle-50k-unavailable.log same error (do not fake 50k)
+  sanitizer-unavailable.log  stable rustc 1.93 no -Z; miri missing;
+                             nightly ASan "loaded too late" / dyld
+
+PLAN STEP 5  shutdown
+  phase14-shutdown.log     5/5 ×2
+    cancellable: yielding tokio::sleep, cancellations_total{reason=shutdown}>=1
+    commit_shield_survives: real ObjectServer PUT stall, 201 after stop-accept
+    5f force: 10s client vs 1s ShutdownDeadline, <1.5s,
+              timeouts_total{phase=shutdown}>=1, .data still written
+
+PLAN STEP 6  notes
+  PHASE-00..14 GO/NO-GO in docs/progress/
+  PHASE-00 / 01 / 01-ci Gate NO-GO rows are historical; current verdict is phase-gogo.txt
+  Phase 14 recapture bug (status 0 after complete()) fixed on shipped hyper_serve
+    via per-connection CONN_SHIELDS + drain after saw_conn_shield
+
+Eventlet-solved: YES under plan SAIO fallback and 50k-idle env fallback.
+Not claimed: §29 24h soak / 10k/100k idle-density; §31 async-default/delete-legacy;
+             live pyeclib SAIO; 50k sockets on this OS; ASan/TSan/Miri on this toolchain.

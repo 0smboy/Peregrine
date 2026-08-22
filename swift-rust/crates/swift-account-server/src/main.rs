@@ -60,6 +60,12 @@ fn main() {
             .or_else(|| conf.get("DEFAULT", key).ok().flatten())
             .unwrap_or_else(|| default.to_string())
     };
+    swift_http::reject_legacy_server_runtime(Some(&get("server_runtime", ""))).unwrap_or_else(
+        |e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        },
+    );
 
     // Observability: syslog-or-stderr logger plus a fire-and-forget statsd
     // client (a no-op when log_statsd_host is unset).

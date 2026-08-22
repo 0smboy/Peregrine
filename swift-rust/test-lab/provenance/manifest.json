@@ -1,0 +1,33 @@
+{
+  "cargo_lock_sha256": "b5823e165e2864ca809425824834c2860d9b2bd904c36773b0db1c1da371db2d",
+  "ceph_s3tests_git_sha": "",
+  "ceph_s3tests_note": "directory exists on swift1 but is not a git checkout; G0 FAIL",
+  "ceph_s3tests_path": "/root/work/s3-tests",
+  "collected_at": "2026-08-21T live SAIO inventory",
+  "compatibility_target": "Python oracle commit 541a59863752de0636a1747e5c3223676a904c35 (not rust /info 2.33.0)",
+  "g0_validate_fails": [
+    "empty ceph_s3tests_git_sha"
+  ],
+  "glibc": "glibc-2.34-274.el9_8.x86_64",
+  "kernel": "5.14.0-687.31.1.el9_8.x86_64",
+  "liberasurecode_note": "so present (liberasurecode.so.1); rpm not installed; strings showed 1.0.0/2.13/2.14",
+  "liberasurecode_version": "unmeasured",
+  "peregrine_git_sha": "e65d26a05a34ba16caad2054d011563fad3c1320",
+  "pipeline_sha256": "6da3ffaadee98bb80bd2479973eee5a526781295e9d0419c911036f45b1f05b1",
+  "production_object_ring_sha256": "bef28a5db51776b032628debe22ea8d0e800b87e7c68dc4b6eebfdfa7b568ea8",
+  "python_object_ring_sha256": "faf6c61858338cd151544fe00ed91959fd8f4d9747c2744a18ef6c72851c51cd",
+  "python_pipeline_sha256": "026896de9acd522db277150366cda95f1eb6be3f860549f35efb5958d3f65312",
+  "python_proxy_conf_sha256": "87f5a48f5ede9d5467cbe4185e2ae16244b95c6dfc6b830807347d10cc4bd87e",
+  "python_swift_git_sha": "541a59863752de0636a1747e5c3223676a904c35",
+  "python_swift_version": "0.0.0",
+  "python_swift_version_note": "editable install from /root/work/swift-master; pip show Version=0.0.0. Rust /info swift.version=2.33.0 is NOT this pin.",
+  "ring_sha256": "8d7292da940a3b78b1ef2bb92d4f37a84bd1508786395ad152f25609d54e02e0",
+  "rust_pipeline_sha256": "9ddf970468baa958fb85d0342d60ffae1c31ac13c53f5ad64d9db956f6a32d0f",
+  "rust_rsaio_object_ring_sha256": "90b53fe720bf707d2629d72589c4ddc126b6fc196c066ccddc5bf86d2e1d4bc9",
+  "rust_rsaio_proxy_conf_sha256": "ca6e2220846d3f882b39a078ce37c3d9925b56bb16e9d30ddc22324c09516ce6",
+  "rustc_version": "rustc 1.93.0 (254b59607 2026-01-19)",
+  "rustc_version_linux_compile_host": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "swift_tests_git_sha": "541a59863752de0636a1747e5c3223676a904c35",
+  "test_config_sha256": "18318b26b83be321596955f20aac5f75a25a6b830ec1398ee62722049fb3cbac",
+  "workspace_git_sha": "b9e4ef976d2d3b17feff4f99b813ca2f481a6f1a"
+}

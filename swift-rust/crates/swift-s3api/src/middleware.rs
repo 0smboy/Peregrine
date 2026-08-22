@@ -100,6 +100,8 @@
 //! still return `InvalidAccessKeyId`.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -107,7 +109,7 @@ use serde_json::Value;
 use swift_http::{
     parse_http_date, Body, ClockHealth, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY,
 };
-use swift_middleware::{Middleware, NextFn, S3TokenClient, S3TokenResult};
+use swift_middleware::{AsyncNextFn, Middleware, NextFn, S3TokenClient, S3TokenResult};
 
 use crate::acl_cors::{
     apply_bucket_acl_input, apply_object_acl_input, bucket_acl_xml_from_headers,
@@ -2524,6 +2526,37 @@ fn translate_bucket_success(method: &str, resp: Response, bucket: Option<&str>) 
 }
 
 impl Middleware for S3Api {
+    fn intercepts_request(&self, req: &Request) -> bool {
+        if is_s3_auth_request(req) {
+            return true;
+        }
+        self.anonymous_account.is_some()
+            && is_s3_unsigned_read_candidate(
+                req,
+                &self.storage_domains,
+                self.dns_compliant_bucket_names,
+            )
+    }
+
+    fn handle_request_async(
+        &self,
+        req: Request,
+        next: AsyncNextFn,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move {
+            // G3: this adapter parks a Tokio worker on the sync S3 handler
+            // (and on `block_in_place` when `next` runs). Counted so the
+            // activation gate can FAIL rather than hide behind Hyper-up.
+            swift_http::record_block_in_place();
+            let next_sync: NextFn = Arc::new(move |r| {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(next(r))
+                })
+            });
+            self.handle(req, &next_sync)
+        })
+    }
+
     fn handle(&self, mut req: Request, next: &NextFn) -> Response {
         // Non-S3 traffic (Swift v1, /auth, /info, healthcheck) passes through.
         // Optional unsigned S3 GET/HEAD → anonymous_account (bucket public-read).

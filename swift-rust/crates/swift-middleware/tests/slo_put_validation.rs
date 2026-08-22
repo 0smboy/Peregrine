@@ -139,7 +139,7 @@ fn stored_manifest(writes: &[CapturedPut]) -> Value {
 fn body_string(resp: &Response) -> String {
     match &resp.body {
         swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
-        swift_http::Body::Streamed(_) => unreachable!(),
+        swift_http::Body::Streamed(_) | swift_http::Body::Channel(_) => unreachable!(),
     }
 }
 

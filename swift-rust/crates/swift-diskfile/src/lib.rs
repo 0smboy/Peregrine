@@ -51,7 +51,7 @@ pub use cleanup::{
 };
 pub use diskfile::{
     DiskFile, DiskFileConfig, DiskFileRangeReader, DiskFileReader, DiskFileStreamReader,
-    DiskFileWriter,
+    DiskFileWriter, DurablePut,
 };
 pub use error::DiskFileError;
 pub use hashes::{

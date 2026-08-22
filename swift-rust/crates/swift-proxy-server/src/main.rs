@@ -95,6 +95,12 @@ fn main() {
             .or_else(|| conf.get("DEFAULT", key).ok().flatten())
             .unwrap_or_else(|| default.to_string())
     };
+    swift_http::reject_legacy_server_runtime(Some(&get("server_runtime", ""))).unwrap_or_else(
+        |e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        },
+    );
 
     // Observability first, so every later startup error reaches syslog: the
     // logger (with stderr fallback) and a statsd client that is a no-op
@@ -4835,7 +4841,7 @@ mod startup_policy_tests {
     fn filter_body(resp: &swift_http::Response) -> &[u8] {
         match &resp.body {
             swift_http::Body::Buffered(b) => b,
-            swift_http::Body::Streamed(_) => unreachable!(),
+            swift_http::Body::Streamed(_) | swift_http::Body::Channel(_) => unreachable!(),
         }
     }
 

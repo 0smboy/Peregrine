@@ -75,6 +75,12 @@ fn main() {
             .or_else(|| conf.get("DEFAULT", key).ok().flatten())
             .unwrap_or_else(|| default.to_string())
     };
+    swift_http::reject_legacy_server_runtime(Some(&get("server_runtime", ""))).unwrap_or_else(
+        |e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        },
+    );
 
     let log_name = get("log_name", "object-server");
     let log_level = get("log_level", "INFO")
@@ -300,6 +306,12 @@ fn main() {
 #[cfg(test)]
 mod startup_policy_tests {
     use super::*;
+
+    #[test]
+    fn server_runtime_legacy_is_rejected_at_startup_helper() {
+        assert!(swift_http::reject_legacy_server_runtime(Some("legacy")).is_err());
+        assert!(swift_http::reject_legacy_server_runtime(Some("")).is_ok());
+    }
 
     #[test]
     fn invalid_storage_policy_is_not_silently_treated_as_replication() {

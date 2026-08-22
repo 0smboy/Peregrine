@@ -13,30 +13,144 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A bounded synchronous HTTP/1.1 server for Swift's proxy and storage
-//! services. Connections are handled by a fixed worker pool, and every
-//! request-line, header, and socket wait has an explicit limit.
+//! Bounded HTTP/1.1 server for Swift's proxy and storage services.
 //!
-//! Bodies STREAM: a request body is handed to the handler as a lazily
-//! consumed reader over the connection (Content-Length-framed or
-//! chunked-decoded), and a response body may be a reader the server
-//! copies to the socket in 64KB chunks. Nothing object-sized is
-//! buffered here.
+//! Production serve (`serve_forever*`) is a Tokio multi-thread runtime:
+//! each accepted connection is a task. Idle keep-alive is a pending
+//! Future on the reactor (no OS thread blocked in `read_head`).
+//! `worker_threads` sizes that runtime, not one-thread-per-connection.
+//!
+//! [`handle_connection`] remains the synchronous unit-test path (one
+//! `TcpStream`, blocking reads). It is not the production accept loop.
+//!
+//! Bodies STREAM: a request body is a lazily consumed reader
+//! (Content-Length or chunked). Nothing object-sized is buffered here.
 
-use crossbeam_channel::{bounded, Sender, TrySendError};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::future::Future;
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWriteExt, ReadBuf};
+use tokio::task::JoinSet;
+
+use swift_runtime::{
+    AdmissionController, AdmissionLimits, CancelReason, ConcurrencyMetrics, DeadlineKind,
+    RuntimeTaskGuard,
+};
 
 use crate::body::{too_large_error, Body, InterimResponder, STREAM_CHUNK};
 use crate::headers::HeaderKeyDict;
 use crate::request::{reason_phrase, unquote, Request, Response};
 
+/// Production HTTP/1.1 engine (AGENTS.md Phase 2). Not a custom reactor.
+pub const PRODUCTION_HTTP1_ENGINE: &str = "hyper/http1";
+
+/// Production serve is async HTTP/1.1 only (AGENTS.md §31).
+///
+/// `None` / empty / `async` / `hyper` / `hyper/http1` are accepted.
+/// `legacy` / `sync` / `blocking` is a hard error — there is no dual-mode
+/// production engine.
+pub fn reject_legacy_server_runtime(raw: Option<&str>) -> Result<(), String> {
+    let v = raw.map(str::trim).filter(|s| !s.is_empty());
+    let Some(v) = v else {
+        return Ok(());
+    };
+    match v.to_ascii_lowercase().as_str() {
+        "async" | "hyper" | "hyper/http1" | "http1" => Ok(()),
+        "legacy" | "sync" | "blocking" | "eventlet" => Err(
+            "server_runtime=legacy has been removed; production serve is async HTTP/1.1 (hyper/http1)"
+                .into(),
+        ),
+        other => Err(format!(
+            "unknown server_runtime={other:?}; production serve is async HTTP/1.1 (hyper/http1)"
+        )),
+    }
+}
+
 /// A request handler shared across connection workers.
 pub type Handler = Arc<dyn Fn(Request) -> Response + Send + Sync>;
+
+/// Phase 3 async request: body wait is a Future, not a blocking `Read`.
+pub struct AsyncRequest {
+    pub method: String,
+    pub path: String,
+    pub query_string: String,
+    pub headers: HeaderKeyDict,
+    pub body: IncomingBody,
+}
+
+/// Production service ABI (AGENTS.md §8). Implementors must not `Read` the
+/// client socket on a blocking worker.
+pub trait AsyncService: Send + Sync + 'static {
+    fn call(&self, req: AsyncRequest) -> Pin<Box<dyn Future<Output = Response> + Send + '_>>;
+
+    /// G3: true only for [`LegacyService`]. Native proxy/object/account/container
+    /// services leave this false so `/recon/concurrency` can prove the path.
+    fn is_legacy_sync_handler(&self) -> bool {
+        false
+    }
+}
+
+/// Adapter: async-materialize the body, then run the sync [`Handler`] on
+/// the Tokio task. Not `BlockingDomain::submit(handler)`.
+pub struct LegacyService {
+    handler: Handler,
+}
+
+impl LegacyService {
+    pub fn new(handler: Handler) -> Self {
+        Self { handler }
+    }
+}
+
+impl AsyncService for LegacyService {
+    fn is_legacy_sync_handler(&self) -> bool {
+        true
+    }
+
+    fn call(&self, mut req: AsyncRequest) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        let handler = Arc::clone(&self.handler);
+        Box::pin(async move {
+            let max = req
+                .body
+                .content_length()
+                .unwrap_or(u64::MAX)
+                .min(crate::MAX_CONTROL_BODY)
+                .min(req.body.max_body_bytes());
+            if req
+                .body
+                .content_length()
+                .is_some_and(|n| n > crate::MAX_CONTROL_BODY)
+            {
+                return Response::error(413, "Your request is too large.");
+            }
+            let body = match req.body.materialize(max).await {
+                Ok(bytes) => Body::Buffered(bytes),
+                Err(e) if crate::body::body_too_large(&e) => {
+                    return Response::error(413, "Your request is too large.");
+                }
+                Err(_) => return Response::error(499, "Client Disconnect"),
+            };
+            let request = Request {
+                method: req.method,
+                path: req.path,
+                query_string: req.query_string,
+                headers: req.headers,
+                body,
+            };
+            match catch_unwind(AssertUnwindSafe(|| handler(request))) {
+                Ok(response) => response,
+                Err(_) => Response::error(500, "request handler panicked"),
+            }
+        })
+    }
+}
 
 /// Called after every parsed request with the request head, the response
 /// status, and the time spent handling and writing the response.
@@ -60,9 +174,11 @@ const KEEPALIVE_DRAIN_CAP: u64 = 64 * 1024;
 /// Resource and protocol limits for the synchronous HTTP server.
 #[derive(Clone)]
 pub struct ServerConfig {
-    /// Maximum number of connections executing concurrently.
+    /// Tokio multi-thread runtime size. Idle keep-alive is a pending task,
+    /// not a dedicated OS worker. Not one-thread-per-connection.
     pub worker_threads: usize,
-    /// Connections waiting for a worker before they are rejected with 503.
+    /// Extra connection slots on top of `worker_threads`. Admission cap is
+    /// `worker_threads + connection_queue`; overflow is 503.
     pub connection_queue: usize,
     /// Client socket inactivity timeout in seconds, Swift's `client_timeout`
     /// (both read and write, applied per chunk like Python's
@@ -95,6 +211,31 @@ pub struct ServerConfig {
     /// Bind with `SO_REUSEPORT` when using [`bind_listener`] (L4). No effect on
     /// an already-bound `TcpListener` passed to `serve_*`.
     pub reuse_port: bool,
+    /// Independent connection admission cap. `0` derives
+    /// `worker_threads + connection_queue` (does not change worker defaults).
+    pub max_connections: usize,
+    /// Independent in-flight request cap (legacy `max_clients` alias).
+    /// `0` derives the same number as [`Self::max_connections`].
+    pub max_active_requests: usize,
+    /// Foreground traffic-class cap. `0` derives [`Self::max_active_requests`].
+    pub max_foreground: usize,
+    /// Replication traffic-class cap. `0` derives [`Self::max_active_requests`].
+    pub max_replication: usize,
+    /// Reconstruction traffic-class cap. `0` derives [`Self::max_active_requests`].
+    pub max_reconstruction: usize,
+    /// Auditor traffic-class cap. `0` derives [`Self::max_active_requests`].
+    pub max_auditor: usize,
+    /// Progress-aware body idle timeout in seconds. `0` uses
+    /// [`Self::client_timeout_secs`]. Distinct from [`Self::max_upload_time_secs`].
+    pub body_idle_timeout_secs: u64,
+    /// Total upload lifetime in seconds. `0` disables. Not refreshed by chunks.
+    pub max_upload_time_secs: u64,
+    /// Phase 11 concurrency snapshot. `None` creates one at accept.
+    pub metrics: Option<ConcurrencyMetrics>,
+    /// Graceful-shutdown drain budget in seconds ([`swift_runtime::ShutdownDeadline`]).
+    /// `0` means 5s. After this, HTTP connections are forced off; commit-shield
+    /// tasks are still joined (never aborted).
+    pub shutdown_deadline_secs: u64,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -119,6 +260,19 @@ impl std::fmt::Debug for ServerConfig {
             )
             .field("shutdown", &self.shutdown)
             .field("reuse_port", &self.reuse_port)
+            .field("max_connections", &self.max_connections)
+            .field("max_active_requests", &self.max_active_requests)
+            .field("max_foreground", &self.max_foreground)
+            .field("max_replication", &self.max_replication)
+            .field("max_reconstruction", &self.max_reconstruction)
+            .field("max_auditor", &self.max_auditor)
+            .field("body_idle_timeout_secs", &self.body_idle_timeout_secs)
+            .field("max_upload_time_secs", &self.max_upload_time_secs)
+            .field(
+                "metrics",
+                &self.metrics.as_ref().map(|_| "<concurrency-metrics>"),
+            )
+            .field("shutdown_deadline_secs", &self.shutdown_deadline_secs)
             .finish()
     }
 }
@@ -142,6 +296,16 @@ impl Default for ServerConfig {
             access_log: None,
             shutdown: None,
             reuse_port: false,
+            max_connections: 0,
+            max_active_requests: 0,
+            max_foreground: 0,
+            max_replication: 0,
+            max_reconstruction: 0,
+            max_auditor: 0,
+            body_idle_timeout_secs: 0,
+            max_upload_time_secs: 0,
+            metrics: None,
+            shutdown_deadline_secs: 0,
         }
     }
 }
@@ -149,7 +313,6 @@ impl Default for ServerConfig {
 /// Bind `addr` (`ip:port`) as a `TcpListener`, optionally with `SO_REUSEPORT`
 /// so multiple acceptors can share the port (L4).
 pub fn bind_listener(addr: &str, reuse_port: bool) -> std::io::Result<TcpListener> {
-    use std::net::SocketAddr;
     use std::os::fd::FromRawFd;
 
     if !reuse_port {
@@ -275,12 +438,14 @@ pub fn serve_forever(listener: TcpListener, handler: Handler) -> std::io::Result
     serve_forever_with_config(listener, handler, ServerConfig::default())
 }
 
-/// Accept connections using a bounded worker pool and explicit limits.
+/// Accept connections with a Tokio multi-thread runtime and explicit limits.
+///
+/// Each connection is a task. Idle keep-alive waits as a pending Future.
+/// `worker_threads` sizes the runtime, not a thread-per-connection pool.
 ///
 /// With `config.shutdown` unset this accepts forever (only an accept error
 /// returns). With it set, the accept loop polls the flag and, once true,
-/// stops accepting, drains queued and in-flight requests, and returns
-/// `Ok(())`.
+/// stops accepting, drains in-flight connection tasks, and returns `Ok(())`.
 pub fn serve_forever_with_config(
     listener: TcpListener,
     handler: Handler,
@@ -290,7 +455,7 @@ pub fn serve_forever_with_config(
 }
 
 /// Like [`serve_forever_with_config`], but accept from multiple listeners
-/// into one shared worker pool (`servers_per_port` / multi-port topology).
+/// (`servers_per_port` / multi-port topology).
 pub fn serve_forever_multi(
     listeners: Vec<TcpListener>,
     handler: Handler,
@@ -303,167 +468,737 @@ pub fn serve_forever_multi(
         ));
     }
     let worker_count = config.worker_threads.max(1);
-    // Lock-free MPMC work queue: each worker holds its own Receiver clone and
-    // recv()s directly, so the accept dispatch never serializes workers on a
-    // shared Mutex<Receiver>. That mutex contention capped write concurrency
-    // once the worker pool was raised past a handful of threads.
-    let (sender, receiver) = bounded::<TcpStream>(config.connection_queue.max(1));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_count)
+        .thread_name("swift-http")
+        .enable_io()
+        .enable_time()
+        .build()?;
+    let service: Arc<dyn AsyncService> = Arc::new(LegacyService::new(handler));
+    rt.block_on(accept_loop_async(listeners, service, config))
+}
 
-    let mut workers = Vec::with_capacity(worker_count);
-    for worker_id in 0..worker_count {
-        let receiver = receiver.clone();
-        let handler = Arc::clone(&handler);
-        let config = config.clone();
-        let worker = std::thread::Builder::new()
-            .name(format!("swift-http-{worker_id}"))
-            .spawn(move || loop {
-                let stream = match receiver.recv() {
-                    Ok(stream) => stream,
-                    Err(_) => return,
-                };
-                // A handler panic must only terminate the affected request,
-                // never permanently reduce the worker pool.
-                let _ = catch_unwind(AssertUnwindSafe(|| {
-                    let _ = handle_connection(stream, Arc::clone(&handler), &config);
-                }));
-            })?;
-        workers.push(worker);
+/// Production serve with an [`AsyncService`] (Phase 3 ABI). Socket wait is a
+/// Future. The whole legacy `Handler` is not one `BlockingDomain` job.
+pub fn serve_forever_multi_service(
+    listeners: Vec<TcpListener>,
+    service: Arc<dyn AsyncService>,
+    config: ServerConfig,
+) -> std::io::Result<()> {
+    if listeners.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "serve_forever_multi requires at least one listener",
+        ));
     }
+    let worker_count = config.worker_threads.max(1);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_count)
+        .thread_name("swift-http")
+        .enable_io()
+        .enable_time()
+        .build()?;
+    rt.block_on(accept_loop_async(listeners, service, config))
+}
 
-    let Some(shutdown) = config.shutdown.clone() else {
-        if listeners.len() == 1 {
-            let mut listeners = listeners;
-            let listener = listeners.pop().unwrap();
-            for stream in listener.incoming() {
-                let stream = stream?;
-                dispatch_connection(stream, &sender, &config)?;
-            }
-            return Ok(());
-        }
-        // Multiple listeners, no shutdown: one blocking accept thread each;
-        // this thread joins them (they run until process exit / accept err).
-        let mut acceptors = Vec::with_capacity(listeners.len());
-        for (idx, listener) in listeners.into_iter().enumerate() {
-            let sender = sender.clone();
-            let config = config.clone();
-            let acceptor = std::thread::Builder::new()
-                .name(format!("swift-http-accept-{idx}"))
-                .spawn(move || -> std::io::Result<()> {
-                    for stream in listener.incoming() {
-                        let stream = stream?;
-                        dispatch_connection(stream, &sender, &config)?;
-                    }
-                    Ok(())
-                })?;
-            acceptors.push(acceptor);
-        }
-        let mut first_err = None;
-        for acceptor in acceptors {
-            match acceptor.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) if first_err.is_none() => first_err = Some(e),
-                Ok(Err(_)) => {}
-                Err(_) if first_err.is_none() => {
-                    first_err = Some(std::io::Error::other("accept thread panicked"));
-                }
-                Err(_) => {}
-            }
-        }
-        return match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        };
-    };
+fn derived_connection_cap(config: &ServerConfig) -> usize {
+    if config.max_connections > 0 {
+        config.max_connections
+    } else {
+        config
+            .worker_threads
+            .max(1)
+            .saturating_add(config.connection_queue)
+            .max(1)
+    }
+}
 
-    // Shutdown path: non-blocking accept on each listener from dedicated
-    // threads; main waits until the flag flips, then joins and drains.
-    let mut acceptors = Vec::with_capacity(listeners.len());
-    for (idx, listener) in listeners.into_iter().enumerate() {
+fn derived_request_cap(config: &ServerConfig) -> usize {
+    if config.max_active_requests > 0 {
+        config.max_active_requests
+    } else {
+        derived_connection_cap(config)
+    }
+}
+
+fn class_cap(explicit: usize, requests: usize) -> usize {
+    if explicit > 0 {
+        explicit
+    } else {
+        requests
+    }
+}
+
+async fn accept_loop_async(
+    listeners: Vec<TcpListener>,
+    service: Arc<dyn AsyncService>,
+    mut config: ServerConfig,
+) -> std::io::Result<()> {
+    let mut tokio_listeners = Vec::with_capacity(listeners.len());
+    for listener in listeners {
         listener.set_nonblocking(true)?;
-        let sender = sender.clone();
-        let config = config.clone();
-        let shutdown = Arc::clone(&shutdown);
-        let acceptor = std::thread::Builder::new()
-            .name(format!("swift-http-accept-{idx}"))
-            .spawn(move || -> std::io::Result<()> {
-                while !shutdown.load(Ordering::SeqCst) {
-                    match listener.accept() {
-                        Ok((stream, _peer)) => {
-                            // On BSD-derived platforms accepted sockets inherit
-                            // the listener's O_NONBLOCK; the connection handler
-                            // needs blocking reads with timeouts.
-                            stream.set_nonblocking(false).ok();
-                            dispatch_connection(stream, &sender, &config)?;
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(SHUTDOWN_POLL_INTERVAL);
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                        Err(error) => return Err(error),
-                    }
-                }
-                Ok(())
-            })?;
-        acceptors.push(acceptor);
+        tokio_listeners.push(tokio::net::TcpListener::from_std(listener)?);
     }
 
-    while !shutdown.load(Ordering::SeqCst) {
-        std::thread::sleep(SHUTDOWN_POLL_INTERVAL);
-    }
-    let mut first_err = None;
-    for acceptor in acceptors {
-        match acceptor.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) if first_err.is_none() => first_err = Some(e),
-            Ok(Err(_)) => {}
-            Err(_) if first_err.is_none() => {
-                first_err = Some(std::io::Error::other("accept thread panicked"));
+    let max_conn = derived_connection_cap(&config);
+    let max_req = derived_request_cap(&config);
+    let admission = AdmissionController::new(AdmissionLimits::new(
+        max_conn,
+        max_req,
+        class_cap(config.max_foreground, max_req),
+        class_cap(config.max_replication, max_req),
+        class_cap(config.max_reconstruction, max_req),
+        class_cap(config.max_auditor, max_req),
+    ));
+    let metrics = config
+        .metrics
+        .clone()
+        .unwrap_or_else(ConcurrencyMetrics::new);
+    metrics.attach_admission(admission.clone());
+    metrics.set_worker_threads(config.worker_threads);
+    config.metrics = Some(metrics.clone());
+    let shutdown = config
+        .shutdown
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+
+    let (conn_tx, mut conn_rx) =
+        tokio::sync::mpsc::channel::<tokio::net::TcpStream>(config.connection_queue.max(1));
+    let mut acceptors = JoinSet::new();
+    for listener in tokio_listeners {
+        let conn_tx = conn_tx.clone();
+        let shutdown = Arc::clone(&shutdown);
+        acceptors.spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = wait_flag(&shutdown) => break,
+                    acc = listener.accept() => {
+                        match acc {
+                            Ok((stream, _)) => {
+                                if conn_tx.send(stream).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
             }
-            Err(_) => {}
+            Ok(())
+        });
+    }
+    drop(conn_tx);
+
+    let mut conns = JoinSet::new();
+    let mut accept_err = None;
+    loop {
+        tokio::select! {
+            _ = wait_flag(&shutdown) => {
+                let snap = metrics.snapshot();
+                metrics.set_graceful_shutdown_requests(snap.runtime_tasks.max(1));
+                metrics.set_shutdown_waiting_requests(admission.requests_active());
+                metrics.set_shutdown_waiting_commits(snap.commit_shield_active as usize);
+                break;
+            }
+            accepted = conn_rx.recv() => {
+                let Some(stream) = accepted else { break; };
+                while conns.try_join_next().is_some() {}
+                match admission.try_acquire_connection() {
+                    Ok(permit) => {
+                        let service = Arc::clone(&service);
+                        let config = config.clone();
+                        let shutdown = Arc::clone(&shutdown);
+                        let admission = admission.clone();
+                        let metrics = metrics.clone();
+                        let scheduled = Instant::now();
+                        metrics.runtime_tasks_inc();
+                        conns.spawn(async move {
+                            metrics.observe_scheduler_lag(scheduled.elapsed());
+                            let _task = RuntimeTaskGuard(Some(metrics.clone()));
+                            let _permit = permit;
+                            let _ = metrics
+                                .bind(handle_connection_async(
+                                    stream, service, config, shutdown, admission,
+                                ))
+                                .await;
+                        });
+                    }
+                    Err(_) => {
+                        crate::hyper_serve::reject_overloaded(stream).await;
+                    }
+                }
+            }
+            acc = acceptors.join_next(), if !acceptors.is_empty() => {
+                match acc {
+                    Some(Ok(Err(e))) => {
+                        accept_err = Some(e);
+                        shutdown.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    Some(Err(_)) => {
+                        accept_err = Some(std::io::Error::other("accept task panicked"));
+                        shutdown.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
-    // Stop accepting. Dropping the sender closes the channel once the
-    // already-queued connections are received, so each worker drains its
-    // share and exits; joining then waits out the in-flight requests.
-    drop(sender);
-    for worker in workers {
-        let _ = worker.join();
-    }
-    match first_err {
+    while acceptors.join_next().await.is_some() {}
+    while conns.join_next().await.is_some() {}
+    // L7: HTTP may already be forced off; commit-shield tasks still finish.
+    metrics.join_remaining_shields().await;
+    match accept_err {
         Some(e) => Err(e),
         None => Ok(()),
     }
 }
 
-fn dispatch_connection(
-    stream: TcpStream,
-    sender: &Sender<TcpStream>,
-    config: &ServerConfig,
-) -> std::io::Result<()> {
-    match sender.try_send(stream) {
-        Ok(()) => Ok(()),
-        Err(TrySendError::Full(stream)) => {
-            reject_overloaded(stream, socket_timeout(config));
-            Ok(())
+pub(crate) async fn wait_flag(flag: &AtomicBool) {
+    loop {
+        if flag.load(Ordering::SeqCst) {
+            return;
         }
-        Err(TrySendError::Disconnected(_)) => Err(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "all HTTP workers exited",
-        )),
+        tokio::time::sleep(SHUTDOWN_POLL_INTERVAL).await;
     }
 }
 
-fn reject_overloaded(mut stream: TcpStream, timeout: Option<Duration>) {
-    let _ = stream.set_write_timeout(timeout);
-    let body = b"Service Unavailable";
-    let _ = write!(
-        stream,
-        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = stream.write_all(body);
-    let _ = stream.flush();
+
+
+/// Buffered async read half. Leftover from a request body can be prepended
+/// so the next keep-alive head parse sees the next request, not a hole.
+#[allow(dead_code)]
+struct ConnRead {
+    io: tokio::net::tcp::OwnedReadHalf,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+#[allow(dead_code)]
+impl ConnRead {
+    fn new(io: tokio::net::tcp::OwnedReadHalf) -> Self {
+        Self {
+            io,
+            buf: Vec::with_capacity(8192),
+            pos: 0,
+        }
+    }
+
+    fn prepend(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let rest = self.buf[self.pos..].to_vec();
+        self.buf.clear();
+        self.pos = 0;
+        self.buf.extend_from_slice(data);
+        self.buf.extend_from_slice(&rest);
+    }
+}
+
+#[allow(dead_code)]
+impl AsyncRead for ConnRead {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.pos < this.buf.len() {
+            let avail = &this.buf[this.pos..];
+            let n = avail.len().min(buf.remaining());
+            buf.put_slice(&avail[..n]);
+            this.pos += n;
+            if this.pos >= this.buf.len() {
+                this.buf.clear();
+                this.pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.io).poll_read(cx, buf)
+    }
+}
+
+#[allow(dead_code)]
+impl AsyncBufRead for ConnRead {
+    fn poll_fill_buf(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<&[u8]>> {
+        let this = self.get_mut();
+        if this.pos < this.buf.len() {
+            return Poll::Ready(Ok(&this.buf[this.pos..]));
+        }
+        this.buf.clear();
+        this.pos = 0;
+        this.buf.resize(8192, 0);
+        let mut rb = ReadBuf::new(&mut this.buf);
+        match Pin::new(&mut this.io).poll_read(cx, &mut rb) {
+            Poll::Pending => {
+                this.buf.clear();
+                Poll::Pending
+            }
+            Poll::Ready(Err(e)) => {
+                this.buf.clear();
+                Poll::Ready(Err(e))
+            }
+            Poll::Ready(Ok(())) => {
+                let n = rb.filled().len();
+                this.buf.truncate(n);
+                Poll::Ready(Ok(&this.buf[..]))
+            }
+        }
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        let this = self.get_mut();
+        this.pos = this.pos.saturating_add(amt);
+        if this.pos >= this.buf.len() {
+            this.buf.clear();
+            this.pos = 0;
+        }
+    }
+}
+
+/// Async incoming body. `next_chunk` awaits the client socket (L1).
+/// Owned so Hyper can hand the body to the service without borrowing the
+/// connection task.
+pub struct IncomingBody {
+    inner: IncomingInner,
+    max_body: u64,
+    decoded: u64,
+    body_idle: Option<swift_runtime::BodyIdleDeadline>,
+    upload_lifetime: Option<swift_runtime::UploadLifetimeDeadline>,
+    on_upgrade: Option<hyper::upgrade::OnUpgrade>,
+    metrics: Option<ConcurrencyMetrics>,
+    buffered: usize,
+}
+
+enum IncomingInner {
+    Hyper(hyper::body::Incoming),
+    Memory { data: Vec<u8>, pos: usize },
+    Channel {
+        rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+        _scope: Option<swift_runtime::TaskScope>,
+        content_length: Option<u64>,
+    },
+}
+
+impl IncomingBody {
+    pub fn from_hyper(incoming: hyper::body::Incoming, max_body: u64) -> Self {
+        Self {
+            inner: IncomingInner::Hyper(incoming),
+            max_body,
+            decoded: 0,
+            body_idle: None,
+            upload_lifetime: None,
+            on_upgrade: None,
+            metrics: ConcurrencyMetrics::current(),
+            buffered: 0,
+        }
+    }
+
+    pub fn from_bytes(data: Vec<u8>, max_body: u64) -> Self {
+        let buffered = data.len();
+        let metrics = ConcurrencyMetrics::current();
+        if let Some(ref m) = metrics {
+            m.add_request_body_buffer(buffered as i64);
+        }
+        Self {
+            inner: IncomingInner::Memory { data, pos: 0 },
+            max_body,
+            decoded: 0,
+            body_idle: None,
+            upload_lifetime: None,
+            on_upgrade: None,
+            metrics,
+            buffered,
+        }
+    }
+
+    /// Drive a [`crate::Body::Channel`] as a request body (COPY source GET
+    /// teed into a destination PUT without materializing the object).
+    pub fn from_channel(
+        rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+        content_length: Option<u64>,
+        scope: Option<swift_runtime::TaskScope>,
+        max_body: u64,
+    ) -> Self {
+        let buffered = content_length.unwrap_or(0) as usize;
+        let metrics = ConcurrencyMetrics::current();
+        if let Some(ref m) = metrics {
+            m.add_request_body_buffer(buffered as i64);
+        }
+        Self {
+            inner: IncomingInner::Channel {
+                rx,
+                _scope: scope,
+                content_length,
+            },
+            max_body,
+            decoded: 0,
+            body_idle: None,
+            upload_lifetime: None,
+            on_upgrade: None,
+            metrics,
+            buffered,
+        }
+    }
+
+    pub fn set_upgrade(&mut self, on_upgrade: hyper::upgrade::OnUpgrade) {
+        self.on_upgrade = Some(on_upgrade);
+    }
+
+    pub fn take_upgrade(&mut self) -> Option<hyper::upgrade::OnUpgrade> {
+        self.on_upgrade.take()
+    }
+
+    pub fn set_body_idle(&mut self, deadline: swift_runtime::BodyIdleDeadline) {
+        self.body_idle = Some(deadline);
+    }
+
+    pub fn set_upload_lifetime(&mut self, deadline: swift_runtime::UploadLifetimeDeadline) {
+        self.upload_lifetime = Some(deadline);
+    }
+
+    pub fn max_body_bytes(&self) -> u64 {
+        self.max_body
+    }
+
+    pub fn content_length(&self) -> Option<u64> {
+        match &self.inner {
+            IncomingInner::Memory { data, pos } => Some((data.len().saturating_sub(*pos)) as u64),
+            IncomingInner::Hyper(incoming) => http_body::Body::size_hint(incoming).exact(),
+            IncomingInner::Channel { content_length, .. } => *content_length,
+        }
+    }
+
+    pub async fn next_chunk(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        if self
+            .upload_lifetime
+            .as_ref()
+            .is_some_and(|d| d.is_expired())
+        {
+            self.record_timeout(DeadlineKind::UploadLifetime);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "upload lifetime exceeded",
+            ));
+        }
+        let idle = self.body_idle.map(|d| d.remaining());
+        let idle_expired = self.body_idle.is_some() && idle == Some(Duration::ZERO);
+        if idle_expired {
+            self.record_timeout(DeadlineKind::BodyIdle);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "body idle timeout",
+            ));
+        }
+        let result = if let Some(idle) = idle.filter(|d| !d.is_zero()) {
+            match tokio::time::timeout(idle, self.next_chunk_inner()).await {
+                Ok(r) => r,
+                Err(_) => {
+                    self.record_timeout(DeadlineKind::BodyIdle);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "body idle timeout",
+                    ))
+                }
+            }
+        } else {
+            self.next_chunk_inner().await
+        };
+        if let Ok(Some(chunk)) = &result {
+            if let Some(idle) = self.body_idle.as_mut() {
+                idle.refresh_on_progress();
+            }
+            let n = chunk.len().min(self.buffered);
+            self.buffered = self.buffered.saturating_sub(n);
+            if n > 0 {
+                if let Some(ref m) = self.metrics {
+                    m.add_request_body_buffer(-(n as i64));
+                }
+            }
+        }
+        result
+    }
+
+    fn record_timeout(&self, kind: DeadlineKind) {
+        if let Some(ref m) = self.metrics {
+            m.record_timeout(kind);
+            m.record_cancellation(CancelReason::Timeout);
+        } else {
+            ConcurrencyMetrics::record_timeout_current(kind);
+            ConcurrencyMetrics::record_cancellation_current(CancelReason::Timeout);
+        }
+    }
+
+    async fn next_chunk_inner(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        match &mut self.inner {
+            IncomingInner::Memory { data, pos } => {
+                if *pos >= data.len() {
+                    return Ok(None);
+                }
+                let end = (*pos + STREAM_CHUNK).min(data.len());
+                let chunk = data[*pos..end].to_vec();
+                *pos = end;
+                self.decoded = self.decoded.saturating_add(chunk.len() as u64);
+                if self.decoded > self.max_body {
+                    return Err(too_large_error());
+                }
+                Ok(Some(chunk))
+            }
+            IncomingInner::Hyper(incoming) => {
+                use http_body_util::BodyExt;
+                loop {
+                    match incoming.frame().await {
+                        Some(Ok(frame)) => {
+                            let Ok(data) = frame.into_data() else {
+                                continue;
+                            };
+                            if data.is_empty() {
+                                continue;
+                            }
+                            self.decoded = self.decoded.saturating_add(data.len() as u64);
+                            if self.decoded > self.max_body {
+                                return Err(too_large_error());
+                            }
+                            return Ok(Some(data.to_vec()));
+                        }
+                        Some(Err(e)) => {
+                            return Err(std::io::Error::other(e.to_string()));
+                        }
+                        None => return Ok(None),
+                    }
+                }
+            }
+            IncomingInner::Channel { rx, .. } => match rx.recv().await {
+                Some(Ok(chunk)) => {
+                    if chunk.is_empty() {
+                        return Ok(None);
+                    }
+                    self.decoded = self.decoded.saturating_add(chunk.len() as u64);
+                    if self.decoded > self.max_body {
+                        return Err(too_large_error());
+                    }
+                    Ok(Some(chunk))
+                }
+                Some(Err(e)) => Err(e),
+                None => Ok(None),
+            },
+        }
+    }
+
+    pub async fn materialize(&mut self, max: u64) -> std::io::Result<Vec<u8>> {
+        let cap = max.min(self.max_body);
+        let mut out = Vec::new();
+        while let Some(chunk) = self.next_chunk().await? {
+            if out.len() as u64 + chunk.len() as u64 > cap {
+                return Err(too_large_error());
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+}
+
+impl Drop for IncomingBody {
+    fn drop(&mut self) {
+        if self.buffered > 0 {
+            if let Some(ref m) = self.metrics {
+                m.add_request_body_buffer(-(self.buffered as i64));
+            }
+            self.buffered = 0;
+        }
+    }
+}
+
+async fn handle_connection_async(
+    stream: tokio::net::TcpStream,
+    service: Arc<dyn AsyncService>,
+    config: ServerConfig,
+    shutdown: Arc<AtomicBool>,
+    admission: AdmissionController,
+) -> std::io::Result<()> {
+    crate::hyper_serve::serve_http1_connection(stream, service, config, shutdown, admission).await
+}
+
+#[allow(dead_code)]
+async fn read_head_async(
+    reader: &mut ConnRead,
+    config: &ServerConfig,
+    keepalive: bool,
+) -> Result<Option<RequestHead>, ProtocolError> {
+    let idle = socket_timeout(config);
+    if keepalive {
+        let wait = idle.unwrap_or(Duration::from_secs(24 * 3600));
+        match tokio::time::timeout(wait, reader.fill_buf()).await {
+            Err(_) => return Ok(None),
+            Ok(Ok([])) => return Ok(None),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(ProtocolError::Io(e)),
+        }
+    }
+
+    let deadline = (config.head_deadline_secs > 0)
+        .then(|| Instant::now() + Duration::from_secs(config.head_deadline_secs));
+
+    let mut acc = Vec::new();
+    // Skip leading blank lines, then request-line + headers until the
+    // terminator. Limits are re-checked by [`read_head`].
+    loop {
+        let timeout = match deadline {
+            Some(d) => {
+                let left = d.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(ProtocolError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "request head deadline exceeded",
+                    )));
+                }
+                Some(left)
+            }
+            None => idle,
+        };
+        let max = if acc.is_empty() {
+            config.max_request_line_bytes
+        } else {
+            config.max_header_line_bytes
+        };
+        let Some(line) = read_line_async(reader, max, timeout).await? else {
+            return if acc.is_empty() {
+                Ok(None)
+            } else {
+                Err(ProtocolError::Http(400, "truncated request headers"))
+            };
+        };
+        let empty = line_text(&line)?.is_empty();
+        if acc.is_empty() && empty {
+            continue;
+        }
+        acc.extend_from_slice(&line);
+        if empty {
+            break;
+        }
+        if acc.len() > config.max_header_bytes.saturating_add(config.max_request_line_bytes) {
+            return Err(ProtocolError::Http(400, "request headers too large"));
+        }
+    }
+    let mut cursor = BufReader::new(Cursor::new(acc));
+    read_head(&mut cursor, config)
+}
+
+#[allow(dead_code)]
+async fn read_line_async(
+    reader: &mut ConnRead,
+    max_bytes: usize,
+    timeout: Option<Duration>,
+) -> Result<Option<Vec<u8>>, ProtocolError> {
+    let mut line = Vec::with_capacity(max_bytes.min(1024));
+    let fut = reader.read_until(b'\n', &mut line);
+    let read = match timeout {
+        Some(t) => match tokio::time::timeout(t, fut).await {
+            Err(_) => {
+                return Err(ProtocolError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "request head deadline exceeded",
+                )));
+            }
+            Ok(r) => r?,
+        },
+        None => fut.await?,
+    };
+    if read == 0 {
+        return Ok(None);
+    }
+    if line.len() > max_bytes || !line.ends_with(b"\n") {
+        return Err(ProtocolError::Http(
+            400,
+            "HTTP line exceeds configured limit",
+        ));
+    }
+    Ok(Some(line))
+}
+
+#[allow(dead_code)]
+async fn write_error_response_async(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    status: u16,
+    message: &str,
+) -> std::io::Result<()> {
+    write_response_async(writer, Response::error(status, message), false, false)
+        .await
+        .map(|_| ())
+}
+
+#[allow(dead_code)]
+async fn write_response_async(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    mut response: Response,
+    keep_alive: bool,
+    head_request: bool,
+) -> std::io::Result<bool> {
+    if response.reason.contains(['\r', '\n']) {
+        response.reason = reason_phrase(response.status).to_string();
+    }
+    let body = response.body.take();
+    let close_delimited = if response.headers.get("Content-Length").is_none() {
+        match body.content_length() {
+            Some(n) => {
+                response.headers.set("Content-Length", n);
+                false
+            }
+            None => true,
+        }
+    } else {
+        false
+    };
+    let keep_alive = keep_alive && !close_delimited;
+    for (name, value) in response.headers.iter() {
+        if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "response header contains a newline",
+            ));
+        }
+    }
+    let mut head = format!("HTTP/1.1 {} {}\r\n", response.status, response.reason);
+    for (name, value) in response.headers.iter() {
+        if name.eq_ignore_ascii_case("Connection") || name.eq_ignore_ascii_case("Transfer-Encoding")
+        {
+            continue;
+        }
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str(if keep_alive {
+        "Connection: keep-alive\r\n\r\n"
+    } else {
+        "Connection: close\r\n\r\n"
+    });
+    writer.write_all(head.as_bytes()).await?;
+    if !head_request {
+        match body {
+            Body::Buffered(bytes) => {
+                writer.write_all(&bytes).await?;
+            }
+            Body::Streamed(_) | Body::Channel(_) => {
+                let (mut src, _) = body.into_reader();
+                let mut buf = [0u8; STREAM_CHUNK];
+                loop {
+                    let n = src.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    writer.write_all(&buf[..n]).await?;
+                }
+            }
+        }
+    }
+    writer.flush().await?;
+    Ok(keep_alive)
 }
 
 #[derive(Debug)]
@@ -482,12 +1217,14 @@ impl From<std::io::Error> for ProtocolError {
 
 /// The head-phase deadline shared between the connection loop and the
 /// socket reader; `None` outside the head phase.
+#[allow(dead_code)]
 type DeadlineCell = Arc<Mutex<Option<Instant>>>;
 
 /// A `TcpStream` reader that, while a head deadline is armed, bounds each
 /// `read` by the time remaining (so a client dripping header bytes cannot
 /// stretch one line past the budget). With the deadline disarmed, reads
 /// carry the plain per-chunk `client_timeout`.
+#[allow(dead_code)]
 struct TimedStream {
     stream: TcpStream,
     deadline: DeadlineCell,
@@ -521,6 +1258,7 @@ impl Read for TimedStream {
     }
 }
 
+#[allow(dead_code)]
 type ConnReader = BufReader<TimedStream>;
 
 /// How the request body is framed on the wire.
@@ -549,8 +1287,8 @@ impl Framing {
 }
 
 /// What the body reader gives back to the connection loop when dropped.
-struct ReclaimedConn {
-    reader: ConnReader,
+struct ReclaimedConn<R> {
+    reader: R,
     fully_consumed: bool,
     /// Bytes left on the wire when known (`Sized` framing); `None` for an
     /// unfinished chunked body (unbounded, never drained).
@@ -561,7 +1299,7 @@ struct ReclaimedConn {
     continue_pending: bool,
 }
 
-type ReclaimSlot = Arc<Mutex<Option<ReclaimedConn>>>;
+type ReclaimSlot<R> = Arc<Mutex<Option<ReclaimedConn<R>>>>;
 
 /// Body-decode limits copied out of `ServerConfig` (the reader outlives
 /// the borrow of the config).
@@ -579,16 +1317,16 @@ struct BodyLimits {
 /// shared [`InterimResponder`] lets the handler send its own interim
 /// responses (with headers, and repeatedly — the multiphase-PUT
 /// handshake) before or between body reads.
-struct ConnBodyReader {
-    reader: Option<ConnReader>,
+struct ConnBodyReader<R> {
+    reader: Option<R>,
     framing: Framing,
     limits: BodyLimits,
     interim: InterimResponder,
     expect_continue: bool,
-    slot: ReclaimSlot,
+    slot: ReclaimSlot<R>,
 }
 
-impl ConnBodyReader {
+impl<R> ConnBodyReader<R> {
     fn maybe_send_continue(&mut self) -> std::io::Result<()> {
         if self.expect_continue {
             self.interim.send_bare_if_unsent()?;
@@ -597,7 +1335,7 @@ impl ConnBodyReader {
     }
 }
 
-impl Read for ConnBodyReader {
+impl<R: BufRead> Read for ConnBodyReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -712,7 +1450,7 @@ impl Read for ConnBodyReader {
     }
 }
 
-impl Drop for ConnBodyReader {
+impl<R> Drop for ConnBodyReader<R> {
     fn drop(&mut self) {
         if let Some(reader) = self.reader.take() {
             // A pending (never-consumed) re-arm means the handler promised
@@ -760,6 +1498,7 @@ struct RequestHead {
     expect_continue: bool,
 }
 
+#[allow(dead_code)]
 fn handle_connection(
     stream: TcpStream,
     handler: Handler,
@@ -779,7 +1518,7 @@ fn handle_connection(
     };
     let mut reader_opt: Option<ConnReader> = Some(BufReader::new(timed));
     let mut stream = stream;
-    let slot: ReclaimSlot = Arc::new(Mutex::new(None));
+    let slot: ReclaimSlot<ConnReader> = Arc::new(Mutex::new(None));
 
     for request_number in 0..config.max_requests_per_connection.max(1) {
         let mut reader = reader_opt
@@ -936,7 +1675,7 @@ fn handle_connection(
             // client reads it (a 422/500 answered mid-body). Send FIN
             // first, then briefly drain what the client already sent so
             // the teardown is graceful.
-            let _ = stream.shutdown(std::net::Shutdown::Write);
+            let _ = stream.shutdown(Shutdown::Write);
             let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
             let mut sink = [0u8; STREAM_CHUNK];
             let mut drained: u64 = 0;
@@ -983,8 +1722,8 @@ fn handle_connection(
 }
 
 /// Parse one request line + headers. Does NOT read any body bytes.
-fn read_head(
-    reader: &mut ConnReader,
+fn read_head<R: BufRead>(
+    reader: &mut R,
     config: &ServerConfig,
 ) -> Result<Option<RequestHead>, ProtocolError> {
     let request_line = loop {
@@ -1194,6 +1933,7 @@ fn read_chunk_trailers_limits<R: BufRead>(
     }
 }
 
+#[allow(dead_code)]
 fn write_error_response<W: Write>(
     writer: &mut W,
     status: u16,
@@ -1205,6 +1945,7 @@ fn write_error_response<W: Write>(
 /// Serialize a response. Returns the keep-alive value actually written
 /// (a streamed body with unknown length forces `Connection: close` - the
 /// EOF is the framing).
+#[allow(dead_code)]
 fn write_response<W: Write>(
     writer: &mut W,
     mut response: Response,
@@ -1255,7 +1996,7 @@ fn write_response<W: Write>(
     if !head_request {
         match body {
             Body::Buffered(bytes) => writer.write_all(&bytes)?,
-            Body::Streamed(_) => {
+            Body::Streamed(_) | Body::Channel(_) => {
                 let (mut reader, _) = body.into_reader();
                 let mut buf = [0u8; STREAM_CHUNK];
                 loop {
@@ -1278,6 +2019,24 @@ mod tests {
     use super::*;
     use crate::body::body_too_large;
     use std::net::Shutdown;
+
+    #[test]
+    fn production_engine_is_hyper_http1() {
+        assert_eq!(PRODUCTION_HTTP1_ENGINE, "hyper/http1");
+        assert!(!PRODUCTION_HTTP1_ENGINE.contains("http2"));
+    }
+
+    #[test]
+    fn reject_legacy_server_runtime_is_the_only_production_choice() {
+        assert!(reject_legacy_server_runtime(None).is_ok());
+        assert!(reject_legacy_server_runtime(Some("")).is_ok());
+        assert!(reject_legacy_server_runtime(Some("async")).is_ok());
+        assert!(reject_legacy_server_runtime(Some("hyper/http1")).is_ok());
+        let err = reject_legacy_server_runtime(Some("legacy")).unwrap_err();
+        assert!(err.contains("removed"), "{err}");
+        assert!(reject_legacy_server_runtime(Some("sync")).is_err());
+        assert!(reject_legacy_server_runtime(Some("blocking")).is_err());
+    }
 
     /// Echo handler used by most round trips: materializes the body the
     /// way a real control-plane handler would, mapping the too-large

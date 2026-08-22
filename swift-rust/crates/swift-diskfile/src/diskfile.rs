@@ -599,7 +599,7 @@ impl DiskFile {
     }
 
     /// `create()`: a writer over a temp file in the policy tmp dir.
-    pub fn create(&self, extension: &str) -> Result<DiskFileWriter<'_>, DiskFileError> {
+    pub fn create(&self, extension: &str) -> Result<DiskFileWriter, DiskFileError> {
         let name = self
             .name
             .clone()
@@ -607,7 +607,9 @@ impl DiskFile {
         std::fs::create_dir_all(&self.tmpdir)?;
         let (file, tmppath) = mkstemp(&self.tmpdir)?;
         Ok(DiskFileWriter {
-            df: self,
+            datadir: self.datadir.clone(),
+            cfg: self.cfg.clone(),
+            policy: self.policy,
             name,
             file: Some(file),
             tmppath: Some(tmppath),
@@ -708,8 +710,13 @@ fn mkstemp(dir: &Path) -> Result<(std::fs::File, PathBuf), DiskFileError> {
 }
 
 /// The Rust `BaseDiskFileWriter` (+ repl/EC `put`/`commit` overrides).
-pub struct DiskFileWriter<'a> {
-    df: &'a DiskFile,
+///
+/// Owned (`'static`, `Send`) so a finite `write` can run on
+/// [`swift_runtime::StorageExecutor`] without borrowing the HTTP task.
+pub struct DiskFileWriter {
+    datadir: PathBuf,
+    cfg: DiskFileConfig,
+    policy: PolicyKind,
     name: String,
     file: Option<std::fs::File>,
     tmppath: Option<PathBuf>,
@@ -721,7 +728,7 @@ pub struct DiskFileWriter<'a> {
     frag_index: Option<i64>,
 }
 
-impl DiskFileWriter<'_> {
+impl DiskFileWriter {
     pub fn write(&mut self, chunk: &[u8]) -> Result<(), DiskFileError> {
         let file = self
             .file
@@ -731,9 +738,7 @@ impl DiskFileWriter<'_> {
         file.write_all(chunk)?;
         self.upload_size += chunk.len() as u64;
         // for large files, sync every bytes_per_sync written
-        if self.df.cfg.fsync_on_close
-            && self.upload_size - self.last_sync >= self.df.cfg.bytes_per_sync
-        {
+        if self.cfg.fsync_on_close && self.upload_size - self.last_sync >= self.cfg.bytes_per_sync {
             file.sync_data()?;
             self.last_sync = self.upload_size;
         }
@@ -747,13 +752,41 @@ impl DiskFileWriter<'_> {
         )
     }
 
+    /// Detach the open tempfile so xattr/`sync_all`/rename can run as a
+    /// `'static` job on [`swift_runtime::StorageExecutor`] (L2, L7).
+    /// The writer will not unlink the temp file; [`DurablePut`] owns it.
+    pub fn into_durable(mut self) -> Result<DurablePut, DiskFileError> {
+        let file = self
+            .file
+            .take()
+            .ok_or_else(|| DiskFileError::Io(std::io::Error::other("writer is not open")))?;
+        let tmppath = self
+            .tmppath
+            .take()
+            .ok_or_else(|| DiskFileError::Io(std::io::Error::other("writer has no tempfile")))?;
+        self.put_succeeded = true;
+        Ok(DurablePut {
+            file,
+            tmppath,
+            datadir: self.datadir.clone(),
+            name: self.name.clone(),
+            extension: self.extension.clone(),
+            fsync_on_close: self.cfg.fsync_on_close,
+            xattr_size: self.cfg.xattr_size,
+            policy: self.policy,
+            cleanup: self.cfg.cleanup,
+            frag_index: self.frag_index,
+            committed: false,
+        })
+    }
+
     /// `put()`: finalize on disk. For EC `.data` files the fragment index
     /// is stamped into sysmeta and cleanup is deferred to `commit()`.
     pub fn put(&mut self, mut metadata: Metadata) -> Result<(), DiskFileError> {
         let mut cleanup = true;
         let mut frag_index_arg: Option<i64> = None;
-        if matches!(self.df.policy, PolicyKind::Ec { .. }) && self.extension == ".data" {
-            let n = match self.df.policy {
+        if matches!(self.policy, PolicyKind::Ec { .. }) && self.extension == ".data" {
+            let n = match self.policy {
                 PolicyKind::Ec { n_unique_fragments } => n_unique_fragments,
                 PolicyKind::Replication => None,
             };
@@ -820,7 +853,7 @@ impl DiskFileWriter<'_> {
             }
         };
         meta_set(&mut metadata, "name", MetaValue::Str(self.name.clone()));
-        let target_path = self.df.datadir.join(&filename);
+        let target_path = self.datadir.join(&filename);
 
         let file = self
             .file
@@ -828,18 +861,18 @@ impl DiskFileWriter<'_> {
             .ok_or_else(|| DiskFileError::Io(std::io::Error::other("writer is not open")))?;
         // metadata goes down before the fsync so data and metadata flush
         // together
-        write_file_metadata(XattrSource::File(file), &metadata, self.df.cfg.xattr_size)?;
-        if self.df.cfg.fsync_on_close {
+        write_file_metadata(XattrSource::File(file), &metadata, self.cfg.xattr_size)?;
+        if self.cfg.fsync_on_close {
             file.sync_all()?;
         }
-        if let Some(suffix_dir) = self.df.datadir.parent() {
+        if let Some(suffix_dir) = self.datadir.parent() {
             invalidate_hash(suffix_dir)?;
         }
         let tmppath = self.tmppath.as_ref().unwrap();
-        renamer(tmppath, &target_path, self.df.cfg.fsync_on_close)?;
+        renamer(tmppath, &target_path, self.cfg.fsync_on_close)?;
         self.put_succeeded = true;
         if cleanup {
-            let _ = cleanup_ondisk_files(&self.df.datadir, self.df.policy, &self.df.cfg.cleanup);
+            let _ = cleanup_ondisk_files(&self.datadir, self.policy, &self.cfg.cleanup);
         }
         Ok(())
     }
@@ -847,30 +880,27 @@ impl DiskFileWriter<'_> {
     /// EC two-phase commit: rename the fragment to its durable name
     /// (`ECDiskFileWriter.commit`/`_finalize_durable`).
     pub fn commit(&mut self, timestamp: &Timestamp) -> Result<(), DiskFileError> {
-        if !matches!(self.df.policy, PolicyKind::Ec { .. }) {
+        if !matches!(self.policy, PolicyKind::Ec { .. }) {
             return Ok(()); // replication commit is a no-op
         }
         let fi = self
             .frag_index
             .ok_or_else(|| DiskFileError::BadFragmentIndex("Bad fragment index: None".into()))?;
         let data_file_path = self
-            .df
             .datadir
             .join(make_ec_ondisk_filename(timestamp, fi, false)?);
         let durable_data_file_path = self
-            .df
             .datadir
             .join(make_ec_ondisk_filename(timestamp, fi, true)?);
         match std::fs::rename(&data_file_path, &durable_data_file_path) {
             Ok(()) => {
-                std::fs::File::open(&self.df.datadir)?.sync_all()?;
-                let _ =
-                    cleanup_ondisk_files(&self.df.datadir, self.df.policy, &self.df.cfg.cleanup);
+                std::fs::File::open(&self.datadir)?.sync_all()?;
+                let _ = cleanup_ondisk_files(&self.datadir, self.policy, &self.cfg.cleanup);
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // we "succeeded" if another writer cleaned up our data
-                let files: Vec<String> = std::fs::read_dir(&self.df.datadir)
+                let files: Vec<String> = std::fs::read_dir(&self.datadir)
                     .map(|rd| {
                         rd.filter_map(|e| e.ok())
                             .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -879,9 +909,9 @@ impl DiskFileWriter<'_> {
                     .unwrap_or_default();
                 let results = get_ondisk_files(
                     &files,
-                    &self.df.datadir,
+                    &self.datadir,
                     true,
-                    self.df.policy,
+                    self.policy,
                     self.frag_index,
                     None,
                 )?;
@@ -912,9 +942,62 @@ impl DiskFileWriter<'_> {
     }
 }
 
-impl Drop for DiskFileWriter<'_> {
+impl Drop for DiskFileWriter {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+/// Owned durability commit: xattr + optional `sync_all` + rename.
+/// Send so it can run on `StorageExecutor::run_finite`.
+pub struct DurablePut {
+    file: std::fs::File,
+    tmppath: PathBuf,
+    datadir: PathBuf,
+    name: String,
+    extension: String,
+    fsync_on_close: bool,
+    xattr_size: usize,
+    policy: PolicyKind,
+    cleanup: CleanupConfig,
+    frag_index: Option<i64>,
+    committed: bool,
+}
+
+impl DurablePut {
+    /// Same bytes as [`DiskFileWriter::put`] / `finalize_put`.
+    pub fn commit(mut self, mut metadata: Metadata) -> Result<(), DiskFileError> {
+        let timestamp: Timestamp = meta_get_str(&metadata, "X-Timestamp")
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| {
+                DiskFileError::InvalidFilename("missing X-Timestamp in metadata".into())
+            })?;
+        let ctype_timestamp = parse_ts(meta_get(&metadata, "Content-Type-Timestamp"));
+        let filename = match self.frag_index {
+            Some(fi) => make_ec_ondisk_filename(&timestamp, fi, false)?,
+            None => make_ondisk_filename(&timestamp, Some(&self.extension), ctype_timestamp.as_ref()),
+        };
+        meta_set(&mut metadata, "name", MetaValue::Str(self.name.clone()));
+        let target_path = self.datadir.join(&filename);
+        write_file_metadata(XattrSource::File(&self.file), &metadata, self.xattr_size)?;
+        if self.fsync_on_close {
+            self.file.sync_all()?;
+        }
+        if let Some(suffix_dir) = self.datadir.parent() {
+            invalidate_hash(suffix_dir)?;
+        }
+        renamer(&self.tmppath, &target_path, self.fsync_on_close)?;
+        self.committed = true;
+        let _ = cleanup_ondisk_files(&self.datadir, self.policy, &self.cleanup);
+        Ok(())
+    }
+}
+
+impl Drop for DurablePut {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.tmppath);
+        }
     }
 }
 

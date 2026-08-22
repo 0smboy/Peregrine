@@ -15,6 +15,7 @@ members = [
     "crates/swift-object-server",
     "crates/swift-proxy-server",
     "crates/swift-ring",
+    "crates/swift-runtime",
     "crates/swift-s3api",
 ]
 

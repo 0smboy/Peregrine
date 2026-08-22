@@ -50,7 +50,10 @@ use swift_core::config::config_true_value;
 use swift_core::constraints::{RESERVED_STR, VALID_API_VERSIONS};
 use swift_http::{split_path, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
 
-use crate::{Middleware, NextFn};
+use crate::{Middleware, MwPrep, NextFn};
+
+const LISTING_OUT_TYPE: &str = "X-Backend-Listing-Out-Content-Type";
+const LISTING_CAN_VARY: &str = "X-Backend-Listing-Can-Vary";
 
 /// Maximum size of a valid JSON container listing body. A larger response is
 /// assumed to be a staticweb page and passed straight through
@@ -66,6 +69,30 @@ impl Default for ListingFormats {
 }
 
 impl Middleware for ListingFormats {
+    fn prepare(&self, req: &mut Request) -> MwPrep {
+        let parts = match split_path(&req.path, 2, 3, false) {
+            Ok(p) => p,
+            Err(_) => return MwPrep::Continue,
+        };
+        let version = parts[0].clone().unwrap_or_default();
+        if !VALID_API_VERSIONS.contains(&version.as_str())
+            || (req.method != "GET" && req.method != "HEAD")
+        {
+            return MwPrep::Continue;
+        }
+        let out = get_listing_content_type(req);
+        req.headers.set(LISTING_OUT_TYPE, out);
+        if !req.params().iter().any(|(k, _)| k == "format") {
+            req.headers.set(LISTING_CAN_VARY, "1");
+        }
+        req.query_string = force_format_json(&req.params());
+        MwPrep::Continue
+    }
+
+    fn intercepts_response(&self) -> bool {
+        true
+    }
+
     fn handle(&self, mut req: Request, next: &NextFn) -> Response {
         // account and container only: `req.split_path(2, 3)`
         let parts = match split_path(&req.path, 2, 3, false) {
@@ -85,10 +112,14 @@ impl Middleware for ListingFormats {
         }
 
         // Desired output content-type, then force the subrequest to JSON.
-        let out_content_type = get_listing_content_type(&req);
+        let stashed = req.headers.get(LISTING_OUT_TYPE).map(str::to_string);
+        let out_content_type = stashed
+            .as_deref()
+            .unwrap_or_else(|| get_listing_content_type(&req));
 
         let params = req.params();
-        let can_vary = !params.iter().any(|(k, _)| k == "format");
+        let can_vary = req.headers.get(LISTING_CAN_VARY).is_some()
+            || !params.iter().any(|(k, _)| k == "format");
         let allow_reserved = req
             .headers
             .get("X-Backend-Allow-Reserved-Names")
@@ -800,7 +831,7 @@ mod tests {
     fn body_bytes(resp: &Response) -> &[u8] {
         match &resp.body {
             swift_http::Body::Buffered(b) => b,
-            swift_http::Body::Streamed(_) => unreachable!(),
+            swift_http::Body::Streamed(_) | swift_http::Body::Channel(_) => unreachable!(),
         }
     }
 

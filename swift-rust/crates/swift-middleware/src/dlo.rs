@@ -38,7 +38,9 @@
 //! truncated and does not require materializing the complete listing.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io::{Cursor, Read};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -49,7 +51,7 @@ use swift_http::{
 };
 
 use crate::slo::{dlo_etag_and_size, normalize_etag};
-use crate::{Middleware, NextFn};
+use crate::{AsyncNextFn, Middleware, NextFn};
 
 /// `swift.common.constraints.CONTAINER_LISTING_LIMIT`.
 const CONTAINER_LISTING_LIMIT: usize = 10000;
@@ -960,6 +962,104 @@ impl DynamicLargeObject {
         };
         Ok(Body::from_reader(body_reader, content_length))
     }
+
+    async fn handle_get_head_async(&self, mut req: Request, next: AsyncNextFn) -> Response {
+        if split_path(&req.path, 4, 4, true).is_err() {
+            return next(req).await;
+        }
+        let is_get_head = req.method == "GET" || req.method == "HEAD";
+        if req.param("multipart-manifest").as_deref() == Some("get") || !is_get_head {
+            return next(req).await;
+        }
+        update_ignore_range_header(&mut req.headers, X_OBJECT_MANIFEST);
+        let orig = req.clone_head();
+        let resp = next(req).await;
+        let Some(manifest) = resp.headers.get(X_OBJECT_MANIFEST).map(str::to_string) else {
+            return resp;
+        };
+        let decoded = unquote(&manifest);
+        let (container, obj_prefix) = decoded.split_once('/').unwrap_or((decoded.as_str(), ""));
+        let parts = match split_path(&orig.path, 2, 3, true) {
+            Ok(p) => p,
+            Err(_) => return Response::error(400, "Invalid path"),
+        };
+        let version = parts[0].clone().unwrap_or_default();
+        let account = parts[1].clone().unwrap_or_default();
+        let list_req = listing_subrequest(&orig, &version, &account, container, obj_prefix, None);
+        let mut list_resp = next(list_req).await;
+        if !(200..300).contains(&list_resp.status) {
+            if orig.method == "HEAD" {
+                list_resp.body = Body::empty();
+            }
+            return list_resp;
+        }
+        let body = match list_resp.body.collect_async().await {
+            Ok(b) => b,
+            Err(_) => return Response::error(409, "Invalid DLO listing body"),
+        };
+        let segments = match parse_segments(&body, self.listing_limit) {
+            Ok(s) => s,
+            Err(message) => {
+                let mut r = Response::error(409, &message);
+                if orig.method == "HEAD" {
+                    r.body = Body::empty();
+                }
+                return r;
+            }
+        };
+        let pairs: Vec<(String, i64)> = segments
+            .iter()
+            .map(|s| (s.hash.clone(), s.bytes as i64))
+            .collect();
+        let (dlo_etag, total_len) = dlo_etag_and_size(&pairs);
+        let mut headers = resp.headers.clone();
+        headers.remove("Content-Length");
+        headers.remove("Content-Range");
+        headers.remove("Transfer-Encoding");
+        headers.remove("Etag");
+        headers.set("Etag", &dlo_etag);
+        headers.set("Accept-Ranges", "bytes");
+        headers.set("Content-Length", total_len.max(0).to_string());
+        let mut out = Response::new(200);
+        out.headers = headers;
+        if orig.method != "GET" {
+            out.body = Body::empty();
+            return out;
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let scope = swift_runtime::TaskScope::bounded(1);
+        let orig_head = orig.clone_head();
+        let container = container.to_string();
+        let _ = scope.spawn(async move {
+            for seg in segments {
+                let path = format!("/{version}/{account}/{container}/{}", seg.name);
+                let sub = make_subreq(&orig_head, "GET", path, String::new());
+                let sresp = next(sub).await;
+                if !(200..300).contains(&sresp.status) {
+                    let _ = tx
+                        .send(Err(std::io::Error::other(format!(
+                            "DLO segment returned {}",
+                            sresp.status
+                        ))))
+                        .await;
+                    return;
+                }
+                match sresp.body.collect_async().await {
+                    Ok(b) => {
+                        if tx.send(Ok(b)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                }
+            }
+        });
+        out.body = Body::from_channel(rx, Some(total_len.max(0) as u64), scope);
+        out
+    }
 }
 
 /// `_validate_x_object_manifest_header`: reject a malformed manifest header on
@@ -989,6 +1089,37 @@ fn validate_x_object_manifest_header(req: &Request) -> Option<Response> {
 }
 
 impl Middleware for DynamicLargeObject {
+    fn intercepts_request(&self, req: &Request) -> bool {
+        req.method == "PUT"
+            && req.headers.get(X_OBJECT_MANIFEST).is_some()
+            && split_path(&req.path, 4, 4, true).is_ok()
+    }
+
+    fn intercepts_response(&self) -> bool {
+        true
+    }
+
+    fn handle_request_async(
+        &self,
+        req: Request,
+        next: AsyncNextFn,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move {
+            if let Some(err) = validate_x_object_manifest_header(&req) {
+                return err;
+            }
+            next(req).await
+        })
+    }
+
+    fn reassemble_async(
+        &self,
+        req: Request,
+        next: AsyncNextFn,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move { self.handle_get_head_async(req, next).await })
+    }
+
     fn handle(&self, req: Request, next: &NextFn) -> Response {
         // Only object requests (v/a/c/o) are candidates.
         if split_path(&req.path, 4, 4, true).is_err() {

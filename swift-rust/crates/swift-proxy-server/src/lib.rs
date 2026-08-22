@@ -31,15 +31,20 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use swift_core::config::config_true_value;
 use swift_core::timestamp::Timestamp;
-use swift_http::{HeaderKeyDict, Request, Response};
+use swift_http::{
+    HeaderKeyDict, Request, Response, AsyncRequest, AsyncService,
+};
 use swift_memcache::{MemcacheClient, TcpConn};
 use swift_ring::Ring;
+
+mod async_fanout;
 
 /// An owned backend node (device ip/port/name), so node lists can move
 /// across the fan-out threads. The Rust `PartNode`/`HandoffNode` borrow
@@ -467,7 +472,7 @@ fn account_info_from_json(v: &serde_json::Value) -> Option<AccountInfo> {
 /// or the conf default; a tenth of that for authoritative absence (404/410);
 /// `None` for any other non-success status, which must not touch the cache
 /// ("bail without touching caches", base.py:689-692).
-fn info_cache_time(status: u16, recheck_header: Option<&str>, default_ttl: f64) -> Option<f64> {
+pub(crate) fn info_cache_time(status: u16, recheck_header: Option<&str>, default_ttl: f64) -> Option<f64> {
     let ttl = recheck_header
         .and_then(|v| v.trim().parse::<f64>().ok())
         .unwrap_or(default_ttl);
@@ -608,7 +613,7 @@ struct BackendHead {
     status: u16,
     reason: String,
     headers: Vec<(String, String)>,
-    reader: std::io::BufReader<std::net::TcpStream>,
+    reader: std::io::BufReader<TcpStream>,
     /// The backend's Content-Length when parseable; backend connections
     /// are `Connection: close`, so `None` means close-delimited.
     content_length: Option<u64>,
@@ -664,7 +669,7 @@ impl BackendHead {
 /// close-delimited); a short read surfaces as an error so a truncated
 /// backend stream never silently truncates the client response.
 struct LimitedBackendReader {
-    reader: std::io::BufReader<std::net::TcpStream>,
+    reader: std::io::BufReader<TcpStream>,
     remaining: Option<u64>,
 }
 
@@ -691,7 +696,7 @@ impl Read for LimitedBackendReader {
 
 /// Read one `\r\n`-terminated line from a backend response head, bounded.
 fn read_backend_line(
-    reader: &mut std::io::BufReader<std::net::TcpStream>,
+    reader: &mut std::io::BufReader<TcpStream>,
 ) -> std::io::Result<String> {
     use std::io::BufRead;
     let mut line = Vec::new();
@@ -712,7 +717,7 @@ type ParsedHead = (u16, String, Vec<(String, String)>);
 
 /// Parse a status line + headers from an open backend connection.
 fn read_backend_head(
-    reader: &mut std::io::BufReader<std::net::TcpStream>,
+    reader: &mut std::io::BufReader<TcpStream>,
 ) -> std::io::Result<ParsedHead> {
     let status_line = read_backend_line(reader)?;
     let mut parts = status_line.splitn(3, ' ');
@@ -788,12 +793,12 @@ fn connect_node(
     node: &Node,
     conn_timeout: Duration,
     node_timeout: Duration,
-) -> std::io::Result<std::net::TcpStream> {
+) -> std::io::Result<TcpStream> {
     let addr = format!("{}:{}", node.ip, node.port);
-    let sock_addr: std::net::SocketAddr = addr
+    let sock_addr: SocketAddr = addr
         .parse()
         .map_err(|e| std::io::Error::other(format!("bad node address {addr}: {e}")))?;
-    let conn = std::net::TcpStream::connect_timeout(&sock_addr, conn_timeout)?;
+    let conn = TcpStream::connect_timeout(&sock_addr, conn_timeout)?;
     // Small backend request/response exchanges over fresh connections are the
     // Nagle/delayed-ACK worst case; without this every proxy->backend hop eats
     // a ~40ms delayed-ACK stall (measured ~100ms+ per client op end to end).
@@ -843,8 +848,8 @@ fn backend_request(
 /// waits for the final response.
 struct Putter {
     node: Node,
-    stream: std::net::TcpStream,
-    reader: std::io::BufReader<std::net::TcpStream>,
+    stream: TcpStream,
+    reader: std::io::BufReader<TcpStream>,
 }
 
 /// What one connect attempt produced (obj.py `_connect_put_node`): a live
@@ -932,7 +937,7 @@ fn write_chunk_framed<W: Write>(writer: &mut W, chunk: &[u8]) -> std::io::Result
 /// The per-segment sizes an object splits into (empty object = no
 /// segments: Python stores zero-byte archives for zero-byte objects).
 #[cfg(feature = "ec")]
-fn ec_segment_sizes(orig_size: usize, segment_size: usize) -> Vec<usize> {
+pub(crate) fn ec_segment_sizes(orig_size: usize, segment_size: usize) -> Vec<usize> {
     if orig_size == 0 {
         return Vec::new();
     }
@@ -1051,8 +1056,8 @@ fn ec_archive_size(driver: &swift_ec::EcDriver, segment_size: usize, total: u64)
 #[cfg(feature = "ec")]
 struct MimePutter {
     node: Node,
-    stream: std::net::TcpStream,
-    reader: std::io::BufReader<std::net::TcpStream>,
+    stream: TcpStream,
+    reader: std::io::BufReader<TcpStream>,
     boundary: String,
     /// Which fragment archive this connection carries (assigned from the
     /// slot after connect).
@@ -1528,7 +1533,8 @@ impl ProxyApp {
         per_node_headers: Vec<HeaderKeyDict>,
         body: Vec<u8>,
     ) -> Response {
-        let (tx, rx) = mpsc::channel();
+        let slot_count = per_node_headers.len().max(1);
+        let (tx, rx) = mpsc::sync_channel(slot_count);
         let mut spawned = 0usize;
         let node_pool = Arc::new(Mutex::new(nodes.into_iter().collect::<Vec<_>>()));
         for headers in per_node_headers.into_iter() {
@@ -1616,8 +1622,8 @@ impl ProxyApp {
     ) -> Response {
         let content_length = body.content_length();
         let node_pool = Arc::new(Mutex::new(nodes.into_iter().collect::<Vec<_>>()));
-        let (tx, rx) = mpsc::channel();
         let slots = per_node_headers.len();
+        let (tx, rx) = mpsc::sync_channel(slots.max(1));
         for headers in per_node_headers.into_iter() {
             let tx = tx.clone();
             let app = Arc::clone(self);
@@ -1833,8 +1839,8 @@ impl ProxyApp {
         query: &str,
         per_node_headers: Vec<HeaderKeyDict>,
     ) -> Vec<Option<BackendResponse>> {
-        let (tx, rx) = mpsc::channel();
         let slots = per_node_headers.len();
+        let (tx, rx) = mpsc::sync_channel(slots.max(1));
         for (i, headers) in per_node_headers.into_iter().enumerate() {
             let tx = tx.clone();
             let app = Arc::clone(self);
@@ -2500,6 +2506,426 @@ impl ProxyApp {
         resp
     }
 
+    /// Production async entry: object PUT/GET stream; HEAD/POST use
+    /// Tokio backend I/O. Remaining verbs stay at the control-plane cap.
+    pub async fn handle_async(
+        self: &Arc<Self>,
+        mut areq: swift_http::AsyncRequest,
+    ) -> Response {
+        let segs: Vec<&str> = areq.path.splitn(5, '/').collect();
+        let v1 = segs.len() >= 3
+            && segs[0].is_empty()
+            && segs[1] == "v1"
+            && !segs[2].is_empty();
+        let object_put = areq.method == "PUT"
+            && segs.len() >= 5
+            && v1
+            && areq.headers.get("X-Copy-From").is_none();
+        let copy_req = v1
+            && segs.len() >= 5
+            && (areq.method == "COPY"
+                || (areq.method == "PUT" && areq.headers.get("X-Copy-From").is_some()));
+        if copy_req {
+            if areq.path.contains('\u{0}') {
+                return text_response(412, "Invalid UTF8 or contains NULL");
+            }
+            let mut req = Request {
+                method: areq.method.clone(),
+                path: areq.path.clone(),
+                query_string: areq.query_string.clone(),
+                headers: areq.headers.clone(),
+                body: swift_http::Body::empty(),
+            };
+            let account = segs[2].to_string();
+            let container = segs[3].to_string();
+            let object = segs[4].to_string();
+            if req.method == "COPY" {
+                let Some(dest) = req.headers.get("Destination").map(str::to_string) else {
+                    return Response::error(412, "Destination header required");
+                };
+                let dest_parts = {
+                    let v = dest.strip_prefix('/').unwrap_or(dest.as_str());
+                    v.split_once('/').and_then(|(c, o)| {
+                        if c.is_empty() || o.is_empty() {
+                            None
+                        } else {
+                            Some((c.to_string(), o.to_string()))
+                        }
+                    })
+                };
+                let Some((dst_c, dst_o)) = dest_parts else {
+                    return Response::error(
+                        412,
+                        "Destination header must be of the form /container/object",
+                    );
+                };
+                let dst_account = req
+                    .headers
+                    .get("Destination-Account")
+                    .map(str::to_string)
+                    .unwrap_or_else(|| account.clone());
+                req.method = "PUT".into();
+                req.path = format!("/v1/{dst_account}/{dst_c}/{dst_o}");
+                req.headers
+                    .set("X-Copy-From", format!("/{container}/{object}"));
+                req.headers.set("X-Copy-From-Account", account.clone());
+                req.headers.remove("Destination");
+                req.headers.remove("Destination-Account");
+                if let Some(denied) = self
+                    .authorize_async(&mut req, &dst_account, Some(&dst_c), Some(&dst_o))
+                    .await
+                {
+                    return denied;
+                }
+                return self
+                    .object_copy_async(req, &dst_account, &dst_c, &dst_o)
+                    .await;
+            }
+            if let Some(denied) = self
+                .authorize_async(&mut req, &account, Some(&container), Some(&object))
+                .await
+            {
+                return denied;
+            }
+            return self
+                .object_copy_async(req, &account, &container, &object)
+                .await;
+        }
+        if object_put {
+            let mut req = Request {
+                method: areq.method.clone(),
+                path: areq.path.clone(),
+                query_string: areq.query_string.clone(),
+                headers: areq.headers.clone(),
+                body: swift_http::Body::empty(),
+            };
+            if req.path.contains('\u{0}') {
+                return text_response(412, "Invalid UTF8 or contains NULL");
+            }
+            let account = segs[2].to_string();
+            let container = segs[3].to_string();
+            let object = segs[4].to_string();
+            if let Some(denied) = self
+                .authorize_async(&mut req, &account, Some(&container), Some(&object))
+                .await
+            {
+                return denied;
+            }
+            return self
+                .object_put_async(&mut req, &account, &container, &object, &mut areq.body)
+                .await;
+        }
+        let get_head_post_delete =
+            v1 && matches!(areq.method.as_str(), "GET" | "HEAD" | "POST" | "DELETE");
+        let account_or_container_put = v1 && areq.method == "PUT" && segs.len() < 5;
+        if get_head_post_delete || account_or_container_put {
+            if areq.path.contains('\u{0}') {
+                return text_response(412, "Invalid UTF8 or contains NULL");
+            }
+            let mut req = Request {
+                method: areq.method.clone(),
+                path: areq.path.clone(),
+                query_string: areq.query_string.clone(),
+                headers: areq.headers.clone(),
+                body: swift_http::Body::empty(),
+            };
+            let account = segs[2].to_string();
+            let container = segs
+                .get(3)
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
+            let object = segs
+                .get(4)
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
+            let allowed = self.allowed_methods(container.is_some());
+            if !allowed
+                .split(", ")
+                .any(|method| method == req.method.as_str())
+            {
+                return method_not_allowed(allowed);
+            }
+            if let Some(denied) = self
+                .authorize_async(&mut req, &account, container.as_deref(), object.as_deref())
+                .await
+            {
+                return denied;
+            }
+            if req
+                .headers
+                .remove(swift_middleware::VERSIONED_WRITES_AUTHORIZE_ONLY_HEADER)
+                .is_some()
+            {
+                return Response::new(204);
+            }
+            if matches!(req.method.as_str(), "POST" | "PUT") {
+                let body = match areq.body.materialize(swift_http::MAX_CONTROL_BODY).await {
+                    Ok(bytes) => swift_http::Body::Buffered(bytes),
+                    Err(e) if swift_http::body_too_large(&e) => {
+                        return Response::error(413, "Your request is too large.")
+                    }
+                    Err(_) => return swob_response(499),
+                };
+                req.body = body;
+            }
+            return match (req.method.as_str(), container.as_deref(), object.as_deref()) {
+                ("GET" | "HEAD", Some(c), Some(o)) => {
+                    let (c, o) = (c.to_string(), o.to_string());
+                    self.object_get_head_async(&mut req, &account, &c, &o).await
+                }
+                ("POST", Some(c), Some(o)) => {
+                    let (c, o) = (c.to_string(), o.to_string());
+                    self.object_post_async(&mut req, &account, &c, &o).await
+                }
+                ("GET" | "HEAD", Some(c), None) => {
+                    let c = c.to_string();
+                    self.container_get_head_async(req, &account, &c).await
+                }
+                ("POST", Some(c), None) => {
+                    let c = c.to_string();
+                    self.container_post_async(req, &account, &c).await
+                }
+                ("GET" | "HEAD", None, _) => self.account_get_head_async(req, &account).await,
+                ("POST", None, _) => self.account_post_async(req, &account).await,
+                ("DELETE", Some(c), Some(o)) => {
+                    let (c, o) = (c.to_string(), o.to_string());
+                    self.object_delete_async(&mut req, &account, &c, &o).await
+                }
+                ("DELETE", Some(c), None) => {
+                    let c = c.to_string();
+                    self.container_delete_async(req, &account, &c).await
+                }
+                ("DELETE", None, _) => self.account_delete_async(req, &account).await,
+                ("PUT", Some(c), None) => {
+                    let c = c.to_string();
+                    self.container_put_async(req, &account, &c).await
+                }
+                ("PUT", None, _) => self.account_put_async(req, &account).await,
+                _ => swob_response(405),
+            };
+        }
+        // Local control plane only. Never `self.handle()` — that path still
+        // fans out over `std::net` (leftover sync controller).
+        if areq.path.contains('\u{0}') {
+            return text_response(412, "Invalid UTF8 or contains NULL");
+        }
+        if areq.path == "/info" || areq.path.starts_with("/info?") {
+            if !self.info_json.is_empty() && matches!(areq.method.as_str(), "GET" | "HEAD") {
+                let mut resp = Response::with_body(
+                    200,
+                    if areq.method == "HEAD" {
+                        Vec::new()
+                    } else {
+                        self.info_json.clone().into_bytes()
+                    },
+                );
+                resp.headers
+                    .set("Content-Type", "application/json; charset=utf-8");
+                resp.headers.set("Content-Length", self.info_json.len());
+                return resp;
+            }
+            return swob_response(if self.info_json.is_empty() { 403 } else { 405 });
+        }
+        if areq.path == "/recon/stage" && matches!(areq.method.as_str(), "GET" | "HEAD") {
+            let body = swift_core::stage::snapshot_json();
+            let mut resp = Response::with_body(
+                200,
+                if areq.method == "HEAD" {
+                    Vec::new()
+                } else {
+                    body.clone().into_bytes()
+                },
+            );
+            resp.headers
+                .set("Content-Type", "application/json; charset=utf-8");
+            resp.headers.set("Content-Length", body.len());
+            return resp;
+        }
+        if areq.method == "OPTIONS" {
+            let segs: Vec<&str> = areq.path.splitn(5, '/').collect();
+            if segs.len() < 3 || !segs[0].is_empty() || segs[1] != "v1" || segs[2].is_empty() {
+                return swob_response(404);
+            }
+            let account = segs[2].to_string();
+            let container = segs
+                .get(3)
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
+            let origin = areq
+                .headers
+                .get("Origin")
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let requested_method = areq
+                .headers
+                .get("Access-Control-Request-Method")
+                .map(str::to_string);
+            let requested_headers_raw = areq
+                .headers
+                .get("Access-Control-Request-Headers")
+                .map(str::to_string);
+            return self
+                .options_response_async(
+                    &account,
+                    container.as_deref(),
+                    origin,
+                    requested_method,
+                    requested_headers_raw,
+                )
+                .await;
+        }
+        swob_response(404)
+    }
+
+    async fn options_response_async(
+        self: &Arc<Self>,
+        account: &str,
+        container: Option<&str>,
+        origin: Option<String>,
+        requested_method: Option<String>,
+        requested_headers_raw: Option<String>,
+    ) -> Response {
+        let allow = self.allowed_methods(container.is_some());
+        let mut resp = Response::new(200);
+        resp.headers.set("Allow", allow);
+        resp.headers.set("Content-Type", "text/html; charset=UTF-8");
+        let Some(origin) = origin else {
+            return resp;
+        };
+        let Some(container) = container else {
+            return resp;
+        };
+        let cors = self.container_info_async(account, container).await.cors;
+        let method_allowed = requested_method
+            .as_deref()
+            .map(|method| allow.split(", ").any(|allowed| allowed == method))
+            .unwrap_or(false);
+        if !self.is_origin_allowed(&cors, origin.as_str()) || !method_allowed {
+            let mut denied = Response::new(401);
+            denied.headers.set("Allow", allow);
+            denied
+                .headers
+                .set("Content-Type", "text/html; charset=UTF-8");
+            return denied;
+        }
+        if cors.allow_origin.as_deref().map(str::trim) == Some("*") {
+            resp.headers.set("Access-Control-Allow-Origin", "*");
+        } else {
+            resp.headers.set("Access-Control-Allow-Origin", origin.as_str());
+            append_vary(&mut resp.headers, "Origin");
+        }
+        if let Some(max_age) = cors.max_age {
+            resp.headers.set("Access-Control-Max-Age", max_age);
+        }
+        resp.headers.set("Access-Control-Allow-Methods", allow);
+        let requested_headers = requested_headers_raw
+            .as_deref()
+            .map(csv_header_values)
+            .unwrap_or_default();
+        if !requested_headers.is_empty() {
+            resp.headers
+                .set("Access-Control-Allow-Headers", requested_headers.join(", "));
+            append_vary(&mut resp.headers, "Access-Control-Request-Headers");
+        }
+        resp
+    }
+
+    async fn object_put_async(
+        self: &Arc<Self>,
+        req: &mut Request,
+        account: &str,
+        container: &str,
+        object: &str,
+        body: &mut swift_http::IncomingBody,
+    ) -> Response {
+        let header_policy: Option<i64> = req
+            .headers
+            .get("X-Backend-Storage-Policy-Index")
+            .and_then(|v| v.parse().ok());
+        let info = self.container_info_async(account, container).await;
+        if !info.exists() {
+            return swob_response(404);
+        }
+        let policy_index: i64 = header_policy.unwrap_or(info.policy_index);
+        let Some(object_ring) = self.object_ring_for(policy_index) else {
+            return text_response(
+                503,
+                &format!("No object ring configured for storage policy {policy_index}"),
+            );
+        };
+        let Ok((object_part, _)) = object_ring.get_nodes(account, Some(container), Some(object))
+        else {
+            return swob_response(503);
+        };
+        let path = format!(
+            "/{}/{}/{}",
+            percent_encode(account),
+            percent_encode(container),
+            percent_encode(object)
+        );
+        let (upd_account, upd_container) = self
+            .resolve_updating_shard_async(account, container, object)
+            .await
+            .unwrap_or_else(|| (account.to_string(), container.to_string()));
+        let Ok((container_part, _)) =
+            self.container_ring
+                .get_nodes(&upd_account, Some(&upd_container), None)
+        else {
+            return swob_response(503);
+        };
+        let container_nodes = self.iter_nodes(&self.container_ring, container_part);
+        let mut base = self.backend_headers(req, true, "object");
+        let put_ts = Timestamp::now();
+        base.set("X-Timestamp", put_ts.internal());
+        base.set("X-Backend-Storage-Policy-Index", policy_index);
+        base.set(
+            "Content-Type",
+            req.headers
+                .get("Content-Type")
+                .unwrap_or("application/octet-stream"),
+        );
+        if upd_account != account || upd_container != container {
+            base.set(
+                "X-Backend-Container-Path",
+                format!("{upd_account}/{upd_container}"),
+            );
+            base.set("X-Backend-Allow-Reserved-Names", "true");
+        }
+        let node_number = object_ring
+            .get_part_nodes(object_part)
+            .map(|n| n.len())
+            .unwrap_or(1);
+        let mut per_node = Vec::with_capacity(node_number);
+        for i in 0..node_number {
+            let mut headers = base.clone();
+            if !container_nodes.is_empty() {
+                let cont = &container_nodes[i % container_nodes.len()];
+                headers.set("X-Container-Host", format!("{}:{}", cont.ip, cont.port));
+                headers.set("X-Container-Partition", container_part);
+                headers.set("X-Container-Device", &cont.device);
+            }
+            per_node.push(headers);
+        }
+        let object_nodes = self.iter_nodes(object_ring, object_part);
+        let mut resp = self
+            .stream_put_async(
+                object_nodes,
+                node_number,
+                object_part,
+                &path,
+                &req.query_string,
+                per_node,
+                body,
+            )
+            .await;
+        if let Some(etag) = resp.headers.get("ETag").map(str::to_string) {
+            resp.headers.set("ETag", etag.trim_matches('"'));
+        }
+        resp.headers
+            .set("Last-Modified", swift_http::http_date(put_ts.ceil()));
+        resp
+    }
+
     fn account_request(self: &Arc<Self>, req: &Request, account: &str) -> Response {
         let Ok((part, _)) = self.account_ring.get_nodes(account, None, None) else {
             return swob_response(503);
@@ -2808,36 +3234,7 @@ impl ProxyApp {
         let headers = HeaderKeyDict::new();
         if let Some(resp) = self.get_or_head("container", nodes, part, "HEAD", &path, "", &headers)
         {
-            info.status = resp.status;
-            if let Some(idx) = resp
-                .headers
-                .get("X-Backend-Storage-Policy-Index")
-                .and_then(|v| v.parse().ok())
-            {
-                info.policy_index = idx;
-            }
-            info.read_acl = resp.headers.get("X-Container-Read").map(str::to_string);
-            info.write_acl = resp.headers.get("X-Container-Write").map(str::to_string);
-            info.temp_url_keys = temp_url_keys_from_headers(&resp.headers, "container");
-            info.sync_key = resp
-                .headers
-                .get("X-Container-Sync-Key")
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            info.cors = CorsInfo {
-                allow_origin: resp
-                    .headers
-                    .get("X-Container-Meta-Access-Control-Allow-Origin")
-                    .map(str::to_string),
-                expose_headers: resp
-                    .headers
-                    .get("X-Container-Meta-Access-Control-Expose-Headers")
-                    .map(str::to_string),
-                max_age: resp
-                    .headers
-                    .get("X-Container-Meta-Access-Control-Max-Age")
-                    .map(str::to_string),
-            };
+            fill_container_info_from_head(&mut info, &resp);
             if let Some(ttl) = info_cache_time(
                 resp.status,
                 resp.headers.get("X-Backend-Recheck-Container-Existence"),
@@ -3584,6 +3981,147 @@ impl ProxyApp {
         denied
     }
 
+    async fn authorize_async(
+        self: &Arc<Self>,
+        req: &mut Request,
+        account: &str,
+        container: Option<&str>,
+        object: Option<&str>,
+    ) -> Option<Response> {
+        if req
+            .headers
+            .get("X-Backend-Authorize-Override")
+            .map(config_true_value)
+            .unwrap_or(false)
+        {
+            req.headers.remove("X-Backend-Swift-Owner");
+            return None;
+        }
+        if !self.config.auth_enabled {
+            return None;
+        }
+        if req.headers.contains_key("X-Account-Access-Control") {
+            match swift_middleware::validate_account_acl_header(
+                req.headers.get("X-Account-Access-Control"),
+            ) {
+                Ok(Some(sysmeta)) => {
+                    req.headers.remove("X-Account-Access-Control");
+                    req.headers
+                        .set("X-Account-Sysmeta-Core-Access-Control", sysmeta);
+                }
+                Ok(None) => {}
+                Err(msg) => {
+                    let body = format!(
+                        "X-Account-Access-Control invalid: {msg}\n\nInput: {}\n",
+                        req.headers.get("X-Account-Access-Control").unwrap_or("")
+                    );
+                    let mut resp = Response::with_body(400, body);
+                    resp.headers
+                        .set("Content-Type", "text/plain; charset=UTF-8");
+                    return Some(resp);
+                }
+            }
+        }
+        if req.method == "OPTIONS" {
+            req.headers.remove("X-Backend-Swift-Owner");
+            return None;
+        }
+        let c_info = match container {
+            Some(c) => Some(self.container_info_async(account, c).await),
+            None => None,
+        };
+        if container.is_some() {
+            if let Some(req_key) = req.headers.get("x-container-sync-key") {
+                let has_ts = req.headers.get("x-timestamp").is_some()
+                    || req.headers.get("x-backend-inbound-x-timestamp").is_some();
+                if !req_key.is_empty() && has_ts {
+                    if let Some(info) = c_info.as_ref() {
+                        if let Some(sk) = info.sync_key.as_deref() {
+                            if !sk.is_empty() && sk == req_key {
+                                if req.headers.get("x-timestamp").is_none() {
+                                    if let Some(ts) = req.headers.get("x-backend-inbound-x-timestamp")
+                                    {
+                                        let ts = ts.to_string();
+                                        req.headers.remove("X-Backend-Inbound-X-Timestamp");
+                                        req.headers.set("X-Timestamp", ts);
+                                    }
+                                }
+                                req.headers.remove("X-Backend-Swift-Owner");
+                                return None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let acl: Option<String> = match container {
+            Some(_) if object.is_some() || matches!(req.method.as_str(), "GET" | "HEAD") => {
+                c_info.as_ref().and_then(|info| {
+                    if matches!(req.method.as_str(), "GET" | "HEAD") {
+                        info.read_acl.clone()
+                    } else {
+                        info.write_acl.clone()
+                    }
+                })
+            }
+            _ => None,
+        };
+        let keystone_plugin = req
+            .headers
+            .get(swift_middleware::AUTH_PLUGIN_HEADER)
+            .map(|v| v.eq_ignore_ascii_case(swift_middleware::AUTH_PLUGIN_KEYSTONE))
+            .unwrap_or(false);
+        if keystone_plugin {
+            if let Some(ka) = &self.config.keystone_auth {
+                let (denied, swift_owner) = ka.authorize_request(
+                    req,
+                    account,
+                    container,
+                    object,
+                    acl.as_deref(),
+                    req.headers.get("Referer"),
+                );
+                if denied.is_none() {
+                    if swift_owner {
+                        req.headers.set("X-Backend-Swift-Owner", "true");
+                    } else {
+                        req.headers.remove("X-Backend-Swift-Owner");
+                    }
+                }
+                return denied;
+            }
+        }
+        let groups: Vec<String> = req
+            .headers
+            .get("X-Backend-Remote-User")
+            .unwrap_or("")
+            .split(',')
+            .filter(|g| !g.is_empty())
+            .map(str::to_string)
+            .collect();
+        let acct_info = self.account_info_async(account).await;
+        let account_acls = swift_middleware::acls_from_sysmeta(acct_info.core_access_control.as_deref());
+        let mut swift_owner = false;
+        let denied = swift_middleware::TempAuth::authorize_acl(
+            &req.method,
+            &req.path,
+            &groups,
+            acl.as_deref(),
+            req.headers.get("Referer"),
+            "AUTH_",
+            account_acls.as_ref(),
+            &mut swift_owner,
+        );
+        if denied.is_none() {
+            if swift_owner {
+                req.headers.set("X-Backend-Swift-Owner", "true");
+            } else {
+                req.headers.remove("X-Backend-Swift-Owner");
+            }
+        }
+        denied
+    }
+
     fn object_request(
         self: &Arc<Self>,
         req: &mut Request,
@@ -3935,7 +4473,7 @@ impl ProxyApp {
             format!("{a}{b}")
         };
         let handoff_pool = Arc::new(Mutex::new(handoffs));
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(primaries.len().max(1));
         for (i, primary) in primaries.into_iter().enumerate() {
             let tx = tx.clone();
             let app = Arc::clone(self);
@@ -4160,7 +4698,7 @@ impl ProxyApp {
         }
         let nodes = self.iter_nodes(object_ring, object_part);
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(nodes.len().max(1));
         for node in nodes {
             let tx = tx.clone();
             let app = Arc::clone(self);
@@ -4489,7 +5027,7 @@ impl ProxyApp {
             .sum();
         let range_header = format!("bytes={frag_off}-{}", frag_off + frag_len - 1);
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(fetch_nodes.len().max(1));
         for (fi, node) in fetch_nodes.iter().cloned() {
             let tx = tx.clone();
             let app = Arc::clone(self);
@@ -4600,7 +5138,7 @@ fn resp_header<'a>(headers: &'a [(String, String)], key: &str) -> Option<&'a str
 
 /// `is_good_source` (base.py:1093-1102): the backend found what it was
 /// looking for — 2xx or 3xx, plus 416 for objects.
-fn is_good_source(status: u16, is_object: bool) -> bool {
+pub(crate) fn is_good_source(status: u16, is_object: bool) -> bool {
     if is_object && status == 416 {
         return true;
     }
@@ -4613,7 +5151,7 @@ fn is_good_source(status: u16, is_object: bool) -> bool {
 /// x-put-timestamp, x-timestamp; zero when none is usable. (Python
 /// raises on a malformed value; a well-formed backend never sends one,
 /// so falling through is the pragmatic port.)
-fn source_timestamp(headers: &[(String, String)]) -> Timestamp {
+pub(crate) fn source_timestamp(headers: &[(String, String)]) -> Timestamp {
     for key in [
         "x-backend-data-timestamp",
         "x-backend-timestamp",
@@ -4633,7 +5171,7 @@ fn source_timestamp(headers: &[(String, String)]) -> Timestamp {
 /// A 404's `X-Backend-Timestamp` — the tombstone timestamp proving the
 /// data was really DELETEd — zero when absent (base.py:1619-1621 and
 /// 1645-1646).
-fn backend_404_timestamp(headers: &[(String, String)]) -> Timestamp {
+pub(crate) fn backend_404_timestamp(headers: &[(String, String)]) -> Timestamp {
     resp_header(headers, "x-backend-timestamp")
         .and_then(|v| v.parse::<Timestamp>().ok())
         .unwrap_or(Timestamp::zero())
@@ -4642,7 +5180,7 @@ fn backend_404_timestamp(headers: &[(String, String)]) -> Timestamp {
 /// obj.py:955-962: a final 404 despite an existence proof (some node
 /// answered 202 Accepted in the primary round) means the mixed results
 /// can't be resolved — return 503 instead.
-fn post_existence_proof_guard(resp: Response, found_count: usize) -> Response {
+pub(crate) fn post_existence_proof_guard(resp: Response, found_count: usize) -> Response {
     if resp.status == 404 && found_count > 0 {
         swob_response(503)
     } else {
@@ -4667,7 +5205,7 @@ fn text_response(status: u16, body: &str) -> Response {
 
 /// The synthesized empty-account response for autocreate accounts
 /// (`account_listing_response` with a `FakeAccountBroker`).
-fn synthesized_account_listing(req: &Request) -> Response {
+pub(crate) fn synthesized_account_listing(req: &Request) -> Response {
     let format = req.param("format").unwrap_or_default();
     let now = Timestamp::now();
     let (content_type, body): (&str, Vec<u8>) = match format.as_str() {
@@ -4820,7 +5358,7 @@ pub(crate) fn merge_sharded_object_listings(
     merged
 }
 
-fn percent_encode(s: &str) -> String {
+pub(crate) fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -4863,7 +5401,40 @@ fn temp_url_keys_from_headers(headers: &HeaderKeyDict, server_type: &str) -> Vec
     keys
 }
 
-fn account_info_from_response(resp: &Response) -> AccountInfo {
+pub(crate) fn fill_container_info_from_head(info: &mut ContainerInfo, resp: &Response) {
+    info.status = resp.status;
+    if let Some(idx) = resp
+        .headers
+        .get("X-Backend-Storage-Policy-Index")
+        .and_then(|v| v.parse().ok())
+    {
+        info.policy_index = idx;
+    }
+    info.read_acl = resp.headers.get("X-Container-Read").map(str::to_string);
+    info.write_acl = resp.headers.get("X-Container-Write").map(str::to_string);
+    info.temp_url_keys = temp_url_keys_from_headers(&resp.headers, "container");
+    info.sync_key = resp
+        .headers
+        .get("X-Container-Sync-Key")
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    info.cors = CorsInfo {
+        allow_origin: resp
+            .headers
+            .get("X-Container-Meta-Access-Control-Allow-Origin")
+            .map(str::to_string),
+        expose_headers: resp
+            .headers
+            .get("X-Container-Meta-Access-Control-Expose-Headers")
+            .map(str::to_string),
+        max_age: resp
+            .headers
+            .get("X-Container-Meta-Access-Control-Max-Age")
+            .map(str::to_string),
+    };
+}
+
+pub(crate) fn account_info_from_response(resp: &Response) -> AccountInfo {
     AccountInfo {
         status: resp.status,
         core_access_control: resp
@@ -4914,9 +5485,138 @@ fn strip_owner_headers(resp: &mut Response, swift_owner: bool) {
     }
 }
 
-pub fn serve(listener: std::net::TcpListener, app: Arc<ProxyApp>) -> std::io::Result<()> {
-    let handler: swift_http::Handler = Arc::new(move |req| app.handle(req));
-    swift_http::serve_forever(listener, handler)
+fn request_to_async(req: Request) -> AsyncRequest {
+    let bytes = match req.body {
+        swift_http::Body::Buffered(b) => b,
+        _ => Vec::new(),
+    };
+    AsyncRequest {
+        method: req.method,
+        path: req.path,
+        query_string: req.query_string,
+        headers: req.headers,
+        body: swift_http::IncomingBody::from_bytes(bytes, swift_http::MAX_CONTROL_BODY),
+    }
+}
+
+struct ProxyAsyncService {
+    app: Arc<RwLock<Arc<ProxyApp>>>,
+    filters: Vec<Arc<dyn swift_middleware::Middleware>>,
+}
+
+impl AsyncService for ProxyAsyncService {
+    fn call(
+        &self,
+        req: AsyncRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+        let app = {
+            let guard = self.app.read().unwrap_or_else(|p| p.into_inner());
+            Arc::clone(&guard)
+        };
+        let filters = self.filters.clone();
+        Box::pin(async move {
+            let mut req = req;
+            if filters.is_empty() {
+                return app.handle_async(req).await;
+            }
+            let mut head = Request {
+                method: req.method.clone(),
+                path: req.path.clone(),
+                query_string: req.query_string.clone(),
+                headers: req.headers.clone(),
+                body: swift_http::Body::empty(),
+            };
+            for filter in &filters {
+                match filter.prepare_async(&mut head).await {
+                    swift_middleware::MwPrep::Continue => {}
+                    swift_middleware::MwPrep::ShortCircuit(resp) => {
+                        let mut resp = resp;
+                        for g in filters.iter().rev() {
+                            resp = g.finish(&head, resp);
+                        }
+                        return resp;
+                    }
+                }
+            }
+            req.headers = head.headers.clone();
+            req.query_string = head.query_string.clone();
+            if filters.iter().any(|f| f.intercepts_request(&head)) {
+                let body = match req.body.materialize(swift_http::MAX_CONTROL_BODY).await {
+                    Ok(bytes) => swift_http::Body::Buffered(bytes),
+                    Err(e) if swift_http::body_too_large(&e) => {
+                        return Response::error(413, "Your request is too large.")
+                    }
+                    Err(_) => return swob_response(499),
+                };
+                let request = Request {
+                    method: req.method,
+                    path: req.path,
+                    query_string: req.query_string,
+                    headers: req.headers,
+                    body,
+                };
+                let next: swift_middleware::AsyncNextFn = {
+                    let app = Arc::clone(&app);
+                    Arc::new(move |r| {
+                        let app = Arc::clone(&app);
+                        Box::pin(async move { app.handle_async(request_to_async(r)).await })
+                    })
+                };
+                for filter in filters.iter().rev() {
+                    if filter.intercepts_request(&head) {
+                        return filter.handle_request_async(request, next).await;
+                    }
+                }
+                return next(request).await;
+            }
+            let mut resp = app.handle_async(req).await;
+            let slo = resp
+                .headers
+                .get("X-Static-Large-Object")
+                .is_some_and(config_true_value);
+            let dlo = resp.headers.get("X-Object-Manifest").is_some();
+            if (slo || dlo) && matches!(resp.body, swift_http::Body::Channel(_)) {
+                let body = std::mem::replace(&mut resp.body, swift_http::Body::empty());
+                match body.collect_async().await {
+                    Ok(bytes) => resp.body = swift_http::Body::Buffered(bytes),
+                    Err(_) => resp.body = swift_http::Body::empty(),
+                }
+            }
+            for filter in filters.iter().rev() {
+                if filter.intercepts_response() {
+                    let captured = Arc::new(Mutex::new(Some(resp)));
+                    let app2 = Arc::clone(&app);
+                    let next: swift_middleware::AsyncNextFn = Arc::new(move |r| {
+                        let captured = Arc::clone(&captured);
+                        let app2 = Arc::clone(&app2);
+                        Box::pin(async move {
+                            if let Some(inner) =
+                                captured.lock().unwrap_or_else(|p| p.into_inner()).take()
+                            {
+                                return inner;
+                            }
+                            app2.handle_async(request_to_async(r)).await
+                        })
+                    });
+                    resp = filter.reassemble_async(head.clone_head(), next).await;
+                } else {
+                    resp = filter.finish(&head, resp);
+                }
+            }
+            resp
+        })
+    }
+}
+
+pub fn serve(listener: TcpListener, app: Arc<ProxyApp>) -> std::io::Result<()> {
+    swift_http::serve_forever_multi_service(
+        vec![listener],
+        Arc::new(ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: Vec::new(),
+        }),
+        swift_http::ServerConfig::default(),
+    )
 }
 
 /// Ring resolver used by `list_endpoints` in the configured middleware
@@ -4954,7 +5654,7 @@ impl swift_middleware::EndpointResolver for ProxyEndpointResolver {
 /// (`catch_errors gatekeeper healthcheck proxy-server`), the default
 /// Swift proxy front matter.
 pub fn serve_with_pipeline(
-    listener: std::net::TcpListener,
+    listener: TcpListener,
     app: Arc<ProxyApp>,
 ) -> std::io::Result<()> {
     serve_with_filters(listener, app, Vec::new())
@@ -4964,7 +5664,7 @@ pub fn serve_with_pipeline(
 /// after gatekeeper (e.g. a configured `TempAuth`), matching the usual
 /// `catch_errors gatekeeper healthcheck <auth> proxy-server` order.
 pub fn serve_with_filters(
-    listener: std::net::TcpListener,
+    listener: TcpListener,
     app: Arc<ProxyApp>,
     extra: Vec<Arc<dyn swift_middleware::Middleware>>,
 ) -> std::io::Result<()> {
@@ -4982,30 +5682,78 @@ pub fn serve_with_filters(
 /// so a ring-reload thread can atomically swap in a freshly built
 /// [`ProxyApp`] without restarting the server.
 pub fn serve_with_filters_and_config(
-    listener: std::net::TcpListener,
+    listener: TcpListener,
     app: Arc<RwLock<Arc<ProxyApp>>>,
     extra: Vec<Arc<dyn swift_middleware::Middleware>>,
     config: swift_http::ServerConfig,
 ) -> std::io::Result<()> {
-    use swift_middleware::{build_pipeline, CatchErrors, Gatekeeper, HealthCheck, Middleware};
-    let inner: Arc<dyn Fn(Request) -> Response + Send + Sync> = Arc::new(move |req| {
-        // Hold the read lock only long enough to clone the Arc so request
-        // handling never blocks a pending ring swap.
-        let current = {
-            let guard = app.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-            Arc::clone(&guard)
-        };
-        current.handle(req)
-    });
+    use swift_middleware::{CatchErrors, Gatekeeper, HealthCheck, Middleware};
     let mut filters: Vec<Arc<dyn Middleware>> = vec![
         Arc::new(CatchErrors::new("")),
         Arc::new(Gatekeeper::default()),
         Arc::new(HealthCheck::default()),
     ];
     filters.extend(extra);
-    let pipeline = build_pipeline(filters, inner);
-    let handler: swift_http::Handler = Arc::new(move |req| pipeline(req));
-    swift_http::serve_forever_with_config(listener, handler, config)
+    swift_http::serve_forever_multi_service(
+        vec![listener],
+        Arc::new(ProxyAsyncService { app, filters }),
+        config,
+    )
+}
+
+#[cfg(test)]
+mod pipeline_async_tests {
+    use super::*;
+    use swift_http::IncomingBody;
+
+    #[tokio::test]
+    async fn tempauth_prepare_runs_on_hyper_path_so_auth_endpoint_is_not_404() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::CatchErrors::new("")),
+                Arc::new(swift_middleware::Gatekeeper::default()),
+                Arc::new(ta),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Auth-User", "test:tester");
+        headers.set("X-Auth-Key", "testing");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/auth/v1.0".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "tempauth must run on the production async path, got {}",
+            resp.reason
+        );
+        assert!(
+            resp.headers.get("X-Auth-Token").is_some(),
+            "token missing: {:?}",
+            resp.headers
+        );
+        assert!(
+            resp.headers.get("X-Trans-Id").is_some(),
+            "catch_errors must stamp X-Trans-Id on the async path"
+        );
+    }
+
 }
 
 #[cfg(test)]
@@ -5511,6 +6259,42 @@ mod cors_tests {
             preflight.headers.get("Access-Control-Allow-Origin"),
             Some("https://allowed.example")
         );
+    }
+
+    #[tokio::test]
+    async fn handle_async_options_and_info_do_not_call_sync_handle() {
+        let app = app(ProxyConfig::default());
+        let opt = app
+            .handle_async(swift_http::AsyncRequest {
+                method: "OPTIONS".into(),
+                path: "/v1/AUTH_test".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(opt.status, 200, "{}", opt.reason);
+        assert_eq!(opt.headers.get("Allow"), Some("GET, HEAD, POST, OPTIONS"));
+        let info = app
+            .handle_async(swift_http::AsyncRequest {
+                method: "GET".into(),
+                path: "/info".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(info.status, 403, "empty info_json is 403, got {}", info.status);
+        let unknown = app
+            .handle_async(swift_http::AsyncRequest {
+                method: "PATCH".into(),
+                path: "/not-v1".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(unknown.status, 404);
     }
 
     #[test]

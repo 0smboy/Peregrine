@@ -50,7 +50,9 @@
 //! a best-effort background segment-DELETE thread is used instead of
 //! Python's bare 503.
 
+use std::future::Future;
 use std::io::{Cursor, Read};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -64,7 +66,7 @@ use swift_http::{
     MAX_CONTROL_BODY,
 };
 
-use crate::{Middleware, NextFn};
+use crate::{AsyncNextFn, Middleware, NextFn};
 
 /// `max_manifest_size` (Python slo.py default): the client manifest on a
 /// `?multipart-manifest=put` may not exceed this.
@@ -403,6 +405,154 @@ fn expand_segments(
         }
     }
     Ok(out)
+}
+
+async fn expand_segments_async(
+    orig: Request,
+    version: String,
+    account: String,
+    segments: Vec<StoredSeg>,
+    next: AsyncNextFn,
+    depth: usize,
+) -> Result<Vec<LeafSeg>, Response> {
+    let mut out = Vec::new();
+    for seg in segments {
+        if let Some(b64) = &seg.data_b64 {
+            let raw = B64
+                .decode(b64.as_bytes())
+                .map_err(|_| Response::error(409, "Conflict"))?;
+            let length = raw.len() as i64;
+            if length <= 0 {
+                continue;
+            }
+            out.push(LeafSeg {
+                name: String::new(),
+                bytes: length,
+                range: None,
+                raw_data: Some(raw),
+            });
+            continue;
+        }
+        if seg.sub_slo {
+            if depth >= MAX_SLO_RECURSION_DEPTH {
+                return Err(Response::error(409, "Conflict"));
+            }
+            let path = format!("/{version}/{account}{}", seg.name);
+            let sub = slo_subreq(&orig, path.clone(), None);
+            let sresp = next(sub).await;
+            if !(200..300).contains(&sresp.status) {
+                return Err(Response::error(409, "Conflict"));
+            }
+            let body = match sresp.body.collect_async().await {
+                Ok(b) => b,
+                Err(_) => return Err(Response::error(409, "Conflict")),
+            };
+            let Some(sub_segs) = parse_stored_manifest(&body) else {
+                return Err(Response::error(409, "Conflict"));
+            };
+            let mut nested = Box::pin(expand_segments_async(
+                orig.clone_head(),
+                version.clone(),
+                account.clone(),
+                sub_segs,
+                next.clone(),
+                depth + 1,
+            ))
+            .await?;
+            if let Some(range) = &seg.range {
+                let Some((start, end)) = parse_inclusive_range(range) else {
+                    return Err(Response::error(409, "Conflict"));
+                };
+                nested = slice_leaves_for_range(&nested, start, end + 1)?;
+            }
+            out.extend(nested);
+        } else {
+            let length = contrib_length(&seg);
+            if length <= 0 {
+                continue;
+            }
+            out.push(LeafSeg {
+                name: seg.name.clone(),
+                bytes: length,
+                range: seg.range.clone(),
+                raw_data: None,
+            });
+        }
+    }
+    Ok(out)
+}
+
+async fn forward_body_chunks(
+    body: Body,
+    tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+) -> Result<(), ()> {
+    match body {
+        Body::Buffered(b) => {
+            if !b.is_empty() && tx.send(Ok(b)).await.is_err() {
+                return Err(());
+            }
+            Ok(())
+        }
+        Body::Channel(ch) => {
+            let (mut rx, _scope, _) = ch.into_rx();
+            while let Some(chunk) = rx.recv().await {
+                if tx.send(chunk).await.is_err() {
+                    return Err(());
+                }
+            }
+            Ok(())
+        }
+        Body::Streamed(s) => match Body::Streamed(s).collect_async().await {
+            Ok(b) => {
+                if !b.is_empty() && tx.send(Ok(b)).await.is_err() {
+                    return Err(());
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                Err(())
+            }
+        },
+    }
+}
+
+fn leaf_stream_channel(
+    orig: Request,
+    version: String,
+    account: String,
+    leaves: Vec<LeafSeg>,
+    next: AsyncNextFn,
+    total_len: u64,
+) -> Body {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let scope = swift_runtime::TaskScope::bounded(1);
+    let _ = scope.spawn(async move {
+        for leaf in leaves {
+            if let Some(raw) = leaf.raw_data {
+                if tx.send(Ok(raw)).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            let path = format!("/{version}/{account}{}", leaf.name);
+            let sub = slo_subreq(&orig, path.clone(), leaf.range.as_deref());
+            let sresp = next(sub).await;
+            if !(200..300).contains(&sresp.status) {
+                let _ = tx
+                    .send(Err(std::io::Error::other(format!(
+                        "SLO segment {path} returned {}",
+                        sresp.status
+                    ))))
+                    .await;
+                return;
+            }
+            if forward_body_chunks(sresp.body, &tx).await.is_err() {
+                return;
+            }
+        }
+    });
+    Body::from_channel(rx, Some(total_len), scope)
 }
 
 /// Narrow `leaves` to the half-open aggregate window `[first, last_excl)`,
@@ -763,6 +913,220 @@ impl Slo {
         out
     }
 
+    async fn handle_get_head_async(&self, mut req: Request, next: AsyncNextFn) -> Response {
+        ignore_range(&mut req.headers, SLO_HEADER);
+        let orig = req.clone_head();
+        let mut resp = next(req).await;
+
+        let is_slo = resp
+            .headers
+            .get(SLO_HEADER)
+            .map(config_true_value)
+            .unwrap_or(false);
+        if !is_slo {
+            return resp;
+        }
+
+        let mut json_etag = resp
+            .headers
+            .get("Etag")
+            .map(normalize_etag)
+            .filter(|etag| !etag.is_empty())
+            .map(str::to_string);
+        let sys_etag = resp
+            .headers
+            .get(SYSMETA_SLO_ETAG)
+            .map(normalize_etag)
+            .filter(|e| !e.is_empty())
+            .map(str::to_string);
+        let sys_size = resp
+            .headers
+            .get(SYSMETA_SLO_SIZE)
+            .and_then(|s| s.parse::<i64>().ok());
+        let is_get = orig.method == "GET";
+
+        let (etag, total_len, segments) = if let (Some(e), Some(sz)) = (&sys_etag, sys_size) {
+            if is_get {
+                let body = std::mem::replace(&mut resp.body, Body::empty());
+                let manifest_bytes = match body.collect_async().await {
+                    Ok(body) => body,
+                    Err(_) => return resp,
+                };
+                if json_etag.is_none() {
+                    json_etag = Some(manifest_etag(&manifest_bytes));
+                }
+                let Some(segments) = parse_stored_manifest(&manifest_bytes) else {
+                    return resp;
+                };
+                (e.clone(), sz, segments)
+            } else {
+                (e.clone(), sz, Vec::new())
+            }
+        } else {
+            if !is_get {
+                let mut get_req = orig.clone_head();
+                get_req.method = "GET".to_string();
+                ignore_range(&mut get_req.headers, SLO_HEADER);
+                resp = next(get_req).await;
+                if !resp
+                    .headers
+                    .get(SLO_HEADER)
+                    .map(config_true_value)
+                    .unwrap_or(false)
+                {
+                    return resp;
+                }
+                json_etag = resp
+                    .headers
+                    .get("Etag")
+                    .map(normalize_etag)
+                    .filter(|etag| !etag.is_empty())
+                    .map(str::to_string)
+                    .or(json_etag);
+            }
+            let body = std::mem::replace(&mut resp.body, Body::empty());
+            let manifest_bytes = match body.collect_async().await {
+                Ok(body) => body,
+                Err(_) => return resp,
+            };
+            if json_etag.is_none() {
+                json_etag = Some(manifest_etag(&manifest_bytes));
+            }
+            let Some(segments) = parse_stored_manifest(&manifest_bytes) else {
+                return resp;
+            };
+            let slo_segs: Vec<SloSegment> = segments
+                .iter()
+                .map(|s| {
+                    if let Some(b64) = &s.data_b64 {
+                        let raw = B64.decode(b64.as_bytes()).unwrap_or_default();
+                        SloSegment {
+                            hash: String::new(),
+                            segment_length: raw.len() as i64,
+                            range: None,
+                            raw_data: Some(raw),
+                        }
+                    } else {
+                        SloSegment {
+                            hash: s.hash.clone(),
+                            segment_length: contrib_length(s),
+                            range: s.range.clone(),
+                            raw_data: None,
+                        }
+                    }
+                })
+                .collect();
+            let (etag, total_len) = slo_etag_and_size(&slo_segs);
+            (etag, total_len, segments)
+        };
+
+        let parts = match split_path(&orig.path, 2, 3, true) {
+            Ok(p) => p,
+            Err(_) => return Response::error(400, "Invalid path"),
+        };
+        let version = parts[0].clone().unwrap_or_default();
+        let account = parts[1].clone().unwrap_or_default();
+
+        let mut byte_range: Option<(u64, u64)> = None;
+        let mut unsatisfiable = false;
+        let range = orig
+            .headers
+            .get("Range")
+            .and_then(|h| Range::parse(h).ok())
+            .filter(|r| r.ranges.len() == 1);
+        if let Some(range) = range {
+            match range.ranges_for_length(Some(total_len.max(0) as u64)) {
+                Some(r) if r.is_empty() => unsatisfiable = true,
+                Some(r) => byte_range = Some(r[0]),
+                None => {}
+            }
+        }
+        if unsatisfiable {
+            let mut r = Response::error(416, "Requested Range Not Satisfiable");
+            r.headers.set("Accept-Ranges", "bytes");
+            r.headers
+                .set("Content-Range", format!("bytes */{}", total_len.max(0)));
+            return r;
+        }
+
+        let mut headers = resp.headers.clone();
+        headers.remove("Content-Length");
+        headers.remove("Content-Range");
+        headers.remove("Transfer-Encoding");
+        headers.remove("Etag");
+        headers.remove(MANIFEST_ETAG_HEADER);
+        headers.set("Etag", format!("\"{etag}\""));
+        if let Some(json_etag) = json_etag {
+            headers.set(MANIFEST_ETAG_HEADER, json_etag);
+        }
+        headers.set("Accept-Ranges", "bytes");
+
+        let leaves = if is_get {
+            match expand_segments_async(
+                orig.clone_head(),
+                version.clone(),
+                account.clone(),
+                segments,
+                next.clone(),
+                1,
+            )
+            .await
+            {
+                Ok(l) => l,
+                Err(err) => return err,
+            }
+        } else {
+            Vec::new()
+        };
+
+        let (status, body, content_len) = if let Some((first, last_excl)) = byte_range {
+            let ranged = if is_get {
+                match slice_leaves_for_range(&leaves, first, last_excl) {
+                    Ok(l) => l,
+                    Err(err) => return err,
+                }
+            } else {
+                Vec::new()
+            };
+            headers.set(
+                "Content-Range",
+                format!("bytes {}-{}/{}", first, last_excl - 1, total_len.max(0)),
+            );
+            let len = (last_excl - first) as i64;
+            let body = if is_get {
+                leaf_stream_channel(
+                    orig.clone_head(),
+                    version.clone(),
+                    account.clone(),
+                    ranged,
+                    next,
+                    last_excl - first,
+                )
+            } else {
+                Body::empty()
+            };
+            (206u16, body, len)
+        } else if is_get {
+            let body = leaf_stream_channel(
+                orig.clone_head(),
+                version.clone(),
+                account.clone(),
+                leaves,
+                next,
+                total_len.max(0) as u64,
+            );
+            (200u16, body, total_len)
+        } else {
+            (200u16, Body::empty(), total_len)
+        };
+
+        headers.set("Content-Length", content_len.to_string());
+        let mut out = Response::new(status);
+        out.headers = headers;
+        out.body = body;
+        out
+    }
+
     /// Lazy leaf-segment reassembly: each subrequest runs only when the
     /// client stream reaches that leaf; a mid-stream failure aborts the
     /// connection (Python parity — the status is already sent). Inline
@@ -880,6 +1244,70 @@ impl Slo {
 
         let built = validate_put_entries(&req, entries, &version, &account, next, &mut || {});
         finish_put(req, next, built)
+    }
+
+    async fn handle_put_async(&self, mut req: Request, next: AsyncNextFn) -> Response {
+        let manifest_bytes = match req.body.materialize(MAX_MANIFEST_SIZE) {
+            Ok(b) => b.to_vec(),
+            Err(e) if body_too_large(&e) => {
+                return Response::error(413, "Request Entity Too Large")
+            }
+            Err(_) => return Response::error(499, "Client Disconnect"),
+        };
+        let Ok(client) = serde_json::from_slice::<serde_json::Value>(&manifest_bytes) else {
+            return Response::error(400, "Manifest must be valid json.");
+        };
+        let Some(entries) = client.as_array() else {
+            return Response::error(400, "Manifest must be a list.");
+        };
+        let object_segment_count = entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .as_object()
+                    .map(|segment| segment.contains_key("path"))
+                    .unwrap_or(false)
+            })
+            .count();
+        if object_segment_count > MAX_MANIFEST_SEGMENTS {
+            let body =
+                format!("Number of object-backed segments must be <= {MAX_MANIFEST_SEGMENTS}");
+            let mut resp = Response::with_body(413, body.clone());
+            resp.headers.set("Content-Type", "text/html; charset=UTF-8");
+            resp.headers.set("Content-Length", body.len());
+            return resp;
+        }
+        let parts = match split_path(&req.path, 4, 4, true) {
+            Ok(p) => p,
+            Err(_) => return Response::error(400, "Invalid path"),
+        };
+        let version = parts[0].clone().unwrap_or_default();
+        let account = parts[1].clone().unwrap_or_default();
+        let mut heads: std::collections::HashMap<String, Response> =
+            std::collections::HashMap::new();
+        for e in entries {
+            let Some(path) = e.get("path").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let stored_path = format!("/{}", path.trim_start_matches('/'));
+            let seg_path = format!("/{version}/{account}{stored_path}");
+            let mut head = req.clone_head();
+            head.method = "HEAD".to_string();
+            head.path = seg_path.clone();
+            head.query_string = String::new();
+            head.headers.remove("Content-Length");
+            heads.insert(seg_path, next(head).await);
+        }
+        let heads = std::sync::Mutex::new(heads);
+        let next_heads: NextFn = Arc::new(move |r| {
+            heads
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&r.path)
+                .unwrap_or_else(|| Response::error(404, "Segment Not Found"))
+        });
+        let built = validate_put_entries(&req, entries, &version, &account, &next_heads, &mut || {});
+        finish_put_async(req, next, built).await
     }
 
     /// `?multipart-manifest=delete`: expand the SLO (and nested sub_slo)
@@ -1044,6 +1472,101 @@ impl Slo {
     /// fails, falls back to a best-effort detached-thread segment DELETE then
     /// still removes the manifest (Python would return 503 and leave the
     /// manifest).
+    async fn handle_multipart_delete_async(
+        &self,
+        req: Request,
+        next: AsyncNextFn,
+    ) -> Response {
+        if req
+            .param("async")
+            .as_deref()
+            .map(config_true_value)
+            .unwrap_or(false)
+        {
+            return next(req).await;
+        }
+        let parts = match split_path(&req.path, 4, 4, true) {
+            Ok(p) => p,
+            Err(_) => return Response::error(400, "Invalid path"),
+        };
+        let version = parts[0].clone().unwrap_or_default();
+        let account = parts[1].clone().unwrap_or_default();
+        let container = parts[2].clone().unwrap_or_default();
+        let object = parts[3].clone().unwrap_or_default();
+        let manifest_name = format!("/{container}/{object}");
+        let mut get = req.clone_head();
+        get.method = "GET".to_string();
+        get.query_string = "multipart-manifest=get".to_string();
+        get.headers.remove("Content-Length");
+        ignore_range(&mut get.headers, SLO_HEADER);
+        let mut mresp = next(get).await;
+        if !(200..300).contains(&mresp.status) {
+            return Response::error(mresp.status, "Unable to load SLO manifest");
+        }
+        let is_slo = mresp
+            .headers
+            .get(SLO_HEADER)
+            .map(config_true_value)
+            .unwrap_or(false);
+        if !is_slo {
+            return Response::error(400, "Not an SLO manifest");
+        }
+        let body = match std::mem::replace(&mut mresp.body, Body::empty())
+            .collect_async()
+            .await
+        {
+            Ok(b) => b,
+            Err(_) => return Response::error(500, "Unable to load SLO manifest data"),
+        };
+        let Some(root_segs) = parse_stored_manifest(&body) else {
+            return Response::error(400, "Invalid SLO manifest");
+        };
+        let mut to_delete: Vec<String> = root_segs
+            .into_iter()
+            .filter(|s| s.data_b64.is_none() && !s.name.is_empty())
+            .map(|s| s.name)
+            .collect();
+        to_delete.push(manifest_name);
+        let mut number_deleted = 0u64;
+        let mut number_not_found = 0u64;
+        let mut errors: Vec<(String, String)> = Vec::new();
+        for name in &to_delete {
+            let delete_path = if name.starts_with('/') {
+                format!("/{version}/{account}{name}")
+            } else {
+                format!("/{version}/{account}/{name}")
+            };
+            let mut del = req.clone_head();
+            del.method = "DELETE".to_string();
+            del.path = delete_path;
+            del.query_string = String::new();
+            del.headers.remove("Content-Length");
+            let resp = next(del).await;
+            match resp.status {
+                s if (200..300).contains(&s) => number_deleted += 1,
+                404 => number_not_found += 1,
+                s => errors.push((name.clone(), format!("{s}"))),
+            }
+        }
+        let (status, body_note) = if !errors.is_empty() {
+            (400u16, "")
+        } else if number_deleted == 0 && number_not_found == 0 {
+            (400, "Invalid bulk delete.")
+        } else {
+            (200, "")
+        };
+        let summary = serde_json::json!({
+            "Number Deleted": number_deleted,
+            "Number Not Found": number_not_found,
+            "Response Status": format!("{status} {}", swift_http::reason_phrase(status)),
+            "Response Body": body_note,
+            "Errors": errors.iter().map(|(p, e)| vec![p.clone(), e.clone()]).collect::<Vec<_>>(),
+        });
+        let mut out = Response::with_body(200, summary.to_string().into_bytes());
+        out.headers.set("Content-Type", "application/json");
+        out
+    }
+
     fn handle_async_delete(&self, req: Request, next: &NextFn) -> Response {
         let parts = match split_path(&req.path, 4, 4, true) {
             Ok(p) => p,
@@ -1592,6 +2115,53 @@ fn finish_put(mut req: Request, next: &NextFn, built: PutManifestBuilt) -> Respo
     resp
 }
 
+async fn finish_put_async(
+    mut req: Request,
+    next: AsyncNextFn,
+    built: PutManifestBuilt,
+) -> Response {
+    if !built.errors.is_empty() {
+        return Response::error(400, &format!("Errors: {}", built.errors.join(", ")));
+    }
+    if built.entry_count > 0 && !built.has_object_backed {
+        return Response::error(
+            400,
+            "Inline data segments require at least one object-backed segment.",
+        );
+    }
+    let (slo_etag, total) = slo_etag_and_size(&built.slo_segs);
+    let client_etag = req
+        .headers
+        .get("Etag")
+        .map(normalize_etag)
+        .filter(|etag| !etag.is_empty())
+        .map(str::to_string);
+    if let Some(client_etag) = client_etag {
+        if client_etag != slo_etag {
+            return Response::error(422, "Unable to process the contained instructions");
+        }
+    }
+    let body = serde_json::to_vec(&built.internal).unwrap_or_default();
+    let json_etag = manifest_etag(&body);
+    req.method = "PUT".to_string();
+    req.query_string = String::new();
+    req.headers.set(SLO_HEADER, "True");
+    req.headers.set("Content-Length", body.len().to_string());
+    req.headers
+        .set(SYSMETA_SLO_ETAG, slo_etag.trim_matches('"'));
+    req.headers.set(SYSMETA_SLO_SIZE, total.to_string());
+    req.headers.set("Etag", json_etag);
+    if req.headers.get("Content-Type").is_none() {
+        req.headers.set("Content-Type", "application/json");
+    }
+    req.body = body.into();
+    let mut resp = next(req).await;
+    if (200..300).contains(&resp.status) {
+        resp.headers.set("Etag", format!("\"{slo_etag}\""));
+    }
+    resp
+}
+
 /// Streamed heartbeat PUT body (Python slo.py): leading space, per-HEAD
 /// spaces, then `\r\n\r\n` + final JSON status under a 202 response.
 struct HeartbeatPutBody {
@@ -1854,6 +2424,52 @@ fn probe_async_delete_write_acl(
 }
 
 impl Middleware for Slo {
+    fn intercepts_request(&self, req: &Request) -> bool {
+        if split_path(&req.path, 4, 4, true).is_err() {
+            return false;
+        }
+        let mpm = req.param("multipart-manifest");
+        (req.method == "PUT" && mpm.as_deref() == Some("put"))
+            || (req.method == "DELETE" && mpm.as_deref() == Some("delete"))
+    }
+
+    fn intercepts_response(&self) -> bool {
+        true
+    }
+
+    fn handle_request_async(
+        &self,
+        req: Request,
+        next: AsyncNextFn,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move {
+            let mpm = req.param("multipart-manifest");
+            if req.method == "PUT" && mpm.as_deref() == Some("put") {
+                return self.handle_put_async(req, next).await;
+            }
+            if req.method == "DELETE" && mpm.as_deref() == Some("delete") {
+                return self.handle_multipart_delete_async(req, next).await;
+            }
+            next(req).await
+        })
+    }
+
+    fn reassemble_async(
+        &self,
+        req: Request,
+        next: AsyncNextFn,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move {
+            if split_path(&req.path, 4, 4, true).is_err() {
+                return next(req).await;
+            }
+            if req.method == "GET" || req.method == "HEAD" {
+                return self.handle_get_head_async(req, next).await;
+            }
+            next(req).await
+        })
+    }
+
     fn handle(&self, req: Request, next: &NextFn) -> Response {
         if split_path(&req.path, 4, 4, true).is_err() {
             return next(req);

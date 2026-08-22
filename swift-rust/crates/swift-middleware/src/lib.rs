@@ -144,6 +144,8 @@ pub use versioned_writes::{
 };
 pub use xprofile::XProfile;
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use swift_http::{Request, Response};
@@ -153,10 +155,91 @@ use swift_http::{Request, Response};
 /// lazy SLO/DLO segment readers).
 pub type NextFn = Arc<dyn Fn(Request) -> Response + Send + Sync>;
 
+/// Async inner app for production Hyper serve. SLO/DLO segment subrequests
+/// must go through this, not a blocking `handle()`.
+pub type AsyncNextFn = Arc<
+    dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync,
+>;
+
+/// Header-only phase on the production Hyper path. Must not read the
+/// request body (object PUT/GET stay on `handle_async`).
+pub enum MwPrep {
+    Continue,
+    ShortCircuit(Response),
+}
+
 /// A pipeline filter. `handle` may inspect/mutate the request, call
 /// `next`, and inspect/mutate the response.
+///
+/// Production serve splits the filter into:
+/// * [`prepare`] — stamp/strip headers or short-circuit (tempauth, gatekeeper)
+/// * the async app (`handle_async`) for object streaming
+/// * [`intercepts_response`] — SLO/DLO/listing wrap the app response
+/// * [`finish`] — outbound header rewrite
 pub trait Middleware: Send + Sync {
     fn handle(&self, req: Request, next: &NextFn) -> Response;
+
+    fn prepare(&self, _req: &mut Request) -> MwPrep {
+        MwPrep::Continue
+    }
+
+    /// Header phase on the Hyper path. Default is [`prepare`]. Auth filters
+    /// that talk to Keystone over the network must override this so the
+    /// wait is a Future, not `std::net` on a Tokio worker.
+    fn prepare_async<'a>(
+        &'a self,
+        req: &'a mut Request,
+    ) -> Pin<Box<dyn Future<Output = MwPrep> + Send + 'a>> {
+        Box::pin(async move { self.prepare(req) })
+    }
+
+    fn finish(&self, _req: &Request, resp: Response) -> Response {
+        resp
+    }
+
+    /// Manifest PUT/DELETE and similar control-plane intercepts: the
+    /// server materializes at [`swift_http::MAX_CONTROL_BODY`] and runs
+    /// the sync pipeline (inner `handle`, not object-sized PUT).
+    fn intercepts_request(&self, _req: &Request) -> bool {
+        false
+    }
+
+    /// Control-plane intercept (SLO PUT/DELETE) with async inner app.
+    fn handle_request_async(
+        &self,
+        req: Request,
+        next: AsyncNextFn,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move { next(req).await })
+    }
+
+    /// GET/HEAD reassembly or listing rewrite after the async app returns.
+    fn intercepts_response(&self) -> bool {
+        false
+    }
+
+    /// Production Hyper path: first `next` is the async app response;
+    /// further `next` calls (SLO/DLO segments) are also async.
+    fn reassemble_async(
+        &self,
+        req: Request,
+        next: AsyncNextFn,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move {
+            let first = next(req.clone_head()).await;
+            let cap = std::sync::Mutex::new(Some(first));
+            let sync: NextFn = Arc::new(move |r| {
+                let _ = r;
+                cap.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take()
+                    .unwrap_or_else(|| {
+                        Response::error(500, "sync intercept issued a second subrequest")
+                    })
+            });
+            self.handle(req, &sync)
+        })
+    }
 }
 
 /// Compose a list of middlewares (outermost first) around a final app,

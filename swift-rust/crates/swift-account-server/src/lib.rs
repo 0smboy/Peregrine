@@ -21,7 +21,9 @@
 //! Deviations tracked for later: the fallocate_reserve free-space check
 //! is not yet enforced.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 pub mod reaper;
 pub use reaper::{
@@ -34,7 +36,10 @@ use swift_core::timestamp::Timestamp;
 use swift_db::{
     AccountBroker, BrokerMetadata, ContainerRecord, DbError, DbValue, ListContainersArgs,
 };
-use swift_http::{split_path, HeaderKeyDict, Request, Response};
+use swift_http::{
+    split_path, AsyncRequest, AsyncService, Body, HeaderKeyDict, Request, Response,
+};
+use swift_runtime::{ConcurrencyMetrics, DbExecutor, DbExecutorConfig};
 
 pub const ACCOUNT_LISTING_LIMIT: i64 = 10000;
 pub const MAX_META_COUNT: usize = 90;
@@ -57,6 +62,7 @@ pub struct AccountServerConfig {
 
 pub struct AccountServer {
     pub config: AccountServerConfig,
+    db: std::sync::OnceLock<DbExecutor>,
 }
 
 /// swob explanations for the statuses these servers emit; a default
@@ -384,7 +390,185 @@ fn validate_internal_name(name: &str, type_: &str) -> Result<(), Response> {
 
 impl AccountServer {
     pub fn new(config: AccountServerConfig) -> Self {
-        AccountServer { config }
+        AccountServer {
+            config,
+            db: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub fn db(&self) -> &DbExecutor {
+        self.db.get_or_init(|| {
+            DbExecutor::new(DbExecutorConfig::new(4, 32, 8).expect("db executor config"))
+                .expect("db executor")
+        })
+    }
+
+    pub fn db_file_for_request(&self, req: &Request) -> Result<PathBuf, Response> {
+        let segs = split_path(&req.path, 3, 4, false).map_err(|e| plain_response(400, &e))?;
+        let drive = segs[0].clone().unwrap_or_default();
+        let part = segs[1].clone().unwrap_or_default();
+        let account = segs[2].clone().unwrap_or_default();
+        validate_internal_name(&account, "account")?;
+        if let Some(container) = segs.get(3).cloned().flatten() {
+            if !container.is_empty() {
+                validate_internal_name(&container, "container")?;
+            }
+        }
+        self.check_drive(&drive)?;
+        Ok(self
+            .broker_for(&drive, &part, &account)
+            .db_file()
+            .to_path_buf())
+    }
+
+    async fn dispatch_on_shard(&self, req: Request) -> Response {
+        let db_file = match self.db_file_for_request(&req) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+        let config = self.config.clone();
+        match self
+            .db()
+            .run_on_shard(db_file, move || {
+                AccountServer {
+                    config,
+                    db: std::sync::OnceLock::new(),
+                }
+                .handle(req)
+            })
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => error_response(500, &e.to_string()),
+        }
+    }
+
+    pub async fn handle_async(&self, mut areq: AsyncRequest) -> Response {
+        if let Some(m) = ConcurrencyMetrics::current() {
+            m.attach_db(self.db().clone());
+        }
+        let max = areq.body.max_body_bytes();
+        let body = match areq.body.materialize(max).await {
+            Ok(bytes) => Body::Buffered(bytes),
+            Err(_) => return error_response(499, "Client Disconnect"),
+        };
+        let req = Request {
+            method: areq.method,
+            path: areq.path,
+            query_string: areq.query_string,
+            headers: areq.headers,
+            body,
+        };
+        if req.method == "OPTIONS" {
+            return self.handle(req);
+        }
+        self.dispatch_on_shard(req).await
+    }
+
+    #[allow(dead_code)]
+    async fn put_async(&self, req: Request) -> Response {
+        let segs = match split_path(&req.path, 3, 4, false) {
+            Ok(segs) => segs,
+            Err(e) => return plain_response(400, &e),
+        };
+        let drive = segs[0].clone().unwrap_or_default();
+        let part = segs[1].clone().unwrap_or_default();
+        let account = segs[2].clone().unwrap_or_default();
+        let container = segs[3].clone();
+        if let Err(resp) = validate_internal_name(&account, "account") {
+            return resp;
+        }
+        if let Some(container) = &container {
+            if let Err(resp) = validate_internal_name(container, "container") {
+                return resp;
+            }
+        }
+        if let Err(resp) = self.check_drive(&drive) {
+            return resp;
+        }
+        match container {
+            Some(container) if !container.is_empty() => {
+                self.put_container_async(req, drive, part, account, container)
+                    .await
+            }
+            _ => self.put_account(&req, &drive, &part, &account),
+        }
+    }
+
+    #[allow(dead_code)]
+    async fn put_container_async(
+        &self,
+        req: Request,
+        drive: String,
+        part: String,
+        account: String,
+        container: String,
+    ) -> Response {
+        let timestamp = match req.headers.get("x-timestamp") {
+            Some(_) => match valid_timestamp(&req) {
+                Ok(t) => t,
+                Err(resp) => return resp,
+            },
+            None => Timestamp::now(),
+        };
+        let policy_index: i64 = req
+            .headers
+            .get("X-Backend-Storage-Policy-Index")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let (Some(put_ts), Some(delete_ts), Some(obj_count), Some(bytes_used)) = (
+            req.headers.get("x-put-timestamp").map(str::to_string),
+            req.headers.get("x-delete-timestamp").map(str::to_string),
+            req.headers.get("x-object-count").map(str::to_string),
+            req.headers.get("x-bytes-used").map(str::to_string),
+        ) else {
+            return error_response(500, "missing required backend headers");
+        };
+        let override_deleted = req
+            .headers
+            .get("x-account-override-deleted")
+            .map(|v| v.to_lowercase() == "yes")
+            .unwrap_or(false);
+        let broker_probe = self.broker_for(&drive, &part, &account);
+        let db_file = broker_probe.db_file().to_path_buf();
+        let account_s = account.clone();
+        let container_s = container.clone();
+        let ts_internal = timestamp.internal();
+        let created_at = self.created_at();
+        let db_id = new_db_id(&drive);
+        let auto = account.starts_with(AUTO_CREATE_ACCOUNT_PREFIX);
+        let result = self
+            .db()
+            .run_on_shard(db_file.clone(), move || {
+                let mut broker = AccountBroker::new(&db_file, &account_s);
+                if auto && !broker.db_file().exists() {
+                    match broker.initialize(&ts_internal, &created_at, &db_id) {
+                        Ok(()) | Err(DbError::AlreadyExists(_)) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                let deleted = broker.db_file().exists() && matches!(broker.is_deleted(), Ok(true));
+                if (!override_deleted && deleted) || !broker.db_file().exists() {
+                    return Ok(None);
+                }
+                broker.put_container(
+                    &container_s,
+                    &put_ts,
+                    &delete_ts,
+                    swift_core::pickle::Value::Str(obj_count),
+                    swift_core::pickle::Value::Str(bytes_used),
+                    policy_index,
+                )?;
+                Ok(Some(delete_ts > put_ts))
+            })
+            .await;
+        match result {
+            Ok(Ok(None)) => swob_response(404, None),
+            Ok(Ok(Some(true))) => Response::new(204),
+            Ok(Ok(Some(false))) => Response::new(201),
+            Ok(Err(e)) => self.db_error_response(&e, broker_probe.db_file()),
+            Err(e) => error_response(500, &e.to_string()),
+        }
     }
 
     fn created_at(&self) -> String {
@@ -1178,11 +1362,21 @@ fn new_db_id(device: &str) -> String {
     format!("{nanos:032x}-{device}")
 }
 
+struct AccountAsyncService(std::sync::Arc<AccountServer>);
+
+impl AsyncService for AccountAsyncService {
+    fn call(&self, req: AsyncRequest) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move { self.0.handle_async(req).await })
+    }
+}
+
 /// Serve on the given listener (used by main and by tests).
 pub fn serve(listener: std::net::TcpListener, config: AccountServerConfig) -> std::io::Result<()> {
-    let server = std::sync::Arc::new(AccountServer::new(config));
-    let handler: swift_http::Handler = std::sync::Arc::new(move |req| server.handle(req));
-    swift_http::serve_forever(listener, handler)
+    serve_instance(
+        listener,
+        std::sync::Arc::new(AccountServer::new(config)),
+        swift_http::ServerConfig::default(),
+    )
 }
 
 /// Like [`serve`], but with an explicit HTTP server config (worker sizing,
@@ -1192,7 +1386,29 @@ pub fn serve_with_config(
     config: AccountServerConfig,
     http_config: swift_http::ServerConfig,
 ) -> std::io::Result<()> {
-    let server = std::sync::Arc::new(AccountServer::new(config));
-    let handler: swift_http::Handler = std::sync::Arc::new(move |req| server.handle(req));
-    swift_http::serve_forever_with_config(listener, handler, http_config)
+    serve_instance(
+        listener,
+        std::sync::Arc::new(AccountServer::new(config)),
+        http_config,
+    )
+}
+
+/// Serve a constructed [`AccountServer`] (tests share the instance to park
+/// its [`DbExecutor`] shard while Hyper still accepts).
+pub fn serve_instance(
+    listener: std::net::TcpListener,
+    server: std::sync::Arc<AccountServer>,
+    mut http_config: swift_http::ServerConfig,
+) -> std::io::Result<()> {
+    let metrics = http_config
+        .metrics
+        .clone()
+        .unwrap_or_else(ConcurrencyMetrics::new);
+    metrics.set_worker_threads(http_config.worker_threads);
+    http_config.metrics = Some(metrics);
+    swift_http::serve_forever_multi_service(
+        vec![listener],
+        std::sync::Arc::new(AccountAsyncService(server)),
+        http_config,
+    )
 }

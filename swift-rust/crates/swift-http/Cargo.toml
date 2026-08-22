@@ -7,9 +7,86 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+bytes = "1"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["http1", "server", "tokio"] }
 libc = "0.2"
-crossbeam-channel = "0.5"
 swift-core = { path = "../swift-core" }
+swift-runtime = { path = "../swift-runtime" }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
 
 [dev-dependencies]
 serde_json = "1"
+swift-object-server = { path = "../swift-object-server" }
+swift-diskfile = { path = "../swift-diskfile" }
+
+# AGENTS.md Phase 0 concurrency gates (crate-local; cargo needs [[test]]).
+[[test]]
+name = "worker_starvation"
+path = "tests/concurrency/worker_starvation.rs"
+
+[[test]]
+name = "slowloris"
+path = "tests/concurrency/slowloris.rs"
+
+[[test]]
+name = "slow_put"
+path = "tests/concurrency/slow_put.rs"
+
+[[test]]
+name = "slow_reader"
+path = "tests/concurrency/slow_reader.rs"
+
+[[test]]
+name = "align_expect_continue"
+path = "tests/concurrency/align_expect_continue.rs"
+
+[[test]]
+name = "fsync_storm"
+path = "tests/concurrency/fsync_storm.rs"
+
+[[test]]
+name = "deadlines"
+path = "tests/concurrency/deadlines.rs"
+
+[[test]]
+name = "phase3_streaming"
+path = "tests/concurrency/phase3_streaming.rs"
+
+[[test]]
+name = "gate5_python_wire"
+path = "tests/concurrency/gate5_python_wire.rs"
+
+[[test]]
+name = "overload"
+path = "tests/concurrency/overload.rs"
+
+[[test]]
+name = "phase11_metrics"
+path = "tests/concurrency/phase11_metrics.rs"
+
+[[test]]
+name = "phase14_shutdown"
+path = "tests/concurrency/phase14_shutdown.rs"
+
+[[test]]
+name = "idle_50k"
+path = "tests/concurrency/idle_50k.rs"
+
+[[test]]
+name = "soak"
+path = "tests/concurrency/soak.rs"
+
+[[test]]
+name = "idle_density"
+path = "tests/concurrency/idle_density.rs"
+
+[[test]]
+name = "legacy_removed"
+path = "tests/concurrency/legacy_removed.rs"
+
+[[test]]
+name = "g3_activation"
+path = "tests/concurrency/g3_activation.rs"

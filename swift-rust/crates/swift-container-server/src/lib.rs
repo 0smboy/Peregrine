@@ -25,8 +25,10 @@
 //! ships rows, and the proxy `container_sync` filter validates inbound realm
 //! auth. Residual: fallocate_reserve free-space check is not enforced.
 
+use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 pub mod reconciler;
 pub mod sharder;
@@ -66,7 +68,10 @@ pub use updater::{
 use swift_core::hashing::HashPathConfig;
 use swift_core::timestamp::Timestamp;
 use swift_db::{BrokerMetadata, ContainerBroker, DbError, DbValue, ListObjectsArgs, ObjectRecord};
-use swift_http::{http_date, split_path, HeaderKeyDict, Request, Response};
+use swift_http::{
+    http_date, split_path, AsyncRequest, AsyncService, HeaderKeyDict, Request, Response,
+};
+use swift_runtime::{ConcurrencyMetrics, DbExecutor, DbExecutorConfig};
 
 pub const CONTAINER_LISTING_LIMIT: i64 = 10000;
 pub const MAX_META_COUNT: usize = 90;
@@ -94,6 +99,7 @@ pub struct ContainerServerConfig {
 
 pub struct ContainerServer {
     pub config: ContainerServerConfig,
+    db: std::sync::OnceLock<DbExecutor>,
 }
 
 fn swob_explanation(status: u16) -> &'static str {
@@ -480,7 +486,134 @@ fn truthy(v: Option<&str>) -> bool {
 
 impl ContainerServer {
     pub fn new(config: ContainerServerConfig) -> Self {
-        ContainerServer { config }
+        ContainerServer {
+            config,
+            db: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub fn db(&self) -> &DbExecutor {
+        self.db.get_or_init(|| {
+            DbExecutor::new(DbExecutorConfig::new(4, 32, 8).expect("db executor config"))
+                .expect("db executor")
+        })
+    }
+
+    pub fn db_file_for_request(&self, req: &Request) -> Result<PathBuf, Response> {
+        let (drive, part, account, container, _obj) = self.obj_path(req)?;
+        self.check_drive(&drive)?;
+        Ok(self
+            .broker_for(&drive, &part, &account, &container)
+            .db_file()
+            .to_path_buf())
+    }
+
+    async fn dispatch_on_shard(&self, req: Request) -> Response {
+        let db_file = match self.db_file_for_request(&req) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+        let config = self.config.clone();
+        match self
+            .db()
+            .run_on_shard(db_file, move || {
+                ContainerServer {
+                    config,
+                    db: std::sync::OnceLock::new(),
+                }
+                .handle(req)
+            })
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => error_response(500, &e.to_string()),
+        }
+    }
+
+    pub async fn handle_async(&self, mut areq: AsyncRequest) -> Response {
+        if let Some(m) = ConcurrencyMetrics::current() {
+            m.attach_db(self.db().clone());
+        }
+        let max = areq.body.max_body_bytes().min(swift_http::MAX_CONTROL_BODY);
+        let body = match areq.body.materialize(max).await {
+            Ok(bytes) => swift_http::Body::Buffered(bytes),
+            Err(e) if swift_http::body_too_large(&e) => return swob_response(413, None),
+            Err(_) => return swob_response(500, None),
+        };
+        let req = Request {
+            method: areq.method,
+            path: areq.path,
+            query_string: areq.query_string,
+            headers: areq.headers,
+            body,
+        };
+        if req.method == "OPTIONS" {
+            return self.handle(req);
+        }
+        self.dispatch_on_shard(req).await
+    }
+
+    #[allow(dead_code)]
+    async fn put_async(&self, req: &mut Request) -> Response {
+        let (drive, part, account, container, obj) = match self.obj_path(req) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        let req_timestamp = match valid_timestamp(req) {
+            Ok(t) => t,
+            Err(resp) => return resp,
+        };
+        if let Err(resp) = self.check_drive(&drive) {
+            return resp;
+        }
+        let Some(obj) = obj else {
+            return self.put(req);
+        };
+        let requested_policy_index = match self.policy_index(req) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        let obj_policy_index = requested_policy_index.unwrap_or(0);
+        let (Some(size), Some(content_type), Some(etag)) = (
+            req.headers.get("x-size").map(str::to_string),
+            req.headers.get("x-content-type").map(str::to_string),
+            req.headers.get("x-etag").map(str::to_string),
+        ) else {
+            return error_response(500, "missing required backend headers");
+        };
+        let Ok(size) = size.trim().parse::<i64>() else {
+            return error_response(500, "bad x-size");
+        };
+        let ctype_ts = req.headers.get("x-content-type-timestamp").map(str::to_string);
+        let meta_ts = req.headers.get("x-meta-timestamp").map(str::to_string);
+        let broker_probe = self.broker_for(&drive, &part, &account, &container);
+        let db_file = broker_probe.db_file().to_path_buf();
+        let account_s = account.clone();
+        let container_s = container.clone();
+        let obj_s = obj.clone();
+        let ts = req_timestamp.internal();
+        let result = self
+            .db()
+            .run_on_shard(db_file.clone(), move || {
+                let mut broker = ContainerBroker::new(&db_file, &account_s, &container_s);
+                broker.put_object(
+                    &obj_s,
+                    &ts,
+                    size,
+                    &content_type,
+                    &etag,
+                    0,
+                    obj_policy_index,
+                    ctype_ts.as_deref(),
+                    meta_ts.as_deref(),
+                )
+            })
+            .await;
+        match result {
+            Ok(Ok(())) => Response::new(201),
+            Ok(Err(e)) => self.db_error_response(&e, broker_probe.db_file()),
+            Err(e) => error_response(500, &e.to_string()),
+        }
     }
 
     fn created_at(&self) -> String {
@@ -1869,13 +2002,23 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
+struct ContainerAsyncService(std::sync::Arc<ContainerServer>);
+
+impl AsyncService for ContainerAsyncService {
+    fn call(&self, req: AsyncRequest) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move { self.0.handle_async(req).await })
+    }
+}
+
 pub fn serve(
     listener: std::net::TcpListener,
     config: ContainerServerConfig,
 ) -> std::io::Result<()> {
-    let server = std::sync::Arc::new(ContainerServer::new(config));
-    let handler: swift_http::Handler = std::sync::Arc::new(move |req| server.handle(req));
-    swift_http::serve_forever(listener, handler)
+    serve_instance(
+        listener,
+        std::sync::Arc::new(ContainerServer::new(config)),
+        swift_http::ServerConfig::default(),
+    )
 }
 
 /// Like [`serve`], but with an explicit HTTP server config (worker sizing,
@@ -1885,9 +2028,30 @@ pub fn serve_with_config(
     config: ContainerServerConfig,
     http_config: swift_http::ServerConfig,
 ) -> std::io::Result<()> {
-    let server = std::sync::Arc::new(ContainerServer::new(config));
-    let handler: swift_http::Handler = std::sync::Arc::new(move |req| server.handle(req));
-    swift_http::serve_forever_with_config(listener, handler, http_config)
+    serve_instance(
+        listener,
+        std::sync::Arc::new(ContainerServer::new(config)),
+        http_config,
+    )
+}
+
+/// Serve a constructed [`ContainerServer`] so tests can park its shard.
+pub fn serve_instance(
+    listener: std::net::TcpListener,
+    server: std::sync::Arc<ContainerServer>,
+    mut http_config: swift_http::ServerConfig,
+) -> std::io::Result<()> {
+    let metrics = http_config
+        .metrics
+        .clone()
+        .unwrap_or_else(ConcurrencyMetrics::new);
+    metrics.set_worker_threads(http_config.worker_threads);
+    http_config.metrics = Some(metrics);
+    swift_http::serve_forever_multi_service(
+        vec![listener],
+        std::sync::Arc::new(ContainerAsyncService(server)),
+        http_config,
+    )
 }
 
 #[cfg(test)]

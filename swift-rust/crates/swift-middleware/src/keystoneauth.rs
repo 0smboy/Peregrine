@@ -541,7 +541,7 @@ impl KeystoneAuth {
 }
 
 impl Middleware for KeystoneAuth {
-    fn handle(&self, mut req: Request, next: &NextFn) -> Response {
+    fn prepare(&self, req: &mut Request) -> crate::MwPrep {
         if self.allow_overrides
             && req
                 .headers
@@ -549,22 +549,23 @@ impl Middleware for KeystoneAuth {
                 .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
                 .unwrap_or(false)
         {
-            return next(req);
+            return crate::MwPrep::Continue;
         }
 
-        let identity = Self::identity_from_request(&req);
-        // Only stamp Auth-Plugin=keystone when Keystone identity is confirmed.
-        // Claiming every reseller-prefix account (AUTH_*) without identity steals
-        // authorize from TempAuth in keystone_coexist pipelines (TempAuth list → 401).
-        // Anonymous / TempAuth-authenticated AUTH_* traffic must fall through so
-        // the proxy can use TempAuth ACLs (or deny as anonymous).
+        let identity = Self::identity_from_request(req);
         if let Some(ref id) = identity {
             let reseller = !self.reseller_admin_role.is_empty()
                 && id.roles.contains(&self.reseller_admin_role);
-            Self::stamp_backend(&mut req, Some(id), reseller);
+            Self::stamp_backend(req, Some(id), reseller);
         }
+        crate::MwPrep::Continue
+    }
 
-        next(req)
+    fn handle(&self, mut req: Request, next: &NextFn) -> Response {
+        match self.prepare(&mut req) {
+            crate::MwPrep::ShortCircuit(resp) => resp,
+            crate::MwPrep::Continue => next(req),
+        }
     }
 }
 

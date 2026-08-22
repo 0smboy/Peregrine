@@ -42,7 +42,7 @@ use serde_json::Value;
 use swift_http::{Request, Response};
 
 use crate::keystoneauth::Identity;
-use crate::{Middleware, NextFn};
+use crate::{Middleware, MwPrep, NextFn};
 
 /// Headers keystonemiddleware sets; always cleared before stamping so a
 /// client cannot forge identity past authtoken (gatekeeper also strips
@@ -88,6 +88,18 @@ pub struct ValidatedToken {
 /// Pluggable token validator (static map or live Keystone).
 pub trait TokenValidator: Send + Sync {
     fn validate(&self, token: &str) -> TokenOutcome;
+
+    /// Keystone HTTP validation must not run on a Tokio worker (`std::net`).
+    fn needs_network(&self) -> bool {
+        false
+    }
+
+    fn validate_async<'a>(
+        &'a self,
+        token: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TokenOutcome> + Send + 'a>> {
+        Box::pin(async move { self.validate(token) })
+    }
 }
 
 /// In-memory token → identity map for tests and SAIO-less evidence.
@@ -222,6 +234,36 @@ impl HttpTokenValidator {
 }
 
 impl TokenValidator for HttpTokenValidator {
+    fn needs_network(&self) -> bool {
+        true
+    }
+
+    fn validate_async<'a>(
+        &'a self,
+        token: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TokenOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            let token = token.to_string();
+            let v = HttpTokenValidator::new(
+                self.auth_url.clone(),
+                self.username.clone(),
+                self.password.clone(),
+                self.project_name.clone(),
+            )
+            .with_domains(
+                self.user_domain_name.clone(),
+                self.project_domain_name.clone(),
+            )
+            .with_timeout(self.timeout);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                let outcome = v.validate(&token);
+                let _ = tx.send(outcome);
+            });
+            rx.await.unwrap_or(TokenOutcome::Invalid)
+        })
+    }
+
     fn validate(&self, token: &str) -> TokenOutcome {
         let admin = match self.service_token() {
             Ok(t) => t,
@@ -485,17 +527,15 @@ impl AuthToken {
 }
 
 impl Middleware for AuthToken {
-    fn handle(&self, mut req: Request, next: &NextFn) -> Response {
-        Self::clear_identity(&mut req);
-
-        // TempURL / formpost already authorized upstream of authtoken.
+    fn prepare(&self, req: &mut Request) -> MwPrep {
+        Self::clear_identity(req);
         if req
             .headers
             .get("X-Backend-Authorize-Override")
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
             .unwrap_or(false)
         {
-            return next(req);
+            return MwPrep::Continue;
         }
 
         let user_token = req
@@ -511,11 +551,9 @@ impl Middleware for AuthToken {
         };
 
         match user_check {
-            // Invalid + delay: defer so TempAuth (or referrer ACL) can decide.
-            // Invalid without delay: hard 401 (strict Keystone-only).
             TokenOutcome::Invalid | TokenOutcome::Indeterminate => {
                 if !self.delay_auth_decision {
-                    return self.unauthorized();
+                    return MwPrep::ShortCircuit(self.unauthorized());
                 }
                 req.headers.set("X-Identity-Status", "Invalid");
             }
@@ -526,18 +564,79 @@ impl Middleware for AuthToken {
                             validated.identity.service_roles = svc.identity.roles.clone();
                             Some(svc)
                         }
-                        // Service token invalid: always hard-fail (no TempAuth
-                        // equivalent for X-Service-Token).
-                        TokenOutcome::Invalid => return self.unauthorized(),
+                        TokenOutcome::Invalid => return MwPrep::ShortCircuit(self.unauthorized()),
                         TokenOutcome::Indeterminate => None,
                     },
                     _ => None,
                 };
-                Self::stamp(&mut req, &validated, service.as_deref());
+                Self::stamp(req, &validated, service.as_deref());
             }
         }
+        MwPrep::Continue
+    }
 
-        next(req)
+    fn prepare_async<'a>(
+        &'a self,
+        req: &'a mut Request,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = MwPrep> + Send + 'a>> {
+        Box::pin(async move {
+            if !self.validator.needs_network() {
+                return self.prepare(req);
+            }
+            Self::clear_identity(req);
+            if req
+                .headers
+                .get("X-Backend-Authorize-Override")
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
+                .unwrap_or(false)
+            {
+                return MwPrep::Continue;
+            }
+            let user_token = req
+                .headers
+                .get("X-Auth-Token")
+                .or_else(|| req.headers.get("X-Storage-Token"))
+                .map(|s| s.to_string());
+            let service_token = req.headers.get("X-Service-Token").map(|s| s.to_string());
+            let user_check = match user_token.as_deref() {
+                Some(t) if !t.is_empty() => self.validator.validate_async(t).await,
+                _ => TokenOutcome::Indeterminate,
+            };
+            match user_check {
+                TokenOutcome::Invalid | TokenOutcome::Indeterminate => {
+                    if !self.delay_auth_decision {
+                        return MwPrep::ShortCircuit(self.unauthorized());
+                    }
+                    req.headers.set("X-Identity-Status", "Invalid");
+                }
+                TokenOutcome::Confirmed(mut validated) => {
+                    let service = match service_token.as_deref() {
+                        Some(t) if !t.is_empty() => {
+                            match self.validator.validate_async(t).await {
+                                TokenOutcome::Confirmed(svc) => {
+                                    validated.identity.service_roles = svc.identity.roles.clone();
+                                    Some(svc)
+                                }
+                                TokenOutcome::Invalid => {
+                                    return MwPrep::ShortCircuit(self.unauthorized())
+                                }
+                                TokenOutcome::Indeterminate => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    Self::stamp(req, &validated, service.as_deref());
+                }
+            }
+            MwPrep::Continue
+        })
+    }
+
+    fn handle(&self, mut req: Request, next: &NextFn) -> Response {
+        match self.prepare(&mut req) {
+            MwPrep::ShortCircuit(resp) => resp,
+            MwPrep::Continue => next(req),
+        }
     }
 }
 

@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use swift_http::{Request, Response};
 
-use crate::{Middleware, NextFn};
+use crate::{Middleware, MwPrep, NextFn};
 
 /// A trans-id generator. Python: `tx<21 hex>-<10 hex unix time><suffix>`.
 /// We keep the same shape; the random part is a per-process counter mixed
@@ -66,14 +66,25 @@ impl CatchErrors {
 }
 
 impl Middleware for CatchErrors {
-    fn handle(&self, mut req: Request, next: &NextFn) -> Response {
+    fn prepare(&self, req: &mut Request) -> MwPrep {
         let extra = req.headers.get("X-Trans-Id-Extra").map(str::to_string);
         let trans_id = self.generate_trans_id(extra.as_deref());
         req.headers.set("X-Trans-Id", &trans_id);
-        let mut resp = next(req);
-        resp.headers.set("X-Trans-Id", &trans_id);
-        resp.headers.set("X-Openstack-Request-Id", &trans_id);
+        MwPrep::Continue
+    }
+
+    fn finish(&self, req: &Request, mut resp: Response) -> Response {
+        if let Some(tx) = req.headers.get("X-Trans-Id") {
+            resp.headers.set("X-Trans-Id", tx);
+            resp.headers.set("X-Openstack-Request-Id", tx);
+        }
         resp
+    }
+
+    fn handle(&self, mut req: Request, next: &NextFn) -> Response {
+        let _ = self.prepare(&mut req);
+        let head = req.clone_head();
+        self.finish(&head, next(req))
     }
 }
 

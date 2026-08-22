@@ -11,6 +11,8 @@ swift-core = { path = "../swift-core" }
 swift-http = { path = "../swift-http" }
 swift-memcache = { path = "../swift-memcache" }
 swift-crypto = { path = "../swift-crypto" }
+swift-runtime = { path = "../swift-runtime" }
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros", "time", "net", "io-util"] }
 sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"

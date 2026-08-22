@@ -271,7 +271,7 @@ mod tests {
     fn body_bytes(resp: &Response) -> &[u8] {
         match &resp.body {
             swift_http::Body::Buffered(b) => b,
-            swift_http::Body::Streamed(_) => unreachable!(),
+            swift_http::Body::Streamed(_) | swift_http::Body::Channel(_) => unreachable!(),
         }
     }
 

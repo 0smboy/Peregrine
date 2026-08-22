@@ -1,0 +1,54 @@
+CONCURRENCY / SAIO LIVE GO/NO-GO  2026-08-21T06:06Z
+tree=.agent-handoff/peregrine-grok-merge-20260814/swift-rust
+scratch=/var/folders/wj/zxfb_g9s0zn4b0tfjq03vdmm0000gn/T/grok-goal-4d1988d6ced8/implementer
+
+Deploy Rust SAIO (Swift2 :8081 only)     GO
+  grok-merge Hyper HTTP/1.1 on /root/work/rsaio
+  proxy sha=0a2e5f16c4d340729fc74f86aeecb3b98bec48fc2ee8b2af72d0f89819ce4665
+  object sha=f9807af68d52147ac1b444a95467476b55e0b743c2f7a92ecb1cfdc87d415c5d
+  account=4aef1c56… container=fef51e3d…
+  :8081 health=200 /info=200 /recon/concurrency=200
+  PUT 201 GET body hello-grok-merge ×2 (rust-saio-putget.log)
+  workers left at rsaio 64 (not copied to production)
+
+Production VIP / :8080 / HAProxy         GO (untouched)
+  /usr/local/bin/swift-proxy-server sha256=ab5cb95c5c3973db8336e4940711fba18ce3cabaae62e13da0865c07ad31622b
+  object=cce33594…
+  local8080=200 local8085=200 vip=10.0.0.10 still on swift2 eth1
+  pre and post suite SHA identical
+
+Swift REST dual-feed (function+headers)  GO with listed header fail rows
+  script now cats remote /tmp/saio-atom-*.hdr and compares
+  ETag, Content-Type, Content-Length, X-Timestamp (not hardcoded header_delta="")
+  pass1+pass2 40 atoms each: status_mismatch=0
+  header_delta fail rows=13 (fail rows, not skipped)
+    11 only X-Timestamp (independent cluster PUT clocks — expected)
+    1 account GET json Content-Length 515 vs 667 (listings differ per cluster)
+    1 If-Match 412 Content-Type text/html vs text/plain (plus X-Timestamp)
+  object PUT/GET ETag identical 3559ba008cc0c86a698891c27402144b both passes
+  jsonl: swift-api-diff.jsonl (pass1) + swift-api-diff-pass2.jsonl
+  timings recorded; NOT a perf gate (Python workers=2 vs Rust conf 64)
+
+s3api 838 s3-tests                       NO-GO for parity / GREEN
+  both JUnit exist; unique names=838 both sides (do not pad)
+  Python XML: 838 tests  241 pass  503 fail  0 err  94 skip  993.6s
+  Rust   XML: 841 attr / 838 names  106 pass  64 fail  670 err  1 skip  5827s
+  both-pass=103  pyPASS_rsNOT=138 (131 ConnectionClosedError setup)  rsPASS_pyNOT=1
+  first 6-shard run discarded (ListBuckets empty 404 before s3api Hyper intercept)
+  after intercept: ListBuckets 200; suite still not at Python pass set
+  NOT 838 PASS
+
+Progress loop                            GO
+  scheduler 01a022809f3a interval 10m + in-conversation ticks
+  progress-10m.log present
+
+Env note                                 workers NOT equivalent
+  Python /etc/pyswift workers=2 (3 processes/service)
+  Rust /etc/rsaio workers=64 (1 process; proxy ~67 OS threads)
+  do not copy 64 into production; do not copy 2 onto Rust keep-alive
+
+Eventlet-solved / production cutover     NOT CLAIMED
+  this goal was SAIO live dual-feed + 838, not VIP cutover
+
+Recommendation: GO for deploy-to-rsaio + Swift REST atom function.
+NO-GO for s3api 838 parity (XML in hand, gap is real: 138 Python-pass cases fail/error on Rust, mostly ConnectionClosedError).

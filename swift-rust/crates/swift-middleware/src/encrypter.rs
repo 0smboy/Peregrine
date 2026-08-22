@@ -282,7 +282,7 @@ pub fn encrypt_object_body_from_body(
                 ciphertext_md5,
             )
         }
-        streamed @ Body::Streamed(_) => {
+        streamed @ (Body::Streamed(_) | Body::Channel(_)) => {
             let declared = streamed.content_length();
             let (mut reader, _) = streamed.into_reader();
             encrypt_object_body_from_reader(
@@ -938,7 +938,7 @@ mod tests {
             if req.method == "PUT" {
                 let body = match &req.body {
                     Body::Buffered(b) => b.clone(),
-                    Body::Streamed(_) => {
+                    Body::Streamed(_) | Body::Channel(_) => {
                         // Encrypter always re-buffers ciphertext for header
                         // stamp (footer residual); treat empty as bug.
                         Vec::new()

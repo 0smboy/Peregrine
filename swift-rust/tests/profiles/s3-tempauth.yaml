@@ -1,0 +1,20 @@
+name: s3-tempauth
+purpose: pinned Swift-upstream S3 + TempAuth pipeline (not a kitchen-sink)
+# Order follows OpenStack Swift s3api docs: s3api before tempauth;
+# slo + bulk required for complete S3 MPU/multi-delete compatibility.
+pipeline:
+  - catch_errors
+  - gatekeeper
+  - healthcheck
+  - proxy-logging
+  - cache
+  - listing_formats
+  - s3api
+  - tempauth
+  - copy
+  - slo
+  - dlo
+  - versioned_writes
+  - symlink
+  - bulk
+app: proxy-server

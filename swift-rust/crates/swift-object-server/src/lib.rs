@@ -24,8 +24,10 @@
 //! The async_pending fallback (writing a pickle the object-updater replays
 //! when a container update can't be applied synchronously) IS implemented.
 
+use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 pub mod daemonutil;
 pub mod expirer;
@@ -68,13 +70,282 @@ use swift_diskfile::{
     PolicyKind,
 };
 use swift_http::{
-    http_date, split_path, unquote, Body, ChainReader, ClockHealth, HeaderKeyDict, Match,
-    MimeDocs, Range, Request, Response, STREAM_CHUNK,
+    http_date, split_path, unquote, AsyncRequest, AsyncService, Body, ChainReader, ClockHealth,
+    HeaderKeyDict, Match, MimeDocs, Range, Request, Response, STREAM_CHUNK,
+};
+use swift_runtime::{
+    ConcurrencyMetrics, DeviceId, DeviceIoLimits, DurabilityBarrier, StorageExecutor,
+    StorageExecutorConfig, TaskScope, TrafficClass,
 };
 
 use crate::ssync::{MissingOffer, SsyncEvent, SsyncParser, SsyncSubrequest};
 
 pub const MAX_FILE_SIZE: i64 = 5_368_709_122;
+
+fn put_is_mime(headers: &HeaderKeyDict) -> bool {
+    use swift_core::config::config_true_value;
+    headers
+        .get("X-Backend-Obj-Metadata-Footer")
+        .is_some_and(config_true_value)
+        || headers
+            .get("X-Backend-Obj-Multiphase-Commit")
+            .is_some_and(config_true_value)
+}
+
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+async fn ingest_mime_object_async(
+    storage: &StorageExecutor,
+    device: DeviceId,
+    mut writer: swift_diskfile::DiskFileWriter,
+    body: &mut swift_http::IncomingBody,
+    boundary: &[u8],
+) -> Result<swift_diskfile::DiskFileWriter, Response> {
+    let mut delim = b"\r\n--".to_vec();
+    delim.extend_from_slice(boundary);
+    let start = delim[2..].to_vec();
+    let mut buf = Vec::new();
+    let mut phase = 0u8; // 0 preamble, 1 headers, 2 body
+    loop {
+        match body.next_chunk().await {
+            Ok(Some(c)) => buf.extend_from_slice(&c),
+            Ok(None) => break,
+            Err(e) if swift_http::body_too_large(&e) => {
+                return Err(plain_response(413, "Your request is too large."))
+            }
+            Err(_) => return Err(swob_response(499)),
+        }
+        if phase == 0 {
+            if let Some(i) = find_bytes(&buf, &start) {
+                buf.drain(..i + start.len());
+                phase = 1;
+            } else if buf.len() > 64 * 1024 {
+                return Err(plain_response(400, "invalid starting boundary"));
+            }
+        }
+        if phase == 1 {
+            if let Some(i) = find_bytes(&buf, b"\r\n\r\n") {
+                buf.drain(..i + 4);
+                phase = 2;
+            } else if buf.len() > 64 * 1024 {
+                return Err(plain_response(400, "mime headers too large"));
+            }
+        }
+        if phase == 2 {
+            if let Some(i) = find_bytes(&buf, &delim) {
+                let piece = buf[..i].to_vec();
+                buf.clear();
+                if !piece.is_empty() {
+                    writer = storage
+                        .run_finite(device.clone(), TrafficClass::Foreground, move || {
+                            writer.write(&piece)?;
+                            Ok::<_, DiskFileError>(writer)
+                        })
+                        .await
+                        .map_err(|e| plain_response(500, &e.to_string()))?
+                        .map_err(|e| plain_response(500, &e.to_string()))?;
+                }
+                return Ok(writer);
+            }
+            if buf.len() > delim.len() {
+                let keep = delim.len() - 1;
+                let piece = buf[..buf.len() - keep].to_vec();
+                buf.drain(..buf.len() - keep);
+                writer = storage
+                    .run_finite(device.clone(), TrafficClass::Foreground, move || {
+                        writer.write(&piece)?;
+                        Ok::<_, DiskFileError>(writer)
+                    })
+                    .await
+                    .map_err(|e| plain_response(500, &e.to_string()))?
+                    .map_err(|e| plain_response(500, &e.to_string()))?;
+            }
+        }
+    }
+    if phase == 2 {
+        if !buf.is_empty() {
+            writer = storage
+                .run_finite(device, TrafficClass::Foreground, move || {
+                    writer.write(&buf)?;
+                    Ok::<_, DiskFileError>(writer)
+                })
+                .await
+                .map_err(|e| plain_response(500, &e.to_string()))?
+                .map_err(|e| plain_response(500, &e.to_string()))?;
+        }
+        return Ok(writer);
+    }
+    Err(plain_response(400, "no object body MIME doc"))
+}
+
+fn ssync_check_missing_owned(
+    devices: PathBuf,
+    hash_config: HashPathConfig,
+    diskfile: DiskFileConfig,
+    device: String,
+    partition: String,
+    policy_index: u32,
+    policy: PolicyKind,
+    frag_index: Option<i64>,
+    offer: &MissingOffer,
+) -> Option<String> {
+    let server = ObjectServer::new(ObjectServerConfig {
+        devices,
+        mount_check: false,
+        hash_config,
+        diskfile,
+        policies: std::collections::HashMap::from([(policy_index, policy)]),
+        container_update_timeout: std::time::Duration::from_secs(1),
+        container_update_mode: ContainerUpdateMode::Sync,
+    });
+    SsyncSession {
+        server: &server,
+        device,
+        partition,
+        policy_index,
+        policy,
+        frag_index,
+    }
+    .check_missing(offer)
+}
+
+/// Full-duplex SSYNC session (Python `ssync_receiver.Receiver.__call__`).
+/// Network wait is `IncomingBody::next_chunk` (async socket via Hyper).
+/// Disk work is a finite `StorageExecutor` job (`TrafficClass::Replication`).
+/// The HTTP 200 head is already on the wire before this future runs.
+#[allow(clippy::too_many_arguments)]
+async fn drive_ssync_session(
+    mut body: swift_http::IncomingBody,
+    tx: tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+    storage: StorageExecutor,
+    config: ObjectServerConfig,
+    device: String,
+    partition: String,
+    policy_index: u32,
+    policy: PolicyKind,
+    frag_index: Option<i64>,
+) {
+    // Python's first yield: a bare b'\r\n' so WSGI/Hyper flushes the 200
+    // head before the sender writes `:MISSING_CHECK:` (ssync_receiver.py:294-296).
+    let _ = tx.send(Ok(b"\r\n".to_vec())).await;
+    let device_id = DeviceId::new(device.clone());
+    let mut parser = SsyncParser::new();
+    let mut wanted: Vec<String> = Vec::new();
+    let mut missing_done = false;
+    while !missing_done {
+        let chunk = match body.next_chunk().await {
+            Ok(Some(c)) => c,
+            Ok(None) | Err(_) => return,
+        };
+        let events = match parser.push(&chunk) {
+            Ok(e) => e,
+            Err(error) => {
+                let _ = tx
+                    .send(Ok(format!(
+                        ":ERROR: 0 {}\n",
+                        python_repr(error.message())
+                    )
+                    .into_bytes()))
+                    .await;
+                return;
+            }
+        };
+        for event in events {
+            match event {
+                SsyncEvent::Missing(offer) => {
+                    let line = storage
+                        .run_finite(device_id.clone(), TrafficClass::Replication, {
+                            let offer = offer.clone();
+                            let device = device.clone();
+                            let partition = partition.clone();
+                            let devices = config.devices.clone();
+                            let hash_config = config.hash_config.clone();
+                            let diskfile_cfg = config.diskfile.clone();
+                            move || {
+                                ssync_check_missing_owned(
+                                    devices,
+                                    hash_config,
+                                    diskfile_cfg,
+                                    device,
+                                    partition,
+                                    policy_index,
+                                    policy,
+                                    frag_index,
+                                    &offer,
+                                )
+                            }
+                        })
+                        .await
+                        .unwrap_or(None);
+                    if let Some(line) = line {
+                        wanted.push(line);
+                    }
+                }
+                SsyncEvent::MissingEnd => missing_done = true,
+                _ => {}
+            }
+        }
+    }
+    let _ = tx.send(Ok(b":MISSING_CHECK: START\r\n".to_vec())).await;
+    if !wanted.is_empty() {
+        let _ = tx.send(Ok(wanted.join("\r\n").into_bytes())).await;
+    }
+    let _ = tx.send(Ok(b"\r\n".to_vec())).await;
+    let _ = tx.send(Ok(b":MISSING_CHECK: END\r\n".to_vec())).await;
+    let mut updates_done = false;
+    let mut events = match parser.start_updates() {
+        Ok(e) => e,
+        Err(error) => {
+            let _ = tx
+                .send(Ok(format!(":ERROR: 0 {}\n", python_repr(error.message())).into_bytes()))
+                .await;
+            Vec::new()
+        }
+    };
+    loop {
+        for event in events {
+            match event {
+                SsyncEvent::Update(update) => {
+                    let cfg = config.clone();
+                    let device = device.clone();
+                    let partition = partition.clone();
+                    let _ = storage
+                        .run_finite(device_id.clone(), TrafficClass::Replication, move || {
+                            ObjectServer::new(cfg).apply_ssync_update(
+                                &device,
+                                &partition,
+                                policy_index,
+                                frag_index,
+                                update,
+                            )
+                        })
+                        .await;
+                }
+                SsyncEvent::UpdatesEnd => updates_done = true,
+                _ => {}
+            }
+        }
+        if updates_done {
+            break;
+        }
+        let chunk = match body.next_chunk().await {
+            Ok(Some(c)) => c,
+            Ok(None) | Err(_) => break,
+        };
+        events = match parser.push(&chunk) {
+            Ok(e) => e,
+            Err(_) => break,
+        };
+    }
+    let _ = tx
+        .send(Ok(b":UPDATES: START\r\n:UPDATES: END\r\n".to_vec()))
+        .await;
+}
 
 /// How the object server applies the container-listing side channel after a
 /// durable object PUT/DELETE.
@@ -89,6 +360,7 @@ pub enum ContainerUpdateMode {
     Async,
 }
 
+#[derive(Clone)]
 pub struct ObjectServerConfig {
     pub devices: PathBuf,
     pub mount_check: bool,
@@ -119,6 +391,29 @@ pub struct ObjectServer {
     /// `clock_ok=true` exactly as before. Enabled (>0) it is fail-closed —
     /// see [`swift_http::clock_health`].
     pub worm_clock: std::sync::Arc<ClockHealth>,
+    storage: std::sync::OnceLock<StorageExecutor>,
+    /// Invoked on the storage thread immediately before durability commit
+    /// (xattr/fsync/rename). Production is `None`. Tests use it to occupy
+    /// the executor during finalize without a dummy `run_finite`.
+    commit_stall: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+struct PendingDurable {
+    drive: String,
+    durable: swift_diskfile::DurablePut,
+    metadata: Metadata,
+    etag: String,
+    upload_size: u64,
+    content_type: String,
+    req_timestamp: Timestamp,
+    footers: Vec<(String, String)>,
+    resolved_delete_at: Option<String>,
+    account: String,
+    container: String,
+    obj: String,
+    policy_index: u32,
+    headers: HeaderKeyDict,
+    path: String,
 }
 
 fn meta_get<'m>(meta: &'m Metadata, key: &str) -> Option<&'m str> {
@@ -504,6 +799,8 @@ impl ObjectServer {
             // swift.common.utils: fallocate_reserve defaults to "1%".
             fallocate_reserve: FallocateReserve::Percent(1.0),
             worm_clock: std::sync::Arc::new(ClockHealth::disabled()),
+            storage: std::sync::OnceLock::new(),
+            commit_stall: None,
         }
     }
 
@@ -519,6 +816,599 @@ impl ObjectServer {
     pub fn with_worm_clock(mut self, clock: std::sync::Arc<ClockHealth>) -> Self {
         self.worm_clock = clock;
         self
+    }
+
+    /// Inject the storage executor (tests: `thread_cap = 1` so a stalled
+    /// commit occupies the only blocking worker).
+    pub fn with_storage(self, exec: StorageExecutor) -> Self {
+        let _ = self.storage.set(exec);
+        self
+    }
+
+    /// `f` runs on the storage thread inside the PUT commit `run_finite`.
+    pub fn with_commit_stall(mut self, f: std::sync::Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.commit_stall = Some(f);
+        self
+    }
+
+    pub fn storage(&self) -> &StorageExecutor {
+        self.storage.get_or_init(|| {
+            StorageExecutor::new(
+                StorageExecutorConfig::new(8, 32, DeviceIoLimits::new(32, 32, 32, 32, 32))
+                    .expect("storage executor config"),
+            )
+            .expect("storage executor")
+        })
+    }
+
+    /// Phase 3/4 entry: body wait is already a Future on [`IncomingBody`].
+    /// Replication PUT finalize runs on [`StorageExecutor`], not this task.
+    pub async fn handle_async(&self, mut areq: AsyncRequest) -> Response {
+        if let Some(m) = ConcurrencyMetrics::current() {
+            m.attach_storage(self.storage().clone());
+        }
+        if areq.method == "PUT" {
+            return self.put_streaming_async(areq).await;
+        }
+        if matches!(areq.method.as_str(), "GET" | "HEAD") {
+            let include_body = areq.method == "GET";
+            let req = Request {
+                method: areq.method,
+                path: areq.path,
+                query_string: areq.query_string,
+                headers: areq.headers,
+                body: Body::empty(),
+            };
+            return self.get_streaming_async(req, include_body).await;
+        }
+        if areq.method == "SSYNC" {
+            return self.ssync_async(areq).await;
+        }
+        let max = areq.body.max_body_bytes();
+        let body = match areq.body.materialize(max).await {
+            Ok(bytes) => Body::Buffered(bytes),
+            Err(e) if swift_http::body_too_large(&e) => {
+                return plain_response(413, "Your request is too large.")
+            }
+            Err(_) => return swob_response(499),
+        };
+        let req = Request {
+            method: areq.method,
+            path: areq.path,
+            query_string: areq.query_string,
+            headers: areq.headers,
+            body,
+        };
+        if req.method == "OPTIONS" {
+            let mut resp = Response::new(200);
+            resp.headers.set(
+                "Allow",
+                "DELETE, GET, HEAD, OPTIONS, POST, PUT, REPLICATE, SSYNC",
+            );
+            resp.headers
+                .setdefault("Content-Type", "text/html; charset=UTF-8");
+            return resp;
+        }
+        // POST/DELETE/REPLICATE (and any other FS method) run on
+        // StorageExecutor. SSYNC never reaches here.
+        self.dispatch_fs_on_storage(req).await
+    }
+
+    /// Disk work for POST/DELETE/REPLICATE: one finite storage job, not the
+    /// Tokio/Hyper worker. Reconstructs a server so `handle()` does not
+    /// borrow `self` across the executor. SSYNC is refused (use `ssync_async`).
+    async fn dispatch_fs_on_storage(&self, req: Request) -> Response {
+        if req.method == "SSYNC" {
+            return plain_response(500, "SSYNC requires handle_async / ssync_async");
+        }
+        let drive = req
+            .path
+            .trim_start_matches('/')
+            .split('/')
+            .next()
+            .unwrap_or("sda1")
+            .to_string();
+        let exec = self.storage().clone();
+        let config = self.config.clone();
+        let fallocate_reserve = self.fallocate_reserve;
+        let worm_clock = std::sync::Arc::clone(&self.worm_clock);
+        match exec
+            .run_finite(DeviceId::new(drive), TrafficClass::Foreground, move || {
+                ObjectServer {
+                    config,
+                    fallocate_reserve,
+                    worm_clock,
+                    storage: std::sync::OnceLock::new(),
+                    commit_stall: None,
+                }
+                .handle(req)
+            })
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => plain_response(500, &e.to_string()),
+        }
+    }
+
+    async fn put_streaming_async(&self, mut areq: AsyncRequest) -> Response {
+        let req = Request {
+            method: areq.method.clone(),
+            path: areq.path.clone(),
+            query_string: areq.query_string.clone(),
+            headers: areq.headers.clone(),
+            body: Body::empty(),
+        };
+        let (drive, part, account, container, obj, policy_index, policy) =
+            match self.obj_path(&req) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+        let req_timestamp = match Self::valid_timestamp(&req) {
+            Ok(t) => t,
+            Err(resp) => return resp,
+        };
+        if let Err(resp) = self.check_drive(&drive) {
+            return resp;
+        }
+        let Some(content_type) = req.headers.get("Content-Type").map(str::to_string) else {
+            return plain_response(400, "No content type");
+        };
+        if req.headers.get("Content-Length").is_none()
+            && !req
+                .headers
+                .get("Transfer-Encoding")
+                .is_some_and(|te| te.eq_ignore_ascii_case("chunked"))
+        {
+            return plain_response(411, "Missing Content-Length header.");
+        }
+        let mime = put_is_mime(&req.headers);
+        let declared_len: Option<u64> = if mime {
+            req.headers
+                .get("X-Backend-Obj-Content-Length")
+                .and_then(|s| s.trim().parse().ok())
+        } else {
+            req.headers
+                .get("Content-Length")
+                .and_then(|s| s.trim().parse().ok())
+        };
+        if declared_len.is_some_and(|len| len > MAX_FILE_SIZE as u64) {
+            return plain_response(413, "Your request is too large.");
+        }
+        let df = match self.diskfile_for(
+            &drive,
+            part,
+            &account,
+            &container,
+            &obj,
+            (policy_index, policy),
+        ) {
+            Ok(df) => df,
+            Err(e) => return plain_response(500, &e.to_string()),
+        };
+        let device = DeviceId::new(drive.clone());
+        let mut writer = match self
+            .storage()
+            .run_finite(device.clone(), TrafficClass::Foreground, move || {
+                df.create(".data")
+            })
+            .await
+        {
+            Ok(Ok(w)) => w,
+            Ok(Err(DiskFileError::NoSpace)) => return swob_response(507),
+            Ok(Err(e)) => return plain_response(500, &e.to_string()),
+            Err(e) => return plain_response(500, &e.to_string()),
+        };
+        if mime {
+            let Some(boundary) = req
+                .headers
+                .get("X-Backend-Obj-Multipart-Mime-Boundary")
+                .map(str::to_string)
+            else {
+                return plain_response(400, "no MIME boundary");
+            };
+            writer = match ingest_mime_object_async(
+                self.storage(),
+                device.clone(),
+                writer,
+                &mut areq.body,
+                boundary.as_bytes(),
+            )
+            .await
+            {
+                Ok(w) => w,
+                Err(resp) => return resp,
+            };
+        } else {
+            loop {
+                let chunk = match areq.body.next_chunk().await {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break,
+                    Err(e) if swift_http::body_too_large(&e) => {
+                        return plain_response(413, "Your request is too large.")
+                    }
+                    Err(_) => return swob_response(499),
+                };
+                writer = match self
+                    .storage()
+                    .run_finite(device.clone(), TrafficClass::Foreground, move || {
+                        writer.write(&chunk)?;
+                        Ok::<_, DiskFileError>(writer)
+                    })
+                    .await
+                {
+                    Ok(Ok(w)) => w,
+                    Ok(Err(e)) => return plain_response(500, &e.to_string()),
+                    Err(e) => return plain_response(500, &e.to_string()),
+                };
+            }
+        }
+        let (upload_size, etag) = writer.chunks_finished();
+        if declared_len.is_some_and(|declared| declared != upload_size) {
+            return swob_response(499);
+        }
+        let received_etag = req.headers.get("ETag").unwrap_or("");
+        let normalized = received_etag.trim_matches('"');
+        if !normalized.is_empty() && !normalized.eq_ignore_ascii_case(&etag) {
+            return swob_response(422);
+        }
+        let mut metadata: Metadata = vec![
+            (
+                "X-Timestamp".into(),
+                MetaValue::Str(req_timestamp.internal()),
+            ),
+            ("Content-Type".into(), MetaValue::Str(content_type.clone())),
+            (
+                "Content-Length".into(),
+                MetaValue::Str(upload_size.to_string()),
+            ),
+            ("ETag".into(), MetaValue::Str(etag.clone())),
+        ];
+        for (k, v) in req.headers.iter() {
+            let lower = k.to_ascii_lowercase();
+            let is_core = matches!(
+                lower.as_str(),
+                "x-timestamp"
+                    | "content-type"
+                    | "content-length"
+                    | "etag"
+                    | "x-delete-at"
+                    | "x-delete-after"
+            );
+            if should_persist_header(&req, k) && !is_core {
+                metadata.push((MetaValue::Str(k.to_string()), MetaValue::Str(v.to_string())));
+            }
+        }
+        let durable = match writer.into_durable() {
+            Ok(d) => d,
+            Err(e) => return plain_response(500, &e.to_string()),
+        };
+        let pending = PendingDurable {
+            drive,
+            durable,
+            metadata,
+            etag,
+            upload_size,
+            content_type,
+            req_timestamp,
+            footers: Vec::new(),
+            resolved_delete_at: None,
+            account,
+            container,
+            obj,
+            policy_index,
+            headers: req.headers.clone(),
+            path: req.path.clone(),
+        };
+        let mut resp = self.finish_pending_put(pending).await;
+        resp.headers
+            .setdefault("Content-Type", "text/html; charset=UTF-8");
+        resp
+    }
+
+    async fn get_streaming_async(&self, req: Request, include_body: bool) -> Response {
+        if let Err(resp) = self.obj_path(&req) {
+            return resp;
+        }
+        let drive = req
+            .path
+            .trim_start_matches('/')
+            .split('/')
+            .next()
+            .unwrap_or("sda1")
+            .to_string();
+        let exec = self.storage().clone();
+        let device = DeviceId::new(drive.clone());
+        let config = self.config.clone();
+        let fallocate_reserve = self.fallocate_reserve;
+        let worm_clock = std::sync::Arc::clone(&self.worm_clock);
+        let method = req.method.clone();
+        let path = req.path.clone();
+        let query_string = req.query_string.clone();
+        let headers = req.headers.clone();
+        let mut resp = match exec
+            .run_finite(device, TrafficClass::Foreground, move || {
+                let tmp = ObjectServer {
+                    config,
+                    fallocate_reserve,
+                    worm_clock,
+                    storage: std::sync::OnceLock::new(),
+                    commit_stall: None,
+                };
+                tmp.get(
+                    &Request {
+                        method,
+                        path,
+                        query_string,
+                        headers,
+                        body: Body::empty(),
+                    },
+                    include_body,
+                )
+            })
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return plain_response(500, &e.to_string()),
+        };
+        resp = swift_http::apply_conditional(&req, resp);
+        if !include_body || !matches!(resp.status, 200 | 206) {
+            return resp;
+        }
+        if !matches!(resp.body, Body::Streamed(_) | Body::Channel(_)) {
+            return resp;
+        }
+        let content_length = resp.body.content_length();
+        let (mut reader, _) = resp.body.take().into_reader();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let scope = TaskScope::bounded(1);
+        let exec = self.storage().clone();
+        let device = DeviceId::new(drive);
+        let _ = scope.spawn(async move {
+            loop {
+                let read = exec
+                    .run_finite(device.clone(), TrafficClass::Foreground, move || {
+                        let mut buf = vec![0u8; STREAM_CHUNK];
+                        let n = reader.read(&mut buf).map(|n| {
+                            buf.truncate(n);
+                            buf
+                        });
+                        (reader, n)
+                    })
+                    .await;
+                let (next_reader, n) = match read {
+                    Ok((r, Ok(buf))) => (r, Ok(buf)),
+                    Ok((r, Err(e))) => (r, Err(e)),
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(std::io::Error::other(e.to_string())))
+                            .await;
+                        break;
+                    }
+                };
+                reader = next_reader;
+                match n {
+                    Ok(buf) if buf.is_empty() => break,
+                    Ok(buf) => {
+                        let n = buf.len();
+                        if tx.send(Ok(buf)).await.is_err() {
+                            break;
+                        }
+                        if let Some(m) = ConcurrencyMetrics::current() {
+                            m.add_response_body_buffer(n as i64);
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        break;
+                    }
+                }
+            }
+        });
+        resp.body = Body::from_channel(rx, content_length, scope);
+        resp
+    }
+
+    async fn ssync_async(&self, areq: AsyncRequest) -> Response {
+        // Validation matches Python `Receiver.initialize_request`: it runs
+        // before start_response, so 400/507 never become a 200 hijack.
+        let req = Request {
+            method: areq.method.clone(),
+            path: areq.path.clone(),
+            query_string: areq.query_string.clone(),
+            headers: areq.headers.clone(),
+            body: Body::empty(),
+        };
+        let segments = match split_path(&req.path, 2, 2, false) {
+            Ok(s) => s,
+            Err(e) => return plain_response(400, &e),
+        };
+        let device = segments[0].clone().unwrap_or_default();
+        let partition = segments[1].clone().unwrap_or_default();
+        if device.is_empty() || matches!(device.as_str(), "." | "..") {
+            return plain_response(400, &format!("Invalid device: {device}"));
+        }
+        if partition.parse::<u64>().is_err() {
+            return plain_response(400, &format!("Invalid partition: {partition}"));
+        }
+        let (policy_index, policy) = match self.storage_policy(&req) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+        if let Err(resp) = self.check_drive(&device) {
+            return resp;
+        }
+        let frag_index: Option<i64> = match req.headers.get("X-Backend-Ssync-Frag-Index") {
+            None | Some("") => None,
+            Some(raw) => match raw.trim().parse::<i64>() {
+                Ok(i) => Some(i),
+                Err(_) => {
+                    return plain_response(
+                        400,
+                        &format!("Invalid X-Backend-Ssync-Frag-Index {raw:?}"),
+                    )
+                }
+            },
+        };
+        // Python `ssync_sender.connect` calls `getresponse()` after
+        // `endheaders()` and *before* writing `:MISSING_CHECK:`
+        // (`ssync_sender.py:264-272`). swob calls `start_response` before
+        // iterating `app_iter` (`swob.py:1548-1549`). Return 200 + Channel
+        // now; drive the session on a scoped task so Hyper can write the
+        // head while IncomingBody still awaits the sender.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(8);
+        let scope = TaskScope::bounded(1);
+        let storage = self.storage().clone();
+        let config = self.config.clone();
+        let body = areq.body;
+        let _ = scope.spawn(drive_ssync_session(
+            body,
+            tx,
+            storage,
+            config,
+            device,
+            partition,
+            policy_index,
+            policy,
+            frag_index,
+        ));
+        let mut resp = Response::new(200);
+        resp.headers.set("X-Backend-Accept-No-Commit", "True");
+        resp.headers.set("Content-Type", "text/plain");
+        resp.body = Body::from_channel(rx, None, scope);
+        resp
+    }
+
+    pub async fn handle_buffered_async(&self, mut req: Request) -> Response {
+        if req.method == "SSYNC" {
+            return plain_response(500, "SSYNC requires handle_async / ssync_async");
+        }
+        if req.method != "PUT" {
+            return self.dispatch_fs_on_storage(req).await;
+        }
+        let mut pending: Option<PendingDurable> = None;
+        let early = self.put(&mut req, Some(&mut pending));
+        if let Some(pending) = pending {
+            let mut resp = self.finish_pending_put(pending).await;
+            resp.headers
+                .setdefault("Content-Type", "text/html; charset=UTF-8");
+            resp
+        } else {
+            let mut resp = early;
+            resp.headers
+                .setdefault("Content-Type", "text/html; charset=UTF-8");
+            resp
+        }
+    }
+
+    async fn finish_pending_put(&self, pending: PendingDurable) -> Response {
+        let PendingDurable {
+            drive,
+            durable,
+            metadata,
+            etag,
+            upload_size,
+            content_type,
+            req_timestamp,
+            footers,
+            resolved_delete_at,
+            account,
+            container,
+            obj,
+            policy_index,
+            headers,
+            path,
+        } = pending;
+        let stall = self.commit_stall.clone();
+        let exec = self.storage().clone();
+        let device = DeviceId::new(drive.clone());
+        // Barrier lives on a non-cancelled shield task (L7). Dropping this
+        // HTTP future does not abort commit or panic-drop the guard.
+        let commit = DurabilityBarrier::run_shielded(async move {
+            exec.run_finite(device, TrafficClass::Foreground, move || {
+                if let Some(stall) = stall.as_ref() {
+                    stall();
+                }
+                durable.commit(metadata)
+            })
+            .await
+        })
+        .await;
+        match commit {
+            Ok(Ok(())) => {}
+            Ok(Err(DiskFileError::NoSpace | DiskFileError::XattrNotSupported)) => {
+                return swob_response(507)
+            }
+            Ok(Err(e)) => return plain_response(500, &e.to_string()),
+            Err(e) => return plain_response(500, &e.to_string()),
+        }
+        let req = Request {
+            method: "PUT".into(),
+            path,
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        };
+        let mut update = HeaderKeyDict::new();
+        update.set("x-size", upload_size);
+        update.set("x-content-type", &content_type);
+        update.set("x-timestamp", req_timestamp.internal());
+        update.set("x-etag", &etag);
+        apply_container_override(&mut update, &req.headers, &footers);
+        let replication = req
+            .headers
+            .get("X-Backend-Replication")
+            .is_some_and(config_true_value);
+        let container_host = req
+            .headers
+            .get("X-Container-Host")
+            .unwrap_or("")
+            .to_string();
+        let container_device = req
+            .headers
+            .get("X-Container-Device")
+            .unwrap_or("")
+            .to_string();
+        let container_partition = req
+            .headers
+            .get("X-Container-Partition")
+            .unwrap_or("")
+            .to_string();
+        let backend_container_path = req
+            .headers
+            .get("X-Backend-Container-Path")
+            .map(str::to_string);
+        self.container_update_async(
+            "PUT",
+            &drive,
+            &account,
+            &container,
+            &obj,
+            replication,
+            container_host,
+            container_device,
+            container_partition,
+            backend_container_path,
+            &update,
+            policy_index,
+        )
+        .await;
+        if let Some(delete_at) = resolved_delete_at
+            .as_deref()
+            .and_then(|v| v.parse::<i64>().ok())
+        {
+            self.delete_at_update(
+                delete_at,
+                &drive,
+                &account,
+                &container,
+                &obj,
+                &req,
+                policy_index,
+            );
+        }
+        let mut resp = Response::new(201);
+        resp.headers.set("ETag", format!("\"{etag}\""));
+        resp
     }
 
     fn check_drive(&self, drive: &str) -> Result<(), Response> {
@@ -833,7 +1723,7 @@ impl ObjectServer {
             // reduced to a 304/412 by If-[None-]Match / If-[Un]Modified-Since.
             "GET" => swift_http::apply_conditional(&req, self.get(&req, true)),
             "HEAD" => swift_http::apply_conditional(&req, self.get(&req, false)),
-            "PUT" => self.put(&mut req),
+            "PUT" => self.put(&mut req, None),
             "POST" => self.post(&req),
             "DELETE" => self.delete(&req),
             "REPLICATE" => self.replicate(&req),
@@ -860,7 +1750,11 @@ impl ObjectServer {
         resp
     }
 
-    fn put(&self, req: &mut Request) -> Response {
+    fn put(
+        &self,
+        req: &mut Request,
+        executor_commit: Option<&mut Option<PendingDurable>>,
+    ) -> Response {
         let _meta_stage =
             swift_core::stage::StageTimer::start("object-server", "put", "metadata_parse");
         let (drive, part, account, container, obj, policy_index, policy) = match self.obj_path(req)
@@ -1202,6 +2096,37 @@ impl ObjectServer {
         }
 
         let _commit_stage = swift_core::stage::StageTimer::start("object-server", "put", "commit");
+        let defer = executor_commit.is_some()
+            && !multiphase
+            && !matches!(policy, PolicyKind::Ec { .. });
+        if defer {
+            let durable = match writer.into_durable() {
+                Ok(d) => d,
+                Err(e) => return plain_response(500, &e.to_string()),
+            };
+            if let Some(slot) = executor_commit {
+                *slot = Some(PendingDurable {
+                    drive: drive.clone(),
+                    durable,
+                    metadata,
+                    etag: etag.clone(),
+                    upload_size,
+                    content_type: content_type.clone(),
+                    req_timestamp: req_timestamp.clone(),
+                    footers: footers.clone(),
+                    resolved_delete_at: resolved_delete_at.clone(),
+                    account: account.clone(),
+                    container: container.clone(),
+                    obj: obj.clone(),
+                    policy_index,
+                    headers: req.headers.clone(),
+                    path: req.path.clone(),
+                });
+            }
+            // Caller (`handle_buffered_async`) commits this request's
+            // PendingDurable on StorageExecutor. Not a process-wide slot.
+            return Response::new(201);
+        }
         if let Err(e) = writer.put(metadata) {
             writer.close();
             return match e {
@@ -2090,6 +3015,92 @@ impl ObjectServer {
         }
     }
 
+    /// Same as [`Self::container_update`] but container HTTP is awaited as
+    /// Tokio I/O so a blackhole replica does not pin the network runtime.
+    #[allow(clippy::too_many_arguments)]
+    async fn container_update_async(
+        &self,
+        op: &str,
+        drive: &str,
+        account: &str,
+        container: &str,
+        obj: &str,
+        replication: bool,
+        container_host: String,
+        container_device: String,
+        container_partition: String,
+        backend_container_path: Option<String>,
+        update: &HeaderKeyDict,
+        policy_index: u32,
+    ) {
+        if replication {
+            return;
+        }
+        if self.config.container_update_mode == ContainerUpdateMode::Async {
+            self.write_async_pending(op, drive, account, container, obj, update, policy_index);
+            return;
+        }
+        let hosts: Vec<String> = container_host
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        let devices: Vec<String> = container_device
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        let partition = container_partition;
+        let (upd_account, upd_container) =
+            match parse_backend_container_path(backend_container_path.as_deref()) {
+                Some((a, c)) => (a.to_string(), c.to_string()),
+                None => (account.to_string(), container.to_string()),
+            };
+        let path = format!(
+            "/{}/{}/{}",
+            percent_encode(&upd_account),
+            percent_encode(&upd_container),
+            percent_encode(obj)
+        );
+        let timeout = self.config.container_update_timeout;
+        let update = update.clone();
+        let op_owned = op.to_string();
+        let drive = drive.to_string();
+        let account = account.to_string();
+        let container = container.to_string();
+        let obj = obj.to_string();
+        let well_formed =
+            !hosts.is_empty() && hosts.len() == devices.len() && !partition.is_empty();
+        let all_ok = if well_formed {
+            fanout_container_http_async(
+                op_owned.clone(),
+                hosts,
+                devices,
+                partition,
+                path,
+                update.clone(),
+                policy_index,
+                timeout,
+            )
+            .await
+        } else {
+            false
+        };
+        if !all_ok {
+            self.write_async_pending(
+                &op_owned,
+                &drive,
+                &account,
+                &container,
+                &obj,
+                &update,
+                policy_index,
+            );
+        }
+    }
+
     /// `delete_at_update`: on a PUT carrying `X-Delete-At`, enqueue a task
     /// object into the hidden `.expiring_objects` account so the object-expirer
     /// deletes the object at that time. The task object is
@@ -2391,6 +3402,87 @@ fn fanout_container_http(
         }
         handles.into_iter().all(|h| h.join().unwrap_or(false))
     })
+}
+
+async fn fanout_container_http_async(
+    op: String,
+    hosts: Vec<String>,
+    devices: Vec<String>,
+    partition: String,
+    path: String,
+    update: HeaderKeyDict,
+    policy_index: u32,
+    timeout: std::time::Duration,
+) -> bool {
+    if hosts.is_empty() || hosts.len() != devices.len() {
+        return false;
+    }
+    let mut join = tokio::task::JoinSet::new();
+    for (host, device) in hosts.into_iter().zip(devices) {
+        let op = op.clone();
+        let partition = partition.clone();
+        let path = path.clone();
+        let update = update.clone();
+        join.spawn(async move {
+            async_container_http(
+                &op,
+                &host,
+                &device,
+                &partition,
+                &path,
+                &update,
+                policy_index,
+                timeout,
+            )
+            .await
+        });
+    }
+    let mut all_ok = true;
+    while let Some(r) = join.join_next().await {
+        all_ok &= r.unwrap_or(false);
+    }
+    all_ok
+}
+
+async fn async_container_http(
+    op: &str,
+    host: &str,
+    device: &str,
+    partition: &str,
+    path: &str,
+    update: &HeaderKeyDict,
+    policy_index: u32,
+    timeout: std::time::Duration,
+) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Ok(addr) = host.parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    let mut request = format!(
+        "{op} /{device}/{partition}{path} HTTP/1.1\r\nHost: {host}\r\n\
+         X-Backend-Storage-Policy-Index: {policy_index}\r\n"
+    );
+    for (k, v) in update.iter() {
+        request.push_str(&format!("{k}: {v}\r\n"));
+    }
+    request.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
+    let Ok(Ok(mut stream)) = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await
+    else {
+        return false;
+    };
+    let _ = stream.set_nodelay(true);
+    if tokio::time::timeout(timeout, stream.write_all(request.as_bytes()))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .is_none()
+    {
+        return false;
+    }
+    let _ = tokio::time::timeout(timeout, stream.flush()).await;
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(timeout, stream.read_to_end(&mut buf)).await;
+    response_is_success(&buf)
 }
 
 /// Whether a raw HTTP response's status line is 2xx.
@@ -2780,10 +3872,20 @@ impl SsyncSession<'_> {
     }
 }
 
+struct ObjectAsyncService(std::sync::Arc<ObjectServer>);
+
+impl AsyncService for ObjectAsyncService {
+    fn call(&self, req: AsyncRequest) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move { self.0.handle_async(req).await })
+    }
+}
+
 pub fn serve(listener: std::net::TcpListener, config: ObjectServerConfig) -> std::io::Result<()> {
-    let server = std::sync::Arc::new(ObjectServer::new(config));
-    let handler: swift_http::Handler = std::sync::Arc::new(move |req| server.handle(req));
-    swift_http::serve_forever(listener, handler)
+    serve_with_config(
+        listener,
+        ObjectServer::new(config),
+        swift_http::ServerConfig::default(),
+    )
 }
 
 /// Like [`serve`], but with a caller-built server (carrying e.g. a
@@ -2802,11 +3904,20 @@ pub fn serve_with_config(
 pub fn serve_with_config_multi(
     listeners: Vec<std::net::TcpListener>,
     server: ObjectServer,
-    http_config: swift_http::ServerConfig,
+    mut http_config: swift_http::ServerConfig,
 ) -> std::io::Result<()> {
+    let metrics = http_config
+        .metrics
+        .clone()
+        .unwrap_or_else(ConcurrencyMetrics::new);
+    metrics.set_worker_threads(http_config.worker_threads);
+    http_config.metrics = Some(metrics);
     let server = std::sync::Arc::new(server);
-    let handler: swift_http::Handler = std::sync::Arc::new(move |req| server.handle(req));
-    swift_http::server::serve_forever_multi(listeners, handler, http_config)
+    swift_http::server::serve_forever_multi_service(
+        listeners,
+        std::sync::Arc::new(ObjectAsyncService(server)),
+        http_config,
+    )
 }
 
 #[cfg(test)]
@@ -2965,16 +4076,30 @@ mod fallocate_reserve_tests {
     }
 
     fn put_request(body: &[u8]) -> Request {
+        put_named("o", "1", body)
+    }
+
+    fn put_named(name: &str, ts: &str, body: &[u8]) -> Request {
         let mut headers = HeaderKeyDict::new();
-        headers.set("X-Timestamp", "1");
+        headers.set("X-Timestamp", ts);
         headers.set("Content-Type", "application/octet-stream");
         headers.set("Content-Length", body.len());
         Request {
             method: "PUT".into(),
-            path: "/sda1/0/AUTH_test/c/o".into(),
+            path: format!("/sda1/0/AUTH_test/c/{name}"),
             query_string: String::new(),
             headers,
             body: body.to_vec().into(),
+        }
+    }
+
+    fn get_named(name: &str) -> Request {
+        Request {
+            method: "GET".into(),
+            path: format!("/sda1/0/AUTH_test/c/{name}"),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
         }
     }
 
@@ -2993,6 +4118,787 @@ mod fallocate_reserve_tests {
         // a tiny reserve passes and the object lands
         let ok = tiny_server(&dir, FallocateReserve::Bytes(1));
         assert_eq!(ok.handle(put_request(b"body")).status, 201);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn shipped_put_finalize_runs_on_storage_executor() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-exec-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let before = server.storage().stats().blocking.started_total;
+        let resp = server
+            .handle_buffered_async(put_request(b"executor-body"))
+            .await;
+        assert_eq!(resp.status, 201, "{}", resp.reason);
+        assert!(
+            server.storage().stats().blocking.started_total > before,
+            "replication PUT finalize must run on StorageExecutor"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn handle_async_delete_post_replicate_run_on_storage_executor() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-fs-dispatch-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let mut put_h = HeaderKeyDict::new();
+        put_h.set("X-Timestamp", "3000");
+        put_h.set("Content-Type", "application/octet-stream");
+        put_h.set("Content-Length", 4);
+        assert_eq!(
+            server
+                .handle_async(AsyncRequest {
+                    method: "PUT".into(),
+                    path: "/sda1/0/AUTH_test/c/o".into(),
+                    query_string: String::new(),
+                    headers: put_h,
+                    body: swift_http::IncomingBody::from_bytes(b"abcd".to_vec(), u64::MAX),
+                })
+                .await
+                .status,
+            201
+        );
+
+        let before_del = server.storage().stats().blocking.started_total;
+        let mut del_h = HeaderKeyDict::new();
+        del_h.set("X-Timestamp", "3001");
+        let del = server
+            .handle_async(AsyncRequest {
+                method: "DELETE".into(),
+                path: "/sda1/0/AUTH_test/c/o".into(),
+                query_string: String::new(),
+                headers: del_h,
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(del.status, 204, "DELETE tombstone obj/server.py:1311-1369 {}", del.reason);
+        assert!(
+            server.storage().stats().blocking.started_total > before_del,
+            "DELETE FS must run on StorageExecutor, not Tokio"
+        );
+
+        let before_post = server.storage().stats().blocking.started_total;
+        let mut post_h = HeaderKeyDict::new();
+        post_h.set("X-Timestamp", "3002");
+        post_h.set("Content-Type", "application/octet-stream");
+        let post = server
+            .handle_async(AsyncRequest {
+                method: "POST".into(),
+                path: "/sda1/0/AUTH_test/c/o".into(),
+                query_string: String::new(),
+                headers: post_h,
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        // Tombstoned object: POST is 404, but the open/stat is still FS on the executor.
+        assert!(
+            server.storage().stats().blocking.started_total > before_post,
+            "POST FS must run on StorageExecutor, got status {}",
+            post.status
+        );
+
+        let before_rep = server.storage().stats().blocking.started_total;
+        let rep = server
+            .handle_async(AsyncRequest {
+                method: "REPLICATE".into(),
+                path: "/sda1/0".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(rep.status, 200, "REPLICATE {}", rep.reason);
+        assert!(
+            server.storage().stats().blocking.started_total > before_rep,
+            "REPLICATE hashes must run on StorageExecutor"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_puts_both_commit_distinct_objects() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-exec-conc-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = std::sync::Arc::new(tiny_server(&dir, FallocateReserve::Bytes(1)));
+        let before = server.storage().stats().blocking.started_total;
+        let a = put_named("o-alpha", "1001", b"alpha-payload");
+        let b = put_named("o-beta", "1002", b"beta-payload!!");
+        let s1 = std::sync::Arc::clone(&server);
+        let s2 = std::sync::Arc::clone(&server);
+        let (r1, r2) = tokio::join!(
+            s1.handle_buffered_async(a),
+            s2.handle_buffered_async(b),
+        );
+        assert_eq!(r1.status, 201, "alpha PUT {}", r1.reason);
+        assert_eq!(r2.status, 201, "beta PUT {}", r2.reason);
+        assert!(
+            server.storage().stats().blocking.started_total >= before + 2,
+            "each concurrent PUT must run its own StorageExecutor commit"
+        );
+        let mut g1 = server.handle(get_named("o-alpha"));
+        let mut g2 = server.handle(get_named("o-beta"));
+        assert_eq!(g1.status, 200, "alpha GET {}", g1.reason);
+        assert_eq!(g2.status, 200, "beta GET {}", g2.reason);
+        let b1 = g1.body.materialize(u64::MAX).unwrap().to_vec();
+        let b2 = g2.body.materialize(u64::MAX).unwrap().to_vec();
+        assert_eq!(b1, b"alpha-payload");
+        assert_eq!(b2, b"beta-payload!!");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn handle_async_put_writes_chunks_on_storage_executor() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-stream-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let before = server.storage().stats().blocking.started_total;
+        let payload = vec![b'z'; 128 * 1024];
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Timestamp", "2001");
+        headers.set("Content-Type", "application/octet-stream");
+        headers.set("Content-Length", payload.len());
+        let areq = AsyncRequest {
+            method: "PUT".into(),
+            path: "/sda1/0/AUTH_test/c/stream-o".into(),
+            query_string: String::new(),
+            headers,
+            body: swift_http::IncomingBody::from_bytes(payload.clone(), u64::MAX),
+        };
+        let resp = server.handle_async(areq).await;
+        assert_eq!(resp.status, 201, "{}", resp.reason);
+        assert!(
+            server.storage().stats().blocking.started_total > before,
+            "chunk writes and commit must run on StorageExecutor"
+        );
+        let mut got = server.handle(get_named("stream-o"));
+        assert_eq!(got.status, 200);
+        assert_eq!(got.body.materialize(u64::MAX).unwrap(), &payload[..]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Range: swob `Range.ranges_for_length` (tests/golden.rs vs Python).
+    /// If-None-Match 304: swob `_get_conditional_response_status` order.
+    #[tokio::test]
+    async fn handle_async_get_range_and_if_none_match() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-range-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let payload = b"abcdefghij".to_vec();
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Timestamp", "2003");
+        headers.set("Content-Type", "application/octet-stream");
+        headers.set("Content-Length", payload.len());
+        let put = AsyncRequest {
+            method: "PUT".into(),
+            path: "/sda1/0/AUTH_test/c/range-o".into(),
+            query_string: String::new(),
+            headers,
+            body: swift_http::IncomingBody::from_bytes(payload.clone(), u64::MAX),
+        };
+        assert_eq!(server.handle_async(put).await.status, 201);
+        let mut rh = HeaderKeyDict::new();
+        rh.set("Range", "bytes=2-5");
+        let got = server
+            .handle_async(AsyncRequest {
+                method: "GET".into(),
+                path: "/sda1/0/AUTH_test/c/range-o".into(),
+                query_string: String::new(),
+                headers: rh,
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(got.status, 206, "{}", got.reason);
+        let slice = got.body.collect_async().await.unwrap_or_default();
+        assert_eq!(slice, b"cdef");
+        let full = server
+            .handle_async(AsyncRequest {
+                method: "GET".into(),
+                path: "/sda1/0/AUTH_test/c/range-o".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(full.status, 200, "{}", full.reason);
+        let etag = full.headers.get("ETag").unwrap_or("").to_string();
+        assert!(!etag.is_empty(), "object GET must expose ETag");
+        let mut inm = HeaderKeyDict::new();
+        inm.set("If-None-Match", etag);
+        let cond = server
+            .handle_async(AsyncRequest {
+                method: "GET".into(),
+                path: "/sda1/0/AUTH_test/c/range-o".into(),
+                query_string: String::new(),
+                headers: inm,
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(cond.status, 304, "If-None-Match must 304, {}", cond.reason);
+        let del = server
+            .handle_async(AsyncRequest {
+                method: "DELETE".into(),
+                path: "/sda1/0/AUTH_test/c/range-o".into(),
+                query_string: String::new(),
+                headers: {
+                    let mut h = HeaderKeyDict::new();
+                    h.set("X-Timestamp", "2004");
+                    h
+                },
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            matches!(del.status, 204 | 200),
+            "DELETE status {}",
+            del.status
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn handle_async_mime_put_ingests_without_whole_object_buffer() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-mime-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let before = server.storage().stats().blocking.started_total;
+        let payload = vec![b'm'; 96 * 1024];
+        let boundary = "mimebound";
+        let mut mime = Vec::new();
+        mime.extend_from_slice(format!("--{boundary}\r\nX-Document: object body\r\n\r\n").as_bytes());
+        mime.extend_from_slice(&payload);
+        mime.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Timestamp", "2002");
+        headers.set("Content-Type", "application/octet-stream");
+        headers.set("Transfer-Encoding", "chunked");
+        headers.set("X-Backend-Obj-Multiphase-Commit", "yes");
+        headers.set("X-Backend-Obj-Multipart-Mime-Boundary", boundary);
+        headers.set("X-Backend-Obj-Content-Length", payload.len());
+        let areq = AsyncRequest {
+            method: "PUT".into(),
+            path: "/sda1/0/AUTH_test/c/mime-o".into(),
+            query_string: String::new(),
+            headers,
+            body: swift_http::IncomingBody::from_bytes(mime, u64::MAX),
+        };
+        let resp = server.handle_async(areq).await;
+        assert_eq!(resp.status, 201, "{}", resp.reason);
+        assert!(
+            server.storage().stats().blocking.started_total > before,
+            "MIME object bytes must be written on StorageExecutor"
+        );
+        let mut got = server.handle(get_named("mime-o"));
+        assert_eq!(got.status, 200);
+        assert_eq!(got.body.materialize(u64::MAX).unwrap(), &payload[..]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn handle_async_ssync_missing_check_uses_storage_executor() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-ssync-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let before = server.storage().stats().blocking.started_total;
+        let offer = crate::ssync::encode_missing(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            Timestamp::now(),
+            None,
+            None,
+            None,
+        );
+        let wire = format!(
+            ":MISSING_CHECK: START\r\n{offer}\r\n:MISSING_CHECK: END\r\n:UPDATES: START\r\n:UPDATES: END\r\n"
+        );
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Length", wire.len());
+        let areq = AsyncRequest {
+            method: "SSYNC".into(),
+            path: "/sda1/0".into(),
+            query_string: String::new(),
+            headers,
+            body: swift_http::IncomingBody::from_bytes(wire.into_bytes(), u64::MAX),
+        };
+        let resp = server.handle_async(areq).await;
+        assert_eq!(resp.status, 200, "{}", resp.reason);
+        assert_eq!(
+            resp.headers.get("X-Backend-Accept-No-Commit").unwrap_or(""),
+            "True"
+        );
+        let body = resp
+            .body
+            .collect_async()
+            .await
+            .expect("ssync channel");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains(":MISSING_CHECK: START"),
+            "ssync body {text:?}"
+        );
+        assert!(
+            server.storage().stats().blocking.started_total > before,
+            "SSYNC missing-check must run on StorageExecutor"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn handle_async_ssync_returns_200_before_sender_body() {
+        // Python ssync_sender.py:264-272: getresponse() after endheaders(),
+        // before any :MISSING_CHECK: bytes. A session that waits for Incoming
+        // EOF before 200 deadlocks the sender.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-ssync-early-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(8);
+        let areq = AsyncRequest {
+            method: "SSYNC".into(),
+            path: "/sda1/0".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::IncomingBody::from_channel(body_rx, None, None, u64::MAX),
+        };
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_millis(400),
+            server.handle_async(areq),
+        )
+        .await
+        .expect("SSYNC 200 must not wait for the sender body (ssync_sender.py:264-272)");
+        assert_eq!(resp.status, 200, "{}", resp.reason);
+        assert_eq!(
+            resp.headers.get("X-Backend-Accept-No-Commit").unwrap_or(""),
+            "True"
+        );
+        let before = server.storage().stats().blocking.started_total;
+        let offer = crate::ssync::encode_missing(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            Timestamp::now(),
+            None,
+            None,
+            None,
+        );
+        let wire = format!(
+            ":MISSING_CHECK: START\r\n{offer}\r\n:MISSING_CHECK: END\r\n:UPDATES: START\r\n:UPDATES: END\r\n"
+        );
+        body_tx.send(Ok(wire.into_bytes())).await.unwrap();
+        drop(body_tx);
+        let body = resp
+            .body
+            .collect_async()
+            .await
+            .expect("ssync channel after body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains(":MISSING_CHECK: START") && text.contains(":MISSING_CHECK: END"),
+            "ssync body {text:?}"
+        );
+        assert!(
+            server.storage().stats().blocking.started_total > before,
+            "missing-check FS must run on StorageExecutor after 200"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn handle_async_get_does_not_pin_storage_on_slow_client() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-slowget-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let payload = vec![b'g'; STREAM_CHUNK * 3];
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Timestamp", "2010");
+        headers.set("Content-Type", "application/octet-stream");
+        headers.set("Content-Length", payload.len());
+        let put = AsyncRequest {
+            method: "PUT".into(),
+            path: "/sda1/0/AUTH_test/c/slow-get".into(),
+            query_string: String::new(),
+            headers,
+            body: swift_http::IncomingBody::from_bytes(payload, u64::MAX),
+        };
+        assert_eq!(server.handle_async(put).await.status, 201);
+        let got = server
+            .handle_async(AsyncRequest {
+                method: "GET".into(),
+                path: "/sda1/0/AUTH_test/c/slow-get".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(got.status, 200, "{}", got.reason);
+        let Body::Channel(ch) = got.body else {
+            panic!("shipped GET must be Body::Channel, got {:?}", got.body);
+        };
+        let (rx, _scope, _) = ch.into_rx();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let started = server.storage().stats().blocking.started_total;
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(
+            server.storage().stats().blocking.started_total,
+            started,
+            "slow client must not issue further disk reads while the channel is full"
+        );
+        assert_eq!(
+            server.storage().stats().device_ops_active,
+            0,
+            "storage workers must not stay pinned waiting for the client"
+        );
+        drop(rx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blackhole_sync_container_update_does_not_starve_health_get() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+        use swift_http::ServerConfig;
+
+        let hole = TcpListener::bind("127.0.0.1:0").unwrap();
+        let hole_addr = hole.local_addr().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-blackhole-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let mut server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        server.config.container_update_timeout = std::time::Duration::from_secs(2);
+        server.config.container_update_mode = ContainerUpdateMode::Sync;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let cfg = ServerConfig {
+            worker_threads: 2,
+            shutdown: Some(std::sync::Arc::clone(&shutdown)),
+            ..ServerConfig::default()
+        };
+        thread::spawn(move || serve_with_config(listener, server, cfg));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(20)).is_ok() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        thread::spawn(move || {
+            let mut c = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400))
+                .unwrap();
+            let host = format!("{hole_addr}");
+            let req = format!(
+                "PUT /sda1/0/AUTH_test/c/o HTTP/1.1\r\nHost: t\r\nX-Timestamp: 4000\r\nContent-Type: application/octet-stream\r\nContent-Length: 4\r\nX-Container-Host: {host}\r\nX-Container-Device: sda1\r\nX-Container-Partition: 0\r\nConnection: close\r\n\r\nabcd"
+            );
+            let _ = c.write_all(req.as_bytes());
+            let mut buf = Vec::new();
+            let _ = c.read_to_end(&mut buf);
+        });
+        thread::sleep(std::time::Duration::from_millis(30));
+        let started = std::time::Instant::now();
+        let mut g = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).unwrap();
+        g.set_read_timeout(Some(std::time::Duration::from_millis(400)))
+            .unwrap();
+        g.write_all(b"GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut buf = Vec::new();
+        let _ = g.read_to_end(&mut buf);
+        let elapsed = started.elapsed();
+        assert!(!buf.is_empty(), "health GET got no response");
+        assert!(
+            elapsed < std::time::Duration::from_millis(400),
+            "health GET took {elapsed:?} during blackhole container update"
+        );
+        shutdown.store(true, Ordering::SeqCst);
+        drop(hole);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Python `obj/server.py:1311-1369` DELETE of a live object with a newer
+    /// timestamp is `HTTPNoContent` (204) after `disk_file.delete` tombstone.
+    /// SSYNC: `obj/server.py:1406-1415` returns 200 with
+    /// `X-Backend-Accept-No-Commit: True`; missing-check is
+    /// `ssync_receiver.py:451-513` (`:MISSING_CHECK: START`/`END`).
+    #[test]
+    fn hyper_serve_shipped_put_delete_ssync_wire() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+        use swift_http::ServerConfig;
+
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-hyper-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let cfg = ServerConfig {
+            worker_threads: 2,
+            shutdown: Some(std::sync::Arc::clone(&shutdown)),
+            ..ServerConfig::default()
+        };
+        thread::spawn(move || serve_with_config(listener, server, cfg));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(20)).is_ok() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let mut c = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).unwrap();
+        c.set_read_timeout(Some(std::time::Duration::from_millis(800)))
+            .unwrap();
+        c.write_all(
+            b"PUT /sda1/0/AUTH_test/c/o HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Timestamp: 3000\r\nContent-Type: application/octet-stream\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabcd",
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        let _ = c.read_to_end(&mut buf);
+        let put = String::from_utf8_lossy(&buf);
+        assert!(put.contains("201"), "PUT {put:?}");
+
+        let mut c = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).unwrap();
+        c.set_read_timeout(Some(std::time::Duration::from_millis(800)))
+            .unwrap();
+        c.write_all(
+            b"DELETE /sda1/0/AUTH_test/c/o HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Timestamp: 3001\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        buf.clear();
+        let _ = c.read_to_end(&mut buf);
+        let del = String::from_utf8_lossy(&buf);
+        assert!(
+            del.contains("204"),
+            "DELETE tombstone must be 204 HTTPNoContent (obj/server.py:1311-1369), got {del:?}"
+        );
+
+        let mut c = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).unwrap();
+        c.set_read_timeout(Some(std::time::Duration::from_millis(800)))
+            .unwrap();
+        let ssync = b":MISSING_CHECK: START\r\n:MISSING_CHECK: END\r\n:UPDATES: START\r\n:UPDATES: END\r\n";
+        let head = format!(
+            "SSYNC /sda1/0 HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            ssync.len()
+        );
+        c.write_all(head.as_bytes()).unwrap();
+        c.write_all(ssync).unwrap();
+        buf.clear();
+        let _ = c.read_to_end(&mut buf);
+        let ss = String::from_utf8_lossy(&buf);
+        assert!(ss.contains("200"), "SSYNC status (obj/server.py:1406-1415) {ss:?}");
+        assert!(
+            ss.to_ascii_lowercase()
+                .contains("x-backend-accept-no-commit: true"),
+            "SSYNC must advertise X-Backend-Accept-No-Commit (obj/server.py:1412), got {ss:?}"
+        );
+
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Python sender (`ssync_sender.py:240-373`): SSYNC + `Transfer-Encoding:
+    /// chunked`, `getresponse()` **before** `:MISSING_CHECK:`, then missing
+    /// check, then updates. FS stays on StorageExecutor — the client fd is
+    /// not owned by a blocking thread for the session.
+    #[test]
+    fn hyper_serve_ssync_full_duplex_async_socket() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+        use swift_http::ServerConfig;
+
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-ssync-duplex-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let cfg = ServerConfig {
+            worker_threads: 2,
+            shutdown: Some(std::sync::Arc::clone(&shutdown)),
+            ..ServerConfig::default()
+        };
+        thread::spawn(move || serve_with_config(listener, server, cfg));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(20)).is_ok() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let mut c = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).unwrap();
+        c.set_nodelay(true).ok();
+        c.set_read_timeout(Some(std::time::Duration::from_millis(800)))
+            .unwrap();
+        c.set_write_timeout(Some(std::time::Duration::from_millis(800)))
+            .unwrap();
+        // Sender endheaders() — no body yet (ssync_sender.py:251-264).
+        c.write_all(
+            b"SSYNC /sda1/0 HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        c.flush().ok();
+
+        let mut head = Vec::new();
+        let mut one = [0u8; 1];
+        let head_deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
+        while std::time::Instant::now() < head_deadline && head.len() < 8192 {
+            match c.read(&mut one) {
+                Ok(0) => break,
+                Ok(_) => {
+                    head.push(one[0]);
+                    if head.len() >= 4 && &head[head.len() - 4..] == b"\r\n\r\n" {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let head_s = String::from_utf8_lossy(&head);
+        assert!(
+            head_s.contains("200"),
+            "Python sender getresponse() after SSYNC headers must see 200 before the body (ssync_sender.py:264-272), got {head_s:?}"
+        );
+        assert!(
+            head_s.to_ascii_lowercase().contains("x-backend-accept-no-commit: true"),
+            "obj/server.py:1406-1415 {head_s:?}"
+        );
+
+        // Same listener, 2 workers: a health GET must complete while this
+        // SSYNC session still holds the client fd waiting for MISSING_CHECK.
+        let health = thread::spawn(move || {
+            let mut g =
+                TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).unwrap();
+            g.set_read_timeout(Some(std::time::Duration::from_millis(400)))
+                .unwrap();
+            g.write_all(b"GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut buf = Vec::new();
+            let _ = g.read_to_end(&mut buf);
+            buf
+        });
+        let health_buf = health.join().expect("health thread");
+        let health_s = String::from_utf8_lossy(&health_buf);
+        assert!(
+            health_s.contains("HTTP/1.1"),
+            "health GET must complete while SSYNC holds the async socket, got {health_s:?}"
+        );
+
+        fn write_http_chunk(c: &mut TcpStream, data: &[u8]) {
+            let hdr = format!("{:x}\r\n", data.len());
+            c.write_all(hdr.as_bytes()).unwrap();
+            c.write_all(data).unwrap();
+            c.write_all(b"\r\n").unwrap();
+        }
+        write_http_chunk(&mut c, b":MISSING_CHECK: START\r\n:MISSING_CHECK: END\r\n");
+        c.flush().ok();
+
+        let mut rest = Vec::new();
+        let miss_deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
+        while std::time::Instant::now() < miss_deadline {
+            let mut tmp = [0u8; 512];
+            match c.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    rest.extend_from_slice(&tmp[..n]);
+                    if String::from_utf8_lossy(&rest).contains(":MISSING_CHECK: END") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let miss = String::from_utf8_lossy(&rest);
+        assert!(
+            miss.contains(":MISSING_CHECK: START") && miss.contains(":MISSING_CHECK: END"),
+            "receiver missing_check yield (ssync_receiver.py:509-513) {miss:?}"
+        );
+
+        write_http_chunk(&mut c, b":UPDATES: START\r\n:UPDATES: END\r\n");
+        write_http_chunk(&mut c, b"");
+        c.flush().ok();
+        let upd_deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
+        while std::time::Instant::now() < upd_deadline {
+            let mut tmp = [0u8; 512];
+            match c.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    rest.extend_from_slice(&tmp[..n]);
+                    if String::from_utf8_lossy(&rest).contains(":UPDATES: END") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let all = String::from_utf8_lossy(&rest);
+        assert!(
+            all.contains(":UPDATES: END"),
+            "receiver updates (ssync_receiver.py) {all:?}"
+        );
+
+        shutdown.store(true, Ordering::SeqCst);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
