@@ -31,6 +31,36 @@ use swift_http::Response;
 /// Python `sysmeta_header('object', 'etag')` — stored unquoted `md5hex-N`.
 pub const SYS_S3API_ETAG: &str = "X-Object-Sysmeta-S3Api-Etag";
 
+/// Python `sysmeta_header('object', 'upload-id')` on the committed SLO object.
+/// `_get_upload_info` falls back to HEAD dest and matches this after the
+/// `{key}/{uploadId}` marker is deleted.
+pub const SYS_S3API_UPLOAD_ID: &str = "X-Object-Sysmeta-S3Api-Upload-Id";
+
+/// Python CompleteMultipartUpload already-uploaded check
+/// (`already_uploaded_s3_etag` vs computed `md5hex-N`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletedMpuEtagMatch {
+    /// Same part list as the committed object → 200 without rewrite.
+    Idempotent,
+    /// Dest has a different s3 etag (more/fewer/other parts) → NoSuchUpload.
+    Conflict,
+    /// No stored s3 etag yet → proceed with SLO PUT.
+    Continue,
+}
+
+/// Compare dest/marker `SYS_S3API_ETAG` with the etag computed from the
+/// CompleteMultipartUpload XML. Python does this before HEADing parts.
+pub fn match_completed_mpu_etag(
+    stored: Option<&str>,
+    computed: Option<&str>,
+) -> CompletedMpuEtagMatch {
+    match stored {
+        Some(stored) if computed == Some(stored) => CompletedMpuEtagMatch::Idempotent,
+        Some(_) => CompletedMpuEtagMatch::Conflict,
+        None => CompletedMpuEtagMatch::Continue,
+    }
+}
+
 /// Python `get_container_update_override_key('etag')`. Live object-server
 /// may ignore it; listing still HEADs [`SYS_S3API_ETAG`] as fallback.
 pub const SYS_CONTAINER_UPDATE_OVERRIDE_ETAG: &str =
@@ -385,6 +415,27 @@ mod tests {
         let j = slo_manifest_json("b+segments", "k", "u", &[(1, "aa".into(), 10)]);
         assert!(j.contains("\"path\":\"/b+segments/k/u/00000001\""));
         assert!(j.contains("\"etag\":\"aa\""));
+    }
+
+    #[test]
+    fn match_completed_mpu_etag_python_cases() {
+        let etag = "b4b77f5320cfe9ce9c0c70c35e84d511-2";
+        assert_eq!(
+            match_completed_mpu_etag(Some(etag), Some(etag)),
+            CompletedMpuEtagMatch::Idempotent
+        );
+        assert_eq!(
+            match_completed_mpu_etag(Some(etag), Some("deadbeefdeadbeefdeadbeefdeadbeef-1")),
+            CompletedMpuEtagMatch::Conflict
+        );
+        assert_eq!(
+            match_completed_mpu_etag(None, Some(etag)),
+            CompletedMpuEtagMatch::Continue
+        );
+        assert_eq!(
+            match_completed_mpu_etag(Some(etag), None),
+            CompletedMpuEtagMatch::Conflict
+        );
     }
 
     #[test]

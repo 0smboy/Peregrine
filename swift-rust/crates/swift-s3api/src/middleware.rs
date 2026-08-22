@@ -155,10 +155,11 @@ use crate::lifecycle_exec::{
 };
 use crate::mpu::{
     aws_multipart_etag, complete_multipart_xml, initiate_response, list_multipart_uploads_xml,
-    list_parts_xml_full, new_upload_id, parse_complete_body, parse_upload_marker_name,
-    part_object_name, segments_container, slo_manifest_json, upload_marker_name, ListedPart,
-    ListedUpload, SYS_CONTAINER_UPDATE_OVERRIDE_ETAG, SYS_CONTAINER_UPDATE_OVERRIDE_SIZE,
-    SYS_S3API_ETAG,
+    list_parts_xml_full, match_completed_mpu_etag, new_upload_id, parse_complete_body,
+    parse_upload_marker_name, part_object_name, segments_container, slo_manifest_json,
+    upload_marker_name, CompletedMpuEtagMatch, ListedPart, ListedUpload,
+    SYS_CONTAINER_UPDATE_OVERRIDE_ETAG, SYS_CONTAINER_UPDATE_OVERRIDE_SIZE, SYS_S3API_ETAG,
+    SYS_S3API_UPLOAD_ID,
 };
 use crate::object_lock_worm::{
     apply_default_retention_headers, bypass_governance_requested,
@@ -4686,6 +4687,60 @@ fn control_head_object(
     }
 }
 
+/// Python `_get_upload_info`: HEAD `{bucket}+segments/{key}/{uploadId}` first;
+/// if missing, HEAD dest and require `SYS_S3API_UPLOAD_ID` == uploadId.
+struct MpuUploadInfo {
+    headers: HeaderKeyDict,
+}
+
+fn get_mpu_upload_info(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    next: &NextFn,
+) -> Result<MpuUploadInfo, Response> {
+    let segs = segments_container(bucket);
+    let marker = upload_marker_name(key, upload_id);
+    match control_head_object(cred, &segs, &marker, next)? {
+        ObjectHead::Present(resp) => Ok(MpuUploadInfo {
+            headers: resp.headers,
+        }),
+        ObjectHead::Missing => match control_head_object(cred, bucket, key, next)? {
+            ObjectHead::Present(resp) => {
+                if resp.headers.get(SYS_S3API_UPLOAD_ID) != Some(upload_id) {
+                    return Err(s3_error_response("NoSuchUpload", None, &[]));
+                }
+                Ok(MpuUploadInfo {
+                    headers: resp.headers,
+                })
+            }
+            ObjectHead::Missing => Err(s3_error_response("NoSuchUpload", None, &[])),
+        },
+    }
+}
+
+/// Python already-uploaded s3-etag check. `None` means continue with SLO PUT.
+fn complete_mpu_already_uploaded(
+    stored_etag: Option<&str>,
+    computed: Option<&str>,
+    bucket: &str,
+    key: &str,
+    location: &str,
+) -> Option<Response> {
+    match match_completed_mpu_etag(stored_etag, computed) {
+        CompletedMpuEtagMatch::Idempotent => {
+            let etag = stored_etag.or(computed).unwrap_or("multipart");
+            Some(xml_response(
+                200,
+                complete_multipart_xml(bucket, key, etag, location),
+            ))
+        }
+        CompletedMpuEtagMatch::Conflict => Some(s3_error_response("NoSuchUpload", None, &[])),
+        CompletedMpuEtagMatch::Continue => None,
+    }
+}
+
 /// Account-level (bucket=None) request with a method the Python s3api
 /// ServiceController does not implement → the byte-aligned Python reject.
 ///
@@ -5804,6 +5859,33 @@ async fn control_head_object_async(
     }
 }
 
+async fn get_mpu_upload_info_async(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    next: &AsyncNextFn,
+) -> Result<MpuUploadInfo, Response> {
+    let segs = segments_container(bucket);
+    let marker = upload_marker_name(key, upload_id);
+    match control_head_object_async(cred, &segs, &marker, next).await? {
+        ObjectHead::Present(resp) => Ok(MpuUploadInfo {
+            headers: resp.headers,
+        }),
+        ObjectHead::Missing => match control_head_object_async(cred, bucket, key, next).await? {
+            ObjectHead::Present(resp) => {
+                if resp.headers.get(SYS_S3API_UPLOAD_ID) != Some(upload_id) {
+                    return Err(s3_error_response("NoSuchUpload", None, &[]));
+                }
+                Ok(MpuUploadInfo {
+                    headers: resp.headers,
+                })
+            }
+            ObjectHead::Missing => Err(s3_error_response("NoSuchUpload", None, &[])),
+        },
+    }
+}
+
 async fn require_bucket_object_lock_async(
     cred: &S3Credential,
     bucket: &str,
@@ -6351,12 +6433,20 @@ async fn handle_mpu_complete_async(
         Err(code) => return s3_error_response(&code, None, &[]),
     };
     let segs = segments_container(bucket);
-    let marker = upload_marker_name(key, upload_id);
-    let marker_head = match control_head_object_async(cred, &segs, &marker, next).await {
-        Ok(ObjectHead::Present(head)) => head,
-        Ok(ObjectHead::Missing) => return s3_error_response("NoSuchUpload", None, &[]),
+    let upload_info = match get_mpu_upload_info_async(cred, bucket, key, upload_id, next).await {
+        Ok(info) => info,
         Err(resp) => return resp,
     };
+    let s3_etag = aws_multipart_etag(parts.iter().map(|(_, e)| e.as_str()));
+    if let Some(resp) = complete_mpu_already_uploaded(
+        upload_info.headers.get(SYS_S3API_ETAG),
+        s3_etag.as_deref(),
+        bucket,
+        key,
+        &location,
+    ) {
+        return resp;
+    }
     let mut sized: Vec<(u32, String, u64)> = Vec::new();
     for (num, etag) in &parts {
         let pname = part_object_name(key, upload_id, *num);
@@ -6392,14 +6482,14 @@ async fn handle_mpu_complete_async(
             }
         }
     }
-    let s3_etag = aws_multipart_etag(sized.iter().map(|(_, e, _)| e.as_str()));
     let manifest = slo_manifest_json(&segs, key, upload_id, &sized);
     let mut put = make_swift_req(
         "PUT",
         &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
     );
-    copy_mpu_object_headers(&marker_head.headers, &mut put.headers);
+    copy_mpu_object_headers(&upload_info.headers, &mut put.headers);
     persist_s3_object_headers(&mut put);
+    put.headers.set(SYS_S3API_UPLOAD_ID, upload_id);
     if let Some(ref etag) = s3_etag {
         put.headers.set(SYS_S3API_ETAG, etag);
         put.headers.set(SYS_CONTAINER_UPDATE_OVERRIDE_ETAG, etag);
@@ -6526,8 +6616,10 @@ async fn delete_mpu_marker_async(
     upload_id: &str,
     next: &AsyncNextFn,
 ) {
-    // Python complete deletes only the `{key}/{uploadId}` marker so a
-    // retry is NoSuchUpload. Parts stay as SLO segments.
+    // Python complete deletes only the `{key}/{uploadId}` marker. Parts
+    // stay as SLO segments. A retry with the same part list is 200
+    // (idempotent complete against dest `s3api-etag`); more/fewer parts
+    // is NoSuchUpload.
     let segs = segments_container(bucket);
     let marker = upload_marker_name(key, upload_id);
     let mut del = make_swift_req(
@@ -9203,12 +9295,20 @@ fn handle_mpu_complete(
         Err(code) => return s3_error_response(&code, None, &[]),
     };
     let segs = segments_container(bucket);
-    let marker = upload_marker_name(key, upload_id);
-    let marker_head = match control_head_object(cred, &segs, &marker, next) {
-        Ok(ObjectHead::Present(head)) => head,
-        Ok(ObjectHead::Missing) => return s3_error_response("NoSuchUpload", None, &[]),
+    let upload_info = match get_mpu_upload_info(cred, bucket, key, upload_id, next) {
+        Ok(info) => info,
         Err(resp) => return resp,
     };
+    let s3_etag = aws_multipart_etag(parts.iter().map(|(_, e)| e.as_str()));
+    if let Some(resp) = complete_mpu_already_uploaded(
+        upload_info.headers.get(SYS_S3API_ETAG),
+        s3_etag.as_deref(),
+        bucket,
+        key,
+        &location,
+    ) {
+        return resp;
+    }
     // HEAD each part for size.
     let mut sized: Vec<(u32, String, u64)> = Vec::new();
     for (num, etag) in &parts {
@@ -9247,14 +9347,14 @@ fn handle_mpu_complete(
             }
         }
     }
-    let s3_etag = aws_multipart_etag(sized.iter().map(|(_, e, _)| e.as_str()));
     let manifest = slo_manifest_json(&segs, key, upload_id, &sized);
     let mut put = make_swift_req(
         "PUT",
         &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
     );
-    copy_mpu_object_headers(&marker_head.headers, &mut put.headers);
+    copy_mpu_object_headers(&upload_info.headers, &mut put.headers);
     persist_s3_object_headers(&mut put);
+    put.headers.set(SYS_S3API_UPLOAD_ID, upload_id);
     if let Some(ref etag) = s3_etag {
         put.headers.set(SYS_S3API_ETAG, etag);
         // Live object-server uses this value as the listing hash (no SLO merge).
@@ -12415,6 +12515,9 @@ mod tests {
         let stamped_c = stamped.clone();
         let stamped_override = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
         let stamped_override_c = stamped_override.clone();
+        let stamped_uid = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let stamped_uid_c = stamped_uid.clone();
+        let uid_for_put = upload_id.clone();
         let complete_next: NextFn = Arc::new(move |r| {
             if r.method == "HEAD" {
                 let mut resp = Response::new(200);
@@ -12441,6 +12544,11 @@ mod tests {
                 .headers
                 .get(SYS_CONTAINER_UPDATE_OVERRIDE_ETAG)
                 .map(str::to_string);
+            *stamped_uid_c.lock().unwrap() = r.headers.get(SYS_S3API_UPLOAD_ID).map(str::to_string);
+            assert_eq!(
+                r.headers.get(SYS_S3API_UPLOAD_ID),
+                Some(uid_for_put.as_str())
+            );
             let mut resp = Response::new(201);
             resp.headers.set("ETag", "slo-manifest-md5-not-aws");
             resp
@@ -12464,6 +12572,132 @@ mod tests {
             stamped_override.lock().unwrap().as_deref(),
             Some("b4b77f5320cfe9ce9c0c70c35e84d511-2")
         );
+        assert_eq!(stamped_uid.lock().unwrap().as_deref(), Some(upload_id.as_str()));
+    }
+
+    fn complete_two_part_xml() -> Vec<u8> {
+        br#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"b8fc857a25e7958868c2f003d5e0952d"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>"973f488aa4a5df5ae05e8e73c63432e0"</ETag></Part></CompleteMultipartUpload>"#
+            .to_vec()
+    }
+
+    fn complete_three_part_xml() -> Vec<u8> {
+        br#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"b8fc857a25e7958868c2f003d5e0952d"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>"973f488aa4a5df5ae05e8e73c63432e0"</ETag></Part><Part><PartNumber>3</PartNumber><ETag>"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"</ETag></Part></CompleteMultipartUpload>"#
+            .to_vec()
+    }
+
+    #[test]
+    fn complete_mpu_same_parts_after_marker_gone_is_idempotent() {
+        // Python `_get_upload_info` dest fallback + matching s3-etag → 200,
+        // no SLO rewrite. Official test_if_none_match_star_mpu retry.
+        let api = S3Api::new(cred_map());
+        let uid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut req = base_s3_req("POST", "/mybucket/big/obj", &format!("uploadId={uid}"));
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.headers.set("If-None-Match", "*");
+        req.body = Body::from(complete_two_part_xml());
+        let req = sign_request(req, "testing");
+        let puts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let puts_c = puts.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            if r.method == "HEAD" && r.path == format!("/v1/AUTH_test/mybucket+segments/big/obj/{uid}")
+            {
+                return Response::new(404);
+            }
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket/big/obj" {
+                let mut resp = Response::new(200);
+                resp.headers.set(SYS_S3API_UPLOAD_ID, uid);
+                resp.headers
+                    .set(SYS_S3API_ETAG, "b4b77f5320cfe9ce9c0c70c35e84d511-2");
+                return resp;
+            }
+            if r.method == "PUT" {
+                puts_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Response::new(201);
+            }
+            Response::new(404)
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("CompleteMultipartUploadResult"), "{body}");
+        assert!(body.contains("\"b4b77f5320cfe9ce9c0c70c35e84d511-2\""), "{body}");
+        assert_eq!(puts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn complete_mpu_different_parts_after_marker_gone_is_nosuchupload() {
+        let api = S3Api::new(cred_map());
+        let uid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut req = base_s3_req("POST", "/mybucket/big/obj", &format!("uploadId={uid}"));
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.headers.set("If-None-Match", "*");
+        req.body = Body::from(complete_three_part_xml());
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            if r.method == "HEAD" && r.path.contains("+segments/big/obj/") {
+                return Response::new(404);
+            }
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket/big/obj" {
+                let mut resp = Response::new(200);
+                resp.headers.set(SYS_S3API_UPLOAD_ID, uid);
+                resp.headers
+                    .set(SYS_S3API_ETAG, "b4b77f5320cfe9ce9c0c70c35e84d511-2");
+                return resp;
+            }
+            if r.method == "PUT" {
+                panic!("conflict complete must not rewrite, got {}", r.path);
+            }
+            Response::new(404)
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 404);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("NoSuchUpload"), "{body}");
+    }
+
+    #[test]
+    fn complete_mpu_async_same_parts_after_marker_gone_is_idempotent() {
+        let api = S3Api::new(cred_map());
+        let uid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut req = base_s3_req("POST", "/mybucket/big/obj", &format!("uploadId={uid}"));
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.headers.set("If-None-Match", "*");
+        req.body = Body::from(complete_two_part_xml());
+        let req = sign_request(req, "testing");
+        let puts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let puts_c = puts.clone();
+        let next = async_ok(move |r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            if r.method == "HEAD" && r.path == format!("/v1/AUTH_test/mybucket+segments/big/obj/{uid}")
+            {
+                return Response::new(404);
+            }
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket/big/obj" {
+                let mut resp = Response::new(200);
+                resp.headers.set(SYS_S3API_UPLOAD_ID, uid);
+                resp.headers
+                    .set(SYS_S3API_ETAG, "b4b77f5320cfe9ce9c0c70c35e84d511-2");
+                return resp;
+            }
+            if r.method == "PUT" {
+                puts_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Response::new(201);
+            }
+            Response::new(404)
+        });
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("CompleteMultipartUploadResult"), "{body}");
+        assert_eq!(puts.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
