@@ -29,9 +29,12 @@ use flate2::read::GzDecoder;
 use tar::Archive;
 
 use swift_core::constraints::MAX_FILE_SIZE;
+use std::future::Future;
+use std::pin::Pin;
+
 use swift_http::{split_path, Body, HeaderKeyDict, Request, Response};
 
-use crate::{Middleware, NextFn};
+use crate::{AsyncNextFn, Middleware, NextFn};
 
 /// The `bulk` middleware (delete + extract-archive).
 pub struct Bulk {
@@ -458,6 +461,67 @@ impl Bulk {
         out.headers.set("Content-Type", "application/json");
         out
     }
+
+    async fn handle_delete_async(&self, mut req: Request, next: AsyncNextFn) -> Response {
+        let parts = match split_path(&req.path, 2, 3, true) {
+            Ok(p) => p,
+            Err(_) => return Response::error(404, "Not Found"),
+        };
+        let version = parts[0].clone().unwrap_or_default();
+        let account = parts[1].clone().unwrap_or_default();
+        if let Some(ct) = req.headers.get("Content-Type") {
+            if !ct.starts_with("text/plain") {
+                return Response::error(406, "Invalid Content-Type");
+            }
+        }
+        let names = match req
+            .body
+            .materialize(swift_core::constraints::MAX_FILE_SIZE as u64)
+        {
+            Ok(bytes) => parse_delete_body(bytes),
+            Err(_) => return Response::error(413, "Request Entity Too Large"),
+        };
+        if names.len() > self.max_deletes_per_request {
+            return Response::error(413, "Maximum Bulk Deletes exceeded");
+        }
+        let sub_headers = Self::auth_sub_headers(&req);
+        let mut result = BulkDeleteResult::default();
+        for name in &names {
+            let delete_path = format!("/{version}/{account}/{}", name.trim_start_matches('/'));
+            let subreq = Request {
+                method: "DELETE".to_string(),
+                path: delete_path,
+                query_string: String::new(),
+                headers: sub_headers.clone(),
+                body: Body::empty(),
+            };
+            let resp = next(subreq).await;
+            match resp.status {
+                s if (200..300).contains(&s) => result.number_deleted += 1,
+                404 => result.number_not_found += 1,
+                s => result
+                    .errors
+                    .push((name.clone(), format!("{s} {}", resp.reason))),
+            }
+        }
+        let (status, body_note) = if !result.errors.is_empty() {
+            (400, "")
+        } else if result.number_deleted == 0 && result.number_not_found == 0 {
+            (400, "Invalid bulk delete.")
+        } else {
+            (200, "")
+        };
+        let summary = serde_json::json!({
+            "Number Deleted": result.number_deleted,
+            "Number Not Found": result.number_not_found,
+            "Response Status": status_line(status),
+            "Response Body": body_note,
+            "Errors": result.errors.iter().map(|(p, e)| vec![p.clone(), e.clone()]).collect::<Vec<_>>(),
+        });
+        let mut out = Response::with_body(200, summary.to_string().into_bytes());
+        out.headers.set("Content-Type", "application/json");
+        out
+    }
 }
 
 fn status_line(code: u16) -> String {
@@ -496,6 +560,26 @@ impl Middleware for Bulk {
         } else {
             next(req)
         }
+    }
+
+    fn intercepts_request(&self, req: &Request) -> bool {
+        req.param("bulk-delete").is_some() && (req.method == "POST" || req.method == "DELETE")
+    }
+
+    fn handle_request_async(
+        &self,
+        req: Request,
+        next: AsyncNextFn,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move {
+            if req.param("bulk-delete").is_some()
+                && (req.method == "POST" || req.method == "DELETE")
+            {
+                self.handle_delete_async(req, next).await
+            } else {
+                next(req).await
+            }
+        })
     }
 }
 
@@ -707,5 +791,21 @@ mod tests {
             body: b"x".to_vec().into(),
         };
         assert_eq!(b.handle(r, &app).status, 400);
+    }
+
+    #[test]
+    fn test_intercepts_bulk_delete_only() {
+        let b = Bulk::new();
+        let mut del = req("/c/a\n");
+        del.query_string = "bulk-delete=1".into();
+        assert!(b.intercepts_request(&del));
+        let put = Request {
+            method: "PUT".into(),
+            path: "/v1/AUTH_test".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        assert!(!b.intercepts_request(&put));
     }
 }

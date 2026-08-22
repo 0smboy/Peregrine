@@ -2240,12 +2240,33 @@ impl ProxyApp {
 }
 
 pub(crate) fn parse_copy_from(value: &str) -> Option<(String, String)> {
-    let v = value.strip_prefix('/').unwrap_or(value);
+    let decoded = percent_decode_copy_from(value);
+    let v = decoded.strip_prefix('/').unwrap_or(decoded.as_str());
     let (container, object) = v.split_once('/')?;
     if container.is_empty() || object.is_empty() {
         return None;
     }
     Some((container.to_string(), object.to_string()))
+}
+
+fn percent_decode_copy_from(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(value) = u8::from_str_radix(hex, 16) {
+                    out.push(value);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn is_copied_source_header(name: &str) -> bool {
@@ -2598,6 +2619,13 @@ mod tests {
     use std::sync::Arc as StdArc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn parse_copy_from_unquotes_percent_encoded_object() {
+        let (c, o) = parse_copy_from("/srcc/object%20name%20%F0%9F%99%82").unwrap();
+        assert_eq!(c, "srcc");
+        assert_eq!(o, "object name 🙂");
+    }
 
     fn ring_unused() -> Ring {
         let dev = RingDevice {

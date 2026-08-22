@@ -2513,6 +2513,11 @@ impl ProxyApp {
         mut areq: swift_http::AsyncRequest,
     ) -> Response {
         let segs: Vec<&str> = areq.path.splitn(5, '/').collect();
+        if matches!(segs.get(1), Some(&"v1") | Some(&"v1.0"))
+            && !segs.get(2).is_some_and(|s| !s.is_empty())
+        {
+            return text_response(412, "Bad URL");
+        }
         let v1 = segs.len() >= 3
             && segs[0].is_empty()
             && segs[1] == "v1"
@@ -2857,6 +2862,17 @@ impl ProxyApp {
         else {
             return swob_response(503);
         };
+        if let Err(e) = swift_core::constraints::check_metadata(req.headers.iter(), "object") {
+            let mut r = Response::with_body(400, e.0);
+            r.headers.set("Content-Type", "text/html; charset=UTF-8");
+            return r;
+        }
+        if object.len() as i64 > swift_core::constraints::MAX_OBJECT_NAME_LENGTH {
+            return text_response(400, &format!("Object name too long: {object}"));
+        }
+        if container.len() as i64 > swift_core::constraints::MAX_CONTAINER_NAME_LENGTH {
+            return text_response(400, &format!("Container name too long: {container}"));
+        }
         let path = format!(
             "/{}/{}/{}",
             percent_encode(account),
@@ -6357,6 +6373,21 @@ mod cors_tests {
             .await;
         assert_eq!(opt.status, 200, "{}", opt.reason);
         assert_eq!(opt.headers.get("Allow"), Some("GET, HEAD, POST, OPTIONS"));
+        let bad = app
+            .handle_async(swift_http::AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(bad.status, 412, "{}", bad.reason);
+        let body = match bad.body {
+            swift_http::Body::Buffered(b) => String::from_utf8_lossy(&b).into_owned(),
+            _ => String::new(),
+        };
+        assert!(body.contains("Bad URL"), "body={body:?}");
         let info = app
             .handle_async(swift_http::AsyncRequest {
                 method: "GET".into(),

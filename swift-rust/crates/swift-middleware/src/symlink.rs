@@ -68,12 +68,15 @@
 use swift_core::config::config_true_value;
 use swift_core::constraints::check_account_format;
 
+use std::future::Future;
+use std::pin::Pin;
+
 use swift_http::{
     body_too_large, normalize_etag, split_path, Body, HeaderKeyDict, Request, Response,
     MAX_CONTROL_BODY,
 };
 
-use crate::{Middleware, NextFn};
+use crate::{AsyncNextFn, Middleware, NextFn};
 
 const DEFAULT_SYMLOOP_MAX: usize = 2;
 
@@ -530,6 +533,282 @@ impl Symlink {
         }
         redirect
     }
+
+    fn is_object_path(req: &Request) -> bool {
+        matches!(split_path(&req.path, 4, 4, true), Ok(p) if p.get(3).and_then(|o| o.as_deref()).is_some_and(|o| !o.is_empty()))
+    }
+
+    async fn handle_object_async(&self, req: Request, next: AsyncNextFn) -> Response {
+        if req.method == "GET" || req.method == "HEAD" {
+            if req.param("symlink").as_deref() == Some("get") {
+                let mut resp = next(req).await;
+                symlink_sysmeta_to_usermeta(&mut resp.headers);
+                resp
+            } else {
+                self.handle_get_head_async(req, next).await
+            }
+        } else if req.method == "PUT" && req.headers.contains_key(TGT_OBJ_SYMLINK_HDR) {
+            self.handle_put_async(req, next).await
+        } else if req.method == "POST" {
+            self.handle_post_async(req, next).await
+        } else {
+            next(req).await
+        }
+    }
+
+    async fn handle_get_head_async(&self, mut req: Request, next: AsyncNextFn) -> Response {
+        update_ignore_range_header(&mut req.headers, TGT_OBJ_SYSMETA_SYMLINK_HDR);
+        let orig_req = req.clone_head();
+        match self
+            .recursive_get_head_async(orig_req, req, next, None, true, None)
+            .await
+        {
+            Ok((mut resp, last_target_path)) => {
+                if let Some(loc) = last_target_path {
+                    resp.headers.set("Content-Location", loc);
+                }
+                resp
+            }
+            Err(resp) => resp,
+        }
+    }
+
+    async fn recursive_get_head_async(
+        &self,
+        orig_req: Request,
+        start_req: Request,
+        next: AsyncNextFn,
+        mut target_etag: Option<String>,
+        follow_softlinks: bool,
+        mut last_target_path: Option<String>,
+    ) -> Result<(Response, Option<String>), Response> {
+        let mut cur = start_req;
+        let mut loop_count: usize = 0;
+        loop {
+            let resp = next(cur.clone_head()).await;
+            let symlink_target = resp
+                .headers
+                .get(TGT_OBJ_SYSMETA_SYMLINK_HDR)
+                .map(str::to_string);
+            let resp_etag = resp
+                .headers
+                .get(TGT_ETAG_SYSMETA_SYMLINK_HDR)
+                .map(str::to_string);
+            let is_symlink = symlink_target.is_some() && (resp_etag.is_some() || follow_softlinks);
+            if is_symlink {
+                let symlink_target = symlink_target.expect("checked is_some");
+                let found_etag = resp_etag
+                    .clone()
+                    .or_else(|| resp.headers.get("etag").map(str::to_string));
+                if let Some(te) = target_etag.as_deref() {
+                    if Some(te) != found_etag.as_deref() {
+                        return Err(conflict(
+                            "X-Symlink-Target-Etag headers do not match",
+                            last_target_path.as_deref(),
+                        ));
+                    }
+                }
+                if loop_count >= self.symloop_max {
+                    return Err(err_text(
+                        409,
+                        format!(
+                            "Too many levels of symbolic links, maximum allowed is {}",
+                            self.symloop_max
+                        ),
+                    ));
+                }
+                let new_req = build_traversal_req(&cur, &resp, &symlink_target, &orig_req);
+                last_target_path = Some(new_req.path.clone());
+                if !config_true_value(resp.headers.get(SYMLOOP_EXTEND).unwrap_or("")) {
+                    loop_count += 1;
+                }
+                target_etag = resp_etag;
+                cur = new_req;
+                continue;
+            }
+            let final_etag = resp.headers.get("etag").map(str::to_string);
+            if let (Some(fe), Some(te)) = (final_etag.as_deref(), target_etag.as_deref()) {
+                if fe != te {
+                    return Err(conflict(
+                        format!(
+                            "Object Etag '{fe}' does not match X-Symlink-Target-Etag header '{te}'"
+                        ),
+                        last_target_path.as_deref(),
+                    ));
+                }
+            }
+            return Ok((resp, last_target_path));
+        }
+    }
+
+    async fn handle_put_async(&self, mut req: Request, next: AsyncNextFn) -> Response {
+        let has_body = match req
+            .headers
+            .get("Content-Length")
+            .map(|s| s.trim().parse::<i64>())
+        {
+            Some(Ok(cl)) => cl != 0,
+            _ => match req.body.materialize(MAX_CONTROL_BODY) {
+                Ok(bytes) => !bytes.is_empty(),
+                Err(e) if body_too_large(&e) => true,
+                Err(_) => return err_text(499, "Client Disconnect"),
+            },
+        };
+        if has_body {
+            return err_text(400, "Symlink requests require a zero byte body");
+        }
+
+        let (symlink_target_path, etag) = match validate_and_prep_request_headers(&mut req) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        if let Some(etag) = &etag {
+            if let Some(resp) = self
+                .validate_etag_and_update_sysmeta_async(
+                    &mut req,
+                    &symlink_target_path,
+                    etag,
+                    next.clone(),
+                )
+                .await
+            {
+                return resp;
+            }
+        }
+        symlink_usermeta_to_sysmeta(&mut req.headers);
+
+        let mut etag_override = vec![
+            req.headers
+                .get(CONTAINER_UPDATE_OVERRIDE_ETAG)
+                .map(str::to_string)
+                .unwrap_or_else(|| MD5_OF_EMPTY_STRING.to_string()),
+            format!(
+                "symlink_target={}",
+                req.headers.get(TGT_OBJ_SYSMETA_SYMLINK_HDR).unwrap_or("")
+            ),
+        ];
+        if let Some(acct) = req
+            .headers
+            .get(TGT_ACCT_SYSMETA_SYMLINK_HDR)
+            .map(str::to_string)
+        {
+            etag_override.push(format!("symlink_target_account={acct}"));
+        }
+        if let Some(tgt_etag) = req
+            .headers
+            .get(TGT_ETAG_SYSMETA_SYMLINK_HDR)
+            .map(str::to_string)
+        {
+            let tgt_bytes = req
+                .headers
+                .get(TGT_BYTES_SYSMETA_SYMLINK_HDR)
+                .unwrap_or("")
+                .to_string();
+            etag_override.push(format!("symlink_target_etag={tgt_etag}"));
+            etag_override.push(format!("symlink_target_bytes={tgt_bytes}"));
+        }
+        req.headers
+            .set(CONTAINER_UPDATE_OVERRIDE_ETAG, etag_override.join("; "));
+        next(req).await
+    }
+
+    async fn validate_etag_and_update_sysmeta_async(
+        &self,
+        req: &mut Request,
+        symlink_target_path: &str,
+        etag: &str,
+        next: AsyncNextFn,
+    ) -> Option<Response> {
+        let orig_req = req.clone_head();
+        let mut subreq = req.clone_head();
+        subreq.method = "HEAD".to_string();
+        subreq.path = symlink_target_path.to_string();
+        subreq.query_string = String::new();
+
+        let (resp, last_target_path) = match self
+            .recursive_get_head_async(
+                orig_req,
+                subreq,
+                next,
+                Some(etag.to_string()),
+                false,
+                Some(symlink_target_path.to_string()),
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(resp) => return Some(resp),
+        };
+
+        if resp.status == 404 {
+            return Some(conflict(
+                "X-Symlink-Target does not exist",
+                last_target_path.as_deref(),
+            ));
+        }
+        if !is_success(resp.status) {
+            return Some(Response::new(resp.status));
+        }
+
+        let bytes = resp
+            .headers
+            .get("X-Object-Sysmeta-Slo-Size")
+            .or_else(|| resp.headers.get("Content-Length"))
+            .unwrap_or("0")
+            .to_string();
+        req.headers.set(TGT_BYTES_SYSMETA_SYMLINK_HDR, bytes);
+        req.headers.set(TGT_ETAG_SYSMETA_SYMLINK_HDR, etag);
+
+        let has_ct = req
+            .headers
+            .get("Content-Type")
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if !has_ct {
+            if let Some(ct) = resp.headers.get("Content-Type").map(str::to_string) {
+                req.headers.set("Content-Type", ct);
+            }
+        }
+        None
+    }
+
+    async fn handle_post_async(&self, req: Request, next: AsyncNextFn) -> Response {
+        if req.headers.contains_key(TGT_OBJ_SYMLINK_HDR) {
+            return err_text(400, "A PUT request is required to set a symlink target");
+        }
+        let head = req.clone_head();
+        let resp = next(req).await;
+        if !is_success(resp.status) {
+            return resp;
+        }
+        let req = head;
+        let tgt_co = match resp.headers.get(TGT_OBJ_SYSMETA_SYMLINK_HDR) {
+            Some(v) => v.to_string(),
+            None => return resp,
+        };
+        let parts = split_path(&req.path, 2, 3, true).unwrap_or_default();
+        let version = parts.first().and_then(|o| o.clone()).unwrap_or_default();
+        let account = parts.get(1).and_then(|o| o.clone()).unwrap_or_default();
+        let target_acc = resp
+            .headers
+            .get(TGT_ACCT_SYSMETA_SYMLINK_HDR)
+            .map(str::to_string)
+            .unwrap_or(account);
+        let location = format!("/{version}/{target_acc}/{tgt_co}");
+        let errmsg = "The requested POST was applied to a symlink. POST \
+                      directly to the target to apply requested metadata.";
+        let mut redirect = err_html(307, errmsg);
+        redirect.headers.set("Location", location);
+        if let Some(tgt_etag) = resp.headers.get(TGT_ETAG_SYSMETA_SYMLINK_HDR) {
+            redirect.headers.set(TGT_ETAG_SYMLINK_HDR, tgt_etag);
+        }
+        for (key, value) in resp.headers.iter() {
+            if key.to_lowercase().starts_with("x-object-sysmeta-") {
+                redirect.headers.set(key, value);
+            }
+        }
+        redirect
+    }
 }
 
 impl Middleware for Symlink {
@@ -547,6 +826,41 @@ impl Middleware for Symlink {
             // deferred; pass the request through.
             _ => next(req),
         }
+    }
+
+    fn intercepts_request(&self, req: &Request) -> bool {
+        Self::is_object_path(req)
+            && ((req.method == "PUT" && req.headers.contains_key(TGT_OBJ_SYMLINK_HDR))
+                || req.method == "POST")
+    }
+
+    fn intercepts_response(&self) -> bool {
+        true
+    }
+
+    fn handle_request_async(
+        &self,
+        req: Request,
+        next: AsyncNextFn,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move { self.handle_object_async(req, next).await })
+    }
+
+    fn reassemble_async(
+        &self,
+        req: Request,
+        next: AsyncNextFn,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move {
+            if req.method == "GET" || req.method == "HEAD" {
+                if !Self::is_object_path(&req) {
+                    return next(req).await;
+                }
+                self.handle_object_async(req, next).await
+            } else {
+                next(req).await
+            }
+        })
     }
 }
 
@@ -1208,5 +1522,58 @@ mod tests {
         assert_eq!(Symlink::from_conf(Some("0")).symloop_max, 2);
         assert_eq!(Symlink::from_conf(Some("-3")).symloop_max, 2);
         assert_eq!(Symlink::from_conf(Some("garbage")).symloop_max, 2);
+    }
+
+    #[test]
+    fn test_intercepts_symlink_put_and_post_not_plain_get() {
+        let mw = Symlink::new(2);
+        let put = req(
+            "PUT",
+            "/v1/a/c/link",
+            &[(TGT_OBJ_SYMLINK_HDR, "c/target")],
+        );
+        assert!(mw.intercepts_request(&put));
+        let post = req("POST", "/v1/a/c/link", &[]);
+        assert!(mw.intercepts_request(&post));
+        let get = req("GET", "/v1/a/c/link", &[]);
+        assert!(!mw.intercepts_request(&get));
+        assert!(mw.intercepts_response());
+        let acc = req("GET", "/v1/a", &[]);
+        assert!(!mw.intercepts_request(&acc));
+    }
+
+    #[tokio::test]
+    async fn test_async_get_follows_symlink() {
+        let mw = Symlink::new(2);
+        let mut link = Response::new(200);
+        link.headers.set(TGT_OBJ_SYSMETA_SYMLINK_HDR, "c/target");
+        let mut tgt = Response::with_body(200, b"target body".to_vec());
+        tgt.headers.set("ETag", "abc");
+        let next: AsyncNextFn = {
+            let routes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::from([
+                ("/v1/a/c/link".to_string(), link),
+                ("/v1/a/c/target".to_string(), tgt),
+            ])));
+            std::sync::Arc::new(move |r: Request| {
+                let routes = std::sync::Arc::clone(&routes);
+                Box::pin(async move {
+                    routes
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&r.path)
+                        .unwrap_or_else(|| Response::new(404))
+                })
+            })
+        };
+        let resp = mw
+            .handle_object_async(req("GET", "/v1/a/c/link", &[]), next)
+            .await;
+        assert_eq!(resp.status, 200);
+        let body = match resp.body {
+            Body::Buffered(b) => b,
+            _ => panic!("expected buffered body"),
+        };
+        assert_eq!(body, b"target body");
+        assert_eq!(resp.headers.get("Content-Location"), Some("/v1/a/c/target"));
     }
 }

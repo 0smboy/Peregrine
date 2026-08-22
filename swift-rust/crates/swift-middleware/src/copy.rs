@@ -34,9 +34,12 @@
 //! source GET. Residual vs. `copy.py` (wontfix P1c): container/account
 //! sync-key propagation.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use swift_http::{split_path, Body, HeaderKeyDict, Request, Response};
 
-use crate::{Middleware, NextFn};
+use crate::{AsyncNextFn, Middleware, NextFn};
 
 /// The `copy` middleware.
 #[derive(Default, Debug, Clone)]
@@ -289,12 +292,158 @@ impl Copy {
             .set("X-Copied-From-Account", src_account.clone());
         resp
     }
+
+    fn rewrite_copy_as_put(&self, mut req: Request) -> Result<Request, Response> {
+        let parts = match split_path(&req.path, 4, 4, true) {
+            Ok(p) => p,
+            Err(_) => return Err(Response::error(412, "Invalid destination path")),
+        };
+        let version = parts[0].clone().unwrap_or_default();
+        let account = parts[1].clone().unwrap_or_default();
+        let container = parts[2].clone().unwrap_or_default();
+        let object = parts[3].clone().unwrap_or_default();
+        let Some(dest) = req.headers.get("Destination").map(|s| s.to_string()) else {
+            return Err(Response::error(412, "Destination header required"));
+        };
+        let Some((dst_container, dst_object)) = parse_container_object(&dest) else {
+            return Err(Response::error(
+                412,
+                "Destination header must be of the form /container/object",
+            ));
+        };
+        let dst_account = req
+            .headers
+            .get("Destination-Account")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| account.clone());
+        req.method = "PUT".to_string();
+        req.path = format!("/{version}/{dst_account}/{dst_container}/{dst_object}");
+        req.headers
+            .set("X-Copy-From", format!("/{container}/{object}"));
+        req.headers.set("X-Copy-From-Account", account);
+        req.headers.remove("Destination");
+        req.headers.remove("Destination-Account");
+        Ok(req)
+    }
+
+    async fn do_copy_async(&self, mut req: Request, next: AsyncNextFn) -> Response {
+        let parts = match split_path(&req.path, 4, 4, true) {
+            Ok(p) => p,
+            Err(_) => return Response::error(412, "Invalid destination path"),
+        };
+        let version = parts[0].clone().unwrap_or_default();
+        let dst_account = parts[1].clone().unwrap_or_default();
+        let copy_from = req.headers.get("X-Copy-From").unwrap_or("").to_string();
+        let Some((src_container, src_object)) = parse_container_object(&copy_from) else {
+            return Response::error(
+                412,
+                "X-Copy-From header must be of the form /container/object",
+            );
+        };
+        let src_account = req
+            .headers
+            .get("X-Copy-From-Account")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| dst_account.clone());
+        let fresh_metadata = req
+            .headers
+            .get("X-Fresh-Metadata")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let manifest_get = is_manifest_get(&req);
+
+        let mut get_req = Request {
+            method: "GET".to_string(),
+            path: format!("/{version}/{src_account}/{src_container}/{src_object}"),
+            query_string: if manifest_get {
+                "multipart-manifest=get&format=raw".to_string()
+            } else {
+                String::new()
+            },
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        get_req.headers.set("X-Newest", "true");
+        if let Some(ru) = req.headers.get("X-Backend-Remote-User") {
+            get_req.headers.set("X-Backend-Remote-User", ru.to_string());
+        }
+        if let Some(rf) = req.headers.get("Referer") {
+            get_req.headers.set("Referer", rf.to_string());
+        }
+        for cond in [
+            "Range",
+            "If-Match",
+            "If-None-Match",
+            "If-Modified-Since",
+            "If-Unmodified-Since",
+        ] {
+            if let Some(v) = req.headers.get(cond) {
+                get_req.headers.set(cond, v.to_string());
+            }
+        }
+        let source = next(get_req).await;
+        if !(200..300).contains(&source.status) {
+            return source;
+        }
+        let source_is_slo = source
+            .headers
+            .get("X-Static-Large-Object")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let source_dlo_manifest = source.headers.get("X-Object-Manifest").map(str::to_string);
+
+        let mut put_headers = HeaderKeyDict::new();
+        if !fresh_metadata {
+            for (k, v) in source.headers.iter() {
+                if is_copied_source_header(k) {
+                    put_headers.set(k, v);
+                }
+            }
+        }
+        for (k, v) in req.headers.iter() {
+            let lk = k.to_ascii_lowercase();
+            if lk == "x-copy-from"
+                || lk == "x-copy-from-account"
+                || lk == "x-fresh-metadata"
+                || lk == "content-length"
+            {
+                continue;
+            }
+            put_headers.set(k, v);
+        }
+        if manifest_get {
+            if source_is_slo {
+                req.query_string = set_multipart_manifest_param(&req.query_string, Some("put"));
+            } else if let Some(dlo) = &source_dlo_manifest {
+                req.query_string = set_multipart_manifest_param(&req.query_string, None);
+                put_headers.set("X-Object-Manifest", dlo);
+            } else {
+                req.query_string = set_multipart_manifest_param(&req.query_string, None);
+            }
+        }
+        let bytes = match source.body.collect_async().await {
+            Ok(b) => b,
+            Err(_) => return Response::error(499, "Client Disconnect"),
+        };
+        put_headers.set("Content-Length", bytes.len().to_string());
+        put_headers.set("X-Copied-From", format!("{src_container}/{src_object}"));
+        put_headers.set("X-Copied-From-Account", src_account.clone());
+        req.method = "PUT".to_string();
+        req.headers = put_headers;
+        req.body = Body::Buffered(bytes);
+        let mut resp = next(req).await;
+        resp.headers
+            .set("X-Copied-From", format!("{src_container}/{src_object}"));
+        resp.headers
+            .set("X-Copied-From-Account", src_account);
+        resp
+    }
 }
 
 impl Middleware for Copy {
-    fn handle(&self, mut req: Request, next: &NextFn) -> Response {
+    fn handle(&self, req: Request, next: &NextFn) -> Response {
         // Only object requests (4 path segments) are candidates.
-        let parts = match split_path(&req.path, 4, 4, true) {
+        let _parts = match split_path(&req.path, 4, 4, true) {
             Ok(p) => p,
             Err(_) => return next(req),
         };
@@ -304,38 +453,36 @@ impl Middleware for Copy {
         }
 
         if req.method == "COPY" {
-            let version = parts[0].clone().unwrap_or_default();
-            let account = parts[1].clone().unwrap_or_default();
-            let container = parts[2].clone().unwrap_or_default();
-            let object = parts[3].clone().unwrap_or_default();
-
-            let Some(dest) = req.headers.get("Destination").map(|s| s.to_string()) else {
-                return Response::error(412, "Destination header required");
-            };
-            let Some((dst_container, dst_object)) = parse_container_object(&dest) else {
-                return Response::error(
-                    412,
-                    "Destination header must be of the form /container/object",
-                );
-            };
-            let dst_account = req
-                .headers
-                .get("Destination-Account")
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| account.clone());
-
-            // rewrite as a PUT-with-X-Copy-From to the destination
-            req.method = "PUT".to_string();
-            req.path = format!("/{version}/{dst_account}/{dst_container}/{dst_object}");
-            req.headers
-                .set("X-Copy-From", format!("/{container}/{object}"));
-            req.headers.set("X-Copy-From-Account", account.clone());
-            req.headers.remove("Destination");
-            req.headers.remove("Destination-Account");
-            return self.do_copy(req, next);
+            match self.rewrite_copy_as_put(req) {
+                Ok(req) => return self.do_copy(req, next),
+                Err(resp) => return resp,
+            }
         }
 
         next(req)
+    }
+
+    fn intercepts_request(&self, req: &Request) -> bool {
+        split_path(&req.path, 4, 4, true).is_ok()
+            && (req.method == "COPY"
+                || (req.method == "PUT" && req.headers.get("X-Copy-From").is_some()))
+    }
+
+    fn handle_request_async(
+        &self,
+        req: Request,
+        next: AsyncNextFn,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move {
+            if req.method == "COPY" {
+                match self.rewrite_copy_as_put(req) {
+                    Ok(req) => self.do_copy_async(req, next).await,
+                    Err(resp) => resp,
+                }
+            } else {
+                self.do_copy_async(req, next).await
+            }
+        })
     }
 }
 
@@ -593,5 +740,38 @@ mod tests {
         let calls = log.lock().unwrap();
         assert!(!calls[1].query_string.contains("multipart-manifest"));
         assert_eq!(calls[1].headers.get("X-Object-Manifest"), Some("c/segs/"));
+    }
+
+    #[test]
+    fn test_intercepts_copy_and_x_copy_from() {
+        let c = Copy::new();
+        let copy = req("COPY", "/v1/a/c/o", &[("Destination", "/d/o2")]);
+        assert!(c.intercepts_request(&copy));
+        let put = req("PUT", "/v1/a/d/o2", &[("X-Copy-From", "/c/o")]);
+        assert!(c.intercepts_request(&put));
+        let plain = req("PUT", "/v1/a/c/o", &[]);
+        assert!(!c.intercepts_request(&plain));
+        let acc = req("COPY", "/v1/a", &[]);
+        assert!(!c.intercepts_request(&acc));
+    }
+
+    #[tokio::test]
+    async fn test_async_x_copy_from_goes_through_next() {
+        let (log, app) = backend(b"hello", "text/plain");
+        let next: AsyncNextFn = std::sync::Arc::new(move |r: Request| {
+            let app = app.clone();
+            Box::pin(async move { app(r) })
+        });
+        let r = req(
+            "PUT",
+            "/v1/AUTH_test/dstc/dsto",
+            &[("X-Copy-From", "/srcc/srco")],
+        );
+        let resp = Copy::new().do_copy_async(r, next).await;
+        assert_eq!(resp.status, 201);
+        let calls = log.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].method, "GET");
+        assert_eq!(calls[1].method, "PUT");
     }
 }
