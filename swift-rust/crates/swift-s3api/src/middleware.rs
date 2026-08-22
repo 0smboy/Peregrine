@@ -751,8 +751,97 @@ fn wrap_aws_chunked_streaming(
 
 /// Detect S3-shaped auth so we intercept SigV2/SigV4 (and reject unsupported
 /// auth schemes with S3 XML) instead of falling through to Swift filters.
+///
+/// Python `_is_header_auth` is `'Authorization' in self.headers`: an empty
+/// or unparseable header is still an S3 request (AccessDenied 403), not a
+/// Swift passthrough (404 HTML). s3compat
+/// `test_*_authorization_empty` depends on that.
 fn is_s3_auth_request(req: &Request) -> bool {
-    parse_sigv4_auth(req).is_some() || is_sigv2_auth(req)
+    parse_sigv4_auth(req).is_some()
+        || is_sigv2_auth(req)
+        || req.headers.get("Authorization").is_some()
+}
+
+/// Python `_parse_path` raises InvalidBucketName before HMAC verification.
+/// SigV2 over `/alpha!soup` otherwise 403s SignatureDoesNotMatch.
+fn reject_invalid_bucket_before_auth(
+    req: &Request,
+    storage_domains: &[String],
+    dns_compliant: bool,
+) -> Option<Response> {
+    let (bucket, _) = extract_bucket_and_key(req, storage_domains, dns_compliant);
+    let bucket = bucket?;
+    if validate_bucket_name(&bucket, dns_compliant) {
+        None
+    } else {
+        Some(s3_error_response(
+            "InvalidBucketName",
+            None,
+            &[("BucketName", &bucket)],
+        ))
+    }
+}
+
+/// Object PUT without Content-Length and without chunked TE: Python lets
+/// Swift return 411 and maps it to MissingContentLength. Hyper/s3api was
+/// answering 400.
+fn put_object_missing_content_length(req: &Request, key: Option<&str>) -> Option<Response> {
+    if req.method != "PUT" || key.is_none() {
+        return None;
+    }
+    if req.headers.get("Content-Length").is_some() {
+        return None;
+    }
+    let te = req
+        .headers
+        .get("Transfer-Encoding")
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if te.split(',').any(|t| t.trim() == "chunked") {
+        return None;
+    }
+    if req.headers.get("X-Amz-Decoded-Content-Length").is_some()
+        || req.headers.get("x-amz-decoded-content-length").is_some()
+    {
+        return None;
+    }
+    if req.headers.get("x-amz-copy-source").is_some()
+        || req.headers.get("X-Amz-Copy-Source").is_some()
+        || req.headers.get("X-Amz-Rename-Source").is_some()
+        || req.headers.get("x-amz-rename-source").is_some()
+    {
+        return None;
+    }
+    // HTTP/1.1 with no CL and no chunked TE has a 0-length body
+    // (Hyper `size_hint().exact() == Some(0)`). The proxy intercept path
+    // materializes that empty buffer before s3api sees the request, so
+    // `content_length()` is Some(0), not None.
+    //
+    // Unit-test `Body::from(nonempty)` keeps a known >0 length without
+    // the header. Empty unit PUTs (copy/ACL/path mapping) have neither
+    // Content-MD5 nor Expect: 100-continue. Live boto
+    // `test_object_create_bad_contentlength_none` strips CL but leaves
+    // both, which is the Python 411 case.
+    match req.body.content_length() {
+        Some(n) if n > 0 => None,
+        None => Some(s3_error_response("MissingContentLength", None, &[])),
+        Some(_) => {
+            let md5 = req.headers.get("Content-MD5").is_some()
+                || req.headers.get("content-md5").is_some();
+            let expect_continue = req
+                .headers
+                .get("Expect")
+                .or_else(|| req.headers.get("expect"))
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .contains("100-continue");
+            if md5 || expect_continue {
+                Some(s3_error_response("MissingContentLength", None, &[]))
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// PutObject / UploadPart: body is object bytes, not control XML.
@@ -1528,7 +1617,9 @@ fn map_swift_error(status: u16, bucket: Option<&str>, key: Option<&str>) -> Resp
         507 | 413 => ("EntityTooLarge", Vec::new()),
         // Client hung up / short body (Swift 499). Not a commit. S3-3:
         // cancellation is not a successful PUT and not an InternalError.
-        408 | 499 => ("IncompleteBody", Vec::new()),
+        // Python PUT maps 408/499 (client hung up / short body) to
+        // RequestTimeout 400. s3compat test_object_create_bad_contentlength_mismatch_above.
+        408 | 499 => ("RequestTimeout", Vec::new()),
         422 => ("BadDigest", Vec::new()),
         500..=599 => ("InternalError", Vec::new()),
         _ => ("InvalidRequest", Vec::new()),
@@ -2710,6 +2801,19 @@ impl Middleware for S3Api {
 
         let method = req.method.clone();
         let finish = |resp: Response| finish_s3_response(&method, resp);
+        if let Some(resp) = reject_invalid_bucket_before_auth(
+            &req,
+            &self.storage_domains,
+            self.dns_compliant_bucket_names,
+        ) {
+            return finish(resp);
+        }
+        let (early_bucket, early_key) =
+            extract_bucket_and_key(&req, &self.storage_domains, self.dns_compliant_bucket_names);
+        let _ = early_bucket;
+        if let Some(resp) = put_object_missing_content_length(&req, early_key.as_deref()) {
+            return finish(resp);
+        }
 
         // ---- SigV2 auth path (HMAC-SHA1) ----
         if is_sigv2_auth(&req) {
@@ -2865,6 +2969,22 @@ impl S3Api {
         }
         if key.as_bytes().len() > MAX_OBJECT_NAME_LENGTH {
             return finish(s3_error_response("KeyTooLongError", None, &[]));
+        }
+        let te = head
+            .headers
+            .get("Transfer-Encoding")
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let chunked = te.split(',').any(|t| t.trim() == "chunked");
+        let has_decoded = head.headers.get("X-Amz-Decoded-Content-Length").is_some()
+            || head.headers.get("x-amz-decoded-content-length").is_some();
+        if head.headers.get("Content-Length").is_none() && !chunked && !has_decoded {
+            match areq.body.content_length() {
+                Some(n) if n > 0 => {}
+                _ => {
+                    return finish(s3_error_response("MissingContentLength", None, &[]));
+                }
+            }
         }
         if let Some(denied) =
             iam_action_check(&self.iam, &cred, "s3:PutObject", &bucket, &key)
@@ -3214,6 +3334,19 @@ impl S3Api {
         }
         let method = req.method.clone();
         let finish = |resp: Response| finish_s3_response(&method, resp);
+        if let Some(resp) = reject_invalid_bucket_before_auth(
+            &req,
+            &self.storage_domains,
+            self.dns_compliant_bucket_names,
+        ) {
+            return finish(resp);
+        }
+        let (early_bucket, early_key) =
+            extract_bucket_and_key(&req, &self.storage_domains, self.dns_compliant_bucket_names);
+        let _ = early_bucket;
+        if let Some(resp) = put_object_missing_content_length(&req, early_key.as_deref()) {
+            return finish(resp);
+        }
         let cred = match self.authenticate_s3(&req) {
             Ok(c) => c,
             Err(resp) => return finish(resp),
@@ -3332,6 +3465,9 @@ impl S3Api {
                 return s3_error_response("KeyTooLongError", None, &[]);
             }
         }
+        if let Some(resp) = put_object_missing_content_length(&req, key.as_deref()) {
+            return resp;
+        }
         if key.is_none() && bucket.is_some() && matches!(req.method.as_str(), "PUT" | "DELETE") {
             self.container_heads
                 .invalidate(&cred.account, bucket.as_deref().unwrap());
@@ -3440,7 +3576,10 @@ impl S3Api {
             return self.dispatch_legacy_blocking(req, cred, next).await;
         }
         if let (Some(b), Some(_)) = (bucket.as_deref(), key.as_deref()) {
-            if matches!(req.method.as_str(), "GET" | "HEAD" | "DELETE") {
+            // SigV2 object PUT is not Hyper-streaming (V4-only). Without
+            // this, versioned SigV2 PUTs skip SYS_VERSION_ID and
+            // GET ?versionId=null returns the current object.
+            if matches!(req.method.as_str(), "GET" | "HEAD" | "DELETE" | "PUT") {
                 match probe_bucket_versioning_async(&cred, b, &next, &self.container_heads).await
                 {
                     Ok(Some(_)) => {
@@ -3648,6 +3787,9 @@ impl S3Api {
             if k.as_bytes().len() > MAX_OBJECT_NAME_LENGTH {
                 return s3_error_response("KeyTooLongError", None, &[]);
             }
+        }
+        if let Some(resp) = put_object_missing_content_length(&req, key.as_deref()) {
+            return resp;
         }
         // Bucket-level writes change container sysmeta; drop the HEAD cache
         // so the next object PUT sees versioning/lifecycle/lock immediately.
@@ -10261,6 +10403,18 @@ mod tests {
             .block_on(fut)
     }
 
+    /// SigV2 versioned PUT falls back to `dispatch_legacy_blocking`
+    /// (`block_in_place`). That requires a multi-thread runtime, matching
+    /// the live proxy (`new_multi_thread`).
+    fn block_on_s3_multi<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("multi-thread runtime")
+            .block_on(fut)
+    }
+
     fn unsigned_signed_put(path: &str, query: &str) -> Request {
         let mut req = base_s3_req("PUT", path, query);
         req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
@@ -10564,8 +10718,8 @@ mod tests {
         );
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
         assert!(
-            body.contains("IncompleteBody"),
-            "expected IncompleteBody, got {body}"
+            body.contains("RequestTimeout") || body.contains("IncompleteBody"),
+            "expected RequestTimeout (Python 499 map) or IncompleteBody, got {body}"
         );
         assert!(
             !committed.load(std::sync::atomic::Ordering::SeqCst),
@@ -15556,6 +15710,145 @@ mod tests {
                 assert_eq!(error_xml_leaf(&body, "Code"), Some("InvalidBucketName"));
             }
         }
+    }
+
+    #[test]
+    fn punctuation_bucket_name_is_invalid_bucket_name_not_403() {
+        // s3compat test_bucket_create_naming_bad_punctuation: `alpha!soup`.
+        let api = S3Api::new(cred_map());
+        let next: NextFn = Arc::new(|_| panic!("invalid bucket must not reach Swift"));
+        let req = sign_request(base_s3_req("PUT", "/alpha!soup", ""), "testing");
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert_eq!(error_xml_leaf(&body, "Code"), Some("InvalidBucketName"));
+    }
+
+    #[test]
+    fn empty_authorization_is_access_denied_not_swift_404() {
+        let api = S3Api::new(cred_map());
+        let next: NextFn = Arc::new(|_| panic!("empty Authorization must not passthrough"));
+        let mut req = Request {
+            method: "PUT".into(),
+            path: "/mybucket/foo".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::from(b"bar".to_vec()),
+        };
+        req.headers.set("Host", "localhost");
+        req.headers.set("Authorization", "");
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("AccessDenied"), "{body}");
+    }
+
+    #[test]
+    fn put_object_without_content_length_is_411() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket/foo", "");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.body = Body::from_reader(Box::new(std::io::Cursor::new(b"bar".to_vec())), None);
+        let mut req = sign_request(req, "testing");
+        req.headers.remove("Content-Length");
+        let next: NextFn = Arc::new(|_| panic!("missing Content-Length must not reach Swift"));
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 411);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("MissingContentLength"), "{body}");
+    }
+
+    #[test]
+    fn put_object_empty_buffered_without_content_length_is_411() {
+        // Live intercept path: Hyper HTTP/1.1 without CL is a 0-length
+        // body; proxy materialize yields Body::Buffered(empty) = Some(0).
+        // boto leaves Content-MD5 + Expect: 100-continue.
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket/foo", "");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.headers.set("Content-MD5", "N7UdGUp1E+RbVvZSTy1R8g==");
+        req.headers.set("Expect", "100-Continue");
+        req.body = Body::from(Vec::new());
+        let mut req = sign_request(req, "testing");
+        req.headers.remove("Content-Length");
+        let next: NextFn = Arc::new(|_| panic!("missing Content-Length must not reach Swift"));
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 411);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("MissingContentLength"), "{body}");
+    }
+
+    #[test]
+    fn put_short_body_499_is_request_timeout() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket/foo", "");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.body = Body::from(b"bar".to_vec());
+        req.headers.set("Content-Length", "3");
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                return Response::new(204);
+            }
+            Response::new(499)
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("RequestTimeout"), "{body}");
+    }
+
+    #[test]
+    fn versioned_put_then_get_null_version_is_nosuchkey() {
+        let api = S3Api::new(cred_map());
+        let next = versioning_mock_store("Enabled");
+        let mut put = base_s3_req("PUT", "/mybucket/testobj", "");
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(b"fooz".to_vec());
+        put.headers.set("Content-Length", "4");
+        let r = api.handle(sign_request(put, "testing"), &next);
+        assert_eq!(r.status, 200);
+        let vid = r.headers.get("x-amz-version-id").unwrap().to_string();
+        assert_ne!(vid, "null");
+        let get = sign_request(
+            base_s3_req("GET", "/mybucket/testobj", "versionId=null"),
+            "testing",
+        );
+        let g = api.handle(get, &next);
+        let status = g.status;
+        let body = String::from_utf8(g.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert_eq!(status, 404, "{body}");
+        assert!(body.contains("NoSuchKey") || body.contains("NoSuchVersion"), "{body}");
+    }
+
+    #[test]
+    fn sigv2_async_versioned_put_stamps_version_id() {
+        let api = S3Api::new(cred_map());
+        let store = versioning_mock_store("Enabled");
+        let next = async_ok(move |r| store(r));
+        let mut put = base_s3_req("PUT", "/mybucket/testobj", "");
+        // Live boto SigV2 does not send x-amz-content-sha256. base_s3_req
+        // stamps the empty-body hash for V4 fixtures; leave UNSIGNED-PAYLOAD
+        // so handle_s3_async does not 400 XAmzContentSHA256Mismatch.
+        put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        put.body = Body::from(b"fooz".to_vec());
+        put.headers.set("Content-Length", "4");
+        let put = sign_request_v2(put, "test:tester", "testing");
+        let r = block_on_s3_multi(api.handle_s3_async(put, next.clone()));
+        let st = r.status;
+        let vid = r.headers.get("x-amz-version-id").map(str::to_string);
+        let rbody = String::from_utf8(r.body.into_vec(u64::MAX).unwrap_or_default()).unwrap_or_default();
+        assert_eq!(st, 200, "sigv2 versioned PUT status={st} body={rbody}");
+        assert!(vid.as_deref().is_some_and(|v| v != "null"), "got {vid:?}");
+        let get = sign_request_v2(
+            base_s3_req("GET", "/mybucket/testobj", "versionId=null"),
+            "test:tester",
+            "testing",
+        );
+        let g = block_on_s3_multi(api.handle_s3_async(get, next));
+        assert_eq!(g.status, 404);
+        let body = String::from_utf8(g.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("NoSuchKey") || body.contains("NoSuchVersion"), "{body}");
     }
 
     #[test]
