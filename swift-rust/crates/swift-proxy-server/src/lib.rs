@@ -2568,6 +2568,12 @@ impl ProxyApp {
         self: &Arc<Self>,
         mut areq: swift_http::AsyncRequest,
     ) -> Response {
+        // Keep-alive requests skip the connection peek. `/info asdf` (and any
+        // path with an unencoded space) is 412 Bad URL like Python
+        // `get_controller is None`.
+        if areq.path.contains(' ') {
+            return text_response(412, "Bad URL");
+        }
         let segs: Vec<&str> = areq.path.splitn(5, '/').collect();
         if matches!(segs.get(1), Some(&"v1") | Some(&"v1.0"))
             && !segs.get(2).is_some_and(|s| !s.is_empty())
@@ -6821,6 +6827,20 @@ mod cors_tests {
         assert!(
             lick.headers.get("Allow").is_some(),
             "405 must advertise Allow"
+        );
+        let info_space = app
+            .handle_async(swift_http::AsyncRequest {
+                method: "GET".into(),
+                path: "/info asdf".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            info_space.status, 412,
+            "/info asdf must be 412, got {}",
+            info_space.status
         );
     }
 

@@ -239,13 +239,18 @@ where
             return Err(ConstraintError("Metadata must be valid UTF-8".to_string()));
         }
         meta_count += 1;
-        meta_size += key.len() as i64 + value.len() as i64;
-        if key.len() as i64 > MAX_META_NAME_LENGTH {
+        // Python 3 `len(str)` is Unicode scalar count, not UTF-8 bytes.
+        // Using byte length 400s TestFileUTF8.testMetadataNumberLimit
+        // (`uni…` values) before 90 items.
+        let key_len = key.chars().count() as i64;
+        let value_len = value.chars().count() as i64;
+        meta_size += key_len + value_len;
+        if key_len > MAX_META_NAME_LENGTH {
             return Err(ConstraintError(format!(
                 "Metadata name too long: {prefix}{key}"
             )));
         }
-        if value.len() as i64 > MAX_META_VALUE_LENGTH {
+        if value_len > MAX_META_VALUE_LENGTH {
             return Err(ConstraintError(format!(
                 "Metadata value longer than {MAX_META_VALUE_LENGTH}: {prefix}{key}"
             )));
@@ -533,6 +538,21 @@ auto_create_account_prefix = !
         assert_eq!(
             check_metadata(pairs, "account").unwrap_err().0,
             "Total metadata too large; max 4096"
+        );
+
+        // Unicode scalar count, not UTF-8 bytes (Python 3 len(str)).
+        let cjk = "中".repeat(15); // 15 chars, 45 bytes
+        let mut utf8_headers = Vec::new();
+        for i in 0..80 {
+            utf8_headers.push((format!("X-Object-Meta-{i:02}"), cjk.clone()));
+        }
+        let pairs: Vec<(&str, &str)> = utf8_headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert!(
+            check_metadata(pairs, "object").is_ok(),
+            "80 CJK values must count as characters, not bytes"
         );
     }
 
