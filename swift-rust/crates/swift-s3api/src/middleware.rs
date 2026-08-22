@@ -3578,7 +3578,46 @@ impl S3Api {
         if let (Some(b), Some(_)) = (bucket.as_deref(), key.as_deref()) {
             let method = req.method.clone();
             match method.as_str() {
-                "GET" | "HEAD" | "DELETE" => {
+                "GET" | "HEAD" => {
+                    let version_id_q = params
+                        .iter()
+                        .find(|(k, _)| k == "versionId")
+                        .map(|(_, v)| v.as_str());
+                    match probe_bucket_versioning_async(
+                        &cred,
+                        b,
+                        &next,
+                        &self.container_heads,
+                    )
+                    .await
+                    {
+                        Ok(Some(_)) => {
+                            return handle_versioned_get_head_async(
+                                &cred,
+                                b,
+                                key.as_deref().unwrap(),
+                                &method,
+                                version_id_q,
+                                &next,
+                            )
+                            .await;
+                        }
+                        Ok(None) if version_id_q.is_some() => {
+                            return handle_versioned_get_head_async(
+                                &cred,
+                                b,
+                                key.as_deref().unwrap(),
+                                &method,
+                                version_id_q,
+                                &next,
+                            )
+                            .await;
+                        }
+                        Ok(None) => {}
+                        Err(resp) => return resp,
+                    }
+                }
+                "DELETE" => {
                     match probe_bucket_versioning_async(
                         &cred,
                         b,
@@ -6050,6 +6089,143 @@ async fn control_head_object_async(
     } else {
         Err(map_swift_error(resp.status, Some(container), Some(key)))
     }
+}
+
+async fn load_version_index_async(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    next: &AsyncNextFn,
+) -> Result<VersionIndex, Response> {
+    let vc = versions_container(bucket);
+    let iname = index_object_name(key);
+    let mut get = make_swift_req(
+        "GET",
+        &s3_to_swift_path(&cred.account, Some(&vc), Some(&iname)),
+    );
+    get.headers.set("X-Newest", "true");
+    stamp_auth(&mut get, cred);
+    let resp = async_call(next, get).await;
+    if resp.status == 404 {
+        return Ok(VersionIndex::new(key));
+    }
+    if !(200..300).contains(&resp.status) {
+        return Err(map_swift_error(resp.status, Some(&vc), Some(&iname)));
+    }
+    let body = body_bytes(resp.body).await?;
+    VersionIndex::from_json(&body)
+        .filter(|index| index.key == key)
+        .ok_or_else(|| {
+            s3_error_response("InternalError", Some("version index is invalid"), &[])
+        })
+}
+
+async fn resolve_object_version_async(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    next: &AsyncNextFn,
+) -> Result<Option<ResolvedObjectVersion>, Response> {
+    if let Some(version_id) = version_id {
+        if !valid_version_id(version_id) {
+            return Err(s3_error_response("InvalidArgument", None, &[]));
+        }
+    }
+    let current = control_head_object_async(cred, bucket, key, next).await?;
+    match (version_id, current) {
+        (None, ObjectHead::Present(head)) => {
+            return Ok(Some(ResolvedObjectVersion {
+                container: bucket.to_string(),
+                key: key.to_string(),
+                head,
+            }))
+        }
+        (None, ObjectHead::Missing) => return Ok(None),
+        (Some(NULL_VERSION_ID), ObjectHead::Present(head))
+            if matches!(
+                head.headers.get(SYS_VERSION_ID),
+                None | Some("") | Some(NULL_VERSION_ID)
+            ) =>
+        {
+            return Ok(Some(ResolvedObjectVersion {
+                container: bucket.to_string(),
+                key: key.to_string(),
+                head,
+            }));
+        }
+        (Some(vid), ObjectHead::Present(head)) if head.headers.get(SYS_VERSION_ID) == Some(vid) => {
+            return Ok(Some(ResolvedObjectVersion {
+                container: bucket.to_string(),
+                key: key.to_string(),
+                head,
+            }));
+        }
+        _ => {}
+    }
+    let version_id = version_id.expect("version id was handled above");
+    let index = load_version_index_async(cred, bucket, key, next).await?;
+    if index.find(version_id).is_none() {
+        return Ok(None);
+    }
+    if !is_safe_version_id(version_id) {
+        return Err(unsafe_version_id_error());
+    }
+    let container = versions_container(bucket);
+    let archived_key = archive_object_name(key, version_id);
+    match control_head_object_async(cred, &container, &archived_key, next).await? {
+        ObjectHead::Present(head) => Ok(Some(ResolvedObjectVersion {
+            container,
+            key: archived_key,
+            head,
+        })),
+        ObjectHead::Missing => Ok(None),
+    }
+}
+
+async fn handle_versioned_get_head_async(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    method: &str,
+    version_id_q: Option<&str>,
+    next: &AsyncNextFn,
+) -> Response {
+    let target = match resolve_object_version_async(cred, bucket, key, version_id_q, next).await {
+        Ok(Some(target)) => target,
+        Ok(None) => return missing_object_version_response(key, version_id_q),
+        Err(resp) => return resp,
+    };
+    let response_version = version_id_q
+        .map(str::to_string)
+        .or_else(|| target.head.headers.get(SYS_VERSION_ID).map(str::to_string));
+    if is_delete_marker_header(target.head.headers.get(SYS_DELETE_MARKER)) {
+        return nosuchkey_delete_marker(key, response_version.as_deref());
+    }
+    let resp = if method == "HEAD" {
+        target.head
+    } else {
+        let mut get = make_swift_req(
+            "GET",
+            &s3_to_swift_path(&cred.account, Some(&target.container), Some(&target.key)),
+        );
+        stamp_auth(&mut get, cred);
+        let resp = async_call(next, get).await;
+        if !(200..300).contains(&resp.status) {
+            return map_swift_error(resp.status, Some(&target.container), Some(&target.key));
+        }
+        resp
+    };
+    if let Some(denied) = deny_if_object_acl_blocks_read(cred, &resp.headers) {
+        return denied;
+    }
+    let mut out = translate_object_get_head(method, resp, cred, &[], None);
+    if (200..300).contains(&out.status) {
+        if let Some(version_id) = response_version {
+            out.headers.set(HDR_VERSION_ID, version_id);
+        }
+    }
+    out
 }
 
 async fn get_mpu_upload_info_async(

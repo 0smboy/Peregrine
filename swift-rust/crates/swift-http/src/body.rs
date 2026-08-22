@@ -318,6 +318,19 @@ impl Body {
         self.content_length() == Some(0)
     }
 
+    /// Drain one Channel chunk. `Receiver::blocking_recv` panics on a
+    /// Tokio worker; wrap it in `block_in_place` when a runtime is
+    /// present (RSAIO proxy is multi-thread).
+    fn recv_channel_chunk(
+        rx: &mut tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+    ) -> Option<Result<Vec<u8>, std::io::Error>> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| rx.blocking_recv())
+        } else {
+            rx.blocking_recv()
+        }
+    }
+
     /// Read a streamed body fully into memory (idempotent), erroring with
     /// the [`body_too_large`] error if more than `cap` bytes arrive. A
     /// body that is ALREADY buffered is returned whole regardless of
@@ -345,7 +358,7 @@ impl Body {
             *self = Body::Buffered(out);
         } else if let Body::Channel(ch) = self {
             let mut out: Vec<u8> = Vec::new();
-            while let Some(chunk) = ch.rx.blocking_recv() {
+            while let Some(chunk) = Self::recv_channel_chunk(&mut ch.rx) {
                 let bytes = chunk?;
                 if out.len() as u64 + bytes.len() as u64 > cap {
                     return Err(too_large_error());
@@ -379,7 +392,7 @@ impl Body {
             Body::Streamed(s) => (s.reader, s.content_length),
             Body::Channel(mut ch) => {
                 let mut out = Vec::new();
-                while let Some(chunk) = ch.rx.blocking_recv() {
+                while let Some(chunk) = Self::recv_channel_chunk(&mut ch.rx) {
                     if let Ok(bytes) = chunk {
                         out.extend_from_slice(&bytes);
                     }
@@ -575,6 +588,24 @@ mod tests {
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, b"abc");
+    }
+
+    #[test]
+    fn channel_materialize_on_multi_thread_runtime_does_not_panic() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("multi-thread runtime");
+        rt.block_on(async {
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            let scope = swift_runtime::TaskScope::bounded(1);
+            tx.try_send(Ok(b"xyz".to_vec())).unwrap();
+            drop(tx);
+            let mut body = Body::from_channel(rx, Some(3), scope);
+            let got = body.materialize(u64::MAX).expect("materialize");
+            assert_eq!(got, b"xyz");
+        });
     }
 
     #[test]

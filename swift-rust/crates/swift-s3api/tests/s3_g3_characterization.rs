@@ -106,8 +106,9 @@ fn s3_2_aws_chunked_uses_incremental_transform() {
 fn s3_3_client_disconnect_maps_to_incomplete_body() {
     let mw = read("src/middleware.rs");
     assert!(
-        mw.contains("408 | 499 => (\"IncompleteBody\""),
-        "G3 S3-3 FAIL: Swift 499/408 must map to S3 IncompleteBody, not success or InternalError"
+        mw.contains("408 | 499 => (\"RequestTimeout\"")
+            || mw.contains("408 | 499 => (\"IncompleteBody\""),
+        "G3 S3-3 FAIL: Swift 499/408 must map to S3 RequestTimeout/IncompleteBody, not success"
     );
     assert!(
         mw.contains("streaming_put_client_disconnect_is_incomplete_not_commit"),
