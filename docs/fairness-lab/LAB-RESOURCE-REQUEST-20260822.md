@@ -1,6 +1,11 @@
 # 独立测试资源申请（2026-08-22）
 
-**状态：BLOCKER。** 现有 swift1–4 **全部**跑生产 `:8080` + HAProxy `:8085`。swift3 是生产节点兼唯一 Linux 编译机，**不是**干净测试机。把 RSAIO 迁到 swift3 **不能**关闭 G7/G8。
+**SUPERSEDED BY OWNER CONSTRAINT 2026-08-22.**  
+Owner 决定：Swift1–4 即本项目测试机，不新增 builder / lab-a / lab-b / staging。G0–G8 在四机分阶段复用上完成。本文件保留为史实，**不得删除**，也**不得**再当作 G7/G8 blocker。
+
+现行角色与模式：`PEREGRINE-FOUR-NODE-G0-G8-EXECUTION-DIRECTIVE-20260822.md`。
+
+~~**状态：BLOCKER。** 现有 swift1–4 **全部**跑生产 `:8080` + HAProxy `:8085`。swift3 是生产节点兼唯一 Linux 编译机，**不是**干净测试机。把 RSAIO 迁到 swift3 **不能**关闭 G7/G8。~~
 
 本文件是向操作者申请资源的清单。在资源到位前：
 
