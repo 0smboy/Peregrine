@@ -1070,7 +1070,18 @@ impl ContainerServer {
                 get("bytes_used"),
                 get("storage_policy_index"),
             );
-            if let Ok(mut conn) = std::net::TcpStream::connect(host) {
+            // Python ConnectionTimeout(self.conn_timeout), default 0.5s.
+            // Unbounded connect() to a ring IP that is down stalls the
+            // container PUT (and the DbExecutor shard it runs on).
+            let connect_timeout = std::time::Duration::from_millis(500);
+            let addr = match std::net::ToSocketAddrs::to_socket_addrs(host) {
+                Ok(mut addrs) => match addrs.next() {
+                    Some(addr) => addr,
+                    None => continue,
+                },
+                Err(_) => continue,
+            };
+            if let Ok(mut conn) = std::net::TcpStream::connect_timeout(&addr, connect_timeout) {
                 conn.set_nodelay(true).ok();
                 let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(10)));
                 if conn.write_all(request.as_bytes()).is_ok() {

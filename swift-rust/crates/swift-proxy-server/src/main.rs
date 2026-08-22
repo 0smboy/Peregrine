@@ -409,6 +409,7 @@ fn proxy_config_from_conf(conf: &SwiftConfig, auth_enabled: bool) -> ProxyConfig
     ProxyConfig {
         conn_timeout: conf_timeout_secs(&get("conn_timeout", ""), 0.5),
         node_timeout: conf_timeout_secs(&get("node_timeout", ""), 10.0),
+        post_quorum_timeout: conf_timeout_secs(&get("post_quorum_timeout", ""), 0.5),
         error_suppression_interval: get("error_suppression_interval", "")
             .trim()
             .parse::<f64>()
@@ -3192,6 +3193,7 @@ mod startup_policy_tests {
         assert_eq!(config.conn_timeout, Duration::from_secs_f64(1.5));
         // node_timeout came from the DEFAULT section
         assert_eq!(config.node_timeout, Duration::from_secs(30));
+        assert_eq!(config.post_quorum_timeout, Duration::from_millis(500));
         assert_eq!(config.error_suppression_interval, 90.0);
         assert_eq!(config.error_suppression_limit, 3);
         assert!(config.account_autocreate);
@@ -3219,6 +3221,7 @@ mod startup_policy_tests {
         let config = proxy_config_from_conf(&conf, false);
         assert_eq!(config.conn_timeout, Duration::from_millis(500));
         assert_eq!(config.node_timeout, Duration::from_secs(10));
+        assert_eq!(config.post_quorum_timeout, Duration::from_millis(500));
         assert_eq!(config.error_suppression_interval, 60.0);
         assert_eq!(config.error_suppression_limit, 10);
         assert!(!config.account_autocreate);

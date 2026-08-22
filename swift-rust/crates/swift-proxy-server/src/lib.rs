@@ -118,6 +118,11 @@ impl ErrorLimiter {
 pub struct ProxyConfig {
     pub conn_timeout: Duration,
     pub node_timeout: Duration,
+    /// Python `post_quorum_timeout` (default 0.5s). After a write fan-out
+    /// has quorum, remaining replica slots are given this long to finish so
+    /// account-update / container-update side channels complete. Unused
+    /// slots are then cancelled; they are not detached.
+    pub post_quorum_timeout: Duration,
     /// `request_node_count`: how many nodes (primaries + handoffs) to
     /// consider per request, as a multiple of the replica count.
     pub request_node_count_factor: u64,
@@ -167,6 +172,7 @@ impl Default for ProxyConfig {
         ProxyConfig {
             conn_timeout: Duration::from_millis(500),
             node_timeout: Duration::from_secs(10),
+            post_quorum_timeout: Duration::from_millis(500),
             request_node_count_factor: 2,
             account_autocreate: false,
             allow_account_management: false,

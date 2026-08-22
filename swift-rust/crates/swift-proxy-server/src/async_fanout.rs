@@ -23,7 +23,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -562,6 +562,21 @@ async fn tee_one_chunk(
     live
 }
 
+/// How remaining replica slots are treated once write quorum is decided.
+///
+/// Object-style fan-out cancels unused backends immediately (a blackhole
+/// replica must not pin the client). Account/container writes carry an
+/// account-update side channel on every replica: Python's `_make_requests`
+/// does `pile.waitall(post_quorum_timeout)` without killing those
+/// greenthreads. Cancelling at quorum here leaves one account replica stale,
+/// and account GET is first-good-source — so a container PUT 201 can miss
+/// the subsequent account listing (G4 testCreate/testDelete leftovers).
+#[derive(Clone, Copy)]
+enum QuorumDrain {
+    CancelUnused,
+    PostQuorumTimeout,
+}
+
 impl ProxyApp {
     /// Bounded async replica fan-out. Unused backends are cancelled once
     /// quorum is reached.
@@ -576,6 +591,33 @@ impl ProxyApp {
         query: &str,
         per_node_headers: Vec<swift_http::HeaderKeyDict>,
         body: Vec<u8>,
+    ) -> Response {
+        self.make_requests_async_drain(
+            nodes,
+            node_number,
+            part,
+            method,
+            path,
+            query,
+            per_node_headers,
+            body,
+            QuorumDrain::CancelUnused,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn make_requests_async_drain(
+        self: &Arc<Self>,
+        nodes: Vec<Node>,
+        node_number: usize,
+        part: u32,
+        method: &str,
+        path: &str,
+        query: &str,
+        per_node_headers: Vec<swift_http::HeaderKeyDict>,
+        body: Vec<u8>,
+        drain: QuorumDrain,
     ) -> Response {
         let slots = per_node_headers.len().max(1);
         let mut group: FanoutGroup<Option<BackendResponse>> =
@@ -607,10 +649,12 @@ impl ProxyApp {
         let mut tracker = QuorumTracker::new(needed);
         let mut results: Vec<BackendResponse> = Vec::new();
         let expected = group.spawned();
+        let mut finished = 0usize;
         let wait = self.config.conn_timeout + self.config.node_timeout;
         for _ in 0..expected {
             match tokio::time::timeout(wait, group.recv()).await {
                 Ok(Some(Some(resp))) => {
+                    finished += 1;
                     if (200..500).contains(&resp.status) {
                         tracker.record_success();
                     } else {
@@ -618,11 +662,35 @@ impl ProxyApp {
                     }
                     results.push(resp);
                     if tracker.has_quorum() {
-                        group.cancel_unused();
+                        if matches!(drain, QuorumDrain::CancelUnused) {
+                            group.cancel_unused();
+                        }
                         break;
                     }
                 }
-                Ok(Some(None)) | Ok(None) | Err(_) => {}
+                Ok(Some(None)) => finished += 1,
+                Ok(None) | Err(_) => {}
+            }
+        }
+        if matches!(drain, QuorumDrain::PostQuorumTimeout) {
+            // Python base.py `_make_requests`: after quorum, waitall(post_quorum_timeout)
+            // so the remaining replica's account_update can finish. Return as
+            // soon as every slot has reported; then cancel stragglers — L6
+            // forbids detaching them.
+            let deadline = Instant::now() + self.config.post_quorum_timeout;
+            while finished < expected {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, group.recv()).await {
+                    Ok(Some(Some(resp))) => {
+                        finished += 1;
+                        results.push(resp);
+                    }
+                    Ok(Some(None)) => finished += 1,
+                    Ok(None) | Err(_) => break,
+                }
             }
         }
         group.cancel_unused();
@@ -2043,8 +2111,20 @@ impl ProxyApp {
         query: &str,
         per_node: Vec<HeaderKeyDict>,
     ) -> Response {
-        self.make_requests_async(nodes, node_number, part, method, path, query, per_node, Vec::new())
-            .await
+        // Account/container PUT/DELETE (and object DELETE) stamp the
+        // next-ring side channel on every replica. Do not cancel at quorum.
+        self.make_requests_async_drain(
+            nodes,
+            node_number,
+            part,
+            method,
+            path,
+            query,
+            per_node,
+            Vec::new(),
+            QuorumDrain::PostQuorumTimeout,
+        )
+        .await
     }
 
     pub(crate) async fn account_post_async(
@@ -3296,6 +3376,23 @@ mod tests {
         (port, h, accepted)
     }
 
+    async fn spawn_delayed_ok_backend(delay: Duration) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let h = tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 16 * 1024];
+            let _ = stream.read(&mut buf).await;
+            tokio::time::sleep(delay).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+        });
+        (port, h)
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn make_requests_async_quorum_cancels_blackhole() {
         let (ok_a, ha) = spawn_ok_backend().await;
@@ -3318,6 +3415,33 @@ mod tests {
         ha.abort();
         hb.abort();
         hh.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn make_write_async_waits_post_quorum_for_slow_replica() {
+        let (ok_a, ha) = spawn_ok_backend().await;
+        let (ok_b, hb) = spawn_ok_backend().await;
+        let (slow, hs) = spawn_delayed_ok_backend(Duration::from_millis(150)).await;
+        let app = test_app();
+        let nodes = vec![node(slow), node(ok_a), node(ok_b)];
+        let headers = vec![HeaderKeyDict::new(); 3];
+        let started = std::time::Instant::now();
+        let resp = app
+            .make_write_async(nodes, 3, 0, "PUT", "/a/c", "", headers)
+            .await;
+        let elapsed = started.elapsed();
+        assert_eq!(resp.status, 201, "{}", resp.reason);
+        assert!(
+            elapsed >= Duration::from_millis(120),
+            "container write must wait for the slow replica's account-update: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must not wait the full node_timeout: {elapsed:?}"
+        );
+        ha.abort();
+        hb.abort();
+        hs.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
