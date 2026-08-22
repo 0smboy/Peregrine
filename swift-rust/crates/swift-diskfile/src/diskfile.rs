@@ -973,8 +973,24 @@ impl DurablePut {
                 DiskFileError::InvalidFilename("missing X-Timestamp in metadata".into())
             })?;
         let ctype_timestamp = parse_ts(meta_get(&metadata, "Content-Type-Timestamp"));
-        let filename = match self.frag_index {
-            Some(fi) => make_ec_ondisk_filename(&timestamp, fi, false)?,
+        let mut frag_index = self.frag_index;
+        if frag_index.is_none()
+            && matches!(self.policy, PolicyKind::Ec { .. })
+            && self.extension == ".data"
+        {
+            if let Some(v) = meta_get(&metadata, "X-Object-Sysmeta-Ec-Frag-Index") {
+                frag_index = match v {
+                    MetaValue::Int(i) => Some(*i),
+                    MetaValue::Str(s) => crate::naming::python_int(s),
+                    MetaValue::Bytes(_) => None,
+                };
+            }
+        }
+        let filename = match frag_index {
+            // DurablePut::commit is the durability barrier: write the
+            // durable EC name (`ts#N#d.data`) in one step. The two-phase
+            // writer path still uses put() (`ts#N.data`) then commit().
+            Some(fi) => make_ec_ondisk_filename(&timestamp, fi, true)?,
             None => make_ondisk_filename(&timestamp, Some(&self.extension), ctype_timestamp.as_ref()),
         };
         meta_set(&mut metadata, "name", MetaValue::Str(self.name.clone()));

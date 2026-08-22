@@ -102,6 +102,47 @@ fn test_ec_put_then_commit_becomes_durable_via_metadata_frag_index() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
+fn test_ec_into_durable_commit_uses_metadata_frag_index() {
+    let dir = std::env::temp_dir().join(format!("swift-ec-durable-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let device = dir.join("sda1");
+    std::fs::create_dir_all(&device).unwrap();
+    let hc = HashPathConfig::new("", "changeme").unwrap();
+    let df = DiskFile::new(
+        &device,
+        0,
+        "AUTH_test",
+        "c",
+        "o",
+        PolicyKind::Ec {
+            n_unique_fragments: Some(6),
+        },
+        0,
+        &hc,
+        DiskFileConfig::default(),
+    )
+    .unwrap();
+    let ts = "1751500002.00000";
+    let mut writer = df.create(".data").unwrap();
+    writer.write(b"hello").unwrap();
+    let durable = writer.into_durable().unwrap();
+    durable
+        .commit(ec_meta(ts, 4))
+        .expect("DurablePut::commit must stamp ts#N#d.data from footer sysmeta");
+    let datadir = find_hash_dir(&device);
+    let files: Vec<String> = std::fs::read_dir(&datadir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        files.iter().any(|f| f.contains("#4#d.data")),
+        "durable fragment not written; files = {files:?}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// Descend `<device>/objects/<part>/<suffix>/<hash>/` to the hash dir.
 fn find_hash_dir(device: &Path) -> std::path::PathBuf {
     let objects = device.join("objects");
