@@ -21,11 +21,12 @@ G2 SAIO pipeline: partial GREEN (live semantic diff 0 after 08-21 align)
 
 G3 Swift PUT/GET: partial evidence only (delta, not absolute counters)
 G3 required routes: RED
-G3 S3: RED overall; S3-1 and S3-2 live-proven on RSAIO :8081
-  - S3-1: unversioned SigV4 PUT 256MiB 200 (commit 897c2d8)
-  - S3-2: STREAMING-UNSIGNED-PAYLOAD-TRAILER 70MiB 200; bad chunk 403 + GET 404
-    proxy SHA e779eb5fdaf4187e329b645fdeb948f5d72185e70048ef239295bcc9c49e8c5a
-    commit 78630f8; native_async +1, block_in_place 0 on both PUT and fail-closed
+G3 S3: RED overall; S3-1/S3-2/S3-3 PUT path live-proven on RSAIO :8081
+  - S3-1: unversioned SigV4 PUT 256MiB 200
+  - S3-2: aws-chunked 70MiB 200; bad chunk 403 + GET 404
+  - S3-3: abort mid-PUT HEAD 404, tmp_delta=0; retry overwrite last body wins
+    proxy SHA 72cc5edc1030c48c2c9e3b4eb05ab71fc1135f6e745f419c2d6d9d37b4fa8337
+    SIGTERM-during-barrier not live-injected this slice (object DurabilityBarrier exists)
   - Control S3 (HEAD/List) still block_in_place; versioned PUT still 64MiB buffered
   - G3 not closed: remaining required routes not all GREEN
 
