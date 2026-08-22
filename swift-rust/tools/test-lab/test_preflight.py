@@ -32,6 +32,12 @@ GREEN_FACTS = {
     "rings_equivalent": True,
     "filesystem_equivalent": True,
     "host_production_traffic": False,
+    "swift2_vip_present": True,
+    "uncontrolled_competing_traffic": 0,
+    "lab_mode": {
+        "mode": "M0",
+        "registered_loadgen_ips": ["10.0.0.4"],
+    },
     "cpu_budgets_equivalent": True,
     "memory_budgets_equivalent": True,
     "data_state_clean": True,
@@ -46,6 +52,8 @@ GREEN_FACTS = {
         "data_state_clean": "measured",
         "no_competing_benchmark_process": "measured",
         "collected_test_names_frozen": "measured",
+        "uncontrolled_competing_traffic": "measured",
+        "swift2_vip_present": "measured",
     },
 }
 
@@ -60,15 +68,40 @@ class PreflightT5(unittest.TestCase):
         self.assertIn("[PASS] host production traffic = 0", report)
         self.assertIn("FAIL_COUNT=0", report)
 
-    def test_vip_fails_production_traffic_line(self):
+    def test_vip_alone_is_not_production_traffic(self):
         facts = dict(GREEN_FACTS)
+        facts["swift2_vip_present"] = True
         facts["host_production_traffic"] = True
+        facts["uncontrolled_competing_traffic"] = 0
+        facts["lab_mode"] = {
+            "mode": "M3",
+            "registered_loadgen_ips": ["10.0.0.4"],
+        }
         rows = preflight.evaluate(facts)
-        by = {label: status for label, status, _ in rows}
-        self.assertEqual(by["host production traffic = 0"], "FAIL")
-        self.assertEqual(by["exact Python Swift commit pinned"], "PASS")
+        by = {label: (status, reason) for label, status, reason in rows}
+        self.assertEqual(by["host production traffic = 0"][0], "PASS")
+        self.assertIn("no uncontrolled traffic; only registered loadgen", by["host production traffic = 0"][1])
+        self.assertEqual(by["exact Python Swift commit pinned"][0], "PASS")
+
+    def test_measured_competing_traffic_fails(self):
+        facts = dict(GREEN_FACTS)
+        facts["uncontrolled_competing_traffic"] = 12
+        rows = preflight.evaluate(facts)
+        by = {label: (status, reason) for label, status, reason in rows}
+        self.assertEqual(by["host production traffic = 0"][0], "FAIL")
+        self.assertIn("uncontrolled competing traffic", by["host production traffic = 0"][1])
         report = preflight.format_report(rows)
         self.assertIn("ABORT", report)
+
+    def test_m2_vip_fails_even_without_competing_traffic(self):
+        facts = dict(GREEN_FACTS)
+        facts["lab_mode"] = {"mode": "M2", "registered_loadgen_ips": ["10.0.0.4"]}
+        facts["swift2_vip_present"] = True
+        facts["uncontrolled_competing_traffic"] = 0
+        rows = preflight.evaluate(facts)
+        by = {label: (status, reason) for label, status, reason in rows}
+        self.assertEqual(by["host production traffic = 0"][0], "FAIL")
+        self.assertIn("M2 forbids VIP", by["host production traffic = 0"][1])
 
     def test_pipeline_drift_fails(self):
         facts = dict(GREEN_FACTS)
@@ -110,9 +143,9 @@ class PreflightT5(unittest.TestCase):
         self.assertEqual(by["provenance manifest valid"], "FAIL")
         self.assertEqual(by["peregrine worktree clean"], "FAIL")
 
-    def test_compatibility_profile_does_not_abort_only_on_vip(self):
+    def test_compatibility_profile_does_not_abort_only_on_host_traffic(self):
         facts = dict(GREEN_FACTS)
-        facts["host_production_traffic"] = True
+        facts["uncontrolled_competing_traffic"] = 3
         rows = preflight.evaluate(facts, profile="compatibility")
         self.assertTrue(preflight.abort_for_profile(rows, "concurrency"))
         self.assertFalse(preflight.abort_for_profile(rows, "compatibility"))

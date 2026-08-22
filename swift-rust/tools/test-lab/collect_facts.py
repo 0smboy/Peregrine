@@ -23,6 +23,13 @@ def main() -> int:
     p.add_argument("--python-pipeline-line")
     p.add_argument("--rust-pipeline-line")
     p.add_argument("--swift2-vip", action="store_true")
+    p.add_argument("--lab-mode", help="LAB-MODE.json path (mode, registered loadgen, VIP policy)")
+    p.add_argument(
+        "--uncontrolled-competing-traffic",
+        type=int,
+        default=None,
+        help="Measured competing connection/process count. Do not pass an operator guess.",
+    )
     p.add_argument("--rings-equivalent", action="store_true")
     p.add_argument("--storage-policies-identical", action="store_true")
     p.add_argument("--filesystem-equivalent", action="store_true")
@@ -59,7 +66,14 @@ def main() -> int:
         facts["pipeline_diff"] = pipeline.diff_pipelines(py, rs)
 
     facts["swift2_vip_present"] = bool(args.swift2_vip)
-    facts["host_production_traffic"] = bool(args.swift2_vip)
+    # VIP present ≠ production/uncontrolled traffic. Preflight needs a
+    # measured competing-traffic count plus LAB-MODE.
+    if args.lab_mode:
+        facts["lab_mode"] = json.loads(Path(args.lab_mode).read_text(encoding="utf-8"))
+    if args.uncontrolled_competing_traffic is not None:
+        facts["uncontrolled_competing_traffic"] = args.uncontrolled_competing_traffic
+    # Legacy key kept for readers; preflight no longer treats VIP as traffic.
+    facts["host_production_traffic"] = None
     # CLI booleans are operator declarations. Preflight rejects them as evidence.
     declared = {
         "rings_equivalent": args.rings_equivalent,
@@ -72,9 +86,13 @@ def main() -> int:
         "collected_test_names_frozen": args.tests_frozen,
     }
     facts.update(declared)
-    facts["measurement_source"] = {
-        k: ("operator_declared" if v else "unmeasured") for k, v in declared.items()
-    }
+    sources = {k: ("operator_declared" if v else "unmeasured") for k, v in declared.items()}
+    sources["swift2_vip_present"] = "cli"
+    if args.uncontrolled_competing_traffic is not None:
+        sources["uncontrolled_competing_traffic"] = "operator_declared"
+    else:
+        sources["uncontrolled_competing_traffic"] = "unmeasured"
+    facts["measurement_source"] = sources
 
     Path(args.out).write_text(json.dumps(facts, indent=2) + "\n", encoding="utf-8")
     return 0

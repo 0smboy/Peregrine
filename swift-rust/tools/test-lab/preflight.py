@@ -2,7 +2,11 @@
 """Fail-closed TEST PREFLIGHT (AGENTS.md T5).
 
 Prints every T5 line as PASS or FAIL. Any FAIL → exit 1. Does not start
-G4/G5/G8. Host production traffic (Swift2 VIP) is FAIL for G7/G8.
+G4/G5/G8.
+
+T5 label `host production traffic = 0` means *uncontrolled competing
+traffic*, not "VIP exists". A test VIP with only the registered loadgen
+is PASS. Operator booleans are not evidence.
 """
 from __future__ import annotations
 
@@ -72,6 +76,35 @@ def _measured_bool(facts: dict, key: str) -> tuple[bool, str]:
     return False, "measured true"
 
 
+def _uncontrolled_traffic(facts: dict) -> tuple[bool, str]:
+    """VIP presence is not production traffic. Competing traffic must be measured.
+
+    PASS reason is the T5 wording: `no uncontrolled traffic; only registered loadgen`.
+    """
+    sources = facts.get("measurement_source") or {}
+    src = str(
+        sources.get("uncontrolled_competing_traffic")
+        or facts.get("uncontrolled_competing_traffic_source")
+        or ""
+    )
+    competing = facts.get("uncontrolled_competing_traffic")
+    lab = facts.get("lab_mode") if isinstance(facts.get("lab_mode"), dict) else {}
+    mode = str(lab.get("mode") or facts.get("lab_mode_name") or "")
+    vip = facts.get("swift2_vip_present")
+    if vip is None:
+        vip = facts.get("vip_present")
+
+    if src in ("operator", "operator_declared", "flag", "cli"):
+        return True, f"operator-declared uncontrolled_competing_traffic={competing!r} is not evidence"
+    if src != "measured":
+        return True, f"unmeasured uncontrolled_competing_traffic (source={src or 'missing'}); VIP present is not traffic"
+    if competing not in (0, False):
+        return True, f"uncontrolled competing traffic={competing!r}"
+    if mode == "M2" and vip:
+        return True, "M2 forbids VIP; competing=0 is not enough"
+    return False, "no uncontrolled traffic; only registered loadgen"
+
+
 def evaluate(facts: dict, profile: str = "compatibility") -> list[tuple[str, str, str]]:
     """Return [(label, PASS|FAIL, reason), ...] in T5 order.
 
@@ -114,9 +147,7 @@ def evaluate(facts: dict, profile: str = "compatibility") -> list[tuple[str, str
         else:
             pipeline_unexpected = None
 
-    vip = facts.get("host_production_traffic")
-    if vip is None:
-        vip = bool(facts.get("swift2_vip_present"))
+    traffic_fail, traffic_reason = _uncontrolled_traffic(facts)
 
     rows = []
 
@@ -162,8 +193,8 @@ def evaluate(facts: dict, profile: str = "compatibility") -> list[tuple[str, str
         add(label, failed, reason)
     add(
         "host production traffic = 0",
-        bool(vip),
-        "VIP/production present" if vip else "no production VIP on test host",
+        traffic_fail,
+        traffic_reason,
     )
     for key, label in (
         ("cpu_budgets_equivalent", "CPU budgets equivalent"),
