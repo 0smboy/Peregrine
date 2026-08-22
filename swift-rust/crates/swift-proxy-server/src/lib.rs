@@ -5674,18 +5674,15 @@ pub(crate) fn account_info_from_response(resp: &Response) -> AccountInfo {
 }
 
 /// Account controller `add_acls_from_sys_metadata`: expose the client header.
+/// Python treats an empty ACL dict as an absent header (`if acl_dict:`).
 fn expose_account_acl_header(resp: &mut Response) {
     if let Some(sys) = resp.headers.remove("X-Account-Sysmeta-Core-Access-Control") {
         if let Some(acls) = swift_middleware::acls_from_sysmeta(Some(&sys)) {
-            resp.headers.set(
-                "X-Account-Access-Control",
-                swift_middleware::format_acl_v2(&acls),
-            );
-        } else if let Some(raw) = swift_middleware::parse_acl_v2(Some(&sys)) {
-            // Empty dict / clear — still surface an empty JSON object when
-            // sysmeta was explicitly set to {}.
-            if raw.is_empty() {
-                resp.headers.set("X-Account-Access-Control", "{}");
+            if !acls.is_empty() {
+                resp.headers.set(
+                    "X-Account-Access-Control",
+                    swift_middleware::format_acl_v2(&acls),
+                );
             }
         }
     }

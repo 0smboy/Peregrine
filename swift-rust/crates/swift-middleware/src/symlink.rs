@@ -984,6 +984,15 @@ fn listing_version_account(req: &Request) -> (String, String) {
 }
 
 fn apply_listing_rewrite(version: &str, account: &str, mut resp: Response, body: Vec<u8>) -> Response {
+    // Ordinary listings must not be re-serialized. Only rewrite when the
+    // container-update override etag actually carries symlink params.
+    let has_symlink = std::str::from_utf8(&body)
+        .map(|s| s.contains("symlink_target"))
+        .unwrap_or(false);
+    if !has_symlink {
+        resp.body = Body::Buffered(body);
+        return resp;
+    }
     match rewrite_listing_json(&body, version, account) {
         Some(new_body) => {
             resp.headers.set("Content-Length", new_body.len().to_string());
