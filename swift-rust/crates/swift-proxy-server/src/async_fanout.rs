@@ -1205,15 +1205,17 @@ impl ProxyApp {
             let is_head = req.method == "HEAD";
             let mut headers = self.backend_headers(req, false, "object");
             headers.set("X-Backend-Storage-Policy-Index", policy_index);
+            // Never forward client Range to fragment archives: those files
+            // are EC-sized, not the original object. Range is applied after
+            // decode. Ignore-Range is evaluated against fragment sysmeta
+            // locally, not sent to the object server.
             for h in [
-                "Range",
                 "If-Match",
                 "If-None-Match",
                 "If-Modified-Since",
                 "If-Unmodified-Since",
                 "X-Newest",
                 "X-Open-Expired",
-                "X-Backend-Ignore-Range-If-Metadata-Present",
             ] {
                 if let Some(v) = req.headers.get(h) {
                     headers.set(h, v.to_string());
@@ -2662,7 +2664,8 @@ impl ProxyApp {
                 "/v1/{}/{}/{}",
                 src_account, src_container, src_object
             ),
-            query_string: String::new(),
+            // Python copy.py `req.copy_get()` keeps `?symlink=get`.
+            query_string: req.query_string.clone(),
             headers: HeaderKeyDict::new(),
             body: Body::empty(),
         };

@@ -145,6 +145,27 @@ fn is_manifest_get(req: &Request) -> bool {
     req.param("multipart-manifest").as_deref() == Some("get")
 }
 
+/// Query string for the source GET: Python `req.copy_get()` keeps the
+/// original params (`symlink=get` copies the link itself) and, when the
+/// client asked for `multipart-manifest=get`, forces `format=raw`.
+fn source_get_query(req: &Request) -> String {
+    let mut qs = req.query_string.clone();
+    if is_manifest_get(req) {
+        let has_format = req
+            .params()
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("format"));
+        if !has_format {
+            if qs.is_empty() {
+                qs = "multipart-manifest=get&format=raw".to_string();
+            } else {
+                qs.push_str("&format=raw");
+            }
+        }
+    }
+    qs
+}
+
 /// Rewrite `query_string`, setting or clearing `multipart-manifest`.
 fn set_multipart_manifest_param(query: &str, value: Option<&str>) -> String {
     let mut parts: Vec<(String, String)> = Vec::new();
@@ -205,16 +226,12 @@ impl Copy {
         let manifest_get = is_manifest_get(&req);
 
         // 1) GET the source object.
+        // Python `_get_source_object` does `req.copy_get()`, so `?symlink=get`
+        // (copy the link, not the target) and other query params survive.
         let mut get_req = Request {
             method: "GET".to_string(),
             path: format!("/{version}/{src_account}/{src_container}/{src_object}"),
-            query_string: if manifest_get {
-                // Python: multipart-manifest=get&format=raw so SLO/DLO return
-                // the stored manifest body, not the reassembled object.
-                "multipart-manifest=get&format=raw".to_string()
-            } else {
-                String::new()
-            },
+            query_string: source_get_query(&req),
             headers: HeaderKeyDict::new(),
             body: Body::empty(),
         };
@@ -378,11 +395,7 @@ impl Copy {
         let mut get_req = Request {
             method: "GET".to_string(),
             path: format!("/{version}/{src_account}/{src_container}/{src_object}"),
-            query_string: if manifest_get {
-                "multipart-manifest=get&format=raw".to_string()
-            } else {
-                String::new()
-            },
+            query_string: source_get_query(&req),
             headers: HeaderKeyDict::new(),
             body: Body::empty(),
         };
@@ -627,6 +640,47 @@ mod tests {
         let resp = c.handle(r, &app);
         assert_eq!(resp.status, 201);
         let calls = log.lock().unwrap();
+        let dest_put = calls.iter().find(|c| c.method == "PUT").unwrap();
+        assert_eq!(
+            dest_put.headers.get("X-Symlink-Target"),
+            Some("tgtc/tgto")
+        );
+    }
+
+    #[test]
+    fn test_copy_preserves_symlink_get_on_source() {
+        // Python copy.py `_get_source_object` does `req.copy_get()`, so
+        // `?symlink=get` reaches the source GET. Without it, symlink
+        // middleware follows the target and dest is a regular object.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let app: NextFn = Arc::new(move |mut r: Request| {
+            let is_get = r.method == "GET";
+            r.body.materialize(u64::MAX).unwrap();
+            log2.lock().unwrap().push(r);
+            if is_get {
+                let mut resp = Response::with_body(200, Vec::new());
+                resp.headers.set("Content-Type", "application/symlink");
+                resp.headers.set("X-Symlink-Target", "tgtc/tgto");
+                resp
+            } else {
+                Response::new(201)
+            }
+        });
+        let mut r = req(
+            "COPY",
+            "/v1/AUTH_test/srcc/link",
+            &[("Destination", "/dstc/link2")],
+        );
+        r.query_string = "symlink=get".to_string();
+        let resp = Copy::new().handle(r, &app);
+        assert_eq!(resp.status, 201);
+        let calls = log.lock().unwrap();
+        let source_get = calls.iter().find(|c| c.method == "GET").unwrap();
+        assert_eq!(
+            source_get.query_string, "symlink=get",
+            "source GET must keep ?symlink=get"
+        );
         let dest_put = calls.iter().find(|c| c.method == "PUT").unwrap();
         assert_eq!(
             dest_put.headers.get("X-Symlink-Target"),

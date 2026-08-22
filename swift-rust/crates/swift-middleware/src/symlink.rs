@@ -58,8 +58,8 @@
 //!   `X-Backend-Allow-Reserved-Names` / `make_pre_authed_request` reserved
 //!   -name subrequests, and the `swift.leave_relative_location` POST flag
 //!   are not modelled.
-//! * `wsgi_quote`/`wsgi_unquote` round-tripping is simplified: paths and
-//!   symlink-target headers are treated as already percent-decoded.
+//! * `X-Symlink-Target` is `wsgi_unquote`d then `wsgi_quote`d (safe `/`) so
+//!   percent-encoded slashes in the object name normalize like Python.
 //! * `filter_factory`, `register_swift_info`, and the logger are not ported
 //!   (matching `gatekeeper`/`read_only`). The `status_map[...]` error body
 //!   for a non-success static-symlink target is simplified to the bare
@@ -116,6 +116,42 @@ fn csv_append(existing: Option<&str>, item: &str) -> String {
 fn update_ignore_range_header(headers: &mut HeaderKeyDict, name: &str) {
     let val = csv_append(headers.get(IGNORE_RANGE_HDR), name);
     headers.set(IGNORE_RANGE_HDR, val);
+}
+
+/// Python `swob.wsgi_unquote` / `urllib.parse.unquote(..., encoding='latin-1')`.
+/// Invalid `%` sequences are left intact.
+fn wsgi_unquote(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(value) = u8::from_str_radix(hex, 16) {
+                    out.push(value);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Python `swob.wsgi_quote` with default `safe='/'`.
+fn wsgi_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'/' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            b => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// `symlink_usermeta_to_sysmeta`: move the client `X-Symlink-Target[-Account]`
@@ -1078,20 +1114,22 @@ fn validate_and_prep_request_headers(
     const ERROR_BODY: &str =
         "X-Symlink-Target header must be of the form <container name>/<object name>";
 
-    // The caller guarantees X-Symlink-Target is present. (wsgi_unquote is
-    // simplified: the value is treated as already decoded.)
+    // Python: `wsgi_unquote` then `check_path_header` then `wsgi_quote` so
+    // `dealde%2Fl04 011e%204c8df/flash.png` stores as
+    // `dealde/l04%20011e%204c8df/flash.png` (TestSymlink encoded target).
     let raw_target = req
         .headers
         .get(TGT_OBJ_SYMLINK_HDR)
         .unwrap_or("")
         .to_string();
-    if raw_target.starts_with('/') {
+    let decoded_target = wsgi_unquote(&raw_target);
+    if decoded_target.starts_with('/') {
         return Err(err_text(412, ERROR_BODY));
     }
 
     // check_path_header: prepend '/' if missing, then split into exactly two
     // segments (container/object, object may contain slashes).
-    let hdr = format!("/{raw_target}");
+    let hdr = format!("/{decoded_target}");
     let cont_obj = match split_path(&hdr, 2, 2, true) {
         Ok(parts) => parts,
         Err(_) => return Err(err_html(412, ERROR_BODY)),
@@ -1099,11 +1137,11 @@ fn validate_and_prep_request_headers(
     let container = cont_obj.first().and_then(|o| o.clone()).unwrap_or_default();
     let obj = cont_obj.get(1).and_then(|o| o.clone()).unwrap_or_default();
     req.headers
-        .set(TGT_OBJ_SYMLINK_HDR, format!("{container}/{obj}"));
+        .set(TGT_OBJ_SYMLINK_HDR, wsgi_quote(&format!("{container}/{obj}")));
 
     // Validate the target account format if the header is present.
     let target_account = match req.headers.get(TGT_ACCT_SYMLINK_HDR).map(str::to_string) {
-        Some(acct) => match check_account_format(&acct) {
+        Some(acct) => match check_account_format(&wsgi_unquote(&acct)) {
             Ok(a) => Some(a.to_string()),
             // check_account_format raises HTTPPreconditionFailed (default
             // content-type).
@@ -1120,7 +1158,7 @@ fn validate_and_prep_request_headers(
 
     let account = match target_account {
         Some(a) => {
-            req.headers.set(TGT_ACCT_SYMLINK_HDR, a.clone());
+            req.headers.set(TGT_ACCT_SYMLINK_HDR, wsgi_quote(&a));
             a
         }
         None => req_acc.clone(),
@@ -1431,6 +1469,29 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(body_bytes(&resp)),
             "Symlink cannot target itself"
+        );
+    }
+
+    #[test]
+    fn test_put_normalizes_percent_encoded_slash_in_target() {
+        let mw = Symlink::default();
+        let resp = run(
+            &mw,
+            req(
+                "PUT",
+                "/v1/a/c/link",
+                &[(
+                    TGT_OBJ_SYMLINK_HDR,
+                    "c2/dealde%2Fl04 011e%204c8df/flash.png",
+                )],
+            ),
+            echo_backend(201),
+        );
+        assert_eq!(resp.status, 201);
+        assert_eq!(
+            resp.headers
+                .get(&format!("Echo-{TGT_OBJ_SYSMETA_SYMLINK_HDR}")),
+            Some("c2/dealde/l04%20011e%204c8df/flash.png")
         );
     }
 
