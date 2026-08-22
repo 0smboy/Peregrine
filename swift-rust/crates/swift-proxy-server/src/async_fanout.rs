@@ -1205,18 +1205,12 @@ impl ProxyApp {
             let is_head = req.method == "HEAD";
             let mut headers = self.backend_headers(req, false, "object");
             headers.set("X-Backend-Storage-Policy-Index", policy_index);
-            // Never forward client Range to fragment archives: those files
-            // are EC-sized, not the original object. Range is applied after
-            // decode. Ignore-Range is evaluated against fragment sysmeta
-            // locally, not sent to the object server.
-            for h in [
-                "If-Match",
-                "If-None-Match",
-                "If-Modified-Since",
-                "If-Unmodified-Since",
-                "X-Newest",
-                "X-Open-Expired",
-            ] {
+            // Never forward client Range or If-* to fragment archives: those
+            // files are EC-sized and carry fragment etags, not the original
+            // object. Range and conditionals are applied after decode against
+            // the reconstructed ETag / Last-Modified. Ignore-Range is
+            // evaluated against fragment sysmeta locally.
+            for h in ["X-Newest", "X-Open-Expired"] {
                 if let Some(v) = req.headers.get(h) {
                     headers.set(h, v.to_string());
                 }
@@ -1226,6 +1220,17 @@ impl ProxyApp {
                 .headers
                 .get("X-Backend-Ignore-Range-If-Metadata-Present")
                 .map(str::to_string);
+            let mut cond_headers = HeaderKeyDict::new();
+            for h in [
+                "If-Match",
+                "If-None-Match",
+                "If-Modified-Since",
+                "If-Unmodified-Since",
+            ] {
+                if let Some(v) = req.headers.get(h) {
+                    cond_headers.set(h, v.to_string());
+                }
+            }
             self.ec_get_async_inner(
                 is_head,
                 headers,
@@ -1236,6 +1241,7 @@ impl ProxyApp {
                 ec,
                 range_hdr,
                 ignore_hdr,
+                cond_headers,
             )
             .await
         }
@@ -1253,6 +1259,7 @@ impl ProxyApp {
         ec: super::EcPolicyParams,
         range_hdr: Option<String>,
         ignore_hdr: Option<String>,
+        cond_headers: HeaderKeyDict,
     ) -> Response {
         use swift_ec::EcDriver;
         let nodes = self.iter_nodes(object_ring, object_part);
@@ -1389,7 +1396,16 @@ impl ProxyApp {
         } else {
             resp.headers.set("Content-Length", orig_size);
         }
-        if is_head {
+        // Conditionals against the reconstructed object, not fragment etags.
+        let cond_req = swift_http::Request {
+            method: if is_head { "HEAD".into() } else { "GET".into() },
+            path: path.to_string(),
+            query_string: String::new(),
+            headers: cond_headers,
+            body: Body::empty(),
+        };
+        resp = swift_http::apply_conditional(&cond_req, resp);
+        if is_head || !(200..300).contains(&resp.status) {
             return resp;
         }
         let driver = match EcDriver::new(ec.ndata, ec.nparity) {
