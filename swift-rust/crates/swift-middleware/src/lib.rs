@@ -148,7 +148,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use swift_http::{Request, Response};
+use swift_http::{AsyncRequest, Request, Response};
 
 /// The innermost app or the next middleware in the chain. An `Arc` so a
 /// middleware can `Arc::clone(next)` INTO a streaming response body (the
@@ -159,6 +159,11 @@ pub type NextFn = Arc<dyn Fn(Request) -> Response + Send + Sync>;
 /// must go through this, not a blocking `handle()`.
 pub type AsyncNextFn = Arc<
     dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync,
+>;
+
+/// Production Hyper inner app that keeps the request body as a stream.
+pub type StreamingAsyncNextFn = Arc<
+    dyn Fn(AsyncRequest) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync,
 >;
 
 /// Header-only phase on the production Hyper path. Must not read the
@@ -202,6 +207,21 @@ pub trait Middleware: Send + Sync {
     /// the sync pipeline (inner `handle`, not object-sized PUT).
     fn intercepts_request(&self, _req: &Request) -> bool {
         false
+    }
+
+    /// Object-sized PUT/UploadPart: the Hyper path must not materialize
+    /// [`swift_http::MAX_CONTROL_BODY`] before calling the filter.
+    fn streams_request(&self, _req: &Request) -> bool {
+        false
+    }
+
+    /// Streaming intercept. Default forwards the unread body.
+    fn handle_streaming_request(
+        &self,
+        req: AsyncRequest,
+        next: StreamingAsyncNextFn,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move { next(req).await })
     }
 
     /// Control-plane intercept (SLO PUT/DELETE) with async inner app.

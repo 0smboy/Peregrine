@@ -1,8 +1,9 @@
-//! S3-0 characterization (PEREGRINE-NEXT-EXECUTION-DIRECTIVE-20260822).
+//! S3-1/S3-2 construction fences (PEREGRINE-FOUR-NODE-G0-G8-EXECUTION-DIRECTIVE).
 //!
-//! These tests encode required architecture. They MUST fail on the current
-//! intercept+materialize+block_in_place path. A skip or `#[ignore]` is not
-//! allowed: environment-unavailable-but-PASS is forbidden.
+//! S3-1 tests must PASS after the streaming ABI lands. Remaining S3-2/S3-3
+//! fences assert the leftover control-path defects so `cargo test` stays
+//! honest: they pass *while the defect exists* and must be inverted in the
+//! slice that removes it. A skip or `#[ignore]` is not allowed.
 
 use std::fs;
 use std::path::PathBuf;
@@ -15,6 +16,18 @@ fn read(rel: &str) -> String {
     fs::read_to_string(crate_dir().join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
 }
 
+fn streaming_fn_src() -> String {
+    let mw = read("src/middleware.rs");
+    let start = mw
+        .find("async fn put_object_streaming")
+        .expect("put_object_streaming missing");
+    let rest = &mw[start..];
+    let end = rest
+        .find("async fn put_object_versioned_buffered")
+        .expect("put_object_versioned_buffered missing");
+    rest[..end].to_string()
+}
+
 #[test]
 fn max_control_body_is_64_mib() {
     assert_eq!(
@@ -25,56 +38,84 @@ fn max_control_body_is_64_mib() {
 }
 
 #[test]
-fn signed_s3_put_must_not_be_fully_buffered_at_control_cap() {
+fn s3_1_proxy_streams_request_before_materialize() {
     let proxy = read("../swift-proxy-server/src/lib.rs");
-    let intercept_then_materialize = proxy.contains("if filters.iter().any(|f| f.intercepts_request(&head))")
-        && proxy.contains("materialize(swift_http::MAX_CONTROL_BODY)");
+    let start = proxy
+        .find("impl AsyncService for ProxyAsyncService")
+        .expect("ProxyAsyncService missing");
+    let src = &proxy[start..];
+    let stream_at = src
+        .find("if filters.iter().any(|f| f.streams_request(&head))")
+        .expect("proxy must branch on streams_request");
+    let mat_at = src
+        .find("materialize(swift_http::MAX_CONTROL_BODY)")
+        .expect("control-plane materialize must remain for SLO/XML");
     assert!(
-        !intercept_then_materialize,
-        "G3 S3-0 FAIL: proxy still materializes MAX_CONTROL_BODY (64 MiB) for every intercepting filter, including signed S3 PutObject/UploadPart"
+        stream_at < mat_at,
+        "G3 S3-1 FAIL: streams_request must run before intercept materialize(MAX_CONTROL_BODY)"
     );
 }
 
 #[test]
-fn s3_handle_request_async_must_not_block_in_place_or_block_on() {
-    let mw = read("src/middleware.rs");
-    let uses_bip = mw.contains("tokio::task::block_in_place");
-    let uses_block_on = mw.contains("block_on(next");
+fn s3_1_put_object_streaming_has_no_block_in_place() {
+    let src = streaming_fn_src();
     assert!(
-        !uses_bip && !uses_block_on,
-        "G3 S3-0 FAIL: handle_request_async still uses block_in_place={uses_bip} block_on={uses_block_on}"
+        !src.contains("tokio::task::block_in_place"),
+        "G3 S3-1 FAIL: put_object_streaming still uses block_in_place"
+    );
+    assert!(
+        !src.contains("block_on("),
+        "G3 S3-1 FAIL: put_object_streaming still uses block_on"
+    );
+    assert!(
+        !src.contains("self.handle("),
+        "G3 S3-1 FAIL: streaming PUT still calls sync handle()"
     );
 }
 
 #[test]
-fn s3_handle_request_async_must_take_streaming_incoming_body() {
+fn s3_1_handle_streaming_request_takes_incoming_body() {
     let mw = read("src/middleware.rs");
-    let still_sync_request = mw.contains("fn handle_request_async")
-        && mw.contains("req: Request")
-        && !mw.contains("IncomingBody");
     assert!(
-        !still_sync_request,
-        "G3 S3-1 FAIL: handle_request_async still takes sync Request instead of AsyncRequest/IncomingBody"
+        mw.contains("fn handle_streaming_request")
+            && mw.contains("req: AsyncRequest")
+            && mw.contains("IncomingBody"),
+        "G3 S3-1 FAIL: streaming ABI must take AsyncRequest/IncomingBody"
     );
 }
 
 #[test]
-fn aws_chunked_must_not_require_fully_buffered_body() {
+fn s3_1_aws_chunked_excluded_from_streaming_put() {
     let mw = read("src/middleware.rs");
-    let decode_after_buffer = mw.contains("decode_and_fix_aws_chunked")
-        && mw.contains("block_in_place");
+    let start = mw
+        .find("fn is_s3_streaming_object_put")
+        .expect("is_s3_streaming_object_put missing");
+    let src = &mw[start..];
+    let end = src.find("/// Paths that are never unsigned S3").unwrap_or(src.len());
+    let src = &src[..end];
     assert!(
-        !decode_after_buffer,
-        "G3 S3-2 FAIL: aws-chunked decode still sits behind the sync/block_in_place adapter (needs incremental dechunk on IncomingBody)"
+        src.contains("is_aws_chunked_request"),
+        "G3 S3-1 FAIL: streaming PUT must refuse aws-chunked (S3-2)"
     );
 }
 
 #[test]
-fn s3_client_cancel_must_not_run_sync_handle_to_completion() {
+fn s3_2_remaining_aws_chunked_decode_is_still_buffered() {
     let mw = read("src/middleware.rs");
-    let sync_handle_on_async = mw.contains("self.handle(req, &next_sync)");
+    let still = mw.contains("decode_and_fix_aws_chunked") && mw.contains("block_in_place");
     assert!(
-        !sync_handle_on_async,
-        "G3 S3-0 FAIL: async intercept still calls sync handle(); client cancellation cannot abort a running sync dispatch"
+        still,
+        "S3-2 tracker inverted: aws-chunked left the sync adapter; convert this test to assert absence"
+    );
+}
+
+#[test]
+fn s3_3_remaining_control_path_still_uses_sync_handle() {
+    let mw = read("src/middleware.rs");
+    let still = mw.contains("self.handle(req, &next_sync)")
+        && mw.contains("tokio::task::block_in_place");
+    assert!(
+        still,
+        "S3-3 tracker inverted: control handle_request_async is native async; convert this test to assert absence"
     );
 }

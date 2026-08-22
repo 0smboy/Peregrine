@@ -107,9 +107,12 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use swift_http::{
-    parse_http_date, Body, ClockHealth, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY,
+    parse_http_date, AsyncRequest, Body, ClockHealth, HeaderKeyDict, IncomingBody, Request,
+    Response, MAX_CONTROL_BODY,
 };
-use swift_middleware::{AsyncNextFn, Middleware, NextFn, S3TokenClient, S3TokenResult};
+use swift_middleware::{
+    AsyncNextFn, Middleware, NextFn, StreamingAsyncNextFn, S3TokenClient, S3TokenResult,
+};
 
 use crate::acl_cors::{
     apply_bucket_acl_input, apply_object_acl_input, bucket_acl_xml_from_headers,
@@ -687,6 +690,63 @@ fn decode_and_fix_aws_chunked(
 /// auth schemes with S3 XML) instead of falling through to Swift filters.
 fn is_s3_auth_request(req: &Request) -> bool {
     parse_sigv4_auth(req).is_some() || is_sigv2_auth(req)
+}
+
+/// PutObject / UploadPart: body is object bytes, not control XML.
+/// CreateMultipartUpload (`POST ?uploads`) and Complete (`POST ?uploadId` without
+/// partNumber) stay on the control intercept + materialize path.
+/// aws-chunked / copy stay off this path until S3-2 / the copy translator.
+fn is_s3_streaming_object_put(
+    req: &Request,
+    storage_domains: &[String],
+    dns_compliant: bool,
+) -> bool {
+    if !matches!(req.method.as_str(), "PUT" | "POST") {
+        return false;
+    }
+    if req.headers.get("x-amz-copy-source").is_some()
+        || req.headers.get("X-Amz-Copy-Source").is_some()
+    {
+        return false;
+    }
+    if is_aws_chunked_request(req) {
+        return false;
+    }
+    let params = req.params();
+    let has_upload_id = params.iter().any(|(k, _)| k == "uploadId");
+    let has_part = params.iter().any(|(k, _)| k == "partNumber");
+    let has_uploads = params.iter().any(|(k, _)| k == "uploads");
+    if has_uploads && !has_upload_id {
+        return false;
+    }
+    if has_upload_id && !has_part && req.method == "POST" {
+        return false;
+    }
+    const CONTROL: &[&str] = &[
+        "acl",
+        "tagging",
+        "cors",
+        "lifecycle",
+        "versioning",
+        "delete",
+        "policy",
+        "website",
+        "logging",
+        "notification",
+        "encryption",
+        "object-lock",
+        "legal-hold",
+        "retention",
+        "publicAccessBlock",
+        "restore",
+        "select",
+        "torrent",
+    ];
+    if params.iter().any(|(k, _)| CONTROL.contains(&k.as_str())) {
+        return false;
+    }
+    let (bucket, key) = extract_bucket_and_key(req, storage_domains, dns_compliant);
+    bucket.is_some() && key.is_some()
 }
 
 /// Paths that are never unsigned S3 (Swift v1 / auth / info / health).
@@ -2527,6 +2587,9 @@ fn translate_bucket_success(method: &str, resp: Response, bucket: Option<&str>) 
 
 impl Middleware for S3Api {
     fn intercepts_request(&self, req: &Request) -> bool {
+        if self.streams_request(req) {
+            return false;
+        }
         if is_s3_auth_request(req) {
             return true;
         }
@@ -2536,6 +2599,23 @@ impl Middleware for S3Api {
                 &self.storage_domains,
                 self.dns_compliant_bucket_names,
             )
+    }
+
+    fn streams_request(&self, req: &Request) -> bool {
+        parse_sigv4_auth(req).is_some()
+            && is_s3_streaming_object_put(
+                req,
+                &self.storage_domains,
+                self.dns_compliant_bucket_names,
+            )
+    }
+
+    fn handle_streaming_request(
+        &self,
+        req: AsyncRequest,
+        next: StreamingAsyncNextFn,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move { self.put_object_streaming(req, next).await })
     }
 
     fn handle_request_async(
@@ -2648,6 +2728,263 @@ impl Middleware for S3Api {
 }
 
 impl S3Api {
+    /// S3-1: PutObject / UploadPart keep IncomingBody. Auth is header-only
+    /// (UNSIGNED-PAYLOAD or the declared payload hash). aws-chunked stays
+    /// on the control intercept until S3-2. Versioned buckets fall back to
+    /// the buffered control path (same 64 MiB cap as before this slice).
+    async fn put_object_streaming(
+        &self,
+        areq: AsyncRequest,
+        next: StreamingAsyncNextFn,
+    ) -> Response {
+        let method = areq.method.clone();
+        let finish = |resp: Response| finish_s3_response(&method, resp);
+        let mut head = Request {
+            method: areq.method.clone(),
+            path: areq.path.clone(),
+            query_string: areq.query_string.clone(),
+            headers: areq.headers.clone(),
+            body: Body::empty(),
+        };
+        if let Some(resp) = reject_unknown_storage_class(&head) {
+            return finish(resp);
+        }
+        if let Some(resp) = reject_unsupported_put_conditionals(&head) {
+            return finish(resp);
+        }
+        let auth = match parse_sigv4_auth(&head) {
+            Some(a) => a,
+            None => return finish(s3_error_response("AccessDenied", None, &[])),
+        };
+        let Some((cred, keystone_verified)) = self.resolve_credential(&auth, &head) else {
+            return finish(s3_error_response("InvalidAccessKeyId", None, &[]));
+        };
+        if let Some(denied) = self.frozen_account_denied(&cred.account, &head) {
+            return finish(denied);
+        }
+        let now = unix_now();
+        if let Err(err) = check_sigv4_time(&head, now, self.allowable_clock_skew) {
+            return finish(s3_auth_error(err));
+        }
+        if !keystone_verified {
+            if let Err(err) = verify_sigv4(
+                &cred.access_key,
+                &cred.secret_key,
+                &head,
+                Some(now),
+                Some(self.allowable_clock_skew),
+            ) {
+                return finish(s3_auth_error(err));
+            }
+        }
+        let (bucket, key) = extract_bucket_and_key(
+            &head,
+            &self.storage_domains,
+            self.dns_compliant_bucket_names,
+        );
+        let (Some(bucket), Some(key)) = (bucket, key) else {
+            return finish(s3_error_response(
+                "InvalidRequest",
+                Some("streaming PUT requires object key"),
+                &[],
+            ));
+        };
+        if !validate_bucket_name(&bucket, self.dns_compliant_bucket_names) {
+            return finish(s3_error_response(
+                "InvalidBucketName",
+                None,
+                &[("BucketName", &bucket)],
+            ));
+        }
+        if key.as_bytes().len() > MAX_OBJECT_NAME_LENGTH {
+            return finish(s3_error_response("KeyTooLongError", None, &[]));
+        }
+        if let Some(denied) =
+            iam_action_check(&self.iam, &cred, "s3:PutObject", &bucket, &key)
+        {
+            return finish(denied);
+        }
+        let params = head.params();
+        let upload_id = params
+            .iter()
+            .find(|(k, _)| k == "uploadId")
+            .map(|(_, v)| v.clone());
+        let part_number = params
+            .iter()
+            .find(|(k, _)| k == "partNumber")
+            .and_then(|(_, v)| v.parse::<u32>().ok());
+        let is_mpu_part = upload_id.is_some() && part_number.is_some();
+
+        map_amz_meta(&mut head);
+        persist_s3_object_headers(&mut head);
+        match resolve_acl_put_input(&head.headers, None, &cred.access_key) {
+            Ok(input) => {
+                if !matches!(input, AclPutInput::None) {
+                    apply_object_acl_input(&mut head.headers, &input);
+                }
+            }
+            Err(_) => return finish(s3_error_response("InvalidArgument", None, &[])),
+        }
+        if let Err(resp) = apply_request_object_lock_headers(&mut head.headers) {
+            return finish(resp);
+        }
+        let bypass_requested = match parse_bypass_governance_header(
+            head.headers
+                .get(HDR_BYPASS_GOVERNANCE)
+                .or_else(|| head.headers.get("X-Amz-Bypass-Governance-Retention")),
+        ) {
+            Ok(value) => value,
+            Err(_) => return finish(s3_error_response("InvalidArgument", None, &[])),
+        };
+        let worm_bypass =
+            match governance_bypass_context(&self.iam, &cred, &bucket, &key, bypass_requested) {
+                Ok(ctx) => ctx,
+                Err(resp) => return finish(resp),
+            };
+        strip_s3_only_headers(&mut head.headers);
+        stamp_auth(&mut head, &cred);
+
+        if is_mpu_part {
+            let segs = segments_container(&bucket);
+            let part_name = part_object_name(&key, upload_id.as_deref().unwrap(), part_number.unwrap());
+            let swift = AsyncRequest {
+                method: "PUT".into(),
+                path: s3_to_swift_path(&cred.account, Some(&segs), Some(&part_name)),
+                query_string: String::new(),
+                headers: head.headers,
+                body: areq.body,
+            };
+            let resp = next(swift).await;
+            return if (200..300).contains(&resp.status) {
+                finish(translate_object_success("PUT", resp, false))
+            } else {
+                finish(map_swift_error(resp.status, Some(&bucket), Some(&key)))
+            };
+        }
+
+        let (st, hdrs) =
+            match head_container_streaming(&cred, &bucket, &next, &self.container_heads).await {
+                Ok(v) => v,
+                Err(resp) => return finish(resp),
+            };
+        if st != 404 && !(200..300).contains(&st) {
+            return finish(map_swift_error(st, Some(&bucket), None));
+        }
+        let vstatus = versioning_status_from_headers(&hdrs).ok().flatten();
+        if bucket_versioning_mode(vstatus.as_deref()).is_some() {
+            return self
+                .put_object_versioned_buffered(areq, next, method)
+                .await;
+        }
+        apply_lifecycle_on_put_from_container(&mut head.headers, &hdrs, &key, unix_now());
+        if head.headers.get(SYS_RETAIN_UNTIL).is_none() {
+            if let Ok(Some(xml)) = validated_object_lock_xml_from_headers(&hdrs) {
+                if let Ok(Some(def)) = parse_object_lock_configuration(&xml) {
+                    apply_default_retention_headers(&mut head.headers, &def, unix_now());
+                }
+            }
+        }
+        let has_lock_headers = head.headers.get(SYS_LOCK_MODE).is_some()
+            || head.headers.get(SYS_RETAIN_UNTIL).is_some()
+            || head.headers.get(SYS_LEGAL_HOLD).is_some();
+        if has_lock_headers {
+            match validated_object_lock_xml_from_headers(&hdrs) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return finish(s3_error_response(
+                        "InvalidRequest",
+                        Some("Bucket is missing Object Lock Configuration"),
+                        &[],
+                    ));
+                }
+                Err(_) => {
+                    return finish(s3_error_response(
+                        "InternalError",
+                        Some("bucket object lock metadata is invalid"),
+                        &[],
+                    ));
+                }
+            }
+        }
+        if st != 404 && container_requires_object_precheck(&hdrs) {
+            match control_head_object_streaming(&cred, &bucket, &key, &next).await {
+                Ok(ObjectHead::Missing) => {}
+                Ok(ObjectHead::Present(existing)) => {
+                    if let Some(blocked) =
+                        worm_guard(&existing.headers, self.worm_clock.clock_ok(), worm_bypass)
+                    {
+                        return finish(blocked);
+                    }
+                    if let Some(blocked) =
+                        deny_if_object_acl_blocks_write(&cred, &existing.headers)
+                    {
+                        return finish(blocked);
+                    }
+                }
+                Err(resp) => return finish(resp),
+            }
+        }
+
+        let stamped_delete_at = head.headers.get("X-Delete-At").map(str::to_string);
+        let swift = AsyncRequest {
+            method: "PUT".into(),
+            path: s3_to_swift_path(&cred.account, Some(&bucket), Some(&key)),
+            query_string: s3_to_swift_query(&params, false),
+            headers: head.headers,
+            body: areq.body,
+        };
+        let resp = next(swift).await;
+        if (200..300).contains(&resp.status) {
+            let mut out = translate_object_success("PUT", resp, false);
+            if let Some(exp) = stamped_delete_at
+                .as_deref()
+                .and_then(amz_expiration_from_delete_at)
+            {
+                out.headers.set("x-amz-expiration", exp);
+            }
+            finish(out)
+        } else {
+            finish(map_swift_error(resp.status, Some(&bucket), Some(&key)))
+        }
+    }
+
+    /// Versioned PutObject still needs the sync version archive. Cap stays
+    /// MAX_CONTROL_BODY until that translator is async. Unversioned PUTs
+    /// never enter this function.
+    async fn put_object_versioned_buffered(
+        &self,
+        mut areq: AsyncRequest,
+        next: StreamingAsyncNextFn,
+        method: String,
+    ) -> Response {
+        let bytes = match areq.body.materialize(MAX_CONTROL_BODY).await {
+            Ok(b) => b,
+            Err(e) if swift_http::body_too_large(&e) => {
+                return finish_s3_response(
+                    &method,
+                    Response::error(413, "Your request is too large."),
+                );
+            }
+            Err(_) => {
+                return finish_s3_response(&method, s3_error_response("InternalError", None, &[]));
+            }
+        };
+        let req = Request {
+            method: areq.method,
+            path: areq.path,
+            query_string: areq.query_string,
+            headers: areq.headers,
+            body: Body::Buffered(bytes),
+        };
+        swift_http::record_block_in_place();
+        let next_sync: NextFn = Arc::new(move |r| {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(next(request_to_streaming(r)))
+            })
+        });
+        self.handle(req, &next_sync)
+    }
+
     /// Shared S3 operation dispatch after auth has succeeded (V2 or V4).
     fn dispatch_authorized(&self, req: Request, cred: S3Credential, next: &NextFn) -> Response {
         let method = req.method.clone();
@@ -4658,6 +4995,63 @@ fn handle_versioning(req: Request, cred: &S3Credential, bucket: &str, next: &Nex
 /// that sequential creates were paying on every object.
 fn container_requires_object_precheck(headers: &HeaderKeyDict) -> bool {
     !matches!(validated_object_lock_xml_from_headers(headers), Ok(None))
+}
+
+fn request_to_streaming(req: Request) -> AsyncRequest {
+    let Request {
+        method,
+        path,
+        query_string,
+        headers,
+        body,
+    } = req;
+    let bytes = body.into_vec(u64::MAX).unwrap_or_default();
+    AsyncRequest {
+        method,
+        path,
+        query_string,
+        headers,
+        body: IncomingBody::from_bytes(bytes, MAX_CONTROL_BODY),
+    }
+}
+
+async fn head_container_streaming(
+    cred: &S3Credential,
+    bucket: &str,
+    next: &StreamingAsyncNextFn,
+    cache: &ContainerHeadCache,
+) -> Result<(u16, HeaderKeyDict), Response> {
+    if let Some(hit) = cache.get(&cred.account, bucket) {
+        return Ok(hit);
+    }
+    let mut head = make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+    stamp_auth(&mut head, cred);
+    let resp = next(request_to_streaming(head)).await;
+    if (200..300).contains(&resp.status) {
+        cache.store(&cred.account, bucket, resp.status, resp.headers.clone());
+    }
+    Ok((resp.status, resp.headers))
+}
+
+async fn control_head_object_streaming(
+    cred: &S3Credential,
+    container: &str,
+    key: &str,
+    next: &StreamingAsyncNextFn,
+) -> Result<ObjectHead, Response> {
+    let mut head = make_swift_req(
+        "HEAD",
+        &s3_to_swift_path(&cred.account, Some(container), Some(key)),
+    );
+    stamp_auth(&mut head, cred);
+    let resp = next(request_to_streaming(head)).await;
+    if (200..300).contains(&resp.status) {
+        Ok(ObjectHead::Present(resp))
+    } else if resp.status == 404 {
+        Ok(ObjectHead::Missing)
+    } else {
+        Err(map_swift_error(resp.status, Some(container), Some(key)))
+    }
 }
 
 fn head_container(
@@ -8166,6 +8560,164 @@ mod tests {
         let resp = api.handle(req, &next);
         assert_eq!(resp.status, 200);
         assert_eq!(resp.headers.get("ETag"), Some("\"abc123\""));
+    }
+
+    fn block_on_s3<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime")
+            .block_on(fut)
+    }
+
+    fn unsigned_signed_put(path: &str, query: &str) -> Request {
+        let mut req = base_s3_req("PUT", path, query);
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        sign_request(req, "testing")
+    }
+
+    fn async_from_signed(req: Request, body: Vec<u8>) -> AsyncRequest {
+        AsyncRequest {
+            method: req.method,
+            path: req.path,
+            query_string: req.query_string,
+            headers: req.headers,
+            body: IncomingBody::from_bytes(body, u64::MAX),
+        }
+    }
+
+    #[test]
+    fn signed_put_object_is_streaming_not_intercept() {
+        let api = S3Api::new(cred_map());
+        let req = unsigned_signed_put("/mybucket/obj", "");
+        assert!(
+            api.streams_request(&req),
+            "SigV4 PutObject must take the streaming ABI"
+        );
+        assert!(
+            !api.intercepts_request(&req),
+            "streaming PutObject must not enter the 64 MiB materialize intercept"
+        );
+    }
+
+    #[test]
+    fn list_buckets_is_intercept_not_streaming() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/", ""), "testing");
+        assert!(!api.streams_request(&req));
+        assert!(api.intercepts_request(&req));
+    }
+
+    #[test]
+    fn aws_chunked_put_is_not_streaming() {
+        let api = S3Api::new(cred_map());
+        let mut req = unsigned_signed_put("/mybucket/obj", "");
+        req.headers.set(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        );
+        req.headers.set("Content-Encoding", "aws-chunked");
+        assert!(
+            !api.streams_request(&req),
+            "aws-chunked stays on the control path until S3-2"
+        );
+        assert!(api.intercepts_request(&req));
+    }
+
+    #[test]
+    fn streaming_put_forwards_unread_body_without_control_cap() {
+        let api = S3Api::new(cred_map());
+        let req = unsigned_signed_put("/mybucket/obj", "");
+        // Body is forwarded as IncomingBody; the 64 MiB control cap is a
+        // proxy-materialize concern proven by the streams_request branch.
+        let payload = vec![b'x'; 256 * 1024];
+        let expected_len = payload.len();
+        let areq = async_from_signed(req, payload);
+        let next: StreamingAsyncNextFn = Arc::new(move |areq| {
+            Box::pin(async move {
+                if areq.method == "HEAD" {
+                    return Response::new(204);
+                }
+                assert_eq!(areq.method, "PUT");
+                assert_eq!(areq.path, "/v1/AUTH_test/mybucket/obj");
+                let mut n = 0usize;
+                let mut body = areq.body;
+                while let Some(c) = body.next_chunk().await.unwrap() {
+                    n += c.len();
+                }
+                assert_eq!(n, expected_len);
+                let mut resp = Response::new(201);
+                resp.headers.set("ETag", "abc123");
+                resp
+            })
+        });
+        let resp = block_on_s3(api.put_object_streaming(areq, next));
+        assert_eq!(resp.status, 200, "streaming PUT must not 413 at 64 MiB");
+        assert_eq!(resp.headers.get("ETag"), Some("\"abc123\""));
+    }
+
+    #[test]
+    fn streaming_put_calls_backend_before_client_eof() {
+        let api = S3Api::new(cred_map());
+        let req = unsigned_signed_put("/mybucket/obj", "");
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(4);
+        let areq = AsyncRequest {
+            method: req.method,
+            path: req.path,
+            query_string: req.query_string,
+            headers: req.headers,
+            body: IncomingBody::from_channel(rx, Some(3), None, u64::MAX),
+        };
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_c = started.clone();
+        let next: StreamingAsyncNextFn = Arc::new(move |areq| {
+            let started_c = started_c.clone();
+            Box::pin(async move {
+                if areq.method == "HEAD" {
+                    return Response::new(204);
+                }
+                started_c.notify_one();
+                let mut n = 0usize;
+                let mut body = areq.body;
+                while let Some(c) = body.next_chunk().await.unwrap() {
+                    n += c.len();
+                }
+                assert_eq!(n, 3);
+                let mut resp = Response::new(201);
+                resp.headers.set("ETag", "early");
+                resp
+            })
+        });
+        let resp = block_on_s3(async move {
+            let put = tokio::spawn(async move { api.put_object_streaming(areq, next).await });
+            started.notified().await;
+            tx.send(Ok(b"abc".to_vec())).await.unwrap();
+            drop(tx);
+            put.await.unwrap()
+        });
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("ETag"), Some("\"early\""));
+    }
+
+    #[test]
+    fn streaming_upload_part_maps_to_segments_container() {
+        let api = S3Api::new(cred_map());
+        let req = unsigned_signed_put("/mybucket/obj", "uploadId=uid1&partNumber=2");
+        let areq = async_from_signed(req, b"part".to_vec());
+        let next: StreamingAsyncNextFn = Arc::new(move |areq| {
+            Box::pin(async move {
+                assert_eq!(areq.method, "PUT");
+                assert_eq!(
+                    areq.path,
+                    "/v1/AUTH_test/mybucket+segments/obj/uid1/00000002"
+                );
+                let mut resp = Response::new(201);
+                resp.headers.set("ETag", "part-etag");
+                resp
+            })
+        });
+        let resp = block_on_s3(api.put_object_streaming(areq, next));
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("ETag"), Some("\"part-etag\""));
     }
 
     #[test]

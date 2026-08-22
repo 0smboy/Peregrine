@@ -5540,6 +5540,21 @@ impl AsyncService for ProxyAsyncService {
             }
             req.headers = head.headers.clone();
             req.query_string = head.query_string.clone();
+            if filters.iter().any(|f| f.streams_request(&head)) {
+                let next: swift_middleware::StreamingAsyncNextFn = {
+                    let app = Arc::clone(&app);
+                    Arc::new(move |areq| {
+                        let app = Arc::clone(&app);
+                        Box::pin(async move { app.handle_async(areq).await })
+                    })
+                };
+                for filter in filters.iter().rev() {
+                    if filter.streams_request(&head) {
+                        return filter.handle_streaming_request(req, next).await;
+                    }
+                }
+                return next(req).await;
+            }
             if filters.iter().any(|f| f.intercepts_request(&head)) {
                 let body = match req.body.materialize(swift_http::MAX_CONTROL_BODY).await {
                     Ok(bytes) => swift_http::Body::Buffered(bytes),
