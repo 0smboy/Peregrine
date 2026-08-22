@@ -6445,7 +6445,7 @@ async fn handle_mpu_complete_async(
     };
     if versioning_mode.is_some() {
         let next_sync = async_next_as_blocking(Arc::clone(next));
-        return handle_versioned_put(
+        let resp = handle_versioned_put(
             put,
             cred,
             bucket,
@@ -6461,6 +6461,10 @@ async fn handle_mpu_complete_async(
             &next_sync,
             api,
         );
+        if (200..300).contains(&resp.status) {
+            delete_mpu_marker_async(cred, bucket, key, upload_id, next).await;
+        }
+        return resp;
     }
     match control_head_object_async(cred, bucket, key, next).await {
         Ok(ObjectHead::Present(existing)) => {
@@ -6502,6 +6506,7 @@ async fn handle_mpu_complete_async(
     if !(200..300).contains(&resp.status) {
         return map_swift_error(resp.status, Some(bucket), Some(key));
     }
+    delete_mpu_marker_async(cred, bucket, key, upload_id, next).await;
     let etag = s3_etag.unwrap_or_else(|| {
         resp.headers
             .get("ETag")
@@ -6517,6 +6522,25 @@ async fn handle_mpu_complete_async(
         out.headers.set(HDR_VERSION_ID, version_id);
     }
     out
+}
+
+async fn delete_mpu_marker_async(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    next: &AsyncNextFn,
+) {
+    // Python complete deletes only the `{key}/{uploadId}` marker so a
+    // retry is NoSuchUpload. Parts stay as SLO segments.
+    let segs = segments_container(bucket);
+    let marker = upload_marker_name(key, upload_id);
+    let mut del = make_swift_req(
+        "DELETE",
+        &s3_to_swift_path(&cred.account, Some(&segs), Some(&marker)),
+    );
+    stamp_auth(&mut del, cred);
+    let _ = async_call(next, del).await;
 }
 
 async fn handle_mpu_abort_async(
@@ -9323,6 +9347,7 @@ fn handle_mpu_complete(
     if !(200..300).contains(&resp.status) {
         return map_swift_error(resp.status, Some(bucket), Some(key));
     }
+    delete_mpu_marker(cred, bucket, key, upload_id, next);
     let etag = s3_etag.unwrap_or_else(|| {
         resp.headers
             .get("ETag")
@@ -9338,6 +9363,23 @@ fn handle_mpu_complete(
         out.headers.set(HDR_VERSION_ID, version_id);
     }
     out
+}
+
+fn delete_mpu_marker(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    next: &NextFn,
+) {
+    let segs = segments_container(bucket);
+    let marker = upload_marker_name(key, upload_id);
+    let mut del = make_swift_req(
+        "DELETE",
+        &s3_to_swift_path(&cred.account, Some(&segs), Some(&marker)),
+    );
+    stamp_auth(&mut del, cred);
+    let _ = next(del);
 }
 
 fn handle_mpu_abort(
@@ -12394,6 +12436,14 @@ mod tests {
                     resp.headers.set("Content-Length", "14");
                 }
                 return resp;
+            }
+            if r.method == "DELETE" {
+                assert!(
+                    r.path.contains("mybucket+segments/"),
+                    "complete must DELETE the MPU marker, got {}",
+                    r.path
+                );
+                return Response::new(204);
             }
             assert_eq!(r.method, "PUT");
             assert_eq!(r.path, "/v1/AUTH_test/mybucket/big/obj");
@@ -16103,6 +16153,10 @@ mod tests {
                 }
                 // Data object does not exist yet (no overwrite in play).
                 return Response::new(404);
+            }
+            if r.method == "DELETE" {
+                assert!(r.path.contains("mybucket+segments/"), "{}", r.path);
+                return Response::new(204);
             }
             assert_eq!(r.method, "PUT");
             assert_eq!(r.path, "/v1/AUTH_test/mybucket/obj");

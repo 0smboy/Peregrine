@@ -446,7 +446,12 @@ fn checksum_spec(header: &str) -> Result<ChecksumSpec, ChecksumHeaderErr> {
             algo: "SHA256",
             digest_size: 32,
         }),
-        "x-amz-checksum-crc32c" | "x-amz-checksum-crc64nvme" => {
+        "x-amz-checksum-crc32c" => Ok(ChecksumSpec {
+            header: header.to_string(),
+            algo: "CRC32C",
+            digest_size: 4,
+        }),
+        "x-amz-checksum-crc64nvme" => {
             Err(ChecksumHeaderErr::NotImplemented(header.to_string()))
         }
         _ => Err(ChecksumHeaderErr::InvalidAlgorithm),
@@ -516,15 +521,24 @@ fn collect_checksum(req: &Request) -> Result<Option<(ChecksumSpec, String)>, Che
             }
         }
     }
-    let n = headers.len() + trailers.len();
-    if n > 1 {
+    // Python: trailer list and header dict are cardinality-checked
+    // separately (`headers_and_trailer=False` → "Multiple checksum Types"),
+    // then the sum is checked with `headers_and_trailer=True` (short
+    // message). Duplicate trailers therefore get the long message, while
+    // exactly one header plus one trailer gets the short one.
+    if trailers.len() > 1 {
         return Err(ChecksumHeaderErr::Cardinality {
-            headers_and_trailer: !headers.is_empty() && !trailers.is_empty(),
+            headers_and_trailer: false,
         });
     }
     if headers.len() > 1 {
         return Err(ChecksumHeaderErr::Cardinality {
             headers_and_trailer: false,
+        });
+    }
+    if headers.len() + trailers.len() > 1 {
+        return Err(ChecksumHeaderErr::Cardinality {
+            headers_and_trailer: true,
         });
     }
     let aws_sha256 = header_ci(req, "x-amz-content-sha256").unwrap_or("");
@@ -625,6 +639,7 @@ fn check_checksum_body(req: &Request, body: &[u8]) -> Option<Response> {
 fn checksum_b64(spec: &ChecksumSpec, body: &[u8]) -> String {
     match spec.algo {
         "CRC32" => base64_encode(&crc32_ieee(body).to_be_bytes()),
+        "CRC32C" => base64_encode(&crc32_castagnoli(body).to_be_bytes()),
         "SHA1" => {
             let d = Sha1::digest(body);
             base64_encode(d.as_slice())
@@ -638,25 +653,41 @@ fn checksum_b64(spec: &ChecksumSpec, body: &[u8]) -> String {
 }
 
 fn crc32_ieee(data: &[u8]) -> u32 {
-    let mut hasher = Crc32Hasher::new();
+    let mut hasher = Crc32Hasher::ieee();
+    hasher.update(data);
+    hasher.finalize()
+}
+
+fn crc32_castagnoli(data: &[u8]) -> u32 {
+    let mut hasher = Crc32Hasher::castagnoli();
     hasher.update(data);
     hasher.finalize()
 }
 
 struct Crc32Hasher {
     crc: u32,
+    poly: u32,
 }
 
 impl Crc32Hasher {
-    fn new() -> Self {
-        Self { crc: 0xFFFF_FFFF }
+    fn ieee() -> Self {
+        Self {
+            crc: 0xFFFF_FFFF,
+            poly: 0xEDB8_8320,
+        }
+    }
+    fn castagnoli() -> Self {
+        Self {
+            crc: 0xFFFF_FFFF,
+            poly: 0x82F6_3B78,
+        }
     }
     fn update(&mut self, data: &[u8]) {
         for &b in data {
             self.crc ^= u32::from(b);
             for _ in 0..8 {
                 self.crc = if self.crc & 1 != 0 {
-                    (self.crc >> 1) ^ 0xEDB8_8320
+                    (self.crc >> 1) ^ self.poly
                 } else {
                     self.crc >> 1
                 };
@@ -677,10 +708,14 @@ pub struct PayloadHashTransform {
     md5_header: Option<String>,
     md5_expected_hex: bool,
     crc32: Option<Crc32Hasher>,
+    crc32c: Option<Crc32Hasher>,
     sha1: Option<Sha1>,
     checksum_sha256: Option<Sha256>,
     expected_checksum_b64: Option<String>,
     checksum_algo: Option<String>,
+    content_length: Option<u64>,
+    received: u64,
+    finished: bool,
     slot: Arc<Mutex<Option<Response>>>,
 }
 
@@ -709,6 +744,7 @@ impl PayloadHashTransform {
         let md5 = expected_md5.as_ref().map(|_| Md5Hasher::new());
         let md5_expected_hex = req.method == "PUT";
         let mut crc32 = None;
+        let mut crc32c = None;
         let mut sha1 = None;
         let mut checksum_sha256 = None;
         let mut expected_checksum_b64 = None;
@@ -718,13 +754,19 @@ impl PayloadHashTransform {
                 expected_checksum_b64 = Some(b64);
                 checksum_algo = Some(spec.algo.to_string());
                 match spec.algo {
-                    "CRC32" => crc32 = Some(Crc32Hasher::new()),
+                    "CRC32" => crc32 = Some(Crc32Hasher::ieee()),
+                    "CRC32C" => crc32c = Some(Crc32Hasher::castagnoli()),
                     "SHA1" => sha1 = Some(Sha1::new()),
                     "SHA256" => checksum_sha256 = Some(Sha256::new()),
                     _ => {}
                 }
             }
         }
+        let content_length = header_ci(req, "content-length")
+            .and_then(|s| s.parse().ok())
+            .or_else(|| {
+                header_ci(req, "x-amz-decoded-content-length").and_then(|s| s.parse().ok())
+            });
         Self {
             sha256,
             expected_sha256,
@@ -733,14 +775,81 @@ impl PayloadHashTransform {
             md5_header,
             md5_expected_hex,
             crc32,
+            crc32c,
             sha1,
             checksum_sha256,
             expected_checksum_b64,
             checksum_algo,
+            content_length,
+            received: 0,
+            finished: false,
             slot,
         }
     }
 
+    fn store_err(&self, resp: Response) {
+        if let Ok(mut g) = self.slot.lock() {
+            *g = Some(resp);
+        }
+    }
+
+    fn finalize_payload_errors(&mut self) -> Option<Response> {
+        if self.finished {
+            return None;
+        }
+        self.finished = true;
+        if let (Some(hasher), Some(expected)) =
+            (self.sha256.take(), self.expected_sha256.as_deref())
+        {
+            let computed = hex_encode(&hasher.finalize());
+            if computed != expected.to_ascii_lowercase() {
+                return Some(sha256_mismatch_response(expected, &computed));
+            }
+        }
+        if let (Some(algo), Some(expected)) = (
+            self.checksum_algo.as_deref(),
+            self.expected_checksum_b64.as_deref(),
+        ) {
+            let computed = match algo {
+                "CRC32" => self
+                    .crc32
+                    .take()
+                    .map(|h| base64_encode(&h.finalize().to_be_bytes())),
+                "CRC32C" => self
+                    .crc32c
+                    .take()
+                    .map(|h| base64_encode(&h.finalize().to_be_bytes())),
+                "SHA1" => self
+                    .sha1
+                    .take()
+                    .map(|h| base64_encode(h.finalize().as_slice())),
+                "SHA256" => self
+                    .checksum_sha256
+                    .take()
+                    .map(|h| base64_encode(h.finalize().as_slice())),
+                _ => None,
+            };
+            if let Some(computed) = computed {
+                if computed != expected {
+                    let msg = format!(
+                        "The {algo} you specified did not match the calculated checksum."
+                    );
+                    return Some(s3_error_response("BadDigest", Some(&msg), &[]));
+                }
+            }
+        }
+        if let (Some(hasher), Some(want), Some(hdr)) = (
+            self.md5.take(),
+            self.expected_md5.as_ref(),
+            self.md5_header.as_deref(),
+        ) {
+            let got = hasher.finalize();
+            if got.as_slice() != want.as_slice() {
+                return Some(bad_digest_response(hdr, self.md5_expected_hex));
+            }
+        }
+        None
+    }
 }
 
 impl BodyTransform for PayloadHashTransform {
@@ -756,75 +865,33 @@ impl BodyTransform for PayloadHashTransform {
                 if let Some(h) = self.crc32.as_mut() {
                     h.update(chunk);
                 }
+                if let Some(h) = self.crc32c.as_mut() {
+                    h.update(chunk);
+                }
                 if let Some(h) = self.sha1.as_mut() {
                     h.update(chunk);
                 }
                 if let Some(h) = self.checksum_sha256.as_mut() {
                     h.update(chunk);
                 }
+                self.received = self.received.saturating_add(chunk.len() as u64);
+                // Python ChecksummingInput validates on the read that
+                // reaches Content-Length and withholds that chunk on
+                // mismatch so the PUT never commits.
+                if self
+                    .content_length
+                    .is_some_and(|n| self.received >= n)
+                {
+                    if let Some(resp) = self.finalize_payload_errors() {
+                        self.store_err(resp);
+                        return Err(io::Error::other("s3 payload hash mismatch"));
+                    }
+                }
                 Ok(chunk.to_vec())
             }
             None => {
-                let err = if let (Some(hasher), Some(expected)) =
-                    (self.sha256.take(), self.expected_sha256.as_deref())
-                {
-                    let computed = hex_encode(&hasher.finalize());
-                    if computed != expected.to_ascii_lowercase() {
-                        Some(sha256_mismatch_response(expected, &computed))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                let err = err.or_else(|| {
-                    if let (Some(algo), Some(expected)) = (
-                        self.checksum_algo.as_deref(),
-                        self.expected_checksum_b64.as_deref(),
-                    ) {
-                        let computed = match algo {
-                            "CRC32" => self
-                                .crc32
-                                .take()
-                                .map(|h| base64_encode(&h.finalize().to_be_bytes())),
-                            "SHA1" => self
-                                .sha1
-                                .take()
-                                .map(|h| base64_encode(h.finalize().as_slice())),
-                            "SHA256" => self
-                                .checksum_sha256
-                                .take()
-                                .map(|h| base64_encode(h.finalize().as_slice())),
-                            _ => None,
-                        };
-                        if let Some(computed) = computed {
-                            if computed != expected {
-                                let msg = format!(
-                                    "The {algo} you specified did not match the calculated checksum."
-                                );
-                                return Some(s3_error_response("BadDigest", Some(&msg), &[]));
-                            }
-                        }
-                    }
-                    None
-                });
-                let err = err.or_else(|| {
-                    if let (Some(hasher), Some(want), Some(hdr)) = (
-                        self.md5.take(),
-                        self.expected_md5.as_ref(),
-                        self.md5_header.as_deref(),
-                    ) {
-                        let got = hasher.finalize();
-                        if got.as_slice() != want.as_slice() {
-                            return Some(bad_digest_response(hdr, self.md5_expected_hex));
-                        }
-                    }
-                    None
-                });
-                if let Some(resp) = err {
-                    if let Ok(mut g) = self.slot.lock() {
-                        *g = Some(resp);
-                    }
+                if let Some(resp) = self.finalize_payload_errors() {
+                    self.store_err(resp);
                     return Err(io::Error::other("s3 payload hash mismatch"));
                 }
                 Ok(Vec::new())
@@ -976,5 +1043,83 @@ mod tests {
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
         assert!(body.contains("InvalidRequest"), "{body}");
         assert!(body.contains("x-amz-checksum-crc32"), "{body}");
+    }
+
+    #[test]
+    fn crc32c_of_123456789_matches_aws_vector() {
+        assert_eq!(
+            base64_encode(&crc32_castagnoli(b"123456789").to_be_bytes()),
+            "4waSgw=="
+        );
+    }
+
+    #[test]
+    fn duplicate_trailer_checksums_are_multiple_types() {
+        let mut req = empty_put();
+        req.headers.set("x-amz-sdk-checksum-algorithm", "sha256");
+        req.headers.set("x-amz-checksum-crc32", "y/Q5Jg==");
+        req.headers
+            .set("x-amz-trailer", "x-amz-checksum-crc32, x-amz-checksum-crc32");
+        req.body = Body::Buffered(b"123456789".to_vec());
+        let resp = validate_s3_payload(&mut req, false).unwrap();
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("InvalidRequest"), "{body}");
+        assert!(
+            body.contains("Multiple checksum Types are not allowed."),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn one_header_plus_one_trailer_uses_short_cardinality_message() {
+        let mut req = empty_put();
+        req.headers.set("x-amz-checksum-crc32", "y/Q5Jg==");
+        req.headers.set("x-amz-trailer", "x-amz-checksum-crc32");
+        req.headers.set("x-amz-content-sha256", sha256_hex(b"123456789"));
+        req.body = Body::Buffered(b"123456789".to_vec());
+        let resp = validate_s3_payload(&mut req, false).unwrap();
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("InvalidRequest"), "{body}");
+        assert!(body.contains("Expecting a single x-amz-checksum- header"), "{body}");
+        assert!(
+            !body.contains("Multiple checksum Types"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn v2_streaming_decoded_shorter_than_content_length_is_incomplete_body() {
+        let mut req = empty_put();
+        req.headers
+            .set("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER");
+        req.headers.set("x-amz-decoded-content-length", "9");
+        req.headers.set("Content-Length", "15");
+        req.body = Body::Buffered(b"9\r\n1234567890\r\n".to_vec());
+        let resp = validate_s3_payload(&mut req, false).unwrap();
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("IncompleteBody"), "{body}");
+        assert!(
+            body.contains(
+                "<Message>You did not provide the number of bytes specified by the Content-Length HTTP header</Message>"
+            ),
+            "{body}"
+        );
+        assert!(!body.contains("HTTP header.</Message>"), "{body}");
+        assert!(body.contains("<NumberBytesExpected>9</NumberBytesExpected>"), "{body}");
+        assert!(body.contains("<NumberBytesProvided>15</NumberBytesProvided>"), "{body}");
+    }
+
+    #[test]
+    fn streaming_bad_crc32_rejects_completing_chunk() {
+        let mut req = empty_put();
+        req.headers.set("x-amz-checksum-crc32", "z/Q5Jg==");
+        req.headers.set("Content-Length", "9");
+        let slot = Arc::new(Mutex::new(None));
+        let mut xform = PayloadHashTransform::from_request(&req, Arc::clone(&slot));
+        assert!(xform.push(Some(b"123456789")).is_err());
+        let resp = slot.lock().unwrap().take().expect("BadDigest slot");
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("BadDigest"), "{body}");
+        assert!(body.contains("CRC32"), "{body}");
     }
 }

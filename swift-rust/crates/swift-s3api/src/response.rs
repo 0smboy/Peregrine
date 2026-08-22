@@ -206,7 +206,8 @@ pub fn error_status_and_message(code: &str) -> (u16, &'static str) {
         ),
         "IncompleteBody" => (
             400,
-            "You did not provide the number of bytes specified by the Content-Length HTTP header.",
+            // Python s3response.IncompleteBody._msg has no trailing period.
+            "You did not provide the number of bytes specified by the Content-Length HTTP header",
         ),
         "InternalError" => (500, "We encountered an internal error. Please try again."),
         "InvalidAccessKeyId" => (
