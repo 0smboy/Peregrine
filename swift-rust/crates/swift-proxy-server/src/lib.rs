@@ -2515,7 +2515,10 @@ impl ProxyApp {
         let segs: Vec<&str> = areq.path.splitn(5, '/').collect();
         if matches!(segs.get(1), Some(&"v1") | Some(&"v1.0"))
             && !segs.get(2).is_some_and(|s| !s.is_empty())
+            && segs.len() <= 3
         {
+            // PUT /v1 or /v1/ → 412 Bad URL. Empty-account paths with later
+            // segments (`/v1//c/o`) stay 404 like Python.
             return text_response(412, "Bad URL");
         }
         let v1 = segs.len() >= 3
@@ -6388,6 +6391,16 @@ mod cors_tests {
             _ => String::new(),
         };
         assert!(body.contains("Bad URL"), "body={body:?}");
+        let empty_acct = app
+            .handle_async(swift_http::AsyncRequest {
+                method: "GET".into(),
+                path: "/v1//testc/testo".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_ne!(empty_acct.status, 412, "empty-account object path must not be Bad URL");
         let info = app
             .handle_async(swift_http::AsyncRequest {
                 method: "GET".into(),
