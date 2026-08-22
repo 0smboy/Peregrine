@@ -439,7 +439,7 @@ impl TempAuth {
         // Deny: 401 for an anonymous request (so a client can authenticate),
         // 403 for an authenticated user who simply lacks access.
         if user_groups.is_empty() {
-            Some(Self::unauthorized(account))
+            Some(Self::unauthorized(&wsgi_quote_realm(account)))
         } else {
             Some(Self::forbidden())
         }
@@ -738,6 +738,26 @@ mod tests {
             resp.headers.get("Www-Authenticate"),
             Some("Swift realm=\"AUTH_haxx%22%0AContent-Length%3A%2014\"")
         );
+    }
+
+    #[test]
+    fn test_anonymous_quoted_path_realm_has_no_crlf() {
+        let mut owner = false;
+        let denial = TempAuth::authorize_acl(
+            "GET",
+            "/v1/AUTH_haxx\"\nContent-Length: 14\n\n<b>Hello World",
+            &[],
+            None,
+            None,
+            "AUTH_",
+            None,
+            &mut owner,
+        )
+        .expect("anonymous");
+        let www = denial.headers.get("Www-Authenticate").unwrap();
+        assert!(!www.contains('\n') && !www.contains('\r'), "{www}");
+        assert!(www.contains("%22") && www.contains("%0A"), "{www}");
+        assert_eq!(denial.status, 401);
     }
 
     #[test]
