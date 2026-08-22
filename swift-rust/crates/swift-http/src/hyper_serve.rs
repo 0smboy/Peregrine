@@ -399,6 +399,31 @@ async fn serve_ssync_handoff(
             Duration::from_secs(config.max_upload_time_secs),
         ));
     }
+    let trans_id = {
+        if let Some(id) = headers.get("X-Trans-Id").filter(|s| !s.is_empty()) {
+            id.to_string()
+        } else {
+            let id = format!(
+                "tx-ssync-{:016x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0)
+            );
+            headers.set("X-Trans-Id", &id);
+            id
+        }
+    };
+    let metrics = config
+        .metrics
+        .clone()
+        .unwrap_or_else(ConcurrencyMetrics::new);
+    metrics.record_http_request_hyper();
+    if service.is_legacy_sync_handler() {
+        metrics.record_legacy_sync_handler_request();
+    } else {
+        metrics.record_native_async_request();
+    }
     let areq = AsyncRequest {
         method,
         path,
@@ -406,7 +431,10 @@ async fn serve_ssync_handoff(
         headers,
         body,
     };
-    let response = service.call(areq).await;
+    let mut response = service.call(areq).await;
+    if response.headers.get("X-Trans-Id").is_none() {
+        response.headers.set("X-Trans-Id", trans_id);
+    }
     write_chunked_http_response(&mut wh, response).await
 }
 

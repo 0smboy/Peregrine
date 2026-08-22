@@ -974,6 +974,12 @@ impl ObjectServer {
         if declared_len.is_some_and(|len| len > MAX_FILE_SIZE as u64) {
             return plain_response(413, "Your request is too large.");
         }
+        if let Ok(free) = swift_core::fsutil::free_bytes(&self.config.devices.join(&drive)) {
+            if fallocate_reserve_breached(free, declared_len.unwrap_or(0), &self.fallocate_reserve)
+            {
+                return swob_response(507);
+            }
+        }
         let df = match self.diskfile_for(
             &drive,
             part,
@@ -1037,6 +1043,13 @@ impl ObjectServer {
                     .await
                 {
                     Ok(Ok(w)) => w,
+                    Ok(Err(DiskFileError::NoSpace)) => return swob_response(507),
+                    Ok(Err(DiskFileError::Io(e))) if e.raw_os_error() == Some(28) => {
+                        return swob_response(507)
+                    }
+                    Ok(Err(DiskFileError::Io(_))) => {
+                        return plain_response(500, "disk I/O error")
+                    }
                     Ok(Err(e)) => return plain_response(500, &e.to_string()),
                     Err(e) => return plain_response(500, &e.to_string()),
                 };
@@ -4298,6 +4311,240 @@ mod fallocate_reserve_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn tmp_files(devices: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let walk = |dir: &Path, acc: &mut Vec<PathBuf>| {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if p.is_dir() {
+                    // recurse one extra level for objects/tmp
+                    if let Ok(rd2) = std::fs::read_dir(&p) {
+                        for e2 in rd2.flatten() {
+                            let p2 = e2.path();
+                            if p2.is_file()
+                                && p2
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .is_some_and(|n| n.contains(".data") || n.starts_with('.'))
+                            {
+                                acc.push(p2);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        if let Ok(rd) = std::fs::read_dir(devices) {
+            for ent in rd.flatten() {
+                walk(&ent.path(), &mut out);
+            }
+        }
+        out
+    }
+
+    fn async_put(
+        ts: &str,
+        name: &str,
+        body: swift_http::IncomingBody,
+        content_length: Option<u64>,
+    ) -> AsyncRequest {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Timestamp", ts);
+        headers.set("Content-Type", "application/octet-stream");
+        if let Some(n) = content_length {
+            headers.set("Content-Length", n);
+        }
+        AsyncRequest {
+            method: "PUT".into(),
+            path: format!("/sda1/0/AUTH_test/c/{name}"),
+            query_string: String::new(),
+            headers,
+            body,
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_put_client_disconnect_is_499_and_leaves_no_object() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-disc-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(4);
+        let put = tokio::spawn({
+            let server = ObjectServer::new(server.config.clone());
+            async move {
+                server
+                    .handle_async(async_put(
+                        "4001",
+                        "disc-o",
+                        swift_http::IncomingBody::from_channel(rx, Some(1_048_576), None, u64::MAX),
+                        Some(1_048_576),
+                    ))
+                    .await
+            }
+        });
+        tx.send(Ok(b"partial".to_vec())).await.unwrap();
+        drop(tx);
+        let resp = put.await.unwrap();
+        assert_eq!(resp.status, 499, "disconnect must not 2xx {}", resp.status);
+        assert_eq!(server.handle(get_named("disc-o")).status, 404);
+        assert!(
+            tmp_files(&dir).is_empty(),
+            "disconnect must not leave tmp: {:?}",
+            tmp_files(&dir)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn streaming_put_retry_overwrites_same_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-retry-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        for (ts, body) in [("5001", b"first".as_slice()), ("5002", b"second-wins".as_slice())] {
+            let resp = server
+                .handle_async(async_put(
+                    ts,
+                    "retry-o",
+                    swift_http::IncomingBody::from_bytes(body.to_vec(), u64::MAX),
+                    Some(body.len() as u64),
+                ))
+                .await;
+            assert_eq!(resp.status, 201, "{}", resp.reason);
+        }
+        let mut got = server.handle(get_named("retry-o"));
+        assert_eq!(got.status, 200);
+        assert_eq!(got.body.materialize(u64::MAX).unwrap(), b"second-wins");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn streaming_put_partial_content_length_is_499_no_commit() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-partial-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let resp = server
+            .handle_async(async_put(
+                "5003",
+                "partial-o",
+                swift_http::IncomingBody::from_bytes(b"short".to_vec(), u64::MAX),
+                Some(64),
+            ))
+            .await;
+        assert_eq!(resp.status, 499, "short body vs Content-Length must 499");
+        assert_eq!(server.handle(get_named("partial-o")).status, 404);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn streaming_put_enospc_reserve_is_507_no_object() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-enospc-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let full = tiny_server(&dir, FallocateReserve::Bytes(i64::MAX));
+        let resp = full
+            .handle_async(async_put(
+                "5004",
+                "full-o",
+                swift_http::IncomingBody::from_bytes(b"body".to_vec(), u64::MAX),
+                Some(4),
+            ))
+            .await;
+        assert_eq!(resp.status, 507, "ENOSPC reserve must 507, got {}", resp.status);
+        assert_eq!(full.handle(get_named("full-o")).status, 404);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_put_commit_survives_http_waiter_drop() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-barrier-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1)).with_commit_stall({
+            let entered = std::sync::Arc::clone(&entered);
+            let release = std::sync::Arc::clone(&release);
+            std::sync::Arc::new(move || {
+                entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            })
+        });
+        let put = tokio::spawn({
+            let server = ObjectServer::new(server.config.clone()).with_commit_stall({
+                let entered = std::sync::Arc::clone(&entered);
+                let release = std::sync::Arc::clone(&release);
+                std::sync::Arc::new(move || {
+                    entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                    while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                })
+            });
+            async move {
+                server
+                    .handle_async(async_put(
+                        "5005",
+                        "barrier-o",
+                        swift_http::IncomingBody::from_bytes(b"shielded".to_vec(), u64::MAX),
+                        Some(8),
+                    ))
+                    .await
+            }
+        });
+        let start = std::time::Instant::now();
+        while !entered.load(std::sync::atomic::Ordering::SeqCst)
+            && start.elapsed() < std::time::Duration::from_secs(2)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            entered.load(std::sync::atomic::Ordering::SeqCst),
+            "commit stall must run"
+        );
+        put.abort();
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        while start.elapsed() < std::time::Duration::from_secs(3) {
+            if server.handle(get_named("barrier-o")).status == 200 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let got = server.handle(get_named("barrier-o"));
+        assert_eq!(
+            got.status, 200,
+            "DurabilityBarrier must finish commit after HTTP waiter drop"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Range: swob `Range.ranges_for_length` (tests/golden.rs vs Python).
     /// If-None-Match 304: swob `_get_conditional_response_status` order.
     #[tokio::test]
@@ -4773,9 +5020,11 @@ mod fallocate_reserve_tests {
         let addr = listener.local_addr().unwrap();
         let shutdown = std::sync::Arc::new(AtomicBool::new(false));
         let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let metrics = swift_runtime::ConcurrencyMetrics::new();
         let cfg = ServerConfig {
             worker_threads: 2,
             shutdown: Some(std::sync::Arc::clone(&shutdown)),
+            metrics: Some(metrics.clone()),
             ..ServerConfig::default()
         };
         thread::spawn(move || serve_with_config(listener, server, cfg));
@@ -4824,6 +5073,19 @@ mod fallocate_reserve_tests {
             head_s.to_ascii_lowercase().contains("x-backend-accept-no-commit: true"),
             "obj/server.py:1406-1415 {head_s:?}"
         );
+        assert!(
+            head_s.to_ascii_lowercase().contains("x-trans-id:"),
+            "SSYNC response must carry X-Trans-Id for G3 traces, got {head_s:?}"
+        );
+        let snap = metrics.snapshot();
+        assert!(
+            snap.native_async_requests_total >= 1,
+            "SSYNC handoff must increment native_async, got {}",
+            snap.native_async_requests_total
+        );
+        assert_eq!(snap.legacy_sync_handler_requests_total, 0);
+        assert_eq!(snap.block_in_place_total, 0);
+        assert_eq!(snap.blocking_network_wait_total, 0);
 
         // Same listener, 2 workers: a health GET must complete while this
         // SSYNC session still holds the client fd waiting for MISSING_CHECK.
