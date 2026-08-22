@@ -6332,7 +6332,6 @@ async fn handle_mpu_complete_async(
     if let Some(resp) = reject_unsupported_put_conditionals(&req) {
         return resp;
     }
-    let if_none_match = req.headers.get("If-None-Match").map(str::to_string);
     let bypass_requested = bypass_governance_requested(
         req.headers
             .get(HDR_BYPASS_GOVERNANCE)
@@ -6413,9 +6412,8 @@ async fn handle_mpu_complete_async(
     put.headers
         .set("Content-Length", manifest.len().to_string());
     put.body = Body::from(manifest);
-    if let Some(ref inm) = if_none_match {
-        put.headers.set("If-None-Match", inm);
-    }
+    // Python complete MPU accepts If-None-Match:* but does not forward it
+    // onto the SLO PUT (manifest PUT 400s on If-None-Match).
     if put.headers.get(SYS_LOCK_MODE).is_some() || put.headers.get(SYS_RETAIN_UNTIL).is_some() {
         if let Some(denied) = iam_action_check(&api.iam, cred, "s3:PutObjectRetention", bucket, key)
         {
@@ -6484,9 +6482,6 @@ async fn handle_mpu_complete_async(
         return resp;
     }
     strip_s3_only_headers(&mut put.headers);
-    if let Some(ref inm) = if_none_match {
-        put.headers.set("If-None-Match", inm);
-    }
     let (st, hdrs) = match head_container_async(cred, bucket, next, &api.container_heads).await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -9189,7 +9184,6 @@ fn handle_mpu_complete(
     if let Some(resp) = reject_unsupported_put_conditionals(&req) {
         return resp;
     }
-    let if_none_match = req.headers.get("If-None-Match").map(str::to_string);
     let bypass_requested = bypass_governance_requested(
         req.headers
             .get(HDR_BYPASS_GOVERNANCE)
@@ -9274,9 +9268,6 @@ fn handle_mpu_complete(
     put.headers
         .set("Content-Length", manifest.len().to_string());
     put.body = Body::from(manifest);
-    if let Some(ref inm) = if_none_match {
-        put.headers.set("If-None-Match", inm);
-    }
 
     if put.headers.get(SYS_LOCK_MODE).is_some() || put.headers.get(SYS_RETAIN_UNTIL).is_some() {
         if let Some(denied) = iam_action_check(&api.iam, cred, "s3:PutObjectRetention", bucket, key)
@@ -9332,9 +9323,6 @@ fn handle_mpu_complete(
             return resp;
         }
         strip_s3_only_headers(&mut put.headers);
-        if let Some(ref inm) = if_none_match {
-            put.headers.set("If-None-Match", inm);
-        }
         maybe_apply_lifecycle_on_put(&mut put, cred, bucket, key, next, &api.container_heads);
         if let Err(resp) =
             apply_bucket_default_retention(&mut put, cred, bucket, next, &api.container_heads)
