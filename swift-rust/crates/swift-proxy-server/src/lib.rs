@@ -4980,7 +4980,12 @@ impl ProxyApp {
                 || kl == "x-timestamp"
                 || kl == "last-modified"
                 || kl == "x-backend-timestamp"
-                || (kl.starts_with("x-object-meta-") && kl.len() > "x-object-meta-".len());
+                || kl == "x-delete-at"
+                || kl == "content-encoding"
+                || kl == "content-disposition"
+                || (kl.starts_with("x-object-meta-") && kl.len() > "x-object-meta-".len())
+                || kl.starts_with("x-object-sysmeta-")
+                || kl.starts_with("x-object-transient-sysmeta-");
             if keep
                 && !(kl == "content-type"
                     && resp.status == 206

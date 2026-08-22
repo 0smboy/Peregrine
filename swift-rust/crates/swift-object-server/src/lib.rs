@@ -2521,7 +2521,7 @@ impl ObjectServer {
             Err(e) => return plain_response(500, &e.to_string()),
         };
         let orig = match df.open(None) {
-            Ok(df) => df,
+            Ok(opened) => opened,
             Err(DiskFileError::NotExist) | Err(DiskFileError::Deleted { .. }) => {
                 return swob_response(404)
             }
@@ -2594,6 +2594,22 @@ impl ObjectServer {
             .and_then(|m| meta_get(m, "ETag"))
             .unwrap_or("")
             .to_string();
+        let orig_sysmeta: Vec<(String, String)> = orig
+            .get_metadata()
+            .ok()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| match (k, v) {
+                        (MetaValue::Str(key), MetaValue::Str(value))
+                            if key.to_ascii_lowercase().starts_with("x-object-sysmeta-") =>
+                        {
+                            Some((key.clone(), value.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let data_timestamp = orig
             .data_timestamp()
             .unwrap_or_else(|_| "0".parse().unwrap());
@@ -2690,7 +2706,7 @@ impl ObjectServer {
         // server.py 755-768: when the winning content-type is not the
         // datafile's, the datafile content-type may carry a swift_bytes param
         // (appended by SLO) that must continue to ride the container update.
-        let mut update_ctype = resolved_ctype;
+        let mut update_ctype = resolved_ctype.clone();
         if resolved_ctype_timestamp != data_timestamp {
             let (_, swift_bytes) = extract_swift_bytes(&datafile_content_type);
             if let Some(swift_bytes) = swift_bytes {
@@ -2725,13 +2741,21 @@ impl ObjectServer {
             policy_index,
         );
 
-        // swob HTTPAccepted default body
+        // Python server.py POST: HTTPAccepted plus orig_metadata sysmeta so
+        // symlink middleware can see X-Object-Sysmeta-Symlink-* and 307.
         let mut resp = Response::with_body(
             202,
             b"<html><h1>Accepted</h1><p>The request is accepted for processing.</p></html>"
                 .to_vec(),
         );
         resp.headers.set("Content-Type", "text/html; charset=UTF-8");
+        if !resolved_ctype.is_empty() {
+            resp.headers
+                .set("X-Backend-Content-Type", resolved_ctype.as_str());
+        }
+        for (key, value) in orig_sysmeta {
+            resp.headers.set(&key, value);
+        }
         resp
     }
 
@@ -4861,6 +4885,48 @@ mod fallocate_reserve_tests {
             matches!(del.status, 204 | 200),
             "DELETE status {}",
             del.status
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn post_echoes_object_sysmeta_for_symlink() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-post-sysmeta-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let mut put_h = HeaderKeyDict::new();
+        put_h.set("X-Timestamp", "4001");
+        put_h.set("Content-Type", "application/symlink");
+        put_h.set("Content-Length", 0);
+        put_h.set("X-Object-Sysmeta-Symlink-Target", "c2/obj");
+        let put = server.handle(Request {
+            method: "PUT".into(),
+            path: "/sda1/0/AUTH_test/c/link".into(),
+            query_string: String::new(),
+            headers: put_h,
+            body: Body::empty(),
+        });
+        assert_eq!(put.status, 201, "{}", put.reason);
+        let mut post_h = HeaderKeyDict::new();
+        post_h.set("X-Timestamp", "4002");
+        post_h.set("Content-Type", "application/foo");
+        let post = server.handle(Request {
+            method: "POST".into(),
+            path: "/sda1/0/AUTH_test/c/link".into(),
+            query_string: String::new(),
+            headers: post_h,
+            body: Body::empty(),
+        });
+        assert_eq!(post.status, 202, "{}", post.reason);
+        assert_eq!(
+            post.headers.get("X-Object-Sysmeta-Symlink-Target"),
+            Some("c2/obj"),
+            "POST must echo symlink sysmeta so the proxy can 307"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

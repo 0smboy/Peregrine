@@ -130,8 +130,13 @@ fn is_copied_source_header(name: &str) -> bool {
     lname == "content-type"
         || lname == "content-encoding"
         || lname == "content-disposition"
+        || lname == "x-delete-at"
         || lname.starts_with("x-object-meta-")
         || lname.starts_with("x-object-sysmeta-")
+        // After `?symlink=get`, sysmeta is converted to X-Symlink-*; Python
+        // copy_header_subset still carries those onto the dest PUT so the
+        // dest is a symlink, not a 0-byte regular object.
+        || lname.starts_with("x-symlink-")
 }
 
 /// True when the client asked for a raw-manifest copy
@@ -591,6 +596,41 @@ mod tests {
         assert_eq!(
             calls[0].path,
             "/v1/AUTH_test/srcc/object name with %-sign 🙂"
+        );
+    }
+
+    #[test]
+    fn test_copy_carries_symlink_user_headers() {
+        // COPY ?symlink=get: source GET returns X-Symlink-Target (sysmeta
+        // already converted). Dest PUT must keep that header.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let app: NextFn = Arc::new(move |mut r: Request| {
+            let is_get = r.method == "GET";
+            r.body.materialize(u64::MAX).unwrap();
+            log2.lock().unwrap().push(r);
+            if is_get {
+                let mut resp = Response::with_body(200, Vec::new());
+                resp.headers.set("Content-Type", "application/symlink");
+                resp.headers.set("X-Symlink-Target", "tgtc/tgto");
+                resp
+            } else {
+                Response::new(201)
+            }
+        });
+        let c = Copy::new();
+        let r = req(
+            "PUT",
+            "/v1/AUTH_test/dstc/link2",
+            &[("X-Copy-From", "/srcc/link")],
+        );
+        let resp = c.handle(r, &app);
+        assert_eq!(resp.status, 201);
+        let calls = log.lock().unwrap();
+        let dest_put = calls.iter().find(|c| c.method == "PUT").unwrap();
+        assert_eq!(
+            dest_put.headers.get("X-Symlink-Target"),
+            Some("tgtc/tgto")
         );
     }
 

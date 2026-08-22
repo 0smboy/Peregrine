@@ -1205,9 +1205,25 @@ impl ProxyApp {
             let is_head = req.method == "HEAD";
             let mut headers = self.backend_headers(req, false, "object");
             headers.set("X-Backend-Storage-Policy-Index", policy_index);
-            if let Some(v) = req.headers.get("X-Open-Expired") {
-                headers.set("X-Open-Expired", v.to_string());
+            for h in [
+                "Range",
+                "If-Match",
+                "If-None-Match",
+                "If-Modified-Since",
+                "If-Unmodified-Since",
+                "X-Newest",
+                "X-Open-Expired",
+                "X-Backend-Ignore-Range-If-Metadata-Present",
+            ] {
+                if let Some(v) = req.headers.get(h) {
+                    headers.set(h, v.to_string());
+                }
             }
+            let range_hdr = req.headers.get("Range").map(str::to_string);
+            let ignore_hdr = req
+                .headers
+                .get("X-Backend-Ignore-Range-If-Metadata-Present")
+                .map(str::to_string);
             self.ec_get_async_inner(
                 is_head,
                 headers,
@@ -1216,6 +1232,8 @@ impl ProxyApp {
                 object_ring,
                 object_part,
                 ec,
+                range_hdr,
+                ignore_hdr,
             )
             .await
         }
@@ -1231,6 +1249,8 @@ impl ProxyApp {
         object_ring: &swift_ring::Ring,
         object_part: u32,
         ec: super::EcPolicyParams,
+        range_hdr: Option<String>,
+        ignore_hdr: Option<String>,
     ) -> Response {
         use swift_ec::EcDriver;
         let nodes = self.iter_nodes(object_ring, object_part);
@@ -1295,7 +1315,13 @@ impl ProxyApp {
             let keep = kl == "content-type"
                 || kl == "x-timestamp"
                 || kl == "last-modified"
-                || (kl.starts_with("x-object-meta-") && kl.len() > "x-object-meta-".len());
+                || kl == "x-backend-timestamp"
+                || kl == "x-delete-at"
+                || kl == "content-encoding"
+                || kl == "content-disposition"
+                || (kl.starts_with("x-object-meta-") && kl.len() > "x-object-meta-".len())
+                || kl.starts_with("x-object-sysmeta-")
+                || kl.starts_with("x-object-transient-sysmeta-");
             if keep {
                 resp.headers.set(k, v);
             }
@@ -1303,8 +1329,64 @@ impl ProxyApp {
         if !ec_etag.is_empty() {
             resp.headers.set("ETag", &ec_etag);
         }
-        resp.headers.set("Content-Length", orig_size);
         resp.headers.set("Accept-Ranges", "bytes");
+        let ignore_range = ignore_hdr
+            .as_deref()
+            .map(|names| {
+                names
+                    .split(',')
+                    .any(|name| resp_header(&meta, name.trim()).is_some())
+            })
+            .unwrap_or(false);
+        let byte_range = if is_head || ignore_range {
+            None
+        } else {
+            range_hdr
+                .as_deref()
+                .and_then(|h| swift_http::Range::parse(h).ok())
+                .and_then(|r| r.ranges_for_length(Some(orig_size as u64)))
+                .and_then(|ranges| match ranges.as_slice() {
+                    [(a, b)] if *a < *b => Some((*a, *b)),
+                    [] => {
+                        // unsatisfiable
+                        None
+                    }
+                    _ => None,
+                })
+        };
+        if !ignore_range {
+            if let Some(h) = range_hdr.as_deref() {
+                if let Ok(parsed) = swift_http::Range::parse(h) {
+                    if let Some(ranges) = parsed.ranges_for_length(Some(orig_size as u64)) {
+                        if ranges.is_empty() {
+                            let body = concat!(
+                                "<html><h1>Requested Range Not Satisfiable</h1>",
+                                "<p>The Range requested is not available.</p></html>"
+                            );
+                            let mut r416 = Response::with_body(416, body.as_bytes().to_vec());
+                            r416.headers
+                                .set("Content-Range", format!("bytes */{orig_size}"));
+                            r416.headers.set("Content-Type", "text/html; charset=UTF-8");
+                            r416.headers.set("Accept-Ranges", "bytes");
+                            if !ec_etag.is_empty() {
+                                r416.headers.set("ETag", &ec_etag);
+                            }
+                            return r416;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((start, end)) = byte_range {
+            resp.status = 206;
+            resp.headers.set(
+                "Content-Range",
+                format!("bytes {start}-{}/{orig_size}", end.saturating_sub(1)),
+            );
+            resp.headers.set("Content-Length", end.saturating_sub(start));
+        } else {
+            resp.headers.set("Content-Length", orig_size);
+        }
         if is_head {
             return resp;
         }
@@ -1315,10 +1397,21 @@ impl ProxyApp {
         let idle = self.config.node_timeout;
         let mut heads: Vec<AsyncBackendHead> = sources.into_values().take(ec.ndata).collect();
         let seg_sizes = super::ec_segment_sizes(orig_size, ec.segment_size);
+        let (skip, take) = byte_range
+            .map(|(s, e)| (s, e.saturating_sub(s)))
+            .unwrap_or((0, u64::MAX));
+        let response_len = byte_range
+            .map(|(s, e)| e.saturating_sub(s))
+            .unwrap_or(orig_size as u64);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let scope = TaskScope::bounded(1);
         let _ = scope.spawn(async move {
+            let mut skipped = 0u64;
+            let mut sent = 0u64;
             for seg_len in seg_sizes {
+                if sent >= take {
+                    break;
+                }
                 let frag_len = driver.fragment_size(seg_len);
                 let mut frags: Vec<Vec<u8>> = Vec::with_capacity(heads.len());
                 for head in &mut heads {
@@ -1333,7 +1426,20 @@ impl ProxyApp {
                 match driver.decode(&frags) {
                     Ok(mut decoded) => {
                         decoded.truncate(seg_len);
-                        if tx.send(Ok(decoded)).await.is_err() {
+                        let mut slice = decoded;
+                        if skipped < skip {
+                            let drop = (skip - skipped).min(slice.len() as u64) as usize;
+                            skipped += drop as u64;
+                            if drop >= slice.len() {
+                                continue;
+                            }
+                            slice = slice[drop..].to_vec();
+                        }
+                        if sent + slice.len() as u64 > take {
+                            slice.truncate((take - sent) as usize);
+                        }
+                        sent += slice.len() as u64;
+                        if tx.send(Ok(slice)).await.is_err() {
                             return;
                         }
                     }
@@ -1346,7 +1452,7 @@ impl ProxyApp {
                 }
             }
         });
-        resp.body = Body::from_channel(rx, Some(orig_size as u64), scope);
+        resp.body = Body::from_channel(rx, Some(response_len), scope);
         resp
     }
 
@@ -2667,8 +2773,10 @@ fn is_copied_source_header(name: &str) -> bool {
     lname == "content-type"
         || lname == "content-encoding"
         || lname == "content-disposition"
+        || lname == "x-delete-at"
         || lname.starts_with("x-object-meta-")
         || lname.starts_with("x-object-sysmeta-")
+        || lname.starts_with("x-symlink-")
 }
 
 fn body_to_incoming(body: Body) -> IncomingBody {
