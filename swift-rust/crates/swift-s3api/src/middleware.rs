@@ -4741,6 +4741,17 @@ fn complete_mpu_already_uploaded(
     }
 }
 
+/// AWS/Python: If-None-Match:* on CompleteMultipartUpload is create-only.
+/// Python leaves the header on the SLO PUT so object-server 412s when dest
+/// exists. We must not put it on the SLO request: segment HEADs would inherit
+/// it and 304/400. Enforce the 412 here instead, then PUT without the header.
+fn complete_mpu_if_none_match_conflict(dest: ObjectHead) -> Option<Response> {
+    match dest {
+        ObjectHead::Present(_) => Some(s3_error_response("PreconditionFailed", None, &[])),
+        ObjectHead::Missing => None,
+    }
+}
+
 /// Account-level (bucket=None) request with a method the Python s3api
 /// ServiceController does not implement → the byte-aligned Python reject.
 ///
@@ -6424,6 +6435,7 @@ async fn handle_mpu_complete_async(
         Err(resp) => return resp,
     };
     let location = complete_object_location(&req, bucket, key);
+    let if_none_match_star = req.headers.get("If-None-Match") == Some("*");
     let body = match req.body.into_vec(MAX_CONTROL_BODY) {
         Ok(b) => b,
         Err(_) => return s3_error_response("IncompleteBody", None, &[]),
@@ -6446,6 +6458,16 @@ async fn handle_mpu_complete_async(
         &location,
     ) {
         return resp;
+    }
+    if if_none_match_star {
+        match control_head_object_async(cred, bucket, key, next).await {
+            Ok(head) => {
+                if let Some(resp) = complete_mpu_if_none_match_conflict(head) {
+                    return resp;
+                }
+            }
+            Err(resp) => return resp,
+        }
     }
     let mut sized: Vec<(u32, String, u64)> = Vec::new();
     for (num, etag) in &parts {
@@ -9286,6 +9308,7 @@ fn handle_mpu_complete(
         Err(resp) => return resp,
     };
     let location = complete_object_location(&req, bucket, key);
+    let if_none_match_star = req.headers.get("If-None-Match") == Some("*");
     let body = match req.body.into_vec(MAX_CONTROL_BODY) {
         Ok(b) => b,
         Err(_) => return s3_error_response("IncompleteBody", None, &[]),
@@ -9308,6 +9331,16 @@ fn handle_mpu_complete(
         &location,
     ) {
         return resp;
+    }
+    if if_none_match_star {
+        match control_head_object(cred, bucket, key, next) {
+            Ok(head) => {
+                if let Some(resp) = complete_mpu_if_none_match_conflict(head) {
+                    return resp;
+                }
+            }
+            Err(resp) => return resp,
+        }
     }
     // HEAD each part for size.
     let mut sized: Vec<(u32, String, u64)> = Vec::new();
@@ -12698,6 +12731,72 @@ mod tests {
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
         assert!(body.contains("CompleteMultipartUploadResult"), "{body}");
         assert_eq!(puts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn complete_mpu_if_none_match_star_existing_object_is_412() {
+        // New upload against a key that already has an object: If-None-Match:*
+        // must 412 before the SLO PUT (Python object-server PreconditionFailed).
+        let api = S3Api::new(cred_map());
+        let uid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut req = base_s3_req("POST", "/mybucket/big/obj", &format!("uploadId={uid}"));
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.headers.set("If-None-Match", "*");
+        req.body = Body::from(complete_two_part_xml());
+        let req = sign_request(req, "testing");
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            if r.method == "HEAD"
+                && r.path == format!("/v1/AUTH_test/mybucket+segments/big/obj/{uid}")
+            {
+                return Response::new(200);
+            }
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket/big/obj" {
+                return Response::new(200);
+            }
+            if r.method == "PUT" {
+                panic!("If-None-Match:* complete must not rewrite dest, {}", r.path);
+            }
+            Response::new(404)
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 412);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("PreconditionFailed"), "{body}");
+    }
+
+    #[test]
+    fn complete_mpu_async_if_none_match_star_existing_object_is_412() {
+        let api = S3Api::new(cred_map());
+        let uid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut req = base_s3_req("POST", "/mybucket/big/obj", &format!("uploadId={uid}"));
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.headers.set("If-None-Match", "*");
+        req.body = Body::from(complete_two_part_xml());
+        let req = sign_request(req, "testing");
+        let next = async_ok(move |r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            if r.method == "HEAD"
+                && r.path == format!("/v1/AUTH_test/mybucket+segments/big/obj/{uid}")
+            {
+                return Response::new(200);
+            }
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket/big/obj" {
+                return Response::new(200);
+            }
+            if r.method == "PUT" {
+                panic!("If-None-Match:* complete must not rewrite dest, {}", r.path);
+            }
+            Response::new(404)
+        });
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 412);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("PreconditionFailed"), "{body}");
     }
 
     #[test]
