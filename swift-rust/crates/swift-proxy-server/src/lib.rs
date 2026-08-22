@@ -558,6 +558,7 @@ fn swob_response(status: u16) -> Response {
         503 => "The server is currently unavailable. Please try again at a later time.",
         501 => "The requested method is not implemented by this server.",
         412 => "A precondition for this request was not met.",
+        409 => "There was a conflict when trying to complete your request.",
         400 => "The server could not comply with the request since it is either malformed or otherwise incorrect.",
         422 => "Unable to process the contained instructions",
         _ => "",

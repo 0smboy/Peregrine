@@ -352,7 +352,10 @@ fn expand_segments(
         if let Some(b64) = &seg.data_b64 {
             let raw = B64
                 .decode(b64.as_bytes())
-                .map_err(|_| Response::error(409, "Conflict"))?;
+                .map_err(|_| Response::error(
+                    409,
+                    "There was a conflict when trying to complete your request.",
+                ))?;
             let length = raw.len() as i64;
             if length <= 0 {
                 continue;
@@ -367,26 +370,41 @@ fn expand_segments(
         }
         if seg.sub_slo {
             if depth >= MAX_SLO_RECURSION_DEPTH {
-                return Err(Response::error(409, "Conflict"));
+                return Err(Response::error(
+                    409,
+                    "There was a conflict when trying to complete your request.",
+                ));
             }
             let path = format!("/{version}/{account}{}", seg.name);
             let sub = slo_subreq(orig, path.clone(), None);
             let mut sresp = next(sub);
             if !(200..300).contains(&sresp.status) {
-                return Err(Response::error(409, "Conflict"));
+                return Err(Response::error(
+                    409,
+                    "There was a conflict when trying to complete your request.",
+                ));
             }
             let body = match sresp.body.materialize(MAX_CONTROL_BODY) {
                 Ok(b) => b,
-                Err(_) => return Err(Response::error(409, "Conflict")),
+                Err(_) => return Err(Response::error(
+                    409,
+                    "There was a conflict when trying to complete your request.",
+                )),
             };
             let Some(sub_segs) = parse_stored_manifest(body) else {
-                return Err(Response::error(409, "Conflict"));
+                return Err(Response::error(
+                    409,
+                    "There was a conflict when trying to complete your request.",
+                ));
             };
             let mut nested = expand_segments(orig, version, account, &sub_segs, next, depth + 1)?;
             // A ranged sub_slo contributes only a window of the nested aggregate.
             if let Some(range) = &seg.range {
                 let Some((start, end)) = parse_inclusive_range(range) else {
-                    return Err(Response::error(409, "Conflict"));
+                    return Err(Response::error(
+                    409,
+                    "There was a conflict when trying to complete your request.",
+                ));
                 };
                 nested = slice_leaves_for_range(&nested, start, end + 1)?;
             }
@@ -420,7 +438,10 @@ async fn expand_segments_async(
         if let Some(b64) = &seg.data_b64 {
             let raw = B64
                 .decode(b64.as_bytes())
-                .map_err(|_| Response::error(409, "Conflict"))?;
+                .map_err(|_| Response::error(
+                    409,
+                    "There was a conflict when trying to complete your request.",
+                ))?;
             let length = raw.len() as i64;
             if length <= 0 {
                 continue;
@@ -435,20 +456,32 @@ async fn expand_segments_async(
         }
         if seg.sub_slo {
             if depth >= MAX_SLO_RECURSION_DEPTH {
-                return Err(Response::error(409, "Conflict"));
+                return Err(Response::error(
+                    409,
+                    "There was a conflict when trying to complete your request.",
+                ));
             }
             let path = format!("/{version}/{account}{}", seg.name);
             let sub = slo_subreq(&orig, path.clone(), None);
             let sresp = next(sub).await;
             if !(200..300).contains(&sresp.status) {
-                return Err(Response::error(409, "Conflict"));
+                return Err(Response::error(
+                    409,
+                    "There was a conflict when trying to complete your request.",
+                ));
             }
             let body = match sresp.body.collect_async().await {
                 Ok(b) => b,
-                Err(_) => return Err(Response::error(409, "Conflict")),
+                Err(_) => return Err(Response::error(
+                    409,
+                    "There was a conflict when trying to complete your request.",
+                )),
             };
             let Some(sub_segs) = parse_stored_manifest(&body) else {
-                return Err(Response::error(409, "Conflict"));
+                return Err(Response::error(
+                    409,
+                    "There was a conflict when trying to complete your request.",
+                ));
             };
             let mut nested = Box::pin(expand_segments_async(
                 orig.clone_head(),
@@ -461,7 +494,10 @@ async fn expand_segments_async(
             .await?;
             if let Some(range) = &seg.range {
                 let Some((start, end)) = parse_inclusive_range(range) else {
-                    return Err(Response::error(409, "Conflict"));
+                    return Err(Response::error(
+                    409,
+                    "There was a conflict when trying to complete your request.",
+                ));
                 };
                 nested = slice_leaves_for_range(&nested, start, end + 1)?;
             }
@@ -583,7 +619,10 @@ fn slice_leaves_for_range(
         // Map aggregate offsets into the segment object's byte space.
         let (obj_base, obj_end_incl) = if let Some(r) = &leaf.range {
             let Some((s, e)) = parse_inclusive_range(r) else {
-                return Err(Response::error(409, "Conflict"));
+                return Err(Response::error(
+                    409,
+                    "There was a conflict when trying to complete your request.",
+                ));
             };
             (s, e)
         } else {
@@ -592,7 +631,10 @@ fn slice_leaves_for_range(
         let obj_start = obj_base + take_from;
         let obj_last = obj_base + take_to_excl - 1;
         if obj_last > obj_end_incl {
-            return Err(Response::error(409, "Conflict"));
+            return Err(Response::error(
+                    409,
+                    "There was a conflict when trying to complete your request.",
+                ));
         }
         let contrib = (obj_last - obj_start + 1) as i64;
         // Inline data: slice the raw bytes rather than object ranges.
