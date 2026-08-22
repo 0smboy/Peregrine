@@ -217,6 +217,14 @@ pub fn error_status_and_message(code: &str) -> (u16, &'static str) {
         "InvalidBucketName" => (400, "The specified bucket is not valid."),
         "InvalidBucketState" => (409, "The request is not valid with the current state of the bucket."),
         "InvalidDigest" => (400, "The Content-MD5 you specified was invalid."),
+        "XAmzContentSHA256Mismatch" => (
+            400,
+            "The provided 'x-amz-content-sha256' header does not match what was computed.",
+        ),
+        "MalformedTrailerError" => (
+            400,
+            "The request contained trailing data that was not well-formed or did not conform to our published schema.",
+        ),
         "InvalidPart" => (
             400,
             "One or more of the specified parts could not be found. The part might not have been uploaded, or the specified entity tag might not have matched the part's entity tag.",
@@ -427,19 +435,22 @@ pub fn s3_error_response(code: &str, message: Option<&str>, extras: &[(&str, &st
     let (status, default_msg) = error_status_and_message(code);
     let msg = message.unwrap_or(default_msg);
     let generated = default_request_id();
-    let mut extras_vec: Vec<(&str, &str)> = extras.to_vec();
-    if !extras_vec
-        .iter()
-        .any(|(tag, _)| tag.eq_ignore_ascii_case("RequestId"))
-    {
-        extras_vec.push(("RequestId", generated.as_str()));
-    }
-    let rid = extras_vec
+    let rid = extras
         .iter()
         .find(|(tag, _)| tag.eq_ignore_ascii_case("RequestId"))
         .map(|(_, v)| *v)
         .unwrap_or(generated.as_str());
-    let body = s3_error_xml(code, msg, &extras_vec);
+    // Put RequestId first in extras so `s3_error_xml` emits
+    // Code, Message, RequestId, then caller extras (Python order).
+    let mut xml_extras: Vec<(&str, &str)> = Vec::with_capacity(extras.len() + 1);
+    if !extras
+        .iter()
+        .any(|(tag, _)| tag.eq_ignore_ascii_case("RequestId"))
+    {
+        xml_extras.push(("RequestId", rid));
+    }
+    xml_extras.extend_from_slice(extras);
+    let body = s3_error_xml(code, msg, &xml_extras);
     let mut resp = Response::with_body(status, body);
     resp.headers.set("Content-Type", "application/xml");
     resp.headers.set("x-amz-request-id", rid);

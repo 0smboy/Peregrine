@@ -125,6 +125,7 @@ pub mod middleware;
 pub mod mpu;
 pub mod object_lock_worm;
 pub mod parse;
+pub mod payload;
 pub mod response;
 pub mod select;
 pub mod sigv2;

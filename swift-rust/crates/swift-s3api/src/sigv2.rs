@@ -293,7 +293,12 @@ pub fn string_to_sign_v2(req: &Request, auth: &SigV2Auth) -> String {
         .find(|(k, _)| k.eq_ignore_ascii_case("content-md5"))
         .map(|(_, v)| v.to_string())
         .unwrap_or_default();
-    let ctype = req.headers.get("Content-Type").unwrap_or("").to_string();
+    let ctype = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.to_string())
+        .unwrap_or_default();
     let date = date_for_string_to_sign(req, auth);
     let amz = canonicalized_amz_headers(req);
     let resource = canonicalized_resource(req);

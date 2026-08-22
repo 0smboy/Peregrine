@@ -87,24 +87,82 @@ fn md5_block(state: &mut [u32; 4], block: &[u8]) {
     state[3] = state[3].wrapping_add(d);
 }
 
+/// Incremental RFC 1321 MD5 (object PUT Content-MD5 / streaming HashingInput).
+pub struct Md5Hasher {
+    state: [u32; 4],
+    buf: [u8; 64],
+    buf_len: usize,
+    bit_len: u64,
+}
+
+impl Default for Md5Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Md5Hasher {
+    pub fn new() -> Self {
+        Self {
+            state: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476],
+            buf: [0; 64],
+            buf_len: 0,
+            bit_len: 0,
+        }
+    }
+
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.bit_len = self.bit_len.wrapping_add((data.len() as u64).wrapping_mul(8));
+        if self.buf_len > 0 {
+            let need = 64 - self.buf_len;
+            if data.len() < need {
+                self.buf[self.buf_len..self.buf_len + data.len()].copy_from_slice(data);
+                self.buf_len += data.len();
+                return;
+            }
+            self.buf[self.buf_len..].copy_from_slice(&data[..need]);
+            md5_block(&mut self.state, &self.buf);
+            self.buf_len = 0;
+            data = &data[need..];
+        }
+        while data.len() >= 64 {
+            md5_block(&mut self.state, &data[..64]);
+            data = &data[64..];
+        }
+        if !data.is_empty() {
+            self.buf[..data.len()].copy_from_slice(data);
+            self.buf_len = data.len();
+        }
+    }
+
+    pub fn finalize(mut self) -> [u8; 16] {
+        self.buf[self.buf_len] = 0x80;
+        self.buf_len += 1;
+        if self.buf_len > 56 {
+            for i in self.buf_len..64 {
+                self.buf[i] = 0;
+            }
+            md5_block(&mut self.state, &self.buf);
+            self.buf_len = 0;
+        }
+        for i in self.buf_len..56 {
+            self.buf[i] = 0;
+        }
+        self.buf[56..64].copy_from_slice(&self.bit_len.to_le_bytes());
+        md5_block(&mut self.state, &self.buf);
+        let mut out = [0u8; 16];
+        for (i, word) in self.state.iter().enumerate() {
+            out[i * 4..(i + 1) * 4].copy_from_slice(&word.to_le_bytes());
+        }
+        out
+    }
+}
+
 /// MD5 of `data`, raw 16 bytes (RFC 1321). Used for AWS MPU composite ETags.
 pub fn md5(data: &[u8]) -> [u8; 16] {
-    let mut state = [0x67452301u32, 0xefcdab89, 0x98badcfe, 0x10325476];
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut buf = data.to_vec();
-    buf.push(0x80);
-    while buf.len() % 64 != 56 {
-        buf.push(0);
-    }
-    buf.extend_from_slice(&bit_len.to_le_bytes());
-    for chunk in buf.chunks_exact(64) {
-        md5_block(&mut state, chunk);
-    }
-    let mut out = [0u8; 16];
-    for (i, word) in state.iter().enumerate() {
-        out[i * 4..(i + 1) * 4].copy_from_slice(&word.to_le_bytes());
-    }
-    out
+    let mut hasher = Md5Hasher::new();
+    hasher.update(data);
+    hasher.finalize()
 }
 
 /// MD5 of `data`, lowercase hex (`hashlib.md5(data).hexdigest()`).

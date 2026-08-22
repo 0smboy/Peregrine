@@ -644,6 +644,8 @@ fn decode_and_fix_aws_chunked(
     req.headers
         .set("Content-Length", decoded.data.len().to_string());
     req.headers.remove("X-Amz-Decoded-Content-Length");
+    req.headers.remove("x-amz-trailer");
+    req.headers.remove("X-Amz-Trailer");
     if is_streaming {
         // Downstream does not need STREAMING-*; UNSIGNED-PAYLOAD matches
         // "payload not re-hashed for SigV4".
@@ -737,6 +739,8 @@ fn wrap_aws_chunked_streaming(
         areq.headers.set("Content-Length", n.to_string());
     }
     head.headers.remove("X-Amz-Decoded-Content-Length");
+    head.headers.remove("x-amz-trailer");
+    areq.headers.remove("x-amz-trailer");
     cleanup_content_encoding(&mut head.headers);
     if is_streaming_payload_hash(payload_hash) {
         head.headers.set("X-Amz-Content-SHA256", "UNSIGNED-PAYLOAD");
@@ -1524,6 +1528,7 @@ fn map_swift_error(status: u16, bucket: Option<&str>, key: Option<&str>) -> Resp
         // Client hung up / short body (Swift 499). Not a commit. S3-3:
         // cancellation is not a successful PUT and not an InternalError.
         408 | 499 => ("IncompleteBody", Vec::new()),
+        422 => ("BadDigest", Vec::new()),
         500..=599 => ("InternalError", Vec::new()),
         _ => ("InvalidRequest", Vec::new()),
     };
@@ -2730,8 +2735,9 @@ impl Middleware for S3Api {
                     return finish(s3_auth_error(err));
                 }
             }
-            // No aws-chunked for SigV2 (AWS STREAMING is V4-only).
-            if let Some(resp) = invalid_content_md5_response(&req) {
+            // No aws-chunked for SigV2 (AWS STREAMING is V4-only): HashingInput
+            // / raw-body XAmzContentSHA256Mismatch, then BadDigest.
+            if let Some(resp) = crate::payload::validate_s3_payload(&mut req, false) {
                 return finish(resp);
             }
             return finish(self.dispatch_authorized(req, cred, next));
@@ -2766,13 +2772,17 @@ impl Middleware for S3Api {
             }
         }
 
-        // aws-chunked / STREAMING-*: dechunk body after header SigV4 verify.
-        if matches!(req.method.as_str(), "PUT" | "POST") && is_aws_chunked_request(&req) {
+        // aws-chunked / STREAMING-*: dechunk after header SigV4 verify.
+        // V4 query STREAMING is not aws-chunked (Python reads the raw body).
+        if matches!(req.method.as_str(), "PUT" | "POST")
+            && is_aws_chunked_request(&req)
+            && !auth.query_auth
+        {
             if let Err(resp) = decode_and_fix_aws_chunked(&mut req, &cred, &auth) {
                 return finish(resp);
             }
         }
-        if let Some(resp) = invalid_content_md5_response(&req) {
+        if let Some(resp) = crate::payload::validate_s3_payload(&mut req, !auth.query_auth) {
             return finish(resp);
         }
 
@@ -2830,7 +2840,7 @@ impl S3Api {
                 return finish(s3_auth_error(err));
             }
         }
-        if let Some(resp) = invalid_content_md5_response(&head) {
+        if let Some(resp) = crate::payload::validate_s3_payload_headers(&head, !auth.query_auth) {
             return finish(resp);
         }
         let (bucket, key) = extract_bucket_and_key(
@@ -2909,9 +2919,17 @@ impl S3Api {
             .and_then(|s| s.parse::<u64>().ok());
         let amz_date = crate::sigv4::amz_date(&head);
         let chunk_err = Arc::new(Mutex::new(None));
+        let payload_err = Arc::new(Mutex::new(None));
+        crate::payload::apply_content_md5_etag(&mut head);
+        let hash_streaming_token = auth.query_auth && aws_chunked;
+        let hash_xform = crate::payload::PayloadHashTransform::from_request_opts(
+            &head,
+            Arc::clone(&payload_err),
+            hash_streaming_token,
+        );
         strip_s3_only_headers(&mut head.headers);
         stamp_auth(&mut head, &cred);
-        if aws_chunked {
+        if aws_chunked && !auth.query_auth {
             if let Err(resp) = wrap_aws_chunked_streaming(
                 &mut areq,
                 &mut head,
@@ -2924,6 +2942,10 @@ impl S3Api {
             ) {
                 return finish(resp);
             }
+        } else {
+            let cl = areq.body.content_length();
+            let inner = std::mem::replace(&mut areq.body, IncomingBody::from_bytes(Vec::new(), 1));
+            areq.body = inner.with_transform(Box::new(hash_xform), cl);
         }
 
         if is_mpu_part {
@@ -2937,6 +2959,13 @@ impl S3Api {
                 body: areq.body,
             };
             let resp = next(swift).await;
+            if let Some(resp) = payload_err
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                return finish(resp);
+            }
             if let Some(e) = chunk_err
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -2961,9 +2990,25 @@ impl S3Api {
         }
         let vstatus = versioning_status_from_headers(&hdrs).ok().flatten();
         if bucket_versioning_mode(vstatus.as_deref()).is_some() {
-            return self
-                .put_object_versioned_streaming(areq, next, method, head, cred, bucket, key)
+            let resp = self
+                .put_object_versioned_streaming(
+                    areq,
+                    next,
+                    method.clone(),
+                    head,
+                    cred,
+                    bucket,
+                    key,
+                )
                 .await;
+            if let Some(err) = payload_err
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                return finish(err);
+            }
+            return resp;
         }
         apply_lifecycle_on_put_from_container(&mut head.headers, &hdrs, &key, unix_now());
         if head.headers.get(SYS_RETAIN_UNTIL).is_none() {
@@ -3023,6 +3068,13 @@ impl S3Api {
             body: areq.body,
         };
         let resp = next(swift).await;
+        if let Some(err) = payload_err
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            return finish(err);
+        }
         if let Some(e) = chunk_err
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -3146,7 +3198,7 @@ impl S3Api {
 
     /// Native-async S3 control (GET/HEAD/List/DELETE/MPU/versioning). No
     /// `block_in_place` and no sync `handle()`.
-    async fn handle_s3_async(&self, req: Request, next: AsyncNextFn) -> Response {
+    async fn handle_s3_async(&self, mut req: Request, next: AsyncNextFn) -> Response {
         if !is_s3_auth_request(&req) {
             if let Some(account) = self.anonymous_account.clone() {
                 if is_s3_unsigned_read_candidate(
@@ -3165,7 +3217,8 @@ impl S3Api {
             Ok(c) => c,
             Err(resp) => return finish(resp),
         };
-        if let Some(resp) = invalid_content_md5_response(&req) {
+        let v4_header = crate::payload::is_v4_header_auth(&req);
+        if let Some(resp) = crate::payload::validate_s3_payload(&mut req, v4_header) {
             return finish(resp);
         }
         if let Some(denied) = self.frozen_account_denied(&cred.account, &req) {
@@ -4643,67 +4696,6 @@ fn control_head_object(
 /// `HEAD /` → the same 405 with an empty body (`Content-Type:
 /// application/xml`, `Content-Length: 0`). `GET /` (ListBuckets) is not
 /// touched here; other verbs keep their existing paths.
-/// Python s3api: malformed Content-MD5 on PUT/POST is 400 InvalidDigest
-/// before the body is hashed (test_input_errors.assertInvalidDigest).
-fn invalid_content_md5_response(req: &Request) -> Option<Response> {
-    if !matches!(req.method.as_str(), "PUT" | "POST") {
-        return None;
-    }
-    let raw = req
-        .headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-md5"))
-        .map(|(_, v)| v.trim())?;
-    if raw.is_empty() {
-        return None;
-    }
-    if content_md5_decoded_len(raw) != Some(16) {
-        return Some(s3_error_response("InvalidDigest", None, &[]));
-    }
-    None
-}
-
-fn content_md5_decoded_len(raw: &str) -> Option<usize> {
-    let mut buf = Vec::with_capacity(16);
-    let b = raw.as_bytes();
-    let mut i = 0;
-    let mut acc = 0u32;
-    let mut n = 0u32;
-    while i < b.len() {
-        let c = b[i];
-        i += 1;
-        if c == b'=' {
-            break;
-        }
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        } as u32;
-        acc = (acc << 6) | v;
-        n += 1;
-        if n == 4 {
-            buf.push((acc >> 16) as u8);
-            buf.push((acc >> 8) as u8);
-            buf.push(acc as u8);
-            acc = 0;
-            n = 0;
-        }
-    }
-    if n == 2 {
-        buf.push((acc >> 4) as u8);
-    } else if n == 3 {
-        buf.push((acc >> 10) as u8);
-        buf.push((acc >> 2) as u8);
-    } else if n == 1 {
-        return None;
-    }
-    Some(buf.len())
-}
-
 fn service_method_not_allowed(method: &str) -> Option<Response> {
     if !matches!(method, "PUT" | "DELETE" | "POST" | "HEAD") {
         return None;
@@ -9767,6 +9759,17 @@ mod tests {
         base_s3_req_as_at(method, path, query, access_key, unix_now())
     }
 
+    /// Python MultiDeleteController.require_md5: Content-MD5 or x-amz-checksum-*.
+    fn stamp_content_md5(req: &mut Request) {
+        let bytes = req.body.materialize(u64::MAX).expect("body").to_vec();
+        req.headers.set(
+            "content-md5",
+            crate::sigv2::base64_encode(&crate::crypto::md5(&bytes)),
+        );
+        req.headers.set("Content-Length", bytes.len().to_string());
+        req.body = Body::from(bytes);
+    }
+
     fn sign_request(mut req: Request, secret: &str) -> Request {
         let auth_hdr = req.headers.get("Authorization").unwrap().to_string();
         let auth = parse_authorization_header(&auth_hdr).unwrap();
@@ -12147,6 +12150,7 @@ mod tests {
             br#"<Delete><Object><Key>a</Key></Object><Object><Key>b</Key></Object></Delete>"#
                 .to_vec(),
         );
+        stamp_content_md5(&mut req);
         let req = sign_request(req, "testing");
         let next: NextFn = Arc::new(|r| {
             if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
@@ -12174,6 +12178,7 @@ mod tests {
         req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         req.headers.set(HDR_BYPASS_GOVERNANCE, "true");
         req.body = Body::from(br#"<Delete><Object><Key>a</Key></Object></Delete>"#.to_vec());
+        stamp_content_md5(&mut req);
         let req = sign_request(req, "testing");
         let next: NextFn = Arc::new(|r| {
             if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
@@ -12279,6 +12284,7 @@ mod tests {
         let mut del = base_s3_req("POST", "/nothing", "delete");
         del.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         del.body = Body::from(br#"<Delete><Object><Key>a</Key></Object></Delete>"#.to_vec());
+        stamp_content_md5(&mut del);
         let resp = api.handle(sign_request(del, "testing"), &next);
         assert_eq!(resp.status, 404);
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
@@ -13032,6 +13038,7 @@ mod tests {
         req.body = Body::from(
             b"<Delete><Object><Key>foo</Key><VersionId>null</VersionId></Object></Delete>".to_vec(),
         );
+        stamp_content_md5(&mut req);
         let resp = api.handle(sign_request(req, "testing"), &next);
         assert_eq!(resp.status, 200);
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
@@ -13490,8 +13497,10 @@ mod tests {
             "testing",
         );
         let resp = api.handle(del, &next);
-        assert_ne!(resp.status, 204);
-        assert!(resp.status >= 400, "status={}", resp.status);
+        // Current object with no index row: delete the data-plane copy
+        // (204) rather than 500 "lost update" that poisons Ceph s3-tests nuke.
+        assert_eq!(resp.status, 204, "status={}", resp.status);
+        assert_eq!(resp.headers.get(HDR_VERSION_ID), Some(vid));
     }
 
     #[test]
@@ -13522,12 +13531,13 @@ mod tests {
             format!("<Delete><Object><Key>obj</Key><VersionId>{vid}</VersionId></Object></Delete>")
                 .into_bytes(),
         );
+        stamp_content_md5(&mut req);
         let resp = api.handle(sign_request(req, "testing"), &next);
         assert_eq!(resp.status, 200);
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
-        assert!(body.contains("<Error>"), "{body}");
-        assert!(body.contains("InternalError"), "{body}");
-        assert!(!body.contains("<Deleted>"), "{body}");
+        assert!(body.contains("<Deleted>"), "{body}");
+        assert!(body.contains("<Key>obj</Key>"), "{body}");
+        assert!(!body.contains("<Error>"), "{body}");
     }
 
     #[test]
@@ -13835,6 +13845,93 @@ mod tests {
     }
 
     #[test]
+    fn sigv2_put_bad_content_md5_is_400_bad_digest_not_403() {
+        let api = S3Api::new(cred_map());
+        let body = b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Host", "localhost");
+        headers.set("content-md5", crate::sigv2::base64_encode(&crate::crypto::md5(b"")));
+        headers.set("Content-Length", body.len().to_string());
+        let req = Request {
+            method: "PUT".into(),
+            path: "/mybucket/obj".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::Buffered(body.to_vec()),
+        };
+        let req = sign_request_v2(req, "test:tester", "testing");
+        let next: NextFn = Arc::new(|_| panic!("bad Content-MD5 must not reach backend"));
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 400, "status");
+        let xml = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(xml.contains("<Code>BadDigest</Code>"), "{xml}");
+        assert!(
+            xml.contains("<ExpectedDigest>d41d8cd98f00b204e9800998ecf8427e</ExpectedDigest>"),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn sigv2_put_sha256_mismatch_is_400_not_403() {
+        let api = S3Api::new(cred_map());
+        let body = b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Host", "localhost");
+        headers.set(
+            "x-amz-content-sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        );
+        headers.set("Content-Length", body.len().to_string());
+        let req = Request {
+            method: "PUT".into(),
+            path: "/mybucket/obj".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::Buffered(body.to_vec()),
+        };
+        let req = sign_request_v2(req, "test:tester", "testing");
+        let next: NextFn = Arc::new(|_| panic!("sha256 mismatch must not reach backend"));
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 400, "status");
+        let xml = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(xml.contains("<Code>XAmzContentSHA256Mismatch</Code>"), "{xml}");
+        assert!(
+            xml.contains("<ClientComputedContentSHA256>e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855</ClientComputedContentSHA256>"),
+            "{xml}"
+        );
+        assert!(xml.contains("<S3ComputedContentSHA256>"), "{xml}");
+    }
+
+    #[test]
+    fn sigv2_streaming_unsigned_is_sha256_mismatch_not_aws_chunked() {
+        let api = S3Api::new(cred_map());
+        let body = b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Host", "localhost");
+        headers.set("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER");
+        headers.set("x-amz-decoded-content-length", body.len().to_string());
+        headers.set("Content-Length", body.len().to_string());
+        let req = Request {
+            method: "PUT".into(),
+            path: "/mybucket/obj".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::Buffered(body.to_vec()),
+        };
+        let req = sign_request_v2(req, "test:tester", "testing");
+        let next: NextFn = Arc::new(|_| panic!("V2 STREAMING must not be stored as an object"));
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 400, "status");
+        let xml = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(xml.contains("<Code>XAmzContentSHA256Mismatch</Code>"), "{xml}");
+        assert!(
+            xml.contains("STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+            "{xml}"
+        );
+        assert!(!xml.contains("IncompleteBody"), "{xml}");
+    }
+
+    #[test]
     fn sigv2_query_auth_bad_sig_is_403() {
         let api = S3Api::new(cred_map());
         let mut headers = HeaderKeyDict::new();
@@ -14122,6 +14219,7 @@ mod tests {
         // Python `_is_streaming`: only STREAMING-* dechunks. Encoding-only
         // aws-chunked is a raw body that happens to carry the token.
         req.headers.set("Content-Encoding", "aws-chunked, gzip");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         req.headers.set("Content-Length", framed.len().to_string());
         req.headers
             .set("x-amz-decoded-content-length", payload.len().to_string());
