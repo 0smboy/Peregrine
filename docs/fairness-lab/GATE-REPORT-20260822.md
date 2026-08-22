@@ -21,10 +21,14 @@ G2 SAIO pipeline: partial GREEN (live semantic diff 0 after 08-21 align)
 
 G3 Swift PUT/GET: partial evidence only (delta, not absolute counters)
 G3 required routes: RED
-G3 S3: RED (S3-1 in progress on g3/s3-native-async-20260822)
-  - S3-1: streams_request before materialize; PutObject/UploadPart keep IncomingBody
-  - Control S3 still block_in_place + sync handle(); aws-chunked still S3-2
-  - G3 S3 PUT not GREEN until live RSAIO counters + 256MiB signed PutObject
+G3 S3: RED overall; S3-1 PutObject/UploadPart live-proven on RSAIO :8081
+  - branch g3/s3-native-async-20260822 commits c18fe0f, 8f44236, 897c2d8
+  - Linux proxy SHA 8e08aea78811c4546dcc0ff331a7b53dedb8b43fe9bc6f98e646a58520d76fa9
+    matches /proc/exe on rsaio pid 2397765
+  - 70MiB signed PutObject 200; 256MiB signed PutObject 200 Content-Length=268435456
+  - PUT delta: native_async +1, legacy 0, block_in_place 0, blocking_network_wait 0
+  - Control S3 (HEAD/List) still block_in_place; aws-chunked still S3-2
+  - G3 not closed: remaining required routes not all GREEN
 
 G4: NOT GATED
 G5: NOT GATED
