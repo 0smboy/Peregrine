@@ -23,8 +23,8 @@ fn streaming_fn_src() -> String {
         .expect("put_object_streaming missing");
     let rest = &mw[start..];
     let end = rest
-        .find("async fn put_object_versioned_buffered")
-        .expect("put_object_versioned_buffered missing");
+        .find("async fn put_object_versioned_streaming")
+        .expect("put_object_versioned_streaming missing");
     rest[..end].to_string()
 }
 
@@ -116,12 +116,25 @@ fn s3_3_client_disconnect_maps_to_incomplete_body() {
 }
 
 #[test]
-fn s3_3_remaining_control_path_still_uses_sync_handle() {
+fn s3_4_handle_request_async_is_native() {
     let mw = read("src/middleware.rs");
-    let still = mw.contains("self.handle(req, &next_sync)")
-        && mw.contains("tokio::task::block_in_place");
+    let start = mw
+        .find("fn handle_request_async")
+        .expect("handle_request_async missing");
+    let end = mw
+        .find("/// Shared S3 operation dispatch after auth has succeeded")
+        .expect("dispatch_authorized marker missing");
+    let src = &mw[start..end];
     assert!(
-        still,
-        "control handle_request_async is native async; convert this test to assert absence"
+        src.contains("self.handle_s3_async(req, next).await"),
+        "G3 S3-4 FAIL: handle_request_async must call handle_s3_async"
+    );
+    assert!(
+        !src.contains("self.handle(req, &next_sync)"),
+        "G3 S3-4 FAIL: handle_request_async still calls sync handle()"
+    );
+    assert!(
+        !src.contains("tokio::task::block_in_place"),
+        "G3 S3-4 FAIL: GET/HEAD/List/MPU control path still uses block_in_place"
     );
 }

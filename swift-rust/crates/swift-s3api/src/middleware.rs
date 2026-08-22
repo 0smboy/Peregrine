@@ -2687,18 +2687,7 @@ impl Middleware for S3Api {
         req: Request,
         next: AsyncNextFn,
     ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
-        Box::pin(async move {
-            // G3: this adapter parks a Tokio worker on the sync S3 handler
-            // (and on `block_in_place` when `next` runs). Counted so the
-            // activation gate can FAIL rather than hide behind Hyper-up.
-            swift_http::record_block_in_place();
-            let next_sync: NextFn = Arc::new(move |r| {
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(next(r))
-                })
-            });
-            self.handle(req, &next_sync)
-        })
+        Box::pin(async move { self.handle_s3_async(req, next).await })
     }
 
     fn handle(&self, mut req: Request, next: &NextFn) -> Response {
@@ -2793,9 +2782,9 @@ impl Middleware for S3Api {
 
 impl S3Api {
     /// S3-1: PutObject / UploadPart keep IncomingBody. Auth is header-only
-    /// (UNSIGNED-PAYLOAD or the declared payload hash). aws-chunked stays
-    /// on the control intercept until S3-2. Versioned buckets fall back to
-    /// the buffered control path (same 64 MiB cap as before this slice).
+    /// (UNSIGNED-PAYLOAD or the declared payload hash). aws-chunked is
+    /// decoded incrementally (S3-2). Versioned buckets stream via
+    /// [`Self::put_object_versioned_streaming`].
     async fn put_object_streaming(
         &self,
         mut areq: AsyncRequest,
@@ -2970,7 +2959,7 @@ impl S3Api {
         let vstatus = versioning_status_from_headers(&hdrs).ok().flatten();
         if bucket_versioning_mode(vstatus.as_deref()).is_some() {
             return self
-                .put_object_versioned_buffered(areq, next, method)
+                .put_object_versioned_streaming(areq, next, method, head, cred, bucket, key)
                 .await;
         }
         apply_lifecycle_on_put_from_container(&mut head.headers, &hdrs, &key, unix_now());
@@ -3052,41 +3041,503 @@ impl S3Api {
         }
     }
 
-    /// Versioned PutObject still needs the sync version archive. Cap stays
-    /// MAX_CONTROL_BODY until that translator is async. Unversioned PUTs
-    /// never enter this function.
-    async fn put_object_versioned_buffered(
+    /// Versioned PutObject: stream the new object body. Archive of a prior
+    /// current object is a separate GET/PUT (not the 64 MiB control cap).
+    /// Index persist uses the same create-only generation fence as the
+    /// sync `cas_save_version_index` path.
+    async fn put_object_versioned_streaming(
         &self,
-        mut areq: AsyncRequest,
+        areq: AsyncRequest,
         next: StreamingAsyncNextFn,
         method: String,
+        mut head: Request,
+        cred: S3Credential,
+        bucket: String,
+        key: String,
     ) -> Response {
-        let bytes = match areq.body.materialize(MAX_CONTROL_BODY).await {
-            Ok(b) => b,
-            Err(e) if swift_http::body_too_large(&e) => {
-                return finish_s3_response(
-                    &method,
-                    Response::error(413, "Your request is too large."),
-                );
+        let finish = |resp: Response| finish_s3_response(&method, resp);
+        let vid = generate_version_id();
+        if !is_safe_version_id(&vid) {
+            return finish(unsafe_version_id_error());
+        }
+        let snap =
+            match load_version_index_snapshot_streaming(&cred, &bucket, &key, &next).await {
+                Ok(s) => s,
+                Err(resp) => return finish(resp),
+            };
+        let expect = expect_generation(&snap);
+        let mut idx = snap.index.clone();
+        match control_head_object_streaming(&cred, &bucket, &key, &next).await {
+            Ok(ObjectHead::Missing) => {}
+            Ok(ObjectHead::Present(cur)) => {
+                if let Some(blocked) = deny_if_object_acl_blocks_write(&cred, &cur.headers) {
+                    return finish(blocked);
+                }
+                if let Err(resp) = maybe_archive_current_for_write_streaming(
+                    &cred, &bucket, &key, &cur.headers, &mut idx, &next,
+                )
+                .await
+                {
+                    return finish(resp);
+                }
             }
-            Err(_) => {
-                return finish_s3_response(&method, s3_error_response("InternalError", None, &[]));
+            Err(resp) => return finish(resp),
+        }
+        head.headers.set(SYS_VERSION_ID, &vid);
+        head.headers.set(SYS_DELETE_MARKER, "false");
+        let request_size: i64 = head
+            .headers
+            .get("Content-Length")
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n >= 0)
+            .unwrap_or(0);
+        let swift = AsyncRequest {
+            method: "PUT".into(),
+            path: s3_to_swift_path(&cred.account, Some(&bucket), Some(&key)),
+            query_string: String::new(),
+            headers: head.headers,
+            body: areq.body,
+        };
+        let resp = next(swift).await;
+        if !swift_write_applied(resp.status) {
+            return finish(backend_write_not_applied(
+                resp.status,
+                Some(&bucket),
+                Some(&key),
+            ));
+        }
+        let etag = resp
+            .headers
+            .get("ETag")
+            .map(bare_etag)
+            .unwrap_or_default();
+        let lm = resp
+            .headers
+            .get("Last-Modified")
+            .map(http_date_to_s3_approx)
+            .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
+        if let Err(resp) = commit_new_version_record(
+            &mut idx,
+            expect,
+            false,
+            VersionRecord {
+                version_id: vid.clone(),
+                is_delete_marker: false,
+                is_latest: true,
+                last_modified: lm,
+                etag: etag.clone(),
+                size: request_size,
+            },
+        ) {
+            return finish(resp);
+        }
+        if let Err(resp) =
+            cas_save_version_index_streaming(&cred, &bucket, &key, &snap, &idx, &next).await
+        {
+            return finish(resp);
+        }
+        let mut out = translate_object_success("PUT", resp, false);
+        out.headers.set(HDR_VERSION_ID, vid);
+        finish(out)
+    }
+
+    /// Native-async S3 control (GET/HEAD/List/DELETE/MPU/versioning). No
+    /// `block_in_place` and no sync `handle()`.
+    async fn handle_s3_async(&self, req: Request, next: AsyncNextFn) -> Response {
+        if !is_s3_auth_request(&req) {
+            if let Some(account) = self.anonymous_account.clone() {
+                if is_s3_unsigned_read_candidate(
+                    &req,
+                    &self.storage_domains,
+                    self.dns_compliant_bucket_names,
+                ) {
+                    return self.dispatch_anonymous_async(req, account, next).await;
+                }
             }
+            return next(req).await;
+        }
+        let method = req.method.clone();
+        let finish = |resp: Response| finish_s3_response(&method, resp);
+        let cred = match self.authenticate_s3(&req) {
+            Ok(c) => c,
+            Err(resp) => return finish(resp),
         };
-        let req = Request {
-            method: areq.method,
-            path: areq.path,
-            query_string: areq.query_string,
-            headers: areq.headers,
-            body: Body::Buffered(bytes),
+        if let Some(denied) = self.frozen_account_denied(&cred.account, &req) {
+            return finish(denied);
+        }
+        finish(self.dispatch_s3_async(req, cred, next).await)
+    }
+
+    fn authenticate_s3(&self, req: &Request) -> Result<S3Credential, Response> {
+        if is_sigv2_auth(req) {
+            let auth_v2 = parse_sigv2_auth(req)
+                .ok_or_else(|| s3_error_response("AccessDenied", None, &[]))?;
+            let (cred, keystone_verified) = self
+                .resolve_credential_v2(&auth_v2, req)
+                .ok_or_else(|| s3_error_response("InvalidAccessKeyId", None, &[]))?;
+            let now = unix_now();
+            check_sigv2_time(req, now, self.allowable_clock_skew).map_err(s3_auth_error)?;
+            if !keystone_verified {
+                verify_sigv2(
+                    &cred.access_key,
+                    &cred.secret_key,
+                    req,
+                    Some(now),
+                    Some(self.allowable_clock_skew),
+                )
+                .map_err(s3_auth_error)?;
+            }
+            return Ok(cred);
+        }
+        let auth = parse_sigv4_auth(req)
+            .ok_or_else(|| s3_error_response("AccessDenied", None, &[]))?;
+        let (cred, keystone_verified) = self
+            .resolve_credential(&auth, req)
+            .ok_or_else(|| s3_error_response("InvalidAccessKeyId", None, &[]))?;
+        let now = unix_now();
+        check_sigv4_time(req, now, self.allowable_clock_skew).map_err(s3_auth_error)?;
+        if !keystone_verified {
+            verify_sigv4(
+                &cred.access_key,
+                &cred.secret_key,
+                req,
+                Some(now),
+                Some(self.allowable_clock_skew),
+            )
+            .map_err(s3_auth_error)?;
+        }
+        Ok(cred)
+    }
+
+    async fn dispatch_anonymous_async(
+        &self,
+        req: Request,
+        account: String,
+        next: AsyncNextFn,
+    ) -> Response {
+        let method = req.method.clone();
+        let (bucket, key) =
+            extract_bucket_and_key(&req, &self.storage_domains, self.dns_compliant_bucket_names);
+        let Some(bucket) = bucket else {
+            return next(req).await;
         };
-        swift_http::record_block_in_place();
-        let next_sync: NextFn = Arc::new(move |r| {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(next(request_to_streaming(r)))
-            })
-        });
-        self.handle(req, &next_sync)
+        let mut swift = req;
+        swift.path = s3_to_swift_path(&account, Some(&bucket), key.as_deref());
+        swift.query_string = s3_to_swift_query(&swift.params(), key.is_none());
+        strip_s3_only_headers(&mut swift.headers);
+        let resp = next(swift).await;
+        finish_s3_response(&method, resp)
+    }
+
+    async fn dispatch_legacy_blocking(
+        &self,
+        req: Request,
+        cred: S3Credential,
+        next: AsyncNextFn,
+    ) -> Response {
+        let next_sync = async_next_as_blocking(next);
+        self.dispatch_authorized(req, cred, &next_sync)
+    }
+
+    async fn dispatch_s3_async(
+        &self,
+        req: Request,
+        cred: S3Credential,
+        next: AsyncNextFn,
+    ) -> Response {
+        if !is_s3_http_method(&req.method) {
+            return s3_error_response("MethodNotAllowed", None, &[]);
+        }
+        if let Some(resp) = validate_delete_headers(&req) {
+            return resp;
+        }
+        let params = req.params();
+        if let Some(sub) = first_unsupported_subresource(&params) {
+            return not_implemented_subresource(sub);
+        }
+        if req.headers.get("X-Amz-Request-Route").is_some()
+            || req.headers.get("x-amz-request-route").is_some()
+        {
+            return not_implemented_subresource("WriteGetObjectResponse");
+        }
+        let (bucket, key) =
+            extract_bucket_and_key(&req, &self.storage_domains, self.dns_compliant_bucket_names);
+        if let Some(b) = &bucket {
+            if !validate_bucket_name(b, self.dns_compliant_bucket_names) {
+                return s3_error_response("InvalidBucketName", None, &[("BucketName", b)]);
+            }
+        }
+        if let Some(k) = &key {
+            if k.as_bytes().len() > MAX_OBJECT_NAME_LENGTH {
+                return s3_error_response("KeyTooLongError", None, &[]);
+            }
+        }
+        if key.is_none() && bucket.is_some() && matches!(req.method.as_str(), "PUT" | "DELETE") {
+            self.container_heads
+                .invalidate(&cred.account, bucket.as_deref().unwrap());
+        }
+        if bucket.is_none() {
+            if let Some(denied) = service_method_not_allowed(&req.method) {
+                return denied;
+            }
+            if req.method == "GET" && params.iter().any(|(k, _)| k == "max-directory-buckets") {
+                return xml_response(200, list_directory_buckets_xml());
+            }
+        }
+        if req.headers.get("X-Amz-Rename-Source").is_some()
+            || req.headers.get("x-amz-rename-source").is_some()
+        {
+            return self.dispatch_legacy_blocking(req, cred, next).await;
+        }
+        if key.is_none()
+            && bucket.is_some()
+            && req.method == "GET"
+            && params.iter().any(|(k, _)| k == "location")
+        {
+            return xml_response(200, location_constraint_xml(&self.location));
+        }
+
+        if let Some(bucket) = bucket.as_deref() {
+            let version_id_q = params.iter().any(|(k, _)| k == "versionId");
+            let has_retention = params.iter().any(|(k, _)| k == "retention");
+            let has_legal_hold = params.iter().any(|(k, _)| k == "legal-hold");
+            let has_restore = params.iter().any(|(k, _)| k == "restore");
+            let mut actions = Vec::new();
+            if key.is_some() && version_id_q {
+                match req.method.as_str() {
+                    "GET" | "HEAD" => actions.push("s3:GetObjectVersion"),
+                    "DELETE" => actions.push("s3:DeleteObjectVersion"),
+                    _ => {}
+                }
+            }
+            if key.is_some() && has_retention {
+                actions.push(if req.method == "PUT" {
+                    "s3:PutObjectRetention"
+                } else {
+                    "s3:GetObjectRetention"
+                });
+            }
+            if key.is_some() && has_legal_hold {
+                actions.push(if req.method == "PUT" {
+                    "s3:PutObjectLegalHold"
+                } else {
+                    "s3:GetObjectLegalHold"
+                });
+            }
+            if key.is_some() && has_restore {
+                actions.push("s3:RestoreObject");
+            }
+            if actions.is_empty() {
+                actions.push(crate::iam::IamService::s3_action(
+                    &req.method,
+                    key.is_some(),
+                ));
+            }
+            let principal = self
+                .iam
+                .identity
+                .canonical_id_for_access_key(&cred.access_key);
+            let resource = crate::iam::IamService::s3_resource(bucket, key.as_deref());
+            if let Some(false) = self
+                .iam
+                .evaluate_all_actions(&principal, &actions, &resource)
+            {
+                return s3_error_response("AccessDenied", Some("IAM policy denied"), &[]);
+            }
+        }
+
+        let has_uploads = params.iter().any(|(k, _)| k == "uploads");
+        let upload_id = params
+            .iter()
+            .find(|(k, _)| k == "uploadId")
+            .map(|(_, v)| v.clone());
+        let part_number = params.iter().any(|(k, _)| k == "partNumber");
+        let has_versioning = params.iter().any(|(k, _)| k == "versioning");
+        if has_versioning {
+            if let Some(b) = bucket.as_deref() {
+                return handle_versioning_async(req, &cred, b, &next).await;
+            }
+        }
+        if has_uploads && req.method == "POST" && upload_id.is_none() {
+            if let (Some(b), Some(k)) = (bucket.as_deref(), key.as_deref()) {
+                return handle_mpu_init_async(req, &cred, b, k, self, &next).await;
+            }
+        }
+        if let Some(uid) = upload_id.as_deref() {
+            if let (Some(b), Some(k)) = (bucket.as_deref(), key.as_deref()) {
+                if req.method == "POST" && !part_number {
+                    return handle_mpu_complete_async(&cred, b, k, uid, req, &next, self).await;
+                }
+                if req.method == "DELETE" {
+                    return handle_mpu_abort_async(&cred, b, k, uid, self, &next).await;
+                }
+            }
+        }
+        if s3_query_needs_legacy_dispatch(&params)
+            || req.headers.get("X-Amz-Copy-Source").is_some_and(|s| s.contains("versionId="))
+            || req.headers.get("x-amz-copy-source").is_some_and(|s| s.contains("versionId="))
+        {
+            return self.dispatch_legacy_blocking(req, cred, next).await;
+        }
+        if let (Some(b), Some(_)) = (bucket.as_deref(), key.as_deref()) {
+            if matches!(req.method.as_str(), "GET" | "HEAD" | "DELETE") {
+                match probe_bucket_versioning_async(&cred, b, &next, &self.container_heads).await
+                {
+                    Ok(Some(_)) => {
+                        return self.dispatch_legacy_blocking(req, cred, next).await;
+                    }
+                    Ok(None) => {}
+                    Err(resp) => return resp,
+                }
+            }
+        }
+        self.forward_s3_async(req, cred, bucket, key, params, next)
+            .await
+    }
+
+    async fn forward_s3_async(
+        &self,
+        req: Request,
+        cred: S3Credential,
+        bucket: Option<String>,
+        key: Option<String>,
+        params: Vec<(String, String)>,
+        next: AsyncNextFn,
+    ) -> Response {
+        let method = req.method.clone();
+        let owner = owner_for(&cred);
+        let list_v2 = params.iter().any(|(k, v)| k == "list-type" && v == "2");
+        let for_list = matches!(method.as_str(), "GET" | "HEAD") && key.is_none();
+        let range_header = req.headers.get("Range").map(str::to_string);
+        let is_copy = req.headers.get("X-Amz-Copy-Source").is_some();
+        let mut swift_req = req;
+        swift_req.path = s3_to_swift_path(&cred.account, bucket.as_deref(), key.as_deref());
+        if for_list && method == "GET" {
+            if let Err(resp) = parse_list_max_keys(&params) {
+                return resp;
+            }
+            swift_req.query_string = s3_to_swift_query(&params, true);
+        } else if method == "GET" && bucket.is_none() {
+            swift_req.query_string = "format=json".into();
+        } else if method == "DELETE" && key.is_some() {
+            swift_req.query_string.clear();
+        } else {
+            swift_req.query_string = s3_to_swift_query(&params, false);
+        }
+        map_amz_meta(&mut swift_req);
+        if method == "HEAD" && key.is_some() {
+            swift_req.headers.remove("Range");
+            swift_req.headers.remove("range");
+        }
+        if let Some(resp) = reject_copy_to_self(&swift_req) {
+            return resp;
+        }
+        if let Some(resp) = apply_copy_source(&mut swift_req) {
+            return resp;
+        }
+        match resolve_acl_put_input(&swift_req.headers, None, &owner.id) {
+            Ok(input) if !matches!(input, AclPutInput::None) => {
+                if key.is_some() {
+                    apply_object_acl_input(&mut swift_req.headers, &input);
+                } else {
+                    apply_bucket_acl_input(&mut swift_req.headers, &input);
+                }
+            }
+            Ok(_) => {}
+            Err(_) => return s3_error_response("InvalidArgument", None, &[]),
+        }
+        strip_s3_only_headers(&mut swift_req.headers);
+        stamp_auth(&mut swift_req, &cred);
+        if for_list && method == "GET" {
+            swift_req.headers.set("Accept", "application/json");
+        }
+        let if_match = swift_req.headers.get("If-Match").map(str::to_string);
+        let if_none_match = swift_req.headers.get("If-None-Match").map(str::to_string);
+        let ius = swift_req
+            .headers
+            .get("If-Unmodified-Since")
+            .map(str::to_string);
+        let ims = swift_req
+            .headers
+            .get("If-Modified-Since")
+            .map(str::to_string);
+        if key.is_some() && matches!(method.as_str(), "GET" | "HEAD") {
+            swift_req.headers.remove("If-Unmodified-Since");
+            swift_req.headers.remove("If-Modified-Since");
+            swift_req.headers.remove("If-Match");
+            swift_req.headers.remove("If-None-Match");
+        }
+        let resp = if method == "DELETE" && key.is_some() {
+            let retry = swift_req.clone_head();
+            let first = next(swift_req).await;
+            if first.status == 412 {
+                let mut retry = retry;
+                retry.query_string = "multipart-manifest=delete".into();
+                next(retry).await
+            } else {
+                first
+            }
+        } else {
+            next(swift_req).await
+        };
+        if bucket.is_none() && method == "GET" && (200..300).contains(&resp.status) {
+            let body = match resp.body.collect_async().await {
+                Ok(b) => b,
+                Err(_) => return s3_error_response("InternalError", Some("listing too large"), &[]),
+            };
+            return translate_list_buckets(&body, &owner);
+        }
+        if key.is_none() && bucket.is_some() {
+            if method == "GET" && (200..300).contains(&resp.status) {
+                let body = match resp.body.collect_async().await {
+                    Ok(b) => b,
+                    Err(_) => {
+                        return s3_error_response("InternalError", Some("listing too large"), &[])
+                    }
+                };
+                let b = bucket.as_deref().unwrap();
+                let body = rewrite_listing_s3_etags_async(&body, &cred, b, &next).await;
+                if list_v2 {
+                    return translate_list_objects_v2(&body, b, &params, &owner);
+                }
+                return translate_list_objects(&body, b, &params, &owner);
+            }
+            if (200..300).contains(&resp.status) {
+                return translate_bucket_success(&method, resp, bucket.as_deref());
+            }
+            return map_swift_error(resp.status, bucket.as_deref(), None);
+        }
+        if key.is_some() {
+            if (200..300).contains(&resp.status) {
+                if matches!(method.as_str(), "GET" | "HEAD") {
+                    if let Some(denied) = deny_if_object_acl_blocks_read(&cred, &resp.headers) {
+                        return denied;
+                    }
+                    let resp = translate_object_get_head(
+                        &method,
+                        resp,
+                        &cred,
+                        &params,
+                        range_header.as_deref(),
+                    );
+                    return apply_get_head_preconditions(
+                        resp,
+                        &method,
+                        if_match.as_deref(),
+                        ius.as_deref(),
+                        if_none_match.as_deref(),
+                        ims.as_deref(),
+                    );
+                }
+                return translate_object_success(&method, resp, is_copy);
+            }
+            return map_swift_error(resp.status, bucket.as_deref(), key.as_deref());
+        }
+        if (200..300).contains(&resp.status) {
+            resp
+        } else {
+            map_swift_error(resp.status, bucket.as_deref(), key.as_deref())
+        }
     }
 
     /// Shared S3 operation dispatch after auth has succeeded (V2 or V4).
@@ -5156,6 +5607,910 @@ async fn control_head_object_streaming(
     } else {
         Err(map_swift_error(resp.status, Some(container), Some(key)))
     }
+}
+
+async fn streaming_call(next: &StreamingAsyncNextFn, req: Request) -> Response {
+    next(request_to_streaming(req)).await
+}
+
+async fn async_call(next: &AsyncNextFn, req: Request) -> Response {
+    next(req).await
+}
+
+async fn body_bytes(body: Body) -> Result<Vec<u8>, Response> {
+    body.collect_async().await.map_err(|_| {
+        s3_error_response("InternalError", Some("response body is too large"), &[])
+    })
+}
+
+fn async_next_as_blocking(next: AsyncNextFn) -> NextFn {
+    Arc::new(move |req| {
+        let next = Arc::clone(&next);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                tokio::task::block_in_place(move || handle.block_on(next(req)))
+            }
+            Err(_) => Response::error(500, "s3 control fallback requires a tokio runtime"),
+        }
+    })
+}
+
+fn s3_query_needs_legacy_dispatch(params: &[(String, String)]) -> bool {
+    const NATIVE: &[&str] = &[
+        "prefix",
+        "delimiter",
+        "marker",
+        "max-keys",
+        "encoding-type",
+        "list-type",
+        "continuation-token",
+        "start-after",
+        "fetch-owner",
+        "uploads",
+        "uploadId",
+        "partNumber",
+        "versioning",
+        "location",
+    ];
+    params.iter().any(|(k, _)| {
+        if k.eq_ignore_ascii_case("AWSAccessKeyId")
+            || k.eq_ignore_ascii_case("Expires")
+            || k.eq_ignore_ascii_case("Signature")
+            || k.len() >= 5 && k[..5].eq_ignore_ascii_case("x-amz")
+        {
+            return false;
+        }
+        !NATIVE.iter().any(|n| n.eq_ignore_ascii_case(k))
+    })
+}
+
+async fn head_container_async(
+    cred: &S3Credential,
+    bucket: &str,
+    next: &AsyncNextFn,
+    cache: &ContainerHeadCache,
+) -> Result<(u16, HeaderKeyDict), Response> {
+    if let Some(hit) = cache.get(&cred.account, bucket) {
+        return Ok(hit);
+    }
+    let mut head = make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+    stamp_auth(&mut head, cred);
+    let resp = async_call(next, head).await;
+    if (200..300).contains(&resp.status) {
+        cache.store(&cred.account, bucket, resp.status, resp.headers.clone());
+    }
+    Ok((resp.status, resp.headers))
+}
+
+async fn require_bucket_async(
+    cred: &S3Credential,
+    bucket: &str,
+    next: &AsyncNextFn,
+    cache: &ContainerHeadCache,
+) -> Result<HeaderKeyDict, Response> {
+    let (status, headers) = head_container_async(cred, bucket, next, cache).await?;
+    if status == 404 {
+        return Err(s3_error_response(
+            "NoSuchBucket",
+            None,
+            &[("BucketName", bucket)],
+        ));
+    }
+    if !(200..300).contains(&status) {
+        return Err(map_swift_error(status, Some(bucket), None));
+    }
+    Ok(headers)
+}
+
+async fn probe_bucket_versioning_async(
+    cred: &S3Credential,
+    bucket: &str,
+    next: &AsyncNextFn,
+    cache: &ContainerHeadCache,
+) -> Result<Option<String>, Response> {
+    let (status, headers) = head_container_async(cred, bucket, next, cache).await?;
+    if status == 404 {
+        return Ok(None);
+    }
+    if !(200..300).contains(&status) {
+        return Err(map_swift_error(status, Some(bucket), None));
+    }
+    versioning_status_from_headers(&headers).map_err(|_| {
+        s3_error_response(
+            "InternalError",
+            Some("bucket versioning metadata is invalid"),
+            &[],
+        )
+    })
+}
+
+async fn control_head_object_async(
+    cred: &S3Credential,
+    container: &str,
+    key: &str,
+    next: &AsyncNextFn,
+) -> Result<ObjectHead, Response> {
+    let mut head = make_swift_req(
+        "HEAD",
+        &s3_to_swift_path(&cred.account, Some(container), Some(key)),
+    );
+    stamp_auth(&mut head, cred);
+    let resp = async_call(next, head).await;
+    if (200..300).contains(&resp.status) {
+        Ok(ObjectHead::Present(resp))
+    } else if resp.status == 404 {
+        Ok(ObjectHead::Missing)
+    } else {
+        Err(map_swift_error(resp.status, Some(container), Some(key)))
+    }
+}
+
+async fn require_bucket_object_lock_async(
+    cred: &S3Credential,
+    bucket: &str,
+    next: &AsyncNextFn,
+) -> Result<(), Response> {
+    let mut head = make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+    stamp_auth(&mut head, cred);
+    let resp = async_call(next, head).await;
+    if !(200..300).contains(&resp.status) {
+        return Err(map_swift_error(resp.status, Some(bucket), None));
+    }
+    match validated_object_lock_xml_from_headers(&resp.headers) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(s3_error_response(
+            "InvalidRequest",
+            Some("Bucket is missing Object Lock Configuration"),
+            &[],
+        )),
+        Err(_) => Err(s3_error_response(
+            "InternalError",
+            Some("bucket object lock metadata is invalid"),
+            &[],
+        )),
+    }
+}
+
+async fn ensure_versions_container_streaming(
+    cred: &S3Credential,
+    bucket: &str,
+    next: &StreamingAsyncNextFn,
+) -> Result<(), Response> {
+    let vc = versions_container(bucket);
+    let mut put = make_swift_req("PUT", &s3_to_swift_path(&cred.account, Some(&vc), None));
+    stamp_auth(&mut put, cred);
+    let resp = streaming_call(next, put).await;
+    if (200..300).contains(&resp.status) {
+        Ok(())
+    } else {
+        Err(map_swift_error(resp.status, Some(&vc), None))
+    }
+}
+
+async fn load_version_index_snapshot_streaming(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    next: &StreamingAsyncNextFn,
+) -> Result<VersionIndexSnapshot, Response> {
+    let vc = versions_container(bucket);
+    let iname = index_object_name(key);
+    let mut get = make_swift_req(
+        "GET",
+        &s3_to_swift_path(&cred.account, Some(&vc), Some(&iname)),
+    );
+    get.headers.set("X-Newest", "true");
+    stamp_auth(&mut get, cred);
+    let resp = streaming_call(next, get).await;
+    let mut snap = if resp.status == 404 {
+        VersionIndexSnapshot {
+            index: VersionIndex::new(key),
+            exists: false,
+            etag: None,
+        }
+    } else if !(200..300).contains(&resp.status) {
+        return Err(map_swift_error(resp.status, Some(&vc), Some(&iname)));
+    } else {
+        let etag = resp
+            .headers
+            .get("ETag")
+            .map(vers_bare_etag)
+            .filter(|s| !s.is_empty());
+        let body = body_bytes(resp.body).await.map_err(|_| {
+            s3_error_response("InternalError", Some("version index is too large"), &[])
+        })?;
+        let index = VersionIndex::from_json(&body)
+            .filter(|index| index.key == key)
+            .ok_or_else(|| {
+                s3_error_response("InternalError", Some("version index is invalid"), &[])
+            })?;
+        VersionIndexSnapshot {
+            index,
+            exists: true,
+            etag,
+        }
+    };
+    if adopt_newer_generation_fences_streaming(cred, bucket, key, &mut snap, next).await? {
+        heal_version_index_mirror_streaming(cred, bucket, key, &mut snap, next).await;
+    }
+    Ok(snap)
+}
+
+async fn adopt_newer_generation_fences_streaming(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    snap: &mut VersionIndexSnapshot,
+    next: &StreamingAsyncNextFn,
+) -> Result<bool, Response> {
+    let vc = versions_container(bucket);
+    let mut adopted = false;
+    for _ in 0..MAX_GENERATION_PROBES {
+        let next_gen = snap.index.generation.saturating_add(1);
+        let fname = index_generation_object_name(key, next_gen);
+        let mut get = make_swift_req(
+            "GET",
+            &s3_to_swift_path(&cred.account, Some(&vc), Some(&fname)),
+        );
+        get.headers.set("X-Newest", "true");
+        stamp_auth(&mut get, cred);
+        let resp = streaming_call(next, get).await;
+        if resp.status == 404 {
+            return Ok(adopted);
+        }
+        if !(200..300).contains(&resp.status) {
+            return Err(map_swift_error(resp.status, Some(&vc), Some(&fname)));
+        }
+        let body = body_bytes(resp.body).await.map_err(|_| {
+            s3_error_response("InternalError", Some("version index is too large"), &[])
+        })?;
+        let index = VersionIndex::from_json(&body)
+            .filter(|index| index.key == key && index.generation == next_gen)
+            .ok_or_else(|| {
+                s3_error_response("InternalError", Some("version index is invalid"), &[])
+            })?;
+        snap.index = index;
+        snap.exists = true;
+        snap.etag = None;
+        adopted = true;
+    }
+    Err(s3_error_response(
+        "InternalError",
+        Some("version index generation probe overflow"),
+        &[],
+    ))
+}
+
+async fn heal_version_index_mirror_streaming(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    snap: &mut VersionIndexSnapshot,
+    next: &StreamingAsyncNextFn,
+) {
+    let vc = versions_container(bucket);
+    let iname = index_object_name(key);
+    let body = snap.index.to_json();
+    let mut put = make_swift_req(
+        "PUT",
+        &s3_to_swift_path(&cred.account, Some(&vc), Some(&iname)),
+    );
+    put.headers.set("Content-Length", body.len().to_string());
+    put.headers.set("Content-Type", "application/json");
+    put.headers.set(SYS_OBJECT_KEY, key);
+    put.body = Body::from(body);
+    stamp_auth(&mut put, cred);
+    let resp = streaming_call(next, put).await;
+    if swift_write_applied(resp.status) {
+        snap.etag = resp
+            .headers
+            .get("ETag")
+            .map(vers_bare_etag)
+            .filter(|s| !s.is_empty());
+    }
+}
+
+async fn cas_save_version_index_streaming(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    snap: &VersionIndexSnapshot,
+    idx: &VersionIndex,
+    next: &StreamingAsyncNextFn,
+) -> Result<(), Response> {
+    ensure_versions_container_streaming(cred, bucket, next).await?;
+    let vc = versions_container(bucket);
+    let body = idx.to_json();
+
+    let fence = index_generation_object_name(key, idx.generation);
+    let mut fence_put = make_swift_req(
+        "PUT",
+        &s3_to_swift_path(&cred.account, Some(&vc), Some(&fence)),
+    );
+    fence_put
+        .headers
+        .set("Content-Length", body.len().to_string());
+    fence_put.headers.set("Content-Type", "application/json");
+    fence_put.headers.set(SYS_OBJECT_KEY, key);
+    fence_put.headers.set("If-None-Match", "*");
+    fence_put.body = Body::from(body.clone());
+    stamp_auth(&mut fence_put, cred);
+    let fence_resp = streaming_call(next, fence_put).await;
+    if !swift_write_applied(fence_resp.status) {
+        return Err(if fence_resp.status == 202 || fence_resp.status == 412 {
+            version_index_persist_conflict()
+        } else {
+            map_swift_error(fence_resp.status, Some(&vc), Some(&fence))
+        });
+    }
+
+    let iname = index_object_name(key);
+    let mut put = make_swift_req(
+        "PUT",
+        &s3_to_swift_path(&cred.account, Some(&vc), Some(&iname)),
+    );
+    put.headers.set("Content-Length", body.len().to_string());
+    put.headers.set("Content-Type", "application/json");
+    put.headers.set(SYS_OBJECT_KEY, key);
+    if snap.exists {
+        if let Some(etag) = snap.etag.as_deref() {
+            put.headers.set("If-Match", etag);
+        }
+    } else {
+        put.headers.set("If-None-Match", "*");
+    }
+    put.body = Body::from(body);
+    stamp_auth(&mut put, cred);
+    let resp = streaming_call(next, put).await;
+    if swift_write_applied(resp.status) {
+        Ok(())
+    } else if resp.status == 202 || resp.status == 412 {
+        Err(version_index_persist_conflict())
+    } else {
+        Err(map_swift_error(resp.status, Some(&vc), Some(&iname)))
+    }
+}
+
+async fn archive_current_version_streaming(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    next: &StreamingAsyncNextFn,
+) -> Result<(), Response> {
+    ensure_versions_container_streaming(cred, bucket, next).await?;
+    let vc = versions_container(bucket);
+    let cur_path = s3_to_swift_path(&cred.account, Some(bucket), Some(key));
+    let mut get = make_swift_req("GET", &cur_path);
+    stamp_auth(&mut get, cred);
+    let got = streaming_call(next, get).await;
+    if !(200..300).contains(&got.status) {
+        return Err(map_swift_error(got.status, Some(bucket), Some(key)));
+    }
+    let aname = archive_name_checked(key, version_id)?;
+    let mut put = make_swift_req(
+        "PUT",
+        &s3_to_swift_path(&cred.account, Some(&vc), Some(&aname)),
+    );
+    copy_version_payload_headers(&got.headers, &mut put.headers);
+    put.headers.set(SYS_VERSION_ID, version_id);
+    put.headers.set(SYS_OBJECT_KEY, key);
+    if put.headers.get(SYS_DELETE_MARKER).is_none() {
+        put.headers.set(SYS_DELETE_MARKER, "false");
+    }
+    put.headers.set("If-None-Match", "*");
+    put.body = got.body;
+    stamp_auth(&mut put, cred);
+    let stored = streaming_call(next, put).await;
+    if swift_write_applied(stored.status) || stored.status == 412 {
+        Ok(())
+    } else if stored.status == 202 {
+        Err(s3_error_response(
+            "InternalError",
+            Some("backend write was not applied"),
+            &[],
+        ))
+    } else {
+        Err(map_swift_error(stored.status, Some(&vc), Some(&aname)))
+    }
+}
+
+async fn maybe_archive_current_for_write_streaming(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    headers: &HeaderKeyDict,
+    idx: &mut VersionIndex,
+    next: &StreamingAsyncNextFn,
+) -> Result<(), Response> {
+    let old_vid = current_object_version_id(headers)?;
+    let old_etag = headers
+        .get("ETag")
+        .map(vers_bare_etag)
+        .unwrap_or_default();
+    let old_size = headers
+        .get("Content-Length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0i64);
+    let old_lm = headers
+        .get("Last-Modified")
+        .map(http_date_to_s3_approx)
+        .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
+    let old_is_delete_marker = is_delete_marker_header(headers.get(SYS_DELETE_MARKER));
+    archive_current_version_streaming(cred, bucket, key, &old_vid, next).await?;
+    if idx.find(&old_vid).is_none() {
+        idx.push_latest(VersionRecord {
+            version_id: old_vid,
+            is_delete_marker: old_is_delete_marker,
+            is_latest: true,
+            last_modified: old_lm,
+            etag: old_etag,
+            size: old_size,
+        });
+    }
+    Ok(())
+}
+
+async fn rewrite_listing_s3_etags_async(
+    body: &[u8],
+    cred: &S3Credential,
+    bucket: &str,
+    next: &AsyncNextFn,
+) -> Vec<u8> {
+    let Ok(Value::Array(mut arr)) = serde_json::from_slice(body) else {
+        return body.to_vec();
+    };
+    for item in &mut arr {
+        if item.get("subdir").is_some() {
+            continue;
+        }
+        let Some(name) = item.get("name").and_then(|v| v.as_str()).map(str::to_string) else {
+            continue;
+        };
+        let hash = item
+            .get("hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if let Some(etag) = s3_etag_from_listing_hash(&hash) {
+            item["hash"] = Value::String(etag);
+        }
+        if !listing_hash_needs_head(&hash) {
+            continue;
+        }
+        if let Ok(ObjectHead::Present(head)) =
+            control_head_object_async(cred, bucket, &name, next).await
+        {
+            if let Some(v) = head
+                .headers
+                .get(SYS_S3API_ETAG)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+            {
+                item["hash"] = Value::String(bare_etag(&v));
+            }
+            if let Some(cl) = head
+                .headers
+                .get("Content-Length")
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                item["bytes"] = Value::Number(cl.into());
+            }
+        }
+    }
+    serde_json::to_vec(&arr).unwrap_or_else(|_| body.to_vec())
+}
+
+async fn handle_versioning_async(
+    req: Request,
+    cred: &S3Credential,
+    bucket: &str,
+    next: &AsyncNextFn,
+) -> Response {
+    match req.method.as_str() {
+        "GET" | "HEAD" => {
+            let mut head =
+                make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+            stamp_auth(&mut head, cred);
+            let resp = async_call(next, head).await;
+            if !(200..300).contains(&resp.status) {
+                return map_swift_error(resp.status, Some(bucket), None);
+            }
+            match versioning_status_from_headers(&resp.headers) {
+                Ok(status) => xml_ok(versioning_configuration_xml(status.as_deref())),
+                Err(_) => s3_error_response(
+                    "InternalError",
+                    Some("bucket versioning metadata is invalid"),
+                    &[],
+                ),
+            }
+        }
+        "PUT" => {
+            let body = match req.body.into_vec(MAX_CONTROL_BODY) {
+                Ok(b) => b,
+                Err(_) => return s3_error_response("IncompleteBody", None, &[]),
+            };
+            let status = match parse_versioning_status(&body) {
+                Ok(s) => s,
+                Err(_) => return s3_error_response("MalformedXML", None, &[]),
+            };
+            if status == "Suspended" {
+                let mut head =
+                    make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+                stamp_auth(&mut head, cred);
+                let current = async_call(next, head).await;
+                if !(200..300).contains(&current.status) {
+                    return map_swift_error(current.status, Some(bucket), None);
+                }
+                match validated_object_lock_xml_from_headers(&current.headers) {
+                    Ok(Some(_)) => {
+                        return s3_error_response(
+                            "InvalidBucketState",
+                            Some("Object Lock requires versioning to remain enabled"),
+                            &[],
+                        )
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        return s3_error_response(
+                            "InternalError",
+                            Some("bucket object lock metadata is invalid"),
+                            &[],
+                        )
+                    }
+                }
+            }
+            let mut post =
+                make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
+            apply_versioning_meta(&mut post.headers, status);
+            stamp_auth(&mut post, cred);
+            let resp = async_call(next, post).await;
+            if (200..300).contains(&resp.status) {
+                Response::new(200)
+            } else {
+                map_swift_error(resp.status, Some(bucket), None)
+            }
+        }
+        _ => s3_error_response("MethodNotAllowed", None, &[]),
+    }
+}
+
+async fn handle_mpu_init_async(
+    mut req: Request,
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    api: &S3Api,
+    next: &AsyncNextFn,
+) -> Response {
+    if let Err(resp) = require_bucket_async(cred, bucket, next, &api.container_heads).await {
+        return resp;
+    }
+    let has_retention = req.headers.get("X-Amz-Object-Lock-Mode").is_some()
+        || req
+            .headers
+            .get("X-Amz-Object-Lock-Retain-Until-Date")
+            .is_some();
+    let has_legal_hold = req.headers.get("X-Amz-Object-Lock-Legal-Hold").is_some();
+    if has_retention || has_legal_hold {
+        if let Err(resp) = require_bucket_object_lock_async(cred, bucket, next).await {
+            return resp;
+        }
+    }
+    if has_retention {
+        if let Some(denied) = iam_action_check(&api.iam, cred, "s3:PutObjectRetention", bucket, key)
+        {
+            return denied;
+        }
+    }
+    if has_legal_hold {
+        if let Some(denied) = iam_action_check(&api.iam, cred, "s3:PutObjectLegalHold", bucket, key)
+        {
+            return denied;
+        }
+    }
+
+    map_amz_meta(&mut req);
+    match resolve_acl_put_input(&req.headers, None, &owner_for(cred).id) {
+        Ok(input) if !matches!(input, AclPutInput::None) => {
+            apply_object_acl_input(&mut req.headers, &input);
+        }
+        Ok(_) => {}
+        Err(_) => return s3_error_response("InvalidArgument", None, &[]),
+    }
+    if let Err(resp) = apply_request_object_lock_headers(&mut req.headers) {
+        return resp;
+    }
+
+    let segs = segments_container(bucket);
+    let mut put_c = make_swift_req("PUT", &s3_to_swift_path(&cred.account, Some(&segs), None));
+    stamp_auth(&mut put_c, cred);
+    let container_resp = async_call(next, put_c).await;
+    if !(200..300).contains(&container_resp.status) {
+        return map_swift_error(container_resp.status, Some(&segs), None);
+    }
+    let upload_id = new_upload_id();
+    let marker = upload_marker_name(key, &upload_id);
+    let mut put_m = make_swift_req(
+        "PUT",
+        &s3_to_swift_path(&cred.account, Some(&segs), Some(&marker)),
+    );
+    copy_mpu_object_headers(&req.headers, &mut put_m.headers);
+    persist_s3_object_headers(&mut put_m);
+    put_m.body = Body::from(Vec::from(b"upload".as_slice()));
+    put_m.headers.set("Content-Length", "6");
+    let mut head = make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+    stamp_auth(&mut head, cred);
+    let head_resp = async_call(next, head).await;
+    if (200..300).contains(&head_resp.status) {
+        apply_abort_incomplete_from_container(
+            &mut put_m.headers,
+            &head_resp.headers,
+            key,
+            unix_now(),
+        );
+    }
+    stamp_auth(&mut put_m, cred);
+    let resp = async_call(next, put_m).await;
+    if !(200..300).contains(&resp.status) {
+        return map_swift_error(resp.status, Some(bucket), Some(key));
+    }
+    initiate_response(bucket, key, &upload_id)
+}
+
+async fn handle_mpu_complete_async(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    req: Request,
+    next: &AsyncNextFn,
+    api: &S3Api,
+) -> Response {
+    if let Err(resp) = require_bucket_async(cred, bucket, next, &api.container_heads).await {
+        return resp;
+    }
+    if let Some(resp) = reject_unsupported_put_conditionals(&req) {
+        return resp;
+    }
+    let if_none_match = req.headers.get("If-None-Match").map(str::to_string);
+    let bypass_requested = bypass_governance_requested(
+        req.headers
+            .get(HDR_BYPASS_GOVERNANCE)
+            .or_else(|| req.headers.get("X-Amz-Bypass-Governance-Retention")),
+    );
+    let bypass = match governance_bypass_context(&api.iam, cred, bucket, key, bypass_requested) {
+        Ok(context) => context,
+        Err(resp) => return resp,
+    };
+    let location = complete_object_location(&req, bucket, key);
+    let body = match req.body.into_vec(MAX_CONTROL_BODY) {
+        Ok(b) => b,
+        Err(_) => return s3_error_response("IncompleteBody", None, &[]),
+    };
+    let parts = match parse_complete_body(&body) {
+        Ok(p) => p,
+        Err(code) => return s3_error_response(&code, None, &[]),
+    };
+    let segs = segments_container(bucket);
+    let marker = upload_marker_name(key, upload_id);
+    let marker_head = match control_head_object_async(cred, &segs, &marker, next).await {
+        Ok(ObjectHead::Present(head)) => head,
+        Ok(ObjectHead::Missing) => return s3_error_response("NoSuchUpload", None, &[]),
+        Err(resp) => return resp,
+    };
+    let mut sized: Vec<(u32, String, u64)> = Vec::new();
+    for (num, etag) in &parts {
+        let pname = part_object_name(key, upload_id, *num);
+        let mut head = make_swift_req(
+            "HEAD",
+            &s3_to_swift_path(&cred.account, Some(&segs), Some(&pname)),
+        );
+        stamp_auth(&mut head, cred);
+        let resp = async_call(next, head).await;
+        if !(200..300).contains(&resp.status) {
+            return s3_error_response("InvalidPart", None, &[]);
+        }
+        let stored = resp
+            .headers
+            .get("ETag")
+            .map(bare_etag)
+            .unwrap_or_default();
+        if !etag.is_empty() && !stored.is_empty() && stored != bare_etag(etag) {
+            return s3_error_response("InvalidPart", None, &[]);
+        }
+        let size = resp
+            .headers
+            .get("Content-Length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        sized.push((*num, etag.clone(), size));
+    }
+    const MIN_PART: u64 = 5_242_880;
+    if sized.len() >= 2 {
+        for (i, (_n, _e, size)) in sized.iter().enumerate() {
+            if i + 1 < sized.len() && *size < MIN_PART {
+                return s3_error_response("EntityTooSmall", None, &[]);
+            }
+        }
+    }
+    let s3_etag = aws_multipart_etag(sized.iter().map(|(_, e, _)| e.as_str()));
+    let manifest = slo_manifest_json(&segs, key, upload_id, &sized);
+    let mut put = make_swift_req(
+        "PUT",
+        &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
+    );
+    copy_mpu_object_headers(&marker_head.headers, &mut put.headers);
+    persist_s3_object_headers(&mut put);
+    if let Some(ref etag) = s3_etag {
+        put.headers.set(SYS_S3API_ETAG, etag);
+        put.headers.set(SYS_CONTAINER_UPDATE_OVERRIDE_ETAG, etag);
+    }
+    let assembled: u64 = sized.iter().map(|(_, _, n)| *n).sum();
+    put.headers
+        .set(SYS_CONTAINER_UPDATE_OVERRIDE_SIZE, assembled.to_string());
+    put.query_string = "multipart-manifest=put".into();
+    let manifest = manifest.into_bytes();
+    put.headers
+        .set("Content-Length", manifest.len().to_string());
+    put.body = Body::from(manifest);
+    if let Some(ref inm) = if_none_match {
+        put.headers.set("If-None-Match", inm);
+    }
+    if put.headers.get(SYS_LOCK_MODE).is_some() || put.headers.get(SYS_RETAIN_UNTIL).is_some() {
+        if let Some(denied) = iam_action_check(&api.iam, cred, "s3:PutObjectRetention", bucket, key)
+        {
+            return denied;
+        }
+    }
+    if put.headers.get(SYS_LEGAL_HOLD).is_some() {
+        if let Some(denied) = iam_action_check(&api.iam, cred, "s3:PutObjectLegalHold", bucket, key)
+        {
+            return denied;
+        }
+    }
+    if put.headers.get(SYS_LOCK_MODE).is_some()
+        || put.headers.get(SYS_RETAIN_UNTIL).is_some()
+        || put.headers.get(SYS_LEGAL_HOLD).is_some()
+    {
+        if let Err(resp) = require_bucket_object_lock_async(cred, bucket, next).await {
+            return resp;
+        }
+    }
+
+    let versioning_mode = match probe_bucket_versioning_async(cred, bucket, next, &api.container_heads)
+        .await
+    {
+        Ok(status) => bucket_versioning_mode(status.as_deref()),
+        Err(resp) => return resp,
+    };
+    if versioning_mode.is_some() {
+        let next_sync = async_next_as_blocking(Arc::clone(next));
+        return handle_versioned_put(
+            put,
+            cred,
+            bucket,
+            key,
+            false,
+            Some("multipart-manifest=put"),
+            match versioning_mode {
+                Some(BucketVersioningMode::Enabled) => None,
+                Some(BucketVersioningMode::Suspended) => Some(NULL_VERSION_ID),
+                None => None,
+            },
+            bypass,
+            &next_sync,
+            api,
+        );
+    }
+    match control_head_object_async(cred, bucket, key, next).await {
+        Ok(ObjectHead::Present(existing)) => {
+            if let Some(blocked) =
+                worm_guard(&existing.headers, api.worm_clock.clock_ok(), bypass)
+            {
+                return blocked;
+            }
+            if let Some(blocked) = deny_if_object_acl_blocks_write(cred, &existing.headers) {
+                return blocked;
+            }
+        }
+        Ok(ObjectHead::Missing) => {}
+        Err(resp) => return resp,
+    }
+    if let Err(resp) = apply_request_object_lock_headers(&mut put.headers) {
+        return resp;
+    }
+    strip_s3_only_headers(&mut put.headers);
+    if let Some(ref inm) = if_none_match {
+        put.headers.set("If-None-Match", inm);
+    }
+    let (st, hdrs) = match head_container_async(cred, bucket, next, &api.container_heads).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    if st != 404 && (200..300).contains(&st) {
+        apply_lifecycle_on_put_from_container(&mut put.headers, &hdrs, key, unix_now());
+        if put.headers.get(SYS_RETAIN_UNTIL).is_none() {
+            if let Ok(Some(xml)) = validated_object_lock_xml_from_headers(&hdrs) {
+                if let Ok(Some(def)) = parse_object_lock_configuration(&xml) {
+                    apply_default_retention_headers(&mut put.headers, &def, unix_now());
+                }
+            }
+        }
+    }
+    stamp_auth(&mut put, cred);
+    let resp = async_call(next, put).await;
+    if !(200..300).contains(&resp.status) {
+        return map_swift_error(resp.status, Some(bucket), Some(key));
+    }
+    let etag = s3_etag.unwrap_or_else(|| {
+        resp.headers
+            .get("ETag")
+            .map(|e| e.trim().trim_matches('"').to_string())
+            .unwrap_or_else(|| "multipart".into())
+    });
+    let version_id = resp.headers.get(HDR_VERSION_ID).map(str::to_string);
+    let mut out = xml_response(
+        200,
+        complete_multipart_xml(bucket, key, &etag, &location),
+    );
+    if let Some(version_id) = version_id {
+        out.headers.set(HDR_VERSION_ID, version_id);
+    }
+    out
+}
+
+async fn handle_mpu_abort_async(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    api: &S3Api,
+    next: &AsyncNextFn,
+) -> Response {
+    if let Err(resp) = require_bucket_async(cred, bucket, next, &api.container_heads).await {
+        return resp;
+    }
+    let segs = segments_container(bucket);
+    let marker = upload_marker_name(key, upload_id);
+    match control_head_object_async(cred, &segs, &marker, next).await {
+        Ok(ObjectHead::Present(_)) => {}
+        Ok(ObjectHead::Missing) => return s3_error_response("NoSuchUpload", None, &[]),
+        Err(resp) => return resp,
+    }
+    let prefix = format!("{key}/{upload_id}/");
+    let mut list = make_swift_req("GET", &s3_to_swift_path(&cred.account, Some(&segs), None));
+    list.query_string = format!("format=json&prefix={}", encode_query(&prefix));
+    list.headers.set("Accept", "application/json");
+    stamp_auth(&mut list, cred);
+    let listed = async_call(next, list).await;
+    if (200..300).contains(&listed.status) {
+        if let Ok(body) = body_bytes(listed.body).await {
+            let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Array(vec![]));
+            if let Some(arr) = parsed.as_array() {
+                for item in arr {
+                    let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let mut del_part = make_swift_req(
+                        "DELETE",
+                        &s3_to_swift_path(&cred.account, Some(&segs), Some(name)),
+                    );
+                    stamp_auth(&mut del_part, cred);
+                    let _ = async_call(next, del_part).await;
+                }
+            }
+        }
+    }
+    let mut del = make_swift_req(
+        "DELETE",
+        &s3_to_swift_path(&cred.account, Some(&segs), Some(&marker)),
+    );
+    stamp_auth(&mut del, cred);
+    let _ = async_call(next, del).await;
+    let mut resp = delete_object_response();
+    resp.headers.set("Content-Type", "text/html; charset=UTF-8");
+    resp
 }
 
 fn head_container(
@@ -9018,6 +10373,237 @@ mod tests {
         let got = etags.lock().unwrap().clone();
         assert_eq!(got.len(), 2);
         assert_ne!(got[0], got[1], "retry must replace bytes, not fork a version");
+    }
+
+    fn async_ok(f: impl Fn(Request) -> Response + Send + Sync + 'static) -> AsyncNextFn {
+        Arc::new(move |req| {
+            let resp = f(req);
+            Box::pin(async move { resp })
+        })
+    }
+
+    #[test]
+    fn handle_s3_async_get_object_is_native() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/mybucket/obj", ""), "testing");
+        let next = async_ok(|r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            assert_eq!(r.method, "GET");
+            assert_eq!(r.path, "/v1/AUTH_test/mybucket/obj");
+            let mut resp = Response::new(200);
+            resp.body = Body::from(b"hello-get".to_vec());
+            resp.headers.set("ETag", "abc123");
+            resp.headers.set("Content-Length", "9");
+            resp
+        });
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert_eq!(body, "hello-get");
+        assert_eq!(resp.headers.get("ETag"), Some("\"abc123\""));
+    }
+
+    #[test]
+    fn handle_s3_async_head_object_is_native() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("HEAD", "/mybucket/obj", ""), "testing");
+        let next = async_ok(|r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            assert_eq!(r.method, "HEAD");
+            assert_eq!(r.path, "/v1/AUTH_test/mybucket/obj");
+            let mut resp = Response::new(200);
+            resp.headers.set("ETag", "abc123");
+            resp.headers.set("Content-Length", "9");
+            resp
+        });
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("ETag"), Some("\"abc123\""));
+    }
+
+    #[test]
+    fn handle_s3_async_list_objects_is_native() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/mybucket", ""), "testing");
+        let next = async_ok(|r| {
+            assert_eq!(r.method, "GET");
+            assert_eq!(r.path, "/v1/AUTH_test/mybucket");
+            assert!(r.query_string.contains("format=json"));
+            let mut resp = Response::new(200);
+            resp.body = Body::from(
+                br#"[{"name":"obj","hash":"abc123","bytes":3,"last_modified":"2026-08-22T00:00:00.000000"}]"#
+                    .to_vec(),
+            );
+            resp
+        });
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("ListBucketResult"), "{body}");
+        assert!(body.contains("<Key>obj</Key>"), "{body}");
+    }
+
+    #[test]
+    fn handle_s3_async_list_buckets_is_native() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/", ""), "testing");
+        let next = async_ok(|r| {
+            assert_eq!(r.path, "/v1/AUTH_test");
+            let mut resp = Response::new(200);
+            resp.body = Body::from(br#"[{"name":"mybucket","count":0,"bytes":0}]"#.to_vec());
+            resp
+        });
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("ListAllMyBucketsResult"), "{body}");
+        assert!(body.contains("<Name>mybucket</Name>"), "{body}");
+    }
+
+    #[test]
+    fn handle_s3_async_mpu_init_complete_abort() {
+        let api = S3Api::new(cred_map());
+        let init = sign_request(base_s3_req("POST", "/mybucket/big/obj", "uploads"), "testing");
+        let init_next = async_ok(|r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            if r.method == "PUT" {
+                return Response::new(201);
+            }
+            Response::new(404)
+        });
+        let init_resp = block_on_s3(api.handle_s3_async(init, init_next));
+        assert_eq!(init_resp.status, 200, "mpu init");
+        let init_body = String::from_utf8(init_resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(init_body.contains("InitiateMultipartUploadResult"), "{init_body}");
+        let upload_id = init_body
+            .split("<UploadId>")
+            .nth(1)
+            .and_then(|s| s.split("</UploadId>").next())
+            .unwrap()
+            .to_string();
+
+        let complete_xml = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"p1\"</ETag></Part></CompleteMultipartUpload>"
+        );
+        let mut complete = base_s3_req(
+            "POST",
+            "/mybucket/big/obj",
+            &format!("uploadId={upload_id}"),
+        );
+        complete
+            .headers
+            .set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        complete.body = Body::from(complete_xml.into_bytes());
+        let complete = sign_request(complete, "testing");
+        let marker = format!("/v1/AUTH_test/mybucket+segments/{}", upload_marker_name("big/obj", &upload_id));
+        let part = format!(
+            "/v1/AUTH_test/mybucket+segments/{}",
+            part_object_name("big/obj", &upload_id, 1)
+        );
+        let complete_next = async_ok(move |r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            if r.method == "HEAD" && r.path == marker {
+                return Response::new(200);
+            }
+            if r.method == "HEAD" && r.path == part {
+                let mut resp = Response::new(200);
+                resp.headers.set("ETag", "p1");
+                resp.headers.set("Content-Length", "14");
+                return resp;
+            }
+            if r.method == "PUT" && r.path == "/v1/AUTH_test/mybucket/big/obj" {
+                let mut resp = Response::new(201);
+                resp.headers.set("ETag", "slo");
+                return resp;
+            }
+            Response::new(404)
+        });
+        let complete_resp = block_on_s3(api.handle_s3_async(complete, complete_next));
+        assert_eq!(complete_resp.status, 200, "mpu complete");
+        let cbody = String::from_utf8(complete_resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(cbody.contains("CompleteMultipartUploadResult"), "{cbody}");
+
+        let abort = sign_request(
+            base_s3_req(
+                "DELETE",
+                "/mybucket/big/obj",
+                &format!("uploadId={upload_id}"),
+            ),
+            "testing",
+        );
+        let abort_next = async_ok(move |r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            if r.method == "HEAD" && r.path.contains("+segments") {
+                return Response::new(200);
+            }
+            if r.method == "GET" && r.path.contains("+segments") {
+                let mut resp = Response::new(200);
+                resp.body = Body::from(b"[]".to_vec());
+                return resp;
+            }
+            if r.method == "DELETE" {
+                return Response::new(204);
+            }
+            Response::new(404)
+        });
+        let abort_resp = block_on_s3(api.handle_s3_async(abort, abort_next));
+        assert_eq!(abort_resp.status, 204, "mpu abort");
+    }
+
+    #[test]
+    fn streaming_versioned_put_uses_generation_fence() {
+        let api = S3Api::new(cred_map());
+        let req = unsigned_signed_put("/mybucket/obj", "");
+        let areq = async_from_signed(req, b"v1".to_vec());
+        let fences = Arc::new(Mutex::new(Vec::<String>::new()));
+        let fences_c = fences.clone();
+        let next: StreamingAsyncNextFn = Arc::new(move |areq| {
+            let fences_c = fences_c.clone();
+            Box::pin(async move {
+                if areq.method == "HEAD" && areq.path == "/v1/AUTH_test/mybucket" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(S3_VERSIONING_META, "Enabled");
+                    return resp;
+                }
+                if areq.method == "HEAD" {
+                    return Response::new(404);
+                }
+                if areq.method == "GET" {
+                    return Response::new(404);
+                }
+                if areq.method == "PUT" && areq.path.contains("/index.g") {
+                    fences_c.lock().unwrap().push(areq.path.clone());
+                    return Response::new(201);
+                }
+                if areq.method == "PUT" {
+                    let mut resp = Response::new(201);
+                    resp.headers.set("ETag", "v1etag");
+                    resp.headers.set("Last-Modified", "Sat, 22 Aug 2026 00:00:00 GMT");
+                    return resp;
+                }
+                Response::new(404)
+            })
+        });
+        let resp = block_on_s3(api.put_object_streaming(areq, next));
+        assert_eq!(resp.status, 200, "versioned streaming PUT");
+        assert!(resp.headers.get(HDR_VERSION_ID).is_some());
+        let got = fences.lock().unwrap().clone();
+        assert_eq!(got.len(), 1, "one generation fence: {got:?}");
+        assert!(
+            got[0].ends_with("/index.g00000000000000000001.json"),
+            "{}",
+            got[0]
+        );
     }
 
     #[test]
