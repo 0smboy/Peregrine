@@ -289,10 +289,10 @@ pub fn string_to_sign_v2(req: &Request, auth: &SigV2Auth) -> String {
     let method = req.method.to_ascii_uppercase();
     let md5 = req
         .headers
-        .get("Content-MD5")
-        .or_else(|| req.headers.get("Content-Md5"))
-        .unwrap_or("")
-        .to_string();
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-md5"))
+        .map(|(_, v)| v.to_string())
+        .unwrap_or_default();
     let ctype = req.headers.get("Content-Type").unwrap_or("").to_string();
     let date = date_for_string_to_sign(req, auth);
     let amz = canonicalized_amz_headers(req);
@@ -525,6 +525,27 @@ mod tests {
             headers,
             body: Body::empty(),
         }
+    }
+
+    #[test]
+    fn string_to_sign_sees_lowercase_content_md5() {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("content-md5", "abcdefghijklmnop1234==");
+        headers.set("Date", "Tue, 27 Mar 2007 19:36:42 +0000");
+        headers.set("Authorization", "AWS AKID:sig");
+        let req = Request {
+            method: "PUT".into(),
+            path: "/b/o".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        };
+        let auth = parse_sigv2_auth(&req).unwrap();
+        let sts = string_to_sign_v2(&req, &auth);
+        assert!(
+            sts.contains("abcdefghijklmnop1234=="),
+            "content-md5 must enter the v2 string-to-sign: {sts}"
+        );
     }
 
     #[test]

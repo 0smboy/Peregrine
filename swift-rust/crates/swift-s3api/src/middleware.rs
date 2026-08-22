@@ -676,13 +676,7 @@ fn aws_chunked_error_to_response(err: AwsChunkedError) -> Response {
             &[],
         ),
         AwsChunkedError::InvalidChunkSignature | AwsChunkedError::InvalidTrailerSignature => {
-            s3_error_response(
-                "SignatureDoesNotMatch",
-                Some(
-                    "The request signature we calculated does not match the signature you provided.",
-                ),
-                &[],
-            )
+            s3_error_response("SignatureDoesNotMatch", None, &[])
         }
     }
 }
@@ -2737,6 +2731,9 @@ impl Middleware for S3Api {
                 }
             }
             // No aws-chunked for SigV2 (AWS STREAMING is V4-only).
+            if let Some(resp) = invalid_content_md5_response(&req) {
+                return finish(resp);
+            }
             return finish(self.dispatch_authorized(req, cred, next));
         }
 
@@ -2774,6 +2771,9 @@ impl Middleware for S3Api {
             if let Err(resp) = decode_and_fix_aws_chunked(&mut req, &cred, &auth) {
                 return finish(resp);
             }
+        }
+        if let Some(resp) = invalid_content_md5_response(&req) {
+            return finish(resp);
         }
 
         finish(self.dispatch_authorized(req, cred, next))
@@ -2829,6 +2829,9 @@ impl S3Api {
             ) {
                 return finish(s3_auth_error(err));
             }
+        }
+        if let Some(resp) = invalid_content_md5_response(&head) {
+            return finish(resp);
         }
         let (bucket, key) = extract_bucket_and_key(
             &head,
@@ -3162,6 +3165,9 @@ impl S3Api {
             Ok(c) => c,
             Err(resp) => return finish(resp),
         };
+        if let Some(resp) = invalid_content_md5_response(&req) {
+            return finish(resp);
+        }
         if let Some(denied) = self.frozen_account_denied(&cred.account, &req) {
             return finish(denied);
         }
@@ -4637,6 +4643,67 @@ fn control_head_object(
 /// `HEAD /` → the same 405 with an empty body (`Content-Type:
 /// application/xml`, `Content-Length: 0`). `GET /` (ListBuckets) is not
 /// touched here; other verbs keep their existing paths.
+/// Python s3api: malformed Content-MD5 on PUT/POST is 400 InvalidDigest
+/// before the body is hashed (test_input_errors.assertInvalidDigest).
+fn invalid_content_md5_response(req: &Request) -> Option<Response> {
+    if !matches!(req.method.as_str(), "PUT" | "POST") {
+        return None;
+    }
+    let raw = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-md5"))
+        .map(|(_, v)| v.trim())?;
+    if raw.is_empty() {
+        return None;
+    }
+    if content_md5_decoded_len(raw) != Some(16) {
+        return Some(s3_error_response("InvalidDigest", None, &[]));
+    }
+    None
+}
+
+fn content_md5_decoded_len(raw: &str) -> Option<usize> {
+    let mut buf = Vec::with_capacity(16);
+    let b = raw.as_bytes();
+    let mut i = 0;
+    let mut acc = 0u32;
+    let mut n = 0u32;
+    while i < b.len() {
+        let c = b[i];
+        i += 1;
+        if c == b'=' {
+            break;
+        }
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32;
+        acc = (acc << 6) | v;
+        n += 1;
+        if n == 4 {
+            buf.push((acc >> 16) as u8);
+            buf.push((acc >> 8) as u8);
+            buf.push(acc as u8);
+            acc = 0;
+            n = 0;
+        }
+    }
+    if n == 2 {
+        buf.push((acc >> 4) as u8);
+    } else if n == 3 {
+        buf.push((acc >> 10) as u8);
+        buf.push((acc >> 2) as u8);
+    } else if n == 1 {
+        return None;
+    }
+    Some(buf.len())
+}
+
 fn service_method_not_allowed(method: &str) -> Option<Response> {
     if !matches!(method, "PUT" | "DELETE" | "POST" | "HEAD") {
         return None;

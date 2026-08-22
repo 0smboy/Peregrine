@@ -1640,7 +1640,7 @@ fn build_configured_filters_with_issues(
                         ""
                     };
                     notes.push(format!(
-                        "s3api enabled (SigV4+CRUD+list{defer}; not advertised on Swift /info)"
+                        "s3api enabled (SigV4+CRUD+list{defer}; advertised on Swift /info)"
                     ));
                     filters.push(swift_s3api::as_middleware(api));
                 }
@@ -2424,6 +2424,22 @@ fn build_info_json(
         info["versioned_writes"] = serde_json::json!({
             "allowed_flags": flags,
         });
+        // Python versioned_writes filter_factory: register_swift_info(
+        // 'object_versioning') when allow_object_versioning is true.
+        let allow_ov = conf
+            .get("filter:versioned_writes", "allow_object_versioning")
+            .ok()
+            .flatten()
+            .or_else(|| {
+                conf.get("filter:versioned-writes", "allow_object_versioning")
+                    .ok()
+                    .flatten()
+            })
+            .map(|v| config_true_value(&v))
+            .unwrap_or(false);
+        if allow_ov {
+            info["object_versioning"] = serde_json::json!({});
+        }
     }
     if configured_pipeline_has(conf, "name_check") || configured_pipeline_has(conf, "name-check") {
         let nc = build_name_check(conf);
@@ -2488,10 +2504,40 @@ fn build_info_json(
             "enabled": !encryption_disabled(conf),
         });
     }
-    // P3-s3: deliberately do NOT advertise `s3api` on Swift v1 `/info`.
-    // S3 is a parallel API surface enabled by pipeline wiring; a v1 /info
-    // key would falsely imply Swift-client capability discovery.
+    // Python s3api.filter_factory register_swift_info('s3api', ...). Hiding
+    // the key while the filter is wired is capability concealment (G5 skip
+    // drift). Advertise only when the pipeline actually wires s3api.
+    if configured_pipeline_has(conf, "s3api") && matches!(build_s3api(conf), Ok(Some(_))) {
+        info["s3api"] = s3api_info_json(conf);
+    }
     serde_json::to_string(&info).unwrap_or_default()
+}
+
+/// Python `s3api.filter_factory` `/info` payload (s3api.py:579-591).
+fn s3api_info_json(conf: &SwiftConfig) -> serde_json::Value {
+    let int_knob = |key: &str, default: i64| -> i64 {
+        conf.get("filter:s3api", key)
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(default)
+    };
+    let flag_knob = |key: &str, default: bool| -> bool {
+        conf.get("filter:s3api", key)
+            .ok()
+            .flatten()
+            .map(|v| config_true_value(&v))
+            .unwrap_or(default)
+    };
+    serde_json::json!({
+        "max_bucket_listing": int_knob("max_bucket_listing", 1000),
+        "max_parts_listing": int_knob("max_parts_listing", 1000),
+        "max_upload_part_num": int_knob("max_upload_part_num", 1000),
+        "max_multi_delete_objects": int_knob("max_multi_delete_objects", 1000),
+        "allow_multipart_uploads": flag_knob("allow_multipart_uploads", true),
+        "min_segment_size": int_knob("min_segment_size", 5242880),
+        "s3_acl": flag_knob("s3_acl", false),
+    })
 }
 
 /// Build `KeystoneAuth` from `[filter:keystoneauth]` (defaults when section empty).
@@ -2679,7 +2725,7 @@ fn strict_config_bool(option: &str, raw: &str) -> Result<bool, String> {
 /// Build the P3-s3 `s3api` filter from TempAuth `user_*` records plus optional
 /// `[filter:s3api]` knobs. Credentials use access key `account:user` and the
 /// TempAuth secret (Swift/tempauth + s3api convention). Returns `None` when
-/// there are no users to map. Does **not** advertise on Swift v1 `/info`.
+/// there are no users to map. `/info` advertises `s3api` when this returns `Some`.
 ///
 /// When `[filter:s3token] auth_uri` is set, attaches [`HttpS3TokenClient`] so
 /// unknown EC2 access keys defer to Keystone `/v3/s3tokens` with a real
@@ -3927,14 +3973,65 @@ mod startup_policy_tests {
                 .count(),
             1
         );
-        // Honest /info: no s3api key even when the filter is wired.
+        // Python register_swift_info('s3api', ...) when the filter loads.
         let info = build_info_json(&conf, &conf, true, false, true);
         let v: serde_json::Value = serde_json::from_str(&info).unwrap();
-        assert!(
-            v.get("s3api").is_none(),
-            "must not advertise s3api on Swift /info: {v}"
+        assert_eq!(
+            v["s3api"],
+            serde_json::json!({
+                "max_bucket_listing": 1000,
+                "max_parts_listing": 1000,
+                "max_upload_part_num": 1000,
+                "max_multi_delete_objects": 1000,
+                "allow_multipart_uploads": true,
+                "min_segment_size": 5242880,
+                "s3_acl": false,
+            })
         );
         assert_eq!(v["tempauth"]["account_acls"], true);
+    }
+
+    #[test]
+    fn info_omits_s3api_when_pipeline_does_not_wire_it() {
+        let conf = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck tempauth copy proxy-server\n\
+             [filter:tempauth]\nuser_test_tester = testing .admin\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&build_info_json(&conf, &conf, true, false, true)).unwrap();
+        assert!(v.get("s3api").is_none(), "{v}");
+    }
+
+    #[test]
+    fn info_registers_object_versioning_when_allowed() {
+        let conf = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors versioned_writes proxy-server\n\
+             [filter:versioned_writes]\n\
+             allow_versioned_writes = true\n\
+             allow_object_versioning = true\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&build_info_json(&conf, &conf, true, false, false)).unwrap();
+        assert_eq!(v["object_versioning"], serde_json::json!({}));
+        let off = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors versioned_writes proxy-server\n\
+             [filter:versioned_writes]\nallow_versioned_writes = true\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let off_v: serde_json::Value =
+            serde_json::from_str(&build_info_json(&off, &off, true, false, false)).unwrap();
+        assert!(off_v.get("object_versioning").is_none(), "{off_v}");
     }
 
     #[test]
