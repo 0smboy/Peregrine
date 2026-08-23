@@ -1038,6 +1038,7 @@ impl ProxyApp {
             write_acl: None,
             temp_url_keys: Vec::new(),
             sync_key: None,
+            rfc_compliant_etags: None,
             cors: super::CorsInfo::default(),
         };
         let Ok((part, _)) = self

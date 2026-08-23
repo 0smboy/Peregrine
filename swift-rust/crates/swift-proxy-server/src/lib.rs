@@ -212,6 +212,10 @@ struct ContainerInfo {
     temp_url_keys: Vec<String>,
     /// Destination container's `X-Container-Sync-Key` (for inbound sync auth).
     sync_key: Option<String>,
+    /// `X-Container-Sysmeta-Rfc-Compliant-Etags` when the container HEAD
+    /// carried a non-empty value. Empty/missing means "fall through to
+    /// account / enable_by_default" (Python etag_quoter).
+    rfc_compliant_etags: Option<String>,
     cors: CorsInfo,
 }
 
@@ -228,6 +232,9 @@ struct AccountInfo {
     /// Raw `X-Account-Sysmeta-Core-Access-Control` value when present.
     core_access_control: Option<String>,
     temp_url_keys: Vec<String>,
+    /// `X-Account-Sysmeta-Rfc-Compliant-Etags` when the account HEAD
+    /// carried a non-empty value.
+    rfc_compliant_etags: Option<String>,
 }
 
 /// L1 (process-local) + optional L2 (shared memcache) cache of container /
@@ -398,6 +405,7 @@ fn container_info_to_json(info: &ContainerInfo) -> serde_json::Value {
         "write_acl": info.write_acl,
         "temp_url_keys": info.temp_url_keys,
         "sync_key": info.sync_key,
+        "rfc_compliant_etags": info.rfc_compliant_etags,
         "cors": {
             "allow_origin": info.cors.allow_origin,
             "expose_headers": info.cors.expose_headers,
@@ -431,6 +439,11 @@ fn container_info_from_json(v: &serde_json::Value) -> Option<ContainerInfo> {
             .get("sync_key")
             .and_then(|x| x.as_str())
             .map(str::to_string),
+        rfc_compliant_etags: v
+            .get("rfc_compliant_etags")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         cors: CorsInfo {
             allow_origin: v
                 .get("cors")
@@ -456,6 +469,7 @@ fn account_info_to_json(info: &AccountInfo) -> serde_json::Value {
         "status": info.status,
         "core_access_control": info.core_access_control,
         "temp_url_keys": info.temp_url_keys,
+        "rfc_compliant_etags": info.rfc_compliant_etags,
     })
 }
 
@@ -475,6 +489,11 @@ fn account_info_from_json(v: &serde_json::Value) -> Option<AccountInfo> {
                     .collect()
             })
             .unwrap_or_default(),
+        rfc_compliant_etags: v
+            .get("rfc_compliant_etags")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     })
 }
 
@@ -3423,6 +3442,7 @@ impl ProxyApp {
             write_acl: None,
             temp_url_keys: Vec::new(),
             sync_key: None,
+            rfc_compliant_etags: None,
             cors: CorsInfo::default(),
         };
         let Ok((part, _)) = self
@@ -5815,6 +5835,11 @@ pub(crate) fn fill_container_info_from_head(info: &mut ContainerInfo, resp: &Res
         .get("X-Container-Sync-Key")
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    info.rfc_compliant_etags = resp
+        .headers
+        .get("X-Container-Sysmeta-Rfc-Compliant-Etags")
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     info.cors = CorsInfo {
         allow_origin: resp
             .headers
@@ -5839,6 +5864,11 @@ pub(crate) fn account_info_from_response(resp: &Response) -> AccountInfo {
             .get("X-Account-Sysmeta-Core-Access-Control")
             .map(str::to_string),
         temp_url_keys: temp_url_keys_from_headers(&resp.headers, "account"),
+        rfc_compliant_etags: resp
+            .headers
+            .get("X-Account-Sysmeta-Rfc-Compliant-Etags")
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     }
 }
 
@@ -5909,20 +5939,8 @@ fn remaining_async_next(
     })
 }
 
-async fn dispatch_remaining(
-    filters: Arc<Vec<Arc<dyn swift_middleware::Middleware>>>,
-    start: usize,
-    app: Arc<ProxyApp>,
-    req: Request,
-) -> Response {
-    let head = req.clone_head();
-    for j in start..filters.len() {
-        if filters[j].intercepts_request(&head) {
-            let next = remaining_async_next(Arc::clone(&filters), j + 1, Arc::clone(&app));
-            return filters[j].handle_request_async(req, next).await;
-        }
-    }
-    let mut resp = app.handle_async(request_to_async(req)).await;
+/// Buffer SLO/DLO channel bodies so reassemble_async can parse the JSON.
+async fn buffer_manifest_channel(resp: &mut Response) {
     let slo = resp
         .headers
         .get("X-Static-Large-Object")
@@ -5935,7 +5953,71 @@ async fn dispatch_remaining(
             Err(_) => resp.body = swift_http::Body::empty(),
         }
     }
-    for j in (start..filters.len()).rev() {
+}
+
+/// Stamp container/account `rfc-compliant-etags` sysmeta onto an object
+/// response so etag-quoter (an *outer* filter) can quote or not without
+/// its own info subrequest. Cache-only: object GET already populated
+/// container L1; a live HEAD here would hold `&Request` across await
+/// (not `Send`) and block a Tokio worker.
+fn stamp_rfc_compliant_etag_flags(app: &ProxyApp, head: &Request, resp: &mut Response) {
+    let Ok(parts) = split_path(&head.path, 4, 4, true) else {
+        return;
+    };
+    let Some(account) = parts[1].as_deref().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let Some(container) = parts[2].as_deref().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    // Cache-only: object GET already populated L1 via container_info_async.
+    // A live HEAD here would block a Tokio worker (L2) and hang unit tests.
+    let Some(cinfo) = app.info_cache.get_container(&format!("{account}/{container}")) else {
+        return;
+    };
+    resp.headers
+        .set("X-Backend-Container-Info-Status", cinfo.status.to_string());
+    if let Some(flag) = cinfo
+        .rfc_compliant_etags
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        resp.headers
+            .set("X-Backend-Container-Rfc-Compliant-Etags", flag);
+    }
+    let container_flag_set = cinfo
+        .rfc_compliant_etags
+        .as_deref()
+        .is_some_and(|s| !s.is_empty());
+    if !container_flag_set && (200..300).contains(&cinfo.status) {
+        if let Some(ainfo) = app.info_cache.get_account(account) {
+            resp.headers
+                .set("X-Backend-Account-Info-Status", ainfo.status.to_string());
+            if let Some(flag) = ainfo
+                .rfc_compliant_etags
+                .as_deref()
+                .filter(|s| !s.is_empty())
+            {
+                resp.headers
+                    .set("X-Backend-Account-Rfc-Compliant-Etags", flag);
+            }
+        }
+    }
+}
+
+/// Outbound WSGI onion for filters in `[start, end)`. Inner intercepts
+/// (`handle_request_async`) must still run outer `finish` / `reassemble_async`
+/// — SLO GET If-Match is an intercept, etag-quoter is outer.
+async fn apply_outbound_filters(
+    filters: Arc<Vec<Arc<dyn swift_middleware::Middleware>>>,
+    start: usize,
+    end: usize,
+    app: Arc<ProxyApp>,
+    head: Request,
+    mut resp: Response,
+) -> Response {
+    stamp_rfc_compliant_etag_flags(&app, &head, &mut resp);
+    for j in (start..end).rev() {
         if filters[j].intercepts_response() {
             // First next() is the captured app response. Later next()s
             // (SLO/DLO segment GET, symlink follow) must still hit the
@@ -5963,13 +6045,58 @@ async fn dispatch_remaining(
             resp = filters[j].finish(&head, resp);
         }
     }
-    app.apply_pipeline_cors(
+    resp
+}
+
+async fn dispatch_remaining(
+    filters: Arc<Vec<Arc<dyn swift_middleware::Middleware>>>,
+    start: usize,
+    app: Arc<ProxyApp>,
+    req: Request,
+) -> Response {
+    let head = req.clone_head();
+    for j in start..filters.len() {
+        if filters[j].intercepts_request(&head) {
+            let next = remaining_async_next(Arc::clone(&filters), j + 1, Arc::clone(&app));
+            let mut resp = filters[j].handle_request_async(req, next).await;
+            buffer_manifest_channel(&mut resp).await;
+            resp = apply_outbound_filters(
+                Arc::clone(&filters),
+                start,
+                j,
+                Arc::clone(&app),
+                head.clone_head(),
+                resp,
+            )
+            .await;
+            app.apply_pipeline_cors(
                 head.method.clone(),
                 head.path.clone(),
                 head.headers.get("Origin").map(str::to_string),
                 &mut resp,
             )
             .await;
+            return resp;
+        }
+    }
+    let mut resp = app.handle_async(request_to_async(req)).await;
+    buffer_manifest_channel(&mut resp).await;
+    resp = apply_outbound_filters(
+        Arc::clone(&filters),
+        start,
+        filters.len(),
+        Arc::clone(&app),
+        head.clone_head(),
+        resp,
+    )
+    .await;
+    app.apply_pipeline_cors(
+        head.method.clone(),
+        head.path.clone(),
+        head.headers.get("Origin").map(str::to_string),
+        &mut resp,
+    )
+    .await;
     resp
 }
 
@@ -6099,6 +6226,16 @@ impl AsyncService for ProxyAsyncService {
                             Arc::clone(&app),
                         );
                         let mut resp = filter.handle_request_async(request, next).await;
+                        buffer_manifest_channel(&mut resp).await;
+                        resp = apply_outbound_filters(
+                            Arc::clone(&filters_arc),
+                            0,
+                            i,
+                            Arc::clone(&app),
+                            head.clone_head(),
+                            resp,
+                        )
+                        .await;
                         app.apply_pipeline_cors(
                 head.method.clone(),
                 head.path.clone(),
@@ -6112,46 +6249,17 @@ impl AsyncService for ProxyAsyncService {
                 return remaining_async_next(filters_arc, 0, Arc::clone(&app))(request).await;
             }
             let mut resp = app.handle_async(req).await;
-            let slo = resp
-                .headers
-                .get("X-Static-Large-Object")
-                .is_some_and(config_true_value);
-            let dlo = resp.headers.get("X-Object-Manifest").is_some();
-            if (slo || dlo) && matches!(resp.body, swift_http::Body::Channel(_)) {
-                let body = std::mem::replace(&mut resp.body, swift_http::Body::empty());
-                match body.collect_async().await {
-                    Ok(bytes) => resp.body = swift_http::Body::Buffered(bytes),
-                    Err(_) => resp.body = swift_http::Body::empty(),
-                }
-            }
+            buffer_manifest_channel(&mut resp).await;
             let filters_arc = Arc::new(filters);
-            for j in (0..filters_arc.len()).rev() {
-                if filters_arc[j].intercepts_response() {
-                    let rest = remaining_async_next(
-                        Arc::clone(&filters_arc),
-                        j + 1,
-                        Arc::clone(&app),
-                    );
-                    let captured = Arc::new(Mutex::new(Some(resp)));
-                    let next: swift_middleware::AsyncNextFn = Arc::new(move |r| {
-                        let captured = Arc::clone(&captured);
-                        let rest = Arc::clone(&rest);
-                        Box::pin(async move {
-                            if let Some(inner) =
-                                captured.lock().unwrap_or_else(|p| p.into_inner()).take()
-                            {
-                                return inner;
-                            }
-                            rest(r).await
-                        })
-                    });
-                    resp = filters_arc[j]
-                        .reassemble_async(head.clone_head(), next)
-                        .await;
-                } else {
-                    resp = filters_arc[j].finish(&head, resp);
-                }
-            }
+            resp = apply_outbound_filters(
+                Arc::clone(&filters_arc),
+                0,
+                filters_arc.len(),
+                Arc::clone(&app),
+                head.clone_head(),
+                resp,
+            )
+            .await;
             app.apply_pipeline_cors(
                 head.method.clone(),
                 head.path.clone(),
@@ -6558,6 +6666,7 @@ mod info_cache_tests {
             write_acl: None,
             temp_url_keys: Vec::new(),
             sync_key: None,
+            rfc_compliant_etags: None,
             cors: CorsInfo::default(),
         }
     }
@@ -6675,6 +6784,7 @@ mod cors_tests {
                 write_acl: None,
                 temp_url_keys: Vec::new(),
                 sync_key: None,
+                rfc_compliant_etags: None,
                 cors,
             },
             60.0,
@@ -6723,6 +6833,7 @@ mod cors_tests {
             write_acl: None,
             temp_url_keys: Vec::new(),
             sync_key: None,
+            rfc_compliant_etags: None,
             cors: CorsInfo {
                 allow_origin: Some("https://allowed.example".into()),
                 expose_headers: Some("X-Object-Meta-Color".into()),
@@ -7053,6 +7164,68 @@ mod cors_tests {
             resp.status, 209,
             "SLO-style subsequent next() must reach remaining filters, got {}",
             resp.status
+        );
+    }
+
+    struct InnerIfMatch412;
+    impl swift_middleware::Middleware for InnerIfMatch412 {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.headers.contains_key("If-Match")
+        }
+        fn handle_request_async(
+            &self,
+            _req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async {
+                let mut resp = Response::new(412);
+                resp.headers.set("Etag", "abc123");
+                resp
+            })
+        }
+    }
+
+    struct OuterQuoteFinish;
+    impl swift_middleware::Middleware for OuterQuoteFinish {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn finish(&self, _req: &Request, mut resp: Response) -> Response {
+            if let Some(etag) = resp.headers.get("Etag").map(str::to_string) {
+                if !(etag.starts_with('"') || etag.starts_with("W/\"")) || !etag.ends_with('"') {
+                    resp.headers.set("Etag", format!("\"{etag}\""));
+                }
+            }
+            resp
+        }
+    }
+
+    #[tokio::test]
+    async fn intercepts_request_still_runs_outer_finish() {
+        // SLO GET If-Match intercepts_request and used to return before
+        // outer etag-quoter finish(), leaving 412 ETags unquoted.
+        let app = app(ProxyConfig::default());
+        let filters: Arc<Vec<Arc<dyn swift_middleware::Middleware>>> = Arc::new(vec![
+            Arc::new(OuterQuoteFinish),
+            Arc::new(InnerIfMatch412),
+        ]);
+        let mut req = Request {
+            method: "GET".into(),
+            path: "/v1/AUTH_test/c/o".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        };
+        req.headers.set("If-Match", "bogus");
+        let resp = dispatch_remaining(filters, 0, app, req).await;
+        assert_eq!(resp.status, 412);
+        assert_eq!(
+            resp.headers.get("Etag"),
+            Some("\"abc123\""),
+            "outer finish must still quote a 412 from an inner intercept"
         );
     }
 
@@ -7486,6 +7659,7 @@ mod p1a_wiring_tests {
             write_acl: None,
             temp_url_keys: Vec::new(),
             sync_key: Some("lab-sync-key".into()),
+            rfc_compliant_etags: None,
             cors: CorsInfo::default(),
         };
         app.info_cache
@@ -7585,6 +7759,7 @@ mod p1a_wiring_tests {
                         .to_string(),
                 ),
                 temp_url_keys: Vec::new(),
+                rfc_compliant_etags: None,
             },
             60.0,
         );

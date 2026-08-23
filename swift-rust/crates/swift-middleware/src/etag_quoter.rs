@@ -22,16 +22,13 @@
 //! `RFC 7232 §2.3` requires the `Etag` header value to be double quoted;
 //! Swift stores bare MD5s, so this filter re-quotes them when enabled.
 //!
-//! Deferred: the per-object flag resolution in Python reads the container
-//! and then the account `rfc-compliant-etags` sysmeta via
-//! `get_container_info` / `get_account_info`, which are memcache/subrequest
-//! (infocache) lookups not available to a filter in this crate. Object
-//! ETag quoting is therefore driven by the global `enable_by_default`
-//! setting — the terminal fallback in the Python control flow
-//! (`flag = self.conf.get('enable_by_default', 'false')`); the
-//! per-account/per-container override is not yet wired. The
-//! account/container header translation and the ETag-quoting predicate
-//! itself are ported exactly.
+//! Per-container / per-account `rfc-compliant-etags` sysmeta is resolved
+//! from `X-Backend-*-Rfc-Compliant-Etags` stamps the proxy copies off
+//! `get_container_info` / `get_account_info` before this filter's
+//! outbound pass. Missing stamps keep the Python terminal fallback
+//! (`enable_by_default`). Empty sysmeta is treated as unset (fall through)
+//! so a container POST of `X-Container-Rfc-Compliant-Etags: ` clears
+//! the override.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -117,15 +114,11 @@ impl Middleware for EtagQuoter {
             return resp;
         }
 
-        // Object request: quote the response ETag when quoting is enabled.
-        // (The per-account/per-container flag from get_container_info /
-        // get_account_info is deferred — see the module docs — so the flag
-        // is the global default.)
-        if !self.enable_by_default {
-            return next(req);
-        }
+        // Object request: quote the response ETag when the container /
+        // account sysmeta (or `enable_by_default`) says to.
+        let head = req.clone_head();
         let resp = next(req);
-        self.quote_object_etag(resp)
+        self.finish(&head, resp)
     }
 
     fn intercepts_response(&self) -> bool {
@@ -143,10 +136,7 @@ impl Middleware for EtagQuoter {
         })
     }
 
-    fn finish(&self, req: &Request, resp: Response) -> Response {
-        if !self.enable_by_default {
-            return resp;
-        }
+    fn finish(&self, req: &Request, mut resp: Response) -> Response {
         let parts = match split_path(&req.path, 2, 4, true) {
             Ok(p) => p,
             Err(_) => return resp,
@@ -159,11 +149,51 @@ impl Middleware for EtagQuoter {
         if !obj_present {
             return resp;
         }
+        if !self.should_quote_object(&mut resp) {
+            return resp;
+        }
         self.quote_object_etag(resp)
     }
 }
 
 impl EtagQuoter {
+    /// Python `EtagQuoterMiddleware.__call__` object-path flag:
+    /// container sysmeta, else account sysmeta, else `enable_by_default`.
+    /// A non-2xx container/account info status skips quoting. The proxy
+    /// stamps these as `X-Backend-*` so this filter does not issue its
+    /// own info subrequest; absent stamps mean "unit-test / no proxy".
+    fn should_quote_object(&self, resp: &mut Response) -> bool {
+        let container_status = resp.headers.remove("X-Backend-Container-Info-Status");
+        let container_flag = resp
+            .headers
+            .remove("X-Backend-Container-Rfc-Compliant-Etags");
+        let account_status = resp.headers.remove("X-Backend-Account-Info-Status");
+        let account_flag = resp
+            .headers
+            .remove("X-Backend-Account-Rfc-Compliant-Etags");
+        let Some(cs) = container_status else {
+            return self.enable_by_default;
+        };
+        let cs: u16 = cs.parse().unwrap_or(0);
+        if !(200..300).contains(&cs) {
+            return false;
+        }
+        if let Some(flag) = container_flag.filter(|s| !s.is_empty()) {
+            return config_true_value(&flag);
+        }
+        let Some(as_) = account_status else {
+            return self.enable_by_default;
+        };
+        let as_: u16 = as_.parse().unwrap_or(0);
+        if !(200..300).contains(&as_) {
+            return false;
+        }
+        if let Some(flag) = account_flag.filter(|s| !s.is_empty()) {
+            return config_true_value(&flag);
+        }
+        self.enable_by_default
+    }
+
     fn quote_object_etag(&self, mut resp: Response) -> Response {
         if let Some(etag) = resp.headers.get("Etag").map(str::to_string) {
             // Keep it as-is only if it is already a (strong or weak)
@@ -241,6 +271,59 @@ mod tests {
         assert_eq!(
             resp.headers.get("Etag"),
             Some("\"d41d8cd98f00b204e9800998ecf8427e\"")
+        );
+    }
+
+    #[test]
+    fn test_finish_quotes_412_when_enabled() {
+        let eq = EtagQuoter {
+            enable_by_default: true,
+        };
+        let mut resp = Response::new(412);
+        resp.headers.set("Etag", "d41d8cd98f00b204e9800998ecf8427e");
+        let resp = eq.finish(&req("/v1/a/c/o"), resp);
+        assert_eq!(
+            resp.headers.get("Etag"),
+            Some("\"d41d8cd98f00b204e9800998ecf8427e\"")
+        );
+    }
+
+    #[test]
+    fn test_finish_container_false_overrides_enable_by_default() {
+        let eq = EtagQuoter {
+            enable_by_default: true,
+        };
+        let mut resp = Response::new(200);
+        resp.headers.set("Etag", "098f6bcd4621d373cade4e832627b4f6");
+        resp.headers.set("X-Backend-Container-Info-Status", "204");
+        resp.headers
+            .set("X-Backend-Container-Rfc-Compliant-Etags", "False");
+        let resp = eq.finish(&req("/v1/a/c/o"), resp);
+        assert_eq!(
+            resp.headers.get("Etag"),
+            Some("098f6bcd4621d373cade4e832627b4f6")
+        );
+        assert!(resp
+            .headers
+            .get("X-Backend-Container-Rfc-Compliant-Etags")
+            .is_none());
+    }
+
+    #[test]
+    fn test_finish_account_true_when_container_flag_cleared() {
+        let eq = EtagQuoter {
+            enable_by_default: false,
+        };
+        let mut resp = Response::new(200);
+        resp.headers.set("Etag", "098f6bcd4621d373cade4e832627b4f6");
+        resp.headers.set("X-Backend-Container-Info-Status", "204");
+        resp.headers.set("X-Backend-Account-Info-Status", "204");
+        resp.headers
+            .set("X-Backend-Account-Rfc-Compliant-Etags", "True");
+        let resp = eq.finish(&req("/v1/a/c/o"), resp);
+        assert_eq!(
+            resp.headers.get("Etag"),
+            Some("\"098f6bcd4621d373cade4e832627b4f6\"")
         );
     }
 
