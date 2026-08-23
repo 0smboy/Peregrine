@@ -62,8 +62,8 @@ use swift_core::config::config_true_value;
 use swift_core::hashing::HashPathConfig;
 use swift_core::timestamp::{normalize_delete_at_timestamp, Timestamp};
 use swift_http::{
-    apply_conditional, body_too_large, split_path, Body, FnReader, HeaderKeyDict, Range, Request,
-    Response, MAX_CONTROL_BODY,
+    apply_conditional, body_too_large, multipart_byteranges_content_type, split_path, Body,
+    FnReader, HeaderKeyDict, Match, Range, Request, Response, MAX_CONTROL_BODY,
 };
 
 use crate::{AsyncNextFn, Middleware, MwPrep, NextFn};
@@ -86,6 +86,8 @@ const MANIFEST_ETAG_HEADER: &str = "X-Manifest-Etag";
 const IGNORE_RANGE_HDR: &str = "X-Backend-Ignore-Range-If-Metadata-Present";
 const SYSMETA_SLO_ETAG: &str = "X-Object-Sysmeta-Slo-Etag";
 const SYSMETA_SLO_SIZE: &str = "X-Object-Sysmeta-Slo-Size";
+const OVERRIDE_ETAG: &str = "X-Object-Sysmeta-Container-Update-Override-Etag";
+const ETG_IS_AT: &str = "X-Backend-Etag-Is-At";
 
 /// Default expirer account (Python `EXPIRER_ACCOUNT_NAME`).
 const EXPIRER_ACCOUNT: &str = ".expiring_objects";
@@ -721,6 +723,235 @@ fn strip_conditionals(headers: &mut HeaderKeyDict) {
     headers.remove("If-Unmodified-Since");
 }
 
+fn update_etag_is_at_header(req: &mut Request, name: &str) {
+    let existing = req
+        .headers
+        .get(ETG_IS_AT)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let value = match existing {
+        Some(e) => format!("{e},{name}"),
+        None => name.to_string(),
+    };
+    req.headers.set(ETG_IS_AT, value);
+}
+
+fn parse_part_number(req: &Request) -> Result<Option<usize>, Response> {
+    let Some(raw) = req.param("part-number") else {
+        return Ok(None);
+    };
+    let parsed = raw.parse::<i64>().ok().filter(|&n| n > 0);
+    let Some(n) = parsed else {
+        return Err(Response::error(
+            400,
+            "Part number must be an integer greater than 0",
+        ));
+    };
+    if req.headers.get("Range").is_some() {
+        return Err(Response::error(
+            400,
+            "Range requests are not supported with part number queries",
+        ));
+    }
+    Ok(Some(n as usize))
+}
+
+fn part_byte_range(segs: &[StoredSeg], part_num: usize) -> Option<(u64, u64)> {
+    if part_num == 0 || part_num > segs.len() {
+        return None;
+    }
+    let mut start = 0u64;
+    for seg in segs.iter().take(part_num - 1) {
+        start += contrib_length(seg).max(0) as u64;
+    }
+    let len = contrib_length(&segs[part_num - 1]).max(0) as u64;
+    Some((start, start + len))
+}
+
+fn apply_slo_put_listing_headers(req: &mut Request, json_etag: &str, slo_etag: &str, total: i64) {
+    let mut ct = req
+        .headers
+        .get("Content-Type")
+        .filter(|s| !s.is_empty())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    if !ct
+        .split(';')
+        .any(|p| p.trim().starts_with("swift_bytes="))
+    {
+        ct.push_str(&format!(";swift_bytes={total}"));
+    }
+    req.headers.set("Content-Type", ct);
+    req.headers
+        .set(OVERRIDE_ETAG, format!("{json_etag}; slo_etag={slo_etag}"));
+}
+
+fn rewrite_listing_slo_etag(resp: &mut Response) {
+    if !(200..300).contains(&resp.status) {
+        return;
+    }
+    let ct = resp.headers.get("Content-Type").unwrap_or("");
+    if !ct.to_ascii_lowercase().contains("application/json") {
+        return;
+    }
+    if resp.body.materialize(MAX_CONTROL_BODY).is_err() {
+        return;
+    }
+    let bytes = resp.body.materialize(MAX_CONTROL_BODY).expect("buffered");
+    let Ok(mut listing) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return;
+    };
+    let Some(arr) = listing.as_array_mut() else {
+        return;
+    };
+    for item in arr {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        if obj.contains_key("subdir") {
+            continue;
+        }
+        let Some(hash) = obj.get("hash").and_then(|v| v.as_str()).map(str::to_string) else {
+            continue;
+        };
+        if let Some((etag, slo)) = split_listing_slo_etag(&hash) {
+            obj.insert("hash".into(), etag.into());
+            obj.insert("slo_etag".into(), format!("\"{slo}\"").into());
+        }
+    }
+    let body = serde_json::to_vec(&listing).unwrap_or_default();
+    resp.headers.set("Content-Length", body.len().to_string());
+    resp.body = body.into();
+}
+
+/// Split `{etag}; slo_etag={slo}` (Python parse_header on listing hash).
+fn split_listing_slo_etag(hash: &str) -> Option<(String, String)> {
+    let mut etag = String::new();
+    let mut slo = None;
+    let mut first = true;
+    for part in hash.split(';') {
+        let part = part.trim();
+        if first {
+            etag = part.to_string();
+            first = false;
+            continue;
+        }
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        if k.trim() == "slo_etag" {
+            slo = Some(v.trim().trim_matches('"').to_string());
+        } else {
+            etag.push_str("; ");
+            etag.push_str(part);
+        }
+    }
+    slo.filter(|s| !s.is_empty()).map(|s| (etag, s))
+}
+
+fn if_none_match_put_rejected(req: &Request) -> Option<Response> {
+    let inm = req.headers.get("If-None-Match")?;
+    if Match::parse(inm).tags.iter().any(|t| t == "*") {
+        None
+    } else {
+        Some(Response::error(400, "If-None-Match only supports *"))
+    }
+}
+
+fn wrap_heartbeat_response(put_resp: Response, accept: Option<&str>) -> Response {
+    let want_json = accept
+        .map(|a| a.to_ascii_lowercase().contains("application/json"))
+        .unwrap_or(false);
+    let status = put_resp.status;
+    let last_modified = put_resp
+        .headers
+        .get("Last-Modified")
+        .unwrap_or("")
+        .to_string();
+    let etag = put_resp.headers.get("Etag").unwrap_or("").to_string();
+    let body_note = match &put_resp.body {
+        Body::Buffered(b) if !b.is_empty() => String::from_utf8_lossy(b).into_owned(),
+        _ => String::new(),
+    };
+    let payload = if want_json {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "Response Status".into(),
+            format!("{status} {}", swift_http::reason_phrase(status)).into(),
+        );
+        map.insert("Response Body".into(), body_note.into());
+        map.insert("Errors".into(), serde_json::json!([]));
+        if (200..300).contains(&status) {
+            if !etag.is_empty() {
+                map.insert("Etag".into(), etag.into());
+            }
+            if !last_modified.is_empty() {
+                map.insert("Last Modified".into(), last_modified.into());
+            }
+        }
+        serde_json::Value::Object(map).to_string().into_bytes()
+    } else {
+        let mut lines = vec![format!(
+            "Response Status: {status} {}",
+            swift_http::reason_phrase(status)
+        )];
+        if (200..300).contains(&status) {
+            if !etag.is_empty() {
+                lines.push(format!("Etag: {etag}"));
+            }
+            if !last_modified.is_empty() {
+                lines.push(format!("Last Modified: {last_modified}"));
+            }
+        } else if !body_note.is_empty() {
+            lines.push(format!("Response Body: {body_note}"));
+        }
+        lines.push("Errors:".into());
+        let mut text = lines.join("\n");
+        text.push('\n');
+        text.into_bytes()
+    };
+    let mut body = b" \r\n\r\n".to_vec();
+    body.extend_from_slice(&payload);
+    let mut out = Response::new(202);
+    out.headers.set(
+        "Content-Type",
+        if want_json {
+            "application/json"
+        } else {
+            "text/plain"
+        },
+    );
+    out.body = Body::from_reader(Box::new(std::io::Cursor::new(body)), None);
+    out
+}
+
+fn multipart_range_body(
+    boundary: &str,
+    ranges: &[(u64, u64)],
+    pieces: &[Vec<u8>],
+    content_type: &str,
+    size: u64,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (i, &(start, stop)) in ranges.iter().enumerate() {
+        out.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        out.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
+        out.extend_from_slice(
+            format!(
+                "Content-Range: bytes {start}-{}/{size}\r\n\r\n",
+                stop.saturating_sub(1)
+            )
+            .as_bytes(),
+        );
+        if let Some(p) = pieces.get(i) {
+            out.extend_from_slice(p);
+        }
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(format!("--{boundary}--").as_bytes());
+    out
+}
+
 fn slo_subreq(orig: &Request, path: String, range: Option<&str>) -> Request {
     let mut headers = orig.headers.clone();
     headers.remove("Range");
@@ -870,18 +1101,28 @@ impl Slo {
         let version = parts[0].clone().unwrap_or_default();
         let account = parts[1].clone().unwrap_or_default();
 
-        // Resolve a single top-level Range against the aggregate length.
+        let part_num = match parse_part_number(&orig) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        // Resolve Range / part-number against the aggregate length.
         let mut byte_range: Option<(u64, u64)> = None;
+        let mut multi_ranges: Option<Vec<(u64, u64)>> = None;
         let mut unsatisfiable = false;
-        let range = orig
+        if let Some(pn) = part_num {
+            match part_byte_range(&segments, pn) {
+                Some(r) => byte_range = Some(r),
+                None => unsatisfiable = true,
+            }
+        } else if let Some(range) = orig
             .headers
             .get("Range")
             .and_then(|h| Range::parse(h).ok())
-            .filter(|r| r.ranges.len() == 1);
-        if let Some(range) = range {
+        {
             match range.ranges_for_length(Some(total_len.max(0) as u64)) {
                 Some(r) if r.is_empty() => unsatisfiable = true,
-                Some(r) => byte_range = Some(r[0]),
+                Some(r) if r.len() == 1 => byte_range = Some(r[0]),
+                Some(r) => multi_ranges = Some(r),
                 None => {}
             }
         }
@@ -891,6 +1132,11 @@ impl Slo {
             r.headers.set("Accept-Ranges", "bytes");
             r.headers
                 .set("Content-Range", format!("bytes */{}", total_len.max(0)));
+            if part_num.is_some() {
+                r.headers.set("X-Parts-Count", segments.len().to_string());
+                r.headers.set("Content-Length", "0");
+                r.body = Body::empty();
+            }
             return r;
         }
 
@@ -905,6 +1151,9 @@ impl Slo {
             headers.set(MANIFEST_ETAG_HEADER, json_etag);
         }
         headers.set("Accept-Ranges", "bytes");
+        if part_num.is_some() {
+            headers.set("X-Parts-Count", segments.len().to_string());
+        }
 
         // Expand nested sub_slo manifests before committing the response
         // status (a depth/parse failure is still a 409 the client can see).
@@ -944,6 +1193,47 @@ impl Slo {
                 Body::empty()
             };
             (206u16, body, len)
+        } else if let Some(ranges) = multi_ranges {
+            let ctype = headers
+                .get("Content-Type")
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            let boundary = format!("slo{total_len}");
+            let mut pieces = Vec::new();
+            if is_get {
+                for &(first, last_excl) in &ranges {
+                    let ranged = match slice_leaves_for_range(&leaves, first, last_excl) {
+                        Ok(l) => l,
+                        Err(err) => return err,
+                    };
+                    let mut b = Self::leaf_stream_body(
+                        orig.clone_head(),
+                        version.clone(),
+                        account.clone(),
+                        ranged,
+                        Arc::clone(next),
+                        last_excl - first,
+                    );
+                    pieces.push(
+                        b.materialize(u64::MAX)
+                            .map(|s| s.to_vec())
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            let mp = multipart_range_body(
+                &boundary,
+                &ranges,
+                &pieces,
+                &ctype,
+                total_len.max(0) as u64,
+            );
+            headers.set(
+                "Content-Type",
+                multipart_byteranges_content_type(&boundary),
+            );
+            let len = mp.len() as i64;
+            (206u16, mp.into(), len)
         } else if is_get {
             let body = Self::leaf_stream_body(
                 orig.clone_head(),
@@ -1080,17 +1370,27 @@ impl Slo {
         let version = parts[0].clone().unwrap_or_default();
         let account = parts[1].clone().unwrap_or_default();
 
+        let part_num = match parse_part_number(&orig) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
         let mut byte_range: Option<(u64, u64)> = None;
+        let mut multi_ranges: Option<Vec<(u64, u64)>> = None;
         let mut unsatisfiable = false;
-        let range = orig
+        if let Some(pn) = part_num {
+            match part_byte_range(&segments, pn) {
+                Some(r) => byte_range = Some(r),
+                None => unsatisfiable = true,
+            }
+        } else if let Some(range) = orig
             .headers
             .get("Range")
             .and_then(|h| Range::parse(h).ok())
-            .filter(|r| r.ranges.len() == 1);
-        if let Some(range) = range {
+        {
             match range.ranges_for_length(Some(total_len.max(0) as u64)) {
                 Some(r) if r.is_empty() => unsatisfiable = true,
-                Some(r) => byte_range = Some(r[0]),
+                Some(r) if r.len() == 1 => byte_range = Some(r[0]),
+                Some(r) => multi_ranges = Some(r),
                 None => {}
             }
         }
@@ -1099,6 +1399,11 @@ impl Slo {
             r.headers.set("Accept-Ranges", "bytes");
             r.headers
                 .set("Content-Range", format!("bytes */{}", total_len.max(0)));
+            if part_num.is_some() {
+                r.headers.set("X-Parts-Count", segments.len().to_string());
+                r.headers.set("Content-Length", "0");
+                r.body = Body::empty();
+            }
             return r;
         }
 
@@ -1113,6 +1418,9 @@ impl Slo {
             headers.set(MANIFEST_ETAG_HEADER, json_etag);
         }
         headers.set("Accept-Ranges", "bytes");
+        if part_num.is_some() {
+            headers.set("X-Parts-Count", segments.len().to_string());
+        }
 
         let leaves = if is_get {
             match expand_segments_async(
@@ -1159,6 +1467,47 @@ impl Slo {
                 Body::empty()
             };
             (206u16, body, len)
+        } else if let Some(ranges) = multi_ranges {
+            let ctype = headers
+                .get("Content-Type")
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            let boundary = format!("slo{total_len}");
+            let mut pieces = Vec::new();
+            if is_get {
+                for &(first, last_excl) in &ranges {
+                    let ranged = match slice_leaves_for_range(&leaves, first, last_excl) {
+                        Ok(l) => l,
+                        Err(err) => return err,
+                    };
+                    let mut b = leaf_stream_channel(
+                        orig.clone_head(),
+                        version.clone(),
+                        account.clone(),
+                        ranged,
+                        next.clone(),
+                        last_excl - first,
+                    );
+                    pieces.push(
+                        b.materialize(u64::MAX)
+                            .map(|s| s.to_vec())
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            let mp = multipart_range_body(
+                &boundary,
+                &ranges,
+                &pieces,
+                &ctype,
+                total_len.max(0) as u64,
+            );
+            headers.set(
+                "Content-Type",
+                multipart_byteranges_content_type(&boundary),
+            );
+            let len = mp.len() as i64;
+            (206u16, mp.into(), len)
         } else if is_get {
             let body = leaf_stream_channel(
                 orig.clone_head(),
@@ -1226,6 +1575,9 @@ impl Slo {
     /// final JSON status. Non-heartbeat PUT uses up to [`Self::concurrent_gets`]
     /// threads for segment HEAD pile (Python `concurrency`).
     fn handle_put(&self, mut req: Request, next: &NextFn) -> Response {
+        if let Some(rej) = if_none_match_put_rejected(&req) {
+            return rej;
+        }
         let heartbeat = req
             .param("heartbeat")
             .as_deref()
@@ -1300,6 +1652,15 @@ impl Slo {
     }
 
     async fn handle_put_async(&self, mut req: Request, next: AsyncNextFn) -> Response {
+        if let Some(rej) = if_none_match_put_rejected(&req) {
+            return rej;
+        }
+        let heartbeat = req
+            .param("heartbeat")
+            .as_deref()
+            .map(config_true_value)
+            .unwrap_or(false);
+        let accept = req.headers.get("Accept").map(str::to_string);
         let manifest_bytes = match req.body.materialize(MAX_MANIFEST_SIZE) {
             Ok(b) => b.to_vec(),
             Err(e) if body_too_large(&e) => {
@@ -1372,6 +1733,10 @@ impl Slo {
             }
         });
         let built = validate_put_entries(&req, entries, &version, &account, &next_heads, &mut || {});
+        if heartbeat {
+            let put_resp = finish_put_async(req, next, built).await;
+            return wrap_heartbeat_response(put_resp, accept.as_deref());
+        }
         finish_put_async(req, next, built).await
     }
 
@@ -2262,10 +2627,8 @@ fn finish_put(mut req: Request, next: &NextFn, built: PutManifestBuilt) -> Respo
     req.headers.set(SYSMETA_SLO_SIZE, total.to_string());
     // The object server validates the transformed stored JSON, not the client
     // manifest or the aggregate large-object representation.
-    req.headers.set("Etag", json_etag);
-    if req.headers.get("Content-Type").is_none() {
-        req.headers.set("Content-Type", "application/json");
-    }
+    req.headers.set("Etag", &json_etag);
+    apply_slo_put_listing_headers(&mut req, &json_etag, slo_etag.trim_matches('"'), total);
     req.body = body.into();
     let mut resp = next(req);
     if (200..300).contains(&resp.status) {
@@ -2311,10 +2674,8 @@ async fn finish_put_async(
     req.headers
         .set(SYSMETA_SLO_ETAG, slo_etag.trim_matches('"'));
     req.headers.set(SYSMETA_SLO_SIZE, total.to_string());
-    req.headers.set("Etag", json_etag);
-    if req.headers.get("Content-Type").is_none() {
-        req.headers.set("Content-Type", "application/json");
-    }
+    req.headers.set("Etag", &json_etag);
+    apply_slo_put_listing_headers(&mut req, &json_etag, slo_etag.trim_matches('"'), total);
     req.body = body.into();
     let mut resp = next(req).await;
     if (200..300).contains(&resp.status) {
@@ -2591,6 +2952,8 @@ impl Middleware for Slo {
             && req.param("multipart-manifest").as_deref() != Some("get")
         {
             ignore_range(&mut req.headers, SLO_HEADER);
+            // Object-server apply_conditional reads SLO etag from sysmeta.
+            update_etag_is_at_header(req, SYSMETA_SLO_ETAG);
         }
         MwPrep::Continue
     }
@@ -2632,6 +2995,11 @@ impl Middleware for Slo {
     ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
         Box::pin(async move {
             if split_path(&req.path, 4, 4, true).is_err() {
+                if req.method == "GET" && split_path(&req.path, 3, 3, false).is_ok() {
+                    let mut resp = next(req).await;
+                    rewrite_listing_slo_etag(&mut resp);
+                    return resp;
+                }
                 return next(req).await;
             }
             let mpm = req.param("multipart-manifest");
@@ -2650,6 +3018,11 @@ impl Middleware for Slo {
 
     fn handle(&self, req: Request, next: &NextFn) -> Response {
         if split_path(&req.path, 4, 4, true).is_err() {
+            if req.method == "GET" && split_path(&req.path, 3, 3, false).is_ok() {
+                let mut resp = next(req);
+                rewrite_listing_slo_etag(&mut resp);
+                return resp;
+            }
             return next(req);
         }
         let mpm = req.param("multipart-manifest");

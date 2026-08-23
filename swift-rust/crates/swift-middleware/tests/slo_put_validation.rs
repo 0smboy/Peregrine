@@ -176,6 +176,14 @@ fn ordinary_segment_uses_head_metadata() {
     let physical_etag = md5_hex(&writes[0].body);
     assert_eq!(writes[0].headers.get("Etag"), Some(physical_etag.as_str()));
     assert_ne!(physical_etag, slo_etag);
+    let ct = writes[0].headers.get("Content-Type").unwrap_or("");
+    assert!(ct.contains("swift_bytes=3"), "{ct}");
+    assert_eq!(
+        writes[0]
+            .headers
+            .get("X-Object-Sysmeta-Container-Update-Override-Etag"),
+        Some(format!("{physical_etag}; slo_etag={slo_etag}").as_str())
+    );
 }
 
 #[test]
@@ -545,4 +553,110 @@ async fn async_manifest_get_sets_json_content_type() {
         response.headers.get("Content-Type"),
         Some("application/json; charset=utf-8")
     );
+}
+
+#[test]
+fn container_listing_splits_slo_etag_from_hash() {
+    let listing = serde_json::to_vec(&json!([
+        {"name": "o", "bytes": 3, "hash": "deadbeef; slo_etag=slohash", "content_type": "application/octet-stream", "last_modified": "2020-01-01T00:00:00.000000"},
+        {"subdir": "p/"}
+    ])).unwrap();
+    let backend_body = listing.clone();
+    let backend: NextFn = Arc::new(move |_r: Request| {
+        let mut resp = Response::with_body(200, backend_body.clone());
+        resp.headers.set("Content-Type", "application/json; charset=utf-8");
+        resp
+    });
+    let req = Request {
+        method: "GET".into(),
+        path: "/v1/a/c".into(),
+        query_string: "format=json".into(),
+        headers: HeaderKeyDict::new(),
+        body: Vec::<u8>::new().into(),
+    };
+    let mut resp = Slo::new().handle(req, &backend);
+    resp.body.materialize(u64::MAX).unwrap();
+    let v: Value = serde_json::from_slice(match &resp.body {
+        swift_http::Body::Buffered(b) => b,
+        _ => panic!("expected buffered"),
+    }).unwrap();
+    assert_eq!(v[0]["hash"], "deadbeef");
+    assert_eq!(v[0]["slo_etag"], "\"slohash\"");
+    assert_eq!(v[1]["subdir"], "p/");
+    let _ = listing;
+}
+
+#[test]
+fn prepare_sets_etag_is_at_for_object_get() {
+    let mut req = Request {
+        method: "GET".into(),
+        path: "/v1/a/c/o".into(),
+        query_string: String::new(),
+        headers: HeaderKeyDict::new(),
+        body: Vec::<u8>::new().into(),
+    };
+    let _ = Slo::new().prepare(&mut req);
+    assert_eq!(
+        req.headers.get("X-Backend-Etag-Is-At"),
+        Some("X-Object-Sysmeta-Slo-Etag")
+    );
+}
+
+#[tokio::test]
+async fn async_heartbeat_put_is_202_chunked() {
+    let backend: AsyncNextFn = Arc::new(|mut request: Request| {
+        Box::pin(async move {
+            if request.method == "HEAD" {
+                let mut r = Response::new(200);
+                r.headers.set("Etag", "e");
+                r.headers.set("Content-Length", "1");
+                return r;
+            }
+            if request.method == "PUT" {
+                let _ = request.body.materialize(u64::MAX);
+                let mut r = Response::new(201);
+                r.headers.set("Etag", "\"slo\"");
+                r.headers.set("Last-Modified", "Mon, 01 Jan 2020 00:00:00 GMT");
+                return r;
+            }
+            Response::new(404)
+        })
+    });
+    let body = serde_json::to_vec(&json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}])).unwrap();
+    let mut headers = HeaderKeyDict::new();
+    headers.set("Content-Type", "application/json");
+    headers.set("Content-Length", body.len().to_string());
+    let request = Request {
+        method: "PUT".into(),
+        path: "/v1/a/c/manifest".into(),
+        query_string: "multipart-manifest=put&heartbeat=on".into(),
+        headers,
+        body: body.into(),
+    };
+    let mut resp = Slo::new().handle_request_async(request, backend).await;
+    assert_eq!(resp.status, 202);
+    assert_eq!(resp.body.content_length(), None);
+    let bytes = resp.body.materialize(u64::MAX).unwrap();
+    assert!(bytes.starts_with(b" "), "{bytes:?}");
+    assert!(bytes.windows(4).any(|w| w == b"\r\n\r\n"));
+    let text = String::from_utf8_lossy(bytes);
+    assert!(text.contains("201 Created"), "{text}");
+    assert!(text.contains("Etag"), "{text}");
+}
+
+#[test]
+fn if_none_match_not_star_is_400() {
+    let backend: NextFn = Arc::new(|_r: Request| Response::new(500));
+    let body = serde_json::to_vec(&json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}])).unwrap();
+    let mut headers = HeaderKeyDict::new();
+    headers.set("If-None-Match", "\"not-star\"");
+    let req = Request {
+        method: "PUT".into(),
+        path: "/v1/a/c/manifest".into(),
+        query_string: "multipart-manifest=put".into(),
+        headers,
+        body: body.into(),
+    };
+    let resp = Slo::new().handle(req, &backend);
+    assert_eq!(resp.status, 400);
 }
