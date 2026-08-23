@@ -96,6 +96,60 @@ const SYMLOOP_EXTEND: &str = "X-Object-Sysmeta-Symloop-Extend";
 const CONTAINER_UPDATE_OVERRIDE_ETAG: &str = "X-Object-Sysmeta-Container-Update-Override-Etag";
 const IGNORE_RANGE_HDR: &str = "X-Backend-Ignore-Range-If-Metadata-Present";
 const MD5_OF_EMPTY_STRING: &str = "d41d8cd98f00b204e9800998ecf8427e";
+const SYSMETA_SLO_ETAG: &str = "X-Object-Sysmeta-Slo-Etag";
+
+/// Python `_validate_etag_and_update_sysmeta`: carry SLO listing etag onto
+/// the zero-byte symlink so container listings expose `slo_etag`.
+fn carry_slo_listing_etag(req: &mut Request, resp: &Response) {
+    if req.headers.contains_key(CONTAINER_UPDATE_OVERRIDE_ETAG) {
+        return;
+    }
+    if let Some(slo_etag) = resp
+        .headers
+        .get(SYSMETA_SLO_ETAG)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+    {
+        req.headers.set(
+            CONTAINER_UPDATE_OVERRIDE_ETAG,
+            format!("{MD5_OF_EMPTY_STRING}; slo_etag={slo_etag}"),
+        );
+        return;
+    }
+    if let Some(ov) = resp.headers.get(CONTAINER_UPDATE_OVERRIDE_ETAG) {
+        if let Some((_, params)) = ov.split_once(';') {
+            if !params.trim().is_empty() {
+                req.headers.set(
+                    CONTAINER_UPDATE_OVERRIDE_ETAG,
+                    format!("{MD5_OF_EMPTY_STRING};{params}"),
+                );
+            }
+        }
+    }
+}
+
+fn copy_target_content_type(req: &mut Request, resp: &Response) {
+    let has_ct = req
+        .headers
+        .get("Content-Type")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    if has_ct {
+        return;
+    }
+    let Some(ct) = resp.headers.get("Content-Type") else {
+        return;
+    };
+    let cleaned = ct
+        .split(';')
+        .map(str::trim)
+        .filter(|p| !p.is_empty() && !p.starts_with("swift_bytes="))
+        .collect::<Vec<_>>()
+        .join(";");
+    if !cleaned.is_empty() {
+        req.headers.set("Content-Type", cleaned);
+    }
+}
 
 /// True for 2xx status codes (`swift.common.http.is_success`).
 fn is_success(status: u16) -> bool {
@@ -511,17 +565,8 @@ impl Symlink {
             .to_string();
         req.headers.set(TGT_BYTES_SYSMETA_SYMLINK_HDR, bytes);
         req.headers.set(TGT_ETAG_SYSMETA_SYMLINK_HDR, etag);
-
-        let has_ct = req
-            .headers
-            .get("Content-Type")
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
-        if !has_ct {
-            if let Some(ct) = resp.headers.get("Content-Type").map(str::to_string) {
-                req.headers.set("Content-Type", ct);
-            }
-        }
+        carry_slo_listing_etag(req, &resp);
+        copy_target_content_type(req, &resp);
         None
     }
 
@@ -796,17 +841,8 @@ impl Symlink {
             .to_string();
         req.headers.set(TGT_BYTES_SYSMETA_SYMLINK_HDR, bytes);
         req.headers.set(TGT_ETAG_SYSMETA_SYMLINK_HDR, etag);
-
-        let has_ct = req
-            .headers
-            .get("Content-Type")
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
-        if !has_ct {
-            if let Some(ct) = resp.headers.get("Content-Type").map(str::to_string) {
-                req.headers.set("Content-Type", ct);
-            }
-        }
+        carry_slo_listing_etag(req, &resp);
+        copy_target_content_type(req, &resp);
         None
     }
 
@@ -1634,6 +1670,57 @@ mod tests {
                  symlink_target_etag=abc123; symlink_target_bytes=100"
             )
         );
+    }
+
+    #[test]
+    fn test_put_static_symlink_to_slo_carries_slo_etag() {
+        let mw = Symlink::default();
+        let echo = echo_backend(201);
+        let be: BackendArc = Arc::new(move |r: Request| {
+            if r.method == "HEAD" && r.path == "/v1/a/c2/manifest" {
+                let mut target = Response::new(200);
+                target.headers.set("Etag", "physicaljson");
+                target.headers.set("Content-Length", "12");
+                target
+                    .headers
+                    .set("Content-Type", "application/octet-stream;swift_bytes=1048577");
+                target.headers.set("X-Static-Large-Object", "True");
+                target.headers.set(SYSMETA_SLO_ETAG, "slohash");
+                target
+                    .headers
+                    .set("X-Object-Sysmeta-Slo-Size", "1048577");
+                return target;
+            }
+            echo(r)
+        });
+        let resp = run(
+            &mw,
+            req(
+                "PUT",
+                "/v1/a/c/link",
+                &[
+                    (TGT_OBJ_SYMLINK_HDR, "c2/manifest"),
+                    (TGT_ETAG_SYMLINK_HDR, "physicaljson"),
+                ],
+            ),
+            be,
+        );
+        assert_eq!(resp.status, 201);
+        assert_eq!(
+            resp.headers.get("Echo-Content-Type"),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            resp.headers
+                .get(&format!("Echo-{TGT_BYTES_SYSMETA_SYMLINK_HDR}")),
+            Some("1048577")
+        );
+        let ov = resp
+            .headers
+            .get(&format!("Echo-{CONTAINER_UPDATE_OVERRIDE_ETAG}"))
+            .unwrap_or("");
+        assert!(ov.contains("slo_etag=slohash"), "{ov}");
+        assert!(ov.contains("symlink_target=c2/manifest"), "{ov}");
     }
 
     #[test]

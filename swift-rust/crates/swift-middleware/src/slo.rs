@@ -742,18 +742,79 @@ fn parse_part_number(req: &Request) -> Result<Option<usize>, Response> {
     };
     let parsed = raw.parse::<i64>().ok().filter(|&n| n > 0);
     let Some(n) = parsed else {
-        return Err(Response::error(
-            400,
-            "Part number must be an integer greater than 0",
-        ));
+        let msg = "Part number must be an integer greater than 0";
+        let mut resp = if req.method == "HEAD" {
+            Response::new(400)
+        } else {
+            Response::with_body(400, msg)
+        };
+        if req.method != "HEAD" {
+            resp.headers.set("Content-Type", "text/plain; charset=utf-8");
+            resp.headers.set("Content-Length", msg.len());
+        }
+        return Err(resp);
     };
     if req.headers.get("Range").is_some() {
-        return Err(Response::error(
-            400,
-            "Range requests are not supported with part number queries",
-        ));
+        let msg = "Range requests are not supported with part number queries";
+        let mut resp = if req.method == "HEAD" {
+            Response::new(400)
+        } else {
+            Response::with_body(400, msg)
+        };
+        if req.method != "HEAD" {
+            resp.headers.set("Content-Type", "text/plain; charset=utf-8");
+            resp.headers.set("Content-Length", msg.len());
+        }
+        return Err(resp);
     }
     Ok(Some(n as usize))
+}
+
+fn part_unsatisfiable(
+    orig: &Request,
+    etag: &str,
+    json_etag: Option<&str>,
+    total: i64,
+    nseg: usize,
+) -> Response {
+    let msg = "The requested part number is not satisfiable";
+    let mut r = if orig.method == "HEAD" {
+        Response::new(416)
+    } else {
+        Response::with_body(416, msg)
+    };
+    r.headers.set("Accept-Ranges", "bytes");
+    r.headers.set("Content-Range", format!("bytes */{total}"));
+    r.headers.set(SLO_HEADER, "True");
+    r.headers.set("Etag", format!("\"{etag}\""));
+    if let Some(j) = json_etag {
+        r.headers.set(MANIFEST_ETAG_HEADER, j);
+    }
+    r.headers.set("X-Parts-Count", nseg.to_string());
+    if orig.method == "HEAD" {
+        r.headers.set("Content-Length", "0");
+    } else {
+        r.headers.set("Content-Type", "text/plain; charset=utf-8");
+        r.headers.set("Content-Length", msg.len());
+    }
+    r
+}
+
+fn strip_swift_bytes_content_type(headers: &mut HeaderKeyDict) {
+    let Some(ct) = headers.get("Content-Type") else {
+        return;
+    };
+    let cleaned = ct
+        .split(';')
+        .map(str::trim)
+        .filter(|p| !p.is_empty() && !p.starts_with("swift_bytes="))
+        .collect::<Vec<_>>()
+        .join(";");
+    if cleaned.is_empty() {
+        headers.remove("Content-Type");
+    } else {
+        headers.set("Content-Type", cleaned);
+    }
 }
 
 fn part_byte_range(segs: &[StoredSeg], part_num: usize) -> Option<(u64, u64)> {
@@ -818,6 +879,32 @@ fn rewrite_listing_slo_etag(resp: &mut Response) {
             obj.insert("hash".into(), etag.into());
             obj.insert("slo_etag".into(), format!("\"{slo}\"").into());
         }
+        if let Some(ct) = obj
+            .get("content_type")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        {
+            let mut bytes_override = None;
+            let cleaned = ct
+                .split(';')
+                .map(str::trim)
+                .filter(|p| {
+                    if let Some(v) = p.strip_prefix("swift_bytes=") {
+                        bytes_override = v.parse::<i64>().ok();
+                        false
+                    } else {
+                        !p.is_empty()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(";");
+            if let Some(n) = bytes_override {
+                obj.insert("bytes".into(), n.into());
+            }
+            if !cleaned.is_empty() {
+                obj.insert("content_type".into(), cleaned.into());
+            }
+        }
     }
     let body = serde_json::to_vec(&listing).unwrap_or_default();
     resp.headers.set("Content-Length", body.len().to_string());
@@ -858,7 +945,15 @@ fn if_none_match_put_rejected(req: &Request) -> Option<Response> {
     }
 }
 
-fn wrap_heartbeat_response(put_resp: Response, accept: Option<&str>) -> Response {
+/// webob `RESPONSE_REASONS[400]` joined with `\n` — heartbeat JSON
+/// `Response Body` when the PUT failed with HTTPBadRequest.
+const HEARTBEAT_400_BODY: &str = "Bad Request\nThe server could not comply with the request since it is either malformed or otherwise incorrect.";
+
+fn wrap_heartbeat_response(
+    put_resp: Response,
+    accept: Option<&str>,
+    errors: &[(String, String)],
+) -> Response {
     let want_json = accept
         .map(|a| a.to_ascii_lowercase().contains("application/json"))
         .unwrap_or(false);
@@ -869,19 +964,31 @@ fn wrap_heartbeat_response(put_resp: Response, accept: Option<&str>) -> Response
         .unwrap_or("")
         .to_string();
     let etag = put_resp.headers.get("Etag").unwrap_or("").to_string();
+    let success = (200..300).contains(&status) && errors.is_empty();
     let body_note = match &put_resp.body {
         Body::Buffered(b) if !b.is_empty() => String::from_utf8_lossy(b).into_owned(),
         _ => String::new(),
     };
+    let json_body = if success {
+        body_note
+    } else if status == 400 {
+        HEARTBEAT_400_BODY.to_string()
+    } else {
+        swift_http::reason_phrase(status).to_string()
+    };
+    let error_json: Vec<serde_json::Value> = errors
+        .iter()
+        .map(|(name, st)| serde_json::json!([name, st]))
+        .collect();
     let payload = if want_json {
         let mut map = serde_json::Map::new();
         map.insert(
             "Response Status".into(),
             format!("{status} {}", swift_http::reason_phrase(status)).into(),
         );
-        map.insert("Response Body".into(), body_note.into());
-        map.insert("Errors".into(), serde_json::json!([]));
-        if (200..300).contains(&status) {
+        map.insert("Response Body".into(), json_body.into());
+        map.insert("Errors".into(), error_json.into());
+        if success {
             if !etag.is_empty() {
                 map.insert("Etag".into(), etag.into());
             }
@@ -895,17 +1002,23 @@ fn wrap_heartbeat_response(put_resp: Response, accept: Option<&str>) -> Response
             "Response Status: {status} {}",
             swift_http::reason_phrase(status)
         )];
-        if (200..300).contains(&status) {
+        if success {
             if !etag.is_empty() {
                 lines.push(format!("Etag: {etag}"));
             }
             if !last_modified.is_empty() {
                 lines.push(format!("Last Modified: {last_modified}"));
             }
-        } else if !body_note.is_empty() {
-            lines.push(format!("Response Body: {body_note}"));
+        } else {
+            lines.push(format!(
+                "Response Body: {}",
+                swift_http::reason_phrase(status)
+            ));
         }
         lines.push("Errors:".into());
+        for (name, st) in errors {
+            lines.push(format!("{name}, {st}"));
+        }
         let mut text = lines.join("\n");
         text.push('\n');
         text.into_bytes()
@@ -988,7 +1101,7 @@ impl Slo {
             .map(config_true_value)
             .unwrap_or(false);
         if !is_slo {
-            return resp;
+            return apply_conditional(&orig, resp);
         }
 
         // The backend Etag names the physical stored-manifest JSON.  Preserve
@@ -1015,12 +1128,21 @@ impl Slo {
             .and_then(|s| s.parse::<i64>().ok());
 
         let is_get = orig.method == "GET";
+        let need_segments = is_get || orig.param("part-number").is_some();
 
         // Resolve segments when we need them for streaming, or when sysmeta
-        // is missing (legacy manifests). HEAD with sysmeta skips the body.
+        // is missing (legacy manifests). HEAD with sysmeta skips the body
+        // unless part-number needs the stored segment list.
         let (etag, total_len, segments) = if let (Some(e), Some(sz)) = (&sys_etag, sys_size) {
-            if is_get {
-                // Still need the segment listing for reassembly.
+            if need_segments {
+                if !is_get {
+                    let mut get_req = orig.clone_head();
+                    get_req.method = "GET".to_string();
+                    ignore_range(&mut get_req.headers, SLO_HEADER);
+                    strip_conditionals(&mut get_req.headers);
+                    resp = next(get_req);
+                }
+                // Still need the segment listing for reassembly / part-number.
                 let manifest_bytes = match resp.body.materialize(MAX_CONTROL_BODY) {
                     Ok(body) => body,
                     Err(_) => return resp,
@@ -1128,19 +1250,24 @@ impl Slo {
         }
 
         if unsatisfiable {
+            if part_num.is_some() {
+                return part_unsatisfiable(
+                    &orig,
+                    &etag,
+                    json_etag.as_deref(),
+                    total_len.max(0),
+                    segments.len(),
+                );
+            }
             let mut r = Response::error(416, "Requested Range Not Satisfiable");
             r.headers.set("Accept-Ranges", "bytes");
             r.headers
                 .set("Content-Range", format!("bytes */{}", total_len.max(0)));
-            if part_num.is_some() {
-                r.headers.set("X-Parts-Count", segments.len().to_string());
-                r.headers.set("Content-Length", "0");
-                r.body = Body::empty();
-            }
             return r;
         }
 
         let mut headers = resp.headers.clone();
+        strip_swift_bytes_content_type(&mut headers);
         headers.remove("Content-Length");
         headers.remove("Content-Range");
         headers.remove("Transfer-Encoding");
@@ -1267,7 +1394,7 @@ impl Slo {
             .map(config_true_value)
             .unwrap_or(false);
         if !is_slo {
-            return resp;
+            return apply_conditional(&orig, resp);
         }
 
         let mut json_etag = resp
@@ -1287,9 +1414,17 @@ impl Slo {
             .get(SYSMETA_SLO_SIZE)
             .and_then(|s| s.parse::<i64>().ok());
         let is_get = orig.method == "GET";
+        let need_segments = is_get || orig.param("part-number").is_some();
 
         let (etag, total_len, segments) = if let (Some(e), Some(sz)) = (&sys_etag, sys_size) {
-            if is_get {
+            if need_segments {
+                if !is_get {
+                    let mut get_req = orig.clone_head();
+                    get_req.method = "GET".to_string();
+                    ignore_range(&mut get_req.headers, SLO_HEADER);
+                    strip_conditionals(&mut get_req.headers);
+                    resp = next(get_req).await;
+                }
                 let body = std::mem::replace(&mut resp.body, Body::empty());
                 let manifest_bytes = match body.collect_async().await {
                     Ok(body) => body,
@@ -1395,19 +1530,24 @@ impl Slo {
             }
         }
         if unsatisfiable {
+            if part_num.is_some() {
+                return part_unsatisfiable(
+                    &orig,
+                    &etag,
+                    json_etag.as_deref(),
+                    total_len.max(0),
+                    segments.len(),
+                );
+            }
             let mut r = Response::error(416, "Requested Range Not Satisfiable");
             r.headers.set("Accept-Ranges", "bytes");
             r.headers
                 .set("Content-Range", format!("bytes */{}", total_len.max(0)));
-            if part_num.is_some() {
-                r.headers.set("X-Parts-Count", segments.len().to_string());
-                r.headers.set("Content-Length", "0");
-                r.body = Body::empty();
-            }
             return r;
         }
 
         let mut headers = resp.headers.clone();
+        strip_swift_bytes_content_type(&mut headers);
         headers.remove("Content-Length");
         headers.remove("Content-Range");
         headers.remove("Transfer-Encoding");
@@ -1717,6 +1857,7 @@ impl Slo {
             head.path = seg_path.clone();
             head.query_string = String::new();
             head.headers.remove("Content-Length");
+            strip_conditionals(&mut head.headers);
             let hr = next(head).await;
             heads.insert(seg_path, (hr.status, hr.headers));
         }
@@ -1734,8 +1875,15 @@ impl Slo {
         });
         let built = validate_put_entries(&req, entries, &version, &account, &next_heads, &mut || {});
         if heartbeat {
+            if !built.problem_segments.is_empty() {
+                return wrap_heartbeat_response(
+                    Response::error(400, "Bad Request"),
+                    accept.as_deref(),
+                    &built.problem_segments,
+                );
+            }
             let put_resp = finish_put_async(req, next, built).await;
-            return wrap_heartbeat_response(put_resp, accept.as_deref());
+            return wrap_heartbeat_response(put_resp, accept.as_deref(), &[]);
         }
         finish_put_async(req, next, built).await
     }
@@ -2241,7 +2389,9 @@ impl Slo {
         let body = serde_json::to_vec(&raw).unwrap_or_default();
         resp.headers.set("Content-Length", body.len().to_string());
         resp.headers.set("Etag", manifest_etag(&body));
-        // Keep the large object's Content-Type (Python) so SSC works.
+        // Keep the large object's Content-Type (Python) so SSC works, minus
+        // the listing-only `swift_bytes` parameter.
+        strip_swift_bytes_content_type(&mut resp.headers);
         resp.body = body.into();
         resp
     }
@@ -2315,6 +2465,7 @@ impl Slo {
         let body = serde_json::to_vec(&raw).unwrap_or_default();
         resp.headers.set("Content-Length", body.len().to_string());
         resp.headers.set("Etag", manifest_etag(&body));
+        strip_swift_bytes_content_type(&mut resp.headers);
         resp.body = body.into();
     }
 
@@ -2337,6 +2488,9 @@ struct PutManifestBuilt {
     internal: Vec<serde_json::Value>,
     slo_segs: Vec<SloSegment>,
     errors: Vec<String>,
+    /// `(path, "404 Not Found")` — heartbeat `Errors` list (Python
+    /// `problem_segments`).
+    problem_segments: Vec<(String, String)>,
     has_object_backed: bool,
     entry_count: usize,
 }
@@ -2354,6 +2508,7 @@ fn validate_put_entries(
     let mut internal: Vec<serde_json::Value> = Vec::new();
     let mut slo_segs: Vec<SloSegment> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    let mut problem_segments: Vec<(String, String)> = Vec::new();
     let mut has_object_backed = false;
     for (i, e) in entries.iter().enumerate() {
         let Some(e) = e.as_object() else {
@@ -2494,10 +2649,13 @@ fn validate_put_entries(
         head.path = seg_path.clone();
         head.query_string = String::new();
         head.headers.remove("Content-Length");
+        strip_conditionals(&mut head.headers);
         let hr = next(head);
         on_head();
         if !(200..300).contains(&hr.status) {
-            errors.push(format!("{path}, Segment Not Found"));
+            let reason = format!("{} {}", hr.status, swift_http::reason_phrase(hr.status));
+            problem_segments.push((path.to_string(), reason.clone()));
+            errors.push(format!("{path}, {reason}"));
             continue;
         }
         let is_sub_slo = hr
@@ -2587,6 +2745,7 @@ fn validate_put_entries(
         internal,
         slo_segs,
         errors,
+        problem_segments,
         has_object_backed,
         entry_count: entries.len(),
     }
@@ -2773,6 +2932,7 @@ fn concurrent_head_warm(
             head.path = path;
             head.query_string = String::new();
             head.headers.remove("Content-Length");
+            strip_conditionals(&mut head.headers);
             let _ = next(head);
         }));
     }
@@ -2808,22 +2968,21 @@ impl HeartbeatPutBody {
         );
         // Spaces collected during HEADs (after the leading space already sent).
         self.push(&spaces);
+        let problem_segments = built.problem_segments.clone();
         let resp = if !built.errors.is_empty() {
-            Response::error(400, &format!("Errors: {}", built.errors.join(", ")))
+            Response::error(400, "Bad Request")
         } else if built.entry_count > 0 && !built.has_object_backed {
             Response::error(
                 400,
                 "Inline data segments require at least one object-backed segment.",
             )
         } else {
-            // Need owned req for finish_put — clone_head + body empty then rebuild.
             let mut put_req = self.req.clone_head();
             put_req.method = "PUT".to_string();
-            // finish_put overwrites method/query/body/headers as needed.
             finish_put(put_req, &self.next, built)
         };
         self.push(b"\r\n\r\n");
-        self.push(&heartbeat_final_json(&resp));
+        self.push(&heartbeat_final_json(&resp, &problem_segments));
     }
 }
 
@@ -2856,16 +3015,26 @@ impl Read for HeartbeatPutBody {
     }
 }
 
-fn heartbeat_final_json(resp: &Response) -> Vec<u8> {
+fn heartbeat_final_json(resp: &Response, errors: &[(String, String)]) -> Vec<u8> {
     let status = resp.status;
-    let body_note = match &resp.body {
-        Body::Buffered(b) if !b.is_empty() => String::from_utf8_lossy(b).into_owned(),
-        _ => String::new(),
+    let body_note = if (200..300).contains(&status) {
+        match &resp.body {
+            Body::Buffered(b) if !b.is_empty() => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        }
+    } else if status == 400 {
+        HEARTBEAT_400_BODY.to_string()
+    } else {
+        swift_http::reason_phrase(status).to_string()
     };
+    let error_json: Vec<serde_json::Value> = errors
+        .iter()
+        .map(|(name, st)| serde_json::json!([name, st]))
+        .collect();
     let summary = serde_json::json!({
         "Response Status": format!("{status} {}", swift_http::reason_phrase(status)),
         "Response Body": body_note,
-        "Errors": [],
+        "Errors": error_json,
     });
     summary.to_string().into_bytes()
 }
@@ -2965,6 +3134,9 @@ impl Middleware for Slo {
         let mpm = req.param("multipart-manifest");
         (req.method == "PUT" && mpm.as_deref() == Some("put"))
             || (req.method == "DELETE" && mpm.as_deref() == Some("delete"))
+            || ((req.method == "GET" || req.method == "HEAD")
+                && (req.headers.contains_key("If-Match")
+                    || req.headers.contains_key("If-None-Match")))
     }
 
     fn intercepts_response(&self) -> bool {
@@ -2983,6 +3155,18 @@ impl Middleware for Slo {
             }
             if req.method == "DELETE" && mpm.as_deref() == Some("delete") {
                 return self.handle_multipart_delete_async(req, next).await;
+            }
+            // Conditional GET/HEAD: do not let the object-server apply
+            // If-Match against the physical JSON etag. intercepts_request
+            // skips later reassemble_async, so this must reassemble here.
+            if req.method == "GET" || req.method == "HEAD" {
+                if mpm.as_deref() == Some("get") {
+                    if req.param("format").as_deref() == Some("raw") {
+                        return self.handle_manifest_get_raw_async(req, next).await;
+                    }
+                    return self.handle_manifest_get_async(req, next).await;
+                }
+                return self.handle_get_head_async(req, next).await;
             }
             next(req).await
         })

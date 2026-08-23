@@ -660,3 +660,240 @@ fn if_none_match_not_star_is_400() {
     let resp = Slo::new().handle(req, &backend);
     assert_eq!(resp.status, 400);
 }
+
+#[tokio::test]
+async fn if_none_match_star_does_not_412_segment_heads() {
+    let saw_inm = Arc::new(Mutex::new(false));
+    let flag = Arc::clone(&saw_inm);
+    let backend: AsyncNextFn = Arc::new(move |mut request: Request| {
+        let flag = Arc::clone(&flag);
+        Box::pin(async move {
+            if request.method == "HEAD" {
+                if request.headers.get("If-None-Match").is_some() {
+                    *flag.lock().unwrap() = true;
+                    return Response::new(412);
+                }
+                let mut r = Response::new(200);
+                r.headers.set("Etag", "e");
+                r.headers.set("Content-Length", "1");
+                return r;
+            }
+            if request.method == "PUT" {
+                let _ = request.body.materialize(u64::MAX);
+                return Response::new(201);
+            }
+            Response::new(404)
+        })
+    });
+    let body = serde_json::to_vec(&json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}])).unwrap();
+    let mut headers = HeaderKeyDict::new();
+    headers.set("If-None-Match", "*");
+    headers.set("Content-Length", body.len().to_string());
+    let request = Request {
+        method: "PUT".into(),
+        path: "/v1/a/c/manifest".into(),
+        query_string: "multipart-manifest=put".into(),
+        headers,
+        body: body.into(),
+    };
+    let resp = Slo::new().handle_request_async(request, backend).await;
+    assert_eq!(resp.status, 201, "first If-None-Match:* PUT must create");
+    assert!(
+        !*saw_inm.lock().unwrap(),
+        "segment HEAD must not forward If-None-Match"
+    );
+}
+
+#[tokio::test]
+async fn heartbeat_missing_segment_lists_404_error() {
+    let backend: AsyncNextFn = Arc::new(|request: Request| {
+        Box::pin(async move {
+            if request.method == "HEAD" && request.path.contains("s1") {
+                let mut r = Response::new(200);
+                r.headers.set("Etag", "e");
+                r.headers.set("Content-Length", "1");
+                return r;
+            }
+            if request.method == "HEAD" {
+                return Response::new(404);
+            }
+            Response::new(404)
+        })
+    });
+    let body = serde_json::to_vec(&json!([
+        {"path": "/c/s1", "etag": "e", "size_bytes": 1},
+        {"path": "non-existent/segment"}
+    ]))
+    .unwrap();
+    let mut headers = HeaderKeyDict::new();
+    headers.set("Content-Length", body.len().to_string());
+    let request = Request {
+        method: "PUT".into(),
+        path: "/v1/a/c/manifest".into(),
+        query_string: "multipart-manifest=put&heartbeat=on".into(),
+        headers,
+        body: body.into(),
+    };
+    let mut resp = Slo::new().handle_request_async(request, backend).await;
+    assert_eq!(resp.status, 202);
+    let text = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap());
+    assert!(text.contains("Response Status: 400 Bad Request"), "{text}");
+    assert!(text.contains("Response Body: Bad Request"), "{text}");
+    assert!(
+        text.contains("non-existent/segment, 404 Not Found"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn if_match_get_uses_slo_etag_not_physical() {
+    let stored = serde_json::to_vec(&json!([{"name": "/c/s1", "bytes": 1, "hash": "e"}])).unwrap();
+    let backend: AsyncNextFn = Arc::new(move |request: Request| {
+        let stored = stored.clone();
+        Box::pin(async move {
+            if request.headers.get("If-Match").is_some() {
+                return Response::new(412);
+            }
+            if request.method == "GET" && request.path == "/v1/a/c/manifest" {
+                let mut resp = Response::with_body(200, stored);
+                resp.headers.set("X-Static-Large-Object", "True");
+                resp.headers.set("Etag", "physicaljson");
+                resp.headers.set("X-Object-Sysmeta-Slo-Etag", "slohash");
+                resp.headers.set("X-Object-Sysmeta-Slo-Size", "1");
+                resp.headers
+                    .set("Content-Type", "application/octet-stream;swift_bytes=1");
+                return resp;
+            }
+            if request.method == "GET" && request.path == "/v1/a/c/s1" {
+                let mut r = Response::with_body(200, b"x".to_vec());
+                r.headers.set("Etag", "e");
+                return r;
+            }
+            Response::new(404)
+        })
+    });
+    let mut headers = HeaderKeyDict::new();
+    headers.set("If-Match", "\"slohash\"");
+    let request = Request {
+        method: "GET".into(),
+        path: "/v1/a/c/manifest".into(),
+        query_string: String::new(),
+        headers,
+        body: Vec::<u8>::new().into(),
+    };
+    assert!(Slo::new().intercepts_request(&request));
+    let mut resp = Slo::new().handle_request_async(request, backend).await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.headers.get("Etag"), Some("\"slohash\""));
+    assert_eq!(
+        resp.headers.get("Content-Type"),
+        Some("application/octet-stream")
+    );
+    let body = std::mem::replace(&mut resp.body, swift_http::Body::empty());
+    assert_eq!(body.collect_async().await.unwrap(), b"x");
+}
+
+#[tokio::test]
+async fn head_part_number_refetches_manifest() {
+    let stored = serde_json::to_vec(&json!([
+        {"name": "/c/s1", "bytes": 3, "hash": "aaa"},
+        {"name": "/c/s2", "bytes": 3, "hash": "bbb"}
+    ]))
+    .unwrap();
+    let backend: AsyncNextFn = Arc::new(move |request: Request| {
+        let stored = stored.clone();
+        Box::pin(async move {
+            if request.path == "/v1/a/c/manifest" {
+                let mut resp = if request.method == "HEAD" {
+                    Response::new(200)
+                } else {
+                    Response::with_body(200, stored)
+                };
+                resp.headers.set("X-Static-Large-Object", "True");
+                resp.headers.set("X-Object-Sysmeta-Slo-Etag", "slohash");
+                resp.headers.set("X-Object-Sysmeta-Slo-Size", "6");
+                resp.headers.set("Etag", "physical");
+                return resp;
+            }
+            Response::new(404)
+        })
+    });
+    let request = Request {
+        method: "HEAD".into(),
+        path: "/v1/a/c/manifest".into(),
+        query_string: "part-number=2".into(),
+        headers: HeaderKeyDict::new(),
+        body: Vec::<u8>::new().into(),
+    };
+    let resp = Slo::new().reassemble_async(request, backend).await;
+    assert_eq!(resp.status, 206);
+    assert_eq!(resp.headers.get("X-Parts-Count"), Some("2"));
+    assert_eq!(resp.headers.get("Content-Length"), Some("3"));
+    assert_eq!(resp.headers.get("Content-Range"), Some("bytes 3-5/6"));
+}
+
+#[tokio::test]
+async fn part_number_out_of_range_is_plain_416() {
+    let stored = serde_json::to_vec(&json!([{"name": "/c/s1", "bytes": 3, "hash": "aaa"}])).unwrap();
+    let backend: AsyncNextFn = Arc::new(move |request: Request| {
+        let stored = stored.clone();
+        Box::pin(async move {
+            if request.path == "/v1/a/c/manifest" {
+                let mut resp = Response::with_body(200, stored);
+                resp.headers.set("X-Static-Large-Object", "True");
+                resp.headers.set("X-Object-Sysmeta-Slo-Etag", "slohash");
+                resp.headers.set("X-Object-Sysmeta-Slo-Size", "3");
+                return resp;
+            }
+            Response::new(404)
+        })
+    });
+    let request = Request {
+        method: "GET".into(),
+        path: "/v1/a/c/manifest".into(),
+        query_string: "part-number=9".into(),
+        headers: HeaderKeyDict::new(),
+        body: Vec::<u8>::new().into(),
+    };
+    let mut resp = Slo::new().reassemble_async(request, backend).await;
+    assert_eq!(resp.status, 416);
+    let body = resp.body.materialize(u64::MAX).unwrap();
+    assert_eq!(body, b"The requested part number is not satisfiable".as_slice());
+    assert_eq!(resp.headers.get("X-Parts-Count"), Some("1"));
+    assert_eq!(resp.headers.get("Content-Range"), Some("bytes */3"));
+}
+
+#[test]
+fn container_listing_strips_swift_bytes_from_content_type() {
+    let listing = serde_json::to_vec(&json!([{
+        "name": "o",
+        "bytes": 1,
+        "hash": "deadbeef; slo_etag=slohash",
+        "content_type": "application/octet-stream;swift_bytes=99"
+    }]))
+    .unwrap();
+    let backend_body = listing.clone();
+    let backend: NextFn = Arc::new(move |_r: Request| {
+        let mut resp = Response::with_body(200, backend_body.clone());
+        resp.headers
+            .set("Content-Type", "application/json; charset=utf-8");
+        resp
+    });
+    let req = Request {
+        method: "GET".into(),
+        path: "/v1/a/c".into(),
+        query_string: "format=json".into(),
+        headers: HeaderKeyDict::new(),
+        body: Vec::<u8>::new().into(),
+    };
+    let mut resp = Slo::new().handle(req, &backend);
+    resp.body.materialize(u64::MAX).unwrap();
+    let v: Value = serde_json::from_slice(match &resp.body {
+        swift_http::Body::Buffered(b) => b,
+        _ => panic!("expected buffered"),
+    })
+    .unwrap();
+    assert_eq!(v[0]["content_type"], "application/octet-stream");
+    assert_eq!(v[0]["bytes"], 99);
+    let _ = listing;
+}
