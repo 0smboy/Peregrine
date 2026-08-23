@@ -67,7 +67,7 @@ use swift_http::{
 };
 
 use crate::keymaster::KeyMaster;
-use crate::{Middleware, NextFn};
+use crate::{Middleware, MwPrep, NextFn};
 
 /// Sysmeta header holding serialized body crypto-meta.
 pub const BODY_META_HEADER: &str = "X-Object-Sysmeta-Crypto-Body-Meta";
@@ -429,6 +429,34 @@ impl Encrypter {
 }
 
 impl Middleware for Encrypter {
+    fn prepare(&self, req: &mut Request) -> MwPrep {
+        // Native-async GET/HEAD never calls sync handle(); mask If-Match /
+        // If-None-Match here so object-server compares against Etag-Mac.
+        if config_true_value(req.headers.get("Swift-Crypto-Override").unwrap_or("")) {
+            return MwPrep::Continue;
+        }
+        if !matches!(req.method.as_str(), "GET" | "HEAD") {
+            return MwPrep::Continue;
+        }
+        let parts = match split_path(&req.path, 4, 4, true) {
+            Ok(p) => p,
+            Err(_) => return MwPrep::Continue,
+        };
+        let version = parts[0].as_deref().unwrap_or("");
+        if !VALID_API_VERSIONS.contains(&version) {
+            return MwPrep::Continue;
+        }
+        let (Some(account), Some(container), Some(object)) = (
+            parts[1].as_deref().filter(|s| !s.is_empty()),
+            parts[2].as_deref().filter(|s| !s.is_empty()),
+            parts[3].as_deref().filter(|s| !s.is_empty()),
+        ) else {
+            return MwPrep::Continue;
+        };
+        self.mask_get_conditionals(req, account, container, object);
+        MwPrep::Continue
+    }
+
     fn handle(&self, req: Request, next: &NextFn) -> Response {
         if config_true_value(req.headers.get("Swift-Crypto-Override").unwrap_or("")) {
             return next(req);
@@ -582,18 +610,28 @@ impl Encrypter {
         container: &str,
         object: &str,
     ) -> Response {
+        self.mask_get_conditionals(&mut req, account, container, object);
+        next(req)
+    }
+
+    fn mask_get_conditionals(
+        &self,
+        req: &mut Request,
+        account: &str,
+        container: &str,
+        object: &str,
+    ) {
         let object_keys = self
             .keymaster
             .fetch_all_object_keys(account, container, object);
         if object_keys.is_empty() {
-            return next(req);
+            return;
         }
-        let masked1 = mask_conditional_etags(&mut req, "If-Match", &object_keys);
-        let masked2 = mask_conditional_etags(&mut req, "If-None-Match", &object_keys);
+        let masked1 = mask_conditional_etags(req, "If-Match", &object_keys);
+        let masked2 = mask_conditional_etags(req, "If-None-Match", &object_keys);
         if masked1 || masked2 {
-            update_etag_is_at_header(&mut req, ETAG_MAC_HEADER);
+            update_etag_is_at_header(req, ETAG_MAC_HEADER);
         }
-        next(req)
     }
 }
 
