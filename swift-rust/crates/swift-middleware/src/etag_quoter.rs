@@ -121,7 +121,32 @@ impl Middleware for EtagQuoter {
         if !self.enable_by_default {
             return next(req);
         }
-        let mut resp = next(req);
+        let resp = next(req);
+        self.quote_object_etag(resp)
+    }
+
+    fn finish(&self, req: &Request, resp: Response) -> Response {
+        if !self.enable_by_default {
+            return resp;
+        }
+        let parts = match split_path(&req.path, 2, 4, true) {
+            Ok(p) => p,
+            Err(_) => return resp,
+        };
+        let version = parts[0].as_deref().unwrap_or("");
+        if !VALID_API_VERSIONS.contains(&version) {
+            return resp;
+        }
+        let obj_present = parts[3].as_deref().is_some_and(|s| !s.is_empty());
+        if !obj_present {
+            return resp;
+        }
+        self.quote_object_etag(resp)
+    }
+}
+
+impl EtagQuoter {
+    fn quote_object_etag(&self, mut resp: Response) -> Response {
         if let Some(etag) = resp.headers.get("Etag").map(str::to_string) {
             // Keep it as-is only if it is already a (strong or weak)
             // quoted validator: starts with `"` or `W/"` AND ends with `"`.
@@ -181,6 +206,20 @@ mod tests {
         };
         let app = etag_app("d41d8cd98f00b204e9800998ecf8427e");
         let resp = eq.handle(req("/v1/a/c/o"), &app);
+        assert_eq!(
+            resp.headers.get("Etag"),
+            Some("\"d41d8cd98f00b204e9800998ecf8427e\"")
+        );
+    }
+
+    #[test]
+    fn test_finish_quotes_on_async_outbound_path() {
+        let eq = EtagQuoter {
+            enable_by_default: true,
+        };
+        let mut resp = Response::new(200);
+        resp.headers.set("Etag", "d41d8cd98f00b204e9800998ecf8427e");
+        let resp = eq.finish(&req("/v1/a/c/o"), resp);
         assert_eq!(
             resp.headers.get("Etag"),
             Some("\"d41d8cd98f00b204e9800998ecf8427e\"")
