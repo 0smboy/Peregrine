@@ -4412,6 +4412,8 @@ impl ProxyApp {
                     // copies are stripped): the object server drops the Range
                     // when the object carries the named manifest metadata.
                     "X-Backend-Ignore-Range-If-Metadata-Present",
+                    // crypto encrypter: compare If-Match against Etag-Mac
+                    "X-Backend-Etag-Is-At",
                 ] {
                     if let Some(v) = req.headers.get(h) {
                         headers.set(h, v.to_string());

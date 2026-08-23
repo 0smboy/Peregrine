@@ -1221,6 +1221,7 @@ impl ProxyApp {
             "If-Unmodified-Since",
             "X-Newest",
             "X-Backend-Ignore-Range-If-Metadata-Present",
+            "X-Backend-Etag-Is-At",
         ] {
             if let Some(v) = req.headers.get(h) {
                 headers.set(h, v.to_string());
@@ -1295,6 +1296,7 @@ impl ProxyApp {
                 "If-None-Match",
                 "If-Modified-Since",
                 "If-Unmodified-Since",
+                "X-Backend-Etag-Is-At",
             ] {
                 if let Some(v) = req.headers.get(h) {
                     cond_headers.set(h, v.to_string());
