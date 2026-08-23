@@ -50,6 +50,7 @@
 //! a best-effort background segment-DELETE thread is used instead of
 //! Python's bare 503.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io::{Cursor, Read};
 use std::pin::Pin;
@@ -566,7 +567,9 @@ fn leaf_stream_channel(
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     let scope = swift_runtime::TaskScope::bounded(1);
     let _ = scope.spawn(async move {
-        for leaf in leaves {
+        let mut work: VecDeque<(LeafSeg, usize)> =
+            leaves.into_iter().map(|leaf| (leaf, 0usize)).collect();
+        while let Some((leaf, depth)) = work.pop_front() {
             if let Some(raw) = leaf.raw_data {
                 if tx.send(Ok(raw)).await.is_err() {
                     return;
@@ -584,6 +587,66 @@ fn leaf_stream_channel(
                     ))))
                     .await;
                 return;
+            }
+            let nested_slo = sresp
+                .headers
+                .get(SLO_HEADER)
+                .map(config_true_value)
+                .unwrap_or(false)
+                || sresp
+                    .headers
+                    .get(SYSMETA_SLO_ETAG)
+                    .is_some_and(|s| !s.is_empty());
+            if nested_slo {
+                if depth >= MAX_SLO_RECURSION_DEPTH {
+                    let _ = tx
+                        .send(Err(std::io::Error::other(
+                            "SLO recursion depth exceeded",
+                        )))
+                        .await;
+                    return;
+                }
+                let body = match sresp.body.collect_async().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                };
+                let Some(sub_segs) = parse_stored_manifest(&body) else {
+                    let _ = tx
+                        .send(Err(std::io::Error::other(
+                            "invalid nested SLO manifest",
+                        )))
+                        .await;
+                    return;
+                };
+                match expand_segments_async(
+                    orig.clone_head(),
+                    version.clone(),
+                    account.clone(),
+                    sub_segs,
+                    next.clone(),
+                    depth + 1,
+                )
+                .await
+                {
+                    Ok(nested) => {
+                        for nleaf in nested.into_iter().rev() {
+                            work.push_front((nleaf, depth + 1));
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(std::io::Error::other(format!(
+                                "nested SLO expand {}",
+                                e.status
+                            ))))
+                            .await;
+                        return;
+                    }
+                }
+                continue;
             }
             if forward_body_chunks(sresp.body, &tx).await.is_err() {
                 return;
@@ -945,9 +1008,15 @@ fn if_none_match_put_rejected(req: &Request) -> Option<Response> {
     }
 }
 
-/// webob `RESPONSE_REASONS[400]` joined with `\n` — heartbeat JSON
-/// `Response Body` when the PUT failed with HTTPBadRequest.
-const HEARTBEAT_400_BODY: &str = "Bad Request\nThe server could not comply with the request since it is either malformed or otherwise incorrect.";
+/// webob `RESPONSE_REASONS` title + explanation joined with `\n` — heartbeat
+/// JSON `Response Body` when the PUT failed (Python `err.body or join`).
+fn heartbeat_error_body(status: u16) -> String {
+    match status {
+        400 => "Bad Request\nThe server could not comply with the request since it is either malformed or otherwise incorrect.".to_string(),
+        422 => "Unprocessable Entity\nUnable to process the contained instructions".to_string(),
+        _ => swift_http::reason_phrase(status).to_string(),
+    }
+}
 
 fn wrap_heartbeat_response(
     put_resp: Response,
@@ -971,10 +1040,8 @@ fn wrap_heartbeat_response(
     };
     let json_body = if success {
         body_note
-    } else if status == 400 {
-        HEARTBEAT_400_BODY.to_string()
     } else {
-        swift_http::reason_phrase(status).to_string()
+        heartbeat_error_body(status)
     };
     let error_json: Vec<serde_json::Value> = errors
         .iter()
@@ -2658,11 +2725,17 @@ fn validate_put_entries(
             errors.push(format!("{path}, {reason}"));
             continue;
         }
+        // A symlink-to-SLO HEAD follows to the target; treat sysmeta SLO
+        // etag as nested even if X-Static-Large-Object was stripped.
         let is_sub_slo = hr
             .headers
             .get(SLO_HEADER)
             .map(config_true_value)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || hr
+                .headers
+                .get(SYSMETA_SLO_ETAG)
+                .is_some_and(|s| !s.is_empty());
         // For a sub-SLO, Etag and Content-Length describe the physical
         // manifest JSON. Python Swift validates against the aggregate SLO
         // values persisted in sysmeta instead.
@@ -3022,10 +3095,8 @@ fn heartbeat_final_json(resp: &Response, errors: &[(String, String)]) -> Vec<u8>
             Body::Buffered(b) if !b.is_empty() => String::from_utf8_lossy(b).into_owned(),
             _ => String::new(),
         }
-    } else if status == 400 {
-        HEARTBEAT_400_BODY.to_string()
     } else {
-        swift_http::reason_phrase(status).to_string()
+        heartbeat_error_body(status)
     };
     let error_json: Vec<serde_json::Value> = errors
         .iter()

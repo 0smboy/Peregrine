@@ -746,6 +746,45 @@ async fn heartbeat_missing_segment_lists_404_error() {
 }
 
 #[tokio::test]
+async fn heartbeat_bad_etag_json_uses_webob_422_body() {
+    let backend: AsyncNextFn = Arc::new(|mut request: Request| {
+        Box::pin(async move {
+            if request.method == "HEAD" {
+                let mut r = Response::new(200);
+                r.headers.set("Etag", "e");
+                r.headers.set("Content-Length", "1");
+                return r;
+            }
+            let _ = request.body.materialize(u64::MAX);
+            Response::new(201)
+        })
+    });
+    let body = serde_json::to_vec(&json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}])).unwrap();
+    let mut headers = HeaderKeyDict::new();
+    headers.set("Accept", "application/json");
+    headers.set("Etag", "bad etag");
+    headers.set("Content-Length", body.len().to_string());
+    let request = Request {
+        method: "PUT".into(),
+        path: "/v1/a/c/manifest".into(),
+        query_string: "multipart-manifest=put&heartbeat=on".into(),
+        headers,
+        body: body.into(),
+    };
+    let mut resp = Slo::new().handle_request_async(request, backend).await;
+    assert_eq!(resp.status, 202);
+    let text = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap());
+    let json_start = text.find('{').expect(&text);
+    let v: Value = serde_json::from_str(&text[json_start..]).unwrap();
+    assert_eq!(v["Response Status"], "422 Unprocessable Entity");
+    assert_eq!(
+        v["Response Body"],
+        "Unprocessable Entity\nUnable to process the contained instructions"
+    );
+    assert_eq!(v["Errors"], json!([]));
+}
+
+#[tokio::test]
 async fn if_match_get_uses_slo_etag_not_physical() {
     let stored = serde_json::to_vec(&json!([{"name": "/c/s1", "bytes": 1, "hash": "e"}])).unwrap();
     let backend: AsyncNextFn = Arc::new(move |request: Request| {
