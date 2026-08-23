@@ -125,6 +125,12 @@ impl Middleware for EtagQuoter {
         self.quote_object_etag(resp)
     }
 
+    fn intercepts_response(&self) -> bool {
+        // Native-async GET/HEAD 412/304 keep the ETag; finish() is skipped
+        // for some backend-error mappings, so quote via reassemble_async.
+        self.enable_by_default
+    }
+
     fn finish(&self, req: &Request, resp: Response) -> Response {
         if !self.enable_by_default {
             return resp;
