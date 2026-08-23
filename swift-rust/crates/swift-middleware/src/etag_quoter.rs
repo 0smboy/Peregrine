@@ -33,11 +33,14 @@
 //! account/container header translation and the ETag-quoting predicate
 //! itself are ported exactly.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use swift_core::config::config_true_value;
 use swift_core::constraints::VALID_API_VERSIONS;
 use swift_http::{split_path, Request, Response};
 
-use crate::{Middleware, NextFn};
+use crate::{AsyncNextFn, Middleware, NextFn};
 
 #[derive(Default)]
 pub struct EtagQuoter {
@@ -126,9 +129,18 @@ impl Middleware for EtagQuoter {
     }
 
     fn intercepts_response(&self) -> bool {
-        // Native-async GET/HEAD 412/304 keep the ETag; finish() is skipped
-        // for some backend-error mappings, so quote via reassemble_async.
         self.enable_by_default
+    }
+
+    fn reassemble_async(
+        &self,
+        req: Request,
+        next: AsyncNextFn,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move {
+            let resp = next(req.clone_head()).await;
+            self.finish(&req, resp)
+        })
     }
 
     fn finish(&self, req: &Request, resp: Response) -> Response {
