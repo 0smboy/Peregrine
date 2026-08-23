@@ -499,3 +499,50 @@ async fn async_put_reuses_head_for_duplicate_ranged_paths() {
         ])
     );
 }
+
+#[test]
+fn typo_etag_key_is_rejected_as_extraneous() {
+    let (response, writes) = run_manifest_put(
+        json!([{
+            "path": "/c/segment",
+            "teag": "deadbeef",
+            "size_bytes": 3
+        }]),
+        vec![("/v1/a/c/segment", head_response("actual", 3))],
+    );
+    assert_eq!(response.status, 400);
+    assert!(body_string(&response).contains("extraneous keys"));
+    assert!(writes.is_empty());
+}
+
+/// Production Hyper GET `?multipart-manifest=get` must not reassemble; Python
+/// forces `application/json; charset=utf-8` on the stored listing.
+#[tokio::test]
+async fn async_manifest_get_sets_json_content_type() {
+    let stored = serde_json::to_vec(&json!([{"name": "/c/segment", "bytes": 3, "hash": "abc"}])).unwrap();
+    let backend: AsyncNextFn = Arc::new(move |request: Request| {
+        let stored = stored.clone();
+        Box::pin(async move {
+            if request.method == "GET" && request.path == "/v1/a/c/manifest" {
+                let mut resp = Response::with_body(200, stored);
+                resp.headers.set("X-Static-Large-Object", "True");
+                resp.headers.set("Content-Type", "application/octet-stream");
+                return resp;
+            }
+            Response::new(404)
+        })
+    });
+    let request = Request {
+        method: "GET".to_string(),
+        path: "/v1/a/c/manifest".to_string(),
+        query_string: "multipart-manifest=get".to_string(),
+        headers: HeaderKeyDict::new(),
+        body: Vec::<u8>::new().into(),
+    };
+    let response = Slo::new().reassemble_async(request, backend).await;
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        response.headers.get("Content-Type"),
+        Some("application/json; charset=utf-8")
+    );
+}

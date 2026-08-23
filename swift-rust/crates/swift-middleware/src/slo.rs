@@ -62,8 +62,8 @@ use swift_core::config::config_true_value;
 use swift_core::hashing::HashPathConfig;
 use swift_core::timestamp::{normalize_delete_at_timestamp, Timestamp};
 use swift_http::{
-    body_too_large, split_path, Body, FnReader, HeaderKeyDict, Range, Request, Response,
-    MAX_CONTROL_BODY,
+    apply_conditional, body_too_large, split_path, Body, FnReader, HeaderKeyDict, Range, Request,
+    Response, MAX_CONTROL_BODY,
 };
 
 use crate::{AsyncNextFn, Middleware, MwPrep, NextFn};
@@ -714,6 +714,13 @@ fn ignore_range(headers: &mut HeaderKeyDict, name: &str) {
     headers.set(IGNORE_RANGE_HDR, val);
 }
 
+fn strip_conditionals(headers: &mut HeaderKeyDict) {
+    headers.remove("If-Match");
+    headers.remove("If-None-Match");
+    headers.remove("If-Modified-Since");
+    headers.remove("If-Unmodified-Since");
+}
+
 fn slo_subreq(orig: &Request, path: String, range: Option<&str>) -> Request {
     let mut headers = orig.headers.clone();
     headers.remove("Range");
@@ -739,6 +746,9 @@ impl Slo {
     fn handle_get_head(&self, mut req: Request, next: &NextFn) -> Response {
         ignore_range(&mut req.headers, SLO_HEADER);
         let orig = req.clone_head();
+        // Backend ETag is the physical JSON; evaluate If-* against the SLO
+        // aggregate after reassembly (Python SloGetContext).
+        strip_conditionals(&mut req.headers);
         let mut resp = next(req);
 
         let is_slo = resp
@@ -952,12 +962,13 @@ impl Slo {
         let mut out = Response::new(status);
         out.headers = headers;
         out.body = body;
-        out
+        apply_conditional(&orig, out)
     }
 
     async fn handle_get_head_async(&self, mut req: Request, next: AsyncNextFn) -> Response {
         ignore_range(&mut req.headers, SLO_HEADER);
         let orig = req.clone_head();
+        strip_conditionals(&mut req.headers);
         let mut resp = next(req).await;
 
         let is_slo = resp
@@ -1166,7 +1177,7 @@ impl Slo {
         let mut out = Response::new(status);
         out.headers = headers;
         out.body = body;
-        out
+        apply_conditional(&orig, out)
     }
 
     /// Lazy leaf-segment reassembly: each subrequest runs only when the
@@ -1876,16 +1887,83 @@ impl Slo {
     /// the original type for server-side copy.
     fn handle_manifest_get(&self, req: Request, next: &NextFn) -> Response {
         let mut resp = next(req);
+        rewrite_manifest_get_content_type(&mut resp);
+        resp
+    }
+
+    async fn handle_manifest_get_async(&self, req: Request, next: AsyncNextFn) -> Response {
+        let mut resp = next(req).await;
+        rewrite_manifest_get_content_type(&mut resp);
+        resp
+    }
+
+    async fn handle_manifest_get_raw_async(&self, req: Request, next: AsyncNextFn) -> Response {
+        // Same rewrite as the sync path, after an async backend GET.
+        let mut resp = next(req).await;
+        self.rewrite_manifest_get_raw(&mut resp);
+        resp
+    }
+
+    fn rewrite_manifest_get_raw(&self, resp: &mut Response) {
         let is_slo = resp
             .headers
             .get(SLO_HEADER)
             .map(config_true_value)
             .unwrap_or(false);
-        if is_slo {
-            resp.headers
-                .set("Content-Type", "application/json; charset=utf-8");
+        if !is_slo {
+            return;
         }
-        resp
+        if resp.body.materialize(MAX_CONTROL_BODY).is_err() {
+            return;
+        }
+        let manifest_bytes = resp.body.materialize(MAX_CONTROL_BODY).expect("buffered");
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(manifest_bytes) else {
+            return;
+        };
+        let Some(arr) = value.as_array() else {
+            return;
+        };
+        let mut raw: Vec<serde_json::Value> = Vec::with_capacity(arr.len());
+        for it in arr {
+            let Some(obj) = it.as_object() else {
+                continue;
+            };
+            if obj.contains_key("data") {
+                raw.push(it.clone());
+                continue;
+            }
+            let mut out = serde_json::Map::new();
+            if let Some(name) = obj.get("name") {
+                out.insert("path".into(), name.clone());
+            }
+            if let Some(bytes) = obj.get("bytes") {
+                out.insert("size_bytes".into(), bytes.clone());
+            }
+            if let Some(hash) = obj.get("hash") {
+                out.insert("etag".into(), hash.clone());
+            }
+            if let Some(range) = obj.get("range") {
+                out.insert("range".into(), range.clone());
+            }
+            raw.push(serde_json::Value::Object(out));
+        }
+        let body = serde_json::to_vec(&raw).unwrap_or_default();
+        resp.headers.set("Content-Length", body.len().to_string());
+        resp.headers.set("Etag", manifest_etag(&body));
+        resp.body = body.into();
+    }
+
+}
+
+fn rewrite_manifest_get_content_type(resp: &mut Response) {
+    let is_slo = resp
+        .headers
+        .get(SLO_HEADER)
+        .map(config_true_value)
+        .unwrap_or(false);
+    if is_slo {
+        resp.headers
+            .set("Content-Type", "application/json; charset=utf-8");
     }
 }
 
@@ -1919,6 +1997,18 @@ fn validate_put_entries(
         };
         // Inline data segment: `{"data": "<base64>"}` (Python slo.py).
         if e.contains_key("data") {
+            let extras: Vec<&str> = e
+                .keys()
+                .filter(|k| k.as_str() != "data")
+                .map(String::as_str)
+                .collect();
+            if !extras.is_empty() {
+                errors.push(format!(
+                    "Index {i}: extraneous keys {}",
+                    extras.join(", ")
+                ));
+                continue;
+            }
             let Some(data_str) = e.get("data").and_then(|v| v.as_str()) else {
                 errors.push(format!("Index {i}: data must be valid base64"));
                 continue;
@@ -1952,6 +2042,23 @@ fn validate_put_entries(
             errors.push(format!("Index {i}: no path in segment"));
             continue;
         };
+        let extras: Vec<&str> = e
+            .keys()
+            .filter(|k| {
+                !matches!(
+                    k.as_str(),
+                    "path" | "etag" | "size_bytes" | "range"
+                )
+            })
+            .map(String::as_str)
+            .collect();
+        if !extras.is_empty() {
+            errors.push(format!(
+                "Index {i}: extraneous keys {}",
+                extras.join(", ")
+            ));
+            continue;
+        }
         has_object_backed = true;
         let stripped_path = path.trim_matches('/');
         let valid_path = stripped_path
@@ -2526,6 +2633,13 @@ impl Middleware for Slo {
         Box::pin(async move {
             if split_path(&req.path, 4, 4, true).is_err() {
                 return next(req).await;
+            }
+            let mpm = req.param("multipart-manifest");
+            if (req.method == "GET" || req.method == "HEAD") && mpm.as_deref() == Some("get") {
+                if req.param("format").as_deref() == Some("raw") {
+                    return self.handle_manifest_get_raw_async(req, next).await;
+                }
+                return self.handle_manifest_get_async(req, next).await;
             }
             if req.method == "GET" || req.method == "HEAD" {
                 return self.handle_get_head_async(req, next).await;
