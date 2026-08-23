@@ -5068,16 +5068,7 @@ impl ProxyApp {
         // Content-Length/ETag and the internal EC/backend headers are dropped.
         for (k, v) in &meta {
             let kl = k.to_lowercase();
-            let keep = kl == "content-type"
-                || kl == "x-timestamp"
-                || kl == "last-modified"
-                || kl == "x-backend-timestamp"
-                || kl == "x-delete-at"
-                || kl == "content-encoding"
-                || kl == "content-disposition"
-                || (kl.starts_with("x-object-meta-") && kl.len() > "x-object-meta-".len())
-                || kl.starts_with("x-object-sysmeta-")
-                || kl.starts_with("x-object-transient-sysmeta-");
+            let keep = keep_ec_client_metadata(&kl);
             if keep
                 && !(kl == "content-type"
                     && resp.status == 206
@@ -5333,6 +5324,32 @@ fn ring_nodes(part_nodes: Vec<swift_ring::PartNode<'_>>) -> Vec<Node> {
             handoff: false,
         })
         .collect()
+}
+
+/// Headers from an EC fragment GET that must be copied onto the reconstructed
+/// client response. Fragment Content-Length/ETag are the archive, not the
+/// object; those are replaced with `X-Object-Sysmeta-Ec-*`. User/sysmeta and
+/// Swift `allowed_headers` (`X-Static-Large-Object`, `X-Object-Manifest`, …)
+/// have to survive or SLO/DLO reassembly never triggers on an EC policy.
+pub(crate) fn keep_ec_client_metadata(kl: &str) -> bool {
+    matches!(
+        kl,
+        "content-type"
+            | "x-timestamp"
+            | "last-modified"
+            | "x-backend-timestamp"
+            | "x-delete-at"
+            | "content-encoding"
+            | "content-disposition"
+            | "content-language"
+            | "cache-control"
+            | "expires"
+            | "x-robots-tag"
+            | "x-object-manifest"
+            | "x-static-large-object"
+    ) || (kl.starts_with("x-object-meta-") && kl.len() > "x-object-meta-".len())
+        || kl.starts_with("x-object-sysmeta-")
+        || kl.starts_with("x-object-transient-sysmeta-")
 }
 
 /// Case-insensitive lookup in a backend response's header list.
@@ -7883,5 +7900,16 @@ mod account_update_headers_tests {
         assert_eq!(per_node[0].get("X-Account-Device"), Some("sda,sdd"));
         assert_eq!(per_node[1].get("X-Account-Device"), Some("sdb"));
         assert_eq!(per_node[2].get("X-Account-Device"), Some("sdc"));
+    }
+
+    #[test]
+    fn keep_ec_client_metadata_includes_slo_and_dlo_headers() {
+        assert!(keep_ec_client_metadata("x-static-large-object"));
+        assert!(keep_ec_client_metadata("x-object-manifest"));
+        assert!(keep_ec_client_metadata("x-object-sysmeta-slo-etag"));
+        assert!(keep_ec_client_metadata("x-object-meta-color"));
+        assert!(!keep_ec_client_metadata("content-length"));
+        assert!(!keep_ec_client_metadata("etag"));
+        assert!(!keep_ec_client_metadata("x-trans-id"));
     }
 }

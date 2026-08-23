@@ -1384,23 +1384,12 @@ impl ProxyApp {
         let orig_size: usize = resp_header(&meta, "X-Object-Sysmeta-Ec-Content-Length")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        let _content_type = resp_header(&meta, "Content-Type")
+        let content_type = resp_header(&meta, "Content-Type")
             .unwrap_or("application/octet-stream")
             .to_string();
         let mut resp = Response::new(200);
         for (k, v) in &meta {
-            let kl = k.to_lowercase();
-            let keep = kl == "content-type"
-                || kl == "x-timestamp"
-                || kl == "last-modified"
-                || kl == "x-backend-timestamp"
-                || kl == "x-delete-at"
-                || kl == "content-encoding"
-                || kl == "content-disposition"
-                || (kl.starts_with("x-object-meta-") && kl.len() > "x-object-meta-".len())
-                || kl.starts_with("x-object-sysmeta-")
-                || kl.starts_with("x-object-transient-sysmeta-");
-            if keep {
+            if super::keep_ec_client_metadata(&k.to_lowercase()) {
                 resp.headers.set(k, v);
             }
         }
@@ -1416,45 +1405,39 @@ impl ProxyApp {
                     .any(|name| resp_header(&meta, name.trim()).is_some())
             })
             .unwrap_or(false);
-        let byte_range = if is_head || ignore_range {
+        let resolved_ranges: Option<Vec<(u64, u64)>> = if is_head || ignore_range {
             None
         } else {
             range_hdr
                 .as_deref()
                 .and_then(|h| swift_http::Range::parse(h).ok())
                 .and_then(|r| r.ranges_for_length(Some(orig_size as u64)))
-                .and_then(|ranges| match ranges.as_slice() {
-                    [(a, b)] if *a < *b => Some((*a, *b)),
-                    [] => {
-                        // unsatisfiable
-                        None
-                    }
-                    _ => None,
-                })
         };
-        if !ignore_range {
-            if let Some(h) = range_hdr.as_deref() {
-                if let Ok(parsed) = swift_http::Range::parse(h) {
-                    if let Some(ranges) = parsed.ranges_for_length(Some(orig_size as u64)) {
-                        if ranges.is_empty() {
-                            let body = concat!(
-                                "<html><h1>Requested Range Not Satisfiable</h1>",
-                                "<p>The Range requested is not available.</p></html>"
-                            );
-                            let mut r416 = Response::with_body(416, body.as_bytes().to_vec());
-                            r416.headers
-                                .set("Content-Range", format!("bytes */{orig_size}"));
-                            r416.headers.set("Content-Type", "text/html; charset=UTF-8");
-                            r416.headers.set("Accept-Ranges", "bytes");
-                            if !ec_etag.is_empty() {
-                                r416.headers.set("ETag", &ec_etag);
-                            }
-                            return r416;
-                        }
-                    }
+        if let Some(ranges) = resolved_ranges.as_deref() {
+            if ranges.is_empty() {
+                let body = concat!(
+                    "<html><h1>Requested Range Not Satisfiable</h1>",
+                    "<p>The Range requested is not available.</p></html>"
+                );
+                let mut r416 = Response::with_body(416, body.as_bytes().to_vec());
+                r416.headers
+                    .set("Content-Range", format!("bytes */{orig_size}"));
+                r416.headers.set("Content-Type", "text/html; charset=UTF-8");
+                r416.headers.set("Accept-Ranges", "bytes");
+                if !ec_etag.is_empty() {
+                    r416.headers.set("ETag", &ec_etag);
                 }
+                return r416;
             }
         }
+        let byte_range = match resolved_ranges.as_deref() {
+            Some([(a, b)]) if *a < *b => Some((*a, *b)),
+            _ => None,
+        };
+        let multi_ranges: Option<Vec<(u64, u64)>> = match resolved_ranges.as_deref() {
+            Some(r) if r.len() > 1 => Some(r.to_vec()),
+            _ => None,
+        };
         if let Some((start, end)) = byte_range {
             resp.status = 206;
             resp.headers.set(
@@ -1462,7 +1445,7 @@ impl ProxyApp {
                 format!("bytes {start}-{}/{orig_size}", end.saturating_sub(1)),
             );
             resp.headers.set("Content-Length", end.saturating_sub(start));
-        } else {
+        } else if multi_ranges.is_none() {
             resp.headers.set("Content-Length", orig_size);
         }
         // Conditionals against the reconstructed object, not fragment etags.
@@ -1487,16 +1470,56 @@ impl ProxyApp {
         let (skip, take) = byte_range
             .map(|(s, e)| (s, e.saturating_sub(s)))
             .unwrap_or((0, u64::MAX));
-        let response_len = byte_range
-            .map(|(s, e)| e.saturating_sub(s))
-            .unwrap_or(orig_size as u64);
+        let multipart = if let Some(ranges) = multi_ranges {
+            use md5::{Digest, Md5};
+            let mut h = Md5::new();
+            h.update(ec_etag.as_bytes());
+            for (s, e) in &ranges {
+                h.update(s.to_le_bytes());
+                h.update(e.to_le_bytes());
+            }
+            let boundary = h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>();
+            let mp_len: u64 = {
+                let size = orig_size as u64;
+                let mut n = format!("--{boundary}--").len() as u64;
+                for &(start, stop) in &ranges {
+                    n += format!("--{boundary}\r\n").len() as u64;
+                    n += format!("Content-Type: {content_type}\r\n").len() as u64;
+                    n += format!(
+                        "Content-Range: {}\r\n\r\n",
+                        swift_http::content_range_header_value(start, stop, size)
+                    )
+                    .len() as u64;
+                    n += stop.saturating_sub(start);
+                    n += 2;
+                }
+                n
+            };
+            resp.status = 206;
+            resp.headers.set(
+                "Content-Type",
+                swift_http::multipart_byteranges_content_type(&boundary),
+            );
+            resp.headers.set("Content-Length", mp_len);
+            Some((boundary, ranges, content_type.clone(), mp_len))
+        } else {
+            None
+        };
+        let response_len = if let Some((_, _, _, mp_len)) = &multipart {
+            *mp_len
+        } else {
+            byte_range
+                .map(|(s, e)| e.saturating_sub(s))
+                .unwrap_or(orig_size as u64)
+        };
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let scope = TaskScope::bounded(1);
         let _ = scope.spawn(async move {
             let mut skipped = 0u64;
             let mut sent = 0u64;
+            let mut assembled: Option<Vec<u8>> = multipart.as_ref().map(|_| Vec::with_capacity(orig_size));
             for seg_len in seg_sizes {
-                if sent >= take {
+                if assembled.is_none() && sent >= take {
                     break;
                 }
                 let frag_len = driver.fragment_size(seg_len);
@@ -1513,6 +1536,10 @@ impl ProxyApp {
                 match driver.decode(&frags) {
                     Ok(mut decoded) => {
                         decoded.truncate(seg_len);
+                        if let Some(buf) = assembled.as_mut() {
+                            buf.extend_from_slice(&decoded);
+                            continue;
+                        }
                         let mut slice = decoded;
                         if skipped < skip {
                             let drop = (skip - skipped).min(slice.len() as u64) as usize;
@@ -1537,6 +1564,16 @@ impl ProxyApp {
                         return;
                     }
                 }
+            }
+            if let (Some(buf), Some((boundary, ranges, ctype, _))) = (assembled, multipart) {
+                let mp = swift_http::multipart_byteranges(
+                    &boundary,
+                    &ranges,
+                    &buf,
+                    &ctype,
+                    orig_size as u64,
+                );
+                let _ = tx.send(Ok(mp)).await;
             }
         });
         resp.body = Body::from_channel(rx, Some(response_len), scope);
