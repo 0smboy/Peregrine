@@ -37,7 +37,7 @@ use swift_core::config::config_true_value;
 use swift_core::constraints::VALID_API_VERSIONS;
 use swift_http::{split_path, Request, Response};
 
-use crate::{AsyncNextFn, Middleware, NextFn};
+use crate::{AsyncNextFn, Middleware, MwPrep, NextFn};
 
 #[derive(Default)]
 pub struct EtagQuoter {
@@ -48,6 +48,13 @@ pub struct EtagQuoter {
 }
 
 impl Middleware for EtagQuoter {
+    fn prepare(&self, req: &mut Request) -> MwPrep {
+        // Hyper object GET never calls handle(); container POST must still
+        // rewrite X-*-Rfc-Compliant-Etags into sysmeta before the app.
+        Self::translate_inbound(req);
+        MwPrep::Continue
+    }
+
     fn handle(&self, mut req: Request, next: &NextFn) -> Response {
         // Parse `/<version>/<account>/<container>/<object>`. A path that
         // does not split, or whose version is not a valid API version, is
@@ -147,7 +154,7 @@ impl Middleware for EtagQuoter {
         }
         let obj_present = parts[3].as_deref().is_some_and(|s| !s.is_empty());
         if !obj_present {
-            return resp;
+            return Self::translate_outbound(req, resp);
         }
         if !self.should_quote_object(&mut resp) {
             return resp;
@@ -157,6 +164,69 @@ impl Middleware for EtagQuoter {
 }
 
 impl EtagQuoter {
+    fn translate_inbound(req: &mut Request) {
+        let parts = match split_path(&req.path, 2, 4, true) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let version = parts[0].as_deref().unwrap_or("");
+        if !VALID_API_VERSIONS.contains(&version) {
+            return;
+        }
+        let obj_present = parts[3].as_deref().is_some_and(|s| !s.is_empty());
+        if obj_present {
+            return;
+        }
+        let container_present = parts[2].as_deref().is_some_and(|s| !s.is_empty());
+        let typ = if container_present {
+            "Container"
+        } else {
+            "Account"
+        };
+        let client_header = format!("X-{typ}-Rfc-Compliant-Etags");
+        let sysmeta_header = format!("X-{typ}-Sysmeta-Rfc-Compliant-Etags");
+        let remove_header = format!("X-Remove-{typ}-Rfc-Compliant-Etags");
+        if req.headers.contains_key(&client_header) {
+            let value = req.headers.get(&client_header).unwrap_or("").to_string();
+            if !value.is_empty() {
+                let normalized = if config_true_value(&value) {
+                    "True"
+                } else {
+                    "False"
+                };
+                req.headers.set(&sysmeta_header, normalized);
+            } else {
+                req.headers.set(&sysmeta_header, "");
+            }
+        }
+        if req
+            .headers
+            .get(&remove_header)
+            .is_some_and(|v| !v.is_empty())
+        {
+            req.headers.set(&sysmeta_header, "");
+        }
+    }
+
+    fn translate_outbound(req: &Request, mut resp: Response) -> Response {
+        let parts = match split_path(&req.path, 2, 4, true) {
+            Ok(p) => p,
+            Err(_) => return resp,
+        };
+        let container_present = parts[2].as_deref().is_some_and(|s| !s.is_empty());
+        let typ = if container_present {
+            "Container"
+        } else {
+            "Account"
+        };
+        let client_header = format!("X-{typ}-Rfc-Compliant-Etags");
+        let sysmeta_header = format!("X-{typ}-Sysmeta-Rfc-Compliant-Etags");
+        if let Some(value) = resp.headers.remove(&sysmeta_header) {
+            resp.headers.set(&client_header, value);
+        }
+        resp
+    }
+
     /// Python `EtagQuoterMiddleware.__call__` object-path flag:
     /// container sysmeta, else account sysmeta, else `enable_by_default`.
     /// A non-2xx container/account info status skips quoting. The proxy
@@ -462,6 +532,21 @@ mod tests {
         assert_eq!(
             resp.headers
                 .get("Echo-X-Container-Sysmeta-Rfc-Compliant-Etags"),
+            Some("False")
+        );
+    }
+
+    #[test]
+    fn test_prepare_rewrites_container_flag_on_hyper_inbound() {
+        let eq = EtagQuoter {
+            enable_by_default: true,
+        };
+        let mut r = req("/v1/a/c");
+        r.method = "POST".into();
+        r.headers.set("X-Container-Rfc-Compliant-Etags", "f");
+        assert!(matches!(eq.prepare(&mut r), MwPrep::Continue));
+        assert_eq!(
+            r.headers.get("X-Container-Sysmeta-Rfc-Compliant-Etags"),
             Some("False")
         );
     }
