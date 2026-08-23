@@ -4742,6 +4742,12 @@ impl ProxyApp {
         if early_finals.contains(&409) {
             return swob_response(202);
         }
+        if let Some(&client_err) = [400u16, 411, 413, 422, 507]
+            .iter()
+            .find(|s| early_finals.contains(s))
+        {
+            return swob_response(client_err);
+        }
         if putters.len() < ec.write_quorum() {
             return swob_response(503);
         }
