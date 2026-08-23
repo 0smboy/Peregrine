@@ -1717,6 +1717,15 @@ impl ProxyApp {
         if earlies.contains(&409) {
             return swob_response(202);
         }
+        // Object-server 4xx on the MIME PUT (If-None-Match not `*`, missing
+        // Content-Length, etag mismatch, ENOSPC, …) must surface to the
+        // client. Mapping them to 503 made `retry()` spin until timeout.
+        if let Some(&client_err) = [400u16, 411, 413, 422, 507]
+            .iter()
+            .find(|s| earlies.contains(s))
+        {
+            return swob_response(client_err);
+        }
         if putters.len() < ec.write_quorum() {
             return swob_response(503);
         }
