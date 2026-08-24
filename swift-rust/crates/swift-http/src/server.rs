@@ -31,7 +31,7 @@ use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -156,14 +156,8 @@ impl AsyncService for LegacyService {
 /// status, and the time spent handling and writing the response.
 pub type AccessLog = Arc<dyn Fn(&Request, u16, Duration) + Send + Sync>;
 
-/// How often the accept loop wakes when the listener is idle. This doubles as
-/// the shutdown-flag poll AND the worst-case accept latency for a freshly
-/// arriving connection, so it must stay small: at 100ms every new connection
-/// (client->proxy and each internal proxy->backend / object->container hop,
-/// which are `Connection: close`) waited up to ~100ms to be accepted, adding
-/// ~100ms per hop end to end. 1ms keeps shutdown responsive with negligible
-/// idle cost. (A blocking accept with SO_RCVTIMEO would remove the poll
-/// entirely; this is the dependency-free form.)
+/// Fallback poll used only when a connection has no [`ServerConfig::shutdown_watch`].
+/// Production accept installs a single watch poller; do not call this per conn.
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// After the handler, an unconsumed request-body remainder up to this
@@ -208,6 +202,11 @@ pub struct ServerConfig {
     /// requests, and `serve_forever_with_config` returns `Ok(())`. Pair with
     /// [`install_sigterm_flag`] for graceful daemon shutdown.
     pub shutdown: Option<Arc<AtomicBool>>,
+    /// Fan-in for [`Self::shutdown`]. The accept loop owns one poller and
+    /// publishes here; idle keep-alives wait on this receiver. They must
+    /// not call [`wait_flag`] (a 1ms Sleep per conn: 100k timers drowned
+    /// G7 health p99).
+    pub shutdown_watch: Option<tokio::sync::watch::Receiver<bool>>,
     /// Bind with `SO_REUSEPORT` when using [`bind_listener`] (L4). No effect on
     /// an already-bound `TcpListener` passed to `serve_*`.
     pub reuse_port: bool,
@@ -259,6 +258,10 @@ impl std::fmt::Debug for ServerConfig {
                 &self.access_log.as_ref().map(|_| "<callback>"),
             )
             .field("shutdown", &self.shutdown)
+            .field(
+                "shutdown_watch",
+                &self.shutdown_watch.as_ref().map(|_| "<watch>"),
+            )
             .field("reuse_port", &self.reuse_port)
             .field("max_connections", &self.max_connections)
             .field("max_active_requests", &self.max_active_requests)
@@ -298,6 +301,7 @@ impl Default for ServerConfig {
             max_body_bytes: swift_core::constraints::MAX_FILE_SIZE as u64,
             access_log: None,
             shutdown: None,
+            shutdown_watch: None,
             reuse_port: false,
             max_connections: 0,
             max_active_requests: 0,
@@ -406,6 +410,19 @@ pub fn bind_listener(addr: &str, reuse_port: bool) -> std::io::Result<TcpListene
         return Err(err);
     }
     Ok(unsafe { TcpListener::from_raw_fd(fd) })
+}
+
+/// Raise the listen backlog on an already-bound listener (std bind is 128
+/// on Linux). `backlog` is clamped to at least 1. Idempotent.
+pub fn set_listen_backlog(listener: &TcpListener, backlog: i32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let n = backlog.max(1);
+    let rc = unsafe { libc::listen(listener.as_raw_fd(), n) };
+    if rc != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn socket_timeout(config: &ServerConfig) -> Option<Duration> {
@@ -564,25 +581,86 @@ async fn accept_loop_async(
         .shutdown
         .clone()
         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    // One poller watches the signal-safe AtomicBool and publishes to a
+    // watch channel. Idle keep-alives wait on the receiver (no timer).
+    let (sd_tx, sd_rx) = tokio::sync::watch::channel(shutdown.load(Ordering::SeqCst));
+    {
+        let flag = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            loop {
+                if flag.load(Ordering::SeqCst) {
+                    let _ = sd_tx.send(true);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+    }
+    config.shutdown_watch = Some(sd_rx.clone());
 
-    let (conn_tx, mut conn_rx) =
-        tokio::sync::mpsc::channel::<tokio::net::TcpStream>(config.connection_queue.max(1));
+    // Spawn each connection from the acceptor. A JoinSet of every live
+    // connection made accept O(live) under 50k idle keep-alives and
+    // delayed health HEAD past the G7 p99 bound.
+    let live = Arc::new(AtomicUsize::new(0));
+    struct LiveGuard(Arc<AtomicUsize>);
+    impl Drop for LiveGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
     let mut acceptors = JoinSet::new();
     for listener in tokio_listeners {
-        let conn_tx = conn_tx.clone();
         let shutdown = Arc::clone(&shutdown);
+        let admission = admission.clone();
+        let service = Arc::clone(&service);
+        let config = config.clone();
+        let metrics = metrics.clone();
+        let live = Arc::clone(&live);
+        let mut sd_rx = sd_rx.clone();
         acceptors.spawn(async move {
             loop {
                 tokio::select! {
-                    _ = wait_flag(&shutdown) => break,
+                    _ = wait_watch(&mut sd_rx) => break,
                     acc = listener.accept() => {
                         match acc {
                             Ok((stream, _)) => {
-                                if conn_tx.send(stream).await.is_err() {
-                                    break;
+                                match admission.try_acquire_connection() {
+                                    Ok(permit) => {
+                                        let service = Arc::clone(&service);
+                                        let config = config.clone();
+                                        let shutdown = Arc::clone(&shutdown);
+                                        let admission = admission.clone();
+                                        let metrics = metrics.clone();
+                                        let live = Arc::clone(&live);
+                                        live.fetch_add(1, Ordering::SeqCst);
+                                        metrics.runtime_tasks_inc();
+                                        let scheduled = Instant::now();
+                                        tokio::spawn(async move {
+                                            let _live = LiveGuard(live);
+                                            metrics.observe_scheduler_lag(scheduled.elapsed());
+                                            let _task = RuntimeTaskGuard(Some(metrics.clone()));
+                                            let _permit = permit;
+                                            let _ = metrics
+                                                .bind(handle_connection_async(
+                                                    stream, service, config, shutdown, admission,
+                                                ))
+                                                .await;
+                                        });
+                                    }
+                                    Err(_) => {
+                                        // Never block accept on a 503 write.
+                                        tokio::spawn(async move {
+                                            crate::hyper_serve::reject_overloaded(stream).await;
+                                        });
+                                    }
                                 }
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(e) if matches!(e.raw_os_error(), Some(23) | Some(24)) => {
+                                // ENFILE/EMFILE: keep accepting when fds return.
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                            }
                             Err(e) => return Err(e),
                         }
                     }
@@ -591,46 +669,17 @@ async fn accept_loop_async(
             Ok(())
         });
     }
-    drop(conn_tx);
 
-    let mut conns = JoinSet::new();
     let mut accept_err = None;
+    let mut sd_rx = sd_rx;
     loop {
         tokio::select! {
-            _ = wait_flag(&shutdown) => {
+            _ = wait_watch(&mut sd_rx) => {
                 let snap = metrics.snapshot();
                 metrics.set_graceful_shutdown_requests(snap.runtime_tasks.max(1));
                 metrics.set_shutdown_waiting_requests(admission.requests_active());
                 metrics.set_shutdown_waiting_commits(snap.commit_shield_active as usize);
                 break;
-            }
-            accepted = conn_rx.recv() => {
-                let Some(stream) = accepted else { break; };
-                while conns.try_join_next().is_some() {}
-                match admission.try_acquire_connection() {
-                    Ok(permit) => {
-                        let service = Arc::clone(&service);
-                        let config = config.clone();
-                        let shutdown = Arc::clone(&shutdown);
-                        let admission = admission.clone();
-                        let metrics = metrics.clone();
-                        let scheduled = Instant::now();
-                        metrics.runtime_tasks_inc();
-                        conns.spawn(async move {
-                            metrics.observe_scheduler_lag(scheduled.elapsed());
-                            let _task = RuntimeTaskGuard(Some(metrics.clone()));
-                            let _permit = permit;
-                            let _ = metrics
-                                .bind(handle_connection_async(
-                                    stream, service, config, shutdown, admission,
-                                ))
-                                .await;
-                        });
-                    }
-                    Err(_) => {
-                        crate::hyper_serve::reject_overloaded(stream).await;
-                    }
-                }
             }
             acc = acceptors.join_next(), if !acceptors.is_empty() => {
                 match acc {
@@ -651,7 +700,19 @@ async fn accept_loop_async(
     }
 
     while acceptors.join_next().await.is_some() {}
-    while conns.join_next().await.is_some() {}
+    let drain_secs = if config.shutdown_deadline_secs > 0 {
+        config.shutdown_deadline_secs
+    } else {
+        5
+    };
+    let drain_until = Instant::now() + Duration::from_secs(drain_secs);
+    while live.load(Ordering::SeqCst) > 0 {
+        metrics.set_shutdown_waiting_requests(live.load(Ordering::SeqCst));
+        if Instant::now() >= drain_until {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     // L7: HTTP may already be forced off; commit-shield tasks still finish.
     metrics.join_remaining_shields().await;
     match accept_err {
@@ -667,6 +728,32 @@ pub(crate) async fn wait_flag(flag: &AtomicBool) {
         }
         tokio::time::sleep(SHUTDOWN_POLL_INTERVAL).await;
     }
+}
+
+/// `watch::wait_for` holds a `RwLockReadGuard` across `.await` and is `!Send`.
+/// `changed()` + a dropped `borrow()` is Send and has no per-conn timer.
+pub(crate) async fn wait_watch(rx: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Idle keep-alive shutdown wait: watch receiver (no timer) when the accept
+/// loop installed one; otherwise the 1ms fallback (tests without accept).
+pub(crate) async fn wait_shutdown(config: &ServerConfig, flag: &AtomicBool) {
+    if flag.load(Ordering::SeqCst) {
+        return;
+    }
+    if let Some(mut rx) = config.shutdown_watch.clone() {
+        wait_watch(&mut rx).await;
+        return;
+    }
+    wait_flag(flag).await;
 }
 
 

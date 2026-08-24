@@ -143,11 +143,12 @@ pub async fn serve_http1_connection(
         .title_case_headers(true)
         .auto_date_header(false)
         .max_headers(config.max_header_count.max(1));
-    if config.head_deadline_secs > 0 {
-        builder.header_read_timeout(Duration::from_secs(config.head_deadline_secs));
-    } else {
-        builder.header_read_timeout(None);
-    }
+    // Hyper's header_read_timeout also covers the idle keep-alive wait for
+    // the *next* request. A timer per idle conn (50k Sleeps) made health
+    // HEAD p50 ~140ms. Idle wait is a pending read (L1). First-line peek
+    // waits for the first byte without a timer (new-conn idle occupancy);
+    // HeaderDeadline still bounds a dripping request line after that byte.
+    builder.header_read_timeout(None);
     let max_buf = config
         .max_header_bytes
         .saturating_add(config.max_request_line_bytes)
@@ -165,7 +166,7 @@ pub async fn serve_http1_connection(
                 r = &mut conn => {
                     return r.map_err(|e| std::io::Error::other(e.to_string()));
                 }
-                _ = crate::server::wait_flag(&shutdown), if !shutting => {
+                _ = crate::server::wait_shutdown(&config, &shutdown), if !shutting => {
                     shutting = true;
                     let secs = if config.shutdown_deadline_secs > 0 {
                         config.shutdown_deadline_secs
@@ -340,13 +341,31 @@ async fn read_until_marker(
     max: usize,
     deadline: Duration,
 ) -> std::io::Result<Vec<u8>> {
-    let read = async {
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 512];
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 512];
+    // First byte is a pending read with no timer (L1). A silent accepted
+    // socket is idle occupancy, bounded by max_connections — not slowloris.
+    // Arming HeaderDeadline at accept() installed one Sleep per new conn
+    // and killed 100k-open clients whose first poll lagged the 30s clock.
+    let n = stream.read(&mut tmp).await?;
+    if n == 0 {
+        return Ok(buf);
+    }
+    buf.extend_from_slice(&tmp[..n]);
+    if buf.len() > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HTTP head too large",
+        ));
+    }
+    if buf.windows(marker.len()).any(|w| w == marker) {
+        return Ok(buf);
+    }
+    let rest = async {
         loop {
             let n = stream.read(&mut tmp).await?;
             if n == 0 {
-                return Ok(buf);
+                return Ok(());
             }
             buf.extend_from_slice(&tmp[..n]);
             if buf.len() > max {
@@ -356,12 +375,13 @@ async fn read_until_marker(
                 ));
             }
             if buf.windows(marker.len()).any(|w| w == marker) {
-                return Ok(buf);
+                return Ok(());
             }
         }
     };
-    match tokio::time::timeout(deadline, read).await {
-        Ok(r) => r,
+    match tokio::time::timeout(deadline, rest).await {
+        Ok(Ok(())) => Ok(buf),
+        Ok(Err(e)) => Err(e),
         Err(_) => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "header read timeout",

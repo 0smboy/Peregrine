@@ -237,6 +237,17 @@ fn main() {
         logger.error(&format!("could not bind {bind}: {e}"));
         std::process::exit(1);
     });
+    // std bind backlog is 128 on Linux; 100k idle keep-alive (G7) needs the
+    // kernel queue, not an application buffer. Independent of worker_threads.
+    let backlog = options
+        .max_connections
+        .max(options.max_clients)
+        .max(1024)
+        .min(65535) as i32;
+    if let Err(e) = swift_http::set_listen_backlog(&listener, backlog) {
+        logger.error(&format!("listen backlog {backlog}: {e}"));
+        std::process::exit(1);
+    }
     let _ = listener.set_nonblocking(false);
     if process_workers > 1 {
         prefork_workers(process_workers, &logger);
@@ -321,10 +332,18 @@ fn main() {
     );
 
     let mut server_config = swift_http::ServerConfig {
-        connection_queue: options.max_clients,
+        // max_clients remains the request-queue / max_active_requests alias
+        // (AGENTS.md §7). Do not copy it onto max_connections.
+        connection_queue: if options.max_connections > 0 {
+            options.max_clients.max(8192).min(options.max_connections)
+        } else {
+            options.max_clients
+        },
         client_timeout_secs: options.client_timeout_secs,
         access_log: Some(access_log),
         shutdown: Some(shutdown),
+        max_connections: options.max_connections,
+        max_active_requests: options.max_active_requests,
         ..Default::default()
     };
     if let Some(workers) = options.workers {
@@ -480,8 +499,14 @@ struct ServerOptions {
     /// `workers`: HTTP worker threads. `None` (unset, `auto`, or `0`) keeps
     /// the server's CPU-scaled default.
     workers: Option<usize>,
-    /// `max_clients`: bound on connections queued for a worker (default 1024).
+    /// `max_clients`: compatibility alias for max_active_requests (default 1024).
+    /// Not the connection admission cap (AGENTS.md §7).
     max_clients: usize,
+    /// Independent connection admission cap. `0` keeps the historic derive
+    /// `worker_threads + connection_queue`.
+    max_connections: usize,
+    /// In-flight request cap. Defaults to `max_clients`.
+    max_active_requests: usize,
     /// `client_timeout`: idle-client socket timeout, whole seconds
     /// (default 60; fractions round up).
     client_timeout_secs: u64,
@@ -509,18 +534,32 @@ fn server_options_from_conf(conf: &SwiftConfig) -> ServerOptions {
             .or_else(|| conf.get("DEFAULT", key).ok().flatten())
             .unwrap_or_else(|| default.to_string())
     };
+    let max_clients = get("max_clients", "")
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|n| *n >= 1)
+        .unwrap_or(1024);
+    let max_active_requests = get("max_active_requests", "")
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|n| *n >= 1)
+        .unwrap_or(max_clients);
     ServerOptions {
         workers: get("workers", "")
             .trim()
             .parse::<usize>()
             .ok()
             .filter(|n| *n >= 1),
-        max_clients: get("max_clients", "")
+        max_clients,
+        max_connections: get("max_connections", "")
             .trim()
             .parse::<usize>()
             .ok()
             .filter(|n| *n >= 1)
-            .unwrap_or(1024),
+            .unwrap_or(0),
+        max_active_requests,
         client_timeout_secs: get("client_timeout", "")
             .trim()
             .parse::<f64>()
@@ -3363,6 +3402,8 @@ mod startup_policy_tests {
         let opts = server_options_from_conf(&conf);
         assert_eq!(opts.workers, Some(8));
         assert_eq!(opts.max_clients, 512);
+        assert_eq!(opts.max_active_requests, 512);
+        assert_eq!(opts.max_connections, 0);
         assert_eq!(opts.client_timeout_secs, 42);
         assert_eq!(opts.log_name, "my-proxy");
         assert_eq!(opts.log_level, "DEBUG");
@@ -3385,6 +3426,8 @@ mod startup_policy_tests {
         let opts = server_options_from_conf(&conf);
         assert_eq!(opts.workers, None);
         assert_eq!(opts.max_clients, 1024);
+        assert_eq!(opts.max_active_requests, 1024);
+        assert_eq!(opts.max_connections, 0);
         assert_eq!(opts.client_timeout_secs, 60);
         assert_eq!(opts.log_name, "proxy-server");
         assert_eq!(opts.log_level, "info");
@@ -3393,6 +3436,20 @@ mod startup_policy_tests {
         assert_eq!(opts.log_statsd_metric_prefix, "");
         assert_eq!(opts.trace_endpoint, "");
         assert_eq!(opts.trace_sample_ratio, 1.0);
+
+        let conf = SwiftConfig::parse_lenient(
+            "[app:proxy-server]\nmax_clients = 1024\nmax_connections = 131072\n\
+             max_active_requests = 2048\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let opts = server_options_from_conf(&conf);
+        assert_eq!(opts.max_clients, 1024);
+        assert_eq!(opts.max_connections, 131072);
+        assert_eq!(opts.max_active_requests, 2048);
+        assert_ne!(opts.max_connections, opts.max_active_requests);
+        assert_ne!(opts.max_connections, opts.max_clients);
     }
 
     #[test]
