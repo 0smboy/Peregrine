@@ -1,0 +1,115 @@
+# FROZEN G7 acceptance.yaml — 2026-08-23T21:40:00Z
+# Do not edit thresholds after the first G7 run that records this file's sha256.
+# opened < target => ENVIRONMENT BLOCKED, never PASS.
+
+gate: G7
+frozen_at: "2026-08-23T21:40:00Z"
+candidate_commit: "02eb0202dd74ef36a19fa0860ee1da229bb6db20"
+rule: "opened must equal target; do not change this file after freeze"
+
+target:
+  impl: rust
+  host: "10.0.0.1"
+  port: 18080
+  swift_dir: "/etc/g6-rust"
+  recon_path: "/recon/concurrency"
+  health_path: "/healthcheck"
+  forbidden_ports: [8080, 8085, 443, 5000]
+
+loadgen:
+  host: swift4
+  source_ips: ["10.0.0.4", "10.0.4.4", "10.0.8.4"]
+
+dummy_acceptor:
+  bind: "10.0.0.1"
+  port: 18099
+
+auth:
+  user: "test:tester"
+  key: "testing"
+  account: "AUTH_test"
+
+cases:
+  idle_keepalive_10k:
+    kind: idle_keepalive
+    target: 10000
+    hold_secs: 30
+  idle_keepalive_50k:
+    kind: idle_keepalive
+    target: 50000
+    hold_secs: 30
+  idle_keepalive_100k:
+    kind: idle_keepalive
+    target: 100000
+    hold_secs: 30
+  slow_put_1000:
+    kind: slow_put
+    target: 1000
+    rate_bps: 1024
+    body_bytes: 65536
+  slowloris:
+    kind: slowloris
+    target: 1000
+    header_interval_ms: 2000
+    hold_secs: 20
+  slow_get_receiver:
+    kind: slow_get
+    target: 200
+    read_pause_ms: 500
+    object_bytes: 1048576
+  keepalive_churn:
+    kind: churn
+    target: 5000
+    cycles: 10
+  fsync_stall:
+    kind: fsync_stall
+    stall_secs: 5
+    health_samples: 40
+  sqlite_stall:
+    kind: sqlite_stall
+    stall_secs: 5
+    health_samples: 40
+  backend_blackhole:
+    kind: blackhole
+    drop_backend: "127.0.0.2:16220"
+    hold_secs: 15
+  quorum_degradation:
+    kind: quorum
+    drop_backends: ["127.0.0.2:16220"]
+    put_n: 20
+  bounded_queue_overload:
+    kind: overload
+    target: 4000
+    body_bytes: 1048576
+  client_cancellation:
+    kind: cancel
+    n: 100
+  sigterm_during_put:
+    kind: sigterm_put
+  sigterm_during_durability:
+    kind: sigterm_barrier
+  fd_exhaustion:
+    kind: fd_exhaust
+  enospc:
+    kind: enospc
+  eio:
+    kind: eio
+  partial_write:
+    kind: partial_write
+  backend_connect_timeout:
+    kind: backend_connect_timeout
+    blackhole_ip: "127.0.0.9"
+    port: 16210
+
+bounds:
+  health_head_p99_ms: 250
+  scheduler_lag_p99_ms: 100
+  scheduler_lag_p999_ms: 500
+  threads_not_linear_in_connections: true
+  storage_threads_le_configured_max: true
+  steady_return_max_of_pct: 1
+  steady_return_abs: 16
+  orphan_temp: 0
+  stuck_commit: 0
+  ambiguous_durability: 0
+  non_injected_correctness: 1.0
