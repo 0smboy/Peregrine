@@ -99,6 +99,16 @@ fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
+fn async_body_read_error(error: &std::io::Error) -> Response {
+    if swift_http::body_too_large(error) {
+        plain_response(413, "Your request is too large.")
+    } else if error.kind() == std::io::ErrorKind::TimedOut {
+        swob_response(408)
+    } else {
+        swob_response(499)
+    }
+}
+
 async fn ingest_mime_object_async(
     storage: &StorageExecutor,
     device: DeviceId,
@@ -115,10 +125,7 @@ async fn ingest_mime_object_async(
         match body.next_chunk().await {
             Ok(Some(c)) => buf.extend_from_slice(&c),
             Ok(None) => break,
-            Err(e) if swift_http::body_too_large(&e) => {
-                return Err(plain_response(413, "Your request is too large."))
-            }
-            Err(_) => return Err(swob_response(499)),
+            Err(error) => return Err(async_body_read_error(&error)),
         }
         if phase == 0 {
             if let Some(i) = find_bytes(&buf, &start) {
@@ -187,7 +194,7 @@ async fn ingest_mime_footer_async(
     body: &mut swift_http::IncomingBody,
     mut buf: Vec<u8>,
     boundary: &[u8],
-) -> Result<Vec<(String, String)>, Response> {
+) -> Result<(Vec<(String, String)>, Vec<u8>), Response> {
     let mut delim = b"\r\n--".to_vec();
     delim.extend_from_slice(boundary);
     loop {
@@ -211,21 +218,19 @@ async fn ingest_mime_footer_async(
                             return Err(plain_response(422, "footer MD5 mismatch"));
                         }
                     }
-                    return parse_footer_json(&json_body);
+                    let trailing = buf[i + delim.len()..].to_vec();
+                    return parse_footer_json(&json_body).map(|footers| (footers, trailing));
                 }
                 match body.next_chunk().await {
                     Ok(Some(c)) => buf.extend_from_slice(&c),
                     Ok(None) => {
                         return if buf.is_empty() {
-                            Ok(Vec::new())
+                            Ok((Vec::new(), Vec::new()))
                         } else {
-                            parse_footer_json(&buf)
+                            parse_footer_json(&buf).map(|footers| (footers, Vec::new()))
                         };
                     }
-                    Err(e) if swift_http::body_too_large(&e) => {
-                        return Err(plain_response(413, "Your request is too large."))
-                    }
-                    Err(_) => return Err(swob_response(499)),
+                    Err(error) => return Err(async_body_read_error(&error)),
                 }
                 if buf.len() > 1024 * 1024 {
                     return Err(plain_response(400, "footer too large"));
@@ -234,14 +239,134 @@ async fn ingest_mime_footer_async(
         }
         match body.next_chunk().await {
             Ok(Some(c)) => buf.extend_from_slice(&c),
-            Ok(None) => return Ok(Vec::new()),
-            Err(e) if swift_http::body_too_large(&e) => {
-                return Err(plain_response(413, "Your request is too large."))
-            }
-            Err(_) => return Err(swob_response(499)),
+            Ok(None) => return Ok((Vec::new(), Vec::new())),
+            Err(error) => return Err(async_body_read_error(&error)),
         }
         if buf.len() > 64 * 1024 {
             return Err(plain_response(400, "mime headers too large"));
+        }
+    }
+}
+
+fn trim_ascii_whitespace(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+/// Consume the remainder of one independently chunked MIME phase. The footer
+/// parser returns as soon as it sees the boundary; the HTTP handoff then
+/// supplies a logical EOF sentinel for that phase while keeping the channel
+/// open for the commit phase.
+async fn drain_mime_phase(
+    body: &mut swift_http::IncomingBody,
+    mut trailing: Vec<u8>,
+) -> Result<(), Response> {
+    const MAX_TRAILING: usize = 64 * 1024;
+    loop {
+        if trailing.len() > MAX_TRAILING {
+            return Err(plain_response(400, "MIME phase trailer too large"));
+        }
+        match body.next_chunk().await {
+            Ok(Some(chunk)) => trailing.extend_from_slice(&chunk),
+            Ok(None) => break,
+            Err(error) => return Err(async_body_read_error(&error)),
+        }
+    }
+    let trailing = trim_ascii_whitespace(&trailing);
+    if trailing.is_empty() || trailing == b"--" {
+        Ok(())
+    } else {
+        Err(plain_response(400, "invalid MIME phase trailer"))
+    }
+}
+
+/// Validate and consume the first phase-two document through its MIME
+/// boundary. Python Swift treats the body as opaque: the durable transition is
+/// authorized by a complete document whose header is `X-Document: put commit`.
+/// Only a bounded header and boundary-sized scan window are retained.
+async fn ingest_mime_commit_async(
+    body: &mut swift_http::IncomingBody,
+    boundary: &[u8],
+) -> Result<Vec<u8>, Response> {
+    const MAX_COMMIT_HEADERS: usize = 64 * 1024;
+    let mut delimiter = b"\r\n--".to_vec();
+    delimiter.extend_from_slice(boundary);
+    let mut buffer = Vec::new();
+    let mut validated = false;
+    loop {
+        if !validated {
+            if let Some(header_end) = find_bytes(&buffer, b"\r\n\r\n") {
+                let header_text = String::from_utf8_lossy(&buffer[..header_end]);
+                let is_commit = header_text.lines().any(|line| {
+                    line.split_once(':').is_some_and(|(name, value)| {
+                        name.trim().eq_ignore_ascii_case("X-Document")
+                            && value.trim().eq_ignore_ascii_case("put commit")
+                    })
+                });
+                if !is_commit {
+                    return Err(plain_response(500, "expected put commit MIME doc"));
+                }
+                buffer.drain(..header_end + 4);
+                validated = true;
+            } else if buffer.len() > MAX_COMMIT_HEADERS {
+                return Err(plain_response(400, "PUT commit MIME headers too large"));
+            }
+        }
+        if validated {
+            let mut partial_delimiter = false;
+            if let Some(index) = find_bytes(&buffer, &delimiter) {
+                let suffix = index + delimiter.len();
+                if buffer.len() < suffix + 2 {
+                    if index > 0 {
+                        buffer.drain(..index);
+                    }
+                    partial_delimiter = true;
+                } else if matches!(&buffer[suffix..suffix + 2], b"--" | b"\r\n") {
+                    return Ok(buffer[suffix..].to_vec());
+                } else {
+                    // A boundary-like byte sequence inside the opaque body is
+                    // not a MIME delimiter unless its legal suffix follows.
+                    buffer.drain(..index + 1);
+                    continue;
+                }
+            }
+            if !partial_delimiter && buffer.len() > delimiter.len() {
+                let keep = delimiter.len().saturating_sub(1);
+                buffer.drain(..buffer.len() - keep);
+            }
+        }
+        match body.next_chunk().await {
+            Ok(Some(chunk)) => buffer.extend_from_slice(&chunk),
+            Ok(None) => {
+                if !validated && buffer.is_empty() {
+                    return Err(plain_response(400, "couldn't find PUT commit MIME doc"));
+                }
+                if !validated {
+                    return Err(plain_response(400, "invalid PUT commit MIME headers"));
+                }
+                return Err(swob_response(499));
+            }
+            Err(error) => return Err(async_body_read_error(&error)),
+        }
+    }
+}
+
+/// Drain bytes after the first commit document. This deliberately happens
+/// after the durability barrier, matching Python Swift's `_drain_mime_request`.
+async fn drain_mime_commit_remainder(
+    body: &mut swift_http::IncomingBody,
+    _trailing: Vec<u8>,
+) -> Result<(), Response> {
+    loop {
+        match body.next_chunk().await {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(()),
+            Err(error) => return Err(async_body_read_error(&error)),
         }
     }
 }
@@ -557,9 +682,13 @@ pub struct ObjectServer {
 }
 
 struct PendingDurable {
-    drive: String,
     durable: swift_diskfile::DurablePut,
     metadata: Metadata,
+    completion: PutCompletion,
+}
+
+struct PutCompletion {
+    drive: String,
     etag: String,
     upload_size: u64,
     content_type: String,
@@ -1144,10 +1273,7 @@ impl ObjectServer {
         let max = areq.body.max_body_bytes();
         let body = match areq.body.materialize(max).await {
             Ok(bytes) => Body::Buffered(bytes),
-            Err(e) if swift_http::body_too_large(&e) => {
-                return plain_response(413, "Your request is too large.")
-            }
-            Err(_) => return swob_response(499),
+            Err(error) => return async_body_read_error(&error),
         };
         let req = Request {
             method: areq.method,
@@ -1352,7 +1478,23 @@ impl ObjectServer {
         {
             return plain_response(411, "Missing Content-Length header.");
         }
+        let have_footer = req
+            .headers
+            .get("X-Backend-Obj-Metadata-Footer")
+            .is_some_and(config_true_value);
+        let multiphase = req
+            .headers
+            .get("X-Backend-Obj-Multiphase-Commit")
+            .is_some_and(config_true_value);
         let mime = put_is_mime(&req.headers);
+        let expect_continue = req.headers.get("Expect").is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("100-continue"))
+        });
+        if multiphase && !expect_continue {
+            return plain_response(400, "multiphase PUT requires Expect: 100-continue");
+        }
         let declared_len: Option<u64> = if mime {
             req.headers
                 .get("X-Backend-Obj-Content-Length")
@@ -1445,6 +1587,7 @@ impl ObjectServer {
             Err(e) => return plain_response(500, &e.to_string()),
         };
         let mut footers: Vec<(String, String)> = Vec::new();
+        let mut mime_boundary: Option<String> = None;
         if mime {
             let Some(boundary) = req
                 .headers
@@ -1453,6 +1596,18 @@ impl ObjectServer {
             else {
                 return plain_response(400, "no MIME boundary");
             };
+            if expect_continue {
+                let mut adverts: Vec<(&str, &str)> = Vec::new();
+                if multiphase {
+                    adverts.push(("X-Obj-Multiphase-Commit", "yes"));
+                }
+                if have_footer {
+                    adverts.push(("X-Obj-Metadata-Footer", "yes"));
+                }
+                if areq.body.send_continue(&adverts).await.is_err() {
+                    return swob_response(499);
+                }
+            }
             writer = match ingest_mime_object_async(
                 self.storage(),
                 device.clone(),
@@ -1463,25 +1618,37 @@ impl ObjectServer {
             .await
             {
                 Ok((w, leftover)) => {
-                    match ingest_mime_footer_async(&mut areq.body, leftover, boundary.as_bytes())
+                    let trailing = if have_footer {
+                        match ingest_mime_footer_async(
+                            &mut areq.body,
+                            leftover,
+                            boundary.as_bytes(),
+                        )
                         .await
-                    {
-                        Ok(f) => footers = f,
-                        Err(resp) => return resp,
+                        {
+                            Ok((found, trailing)) => {
+                                footers = found;
+                                trailing
+                            }
+                            Err(resp) => return resp,
+                        }
+                    } else {
+                        leftover
+                    };
+                    if let Err(resp) = drain_mime_phase(&mut areq.body, trailing).await {
+                        return resp;
                     }
                     w
                 }
                 Err(resp) => return resp,
             };
+            mime_boundary = Some(boundary);
         } else {
             loop {
                 let chunk = match areq.body.next_chunk().await {
                     Ok(Some(c)) => c,
                     Ok(None) => break,
-                    Err(e) if swift_http::body_too_large(&e) => {
-                        return plain_response(413, "Your request is too large.")
-                    }
-                    Err(_) => return swob_response(499),
+                    Err(error) => return async_body_read_error(&error),
                 };
                 writer = match self
                     .storage()
@@ -1554,14 +1721,8 @@ impl ObjectServer {
                 MetaValue::Str(delete_at.clone()),
             ));
         }
-        let durable = match writer.into_durable() {
-            Ok(d) => d,
-            Err(e) => return plain_response(500, &e.to_string()),
-        };
-        let pending = PendingDurable {
+        let completion = PutCompletion {
             drive,
-            durable,
-            metadata,
             etag,
             upload_size,
             content_type,
@@ -1575,7 +1736,81 @@ impl ObjectServer {
             headers: req.headers.clone(),
             path: req.path.clone(),
         };
-        let mut resp = self.finish_pending_put(pending).await;
+        let mut resp = if multiphase {
+            let Some(boundary) = mime_boundary else {
+                return plain_response(400, "multiphase commit requires a MIME body");
+            };
+            writer = match self
+                .storage()
+                .run_finite(device.clone(), TrafficClass::Foreground, move || {
+                    writer.put(metadata)?;
+                    Ok::<_, DiskFileError>(writer)
+                })
+                .await
+            {
+                Ok(Ok(writer)) => writer,
+                Ok(Err(DiskFileError::NoSpace | DiskFileError::XattrNotSupported)) => {
+                    return swob_response(507)
+                }
+                Ok(Err(error)) => return plain_response(500, &error.to_string()),
+                Err(error) => return plain_response(500, &error.to_string()),
+            };
+            if areq.body.send_continue(&[]).await.is_err() {
+                return swob_response(499);
+            }
+            let commit_trailing =
+                match ingest_mime_commit_async(&mut areq.body, boundary.as_bytes()).await {
+                    Ok(trailing) => trailing,
+                    Err(response) => return response,
+                };
+            let no_commit = completion
+                .headers
+                .get("X-Backend-No-Commit")
+                .is_some_and(config_true_value);
+            if !no_commit {
+                let req_timestamp = completion.req_timestamp.clone();
+                let stall = self.commit_stall.clone();
+                let exec = self.storage().clone();
+                let commit_device = device.clone();
+                let commit = DurabilityBarrier::run_shielded(async move {
+                    exec.run_finite(commit_device, TrafficClass::Foreground, move || {
+                        if let Some(stall) = stall.as_ref() {
+                            stall();
+                        }
+                        writer.commit(&req_timestamp)?;
+                        writer.close();
+                        Ok::<(), DiskFileError>(())
+                    })
+                    .await
+                })
+                .await;
+                match commit {
+                    Ok(Ok(())) => {}
+                    Ok(Err(DiskFileError::NoSpace | DiskFileError::XattrNotSupported)) => {
+                        return swob_response(507)
+                    }
+                    Ok(Err(error)) => return plain_response(500, &error.to_string()),
+                    Err(error) => return plain_response(500, &error.to_string()),
+                }
+            }
+            if let Err(response) =
+                drain_mime_commit_remainder(&mut areq.body, commit_trailing).await
+            {
+                return response;
+            }
+            self.finish_put_completion(completion).await
+        } else {
+            let durable = match writer.into_durable() {
+                Ok(durable) => durable,
+                Err(error) => return plain_response(500, &error.to_string()),
+            };
+            self.finish_pending_put(PendingDurable {
+                durable,
+                metadata,
+                completion,
+            })
+            .await
+        };
         resp.headers
             .setdefault("Content-Type", "text/html; charset=UTF-8");
         resp
@@ -1776,28 +2011,18 @@ impl ObjectServer {
 
     async fn finish_pending_put(&self, pending: PendingDurable) -> Response {
         let PendingDurable {
-            drive,
             durable,
             metadata,
-            etag,
-            upload_size,
-            content_type,
-            req_timestamp,
-            footers,
-            resolved_delete_at,
-            account,
-            container,
-            obj,
-            policy_index,
-            headers,
-            path,
+            completion,
         } = pending;
-        let no_commit = headers
+        let no_commit = completion
+            .headers
             .get("X-Backend-No-Commit")
             .is_some_and(config_true_value);
+        let drive = completion.drive.clone();
         let stall = self.commit_stall.clone();
         let exec = self.storage().clone();
-        let device = DeviceId::new(drive.clone());
+        let device = DeviceId::new(drive);
         // Barrier lives on a non-cancelled shield task (L7). Dropping this
         // HTTP future does not abort commit or panic-drop the guard.
         let commit = DurabilityBarrier::run_shielded(async move {
@@ -1822,6 +2047,25 @@ impl ObjectServer {
             Ok(Err(e)) => return plain_response(500, &e.to_string()),
             Err(e) => return plain_response(500, &e.to_string()),
         }
+        self.finish_put_completion(completion).await
+    }
+
+    async fn finish_put_completion(&self, completion: PutCompletion) -> Response {
+        let PutCompletion {
+            drive,
+            etag,
+            upload_size,
+            content_type,
+            req_timestamp,
+            footers,
+            resolved_delete_at,
+            account,
+            container,
+            obj,
+            policy_index,
+            headers,
+            path,
+        } = completion;
         let req = Request {
             method: "PUT".into(),
             path,
@@ -2589,21 +2833,23 @@ impl ObjectServer {
             };
             if let Some(slot) = executor_commit {
                 *slot = Some(PendingDurable {
-                    drive: drive.clone(),
                     durable,
                     metadata,
-                    etag: etag.clone(),
-                    upload_size,
-                    content_type: content_type.clone(),
-                    req_timestamp: req_timestamp.clone(),
-                    footers: footers.clone(),
-                    resolved_delete_at: resolved_delete_at.clone(),
-                    account: account.clone(),
-                    container: container.clone(),
-                    obj: obj.clone(),
-                    policy_index,
-                    headers: req.headers.clone(),
-                    path: req.path.clone(),
+                    completion: PutCompletion {
+                        drive: drive.clone(),
+                        etag: etag.clone(),
+                        upload_size,
+                        content_type: content_type.clone(),
+                        req_timestamp: req_timestamp.clone(),
+                        footers: footers.clone(),
+                        resolved_delete_at: resolved_delete_at.clone(),
+                        account: account.clone(),
+                        container: container.clone(),
+                        obj: obj.clone(),
+                        policy_index,
+                        headers: req.headers.clone(),
+                        path: req.path.clone(),
+                    },
                 });
             }
             // Caller (`handle_buffered_async`) commits this request's
@@ -4788,6 +5034,10 @@ impl SsyncSession<'_> {
 struct ObjectAsyncService(std::sync::Arc<ObjectServer>);
 
 impl AsyncService for ObjectAsyncService {
+    fn supports_object_mime_interim(&self) -> bool {
+        true
+    }
+
     fn call(&self, req: AsyncRequest) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
         Box::pin(async move { self.0.handle_async(req).await })
     }
@@ -6218,12 +6468,24 @@ mod fallocate_reserve_tests {
             format!("--{boundary}\r\nX-Document: object body\r\n\r\n").as_bytes(),
         );
         mime.extend_from_slice(&payload);
+        let footer_json = b"{}";
+        let footer_md5 = {
+            use md5::{Digest, Md5};
+            format!("{:x}", Md5::digest(footer_json))
+        };
+        mime.extend_from_slice(
+            format!(
+                "\r\n--{boundary}\r\nX-Document: object metadata\r\nContent-MD5: {footer_md5}\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        mime.extend_from_slice(footer_json);
         mime.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         let mut headers = HeaderKeyDict::new();
         headers.set("X-Timestamp", "2002");
         headers.set("Content-Type", "application/octet-stream");
         headers.set("Transfer-Encoding", "chunked");
-        headers.set("X-Backend-Obj-Multiphase-Commit", "yes");
+        headers.set("X-Backend-Obj-Metadata-Footer", "yes");
         headers.set("X-Backend-Obj-Multipart-Mime-Boundary", boundary);
         headers.set("X-Backend-Obj-Content-Length", payload.len());
         let areq = AsyncRequest {

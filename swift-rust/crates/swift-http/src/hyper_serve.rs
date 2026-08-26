@@ -45,7 +45,9 @@ use crate::body::Body;
 use crate::headers::HeaderKeyDict;
 use crate::dates::http_date;
 use crate::request::{decoded_path_is_utf8, reason_phrase, unquote, Response};
-use crate::server::{AsyncRequest, AsyncService, IncomingBody, ServerConfig};
+use crate::server::{
+    AsyncInterimCommand, AsyncRequest, AsyncService, IncomingBody, ServerConfig,
+};
 
 /// Decode a Hyper header value the way WSGI/Swift does: UTF-8 when the
 /// octets are valid UTF-8 (Python `str_to_wsgi` puts UTF-8 on the wire),
@@ -117,6 +119,18 @@ pub async fn serve_http1_connection(
     };
     if request_line_is_ssync(&more) {
         return serve_ssync_handoff(
+            stream,
+            more,
+            service,
+            config,
+            shutdown,
+            admission,
+            peer_ip,
+        )
+        .await;
+    }
+    if service.supports_object_mime_interim() && request_is_object_mime_continue_put(&more) {
+        return serve_object_mime_handoff(
             stream,
             more,
             service,
@@ -299,6 +313,59 @@ impl AsyncWrite for PrefixedIo {
 fn request_line_is_ssync(buf: &[u8]) -> bool {
     let line = buf.split(|&b| b == b'\r' || b == b'\n').next().unwrap_or(buf);
     line.len() >= 6 && line[..6].eq_ignore_ascii_case(b"SSYNC ")
+}
+
+fn ascii_config_true(value: &[u8]) -> bool {
+    let value = trim_ascii_bytes(value);
+    value.eq_ignore_ascii_case(b"true")
+        || value.eq_ignore_ascii_case(b"yes")
+        || value.eq_ignore_ascii_case(b"on")
+        || value == b"1"
+}
+
+/// Hyper can emit only its standard, bare `100 Continue`. Swift's EC
+/// backend protocol needs capability headers on the first informational
+/// response and a second informational response before the commit phase, so
+/// this narrow wire shape must be handed to the native async socket driver.
+fn request_is_object_mime_continue_put(buf: &[u8]) -> bool {
+    let mut lines = buf.split(|&byte| byte == b'\n');
+    let request_line = lines
+        .next()
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .unwrap_or_default();
+    if !request_line
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"PUT "))
+    {
+        return false;
+    }
+    let mut mime_feature = false;
+    let mut expect_continue = false;
+    for raw_line in lines {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if line.is_empty() {
+            break;
+        }
+        let Some(colon) = line.iter().position(|&byte| byte == b':') else {
+            continue;
+        };
+        let name = trim_ascii_bytes(&line[..colon]);
+        let value = trim_ascii_bytes(&line[colon + 1..]);
+        if (name.eq_ignore_ascii_case(b"X-Backend-Obj-Multiphase-Commit")
+            || name.eq_ignore_ascii_case(b"X-Backend-Obj-Metadata-Footer"))
+            && ascii_config_true(value)
+        {
+            mime_feature = true;
+        }
+        if name.eq_ignore_ascii_case(b"Expect")
+            && value
+                .split(|&byte| byte == b',')
+                .any(|token| trim_ascii_bytes(token).eq_ignore_ascii_case(b"100-continue"))
+        {
+            expect_continue = true;
+        }
+    }
+    mime_feature && expect_continue
 }
 
 /// Python proxy `check_utf8(PATH_INFO)` / `get_controller is None` → 412.
@@ -670,6 +737,253 @@ fn te_is_chunked(headers: &HeaderKeyDict) -> bool {
         .unwrap_or(false)
 }
 
+fn header_config_true(headers: &HeaderKeyDict, name: &str) -> bool {
+    headers
+        .get(name)
+        .is_some_and(|value| ascii_config_true(value.as_bytes()))
+}
+
+async fn write_handoff_error(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    body: &str,
+) -> std::io::Result<()> {
+    let reason = reason_phrase(status);
+    let bytes = body.as_bytes();
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            )
+            .as_bytes(),
+        )
+        .await?;
+    stream.write_all(bytes).await?;
+    stream.flush().await
+}
+
+/// Native async Swift MIME object PUT. Each `send_continue()` requested by the
+/// object service writes one informational response and then unlocks exactly
+/// one independently chunked request phase. Multiphase EC uses the same body
+/// channel for its second commit document; a zero-length item marks each phase
+/// boundary without closing that channel.
+async fn serve_object_mime_handoff(
+    mut stream: tokio::net::TcpStream,
+    peeked: Vec<u8>,
+    service: Arc<dyn AsyncService>,
+    config: ServerConfig,
+    shutdown: Arc<AtomicBool>,
+    admission: AdmissionController,
+    peer_ip: Option<String>,
+) -> std::io::Result<()> {
+    if shutdown.load(Ordering::SeqCst) {
+        reject_overloaded(stream).await;
+        return Ok(());
+    }
+    if !service.supports_object_mime_interim() {
+        return write_handoff_error(
+            &mut stream,
+            500,
+            "Swift MIME PUT requires a native async service",
+        )
+        .await;
+    }
+    let _request_permit = match admission.try_acquire_request(TrafficClass::Foreground) {
+        Ok(permit) => permit,
+        Err(_) => {
+            reject_overloaded(stream).await;
+            return Ok(());
+        }
+    };
+    let (head, leftover) = split_head_body(peeked);
+    let (method, path, query_string, mut headers) =
+        match parse_swift_utf8_head(&head, config.max_header_count) {
+            Ok(parsed) => parsed,
+            Err(_) => return write_handoff_error(&mut stream, 400, "Bad Request").await,
+        };
+    let expect_continue = headers.get("Expect").is_some_and(|value| {
+        value
+            .split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case("100-continue"))
+    });
+    if method != "PUT"
+        || !(header_config_true(&headers, "X-Backend-Obj-Multiphase-Commit")
+            || header_config_true(&headers, "X-Backend-Obj-Metadata-Footer"))
+        || !te_is_chunked(&headers)
+        || !expect_continue
+        || headers.contains_key("Content-Length")
+    {
+        return write_handoff_error(&mut stream, 400, "Invalid Swift MIME PUT framing").await;
+    }
+    if let Some(ref ip) = peer_ip {
+        if !headers.contains_key("X-Backend-Remote-Addr") {
+            headers.set("X-Backend-Remote-Addr", ip);
+        }
+    }
+
+    let (read_half, write_half) = stream.into_split();
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(8);
+    let (interim_tx, interim_rx) = tokio::sync::mpsc::channel::<AsyncInterimCommand>(2);
+    let scope = swift_runtime::TaskScope::bounded(1);
+    let wire_task = scope
+        .spawn(drive_object_multiphase_wire(
+            leftover,
+            read_half,
+            write_half,
+            body_tx,
+            interim_rx,
+            config.max_body_bytes,
+        ))
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let mut body = IncomingBody::from_channel(
+        body_rx,
+        None,
+        Some(scope.clone()),
+        config.max_body_bytes,
+    );
+    body.attach_async_interim(interim_tx);
+    let idle_secs = if config.body_idle_timeout_secs > 0 {
+        config.body_idle_timeout_secs
+    } else {
+        config.client_timeout_secs
+    };
+    if idle_secs > 0 {
+        body.set_body_idle(BodyIdleDeadline::from_timeout(Duration::from_secs(
+            idle_secs,
+        )));
+    }
+    if config.max_upload_time_secs > 0 {
+        body.set_upload_lifetime(UploadLifetimeDeadline::from_timeout(Duration::from_secs(
+            config.max_upload_time_secs,
+        )));
+    }
+
+    let metrics = config
+        .metrics
+        .clone()
+        .unwrap_or_else(ConcurrencyMetrics::new);
+    metrics.record_http_request_hyper();
+    metrics.record_native_async_request();
+    let response = service
+        .call(AsyncRequest {
+            method,
+            path,
+            query_string,
+            headers,
+            body,
+        })
+        .await;
+    let (mut write_half, wire_result) = wire_task
+        .join()
+        .await
+        .map_err(|_| std::io::Error::other("multiphase wire task cancelled"))?;
+    scope
+        .join()
+        .await
+        .map_err(|_| std::io::Error::other("multiphase wire task panicked"))?;
+    if let Err(error) = &wire_result {
+        if !matches!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+        ) {
+            eprintln!("multiphase request wire error: {error}");
+        }
+    }
+    write_swift_compat_response(&mut write_half, response, false).await
+}
+
+async fn write_async_continue(
+    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+    headers: &[(String, String)],
+) -> std::io::Result<()> {
+    let mut head = String::from("HTTP/1.1 100 Continue\r\n");
+    for (name, value) in headers {
+        if name.is_empty()
+            || !name.is_ascii()
+            || !name.as_bytes().iter().copied().all(ascii_header_name_byte)
+            || value.contains(['\r', '\n'])
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid informational response header",
+            ));
+        }
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    write_half.write_all(head.as_bytes()).await?;
+    write_half.flush().await
+}
+
+fn duplicate_io_error(error: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(error.kind(), error.to_string())
+}
+
+async fn drive_object_multiphase_wire(
+    leftover: Vec<u8>,
+    read_half: tokio::net::tcp::OwnedReadHalf,
+    mut write_half: tokio::net::tcp::OwnedWriteHalf,
+    body_tx: tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+    mut interim_rx: tokio::sync::mpsc::Receiver<AsyncInterimCommand>,
+    max_body: u64,
+) -> (tokio::net::tcp::OwnedWriteHalf, std::io::Result<()>) {
+    let mut source = ByteSrc {
+        buf: leftover,
+        pos: 0,
+        rh: read_half,
+    };
+    let mut phases = 0usize;
+    while let Some(command) = interim_rx.recv().await {
+        phases += 1;
+        if phases > 2 {
+            let error = std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "multiphase PUT requested more than two request phases",
+            );
+            let _ = command.ack.send(Err(duplicate_io_error(&error)));
+            return (write_half, Err(error));
+        }
+        if let Err(error) = write_async_continue(&mut write_half, &command.headers).await {
+            let _ = command.ack.send(Err(duplicate_io_error(&error)));
+            return (write_half, Err(error));
+        }
+        let _ = command.ack.send(Ok(()));
+        let pump_result = tokio::select! {
+            result = pump_chunked(&mut source, &body_tx, max_body) => result,
+            early = interim_rx.recv() => {
+                let Some(early) = early else {
+                    // The service returned or timed out and dropped the body.
+                    // Cancel the socket read so the final response is not held
+                    // hostage by a stalled sender.
+                    return (write_half, Ok(()));
+                };
+                let error = std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "next request phase requested before the current phase ended",
+                );
+                let _ = early.ack.send(Err(duplicate_io_error(&error)));
+                Err(error)
+            }
+        };
+        if let Err(error) = pump_result {
+            let _ = body_tx.send(Err(duplicate_io_error(&error))).await;
+            return (write_half, Err(error));
+        }
+        // Logical EOF for this chunked phase. `IncomingBody::Channel` treats
+        // an empty item as `None` but remains open for the next phase.
+        if body_tx.send(Ok(Vec::new())).await.is_err() {
+            return (write_half, Ok(()));
+        }
+    }
+    (write_half, Ok(()))
+}
+
 /// Async Swift-wire compatibility for valid UTF-8 metadata field names.
 /// This is intentionally a one-request, connection-close lane: it preserves
 /// Python Swift's non-RFC header octets without weakening Hyper's parser for
@@ -989,7 +1303,7 @@ impl ByteSrc {
             if !self.fill().await? {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
-                    "ssync body truncated",
+                    "request body truncated",
                 ));
             }
             let take = (n - out.len()).min(self.buf.len() - self.pos);
@@ -1032,7 +1346,10 @@ async fn pump_chunked(
     loop {
         let line = src.read_line().await?;
         if line.is_empty() {
-            return Ok(());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "chunked request phase ended before its terminator",
+            ));
         }
         let hex = std::str::from_utf8(&line)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
@@ -1051,19 +1368,31 @@ async fn pump_chunked(
         if decoded > max_body {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "ssync body too large",
+                "chunked request body too large",
             ));
         }
-        let data = src.read_exact(size).await?;
+        let mut remaining = size;
+        while remaining > 0 {
+            if !src.fill().await? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "request body truncated",
+                ));
+            }
+            let take = remaining.min(src.buf.len() - src.pos);
+            let data = src.buf[src.pos..src.pos + take].to_vec();
+            src.pos += take;
+            remaining -= take;
+            if tx.send(Ok(data)).await.is_err() {
+                return Ok(());
+            }
+        }
         let crlf = src.read_exact(2).await?;
         if crlf != b"\r\n" {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "chunk missing CRLF",
             ));
-        }
-        if tx.send(Ok(data)).await.is_err() {
-            return Ok(());
         }
     }
 }

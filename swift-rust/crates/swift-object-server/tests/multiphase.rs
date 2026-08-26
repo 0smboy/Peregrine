@@ -14,15 +14,15 @@
 // limitations under the License.
 
 //! Backend multipart-MIME PUT coverage for both shipped execution paths:
-//! the production async server's single-phase streaming wire protocol and
-//! the synchronous compatibility handler's two-phase commit state machine.
+//! the production async server's streaming two-phase wire protocol and the
+//! synchronous compatibility handler's two-phase commit state machine.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use swift_object_server::{ContainerUpdateMode, ObjectServer, ObjectServerConfig};
 
@@ -80,15 +80,18 @@ fn object_server(devices: &Path) -> ObjectServer {
 /// Serve the production async object service (policy 0 replication + policy
 /// 1 EC-ish) on an ephemeral port; process exit reaps the detached thread.
 fn spawn_server(devices: &Path) -> std::net::SocketAddr {
+    spawn_server_with_config(devices, swift_http::ServerConfig::default())
+}
+
+fn spawn_server_with_config(
+    devices: &Path,
+    config: swift_http::ServerConfig,
+) -> std::net::SocketAddr {
     let server = object_server(devices);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     std::thread::spawn(move || {
-        let _ = swift_object_server::serve_with_config(
-            listener,
-            server,
-            swift_http::ServerConfig::default(),
-        );
+        let _ = swift_object_server::serve_with_config(listener, server, config);
     });
     address
 }
@@ -137,6 +140,46 @@ fn read_interim(client: &mut TcpStream) -> String {
         seen.push(byte[0]);
     }
     String::from_utf8_lossy(&seen).into_owned()
+}
+
+fn begin_native_multiphase(
+    address: std::net::SocketAddr,
+    path: &str,
+    boundary: &str,
+    data: &[u8],
+    footer_json: &str,
+) -> TcpStream {
+    let mut client = TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client
+        .write_all(
+            format!(
+                "PUT {path} HTTP/1.1\r\nHost: t\r\nX-Timestamp: {}\r\n\
+                 Content-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\
+                 Expect: 100-continue\r\nX-Backend-Storage-Policy-Index: 1\r\n\
+                 X-Backend-Obj-Multipart-Mime-Boundary: {boundary}\r\n\
+                 X-Backend-Obj-Metadata-Footer: yes\r\n\
+                 X-Backend-Obj-Multiphase-Commit: yes\r\n\
+                 X-Backend-Obj-Content-Length: {}\r\nConnection: close\r\n\r\n",
+                swift_core::timestamp::Timestamp::now().internal(),
+                data.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let first = read_interim(&mut client);
+    assert_eq!(status_of(&first), 100, "{first}");
+    assert!(first.contains("X-Obj-Metadata-Footer: yes"), "{first}");
+    assert!(first.contains("X-Obj-Multiphase-Commit: yes"), "{first}");
+    client
+        .write_all(&chunked(&phase1(boundary, data, footer_json)))
+        .unwrap();
+    client.write_all(TERMINATOR).unwrap();
+    let second = read_interim(&mut client);
+    assert_eq!(status_of(&second), 100, "{second}");
+    client
 }
 
 fn status_of(response: &str) -> u16 {
@@ -245,9 +288,7 @@ fn async_mime_put(
         let _ = client.read_to_string(&mut rest);
         return (status_of(&first), first + &rest);
     }
-    // Hyper owns the production async connection and emits the standard bare
-    // 100. Capability-bearing repeated informational responses belong only to
-    // the synchronous compatibility state machine tested below.
+    assert!(first.contains("X-Obj-Metadata-Footer: yes"), "{first}");
     client
         .write_all(&chunked(&phase1(boundary, data, footer_json)))
         .unwrap();
@@ -294,6 +335,341 @@ fn sync_compatibility_handler_keeps_two_phase_commit_contract() {
         Arc::new(Mutex::new(Vec::new())),
     );
     assert_eq!(rejected.status, 500);
+}
+
+#[test]
+fn native_async_multiphase_put_advertises_and_commits_after_confirmation() {
+    let devices = TestDevices::new("native-two-phase");
+    let address = spawn_server(devices.path());
+    let boundary = "native-two-phase-boundary";
+    let data = b"native async fragment";
+    let footers = format!(
+        "{{\"Etag\": \"{}\", \"X-Object-Sysmeta-Ec-Frag-Index\": \"3\"}}",
+        md5_hex(data)
+    );
+    let mut client = TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client
+        .write_all(
+            format!(
+                "PUT /sda1/0/a/c/native HTTP/1.1\r\nHost: t\r\nX-Timestamp: {}\r\n\
+                 Content-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\
+                 Expect: 100-continue\r\nX-Backend-Storage-Policy-Index: 1\r\n\
+                 X-Backend-Obj-Multipart-Mime-Boundary: {boundary}\r\n\
+                 X-Backend-Obj-Metadata-Footer: yes\r\n\
+                 X-Backend-Obj-Multiphase-Commit: yes\r\n\
+                 X-Backend-Obj-Content-Length: {}\r\nConnection: close\r\n\r\n",
+                swift_core::timestamp::Timestamp::now().internal(),
+                data.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let first = read_interim(&mut client);
+    assert_eq!(status_of(&first), 100, "{first}");
+    assert!(first.contains("X-Obj-Metadata-Footer: yes"), "{first}");
+    assert!(first.contains("X-Obj-Multiphase-Commit: yes"), "{first}");
+    client
+        .write_all(&chunked(&phase1(boundary, data, &footers)))
+        .unwrap();
+    client.write_all(TERMINATOR).unwrap();
+
+    let second = read_interim(&mut client);
+    assert_eq!(status_of(&second), 100, "{second}");
+    let before_commit = find_files(devices.path(), "data");
+    assert!(
+        before_commit
+            .iter()
+            .any(|path| path.to_string_lossy().contains("#3.data")),
+        "second 100 must follow a persisted non-durable fragment: {before_commit:?}"
+    );
+    assert!(
+        !before_commit
+            .iter()
+            .any(|path| path.to_string_lossy().contains("#3#d.data")),
+        "fragment became durable before commit confirmation: {before_commit:?}"
+    );
+
+    client.write_all(&chunked(&phase2(boundary))).unwrap();
+    client.write_all(TERMINATOR).unwrap();
+    let mut final_response = String::new();
+    client.read_to_string(&mut final_response).unwrap();
+    assert_eq!(status_of(&final_response), 201, "{final_response}");
+    let after_commit = find_files(devices.path(), "data");
+    assert!(
+        after_commit
+            .iter()
+            .any(|path| path.to_string_lossy().contains("#3#d.data")),
+        "commit confirmation did not make the fragment durable: {after_commit:?}"
+    );
+}
+
+#[test]
+fn native_async_multiphase_disconnect_never_marks_fragment_durable() {
+    let devices = TestDevices::new("native-two-phase-disconnect");
+    let address = spawn_server(devices.path());
+    let boundary = "native-disconnect-boundary";
+    let data = b"non durable fragment";
+    let footers = format!(
+        "{{\"Etag\": \"{}\", \"X-Object-Sysmeta-Ec-Frag-Index\": \"2\"}}",
+        md5_hex(data)
+    );
+    let mut client = TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client
+        .write_all(
+            format!(
+                "PUT /sda1/0/a/c/disconnect HTTP/1.1\r\nHost: t\r\nX-Timestamp: {}\r\n\
+                 Content-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\
+                 Expect: 100-continue\r\nX-Backend-Storage-Policy-Index: 1\r\n\
+                 X-Backend-Obj-Multipart-Mime-Boundary: {boundary}\r\n\
+                 X-Backend-Obj-Metadata-Footer: yes\r\n\
+                 X-Backend-Obj-Multiphase-Commit: yes\r\n\
+                 X-Backend-Obj-Content-Length: {}\r\nConnection: close\r\n\r\n",
+                swift_core::timestamp::Timestamp::now().internal(),
+                data.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    assert_eq!(status_of(&read_interim(&mut client)), 100);
+    client
+        .write_all(&chunked(&phase1(boundary, data, &footers)))
+        .unwrap();
+    client.write_all(TERMINATOR).unwrap();
+    assert_eq!(status_of(&read_interim(&mut client)), 100);
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut final_response = String::new();
+    let _ = client.read_to_string(&mut final_response);
+    if !final_response.is_empty() {
+        assert_eq!(status_of(&final_response), 499, "{final_response}");
+    }
+    let data_files = find_files(devices.path(), "data");
+    assert!(
+        !data_files
+            .iter()
+            .any(|path| path.to_string_lossy().contains("#2#d.data")),
+        "disconnect marked an unconfirmed fragment durable: {data_files:?}"
+    );
+}
+
+#[test]
+fn native_async_multiphase_body_idle_returns_408_without_waiting_for_socket_eof() {
+    let devices = TestDevices::new("native-two-phase-idle");
+    let mut config = swift_http::ServerConfig::default();
+    config.body_idle_timeout_secs = 1;
+    let address = spawn_server_with_config(devices.path(), config);
+    let boundary = "native-idle-boundary";
+    let mut client = TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client
+        .write_all(
+            format!(
+                "PUT /sda1/0/a/c/idle HTTP/1.1\r\nHost: t\r\nX-Timestamp: {}\r\n\
+                 Content-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\
+                 Expect: 100-continue\r\nX-Backend-Storage-Policy-Index: 1\r\n\
+                 X-Backend-Obj-Multipart-Mime-Boundary: {boundary}\r\n\
+                 X-Backend-Obj-Metadata-Footer: yes\r\n\
+                 X-Backend-Obj-Multiphase-Commit: yes\r\n\
+                 X-Backend-Obj-Content-Length: 1\r\nConnection: close\r\n\r\n",
+                swift_core::timestamp::Timestamp::now().internal()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+    assert_eq!(status_of(&read_interim(&mut client)), 100);
+    let started = Instant::now();
+    let mut final_response = String::new();
+    client.read_to_string(&mut final_response).unwrap();
+    assert_eq!(status_of(&final_response), 408, "{final_response}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "body-idle response waited for the stalled client: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        find_files(devices.path(), "data").is_empty(),
+        "a body-idle timeout must not persist a fragment"
+    );
+}
+
+#[test]
+fn native_async_multiphase_accepts_opaque_commit_body_and_drains_extra_docs() {
+    let devices = TestDevices::new("native-two-phase-opaque-commit");
+    let address = spawn_server(devices.path());
+    let boundary = "native-opaque-boundary";
+    let data = b"opaque commit fragment";
+    let footers = format!(
+        "{{\"Etag\": \"{}\", \"X-Object-Sysmeta-Ec-Frag-Index\": \"4\"}}",
+        md5_hex(data)
+    );
+    let mut client = begin_native_multiphase(
+        address,
+        "/sda1/0/a/c/opaque",
+        boundary,
+        data,
+        &footers,
+    );
+    let commit_and_junk = format!(
+        "X-Document: put commit\r\n\r\ncommit_confirmation\r\n\
+         --{boundary}\r\nX-Document: extra\r\n\r\njunk\r\n--{boundary}--"
+    );
+    client
+        .write_all(&chunked(commit_and_junk.as_bytes()))
+        .unwrap();
+    client.write_all(TERMINATOR).unwrap();
+    let mut final_response = String::new();
+    client.read_to_string(&mut final_response).unwrap();
+    assert_eq!(status_of(&final_response), 201, "{final_response}");
+    let data_files = find_files(devices.path(), "data");
+    assert!(
+        data_files
+            .iter()
+            .any(|path| path.to_string_lossy().contains("#4#d.data")),
+        "opaque commit body was not accepted like Python Swift: {data_files:?}"
+    );
+}
+
+#[test]
+fn native_async_multiphase_invalid_commit_header_is_500_and_not_durable() {
+    let devices = TestDevices::new("native-two-phase-invalid-commit");
+    let address = spawn_server(devices.path());
+    let boundary = "native-invalid-boundary";
+    let data = b"invalid commit fragment";
+    let footers = format!(
+        "{{\"Etag\": \"{}\", \"X-Object-Sysmeta-Ec-Frag-Index\": \"5\"}}",
+        md5_hex(data)
+    );
+    let mut client = begin_native_multiphase(
+        address,
+        "/sda1/0/a/c/invalid",
+        boundary,
+        data,
+        &footers,
+    );
+    let invalid = format!(
+        "X-Document: not a commit\r\n\r\nnope\r\n--{boundary}--"
+    );
+    client.write_all(&chunked(invalid.as_bytes())).unwrap();
+    client.write_all(TERMINATOR).unwrap();
+    let mut final_response = String::new();
+    client.read_to_string(&mut final_response).unwrap();
+    assert_eq!(status_of(&final_response), 500, "{final_response}");
+    let data_files = find_files(devices.path(), "data");
+    assert!(
+        !data_files
+            .iter()
+            .any(|path| path.to_string_lossy().contains("#5#d.data")),
+        "invalid commit header marked a fragment durable: {data_files:?}"
+    );
+}
+
+#[test]
+fn native_async_multiphase_without_metadata_footer_matches_replication_contract() {
+    let devices = TestDevices::new("native-two-phase-no-footer");
+    let address = spawn_server(devices.path());
+    let boundary = "native-no-footer-boundary";
+    let data = b"replicated multiphase bytes";
+    let mut client = TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client
+        .write_all(
+            format!(
+                "PUT /sda1/0/a/c/no-footer HTTP/1.1\r\nHost: t\r\nX-Timestamp: {}\r\n\
+                 Content-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\
+                 Expect: 100-continue\r\n\
+                 X-Backend-Obj-Multipart-Mime-Boundary: {boundary}\r\n\
+                 X-Backend-Obj-Multiphase-Commit: yes\r\n\
+                 X-Backend-Obj-Content-Length: {}\r\nConnection: close\r\n\r\n",
+                swift_core::timestamp::Timestamp::now().internal(),
+                data.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let first = read_interim(&mut client);
+    assert_eq!(status_of(&first), 100, "{first}");
+    assert!(first.contains("X-Obj-Multiphase-Commit: yes"), "{first}");
+    assert!(!first.contains("X-Obj-Metadata-Footer"), "{first}");
+
+    let mut object_doc = format!("--{boundary}\r\nX-Document: object body\r\n\r\n").into_bytes();
+    object_doc.extend_from_slice(data);
+    object_doc.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes());
+    client.write_all(&chunked(&object_doc)).unwrap();
+    client.write_all(TERMINATOR).unwrap();
+    assert_eq!(status_of(&read_interim(&mut client)), 100);
+
+    let opaque_commit = format!(
+        "X-Document: put commit\r\n\r\ncommit_confirmation\r\n--{boundary}--"
+    );
+    client
+        .write_all(&chunked(opaque_commit.as_bytes()))
+        .unwrap();
+    client.write_all(TERMINATOR).unwrap();
+    let mut final_response = String::new();
+    client.read_to_string(&mut final_response).unwrap();
+    assert_eq!(status_of(&final_response), 201, "{final_response}");
+
+    let mut get = TcpStream::connect(address).unwrap();
+    get.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    get.write_all(
+        b"GET /sda1/0/a/c/no-footer HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
+    let mut response = Vec::new();
+    get.read_to_end(&mut response).unwrap();
+    assert!(
+        response.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    assert!(response.ends_with(data), "replicated body mismatch");
+}
+
+#[test]
+fn native_async_complete_commit_doc_then_disconnect_remains_durable() {
+    let devices = TestDevices::new("native-two-phase-post-commit-disconnect");
+    let address = spawn_server(devices.path());
+    let boundary = "native-post-commit-disconnect-boundary";
+    let data = b"commit before drain fragment";
+    let footers = format!(
+        "{{\"Etag\": \"{}\", \"X-Object-Sysmeta-Ec-Frag-Index\": \"0\"}}",
+        md5_hex(data)
+    );
+    let mut client = begin_native_multiphase(
+        address,
+        "/sda1/0/a/c/post-commit-disconnect",
+        boundary,
+        data,
+        &footers,
+    );
+    let commit_doc = format!(
+        "X-Document: put commit\r\n\r\ncommit_confirmation\r\n--{boundary}--"
+    );
+    client.write_all(&chunked(commit_doc.as_bytes())).unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut final_response = String::new();
+    let _ = client.read_to_string(&mut final_response);
+    if !final_response.is_empty() {
+        assert_eq!(status_of(&final_response), 499, "{final_response}");
+    }
+    let data_files = find_files(devices.path(), "data");
+    assert!(
+        data_files
+            .iter()
+            .any(|path| path.to_string_lossy().contains("#0#d.data")),
+        "a complete commit document must authorize durability before post-commit drain: {data_files:?}"
+    );
 }
 
 fn find_files(root: &Path, extension: &str) -> Vec<PathBuf> {

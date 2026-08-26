@@ -95,6 +95,15 @@ pub trait AsyncService: Send + Sync + 'static {
     fn is_legacy_sync_handler(&self) -> bool {
         false
     }
+
+    /// True only for the native object service that understands Swift's
+    /// metadata-footer and multiphase request-body handshake. Backend-shaped
+    /// headers received by proxy/account/container services must remain on
+    /// Hyper's ordinary request path instead of waiting for an interim command
+    /// those services will never issue.
+    fn supports_object_mime_interim(&self) -> bool {
+        false
+    }
 }
 
 /// Adapter: async-materialize the body, then run the sync [`Handler`] on
@@ -879,6 +888,17 @@ pub struct IncomingBody {
     on_upgrade: Option<hyper::upgrade::OnUpgrade>,
     metrics: Option<ConcurrencyMetrics>,
     buffered: usize,
+    async_interim: Option<tokio::sync::mpsc::Sender<AsyncInterimCommand>>,
+}
+
+/// One capability-bearing informational response requested by a native async
+/// service. The HTTP runtime owns the socket write half; the service only
+/// requests the response and waits for an acknowledgement that it reached the
+/// wire. This keeps the object-server multiphase PUT handshake off blocking
+/// compatibility paths.
+pub(crate) struct AsyncInterimCommand {
+    pub headers: Vec<(String, String)>,
+    pub ack: tokio::sync::oneshot::Sender<std::io::Result<()>>,
 }
 
 enum IncomingInner {
@@ -909,6 +929,7 @@ impl IncomingBody {
             on_upgrade: None,
             metrics: ConcurrencyMetrics::current(),
             buffered: 0,
+            async_interim: None,
         }
     }
 
@@ -927,6 +948,7 @@ impl IncomingBody {
             on_upgrade: None,
             metrics,
             buffered,
+            async_interim: None,
         }
     }
 
@@ -956,19 +978,62 @@ impl IncomingBody {
             on_upgrade: None,
             metrics,
             buffered,
+            async_interim: None,
         }
+    }
+
+    pub(crate) fn attach_async_interim(
+        &mut self,
+        sender: tokio::sync::mpsc::Sender<AsyncInterimCommand>,
+    ) {
+        self.async_interim = Some(sender);
+    }
+
+    /// Send a `100 Continue` through the async connection owner. The method
+    /// completes only after the informational response has been flushed, so
+    /// the caller may safely begin awaiting the corresponding request phase.
+    pub async fn send_continue(&mut self, headers: &[(&str, &str)]) -> std::io::Result<()> {
+        let Some(sender) = &self.async_interim else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "async interim responder is unavailable",
+            ));
+        };
+        let (ack, received) = tokio::sync::oneshot::channel();
+        sender
+            .send(AsyncInterimCommand {
+                headers: headers
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                    .collect(),
+                ack,
+            })
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "async interim connection closed",
+                )
+            })?;
+        received.await.map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "async interim acknowledgement dropped",
+            )
+        })?
     }
 
     /// Decode/transform `self` as `next_chunk` is pulled. Does not spawn a
     /// task: backpressure is the consumer, and the transform window is owned
     /// by [`BodyTransform`].
     pub fn with_transform(
-        self,
+        mut self,
         xform: Box<dyn BodyTransform>,
         decoded_len: Option<u64>,
     ) -> Self {
         let max_body = decoded_len.unwrap_or(self.max_body);
         let metrics = self.metrics.clone();
+        let async_interim = self.async_interim.take();
         Self {
             inner: IncomingInner::Transform {
                 source: Box::new(self),
@@ -984,6 +1049,7 @@ impl IncomingBody {
             on_upgrade: None,
             metrics,
             buffered: 0,
+            async_interim,
         }
     }
 
