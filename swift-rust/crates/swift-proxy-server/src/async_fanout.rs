@@ -741,7 +741,8 @@ impl ProxyApp {
         per_node_headers: Vec<swift_http::HeaderKeyDict>,
         body: &mut IncomingBody,
     ) -> Response {
-        let content_length = body.content_length();
+        let content_length =
+            super::backend_put_content_length(body.content_length(), &per_node_headers);
         let slots = per_node_headers.len().max(1);
         let quorum = quorum_size(node_number.max(1) as f64) as usize;
         let mut group: FanoutGroup<AsyncPutterOutcome> = match FanoutGroup::new(slots, slots) {

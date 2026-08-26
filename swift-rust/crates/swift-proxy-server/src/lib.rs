@@ -1029,6 +1029,42 @@ fn write_chunk_framed<W: Write>(writer: &mut W, chunk: &[u8]) -> std::io::Result
     writer.write_all(b"\r\n")
 }
 
+/// Keep a conditional zero-byte backend PUT in its pre-commit phase until
+/// every object server has answered `100 Continue` or an early final status.
+/// With `Content-Length: 0`, servers missing the object can commit before a
+/// different replica returns `412`; chunked framing lets the proxy withhold
+/// the terminating zero chunk when any replica rejects `If-None-Match: *`.
+pub(crate) fn backend_put_content_length(
+    client_length: Option<u64>,
+    per_node_headers: &[HeaderKeyDict],
+) -> Option<u64> {
+    let conditional = per_node_headers
+        .iter()
+        .any(|headers| headers.get("If-None-Match").is_some());
+    if client_length == Some(0) && conditional {
+        None
+    } else {
+        client_length
+    }
+}
+
+#[cfg(test)]
+mod conditional_zero_put_tests {
+    use super::*;
+
+    #[test]
+    fn conditional_zero_put_uses_chunked_backend_commit_barrier() {
+        let mut conditional = HeaderKeyDict::new();
+        conditional.set("If-None-Match", "*");
+        assert_eq!(backend_put_content_length(Some(0), &[conditional]), None);
+
+        let ordinary = HeaderKeyDict::new();
+        assert_eq!(backend_put_content_length(Some(0), &[ordinary]), Some(0));
+        assert_eq!(backend_put_content_length(Some(4), &[]), Some(4));
+        assert_eq!(backend_put_content_length(None, &[]), None);
+    }
+}
+
 /// The per-segment sizes an object splits into (empty object = no
 /// segments: Python stores zero-byte archives for zero-byte objects).
 #[cfg(feature = "ec")]
@@ -1875,7 +1911,7 @@ impl ProxyApp {
         per_node_headers: Vec<HeaderKeyDict>,
         body: swift_http::Body,
     ) -> Response {
-        let content_length = body.content_length();
+        let content_length = backend_put_content_length(body.content_length(), &per_node_headers);
         let node_pool = Arc::new(Mutex::new(nodes.into_iter().collect::<Vec<_>>()));
         let slots = per_node_headers.len();
         let (tx, rx) = mpsc::sync_channel(slots.max(1));
