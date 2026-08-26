@@ -4287,31 +4287,33 @@ impl ProxyApp {
         path: &str,
         shard_headers: &HeaderKeyDict,
     ) -> Option<Vec<serde_json::Value>> {
-        // 1) Prefer the *longest* nonempty states=listing set (not first
-        // nonempty). A lagging 1-range replica must not hide CLEAVED children
-        // (probe test_sharding_listing L631).
-        if let Some(arr) = self.fetch_json_array_longest_nonempty(
-            &nodes,
-            part,
-            path,
-            "states=listing&format=json",
-            shard_headers,
+        // 1) Prefer the topology reported by the most replicas.  On a tie,
+        // keep the longest progressed view so a lagging 1-range replica does
+        // not hide CLEAVED children (probe test_sharding_listing L631).
+        if let Some(arr) = prefer_quorum_consistent_listing_arrays(
+            &self.fetch_json_arrays_nonempty(
+                &nodes,
+                part,
+                path,
+                "states=listing&format=json",
+                shard_headers,
+            ),
         ) {
             if !arr.is_empty() {
-                return Some(prefer_full_active_cover_ranges(&arr));
+                return Some(arr);
             }
         }
         // 2) Broader: no state filter; prefer listing-state rows, else all.
-        let broad = self.fetch_json_array_longest_nonempty(
-            &nodes,
-            part,
-            path,
-            "format=json",
-            shard_headers,
+        let broad = prefer_quorum_consistent_listing_arrays(
+            &self.fetch_json_arrays_nonempty(
+                &nodes,
+                part,
+                path,
+                "format=json",
+                shard_headers,
+            ),
         )?;
-        Some(prefer_full_active_cover_ranges(
-            &prefer_listing_state_ranges(&broad),
-        ))
+        Some(prefer_listing_state_ranges(&broad))
     }
 
     /// Walk every replica and collect nonempty JSON arrays.
@@ -6490,64 +6492,6 @@ pub(crate) fn listing_has_full_shrinking_cover(selected: &[&serde_json::Value]) 
     })
 }
 
-/// listing-w217 L2044: a lagging 2-range set (SHRINKING first-shard +
-/// expanded ACTIVE MIN–MAX) is longer than the settled 1-range acceptor.
-/// Longest-wins then fans out to the leftover first-shard DB and
-/// resurrects `obj-1-000…`. Once a live MIN–MAX ACTIVE range exists,
-/// list only that range.
-pub(crate) fn prefer_full_active_cover_ranges(
-    ranges: &[serde_json::Value],
-) -> Vec<serde_json::Value> {
-    let refs: Vec<&serde_json::Value> = ranges.iter().collect();
-    if !listing_has_full_active_cover(&refs) {
-        return ranges.to_vec();
-    }
-    // listing-w221 L1985: first-shard is still ACTIVE with alpha while an
-    // expanded acceptor already reports MIN–MAX. Dropping it hides alpha.
-    // Only collapse to the cover once no other bounded ACTIVE range remains
-    // (L2044 leftover is SHRINKING/SHRUNK, not ACTIVE).
-    let other_active_bounded = ranges.iter().any(|sr| {
-        sr.get("state").and_then(|v| v.as_i64()) == Some(40)
-            && sr.get("deleted").and_then(|v| v.as_i64()).unwrap_or(0) == 0
-            && !(sr
-                .get("lower")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .is_empty()
-                && sr
-                    .get("upper")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .is_empty())
-    });
-    if other_active_bounded {
-        return ranges.to_vec();
-    }
-    let cover: Vec<serde_json::Value> = ranges
-        .iter()
-        .filter(|sr| {
-            sr.get("state").and_then(|v| v.as_i64()) == Some(40)
-                && sr.get("deleted").and_then(|v| v.as_i64()).unwrap_or(0) == 0
-                && sr
-                    .get("lower")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .is_empty()
-                && sr
-                    .get("upper")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .is_empty()
-        })
-        .cloned()
-        .collect();
-    if cover.is_empty() {
-        ranges.to_vec()
-    } else {
-        cover
-    }
-}
-
 pub(crate) fn include_root_residual_for_listing(
     sharding_state: &str,
     newest: bool,
@@ -6636,6 +6580,88 @@ pub(crate) fn prefer_longest_nonempty_arrays(
         .iter()
         .filter(|a| !a.is_empty())
         .max_by_key(|a| a.len())
+        .cloned()
+}
+
+type ListingTopology = Vec<(String, String, String, i64, i64)>;
+
+fn listing_topology(arr: &[serde_json::Value]) -> ListingTopology {
+    let mut topology: ListingTopology = arr
+        .iter()
+        .map(|sr| {
+            (
+                sr.get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                sr.get("lower")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                sr.get("upper")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                sr.get("state").and_then(|v| v.as_i64()).unwrap_or(0),
+                sr.get("deleted").and_then(|v| v.as_i64()).unwrap_or(0),
+            )
+        })
+        .collect();
+    topology.sort();
+    topology
+}
+
+fn listing_array_timestamp(arr: &[serde_json::Value]) -> String {
+    arr.iter()
+        .map(listing_feed_timestamp)
+        .max()
+        .unwrap_or_default()
+}
+
+/// Select the shard-range topology reported by the most replicas.
+///
+/// A longest-array rule is useful during partial cleave, when only one
+/// replica has progressed beyond an empty/filler view, but it is wrong once
+/// a quorum agrees on a shorter, newer topology.  In particular:
+///
+/// * During W103/L1985 all three roots report a live SHRINKING donor plus an
+///   expanded ACTIVE acceptor.  Both ranges must be queried until the donor
+///   has moved `alpha`.
+/// * During L2044 two roots report only the settled acceptor while one stale
+///   root still reports donor+acceptor.  The quorum topology must win over
+///   the longer stale array.
+///
+/// Empty arrays are intentionally absent from `arrays`; if every response is
+/// empty the caller falls back to the root-listing path.  A topology tie keeps
+/// the longest view, preserving the partial-cleave behaviour.
+pub(crate) fn prefer_quorum_consistent_listing_arrays(
+    arrays: &[Vec<serde_json::Value>],
+) -> Option<Vec<serde_json::Value>> {
+    struct Group<'a> {
+        topology: ListingTopology,
+        members: Vec<&'a Vec<serde_json::Value>>,
+    }
+
+    let mut groups: Vec<Group<'_>> = Vec::new();
+    for arr in arrays.iter().filter(|arr| !arr.is_empty()) {
+        let topology = listing_topology(arr);
+        if let Some(group) = groups.iter_mut().find(|group| group.topology == topology) {
+            group.members.push(arr);
+        } else {
+            groups.push(Group {
+                topology,
+                members: vec![arr],
+            });
+        }
+    }
+
+    let winner = groups
+        .into_iter()
+        .max_by_key(|group| (group.members.len(), group.topology.len()))?;
+    winner
+        .members
+        .into_iter()
+        .max_by_key(|arr| listing_array_timestamp(arr))
         .cloned()
 }
 
@@ -9934,11 +9960,12 @@ mod shard_listing_fanout_tests {
         listing_has_full_active_cover, listing_ranges_are_settled_active, listing_resp_timestamp,
         lowest_shard_usage, merge_listings_newest_covering, merge_sharded_object_listings,
         merge_sharded_object_listings_dir, pick_updating_shard_name,
-        prefer_full_active_cover_ranges, prefer_listing_state_ranges,
-        prefer_longest_nonempty_arrays, select_listing_shard_ranges, shard_usage_from_ranges,
-        should_fanout_sharded_listing, should_fold_root_objects_without_ranges,
-        should_probe_sharded_listing, stamp_shard_container_path, updating_shard_query,
-        ListingFeed, SHARD_LISTING_STATE_NUMS,
+        prefer_listing_state_ranges, prefer_longest_nonempty_arrays,
+        prefer_quorum_consistent_listing_arrays,
+        select_listing_shard_ranges, shard_usage_from_ranges, should_fanout_sharded_listing,
+        should_fold_root_objects_without_ranges, should_probe_sharded_listing,
+        stamp_shard_container_path, updating_shard_query, ListingFeed,
+        SHARD_LISTING_STATE_NUMS,
     };
     use swift_http::HeaderKeyDict;
 
@@ -10418,6 +10445,80 @@ mod shard_listing_fanout_tests {
     }
 
     #[test]
+    fn quorum_listing_keeps_live_shrinking_donor_until_move() {
+        let transition = vec![
+            serde_json::json!({
+                "name": ".shards/a/donor",
+                "lower": "",
+                "upper": "obj-1-049",
+                "state": 50,
+                "deleted": 0,
+                "timestamp": "1751500001.00000",
+                "state_timestamp": "1751500010.00000",
+            }),
+            serde_json::json!({
+                "name": ".shards/a/acceptor",
+                "lower": "",
+                "upper": "",
+                "state": 40,
+                "deleted": 0,
+                "timestamp": "1751500010.00000",
+            }),
+        ];
+        let got = prefer_quorum_consistent_listing_arrays(&[
+            transition.clone(),
+            transition.clone(),
+            transition,
+        ])
+        .unwrap();
+        assert_eq!(got.len(), 2, "W103/L1985 must query donor and acceptor");
+        assert!(got.iter().any(|sr| sr["name"] == ".shards/a/donor"));
+    }
+
+    #[test]
+    fn quorum_listing_ignores_one_long_stale_shrink_topology() {
+        let acceptor = serde_json::json!({
+            "name": ".shards/a/acceptor",
+            "lower": "",
+            "upper": "",
+            "state": 40,
+            "deleted": 0,
+            "timestamp": "1751500020.00000",
+        });
+        let settled = vec![acceptor.clone()];
+        let stale = vec![
+            serde_json::json!({
+                "name": ".shards/a/donor",
+                "lower": "",
+                "upper": "obj-1-049",
+                "state": 50,
+                "deleted": 0,
+                "timestamp": "1751500010.00000",
+            }),
+            acceptor,
+        ];
+        let got = prefer_quorum_consistent_listing_arrays(&[
+            settled.clone(),
+            stale,
+            settled,
+        ])
+        .unwrap();
+        assert_eq!(got.len(), 1, "L2044 quorum must beat longer stale view");
+        assert_eq!(got[0]["name"], ".shards/a/acceptor");
+    }
+
+    #[test]
+    fn quorum_listing_tie_preserves_longest_partial_cleave_view() {
+        let short = vec![sr_state("AUTH_test/root", "", "", 60)];
+        let long = vec![
+            sr_state(".shards/a/c0", "", "m", 30),
+            sr_state("AUTH_test/root", "m", "", 60),
+        ];
+        let got = prefer_quorum_consistent_listing_arrays(&[short, long]).unwrap();
+        assert_eq!(got.len(), 2, "L631 tie must retain progressed cleave view");
+    }
+
+    #[test]
     fn copy_root_listing_headers_copies_acl_and_versions() {
         let mut head = swift_http::Response::with_body(204, Vec::new());
         head.headers.set("X-Container-Read", "read_acl");
@@ -10818,20 +10919,6 @@ mod shard_listing_fanout_tests {
             listing_ranges_are_settled_active(&[&shrinking_lo, &acc]),
             "L1985 nested shrinking under expanded acceptor must majority-vote, not union handoffs"
         );
-        let mixed = vec![shrinking_lo.clone(), acc.clone()];
-        let only = prefer_full_active_cover_ranges(&mixed);
-        assert_eq!(
-            only.len(),
-            1,
-            "L2044 drop leftover first-shard range {only:?}"
-        );
-        assert_eq!(
-            only[0].get("name").and_then(|v| v.as_str()),
-            Some(".shards/a0")
-        );
-        let first_active = sr_state(".shards/d0", "", "m", 40);
-        let keep = prefer_full_active_cover_ranges(&[first_active, acc.clone()]);
-        assert_eq!(keep.len(), 2, "L1985 keep ACTIVE first-shard with alpha");
         // Overlapping donor + children, even if all ACTIVE: L1321 must union.
         let donor = sr_state(".shards/donor", "", "obj-0049", 40);
         let sub0 = sr_state(".shards/s0", "", "beta049", 40);

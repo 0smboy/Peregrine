@@ -1341,7 +1341,12 @@ fn ensure_shard_root_sysmeta(
     own: &ShardRange,
 ) {
     let ts = swift_core::timestamp::Timestamp::now().internal();
-    let root_path = format!("{root_account}/{root_container}");
+    // The header name is deliberately *Quoted*-Root.  Python stores
+    // `urllib.parse.quote(root_path)` here so the metadata value remains
+    // ASCII-safe when it is later copied back into an HTTP response header.
+    // Storing the raw UTF-8 path causes the HTTP/1 parser to reinterpret its
+    // bytes as Latin-1 (probe MoreUTF8 test_shrinking).
+    let root_path = http_quote(&format!("{root_account}/{root_container}"));
     let _ = broker.update_metadata(&vec![
         (
             "X-Container-Sysmeta-Shard-Quoted-Root".to_string(),
@@ -1367,7 +1372,7 @@ fn root_account_container(broker: &mut ContainerBroker) -> Option<(String, Strin
             .filter(|v| !v.is_empty())
     };
     let path = get("X-Container-Sysmeta-Shard-Quoted-Root")
-        .map(|p| p.replace("%2F", "/").replace("%2f", "/"))
+        .map(|p| swift_http::unquote(&p))
         .or_else(|| get("X-Container-Sysmeta-Shard-Root"))?;
     let path = path.trim_start_matches('/');
     let (acct, cont) = path.split_once('/')?;
@@ -5227,6 +5232,38 @@ mod tests {
         assert_eq!(http_quote("AUTH_test/caf\u{e9}"), "AUTH_test/caf%C3%A9");
         assert_eq!(http_quote("AUTH_test/rootc"), "AUTH_test/rootc");
         assert!(!http_quote("AUTH_test/caf\u{e9}").contains('\u{e9}'));
+    }
+
+    #[test]
+    fn test_ensure_shard_root_sysmeta_stores_utf8_root_quoted() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharder-quoted-root-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut shard = container_broker(&dir, "shard-0", 0);
+        let own = ShardRange::new(
+            ".shards_AUTH_test/shard-0",
+            "1751500010.00000",
+            "",
+            "",
+        );
+
+        ensure_shard_root_sysmeta(&mut shard, "AUTH_test", "café-ሴ", &own);
+
+        let metadata = shard.metadata().unwrap();
+        let quoted = metadata
+            .iter()
+            .find(|(key, _)| {
+                key.eq_ignore_ascii_case("X-Container-Sysmeta-Shard-Quoted-Root")
+            })
+            .map(|(_, (value, _))| value.as_str());
+        assert_eq!(quoted, Some("AUTH_test/caf%C3%A9-%E1%88%B4"));
+        assert_eq!(
+            root_account_container(&mut shard),
+            Some(("AUTH_test".into(), "café-ሴ".into()))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

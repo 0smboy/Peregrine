@@ -2703,32 +2703,33 @@ impl ProxyApp {
         path: &str,
         shard_headers: &HeaderKeyDict,
     ) -> Option<Vec<serde_json::Value>> {
-        if let Some(arr) = self
-            .fetch_json_array_longest_nonempty_async(
-                &nodes,
-                part,
-                path,
-                "states=listing&format=json",
-                shard_headers,
-            )
-            .await
-        {
+        if let Some(arr) = super::prefer_quorum_consistent_listing_arrays(
+            &self
+                .fetch_json_arrays_nonempty_async(
+                    &nodes,
+                    part,
+                    path,
+                    "states=listing&format=json",
+                    shard_headers,
+                )
+                .await,
+        ) {
             if !arr.is_empty() {
-                return Some(super::prefer_full_active_cover_ranges(&arr));
+                return Some(arr);
             }
         }
-        let broad = self
-            .fetch_json_array_longest_nonempty_async(
-                &nodes,
-                part,
-                path,
-                "format=json",
-                shard_headers,
-            )
-            .await?;
-        Some(super::prefer_full_active_cover_ranges(
-            &super::prefer_listing_state_ranges(&broad),
-        ))
+        let broad = super::prefer_quorum_consistent_listing_arrays(
+            &self
+                .fetch_json_arrays_nonempty_async(
+                    &nodes,
+                    part,
+                    path,
+                    "format=json",
+                    shard_headers,
+                )
+                .await,
+        )?;
+        Some(super::prefer_listing_state_ranges(&broad))
     }
 
     pub(crate) async fn maybe_sharded_container_listing_async(
