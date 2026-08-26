@@ -3,7 +3,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,11 +13,9 @@ use swift_core::hashing::HashPathConfig;
 use swift_http::{AsyncRequest, HeaderKeyDict, IncomingBody, Request, ServerConfig};
 
 fn tmpdir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "cont-dispatch-{}-{}",
-        std::process::id(),
-        line!()
-    ));
+    static NEXT_TMPDIR: AtomicU64 = AtomicU64::new(0);
+    let unique = NEXT_TMPDIR.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("cont-dispatch-{}-{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("sda1")).unwrap();
     dir
@@ -75,9 +73,7 @@ async fn handle_async_container_put_and_listing_wait_on_parked_shard() {
         .recv_timeout(Duration::from_secs(2))
         .expect("shard park entered");
 
-    let put = tokio::spawn({
-        async move { server.handle_async(put_container()).await }
-    });
+    let put = tokio::spawn(async move { server.handle_async(put_container()).await });
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert!(
         !put.is_finished(),
@@ -106,10 +102,7 @@ async fn handle_async_container_put_and_listing_wait_on_parked_shard() {
             })
             .await
             .status;
-        assert!(
-            (200..500).contains(&status),
-            "{method} status {status}"
-        );
+        assert!((200..500).contains(&status), "{method} status {status}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -160,7 +153,8 @@ async fn hyper_health_get_while_container_shard_parked() {
     }
     let started = std::time::Instant::now();
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(400)).unwrap();
-    s.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
+    s.set_read_timeout(Some(Duration::from_millis(400)))
+        .unwrap();
     s.write_all(b"GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
         .unwrap();
     let mut buf = Vec::new();
@@ -174,5 +168,69 @@ async fn hyper_health_get_while_container_shard_parked() {
     release_tx.send(()).ok();
     let _ = park.await;
     shutdown.store(true, Ordering::SeqCst);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handle_async_replicate_uses_hash_path_not_account_container() {
+    // G6: handle_async parsed REPLICATE /device/part/hash as obj_path
+    // (4 segs) and 400'd every db-replicator sync RPC.
+    let dir = tmpdir();
+    let server = ContainerServer::new(cfg(dir.clone()));
+    let put = server.handle_async(put_container()).await;
+    assert!(
+        put.status == 201 || put.status == 202,
+        "container PUT got {}",
+        put.status
+    );
+    let probe = Request {
+        method: "PUT".into(),
+        path: "/sda1/0/AUTH_test/c".into(),
+        query_string: String::new(),
+        headers: HeaderKeyDict::new(),
+        body: swift_http::Body::empty(),
+    };
+    let db_file = server.db_file_for_request(&probe).unwrap();
+    let hsh = db_file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .expect("hash.db stem")
+        .to_string();
+    let rpc_path = format!("/sda1/0/{hsh}");
+    let via_helper = server
+        .replicate_db_file_for_request(&Request {
+            method: "REPLICATE".into(),
+            path: rpc_path.clone(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        })
+        .unwrap();
+    assert_eq!(via_helper, db_file);
+
+    let body = serde_json::json!([
+        "sync",
+        -1,
+        "hash",
+        "peer-id",
+        "3286000000.00000",
+        "3286000000.00000",
+        "0",
+        "{}"
+    ]);
+    let resp = server
+        .handle_async(AsyncRequest {
+            method: "REPLICATE".into(),
+            path: rpc_path,
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: IncomingBody::from_bytes(body.to_string().into_bytes(), u64::MAX),
+        })
+        .await;
+    assert_eq!(
+        resp.status, 200,
+        "REPLICATE sync over handle_async must not 400 Invalid path; got {}",
+        resp.status
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

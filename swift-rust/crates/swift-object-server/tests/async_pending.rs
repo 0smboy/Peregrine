@@ -118,6 +118,47 @@ fn test_async_mode_always_writes_pending_even_with_hosts() {
 }
 
 #[test]
+fn test_async_pending_pickle_includes_root_db_state() {
+    let dir = std::env::temp_dir().join(format!("swift-os-async-dbstate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let device = dir.join("sda1");
+    std::fs::create_dir_all(&device).unwrap();
+
+    let server = ObjectServer::new(config(&dir));
+    let mut headers = HeaderKeyDict::new();
+    headers.set("X-Timestamp", "1751500000.00000");
+    headers.set("Content-Length", "5");
+    headers.set("Content-Type", "text/plain");
+    headers.set("X-Container-Root-Db-State", "unsharded");
+    let req = Request {
+        method: "PUT".into(),
+        path: "/sda1/0/AUTH_test/c/o-state".into(),
+        query_string: String::new(),
+        headers,
+        body: b"hello".to_vec().into(),
+    };
+    assert_eq!(server.handle(req).status, 201);
+    let mut stats = UpdaterStats::default();
+    let updates = iter_async_pendings(&device, &mut stats);
+    assert_eq!(updates.len(), 1);
+    let bytes = std::fs::read(&updates[0].path).expect("read pending pickle");
+    let pairs = match swift_core::pickle::loads(&bytes).expect("unpickle") {
+        swift_core::pickle::Value::Dict(p) => p,
+        other => panic!("expected dict pickle, got {other:?}"),
+    };
+    let state = pairs.iter().find_map(|(k, v)| match (k, v) {
+        (swift_core::pickle::Value::Str(k), swift_core::pickle::Value::Str(v))
+            if k == "db_state" =>
+        {
+            Some(v.as_str())
+        }
+        _ => None,
+    });
+    assert_eq!(state, Some("unsharded"), "pickle keys: {pairs:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn test_put_with_x_delete_at_enqueues_expiry_task() {
     let dir = std::env::temp_dir().join(format!("swift-os-exp-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

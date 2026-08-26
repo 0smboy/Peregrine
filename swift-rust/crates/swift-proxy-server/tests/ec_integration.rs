@@ -322,6 +322,59 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
         "all {N} fragments landed durable, got {durable}"
     );
 
+    // The normal PUT's container update records the WHOLE OBJECT's etag/size
+    // (the footers' overrides), not the fragment archive's. Check this before
+    // staging a newer non-durable generation: Python still emits a container
+    // update for that internal PUT, while object GET durability is independent.
+    let (status, _, listing) = http(
+        proxy_addr,
+        "GET",
+        "/v1/AUTH_ec/ecbox?format=json",
+        &[],
+        b"",
+    );
+    assert_eq!(status, 200, "container listing");
+    let entries: serde_json::Value = serde_json::from_slice(&listing).unwrap();
+    let entry = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "big.bin")
+        .expect("big.bin listed");
+    assert_eq!(entry["bytes"], serde_json::json!(payload.len()));
+    assert_eq!(entry["hash"], serde_json::json!(md5_hex(&payload)));
+
+    // An internal caller may stage a newer EC generation without committing
+    // it.  The proxy must carry X-Backend-No-Commit to every object node; the
+    // old durable generation remains the client-visible object while the new
+    // fragments coexist on disk without #d.
+    let staged_payload: Vec<u8> = (0..4200u32)
+        .map(|i| (i.wrapping_mul(47).wrapping_add(3) % 251) as u8)
+        .collect();
+    let (status, _, _) = http(
+        proxy_addr,
+        "PUT",
+        "/v1/AUTH_ec/ecbox/big.bin",
+        &[
+            ("Content-Type", "text/plain"),
+            ("X-Backend-Storage-Policy-Index", "1"),
+            ("X-Backend-No-Commit", "True"),
+        ],
+        &staged_payload,
+    );
+    assert_eq!(status, 201, "non-durable EC object PUT");
+    let mut nondurable = 0;
+    for d in &obj_dirs {
+        nondurable += find_files(d, &|n| {
+            n.ends_with(".data") && !n.ends_with("#d.data")
+        })
+        .len();
+    }
+    assert_eq!(
+        nondurable, N,
+        "all {N} staged fragments must remain non-durable"
+    );
+
     // EC GET through the proxy: gather ndata fragments and decode
     let (status, headers, body) = http(
         proxy_addr,
@@ -332,6 +385,21 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
     );
     assert_eq!(status, 200, "EC object GET");
     assert_eq!(body, payload, "EC object body round-trips after decode");
+    let backend_data_timestamp = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("X-Backend-Data-Timestamp"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let backend_durable_timestamp = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("X-Backend-Durable-Timestamp"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    assert!(!backend_data_timestamp.is_empty(), "backend data timestamp");
+    assert_eq!(
+        backend_data_timestamp, backend_durable_timestamp,
+        "a normal EC GET must expose its selected durable generation to InternalClient"
+    );
     let cl = headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
@@ -359,20 +427,6 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
     );
     assert_eq!(status, 200, "EC GET survives loss of {M} fragments");
     assert_eq!(body, payload, "EC decode from ndata surviving fragments");
-
-    // The container listing records the WHOLE OBJECT's etag/size (the
-    // footers' container-update overrides), not the fragment archive's.
-    let (status, _, listing) = http(proxy_addr, "GET", "/v1/AUTH_ec/ecbox?format=json", &[], b"");
-    assert_eq!(status, 200, "container listing");
-    let entries: serde_json::Value = serde_json::from_slice(&listing).unwrap();
-    let entry = entries
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| e["name"] == "big.bin")
-        .expect("big.bin listed");
-    assert_eq!(entry["bytes"], serde_json::json!(payload.len()));
-    assert_eq!(entry["hash"], serde_json::json!(md5_hex(&payload)));
 
     // The client-facing ETag is the whole-object md5 too.
     let (status, headers, _) = http(

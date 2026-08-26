@@ -165,10 +165,11 @@ pub fn percent_decode_bytes(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Python `check_utf8(wsgi_to_str(PATH_INFO))` on the percent-decoded bytes.
-/// Lossy UTF-8 replacement would hide InvalidUTF8Path as a 400.
+/// Python WSGI does not reject reserved NUL at the HTTP parse; `check_utf8`
+/// (`internal=allow_reserved_names`) runs later in the proxy/backend.
+/// Only invalid UTF-8 is a 412 at this layer (`%FF` etc.).
 pub fn decoded_path_is_utf8(s: &[u8]) -> bool {
-    swift_core::constraints::check_utf8_bytes(&percent_decode_bytes(s), false)
+    std::str::from_utf8(&percent_decode_bytes(s)).is_ok()
 }
 
 /// Percent-decode a path or query component (no `+` handling).
@@ -225,6 +226,50 @@ pub fn guess_content_type(path: &str) -> &'static str {
         "webp" => "image/webp",
         _ => "application/octet-stream",
     }
+}
+
+/// Python `validate_params` / `get_param`: listing query *values* must be
+/// valid UTF-8 after percent-decode. `unquote` is lossy (`%FF` → U+FFFD);
+/// callers that need 400 `"%s" parameter not valid UTF-8` use this.
+///
+/// Names checked match `validate_container_params` (marker, end_marker,
+/// prefix, delimiter, path, format, reverse, states, includes) plus
+/// `limit` (`constrain_req_limit` also goes through `get_param`).
+pub fn listing_query_invalid_utf8_param(query: &str) -> Option<String> {
+    const NAMES: &[&str] = &[
+        "marker",
+        "end_marker",
+        "prefix",
+        "delimiter",
+        "path",
+        "format",
+        "reverse",
+        "states",
+        "includes",
+        "limit",
+    ];
+    for piece in query.split('&') {
+        if piece.is_empty() {
+            continue;
+        }
+        let (kraw, vraw) = piece.split_once('=').unwrap_or((piece, ""));
+        let kbytes = percent_decode_bytes(kraw.replace('+', " ").as_bytes());
+        let Ok(k) = std::str::from_utf8(&kbytes) else {
+            continue;
+        };
+        if !NAMES.contains(&k) {
+            continue;
+        }
+        // Python `get_param`: only decode-check a truthy value.
+        if vraw.is_empty() {
+            continue;
+        }
+        let vbytes = percent_decode_bytes(vraw.replace('+', " ").as_bytes());
+        if std::str::from_utf8(&vbytes).is_err() {
+            return Some(k.to_string());
+        }
+    }
+    None
 }
 
 /// Parse a query string: percent-decoding plus `+` as space, preserving
@@ -347,6 +392,16 @@ mod tests {
         assert!(decoded_path_is_utf8(b"/v1/AUTH_test/%E4%B8%AD"));
         assert!(!decoded_path_is_utf8(b"/v1/AUTH_test/%FF%FE"));
         assert!(!decoded_path_is_utf8(&[0xff, 0xfe]));
+        // Probe test_sharding_listing: delimiter=%ff is not valid UTF-8.
+        assert_eq!(
+            listing_query_invalid_utf8_param("delimiter=%ff").as_deref(),
+            Some("delimiter")
+        );
+        assert!(listing_query_invalid_utf8_param("delimiter=%2F").is_none());
+        assert!(listing_query_invalid_utf8_param("prefix=obj").is_none());
+        // InternalClient reserved names percent-encode RESERVED as %00.
+        // Python check_utf8(internal=True) accepts that after parse.
+        assert!(decoded_path_is_utf8(b"/v1/AUTH_test/%00reserved"));
         assert_eq!(guess_content_type("/v1/a/c/file.txt"), "text/plain");
         assert_eq!(guess_content_type("/v1/a/c/file.WAV"), "audio/x-wav");
         assert_eq!(guess_content_type("/v1/a/c/file.zip"), "application/zip");

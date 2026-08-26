@@ -25,6 +25,9 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static FRESH_DB_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 
 use rusqlite::Connection;
 use swift_core::pickle::{self, Value};
@@ -262,6 +265,22 @@ pub fn shards_account_name(account: &str) -> String {
     format!(".shards_{account}")
 }
 
+fn set_info_i64(info: &mut Vec<(String, DbValue)>, key: &str, value: i64) {
+    if let Some((_, v)) = info.iter_mut().find(|(k, _)| k == key) {
+        *v = DbValue::Int(value);
+    } else {
+        info.push((key.to_string(), DbValue::Int(value)));
+    }
+}
+
+fn set_info_text(info: &mut Vec<(String, DbValue)>, key: &str, value: &str) {
+    if let Some((_, v)) = info.iter_mut().find(|(k, _)| k == key) {
+        *v = DbValue::Text(value.to_string());
+    } else {
+        info.push((key.to_string(), DbValue::Text(value.to_string())));
+    }
+}
+
 /// The on-disk state of a container's DB files (Python `get_db_state`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbState {
@@ -389,7 +408,6 @@ pub struct ObjectRecord {
 /// The Rust `ContainerBroker`.
 pub struct ContainerBroker {
     db_file: PathBuf,
-    pending_file: PathBuf,
     account: String,
     container: String,
     conn: Option<Connection>,
@@ -403,12 +421,38 @@ impl ContainerBroker {
     pub fn new(db_file: &Path, account: &str, container: &str) -> Self {
         ContainerBroker {
             db_file: db_file.to_path_buf(),
-            pending_file: PathBuf::from(format!("{}.pending", db_file.display())),
             account: account.to_string(),
             container: container.to_string(),
             conn: None,
             force_db_file: None,
         }
+    }
+
+    /// Fill `account`/`container` from `container_stat` when the constructor
+    /// was given empty strings (REPLICATE RPC opens `/device/part/hash` with
+    /// no path identity). Without this, `get_own_shard_range` misses the own
+    /// row and `get_db_state` reports `unsharded` on a SHARDED epoch DB, so
+    /// object usync is not skipped (probe L2311).
+    pub fn hydrate_account_container(&mut self) -> Result<(), DbError> {
+        if !self.account.is_empty() && !self.container.is_empty() {
+            return Ok(());
+        }
+        self.commit_pending()?;
+        let (acct, cont): (String, String) = {
+            let conn = self.conn()?;
+            conn.query_row(
+                "SELECT account, container FROM container_stat",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?
+        };
+        if self.account.is_empty() {
+            self.account = acct;
+        }
+        if self.container.is_empty() {
+            self.container = cont;
+        }
+        Ok(())
     }
 
     /// A broker that always operates on exactly `db_file` (never re-resolves to
@@ -437,8 +481,16 @@ impl ContainerBroker {
         &self.db_file
     }
 
-    pub fn pending_file(&self) -> &Path {
-        &self.pending_file
+    /// Whether any epoch/hash DB for this container exists. Python
+    /// `ContainerBroker.db_file` is the freshest epoch file; after
+    /// `set_sharded_state` the constructor `<hash>.db` path is unlinked, so
+    /// existence checks must not use [`Self::db_file`].
+    pub fn db_exists(&self) -> bool {
+        !self.db_files().is_empty()
+    }
+
+    pub fn pending_file(&self) -> PathBuf {
+        PathBuf::from(format!("{}.pending", self.current_db_file().display()))
     }
 
     fn conn(&mut self) -> Result<&Connection, DbError> {
@@ -599,7 +651,16 @@ impl ContainerBroker {
         let _ = std::fs::remove_file(&tmp);
         {
             let mut fresh = ContainerBroker::new(&tmp, &self.account, &self.container);
-            fresh.initialize(&put_timestamp, storage_policy_index, &created_at, "shardid")?;
+            // Python `initialize()` assigns a new UUID. A hardcoded id made
+            // every replica's fresh DB share `id=shardid`, so cleaving
+            // contexts collapsed to one sysmeta key on replicate.
+            let fresh_id = format!(
+                "{}-{}-{}",
+                now_internal(),
+                std::process::id(),
+                FRESH_DB_ID_SEQ.fetch_add(1, Ordering::Relaxed)
+            );
+            fresh.initialize(&put_timestamp, storage_policy_index, &created_at, &fresh_id)?;
             fresh.update_metadata(&metadata)?;
             if !all_ranges.is_empty() {
                 fresh.merge_shard_ranges(all_ranges)?;
@@ -658,10 +719,15 @@ impl ContainerBroker {
         if self.db_files().len() >= 2 {
             return Ok(false);
         }
-        // Align own-range state text with on-disk SHARDED (Python bumps own
-        // range when the epoch DB is the only remaining file).
+        // Align own-range state text with on-disk SHARDED for a *sharding*
+        // root. Python `set_sharded_state` does not rewrite own state;
+        // shrinking donors are already SHRUNK and must stay SHRUNK (probe
+        // L2031 `assertEqual(SHRUNK, own_sr.state)` — 80 != 70).
         if let Some(mut own) = self.get_own_shard_range(false)? {
-            if own.state != crate::shard::state::SHARDED {
+            if own.state != crate::shard::state::SHARDED
+                && own.state != crate::shard::state::SHRUNK
+                && own.state != crate::shard::state::SHRINKING
+            {
                 own.state = crate::shard::state::SHARDED;
                 let ts = Timestamp::now().internal();
                 own.state_timestamp = ts.clone();
@@ -757,17 +823,28 @@ impl ContainerBroker {
         timestamp: &str,
         storage_policy_index: i64,
     ) -> Result<(), DbError> {
-        self.put_object(
-            name,
-            timestamp,
-            0,
-            "application/deleted",
-            "noetag",
-            1,
+        // Probe L2094: collapsed roots live on `<hash>_<epoch>.db`. Writing
+        // only the pending file and returning lets a subsequent DELETE
+        // container race a replica whose GET never commit_pending()d. Merge
+        // the tombstone into the freshest epoch immediately (same row as
+        // Python after `_commit_puts`).
+        let ts = if timestamp.is_empty() {
+            swift_core::timestamp::Timestamp::now().internal()
+        } else {
+            timestamp.to_string()
+        };
+        let record = ObjectRecord {
+            name: name.to_string(),
+            created_at: ts,
+            size: 0,
+            content_type: "application/deleted".to_string(),
+            etag: "noetag".to_string(),
+            deleted: 1,
             storage_policy_index,
-            None,
-            None,
-        )
+            ctype_timestamp: None,
+            meta_timestamp: None,
+        };
+        self.merge_items(vec![record])
     }
 
     /// Port of `ContainerBroker.remove_objects`: hard-DELETE object rows in
@@ -875,14 +952,18 @@ impl ContainerBroker {
     /// under the parent lock, or merge immediately when the pending file
     /// is over `PENDING_CAP`.
     pub fn put_record(&mut self, record: ObjectRecord) -> Result<(), DbError> {
-        if !self.db_file.exists() {
+        // Python `broker.db_file` is the freshest epoch. After
+        // `set_sharded_state` the constructor `<hash>.db` is unlinked
+        // (probe L2094 DELETE on a collapsed root).
+        if !self.db_exists() {
             return Err(DbError::Connection(format!(
                 "{}: DB doesn't exist",
-                self.db_file.display()
+                self.current_db_file().display()
             )));
         }
-        let _lock = lock_parent_directory(&self.pending_file, PENDING_TIMEOUT)?;
-        let pending_size = std::fs::metadata(&self.pending_file)
+        let pending = self.pending_file();
+        let _lock = lock_parent_directory(&pending, PENDING_TIMEOUT)?;
+        let pending_size = std::fs::metadata(&pending)
             .map(|m| m.len())
             .unwrap_or(0);
         if pending_size > PENDING_CAP {
@@ -892,7 +973,7 @@ impl ContainerBroker {
             let mut fp = std::fs::OpenOptions::new()
                 .append(true)
                 .create(true)
-                .open(&self.pending_file)?;
+                .open(&pending)?;
             fp.write_all(b":")?;
             fp.write_all(b64encode(&blob).as_bytes())?;
             fp.flush()?;
@@ -903,8 +984,9 @@ impl ContainerBroker {
     /// Port of `_commit_puts` (lock assumed held by the caller path):
     /// fold the pending file plus `extra` into the object table.
     fn commit_puts(&mut self, extra: Vec<ObjectRecord>) -> Result<(), DbError> {
+        let pending = self.pending_file();
         let mut item_list = Vec::new();
-        let raw = match std::fs::read(&self.pending_file) {
+        let raw = match std::fs::read(&pending) {
             Ok(raw) => raw,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(DbError::Io(e)),
@@ -927,17 +1009,18 @@ impl ContainerBroker {
             self.merge_items(item_list)?;
         }
         if !raw.is_empty() {
-            std::fs::write(&self.pending_file, b"")?;
+            std::fs::write(&pending, b"")?;
         }
         Ok(())
     }
 
     /// `_commit_puts_stale_ok` equivalent used before reads.
     pub fn commit_pending(&mut self) -> Result<(), DbError> {
-        if !self.pending_file.exists() {
+        let pending = self.pending_file();
+        if !pending.exists() {
             return Ok(());
         }
-        let _lock = lock_parent_directory(&self.pending_file, PENDING_TIMEOUT)?;
+        let _lock = lock_parent_directory(&pending, PENDING_TIMEOUT)?;
         self.commit_puts(Vec::new())
     }
 
@@ -1063,8 +1146,9 @@ impl ContainerBroker {
     /// `get_info` (always `unsharded` at this stage).
     pub fn get_info(&mut self) -> Result<Vec<(String, DbValue)>, DbError> {
         self.commit_pending()?;
-        let conn = self.conn()?;
-        let sql = "
+        let mut out = {
+            let conn = self.conn()?;
+            let sql = "
                     SELECT account, container, created_at, put_timestamp,
                         delete_timestamp, status, status_changed_at,
                         object_count, bytes_used,
@@ -1073,24 +1157,54 @@ impl ContainerBroker {
                         id, x_container_sync_point1, x_container_sync_point2, storage_policy_index
                         FROM container_stat
                 ";
-        let mut stmt = conn.prepare(sql)?;
-        let names: Vec<String> = stmt
-            .column_names()
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        let mut rows = stmt.query([])?;
-        let row = rows
-            .next()?
-            .ok_or_else(|| DbError::Connection("no container_stat row".to_string()))?;
-        let mut out = Vec::with_capacity(names.len() + 1);
-        for (i, name) in names.iter().enumerate() {
-            out.push((name.clone(), DbValue::from_sql(row.get_ref(i)?)));
+            let mut stmt = conn.prepare(sql)?;
+            let names: Vec<String> = stmt
+                .column_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            let mut rows = stmt.query([])?;
+            let row = rows
+                .next()?
+                .ok_or_else(|| DbError::Connection("no container_stat row".to_string()))?;
+            let mut out = Vec::with_capacity(names.len() + 1);
+            for (i, name) in names.iter().enumerate() {
+                out.push((name.clone(), DbValue::from_sql(row.get_ref(i)?)));
+            }
+            out
+        };
+        // Python `_get_alternate_object_stats` + `db_state`.
+        let state = self.get_db_state()?;
+        match state {
+            DbState::Sharding => {
+                if let Some(mut retiring) = self.retiring_broker() {
+                    retiring.commit_pending()?;
+                    let (oc, bu) = {
+                        let conn = retiring.conn()?;
+                        let oc: i64 = conn.query_row(
+                            "SELECT object_count FROM container_stat",
+                            [],
+                            |r| r.get(0),
+                        )?;
+                        let bu: i64 = conn.query_row(
+                            "SELECT bytes_used FROM container_stat",
+                            [],
+                            |r| r.get(0),
+                        )?;
+                        (oc, bu)
+                    };
+                    set_info_i64(&mut out, "object_count", oc);
+                    set_info_i64(&mut out, "bytes_used", bu);
+                }
+            }
+            DbState::Sharded if self.is_root_container()? => {
+                let (bytes, count) = self.get_shard_usage()?;
+                set_info_i64(&mut out, "object_count", count);
+                set_info_i64(&mut out, "bytes_used", bytes);
+            }
+            _ => {}
         }
-        out.push((
-            "db_state".to_string(),
-            DbValue::Text("unsharded".to_string()),
-        ));
+        set_info_text(&mut out, "db_state", state.as_str());
         Ok(out)
     }
 
@@ -1229,8 +1343,8 @@ impl ContainerBroker {
 
     /// `get_shard_ranges`: query persisted shard ranges with the same filters
     /// as Python (states, deleted, marker/end_marker or includes, own/others),
-    /// sorted by `ShardRange.sort_key`. Deferred: `fill_gaps` (synthesising a
-    /// copy of the own shard range to fill a trailing gap).
+    /// sorted by `ShardRange.sort_key`. `fill_gaps` synthesises a copy of the
+    /// own shard range to fill a trailing gap (Python listing/updating).
     pub fn get_shard_ranges(
         &mut self,
         args: &GetShardRangesArgs,
@@ -1248,7 +1362,6 @@ impl ContainerBroker {
         }
 
         let path = self.path();
-        let conn = self.conn()?;
         let mut conditions: Vec<String> = Vec::new();
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if !args.include_deleted {
@@ -1302,21 +1415,80 @@ impl ContainerBroker {
             "SELECT {} FROM shard_range{where_clause}",
             crate::shard::SHARD_RANGE_KEYS.join(", ")
         );
-        let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            out.push(shard_range_from_row(row)?);
-        }
+        let mut out = {
+            let conn = self.conn()?;
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+            let mut collected = Vec::new();
+            while let Some(row) = rows.next()? {
+                collected.push(shard_range_from_row(row)?);
+            }
+            collected
+        };
         out.sort_by_key(|r| r.sort_key());
         if args.includes.is_some() {
             out.truncate(1);
             return Ok(out);
         }
+        if args.fill_gaps {
+            if let Some(filler) = self.make_filler_shard_range(
+                &out,
+                args.marker.as_deref(),
+                args.end_marker.as_deref(),
+            )? {
+                out.push(filler);
+            }
+        }
         if args.reverse {
             out.reverse();
         }
         Ok(out)
+    }
+
+    /// Python `_make_filler_shard_range`: own range covering
+    /// (last_found.upper, own.upper] when listing/updating states omit
+    /// CREATED children (probe test_sharding_listing L631).
+    fn make_filler_shard_range(
+        &mut self,
+        found: &[crate::shard::ShardRange],
+        marker: Option<&str>,
+        end_marker: Option<&str>,
+    ) -> Result<Option<crate::shard::ShardRange>, DbError> {
+        if found.last().is_some_and(|r| r.upper.is_empty()) {
+            return Ok(None);
+        }
+        let Some(mut own) = self.get_own_shard_range(false)? else {
+            return Ok(None);
+        };
+        let last_upper = match found.last() {
+            Some(r) => r.upper.clone(),
+            None => {
+                let m = marker.unwrap_or("");
+                if !own.lower.is_empty() && (m.is_empty() || m < own.lower.as_str()) {
+                    own.lower.clone()
+                } else {
+                    m.to_string()
+                }
+            }
+        };
+        // empty upper = Namespace.MAX, greater than any finite bound.
+        let required_upper = match (end_marker.unwrap_or(""), own.upper.as_str()) {
+            ("", o) => o.to_string(),
+            (e, "") => e.to_string(),
+            (e, o) if e.is_empty() || (!o.is_empty() && o < e) => o.to_string(),
+            (e, _) => e.to_string(),
+        };
+        let gap = match (last_upper.is_empty(), required_upper.is_empty()) {
+            (true, _) => false,
+            (false, true) => true,
+            (false, false) => required_upper > last_upper,
+        };
+        if !gap {
+            return Ok(None);
+        }
+        own.lower = last_upper;
+        own.upper = required_upper;
+        Ok(Some(own))
     }
 
     /// `get_own_shard_range`: the broker's own shard range from the table, or
@@ -1384,6 +1556,16 @@ impl ContainerBroker {
             return Ok((Vec::new(), false));
         }
 
+        // Python: the last found range is capped at own.upper (a shard of a
+        // shard must not extend to namespace MAX).
+        let own_upper = self
+            .get_own_shard_range(false)?
+            .map(|o| o.upper)
+            .unwrap_or_default();
+        let past_own = |upper: &str| {
+            !own_upper.is_empty() && (upper.is_empty() || upper > own_upper.as_str())
+        };
+
         let mut found = Vec::new();
         let mut progress: i64 = 0;
         let mut last_upper = String::new(); // namespace MIN
@@ -1396,7 +1578,7 @@ impl ContainerBroker {
                 self.next_shard_range_upper(shard_size, &last_upper)?
             };
             match next_upper {
-                Some(upper) => {
+                Some(upper) if !past_own(&upper) => {
                     found.push(FoundShardRange {
                         index,
                         lower: last_upper.clone(),
@@ -1407,12 +1589,12 @@ impl ContainerBroker {
                     last_upper = upper;
                     index += 1;
                 }
-                None => {
-                    // final range up to the namespace MAX ("")
+                Some(_) | None => {
+                    // final range up to own.upper (MAX when this is a root)
                     found.push(FoundShardRange {
                         index,
                         lower: last_upper,
-                        upper: String::new(),
+                        upper: own_upper,
                         object_count: object_count - progress,
                     });
                     return Ok((found, true));
@@ -1434,6 +1616,18 @@ impl ContainerBroker {
     /// Used by the sharder to cleave a shard range's objects into its shard
     /// container. The raw `created_at` is preserved (ctype/meta timestamps are
     /// encoded within it), so re-merging into the shard copies rows exactly.
+    /// Live `deleted=1` row count (Python sharder tombstone estimate).
+    pub fn tombstone_count(&mut self) -> Result<i64, DbError> {
+        self.commit_pending()?;
+        let conn = self.conn()?;
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM object WHERE deleted = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
     pub fn object_records_in_range(
         &mut self,
         lower: &str,
@@ -1448,6 +1642,45 @@ impl ContainerBroker {
              ORDER BY name",
         )?;
         let rows = stmt.query_map(rusqlite::params![lower, upper], |row| {
+            Ok(ObjectRecord {
+                name: row.get(0)?,
+                created_at: row.get(1)?,
+                size: row.get(2)?,
+                content_type: row.get(3)?,
+                etag: row.get(4)?,
+                deleted: row.get(5)?,
+                storage_policy_index: row.get(6)?,
+                ctype_timestamp: None,
+                meta_timestamp: None,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Object rows in `(lower, upper]` whose local ROWID is newer than
+    /// `since_row`.  Container sharding uses this to resume a cleave without
+    /// replaying rows that were copied during an earlier pass.
+    ///
+    /// This is the bounded-by-high-water-mark form of Python Swift's
+    /// `yield_objects(..., since_row=...)`.  Both live rows and tombstones are
+    /// returned because either may be the newest version of an object.
+    pub fn object_records_in_range_since(
+        &mut self,
+        lower: &str,
+        upper: &str,
+        since_row: i64,
+    ) -> Result<Vec<ObjectRecord>, DbError> {
+        self.commit_pending()?;
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, created_at, size, content_type, etag, deleted, \
+             storage_policy_index FROM object \
+             WHERE ROWID > ?3 \
+               AND (?1 = '' OR name > ?1) \
+               AND (?2 = '' OR name <= ?2) \
+             ORDER BY ROWID",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![lower, upper, since_row], |row| {
             Ok(ObjectRecord {
                 name: row.get(0)?,
                 created_at: row.get(1)?,
@@ -1594,6 +1827,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn misplaced_rows_and_reconciler_sync_are_resumable() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-misplaced-{}-{}",
+            std::process::id(),
+            Timestamp::now().raw()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut broker = ContainerBroker::new(&dir.join("hash.db"), "AUTH_test", "c");
+        broker
+            .initialize("1751500001.00000", 2, "1751500001.00000", "id")
+            .unwrap();
+        broker
+            .put_object(
+                "wrong-policy",
+                "1751500002.00000",
+                1,
+                "text/plain",
+                "etag",
+                0,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(broker.has_multiple_policies().unwrap());
+        let rows = broker.get_misplaced_since(-1, 1000).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.name, "wrong-policy");
+        assert_eq!(rows[0].1.storage_policy_index, 0);
+        assert_eq!(broker.get_reconciler_sync().unwrap(), -1);
+        broker.update_reconciler_sync(rows[0].0).unwrap();
+        assert_eq!(broker.get_reconciler_sync().unwrap(), rows[0].0);
+        let point = broker.get_reconciler_sync().unwrap();
+        assert!(broker.get_misplaced_since(point, 1000).unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn test_extract_swift_bytes() {
         assert_eq!(
             extract_swift_bytes("text/plain;swift_bytes=10"),
@@ -1704,6 +1975,161 @@ mod tests {
         let mut b = shard_broker(&dir, 0);
         b.newid("remote-x").unwrap();
         assert_eq!(b.get_sync("remote-x", true).unwrap(), -1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_empty_uses_shard_usage_on_sharded_root() {
+        // Probe test_sharded_delete: Python DELETE 409s while shards still
+        // hold objects. policy_stat on the SHARDED root is 0.
+        let dir = std::env::temp_dir().join(format!("swift-empty-shard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut b = shard_broker(&dir, 0);
+        assert!(b.empty().unwrap(), "no objects, no shards");
+        let epoch = "1751500010.00000";
+        b.enable_sharding(epoch).unwrap();
+        let mut s1 = crate::shard::ShardRange::new(".shards_AUTH_test/c-0", epoch, "", "m");
+        s1.state = crate::shard::state::ACTIVE;
+        s1.object_count = 50;
+        let mut s2 = crate::shard::ShardRange::new(".shards_AUTH_test/c-1", epoch, "m", "");
+        s2.state = crate::shard::state::ACTIVE;
+        s2.object_count = 50;
+        b.merge_shard_ranges(vec![s1, s2]).unwrap();
+        assert!(b.set_sharding_state().unwrap());
+        assert!(b.set_sharded_state().unwrap());
+        assert_eq!(b.get_db_state().unwrap(), DbState::Sharded);
+        assert!(
+            b.db_exists(),
+            "SHARDED root still exists via epoch file even if <hash>.db is gone"
+        );
+        assert!(b.sharding_initiated().unwrap());
+        assert_eq!(b.get_shard_usage().unwrap(), (0, 100));
+        assert!(
+            !b.empty().unwrap(),
+            "ACTIVE shard object_count must keep DELETE at 409"
+        );
+        let info = b.get_info().unwrap();
+        let oc = info
+            .iter()
+            .find(|(k, _)| k == "object_count")
+            .and_then(|(_, v)| v.as_i64());
+        let st = info
+            .iter()
+            .find(|(k, _)| k == "db_state")
+            .and_then(|(_, v)| v.as_text());
+        assert_eq!(oc, Some(100), "{info:?}");
+        assert_eq!(st.as_deref(), Some("sharded"), "{info:?}");
+
+        // Probe `_test_sharded_listing` after extra PUTs + run_sharders:
+        // same created timestamp, newer meta_timestamp, object_count 150
+        // on the first range. HEAD must become 200.
+        let mut s1b = crate::shard::ShardRange::new(".shards_AUTH_test/c-0", epoch, "", "m");
+        s1b.state = crate::shard::state::ACTIVE;
+        s1b.object_count = 150;
+        s1b.bytes_used = 150;
+        s1b.meta_timestamp = "1751500099.00000".into();
+        s1b.reported = 0;
+        b.merge_shard_ranges(vec![s1b]).unwrap();
+        assert_eq!(b.get_shard_usage().unwrap(), (150, 200), "first-range stats");
+        let info = b.get_info().unwrap();
+        let oc = info
+            .iter()
+            .find(|(k, _)| k == "object_count")
+            .and_then(|(_, v)| v.as_i64());
+        assert_eq!(oc, Some(200), "{info:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_collapsed_root_delete_object_makes_empty() {
+        // Probe L2094: shrink-to-root leaves a COLLAPSED epoch DB with the
+        // last live row. DELETE that object must make empty() true so
+        // DELETE_container is 204, not 409.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-empty-coll-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut b = shard_broker(&dir, 0);
+        b.put_object(
+            "alpha",
+            "1751500001.00000",
+            1,
+            "text/plain",
+            "e",
+            0,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        let epoch = "1751500010.00000";
+        b.enable_sharding(epoch).unwrap();
+        assert!(b.set_sharding_state().unwrap());
+        b.reload_db_files();
+        b.put_object(
+            "alpha",
+            "1751500001.00000",
+            1,
+            "text/plain",
+            "e",
+            0,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(b.set_sharded_state().unwrap());
+        assert_eq!(b.get_db_state().unwrap(), DbState::Collapsed);
+        assert!(!b.empty().unwrap(), "live alpha on collapsed root");
+        b.delete_object("alpha", "1751500099.00000", 0).unwrap();
+        assert!(
+            b.empty().unwrap(),
+            "tombstone must empty collapsed root for DELETE container"
+        );
+        b.delete_db("1751500100.00000").unwrap();
+        assert!(b.is_deleted().unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_find_shard_ranges_caps_last_upper_at_own() {
+        // Nested sharding: a shard's last sub-range must end at own.upper,
+        // not namespace MAX (probe assert_shard_ranges_contiguous last_upper).
+        let dir = std::env::temp_dir().join(format!(
+            "swift-find-own-upper-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut b = shard_broker(&dir, 0);
+        for i in 0..150 {
+            b.put_object(
+                &format!("j{i:04}"),
+                "1751500001.00000",
+                1,
+                "text/plain",
+                "etag",
+                0,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        let ts = "1751500010.00000";
+        let mut own = crate::shard::ShardRange::new(&b.path(), ts, "", "m");
+        own.state = crate::shard::state::SHARDING;
+        own.epoch = Some(ts.into());
+        b.merge_shard_ranges(vec![own]).unwrap();
+        let (found, done) = b.find_shard_ranges(50, 1).unwrap();
+        assert!(done);
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert_eq!(found[0].lower, "");
+        assert_eq!(found.last().unwrap().upper, "m", "{found:?}");
+        assert!(
+            found.iter().all(|f| f.upper != "" || f.lower == "m"),
+            "no sub-range may use namespace MAX: {found:?}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1825,6 +2251,46 @@ mod tests {
         );
         assert_eq!(got[0].name, ".shards_a/c-1");
         assert_eq!(got[0].state, state::CLEAVED);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_fill_gaps_appends_own_range_after_cleaved() {
+        use crate::shard::{resolve_shard_range_states, state, ShardRange};
+
+        let dir = std::env::temp_dir().join(format!(
+            "swift-shard-fill-gaps-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut b = shard_broker(&dir, 0);
+        b.enable_sharding("1751500010.00000").unwrap();
+
+        let mut c0 = ShardRange::new(".shards_a/c-0", "1751500001.00000", "", "m");
+        c0.state = state::CLEAVED;
+        let mut c1 = ShardRange::new(".shards_a/c-1", "1751500001.00000", "m", "s");
+        c1.state = state::CLEAVED;
+        let mut cr = ShardRange::new(".shards_a/c-2", "1751500001.00000", "s", "");
+        cr.state = state::CREATED;
+        b.merge_shard_ranges(vec![c0, c1, cr]).unwrap();
+
+        let listing_states = resolve_shard_range_states(&["listing".into()])
+            .unwrap()
+            .unwrap();
+        let got = b
+            .get_shard_ranges(&GetShardRangesArgs {
+                states: Some(listing_states),
+                fill_gaps: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(got.len(), 3, "2 CLEAVED + own filler, not CREATED: {got:?}");
+        assert_eq!(got[0].state, state::CLEAVED);
+        assert_eq!(got[1].state, state::CLEAVED);
+        assert_eq!(got[2].lower, "s");
+        assert!(got[2].upper.is_empty(), "filler to MAX");
+        assert_eq!(got[2].name, b.path());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -2002,6 +2468,63 @@ mod tests {
         assert!(!done);
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    fn info_count(b: &mut ContainerBroker) -> i64 {
+        b.get_info()
+            .unwrap()
+            .into_iter()
+            .find(|(k, _)| k == "object_count")
+            .and_then(|(_, v)| match v {
+                DbValue::Int(i) => Some(i),
+                DbValue::Text(s) => s.parse().ok(),
+                _ => None,
+            })
+            .unwrap_or(-1)
+    }
+
+    #[test]
+    fn test_usync_tombstones_zero_peer_object_count() {
+        // Probe L1435: a replica that has deleted=1 rows must be able to
+        // merge_items those tombstones onto a peer that still lists the
+        // objects. Restarting usync from -1 is not enough if the rows are
+        // missing or merge_items drops deleted=1.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-tombstone-usync-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut src = shard_broker(&dir.join("src"), 50);
+        let mut dst = shard_broker(&dir.join("dst"), 50);
+        src.commit_pending().unwrap();
+        dst.commit_pending().unwrap();
+        assert_eq!(info_count(&mut src), 50);
+        assert_eq!(info_count(&mut dst), 50);
+        let before = src.get_max_row().unwrap().unwrap_or(-1);
+        for i in 0..50 {
+            src.delete_object(&format!("o{i:04}"), "1751500099.00000", 0)
+                .unwrap();
+        }
+        src.commit_pending().unwrap();
+        assert_eq!(info_count(&mut src), 0, "source empty after delete");
+        let after = src.get_max_row().unwrap().unwrap_or(-1);
+        let items = src.get_items_since(-1, 1000).unwrap();
+        assert!(
+            !items.is_empty(),
+            "tombstones must exist as rows to usync; max_row {before}->{after}"
+        );
+        assert!(
+            items.iter().all(|(_, r)| r.deleted == 1),
+            "usync rows must be tombstones"
+        );
+        let recs: Vec<_> = items.into_iter().map(|(_, r)| r).collect();
+        dst.merge_items(recs).unwrap();
+        assert_eq!(
+            info_count(&mut dst),
+            0,
+            "peer object_count must drop to 0 after tombstone merge"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 /// Arguments to [`ContainerBroker::get_shard_ranges`], mirroring the Python
@@ -2017,6 +2540,9 @@ pub struct GetShardRangesArgs {
     pub states: Option<Vec<i64>>,
     pub include_own: bool,
     pub exclude_others: bool,
+    /// Python `fill_gaps`: for `states=listing` / `states=updating`, insert a
+    /// copy of the own range covering (last_found.upper, own.upper].
+    pub fill_gaps: bool,
 }
 
 /// Minimal percent-decode for the Quoted-Root sysmeta (utf-8 lossy).
@@ -2401,8 +2927,9 @@ impl ContainerBroker {
 }
 
 impl ContainerBroker {
-    /// `ContainerBroker._empty` (unsharded form).
-    pub fn empty(&mut self) -> Result<bool, DbError> {
+    /// `ContainerBroker._empty`: no live objects in any policy on *this* DB
+    /// file (not retiring, not shard-range rollup).
+    fn policy_stat_empty(&mut self) -> Result<bool, DbError> {
         self.commit_pending()?;
         let conn = self.conn()?;
         let max_count: Option<i64> =
@@ -2410,6 +2937,75 @@ impl ContainerBroker {
                 row.get(0)
             })?;
         Ok(matches!(max_count, None | Some(0)))
+    }
+
+    /// Python `get_shard_usage`: sum of `object_count`/`bytes_used` across
+    /// other-ranges in `SHARD_STATS_STATES` (ACTIVE/SHARDING/SHRINKING).
+    pub fn get_shard_usage(&mut self) -> Result<(i64, i64), DbError> {
+        let path = self.path();
+        let states = crate::shard::SHARD_STATS_STATES
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT COALESCE(SUM(bytes_used), 0), COALESCE(SUM(object_count), 0)
+             FROM shard_range
+             WHERE deleted = 0 AND name != ?1
+               AND state IN ({states})"
+        );
+        let conn = self.conn()?;
+        let row: (i64, i64) = conn.query_row(&sql, [path], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(row)
+    }
+
+    /// Python `sharding_initiated`: own range is in CLEAVING_STATES and
+    /// at least one other shard range exists.
+    pub fn sharding_initiated(&mut self) -> Result<bool, DbError> {
+        let own = match self.get_own_shard_range(false)? {
+            Some(o) => o,
+            None => return Ok(false),
+        };
+        if crate::shard::CLEAVING_STATES.contains(&own.state) {
+            self.has_other_shard_ranges()
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Live `deleted=0` rows in *this* DB file (pending committed).
+    /// policy_stat can lag a tombstone merge; DELETE container (probe L2094)
+    /// must follow actual live rows, matching Python empty() intent.
+    fn live_object_rows_empty(&mut self) -> Result<bool, DbError> {
+        self.commit_pending()?;
+        let conn = self.conn()?;
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM object WHERE deleted = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(n == 0)
+    }
+
+    /// Python `ContainerBroker.empty`: retiring + fresh `_empty`, then for a
+    /// root that has started sharding, shard-range usage (so a SHARDED root
+    /// with objects in ACTIVE shards is not empty → DELETE 409, not 404).
+    pub fn empty(&mut self) -> Result<bool, DbError> {
+        // Prefer live rows over policy_stat: a tombstone that merged but did
+        // not tick the trigger would 409 forever on collapsed roots.
+        if !self.live_object_rows_empty()? {
+            return Ok(false);
+        }
+        if let Some(mut retiring) = self.retiring_broker() {
+            if !retiring.live_object_rows_empty()? {
+                return Ok(false);
+            }
+        }
+        if self.is_root_container()? && self.sharding_initiated()? {
+            let (_, count) = self.get_shard_usage()?;
+            return Ok(count <= 0);
+        }
+        Ok(true)
     }
 
     /// `get_info_is_deleted`: `({}, true)` when no DB file (including
@@ -2441,9 +3037,12 @@ impl ContainerBroker {
             };
             matches!((parse(a), parse(b)), (Some(x), Some(y)) if x > y)
         };
-        let is_deleted =
-            zero(&get("object_count")) && newer(&get("delete_timestamp"), &get("put_timestamp"));
-        Ok((info, is_deleted))
+        // GET/HEAD 404 must match DELETE_container's is_deleted() (container_stat),
+        // not get_info() object_count which substitutes shard usage on SHARDED
+        // roots. Stale shard stats after shrink-to-root made probe L2095 GET 200.
+        let deleted = self.is_deleted()?;
+        let _ = (zero(&get("object_count")), newer(&get("delete_timestamp"), &get("put_timestamp")));
+        Ok((info, deleted))
     }
 
     /// `ContainerBroker.storage_policy_index`.
@@ -2486,6 +3085,75 @@ impl ContainerBroker {
 }
 
 impl ContainerBroker {
+    /// Whether object rows exist under more than one storage policy.
+    pub fn has_multiple_policies(&mut self) -> Result<bool, DbError> {
+        self.commit_pending()?;
+        let conn = self.conn()?;
+        let count: i64 = conn.query_row(
+            "SELECT count(storage_policy_index) FROM policy_stat",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count > 1)
+    }
+
+    /// Last object ROWID successfully handed to the reconciler queue.
+    pub fn get_reconciler_sync(&mut self) -> Result<i64, DbError> {
+        self.commit_pending()?;
+        let conn = self.conn()?;
+        Ok(conn.query_row(
+            "SELECT reconciler_sync_point FROM container_stat",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Advance the reconciler high-water mark after queue durability is
+    /// protected by a successful replication majority.
+    pub fn update_reconciler_sync(&mut self, point: i64) -> Result<(), DbError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE container_stat SET reconciler_sync_point = ?",
+            [point],
+        )?;
+        Ok(())
+    }
+
+    /// Object rows whose policy differs from the authoritative container
+    /// policy, ordered by ROWID for resumable queue feeding.
+    pub fn get_misplaced_since(
+        &mut self,
+        start: i64,
+        count: i64,
+    ) -> Result<Vec<(i64, ObjectRecord)>, DbError> {
+        self.commit_pending()?;
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT ROWID, name, created_at, size, content_type, etag, \
+             deleted, storage_policy_index FROM object \
+             WHERE ROWID > ? AND storage_policy_index != ( \
+                 SELECT storage_policy_index FROM container_stat LIMIT 1) \
+             ORDER BY ROWID ASC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![start, count], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                ObjectRecord {
+                    name: row.get(1)?,
+                    created_at: row.get(2)?,
+                    size: row.get(3)?,
+                    content_type: row.get(4)?,
+                    etag: row.get(5)?,
+                    deleted: row.get(6)?,
+                    storage_policy_index: row.get(7)?,
+                    ctype_timestamp: None,
+                    meta_timestamp: None,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// `get_items_since`: object rows with ROWID > `start`, oldest
     /// first, up to `count` — the push-side query for usync replication.
     pub fn get_items_since(
@@ -2669,6 +3337,21 @@ impl ContainerBroker {
             "metadata".to_string(),
             DbValue::Text(self.get_raw_metadata()?),
         ));
+        // Python ContainerBroker.get_replication_info includes shard_max_row
+        // so peers know to run merge_shard_ranges / get_shard_ranges.
+        info.push((
+            "shard_max_row".to_string(),
+            DbValue::Int(self.shard_max_row()?),
+        ));
         Ok(info)
+    }
+
+    /// MAX(ROWID) of `shard_range`, or -1 when the table is empty/missing.
+    pub fn shard_max_row(&mut self) -> Result<i64, DbError> {
+        let conn = self.conn()?;
+        let n: Option<i64> = conn
+            .query_row("SELECT MAX(ROWID) FROM shard_range", [], |row| row.get(0))
+            .unwrap_or(None);
+        Ok(n.unwrap_or(-1))
     }
 }

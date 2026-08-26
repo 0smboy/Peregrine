@@ -29,6 +29,7 @@
 //! [`run_once`] over local account DBs. Deferred: per-device sharding of
 //! container work, the reap-not-done warning, and concurrency.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -239,8 +240,9 @@ fn raw_request(
 /// Ring-direct reaper client (Python `direct_get_container` /
 /// `direct_delete_object` / container DELETE).
 pub struct HttpReaperClient<'a> {
-    pub object_ring: &'a Ring,
+    pub object_rings: &'a HashMap<i64, Ring>,
     pub container_ring: &'a Ring,
+    pub account_ring: &'a Ring,
 }
 
 impl ReaperClient for HttpReaperClient<'_> {
@@ -270,6 +272,8 @@ impl ReaperClient for HttpReaperClient<'_> {
                 &[
                     ("Accept", "application/json"),
                     ("X-Backend-Storage-Policy-Index", pi.as_str()),
+                    ("X-Backend-Allow-Reserved-Names", "true"),
+                    ("X-Backend-Use-Replication-Network", "true"),
                 ],
             ) else {
                 continue;
@@ -306,16 +310,28 @@ impl ReaperClient for HttpReaperClient<'_> {
         policy_index: i64,
         timestamp: &str,
     ) -> bool {
-        let Ok((part, nodes)) = self
-            .object_ring
-            .get_nodes(account, Some(container), Some(obj))
+        let Some(object_ring) = self.object_rings.get(&policy_index) else {
+            return false;
+        };
+        let Ok((part, nodes)) = object_ring.get_nodes(account, Some(container), Some(obj)) else {
+            return false;
+        };
+        let Ok((container_part, container_nodes)) =
+            self.container_ring
+                .get_nodes(account, Some(container), None)
         else {
             return false;
         };
+        if container_nodes.is_empty() {
+            return false;
+        }
         let pi = policy_index.to_string();
+        let container_part = container_part.to_string();
         let mut ok = 0usize;
-        for node in &nodes {
-            let host = format!("{}:{}", node.dev.ip, node.dev.port);
+        for (index, node) in nodes.iter().enumerate() {
+            let container_node = container_nodes[index % container_nodes.len()].dev;
+            let host = node_host(node.dev);
+            let container_host = node_host(container_node);
             let path = format!(
                 "/{}/{part}/{}/{}/{}",
                 node.dev.device,
@@ -330,6 +346,11 @@ impl ReaperClient for HttpReaperClient<'_> {
                 &[
                     ("X-Timestamp", timestamp),
                     ("X-Backend-Storage-Policy-Index", pi.as_str()),
+                    ("X-Container-Host", container_host.as_str()),
+                    ("X-Container-Partition", container_part.as_str()),
+                    ("X-Container-Device", container_node.device.as_str()),
+                    ("X-Backend-Allow-Reserved-Names", "true"),
+                    ("X-Backend-Use-Replication-Network", "true"),
                 ],
             ) else {
                 continue;
@@ -348,9 +369,19 @@ impl ReaperClient for HttpReaperClient<'_> {
         else {
             return false;
         };
+        let Ok((account_part, account_nodes)) = self.account_ring.get_nodes(account, None, None)
+        else {
+            return false;
+        };
+        if account_nodes.is_empty() {
+            return false;
+        }
+        let account_part = account_part.to_string();
         let mut ok = 0usize;
-        for node in &nodes {
+        for (index, node) in nodes.iter().enumerate() {
+            let account_node = account_nodes[index % account_nodes.len()].dev;
             let host = node_host(node.dev);
+            let account_host = node_host(account_node);
             let path = format!(
                 "/{}/{part}/{}/{}",
                 node.dev.device,
@@ -363,7 +394,12 @@ impl ReaperClient for HttpReaperClient<'_> {
                 &path,
                 &[
                     ("X-Timestamp", timestamp),
-                    ("X-Backend-Storage-Policy-Index", "0"),
+                    ("X-Account-Host", account_host.as_str()),
+                    ("X-Account-Partition", account_part.as_str()),
+                    ("X-Account-Device", account_node.device.as_str()),
+                    ("X-Account-Override-Deleted", "yes"),
+                    ("X-Backend-Allow-Reserved-Names", "true"),
+                    ("X-Backend-Use-Replication-Network", "true"),
                 ],
             ) else {
                 continue;
@@ -393,13 +429,15 @@ pub fn run_once(
     device: &Path,
     now: f64,
     delay_reaping: f64,
-    object_ring: &Ring,
+    object_rings: &HashMap<i64, Ring>,
     container_ring: &Ring,
+    account_ring: &Ring,
 ) -> ReaperPassStats {
     let mut pass = ReaperPassStats::default();
     let client = HttpReaperClient {
-        object_ring,
+        object_rings,
         container_ring,
+        account_ring,
     };
     let timestamp = format!(
         "{:.5}",

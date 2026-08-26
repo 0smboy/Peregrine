@@ -640,11 +640,16 @@ async fn accept_loop_async(
                                             metrics.observe_scheduler_lag(scheduled.elapsed());
                                             let _task = RuntimeTaskGuard(Some(metrics.clone()));
                                             let _permit = permit;
-                                            let _ = metrics
+                                            let connection_result = metrics
                                                 .bind(handle_connection_async(
                                                     stream, service, config, shutdown, admission,
                                                 ))
                                                 .await;
+                                            if let Err(error) = connection_result {
+                                                eprintln!(
+                                                    "G6_DIAG swift-http stage=connection-error error={error}"
+                                                );
+                                            }
                                         });
                                     }
                                     Err(_) => {

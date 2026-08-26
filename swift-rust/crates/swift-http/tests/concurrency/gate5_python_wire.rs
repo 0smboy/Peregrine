@@ -93,6 +93,45 @@ impl AsyncService for EtagService {
     }
 }
 
+struct SwiftUtf8MetadataEcho;
+
+impl AsyncService for SwiftUtf8MetadataEcho {
+    fn call(
+        &self,
+        mut req: AsyncRequest,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move {
+            assert_eq!(req.method, "PUT");
+            assert_eq!(req.path, "/v1/a/c/o-è");
+            assert_eq!(req.headers.get("x-object-meta-è"), Some("meta-è"));
+
+            let mut body = Vec::new();
+            while let Some(chunk) = req.body.next_chunk().await.expect("UTF-8 request body") {
+                body.extend_from_slice(&chunk);
+            }
+            assert_eq!(body, b"body");
+
+            let mut response = Response::new(201);
+            response.headers.set("x-object-meta-è", "meta-è");
+            response
+        })
+    }
+}
+
+struct SwiftUtf8MetadataPost;
+
+impl AsyncService for SwiftUtf8MetadataPost {
+    fn call(&self, mut req: AsyncRequest) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move {
+            assert_eq!(req.method, "POST");
+            assert_eq!(req.path, "/v1/AUTH_test/container-è/object-è");
+            assert_eq!(req.headers.get("x-object-meta-è"), Some("meta-è"));
+            assert_eq!(req.body.materialize(64 * 1024).await.unwrap(), b"");
+            Response::new(202)
+        })
+    }
+}
+
 fn spawn_async(worker_threads: usize, service: Arc<dyn AsyncService>) -> harness::Server {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -358,6 +397,107 @@ fn etag_header_survives_on_the_wire() {
     assert!(
         text.to_ascii_lowercase().contains("etag:"),
         "ETag must be present on the wire, got {text:?}"
+    );
+}
+
+#[test]
+fn swift_utf8_metadata_names_survive_raw_request_and_response_wire() {
+    // Python Swift accepts UTF-8 object metadata field names on its native
+    // HTTP/1.1 wire. RFC-only Hyper rejects those names before AsyncService,
+    // so the production listener has a narrowly-scoped Swift compatibility
+    // handoff. This is a real socket test of both directions, not a parser
+    // unit test.
+    let server = spawn_async(2, Arc::new(SwiftUtf8MetadataEcho));
+    let mut client = TcpStream::connect_timeout(&server.addr, Duration::from_millis(400)).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(800)))
+        .unwrap();
+    client
+        .write_all(
+            b"PUT /v1/a/c/o-%C3%A8 HTTP/1.1\r\n\
+              Host: 127.0.0.1\r\n\
+              x-object-meta-\xc3\xa8: meta-\xc3\xa8\r\n\
+              Content-Length: 4\r\n\
+              Connection: close\r\n\
+              \r\n\
+              body",
+        )
+        .unwrap();
+
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).unwrap();
+    assert!(
+        response.starts_with(b"HTTP/1.1 201 "),
+        "unexpected response: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+    assert!(
+        response
+            .windows(b"X-Object-Meta-\xc3\xa8: meta-\xc3\xa8\r\n".len())
+            .any(|window| window == b"X-Object-Meta-\xc3\xa8: meta-\xc3\xa8\r\n"),
+        "UTF-8 metadata field must survive response wire: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+}
+
+#[test]
+fn swiftclient_utf8_zero_length_post_receives_a_complete_response() {
+    let server = spawn_async(2, Arc::new(SwiftUtf8MetadataPost));
+    let response = transact(
+        server.addr,
+        b"POST /v1/AUTH_test/container-%C3%A8/object-%C3%A8 HTTP/1.1\r\n\
+          Host: 127.0.0.1\r\n\
+          Accept-Encoding: identity\r\n\
+          x-auth-token: AUTH_tk-test\r\n\
+          x-object-meta-\xc3\xa8: meta-\xc3\xa8\r\n\
+          user-agent: python-swiftclient-4.10.0\r\n\
+          Content-Length: 0\r\n\
+          \r\n",
+    );
+    assert!(
+        response.starts_with(b"HTTP/1.1 202 "),
+        "swiftclient POST must not be closed without a response: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+    assert!(
+        response
+            .windows(b"Content-Length: 0\r\n".len())
+            .any(|window| window == b"Content-Length: 0\r\n"),
+        "empty response must be explicitly framed: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+}
+
+#[test]
+fn swift_utf8_head_terminator_may_straddle_request_line_peek_boundary() {
+    // Reproduce the production failure deterministically. The first socket
+    // write contains the request line and all but the final LF of CRLFCRLF.
+    // The request-line peek is allowed to consume that whole packet, so the
+    // complete-head reader must retain the peeked suffix when it continues.
+    let server = spawn_async(2, Arc::new(SwiftUtf8MetadataPost));
+    let mut client = TcpStream::connect_timeout(&server.addr, Duration::from_millis(400)).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(800)))
+        .unwrap();
+    client
+        .write_all(
+            b"POST /v1/AUTH_test/container-%C3%A8/object-%C3%A8 HTTP/1.1\r\n\
+              Host: 127.0.0.1\r\n\
+              x-object-meta-\xc3\xa8: meta-\xc3\xa8\r\n\
+              Content-Length: 0\r\n\r",
+        )
+        .unwrap();
+    client.flush().unwrap();
+    thread::sleep(Duration::from_millis(50));
+    client.write_all(b"\n").unwrap();
+    client.flush().unwrap();
+
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).unwrap();
+    assert!(
+        response.starts_with(b"HTTP/1.1 202 "),
+        "split head terminator must not time out: {:?}",
+        String::from_utf8_lossy(&response)
     );
 }
 

@@ -38,6 +38,35 @@ use swift_core::obslog::{LogLevel, Logger};
 use swift_core::statsd::StatsdClient;
 use swift_ring::{Ring, RingData};
 
+/// Probe/G6: prefer `PROXY_BASE_URL`, then `[probe_test] proxy_base_url`
+/// from `SWIFT_TEST_CONFIG_FILE`, else Python's historic `:8080`.
+fn resolve_proxy_base(env_proxy: Option<&str>, test_conf: Option<&SwiftConfig>) -> String {
+    if let Some(u) = env_proxy.map(str::trim).filter(|s| !s.is_empty()) {
+        return u.trim_end_matches('/').to_string();
+    }
+    if let Some(conf) = test_conf {
+        if let Ok(Some(u)) = conf.get("probe_test", "proxy_base_url") {
+            let u = u.trim().trim_end_matches('/');
+            if !u.is_empty() {
+                return u.to_string();
+            }
+        }
+    }
+    "http://127.0.0.1:8080".to_string()
+}
+
+/// Copied SAIO samples hardcode `:8080`; a probe base on another port wins.
+fn rewrite_loopback_8080(url: &str, replacement: &str) -> String {
+    if replacement == "http://127.0.0.1:8080" {
+        return url.to_string();
+    }
+    if url.contains("://127.0.0.1:8080/") || url.contains("://localhost:8080/") {
+        replacement.to_string()
+    } else {
+        url.to_string()
+    }
+}
+
 fn parse_conf_file(path: &str) -> SwiftConfig {
     let content = std::fs::read_to_string(path).unwrap_or_default();
     SwiftConfig::parse_lenient(&content, &[], false).unwrap_or_else(|e| {
@@ -82,9 +111,14 @@ impl ProxyObjectSource {
             ("X-Auth-Key".into(), self.auth_key.clone()),
             ("Connection".into(), "close".into()),
         ];
-        let (status, resp_headers, _) =
-            http_exchange("GET", &self.auth_url, &headers, &[], self.timeout)?;
+        let Some((status, resp_headers, _)) =
+            http_exchange("GET", &self.auth_url, &headers, &[], self.timeout)
+        else {
+            eprintln!("container-sync: auth transport failure");
+            return None;
+        };
         if !(200..300).contains(&status) {
+            eprintln!("container-sync: auth status={status}");
             return None;
         }
         let tok = resp_headers
@@ -92,7 +126,11 @@ impl ProxyObjectSource {
             .find(|(k, _)| {
                 k.eq_ignore_ascii_case("X-Auth-Token") || k.eq_ignore_ascii_case("X-Storage-Token")
             })
-            .map(|(_, v)| v.clone())?;
+            .map(|(_, v)| v.clone());
+        let Some(tok) = tok else {
+            eprintln!("container-sync: auth response missing token");
+            return None;
+        };
         if let Ok(mut guard) = self.token.lock() {
             *guard = Some(tok.clone());
         }
@@ -106,6 +144,46 @@ impl ProxyObjectSource {
     }
 }
 
+fn object_source_url(base: &str, account: &str, container: &str, name: &str) -> String {
+    // Python's container-sync InternalClient always asks symlink middleware
+    // for the link object itself.  Without this query a dynamic link is
+    // dereferenced and the target body is copied as an ordinary object.
+    format!(
+        "{}/{}/{}/{}?symlink=get",
+        base.trim_end_matches('/'),
+        pe(account),
+        pe(container),
+        pe(name)
+    )
+}
+
+fn debug_object_source(name: &str, headers: &[(String, String)], body: &[u8]) {
+    if std::env::var("G6_CONTAINER_SYNC_DEBUG").as_deref() != Ok("1") {
+        return;
+    }
+    let header = |wanted: &str| {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(wanted))
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("")
+    };
+    eprintln!(
+        "container-sync-debug: source name={name:?} etag={:?} slo={:?} \
+         symlink_target={:?} symlink_account={:?} symlink_etag={:?} \
+         symlink_bytes={:?} content_length={:?} body_len={} body={:?}",
+        header("etag"),
+        header("x-static-large-object"),
+        header("x-symlink-target"),
+        header("x-symlink-target-account"),
+        header("x-symlink-target-etag"),
+        header("x-symlink-target-bytes"),
+        header("content-length"),
+        body.len(),
+        String::from_utf8_lossy(body),
+    );
+}
+
 impl ObjectSource for ProxyObjectSource {
     fn get_object(
         &self,
@@ -114,13 +192,7 @@ impl ObjectSource for ProxyObjectSource {
         name: &str,
         _storage_policy_index: i64,
     ) -> Option<(Vec<(String, String)>, Vec<u8>)> {
-        let url = format!(
-            "{}/{}/{}/{}",
-            self.base.trim_end_matches('/'),
-            pe(account),
-            pe(container),
-            pe(name)
-        );
+        let url = object_source_url(&self.base, account, container, name);
         let mut headers = vec![
             ("X-Newest".into(), "True".into()),
             ("Connection".into(), "close".into()),
@@ -128,7 +200,12 @@ impl ObjectSource for ProxyObjectSource {
         if let Some(tok) = self.ensure_token() {
             headers.push(("X-Auth-Token".into(), tok));
         }
-        let (status, resp_headers, body) = http_exchange("GET", &url, &headers, &[], self.timeout)?;
+        let Some((status, resp_headers, body)) =
+            http_exchange("GET", &url, &headers, &[], self.timeout)
+        else {
+            eprintln!("container-sync: source GET transport failure");
+            return None;
+        };
         // One retry on 401 with a fresh token (expired / first static miss).
         if status == 401 && !self.auth_user.is_empty() {
             self.invalidate_token();
@@ -139,16 +216,24 @@ impl ObjectSource for ProxyObjectSource {
             if let Some(tok) = self.ensure_token() {
                 headers.push(("X-Auth-Token".into(), tok));
             }
-            let (status, resp_headers, body) =
-                http_exchange("GET", &url, &headers, &[], self.timeout)?;
+            let Some((status, resp_headers, body)) =
+                http_exchange("GET", &url, &headers, &[], self.timeout)
+            else {
+                eprintln!("container-sync: source GET retry transport failure");
+                return None;
+            };
             if !(200..300).contains(&status) {
+                eprintln!("container-sync: source GET retry status={status}");
                 return None;
             }
+            debug_object_source(name, &resp_headers, &body);
             return Some((resp_headers, body));
         }
         if !(200..300).contains(&status) {
+            eprintln!("container-sync: source GET status={status}");
             return None;
         }
+        debug_object_source(name, &resp_headers, &body);
         Some((resp_headers, body))
     }
 }
@@ -294,7 +379,7 @@ fn http_exchange(
 fn dechunk(raw: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut i = 0usize;
-    while i < raw.len() {
+    loop {
         let line_end = raw[i..].iter().position(|&b| b == b'\n')? + i;
         let hex = std::str::from_utf8(&raw[i..line_end])
             .ok()?
@@ -305,7 +390,20 @@ fn dechunk(raw: &[u8]) -> Option<Vec<u8>> {
         let size = usize::from_str_radix(hex, 16).ok()?;
         i = line_end + 1;
         if size == 0 {
-            break;
+            // A complete chunked message ends with the empty trailer line
+            // after the zero-size chunk.  Returning merely because all bytes
+            // received so far happen to form whole data chunks truncates a
+            // response whenever the next TCP read has not arrived yet.
+            let trailer = &raw[i..];
+            if trailer.starts_with(b"\r\n") || trailer.starts_with(b"\n") {
+                return Some(out);
+            }
+            if trailer.windows(4).any(|window| window == b"\r\n\r\n")
+                || trailer.windows(2).any(|window| window == b"\n\n")
+            {
+                return Some(out);
+            }
+            return None;
         }
         if i + size > raw.len() {
             return None;
@@ -317,9 +415,10 @@ fn dechunk(raw: &[u8]) -> Option<Vec<u8>> {
             i += 2;
         } else if i < raw.len() && raw[i] == b'\n' {
             i += 1;
+        } else {
+            return None;
         }
     }
-    Some(out)
 }
 
 fn main() {
@@ -354,21 +453,55 @@ fn main() {
         ),
     );
     let recon_cache_path = get("container-sync", "recon_cache_path", "/var/cache/swift");
-    let internal_url = get(
-        "container-sync",
-        "internal_client_url",
-        "http://127.0.0.1:8080/v1",
+    // Probe IsolatedIdentity exports PROXY_BASE_URL (G6 :18080). A hardcoded
+    // :8080 default fetched production objects and dest GETs 404'd.
+    // SWIFT_TEST_CONFIG_FILE [probe_test] proxy_base_url is the same source
+    // Python test.probe uses; honor it when the env var is missing (Manager
+    // children do not always inherit a Python module global).
+    let test_conf_for_base = std::env::var("SWIFT_TEST_CONFIG_FILE")
+        .ok()
+        .map(|p| parse_conf_file(&p));
+    let proxy_base = resolve_proxy_base(
+        std::env::var("PROXY_BASE_URL").ok().as_deref(),
+        test_conf_for_base.as_ref(),
     );
+    let default_internal = format!("{proxy_base}/v1");
+    let default_auth = format!("{proxy_base}/auth/v1.0");
+    let mut internal_url = get("container-sync", "internal_client_url", &default_internal);
     // TempAuth (or static token) so proxy GETs succeed — unauth → 401 and
     // PUT bodies never leave the node.
-    let auth_url = get(
-        "container-sync",
-        "internal_client_auth_url",
-        "http://127.0.0.1:8080/auth/v1.0",
-    );
-    let auth_user = get("container-sync", "internal_client_auth_user", "");
-    let auth_key = get("container-sync", "internal_client_auth_key", "");
+    let mut auth_url = get("container-sync", "internal_client_auth_url", &default_auth);
+    internal_url = rewrite_loopback_8080(&internal_url, &default_internal);
+    auth_url = rewrite_loopback_8080(&auth_url, &default_auth);
+    let mut auth_user = get("container-sync", "internal_client_auth_user", "");
+    let mut auth_key = get("container-sync", "internal_client_auth_key", "");
     let auth_token = get("container-sync", "internal_client_auth_token", "");
+    if auth_user.is_empty() || auth_key.is_empty() {
+        if let Ok(test_conf_path) = std::env::var("SWIFT_TEST_CONFIG_FILE") {
+            let test_conf = parse_conf_file(&test_conf_path);
+            let acct = test_conf
+                .get("func_test", "account")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "test".to_string());
+            let user = test_conf
+                .get("func_test", "username")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "tester".to_string());
+            let key = test_conf
+                .get("func_test", "password")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "testing".to_string());
+            if auth_user.is_empty() {
+                auth_user = format!("{acct}:{user}");
+            }
+            if auth_key.is_empty() {
+                auth_key = key;
+            }
+        }
+    }
 
     let swift_conf_path =
         std::env::var("SWIFT_CONF").unwrap_or_else(|_| format!("{swift_dir}/swift.conf"));
@@ -505,5 +638,96 @@ fn main() {
                 "could not reload {ring_path}: {e}; reusing previous ring"
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod proxy_base_tests {
+    use super::{object_source_url, resolve_proxy_base, rewrite_loopback_8080};
+    use swift_core::config::SwiftConfig;
+
+    #[test]
+    fn env_proxy_base_url_wins_over_test_conf_and_default() {
+        let conf = SwiftConfig::parse_lenient(
+            "[probe_test]\nproxy_base_url = http://127.0.0.1:18080\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_proxy_base(Some("http://127.0.0.1:19999/"), Some(&conf)),
+            "http://127.0.0.1:19999"
+        );
+    }
+
+    #[test]
+    fn probe_test_proxy_base_url_used_when_env_missing() {
+        let conf = SwiftConfig::parse_lenient(
+            "[probe_test]\nproxy_base_url = http://127.0.0.1:18080\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_proxy_base(None, Some(&conf)),
+            "http://127.0.0.1:18080"
+        );
+        assert_eq!(
+            resolve_proxy_base(Some("  "), Some(&conf)),
+            "http://127.0.0.1:18080"
+        );
+    }
+
+    #[test]
+    fn default_is_python_historic_8080() {
+        assert_eq!(resolve_proxy_base(None, None), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn rewrite_replaces_copied_saio_8080_when_probe_base_differs() {
+        assert_eq!(
+            rewrite_loopback_8080("http://127.0.0.1:8080/v1", "http://127.0.0.1:18080/v1"),
+            "http://127.0.0.1:18080/v1"
+        );
+        assert_eq!(
+            rewrite_loopback_8080("http://10.0.0.1:18080/v1", "http://127.0.0.1:18080/v1"),
+            "http://10.0.0.1:18080/v1"
+        );
+        assert_eq!(
+            rewrite_loopback_8080("http://127.0.0.1:8080/v1", "http://127.0.0.1:8080"),
+            "http://127.0.0.1:8080/v1"
+        );
+    }
+
+    #[test]
+    fn internal_object_get_preserves_symlink_objects() {
+        assert_eq!(
+            object_source_url(
+                "http://127.0.0.1:18082/v1/",
+                "AUTH_a",
+                "source container",
+                "link/name"
+            ),
+            "http://127.0.0.1:18082/v1/AUTH_a/source%20container/link%2Fname?symlink=get"
+        );
+    }
+
+    #[test]
+    fn chunked_decoder_requires_terminal_zero_chunk() {
+        assert_eq!(super::dechunk(b""), None);
+        assert_eq!(super::dechunk(b"3\r\nabc\r\n"), None);
+        assert_eq!(
+            super::dechunk(b"3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"),
+            Some(b"abcde".to_vec())
+        );
+    }
+
+    #[test]
+    fn chunked_decoder_accepts_extensions_and_complete_trailers() {
+        assert_eq!(
+            super::dechunk(b"3;foo=bar\r\nabc\r\n0\r\nX-Check: yes\r\n\r\n"),
+            Some(b"abc".to_vec())
+        );
+        assert_eq!(super::dechunk(b"0\r\nX-Check: yes\r\n"), None);
     }
 }

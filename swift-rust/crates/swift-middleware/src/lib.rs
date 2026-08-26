@@ -141,6 +141,7 @@ pub use tempurl::{ClosureKeyProvider, KeyProvider, TempUrl};
 pub use versioned_writes::{
     versions_object_name, VersionedWrites,
     AUTHORIZE_ONLY_HEADER as VERSIONED_WRITES_AUTHORIZE_ONLY_HEADER,
+    OWNER_INFO_HEADER as VERSIONED_WRITES_OWNER_INFO_HEADER,
 };
 pub use xprofile::XProfile;
 
@@ -157,14 +158,12 @@ pub type NextFn = Arc<dyn Fn(Request) -> Response + Send + Sync>;
 
 /// Async inner app for production Hyper serve. SLO/DLO segment subrequests
 /// must go through this, not a blocking `handle()`.
-pub type AsyncNextFn = Arc<
-    dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync,
->;
+pub type AsyncNextFn =
+    Arc<dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync>;
 
 /// Production Hyper inner app that keeps the request body as a stream.
-pub type StreamingAsyncNextFn = Arc<
-    dyn Fn(AsyncRequest) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync,
->;
+pub type StreamingAsyncNextFn =
+    Arc<dyn Fn(AsyncRequest) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync>;
 
 /// Header-only phase on the production Hyper path. Must not read the
 /// request body (object PUT/GET stay on `handle_async`).

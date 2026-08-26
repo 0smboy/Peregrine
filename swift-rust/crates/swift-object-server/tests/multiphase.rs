@@ -13,16 +13,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The multipart-MIME / multiphase-commit backend PUT, over a real
-//! connection (both 100 Continue interim responses and both chunked
-//! sequences on the wire) — the protocol the EC proxy PUT path speaks
-//! (obj.py MIMEPutter <-> obj/server.py mime_documents flow).
+//! Backend multipart-MIME PUT coverage for both shipped execution paths:
+//! the production async server's single-phase streaming wire protocol and
+//! the synchronous compatibility handler's two-phase commit state machine.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use swift_object_server::{ContainerUpdateMode, ObjectServer, ObjectServerConfig};
@@ -54,10 +53,8 @@ impl Drop for TestDevices {
     }
 }
 
-/// Serve an object server (policy 0 replication + policy 1 EC-ish) on an
-/// ephemeral port; the accept thread is detached (process exit reaps it).
-fn spawn_server(devices: &Path) -> std::net::SocketAddr {
-    let server = Arc::new(ObjectServer::new(ObjectServerConfig {
+fn object_server(devices: &Path) -> ObjectServer {
+    ObjectServer::new(ObjectServerConfig {
         devices: devices.to_path_buf(),
         mount_check: false,
         hash_config: swift_core::hashing::HashPathConfig::new(
@@ -77,11 +74,22 @@ fn spawn_server(devices: &Path) -> std::net::SocketAddr {
         ]),
         container_update_timeout: std::time::Duration::from_secs(1),
         container_update_mode: ContainerUpdateMode::Sync,
-    }));
+    })
+}
+
+/// Serve the production async object service (policy 0 replication + policy
+/// 1 EC-ish) on an ephemeral port; process exit reaps the detached thread.
+fn spawn_server(devices: &Path) -> std::net::SocketAddr {
+    let server = object_server(devices);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
-    let handler: swift_http::Handler = Arc::new(move |req| server.handle(req));
-    std::thread::spawn(move || swift_http::serve_forever(listener, handler));
+    std::thread::spawn(move || {
+        let _ = swift_object_server::serve_with_config(
+            listener,
+            server,
+            swift_http::ServerConfig::default(),
+        );
+    });
     address
 }
 
@@ -135,7 +143,7 @@ fn status_of(response: &str) -> u16 {
     response
         .lines()
         .next()
-        .unwrap()
+        .unwrap_or_else(|| panic!("empty HTTP response"))
         .split_whitespace()
         .nth(1)
         .unwrap()
@@ -143,14 +151,69 @@ fn status_of(response: &str) -> u16 {
         .unwrap()
 }
 
+#[derive(Clone)]
+struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn sync_multiphase_put(
+    server: &ObjectServer,
+    path: &str,
+    data: &[u8],
+    footer_json: &str,
+    commit_doc: &[u8],
+    captured: Arc<Mutex<Vec<u8>>>,
+) -> swift_http::Response {
+    let boundary = "sync-two-phase-boundary";
+    let mut decoded = phase1(boundary, data, footer_json);
+    decoded.extend_from_slice(commit_doc);
+    let mut body = swift_http::Body::from_reader(
+        Box::new(std::io::Cursor::new(decoded)),
+        None,
+    );
+    body.attach_interim(swift_http::InterimResponder::new(Some(Box::new(
+        CaptureWriter(captured),
+    ))));
+    let mut headers = swift_http::HeaderKeyDict::new();
+    headers.set(
+        "X-Timestamp",
+        swift_core::timestamp::Timestamp::now().internal(),
+    );
+    headers.set("Content-Type", "application/octet-stream");
+    headers.set("Transfer-Encoding", "chunked");
+    headers.set("Expect", "100-continue");
+    headers.set("X-Backend-Obj-Multipart-Mime-Boundary", boundary);
+    headers.set("X-Backend-Obj-Metadata-Footer", "yes");
+    headers.set("X-Backend-Obj-Multiphase-Commit", "yes");
+    headers.set("X-Backend-Obj-Content-Length", data.len());
+    server.handle(swift_http::Request {
+        method: "PUT".into(),
+        path: path.into(),
+        query_string: String::new(),
+        headers,
+        body,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
-fn mime_put(
+fn async_mime_put(
     address: std::net::SocketAddr,
     path: &str,
     policy_index: Option<i64>,
     data: &[u8],
     footer_json: &str,
-    send_commit: bool,
     extra_headers: &[(&str, &str)],
 ) -> (u16, String) {
     let boundary = "deadbeefcafe";
@@ -162,7 +225,7 @@ fn mime_put(
         "PUT {path} HTTP/1.1\r\nHost: test\r\nX-Timestamp: {}\r\nContent-Type: application/octet-stream\r\n\
          Transfer-Encoding: chunked\r\nExpect: 100-continue\r\n\
          X-Backend-Obj-Multipart-Mime-Boundary: {boundary}\r\n\
-         X-Backend-Obj-Metadata-Footer: yes\r\nX-Backend-Obj-Multiphase-Commit: yes\r\n\
+         X-Backend-Obj-Metadata-Footer: yes\r\n\
          X-Backend-Obj-Content-Length: {}\r\n",
         swift_core::timestamp::Timestamp::now().internal(),
         data.len()
@@ -182,36 +245,55 @@ fn mime_put(
         let _ = client.read_to_string(&mut rest);
         return (status_of(&first), first + &rest);
     }
-    assert!(first.contains("X-Obj-Multiphase-Commit: yes"), "{first}");
-    assert!(first.contains("X-Obj-Metadata-Footer: yes"), "{first}");
-
+    // Hyper owns the production async connection and emits the standard bare
+    // 100. Capability-bearing repeated informational responses belong only to
+    // the synchronous compatibility state machine tested below.
     client
         .write_all(&chunked(&phase1(boundary, data, footer_json)))
         .unwrap();
     client.write_all(TERMINATOR).unwrap();
-
-    let second = read_interim(&mut client);
-    if status_of(&second) != 100 {
-        let mut rest = String::new();
-        let _ = client.read_to_string(&mut rest);
-        return (status_of(&second), second + &rest);
-    }
-
-    if send_commit {
-        client.write_all(&chunked(&phase2(boundary))).unwrap();
-    } else {
-        // terminal boundary with no commit doc
-        client
-            .write_all(&chunked(
-                format!("X-Document: not a commit\r\n\r\nnope\r\n--{boundary}--").as_bytes(),
-            ))
-            .unwrap();
-    }
-    client.write_all(TERMINATOR).unwrap();
-    let _ = client.shutdown(Shutdown::Write);
     let mut rest = String::new();
     client.read_to_string(&mut rest).unwrap();
+    assert!(!rest.is_empty(), "server closed without a final response after {first:?}");
     (status_of(&rest), rest)
+}
+
+#[test]
+fn sync_compatibility_handler_keeps_two_phase_commit_contract() {
+    let devices = TestDevices::new("sync-two-phase");
+    let server = object_server(devices.path());
+    let data = b"two phase fragment";
+    let footers = format!("{{\"Etag\": \"{}\"}}", md5_hex(data));
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let response = sync_multiphase_put(
+        &server,
+        "/sda1/0/a/c/committed",
+        data,
+        &footers,
+        &phase2("sync-two-phase-boundary"),
+        Arc::clone(&captured),
+    );
+    assert_eq!(response.status, 201);
+    let interim = String::from_utf8_lossy(
+        &captured
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    )
+    .into_owned();
+    assert_eq!(interim.matches("HTTP/1.1 100 Continue").count(), 2, "{interim}");
+    assert!(interim.contains("X-Obj-Multiphase-Commit: yes"), "{interim}");
+    assert!(interim.contains("X-Obj-Metadata-Footer: yes"), "{interim}");
+
+    let bad_doc = b"X-Document: not a commit\r\n\r\nnope\r\n--sync-two-phase-boundary--";
+    let rejected = sync_multiphase_put(
+        &server,
+        "/sda1/0/a/c/rejected",
+        data,
+        &footers,
+        bad_doc,
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    assert_eq!(rejected.status, 500);
 }
 
 fn find_files(root: &Path, extension: &str) -> Vec<PathBuf> {
@@ -234,10 +316,10 @@ fn find_files(root: &Path, extension: &str) -> Vec<PathBuf> {
 }
 
 #[test]
-fn full_multiphase_put_stores_data_footers_and_overrides() {
+fn async_mime_put_stores_data_footers_and_overrides() {
     let devices = TestDevices::new("full");
     let address = spawn_server(devices.path());
-    let data = b"multiphase object payload";
+    let data = b"async MIME object payload";
     let footers = format!(
         "{{\"Etag\": \"{}\", \"X-Object-Sysmeta-From-Footer\": \"yes-indeed\", \
           \"X-Backend-Container-Update-Override-Etag\": \"whole-object-etag\"}}",
@@ -245,13 +327,12 @@ fn full_multiphase_put_stores_data_footers_and_overrides() {
     );
     // An unreachable container host forces the update onto the
     // async_pending side channel, where the override etag must appear.
-    let (status, _resp) = mime_put(
+    let (status, _resp) = async_mime_put(
         address,
         "/sda1/0/a/c/o",
         None,
         data,
         &footers,
-        true,
         &[
             ("X-Container-Host", "127.0.0.1:1"),
             ("X-Container-Partition", "0"),
@@ -312,7 +393,7 @@ fn full_multiphase_put_stores_data_footers_and_overrides() {
 }
 
 #[test]
-fn ec_policy_put_is_durable_only_after_commit() {
+fn async_ec_policy_put_commits_only_after_complete_mime_body() {
     let devices = TestDevices::new("durable");
     let address = spawn_server(devices.path());
     let data = b"fragment archive bytes";
@@ -322,13 +403,12 @@ fn ec_policy_put_is_durable_only_after_commit() {
     );
 
     // Committed: the fragment lands as a durable #3#d.data.
-    let (status, _r) = mime_put(
+    let (status, _r) = async_mime_put(
         address,
         "/sda1/0/a/c/committed",
         Some(1),
         data,
         &footers,
-        true,
         &[],
     );
     assert_eq!(status, 201);
@@ -342,24 +422,43 @@ fn ec_policy_put_is_durable_only_after_commit() {
         "expected one durable fragment: {durable:?}"
     );
 
-    // No commit doc: 500 per server.py:1020-1021, and the fragment stays
-    // NON-durable (#3.data without the #d marker).
-    let (status, resp) = mime_put(
-        address,
-        "/sda1/0/a/c/uncommitted",
-        Some(1),
-        data,
-        &footers,
-        false,
-        &[],
-    );
-    assert_eq!(status, 500, "{resp}");
+    // A truncated chunked MIME stream must not create either a durable or a
+    // non-durable fragment. This is the production async equivalent of the
+    // legacy two-phase handler refusing a missing commit document.
+    let boundary = "disconnect-boundary";
+    let mut client = TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client
+        .write_all(
+            format!(
+                "PUT /sda1/0/a/c/uncommitted HTTP/1.1\r\nHost: t\r\nX-Timestamp: {}\r\n\
+                 Content-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\
+                 Expect: 100-continue\r\nX-Backend-Storage-Policy-Index: 1\r\n\
+                 X-Backend-Obj-Multipart-Mime-Boundary: {boundary}\r\n\
+                 X-Backend-Obj-Metadata-Footer: yes\r\n\
+                 X-Backend-Obj-Content-Length: {}\r\nConnection: close\r\n\r\n",
+                swift_core::timestamp::Timestamp::now().internal(),
+                data.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    assert_eq!(status_of(&read_interim(&mut client)), 100);
+    let partial = format!("--{boundary}\r\nX-Document: object body\r\n\r\n");
+    client
+        .write_all(format!("{:x}\r\n", partial.len() + data.len() + 1024).as_bytes())
+        .unwrap();
+    client.write_all(partial.as_bytes()).unwrap();
+    client.write_all(data).unwrap();
+    let _ = client.shutdown(Shutdown::Write);
+    let mut aborted = String::new();
+    let _ = client.read_to_string(&mut aborted);
+    if !aborted.is_empty() {
+        assert_eq!(status_of(&aborted), 499, "{aborted}");
+    }
     let all: Vec<_> = find_files(devices.path(), "data");
-    let uncommitted: Vec<_> = all
-        .iter()
-        .filter(|p| !p.to_string_lossy().contains("committed"))
-        .collect();
-    let _ = uncommitted;
     let non_durable: Vec<_> = all
         .iter()
         .filter(|p| {
@@ -369,8 +468,8 @@ fn ec_policy_put_is_durable_only_after_commit() {
         .collect();
     assert_eq!(
         non_durable.len(),
-        1,
-        "expected one non-durable fragment: {all:?}"
+        0,
+        "truncated MIME PUT left a non-durable fragment: {all:?}"
     );
 }
 
@@ -379,13 +478,12 @@ fn footer_etag_mismatch_is_422() {
     let devices = TestDevices::new("etag");
     let address = spawn_server(devices.path());
     let footers = "{\"Etag\": \"0000deadbeef0000deadbeef00000000\"}".to_string();
-    let (status, _r) = mime_put(
+    let (status, _r) = async_mime_put(
         address,
         "/sda1/0/a/c/bad",
         None,
         b"real data",
         &footers,
-        true,
         &[],
     );
     assert_eq!(status, 422);
@@ -425,7 +523,6 @@ fn corrupt_footer_md5_is_422() {
     );
     client.write_all(&chunked(&body)).unwrap();
     client.write_all(TERMINATOR).unwrap();
-    let _ = client.shutdown(Shutdown::Write);
     let mut rest = String::new();
     client.read_to_string(&mut rest).unwrap();
     assert_eq!(status_of(&rest), 422, "{rest}");

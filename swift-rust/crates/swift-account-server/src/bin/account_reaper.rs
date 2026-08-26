@@ -17,6 +17,7 @@
 //! accounts marked status=DELETED after `delay_reaping`. Reads object and
 //! container rings from SWIFT_DIR.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,6 +27,7 @@ use swift_core::daemon;
 use swift_core::hashing::HashPathConfig;
 use swift_core::obslog::{LogLevel, Logger};
 use swift_core::statsd::StatsdClient;
+use swift_core::storage_policy::parse_storage_policies;
 use swift_ring::{Ring, RingData};
 
 fn parse_conf_file(path: &str) -> SwiftConfig {
@@ -91,10 +93,27 @@ fn main() {
         std::process::exit(1);
     });
     let swift_dir = std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string());
-    let object_ring_path = format!("{swift_dir}/object.ring.gz");
+    let policies = parse_storage_policies(&swift_conf).unwrap_or_else(|e| {
+        logger.error(&format!("bad storage policies in {swift_conf_path}: {e}"));
+        std::process::exit(1);
+    });
+    let object_ring_paths: Vec<(i64, String)> = policies
+        .iter()
+        .map(|policy| {
+            (
+                i64::from(policy.idx()),
+                format!("{swift_dir}/{}.ring.gz", policy.ring_name()),
+            )
+        })
+        .collect();
     let container_ring_path = format!("{swift_dir}/container.ring.gz");
-    let mut object_ring = load_ring(&object_ring_path, &hash_config, &logger);
+    let account_ring_path = format!("{swift_dir}/account.ring.gz");
+    let mut object_rings: HashMap<i64, Ring> = object_ring_paths
+        .iter()
+        .map(|(index, path)| (*index, load_ring(path, &hash_config, &logger)))
+        .collect();
     let mut container_ring = load_ring(&container_ring_path, &hash_config, &logger);
+    let mut account_ring = load_ring(&account_ring_path, &hash_config, &logger);
     let stop = swift_http::install_sigterm_flag();
 
     logger.info(&format!(
@@ -111,7 +130,14 @@ fn main() {
         if let Ok(entries) = std::fs::read_dir(&devices) {
             for e in entries.flatten() {
                 if e.path().is_dir() {
-                    let s = run_once(&e.path(), now, delay_reaping, &object_ring, &container_ring);
+                    let s = run_once(
+                        &e.path(),
+                        now,
+                        delay_reaping,
+                        &object_rings,
+                        &container_ring,
+                        &account_ring,
+                    );
                     pass.accounts_reaped += s.accounts_reaped;
                     pass.accounts_skipped += s.accounts_skipped;
                     pass.containers_deleted += s.containers_deleted;
@@ -143,9 +169,19 @@ fn main() {
             logger.info("exiting on SIGTERM");
             break;
         }
+        for (index, path) in &object_ring_paths {
+            match RingData::load(Path::new(path)) {
+                Ok(data) => {
+                    object_rings.insert(*index, Ring::new(data, hash_config.clone()));
+                }
+                Err(e) => logger.warning(&format!(
+                    "could not reload {path}: {e}; reusing previous ring"
+                )),
+            }
+        }
         for (path, ring) in [
-            (&object_ring_path, &mut object_ring),
             (&container_ring_path, &mut container_ring),
+            (&account_ring_path, &mut account_ring),
         ] {
             match RingData::load(Path::new(path)) {
                 Ok(data) => *ring = Ring::new(data, hash_config.clone()),

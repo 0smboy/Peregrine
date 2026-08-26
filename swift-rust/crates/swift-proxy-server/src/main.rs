@@ -34,7 +34,9 @@ use swift_core::obslog::{LogLevel, Logger};
 use swift_core::otlp::{self, AttrValue, TraceExporter, TraceSpan};
 use swift_core::statsd::StatsdClient;
 use swift_core::storage_policy::{parse_storage_policies, StoragePolicyCollection};
-use swift_proxy_server::{EcPolicyParams, ProxyApp, ProxyConfig, ProxyEndpointResolver};
+use swift_proxy_server::{
+    CorePipelineFilters, EcPolicyParams, ProxyApp, ProxyConfig, ProxyEndpointResolver,
+};
 use swift_ring::{Ring, RingData};
 
 /// How often the reload thread re-stats the ring files (Python
@@ -237,6 +239,18 @@ fn main() {
         logger.error(&format!("could not bind {bind}: {e}"));
         std::process::exit(1);
     });
+    let core_filters = core_pipeline_filters_from_conf(&conf);
+    let internal_client_mode = internal_client_mode_from_conf(&conf);
+    let listener_addr = listener.local_addr().unwrap_or_else(|e| {
+        logger.error(&format!("could not inspect bound listener {bind}: {e}"));
+        std::process::exit(1);
+    });
+    if let Err(e) =
+        validate_core_pipeline_listener(core_filters, internal_client_mode, listener_addr)
+    {
+        logger.error(&e);
+        std::process::exit(1);
+    }
     // std bind backlog is 128 on Linux; 100k idle keep-alive (G7) needs the
     // kernel queue, not an application buffer. Independent of worker_threads.
     let backlog = options
@@ -351,9 +365,10 @@ fn main() {
     }
 
     // Optional `[pipeline:main] pipeline = ...` orders the *implemented*
-    // filters (P0–P1b). Always-on catch_errors / gatekeeper / healthcheck
-    // stay in serve_with_filters_and_config. Absent pipeline → today's
-    // default order. Unknown names fail startup by default. Operators may set
+    // filters (P0–P1b). The configured core front matter is preserved too;
+    // omitting gatekeeper is accepted only for an explicitly marked,
+    // loopback-only InternalClient listener. Absent pipeline keeps today's
+    // public default. Unknown names fail startup by default. Operators may set
     // `strict_pipeline = false` to skip them or explicitly opt into a named
     // no-op with `plugin_default = passthrough`.
     let key_provider: Arc<dyn swift_middleware::KeyProvider> =
@@ -398,9 +413,13 @@ fn main() {
         }
         std::process::exit(1);
     }
-    if let Err(e) =
-        swift_proxy_server::serve_with_filters_and_config(listener, app, filters, server_config)
-    {
+    if let Err(e) = swift_proxy_server::serve_with_core_filters_and_config(
+        listener,
+        app,
+        filters,
+        core_filters,
+        server_config,
+    ) {
         logger.error(&format!("server error: {e}"));
         std::process::exit(1);
     }
@@ -844,6 +863,64 @@ fn configured_pipeline_has(conf: &SwiftConfig, name: &str) -> bool {
         .unwrap_or_else(|| DEFAULT_CONFIGURED_FILTERS.contains(&name))
 }
 
+/// Core filters are present by default, but an explicit pipeline line is
+/// authoritative. This is required by Python Swift's `InternalClient`, whose
+/// private pipeline intentionally excludes gatekeeper.
+fn core_pipeline_filters_from_conf(conf: &SwiftConfig) -> CorePipelineFilters {
+    let Some(line) = conf
+        .get("pipeline:main", "pipeline")
+        .ok()
+        .flatten()
+        .filter(|line| !line.trim().is_empty())
+    else {
+        return CorePipelineFilters::default();
+    };
+    let names: Vec<String> = line
+        .split_whitespace()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    let has = |aliases: &[&str]| {
+        names
+            .iter()
+            .any(|name| aliases.iter().any(|alias| name == alias))
+    };
+    CorePipelineFilters {
+        catch_errors: has(&["catch_errors", "catch-errors"]),
+        gatekeeper: has(&["gatekeeper"]),
+        healthcheck: has(&["healthcheck", "health_check", "health-check"]),
+    }
+}
+
+fn internal_client_mode_from_conf(conf: &SwiftConfig) -> bool {
+    conf.get("app:proxy-server", "internal_client_mode")
+        .ok()
+        .flatten()
+        .or_else(|| conf.get("DEFAULT", "internal_client_mode").ok().flatten())
+        .is_some_and(|value| config_true_value(value.trim()))
+}
+
+/// A socket-based InternalClient adapter is safe only on loopback. Refuse to
+/// start if an operator accidentally exposes a gatekeeper-free pipeline on a
+/// routable address, even when `internal_client_mode` was copied into config.
+fn validate_core_pipeline_listener(
+    core: CorePipelineFilters,
+    internal_client_mode: bool,
+    addr: std::net::SocketAddr,
+) -> Result<(), String> {
+    if core.gatekeeper {
+        return Ok(());
+    }
+    if !internal_client_mode {
+        return Err("gatekeeper-free pipeline requires internal_client_mode = true".to_string());
+    }
+    if !addr.ip().is_loopback() {
+        return Err(format!(
+            "gatekeeper-free internal client must bind loopback, got {addr}"
+        ));
+    }
+    Ok(())
+}
+
 /// Number of OS processes for prefork worker model.
 /// Prefer `[app:proxy-server] process_workers`; if `worker_model = process`
 /// then numeric `workers` is treated as process count (threads use
@@ -1071,7 +1148,20 @@ fn build_versioned_writes(conf: &SwiftConfig) -> swift_middleware::VersionedWrit
                 .ok()
                 .flatten()
         });
-    swift_middleware::VersionedWrites::from_conf(allow.as_deref()).with_authorization_probe(true)
+    let allow_object_versioning = conf
+        .get("filter:versioned_writes", "allow_object_versioning")
+        .ok()
+        .flatten()
+        .or_else(|| {
+            conf.get("filter:versioned-writes", "allow_object_versioning")
+                .ok()
+                .flatten()
+        })
+        .map(|value| config_true_value(&value))
+        .unwrap_or(false);
+    swift_middleware::VersionedWrites::from_conf(allow.as_deref())
+        .with_object_versioning(allow_object_versioning)
+        .with_authorization_probe(true)
 }
 
 fn build_symlink(conf: &SwiftConfig) -> Result<swift_middleware::Symlink, String> {
@@ -2499,18 +2589,7 @@ fn build_info_json(
         });
         // Python versioned_writes filter_factory: register_swift_info(
         // 'object_versioning') when allow_object_versioning is true.
-        let allow_ov = conf
-            .get("filter:versioned_writes", "allow_object_versioning")
-            .ok()
-            .flatten()
-            .or_else(|| {
-                conf.get("filter:versioned-writes", "allow_object_versioning")
-                    .ok()
-                    .flatten()
-            })
-            .map(|v| config_true_value(&v))
-            .unwrap_or(false);
-        if allow_ov {
+        if vw.allow_object_versioning {
             info["object_versioning"] = serde_json::json!({});
         }
     }
@@ -3139,9 +3218,7 @@ fn build_s3api(conf: &SwiftConfig) -> Result<Option<swift_s3api::S3Api>, String>
         .transpose()?
         .unwrap_or(false);
     if cold_delete_hot_after_archive && !cold_backend_configured {
-        return Err(
-            "cold_delete_hot_after_archive requires a configured cold_backend_root".into(),
-        );
+        return Err("cold_delete_hot_after_archive requires a configured cold_backend_root".into());
     }
     if cold_delete_hot_after_archive && !cold_backend_shared {
         return Err(
@@ -3245,6 +3322,63 @@ mod startup_policy_tests {
         )
         .unwrap();
         assert_eq!(resolve_swift_dir(&conf), "/opt/saio/swift");
+    }
+
+    #[test]
+    fn internal_client_pipeline_can_omit_gatekeeper_only_on_loopback() {
+        let conf = SwiftConfig::parse_lenient(
+            "[DEFAULT]\ninternal_client_mode = true\n\
+             [pipeline:main]\n\
+             pipeline = catch_errors proxy-logging cache symlink proxy-server\n\
+             [app:proxy-server]\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        let core = core_pipeline_filters_from_conf(&conf);
+        assert_eq!(
+            core,
+            CorePipelineFilters {
+                catch_errors: true,
+                gatekeeper: false,
+                healthcheck: false,
+            }
+        );
+        assert!(internal_client_mode_from_conf(&conf));
+        assert!(
+            validate_core_pipeline_listener(core, true, "127.0.0.1:18082".parse().unwrap(),)
+                .is_ok()
+        );
+        assert!(
+            validate_core_pipeline_listener(core, false, "127.0.0.1:18082".parse().unwrap(),)
+                .unwrap_err()
+                .contains("internal_client_mode")
+        );
+        assert!(
+            validate_core_pipeline_listener(core, true, "0.0.0.0:18082".parse().unwrap(),)
+                .unwrap_err()
+                .contains("loopback")
+        );
+    }
+
+    #[test]
+    fn public_and_implicit_pipelines_keep_gatekeeper() {
+        let public = SwiftConfig::parse_lenient(
+            "[pipeline:main]\n\
+             pipeline = catch_errors gatekeeper healthcheck proxy-server\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            core_pipeline_filters_from_conf(&public),
+            CorePipelineFilters::default()
+        );
+        let implicit = SwiftConfig::parse_lenient("[app:proxy-server]\n", &[], false).unwrap();
+        assert_eq!(
+            core_pipeline_filters_from_conf(&implicit),
+            CorePipelineFilters::default()
+        );
     }
 
     fn no_tempurl_keys() -> Arc<dyn swift_middleware::KeyProvider> {
@@ -5100,7 +5234,11 @@ mod startup_policy_tests {
             notes.iter().any(|n| n == "account_freeze enabled"),
             "{notes:?}"
         );
-        assert_eq!(filters.len(), 2, "copy + last-extra freeze; notes={notes:?}");
+        assert_eq!(
+            filters.len(),
+            2,
+            "copy + last-extra freeze; notes={notes:?}"
+        );
         assert!(!pipeline_start_rejects(&good, &issues));
         let denied = run_extra_filters(filters.clone(), "PUT", "/v1/AUTH_test/c/o");
         assert_eq!(denied.status, 403);

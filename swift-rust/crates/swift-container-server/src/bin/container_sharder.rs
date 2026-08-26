@@ -37,11 +37,41 @@ fn parse_conf_file(path: &str) -> SwiftConfig {
     })
 }
 
-fn main() {
-    let conf_path = std::env::args()
-        .nth(1)
+fn parse_cli_args() -> (String, bool, bool, Vec<String>) {
+    let args: Vec<String> = std::env::args().collect();
+    let conf_path = args
+        .get(1)
+        .cloned()
         .unwrap_or_else(|| "/etc/swift/container-server.conf".to_string());
-    let run_once_only = std::env::args().nth(2).as_deref() == Some("once");
+    let rest = if args.len() > 2 { &args[2..] } else { &[] };
+    let run_once_only = rest.iter().any(|a| a == "once" || a == "--once");
+    let no_auto_shard = rest.iter().any(|a| a == "--no-auto-shard");
+    let mut partitions = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        if let Some(v) = rest[i].strip_prefix("--partitions=") {
+            partitions.extend(
+                v.split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
+            );
+        } else if rest[i] == "--partitions" || rest[i] == "-p" {
+            if let Some(v) = rest.get(i + 1) {
+                partitions.extend(
+                    v.split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string()),
+                );
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    (conf_path, run_once_only, no_auto_shard, partitions)
+}
+
+fn main() {
+    let (conf_path, run_once_only, no_auto_shard, partitions) = parse_cli_args();
     let conf = parse_conf_file(&conf_path);
     let get = |section: &str, key: &str, default: &str| -> String {
         conf.get(section, key)
@@ -58,24 +88,46 @@ fn main() {
     let cleave_batch_size: usize = get("container-sharder", "cleave_batch_size", "2")
         .parse()
         .unwrap_or(2);
-    let auto_shard = matches!(
-        get("container-sharder", "auto_shard", "false")
-            .to_lowercase()
-            .as_str(),
-        "true" | "1" | "yes" | "on" | "t" | "y"
-    );
-    let auto_shrink = matches!(
-        get("container-sharder", "auto_shrink", "false")
-            .to_lowercase()
-            .as_str(),
-        "true" | "1" | "yes" | "on" | "t" | "y"
-    );
+    let auto_shard = if no_auto_shard {
+        false
+    } else {
+        matches!(
+            get("container-sharder", "auto_shard", "false")
+                .to_lowercase()
+                .as_str(),
+            "true" | "1" | "yes" | "on" | "t" | "y"
+        )
+    };
+    // Python `_find_and_enable_shrinking_candidates` runs on a SHARDED root
+    // when `auto_shard` and the node is leader — there is no separate
+    // auto_shrink gate. G6 probe test_shrinking L2001 expects the donor
+    // range to disappear after sharders.once(); an explicit auto_shrink=false
+    // still wins.
+    let auto_shrink_raw = get("container-sharder", "auto_shrink", "");
+    let auto_shrink = if auto_shrink_raw.is_empty() {
+        auto_shard
+    } else {
+        matches!(
+            auto_shrink_raw.to_lowercase().as_str(),
+            "true" | "1" | "yes" | "on" | "t" | "y"
+        )
+    };
     let shard_size: i64 = get("container-sharder", "shard_container_threshold", "1000000")
         .parse()
         .unwrap_or(1_000_000);
-    let minimum_shard_size: i64 = get("container-sharder", "minimum_shard_size", "100000")
+    // Python: rows_per_shard default threshold//2; minimum_shard_size default
+    // rows_per_shard//5. A hardcoded 100000 minimum made G6 probe (threshold
+    // 100, 100 objects) find 0 ranges (2 != 0).
+    let rows_per_shard: i64 = get("container-sharder", "rows_per_shard", "")
         .parse()
-        .unwrap_or(100_000);
+        .ok()
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| (shard_size / 2).max(1));
+    let minimum_shard_size: i64 = get("container-sharder", "minimum_shard_size", "")
+        .parse()
+        .ok()
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| (rows_per_shard / 5).max(1));
     let log_name = get("container-sharder", "log_name", "container-sharder");
     let log_level = get("container-sharder", "log_level", "INFO")
         .parse::<LogLevel>()
@@ -105,7 +157,9 @@ fn main() {
         auto_shard,
         auto_shrink,
         shard_size,
+        rows_per_shard,
         minimum_shard_size,
+        partitions,
     };
     let swift_dir = std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string());
     let ring_path = format!("{swift_dir}/container.ring.gz");
@@ -135,7 +189,8 @@ fn main() {
         "swift-container-sharder: devices={devices} interval={interval}s \
          cleave_batch_size={cleave_batch_size} auto_shard={auto_shard} \
          auto_shrink={auto_shrink} \
-         shard_size={shard_size} once={run_once_only} mode={mode} \
+         shard_size={shard_size} rows_per_shard={rows_per_shard} \
+         minimum_shard_size={minimum_shard_size} once={run_once_only} mode={mode} \
          (no Contabo KEEP claim without live quorum evidence)"
     ));
     loop {

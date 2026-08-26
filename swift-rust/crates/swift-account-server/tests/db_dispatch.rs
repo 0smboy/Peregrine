@@ -196,3 +196,59 @@ async fn hyper_health_get_while_account_shard_parked() {
     shutdown.store(true, Ordering::SeqCst);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handle_async_replicate_uses_hash_db_not_account_name() {
+    let dir = tmpdir();
+    let server = AccountServer::new(cfg(dir.clone()));
+    assert_eq!(server.handle_async(put_account("AUTH_test")).await.status, 201);
+    let probe = Request {
+        method: "PUT".into(),
+        path: "/sda1/0/AUTH_test".into(),
+        query_string: String::new(),
+        headers: HeaderKeyDict::new(),
+        body: swift_http::Body::empty(),
+    };
+    let db_file = server.db_file_for_request(&probe).unwrap();
+    let hsh = db_file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .expect("hash.db stem")
+        .to_string();
+    let rpc_path = format!("/sda1/0/{hsh}");
+    let via_helper = server
+        .replicate_db_file_for_request(&Request {
+            method: "REPLICATE".into(),
+            path: rpc_path.clone(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        })
+        .unwrap();
+    assert_eq!(via_helper, db_file);
+    let body = serde_json::json!([
+        "sync",
+        -1,
+        "hash",
+        "peer-id",
+        "3286000000.00000",
+        "3286000000.00000",
+        "0",
+        "{}"
+    ]);
+    let resp = server
+        .handle_async(AsyncRequest {
+            method: "REPLICATE".into(),
+            path: rpc_path,
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: IncomingBody::from_bytes(body.to_string().into_bytes(), u64::MAX),
+        })
+        .await;
+    assert_eq!(
+        resp.status, 200,
+        "account REPLICATE sync over handle_async got {}",
+        resp.status
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

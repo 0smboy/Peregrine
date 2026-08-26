@@ -23,13 +23,517 @@
 //! Deferred: the daemon loop (partition scan + ring-based peer
 //! discovery) and outgoing-sync bookkeeping.
 
+use std::cmp::Ordering;
 use std::io::{Read, Write};
 
-use crate::container::DbValue;
-use crate::{py_json_parse_metadata, AccountBroker, ContainerBroker, DbError};
+use crate::container::{DbState, DbValue, GetShardRangesArgs};
+use crate::shard_state;
+use crate::{py_json_parse_metadata, AccountBroker, ContainerBroker, DbError, ShardRange};
+use swift_core::config::SwiftConfig;
+use swift_core::hashing::HashPathConfig;
+use swift_core::timestamp::Timestamp;
+use swift_ring::{Ring, RingData, RingDevice};
 
 const PER_DIFF: i64 = 1000;
 const MAX_DIFFS: i64 = 100;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContainerPolicyInfo {
+    put_timestamp: Timestamp,
+    delete_timestamp: Timestamp,
+    status_changed_at: Timestamp,
+    count: i64,
+    storage_policy_index: i64,
+}
+
+impl ContainerPolicyInfo {
+    fn is_deleted(self) -> bool {
+        self.delete_timestamp > self.put_timestamp && self.count == 0
+    }
+
+    fn has_been_recreated(self) -> bool {
+        self.put_timestamp > self.delete_timestamp && self.delete_timestamp > Timestamp::zero()
+    }
+}
+
+fn ordering_i8(ordering: Ordering) -> i8 {
+    match ordering {
+        Ordering::Less => -1,
+        Ordering::Equal => 0,
+        Ordering::Greater => 1,
+    }
+}
+
+/// Exact port of `swift.container.reconciler.cmp_policy_info`.
+///
+/// A positive result means `local` is less authoritative than `remote`.
+/// Ordinary live containers choose the oldest `status_changed_at`; deleted
+/// containers choose the newest, while a genuine recreation takes precedence
+/// over either rule.
+fn cmp_policy_info(local: ContainerPolicyInfo, remote: ContainerPolicyInfo) -> i8 {
+    let local_deleted = local.is_deleted();
+    let remote_deleted = remote.is_deleted();
+    if local_deleted || remote_deleted {
+        if !local_deleted {
+            return -1;
+        }
+        if !remote_deleted {
+            return 1;
+        }
+        return ordering_i8(remote.status_changed_at.cmp(&local.status_changed_at));
+    }
+
+    let local_recreated = local.has_been_recreated();
+    let remote_recreated = remote.has_been_recreated();
+    if local_recreated || remote_recreated {
+        if !local_recreated {
+            return 1;
+        }
+        if !remote_recreated {
+            return -1;
+        }
+        let most_recent_delete = local.delete_timestamp.max(remote.delete_timestamp);
+        if local.put_timestamp < most_recent_delete {
+            return 1;
+        }
+        if remote.put_timestamp < most_recent_delete {
+            return -1;
+        }
+    }
+
+    ordering_i8(local.status_changed_at.cmp(&remote.status_changed_at))
+}
+
+fn db_value_timestamp(info: &[(String, DbValue)], key: &str) -> Option<Timestamp> {
+    info.iter().find(|(k, _)| k == key).and_then(|(_, value)| {
+        let raw = value_str(value);
+        raw.parse().ok()
+    })
+}
+
+fn db_value_i64(info: &[(String, DbValue)], key: &str) -> Option<i64> {
+    info.iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, value)| match value {
+            DbValue::Int(value) => Some(*value),
+            DbValue::Text(value) => value.parse().ok(),
+            DbValue::Null => None,
+        })
+}
+
+fn json_i64(value: &serde_json::Value) -> Option<i64> {
+    value.as_i64().or_else(|| value.as_str()?.parse().ok())
+}
+
+fn local_policy_info(info: &[(String, DbValue)]) -> Option<ContainerPolicyInfo> {
+    Some(ContainerPolicyInfo {
+        put_timestamp: db_value_timestamp(info, "put_timestamp")?,
+        delete_timestamp: db_value_timestamp(info, "delete_timestamp")?,
+        status_changed_at: db_value_timestamp(info, "status_changed_at")?,
+        count: db_value_i64(info, "count").or_else(|| db_value_i64(info, "object_count"))?,
+        storage_policy_index: db_value_i64(info, "storage_policy_index")?,
+    })
+}
+
+fn remote_policy_info(info: &serde_json::Value) -> Option<ContainerPolicyInfo> {
+    Some(ContainerPolicyInfo {
+        put_timestamp: info.get("put_timestamp")?.as_str()?.parse().ok()?,
+        delete_timestamp: info.get("delete_timestamp")?.as_str()?.parse().ok()?,
+        status_changed_at: info.get("status_changed_at")?.as_str()?.parse().ok()?,
+        count: info
+            .get("count")
+            .and_then(json_i64)
+            .or_else(|| info.get("object_count").and_then(json_i64))?,
+        storage_policy_index: json_i64(info.get("storage_policy_index")?)?,
+    })
+}
+
+/// Return true when Python Swift's container policy reconciliation rules say
+/// the local broker must adopt the peer's storage policy.
+///
+/// Missing extension fields deliberately return false so mixed-version peers
+/// retain the pre-extension behavior instead of guessing a policy.
+pub fn incorrect_policy_index(
+    local_info: &[(String, DbValue)],
+    remote_info: &serde_json::Value,
+) -> bool {
+    let Some(local) = local_policy_info(local_info) else {
+        return false;
+    };
+    let Some(remote) = remote_policy_info(remote_info) else {
+        return false;
+    };
+    local.storage_policy_index != remote.storage_policy_index && cmp_policy_info(local, remote) > 0
+}
+
+/// If we have no live objects left (tombstones/empty) but the peer still
+/// lists some, and it already claims to be at our max_row, restart usync
+/// from -1 so DELETE rows are pushed (probe L1435).
+///
+/// Do **not** treat any count mismatch as diverge: during nested cleave
+/// (L1256) replicas intentionally differ (150 vs 50). `!=` on listing-w94
+/// full-usynced an uncleaved donor and dropped obj-0000–0049 at L1321.
+pub fn usync_start_point(
+    point: i64,
+    local_max_row: i64,
+    local_count: i64,
+    remote_count: i64,
+) -> i64 {
+    if local_count == 0 && remote_count > 0 && point >= local_max_row {
+        -1
+    } else {
+        point
+    }
+}
+
+/// Tombstone rows must win over live rows on the peer. Bump `created_at`
+/// to now so merge_items cannot keep leftover objects (probe L1435).
+fn usync_created_at(rec: &crate::ObjectRecord) -> String {
+    if rec.deleted != 1 {
+        return rec.created_at.clone();
+    }
+    let now = Timestamp::now().internal();
+    if rec.created_at.as_str() >= now.as_str() {
+        rec.created_at.clone()
+    } else {
+        now
+    }
+}
+
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            b => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn broker_account_container(local: &mut ContainerBroker) -> Option<(String, String)> {
+    let info = local.get_info().ok()?;
+    let get = |k: &str| -> Option<String> {
+        info.iter()
+            .find(|(key, _)| key == k)
+            .and_then(|(_, v)| match v {
+                DbValue::Text(s) if !s.is_empty() => Some(s.clone()),
+                _ => None,
+            })
+    };
+    Some((get("account")?, get("container")?))
+}
+
+fn fetch_peer_object_names(
+    host: &str,
+    device: &str,
+    partition: &str,
+    account: &str,
+    container: &str,
+) -> Result<Vec<String>, DbError> {
+    let mut conn = std::net::TcpStream::connect(host)
+        .map_err(|e| DbError::Connection(format!("connect {host}: {e}")))?;
+    conn.set_nodelay(true).ok();
+    conn.set_read_timeout(Some(std::time::Duration::from_secs(15)))
+        .ok();
+    let path = format!(
+        "/{}/{}/{}/{}?format=json",
+        url_encode(device),
+        url_encode(partition),
+        url_encode(account),
+        url_encode(container)
+    );
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nX-Backend-Allow-Reserved-Names: true\r\nConnection: close\r\n\r\n"
+    );
+    conn.write_all(req.as_bytes())
+        .map_err(|e| DbError::Connection(format!("write {host}: {e}")))?;
+    let mut raw = Vec::new();
+    conn.read_to_end(&mut raw)
+        .map_err(|e| DbError::Connection(format!("read {host}: {e}")))?;
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| DbError::Connection("bad listing response".into()))?;
+    let status: u16 = String::from_utf8_lossy(&raw[..split])
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if !(200..300).contains(&status) {
+        return Err(DbError::Connection(format!("peer listing status {status}")));
+    }
+    let val: serde_json::Value = serde_json::from_slice(&raw[split + 4..])
+        .map_err(|e| DbError::Connection(e.to_string()))?;
+    let mut names = Vec::new();
+    if let Some(arr) = val.as_array() {
+        for obj in arr {
+            if let Some(n) = obj.get("name").and_then(|v| v.as_str()) {
+                if !n.is_empty() {
+                    names.push(n.to_string());
+                }
+            }
+        }
+    }
+    Ok(names)
+}
+
+fn url_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (
+                (b[i + 1] as char).to_digit(16),
+                (b[i + 2] as char).to_digit(16),
+            ) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn object_namespace(local: &mut ContainerBroker) -> Option<(String, String)> {
+    let md = local.metadata().ok()?;
+    let get = |k: &str| -> Option<String> {
+        md.iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(k))
+            .map(|(_, (v, _))| v.clone())
+            .filter(|v| !v.is_empty())
+    };
+    let root = get("X-Container-Sysmeta-Shard-Quoted-Root")
+        .map(|s| url_decode(&s))
+        .or_else(|| get("X-Container-Sysmeta-Shard-Root"));
+    if let Some(rp) = root {
+        if let Some((a, c)) = rp.split_once('/') {
+            if !a.is_empty() && !c.is_empty() {
+                return Some((a.to_string(), c.to_string()));
+            }
+        }
+    }
+    broker_account_container(local)
+}
+
+fn load_object_ring() -> Option<Ring> {
+    let swift_dir = std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string());
+    let swift_conf =
+        std::env::var("SWIFT_CONF").unwrap_or_else(|_| format!("{swift_dir}/swift.conf"));
+    let text = std::fs::read_to_string(swift_conf).ok()?;
+    let conf = SwiftConfig::parse_lenient(&text, &[], false).ok()?;
+    let hash = HashPathConfig::from_swift_conf(&conf).ok()?;
+    let ring_path = format!("{swift_dir}/object.ring.gz");
+    let data = RingData::load(std::path::Path::new(&ring_path)).ok()?;
+    Some(Ring::new(data, hash))
+}
+
+fn head_object_status(
+    dev: &RingDevice,
+    part: u32,
+    account: &str,
+    container: &str,
+    name: &str,
+) -> Option<u16> {
+    let host = format!("{}:{}", dev.ip, dev.port);
+    let mut conn = std::net::TcpStream::connect(&host).ok()?;
+    conn.set_nodelay(true).ok();
+    conn.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .ok();
+    let path = format!(
+        "/{}/{}/{}/{}/{}",
+        url_encode(&dev.device),
+        part,
+        url_encode(account),
+        url_encode(container),
+        url_encode(name)
+    );
+    let req = format!(
+        "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nX-Backend-Storage-Policy-Index: 0\r\nConnection: close\r\n\r\n"
+    );
+    conn.write_all(req.as_bytes()).ok()?;
+    let mut raw = Vec::new();
+    conn.read_to_end(&mut raw).ok()?;
+    let status: u16 = String::from_utf8_lossy(&raw)
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())?;
+    Some(status)
+}
+
+/// `Some(true)` = every object replica 404/410; `Some(false)` = at least one
+/// 2xx; `None` = could not tell (leave the name alone).
+fn object_is_gone(ring: &Ring, account: &str, container: &str, name: &str) -> Option<bool> {
+    let (part, nodes) = ring.get_nodes(account, Some(container), Some(name)).ok()?;
+    if nodes.is_empty() {
+        return None;
+    }
+    let mut saw_404 = false;
+    let mut saw_err = false;
+    for n in nodes {
+        match head_object_status(n.dev, part, account, container, name) {
+            Some(s) if (200..300).contains(&s) => return Some(false),
+            Some(404) | Some(410) => saw_404 = true,
+            _ => saw_err = true,
+        }
+    }
+    if saw_404 && !saw_err {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// After merging the peer's shard ranges: only a settled ACTIVE unsharded
+/// shard may synthesize tombstones. `own_state=None` is not enough —
+/// listing-w105 treated L1256 CREATED children (no own row yet) as leftover
+/// and dropped alpha+beta at L1369. Do **not** default a missing own range
+/// to ACTIVE (listing-w100).
+pub(crate) fn synthetic_tombstones_allowed(
+    db_state: Option<DbState>,
+    own_state: Option<i64>,
+    own_deleted: Option<i64>,
+    mid_cleave: bool,
+    from_handoff: bool,
+) -> bool {
+    if !matches!(db_state, Some(DbState::Unsharded)) {
+        return false;
+    }
+    if mid_cleave {
+        return false;
+    }
+    match (own_state, own_deleted) {
+        (Some(shard_state::ACTIVE), Some(0)) => true,
+        // listing-w108: empty handoff vs leftover primary (own=None even
+        // after merging the peer's ranges). Do not allow own=None on a
+        // primary — that tombstoned L1256 CREATED children (listing-w105).
+        (None, None) if from_handoff => true,
+        _ => false,
+    }
+}
+
+fn shard_ranges_mid_cleave(local: &mut ContainerBroker) -> bool {
+    let args = GetShardRangesArgs {
+        include_own: true,
+        include_deleted: false,
+        ..Default::default()
+    };
+    match local.get_shard_ranges(&args) {
+        Ok(rows) => rows.iter().any(|sr| {
+            sr.state == shard_state::CREATED
+                || sr.state == shard_state::CLEAVED
+                || sr.state == shard_state::SHARDING
+        }),
+        Err(_) => true,
+    }
+}
+
+/// listing-w99: empty local replica vs leftover live rows on the peer.
+/// Only for settled unsharded shards (post nested-complete / L1426).
+fn push_synthetic_tombstones(
+    local: &mut ContainerBroker,
+    local_id: &str,
+    peer_host: &str,
+    peer_device: &str,
+    partition: &str,
+    hsh: &str,
+    from_handoff: bool,
+) -> Result<u64, DbError> {
+    // Pull the peer's shard-range table first. listing-w104's empty replica
+    // had own=None; the peer that still lists objects already knows the
+    // range. After merge: CREATED/CLEAVED at L1256 → skip; ACTIVE at L1426
+    // → synthesize.
+    let _ = fetch_and_merge_remote_shard_ranges(local, peer_host, peer_device, partition, hsh);
+    let db_state = local.get_db_state().ok();
+    let own = local.get_own_shard_range(true).ok().flatten();
+    let own_state = own.as_ref().map(|sr| sr.state);
+    let own_del = own.as_ref().map(|sr| sr.deleted);
+    let mid_cleave = shard_ranges_mid_cleave(local);
+    if !synthetic_tombstones_allowed(db_state, own_state, own_del, mid_cleave, from_handoff) {
+        eprintln!(
+            "db-replicator: skip synthetic hsh={hsh} db_state={db_state:?} own_state={own_state:?} own_deleted={own_del:?} mid_cleave={mid_cleave} handoff={from_handoff}"
+        );
+        return Ok(0);
+    }
+    let Some((account, container)) = broker_account_container(local) else {
+        eprintln!("db-replicator: skip synthetic hsh={hsh} no account/container");
+        return Ok(0);
+    };
+    let names = fetch_peer_object_names(peer_host, peer_device, partition, &account, &container)?;
+    if names.is_empty() {
+        return Ok(0);
+    }
+    // L1256 vs L1426 have the same empty-handoff/lagging-primary shape.
+    // Only tombstone names that are already gone from object storage
+    // (user DELETE completed). Cleaved objects still on disk must live.
+    let (obj_acct, obj_cont) =
+        object_namespace(local).unwrap_or_else(|| (account.clone(), container.clone()));
+    let Some(ring) = load_object_ring() else {
+        eprintln!("db-replicator: skip synthetic hsh={hsh} no object ring");
+        return Ok(0);
+    };
+    let gone: Vec<String> = names
+        .iter()
+        .filter(|n| object_is_gone(&ring, &obj_acct, &obj_cont, n) == Some(true))
+        .cloned()
+        .collect();
+    if gone.is_empty() {
+        eprintln!(
+            "db-replicator: skip synthetic hsh={hsh} n={} objects still live account={obj_acct} container={obj_cont}",
+            names.len()
+        );
+        return Ok(0);
+    }
+    eprintln!(
+        "db-replicator: synthetic gone hsh={hsh} gone={} listed={} account={obj_acct} container={obj_cont}",
+        gone.len(),
+        names.len()
+    );
+    let names = gone;
+    let now = Timestamp::now().internal();
+    let json_items: Vec<serde_json::Value> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            serde_json::json!({
+                "ROWID": i as i64 + 1,
+                "name": name,
+                "created_at": now,
+                "size": 0,
+                "content_type": "application/deleted",
+                "etag": "noetag",
+                "deleted": 1,
+                "storage_policy_index": 0,
+            })
+        })
+        .collect();
+    eprintln!(
+        "db-replicator: synthetic tombstones hsh={hsh} n={} account={account} container={container}",
+        json_items.len()
+    );
+    let body = serde_json::json!(["merge_items", json_items, local_id]);
+    let (status, _) = replicate_rpc(
+        peer_host,
+        peer_device,
+        partition,
+        hsh,
+        body.to_string().as_bytes(),
+    )?;
+    if status != 202 {
+        return Err(DbError::Connection(format!(
+            "synthetic merge_items status {status}"
+        )));
+    }
+    Ok(json_items.len() as u64)
+}
 
 /// Outcome of a replication pass.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,9 +570,10 @@ pub trait RsyncTransport {
         peer_device: &str,
         stage_name: &str,
     ) -> bool;
-    /// POST the completion RPC `[op, stage_name, ...]` telling the peer to
-    /// adopt (`complete_rsync`) or merge (`rsync_then_merge`) the staged
-    /// DB (db_replicator.py:409-412). Returns success.
+    /// POST the completion RPC `[op, stage_name, dest_db_name]` telling the
+    /// peer to adopt (`complete_rsync`) or merge (`rsync_then_merge`) the
+    /// staged DB (db_replicator.py:409-412). `dest_db_name` is Python
+    /// `os.path.basename(broker.db_file)` and must keep any epoch suffix.
     fn complete(
         &self,
         peer_host: &str,
@@ -77,7 +582,18 @@ pub trait RsyncTransport {
         hsh: &str,
         op: &str,
         stage_name: &str,
+        dest_db_name: &str,
     ) -> bool;
+}
+
+/// Python `os.path.basename(broker.db_file)` for the complete_rsync third
+/// argument. Epoch-suffixed DBs must keep the suffix so a SHARDED replica
+/// does not recreate an unsuffixed retiring file (probe L1347/L1375).
+pub fn rsync_dest_db_name(local_db: &std::path::Path, hsh: &str) -> String {
+    match local_db.file_name().and_then(|s| s.to_str()) {
+        Some(name) if name.ends_with(".db") => name.to_string(),
+        _ => format!("{hsh}.db"),
+    }
 }
 
 /// `_rsync_db` (db_replicator.py:379-412): stage the whole local DB file
@@ -104,15 +620,25 @@ pub fn rsync_db(
     if !transport.rsync(local_db, peer_host, peer_device, local_id) {
         return false;
     }
-    transport.complete(peer_host, peer_device, partition, hsh, op, local_id)
+    // Python `_rsync_db` dest is `os.path.basename(broker.db_file)`. An
+    // epoch-suffixed source must complete onto `hash_<epoch>.db` so
+    // shrink-to-root objects land in the live SHARDED file (probe L2088).
+    // Staging an epoch file under `<hsh>.db` resurrects retiring (L1347).
+    let dest = rsync_dest_db_name(local_db, hsh);
+    transport.complete(peer_host, peer_device, partition, hsh, op, local_id, &dest)
+}
+
+/// True when `local_db` is an epoch-suffixed file (`<hash>_<epoch>.db`).
+/// Full-file rsync dest is always `<hsh>.db`; staging an epoch file under
+/// that name resurrects the retiring DB next to the peer's epoch file.
+pub fn rsync_would_recreate_retiring(local_db: &std::path::Path) -> bool {
+    crate::parse_db_filename(local_db).1.is_some()
 }
 
 /// The completion RPC at the end of `_rsync_db` (db_replicator.py:409-412):
-/// POST `[op, stage_name, <hsh>.db]` to the peer's REPLICATE endpoint and
+/// POST `[op, stage_name, dest_db_name]` to the peer's REPLICATE endpoint and
 /// report success on any 2xx (Python's `200 <= response.status < 300`).
-/// Python sends `os.path.basename(broker.db_file)` as the third element;
-/// this replicator only stages plain `<hsh>.db` DBs, so the basename is
-/// derived from the URL hash.
+/// Python sends `os.path.basename(broker.db_file)` as the third element.
 pub fn replicate_completion_rpc(
     host: &str,
     device: &str,
@@ -120,8 +646,14 @@ pub fn replicate_completion_rpc(
     hsh: &str,
     op: &str,
     stage_name: &str,
+    dest_db_name: &str,
 ) -> Result<bool, DbError> {
-    let body = serde_json::json!([op, stage_name, format!("{hsh}.db")]);
+    let dest = if dest_db_name.is_empty() {
+        format!("{hsh}.db")
+    } else {
+        dest_db_name.to_string()
+    };
+    let body = serde_json::json!([op, stage_name, dest]);
     let (status, _) = replicate_rpc(host, device, partition, hsh, body.to_string().as_bytes())?;
     Ok((200..300).contains(&status))
 }
@@ -182,6 +714,28 @@ pub fn replicate_container_db(
     partition: &str,
     hsh: &str,
 ) -> Result<ReplicateOutcome, DbError> {
+    replicate_container_db_role(
+        local,
+        local_id,
+        peer_host,
+        peer_device,
+        partition,
+        hsh,
+        false,
+    )
+}
+
+/// Like [`replicate_container_db`], but `local_is_handoff` lets an empty
+/// handoff synthesize tombstones onto a leftover primary (probe L1435).
+pub fn replicate_container_db_role(
+    local: &mut ContainerBroker,
+    local_id: &str,
+    peer_host: &str,
+    peer_device: &str,
+    partition: &str,
+    hsh: &str,
+    local_is_handoff: bool,
+) -> Result<ReplicateOutcome, DbError> {
     let info = local.get_replication_info()?;
     let get = |k: &str| {
         info.iter()
@@ -190,19 +744,28 @@ pub fn replicate_container_db(
             .unwrap_or_default()
     };
     let local_max_row: i64 = get("max_row").parse().unwrap_or(-1);
+    let local_count: i64 = get("count").parse().unwrap_or(-1);
+    let local_policy_index: i64 = get("storage_policy_index").parse().unwrap_or(0);
+    let local_created_at = get("created_at");
+    let local_put_timestamp = get("put_timestamp");
+    let local_delete_timestamp = get("delete_timestamp");
     let metadata = get("metadata");
 
-    // sync RPC: [op, remote_sync(max_row), hash, id, created_at,
-    // put_timestamp, delete_timestamp, metadata]
+    // ContainerReplicator._gather_sync_args extends the base DB RPC with
+    // status_changed_at, count and storage_policy_index. Peers use those
+    // fields to converge a container created under conflicting policies.
     let sync_body = serde_json::json!([
         "sync",
         local_max_row,
         get("hash"),
         local_id,
-        get("created_at"),
-        get("put_timestamp"),
-        get("delete_timestamp"),
+        local_created_at,
+        local_put_timestamp,
+        local_delete_timestamp,
         metadata,
+        get("status_changed_at"),
+        local_count,
+        local_policy_index,
     ]);
     let (status, resp) = replicate_rpc(
         peer_host,
@@ -228,6 +791,32 @@ pub fn replicate_container_db(
     }
     let remote_info: serde_json::Value =
         serde_json::from_slice(&resp).map_err(|e| DbError::Connection(e.to_string()))?;
+
+    // ContainerReplicator._handle_sync_response: the more authoritative
+    // policy wins before timestamps and metadata are merged.
+    if incorrect_policy_index(&info, &remote_info) {
+        let remote_policy_index = remote_info
+            .get("storage_policy_index")
+            .and_then(json_i64)
+            .ok_or_else(|| DbError::Connection("peer omitted storage_policy_index".into()))?;
+        local.set_storage_policy_index(remote_policy_index, &Timestamp::now().internal())?;
+    }
+    if let (Some(remote_created_at), Some(remote_put_timestamp), Some(remote_delete_timestamp)) = (
+        remote_info.get("created_at").and_then(|v| v.as_str()),
+        remote_info.get("put_timestamp").and_then(|v| v.as_str()),
+        remote_info.get("delete_timestamp").and_then(|v| v.as_str()),
+    ) {
+        if remote_created_at != local_created_at
+            || remote_put_timestamp != local_put_timestamp
+            || remote_delete_timestamp != local_delete_timestamp
+        {
+            local.merge_timestamps(
+                remote_created_at,
+                remote_put_timestamp,
+                remote_delete_timestamp,
+            )?;
+        }
+    }
     // _handle_sync_response (db_replicator.py:561-564): a non-empty
     // `metadata` field in the peer's replication info is merged into the
     // local DB (timestamp-wins per key) before usyncing.
@@ -239,6 +828,74 @@ pub fn replicate_container_db(
     }
     // 'point' is how much of US the remote already has
     let mut point = remote_info["point"].as_i64().unwrap_or(-1);
+    let remote_count = remote_info
+        .get("count")
+        .and_then(|v| v.as_i64())
+        .or_else(|| remote_info.get("object_count").and_then(|v| v.as_i64()))
+        .unwrap_or(-1);
+    // Hash/point can claim in-sync while object_count still diverges
+    // (tombstones not applied on a lagging primary). Force a full usync
+    // so DELETE rows converge before sharders UPDATE_ROOT (probe L1435).
+    let new_point = usync_start_point(point, local_max_row, local_count, remote_count);
+    if new_point != point {
+        eprintln!(
+            "db-replicator: count diverge hsh={hsh} local_count={local_count} remote_count={remote_count} point={point}->{new_point}"
+        );
+    }
+    point = new_point;
+
+    // Python `_handle_sync_response`: pull remote shard ranges when
+    // `shard_max_row >= 0`. Also pull when the peer is already
+    // sharding/sharded (probe L2321: third replica must copy ranges, not
+    // object rows). Then push ours (`_sync_shard_ranges`).
+    let remote_state = remote_info
+        .get("db_state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let shard_max_row = remote_info
+        .get("shard_max_row")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
+    if shard_max_row >= 0 || remote_state == "sharding" || remote_state == "sharded" {
+        if let Err(e) =
+            fetch_and_merge_remote_shard_ranges(local, peer_host, peer_device, partition, hsh)
+        {
+            eprintln!("db-replicator: fetch shard ranges hsh={hsh} err={e}");
+        }
+        if let Err(e) =
+            sync_shard_ranges_to_peer(local, local_id, peer_host, peer_device, partition, hsh)
+        {
+            eprintln!("db-replicator: push shard ranges hsh={hsh} err={e}");
+        }
+    }
+
+    // Python `_choose_replication_mode`: if *this* broker can shard,
+    // refuse object rows and wait for cleaving (container/replicator.py:149).
+    // Probe `test_replication_to_sharding_container` L2242: usync from an
+    // unsharded replica must not merge rows into a SHARDING peer's fresh DB
+    // (`get_objects()` on the epoch file stays empty). Python's small-db
+    // path usyncs; aborting rsync_then_merge is not enough when
+    // `max_row < per_diff`.
+    if local.sharding_initiated().unwrap_or(false) {
+        eprintln!("db-replicator: skip object usync (local sharding) hsh={hsh}");
+        return Ok(ReplicateOutcome {
+            diffs: 0,
+            rows_pushed: 0,
+            point,
+            needs_rsync: false,
+            usync_incomplete: false,
+        });
+    }
+    if remote_state == "sharding" || remote_state == "sharded" {
+        eprintln!("db-replicator: skip object usync (remote {remote_state}) hsh={hsh}");
+        return Ok(ReplicateOutcome {
+            diffs: 0,
+            rows_pushed: 0,
+            point,
+            needs_rsync: false,
+            usync_incomplete: false,
+        });
+    }
 
     // _choose_replication_mode (db_replicator.py:571-591): when the peer
     // is not already in sync (its point does not cover our max_row,
@@ -275,7 +932,35 @@ pub fn replicate_container_db(
             break;
         }
         let items = local.get_items_since(point, PER_DIFF)?;
+        if diffs == 0 && local_count == 0 && remote_count > 0 {
+            let n_del = items.iter().filter(|(_, r)| r.deleted == 1).count();
+            eprintln!(
+                "db-replicator: tombstone usync hsh={hsh} n={} deleted={n_del} point={point}",
+                items.len()
+            );
+        }
         if items.is_empty() {
+            // listing-w99: local_count=0 but no tombstone rows (n=0).
+            // The leftover live objects sit on the peer. Only synthesize
+            // tombstones for a settled ACTIVE unsharded shard (L1426), never
+            // during nested cleave (L1256 CREATED/CLEAVED — that dropped
+            // obj-0000–0049).
+            if local_count == 0 && remote_count > 0 {
+                match push_synthetic_tombstones(
+                    local,
+                    local_id,
+                    peer_host,
+                    peer_device,
+                    partition,
+                    hsh,
+                    local_is_handoff,
+                ) {
+                    Ok(n) => rows_pushed += n,
+                    Err(e) => {
+                        eprintln!("db-replicator: synthetic tombstones failed hsh={hsh}: {e}")
+                    }
+                }
+            }
             break;
         }
         let json_items: Vec<serde_json::Value> = items
@@ -284,7 +969,7 @@ pub fn replicate_container_db(
                 serde_json::json!({
                     "ROWID": rowid,
                     "name": rec.name,
-                    "created_at": rec.created_at,
+                    "created_at": usync_created_at(rec),
                     "size": rec.size,
                     "content_type": rec.content_type,
                     "etag": rec.etag,
@@ -308,6 +993,9 @@ pub fn replicate_container_db(
         point = *items.last().map(|(r, _)| r).unwrap();
         diffs += 1;
     }
+    // Python ContainerReplicator._sync_shard_ranges: push every shard-range
+    // row each cycle (no shard sync-points yet).
+    let _ = sync_shard_ranges_to_peer(local, local_id, peer_host, peer_device, partition, hsh);
     Ok(ReplicateOutcome {
         diffs,
         rows_pushed,
@@ -315,6 +1003,67 @@ pub fn replicate_container_db(
         needs_rsync: false,
         usync_incomplete,
     })
+}
+
+fn fetch_and_merge_remote_shard_ranges(
+    local: &mut ContainerBroker,
+    peer_host: &str,
+    peer_device: &str,
+    partition: &str,
+    hsh: &str,
+) -> Result<(), DbError> {
+    let body = serde_json::json!(["get_shard_ranges"]);
+    let (status, resp) = replicate_rpc(
+        peer_host,
+        peer_device,
+        partition,
+        hsh,
+        body.to_string().as_bytes(),
+    )?;
+    if status != 200 {
+        return Ok(());
+    }
+    let arr: Vec<serde_json::Value> = serde_json::from_slice(&resp).unwrap_or_default();
+    let mut ranges = Vec::new();
+    for v in arr {
+        if let Some(sr) = ShardRange::from_json(&v) {
+            ranges.push(sr);
+        }
+    }
+    if !ranges.is_empty() {
+        local.merge_shard_ranges(ranges)?;
+    }
+    Ok(())
+}
+
+/// `merge_shard_ranges` RPC: send this DB's shard-range table to the peer.
+pub fn sync_shard_ranges_to_peer(
+    local: &mut ContainerBroker,
+    local_id: &str,
+    peer_host: &str,
+    peer_device: &str,
+    partition: &str,
+    hsh: &str,
+) -> Result<(), DbError> {
+    let ranges = local.get_all_shard_range_data()?;
+    if ranges.is_empty() {
+        return Ok(());
+    }
+    let json_ranges: Vec<serde_json::Value> = ranges.iter().map(|r| r.to_json()).collect();
+    let body = serde_json::json!(["merge_shard_ranges", json_ranges, local_id]);
+    let (status, _) = replicate_rpc(
+        peer_host,
+        peer_device,
+        partition,
+        hsh,
+        body.to_string().as_bytes(),
+    )?;
+    if status != 202 && status != 200 {
+        return Err(DbError::Connection(format!(
+            "merge_shard_ranges status {status}"
+        )));
+    }
+    Ok(())
 }
 
 /// A pickle stat value (`object_count`/`bytes_used`) as a JSON scalar for the
@@ -465,7 +1214,7 @@ pub fn replicate_account_db(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     struct FakeRsync {
         /// (peer host, stage name) of every staging attempt.
@@ -490,6 +1239,7 @@ mod tests {
             _h: &str,
             op: &str,
             stage: &str,
+            _dest: &str,
         ) -> bool {
             self.completed
                 .lock()
@@ -501,9 +1251,17 @@ mod tests {
 
     /// A one-shot fake peer: accepts one REPLICATE connection, reads the
     /// full request, then answers 200 with `body` and closes.
-    fn spawn_fake_peer(body: String) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+    fn spawn_recording_fake_peer(
+        body: String,
+    ) -> (
+        std::net::SocketAddr,
+        std::thread::JoinHandle<()>,
+        Arc<Mutex<Vec<u8>>>,
+    ) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let request = Arc::new(Mutex::new(Vec::new()));
+        let captured = request.clone();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut buf = Vec::new();
@@ -534,13 +1292,114 @@ mod tests {
                 }
                 buf.extend_from_slice(&tmp[..n]);
             }
+            *captured.lock().unwrap() = buf;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             stream.write_all(resp.as_bytes()).unwrap();
         });
+        (addr, handle, request)
+    }
+
+    fn spawn_fake_peer(body: String) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let (addr, handle, _) = spawn_recording_fake_peer(body);
         (addr, handle)
+    }
+
+    fn policy_info(
+        put: &str,
+        delete: &str,
+        changed: &str,
+        count: i64,
+        policy: i64,
+    ) -> ContainerPolicyInfo {
+        ContainerPolicyInfo {
+            put_timestamp: put.parse().unwrap(),
+            delete_timestamp: delete.parse().unwrap(),
+            status_changed_at: changed.parse().unwrap(),
+            count,
+            storage_policy_index: policy,
+        }
+    }
+
+    #[test]
+    fn test_cmp_policy_info_matches_python_reconciler_rules() {
+        let ordinary_new = policy_info("20", "0", "20", 0, 2);
+        let ordinary_old = policy_info("10", "0", "10", 0, 0);
+        assert_eq!(cmp_policy_info(ordinary_new, ordinary_old), 1);
+        assert_eq!(cmp_policy_info(ordinary_old, ordinary_new), -1);
+
+        let deleted_old = policy_info("5", "10", "20", 0, 2);
+        let deleted_new = policy_info("5", "10", "30", 0, 0);
+        assert_eq!(cmp_policy_info(deleted_old, deleted_new), 1);
+        assert_eq!(cmp_policy_info(deleted_new, deleted_old), -1);
+        assert_eq!(cmp_policy_info(ordinary_new, deleted_new), -1);
+        assert_eq!(cmp_policy_info(deleted_new, ordinary_new), 1);
+
+        let recreated_old = policy_info("12", "10", "20", 0, 2);
+        let recreated_new = policy_info("20", "15", "30", 0, 0);
+        assert_eq!(cmp_policy_info(recreated_old, recreated_new), 1);
+        assert_eq!(cmp_policy_info(recreated_new, recreated_old), -1);
+    }
+
+    #[test]
+    fn test_container_sync_sends_policy_extension_and_adopts_older_policy() {
+        let dir = std::env::temp_dir().join(format!("swift-repl-policy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("hash.db");
+        let mut broker = ContainerBroker::new(&db_path, "a", "c");
+        broker
+            .initialize("0000000020.00000", 2, "0000000020.00000", "local-id")
+            .unwrap();
+
+        let body = serde_json::json!({
+            "point": -1,
+            "max_row": -1,
+            "id": "peer-id",
+            "created_at": "0000000010.00000",
+            "put_timestamp": "0000000010.00000",
+            "delete_timestamp": "0000000000.00000",
+            "status_changed_at": "0000000010.00000",
+            "count": 0,
+            "storage_policy_index": 0,
+            "metadata": "",
+        })
+        .to_string();
+        let (addr, handle, request) = spawn_recording_fake_peer(body);
+        let outcome = replicate_container_db(
+            &mut broker,
+            "local-id",
+            &addr.to_string(),
+            "sdb",
+            "0",
+            "hash",
+        )
+        .unwrap();
+        handle.join().unwrap();
+        assert!(!outcome.needs_rsync, "{outcome:?}");
+
+        let request = request.lock().unwrap();
+        let split = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let sent: serde_json::Value = serde_json::from_slice(&request[split + 4..]).unwrap();
+        let sent = sent.as_array().unwrap();
+        assert_eq!(sent.len(), 11, "{sent:?}");
+        assert_eq!(sent[8], "0000000020.00000");
+        assert_eq!(sent[9], 0);
+        assert_eq!(sent[10], 2);
+
+        assert_eq!(broker.storage_policy_index().unwrap(), 0);
+        let info = broker.get_info().unwrap();
+        let get = |key: &str| {
+            info.iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value_str(value))
+                .unwrap()
+        };
+        assert_eq!(get("created_at"), "0000000010.00000");
+        assert_eq!(get("put_timestamp"), "0000000020.00000");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -586,6 +1445,122 @@ mod tests {
             Some(("blue".to_string(), "0000000002.00000".to_string()))
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_skip_object_usync_when_remote_is_sharding() {
+        // Probe L2242: unsharded replica must not merge_items into a
+        // SHARDING peer's fresh DB.
+        let dir = std::env::temp_dir().join(format!("swift-repl-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("hash.db");
+        let mut broker = ContainerBroker::new(&db_path, "a", "c");
+        broker
+            .initialize("0000000001.00000", 0, "0000000001.00000", "local-id")
+            .unwrap();
+        broker
+            .put_object(
+                "alpha",
+                "0000000002.00000",
+                0,
+                "text/plain",
+                "e",
+                0,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        let body = serde_json::json!({
+            "point": -1,
+            "id": "peer-id",
+            "max_row": 0,
+            "count": 0,
+            "db_state": "sharding",
+            "metadata": "",
+        })
+        .to_string();
+        let (addr, handle) = spawn_fake_peer(body);
+        let outcome = replicate_container_db(
+            &mut broker,
+            "local-id",
+            &addr.to_string(),
+            "sdb",
+            "0",
+            "hash",
+        )
+        .unwrap();
+        handle.join().unwrap();
+        assert_eq!(outcome.rows_pushed, 0, "{outcome:?}");
+        assert!(!outcome.needs_rsync, "{outcome:?}");
+        assert!(!outcome.usync_incomplete, "{outcome:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_rsync_would_recreate_retiring_on_epoch_file() {
+        assert!(rsync_would_recreate_retiring(std::path::Path::new(
+            "/d/h/h_1751500010.00000.db"
+        )));
+        assert!(!rsync_would_recreate_retiring(std::path::Path::new(
+            "/d/h/h.db"
+        )));
+    }
+
+    #[test]
+    fn test_rsync_db_keeps_epoch_suffix_on_dest() {
+        // Probe L2088: sharder `_replicate_object` of a collapsed root must
+        // complete onto `hash_<epoch>.db`, not recreate unsuffixed retiring.
+        struct RecDest {
+            dest: Mutex<String>,
+        }
+        impl RsyncTransport for RecDest {
+            fn rsync(&self, _db: &std::path::Path, _host: &str, _dev: &str, _stage: &str) -> bool {
+                true
+            }
+            fn complete(
+                &self,
+                _host: &str,
+                _dev: &str,
+                _p: &str,
+                _h: &str,
+                _op: &str,
+                _stage: &str,
+                dest: &str,
+            ) -> bool {
+                *self.dest.lock().unwrap() = dest.to_string();
+                true
+            }
+        }
+        let t = RecDest {
+            dest: Mutex::new(String::new()),
+        };
+        assert!(rsync_db(
+            std::path::Path::new("/d/h/h_1751500010.00000.db"),
+            "id",
+            "10.0.0.1:6201",
+            "sdb",
+            "0",
+            "h",
+            "rsync_then_merge",
+            &t
+        ));
+        assert_eq!(t.dest.lock().unwrap().as_str(), "h_1751500010.00000.db");
+        let t2 = RecDest {
+            dest: Mutex::new(String::new()),
+        };
+        assert!(rsync_db(
+            std::path::Path::new("/d/h/h.db"),
+            "id",
+            "10.0.0.1:6201",
+            "sdb",
+            "0",
+            "h",
+            "complete_rsync",
+            &t2
+        ));
+        assert_eq!(t2.dest.lock().unwrap().as_str(), "h.db");
     }
 
     #[test]
@@ -636,6 +1611,114 @@ mod tests {
         ));
         // complete is not attempted if the rsync failed
         assert!(t.completed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_synthetic_tombstones_allowed_listing_w104_own_none() {
+        use DbState::*;
+        // listing-w105: missing own range on a primary must NOT synthesize.
+        assert!(!synthetic_tombstones_allowed(
+            Some(Unsharded),
+            None,
+            None,
+            false,
+            false
+        ));
+        // listing-w108: empty handoff vs leftover primary.
+        assert!(synthetic_tombstones_allowed(
+            Some(Unsharded),
+            None,
+            None,
+            false,
+            true
+        ));
+        // L1426 settled ACTIVE after merging the peer's own range.
+        assert!(synthetic_tombstones_allowed(
+            Some(Unsharded),
+            Some(shard_state::ACTIVE),
+            Some(0),
+            false,
+            false
+        ));
+        // listing-w100: default-ACTIVE during nested cleave must stay off.
+        assert!(!synthetic_tombstones_allowed(
+            Some(Unsharded),
+            Some(shard_state::ACTIVE),
+            Some(0),
+            true,
+            false
+        ));
+        assert!(!synthetic_tombstones_allowed(
+            Some(Unsharded),
+            None,
+            None,
+            true,
+            true
+        ));
+        // L1256 CREATED/CLEAVED child after range merge.
+        assert!(!synthetic_tombstones_allowed(
+            Some(Unsharded),
+            Some(shard_state::CREATED),
+            Some(0),
+            false,
+            true
+        ));
+        assert!(!synthetic_tombstones_allowed(
+            Some(Unsharded),
+            Some(shard_state::CLEAVED),
+            Some(0),
+            false,
+            false
+        ));
+        assert!(!synthetic_tombstones_allowed(
+            Some(Sharded),
+            Some(shard_state::ACTIVE),
+            Some(0),
+            false,
+            true
+        ));
+        assert!(!synthetic_tombstones_allowed(
+            Some(Unsharded),
+            Some(shard_state::ACTIVE),
+            Some(1),
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn test_usync_start_point_resets_when_counts_diverge() {
+        assert_eq!(usync_start_point(100, 100, 0, 50), -1);
+        assert_eq!(usync_start_point(100, 100, 0, 0), 100);
+        assert_eq!(usync_start_point(40, 100, 0, 50), 40);
+        // nested cleave: 50 vs 150 must NOT reset (listing-w94 L1321).
+        assert_eq!(usync_start_point(150, 150, 50, 150), 150);
+        assert_eq!(usync_start_point(150, 150, 150, 50), 150);
+        let live = crate::ObjectRecord {
+            name: "o".into(),
+            created_at: "1751500001.00000".into(),
+            size: 1,
+            content_type: "text/plain".into(),
+            etag: "e".into(),
+            deleted: 0,
+            storage_policy_index: 0,
+            ctype_timestamp: None,
+            meta_timestamp: None,
+        };
+        assert_eq!(usync_created_at(&live), "1751500001.00000");
+        let tomb = crate::ObjectRecord {
+            name: "o".into(),
+            created_at: "1751500001.00000".into(),
+            size: 0,
+            content_type: "application/deleted".into(),
+            etag: "noetag".into(),
+            deleted: 1,
+            storage_policy_index: 0,
+            ctype_timestamp: None,
+            meta_timestamp: None,
+        };
+        let bumped = usync_created_at(&tomb);
+        assert!(bumped.as_str() > "1751500001.00000", "{bumped}");
     }
 
     #[test]

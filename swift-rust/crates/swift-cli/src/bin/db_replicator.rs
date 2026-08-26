@@ -39,10 +39,12 @@ use swift_core::config::SwiftConfig;
 use swift_core::hashing::HashPathConfig;
 use swift_core::obslog::{LogLevel, Logger};
 use swift_core::statsd::StatsdClient;
+use swift_core::timestamp::{decode_timestamps, Timestamp};
 use swift_db::{
-    replicate_account_db, replicate_completion_rpc, replicate_container_db,
-    replicator_run_once as run_once, rsync_db, AccountBroker, ContainerBroker, DbPartition,
-    DbReplicateClient, RsyncTransport,
+    replicate_account_db, replicate_completion_rpc, replicate_container_db_role,
+    replicator_run_once as run_once, rsync_db, rsync_would_recreate_retiring, AccountBroker,
+    ContainerBroker, DbError, DbPartition, DbReplicateClient, DbState, DbValue, ObjectRecord,
+    RsyncTransport,
 };
 use swift_ring::{Ring, RingData, RingDevice};
 
@@ -184,13 +186,66 @@ impl RsyncTransport for DbRsync {
         hsh: &str,
         op: &str,
         stage_name: &str,
+        dest_db_name: &str,
     ) -> bool {
         // The receive-side op that adopts (complete_rsync) or merges
         // (rsync_then_merge) the staged DB (db_replicator.py:409-412).
         matches!(
-            replicate_completion_rpc(peer_host, peer_device, partition, hsh, op, stage_name),
+            replicate_completion_rpc(
+                peer_host,
+                peer_device,
+                partition,
+                hsh,
+                op,
+                stage_name,
+                dest_db_name,
+            ),
             Ok(true)
         )
+    }
+}
+
+/// Probe L1356: `CleavingContext.load_all` / `done()` on every replica.
+/// Skip-epoch full-file rsync no longer copies Context-* sysmeta, so a
+/// SHARDED container must rewrite every stored context as done before usync.
+fn mark_sharded_cleaving_contexts_done(broker: &mut ContainerBroker) {
+    match broker.get_db_state() {
+        Ok(DbState::Sharded) => {}
+        _ => return,
+    }
+    let ts = Timestamp::now().internal();
+    let Ok(md) = broker.metadata() else {
+        return;
+    };
+    let mut updates = Vec::new();
+    for (k, (v, _)) in md {
+        if v.is_empty() {
+            continue;
+        }
+        let lk = k.to_ascii_lowercase();
+        if !lk.starts_with("x-container-sysmeta-shard-context-")
+            && lk != "x-container-sysmeta-shard-cleaving-context"
+        {
+            continue;
+        }
+        let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&v) else {
+            continue;
+        };
+        let Some(obj) = val.as_object_mut() else {
+            continue;
+        };
+        obj.insert("cleaving_done".into(), serde_json::Value::Bool(true));
+        obj.insert("misplaced_done".into(), serde_json::Value::Bool(true));
+        let to = obj
+            .get("cleave_to_row")
+            .and_then(|x| x.as_i64())
+            .or_else(|| obj.get("max_row").and_then(|x| x.as_i64()))
+            .unwrap_or(0);
+        obj.insert("max_row".into(), serde_json::json!(to));
+        updates.push((k, (val.to_string(), ts.clone())));
+    }
+    if !updates.is_empty() {
+        let _ = broker.update_metadata(&updates);
     }
 }
 
@@ -198,50 +253,230 @@ impl RsyncTransport for DbRsync {
 struct DbClient {
     server: ServerType,
     rsync: DbRsync,
+    hash_config: HashPathConfig,
+}
+
+const MISPLACED_OBJECTS_ACCOUNT: &str = ".misplaced_objects";
+const RECONCILER_BATCH_SIZE: i64 = 1000;
+
+fn reconciler_container_name(created_at: &str) -> Option<String> {
+    let (data, _ctype, meta) = decode_timestamps(created_at, false).ok()?;
+    let timestamp = meta.unwrap_or(data).as_secs_f64() as i64;
+    Some((timestamp.div_euclid(3600) * 3600).to_string())
+}
+
+fn reconciler_object_name(
+    policy_index: i64,
+    account: &str,
+    container: &str,
+    object: &str,
+) -> String {
+    format!("{policy_index}:/{account}/{container}/{object}")
+}
+
+fn source_device_path(db: &DbPartition) -> Option<&Path> {
+    // <device>/containers/<part>/<suffix>/<hash>/<hash>.db
+    db.path.ancestors().nth(5)
+}
+
+impl DbClient {
+    fn feed_reconciler(
+        &self,
+        source_db: &DbPartition,
+        ring: &Ring,
+        account: &str,
+        container: &str,
+        row: &ObjectRecord,
+    ) -> bool {
+        let Some(queue_container) = reconciler_container_name(&row.created_at) else {
+            return false;
+        };
+        let Ok(partition) = ring.get_part(MISPLACED_OBJECTS_ACCOUNT, Some(&queue_container), None)
+        else {
+            return false;
+        };
+        let Some(device) = source_device_path(source_db) else {
+            return false;
+        };
+        let Ok(hash) =
+            self.hash_config
+                .hash_path(MISPLACED_OBJECTS_ACCOUNT, Some(&queue_container), None)
+        else {
+            return false;
+        };
+        let suffix = &hash[hash.len().saturating_sub(3)..];
+        let db_path = device
+            .join("containers")
+            .join(partition.to_string())
+            .join(suffix)
+            .join(&hash)
+            .join(format!("{hash}.db"));
+        if std::fs::create_dir_all(db_path.parent().unwrap_or(device)).is_err() {
+            return false;
+        }
+
+        let mut queue = ContainerBroker::new(&db_path, MISPLACED_OBJECTS_ACCOUNT, &queue_container);
+        if !queue.db_exists() {
+            let id = format!(
+                "reconciler-{}-{}",
+                std::process::id(),
+                Timestamp::now().internal()
+            );
+            match queue.initialize(&queue_container, 0, &queue_container, &id) {
+                Ok(()) | Err(DbError::AlreadyExists(_)) => {}
+                Err(e) => {
+                    eprintln!("db-replicator: create reconciler DB failed: {e}");
+                    return false;
+                }
+            }
+        }
+
+        let queue_row = ObjectRecord {
+            name: reconciler_object_name(row.storage_policy_index, account, container, &row.name),
+            created_at: row.created_at.clone(),
+            size: 0,
+            content_type: if row.deleted == 0 {
+                "application/x-put".to_string()
+            } else {
+                "application/x-delete".to_string()
+            },
+            etag: row.created_at.clone(),
+            deleted: 0,
+            storage_policy_index: 0,
+            ctype_timestamp: None,
+            meta_timestamp: None,
+        };
+        match queue.merge_items(vec![queue_row]) {
+            Ok(()) => {
+                eprintln!(
+                    "db-replicator: reconciler enqueue account={account} container={container} object={} source_policy={} bucket={queue_container}",
+                    row.name, row.storage_policy_index
+                );
+                true
+            }
+            Err(e) => {
+                eprintln!("db-replicator: reconciler enqueue failed: {e}");
+                false
+            }
+        }
+    }
+}
+
+fn info_text(info: &[(String, DbValue)], key: &str) -> Option<String> {
+    info.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
+        DbValue::Text(s) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    })
 }
 
 impl DbReplicateClient for DbClient {
+    fn db_max_row(&self, db: &DbPartition) -> i64 {
+        match self.server {
+            ServerType::Container => {
+                let mut broker = ContainerBroker::new(&db.path, "", "");
+                broker.get_max_row().ok().flatten().unwrap_or(-1)
+            }
+            ServerType::Account => {
+                let mut broker = AccountBroker::new(&db.path, "");
+                broker.get_max_row().ok().flatten().unwrap_or(-1)
+            }
+        }
+    }
+
+    fn db_account_container(&self, db: &DbPartition) -> Option<(String, Option<String>)> {
+        match self.server {
+            ServerType::Container => {
+                let mut broker = ContainerBroker::new(&db.path, "", "");
+                let info = broker.get_info().ok()?;
+                Some((info_text(&info, "account")?, info_text(&info, "container")))
+            }
+            ServerType::Account => {
+                let mut broker = AccountBroker::new(&db.path, "");
+                let info = broker.get_info().ok()?;
+                Some((info_text(&info, "account")?, None))
+            }
+        }
+    }
+
     fn replicate(&self, db: &DbPartition, peer: &RingDevice) -> bool {
         let peer_host = format!("{}:{}", peer.ip, peer.port);
         let partition = db.partition.to_string();
         match self.server {
             ServerType::Container => {
                 let mut broker = ContainerBroker::new(&db.path, "", "");
+                // Skip-epoch rsync no longer copies sysmeta. After nested
+                // complete the local Context-* is done but peer keys stay
+                // False (probe L1356). Force them done on SHARDED DBs so
+                // usync/metadata merge matches Python whole-file rsync.
+                mark_sharded_cleaving_contexts_done(&mut broker);
                 let local_id = broker_id(broker.get_replication_info().ok());
-                match replicate_container_db(
+                match replicate_container_db_role(
                     &mut broker,
                     &local_id,
                     &peer_host,
                     &peer.device,
                     &partition,
                     &db.hash,
+                    db.is_handoff,
                 ) {
                     // peer had no DB at all: stage the whole DB into the
                     // peer's tmp dir and have it adopted (complete_rsync,
                     // db_replicator.py:553-557)
-                    Ok(outcome) if outcome.needs_rsync => rsync_db(
-                        &db.path,
-                        &local_id,
-                        &peer_host,
-                        &peer.device,
-                        &partition,
-                        &db.hash,
-                        "complete_rsync",
-                        &self.rsync,
-                    ),
+                    Ok(outcome) if outcome.needs_rsync => {
+                        if rsync_would_recreate_retiring(&db.path) {
+                            // complete_rsync dest is always <hsh>.db. Do not
+                            // stage an epoch file under that name (probe L1347).
+                            // Still push shard-range rows so nested UPDATE_ROOT
+                            // that missed a down replica is repaired (L1306).
+                            let _ = swift_db::sync_shard_ranges_to_peer(
+                                &mut broker,
+                                &local_id,
+                                &peer_host,
+                                &peer.device,
+                                &partition,
+                                &db.hash,
+                            );
+                            true
+                        } else {
+                            rsync_db(
+                                &db.path,
+                                &local_id,
+                                &peer_host,
+                                &peer.device,
+                                &partition,
+                                &db.hash,
+                                "complete_rsync",
+                                &self.rsync,
+                            )
+                        }
+                    }
                     // usync can't converge the peer: stage the DB and have
                     // the peer merge its own rows into it before adopting
                     // (rsync_then_merge, db_replicator.py:579-591)
-                    Ok(outcome) if outcome.usync_incomplete => rsync_db(
-                        &db.path,
-                        &local_id,
-                        &peer_host,
-                        &peer.device,
-                        &partition,
-                        &db.hash,
-                        "rsync_then_merge",
-                        &self.rsync,
-                    ),
+                    Ok(outcome) if outcome.usync_incomplete => {
+                        if rsync_would_recreate_retiring(&db.path) {
+                            let _ = swift_db::sync_shard_ranges_to_peer(
+                                &mut broker,
+                                &local_id,
+                                &peer_host,
+                                &peer.device,
+                                &partition,
+                                &db.hash,
+                            );
+                            true
+                        } else {
+                            rsync_db(
+                                &db.path,
+                                &local_id,
+                                &peer_host,
+                                &peer.device,
+                                &partition,
+                                &db.hash,
+                                "rsync_then_merge",
+                                &self.rsync,
+                            )
+                        }
+                    }
                     Ok(_) => true,
                     Err(e) => {
                         eprintln!("db-replicator: container push to {peer_host} failed: {e}");
@@ -286,6 +521,81 @@ impl DbReplicateClient for DbClient {
                         false
                     }
                 }
+            }
+        }
+    }
+
+    fn post_replicate(&self, db: &DbPartition, ring: &Ring, responses: &[bool]) {
+        if self.server != ServerType::Container {
+            return;
+        }
+        let mut broker = ContainerBroker::new(&db.path, "", "");
+        if broker.hydrate_account_container().is_err() {
+            return;
+        }
+        let Ok(info) = broker.get_replication_info() else {
+            return;
+        };
+        let Some(account) = info_text(&info, "account") else {
+            return;
+        };
+        let Some(container) = info_text(&info, "container") else {
+            return;
+        };
+        if account == MISPLACED_OBJECTS_ACCOUNT {
+            return;
+        }
+        let Ok(point) = broker.get_reconciler_sync() else {
+            return;
+        };
+        let max_row = broker.get_max_row().ok().flatten().unwrap_or(-1);
+        if !broker.has_multiple_policies().unwrap_or(false) {
+            if max_row != point {
+                let _ = broker.update_reconciler_sync(max_row);
+            }
+            return;
+        }
+
+        let mut cursor = point;
+        let mut durable_point = point;
+        let mut errors = false;
+        let mut first_batch = true;
+        loop {
+            let Ok(rows) = broker.get_misplaced_since(cursor, RECONCILER_BATCH_SIZE) else {
+                return;
+            };
+            if rows.is_empty() {
+                // Python `dump_to_reconciler`: when there was no misplaced
+                // row at all after `point`, the whole DB through max_row is
+                // known clean and may be checkpointed after the peer quorum.
+                if first_batch {
+                    durable_point = max_row;
+                }
+                break;
+            }
+            first_batch = false;
+            for (_, row) in &rows {
+                if !self.feed_reconciler(db, ring, &account, &container, row) {
+                    errors = true;
+                }
+            }
+            cursor = rows.last().map(|(rowid, _)| *rowid).unwrap_or(cursor);
+            // Once any queue write fails, never checkpoint beyond the gap,
+            // even if later batches succeed. Otherwise a restart could skip
+            // the failed row forever.
+            if !errors {
+                durable_point = cursor;
+            }
+            if rows.len() < RECONCILER_BATCH_SIZE as usize {
+                break;
+            }
+        }
+
+        let successes = responses.iter().filter(|&&ok| ok).count();
+        let majority = responses.len() / 2 + 1;
+        if durable_point > point && !responses.is_empty() && successes >= majority {
+            if let Err(e) = broker.update_reconciler_sync(durable_point) {
+                eprintln!("db-replicator: update reconciler sync failed: {e}");
             }
         }
     }
@@ -426,6 +736,7 @@ fn main() {
     let client = DbClient {
         server,
         rsync: DbRsync { dest: rsync_dest },
+        hash_config: hash_config.clone(),
     };
     let stop = swift_http::install_sigterm_flag();
 
@@ -495,6 +806,97 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn one_partition_ring(hash_config: HashPathConfig) -> Ring {
+        let device = RingDevice {
+            id: 0,
+            region: 1,
+            zone: 1,
+            ip: "127.0.0.1".to_string(),
+            port: 6011,
+            replication_ip: None,
+            replication_port: None,
+            device: "sda".to_string(),
+            weight: 1.0,
+            meta: String::new(),
+            extra: Default::default(),
+        };
+        Ring::new(
+            RingData::from_parts(vec![Some(device)], 32, vec![vec![0]]),
+            hash_config,
+        )
+    }
+
+    fn test_db_client(hash_config: HashPathConfig) -> DbClient {
+        DbClient {
+            server: ServerType::Container,
+            rsync: DbRsync {
+                dest: DbRsyncDest::Local {
+                    peer_map: HashMap::new(),
+                    port_of: HashMap::new(),
+                },
+            },
+            hash_config,
+        }
+    }
+
+    #[test]
+    fn test_feed_reconciler_creates_resumable_queue_entry() {
+        let root = std::env::temp_dir().join(format!(
+            "swift-reconciler-feed-{}-{}",
+            std::process::id(),
+            Timestamp::now().raw()
+        ));
+        let source_hash = "11111111111111111111111111111111";
+        let source_path = root
+            .join("sda/containers/0/111")
+            .join(source_hash)
+            .join(format!("{source_hash}.db"));
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        let source = DbPartition {
+            partition: 0,
+            hash: source_hash.to_string(),
+            path: source_path,
+            is_handoff: false,
+        };
+        let hash_config = HashPathConfig::new("test-prefix", "test-suffix").unwrap();
+        let ring = one_partition_ring(hash_config.clone());
+        let client = test_db_client(hash_config.clone());
+        let created_at = "1700000000.12345";
+        let row = ObjectRecord {
+            name: "nested/object".to_string(),
+            created_at: created_at.to_string(),
+            size: 99,
+            content_type: "application/octet-stream".to_string(),
+            etag: "source-etag".to_string(),
+            deleted: 0,
+            storage_policy_index: 2,
+            ctype_timestamp: None,
+            meta_timestamp: None,
+        };
+
+        assert!(client.feed_reconciler(&source, &ring, "AUTH_test", "ec", &row));
+
+        let bucket = reconciler_container_name(created_at).unwrap();
+        let queue_hash = hash_config
+            .hash_path(MISPLACED_OBJECTS_ACCOUNT, Some(&bucket), None)
+            .unwrap();
+        let queue_path = root
+            .join("sda/containers/0")
+            .join(&queue_hash[queue_hash.len() - 3..])
+            .join(&queue_hash)
+            .join(format!("{queue_hash}.db"));
+        let mut queue = ContainerBroker::new(&queue_path, MISPLACED_OBJECTS_ACCOUNT, &bucket);
+        let queued = queue.get_items_since(-1, 10).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].1.name, "2:/AUTH_test/ec/nested/object");
+        assert_eq!(queued[0].1.created_at, created_at);
+        assert_eq!(queued[0].1.etag, created_at);
+        assert_eq!(queued[0].1.content_type, "application/x-put");
+        assert_eq!(queued[0].1.deleted, 0);
+        assert_eq!(queued[0].1.storage_policy_index, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn test_rsync_dest_local_stages_into_peer_tmp() {

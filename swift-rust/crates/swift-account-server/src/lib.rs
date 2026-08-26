@@ -421,8 +421,35 @@ impl AccountServer {
             .to_path_buf())
     }
 
+    /// Python `ReplicatorRpc` URL is `/<device>/<partition>/<hash>`. Parking
+    /// that hash as if it were an account name serializes the wrong DB.
+    pub fn replicate_db_file_for_request(&self, req: &Request) -> Result<PathBuf, Response> {
+        let segs = split_path(&req.path, 3, 3, false).map_err(|e| plain_response(400, &e))?;
+        let drive = segs[0].clone().unwrap_or_default();
+        let partition = segs[1].clone().unwrap_or_default();
+        let hsh = segs[2].clone().unwrap_or_default();
+        self.check_drive(&drive)?;
+        if hsh.is_empty() {
+            return Err(plain_response(400, &format!("Invalid path: {}", req.path)));
+        }
+        let suffix = &hsh[hsh.len().saturating_sub(3)..];
+        Ok(self
+            .config
+            .devices
+            .join(&drive)
+            .join("accounts")
+            .join(&partition)
+            .join(suffix)
+            .join(&hsh)
+            .join(format!("{hsh}.db")))
+    }
+
     async fn dispatch_on_shard(&self, req: Request) -> Response {
-        let db_file = match self.db_file_for_request(&req) {
+        let db_file = match if req.method.eq_ignore_ascii_case("REPLICATE") {
+            self.replicate_db_file_for_request(&req)
+        } else {
+            self.db_file_for_request(&req)
+        } {
             Ok(p) => p,
             Err(resp) => return resp,
         };

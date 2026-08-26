@@ -45,6 +45,51 @@ fn load_ring(path: &str, hash_config: &HashPathConfig, logger: &Logger) -> Ring 
     )
 }
 
+fn parse_internal_client_url(raw: &str) -> Result<String, String> {
+    let endpoint = raw
+        .trim()
+        .strip_prefix("http://")
+        .ok_or_else(|| "internal_client_url must use http://".to_string())?
+        .trim_end_matches('/');
+    if endpoint.is_empty() || endpoint.contains('/') || endpoint.contains('@') {
+        return Err("internal_client_url must be a bare loopback host:port".to_string());
+    }
+    let (host, port) = endpoint
+        .rsplit_once(':')
+        .ok_or_else(|| "internal_client_url must include an explicit port".to_string())?;
+    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+        return Err("internal_client_url must resolve through loopback".to_string());
+    }
+    let port: u16 = port
+        .parse()
+        .map_err(|_| "internal_client_url has an invalid port".to_string())?;
+    if port == 0 {
+        return Err("internal_client_url port must be non-zero".to_string());
+    }
+    Ok(endpoint.to_string())
+}
+
+fn parse_process_partition(processes: &str, process: &str) -> Result<(u64, u64), String> {
+    let processes: i64 = processes
+        .trim()
+        .parse()
+        .map_err(|_| "processes must be an integer greater than or equal to 0".to_string())?;
+    let process: i64 = process
+        .trim()
+        .parse()
+        .map_err(|_| "process must be an integer greater than or equal to 0".to_string())?;
+    if processes < 0 {
+        return Err("processes must be an integer greater than or equal to 0".to_string());
+    }
+    if process < 0 {
+        return Err("process must be an integer greater than or equal to 0".to_string());
+    }
+    if processes != 0 && process >= processes {
+        return Err("process must be less than processes".to_string());
+    }
+    Ok((processes as u64, process as u64))
+}
+
 fn main() {
     let conf_path = std::env::args()
         .nth(1)
@@ -86,6 +131,19 @@ fn main() {
         "recon_cache_path",
         "/var/cache/swift",
     );
+    let internal_client_url = get("container-reconciler", "internal_client_url", "");
+    let internal_proxy_host = parse_internal_client_url(&internal_client_url).unwrap_or_else(|e| {
+        logger.error(&format!("invalid internal_client_url: {e}"));
+        std::process::exit(1);
+    });
+    let (processes, process) = parse_process_partition(
+        &get("container-reconciler", "processes", "0"),
+        &get("container-reconciler", "process", "0"),
+    )
+    .unwrap_or_else(|e| {
+        logger.error(&format!("invalid reconciler process partition: {e}"));
+        std::process::exit(1);
+    });
 
     let swift_conf_path =
         std::env::var("SWIFT_CONF").unwrap_or_else(|_| "/etc/swift/swift.conf".to_string());
@@ -97,18 +155,23 @@ fn main() {
     let swift_dir = std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string());
     let account_ring_path = format!("{swift_dir}/account.ring.gz");
     let container_ring_path = format!("{swift_dir}/container.ring.gz");
-    let object_ring_path = format!("{swift_dir}/object.ring.gz");
     let mut account_ring = load_ring(&account_ring_path, &hash_config, &logger);
     let mut container_ring = load_ring(&container_ring_path, &hash_config, &logger);
-    let mut object_ring = load_ring(&object_ring_path, &hash_config, &logger);
     let stop = swift_http::install_sigterm_flag();
 
     logger.info(&format!(
-        "swift-container-reconciler: interval={interval}s once={run_once_only}"
+        "swift-container-reconciler: interval={interval}s once={run_once_only} internal_proxy={internal_proxy_host} process={process}/{processes}"
     ));
     loop {
         let sweep_start = std::time::Instant::now();
-        let stats = run_once(&account_ring, &container_ring, &object_ring);
+        let stats = run_once(
+            &account_ring,
+            &container_ring,
+            &hash_config,
+            &internal_proxy_host,
+            processes,
+            process,
+        );
         logger.info(&format!(
             "container-reconciler pass: moved={} already_correct={} failed={} errors={}",
             stats.moved, stats.already_correct, stats.failed, stats.errors
@@ -131,7 +194,6 @@ fn main() {
         for (path, ring) in [
             (&account_ring_path, &mut account_ring),
             (&container_ring_path, &mut container_ring),
-            (&object_ring_path, &mut object_ring),
         ] {
             match RingData::load(Path::new(path)) {
                 Ok(data) => *ring = Ring::new(data, hash_config.clone()),
@@ -140,5 +202,32 @@ fn main() {
                 )),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_internal_client_url, parse_process_partition};
+
+    #[test]
+    fn internal_client_url_is_explicit_and_loopback_only() {
+        assert_eq!(
+            parse_internal_client_url("http://127.0.0.1:18082/").unwrap(),
+            "127.0.0.1:18082"
+        );
+        assert!(parse_internal_client_url("").is_err());
+        assert!(parse_internal_client_url("https://127.0.0.1:18082").is_err());
+        assert!(parse_internal_client_url("http://10.0.0.1:18082").is_err());
+        assert!(parse_internal_client_url("http://127.0.0.1:0").is_err());
+    }
+
+    #[test]
+    fn process_partition_matches_python_validation() {
+        assert_eq!(parse_process_partition("0", "0").unwrap(), (0, 0));
+        assert_eq!(parse_process_partition("4", "2").unwrap(), (4, 2));
+        assert!(parse_process_partition("-1", "0").is_err());
+        assert!(parse_process_partition("4", "-1").is_err());
+        assert!(parse_process_partition("4", "4").is_err());
+        assert!(parse_process_partition("many", "0").is_err());
     }
 }

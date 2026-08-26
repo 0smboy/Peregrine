@@ -49,16 +49,18 @@ pub use container::{
     ListObjectsArgs, ObjectRecord,
 };
 pub use repl_loop::{
-    iter_db_partitions, repl_peers, run_once as replicator_run_once, DbPartition,
-    DbReplicateClient, ReplLoopStats,
+    iter_db_partitions, remove_replicated_handoff_db, repl_peers, run_once as replicator_run_once,
+    DbPartition, DbReplicateClient, ReplLoopStats,
 };
 pub use replicator::{
-    replicate_account_db, replicate_completion_rpc, replicate_container_db, rsync_db,
-    ReplicateOutcome, RsyncTransport,
+    incorrect_policy_index, replicate_account_db, replicate_completion_rpc, replicate_container_db,
+    replicate_container_db_role, rsync_db, rsync_dest_db_name, rsync_would_recreate_retiring,
+    sync_shard_ranges_to_peer, ReplicateOutcome, RsyncTransport,
 };
 pub use shard::{
     find_namespace_gaps, find_overlapping_ranges, merge_shards, resolve_shard_range_states,
-    sift_shard_ranges, state as shard_state, ShardRange, SHARD_RANGE_KEYS, SHARD_UPDATE_STATES,
+    sift_shard_ranges, state as shard_state, ShardRange, CLEAVING_STATES, SHARD_RANGE_KEYS,
+    SHARD_STATS_STATES, SHARD_UPDATE_STATES,
 };
 pub use util::{chexor, is_corruption_error, quarantine_db, renamer, DbError};
 pub use vacuum::{

@@ -335,6 +335,49 @@ fn ssync_incremental_parser_accepts_one_byte_feeds() {
 }
 
 #[test]
+fn ssync_parser_accepts_utf8_swift_object_metadata() {
+    let body = session(
+        &[],
+        "PUT /a/c/o\r\nContent-Length: 1\r\nX-Timestamp: 1751500001.00000\r\nX-Object-Meta-è: meta-è\r\n\r\nx"
+            .as_bytes(),
+    );
+    let mut parser = SsyncParser::new();
+    assert!(matches!(
+        parser.push(&body).unwrap().as_slice(),
+        [SsyncEvent::MissingEnd]
+    ));
+    let events = parser.start_updates().unwrap();
+    let SsyncEvent::Update(update) = &events[0] else {
+        panic!("expected update, got {:?}", events[0]);
+    };
+    assert_eq!(update.headers.get("X-Object-Meta-è"), Some("meta-è"));
+    assert!(update
+        .replication_headers
+        .iter()
+        .any(|name| name == "x-object-meta-è"));
+    parser.finish().unwrap();
+}
+
+#[test]
+fn ssync_parser_rejects_utf8_outside_swift_object_metadata() {
+    let body = session(
+        &[],
+        "PUT /a/c/o\r\nContent-Length: 1\r\nX-Timestamp: 1751500001.00000\r\nX-Other: meta-è\r\n\r\nx"
+            .as_bytes(),
+    );
+    let mut parser = SsyncParser::new();
+    assert!(matches!(
+        parser.push(&body).unwrap().as_slice(),
+        [SsyncEvent::MissingEnd]
+    ));
+    let error = parser.start_updates().unwrap_err();
+    assert_eq!(
+        error.message(),
+        "non-ASCII data outside Swift metadata header"
+    );
+}
+
+#[test]
 fn ssync_encode_missing_matches_python_wire_format() {
     let ts = |s: &str| s.parse::<swift_core::timestamp::Timestamp>().unwrap();
     let hash = "55555555555555555555555555555555";

@@ -99,6 +99,10 @@ const ASYNC_DELETE_TYPE: &str = "application/async-deleted";
 /// md5 of empty string — etag on zero-byte async-delete task records.
 const MD5_OF_EMPTY_STRING: &str = "d41d8cd98f00b204e9800998ecf8427e";
 
+fn slo_override(req: &Request) -> bool {
+    config_true_value(req.headers.get("X-Backend-Slo-Override").unwrap_or(""))
+}
+
 /// One entry in a validated SLO manifest, as far as the Etag/size calculation
 /// is concerned.
 #[derive(Debug, Clone, PartialEq)]
@@ -353,12 +357,12 @@ fn expand_segments(
     let mut out = Vec::new();
     for seg in segments {
         if let Some(b64) = &seg.data_b64 {
-            let raw = B64
-                .decode(b64.as_bytes())
-                .map_err(|_| Response::error(
+            let raw = B64.decode(b64.as_bytes()).map_err(|_| {
+                Response::error(
                     409,
                     "There was a conflict when trying to complete your request.",
-                ))?;
+                )
+            })?;
             let length = raw.len() as i64;
             if length <= 0 {
                 continue;
@@ -389,10 +393,12 @@ fn expand_segments(
             }
             let body = match sresp.body.materialize(MAX_CONTROL_BODY) {
                 Ok(b) => b,
-                Err(_) => return Err(Response::error(
-                    409,
-                    "There was a conflict when trying to complete your request.",
-                )),
+                Err(_) => {
+                    return Err(Response::error(
+                        409,
+                        "There was a conflict when trying to complete your request.",
+                    ))
+                }
             };
             let Some(sub_segs) = parse_stored_manifest(body) else {
                 return Err(Response::error(
@@ -405,9 +411,9 @@ fn expand_segments(
             if let Some(range) = &seg.range {
                 let Some((start, end)) = parse_inclusive_range(range) else {
                     return Err(Response::error(
-                    409,
-                    "There was a conflict when trying to complete your request.",
-                ));
+                        409,
+                        "There was a conflict when trying to complete your request.",
+                    ));
                 };
                 nested = slice_leaves_for_range(&nested, start, end + 1)?;
             }
@@ -439,12 +445,12 @@ async fn expand_segments_async(
     let mut out = Vec::new();
     for seg in segments {
         if let Some(b64) = &seg.data_b64 {
-            let raw = B64
-                .decode(b64.as_bytes())
-                .map_err(|_| Response::error(
+            let raw = B64.decode(b64.as_bytes()).map_err(|_| {
+                Response::error(
                     409,
                     "There was a conflict when trying to complete your request.",
-                ))?;
+                )
+            })?;
             let length = raw.len() as i64;
             if length <= 0 {
                 continue;
@@ -475,10 +481,12 @@ async fn expand_segments_async(
             }
             let body = match sresp.body.collect_async().await {
                 Ok(b) => b,
-                Err(_) => return Err(Response::error(
-                    409,
-                    "There was a conflict when trying to complete your request.",
-                )),
+                Err(_) => {
+                    return Err(Response::error(
+                        409,
+                        "There was a conflict when trying to complete your request.",
+                    ))
+                }
             };
             let Some(sub_segs) = parse_stored_manifest(&body) else {
                 return Err(Response::error(
@@ -498,9 +506,9 @@ async fn expand_segments_async(
             if let Some(range) = &seg.range {
                 let Some((start, end)) = parse_inclusive_range(range) else {
                     return Err(Response::error(
-                    409,
-                    "There was a conflict when trying to complete your request.",
-                ));
+                        409,
+                        "There was a conflict when trying to complete your request.",
+                    ));
                 };
                 nested = slice_leaves_for_range(&nested, start, end + 1)?;
             }
@@ -519,6 +527,63 @@ async fn expand_segments_async(
         }
     }
     Ok(out)
+}
+
+fn first_segment_failure(status: u16) -> Response {
+    if status >= 500 {
+        Response::error(503, "Service Unavailable")
+    } else {
+        Response::error(
+            409,
+            "There was a conflict when trying to complete your request.",
+        )
+    }
+}
+
+/// Fetch the first object-backed leaf before the client response is
+/// committed. Python Swift's `SegmentedIterable::validate_first_segment`
+/// does the same: a missing first segment is a visible 409, while a failure
+/// after bytes have started streaming aborts the connection.
+fn prefetch_first_leaf(
+    orig: &Request,
+    version: &str,
+    account: &str,
+    leaves: &[LeafSeg],
+    next: &NextFn,
+) -> Result<Option<Response>, Response> {
+    let Some(leaf) = leaves.first() else {
+        return Ok(None);
+    };
+    if leaf.raw_data.is_some() {
+        return Ok(None);
+    }
+    let path = format!("/{version}/{account}{}", leaf.name);
+    let response = next(slo_subreq(orig, path, leaf.range.as_deref()));
+    if !(200..300).contains(&response.status) {
+        return Err(first_segment_failure(response.status));
+    }
+    Ok(Some(response))
+}
+
+async fn prefetch_first_leaf_async(
+    orig: Request,
+    version: String,
+    account: String,
+    leaf: Option<LeafSeg>,
+    next: AsyncNextFn,
+) -> Result<Option<Response>, Response> {
+    let Some(leaf) = leaf else {
+        return Ok(None);
+    };
+    if leaf.raw_data.is_some() {
+        return Ok(None);
+    }
+    let path = format!("/{version}/{account}{}", leaf.name);
+    let response = next(slo_subreq(&orig, path, leaf.range.as_deref())).await;
+    if !(200..300).contains(&response.status) {
+        return Err(first_segment_failure(response.status));
+    }
+    Ok(Some(response))
 }
 
 async fn forward_body_chunks(
@@ -562,11 +627,13 @@ fn leaf_stream_channel(
     account: String,
     leaves: Vec<LeafSeg>,
     next: AsyncNextFn,
+    first_response: Option<Response>,
     total_len: u64,
 ) -> Body {
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     let scope = swift_runtime::TaskScope::bounded(1);
     let _ = scope.spawn(async move {
+        let mut first_response = first_response;
         let mut work: VecDeque<(LeafSeg, usize)> =
             leaves.into_iter().map(|leaf| (leaf, 0usize)).collect();
         while let Some((leaf, depth)) = work.pop_front() {
@@ -578,7 +645,11 @@ fn leaf_stream_channel(
             }
             let path = format!("/{version}/{account}{}", leaf.name);
             let sub = slo_subreq(&orig, path.clone(), leaf.range.as_deref());
-            let sresp = next(sub).await;
+            let sresp = if let Some(response) = first_response.take() {
+                response
+            } else {
+                next(sub).await
+            };
             if !(200..300).contains(&sresp.status) {
                 let _ = tx
                     .send(Err(std::io::Error::other(format!(
@@ -600,9 +671,7 @@ fn leaf_stream_channel(
             if nested_slo {
                 if depth >= MAX_SLO_RECURSION_DEPTH {
                     let _ = tx
-                        .send(Err(std::io::Error::other(
-                            "SLO recursion depth exceeded",
-                        )))
+                        .send(Err(std::io::Error::other("SLO recursion depth exceeded")))
                         .await;
                     return;
                 }
@@ -615,9 +684,7 @@ fn leaf_stream_channel(
                 };
                 let Some(sub_segs) = parse_stored_manifest(&body) else {
                     let _ = tx
-                        .send(Err(std::io::Error::other(
-                            "invalid nested SLO manifest",
-                        )))
+                        .send(Err(std::io::Error::other("invalid nested SLO manifest")))
                         .await;
                     return;
                 };
@@ -697,9 +764,9 @@ fn slice_leaves_for_range(
         let obj_last = obj_base + take_to_excl - 1;
         if obj_last > obj_end_incl {
             return Err(Response::error(
-                    409,
-                    "There was a conflict when trying to complete your request.",
-                ));
+                409,
+                "There was a conflict when trying to complete your request.",
+            ));
         }
         let contrib = (obj_last - obj_start + 1) as i64;
         // Inline data: slice the raw bytes rather than object ranges.
@@ -812,7 +879,8 @@ fn parse_part_number(req: &Request) -> Result<Option<usize>, Response> {
             Response::with_body(400, msg)
         };
         if req.method != "HEAD" {
-            resp.headers.set("Content-Type", "text/plain; charset=utf-8");
+            resp.headers
+                .set("Content-Type", "text/plain; charset=utf-8");
             resp.headers.set("Content-Length", msg.len());
         }
         return Err(resp);
@@ -825,7 +893,8 @@ fn parse_part_number(req: &Request) -> Result<Option<usize>, Response> {
             Response::with_body(400, msg)
         };
         if req.method != "HEAD" {
-            resp.headers.set("Content-Type", "text/plain; charset=utf-8");
+            resp.headers
+                .set("Content-Type", "text/plain; charset=utf-8");
             resp.headers.set("Content-Length", msg.len());
         }
         return Err(resp);
@@ -899,10 +968,7 @@ fn apply_slo_put_listing_headers(req: &mut Request, json_etag: &str, slo_etag: &
         .filter(|s| !s.is_empty())
         .unwrap_or("application/octet-stream")
         .to_string();
-    if !ct
-        .split(';')
-        .any(|p| p.trim().starts_with("swift_bytes="))
-    {
+    if !ct.split(';').any(|p| p.trim().starts_with("swift_bytes=")) {
         ct.push_str(&format!(";swift_bytes={total}"));
     }
     req.headers.set("Content-Type", ct);
@@ -1303,11 +1369,7 @@ impl Slo {
                 Some(r) => byte_range = Some(r),
                 None => unsatisfiable = true,
             }
-        } else if let Some(range) = orig
-            .headers
-            .get("Range")
-            .and_then(|h| Range::parse(h).ok())
-        {
+        } else if let Some(range) = orig.headers.get("Range").and_then(|h| Range::parse(h).ok()) {
             match range.ranges_for_length(Some(total_len.max(0) as u64)) {
                 Some(r) if r.is_empty() => unsatisfiable = true,
                 Some(r) if r.len() == 1 => byte_range = Some(r[0]),
@@ -1375,12 +1437,19 @@ impl Slo {
             );
             let len = (last_excl - first) as i64;
             let body = if is_get {
+                let first_response = match prefetch_first_leaf(
+                    &orig, &version, &account, &ranged, next,
+                ) {
+                    Ok(response) => response,
+                    Err(error) => return error,
+                };
                 Self::leaf_stream_body(
                     orig.clone_head(),
                     version.clone(),
                     account.clone(),
                     ranged,
                     Arc::clone(next),
+                    first_response,
                     last_excl - first,
                 )
             } else {
@@ -1400,12 +1469,19 @@ impl Slo {
                         Ok(l) => l,
                         Err(err) => return err,
                     };
+                    let first_response = match prefetch_first_leaf(
+                        &orig, &version, &account, &ranged, next,
+                    ) {
+                        Ok(response) => response,
+                        Err(error) => return error,
+                    };
                     let mut b = Self::leaf_stream_body(
                         orig.clone_head(),
                         version.clone(),
                         account.clone(),
                         ranged,
                         Arc::clone(next),
+                        first_response,
                         last_excl - first,
                     );
                     pieces.push(
@@ -1415,26 +1491,24 @@ impl Slo {
                     );
                 }
             }
-            let mp = multipart_range_body(
-                &boundary,
-                &ranges,
-                &pieces,
-                &ctype,
-                total_len.max(0) as u64,
-            );
-            headers.set(
-                "Content-Type",
-                multipart_byteranges_content_type(&boundary),
-            );
+            let mp =
+                multipart_range_body(&boundary, &ranges, &pieces, &ctype, total_len.max(0) as u64);
+            headers.set("Content-Type", multipart_byteranges_content_type(&boundary));
             let len = mp.len() as i64;
             (206u16, mp.into(), len)
         } else if is_get {
+            let first_response =
+                match prefetch_first_leaf(&orig, &version, &account, &leaves, next) {
+                    Ok(response) => response,
+                    Err(error) => return error,
+                };
             let body = Self::leaf_stream_body(
                 orig.clone_head(),
                 version.clone(),
                 account.clone(),
                 leaves,
                 Arc::clone(next),
+                first_response,
                 total_len.max(0) as u64,
             );
             (200u16, body, total_len)
@@ -1584,11 +1658,7 @@ impl Slo {
                 Some(r) => byte_range = Some(r),
                 None => unsatisfiable = true,
             }
-        } else if let Some(range) = orig
-            .headers
-            .get("Range")
-            .and_then(|h| Range::parse(h).ok())
-        {
+        } else if let Some(range) = orig.headers.get("Range").and_then(|h| Range::parse(h).ok()) {
             match range.ranges_for_length(Some(total_len.max(0) as u64)) {
                 Some(r) if r.is_empty() => unsatisfiable = true,
                 Some(r) if r.len() == 1 => byte_range = Some(r[0]),
@@ -1662,12 +1732,25 @@ impl Slo {
             );
             let len = (last_excl - first) as i64;
             let body = if is_get {
+                let first_response = match prefetch_first_leaf_async(
+                    orig.clone_head(),
+                    version.clone(),
+                    account.clone(),
+                    ranged.first().cloned(),
+                    next.clone(),
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(error) => return error,
+                };
                 leaf_stream_channel(
                     orig.clone_head(),
                     version.clone(),
                     account.clone(),
                     ranged,
                     next,
+                    first_response,
                     last_excl - first,
                 )
             } else {
@@ -1687,12 +1770,25 @@ impl Slo {
                         Ok(l) => l,
                         Err(err) => return err,
                     };
+                    let first_response = match prefetch_first_leaf_async(
+                        orig.clone_head(),
+                        version.clone(),
+                        account.clone(),
+                        ranged.first().cloned(),
+                        next.clone(),
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => return error,
+                    };
                     let mut b = leaf_stream_channel(
                         orig.clone_head(),
                         version.clone(),
                         account.clone(),
                         ranged,
                         next.clone(),
+                        first_response,
                         last_excl - first,
                     );
                     pieces.push(
@@ -1702,26 +1798,31 @@ impl Slo {
                     );
                 }
             }
-            let mp = multipart_range_body(
-                &boundary,
-                &ranges,
-                &pieces,
-                &ctype,
-                total_len.max(0) as u64,
-            );
-            headers.set(
-                "Content-Type",
-                multipart_byteranges_content_type(&boundary),
-            );
+            let mp =
+                multipart_range_body(&boundary, &ranges, &pieces, &ctype, total_len.max(0) as u64);
+            headers.set("Content-Type", multipart_byteranges_content_type(&boundary));
             let len = mp.len() as i64;
             (206u16, mp.into(), len)
         } else if is_get {
+            let first_response = match prefetch_first_leaf_async(
+                orig.clone_head(),
+                version.clone(),
+                account.clone(),
+                leaves.first().cloned(),
+                next.clone(),
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => return error,
+            };
             let body = leaf_stream_channel(
                 orig.clone_head(),
                 version.clone(),
                 account.clone(),
                 leaves,
                 next,
+                first_response,
                 total_len.max(0) as u64,
             );
             (200u16, body, total_len)
@@ -1746,8 +1847,10 @@ impl Slo {
         account: String,
         leaves: Vec<LeafSeg>,
         next: NextFn,
+        first_response: Option<Response>,
         total_len: u64,
     ) -> Body {
+        let mut first_response = first_response;
         let mut queue = leaves.into_iter();
         let reader = FnReader::new(move || {
             let seg = queue.next()?;
@@ -1757,7 +1860,11 @@ impl Slo {
             }
             let path = format!("/{version}/{account}{}", seg.name);
             let sub = slo_subreq(&orig, path.clone(), seg.range.as_deref());
-            let sresp = next(sub);
+            let sresp = if let Some(response) = first_response.take() {
+                response
+            } else {
+                next(sub)
+            };
             if !(200..300).contains(&sresp.status) {
                 return Some(Err(std::io::Error::other(format!(
                     "SLO segment {path} returned {}",
@@ -1940,7 +2047,8 @@ impl Slo {
                 None => Response::error(404, "Segment Not Found"),
             }
         });
-        let built = validate_put_entries(&req, entries, &version, &account, &next_heads, &mut || {});
+        let built =
+            validate_put_entries(&req, entries, &version, &account, &next_heads, &mut || {});
         if heartbeat {
             if !built.problem_segments.is_empty() {
                 return wrap_heartbeat_response(
@@ -2117,11 +2225,7 @@ impl Slo {
     /// fails, falls back to a best-effort detached-thread segment DELETE then
     /// still removes the manifest (Python would return 503 and leave the
     /// manifest).
-    async fn handle_multipart_delete_async(
-        &self,
-        req: Request,
-        next: AsyncNextFn,
-    ) -> Response {
+    async fn handle_multipart_delete_async(&self, req: Request, next: AsyncNextFn) -> Response {
         if req
             .param("async")
             .as_deref()
@@ -2535,7 +2639,6 @@ impl Slo {
         strip_swift_bytes_content_type(&mut resp.headers);
         resp.body = body.into();
     }
-
 }
 
 fn rewrite_manifest_get_content_type(resp: &mut Response) {
@@ -2590,10 +2693,7 @@ fn validate_put_entries(
                 .map(String::as_str)
                 .collect();
             if !extras.is_empty() {
-                errors.push(format!(
-                    "Index {i}: extraneous keys {}",
-                    extras.join(", ")
-                ));
+                errors.push(format!("Index {i}: extraneous keys {}", extras.join(", ")));
                 continue;
             }
             let Some(data_str) = e.get("data").and_then(|v| v.as_str()) else {
@@ -2631,19 +2731,11 @@ fn validate_put_entries(
         };
         let extras: Vec<&str> = e
             .keys()
-            .filter(|k| {
-                !matches!(
-                    k.as_str(),
-                    "path" | "etag" | "size_bytes" | "range"
-                )
-            })
+            .filter(|k| !matches!(k.as_str(), "path" | "etag" | "size_bytes" | "range"))
             .map(String::as_str)
             .collect();
         if !extras.is_empty() {
-            errors.push(format!(
-                "Index {i}: extraneous keys {}",
-                extras.join(", ")
-            ));
+            errors.push(format!("Index {i}: extraneous keys {}", extras.join(", ")));
             continue;
         }
         has_object_backed = true;
@@ -3187,6 +3279,9 @@ fn probe_async_delete_write_acl(
 
 impl Middleware for Slo {
     fn prepare(&self, req: &mut Request) -> MwPrep {
+        if slo_override(req) {
+            return MwPrep::Continue;
+        }
         if matches!(req.method.as_str(), "GET" | "HEAD")
             && split_path(&req.path, 4, 4, true).is_ok()
             && req.param("multipart-manifest").as_deref() != Some("get")
@@ -3199,6 +3294,9 @@ impl Middleware for Slo {
     }
 
     fn intercepts_request(&self, req: &Request) -> bool {
+        if slo_override(req) {
+            return false;
+        }
         if split_path(&req.path, 4, 4, true).is_err() {
             return false;
         }
@@ -3220,6 +3318,9 @@ impl Middleware for Slo {
         next: AsyncNextFn,
     ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
         Box::pin(async move {
+            if slo_override(&req) {
+                return next(req).await;
+            }
             let mpm = req.param("multipart-manifest");
             if req.method == "PUT" && mpm.as_deref() == Some("put") {
                 return self.handle_put_async(req, next).await;
@@ -3249,6 +3350,9 @@ impl Middleware for Slo {
         next: AsyncNextFn,
     ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
         Box::pin(async move {
+            if slo_override(&req) {
+                return next(req).await;
+            }
             if split_path(&req.path, 4, 4, true).is_err() {
                 if req.method == "GET" && split_path(&req.path, 3, 3, false).is_ok() {
                     let mut resp = next(req).await;
@@ -3272,6 +3376,9 @@ impl Middleware for Slo {
     }
 
     fn handle(&self, req: Request, next: &NextFn) -> Response {
+        if slo_override(&req) {
+            return next(req);
+        }
         if split_path(&req.path, 4, 4, true).is_err() {
             if req.method == "GET" && split_path(&req.path, 3, 3, false).is_ok() {
                 let mut resp = next(req);
@@ -3308,6 +3415,33 @@ impl Middleware for Slo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_container_sync_override_stores_internal_manifest_without_validation() {
+        let raw = br#"[{"name":"/segments/s1","hash":"abc","bytes":3}]"#.to_vec();
+        let expected = raw.clone();
+        let backend: NextFn = Arc::new(move |mut req: Request| {
+            assert_eq!(req.method, "PUT");
+            assert_eq!(req.query_string, "");
+            assert_eq!(
+                req.body.materialize(MAX_CONTROL_BODY).unwrap().as_ref(),
+                expected.as_slice()
+            );
+            Response::new(201)
+        });
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Slo-Override", "true");
+        headers.set(SLO_HEADER, "True");
+        let request = Request {
+            method: "PUT".into(),
+            path: "/v1/a/c/manifest".into(),
+            query_string: String::new(),
+            headers,
+            body: raw.into(),
+        };
+        assert!(!Slo::new().intercepts_request(&request));
+        assert_eq!(Slo::new().handle(request, &backend).status, 201);
+    }
 
     #[test]
     fn test_slo_etag_whole_segments() {
@@ -3500,6 +3634,42 @@ mod tests {
             resp.headers.get(MANIFEST_ETAG_HEADER),
             Some(manifest_etag(&two_segment_manifest_json()).as_str())
         );
+    }
+
+    #[test]
+    fn test_slo_missing_first_segment_is_conflict_before_stream_commit() {
+        let manifest_json = serde_json::to_vec(&serde_json::json!([
+            {"name": "/c/missing", "bytes": 12, "hash": "missing-etag"},
+        ]))
+        .unwrap();
+        let mut manifest = Response::with_body(200, manifest_json);
+        manifest.headers.set("X-Static-Large-Object", "True");
+        let be = backend(vec![("GET", "/v1/a/c/manifest", manifest)]);
+
+        let resp = Slo::new().handle(slo_get("/v1/a/c/manifest", None), &be);
+
+        assert_eq!(resp.status, 409);
+    }
+
+    #[tokio::test]
+    async fn test_slo_async_missing_first_segment_is_conflict_before_stream_commit() {
+        let manifest_json = serde_json::to_vec(&serde_json::json!([
+            {"name": "/c/missing", "bytes": 12, "hash": "missing-etag"},
+        ]))
+        .unwrap();
+        let mut manifest = Response::with_body(200, manifest_json);
+        manifest.headers.set("X-Static-Large-Object", "True");
+        let sync = backend(vec![("GET", "/v1/a/c/manifest", manifest)]);
+        let next: crate::AsyncNextFn = Arc::new(move |request| {
+            let sync = Arc::clone(&sync);
+            Box::pin(async move { sync(request) })
+        });
+
+        let resp = Slo::new()
+            .reassemble_async(slo_get("/v1/a/c/manifest", None), next)
+            .await;
+
+        assert_eq!(resp.status, 409);
     }
 
     #[test]

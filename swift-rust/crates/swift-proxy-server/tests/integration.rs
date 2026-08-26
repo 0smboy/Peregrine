@@ -280,9 +280,25 @@ fn test_proxy_end_to_end_account_and_container() {
     );
 
     // missing account: autocreate synthesizes an empty listing
-    let (status, _, body) = http(proxy_addr, "GET", "/v1/AUTH_missing?format=json", "");
+    let (status, headers, body) = http(proxy_addr, "GET", "/v1/AUTH_missing?format=json", "");
     assert_eq!(status, 200);
     assert_eq!(String::from_utf8_lossy(&body), "[]");
+    assert!(
+        headers.iter().any(|(k, v)| k.eq_ignore_ascii_case(
+            "X-Backend-Fake-Account-Listing"
+        ) && v.eq_ignore_ascii_case("yes")),
+        "fake listing must carry X-Backend-Fake-Account-Listing: {headers:?}"
+    );
+
+    // Probe check_server HEADs the account (fake 204) then PUTs a container.
+    // Without account_really_exists=false the proxy skips autocreate and 404s.
+    let (status, _, _) = http(proxy_addr, "HEAD", "/v1/AUTH_after_head", "");
+    assert_eq!(status, 204, "HEAD missing autocreate account");
+    let (status, _, _) = http(proxy_addr, "PUT", "/v1/AUTH_after_head/box2", "");
+    assert_eq!(
+        status, 201,
+        "container PUT after fake HEAD must autocreate the account"
+    );
 
     std::fs::remove_dir_all(&tmp).unwrap();
 }

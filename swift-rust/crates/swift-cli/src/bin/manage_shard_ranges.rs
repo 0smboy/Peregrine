@@ -246,8 +246,11 @@ fn cmd_info(broker: &mut ContainerBroker) -> i32 {
         // Cleaving context is optional sysmeta; print if present.
         if let Ok(md) = broker.metadata() {
             for (k, (v, _)) in md {
-                if k.eq_ignore_ascii_case("X-Container-Sysmeta-Shard-Cleaving-Context") {
-                    println!("Cleaving context: {v}");
+                let kl = k.to_ascii_lowercase();
+                if kl == "x-container-sysmeta-shard-cleaving-context"
+                    || kl.starts_with("x-container-sysmeta-shard-context-")
+                {
+                    println!("Cleaving context ({k}): {v}");
                 }
             }
         }

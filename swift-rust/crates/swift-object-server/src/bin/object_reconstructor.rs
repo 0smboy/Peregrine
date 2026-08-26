@@ -77,6 +77,10 @@ fn main() {
     let interval: u64 = get("object-reconstructor", "interval", "30")
         .parse()
         .unwrap_or(30);
+    let rebuild_handoff_node_count: i64 =
+        get("object-reconstructor", "rebuild_handoff_node_count", "2")
+            .parse()
+            .unwrap_or(2);
     let log_name = get("object-reconstructor", "log_name", "object-reconstructor");
     let log_level = get("object-reconstructor", "log_level", "INFO")
         .parse::<LogLevel>()
@@ -98,14 +102,14 @@ fn main() {
         "/var/cache/swift",
     );
 
-    let swift_conf_path =
-        std::env::var("SWIFT_CONF").unwrap_or_else(|_| "/etc/swift/swift.conf".to_string());
+    let swift_dir = std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string());
+    let swift_conf_path = std::env::var("SWIFT_CONF")
+        .unwrap_or_else(|_| format!("{swift_dir}/swift.conf"));
     let swift_conf = parse_conf_file(&swift_conf_path);
     let hash_config = HashPathConfig::from_swift_conf(&swift_conf).unwrap_or_else(|e| {
         logger.error(&format!("bad swift.conf hash config: {e}"));
         std::process::exit(1);
     });
-    let swift_dir = std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string());
     let policies = parse_storage_policies(&swift_conf).unwrap_or_else(|e| {
         logger.error(&format!("bad swift.conf storage policies: {e}"));
         std::process::exit(1);
@@ -176,6 +180,7 @@ fn main() {
                 &hash_config,
                 &diskfile_config,
                 &cleanup,
+                rebuild_handoff_node_count,
                 &pusher,
                 &hash_fetcher,
                 &mut total,
@@ -234,6 +239,7 @@ fn sweep_policy(
     hash_config: &HashPathConfig,
     diskfile_config: &DiskFileConfig,
     cleanup: &CleanupConfig,
+    rebuild_handoff_node_count: i64,
     pusher: &TcpSsyncPusher,
     hash_fetcher: &HttpSuffixHashFetcher,
     total: &mut EcSsyncStats,
@@ -282,6 +288,10 @@ fn sweep_policy(
                 total.failures += 1;
                 continue;
             };
+            let Ok(handoff_nodes) = policy.ring.get_more_nodes(partition as u32) else {
+                total.failures += 1;
+                continue;
+            };
             let jobs = build_part_jobs(
                 &part_path,
                 partition,
@@ -289,6 +299,8 @@ fn sweep_policy(
                 policy.kind,
                 cleanup,
                 &part_nodes,
+                &handoff_nodes,
+                rebuild_handoff_node_count,
                 local_id,
                 Some(policy.scheme),
             );

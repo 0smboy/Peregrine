@@ -30,18 +30,38 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use swift_http::{Body, HeaderKeyDict, IncomingBody, Response, STREAM_CHUNK};
-use swift_runtime::{
-    CancellationToken, FanoutGroup, QuorumTracker, SharedWindow, TaskScope,
-};
+use swift_runtime::{CancellationToken, FanoutGroup, QuorumTracker, SharedWindow, TaskScope};
 
 use swift_core::config::config_true_value;
 use swift_core::storage_policy::quorum_size;
 use swift_core::timestamp::Timestamp;
 
+/// Python `container.py` GET/HEAD: `resp.last_modified = Timestamp(x-put-timestamp)`.
+pub(crate) fn stamp_container_last_modified(resp: &mut Response) {
+    if resp
+        .headers
+        .get("Last-Modified")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let put = resp
+        .headers
+        .get("X-PUT-Timestamp")
+        .or_else(|| resp.headers.get("X-Timestamp"))
+        .unwrap_or("");
+    if let Ok(ts) = put.parse::<Timestamp>() {
+        resp.headers
+            .set("Last-Modified", swift_http::http_date(ts.ceil()));
+    }
+}
+
 use super::{
     account_info_from_response, backend_404_timestamp, fill_container_info_from_head,
     info_cache_time, is_good_source, percent_encode, post_existence_proof_guard, resp_header,
-    source_timestamp, swob_response, AccountInfo, BackendResponse, ContainerInfo, Node, ProxyApp,
+    ring_nodes, source_timestamp, swob_response, AccountInfo, BackendResponse, ContainerInfo, Node,
+    ProxyApp,
 };
 
 /// Per-backend pending bytes: one stream chunk. A replica that does not
@@ -92,7 +112,10 @@ async fn read_http_head(
         }
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "backend read timeout"));
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "backend read timeout",
+            ));
         }
         let mut tmp = [0u8; 512];
         let n = tokio::time::timeout(left, stream.read(&mut tmp))
@@ -620,11 +643,10 @@ impl ProxyApp {
         drain: QuorumDrain,
     ) -> Response {
         let slots = per_node_headers.len().max(1);
-        let mut group: FanoutGroup<Option<BackendResponse>> =
-            match FanoutGroup::new(slots, slots) {
-                Ok(g) => g,
-                Err(_) => return swob_response(503),
-            };
+        let mut group: FanoutGroup<Option<BackendResponse>> = match FanoutGroup::new(slots, slots) {
+            Ok(g) => g,
+            Err(_) => return swob_response(503),
+        };
         let node_pool = Arc::new(Mutex::new(nodes.into_iter().collect::<VecDeque<_>>()));
         for headers in per_node_headers.into_iter() {
             let app = Arc::clone(self);
@@ -805,13 +827,7 @@ impl ProxyApp {
                 Err(_) => return swob_response(499),
             };
             for piece in chunk.chunks(BACKEND_WINDOW_BYTES) {
-                putters = tee_one_chunk(
-                    putters,
-                    piece.to_vec(),
-                    chunked,
-                    node_timeout,
-                )
-                .await;
+                putters = tee_one_chunk(putters, piece.to_vec(), chunked, node_timeout).await;
                 if putters.len() < quorum {
                     return swob_response(503);
                 }
@@ -957,12 +973,20 @@ impl ProxyApp {
                 Ok(head) if head.status == 404 => {
                     let ts = backend_404_timestamp(&head.headers);
                     if !node.handoff || ts.is_truthy() {
-                        if is_object && ts > latest_404_timestamp {
+                        // Same watermark as sync get_or_head: container
+                        // DELETE tombstones beat a stale handoff 200
+                        // (probe L2095 / listing-w214).
+                        if ts > latest_404_timestamp {
                             latest_404_timestamp = ts;
                         }
                         if recorded_404.is_none() {
-                            match buffer_backend_body(head, swift_http::MAX_CONTROL_BODY, !is_head, idle)
-                                .await
+                            match buffer_backend_body(
+                                head,
+                                swift_http::MAX_CONTROL_BODY,
+                                !is_head,
+                                idle,
+                            )
+                            .await
                             {
                                 Ok(resp) => recorded_404 = Some(build(resp)),
                                 Err(_) => self.error_limiter.increment(&node),
@@ -980,8 +1004,13 @@ impl ProxyApp {
                         if is_object && !is_head {
                             return Some(build_streamed(head));
                         }
-                        match buffer_backend_body(head, swift_http::MAX_CONTROL_BODY, !is_head, idle)
-                            .await
+                        match buffer_backend_body(
+                            head,
+                            swift_http::MAX_CONTROL_BODY,
+                            !is_head,
+                            idle,
+                        )
+                        .await
                         {
                             Ok(resp) => return Some(build(resp)),
                             Err(_) => {
@@ -1040,6 +1069,7 @@ impl ProxyApp {
             sync_key: None,
             rfc_compliant_etags: None,
             cors: super::CorsInfo::default(),
+            db_state: String::new(),
         };
         let Ok((part, _)) = self
             .container_ring
@@ -1083,14 +1113,7 @@ impl ProxyApp {
             .await
         {
             info = account_info_from_response(&resp);
-            if let Some(ttl) = info_cache_time(
-                resp.status,
-                resp.headers.get("X-Backend-Recheck-Account-Existence"),
-                self.config.recheck_account_existence,
-            ) {
-                self.info_cache
-                    .set_account(account.to_string(), info.clone(), ttl);
-            }
+            self.cache_account_from_response(account, &resp);
         } else {
             info.status = 503;
         }
@@ -1136,8 +1159,10 @@ impl ProxyApp {
         }
         let mut shard_headers = HeaderKeyDict::new();
         shard_headers.set("X-Backend-Record-Type", "shard");
-        let arr = if let Some(a) = self
-            .fetch_json_array_first_nonempty_async(
+        // Longest nonempty, same `states=updating` query (probe L631).
+        // listing-w137/w138: do not add includes= here until concat is proven.
+        let updating = self
+            .fetch_json_array_longest_nonempty_async(
                 &nodes,
                 part,
                 &path,
@@ -1145,34 +1170,23 @@ impl ProxyApp {
                 &shard_headers,
             )
             .await
-            .filter(|a| !a.is_empty())
+            .filter(|a| !a.is_empty());
+        let root_path = format!("{account}/{container}");
+        let name = match updating
+            .as_ref()
+            .and_then(|arr| super::pick_updating_shard_name(arr, object, &root_path))
         {
-            a
-        } else {
-            self.fetch_listing_shard_ranges_async(nodes, part, &path, &shard_headers)
-                .await?
+            Some(n) => n,
+            None => {
+                // Lagging replica may return a non-empty updating set that
+                // still lacks nested children; fall back to listing states
+                // without changing the updating query (probe L1435).
+                let listing = self
+                    .fetch_listing_shard_ranges_async(nodes, part, &path, &shard_headers)
+                    .await?;
+                super::pick_updating_shard_name(&listing, object, &root_path)?
+            }
         };
-        let mut best: Option<&serde_json::Value> = None;
-        for sr in &arr {
-            let name = sr.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if !name.contains('/') {
-                continue;
-            }
-            if name == format!("{account}/{container}") {
-                continue;
-            }
-            let lower = sr.get("lower").and_then(|v| v.as_str()).unwrap_or("");
-            let upper = sr.get("upper").and_then(|v| v.as_str()).unwrap_or("");
-            if !lower.is_empty() && object <= lower {
-                continue;
-            }
-            if !upper.is_empty() && object > upper {
-                continue;
-            }
-            best = Some(sr);
-            break;
-        }
-        let name = best?.get("name")?.as_str()?;
         let (a, c) = name.split_once('/')?;
         Some((a.to_string(), c.to_string()))
     }
@@ -1334,53 +1348,125 @@ impl ProxyApp {
         cond_headers: HeaderKeyDict,
     ) -> Response {
         use swift_ec::EcDriver;
+        struct EcResponseBucket {
+            etag: String,
+            meta: Vec<(String, String)>,
+            sources: std::collections::HashMap<i32, AsyncBackendHead>,
+        }
+
         let nodes = self.iter_nodes(object_ring, object_part);
-        let mut sources: std::collections::HashMap<i32, AsyncBackendHead> =
+        let required = if is_head { 1 } else { ec.ndata };
+        let mut buckets: std::collections::HashMap<String, EcResponseBucket> =
             std::collections::HashMap::new();
-        let mut meta: Option<Vec<(String, String)>> = None;
+        let mut durable_timestamps: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut saw_404 = false;
-        for node in nodes {
-            match backend_request_head_async(
-                &node,
-                object_part,
-                "GET",
-                path,
-                "",
-                &headers,
-                b"",
-                self.config.conn_timeout,
-                self.config.node_timeout,
-            )
-            .await
-            {
-                Ok(head) if head.status == 200 => {
-                    let fi = resp_header(&head.headers, "X-Object-Sysmeta-Ec-Frag-Index")
-                        .and_then(|v| v.parse::<i32>().ok());
-                    if let Some(fi) = fi {
-                        if sources.len() >= ec.ndata && !sources.contains_key(&fi) {
+        // Python may issue up to twice the replica count. The second pass is
+        // essential when every primary has a newer non-durable generation:
+        // pass one discovers and excludes those fragment indexes, then pass
+        // two asks the same nodes for the older durable generation.
+        'request_rounds: for _round in 0..2 {
+            for node in &nodes {
+                let preferences = encode_ec_fragment_preferences(
+                    buckets.iter().map(|(timestamp, bucket)| {
+                        (
+                            timestamp.as_str(),
+                            durable_timestamps.contains(timestamp),
+                            bucket.sources.keys().copied().collect(),
+                        )
+                    }),
+                    required,
+                );
+                let mut request_headers = headers.clone();
+                request_headers.set("X-Backend-Fragment-Preferences", preferences);
+                match backend_request_head_async(
+                    node,
+                    object_part,
+                    "GET",
+                    path,
+                    "",
+                    &request_headers,
+                    b"",
+                    self.config.conn_timeout,
+                    self.config.node_timeout,
+                )
+                .await
+                {
+                    Ok(head) if head.status == 200 => {
+                        let explicit_data_timestamp =
+                            resp_header(&head.headers, "X-Backend-Data-Timestamp");
+                        let data_timestamp = explicit_data_timestamp
+                            .or_else(|| resp_header(&head.headers, "X-Backend-Timestamp"))
+                            .or_else(|| resp_header(&head.headers, "X-Timestamp"))
+                            .map(str::to_string);
+                        let Some(data_timestamp) = data_timestamp else {
                             continue;
+                        };
+                        if let Some(durable_timestamp) =
+                            resp_header(&head.headers, "X-Backend-Durable-Timestamp")
+                        {
+                            durable_timestamps.insert(durable_timestamp.to_string());
+                        } else if explicit_data_timestamp.is_none() {
+                            // Compatibility with older object servers: without
+                            // a distinct data timestamp Python assumes a
+                            // successful fragment response is durable.
+                            durable_timestamps.insert(data_timestamp.clone());
                         }
-                        if meta.is_none() {
-                            meta = Some(head.headers.clone());
+                        let fi = resp_header(&head.headers, "X-Object-Sysmeta-Ec-Frag-Index")
+                            .and_then(|value| value.parse::<i32>().ok());
+                        if let Some(fi) = fi {
+                            let etag = resp_header(&head.headers, "X-Object-Sysmeta-Ec-Etag")
+                                .unwrap_or_default()
+                                .to_string();
+                            let bucket =
+                                buckets.entry(data_timestamp.clone()).or_insert_with(|| {
+                                    EcResponseBucket {
+                                        etag: etag.clone(),
+                                        meta: head.headers.clone(),
+                                        sources: std::collections::HashMap::new(),
+                                    }
+                                });
+                            // Fragments at one timestamp with different EC
+                            // etags can never be decoded together. Python
+                            // rejects the mismatching response too.
+                            if bucket.etag == etag {
+                                bucket.sources.entry(fi).or_insert(head);
+                            }
                         }
-                        sources.entry(fi).or_insert(head);
                     }
+                    Ok(head) if head.status == 404 => saw_404 = true,
+                    Ok(head) if head.status == 507 => self.error_limiter.limit(node),
+                    Ok(head) if head.status >= 500 => self.error_limiter.increment(node),
+                    Ok(_) => {}
+                    Err(_) => self.error_limiter.increment(node),
                 }
-                Ok(head) if head.status == 404 => saw_404 = true,
-                Ok(head) if head.status == 507 => self.error_limiter.limit(&node),
-                Ok(head) if head.status >= 500 => self.error_limiter.increment(&node),
-                Ok(_) => {}
-                Err(_) => self.error_limiter.increment(&node),
+                if buckets.iter().any(|(timestamp, bucket)| {
+                    durable_timestamps.contains(timestamp) && bucket.sources.len() >= required
+                }) {
+                    break 'request_rounds;
+                }
             }
         }
-        if sources.len() < ec.ndata {
-            return if saw_404 && sources.is_empty() {
+        let chosen_timestamp = buckets
+            .iter()
+            .filter(|(timestamp, bucket)| {
+                durable_timestamps.contains(*timestamp) && bucket.sources.len() >= required
+            })
+            .map(|(timestamp, _)| timestamp)
+            .max()
+            .cloned();
+        let Some(chosen_timestamp) = chosen_timestamp else {
+            return if saw_404 && buckets.is_empty() {
                 swob_response(404)
             } else {
                 swob_response(503)
             };
-        }
-        let meta = meta.unwrap_or_default();
+        };
+        let chosen = buckets
+            .remove(&chosen_timestamp)
+            .expect("chosen EC response bucket must exist");
+        let sources = chosen.sources;
+        let meta = chosen.meta;
         let ec_etag = resp_header(&meta, "X-Object-Sysmeta-Ec-Etag")
             .unwrap_or_default()
             .to_string();
@@ -1447,7 +1533,8 @@ impl ProxyApp {
                 "Content-Range",
                 format!("bytes {start}-{}/{orig_size}", end.saturating_sub(1)),
             );
-            resp.headers.set("Content-Length", end.saturating_sub(start));
+            resp.headers
+                .set("Content-Length", end.saturating_sub(start));
         } else if multi_ranges.is_none() {
             resp.headers.set("Content-Length", orig_size);
         }
@@ -1465,7 +1552,9 @@ impl ProxyApp {
         }
         let driver = match EcDriver::new(ec.ndata, ec.nparity) {
             Ok(d) => d,
-            Err(e) => return Response::with_body(500, format!("EC init failed: {e:?}").into_bytes()),
+            Err(e) => {
+                return Response::with_body(500, format!("EC init failed: {e:?}").into_bytes())
+            }
         };
         let idle = self.config.node_timeout;
         let mut heads: Vec<AsyncBackendHead> = sources.into_values().take(ec.ndata).collect();
@@ -1481,7 +1570,11 @@ impl ProxyApp {
                 h.update(s.to_le_bytes());
                 h.update(e.to_le_bytes());
             }
-            let boundary = h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>();
+            let boundary = h
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
             let mp_len: u64 = {
                 let size = orig_size as u64;
                 let mut n = format!("--{boundary}--").len() as u64;
@@ -1520,7 +1613,8 @@ impl ProxyApp {
         let _ = scope.spawn(async move {
             let mut skipped = 0u64;
             let mut sent = 0u64;
-            let mut assembled: Option<Vec<u8>> = multipart.as_ref().map(|_| Vec::with_capacity(orig_size));
+            let mut assembled: Option<Vec<u8>> =
+                multipart.as_ref().map(|_| Vec::with_capacity(orig_size));
             for seg_len in seg_sizes {
                 if assembled.is_none() && sent >= take {
                     break;
@@ -1600,7 +1694,16 @@ impl ProxyApp {
     ) -> Response {
         #[cfg(not(feature = "ec"))]
         {
-            let _ = (req, account, container, path, policy_index, object_ring, object_part, body);
+            let _ = (
+                req,
+                account,
+                container,
+                path,
+                policy_index,
+                object_ring,
+                object_part,
+                body,
+            );
             return Response::with_body(
                 501,
                 b"erasure coding not built (compile with --features ec)".to_vec(),
@@ -1647,8 +1750,9 @@ impl ProxyApp {
         };
         let n = ec.n_unique();
         let client_len = body.content_length();
-        let archive_len = client_len.map(|total| super::ec_archive_size(&driver, ec.segment_size, total));
-        let put_ts = Timestamp::now();
+        let archive_len =
+            client_len.map(|total| super::ec_archive_size(&driver, ec.segment_size, total));
+        let put_ts = super::object_write_timestamp(req);
         let ts = put_ts.internal();
         super::apply_content_type_guess(req);
         let content_type = req
@@ -1667,6 +1771,7 @@ impl ProxyApp {
         base.set("X-Timestamp", &ts);
         base.set("Content-Type", &content_type);
         base.set("X-Backend-Storage-Policy-Index", policy_index);
+        self.stamp_root_db_state(account, container, &mut base);
         let mut per_node = Vec::with_capacity(n);
         for i in 0..n {
             let mut h = base.clone();
@@ -1687,31 +1792,77 @@ impl ProxyApp {
                 Md5::digest(b.as_bytes())
             )
         };
-        let nodes = self.iter_nodes(object_ring, object_part);
+        // Preserve the primary slot as the fragment index. `iter_nodes()` is
+        // unsuitable here: it removes error-limited primaries and then a
+        // plain enumerate shifts every later fragment index; its `.take(n)`
+        // also prevents a failed primary from consuming a handoff. Python's
+        // EC putter keeps one slot per primary and fills that same slot from
+        // the next handoff when necessary.
+        let primaries = ring_nodes(object_ring.get_part_nodes(object_part).unwrap_or_default());
+        if primaries.len() != n {
+            return Response::with_body(
+                500,
+                format!("EC ring replica count {} != k+m {}", primaries.len(), n).into_bytes(),
+            );
+        }
+        let mut handoffs: VecDeque<Node> = object_ring
+            .get_more_nodes(object_part)
+            .map(|more| {
+                more.into_iter()
+                    .map(|h| Node {
+                        ip: h.dev.ip.clone(),
+                        port: h.dev.port,
+                        device: h.dev.device.clone(),
+                        handoff: true,
+                    })
+                    .filter(|node| !self.error_limiter.is_limited(node))
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut putters: Vec<AsyncMimePutter> = Vec::new();
         let mut earlies: Vec<u16> = Vec::new();
         let wait = self.config.conn_timeout + self.config.node_timeout;
         let node_timeout = self.config.node_timeout;
         let conn_timeout = self.config.conn_timeout;
-        for (i, node) in nodes.into_iter().take(n).enumerate() {
-            match connect_mime_putter_async(
-                &node,
-                object_part,
-                path,
-                &per_node[i.min(per_node.len().saturating_sub(1))],
-                &boundary,
-                archive_len,
-                conn_timeout,
-                node_timeout,
-            )
-            .await
-            {
-                Ok(AsyncMimeOutcome::Live(mut p)) => {
-                    p.frag_index = i;
-                    putters.push(p);
+        for (i, primary) in primaries.into_iter().enumerate() {
+            let mut candidate = Some(primary);
+            loop {
+                let node = match candidate.take() {
+                    Some(node) if !self.error_limiter.is_limited(&node) => node,
+                    Some(_) | None => match handoffs.pop_front() {
+                        Some(node) => node,
+                        None => break,
+                    },
+                };
+                match connect_mime_putter_async(
+                    &node,
+                    object_part,
+                    path,
+                    &per_node[i],
+                    &boundary,
+                    archive_len,
+                    conn_timeout,
+                    node_timeout,
+                )
+                .await
+                {
+                    Ok(AsyncMimeOutcome::Live(mut p)) => {
+                        p.frag_index = i;
+                        putters.push(p);
+                        break;
+                    }
+                    Ok(AsyncMimeOutcome::EarlyFinal(507)) => {
+                        self.error_limiter.limit(&node);
+                    }
+                    Ok(AsyncMimeOutcome::EarlyFinal(status)) if status >= 500 => {
+                        self.error_limiter.increment(&node);
+                    }
+                    Ok(AsyncMimeOutcome::EarlyFinal(status)) => {
+                        earlies.push(status);
+                        break;
+                    }
+                    Err(_) => self.error_limiter.increment(&node),
                 }
-                Ok(AsyncMimeOutcome::EarlyFinal(status)) => earlies.push(status),
-                Err(_) => self.error_limiter.increment(&node),
             }
         }
         if earlies.contains(&412) {
@@ -1752,7 +1903,8 @@ impl ProxyApp {
             while seg_buf.len() >= ec.segment_size {
                 let rest = seg_buf.split_off(ec.segment_size);
                 let segment = std::mem::replace(&mut seg_buf, rest);
-                if let Err(resp) = tee_ec_segment(&mut putters, &driver, &segment, node_timeout).await
+                if let Err(resp) =
+                    tee_ec_segment(&mut putters, &driver, &segment, node_timeout).await
                 {
                     return resp;
                 }
@@ -1765,8 +1917,7 @@ impl ProxyApp {
             return swob_response(499);
         }
         if !seg_buf.is_empty() {
-            if let Err(resp) = tee_ec_segment(&mut putters, &driver, &seg_buf, node_timeout).await
-            {
+            if let Err(resp) = tee_ec_segment(&mut putters, &driver, &seg_buf, node_timeout).await {
                 return resp;
             }
         }
@@ -1827,7 +1978,9 @@ impl ProxyApp {
             .headers
             .get("X-Backend-Storage-Policy-Index")
             .and_then(|v| v.parse().ok());
-        let info = self.container_info_async(account, container).await;
+        let info = self
+            .container_info_for_write_async(account, container)
+            .await;
         if !info.exists() {
             return swob_response(404);
         }
@@ -1854,32 +2007,22 @@ impl ProxyApp {
         else {
             return swob_response(503);
         };
-        let container_nodes = self.iter_nodes(&self.container_ring, container_part);
         let mut base = self.backend_headers(req, true, "object");
-        base.set("X-Timestamp", Timestamp::now().internal());
+        base.set("X-Timestamp", super::object_write_timestamp(req).internal());
         base.set("X-Backend-Storage-Policy-Index", policy_index);
-        if upd_account != account || upd_container != container {
-            base.set(
-                "X-Backend-Container-Path",
-                format!("{upd_account}/{upd_container}"),
-            );
-            base.set("X-Backend-Allow-Reserved-Names", "true");
-        }
+        self.stamp_root_db_state(account, container, &mut base);
+        super::stamp_shard_container_path(
+            &mut base,
+            &upd_account,
+            &upd_container,
+            account,
+            container,
+        );
         let node_number = object_ring
             .get_part_nodes(object_part)
             .map(|n| n.len())
             .unwrap_or(1);
-        let mut per_node = Vec::with_capacity(node_number);
-        for i in 0..node_number {
-            let mut headers = base.clone();
-            if !container_nodes.is_empty() {
-                let cont = &container_nodes[i % container_nodes.len()];
-                headers.set("X-Container-Host", format!("{}:{}", cont.ip, cont.port));
-                headers.set("X-Container-Partition", container_part);
-                headers.set("X-Container-Device", &cont.device);
-            }
-            per_node.push(headers);
-        }
+        let per_node = self.object_container_update_headers(&base, container_part, node_number);
         self.post_object_async(
             object_ring,
             object_part,
@@ -1906,7 +2049,9 @@ impl ProxyApp {
         replica_count: usize,
     ) -> Response {
         let node_pool = Arc::new(Mutex::new(
-            self.iter_nodes(ring, part).into_iter().collect::<VecDeque<_>>(),
+            self.iter_nodes(ring, part)
+                .into_iter()
+                .collect::<VecDeque<_>>(),
         ));
         let mut slots = self
             .post_fan_out_async(&node_pool, part, path, query, per_node_headers.clone())
@@ -1999,7 +2144,7 @@ impl ProxyApp {
                             }
                         }
                     };
-                    match backend_request_async(
+                    let backend_result = backend_request_async(
                         &node,
                         part,
                         "POST",
@@ -2010,8 +2155,8 @@ impl ProxyApp {
                         app.config.conn_timeout,
                         app.config.node_timeout,
                     )
-                    .await
-                    {
+                    .await;
+                    match backend_result {
                         Ok(resp) if resp.status == 507 => app.error_limiter.limit(&node),
                         Ok(resp) if resp.status >= 500 => app.error_limiter.increment(&node),
                         Ok(resp) => {
@@ -2058,19 +2203,17 @@ impl ProxyApp {
         let headers = self.backend_headers(&req, false, "account");
         let nodes = self.iter_nodes(&self.account_ring, part);
         match self
-            .get_or_head_async(
-                "account",
-                nodes,
-                part,
-                &method,
-                &path,
-                &query,
-                &headers,
-            )
+            .get_or_head_async("account", nodes, part, &method, &path, &query, &headers)
             .await
         {
             Some(resp) if resp.status == 404 && self.config.account_autocreate => {
-                super::synthesized_account_listing(&req)
+                let mut fake = super::synthesized_account_listing(&req);
+                fake.headers.set(
+                    "X-Backend-Recheck-Account-Existence",
+                    format!("{}", self.config.recheck_account_existence as i64),
+                );
+                self.cache_account_from_response(account, &fake);
+                fake
             }
             Some(resp) => resp,
             None => swob_response(503),
@@ -2090,6 +2233,19 @@ impl ProxyApp {
             return swob_response(503);
         };
         let path = format!("/{}/{}", percent_encode(account), percent_encode(container));
+        // Python `validate_container_params` (probe test_sharding_listing
+        // delimiter=%ff → 400 "not valid UTF-8").
+        if let Some(name) = swift_http::listing_query_invalid_utf8_param(&req.query_string) {
+            let mut resp = Response::with_body(
+                400,
+                format!("\"{name}\" parameter not valid UTF-8").into_bytes(),
+            );
+            resp.headers.set("Content-Type", "text/plain");
+            return resp;
+        }
+        if let Err(resp) = super::constrain_listing_limit(&req) {
+            return resp;
+        }
         let record_type = req
             .headers
             .get("X-Backend-Record-Type")
@@ -2146,6 +2302,7 @@ impl ProxyApp {
             {
                 resp.headers.set("X-Storage-Policy", name);
             }
+            stamp_container_last_modified(&mut resp);
         }
         resp
     }
@@ -2219,15 +2376,7 @@ impl ProxyApp {
             let _ = self.autocreate_account(account);
             let nodes = self.iter_nodes(&self.account_ring, part);
             return self
-                .make_write_async(
-                    nodes,
-                    node_count,
-                    part,
-                    &method,
-                    &path,
-                    &query,
-                    per_node,
-                )
+                .make_write_async(nodes, node_count, part, &method, &path, &query, per_node)
                 .await;
         }
         resp
@@ -2250,8 +2399,8 @@ impl ProxyApp {
         else {
             return swob_response(503);
         };
-        let acct_status = self.account_info_async(account).await.status;
-        if !(200..300).contains(&acct_status) {
+        let acct_status = self.account_info_async(account).await;
+        if !acct_status.exists() {
             return swob_response(404);
         }
         let mut base = self.backend_headers(&req, true, "container");
@@ -2300,14 +2449,14 @@ impl ProxyApp {
         let Ok((account_part, _)) = self.account_ring.get_nodes(account, None, None) else {
             return swob_response(503);
         };
-        let acct_status = self.account_info_async(account).await.status;
-        if !(200..300).contains(&acct_status) {
+        let acct_status = self.account_info_async(account).await;
+        if !acct_status.exists() {
             if self.config.account_autocreate {
                 if !self.autocreate_account(account) {
                     return swob_response(503);
                 }
-                let refreshed = self.account_info_async(account).await.status;
-                if !(200..300).contains(&refreshed) {
+                let refreshed = self.account_info_async(account).await;
+                if !refreshed.exists() {
                     return swob_response(404);
                 }
             } else {
@@ -2384,6 +2533,7 @@ impl ProxyApp {
         query: &str,
         headers: &HeaderKeyDict,
     ) -> Option<Vec<serde_json::Value>> {
+        // Shard-range fetch: first nonempty array, never union (L1306).
         let mut last_empty: Option<Vec<serde_json::Value>> = None;
         for node in nodes {
             let Some(resp) = self
@@ -2420,6 +2570,132 @@ impl ProxyApp {
         last_empty
     }
 
+    async fn fetch_json_array_merged_async(
+        self: &Arc<Self>,
+        nodes: &[Node],
+        part: u32,
+        path: &str,
+        query: &str,
+        headers: &HeaderKeyDict,
+        empty_wins: bool,
+    ) -> Option<Vec<serde_json::Value>> {
+        // Always walk replicas. Unsettled union (L1321 extra PUTs); settled
+        // empty-wins (L1418). 404 is not empty.
+        // Do not short-circuit on X-Newest (listing-w151 UTF8 L692 FAIL).
+        let mut replies: Vec<Option<Vec<serde_json::Value>>> = Vec::new();
+        let mut timestamps: Vec<swift_core::timestamp::Timestamp> = Vec::new();
+        for node in nodes {
+            let Some(resp) = self
+                .get_or_head_async(
+                    "container",
+                    vec![node.clone()],
+                    part,
+                    "GET",
+                    path,
+                    query,
+                    headers,
+                )
+                .await
+            else {
+                replies.push(None);
+                timestamps.push(swift_core::timestamp::Timestamp::zero());
+                continue;
+            };
+            if !(200..300).contains(&resp.status) {
+                replies.push(None);
+                timestamps.push(swift_core::timestamp::Timestamp::zero());
+                continue;
+            }
+            let ts = super::listing_resp_timestamp(&resp.headers);
+            let body = match resp.body.collect_async().await {
+                Ok(b) => b,
+                Err(_) => {
+                    replies.push(None);
+                    timestamps.push(swift_core::timestamp::Timestamp::zero());
+                    continue;
+                }
+            };
+            if resp.status == 204 || body.is_empty() {
+                replies.push(Some(Vec::new()));
+                timestamps.push(ts);
+                continue;
+            }
+            let val: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(_) => {
+                    replies.push(None);
+                    timestamps.push(swift_core::timestamp::Timestamp::zero());
+                    continue;
+                }
+            };
+            let arr = val.as_array().cloned().unwrap_or_default();
+            replies.push(Some(arr));
+            timestamps.push(ts);
+        }
+        super::fold_replica_listings_dated(&replies, empty_wins, &timestamps)
+    }
+
+    async fn fetch_json_arrays_nonempty_async(
+        self: &Arc<Self>,
+        nodes: &[Node],
+        part: u32,
+        path: &str,
+        query: &str,
+        headers: &HeaderKeyDict,
+    ) -> Vec<Vec<serde_json::Value>> {
+        let mut arrays: Vec<Vec<serde_json::Value>> = Vec::new();
+        for node in nodes {
+            let Some(resp) = self
+                .get_or_head_async(
+                    "container",
+                    vec![node.clone()],
+                    part,
+                    "GET",
+                    path,
+                    query,
+                    headers,
+                )
+                .await
+            else {
+                continue;
+            };
+            if !(200..300).contains(&resp.status) {
+                continue;
+            }
+            let body = match resp.body.collect_async().await {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if resp.status == 204 || body.is_empty() {
+                continue;
+            }
+            let val: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let arr = val.as_array().cloned().unwrap_or_default();
+            if !arr.is_empty() {
+                arrays.push(arr);
+            }
+        }
+        arrays
+    }
+
+    async fn fetch_json_array_longest_nonempty_async(
+        self: &Arc<Self>,
+        nodes: &[Node],
+        part: u32,
+        path: &str,
+        query: &str,
+        headers: &HeaderKeyDict,
+    ) -> Option<Vec<serde_json::Value>> {
+        super::prefer_longest_nonempty_arrays(
+            &self
+                .fetch_json_arrays_nonempty_async(nodes, part, path, query, headers)
+                .await,
+        )
+    }
+
     async fn fetch_listing_shard_ranges_async(
         self: &Arc<Self>,
         nodes: Vec<Node>,
@@ -2428,7 +2704,7 @@ impl ProxyApp {
         shard_headers: &HeaderKeyDict,
     ) -> Option<Vec<serde_json::Value>> {
         if let Some(arr) = self
-            .fetch_json_array_first_nonempty_async(
+            .fetch_json_array_longest_nonempty_async(
                 &nodes,
                 part,
                 path,
@@ -2438,13 +2714,21 @@ impl ProxyApp {
             .await
         {
             if !arr.is_empty() {
-                return Some(arr);
+                return Some(super::prefer_full_active_cover_ranges(&arr));
             }
         }
         let broad = self
-            .fetch_json_array_first_nonempty_async(&nodes, part, path, "format=json", shard_headers)
+            .fetch_json_array_longest_nonempty_async(
+                &nodes,
+                part,
+                path,
+                "format=json",
+                shard_headers,
+            )
             .await?;
-        Some(super::prefer_listing_state_ranges(&broad))
+        Some(super::prefer_full_active_cover_ranges(
+            &super::prefer_listing_state_ranges(&broad),
+        ))
     }
 
     pub(crate) async fn maybe_sharded_container_listing_async(
@@ -2454,7 +2738,10 @@ impl ProxyApp {
         container: &str,
     ) -> Option<Response> {
         let marker = req.param("marker").unwrap_or_default();
+        let end_marker = req.param("end_marker").unwrap_or_default();
         let prefix = req.param("prefix").unwrap_or_default();
+        let delimiter = req.param("delimiter").unwrap_or_default();
+        let reverse = config_true_value(req.param("reverse").as_deref().unwrap_or(""));
         let limit: usize = req
             .param("limit")
             .and_then(|v| v.parse().ok())
@@ -2467,6 +2754,7 @@ impl ProxyApp {
         root_headers.set("X-Backend-Record-Type", "object");
         let mut listing_headers = self.backend_headers(&req, false, "container");
         listing_headers.set("X-Backend-Allow-Reserved-Names", "true");
+        listing_headers.set("X-Backend-Record-Type", "object");
         let Ok((part, _)) = self
             .container_ring
             .get_nodes(account, Some(container), None)
@@ -2475,7 +2763,7 @@ impl ProxyApp {
         };
         let path = format!("/{}/{}", percent_encode(account), percent_encode(container));
         let nodes = self.iter_nodes(&self.container_ring, part);
-        let head = self
+        let mut head = self
             .get_or_head_async(
                 "container",
                 nodes.clone(),
@@ -2489,6 +2777,27 @@ impl ProxyApp {
         if !(200..300).contains(&head.status) {
             return None;
         }
+        // Python HEAD uses root `get_shard_usage` (ACTIVE/SHARDING/SHRINKING
+        // range stats). Max of replica HEAD counts is wrong on the way down:
+        // after reclaim PUT_shard, lagging replicas still say 100 and
+        // `best=max` fails probe L1979 (`51 != 100`).
+        if req.method.eq_ignore_ascii_case("HEAD") {
+            let arrays = self
+                .fetch_json_arrays_nonempty_async(
+                    &nodes,
+                    part,
+                    &path,
+                    "states=listing&format=json",
+                    &shard_headers,
+                )
+                .await;
+            if let Some((usage_count, usage_bytes)) = super::lowest_shard_usage(&arrays) {
+                head.headers
+                    .set("X-Container-Object-Count", usage_count.to_string());
+                head.headers
+                    .set("X-Container-Bytes-Used", usage_bytes.to_string());
+            }
+        }
         let state = head
             .headers
             .get("X-Backend-Sharding-State")
@@ -2499,38 +2808,209 @@ impl ProxyApp {
             .get("X-Container-Object-Count")
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(0);
-        if !super::should_probe_sharded_listing(&state, object_count) {
-            return None;
+        if req.method.eq_ignore_ascii_case("HEAD") {
+            // Python HEAD is `_GETorHEAD_from_backend`, not listing fan-out.
+            // Rebuilding from the listing dropped X-Container-Meta-*
+            // (probe test_sharding_listing L613 assert_container_post_ok).
+            head.status = 204;
+            head.body = swift_http::Body::empty();
+            head.headers.set("Content-Length", "0");
+            if let Some(name) = head
+                .headers
+                .get("X-Backend-Storage-Policy-Index")
+                .and_then(|v| v.parse::<i64>().ok())
+                .and_then(|idx| self.policy_index_to_name.get(&idx))
+            {
+                head.headers.set("X-Storage-Policy", name.clone());
+            }
+            stamp_container_last_modified(&mut head);
+            return Some(head);
         }
         let arr = self
             .fetch_listing_shard_ranges_async(nodes.clone(), part, &path, &shard_headers)
-            .await?;
+            .await
+            .unwrap_or_default();
         if !super::should_fanout_sharded_listing(&state, object_count, !arr.is_empty()) {
-            return None;
-        }
-        let selected = super::select_listing_shard_ranges(&arr, &marker, &prefix);
-        let mut shard_listings: Vec<Vec<serde_json::Value>> = Vec::new();
-        if object_count > 0 {
-            let mut qs_parts = vec!["format=json".to_string()];
-            if !marker.is_empty() {
-                qs_parts.push(format!("marker={}", percent_encode(&marker)));
+            if !super::should_fold_root_objects_without_ranges(&state) {
+                return None;
             }
-            if !prefix.is_empty() {
-                qs_parts.push(format!("prefix={}", percent_encode(&prefix)));
+            let qs_parts = super::shard_listing_query_parts(
+                &marker,
+                &end_marker,
+                &prefix,
+                &delimiter,
+                reverse,
+                limit,
+            );
+            let mut scored: Vec<(i64, bool, Node)> = Vec::new();
+            for node in &nodes {
+                let Some(h) = self
+                    .get_or_head_async(
+                        "container",
+                        vec![node.clone()],
+                        part,
+                        "HEAD",
+                        &path,
+                        "",
+                        &head_headers,
+                    )
+                    .await
+                else {
+                    continue;
+                };
+                if !(200..300).contains(&h.status) {
+                    continue;
+                }
+                let st = h
+                    .headers
+                    .get("X-Backend-Sharding-State")
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let oc = h
+                    .headers
+                    .get("X-Container-Object-Count")
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(0);
+                scored.push((oc, st == "collapsed", node.clone()));
             }
-            qs_parts.push(format!("limit={limit}"));
-            if let Some(items) = self
-                .fetch_json_array_first_nonempty_async(
-                    &nodes,
-                    part,
-                    &path,
-                    &qs_parts.join("&"),
-                    &root_headers,
-                )
+            scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+            let order: Vec<Node> = if scored.is_empty() {
+                nodes.clone()
+            } else {
+                scored.into_iter().map(|(_, _, n)| n).collect()
+            };
+            let qs_plain = "format=json";
+            let qs_full = qs_parts.join("&");
+            let items = match self
+                .fetch_json_array_first_nonempty_async(&order, part, &path, qs_plain, &root_headers)
                 .await
             {
+                Some(a) if !a.is_empty() => a,
+                _ => match self
+                    .fetch_json_array_first_nonempty_async(
+                        &order,
+                        part,
+                        &path,
+                        &qs_full,
+                        &root_headers,
+                    )
+                    .await
+                {
+                    Some(a) if !a.is_empty() => a,
+                    _ => {
+                        self.fetch_json_array_merged_async(
+                            &order,
+                            part,
+                            &path,
+                            qs_plain,
+                            &root_headers,
+                            false,
+                        )
+                        .await?
+                    }
+                },
+            };
+            let bytes = serde_json::to_vec(&items).unwrap_or_else(|_| b"[]".to_vec());
+            let mut out = Response::with_body(200, bytes);
+            out.headers
+                .set("Content-Type", "application/json; charset=utf-8");
+            out.headers.set("X-Backend-Sharding-State", state);
+            out.headers.set("X-Backend-Record-Type", "object");
+            super::stamp_sharded_listing_stats(
+                &mut out,
+                &head,
+                &items,
+                &marker,
+                &end_marker,
+                &prefix,
+                &delimiter,
+                limit,
+            );
+            if let Some(name) = head
+                .headers
+                .get("X-Backend-Storage-Policy-Index")
+                .and_then(|v| v.parse::<i64>().ok())
+                .and_then(|idx| self.policy_index_to_name.get(&idx))
+            {
+                out.headers.set("X-Storage-Policy", name);
+            }
+            super::copy_root_listing_headers(&head, &mut out);
+            return Some(out);
+        }
+        let selected =
+            super::select_listing_shard_ranges(&arr, &marker, &end_marker, &prefix, reverse);
+        let all_ranges: Vec<&serde_json::Value> = arr.iter().collect();
+        let empty_wins = super::listing_ranges_are_settled_active(&all_ranges);
+        let mut feeds: Vec<super::ListingFeed> = Vec::new();
+        let newest = req
+            .headers
+            .get("X-Newest")
+            .map(config_true_value)
+            .unwrap_or(false);
+        // Residual: SHARDING always (L1483). SHARDED only with X-Newest so a
+        // just-cleaved replica's retiring rows appear (L1517) without a
+        // lagging replica resurrecting L692 leftovers.
+        let has_shrinking = all_ranges
+            .iter()
+            .any(|sr| sr.get("state").and_then(|v| v.as_i64()).unwrap_or(0) == 50);
+        if super::include_root_residual_for_listing_ex(
+            &state,
+            newest,
+            empty_wins,
+            has_shrinking,
+            !arr.is_empty(),
+            super::listing_has_full_active_cover(&all_ranges),
+            super::listing_has_full_shrinking_cover(&all_ranges),
+        ) {
+            let qs_parts = super::shard_listing_query_parts(
+                &marker,
+                &end_marker,
+                &prefix,
+                &delimiter,
+                reverse,
+                limit,
+            );
+            let qs = qs_parts.join("&");
+            let items = if newest {
+                if let Some(resp) = self
+                    .get_or_head_async(
+                        "container",
+                        nodes.clone(),
+                        part,
+                        "GET",
+                        &path,
+                        &qs,
+                        &root_headers,
+                    )
+                    .await
+                {
+                    if (200..300).contains(&resp.status) {
+                        let body = resp.body.collect_async().await.ok().unwrap_or_default();
+                        if resp.status == 204 || body.is_empty() {
+                            Some(Vec::new())
+                        } else {
+                            serde_json::from_slice::<serde_json::Value>(&body)
+                                .ok()
+                                .map(|v| v.as_array().cloned().unwrap_or_default())
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                self.fetch_json_array_first_nonempty_async(&nodes, part, &path, &qs, &root_headers)
+                    .await
+            };
+            if let Some(items) = items {
                 if !items.is_empty() {
-                    shard_listings.push(items);
+                    feeds.push(super::ListingFeed {
+                        lower: String::new(),
+                        upper: String::new(),
+                        timestamp: String::new(),
+                        items,
+                    });
                 }
             }
         }
@@ -2540,6 +3020,9 @@ impl ProxyApp {
                 Some((a, c)) => (a, c),
                 None => continue,
             };
+            if shard_account == account && shard_container == container {
+                continue;
+            }
             let Ok((spart, _)) =
                 self.container_ring
                     .get_nodes(shard_account, Some(shard_container), None)
@@ -2552,47 +3035,87 @@ impl ProxyApp {
                 percent_encode(shard_container)
             );
             let snodes = self.iter_nodes(&self.container_ring, spart);
-            let remaining =
-                limit.saturating_sub(shard_listings.iter().map(|v| v.len()).sum::<usize>());
-            if remaining == 0 {
-                break;
+            let mut qs_parts = super::shard_listing_query_parts(
+                &marker,
+                &end_marker,
+                &prefix,
+                &delimiter,
+                reverse,
+                limit,
+            );
+            if empty_wins {
+                qs_parts.retain(|p| !p.starts_with("limit="));
             }
-            let mut qs_parts = vec!["format=json".to_string()];
-            if !marker.is_empty() {
-                qs_parts.push(format!("marker={}", percent_encode(&marker)));
-            }
-            if !prefix.is_empty() {
-                qs_parts.push(format!("prefix={}", percent_encode(&prefix)));
-            }
-            qs_parts.push(format!("limit={remaining}"));
             let Some(items) = self
-                .fetch_json_array_first_nonempty_async(
+                .fetch_json_array_merged_async(
                     &snodes,
                     spart,
                     &spath,
                     &qs_parts.join("&"),
                     &listing_headers,
+                    empty_wins,
                 )
                 .await
             else {
                 continue;
             };
-            if !items.is_empty() {
-                shard_listings.push(items);
+            if items.is_empty() && !empty_wins {
+                continue;
             }
+            feeds.push(super::ListingFeed {
+                lower: sr
+                    .get("lower")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                upper: sr
+                    .get("upper")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                timestamp: super::listing_feed_timestamp(sr),
+                items,
+            });
         }
-        let merged = super::merge_sharded_object_listings(&shard_listings, limit);
+        let merged = super::merge_listings_newest_covering(&feeds, limit, reverse);
         let bytes = serde_json::to_vec(&merged).unwrap_or_else(|_| b"[]".to_vec());
         let mut out = Response::with_body(200, bytes);
         out.headers
             .set("Content-Type", "application/json; charset=utf-8");
         out.headers.set("X-Backend-Sharding-State", state);
         out.headers.set("X-Backend-Record-Type", "object");
-        out.headers
-            .set("X-Container-Object-Count", merged.len().to_string());
-        if let Some(bytes_used) = head.headers.get("X-Container-Bytes-Used") {
-            out.headers.set("X-Container-Bytes-Used", bytes_used);
+        // GET listing: count matches the returned listing (Python GET after
+        // extra PUTs is 200). HEAD: keep the root's stale count until sharders
+        // update it (Python HEAD is still 100). Mixing these fails
+        // `_test_sharded_listing` either at listing or at HEAD.
+        if req.method.eq_ignore_ascii_case("HEAD") {
+            if let Some(c) = head
+                .headers
+                .get("X-Container-Object-Count")
+                .filter(|s| !s.is_empty())
+            {
+                out.headers.set("X-Container-Object-Count", c);
+            } else {
+                out.headers
+                    .set("X-Container-Object-Count", merged.len().to_string());
+            }
+            if let Some(bytes_used) = head.headers.get("X-Container-Bytes-Used") {
+                out.headers.set("X-Container-Bytes-Used", bytes_used);
+            }
+        } else {
+            super::stamp_sharded_listing_stats(
+                &mut out,
+                &head,
+                &merged,
+                &marker,
+                &end_marker,
+                &prefix,
+                &delimiter,
+                limit,
+            );
         }
+        super::copy_root_listing_headers(&head, &mut out);
+        stamp_container_last_modified(&mut out);
         if let Some(name) = head
             .headers
             .get("X-Backend-Storage-Policy-Index")
@@ -2615,7 +3138,9 @@ impl ProxyApp {
             .headers
             .get("X-Backend-Storage-Policy-Index")
             .and_then(|v| v.parse().ok());
-        let info = self.container_info_async(account, container).await;
+        let info = self
+            .container_info_for_write_async(account, container)
+            .await;
         if !info.exists() {
             return swob_response(404);
         }
@@ -2637,32 +3162,22 @@ impl ProxyApp {
         else {
             return swob_response(503);
         };
-        let container_nodes = self.iter_nodes(&self.container_ring, container_part);
         let mut base = self.backend_headers(req, true, "object");
-        base.set("X-Timestamp", Timestamp::now().internal());
+        base.set("X-Timestamp", super::object_write_timestamp(req).internal());
         base.set("X-Backend-Storage-Policy-Index", policy_index);
-        if upd_account != account || upd_container != container {
-            base.set(
-                "X-Backend-Container-Path",
-                format!("{upd_account}/{upd_container}"),
-            );
-            base.set("X-Backend-Allow-Reserved-Names", "true");
-        }
+        self.stamp_root_db_state(account, container, &mut base);
+        super::stamp_shard_container_path(
+            &mut base,
+            &upd_account,
+            &upd_container,
+            account,
+            container,
+        );
         let node_number = object_ring
             .get_part_nodes(object_part)
             .map(|n| n.len())
             .unwrap_or(1);
-        let mut per_node = Vec::with_capacity(node_number);
-        for i in 0..node_number {
-            let mut headers = base.clone();
-            if !container_nodes.is_empty() {
-                let cont = &container_nodes[i % container_nodes.len()];
-                headers.set("X-Container-Host", format!("{}:{}", cont.ip, cont.port));
-                headers.set("X-Container-Partition", container_part);
-                headers.set("X-Container-Device", &cont.device);
-            }
-            per_node.push(headers);
-        }
+        let per_node = self.object_container_update_headers(&base, container_part, node_number);
         let object_nodes = self.iter_nodes(object_ring, object_part);
         let path = format!(
             "/{}/{}/{}",
@@ -2697,8 +3212,8 @@ impl ProxyApp {
         let Ok((account_part, _)) = self.account_ring.get_nodes(account, None, None) else {
             return swob_response(503);
         };
-        let acct_status = self.account_info_async(account).await.status;
-        if !(200..300).contains(&acct_status) {
+        let acct_status = self.account_info_async(account).await;
+        if !acct_status.exists() {
             return swob_response(404);
         }
         let mut base = self.backend_headers(&req, true, "container");
@@ -2777,10 +3292,7 @@ impl ProxyApp {
             .unwrap_or(false);
         let mut get_req = swift_http::Request {
             method: "GET".into(),
-            path: format!(
-                "/v1/{}/{}/{}",
-                src_account, src_container, src_object
-            ),
+            path: format!("/v1/{}/{}/{}", src_account, src_container, src_object),
             // Python copy.py `req.copy_get()` keeps `?symlink=get`.
             query_string: req.query_string.clone(),
             headers: HeaderKeyDict::new(),
@@ -2836,23 +3348,59 @@ impl ProxyApp {
         if let Some(len) = source.body.content_length() {
             put_headers.set("Content-Length", len.to_string());
         }
-        put_headers.set(
-            "X-Copied-From",
-            format!("{src_container}/{src_object}"),
-        );
+        put_headers.set("X-Copied-From", format!("{src_container}/{src_object}"));
         put_headers.set("X-Copied-From-Account", src_account.clone());
         req.method = "PUT".into();
         req.headers = put_headers;
         let mut incoming = body_to_incoming(source.body.take());
         let mut resp = self
-            .object_put_async(&mut req, dst_account, dst_container, dst_object, &mut incoming)
+            .object_put_async(
+                &mut req,
+                dst_account,
+                dst_container,
+                dst_object,
+                &mut incoming,
+            )
             .await;
         resp.headers
             .set("X-Copied-From", format!("{src_container}/{src_object}"));
-        resp.headers
-            .set("X-Copied-From-Account", src_account);
+        resp.headers.set("X-Copied-From-Account", src_account);
         resp
     }
+}
+
+#[cfg(feature = "ec")]
+fn ec_sources_sufficient(is_head: bool, available: usize, ndata: usize) -> bool {
+    available >= if is_head { 1 } else { ndata }
+}
+
+/// Encode Python `ECGetResponseCollection._get_frag_prefs`. Each later
+/// request names the data generations already observed and excludes fragment
+/// indexes already held for that generation. An empty collection deliberately
+/// serializes as `[]`: that is the object-server contract which makes a
+/// non-durable fragment eligible for EC reconstruction.
+#[cfg(feature = "ec")]
+fn encode_ec_fragment_preferences<'a>(
+    buckets: impl IntoIterator<Item = (&'a str, bool, Vec<i32>)>,
+    required: usize,
+) -> String {
+    let mut buckets: Vec<(&str, bool, Vec<i32>)> = buckets.into_iter().collect();
+    for (_, _, fragments) in &mut buckets {
+        fragments.sort_unstable();
+        fragments.dedup();
+    }
+    buckets.sort_by(|left, right| {
+        let left_score = (left.1, left.2.len() >= required, left.2.len(), left.0);
+        let right_score = (right.1, right.2.len() >= required, right.2.len(), right.0);
+        right_score.cmp(&left_score)
+    });
+    let preferences: Vec<serde_json::Value> = buckets
+        .into_iter()
+        .map(|(timestamp, _, exclude)| {
+            serde_json::json!({"timestamp": timestamp, "exclude": exclude})
+        })
+        .collect();
+    serde_json::to_string(&preferences).expect("EC fragment preferences are JSON-safe")
 }
 
 pub(crate) fn parse_copy_from(value: &str) -> Option<(String, String)> {
@@ -3117,9 +3665,14 @@ async fn leftover_then_read(
         }
         None => {
             let mut body = std::mem::take(leftover);
-            tokio::time::timeout(idle, reader.take(swift_http::MAX_CONTROL_BODY).read_to_end(&mut body))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "backend body timeout"))??;
+            tokio::time::timeout(
+                idle,
+                reader
+                    .take(swift_http::MAX_CONTROL_BODY)
+                    .read_to_end(&mut body),
+            )
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "backend body timeout"))??;
             Ok(body)
         }
     }
@@ -3230,13 +3783,44 @@ async fn connect_slot(
 mod tests {
     use super::*;
     use crate::{ProxyApp, ProxyConfig};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc as StdArc;
     use swift_core::hashing::HashPathConfig;
     use swift_http::{HeaderKeyDict, IncomingBody};
     use swift_ring::{Ring, RingData, RingDevice};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc as StdArc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[cfg(feature = "ec")]
+    #[test]
+    fn ec_head_needs_metadata_source_but_get_still_needs_ndata() {
+        assert!(ec_sources_sufficient(true, 1, 4));
+        assert!(!ec_sources_sufficient(true, 0, 4));
+        assert!(!ec_sources_sufficient(false, 1, 4));
+        assert!(ec_sources_sufficient(false, 4, 4));
+    }
+
+    #[cfg(feature = "ec")]
+    #[test]
+    fn ec_fragment_preferences_expose_non_durable_then_prioritize_durable_bucket() {
+        assert_eq!(
+            encode_ec_fragment_preferences(std::iter::empty(), 4),
+            "[]",
+            "the first EC request must make non-durable fragments eligible"
+        );
+        let encoded = encode_ec_fragment_preferences(
+            [
+                ("0000006001.00000", false, vec![3, 1, 3]),
+                ("0000006000.00000", true, vec![2]),
+            ],
+            4,
+        );
+        let decoded: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded[0]["timestamp"], "0000006000.00000");
+        assert_eq!(decoded[0]["exclude"], serde_json::json!([2]));
+        assert_eq!(decoded[1]["timestamp"], "0000006001.00000");
+        assert_eq!(decoded[1]["exclude"], serde_json::json!([1, 3]));
+    }
 
     #[test]
     fn parse_copy_from_unquotes_percent_encoded_object() {
@@ -3295,14 +3879,18 @@ mod tests {
                 let mut buf = vec![0u8; 16 * 1024];
                 let _ = stream.read(&mut buf).await;
                 let _ = stream
-                    .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .write_all(
+                        b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
                     .await;
             }
         });
         (port, h)
     }
 
-    async fn spawn_put_ok_backend(reads: StdArc<AtomicUsize>) -> (u16, tokio::task::JoinHandle<()>) {
+    async fn spawn_put_ok_backend(
+        reads: StdArc<AtomicUsize>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let h = tokio::spawn(async move {
@@ -3406,7 +3994,9 @@ mod tests {
             let _ = stream.read(&mut buf).await;
             tokio::time::sleep(delay).await;
             let _ = stream
-                .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
                 .await;
         });
         (port, h)
@@ -3835,7 +4425,8 @@ mod tests {
             })
             .await;
         assert_eq!(
-            resp.status, 201,
+            resp.status,
+            201,
             "handle_async COPY {} put_reads={}",
             resp.reason,
             reads.load(Ordering::SeqCst)
@@ -3880,9 +4471,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         tokio::time::sleep(Duration::from_millis(40)).await;
-        let mut c = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(400)).unwrap();
+        let mut c =
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(400)).unwrap();
         use std::io::{Read, Write};
-        c.set_read_timeout(Some(Duration::from_millis(2500))).unwrap();
+        c.set_read_timeout(Some(Duration::from_millis(2500)))
+            .unwrap();
         c.write_all(
             b"COPY /v1/AUTH/srcc/srco HTTP/1.1\r\nHost: 127.0.0.1\r\nDestination: /dstc/dsto\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         )
@@ -3896,7 +4489,8 @@ mod tests {
             "shipped Hyper COPY must be 201 via object_copy_async, got {text:?}"
         );
         assert!(
-            text.to_ascii_lowercase().contains("x-copied-from: srcc/srco"),
+            text.to_ascii_lowercase()
+                .contains("x-copied-from: srcc/srco"),
             "copy.py Destination COPY stamps X-Copied-From on the wire, got {text:?}"
         );
         assert_eq!(
@@ -4040,7 +4634,11 @@ mod tests {
                     let _ = stream.write_all(hdr.as_bytes()).await;
                     let _ = stream.write_all(body).await;
                 } else {
-                    let body = br#"[{"name":"obj-a"}]"#;
+                    let body: &[u8] = if first.contains("reverse=on") {
+                        br#"[{"name":"obj-b"},{"name":"obj-a"}]"#
+                    } else {
+                        br#"[{"name":"obj-a"},{"name":"obj-b"}]"#
+                    };
                     let hdr = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
@@ -4079,9 +4677,63 @@ mod tests {
             .await
             .expect("sharded fan-out");
         assert_eq!(resp.status, 200, "{}", resp.reason);
+        assert_eq!(
+            resp.headers.get("X-Container-Object-Count").as_deref(),
+            Some("2"),
+            "GET listing count matches returned objects"
+        );
         let body = resp.body.collect_async().await.expect("listing body");
         let listing: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(listing[0]["name"], "obj-a");
+        assert_eq!(listing[1]["name"], "obj-b");
+        let head_req = swift_http::Request {
+            method: "HEAD".into(),
+            path: "/v1/AUTH_test/c".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let head_resp = app
+            .maybe_sharded_container_listing_async(head_req, "AUTH_test", "c")
+            .await
+            .expect("sharded head");
+        assert_eq!(
+            head_resp.headers.get("X-Container-Object-Count").as_deref(),
+            Some("0"),
+            "HEAD keeps root count, not listing length"
+        );
+        h.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sharded_listing_async_honors_reverse_on() {
+        let (port, h) = spawn_sharded_listing_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let app = StdArc::new(ProxyApp::new(
+            ring_on_port(port),
+            ring_on_port(port),
+            ProxyConfig {
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                ..ProxyConfig::default()
+            },
+        ));
+        let req = swift_http::Request {
+            method: "GET".into(),
+            path: "/v1/AUTH_test/c".into(),
+            query_string: "reverse=on".into(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let resp = app
+            .maybe_sharded_container_listing_async(req, "AUTH_test", "c")
+            .await
+            .expect("sharded fan-out");
+        assert_eq!(resp.status, 200, "{}", resp.reason);
+        let body = resp.body.collect_async().await.expect("listing body");
+        let listing: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(listing[0]["name"], "obj-b", "{listing:?}");
+        assert_eq!(listing[1]["name"], "obj-a", "{listing:?}");
         h.abort();
     }
 }

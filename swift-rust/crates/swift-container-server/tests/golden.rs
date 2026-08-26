@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use serde_json::Value as Json;
 use swift_container_server::{serve, ContainerServerConfig};
-use swift_db::{ContainerBroker, DbValue};
+use swift_db::{replicate_container_db, ContainerBroker, DbValue};
 
 fn tmpdir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("swift-cont-golden-{name}-{}", std::process::id()));
@@ -435,5 +435,98 @@ fn test_usync_push_replication_between_two_servers() {
     );
     // and the source sync point was recorded
     assert_eq!(remote2.get_sync("src-db-id", true).unwrap(), 2);
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+fn info_count(b: &mut ContainerBroker) -> i64 {
+    b.get_info()
+        .unwrap()
+        .into_iter()
+        .find(|(k, _)| k == "object_count")
+        .and_then(|(_, v)| match v {
+            DbValue::Int(i) => Some(i),
+            DbValue::Text(s) => s.parse().ok(),
+            _ => None,
+        })
+        .unwrap_or(-1)
+}
+
+#[test]
+fn test_replicate_tombstones_zero_peer_object_count() {
+    // listing-w95: local_count=0 vs remote_count=50, point reset to -1,
+    // but peer object_count stayed 50. The shipped replicate_container_db
+    // path must actually merge deleted=1 rows onto the peer.
+    let tmp = tmpdir("tombstone-repl");
+    let account = "a";
+    let container = "shard50";
+    let hash_cfg =
+        swift_core::hashing::HashPathConfig::new(b"".to_vec(), b"changeme".to_vec()).unwrap();
+    let hsh = hash_cfg.hash_path(account, Some(container), None).unwrap();
+    let suffix = &hsh[hsh.len() - 3..];
+    let db_rel = format!("containers/0/{suffix}/{hsh}/{hsh}.db");
+
+    let local_db = tmp.join("sda1").join(&db_rel);
+    let mut local = ContainerBroker::new(&local_db, account, container);
+    local
+        .initialize("1751500000.00000", 0, "1751500000.00000", "src-db-id")
+        .unwrap();
+    let remote_db = tmp.join("sdb1").join(&db_rel);
+    let mut remote = ContainerBroker::new(&remote_db, account, container);
+    remote
+        .initialize("1751500000.00000", 0, "1751500000.00000", "dst-db-id")
+        .unwrap();
+    for i in 0..50 {
+        let name = format!("o{i:03}");
+        local
+            .put_object(&name, "1751500001.00000", 1, "text/plain", "e", 0, 0, None, None)
+            .unwrap();
+        remote
+            .put_object(&name, "1751500001.00000", 1, "text/plain", "e", 0, 0, None, None)
+            .unwrap();
+    }
+    local.commit_pending().unwrap();
+    remote.commit_pending().unwrap();
+    // Peer already received our live rows (sync point == pre-delete max_row).
+    let pre = local.get_max_row().unwrap().unwrap_or(-1);
+    remote.merge_syncs(&[(pre, "src-db-id".to_string())], true).unwrap();
+    assert_eq!(info_count(&mut local), 50);
+    assert_eq!(info_count(&mut remote), 50);
+
+    for i in 0..50 {
+        local
+            .delete_object(&format!("o{i:03}"), "1751500099.00000", 0)
+            .unwrap();
+    }
+    local.commit_pending().unwrap();
+    assert_eq!(info_count(&mut local), 0);
+
+    let config = container_config(&tmp, "changeme");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || serve(listener, config));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let outcome = replicate_container_db(
+        &mut local,
+        "src-db-id",
+        &addr.to_string(),
+        "sdb1",
+        "0",
+        &hsh,
+    )
+    .expect("replicate_container_db");
+    assert!(!outcome.needs_rsync, "{outcome:?}");
+    assert!(
+        outcome.rows_pushed > 0,
+        "must push tombstone rows, got {outcome:?}"
+    );
+
+    let mut remote2 = ContainerBroker::new(&remote_db, account, container);
+    assert_eq!(
+        info_count(&mut remote2),
+        0,
+        "peer object_count must be 0 after tombstone usync; rows={:?}",
+        remote2.object_rows().unwrap()
+    );
     std::fs::remove_dir_all(&tmp).unwrap();
 }

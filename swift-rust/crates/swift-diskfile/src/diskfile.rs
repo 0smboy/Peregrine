@@ -965,8 +965,20 @@ pub struct DurablePut {
 }
 
 impl DurablePut {
-    /// Same bytes as [`DiskFileWriter::put`] / `finalize_put`.
-    pub fn commit(mut self, mut metadata: Metadata) -> Result<(), DiskFileError> {
+    /// Same bytes as [`DiskFileWriter::put`] / `finalize_put`, persisted as a
+    /// durable object (the normal async durability barrier).
+    pub fn commit(self, metadata: Metadata) -> Result<(), DiskFileError> {
+        self.persist(metadata, true)
+    }
+
+    /// Persist an EC fragment without the durable marker.  This is the async
+    /// equivalent of `DiskFileWriter::put()` without the later `commit()` and
+    /// is required by `X-Backend-No-Commit` / reconstructor propagation.
+    pub fn commit_nondurable(self, metadata: Metadata) -> Result<(), DiskFileError> {
+        self.persist(metadata, false)
+    }
+
+    fn persist(mut self, mut metadata: Metadata, make_durable: bool) -> Result<(), DiskFileError> {
         let timestamp: Timestamp = meta_get_str(&metadata, "X-Timestamp")
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| {
@@ -990,7 +1002,7 @@ impl DurablePut {
             // DurablePut::commit is the durability barrier: write the
             // durable EC name (`ts#N#d.data`) in one step. The two-phase
             // writer path still uses put() (`ts#N.data`) then commit().
-            Some(fi) => make_ec_ondisk_filename(&timestamp, fi, true)?,
+            Some(fi) => make_ec_ondisk_filename(&timestamp, fi, make_durable)?,
             None => make_ondisk_filename(&timestamp, Some(&self.extension), ctype_timestamp.as_ref()),
         };
         meta_set(&mut metadata, "name", MetaValue::Str(self.name.clone()));
@@ -1004,7 +1016,12 @@ impl DurablePut {
         }
         renamer(&self.tmppath, &target_path, self.fsync_on_close)?;
         self.committed = true;
-        let _ = cleanup_ondisk_files(&self.datadir, self.policy, &self.cleanup);
+        // A non-durable fragment must remain alongside the older durable set;
+        // cleanup here would discard precisely the state the reconstructor is
+        // meant to observe and propagate.
+        if make_durable {
+            let _ = cleanup_ondisk_files(&self.datadir, self.policy, &self.cleanup);
+        }
         Ok(())
     }
 }

@@ -29,17 +29,17 @@
 //! * queue object    = `"{policy_index}:/{account}/{container}/{object}"`,
 //! * content-type    = `application/x-put` | `application/x-delete`.
 //!
-//! Production uses [`HttpReconcileClient`] (ring-direct GET/PUT/DELETE move)
-//! and [`run_once`] over the `.misplaced_objects` queue. Deferred: the
-//! `cmp_policy_info` container-recreation tie-break and the two-phase enqueue.
-//! The move *decision* (which policy is authoritative, whether a queue entry
-//! is still actionable) is ported and unit-tested over a pluggable client.
+//! Production uses [`HttpReconcileClient`] through an explicitly configured
+//! internal proxy. The proxy is required: it selects the source/destination
+//! policy rings and performs EC encoding on a replication-to-EC move.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use swift_core::timestamp::decode_timestamps;
+use swift_core::hashing::HashPathConfig;
+use swift_core::timestamp::{decode_timestamps, Timestamp};
 use swift_http::split_path;
 use swift_ring::Ring;
 
@@ -222,6 +222,50 @@ fn http_body(buf: &[u8]) -> &[u8] {
     }
 }
 
+fn decoded_http_body(buf: &[u8]) -> Option<Vec<u8>> {
+    let split = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = std::str::from_utf8(&buf[..split]).ok()?;
+    let chunked = head.lines().skip(1).any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("transfer-encoding")
+                && value
+                    .split(',')
+                    .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
+        })
+    });
+    let body = &buf[split + 4..];
+    if !chunked {
+        return Some(body.to_vec());
+    }
+
+    let mut rest = body;
+    let mut decoded = Vec::new();
+    loop {
+        let line_end = rest.windows(2).position(|w| w == b"\r\n")?;
+        let size_token = std::str::from_utf8(&rest[..line_end])
+            .ok()?
+            .split(';')
+            .next()?
+            .trim();
+        let size = usize::from_str_radix(size_token, 16).ok()?;
+        rest = &rest[line_end + 2..];
+        if size == 0 {
+            return Some(decoded);
+        }
+        if rest.len() < size + 2 || &rest[size..size + 2] != b"\r\n" {
+            return None;
+        }
+        decoded.extend_from_slice(&rest[..size]);
+        rest = &rest[size + 2..];
+    }
+}
+
+fn timestamp_with_offset(raw: &str, offset: u64) -> Option<String> {
+    let mut timestamp: Timestamp = raw.parse().ok()?;
+    timestamp.increment_offset(offset).ok()?;
+    Some(timestamp.internal())
+}
+
 fn header_value<'a>(buf: &'a [u8], name: &str) -> Option<&'a str> {
     let head = std::str::from_utf8(buf).ok()?;
     let end = head.find("\r\n\r\n").unwrap_or(head.len());
@@ -284,6 +328,8 @@ fn raw_request(
 /// List containers under an account (JSON names).
 pub fn list_account_containers(account_ring: &Ring, account: &str) -> Option<Vec<String>> {
     let (part, nodes) = account_ring.get_nodes(account, None, None).ok()?;
+    let mut usable_response = false;
+    let mut merged = BTreeSet::new();
     for node in &nodes {
         let host = node_host(node.dev, true);
         let path = format!(
@@ -304,7 +350,8 @@ pub fn list_account_containers(account_ring: &Ring, account: &str) -> Option<Vec
             continue;
         };
         if status == 404 {
-            return Some(Vec::new());
+            usable_response = true;
+            continue;
         }
         if !(200..300).contains(&status) {
             continue;
@@ -316,15 +363,15 @@ pub fn list_account_containers(account_ring: &Ring, account: &str) -> Option<Vec
         let Some(arr) = v.as_array() else {
             continue;
         };
-        let mut names = Vec::new();
+        usable_response = true;
         for item in arr {
             if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
-                names.push(name.to_string());
+                merged.insert(name.to_string());
             }
         }
-        return Some(names);
     }
-    None
+    let names: Vec<String> = merged.into_iter().collect();
+    usable_response.then_some(names)
 }
 
 /// List misplaced-object queue entries (name + content_type).
@@ -336,6 +383,8 @@ pub fn list_queue_objects(
     let (part, nodes) = container_ring
         .get_nodes(account, Some(container), None)
         .ok()?;
+    let mut usable_response = false;
+    let mut merged = BTreeMap::new();
     for node in &nodes {
         let host = node_host(node.dev, true);
         let path = format!(
@@ -358,7 +407,8 @@ pub fn list_queue_objects(
             continue;
         };
         if status == 404 {
-            return Some(Vec::new());
+            usable_response = true;
+            continue;
         }
         if !(200..300).contains(&status) {
             continue;
@@ -370,7 +420,7 @@ pub fn list_queue_objects(
         let Some(arr) = v.as_array() else {
             continue;
         };
-        let mut out = Vec::new();
+        usable_response = true;
         for item in arr {
             let Some(name) = item.get("name").and_then(|n| n.as_str()) else {
                 continue;
@@ -380,11 +430,11 @@ pub fn list_queue_objects(
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
                 .to_string();
-            out.push((name.to_string(), ctype));
+            merged.entry(name.to_string()).or_insert(ctype);
         }
-        return Some(out);
     }
-    None
+    let objects: Vec<(String, String)> = merged.into_iter().collect();
+    usable_response.then_some(objects)
 }
 
 /// Read a container's authoritative storage policy index (HEAD).
@@ -426,10 +476,12 @@ pub fn container_policy_index(
     None
 }
 
-/// Ring-direct reconcile client: GET from wrong policy → PUT to right →
-/// DELETE from wrong; pop via container ring.
+/// Internal-proxy reconcile client: GET from wrong policy → PUT to right →
+/// DELETE from wrong; pop remains ring-direct to the queue container.
 pub struct HttpReconcileClient<'a> {
-    pub object_ring: &'a Ring,
+    /// Explicit `host:port` of a loopback/internal proxy pipeline. It must
+    /// preserve trusted X-Backend headers and must not be a public endpoint.
+    pub proxy_host: &'a str,
     pub container_ring: &'a Ring,
     /// Queue container the entry was listed from (for pop_queue).
     pub queue_container: String,
@@ -437,128 +489,92 @@ pub struct HttpReconcileClient<'a> {
 
 impl ReconcileClient for HttpReconcileClient<'_> {
     fn move_object(&self, entry: &QueueEntry, from_policy: i64, to_policy: i64) -> bool {
-        let Ok((part, nodes)) =
-            self.object_ring
-                .get_nodes(&entry.account, Some(&entry.container), Some(&entry.obj))
+        let from_pi = from_policy.to_string();
+        let to_pi = to_policy.to_string();
+        let path = format!(
+            "/v1/{}/{}/{}",
+            pe(&entry.account),
+            pe(&entry.container),
+            pe(&entry.obj)
+        );
+
+        let Some((status, source_response)) = raw_request(
+            self.proxy_host,
+            "GET",
+            &path,
+            &[
+                ("X-Backend-Storage-Policy-Index", from_pi.as_str()),
+                ("X-Backend-Allow-Reserved-Names", "true"),
+                ("X-Backend-Use-Replication-Network", "true"),
+            ],
+            &[],
+        ) else {
+            return false;
+        };
+        // Python keeps an unavailable/missing PUT source queued until its
+        // reclaim age; never pop it merely because one request saw a 404.
+        if !(200..300).contains(&status) {
+            return false;
+        }
+        let Some(body) = decoded_http_body(&source_response) else {
+            return false;
+        };
+        let etag = header_value(&source_response, "ETag")
+            .unwrap_or("")
+            .trim_matches('"')
+            .to_string();
+        let content_type = header_value(&source_response, "Content-Type")
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let Some(source_timestamp) = header_value(&source_response, "X-Backend-Timestamp")
+            .or_else(|| header_value(&source_response, "X-Timestamp"))
         else {
             return false;
         };
-        let from_pi = from_policy.to_string();
-        let to_pi = to_policy.to_string();
-        // GET body from any primary that still has the misplaced object.
-        let mut body: Option<Vec<u8>> = None;
-        let mut etag = String::new();
-        let mut content_type = String::from("application/octet-stream");
-        let mut x_timestamp = String::new();
-        for node in &nodes {
-            let host = node_host(node.dev, false);
-            let path = format!(
-                "/{}/{part}/{}/{}/{}",
-                node.dev.device,
-                pe(&entry.account),
-                pe(&entry.container),
-                pe(&entry.obj)
-            );
-            let Some((status, buf)) = raw_request(
-                &host,
-                "GET",
-                &path,
-                &[("X-Backend-Storage-Policy-Index", from_pi.as_str())],
-                &[],
-            ) else {
-                continue;
-            };
-            if !(200..300).contains(&status) {
-                continue;
-            }
-            etag = header_value(&buf, "ETag")
-                .unwrap_or("")
-                .trim_matches('"')
-                .to_string();
-            content_type = header_value(&buf, "Content-Type")
-                .unwrap_or("application/octet-stream")
-                .to_string();
-            x_timestamp = header_value(&buf, "X-Timestamp")
-                .or_else(|| header_value(&buf, "X-Backend-Timestamp"))
-                .unwrap_or("")
-                .to_string();
-            body = Some(http_body(&buf).to_vec());
-            break;
-        }
-        let Some(body) = body else {
-            // Already gone from the wrong policy — treat as success so the
-            // queue entry can be popped (AlreadyCorrect-ish).
-            return true;
+        // `slightly_later_timestamp(ts, offset=3)`: retain the raw time and
+        // add an internal offset so the destination supersedes the source.
+        let Some(put_timestamp) = timestamp_with_offset(source_timestamp, 3) else {
+            return false;
         };
-        if x_timestamp.is_empty() {
-            x_timestamp = format!(
-                "{:.5}",
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs_f64())
-                    .unwrap_or(0.0)
-            );
-        }
-        // PUT to the correct policy on a majority of primaries.
-        let mut put_ok = 0usize;
-        for node in &nodes {
-            let host = node_host(node.dev, false);
-            let path = format!(
-                "/{}/{part}/{}/{}/{}",
-                node.dev.device,
-                pe(&entry.account),
-                pe(&entry.container),
-                pe(&entry.obj)
-            );
-            let Some((status, _)) = raw_request(
-                &host,
-                "PUT",
-                &path,
-                &[
-                    ("X-Timestamp", x_timestamp.as_str()),
-                    ("Content-Type", content_type.as_str()),
-                    ("X-Backend-Storage-Policy-Index", to_pi.as_str()),
-                    ("ETag", etag.as_str()),
-                ],
-                &body,
-            ) else {
-                continue;
-            };
-            if (200..300).contains(&status) {
-                put_ok += 1;
-            }
-        }
-        if put_ok * 2 <= nodes.len() {
+        let Some(delete_timestamp) = timestamp_with_offset(source_timestamp, 1) else {
+            return false;
+        };
+
+        let Some((put_status, _)) = raw_request(
+            self.proxy_host,
+            "PUT",
+            &path,
+            &[
+                ("X-Timestamp", put_timestamp.as_str()),
+                ("Content-Type", content_type.as_str()),
+                ("X-Backend-Storage-Policy-Index", to_pi.as_str()),
+                ("X-Backend-Allow-Reserved-Names", "true"),
+                ("X-Backend-Use-Replication-Network", "true"),
+                ("ETag", etag.as_str()),
+            ],
+            &body,
+        ) else {
+            return false;
+        };
+        if !(200..300).contains(&put_status) {
             return false;
         }
-        // DELETE the misplaced copy.
-        let mut del_ok = 0usize;
-        for node in &nodes {
-            let host = node_host(node.dev, false);
-            let path = format!(
-                "/{}/{part}/{}/{}/{}",
-                node.dev.device,
-                pe(&entry.account),
-                pe(&entry.container),
-                pe(&entry.obj)
-            );
-            let Some((status, _)) = raw_request(
-                &host,
-                "DELETE",
-                &path,
-                &[
-                    ("X-Timestamp", x_timestamp.as_str()),
-                    ("X-Backend-Storage-Policy-Index", from_pi.as_str()),
-                ],
-                &[],
-            ) else {
-                continue;
-            };
-            if (200..300).contains(&status) || status == 404 {
-                del_ok += 1;
-            }
-        }
-        del_ok > 0
+
+        let Some((delete_status, _)) = raw_request(
+            self.proxy_host,
+            "DELETE",
+            &path,
+            &[
+                ("X-Timestamp", delete_timestamp.as_str()),
+                ("X-Backend-Storage-Policy-Index", from_pi.as_str()),
+                ("X-Backend-Allow-Reserved-Names", "true"),
+                ("X-Backend-Use-Replication-Network", "true"),
+            ],
+            &[],
+        ) else {
+            return false;
+        };
+        (200..300).contains(&delete_status) || delete_status == 404
     }
 
     fn pop_queue(&self, entry: &QueueEntry) -> bool {
@@ -622,13 +638,67 @@ pub struct ReconcilerStats {
     pub errors: u64,
 }
 
-/// One full pass over `.misplaced_objects`.
-pub fn run_once(account_ring: &Ring, container_ring: &Ring, object_ring: &Ring) -> ReconcilerStats {
-    let mut stats = ReconcilerStats::default();
-    let Some(containers) = list_account_containers(account_ring, MISPLACED_OBJECTS_ACCOUNT) else {
-        stats.errors += 1;
-        return stats;
+/// Match Python's `ContainerReconciler.should_process`: when multiple
+/// reconciler daemons share a queue, exactly one process owns each object.
+/// The canonical Swift path hash is interpreted as one big-endian integer
+/// before taking the modulo.
+pub fn should_process_entry(
+    hash_config: &HashPathConfig,
+    entry: &QueueEntry,
+    processes: u64,
+    process: u64,
+) -> bool {
+    if processes == 0 {
+        return true;
+    }
+    let Ok(digest) =
+        hash_config.hash_path_raw(&entry.account, Some(&entry.container), Some(&entry.obj))
+    else {
+        return false;
     };
+    u128::from_be_bytes(digest) % u128::from(processes) == u128::from(process)
+}
+
+fn queue_containers_for_pass(now_secs: f64, mut listed: Vec<String>) -> Vec<String> {
+    // Python `_iter_containers` always checks the current hour first. A queue
+    // DB may have been created by the container-replicator after the last
+    // container-updater pass, so it is not necessarily visible in the hidden
+    // account listing yet.
+    let current = ((now_secs as i64).div_euclid(MISPLACED_OBJECTS_CONTAINER_DIVISOR)
+        * MISPLACED_OBJECTS_CONTAINER_DIVISOR)
+        .to_string();
+    let mut containers = vec![current.clone()];
+    // Account listings are oldest-to-newest; Python walks each page in
+    // reverse after the current-hour fast path.
+    listed.reverse();
+    containers.extend(listed.into_iter().filter(|name| name != &current));
+    containers
+}
+
+/// One full pass over `.misplaced_objects`.
+pub fn run_once(
+    account_ring: &Ring,
+    container_ring: &Ring,
+    hash_config: &HashPathConfig,
+    proxy_host: &str,
+    processes: u64,
+    process: u64,
+) -> ReconcilerStats {
+    let mut stats = ReconcilerStats::default();
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let listed = match list_account_containers(account_ring, MISPLACED_OBJECTS_ACCOUNT) {
+        Some(containers) => containers,
+        None => {
+            // The current-hour queue is still directly discoverable even if
+            // the account listing is temporarily unavailable.
+            stats.errors += 1;
+            Vec::new()
+        }
+    };
+    let containers = queue_containers_for_pass(now_secs, listed);
     for qcontainer in containers {
         let Some(objects) =
             list_queue_objects(container_ring, MISPLACED_OBJECTS_ACCOUNT, &qcontainer)
@@ -640,6 +710,9 @@ pub fn run_once(account_ring: &Ring, container_ring: &Ring, object_ring: &Ring) 
             let Some(entry) = parse_reconciler_obj_name(&name) else {
                 continue;
             };
+            if !should_process_entry(hash_config, &entry, processes, process) {
+                continue;
+            }
             let Some(current_pi) =
                 container_policy_index(container_ring, &entry.account, &entry.container)
             else {
@@ -647,7 +720,7 @@ pub fn run_once(account_ring: &Ring, container_ring: &Ring, object_ring: &Ring) 
                 continue;
             };
             let client = HttpReconcileClient {
-                object_ring,
+                proxy_host,
                 container_ring,
                 queue_container: qcontainer.clone(),
             };
@@ -675,6 +748,28 @@ pub fn recon_update(elapsed: std::time::Duration, stats: &ReconcilerStats) -> se
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn internal_proxy_chunked_body_is_decoded_before_reupload() {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n3;ext=x\r\n123\r\n0\r\n\r\n";
+        assert_eq!(decoded_http_body(response).unwrap(), b"test123");
+        assert!(decoded_http_body(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nbad"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn reconciler_timestamp_adds_offset_three() {
+        assert_eq!(
+            timestamp_with_offset("1751500001.00000", 3).unwrap(),
+            "1751500001.00000_0000000000000003"
+        );
+        assert_eq!(
+            timestamp_with_offset("1751500001.00000_0000000000000002", 3).unwrap(),
+            "1751500001.00000_0000000000000005"
+        );
+    }
 
     struct FakeReconcile {
         moves: Mutex<Vec<(i64, i64)>>,
@@ -757,6 +852,27 @@ mod tests {
     }
 
     #[test]
+    fn reconciler_process_partition_matches_python_hash_modulo() {
+        let hash_config =
+            HashPathConfig::new(b"testprefix".to_vec(), b"testsuffix".to_vec()).unwrap();
+        let entry = QueueEntry {
+            policy_index: 1,
+            account: "AUTH_test".into(),
+            container: "c".into(),
+            obj: "o".into(),
+        };
+        // Python hash_path is 05c5055fb64b7219c5a436127559a5de;
+        // int(hexdigest, 16) % 4 == 2.
+        assert!(should_process_entry(&hash_config, &entry, 0, 0));
+        for process in 0..4 {
+            assert_eq!(
+                should_process_entry(&hash_config, &entry, 4, process),
+                process == 2
+            );
+        }
+    }
+
+    #[test]
     fn test_content_type_roundtrip() {
         assert_eq!(reconciler_content_type("put"), Some("application/x-put"));
         assert_eq!(
@@ -781,6 +897,19 @@ mod tests {
         assert_eq!(name, "1751497200");
         // not zero-padded (unlike the expirer's queue)
         assert!(!name.starts_with('0'));
+    }
+
+    #[test]
+    fn current_queue_container_is_checked_before_account_listing() {
+        let containers = queue_containers_for_pass(
+            1_751_500_001.0,
+            vec![
+                "1751490000".to_string(),
+                "1751497200".to_string(),
+                "1751493600".to_string(),
+            ],
+        );
+        assert_eq!(containers, vec!["1751497200", "1751493600", "1751490000"]);
     }
 
     #[test]

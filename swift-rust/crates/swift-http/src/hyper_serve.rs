@@ -93,16 +93,29 @@ pub async fn serve_http1_connection(
     if let Some(body) = request_line_precondition(&peeked) {
         return write_precondition_failed(&mut stream, body).await;
     }
-    if request_line_is_ssync(&peeked) {
-        let more = if peeked.windows(4).any(|w| w == b"\r\n\r\n") {
-            peeked
-        } else {
-            let rest =
-                read_until_marker(&mut stream, b"\r\n\r\n", max_head, head_deadline).await?;
-            let mut all = peeked;
-            all.extend_from_slice(&rest);
-            all
-        };
+    // Hyper deliberately enforces RFC token syntax for field names, while
+    // Python Swift's WSGI contract also accepts UTF-8 object-metadata names
+    // (python-swiftclient puts those octets directly on HTTP/1.1). Read the
+    // complete first head so that the narrow compatibility lane below can
+    // recognize that legacy Swift wire shape before Hyper rejects it.
+    let more = if peeked.windows(4).any(|w| w == b"\r\n\r\n") {
+        peeked
+    } else {
+        // Preserve the bytes already consumed while peeking the request line.
+        // The terminating CRLFCRLF may straddle the peek/read boundary (for
+        // example, the peek can end in CR and the next packet begin with LF).
+        // Starting a fresh buffer here loses that prefix and waits until the
+        // header deadline even though a complete head is already on the wire.
+        read_until_marker_with_prefix(
+            &mut stream,
+            peeked,
+            b"\r\n\r\n",
+            max_head,
+            head_deadline,
+        )
+        .await?
+    };
+    if request_line_is_ssync(&more) {
         return serve_ssync_handoff(
             stream,
             more,
@@ -114,8 +127,20 @@ pub async fn serve_http1_connection(
         )
         .await;
     }
+    if request_needs_swift_utf8_handoff(&more) {
+        return serve_swift_utf8_handoff(
+            stream,
+            more,
+            service,
+            config,
+            shutdown,
+            admission,
+            peer_ip,
+        )
+        .await;
+    }
     let io = TokioIo::new(PrefixedIo {
-        prefix: peeked,
+        prefix: more,
         seen: 0,
         inner: stream,
     });
@@ -307,6 +332,108 @@ fn request_line_precondition(buf: &[u8]) -> Option<&'static str> {
     None
 }
 
+fn trim_ascii_bytes(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn ascii_header_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Accept only Swift's metadata-name extension to HTTP field-name syntax.
+/// The prefix stays ASCII and the suffix must be valid UTF-8 with no control,
+/// whitespace, or colon characters. Other malformed field names remain
+/// Hyper 400s rather than widening the parser surface.
+fn swift_utf8_metadata_name(raw: &[u8]) -> Option<&str> {
+    if raw.is_ascii() || !raw.iter().any(|byte| !byte.is_ascii()) {
+        return None;
+    }
+    let name = std::str::from_utf8(raw).ok()?;
+    let lower = name.to_lowercase();
+    let prefix = [
+        "x-object-meta-",
+        "x-object-sysmeta-",
+        "x-object-transient-sysmeta-",
+    ]
+    .into_iter()
+    .find(|prefix| lower.starts_with(prefix))?;
+    if name.len() == prefix.len()
+        || name
+            .chars()
+            .any(|character| character == ':' || character.is_control() || character.is_whitespace())
+    {
+        return None;
+    }
+    Some(name)
+}
+
+fn request_target_has_non_ascii_path(buf: &[u8]) -> bool {
+    let line = buf.split(|&byte| byte == b'\r' || byte == b'\n').next().unwrap_or(buf);
+    let Some(target) = line.split(|&byte| byte == b' ').nth(1) else {
+        return false;
+    };
+    let path = target.split(|&byte| byte == b'?').next().unwrap_or(target);
+    let mut index = 0usize;
+    while index < path.len() {
+        if path[index] >= 0x80 {
+            return true;
+        }
+        if path[index] == b'%' && index + 2 < path.len() {
+            let hex = |byte: u8| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            };
+            if let (Some(high), Some(low)) = (hex(path[index + 1]), hex(path[index + 2])) {
+                if (high << 4 | low) >= 0x80 {
+                    return true;
+                }
+                index += 3;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+fn request_needs_swift_utf8_handoff(buf: &[u8]) -> bool {
+    if request_target_has_non_ascii_path(buf) {
+        return true;
+    }
+    let (head, _) = split_head_body(buf.to_vec());
+    head.split(|&byte| byte == b'\n')
+        .skip(1)
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.iter().position(|&byte| byte == b':').map(|pos| &line[..pos]))
+        .any(|name| swift_utf8_metadata_name(trim_ascii_bytes(name)).is_some())
+}
+
 fn fresh_trans_id() -> String {
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -341,7 +468,25 @@ async fn read_until_marker(
     max: usize,
     deadline: Duration,
 ) -> std::io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
+    read_until_marker_with_prefix(stream, Vec::new(), marker, max, deadline).await
+}
+
+async fn read_until_marker_with_prefix(
+    stream: &mut tokio::net::TcpStream,
+    mut buf: Vec<u8>,
+    marker: &[u8],
+    max: usize,
+    deadline: Duration,
+) -> std::io::Result<Vec<u8>> {
+    if buf.len() > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HTTP head too large",
+        ));
+    }
+    if buf.windows(marker.len()).any(|w| w == marker) {
+        return Ok(buf);
+    }
     let mut tmp = [0u8; 512];
     // First byte is a pending read with no timer (L1). A silent accepted
     // socket is idle occupancy, bounded by max_connections — not slowloris.
@@ -427,6 +572,92 @@ fn parse_ssync_head(
     Ok((method, path, query, headers))
 }
 
+fn parse_swift_utf8_head(
+    head: &[u8],
+    max_headers: usize,
+) -> std::io::Result<(String, String, String, HeaderKeyDict)> {
+    let mut lines = head.split(|&byte| byte == b'\n');
+    let request_line = lines
+        .next()
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .unwrap_or_default();
+    let request_line = std::str::from_utf8(request_line).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid request line")
+    })?;
+    let mut parts = request_line.split(' ');
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("");
+    let version = parts.next().unwrap_or("");
+    if method.is_empty()
+        || target.is_empty()
+        || parts.next().is_some()
+        || !version.starts_with("HTTP/")
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid request line",
+        ));
+    }
+    let (path_raw, query_string) = match target.split_once('?') {
+        Some((path, query)) => (path, query.to_string()),
+        None => (target, String::new()),
+    };
+    let mut headers = HeaderKeyDict::new();
+    let mut count = 0usize;
+    for raw_line in lines {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if line.is_empty() {
+            break;
+        }
+        count += 1;
+        if count > max_headers.max(1) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "too many headers",
+            ));
+        }
+        let Some(colon) = line.iter().position(|&byte| byte == b':') else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid header line",
+            ));
+        };
+        let raw_name = trim_ascii_bytes(&line[..colon]);
+        let name = if raw_name.is_ascii() {
+            if raw_name.is_empty() || !raw_name.iter().copied().all(ascii_header_name_byte) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid header name",
+                ));
+            }
+            // Safe because of is_ascii above.
+            std::str::from_utf8(raw_name).unwrap()
+        } else {
+            swift_utf8_metadata_name(raw_name).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid header name")
+            })?
+        };
+        let raw_value = trim_ascii_bytes(&line[colon + 1..]);
+        if raw_value.iter().any(|byte| matches!(byte, b'\0' | b'\r' | b'\n')) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid header value",
+            ));
+        }
+        let value = match std::str::from_utf8(raw_value) {
+            Ok(value) => value.to_string(),
+            Err(_) => raw_value.iter().map(|&byte| char::from(byte)).collect(),
+        };
+        headers.set(name, value);
+    }
+    Ok((
+        method.to_string(),
+        unquote(path_raw),
+        query_string,
+        headers,
+    ))
+}
+
 fn te_is_chunked(headers: &HeaderKeyDict) -> bool {
     headers
         .get("Transfer-Encoding")
@@ -437,6 +668,179 @@ fn te_is_chunked(headers: &HeaderKeyDict) -> bool {
                 .unwrap_or(false)
         })
         .unwrap_or(false)
+}
+
+/// Async Swift-wire compatibility for valid UTF-8 metadata field names.
+/// This is intentionally a one-request, connection-close lane: it preserves
+/// Python Swift's non-RFC header octets without weakening Hyper's parser for
+/// ordinary traffic or turning the exceptional connection into a bespoke
+/// keep-alive implementation.
+async fn serve_swift_utf8_handoff(
+    mut stream: tokio::net::TcpStream,
+    peeked: Vec<u8>,
+    service: Arc<dyn AsyncService>,
+    config: ServerConfig,
+    shutdown: Arc<AtomicBool>,
+    admission: AdmissionController,
+    peer_ip: Option<String>,
+) -> std::io::Result<()> {
+    eprintln!("G6_DIAG utf8-compat stage=handoff-start");
+    if shutdown.load(Ordering::SeqCst) {
+        reject_overloaded(stream).await;
+        return Ok(());
+    }
+    let _request_permit = match admission.try_acquire_request(TrafficClass::Foreground) {
+        Ok(permit) => permit,
+        Err(_) => {
+            reject_overloaded(stream).await;
+            return Ok(());
+        }
+    };
+    let (head, leftover) = split_head_body(peeked);
+    let (method, path, query_string, mut headers) =
+        match parse_swift_utf8_head(&head, config.max_header_count) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                eprintln!("G6_DIAG utf8-compat stage=parse-error error={error}");
+                let body = b"Bad Request";
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                stream.write_all(body).await?;
+                stream.flush().await?;
+                return Ok(());
+            }
+        };
+    if let Some(ref ip) = peer_ip {
+        if !headers.contains_key("X-Backend-Remote-Addr") {
+            headers.set("X-Backend-Remote-Addr", ip);
+        }
+    }
+    let chunked = te_is_chunked(&headers);
+    let content_length = headers
+        .get("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok());
+    if content_length.is_some_and(|length| length > config.max_body_bytes) {
+        let body = b"Request Entity Too Large";
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 413 Payload Too Large\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await?;
+        stream.write_all(body).await?;
+        stream.flush().await?;
+        return Ok(());
+    }
+    if headers
+        .get("Expect")
+        .is_some_and(|value| value.eq_ignore_ascii_case("100-continue"))
+    {
+        stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+        stream.flush().await?;
+    }
+    let (read_half, mut write_half) = stream.into_split();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(8);
+    let scope = swift_runtime::TaskScope::bounded(1);
+    let max_body = config.max_body_bytes;
+    let body_scope = scope.clone();
+    let _ = body_scope.spawn(async move {
+        pump_swift_compat_request_body(
+            leftover,
+            read_half,
+            tx,
+            chunked,
+            content_length,
+            max_body,
+        )
+        .await;
+    });
+    let mut body = IncomingBody::from_channel(rx, content_length, Some(scope), max_body);
+    let idle_secs = if config.body_idle_timeout_secs > 0 {
+        config.body_idle_timeout_secs
+    } else {
+        config.client_timeout_secs
+    };
+    if idle_secs > 0 {
+        body.set_body_idle(BodyIdleDeadline::from_timeout(Duration::from_secs(idle_secs)));
+    }
+    if config.max_upload_time_secs > 0 {
+        body.set_upload_lifetime(UploadLifetimeDeadline::from_timeout(Duration::from_secs(
+            config.max_upload_time_secs,
+        )));
+    }
+    let metrics = config
+        .metrics
+        .clone()
+        .unwrap_or_else(ConcurrencyMetrics::new);
+    // The compatibility lane is still the production Tokio HTTP/1 runtime;
+    // it never invokes a blocking/legacy handler unless the configured
+    // service itself is legacy.
+    metrics.record_http_request_hyper();
+    if service.is_legacy_sync_handler() {
+        metrics.record_legacy_sync_handler_request();
+    } else {
+        metrics.record_native_async_request();
+    }
+    let head_request = method == "HEAD";
+    let diagnostic_method = method.clone();
+    let diagnostic_started = std::time::Instant::now();
+    eprintln!("G6_DIAG utf8-compat method={diagnostic_method} stage=service-start");
+    let response = service
+        .call(AsyncRequest {
+            method,
+            path,
+            query_string,
+            headers,
+            body,
+        })
+        .await;
+    eprintln!(
+        "G6_DIAG utf8-compat method={} stage=service-complete status={} elapsed_ms={}",
+        diagnostic_method,
+        response.status,
+        diagnostic_started.elapsed().as_millis()
+    );
+    let write_result = write_swift_compat_response(&mut write_half, response, head_request).await;
+    if let Err(error) = &write_result {
+        eprintln!(
+            "G6_DIAG utf8-compat method={} stage=response-error error={}",
+            diagnostic_method, error
+        );
+    }
+    write_result
+}
+
+async fn pump_swift_compat_request_body(
+    leftover: Vec<u8>,
+    read_half: tokio::net::tcp::OwnedReadHalf,
+    tx: tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+    chunked: bool,
+    content_length: Option<u64>,
+    max_body: u64,
+) {
+    let mut source = ByteSrc {
+        buf: leftover,
+        pos: 0,
+        rh: read_half,
+    };
+    let result = if chunked {
+        pump_chunked(&mut source, &tx, max_body).await
+    } else {
+        pump_length(&mut source, &tx, content_length.unwrap_or(0), max_body).await
+    };
+    if let Err(error) = result {
+        let _ = tx.send(Err(error)).await;
+    }
 }
 
 /// Full-duplex SSYNC on the async socket after Hyper header peek (not
@@ -684,7 +1088,112 @@ async fn pump_length(
             return Ok(());
         }
     }
-    Ok(())
+    if sent == want {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("request body ended after {sent} of {want} bytes"),
+        ))
+    }
+}
+
+async fn write_swift_compat_response(
+    write: &mut tokio::net::tcp::OwnedWriteHalf,
+    mut response: Response,
+    head_request: bool,
+) -> std::io::Result<()> {
+    let reason = if response.reason.contains(['\r', '\n']) || response.reason.is_empty() {
+        reason_phrase(response.status).to_string()
+    } else {
+        response.reason.clone()
+    };
+    if response.headers.get("Date").is_none() {
+        let seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        response.headers.set("Date", http_date(seconds));
+    }
+    if response.headers.get("Content-Length").is_none() {
+        if let Some(length) = response.body.content_length() {
+            response.headers.set("Content-Length", length);
+        }
+    }
+    let content_length = response
+        .headers
+        .get("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok());
+    let chunked = content_length.is_none();
+    let mut head = format!("HTTP/1.1 {} {}\r\n", response.status, reason);
+    for (name, value) in response.headers.iter() {
+        if name.eq_ignore_ascii_case("Connection")
+            || name.eq_ignore_ascii_case("Transfer-Encoding")
+            || (chunked && name.eq_ignore_ascii_case("Content-Length"))
+        {
+            continue;
+        }
+        if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
+            continue;
+        }
+        let valid_name = if name.is_ascii() {
+            name.as_bytes().iter().copied().all(ascii_header_name_byte)
+        } else {
+            swift_utf8_metadata_name(name.as_bytes()).is_some()
+        };
+        if !valid_name {
+            continue;
+        }
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    if chunked {
+        head.push_str("Transfer-Encoding: chunked\r\n");
+    }
+    head.push_str("Connection: close\r\n\r\n");
+    write.write_all(head.as_bytes()).await?;
+    if head_request {
+        write.flush().await?;
+        return Ok(());
+    }
+
+    let write_chunk = |bytes: &[u8]| {
+        let framed = if chunked {
+            let mut framed = format!("{:x}\r\n", bytes.len()).into_bytes();
+            framed.extend_from_slice(bytes);
+            framed.extend_from_slice(b"\r\n");
+            framed
+        } else {
+            bytes.to_vec()
+        };
+        framed
+    };
+    match response.body.take() {
+        Body::Buffered(bytes) if !bytes.is_empty() => {
+            write.write_all(&write_chunk(&bytes)).await?;
+        }
+        Body::Channel(channel) => {
+            let (mut receiver, _scope, _) = channel.into_rx();
+            while let Some(chunk) = receiver.recv().await {
+                let bytes = chunk?;
+                if !bytes.is_empty() {
+                    write.write_all(&write_chunk(&bytes)).await?;
+                }
+            }
+        }
+        Body::Streamed(_) => {
+            return Err(std::io::Error::other(
+                "blocking response body is forbidden on Swift UTF-8 async compatibility lane",
+            ));
+        }
+        Body::Buffered(_) => {}
+    }
+    if chunked {
+        write.write_all(b"0\r\n\r\n").await?;
+    }
+    write.flush().await
 }
 
 async fn write_chunked_http_response(
@@ -714,7 +1223,13 @@ async fn write_chunked_http_response(
         head.push_str(value);
         head.push_str("\r\n");
     }
-    head.push_str("Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+    // SSYNC is deliberately full duplex: Python's sender calls
+    // HTTPConnection.getresponse() before it writes MISSING_CHECK. Advertising
+    // `Connection: close` makes http.client detach the socket from the
+    // connection, so its subsequent `send()` no longer uses this session.
+    // HTTP/1.1 persistence is the protocol default; the handoff drops the
+    // split socket naturally after the terminal response chunk.
+    head.push_str("Transfer-Encoding: chunked\r\n\r\n");
     write.write_all(head.as_bytes()).await?;
     match response.body.take() {
         Body::Channel(ch) => {
@@ -1120,6 +1635,10 @@ mod tests {
         );
         assert_eq!(
             request_line_precondition(b"GET /v1/AUTH_test/c/o HTTP/1.1\r\n"),
+            None
+        );
+        assert_eq!(
+            request_line_precondition(b"GET /v1/AUTH_test/%00reserved HTTP/1.1\r\n"),
             None
         );
         assert_eq!(

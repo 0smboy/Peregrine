@@ -80,6 +80,21 @@ pub trait FragmentFetcher {
         container: &str,
         object: &str,
     ) -> Option<FetchedFragment>;
+
+    /// Fetch a specific data timestamp when reconstructing from a local
+    /// durable fragment while newer non-durable data may coexist on peers.
+    /// Test fetchers that model a single version can use the default.
+    fn fetch_at(
+        &self,
+        node: &RingDevice,
+        partition: u64,
+        account: &str,
+        container: &str,
+        object: &str,
+        _preferred_timestamp: Option<&str>,
+    ) -> Option<FetchedFragment> {
+        self.fetch(node, partition, account, container, object)
+    }
 }
 
 /// One object whose local fragment must be rebuilt.
@@ -143,6 +158,7 @@ fn gather_coherent_archives(
     object: &str,
     ndata: usize,
     fetcher: &dyn FragmentFetcher,
+    preferred_timestamp: Option<&str>,
 ) -> Result<(FetchedFragment, Vec<Vec<u8>>), ReconstructError> {
     let mut archives: Vec<Vec<u8>> = Vec::new();
     let mut chosen: Option<FetchedFragment> = None;
@@ -150,7 +166,14 @@ fn gather_coherent_archives(
         if archives.len() >= ndata {
             break;
         }
-        let Some(frag) = fetcher.fetch(node, partition, account, container, object) else {
+        let Some(frag) = fetcher.fetch_at(
+            node,
+            partition,
+            account,
+            container,
+            object,
+            preferred_timestamp,
+        ) else {
             continue;
         };
         match &chosen {
@@ -209,6 +232,7 @@ impl crate::ssync_sender::SyncDiskfileBuilder for EcSyncRebuilder<'_> {
             parts.next().ok_or("bad name")?,
             parts.next().ok_or("bad name")?,
         );
+        let local_ts = get("X-Timestamp").ok_or("datafile has no X-Timestamp")?;
         let (chosen, archives) = gather_coherent_archives(
             &self.peers,
             self.partition,
@@ -217,12 +241,12 @@ impl crate::ssync_sender::SyncDiskfileBuilder for EcSyncRebuilder<'_> {
             object,
             self.scheme.ndata,
             self.fetcher,
+            Some(&local_ts),
         )
         .map_err(|e| format!("{e:?}"))?;
         // The rebuilt bytes must belong to the SAME version the sender is
         // offering: peers serving a different timestamp would be labelled
         // with this datafile's metadata and corrupt the receiver's view.
-        let local_ts = get("X-Timestamp").ok_or("datafile has no X-Timestamp")?;
         if chosen.timestamp != local_ts {
             return Err(format!(
                 "peers serve timestamp {} but the local fragment is {local_ts}",
@@ -283,6 +307,7 @@ pub fn rebuild_job(
         &job.object,
         scheme.ndata,
         fetcher,
+        None,
     )?;
 
     let rebuilt = driver
@@ -564,19 +589,78 @@ impl FragmentFetcher for HttpFragmentFetcher {
         container: &str,
         object: &str,
     ) -> Option<FetchedFragment> {
+        self.fetch_with_preference(node, partition, account, container, object, None)
+    }
+
+    fn fetch_at(
+        &self,
+        node: &RingDevice,
+        partition: u64,
+        account: &str,
+        container: &str,
+        object: &str,
+        preferred_timestamp: Option<&str>,
+    ) -> Option<FetchedFragment> {
+        self.fetch_with_preference(
+            node,
+            partition,
+            account,
+            container,
+            object,
+            preferred_timestamp,
+        )
+    }
+}
+
+impl HttpFragmentFetcher {
+    fn request_target(
+        node: &RingDevice,
+        partition: u64,
+        account: &str,
+        container: &str,
+        object: &str,
+    ) -> String {
+        // Swift direct-client and ssync paths percent-encode UTF-8 octets.
+        // Sending raw Unicode in an HTTP/1.1 request-target makes the peer's
+        // URI parser reject or misroute non-ASCII objects, so reconstruction
+        // silently gathers fewer than ndata archives while ASCII probes pass.
+        let swift_path = format!("/{account}/{container}/{object}");
+        format!(
+            "/{}/{partition}{}",
+            crate::percent_encode(&node.device),
+            crate::percent_encode(&swift_path)
+        )
+    }
+
+    fn fetch_with_preference(
+        &self,
+        node: &RingDevice,
+        partition: u64,
+        account: &str,
+        container: &str,
+        object: &str,
+        preferred_timestamp: Option<&str>,
+    ) -> Option<FetchedFragment> {
         let addr = format!("{}:{}", node.ip, node.port);
         let sock: std::net::SocketAddr = addr.parse().ok()?;
         let conn = std::net::TcpStream::connect_timeout(&sock, self.conn_timeout).ok()?;
         conn.set_read_timeout(Some(self.node_timeout)).ok()?;
         conn.set_write_timeout(Some(self.node_timeout)).ok()?;
         let mut conn = conn;
-        let target = format!(
-            "/{}/{}/{}/{}/{}",
-            node.device, partition, account, container, object
-        );
+        let target = Self::request_target(node, partition, account, container, object);
+        let preference_header = preferred_timestamp
+            .map(|timestamp| {
+                format!(
+                    "X-Backend-Fragment-Preferences: {}\r\n",
+                    serde_json::json!([{"timestamp": timestamp, "exclude": []}])
+                )
+            })
+            .unwrap_or_default();
         let req = format!(
             "GET {target} HTTP/1.1\r\nHost: {addr}\r\n\
              X-Backend-Storage-Policy-Index: {}\r\n\
+             X-Backend-Replication: True\r\n\
+             {preference_header}\
              Content-Length: 0\r\nConnection: close\r\n\r\n",
             self.policy_index
         );
@@ -593,7 +677,12 @@ impl FragmentFetcher for HttpFragmentFetcher {
         }
         let mut ec_etag = String::new();
         let mut ec_content_length = 0usize;
-        let mut timestamp = String::new();
+        // Fast-POST objects carry both timestamps.  The data timestamp names
+        // the fragment archive/durable set; the backend timestamp may instead
+        // be the newer metadata timestamp.  Header order is not a contract, so
+        // collect them independently and prefer the data timestamp explicitly.
+        let mut data_timestamp = String::new();
+        let mut backend_timestamp = String::new();
         let mut content_type = "application/octet-stream".to_string();
         let mut frag_index = -1i32;
         for l in lines {
@@ -605,10 +694,9 @@ impl FragmentFetcher for HttpFragmentFetcher {
                 "x-object-sysmeta-ec-etag" => ec_etag = v.to_string(),
                 "x-object-sysmeta-ec-content-length" => ec_content_length = v.parse().unwrap_or(0),
                 "x-object-sysmeta-ec-frag-index" => frag_index = v.parse().unwrap_or(-1),
-                "x-backend-data-timestamp" | "x-backend-timestamp" => {
-                    if timestamp.is_empty() {
-                        timestamp = v.to_string();
-                    }
+                "x-backend-data-timestamp" => data_timestamp = v.to_string(),
+                "x-backend-timestamp" if backend_timestamp.is_empty() => {
+                    backend_timestamp = v.to_string();
                 }
                 "content-type" => content_type = v.to_string(),
                 _ => {}
@@ -618,6 +706,11 @@ impl FragmentFetcher for HttpFragmentFetcher {
         if frag_index < 0 {
             frag_index = EcDriver::fragment_index(&body).unwrap_or(-1);
         }
+        let timestamp = if data_timestamp.is_empty() {
+            backend_timestamp
+        } else {
+            data_timestamp
+        };
         Some(FetchedFragment {
             frag_index,
             archive: body,
@@ -641,7 +734,7 @@ use std::path::PathBuf;
 
 use swift_core::pickle::{self, Value};
 use swift_diskfile::{get_partition_hashes, CleanupConfig, Hashes};
-use swift_ring::PartNode;
+use swift_ring::{HandoffNode, PartNode};
 
 use crate::ssync_sender::{
     ObjectTimestamps, Sender, SenderReport, SsyncJob, SsyncNode, SsyncSenderError, TcpSsyncWire,
@@ -663,6 +756,10 @@ pub struct EcPartJob {
     pub frag_index: Option<i64>,
     pub suffixes: Vec<String>,
     pub sync_to: Vec<SsyncNode>,
+    /// Ordered handoff candidates for SYNC targets that answer REPLICATE
+    /// with 507. Each candidate carries the backend fragment index it stands
+    /// in for, matching Python `_iter_nodes_for_frag`.
+    pub sync_handoffs: Vec<SsyncNode>,
     pub partition: u64,
     /// Full path to the partition directory.
     pub path: PathBuf,
@@ -714,9 +811,10 @@ fn ssync_node(dev: &RingDevice, backend_index: i64) -> SsyncNode {
 /// for every other frag index found. With no EC duplication,
 /// `get_backend_index(index) == index`.
 ///
-/// Deviations from Python: the tombstone-only revert job samples the FIRST
-/// `nparity + 1` primaries deterministically instead of `random.sample`
-/// (`None` scheme falls back to all primaries).
+/// Tombstone-only revert jobs sample `nparity + 1` distinct primaries on each
+/// pass, matching Python's `random.sample`. Varying the subset is required for
+/// liveness: repeatedly selecting the same unavailable primaries can otherwise
+/// leave a handoff tombstone forever.
 #[allow(clippy::too_many_arguments)]
 pub fn build_part_jobs(
     part_path: &Path,
@@ -725,6 +823,8 @@ pub fn build_part_jobs(
     policy: PolicyKind,
     cleanup: &CleanupConfig,
     part_nodes: &[PartNode<'_>],
+    handoff_nodes: &[HandoffNode<'_>],
+    rebuild_handoff_node_count: i64,
     local_dev_id: u64,
     scheme: Option<EcScheme>,
 ) -> Vec<EcPartJob> {
@@ -805,11 +905,30 @@ pub fn build_part_jobs(
             .into_iter()
             .map(|i| ssync_node(part_nodes[i].dev, part_nodes[i].index as i64))
             .collect();
+        let n_unique = scheme
+            .map(|value| value.ndata + value.nparity)
+            .unwrap_or(part_nodes.len())
+            .max(1);
+        let mut handoffs_per_index: BTreeMap<i64, usize> = BTreeMap::new();
+        let sync_handoffs = handoff_nodes
+            .iter()
+            .filter_map(|handoff| {
+                let backend_index = (handoff.handoff_index % n_unique) as i64;
+                let count = handoffs_per_index.entry(backend_index).or_default();
+                if rebuild_handoff_node_count >= 0 && *count >= rebuild_handoff_node_count as usize
+                {
+                    return None;
+                }
+                *count += 1;
+                Some(ssync_node(handoff.dev, backend_index))
+            })
+            .collect();
         jobs.push(EcPartJob {
             job_type: EcJobType::Sync,
             frag_index: Some(pfi),
             suffixes,
             sync_to,
+            sync_handoffs,
             partition,
             path: part_path.to_path_buf(),
             device: device.to_string(),
@@ -833,6 +952,7 @@ pub fn build_part_jobs(
             frag_index: Some(fi),
             suffixes: data_fi_to_suffixes[&fi].clone(),
             sync_to: vec![ssync_node(node.dev, fi)],
+            sync_handoffs: Vec::new(),
             partition,
             path: part_path.to_path_buf(),
             device: device.to_string(),
@@ -851,16 +971,24 @@ pub fn build_part_jobs(
                 .map(|s| s.nparity + 1)
                 .unwrap_or(part_nodes.len())
                 .min(part_nodes.len());
-            let sync_to = part_nodes
-                .iter()
-                .take(nsample)
-                .map(|node| ssync_node(node.dev, node.index as i64))
+            let sync_to = tombstone_sample_indices(
+                part_nodes.len(),
+                nsample,
+                partition,
+                local_dev_id,
+            )
+                .into_iter()
+                .map(|index| {
+                    let node = &part_nodes[index];
+                    ssync_node(node.dev, node.index as i64)
+                })
                 .collect();
             jobs.push(EcPartJob {
                 job_type: EcJobType::Revert,
                 frag_index: None,
                 suffixes: non_data_suffixes,
                 sync_to,
+                sync_handoffs: Vec::new(),
                 partition,
                 path: part_path.to_path_buf(),
                 device: device.to_string(),
@@ -869,6 +997,52 @@ pub fn build_part_jobs(
         }
     }
     jobs
+}
+
+static TOMBSTONE_SAMPLE_NONCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+/// Partial Fisher-Yates sample without replacement. The generator need not be
+/// cryptographic; it must provide an unbiased-enough, changing retry order as
+/// Python's Mersenne-Twister-backed `random.sample` does.
+fn sample_indices(total: usize, count: usize, mut seed: u64) -> Vec<usize> {
+    let count = count.min(total);
+    let mut indices: Vec<usize> = (0..total).collect();
+    for selected in 0..count {
+        let remaining = total - selected;
+        let swap_with = selected + (splitmix64(&mut seed) as usize % remaining);
+        indices.swap(selected, swap_with);
+    }
+    indices.truncate(count);
+    indices
+}
+
+fn tombstone_sample_indices(
+    total: usize,
+    count: usize,
+    partition: u64,
+    local_dev_id: u64,
+) -> Vec<usize> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let nonce = TOMBSTONE_SAMPLE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let seed = (nanos as u64)
+        ^ ((nanos >> 64) as u64)
+        ^ partition.rotate_left(17)
+        ^ local_dev_id.rotate_left(37)
+        ^ (std::process::id() as u64).rotate_left(49)
+        ^ nonce;
+    sample_indices(total, count, seed)
 }
 
 /// Runs one ssync exchange against a node; pluggable so job processing is
@@ -911,7 +1085,12 @@ impl SsyncPusher for TcpSsyncPusher {
 /// the sync to that node is skipped (never a fall back to a whole-partition
 /// ssync).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SuffixSyncError;
+pub enum SuffixSyncError {
+    /// The target returned 507, so Python retries a matching handoff node.
+    InsufficientStorage,
+    /// Transport, other HTTP status, pickle, or local hash failure.
+    Failed,
+}
 
 /// `reconstructor.get_suffix_delta`: compare local and remote EC per-suffix
 /// hash dicts (`{suffix: {None | frag_index: md5hex}}` as pickle [`Value`]s)
@@ -973,6 +1152,18 @@ pub trait SuffixHashFetcher {
     /// REPLICATE `/<device>/<partition>`: the partner's pickled per-suffix
     /// hash dict, decoded; `None` on any transport/HTTP/parse failure.
     fn fetch_hashes(&self, node: &SsyncNode, partition: u64, policy_index: u32) -> Option<Value>;
+
+    /// Status-preserving form used by the 507 handoff fallback. Existing test
+    /// fetchers retain the old contract and map `None` to a generic failure.
+    fn fetch_hashes_with_status(
+        &self,
+        node: &SsyncNode,
+        partition: u64,
+        policy_index: u32,
+    ) -> Result<Value, SuffixSyncError> {
+        self.fetch_hashes(node, partition, policy_index)
+            .ok_or(SuffixSyncError::Failed)
+    }
 }
 
 /// Real REPLICATE-verb client (the request shape of the object replicator's
@@ -991,13 +1182,21 @@ impl Default for HttpSuffixHashFetcher {
     }
 }
 
-impl SuffixHashFetcher for HttpSuffixHashFetcher {
-    fn fetch_hashes(&self, node: &SsyncNode, partition: u64, policy_index: u32) -> Option<Value> {
+impl HttpSuffixHashFetcher {
+    fn fetch_result(
+        &self,
+        node: &SsyncNode,
+        partition: u64,
+        policy_index: u32,
+    ) -> Result<Value, SuffixSyncError> {
         let addr = format!("{}:{}", node.replication_ip, node.replication_port);
-        let sock: std::net::SocketAddr = addr.parse().ok()?;
-        let conn = std::net::TcpStream::connect_timeout(&sock, self.conn_timeout).ok()?;
-        conn.set_read_timeout(Some(self.node_timeout)).ok()?;
-        conn.set_write_timeout(Some(self.node_timeout)).ok()?;
+        let sock: std::net::SocketAddr = addr.parse().map_err(|_| SuffixSyncError::Failed)?;
+        let conn = std::net::TcpStream::connect_timeout(&sock, self.conn_timeout)
+            .map_err(|_| SuffixSyncError::Failed)?;
+        conn.set_read_timeout(Some(self.node_timeout))
+            .map_err(|_| SuffixSyncError::Failed)?;
+        conn.set_write_timeout(Some(self.node_timeout))
+            .map_err(|_| SuffixSyncError::Failed)?;
         let mut conn = conn;
         let req = format!(
             "REPLICATE /{}/{partition} HTTP/1.1\r\nHost: {addr}\r\n\
@@ -1005,21 +1204,43 @@ impl SuffixHashFetcher for HttpSuffixHashFetcher {
              Content-Length: 0\r\nConnection: close\r\n\r\n",
             node.device
         );
-        conn.write_all(req.as_bytes()).ok()?;
+        conn.write_all(req.as_bytes())
+            .map_err(|_| SuffixSyncError::Failed)?;
         let mut raw = Vec::new();
-        conn.read_to_end(&mut raw).ok()?;
-        let split = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
+        conn.read_to_end(&mut raw)
+            .map_err(|_| SuffixSyncError::Failed)?;
+        let split = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .ok_or(SuffixSyncError::Failed)?;
         let status: u16 = String::from_utf8_lossy(&raw[..split])
             .lines()
-            .next()?
-            .split_whitespace()
-            .nth(1)?
-            .parse()
-            .ok()?;
-        if status != 200 {
-            return None;
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse().ok())
+            .ok_or(SuffixSyncError::Failed)?;
+        if status == 507 {
+            return Err(SuffixSyncError::InsufficientStorage);
         }
-        pickle::loads(&raw[split + 4..]).ok()
+        if status != 200 {
+            return Err(SuffixSyncError::Failed);
+        }
+        pickle::loads(&raw[split + 4..]).map_err(|_| SuffixSyncError::Failed)
+    }
+}
+
+impl SuffixHashFetcher for HttpSuffixHashFetcher {
+    fn fetch_hashes(&self, node: &SsyncNode, partition: u64, policy_index: u32) -> Option<Value> {
+        self.fetch_result(node, partition, policy_index).ok()
+    }
+
+    fn fetch_hashes_with_status(
+        &self,
+        node: &SsyncNode,
+        partition: u64,
+        policy_index: u32,
+    ) -> Result<Value, SuffixSyncError> {
+        self.fetch_result(node, partition, policy_index)
     }
 }
 
@@ -1029,11 +1250,9 @@ impl SuffixHashFetcher for HttpSuffixHashFetcher {
 /// invalidates and rehashes each) and diff again so the comparison is
 /// against the latest local state.
 ///
-/// Any REPLICATE failure is Python's `SuffixSyncError`: the caller skips the
-/// sync to this node. Deviations from Python: the first diff reads fresh
-/// partition hashes instead of the job-build-time snapshot (strictly newer),
-/// and there is no handoff retry on a 507 (`_iter_nodes_for_frag`) — any
-/// failure skips the partner.
+/// Any non-507 REPLICATE failure is Python's `SuffixSyncError`: the caller
+/// skips the sync to this node. A 507 remains distinguishable so the caller
+/// can retry a handoff with the same backend fragment index.
 #[allow(clippy::too_many_arguments)]
 pub fn get_suffixes_to_sync(
     part_path: &Path,
@@ -1045,11 +1264,9 @@ pub fn get_suffixes_to_sync(
     node: &SsyncNode,
     fetcher: &dyn SuffixHashFetcher,
 ) -> Result<Vec<String>, SuffixSyncError> {
-    let remote = fetcher
-        .fetch_hashes(node, partition, policy_index)
-        .ok_or(SuffixSyncError)?;
+    let remote = fetcher.fetch_hashes_with_status(node, partition, policy_index)?;
     let (_hashed, local) = get_partition_hashes(part_path, policy, &[], false, cleanup)
-        .map_err(|_| SuffixSyncError)?;
+        .map_err(|_| SuffixSyncError::Failed)?;
     let suffixes = get_suffix_delta(
         &local.to_value(),
         local_frag_index,
@@ -1059,7 +1276,7 @@ pub fn get_suffixes_to_sync(
     // now recalculate local hashes for suffixes that don't match so we're
     // comparing the latest
     let (_hashed, local) = get_partition_hashes(part_path, policy, &suffixes, false, cleanup)
-        .map_err(|_| SuffixSyncError)?;
+        .map_err(|_| SuffixSyncError::Failed)?;
     Ok(get_suffix_delta(
         &local.to_value(),
         local_frag_index,
@@ -1127,49 +1344,62 @@ pub fn process_part_job(
     };
     match job.job_type {
         EcJobType::Sync => {
-            for node in &job.sync_to {
+            for primary in &job.sync_to {
+                let mut candidates = Vec::with_capacity(1 + job.sync_handoffs.len());
+                candidates.push(primary);
+                candidates.extend(
+                    job.sync_handoffs
+                        .iter()
+                        .filter(|node| node.backend_index == primary.backend_index),
+                );
                 // Python `_get_suffixes_to_sync`: a REPLICATE hash comparison
-                // narrows the ssync to the out-of-sync suffixes; on
-                // SuffixSyncError the partner is skipped entirely.
-                let Ok(suffixes) = get_suffixes_to_sync(
-                    &job.path,
-                    job.partition,
-                    policy,
-                    policy_index,
-                    &cfg.cleanup,
-                    job.frag_index,
-                    node,
-                    hash_fetcher,
-                ) else {
-                    continue;
-                };
-                if suffixes.is_empty() {
-                    continue;
-                }
-                let sender = Sender {
-                    devices,
-                    hash_config,
-                    diskfile_config: cfg,
-                    job: &ssync_job,
-                    suffixes: Some(&suffixes),
-                    include_non_durable: false,
-                    max_objects: 0,
-                    sync_frag_target: node.backend_index,
-                    diskfile_builder,
-                };
-                match pusher.push(&sender, node) {
-                    Ok(_) => stats.suffix_syncs += suffixes.len() as u64,
-                    Err(e) => {
-                        stats.failures += 1;
-                        stats.last_error = Some(format!(
-                            "sync part {} frag {:?} -> {}:{}/{}: {e}",
-                            job.partition,
-                            job.frag_index,
-                            node.replication_ip,
-                            node.replication_port,
-                            node.device
-                        ));
+                // narrows the ssync to the out-of-sync suffixes. Only a 507
+                // advances to a same-index handoff; every other failure skips
+                // this primary target exactly as Python does.
+                for node in candidates {
+                    let suffixes = match get_suffixes_to_sync(
+                        &job.path,
+                        job.partition,
+                        policy,
+                        policy_index,
+                        &cfg.cleanup,
+                        job.frag_index,
+                        node,
+                        hash_fetcher,
+                    ) {
+                        Ok(suffixes) => suffixes,
+                        Err(SuffixSyncError::InsufficientStorage) => continue,
+                        Err(SuffixSyncError::Failed) => break,
+                    };
+                    if suffixes.is_empty() {
+                        break;
                     }
+                    let sender = Sender {
+                        devices,
+                        hash_config,
+                        diskfile_config: cfg,
+                        job: &ssync_job,
+                        suffixes: Some(&suffixes),
+                        include_non_durable: false,
+                        max_objects: 0,
+                        sync_frag_target: node.backend_index,
+                        diskfile_builder,
+                    };
+                    match pusher.push(&sender, node) {
+                        Ok(_) => stats.suffix_syncs += suffixes.len() as u64,
+                        Err(e) => {
+                            stats.failures += 1;
+                            stats.last_error = Some(format!(
+                                "sync part {} frag {:?} -> {}:{}/{}: {e}",
+                                job.partition,
+                                job.frag_index,
+                                node.replication_ip,
+                                node.replication_port,
+                                node.device
+                            ));
+                        }
+                    }
+                    break;
                 }
             }
         }
@@ -1351,6 +1581,37 @@ mod suffix_sync_tests {
         )
     }
 
+    #[test]
+    fn tombstone_sample_changes_subset_without_duplicates() {
+        let first = sample_indices(6, 3, 7);
+        assert_eq!(first, sample_indices(6, 3, 7), "seeded sample must be reproducible");
+        assert_eq!(first.len(), 3);
+        assert_eq!(
+            first.iter().copied().collect::<std::collections::BTreeSet<_>>().len(),
+            3,
+            "sample is without replacement"
+        );
+
+        let subsets: std::collections::BTreeSet<Vec<usize>> = (1..=32)
+            .map(|seed| {
+                let mut subset = sample_indices(6, 3, seed);
+                subset.sort_unstable();
+                subset
+            })
+            .collect();
+        assert!(
+            subsets.len() > 1,
+            "reconstructor retries must not keep choosing the same primaries"
+        );
+        let seen: std::collections::BTreeSet<usize> =
+            subsets.iter().flat_map(|subset| subset.iter().copied()).collect();
+        assert_eq!(seen, (0..6).collect(), "retry samples must reach every primary");
+
+        let mut all = sample_indices(4, 4, 11);
+        all.sort_unstable();
+        assert_eq!(all, [0, 1, 2, 3]);
+    }
+
     // ---- get_suffix_delta: the Python test table -------------------------
 
     #[test]
@@ -1435,6 +1696,35 @@ mod suffix_sync_tests {
         }
     }
 
+    struct HandoffFetcher {
+        handoff_port: u32,
+        handoff_hashes: Value,
+    }
+
+    impl SuffixHashFetcher for HandoffFetcher {
+        fn fetch_hashes(
+            &self,
+            _node: &SsyncNode,
+            _partition: u64,
+            _policy_index: u32,
+        ) -> Option<Value> {
+            None
+        }
+
+        fn fetch_hashes_with_status(
+            &self,
+            node: &SsyncNode,
+            _partition: u64,
+            _policy_index: u32,
+        ) -> Result<Value, SuffixSyncError> {
+            if node.replication_port == self.handoff_port {
+                Ok(self.handoff_hashes.clone())
+            } else {
+                Err(SuffixSyncError::InsufficientStorage)
+            }
+        }
+    }
+
     #[derive(Default)]
     struct RecordingPusher {
         pushes: RefCell<Vec<(u32, Vec<String>)>>,
@@ -1494,6 +1784,7 @@ mod suffix_sync_tests {
             frag_index: Some(1),
             suffixes: suffixes.iter().map(|s| s.to_string()).collect(),
             sync_to,
+            sync_handoffs: Vec::new(),
             partition: 3,
             path: part_path.to_path_buf(),
             device: "sda1".to_string(),
@@ -1596,6 +1887,52 @@ mod suffix_sync_tests {
     }
 
     #[test]
+    fn test_sync_job_retries_matching_handoff_only_after_507() {
+        let devices = tmp_root("sync-507-handoff");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let ts = now_ts();
+        put_frag(&part_path, "abc", &ts, 1);
+        let cleanup = CleanupConfig::default();
+        get_partition_hashes(&part_path, ec_kind(), &[], true, &cleanup).unwrap();
+
+        let fetcher = HandoffFetcher {
+            handoff_port: 2222,
+            handoff_hashes: Value::Dict(Vec::new()),
+        };
+        let pusher = RecordingPusher::default();
+        let mut job = sync_job(&part_path, &["abc"], vec![node(1111, 2)]);
+        job.sync_handoffs = vec![node(2222, 2), node(3333, 3)];
+
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let mut stats = EcSsyncStats::default();
+        process_part_job(
+            &devices,
+            &hc,
+            &cfg,
+            POLICY_INDEX,
+            ec_kind(),
+            &job,
+            &pusher,
+            &fetcher,
+            None,
+            &mut stats,
+        );
+
+        assert_eq!(
+            *pusher.pushes.borrow(),
+            vec![(2222, vec!["abc".to_string()])],
+            "the 507 primary must fall back only to a handoff for index 2"
+        );
+        assert_eq!(stats.suffix_syncs, 1, "{stats:?}");
+        assert_eq!(stats.failures, 0, "{stats:?}");
+        let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    #[test]
     fn test_sync_job_fully_in_sync_pushes_nothing() {
         let devices = tmp_root("insync");
         let part_path = devices
@@ -1693,6 +2030,8 @@ mod suffix_sync_tests {
             ec_kind(),
             &cleanup,
             &part_nodes,
+            &[],
+            2,
             1, // this node is the primary at index 1
             Some(EcScheme {
                 ndata: 2,
@@ -1795,6 +2134,7 @@ mod suffix_sync_tests {
             frag_index: Some(2),
             suffixes: vec!["abc".to_string()],
             sync_to: vec![node(1111, 2)],
+            sync_handoffs: Vec::new(),
             partition: 3,
             path: part_path.clone(),
             device: "sda1".to_string(),
@@ -1853,6 +2193,95 @@ mod suffix_sync_tests {
 #[cfg(all(test, feature = "ec"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_fragment_fetcher_prefers_data_timestamp_over_header_order() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = b"fragment-archive";
+            // Deliberately put the newer metadata timestamp first.  The
+            // fetcher must still select X-Backend-Data-Timestamp.
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 X-Backend-Timestamp: 1751500999.99999\r\n\
+                 X-Backend-Data-Timestamp: 1751500123.45678\r\n\
+                 X-Object-Sysmeta-Ec-Frag-Index: 2\r\n\
+                 X-Object-Sysmeta-Ec-Etag: deadbeef\r\n\
+                 X-Object-Sysmeta-Ec-Content-Length: {}\r\n\
+                 Content-Type: application/octet-stream\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len(),
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+            request
+        });
+
+        let node = RingDevice {
+            id: 1,
+            region: 1,
+            zone: 1,
+            ip: "127.0.0.1".to_string(),
+            port: u32::from(port),
+            replication_ip: None,
+            replication_port: None,
+            device: "sda1".to_string(),
+            weight: 1.0,
+            meta: String::new(),
+            extra: Default::default(),
+        };
+        let fetched = HttpFragmentFetcher {
+            policy_index: 2,
+            conn_timeout: Duration::from_secs(2),
+            node_timeout: Duration::from_secs(2),
+        }
+        .fetch_at(
+            &node,
+            17,
+            "AUTH_test",
+            "c-è",
+            "o-è/child",
+            Some("1751500123.45678"),
+        )
+        .expect("fetch fragment");
+
+        let request = server.join().unwrap();
+        let request = String::from_utf8(request).unwrap();
+        assert!(
+            request.starts_with(
+                "GET /sda1/17/AUTH_test/c-%C3%A8/o-%C3%A8/child HTTP/1.1\r\n"
+            ),
+            "UTF-8 Swift path segments must be percent-encoded: {request:?}"
+        );
+        assert!(
+            request.contains("X-Backend-Fragment-Preferences: [")
+                && request.contains("\"timestamp\":\"1751500123.45678\"")
+                && request.contains("\"exclude\":[]"),
+            "preferred durable timestamp must reach the peer: {request:?}"
+        );
+        assert_eq!(fetched.timestamp, "1751500123.45678");
+        assert_eq!(fetched.frag_index, 2);
+        assert_eq!(fetched.archive, b"fragment-archive");
+    }
 
     /// A fetcher backed by fragment archives held in memory, keyed by node id
     /// (node `i` returns fragment `i`) — the same layout a real cluster holds.

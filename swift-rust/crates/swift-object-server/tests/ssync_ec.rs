@@ -14,7 +14,6 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 use swift_core::hashing::HashPathConfig;
 use swift_diskfile::{get_data_dir, storage_directory, DiskFileConfig, PolicyKind};
@@ -80,12 +79,15 @@ fn object_server(devices: &Path) -> ObjectServer {
 /// Serve an object server on an ephemeral port; the thread lives for the
 /// rest of the test process.
 fn spawn_server(devices: &Path) -> SocketAddr {
-    let server = Arc::new(object_server(devices));
+    let server = object_server(devices);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
-    let handler: swift_http::Handler = Arc::new(move |req| server.handle(req));
     std::thread::spawn(move || {
-        let _ = swift_http::serve_forever(listener, handler);
+        let _ = swift_object_server::serve_with_config(
+            listener,
+            server,
+            swift_http::ServerConfig::default(),
+        );
     });
     address
 }
@@ -520,6 +522,8 @@ fn reconstructor_revert_moves_a_handoff_fragment_and_purges_it() {
         ec_kind(),
         &cleanup,
         &part_nodes,
+        &[],
+        2,
         99,
         None,
     );

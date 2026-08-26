@@ -29,7 +29,9 @@
 //! (Python registers via `register_swift_info('container_sync', realms=...)`).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use hmac::{Hmac, Mac};
@@ -37,7 +39,7 @@ use sha1::Sha1;
 use swift_core::constraints::VALID_API_VERSIONS;
 use swift_http::{split_path, Request, Response};
 
-use crate::{Middleware, NextFn};
+use crate::{AsyncNextFn, Middleware, MwPrep, NextFn};
 
 type HmacSha1 = Hmac<Sha1>;
 
@@ -375,26 +377,80 @@ impl ContainerSync {
         resp.headers.set("Content-Type", "text/plain");
         resp
     }
-}
 
-impl Middleware for ContainerSync {
-    fn handle(&self, mut req: Request, next: &NextFn) -> Response {
+    fn is_sync_source_update(req: &Request) -> bool {
+        if !matches!(req.method.as_str(), "PUT" | "POST")
+            || !req
+                .headers
+                .get("X-Container-Sync-To")
+                .is_some_and(|value| !value.is_empty())
+        {
+            return false;
+        }
+        matches!(split_path(&req.path, 3, 3, true), Ok(parts) if parts[2].as_deref().is_some_and(|container| !container.is_empty()))
+    }
+
+    fn versioning_configured(resp: &Response) -> bool {
+        resp.headers
+            .get("X-Container-Sysmeta-Versions-Container")
+            .is_some_and(|value| !value.is_empty())
+    }
+
+    fn versioning_sync_conflict() -> Response {
+        Self::bad_request(
+            "Cannot configure container sync on a container with object versioning configured.",
+        )
+    }
+
+    fn check_sync_source_update(&self, req: Request, next: &NextFn) -> Response {
+        let mut head = req.clone_head();
+        head.method = "HEAD".to_string();
+        head.query_string.clear();
+        head.headers.remove("X-Container-Sync-To");
+        head.headers.remove("X-Container-Sync-Key");
+        head.headers.set("X-Backend-Authorize-Override", "true");
+        if Self::versioning_configured(&next(head)) {
+            return Self::versioning_sync_conflict();
+        }
+        next(req)
+    }
+
+    async fn check_sync_source_update_async(
+        &self,
+        req: Request,
+        next: AsyncNextFn,
+    ) -> Response {
+        let mut head = req.clone_head();
+        head.method = "HEAD".to_string();
+        head.query_string.clear();
+        head.headers.remove("X-Container-Sync-To");
+        head.headers.remove("X-Container-Sync-Key");
+        head.headers.set("X-Backend-Authorize-Override", "true");
+        if Self::versioning_configured(&next(head).await) {
+            return Self::versioning_sync_conflict();
+        }
+        next(req).await
+    }
+
+    /// Header-only container-sync authorization shared by the synchronous
+    /// WSGI-compatible path and the production Hyper path.
+    fn prepare_request(&self, req: &mut Request) -> Option<Response> {
         // Fresh realms on /info is Python behaviour; proxy rebuilds info at
         // startup — middleware still reloads from disk if a path is set.
         if req.path == "/info" || req.path.starts_with("/info?") {
-            return next(req);
+            return None;
         }
 
         let segs = match split_path(&req.path, 3, 4, true) {
             Ok(s) => s,
-            Err(_) => return next(req),
+            Err(_) => return None,
         };
         let version = segs[0].as_deref().unwrap_or("");
         if !VALID_API_VERSIONS
             .iter()
             .any(|v| v.eq_ignore_ascii_case(version))
         {
-            return next(req);
+            return None;
         }
         let account = segs[1].clone().unwrap_or_default();
         let container = segs[2].clone().unwrap_or_default();
@@ -407,31 +463,31 @@ impl Middleware for ContainerSync {
         {
             if let Some(sync_to) = req.headers.get("x-container-sync-to") {
                 if !self.allow_full_urls && !sync_to.starts_with("//") {
-                    return Self::bad_request(
+                    return Some(Self::bad_request(
                         "Full URLs are not allowed for X-Container-Sync-To \
                          values. Only realm values of the format \
                          //realm/cluster/account/container are allowed.\n",
-                    );
+                    ));
                 }
             }
         }
 
         let auth = match req.headers.get("x-container-sync-auth") {
             Some(a) if !a.is_empty() => a.to_string(),
-            _ => return next(req),
+            _ => return None,
         };
         let parts: Vec<&str> = auth.split_whitespace().collect();
         if parts.len() != 3 {
-            return Self::unauthorized();
+            return Some(Self::unauthorized());
         }
         let (realm, nonce, sig) = (parts[0], parts[1], parts[2]);
         let realm_key = self.realms.key(realm);
         let realm_key2 = self.realms.key2(realm);
         let Some(realm_key) = realm_key else {
-            return Self::unauthorized();
+            return Some(Self::unauthorized());
         };
         let Some(user_key) = self.sync_keys.sync_key(&account, &container) else {
-            return Self::unauthorized();
+            return Some(Self::unauthorized());
         };
 
         // Gatekeeper shunts x-timestamp → x-backend-inbound-x-timestamp.
@@ -458,7 +514,7 @@ impl Middleware for ContainerSync {
             .unwrap_or_else(|| expected.clone());
 
         if !streq_const_time(sig, &expected) && !streq_const_time(sig, &expected2) {
-            return Self::unauthorized();
+            return Some(Self::unauthorized());
         }
 
         // Valid: authorize override + SLO/symlink overrides (header stamps).
@@ -467,7 +523,38 @@ impl Middleware for ContainerSync {
             .set("X-Backend-Remote-User", ".wsgi.container_sync");
         req.headers.set("X-Backend-Slo-Override", "true");
         req.headers.set("X-Backend-Symlink-Override", "true");
-        next(req)
+        None
+    }
+}
+
+impl Middleware for ContainerSync {
+    fn prepare(&self, req: &mut Request) -> MwPrep {
+        match self.prepare_request(req) {
+            Some(resp) => MwPrep::ShortCircuit(resp),
+            None => MwPrep::Continue,
+        }
+    }
+
+    fn handle(&self, mut req: Request, next: &NextFn) -> Response {
+        match self.prepare_request(&mut req) {
+            Some(resp) => resp,
+            None if Self::is_sync_source_update(&req) => {
+                self.check_sync_source_update(req, next)
+            }
+            None => next(req),
+        }
+    }
+
+    fn intercepts_request(&self, req: &Request) -> bool {
+        Self::is_sync_source_update(req)
+    }
+
+    fn handle_request_async(
+        &self,
+        req: Request,
+        next: AsyncNextFn,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move { self.check_sync_source_update_async(req, next).await })
     }
 }
 
@@ -518,6 +605,39 @@ mod tests {
     }
 
     #[test]
+    fn test_hyper_prepare_validates_gatekeeper_shunted_timestamp() {
+        let mut keys = HashMap::new();
+        keys.insert("AUTH_a/c".into(), "userkey".into());
+        let mut realms = RealmsConf::default();
+        realms.realms.insert(
+            "US".into(),
+            RealmInfo {
+                key: Some("realmkey".into()),
+                key2: None,
+                clusters: HashMap::new(),
+            },
+        );
+        let mw = ContainerSync::new(Arc::new(MapSyncKeyProvider { keys })).with_realms(realms);
+        let path = "/v1/AUTH_a/c/obj";
+        let ts = "1751500000.00000";
+        let nonce = "deadbeefdeadbeefdeadbeefdeadbeef";
+        let sig = get_sig("PUT", path, ts, nonce, "realmkey", "userkey");
+        let mut r = req("PUT", path);
+        r.headers.set("X-Backend-Inbound-X-Timestamp", ts);
+        r.headers
+            .set("X-Container-Sync-Auth", format!("US {nonce} {sig}"));
+
+        assert!(matches!(mw.prepare(&mut r), MwPrep::Continue));
+        assert_eq!(r.headers.get("X-Timestamp"), Some(ts));
+        assert!(r.headers.get("X-Backend-Inbound-X-Timestamp").is_none());
+        assert_eq!(r.headers.get("X-Backend-Authorize-Override"), Some("true"));
+        assert_eq!(
+            r.headers.get("X-Backend-Remote-User"),
+            Some(".wsgi.container_sync")
+        );
+    }
+
+    #[test]
     fn test_invalid_sig_401() {
         let mut keys = HashMap::new();
         keys.insert("AUTH_a/c".into(), "userkey".into());
@@ -557,6 +677,36 @@ mod tests {
         }));
         let resp = mw.handle(req("GET", "/v1/AUTH_a/c/obj"), &app_ok());
         assert_eq!(resp.status, 204);
+    }
+
+    #[test]
+    fn test_sync_source_rejected_when_object_versioning_is_configured() {
+        let mw = ContainerSync::new(Arc::new(MapSyncKeyProvider {
+            keys: HashMap::new(),
+        }));
+        let app: NextFn = Arc::new(|r: Request| {
+            if r.method == "HEAD" {
+                let mut resp = Response::new(204);
+                resp.headers.set(
+                    "X-Container-Sysmeta-Versions-Container",
+                    "%00versions%00c",
+                );
+                return resp;
+            }
+            Response::new(204)
+        });
+        let mut r = req("POST", "/v1/AUTH_a/c");
+        r.headers.set("X-Container-Sync-To", "//R/C/AUTH_a/d");
+        let mut resp = mw.handle(r, &app);
+        assert_eq!(resp.status, 400);
+        let body = resp
+            .body
+            .materialize(swift_http::MAX_CONTROL_BODY)
+            .unwrap();
+        assert_eq!(
+            body,
+            b"Cannot configure container sync on a container with object versioning configured."
+        );
     }
 
     #[test]

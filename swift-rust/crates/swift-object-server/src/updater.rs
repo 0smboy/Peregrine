@@ -50,6 +50,9 @@ pub struct AsyncUpdate {
     pub account: String,
     pub container: String,
     pub obj: String,
+    /// Shard destination (`account/container`) when this update is not for
+    /// the root. Python `split_update_path`.
+    pub container_path: Option<String>,
     /// Headers to forward on the container update, insertion-ordered.
     pub headers: Vec<(String, String)>,
     /// Container-node ids already updated (the `successes` key).
@@ -96,6 +99,7 @@ impl AsyncUpdate {
         let account = as_wire_string(dict_get(&pairs, "account")?)?;
         let container = as_wire_string(dict_get(&pairs, "container")?)?;
         let obj = as_wire_string(dict_get(&pairs, "obj")?)?;
+        let container_path = dict_get(&pairs, "container_path").and_then(as_wire_string);
         let headers = match dict_get(&pairs, "headers") {
             Some(Value::Dict(hp)) => hp
                 .iter()
@@ -118,6 +122,7 @@ impl AsyncUpdate {
             account,
             container,
             obj,
+            container_path,
             headers,
             successes,
             policy_index,
@@ -127,13 +132,26 @@ impl AsyncUpdate {
         })
     }
 
+    /// Account/container the container ring should use (shard when set).
+    pub fn ring_account_container(&self) -> (&str, &str) {
+        if let Some(p) = self.container_path.as_deref() {
+            if let Some((a, c)) = p.split_once('/') {
+                if !a.is_empty() && !c.is_empty() {
+                    return (a, c);
+                }
+            }
+        }
+        (&self.account, &self.container)
+    }
+
     /// The container path `/<account>/<container>/<object>` (percent-encoded),
     /// as sent to a container server.
     pub fn container_object_path(&self) -> String {
+        let (acct, cont) = self.ring_account_container();
         format!(
             "/{}/{}/{}",
-            percent_encode(&self.account),
-            percent_encode(&self.container),
+            percent_encode(acct),
+            percent_encode(cont),
             percent_encode(&self.obj)
         )
     }
@@ -442,8 +460,9 @@ pub fn run_once_with_concurrency(
     let concurrency = concurrency.max(1);
     if concurrency == 1 {
         for update in updates {
+            let (acct, cont) = update.ring_account_container();
             let Ok((part, nodes)) =
-                container_ring.get_nodes(&update.account, Some(&update.container), None)
+                container_ring.get_nodes(acct, Some(cont), None)
             else {
                 stats.errors += 1;
                 continue;
@@ -464,8 +483,9 @@ pub fn run_once_with_concurrency(
             for update in chunk {
                 let stats = &stats;
                 scope.spawn(move || {
+                    let (acct, cont) = update.ring_account_container();
                     let Ok((part, nodes)) =
-                        container_ring.get_nodes(&update.account, Some(&update.container), None)
+                        container_ring.get_nodes(acct, Some(cont), None)
                     else {
                         stats.lock().unwrap().errors += 1;
                         return;
@@ -563,6 +583,36 @@ mod tests {
         assert_eq!(u.container_object_path(), "/AUTH_test/c/o");
         assert!(u.headers.iter().any(|(k, v)| k == "x-size" && v == "4"));
         assert!(u.successes.is_empty());
+        assert!(u.container_path.is_none());
+    }
+
+    #[test]
+    fn test_parse_container_path_uses_shard_not_root() {
+        let headers = Value::Dict(vec![(
+            Value::Str("x-timestamp".into()),
+            Value::Str("1751500000.00000".into()),
+        )]);
+        let dict = Value::Dict(vec![
+            (Value::Str("op".into()), Value::Str("DELETE".into())),
+            (Value::Str("account".into()), Value::Str("AUTH_test".into())),
+            (Value::Str("container".into()), Value::Str("root".into())),
+            (Value::Str("obj".into()), Value::Str("obj-0000".into())),
+            (Value::Str("headers".into()), headers),
+            (
+                Value::Str("container_path".into()),
+                Value::Str(".shards_AUTH_test/shard-cont".into()),
+            ),
+        ]);
+        let bytes = pickle::dumps(&dict).unwrap();
+        let u = AsyncUpdate::parse(&bytes, PathBuf::from("/x"), 0, "1".into()).unwrap();
+        assert_eq!(
+            u.ring_account_container(),
+            (".shards_AUTH_test", "shard-cont")
+        );
+        assert_eq!(
+            u.container_object_path(),
+            "/.shards_AUTH_test/shard-cont/obj-0000"
+        );
     }
 
     #[test]

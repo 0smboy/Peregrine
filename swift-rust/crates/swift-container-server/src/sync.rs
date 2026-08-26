@@ -48,7 +48,9 @@ use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use swift_core::config::config_true_value;
 use swift_core::hashing::HashPathConfig;
+use swift_core::timestamp::Timestamp;
 use swift_db::{db_locations, ContainerBroker, DbError, DbValue};
+use swift_http::normalize_etag;
 
 type HmacSha1 = Hmac<Sha1>;
 
@@ -465,23 +467,59 @@ impl SyncRow {
         }
     }
 
-    /// Data timestamp for DELETE (first segment of `created_at`).
-    pub fn ts_data(&self) -> &str {
-        self.created_at
-            .split('_')
-            .next()
-            .unwrap_or(self.created_at.as_str())
+    /// Data timestamp for DELETE (first component of Swift's compact
+    /// `encode_timestamps` representation).
+    pub fn ts_data(&self) -> Option<Timestamp> {
+        decode_row_timestamps(&self.created_at).map(|(data, _, _)| data)
     }
 
-    /// Meta timestamp for PUT (third segment when present, else data).
-    pub fn ts_meta(&self) -> &str {
-        let parts: Vec<&str> = self.created_at.split('_').collect();
-        if parts.len() >= 3 {
-            parts[2]
-        } else {
-            self.ts_data()
-        }
+    /// Meta timestamp for PUT (third decoded component, defaulting through
+    /// content-type to data when the compact deltas are absent).
+    pub fn ts_meta(&self) -> Option<Timestamp> {
+        decode_row_timestamps(&self.created_at).map(|(_, _, meta)| meta)
     }
+}
+
+/// Decode Python Swift's `encode_timestamps` form:
+/// `<t1>[<+/-><t2-t1>[<+/-><t3-t2>]]`, where deltas are hexadecimal counts
+/// of [`swift_core::timestamp::PRECISION`]. This is distinct from a
+/// `Timestamp`'s optional `_hexoffset`; container rows use `+`/`-` deltas.
+fn decode_row_timestamps(encoded: &str) -> Option<(Timestamp, Timestamp, Timestamp)> {
+    let first_sign = encoded.find(['+', '-']).unwrap_or(encoded.len());
+    let data: Timestamp = encoded.get(..first_sign)?.parse().ok()?;
+    let mut deltas = Vec::new();
+    let mut cursor = first_sign;
+    while cursor < encoded.len() {
+        let sign = match encoded.as_bytes().get(cursor)? {
+            b'+' => 1i64,
+            b'-' => -1i64,
+            _ => return None,
+        };
+        let start = cursor + 1;
+        let rest = encoded.get(start..)?;
+        let next = rest.find(['+', '-']).map(|offset| start + offset);
+        let end = next.unwrap_or(encoded.len());
+        let raw = encoded.get(start..end)?;
+        if raw.is_empty() {
+            return None;
+        }
+        let magnitude = i64::from_str_radix(raw, 16).ok()?;
+        deltas.push(sign.checked_mul(magnitude)?);
+        if deltas.len() > 2 {
+            return None;
+        }
+        cursor = end;
+    }
+
+    let content_type = match deltas.first().copied().unwrap_or(0) {
+        0 => data,
+        delta => data.normalized().apply_delta(delta).ok()?,
+    };
+    let metadata = match deltas.get(1).copied().unwrap_or(0) {
+        0 => content_type,
+        delta => content_type.normalized().apply_delta(delta).ok()?,
+    };
+    Some((data, content_type, metadata))
 }
 
 /// Context for one remote sync operation (auth material + destination).
@@ -786,6 +824,35 @@ impl HttpSyncClient {
     }
 }
 
+fn newest_source_timestamp(row: &SyncRow, headers: &[(String, String)]) -> Option<String> {
+    let source_raw = headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("x-timestamp"))
+        .map(|(_, value)| value.as_str())?;
+    let source = source_raw.parse::<Timestamp>().ok()?;
+    let row_meta = row.ts_meta()?;
+    (source >= row_meta).then(|| source.internal())
+}
+
+/// Match Python container-sync's response-header normalization before a
+/// source object is replayed to the destination.  Public proxy responses may
+/// quote ETags, while object PUT expects the bare digest.  Container listings
+/// may also append an internal `swift_bytes` content-type parameter that must
+/// not escape onto the destination object.
+fn normalize_source_put_header(name: &str, value: String) -> String {
+    if name.eq_ignore_ascii_case("etag") {
+        return normalize_etag(&value).to_string();
+    }
+    if name.eq_ignore_ascii_case("content-type") {
+        if let Some((content_type, parameter)) = value.rsplit_once(';') {
+            if parameter.trim_start().starts_with("swift_bytes=") {
+                return content_type.to_string();
+            }
+        }
+    }
+    value
+}
+
 impl SyncClient for HttpSyncClient {
     fn sync_row(&self, row: &SyncRow, action: &SyncAction, ctx: &SyncContext) -> bool {
         let url = format!(
@@ -796,6 +863,9 @@ impl SyncClient for HttpSyncClient {
         let nonce = self.next_nonce();
         match action {
             SyncAction::Delete => {
+                let Some(data_timestamp) = row.ts_data() else {
+                    return false;
+                };
                 let headers = build_sync_headers(
                     "DELETE",
                     &row.name,
@@ -803,12 +873,15 @@ impl SyncClient for HttpSyncClient {
                     &ctx.user_key,
                     ctx.realm.as_deref(),
                     ctx.realm_key.as_deref(),
-                    row.ts_data(),
+                    &data_timestamp.internal(),
                     &nonce,
                     &[],
                 );
                 let status =
                     http_request_with_tls("DELETE", &url, &headers, &[], self.timeout, &self.tls);
+                if !matches!(status, 200..=299 | 404 | 409) {
+                    eprintln!("container-sync: destination DELETE status={status}");
+                }
                 // Python treats 404/409 as success for DELETE.
                 matches!(status, 200..=299 | 404 | 409)
             }
@@ -821,7 +894,14 @@ impl SyncClient for HttpSyncClient {
                 ) else {
                     return false;
                 };
-                let ts = row.ts_meta();
+                // The container row may be stale when an object-server PUT
+                // could not update any container replica.  Python uses the
+                // X-Newest object GET's X-Timestamp for the destination PUT,
+                // and refuses to advance the sync point if that object is
+                // older than the row's metadata timestamp.
+                let Some(ts) = newest_source_timestamp(row, &obj_headers) else {
+                    return false;
+                };
                 // Strip hop-by-hop / framing headers from the proxy GET.
                 // Forwarding Transfer-Encoding / Content-Length (we recompute
                 // CL from body) makes the remote PUT fail with 4xx/5xx and
@@ -850,6 +930,10 @@ impl SyncClient for HttpSyncClient {
                                 | "accept-ranges"
                         )
                     })
+                    .map(|(name, value)| {
+                        let value = normalize_source_put_header(&name, value);
+                        (name, value)
+                    })
                     .collect();
                 if !extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("etag"))
                     && !row.etag.is_empty()
@@ -870,12 +954,15 @@ impl SyncClient for HttpSyncClient {
                     &ctx.user_key,
                     ctx.realm.as_deref(),
                     ctx.realm_key.as_deref(),
-                    ts,
+                    &ts,
                     &nonce,
                     &extra,
                 );
                 let status =
                     http_request_with_tls("PUT", &url, &headers, &body, self.timeout, &self.tls);
+                if !(200..300).contains(&status) {
+                    eprintln!("container-sync: destination PUT status={status}");
+                }
                 (200..300).contains(&status)
             }
         }
@@ -998,6 +1085,21 @@ pub fn process_container_db(
         return stats;
     }
     let md = broker.metadata().unwrap_or_default();
+    let versions_enabled = md
+        .iter()
+        .find(|(key, _)| {
+            key.eq_ignore_ascii_case("X-Container-Sysmeta-Versions-Enabled")
+        })
+        .map(|(_, (value, _))| value.as_str())
+        .unwrap_or("");
+    // Python object-versioning and container-sync deliberately do not share
+    // a source container: container-sync cannot preserve prior versions.
+    // Fail closed if an internal pipeline bypass produced both metadata
+    // families on one DB.
+    if config_true_value(versions_enabled) {
+        stats.skips += 1;
+        return stats;
+    }
     let sync_to = md
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("X-Container-Sync-To"))
@@ -1295,6 +1397,32 @@ mod tests {
     }
 
     #[test]
+    fn test_source_put_headers_match_python_normalization() {
+        assert_eq!(
+            normalize_source_put_header("ETag", "\"7008d51685b171535a9114d25d60d18e\"".into()),
+            "7008d51685b171535a9114d25d60d18e"
+        );
+        assert_eq!(
+            normalize_source_put_header(
+                "Content-Type",
+                "application/octet-stream; swift_bytes=12".into(),
+            ),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            normalize_source_put_header(
+                "Content-Type",
+                "text/plain; charset=utf-8; swift_bytes=7".into(),
+            ),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            normalize_source_put_header("X-Object-Meta-Test", "keep".into()),
+            "keep"
+        );
+    }
+
+    #[test]
     fn test_realms_parse_and_validate() {
         let conf = r#"
 [realm1]
@@ -1487,6 +1615,85 @@ cluster_c1 = http://127.0.0.1:8080/v1/
     }
 
     #[test]
+    fn test_newest_source_timestamp_supersedes_stale_container_row() {
+        let row = SyncRow {
+            row_id: 1,
+            name: "o".into(),
+            created_at: "1751500000.00000".into(),
+            deleted: false,
+            size: 1,
+            content_type: "text/plain".into(),
+            etag: "old".into(),
+        };
+        let headers = vec![("X-Timestamp".into(), "1751500001.25000".into())];
+        assert_eq!(
+            newest_source_timestamp(&row, &headers).as_deref(),
+            Some("1751500001.25000")
+        );
+    }
+
+    #[test]
+    fn test_decode_row_timestamps_matches_python_compact_deltas() {
+        let (data, content_type, metadata) =
+            decode_row_timestamps("1787757710.91367+3bf3+0").unwrap();
+        assert_eq!(data.internal(), "1787757710.91367");
+        assert_eq!(content_type.internal(), "1787757711.06714");
+        assert_eq!(metadata.internal(), "1787757711.06714");
+
+        let (data, content_type, metadata) =
+            decode_row_timestamps("1751500003.00000-186a0+30d40").unwrap();
+        assert_eq!(data.internal(), "1751500003.00000");
+        assert_eq!(content_type.internal(), "1751500002.00000");
+        assert_eq!(metadata.internal(), "1751500004.00000");
+
+        let (data, content_type, metadata) =
+            decode_row_timestamps("1751500000.00000_0000000000000002+0+0").unwrap();
+        assert_eq!(data.offset(), 2);
+        assert_eq!(content_type, data);
+        assert_eq!(metadata, data);
+    }
+
+    #[test]
+    fn test_sync_row_uses_decoded_meta_and_data_timestamps() {
+        let row = SyncRow {
+            row_id: 2,
+            name: "o".into(),
+            created_at: "1787757710.91367+3bf3+0".into(),
+            deleted: false,
+            size: 9,
+            content_type: "image/jpeg".into(),
+            etag: "etag".into(),
+        };
+        assert_eq!(
+            row.ts_data().map(|timestamp| timestamp.internal()).as_deref(),
+            Some("1787757710.91367")
+        );
+        assert_eq!(
+            row.ts_meta().map(|timestamp| timestamp.internal()).as_deref(),
+            Some("1787757711.06714")
+        );
+    }
+
+    #[test]
+    fn test_newest_source_timestamp_rejects_missing_or_older_object() {
+        let row = SyncRow {
+            row_id: 1,
+            name: "o".into(),
+            created_at: "1751500001.00000".into(),
+            deleted: false,
+            size: 1,
+            content_type: "text/plain".into(),
+            etag: "row".into(),
+        };
+        assert!(newest_source_timestamp(&row, &[]).is_none());
+        assert!(newest_source_timestamp(
+            &row,
+            &[("x-timestamp".into(), "1751500000.00000".into())]
+        )
+        .is_none());
+    }
+
+    #[test]
     fn test_sync_store_add_remove_and_list() {
         let root = std::env::temp_dir().join(format!(
             "swift-sync-store-{}-{}",
@@ -1584,6 +1791,61 @@ cluster_c1 = http://127.0.0.1:8080/v1/
         assert_eq!(stats2.sync_point1, 3);
         // point2 should have advanced through the backfill window.
         assert!(stats2.sync_point2 >= 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_process_container_db_skips_object_versioning_source() {
+        let root = std::env::temp_dir().join(format!(
+            "swift-sync-versioned-skip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = root.join("c.db");
+        std::fs::create_dir_all(&root).unwrap();
+        let ts = "1751500000.00000";
+        let mut broker = ContainerBroker::new(&db, "a", "c");
+        broker.initialize(ts, 0, ts, "dbid").unwrap();
+        broker
+            .update_metadata(&vec![
+                (
+                    "X-Container-Sync-To".into(),
+                    ("http://127.0.0.1:9/v1/dst/c".into(), ts.into()),
+                ),
+                ("X-Container-Sync-Key".into(), ("secret".into(), ts.into())),
+                (
+                    "X-Container-Sysmeta-Versions-Enabled".into(),
+                    ("True".into(), ts.into()),
+                ),
+            ])
+            .unwrap();
+        broker
+            .put_object(
+                "o1",
+                ts,
+                3,
+                "text/plain",
+                "abc",
+                0,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let client = FakeSync {
+            sent: Mutex::new(Vec::new()),
+            fail_at: None,
+        };
+        let realms = ContainerSyncRealms::default();
+        let hosts = vec!["127.0.0.1".into()];
+        let hash = HashPathConfig::new("changeme", "changeme").unwrap();
+        let stats = process_container_db(&db, &client, &realms, &hosts, &hash, 0, 1, 60);
+        assert_eq!(stats.skips, 1);
+        assert!(client.sent.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

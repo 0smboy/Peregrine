@@ -45,10 +45,6 @@ pub mod updater;
 /// existing object (not REPLICATE/SSYNC). Not live-proven, not deployed,
 /// not a compliance claim.
 pub mod worm_native_gate;
-pub use worm_native_gate::{
-    is_s3_lock_control_plane_post, native_mutation_allowed, native_mutation_allowed_for,
-    NativeGovernanceBypass,
-};
 pub use expirer::{
     build_task_obj, get_expirer_container, iter_due_tasks, parse_task_obj, process_task,
     recon_update as expirer_recon_update, run_once as expirer_run_once, DeleteResult, ExpirerStats,
@@ -59,6 +55,10 @@ pub use updater::{
     iter_async_pendings, process_update, run_once, run_once_with_concurrency, AsyncUpdate,
     ContainerNodeClient, HttpContainerClient, NodeResult, UpdateOutcome, UpdaterStats,
 };
+pub use worm_native_gate::{
+    is_s3_lock_control_plane_post, native_mutation_allowed, native_mutation_allowed_for,
+    NativeGovernanceBypass,
+};
 
 use swift_core::config::{config_true_value, FallocateReserve};
 use swift_core::hashing::HashPathConfig;
@@ -66,8 +66,8 @@ use swift_core::pickle::{self, Value as PickleValue};
 use swift_core::timestamp::{normalize_delete_at_timestamp, Timestamp};
 use swift_diskfile::{
     get_data_dir, get_partition_hashes, invalidate_hash, make_ec_ondisk_filename,
-    storage_directory, valid_suffix, DiskFile, DiskFileConfig, DiskFileError, MetaValue, Metadata,
-    PolicyKind,
+    storage_directory, valid_suffix, DiskFile, DiskFileConfig, DiskFileError, FragPref, MetaValue,
+    Metadata, PolicyKind,
 };
 use swift_http::{
     http_date, split_path, unquote, AsyncRequest, AsyncService, Body, ChainReader, ClockHealth,
@@ -335,11 +335,9 @@ async fn drive_ssync_session(
             Ok(e) => e,
             Err(error) => {
                 let _ = tx
-                    .send(Ok(format!(
-                        ":ERROR: 0 {}\n",
-                        python_repr(error.message())
-                    )
-                    .into_bytes()))
+                    .send(Ok(
+                        format!(":ERROR: 0 {}\n", python_repr(error.message())).into_bytes()
+                    ))
                     .await;
                 return;
             }
@@ -347,7 +345,7 @@ async fn drive_ssync_session(
         for event in events {
             match event {
                 SsyncEvent::Missing(offer) => {
-                    let line = storage
+                    let line = match storage
                         .run_finite(device_id.clone(), TrafficClass::Replication, {
                             let offer = offer.clone();
                             let device = device.clone();
@@ -370,14 +368,36 @@ async fn drive_ssync_session(
                             }
                         })
                         .await
-                        .unwrap_or(None);
+                    {
+                        Ok(line) => line,
+                        Err(error) => {
+                            let _ = tx
+                                .send(Ok(format!(
+                                    ":ERROR: 0 {}\n",
+                                    python_repr(&error.to_string())
+                                )
+                                .into_bytes()))
+                                .await;
+                            return;
+                        }
+                    };
                     if let Some(line) = line {
                         wanted.push(line);
                     }
                 }
-                SsyncEvent::MissingEnd => missing_done = true,
+                SsyncEvent::MissingEnd => {
+                    missing_done = true;
+                }
                 _ => {}
             }
+        }
+        if let Some(message) = parser.failure().map(|error| error.message().to_string()) {
+            let _ = tx
+                .send(Ok(
+                    format!(":ERROR: 0 {}\n", python_repr(&message)).into_bytes()
+                ))
+                .await;
+            return;
         }
     }
     let _ = tx.send(Ok(b":MISSING_CHECK: START\r\n".to_vec())).await;
@@ -391,11 +411,15 @@ async fn drive_ssync_session(
         Ok(e) => e,
         Err(error) => {
             let _ = tx
-                .send(Ok(format!(":ERROR: 0 {}\n", python_repr(error.message())).into_bytes()))
+                .send(Ok(
+                    format!(":ERROR: 0 {}\n", python_repr(error.message())).into_bytes()
+                ))
                 .await;
-            Vec::new()
+            return;
         }
     };
+    let mut successes = 0usize;
+    let mut failures = 0usize;
     loop {
         for event in events {
             match event {
@@ -403,7 +427,7 @@ async fn drive_ssync_session(
                     let cfg = config.clone();
                     let device = device.clone();
                     let partition = partition.clone();
-                    let _ = storage
+                    let result = storage
                         .run_finite(device_id.clone(), TrafficClass::Replication, move || {
                             ObjectServer::new(cfg).apply_ssync_update(
                                 &device,
@@ -414,10 +438,39 @@ async fn drive_ssync_session(
                             )
                         })
                         .await;
+                    match result {
+                        Ok(response)
+                            if (200..300).contains(&response.status) || response.status == 404 =>
+                        {
+                            successes += 1;
+                        }
+                        Ok(_) | Err(_) => failures += 1,
+                    }
+                    if failures >= REPLICATION_FAILURE_THRESHOLD
+                        && (successes == 0
+                            || failures as f64 / successes as f64 > REPLICATION_FAILURE_RATIO)
+                    {
+                        let message =
+                            format!("Too many {failures} failures to {successes} successes");
+                        let _ = tx
+                            .send(Ok(
+                                format!(":ERROR: 0 {}\n", python_repr(&message)).into_bytes()
+                            ))
+                            .await;
+                        return;
+                    }
                 }
                 SsyncEvent::UpdatesEnd => updates_done = true,
                 _ => {}
             }
+        }
+        if let Some(message) = parser.failure().map(|error| error.message().to_string()) {
+            let _ = tx
+                .send(Ok(
+                    format!(":ERROR: 0 {}\n", python_repr(&message)).into_bytes()
+                ))
+                .await;
+            return;
         }
         if updates_done {
             break;
@@ -428,8 +481,24 @@ async fn drive_ssync_session(
         };
         events = match parser.push(&chunk) {
             Ok(e) => e,
-            Err(_) => break,
+            Err(error) => {
+                let _ = tx
+                    .send(Ok(
+                        format!(":ERROR: 0 {}\n", python_repr(error.message())).into_bytes()
+                    ))
+                    .await;
+                return;
+            }
         };
+    }
+    if failures != 0 {
+        let body = format!("ERROR: With :UPDATES: {failures} failures to {successes} successes");
+        let _ = tx
+            .send(Ok(
+                format!(":ERROR: 500 b{}\n", python_repr(&body)).into_bytes()
+            ))
+            .await;
+        return;
     }
     let _ = tx
         .send(Ok(b":UPDATES: START\r\n:UPDATES: END\r\n".to_vec()))
@@ -509,6 +578,54 @@ fn meta_get<'m>(meta: &'m Metadata, key: &str) -> Option<&'m str> {
     meta.iter()
         .find(|(k, _)| matches!(k, MetaValue::Str(s) if s.eq_ignore_ascii_case(key)))
         .and_then(|(_, v)| v.as_str())
+}
+
+/// Parse Python's `X-Backend-Fragment-Preferences` JSON while preserving the
+/// semantically important empty list: `[]` means a non-durable EC fragment is
+/// acceptable, whereas an absent header requires the durable set.
+fn parse_fragment_preferences(
+    headers: &HeaderKeyDict,
+    policy: PolicyKind,
+) -> Result<Option<Vec<FragPref>>, Response> {
+    let Some(raw) = headers.get("X-Backend-Fragment-Preferences") else {
+        return Ok(None);
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| plain_response(500, "Bad fragment preferences"))?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| plain_response(500, "Bad fragment preferences"))?;
+    let max_frag = match policy {
+        PolicyKind::Ec { n_unique_fragments } => n_unique_fragments.map(i64::from),
+        PolicyKind::Replication => None,
+    };
+    let mut prefs = Vec::with_capacity(items.len());
+    for item in items {
+        let object = item
+            .as_object()
+            .ok_or_else(|| plain_response(500, "Bad fragment preferences"))?;
+        let timestamp = object
+            .get("timestamp")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<Timestamp>().ok())
+            .ok_or_else(|| plain_response(500, "Bad fragment preferences"))?;
+        let exclude_values = object
+            .get("exclude")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| plain_response(500, "Bad fragment preferences"))?;
+        let mut exclude = Vec::with_capacity(exclude_values.len());
+        for value in exclude_values {
+            let frag = value
+                .as_i64()
+                .ok_or_else(|| plain_response(500, "Bad fragment preferences"))?;
+            if frag < 0 || max_frag.is_some_and(|limit| frag >= limit) {
+                return Err(plain_response(500, "Bad fragment preferences"));
+            }
+            exclude.push(frag);
+        }
+        prefs.push(FragPref { timestamp, exclude });
+    }
+    Ok(Some(prefs))
 }
 
 /// Stored object ETag used by GET/HEAD and PUT `If-Match`.
@@ -1018,6 +1135,9 @@ impl ObjectServer {
             };
             return self.get_streaming_async(req, include_body).await;
         }
+        if areq.method == "DELETE" {
+            return self.delete_async(areq).await;
+        }
         if areq.method == "SSYNC" {
             return self.ssync_async(areq).await;
         }
@@ -1046,9 +1166,123 @@ impl ObjectServer {
                 .setdefault("Content-Type", "text/html; charset=UTF-8");
             return resp;
         }
-        // POST/DELETE/REPLICATE (and any other FS method) run on
-        // StorageExecutor. SSYNC never reaches here.
+        // POST/REPLICATE run on StorageExecutor. DELETE is `delete_async`
+        // (disk on storage, container-update on the network runtime).
+        // SSYNC never reaches here.
         self.dispatch_fs_on_storage(req).await
+    }
+
+    /// Disk tombstone on the storage executor, then container-update on Tokio
+    /// so a sharded DELETE can follow 301 / ring-lookup the shard (probe L692).
+    async fn delete_async(&self, areq: AsyncRequest) -> Response {
+        let req = Request {
+            method: areq.method,
+            path: areq.path,
+            query_string: areq.query_string,
+            headers: areq.headers,
+            body: Body::empty(),
+        };
+        let (drive, part, account, container, obj, policy_index, policy) = match self.obj_path(&req)
+        {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        let req_timestamp = match Self::valid_timestamp(&req) {
+            Ok(t) => t,
+            Err(resp) => return resp,
+        };
+        let replication = req
+            .headers
+            .get("X-Backend-Replication")
+            .is_some_and(config_true_value);
+        let container_host = req
+            .headers
+            .get("X-Container-Host")
+            .unwrap_or("")
+            .to_string();
+        let container_device = req
+            .headers
+            .get("X-Container-Device")
+            .unwrap_or("")
+            .to_string();
+        let container_partition = req
+            .headers
+            .get("X-Container-Partition")
+            .unwrap_or("")
+            .to_string();
+        let backend_container_path =
+            shard_update_account_container(&req.headers).map(|(a, c)| format!("{a}/{c}"));
+        let db_state = req
+            .headers
+            .get("X-Container-Root-Db-State")
+            .map(str::to_string);
+        let exec = self.storage().clone();
+        let config = self.config.clone();
+        let fallocate_reserve = self.fallocate_reserve;
+        let worm_clock = std::sync::Arc::clone(&self.worm_clock);
+        let req_for_disk = Request {
+            method: req.method.clone(),
+            path: req.path.clone(),
+            query_string: req.query_string.clone(),
+            headers: req.headers.clone(),
+            body: Body::empty(),
+        };
+        // Clone path parts the storage closure owns so container-update can
+        // still borrow them after `.await` (probe L692).
+        let drive_disk = drive.clone();
+        let account_disk = account.clone();
+        let container_disk = container.clone();
+        let obj_disk = obj.clone();
+        let disk = exec
+            .run_finite(
+                DeviceId::new(drive.clone()),
+                TrafficClass::Foreground,
+                move || {
+                    ObjectServer {
+                        config,
+                        fallocate_reserve,
+                        worm_clock,
+                        storage: std::sync::OnceLock::new(),
+                        commit_stall: None,
+                    }
+                    .delete_apply_tombstone(
+                        &req_for_disk,
+                        &drive_disk,
+                        part,
+                        &account_disk,
+                        &container_disk,
+                        &obj_disk,
+                        policy_index,
+                        policy,
+                    )
+                },
+            )
+            .await;
+        let (resp, do_cu) = match disk {
+            Ok(pair) => pair,
+            Err(e) => return plain_response(500, &e.to_string()),
+        };
+        if do_cu {
+            let mut update = HeaderKeyDict::new();
+            update.set("x-timestamp", req_timestamp.internal());
+            self.container_update_async(
+                "DELETE",
+                &drive,
+                &account,
+                &container,
+                &obj,
+                replication,
+                container_host,
+                container_device,
+                container_partition,
+                backend_container_path,
+                &update,
+                policy_index,
+                db_state,
+            )
+            .await;
+        }
+        resp
     }
 
     /// Disk work for POST/DELETE/REPLICATE: one finite storage job, not the
@@ -1095,11 +1329,11 @@ impl ObjectServer {
             headers: areq.headers.clone(),
             body: Body::empty(),
         };
-        let (drive, part, account, container, obj, policy_index, policy) =
-            match self.obj_path(&req) {
-                Ok(v) => v,
-                Err(resp) => return resp,
-            };
+        let (drive, part, account, container, obj, policy_index, policy) = match self.obj_path(&req)
+        {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
         let req_timestamp = match Self::valid_timestamp(&req) {
             Ok(t) => t,
             Err(resp) => return resp,
@@ -1164,8 +1398,7 @@ impl ObjectServer {
         let resolved_delete_at = match self
             .storage()
             .run_finite(device.clone(), TrafficClass::Foreground, move || {
-                let (exists, orig_ts, orig_meta) =
-                    open_put_original(pre_df, ssync_frag_index)?;
+                let (exists, orig_ts, orig_meta) = open_put_original(pre_df, ssync_frag_index)?;
                 let pre_req = Request {
                     method: "PUT".into(),
                     path: String::new(),
@@ -1230,12 +1463,8 @@ impl ObjectServer {
             .await
             {
                 Ok((w, leftover)) => {
-                    match ingest_mime_footer_async(
-                        &mut areq.body,
-                        leftover,
-                        boundary.as_bytes(),
-                    )
-                    .await
+                    match ingest_mime_footer_async(&mut areq.body, leftover, boundary.as_bytes())
+                        .await
                     {
                         Ok(f) => footers = f,
                         Err(resp) => return resp,
@@ -1267,9 +1496,7 @@ impl ObjectServer {
                     Ok(Err(DiskFileError::Io(e))) if e.raw_os_error() == Some(28) => {
                         return swob_response(507)
                     }
-                    Ok(Err(DiskFileError::Io(_))) => {
-                        return plain_response(500, "disk I/O error")
-                    }
+                    Ok(Err(DiskFileError::Io(_))) => return plain_response(500, "disk I/O error"),
                     Ok(Err(e)) => return plain_response(500, &e.to_string()),
                     Err(e) => return plain_response(500, &e.to_string()),
                 };
@@ -1428,9 +1655,7 @@ impl ObjectServer {
                     Ok((r, Ok(buf))) => (r, Ok(buf)),
                     Ok((r, Err(e))) => (r, Err(e)),
                     Err(e) => {
-                        let _ = tx
-                            .send(Err(std::io::Error::other(e.to_string())))
-                            .await;
+                        let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
                         break;
                     }
                 };
@@ -1567,6 +1792,9 @@ impl ObjectServer {
             headers,
             path,
         } = pending;
+        let no_commit = headers
+            .get("X-Backend-No-Commit")
+            .is_some_and(config_true_value);
         let stall = self.commit_stall.clone();
         let exec = self.storage().clone();
         let device = DeviceId::new(drive.clone());
@@ -1577,7 +1805,11 @@ impl ObjectServer {
                 if let Some(stall) = stall.as_ref() {
                     stall();
                 }
-                durable.commit(metadata)
+                if no_commit {
+                    durable.commit_nondurable(metadata)
+                } else {
+                    durable.commit(metadata)
+                }
             })
             .await
         })
@@ -1622,9 +1854,11 @@ impl ObjectServer {
             .get("X-Container-Partition")
             .unwrap_or("")
             .to_string();
-        let backend_container_path = req
+        let backend_container_path =
+            shard_update_account_container(&req.headers).map(|(a, c)| format!("{a}/{c}"));
+        let db_state = req
             .headers
-            .get("X-Backend-Container-Path")
+            .get("X-Container-Root-Db-State")
             .map(str::to_string);
         self.container_update_async(
             "PUT",
@@ -1639,6 +1873,7 @@ impl ObjectServer {
             backend_container_path,
             &update,
             policy_index,
+            db_state,
         )
         .await;
         if let Some(delete_at) = resolved_delete_at
@@ -2345,9 +2580,8 @@ impl ObjectServer {
         }
 
         let _commit_stage = swift_core::stage::StageTimer::start("object-server", "put", "commit");
-        let defer = executor_commit.is_some()
-            && !multiphase
-            && !matches!(policy, PolicyKind::Ec { .. });
+        let defer =
+            executor_commit.is_some() && !multiphase && !matches!(policy, PolicyKind::Ec { .. });
         if defer {
             let durable = match writer.into_durable() {
                 Ok(d) => d,
@@ -2520,6 +2754,24 @@ impl ObjectServer {
             Ok(df) => df,
             Err(e) => return plain_response(500, &e.to_string()),
         };
+        // Python object-server POST constructs its DiskFile with
+        // `open_expired=is_backend_open_expired(request)`.  SSYNC marks every
+        // subrequest as backend replication, and must therefore be able to
+        // apply a newer .meta file that removes an already-expired
+        // X-Delete-At.  Opening with the normal client semantics here made
+        // the receiver return 404 before the replication POST could repair
+        // the missed metadata update.
+        if req
+            .headers
+            .get("X-Backend-Open-Expired")
+            .is_some_and(config_true_value)
+            || req
+                .headers
+                .get("X-Backend-Replication")
+                .is_some_and(config_true_value)
+        {
+            df = df.with_open_expired(true);
+        }
         let orig = match df.open(None) {
             Ok(opened) => opened,
             Err(DiskFileError::NotExist) | Err(DiskFileError::Deleted { .. }) => {
@@ -2765,47 +3017,84 @@ impl ObjectServer {
             Ok(v) => v,
             Err(resp) => return resp,
         };
-        let req_timestamp = match Self::valid_timestamp(req) {
-            Ok(t) => t,
-            Err(resp) => return resp,
-        };
-        if let Err(resp) = self.check_drive(&drive) {
-            return resp;
-        }
-        // Parse X-If-Delete-At up front (Python server.py DELETE): bad value
-        // → 400; when present we must verify it against the object's
-        // X-Delete-At before writing a tombstone (412 on mismatch).
-        let if_delete_at: Option<Timestamp> = match req.headers.get("X-If-Delete-At") {
-            None => None,
-            Some(raw) => match raw.parse::<Timestamp>() {
-                Ok(t) => Some(t),
-                Err(_) => return plain_response(400, "Bad X-If-Delete-At header value"),
-            },
-        };
-        let mut df = match self.diskfile_for(
+        let (resp, do_cu) = self.delete_apply_tombstone(
+            req,
             &drive,
             part,
             &account,
             &container,
             &obj,
-            (policy_index, policy),
-        ) {
-            Ok(df) => df,
-            Err(e) => return plain_response(500, &e.to_string()),
+            policy_index,
+            policy,
+        );
+        if do_cu {
+            let req_timestamp = match Self::valid_timestamp(req) {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+            let mut update = HeaderKeyDict::new();
+            update.set("x-timestamp", req_timestamp.internal());
+            self.container_update(
+                "DELETE",
+                &drive,
+                &account,
+                &container,
+                &obj,
+                req,
+                &update,
+                policy_index,
+            );
+        }
+        resp
+    }
+
+    /// Disk-only half of DELETE. `true` means a tombstone was written and a
+    /// container-update must follow (Python `orig_timestamp < req_timestamp`).
+    #[allow(clippy::too_many_arguments)]
+    fn delete_apply_tombstone(
+        &self,
+        req: &Request,
+        drive: &str,
+        part: u64,
+        account: &str,
+        container: &str,
+        obj: &str,
+        policy_index: u32,
+        policy: PolicyKind,
+    ) -> (Response, bool) {
+        let req_timestamp = match Self::valid_timestamp(req) {
+            Ok(t) => t,
+            Err(resp) => return (resp, false),
         };
-        // Expirer deletes already-past X-Delete-At objects; open them.
+        if let Err(resp) = self.check_drive(drive) {
+            return (resp, false);
+        }
+        let if_delete_at: Option<Timestamp> = match req.headers.get("X-If-Delete-At") {
+            None => None,
+            Some(raw) => match raw.parse::<Timestamp>() {
+                Ok(t) => Some(t),
+                Err(_) => {
+                    return (
+                        plain_response(400, "Bad X-If-Delete-At header value"),
+                        false,
+                    )
+                }
+            },
+        };
+        let mut df =
+            match self.diskfile_for(drive, part, account, container, obj, (policy_index, policy)) {
+                Ok(df) => df,
+                Err(e) => return (plain_response(500, &e.to_string()), false),
+            };
         if if_delete_at.is_some() {
             df = df.with_open_expired(true);
         }
-        // A live object yields 204 (if we win the timestamp race) or 409;
-        // a missing or already-deleted object always yields 404 even
-        // though a fresh tombstone is still written when we win.
         let (orig_timestamp, was_live, orig_delete_at, orig_metadata) = match df.open(None) {
             Ok(_) => {
                 let ts = df.data_timestamp().unwrap_or_else(|_| "0".parse().unwrap());
                 let metadata = match df.get_metadata() {
                     Ok(m) => Some(m.clone()),
-                    Err(e) => return plain_response(500, &e.to_string()),
+                    Err(e) => return (plain_response(500, &e.to_string()), false),
                 };
                 let delete_at = metadata
                     .as_ref()
@@ -2831,8 +3120,6 @@ impl ObjectServer {
                 ("0".parse().unwrap(), false, "0".parse().unwrap(), None)
             }
             Err(DiskFileError::Expired { metadata }) => {
-                // open_expired=false path; treat as live-but-expired for
-                // X-If-Delete-At verification.
                 let ts = metadata
                     .iter()
                     .find_map(|(k, v)| {
@@ -2858,11 +3145,8 @@ impl ObjectServer {
                     .unwrap_or_else(|| "0".parse().unwrap());
                 (ts, true, delete_at, Some(metadata))
             }
-            Err(e) => return plain_response(500, &e.to_string()),
+            Err(e) => return (plain_response(500, &e.to_string()), false),
         };
-        // Python: when X-If-Delete-At is set, refuse to tombstone unless the
-        // object's X-Delete-At matches (412) / object exists (404) / not
-        // newer (409).
         if let Some(req_if) = if_delete_at {
             if !was_live {
                 let mut resp = swob_response(404);
@@ -2870,7 +3154,7 @@ impl ObjectServer {
                     "X-Backend-Timestamp",
                     orig_timestamp.max(req_timestamp).internal(),
                 );
-                return resp;
+                return (resp, false);
             }
             if orig_timestamp >= req_timestamp {
                 let mut resp = swob_response(409);
@@ -2878,10 +3162,13 @@ impl ObjectServer {
                     "X-Backend-Timestamp",
                     orig_timestamp.max(req_timestamp).internal(),
                 );
-                return resp;
+                return (resp, false);
             }
             if orig_delete_at != req_if {
-                return plain_response(412, "X-If-Delete-At and X-Delete-At do not match");
+                return (
+                    plain_response(412, "X-If-Delete-At and X-Delete-At do not match"),
+                    false,
+                );
             }
         }
         let response_timestamp = orig_timestamp.max(req_timestamp);
@@ -2892,8 +3179,6 @@ impl ObjectServer {
         } else {
             409
         };
-        // Experimental native lock: existing object only. Replicate/ssync skip.
-        // Not live-proven, not deployed. Live metadata read failure is 500.
         if was_live && orig_timestamp < req_timestamp {
             if let Some(resp) = deny_locked_native_mutation(
                 req,
@@ -2902,48 +3187,44 @@ impl ObjectServer {
                     .map(|meta| Ok::<_, DiskFileError>(meta)),
                 self.worm_clock.clock_ok(),
             ) {
-                return resp;
+                return (resp, false);
             }
         }
+        let mut did_cu = false;
         if orig_timestamp < req_timestamp {
             let fresh = match self.diskfile_for(
-                &drive,
+                drive,
                 part,
-                &account,
-                &container,
-                &obj,
+                account,
+                container,
+                obj,
                 (policy_index, policy),
             ) {
                 Ok(df) => df,
-                Err(e) => return plain_response(500, &e.to_string()),
+                Err(e) => return (plain_response(500, &e.to_string()), false),
             };
             if let Err(e) = fresh.delete(&req_timestamp) {
-                return match e {
-                    DiskFileError::NoSpace => swob_response(507),
-                    other => plain_response(500, &other.to_string()),
-                };
+                return (
+                    match e {
+                        DiskFileError::NoSpace => swob_response(507),
+                        other => plain_response(500, &other.to_string()),
+                    },
+                    false,
+                );
             }
-            let mut update = HeaderKeyDict::new();
-            update.set("x-timestamp", req_timestamp.internal());
-            self.container_update(
-                "DELETE",
-                &drive,
-                &account,
-                &container,
-                &obj,
-                req,
-                &update,
-                policy_index,
-            );
+            did_cu = true;
         }
         let mut resp = match response_class {
-            204 => Response::new(204),
+            // Swift's swob response keeps the default HTML content type even
+            // for an empty successful DELETE body. The Python golden oracle
+            // asserts this header on 204 responses.
+            204 => swob_response(204),
             404 => swob_response(404),
             _ => swob_response(409),
         };
         resp.headers
             .set("X-Backend-Timestamp", response_timestamp.internal());
-        resp
+        (resp, did_cu)
     }
 
     fn get(&self, req: &Request, include_body: bool) -> Response {
@@ -2974,10 +3255,20 @@ impl ObjectServer {
             .is_some_and(config_true_value)
             || req
                 .headers
+                .get("X-Backend-Replication")
+                .is_some_and(config_true_value)
+            || req
+                .headers
                 .get("X-Open-Expired")
                 .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
                 .unwrap_or(false);
-        df = df.with_open_expired(open_expired);
+        let frag_prefs = match parse_fragment_preferences(&req.headers, policy) {
+            Ok(value) => value,
+            Err(resp) => return resp,
+        };
+        df = df
+            .with_frag_prefs(frag_prefs)
+            .with_open_expired(open_expired);
         let opened = match df.open(None) {
             Ok(df) => df,
             Err(DiskFileError::Deleted { timestamp, .. }) => {
@@ -3236,7 +3527,19 @@ impl ObjectServer {
         // L1b: take the container update fully off the PUT/DELETE critical
         // path. Listing lag is bounded by object-updater drain.
         if self.config.container_update_mode == ContainerUpdateMode::Async {
-            self.write_async_pending(op, drive, account, container, obj, update, policy_index);
+            let pending_path =
+                shard_update_account_container(&req.headers).map(|(a, c)| format!("{a}/{c}"));
+            self.write_async_pending(
+                op,
+                drive,
+                account,
+                container,
+                obj,
+                update,
+                policy_index,
+                req.headers.get("X-Container-Root-Db-State"),
+                pending_path.as_deref(),
+            );
             return;
         }
         let hosts: Vec<&str> = req
@@ -3256,18 +3559,21 @@ impl ObjectServer {
             .filter(|s| !s.is_empty())
             .collect();
         let partition = req.headers.get("X-Container-Partition").unwrap_or("");
-        // Sharded roots: proxy sets X-Backend-Container-Path to the owning
-        // shard's account/container so the update hits the shard DB, not the
-        // root (Python object-server container_update + Container-Path).
-        let (upd_account, upd_container) =
-            parse_backend_container_path(req.headers.get("X-Backend-Container-Path"))
-                .unwrap_or((account, container));
+        // Sharded roots: proxy sets X-Backend-Quoted-Container-Path (preferred)
+        // or X-Backend-Container-Path to the owning shard so the update hits
+        // the shard DB, not the root (Python object-server container_update).
+        let shard = shard_update_account_container(&req.headers);
+        let (upd_account, upd_container) = shard
+            .as_ref()
+            .map(|(a, c)| (a.as_str(), c.as_str()))
+            .unwrap_or((account, container));
         let path = format!(
             "/{}/{}/{}",
             percent_encode(upd_account),
             percent_encode(upd_container),
             percent_encode(obj)
         );
+        let pending_container_path = shard.map(|(a, c)| format!("{a}/{c}"));
         // A well-formed side channel gives matching host/device lists and a
         // partition; otherwise there is nothing to update synchronously and the
         // whole update goes async.
@@ -3283,12 +3589,23 @@ impl ObjectServer {
                 update,
                 policy_index,
                 self.config.container_update_timeout,
+                Some(&self.config.hash_config),
             )
         } else {
             false
         };
         if !all_ok {
-            self.write_async_pending(op, drive, account, container, obj, update, policy_index);
+            self.write_async_pending(
+                op,
+                drive,
+                account,
+                container,
+                obj,
+                update,
+                policy_index,
+                req.headers.get("X-Container-Root-Db-State"),
+                pending_container_path.as_deref(),
+            );
         }
     }
 
@@ -3309,12 +3626,23 @@ impl ObjectServer {
         backend_container_path: Option<String>,
         update: &HeaderKeyDict,
         policy_index: u32,
+        db_state: Option<String>,
     ) {
         if replication {
             return;
         }
         if self.config.container_update_mode == ContainerUpdateMode::Async {
-            self.write_async_pending(op, drive, account, container, obj, update, policy_index);
+            self.write_async_pending(
+                op,
+                drive,
+                account,
+                container,
+                obj,
+                update,
+                policy_index,
+                db_state.as_deref(),
+                backend_container_path.as_deref(),
+            );
             return;
         }
         let hosts: Vec<String> = container_host
@@ -3335,6 +3663,7 @@ impl ObjectServer {
                 Some((a, c)) => (a.to_string(), c.to_string()),
                 None => (account.to_string(), container.to_string()),
             };
+        let pending_container_path = backend_container_path.clone();
         let path = format!(
             "/{}/{}/{}",
             percent_encode(&upd_account),
@@ -3350,21 +3679,46 @@ impl ObjectServer {
         let obj = obj.to_string();
         let well_formed =
             !hosts.is_empty() && hosts.len() == devices.len() && !partition.is_empty();
-        let all_ok = if well_formed {
+        // Python: one container replica per object replica. Replacing hosts
+        // with every shard primary (3×3 CU per DELETE) timed out after shard 0
+        // (probe L692 leftover obj-0100+). Trust the proxy host first; ring-
+        // lookup the shard only when that fanout fails (path/host mismatch).
+        let mut all_ok = if well_formed {
             fanout_container_http_async(
                 op_owned.clone(),
-                hosts,
-                devices,
-                partition,
-                path,
+                hosts.clone(),
+                devices.clone(),
+                partition.clone(),
+                path.clone(),
                 update.clone(),
                 policy_index,
                 timeout,
+                Some(self.config.hash_config.clone()),
             )
             .await
         } else {
             false
         };
+        if !all_ok && backend_container_path.is_some() {
+            if let Some((part, ring_hosts, ring_devs)) =
+                shard_container_ring_targets(&upd_account, &upd_container, &self.config.hash_config)
+            {
+                if ring_hosts != hosts || part.to_string() != partition {
+                    all_ok = fanout_container_http_async(
+                        op_owned.clone(),
+                        ring_hosts,
+                        ring_devs,
+                        part.to_string(),
+                        path,
+                        update.clone(),
+                        policy_index,
+                        timeout,
+                        Some(self.config.hash_config.clone()),
+                    )
+                    .await;
+                }
+            }
+        }
         if !all_ok {
             self.write_async_pending(
                 &op_owned,
@@ -3374,6 +3728,8 @@ impl ObjectServer {
                 &obj,
                 &update,
                 policy_index,
+                db_state.as_deref(),
+                pending_container_path.as_deref(),
             );
         }
     }
@@ -3452,6 +3808,7 @@ impl ObjectServer {
                 &update,
                 0,
                 self.config.container_update_timeout,
+                None,
             )
         } else {
             false
@@ -3467,6 +3824,8 @@ impl ObjectServer {
                 &task_obj,
                 &update,
                 0,
+                None,
+                None,
             );
         }
     }
@@ -3493,6 +3852,8 @@ impl ObjectServer {
         obj: &str,
         update: &HeaderKeyDict,
         policy_index: u32,
+        db_state: Option<&str>,
+        container_path: Option<&str>,
     ) {
         use swift_core::pickle::{dumps, Value};
         let ohash = match self
@@ -3532,7 +3893,7 @@ impl ObjectServer {
             Value::Str("X-Backend-Storage-Policy-Index".into()),
             Value::Str(policy_index.to_string()),
         ));
-        let data = Value::Dict(vec![
+        let mut pairs = vec![
             (Value::Str("op".into()), Value::Str(op.to_string())),
             (
                 Value::Str("account".into()),
@@ -3544,7 +3905,22 @@ impl ObjectServer {
             ),
             (Value::Str("obj".into()), Value::Str(obj.to_string())),
             (Value::Str("headers".into()), Value::Dict(headers)),
-        ]);
+        ];
+        // Python pickle_async_update always stores db_state (obj.py async_update).
+        // Probe test_async_pendings asserts the key exists with the container's
+        // X-Container-Root-Db-State (`unsharded` until the sharder runs).
+        if let Some(state) = db_state {
+            pairs.push((Value::Str("db_state".into()), Value::Str(state.to_string())));
+        }
+        // Python pickle_async_update stores container_path so the updater
+        // talks to the shard, not the root (probe L1435 nested DELETE).
+        if let Some(path) = container_path.filter(|p| !p.is_empty()) {
+            pairs.push((
+                Value::Str("container_path".into()),
+                Value::Str(path.to_string()),
+            ));
+        }
+        let data = Value::Dict(pairs);
         let bytes = match dumps(&data) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -3583,6 +3959,26 @@ fn parse_backend_container_path(raw: Option<&str>) -> Option<(&str, &str)> {
     Some((a, c))
 }
 
+/// Python object-server prefers `X-Backend-Quoted-Container-Path` (unquoted)
+/// then `X-Backend-Container-Path`.
+fn shard_update_account_container(headers: &HeaderKeyDict) -> Option<(String, String)> {
+    let decoded;
+    let raw = if let Some(quoted) = headers.get("X-Backend-Quoted-Container-Path") {
+        decoded = percent_decode(quoted);
+        Some(decoded.as_str())
+    } else {
+        headers.get("X-Backend-Container-Path")
+    };
+    parse_backend_container_path(raw).map(|(a, c)| (a.to_string(), c.to_string()))
+}
+
+#[derive(Debug)]
+enum CuHostResult {
+    Ok,
+    Redirect(String),
+    Fail,
+}
+
 /// Fire one container-server update over a fresh TCP connection, honouring
 /// `timeout` for connect + read (Python `container_update_timeout`).
 #[allow(clippy::too_many_arguments)]
@@ -3595,13 +3991,16 @@ fn sync_container_http(
     update: &HeaderKeyDict,
     policy_index: u32,
     timeout: std::time::Duration,
-) -> bool {
+) -> CuHostResult {
     let Ok(addr) = host.parse::<std::net::SocketAddr>() else {
-        return false;
+        return CuHostResult::Fail;
     };
     let mut request = format!(
         "{op} /{device}/{partition}{path} HTTP/1.1\r\nHost: {host}\r\n\
-         X-Backend-Storage-Policy-Index: {policy_index}\r\n"
+         X-Backend-Storage-Policy-Index: {policy_index}\r\n\
+         X-Backend-Allow-Reserved-Names: true\r\n\
+         X-Backend-Accept-Redirect: true\r\n\
+         X-Backend-Accept-Quoted-Location: true\r\n"
     );
     for (k, v) in update.iter() {
         request.push_str(&format!("{k}: {v}\r\n"));
@@ -3613,16 +4012,182 @@ fn sync_container_http(
             let _ = conn.set_read_timeout(Some(timeout));
             let _ = conn.set_write_timeout(Some(timeout));
             let mut buf = Vec::new();
-            conn.write_all(request.as_bytes()).is_ok()
-                && conn.read_to_end(&mut buf).is_ok()
-                && response_is_success(&buf)
+            if conn.write_all(request.as_bytes()).is_err() || conn.read_to_end(&mut buf).is_err() {
+                return CuHostResult::Fail;
+            }
+            cu_host_result(&buf)
         }
-        Err(_) => false,
+        Err(_) => CuHostResult::Fail,
     }
 }
 
+fn cu_host_result(buf: &[u8]) -> CuHostResult {
+    let text = String::from_utf8_lossy(buf);
+    let mut lines = text.split("\r\n");
+    let status: u16 = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    if (200..300).contains(&status) {
+        return CuHostResult::Ok;
+    }
+    if status == 301 {
+        for line in lines {
+            if let Some((k, v)) = line.split_once(':') {
+                if k.eq_ignore_ascii_case("location") {
+                    let loc = v.trim();
+                    if !loc.is_empty() {
+                        return CuHostResult::Redirect(loc.to_string());
+                    }
+                }
+            }
+        }
+    }
+    CuHostResult::Fail
+}
+
+/// Parse a container-server 301 `Location` `/account/container/obj`.
+fn parse_shard_redirect_location(location: &str) -> Option<(String, String, String)> {
+    let decoded = percent_decode(location.trim());
+    let s = decoded.trim_start_matches('/');
+    let (acct, rest) = s.split_once('/')?;
+    let (cont, obj) = rest.split_once('/')?;
+    if acct.is_empty() || cont.is_empty() || obj.is_empty() {
+        return None;
+    }
+    Some((acct.to_string(), cont.to_string(), obj.to_string()))
+}
+
+fn load_container_ring(hash_config: &HashPathConfig) -> Option<swift_ring::Ring> {
+    let swift_dir = std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string());
+    let data = swift_ring::RingData::load(std::path::Path::new(&format!(
+        "{swift_dir}/container.ring.gz"
+    )))
+    .ok()?;
+    Some(swift_ring::Ring::new(data, hash_config.clone()))
+}
+
+/// Primary container-ring nodes for a resolved shard account/container.
+fn shard_container_ring_targets(
+    account: &str,
+    container: &str,
+    hash_config: &HashPathConfig,
+) -> Option<(u32, Vec<String>, Vec<String>)> {
+    let ring = load_container_ring(hash_config)?;
+    let (part, nodes) = ring.get_nodes(account, Some(container), None).ok()?;
+    if nodes.is_empty() {
+        return None;
+    }
+    let hosts: Vec<String> = nodes
+        .iter()
+        .map(|n| format!("{}:{}", n.dev.ip, n.dev.port))
+        .collect();
+    let devices: Vec<String> = nodes.iter().map(|n| n.dev.device.clone()).collect();
+    Some((part, hosts, devices))
+}
+
+/// Python updater applies 301 `Location` `/account/container/obj` via the
+/// container ring. Do it synchronously so probe L1435 does not wait for the
+/// updater interval.
+fn follow_shard_redirect(
+    location: &str,
+    op: &str,
+    update: &HeaderKeyDict,
+    policy_index: u32,
+    timeout: std::time::Duration,
+    hash_config: &HashPathConfig,
+) -> bool {
+    let Some((acct, cont, obj)) = parse_shard_redirect_location(location) else {
+        return false;
+    };
+    let Some(ring) = load_container_ring(hash_config) else {
+        return false;
+    };
+    let Ok((part, nodes)) = ring.get_nodes(&acct, Some(&cont), None) else {
+        return false;
+    };
+    if nodes.is_empty() {
+        return false;
+    }
+    let path = format!(
+        "/{}/{}/{}",
+        percent_encode(&acct),
+        percent_encode(&cont),
+        percent_encode(&obj)
+    );
+    let hosts: Vec<String> = nodes
+        .iter()
+        .map(|n| format!("{}:{}", n.dev.ip, n.dev.port))
+        .collect();
+    let devices: Vec<String> = nodes.iter().map(|n| n.dev.device.clone()).collect();
+    let host_refs: Vec<&str> = hosts.iter().map(|s| s.as_str()).collect();
+    let dev_refs: Vec<&str> = devices.iter().map(|s| s.as_str()).collect();
+    fanout_container_http(
+        op,
+        &host_refs,
+        &dev_refs,
+        &part.to_string(),
+        &path,
+        update,
+        policy_index,
+        timeout,
+        None,
+    )
+}
+
+/// Async twin of [`follow_shard_redirect`]: live Hyper PUT uses
+/// `container_update_async`, so a CLEAVED-root 301 must be followed on the
+/// Tokio path (probe test_sharding_listing L631).
+async fn follow_shard_redirect_async(
+    location: &str,
+    op: String,
+    update: HeaderKeyDict,
+    policy_index: u32,
+    timeout: std::time::Duration,
+    hash_config: &HashPathConfig,
+) -> bool {
+    let Some((acct, cont, obj)) = parse_shard_redirect_location(location) else {
+        return false;
+    };
+    let Some(ring) = load_container_ring(hash_config) else {
+        return false;
+    };
+    let Ok((part, nodes)) = ring.get_nodes(&acct, Some(&cont), None) else {
+        return false;
+    };
+    if nodes.is_empty() {
+        return false;
+    }
+    let path = format!(
+        "/{}/{}/{}",
+        percent_encode(&acct),
+        percent_encode(&cont),
+        percent_encode(&obj)
+    );
+    let hosts: Vec<String> = nodes
+        .iter()
+        .map(|n| format!("{}:{}", n.dev.ip, n.dev.port))
+        .collect();
+    let devices: Vec<String> = nodes.iter().map(|n| n.dev.device.clone()).collect();
+    fanout_container_http_async_once(
+        op,
+        hosts,
+        devices,
+        part.to_string(),
+        path,
+        update,
+        policy_index,
+        timeout,
+    )
+    .await
+    .iter()
+    .all(|r| matches!(r, CuHostResult::Ok))
+}
+
 /// Contact every container replica in parallel. Returns true only when every
-/// replica accepts the update inside `timeout`.
+/// replica accepts the update inside `timeout`. A 301 from a SHARDED root is
+/// followed once via the container ring (`hash_config` set).
 #[allow(clippy::too_many_arguments)]
 fn fanout_container_http(
     op: &str,
@@ -3633,6 +4198,7 @@ fn fanout_container_http(
     update: &HeaderKeyDict,
     policy_index: u32,
     timeout: std::time::Duration,
+    hash_config: Option<&HashPathConfig>,
 ) -> bool {
     if hosts.is_empty() || hosts.len() != devices.len() {
         return false;
@@ -3653,7 +4219,7 @@ fn fanout_container_http(
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-    std::thread::scope(|scope| {
+    let results: Vec<CuHostResult> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(jobs.len());
         for (host, device) in &jobs {
             let op = op.as_str();
@@ -3677,8 +4243,24 @@ fn fanout_container_http(
                 )
             }));
         }
-        handles.into_iter().all(|h| h.join().unwrap_or(false))
-    })
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or(CuHostResult::Fail))
+            .collect()
+    });
+    if results.iter().all(|r| matches!(r, CuHostResult::Ok)) {
+        return true;
+    }
+    if let (Some(cfg), Some(loc)) = (
+        hash_config,
+        results.iter().find_map(|r| match r {
+            CuHostResult::Redirect(s) => Some(s.as_str()),
+            _ => None,
+        }),
+    ) {
+        return follow_shard_redirect(loc, &op, update, policy_index, timeout, cfg);
+    }
+    false
 }
 
 async fn fanout_container_http_async(
@@ -3690,9 +4272,49 @@ async fn fanout_container_http_async(
     update: HeaderKeyDict,
     policy_index: u32,
     timeout: std::time::Duration,
+    hash_config: Option<HashPathConfig>,
 ) -> bool {
     if hosts.is_empty() || hosts.len() != devices.len() {
         return false;
+    }
+    let results = fanout_container_http_async_once(
+        op.clone(),
+        hosts,
+        devices,
+        partition,
+        path.clone(),
+        update.clone(),
+        policy_index,
+        timeout,
+    )
+    .await;
+    if results.iter().all(|r| matches!(r, CuHostResult::Ok)) {
+        return true;
+    }
+    if let (Some(cfg), Some(loc)) = (
+        hash_config.as_ref(),
+        results.iter().find_map(|r| match r {
+            CuHostResult::Redirect(s) => Some(s.as_str()),
+            _ => None,
+        }),
+    ) {
+        return follow_shard_redirect_async(loc, op, update, policy_index, timeout, cfg).await;
+    }
+    false
+}
+
+async fn fanout_container_http_async_once(
+    op: String,
+    hosts: Vec<String>,
+    devices: Vec<String>,
+    partition: String,
+    path: String,
+    update: HeaderKeyDict,
+    policy_index: u32,
+    timeout: std::time::Duration,
+) -> Vec<CuHostResult> {
+    if hosts.is_empty() || hosts.len() != devices.len() {
+        return vec![CuHostResult::Fail];
     }
     let mut join = tokio::task::JoinSet::new();
     for (host, device) in hosts.into_iter().zip(devices) {
@@ -3714,11 +4336,11 @@ async fn fanout_container_http_async(
             .await
         });
     }
-    let mut all_ok = true;
+    let mut results: Vec<CuHostResult> = Vec::new();
     while let Some(r) = join.join_next().await {
-        all_ok &= r.unwrap_or(false);
+        results.push(r.unwrap_or(CuHostResult::Fail));
     }
-    all_ok
+    results
 }
 
 async fn async_container_http(
@@ -3730,22 +4352,26 @@ async fn async_container_http(
     update: &HeaderKeyDict,
     policy_index: u32,
     timeout: std::time::Duration,
-) -> bool {
+) -> CuHostResult {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let Ok(addr) = host.parse::<std::net::SocketAddr>() else {
-        return false;
+        return CuHostResult::Fail;
     };
     let mut request = format!(
         "{op} /{device}/{partition}{path} HTTP/1.1\r\nHost: {host}\r\n\
-         X-Backend-Storage-Policy-Index: {policy_index}\r\n"
+         X-Backend-Storage-Policy-Index: {policy_index}\r\n\
+         X-Backend-Allow-Reserved-Names: true\r\n\
+         X-Backend-Accept-Redirect: true\r\n\
+         X-Backend-Accept-Quoted-Location: true\r\n"
     );
     for (k, v) in update.iter() {
         request.push_str(&format!("{k}: {v}\r\n"));
     }
     request.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
-    let Ok(Ok(mut stream)) = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await
+    let Ok(Ok(mut stream)) =
+        tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await
     else {
-        return false;
+        return CuHostResult::Fail;
     };
     let _ = stream.set_nodelay(true);
     if tokio::time::timeout(timeout, stream.write_all(request.as_bytes()))
@@ -3754,23 +4380,12 @@ async fn async_container_http(
         .and_then(Result::ok)
         .is_none()
     {
-        return false;
+        return CuHostResult::Fail;
     }
     let _ = tokio::time::timeout(timeout, stream.flush()).await;
     let mut buf = Vec::new();
     let _ = tokio::time::timeout(timeout, stream.read_to_end(&mut buf)).await;
-    response_is_success(&buf)
-}
-
-/// Whether a raw HTTP response's status line is 2xx.
-fn response_is_success(buf: &[u8]) -> bool {
-    String::from_utf8_lossy(buf)
-        .split("\r\n")
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|c| c.parse::<u16>().ok())
-        .map(|s| (200..300).contains(&s))
-        .unwrap_or(false)
+    cu_host_result(&buf)
 }
 
 pub(crate) fn percent_encode(s: &str) -> String {
@@ -3784,6 +4399,27 @@ pub(crate) fn percent_encode(s: &str) -> String {
         }
     }
     out
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (
+                (b[i + 1] as char).to_digit(16),
+                (b[i + 2] as char).to_digit(16),
+            ) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Python object-server defaults `replication_failure_threshold` /
@@ -4274,6 +4910,20 @@ mod fast_post_helper_tests {
     use super::*;
 
     #[test]
+    fn test_shard_update_account_container_prefers_quoted() {
+        let mut h = HeaderKeyDict::new();
+        h.set("X-Backend-Quoted-Container-Path", ".shards_AUTH_test/c%2D0");
+        h.set("X-Backend-Container-Path", "AUTH_test/root");
+        let got = shard_update_account_container(&h).unwrap();
+        assert_eq!(got.0, ".shards_AUTH_test");
+        assert_eq!(got.1, "c-0");
+        let mut h2 = HeaderKeyDict::new();
+        h2.set("X-Backend-Container-Path", ".shards_AUTH_test/shard-cont");
+        let got2 = shard_update_account_container(&h2).unwrap();
+        assert_eq!(got2, (".shards_AUTH_test".into(), "shard-cont".into()));
+    }
+
+    #[test]
     fn test_extract_swift_bytes() {
         assert_eq!(
             extract_swift_bytes("text/plain"),
@@ -4308,6 +4958,9 @@ mod fast_post_helper_tests {
 #[cfg(test)]
 mod fallocate_reserve_tests {
     use super::*;
+
+    // `SWIFT_DIR` is process-global; serialize tests that load container.ring.gz.
+    static SWIFT_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn breach_math_matches_python_fallocate_reserve() {
@@ -4352,6 +5005,56 @@ mod fallocate_reserve_tests {
         .with_fallocate_reserve(reserve)
     }
 
+    #[tokio::test]
+    async fn async_ssync_reports_failed_subrequest_in_band() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-async-ssync-error-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let config = server.config.clone();
+        let storage = server.storage().clone();
+        let body = b":MISSING_CHECK: START\r\n\
+                     :MISSING_CHECK: END\r\n\
+                     :UPDATES: START\r\n\
+                     PUT /a/c/o\r\n\
+                     Content-Length: 0\r\n\r\n\
+                     :UPDATES: END\r\n"
+            .to_vec();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        drive_ssync_session(
+            swift_http::IncomingBody::from_bytes(body, u64::MAX),
+            tx,
+            storage,
+            config,
+            "sda1".to_string(),
+            "0".to_string(),
+            0,
+            PolicyKind::Replication,
+            None,
+        )
+        .await;
+
+        let mut output = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            output.extend_from_slice(&chunk.unwrap());
+        }
+        let output = String::from_utf8_lossy(&output);
+        assert!(
+            output.contains(":ERROR: 500 b'ERROR: With :UPDATES: 1 failures to 0 successes'"),
+            "async receiver falsely reported success: {output:?}"
+        );
+        assert!(
+            !output.contains(":UPDATES: START"),
+            "failed update must not receive success frames: {output:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn put_request(body: &[u8]) -> Request {
         put_named("o", "1", body)
     }
@@ -4381,6 +5084,366 @@ mod fallocate_reserve_tests {
     }
 
     #[test]
+    fn delete_container_update_uses_backend_container_path() {
+        // Probe L1435: DELETE of a sharded object must update the nested
+        // shard DB (`X-Backend-Container-Path`), not the root listing.
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+        let seen = Arc::new(Mutex::new(String::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen_t = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = vec![0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                *seen_t.lock().unwrap() = req.lines().next().unwrap_or("").to_string();
+                let _ = stream.write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-cu-del-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        assert_eq!(server.handle(put_named("obj-0000", "1", b"x")).status, 201);
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Timestamp", "2");
+        headers.set("X-Container-Host", format!("{addr}"));
+        headers.set("X-Container-Device", "sda1");
+        headers.set("X-Container-Partition", "7");
+        headers.set("X-Backend-Container-Path", ".shards_AUTH_test/shard-cont");
+        let resp = server.handle(Request {
+            method: "DELETE".into(),
+            path: "/sda1/0/AUTH_test/c/obj-0000".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        });
+        assert_eq!(resp.status, 204, "{}", resp.reason);
+        let line = seen.lock().unwrap().clone();
+        assert!(
+            line.contains("DELETE /sda1/7/.shards_AUTH_test/shard-cont/obj-0000"),
+            "container update must target the shard, got {line:?}"
+        );
+        assert!(
+            !line.contains("/AUTH_test/c/obj-0000"),
+            "must not update the root listing, got {line:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn handle_async_delete_container_update_uses_backend_container_path() {
+        // Hyper DELETE must use the same shard path as sync handle() (L692).
+        // Empty SWIFT_DIR so we do not pick up a host container.ring.gz.
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+        let _guard = SWIFT_DIR_LOCK.lock().unwrap();
+        let empty_swift = std::env::temp_dir().join(format!(
+            "swift-obj-cu-del-async-noswift-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&empty_swift);
+        std::fs::create_dir_all(&empty_swift).unwrap();
+        std::env::set_var("SWIFT_DIR", &empty_swift);
+        let seen = Arc::new(Mutex::new(String::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen_t = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = vec![0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                *seen_t.lock().unwrap() = req.lines().next().unwrap_or("").to_string();
+                let _ = stream.write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-cu-del-async-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        assert_eq!(server.handle(put_named("obj-0000", "1", b"x")).status, 201);
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Timestamp", "2");
+        headers.set("X-Container-Host", format!("{addr}"));
+        headers.set("X-Container-Device", "sda1");
+        headers.set("X-Container-Partition", "7");
+        headers.set("X-Backend-Container-Path", ".shards_AUTH_test/shard-cont");
+        let resp = server
+            .handle_async(AsyncRequest {
+                method: "DELETE".into(),
+                path: "/sda1/0/AUTH_test/c/obj-0000".into(),
+                query_string: String::new(),
+                headers,
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        let _ = std::env::remove_var("SWIFT_DIR");
+        let _ = std::fs::remove_dir_all(&empty_swift);
+        assert_eq!(resp.status, 204, "{}", resp.reason);
+        let line = seen.lock().unwrap().clone();
+        assert!(
+            line.contains("DELETE /sda1/7/.shards_AUTH_test/shard-cont/obj-0000"),
+            "async DELETE container update must target the shard, got {line:?}"
+        );
+        assert!(
+            !line.contains("/AUTH_test/c/obj-0000"),
+            "must not update the root listing, got {line:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn handle_async_delete_ring_looks_up_shard_not_root_host() {
+        // X-Container-Host names the root; X-Backend-Container-Path names the
+        // shard. Ring lookup must send the tombstone to the shard nodes.
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+        let _guard = SWIFT_DIR_LOCK.lock().unwrap();
+        let root = TcpListener::bind("127.0.0.1:0").unwrap();
+        let shard = TcpListener::bind("127.0.0.1:0").unwrap();
+        let root_addr = root.local_addr().unwrap();
+        let shard_addr = shard.local_addr().unwrap();
+        let seen_root = Arc::new(Mutex::new(String::new()));
+        let seen_shard = Arc::new(Mutex::new(String::new()));
+        let seen_root_t = Arc::clone(&seen_root);
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = root.accept() {
+                let mut buf = vec![0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                *seen_root_t.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let seen_shard_t = Arc::clone(&seen_shard);
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = shard.accept() {
+                let mut buf = vec![0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                *seen_shard_t.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = stream.write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let data = swift_ring::RingData::from_parts(
+            vec![Some(swift_ring::RingDevice {
+                id: 0,
+                region: 1,
+                zone: 1,
+                ip: shard_addr.ip().to_string(),
+                port: shard_addr.port() as u32,
+                replication_ip: None,
+                replication_port: None,
+                device: "sdb1".into(),
+                weight: 100.0,
+                meta: String::new(),
+                extra: Default::default(),
+            })],
+            32,
+            vec![vec![0]],
+        );
+        let swift_dir = std::env::temp_dir().join(format!(
+            "swift-obj-cu-del-ring-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&swift_dir);
+        std::fs::create_dir_all(&swift_dir).unwrap();
+        data.save_v1(&swift_dir.join("container.ring.gz")).unwrap();
+        std::env::set_var("SWIFT_DIR", &swift_dir);
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-cu-del-ring-dev-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        assert_eq!(server.handle(put_named("obj-0000", "1", b"x")).status, 201);
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Timestamp", "2");
+        headers.set("X-Container-Host", format!("{root_addr}"));
+        headers.set("X-Container-Device", "sda1");
+        headers.set("X-Container-Partition", "7");
+        headers.set("X-Backend-Container-Path", ".shards_AUTH_test/shard-cont");
+        let resp = server
+            .handle_async(AsyncRequest {
+                method: "DELETE".into(),
+                path: "/sda1/0/AUTH_test/c/obj-0000".into(),
+                query_string: String::new(),
+                headers,
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        let _ = std::env::remove_var("SWIFT_DIR");
+        let _ = std::fs::remove_dir_all(&swift_dir);
+        assert_eq!(resp.status, 204, "{}", resp.reason);
+        let shard_req = seen_shard.lock().unwrap().clone();
+        assert!(
+            shard_req.contains("DELETE /sdb1/0/.shards_AUTH_test/shard-cont/obj-0000"),
+            "ring lookup must tombstone the shard, got {shard_req:?}"
+        );
+        let root_req = seen_root.lock().unwrap().clone();
+        assert!(
+            root_req.contains("DELETE"),
+            "root host is tried first and 404s, got {root_req:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cu_host_result_parses_301_location() {
+        let buf = b"HTTP/1.1 301 Moved Permanently\r\n\
+                    Location: /.shards_AUTH_test/shard-cont/obj-0001\r\n\
+                    Content-Length: 0\r\n\r\n";
+        match cu_host_result(buf) {
+            CuHostResult::Redirect(loc) => {
+                assert_eq!(loc, "/.shards_AUTH_test/shard-cont/obj-0001");
+            }
+            other => panic!("expected Redirect, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn async_container_http_reports_301_redirect() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = vec![0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 301 Moved Permanently\r\n\
+                      Location: /.shards_AUTH_test/shard-cont/obj-0001\r\n\
+                      Content-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let got = async_container_http(
+            "PUT",
+            &addr.to_string(),
+            "sda1",
+            "7",
+            "/AUTH_test/c/obj-0001",
+            &HeaderKeyDict::new(),
+            0,
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        match got {
+            CuHostResult::Redirect(loc) => {
+                assert_eq!(loc, "/.shards_AUTH_test/shard-cont/obj-0001");
+            }
+            _ => panic!("expected Redirect, got {got:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_async_follows_301_via_container_ring() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+        let _guard = SWIFT_DIR_LOCK.lock().unwrap();
+        let redirect = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dest = TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirect_addr = redirect.local_addr().unwrap();
+        let dest_addr = dest.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(String::new()));
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = redirect.accept() {
+                let mut buf = vec![0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 301 Moved Permanently\r\n\
+                      Location: /.shards_AUTH_test/shard-cont/obj-0001\r\n\
+                      Content-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let seen_t = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = dest.accept() {
+                let mut buf = vec![0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                *seen_t.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = stream.write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let hash = HashPathConfig::new(Vec::new(), b"cu-301-follow".to_vec()).unwrap();
+        let data = swift_ring::RingData::from_parts(
+            vec![Some(swift_ring::RingDevice {
+                id: 0,
+                region: 1,
+                zone: 1,
+                ip: dest_addr.ip().to_string(),
+                port: dest_addr.port() as u32,
+                replication_ip: None,
+                replication_port: None,
+                device: "sdb1".into(),
+                weight: 100.0,
+                meta: String::new(),
+                extra: Default::default(),
+            })],
+            32,
+            vec![vec![0]],
+        );
+        let swift_dir = std::env::temp_dir().join(format!(
+            "swift-obj-cu-ring-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&swift_dir);
+        std::fs::create_dir_all(&swift_dir).unwrap();
+        data.save_v1(&swift_dir.join("container.ring.gz")).unwrap();
+        std::env::set_var("SWIFT_DIR", &swift_dir);
+        let ok = fanout_container_http_async(
+            "PUT".into(),
+            vec![redirect_addr.to_string()],
+            vec!["sda1".into()],
+            "7".into(),
+            "/AUTH_test/c/obj-0001".into(),
+            HeaderKeyDict::new(),
+            0,
+            std::time::Duration::from_secs(2),
+            Some(hash),
+        )
+        .await;
+        let _ = std::env::remove_var("SWIFT_DIR");
+        let _ = std::fs::remove_dir_all(&swift_dir);
+        assert!(ok, "301 must be followed onto the shard ring");
+        let req = seen.lock().unwrap().clone();
+        assert!(
+            req.contains("PUT /sdb1/0/.shards_AUTH_test/shard-cont/obj-0001"),
+            "follow must rewrite path+device, got {req:?}"
+        );
+    }
+
+    #[test]
     fn put_honors_the_fallocate_reserve_against_a_temp_device() {
         let dir = std::env::temp_dir().join(format!(
             "swift-obj-reserve-{}-{}",
@@ -4400,11 +5463,8 @@ mod fallocate_reserve_tests {
 
     #[tokio::test]
     async fn shipped_put_finalize_runs_on_storage_executor() {
-        let dir = std::env::temp_dir().join(format!(
-            "swift-obj-exec-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("swift-obj-exec-{}-{}", std::process::id(), line!()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sda1")).unwrap();
         let server = tiny_server(&dir, FallocateReserve::Bytes(1));
@@ -4460,7 +5520,11 @@ mod fallocate_reserve_tests {
                 body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
             })
             .await;
-        assert_eq!(del.status, 204, "DELETE tombstone obj/server.py:1311-1369 {}", del.reason);
+        assert_eq!(
+            del.status, 204,
+            "DELETE tombstone obj/server.py:1311-1369 {}",
+            del.reason
+        );
         assert!(
             server.storage().stats().blocking.started_total > before_del,
             "DELETE FS must run on StorageExecutor, not Tokio"
@@ -4519,10 +5583,7 @@ mod fallocate_reserve_tests {
         let b = put_named("o-beta", "1002", b"beta-payload!!");
         let s1 = std::sync::Arc::clone(&server);
         let s2 = std::sync::Arc::clone(&server);
-        let (r1, r2) = tokio::join!(
-            s1.handle_buffered_async(a),
-            s2.handle_buffered_async(b),
-        );
+        let (r1, r2) = tokio::join!(s1.handle_buffered_async(a), s2.handle_buffered_async(b),);
         assert_eq!(r1.status, 201, "alpha PUT {}", r1.reason);
         assert_eq!(r2.status, 201, "beta PUT {}", r2.reason);
         assert!(
@@ -4572,6 +5633,114 @@ mod fallocate_reserve_tests {
         let mut got = server.handle(get_named("stream-o"));
         assert_eq!(got.status, 200);
         assert_eq!(got.body.materialize(u64::MAX).unwrap(), &payload[..]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn async_ec_no_commit_is_visible_only_with_fragment_preferences() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-ec-nondurable-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = ObjectServer::new(ObjectServerConfig {
+            devices: dir.clone(),
+            mount_check: false,
+            hash_config: HashPathConfig::new(Vec::new(), b"ec-nondurable-tests".to_vec()).unwrap(),
+            diskfile: DiskFileConfig::default(),
+            policies: std::collections::HashMap::from([(
+                2,
+                PolicyKind::Ec {
+                    n_unique_fragments: Some(6),
+                },
+            )]),
+            container_update_timeout: std::time::Duration::from_millis(10),
+            container_update_mode: ContainerUpdateMode::Async,
+        });
+        // Match the probe's harder case: a newer non-durable fragment must
+        // coexist with an older durable fragment.  A normal GET selects the
+        // durable generation; an explicit empty fragment-preferences list
+        // selects the newest generation.
+        let durable_body = b"older-durable-fragment".to_vec();
+        let mut durable_headers = HeaderKeyDict::new();
+        durable_headers.set("X-Timestamp", "6000.00000");
+        durable_headers.set("Content-Type", "application/octet-stream");
+        durable_headers.set("Content-Length", durable_body.len());
+        durable_headers.set("X-Backend-Storage-Policy-Index", "2");
+        durable_headers.set("X-Object-Sysmeta-Ec-Frag-Index", "0");
+        durable_headers.set("X-Object-Sysmeta-Ec-Etag", "whole-object-etag-old");
+        durable_headers.set("X-Object-Sysmeta-Ec-Content-Length", durable_body.len());
+        let durable_put = server
+            .handle_async(AsyncRequest {
+                method: "PUT".into(),
+                path: "/sda1/0/AUTH_test/c/o".into(),
+                query_string: String::new(),
+                headers: durable_headers,
+                body: swift_http::IncomingBody::from_bytes(durable_body.clone(), u64::MAX),
+            })
+            .await;
+        assert_eq!(durable_put.status, 201, "{}", durable_put.reason);
+
+        let body = b"newer-non-durable-fragment".to_vec();
+        let mut put_headers = HeaderKeyDict::new();
+        put_headers.set("X-Timestamp", "6001.00000");
+        put_headers.set("Content-Type", "application/octet-stream");
+        put_headers.set("Content-Length", body.len());
+        put_headers.set("X-Backend-Storage-Policy-Index", "2");
+        put_headers.set("X-Backend-No-Commit", "true");
+        put_headers.set("X-Object-Sysmeta-Ec-Frag-Index", "0");
+        put_headers.set("X-Object-Sysmeta-Ec-Etag", "whole-object-etag");
+        put_headers.set("X-Object-Sysmeta-Ec-Content-Length", body.len());
+        let put = server
+            .handle_async(AsyncRequest {
+                method: "PUT".into(),
+                path: "/sda1/0/AUTH_test/c/o".into(),
+                query_string: String::new(),
+                headers: put_headers,
+                body: swift_http::IncomingBody::from_bytes(body.clone(), u64::MAX),
+            })
+            .await;
+        assert_eq!(put.status, 201, "{}", put.reason);
+
+        let mut default_headers = HeaderKeyDict::new();
+        default_headers.set("X-Backend-Storage-Policy-Index", "2");
+        let mut default_get = server.handle(Request {
+            method: "GET".into(),
+            path: "/sda1/0/AUTH_test/c/o".into(),
+            query_string: String::new(),
+            headers: default_headers.clone(),
+            body: Body::empty(),
+        });
+        assert_eq!(
+            default_get.status, 200,
+            "a normal GET requires durable data"
+        );
+        assert_eq!(
+            default_get.body.materialize(u64::MAX).unwrap(),
+            &durable_body[..],
+            "normal GET must stay on the older durable generation"
+        );
+
+        default_headers.set("X-Backend-Fragment-Preferences", "[]");
+        let mut nondurable_get = server.handle(Request {
+            method: "GET".into(),
+            path: "/sda1/0/AUTH_test/c/o".into(),
+            query_string: String::new(),
+            headers: default_headers,
+            body: Body::empty(),
+        });
+        assert_eq!(nondurable_get.status, 200, "{}", nondurable_get.reason);
+        assert_eq!(
+            nondurable_get.headers.get("X-Backend-Durable-Timestamp"),
+            Some("0000006000.00000"),
+            "the response reports the older durable generation separately"
+        );
+        assert_eq!(
+            nondurable_get.body.materialize(u64::MAX).unwrap(),
+            &body[..]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4632,11 +5801,8 @@ mod fallocate_reserve_tests {
 
     #[tokio::test]
     async fn streaming_put_client_disconnect_is_499_and_leaves_no_object() {
-        let dir = std::env::temp_dir().join(format!(
-            "swift-obj-disc-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("swift-obj-disc-{}-{}", std::process::id(), line!()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sda1")).unwrap();
         let server = tiny_server(&dir, FallocateReserve::Bytes(1));
@@ -4677,7 +5843,10 @@ mod fallocate_reserve_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sda1")).unwrap();
         let server = tiny_server(&dir, FallocateReserve::Bytes(1));
-        for (ts, body) in [("5001", b"first".as_slice()), ("5002", b"second-wins".as_slice())] {
+        for (ts, body) in [
+            ("5001", b"first".as_slice()),
+            ("5002", b"second-wins".as_slice()),
+        ] {
             let resp = server
                 .handle_async(async_put(
                     ts,
@@ -4735,7 +5904,11 @@ mod fallocate_reserve_tests {
                 Some(4),
             ))
             .await;
-        assert_eq!(resp.status, 507, "ENOSPC reserve must 507, got {}", resp.status);
+        assert_eq!(
+            resp.status, 507,
+            "ENOSPC reserve must 507, got {}",
+            resp.status
+        );
         assert_eq!(full.handle(get_named("full-o")).status, 404);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4937,11 +6110,8 @@ mod fallocate_reserve_tests {
 
     #[tokio::test]
     async fn handle_async_put_if_none_match_and_delete_at() {
-        let dir = std::env::temp_dir().join(format!(
-            "swift-obj-inm-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("swift-obj-inm-{}-{}", std::process::id(), line!()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sda1")).unwrap();
         let server = tiny_server(&dir, FallocateReserve::Bytes(1));
@@ -4987,11 +6157,7 @@ mod fallocate_reserve_tests {
         // timestamp 3006 > delete-at 1 → still 400 (delete-at in the past vs req ts)
         assert_eq!(soon.status, 400);
         let future = server
-            .handle_async(put(
-                "3007",
-                "exp-o",
-                &[("X-Delete-At", "9999999999")],
-            ))
+            .handle_async(put("3007", "exp-o", &[("X-Delete-At", "9999999999")]))
             .await;
         assert_eq!(future.status, 201, "{}", future.reason);
         let head = server
@@ -5019,16 +6185,28 @@ mod fallocate_reserve_tests {
             })
             .await;
         assert_eq!(expired_get.status, 404, "past X-Delete-At must 404 on GET");
+        let mut replication_headers = HeaderKeyDict::new();
+        replication_headers.set("X-Backend-Replication", "True");
+        let replication_get = server
+            .handle_async(AsyncRequest {
+                method: "GET".into(),
+                path: "/sda1/0/AUTH_test/c/gone-o".into(),
+                query_string: String::new(),
+                headers: replication_headers,
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            replication_get.status, 200,
+            "backend replication must read an expired-but-unreaped object"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn handle_async_mime_put_ingests_without_whole_object_buffer() {
-        let dir = std::env::temp_dir().join(format!(
-            "swift-obj-mime-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("swift-obj-mime-{}-{}", std::process::id(), line!()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sda1")).unwrap();
         let server = tiny_server(&dir, FallocateReserve::Bytes(1));
@@ -5036,7 +6214,9 @@ mod fallocate_reserve_tests {
         let payload = vec![b'm'; 96 * 1024];
         let boundary = "mimebound";
         let mut mime = Vec::new();
-        mime.extend_from_slice(format!("--{boundary}\r\nX-Document: object body\r\n\r\n").as_bytes());
+        mime.extend_from_slice(
+            format!("--{boundary}\r\nX-Document: object body\r\n\r\n").as_bytes(),
+        );
         mime.extend_from_slice(&payload);
         mime.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         let mut headers = HeaderKeyDict::new();
@@ -5101,11 +6281,7 @@ mod fallocate_reserve_tests {
             resp.headers.get("X-Backend-Accept-No-Commit").unwrap_or(""),
             "True"
         );
-        let body = resp
-            .body
-            .collect_async()
-            .await
-            .expect("ssync channel");
+        let body = resp.body.collect_async().await.expect("ssync channel");
         let text = String::from_utf8_lossy(&body);
         assert!(
             text.contains(":MISSING_CHECK: START"),
@@ -5271,8 +6447,8 @@ mod fallocate_reserve_tests {
             thread::sleep(std::time::Duration::from_millis(5));
         }
         thread::spawn(move || {
-            let mut c = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400))
-                .unwrap();
+            let mut c =
+                TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).unwrap();
             let host = format!("{hole_addr}");
             let req = format!(
                 "PUT /sda1/0/AUTH_test/c/o HTTP/1.1\r\nHost: t\r\nX-Timestamp: 4000\r\nContent-Type: application/octet-stream\r\nContent-Length: 4\r\nX-Container-Host: {host}\r\nX-Container-Device: sda1\r\nX-Container-Partition: 0\r\nConnection: close\r\n\r\nabcd"
@@ -5283,7 +6459,8 @@ mod fallocate_reserve_tests {
         });
         thread::sleep(std::time::Duration::from_millis(30));
         let started = std::time::Instant::now();
-        let mut g = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).unwrap();
+        let mut g =
+            TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).unwrap();
         g.set_read_timeout(Some(std::time::Duration::from_millis(400)))
             .unwrap();
         g.write_all(b"GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
@@ -5339,7 +6516,8 @@ mod fallocate_reserve_tests {
             thread::sleep(std::time::Duration::from_millis(5));
         }
 
-        let mut c = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).unwrap();
+        let mut c =
+            TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).unwrap();
         c.set_read_timeout(Some(std::time::Duration::from_millis(800)))
             .unwrap();
         c.write_all(
@@ -5351,7 +6529,8 @@ mod fallocate_reserve_tests {
         let put = String::from_utf8_lossy(&buf);
         assert!(put.contains("201"), "PUT {put:?}");
 
-        let mut c = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).unwrap();
+        let mut c =
+            TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).unwrap();
         c.set_read_timeout(Some(std::time::Duration::from_millis(800)))
             .unwrap();
         c.write_all(
@@ -5366,10 +6545,12 @@ mod fallocate_reserve_tests {
             "DELETE tombstone must be 204 HTTPNoContent (obj/server.py:1311-1369), got {del:?}"
         );
 
-        let mut c = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).unwrap();
+        let mut c =
+            TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).unwrap();
         c.set_read_timeout(Some(std::time::Duration::from_millis(800)))
             .unwrap();
-        let ssync = b":MISSING_CHECK: START\r\n:MISSING_CHECK: END\r\n:UPDATES: START\r\n:UPDATES: END\r\n";
+        let ssync =
+            b":MISSING_CHECK: START\r\n:MISSING_CHECK: END\r\n:UPDATES: START\r\n:UPDATES: END\r\n";
         let head = format!(
             "SSYNC /sda1/0 HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             ssync.len()
@@ -5379,7 +6560,10 @@ mod fallocate_reserve_tests {
         buf.clear();
         let _ = c.read_to_end(&mut buf);
         let ss = String::from_utf8_lossy(&buf);
-        assert!(ss.contains("200"), "SSYNC status (obj/server.py:1406-1415) {ss:?}");
+        assert!(
+            ss.contains("200"),
+            "SSYNC status (obj/server.py:1406-1415) {ss:?}"
+        );
         assert!(
             ss.to_ascii_lowercase()
                 .contains("x-backend-accept-no-commit: true"),
@@ -5429,7 +6613,8 @@ mod fallocate_reserve_tests {
             thread::sleep(std::time::Duration::from_millis(5));
         }
 
-        let mut c = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).unwrap();
+        let mut c =
+            TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).unwrap();
         c.set_nodelay(true).ok();
         c.set_read_timeout(Some(std::time::Duration::from_millis(800)))
             .unwrap();
@@ -5437,7 +6622,7 @@ mod fallocate_reserve_tests {
             .unwrap();
         // Sender endheaders() — no body yet (ssync_sender.py:251-264).
         c.write_all(
-            b"SSYNC /sda1/0 HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            b"SSYNC /sda1/0 HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n",
         )
         .unwrap();
         c.flush().ok();
@@ -5463,12 +6648,18 @@ mod fallocate_reserve_tests {
             "Python sender getresponse() after SSYNC headers must see 200 before the body (ssync_sender.py:264-272), got {head_s:?}"
         );
         assert!(
-            head_s.to_ascii_lowercase().contains("x-backend-accept-no-commit: true"),
+            head_s
+                .to_ascii_lowercase()
+                .contains("x-backend-accept-no-commit: true"),
             "obj/server.py:1406-1415 {head_s:?}"
         );
         assert!(
             head_s.to_ascii_lowercase().contains("x-trans-id:"),
             "SSYNC response must carry X-Trans-Id for G3 traces, got {head_s:?}"
+        );
+        assert!(
+            !head_s.to_ascii_lowercase().contains("connection: close"),
+            "Python http.client must retain the SSYNC socket after getresponse(), got {head_s:?}"
         );
         let snap = metrics.snapshot();
         assert!(
@@ -5501,10 +6692,12 @@ mod fallocate_reserve_tests {
         );
 
         fn write_http_chunk(c: &mut TcpStream, data: &[u8]) {
-            let hdr = format!("{:x}\r\n", data.len());
-            c.write_all(hdr.as_bytes()).unwrap();
-            c.write_all(data).unwrap();
-            c.write_all(b"\r\n").unwrap();
+            // Python's SsyncBufferedHTTPConnection.send() writes one complete
+            // HTTP chunk frame per call. Mirror that exact wire boundary.
+            let mut frame = format!("{:x}\r\n", data.len()).into_bytes();
+            frame.extend_from_slice(data);
+            frame.extend_from_slice(b"\r\n");
+            c.write_all(&frame).unwrap();
         }
         write_http_chunk(&mut c, b":MISSING_CHECK: START\r\n:MISSING_CHECK: END\r\n");
         c.flush().ok();
@@ -5759,6 +6952,30 @@ mod native_worm_gate_wiring_tests {
             201
         );
         assert_eq!(srv.handle(put_req("2", &[], b"nope")).status, 403);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replication_post_can_remove_expiry_after_delete_at_has_passed() {
+        let dir = temp_devices();
+        let srv = server(&dir);
+        assert_eq!(
+            srv.handle(put_req(
+                "1",
+                &[("X-Delete-At", "1"), ("X-Backend-Replication", "True"),],
+                b"repair-me"
+            ))
+            .status,
+            201
+        );
+        assert_eq!(srv.handle(method_req("HEAD", "1")).status, 404);
+
+        let replicated_post = method_req_headers("POST", "2", &[("X-Backend-Replication", "True")]);
+        assert_eq!(srv.handle(replicated_post).status, 202);
+
+        let repaired = srv.handle(method_req("HEAD", "2"));
+        assert_eq!(repaired.status, 200);
+        assert_eq!(repaired.headers.get("X-Delete-At"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -48,7 +48,10 @@
 
 use swift_core::config::config_true_value;
 use swift_core::constraints::{RESERVED_STR, VALID_API_VERSIONS};
-use swift_http::{split_path, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
+use swift_http::{
+    listing_query_invalid_utf8_param, split_path, HeaderKeyDict, Request, Response,
+    MAX_CONTROL_BODY,
+};
 
 use crate::{Middleware, MwPrep, NextFn};
 
@@ -80,6 +83,12 @@ impl Middleware for ListingFormats {
         {
             return MwPrep::Continue;
         }
+        if let Some(resp) = invalid_utf8_listing_param(&req.query_string) {
+            // Must run on the raw query. `force_format_json` uses lossy
+            // `unquote` (`%FF` → U+FFFD), after which the proxy's UTF-8
+            // check would 200 (probe test_sharding_listing delimiter=%ff).
+            return MwPrep::ShortCircuit(resp);
+        }
         let out = get_listing_content_type(req);
         req.headers.set(LISTING_OUT_TYPE, out);
         if !req.params().iter().any(|(k, _)| k == "format") {
@@ -109,6 +118,10 @@ impl Middleware for ListingFormats {
         if !VALID_API_VERSIONS.contains(&version.as_str()) || (method != "GET" && method != "HEAD")
         {
             return next(req);
+        }
+
+        if let Some(resp) = invalid_utf8_listing_param(&req.query_string) {
+            return resp;
         }
 
         // Desired output content-type, then force the subrequest to JSON.
@@ -254,6 +267,19 @@ fn add_vary_accept(headers: &mut HeaderKeyDict) {
         }
         None => headers.set("Vary", "Accept"),
     }
+}
+
+/// Python `get_param` / `validate_container_params`: listing query values
+/// that are not valid UTF-8 after percent-decode are 400
+/// `"<name>" parameter not valid UTF-8`.
+fn invalid_utf8_listing_param(query: &str) -> Option<Response> {
+    let name = listing_query_invalid_utf8_param(query)?;
+    let mut resp = Response::with_body(
+        400,
+        format!("\"{name}\" parameter not valid UTF-8").into_bytes(),
+    );
+    resp.headers.set("Content-Type", "text/plain");
+    Some(resp)
 }
 
 /// Rebuild the query string with `format=json` forced, preserving every
@@ -1201,5 +1227,34 @@ mod tests {
             body_bytes(&resp),
             b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<container name=\"c\"><object><name /><hash>h</hash><bytes>0</bytes><content_type /><last_modified /></object></container>"
         );
+    }
+
+    #[test]
+    fn test_non_utf8_delimiter_is_400() {
+        // Probe test_sharding_listing: delimiter=%ff must 400 before
+        // force_format_json lossy-unquotes it to U+FFFD.
+        let lf = ListingFormats;
+        let mut r = req("GET", "/v1/AUTH_test/c", "delimiter=%ff");
+        match lf.prepare(&mut r) {
+            crate::MwPrep::ShortCircuit(resp) => {
+                assert_eq!(resp.status, 400);
+                let body = String::from_utf8_lossy(match &resp.body {
+                    swift_http::Body::Buffered(b) => b,
+                    _ => panic!("expected buffered 400 body"),
+                });
+                assert!(body.contains("not valid UTF-8"), "{body:?}");
+                assert!(body.contains("delimiter"), "{body:?}");
+            }
+            crate::MwPrep::Continue => panic!("delimiter=%ff must short-circuit"),
+        }
+
+        let resp = call(req("GET", "/v1/AUTH_test/c", "delimiter=%ff"), |_| {
+            panic!("backend must not run for delimiter=%ff")
+        });
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8_lossy(body_bytes(&resp));
+        assert!(body.contains("not valid UTF-8"), "{body:?}");
+        assert!(body.contains("delimiter"), "{body:?}");
+        assert_eq!(resp.headers.get("Content-Type"), Some("text/plain"));
     }
 }

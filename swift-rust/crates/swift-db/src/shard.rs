@@ -76,12 +76,24 @@ pub const SHARD_UPDATE_STATES: [i64; 4] = [
     state::SHARDING,
 ];
 
+/// `SHARD_STATS_STATES`: states whose object/byte counts roll up to the
+/// root (`ACTIVE`/`SHARDING`/`SHRINKING`). Used by `get_shard_usage`.
+pub const SHARD_STATS_STATES: [i64; 3] = [state::ACTIVE, state::SHARDING, state::SHRINKING];
+
 /// `SHARD_LISTING_STATES`: states valid when listing objects.
 pub const SHARD_LISTING_STATES: [i64; 4] = [
     state::ACTIVE,
     state::SHARDING,
     state::SHRINKING,
     state::CLEAVED,
+];
+
+/// `ShardRange.CLEAVING_STATES`: shrinking/shrunk + sharding/sharded.
+pub const CLEAVING_STATES: [i64; 4] = [
+    state::SHRINKING,
+    state::SHRUNK,
+    state::SHARDING,
+    state::SHARDED,
 ];
 
 /// `SHARD_AUDITING_STATES`: every state except FOUND.
@@ -304,16 +316,44 @@ impl ShardRange {
         }
     }
 
+    /// Python `ShardRange.update_meta`: set counts and bump `meta_timestamp`.
+    /// `reported` is cleared only when a count actually changes, so a lagging
+    /// replica does not re-send an unchanged older count with a newer meta
+    /// timestamp (probe L1157).
+    pub fn update_meta(&mut self, object_count: i64, bytes_used: i64, meta_timestamp: &str) {
+        if self.object_count != object_count {
+            self.object_count = object_count;
+            self.reported = 0;
+        }
+        if self.bytes_used != bytes_used {
+            self.bytes_used = bytes_used;
+            self.reported = 0;
+        }
+        self.meta_timestamp = meta_timestamp.to_string();
+    }
+
+    /// Python `ShardRange.increment_meta`: add to object/byte counts and bump
+    /// `meta_timestamp`. Probe shrinking sends the expanded acceptor to each
+    /// donor with projected stats (`donors.object_count` added).
+    pub fn increment_meta(&mut self, object_count: i64, bytes_used: i64, meta_timestamp: &str) {
+        self.update_meta(
+            self.object_count + object_count,
+            self.bytes_used + bytes_used,
+            meta_timestamp,
+        );
+    }
+
     /// Update state if different; bumps `state_timestamp` when set. Returns
     /// whether the state changed (`ShardRange.update_state`).
     pub fn update_state(&mut self, new_state: i64, state_timestamp: Option<&str>) -> bool {
-        if self.state == new_state {
+        if state_timestamp.is_none() && self.state == new_state {
             return false;
         }
         self.state = new_state;
         if let Some(ts) = state_timestamp {
             self.state_timestamp = ts.to_string();
         }
+        self.reported = 0;
         true
     }
 }
@@ -427,7 +467,11 @@ pub fn merge_shards(new: &mut ShardRange, existing: Option<&ShardRange>) -> bool
     new.upper = existing.upper.clone();
     new.deleted = existing.deleted;
 
-    // meta data: the newer meta_timestamp's counts win
+    // Metadata is pure newest-wins, matching Python `merge_shards`: a newer
+    // `meta_timestamp` owns object_count, bytes_used and tombstones even when
+    // the count decreases. Preventing an unchanged lagging replica from
+    // manufacturing a newer timestamp belongs at the reporter latch
+    // (`refresh_own_shard_range_stats`), not in this merge function.
     if existing.meta_timestamp >= new.meta_timestamp {
         new.object_count = existing.object_count;
         new.bytes_used = existing.bytes_used;
@@ -516,6 +560,115 @@ mod tests {
         for s in SHARD_LISTING_STATES {
             assert!(resolved.contains(&s), "missing {s} in {resolved:?}");
         }
+    }
+
+    #[test]
+    fn update_meta_clears_reported_only_on_count_change() {
+        let mut sr = ShardRange::new("a", "1751500001.00000", "", "");
+        sr.object_count = 10;
+        sr.bytes_used = 10;
+        sr.reported = 1;
+        sr.update_meta(10, 10, "1751500002.00000");
+        assert_eq!(sr.reported, 1, "unchanged counts keep the latch");
+        assert_eq!(sr.meta_timestamp, "1751500002.00000");
+        sr.update_meta(20, 10, "1751500003.00000");
+        assert_eq!(sr.reported, 0);
+        assert_eq!(sr.object_count, 20);
+    }
+
+    #[test]
+    fn update_state_clears_reported() {
+        let mut sr = ShardRange::new("a", "1751500001.00000", "", "");
+        sr.reported = 1;
+        sr.state = state::ACTIVE;
+        assert!(sr.update_state(state::SHARDED, Some("1751500002.00000")));
+        assert_eq!(sr.reported, 0);
+        assert_eq!(sr.state, state::SHARDED);
+    }
+
+    #[test]
+    fn merge_newer_meta_timestamp_wins_even_when_count_drops() {
+        let ts = "1751500001.00000";
+        let existing = ShardRange {
+            object_count: 150,
+            bytes_used: 150,
+            meta_timestamp: "1751500002.00000".into(),
+            state: state::ACTIVE,
+            tombstones: -1,
+            ..ShardRange::new("a", ts, "", "m")
+        };
+        let mut newer_lower = ShardRange {
+            object_count: 50,
+            bytes_used: 50,
+            meta_timestamp: "1751500003.00000".into(),
+            state: state::ACTIVE,
+            tombstones: -1,
+            ..ShardRange::new("a", ts, "", "m")
+        };
+        assert!(merge_shards(&mut newer_lower, Some(&existing)));
+        assert_eq!(
+            newer_lower.object_count, 50,
+            "Python merge_shards gives newer metadata precedence"
+        );
+
+        let existing_live = ShardRange {
+            object_count: 50,
+            bytes_used: 50,
+            meta_timestamp: "1751500002.00000".into(),
+            state: state::ACTIVE,
+            tombstones: -1,
+            ..ShardRange::new("a", ts, "", "m")
+        };
+        let mut deleted = ShardRange {
+            object_count: 0,
+            bytes_used: 0,
+            meta_timestamp: "1751500004.00000".into(),
+            state: state::ACTIVE,
+            tombstones: 50,
+            ..ShardRange::new("a", ts, "", "m")
+        };
+        assert!(merge_shards(&mut deleted, Some(&existing_live)));
+        assert_eq!(deleted.object_count, 0, "tombstones allow count to drop");
+
+        // probe test_shrinking L1979: reclaim_age=0 zeros tombstones and
+        // reports the post-DELETE live count.
+        let mut reclaimed = ShardRange {
+            object_count: 1,
+            bytes_used: 1,
+            meta_timestamp: "1751500005.00000".into(),
+            state: state::ACTIVE,
+            tombstones: 0,
+            ..ShardRange::new("a", ts, "", "m")
+        };
+        assert!(merge_shards(&mut reclaimed, Some(&existing_live)));
+        assert_eq!(
+            reclaimed.object_count, 1,
+            "reclaimed tombstones=0 must still lower root stats: {reclaimed:?}"
+        );
+
+        // Probe L2088: after first compact the acceptor already has
+        // tombstones=0; a later reclaim still has to lower 51 → 1.
+        let existing_zero_tombs = ShardRange {
+            object_count: 51,
+            bytes_used: 51,
+            meta_timestamp: "1751500006.00000".into(),
+            state: state::ACTIVE,
+            tombstones: 0,
+            ..ShardRange::new("a", ts, "", "m")
+        };
+        let mut reclaimed2 = ShardRange {
+            object_count: 1,
+            bytes_used: 1,
+            meta_timestamp: "1751500007.00000".into(),
+            state: state::ACTIVE,
+            tombstones: 0,
+            ..ShardRange::new("a", ts, "", "m")
+        };
+        assert!(merge_shards(&mut reclaimed2, Some(&existing_zero_tombs)));
+        assert_eq!(
+            reclaimed2.object_count, 1,
+            "reclaim onto tombs=0 acceptor must lower 51→1: {reclaimed2:?}"
+        );
     }
 
     #[test]
@@ -641,6 +794,15 @@ mod tests {
         with_tomb.object_count = 3;
         with_tomb.tombstones = 2;
         assert_eq!(with_tomb.row_count(), 5);
+        let mut inc = a.clone();
+        inc.object_count = 50;
+        inc.bytes_used = 50;
+        inc.reported = 1;
+        inc.increment_meta(1, 10, "1751500002.00000");
+        assert_eq!(inc.object_count, 51);
+        assert_eq!(inc.bytes_used, 60);
+        assert_eq!(inc.meta_timestamp, "1751500002.00000");
+        assert_eq!(inc.reported, 0);
     }
 
     #[test]

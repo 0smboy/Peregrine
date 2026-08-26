@@ -19,7 +19,7 @@
 //!
 //! Sharding request paths ARE implemented: record-type=shard PUT (merge
 //! shard ranges), record-type=shard/auto GET (shard-range listing), and the
-//! _redirect_to_shard 301 on object PUT. Deviations tracked for later:
+//! _redirect_to_shard 301 on object PUT and DELETE. Deviations tracked for later:
 //! REPLICATE is handled via the db_replicator RPC. Container-sync is a full
 //! path: metadata updates maintain `sync_containers/`, `swift-container-sync`
 //! ships rows, and the proxy `container_sync` filter validates inbound realm
@@ -41,18 +41,22 @@ pub use reconciler::{
     MISPLACED_OBJECTS_ACCOUNT,
 };
 pub use sharder::{
-    cleave, cleave_shard_range, default_shard_quorum, find_and_merge_found_ranges,
-    find_shrink_acceptor, find_shrinking_donors, http_replicator_for_primaries,
+    cleave, cleave_shard_range, cleaving_context_sysmeta_key, default_shard_quorum,
+    find_and_enable_shrinking_candidates, find_and_merge_found_ranges,
+    find_compactible_shard_sequences, find_shrink_acceptor, find_shrinking_donors,
+    http_replicator_for_primaries, is_shrinking_candidate, load_all_cleaving_contexts,
     load_cleaving_context, lookup_replicator_for_ring, maybe_auto_shard,
-    move_misplaced_from_retiring, primary_shard_replica_nodes, process_sharding_container,
-    process_sharding_container_detailed, process_sharding_container_with_replicator,
-    process_shrinking_donors, process_shrinking_donors_stub, put_shard_quorum, range_covers,
-    recon_update as sharder_recon_update, ring_get_nodes_for_shard, run_once as sharder_run_once,
-    run_once_with_opts as sharder_run_once_with_opts, run_once_with_opts_and_replicator,
-    run_once_with_opts_and_ring, save_cleaving_context, shard_replicas_from_ring_devices,
-    CleavingContext, HttpShardReplicator, LocalShardReplicator, LookupHttpShardReplicator,
-    MapShardHttpTransport, ProcessShardingOutcome, ShardHttpTransport, ShardReplicaNode,
-    ShardReplicator, SharderRunOpts, SharderStats, TcpShardHttpTransport, CLEAVING_CONTEXT_KEY,
+    move_misplaced_from_retiring, primary_shard_replica_nodes, process_compactible_shard_sequences,
+    process_sharding_container, process_sharding_container_detailed,
+    process_sharding_container_with_replicator, process_shrinking_donors,
+    process_shrinking_donors_stub, put_shard_quorum, range_covers,
+    recon_update as sharder_recon_update, refresh_own_shard_range_stats, ring_get_nodes_for_shard,
+    run_once as sharder_run_once, run_once_with_opts as sharder_run_once_with_opts,
+    run_once_with_opts_and_replicator, run_once_with_opts_and_ring, save_cleaving_context,
+    shard_replicas_from_ring_devices, update_root_container, CleavingContext, HttpShardReplicator,
+    LocalShardReplicator, LookupHttpShardReplicator, MapShardHttpTransport, ProcessShardingOutcome,
+    ShardHttpTransport, ShardReplicaNode, ShardReplicator, SharderRunOpts, SharderStats,
+    TcpShardHttpTransport, CLEAVING_CONTEXT_KEY, CLEAVING_CONTEXT_KEY_PREFIX,
 };
 pub use sync::{
     build_sync_headers, get_sig, owns_object, process_container_db, run_once as sync_run_once,
@@ -100,6 +104,11 @@ pub struct ContainerServerConfig {
 pub struct ContainerServer {
     pub config: ContainerServerConfig,
     db: std::sync::OnceLock<DbExecutor>,
+}
+
+struct ReplicateTarget {
+    drive: String,
+    db_path: PathBuf,
 }
 
 fn swob_explanation(status: u16) -> &'static str {
@@ -508,8 +517,44 @@ impl ContainerServer {
             .to_path_buf())
     }
 
+    /// Python `ReplicatorRpc` URL is `/<device>/<partition>/<hash>`, not
+    /// `/<device>/<partition>/<account>/<container>`. `handle_async` must
+    /// park the hash DB on DbExecutor; using `obj_path` 400s every REPLICATE
+    /// (G6 `sync RPC status 400`).
+    pub fn replicate_db_file_for_request(&self, req: &Request) -> Result<PathBuf, Response> {
+        self.replicate_target(req).map(|t| t.db_path)
+    }
+
+    fn replicate_target(&self, req: &Request) -> Result<ReplicateTarget, Response> {
+        let segs = split_path(&req.path, 3, 3, false).map_err(|e| plain_response(400, &e))?;
+        let drive = segs[0].clone().unwrap_or_default();
+        let partition = segs[1].clone().unwrap_or_default();
+        let hsh = segs[2].clone().unwrap_or_default();
+        if let Err(resp) = self.check_drive(&drive) {
+            return Err(resp);
+        }
+        if hsh.is_empty() {
+            return Err(plain_response(400, &format!("Invalid path: {}", req.path)));
+        }
+        let suffix = &hsh[hsh.len().saturating_sub(3)..];
+        let db_path = self
+            .config
+            .devices
+            .join(&drive)
+            .join("containers")
+            .join(&partition)
+            .join(suffix)
+            .join(&hsh)
+            .join(format!("{hsh}.db"));
+        Ok(ReplicateTarget { drive, db_path })
+    }
+
     async fn dispatch_on_shard(&self, req: Request) -> Response {
-        let db_file = match self.db_file_for_request(&req) {
+        let db_file = match if req.method.eq_ignore_ascii_case("REPLICATE") {
+            self.replicate_db_file_for_request(&req)
+        } else {
+            self.db_file_for_request(&req)
+        } {
             Ok(p) => p,
             Err(resp) => return resp,
         };
@@ -584,7 +629,10 @@ impl ContainerServer {
         let Ok(size) = size.trim().parse::<i64>() else {
             return error_response(500, "bad x-size");
         };
-        let ctype_ts = req.headers.get("x-content-type-timestamp").map(str::to_string);
+        let ctype_ts = req
+            .headers
+            .get("x-content-type-timestamp")
+            .map(str::to_string);
         let meta_ts = req.headers.get("x-meta-timestamp").map(str::to_string);
         let broker_probe = self.broker_for(&drive, &part, &account, &container);
         let db_file = broker_probe.db_file().to_path_buf();
@@ -957,9 +1005,21 @@ impl ContainerServer {
             include_deleted: Some(false),
             allow_reserved: req.headers.get("X-Backend-Allow-Reserved-Names").is_some(),
         };
-        let rows = match broker.list_objects_iter(&args) {
-            Ok(rows) => rows,
-            Err(e) => return self.db_error_response(&e, broker.db_file()),
+        // Python GET_object: `with broker.get_brokers()[0] as src_broker`
+        // lists from the retiring DB while sharding. The fresh epoch DB has
+        // no object rows (set_sharding_state copies metadata only). Listing
+        // the freshest file drops uncleaved names (probe L1321 obj-0000-0049
+        // after extra replicators put an epoch DB on every replica).
+        let rows = if let Some(mut retiring) = broker.retiring_broker() {
+            match retiring.list_objects_iter(&args) {
+                Ok(rows) => rows,
+                Err(e) => return self.db_error_response(&e, retiring.db_file()),
+            }
+        } else {
+            match broker.list_objects_iter(&args) {
+                Ok(rows) => rows,
+                Err(e) => return self.db_error_response(&e, broker.db_file()),
+            }
         };
         let mut records = Vec::with_capacity(rows.len());
         for row in rows {
@@ -1121,7 +1181,7 @@ impl ContainerServer {
         req: &Request,
     ) -> Result<bool, Response> {
         let mut created = false;
-        if self.should_autocreate(account, req) && !broker.db_file().exists() {
+        if self.should_autocreate(account, req) && !broker.db_exists() {
             let Some(policy_index) = policy_index else {
                 return Err(error_response(
                     400,
@@ -1138,7 +1198,7 @@ impl ContainerServer {
                 Err(e) => return Err(error_response(500, &e.to_string())),
             }
         }
-        if !broker.db_file().exists() {
+        if !broker.db_exists() {
             return Err(swob_response(404, None));
         }
         Ok(created)
@@ -1257,7 +1317,13 @@ impl ContainerServer {
             Ok(v) => v,
             Err(resp) => return resp,
         };
-        let obj_policy_index = requested_policy_index.unwrap_or(0);
+        // Python PUT_object: request SPI if present, else the container's.
+        // Hardcoding 0 made policy_stat.object_count stay 0 when the container
+        // SPI was non-zero, so the sharder saw object_count < threshold.
+        let obj_policy_index = match requested_policy_index {
+            Some(i) => i,
+            None => broker.storage_policy_index().unwrap_or(0),
+        };
         if let Err(resp) = self.maybe_autocreate(
             broker,
             req_timestamp,
@@ -1342,6 +1408,12 @@ impl ContainerServer {
             Ok(c) => c,
             Err(resp) => return resp,
         };
+        // Python PUT_shard: `_update_metadata` then merge. Quoted-Root /
+        // Sharding sysmeta on `_create_shard_containers` must stick so later
+        // sharder passes treat the DB as a shard and `_update_root_container`.
+        if let Err(resp) = self.update_metadata_from_headers(req, broker, req_timestamp) {
+            return resp;
+        }
         if !ranges.is_empty() {
             if let Err(e) = broker.merge_shard_ranges(ranges) {
                 return self.db_error_response(&e, broker.db_file());
@@ -1394,7 +1466,24 @@ impl ContainerServer {
         mut headers: HeaderKeyDict,
         out_content_type: &str,
     ) -> Response {
-        let states = match req.param("states") {
+        // Python `_create_GET_response` copies broker.metadata onto shard
+        // listings. Probe `direct_get_container_shard_ranges` is a GET with
+        // `X-Backend-Record-Type: shard` (not HEAD); missing Quoted-Root
+        // fails test_shrinking L1808.
+        if let Err(e) = self.add_meta_headers(broker, &mut headers) {
+            return self.db_error_response(&e, broker.db_file());
+        }
+        self.last_modified(&mut headers);
+        let states_raw = req.param("states");
+        let fill_gaps = states_raw.as_deref().is_some_and(|csv| {
+            csv.split(',').any(|p| {
+                matches!(
+                    p.trim().to_ascii_lowercase().as_str(),
+                    "listing" | "updating"
+                )
+            })
+        });
+        let states = match states_raw {
             Some(csv) => {
                 let list: Vec<String> = csv.split(',').map(str::to_string).collect();
                 match swift_db::resolve_shard_range_states(&list) {
@@ -1411,13 +1500,42 @@ impl ContainerServer {
             reverse: truthy(req.param("reverse").as_deref()),
             include_deleted: truthy(req.headers.get("x-backend-include-deleted")),
             states,
+            fill_gaps,
             ..Default::default()
         };
         let ranges = match broker.get_shard_ranges(&args) {
             Ok(r) => r,
             Err(e) => return self.db_error_response(&e, broker.db_file()),
         };
-        let body = serde_json::Value::Array(ranges.iter().map(|r| r.to_json()).collect::<Vec<_>>());
+        let shard_format = req
+            .headers
+            .get("x-backend-record-shard-format")
+            .unwrap_or("full")
+            .to_ascii_lowercase();
+        // Python: includes/marker/end_marker force full shard ranges even when
+        // the caller asked for namespaces.
+        let namespace_ok = shard_format == "namespace"
+            && req.param("includes").is_none()
+            && req.param("marker").is_none()
+            && req.param("end_marker").is_none();
+        let body = if namespace_ok {
+            headers.set("X-Backend-Record-Shard-Format", "namespace");
+            serde_json::Value::Array(
+                ranges
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "name": r.name,
+                            "lower": r.lower,
+                            "upper": r.upper,
+                        })
+                    })
+                    .collect(),
+            )
+        } else {
+            headers.set("X-Backend-Record-Shard-Format", "full");
+            serde_json::Value::Array(ranges.iter().map(|r| r.to_json()).collect::<Vec<_>>())
+        };
         let bytes = serde_json::to_vec(&body).unwrap_or_default();
         headers.set("X-Backend-Record-Type", "shard");
         headers.set("Content-Type", format!("{out_content_type}; charset=utf-8"));
@@ -1475,7 +1593,7 @@ impl ContainerServer {
         });
         // _update_or_create
         let mut created = false;
-        if !broker.db_file().exists() {
+        if !broker.db_exists() {
             match broker.initialize(
                 &req_timestamp.internal(),
                 new_container_policy,
@@ -1544,7 +1662,7 @@ impl ContainerServer {
             return resp;
         }
         let mut broker = self.broker_for(&drive, &part, &account, &container);
-        if !broker.db_file().exists() || matches!(broker.is_deleted(), Ok(true)) {
+        if !broker.db_exists() || matches!(broker.is_deleted(), Ok(true)) {
             return swob_response(404, None);
         }
         if !truthy(req.headers.get("x-backend-no-timestamp-update")) {
@@ -1589,6 +1707,12 @@ impl ContainerServer {
                 ) {
                     return resp;
                 }
+                // Python DELETE_object: redirect if a shard range owns the name
+                // (probe L1435 — tombstones must land on the nested shard, not
+                // the SHARDED root).
+                if let Some(redirect) = self.redirect_to_shard(req, &mut broker, &obj) {
+                    return redirect;
+                }
                 let raw_ts = req
                     .headers
                     .get("x-timestamp")
@@ -1601,7 +1725,7 @@ impl ContainerServer {
             }
             None => {
                 // DELETE_container
-                if !broker.db_file().exists() {
+                if !broker.db_exists() {
                     return swob_response(404, None);
                 }
                 match broker.empty() {
@@ -1644,16 +1768,12 @@ impl ContainerServer {
     /// merge_syncs and merge_items, plus the rsync-staged full-DB ops
     /// complete_rsync and rsync_then_merge.
     fn replicate(&self, req: &mut Request) -> Response {
-        let segs = match split_path(&req.path, 3, 3, false) {
-            Ok(segs) => segs,
-            Err(e) => return plain_response(400, &e),
+        let target = match self.replicate_target(req) {
+            Ok(t) => t,
+            Err(resp) => return resp,
         };
-        let drive = segs[0].clone().unwrap_or_default();
-        let partition = segs[1].clone().unwrap_or_default();
-        let hsh = segs[2].clone().unwrap_or_default();
-        if let Err(resp) = self.check_drive(&drive) {
-            return resp;
-        }
+        let drive = target.drive;
+        let db_path = target.db_path;
         let body = match read_control_body(req) {
             Ok(body) => body,
             Err(resp) => return resp,
@@ -1666,17 +1786,6 @@ impl ContainerServer {
             return plain_response(400, "Invalid object type");
         }
         let op = args[0].as_str().unwrap_or("");
-        // db path: <device>/containers/<part>/<hsh[-3:]>/<hsh>/<hsh>.db
-        let suffix = &hsh[hsh.len().saturating_sub(3)..];
-        let db_path = self
-            .config
-            .devices
-            .join(&drive)
-            .join("containers")
-            .join(&partition)
-            .join(suffix)
-            .join(&hsh)
-            .join(format!("{hsh}.db"));
         // The rsync-staged ops dispatch before the db-exists gate — they
         // are exactly the ops that run when the final DB is missing or
         // divergent (dispatch, db_replicator.py:972-975).
@@ -1689,10 +1798,20 @@ impl ContainerServer {
         // someone might be about to rsync a db to us, so make sure there's
         // a tmp dir to receive it (dispatch, db_replicator.py:976-980)
         let _ = std::fs::create_dir_all(self.config.devices.join(&drive).join("tmp"));
-        if matches!(op, "sync" | "merge_syncs" | "merge_items") && !db_path.exists() {
+        // Python `_db_file_exists` = `bool(get_db_files(db_path))`. After
+        // `set_sharded_state` the retiring `<hash>.db` is unlinked and only
+        // `<hash>_<epoch>.db` remains. A `hash.db.exists()` 404 here made
+        // unsharded→sharded sync skip `get_shard_ranges`, so the third
+        // replica never received shard ranges (probe L2321 `[] != 2`).
+        if matches!(
+            op,
+            "sync" | "merge_syncs" | "merge_items" | "get_shard_ranges" | "merge_shard_ranges"
+        ) && swift_db::get_db_files(&db_path).is_empty()
+        {
             return swob_response(404, None);
         }
         let mut broker = ContainerBroker::new(&db_path, "", "");
+        let _ = broker.hydrate_account_container();
         match op {
             "merge_items" => {
                 let items = args
@@ -1751,7 +1870,8 @@ impl ContainerServer {
             }
             "sync" => {
                 // args: remote_sync, hash, id, created_at, put_timestamp,
-                // delete_timestamp, metadata
+                // delete_timestamp, metadata, [status_changed_at, count,
+                // storage_policy_index]
                 let s = |i: usize| {
                     args.get(i)
                         .and_then(|v| v.as_str())
@@ -1765,15 +1885,48 @@ impl ContainerServer {
                 let put_timestamp = s(5);
                 let delete_timestamp = s(6);
                 let remote_metadata = s(7);
-                if !remote_metadata.is_empty() {
-                    if let Ok(md) = swift_db::py_json_parse_metadata(&remote_metadata) {
-                        let _ = broker.update_metadata(&md);
-                    }
+                let mut remote_info = serde_json::json!({
+                    "created_at": created_at,
+                    "put_timestamp": put_timestamp,
+                    "delete_timestamp": delete_timestamp,
+                });
+                if args.len() > 10 {
+                    remote_info["status_changed_at"] = args[8].clone();
+                    remote_info["count"] = args[9].clone();
+                    remote_info["storage_policy_index"] = args[10].clone();
                 }
-                let info = match broker.get_replication_info() {
+
+                let mut info = match broker.get_replication_info() {
                     Ok(i) => i,
                     Err(e) => return self.db_error_response(&e, broker.db_file()),
                 };
+                // ContainerReplicatorRpc._get_synced_replication_info: if
+                // the peer is authoritative, adopt its policy and refresh
+                // the response snapshot before the generic sync merge.
+                if swift_db::incorrect_policy_index(&info, &remote_info) {
+                    let remote_policy_index = args[10]
+                        .as_i64()
+                        .or_else(|| args[10].as_str().and_then(|v| v.parse().ok()))
+                        .expect("validated by incorrect_policy_index");
+                    if let Err(e) = broker
+                        .set_storage_policy_index(remote_policy_index, &Timestamp::now().internal())
+                    {
+                        return self.db_error_response(&e, broker.db_file());
+                    }
+                    info = match broker.get_replication_info() {
+                        Ok(i) => i,
+                        Err(e) => return self.db_error_response(&e, broker.db_file()),
+                    };
+                }
+                if !remote_metadata.is_empty() {
+                    let md = match swift_db::py_json_parse_metadata(&remote_metadata) {
+                        Ok(md) => md,
+                        Err(e) => return self.db_error_response(&e, broker.db_file()),
+                    };
+                    if let Err(e) = broker.update_metadata(&md) {
+                        return self.db_error_response(&e, broker.db_file());
+                    }
+                }
                 let get = |k: &str| {
                     info.iter()
                         .find(|(key, _)| key == k)
@@ -1785,7 +1938,11 @@ impl ContainerServer {
                     || get("put_timestamp") != put_timestamp
                     || get("delete_timestamp") != delete_timestamp
                 {
-                    let _ = broker.merge_timestamps(&created_at, &put_timestamp, &delete_timestamp);
+                    if let Err(e) =
+                        broker.merge_timestamps(&created_at, &put_timestamp, &delete_timestamp)
+                    {
+                        return self.db_error_response(&e, broker.db_file());
+                    }
                 }
                 let mut point = broker.get_sync(&remote_id, true).unwrap_or(-1);
                 let local_hash = get("hash");
@@ -1809,6 +1966,35 @@ impl ContainerServer {
                 resp.headers.set("Content-Type", "text/html; charset=UTF-8");
                 resp
             }
+            "merge_shard_ranges" => {
+                // Python ContainerReplicatorRpc.merge_shard_ranges: args[1]
+                // is a list of shard-range dicts.
+                let mut ranges = Vec::new();
+                if let Some(arr) = args.get(1).and_then(|v| v.as_array()) {
+                    for item in arr {
+                        if let Some(sr) = swift_db::ShardRange::from_json(item) {
+                            ranges.push(sr);
+                        }
+                    }
+                }
+                if let Err(e) = broker.merge_shard_ranges(ranges) {
+                    return self.db_error_response(&e, broker.db_file());
+                }
+                swob_response(202, None)
+            }
+            "get_shard_ranges" => {
+                let ranges = match broker.get_all_shard_range_data() {
+                    Ok(r) => r,
+                    Err(e) => return self.db_error_response(&e, broker.db_file()),
+                };
+                let body = serde_json::Value::Array(
+                    ranges.iter().map(|r| r.to_json()).collect::<Vec<_>>(),
+                );
+                let bytes = serde_json::to_vec(&body).unwrap_or_default();
+                let mut resp = Response::with_body(200, bytes);
+                resp.headers.set("Content-Type", "application/json");
+                resp
+            }
             other => plain_response(400, &format!("unknown replicate op {other}")),
         }
     }
@@ -1830,6 +2016,21 @@ impl ContainerServer {
         };
         if db_file.exists() {
             return swob_response(404, None);
+        }
+        // Sender used to always pass `<hsh>.db` even for an epoch DB
+        // (db_replicator.py sends basename(broker.db_file)). Creating the
+        // unsuffixed name next to an existing epoch file resurrects the
+        // retiring DB (probe L1347/L1375: db_state=sharding, leftover
+        // normal_dbs). Refuse that without blocking a real first create.
+        let dest_name = db_file.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if dest_name.ends_with(".db") && !dest_name.contains('_') {
+            let others = swift_db::get_db_files(&db_file);
+            if others
+                .iter()
+                .any(|p| p.file_name().and_then(|s| s.to_str()) != Some(dest_name))
+            {
+                return swob_response(404, None);
+            }
         }
         if !old_filename.exists() {
             return swob_response(404, None);
@@ -1919,7 +2120,14 @@ impl ContainerServer {
         if self.abort_rsync_then_merge(db_path, &tmp_filename) {
             return swob_response(404, None);
         }
-        if let Err(e) = swift_db::renamer(&tmp_filename, db_path) {
+        // Python `db_file = existing_broker.db_file` (freshest epoch).
+        // Renaming onto the URL's unsuffixed `<hsh>.db` recreates a retiring
+        // file next to the epoch DB (probe L1347/L1375).
+        let dest = swift_db::get_db_files(db_path)
+            .into_iter()
+            .last()
+            .unwrap_or_else(|| db_path.to_path_buf());
+        if let Err(e) = swift_db::renamer(&tmp_filename, &dest) {
             return error_response(500, &e.to_string());
         }
         swob_response(204, None)
@@ -2087,5 +2295,79 @@ mod remove_header_tests {
             translate_container_remove_header("X-Remove-Container-Meta-Color", "true").unwrap();
         assert_eq!(k.to_ascii_lowercase(), "x-container-meta-color");
         assert_eq!(v, "");
+    }
+}
+
+#[cfg(test)]
+mod replication_policy_tests {
+    use super::*;
+
+    fn test_server(devices: PathBuf) -> ContainerServer {
+        ContainerServer::new(ContainerServerConfig {
+            devices,
+            mount_check: false,
+            hash_config: HashPathConfig::new(b"test-prefix".to_vec(), Vec::new()).unwrap(),
+            policies: vec![(0, "ec".to_string()), (2, "replication".to_string())],
+            default_policy_index: 0,
+            fixed_created_at: None,
+        })
+    }
+
+    fn policy_test_dir() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "swift-container-policy-sync-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn sync_receiver_adopts_authoritative_remote_policy() {
+        let devices = policy_test_dir();
+        let db_path = devices
+            .join("sda")
+            .join("containers")
+            .join("0")
+            .join("123")
+            .join("abc123")
+            .join("abc123.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let mut broker = ContainerBroker::new(&db_path, "a", "c");
+        broker
+            .initialize("0000000020.00000", 2, "0000000020.00000", "local-id")
+            .unwrap();
+
+        let sync = serde_json::json!([
+            "sync",
+            -1,
+            "",
+            "remote-id",
+            "0000000010.00000",
+            "0000000010.00000",
+            "0000000000.00000",
+            "",
+            "0000000010.00000",
+            0,
+            0,
+        ]);
+        let request = Request {
+            method: "REPLICATE".to_string(),
+            path: "/sda/0/abc123".to_string(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::Buffered(serde_json::to_vec(&sync).unwrap()),
+        };
+        let response = test_server(devices.clone()).handle(request);
+        assert_eq!(response.status, 200);
+
+        let mut broker = ContainerBroker::new(&db_path, "", "");
+        assert_eq!(broker.storage_policy_index().unwrap(), 0);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.body.into_vec(1024 * 1024).unwrap()).unwrap();
+        assert_eq!(body["storage_policy_index"], 0);
+        std::fs::remove_dir_all(devices).unwrap();
     }
 }

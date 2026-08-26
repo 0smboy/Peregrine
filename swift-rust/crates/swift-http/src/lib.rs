@@ -49,8 +49,8 @@ pub use range::{
     normalize_etag, Match, Range,
 };
 pub use request::{
-    decoded_path_is_utf8, guess_content_type, parse_query, percent_decode_bytes, reason_phrase,
-    split_path, unquote, Request, Response,
+    decoded_path_is_utf8, guess_content_type, listing_query_invalid_utf8_param, parse_query,
+    percent_decode_bytes, reason_phrase, split_path, unquote, Request, Response,
 };
 pub use server::{
     bind_listener, install_sigterm_flag, serve_forever, serve_forever_multi,

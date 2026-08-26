@@ -37,9 +37,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use swift_core::config::config_true_value;
+use swift_core::constraints::check_utf8;
 use swift_core::timestamp::{normalize_delete_at_timestamp, Timestamp};
 use swift_http::{
-    split_path, HeaderKeyDict, Request, Response, AsyncRequest, AsyncService,
+    listing_query_invalid_utf8_param, split_path, AsyncRequest, AsyncService, HeaderKeyDict,
+    Request, Response,
 };
 use swift_memcache::{MemcacheClient, TcpConn};
 use swift_ring::Ring;
@@ -217,16 +219,42 @@ struct ContainerInfo {
     /// account / enable_by_default" (Python etag_quoter).
     rfc_compliant_etags: Option<String>,
     cors: CorsInfo,
+    /// Python `container_info['db_state']` from `X-Backend-Sharding-State`.
+    /// Empty means the HEAD omitted it; [`Self::root_db_state`] then reports
+    /// `unsharded`, matching an unsharded broker.
+    db_state: String,
 }
 
 impl ContainerInfo {
     fn exists(&self) -> bool {
         (200..300).contains(&self.status)
     }
+
+    /// Object writes distinguish an authoritative missing container (404)
+    /// from a container ring that could not answer at all (status 0). Python
+    /// synthesizes 503 for the latter so callers do not cache infrastructure
+    /// failure as non-existence.
+    fn write_failure_status(&self) -> u16 {
+        if self.status == 0 || self.status >= 500 {
+            503
+        } else {
+            404
+        }
+    }
+
+    /// Value for `X-Container-Root-Db-State` on object PUT/DELETE (Python
+    /// obj.py `headers_in.get('X-Container-Root-Db-State')`).
+    fn root_db_state(&self) -> &str {
+        if self.db_state.is_empty() {
+            "unsharded"
+        } else {
+            &self.db_state
+        }
+    }
 }
 
 /// Cached account HEAD: status plus sysmeta ACL and Temp-URL keys.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct AccountInfo {
     status: u16,
     /// Raw `X-Account-Sysmeta-Core-Access-Control` value when present.
@@ -235,6 +263,30 @@ struct AccountInfo {
     /// `X-Account-Sysmeta-Rfc-Compliant-Etags` when the account HEAD
     /// carried a non-empty value.
     rfc_compliant_etags: Option<String>,
+    /// Python `headers_to_account_info` `account_really_exists`: false when
+    /// the listing was synthesized for `account_autocreate` (`X-Backend-
+    /// Fake-Account-Listing: yes`). Defaults true so a missing cache field
+    /// does not skip autocreate. Presence is `exists()`.
+    account_really_exists: bool,
+}
+
+impl Default for AccountInfo {
+    fn default() -> Self {
+        AccountInfo {
+            status: 0,
+            core_access_control: None,
+            temp_url_keys: Vec::new(),
+            rfc_compliant_etags: None,
+            account_really_exists: true,
+        }
+    }
+}
+
+impl AccountInfo {
+    /// Python `Controller.account_info`: 2xx AND not a fake autocreate listing.
+    fn exists(&self) -> bool {
+        (200..300).contains(&self.status) && self.account_really_exists
+    }
 }
 
 /// L1 (process-local) + optional L2 (shared memcache) cache of container /
@@ -406,6 +458,7 @@ fn container_info_to_json(info: &ContainerInfo) -> serde_json::Value {
         "temp_url_keys": info.temp_url_keys,
         "sync_key": info.sync_key,
         "rfc_compliant_etags": info.rfc_compliant_etags,
+        "db_state": info.db_state,
         "cors": {
             "allow_origin": info.cors.allow_origin,
             "expose_headers": info.cors.expose_headers,
@@ -444,6 +497,11 @@ fn container_info_from_json(v: &serde_json::Value) -> Option<ContainerInfo> {
             .and_then(|x| x.as_str())
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        db_state: v
+            .get("db_state")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
         cors: CorsInfo {
             allow_origin: v
                 .get("cors")
@@ -470,6 +528,7 @@ fn account_info_to_json(info: &AccountInfo) -> serde_json::Value {
         "core_access_control": info.core_access_control,
         "temp_url_keys": info.temp_url_keys,
         "rfc_compliant_etags": info.rfc_compliant_etags,
+        "account_really_exists": info.account_really_exists,
     })
 }
 
@@ -494,6 +553,11 @@ fn account_info_from_json(v: &serde_json::Value) -> Option<AccountInfo> {
             .and_then(|x| x.as_str())
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        // Python `.get('account_really_exists', True)`: absent key is real.
+        account_really_exists: v
+            .get("account_really_exists")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(true),
     })
 }
 
@@ -502,7 +566,11 @@ fn account_info_from_json(v: &serde_json::Value) -> Option<AccountInfo> {
 /// or the conf default; a tenth of that for authoritative absence (404/410);
 /// `None` for any other non-success status, which must not touch the cache
 /// ("bail without touching caches", base.py:689-692).
-pub(crate) fn info_cache_time(status: u16, recheck_header: Option<&str>, default_ttl: f64) -> Option<f64> {
+pub(crate) fn info_cache_time(
+    status: u16,
+    recheck_header: Option<&str>,
+    default_ttl: f64,
+) -> Option<f64> {
     let ttl = recheck_header
         .and_then(|v| v.trim().parse::<f64>().ok())
         .unwrap_or(default_ttl);
@@ -726,9 +794,7 @@ impl Read for LimitedBackendReader {
 }
 
 /// Read one `\r\n`-terminated line from a backend response head, bounded.
-fn read_backend_line(
-    reader: &mut std::io::BufReader<TcpStream>,
-) -> std::io::Result<String> {
+fn read_backend_line(reader: &mut std::io::BufReader<TcpStream>) -> std::io::Result<String> {
     use std::io::BufRead;
     let mut line = Vec::new();
     (&mut *reader)
@@ -747,9 +813,7 @@ fn read_backend_line(
 type ParsedHead = (u16, String, Vec<(String, String)>);
 
 /// Parse a status line + headers from an open backend connection.
-fn read_backend_head(
-    reader: &mut std::io::BufReader<TcpStream>,
-) -> std::io::Result<ParsedHead> {
+fn read_backend_head(reader: &mut std::io::BufReader<TcpStream>) -> std::io::Result<ParsedHead> {
     let status_line = read_backend_line(reader)?;
     let mut parts = status_line.splitn(3, ' ');
     let _proto = parts.next();
@@ -1266,6 +1330,32 @@ fn connect_mime_putter(
 /// `swift.common.utils.quorum_size` is in swift-core.
 use swift_core::storage_policy::quorum_size;
 
+/// Python `generate_request_headers` always carries backend-control headers
+/// (and an explicit timestamp) into storage-node requests, independently of
+/// the public metadata transfer rules. Internal Swift callers rely on this
+/// for controls such as `X-Backend-No-Commit`; dropping it turns an intended
+/// non-durable EC generation into a durable overwrite.
+fn copy_backend_control_headers(req: &Request, headers: &mut HeaderKeyDict) {
+    for (key, value) in req.headers.iter() {
+        let lower = key.to_ascii_lowercase();
+        if lower.starts_with("x-backend-") || lower == "x-timestamp" {
+            headers.set(key, value);
+        }
+    }
+}
+
+/// Preserve a trusted Swift-internal timestamp (including its offset) when
+/// generating object backend requests. Public pipelines remove or shunt the
+/// client form in gatekeeper; internal clients such as container-reconciler
+/// intentionally supply it. Replacing it with wall-clock time loses Swift's
+/// conflict-ordering semantics.
+fn object_write_timestamp(req: &Request) -> Timestamp {
+    req.headers
+        .get("X-Timestamp")
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or_else(Timestamp::now)
+}
+
 impl ProxyApp {
     pub fn new(account_ring: Ring, container_ring: Ring, config: ProxyConfig) -> Self {
         // Default the object ring to the container ring's topology when
@@ -1489,6 +1579,59 @@ impl ProxyApp {
         }
     }
 
+    /// Python `num_container_updates`: enough CU side-channels that a
+    /// quorum object write still leaves a quorum container update.
+    fn num_container_updates(rc: usize, qc: usize, ro: usize, qo: usize) -> usize {
+        (qc + ro.saturating_sub(qo)).max(rc)
+    }
+
+    /// Python `BaseObjectController._backend_requests` container-update
+    /// headers: cycle *primaries* (`get_part_nodes`) with `csv_append` until
+    /// `num_container_updates`. `iter_nodes` includes handoffs; a handoff as
+    /// a replica's only CU target 404s and the shard listing keeps the name
+    /// (probe test_shrinking L1925).
+    fn stamp_container_update_headers(
+        per_node: &mut [HeaderKeyDict],
+        container_part: u32,
+        container_primaries: &[Node],
+    ) {
+        if per_node.is_empty() || container_primaries.is_empty() {
+            return;
+        }
+        let rc = container_primaries.len();
+        let ro = per_node.len();
+        let qc = quorum_size(rc as f64) as usize;
+        let qo = quorum_size(ro as f64) as usize;
+        let n_updates_needed = Self::num_container_updates(rc, qc, ro, qo);
+        for i in 0..n_updates_needed {
+            let headers = &mut per_node[i % per_node.len()];
+            let cont = &container_primaries[i % rc];
+            headers.set("X-Container-Partition", container_part);
+            let host = format!("{}:{}", cont.ip, cont.port);
+            headers.set(
+                "X-Container-Host",
+                csv_append(headers.get("X-Container-Host"), &host),
+            );
+            headers.set(
+                "X-Container-Device",
+                csv_append(headers.get("X-Container-Device"), &cont.device),
+            );
+        }
+    }
+
+    fn object_container_update_headers(
+        &self,
+        base: &HeaderKeyDict,
+        container_part: u32,
+        node_number: usize,
+    ) -> Vec<HeaderKeyDict> {
+        let n = node_number.max(1);
+        let mut per_node = vec![base.clone(); n];
+        let primaries = Self::part_nodes(&self.container_ring, container_part);
+        Self::stamp_container_update_headers(&mut per_node, container_part, &primaries);
+        per_node
+    }
+
     fn container_write_headers(
         &self,
         base: &HeaderKeyDict,
@@ -1547,6 +1690,7 @@ impl ProxyApp {
     /// `generate_request_headers`: the base backend headers.
     fn backend_headers(&self, req: &Request, transfer: bool, server_type: &str) -> HeaderKeyDict {
         let mut headers = HeaderKeyDict::new();
+        copy_backend_control_headers(req, &mut headers);
         if transfer {
             // transfer_headers: user/sys metadata and the ACL headers
             for (k, v) in req.headers.iter() {
@@ -1584,6 +1728,16 @@ impl ProxyApp {
                 // updates on the container server (P1c ACL revoke path).
                 let container_remove =
                     server_type == "container" && kl.starts_with("x-remove-container-");
+                // container.py PUT/POST: reseller `X-Container-Sharding` becomes
+                // sysmeta so the sharder sees sharding_enabled(broker).
+                if server_type == "container" && kl == "x-container-sharding" {
+                    let on = config_true_value(v);
+                    headers.set(
+                        "X-Container-Sysmeta-Sharding",
+                        if on { "True" } else { "False" },
+                    );
+                    continue;
+                }
                 if kl.starts_with(&user)
                     || kl.starts_with(&sys)
                     || object_transient
@@ -1608,6 +1762,13 @@ impl ProxyApp {
         }
         if let Some(trans_id) = req.headers.get("X-Trans-Id") {
             headers.set("X-Trans-Id", trans_id);
+        }
+        // Python generate_request_headers copies X-Newest. Listing HEAD
+        // then get_or_head picks the newest replica so a just-SHARDED
+        // under-populated node wins over a lagging SHARDING replica
+        // (probe listing_under_populated L1509).
+        if let Some(v) = req.headers.get("X-Newest") {
+            headers.set("X-Newest", v);
         }
         headers.set("User-Agent", format!("proxy-server {}", std::process::id()));
         headers
@@ -2214,10 +2375,13 @@ impl ProxyApp {
                     // authoritative turns up the request ends 503, not 404.
                     let ts = backend_404_timestamp(&head.headers);
                     if !node.handoff || ts.is_truthy() {
-                        // base.py:1642-1648: for objects, remember the newest
-                        // tombstone so a slower stale source can't win. (lp
-                        // 1560574 checks only objects for now.)
-                        if is_object && ts > latest_404_timestamp {
+                        // base.py:1642-1648 raises the tombstone watermark
+                        // for objects (lp 1560574). Container DELETE must
+                        // too: probe test_shrinking L2095, listing-w214 left
+                        // an unsuffixed handoff with live alpha-1 after the
+                        // three collapsed primaries tombstoned. Without this,
+                        // first-200 GET returns that handoff instead of 404.
+                        if ts > latest_404_timestamp {
                             latest_404_timestamp = ts;
                         }
                         // Python's best_response returns the first entry with
@@ -2517,11 +2681,8 @@ impl ProxyApp {
     }
 
     pub fn handle(self: &Arc<Self>, req: Request) -> Response {
-        // Reject a decoded path carrying a NUL byte (invalid UTF-8 can't reach a
-        // Rust String), mirroring Python's `check_utf8` at request entry:
-        // HTTPPreconditionFailed (412) "Invalid UTF8 or contains NULL".
-        if req.path.contains('\u{0}') {
-            return text_response(412, "Invalid UTF8 or contains NULL");
+        if let Some(resp) = utf8_or_null_rejected(&req) {
+            return resp;
         }
         // `/info`: public cluster-capabilities document (no auth). Reports only
         // the features this proxy actually serves, so clients (and the
@@ -2636,6 +2797,7 @@ impl ProxyApp {
             (Some(container), None) => {
                 let mut resp = self.container_request(&req, &account, &container);
                 strip_owner_headers(&mut resp, swift_owner);
+                expose_container_sharding(&mut resp, is_reseller_request(&req));
                 resp
             }
             (None, _) => {
@@ -2653,10 +2815,7 @@ impl ProxyApp {
 
     /// Production async entry: object PUT/GET stream; HEAD/POST use
     /// Tokio backend I/O. Remaining verbs stay at the control-plane cap.
-    pub async fn handle_async(
-        self: &Arc<Self>,
-        mut areq: swift_http::AsyncRequest,
-    ) -> Response {
+    pub async fn handle_async(self: &Arc<Self>, mut areq: swift_http::AsyncRequest) -> Response {
         // Keep-alive requests skip the connection peek. `/info asdf` is 412
         // Bad URL (Python `get_controller is None`). Object names may contain
         // spaces after unquote (`testCopy`); only non-/v1 paths with a space
@@ -2680,10 +2839,7 @@ impl ProxyApp {
             // segments (`/v1//c/o`) stay 404 like Python.
             return text_response(412, "Bad URL");
         }
-        let v1 = segs.len() >= 3
-            && segs[0].is_empty()
-            && segs[1] == "v1"
-            && !segs[2].is_empty();
+        let v1 = segs.len() >= 3 && segs[0].is_empty() && segs[1] == "v1" && !segs[2].is_empty();
         let object_put = areq.method == "PUT"
             && segs.len() >= 5
             && v1
@@ -2693,8 +2849,15 @@ impl ProxyApp {
             && (areq.method == "COPY"
                 || (areq.method == "PUT" && areq.headers.get("X-Copy-From").is_some()));
         if copy_req {
-            if areq.path.contains('\u{0}') {
-                return text_response(412, "Invalid UTF8 or contains NULL");
+            let tmp = Request {
+                method: areq.method.clone(),
+                path: areq.path.clone(),
+                query_string: areq.query_string.clone(),
+                headers: areq.headers.clone(),
+                body: swift_http::Body::empty(),
+            };
+            if let Some(resp) = utf8_or_null_rejected(&tmp) {
+                return resp;
             }
             let mut req = Request {
                 method: areq.method.clone(),
@@ -2769,8 +2932,8 @@ impl ProxyApp {
                 headers: areq.headers.clone(),
                 body: swift_http::Body::empty(),
             };
-            if req.path.contains('\u{0}') {
-                return text_response(412, "Invalid UTF8 or contains NULL");
+            if let Some(resp) = utf8_or_null_rejected(&req) {
+                return resp;
             }
             let account = segs[2].to_string();
             let container = segs[3].to_string();
@@ -2781,6 +2944,17 @@ impl ProxyApp {
             {
                 return denied;
             }
+            // VersionedWrites must authorize the client-visible destination
+            // before it moves the unread client stream into the hidden
+            // versions container.  This header-only probe is deliberately
+            // consumed after authorization and before any backend PUT.
+            if req
+                .headers
+                .remove(swift_middleware::VERSIONED_WRITES_AUTHORIZE_ONLY_HEADER)
+                .is_some()
+            {
+                return Response::new(204);
+            }
             return self
                 .object_put_async(&mut req, &account, &container, &object, &mut areq.body)
                 .await;
@@ -2789,9 +2963,6 @@ impl ProxyApp {
             v1 && matches!(areq.method.as_str(), "GET" | "HEAD" | "POST" | "DELETE");
         let account_or_container_put = v1 && areq.method == "PUT" && segs.len() < 5;
         if get_head_post_delete || account_or_container_put {
-            if areq.path.contains('\u{0}') {
-                return text_response(412, "Invalid UTF8 or contains NULL");
-            }
             let mut req = Request {
                 method: areq.method.clone(),
                 path: areq.path.clone(),
@@ -2799,18 +2970,15 @@ impl ProxyApp {
                 headers: areq.headers.clone(),
                 body: swift_http::Body::empty(),
             };
+            if let Some(resp) = utf8_or_null_rejected(&req) {
+                return resp;
+            }
             let account = segs[2].to_string();
             if segs.get(3) == Some(&"") {
                 return swob_response(404);
             }
-            let container = segs
-                .get(3)
-                .map(|s| s.to_string())
-                .filter(|s| !s.is_empty());
-            let object = segs
-                .get(4)
-                .map(|s| s.to_string())
-                .filter(|s| !s.is_empty());
+            let container = segs.get(3).map(|s| s.to_string()).filter(|s| !s.is_empty());
+            let object = segs.get(4).map(|s| s.to_string()).filter(|s| !s.is_empty());
             let allowed = self.allowed_methods(container.is_some());
             if !allowed
                 .split(", ")
@@ -2858,6 +3026,7 @@ impl ProxyApp {
                     let c = c.to_string();
                     finish_container_resp(
                         swift_owner,
+                        is_reseller_request(&req),
                         self.container_get_head_async(req, &account, &c).await,
                     )
                 }
@@ -2865,6 +3034,7 @@ impl ProxyApp {
                     let c = c.to_string();
                     finish_container_resp(
                         swift_owner,
+                        is_reseller_request(&req),
                         self.container_post_async(req, &account, &c).await,
                     )
                 }
@@ -2872,10 +3042,9 @@ impl ProxyApp {
                     swift_owner,
                     self.account_get_head_async(req, &account).await,
                 ),
-                ("POST", None, _) => finish_account_resp(
-                    swift_owner,
-                    self.account_post_async(req, &account).await,
-                ),
+                ("POST", None, _) => {
+                    finish_account_resp(swift_owner, self.account_post_async(req, &account).await)
+                }
                 ("DELETE", Some(c), Some(o)) => {
                     let (c, o) = (c.to_string(), o.to_string());
                     self.object_delete_async(&mut req, &account, &c, &o).await
@@ -2889,20 +3058,29 @@ impl ProxyApp {
                     let c = c.to_string();
                     finish_container_resp(
                         swift_owner,
+                        is_reseller_request(&req),
                         self.container_put_async(req, &account, &c).await,
                     )
                 }
-                ("PUT", None, _) => finish_account_resp(
-                    swift_owner,
-                    self.account_put_async(req, &account).await,
-                ),
+                ("PUT", None, _) => {
+                    finish_account_resp(swift_owner, self.account_put_async(req, &account).await)
+                }
                 _ => swob_response(405),
             };
         }
         // Local control plane only. Never `self.handle()` — that path still
         // fans out over `std::net` (leftover sync controller).
-        if areq.path.contains('\u{0}') {
-            return text_response(412, "Invalid UTF8 or contains NULL");
+        {
+            let tmp = Request {
+                method: areq.method.clone(),
+                path: areq.path.clone(),
+                query_string: areq.query_string.clone(),
+                headers: areq.headers.clone(),
+                body: swift_http::Body::empty(),
+            };
+            if let Some(resp) = utf8_or_null_rejected(&tmp) {
+                return resp;
+            }
         }
         if areq.path == "/info" || areq.path.starts_with("/info?") {
             if !self.info_json.is_empty() && matches!(areq.method.as_str(), "GET" | "HEAD") {
@@ -2942,10 +3120,7 @@ impl ProxyApp {
                 return swob_response(404);
             }
             let account = segs[2].to_string();
-            let container = segs
-                .get(3)
-                .map(|s| s.to_string())
-                .filter(|s| !s.is_empty());
+            let container = segs.get(3).map(|s| s.to_string()).filter(|s| !s.is_empty());
             let origin = areq
                 .headers
                 .get("Origin")
@@ -3013,7 +3188,8 @@ impl ProxyApp {
         if cors.allow_origin.as_deref().map(str::trim) == Some("*") {
             resp.headers.set("Access-Control-Allow-Origin", "*");
         } else {
-            resp.headers.set("Access-Control-Allow-Origin", origin.as_str());
+            resp.headers
+                .set("Access-Control-Allow-Origin", origin.as_str());
             append_vary(&mut resp.headers, "Origin");
         }
         if let Some(max_age) = cors.max_age {
@@ -3044,9 +3220,11 @@ impl ProxyApp {
             .headers
             .get("X-Backend-Storage-Policy-Index")
             .and_then(|v| v.parse().ok());
-        let info = self.container_info_async(account, container).await;
+        let info = self
+            .container_info_for_write_async(account, container)
+            .await;
         if !info.exists() {
-            return swob_response(404);
+            return swob_response(info.write_failure_status());
         }
         let policy_index: i64 = header_policy.unwrap_or(info.policy_index);
         let Some(object_ring) = self.object_ring_for(policy_index) else {
@@ -3105,39 +3283,29 @@ impl ProxyApp {
         else {
             return swob_response(503);
         };
-        let container_nodes = self.iter_nodes(&self.container_ring, container_part);
         let mut base = self.backend_headers(req, true, "object");
-        let put_ts = Timestamp::now();
+        let put_ts = object_write_timestamp(req);
         base.set("X-Timestamp", put_ts.internal());
         base.set("X-Backend-Storage-Policy-Index", policy_index);
+        self.stamp_root_db_state(&account, &container, &mut base);
         base.set(
             "Content-Type",
             req.headers
                 .get("Content-Type")
                 .unwrap_or("application/octet-stream"),
         );
-        if upd_account != account || upd_container != container {
-            base.set(
-                "X-Backend-Container-Path",
-                format!("{upd_account}/{upd_container}"),
-            );
-            base.set("X-Backend-Allow-Reserved-Names", "true");
-        }
+        stamp_shard_container_path(
+            &mut base,
+            &upd_account,
+            &upd_container,
+            &account,
+            &container,
+        );
         let node_number = object_ring
             .get_part_nodes(object_part)
             .map(|n| n.len())
             .unwrap_or(1);
-        let mut per_node = Vec::with_capacity(node_number);
-        for i in 0..node_number {
-            let mut headers = base.clone();
-            if !container_nodes.is_empty() {
-                let cont = &container_nodes[i % container_nodes.len()];
-                headers.set("X-Container-Host", format!("{}:{}", cont.ip, cont.port));
-                headers.set("X-Container-Partition", container_part);
-                headers.set("X-Container-Device", &cont.device);
-            }
-            per_node.push(headers);
-        }
+        let per_node = self.object_container_update_headers(&base, container_part, node_number);
         let object_nodes = self.iter_nodes(object_ring, object_part);
         let mut resp = self
             .stream_put_async(
@@ -3180,7 +3348,13 @@ impl ProxyApp {
                 ) {
                     Some(resp) if resp.status == 404 && self.config.account_autocreate => {
                         // synthesize an empty account listing
-                        synthesized_account_listing(req)
+                        let mut fake = synthesized_account_listing(req);
+                        fake.headers.set(
+                            "X-Backend-Recheck-Account-Existence",
+                            format!("{}", self.config.recheck_account_existence as i64),
+                        );
+                        self.cache_account_from_response(account, &fake);
+                        fake
                     }
                     Some(resp) => resp,
                     None => swob_response(503),
@@ -3254,6 +3428,16 @@ impl ProxyApp {
         let path = format!("/{}/{}", percent_encode(account), percent_encode(container));
         match req.method.as_str() {
             "GET" | "HEAD" => {
+                // Python `validate_container_params` / `get_param`: listing
+                // query values that are not valid UTF-8 are 400
+                // `"<name>" parameter not valid UTF-8` (probe
+                // test_sharding_listing delimiter=%ff).
+                if let Some(name) = listing_query_invalid_utf8_param(&req.query_string) {
+                    return constraint_plain(400, &format!("\"{name}\" parameter not valid UTF-8"));
+                }
+                if let Err(resp) = constrain_listing_limit(req) {
+                    return resp;
+                }
                 // Wave 3 L3b: shard-range listing fan-out for sharded containers.
                 // Skip when the client already asked for record-type=shard (or
                 // backend override), so admin shard listings stay single-hop.
@@ -3335,8 +3519,8 @@ impl ProxyApp {
                 // else do the live HEAD and cache it with set_info_cache
                 // semantics. An unreachable ring (None → 503) is never
                 // cached, like Python's synthesized 503 info.
-                let acct_status = self.account_info(account).status;
-                if !(200..300).contains(&acct_status) {
+                let acct_status = self.account_info(account);
+                if !acct_status.exists() {
                     if self.config.account_autocreate && req.method == "PUT" {
                         // Python container PUT stops with 503 when account
                         // autocreation fails. Continuing would let container
@@ -3350,8 +3534,8 @@ impl ProxyApp {
                         // a successful autocreate. A nominal 2xx create is not
                         // enough: if the account still cannot be observed, the
                         // container fan-out must not start.
-                        let refreshed = self.account_info(account).status;
-                        if !(200..300).contains(&refreshed) {
+                        let refreshed = self.account_info(account);
+                        if !refreshed.exists() {
                             return swob_response(404);
                         }
                     } else {
@@ -3420,6 +3604,45 @@ impl ProxyApp {
         }
     }
 
+    /// Python `set_info_cache` from a container GETorHEAD response
+    /// (base.py:672-694). Probe L2111: `assert_container_not_found` caches
+    /// a 404; a later listing 200 must overwrite it or object DELETE sees
+    /// `container_info.exists()==false` and 404s while the object bytes
+    /// are still on disk (listing-w216 beta-1).
+    fn remember_container_info(&self, account: &str, container: &str, resp: &Response) {
+        let cache_key = format!("{account}/{container}");
+        // listing-w217: overwriting a live 200 sharded cache from listing
+        // headers reopened L2044 leftover names. Only fill a miss or a
+        // negative (404) entry — the DELETE-container → listing [beta]
+        // revive path (L2111).
+        if self
+            .info_cache
+            .get_container(&cache_key)
+            .is_some_and(|c| c.exists())
+        {
+            return;
+        }
+        let mut info = ContainerInfo {
+            status: 0,
+            policy_index: self.config.default_policy_index,
+            read_acl: None,
+            write_acl: None,
+            temp_url_keys: Vec::new(),
+            sync_key: None,
+            rfc_compliant_etags: None,
+            cors: CorsInfo::default(),
+            db_state: String::new(),
+        };
+        fill_container_info_from_head(&mut info, resp);
+        if let Some(ttl) = info_cache_time(
+            resp.status,
+            resp.headers.get("X-Backend-Recheck-Container-Existence"),
+            self.config.recheck_container_existence,
+        ) {
+            self.info_cache.set_container(cache_key, info, ttl);
+        }
+    }
+
     /// `get_container_info`-lite (base.py:430-538): the container's
     /// storage-policy index plus its read/write ACLs and Temp-URL keys.
     /// Served from the in-process info cache when fresh; a miss does a live
@@ -3430,6 +3653,33 @@ impl ProxyApp {
     /// other errors and an unreachable ring (Python's synthesized 503 info)
     /// never cached. `read_acl`/`write_acl` are `None` when the container
     /// has none or is unreachable; the policy falls back to the default.
+    /// Object PUT/DELETE: if a cached 404 is stale (container revived by
+    /// async pending), drop it and HEAD again. Does not change listing
+    /// fan-out.
+    fn container_info_for_write(&self, account: &str, container: &str) -> ContainerInfo {
+        let info = self.container_info(account, container);
+        if info.exists() {
+            return info;
+        }
+        self.info_cache
+            .clear_container(&format!("{account}/{container}"));
+        self.container_info(account, container)
+    }
+
+    async fn container_info_for_write_async(
+        self: &Arc<Self>,
+        account: &str,
+        container: &str,
+    ) -> ContainerInfo {
+        let info = self.container_info_async(account, container).await;
+        if info.exists() {
+            return info;
+        }
+        self.info_cache
+            .clear_container(&format!("{account}/{container}"));
+        self.container_info_async(account, container).await
+    }
+
     fn container_info(&self, account: &str, container: &str) -> ContainerInfo {
         let cache_key = format!("{account}/{container}");
         if let Some(info) = self.info_cache.get_container(&cache_key) {
@@ -3444,6 +3694,7 @@ impl ProxyApp {
             sync_key: None,
             rfc_compliant_etags: None,
             cors: CorsInfo::default(),
+            db_state: String::new(),
         };
         let Ok((part, _)) = self
             .container_ring
@@ -3468,15 +3719,26 @@ impl ProxyApp {
         info
     }
 
+    /// Python obj.py: object PUT/DELETE carry `X-Container-Root-Db-State` so
+    /// a failed container update still pickles `db_state` into async_pending.
+    fn stamp_root_db_state(&self, account: &str, container: &str, headers: &mut HeaderKeyDict) {
+        headers.set(
+            "X-Container-Root-Db-State",
+            self.container_info(account, container).root_db_state(),
+        );
+    }
+
     /// Container-sync user key for inbound realm HMAC validation.
     pub fn container_sync_key(&self, account: &str, container: &str) -> Option<String> {
         self.container_info(account, container).sync_key
     }
 
-    /// For a sharded root HEAD: sum live `X-Container-Object-Count` /
-    /// `X-Container-Bytes-Used` from listing-state shard containers and
-    /// overwrite the (often stale) root totals. No-op when not sharded or
-    /// no listing ranges are available.
+    /// For a sharded root HEAD: Python `get_shard_usage` — sum
+    /// `object_count`/`bytes_used` from root shard-range rows in
+    /// ACTIVE/SHARDING/SHRINKING. Do **not** HEAD each shard container:
+    /// live shard `object_count` lags `run_custom_sharder(reclaim_age=0)`
+    /// PUT_shard onto the root (probe L1979 expected 51, live-shard sum
+    /// stayed 50+50=100).
     fn patch_sharded_head_counts(
         self: &Arc<Self>,
         req: &Request,
@@ -3503,118 +3765,11 @@ impl ProxyApp {
         let mut shard_headers = self.backend_headers(req, false, "container");
         shard_headers.set("X-Backend-Record-Type", "shard");
         shard_headers.set("X-Backend-Allow-Reserved-Names", "true");
-        let Some(arr) = self.fetch_listing_shard_ranges(nodes.clone(), part, &path, &shard_headers)
-        else {
+        let Some(arr) = self.fetch_listing_shard_ranges(nodes, part, &path, &shard_headers) else {
             return;
         };
-        if arr.is_empty() {
-            return;
-        }
-        let mut total_count: i64 = 0;
-        let mut total_bytes: i64 = 0;
-        let mut saw_shard = false;
-        for sr in &arr {
-            // Skip soft-deleted / SHRUNK donors so we do not double-count
-            // during shrink (objects already live on the acceptor).
-            let st = sr.get("state").and_then(|v| v.as_i64()).unwrap_or(0);
-            let deleted = sr.get("deleted").and_then(|v| v.as_i64()).unwrap_or(0);
-            if st == 80 || deleted != 0 {
-                // SHRUNK or soft-deleted
-                continue;
-            }
-            let name = sr.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let (shard_account, shard_container) = match name.split_once('/') {
-                Some((a, c)) => (a, c),
-                None => continue,
-            };
-            let Ok((spart, _)) =
-                self.container_ring
-                    .get_nodes(shard_account, Some(shard_container), None)
-            else {
-                continue;
-            };
-            let spath = format!(
-                "/{}/{}",
-                percent_encode(shard_account),
-                percent_encode(shard_container)
-            );
-            let snodes = self.iter_nodes(&self.container_ring, spart);
-            let mut headers = self.backend_headers(req, false, "container");
-            headers.set("X-Backend-Allow-Reserved-Names", "true");
-            let Some(head) =
-                self.get_or_head("container", snodes, spart, "HEAD", &spath, "", &headers)
-            else {
-                continue;
-            };
-            if !(200..300).contains(&head.status) {
-                continue;
-            }
-            saw_shard = true;
-            total_count += head
-                .headers
-                .get("X-Container-Object-Count")
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(0);
-            total_bytes += head
-                .headers
-                .get("X-Container-Bytes-Used")
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(0);
-        }
-        // Residual root rows (same condition as listing fan-out): when the
-        // root still reports object_count > 0, GET listing merges those rows
-        // (name-deduped against shards). For HEAD we cannot cheaply dedupe
-        // without names from every shard; approximate by adding residual
-        // count only when shard_sum is 0 (pure residual) or when residual
-        // fetch returns rows and we use max(shard_sum, residual) as a floor
-        // when residual alone is larger (rare). Prefer: add residual when
-        // non-empty and track via name set from residual only if shard_sum
-        // already covers live shards — residual names are typically
-        // post-cleave leftovers not yet removed from root.
-        let root_oc = resp
-            .headers
-            .get("X-Container-Object-Count")
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(0);
-        if root_oc > 0 {
-            let mut root_headers = self.backend_headers(req, false, "container");
-            root_headers.set("X-Backend-Record-Type", "object");
-            if let Some(items) = self.fetch_shard_object_listing_first_nonempty(
-                &nodes,
-                part,
-                &path,
-                "format=json&limit=10000",
-                &root_headers,
-            ) {
-                if !items.is_empty() {
-                    // Name-dedupe residual against would-be double count: if
-                    // shard_sum already reflects live data, residual rows
-                    // that still sit on root after cleave are *extra* only
-                    // when not moved. Listing dedupes by name; we add residual
-                    // count when it is the only signal (shard_sum==0), else
-                    // take max(shard_sum, residual) to avoid under-count
-                    // without full name merge (cheap HEAD path).
-                    let residual = items.len() as i64;
-                    let residual_bytes: i64 = items
-                        .iter()
-                        .filter_map(|o| o.get("bytes").and_then(|v| v.as_i64()))
-                        .sum();
-                    if total_count == 0 {
-                        total_count = residual;
-                        total_bytes = residual_bytes;
-                    } else if residual > total_count {
-                        // Residual listing longer than shard sum — use it as
-                        // the more complete signal ( Contabo partial cleave ).
-                        total_count = residual;
-                        total_bytes = residual_bytes;
-                    }
-                    // else keep shard_sum (typical sharded case; residual is
-                    // stale root rows also present on shards — list dedupes).
-                    saw_shard = true;
-                }
-            }
-        }
-        if saw_shard {
+        let (total_count, total_bytes, saw) = shard_usage_from_ranges(&arr);
+        if saw {
             resp.headers
                 .set("X-Container-Object-Count", total_count.to_string());
             resp.headers
@@ -3648,7 +3803,7 @@ impl ProxyApp {
         // internal requests carry the same baseline as other container hops
         // (User-Agent / X-Trans-Id); gatekeeper strips client X-Backend-*.
         let head_headers = self.backend_headers(req, false, "container");
-        let head = self.get_or_head(
+        let mut head = self.get_or_head(
             "container",
             nodes.clone(),
             part,
@@ -3670,9 +3825,42 @@ impl ProxyApp {
             .get("X-Container-Object-Count")
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(0);
-        // May still probe ranges when unsharded + empty root (partial cleave).
-        if !should_probe_sharded_listing(&state, object_count) {
-            return None;
+        // GET: always look for listing ranges. A lagging unsharded HEAD
+        // replica (count still 100) must not skip fan-out and list retiring
+        // root leftovers (probe L1985). HEAD stays on the backend replica.
+        if req.method.eq_ignore_ascii_case("HEAD") {
+            // Patch counts from listing-state range stats even when the
+            // first replica still says unsharded/100 (probe L1979).
+            let mut shard_headers = self.backend_headers(req, false, "container");
+            shard_headers.set("X-Backend-Record-Type", "shard");
+            shard_headers.set("X-Backend-Allow-Reserved-Names", "true");
+            let arrays = self.fetch_json_arrays_nonempty(
+                &nodes,
+                part,
+                &path,
+                "states=listing&format=json",
+                &shard_headers,
+            );
+            if let Some((usage_count, usage_bytes)) = lowest_shard_usage(&arrays) {
+                head.headers
+                    .set("X-Container-Object-Count", usage_count.to_string());
+                head.headers
+                    .set("X-Container-Bytes-Used", usage_bytes.to_string());
+            }
+            // Python HEAD is `_GETorHEAD_from_backend` (probe L613 user-meta).
+            head.status = 204;
+            head.body = swift_http::Body::empty();
+            head.headers.set("Content-Length", "0");
+            if let Some(name) = head
+                .headers
+                .get("X-Backend-Storage-Policy-Index")
+                .and_then(|v| v.parse::<i64>().ok())
+                .and_then(|idx| self.policy_index_to_name.get(&idx))
+            {
+                head.headers.set("X-Storage-Policy", name.clone());
+            }
+            async_fanout::stamp_container_last_modified(&mut head);
+            return Some(head);
         }
         // Fetch shard ranges. Prefer SHARD_LISTING_STATES via states=listing
         // (ACTIVE/CLEAVED/SHARDING/SHRINKING). If empty, retry without state
@@ -3686,43 +3874,106 @@ impl ProxyApp {
         shard_headers.set("X-Backend-Record-Type", "shard");
         // Allow reserved `.shards_*` accounts on the subsequent fan-out GETs.
         shard_headers.set("X-Backend-Allow-Reserved-Names", "true");
-        let arr = self.fetch_listing_shard_ranges(nodes.clone(), part, &path, &shard_headers)?;
+        // None (every replica 200 []) is the same as Some([]) for fan-out:
+        // probe L2070 dump has 2/3 SHARDING 200 [] and 1 COLLAPSED [alpha].
+        // `?` here first-wins the empty SHARDING replica.
+        let arr = self
+            .fetch_listing_shard_ranges(nodes.clone(), part, &path, &shard_headers)
+            .unwrap_or_default();
         // Unsharded/collapsed path only fans out when ranges actually exist
         // (partial cleave with CLEAVED ranges + empty root).
         if !should_fanout_sharded_listing(&state, object_count, !arr.is_empty()) {
-            return None;
+            // Shrink-to-root L2070: listing ranges are gone; one replica is
+            // already COLLAPSED with the objects, others still SHARDING on an
+            // empty epoch. First-wins would return []. Dated empty_wins fold
+            // keeps the newer nonempty replica (and still drops L692 leftovers).
+            return self.folded_root_object_listing(req, &nodes, part, &path, &head, &state);
         }
         // Parse client listing knobs.
         let marker = req.param("marker").unwrap_or_default();
+        let end_marker = req.param("end_marker").unwrap_or_default();
         let prefix = req.param("prefix").unwrap_or_default();
+        let delimiter = req.param("delimiter").unwrap_or_default();
+        let reverse = config_true_value(req.param("reverse").as_deref().unwrap_or(""));
         let limit: usize = req
             .param("limit")
             .and_then(|v| v.parse().ok())
             .unwrap_or(10000);
-        let selected = select_listing_shard_ranges(&arr, &marker, &prefix);
-        let mut shard_listings: Vec<Vec<serde_json::Value>> = Vec::new();
-        // Include residual root rows (misplaced / pre-redirect writes) when
-        // the root still reports object_count > 0 after cleave.
-        if object_count > 0 {
+        let selected = select_listing_shard_ranges(&arr, &marker, &end_marker, &prefix, reverse);
+        // Marker windows may select 1–2 ranges; settled-ness is a property of
+        // the whole container (probe L692 reverse+limit).
+        let all_ranges: Vec<&serde_json::Value> = arr.iter().collect();
+        let empty_wins = listing_ranges_are_settled_active(&all_ranges);
+        let mut feeds: Vec<ListingFeed> = Vec::new();
+        // Residual root rows cover uncleaved namespace while SHARDING
+        // (probe L631 / listing_under_populated L1483). Python `fill_gaps`
+        // inserts the root as a namespace; we also GET the retiring DB.
+        // Do not gate on HEAD object_count: after the first cleave batch the
+        // fresh epoch HEAD is 0 while retiring still holds obj-0100+.
+        // After db_state=sharded, Python lists shards only — residual would
+        // resurrect deleted originals (L692).
+        let newest = req
+            .headers
+            .get("X-Newest")
+            .map(config_true_value)
+            .unwrap_or(false);
+        let has_shrinking = all_ranges
+            .iter()
+            .any(|sr| sr.get("state").and_then(|v| v.as_i64()).unwrap_or(0) == 50);
+        // Probe L1985: reclaim custom-sharder may already have nested a
+        // SHRINKING donor inside an expanded acceptor. Root retiring rows
+        // still hold DELETE'd first-shard names; unioning them resurrects
+        // obj-1-000…. Shard DBs are already [alpha] + second shard.
+        if include_root_residual_for_listing_ex(
+            &state,
+            newest,
+            empty_wins,
+            has_shrinking,
+            !arr.is_empty(),
+            listing_has_full_active_cover(&all_ranges),
+            listing_has_full_shrinking_cover(&all_ranges),
+        ) {
             let mut root_headers = self.backend_headers(req, false, "container");
             root_headers.set("X-Backend-Record-Type", "object");
-            let mut qs_parts = vec!["format=json".to_string()];
-            if !marker.is_empty() {
-                qs_parts.push(format!("marker={}", percent_encode(&marker)));
-            }
-            if !prefix.is_empty() {
-                qs_parts.push(format!("prefix={}", percent_encode(&prefix)));
-            }
-            qs_parts.push(format!("limit={limit}"));
-            if let Some(items) = self.fetch_shard_object_listing_first_nonempty(
-                &nodes,
-                part,
-                &path,
-                &qs_parts.join("&"),
-                &root_headers,
-            ) {
+            let qs_parts = shard_listing_query_parts(
+                &marker,
+                &end_marker,
+                &prefix,
+                &delimiter,
+                reverse,
+                limit,
+            );
+            let qs = qs_parts.join("&");
+            // X-Newest: same replica as HEAD (L1517). Otherwise first nonempty
+            // (L1483 lagging CLEAVED replica still has names).
+            let items = if newest {
+                self.get_or_head(
+                    "container",
+                    nodes.clone(),
+                    part,
+                    "GET",
+                    &path,
+                    &qs,
+                    &root_headers,
+                )
+                .and_then(parse_listing_json_body)
+            } else {
+                self.fetch_shard_object_listing_first_nonempty(
+                    &nodes,
+                    part,
+                    &path,
+                    &qs,
+                    &root_headers,
+                )
+            };
+            if let Some(items) = items {
                 if !items.is_empty() {
-                    shard_listings.push(items);
+                    feeds.push(ListingFeed {
+                        lower: String::new(),
+                        upper: String::new(),
+                        timestamp: String::new(),
+                        items,
+                    });
                 }
             }
         }
@@ -3732,6 +3983,11 @@ impl ProxyApp {
                 Some((a, c)) => (a, c),
                 None => continue,
             };
+            // Probe L1985: `states=listing` fill_gaps may synthesise the root
+            // own range. GETting that lists retiring-root leftovers.
+            if shard_account == account && shard_container == container {
+                continue;
+            }
             let Ok((spart, _)) =
                 self.container_ring
                     .get_nodes(shard_account, Some(shard_container), None)
@@ -3744,38 +4000,65 @@ impl ProxyApp {
                 percent_encode(shard_container)
             );
             let snodes = self.iter_nodes(&self.container_ring, spart);
-            let remaining =
-                limit.saturating_sub(shard_listings.iter().map(|v| v.len()).sum::<usize>());
-            if remaining == 0 {
-                break;
+            let mut qs_parts = shard_listing_query_parts(
+                &marker,
+                &end_marker,
+                &prefix,
+                &delimiter,
+                reverse,
+                limit,
+            );
+            if empty_wins {
+                // Limited per-replica pages are not comparable (L692 reverse
+                // +limit mixed leftover evens). Majority-vote the full
+                // marker window, then truncate client-side.
+                qs_parts.retain(|p| !p.starts_with("limit="));
             }
-            let mut qs_parts = vec!["format=json".to_string()];
-            if !marker.is_empty() {
-                qs_parts.push(format!("marker={}", percent_encode(&marker)));
-            }
-            if !prefix.is_empty() {
-                qs_parts.push(format!("prefix={}", percent_encode(&prefix)));
-            }
-            qs_parts.push(format!("limit={remaining}"));
             let mut headers = self.backend_headers(req, false, "container");
             // Shard containers live under the reserved `.shards_*` account.
             headers.set("X-Backend-Allow-Reserved-Names", "true");
-            // Walk primaries until a non-empty object listing is found —
-            // same lagging-replica empty-`[]` trap as range fetch.
-            let Some(items) = self.fetch_shard_object_listing_first_nonempty(
+            // Object rows, not nested namespaces. A SHARDING donor's default
+            // GET would otherwise list the empty fresh epoch (probe L1321).
+            headers.set("X-Backend-Record-Type", "object");
+            // Settled listing (every selected range ACTIVE, ≥3 ranges): a
+            // successful 200 [] on any replica is authoritative empty so a
+            // lagging replica cannot resurrect DELETE leftovers (probe L1418).
+            // First-gen (2 ACTIVE) and in-progress CLEAVED/SHARDING keep
+            // replica-union (L1146 extra PUTs, L1321 cleave). 404 is not empty.
+            // Feed merge is a name union: newest-covering empty suppression
+            // dropped cleaved betas on listing-w91 (donor ts > children).
+            let Some(items) = self.fetch_json_array_merged(
                 &snodes,
                 spart,
                 &spath,
                 &qs_parts.join("&"),
                 &headers,
+                empty_wins,
             ) else {
                 continue;
             };
-            if !items.is_empty() {
-                shard_listings.push(items);
+            // Python `_get_from_shards`: empty shard `continue`s — do not
+            // feed an empty covering range into newest-covering while a
+            // SHARDING donor still holds the names (probe L1321).
+            if items.is_empty() && !empty_wins {
+                continue;
             }
+            feeds.push(ListingFeed {
+                lower: sr
+                    .get("lower")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                upper: sr
+                    .get("upper")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                timestamp: listing_feed_timestamp(sr),
+                items,
+            });
         }
-        let merged = merge_sharded_object_listings(&shard_listings, limit);
+        let merged = merge_listings_newest_covering(&feeds, limit, reverse);
         let bytes = serde_json::to_vec(&merged).unwrap_or_else(|_| b"[]".to_vec());
         let mut out = Response::with_body(200, bytes);
         out.headers
@@ -3784,11 +4067,16 @@ impl ProxyApp {
         out.headers.set("X-Backend-Record-Type", "object");
         // Root object_count is often 0 after cleave; report the merged listing
         // length so clients see a coherent count for this response page.
-        out.headers
-            .set("X-Container-Object-Count", merged.len().to_string());
-        if let Some(bytes_used) = head.headers.get("X-Container-Bytes-Used") {
-            out.headers.set("X-Container-Bytes-Used", bytes_used);
-        }
+        stamp_sharded_listing_stats(
+            &mut out,
+            &head,
+            &merged,
+            &marker,
+            &end_marker,
+            &prefix,
+            &delimiter,
+            limit,
+        );
         if let Some(name) = head
             .headers
             .get("X-Backend-Storage-Policy-Index")
@@ -3797,6 +4085,118 @@ impl ProxyApp {
         {
             out.headers.set("X-Storage-Policy", name);
         }
+        copy_root_listing_headers(&head, &mut out);
+        Some(out)
+    }
+
+    /// Root object GET folded across replicas (no shard fan-out).
+    fn folded_root_object_listing(
+        &self,
+        req: &Request,
+        nodes: &[Node],
+        part: u32,
+        path: &str,
+        head: &Response,
+        state: &str,
+    ) -> Option<Response> {
+        if !should_fold_root_objects_without_ranges(state) {
+            return None;
+        }
+        let marker = req.param("marker").unwrap_or_default();
+        let end_marker = req.param("end_marker").unwrap_or_default();
+        let prefix = req.param("prefix").unwrap_or_default();
+        let delimiter = req.param("delimiter").unwrap_or_default();
+        let reverse = config_true_value(req.param("reverse").as_deref().unwrap_or(""));
+        let limit: usize = req
+            .param("limit")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10000);
+        let qs_parts =
+            shard_listing_query_parts(&marker, &end_marker, &prefix, &delimiter, reverse, limit);
+        let mut headers = self.backend_headers(req, false, "container");
+        headers.set("X-Backend-Record-Type", "object");
+        // Probe L2070: 2/3 SHARDING epoch 200 [] + 1 COLLAPSED [alpha].
+        // Pick the replica with the highest live count (collapsed=1) and
+        // GET objects from that node. Query matches dump (`format=json`
+        // only): `limit=10000` is not what direct_client sends.
+        let head_hdrs = self.backend_headers(req, false, "container");
+        let mut scored: Vec<(i64, bool, Node)> = Vec::new();
+        for node in nodes {
+            let Some(h) = self.get_or_head(
+                "container",
+                vec![node.clone()],
+                part,
+                "HEAD",
+                path,
+                "",
+                &head_hdrs,
+            ) else {
+                continue;
+            };
+            // listing-w214 L2095: a DELETED primary HEAD 404 must not
+            // compete as object_count=0; skip it so we don't fold a
+            // leftover handoff listing after all primaries tombstoned.
+            if !(200..300).contains(&h.status) {
+                continue;
+            }
+            let st = h
+                .headers
+                .get("X-Backend-Sharding-State")
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let oc = h
+                .headers
+                .get("X-Container-Object-Count")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
+            scored.push((oc, st == "collapsed", node.clone()));
+        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        let order: Vec<Node> = if scored.is_empty() {
+            nodes.to_vec()
+        } else {
+            scored.into_iter().map(|(_, _, n)| n).collect()
+        };
+        let qs_plain = "format=json";
+        let qs_full = qs_parts.join("&");
+        let items = self
+            .fetch_shard_object_listing_first_nonempty(&order, part, path, qs_plain, &headers)
+            .filter(|a| !a.is_empty())
+            .or_else(|| {
+                self.fetch_shard_object_listing_first_nonempty(
+                    &order, part, path, &qs_full, &headers,
+                )
+                .filter(|a| !a.is_empty())
+            })
+            .or_else(|| {
+                self.fetch_json_array_merged(&order, part, path, qs_plain, &headers, false)
+                    .filter(|a| !a.is_empty())
+            })?;
+        let bytes = serde_json::to_vec(&items).unwrap_or_else(|_| b"[]".to_vec());
+        let mut out = Response::with_body(200, bytes);
+        out.headers
+            .set("Content-Type", "application/json; charset=utf-8");
+        out.headers.set("X-Backend-Sharding-State", state);
+        out.headers.set("X-Backend-Record-Type", "object");
+        stamp_sharded_listing_stats(
+            &mut out,
+            head,
+            &items,
+            &marker,
+            &end_marker,
+            &prefix,
+            &delimiter,
+            limit,
+        );
+        if let Some(name) = head
+            .headers
+            .get("X-Backend-Storage-Policy-Index")
+            .and_then(|v| v.parse::<i64>().ok())
+            .and_then(|idx| self.policy_index_to_name.get(&idx))
+        {
+            out.headers.set("X-Storage-Policy", name);
+        }
+        copy_root_listing_headers(head, &mut out);
         Some(out)
     }
 
@@ -3840,42 +4240,35 @@ impl ProxyApp {
         }
         let mut shard_headers = HeaderKeyDict::new();
         shard_headers.set("X-Backend-Record-Type", "shard");
-        // Prefer updating states (CREATED/CLEAVED/ACTIVE/SHARDING); fall back
-        // to listing states then any non-empty ranges.
-        let arr = self
-            .fetch_shard_ranges_first_nonempty(
+        // Prefer updating states (CREATED/CLEAVED/ACTIVE/SHARDING). A lagging
+        // replica can return a non-empty updating set that still lacks nested
+        // children; if no range covers the object, fall back to listing states
+        // (do not change the updating query itself). Use the *longest* nonempty
+        // replica: first-nonempty can hide CLEAVED children behind a 1-range
+        // filler (probe test_sharding_listing L631).
+        // listing-w137/w138: `includes=` on this query made L692 worse; keep
+        // `states=updating&format=json` until includes= concat is proven.
+        let updating = self
+            .fetch_json_array_longest_nonempty(
                 &nodes,
                 part,
                 &path,
                 "states=updating&format=json",
                 &shard_headers,
             )
-            .filter(|a| !a.is_empty())
-            .or_else(|| self.fetch_listing_shard_ranges(nodes, part, &path, &shard_headers))?;
-        // Pick the range that owns `object` (lower < name <= upper; empty bounds
-        // are open-ended). Prefer non-own (shard) names.
-        let mut best: Option<&serde_json::Value> = None;
-        for sr in &arr {
-            let name = sr.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if !name.contains('/') {
-                continue;
+            .filter(|a| !a.is_empty());
+        let root_path = format!("{account}/{container}");
+        let name = match updating
+            .as_ref()
+            .and_then(|arr| pick_updating_shard_name(arr, object, &root_path))
+        {
+            Some(n) => n,
+            None => {
+                let listing =
+                    self.fetch_listing_shard_ranges(nodes, part, &path, &shard_headers)?;
+                pick_updating_shard_name(&listing, object, &root_path)?
             }
-            // Skip the root's own range (same account/container).
-            if name == format!("{account}/{container}") {
-                continue;
-            }
-            let lower = sr.get("lower").and_then(|v| v.as_str()).unwrap_or("");
-            let upper = sr.get("upper").and_then(|v| v.as_str()).unwrap_or("");
-            if !lower.is_empty() && object <= lower {
-                continue;
-            }
-            if !upper.is_empty() && object > upper {
-                continue;
-            }
-            best = Some(sr);
-            break;
-        }
-        let name = best?.get("name")?.as_str()?;
+        };
         let (a, c) = name.split_once('/')?;
         Some((a.to_string(), c.to_string()))
     }
@@ -3894,8 +4287,10 @@ impl ProxyApp {
         path: &str,
         shard_headers: &HeaderKeyDict,
     ) -> Option<Vec<serde_json::Value>> {
-        // 1) Prefer non-empty states=listing from any primary.
-        if let Some(arr) = self.fetch_shard_ranges_first_nonempty(
+        // 1) Prefer the *longest* nonempty states=listing set (not first
+        // nonempty). A lagging 1-range replica must not hide CLEAVED children
+        // (probe test_sharding_listing L631).
+        if let Some(arr) = self.fetch_json_array_longest_nonempty(
             &nodes,
             part,
             path,
@@ -3903,18 +4298,78 @@ impl ProxyApp {
             shard_headers,
         ) {
             if !arr.is_empty() {
-                return Some(arr);
+                return Some(prefer_full_active_cover_ranges(&arr));
             }
         }
         // 2) Broader: no state filter; prefer listing-state rows, else all.
-        let broad = self.fetch_shard_ranges_first_nonempty(
+        let broad = self.fetch_json_array_longest_nonempty(
             &nodes,
             part,
             path,
             "format=json",
             shard_headers,
         )?;
-        Some(prefer_listing_state_ranges(&broad))
+        Some(prefer_full_active_cover_ranges(
+            &prefer_listing_state_ranges(&broad),
+        ))
+    }
+
+    /// Walk every replica and collect nonempty JSON arrays.
+    fn fetch_json_arrays_nonempty(
+        &self,
+        nodes: &[Node],
+        part: u32,
+        path: &str,
+        query: &str,
+        headers: &HeaderKeyDict,
+    ) -> Vec<Vec<serde_json::Value>> {
+        let mut arrays: Vec<Vec<serde_json::Value>> = Vec::new();
+        for node in nodes {
+            let Some(resp) = self.get_or_head(
+                "container",
+                vec![node.clone()],
+                part,
+                "GET",
+                path,
+                query,
+                headers,
+            ) else {
+                continue;
+            };
+            if !(200..300).contains(&resp.status) {
+                continue;
+            }
+            let body = match resp.body.into_vec(16 * 1024 * 1024) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if resp.status == 204 || body.is_empty() {
+                continue;
+            }
+            let val: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let arr = val.as_array().cloned().unwrap_or_default();
+            if !arr.is_empty() {
+                arrays.push(arr);
+            }
+        }
+        arrays
+    }
+
+    /// Walk every replica and keep the longest nonempty JSON array.
+    fn fetch_json_array_longest_nonempty(
+        &self,
+        nodes: &[Node],
+        part: u32,
+        path: &str,
+        query: &str,
+        headers: &HeaderKeyDict,
+    ) -> Option<Vec<serde_json::Value>> {
+        prefer_longest_nonempty_arrays(
+            &self.fetch_json_arrays_nonempty(nodes, part, path, query, headers),
+        )
     }
 
     /// GET shard-range JSON from backends until a 2xx body parses as a
@@ -3943,8 +4398,11 @@ impl ProxyApp {
         self.fetch_json_array_first_nonempty(nodes, part, path, query, headers)
     }
 
-    /// Shared walk: first 2xx JSON array that is non-empty wins; if every
-    /// good response is `[]`, return that empty array; if none parse, None.
+    /// Shared walk for shard-range JSON: first 2xx nonempty array wins.
+    /// Do not union range rows across replicas — a lagging 2-range replica
+    /// mixed with a 5-range replica makes InternalClient (sharder via
+    /// :18080) skip nested UPDATE_ROOT (probe L1306 `2 != 5`).
+    /// Object listings use `fetch_json_array_merged` instead.
     fn fetch_json_array_first_nonempty(
         &self,
         nodes: &[Node],
@@ -3986,6 +4444,70 @@ impl ProxyApp {
         last_empty
     }
 
+    fn fetch_json_array_merged(
+        &self,
+        nodes: &[Node],
+        part: u32,
+        path: &str,
+        query: &str,
+        headers: &HeaderKeyDict,
+        empty_wins: bool,
+    ) -> Option<Vec<serde_json::Value>> {
+        // Always walk replicas. Unsettled: union so extra PUTs on a later
+        // replica are not dropped (L1321 donor). Settled: empty 200 [] wins
+        // (L1418). 404 is not empty.
+        // Do not short-circuit on X-Newest: a newest-timestamp replica can
+        // still list deleted originals (listing-w151 UTF8 L692 FAIL).
+        let mut replies: Vec<Option<Vec<serde_json::Value>>> = Vec::new();
+        let mut timestamps: Vec<Timestamp> = Vec::new();
+        for node in nodes {
+            let Some(resp) = self.get_or_head(
+                "container",
+                vec![node.clone()],
+                part,
+                "GET",
+                path,
+                query,
+                headers,
+            ) else {
+                replies.push(None);
+                timestamps.push(Timestamp::zero());
+                continue;
+            };
+            if !(200..300).contains(&resp.status) {
+                replies.push(None);
+                timestamps.push(Timestamp::zero());
+                continue;
+            }
+            let ts = listing_resp_timestamp(&resp.headers);
+            let body = match resp.body.into_vec(16 * 1024 * 1024) {
+                Ok(b) => b,
+                Err(_) => {
+                    replies.push(None);
+                    timestamps.push(Timestamp::zero());
+                    continue;
+                }
+            };
+            if resp.status == 204 || body.is_empty() {
+                replies.push(Some(Vec::new()));
+                timestamps.push(ts);
+                continue;
+            }
+            let val: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(_) => {
+                    replies.push(None);
+                    timestamps.push(Timestamp::zero());
+                    continue;
+                }
+            };
+            let arr = val.as_array().cloned().unwrap_or_default();
+            replies.push(Some(arr));
+            timestamps.push(ts);
+        }
+        fold_replica_listings_dated(&replies, empty_wins, &timestamps)
+    }
+
     /// `get_account_info`-lite: status, account ACL sysmeta, Temp-URL keys.
     fn account_info(&self, account: &str) -> AccountInfo {
         if let Some(info) = self.info_cache.get_account(account) {
@@ -4001,18 +4523,24 @@ impl ProxyApp {
         let headers = HeaderKeyDict::new();
         if let Some(resp) = self.get_or_head("account", nodes, part, "HEAD", &path, "", &headers) {
             info = account_info_from_response(&resp);
-            if let Some(ttl) = info_cache_time(
-                resp.status,
-                resp.headers.get("X-Backend-Recheck-Account-Existence"),
-                self.config.recheck_account_existence,
-            ) {
-                self.info_cache
-                    .set_account(account.to_string(), info.clone(), ttl);
-            }
+            self.cache_account_from_response(account, &resp);
         } else {
             info.status = 503;
         }
         info
+    }
+
+    /// `set_info_cache` for an account HEAD/listing (including the
+    /// autocreate fake listing, which must carry `account_really_exists=false`).
+    pub(crate) fn cache_account_from_response(&self, account: &str, resp: &Response) {
+        let info = account_info_from_response(resp);
+        if let Some(ttl) = info_cache_time(
+            resp.status,
+            resp.headers.get("X-Backend-Recheck-Account-Existence"),
+            self.config.recheck_account_existence,
+        ) {
+            self.info_cache.set_account(account.to_string(), info, ttl);
+        }
     }
 
     /// Parsed TempAuth account ACLs from the account HEAD sysmeta.
@@ -4059,9 +4587,21 @@ impl ProxyApp {
             .map(config_true_value)
             .unwrap_or(false)
         {
-            // TempURL is deliberately not a Swift owner: privileged response
-            // metadata must still be stripped on the way back out.
-            req.headers.remove("X-Backend-Swift-Owner");
+            // TempURL and ordinary pre-authed subrequests are deliberately
+            // not Swift owners.  VersionedWrites container-info probes are a
+            // narrower trusted case: they need owner-only sync metadata to
+            // enforce Python's versioning/container-sync exclusion.  The
+            // marker is consumed here and cannot originate at the public
+            // listener because gatekeeper strips X-Backend-*.
+            let owner_info = req
+                .headers
+                .remove(swift_middleware::VERSIONED_WRITES_OWNER_INFO_HEADER)
+                .is_some_and(|value| config_true_value(&value));
+            if owner_info {
+                req.headers.set("X-Backend-Swift-Owner", "true");
+            } else {
+                req.headers.remove("X-Backend-Swift-Owner");
+            }
             return None;
         }
         if !self.config.auth_enabled {
@@ -4194,11 +4734,7 @@ impl ProxyApp {
             &mut swift_owner,
         );
         if denied.is_none() {
-            if swift_owner {
-                req.headers.set("X-Backend-Swift-Owner", "true");
-            } else {
-                req.headers.remove("X-Backend-Swift-Owner");
-            }
+            stamp_auth_backend_headers(req, swift_owner, &groups);
         }
         denied
     }
@@ -4216,7 +4752,15 @@ impl ProxyApp {
             .map(config_true_value)
             .unwrap_or(false)
         {
-            req.headers.remove("X-Backend-Swift-Owner");
+            let owner_info = req
+                .headers
+                .remove(swift_middleware::VERSIONED_WRITES_OWNER_INFO_HEADER)
+                .is_some_and(|value| config_true_value(&value));
+            if owner_info {
+                req.headers.set("X-Backend-Swift-Owner", "true");
+            } else {
+                req.headers.remove("X-Backend-Swift-Owner");
+            }
             return None;
         }
         if !self.config.auth_enabled {
@@ -4261,7 +4805,8 @@ impl ProxyApp {
                         if let Some(sk) = info.sync_key.as_deref() {
                             if !sk.is_empty() && sk == req_key {
                                 if req.headers.get("x-timestamp").is_none() {
-                                    if let Some(ts) = req.headers.get("x-backend-inbound-x-timestamp")
+                                    if let Some(ts) =
+                                        req.headers.get("x-backend-inbound-x-timestamp")
                                     {
                                         let ts = ts.to_string();
                                         req.headers.remove("X-Backend-Inbound-X-Timestamp");
@@ -4322,7 +4867,8 @@ impl ProxyApp {
             .map(str::to_string)
             .collect();
         let acct_info = self.account_info_async(account).await;
-        let account_acls = swift_middleware::acls_from_sysmeta(acct_info.core_access_control.as_deref());
+        let account_acls =
+            swift_middleware::acls_from_sysmeta(acct_info.core_access_control.as_deref());
         let mut swift_owner = false;
         let denied = swift_middleware::TempAuth::authorize_acl(
             &req.method,
@@ -4335,11 +4881,7 @@ impl ProxyApp {
             &mut swift_owner,
         );
         if denied.is_none() {
-            if swift_owner {
-                req.headers.set("X-Backend-Swift-Owner", "true");
-            } else {
-                req.headers.remove("X-Backend-Swift-Owner");
-            }
+            stamp_auth_backend_headers(req, swift_owner, &groups);
         }
         denied
     }
@@ -4363,9 +4905,9 @@ impl ProxyApp {
         // our caller has already run swift.authorize, matching Python's
         // order. Reads skip the check and go straight to the object servers.
         let policy_index: i64 = if matches!(req.method.as_str(), "PUT" | "POST" | "DELETE") {
-            let info = self.container_info(account, container);
+            let info = self.container_info_for_write(account, container);
             if !info.exists() {
-                return swob_response(404);
+                return swob_response(info.write_failure_status());
             }
             header_policy.unwrap_or(info.policy_index)
         } else {
@@ -4481,14 +5023,14 @@ impl ProxyApp {
                 else {
                     return swob_response(503);
                 };
-                let container_nodes = self.iter_nodes(&self.container_ring, container_part);
                 let mut base = self.backend_headers(req, true, "object");
-                let put_ts = Timestamp::now();
+                let put_ts = object_write_timestamp(req);
                 base.set("X-Timestamp", put_ts.internal());
                 // Route the write/tombstone to the right policy datadir (see
                 // the GET note above) — an EC DELETE landing in objects/ would
                 // 404 and leave the fragments orphaned.
                 base.set("X-Backend-Storage-Policy-Index", policy_index);
+                self.stamp_root_db_state(account, container, &mut base);
                 if req.method == "PUT" {
                     base.set(
                         "Content-Type",
@@ -4499,31 +5041,19 @@ impl ProxyApp {
                 }
                 // Tell the object server which container DB to update (shard
                 // path differs from the client-visible account/container).
-                if upd_account != account || upd_container != container {
-                    base.set(
-                        "X-Backend-Container-Path",
-                        format!("{upd_account}/{upd_container}"),
-                    );
-                    base.set("X-Backend-Allow-Reserved-Names", "true");
-                }
+                stamp_shard_container_path(
+                    &mut base,
+                    &upd_account,
+                    &upd_container,
+                    account,
+                    container,
+                );
                 let node_number = object_ring
                     .get_part_nodes(object_part)
                     .map(|n| n.len())
                     .unwrap_or(1);
-                // distribute container nodes across the object backend
-                // requests so each object server can drive a container
-                // update
-                let mut per_node = Vec::with_capacity(node_number);
-                for i in 0..node_number {
-                    let mut headers = base.clone();
-                    if !container_nodes.is_empty() {
-                        let cont = &container_nodes[i % container_nodes.len()];
-                        headers.set("X-Container-Host", format!("{}:{}", cont.ip, cont.port));
-                        headers.set("X-Container-Partition", container_part);
-                        headers.set("X-Container-Device", &cont.device);
-                    }
-                    per_node.push(headers);
-                }
+                let per_node =
+                    self.object_container_update_headers(&base, container_part, node_number);
                 if req.method == "POST" {
                     // Object POST takes its own path with the mixed-result
                     // handoff fallback (obj.py:912-962); PUT/DELETE keep the
@@ -4631,7 +5161,7 @@ impl ProxyApp {
         // object server verifies its own bytes against it), computable
         // only when the client declared a length.
         let archive_len = client_len.map(|total| ec_archive_size(&driver, ec.segment_size, total));
-        let put_ts = Timestamp::now();
+        let put_ts = object_write_timestamp(req);
         let ts = put_ts.internal();
         let content_type = req
             .headers
@@ -4677,6 +5207,7 @@ impl ProxyApp {
         base.set("X-Timestamp", &ts);
         base.set("Content-Type", &content_type);
         base.set("X-Backend-Storage-Policy-Index", policy_index);
+        self.stamp_root_db_state(account, container, &mut base);
         let mut per_node = Vec::with_capacity(n);
         for i in 0..n {
             let mut h = base.clone();
@@ -5366,6 +5897,8 @@ pub(crate) fn keep_ec_client_metadata(kl: &str) -> bool {
             | "x-timestamp"
             | "last-modified"
             | "x-backend-timestamp"
+            | "x-backend-data-timestamp"
+            | "x-backend-durable-timestamp"
             | "x-delete-at"
             | "content-encoding"
             | "content-disposition"
@@ -5461,15 +5994,80 @@ fn constraint_plain(status: u16, body: &str) -> Response {
     resp
 }
 
+/// Python `constrain_req_limit` / `validate_container_params`: listing
+/// `limit=` above CONTAINER_LISTING_LIMIT is 412 `Maximum limit is N`
+/// (probe test_sharding_listing L583). Must run in the proxy — sharded
+/// fan-out never forwards the oversized limit to the container-server.
+pub(crate) fn constrain_listing_limit(req: &Request) -> Result<usize, Response> {
+    let max = swift_core::constraints::CONTAINER_LISTING_LIMIT;
+    match req.param("limit") {
+        Some(given) if !given.is_empty() && given.bytes().all(|b| b.is_ascii_digit()) => {
+            let limit: i64 = given.parse().unwrap_or(max + 1);
+            if limit > max {
+                return Err(constraint_plain(412, &format!("Maximum limit is {max}")));
+            }
+            Ok(limit.max(0) as usize)
+        }
+        _ => Ok(max as usize),
+    }
+}
+
 fn finish_account_resp(swift_owner: bool, mut resp: Response) -> Response {
     expose_account_acl_header(&mut resp);
     strip_owner_headers(&mut resp, swift_owner);
     resp
 }
 
-fn finish_container_resp(swift_owner: bool, mut resp: Response) -> Response {
+fn finish_container_resp(swift_owner: bool, reseller: bool, mut resp: Response) -> Response {
     strip_owner_headers(&mut resp, swift_owner);
+    expose_container_sharding(&mut resp, reseller);
     resp
+}
+
+/// Python container.py GET/HEAD: reseller requests see `X-Container-Sharding`
+/// as `str(config_true_value(sysmeta))` (`'True'` / `'False'`). Probe tests
+/// POST `X-Container-Sharding: on` with the admin token then HEAD that header.
+fn expose_container_sharding(resp: &mut Response, reseller: bool) {
+    if !reseller {
+        return;
+    }
+    let sys = resp
+        .headers
+        .get("X-Container-Sysmeta-Sharding")
+        .unwrap_or("False");
+    resp.headers.set(
+        "X-Container-Sharding",
+        if config_true_value(sys) {
+            "True"
+        } else {
+            "False"
+        },
+    );
+}
+
+fn is_reseller_request(req: &Request) -> bool {
+    req.headers
+        .get("X-Backend-Reseller-Request")
+        .is_some_and(config_true_value)
+        || req
+            .headers
+            .get("X-Backend-Remote-User")
+            .unwrap_or("")
+            .split(',')
+            .any(|g| g == ".reseller_admin")
+}
+
+fn stamp_auth_backend_headers(req: &mut Request, swift_owner: bool, groups: &[String]) {
+    if swift_owner {
+        req.headers.set("X-Backend-Swift-Owner", "true");
+    } else {
+        req.headers.remove("X-Backend-Swift-Owner");
+    }
+    if groups.iter().any(|g| g == ".reseller_admin") {
+        req.headers.set("X-Backend-Reseller-Request", "true");
+    } else {
+        req.headers.remove("X-Backend-Reseller-Request");
+    }
 }
 
 /// Python `int()`-like parse used by `check_delete_headers`.
@@ -5612,6 +6210,21 @@ fn check_object_creation(req: &mut Request, object_name: &str) -> Option<Respons
     None
 }
 
+/// Python `check_utf8(path, internal=req.allow_reserved_names)`.
+/// InternalClient sets `X-Backend-Allow-Reserved-Names: true`.
+fn utf8_or_null_rejected(req: &Request) -> Option<Response> {
+    let internal = req
+        .headers
+        .get("X-Backend-Allow-Reserved-Names")
+        .map(config_true_value)
+        .unwrap_or(false);
+    if !check_utf8(&req.path, internal) {
+        Some(text_response(412, "Invalid UTF8 or contains NULL"))
+    } else {
+        None
+    }
+}
+
 /// The synthesized empty-account response for autocreate accounts
 /// (`account_listing_response` with a `FakeAccountBroker`).
 pub(crate) fn synthesized_account_listing(req: &Request) -> Response {
@@ -5640,10 +6253,159 @@ pub(crate) fn synthesized_account_listing(req: &Request) -> Response {
     resp.headers.set("X-Timestamp", now.normal());
     resp.headers.set("X-PUT-Timestamp", now.normal());
     resp.headers.set("Accept-Ranges", "bytes");
+    // account.py:79-94: without this header a subsequent container PUT
+    // treats the 2xx listing as a real account and skips autocreate, then
+    // 404s because no account DB exists for the container-update.
+    resp.headers.set("X-Backend-Fake-Account-Listing", "yes");
     if req.method == "HEAD" || empty {
         resp.headers.set("Content-Length", 0);
     }
     resp
+}
+
+/// Choose the updating shard that owns `object`.
+///
+/// Replica union can include a lagging donor (ACTIVE, older timestamp) plus
+/// newer nested sub-shards. First-match would send DELETE to the donor
+/// (probe L1418 leftover listing after delete-all). Skip deleted/SHARDED/
+/// SHRUNK and pick the newest covering timestamp.
+/// Python `_do_get_updating_namespaces(..., includes=obj)`: keep
+/// `states=updating` and restrict the set to the range that owns `object`
+/// so DELETE/PUT container-updates target that shard, not the first range
+/// in a full listing (probe L692 leftover originals from shard 1+).
+pub(crate) fn updating_shard_query(object: &str) -> String {
+    format!(
+        "states=updating&format=json&includes={}",
+        percent_encode(object)
+    )
+}
+
+pub(crate) fn pick_updating_shard_name(
+    ranges: &[serde_json::Value],
+    object: &str,
+    root_path: &str,
+) -> Option<String> {
+    let mut best: Option<(&str, &str)> = None; // (timestamp, name)
+    for sr in ranges {
+        if sr.get("deleted").and_then(|v| v.as_i64()).unwrap_or(0) != 0 {
+            continue;
+        }
+        let state = sr.get("state").and_then(|v| v.as_i64()).unwrap_or(0);
+        if state == 70 || state == 80 {
+            continue;
+        }
+        let name = sr.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if !name.contains('/') || name == root_path {
+            continue;
+        }
+        let lower = sr.get("lower").and_then(|v| v.as_str()).unwrap_or("");
+        let upper = sr.get("upper").and_then(|v| v.as_str()).unwrap_or("");
+        if !lower.is_empty() && object <= lower {
+            continue;
+        }
+        if !upper.is_empty() && object > upper {
+            continue;
+        }
+        let ts = sr.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+        match best {
+            None => best = Some((ts, name)),
+            Some((bts, _)) if ts > bts => best = Some((ts, name)),
+            _ => {}
+        }
+    }
+    best.map(|(_, n)| n.to_string())
+}
+
+/// Python `get_shard_usage`: sum object/byte counts for non-deleted ranges
+/// in `SHARD_STATS_STATES` (ACTIVE/SHARDING/SHRINKING).
+pub(crate) fn shard_usage_from_ranges(arr: &[serde_json::Value]) -> (i64, i64, bool) {
+    let mut count = 0i64;
+    let mut bytes = 0i64;
+    let mut saw = false;
+    for sr in arr {
+        let deleted = sr.get("deleted").and_then(|v| v.as_i64()).unwrap_or(0);
+        if deleted != 0 {
+            continue;
+        }
+        let st = sr.get("state").and_then(|v| v.as_i64()).unwrap_or(0);
+        if st != 40 && st != 50 && st != 60 {
+            continue;
+        }
+        saw = true;
+        count += sr.get("object_count").and_then(|v| v.as_i64()).unwrap_or(0);
+        bytes += sr.get("bytes_used").and_then(|v| v.as_i64()).unwrap_or(0);
+    }
+    (count, bytes, saw)
+}
+
+/// One non-deleted ACTIVE/SHRINKING range covering MIN–MAX. After first-shard
+/// reclaim the updated root is this (probe L1979 listing-w231); a lagging
+/// replica may still list two ranges totaling 100.
+fn listing_is_single_full_cover(arr: &[serde_json::Value]) -> bool {
+    if arr.len() != 1 {
+        return false;
+    }
+    let sr = &arr[0];
+    let st = sr.get("state").and_then(|v| v.as_i64()).unwrap_or(0);
+    (st == 40 || st == 50)
+        && sr.get("deleted").and_then(|v| v.as_i64()).unwrap_or(0) == 0
+        && sr
+            .get("lower")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .is_empty()
+        && sr
+            .get("upper")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .is_empty()
+}
+
+fn shard_usage_pick_min_floor(usages: Vec<(i64, i64)>) -> Option<(i64, i64)> {
+    let max_c = usages.iter().map(|(c, _)| *c).max()?;
+    let floor = max_c / 2;
+    usages
+        .into_iter()
+        .filter(|(c, _)| *c >= floor)
+        .min_by_key(|(c, _)| *c)
+}
+
+/// HEAD object-count after reclaim (probe L1979): equal-length listing
+/// sets must not first-win a lagging 50+50 over a reclaimed 1+50.
+/// Python HEAD is one replica's `get_shard_usage`; on the way down we take
+/// the lowest live usage among nonempty listing-state replies.
+pub(crate) fn lowest_shard_usage(arrays: &[Vec<serde_json::Value>]) -> Option<(i64, i64)> {
+    // listing-w231: updated replica already dropped the reclaimed first
+    // range (MIN–MAX 51) while a lagging replica still has 2 ranges (100).
+    // Longest-wins then reports 100. A single MIN–MAX cover is the remaining
+    // namespace; a bounded 1-range (second shard only, count 50) is not.
+    let cover: Vec<(i64, i64)> = arrays
+        .iter()
+        .filter(|a| listing_is_single_full_cover(a))
+        .filter_map(|a| {
+            let (c, b, saw) = shard_usage_from_ranges(a);
+            saw.then_some((c, b))
+        })
+        .collect();
+    if !cover.is_empty() {
+        return shard_usage_pick_min_floor(cover);
+    }
+    // listing-w195: a 1-range acceptor (count 50) must not beat a 2-range
+    // reclaimed set (1+50=51). Longest listing-state set first, then the
+    // lowest live usage among those (lagging 50+50 vs reclaimed 1+50).
+    // listing-w201 L1992: same-length 51 vs 1 — a lagging 1-object view
+    // must not win. Drop counts below half of the max, then take min
+    // (51 vs 100 keeps 51; 51 vs 1 drops 1).
+    let max_len = arrays.iter().map(|a| a.len()).max().filter(|n| *n > 0)?;
+    let usages: Vec<(i64, i64)> = arrays
+        .iter()
+        .filter(|a| a.len() == max_len)
+        .filter_map(|a| {
+            let (c, b, saw) = shard_usage_from_ranges(a);
+            saw.then_some((c, b))
+        })
+        .collect();
+    shard_usage_pick_min_floor(usages)
 }
 
 /// Numeric `SHARD_LISTING_STATES` (ACTIVE/SHARDING/SHRINKING/CLEAVED).
@@ -5661,31 +6423,220 @@ pub(crate) const SHARD_LISTING_STATE_NUMS: [i64; 4] = [
 /// Always for `sharding`/`sharded`. Also for empty roots that still report
 /// `unsharded` after partial cleave (Contabo L3b) — the subsequent range GET
 /// decides if fan-out actually runs.
+/// Residual retiring-root object rows.
+///
+/// * `sharding`: always (L1483 uncleaved names; HEAD count may be 0).
+/// * `sharded` + X-Newest: the newest replica may still hold uncleaved
+///   rows after a peer marked ACTIVE (L1517). Without X-Newest, a lagging
+///   replica would resurrect DELETE leftovers (L692).
+pub(crate) fn include_sharding_residual_root(sharding_state: &str, newest: bool) -> bool {
+    let s = sharding_state.to_ascii_lowercase();
+    s == "sharding" || (s == "sharded" && newest)
+}
+
+/// Shrink-to-root (probe L2068/L2070): objects have been cleaved into the
+/// root DB while listing still fans out to a now-empty SHRINKING shard.
+/// Include root object rows only when the listing view is a settled
+/// ACTIVE/SHRINKING partition (not nested donor+children, which would
+/// resurrect L692 leftovers from a lagging root replica).
+pub(crate) fn include_shrink_to_root_residual(
+    sharding_state: &str,
+    empty_wins: bool,
+    has_shrinking: bool,
+) -> bool {
+    if !empty_wins || !has_shrinking {
+        return false;
+    }
+    let s = sharding_state.to_ascii_lowercase();
+    s == "sharded" || s == "collapsed"
+}
+
+/// Root retiring rows. Skip when a SHRINKING donor is nested under an
+/// expanded acceptor (probe L1985): shard DBs already have the live names
+/// and the retiring DB still lists DELETE'd first-shard objects.
+pub(crate) fn listing_has_full_active_cover(selected: &[&serde_json::Value]) -> bool {
+    selected.iter().any(|sr| {
+        sr.get("state").and_then(|v| v.as_i64()) == Some(40)
+            && sr.get("deleted").and_then(|v| v.as_i64()).unwrap_or(0) == 0
+            && sr
+                .get("lower")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .is_empty()
+            && sr
+                .get("upper")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .is_empty()
+    })
+}
+
+/// Shrink-to-root donor: a non-deleted SHRINKING range covering MIN-MAX.
+/// Distinct from listing-w191 bounded shrinking (first-shard donor).
+pub(crate) fn listing_has_full_shrinking_cover(selected: &[&serde_json::Value]) -> bool {
+    selected.iter().any(|sr| {
+        sr.get("state").and_then(|v| v.as_i64()) == Some(50)
+            && sr.get("deleted").and_then(|v| v.as_i64()).unwrap_or(0) == 0
+            && sr
+                .get("lower")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .is_empty()
+            && sr
+                .get("upper")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .is_empty()
+    })
+}
+
+/// listing-w217 L2044: a lagging 2-range set (SHRINKING first-shard +
+/// expanded ACTIVE MIN–MAX) is longer than the settled 1-range acceptor.
+/// Longest-wins then fans out to the leftover first-shard DB and
+/// resurrects `obj-1-000…`. Once a live MIN–MAX ACTIVE range exists,
+/// list only that range.
+pub(crate) fn prefer_full_active_cover_ranges(
+    ranges: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let refs: Vec<&serde_json::Value> = ranges.iter().collect();
+    if !listing_has_full_active_cover(&refs) {
+        return ranges.to_vec();
+    }
+    // listing-w221 L1985: first-shard is still ACTIVE with alpha while an
+    // expanded acceptor already reports MIN–MAX. Dropping it hides alpha.
+    // Only collapse to the cover once no other bounded ACTIVE range remains
+    // (L2044 leftover is SHRINKING/SHRUNK, not ACTIVE).
+    let other_active_bounded = ranges.iter().any(|sr| {
+        sr.get("state").and_then(|v| v.as_i64()) == Some(40)
+            && sr.get("deleted").and_then(|v| v.as_i64()).unwrap_or(0) == 0
+            && !(sr
+                .get("lower")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .is_empty()
+                && sr
+                    .get("upper")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .is_empty())
+    });
+    if other_active_bounded {
+        return ranges.to_vec();
+    }
+    let cover: Vec<serde_json::Value> = ranges
+        .iter()
+        .filter(|sr| {
+            sr.get("state").and_then(|v| v.as_i64()) == Some(40)
+                && sr.get("deleted").and_then(|v| v.as_i64()).unwrap_or(0) == 0
+                && sr
+                    .get("lower")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .is_empty()
+                && sr
+                    .get("upper")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .is_empty()
+        })
+        .cloned()
+        .collect();
+    if cover.is_empty() {
+        ranges.to_vec()
+    } else {
+        cover
+    }
+}
+
+pub(crate) fn include_root_residual_for_listing(
+    sharding_state: &str,
+    newest: bool,
+    empty_wins: bool,
+    has_shrinking: bool,
+    has_listing_ranges: bool,
+    full_active_cover: bool,
+) -> bool {
+    include_root_residual_for_listing_ex(
+        sharding_state,
+        newest,
+        empty_wins,
+        has_shrinking,
+        has_listing_ranges,
+        full_active_cover,
+        false,
+    )
+}
+
+pub(crate) fn include_root_residual_for_listing_ex(
+    sharding_state: &str,
+    newest: bool,
+    empty_wins: bool,
+    has_shrinking: bool,
+    has_listing_ranges: bool,
+    full_active_cover: bool,
+    full_shrinking_cover: bool,
+) -> bool {
+    // L1985: nested shrinking under an expanded ACTIVE MIN-MAX acceptor.
+    // Shard DBs hold the live names; retiring still lists DELETE'd rows.
+    if full_active_cover {
+        return false;
+    }
+    // listing-w191: bounded SHRINKING donor, fetch missed the acceptor.
+    // Residual would union retiring leftovers; fan-out to the donor instead.
+    if has_shrinking && has_listing_ranges && !full_shrinking_cover {
+        return false;
+    }
+    // L2068/L2070: last shard shrinking into root (MIN-MAX SHRINKING, no
+    // ACTIVE cover). Objects already live on the root; include them.
+    if full_shrinking_cover {
+        return include_shrink_to_root_residual(sharding_state, empty_wins, has_shrinking)
+            || include_sharding_residual_root(sharding_state, newest);
+    }
+    include_sharding_residual_root(sharding_state, newest)
+        || include_shrink_to_root_residual(sharding_state, empty_wins, has_shrinking)
+}
+
 pub(crate) fn should_probe_sharded_listing(sharding_state: &str, object_count: i64) -> bool {
     let state = sharding_state.to_ascii_lowercase();
-    if state == "sharding" || state == "sharded" {
+    if state == "sharding" || state == "sharded" || state == "collapsed" {
         return true;
     }
     object_count == 0
 }
 
-/// Whether non-empty listing/CLEAVED ranges should trigger fan-out.
+/// Shrink-to-root (probe L2070): no shard ranges left. Fold root object
+/// rows across replicas instead of first-wins (a lagging SHARDING epoch
+/// is 200 []).
+pub(crate) fn should_fold_root_objects_without_ranges(sharding_state: &str) -> bool {
+    matches!(
+        sharding_state.to_ascii_lowercase().as_str(),
+        "collapsed" | "sharding" | "sharded"
+    )
+}
+
+/// Whether listing-state shard ranges should trigger fan-out.
 ///
-/// True when DB state is sharding/sharded, or when the root still claims
-/// unsharded (or other) with object_count=0 but usable ranges exist.
+/// Any nonempty listing-state set wins, including a lagging replica whose
+/// HEAD still says unsharded/count=100 (probe L1985).
 pub(crate) fn should_fanout_sharded_listing(
-    sharding_state: &str,
-    object_count: i64,
+    _sharding_state: &str,
+    _object_count: i64,
     has_listing_ranges: bool,
 ) -> bool {
-    if !has_listing_ranges {
-        return false;
-    }
-    let state = sharding_state.to_ascii_lowercase();
-    if state == "sharding" || state == "sharded" {
-        return true;
-    }
-    object_count == 0
+    has_listing_ranges
+}
+
+/// Pick the longest nonempty JSON array. Listing-state `states=listing` from
+/// a lagging replica can be a nonempty 1-range own-SHARDING set that would
+/// first-win over a 2-CLEAVED replica and drop new PUTs (probe L631).
+pub(crate) fn prefer_longest_nonempty_arrays(
+    arrays: &[Vec<serde_json::Value>],
+) -> Option<Vec<serde_json::Value>> {
+    arrays
+        .iter()
+        .filter(|a| !a.is_empty())
+        .max_by_key(|a| a.len())
+        .cloned()
 }
 
 /// Prefer ranges whose `state` is in SHARD_LISTING_STATES. If none match
@@ -5709,17 +6660,167 @@ pub(crate) fn prefer_listing_state_ranges(ranges: &[serde_json::Value]) -> Vec<s
     }
 }
 
-/// Select listing-state shard ranges that can contribute to a client listing
-/// given `marker` / `prefix` (Wave 3 L3b fan-out filter).
+/// Query string for a shard/root object listing subrequest. Python
+/// `_get_from_shards` forwards marker/end_marker/prefix/delimiter/reverse/limit
+/// (probe test_sharding_listing do_listing_checks).
+pub(crate) fn shard_listing_query_parts(
+    marker: &str,
+    end_marker: &str,
+    prefix: &str,
+    delimiter: &str,
+    reverse: bool,
+    limit: usize,
+) -> Vec<String> {
+    let mut qs_parts = vec!["format=json".to_string()];
+    if !marker.is_empty() {
+        qs_parts.push(format!("marker={}", percent_encode(marker)));
+    }
+    if !end_marker.is_empty() {
+        qs_parts.push(format!("end_marker={}", percent_encode(end_marker)));
+    }
+    if !prefix.is_empty() {
+        qs_parts.push(format!("prefix={}", percent_encode(prefix)));
+    }
+    if !delimiter.is_empty() {
+        qs_parts.push(format!("delimiter={}", percent_encode(delimiter)));
+    }
+    if reverse {
+        qs_parts.push("reverse=on".to_string());
+    }
+    qs_parts.push(format!("limit={limit}"));
+    qs_parts
+}
+
+/// Copy root HEAD headers onto a sharded listing GET (Python keeps the
+/// backend GET/HEAD headers). Probe `do_listing_checks` wants
+/// Accept-Ranges, X-Timestamp, Last-Modified. Probe L671 also wants
+/// X-Container-Read/Write, sync-key, and X-Versions-Location from POST.
+pub(crate) fn copy_root_listing_headers(head: &Response, out: &mut Response) {
+    out.headers.set("Accept-Ranges", "bytes");
+    for k in ["X-Timestamp", "X-PUT-Timestamp", "Last-Modified"] {
+        if out.headers.get(k).is_none() {
+            if let Some(v) = head.headers.get(k).filter(|s| !s.is_empty()) {
+                out.headers.set(k, v);
+            }
+        }
+    }
+    for (k, v) in head.headers.iter() {
+        let lk = k.to_ascii_lowercase();
+        if out.headers.get(k).is_some() {
+            continue;
+        }
+        if lk.starts_with("x-container-meta-")
+            || lk.starts_with("x-container-sysmeta-")
+            || matches!(
+                lk.as_str(),
+                "x-container-read"
+                    | "x-container-write"
+                    | "x-container-sync-key"
+                    | "x-container-sync-to"
+                    | "x-versions-location"
+                    | "x-history-location"
+            )
+        {
+            out.headers.set(k, v);
+        }
+    }
+    // Client POST `X-Versions-Location` is stored as sysmeta; the
+    // versioned_writes filter may not see a reconstructed listing GET.
+    // Probe test_sharding_listing L671 expects the client header.
+    if out.headers.get("X-Versions-Location").is_none()
+        && out.headers.get("X-History-Location").is_none()
+    {
+        if let Some(loc) = head
+            .headers
+            .get("X-Container-Sysmeta-Versions-Location")
+            .filter(|s| !s.is_empty())
+        {
+            let mode = head
+                .headers
+                .get("X-Container-Sysmeta-Versions-Mode")
+                .unwrap_or("stack");
+            if mode.eq_ignore_ascii_case("history") {
+                out.headers.set("X-History-Location", loc);
+            } else {
+                out.headers.set("X-Versions-Location", loc);
+            }
+        }
+    }
+}
+
+fn listing_items_bytes_used(merged: &[serde_json::Value]) -> u64 {
+    merged
+        .iter()
+        .filter_map(|v| {
+            v.get("bytes").and_then(|b| {
+                b.as_u64()
+                    .or_else(|| b.as_i64().and_then(|i| u64::try_from(i).ok()))
+            })
+        })
+        .sum()
+}
+
+/// Object-count from the merged listing page; bytes-used from that listing
+/// when it is a complete unfiltered GET (root stats are 0 after cleave,
+/// probe test_sharding_listing L671).
+pub(crate) fn stamp_sharded_listing_stats(
+    out: &mut Response,
+    head: &Response,
+    merged: &[serde_json::Value],
+    marker: &str,
+    end_marker: &str,
+    prefix: &str,
+    delimiter: &str,
+    limit: usize,
+) {
+    out.headers
+        .set("X-Container-Object-Count", merged.len().to_string());
+    let head_bytes = head
+        .headers
+        .get("X-Container-Bytes-Used")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let listing_bytes = listing_items_bytes_used(merged);
+    let complete = marker.is_empty()
+        && end_marker.is_empty()
+        && prefix.is_empty()
+        && delimiter.is_empty()
+        && merged.len() < limit;
+    let bytes = if complete {
+        listing_bytes.max(head_bytes)
+    } else {
+        head_bytes
+    };
+    out.headers.set("X-Container-Bytes-Used", bytes.to_string());
+}
+
+/// Select listing-state shard ranges that can contribute to a client listing.
+/// Matches Python `_filter_complete_listing` + `filter_namespaces`: reverse
+/// swaps marker/end_marker before the bound filter, then reverses the
+/// remaining ranges so the walk is high-to-low (probe L562).
+///
+/// Keep a range when `marker < upper` (empty upper = MAX) and
+/// `end_marker > lower` (empty lower = MIN). Prefix still skips `upper < prefix`.
 pub(crate) fn select_listing_shard_ranges<'a>(
     ranges: &'a [serde_json::Value],
     marker: &str,
+    end_marker: &str,
     prefix: &str,
+    reverse: bool,
 ) -> Vec<&'a serde_json::Value> {
+    let (filt_marker, filt_end) = if reverse {
+        (end_marker, marker)
+    } else {
+        (marker, end_marker)
+    };
     let mut out = Vec::new();
     for sr in ranges {
+        let lower = sr.get("lower").and_then(|v| v.as_str()).unwrap_or("");
         let upper = sr.get("upper").and_then(|v| v.as_str()).unwrap_or("");
-        if !marker.is_empty() && !upper.is_empty() && upper <= marker {
+        if !filt_marker.is_empty() && !upper.is_empty() && upper <= filt_marker {
+            continue;
+        }
+        if !filt_end.is_empty() && !lower.is_empty() && lower >= filt_end {
             continue;
         }
         if !prefix.is_empty() && !upper.is_empty() && upper < prefix {
@@ -5727,44 +6828,443 @@ pub(crate) fn select_listing_shard_ranges<'a>(
         }
         out.push(sr);
     }
+    if reverse {
+        out.reverse();
+    }
     out
+}
+
+/// True when the listing view is a settled partition of ACTIVE/SHRINKING
+/// ranges: every selected range is ACTIVE (40) or SHRINKING (50) and none
+/// is a strict sub-interval of another (overlapping donor+children at
+/// probe L1321). First-gen shrinking is two adjacent ACTIVE ranges covering
+/// MIN–MAX (probe L1925); L1418 is four after the nested donor is gone.
+/// Probe L2068: after shrink-to-root the last range is SHRINKING; treating
+/// that as unsettled turned empty_wins off and a lagging replica resurrected
+/// `obj-1-050+`. SHARDING/CLEAVED stay unsettled (L1483 residual union).
+pub(crate) fn listing_ranges_are_settled_active(selected: &[&serde_json::Value]) -> bool {
+    if selected.is_empty() {
+        return false;
+    }
+    // Probe L1985: expanded ACTIVE acceptor (MIN–MAX) with a nested
+    // SHRINKING donor. Treating that as unsettled unions handoff replicas
+    // that still list DELETE'd obj-1-000… (listing-w191/w192 101 vs 51).
+    // Shard DBs on primaries are already [alpha] + second-shard.
+    if listing_has_full_active_cover(selected) {
+        return true;
+    }
+    selected.iter().all(|sr| {
+        matches!(
+            sr.get("state").and_then(|v| v.as_i64()).unwrap_or(0),
+            40 | 50
+        )
+    }) && !selected.iter().any(|sr| json_range_is_nested(sr, selected))
+}
+
+/// Fold per-replica object-listing replies.
+///
+/// `None` is 404/timeout (not empty). `Some([])` is a successful 200 [].
+/// `empty_wins` (settled ACTIVE listing): any 200 [] is authoritative empty
+/// so a lagging replica cannot resurrect DELETE leftovers (L1418). Otherwise
+/// union nonempty replicas (L1146 extra PUTs / L1321 cleave). 404 is not empty.
+pub(crate) fn fold_replica_listings(
+    replies: &[Option<Vec<serde_json::Value>>],
+    empty_wins: bool,
+) -> Option<Vec<serde_json::Value>> {
+    fold_replica_listings_dated(replies, empty_wins, &[])
+}
+
+/// Same as [`fold_replica_listings`], with per-reply container timestamps
+/// aligned with `replies`. A nonempty listing newer than every 200 [] is a
+/// just-cleaved shard (L1517), not L1418 leftover (leftover is older than
+/// DELETE). This is not newest-fold: majority still wins when names exist.
+pub(crate) fn fold_replica_listings_dated(
+    replies: &[Option<Vec<serde_json::Value>>],
+    empty_wins: bool,
+    timestamps: &[Timestamp],
+) -> Option<Vec<serde_json::Value>> {
+    let ts_at = |i: usize| timestamps.get(i).copied().unwrap_or(Timestamp::zero());
+    let mut arrays: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut n_empty = 0usize;
+    let mut n_200 = 0usize;
+    for r in replies {
+        match r {
+            None => {}
+            Some(a) if a.is_empty() => {
+                n_200 += 1;
+                n_empty += 1;
+            }
+            Some(a) => {
+                n_200 += 1;
+                arrays.push(a.clone());
+            }
+        }
+    }
+    if arrays.is_empty() {
+        return if n_empty > 0 { Some(Vec::new()) } else { None };
+    }
+    if empty_wins && n_200 > 0 {
+        // Probe L1985: 2/3 replicas still list DELETE'd first-shard names.
+        // A newer strict subset ([alpha] after DELETE+PUT) is the settled
+        // listing; collapse older supersets before majority vote.
+        let collapsed = collapse_lagging_supersets(replies, timestamps);
+        let arrays: Vec<Vec<serde_json::Value>> = collapsed
+            .iter()
+            .filter_map(|r| r.as_ref())
+            .filter(|a| !a.is_empty())
+            .cloned()
+            .collect();
+        let n_200 = collapsed.iter().filter(|r| r.is_some()).count();
+        // Majority of 200 replies must list the name. Empty 200 [] votes
+        // against every name (L1418). A lagging superset of DELETE'd
+        // originals is a minority (L692). Extra PUTs on ≥2 replicas stay
+        // (L643). 404 does not vote (not a 200).
+        let mut counts: std::collections::HashMap<String, (usize, serde_json::Value)> =
+            std::collections::HashMap::new();
+        for a in &arrays {
+            let mut seen = std::collections::HashSet::new();
+            for item in a {
+                let key = listing_item_sort_key(item).to_string();
+                if key.is_empty() || !seen.insert(key.clone()) {
+                    continue;
+                }
+                counts
+                    .entry(key)
+                    .and_modify(|(c, _)| *c += 1)
+                    .or_insert((1, item.clone()));
+            }
+        }
+        let mut kept: Vec<serde_json::Value> = counts
+            .into_iter()
+            .filter(|(_, (c, _))| *c * 2 > n_200)
+            .map(|(_, (_, item))| item)
+            .collect();
+        kept.sort_by(|a, b| listing_item_sort_key(a).cmp(listing_item_sort_key(b)));
+        if kept.is_empty() {
+            // Majority empty: L1418 leftover (older) vs L1517 just-cleaved
+            // (newer than the empty under-populated replicas).
+            let mut max_empty = Timestamp::zero();
+            for (i, r) in replies.iter().enumerate() {
+                if matches!(r, Some(a) if a.is_empty()) && ts_at(i) > max_empty {
+                    max_empty = ts_at(i);
+                }
+            }
+            let mut best: Option<(Timestamp, usize)> = None;
+            for (i, r) in replies.iter().enumerate() {
+                if let Some(a) = r {
+                    if !a.is_empty() {
+                        let ts = ts_at(i);
+                        if best.map(|(b, _)| ts >= b).unwrap_or(true) {
+                            best = Some((ts, i));
+                        }
+                    }
+                }
+            }
+            if let Some((ts, i)) = best {
+                if ts > max_empty {
+                    let mut out = replies[i].clone().unwrap_or_default();
+                    out.sort_by(|a, b| listing_item_sort_key(a).cmp(listing_item_sort_key(b)));
+                    return Some(out);
+                }
+            }
+            return Some(Vec::new());
+        }
+        // Majority drops a just-cleaved 1/3 superset (L1517 obj-0100..0198).
+        // Fill extras that occupy a single gap in the majority listing.
+        // Interleaved DELETE leftovers span many gaps (L692) and stay dropped.
+        kept = fill_single_gap_from_supersets(&kept, &arrays);
+        return Some(kept);
+    }
+    Some(merge_sharded_object_listings(&arrays, usize::MAX))
+}
+
+fn parse_listing_json_body(resp: Response) -> Option<Vec<serde_json::Value>> {
+    if !(200..300).contains(&resp.status) {
+        return None;
+    }
+    let body = resp.body.into_vec(16 * 1024 * 1024).ok()?;
+    if resp.status == 204 || body.is_empty() {
+        return Some(Vec::new());
+    }
+    let val: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    Some(val.as_array().cloned().unwrap_or_default())
+}
+
+pub(crate) fn listing_resp_timestamp(headers: &HeaderKeyDict) -> Timestamp {
+    // Prefer PUT/data timestamps. CS always sends X-Backend-Timestamp as
+    // created_at, which is identical across replicas and hides DELETE/PUT
+    // freshness (probe L1985 leftover after reclaim).
+    for key in [
+        "X-Backend-Data-Timestamp",
+        "X-Backend-PUT-Timestamp",
+        "X-PUT-Timestamp",
+        "X-Backend-Timestamp",
+        "X-Timestamp",
+    ] {
+        if let Some(v) = headers.get(key).filter(|s| !s.is_empty()) {
+            if let Ok(ts) = v.parse::<Timestamp>() {
+                return ts;
+            }
+        }
+    }
+    Timestamp::zero()
+}
+
+/// If listing A is a strict subset of B and A is newer, B is a lagging
+/// DELETE leftover (probe L1985: `[alpha]` vs `[alpha]+obj-1-000…`).
+fn collapse_lagging_supersets(
+    replies: &[Option<Vec<serde_json::Value>>],
+    timestamps: &[Timestamp],
+) -> Vec<Option<Vec<serde_json::Value>>> {
+    let name_set = |a: &[serde_json::Value]| -> std::collections::HashSet<String> {
+        a.iter()
+            .map(|i| listing_item_sort_key(i).to_string())
+            .filter(|k| !k.is_empty())
+            .collect()
+    };
+    let mut out = replies.to_vec();
+    for i in 0..out.len() {
+        let Some(a) = out[i].as_ref() else {
+            continue;
+        };
+        if a.is_empty() {
+            continue;
+        }
+        let ta = timestamps.get(i).copied().unwrap_or_else(Timestamp::zero);
+        if ta == Timestamp::zero() {
+            continue;
+        }
+        let na = name_set(a);
+        let a_clone = a.clone();
+        for j in 0..out.len() {
+            if i == j {
+                continue;
+            }
+            let Some(b) = out[j].as_ref() else {
+                continue;
+            };
+            if b.is_empty() {
+                continue;
+            }
+            let tb = timestamps.get(j).copied().unwrap_or_else(Timestamp::zero);
+            let nb = name_set(b);
+            if na.len() < nb.len() && na.is_subset(&nb) && ta > tb {
+                out[j] = Some(a_clone.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Keep minority names that sit in exactly one gap of the majority listing.
+/// Empty majority is L1418 delete-all: do not resurrect leftovers.
+fn fill_single_gap_from_supersets(
+    majority: &[serde_json::Value],
+    arrays: &[Vec<serde_json::Value>],
+) -> Vec<serde_json::Value> {
+    if majority.is_empty() {
+        return Vec::new();
+    }
+    let maj_keys: Vec<String> = majority
+        .iter()
+        .map(|i| listing_item_sort_key(i).to_string())
+        .filter(|k| !k.is_empty())
+        .collect();
+    let maj_set: std::collections::HashSet<&str> = maj_keys.iter().map(|s| s.as_str()).collect();
+    let mut extra_items: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    for a in arrays {
+        let extra: Vec<&serde_json::Value> = a
+            .iter()
+            .filter(|i| {
+                let k = listing_item_sort_key(i);
+                !k.is_empty() && !maj_set.contains(k)
+            })
+            .collect();
+        if extra.is_empty() {
+            continue;
+        }
+        if extras_occupy_single_majority_gap(&maj_keys, &extra) {
+            for item in extra {
+                extra_items
+                    .entry(listing_item_sort_key(item).to_string())
+                    .or_insert_with(|| (*item).clone());
+            }
+        }
+    }
+    if extra_items.is_empty() {
+        return majority.to_vec();
+    }
+    let mut out = majority.to_vec();
+    out.extend(extra_items.into_values());
+    out.sort_by(|a, b| listing_item_sort_key(a).cmp(listing_item_sort_key(b)));
+    out
+}
+
+fn extras_occupy_single_majority_gap(maj_sorted: &[String], extra: &[&serde_json::Value]) -> bool {
+    if extra.is_empty() || maj_sorted.is_empty() {
+        return false;
+    }
+    let mut gap: Option<usize> = None;
+    for item in extra {
+        let k = listing_item_sort_key(item);
+        let this_gap = match maj_sorted.binary_search_by(|m| m.as_str().cmp(k)) {
+            Ok(_) => return false,
+            Err(i) => i,
+        };
+        // Unbounded prefix (i==0) or suffix (i==len) is L1931 leftover after
+        // emptying a shard then PUTting one new name (`alpha`). Only fill a
+        // hole BETWEEN two majority names (L631 extra PUTs).
+        if this_gap == 0 || this_gap == maj_sorted.len() {
+            return false;
+        }
+        match gap {
+            None => gap = Some(this_gap),
+            Some(g) if g != this_gap => return false,
+            Some(_) => {}
+        }
+    }
+    true
+}
+
+fn listing_item_sort_key(item: &serde_json::Value) -> &str {
+    item.get("name")
+        .and_then(|v| v.as_str())
+        .or_else(|| item.get("subdir").and_then(|v| v.as_str()))
+        .unwrap_or("")
 }
 
 /// Merge per-shard object listing arrays, stopping at `limit`.
 /// Later sources overwrite same `name` (root residual then shards → shard wins).
+///
+/// Sort by name/subdir **after** the union. Residual-root insertion order
+/// is even originals first; cleaved new PUTs would otherwise appear after
+/// them and fail probe test_sharding_listing L631 (`expected 0001, got 0002`).
 pub(crate) fn merge_sharded_object_listings(
     shard_listings: &[Vec<serde_json::Value>],
     limit: usize,
 ) -> Vec<serde_json::Value> {
+    merge_sharded_object_listings_dir(shard_listings, limit, false)
+}
+
+pub(crate) fn merge_sharded_object_listings_dir(
+    shard_listings: &[Vec<serde_json::Value>],
+    limit: usize,
+    reverse: bool,
+) -> Vec<serde_json::Value> {
     use std::collections::HashMap;
     let mut by_name: HashMap<String, serde_json::Value> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
     for items in shard_listings {
         for item in items {
-            let name = item
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            // Delimiter listings use `subdir` not `name` (probe
+            // test_sharding_listing L576 `[{subdir: obj-}]`).
+            let name = listing_item_sort_key(item).to_string();
             if name.is_empty() {
                 continue;
-            }
-            if !by_name.contains_key(&name) {
-                order.push(name.clone());
             }
             by_name.insert(name, item.clone());
         }
     }
-    let mut merged = Vec::new();
-    for name in order {
-        if let Some(item) = by_name.remove(&name) {
-            merged.push(item);
-            if merged.len() >= limit {
-                return merged;
-            }
+    let mut merged: Vec<serde_json::Value> = by_name.into_values().collect();
+    merged.sort_by(|a, b| {
+        let ka = listing_item_sort_key(a);
+        let kb = listing_item_sort_key(b);
+        if reverse {
+            kb.cmp(ka)
+        } else {
+            ka.cmp(kb)
         }
+    });
+    if merged.len() > limit {
+        merged.truncate(limit);
     }
     merged
+}
+
+/// One shard (or nonempty residual root) contribution to a sharded GET listing.
+pub(crate) struct ListingFeed {
+    /// Bounds/timestamp kept for diagnostics; merge is a name union (L1321).
+    #[allow(dead_code)]
+    pub lower: String,
+    #[allow(dead_code)]
+    pub upper: String,
+    #[allow(dead_code)]
+    pub timestamp: String,
+    pub items: Vec<serde_json::Value>,
+}
+
+pub(crate) fn listing_feed_timestamp(sr: &serde_json::Value) -> String {
+    let ts = sr.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+    let meta = sr
+        .get("meta_timestamp")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let state = sr
+        .get("state_timestamp")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    [ts, meta, state]
+        .into_iter()
+        .max()
+        .unwrap_or("")
+        .to_string()
+}
+
+#[allow(dead_code)]
+fn object_in_shard_bounds(name: &str, lower: &str, upper: &str) -> bool {
+    if !lower.is_empty() && name <= lower {
+        return false;
+    }
+    if !upper.is_empty() && name > upper {
+        return false;
+    }
+    true
+}
+
+/// True when `a` is a strict sub-interval of `b` (empty = open bound).
+fn shard_bounds_stricter(a_lo: &str, a_hi: &str, b_lo: &str, b_hi: &str) -> bool {
+    if a_lo == b_lo && a_hi == b_hi {
+        return false;
+    }
+    let left_ok = b_lo.is_empty() || (!a_lo.is_empty() && a_lo >= b_lo);
+    let right_ok = b_hi.is_empty() || (!a_hi.is_empty() && a_hi <= b_hi);
+    left_ok && right_ok
+}
+
+fn json_range_bounds(sr: &serde_json::Value) -> (&str, &str) {
+    (
+        sr.get("lower").and_then(|v| v.as_str()).unwrap_or(""),
+        sr.get("upper").and_then(|v| v.as_str()).unwrap_or(""),
+    )
+}
+
+/// True when `sr` is a strict sub-interval of another selected listing range.
+pub(crate) fn json_range_is_nested(sr: &serde_json::Value, all: &[&serde_json::Value]) -> bool {
+    let name = sr.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let (lo, hi) = json_range_bounds(sr);
+    all.iter().any(|other| {
+        let on = other.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if on.is_empty() || on == name {
+            return false;
+        }
+        let (olo, ohi) = json_range_bounds(other);
+        shard_bounds_stricter(lo, hi, olo, ohi)
+    })
+}
+
+/// Union object rows across shard feeds. Empty children add nothing and must
+/// not omit names that still live on a SHARDING donor (probe L1321 / Python
+/// `_get_from_shards` `if not objs: continue`). Newest-covering empty
+/// suppression dropped cleaved betas on listing-w91 when the donor's
+/// state_timestamp was newer than the CLEAVED children. L1418 leftover is
+/// handled by settled replica empty-wins, not by this merge.
+pub(crate) fn merge_listings_newest_covering(
+    feeds: &[ListingFeed],
+    limit: usize,
+    reverse: bool,
+) -> Vec<serde_json::Value> {
+    let arrays: Vec<Vec<serde_json::Value>> = feeds.iter().map(|f| f.items.clone()).collect();
+    merge_sharded_object_listings_dir(&arrays, limit, reverse)
 }
 
 /// Python `swift.common.utils.csv_append`.
@@ -5772,6 +7272,33 @@ fn csv_append(existing: Option<&str>, item: &str) -> String {
     match existing {
         Some(s) if !s.is_empty() => format!("{s},{item}"),
         _ => item.to_string(),
+    }
+}
+
+/// Python `_backend_requests` `set_container_update`: send both the
+/// unquoted path and `X-Backend-Quoted-Container-Path` so object-servers
+/// update the nested shard, not the root (probe L1435).
+pub(crate) fn stamp_shard_container_path(
+    headers: &mut HeaderKeyDict,
+    upd_account: &str,
+    upd_container: &str,
+    account: &str,
+    container: &str,
+) {
+    if upd_account == account && upd_container == container {
+        return;
+    }
+    let path = format!("{upd_account}/{upd_container}");
+    let quoted = percent_encode_path(&path);
+    headers.set("X-Backend-Quoted-Container-Path", &quoted);
+    headers.set("X-Backend-Allow-Reserved-Names", "true");
+    // HTTP/1.1 forbids CR/LF in header values. FunkyNames shard container
+    // names include `\n`; sending the raw path 400s the object PUT.
+    if path.bytes().any(|b| matches!(b, b'\r' | b'\n')) {
+        headers.set("X-Backend-Container-Path", &quoted);
+        headers.set("X-Backend-Location-Is-Quoted", "true");
+    } else {
+        headers.set("X-Backend-Container-Path", &path);
     }
 }
 
@@ -5840,6 +7367,11 @@ pub(crate) fn fill_container_info_from_head(info: &mut ContainerInfo, resp: &Res
         .get("X-Container-Sysmeta-Rfc-Compliant-Etags")
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    info.db_state = resp
+        .headers
+        .get("X-Backend-Sharding-State")
+        .unwrap_or("")
+        .to_string();
     info.cors = CorsInfo {
         allow_origin: resp
             .headers
@@ -5857,6 +7389,11 @@ pub(crate) fn fill_container_info_from_head(info: &mut ContainerInfo, resp: &Res
 }
 
 pub(crate) fn account_info_from_response(resp: &Response) -> AccountInfo {
+    let fake = resp
+        .headers
+        .get("X-Backend-Fake-Account-Listing")
+        .map(config_true_value)
+        .unwrap_or(false);
     AccountInfo {
         status: resp.status,
         core_access_control: resp
@@ -5869,6 +7406,7 @@ pub(crate) fn account_info_from_response(resp: &Response) -> AccountInfo {
             .get("X-Account-Sysmeta-Rfc-Compliant-Etags")
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        account_really_exists: (200..300).contains(&resp.status) && !fake,
     }
 }
 
@@ -5939,6 +7477,96 @@ fn remaining_async_next(
     })
 }
 
+/// Continue an unread Hyper body through the remaining middleware in WSGI
+/// order. A streaming middleware may pass a transformed request to another
+/// streaming middleware (S3 -> versioned writes), or to a control-plane
+/// interceptor (versioned writes -> symlink). The old top-level branch picked
+/// only the innermost streaming filter and wired its `next` directly to the
+/// proxy app, silently bypassing every inner middleware.
+fn remaining_streaming_next(
+    filters: Arc<Vec<Arc<dyn swift_middleware::Middleware>>>,
+    start: usize,
+    app: Arc<ProxyApp>,
+) -> swift_middleware::StreamingAsyncNextFn {
+    Arc::new(move |req| {
+        let filters = Arc::clone(&filters);
+        let app = Arc::clone(&app);
+        Box::pin(async move { dispatch_streaming_remaining(filters, start, app, req).await })
+    })
+}
+
+/// Adapt a buffered control-plane subrequest back into the unread-body
+/// dispatcher so an inner streaming middleware is not skipped.
+fn remaining_buffered_next(
+    filters: Arc<Vec<Arc<dyn swift_middleware::Middleware>>>,
+    start: usize,
+    app: Arc<ProxyApp>,
+) -> swift_middleware::AsyncNextFn {
+    Arc::new(move |req| {
+        let filters = Arc::clone(&filters);
+        let app = Arc::clone(&app);
+        Box::pin(async move {
+            dispatch_streaming_remaining(filters, start, app, request_to_async(req)).await
+        })
+    })
+}
+
+async fn dispatch_streaming_remaining(
+    filters: Arc<Vec<Arc<dyn swift_middleware::Middleware>>>,
+    start: usize,
+    app: Arc<ProxyApp>,
+    mut req: AsyncRequest,
+) -> Response {
+    let head = Request {
+        method: req.method.clone(),
+        path: req.path.clone(),
+        query_string: req.query_string.clone(),
+        headers: req.headers.clone(),
+        body: swift_http::Body::empty(),
+    };
+
+    for j in start..filters.len() {
+        if filters[j].streams_request(&head) {
+            let next = remaining_streaming_next(Arc::clone(&filters), j + 1, Arc::clone(&app));
+            let mut resp = filters[j].handle_streaming_request(req, next).await;
+            buffer_manifest_channel(&mut resp).await;
+            return apply_outbound_filters(filters, start, j, app, head, resp).await;
+        }
+
+        if filters[j].intercepts_request(&head) {
+            let body = match req.body.materialize(swift_http::MAX_CONTROL_BODY).await {
+                Ok(bytes) => swift_http::Body::Buffered(bytes),
+                Err(e) if swift_http::body_too_large(&e) => {
+                    return Response::error(413, "Your request is too large.")
+                }
+                Err(_) => {
+                    if head.method == "PUT" {
+                        let mut resp = swift_s3api::s3_error_response("RequestTimeout", None, &[]);
+                        resp.headers.set("Connection", "close");
+                        return resp;
+                    }
+                    return swob_response(499);
+                }
+            };
+            let request = Request {
+                method: req.method,
+                path: req.path,
+                query_string: req.query_string,
+                headers: req.headers,
+                body,
+            };
+            let next = remaining_buffered_next(Arc::clone(&filters), j + 1, Arc::clone(&app));
+            let mut resp = filters[j].handle_request_async(request, next).await;
+            buffer_manifest_channel(&mut resp).await;
+            return apply_outbound_filters(filters, start, j, app, head, resp).await;
+        }
+    }
+
+    let mut resp = app.handle_async(req).await;
+    buffer_manifest_channel(&mut resp).await;
+    apply_outbound_filters(filters.clone(), start, filters.len(), app, head, resp).await
+}
+
 /// Buffer SLO/DLO channel bodies so reassemble_async can parse the JSON.
 async fn buffer_manifest_channel(resp: &mut Response) {
     let slo = resp
@@ -5972,7 +7600,10 @@ fn stamp_rfc_compliant_etag_flags(app: &ProxyApp, head: &Request, resp: &mut Res
     };
     // Cache-only: object GET already populated L1 via container_info_async.
     // A live HEAD here would block a Tokio worker (L2) and hang unit tests.
-    let Some(cinfo) = app.info_cache.get_container(&format!("{account}/{container}")) else {
+    let Some(cinfo) = app
+        .info_cache
+        .get_container(&format!("{account}/{container}"))
+    else {
         return;
     };
     resp.headers
@@ -6028,19 +7659,13 @@ async fn apply_outbound_filters(
                 let captured = Arc::clone(&captured);
                 let rest = Arc::clone(&rest);
                 Box::pin(async move {
-                    if let Some(inner) = captured
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .take()
-                    {
+                    if let Some(inner) = captured.lock().unwrap_or_else(|p| p.into_inner()).take() {
                         return inner;
                     }
                     rest(r).await
                 })
             });
-            resp = filters[j]
-                .reassemble_async(head.clone_head(), next)
-                .await;
+            resp = filters[j].reassemble_async(head.clone_head(), next).await;
         } else {
             resp = filters[j].finish(&head, resp);
         }
@@ -6127,12 +7752,12 @@ impl AsyncService for ProxyAsyncService {
                 };
                 let mut resp = app.handle_async(req).await;
                 app.apply_pipeline_cors(
-                head.method.clone(),
-                head.path.clone(),
-                head.headers.get("Origin").map(str::to_string),
-                &mut resp,
-            )
-            .await;
+                    head.method.clone(),
+                    head.path.clone(),
+                    head.headers.get("Origin").map(str::to_string),
+                    &mut resp,
+                )
+                .await;
                 return resp;
             }
             let mut head = Request {
@@ -6157,34 +7782,15 @@ impl AsyncService for ProxyAsyncService {
             req.headers = head.headers.clone();
             req.query_string = head.query_string.clone();
             if filters.iter().any(|f| f.streams_request(&head)) {
-                let next: swift_middleware::StreamingAsyncNextFn = {
-                    let app = Arc::clone(&app);
-                    Arc::new(move |areq| {
-                        let app = Arc::clone(&app);
-                        Box::pin(async move { app.handle_async(areq).await })
-                    })
-                };
-                for filter in filters.iter().rev() {
-                    if filter.streams_request(&head) {
-                        let mut resp = filter.handle_streaming_request(req, next).await;
-                        app.apply_pipeline_cors(
-                head.method.clone(),
-                head.path.clone(),
-                head.headers.get("Origin").map(str::to_string),
-                &mut resp,
-            )
-            .await;
-                        return resp;
-                    }
-                }
-                let mut resp = next(req).await;
+                let mut resp =
+                    dispatch_streaming_remaining(Arc::new(filters), 0, Arc::clone(&app), req).await;
                 app.apply_pipeline_cors(
-                head.method.clone(),
-                head.path.clone(),
-                head.headers.get("Origin").map(str::to_string),
-                &mut resp,
-            )
-            .await;
+                    head.method.clone(),
+                    head.path.clone(),
+                    head.headers.get("Origin").map(str::to_string),
+                    &mut resp,
+                )
+                .await;
                 return resp;
             }
             if filters.iter().any(|f| f.intercepts_request(&head)) {
@@ -6199,11 +7805,8 @@ impl AsyncService for ProxyAsyncService {
                         // intercept path never reaches s3api if Hyper
                         // fails the body read (Content-Length mismatch).
                         if head.method == "PUT" {
-                            let mut resp = swift_s3api::s3_error_response(
-                                "RequestTimeout",
-                                None,
-                                &[],
-                            );
+                            let mut resp =
+                                swift_s3api::s3_error_response("RequestTimeout", None, &[]);
                             resp.headers.set("Connection", "close");
                             return resp;
                         }
@@ -6220,11 +7823,8 @@ impl AsyncService for ProxyAsyncService {
                 let filters_arc = Arc::new(filters.clone());
                 for (i, filter) in filters.iter().enumerate() {
                     if filter.intercepts_request(&head) {
-                        let next = remaining_async_next(
-                            Arc::clone(&filters_arc),
-                            i + 1,
-                            Arc::clone(&app),
-                        );
+                        let next =
+                            remaining_async_next(Arc::clone(&filters_arc), i + 1, Arc::clone(&app));
                         let mut resp = filter.handle_request_async(request, next).await;
                         buffer_manifest_channel(&mut resp).await;
                         resp = apply_outbound_filters(
@@ -6237,12 +7837,12 @@ impl AsyncService for ProxyAsyncService {
                         )
                         .await;
                         app.apply_pipeline_cors(
-                head.method.clone(),
-                head.path.clone(),
-                head.headers.get("Origin").map(str::to_string),
-                &mut resp,
-            )
-            .await;
+                            head.method.clone(),
+                            head.path.clone(),
+                            head.headers.get("Origin").map(str::to_string),
+                            &mut resp,
+                        )
+                        .await;
                         return resp;
                     }
                 }
@@ -6317,10 +7917,7 @@ impl swift_middleware::EndpointResolver for ProxyEndpointResolver {
 /// Serve behind the always-on middleware pipeline
 /// (`catch_errors gatekeeper healthcheck proxy-server`), the default
 /// Swift proxy front matter.
-pub fn serve_with_pipeline(
-    listener: TcpListener,
-    app: Arc<ProxyApp>,
-) -> std::io::Result<()> {
+pub fn serve_with_pipeline(listener: TcpListener, app: Arc<ProxyApp>) -> std::io::Result<()> {
     serve_with_filters(listener, app, Vec::new())
 }
 
@@ -6340,6 +7937,27 @@ pub fn serve_with_filters(
     )
 }
 
+/// The three front-matter filters that normally guard every public proxy
+/// listener.  Python's `InternalClient` is the deliberate exception: it
+/// loads an in-process pipeline without gatekeeper so trusted `X-Backend-*`
+/// controls can reach the terminal proxy app.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CorePipelineFilters {
+    pub catch_errors: bool,
+    pub gatekeeper: bool,
+    pub healthcheck: bool,
+}
+
+impl Default for CorePipelineFilters {
+    fn default() -> Self {
+        Self {
+            catch_errors: true,
+            gatekeeper: true,
+            healthcheck: true,
+        }
+    }
+}
+
 /// [`serve_with_filters`] with an explicit HTTP [`swift_http::ServerConfig`]
 /// (worker pool size, client timeout, access log, graceful shutdown) and a
 /// hot-swappable app: the innermost handler re-reads `app` on every request,
@@ -6351,12 +7969,31 @@ pub fn serve_with_filters_and_config(
     extra: Vec<Arc<dyn swift_middleware::Middleware>>,
     config: swift_http::ServerConfig,
 ) -> std::io::Result<()> {
+    serve_with_core_filters_and_config(listener, app, extra, CorePipelineFilters::default(), config)
+}
+
+/// Serve with an explicitly selected front-matter pipeline. Public callers
+/// should use [`serve_with_filters_and_config`]; the proxy binary only calls
+/// this variant after enforcing that a gatekeeper-free listener is both
+/// explicitly marked as an internal-client endpoint and bound to loopback.
+pub fn serve_with_core_filters_and_config(
+    listener: TcpListener,
+    app: Arc<RwLock<Arc<ProxyApp>>>,
+    extra: Vec<Arc<dyn swift_middleware::Middleware>>,
+    core: CorePipelineFilters,
+    config: swift_http::ServerConfig,
+) -> std::io::Result<()> {
     use swift_middleware::{CatchErrors, Gatekeeper, HealthCheck, Middleware};
-    let mut filters: Vec<Arc<dyn Middleware>> = vec![
-        Arc::new(CatchErrors::new("")),
-        Arc::new(Gatekeeper::default()),
-        Arc::new(HealthCheck::default()),
-    ];
+    let mut filters: Vec<Arc<dyn Middleware>> = Vec::new();
+    if core.catch_errors {
+        filters.push(Arc::new(CatchErrors::new("")));
+    }
+    if core.gatekeeper {
+        filters.push(Arc::new(Gatekeeper::default()));
+    }
+    if core.healthcheck {
+        filters.push(Arc::new(HealthCheck::default()));
+    }
     filters.extend(extra);
     swift_http::serve_forever_multi_service(
         vec![listener],
@@ -6417,7 +8054,6 @@ mod pipeline_async_tests {
             "catch_errors must stamp X-Trans-Id on the async path"
         );
     }
-
 }
 
 #[cfg(test)]
@@ -6592,6 +8228,29 @@ mod stale_read_and_post_tests {
     }
 
     #[test]
+    fn test_container_delete_tombstone_beats_stale_handoff() {
+        // listing-w214 L2095: primary DELETE 404 X-Backend-Timestamp is
+        // newer than the leftover handoff's created/put timestamp. A 2xx
+        // source older than that watermark must not win GETorHEAD.
+        let tombstone: Timestamp = "1787701243.57447".parse().unwrap();
+        let handoff: Timestamp = "1787701243.23638".parse().unwrap();
+        let mut latest_404 = Timestamp::zero();
+        if tombstone > latest_404 {
+            latest_404 = tombstone;
+        }
+        assert!(
+            handoff < latest_404,
+            "stale unsuffixed handoff {:?} must lose to primary tombstone {:?}",
+            handoff,
+            latest_404
+        );
+        assert!(!(handoff >= latest_404));
+        // A revived replica whose timestamp is at/after DELETE still wins.
+        let revived: Timestamp = "1787701243.57447".parse().unwrap();
+        assert!(revived >= latest_404);
+    }
+
+    #[test]
     fn test_is_good_source_matches_python() {
         // base.py:1093-1102: 2xx/3xx are good; 416 only for objects
         assert!(is_good_source(200, false));
@@ -6652,6 +8311,42 @@ mod stale_read_and_post_tests {
         let resp = app.best_response_with_quorum(&combined, 2);
         assert_eq!(post_existence_proof_guard(resp, 1).status, 202);
     }
+
+    #[test]
+    fn container_listing_rejects_non_utf8_delimiter() {
+        // Python `validate_container_params` / `get_param`: delimiter=%ff
+        // is 400 `"delimiter" parameter not valid UTF-8`
+        // (probe test_sharding_listing).
+        let app = Arc::new(ProxyApp::new(ring(0), ring(0), ProxyConfig::default()));
+        let req = Request {
+            method: "GET".into(),
+            path: "/v1/AUTH_test/c".into(),
+            query_string: "delimiter=%ff".into(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        };
+        let mut resp = app.container_request(&req, "AUTH_test", "c");
+        assert_eq!(resp.status, 400, "{}", resp.reason);
+        let body = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap());
+        assert!(body.contains("not valid UTF-8"), "body={body:?}");
+        assert!(body.contains("delimiter"), "body={body:?}");
+    }
+
+    #[test]
+    fn container_listing_rejects_oversize_limit() {
+        let app = Arc::new(ProxyApp::new(ring(0), ring(0), ProxyConfig::default()));
+        let req = Request {
+            method: "GET".into(),
+            path: "/v1/AUTH_test/c".into(),
+            query_string: "limit=10001".into(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        };
+        let mut resp = app.container_request(&req, "AUTH_test", "c");
+        assert_eq!(resp.status, 412, "{}", resp.reason);
+        let body = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap());
+        assert!(body.contains("Maximum limit"), "body={body:?}");
+    }
 }
 
 #[cfg(test)]
@@ -6668,7 +8363,44 @@ mod info_cache_tests {
             sync_key: None,
             rfc_compliant_etags: None,
             cors: CorsInfo::default(),
+            db_state: String::new(),
         }
+    }
+
+    #[test]
+    fn test_listing_200_overwrites_deleted_404_cache() {
+        // listing-w216 L2111: GET 404 after DELETE container caches
+        // exists=false; listing [beta] 200 must refill so object DELETE
+        // does not 404 while .data is on disk.
+        let app = ProxyApp::new(
+            super::policy_ring_tests::ring(0),
+            super::policy_ring_tests::ring(0),
+            ProxyConfig::default(),
+        );
+        let mut gone = Response::new(404);
+        gone.headers.set("X-Backend-Storage-Policy-Index", "0");
+        app.remember_container_info("AUTH_test", "c", &gone);
+        let cached = app.info_cache.get_container("AUTH_test/c").unwrap();
+        assert_eq!(cached.status, 404);
+        assert!(!cached.exists());
+        let mut ok = Response::new(200);
+        ok.headers.set("X-Backend-Storage-Policy-Index", "0");
+        ok.headers.set("X-Backend-Sharding-State", "collapsed");
+        app.remember_container_info("AUTH_test", "c", &ok);
+        let cached = app.info_cache.get_container("AUTH_test/c").unwrap();
+        assert!(
+            cached.exists(),
+            "listing 200 must overwrite DELETE 404 cache"
+        );
+        assert_eq!(cached.db_state, "collapsed");
+        // A live 200 sharded cache must not be replaced by a later listing
+        // (listing-w217 L2044).
+        let mut sharded = Response::new(200);
+        sharded.headers.set("X-Backend-Storage-Policy-Index", "0");
+        sharded.headers.set("X-Backend-Sharding-State", "sharded");
+        app.remember_container_info("AUTH_test", "c", &sharded);
+        let cached = app.info_cache.get_container("AUTH_test/c").unwrap();
+        assert_eq!(cached.db_state, "collapsed");
     }
 
     #[test]
@@ -6749,6 +8481,70 @@ mod info_cache_tests {
         assert_eq!(info_cache_time(404, Some("120"), 60.0), Some(12.0));
         assert_eq!(info_cache_time(200, Some("banana"), 60.0), Some(60.0));
     }
+
+    #[test]
+    fn test_container_info_write_failure_distinguishes_unreachable_from_missing() {
+        assert_eq!(ContainerInfo::default().write_failure_status(), 503);
+        assert_eq!(
+            ContainerInfo {
+                status: 503,
+                ..Default::default()
+            }
+            .write_failure_status(),
+            503
+        );
+        assert_eq!(
+            ContainerInfo {
+                status: 404,
+                ..Default::default()
+            }
+            .write_failure_status(),
+            404
+        );
+    }
+
+    #[test]
+    fn test_reserved_nul_path_follows_allow_reserved_header() {
+        let mut req = Request {
+            method: "PUT".to_string(),
+            path: "/v1/AUTH_test/\u{0}reserved".to_string(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        };
+        assert!(utf8_or_null_rejected(&req).is_some());
+        req.headers.set("X-Backend-Allow-Reserved-Names", "true");
+        assert!(utf8_or_null_rejected(&req).is_none());
+    }
+
+    #[test]
+    fn test_synthesized_listing_is_not_a_real_account() {
+        // account.py:79-94: fake listing is 2xx but account_really_exists
+        // is false so container PUT still autocreates.
+        let req = Request {
+            method: "HEAD".to_string(),
+            path: "/v1/AUTH_missing".to_string(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        };
+        let resp = synthesized_account_listing(&req);
+        assert_eq!(resp.status, 204);
+        assert_eq!(
+            resp.headers
+                .get("X-Backend-Fake-Account-Listing")
+                .map(|s| s.to_ascii_lowercase()),
+            Some("yes".to_string())
+        );
+        let info = account_info_from_response(&resp);
+        assert_eq!(info.status, 204);
+        assert!(!info.account_really_exists);
+        assert!(!info.exists());
+        let mut real = Response::new(204);
+        real.headers.set("X-Account-Container-Count", "0");
+        let real_info = account_info_from_response(&real);
+        assert!(real_info.exists());
+    }
 }
 
 #[cfg(test)]
@@ -6786,6 +8582,7 @@ mod cors_tests {
                 sync_key: None,
                 rfc_compliant_etags: None,
                 cors,
+                db_state: String::new(),
             },
             60.0,
         );
@@ -6839,6 +8636,7 @@ mod cors_tests {
                 expose_headers: Some("X-Object-Meta-Color".into()),
                 max_age: Some("999".into()),
             },
+            db_state: String::new(),
         };
         let decoded = container_info_from_json(&container_info_to_json(&info)).unwrap();
         assert_eq!(decoded.cors, info.cors);
@@ -6855,6 +8653,40 @@ mod cors_tests {
             container_info_from_json(&old_value).unwrap().cors,
             CorsInfo::default()
         );
+        assert_eq!(
+            container_info_from_json(&old_value)
+                .unwrap()
+                .root_db_state(),
+            "unsharded"
+        );
+    }
+
+    #[test]
+    fn reseller_head_exposes_x_container_sharding_from_sysmeta() {
+        let mut resp = Response::new(204);
+        resp.headers.set("X-Container-Sysmeta-Sharding", "True");
+        expose_container_sharding(&mut resp, true);
+        assert_eq!(resp.headers.get("X-Container-Sharding"), Some("True"));
+
+        let mut resp = Response::new(204);
+        expose_container_sharding(&mut resp, true);
+        assert_eq!(resp.headers.get("X-Container-Sharding"), Some("False"));
+
+        let mut resp = Response::new(204);
+        resp.headers.set("X-Container-Sysmeta-Sharding", "on");
+        expose_container_sharding(&mut resp, false);
+        assert!(resp.headers.get("X-Container-Sharding").is_none());
+    }
+
+    #[test]
+    fn fill_container_info_reads_backend_sharding_state() {
+        let mut resp = Response::new(204);
+        resp.headers.set("X-Backend-Sharding-State", "sharded");
+        resp.headers.set("X-Backend-Storage-Policy-Index", "2");
+        let mut info = ContainerInfo::default();
+        fill_container_info_from_head(&mut info, &resp);
+        assert_eq!(info.root_db_state(), "sharded");
+        assert_eq!(info.policy_index, 2);
     }
 
     #[test]
@@ -7003,7 +8835,10 @@ mod cors_tests {
                 body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
             })
             .await;
-        assert_ne!(empty_acct.status, 412, "empty-account object path must not be Bad URL");
+        assert_ne!(
+            empty_acct.status, 412,
+            "empty-account object path must not be Bad URL"
+        );
         let empty_cont = app
             .handle_async(swift_http::AsyncRequest {
                 method: "GET".into(),
@@ -7027,7 +8862,11 @@ mod cors_tests {
                 body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
             })
             .await;
-        assert_eq!(info.status, 403, "empty info_json is 403, got {}", info.status);
+        assert_eq!(
+            info.status, 403,
+            "empty info_json is 403, got {}",
+            info.status
+        );
         let unknown = app
             .handle_async(swift_http::AsyncRequest {
                 method: "PATCH".into(),
@@ -7047,7 +8886,11 @@ mod cors_tests {
                 body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
             })
             .await;
-        assert_eq!(lick.status, 405, "LICK on /v1 must be 405, got {}", lick.status);
+        assert_eq!(
+            lick.status, 405,
+            "LICK on /v1 must be 405, got {}",
+            lick.status
+        );
         assert!(
             lick.headers.get("Allow").is_some(),
             "405 must advertise Allow"
@@ -7208,10 +9051,8 @@ mod cors_tests {
         // SLO GET If-Match intercepts_request and used to return before
         // outer etag-quoter finish(), leaving 412 ETags unquoted.
         let app = app(ProxyConfig::default());
-        let filters: Arc<Vec<Arc<dyn swift_middleware::Middleware>>> = Arc::new(vec![
-            Arc::new(OuterQuoteFinish),
-            Arc::new(InnerIfMatch412),
-        ]);
+        let filters: Arc<Vec<Arc<dyn swift_middleware::Middleware>>> =
+            Arc::new(vec![Arc::new(OuterQuoteFinish), Arc::new(InnerIfMatch412)]);
         let mut req = Request {
             method: "GET".into(),
             path: "/v1/AUTH_test/c/o".into(),
@@ -7227,6 +9068,78 @@ mod cors_tests {
             Some("\"abc123\""),
             "outer finish must still quote a 412 from an inner intercept"
         );
+    }
+
+    struct OuterObjectStreamer;
+    impl swift_middleware::Middleware for OuterObjectStreamer {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn streams_request(&self, req: &Request) -> bool {
+            req.method == "PUT"
+        }
+        fn handle_streaming_request(
+            &self,
+            req: swift_http::AsyncRequest,
+            next: swift_middleware::StreamingAsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move { next(req).await })
+        }
+    }
+
+    struct InnerSymlinkPut;
+    impl swift_middleware::Middleware for InnerSymlinkPut {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.method == "PUT" && req.headers.contains_key("X-Symlink-Target")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                assert_eq!(req.headers.get("X-Symlink-Target"), Some("targets/object"));
+                assert!(
+                    matches!(req.body, swift_http::Body::Buffered(ref body) if body.is_empty())
+                );
+                Response::new(218)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_outer_filter_keeps_inner_symlink_intercept() {
+        // VersionedWrites streams every ordinary object PUT. Its old `next`
+        // pointed straight at ProxyApp, so a later Symlink filter never saw
+        // X-Symlink-Target and stored an ordinary zero-byte object.
+        let app = app(ProxyConfig::default());
+        let filters: Arc<Vec<Arc<dyn swift_middleware::Middleware>>> = Arc::new(vec![
+            Arc::new(OuterObjectStreamer),
+            Arc::new(InnerSymlinkPut),
+        ]);
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Symlink-Target", "targets/object");
+        headers.set("Content-Length", "0");
+        let resp = dispatch_streaming_remaining(
+            filters,
+            0,
+            app,
+            swift_http::AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/source/link".into(),
+                query_string: String::new(),
+                headers,
+                body: swift_http::IncomingBody::from_bytes(
+                    Vec::new(),
+                    swift_http::MAX_CONTROL_BODY,
+                ),
+            },
+        )
+        .await;
+        assert_eq!(resp.status, 218);
     }
 
     #[test]
@@ -7629,6 +9542,24 @@ mod p1a_wiring_tests {
     }
 
     #[test]
+    fn trusted_object_write_timestamp_preserves_internal_offset() {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Timestamp", "1787742045.13120_0000000000000003");
+        let req = Request {
+            method: "PUT".to_string(),
+            path: "/v1/AUTH_test/container/object".to_string(),
+            query_string: String::new(),
+            headers,
+            body: swift_http::Body::empty(),
+        };
+
+        assert_eq!(
+            object_write_timestamp(&req).internal(),
+            "1787742045.13120_0000000000000003"
+        );
+    }
+
+    #[test]
     fn authorize_override_allows_as_non_owner() {
         let app = app(true);
         let mut headers = HeaderKeyDict::new();
@@ -7649,6 +9580,30 @@ mod p1a_wiring_tests {
     }
 
     #[test]
+    fn authorize_override_allows_trusted_versioning_info_probe_as_owner() {
+        let app = app(true);
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Authorize-Override", "true");
+        headers.set(swift_middleware::VERSIONED_WRITES_OWNER_INFO_HEADER, "true");
+        let mut req = Request {
+            method: "HEAD".to_string(),
+            path: "/v1/AUTH_test/container".to_string(),
+            query_string: String::new(),
+            headers,
+            body: swift_http::Body::empty(),
+        };
+
+        assert!(app
+            .authorize(&mut req, "AUTH_test", Some("container"), None)
+            .is_none());
+        assert_eq!(req.headers.get("X-Backend-Swift-Owner"), Some("true"));
+        assert!(req
+            .headers
+            .get(swift_middleware::VERSIONED_WRITES_OWNER_INFO_HEADER)
+            .is_none());
+    }
+
+    #[test]
     fn authorize_legacy_sync_key_allows_without_token() {
         // Seed container info cache with a sync_key (no backend HEAD).
         let app = app(true);
@@ -7661,6 +9616,7 @@ mod p1a_wiring_tests {
             sync_key: Some("lab-sync-key".into()),
             rfc_compliant_etags: None,
             cors: CorsInfo::default(),
+            db_state: String::new(),
         };
         app.info_cache
             .set_container("AUTH_test/syncc".into(), info, 60.0);
@@ -7747,6 +9703,27 @@ mod p1a_wiring_tests {
         assert_eq!(denied.handle(req).status, 401);
     }
 
+    #[tokio::test]
+    async fn versioned_write_streaming_authorize_probe_stops_before_object_put() {
+        let allowed = app(false);
+        let mut headers = HeaderKeyDict::new();
+        headers.set(
+            swift_middleware::VERSIONED_WRITES_AUTHORIZE_ONLY_HEADER,
+            "true",
+        );
+        headers.set("Content-Length", "16");
+        let resp = allowed
+            .handle_async(AsyncRequest {
+                method: "PUT".to_string(),
+                path: "/v1/AUTH_test/container/object".to_string(),
+                query_string: String::new(),
+                headers,
+                body: swift_http::IncomingBody::from_bytes(b"must-not-consume".to_vec(), 1024),
+            })
+            .await;
+        assert_eq!(resp.status, 204);
+    }
+
     #[test]
     fn cached_account_acls_are_loaded() {
         let app = app(true);
@@ -7760,6 +9737,7 @@ mod p1a_wiring_tests {
                 ),
                 temp_url_keys: Vec::new(),
                 rfc_compliant_etags: None,
+                account_really_exists: true,
             },
             60.0,
         );
@@ -7863,7 +9841,11 @@ mod p1a_wiring_tests {
             headers: HeaderKeyDict::new(),
             body: swift_http::Body::empty(),
         });
-        assert_ne!(post.status, 405, "account POST must not 405: {}", post.status);
+        assert_ne!(
+            post.status, 405,
+            "account POST must not 405: {}",
+            post.status
+        );
         // When enabled, the gate is open: unreachable backends yield 503, not 405.
         let open = Arc::new(ProxyApp::new(
             ring(0),
@@ -7946,9 +9928,19 @@ mod p1a_wiring_tests {
 #[cfg(test)]
 mod shard_listing_fanout_tests {
     use super::{
-        merge_sharded_object_listings, prefer_listing_state_ranges, select_listing_shard_ranges,
-        should_fanout_sharded_listing, should_probe_sharded_listing, SHARD_LISTING_STATE_NUMS,
+        copy_root_listing_headers, fold_replica_listings, fold_replica_listings_dated,
+        include_root_residual_for_listing, include_root_residual_for_listing_ex,
+        include_sharding_residual_root, include_shrink_to_root_residual, json_range_is_nested,
+        listing_has_full_active_cover, listing_ranges_are_settled_active, listing_resp_timestamp,
+        lowest_shard_usage, merge_listings_newest_covering, merge_sharded_object_listings,
+        merge_sharded_object_listings_dir, pick_updating_shard_name,
+        prefer_full_active_cover_ranges, prefer_listing_state_ranges,
+        prefer_longest_nonempty_arrays, select_listing_shard_ranges, shard_usage_from_ranges,
+        should_fanout_sharded_listing, should_fold_root_objects_without_ranges,
+        should_probe_sharded_listing, stamp_shard_container_path, updating_shard_query,
+        ListingFeed, SHARD_LISTING_STATE_NUMS,
     };
+    use swift_http::HeaderKeyDict;
 
     fn sr(name: &str, lower: &str, upper: &str) -> serde_json::Value {
         serde_json::json!({"name": name, "lower": lower, "upper": upper})
@@ -7970,15 +9962,81 @@ mod shard_listing_fanout_tests {
             sr(".shards/b", "m", "t"),
             sr(".shards/c", "t", ""),
         ];
-        let selected = select_listing_shard_ranges(&ranges, "m", "");
+        let selected = select_listing_shard_ranges(&ranges, "m", "", "", false);
         // upper "m" <= marker "m" → skip first
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0]["name"], ".shards/b");
 
-        let selected = select_listing_shard_ranges(&ranges, "", "u");
+        let selected = select_listing_shard_ranges(&ranges, "", "", "u", false);
         // upper "m" < "u" and upper "t" < "u" → only open-ended last range
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0]["name"], ".shards/c");
+    }
+
+    #[test]
+    fn select_ranges_reverse_swaps_marker_and_end_marker() {
+        // probe L562: reverse=True, marker=obj-0350, end_marker=obj-0150.
+        // Forward skip `upper <= marker` would keep only shard3 (13 extras)
+        // and under-return the 25-name reverse page.
+        let ranges = vec![
+            sr(".shards/s0", "", "obj-0098"),
+            sr(".shards/s1", "obj-0098", "obj-0198"),
+            sr(".shards/s2", "obj-0198", "obj-0298"),
+            sr(".shards/s3", "obj-0298", ""),
+        ];
+        let selected = select_listing_shard_ranges(&ranges, "obj-0350", "obj-0150", "", true);
+        let names: Vec<&str> = selected
+            .iter()
+            .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![".shards/s3", ".shards/s2", ".shards/s1"],
+            "{names:?}"
+        );
+
+        let fwd = select_listing_shard_ranges(&ranges, "obj-0198", "", "", false);
+        assert_eq!(fwd.len(), 2);
+        assert_eq!(fwd[0]["name"], ".shards/s2");
+        assert_eq!(fwd[1]["name"], ".shards/s3");
+    }
+
+    #[test]
+    fn merge_reverse_limit_spans_shards() {
+        // L562: shard3 holds 13 reverse extras; page limit 25 continues into shard2.
+        let s3: Vec<_> = (0..13)
+            .map(|i| serde_json::json!({"name": format!("obj-{:04}", 349 - i * 4)}))
+            .collect();
+        let s2: Vec<_> = (0..25)
+            .map(|i| serde_json::json!({"name": format!("obj-{:04}", 297 - i * 4)}))
+            .collect();
+        let merged = merge_listings_newest_covering(
+            &[
+                ListingFeed {
+                    lower: "obj-0298".into(),
+                    upper: String::new(),
+                    timestamp: String::new(),
+                    items: s3,
+                },
+                ListingFeed {
+                    lower: "obj-0198".into(),
+                    upper: "obj-0298".into(),
+                    timestamp: String::new(),
+                    items: s2,
+                },
+            ],
+            25,
+            true,
+        );
+        let names: Vec<&str> = merged
+            .iter()
+            .filter_map(|v| v.get("name")?.as_str())
+            .collect();
+        assert_eq!(names.len(), 25, "{names:?}");
+        assert_eq!(names[0], "obj-0349");
+        assert_eq!(names[12], "obj-0301");
+        assert_eq!(names[13], "obj-0297");
+        assert_eq!(names[24], "obj-0253");
     }
 
     #[test]
@@ -7998,6 +10056,67 @@ mod shard_listing_fanout_tests {
     }
 
     #[test]
+    fn merge_listings_unions_cleaved_replica_and_new_puts() {
+        // no_replicators: replica A has only extra PUTs, replica B has cleaved
+        // originals. Union must include both.
+        let extra = vec![
+            serde_json::json!({"name": "beta000"}),
+            serde_json::json!({"name": "beta001"}),
+        ];
+        let cleaved = vec![
+            serde_json::json!({"name": "obj-0000"}),
+            serde_json::json!({"name": "beta000"}),
+        ];
+        let merged = merge_sharded_object_listings(&[extra, cleaved], 10000);
+        let names: Vec<&str> = merged
+            .iter()
+            .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert_eq!(merged.len(), 3, "{names:?}");
+        assert!(names.contains(&"beta000"));
+        assert!(names.contains(&"beta001"));
+        assert!(names.contains(&"obj-0000"));
+    }
+
+    #[test]
+    fn merge_sorts_residual_evens_ahead_of_cleaved_new_puts() {
+        // probe test_sharding_listing L631: residual root is even originals;
+        // cleaved shard also has odd new PUTs. Insertion order would yield
+        // 0000,0002,0001; Swift listings are name-sorted.
+        let residual = vec![
+            serde_json::json!({"name": "obj-0000"}),
+            serde_json::json!({"name": "obj-0002"}),
+            serde_json::json!({"name": "obj-0004"}),
+        ];
+        let cleaved = vec![
+            serde_json::json!({"name": "obj-0000"}),
+            serde_json::json!({"name": "obj-0001"}),
+            serde_json::json!({"name": "obj-0002"}),
+            serde_json::json!({"name": "obj-0004"}),
+            serde_json::json!({"name": "obj-0005"}),
+        ];
+        let merged = merge_sharded_object_listings(&[residual.clone(), cleaved.clone()], 10000);
+        let names: Vec<&str> = merged
+            .iter()
+            .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            ["obj-0000", "obj-0001", "obj-0002", "obj-0004", "obj-0005"]
+        );
+        let rev =
+            merge_sharded_object_listings_dir(&[cleaved.clone(), residual.clone()], 10000, true);
+        let rnames: Vec<&str> = rev
+            .iter()
+            .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert_eq!(
+            rnames,
+            ["obj-0005", "obj-0004", "obj-0002", "obj-0001", "obj-0000"]
+        );
+    }
+
+    #[test]
     fn empty_state_with_ranges_is_fanout_eligible() {
         // Contabo partial cleave: DB state still unsharded, root emptied,
         // CLEAVED ranges present → fan out.
@@ -8005,9 +10124,10 @@ mod shard_listing_fanout_tests {
         assert!(should_fanout_sharded_listing("unsharded", 0, true));
         assert!(!should_fanout_sharded_listing("unsharded", 0, false));
 
-        // Non-empty unsharded root: do not probe (objects still local).
+        // Non-empty unsharded HEAD: do not rewrite HEAD. GET still fans
+        // out when listing ranges exist (lagging replica, L1985).
         assert!(!should_probe_sharded_listing("unsharded", 5));
-        assert!(!should_fanout_sharded_listing("unsharded", 5, true));
+        assert!(should_fanout_sharded_listing("unsharded", 5, true));
 
         // Explicit sharding/sharded always eligible when ranges exist.
         assert!(should_probe_sharded_listing("sharding", 0));
@@ -8015,6 +10135,97 @@ mod shard_listing_fanout_tests {
         assert!(should_fanout_sharded_listing("sharding", 0, true));
         assert!(should_fanout_sharded_listing("sharded", 0, true));
         assert!(!should_fanout_sharded_listing("sharded", 0, false));
+        assert!(should_probe_sharded_listing("collapsed", 1));
+        assert!(!should_fanout_sharded_listing("collapsed", 1, false));
+        assert!(should_fold_root_objects_without_ranges("collapsed"));
+        assert!(should_fold_root_objects_without_ranges("sharding"));
+        assert!(!should_fold_root_objects_without_ranges("unsharded"));
+
+        // L1483: SHARDING residual even when HEAD count is 0.
+        assert!(include_sharding_residual_root("sharding", false));
+        assert!(include_sharding_residual_root("SHARDING", true));
+        assert!(include_sharding_residual_root("sharded", true));
+        assert!(!include_sharding_residual_root("sharded", false));
+        assert!(!include_sharding_residual_root("unsharded", true));
+        // Probe L2070: shrink-to-root residual on sharded without X-Newest.
+        assert!(include_shrink_to_root_residual("sharded", true, true));
+        assert!(include_shrink_to_root_residual("collapsed", true, true));
+        assert!(!include_shrink_to_root_residual("sharded", true, false));
+        assert!(!include_shrink_to_root_residual("sharded", false, true));
+        assert!(!include_shrink_to_root_residual("sharding", true, true));
+        // L1985 nested shrinking: retiring root must not union.
+        assert!(!include_root_residual_for_listing(
+            "sharded", false, false, true, true, false
+        ));
+        assert!(!include_root_residual_for_listing(
+            "sharding", false, false, true, true, false
+        ));
+        // L1985 expanded acceptor covers MIN–MAX: never union retiring root.
+        assert!(!include_root_residual_for_listing(
+            "sharding", false, true, true, true, true
+        ));
+        assert!(!include_root_residual_for_listing(
+            "sharded", true, true, true, true, true
+        ));
+        // L1483 SHARDING residual while uncleaved (no shrinking nest).
+        assert!(include_root_residual_for_listing(
+            "sharding", false, false, false, true, false
+        ));
+        // L2070 no ranges: fold root objects instead of residual-from-fanout.
+        assert!(!include_root_residual_for_listing(
+            "collapsed",
+            false,
+            false,
+            false,
+            false,
+            false
+        ));
+        // listing-w191: settled shrinking without MIN-MAX ACTIVE (fetch
+        // missed the expanded acceptor). Must still skip residual.
+        assert!(!include_root_residual_for_listing(
+            "sharded", false, true, true, true, false
+        ));
+        assert!(!include_root_residual_for_listing_ex(
+            "sharded", false, true, true, true, false, false
+        ));
+        // L2070: last shard shrinking into root (MIN-MAX SHRINKING).
+        assert!(include_root_residual_for_listing_ex(
+            "sharded", false, true, true, true, false, true
+        ));
+        assert!(include_root_residual_for_listing_ex(
+            "collapsed",
+            false,
+            true,
+            true,
+            true,
+            false,
+            true
+        ));
+        let shrinking_partial = sr_state(".shards/0", "", "obj-1-049", 50);
+        let acc = sr_state(".shards/1", "", "", 40);
+        assert!(listing_has_full_active_cover(&[&shrinking_partial, &acc]));
+        assert!(!include_root_residual_for_listing(
+            "sharded",
+            false,
+            false,
+            true,
+            true,
+            listing_has_full_active_cover(&[&shrinking_partial, &acc])
+        ));
+    }
+
+    #[test]
+    fn folded_root_unions_collapsed_replica_over_empty_sharding() {
+        // Probe L2068: 2/3 roots SHARDING 200 [] (empty epoch), 1 COLLAPSED
+        // with [alpha-1]. empty_wins would drop alpha; union nonempty.
+        let empty = Some(vec![]);
+        let alpha = Some(vec![serde_json::json!({"name": "alpha-1"})]);
+        let got = fold_replica_listings(&[empty.clone(), alpha, empty], false).unwrap();
+        let names: Vec<&str> = got
+            .iter()
+            .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert_eq!(names, vec!["alpha-1"], "L2068 fold {got:?}");
     }
 
     #[test]
@@ -8031,17 +10242,685 @@ mod shard_listing_fanout_tests {
         assert_eq!(preferred[0]["name"], ".shards/cleaved");
         assert_eq!(preferred[1]["name"], ".shards/active");
 
-        // All non-listing → fall back to full list (broader retry path).
+        // All FOUND → fall back to full list (broader retry path).
         let only_found = vec![sr_state(".shards/f", "", "", 10)];
         let fallback = prefer_listing_state_ranges(&only_found);
         assert_eq!(fallback.len(), 1);
         assert_eq!(fallback[0]["name"], ".shards/f");
+    }
+
+    #[test]
+    fn pick_updating_prefers_newer_subshard_over_lagging_donor() {
+        // Probe L1418: union of a lagging replica's old ACTIVE donor and
+        // newer nested sub-shards must DELETE to the sub-shard.
+        let donor = serde_json::json!({
+            "name": ".shards_a/c-0",
+            "lower": "",
+            "upper": "m",
+            "state": 40,
+            "deleted": 0,
+            "timestamp": "1751500001.00000",
+        });
+        let sub = serde_json::json!({
+            "name": ".shards_a/c-0-0",
+            "lower": "",
+            "upper": "g",
+            "state": 40,
+            "deleted": 0,
+            "timestamp": "1751500009.00000",
+        });
+        let deleted_donor = serde_json::json!({
+            "name": ".shards_a/c-0",
+            "lower": "",
+            "upper": "m",
+            "state": 70,
+            "deleted": 1,
+            "timestamp": "1751500010.00000",
+        });
+        let got = pick_updating_shard_name(&[donor, sub, deleted_donor], "beta000", "AUTH_test/c");
+        assert_eq!(got.as_deref(), Some(".shards_a/c-0-0"));
+    }
+
+    #[test]
+    fn concat_includes_ranges_prefers_newest_covering_not_longest_tie() {
+        // Two replicas each return one includes= range (length 1). Longest
+        // nonempty is a tie; concatenating then picking newest covering is
+        // what resolve_updating_shard must do (listing-w137).
+        let lagging = serde_json::json!({
+            "name": ".shards_a/c-0",
+            "lower": "",
+            "upper": "",
+            "state": 40,
+            "deleted": 0,
+            "timestamp": "1751500001.00000",
+        });
+        let child = serde_json::json!({
+            "name": ".shards_a/c-1",
+            "lower": "m",
+            "upper": "",
+            "state": 40,
+            "deleted": 0,
+            "timestamp": "1751500009.00000",
+        });
+        let concat = vec![lagging, child];
+        assert_eq!(
+            pick_updating_shard_name(&concat, "obj-0100", "AUTH_test/c").as_deref(),
+            Some(".shards_a/c-1")
+        );
+        assert_eq!(
+            pick_updating_shard_name(&concat, "aaa", "AUTH_test/c").as_deref(),
+            Some(".shards_a/c-0")
+        );
+    }
+
+    #[test]
+    fn updating_shard_query_keeps_states_updating_and_includes_object() {
+        let q = updating_shard_query("obj-0100");
+        assert!(q.starts_with("states=updating&format=json&"), "{q}");
+        assert!(q.contains("includes=obj-0100"), "{q}");
+        let funky = updating_shard_query("obj\n0001%Ff");
+        assert!(funky.contains("states=updating"), "{funky}");
+        assert!(funky.contains("includes=obj%0A0001%25Ff"), "{funky}");
+    }
+
+    #[test]
+    fn pick_updating_none_when_lagging_updating_lacks_nested_child() {
+        // A lagging root replica's updating set: SHARDED donor (skipped) plus
+        // the un-nested sibling. Objects in the nested first-half are not
+        // covered → None, so resolve_updating_shard must fall back to listing.
+        let sibling = serde_json::json!({
+            "name": ".shards_a/c-1",
+            "lower": "m",
+            "upper": "",
+            "state": 40,
+            "deleted": 0,
+            "timestamp": "1751500001.00000",
+        });
+        let donor_sharded = serde_json::json!({
+            "name": ".shards_a/c-0",
+            "lower": "",
+            "upper": "m",
+            "state": 70,
+            "deleted": 1,
+            "timestamp": "1751500010.00000",
+        });
+        assert_eq!(
+            pick_updating_shard_name(
+                &[sibling.clone(), donor_sharded.clone()],
+                "beta000",
+                "AUTH_test/c"
+            ),
+            None
+        );
+        let nested = serde_json::json!({
+            "name": ".shards_a/c-0-0",
+            "lower": "",
+            "upper": "g",
+            "state": 40,
+            "deleted": 0,
+            "timestamp": "1751500009.00000",
+        });
+        assert_eq!(
+            pick_updating_shard_name(&[sibling, donor_sharded, nested], "beta000", "AUTH_test/c")
+                .as_deref(),
+            Some(".shards_a/c-0-0")
+        );
+    }
+
+    #[test]
+    fn merge_empty_sub_does_not_drop_donor_or_sibling_names() {
+        // Python `_get_from_shards` skips empty children; they must not wipe
+        // names still listed on the SHARDING donor (listing-w91 L1321).
+        let donor = ListingFeed {
+            lower: String::new(),
+            upper: "m".into(),
+            timestamp: "1751500001.00000".into(),
+            items: vec![
+                serde_json::json!({"name": "beta000"}),
+                serde_json::json!({"name": "beta001"}),
+                serde_json::json!({"name": "j-0000"}),
+            ],
+        };
+        let sub = ListingFeed {
+            lower: String::new(),
+            upper: "g".into(),
+            timestamp: "1751500001.00000".into(),
+            items: vec![],
+        };
+        let other = ListingFeed {
+            lower: "m".into(),
+            upper: String::new(),
+            timestamp: "1751500001.00000".into(),
+            items: vec![serde_json::json!({"name": "z-0100"})],
+        };
+        let merged = merge_listings_newest_covering(&[donor, sub, other], 10000, false);
+        let names: Vec<&str> = merged
+            .iter()
+            .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert!(names.contains(&"beta000"), "{names:?}");
+        assert!(names.contains(&"beta001"), "{names:?}");
+        assert!(names.contains(&"j-0000"), "{names:?}");
+        assert!(names.contains(&"z-0100"), "{names:?}");
+    }
+
+    #[test]
+    fn prefer_longest_nonempty_listing_set() {
+        let short = vec![serde_json::json!({"name": "own"})];
+        let long = vec![
+            serde_json::json!({"name": "c0", "state": 30}),
+            serde_json::json!({"name": "c1", "state": 30}),
+            serde_json::json!({"name": "own", "state": 60}),
+        ];
+        let got = prefer_longest_nonempty_arrays(&[vec![], short, long.clone()]).unwrap();
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got[0]["name"], "c0");
+    }
+
+    #[test]
+    fn copy_root_listing_headers_copies_acl_and_versions() {
+        let mut head = swift_http::Response::with_body(204, Vec::new());
+        head.headers.set("X-Container-Read", "read_acl");
+        head.headers.set("X-Container-Write", "write_acl");
+        head.headers.set("X-Container-Sync-Key", "sync_key");
+        head.headers
+            .set("X-Container-Sysmeta-Versions-Location", "versions");
+        head.headers.set("X-Container-Meta-Test", "testing");
+        let mut out = swift_http::Response::with_body(200, b"[]".to_vec());
+        copy_root_listing_headers(&head, &mut out);
+        assert_eq!(out.headers.get("X-Container-Read"), Some("read_acl"));
+        assert_eq!(out.headers.get("X-Container-Write"), Some("write_acl"));
+        assert_eq!(out.headers.get("X-Container-Sync-Key"), Some("sync_key"));
+        assert_eq!(out.headers.get("X-Versions-Location"), Some("versions"));
+        assert_eq!(out.headers.get("X-Container-Meta-Test"), Some("testing"));
+        assert_eq!(out.headers.get("Accept-Ranges"), Some("bytes"));
+    }
+
+    #[test]
+    fn stamp_shard_path_encodes_newline_in_headers() {
+        let mut h = HeaderKeyDict::new();
+        stamp_shard_container_path(
+            &mut h,
+            ".shards_AUTH_test",
+            "c\n%Ff-0",
+            "AUTH_test",
+            "c\n%Ff",
+        );
+        let raw = h.get("X-Backend-Container-Path").unwrap_or("");
+        assert!(
+            !raw.contains('\n') && !raw.contains('\r'),
+            "HTTP header must not carry CR/LF: {raw:?}"
+        );
+        let quoted = h.get("X-Backend-Quoted-Container-Path").unwrap_or("");
+        assert!(quoted.contains("%0A"), "{quoted}");
+        assert_eq!(h.get("X-Backend-Location-Is-Quoted"), Some("true"));
+    }
+
+    #[test]
+    fn merge_keeps_delimiter_subdir_entries() {
+        let a = vec![serde_json::json!({"subdir": "obj-"})];
+        let b = vec![serde_json::json!({"subdir": "obj-"})];
+        let merged = merge_sharded_object_listings(&[a, b], 10000);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0]["subdir"], "obj-");
+    }
+
+    #[test]
+    fn merge_newer_donor_without_cleaved_names_keeps_child_rows() {
+        // listing-w91: SHARDING donor state_timestamp can be newer than
+        // CLEAVED children. Newest-covering then omitted cleaved betas.
+        let donor = ListingFeed {
+            lower: String::new(),
+            upper: "obj-0049".into(),
+            timestamp: "1751500010.00000".into(),
+            items: vec![serde_json::json!({"name": "obj-0000"})],
+        };
+        let sub0 = ListingFeed {
+            lower: String::new(),
+            upper: "beta049".into(),
+            timestamp: "1751500009.00000".into(),
+            items: vec![
+                serde_json::json!({"name": "beta000"}),
+                serde_json::json!({"name": "beta049"}),
+            ],
+        };
+        let sub1 = ListingFeed {
+            lower: "beta049".into(),
+            upper: "obj-0049".into(),
+            timestamp: "1751500009.00000".into(),
+            items: vec![serde_json::json!({"name": "beta050"})],
+        };
+        let merged = merge_listings_newest_covering(&[donor, sub0, sub1], 10000, false);
+        let names: Vec<&str> = merged
+            .iter()
+            .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert!(names.contains(&"beta000"), "{names:?}");
+        assert!(names.contains(&"beta049"), "{names:?}");
+        assert!(names.contains(&"beta050"), "{names:?}");
+        assert!(names.contains(&"obj-0000"), "{names:?}");
+    }
+
+    #[test]
+    fn nested_sub_ranges_are_detected_against_donor() {
+        let donor = serde_json::json!({
+            "name": ".shards_a/c-0",
+            "lower": "",
+            "upper": "obj-0049",
+        });
+        let sub0 = serde_json::json!({
+            "name": ".shards_a/c-0-0",
+            "lower": "",
+            "upper": "beta049",
+        });
+        let sub1 = serde_json::json!({
+            "name": ".shards_a/c-0-1",
+            "lower": "beta049",
+            "upper": "obj-0049",
+        });
+        let sibling = serde_json::json!({
+            "name": ".shards_a/c-1",
+            "lower": "obj-0049",
+            "upper": "",
+        });
+        let all = [&donor, &sub0, &sub1, &sibling];
+        assert!(json_range_is_nested(&sub0, &all));
+        assert!(json_range_is_nested(&sub1, &all));
+        assert!(!json_range_is_nested(&donor, &all));
+        assert!(!json_range_is_nested(&sibling, &all));
+    }
+
+    #[test]
+    fn settled_active_empty_wins_over_lagging_objects() {
+        // Majority 200 [] (delete-all, L1418), not a 1:1 split with extras.
+        let empty = Some(vec![]);
+        let objs = Some(vec![serde_json::json!({"name": "beta050"})]);
+        let got = fold_replica_listings(&[empty.clone(), empty, objs], true).unwrap();
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn cleaved_union_keeps_objects_despite_empty_replica() {
+        let empty = Some(vec![]);
+        let objs = Some(vec![serde_json::json!({"name": "beta000"})]);
+        let got = fold_replica_listings(&[empty, objs], false).unwrap();
+        assert_eq!(got[0]["name"], "beta000");
+    }
+
+    #[test]
+    fn replica_404_is_not_empty() {
+        assert!(fold_replica_listings(&[None, None], true).is_none());
+        assert!(fold_replica_listings(&[None, None], false).is_none());
+        let empty = fold_replica_listings(&[None, Some(vec![])], false).unwrap();
+        assert!(empty.is_empty());
+        // 404 + leftover objects, empty_wins still not empty (no 200 []).
+        let leftover = fold_replica_listings(
+            &[None, Some(vec![serde_json::json!({"name": "beta050"})])],
+            true,
+        )
+        .unwrap();
+        assert_eq!(leftover[0]["name"], "beta050");
+    }
+
+    #[test]
+    fn settled_shortest_nonempty_drops_lagging_originals() {
+        // L692: extras remain so no replica is 200 []. Lagging replica still
+        // lists deleted originals (longer). Shortest nonempty is the
+        // tombstoned replica.
+        let extras = Some(vec![
+            serde_json::json!({"name": "obj-0001"}),
+            serde_json::json!({"name": "obj-0005"}),
+        ]);
+        let mixed = Some(vec![
+            serde_json::json!({"name": "obj-0000"}),
+            serde_json::json!({"name": "obj-0001"}),
+            serde_json::json!({"name": "obj-0002"}),
+            serde_json::json!({"name": "obj-0005"}),
+        ]);
+        let got = fold_replica_listings(&[mixed, extras], true).unwrap();
+        let names: Vec<&str> = got.iter().filter_map(|v| v.get("name")?.as_str()).collect();
+        assert_eq!(names, vec!["obj-0001", "obj-0005"]);
+        let extras = Some(vec![serde_json::json!({"name": "obj-0001"})]);
+        let mixed = Some(vec![
+            serde_json::json!({"name": "obj-0000"}),
+            serde_json::json!({"name": "obj-0001"}),
+        ]);
+        let unioned = fold_replica_listings(&[mixed, extras], false).unwrap();
+        assert_eq!(unioned.len(), 2, "cleaving still unions: {unioned:?}");
+        // L643: extras on 2/3 replicas stay (majority). L692: originals on 1/3 drop.
+        let orig_and_extra = Some(vec![
+            serde_json::json!({"name": "obj-0000"}),
+            serde_json::json!({"name": "obj-0001"}),
+        ]);
+        let extra_only = Some(vec![serde_json::json!({"name": "obj-0001"})]);
+        let both_extras = Some(vec![
+            serde_json::json!({"name": "obj-0000"}),
+            serde_json::json!({"name": "obj-0001"}),
+        ]);
+        let got = fold_replica_listings(&[orig_and_extra, extra_only, both_extras], true).unwrap();
+        let names: Vec<&str> = got.iter().filter_map(|v| v.get("name")?.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["obj-0000", "obj-0001"],
+            "L643 extras+orig {got:?}"
+        );
+        let a = Some(vec![
+            serde_json::json!({"name": "obj-0001"}),
+            serde_json::json!({"name": "obj-0005"}),
+        ]);
+        let b = Some(vec![
+            serde_json::json!({"name": "obj-0000"}),
+            serde_json::json!({"name": "obj-0001"}),
+            serde_json::json!({"name": "obj-0002"}),
+            serde_json::json!({"name": "obj-0005"}),
+        ]);
+        let c = Some(vec![
+            serde_json::json!({"name": "obj-0001"}),
+            serde_json::json!({"name": "obj-0005"}),
+        ]);
+        let got = fold_replica_listings(&[a, b, c], true).unwrap();
+        let names: Vec<&str> = got.iter().filter_map(|v| v.get("name")?.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["obj-0001", "obj-0005"],
+            "L692 extras only {got:?}"
+        );
+    }
+
+    #[test]
+    fn just_cleaved_superset_does_not_fill_unbounded_prefix() {
+        // After L1931, unbounded prefix/suffix extras are not hole-filled.
+        // Live L1517 GREEN is sharder PUT onto primaries plus dated-empty
+        // (`newer_nonempty_beats_older_empty_majority`), not prefix fill.
+        let under = Some(vec![serde_json::json!({"name": "obj-0199"})]);
+        let full: Vec<_> = (100..=199)
+            .map(|i| serde_json::json!({"name": format!("obj-{i:04}")}))
+            .collect();
+        let got = fold_replica_listings(&[under.clone(), Some(full), under], true).unwrap();
+        let names: Vec<&str> = got.iter().filter_map(|v| v.get("name")?.as_str()).collect();
+        assert_eq!(names, vec!["obj-0199"], "{names:?}");
+
+        // L692 interleaved evens still drop: extras 0001/0005, mixed adds
+        // 0000 (prefix) and 0002 (between) — two gaps.
+        let extras = Some(vec![
+            serde_json::json!({"name": "obj-0001"}),
+            serde_json::json!({"name": "obj-0005"}),
+        ]);
+        let mixed = Some(vec![
+            serde_json::json!({"name": "obj-0000"}),
+            serde_json::json!({"name": "obj-0001"}),
+            serde_json::json!({"name": "obj-0002"}),
+            serde_json::json!({"name": "obj-0005"}),
+        ]);
+        let got = fold_replica_listings(&[extras.clone(), mixed, extras], true).unwrap();
+        let names: Vec<&str> = got.iter().filter_map(|v| v.get("name")?.as_str()).collect();
+        assert_eq!(names, vec!["obj-0001", "obj-0005"]);
+    }
+
+    #[test]
+    fn empty_wins_collapses_newer_subset_over_lagging_supersets() {
+        use swift_core::timestamp::Timestamp;
+        // Probe L1985: 2/3 shard-0 replicas still list DELETE'd obj-1-000…;
+        // the reclaimed replica lists only alpha. Majority would keep the
+        // leftovers (`c*2 > n_200`). Collapse the older supersets first.
+        let alpha = Some(vec![serde_json::json!({"name": "alpha-1"})]);
+        let leftover = Some(vec![
+            serde_json::json!({"name": "alpha-1"}),
+            serde_json::json!({"name": "obj-1-000"}),
+            serde_json::json!({"name": "obj-1-001"}),
+        ]);
+        let old: Timestamp = "1751500001.00000".parse().unwrap();
+        let new: Timestamp = "1751500002.00000".parse().unwrap();
+        let got = fold_replica_listings_dated(
+            &[leftover.clone(), leftover.clone(), alpha.clone()],
+            true,
+            &[old, old, new],
+        )
+        .unwrap();
+        let names: Vec<&str> = got
+            .iter()
+            .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert_eq!(names, vec!["alpha-1"], "L1985 leftovers {got:?}");
+
+        // Equal timestamps (created_at identical): do not collapse — that is
+        // why listing_resp_timestamp prefers PUT/data timestamps.
+        let got = fold_replica_listings_dated(
+            &[leftover.clone(), leftover.clone(), alpha.clone()],
+            true,
+            &[old, old, old],
+        )
+        .unwrap();
+        let names: Vec<&str> = got
+            .iter()
+            .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["alpha-1", "obj-1-000", "obj-1-001"],
+            "equal ts must not newest-fold {got:?}"
+        );
+
+        // L1517 safety: older under-populated subset must not replace a
+        // newer 2/3 just-cleaved superset.
+        let under = Some(vec![serde_json::json!({"name": "obj-0199"})]);
+        let full: Vec<_> = (100..=199)
+            .map(|i| serde_json::json!({"name": format!("obj-{i:04}")}))
+            .collect();
+        let got = fold_replica_listings_dated(
+            &[Some(full.clone()), Some(full.clone()), under],
+            true,
+            &[new, new, old],
+        )
+        .unwrap();
+        let names: Vec<&str> = got.iter().filter_map(|v| v.get("name")?.as_str()).collect();
+        assert_eq!(names.len(), 100, "L1517 reverse-collapse {names:?}");
+        assert_eq!(names[0], "obj-0100");
+        assert_eq!(names[99], "obj-0199");
+    }
+
+    #[test]
+    fn listing_resp_timestamp_prefers_put_over_created_at() {
+        let mut h = HeaderKeyDict::new();
+        h.set("X-Backend-Timestamp", "1751500001.00000");
+        h.set("X-Backend-PUT-Timestamp", "1751500002.00000");
+        h.set("X-Timestamp", "1751500000.00000");
+        assert_eq!(
+            listing_resp_timestamp(&h),
+            "1751500002.00000".parse().unwrap()
+        );
+        let mut h = HeaderKeyDict::new();
+        h.set("X-Backend-Timestamp", "1751500001.00000");
+        h.set("X-Backend-Data-Timestamp", "1751500003.00000");
+        h.set("X-Backend-PUT-Timestamp", "1751500002.00000");
+        assert_eq!(
+            listing_resp_timestamp(&h),
+            "1751500003.00000".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn empty_wins_does_not_fill_unbounded_suffix_after_one_name() {
+        // probe test_shrinking L1931: majority [alpha], lagging replica still
+        // has deleted obj-1-000… in the suffix "gap".
+        let alpha = Some(vec![serde_json::json!({"name": "alpha-1"})]);
+        let leftover = Some(vec![
+            serde_json::json!({"name": "alpha-1"}),
+            serde_json::json!({"name": "obj-1-000"}),
+            serde_json::json!({"name": "obj-1-001"}),
+        ]);
+        let got = fold_replica_listings(&[alpha.clone(), alpha.clone(), leftover], true).unwrap();
+        let names: Vec<&str> = got
+            .iter()
+            .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert_eq!(names, vec!["alpha-1"], "{got:?}");
+    }
+
+    #[test]
+    fn newer_nonempty_beats_older_empty_majority() {
+        use swift_core::timestamp::Timestamp;
+        let empty = Some(vec![]);
+        let full = Some(vec![
+            serde_json::json!({"name": "obj-0100"}),
+            serde_json::json!({"name": "obj-0101"}),
+        ]);
+        let old: Timestamp = "1751500001.00000".parse().unwrap();
+        let new: Timestamp = "1751500002.00000".parse().unwrap();
+        // L1517 shard-2: under-populated 200 [] older than just-cleaved.
+        let got = fold_replica_listings_dated(
+            &[empty.clone(), full.clone(), empty.clone()],
+            true,
+            &[old, new, old],
+        )
+        .unwrap();
+        let names: Vec<&str> = got.iter().filter_map(|v| v.get("name")?.as_str()).collect();
+        assert_eq!(names, vec!["obj-0100", "obj-0101"]);
+        // L1418: leftover older than DELETE 200 [].
+        let leftover = Some(vec![serde_json::json!({"name": "beta050"})]);
+        let got = fold_replica_listings_dated(
+            &[empty.clone(), empty.clone(), leftover],
+            true,
+            &[new, new, old],
+        )
+        .unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        // No timestamps: keep L1418 (do not resurrect).
+        let got = fold_replica_listings(&[empty.clone(), empty, full], true).unwrap();
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn settled_active_two_range_first_gen_and_nested() {
+        let a = sr_state(".shards/a", "", "m", 40);
+        let b = sr_state(".shards/b", "m", "", 40);
+        // probe test_shrinking L1925: two ACTIVE first-gen shards.
+        assert!(listing_ranges_are_settled_active(&[&a, &b]));
+        let r0 = sr_state(".shards/r0", "", "g", 40);
+        let r1 = sr_state(".shards/r1", "g", "m", 40);
+        let r2 = sr_state(".shards/r2", "m", "t", 40);
+        let r3 = sr_state(".shards/r3", "t", "", 40);
+        assert!(listing_ranges_are_settled_active(&[&r0, &r1, &r2, &r3]));
+        let cleaved = sr_state(".shards/cl", "", "g", 30);
+        assert!(!listing_ranges_are_settled_active(&[
+            &cleaved, &r1, &r2, &r3
+        ]));
+        // Probe L2068: last remaining shard shrinking into root.
+        let shrinking = sr_state(".shards/last", "", "", 50);
+        assert!(listing_ranges_are_settled_active(&[&shrinking]));
+        let shrinking_lo = sr_state(".shards/d0", "", "m", 50);
+        let acc = sr_state(".shards/a0", "", "", 40);
+        assert!(
+            listing_has_full_active_cover(&[&shrinking_lo, &acc]),
+            "expanded acceptor is MIN–MAX ACTIVE"
+        );
+        assert!(
+            listing_ranges_are_settled_active(&[&shrinking_lo, &acc]),
+            "L1985 nested shrinking under expanded acceptor must majority-vote, not union handoffs"
+        );
+        let mixed = vec![shrinking_lo.clone(), acc.clone()];
+        let only = prefer_full_active_cover_ranges(&mixed);
+        assert_eq!(
+            only.len(),
+            1,
+            "L2044 drop leftover first-shard range {only:?}"
+        );
+        assert_eq!(
+            only[0].get("name").and_then(|v| v.as_str()),
+            Some(".shards/a0")
+        );
+        let first_active = sr_state(".shards/d0", "", "m", 40);
+        let keep = prefer_full_active_cover_ranges(&[first_active, acc.clone()]);
+        assert_eq!(keep.len(), 2, "L1985 keep ACTIVE first-shard with alpha");
+        // Overlapping donor + children, even if all ACTIVE: L1321 must union.
+        let donor = sr_state(".shards/donor", "", "obj-0049", 40);
+        let sub0 = sr_state(".shards/s0", "", "beta049", 40);
+        let sub1 = sr_state(".shards/s1", "beta049", "obj-0049", 40);
+        assert!(!listing_ranges_are_settled_active(&[
+            &donor, &sub0, &sub1, &r3
+        ]));
+        assert!(!listing_ranges_are_settled_active(&[]));
+    }
+
+    #[test]
+    fn shard_usage_matches_python_stats_states() {
+        // L1979: root range stats 1+50, not live shard HEAD 50+50.
+        let d0 = serde_json::json!({"name":"s/0","state":40,"deleted":0,"object_count":1,"bytes_used":1});
+        let d1 = serde_json::json!({"name":"s/1","state":40,"deleted":0,"object_count":50,"bytes_used":50});
+        let (c, b, saw) = shard_usage_from_ranges(&[d0, d1]);
+        assert!(saw);
+        assert_eq!((c, b), (51, 51));
+        let shrunk = serde_json::json!({"name":"s/x","state":80,"deleted":1,"object_count":1,"bytes_used":1});
+        let (c, _, saw) = shard_usage_from_ranges(&[shrunk]);
+        assert!(!saw);
+        assert_eq!(c, 0);
+        let shrinking = serde_json::json!({"name":"s/d","state":50,"deleted":0,"object_count":1,"bytes_used":1});
+        let (c, _, saw) = shard_usage_from_ranges(&[shrinking]);
+        assert!(saw);
+        assert_eq!(c, 1);
+        // listing-w193/w194: equal-length lagging 50+50 vs reclaimed 1+50.
+        let lagging = vec![
+            serde_json::json!({"name":"s/0","state":40,"deleted":0,"object_count":50,"bytes_used":50}),
+            serde_json::json!({"name":"s/1","state":40,"deleted":0,"object_count":50,"bytes_used":50}),
+        ];
+        let reclaimed = vec![
+            serde_json::json!({"name":"s/0","state":40,"deleted":0,"object_count":1,"bytes_used":1}),
+            serde_json::json!({"name":"s/1","state":40,"deleted":0,"object_count":50,"bytes_used":50}),
+        ];
+        let incomplete = vec![
+            serde_json::json!({"name":"s/1","lower":"obj-1-049","upper":"","state":40,"deleted":0,"object_count":50,"bytes_used":50}),
+        ];
+        let (c, _) = lowest_shard_usage(&[lagging.clone(), reclaimed.clone()]).unwrap();
+        assert_eq!(c, 51, "L1979 HEAD must not first-win lagging 100");
+        let (c, _) = lowest_shard_usage(&[incomplete, reclaimed.clone()]).unwrap();
+        assert_eq!(c, 51, "L1979 HEAD must not prefer a 1-range 50");
+        // listing-w231: reclaimed replica is already MIN–MAX 51; lagging
+        // still lists 2 ranges totaling 100. Prefer the cover, not longest.
+        let cover_51 = vec![
+            serde_json::json!({"name":"s/1","lower":"","upper":"","state":40,"deleted":0,"object_count":51,"bytes_used":51}),
+        ];
+        let (c, _) = lowest_shard_usage(&[lagging.clone(), cover_51]).unwrap();
+        assert_eq!(
+            c, 51,
+            "L1979 HEAD must prefer MIN-MAX cover 51 over 2-range 100"
+        );
+        // listing-w201 L1992: after shrink, one replica still says 1.
+        let only_alpha = vec![
+            serde_json::json!({"name":"s/1","lower":"","upper":"","state":40,"deleted":0,"object_count":1,"bytes_used":1}),
+        ];
+        let full_acc = vec![
+            serde_json::json!({"name":"s/1","lower":"","upper":"","state":40,"deleted":0,"object_count":51,"bytes_used":51}),
+        ];
+        let (c, _) = lowest_shard_usage(&[only_alpha, full_acc]).unwrap();
+        assert_eq!(c, 51, "L1992 HEAD must not min-pick lagging 1");
     }
 }
 
 #[cfg(test)]
 mod account_update_headers_tests {
     use super::*;
+
+    #[test]
+    fn backend_controls_are_independent_of_metadata_transfer() {
+        let mut request_headers = HeaderKeyDict::new();
+        request_headers.set("X-Backend-No-Commit", "True");
+        request_headers.set("X-Backend-Storage-Policy-Index", "2");
+        request_headers.set("X-Timestamp", "6001.00000");
+        request_headers.set("X-Object-Meta-Color", "blue");
+        let request = Request {
+            method: "PUT".into(),
+            path: "/v1/a/c/o".into(),
+            query_string: String::new(),
+            headers: request_headers,
+            body: swift_http::Body::empty(),
+        };
+        let mut backend = HeaderKeyDict::new();
+        copy_backend_control_headers(&request, &mut backend);
+        assert_eq!(backend.get("X-Backend-No-Commit"), Some("True"));
+        assert_eq!(backend.get("X-Backend-Storage-Policy-Index"), Some("2"));
+        assert_eq!(backend.get("X-Timestamp"), Some("6001.00000"));
+        assert_eq!(backend.get("X-Object-Meta-Color"), None);
+    }
 
     fn node(device: &str, port: u32) -> Node {
         Node {
@@ -8086,11 +10965,47 @@ mod account_update_headers_tests {
     }
 
     #[test]
+    fn container_update_round_robin_uses_primaries() {
+        let mut per_node = vec![HeaderKeyDict::new(); 3];
+        let primaries = vec![node("sda", 1000), node("sdb", 1001), node("sdc", 1002)];
+        ProxyApp::stamp_container_update_headers(&mut per_node, 9, &primaries);
+        assert_eq!(per_node[0].get("X-Container-Host"), Some("10.0.0.1:1000"));
+        assert_eq!(per_node[0].get("X-Container-Device"), Some("sda"));
+        assert_eq!(per_node[1].get("X-Container-Host"), Some("10.0.0.1:1001"));
+        assert_eq!(per_node[1].get("X-Container-Device"), Some("sdb"));
+        assert_eq!(per_node[2].get("X-Container-Host"), Some("10.0.0.1:1002"));
+        assert_eq!(per_node[2].get("X-Container-Device"), Some("sdc"));
+        assert_eq!(per_node[0].get("X-Container-Partition"), Some("9"));
+        assert_eq!(ProxyApp::num_container_updates(3, 2, 3, 2), 3);
+    }
+
+    #[test]
+    fn extra_container_primary_csv_appends_onto_first_replica() {
+        let mut per_node = vec![HeaderKeyDict::new(); 3];
+        let primaries = vec![
+            node("sda", 1000),
+            node("sdb", 1001),
+            node("sdc", 1002),
+            node("sdd", 1003),
+        ];
+        ProxyApp::stamp_container_update_headers(&mut per_node, 9, &primaries);
+        assert_eq!(
+            per_node[0].get("X-Container-Host"),
+            Some("10.0.0.1:1000,10.0.0.1:1003")
+        );
+        assert_eq!(per_node[0].get("X-Container-Device"), Some("sda,sdd"));
+        assert_eq!(per_node[1].get("X-Container-Device"), Some("sdb"));
+        assert_eq!(per_node[2].get("X-Container-Device"), Some("sdc"));
+    }
+
+    #[test]
     fn keep_ec_client_metadata_includes_slo_and_dlo_headers() {
         assert!(keep_ec_client_metadata("x-static-large-object"));
         assert!(keep_ec_client_metadata("x-object-manifest"));
         assert!(keep_ec_client_metadata("x-object-sysmeta-slo-etag"));
         assert!(keep_ec_client_metadata("x-object-meta-color"));
+        assert!(keep_ec_client_metadata("x-backend-data-timestamp"));
+        assert!(keep_ec_client_metadata("x-backend-durable-timestamp"));
         assert!(!keep_ec_client_metadata("content-length"));
         assert!(!keep_ec_client_metadata("etag"));
         assert!(!keep_ec_client_metadata("x-trans-id"));

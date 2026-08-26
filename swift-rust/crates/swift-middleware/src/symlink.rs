@@ -54,10 +54,11 @@
 //!   target size falls back from `X-Object-Sysmeta-Slo-Size` to
 //!   `Content-Length`, but the override-etag rewrite for SLO manifests is
 //!   deferred.
-//! * The `swift.symlink_override` fast path (versioned_writes integration),
-//!   `X-Backend-Allow-Reserved-Names` / `make_pre_authed_request` reserved
-//!   -name subrequests, and the `swift.leave_relative_location` POST flag
-//!   are not modelled.
+//! * Reserved-name traversal follows Python's capability hand-off: only a
+//!   symlink object carrying `X-Object-Sysmeta-Allow-Reserved-Names` may
+//!   create a pre-authorized subrequest with
+//!   `X-Backend-Allow-Reserved-Names`. The `swift.leave_relative_location`
+//!   POST flag is not modelled.
 //! * `X-Symlink-Target` is `wsgi_unquote`d then `wsgi_quote`d (safe `/`) so
 //!   percent-encoded slashes in the object name normalize like Python.
 //! * `filter_factory`, `register_swift_info`, and the logger are not ported
@@ -92,6 +93,7 @@ const TGT_ACCT_SYSMETA_SYMLINK_HDR: &str = "X-Object-Sysmeta-Symlink-Target-Acco
 const TGT_ETAG_SYSMETA_SYMLINK_HDR: &str = "X-Object-Sysmeta-Symlink-Target-Etag";
 const TGT_BYTES_SYSMETA_SYMLINK_HDR: &str = "X-Object-Sysmeta-Symlink-Target-Bytes";
 const SYMLOOP_EXTEND: &str = "X-Object-Sysmeta-Symloop-Extend";
+const ALLOW_RESERVED_NAMES: &str = "X-Object-Sysmeta-Allow-Reserved-Names";
 
 const CONTAINER_UPDATE_OVERRIDE_ETAG: &str = "X-Object-Sysmeta-Container-Update-Override-Etag";
 const IGNORE_RANGE_HDR: &str = "X-Backend-Ignore-Range-If-Metadata-Present";
@@ -526,7 +528,16 @@ impl Symlink {
         etag: &str,
         next: &NextFn,
     ) -> Option<Response> {
-        // NOTE: the swift.symlink_override fast path is deferred.
+        if config_true_value(req.headers.get("X-Backend-Symlink-Override").unwrap_or("")) {
+            let bytes = req
+                .headers
+                .get(TGT_BYTES_SYMLINK_HDR)
+                .unwrap_or("")
+                .to_string();
+            req.headers.set(TGT_ETAG_SYSMETA_SYMLINK_HDR, etag);
+            req.headers.set(TGT_BYTES_SYSMETA_SYMLINK_HDR, bytes);
+            return None;
+        }
         let orig_req = req.clone_head();
         let mut subreq = req.clone_head();
         subreq.method = "HEAD".to_string();
@@ -802,6 +813,16 @@ impl Symlink {
         etag: &str,
         next: AsyncNextFn,
     ) -> Option<Response> {
+        if config_true_value(req.headers.get("X-Backend-Symlink-Override").unwrap_or("")) {
+            let bytes = req
+                .headers
+                .get(TGT_BYTES_SYMLINK_HDR)
+                .unwrap_or("")
+                .to_string();
+            req.headers.set(TGT_ETAG_SYSMETA_SYMLINK_HDR, etag);
+            req.headers.set(TGT_BYTES_SYSMETA_SYMLINK_HDR, bytes);
+            return None;
+        }
         let orig_req = req.clone_head();
         let mut subreq = req.clone_head();
         subreq.method = "HEAD".to_string();
@@ -1015,10 +1036,7 @@ fn extract_symlink_path_json(obj: &mut serde_json::Value, version: &str, account
             }
             "symlink_target_bytes" => {
                 if let Ok(n) = value.parse::<i64>() {
-                    map.insert(
-                        "symlink_bytes".into(),
-                        serde_json::Value::Number(n.into()),
-                    );
+                    map.insert("symlink_bytes".into(), serde_json::Value::Number(n.into()));
                 }
             }
             _ => {
@@ -1057,7 +1075,12 @@ fn listing_version_account(req: &Request) -> (String, String) {
     (version, account)
 }
 
-fn apply_listing_rewrite(version: &str, account: &str, mut resp: Response, body: Vec<u8>) -> Response {
+fn apply_listing_rewrite(
+    version: &str,
+    account: &str,
+    mut resp: Response,
+    body: Vec<u8>,
+) -> Response {
     // Ordinary listings must not be re-serialized. Only rewrite when the
     // container-update override etag actually carries symlink params.
     let has_symlink = std::str::from_utf8(&body)
@@ -1069,7 +1092,8 @@ fn apply_listing_rewrite(version: &str, account: &str, mut resp: Response, body:
     }
     match rewrite_listing_json(&body, version, account) {
         Some(new_body) => {
-            resp.headers.set("Content-Length", new_body.len().to_string());
+            resp.headers
+                .set("Content-Length", new_body.len().to_string());
             resp.body = Body::Buffered(new_body);
             resp
         }
@@ -1135,6 +1159,20 @@ fn build_traversal_req(
     new_req.path = wsgi_unquote(&quoted_path);
     new_req.query_string = String::new();
     new_req.headers = cur.headers.clone();
+    new_req.headers.set("X-Backend-Source", "SYM");
+    if resp
+        .headers
+        .get(ALLOW_RESERVED_NAMES)
+        .is_some_and(|value| !value.is_empty())
+    {
+        // Python uses make_pre_authed_request for this hop. The stored
+        // object sysmeta is the capability: ordinary/user-created symlinks
+        // must never acquire reserved-name access merely from their target.
+        new_req.headers.set("X-Backend-Authorize-Override", "true");
+        new_req
+            .headers
+            .set("X-Backend-Allow-Reserved-Names", "true");
+    }
     new_req.headers.remove("X-Backend-Storage-Policy-Index");
     (new_req, quoted_path)
 }
@@ -1172,8 +1210,10 @@ fn validate_and_prep_request_headers(
     };
     let container = cont_obj.first().and_then(|o| o.clone()).unwrap_or_default();
     let obj = cont_obj.get(1).and_then(|o| o.clone()).unwrap_or_default();
-    req.headers
-        .set(TGT_OBJ_SYMLINK_HDR, wsgi_quote(&format!("{container}/{obj}")));
+    req.headers.set(
+        TGT_OBJ_SYMLINK_HDR,
+        wsgi_quote(&format!("{container}/{obj}")),
+    );
 
     // Validate the target account format if the header is present.
     let target_account = match req.headers.get(TGT_ACCT_SYMLINK_HDR).map(str::to_string) {
@@ -1521,11 +1561,7 @@ mod tests {
         tgt.headers.set("ETag", "abc");
         let be = backend(vec![
             ("GET", "/v1/a/c/link", link),
-            (
-                "GET",
-                "/v1/a/c2/dealde/l04 011e 4c8df/flash.png",
-                tgt,
-            ),
+            ("GET", "/v1/a/c2/dealde/l04 011e 4c8df/flash.png", tgt),
         ]);
         let resp = run(&mw, req("GET", "/v1/a/c/link", &[]), be);
         assert_eq!(resp.status, 200);
@@ -1533,6 +1569,46 @@ mod tests {
         assert_eq!(
             resp.headers.get("Content-Location"),
             Some("/v1/a/c2/dealde/l04%20011e%204c8df/flash.png")
+        );
+    }
+
+    #[test]
+    fn test_reserved_symlink_capability_is_required_and_propagated() {
+        let cur = req("GET", "/v1/a/c/link", &[]);
+        let orig = cur.clone_head();
+        let target = "%00versions%00c/%00o%001787770000.00000";
+
+        let ordinary = symlink_resp(target, None, Some("abc"));
+        let (ordinary_req, _) = build_traversal_req(&cur, &ordinary, target, &orig);
+        assert_eq!(
+            ordinary_req.path,
+            "/v1/a/\0versions\0c/\0o\01787770000.00000"
+        );
+        assert_eq!(ordinary_req.headers.get("X-Backend-Source"), Some("SYM"));
+        assert!(ordinary_req
+            .headers
+            .get("X-Backend-Allow-Reserved-Names")
+            .is_none());
+        assert!(ordinary_req
+            .headers
+            .get("X-Backend-Authorize-Override")
+            .is_none());
+
+        let mut authorized = symlink_resp(target, None, Some("abc"));
+        authorized.headers.set(ALLOW_RESERVED_NAMES, "true");
+        let (authorized_req, quoted_path) = build_traversal_req(&cur, &authorized, target, &orig);
+        assert_eq!(
+            authorized_req.path,
+            "/v1/a/\0versions\0c/\0o\01787770000.00000"
+        );
+        assert_eq!(quoted_path, "/v1/a/%00versions%00c/%00o%001787770000.00000");
+        assert_eq!(
+            authorized_req.headers.get("X-Backend-Allow-Reserved-Names"),
+            Some("true")
+        );
+        assert_eq!(
+            authorized_req.headers.get("X-Backend-Authorize-Override"),
+            Some("true")
         );
     }
 
@@ -1673,6 +1749,41 @@ mod tests {
     }
 
     #[test]
+    fn test_container_sync_override_trusts_static_symlink_metadata() {
+        let mw = Symlink::default();
+        let echo = echo_backend(201);
+        let be: BackendArc = Arc::new(move |r: Request| {
+            assert_ne!(r.method, "HEAD", "override must not resolve the target");
+            echo(r)
+        });
+        let resp = run(
+            &mw,
+            req(
+                "PUT",
+                "/v1/a/c/link",
+                &[
+                    (TGT_OBJ_SYMLINK_HDR, "c2/obj"),
+                    (TGT_ETAG_SYMLINK_HDR, "abc123"),
+                    (TGT_BYTES_SYMLINK_HDR, "100"),
+                    ("X-Backend-Symlink-Override", "true"),
+                ],
+            ),
+            be,
+        );
+        assert_eq!(resp.status, 201);
+        assert_eq!(
+            resp.headers
+                .get(&format!("Echo-{TGT_ETAG_SYSMETA_SYMLINK_HDR}")),
+            Some("abc123")
+        );
+        assert_eq!(
+            resp.headers
+                .get(&format!("Echo-{TGT_BYTES_SYSMETA_SYMLINK_HDR}")),
+            Some("100")
+        );
+    }
+
+    #[test]
     fn test_put_static_symlink_to_slo_carries_slo_etag() {
         let mw = Symlink::default();
         let echo = echo_backend(201);
@@ -1681,14 +1792,13 @@ mod tests {
                 let mut target = Response::new(200);
                 target.headers.set("Etag", "physicaljson");
                 target.headers.set("Content-Length", "12");
-                target
-                    .headers
-                    .set("Content-Type", "application/octet-stream;swift_bytes=1048577");
+                target.headers.set(
+                    "Content-Type",
+                    "application/octet-stream;swift_bytes=1048577",
+                );
                 target.headers.set("X-Static-Large-Object", "True");
                 target.headers.set(SYSMETA_SLO_ETAG, "slohash");
-                target
-                    .headers
-                    .set("X-Object-Sysmeta-Slo-Size", "1048577");
+                target.headers.set("X-Object-Sysmeta-Slo-Size", "1048577");
                 return target;
             }
             echo(r)
@@ -1796,10 +1906,7 @@ mod tests {
         let resp = run(&mw, req("GET", "/v1/AUTH_a/c", &[]), be);
         assert_eq!(resp.status, 200);
         let items: Vec<serde_json::Value> = serde_json::from_slice(body_bytes(&resp)).unwrap();
-        assert_eq!(
-            items[0]["symlink_path"].as_str(),
-            Some("/v1/AUTH_a/c2/obj")
-        );
+        assert_eq!(items[0]["symlink_path"].as_str(), Some("/v1/AUTH_a/c2/obj"));
         assert_eq!(
             items[0]["hash"].as_str(),
             Some("d41d8cd98f00b204e9800998ecf8427e")
@@ -1902,11 +2009,7 @@ mod tests {
     #[test]
     fn test_intercepts_symlink_put_and_post_not_plain_get() {
         let mw = Symlink::new(2);
-        let put = req(
-            "PUT",
-            "/v1/a/c/link",
-            &[(TGT_OBJ_SYMLINK_HDR, "c/target")],
-        );
+        let put = req("PUT", "/v1/a/c/link", &[(TGT_OBJ_SYMLINK_HDR, "c/target")]);
         assert!(mw.intercepts_request(&put));
         let post = req("POST", "/v1/a/c/link", &[]);
         assert!(mw.intercepts_request(&post));
@@ -1925,10 +2028,11 @@ mod tests {
         let mut tgt = Response::with_body(200, b"target body".to_vec());
         tgt.headers.set("ETag", "abc");
         let next: AsyncNextFn = {
-            let routes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::from([
-                ("/v1/a/c/link".to_string(), link),
-                ("/v1/a/c/target".to_string(), tgt),
-            ])));
+            let routes =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::from([
+                    ("/v1/a/c/link".to_string(), link),
+                    ("/v1/a/c/target".to_string(), tgt),
+                ])));
             std::sync::Arc::new(move |r: Request| {
                 let routes = std::sync::Arc::clone(&routes);
                 Box::pin(async move {

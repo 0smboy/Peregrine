@@ -392,7 +392,7 @@ impl SsyncParser {
                     }
                     let (name, value) = parse_header(&line)?;
                     let lower_name = name.to_ascii_lowercase();
-                    pending.headers.set(name, value);
+                    pending.headers.set(&name, value);
                     if lower_name != "etag" && lower_name != "x-backend-no-commit" {
                         pending.replication_headers.push(lower_name);
                     }
@@ -536,18 +536,29 @@ fn parse_request_line(line: &[u8]) -> Result<(String, String), SsyncError> {
     Ok((method.to_string(), path.to_string()))
 }
 
-fn parse_header(line: &[u8]) -> Result<(&str, &str), SsyncError> {
-    if !line.is_ascii() {
-        return Err(SsyncError::new("non-ASCII subrequest header"));
-    }
+fn parse_header(line: &[u8]) -> Result<(String, String), SsyncError> {
     let line = std::str::from_utf8(line).map_err(|_| SsyncError::new("bad header"))?;
     let Some((raw_name, raw_value)) = line.split_once(':') else {
         return Err(SsyncError::new("malformed header"));
     };
     let name = raw_name.trim();
     let value = raw_value.trim();
-    if name.is_empty() || !name.bytes().all(is_header_name_byte) {
+    let ascii_name = !name.is_empty() && name.bytes().all(is_header_name_byte);
+    let swift_metadata_name = is_swift_metadata_header_name(name);
+    if !ascii_name && !swift_metadata_name {
         return Err(SsyncError::new("invalid header name"));
+    }
+    // Python's SSYNC sender serializes WSGI metadata with wsgi_to_bytes(),
+    // and its receiver reconstructs it with bytes_to_wsgi().  Consequently,
+    // valid UTF-8 bytes may occur in Swift metadata names and values even
+    // though they are not legal RFC HTTP field bytes.  This is an internal
+    // SSYNC subrequest document, not an HTTP head; keep the exception narrow
+    // to the three object-metadata namespaces instead of relaxing every
+    // header accepted by the object server.
+    if !line.is_ascii() && !swift_metadata_name {
+        return Err(SsyncError::new(
+            "non-ASCII data outside Swift metadata header",
+        ));
     }
     if value
         .bytes()
@@ -555,7 +566,31 @@ fn parse_header(line: &[u8]) -> Result<(&str, &str), SsyncError> {
     {
         return Err(SsyncError::new("invalid header value"));
     }
-    Ok((name, value))
+    Ok((name.to_string(), value.to_string()))
+}
+
+fn is_swift_metadata_header_name(name: &str) -> bool {
+    const PREFIXES: [&str; 3] = [
+        "x-object-meta-",
+        "x-object-sysmeta-",
+        "x-object-transient-sysmeta-",
+    ];
+    let lower = name.to_ascii_lowercase();
+    let Some(prefix) = PREFIXES
+        .iter()
+        .find(|prefix| lower.starts_with(**prefix))
+    else {
+        return false;
+    };
+    let suffix = &name[prefix.len()..];
+    !suffix.is_empty()
+        && suffix.chars().all(|character| {
+            if character.is_ascii() {
+                is_header_name_byte(character as u8)
+            } else {
+                !character.is_control() && !character.is_whitespace()
+            }
+        })
 }
 
 fn is_header_name_byte(byte: u8) -> bool {
