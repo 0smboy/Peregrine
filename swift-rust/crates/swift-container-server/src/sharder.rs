@@ -3914,6 +3914,33 @@ fn maybe_start_sharding(
         if has_shrinking_donor && !own_is_donor {
             return Ok(false);
         }
+        // An epoch-suffixed DB already cleaved once. Leftover ACTIVE
+        // siblings after the first shrink are mid-shrink children, not a
+        // reason to start a second epoch. set_sharding_state() here makes
+        // own.epoch diverge from the filename and HEAD reports unsharded
+        // with object_count 1 (probe test_shrinking L2088).
+        if broker.db_epoch().is_some() {
+            if let Some(db_epoch) = broker.db_epoch() {
+                if let Some(mut own) = broker.get_own_shard_range(true)? {
+                    let own_norm = own
+                        .epoch
+                        .as_deref()
+                        .and_then(|e| e.parse::<swift_core::timestamp::Timestamp>().ok())
+                        .map(|ts| ts.normal());
+                    let db_norm = db_epoch
+                        .parse::<swift_core::timestamp::Timestamp>()
+                        .ok()
+                        .map(|ts| ts.normal());
+                    if own_norm != db_norm {
+                        own.epoch = Some(db_epoch);
+                        let ts = swift_core::timestamp::Timestamp::now().internal();
+                        own.timestamp = ts;
+                        broker.merge_shard_ranges(vec![own])?;
+                    }
+                }
+            }
+            return Ok(false);
+        }
         return broker.set_sharding_state();
     }
     maybe_auto_shard(broker, opts)
@@ -4830,6 +4857,147 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![first.name.as_str(), second.name.as_str()]
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+
+    #[test]
+    fn test_maybe_start_sharding_skips_epoch_db_with_active_sibling() {
+        // After the first shard shrinks away, the leftover sibling is still
+        // ACTIVE (tombstones). The root is epoch-backed. Must not create a
+        // second epoch (L2088 unsharded / own.epoch mismatch).
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-s2r-active-sib-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "c";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let unsuffixed = hd.join(format!("{hsh}.db"));
+        let epoch = "1751500010.00000";
+        let epoch_path = make_db_file_path(&unsuffixed, Some(epoch)).unwrap();
+        let mut root = ContainerBroker::new(&epoch_path, account, container);
+        root.initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        root.put_object(
+            "alpha-1",
+            "1751500001.00000",
+            1,
+            "text/plain",
+            "e",
+            0,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut own = root.get_own_shard_range(false).unwrap().unwrap();
+        own.epoch = Some(epoch.to_string());
+        own.state = shard_state::SHARDED;
+        let mut sibling = ShardRange::new(".shards_AUTH_test/c-1", epoch, "m", "");
+        sibling.state = shard_state::ACTIVE;
+        sibling.object_count = 1;
+        root.merge_shard_ranges(vec![own, sibling]).unwrap();
+        assert_eq!(root.get_db_state().unwrap(), DbState::Sharded);
+        let files_before = swift_db::get_db_files(&unsuffixed).len();
+
+        let opts = SharderRunOpts {
+            cleave_batch_size: 10,
+            auto_shard: true,
+            auto_shrink: false,
+            shard_size: 100,
+            rows_per_shard: 0,
+            minimum_shard_size: 1,
+            partitions: Vec::new(),
+        };
+        assert!(!maybe_start_sharding(&mut root, &opts).unwrap());
+        assert_eq!(root.get_db_state().unwrap(), DbState::Sharded);
+        assert_eq!(
+            swift_db::get_db_files(&unsuffixed).len(),
+            files_before,
+            "must not create a second epoch file"
+        );
+        let after = root.get_own_shard_range(true).unwrap().unwrap();
+        assert_eq!(after.epoch.as_deref(), Some(epoch), "{after:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_maybe_start_sharding_heals_wiped_own_epoch() {
+        // Compactible/merge can persist own without epoch onto an epoch file.
+        // get_db_state() is then Unsharded even though object_count is 1.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-s2r-heal-epoch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "c";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let unsuffixed = hd.join(format!("{hsh}.db"));
+        let epoch = "1751500010.00000";
+        let epoch_path = make_db_file_path(&unsuffixed, Some(epoch)).unwrap();
+        let mut root = ContainerBroker::new(&epoch_path, account, container);
+        root.initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        root.put_object(
+            "alpha-1",
+            "1751500001.00000",
+            1,
+            "text/plain",
+            "e",
+            0,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut own = root.get_own_shard_range(false).unwrap().unwrap();
+        own.epoch = None;
+        own.state = shard_state::ACTIVE;
+        let mut sibling = ShardRange::new(".shards_AUTH_test/c-1", epoch, "m", "");
+        sibling.state = shard_state::ACTIVE;
+        root.merge_shard_ranges(vec![own, sibling]).unwrap();
+        assert_eq!(root.get_db_state().unwrap(), DbState::Unsharded);
+
+        let opts = SharderRunOpts {
+            cleave_batch_size: 10,
+            auto_shard: true,
+            auto_shrink: false,
+            shard_size: 100,
+            rows_per_shard: 0,
+            minimum_shard_size: 1,
+            partitions: Vec::new(),
+        };
+        assert!(!maybe_start_sharding(&mut root, &opts).unwrap());
+        let after = root.get_own_shard_range(true).unwrap().unwrap();
+        let own_norm = after
+            .epoch
+            .as_deref()
+            .and_then(|e| e.parse::<swift_core::timestamp::Timestamp>().ok())
+            .map(|ts| ts.normal());
+        let db_norm = epoch
+            .parse::<swift_core::timestamp::Timestamp>()
+            .ok()
+            .map(|ts| ts.normal());
+        assert_eq!(own_norm, db_norm, "{after:?}");
+        assert_eq!(root.get_db_state().unwrap(), DbState::Sharded);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
