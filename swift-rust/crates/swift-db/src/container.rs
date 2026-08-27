@@ -579,7 +579,15 @@ impl ContainerBroker {
             .map(|t| t.normal());
         let db_epoch_normal = db_epoch.parse::<Timestamp>().ok().map(|t| t.normal());
         if db_epoch_normal != own_epoch_normal {
-            return Ok(DbState::Unsharded);
+            // A newer-timestamp merge can drop own.epoch onto an epoch file
+            // (shrink-to-root compactible). If own is already an acceptor,
+            // the filename epoch is authoritative: HEAD must not report
+            // unsharded with object_count 1 (probe test_shrinking L2088).
+            // A SHARDING own still mismatches so the first cleave starts.
+            let acceptor = !crate::shard::CLEAVING_STATES.contains(&own.state);
+            if !(acceptor && own_epoch_normal.is_none() && db_epoch_normal.is_some()) {
+                return Ok(DbState::Unsharded);
+            }
         }
         if !self.has_other_shard_ranges()? {
             return Ok(DbState::Collapsed);
@@ -2037,6 +2045,44 @@ mod tests {
             .find(|(k, _)| k == "object_count")
             .and_then(|(_, v)| v.as_i64());
         assert_eq!(oc, Some(200), "{info:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+
+    #[test]
+    fn test_get_db_state_acceptor_without_own_epoch_is_collapsed() {
+        // Probe L2088: epoch file + wiped own.epoch + no other ranges +
+        // alpha still in the live table. Must be collapsed, not unsharded.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-db-l2088-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let unsuffixed = dir.join("hash.db");
+        let epoch = "1751500010.00000";
+        let epoch_path = make_db_file_path(&unsuffixed, Some(epoch)).unwrap();
+        let mut root = ContainerBroker::new(&epoch_path, "AUTH_test", "c");
+        root.initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        root.put_object(
+            "alpha-1",
+            "1751500001.00000",
+            1,
+            "text/plain",
+            "e",
+            0,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut own = root.get_own_shard_range(false).unwrap().unwrap();
+        own.epoch = None;
+        own.state = crate::shard::state::ACTIVE;
+        root.merge_shard_ranges(vec![own]).unwrap();
+        assert_eq!(root.get_db_state().unwrap(), DbState::Collapsed);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
