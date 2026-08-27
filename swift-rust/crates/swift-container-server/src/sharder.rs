@@ -2852,6 +2852,114 @@ pub fn move_misplaced_from_retiring_with_ring(
     Ok(moved)
 }
 
+
+/// Python `_process_broker` -> `_move_misplaced_objects` on the **live** broker.
+///
+/// Probe `test_misplaced_object_movement` L2761: after a shard shrinks, its
+/// DB is SHARDED and a late in-flight PUT can land in that live table. Python
+/// treats every remaining object row as misplaced (`_make_misplaced_object_bounds`
+/// for SHARDED = `("", "")`) and moves it to a covering
+/// CREATED/CLEAVED/ACTIVE/SHARDING destination. Rust previously only moved
+/// rows out of the *retiring* file during `_cleave`, so `alpha` stayed on the
+/// SHRUNK donor and listing missed it.
+fn range_contains_object_name(r: &ShardRange, name: &str) -> bool {
+    (r.lower.is_empty() || name > r.lower.as_str())
+        && (r.upper.is_empty() || name <= r.upper.as_str())
+}
+
+fn is_shard_update_state(state: i64) -> bool {
+    matches!(
+        state,
+        shard_state::CREATED
+            | shard_state::CLEAVED
+            | shard_state::ACTIVE
+            | shard_state::SHARDING
+    )
+}
+
+fn misplaced_dest_ranges(
+    source: &mut ContainerBroker,
+    ring: Option<&swift_ring::Ring>,
+) -> Vec<ShardRange> {
+    if source.is_root_container().unwrap_or(true) {
+        return source
+            .get_shard_ranges(&GetShardRangesArgs {
+                include_own: false,
+                include_deleted: false,
+                states: Some(vec![
+                    shard_state::CREATED,
+                    shard_state::CLEAVED,
+                    shard_state::ACTIVE,
+                    shard_state::SHARDING,
+                ]),
+                ..GetShardRangesArgs::default()
+            })
+            .unwrap_or_default();
+    }
+    let mut ranges = Vec::new();
+    if let (Some(ring), Some((root_acct, root_cont))) = (ring, root_account_container(source)) {
+        ranges = fetch_shard_ranges_from_root(ring, &root_acct, &root_cont, "", "");
+    }
+    if ranges.is_empty() {
+        ranges = source
+            .get_shard_ranges(&GetShardRangesArgs {
+                include_own: false,
+                include_deleted: false,
+                ..GetShardRangesArgs::default()
+            })
+            .unwrap_or_default();
+    }
+    ranges
+}
+
+pub fn move_misplaced_from_live(
+    source: &mut ContainerBroker,
+    device: &Path,
+    hash_config: &HashPathConfig,
+    part: &str,
+    ring: Option<&swift_ring::Ring>,
+) -> Result<usize, DbError> {
+    if !matches!(source.get_db_state()?, DbState::Sharded) {
+        return Ok(0);
+    }
+    let dest_ranges = misplaced_dest_ranges(source, ring);
+    if dest_ranges.is_empty() {
+        return Ok(0);
+    }
+    let source_path = source.path();
+    let records = source.object_records_in_range("", "")?;
+    if records.is_empty() {
+        return Ok(0);
+    }
+    let search = local_device_siblings(device);
+    let mut moved = 0usize;
+    for rec in records {
+        let name = rec.name.clone();
+        let Some(owner) = dest_ranges.iter().find(|r| {
+            r.deleted == 0
+                && is_shard_update_state(r.state)
+                && range_contains_object_name(r, &name)
+                && r.name != source_path
+        }) else {
+            continue;
+        };
+        let dest_part = shard_part_for(&owner.name, ring, part);
+        let mut dest = match open_existing_shard_on_devices(
+            &search,
+            hash_config,
+            &dest_part,
+            &owner.name,
+        ) {
+            Some((_dev, broker)) => broker,
+            None => local_shard_broker_for_range(device, hash_config, &dest_part, owner),
+        };
+        dest.merge_items(vec![rec])?;
+        source.remove_object_named(&name)?;
+        moved += 1;
+    }
+    Ok(moved)
+}
+
 /// Options for one sharder device sweep.
 #[derive(Debug, Clone)]
 pub struct SharderRunOpts {
@@ -3325,6 +3433,15 @@ fn run_once_with_opts_replicator_ring_and_node(
         // own=SHARDING and sub-shards from the root here (probe L1245).
         if !broker.is_root_container().unwrap_or(true) {
             audit_shard_from_root(&mut broker, ring);
+        }
+        // Python `_process_broker`: misplaced pass after audit. SHARDED
+        // live-table rows (post-shrink in-flight PUTs) never sit in retiring,
+        // so `_cleave`'s retiring helper cannot see them (probe L2761).
+        if matches!(broker.get_db_state().ok(), Some(DbState::Sharded)) {
+            if let Err(_) = move_misplaced_from_live(&mut broker, device, hash_config, &part, ring)
+            {
+                stats.failures += 1;
+            }
         }
         let broker_path = broker.path();
         let (broker_account, broker_container) =
@@ -5849,6 +5966,96 @@ mod tests {
             objs.iter()
                 .any(|(n, d, e)| n == "a1" && *d == 0 && e == "e"),
             "misplaced live object must stay live, got {objs:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_move_misplaced_from_sharded_live_table_into_owner() {
+        // Probe L2761: SHARDED donor live table holds a late "alpha"; the
+        // covering ACTIVE acceptor must receive it and the donor must drop it.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharder-mis-live-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "shrunk-donor";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let db = hd.join(format!("{hsh}.db"));
+        let mut source = ContainerBroker::new(&db, account, container);
+        source
+            .initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        source
+            .put_object(
+                "seed",
+                "1751500001.00000",
+                1,
+                "text/plain",
+                "e",
+                0,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        let epoch = "1751500010.00000";
+        let dest = {
+            let mut sr = ShardRange::new(".shards_AUTH_test/c-hi", epoch, "", "");
+            sr.state = shard_state::ACTIVE;
+            sr
+        };
+        source.merge_shard_ranges(vec![dest.clone()]).unwrap();
+        source.enable_sharding(epoch).unwrap();
+        assert!(source.set_sharding_state().unwrap());
+        assert!(source.set_sharded_state().unwrap());
+        assert_eq!(source.get_db_state().unwrap(), DbState::Sharded);
+        source
+            .put_object(
+                "alpha",
+                "1751500020.00000",
+                0,
+                "text/plain",
+                "misplaced",
+                0,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        let moved =
+            move_misplaced_from_live(&mut source, &device, &hash_config, "0", None).unwrap();
+        assert_eq!(moved, 1, "expected alpha moved from SHARDED live table");
+        let leftover = source
+            .object_records_in_range("", "")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect::<Vec<_>>();
+        assert!(
+            !leftover.iter().any(|n| n == "alpha"),
+            "donor must drop alpha, leftover={leftover:?}"
+        );
+        let mut dest_b = local_shard_broker(&device, &hash_config, "0", &dest.name);
+        let dest_names = dest_b
+            .object_records_in_range("", "")
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.name, r.deleted, r.etag))
+            .collect::<Vec<_>>();
+        assert!(
+            dest_names
+                .iter()
+                .any(|(n, d, e)| n == "alpha" && *d == 0 && e == "misplaced"),
+            "acceptor must have live alpha, got {dest_names:?}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
