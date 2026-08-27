@@ -27,9 +27,9 @@
 //! after a partial update, a `'successes'` list of container-node ids.
 //!
 //! Deferred: the container-ratelimit/bucketizing skip logic, per-container
-//! redirect (sharding `Location`) rewriting of the async file, recon stats
-//! dumping, and the multiprocess/greenlet concurrency; this is the
-//! single-threaded sweep + replay core that the daemon loop drives.
+//! redirect (sharding `Location`) rewriting of the async file, and the
+//! multiprocess/greenlet concurrency; this is the single-threaded sweep +
+//! replay core that the daemon loop drives.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -280,7 +280,16 @@ pub enum UpdateOutcome {
 }
 
 /// A running tally over a sweep.
-#[derive(Debug, Clone, Default, PartialEq)]
+pub const DEFAULT_ASYNC_TRACKER_MAX_ENTRIES: usize = 100;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FailedUpdate {
+    pub account: String,
+    pub container: String,
+    pub timestamp: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct UpdaterStats {
     pub successes: u64,
     pub failures: u64,
@@ -288,6 +297,84 @@ pub struct UpdaterStats {
     pub outdated_unlinks: u64,
     pub errors: u64,
     pub redirects: u64,
+    failed_updates: Vec<FailedUpdate>,
+    tracker_max_entries: usize,
+}
+
+impl Default for UpdaterStats {
+    fn default() -> Self {
+        Self::with_tracker_limit(DEFAULT_ASYNC_TRACKER_MAX_ENTRIES)
+    }
+}
+
+impl UpdaterStats {
+    pub fn with_tracker_limit(max_entries: usize) -> Self {
+        Self {
+            successes: 0,
+            failures: 0,
+            unlinks: 0,
+            outdated_unlinks: 0,
+            errors: 0,
+            redirects: 0,
+            failed_updates: Vec::new(),
+            tracker_max_entries: max_entries.max(1),
+        }
+    }
+
+    pub fn track_failure(&mut self, account: &str, container: &str, timestamp: f64) {
+        if let Some(existing) = self
+            .failed_updates
+            .iter_mut()
+            .find(|entry| entry.account == account && entry.container == container)
+        {
+            if timestamp < existing.timestamp {
+                existing.timestamp = timestamp;
+            }
+        } else {
+            self.failed_updates.push(FailedUpdate {
+                account: account.to_string(),
+                container: container.to_string(),
+                timestamp,
+            });
+        }
+        self.failed_updates.sort_by(|left, right| {
+            left.timestamp
+                .total_cmp(&right.timestamp)
+                .then_with(|| left.account.cmp(&right.account))
+                .then_with(|| left.container.cmp(&right.container))
+        });
+        self.failed_updates.truncate(self.tracker_max_entries);
+    }
+
+    fn track_update_failure(&mut self, update: &AsyncUpdate) {
+        if let Ok(timestamp) = update.timestamp.parse::<Timestamp>() {
+            self.track_failure(
+                &update.account,
+                &update.container,
+                timestamp.as_secs_f64(),
+            );
+        }
+    }
+
+    pub fn failed_updates(&self) -> &[FailedUpdate] {
+        &self.failed_updates
+    }
+
+    pub fn merge_from(&mut self, other: UpdaterStats) {
+        self.successes += other.successes;
+        self.failures += other.failures;
+        self.unlinks += other.unlinks;
+        self.outdated_unlinks += other.outdated_unlinks;
+        self.errors += other.errors;
+        self.redirects += other.redirects;
+        for failure in other.failed_updates {
+            self.track_failure(
+                &failure.account,
+                &failure.container,
+                failure.timestamp,
+            );
+        }
+    }
 }
 
 /// Replay one update against the given container-ring nodes, then unlink or
@@ -332,22 +419,25 @@ pub fn process_update(
         stats.successes += 1;
         stats.unlinks += 1;
         Ok(UpdateOutcome::Unlinked)
-    } else if successes.len() > update.successes.len() {
-        // partial progress: persist which replicas are done
-        match update.repickle_with_successes(&successes) {
-            Ok(bytes) => {
-                std::fs::write(&update.path, bytes)?;
-                stats.failures += 1;
-                Ok(UpdateOutcome::Rewritten)
-            }
-            Err(_) => {
-                stats.errors += 1;
-                Ok(UpdateOutcome::Failed)
-            }
-        }
     } else {
-        stats.failures += 1;
-        Ok(UpdateOutcome::Failed)
+        stats.track_update_failure(update);
+        if successes.len() > update.successes.len() {
+            // partial progress: persist which replicas are done
+            match update.repickle_with_successes(&successes) {
+                Ok(bytes) => {
+                    std::fs::write(&update.path, bytes)?;
+                    stats.failures += 1;
+                    Ok(UpdateOutcome::Rewritten)
+                }
+                Err(_) => {
+                    stats.errors += 1;
+                    Ok(UpdateOutcome::Failed)
+                }
+            }
+        } else {
+            stats.failures += 1;
+            Ok(UpdateOutcome::Failed)
+        }
     }
 }
 
@@ -452,7 +542,23 @@ pub fn run_once_with_concurrency(
     client: &(dyn ContainerNodeClient + Sync),
     concurrency: usize,
 ) -> UpdaterStats {
-    let mut stats = UpdaterStats::default();
+    run_once_with_concurrency_and_tracker(
+        device,
+        container_ring,
+        client,
+        concurrency,
+        DEFAULT_ASYNC_TRACKER_MAX_ENTRIES,
+    )
+}
+
+pub fn run_once_with_concurrency_and_tracker(
+    device: &Path,
+    container_ring: &Ring,
+    client: &(dyn ContainerNodeClient + Sync),
+    concurrency: usize,
+    tracker_max_entries: usize,
+) -> UpdaterStats {
+    let mut stats = UpdaterStats::with_tracker_limit(tracker_max_entries);
     let updates = iter_async_pendings(device, &mut stats);
     if updates.is_empty() {
         return stats;
@@ -491,15 +597,10 @@ pub fn run_once_with_concurrency(
                         return;
                     };
                     let devs: Vec<&swift_ring::RingDevice> = nodes.iter().map(|n| n.dev).collect();
-                    let mut local = UpdaterStats::default();
+                    let mut local = UpdaterStats::with_tracker_limit(tracker_max_entries);
                     let _ = process_update(update, part, &devs, client, &mut local);
                     let mut g = stats.lock().unwrap();
-                    g.successes += local.successes;
-                    g.failures += local.failures;
-                    g.unlinks += local.unlinks;
-                    g.outdated_unlinks += local.outdated_unlinks;
-                    g.errors += local.errors;
-                    g.redirects += local.redirects;
+                    g.merge_from(local);
                 });
             }
         });
@@ -665,6 +766,10 @@ mod tests {
         let outcome = process_update(&updates[0], 5, &refs, &client, &mut stats).unwrap();
         assert_eq!(outcome, UpdateOutcome::Failed);
         assert!(file.exists(), "async file kept when nothing succeeded");
+        assert_eq!(stats.failed_updates().len(), 1);
+        assert_eq!(stats.failed_updates()[0].account, "a");
+        assert_eq!(stats.failed_updates()[0].container, "c");
+        assert!((stats.failed_updates()[0].timestamp - 1_751_500_000.0).abs() < 0.001);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

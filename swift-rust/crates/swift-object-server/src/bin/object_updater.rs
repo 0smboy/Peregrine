@@ -25,7 +25,9 @@ use swift_core::hashing::HashPathConfig;
 use swift_core::obslog::{LogLevel, Logger};
 use swift_core::statsd::StatsdClient;
 use swift_object_server::daemonutil;
-use swift_object_server::updater::{run_once_with_concurrency, HttpContainerClient};
+use swift_object_server::updater::{
+    run_once_with_concurrency_and_tracker, HttpContainerClient, UpdaterStats,
+};
 use swift_ring::{Ring, RingData};
 
 fn parse_conf_file(path: &str) -> SwiftConfig {
@@ -49,7 +51,11 @@ fn main() {
             .or_else(|| conf.get("DEFAULT", key).ok().flatten())
             .unwrap_or_else(|| default.to_string())
     };
-    let devices = get("app:object-server", "devices", "/srv/node");
+    // The probe's run-forever contract writes a minimal config containing
+    // only [object-updater], with inherited DEFAULT values materialized in
+    // that section. Python's daemon reads `devices` from the updater config,
+    // so do not require an [app:object-server] section here.
+    let devices = get("object-updater", "devices", "/srv/node");
     // Python parity: swift/obj/updater.py defaults interval to 300 seconds.
     let interval: u64 = get("object-updater", "interval", "300")
         .parse()
@@ -60,6 +66,22 @@ fn main() {
         .parse()
         .unwrap_or(10)
         .max(1);
+    let tracker_max_entries: usize = get(
+        "object-updater",
+        "async_tracker_max_entries",
+        "100",
+    )
+    .parse()
+    .unwrap_or(100)
+    .max(1);
+    let tracker_dump_count: usize = get(
+        "object-updater",
+        "async_tracker_dump_count",
+        "5",
+    )
+    .parse()
+    .unwrap_or(5)
+    .max(1);
     let log_name = get("object-updater", "log_name", "object-updater");
     let log_level = get("object-updater", "log_level", "INFO")
         .parse::<LogLevel>()
@@ -104,20 +126,26 @@ fn main() {
     ));
     loop {
         let sweep_start = std::time::Instant::now();
-        let (mut ok, mut fail, mut unlink, mut errors, mut redirects) = (0u64, 0, 0, 0, 0);
+        let mut pass_stats = UpdaterStats::with_tracker_limit(tracker_max_entries);
         if let Ok(entries) = std::fs::read_dir(&devices) {
             for e in entries.flatten() {
                 if e.path().is_dir() {
-                    let s =
-                        run_once_with_concurrency(&e.path(), &container_ring, &client, concurrency);
-                    ok += s.successes;
-                    fail += s.failures;
-                    unlink += s.unlinks + s.outdated_unlinks;
-                    errors += s.errors;
-                    redirects += s.redirects;
+                    let stats = run_once_with_concurrency_and_tracker(
+                        &e.path(),
+                        &container_ring,
+                        &client,
+                        concurrency,
+                        tracker_max_entries,
+                    );
+                    pass_stats.merge_from(stats);
                 }
             }
         }
+        let ok = pass_stats.successes;
+        let fail = pass_stats.failures;
+        let unlink = pass_stats.unlinks + pass_stats.outdated_unlinks;
+        let errors = pass_stats.errors;
+        let redirects = pass_stats.redirects;
         logger.info(&format!(
             "object-updater pass: successes={ok} failures={fail} unlinks={unlink} \
              errors={errors} redirects={redirects}"
@@ -125,8 +153,12 @@ fn main() {
         statsd.update_stats("successes", ok as i64);
         statsd.update_stats("failures", fail as i64);
         statsd.update_stats("unlinks", unlink as i64);
-        let update =
-            daemonutil::updater_recon_update(sweep_start.elapsed(), daemonutil::epoch_secs_now());
+        let update = daemonutil::updater_recon_update(
+            &pass_stats,
+            sweep_start.elapsed(),
+            daemonutil::epoch_secs_now(),
+            tracker_dump_count,
+        );
         if let Err(e) = daemonutil::dump_recon(&recon_cache_path, "object.recon", &update) {
             logger.warning(&format!(
                 "could not dump recon cache to {recon_cache_path}/object.recon: {e}"

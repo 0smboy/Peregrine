@@ -23,6 +23,7 @@ pub use swift_core::daemon::{dump_recon, epoch_secs_now, sleep_unless_stopped, s
 use std::time::Duration;
 
 use crate::replicator::ReplicatorStats;
+use crate::updater::UpdaterStats;
 
 /// The recon-cache update the Python object replicator dumps after a pass
 /// (`swift/obj/replicator.py update_recon`): `replication_time` /
@@ -59,10 +60,39 @@ pub fn replicator_recon_update(
 /// The recon-cache update the Python object updater dumps after a sweep
 /// (`swift/obj/updater.py aggregate_and_dump_recon`, the keys `swift-recon`
 /// reads): the sweep duration in seconds and the sweep end as epoch seconds.
-pub fn updater_recon_update(elapsed: Duration, end_epoch_secs: f64) -> serde_json::Value {
+pub fn updater_recon_update(
+    stats: &UpdaterStats,
+    elapsed: Duration,
+    end_epoch_secs: f64,
+    dump_count: usize,
+) -> serde_json::Value {
+    let oldest_entries: Vec<serde_json::Value> = stats
+        .failed_updates()
+        .iter()
+        .take(dump_count)
+        .map(|entry| {
+            serde_json::json!({
+                "timestamp": entry.timestamp,
+                "account": entry.account,
+                "container": entry.container,
+            })
+        })
+        .collect();
+    let oldest_timestamp = stats.failed_updates().first().map(|entry| entry.timestamp);
+    let oldest_age = oldest_timestamp.map(|timestamp| (end_epoch_secs - timestamp).max(0.0));
     serde_json::json!({
         "object_updater_sweep": elapsed.as_secs_f64(),
         "object_updater_last": end_epoch_secs,
+        "object_updater_stats": {
+            "failures_account_container_count": stats.failed_updates().len(),
+            "failures_oldest_timestamp": oldest_timestamp,
+            "failures_oldest_timestamp_age": oldest_age,
+            "failures_oldest_timestamp_account_containers": {
+                "oldest_count": oldest_entries.len(),
+                "oldest_entries": oldest_entries,
+            },
+            "tracker_memory_usage": std::mem::size_of_val(stats.failed_updates()),
+        },
     })
 }
 
@@ -148,11 +178,40 @@ mod tests {
 
     #[test]
     fn updater_recon_update_dumps_python_recon_keys() {
-        let update = updater_recon_update(Duration::from_secs(7), 1_700_000_100.0);
+        let mut stats = UpdaterStats::with_tracker_limit(3);
+        stats.track_failure("AUTH_later", "c", 1_700_000_090.0);
+        stats.track_failure("AUTH_first", "c", 1_700_000_070.0);
+        stats.track_failure("AUTH_first", "c", 1_700_000_080.0);
+        stats.track_failure("AUTH_middle", "c", 1_700_000_080.0);
+        stats.track_failure("AUTH_evicted", "c", 1_700_000_095.0);
+        let update = updater_recon_update(
+            &stats,
+            Duration::from_secs(7),
+            1_700_000_100.0,
+            2,
+        );
         assert_eq!(update["object_updater_sweep"].as_f64().unwrap(), 7.0);
         assert_eq!(
             update["object_updater_last"].as_f64().unwrap(),
             1_700_000_100.0
+        );
+        assert!(
+            update["object_updater_stats"].is_object(),
+            "Python probe contract requires object_updater_stats"
+        );
+        assert_eq!(
+            update["object_updater_stats"]["failures_account_container_count"],
+            3
+        );
+        let oldest = &update["object_updater_stats"]
+            ["failures_oldest_timestamp_account_containers"];
+        assert_eq!(oldest["oldest_count"], 2);
+        assert_eq!(oldest["oldest_entries"][0]["account"], "AUTH_first");
+        assert_eq!(oldest["oldest_entries"][0]["timestamp"], 1_700_000_070.0);
+        assert_eq!(oldest["oldest_entries"][1]["account"], "AUTH_middle");
+        assert_eq!(
+            update["object_updater_stats"]["failures_oldest_timestamp_age"],
+            30.0
         );
 
         // round-trip through the dump helper into a temp cache path
