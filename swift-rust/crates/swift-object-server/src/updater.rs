@@ -26,10 +26,9 @@
 //! `{'op', 'account', 'container', 'obj', 'headers', 'db_state', ...}` and,
 //! after a partial update, a `'successes'` list of container-node ids.
 //!
-//! Deferred: the container-ratelimit/bucketizing skip logic, per-container
-//! redirect (sharding `Location`) rewriting of the async file, and the
-//! multiprocess/greenlet concurrency; this is the single-threaded sweep +
-//! replay core that the daemon loop drives.
+//! Deferred: the container-ratelimit/bucketizing skip logic and the
+//! multiprocess/greenlet pool. Shard 301 `Location` rewriting is implemented:
+//! `container_path` is rewritten and the destination is retried once.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -160,18 +159,43 @@ impl AsyncUpdate {
     /// other key. Mirrors the object updater rewriting the async file after a
     /// partial success so the next sweep skips already-updated replicas.
     fn repickle_with_successes(&self, successes: &[i64]) -> Result<Vec<u8>, pickle::PickleError> {
+        self.repickle_pairs(Some(successes), None)
+    }
+
+    fn repickle_redirect(&self, container_path: &str) -> Result<Vec<u8>, pickle::PickleError> {
+        self.repickle_pairs(Some(&[]), Some(container_path))
+    }
+
+    fn repickle_pairs(
+        &self,
+        successes: Option<&[i64]>,
+        container_path: Option<&str>,
+    ) -> Result<Vec<u8>, pickle::PickleError> {
         let mut pairs = match &self.raw {
             Value::Dict(p) => p.clone(),
             _ => Vec::new(),
         };
-        let list = Value::List(successes.iter().map(|i| Value::Int(*i)).collect());
-        if let Some(slot) = pairs
-            .iter_mut()
-            .find(|(k, _)| matches!(k, Value::Str(s) if s == "successes"))
-        {
-            slot.1 = list;
-        } else {
-            pairs.push((Value::Str("successes".to_string()), list));
+        if let Some(successes) = successes {
+            let list = Value::List(successes.iter().map(|i| Value::Int(*i)).collect());
+            if let Some(slot) = pairs
+                .iter_mut()
+                .find(|(k, _)| matches!(k, Value::Str(s) if s == "successes"))
+            {
+                slot.1 = list;
+            } else {
+                pairs.push((Value::Str("successes".to_string()), list));
+            }
+        }
+        if let Some(path) = container_path {
+            let value = Value::Str(path.to_string());
+            if let Some(slot) = pairs
+                .iter_mut()
+                .find(|(k, _)| matches!(k, Value::Str(s) if s == "container_path"))
+            {
+                slot.1 = value;
+            } else {
+                pairs.push((Value::Str("container_path".to_string()), value));
+            }
         }
         pickle::dumps(&Value::Dict(pairs))
     }
@@ -182,8 +206,8 @@ impl AsyncUpdate {
 pub enum NodeResult {
     /// 2xx, replica updated.
     Success,
-    /// 2xx with a sharding redirect `Location` (the update belongs to a
-    /// shard container). Treated as a success for this node.
+    /// HTTP 301 with a sharding `Location`. Not a replica success: Python
+    /// rewrites `container_path` and retries the destination.
     Redirect(String),
     /// Any non-2xx / connection error; the update must be retried later.
     Failure,
@@ -252,8 +276,8 @@ fn parse_status(buf: &[u8]) -> NodeResult {
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|c| c.parse::<u16>().ok());
     match status {
-        Some(s) if (200..300).contains(&s) => {
-            // a sharding redirect carries a Location header
+        Some(s) if (200..300).contains(&s) => NodeResult::Success,
+        Some(301) => {
             for line in head.split("\r\n").skip(1) {
                 if let Some(loc) = line
                     .split_once(':')
@@ -262,9 +286,49 @@ fn parse_status(buf: &[u8]) -> NodeResult {
                     return NodeResult::Redirect(loc.1.trim().to_string());
                 }
             }
-            NodeResult::Success
+            NodeResult::Failure
         }
         _ => NodeResult::Failure,
+    }
+}
+
+/// `/acct/cont/obj` or percent-encoded Location → `acct/cont`.
+fn redirect_container_path(location: &str) -> Option<String> {
+    let decoded = percent_decode(location.trim());
+    let s = decoded.trim_start_matches('/');
+    let (acct, rest) = s.split_once('/')?;
+    let cont = rest.split_once('/').map(|(c, _)| c).unwrap_or(rest);
+    if acct.is_empty() || cont.is_empty() {
+        return None;
+    }
+    Some(format!("{acct}/{cont}"))
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = &input[i + 1..i + 3];
+            if let Ok(v) = u8::from_str_radix(hex, 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn ensure_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
+    if !headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case(name))
+    {
+        headers.push((name.to_string(), value.to_string()));
     }
 }
 
@@ -275,6 +339,8 @@ pub enum UpdateOutcome {
     Unlinked,
     /// Some replicas updated; the file was rewritten with the new successes.
     Rewritten,
+    /// A shard 301 rewrote `container_path`; caller should retry once.
+    Redirected(String),
     /// No progress; the file is left untouched for a later sweep.
     Failed,
 }
@@ -398,18 +464,21 @@ pub fn process_update(
             update.policy_index.to_string(),
         ));
     }
+    ensure_header(&mut headers, "X-Backend-Accept-Redirect", "true");
+    ensure_header(&mut headers, "X-Backend-Accept-Quoted-Location", "true");
     let path = update.container_object_path();
     let mut successes = update.successes.clone();
     let mut all_ok = true;
+    let mut redirects = Vec::new();
     for node in nodes {
         if successes.contains(&(node.id as i64)) {
             continue;
         }
         match client.send(node, part, &update.op, &path, update.policy_index, &headers) {
             NodeResult::Success => successes.push(node.id as i64),
-            NodeResult::Redirect(_) => {
-                stats.redirects += 1;
-                successes.push(node.id as i64);
+            NodeResult::Redirect(loc) => {
+                all_ok = false;
+                redirects.push(loc);
             }
             NodeResult::Failure => all_ok = false,
         }
@@ -419,6 +488,20 @@ pub fn process_update(
         stats.successes += 1;
         stats.unlinks += 1;
         Ok(UpdateOutcome::Unlinked)
+    } else if let Some(dest) = redirects.iter().find_map(|loc| redirect_container_path(loc))
+    {
+        // Python: erase successes, persist container_path, retry once.
+        match update.repickle_redirect(&dest) {
+            Ok(bytes) => {
+                std::fs::write(&update.path, bytes)?;
+                stats.redirects += 1;
+                Ok(UpdateOutcome::Redirected(dest))
+            }
+            Err(_) => {
+                stats.errors += 1;
+                Ok(UpdateOutcome::Failed)
+            }
+        }
     } else {
         stats.track_update_failure(update);
         if successes.len() > update.successes.len() {
@@ -438,6 +521,35 @@ pub fn process_update(
             stats.failures += 1;
             Ok(UpdateOutcome::Failed)
         }
+    }
+}
+
+/// Python `process_object_update`: one redirect rewrite, then one retry.
+pub fn process_update_following_redirects(
+    update: &AsyncUpdate,
+    part: u32,
+    nodes: &[&swift_ring::RingDevice],
+    container_ring: &Ring,
+    client: &dyn ContainerNodeClient,
+    stats: &mut UpdaterStats,
+) -> std::io::Result<UpdateOutcome> {
+    match process_update(update, part, nodes, client, stats)? {
+        UpdateOutcome::Redirected(dest) => {
+            let mut retry = update.clone();
+            retry.container_path = Some(dest);
+            retry.successes.clear();
+            let (acct, cont) = retry.ring_account_container();
+            let Ok((retry_part, retry_nodes)) =
+                container_ring.get_nodes(acct, Some(cont), None)
+            else {
+                stats.errors += 1;
+                return Ok(UpdateOutcome::Failed);
+            };
+            let retry_devs: Vec<&swift_ring::RingDevice> =
+                retry_nodes.iter().map(|n| n.dev).collect();
+            process_update(&retry, retry_part, &retry_devs, client, stats)
+        }
+        other => Ok(other),
     }
 }
 
@@ -574,7 +686,14 @@ pub fn run_once_with_concurrency_and_tracker(
                 continue;
             };
             let devs: Vec<&swift_ring::RingDevice> = nodes.iter().map(|n| n.dev).collect();
-            let _ = process_update(&update, part, &devs, client, &mut stats);
+            let _ = process_update_following_redirects(
+                &update,
+                part,
+                &devs,
+                container_ring,
+                client,
+                &mut stats,
+            );
         }
         return stats;
     }
@@ -598,7 +717,14 @@ pub fn run_once_with_concurrency_and_tracker(
                     };
                     let devs: Vec<&swift_ring::RingDevice> = nodes.iter().map(|n| n.dev).collect();
                     let mut local = UpdaterStats::with_tracker_limit(tracker_max_entries);
-                    let _ = process_update(update, part, &devs, client, &mut local);
+                    let _ = process_update_following_redirects(
+                        update,
+                        part,
+                        &devs,
+                        container_ring,
+                        client,
+                        &mut local,
+                    );
                     let mut g = stats.lock().unwrap();
                     g.merge_from(local);
                 });
@@ -841,6 +967,56 @@ mod tests {
         assert_eq!(stats.errors, 2);
         assert!(ap.join("a-b-c").exists());
         assert!(ap.join("deadbeef-notatimestamp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parse_status_treats_301_location_as_redirect() {
+        let raw = b"HTTP/1.1 301 Moved Permanently\r\n\
+Location: /.shards_AUTH_test/shard-1/alpha\r\n\
+X-Backend-Redirect-Timestamp: 1.00000\r\n\r\n";
+        assert_eq!(
+            parse_status(raw),
+            NodeResult::Redirect("/.shards_AUTH_test/shard-1/alpha".into())
+        );
+        assert_eq!(
+            redirect_container_path("/.shards_AUTH_test/shard-1/alpha").as_deref(),
+            Some(".shards_AUTH_test/shard-1")
+        );
+        let ok = b"HTTP/1.1 204 No Content\r\n\r\n";
+        assert_eq!(parse_status(ok), NodeResult::Success);
+    }
+
+    #[test]
+    fn process_update_rewrites_container_path_on_301() {
+        let dir = std::env::temp_dir().join(format!("swift-upd-301-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ap = dir.join("async_pending/abc");
+        std::fs::create_dir_all(&ap).unwrap();
+        let file = ap.join("00000000000000000000000000000abc-1751500000.00000");
+        std::fs::write(&file, make_async_pickle("PUT", "AUTH_test", "root", "alpha")).unwrap();
+        let mut stats = UpdaterStats::default();
+        let updates = iter_async_pendings(&dir, &mut stats);
+        let client = FakeClient {
+            calls: Mutex::new(Vec::new()),
+            answer: NodeResult::Redirect("/.shards_AUTH_test/shard-b/alpha".into()),
+        };
+        let nodes = [dev(1), dev(2), dev(3)];
+        let refs: Vec<&swift_ring::RingDevice> = nodes.iter().collect();
+        let outcome = process_update(&updates[0], 5, &refs, &client, &mut stats).unwrap();
+        assert_eq!(
+            outcome,
+            UpdateOutcome::Redirected(".shards_AUTH_test/shard-b".into())
+        );
+        assert!(file.exists(), "redirect rewrite keeps the pending file");
+        assert_eq!(stats.redirects, 1);
+        let rewritten = std::fs::read(&file).unwrap();
+        let again = AsyncUpdate::parse(&rewritten, file.clone(), 0, "1".into()).unwrap();
+        assert_eq!(
+            again.container_path.as_deref(),
+            Some(".shards_AUTH_test/shard-b")
+        );
+        assert!(again.successes.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
