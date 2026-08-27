@@ -4323,6 +4323,44 @@ impl ProxyApp {
         path: &str,
         shard_headers: &HeaderKeyDict,
     ) -> Option<Vec<serde_json::Value>> {
+        // Python `_get_listing_namespaces_from_backend` uses the same
+        // X-Newest walk as HEAD. Quorum topology is wrong here: two lagging
+        // SHARDING replicas (CLEAVED+CREATED) outvote one just-SHARDED
+        // replica with 4 ACTIVE (probe listing_under_populated L1509).
+        let newest = shard_headers
+            .get("X-Newest")
+            .map(config_true_value)
+            .unwrap_or(false);
+        if newest {
+            if let Some(arr) = self
+                .get_or_head(
+                    "container",
+                    nodes.clone(),
+                    part,
+                    "GET",
+                    path,
+                    "states=listing&format=json",
+                    shard_headers,
+                )
+                .and_then(parse_listing_json_body)
+            {
+                if !arr.is_empty() {
+                    return Some(arr);
+                }
+            }
+            let broad = self
+                .get_or_head(
+                    "container",
+                    nodes,
+                    part,
+                    "GET",
+                    path,
+                    "format=json",
+                    shard_headers,
+                )
+                .and_then(parse_listing_json_body)?;
+            return Some(prefer_listing_state_ranges(&broad));
+        }
         // 1) Prefer the topology reported by the most replicas.  On a tie,
         // keep the longest progressed view so a lagging 1-range replica does
         // not hide CLEAVED children (probe test_sharding_listing L631).
@@ -10497,6 +10535,37 @@ mod shard_listing_fanout_tests {
         let got = prefer_longest_nonempty_arrays(&[vec![], short, long.clone()]).unwrap();
         assert_eq!(got.len(), 3, "{got:?}");
         assert_eq!(got[0]["name"], "c0");
+    }
+
+    #[test]
+    fn quorum_listing_outvotes_single_sharded_active_partition() {
+        // L1509: two lagging SHARDING replicas agree on CLEAVED+CREATED;
+        // the just-SHARDED replica has 4 ACTIVE. Quorum therefore cannot
+        // be the X-Newest namespace source.
+        let cleaved = vec![
+            serde_json::json!({"name": "s0", "lower": "", "upper": "obj-0049", "state": 30}),
+            serde_json::json!({"name": "s1", "lower": "obj-0049", "upper": "obj-0099", "state": 30}),
+            serde_json::json!({"name": "s2", "lower": "obj-0099", "upper": "obj-0149", "state": 20}),
+            serde_json::json!({"name": "s3", "lower": "obj-0149", "upper": "", "state": 20}),
+        ];
+        let active = vec![
+            serde_json::json!({"name": "s0", "lower": "", "upper": "obj-0049", "state": 40, "timestamp": "1751500099.00000"}),
+            serde_json::json!({"name": "s1", "lower": "obj-0049", "upper": "obj-0099", "state": 40, "timestamp": "1751500099.00000"}),
+            serde_json::json!({"name": "s2", "lower": "obj-0099", "upper": "obj-0149", "state": 40, "timestamp": "1751500099.00000"}),
+            serde_json::json!({"name": "s3", "lower": "obj-0149", "upper": "", "state": 40, "timestamp": "1751500099.00000"}),
+        ];
+        let got = prefer_quorum_consistent_listing_arrays(&[
+            cleaved.clone(),
+            cleaved,
+            active,
+        ])
+        .unwrap();
+        assert_eq!(
+            got.iter().filter(|sr| sr["state"] == 40).count(),
+            0,
+            "quorum must pick the 2-replica SHARDING view, got {got:?}"
+        );
+        assert_eq!(got.iter().filter(|sr| sr["state"] == 30).count(), 2);
     }
 
     #[test]
