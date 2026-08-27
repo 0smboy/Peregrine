@@ -1529,10 +1529,18 @@ fn update_objects_on_primaries(
     let part = part.to_string();
     let ts = swift_core::timestamp::Timestamp::now().internal();
     let body = object_records_update_json(records);
-    let extra = [
-        ("X-Backend-Allow-Reserved-Names", "true"),
-        ("X-Backend-Auto-Create", "True"),
-    ];
+    let dest_is_shard = account.starts_with(".shards_");
+    let extra = if dest_is_shard {
+        [
+            ("X-Backend-Allow-Reserved-Names", "true"),
+            ("X-Backend-Auto-Create", "True"),
+        ]
+    } else {
+        [
+            ("X-Backend-Allow-Reserved-Names", "true"),
+            ("X-Backend-Auto-Create", "False"),
+        ]
+    };
     let mut ok = 0usize;
     for node in &nodes {
         match update_objects_body(node, &part, &account, &container, &ts, &body, &extra) {
@@ -1741,10 +1749,23 @@ fn fetch_shard_ranges_from_root(
     marker: &str,
     end_marker: &str,
 ) -> Vec<ShardRange> {
+    fetch_shard_ranges_from_root_states(
+        ring, root_acct, root_cont, marker, end_marker, "auditing",
+    )
+}
+
+fn fetch_shard_ranges_from_root_states(
+    ring: &swift_ring::Ring,
+    root_acct: &str,
+    root_cont: &str,
+    marker: &str,
+    end_marker: &str,
+    states: &str,
+) -> Vec<ShardRange> {
     let Ok((part, nodes)) = ring.get_nodes(root_acct, Some(root_cont), None) else {
         return Vec::new();
     };
-    let mut q = String::from("format=json&states=auditing");
+    let mut q = format!("format=json&states={states}");
     if !marker.is_empty() {
         q.push_str("&marker=");
         q.push_str(&http_path_seg(marker));
@@ -2904,7 +2925,9 @@ fn misplaced_dest_ranges(
     }
     let mut ranges = Vec::new();
     if let (Some(ring), Some((root_acct, root_cont))) = (ring, root_account_container(source)) {
-        ranges = fetch_shard_ranges_from_root(ring, &root_acct, &root_cont, "", "");
+        ranges = fetch_shard_ranges_from_root_states(
+            ring, &root_acct, &root_cont, "", "", "updating",
+        );
     }
     if ranges.is_empty() {
         ranges = source
@@ -2929,23 +2952,37 @@ pub fn move_misplaced_from_live(
         return Ok(0);
     }
     let dest_ranges = misplaced_dest_ranges(source, ring);
-    // After shrink-to-root there are no updating children. Python
-    // states=updating + fill_gaps yields the root own range, so leftover
-    // rows move onto the root (probe L2798 beta replaces alpha).
-    let root_fallback = if source.is_root_container().unwrap_or(true) {
-        None
-    } else {
-        root_account_container(source).map(|(acct, cont)| {
-            let ts = swift_core::timestamp::Timestamp::now().internal();
-            let mut sr = ShardRange::new(&format!("{acct}/{cont}"), &ts, "", "");
+    let source_path = source.path();
+    let root_path = root_account_container(source).map(|(acct, cont)| format!("{acct}/{cont}"));
+    // Python fill_gaps appends the root own range (often SHARDED). That
+    // range is a valid dest after shrink-to-root (probe L2798). Do not
+    // synthesize an ACTIVE MIN-MAX fallback for uncovered names: a
+    // mid-shrink leading gap must stay unplaced (probe test_shrinking).
+    let has_updating_dest = dest_ranges.iter().any(|r| {
+        r.deleted == 0
+            && r.name != source_path
+            && (is_shard_update_state(r.state)
+                || root_path.as_deref() == Some(r.name.as_str()))
+    });
+    let root_fallback = if !has_updating_dest && !source.is_root_container().unwrap_or(true)
+    {
+        root_path.as_ref().map(|path| {
+            let ts = source
+                .get_own_shard_range(false)
+                .ok()
+                .flatten()
+                .map(|o| o.timestamp.clone())
+                .unwrap_or_else(|| swift_core::timestamp::Timestamp::now().internal());
+            let mut sr = ShardRange::new(path, &ts, "", "");
             sr.state = shard_state::ACTIVE;
             sr
         })
+    } else {
+        None
     };
     if dest_ranges.is_empty() && root_fallback.is_none() {
         return Ok(0);
     }
-    let source_path = source.path();
     let records = source.object_records_in_range("", "")?;
     if records.is_empty() {
         return Ok(0);
@@ -2956,9 +2993,10 @@ pub fn move_misplaced_from_live(
         let name = rec.name.clone();
         let owner_from_ranges = dest_ranges.iter().find(|r| {
             r.deleted == 0
-                && is_shard_update_state(r.state)
                 && range_contains_object_name(r, &name)
                 && r.name != source_path
+                && (is_shard_update_state(r.state)
+                    || root_path.as_deref() == Some(r.name.as_str()))
         });
         let Some(owner) = owner_from_ranges.or(root_fallback.as_ref()) else {
             continue;
