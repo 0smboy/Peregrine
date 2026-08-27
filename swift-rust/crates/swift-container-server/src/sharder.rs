@@ -3914,12 +3914,16 @@ fn maybe_start_sharding(
         if has_shrinking_donor && !own_is_donor {
             return Ok(false);
         }
-        // An epoch-suffixed DB already cleaved once. Leftover ACTIVE
-        // siblings after the first shrink are mid-shrink children, not a
-        // reason to start a second epoch. set_sharding_state() here makes
-        // own.epoch diverge from the filename and HEAD reports unsharded
-        // with object_count 1 (probe test_shrinking L2088).
-        if broker.db_epoch().is_some() {
+        // An epoch-suffixed DB whose own range is already an acceptor
+        // (ACTIVE/SHARDED), not a cleaving donor. Leftover ACTIVE siblings
+        // after the first shrink are mid-shrink children. Calling
+        // set_sharding_state() here creates a second epoch, own.epoch
+        // diverges, and HEAD reports unsharded with object_count 1 (L2088).
+        //
+        // If own is still SHARDING, this is the first cleave (maybe_auto_shard
+        // just created the epoch file). Must continue into set_sharding_state
+        // so objects actually leave the root (probe expected count 0).
+        if broker.db_epoch().is_some() && !own_is_donor {
             if let Some(db_epoch) = broker.db_epoch() {
                 if let Some(mut own) = broker.get_own_shard_range(true)? {
                     let own_norm = own
