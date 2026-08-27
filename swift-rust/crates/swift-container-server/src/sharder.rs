@@ -2663,15 +2663,32 @@ pub fn process_shrinking_donors(
         else {
             continue;
         };
-        // Prefer acceptor on same device as donor; else create under donor device.
-        let mut acc_b =
-            open_existing_shard_broker(&donor_dev, hash_config, &acc_part, &acceptor.name)
-                .unwrap_or_else(|| {
-                    local_shard_broker_for_range(&donor_dev, hash_config, &acc_part, acceptor)
-                });
+        // Search every local device for the real acceptor before creating
+        // an empty one. Creating empty on the donor device and then publishing
+        // that DB's object_count overwrites the root with 1 (alpha only)
+        // while listing still reads the real acceptor (probe MoreUTF8
+        // test_shrinking L1992: 51 != 1).
+        let (acc_existing, mut acc_b) = match open_existing_shard_on_devices(
+            &search_devices,
+            hash_config,
+            &acc_part,
+            &acceptor.name,
+        ) {
+            Some((_acc_dev, broker)) => (true, broker),
+            None => (
+                false,
+                local_shard_broker_for_range(&donor_dev, hash_config, &acc_part, acceptor),
+            ),
+        };
 
         // Copy all rows in the donor's original bounds into the acceptor.
         let records = donor_b.object_records_in_range(&donor.lower, &donor.upper)?;
+        let live_copied = records.iter().filter(|r| r.deleted == 0).count() as i64;
+        let bytes_copied: i64 = records
+            .iter()
+            .filter(|r| r.deleted == 0)
+            .map(|r| r.size)
+            .sum();
         let names: Vec<String> = records.iter().map(|r| r.name.clone()).collect();
         if !records.is_empty() {
             acc_b.merge_items(records)?;
@@ -2681,17 +2698,26 @@ pub fn process_shrinking_donors(
             let _ = donor_b.remove_object_named(name);
         }
 
-        // Refresh acceptor stats from live DB.
+        // Refresh acceptor stats from the live acceptor DB only when that
+        // DB already existed. A newly created empty acceptor only has the
+        // just-copied donor rows; publishing get_info() would stomp the
+        // real acceptor's 50 down to 1 on the root.
         let mut acc_updated = acceptor.clone();
-        if let Ok(info) = acc_b.get_info() {
-            let get = |k: &str| {
-                info.iter()
-                    .find(|(n, _)| n == k)
-                    .and_then(|(_, v)| v.as_i64())
-                    .unwrap_or(0)
-            };
-            acc_updated.object_count = get("object_count");
-            acc_updated.bytes_used = get("bytes_used");
+        if acc_existing {
+            if let Ok(info) = acc_b.get_info() {
+                let get = |k: &str| {
+                    info.iter()
+                        .find(|(n, _)| n == k)
+                        .and_then(|(_, v)| v.as_i64())
+                        .unwrap_or(0)
+                };
+                acc_updated.object_count = get("object_count");
+                acc_updated.bytes_used = get("bytes_used");
+                acc_updated.meta_timestamp = ts.clone();
+            }
+        } else {
+            acc_updated.object_count = acceptor.object_count + live_copied;
+            acc_updated.bytes_used = acceptor.bytes_used + bytes_copied;
             acc_updated.meta_timestamp = ts.clone();
         }
 
@@ -6530,6 +6556,106 @@ mod tests {
             moved.iter().any(|r| r.name == "bbb" && r.deleted == 0),
             "{moved:?}"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_shrink_does_not_publish_empty_local_acceptor_stats() {
+        // Probe MoreUTF8 test_shrinking L1992: donor+root on d1, real
+        // acceptor (50 objects) only on d2. Shrinking must not create an
+        // empty acceptor on d1 and write object_count=1 to the root.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharder-shrink-empty-acc-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let d1 = dir.join("d1");
+        let d2 = dir.join("d2");
+        let account = "AUTH_test";
+        let container = "root";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = d1.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let db = hd.join(format!("{hsh}.db"));
+        let mut source = ContainerBroker::new(&db, account, container);
+        source
+            .initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        let epoch = "1751500010.00000";
+        let mut donor = ShardRange::new(".shards_AUTH_test/c-d0", epoch, "", "m");
+        donor.state = shard_state::SHRINKING;
+        donor.object_count = 1;
+        let mut acceptor = ShardRange::new(".shards_AUTH_test/c-a0", epoch, "", "");
+        acceptor.state = shard_state::ACTIVE;
+        acceptor.object_count = 50;
+        acceptor.bytes_used = 150;
+        source
+            .merge_shard_ranges(vec![donor.clone(), acceptor.clone()])
+            .unwrap();
+
+        let mut donor_b = local_shard_broker(&d1, &hash_config, "0", &donor.name);
+        donor_b
+            .merge_items(vec![swift_db::ObjectRecord {
+                name: "alpha-1".into(),
+                created_at: "1751500011.00000".into(),
+                size: 3,
+                content_type: "text/plain".into(),
+                etag: "d41d8cd98f00b204e9800998ecf8427e".into(),
+                deleted: 0,
+                storage_policy_index: 0,
+                ctype_timestamp: None,
+                meta_timestamp: None,
+            }])
+            .unwrap();
+
+        let mut acc_b = local_shard_broker(&d2, &hash_config, "0", &acceptor.name);
+        let records: Vec<_> = (0..50)
+            .map(|i| swift_db::ObjectRecord {
+                name: format!("obj-{i:03}"),
+                created_at: "1751500011.00000".into(),
+                size: 3,
+                content_type: "text/plain".into(),
+                etag: "d41d8cd98f00b204e9800998ecf8427e".into(),
+                deleted: 0,
+                storage_policy_index: 0,
+                ctype_timestamp: None,
+                meta_timestamp: None,
+            })
+            .collect();
+        acc_b.merge_items(records).unwrap();
+
+        let n = process_shrinking_donors(&mut source, &d1, &hash_config, "0", None).unwrap();
+        assert_eq!(n, 1);
+
+        let after = source
+            .get_shard_ranges(&GetShardRangesArgs {
+                include_deleted: true,
+                include_own: false,
+                ..Default::default()
+            })
+            .unwrap();
+        let a = after.iter().find(|r| r.name == acceptor.name).unwrap();
+        assert_eq!(
+            a.object_count, 51,
+            "root acceptor stats must keep the real 50 plus copied alpha, got {a:?}"
+        );
+        assert_eq!(a.bytes_used, 153, "{a:?}");
+        let d = after.iter().find(|r| r.name == donor.name).unwrap();
+        assert_eq!(d.state, shard_state::SHRUNK);
+        assert_eq!(d.deleted, 1);
+
+        let mut acc_after = open_existing_shard_broker(&d2, &hash_config, "0", &acceptor.name)
+            .expect("real acceptor must still exist on d2");
+        let moved = acc_after.object_records_in_range("", "").unwrap();
+        assert!(
+            moved.iter().any(|r| r.name == "alpha-1" && r.deleted == 0),
+            "{moved:?}"
+        );
+        assert_eq!(moved.iter().filter(|r| r.deleted == 0).count(), 51);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
