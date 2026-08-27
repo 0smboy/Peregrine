@@ -6013,10 +6013,16 @@ pub(crate) fn is_good_source(status: u16, is_object: bool) -> bool {
 /// raises on a malformed value; a well-formed backend never sends one,
 /// so falling through is the pragmatic port.)
 pub(crate) fn source_timestamp(headers: &[(String, String)]) -> Timestamp {
+    // Container servers set X-Backend-Timestamp = created_at, identical on
+    // every replica. Prefer status-changed (set_sharded_state / delete)
+    // then PUT so X-Newest can see the just-SHARDED under-populated node
+    // (listing_under_populated L1509). Objects still win via data-timestamp.
     for key in [
         "x-backend-data-timestamp",
-        "x-backend-timestamp",
+        "x-backend-status-changed-at",
+        "x-backend-put-timestamp",
         "x-put-timestamp",
+        "x-backend-timestamp",
         "x-timestamp",
     ] {
         if let Some(ts) = resp_header(headers, key)
@@ -8324,6 +8330,14 @@ mod stale_read_and_post_tests {
         assert_eq!(source_timestamp(&h), "1000000003.00000".parse().unwrap());
         // nothing usable -> zero
         assert_eq!(source_timestamp(&hdrs(&[])), Timestamp::zero());
+        // L1509: same created_at on all replicas; SHARDED replica just
+        // bumped status_changed_at. That must beat created_at.
+        let h = hdrs(&[
+            ("X-Backend-Timestamp", "1000000001.00000"),
+            ("X-Backend-PUT-Timestamp", "1000000002.00000"),
+            ("X-Backend-Status-Changed-At", "1000000009.00000"),
+        ]);
+        assert_eq!(source_timestamp(&h), "1000000009.00000".parse().unwrap());
     }
 
     #[test]
