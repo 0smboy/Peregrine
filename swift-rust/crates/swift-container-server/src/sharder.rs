@@ -2433,10 +2433,10 @@ pub fn find_compactible_shard_sequences(
         include_deleted: false,
         ..GetShardRangesArgs::default()
     })?;
-    let own = broker.get_own_shard_range(false)?.unwrap_or_else(|| {
-        let now = swift_core::timestamp::Timestamp::now().internal();
-        ShardRange::new(&broker.path(), &now, "", "")
-    });
+    // Persist own only. A synthesized default has no epoch; merging it as
+    // the shrink-to-root acceptor overwrites own.epoch and get_db_state()
+    // becomes Unsharded (probe test_shrinking L2088).
+    let own = broker.get_own_shard_range(true)?;
     let shrinking_states = [shard_state::ACTIVE, shard_state::SHRINKING];
     let mut compactible = Vec::new();
     let mut index = 0usize;
@@ -2476,9 +2476,11 @@ pub fn find_compactible_shard_sequences(
         if index == shard_ranges.len()
             && shard_ranges.len() == sequence.len()
             && !sequence_complete(&sequence, shrink_threshold, expansion_limit, max_shrinking)
-            && sequence_includes(&sequence, &own)
+            && own
+                .as_ref()
+                .is_some_and(|o| sequence_includes(&sequence, o))
         {
-            sequence.push(own.clone());
+            sequence.push(own.clone().expect("own checked above"));
         }
         let last_state = sequence.last().map(|r| r.state).unwrap_or(-1);
         if sequence.len() < 2
@@ -2503,6 +2505,12 @@ pub fn process_compactible_shard_sequences(
     sequences: &mut [Vec<ShardRange>],
 ) -> Result<(), DbError> {
     let timestamp = swift_core::timestamp::Timestamp::now().internal();
+    let own_path = broker.path();
+    let persisted_own_epoch = broker
+        .get_own_shard_range(true)
+        .ok()
+        .flatten()
+        .and_then(|o| o.epoch);
     let mut to_merge = Vec::new();
     for sequence in sequences.iter_mut() {
         if sequence.len() < 2 {
@@ -2515,6 +2523,13 @@ pub fn process_compactible_shard_sequences(
         }
         if sequence[acceptor_idx].update_state(shard_state::ACTIVE, None) {
             sequence[acceptor_idx].state_timestamp = timestamp.clone();
+        }
+        // Expand/timestamp-bump must not drop the root own epoch. A no-epoch
+        // own on an epoch-suffixed DB is Unsharded (L2088).
+        if sequence[acceptor_idx].name == own_path {
+            if sequence[acceptor_idx].epoch.is_none() {
+                sequence[acceptor_idx].epoch = persisted_own_epoch.clone();
+            }
         }
         for donor in sequence[..acceptor_idx].iter_mut() {
             if donor.update_state(shard_state::SHRINKING, None) {
@@ -2694,13 +2709,27 @@ pub fn process_shrinking_donors(
         include_deleted: false,
         ..GetShardRangesArgs::default()
     })?;
+    // Last-shard shrink-to-root: the covering acceptor is the root own,
+    // which `include_own: false` hides from `find_shrink_acceptor`.
+    let own = root.get_own_shard_range(true)?;
     let ts = swift_core::timestamp::Timestamp::now().internal();
     let mut finished = 0usize;
     let search_devices = local_device_siblings(device);
     for donor in donors {
-        let Some(acceptor) = find_shrink_acceptor(&ranges, &donor) else {
+        let acceptor = find_shrink_acceptor(&ranges, &donor)
+            .cloned()
+            .or_else(|| {
+                own.clone().filter(|o| {
+                    o.deleted == 0
+                        && (o.state == shard_state::ACTIVE || o.state == shard_state::SHARDED)
+                        && o.name != donor.name
+                        && range_covers(o, &donor)
+                })
+            });
+        let Some(acceptor) = acceptor else {
             continue;
         };
+        let acceptor_is_this_root = acceptor.name == root.path();
         let donor_part = shard_part_for(&donor.name, ring, root_part);
         let acc_part = shard_part_for(&acceptor.name, ring, root_part);
         // Only shrink when the donor shard DB already lives on this host.
@@ -2716,19 +2745,6 @@ pub fn process_shrinking_donors(
         // that DB's object_count overwrites the root with 1 (alpha only)
         // while listing still reads the real acceptor (probe MoreUTF8
         // test_shrinking L1992: 51 != 1).
-        let (acc_existing, mut acc_b) = match open_existing_shard_on_devices(
-            &search_devices,
-            hash_config,
-            &acc_part,
-            &acceptor.name,
-        ) {
-            Some((_acc_dev, broker)) => (true, broker),
-            None => (
-                false,
-                local_shard_broker_for_range(&donor_dev, hash_config, &acc_part, acceptor),
-            ),
-        };
-
         // Copy all rows in the donor's original bounds into the acceptor.
         let records = donor_b.object_records_in_range(&donor.lower, &donor.upper)?;
         let live_copied = records.iter().filter(|r| r.deleted == 0).count() as i64;
@@ -2738,6 +2754,47 @@ pub fn process_shrinking_donors(
             .map(|r| r.size)
             .sum();
         let names: Vec<String> = records.iter().map(|r| r.name.clone()).collect();
+
+        let mut donor_updated = donor.clone();
+        // Bump created timestamp so merge_shards takes the full new row
+        // (same timestamp would preserve existing deleted=0).
+        donor_updated.timestamp = ts.clone();
+        donor_updated.object_count = 0;
+        donor_updated.bytes_used = 0;
+        donor_updated.meta_timestamp = ts.clone();
+        let _ = donor_updated.update_state(shard_state::SHRUNK, Some(&ts));
+        // SHRUNK donors are soft-deleted from the namespace (Python).
+        donor_updated.deleted = 1;
+
+        if acceptor_is_this_root {
+            // Shrink-to-root: write into this root broker (epoch file).
+            // Do not open_or_create a second unsuffixed hash.db (L2088
+            // unsharded + object_count 1). Do not timestamp-bump own:
+            // a newer no-epoch own would wipe own.epoch.
+            if !records.is_empty() {
+                root.merge_items(records)?;
+            }
+            for name in &names {
+                let _ = donor_b.remove_object_named(name);
+            }
+            root.merge_shard_ranges(vec![donor_updated])?;
+            finished += 1;
+            continue;
+        }
+
+        let (acc_existing, mut acc_b) = match open_existing_shard_on_devices(
+            &search_devices,
+            hash_config,
+            &acc_part,
+            &acceptor.name,
+        ) {
+            Some((_acc_dev, broker)) => (true, broker),
+            None => (
+                false,
+                local_shard_broker_for_range(&donor_dev, hash_config, &acc_part, &acceptor),
+            ),
+        };
+
         if !records.is_empty() {
             acc_b.merge_items(records)?;
         }
@@ -2768,17 +2825,6 @@ pub fn process_shrinking_donors(
             acc_updated.bytes_used = acceptor.bytes_used + bytes_copied;
             acc_updated.meta_timestamp = ts.clone();
         }
-
-        let mut donor_updated = donor.clone();
-        // Bump created timestamp so merge_shards takes the full new row
-        // (same timestamp would preserve existing deleted=0).
-        donor_updated.timestamp = ts.clone();
-        donor_updated.object_count = 0;
-        donor_updated.bytes_used = 0;
-        donor_updated.meta_timestamp = ts.clone();
-        let _ = donor_updated.update_state(shard_state::SHRUNK, Some(&ts));
-        // SHRUNK donors are soft-deleted from the namespace (Python).
-        donor_updated.deleted = 1;
 
         // Acceptor bounds/stats: bump timestamp so meta wins cleanly.
         acc_updated.timestamp = ts.clone();
@@ -6793,6 +6839,117 @@ mod tests {
             find_shrink_acceptor(&ranges, &donor).map(|r| r.name.as_str()),
             Some("a")
         );
+    }
+
+    #[test]
+    fn test_process_shrinking_donors_shrink_to_root_collapses() {
+        // Probe L2088: last SHRINKING donor is covered only by the root own
+        // (`include_own: false` hides it from find_shrink_acceptor). Must copy
+        // alpha onto the epoch DB and leave collapsed, not unsharded.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-s2r-collapse-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "c";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let unsuffixed = hd.join(format!("{hsh}.db"));
+        let epoch = "1751500010.00000";
+        let epoch_path = make_db_file_path(&unsuffixed, Some(epoch)).unwrap();
+        let mut root = ContainerBroker::new(&epoch_path, account, container);
+        root.initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        let mut own = root.get_own_shard_range(false).unwrap().unwrap();
+        own.epoch = Some(epoch.to_string());
+        own.state = shard_state::SHARDED;
+        let mut donor = ShardRange::new(".shards_AUTH_test/c-0", epoch, "", "");
+        donor.state = shard_state::SHRINKING;
+        donor.object_count = 1;
+        root.merge_shard_ranges(vec![own, donor.clone()]).unwrap();
+        assert_eq!(root.get_db_state().unwrap(), DbState::Sharded);
+
+        let mut donor_b = local_shard_broker(&device, &hash_config, "0", &donor.name);
+        donor_b
+            .merge_items(vec![swift_db::ObjectRecord {
+                name: "alpha-1".into(),
+                created_at: "1751500011.00000".into(),
+                size: 1,
+                content_type: "text/plain".into(),
+                etag: "e".into(),
+                deleted: 0,
+                storage_policy_index: 0,
+                ctype_timestamp: None,
+                meta_timestamp: None,
+            }])
+            .unwrap();
+
+        let n = process_shrinking_donors(&mut root, &device, &hash_config, "0", None).unwrap();
+        assert_eq!(n, 1, "shrink-to-root must finish the last donor, got {n}");
+        assert!(
+            !unsuffixed.exists(),
+            "must not create unsuffixed sidecar beside epoch"
+        );
+        assert_eq!(
+            root.get_db_state().unwrap(),
+            DbState::Collapsed,
+            "L2088: last shrink must collapse, not unsharded"
+        );
+        let names: Vec<String> = root
+            .object_records_in_range("", "")
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.deleted == 0)
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(names, vec!["alpha-1".to_string()], "{names:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_compactible_shrink_to_root_preserves_own_epoch() {
+        // A synthesized default own has no epoch. Merging it as acceptor
+        // would make get_db_state()==unsharded on the epoch file (L2088).
+        let dir = std::env::temp_dir().join(format!(
+            "swift-s2r-epoch-keep-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut root = container_broker(&dir, "c", 1);
+        let epoch = "1751500010.00000";
+        let mut own = root.get_own_shard_range(false).unwrap().unwrap();
+        own.epoch = Some(epoch.to_string());
+        own.state = shard_state::SHARDED;
+        let mut donor = ShardRange::new(".shards_AUTH_test/c-0", epoch, "", "");
+        donor.state = shard_state::ACTIVE;
+        donor.object_count = 1;
+        root.merge_shard_ranges(vec![own, donor]).unwrap();
+
+        let mut sequences = find_compactible_shard_sequences(
+            &mut root, 10, 100, 1, 1, true,
+        )
+        .unwrap();
+        assert!(
+            !sequences.is_empty(),
+            "last shard must form a shrink-to-root sequence"
+        );
+        process_compactible_shard_sequences(&mut root, &mut sequences).unwrap();
+        let after = root.get_own_shard_range(true).unwrap().unwrap();
+        assert_eq!(
+            after.epoch.as_deref(),
+            Some(epoch),
+            "own.epoch must survive compactible expand: {after:?}"
+        );
+        // container_broker is unsuffixed, so db_state stays Unsharded;
+        // the invariant is that own.epoch survived the merge.
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
