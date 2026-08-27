@@ -986,8 +986,30 @@ impl ContainerServer {
             .get_db_state()
             .map(|s| s.as_str().to_string())
             .unwrap_or_else(|_| "unsharded".to_string());
-        let mut headers = self.gen_resp_headers(&info, is_deleted, &sharding_state);
-        if is_deleted {
+        // Python GET_shard: X-Backend-Override-Deleted lets the sharder
+        // read ranges from a deleted root (probe test_delete_root_reclaim).
+        // Object listings stay 404.
+        let db_state_early = broker
+            .get_db_state()
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_default();
+        let mut record_type_early = req
+            .headers
+            .get("x-backend-record-type")
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if record_type_early == "auto"
+            && (db_state_early == "sharding" || db_state_early == "sharded")
+        {
+            record_type_early = "shard".to_string();
+        }
+        let override_deleted = truthy(req.headers.get("x-backend-override-deleted"));
+        let mut headers = self.gen_resp_headers(
+            &info,
+            is_deleted && !(record_type_early == "shard" && override_deleted),
+            &sharding_state,
+        );
+        if is_deleted && !(record_type_early == "shard" && override_deleted) {
             let mut resp = swob_response(404, None);
             for (k, v) in headers.iter() {
                 resp.headers.set(k, v);
