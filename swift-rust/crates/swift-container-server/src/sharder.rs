@@ -1796,8 +1796,14 @@ fn merge_shard_ranges_from_root(
         let _ = broker.merge_shard_ranges(vec![from_root]);
     }
     let sharded = matches!(broker.get_db_state(), Ok(DbState::Sharded));
-    if !children.is_empty() && !sharded {
-        let _ = broker.merge_shard_ranges(children);
+    // SHARDED+SHRUNK donors still need the covering acceptor so the
+    // live misplaced pass can find a destination (probe L2761).
+    if !children.is_empty() {
+        let shrinking_own =
+            own.state == shard_state::SHRINKING || own.state == shard_state::SHRUNK;
+        if !sharded || shrinking_own {
+            let _ = broker.merge_shard_ranges(children);
+        }
     }
 }
 
@@ -2944,18 +2950,38 @@ pub fn move_misplaced_from_live(
             continue;
         };
         let dest_part = shard_part_for(&owner.name, ring, part);
-        let mut dest = match open_existing_shard_on_devices(
+        let local_ok = match open_existing_shard_on_devices(
             &search,
             hash_config,
             &dest_part,
             &owner.name,
         ) {
-            Some((_dev, broker)) => broker,
-            None => local_shard_broker_for_range(device, hash_config, &dest_part, owner),
+            Some((_dev, mut dest)) => dest.merge_items(vec![rec.clone()]).is_ok(),
+            None if ring.is_none() => {
+                // Unit tests / no-ring SAIO: create dest on this device.
+                let mut dest =
+                    local_shard_broker_for_range(device, hash_config, &dest_part, owner);
+                dest.merge_items(vec![rec.clone()]).is_ok()
+            }
+            None => false,
         };
-        dest.merge_items(vec![rec])?;
-        source.remove_object_named(&name)?;
-        moved += 1;
+        // Python `_replicate_and_delete`: the dest primary set must receive
+        // the row. A local merge on the donor device is invisible to listing
+        // when dest primaries live on other /srv/N/node trees (probe L2761).
+        let remote_ok = match ring {
+            Some(ring) => {
+                update_objects_on_primaries(ring, &owner.name, std::slice::from_ref(&rec)).is_ok()
+            }
+            None => false,
+        };
+        eprintln!(
+            "G6_MISPLACED name={name} dest={} local={local_ok} remote={remote_ok}",
+            owner.name
+        );
+        if local_ok || remote_ok {
+            source.remove_object_named(&name)?;
+            moved += 1;
+        }
     }
     Ok(moved)
 }
