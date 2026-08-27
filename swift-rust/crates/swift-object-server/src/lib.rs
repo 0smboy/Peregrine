@@ -664,6 +664,10 @@ pub struct ObjectServerConfig {
 
 pub struct ObjectServer {
     pub config: ObjectServerConfig,
+    /// Directory containing Python-compatible `object.recon` daemon output.
+    /// The default matches Swift's recon middleware; the server binary
+    /// overrides it from `recon_cache_path`.
+    pub recon_cache_path: PathBuf,
     /// `fallocate_reserve`: the free-space floor a PUT may not take the
     /// device below. Python enforces it inside `fallocate()`
     /// (`swift/common/utils`), surfacing as DiskFileNoSpace -> 507; the
@@ -1199,6 +1203,7 @@ impl ObjectServer {
     pub fn new(config: ObjectServerConfig) -> Self {
         ObjectServer {
             config,
+            recon_cache_path: PathBuf::from("/var/cache/swift"),
             // swift.common.utils: fallocate_reserve defaults to "1%".
             fallocate_reserve: FallocateReserve::Percent(1.0),
             worm_clock: std::sync::Arc::new(ClockHealth::disabled()),
@@ -1211,6 +1216,11 @@ impl ObjectServer {
     /// `swift_core::config::config_fallocate_value`.
     pub fn with_fallocate_reserve(mut self, reserve: FallocateReserve) -> Self {
         self.fallocate_reserve = reserve;
+        self
+    }
+
+    pub fn with_recon_cache_path(mut self, path: PathBuf) -> Self {
+        self.recon_cache_path = path;
         self
     }
 
@@ -1249,6 +1259,20 @@ impl ObjectServer {
     pub async fn handle_async(&self, mut areq: AsyncRequest) -> Response {
         if let Some(m) = ConcurrencyMetrics::current() {
             m.attach_storage(self.storage().clone());
+        }
+        if areq.path == "/recon/updater/object"
+            && matches!(areq.method.as_str(), "GET" | "HEAD")
+        {
+            let req = Request {
+                method: areq.method,
+                path: areq.path,
+                query_string: areq.query_string,
+                headers: areq.headers,
+                body: Body::empty(),
+            };
+            return self
+                .recon_response(&req)
+                .expect("matched updater recon route");
         }
         if areq.method == "PUT" {
             return self.put_streaming_async(areq).await;
@@ -1344,6 +1368,7 @@ impl ObjectServer {
             .map(str::to_string);
         let exec = self.storage().clone();
         let config = self.config.clone();
+        let recon_cache_path = self.recon_cache_path.clone();
         let fallocate_reserve = self.fallocate_reserve;
         let worm_clock = std::sync::Arc::clone(&self.worm_clock);
         let req_for_disk = Request {
@@ -1366,6 +1391,7 @@ impl ObjectServer {
                 move || {
                     ObjectServer {
                         config,
+                        recon_cache_path,
                         fallocate_reserve,
                         worm_clock,
                         storage: std::sync::OnceLock::new(),
@@ -1427,12 +1453,14 @@ impl ObjectServer {
             .to_string();
         let exec = self.storage().clone();
         let config = self.config.clone();
+        let recon_cache_path = self.recon_cache_path.clone();
         let fallocate_reserve = self.fallocate_reserve;
         let worm_clock = std::sync::Arc::clone(&self.worm_clock);
         match exec
             .run_finite(DeviceId::new(drive), TrafficClass::Foreground, move || {
                 ObjectServer {
                     config,
+                    recon_cache_path,
                     fallocate_reserve,
                     worm_clock,
                     storage: std::sync::OnceLock::new(),
@@ -1830,6 +1858,7 @@ impl ObjectServer {
         let exec = self.storage().clone();
         let device = DeviceId::new(drive.clone());
         let config = self.config.clone();
+        let recon_cache_path = self.recon_cache_path.clone();
         let fallocate_reserve = self.fallocate_reserve;
         let worm_clock = std::sync::Arc::clone(&self.worm_clock);
         let method = req.method.clone();
@@ -1840,6 +1869,7 @@ impl ObjectServer {
             .run_finite(device, TrafficClass::Foreground, move || {
                 let tmp = ObjectServer {
                     config,
+                    recon_cache_path,
                     fallocate_reserve,
                     worm_clock,
                     storage: std::sync::OnceLock::new(),
@@ -2424,12 +2454,50 @@ impl ObjectServer {
             })
     }
 
+    fn recon_response(&self, req: &Request) -> Option<Response> {
+        if !matches!(req.method.as_str(), "GET" | "HEAD") {
+            return None;
+        }
+        let keys: &[&str] = match req.path.as_str() {
+            "/recon/updater/object" => &[
+                "object_updater_sweep",
+                "object_updater_stats",
+                "object_updater_last",
+            ],
+            _ => return None,
+        };
+        let cached = std::fs::read(self.recon_cache_path.join("object.recon"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        let mut selected = serde_json::Map::new();
+        for key in keys {
+            selected.insert(
+                (*key).to_string(),
+                cached.get(*key).cloned().unwrap_or(serde_json::Value::Null),
+            );
+        }
+        let body = serde_json::to_vec(&serde_json::Value::Object(selected)).unwrap_or_default();
+        let content_length = body.len();
+        let mut resp = Response::with_body(
+            200,
+            if req.method == "HEAD" { Vec::new() } else { body },
+        );
+        resp.headers.set("Content-Type", "application/json");
+        resp.headers.set("Content-Length", content_length);
+        Some(resp)
+    }
+
     pub fn handle(&self, mut req: Request) -> Response {
         // Reject object names carrying a NUL byte before dispatch, as the
         // proxy does with `check_utf8`. Matches the functional-test contract
         // of 412 "Invalid UTF8 or contains NULL".
         if req.path.contains('\u{0}') {
             return plain_response(412, "Invalid UTF8 or contains NULL");
+        }
+        if let Some(resp) = self.recon_response(&req) {
+            return resp;
         }
         if req.path == "/recon/stage" && matches!(req.method.as_str(), "GET" | "HEAD") {
             let body = swift_core::stage::snapshot_json();
@@ -5253,6 +5321,44 @@ mod fallocate_reserve_tests {
             container_update_mode: ContainerUpdateMode::Sync,
         })
         .with_fallocate_reserve(reserve)
+    }
+
+    #[tokio::test]
+    async fn recon_updater_object_reads_python_cache_shape() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-recon-updater-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(
+            cache.join("object.recon"),
+            br#"{"object_updater_sweep": 1.5, "object_updater_stats": {"failures_account_container_count": 2}, "object_updater_last": 1700000000.0, "unrelated": true}"#,
+        )
+        .unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1))
+            .with_recon_cache_path(cache.clone());
+        let resp = server.handle_async(AsyncRequest {
+            method: "GET".into(),
+            path: "/recon/updater/object".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::IncomingBody::from_bytes(Vec::new(), 0),
+        }).await;
+        assert_eq!(resp.status, 200, "{}", resp.reason);
+        assert_eq!(resp.headers.get("Content-Type"), Some("application/json"));
+        let body = resp.body.collect_async().await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["object_updater_sweep"], 1.5);
+        assert_eq!(
+            json["object_updater_stats"]["failures_account_container_count"],
+            2
+        );
+        assert_eq!(json["object_updater_last"], 1_700_000_000.0);
+        assert!(json.get("unrelated").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

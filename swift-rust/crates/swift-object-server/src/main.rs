@@ -288,7 +288,9 @@ fn main() {
         ));
     }
 
-    let mut server = ObjectServer::new(config).with_fallocate_reserve(fallocate_reserve);
+    let mut server = ObjectServer::new(config)
+        .with_fallocate_reserve(fallocate_reserve)
+        .with_recon_cache_path(get("recon_cache_path", "/var/cache/swift").into());
     if worm_clock_max_offset_ms > 0 {
         server = server.with_worm_clock(std::sync::Arc::new(swift_http::ClockHealth::chrony(
             worm_clock_max_offset_ms,
