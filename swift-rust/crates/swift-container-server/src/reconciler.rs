@@ -398,6 +398,26 @@ fn copied_source_headers(buf: &[u8]) -> Option<Vec<(String, String)>> {
     let mut copied = Vec::new();
     for (name, value) in response_headers(buf)? {
         let lower = name.to_ascii_lowercase();
+        // The reconciler reaches the internal proxy through a pipeline that
+        // includes symlink middleware and therefore reads a raw symlink with
+        // `?symlink=get`. That middleware exposes the four stored sysmeta
+        // fields as client-facing X-Symlink-* response headers. Python's
+        // reconciler pipeline omits symlink middleware, so its source GET and
+        // destination PUT carry the original sysmeta fields instead. Restore
+        // that internal representation here: replaying X-Symlink-Target as a
+        // client header would revalidate the target in the destination policy
+        // and can reject a valid versioning symlink with HTTP 409.
+        let symlink_sysmeta = match lower.as_str() {
+            "x-symlink-target" => Some("X-Object-Sysmeta-Symlink-Target"),
+            "x-symlink-target-account" => Some("X-Object-Sysmeta-Symlink-Target-Account"),
+            "x-symlink-target-etag" => Some("X-Object-Sysmeta-Symlink-Target-Etag"),
+            "x-symlink-target-bytes" => Some("X-Object-Sysmeta-Symlink-Target-Bytes"),
+            _ => None,
+        };
+        if let Some(sysmeta_name) = symlink_sysmeta {
+            copied.push((sysmeta_name.to_string(), value));
+            continue;
+        }
         let keep = matches!(
             lower.as_str(),
             "content-type"
@@ -412,8 +432,7 @@ fn copied_source_headers(buf: &[u8]) -> Option<Vec<(String, String)>> {
                 | "x-static-large-object"
         ) || lower.starts_with("x-object-meta-")
             || lower.starts_with("x-object-sysmeta-")
-            || lower.starts_with("x-object-transient-sysmeta-")
-            || lower.starts_with("x-symlink-");
+            || lower.starts_with("x-object-transient-sysmeta-");
         if keep {
             copied.push((name, value));
         }
@@ -1116,7 +1135,7 @@ mod tests {
 
     #[test]
     fn reconciler_copy_keeps_object_contract_headers_only() {
-        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Type: text/plain\r\nX-Object-Meta-Test: custom-meta\r\nX-Static-Large-Object: True\r\nX-Symlink-Target: c/o\r\nX-Backend-Timestamp: 1751500001.00000\r\nX-Trans-Id: tx-test\r\n\r\ntest";
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Type: text/plain\r\nX-Object-Meta-Test: custom-meta\r\nX-Static-Large-Object: True\r\nX-Symlink-Target: c/o\r\nX-Symlink-Target-Account: AUTH_other\r\nX-Symlink-Target-Etag: target-etag\r\nX-Symlink-Target-Bytes: 123\r\nX-Object-Sysmeta-Versions-Symlink: true\r\nX-Backend-Timestamp: 1751500001.00000\r\nX-Trans-Id: tx-test\r\n\r\ntest";
         let copied = copied_source_headers(response).unwrap();
         assert!(copied.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("x-object-meta-test") && value == "custom-meta"
@@ -1124,9 +1143,20 @@ mod tests {
         assert!(copied.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("x-static-large-object") && value == "True"
         }));
-        assert!(copied.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case("x-symlink-target") && value == "c/o"
-        }));
+        for (name, expected) in [
+            ("x-object-sysmeta-symlink-target", "c/o"),
+            ("x-object-sysmeta-symlink-target-account", "AUTH_other"),
+            ("x-object-sysmeta-symlink-target-etag", "target-etag"),
+            ("x-object-sysmeta-symlink-target-bytes", "123"),
+            ("x-object-sysmeta-versions-symlink", "true"),
+        ] {
+            assert!(copied.iter().any(|(copied_name, value)| {
+                copied_name.eq_ignore_ascii_case(name) && value == expected
+            }));
+        }
+        assert!(!copied
+            .iter()
+            .any(|(name, _)| name.to_ascii_lowercase().starts_with("x-symlink-")));
         assert!(!copied.iter().any(|(name, _)| {
             name.eq_ignore_ascii_case("content-length")
                 || name.eq_ignore_ascii_case("x-backend-timestamp")
