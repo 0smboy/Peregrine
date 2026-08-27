@@ -24,11 +24,12 @@
 //!
 //! This module ports the pure task-name / bucket arithmetic (byte-identical
 //! to Python, golden-tested) plus the due-task iteration and the
-//! delete-then-pop flow over a pluggable [`ExpiryClient`], plus a
-//! ring-direct [`HttpExpiryClient`] and [`run_once`] sweep used by the
-//! `swift-object-expirer` daemon. Deferred: process-sharding (`hash_mod`),
-//! delay_reaping per-account overrides, and InternalClient/proxy transport
-//! (ring-direct matches the object/container updaters).
+//! delete-then-pop flow over a pluggable [`ExpiryClient`]. Real-object
+//! DELETEs can use an internal proxy through [`ProxyExpiryClient`], matching
+//! Python InternalClient policy/quorum/container-update semantics; queue pops
+//! remain ring-direct. [`HttpExpiryClient`] preserves the legacy ring-direct
+//! fallback. Deferred: process-sharding (`hash_mod`) and delay_reaping
+//! per-account overrides.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -276,6 +277,45 @@ fn http_body(buf: &[u8]) -> &[u8] {
     }
 }
 
+fn delete_actual_object_via_proxy(proxy_host: &str, task: &TaskInfo) -> DeleteResult {
+    let ts = normalize_delete_at_timestamp(task.delete_timestamp);
+    let path = format!(
+        "/v1/{}/{}/{}",
+        pe(&task.target_account),
+        pe(&task.target_container),
+        pe(&task.target_object)
+    );
+    let headers: Vec<(&str, &str)> = if task.is_async_delete {
+        vec![
+            ("X-Timestamp", ts.as_str()),
+            ("X-Backend-Allow-Reserved-Names", "true"),
+        ]
+    } else {
+        vec![
+            ("X-Timestamp", ts.as_str()),
+            ("X-If-Delete-At", ts.as_str()),
+            ("X-Backend-Clean-Expiring-Object-Queue", "no"),
+            ("X-Backend-Allow-Reserved-Names", "true"),
+        ]
+    };
+    let Some((status, _)) = raw_request(proxy_host, "DELETE", &path, &headers) else {
+        return DeleteResult::Error;
+    };
+    if task.is_async_delete {
+        if (200..300).contains(&status) || status == 404 || status == 409 {
+            DeleteResult::Deleted
+        } else {
+            DeleteResult::Error
+        }
+    } else if (200..300).contains(&status) || status == 409 {
+        DeleteResult::Deleted
+    } else if status == 404 || status == 412 {
+        DeleteResult::Stale
+    } else {
+        DeleteResult::Error
+    }
+}
+
 fn node_host(node: &swift_ring::RingDevice, replication: bool) -> String {
     if replication {
         let ip = node
@@ -428,6 +468,59 @@ pub struct HttpExpiryClient<'a> {
     pub container_ring: &'a Ring,
 }
 
+/// Internal-proxy expiry client. Python's object expirer uses InternalClient
+/// for the real-object DELETE so policy resolution, replica quorum, and
+/// container updates all go through the proxy. Queue cleanup remains the
+/// ring-direct `direct_delete_container_entry` operation.
+pub struct ProxyExpiryClient<'a> {
+    pub proxy_host: &'a str,
+    pub container_ring: &'a Ring,
+}
+
+fn pop_queue_direct(container_ring: &Ring, task: &TaskInfo) -> bool {
+    let Ok((part, nodes)) = container_ring.get_nodes(
+        &task.task_account,
+        Some(&task.task_container),
+        Some(&task.task_object),
+    ) else {
+        return false;
+    };
+    let ts = format!(
+        "{:.5}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)
+    );
+    let mut ok = 0usize;
+    for node in &nodes {
+        let host = node_host(node.dev, true);
+        let path = format!(
+            "/{}/{part}/{}/{}/{}",
+            node.dev.device,
+            pe(&task.task_account),
+            pe(&task.task_container),
+            pe(&task.task_object)
+        );
+        let Some((status, _)) = raw_request(
+            &host,
+            "DELETE",
+            &path,
+            &[
+                ("X-Timestamp", ts.as_str()),
+                ("X-Backend-Storage-Policy-Index", "0"),
+                ("X-Backend-Allow-Reserved-Names", "true"),
+            ],
+        ) else {
+            continue;
+        };
+        if (200..300).contains(&status) || status == 404 {
+            ok += 1;
+        }
+    }
+    ok > 0
+}
+
 impl ExpiryClient for HttpExpiryClient<'_> {
     fn delete_actual_object(&self, task: &TaskInfo) -> DeleteResult {
         let Ok((part, nodes)) = self.object_ring.get_nodes(
@@ -492,47 +585,17 @@ impl ExpiryClient for HttpExpiryClient<'_> {
     }
 
     fn pop_queue(&self, task: &TaskInfo) -> bool {
-        let Ok((part, nodes)) = self.container_ring.get_nodes(
-            &task.task_account,
-            Some(&task.task_container),
-            Some(&task.task_object),
-        ) else {
-            return false;
-        };
-        let ts = format!(
-            "{:.5}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0)
-        );
-        let mut ok = 0usize;
-        for node in &nodes {
-            let host = node_host(node.dev, true);
-            let path = format!(
-                "/{}/{part}/{}/{}/{}",
-                node.dev.device,
-                pe(&task.task_account),
-                pe(&task.task_container),
-                pe(&task.task_object)
-            );
-            let Some((status, _)) = raw_request(
-                &host,
-                "DELETE",
-                &path,
-                &[
-                    ("X-Timestamp", ts.as_str()),
-                    ("X-Backend-Storage-Policy-Index", "0"),
-                    ("X-Backend-Allow-Reserved-Names", "true"),
-                ],
-            ) else {
-                continue;
-            };
-            if (200..300).contains(&status) || status == 404 {
-                ok += 1;
-            }
-        }
-        ok > 0
+        pop_queue_direct(self.container_ring, task)
+    }
+}
+
+impl ExpiryClient for ProxyExpiryClient<'_> {
+    fn delete_actual_object(&self, task: &TaskInfo) -> DeleteResult {
+        delete_actual_object_via_proxy(self.proxy_host, task)
+    }
+
+    fn pop_queue(&self, task: &TaskInfo) -> bool {
+        pop_queue_direct(self.container_ring, task)
     }
 }
 
@@ -545,11 +608,39 @@ pub fn run_once(
     now: i64,
     reclaim_age: i64,
 ) -> ExpirerStats {
-    let mut stats = ExpirerStats::default();
     let client = HttpExpiryClient {
         object_ring,
         container_ring,
     };
+    run_once_with_client(account_ring, container_ring, now, reclaim_age, &client)
+}
+
+/// One full expiry pass using the internal proxy for real-object DELETEs.
+/// This is the production-equivalent transport: the proxy resolves the
+/// current storage policy, enforces replica quorum, and emits container
+/// updates. The expirer still removes successful queue entries directly.
+pub fn run_once_via_proxy(
+    account_ring: &Ring,
+    container_ring: &Ring,
+    proxy_host: &str,
+    now: i64,
+    reclaim_age: i64,
+) -> ExpirerStats {
+    let client = ProxyExpiryClient {
+        proxy_host,
+        container_ring,
+    };
+    run_once_with_client(account_ring, container_ring, now, reclaim_age, &client)
+}
+
+fn run_once_with_client(
+    account_ring: &Ring,
+    container_ring: &Ring,
+    now: i64,
+    reclaim_age: i64,
+    client: &dyn ExpiryClient,
+) -> ExpirerStats {
+    let mut stats = ExpirerStats::default();
     let Some(containers) = list_account_containers(account_ring, EXPIRER_ACCOUNT_NAME) else {
         stats.errors += 1;
         return stats;
@@ -575,13 +666,13 @@ pub fn run_once(
             };
             let due = iter_due_tasks(EXPIRER_ACCOUNT_NAME, &cname, &objects, now);
             for task in due {
-                process_task(&task, now, reclaim_age, &client, &mut stats);
+                process_task(&task, now, reclaim_age, client, &mut stats);
             }
             continue;
         };
         let due = iter_due_tasks(EXPIRER_ACCOUNT_NAME, &task_container, &objects, now);
         for task in due {
-            process_task(&task, now, reclaim_age, &client, &mut stats);
+            process_task(&task, now, reclaim_age, client, &mut stats);
         }
     }
     stats
@@ -599,7 +690,87 @@ pub fn recon_update(elapsed: std::time::Duration, expired: u64) -> serde_json::V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
     use std::sync::Mutex;
+
+    fn proxy_task(is_async_delete: bool) -> TaskInfo {
+        TaskInfo {
+            task_account: ".expiring_objects".into(),
+            task_container: "1751414400".into(),
+            task_object: "1751500000-AUTH_test/c/o/deep".into(),
+            target_account: "AUTH_test".into(),
+            target_container: "c".into(),
+            target_object: "o/deep".into(),
+            delete_timestamp: 1_751_500_000,
+            is_async_delete,
+        }
+    }
+
+    fn serve_proxy_status(status: &str) -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut buf = [0_u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+        (host, handle)
+    }
+
+    #[test]
+    fn test_proxy_delete_routes_through_proxy_with_internal_headers() {
+        let (host, request) = serve_proxy_status("204 No Content");
+        let result = delete_actual_object_via_proxy(&host, &proxy_task(false));
+        assert_eq!(result, DeleteResult::Deleted);
+        let request = request.join().unwrap();
+        assert!(
+            request.starts_with("DELETE /v1/AUTH_test/c/o%2Fdeep HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(request.contains("X-Timestamp: 1751500000\r\n"), "{request}");
+        assert!(
+            request.contains("X-If-Delete-At: 1751500000\r\n"),
+            "{request}"
+        );
+        assert!(
+            request.contains("X-Backend-Clean-Expiring-Object-Queue: no\r\n"),
+            "{request}"
+        );
+        assert!(
+            request.contains("X-Backend-Allow-Reserved-Names: true\r\n"),
+            "{request}"
+        );
+        assert!(
+            !request.contains("X-Backend-Storage-Policy-Index"),
+            "the proxy, not the expirer, must resolve the current policy: {request}"
+        );
+    }
+
+    #[test]
+    fn test_proxy_delete_statuses_match_python_internal_client() {
+        let (host, request) = serve_proxy_status("412 Precondition Failed");
+        assert_eq!(
+            delete_actual_object_via_proxy(&host, &proxy_task(false)),
+            DeleteResult::Stale
+        );
+        request.join().unwrap();
+
+        let (host, request) = serve_proxy_status("404 Not Found");
+        assert_eq!(
+            delete_actual_object_via_proxy(&host, &proxy_task(true)),
+            DeleteResult::Deleted
+        );
+        let request = request.join().unwrap();
+        assert!(!request.contains("X-If-Delete-At"), "{request}");
+    }
 
     #[test]
     fn test_build_and_parse_roundtrip() {

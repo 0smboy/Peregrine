@@ -25,7 +25,7 @@ use swift_core::hashing::HashPathConfig;
 use swift_core::obslog::{LogLevel, Logger};
 use swift_core::statsd::StatsdClient;
 use swift_object_server::daemonutil;
-use swift_object_server::expirer::{recon_update, run_once};
+use swift_object_server::expirer::{recon_update, run_once, run_once_via_proxy};
 use swift_ring::{Ring, RingData};
 
 fn parse_conf_file(path: &str) -> SwiftConfig {
@@ -44,6 +44,21 @@ fn load_ring(path: &str, hash_config: &HashPathConfig, logger: &Logger) -> Ring 
         }),
         hash_config.clone(),
     )
+}
+
+fn parse_internal_client_host(url: &str) -> Result<Option<String>, String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Ok(None);
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return Err("internal_client_url must use plain http:// on a protected listener".into());
+    };
+    let host = rest.split('/').next().unwrap_or("").trim();
+    if host.is_empty() || !host.contains(':') {
+        return Err("internal_client_url must include host:port".into());
+    }
+    Ok(Some(host.to_string()))
 }
 
 fn main() {
@@ -72,6 +87,15 @@ fn main() {
     let reclaim_age: i64 = get("object-expirer", "reclaim_age", "604800")
         .parse()
         .unwrap_or(604800);
+    let internal_client_host = parse_internal_client_host(&get(
+        "object-expirer",
+        "internal_client_url",
+        "",
+    ))
+    .unwrap_or_else(|e| {
+        eprintln!("invalid object-expirer internal client endpoint: {e}");
+        std::process::exit(1);
+    });
     let log_name = get("object-expirer", "log_name", "object-expirer");
     let log_level = get("object-expirer", "log_level", "INFO")
         .parse::<LogLevel>()
@@ -105,8 +129,12 @@ fn main() {
     let mut object_ring = load_ring(&object_ring_path, &hash_config, &logger);
     let stop = swift_http::install_sigterm_flag();
 
+    let delete_transport = internal_client_host
+        .as_deref()
+        .map(|host| format!("internal-proxy:{host}"))
+        .unwrap_or_else(|| "legacy-ring-direct".to_string());
     logger.info(&format!(
-        "swift-object-expirer: interval={interval}s reclaim_age={reclaim_age}s once={run_once_only}"
+        "swift-object-expirer: interval={interval}s reclaim_age={reclaim_age}s once={run_once_only} delete_transport={delete_transport}"
     ));
     loop {
         let sweep_start = std::time::Instant::now();
@@ -114,13 +142,17 @@ fn main() {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let stats = run_once(
-            &account_ring,
-            &container_ring,
-            &object_ring,
-            now,
-            reclaim_age,
-        );
+        let stats = if let Some(host) = internal_client_host.as_deref() {
+            run_once_via_proxy(&account_ring, &container_ring, host, now, reclaim_age)
+        } else {
+            run_once(
+                &account_ring,
+                &container_ring,
+                &object_ring,
+                now,
+                reclaim_age,
+            )
+        };
         logger.info(&format!(
             "object-expirer pass: expired={} errors={} retained={}",
             stats.objects, stats.errors, stats.skipped_retained
@@ -152,5 +184,21 @@ fn main() {
                 )),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_internal_client_host;
+
+    #[test]
+    fn internal_client_url_requires_protected_plain_http_host_port() {
+        assert_eq!(
+            parse_internal_client_host("http://127.0.0.1:18082").unwrap(),
+            Some("127.0.0.1:18082".to_string())
+        );
+        assert_eq!(parse_internal_client_host("  ").unwrap(), None);
+        assert!(parse_internal_client_host("https://127.0.0.1:18082").is_err());
+        assert!(parse_internal_client_host("http://127.0.0.1").is_err());
     }
 }
