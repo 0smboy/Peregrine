@@ -229,10 +229,11 @@ pub fn process_container(
         Some(s) => s,
         None => return Ok(ContainerOutcome::Skipped),
     };
-    // Auto-created containers have a zero put_timestamp and unreliable stats.
-    if ts_value(&stat.put_timestamp) <= 0.0 {
-        return Ok(ContainerOutcome::Skipped);
-    }
+    // Do not skip auto-created containers (put_timestamp == 0).  Expirer
+    // queue containers are auto-created and their object/byte changes must be
+    // reported to the reserved account so the queue remains discoverable.
+    // An untouched auto-created container naturally falls through to
+    // `needs_report() == false`, matching Python's updater behavior.
     // A shard (non-root) container must not double-count its stats into the
     // account — the sharder rolls those up to the root, whose updater reports
     // them. Zero them here (Python container/updater.py).
@@ -415,6 +416,53 @@ mod tests {
         // still needs report next time (reported_* untouched)
         let stat = ContainerStat::from_info(&broker.get_info().unwrap()).unwrap();
         assert!(stat.needs_report());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_auto_created_container_with_objects_is_reported() {
+        // Expirer queue containers are auto-created: their put timestamp is
+        // zero, but their object/byte totals still have to be reported to the
+        // reserved account so the expirer can discover the queue.  This is
+        // the behavior of Python's ContainerUpdater.process_container().
+        let dir = std::env::temp_dir().join(format!(
+            "swift-cupd-autocreate-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("sda1");
+        let h = "0000000000000000000000000000abce";
+        let hd = device.join(format!("containers/0/bce/{h}"));
+        std::fs::create_dir_all(&hd).unwrap();
+        let db = hd.join(format!("{h}.db"));
+        let mut broker = ContainerBroker::new(&db, "\0expiring_objects", "1751500000");
+        broker
+            .initialize("0", 0, "1751500000.00000", "id")
+            .unwrap();
+        broker
+            .put_object(
+                "1751500000-AUTH_test/c/o",
+                "1751500001.00000",
+                17,
+                "application/async-deleted",
+                "etag",
+                0,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let client = FakeAccount {
+            calls: Mutex::new(Vec::new()),
+            status: 204,
+        };
+        let mut stats = ContainerUpdaterStats::default();
+        let out = process_container(&mut broker, &ring3(), &client, &mut stats).unwrap();
+
+        assert_eq!(out, ContainerOutcome::Reported);
+        assert_eq!(client.calls.lock().unwrap().len(), 3);
+        assert_eq!(stats.successes, 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
