@@ -4338,18 +4338,18 @@ impl ProxyApp {
             .map(config_true_value)
             .unwrap_or(false);
         if newest {
-            if let Some(arr) = self
-                .get_or_head(
-                    "container",
-                    nodes.clone(),
+            // Walk every replica and keep the most cleaved view. get_or_head
+            // X-Newest can still return a SHARDING primary (same created_at);
+            // 4 ACTIVE on the under-populated node must win (L1509).
+            if let Some(arr) = prefer_most_progressed_listing_arrays(
+                &self.fetch_json_arrays_nonempty(
+                    &nodes,
                     part,
-                    "GET",
                     path,
                     "states=listing&format=json",
                     shard_headers,
-                )
-                .and_then(parse_listing_json_body)
-            {
+                ),
+            ) {
                 if !arr.is_empty() {
                     return Some(arr);
                 }
@@ -6637,16 +6637,12 @@ pub(crate) fn include_root_residual_for_listing_ex(
         return include_shrink_to_root_residual(sharding_state, empty_wins, has_shrinking)
             || include_sharding_residual_root(sharding_state, newest);
     }
-    // L1509: a SHARDED replica with a settled ACTIVE partition must list
-    // shards only. Residual retiring rows from this or a lagging SHARDING
-    // peer fill the under-populated last shards (expected 101, got 200).
-    // L1483 still residuals while the HEAD state is SHARDING / unsettled.
-    // L1517 completeness comes from the just-cleaved shard DBs, not root.
+    // L1509: settled ACTIVE ranges already cover the namespace. Residual
+    // retiring rows fill the under-populated last shards (101 != 200)
+    // even when HEAD still says SHARDING (created_at tie / replicator).
+    // L1483 keeps residual: CREATED ranges => empty_wins is false.
     if empty_wins && !has_shrinking {
-        let s = sharding_state.to_ascii_lowercase();
-        if s == "sharded" || s == "collapsed" {
-            return false;
-        }
+        return false;
     }
     include_sharding_residual_root(sharding_state, newest)
         || include_shrink_to_root_residual(sharding_state, empty_wins, has_shrinking)
@@ -6746,6 +6742,25 @@ fn listing_array_timestamp(arr: &[serde_json::Value]) -> String {
 /// Empty arrays are intentionally absent from `arrays`; if every response is
 /// empty the caller falls back to the root-listing path.  A topology tie keeps
 /// the longest view, preserving the partial-cleave behaviour.
+pub(crate) fn prefer_most_progressed_listing_arrays(
+    arrays: &[Vec<serde_json::Value>],
+) -> Option<Vec<serde_json::Value>> {
+    arrays
+        .iter()
+        .filter(|arr| !arr.is_empty())
+        .max_by_key(|arr| {
+            let n_active = arr
+                .iter()
+                .filter(|sr| {
+                    sr.get("state").and_then(|v| v.as_i64()) == Some(40)
+                        && sr.get("deleted").and_then(|v| v.as_i64()).unwrap_or(0) == 0
+                })
+                .count();
+            (n_active, arr.len(), listing_array_timestamp(arr))
+        })
+        .cloned()
+}
+
 pub(crate) fn prefer_quorum_consistent_listing_arrays(
     arrays: &[Vec<serde_json::Value>],
 ) -> Option<Vec<serde_json::Value>> {
@@ -10089,7 +10104,7 @@ mod shard_listing_fanout_tests {
         lowest_shard_usage, merge_listings_newest_covering, merge_sharded_object_listings,
         merge_sharded_object_listings_dir, pick_updating_shard_name,
         prefer_listing_state_ranges, prefer_longest_nonempty_arrays,
-        prefer_quorum_consistent_listing_arrays,
+        prefer_most_progressed_listing_arrays, prefer_quorum_consistent_listing_arrays,
         select_listing_shard_ranges, shard_usage_from_ranges, should_fanout_sharded_listing,
         should_fold_root_objects_without_ranges, should_probe_sharded_listing,
         stamp_shard_container_path, updating_shard_query, ListingFeed,
@@ -10356,11 +10371,14 @@ mod shard_listing_fanout_tests {
             false,
             true
         ));
-        // L1509: SHARDED + X-Newest + 4 ACTIVE, no shrinking → shards only.
+        // L1509: settled ACTIVE, even if HEAD is still SHARDING.
         assert!(!include_root_residual_for_listing_ex(
             "sharded", true, true, false, true, false, false
         ));
-        // L1483: still SHARDING / unsettled → residual stays on.
+        assert!(!include_root_residual_for_listing_ex(
+            "sharding", true, true, false, true, false, false
+        ));
+        // L1483: still SHARDING / unsettled CREATED → residual stays on.
         assert!(include_root_residual_for_listing_ex(
             "sharding", true, false, false, true, false, false
         ));
@@ -10578,6 +10596,29 @@ mod shard_listing_fanout_tests {
         let got = prefer_longest_nonempty_arrays(&[vec![], short, long.clone()]).unwrap();
         assert_eq!(got.len(), 3, "{got:?}");
         assert_eq!(got[0]["name"], "c0");
+    }
+
+    #[test]
+    fn newest_listing_prefers_four_active_over_cleaved_quorum() {
+        let cleaved = vec![
+            serde_json::json!({"name": "s0", "lower": "", "upper": "obj-0049", "state": 30}),
+            serde_json::json!({"name": "s1", "lower": "obj-0049", "upper": "obj-0099", "state": 30}),
+            serde_json::json!({"name": "s2", "lower": "obj-0099", "upper": "obj-0149", "state": 20}),
+            serde_json::json!({"name": "s3", "lower": "obj-0149", "upper": "", "state": 20}),
+        ];
+        let active = vec![
+            serde_json::json!({"name": "s0", "lower": "", "upper": "obj-0049", "state": 40, "timestamp": "1751500001.00000"}),
+            serde_json::json!({"name": "s1", "lower": "obj-0049", "upper": "obj-0099", "state": 40, "timestamp": "1751500001.00000"}),
+            serde_json::json!({"name": "s2", "lower": "obj-0099", "upper": "obj-0149", "state": 40, "timestamp": "1751500001.00000"}),
+            serde_json::json!({"name": "s3", "lower": "obj-0149", "upper": "", "state": 40, "timestamp": "1751500001.00000"}),
+        ];
+        let got = prefer_most_progressed_listing_arrays(&[
+            cleaved.clone(),
+            cleaved,
+            active.clone(),
+        ])
+        .unwrap();
+        assert_eq!(got.iter().filter(|sr| sr["state"] == 40).count(), 4, "{got:?}");
     }
 
     #[test]
