@@ -3904,6 +3904,33 @@ fn maybe_start_sharding(
         include_deleted: false,
         ..GetShardRangesArgs::default()
     })?;
+    // Last shrink-to-root: other_ranges is empty (donor SHRUNK/deleted) but
+    // compactible may have persisted own without epoch onto the epoch file.
+    // get_db_state() is then Unsharded with object_count 1 (probe L2088).
+    // Heal only when own is an acceptor — a SHARDING own must keep cleaving.
+    if let Some(db_epoch) = broker.db_epoch() {
+        if let Some(mut own) = broker.get_own_shard_range(true)? {
+            let cleaving = own.state == shard_state::SHARDING
+                || own.state == shard_state::SHRINKING;
+            if !cleaving {
+                let own_norm = own
+                    .epoch
+                    .as_deref()
+                    .and_then(|e| e.parse::<swift_core::timestamp::Timestamp>().ok())
+                    .map(|ts| ts.normal());
+                let db_norm = db_epoch
+                    .parse::<swift_core::timestamp::Timestamp>()
+                    .ok()
+                    .map(|ts| ts.normal());
+                if own_norm != db_norm {
+                    own.epoch = Some(db_epoch);
+                    own.timestamp = swift_core::timestamp::Timestamp::now().internal();
+                    broker.merge_shard_ranges(vec![own])?;
+                }
+            }
+        }
+    }
+
     if !other_ranges.is_empty() {
         let has_shrinking_donor = other_ranges
             .iter()
@@ -4865,8 +4892,6 @@ mod tests {
     }
 
     #[test]
-
-    #[test]
     fn test_maybe_start_sharding_skips_epoch_db_with_active_sibling() {
         // After the first shard shrinks away, the leftover sibling is still
         // ACTIVE (tombstones). The root is epoch-backed. Must not create a
@@ -4932,6 +4957,67 @@ mod tests {
         );
         let after = root.get_own_shard_range(true).unwrap().unwrap();
         assert_eq!(after.epoch.as_deref(), Some(epoch), "{after:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_maybe_start_sharding_heals_collapsed_root_without_siblings() {
+        // Probe L2088 after the last donor is SHRUNK: no other ranges,
+        // epoch file, own.epoch wiped, object_count 1. Must become collapsed.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-s2r-heal-collapsed-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "c";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let unsuffixed = hd.join(format!("{hsh}.db"));
+        let epoch = "1751500010.00000";
+        let epoch_path = make_db_file_path(&unsuffixed, Some(epoch)).unwrap();
+        let mut root = ContainerBroker::new(&epoch_path, account, container);
+        root.initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        root.put_object(
+            "alpha-1",
+            "1751500001.00000",
+            1,
+            "text/plain",
+            "e",
+            0,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut own = root.get_own_shard_range(false).unwrap().unwrap();
+        own.epoch = None;
+        own.state = shard_state::ACTIVE;
+        root.merge_shard_ranges(vec![own]).unwrap();
+        assert_eq!(root.get_db_state().unwrap(), DbState::Unsharded);
+
+        let opts = SharderRunOpts {
+            cleave_batch_size: 10,
+            auto_shard: true,
+            auto_shrink: false,
+            shard_size: 100,
+            rows_per_shard: 0,
+            minimum_shard_size: 1,
+            partitions: Vec::new(),
+        };
+        assert!(!maybe_start_sharding(&mut root, &opts).unwrap());
+        assert_eq!(
+            root.get_db_state().unwrap(),
+            DbState::Collapsed,
+            "L2088: empty-others heal must collapse"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
