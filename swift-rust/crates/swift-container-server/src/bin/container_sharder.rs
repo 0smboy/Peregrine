@@ -21,7 +21,9 @@
 
 use std::path::Path;
 
-use swift_container_server::sharder::{self, run_once_with_opts_and_ring, SharderRunOpts};
+use swift_container_server::sharder::{
+    self, run_once_with_opts_and_ring_for_node, SharderNodeIdentity, SharderRunOpts,
+};
 use swift_core::config::SwiftConfig;
 use swift_core::daemon;
 use swift_core::hashing::HashPathConfig;
@@ -81,6 +83,11 @@ fn main() {
             .unwrap_or_else(|| default.to_string())
     };
     let devices = get("app:container-server", "devices", "/srv/node");
+    let bind_ip = get("app:container-server", "bind_ip", "0.0.0.0");
+    let bind_port: u32 = get("app:container-server", "bind_port", "6201")
+        .parse()
+        .unwrap_or(6201);
+    let local_node = SharderNodeIdentity::new(bind_ip.clone(), bind_port);
     // Python container/sharder.py defaults interval to 30s.
     let interval: u64 = get("container-sharder", "interval", "30")
         .parse()
@@ -186,7 +193,7 @@ fn main() {
         "local-cleave-only"
     };
     logger.info(&format!(
-        "swift-container-sharder: devices={devices} interval={interval}s \
+        "swift-container-sharder: devices={devices} bind={bind_ip}:{bind_port} interval={interval}s \
          cleave_batch_size={cleave_batch_size} auto_shard={auto_shard} \
          auto_shrink={auto_shrink} \
          shard_size={shard_size} rows_per_shard={rows_per_shard} \
@@ -199,11 +206,12 @@ fn main() {
         if let Ok(entries) = std::fs::read_dir(&devices) {
             for e in entries.flatten() {
                 if e.path().is_dir() {
-                    let s = run_once_with_opts_and_ring(
+                    let s = run_once_with_opts_and_ring_for_node(
                         &e.path(),
                         &hash_config,
                         &opts,
                         container_ring.as_ref(),
+                        &local_node,
                     );
                     agg.containers_seen += s.containers_seen;
                     agg.sharding += s.sharding;

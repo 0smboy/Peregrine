@@ -2827,6 +2827,27 @@ pub struct SharderRunOpts {
     pub partitions: Vec<String>,
 }
 
+/// Identity of the container-server instance whose device is being swept.
+///
+/// Python Swift only lets ring primary index 0 discover new root shard or
+/// shrink candidates.  The identity must therefore include the service IP
+/// and port as well as the device name supplied to the leader check; device
+/// names alone are commonly repeated on different hosts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharderNodeIdentity {
+    pub bind_ip: String,
+    pub bind_port: u32,
+}
+
+impl SharderNodeIdentity {
+    pub fn new(bind_ip: impl Into<String>, bind_port: u32) -> Self {
+        Self {
+            bind_ip: bind_ip.into(),
+            bind_port,
+        }
+    }
+}
+
 impl Default for SharderRunOpts {
     fn default() -> Self {
         Self {
@@ -3163,6 +3184,34 @@ fn broker_with_path_from_db(db: &Path) -> Result<ContainerBroker, DbError> {
     }
 }
 
+/// Whether this local device is ring primary index 0 for a container.
+///
+/// A wildcard bind address cannot be compared with the ring IP, so in that
+/// case the configured port plus the on-disk device name are used.  With a
+/// concrete bind address all three values must match.
+fn local_node_is_primary_leader(
+    ring: &swift_ring::Ring,
+    account: &str,
+    container: &str,
+    device: &Path,
+    local: &SharderNodeIdentity,
+) -> bool {
+    let Ok((_part, nodes)) = ring.get_nodes(account, Some(container), None) else {
+        return false;
+    };
+    let Some(primary) = nodes.first() else {
+        return false;
+    };
+    let local_device = device
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let wildcard = matches!(local.bind_ip.as_str(), "0.0.0.0" | "::" | "[::]");
+    (wildcard || primary.dev.ip == local.bind_ip)
+        && primary.dev.port == local.bind_port
+        && primary.dev.device == local_device
+}
+
 /// Sweep with an injectable [`ShardReplicator`] for multi-node shard create.
 ///
 /// Pass [`LookupHttpShardReplicator`] (ring callback + transport) so each
@@ -3185,6 +3234,24 @@ pub fn run_once_with_opts_replicator_and_ring(
     opts: &SharderRunOpts,
     replicator: &mut dyn ShardReplicator,
     ring: Option<&swift_ring::Ring>,
+) -> SharderStats {
+    run_once_with_opts_replicator_ring_and_node(
+        device,
+        hash_config,
+        opts,
+        replicator,
+        ring,
+        None,
+    )
+}
+
+fn run_once_with_opts_replicator_ring_and_node(
+    device: &Path,
+    hash_config: &HashPathConfig,
+    opts: &SharderRunOpts,
+    replicator: &mut dyn ShardReplicator,
+    ring: Option<&swift_ring::Ring>,
+    local_node: Option<&SharderNodeIdentity>,
 ) -> SharderStats {
     let mut stats = SharderStats::default();
     for db in current_container_db_files(device) {
@@ -3212,6 +3279,22 @@ pub fn run_once_with_opts_replicator_and_ring(
         if !broker.is_root_container().unwrap_or(true) {
             audit_shard_from_root(&mut broker, ring);
         }
+        let broker_path = broker.path();
+        let (broker_account, broker_container) =
+            broker_path.split_once('/').unwrap_or((broker_path.as_str(), ""));
+        // Local/single-node callers without a ring identity keep their
+        // historical behavior. The daemon always supplies an identity when
+        // a ring is loaded, matching Python's `node['index'] == 0` gate.
+        let is_leader = match (ring, local_node) {
+            (Some(ring), Some(local)) => local_node_is_primary_leader(
+                ring,
+                broker_account,
+                broker_container,
+                device,
+                local,
+            ),
+            _ => true,
+        };
         let state = match broker.get_db_state() {
             Ok(s) => s,
             Err(_) => {
@@ -3253,7 +3336,12 @@ pub fn run_once_with_opts_replicator_and_ring(
                         .ok()
                         .flatten()
                         .is_some_and(|r| swift_db::CLEAVING_STATES.contains(&r.state));
-                    (is_root && (opts.auto_shard || sharding_enabled(&mut broker)))
+                    let has_other_ranges = own_cleaving
+                        && broker.has_other_shard_ranges().unwrap_or(false);
+                    (is_root
+                        && (has_other_ranges
+                            || (is_leader
+                                && (opts.auto_shard || sharding_enabled(&mut broker)))))
                         || (!is_root && own_cleaving)
                 } =>
             {
@@ -3353,7 +3441,7 @@ pub fn run_once_with_opts_replicator_and_ring(
                 }
                 // Python `_process_broker` on a SHARDED root leader:
                 // shrinking candidates first, then sharding candidates.
-                if broker.is_root_container().unwrap_or(false) && opts.auto_shard {
+                if broker.is_root_container().unwrap_or(false) && opts.auto_shard && is_leader {
                     find_and_enable_shrinking_candidates(
                         &mut broker,
                         python_shrink_threshold(opts),
@@ -3393,6 +3481,31 @@ pub fn run_once_with_opts_and_ring(
         Some(ring) => {
             let mut rep = lookup_replicator_for_ring(ring);
             run_once_with_opts_replicator_and_ring(device, hash_config, opts, &mut rep, Some(ring))
+        }
+        None => run_once_with_opts(device, hash_config, opts),
+    }
+}
+
+/// Ring-backed sweep with the local service identity needed for Python's
+/// primary-index-zero leader semantics.
+pub fn run_once_with_opts_and_ring_for_node(
+    device: &Path,
+    hash_config: &HashPathConfig,
+    opts: &SharderRunOpts,
+    container_ring: Option<&swift_ring::Ring>,
+    local_node: &SharderNodeIdentity,
+) -> SharderStats {
+    match container_ring {
+        Some(ring) => {
+            let mut rep = lookup_replicator_for_ring(ring);
+            run_once_with_opts_replicator_ring_and_node(
+                device,
+                hash_config,
+                opts,
+                &mut rep,
+                Some(ring),
+                Some(local_node),
+            )
         }
         None => run_once_with_opts(device, hash_config, opts),
     }
@@ -6192,6 +6305,58 @@ mod tests {
             run_once_with_opts_and_ring(&device, &hash_config, &SharderRunOpts::default(), None);
         assert_eq!(stats.containers_seen, 0);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_only_ring_index_zero_is_local_sharder_leader() {
+        use swift_ring::{Ring, RingData, RingDevice};
+
+        fn dev(id: u64) -> RingDevice {
+            RingDevice {
+                id,
+                region: 1,
+                zone: id + 1,
+                ip: format!("10.0.0.{}", id + 1),
+                port: 6201,
+                replication_ip: None,
+                replication_port: None,
+                device: format!("sd{id}"),
+                weight: 1.0,
+                meta: String::new(),
+                extra: Default::default(),
+            }
+        }
+
+        let data = RingData::from_parts(
+            vec![Some(dev(0)), Some(dev(1)), Some(dev(2))],
+            32,
+            vec![vec![0u32], vec![1u32], vec![2u32]],
+        );
+        let ring = Ring::new(data, HashPathConfig::new("", "changeme").unwrap());
+        let leader = SharderNodeIdentity::new("10.0.0.1", 6201);
+        let follower = SharderNodeIdentity::new("10.0.0.2", 6201);
+
+        assert!(local_node_is_primary_leader(
+            &ring,
+            "AUTH_test",
+            "root",
+            Path::new("/srv/1/node/sd0"),
+            &leader,
+        ));
+        assert!(!local_node_is_primary_leader(
+            &ring,
+            "AUTH_test",
+            "root",
+            Path::new("/srv/2/node/sd1"),
+            &follower,
+        ));
+        assert!(!local_node_is_primary_leader(
+            &ring,
+            "AUTH_test",
+            "root",
+            Path::new("/srv/1/node/sd0"),
+            &SharderNodeIdentity::new("10.0.0.1", 6202),
+        ));
     }
 
     #[test]
