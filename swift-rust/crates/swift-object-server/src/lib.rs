@@ -46,10 +46,11 @@ pub mod updater;
 /// not a compliance claim.
 pub mod worm_native_gate;
 pub use expirer::{
-    build_task_obj, get_expirer_container, iter_due_tasks, parse_task_obj, process_task,
-    recon_update as expirer_recon_update, run_once as expirer_run_once, DeleteResult, ExpirerStats,
-    ExpiryClient, HttpExpiryClient, TaskInfo, ASYNC_DELETE_TYPE, EXPIRER_ACCOUNT_NAME,
-    EXPIRER_CONTAINER_DIVISOR,
+    build_task_obj, get_expirer_container, get_expirer_container_for_object_hash, iter_due_tasks,
+    parse_task_obj, process_task, recon_update as expirer_recon_update,
+    run_once as expirer_run_once, DeleteResult, ExpirerStats, ExpiryClient, HttpExpiryClient,
+    TaskInfo, ASYNC_DELETE_TYPE, EXPIRER_ACCOUNT_NAME, EXPIRER_CONTAINER_DIVISOR,
+    EXPIRER_CONTAINER_PER_DIVISOR,
 };
 pub use updater::{
     iter_async_pendings, process_update, run_once, run_once_with_concurrency, AsyncUpdate,
@@ -943,6 +944,7 @@ fn is_allowed_header(key: &str) -> bool {
             | "cache-control"
             | "expires"
             | "x-robots-tag"
+            | "x-delete-at"
     )
 }
 
@@ -2155,6 +2157,7 @@ impl ObjectServer {
             .and_then(|v| v.parse::<i64>().ok())
         {
             self.delete_at_update(
+                "PUT",
                 delete_at,
                 &drive,
                 &account,
@@ -2162,6 +2165,8 @@ impl ObjectServer {
                 &obj,
                 &req,
                 policy_index,
+                Some(upload_size),
+                Some(req_timestamp.internal()),
             );
         }
         let mut resp = Response::new(201);
@@ -3019,6 +3024,7 @@ impl ObjectServer {
             .and_then(|v| v.parse::<i64>().ok())
         {
             self.delete_at_update(
+                "PUT",
                 delete_at,
                 &drive,
                 &account,
@@ -3026,6 +3032,8 @@ impl ObjectServer {
                 &obj,
                 req,
                 policy_index,
+                Some(upload_size),
+                Some(req_timestamp.internal()),
             );
         }
 
@@ -3223,8 +3231,54 @@ impl ObjectServer {
                 None => return plain_response(500, "POST preserving absent .meta metadata"),
             }
         };
-        // Deferred, as elsewhere: _conditional_delete_at_update (delete-at
-        // queue maintenance on POST) is not yet ported.
+        // Python server.py:_conditional_delete_at_update.  A metadata POST
+        // may create a new expiry task and must remove the old task when the
+        // delete-at changes or is cleared.  The queue row records the data
+        // file's byte length and timestamp, not the POST timestamp.
+        if req_timestamp > orig_timestamp {
+            let orig_delete_at = orig
+                .get_metadata()
+                .ok()
+                .and_then(|m| meta_get(m, "X-Delete-At"))
+                .and_then(|raw| parse_int_like(raw))
+                .map(|value| value as i64)
+                .unwrap_or(0);
+            let new_delete_at = req
+                .headers
+                .get("X-Delete-At")
+                .and_then(parse_int_like)
+                .map(|value| value as i64)
+                .unwrap_or(0);
+            let expirer_bytes = content_length.parse::<u64>().unwrap_or(0);
+            if new_delete_at != 0 {
+                self.delete_at_update(
+                    "PUT",
+                    new_delete_at,
+                    &drive,
+                    &account,
+                    &container,
+                    &obj,
+                    req,
+                    policy_index,
+                    Some(expirer_bytes),
+                    Some(data_timestamp.internal()),
+                );
+            }
+            if orig_delete_at != 0 && orig_delete_at != new_delete_at {
+                self.delete_at_update(
+                    "DELETE",
+                    orig_delete_at,
+                    &drive,
+                    &account,
+                    &container,
+                    &obj,
+                    req,
+                    policy_index,
+                    None,
+                    None,
+                );
+            }
+        }
 
         // server.py 733-748: resolve which content-type wins. A newer request
         // content-type goes into the .meta stamped with its own timestamp;
@@ -4048,9 +4102,9 @@ impl ObjectServer {
         }
     }
 
-    /// `delete_at_update`: on a PUT carrying `X-Delete-At`, enqueue a task
-    /// object into the hidden `.expiring_objects` account so the object-expirer
-    /// deletes the object at that time. The task object is
+    /// `delete_at_update`: enqueue or remove a task object in the hidden
+    /// `.expiring_objects` account as an object's `X-Delete-At` changes. The
+    /// task object is
     /// `build_task_obj(delete_at, account, container, obj)` in the hour-bucket
     /// container `get_expirer_container(delete_at)`; it is sent to the expirer
     /// container replicas named by `X-Delete-At-Host/Partition/Device`, falling
@@ -4058,6 +4112,7 @@ impl ObjectServer {
     #[allow(clippy::too_many_arguments)]
     fn delete_at_update(
         &self,
+        op: &str,
         delete_at: i64,
         drive: &str,
         account: &str,
@@ -4065,6 +4120,8 @@ impl ObjectServer {
         obj: &str,
         req: &Request,
         _policy_index: u32,
+        expirer_bytes: Option<u64>,
+        content_type_timestamp: Option<String>,
     ) {
         if req
             .headers
@@ -4074,18 +4131,68 @@ impl ObjectServer {
             return;
         }
         let task_account = crate::expirer::EXPIRER_ACCOUNT_NAME;
-        let task_container = crate::expirer::get_expirer_container(
-            delete_at,
-            crate::expirer::EXPIRER_CONTAINER_DIVISOR,
-        );
+        let expected_task_container = self
+            .config
+            .hash_config
+            .hash_path(account, Some(container), Some(obj))
+            .ok()
+            .map(|object_hash| {
+                crate::expirer::get_expirer_container_for_object_hash(
+                    delete_at,
+                    &object_hash,
+                    crate::expirer::EXPIRER_CONTAINER_DIVISOR,
+                    crate::expirer::EXPIRER_CONTAINER_PER_DIVISOR,
+                )
+            })
+            .unwrap_or_else(|| {
+                crate::expirer::get_expirer_container(
+                    delete_at,
+                    crate::expirer::EXPIRER_CONTAINER_DIVISOR,
+                )
+            });
+        // For PUT, the proxy's container name and partition/device headers
+        // are one routing tuple and must never be mixed with our fallback.
+        // DELETE cleanup is intentionally recomputed from the old delete-at,
+        // matching Python's direct-to-async_pending branch.
+        let task_container = if op != "DELETE" {
+            req.headers
+                .get("X-Delete-At-Container")
+                .and_then(parse_int_like)
+                .map(|value| crate::expirer::normalize_delete_at_timestamp(value as i64))
+                .unwrap_or(expected_task_container)
+        } else {
+            expected_task_container
+        };
         let task_obj = crate::expirer::build_task_obj(delete_at, account, container, obj);
 
-        // the expiry queue entry: an empty object marking the deletion
+        if op == "DELETE"
+            && req
+                .headers
+                .get("X-Backend-Clean-Expiring-Object-Queue")
+                .is_some_and(|value| !config_true_value(value))
+        {
+            return;
+        }
+
         let mut update = HeaderKeyDict::new();
-        update.set("x-size", "0");
-        update.set("x-content-type", "text/plain"); // X_DELETE_TYPE
-        update.set("x-etag", "d41d8cd98f00b204e9800998ecf8427e"); // md5("")
         update.set("x-timestamp", req.headers.get("X-Timestamp").unwrap_or("0"));
+        if op != "DELETE" {
+            // The expiry queue entry is an empty marker object, while the
+            // content-type carries the size of the real object for expirer
+            // accounting (expirer.embed_expirer_bytes_in_ctype).
+            update.set("x-size", "0");
+            update.set(
+                "x-content-type",
+                format!(
+                    "text/plain;swift_expirer_bytes={}",
+                    expirer_bytes.unwrap_or(0)
+                ),
+            );
+            update.set("x-etag", "d41d8cd98f00b204e9800998ecf8427e"); // md5("")
+            if let Some(timestamp) = content_type_timestamp.as_deref() {
+                update.set("x-content-type-timestamp", timestamp);
+            }
+        }
 
         let hosts: Vec<&str> = req
             .headers
@@ -4110,11 +4217,15 @@ impl ObjectServer {
             percent_encode(&task_container),
             percent_encode(&task_obj)
         );
-        let well_formed =
-            !hosts.is_empty() && hosts.len() == devices.len() && !partition.is_empty();
+        // Python sends DELETE cleanup through async_pending unconditionally;
+        // only a PUT may fan out directly to proxy-selected container nodes.
+        let well_formed = op != "DELETE"
+            && !hosts.is_empty()
+            && hosts.len() == devices.len()
+            && !partition.is_empty();
         let all_ok = if well_formed {
             fanout_container_http(
-                "PUT",
+                op,
                 &hosts,
                 &devices,
                 partition,
@@ -4131,7 +4242,7 @@ impl ObjectServer {
             // enqueue via async_pending against the object's own device;
             // storage policy 0 is the expirer account's policy.
             self.write_async_pending(
-                "PUT",
+                op,
                 drive,
                 task_account,
                 &task_container,
@@ -6461,6 +6572,104 @@ mod fallocate_reserve_tests {
             Some("c2/obj"),
             "POST must echo symlink sysmeta so the proxy can 307"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn post_delete_at_enqueues_expirer_task_with_object_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-post-expirer-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+
+        let mut put_h = HeaderKeyDict::new();
+        put_h.set("X-Timestamp", "4001");
+        put_h.set("Content-Type", "application/octet-stream");
+        put_h.set("Content-Length", 24);
+        let put = server.handle(Request {
+            method: "PUT".into(),
+            path: "/sda1/0/AUTH_test/c/o".into(),
+            query_string: String::new(),
+            headers: put_h,
+            body: vec![b'x'; 24].into(),
+        });
+        assert_eq!(put.status, 201, "{}", put.reason);
+
+        let mut post_h = HeaderKeyDict::new();
+        post_h.set("X-Timestamp", "4002");
+        post_h.set("X-Delete-At", "9999999999");
+        // Force the direct update to fail quickly so the behavior is
+        // inspectable in the same durable async_pending format used live.
+        post_h.set("X-Delete-At-Host", "127.0.0.1:1");
+        post_h.set("X-Delete-At-Device", "sdb1");
+        post_h.set("X-Delete-At-Partition", "1");
+        // Modern Swift spreads one day's tasks across 100 adjacent container
+        // names; the proxy-provided container is therefore often offset from
+        // the raw day boundary and its partition is tied to that exact name.
+        let object_hash = server
+            .config
+            .hash_config
+            .hash_path("AUTH_test", Some("c"), Some("o"))
+            .unwrap();
+        let task_container = get_expirer_container_for_object_hash(
+            9_999_999_999,
+            &object_hash,
+            EXPIRER_CONTAINER_DIVISOR,
+            EXPIRER_CONTAINER_PER_DIVISOR,
+        );
+        assert_ne!(task_container, "9999936000", "test must exercise a non-zero shard offset");
+        post_h.set("X-Delete-At-Container", &task_container);
+        let post = server.handle(Request {
+            method: "POST".into(),
+            path: "/sda1/0/AUTH_test/c/o".into(),
+            query_string: String::new(),
+            headers: post_h,
+            body: Body::empty(),
+        });
+        assert_eq!(post.status, 202, "{}", post.reason);
+
+        let mut stats = UpdaterStats::default();
+        let pending = iter_async_pendings(&dir.join("sda1"), &mut stats);
+        let expiry = pending
+            .iter()
+            .find(|update| update.account == EXPIRER_ACCOUNT_NAME)
+            .expect("POST X-Delete-At must enqueue an expirer task");
+        assert_eq!(expiry.op, "PUT");
+        assert_eq!(expiry.container, task_container);
+        assert_eq!(
+            expiry
+                .headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("x-content-type"))
+                .map(|(_, value)| value.as_str()),
+            Some("text/plain;swift_expirer_bytes=24")
+        );
+        assert!(expiry.headers.iter().any(|(key, _)| {
+            key.eq_ignore_ascii_case("x-content-type-timestamp")
+        }));
+
+        let mut clear_h = HeaderKeyDict::new();
+        clear_h.set("X-Timestamp", "4003");
+        let clear = server.handle(Request {
+            method: "POST".into(),
+            path: "/sda1/0/AUTH_test/c/o".into(),
+            query_string: String::new(),
+            headers: clear_h,
+            body: Body::empty(),
+        });
+        assert_eq!(clear.status, 202, "{}", clear.reason);
+        let mut stats = UpdaterStats::default();
+        let pending = iter_async_pendings(&dir.join("sda1"), &mut stats);
+        let cleanup = pending
+            .iter()
+            .find(|update| update.account == EXPIRER_ACCOUNT_NAME)
+            .expect("clearing X-Delete-At must enqueue queue cleanup");
+        assert_eq!(cleanup.op, "DELETE");
+        assert_eq!(cleanup.container, task_container);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -40,6 +40,11 @@ use swift_ring::Ring;
 /// Default `expiring_objects_container_divisor` (one bucket per day).
 pub const EXPIRER_CONTAINER_DIVISOR: i64 = 86400;
 
+/// Number of task-container names used within each divisor window. Modern
+/// Swift spreads a day's tasks across the preceding 100 seconds by object
+/// hash, avoiding a single hot queue container.
+pub const EXPIRER_CONTAINER_PER_DIVISOR: i64 = 100;
+
 /// The hidden account holding the expiry queue.
 pub const EXPIRER_ACCOUNT_NAME: &str = ".expiring_objects";
 
@@ -85,6 +90,26 @@ pub fn get_expirer_container(x_delete_at: i64, divisor: i64) -> String {
     // Python: int(x_delete_at) // divisor * divisor, floor division
     let bucket = x_delete_at.div_euclid(divisor) * divisor;
     normalize_delete_at_timestamp(bucket)
+}
+
+/// `ExpirerConfig.get_expirer_container`: select the hash-sharded task
+/// container for one object. `object_hash` is Swift's 32-hex-character
+/// `hash_path(account, container, object)` result.
+pub fn get_expirer_container_for_object_hash(
+    x_delete_at: i64,
+    object_hash: &str,
+    divisor: i64,
+    per_divisor: i64,
+) -> String {
+    let bucket = x_delete_at.div_euclid(divisor) * divisor;
+    let offset = if per_divisor > 0 {
+        u128::from_str_radix(object_hash, 16)
+            .unwrap_or(0)
+            .rem_euclid(per_divisor as u128) as i64
+    } else {
+        0
+    };
+    normalize_delete_at_timestamp(bucket.saturating_sub(offset))
 }
 
 /// `is_expected_task_container`: whether a bucket int is a legal task
@@ -604,6 +629,21 @@ mod tests {
         assert_eq!(
             get_expirer_container(1751500000 + 5, 86400),
             get_expirer_container(1751500000, 86400)
+        );
+    }
+
+    #[test]
+    fn test_expirer_container_is_sharded_backwards_by_object_hash() {
+        let delete_at = 1_751_500_000;
+        let day = delete_at / EXPIRER_CONTAINER_DIVISOR * EXPIRER_CONTAINER_DIVISOR;
+        assert_eq!(
+            get_expirer_container_for_object_hash(
+                delete_at,
+                "00000000000000000000000000000063",
+                EXPIRER_CONTAINER_DIVISOR,
+                EXPIRER_CONTAINER_PER_DIVISOR,
+            ),
+            normalize_delete_at_timestamp(day - 99)
         );
     }
 
