@@ -924,6 +924,15 @@ pub fn cleave_shard_range(
     };
     let sync_from_row = std::cmp::max(last_cleave_to_row.unwrap_or(-1), sync_point);
     let should_sync = source_max_row == -1 || sync_point < source_max_row;
+    let prior_object_count = shard
+        .get_info()
+        .ok()
+        .and_then(|info| {
+            info.iter()
+                .find(|(n, _)| *n == "object_count")
+                .and_then(|(_, v)| v.as_i64())
+        })
+        .unwrap_or(0);
     let records = if should_sync {
         retiring.object_records_in_range_since(&range.lower, &range.upper, sync_from_row)?
     } else {
@@ -958,10 +967,22 @@ pub fn cleave_shard_range(
     }
     source.merge_shard_ranges(vec![range.clone()])?;
 
-    // An existing shard that was already in sync is CLEAVE_SUCCESS and still
-    // consumes a batch slot.  Only a newly-created, genuinely empty shard is
-    // CLEAVE_EMPTY in Python Swift.
-    Ok(had_objects || sync_point >= 0 || !first_cleave)
+    // Python `_cleave_shard_broker`: CLEAVE_EMPTY does not consume
+    // `cleave_batch_size` only when yield_objects found nothing AND the
+    // shard broker was just created this pass. An already-CLEAVED range
+    // with a newly-created empty local shard and no retiring rows is
+    // therefore CLEAVE_EMPTY (probe listing_under_populated L1494). The
+    // same already-CLEAVED range with retiring rows is CLEAVE_SUCCESS and
+    // still consumes the batch (probe L1191 / L1204).
+    let newly_created_empty = prior_object_count == 0 && sync_point < 0;
+    let consume_batch = if !should_sync {
+        true
+    } else if had_objects {
+        true
+    } else {
+        !newly_created_empty
+    };
+    Ok(consume_batch)
 }
 
 /// Python `shard_range.upper >= own_shard_range.upper` with empty = MAX.
@@ -4312,6 +4333,93 @@ mod tests {
         );
         let ctx = load_cleaving_context(&mut source).unwrap();
         assert!(!ctx.cleaving_done, "{ctx:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_underpopulated_replica_finishes_empty_cleaved_prefix() {
+        // Probe listing_under_populated L1494: under-populated replica has
+        // one object in the last range and an empty cleaving context. The
+        // two already-CLEAVED prefix ranges have no local rows, so Python
+        // treats them as CLEAVE_EMPTY and does not spend cleave_batch_size
+        // on them. One once() must finish the leftover CREATED ranges and
+        // reach SHARDED.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-cleave-underpop-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "c-under";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let db = hd.join(format!("{hsh}.db"));
+        let mut source = ContainerBroker::new(&db, account, container);
+        source
+            .initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        source
+            .put_object(
+                "zzz",
+                "1751500001.00000",
+                1,
+                "text/plain",
+                "e",
+                0,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        let epoch = "1751500010.00000";
+        let mut own = ShardRange::new(&source.path(), epoch, "", "");
+        own.state = shard_state::SHARDING;
+        own.epoch = Some(epoch.into());
+        ensure_shard_root_sysmeta(&mut source, account, "rootc", &own);
+        let mut r0 = ShardRange::new(".shards_AUTH_test/c-u-0", epoch, "", "m");
+        r0.state = shard_state::CLEAVED;
+        let mut r1 = ShardRange::new(".shards_AUTH_test/c-u-1", epoch, "m", "y");
+        r1.state = shard_state::CLEAVED;
+        let mut r2 = ShardRange::new(".shards_AUTH_test/c-u-2", epoch, "y", "zzz");
+        r2.state = shard_state::CREATED;
+        let mut r3 = ShardRange::new(".shards_AUTH_test/c-u-3", epoch, "zzz", "");
+        r3.state = shard_state::CREATED;
+        source
+            .merge_shard_ranges(vec![r0, r1, r2, r3])
+            .unwrap();
+        source.enable_sharding(epoch).unwrap();
+        assert!(source.set_sharding_state().unwrap());
+
+        let finished =
+            process_sharding_container(&mut source, &device, &hash_config, "0", 2).unwrap();
+        assert!(
+            finished,
+            "under-populated replica must finish leftover CREATED ranges"
+        );
+        assert_eq!(source.get_db_state().unwrap(), DbState::Sharded);
+        let got = source
+            .get_shard_ranges(&GetShardRangesArgs {
+                include_own: false,
+                ..Default::default()
+            })
+            .unwrap();
+        let states: Vec<i64> = got.iter().map(|r| r.state).collect();
+        assert_eq!(
+            states,
+            vec![
+                shard_state::ACTIVE,
+                shard_state::ACTIVE,
+                shard_state::ACTIVE,
+                shard_state::ACTIVE
+            ],
+            "{got:?}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
