@@ -329,6 +329,20 @@ fn node_host(node: &swift_ring::RingDevice, replication: bool) -> String {
     }
 }
 
+/// Resolve a reconciler queue entry to the container-ring partition that owns
+/// its queue container. The queue object's encoded name is deliberately kept
+/// as an argument so callers cannot accidentally hide the distinction between
+/// container-ring and object-ring routing.
+fn queue_partition(
+    container_ring: &Ring,
+    queue_container: &str,
+    _queue_object: &str,
+) -> Option<u32> {
+    container_ring
+        .get_part(MISPLACED_OBJECTS_ACCOUNT, Some(queue_container), None)
+        .ok()
+}
+
 fn raw_request<K: AsRef<str>, V: AsRef<str>>(
     host: &str,
     method: &str,
@@ -880,11 +894,11 @@ impl ReconcileClient for HttpReconcileClient<'_> {
             &entry.container,
             &entry.obj,
         );
-        let Ok((part, nodes)) = self.container_ring.get_nodes(
-            MISPLACED_OBJECTS_ACCOUNT,
-            Some(&self.queue_container),
-            Some(&qname),
-        ) else {
+        let Some(part) = queue_partition(&self.container_ring, &self.queue_container, &qname)
+        else {
+            return false;
+        };
+        let Ok(nodes) = self.container_ring.get_part_nodes(part) else {
             return false;
         };
         let pop_base = record.q_record.max(record.q_ts);
@@ -1045,6 +1059,50 @@ pub fn recon_update(elapsed: std::time::Duration, stats: &ReconcilerStats) -> se
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use swift_ring::{RingData, RingDevice};
+
+    fn queue_test_ring() -> Ring {
+        let dev = RingDevice {
+            id: 0,
+            region: 1,
+            zone: 1,
+            ip: "127.0.0.1".to_string(),
+            port: 6201,
+            replication_ip: None,
+            replication_port: None,
+            device: "sda".to_string(),
+            weight: 1.0,
+            meta: String::new(),
+            extra: Default::default(),
+        };
+        Ring::new(
+            RingData::from_parts(vec![Some(dev)], 30, vec![vec![0, 0, 0, 0]]),
+            HashPathConfig::new("test-prefix", "test-suffix").unwrap(),
+        )
+    }
+
+    #[test]
+    fn queue_pop_partition_is_independent_of_queue_object_name() {
+        let ring = queue_test_ring();
+        let queue_container = "1787785200";
+        let canonical = ring
+            .get_part(MISPLACED_OBJECTS_ACCOUNT, Some(queue_container), None)
+            .unwrap();
+        let queue_object = (0..1000)
+            .map(|i| format!("0:/AUTH_test/c/object-{i}"))
+            .find(|name| {
+                ring.get_part(MISPLACED_OBJECTS_ACCOUNT, Some(queue_container), Some(name))
+                    .unwrap()
+                    != canonical
+            })
+            .expect("test ring must expose an object-derived partition");
+
+        assert_eq!(
+            queue_partition(&ring, queue_container, &queue_object),
+            Some(canonical),
+            "container queue DELETE must never be routed by queue object name"
+        );
+    }
 
     #[test]
     fn internal_proxy_chunked_body_is_decoded_before_reupload() {

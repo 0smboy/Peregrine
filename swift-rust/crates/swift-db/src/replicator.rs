@@ -323,15 +323,24 @@ fn object_namespace(local: &mut ContainerBroker) -> Option<(String, String)> {
     broker_account_container(local)
 }
 
-fn load_object_ring() -> Option<Ring> {
+fn object_ring_path(swift_dir: &str, policy_index: i64) -> std::path::PathBuf {
+    let filename = if policy_index == 0 {
+        "object.ring.gz".to_string()
+    } else {
+        format!("object-{policy_index}.ring.gz")
+    };
+    std::path::Path::new(swift_dir).join(filename)
+}
+
+fn load_object_ring(policy_index: i64) -> Option<Ring> {
     let swift_dir = std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string());
     let swift_conf =
         std::env::var("SWIFT_CONF").unwrap_or_else(|_| format!("{swift_dir}/swift.conf"));
     let text = std::fs::read_to_string(swift_conf).ok()?;
     let conf = SwiftConfig::parse_lenient(&text, &[], false).ok()?;
     let hash = HashPathConfig::from_swift_conf(&conf).ok()?;
-    let ring_path = format!("{swift_dir}/object.ring.gz");
-    let data = RingData::load(std::path::Path::new(&ring_path)).ok()?;
+    let ring_path = object_ring_path(&swift_dir, policy_index);
+    let data = RingData::load(&ring_path).ok()?;
     Some(Ring::new(data, hash))
 }
 
@@ -341,6 +350,7 @@ fn head_object_status(
     account: &str,
     container: &str,
     name: &str,
+    policy_index: i64,
 ) -> Option<u16> {
     let host = format!("{}:{}", dev.ip, dev.port);
     let mut conn = std::net::TcpStream::connect(&host).ok()?;
@@ -356,7 +366,7 @@ fn head_object_status(
         url_encode(name)
     );
     let req = format!(
-        "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nX-Backend-Storage-Policy-Index: 0\r\nConnection: close\r\n\r\n"
+        "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nX-Backend-Storage-Policy-Index: {policy_index}\r\nConnection: close\r\n\r\n"
     );
     conn.write_all(req.as_bytes()).ok()?;
     let mut raw = Vec::new();
@@ -371,7 +381,13 @@ fn head_object_status(
 
 /// `Some(true)` = every object replica 404/410; `Some(false)` = at least one
 /// 2xx; `None` = could not tell (leave the name alone).
-fn object_is_gone(ring: &Ring, account: &str, container: &str, name: &str) -> Option<bool> {
+fn object_is_gone(
+    ring: &Ring,
+    policy_index: i64,
+    account: &str,
+    container: &str,
+    name: &str,
+) -> Option<bool> {
     let (part, nodes) = ring.get_nodes(account, Some(container), Some(name)).ok()?;
     if nodes.is_empty() {
         return None;
@@ -379,7 +395,7 @@ fn object_is_gone(ring: &Ring, account: &str, container: &str, name: &str) -> Op
     let mut saw_404 = false;
     let mut saw_err = false;
     for n in nodes {
-        match head_object_status(n.dev, part, account, container, name) {
+        match head_object_status(n.dev, part, account, container, name, policy_index) {
             Some(s) if (200..300).contains(&s) => return Some(false),
             Some(404) | Some(410) => saw_404 = true,
             _ => saw_err = true,
@@ -436,6 +452,29 @@ fn shard_ranges_mid_cleave(local: &mut ContainerBroker) -> bool {
     }
 }
 
+fn synthetic_tombstone_items(
+    names: &[String],
+    policy_index: i64,
+    created_at: &str,
+) -> Vec<serde_json::Value> {
+    names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            serde_json::json!({
+                "ROWID": i as i64 + 1,
+                "name": name,
+                "created_at": created_at,
+                "size": 0,
+                "content_type": "application/deleted",
+                "etag": "noetag",
+                "deleted": 1,
+                "storage_policy_index": policy_index,
+            })
+        })
+        .collect()
+}
+
 /// listing-w99: empty local replica vs leftover live rows on the peer.
 /// Only for settled unsharded shards (post nested-complete / L1426).
 fn push_synthetic_tombstones(
@@ -476,13 +515,17 @@ fn push_synthetic_tombstones(
     // (user DELETE completed). Cleaved objects still on disk must live.
     let (obj_acct, obj_cont) =
         object_namespace(local).unwrap_or_else(|| (account.clone(), container.clone()));
-    let Some(ring) = load_object_ring() else {
-        eprintln!("db-replicator: skip synthetic hsh={hsh} no object ring");
+    let Ok(policy_index) = local.storage_policy_index() else {
+        eprintln!("db-replicator: skip synthetic hsh={hsh} no storage policy");
+        return Ok(0);
+    };
+    let Some(ring) = load_object_ring(policy_index) else {
+        eprintln!("db-replicator: skip synthetic hsh={hsh} no object ring policy={policy_index}");
         return Ok(0);
     };
     let gone: Vec<String> = names
         .iter()
-        .filter(|n| object_is_gone(&ring, &obj_acct, &obj_cont, n) == Some(true))
+        .filter(|n| object_is_gone(&ring, policy_index, &obj_acct, &obj_cont, n) == Some(true))
         .cloned()
         .collect();
     if gone.is_empty() {
@@ -497,24 +540,8 @@ fn push_synthetic_tombstones(
         gone.len(),
         names.len()
     );
-    let names = gone;
     let now = Timestamp::now().internal();
-    let json_items: Vec<serde_json::Value> = names
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            serde_json::json!({
-                "ROWID": i as i64 + 1,
-                "name": name,
-                "created_at": now,
-                "size": 0,
-                "content_type": "application/deleted",
-                "etag": "noetag",
-                "deleted": 1,
-                "storage_policy_index": 0,
-            })
-        })
-        .collect();
+    let json_items = synthetic_tombstone_items(&gone, policy_index, &now);
     eprintln!(
         "db-replicator: synthetic tombstones hsh={hsh} n={} account={account} container={container}",
         json_items.len()
@@ -1305,6 +1332,47 @@ mod tests {
     fn spawn_fake_peer(body: String) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
         let (addr, handle, _) = spawn_recording_fake_peer(body);
         (addr, handle)
+    }
+
+    #[test]
+    fn synthetic_tombstone_object_lookup_uses_selected_policy() {
+        assert_eq!(
+            object_ring_path("/etc/swift", 0),
+            std::path::Path::new("/etc/swift/object.ring.gz")
+        );
+        assert_eq!(
+            object_ring_path("/etc/swift", 2),
+            std::path::Path::new("/etc/swift/object-2.ring.gz")
+        );
+
+        let (addr, handle, request) = spawn_recording_fake_peer(String::new());
+        let dev = RingDevice {
+            id: 0,
+            region: 1,
+            zone: 1,
+            ip: addr.ip().to_string(),
+            port: addr.port() as u32,
+            replication_ip: None,
+            replication_port: None,
+            device: "sda".to_string(),
+            weight: 1.0,
+            meta: String::new(),
+            extra: Default::default(),
+        };
+        assert_eq!(
+            head_object_status(&dev, 7, "AUTH_test", "c", "o", 2),
+            Some(200)
+        );
+        handle.join().unwrap();
+        let request = String::from_utf8(request.lock().unwrap().clone()).unwrap();
+        assert!(
+            request.contains("X-Backend-Storage-Policy-Index: 2\r\n"),
+            "{request}"
+        );
+
+        let items = synthetic_tombstone_items(&["object-a".to_string()], 2, "123.00000");
+        assert_eq!(items[0]["storage_policy_index"], 2);
+        assert_eq!(items[0]["created_at"], "123.00000");
     }
 
     fn policy_info(
