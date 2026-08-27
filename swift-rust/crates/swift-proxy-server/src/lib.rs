@@ -2381,7 +2381,7 @@ impl ProxyApp {
         // X-Newest path: collect every good source, then pick the newest
         // timestamp after the node walk (base.py:1678-1688). Non-newest
         // returns the first valid source immediately.
-        let mut newest_candidates: Vec<(Timestamp, BackendHead)> = Vec::new();
+        let mut newest_candidates: Vec<((u8, Timestamp), BackendHead)> = Vec::new();
         for node in nodes {
             match backend_request_head(
                 &node,
@@ -2442,7 +2442,13 @@ impl ProxyApp {
                         if newest {
                             // Keep looking — one good source is not enough
                             // when searching for the newest (base.py:1614).
-                            newest_candidates.push((ts, head));
+                            // Containers: SHARDED beats SHARDING on a created_at tie.
+                            let key = if is_object {
+                                (0u8, ts)
+                            } else {
+                                container_newest_key(&head.headers)
+                            };
+                            newest_candidates.push((key, head));
                             continue;
                         }
                         // Once the winner streams there is no failover: a
@@ -2471,7 +2477,7 @@ impl ProxyApp {
         if newest {
             // Weed out sources older than tombstones discovered later in
             // the walk, then take the newest (base.py:1678-1688).
-            newest_candidates.retain(|(ts, _)| *ts >= latest_404_timestamp);
+            newest_candidates.retain(|((_, ts), _)| *ts >= latest_404_timestamp);
             if let Some((_, head)) = newest_candidates
                 .into_iter()
                 .max_by(|(a, _), (b, _)| a.cmp(b))
@@ -6013,16 +6019,13 @@ pub(crate) fn is_good_source(status: u16, is_object: bool) -> bool {
 /// raises on a malformed value; a well-formed backend never sends one,
 /// so falling through is the pragmatic port.)
 pub(crate) fn source_timestamp(headers: &[(String, String)]) -> Timestamp {
-    // Container servers set X-Backend-Timestamp = created_at, identical on
-    // every replica. Prefer status-changed (set_sharded_state / delete)
-    // then PUT so X-Newest can see the just-SHARDED under-populated node
-    // (listing_under_populated L1509). Objects still win via data-timestamp.
+    // GetterSource.timestamp, base.py:1176-1180. Container X-Newest
+    // additionally ranks X-Backend-Sharding-State (see
+    // container_newest_key) because created_at ties every replica.
     for key in [
         "x-backend-data-timestamp",
-        "x-backend-status-changed-at",
-        "x-backend-put-timestamp",
-        "x-put-timestamp",
         "x-backend-timestamp",
+        "x-put-timestamp",
         "x-timestamp",
     ] {
         if let Some(ts) = resp_header(headers, key)
@@ -6033,6 +6036,24 @@ pub(crate) fn source_timestamp(headers: &[(String, String)]) -> Timestamp {
         }
     }
     Timestamp::zero()
+}
+
+/// Container X-Newest key: sharding progress first, then timestamp.
+/// `set_sharded_state` does not bump status_changed_at, and
+/// X-Backend-Timestamp is created_at, so timestamp-only newest keeps a
+/// lagging SHARDING primary (listing_under_populated L1509: 200 != 101).
+pub(crate) fn container_newest_key(headers: &[(String, String)]) -> (u8, Timestamp) {
+    let rank = match resp_header(headers, "x-backend-sharding-state")
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "sharded" | "collapsed" => 3,
+        "sharding" => 2,
+        "unsharded" => 1,
+        _ => 0,
+    };
+    (rank, source_timestamp(headers))
 }
 
 /// A 404's `X-Backend-Timestamp` — the tombstone timestamp proving the
@@ -8330,14 +8351,22 @@ mod stale_read_and_post_tests {
         assert_eq!(source_timestamp(&h), "1000000003.00000".parse().unwrap());
         // nothing usable -> zero
         assert_eq!(source_timestamp(&hdrs(&[])), Timestamp::zero());
-        // L1509: same created_at on all replicas; SHARDED replica just
-        // bumped status_changed_at. That must beat created_at.
-        let h = hdrs(&[
-            ("X-Backend-Timestamp", "1000000001.00000"),
-            ("X-Backend-PUT-Timestamp", "1000000002.00000"),
-            ("X-Backend-Status-Changed-At", "1000000009.00000"),
+    }
+
+    #[test]
+    fn test_container_newest_key_prefers_sharded_over_newer_sharding() {
+        // L1509: created_at ties; a SHARDING primary may even have a newer
+        // put/created header. The just-SHARDED under-populated replica
+        // must still win so listing uses 4 ACTIVE shards, not residual.
+        let sharding = hdrs(&[
+            ("X-Backend-Timestamp", "1000000009.00000"),
+            ("X-Backend-Sharding-State", "sharding"),
         ]);
-        assert_eq!(source_timestamp(&h), "1000000009.00000".parse().unwrap());
+        let sharded = hdrs(&[
+            ("X-Backend-Timestamp", "1000000001.00000"),
+            ("X-Backend-Sharding-State", "sharded"),
+        ]);
+        assert!(container_newest_key(&sharded) > container_newest_key(&sharding));
     }
 
     #[test]
