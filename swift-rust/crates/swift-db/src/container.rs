@@ -2041,6 +2041,64 @@ mod tests {
     }
 
     #[test]
+    fn test_sharded_root_revive_uses_shard_usage_for_is_deleted() {
+        // Probe test_sharded_delete L2506 vs shrink-to-root L2095:
+        // SHARDED + shard usage > 0 revives; COLLAPSED leftover rows do not.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-revive-shard-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut b = shard_broker(&dir, 0);
+        let epoch = "1751500010.00000";
+        b.enable_sharding(epoch).unwrap();
+        let mut s1 = crate::shard::ShardRange::new(".shards_AUTH_test/c-0", epoch, "", "m");
+        s1.state = crate::shard::state::ACTIVE;
+        s1.object_count = 1;
+        let mut s2 = crate::shard::ShardRange::new(".shards_AUTH_test/c-1", epoch, "m", "");
+        s2.state = crate::shard::state::ACTIVE;
+        s2.object_count = 0;
+        b.merge_shard_ranges(vec![s1, s2]).unwrap();
+        assert!(b.set_sharding_state().unwrap());
+        assert!(b.set_sharded_state().unwrap());
+        assert_eq!(b.get_db_state().unwrap(), DbState::Sharded);
+        b.delete_db("1751500200.00000").unwrap();
+        assert!(
+            !b.is_deleted().unwrap(),
+            "SHARDED root with shard usage > 0 must revive"
+        );
+        let (_, del) = b.get_info_is_deleted().unwrap();
+        assert!(!del, "get_info_is_deleted must follow shard usage");
+
+        // L2095: shrink-to-root leaves a COLLAPSED root with no other
+        // live shard ranges. delete_timestamp > put_timestamp and
+        // container_stat object_count stay decisive.
+        let dir2 = std::env::temp_dir().join(format!(
+            "swift-revive-coll-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir2);
+        let mut c = shard_broker(&dir2, 0);
+        c.enable_sharding(epoch).unwrap();
+        assert!(c.set_sharding_state().unwrap());
+        assert!(c.set_sharded_state().unwrap());
+        assert_eq!(c.get_db_state().unwrap(), DbState::Collapsed);
+        let mut leftover = crate::shard::ShardRange::new(".shards_AUTH_test/c-x", epoch, "", "");
+        leftover.state = crate::shard::state::SHRUNK;
+        leftover.deleted = 1;
+        leftover.object_count = 1;
+        c.merge_shard_ranges(vec![leftover]).unwrap();
+        assert_eq!(c.get_db_state().unwrap(), DbState::Collapsed);
+        c.delete_db("1751500200.00000").unwrap();
+        assert!(
+            c.is_deleted().unwrap(),
+            "COLLAPSED + deleted SHRUNK leftover must not revive L2095"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&dir2).unwrap();
+    }
+
+    #[test]
     fn test_collapsed_root_delete_object_makes_empty() {
         // Probe L2094: shrink-to-root leaves a COLLAPSED epoch DB with the
         // last live row. DELETE that object must make empty() true so
@@ -2642,28 +2700,43 @@ impl ContainerBroker {
     /// resolves to the freshest epoch DB). After `set_sharded_state` only
     /// `<hash>_<epoch>.db` remains — checking the constructor `<hash>.db`
     /// path would falsely treat SHARDED containers as deleted (404).
+    fn info_shows_deleted(info: &[(String, DbValue)]) -> bool {
+        let get = |k: &str| {
+            info.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or(DbValue::Null)
+        };
+        let object_count = get("object_count");
+        let delete_ts = get("delete_timestamp");
+        let put_ts = get("put_timestamp");
+        let zero = match &object_count {
+            DbValue::Int(i) => *i == 0,
+            DbValue::Text(s) => s.is_empty() || s == "0",
+            DbValue::Null => true,
+        };
+        let parse = |v: &DbValue| match v {
+            DbValue::Text(s) => s.parse::<Timestamp>().ok(),
+            DbValue::Int(i) => Timestamp::from_secs(*i as f64).ok(),
+            DbValue::Null => None,
+        };
+        zero
+            && matches!(
+                (parse(&delete_ts), parse(&put_ts)),
+                (Some(d), Some(p)) if d > p
+            )
+    }
+
     pub fn is_deleted(&mut self) -> Result<bool, DbError> {
         if self.db_files().is_empty() {
             return Ok(true);
         }
-        self.commit_pending()?;
-        let conn = self.conn()?;
-        let (put_ts, delete_ts, object_count): (String, String, Value) = conn.query_row(
-            "\n            SELECT put_timestamp, delete_timestamp, object_count\n            FROM container_stat",
-            [],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    crate::account::sql_value(row.get_ref(2)?),
-                ))
-            },
-        )?;
-        Ok(crate::account::zero_like(&object_count)
-            && matches!(
-                (delete_ts.parse::<Timestamp>(), put_ts.parse::<Timestamp>()),
-                (Ok(d), Ok(p)) if d > p
-            ))
+        // Python `_is_deleted`: use the same object_count `get_info` exposes
+        // (shard usage on SHARDED roots). container_stat alone leaves a
+        // deleted SHARDED root 404 after shards report objects
+        // (probe test_sharded_delete L2506).
+        let info = self.get_info()?;
+        Ok(Self::info_shows_deleted(&info))
     }
 
     /// `DatabaseBroker.reclaim`: commit pending, purge old tombstone
@@ -3037,10 +3110,10 @@ impl ContainerBroker {
             };
             matches!((parse(a), parse(b)), (Some(x), Some(y)) if x > y)
         };
-        // GET/HEAD 404 must match DELETE_container's is_deleted() (container_stat),
-        // not get_info() object_count which substitutes shard usage on SHARDED
-        // roots. Stale shard stats after shrink-to-root made probe L2095 GET 200.
-        let deleted = self.is_deleted()?;
+        // Python get_info_is_deleted: deleted follows get_info object_count
+        // (shard usage on SHARDED roots). Collapsed roots do not substitute
+        // shard usage, so leftover shrink-to-root rows cannot revive L2095.
+        let deleted = Self::info_shows_deleted(&info);
         let _ = (zero(&get("object_count")), newer(&get("delete_timestamp"), &get("put_timestamp")));
         Ok((info, deleted))
     }
