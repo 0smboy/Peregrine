@@ -2929,7 +2929,20 @@ pub fn move_misplaced_from_live(
         return Ok(0);
     }
     let dest_ranges = misplaced_dest_ranges(source, ring);
-    if dest_ranges.is_empty() {
+    // After shrink-to-root there are no updating children. Python
+    // states=updating + fill_gaps yields the root own range, so leftover
+    // rows move onto the root (probe L2798 beta replaces alpha).
+    let root_fallback = if source.is_root_container().unwrap_or(true) {
+        None
+    } else {
+        root_account_container(source).map(|(acct, cont)| {
+            let ts = swift_core::timestamp::Timestamp::now().internal();
+            let mut sr = ShardRange::new(&format!("{acct}/{cont}"), &ts, "", "");
+            sr.state = shard_state::ACTIVE;
+            sr
+        })
+    };
+    if dest_ranges.is_empty() && root_fallback.is_none() {
         return Ok(0);
     }
     let source_path = source.path();
@@ -2941,14 +2954,18 @@ pub fn move_misplaced_from_live(
     let mut moved = 0usize;
     for rec in records {
         let name = rec.name.clone();
-        let Some(owner) = dest_ranges.iter().find(|r| {
+        let owner_from_ranges = dest_ranges.iter().find(|r| {
             r.deleted == 0
                 && is_shard_update_state(r.state)
                 && range_contains_object_name(r, &name)
                 && r.name != source_path
-        }) else {
+        });
+        let Some(owner) = owner_from_ranges.or(root_fallback.as_ref()) else {
             continue;
         };
+        if owner.name == source_path {
+            continue;
+        }
         let dest_part = shard_part_for(&owner.name, ring, part);
         let local_ok = match open_existing_shard_on_devices(
             &search,
