@@ -299,8 +299,22 @@ fn delete_actual_object_via_proxy(proxy_host: &str, task: &TaskInfo) -> DeleteRe
         ]
     };
     let Some((status, _)) = raw_request(proxy_host, "DELETE", &path, &headers) else {
+        if std::env::var_os("PEREGRINE_EXPIRER_TRACE").is_some() {
+            eprintln!(
+                "EXPIRER_PROXY_DELETE target={} async={} result=transport-error",
+                task.target_path(),
+                task.is_async_delete
+            );
+        }
         return DeleteResult::Error;
     };
+    if std::env::var_os("PEREGRINE_EXPIRER_TRACE").is_some() {
+        eprintln!(
+            "EXPIRER_PROXY_DELETE target={} async={} status={status}",
+            task.target_path(),
+            task.is_async_delete
+        );
+    }
     if task.is_async_delete {
         if (200..300).contains(&status) || status == 404 || status == 409 {
             DeleteResult::Deleted
