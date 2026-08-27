@@ -5910,7 +5910,7 @@ impl ProxyApp {
 }
 
 /// Convert borrowed ring part-nodes into owned `Node`s in ring order.
-#[cfg(feature = "ec")]
+/// Used by the default async fan-out path; not EC-specific.
 fn ring_nodes(part_nodes: Vec<swift_ring::PartNode<'_>>) -> Vec<Node> {
     part_nodes
         .iter()
@@ -6571,6 +6571,17 @@ pub(crate) fn include_root_residual_for_listing_ex(
     if full_shrinking_cover {
         return include_shrink_to_root_residual(sharding_state, empty_wins, has_shrinking)
             || include_sharding_residual_root(sharding_state, newest);
+    }
+    // L1509: a SHARDED replica with a settled ACTIVE partition must list
+    // shards only. Residual retiring rows from this or a lagging SHARDING
+    // peer fill the under-populated last shards (expected 101, got 200).
+    // L1483 still residuals while the HEAD state is SHARDING / unsettled.
+    // L1517 completeness comes from the just-cleaved shard DBs, not root.
+    if empty_wins && !has_shrinking {
+        let s = sharding_state.to_ascii_lowercase();
+        if s == "sharded" || s == "collapsed" {
+            return false;
+        }
     }
     include_sharding_residual_root(sharding_state, newest)
         || include_shrink_to_root_residual(sharding_state, empty_wins, has_shrinking)
@@ -10263,6 +10274,14 @@ mod shard_listing_fanout_tests {
             true,
             false,
             true
+        ));
+        // L1509: SHARDED + X-Newest + 4 ACTIVE, no shrinking → shards only.
+        assert!(!include_root_residual_for_listing_ex(
+            "sharded", true, true, false, true, false, false
+        ));
+        // L1483: still SHARDING / unsettled → residual stays on.
+        assert!(include_root_residual_for_listing_ex(
+            "sharding", true, false, false, true, false, false
         ));
         let shrinking_partial = sr_state(".shards/0", "", "obj-1-049", 50);
         let acc = sr_state(".shards/1", "", "", 40);
