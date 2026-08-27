@@ -471,6 +471,37 @@ fn validate_internal_name(name: &str, type_: &str) -> Result<(), Response> {
     Ok(())
 }
 
+/// Port of `swift.common.request_helpers.validate_internal_obj`.
+///
+/// Reconciler queue object names deliberately embed the source account,
+/// container, and object in one record name.  Those embedded names may contain
+/// the reserved byte, so Python skips object-name validation for auto-created
+/// system accounts (including `.misplaced_objects`).  User-account paths must
+/// retain the stricter namespace checks.
+fn validate_internal_obj(account: &str, container: &str, obj: &str) -> Result<(), Response> {
+    validate_internal_name(account, "account")?;
+    validate_internal_name(container, "container")?;
+    if !obj.is_empty()
+        && !account.starts_with(AUTO_CREATE_ACCOUNT_PREFIX)
+        && account != MISPLACED_OBJECTS_ACCOUNT
+    {
+        validate_internal_name(obj, "object")?;
+        if container.starts_with(RESERVED) && !obj.starts_with(RESERVED) {
+            return Err(error_response(
+                400,
+                "Invalid user-namespace object in reserved-namespace container",
+            ));
+        }
+        if obj.starts_with(RESERVED) && !container.starts_with(RESERVED) {
+            return Err(error_response(
+                400,
+                "Invalid reserved-namespace object in user-namespace container",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Percent-encode a location the way `urllib.parse.quote` does with the
 /// default safe set (letters, digits, `_.-~` and `/`).
 fn pct_quote(s: &str) -> String {
@@ -789,10 +820,11 @@ impl ContainerServer {
         let account = segs[2].clone().unwrap_or_default();
         let container = segs[3].clone().unwrap_or_default();
         let obj = segs.get(4).cloned().flatten().filter(|o| !o.is_empty());
-        validate_internal_name(&account, "account")?;
-        validate_internal_name(&container, "container")?;
         if let Some(obj) = &obj {
-            validate_internal_name(obj, "object")?;
+            validate_internal_obj(&account, &container, obj)?;
+        } else {
+            validate_internal_name(&account, "account")?;
+            validate_internal_name(&container, "container")?;
         }
         Ok((drive, part, account, container, obj))
     }
@@ -2271,6 +2303,52 @@ pub fn serve_instance(
         std::sync::Arc::new(ContainerAsyncService(server)),
         http_config,
     )
+}
+
+#[cfg(test)]
+mod reserved_path_tests {
+    use super::*;
+
+    fn test_server() -> ContainerServer {
+        ContainerServer::new(ContainerServerConfig {
+            devices: std::env::temp_dir(),
+            mount_check: false,
+            hash_config: HashPathConfig::new(b"test-prefix".to_vec(), Vec::new()).unwrap(),
+            policies: vec![(0, "replication".to_string())],
+            default_policy_index: 0,
+            fixed_created_at: None,
+        })
+    }
+
+    fn delete_request(account: &str, object: &str) -> Request {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Allow-Reserved-Names", "true");
+        Request {
+            method: "DELETE".to_string(),
+            path: format!("/sda1/396/{account}/1787788800/{object}"),
+            query_string: String::new(),
+            headers,
+            body: Vec::new().into(),
+        }
+    }
+
+    #[test]
+    fn reconciler_queue_object_may_embed_reserved_components() {
+        let object = "1:/AUTH_test/\0container\0uuid/\0object\0uuid";
+        let parsed = test_server()
+            .obj_path(&delete_request(MISPLACED_OBJECTS_ACCOUNT, object))
+            .expect(".misplaced_objects queue names embed reserved source names");
+        assert_eq!(parsed.4.as_deref(), Some(object));
+    }
+
+    #[test]
+    fn user_account_still_rejects_embedded_reserved_components() {
+        let object = "ordinary-prefix/\0object";
+        let response = test_server()
+            .obj_path(&delete_request("AUTH_test", object))
+            .expect_err("allow-reserved listing header must not bypass path validation");
+        assert_eq!(response.status, 400);
+    }
 }
 
 #[cfg(test)]
