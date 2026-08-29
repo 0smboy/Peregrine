@@ -300,6 +300,7 @@ impl AccountInfo {
 /// or errors fall through to a live HEAD; they never fail the request.
 struct InfoCache {
     containers: Mutex<HashMap<String, (Instant, ContainerInfo)>>,
+    container_db_states: Mutex<HashMap<String, (Instant, String)>>,
     accounts: Mutex<HashMap<String, (Instant, AccountInfo)>>,
     memcache: Option<Mutex<MemcacheClient<TcpConn>>>,
 }
@@ -308,6 +309,7 @@ impl InfoCache {
     fn new() -> Self {
         InfoCache {
             containers: Mutex::new(HashMap::new()),
+            container_db_states: Mutex::new(HashMap::new()),
             accounts: Mutex::new(HashMap::new()),
             memcache: None,
         }
@@ -321,6 +323,10 @@ impl InfoCache {
 
     fn memcache_key_container(account_container: &str) -> String {
         format!("container/{account_container}")
+    }
+
+    fn memcache_key_container_db_state(account_container: &str) -> String {
+        format!("peregrine/container-root-db-state/{account_container}")
     }
 
     fn memcache_key_account(account: &str) -> String {
@@ -365,27 +371,49 @@ impl InfoCache {
         self.memcache_set_container(&mkey, &info, ttl_secs);
     }
 
-    /// Refresh only the root database state in an existing positive cache
-    /// entry. A sharded listing may prove the state changed while the rest of
-    /// the cached container metadata is still valid. Keeping this operation
-    /// field-scoped avoids making listing/HEAD consume stale whole entries.
-    fn set_container_db_state(&self, key: &str, state: &str, ttl_secs: f64) -> bool {
-        let Some(mut info) = self.get_container(key) else {
-            return false;
-        };
-        if !info.exists() {
-            return false;
+    /// A root DB-state proof is intentionally separate from container-info.
+    /// Updating the latter from a listing extends stale policy/ACL metadata
+    /// and breaks delete/recreate across storage policies (probe L2541).
+    fn get_container_db_state(&self, key: &str) -> Option<String> {
+        if self.memcache.is_some() {
+            let mkey = Self::memcache_key_container_db_state(key);
+            return self.memcache_get_string(&mkey);
         }
-        info.db_state = state.to_string();
-        self.set_container(key.to_string(), info, ttl_secs);
-        true
+        let mut map = self.container_db_states.lock().unwrap();
+        match map.get(key) {
+            None => None,
+            Some((deadline, state)) => {
+                if Instant::now() >= *deadline {
+                    map.remove(key);
+                    None
+                } else {
+                    Some(state.clone())
+                }
+            }
+        }
+    }
+
+    fn set_container_db_state(&self, key: &str, state: &str, ttl_secs: f64) {
+        if !ttl_secs.is_finite() || ttl_secs <= 0.0 {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs_f64(ttl_secs.min(1e9));
+        self.container_db_states
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), (deadline, state.to_string()));
+        let mkey = Self::memcache_key_container_db_state(key);
+        self.memcache_set_string(&mkey, state, ttl_secs);
     }
 
     /// `clear_info_cache` for one container (base.py:732-744).
     fn clear_container(&self, key: &str) {
         self.containers.lock().unwrap().remove(key);
+        self.container_db_states.lock().unwrap().remove(key);
         let mkey = Self::memcache_key_container(key);
         self.memcache_delete(&mkey);
+        let state_key = Self::memcache_key_container_db_state(key);
+        self.memcache_delete(&state_key);
     }
 
     /// A fresh cached account info, or `None`.
@@ -447,6 +475,24 @@ impl InfoCache {
         let Some(mc) = &self.memcache else { return };
         let Ok(mut guard) = mc.lock() else { return };
         let value = container_info_to_json(info);
+        let _ = guard.set_json(key, &value, ttl_secs as i64);
+    }
+
+    fn memcache_get_string(&self, key: &str) -> Option<String> {
+        let mc = self.memcache.as_ref()?;
+        let mut guard = mc.lock().ok()?;
+        guard
+            .get_json(key)
+            .ok()
+            .flatten()?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    fn memcache_set_string(&self, key: &str, value: &str, ttl_secs: f64) {
+        let Some(mc) = &self.memcache else { return };
+        let Ok(mut guard) = mc.lock() else { return };
+        let value = serde_json::Value::String(value.to_string());
         let _ = guard.set_json(key, &value, ttl_secs as i64);
     }
 
@@ -3702,12 +3748,11 @@ impl ProxyApp {
     }
 
     /// Record a database state proved by the root listing path without
-    /// replacing unrelated cached metadata. This is the fast-sharding case:
+    /// touching container policy/ACL metadata. This is the fast-sharding case:
     /// Rust can complete a probe cycle before the ordinary 60-second
     /// container-info TTL expires, so the initial `unsharded` value would
     /// otherwise be stamped into async_pending files after the container
-    /// nodes are deliberately stopped. A listing cannot safely infer policy
-    /// or ACL metadata, so a cache miss is deliberately left untouched.
+    /// nodes are deliberately stopped.
     fn remember_proven_container_db_state(
         &self,
         account: &str,
@@ -3801,6 +3846,11 @@ impl ProxyApp {
     /// Python obj.py: object PUT/DELETE carry `X-Container-Root-Db-State` so
     /// a failed container update still pickles `db_state` into async_pending.
     fn stamp_root_db_state(&self, account: &str, container: &str, headers: &mut HeaderKeyDict) {
+        let cache_key = format!("{account}/{container}");
+        if let Some(state) = self.info_cache.get_container_db_state(&cache_key) {
+            headers.set("X-Container-Root-Db-State", state);
+            return;
+        }
         headers.set(
             "X-Container-Root-Db-State",
             self.container_info(account, container).root_db_state(),
@@ -8650,7 +8700,7 @@ mod info_cache_tests {
     }
 
     #[test]
-    fn proven_listing_state_refreshes_only_cached_db_state() {
+    fn proven_listing_state_is_independent_of_container_metadata() {
         let app = ProxyApp::new(
             super::policy_ring_tests::ring(0),
             super::policy_ring_tests::ring(0),
@@ -8661,10 +8711,10 @@ mod info_cache_tests {
         app.info_cache
             .set_container("AUTH_test/c".to_string(), cached, 60.0);
         app.remember_proven_container_db_state("AUTH_test", "c", "sharded");
-        let refreshed = app.info_cache.get_container("AUTH_test/c").unwrap();
-        assert_eq!(refreshed.db_state, "sharded");
-        assert_eq!(refreshed.policy_index, 7);
-        assert_eq!(refreshed.read_acl.as_deref(), Some("r"));
+        let unchanged = app.info_cache.get_container("AUTH_test/c").unwrap();
+        assert_eq!(unchanged.db_state, "unsharded");
+        assert_eq!(unchanged.policy_index, 7);
+        assert_eq!(unchanged.read_acl.as_deref(), Some("r"));
         let mut headers = HeaderKeyDict::new();
         app.stamp_root_db_state("AUTH_test", "c", &mut headers);
         assert_eq!(
@@ -8686,6 +8736,12 @@ mod info_cache_tests {
             app.info_cache.get_container("AUTH_test/c").is_none(),
             "a shard listing cannot safely infer policy or ACL metadata"
         );
+        let mut headers = HeaderKeyDict::new();
+        app.stamp_root_db_state("AUTH_test", "c", &mut headers);
+        assert_eq!(
+            headers.get("X-Container-Root-Db-State"),
+            Some("sharded")
+        );
     }
 
     #[test]
@@ -8704,8 +8760,10 @@ mod info_cache_tests {
         assert!(cache.containers.lock().unwrap().is_empty());
         // clear_info_cache (container PUT/POST/DELETE) drops a live entry
         cache.set_container("a/c".to_string(), info(5), 60.0);
+        cache.set_container_db_state("a/c", "sharded", 60.0);
         cache.clear_container("a/c");
         assert!(cache.get_container("a/c").is_none());
+        assert!(cache.get_container_db_state("a/c").is_none());
         // a non-positive TTL disables caching entirely
         cache.set_container("a/c".to_string(), info(6), 0.0);
         assert!(cache.get_container("a/c").is_none());
