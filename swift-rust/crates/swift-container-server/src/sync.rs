@@ -1704,12 +1704,13 @@ cluster_c1 = http://127.0.0.1:8080/v1/
                 .as_nanos()
         ));
         let device = root.join("sdb");
+        let hash = "0123456789abcdef0123456789abcdef";
         let db = device
             .join("containers")
             .join("0")
-            .join("abc")
-            .join("hash")
-            .join("hash.db");
+            .join("def")
+            .join(hash)
+            .join(format!("{hash}.db"));
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         std::fs::write(&db, b"x").unwrap();
         let store = ContainerSyncStore::new(&root);

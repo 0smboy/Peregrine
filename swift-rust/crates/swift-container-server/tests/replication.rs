@@ -94,6 +94,7 @@ fn test_replicate_container_db_converges() {
         policies: vec![(0, "Policy-0".to_string())],
         default_policy_index: 0,
         fixed_created_at: None,
+        recon_cache_path: PathBuf::from("/var/cache/swift"),
     };
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -195,6 +196,7 @@ fn test_replicate_container_db_copies_shard_ranges() {
         policies: vec![(0, "Policy-0".to_string())],
         default_policy_index: 0,
         fixed_created_at: None,
+        recon_cache_path: PathBuf::from("/var/cache/swift"),
     };
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();

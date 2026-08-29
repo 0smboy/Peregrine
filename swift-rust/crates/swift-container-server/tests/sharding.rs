@@ -17,6 +17,7 @@
 //! shard ranges), record-type=shard GET (shard-range listing), and the
 //! _redirect_to_shard 301 on an object PUT and DELETE.
 
+use std::path::PathBuf;
 use swift_container_server::{ContainerServer, ContainerServerConfig};
 use swift_db::{shard_state, ShardRange};
 use swift_http::{HeaderKeyDict, Request};
@@ -30,6 +31,7 @@ fn config(devices: &std::path::Path) -> ContainerServerConfig {
         policies: vec![(0, "Policy-0".to_string())],
         default_policy_index: 0,
         fixed_created_at: Some("1751500000.00000".to_string()),
+        recon_cache_path: PathBuf::from("/var/cache/swift"),
     }
 }
 

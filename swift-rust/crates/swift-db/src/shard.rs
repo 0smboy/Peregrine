@@ -456,6 +456,17 @@ pub fn merge_shards(new: &mut ShardRange, existing: Option<&ShardRange>) -> bool
     if existing.timestamp < new.timestamp {
         // newer created-time trumps entirely; reset the reported latch
         new.reported = 0;
+        // An empty incoming epoch is not a successful overwrite of a real
+        // epoch. Shrink-to-root compactible bumps own.timestamp and can
+        // synthesize a no-epoch own; Python never does that. Losing
+        // own.epoch on an epoch file makes get_db_state() Unsharded
+        // (probe test_shrinking L2088).
+        let incoming_empty = new.epoch.as_deref().map(str::is_empty).unwrap_or(true);
+        if incoming_empty {
+            if existing.epoch.as_deref().is_some_and(|e| !e.is_empty()) {
+                new.epoch = existing.epoch.clone();
+            }
+        }
         return true;
     } else if existing.timestamp > new.timestamp {
         return false;
@@ -684,6 +695,28 @@ mod tests {
         assert!(merge_shards(&mut new, Some(&existing)));
         // older existing does not roll forward the reported latch
         assert_eq!(new.reported, 0);
+    }
+
+    #[test]
+    fn test_merge_newer_without_epoch_preserves_existing_epoch() {
+        // Probe L2088: compactible timestamp-bump must not wipe own.epoch.
+        let mut existing = sr("AUTH_test/c", "1751500001.00000");
+        existing.epoch = Some("1751500010.00000".into());
+        existing.state = crate::shard::state::SHARDED;
+        let mut new = sr("AUTH_test/c", "1751500002.00000");
+        new.state = crate::shard::state::ACTIVE;
+        assert!(merge_shards(&mut new, Some(&existing)));
+        assert_eq!(new.epoch.as_deref(), Some("1751500010.00000"));
+    }
+
+    #[test]
+    fn test_merge_newer_with_epoch_still_wins() {
+        let mut existing = sr("AUTH_test/c", "1751500001.00000");
+        existing.epoch = Some("1751500010.00000".into());
+        let mut new = sr("AUTH_test/c", "1751500002.00000");
+        new.epoch = Some("1751500099.00000".into());
+        assert!(merge_shards(&mut new, Some(&existing)));
+        assert_eq!(new.epoch.as_deref(), Some("1751500099.00000"));
     }
 
     #[test]

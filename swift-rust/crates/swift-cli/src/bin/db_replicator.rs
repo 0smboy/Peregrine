@@ -149,7 +149,8 @@ impl DbRsync {
                 // 127.0.0.2:16221, and so on. `port_of` is keyed by the
                 // local listener address, so an exact lookup can miss a
                 // primary whose ring host uses another loopback address.
-                // The port uniquely identifies that local server root.
+                // The port uniquely identifies that local server root;
+                // otherwise the handoff is never staged (probe L2938/L3024).
                 let port = port_of.get(peer_host).copied().or_else(|| {
                     peer_host
                         .rsplit_once(':')
@@ -177,6 +178,7 @@ impl DbRsync {
 impl RsyncTransport for DbRsync {
     fn rsync(&self, local_db: &Path, peer_host: &str, peer_device: &str, stage_name: &str) -> bool {
         let Some((dest, ssh)) = self.rsync_dest(peer_host, peer_device, stage_name) else {
+            eprintln!("db-replicator: rsync dest missing peer={peer_host} device={peer_device}");
             return false;
         };
         let mut cmd = std::process::Command::new("rsync");
@@ -184,8 +186,12 @@ impl RsyncTransport for DbRsync {
         if let Some(opts) = ssh {
             cmd.arg("-e").arg(opts);
         }
-        cmd.arg(local_db).arg(dest);
-        matches!(cmd.status(), Ok(s) if s.success())
+        cmd.arg(local_db).arg(&dest);
+        let ok = matches!(cmd.status(), Ok(s) if s.success());
+        if !ok {
+            eprintln!("db-replicator: rsync failed peer={peer_host} dest={dest}");
+        }
+        ok
     }
 
     fn complete(
@@ -384,8 +390,9 @@ impl DbReplicateClient for DbClient {
         if self.server != ServerType::Container {
             return false;
         }
-        // REPLICATE paths do not carry account/container, so hydrate them
-        // from container_stat before evaluating sharding_required().
+        // Must read account/container from container_stat. A blank path
+        // synthesizes an ACTIVE own, so sharding_initiated() is false even
+        // when the on-disk own is SHARDED (probe L2972).
         let mut probe = ContainerBroker::new(&db.path, "", "");
         let info = match probe.get_info() {
             Ok(info) => info,
@@ -466,7 +473,8 @@ impl DbReplicateClient for DbClient {
                         // completion destination. The older guard assumed
                         // every destination was `<hash>.db`; keeping it here
                         // suppresses the only whole-DB transfer to an empty
-                        // new primary.
+                        // new primary (probe L3024/L2938). The receive side,
+                        // not this staging guard, enforces L1347.
                         rsync_db(
                             &db.path,
                             &local_id,
@@ -939,6 +947,8 @@ mod tests {
 
     #[test]
     fn test_rsync_dest_local_matches_ring_ip_by_port() {
+        // G6 probe ring: 127.0.0.1:16211 .. 127.0.0.4:16241. Lookup must
+        // not require the host to be 127.0.0.1.
         let peer_map: HashMap<u32, PathBuf> = [
             (16211u32, PathBuf::from("/srv/1/node")),
             (16231u32, PathBuf::from("/srv/3/node")),

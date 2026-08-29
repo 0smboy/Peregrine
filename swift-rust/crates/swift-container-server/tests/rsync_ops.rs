@@ -36,6 +36,7 @@ fn config(devices: &Path) -> ContainerServerConfig {
         policies: vec![(0, "Policy-0".to_string())],
         default_policy_index: 0,
         fixed_created_at: Some("1751500000.00000".to_string()),
+        recon_cache_path: PathBuf::from("/var/cache/swift"),
     }
 }
 

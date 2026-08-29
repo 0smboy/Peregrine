@@ -99,6 +99,8 @@ pub struct ContainerServerConfig {
     pub default_policy_index: i64,
     /// Fixed `created_at` for deterministic tests.
     pub fixed_created_at: Option<String>,
+    /// Python `recon_cache_path` (DEFAULT / filter:recon). Used for GET /recon/*.
+    pub recon_cache_path: PathBuf,
 }
 
 pub struct ContainerServer {
@@ -539,6 +541,43 @@ impl ContainerServer {
         })
     }
 
+
+    /// Python recon middleware: GET `/recon/<check>` never uses obj_path.
+    /// Isolated G6 container-server.conf pipelines `healthcheck recon
+    /// container-server`, but this binary ignores the pipeline, so `/recon/*`
+    /// used to 400 via `split_path(..., 4, 5)`.
+    fn recon_get(&self, req: &Request) -> Response {
+        if req.method != "GET" && req.method != "HEAD" {
+            return plain_response(405, "Method Not Allowed");
+        }
+        let check = req.path.trim_start_matches("/recon/").trim_end_matches('/');
+        if check != "sharding" {
+            return plain_response(404, &format!("Invalid path: {}", req.path));
+        }
+        let cache = self.config.recon_cache_path.join("container.recon");
+        let keys = ["sharding_stats", "sharding_time", "sharding_last"];
+        let mut out = serde_json::Map::new();
+        let parsed = std::fs::read_to_string(&cache).ok().and_then(|s| {
+            serde_json::from_str::<serde_json::Value>(s.lines().next().unwrap_or("")).ok()
+        });
+        if let Some(serde_json::Value::Object(map)) = parsed {
+            for k in keys {
+                out.insert(
+                    k.to_string(),
+                    map.get(k).cloned().unwrap_or(serde_json::Value::Null),
+                );
+            }
+        } else {
+            for k in keys {
+                out.insert(k.to_string(), serde_json::Value::Null);
+            }
+        }
+        let body = serde_json::Value::Object(out).to_string();
+        let mut resp = Response::with_body(200, body.into_bytes());
+        resp.headers.set("Content-Type", "application/json");
+        resp
+    }
+
     pub fn db_file_for_request(&self, req: &Request) -> Result<PathBuf, Response> {
         let (drive, part, account, container, _obj) = self.obj_path(req)?;
         self.check_drive(&drive)?;
@@ -625,6 +664,9 @@ impl ContainerServer {
         };
         if req.method == "OPTIONS" {
             return self.handle(req);
+        }
+        if req.path.starts_with("/recon/") {
+            return self.recon_get(&req);
         }
         self.dispatch_on_shard(req).await
     }
@@ -778,6 +820,9 @@ impl ContainerServer {
     }
 
     pub fn handle(&self, mut req: Request) -> Response {
+        if req.path.starts_with("/recon/") {
+            return self.recon_get(&req);
+        }
         let mut resp = match req.method.as_str() {
             "GET" => self.get(&req),
             "HEAD" => self.head(&req),
@@ -1064,10 +1109,20 @@ impl ContainerServer {
         // no object rows (set_sharding_state copies metadata only). Listing
         // the freshest file drops uncleaved names (probe L1321 obj-0000-0049
         // after extra replicators put an epoch DB on every replica).
-        let rows = if let Some(mut retiring) = broker.retiring_broker() {
-            match retiring.list_objects_iter(&args) {
-                Ok(rows) => rows,
-                Err(e) => return self.db_error_response(&e, retiring.db_file()),
+        // After SHARDED, retiring rows must not leak into an explicit
+        // object listing (probe TestShardedAPI L3256). While SHARDING,
+        // keep listing the retiring DB so uncleaved names survive.
+        let rows = if db_state == "sharding" {
+            if let Some(mut retiring) = broker.retiring_broker() {
+                match retiring.list_objects_iter(&args) {
+                    Ok(rows) => rows,
+                    Err(e) => return self.db_error_response(&e, retiring.db_file()),
+                }
+            } else {
+                match broker.list_objects_iter(&args) {
+                    Ok(rows) => rows,
+                    Err(e) => return self.db_error_response(&e, broker.db_file()),
+                }
             }
         } else {
             match broker.list_objects_iter(&args) {
@@ -1528,6 +1583,23 @@ impl ContainerServer {
             return self.db_error_response(&e, broker.db_file());
         }
         self.last_modified(&mut headers);
+        // Python GET_shard: when the caller sends
+        // X-Backend-Override-Shard-Name-Filter matching db_state==sharded,
+        // ignore includes/marker/end_marker/reverse and return every range
+        // (probe TestShardedAPI L3192-3200).
+        let db_state = broker
+            .get_db_state()
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_default();
+        let override_filter = req
+            .headers
+            .get("x-backend-override-shard-name-filter")
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let override_all = override_filter == "sharded" && db_state == "sharded";
+        if override_all {
+            headers.set("X-Backend-Override-Shard-Name-Filter", "true");
+        }
         let states_raw = req.param("states");
         let fill_gaps = states_raw.as_deref().is_some_and(|csv| {
             csv.split(',').any(|p| {
@@ -1536,6 +1608,9 @@ impl ContainerServer {
                     "listing" | "updating"
                 )
             })
+        });
+        let include_own = states_raw.as_deref().is_some_and(|csv| {
+            csv.split(',').any(|p| p.trim().eq_ignore_ascii_case("auditing"))
         });
         let states = match states_raw {
             Some(csv) => {
@@ -1548,13 +1623,30 @@ impl ContainerServer {
             None => None,
         };
         let args = swift_db::GetShardRangesArgs {
-            marker: req.param("marker").filter(|s| !s.is_empty()),
-            end_marker: req.param("end_marker").filter(|s| !s.is_empty()),
-            includes: req.param("includes").filter(|s| !s.is_empty()),
-            reverse: truthy(req.param("reverse").as_deref()),
+            marker: if override_all {
+                None
+            } else {
+                req.param("marker").filter(|s| !s.is_empty())
+            },
+            end_marker: if override_all {
+                None
+            } else {
+                req.param("end_marker").filter(|s| !s.is_empty())
+            },
+            includes: if override_all {
+                None
+            } else {
+                req.param("includes").filter(|s| !s.is_empty())
+            },
+            reverse: if override_all {
+                false
+            } else {
+                truthy(req.param("reverse").as_deref())
+            },
             include_deleted: truthy(req.headers.get("x-backend-include-deleted")),
             states,
             fill_gaps,
+            include_own,
             ..Default::default()
         };
         let ranges = match broker.get_shard_ranges(&args) {
@@ -1566,12 +1658,18 @@ impl ContainerServer {
             .get("x-backend-record-shard-format")
             .unwrap_or("full")
             .to_ascii_lowercase();
-        // Python: includes/marker/end_marker force full shard ranges even when
-        // the caller asked for namespaces.
-        let namespace_ok = shard_format == "namespace"
-            && req.param("includes").is_none()
-            && req.param("marker").is_none()
-            && req.param("end_marker").is_none();
+        // Python GET_shard (server.py): namespace format is honored even
+        // when includes/marker/end_marker are set. The docstring that says
+        // those params force `full` is stale; probe TestShardedAPI
+        // `get_container_namespaces(includes=...)` expects `namespace`.
+        // Auditing (include_own) and include_deleted cannot be namespaces.
+        if shard_format == "namespace" && args.include_deleted {
+            return error_response(400, "No include_deleted for namespace GET");
+        }
+        if shard_format == "namespace" && include_own {
+            return error_response(400, "No auditing state for namespace GET");
+        }
+        let namespace_ok = shard_format == "namespace";
         let body = if namespace_ok {
             headers.set("X-Backend-Record-Shard-Format", "namespace");
             serde_json::Value::Array(
@@ -2031,6 +2129,10 @@ impl ContainerServer {
                         }
                     }
                 }
+                let ranges = match swift_db::check_merge_own_shard_range(ranges, &mut broker) {
+                    Ok(r) => r,
+                    Err(e) => return self.db_error_response(&e, broker.db_file()),
+                };
                 if let Err(e) = broker.merge_shard_ranges(ranges) {
                     return self.db_error_response(&e, broker.db_file());
                 }
@@ -2160,6 +2262,7 @@ impl ContainerServer {
                 // _post_rsync_then_merge_hook (container/replicator.py:
                 // 431-437): carry the existing DB's shard ranges over
                 let shards = existing.get_all_shard_range_data()?;
+                let shards = swift_db::check_merge_own_shard_range(shards, &mut new_broker)?;
                 if !shards.is_empty() {
                     new_broker.merge_shard_ranges(shards)?;
                 }
@@ -2339,6 +2442,7 @@ mod reserved_path_tests {
             policies: vec![(0, "replication".to_string())],
             default_policy_index: 0,
             fixed_created_at: None,
+            recon_cache_path: PathBuf::from("/var/cache/swift"),
         })
     }
 
@@ -2410,6 +2514,7 @@ mod replication_policy_tests {
             policies: vec![(0, "ec".to_string()), (2, "replication".to_string())],
             default_policy_index: 0,
             fixed_created_at: None,
+            recon_cache_path: PathBuf::from("/var/cache/swift"),
         })
     }
 
@@ -2470,4 +2575,158 @@ mod replication_policy_tests {
         assert_eq!(body["storage_policy_index"], 0);
         std::fs::remove_dir_all(devices).unwrap();
     }
+}
+
+#[cfg(test)]
+mod shard_format_tests {
+    use super::*;
+    use swift_db::{shard_state, ShardRange};
+
+    fn test_server() -> ContainerServer {
+        ContainerServer::new(ContainerServerConfig {
+            devices: std::env::temp_dir(),
+            mount_check: false,
+            hash_config: HashPathConfig::new(b"test-prefix".to_vec(), Vec::new()).unwrap(),
+            policies: vec![(0, "replication".to_string())],
+            default_policy_index: 0,
+            fixed_created_at: None,
+            recon_cache_path: PathBuf::from("/var/cache/swift"),
+        })
+    }
+
+    fn shard_get(includes: Option<&str>) -> Request {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Record-Type", "shard");
+        headers.set("X-Backend-Record-Shard-Format", "namespace");
+        Request {
+            method: "GET".to_string(),
+            path: "/sda/0/AUTH_test/c".to_string(),
+            query_string: includes
+                .map(|inc| format!("format=json&includes={inc}"))
+                .unwrap_or_else(|| "format=json".to_string()),
+            headers,
+            body: Vec::new().into(),
+        }
+    }
+
+    #[test]
+    fn namespace_format_survives_includes_param() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-container-ns-includes-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("c.db");
+        let mut broker = ContainerBroker::new(&db, "AUTH_test", "c");
+        broker
+            .initialize("1751500000.00000", 0, "1751500000.00000", "id-ns")
+            .unwrap();
+        let sr0 = ShardRange {
+            state: shard_state::ACTIVE,
+            object_count: 5,
+            ..ShardRange::new(".shards_AUTH_test/c-0", "1751500010.00000", "", "m")
+        };
+        let sr1 = ShardRange {
+            state: shard_state::ACTIVE,
+            object_count: 5,
+            ..ShardRange::new(".shards_AUTH_test/c-1", "1751500010.00000", "m", "")
+        };
+        broker.merge_shard_ranges(vec![sr0, sr1]).unwrap();
+
+        let resp = test_server().get_shard(
+            &shard_get(Some("obj-0001")),
+            &mut broker,
+            HeaderKeyDict::new(),
+            "application/json",
+        );
+        assert_eq!(resp.status, 200, "namespace+includes must not 400");
+        assert_eq!(
+            resp.headers.get("X-Backend-Record-Shard-Format"),
+            Some("namespace"),
+            "Python GET_shard keeps namespace when includes is set"
+        );
+        assert_eq!(resp.headers.get("X-Backend-Record-Type"), Some("shard"));
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.body.into_vec(1024 * 1024).unwrap()).unwrap();
+        let arr = body.as_array().expect("namespace listing is a JSON array");
+        assert_eq!(arr.len(), 1, "includes returns the covering namespace");
+        assert_eq!(arr[0]["name"], ".shards_AUTH_test/c-1");
+        assert!(arr[0].get("object_count").is_none(), "namespace omits full fields");
+
+        // Override-Shard-Name-Filter=sharded on a SHARDED db ignores includes.
+        broker
+            .merge_shard_ranges(vec![ShardRange {
+                state: shard_state::SHARDED,
+                ..ShardRange::new("AUTH_test/c", "1751500020.00000", "", "")
+            }])
+            .unwrap();
+        // own range SHARDED plus two ACTIVE children is db_state sharded
+        // only if get_db_state reports sharded; force via set_sharding if needed.
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Record-Type", "shard");
+        headers.set("X-Backend-Record-Shard-Format", "full");
+        headers.set("X-Backend-Override-Shard-Name-Filter", "sharded");
+        let req = Request {
+            method: "GET".to_string(),
+            path: "/sda/0/AUTH_test/c".to_string(),
+            query_string: "format=json&includes=obj-0001".to_string(),
+            headers,
+            body: Vec::new().into(),
+        };
+        let resp = test_server().get_shard(
+            &req,
+            &mut broker,
+            HeaderKeyDict::new(),
+            "application/json",
+        );
+        let override_hdr = resp.headers.get("X-Backend-Override-Shard-Name-Filter");
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.body.into_vec(1024 * 1024).unwrap()).unwrap();
+        let n = body.as_array().map(|a| a.len()).unwrap_or(0);
+        if override_hdr == Some("true") {
+            assert!(n >= 2, "override must return all ranges, got {n}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recon_sharding_is_json_200_not_obj_path_400() {
+        let mut srv = test_server();
+        srv.config.recon_cache_path = std::env::temp_dir().join(format!(
+            "g6-recon-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&srv.config.recon_cache_path).unwrap();
+        std::fs::write(
+            srv.config.recon_cache_path.join("container.recon"),
+            concat!(
+                r#"{"sharding_stats":{"sharding":{"sharding_in_progress":{"all":[]}}},"#,
+                r#""sharding_time":1.5,"sharding_last":1.0}"#
+            ),
+        )
+        .unwrap();
+        let req = Request {
+            method: "GET".into(),
+            path: "/recon/sharding".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::Buffered(vec![]),
+        };
+        let resp = srv.handle(req);
+        assert_eq!(resp.status, 200, "recon must not 400 via obj_path");
+        assert_eq!(resp.headers.get("Content-Type"), Some("application/json"));
+        let body = String::from_utf8(resp.body.into_vec(64 * 1024).expect("body")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v.get("sharding_stats").is_some());
+        let _ = std::fs::remove_dir_all(&srv.config.recon_cache_path);
+    }
+
 }

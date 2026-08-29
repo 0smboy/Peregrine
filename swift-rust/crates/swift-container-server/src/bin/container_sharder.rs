@@ -221,6 +221,7 @@ fn main() {
                     agg.failures += s.failures;
                     agg.replicate_errors += s.replicate_errors;
                     agg.shrinking_donors += s.shrinking_donors;
+                    agg.sharding_in_progress.extend(s.sharding_in_progress);
                 }
             }
         }

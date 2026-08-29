@@ -186,6 +186,7 @@ fn test_object_put_updates_container_server() {
         policies: vec![(0, "Policy-0".to_string())],
         default_policy_index: 0,
         fixed_created_at: None,
+        recon_cache_path: tmp.join("cache"),
     };
     std::thread::spawn(move || swift_container_server::serve(cont_listener, cont_config));
 

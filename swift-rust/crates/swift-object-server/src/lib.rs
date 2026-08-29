@@ -4407,6 +4407,11 @@ enum CuHostResult {
 /// Fire one container-server update over a fresh TCP connection, honouring
 /// `timeout` for connect + read (Python `container_update_timeout`).
 #[allow(clippy::too_many_arguments)]
+/// Python object-server `container_update` / `async_update` does **not**
+/// stamp `X-Backend-Accept-Redirect`. Only the object-updater does. Sending
+/// it here 301s sync DELETEs off a still-unsharded root (which already has
+/// CREATED shard ranges) into those shards, so `is_deleted()` stays false
+/// (probe unsharded_deleted_root L4095).
 fn sync_container_http(
     op: &str,
     host: &str,
@@ -4423,9 +4428,7 @@ fn sync_container_http(
     let mut request = format!(
         "{op} /{device}/{partition}{path} HTTP/1.1\r\nHost: {host}\r\n\
          X-Backend-Storage-Policy-Index: {policy_index}\r\n\
-         X-Backend-Allow-Reserved-Names: true\r\n\
-         X-Backend-Accept-Redirect: true\r\n\
-         X-Backend-Accept-Quoted-Location: true\r\n"
+         X-Backend-Allow-Reserved-Names: true\r\n"
     );
     for (k, v) in update.iter() {
         request.push_str(&format!("{k}: {v}\r\n"));
@@ -4673,19 +4676,41 @@ fn fanout_container_http(
             .map(|h| h.join().unwrap_or(CuHostResult::Fail))
             .collect()
     });
+    // Python object-server contacts each container replica independently.
+    // One 301 must not skip the still-unsharded root (L4095 live rows).
+    if op == "DELETE" {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/var/log/g6-rust/w254-cu.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "sync {op} hosts={hosts:?} devices={devices:?} results={results:?}"
+            );
+        }
+    }
     if results.iter().all(|r| matches!(r, CuHostResult::Ok)) {
         return true;
     }
-    if let (Some(cfg), Some(loc)) = (
-        hash_config,
-        results.iter().find_map(|r| match r {
-            CuHostResult::Redirect(s) => Some(s.as_str()),
-            _ => None,
-        }),
-    ) {
-        return follow_shard_redirect(loc, &op, update, policy_index, timeout, cfg);
+    let mut all_ok = true;
+    for r in &results {
+        match r {
+            CuHostResult::Ok => {}
+            CuHostResult::Redirect(loc) => {
+                if let Some(cfg) = hash_config {
+                    if !follow_shard_redirect(loc, &op, update, policy_index, timeout, cfg) {
+                        all_ok = false;
+                    }
+                } else {
+                    all_ok = false;
+                }
+            }
+            CuHostResult::Fail => all_ok = false,
+        }
     }
-    false
+    all_ok
 }
 
 async fn fanout_container_http_async(
@@ -4704,8 +4729,8 @@ async fn fanout_container_http_async(
     }
     let results = fanout_container_http_async_once(
         op.clone(),
-        hosts,
-        devices,
+        hosts.clone(),
+        devices.clone(),
         partition,
         path.clone(),
         update.clone(),
@@ -4713,19 +4738,48 @@ async fn fanout_container_http_async(
         timeout,
     )
     .await;
+    if op == "DELETE" {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/var/log/g6-rust/w254-cu.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "async {op} hosts={hosts:?} devices={devices:?} results={results:?}"
+            );
+        }
+    }
     if results.iter().all(|r| matches!(r, CuHostResult::Ok)) {
         return true;
     }
-    if let (Some(cfg), Some(loc)) = (
-        hash_config.as_ref(),
-        results.iter().find_map(|r| match r {
-            CuHostResult::Redirect(s) => Some(s.as_str()),
-            _ => None,
-        }),
-    ) {
-        return follow_shard_redirect_async(loc, op, update, policy_index, timeout, cfg).await;
+    let mut all_ok = true;
+    for r in &results {
+        match r {
+            CuHostResult::Ok => {}
+            CuHostResult::Redirect(loc) => {
+                if let Some(cfg) = hash_config.as_ref() {
+                    if !follow_shard_redirect_async(
+                        loc,
+                        op.clone(),
+                        update.clone(),
+                        policy_index,
+                        timeout,
+                        cfg,
+                    )
+                    .await
+                    {
+                        all_ok = false;
+                    }
+                } else {
+                    all_ok = false;
+                }
+            }
+            CuHostResult::Fail => all_ok = false,
+        }
     }
-    false
+    all_ok
 }
 
 async fn fanout_container_http_async_once(
@@ -4785,9 +4839,7 @@ async fn async_container_http(
     let mut request = format!(
         "{op} /{device}/{partition}{path} HTTP/1.1\r\nHost: {host}\r\n\
          X-Backend-Storage-Policy-Index: {policy_index}\r\n\
-         X-Backend-Allow-Reserved-Names: true\r\n\
-         X-Backend-Accept-Redirect: true\r\n\
-         X-Backend-Accept-Quoted-Location: true\r\n"
+         X-Backend-Allow-Reserved-Names: true\r\n"
     );
     for (k, v) in update.iter() {
         request.push_str(&format!("{k}: {v}\r\n"));
@@ -5826,6 +5878,103 @@ mod fallocate_reserve_tests {
             }
             _ => panic!("expected Redirect, got {got:?}"),
         }
+    }
+
+    #[test]
+    fn sync_container_http_omits_accept_redirect() {
+        // Python object-server never stamps Accept-Redirect on the sync
+        // path. Only the updater does. W254 / L4095.
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = stream.write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                req
+            } else {
+                String::new()
+            }
+        });
+        let got = sync_container_http(
+            "DELETE",
+            &addr.to_string(),
+            "sda1",
+            "7",
+            "/AUTH_test/c/obj-0001",
+            &HeaderKeyDict::new(),
+            0,
+            std::time::Duration::from_secs(2),
+        );
+        let req = handle.join().expect("listener thread");
+        assert!(
+            matches!(got, CuHostResult::Ok),
+            "expected Ok, got {got:?}; req={req:?}"
+        );
+        let lower = req.to_ascii_lowercase();
+        assert!(
+            !lower.contains("x-backend-accept-redirect"),
+            "object-server sync must not stamp Accept-Redirect, got {req:?}"
+        );
+        assert!(
+            !lower.contains("x-backend-accept-quoted-location"),
+            "object-server sync must not stamp Accept-Quoted-Location, got {req:?}"
+        );
+        assert!(
+            lower.contains("x-backend-allow-reserved-names"),
+            "reserved-names header stays, got {req:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_container_http_omits_accept_redirect() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = stream.write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                req
+            } else {
+                String::new()
+            }
+        });
+        let got = async_container_http(
+            "DELETE",
+            &addr.to_string(),
+            "sda1",
+            "7",
+            "/AUTH_test/c/obj-0001",
+            &HeaderKeyDict::new(),
+            0,
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        let req = handle.join().expect("listener thread");
+        assert!(
+            matches!(got, CuHostResult::Ok),
+            "expected Ok, got {got:?}; req={req:?}"
+        );
+        let lower = req.to_ascii_lowercase();
+        assert!(
+            !lower.contains("x-backend-accept-redirect"),
+            "object-server async must not stamp Accept-Redirect, got {req:?}"
+        );
+        assert!(
+            !lower.contains("x-backend-accept-quoted-location"),
+            "object-server async must not stamp Accept-Quoted-Location, got {req:?}"
+        );
     }
 
     #[tokio::test]
