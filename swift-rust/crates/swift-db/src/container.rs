@@ -852,6 +852,10 @@ impl ContainerBroker {
             ctype_timestamp: None,
             meta_timestamp: None,
         };
+        // Pending PUTs must be merged before the tombstone. Otherwise a
+        // later read commits the stale pending record after this DELETE and
+        // resurrects the object.
+        self.commit_pending()?;
         self.merge_items(vec![record])
     }
 
@@ -2047,8 +2051,6 @@ mod tests {
         assert_eq!(oc, Some(200), "{info:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
-
-    #[test]
 
     #[test]
     fn test_get_db_state_acceptor_without_own_epoch_is_collapsed() {
