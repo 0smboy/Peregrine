@@ -775,6 +775,16 @@ fn peer_supports_shard_ranges(remote_info: &serde_json::Value, remote_state: &st
         || remote_state == "sharded"
 }
 
+/// Python defers object replication only after this broker has initiated
+/// sharding. Rust also needs to protect a newly-created *handoff* that has
+/// learned shard ranges before its own range reflects that transition. That
+/// exception must stay handoff-scoped: an under-populated primary can already
+/// have shard ranges and still needs object usync before it cleaves.
+fn defer_object_usync(local: &mut ContainerBroker, local_is_handoff: bool) -> bool {
+    local.sharding_initiated().unwrap_or(false)
+        || (local_is_handoff && local.has_other_shard_ranges().unwrap_or(false))
+}
+
 /// Like [`replicate_container_db`], but `local_is_handoff` lets an empty
 /// handoff synthesize tombstones onto a leftover primary (probe L1435).
 pub fn replicate_container_db_role(
@@ -922,13 +932,13 @@ pub fn replicate_container_db_role(
     // (`get_objects()` on the epoch file stays empty). Python's small-db
     // path usyncs; aborting rsync_then_merge is not enough when
     // `max_row < per_diff`.
-    if local.sharding_initiated().unwrap_or(false)
-        || local.has_other_shard_ranges().unwrap_or(false)
-    {
-        // Python `_choose_replication_mode`: once the handoff has learned
-        // shard ranges it waits for cleaving instead of rsync_then_merge
-        // (probe L2964: new primary stays at 0 objects).
-        eprintln!("db-replicator: skip object usync (local shard ranges) hsh={hsh}");
+    if defer_object_usync(local, local_is_handoff) {
+        // A handoff that has learned ranges waits for cleaving instead of
+        // rsync_then_merge (probe L2964). Primaries are deliberately excluded
+        // from that compatibility exception (listing probe L1517).
+        eprintln!(
+            "db-replicator: skip object usync (local sharding) hsh={hsh} handoff={local_is_handoff}"
+        );
         return Ok(ReplicateOutcome {
             diffs: 0,
             rows_pushed: 0,
@@ -1608,7 +1618,7 @@ mod tests {
     }
 
     #[test]
-    fn test_skip_object_usync_when_local_has_shard_ranges() {
+    fn test_skip_object_usync_when_handoff_has_shard_ranges() {
         // A fresh handoff may still report UNSHARDED after ranges replicate
         // into it. It must not accept object rows before the sharder cleaves.
         let dir = std::env::temp_dir().join(format!(
@@ -1645,6 +1655,12 @@ mod tests {
         broker.merge_shard_ranges(vec![shard]).unwrap();
         assert!(broker.has_other_shard_ranges().unwrap());
 
+        assert!(
+            !defer_object_usync(&mut broker, false),
+            "a primary with ranges must still receive missing object rows"
+        );
+        assert!(defer_object_usync(&mut broker, true));
+
         let body = serde_json::json!({
             "point": -1,
             "id": "peer-id",
@@ -1655,13 +1671,14 @@ mod tests {
         })
         .to_string();
         let (addr, handle) = spawn_fake_peer(body);
-        let outcome = replicate_container_db(
+        let outcome = replicate_container_db_role(
             &mut broker,
             "local-id",
             &addr.to_string(),
             "sdb",
             "0",
             "hash",
+            true,
         )
         .unwrap();
         handle.join().unwrap();
