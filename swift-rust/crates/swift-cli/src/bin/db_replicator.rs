@@ -42,7 +42,7 @@ use swift_core::statsd::StatsdClient;
 use swift_core::timestamp::{decode_timestamps, Timestamp};
 use swift_db::{
     replicate_account_db, replicate_completion_rpc, replicate_container_db_role,
-    replicator_run_once as run_once, rsync_db, rsync_would_recreate_retiring, AccountBroker,
+    replicator_run_once as run_once, rsync_db, AccountBroker,
     ContainerBroker, DbError, DbPartition, DbReplicateClient, DbState, DbValue, ObjectRecord,
     RsyncTransport,
 };
@@ -433,59 +433,36 @@ impl DbReplicateClient for DbClient {
                     // peer's tmp dir and have it adopted (complete_rsync,
                     // db_replicator.py:553-557)
                     Ok(outcome) if outcome.needs_rsync => {
-                        if rsync_would_recreate_retiring(&db.path) {
-                            // complete_rsync dest is always <hsh>.db. Do not
-                            // stage an epoch file under that name (probe L1347).
-                            // Still push shard-range rows so nested UPDATE_ROOT
-                            // that missed a down replica is repaired (L1306).
-                            let _ = swift_db::sync_shard_ranges_to_peer(
-                                &mut broker,
-                                &local_id,
-                                &peer_host,
-                                &peer.device,
-                                &partition,
-                                &db.hash,
-                            );
-                            true
-                        } else {
-                            rsync_db(
-                                &db.path,
-                                &local_id,
-                                &peer_host,
-                                &peer.device,
-                                &partition,
-                                &db.hash,
-                                "complete_rsync",
-                                &self.rsync,
-                            )
-                        }
+                        // `rsync_db` preserves an epoch suffix in the
+                        // completion destination. The older guard assumed
+                        // every destination was `<hash>.db`; keeping it here
+                        // suppresses the only whole-DB transfer to an empty
+                        // new primary.
+                        rsync_db(
+                            &db.path,
+                            &local_id,
+                            &peer_host,
+                            &peer.device,
+                            &partition,
+                            &db.hash,
+                            "complete_rsync",
+                            &self.rsync,
+                        )
                     }
                     // usync can't converge the peer: stage the DB and have
                     // the peer merge its own rows into it before adopting
                     // (rsync_then_merge, db_replicator.py:579-591)
                     Ok(outcome) if outcome.usync_incomplete => {
-                        if rsync_would_recreate_retiring(&db.path) {
-                            let _ = swift_db::sync_shard_ranges_to_peer(
-                                &mut broker,
-                                &local_id,
-                                &peer_host,
-                                &peer.device,
-                                &partition,
-                                &db.hash,
-                            );
-                            true
-                        } else {
-                            rsync_db(
-                                &db.path,
-                                &local_id,
-                                &peer_host,
-                                &peer.device,
-                                &partition,
-                                &db.hash,
-                                "rsync_then_merge",
-                                &self.rsync,
-                            )
-                        }
+                        rsync_db(
+                            &db.path,
+                            &local_id,
+                            &peer_host,
+                            &peer.device,
+                            &partition,
+                            &db.hash,
+                            "rsync_then_merge",
+                            &self.rsync,
+                        )
                     }
                     Ok(_) => true,
                     Err(e) => {
