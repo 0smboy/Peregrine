@@ -752,6 +752,16 @@ pub fn replicate_container_db(
     )
 }
 
+fn peer_supports_shard_ranges(remote_info: &serde_json::Value, remote_state: &str) -> bool {
+    // Python `_choose_replication_mode` treats the presence of
+    // `shard_max_row` as the capability signal, including -1 on a fresh
+    // unsharded peer. Requiring a non-negative value suppresses the initial
+    // shard-range push to an empty new primary.
+    remote_info.get("shard_max_row").is_some()
+        || remote_state == "sharding"
+        || remote_state == "sharded"
+}
+
 /// Like [`replicate_container_db`], but `local_is_handoff` lets an empty
 /// handoff synthesize tombstones onto a leftover primary (probe L1435).
 pub fn replicate_container_db_role(
@@ -871,19 +881,15 @@ pub fn replicate_container_db_role(
     }
     point = new_point;
 
-    // Python `_handle_sync_response`: pull remote shard ranges when
-    // `shard_max_row >= 0`. Also pull when the peer is already
-    // sharding/sharded (probe L2321: third replica must copy ranges, not
-    // object rows). Then push ours (`_sync_shard_ranges`).
+    // Python `_handle_sync_response`: the presence of `shard_max_row`
+    // advertises shard-range support, including -1 on a fresh peer. Also
+    // synchronize when the peer is already sharding/sharded (probe L2321:
+    // third replica must copy ranges, not object rows).
     let remote_state = remote_info
         .get("db_state")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let shard_max_row = remote_info
-        .get("shard_max_row")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(-1);
-    if shard_max_row >= 0 || remote_state == "sharding" || remote_state == "sharded" {
+    if peer_supports_shard_ranges(&remote_info, remote_state) {
         if let Err(e) =
             fetch_and_merge_remote_shard_ranges(local, peer_host, peer_device, partition, hsh)
         {
@@ -1242,6 +1248,20 @@ pub fn replicate_account_db(
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn fresh_peer_with_negative_shard_max_row_supports_shard_ranges() {
+        let fresh = serde_json::json!({"shard_max_row": -1});
+        assert!(peer_supports_shard_ranges(&fresh, "unsharded"));
+        assert!(peer_supports_shard_ranges(
+            &serde_json::json!({}),
+            "sharding"
+        ));
+        assert!(!peer_supports_shard_ranges(
+            &serde_json::json!({}),
+            "unsharded"
+        ));
+    }
 
     struct FakeRsync {
         /// (peer host, stage name) of every staging attempt.
