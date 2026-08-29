@@ -365,6 +365,22 @@ impl InfoCache {
         self.memcache_set_container(&mkey, &info, ttl_secs);
     }
 
+    /// Refresh only the root database state in an existing positive cache
+    /// entry. A sharded listing may prove the state changed while the rest of
+    /// the cached container metadata is still valid. Keeping this operation
+    /// field-scoped avoids making listing/HEAD consume stale whole entries.
+    fn set_container_db_state(&self, key: &str, state: &str, ttl_secs: f64) -> bool {
+        let Some(mut info) = self.get_container(key) else {
+            return false;
+        };
+        if !info.exists() {
+            return false;
+        }
+        info.db_state = state.to_string();
+        self.set_container(key.to_string(), info, ttl_secs);
+        true
+    }
+
     /// `clear_info_cache` for one container (base.py:732-744).
     fn clear_container(&self, key: &str) {
         self.containers.lock().unwrap().remove(key);
@@ -3685,6 +3701,53 @@ impl ProxyApp {
         }
     }
 
+    /// Record a database state proved by the root listing path without
+    /// replacing unrelated cached metadata. This is the fast-sharding case:
+    /// Rust can complete a probe cycle before the ordinary 60-second
+    /// container-info TTL expires, so the initial `unsharded` value would
+    /// otherwise be stamped into async_pending files after the container
+    /// nodes are deliberately stopped.
+    fn remember_proven_container_db_state(
+        &self,
+        account: &str,
+        container: &str,
+        resp: &Response,
+        state: &str,
+    ) {
+        let cache_key = format!("{account}/{container}");
+        if self.info_cache.set_container_db_state(
+            &cache_key,
+            state,
+            self.config.recheck_container_existence,
+        ) {
+            return;
+        }
+
+        let mut info = ContainerInfo {
+            status: 0,
+            policy_index: self.config.default_policy_index,
+            read_acl: None,
+            write_acl: None,
+            temp_url_keys: Vec::new(),
+            sync_key: None,
+            rfc_compliant_etags: None,
+            cors: CorsInfo::default(),
+            db_state: state.to_string(),
+        };
+        fill_container_info_from_head(&mut info, resp);
+        if !info.exists() {
+            return;
+        }
+        info.db_state = state.to_string();
+        if let Some(ttl) = info_cache_time(
+            resp.status,
+            resp.headers.get("X-Backend-Recheck-Container-Existence"),
+            self.config.recheck_container_existence,
+        ) {
+            self.info_cache.set_container(cache_key, info, ttl);
+        }
+    }
+
     /// `get_container_info`-lite (base.py:430-538): the container's
     /// storage-policy index plus its read/write ACLs and Temp-URL keys.
     /// Served from the in-process info cache when fresh; a miss does a live
@@ -3945,6 +4008,9 @@ impl ProxyApp {
         // Marker windows may select 1–2 ranges; settled-ness is a property of
         // the whole container (probe L692 reverse+limit).
         let all_ranges: Vec<&serde_json::Value> = arr.iter().collect();
+        if state == "sharded" || listing_ranges_prove_sharded(&all_ranges) {
+            self.remember_proven_container_db_state(account, container, &head, "sharded");
+        }
         let empty_wins = listing_ranges_are_settled_active(&all_ranges);
         let mut feeds: Vec<ListingFeed> = Vec::new();
         // Residual root rows cover uncleaved namespace while SHARDING
@@ -7014,6 +7080,43 @@ pub(crate) fn listing_ranges_are_settled_active(selected: &[&serde_json::Value])
     }) && !selected.iter().any(|sr| json_range_is_nested(sr, selected))
 }
 
+/// Strong proof that ACTIVE shard ranges form one gap-free MIN-to-MAX
+/// namespace partition. Unlike `listing_ranges_are_settled_active`, this does
+/// not accept SHRINKING ranges; it is safe to use as evidence that object
+/// updates should carry root `db_state=sharded`.
+pub(crate) fn listing_ranges_prove_sharded(selected: &[&serde_json::Value]) -> bool {
+    if selected.is_empty() {
+        return false;
+    }
+    let mut bounds = Vec::with_capacity(selected.len());
+    for sr in selected {
+        if sr.get("state").and_then(|v| v.as_i64()) != Some(40)
+            || sr.get("deleted").and_then(|v| v.as_i64()).unwrap_or(0) != 0
+        {
+            return false;
+        }
+        bounds.push((
+            sr.get("lower")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            sr.get("upper")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        ));
+    }
+    bounds.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    if !bounds.first().is_some_and(|(lower, _)| lower.is_empty())
+        || !bounds.last().is_some_and(|(_, upper)| upper.is_empty())
+    {
+        return false;
+    }
+    bounds
+        .windows(2)
+        .all(|pair| !pair[0].1.is_empty() && pair[0].1 == pair[1].0)
+}
+
 /// Fold per-replica object-listing replies.
 ///
 /// `None` is 404/timeout (not empty). `Some([])` is a successful 200 [].
@@ -8573,6 +8676,35 @@ mod info_cache_tests {
     }
 
     #[test]
+    fn proven_listing_state_refreshes_only_cached_db_state() {
+        let app = ProxyApp::new(
+            super::policy_ring_tests::ring(0),
+            super::policy_ring_tests::ring(0),
+            ProxyConfig::default(),
+        );
+        let mut cached = info(7);
+        cached.db_state = "unsharded".to_string();
+        app.info_cache
+            .set_container("AUTH_test/c".to_string(), cached, 60.0);
+        let mut head = Response::new(204);
+        head.headers
+            .set("X-Backend-Storage-Policy-Index", "7");
+        head.headers.set("X-Backend-Sharding-State", "sharded");
+        app.remember_proven_container_db_state("AUTH_test", "c", &head, "sharded");
+        let refreshed = app.info_cache.get_container("AUTH_test/c").unwrap();
+        assert_eq!(refreshed.db_state, "sharded");
+        assert_eq!(refreshed.policy_index, 7);
+        assert_eq!(refreshed.read_acl.as_deref(), Some("r"));
+        let mut headers = HeaderKeyDict::new();
+        app.stamp_root_db_state("AUTH_test", "c", &mut headers);
+        assert_eq!(
+            headers.get("X-Container-Root-Db-State"),
+            Some("sharded"),
+            "object PUT must use the listing-proven state"
+        );
+    }
+
+    #[test]
     fn test_container_hit_expiry_and_clear() {
         let cache = InfoCache::new();
         assert!(cache.get_container("a/c").is_none());
@@ -10100,8 +10232,9 @@ mod shard_listing_fanout_tests {
         copy_root_listing_headers, fold_replica_listings, fold_replica_listings_dated,
         include_root_residual_for_listing, include_root_residual_for_listing_ex,
         include_sharding_residual_root, include_shrink_to_root_residual, json_range_is_nested,
-        listing_has_full_active_cover, listing_ranges_are_settled_active, listing_resp_timestamp,
-        lowest_shard_usage, merge_listings_newest_covering, merge_sharded_object_listings,
+        listing_has_full_active_cover, listing_ranges_are_settled_active,
+        listing_ranges_prove_sharded, listing_resp_timestamp, lowest_shard_usage,
+        merge_listings_newest_covering, merge_sharded_object_listings,
         merge_sharded_object_listings_dir, pick_updating_shard_name,
         prefer_listing_state_ranges, prefer_longest_nonempty_arrays,
         prefer_most_progressed_listing_arrays, prefer_quorum_consistent_listing_arrays,
@@ -11105,18 +11238,24 @@ mod shard_listing_fanout_tests {
         let b = sr_state(".shards/b", "m", "", 40);
         // probe test_shrinking L1925: two ACTIVE first-gen shards.
         assert!(listing_ranges_are_settled_active(&[&a, &b]));
+        assert!(listing_ranges_prove_sharded(&[&b, &a]));
         let r0 = sr_state(".shards/r0", "", "g", 40);
         let r1 = sr_state(".shards/r1", "g", "m", 40);
         let r2 = sr_state(".shards/r2", "m", "t", 40);
         let r3 = sr_state(".shards/r3", "t", "", 40);
         assert!(listing_ranges_are_settled_active(&[&r0, &r1, &r2, &r3]));
+        assert!(listing_ranges_prove_sharded(&[&r0, &r1, &r2, &r3]));
         let cleaved = sr_state(".shards/cl", "", "g", 30);
         assert!(!listing_ranges_are_settled_active(&[
+            &cleaved, &r1, &r2, &r3
+        ]));
+        assert!(!listing_ranges_prove_sharded(&[
             &cleaved, &r1, &r2, &r3
         ]));
         // Probe L2068: last remaining shard shrinking into root.
         let shrinking = sr_state(".shards/last", "", "", 50);
         assert!(listing_ranges_are_settled_active(&[&shrinking]));
+        assert!(!listing_ranges_prove_sharded(&[&shrinking]));
         let shrinking_lo = sr_state(".shards/d0", "", "m", 50);
         let acc = sr_state(".shards/a0", "", "", 40);
         assert!(
@@ -11134,7 +11273,11 @@ mod shard_listing_fanout_tests {
         assert!(!listing_ranges_are_settled_active(&[
             &donor, &sub0, &sub1, &r3
         ]));
+        assert!(!listing_ranges_prove_sharded(&[
+            &donor, &sub0, &sub1, &r3
+        ]));
         assert!(!listing_ranges_are_settled_active(&[]));
+        assert!(!listing_ranges_prove_sharded(&[]));
     }
 
     #[test]

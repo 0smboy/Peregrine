@@ -2942,6 +2942,9 @@ impl ProxyApp {
         let selected =
             super::select_listing_shard_ranges(&arr, &marker, &end_marker, &prefix, reverse);
         let all_ranges: Vec<&serde_json::Value> = arr.iter().collect();
+        if state == "sharded" || super::listing_ranges_prove_sharded(&all_ranges) {
+            self.remember_proven_container_db_state(account, container, &head, "sharded");
+        }
         let empty_wins = super::listing_ranges_are_settled_active(&all_ranges);
         let mut feeds: Vec<super::ListingFeed> = Vec::new();
         let newest = req
