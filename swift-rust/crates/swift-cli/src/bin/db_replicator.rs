@@ -145,7 +145,17 @@ impl DbRsync {
         let rel = format!("{peer_device}/tmp/{stage_name}");
         match &self.dest {
             DbRsyncDest::Local { peer_map, port_of } => {
-                let port = port_of.get(peer_host).copied()?;
+                // Probe/SAIO rings bind 127.0.0.1:16211,
+                // 127.0.0.2:16221, and so on. `port_of` is keyed by the
+                // local listener address, so an exact lookup can miss a
+                // primary whose ring host uses another loopback address.
+                // The port uniquely identifies that local server root.
+                let port = port_of.get(peer_host).copied().or_else(|| {
+                    peer_host
+                        .rsplit_once(':')
+                        .and_then(|(_, port)| port.parse().ok())
+                        .filter(|port| peer_map.contains_key(port))
+                })?;
                 let root = peer_map.get(&port)?;
                 Some((format!("{}/{rel}", root.display()), None))
             }
@@ -919,6 +929,30 @@ mod tests {
         assert!(ssh.is_none());
         // a peer missing from the map has no destination
         assert!(rsync.rsync_dest("127.0.0.1:9999", "sdb1", "x").is_none());
+    }
+
+    #[test]
+    fn test_rsync_dest_local_matches_ring_ip_by_port() {
+        let peer_map: HashMap<u32, PathBuf> = [
+            (16211u32, PathBuf::from("/srv/1/node")),
+            (16231u32, PathBuf::from("/srv/3/node")),
+        ]
+        .into_iter()
+        .collect();
+        let rsync = DbRsync {
+            dest: DbRsyncDest::Local {
+                peer_map,
+                port_of: HashMap::new(),
+            },
+        };
+        let (dest, ssh) = rsync
+            .rsync_dest("127.0.0.3:16231", "sdb3", "handoff-id")
+            .unwrap();
+        assert_eq!(dest, "/srv/3/node/sdb3/tmp/handoff-id");
+        assert!(ssh.is_none());
+        assert!(rsync
+            .rsync_dest("127.0.0.2:16221", "sdb2", "x")
+            .is_none());
     }
 
     #[test]
