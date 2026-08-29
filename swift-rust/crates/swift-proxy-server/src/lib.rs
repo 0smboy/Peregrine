@@ -3706,46 +3706,20 @@ impl ProxyApp {
     /// Rust can complete a probe cycle before the ordinary 60-second
     /// container-info TTL expires, so the initial `unsharded` value would
     /// otherwise be stamped into async_pending files after the container
-    /// nodes are deliberately stopped.
+    /// nodes are deliberately stopped. A listing cannot safely infer policy
+    /// or ACL metadata, so a cache miss is deliberately left untouched.
     fn remember_proven_container_db_state(
         &self,
         account: &str,
         container: &str,
-        resp: &Response,
         state: &str,
     ) {
         let cache_key = format!("{account}/{container}");
-        if self.info_cache.set_container_db_state(
+        self.info_cache.set_container_db_state(
             &cache_key,
             state,
             self.config.recheck_container_existence,
-        ) {
-            return;
-        }
-
-        let mut info = ContainerInfo {
-            status: 0,
-            policy_index: self.config.default_policy_index,
-            read_acl: None,
-            write_acl: None,
-            temp_url_keys: Vec::new(),
-            sync_key: None,
-            rfc_compliant_etags: None,
-            cors: CorsInfo::default(),
-            db_state: state.to_string(),
-        };
-        fill_container_info_from_head(&mut info, resp);
-        if !info.exists() {
-            return;
-        }
-        info.db_state = state.to_string();
-        if let Some(ttl) = info_cache_time(
-            resp.status,
-            resp.headers.get("X-Backend-Recheck-Container-Existence"),
-            self.config.recheck_container_existence,
-        ) {
-            self.info_cache.set_container(cache_key, info, ttl);
-        }
+        );
     }
 
     /// `get_container_info`-lite (base.py:430-538): the container's
@@ -4009,7 +3983,7 @@ impl ProxyApp {
         // the whole container (probe L692 reverse+limit).
         let all_ranges: Vec<&serde_json::Value> = arr.iter().collect();
         if state == "sharded" || listing_ranges_prove_sharded(&all_ranges) {
-            self.remember_proven_container_db_state(account, container, &head, "sharded");
+            self.remember_proven_container_db_state(account, container, "sharded");
         }
         let empty_wins = listing_ranges_are_settled_active(&all_ranges);
         let mut feeds: Vec<ListingFeed> = Vec::new();
@@ -8686,11 +8660,7 @@ mod info_cache_tests {
         cached.db_state = "unsharded".to_string();
         app.info_cache
             .set_container("AUTH_test/c".to_string(), cached, 60.0);
-        let mut head = Response::new(204);
-        head.headers
-            .set("X-Backend-Storage-Policy-Index", "7");
-        head.headers.set("X-Backend-Sharding-State", "sharded");
-        app.remember_proven_container_db_state("AUTH_test", "c", &head, "sharded");
+        app.remember_proven_container_db_state("AUTH_test", "c", "sharded");
         let refreshed = app.info_cache.get_container("AUTH_test/c").unwrap();
         assert_eq!(refreshed.db_state, "sharded");
         assert_eq!(refreshed.policy_index, 7);
@@ -8701,6 +8671,20 @@ mod info_cache_tests {
             headers.get("X-Container-Root-Db-State"),
             Some("sharded"),
             "object PUT must use the listing-proven state"
+        );
+    }
+
+    #[test]
+    fn proven_listing_state_does_not_synthesize_container_metadata() {
+        let app = ProxyApp::new(
+            super::policy_ring_tests::ring(0),
+            super::policy_ring_tests::ring(0),
+            ProxyConfig::default(),
+        );
+        app.remember_proven_container_db_state("AUTH_test", "c", "sharded");
+        assert!(
+            app.info_cache.get_container("AUTH_test/c").is_none(),
+            "a shard listing cannot safely infer policy or ACL metadata"
         );
     }
 
