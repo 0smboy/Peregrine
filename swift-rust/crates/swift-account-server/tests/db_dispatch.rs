@@ -5,7 +5,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,10 +15,11 @@ use swift_core::hashing::HashPathConfig;
 use swift_http::{AsyncRequest, HeaderKeyDict, IncomingBody, Request, ServerConfig};
 
 fn tmpdir() -> PathBuf {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "acct-dispatch-{}-{}",
+        "acct-dispatch-{}-{id}",
         std::process::id(),
-        line!()
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("sda1")).unwrap();
