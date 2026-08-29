@@ -1991,6 +1991,57 @@ mod tests {
     }
 
     #[test]
+    fn test_sharding_required_while_sharding() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharding-required-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut broker = shard_broker(&dir, 0);
+        assert!(!broker.sharding_required().unwrap());
+        let epoch = "1751500099.00000";
+        broker.enable_sharding(epoch).unwrap();
+        let mut first = crate::shard::ShardRange::new(".shards_AUTH_test/c-0", epoch, "", "m");
+        first.state = crate::shard::state::ACTIVE;
+        let mut second = crate::shard::ShardRange::new(".shards_AUTH_test/c-1", epoch, "m", "");
+        second.state = crate::shard::state::ACTIVE;
+        broker.merge_shard_ranges(vec![first, second]).unwrap();
+        assert!(broker.set_sharding_state().unwrap());
+        assert_eq!(broker.get_db_state().unwrap(), DbState::Sharding);
+        assert!(broker.sharding_required().unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_sharding_required_after_ranges_replicate_to_unsharded_handoff() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharding-required-unsharded-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut broker = shard_broker(&dir, 4);
+        let epoch = "1751500099.00000";
+        let mut own = broker.get_own_shard_range(false).unwrap().unwrap();
+        own.state = crate::shard::state::SHARDED;
+        own.epoch = Some(epoch.to_string());
+        let mut first = crate::shard::ShardRange::new(".shards_AUTH_test/c-0", epoch, "", "m");
+        first.state = crate::shard::state::ACTIVE;
+        let mut second = crate::shard::ShardRange::new(".shards_AUTH_test/c-1", epoch, "m", "");
+        second.state = crate::shard::state::ACTIVE;
+        broker.merge_shard_ranges(vec![own, first, second]).unwrap();
+        assert_eq!(broker.get_db_state().unwrap(), DbState::Unsharded);
+        assert!(broker.sharding_required().unwrap());
+
+        // REPLICATE opens by hash and initially has no path-derived account
+        // or container. The predicate must still hydrate the own range.
+        let path = broker.db_file().to_path_buf();
+        let mut blind = ContainerBroker::new(&path, "", "");
+        assert_eq!(blind.get_db_state().unwrap(), DbState::Unsharded);
+        assert!(blind.sharding_required().unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn test_empty_uses_shard_usage_on_sharded_root() {
         // Probe test_sharded_delete: Python DELETE 409s while shards still
         // hold objects. policy_stat on the SHARDED root is 0.
@@ -3091,6 +3142,19 @@ impl ContainerBroker {
             self.has_other_shard_ranges()
         } else {
             Ok(false)
+        }
+    }
+
+    /// Python `ContainerReplicator.cleanup_post_replicate`: a handoff must
+    /// remain on disk while it is SHARDING, or while an UNSHARDED copy has
+    /// learned shard ranges and still needs the sharder to cleave them.
+    pub fn sharding_required(&mut self) -> Result<bool, DbError> {
+        match self.get_db_state()? {
+            DbState::Sharding => Ok(true),
+            DbState::Unsharded => {
+                Ok(self.sharding_initiated()? || self.has_other_shard_ranges()?)
+            }
+            _ => Ok(false),
         }
     }
 

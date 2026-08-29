@@ -136,6 +136,12 @@ pub trait DbReplicateClient {
         let _ = db;
         None
     }
+    /// Container handoffs that still require sharding must survive a
+    /// successful replication pass so the sharder can finish cleaving.
+    fn keep_handoff(&self, db: &DbPartition) -> bool {
+        let _ = db;
+        false
+    }
 }
 
 /// True when `local_id` is not a primary for `partition` (a handoff copy).
@@ -236,7 +242,12 @@ pub fn run_once(
             // 50 each → HEAD 150 at probe L1435.
             if target.is_handoff && !responses.is_empty() && responses.iter().all(|&ok| ok) {
                 let delta = client.db_max_row(&db) - orig_max_row;
-                if delta == 0 {
+                if client.keep_handoff(&db) {
+                    eprintln!(
+                        "db-replicator: keep handoff hsh={} (requires sharding)",
+                        db.hash
+                    );
+                } else if delta == 0 {
                     eprintln!(
                         "db-replicator: deleted handoff hsh={} disk_part={} ring_part={} wrong_part={wrong_part}",
                         db.hash, db.partition, target.partition
@@ -433,6 +444,33 @@ mod tests {
             .map(|(_, id)| *id)
             .collect();
         assert_eq!(pushed, vec![0, 1, 2]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_run_once_keeps_handoff_when_client_requires_sharding() {
+        struct KeepRepl;
+        impl DbReplicateClient for KeepRepl {
+            fn replicate(&self, _db: &DbPartition, _peer: &RingDevice) -> bool {
+                true
+            }
+
+            fn keep_handoff(&self, _db: &DbPartition) -> bool {
+                true
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "swift-repl-handoff-sharding-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("sda1");
+        let hash = make_db(&device, 0);
+        let db_path = device.join(format!("containers/0/bcd/{hash}/{hash}.db"));
+        let stats = run_once(&device, "containers", &ring3(), 99, &KeepRepl);
+        assert_eq!(stats.successes, 1);
+        assert!(db_path.exists(), "sharding-required handoff must remain");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

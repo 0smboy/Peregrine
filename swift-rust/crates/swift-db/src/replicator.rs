@@ -909,8 +909,10 @@ pub fn replicate_container_db_role(
     // (`get_objects()` on the epoch file stays empty). Python's small-db
     // path usyncs; aborting rsync_then_merge is not enough when
     // `max_row < per_diff`.
-    if local.sharding_initiated().unwrap_or(false) {
-        eprintln!("db-replicator: skip object usync (local sharding) hsh={hsh}");
+    if local.sharding_initiated().unwrap_or(false)
+        || local.has_other_shard_ranges().unwrap_or(false)
+    {
+        eprintln!("db-replicator: skip object usync (local shard ranges) hsh={hsh}");
         return Ok(ReplicateOutcome {
             diffs: 0,
             rows_pushed: 0,
@@ -1566,6 +1568,70 @@ mod tests {
             "max_row": 0,
             "count": 0,
             "db_state": "sharding",
+            "metadata": "",
+        })
+        .to_string();
+        let (addr, handle) = spawn_fake_peer(body);
+        let outcome = replicate_container_db(
+            &mut broker,
+            "local-id",
+            &addr.to_string(),
+            "sdb",
+            "0",
+            "hash",
+        )
+        .unwrap();
+        handle.join().unwrap();
+        assert_eq!(outcome.rows_pushed, 0, "{outcome:?}");
+        assert!(!outcome.needs_rsync, "{outcome:?}");
+        assert!(!outcome.usync_incomplete, "{outcome:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_skip_object_usync_when_local_has_shard_ranges() {
+        // A fresh handoff may still report UNSHARDED after ranges replicate
+        // into it. It must not accept object rows before the sharder cleaves.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-repl-local-shard-ranges-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("hash.db");
+        let mut broker = ContainerBroker::new(&db_path, "a", "c");
+        broker
+            .initialize("0000000001.00000", 0, "0000000001.00000", "local-id")
+            .unwrap();
+        broker
+            .put_object(
+                "alpha",
+                "0000000002.00000",
+                0,
+                "text/plain",
+                "e",
+                0,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        let mut shard = crate::shard::ShardRange::new(
+            ".shards_a/c-0",
+            "0000000003.00000",
+            "",
+            "",
+        );
+        shard.state = crate::shard::state::ACTIVE;
+        broker.merge_shard_ranges(vec![shard]).unwrap();
+        assert!(broker.has_other_shard_ranges().unwrap());
+
+        let body = serde_json::json!({
+            "point": -1,
+            "id": "peer-id",
+            "max_row": -1,
+            "count": 0,
+            "db_state": "unsharded",
             "metadata": "",
         })
         .to_string();

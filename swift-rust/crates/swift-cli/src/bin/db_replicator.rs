@@ -380,6 +380,35 @@ fn info_text(info: &[(String, DbValue)], key: &str) -> Option<String> {
 }
 
 impl DbReplicateClient for DbClient {
+    fn keep_handoff(&self, db: &DbPartition) -> bool {
+        if self.server != ServerType::Container {
+            return false;
+        }
+        // REPLICATE paths do not carry account/container, so hydrate them
+        // from container_stat before evaluating sharding_required().
+        let mut probe = ContainerBroker::new(&db.path, "", "");
+        let info = match probe.get_info() {
+            Ok(info) => info,
+            Err(_) => return probe.sharding_required().unwrap_or(false),
+        };
+        let account = info
+            .iter()
+            .find(|(key, _)| key == "account")
+            .and_then(|(_, value)| value.as_text())
+            .unwrap_or_default();
+        let container = info
+            .iter()
+            .find(|(key, _)| key == "container")
+            .and_then(|(_, value)| value.as_text())
+            .unwrap_or_default();
+        let mut broker = if account.is_empty() {
+            probe
+        } else {
+            ContainerBroker::new(&db.path, &account, &container)
+        };
+        broker.sharding_required().unwrap_or(false)
+    }
+
     fn db_max_row(&self, db: &DbPartition) -> i64 {
         match self.server {
             ServerType::Container => {
