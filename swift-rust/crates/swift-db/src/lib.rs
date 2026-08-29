@@ -45,7 +45,7 @@ pub use auditor::{
 pub use broker::{py_json_dumps_metadata, py_json_parse_metadata, BrokerMetadata};
 pub use container::{
     get_db_files, hash_container_name, make_db_file_path, make_shard_name, parse_db_filename,
-    shards_account_name, ContainerBroker, DbState, DbValue, FoundShardRange, GetShardRangesArgs,
+    shards_account_name, check_merge_own_shard_range, ContainerBroker, DbState, DbValue, FoundShardRange, GetShardRangesArgs,
     ListObjectsArgs, ObjectRecord,
 };
 pub use repl_loop::{
@@ -58,11 +58,11 @@ pub use replicator::{
     sync_shard_ranges_to_peer, ReplicateOutcome, RsyncTransport,
 };
 pub use shard::{
-    find_namespace_gaps, find_overlapping_ranges, merge_shards, resolve_shard_range_states,
-    sift_shard_ranges, state as shard_state, ShardRange, CLEAVING_STATES, SHARD_RANGE_KEYS,
-    SHARD_STATS_STATES, SHARD_UPDATE_STATES,
+    find_namespace_gaps, find_overlapping_ranges, merge_shards,
+    resolve_shard_range_states, sift_shard_ranges, state as shard_state, ShardRange,
+    CLEAVING_STATES, SHARD_RANGE_KEYS, SHARD_STATS_STATES, SHARD_UPDATE_STATES,
 };
-pub use util::{chexor, is_corruption_error, quarantine_db, renamer, DbError};
+pub use util::{chexor, is_corruption_error, is_readonly_dbmoved, quarantine_db, renamer, DbError};
 pub use vacuum::{
     sample_db_space, sample_device_db_space, vacuum_db, vacuum_device_dbs, DbSpaceSample,
     DbSpaceTotals,

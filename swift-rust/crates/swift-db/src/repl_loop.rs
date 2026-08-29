@@ -136,6 +136,11 @@ pub trait DbReplicateClient {
         let _ = db;
         None
     }
+    /// Python `ContainerReplicator.cleanup_post_replicate`: a handoff that
+    /// `sharding_required()` must stay on disk so cleaving can finish.
+    fn keep_handoff(&self, _db: &DbPartition) -> bool {
+        false
+    }
 }
 
 /// True when `local_id` is not a primary for `partition` (a handoff copy).
@@ -236,7 +241,12 @@ pub fn run_once(
             // 50 each → HEAD 150 at probe L1435.
             if target.is_handoff && !responses.is_empty() && responses.iter().all(|&ok| ok) {
                 let delta = client.db_max_row(&db) - orig_max_row;
-                if delta == 0 {
+                if client.keep_handoff(&db) {
+                    eprintln!(
+                        "db-replicator: keep handoff hsh={} (requires sharding)",
+                        db.hash
+                    );
+                } else if delta == 0 {
                     eprintln!(
                         "db-replicator: deleted handoff hsh={} disk_part={} ring_part={} wrong_part={wrong_part}",
                         db.hash, db.partition, target.partition

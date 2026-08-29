@@ -150,6 +150,19 @@ impl TaskInfo {
     }
 }
 
+/// X-Timestamp for the real-object DELETE. Prefer the task-name prefix so
+/// high-precision SLO async jobs (`1751500000.12345-acct/c/o`) are not
+/// truncated below the segment PUT timestamp (409 / ignored delete).
+fn task_x_timestamp(task: &TaskInfo) -> String {
+    task.task_object
+        .split_once('-')
+        .map(|(ts, _)| ts.to_string())
+        .filter(|ts| {
+            !ts.is_empty() && ts.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+        })
+        .unwrap_or_else(|| normalize_delete_at_timestamp(task.delete_timestamp))
+}
+
 /// Iterate the task-container listing, yielding tasks whose delete time has
 /// passed. Mirrors `_iter_task_container`: the listing is name-sorted (so
 /// timestamp-ascending); the first not-yet-due task stops iteration.
@@ -278,7 +291,7 @@ fn http_body(buf: &[u8]) -> &[u8] {
 }
 
 fn delete_actual_object_via_proxy(proxy_host: &str, task: &TaskInfo) -> DeleteResult {
-    let ts = normalize_delete_at_timestamp(task.delete_timestamp);
+    let ts = task_x_timestamp(task);
     let path = format!(
         "/v1/{}/{}/{}",
         pe(&task.target_account),
@@ -373,6 +386,8 @@ fn raw_request(
 /// List containers under an account via the account ring (JSON).
 pub fn list_account_containers(account_ring: &Ring, account: &str) -> Option<Vec<String>> {
     let (part, nodes) = account_ring.get_nodes(account, None, None).ok()?;
+    let mut names = std::collections::BTreeSet::new();
+    let mut saw_ok = false;
     for node in &nodes {
         let host = node_host(node.dev, true);
         let path = format!(
@@ -392,11 +407,13 @@ pub fn list_account_containers(account_ring: &Ring, account: &str) -> Option<Vec
             continue;
         };
         if status == 404 {
-            return Some(Vec::new());
+            saw_ok = true;
+            continue;
         }
         if !(200..300).contains(&status) {
             continue;
         }
+        saw_ok = true;
         let body = http_body(&buf);
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
             continue;
@@ -404,15 +421,17 @@ pub fn list_account_containers(account_ring: &Ring, account: &str) -> Option<Vec
         let Some(arr) = v.as_array() else {
             continue;
         };
-        let mut names = Vec::new();
         for item in arr {
             if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
-                names.push(name.to_string());
+                names.insert(name.to_string());
             }
         }
-        return Some(names);
     }
-    None
+    if saw_ok {
+        Some(names.into_iter().collect())
+    } else {
+        None
+    }
 }
 
 /// List objects in a container via the container ring (name + content_type).
@@ -424,6 +443,8 @@ pub fn list_container_objects(
     let (part, nodes) = container_ring
         .get_nodes(account, Some(container), None)
         .ok()?;
+    let mut best: Vec<(String, String)> = Vec::new();
+    let mut saw_ok = false;
     for node in &nodes {
         let host = node_host(node.dev, true);
         let path = format!(
@@ -445,11 +466,13 @@ pub fn list_container_objects(
             continue;
         };
         if status == 404 {
-            return Some(Vec::new());
+            saw_ok = true;
+            continue;
         }
         if !(200..300).contains(&status) {
             continue;
         }
+        saw_ok = true;
         let body = http_body(&buf);
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
             continue;
@@ -469,9 +492,15 @@ pub fn list_container_objects(
                 .to_string();
             out.push((name.to_string(), ctype));
         }
-        return Some(out);
+        if out.len() > best.len() {
+            best = out;
+        }
     }
-    None
+    if saw_ok {
+        Some(best)
+    } else {
+        None
+    }
 }
 
 /// Ring-direct expiry client: DELETE the real object on the object ring,
@@ -544,7 +573,7 @@ impl ExpiryClient for HttpExpiryClient<'_> {
         ) else {
             return DeleteResult::Error;
         };
-        let ts = normalize_delete_at_timestamp(task.delete_timestamp);
+        let ts = task_x_timestamp(task);
         let mut saw_success = false;
         let mut saw_stale = false;
         let mut saw_error = false;
@@ -659,12 +688,26 @@ fn run_once_with_client(
         stats.errors += 1;
         return stats;
     };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/g6-expirer.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            f,
+            "run_once now={now} containers={} names={containers:?}",
+            containers.len()
+        );
+    }
     for cname in containers {
         let Ok(c_int) = cname.parse::<i64>() else {
             continue;
         };
         if c_int > now {
-            break;
+            // Name-sorted listings can break; unsorted leftovers must not
+            // hide a due hash-sharded task container.
+            continue;
         }
         // Zero-padded form used by the enqueue path.
         let task_container = normalize_delete_at_timestamp(c_int);
@@ -685,6 +728,20 @@ fn run_once_with_client(
             continue;
         };
         let due = iter_due_tasks(EXPIRER_ACCOUNT_NAME, &task_container, &objects, now);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/g6-expirer.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "container={task_container} objs={} due={} sample={:?}",
+                objects.len(),
+                due.len(),
+                objects.iter().take(3).collect::<Vec<_>>()
+            );
+        }
         for task in due {
             process_task(&task, now, reclaim_age, client, &mut stats);
         }
@@ -876,6 +933,28 @@ mod tests {
         assert!(popped);
         assert_eq!(stats.objects, 1);
         assert_eq!(client.popped.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_async_delete_uses_high_precision_task_timestamp() {
+        let task = TaskInfo {
+            task_account: ".expiring_objects".into(),
+            task_container: "1751414400".into(),
+            task_object: "1787896797.36012-AUTH_test/c/segment_2".into(),
+            target_account: "AUTH_test".into(),
+            target_container: "c".into(),
+            target_object: "segment_2".into(),
+            delete_timestamp: 1_787_896_797,
+            is_async_delete: true,
+        };
+        assert_eq!(task_x_timestamp(&task), "1787896797.36012");
+        let integer = TaskInfo {
+            task_object: "1751500000-AUTH_test/c/o".into(),
+            delete_timestamp: 1_751_500_000,
+            is_async_delete: false,
+            ..task.clone()
+        };
+        assert_eq!(task_x_timestamp(&integer), "1751500000");
     }
 
     #[test]

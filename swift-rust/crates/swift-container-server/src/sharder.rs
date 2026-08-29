@@ -74,9 +74,10 @@ use std::path::{Path, PathBuf};
 
 use swift_core::hashing::HashPathConfig;
 use swift_db::{
-    db_locations, get_db_files, make_db_file_path, make_shard_name, remove_replicated_handoff_db,
+    db_locations, get_db_files, make_db_file_path, make_shard_name, parse_db_filename,
+    remove_replicated_handoff_db,
     replicate_container_db, shard_state, shards_account_name, ContainerBroker, DbError, DbState,
-    GetShardRangesArgs, ObjectRecord, ShardRange,
+    find_overlapping_ranges, GetShardRangesArgs, ObjectRecord, ShardRange,
 };
 
 /// Legacy single-key persist (pre Python `Context-{db_id}` namespace).
@@ -483,6 +484,18 @@ impl<T: ShardHttpTransport> HttpShardReplicator<T> {
 pub fn default_shard_quorum(replica_count: usize) -> usize {
     ((replica_count / 2) + 1).max(1)
 }
+
+/// Python `_cleave_shard_broker` first-cleave hold: `responses.count(True)
+/// < shard_replication_quorum`. `replica_count == 0` means no ring (local
+/// leftover10 path) and must not hold.
+fn shard_cleave_replication_holds(
+    first_cleave: bool,
+    python_successes: usize,
+    replica_count: usize,
+) -> bool {
+    first_cleave && replica_count > 0 && python_successes < default_shard_quorum(replica_count)
+}
+
 
 /// Build ordered primary [`ShardReplicaNode`]s from ring device fields
 /// (`ip`, `port`, `device`). Preserves ring primary order so HTTP create
@@ -910,7 +923,7 @@ pub fn cleave_shard_range(
     range: &mut ShardRange,
     last_cleave_to_row: Option<i64>,
     own_shrinking: bool,
-) -> Result<bool, DbError> {
+) -> Result<CleaveShardOutcome, DbError> {
     let initial_state = range.state;
     // The daemon converts FOUND to CREATED before cleaving.  Local/unit
     // callers intentionally allow FOUND as the same first-cleave state.
@@ -933,11 +946,27 @@ pub fn cleave_shard_range(
                 .and_then(|(_, v)| v.as_i64())
         })
         .unwrap_or(0);
-    let records = if should_sync {
+    // object_count can be 0 while rows exist (W240 rmtree). A brand-new
+    // empty handoff may also fail this query; if stats and sync still look
+    // fresh-empty, treat that as zero rows so we do not rsync it.
+    let prior_row_count = match shard.object_records_in_range(&range.lower, &range.upper) {
+        Ok(r) => r.len(),
+        Err(_) if prior_object_count == 0 && sync_point < 0 => 0,
+        Err(_) => 1,
+    };
+    let mut records = if should_sync {
         retiring.object_records_in_range_since(&range.lower, &range.upper, sync_from_row)?
     } else {
         Vec::new()
     };
+    // Gap repair (`--gaps`) leaves an ACTIVE+deleted tombstone. A later
+    // root re-cleave must not resurrect those lost objects into the
+    // expanded acceptor (probe L4027). Overlap-repair losers are
+    // SHRUNK+deleted and must still cleave into the winning 1.* ranges
+    // (repair_root L3649). Shrinking donors still copy everything.
+    if !own_shrinking {
+        records = filter_out_deleted_gap_objects(source, records)?;
+    }
     let had_objects = !records.is_empty();
     if had_objects {
         shard.merge_items(records)?;
@@ -974,7 +1003,12 @@ pub fn cleave_shard_range(
     // therefore CLEAVE_EMPTY (probe listing_under_populated L1494). The
     // same already-CLEAVED range with retiring rows is CLEAVE_SUCCESS and
     // still consumes the batch (probe L1191 / L1204).
-    let newly_created_empty = prior_object_count == 0 && sync_point < 0;
+    // W244: leftover empty CREATED/CLEAVED handoffs often already have a
+    // sync_point from first-gen cleave. Python rsyncs the *existing* broker
+    // (the primary, still populated). Rust's existing is this local empty
+    // leftover; treating sync_point>=0 as CLEAVE_SUCCESS rsyncs empty over
+    // all three primaries (repair_root L3649 wipe, not empty_wins hide).
+    let newly_created_empty = prior_object_count == 0 && prior_row_count == 0;
     let consume_batch = if !should_sync {
         true
     } else if had_objects {
@@ -982,7 +1016,19 @@ pub fn cleave_shard_range(
     } else {
         !newly_created_empty
     };
-    Ok(consume_batch)
+    Ok(CleaveShardOutcome {
+        consume_batch,
+        empty_new: newly_created_empty && should_sync && !had_objects,
+    })
+}
+
+/// Python `_cleave_shard_broker` result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CleaveShardOutcome {
+    /// False = CLEAVE_EMPTY: do not consume `cleave_batch_size`.
+    pub consume_batch: bool,
+    /// Newly created empty shard DB: Python `delete_db`, do not replicate.
+    pub empty_new: bool,
 }
 
 /// Python `shard_range.upper >= own_shard_range.upper` with empty = MAX.
@@ -1005,21 +1051,33 @@ pub fn cleave(
     shard_for: &mut dyn FnMut(&ShardRange) -> ContainerBroker,
     ctx: &mut CleavingContext,
     batch_size: usize,
-) -> Result<(), DbError> {
-    let Some(mut retiring) = source.retiring_broker() else {
-        // not in the sharding state; nothing to cleave from a retiring DB
-        return Ok(());
-    };
+) -> Result<Vec<String>, DbError> {
     let own = source.get_own_shard_range(false)?;
     let own_upper = own.as_ref().map(|o| o.upper.clone()).unwrap_or_default();
     let own_shrinking = own
         .as_ref()
         .is_some_and(|o| o.state == shard_state::SHRINKING || o.state == shard_state::SHRUNK);
+    let Some(mut retiring) = source.retiring_broker() else {
+        // SHARDED shrinking donors have already unlinked retiring; objects
+        // sit on the live table. Python `_cleave` skips sharded DBs, but
+        // repair_root then never deletes straddling 0.* (W235 L3514).
+        if own_shrinking {
+            return cleave_shrinking_from_live(source, ranges, shard_for, ctx, batch_size);
+        }
+        return Ok(Vec::new());
+    };
+    let start_cursor = ctx.cursor.clone();
+    let mut empty_new_names = Vec::new();
     ctx.ranges_todo = ranges
         .iter()
         .filter(|r| r.state != shard_state::SHRINKING)
         .filter(|r| r.upper.is_empty() || r.upper.as_str() > ctx.cursor.as_str())
         .count();
+    let mut cleaved_covers: Vec<(String, String, String)> = ranges
+        .iter()
+        .filter(|r| r.deleted == 0 && r.state >= shard_state::CLEAVED)
+        .map(|r| (r.name.clone(), r.lower.clone(), r.upper.clone()))
+        .collect();
     let mut done_this_batch = 0usize;
     for range in ranges.iter_mut() {
         if ctx.cleaving_done || done_this_batch >= batch_size {
@@ -1028,16 +1086,38 @@ pub fn cleave(
         if range.state == shard_state::SHRINKING {
             continue;
         }
-        // skip ranges already behind the cursor
+        // Skip ranges already behind the cursor when they are already
+        // CLEAVED/ACTIVE. A replicated cursor (W225) must still cleave
+        // sequential CREATED children that have no covering sibling.
+        // repair_shard L3753: overlapping CREATED (10-12) after 9-12
+        // was cleaved must stay CREATED — Python
+        // get_shard_ranges(marker=cursor+\x00) never yields them.
         if !range.upper.is_empty() && range.upper.as_str() <= ctx.cursor.as_str() {
-            continue;
+            if range.state >= shard_state::CLEAVED {
+                continue;
+            }
+            if range.state == shard_state::CREATED {
+                let covered = cleaved_covers.iter().any(|(name, lower, upper)| {
+                    name != &range.name
+                        && ShardRange::lower_cmp(lower, &range.lower)
+                            != std::cmp::Ordering::Greater
+                        && ShardRange::upper_cmp(&range.upper, upper)
+                            != std::cmp::Ordering::Greater
+                });
+                if covered {
+                    continue;
+                }
+            }
+        }
+        // Python `_cleave`: `if shard_range.lower > cursor: break`.
+        // Empty lower/cursor are namespace MIN.
+        if ShardRange::lower_cmp(&range.lower, &ctx.cursor) == std::cmp::Ordering::Greater {
+            break;
         }
         // Python `_cleave` stops at a range not in CREATED/CLEAVED/ACTIVE.
-        // FOUND is included here because local `cleave()` tests drive the
-        // copy step without `_create_shard_containers`; the daemon converts
-        // FOUND → CREATED before calling `cleave`.
-        if range.state != shard_state::FOUND
-            && range.state != shard_state::CREATED
+        // FOUND is unready: a peer find that arrived after create/replicate
+        // must stall this replica (repair_root: 2 CLEAVED, not 3).
+        if range.state != shard_state::CREATED
             && range.state != shard_state::CLEAVED
             && range.state != shard_state::ACTIVE
         {
@@ -1063,7 +1143,7 @@ pub fn cleave(
             continue;
         }
         let mut shard = shard_for(range);
-        let had_objects = cleave_shard_range(
+        let outcome = cleave_shard_range(
             &mut retiring,
             &mut shard,
             source,
@@ -1071,6 +1151,10 @@ pub fn cleave(
             ctx.last_cleave_to_row,
             own_shrinking,
         )?;
+        cleaved_covers.push((range.name.clone(), range.lower.clone(), range.upper.clone()));
+        if outcome.empty_new {
+            empty_new_names.push(range.name.clone());
+        }
         ctx.cursor = range.upper.clone();
         ctx.ranges_done += 1;
         // Python `range_done`: todo shrinks as each range is cleaved.
@@ -1078,14 +1162,22 @@ pub fn cleave(
             ctx.ranges_todo -= 1;
         }
         // Python CLEAVE_EMPTY does not consume cleave_batch_size.
-        if had_objects {
-            done_this_batch += 1;
+        // Catch-up of a CREATED range already behind a *replicated*
+        // cursor also must not consume the batch: otherwise a 3-range
+        // root with batch=2 never reaches the last range on a late
+        // replica (W226 nodes[0] stuck sharding).
+        if outcome.consume_batch {
+            let catch_up = !range.upper.is_empty()
+                && range.upper.as_str() <= start_cursor.as_str();
+            if !catch_up {
+                done_this_batch += 1;
+            }
         }
         if namespace_upper_covers(&range.upper, &own_upper) {
             ctx.cleaving_done = true;
         }
     }
-    Ok(())
+    Ok(empty_new_names)
 }
 
 /// Sweep counters for one device pass.
@@ -1101,6 +1193,8 @@ pub struct SharderStats {
     pub replicate_errors: u64,
     /// SHRINKING donor ranges observed (stub compact pass; no object move).
     pub shrinking_donors: u64,
+    /// Python `sharding_stats.sharding.sharding_in_progress.all`.
+    pub sharding_in_progress: Vec<serde_json::Value>,
 }
 
 /// Recon-cache update dumped after a sharder sweep.
@@ -1119,6 +1213,15 @@ pub fn recon_update(
         "container_sharder_failures": stats.failures,
         "container_sharder_replicate_errors": stats.replicate_errors,
         "container_sharder_shrinking_donors": stats.shrinking_donors,
+        "sharding_time": elapsed.as_secs_f64(),
+        "sharding_last": end_epoch_secs,
+        "sharding_stats": {
+            "sharding": {
+                "sharding_in_progress": {
+                    "all": stats.sharding_in_progress,
+                }
+            }
+        },
     })
 }
 
@@ -1355,6 +1458,112 @@ fn open_or_create_shard_broker(
 
 /// Python `_get_shard_broker`: stamp Quoted-Root so later sharder passes
 /// treat this DB as a shard and `_update_root_container`.
+fn shard_local_is_empty(shard: &mut ContainerBroker, sr: &ShardRange) -> bool {
+    let rows = shard
+        .object_records_in_range(&sr.lower, &sr.upper)
+        .ok()
+        .map(|r| r.len())
+        .unwrap_or(0);
+    rows == 0 && shard_object_count(shard) == 0
+}
+
+fn shard_object_count(broker: &mut ContainerBroker) -> i64 {
+    broker
+        .get_info()
+        .ok()
+        .and_then(|info| {
+            info.iter()
+                .find(|(n, _)| *n == "object_count")
+                .and_then(|(_, v)| v.as_i64())
+        })
+        .unwrap_or(0)
+}
+
+/// Python CLEAVE_EMPTY `delete_db`: remove a just-created empty handoff so
+/// an epoch_1 zero-object re-cleave cannot rsync it over already-ACTIVE
+/// shard objects (repair_root L3649). Never delete a shard that has rows.
+/// Remove an empty *handoff* leftover so container-replicator cannot rsync
+/// it over populated primaries (repair_root L3649). Never touch a primary
+/// hash dir (W240/W244 L3613 FileNotFound).
+fn discard_empty_handoff_if_not_primary(
+    device: &Path,
+    hash_config: &HashPathConfig,
+    part: &str,
+    sr: &ShardRange,
+    ring: Option<&swift_ring::Ring>,
+    local_device: &str,
+) -> bool {
+    let (acct, cont) = split_shard_name(&sr.name);
+    if local_device_is_container_primary(ring, local_device, &acct, &cont) {
+        return false;
+    }
+    discard_empty_cleave_handoff(device, hash_config, part, sr)
+}
+
+fn discard_empty_cleave_handoff(
+    device: &Path,
+    hash_config: &HashPathConfig,
+    part: &str,
+    sr: &ShardRange,
+) -> bool {
+    let Some(mut shard) = open_existing_shard_broker(device, hash_config, part, &sr.name) else {
+        return true;
+    };
+    let rows = shard
+        .object_records_in_range(&sr.lower, &sr.upper)
+        .ok()
+        .map(|r| r.len())
+        .unwrap_or(1);
+    if rows != 0 || shard_object_count(&mut shard) != 0 {
+        return false;
+    }
+    let db_path = shard.db_file().to_path_buf();
+    let siblings = get_db_files(&db_path);
+    drop(shard);
+    // A primary hash dir can hold an older epoch file plus a new empty one.
+    // Never rmtree that (W240 L3612).
+    if siblings.len() != 1 {
+        return false;
+    }
+    remove_replicated_handoff_db(&db_path)
+}
+
+/// Epoch_1 zero-object re-cleave of an already-ACTIVE range must not
+/// initialize a new DB on a ring primary. That replica then answers
+/// `200 []`, and settled listing `empty_wins` hides the other primaries
+/// (repair_root L3649: only the first 1.* shard listed).
+fn ephemeral_empty_shard_broker(sr: &ShardRange) -> ContainerBroker {
+    let (account, container) = split_shard_name(&sr.name);
+    // leftover10 L3068 MoreUTF8: shard container names are the max-length
+    // UTF-8 root plus a suffix. Embedding that in the tmpdir component
+    // exceeded NAME_MAX (255), create_dir_all failed, initialize left
+    // no shard.db, and the follower stayed sharding.
+    let dir = std::env::temp_dir().join(format!(
+        "g6-cleave-empty-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!(
+            "G6_CLEAVE_EMPTY_TMPDIR err={e:?} dir={}",
+            dir.display()
+        );
+    }
+    let db = dir.join("shard.db");
+    let mut b = ContainerBroker::new(&db, &account, &container);
+    let ts = swift_core::timestamp::Timestamp::now().internal();
+    if let Err(e) = b.initialize(&ts, 0, &ts, "ephemeral-cleave-empty") {
+        eprintln!(
+            "G6_CLEAVE_EMPTY_INIT err={e:?} db={}",
+            db.display()
+        );
+    }
+    b
+}
+
 fn ensure_shard_root_sysmeta(
     broker: &mut ContainerBroker,
     root_account: &str,
@@ -1422,6 +1631,9 @@ pub fn refresh_own_shard_range_stats(
     let Some(mut own) = broker.get_own_shard_range(true)? else {
         return Ok(None);
     };
+    if own.state == shard_state::FOUND || own.state == shard_state::CREATED {
+        return Ok(Some(own));
+    }
     let info = broker.get_info()?;
     let get = |k: &str| {
         info.iter()
@@ -1519,6 +1731,7 @@ fn update_objects_on_primaries(
     ring: &swift_ring::Ring,
     shard_name: &str,
     records: &[ObjectRecord],
+    require_all: bool,
 ) -> Result<(), String> {
     if records.is_empty() {
         return Ok(());
@@ -1548,10 +1761,11 @@ fn update_objects_on_primaries(
             _ => {}
         }
     }
-    if ok == 0 {
+    if ok == 0 || (require_all && ok < nodes.len()) {
         Err(format!(
-            "UPDATE objects onto {} primaries failed (0/{})",
+            "UPDATE objects onto {} primaries failed ({}/{})",
             shard_name,
+            ok,
             nodes.len()
         ))
     } else {
@@ -1799,31 +2013,56 @@ fn merge_shard_ranges_from_root(
     fetched: &[ShardRange],
     own: &ShardRange,
 ) {
-    let mut own_from_root = None;
-    let mut children = Vec::new();
-    for sr in fetched {
-        if sr.name == own.name {
-            own_from_root = Some(sr.clone());
-        } else if own.includes_range(sr) {
-            children.push(sr.clone());
-        } else if (own.state == shard_state::SHRINKING || own.state == shard_state::SHRUNK)
-            && sr.includes_range(own)
-        {
-            // Shrinking acceptor is an expanded neighbor, not a child.
-            children.push(sr.clone());
-        }
-    }
+    // Python `_merge_shard_ranges_from_root`: merge own FIRST, reload, then
+    // children / shrinking acceptors. Classifying others against a stale
+    // ACTIVE own drops the expanded acceptor (probe compact L3380).
+    let own_from_root = fetched.iter().find(|sr| sr.name == own.name).cloned();
     if let Some(from_root) = own_from_root {
         let _ = broker.merge_shard_ranges(vec![from_root]);
     }
+    let own = broker
+        .get_own_shard_range(true)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| own.clone());
     let sharded = matches!(broker.get_db_state(), Ok(DbState::Sharded));
-    // SHARDED+SHRUNK donors still need the covering acceptor so the
-    // live misplaced pass can find a destination (probe L2761).
-    if !children.is_empty() {
-        let shrinking_own =
-            own.state == shard_state::SHRINKING || own.state == shard_state::SHRUNK;
-        if !sharded || shrinking_own {
-            let _ = broker.merge_shard_ranges(children);
+    let shrinking_own =
+        own.state == shard_state::SHRINKING || own.state == shard_state::SHRUNK;
+    let cleaving_own = swift_db::CLEAVING_STATES.contains(&own.state);
+    let mut children = Vec::new();
+    let mut others = Vec::new();
+    for sr in fetched {
+        if sr.name == own.name {
+            continue;
+        } else if own.includes_range(sr) {
+            children.push(sr.clone());
+        } else {
+            others.push(sr.clone());
+        }
+    }
+    if !children.is_empty() && (!sharded || shrinking_own) {
+        let _ = broker.merge_shard_ranges(children);
+    }
+    if cleaving_own && (!sharded || shrinking_own) {
+        let mut acceptors = Vec::new();
+        for sr in others {
+            if swift_db::CLEAVING_STATES.contains(&sr.state) && sr.deleted == 0 {
+                continue;
+            }
+            // repair_root 0.* vs 1.*: a shrinking donor often straddles two
+            // acceptors. Python merges every overlapping non-cleaving other.
+            // Full-cover-only dropped both (W235 L3514: 5 ranges, expected 3).
+            let keep = if shrinking_own {
+                sr.overlaps(&own) || sr.includes_range(&own)
+            } else {
+                sr.includes_range(&own)
+            };
+            if keep {
+                acceptors.push(sr);
+            }
+        }
+        if !acceptors.is_empty() {
+            let _ = broker.merge_shard_ranges(acceptors);
         }
     }
 }
@@ -1861,7 +2100,13 @@ pub fn update_root_container(
         return Ok(false);
     };
     // Python `_update_root_container`: if the latch is set, do not send.
-    if own.reported != 0 {
+    // Exception: a SHRUNK/deleted own must reach the root even if an earlier
+    // stats push latched reported (leftover10 L2785: first-shrink donor
+    // otherwise stays SHRINKING on the root and blocks last-shard shrink-to-root).
+    if own.reported != 0
+        && own.deleted == 0
+        && own.state != shard_state::SHRUNK
+    {
         return Ok(true);
     }
     let Some(ring) = ring else {
@@ -2030,6 +2275,32 @@ pub fn process_sharding_container_detailed(
 /// Same as [`process_sharding_container_detailed`] but places local shard DBs
 /// under each shard's **own** container-ring partition when `ring` is set.
 /// Multi-node listing fan-out requires this; root-part placement is SAIO-only.
+
+
+/// True when `local_device` is a primary for `account/container`.
+/// Conservative: missing ring or lookup failure is treated as primary so we
+/// never rmtree a live root epoch DB.
+fn local_device_is_container_primary(
+    ring: Option<&swift_ring::Ring>,
+    local_device: &str,
+    account: &str,
+    container: &str,
+) -> bool {
+    let Some(ring) = ring else {
+        return true;
+    };
+    match ring.get_nodes(account, Some(container), None) {
+        Ok((_, nodes)) => nodes.iter().any(|n| n.dev.device == local_device),
+        Err(_) => true,
+    }
+}
+
+fn range_name_is_root(sr: &ShardRange, account: &str, container: &str, root_acct: &str, root_cont: &str) -> bool {
+    let this = format!("{account}/{container}");
+    let root = format!("{root_acct}/{root_cont}");
+    sr.name == this || sr.name == root
+}
+
 pub fn process_sharding_container_detailed_with_ring(
     broker: &mut ContainerBroker,
     device: &Path,
@@ -2072,7 +2343,11 @@ pub fn process_sharding_container_detailed_with_ring(
     // listed the expanded acceptor on the donor.
     if let Some(own) = broker.get_own_shard_range(true).ok().flatten() {
         if own.state == shard_state::SHRINKING || own.state == shard_state::SHRUNK {
-            ranges.retain(|r| r.includes_range(&own) || own.includes_range(r));
+            // Overlap repair donors are not always nested in one acceptor
+            // (repair_root 0.* vs 1.*). Python cleaves into every overlapping
+            // non-shrinking acceptor; nest-only retain left straddling donors
+            // skip-empty (W234 L3514: 5 ranges, expected 3).
+            ranges.retain(|r| r.overlaps(&own) || r.includes_range(&own) || own.includes_range(r));
         } else if !own.lower.is_empty() || !own.upper.is_empty() {
             ranges.retain(|r| own.includes_range(r));
         }
@@ -2135,6 +2410,9 @@ pub fn process_sharding_container_detailed_with_ring(
         if sr.state != shard_state::FOUND {
             continue;
         }
+        if range_name_is_root(sr, &account, &container, &root_acct, &root_cont) {
+            continue;
+        }
         let spart = shard_part_for(&sr.name, ring, part);
         // Python updates CREATED before `_send_shard_ranges` so the PUT body
         // carries state=20 (probe other-replicas `[CREATED, CREATED]`).
@@ -2172,6 +2450,9 @@ pub fn process_sharding_container_detailed_with_ring(
         // materialize DBs during cleave, so the leftover CREATED range had
         // no file for replicators to push (probe L1290 FileNotFoundError).
         for sr in &created {
+            if range_name_is_root(sr, &account, &container, &root_acct, &root_cont) {
+                continue;
+            }
             let spart = shard_part_for(&sr.name, ring, part);
             let mut shard = local_shard_broker_for_range(device, hash_config, &spart, sr);
             ensure_shard_root_sysmeta(&mut shard, &root_acct, &root_cont, sr);
@@ -2207,12 +2488,27 @@ pub fn process_sharding_container_detailed_with_ring(
     // expanded acceptor. Python uses retiring-id context + sync_point;
     // we skip the object copy and finish `set_sharded_state` (unlink).
     if ctx.cleaving_done {
+        let all_cleaved = ranges.iter().all(|r| r.state >= shard_state::CLEAVED);
+        let is_root = broker.is_root_container().unwrap_or(true);
+        if is_root && !all_cleaved {
+            eprintln!(
+                "G6_CLEAVE reset-undercleaved account={account} container={container} states={:?}",
+                ranges.iter().map(|r| r.state).collect::<Vec<_>>()
+            );
+            ctx.cleaving_done = false;
+            ctx.ranges_done = 0;
+            ctx.ranges_todo = 0;
+            ctx.cursor.clear();
+            if let Some(own) = broker.get_own_shard_range(true).ok().flatten() {
+                ctx.cursor = own.lower;
+            }
+        } else {
         eprintln!(
             "G6_CLEAVE already-done account={account} container={container} misplaced={}",
             ctx.misplaced_done
         );
         let finished = if ctx.misplaced_done {
-            complete_sharding(broker)?
+            complete_sharding(broker, ring)?
         } else {
             false
         };
@@ -2220,29 +2516,128 @@ pub fn process_sharding_container_detailed_with_ring(
             finished,
             replicate_errors: 0,
         });
+        }
     }
+    // Python `_cleave` reloads `broker.get_shard_ranges(marker=cursor)`
+    // AFTER `_create_shard_containers` and `_replicate_object`. Peer
+    // FOUND ranges that arrived during that sync must be visible so
+    // cleave stops on them (repair_root expected 2 CLEAVED).
+    ranges = broker.get_shard_ranges(&GetShardRangesArgs {
+        include_own: false,
+        ..GetShardRangesArgs::default()
+    })?;
+    if let Some(own) = broker.get_own_shard_range(true).ok().flatten() {
+        if own.state == shard_state::SHRINKING || own.state == shard_state::SHRUNK {
+            // Overlap repair donors are not always nested in one acceptor
+            // (repair_root 0.* vs 1.*). Python cleaves into every overlapping
+            // non-shrinking acceptor; nest-only retain left straddling donors
+            // skip-empty (W234 L3514: 5 ranges, expected 3).
+            ranges.retain(|r| r.overlaps(&own) || r.includes_range(&own) || own.includes_range(r));
+        } else if !own.lower.is_empty() || !own.upper.is_empty() {
+            ranges.retain(|r| own.includes_range(r));
+        }
+    }
+    let own_shrinking_for_create = broker
+        .get_own_shard_range(true)
+        .ok()
+        .flatten()
+        .is_some_and(|o| o.state == shard_state::SHRINKING || o.state == shard_state::SHRUNK);
+    // L1517: an under-populated peer may already have marked remaining
+    // ranges ACTIVE. Ephemeral sink + skip-empty then drops the cleave
+    // and never UPDATEs shard primaries (listing stays L1509). Persist
+    // only when retiring still has rows in that range. Empty retiring
+    // (repair_root L3649 leftover ACTIVE) stays ephemeral.
+    let retiring_nonempty_ranges: Vec<(String, String)> = {
+        let mut out = Vec::new();
+        if let Some(mut retiring) = broker.retiring_broker() {
+            for sr in &ranges {
+                if retiring
+                    .object_records_in_range(&sr.lower, &sr.upper)
+                    .ok()
+                    .is_some_and(|recs| !recs.is_empty())
+                {
+                    out.push((sr.lower.clone(), sr.upper.clone()));
+                }
+            }
+        }
+        out
+    };
     let mut shard_for = |sr: &ShardRange| {
         let spart = shard_part_for(&sr.name, ring, part);
+        // ACTIVE re-cleave: open a *populated* local shard only. A leftover
+        // empty hash.db from first-gen create/cleave answers listing 200 []
+        // and settled empty_wins hides the real primaries (repair_root L3649).
+        if sr.state == shard_state::ACTIVE && !own_shrinking_for_create {
+            if let Some(mut b) =
+                open_existing_shard_broker(device, hash_config, &spart, &sr.name)
+            {
+                let rows = b
+                    .object_records_in_range(&sr.lower, &sr.upper)
+                    .ok()
+                    .map(|r| r.len())
+                    .unwrap_or(0);
+                let count = shard_object_count(&mut b);
+                if rows > 0 || count > 0 {
+                    ensure_shard_root_sysmeta(&mut b, &root_acct, &root_cont, sr);
+                    return b;
+                }
+                drop(b);
+                // Do not discard/rmtree: W240/W244 L3613 FileNotFound on a
+                // primary hash dir when the leftover was empty.
+            }
+            let retiring_has_rows = retiring_nonempty_ranges.iter().any(|(lo, up)| {
+                lo == &sr.lower && up == &sr.upper
+            });
+            if !retiring_has_rows {
+                eprintln!(
+                    "G6_CLEAVE_ACTIVE_EPHEMERAL shard={} part={}",
+                    sr.name, spart
+                );
+                return ephemeral_empty_shard_broker(sr);
+            }
+            eprintln!(
+                "G6_CLEAVE_ACTIVE_PERSIST shard={} part={}",
+                sr.name, spart
+            );
+        }
         let mut b = local_shard_broker_for_range(device, hash_config, &spart, sr);
         ensure_shard_root_sysmeta(&mut b, &root_acct, &root_cont, sr);
         b
     };
-    cleave(
+    let created_before: std::collections::HashSet<String> = ranges
+        .iter()
+        .filter(|r| r.state == shard_state::CREATED)
+        .map(|r| r.name.clone())
+        .collect();
+    let pre_cleave_cursor = ctx.cursor.clone();
+    let empty_new_names = cleave(
         broker,
         &mut ranges,
         &mut shard_for,
         &mut ctx,
         cleave_batch_size,
     )?;
+    if !empty_new_names.is_empty() {
+        eprintln!("G6_CLEAVE_EMPTY_NAMES names={empty_new_names:?}");
+    }
     // Python `_cleave_shard_broker` `_replicate_object`: push the cleaved
     // shard DB onto that shard's ring primaries. Also push leftover CREATED
     // DBs so `replicators.once()` can fill a primary that missed Auto-Create.
+    let mut new_cleave_reps: Vec<(String, usize, usize)> = Vec::new();
     let own_shrinking = broker
         .get_own_shard_range(true)
         .ok()
         .flatten()
         .is_some_and(|o| o.state == shard_state::SHRINKING || o.state == shard_state::SHRUNK);
     for sr in ranges.iter().filter(|r| r.state >= shard_state::CREATED) {
+        // Skip a root-named range only on first-gen cleave. Shrink-to-root
+        // uses the root path as the acceptor; skipping here left alpha off
+        // the root primaries (probe L2680 empty listing).
+        if range_name_is_root(sr, &account, &container, &root_acct, &root_cont)
+            && !own_shrinking
+        {
+            continue;
+        }
         // listing-w207: HTTP UPDATE of a leftover local ACTIVE MIN–MAX
         // DB resurrected obj-1-000 after client DELETEs. First-gen UPDATE
         // is CLEAVED (not ACTIVE) so this does not skip it. listing-w219:
@@ -2255,7 +2650,46 @@ pub fn process_sharding_container_detailed_with_ring(
             && sr.lower.is_empty()
             && sr.upper.is_empty();
         let spart = shard_part_for(&sr.name, ring, part);
+        // Python CLEAVE_EMPTY: delete the just-created empty handoff and do
+        // not `_replicate_object`. Epoch_1 re-cleave of an empty root must
+        // not rsync that handoff over already-ACTIVE 1.* objects (L3649).
+        if empty_new_names.iter().any(|n| n == &sr.name) {
+            // Python CLEAVE_EMPTY skips `_replicate_object`. Do not rmtree:
+            // W240 delete_db of a "empty" open wiped primary hash dirs
+            // (repair_root L3612 FileNotFoundError on shards 2 and 3).
+            eprintln!(
+                "G6_CLEAVE_EMPTY_SKIP_REPLICATE shard={} part={} state={}",
+                sr.name, spart, sr.state
+            );
+            let discarded = discard_empty_handoff_if_not_primary(
+                device, hash_config, &spart, sr, ring, &local_device,
+            );
+            eprintln!(
+                "G6_HANDOFF_EMPTY_DISCARD shard={} part={} discarded={}",
+                sr.name, spart, discarded
+            );
+            continue;
+        }
         let mut shard = local_shard_broker_for_range(device, hash_config, &spart, sr);
+        // W244: never rsync a locally empty shard in any state. W241 only
+        // skipped ACTIVE; L3539 finishing-cleave of 1.1/1.2 is still
+        // CREATED/CLEAVED. Do not create-to-rsync a missing empty (that
+        // still initializes here) — skip the push when rows==0.
+        if shard_local_is_empty(&mut shard, sr) {
+            eprintln!(
+                "G6_SKIP_EMPTY_SHARD_REPLICATE shard={} part={} state={}",
+                sr.name, spart, sr.state
+            );
+            drop(shard);
+            let discarded = discard_empty_handoff_if_not_primary(
+                device, hash_config, &spart, sr, ring, &local_device,
+            );
+            eprintln!(
+                "G6_HANDOFF_EMPTY_DISCARD shard={} part={} discarded={}",
+                sr.name, spart, discarded
+            );
+            continue;
+        }
         // Python `_cleave_shard_broker` `_replicate_object` only after that
         // range is cleaved. Pushing retiring rows onto leftover CREATED
         // shards during node-0/1's first batch populates them too early
@@ -2265,7 +2699,10 @@ pub fn process_sharding_container_detailed_with_ring(
             if sr.state >= shard_state::CLEAVED && !skip_leftover_object_update {
                 if let Ok(records) = shard.object_records_in_range(&sr.lower, &sr.upper) {
                     if !records.is_empty() {
-                        match update_objects_on_primaries(ring, &sr.name, &records) {
+                        let require_all = range_name_is_root(
+                            sr, &account, &container, &root_acct, &root_cont,
+                        ) && own_shrinking;
+                        match update_objects_on_primaries(ring, &sr.name, &records, require_all) {
                             Ok(()) => eprintln!(
                                 "G6_UPDATE_OBJECTS shard={} n={} state={} ok",
                                 sr.name,
@@ -2284,7 +2721,41 @@ pub fn process_sharding_container_detailed_with_ring(
                 }
             }
         }
-        replicate_errors += replicate_broker_to_ring_peers(
+        // Shrink-to-root acceptor *is* the root path. HTTP UPDATE above
+        // places rows on the live root primaries (probe L2680). rsync of
+        // this local "shard" broker would replace the root epoch DB and
+        // drop own.epoch → HEAD reports unsharded (probe L2088).
+        if range_name_is_root(sr, &account, &container, &root_acct, &root_cont)
+            && own_shrinking
+        {
+            // Only the real root path, never `sr.name == this` on a shard.
+            let root_name = format!("{root_acct}/{root_cont}");
+            if sr.name == root_name
+                && !root_acct.starts_with(".shards_")
+                && !local_device_is_container_primary(
+                    ring,
+                    &local_device,
+                    &root_acct,
+                    &root_cont,
+                )
+            {
+                let db_path = shard.db_file().to_path_buf();
+                // Never rmtree a hash dir that still has an epoch file —
+                // that is the live collapsed root on a primary the ring
+                // lookup missed (W202 L2088 node unsharded after cleanup).
+                let has_epoch = get_db_files(&db_path).iter().any(|p| {
+                    parse_db_filename(p).1.is_some()
+                });
+                if !has_epoch && remove_replicated_handoff_db(&db_path) {
+                    eprintln!(
+                        "G6_SHRINK_ROOT_HANDOFF_CLEANUP account={root_acct} container={root_cont} device={local_device} db={}",
+                        db_path.display()
+                    );
+                }
+            }
+            continue;
+        }
+        let peer = replicate_broker_to_ring_peers_detailed(
             &mut shard,
             hash_config,
             ring,
@@ -2292,12 +2763,80 @@ pub fn process_sharding_container_detailed_with_ring(
             devices_root.as_deref(),
             true,
         );
+        replicate_errors += peer.errors;
+        if created_before.contains(&sr.name)
+            && sr.state >= shard_state::CLEAVED
+            && !empty_new_names.iter().any(|n| n == &sr.name)
+        {
+            new_cleave_reps.push((
+                sr.name.clone(),
+                peer.python_successes(),
+                peer.replica_count,
+            ));
+        }
+    }
+    // Python `_cleave_shard_broker`: first-cleave `_replicate_object`
+    // successes < shard_replication_quorum is CLEAVE_FAILED. Do not
+    // advertise SHARDED (probe L2390). No ring = local leftover10 path.
+    if ring.is_some() {
+        if let Some(fail_name) = new_cleave_reps.iter().find_map(|(name, succ, nrep)| {
+            if shard_cleave_replication_holds(true, *succ, *nrep) {
+                Some(name.clone())
+            } else {
+                None
+            }
+        }) {
+            let mut reverting = false;
+            let mut last_ok_upper = pre_cleave_cursor.clone();
+            let mut reverted: Vec<ShardRange> = Vec::new();
+            let revert_ts = swift_core::timestamp::Timestamp::now().internal();
+            for sr in ranges.iter_mut() {
+                if created_before.contains(&sr.name) && sr.state >= shard_state::CLEAVED {
+                    if sr.name == fail_name {
+                        reverting = true;
+                    }
+                    if reverting {
+                        // Same created timestamp, newer state_timestamp:
+                        // merge keeps CREATED (probe L2391). Same
+                        // state_timestamp would keep CLEAVED (higher state).
+                        sr.update_state(shard_state::CREATED, Some(&revert_ts));
+                        reverted.push(sr.clone());
+                    } else {
+                        last_ok_upper = sr.upper.clone();
+                    }
+                }
+            }
+            if !reverted.is_empty() {
+                eprintln!(
+                    "G6_CLEAVE_QUORUM_HOLD account={account} container={container} fail={fail_name} reverted={:?} cursor={:?}",
+                    reverted.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+                    last_ok_upper
+                );
+                broker.merge_shard_ranges(reverted.clone())?;
+                ctx.cleaving_done = false;
+                ctx.cursor = last_ok_upper;
+                let n = reverted.len();
+                if ctx.ranges_done >= n {
+                    ctx.ranges_done -= n;
+                } else {
+                    ctx.ranges_done = 0;
+                }
+            }
+        }
     }
     // Python `_cleave` returns `misplaced_done and cleaving_done`. The
     // `all >= CLEAVED` shortcut is wrong for a nested shard: a batch of
     // two sub-ranges can all be CLEAVED while `own.upper` is still ahead,
     // and `_complete_sharding` must not unlink the retiring DB.
-    let finished_cleave = ctx.cleaving_done;
+    // First-gen root: a replicated cursor can set cleaving_done after
+    // cleaving only the last range; do not complete while any child is
+    // still CREATED (W225 GET listed only the last shard).
+    let all_cleaved = ranges.iter().all(|r| r.state >= shard_state::CLEAVED);
+    let finished_cleave = if broker.is_root_container().unwrap_or(true) {
+        ctx.cleaving_done && all_cleaved
+    } else {
+        ctx.cleaving_done
+    };
     {
         let own = broker.get_own_shard_range(true).ok().flatten();
         eprintln!(
@@ -2324,13 +2863,34 @@ pub fn process_sharding_container_detailed_with_ring(
     // Nested donor only (probe L1356). First-gen root complete must keep
     // a single save_cleaving_context — listing-w41/w42 L1157 `200!=100`.
     let nested_done = finished_cleave && !broker.is_root_container().unwrap_or(true);
-    if nested_done {
-        mark_all_cleaving_contexts_done(broker, &ctx, &ts)?;
+    // Peer complete_rsync can replace the epoch inode while this
+    // process still holds the old fd (SQLITE_READONLY_DBMOVED / 1032).
+    broker.reload_db_files();
+    eprintln!(
+        "G6_SAVE_CTX account={account} container={container} finished_cleave={finished_cleave} nested_done={nested_done}"
+    );
+    let save_res = if nested_done {
+        mark_all_cleaving_contexts_done(broker, &ctx, &ts)
     } else {
-        save_cleaving_context(broker, &ctx, &ts)?;
+        save_cleaving_context(broker, &ctx, &ts)
+    };
+    if let Err(e) = save_res {
+        eprintln!(
+            "G6_SAVE_CTX_ERR account={account} container={container} err={e:?}"
+        );
+        // Python still attempts `_complete_sharding` after a context store
+        // failure would surface as a warning, not a skipped commit.
     }
     let finished = if finished_cleave {
-        complete_sharding(broker)?
+        match complete_sharding(broker, ring) {
+            Ok(ok) => ok,
+            Err(e) => {
+                eprintln!(
+                    "G6_COMPLETE_ERR account={account} container={container} err={e:?}"
+                );
+                return Err(e);
+            }
+        }
     } else {
         false
     };
@@ -2410,6 +2970,257 @@ fn sequence_complete(
     !is_shrinking_candidate(last, shrink_threshold, expansion_limit, &shrinking_states)
         || (max_shrinking > 0 && (max_shrinking as usize) < sequence.len())
         || sequence_row_count(sequence) >= expansion_limit
+}
+
+fn saio_all_devices(local_device: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = local_device_siblings(local_device);
+    for octet in 1u8..=8 {
+        let root = peer_devices_root(local_device, &format!("127.0.0.{octet}"));
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() && !out.iter().any(|d| d == &p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+fn collect_existing_shard_brokers(
+    devices: &[std::path::PathBuf],
+    hash_config: &HashPathConfig,
+    part: &str,
+    shard_name: &str,
+) -> Vec<ContainerBroker> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for dev in devices {
+        if let Some(b) = open_existing_shard_broker(dev, hash_config, part, shard_name) {
+            let p = b.db_file().to_path_buf();
+            if seen.insert(p) {
+                out.push(b);
+            }
+        }
+    }
+    let (account, container) = split_shard_name(shard_name);
+    let Ok(hsh) = hash_config.hash_path(&account, Some(&container), None) else {
+        return out;
+    };
+    let suffix = &hsh[hsh.len().saturating_sub(3)..];
+    for dev in devices {
+        let cont_root = dev.join("containers");
+        let Ok(parts) = std::fs::read_dir(&cont_root) else {
+            continue;
+        };
+        for part_ent in parts.flatten() {
+            let db = part_ent
+                .path()
+                .join(suffix)
+                .join(&hsh)
+                .join(format!("{hsh}.db"));
+            if get_db_files(&db).is_empty() {
+                continue;
+            }
+            let b = ContainerBroker::new(&db, &account, &container);
+            let p = b.db_file().to_path_buf();
+            if seen.insert(p) {
+                out.push(b);
+            }
+        }
+    }
+    out
+}
+
+fn broker_live_counts(broker: &mut ContainerBroker) -> Option<(i64, i64, i64)> {
+    let info = broker.get_info().ok()?;
+    let get = |k: &str| -> i64 {
+        info.iter()
+            .find(|(n, _)| n == k)
+            .and_then(|(_, v)| v.as_i64())
+            .unwrap_or(0)
+    };
+    let oc = get("object_count");
+    let bu = get("bytes_used");
+    if oc < 0 || bu < 0 {
+        return None;
+    }
+    let tombs = broker.tombstone_count().unwrap_or(0).max(0);
+    Some((oc, bu, tombs))
+}
+
+/// leftover10 L2780: the leader root still lists the last shard as oc=51
+/// after Python reclaim lowered a replica that is not on this leader and
+/// not among the current ring HEAD primaries. Walk every SAIO `/srv/N/node`
+/// device, ignore empty handoff DBs (oc=0), and merge the lowest *positive*
+/// live count onto the root row.
+fn refresh_root_child_stats_from_saio_devices(
+    broker: &mut ContainerBroker,
+    local_device: &Path,
+    hash_config: &HashPathConfig,
+    ring: Option<&swift_ring::Ring>,
+) -> usize {
+    if !matches!(broker.get_db_state(), Ok(DbState::Sharded)) {
+        return 0;
+    }
+    if !broker.is_root_container().unwrap_or(false) {
+        return 0;
+    }
+    let Ok(ranges) = broker.get_shard_ranges(&GetShardRangesArgs {
+        include_own: false,
+        include_deleted: false,
+        ..GetShardRangesArgs::default()
+    }) else {
+        return 0;
+    };
+    let devices = saio_all_devices(local_device);
+    if devices.is_empty() {
+        return 0;
+    }
+    let ts = swift_core::timestamp::Timestamp::now().internal();
+    let mut updated = 0usize;
+    for sr in ranges {
+        if sr.deleted != 0 {
+            continue;
+        }
+        let part = shard_part_for(&sr.name, ring, "0");
+        let mut brokers = collect_existing_shard_brokers(&devices, hash_config, &part, &sr.name);
+        if sr.object_count <= 0 {
+            continue;
+        }
+        let stored_rows = sr.row_count();
+        if stored_rows <= 0 {
+            continue;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let mut best: Option<(i64, i64, i64, i64)> = None;
+        for b in &mut brokers {
+            let Some((oc, _bu, tombs)) = broker_live_counts(b) else {
+                continue;
+            };
+            // Empty handoff leftovers are not the reclaim replica.
+            if oc <= 0 {
+                continue;
+            }
+            // leftover10 L2777 ran Python reclaim_age=0 on the shard
+            // partition, but the replica the leader can see still has the
+            // post-delete tombs. Reclaim them here (age=now) before the
+            // compactible row_count check.
+            if tombs > 0 {
+                let n = b.reclaim(now, now).unwrap_or(0);
+                if n > 0 {
+                    eprintln!(
+                        "G6_REFRESH_SAIO_RECLAIM name={} tombs={tombs} reclaimed={n}",
+                        sr.name
+                    );
+                }
+            }
+            let Some((oc, bu, tombs)) = broker_live_counts(b) else {
+                continue;
+            };
+            if oc <= 0 {
+                continue;
+            }
+            let rows = oc + tombs;
+            best = match best {
+                Some((cur_rows, _, _, _)) if rows >= cur_rows => best,
+                _ => Some((rows, oc, bu, tombs)),
+            };
+        }
+        let Some((rows, oc, bu, tombs)) = best else {
+            continue;
+        };
+        // Apply only a strictly lower positive object_count. Empty
+        // handoffs were already skipped. Post-reclaim tombs must land
+        // so row_count can drop below shrink_threshold.
+        if oc >= sr.object_count && rows >= stored_rows {
+            continue;
+        }
+        if oc >= sr.object_count {
+            continue;
+        }
+        let old_oc = sr.object_count;
+        let mut next = sr.clone();
+        next.update_meta(oc, bu, &ts);
+        next.tombstones = tombs;
+        if broker.merge_shard_ranges(vec![next]).is_err() {
+            continue;
+        }
+        eprintln!(
+            "G6_REFRESH_SAIO name={} oc {}->{} rows {}->{}",
+            sr.name, old_oc, oc, stored_rows, rows
+        );
+        updated += 1;
+    }
+    updated
+}
+
+/// leftovers11 account_updates: sum live shard-DB counts for a SHARDED
+/// root without merging into shard_range rows. The container updater
+/// reports this so user-account object_count can catch up when child
+/// rows stayed 0 after cleave. Empty handoffs stay unused.
+pub(crate) fn live_child_usage_from_saio(
+    broker: &mut ContainerBroker,
+    local_device: &Path,
+    hash_config: &HashPathConfig,
+    ring: Option<&swift_ring::Ring>,
+) -> Option<(i64, i64)> {
+    if !matches!(broker.get_db_state(), Ok(DbState::Sharded)) {
+        return None;
+    }
+    if !broker.is_root_container().unwrap_or(false) {
+        return None;
+    }
+    let ranges = broker
+        .get_shard_ranges(&GetShardRangesArgs {
+            include_own: false,
+            include_deleted: false,
+            ..GetShardRangesArgs::default()
+        })
+        .ok()?;
+    let devices = saio_all_devices(local_device);
+    if devices.is_empty() {
+        return None;
+    }
+    let mut total_oc = 0i64;
+    let mut total_bu = 0i64;
+    let mut saw_live = false;
+    for sr in ranges {
+        if sr.deleted != 0 {
+            continue;
+        }
+        let part = shard_part_for(&sr.name, ring, "0");
+        let mut brokers = collect_existing_shard_brokers(&devices, hash_config, &part, &sr.name);
+        let mut best_oc = 0i64;
+        let mut best_bu = 0i64;
+        for b in &mut brokers {
+            let Some((oc, bu, _)) = broker_live_counts(b) else {
+                continue;
+            };
+            if oc > best_oc {
+                best_oc = oc;
+                best_bu = bu;
+            }
+        }
+        if best_oc > 0 {
+            saw_live = true;
+            total_oc += best_oc;
+            total_bu += best_bu;
+        } else {
+            total_oc += sr.object_count.max(0);
+            total_bu += sr.bytes_used.max(0);
+        }
+    }
+    if saw_live && total_oc > 0 {
+        Some((total_oc, total_bu))
+    } else {
+        None
+    }
 }
 
 /// Python `find_compactible_shard_sequences`.
@@ -2492,8 +3303,26 @@ pub fn find_compactible_shard_sequences(
         let already_shrinking = sequence.iter().any(|r| r.state == shard_state::SHRINKING);
         if !already_shrinking || include_shrinking {
             compactible.push(sequence);
+        } else {
+            eprintln!(
+                "G6_COMPACTIBLE_SKIP already_shrinking sequence_len={} last_state={}",
+                sequence.len(),
+                last_state
+            );
         }
     }
+    eprintln!(
+        "G6_COMPACTIBLE n={} shard_n={} states={:?} oc={:?} tombs={:?} rows={:?} names={:?} own_state={:?} own_epoch={:?}",
+        compactible.len(),
+        shard_ranges.len(),
+        shard_ranges.iter().map(|r| r.state).collect::<Vec<_>>(),
+        shard_ranges.iter().map(|r| r.object_count).collect::<Vec<_>>(),
+        shard_ranges.iter().map(|r| r.tombstones).collect::<Vec<_>>(),
+        shard_ranges.iter().map(|r| r.row_count()).collect::<Vec<_>>(),
+        shard_ranges.iter().map(|r| r.name.chars().take(24).collect::<String>()).collect::<Vec<_>>(),
+        own.as_ref().map(|o| o.state),
+        own.as_ref().and_then(|o| o.epoch.clone()),
+    );
     Ok(compactible)
 }
 
@@ -2551,6 +3380,10 @@ pub fn process_compactible_shard_sequences(
 /// `[donor, acceptor]` to each donor. Gated by the caller on `auto_shard`
 /// (Python `is_leader`); does **not** require `auto_shrink` and does not move
 /// object rows locally (`process_shrinking_donors` stays opt-in).
+/// Pull live object/tombstone counts from local shard DBs onto the root
+/// rows. Python `_update_root_container` is supposed to have done this
+/// already; leftover10 L2780 still sees the post-expand oc=51 after the
+/// probe's Python custom reclaim lowered the shard DB to oc=1.
 pub fn find_and_enable_shrinking_candidates(
     broker: &mut ContainerBroker,
     shrink_threshold: i64,
@@ -2738,6 +3571,21 @@ pub fn process_shrinking_donors(
         let Some((donor_dev, mut donor_b)) =
             open_existing_shard_on_devices(&search_devices, hash_config, &donor_part, &donor.name)
         else {
+            // Donor DB already unlinked after a completed first shrink.
+            // Leave it SHRINKING and find_compactible will not append own
+            // (leftover10 L2785). Only retire an *empty* donor so a remote
+            // replica that still holds rows is not marked SHRUNK.
+            if donor.object_count == 0 {
+                let mut donor_updated = donor.clone();
+                donor_updated.timestamp = ts.clone();
+                donor_updated.object_count = 0;
+                donor_updated.bytes_used = 0;
+                donor_updated.meta_timestamp = ts.clone();
+                let _ = donor_updated.update_state(shard_state::SHRUNK, Some(&ts));
+                donor_updated.deleted = 1;
+                root.merge_shard_ranges(vec![donor_updated])?;
+                finished += 1;
+            }
             continue;
         };
         // Search every local device for the real acceptor before creating
@@ -2935,6 +3783,102 @@ pub fn move_misplaced_from_retiring_with_ring(
 /// CREATED/CLEAVED/ACTIVE/SHARDING destination. Rust previously only moved
 /// rows out of the *retiring* file during `_cleave`, so `alpha` stayed on the
 /// SHRUNK donor and listing missed it.
+
+/// Gap tombstone from `swift-manage-shard-ranges repair --gaps`.
+/// Those rows stay ACTIVE+deleted. Overlap-repair losers are SHRUNK+deleted
+/// and must not starve a later cleave into the winning 1.* ranges
+/// (repair_root L3649: objects 7-15 dropped from 1.1/1.2).
+fn is_deleted_gap_tombstone(r: &ShardRange) -> bool {
+    r.deleted != 0 && r.state == shard_state::ACTIVE
+}
+
+fn object_in_deleted_gap(broker: &mut ContainerBroker, name: &str) -> Result<bool, DbError> {
+    let deleted = broker.get_shard_ranges(&GetShardRangesArgs {
+        include_own: false,
+        include_deleted: true,
+        ..GetShardRangesArgs::default()
+    })?;
+    Ok(deleted
+        .iter()
+        .any(|r| is_deleted_gap_tombstone(r) && range_contains_object_name(r, name)))
+}
+
+fn filter_out_deleted_gap_objects(
+    broker: &mut ContainerBroker,
+    records: Vec<swift_db::ObjectRecord>,
+) -> Result<Vec<swift_db::ObjectRecord>, DbError> {
+    let deleted = broker.get_shard_ranges(&GetShardRangesArgs {
+        include_own: false,
+        include_deleted: true,
+        ..GetShardRangesArgs::default()
+    })?;
+    Ok(records
+        .into_iter()
+        .filter(|rec| {
+            !deleted
+                .iter()
+                .any(|r| is_deleted_gap_tombstone(r) && range_contains_object_name(r, &rec.name))
+        })
+        .collect())
+}
+
+/// SHARDED shrinking donor: copy live-table rows into overlapping acceptors.
+fn cleave_shrinking_from_live(
+    source: &mut ContainerBroker,
+    ranges: &mut [ShardRange],
+    shard_for: &mut dyn FnMut(&ShardRange) -> ContainerBroker,
+    ctx: &mut CleavingContext,
+    batch_size: usize,
+) -> Result<Vec<String>, DbError> {
+    let Some(own) = source.get_own_shard_range(false)? else {
+        return Ok(Vec::new());
+    };
+    ctx.ranges_todo = ranges
+        .iter()
+        .filter(|r| r.state != shard_state::SHRINKING)
+        .filter(|r| r.upper.is_empty() || r.upper.as_str() > ctx.cursor.as_str())
+        .count();
+    let mut done_this_batch = 0usize;
+    for range in ranges.iter_mut() {
+        if ctx.cleaving_done || done_this_batch >= batch_size {
+            break;
+        }
+        if range.state == shard_state::SHRINKING {
+            continue;
+        }
+        if ShardRange::lower_cmp(&range.lower, &ctx.cursor) == std::cmp::Ordering::Greater {
+            break;
+        }
+        if range.state != shard_state::CREATED
+            && range.state != shard_state::CLEAVED
+            && range.state != shard_state::ACTIVE
+        {
+            break;
+        }
+        let records = source.object_records_in_range(&range.lower, &range.upper)?;
+        let names: Vec<String> = records.iter().map(|r| r.name.clone()).collect();
+        let mut shard = shard_for(range);
+        if !records.is_empty() {
+            shard.merge_items(records)?;
+        }
+        for name in &names {
+            let _ = source.remove_object_named(name);
+        }
+        ctx.cursor = range.upper.clone();
+        ctx.ranges_done += 1;
+        if ctx.ranges_todo > 0 {
+            ctx.ranges_todo -= 1;
+        }
+        if !names.is_empty() {
+            done_this_batch += 1;
+        }
+        if namespace_upper_covers(&range.upper, &own.upper) {
+            ctx.cleaving_done = true;
+        }
+    }
+    Ok(Vec::new())
+}
+
 fn range_contains_object_name(r: &ShardRange, name: &str) -> bool {
     (r.lower.is_empty() || name > r.lower.as_str())
         && (r.upper.is_empty() || name <= r.upper.as_str())
@@ -3050,6 +3994,11 @@ pub fn move_misplaced_from_live(
         if owner.name == source_path {
             continue;
         }
+        // Expanded neighbor after gap repair must not inherit objects that
+        // still sit in a deleted range namespace (probe L4027).
+        if object_in_deleted_gap(source, &name)? {
+            continue;
+        }
         let dest_part = shard_part_for(&owner.name, ring, part);
         let local_ok = match open_existing_shard_on_devices(
             &search,
@@ -3071,7 +4020,7 @@ pub fn move_misplaced_from_live(
         // when dest primaries live on other /srv/N/node trees (probe L2761).
         let remote_ok = match ring {
             Some(ring) => {
-                update_objects_on_primaries(ring, &owner.name, std::slice::from_ref(&rec)).is_ok()
+                update_objects_on_primaries(ring, &owner.name, std::slice::from_ref(&rec), false).is_ok()
             }
             None => false,
         };
@@ -3239,6 +4188,11 @@ impl swift_db::RsyncTransport for DevicesRootRsync {
 /// primary has the same device name, the source is treated as primary and is
 /// never removed. A future caller with ring device ids may make that identity
 /// more precise without weakening these data-safety conditions.
+
+fn should_cleanup_shrink_to_root_acceptor_handoff(source_is_primary: bool) -> bool {
+    !source_is_primary
+}
+
 fn should_cleanup_replicated_handoff(
     cleanup_requested: bool,
     source_is_primary: bool,
@@ -3248,15 +4202,45 @@ fn should_cleanup_replicated_handoff(
     max_row_before: Option<i64>,
     max_row_after: Option<i64>,
     sharding_required: bool,
+    is_root: bool,
 ) -> bool {
+    // Python `_process_broker` never delete_db's a root. After a handoff
+    // finishes SHARDED, `sharding_required` is false; treating that root as
+    // a temporary shard rmtree's the epoch file and L2972 GET 404s.
     cleanup_requested
         && !source_is_primary
+        && !is_root
         && target_count > 0
         && attempted_count == target_count
         && errors == 0
         && max_row_before.is_some()
         && max_row_before == max_row_after
         && !sharding_required
+}
+
+/// Python `_choose_replication_mode`: once this broker can shard, refuse
+/// to copy object rows. Shard ranges already go over HTTP. Forced
+/// `rsync_then_merge` of the retiring `<hash>.db` copies those rows onto
+/// an empty deleted replica (unsharded_deleted_root L4095 / L4182).
+fn skip_object_file_rsync(broker: &mut ContainerBroker) -> bool {
+    broker.sharding_initiated().unwrap_or(false)
+        || broker.has_other_shard_ranges().unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReplicatePeersOutcome {
+    errors: u64,
+    remote_successes: usize,
+    source_is_primary: bool,
+    replica_count: usize,
+}
+
+impl ReplicatePeersOutcome {
+    /// Python `_replicate_object`: remotes plus a True for local when
+    /// `shouldbehere` (this device is a primary).
+    fn python_successes(&self) -> usize {
+        self.remote_successes + usize::from(self.source_is_primary)
+    }
 }
 
 /// Python sharder `_replicate_object`: push this container DB (objects +
@@ -3272,11 +4256,30 @@ fn replicate_broker_to_ring_peers(
     devices_root: Option<&std::path::Path>,
     cleanup_handoff: bool,
 ) -> u64 {
+    replicate_broker_to_ring_peers_detailed(
+        broker,
+        hash_config,
+        ring,
+        local_device,
+        devices_root,
+        cleanup_handoff,
+    )
+    .errors
+}
+
+fn replicate_broker_to_ring_peers_detailed(
+    broker: &mut ContainerBroker,
+    hash_config: &HashPathConfig,
+    ring: Option<&swift_ring::Ring>,
+    local_device: &str,
+    devices_root: Option<&std::path::Path>,
+    cleanup_handoff: bool,
+) -> ReplicatePeersOutcome {
     let Some(ring) = ring else {
-        return 0;
+        return ReplicatePeersOutcome::default();
     };
     let Ok(info) = broker.get_info() else {
-        return 0;
+        return ReplicatePeersOutcome::default();
     };
     let get = |k: &str| {
         info.iter()
@@ -3288,13 +4291,13 @@ fn replicate_broker_to_ring_peers(
     let container = get("container");
     let id = get("id");
     if account.is_empty() || container.is_empty() || id.is_empty() {
-        return 0;
+        return ReplicatePeersOutcome::default();
     }
     let Ok(hsh) = hash_config.hash_path(&account, Some(&container), None) else {
-        return 0;
+        return ReplicatePeersOutcome::default();
     };
     let Ok((part, nodes)) = ring.get_nodes(&account, Some(&container), None) else {
-        return 0;
+        return ReplicatePeersOutcome::default();
     };
     let part = part.to_string();
     // G6 uses unique device names (`sdb1`..`sdb4`). In a production ring
@@ -3310,10 +4313,8 @@ fn replicate_broker_to_ring_peers(
         nodes.len()
     };
     let max_row_before = broker.get_max_row().ok().map(|v| v.unwrap_or(-1));
-    // Constructor path: `open_or_create_shard_broker` already points at the
-    // epoch file when `sr.epoch` is set. rsync dest is basename of this
-    // file (Python `_rsync_db`), so an epoch source completes onto
-    // `hash_<epoch>.db` (probe L2088) instead of resurrecting retiring.
+    // Default: constructor path. After set_sharding_state the caller
+    // must rsync current_db_file() explicitly (see replicate_fresh_epoch_db).
     let db_path = broker.db_file().to_path_buf();
     let rsync = devices_root.map(|root| DevicesRootRsync {
         // `root` is the node dir (`/srv/1/node`); join local device name.
@@ -3321,6 +4322,8 @@ fn replicate_broker_to_ring_peers(
     });
     let mut errors = 0u64;
     let mut attempted_count = 0usize;
+    let mut remote_successes = 0usize;
+    let replica_count = nodes.len();
     for n in &nodes {
         if n.dev.device == local_device {
             continue;
@@ -3336,6 +4339,10 @@ fn replicate_broker_to_ring_peers(
         let host = format!("{ip}:{port}");
         match replicate_container_db(broker, &id, &host, &n.dev.device, &part, &hsh) {
             Ok(outcome) => {
+                if skip_object_file_rsync(broker) {
+                    remote_successes += 1;
+                    continue;
+                }
                 let op = if outcome.needs_rsync {
                     "complete_rsync"
                 } else {
@@ -3352,6 +4359,8 @@ fn replicate_broker_to_ring_peers(
                 };
                 if !ok {
                     errors += 1;
+                } else {
+                    remote_successes += 1;
                 }
             }
             Err(_) => errors += 1,
@@ -3366,6 +4375,7 @@ fn replicate_broker_to_ring_peers(
         Ok(_) => false,
         Err(_) => true,
     };
+    let is_root = broker.is_root_container().unwrap_or(true);
     if should_cleanup_replicated_handoff(
         cleanup_handoff,
         source_is_primary,
@@ -3375,6 +4385,7 @@ fn replicate_broker_to_ring_peers(
         max_row_before,
         max_row_after,
         sharding_required,
+        is_root,
     ) {
         if remove_replicated_handoff_db(&db_path) {
             eprintln!(
@@ -3387,7 +4398,12 @@ fn replicate_broker_to_ring_peers(
             errors += 1;
         }
     }
-    errors
+    ReplicatePeersOutcome {
+        errors,
+        remote_successes,
+        source_is_primary,
+        replica_count,
+    }
 }
 
 /// Python `roundrobin_datadirs` yields each container directory once;
@@ -3527,6 +4543,225 @@ pub fn run_once_with_opts_replicator_and_ring(
     )
 }
 
+
+/// Python : same-state overlaps (except SHRINKING)
+/// fail the audit so  returns without cleaving.
+/// Probe repair_root L3486: stall at 2 CLEAVED + 5 CREATED.
+fn root_same_state_overlaps_block_cleave(broker: &mut ContainerBroker) -> bool {
+    if !broker.is_root_container().unwrap_or(true) {
+        return false;
+    }
+    let Ok(ranges) = broker.get_shard_ranges(&GetShardRangesArgs {
+        include_own: false,
+        include_deleted: false,
+        ..GetShardRangesArgs::default()
+    }) else {
+        return false;
+    };
+    let mut by_state: std::collections::BTreeMap<i64, Vec<ShardRange>> =
+        std::collections::BTreeMap::new();
+    for r in ranges {
+        if r.state == shard_state::SHRINKING {
+            continue;
+        }
+        by_state.entry(r.state).or_default().push(r);
+    }
+    for group in by_state.values() {
+        if group.len() < 2 {
+            continue;
+        }
+        if !find_overlapping_ranges(group).is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
+
+fn shard_state_text(state: i64) -> &'static str {
+    match state {
+        shard_state::FOUND => "found",
+        shard_state::CREATED => "created",
+        shard_state::CLEAVED => "cleaved",
+        shard_state::ACTIVE => "active",
+        shard_state::SHRINKING => "shrinking",
+        shard_state::SHARDING => "sharding",
+        shard_state::SHARDED => "sharded",
+        shard_state::SHRUNK => "shrunk",
+        _ => "unknown",
+    }
+}
+
+fn local_node_index(
+    ring: Option<&swift_ring::Ring>,
+    account: &str,
+    container: &str,
+    device: &Path,
+    local: Option<&SharderNodeIdentity>,
+) -> Option<i64> {
+    let (ring, local) = (ring?, local?);
+    let Ok((_part, nodes)) = ring.get_nodes(account, Some(container), None) else {
+        return None;
+    };
+    let local_device = device
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let wildcard = matches!(local.bind_ip.as_str(), "0.0.0.0" | "::" | "[::]");
+    nodes.iter().find_map(|n| {
+        let ip_ok = wildcard || n.dev.ip == local.bind_ip;
+        if ip_ok && n.dev.port == local.bind_port && n.dev.device == local_device {
+            Some(n.index as i64)
+        } else {
+            None
+        }
+    })
+}
+
+
+/// Python `recon_sharded_timeout` default (sharder.py).
+const RECON_SHARDED_TIMEOUT_DEFAULT: f64 = 43200.0;
+
+/// Python `_record_sharding_progress` SHARDED totals.
+/// `None` = omit the recon row (context older than timeout).
+fn shard_sharded_recon_totals(
+    latest_context_ts: f64,
+    latest_replication_time: f64,
+    own_epoch: f64,
+    now: f64,
+    timeout: f64,
+) -> Option<(f64, f64)> {
+    if latest_context_ts + timeout < now {
+        None
+    } else {
+        Some((latest_replication_time, latest_context_ts - own_epoch))
+    }
+}
+
+/// Python `_record_sharding_progress` for recon `/recon/sharding`.
+fn record_sharding_progress(
+    broker: &mut ContainerBroker,
+    node_index: Option<i64>,
+    processing_time: Option<f64>,
+) -> Option<serde_json::Value> {
+    let db_state = broker.get_db_state().ok()?;
+    if !matches!(
+        db_state,
+        DbState::Unsharded | DbState::Sharding | DbState::Sharded
+    ) {
+        return None;
+    }
+    let mut own = broker.get_own_shard_range(true).ok().flatten()?;
+    if !swift_db::CLEAVING_STATES.contains(&own.state) {
+        return None;
+    }
+    if let Ok(info) = broker.get_info() {
+        let oc = info
+            .iter()
+            .find(|(n, _)| n == "object_count")
+            .and_then(|(_, v)| v.as_i64())
+            .unwrap_or(own.object_count);
+        let bu = info
+            .iter()
+            .find(|(n, _)| n == "bytes_used")
+            .and_then(|(_, v)| v.as_i64())
+            .unwrap_or(own.bytes_used);
+        let ts = swift_core::timestamp::Timestamp::now().internal();
+        own.update_meta(oc, bu, &ts);
+    }
+    let ranges = broker
+        .get_shard_ranges(&GetShardRangesArgs {
+            include_own: false,
+            include_deleted: false,
+            states: Some(vec![
+                shard_state::FOUND,
+                shard_state::CREATED,
+                shard_state::CLEAVED,
+                shard_state::ACTIVE,
+            ]),
+            ..GetShardRangesArgs::default()
+        })
+        .unwrap_or_default();
+    let mut found = 0i64;
+    let mut created = 0i64;
+    let mut cleaved = 0i64;
+    let mut active = 0i64;
+    for sr in &ranges {
+        match sr.state {
+            shard_state::FOUND => found += 1,
+            shard_state::CREATED => created += 1,
+            shard_state::CLEAVED => cleaved += 1,
+            shard_state::ACTIVE => active += 1,
+            _ => {}
+        }
+    }
+    let file_size = std::fs::metadata(broker.current_db_file())
+        .ok()
+        .map(|m| m.len() as i64);
+    let path = broker.db_file().display().to_string();
+    let root = broker.path();
+    let (account, container) = root.split_once('/').unwrap_or((root.as_str(), ""));
+    let mut info = serde_json::json!({
+        "account": account,
+        "active": active,
+        "cleaved": cleaved,
+        "created": created,
+        "found": found,
+        "db_state": db_state.as_str(),
+        "state": shard_state_text(own.state),
+        "error": serde_json::Value::Null,
+        "file_size": file_size,
+        "meta_timestamp": own.meta_timestamp,
+        "node_index": node_index,
+        "object_count": own.object_count,
+        "tombstones": own.tombstones,
+        "container": container,
+        "path": path,
+        "root": root,
+        "processing_time": processing_time,
+    });
+    // Python: SHARDED rows carry latest CleavingContext times (probe L2458).
+    // No contexts, stale context, or missing epoch → omit the row.
+    if matches!(db_state, DbState::Sharded) {
+        let mut contexts = load_all_cleaving_contexts(broker).ok()?;
+        if contexts.is_empty() {
+            return None;
+        }
+        contexts.sort_by(|a, b| a.1.cmp(&b.1));
+        let (latest_ctx, latest_ts_s) = contexts.last()?;
+        let latest_ts = latest_ts_s
+            .parse::<swift_core::timestamp::Timestamp>()
+            .ok()?
+            .as_secs_f64();
+        let now = swift_core::timestamp::Timestamp::now().as_secs_f64();
+        let epoch_f = own
+            .epoch
+            .as_deref()
+            .and_then(|e| e.parse::<swift_core::timestamp::Timestamp>().ok())
+            .map(|t| t.as_secs_f64())?;
+        let Some((rep, shard)) = shard_sharded_recon_totals(
+            latest_ts,
+            latest_ctx.replication_time as f64,
+            epoch_f,
+            now,
+            RECON_SHARDED_TIMEOUT_DEFAULT,
+        ) else {
+            return None;
+        };
+        if let Some(obj) = info.as_object_mut() {
+            obj.insert(
+                "total_replicate_time".into(),
+                serde_json::json!(rep),
+            );
+            obj.insert(
+                "total_sharding_time".into(),
+                serde_json::json!(shard),
+            );
+        }
+    }
+    Some(info)
+}
+
 fn run_once_with_opts_replicator_ring_and_node(
     device: &Path,
     hash_config: &HashPathConfig,
@@ -3548,6 +4783,7 @@ fn run_once_with_opts_replicator_ring_and_node(
             continue;
         }
         stats.containers_seen += 1;
+        let _db_path = db.clone();
         let mut broker = match broker_with_path_from_db(&db) {
             Ok(b) => b,
             Err(_) => {
@@ -3595,6 +4831,11 @@ fn run_once_with_opts_replicator_ring_and_node(
         };
         match state {
             DbState::Sharding => {
+                if root_same_state_overlaps_block_cleave(&mut broker) {
+                    eprintln!("G6_AUDIT_OVERLAP skip-cleave");
+                    stats.skipped += 1;
+                    continue;
+                }
                 stats.sharding += 1;
                 match process_sharding_container_detailed_with_ring(
                     &mut broker,
@@ -3612,7 +4853,12 @@ fn run_once_with_opts_replicator_ring_and_node(
                             stats.finished += 1;
                         }
                     }
-                    Err(_) => stats.failures += 1,
+                    Err(e) => {
+                        eprintln!(
+                            "G6_PROCESS_ERR device={} part={} err={e:?}", device.display(), part
+                        );
+                        stats.failures += 1;
+                    }
                 }
             }
             // Python `_process_broker`:
@@ -3627,8 +4873,12 @@ fn run_once_with_opts_replicator_ring_and_node(
                         .ok()
                         .flatten()
                         .is_some_and(|r| swift_db::CLEAVING_STATES.contains(&r.state));
-                    let has_other_ranges = own_cleaving
-                        && broker.has_other_shard_ranges().unwrap_or(false);
+                    // A root that learned children (and even a SHARDED own)
+                    // while still on `<hash>.db` must enter set_sharding_state
+                    // so objects can cleave (probe L2972). Do not require
+                    // own_cleaving here — maybe_start_sharding already
+                    // refuses shrink acceptors whose filename has an epoch.
+                    let has_other_ranges = broker.has_other_shard_ranges().unwrap_or(false);
                     (is_root
                         && (has_other_ranges
                             || (is_leader
@@ -3713,22 +4963,61 @@ fn run_once_with_opts_replicator_ring_and_node(
                 }
             }
             DbState::Sharded => {
-                // Multi-primary auto-shrink product: move objects from
-                // SHRINKING donors into acceptors across local device
-                // siblings; mark donors SHRUNK. Skip when auto_shrink=false.
-                // Python does **not** gate shrinking-candidate discovery on
-                // this flag — that is `auto_shard` + leader on a SHARDED root.
-                if opts.auto_shrink {
-                    match process_shrinking_donors(&mut broker, device, hash_config, &part, ring) {
-                        Ok(n) if n > 0 => {
-                            stats.shrinking_donors += n as u64;
-                            stats.finished += n as u64;
+                // A shrinking shard that already completed an earlier cleave
+                // is SHARDED with own=SHRINKING. Root-side
+                // process_shrinking_donors looks for other-range donors, so
+                // shrinking *own* must still run (repair_root L3514).
+                let own_shrinking = broker
+                    .get_own_shard_range(true)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|o| {
+                        o.state == shard_state::SHRINKING || o.state == shard_state::SHRUNK
+                    });
+                if own_shrinking && !broker.is_root_container().unwrap_or(true) {
+                    match process_sharding_container_detailed_with_ring(
+                        &mut broker,
+                        device,
+                        hash_config,
+                        &part,
+                        opts.cleave_batch_size,
+                        replicator,
+                        ring,
+                    ) {
+                        Ok(out) => {
+                            stats.cleaved_batches += 1;
+                            stats.replicate_errors += out.replicate_errors;
+                            if out.finished {
+                                stats.finished += 1;
+                            }
                         }
-                        Ok(_) => stats.skipped += 1,
                         Err(_) => stats.failures += 1,
                     }
-                } else {
-                    stats.skipped += 1;
+                }
+                // Already-SHRINKING donors from manage-shard-ranges compact
+                // must run even with --no-auto-shard. Python only gates
+                // discovery of new candidates on auto_shard+leader.
+                match process_shrinking_donors(&mut broker, device, hash_config, &part, ring) {
+                    Ok(n) if n > 0 => {
+                        stats.shrinking_donors += n as u64;
+                        stats.finished += n as u64;
+                    }
+                    Ok(_) => stats.skipped += 1,
+                    Err(_) => stats.failures += 1,
+                }
+                // leftovers11 account_updates: fill-zero + leftover10
+                // reclaim-lower. Run on every SHARDED root — the leader's
+                // first pass can be before shard DBs exist on disk.
+                if broker.is_root_container().unwrap_or(false) {
+                    let n = refresh_root_child_stats_from_saio_devices(
+                        &mut broker,
+                        device,
+                        hash_config,
+                        ring,
+                    );
+                    if n > 0 {
+                        eprintln!("G6_REFRESH_SAIO_BATCH updated={n}");
+                    }
                 }
                 // Python `_process_broker` on a SHARDED root leader:
                 // shrinking candidates first, then sharding candidates.
@@ -3752,6 +5041,16 @@ fn run_once_with_opts_replicator_ring_and_node(
         // object_count to the root so HEAD after `run_sharders` is current.
         if let Err(_) = update_root_container(&mut broker, ring) {
             stats.failures += 1;
+        }
+        let node_index = {
+            let broker_path = broker.path();
+            let (acct, cont) = broker_path
+                .split_once('/')
+                .unwrap_or((broker_path.as_str(), ""));
+            local_node_index(ring, acct, cont, device, local_node)
+        };
+        if let Some(info) = record_sharding_progress(&mut broker, node_index, None) {
+            stats.sharding_in_progress.push(info);
         }
     }
     stats
@@ -3808,9 +5107,20 @@ pub fn run_once_with_opts_and_ring_for_node(
 ///
 /// Probe `_test_sharded_listing` L1362 lists 4 live ranges because the donor
 /// own range is deleted on the root; L1396 asserts `old_shard_range.deleted`.
-fn complete_sharding(broker: &mut ContainerBroker) -> Result<bool, DbError> {
+fn complete_sharding(
+    broker: &mut ContainerBroker,
+    ring: Option<&swift_ring::Ring>,
+) -> Result<bool, DbError> {
+    broker.reload_db_files();
+    eprintln!(
+        "G6_COMPLETE_ENTER files={:?} state={:?} own={:?}",
+        broker.db_files(),
+        broker.get_db_state().ok(),
+        broker.get_own_shard_range(true).ok().flatten().map(|o| (o.lower, o.upper, o.state)),
+    );
     let ts = swift_core::timestamp::Timestamp::now().internal();
     let Some(mut own) = broker.get_own_shard_range(true)? else {
+        eprintln!("G6_COMPLETE_NO_OWN");
         return Ok(false);
     };
     own.update_meta(0, 0, &ts);
@@ -3837,11 +5147,30 @@ fn complete_sharding(broker: &mut ContainerBroker) -> Result<bool, DbError> {
         own.deleted = 1;
         own.timestamp = ts.clone();
         own.meta_timestamp = ts.clone();
-        own.state_timestamp = ts;
+        own.state_timestamp = ts.clone();
+        own.reported = 0;
     }
     to_merge.push(own);
     broker.merge_shard_ranges(to_merge)?;
-    broker.set_sharded_state()
+    // Python `_update_root_container` still has the shard DB. Send the
+    // deleted/SHRUNK own now; set_sharded_state unlinks retiring next.
+    if !broker.is_root_container().unwrap_or(true) {
+        let _ = update_root_container(broker, ring);
+    }
+    let before = broker.db_files();
+    let state_before = broker.get_db_state().ok();
+    let ok = broker.set_sharded_state()?;
+    eprintln!(
+        "G6_COMPLETE account={} container={} ok={} state_before={:?} files_before={:?} state_after={:?} files_after={:?}",
+        broker.get_info().ok().and_then(|i| i.into_iter().find(|(k,_)| k=="account").and_then(|(_,v)| v.as_text().map(|s| s.to_string()))).unwrap_or_default(),
+        broker.get_info().ok().and_then(|i| i.into_iter().find(|(k,_)| k=="container").and_then(|(_,v)| v.as_text().map(|s| s.to_string()))).unwrap_or_default(),
+        ok,
+        state_before,
+        before,
+        broker.get_db_state().ok(),
+        broker.db_files(),
+    );
+    Ok(ok)
 }
 
 /// Python `find_sharding_candidates` + `_find_and_enable_sharding_candidates`:
@@ -3885,6 +5214,66 @@ fn find_and_enable_sharding_candidates(
     }
 }
 
+
+/// Restore `own.epoch` from the filename only when own is missing an epoch
+/// or has an *older* epoch (L2088 compact dropped it). A *newer* own.epoch
+/// from a peer replica must keep `get_db_state()` Unsharded (repair_root
+/// L3573: node 0 filename epoch_0 vs own epoch_1).
+fn should_restore_own_epoch_from_filename(own_epoch: Option<&str>, db_epoch: &str) -> bool {
+    let Some(own) = own_epoch else {
+        return true;
+    };
+    let own_norm = own
+        .parse::<swift_core::timestamp::Timestamp>()
+        .ok()
+        .map(|ts| ts.normal());
+    let db_norm = db_epoch
+        .parse::<swift_core::timestamp::Timestamp>()
+        .ok()
+        .map(|ts| ts.normal());
+    match (own_norm, db_norm) {
+        (Some(o), Some(d)) => o < d,
+        (None, _) => true,
+        _ => false,
+    }
+}
+
+/// repair_root L3600: filename epoch_0, own.epoch epoch_1, own already
+/// SHARDED. Python `CLEAVING_STATES` includes SHARDED, so the *next*
+/// sharder pass after L3573 (`get_db_state()==UNSHARDED`) calls
+/// `set_sharding_state` and creates `hash_<epoch_1>.db`. Do not create
+/// that file on the L3539/L3540 finishing-cleave passes.
+fn own_epoch_newer_than_filename(own_epoch: Option<&str>, db_epoch: &str) -> bool {
+    let Some(own) = own_epoch else {
+        return false;
+    };
+    let own_norm = own
+        .parse::<swift_core::timestamp::Timestamp>()
+        .ok()
+        .map(|ts| ts.normal());
+    let db_norm = db_epoch
+        .parse::<swift_core::timestamp::Timestamp>()
+        .ok()
+        .map(|ts| ts.normal());
+    matches!((own_norm, db_norm), (Some(o), Some(d)) if o > d)
+}
+
+fn other_ranges_settled_for_reepoch(ranges: &[ShardRange]) -> bool {
+    !ranges.is_empty()
+        && ranges.iter().all(|range| {
+            range.state == shard_state::ACTIVE
+                || range.state == shard_state::SHARDED
+                || range.state == shard_state::SHRUNK
+        })
+}
+
+// W249: L3539/L3540 node 0 is still SHARDED (filename epoch_0 ==
+// own.epoch). process_broker never calls maybe_start_sharding, so a
+// pending-reepoch counter never increments. L3587 is the first
+// Unsharded+mismatch pass (peer epoch_1 replicated after L3540).
+// W248 required seen>=3 and stayed Unsharded. Create on the first
+// settled winner-only observation (Python L3587 / W239 after L3573).
+
 /// Enter SHARDING when ranges already exist (`swift-manage-shard-ranges
 /// find_and_replace --enable`) even if `object_count < shard_size`. Auto-find
 /// still requires the threshold.
@@ -3922,7 +5311,7 @@ fn maybe_start_sharding(
                     .parse::<swift_core::timestamp::Timestamp>()
                     .ok()
                     .map(|ts| ts.normal());
-                if own_norm != db_norm {
+                if should_restore_own_epoch_from_filename(own.epoch.as_deref(), &db_epoch) {
                     own.epoch = Some(db_epoch);
                     own.timestamp = swift_core::timestamp::Timestamp::now().internal();
                     broker.merge_shard_ranges(vec![own])?;
@@ -3953,16 +5342,32 @@ fn maybe_start_sharding(
         if broker.db_epoch().is_some() && !own_is_donor {
             if let Some(db_epoch) = broker.db_epoch() {
                 if let Some(mut own) = broker.get_own_shard_range(true)? {
-                    let own_norm = own
-                        .epoch
-                        .as_deref()
-                        .and_then(|e| e.parse::<swift_core::timestamp::Timestamp>().ok())
-                        .map(|ts| ts.normal());
-                    let db_norm = db_epoch
-                        .parse::<swift_core::timestamp::Timestamp>()
-                        .ok()
-                        .map(|ts| ts.normal());
-                    if own_norm != db_norm {
+                    if own_epoch_newer_than_filename(own.epoch.as_deref(), &db_epoch) {
+                        // Mixed 0.*+1.* (pre-repair, typically 7 ranges)
+                        // must not create epoch_1. After overlap repair
+                        // only the winning 1.* remain (3 ranges).
+                        let settled = other_ranges_settled_for_reepoch(&other_ranges);
+                        eprintln!(
+                            "G6_REEPOCH path={} len={} settled={} own_epoch={:?} db_epoch={}",
+                            broker.path(),
+                            other_ranges.len(),
+                            settled,
+                            own.epoch,
+                            db_epoch
+                        );
+                        if other_ranges.len() > 3 {
+                            return Ok(false);
+                        }
+                        // L3539/L3540 if a mismatch raced in while 1.*
+                        // are still CREATED/CLEAVED: stay Unsharded.
+                        if !settled {
+                            return Ok(false);
+                        }
+                        // L3587 / W239 after L3573: first settled
+                        // winner-only mismatch creates hash_<epoch_1>.db.
+                        return broker.set_sharding_state();
+                    }
+                    if should_restore_own_epoch_from_filename(own.epoch.as_deref(), &db_epoch) {
                         own.epoch = Some(db_epoch);
                         let ts = swift_core::timestamp::Timestamp::now().internal();
                         own.timestamp = ts;
@@ -3974,6 +5379,9 @@ fn maybe_start_sharding(
         }
         return broker.set_sharding_state();
     }
+    if !opts.auto_shard {
+        return Ok(false);
+    }
     maybe_auto_shard(broker, opts)
 }
 
@@ -3983,6 +5391,9 @@ pub fn maybe_auto_shard(
     broker: &mut ContainerBroker,
     opts: &SharderRunOpts,
 ) -> Result<bool, DbError> {
+    if !opts.auto_shard {
+        return Ok(false);
+    }
     let info = broker.get_info()?;
     let object_count = info
         .iter()
@@ -4073,6 +5484,12 @@ mod tests {
             find_and_merge_found_ranges(&mut source, "AUTH_test", "c", 3, 1, epoch).unwrap();
         assert_eq!(ranges.len(), 4, "{ranges:?}");
         assert!(ranges.iter().all(|r| r.state == shard_state::FOUND));
+        // Daemon `_create_shard_containers` converts FOUND -> CREATED before
+        // `_cleave`. `cleave()` itself must stop at leftover FOUND.
+        for r in ranges.iter_mut() {
+            r.state = shard_state::CREATED;
+        }
+        source.merge_shard_ranges(ranges.clone()).unwrap();
 
         // move to sharding state
         source.enable_sharding(epoch).unwrap();
@@ -4107,6 +5524,42 @@ mod tests {
     }
 
     #[test]
+    fn test_cleave_stops_at_found() {
+        // Python `_cleave` breaks at FOUND. repair_root: after create/sync
+        // a peer FOUND range must stall this replica.
+        let dir = std::env::temp_dir().join(format!("swift-sharder-found-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut source = container_broker(&dir, "c", 10);
+        let epoch = "1751500010.00000";
+        let mut ranges =
+            find_and_merge_found_ranges(&mut source, "AUTH_test", "c", 3, 1, epoch).unwrap();
+        ranges[0].state = shard_state::CREATED;
+        source.merge_shard_ranges(ranges.clone()).unwrap();
+        source.enable_sharding(epoch).unwrap();
+        source.set_sharding_state().unwrap();
+
+        let shard_dir = dir.join("shards");
+        let mut shard_for = |sr: &ShardRange| {
+            let safe = sr.name.replace(['/', '.', '-'], "_");
+            let hd = shard_dir.join(&safe);
+            std::fs::create_dir_all(&hd).unwrap();
+            let mut b = ContainerBroker::new(&hd.join("s.db"), ".shards_AUTH_test", &sr.name);
+            let _ = b.initialize("1751500010.00000", 0, "1751500010.00000", "sid");
+            b
+        };
+        let mut ctx = CleavingContext::default();
+        cleave(&mut source, &mut ranges, &mut shard_for, &mut ctx, 10).unwrap();
+        assert_eq!(ranges[0].state, shard_state::CLEAVED);
+        assert!(
+            ranges[1..].iter().all(|r| r.state == shard_state::FOUND),
+            "must not cleave past leftover FOUND: {:?}",
+            ranges.iter().map(|r| r.state).collect::<Vec<_>>()
+        );
+        assert!(!ctx.cleaving_done);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn test_cleave_is_batched() {
         let dir = std::env::temp_dir().join(format!("swift-sharder-b-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -4114,6 +5567,10 @@ mod tests {
         let epoch = "1751500010.00000";
         let mut ranges =
             find_and_merge_found_ranges(&mut source, "AUTH_test", "c", 3, 1, epoch).unwrap();
+        for r in ranges.iter_mut() {
+            r.state = shard_state::CREATED;
+        }
+        source.merge_shard_ranges(ranges.clone()).unwrap();
         source.enable_sharding(epoch).unwrap();
         source.set_sharding_state().unwrap();
 
@@ -4141,6 +5598,132 @@ mod tests {
         assert_eq!(ctx.ranges_done, 4);
         assert_eq!(ctx.ranges_todo, 0);
         assert!(ctx.cleaving_done);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_replicated_cursor_still_cleaves_created_behind_cursor() {
+        // W225: peer first-pass context (cursor at range[1].upper) landed on
+        // a replica whose children were still CREATED. Skipping those as
+        // "behind cursor" cleaved only the last range and listing lost
+        // obj-0000..0005.
+        let dir = std::env::temp_dir().join(format!("swift-sharder-cur-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut source = container_broker(&dir, "c", 10);
+        let epoch = "1751500010.00000";
+        let mut ranges =
+            find_and_merge_found_ranges(&mut source, "AUTH_test", "c", 3, 1, epoch).unwrap();
+        for r in ranges.iter_mut() {
+            r.state = shard_state::CREATED;
+        }
+        source.merge_shard_ranges(ranges.clone()).unwrap();
+        source.enable_sharding(epoch).unwrap();
+        source.set_sharding_state().unwrap();
+
+        let shard_dir = dir.join("shards");
+        let mut shard_for = |sr: &ShardRange| {
+            let safe = sr.name.replace(['/', '.', '-'], "_");
+            let hd = shard_dir.join(&safe);
+            std::fs::create_dir_all(&hd).unwrap();
+            let mut b = ContainerBroker::new(&hd.join("s.db"), ".shards_AUTH_test", &sr.name);
+            let _ = b.initialize("1751500010.00000", 0, "1751500010.00000", "sid");
+            b
+        };
+        let mut ctx = CleavingContext::default();
+        ctx.cursor = ranges[1].upper.clone();
+        ctx.ranges_done = 2;
+        cleave(&mut source, &mut ranges, &mut shard_for, &mut ctx, 2).unwrap();
+        assert_eq!(
+            ranges[0].state,
+            shard_state::CLEAVED,
+            "CREATED behind replicated cursor must still cleave"
+        );
+        assert_eq!(ranges[1].state, shard_state::CLEAVED);
+        assert!(
+            ranges.iter().all(|r| r.state >= shard_state::CLEAVED),
+            "catch-up must not consume batch so the last range also cleaves: {:?}",
+            ranges.iter().map(|r| r.state).collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_cleave_skips_overlapping_created_behind_cursor() {
+        // repair_shard L3753: after 9-12 is cleaved, cursor=12.
+        // Overlapping 10-12 CREATED must stay CREATED (Python marker).
+        let dir = std::env::temp_dir().join(format!(
+            "swift-w252-overlap-created-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut source = container_broker(&dir, "c-shard", 0);
+        for i in 7..=14 {
+            source
+                .put_object(
+                    &format!("obj-{i:04}"),
+                    "1751500001.00000",
+                    1,
+                    "text/plain",
+                    "etag",
+                    0,
+                    0,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        let epoch = "1751500010.00000";
+        let mut own = ShardRange::new(&source.path(), epoch, "obj-0006", "obj-0014");
+        own.state = shard_state::SHARDING;
+        own.epoch = Some(epoch.into());
+        let mut r_9_12 = ShardRange::new(
+            ".shards_AUTH_test/c-shard-912",
+            epoch,
+            "obj-0009",
+            "obj-0012",
+        );
+        r_9_12.state = shard_state::CREATED;
+        let mut r_10_12 = ShardRange::new(
+            ".shards_AUTH_test/c-shard-1012",
+            epoch,
+            "obj-0010",
+            "obj-0012",
+        );
+        r_10_12.state = shard_state::CREATED;
+        source
+            .merge_shard_ranges(vec![own, r_9_12.clone(), r_10_12.clone()])
+            .unwrap();
+        source.set_sharding_state().unwrap();
+        let mut ranges = vec![r_9_12, r_10_12];
+        ranges.sort_by_key(|r| r.sort_key());
+        let shard_dir = dir.join("shards");
+        let mut shard_for = |sr: &ShardRange| {
+            let safe = sr.name.replace(['/', '.', '-'], "_");
+            let hd = shard_dir.join(&safe);
+            std::fs::create_dir_all(&hd).unwrap();
+            let mut b = ContainerBroker::new(&hd.join("s.db"), ".shards_AUTH_test", &sr.name);
+            let _ = b.initialize("1751500010.00000", 0, "1751500010.00000", "sid");
+            b
+        };
+        let mut ctx = CleavingContext::default();
+        ctx.cursor = "obj-0010".into();
+        cleave(&mut source, &mut ranges, &mut shard_for, &mut ctx, 2).unwrap();
+        let nine = ranges
+            .iter()
+            .find(|r| r.lower == "obj-0009")
+            .unwrap();
+        let ten = ranges
+            .iter()
+            .find(|r| r.lower == "obj-0010")
+            .unwrap();
+        assert_eq!(
+            nine.state, shard_state::CLEAVED,
+            "9-12 must cleave: {ranges:?}"
+        );
+        assert_eq!(
+            ten.state, shard_state::CREATED,
+            "overlapping 10-12 must stay CREATED: {ranges:?}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -4783,6 +6366,22 @@ mod tests {
             !ranges.is_empty() && ranges.iter().all(|r| r.state == shard_state::ACTIVE),
             "complete_sharding must promote CLEAVED→ACTIVE, got {ranges:?}"
         );
+        // Python get_info on a SHARDED root uses get_shard_usage (ACTIVE
+        // range object_count). Probe test_sharded_account_updates L3095
+        // expected 100, got 0 when those counts stayed 0 after cleave.
+        let usage = check.get_shard_usage().unwrap();
+        assert_eq!(
+            usage.1, 10,
+            "shard usage object_count after cleave+complete, usage={usage:?} ranges={ranges:?}"
+        );
+        let info_oc = check
+            .get_info()
+            .unwrap()
+            .into_iter()
+            .find(|(n, _)| n == "object_count")
+            .and_then(|(_, v)| v.as_i64())
+            .unwrap_or(-1);
+        assert_eq!(info_oc, 10, "SHARDED root get_info must roll up shard usage");
         let loaded = load_cleaving_context(&mut check).unwrap();
         assert!(
             loaded.done(),
@@ -4831,6 +6430,143 @@ mod tests {
     }
 
     #[test]
+    fn test_no_auto_shard_does_not_find_ranges_above_threshold() {
+        // Probe managed sharding: X-Container-Sharding on + 100 objects +
+        // --no-auto-shard must stay unsharded with 0 ranges (0 != 2).
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharder-noauto-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut source = container_broker(&dir, "c", 100);
+        let ts = swift_core::timestamp::Timestamp::now().normal();
+        source
+            .update_metadata(&vec![(
+                "X-Container-Sysmeta-Sharding".into(),
+                ("True".into(), ts),
+            )])
+            .unwrap();
+        let opts = SharderRunOpts {
+            cleave_batch_size: 2,
+            auto_shard: false,
+            auto_shrink: false,
+            shard_size: 100,
+            rows_per_shard: 50,
+            minimum_shard_size: 10,
+            partitions: Vec::new(),
+        };
+        assert!(
+            !maybe_auto_shard(&mut source, &opts).unwrap(),
+            "--no-auto-shard must not find ranges"
+        );
+        assert!(
+            !maybe_start_sharding(&mut source, &opts).unwrap(),
+            "no injected ranges + auto_shard=false must not start"
+        );
+        let ranges = source
+            .get_shard_ranges(&GetShardRangesArgs {
+                include_own: false,
+                ..GetShardRangesArgs::default()
+            })
+            .unwrap();
+        assert!(ranges.is_empty(), "got {ranges:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_unsharded_handoff_with_replicated_ranges_stays_gettable() {
+        // Probe L2972: unsharded handoff learned two shard ranges + a SHARDED
+        // own. After set_sharding + cleave + set_sharded, the epoch file must
+        // remain and GET must not treat the root as deleted.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharder-l2972-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("sdb4");
+        let account = "AUTH_test";
+        let container = "container-handoff";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/1006").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let unsuffixed = hd.join(format!("{hsh}.db"));
+        let mut root = ContainerBroker::new(&unsuffixed, account, container);
+        root.initialize("1751500000.00000", 0, "1751500000.00000", "rootid")
+            .unwrap();
+        for i in 0..4 {
+            root.put_object(
+                &format!("obj-{i:04}"),
+                "1751500001.00000",
+                1,
+                "text/plain",
+                "e",
+                0,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        let epoch = "1751500010.00000";
+        let mut own = root.get_own_shard_range(false).unwrap().unwrap();
+        own.state = shard_state::SHARDED;
+        own.state_timestamp = epoch.into();
+        own.epoch = Some(epoch.into());
+        let mut first = ShardRange::new(".shards_AUTH_test/container-handoff-0", epoch, "", "obj-0001");
+        first.state = shard_state::ACTIVE;
+        first.object_count = 2;
+        let mut second = ShardRange::new(".shards_AUTH_test/container-handoff-1", epoch, "obj-0001", "");
+        second.state = shard_state::ACTIVE;
+        second.object_count = 2;
+        root.merge_shard_ranges(vec![own, first, second]).unwrap();
+        assert_eq!(root.get_db_state().unwrap(), DbState::Unsharded);
+        assert!(!root.is_deleted().unwrap());
+
+        let opts = SharderRunOpts {
+            cleave_batch_size: 10,
+            auto_shard: false,
+            auto_shrink: false,
+            shard_size: 2,
+            rows_per_shard: 0,
+            minimum_shard_size: 1,
+            partitions: Vec::new(),
+        };
+        assert!(
+            maybe_start_sharding(&mut root, &opts).unwrap(),
+            "handoff with other ranges must enter SHARDING"
+        );
+        assert_eq!(root.get_db_state().unwrap(), DbState::Sharding);
+
+        let mut replicator = LocalShardReplicator;
+        let out = process_sharding_container_detailed_with_ring(
+            &mut root,
+            &device,
+            &hash_config,
+            "1006",
+            opts.cleave_batch_size,
+            &mut replicator,
+            None,
+        )
+        .unwrap();
+        assert!(out.finished, "cleave should complete in one batch");
+
+        let files = get_db_files(&unsuffixed);
+        assert!(
+            !files.is_empty(),
+            "L2972: epoch DB must survive set_sharded_state, files={files:?}"
+        );
+        assert!(
+            !root.is_deleted().unwrap(),
+            "L2972: SHARDED handoff root must stay GET-able"
+        );
+        assert_eq!(root.get_db_state().unwrap(), DbState::Sharded);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn test_replicated_sharded_own_reuses_active_ranges() {
         // Probe test_replication_to_sharded_container L2323: the third node
         // has an UNSHARDED local DB, but replication supplied a SHARDED own
@@ -5696,6 +7432,31 @@ mod tests {
     }
 
     #[test]
+    fn refresh_own_skips_found_and_created_zero_stats() {
+        // Probe test_manage_shard_ranges: uncleaved CREATED shard is empty
+        // but must keep injected object_count=4.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharder-created-stat-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut shard = container_broker(&dir, "c", 0);
+        let ts = "1751500010.00000";
+        let mut own = ShardRange::new("AUTH_test/c", ts, "", "");
+        own.state = shard_state::CREATED;
+        own.object_count = 4;
+        own.bytes_used = 4;
+        ensure_shard_root_sysmeta(&mut shard, "AUTH_test", "rootc", &own);
+        shard.merge_shard_ranges(vec![own.clone()]).unwrap();
+        let refreshed = refresh_own_shard_range_stats(&mut shard)
+            .unwrap()
+            .expect("own range");
+        assert_eq!(refreshed.object_count, 4, "{refreshed:?}");
+        assert_eq!(refreshed.state, shard_state::CREATED);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn nested_child_quoted_root_is_true_root_not_parent() {
         // Probe L1435: first-gen parent is itself a shard of AUTH_test/rootc.
         // Nested children must stamp Quoted-Root as AUTH_test/rootc, not the
@@ -5793,6 +7554,807 @@ mod tests {
             !names.contains(&".shards_AUTH_test/c-1"),
             "sibling must not merge into this shard: {names:?}"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_merge_from_root_shrinking_keeps_overlapping_acceptors() {
+        // repair_root L3514: shrinking donor (c,g] must learn both overlapping
+        // 1.* acceptors. Full-cover-only merge left the donor skip-empty.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharder-shrink-overlap-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut shard = container_broker(&dir, "c-donor", 0);
+        let ts = "1751500010.00000";
+        let mut own = ShardRange::new("AUTH_test/c-donor", ts, "c", "g");
+        own.state = shard_state::ACTIVE;
+        ensure_shard_root_sysmeta(&mut shard, "AUTH_test", "rootc", &own);
+
+        let mut from_root = own.clone();
+        from_root.state = shard_state::SHRINKING;
+        from_root.state_timestamp = "1751500099.00000".into();
+        let mut a0 = ShardRange::new(".shards_AUTH_test/c-a0", ts, "a", "e");
+        a0.state = shard_state::CREATED;
+        let mut a1 = ShardRange::new(".shards_AUTH_test/c-a1", ts, "e", "j");
+        a1.state = shard_state::CREATED;
+        let mut sibling = ShardRange::new(".shards_AUTH_test/c-z", ts, "x", "z");
+        sibling.state = shard_state::ACTIVE;
+        merge_shard_ranges_from_root(&mut shard, &[from_root, a0, a1, sibling], &own);
+        let got_own = shard.get_own_shard_range(true).unwrap().unwrap();
+        assert_eq!(got_own.state, shard_state::SHRINKING, "{got_own:?}");
+        let others = shard
+            .get_shard_ranges(&GetShardRangesArgs::default())
+            .unwrap();
+        let names: Vec<_> = others.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&".shards_AUTH_test/c-a0"), "{names:?}");
+        assert!(names.contains(&".shards_AUTH_test/c-a1"), "{names:?}");
+        assert!(
+            !names.contains(&".shards_AUTH_test/c-z"),
+            "non-overlapping sibling must not merge: {names:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_restore_own_epoch_skips_newer_peer_epoch() {
+        // repair_root L3573: filename epoch_0, own epoch_1 from the other
+        // replica. Must not clobber the newer epoch or get_db_state() becomes
+        // Sharded instead of Unsharded.
+        assert!(should_restore_own_epoch_from_filename(None, "1751500010.00000"));
+        assert!(should_restore_own_epoch_from_filename(
+            Some("1751500009.00000"),
+            "1751500010.00000"
+        ));
+        assert!(!should_restore_own_epoch_from_filename(
+            Some("1751500011.00000"),
+            "1751500010.00000"
+        ));
+        assert!(!should_restore_own_epoch_from_filename(
+            Some("1751500010.00000"),
+            "1751500010.00000"
+        ));
+        assert!(own_epoch_newer_than_filename(
+            Some("1751500011.00000"),
+            "1751500010.00000"
+        ));
+        assert!(!own_epoch_newer_than_filename(
+            Some("1751500009.00000"),
+            "1751500010.00000"
+        ));
+        assert!(!own_epoch_newer_than_filename(None, "1751500010.00000"));
+    }
+
+    #[test]
+    fn test_maybe_start_sharding_defers_unsettled_newer_peer_epoch() {
+        // L3539/L3540 if mismatch raced in: 1.* still CREATED/CLEAVED.
+        // Must not create epoch_1.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-repair-root-unsettled-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "c";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let unsuffixed = hd.join(format!("{hsh}.db"));
+        let epoch_0 = "1751500010.00000";
+        let epoch_1 = "1751500011.00000";
+        let epoch_path = make_db_file_path(&unsuffixed, Some(epoch_0)).unwrap();
+        let mut root = ContainerBroker::new(&epoch_path, account, container);
+        root.initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        let mut own = root.get_own_shard_range(false).unwrap().unwrap();
+        own.epoch = Some(epoch_1.to_string());
+        own.state = shard_state::SHARDED;
+        own.state_timestamp = epoch_1.into();
+        let mut child = ShardRange::new(".shards_AUTH_test/c-0", epoch_1, "", "");
+        child.state = shard_state::CREATED;
+        child.object_count = 3;
+        root.merge_shard_ranges(vec![own, child]).unwrap();
+        assert_eq!(root.get_db_state().unwrap(), DbState::Unsharded);
+
+        let opts = SharderRunOpts {
+            cleave_batch_size: 10,
+            auto_shard: false,
+            auto_shrink: false,
+            shard_size: 100,
+            rows_per_shard: 0,
+            minimum_shard_size: 1,
+            partitions: Vec::new(),
+        };
+        assert!(!maybe_start_sharding(&mut root, &opts).unwrap());
+        assert_eq!(root.db_epoch().as_deref(), Some(epoch_0));
+        assert_eq!(root.get_db_state().unwrap(), DbState::Unsharded);
+        // Still unsettled: still no epoch_1 file.
+        assert!(!maybe_start_sharding(&mut root, &opts).unwrap());
+        assert_eq!(root.db_epoch().as_deref(), Some(epoch_0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_maybe_start_sharding_creates_newer_peer_epoch_file() {
+        // repair_root L3587/L3600: node 0 filename epoch_0, own.epoch epoch_1
+        // (SHARDED). L3539/L3540 never enter this function (db still
+        // SHARDED, epochs match). First settled mismatch IS L3587.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-repair-root-epoch1-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "c";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let unsuffixed = hd.join(format!("{hsh}.db"));
+        let epoch_0 = "1751500010.00000";
+        let epoch_1 = "1751500011.00000";
+        let epoch_path = make_db_file_path(&unsuffixed, Some(epoch_0)).unwrap();
+        let mut root = ContainerBroker::new(&epoch_path, account, container);
+        root.initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        let mut own = root.get_own_shard_range(false).unwrap().unwrap();
+        own.epoch = Some(epoch_1.to_string());
+        own.state = shard_state::SHARDED;
+        own.state_timestamp = epoch_1.into();
+        let mut child = ShardRange::new(".shards_AUTH_test/c-0", epoch_1, "", "");
+        child.state = shard_state::ACTIVE;
+        child.object_count = 3;
+        root.merge_shard_ranges(vec![own, child]).unwrap();
+        assert_eq!(root.get_db_state().unwrap(), DbState::Unsharded);
+        assert_eq!(root.db_epoch().as_deref(), Some(epoch_0));
+
+        let opts = SharderRunOpts {
+            cleave_batch_size: 10,
+            auto_shard: false,
+            auto_shrink: false,
+            shard_size: 100,
+            rows_per_shard: 0,
+            minimum_shard_size: 1,
+            partitions: Vec::new(),
+        };
+        assert!(
+            maybe_start_sharding(&mut root, &opts).unwrap(),
+            "first settled mismatch pass is L3587 and must create epoch_1"
+        );
+        assert_eq!(root.db_epoch().as_deref(), Some(epoch_1), "{:?}", root.db_files());
+        assert!(
+            matches!(
+                root.get_db_state().unwrap(),
+                DbState::Sharding | DbState::Sharded
+            ),
+            "{:?}",
+            root.get_db_state()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_maybe_start_sharding_creates_epoch_after_unsettled_cleave_passes() {
+        // W247/W249: object-bearing 1.1/1.2 cleave leaves CREATED after
+        // L3539/L3540. Those must not create. First settled pass (L3587)
+        // creates hash_<epoch_1>.db.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-w248-unsettled-then-epoch1-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "c";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let unsuffixed = hd.join(format!("{hsh}.db"));
+        let epoch_0 = "1751500010.00000";
+        let epoch_1 = "1751500011.00000";
+        let epoch_path = make_db_file_path(&unsuffixed, Some(epoch_0)).unwrap();
+        let mut root = ContainerBroker::new(&epoch_path, account, container);
+        root.initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        let mut own = root.get_own_shard_range(false).unwrap().unwrap();
+        own.epoch = Some(epoch_1.to_string());
+        own.state = shard_state::SHARDED;
+        own.state_timestamp = epoch_1.into();
+        let mut c0 = ShardRange::new(".shards_AUTH_test/c-1-0", epoch_1, "", "obj-0006");
+        c0.state = shard_state::CLEAVED;
+        let mut c1 = ShardRange::new(".shards_AUTH_test/c-1-1", epoch_1, "obj-0006", "obj-0013");
+        c1.state = shard_state::CREATED;
+        let mut c2 = ShardRange::new(".shards_AUTH_test/c-1-2", epoch_1, "obj-0013", "");
+        c2.state = shard_state::CREATED;
+        root.merge_shard_ranges(vec![own.clone(), c0, c1, c2]).unwrap();
+        let opts = SharderRunOpts {
+            cleave_batch_size: 10,
+            auto_shard: false,
+            auto_shrink: false,
+            shard_size: 100,
+            rows_per_shard: 0,
+            minimum_shard_size: 1,
+            partitions: Vec::new(),
+        };
+        assert!(!maybe_start_sharding(&mut root, &opts).unwrap());
+        assert_eq!(root.db_epoch().as_deref(), Some(epoch_0));
+        assert!(!maybe_start_sharding(&mut root, &opts).unwrap());
+        assert_eq!(root.db_epoch().as_deref(), Some(epoch_0));
+        let mut settled = root.get_shard_ranges(&GetShardRangesArgs::default()).unwrap();
+        for sr in &mut settled {
+            if sr.name != root.path() {
+                sr.state = shard_state::ACTIVE;
+            }
+        }
+        root.merge_shard_ranges(settled).unwrap();
+        assert!(
+            maybe_start_sharding(&mut root, &opts).unwrap(),
+            "L3587 first settled pass after two unfinished cleaves"
+        );
+        assert_eq!(root.db_epoch().as_deref(), Some(epoch_1), "{:?}", root.db_files());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_run_once_skips_renamed_hash_tmp_replica() {
+        // deleted_child L4484–L4541: a replica dir renamed to `{hash}.tmp`
+        // must stay Unsharded. Walking it would set_sharding_state.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-w250-hash-tmp-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "c-child";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let aside = device
+            .join("containers/0")
+            .join(suf)
+            .join(format!("{hsh}.tmp"));
+        std::fs::create_dir_all(&aside).unwrap();
+        let unsuffixed = aside.join(format!("{hsh}.db"));
+        let mut child = ContainerBroker::new(&unsuffixed, account, container);
+        child
+            .initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        let epoch = "1751500010.00000";
+        let mut own = child.get_own_shard_range(false).unwrap().unwrap();
+        own.epoch = Some(epoch.to_string());
+        own.state = shard_state::SHARDING;
+        own.state_timestamp = epoch.into();
+        let mut gc0 = ShardRange::new(".shards_AUTH_test/c-child-0", epoch, "", "m");
+        gc0.state = shard_state::CREATED;
+        let mut gc1 = ShardRange::new(".shards_AUTH_test/c-child-1", epoch, "m", "");
+        gc1.state = shard_state::CREATED;
+        child.merge_shard_ranges(vec![own, gc0, gc1]).unwrap();
+        assert_eq!(child.get_db_state().unwrap(), DbState::Unsharded);
+        let opts = SharderRunOpts {
+            cleave_batch_size: 10,
+            auto_shard: false,
+            auto_shrink: false,
+            shard_size: 100,
+            rows_per_shard: 0,
+            minimum_shard_size: 1,
+            partitions: Vec::new(),
+        };
+        let _ = run_once_with_opts(&device, &hash_config, &opts);
+        let mut after = ContainerBroker::new(&unsuffixed, account, container);
+        assert_eq!(
+            after.get_db_state().unwrap(),
+            DbState::Unsharded,
+            "aside .tmp must not be sharded: {:?}",
+            after.db_files()
+        );
+        assert_eq!(after.db_epoch(), None, "{:?}", after.db_files());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_epoch1_empty_recleave_does_not_wipe_active_shard_objects() {
+        // repair_root L3649: epoch_1 re-cleave of an empty root must not
+        // treat a newly created empty handoff as something to replicate over
+        // already-ACTIVE 1.* shard objects. Same-node populated shards stay
+        // CLEAVE_SUCCESS; other-node shards stay untouched on their device.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-w240-empty-recleave-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "c-repair-root";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let db = hd.join(format!("{hsh}.db"));
+        let mut root = ContainerBroker::new(&db, account, container);
+        root.initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        let epoch_1 = "1751500011.00000";
+        let mut own = ShardRange::new(&root.path(), epoch_1, "", "");
+        own.state = shard_state::SHARDING;
+        own.epoch = Some(epoch_1.into());
+        root.merge_shard_ranges(vec![own]).unwrap();
+        root.enable_sharding(epoch_1).unwrap();
+        assert!(root.set_sharding_state().unwrap());
+
+        let mut r0 = ShardRange::new(".shards_AUTH_test/c-1-0", epoch_1, "", "obj-0006");
+        r0.state = shard_state::ACTIVE;
+        r0.object_count = 7;
+        let mut r1 = ShardRange::new(
+            ".shards_AUTH_test/c-1-1",
+            epoch_1,
+            "obj-0006",
+            "obj-0012",
+        );
+        r1.state = shard_state::ACTIVE;
+        r1.object_count = 6;
+        let mut r2 = ShardRange::new(".shards_AUTH_test/c-1-2", epoch_1, "obj-0012", "");
+        r2.state = shard_state::ACTIVE;
+        r2.object_count = 3;
+        root.merge_shard_ranges(vec![r0.clone(), r1.clone(), r2.clone()])
+            .unwrap();
+
+        let mut existing = local_shard_broker_for_range(&device, &hash_config, "0", &r1);
+        ensure_shard_root_sysmeta(&mut existing, account, container, &r1);
+        for i in 7..13 {
+            existing
+                .put_object(
+                    &format!("obj-{i:04}"),
+                    "1751500001.00000",
+                    1,
+                    "text/plain",
+                    "e",
+                    0,
+                    0,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        let _ = existing.commit_pending();
+        let before: Vec<String> = existing
+            .object_records_in_range(&r1.lower, &r1.upper)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(before.len(), 6, "{before:?}");
+        drop(existing);
+
+        let device2 = dir.join("d2");
+        let mut remote = local_shard_broker_for_range(&device2, &hash_config, "0", &r2);
+        ensure_shard_root_sysmeta(&mut remote, account, container, &r2);
+        for i in 13..16 {
+            remote
+                .put_object(
+                    &format!("obj-{i:04}"),
+                    "1751500001.00000",
+                    1,
+                    "text/plain",
+                    "e",
+                    0,
+                    0,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        let _ = remote.commit_pending();
+        drop(remote);
+
+        let mut ranges = vec![r0.clone(), r1.clone(), r2.clone()];
+        let mut ctx = CleavingContext::default();
+        let mut shard_for = |sr: &ShardRange| {
+            let mut b = local_shard_broker_for_range(&device, &hash_config, "0", sr);
+            ensure_shard_root_sysmeta(&mut b, account, container, sr);
+            b
+        };
+        let empty_new = cleave(&mut root, &mut ranges, &mut shard_for, &mut ctx, 3).unwrap();
+        assert!(
+            !empty_new.iter().any(|n| n == &r1.name),
+            "populated ACTIVE shard must not be CLEAVE_EMPTY: {empty_new:?}"
+        );
+        assert!(
+            empty_new.iter().any(|n| n == &r2.name),
+            "new empty handoff for ACTIVE r2 must be CLEAVE_EMPTY: {empty_new:?}"
+        );
+
+        for name in &empty_new {
+            let sr = ranges.iter().find(|r| &r.name == name).unwrap();
+            assert!(
+                discard_empty_cleave_handoff(&device, &hash_config, "0", sr),
+                "must discard empty handoff {name}"
+            );
+        }
+
+        let mut kept = local_shard_broker_for_range(&device, &hash_config, "0", &r1);
+        let after: Vec<String> = kept
+            .object_records_in_range(&r1.lower, &r1.upper)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(after, before, "ACTIVE shard objects must survive empty recleave");
+
+        let mut remote = local_shard_broker_for_range(&device2, &hash_config, "0", &r2);
+        let remote_names: Vec<String> = remote
+            .object_records_in_range(&r2.lower, &r2.upper)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(
+            remote_names,
+            vec![
+                "obj-0013".to_string(),
+                "obj-0014".to_string(),
+                "obj-0015".to_string()
+            ],
+            "{remote_names:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_active_recleave_does_not_materialize_empty_primary() {
+        // Daemon shard_for for already-ACTIVE ranges: missing local DB must
+        // use an ephemeral broker. Creating hash.db on this device makes
+        // listing empty_wins return 200 [] (repair_root L3649).
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-l3649-ephemeral-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "c-l3649";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let db = hd.join(format!("{hsh}.db"));
+        let mut root = ContainerBroker::new(&db, account, container);
+        root.initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        let epoch_1 = "1751500011.00000";
+        let mut own = ShardRange::new(&root.path(), epoch_1, "", "");
+        own.state = shard_state::SHARDING;
+        own.epoch = Some(epoch_1.into());
+        let mut r0 = ShardRange::new(".shards_AUTH_test/c-l3649-0", epoch_1, "", "obj-0006");
+        r0.state = shard_state::ACTIVE;
+        r0.object_count = 7;
+        let mut r1 = ShardRange::new(
+            ".shards_AUTH_test/c-l3649-1",
+            epoch_1,
+            "obj-0006",
+            "obj-0013",
+        );
+        r1.state = shard_state::ACTIVE;
+        r1.object_count = 7;
+        root.merge_shard_ranges(vec![own, r0.clone(), r1.clone()])
+            .unwrap();
+        root.enable_sharding(epoch_1).unwrap();
+        assert!(root.set_sharding_state().unwrap());
+
+        // First-gen create leftover: empty hash.db for r1 on this device.
+        let mut leftover = local_shard_broker_for_range(&device, &hash_config, "0", &r1);
+        ensure_shard_root_sysmeta(&mut leftover, account, container, &r1);
+        drop(leftover);
+        let (leftover_path, _, _) = shard_db_path(&device, &hash_config, "0", &r1.name);
+        assert!(!get_db_files(&leftover_path).is_empty(), "precondition: leftover empty db");
+
+        let mut ranges = vec![r0.clone(), r1.clone()];
+        let mut ctx = CleavingContext::default();
+        let mut shard_for = |sr: &ShardRange| {
+            if sr.state == shard_state::ACTIVE {
+                if let Some(mut b) =
+                    open_existing_shard_broker(&device, &hash_config, "0", &sr.name)
+                {
+                    let rows = b
+                        .object_records_in_range(&sr.lower, &sr.upper)
+                        .ok()
+                        .map(|r| r.len())
+                        .unwrap_or(0);
+                    let count = shard_object_count(&mut b);
+                    if rows > 0 || count > 0 {
+                        ensure_shard_root_sysmeta(&mut b, account, container, sr);
+                        return b;
+                    }
+                    drop(b);
+                    let _ = discard_empty_cleave_handoff(&device, &hash_config, "0", sr);
+                }
+                return ephemeral_empty_shard_broker(sr);
+            }
+            local_shard_broker_for_range(&device, &hash_config, "0", sr)
+        };
+        let empty_new = cleave(&mut root, &mut ranges, &mut shard_for, &mut ctx, 3).unwrap();
+        assert!(
+            empty_new.iter().any(|n| n == &r0.name) && empty_new.iter().any(|n| n == &r1.name),
+            "both missing ACTIVE shards are CLEAVE_EMPTY: {empty_new:?}"
+        );
+        for sr in [&r0, &r1] {
+            let (path, _, _) = shard_db_path(&device, &hash_config, "0", &sr.name);
+            assert!(
+                get_db_files(&path).is_empty(),
+                "must not materialize empty primary for {}: {:?}",
+                sr.name,
+                get_db_files(&path)
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_bounded_active_empty_persists_retiring_rows_l1517() {
+        // listing_under_populated L1517: peer already ACTIVE; local shard
+        // empty; retiring still has the missing names. Must persist, not
+        // ephemeral-drop.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-l1517-persist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let device = dir.join("sdb1");
+        std::fs::create_dir_all(&device).unwrap();
+        let account = "AUTH_test";
+        let container = "c-l1517";
+        let (root_path, _, _) =
+            shard_db_path(&device, &hash_config, "0", &format!("{account}/{container}"));
+        std::fs::create_dir_all(root_path.parent().unwrap()).unwrap();
+        let mut root = ContainerBroker::new(&root_path, account, container);
+        let ts = "1751500001.00000";
+        root.initialize(ts, 0, ts, "l1517").unwrap();
+        for i in 0..4 {
+            root.put_object(
+                &format!("obj-{i:04}"),
+                ts,
+                1,
+                "text/plain",
+                &format!("etag{i}"),
+                0,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        let epoch = "1751500002.00000";
+        let mut r0 = ShardRange::new(".shards_AUTH_test/c-l1517-0", epoch, "", "obj-0002");
+        r0.state = shard_state::CLEAVED;
+        let mut r1 = ShardRange::new(".shards_AUTH_test/c-l1517-1", epoch, "obj-0002", "");
+        r1.state = shard_state::ACTIVE;
+        let own = ShardRange::new(&format!("{account}/{container}"), epoch, "", "");
+        root.merge_shard_ranges(vec![own, r0.clone(), r1.clone()])
+            .unwrap();
+        root.enable_sharding(epoch).unwrap();
+        assert!(root.set_sharding_state().unwrap());
+
+        let retiring_nonempty_ranges: Vec<(String, String)> = {
+            let mut out = Vec::new();
+            if let Some(mut retiring) = root.retiring_broker() {
+                for sr in [&r0, &r1] {
+                    if retiring
+                        .object_records_in_range(&sr.lower, &sr.upper)
+                        .ok()
+                        .is_some_and(|recs| !recs.is_empty())
+                    {
+                        out.push((sr.lower.clone(), sr.upper.clone()));
+                    }
+                }
+            }
+            out
+        };
+        assert!(
+            retiring_nonempty_ranges
+                .iter()
+                .any(|(lo, up)| lo == &r1.lower && up == &r1.upper),
+            "precondition: retiring has last-range rows"
+        );
+
+        let mut ranges = vec![r0.clone(), r1.clone()];
+        let mut ctx = CleavingContext::default();
+        ctx.cursor = r0.upper.clone();
+        let mut shard_for = |sr: &ShardRange| {
+            if sr.state == shard_state::ACTIVE {
+                if let Some(mut b) =
+                    open_existing_shard_broker(&device, &hash_config, "0", &sr.name)
+                {
+                    let rows = b
+                        .object_records_in_range(&sr.lower, &sr.upper)
+                        .ok()
+                        .map(|r| r.len())
+                        .unwrap_or(0);
+                    let count = shard_object_count(&mut b);
+                    if rows > 0 || count > 0 {
+                        return b;
+                    }
+                    drop(b);
+                }
+                let retiring_has_rows = retiring_nonempty_ranges.iter().any(|(lo, up)| {
+                    lo == &sr.lower && up == &sr.upper
+                });
+                if !retiring_has_rows {
+                    return ephemeral_empty_shard_broker(sr);
+                }
+            }
+            local_shard_broker_for_range(&device, &hash_config, "0", sr)
+        };
+        let empty_new = cleave(&mut root, &mut ranges, &mut shard_for, &mut ctx, 2).unwrap();
+        assert!(
+            !empty_new.iter().any(|n| n == &r1.name),
+            "L1517 last range must not be CLEAVE_EMPTY: {empty_new:?}"
+        );
+        let (path, _, _) = shard_db_path(&device, &hash_config, "0", &r1.name);
+        let mut shard = ContainerBroker::new(&path, ".shards_AUTH_test", "c-l1517-1");
+        let names: Vec<String> = shard
+            .object_records_in_range(&r1.lower, &r1.upper)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["obj-0003".to_string()],
+            "persisted retiring rows on bounded ACTIVE: {names:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_empty_handoff_discard_skips_when_ring_unknown() {
+        // W240/W244: ring=None must assume primary and refuse discard.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-w246-nodiscard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("sdb1");
+        let mut sr = ShardRange::new(".shards_AUTH_test/c-w246-1", "1", "obj-0006", "obj-0013");
+        sr.state = shard_state::CLEAVED;
+        let leftover = local_shard_broker_for_range(&device, &hash_config, "0", &sr);
+        drop(leftover);
+        let (path, _, _) = shard_db_path(&device, &hash_config, "0", &sr.name);
+        assert!(!get_db_files(&path).is_empty());
+        assert!(
+            !discard_empty_handoff_if_not_primary(
+                &device, &hash_config, "0", &sr, None, "sdb1",
+            ),
+            "unknown ring must not discard"
+        );
+        assert!(!get_db_files(&path).is_empty(), "primary leftover must remain");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_cleaved_leftover_empty_with_syncs_is_cleave_empty() {
+        // W244: first-gen cleave writes a sync_point onto an empty leftover.
+        // A later CREATED/CLEAVED finishing pass must stay CLEAVE_EMPTY so
+        // the daemon does not rsync that leftover over populated primaries
+        // (repair_root L3649: 1.1/1.2 0 rows, put_ts identical on all 3).
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-w244-cleaved-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "c-w244";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let db = hd.join(format!("{hsh}.db"));
+        let mut root = ContainerBroker::new(&db, account, container);
+        root.initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        let epoch_1 = "1751500011.00000";
+        let mut own = ShardRange::new(&root.path(), epoch_1, "", "");
+        own.state = shard_state::SHARDING;
+        own.epoch = Some(epoch_1.into());
+        root.merge_shard_ranges(vec![own]).unwrap();
+        root.enable_sharding(epoch_1).unwrap();
+        assert!(root.set_sharding_state().unwrap());
+
+        let mut r1 = ShardRange::new(
+            ".shards_AUTH_test/c-w244-1",
+            epoch_1,
+            "obj-0006",
+            "obj-0013",
+        );
+        r1.state = shard_state::CREATED;
+        r1.object_count = 7;
+        root.merge_shard_ranges(vec![r1.clone()]).unwrap();
+
+        let mut leftover = local_shard_broker_for_range(&device, &hash_config, "0", &r1);
+        ensure_shard_root_sysmeta(&mut leftover, account, container, &r1);
+        drop(leftover);
+
+        let mut ranges = vec![r1.clone()];
+        let mut ctx = CleavingContext::default();
+        ctx.cursor = r1.lower.clone();
+        let mut shard_for = |sr: &ShardRange| {
+            let mut b = local_shard_broker_for_range(&device, &hash_config, "0", sr);
+            ensure_shard_root_sysmeta(&mut b, account, container, sr);
+            b
+        };
+        let first = cleave(&mut root, &mut ranges, &mut shard_for, &mut ctx, 3).unwrap();
+        assert!(
+            first.iter().any(|n| n == &r1.name),
+            "first empty CREATED cleave is CLEAVE_EMPTY: {first:?}"
+        );
+        assert_eq!(ranges[0].state, shard_state::CLEAVED);
+
+        let mut leftover = local_shard_broker_for_range(&device, &hash_config, "0", &r1);
+        assert!(
+            shard_local_is_empty(&mut leftover, &r1),
+            "leftover must stay empty after first cleave"
+        );
+        drop(leftover);
+
+        let mut ctx2 = CleavingContext::default();
+        ctx2.cursor = r1.lower.clone();
+        let second = cleave(&mut root, &mut ranges, &mut shard_for, &mut ctx2, 3).unwrap();
+        assert!(
+            second.iter().any(|n| n == &r1.name),
+            "CLEAVED leftover with syncs must stay CLEAVE_EMPTY (W244): {second:?}"
+        );
+        let mut leftover = local_shard_broker_for_range(&device, &hash_config, "0", &r1);
+        assert!(
+            shard_local_is_empty(&mut leftover, &r1),
+            "second pass must not invent rows"
+        );
+        drop(leftover);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -5915,6 +8477,36 @@ mod tests {
     }
 
     #[test]
+    fn test_current_db_file_after_set_sharding_state_is_epoch() {
+        // replicate_broker_to_ring_peers must rsync this path, not db_file().
+        let dir = std::env::temp_dir().join(format!(
+            "swift-rsync-epoch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let unsuffixed = dir.join("hash.db");
+        let mut broker = ContainerBroker::new(&unsuffixed, "AUTH_test", "c");
+        let ts = "1751500100.00000";
+        broker.initialize(ts, 0, ts, "id-rsync-epoch").unwrap();
+        broker.enable_sharding(ts).unwrap();
+        assert!(broker.set_sharding_state().unwrap());
+        let current = broker.current_db_file();
+        assert_ne!(
+            current,
+            unsuffixed,
+            "current_db_file must not stay on retiring hash.db"
+        );
+        assert!(
+            parse_db_filename(&current).1.is_some(),
+            "rsync source must be epoch-suffixed, got {}",
+            current.display()
+        );
+        assert_eq!(broker.db_file(), unsuffixed.as_path());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn test_replicate_broker_to_ring_peers_noop_without_ring() {
         let dir =
             std::env::temp_dir().join(format!("swift-sharder-replnone-{}", std::process::id()));
@@ -5929,6 +8521,66 @@ mod tests {
     }
 
     #[test]
+    fn test_skip_object_file_rsync_when_root_has_shard_ranges() {
+        // unsharded_deleted_root L4182: a SHARDING root with CREATED children
+        // must not rsync the retiring object DB onto an empty deleted replica.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-w253-skip-object-rsync-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut root = container_broker(&dir, "c-del", 3);
+        assert!(
+            !skip_object_file_rsync(&mut root),
+            "plain unsharded root still usyncs objects"
+        );
+        let epoch = "1751500010.00000";
+        let mut own = ShardRange::new(&root.path(), epoch, "", "");
+        own.state = shard_state::SHARDING;
+        own.epoch = Some(epoch.into());
+        let mut child = ShardRange::new(".shards_AUTH_test/c-del-0", epoch, "", "m");
+        child.state = shard_state::CREATED;
+        child.object_count = 3;
+        root.merge_shard_ranges(vec![own, child]).unwrap();
+        assert!(
+            skip_object_file_rsync(&mut root),
+            "SHARDING root with CREATED children must refuse object rsync"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_shrink_to_root_cleanup_refuses_epoch_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-shrink-epoch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let unsuffixed = dir.join("hash.db");
+        let epoch_path = make_db_file_path(&unsuffixed, Some("1751500010.00000")).unwrap();
+        std::fs::write(&epoch_path, b"").unwrap();
+        assert!(
+            get_db_files(&unsuffixed)
+                .iter()
+                .any(|p| parse_db_filename(p).1.is_some()),
+            "epoch file must be visible to the cleanup guard"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_shrink_to_root_handoff_cleanup_skips_primary() {
+        // rsync cleanup must still refuse roots (L2972). The dedicated
+        // shrink-to-root handoff cleanup only fires on a non-primary.
+        assert!(!should_cleanup_replicated_handoff(
+            true, false, 3, 3, 0, Some(1), Some(1), false, true,
+        ));
+        assert!(!should_cleanup_shrink_to_root_acceptor_handoff(true));
+        assert!(should_cleanup_shrink_to_root_acceptor_handoff(false));
+    }
+
+    #[test]
     fn test_handoff_cleanup_requires_complete_stable_non_sharding_copy() {
         assert!(should_cleanup_replicated_handoff(
             true,
@@ -5939,13 +8591,15 @@ mod tests {
             Some(50),
             Some(50),
             false,
+            false,
         ));
         for unsafe_case in [
-            should_cleanup_replicated_handoff(true, true, 2, 2, 0, Some(50), Some(50), false),
-            should_cleanup_replicated_handoff(true, false, 3, 2, 0, Some(50), Some(50), false),
-            should_cleanup_replicated_handoff(true, false, 3, 3, 1, Some(50), Some(50), false),
-            should_cleanup_replicated_handoff(true, false, 3, 3, 0, Some(50), Some(51), false),
-            should_cleanup_replicated_handoff(true, false, 3, 3, 0, Some(50), Some(50), true),
+            should_cleanup_replicated_handoff(true, true, 2, 2, 0, Some(50), Some(50), false, false),
+            should_cleanup_replicated_handoff(true, false, 3, 2, 0, Some(50), Some(50), false, false),
+            should_cleanup_replicated_handoff(true, false, 3, 3, 1, Some(50), Some(50), false, false),
+            should_cleanup_replicated_handoff(true, false, 3, 3, 0, Some(50), Some(51), false, false),
+            should_cleanup_replicated_handoff(true, false, 3, 3, 0, Some(50), Some(50), true, false),
+            should_cleanup_replicated_handoff(true, false, 3, 3, 0, Some(50), Some(50), false, true),
         ] {
             assert!(!unsafe_case);
         }
@@ -6841,6 +9495,39 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_sharded_recon_totals_matches_python() {
+        // fresh context: emit (replication_time, latest - epoch)
+        assert_eq!(
+            shard_sharded_recon_totals(110.0, 3.0, 100.0, 120.0, 43200.0),
+            Some((3.0, 10.0))
+        );
+        // context older than recon_sharded_timeout: omit row
+        assert_eq!(
+            shard_sharded_recon_totals(100.0, 3.0, 90.0, 100.0 + 43201.0, 43200.0),
+            None
+        );
+        // boundary: ts + timeout == now still reported
+        assert_eq!(
+            shard_sharded_recon_totals(100.0, 0.0, 100.0, 100.0 + 43200.0, 43200.0),
+            Some((0.0, 0.0))
+        );
+    }
+
+    #[test]
+    fn test_shard_cleave_replication_holds_matches_python_quorum() {
+        // 3 replicas, quorum 2. Local-only (1) must hold (probe L2390).
+        assert!(shard_cleave_replication_holds(true, 1, 3));
+        assert!(shard_cleave_replication_holds(true, 0, 3));
+        assert!(!shard_cleave_replication_holds(true, 2, 3));
+        assert!(!shard_cleave_replication_holds(true, 3, 3));
+        // already-CLEAVED re-replicate must not hold leftover10
+        assert!(!shard_cleave_replication_holds(false, 0, 3));
+        // no ring
+        assert!(!shard_cleave_replication_holds(true, 0, 0));
+    }
+
+
+    #[test]
     fn test_run_once_with_replicator_invokes_create_for_uncleaved() {
         let hash_config = HashPathConfig::new("", "changeme").unwrap();
         let dir = std::env::temp_dir().join(format!("swift-sharder-mn-run-{}", std::process::id()));
@@ -7100,6 +9787,233 @@ mod tests {
     }
 
     #[test]
+    fn test_deleted_gap_objects_are_not_misplaced_into_expanded_neighbor() {
+        // repair_root_gap L4027: after the high shard expands over a deleted
+        // gap, leftover root/live rows in that namespace must stay lost.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-gap-nocopy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "rootc";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let db = hd.join(format!("{hsh}.db"));
+        let mut root = ContainerBroker::new(&db, account, container);
+        root.initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        let epoch = "1751500010.00000";
+        let mut own = ShardRange::new(&root.path(), epoch, "", "");
+        own.state = shard_state::SHARDED;
+        own.epoch = Some(epoch.into());
+        root.merge_shard_ranges(vec![own]).unwrap();
+        let mut deleted = ShardRange::new(".shards_AUTH_test/gap", epoch, "obj-0003", "obj-0005");
+        deleted.state = shard_state::ACTIVE;
+        deleted.deleted = 1;
+        let mut expanded = ShardRange::new(".shards_AUTH_test/high", epoch, "obj-0003", "");
+        expanded.state = shard_state::ACTIVE;
+        root.merge_shard_ranges(vec![deleted, expanded]).unwrap();
+        assert!(root.set_sharding_state().unwrap());
+        assert!(root.set_sharded_state().unwrap());
+        root.put_object(
+            "obj-0004",
+            "1751500002.00000",
+            1,
+            "text/plain",
+            "e",
+            0,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        root.put_object(
+            "obj-0005",
+            "1751500002.00000",
+            1,
+            "text/plain",
+            "e",
+            0,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        let moved = move_misplaced_from_live(&mut root, &device, &hash_config, "0", None).unwrap();
+        assert_eq!(moved, 0, "deleted-gap objects must not move");
+        let mut high = local_shard_broker(&device, &hash_config, "0", ".shards_AUTH_test/high");
+        assert!(
+            high.object_records_in_range("", "")
+                .unwrap()
+                .is_empty(),
+            "expanded neighbor inherited deleted-gap objects"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_shrunk_overlap_losers_do_not_block_winner_cleave() {
+        // repair_root L3649: 0.* are SHRUNK+deleted after overlap repair.
+        // They are not --gaps tombstones. Re-cleave into 1.1/1.2 must copy
+        // retiring objects 7-15. W246 skip-empty rsync did not restore them.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-w247-shrunk-losers-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "c-repair-root-3649";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let db = hd.join(format!("{hsh}.db"));
+        let mut root = ContainerBroker::new(&db, account, container);
+        root.initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        for i in 7..16 {
+            root.put_object(
+                &format!("obj-{i:04}"),
+                "1751500001.00000",
+                1,
+                "text/plain",
+                "e",
+                0,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        let _ = root.commit_pending();
+        let epoch = "1751500011.00000";
+        let mut own = ShardRange::new(&root.path(), epoch, "", "");
+        own.state = shard_state::SHARDING;
+        own.epoch = Some(epoch.into());
+        let mut winner1 = ShardRange::new(
+            ".shards_AUTH_test/c-1-1",
+            epoch,
+            "obj-0006",
+            "obj-0013",
+        );
+        winner1.state = shard_state::ACTIVE;
+        let mut winner2 = ShardRange::new(".shards_AUTH_test/c-1-2", epoch, "obj-0013", "");
+        winner2.state = shard_state::ACTIVE;
+        let mut loser2 = ShardRange::new(
+            ".shards_AUTH_test/c-0-2",
+            epoch,
+            "obj-0007",
+            "obj-0011",
+        );
+        loser2.state = shard_state::SHRUNK;
+        loser2.deleted = 1;
+        let mut loser3 = ShardRange::new(".shards_AUTH_test/c-0-3", epoch, "obj-0011", "");
+        loser3.state = shard_state::SHRUNK;
+        loser3.deleted = 1;
+        root.merge_shard_ranges(vec![
+            own,
+            winner1.clone(),
+            winner2.clone(),
+            loser2,
+            loser3,
+        ])
+        .unwrap();
+        root.enable_sharding(epoch).unwrap();
+        assert!(root.set_sharding_state().unwrap());
+        let mut retiring = root
+            .retiring_broker()
+            .expect("sharding root must have retiring");
+
+        let mut shard1 = local_shard_broker_for_range(&device, &hash_config, "0", &winner1);
+        let out1 = cleave_shard_range(
+            &mut retiring,
+            &mut shard1,
+            &mut root,
+            &mut winner1,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(!out1.empty_new, "1.1 must receive retiring rows: {out1:?}");
+        let names1: Vec<String> = shard1
+            .object_records_in_range(&winner1.lower, &winner1.upper)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.deleted == 0)
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(
+            names1,
+            (7..14).map(|i| format!("obj-{i:04}")).collect::<Vec<_>>(),
+            "SHRUNK 0.* must not filter 1.1 cleave: {names1:?}"
+        );
+
+        let mut shard2 = local_shard_broker_for_range(&device, &hash_config, "0", &winner2);
+        let out2 = cleave_shard_range(
+            &mut retiring,
+            &mut shard2,
+            &mut root,
+            &mut winner2,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(!out2.empty_new, "1.2 must receive retiring rows: {out2:?}");
+        let names2: Vec<String> = shard2
+            .object_records_in_range(&winner2.lower, &winner2.upper)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.deleted == 0)
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(
+            names2,
+            vec!["obj-0014".to_string(), "obj-0015".to_string()],
+            "SHRUNK 0.* must not filter 1.2 cleave: {names2:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_shrinking_retain_keeps_overlapping_acceptors() {
+        // repair_root: donor (c,g] straddles acceptors (a,e] and (e,j].
+        // Nest-only retain dropped both; overlap retain keeps them.
+        let mut donor = ShardRange::new("d", "1", "c", "g");
+        donor.state = shard_state::SHRINKING;
+        let mut a0 = ShardRange::new("a0", "1", "a", "e");
+        a0.state = shard_state::CREATED;
+        let mut a1 = ShardRange::new("a1", "1", "e", "j");
+        a1.state = shard_state::CREATED;
+        let mut sibling = ShardRange::new("sib", "1", "x", "z");
+        sibling.state = shard_state::CREATED;
+        let mut ranges = vec![a0, a1, sibling];
+        ranges.retain(|r| r.overlaps(&donor) || r.includes_range(&donor) || donor.includes_range(r));
+        assert_eq!(
+            ranges.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["a0", "a1"]
+        );
+    }
+
+    #[test]
     fn test_process_shrinking_donors_shrink_to_root_collapses() {
         // Probe L2088: last SHRINKING donor is covered only by the root own
         // (`include_own: false` hides it from find_shrink_acceptor). Must copy
@@ -7207,6 +10121,327 @@ mod tests {
         );
         // container_broker is unsuffixed, so db_state stays Unsharded;
         // the invariant is that own.epoch survived the merge.
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_refresh_saio_peer_oc1_unblocks_last_shard_shrink_to_root() {
+        // leftover10 L2780: leader root on /srv/1 still lists oc=51.
+        // Python reclaim landed on /srv/3 (not a ring primary, not the
+        // leader). An empty handoff on /srv/2 must not become 0.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-s2r-saio-oc1-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let leader = dir.join("srv/1/node/sdb1");
+        let empty_handoff = dir.join("srv/2/node/sdb2");
+        let reclaimed = dir.join("srv/3/node/sdb3");
+        for d in [&leader, &empty_handoff, &reclaimed] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let account = "AUTH_test";
+        let container = "c";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = leader.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let epoch = "1751500010.00000";
+        let unsuffixed = hd.join(format!("{hsh}.db"));
+        let epoch_path = make_db_file_path(&unsuffixed, Some(epoch)).unwrap();
+        let mut root = ContainerBroker::new(&epoch_path, account, container);
+        root.initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        let mut own = root.get_own_shard_range(false).unwrap().unwrap();
+        own.epoch = Some(epoch.to_string());
+        own.state = shard_state::SHARDED;
+        let mut child = ShardRange::new(".shards_AUTH_test/c-1", epoch, "", "");
+        child.state = shard_state::ACTIVE;
+        child.object_count = 51;
+        child.bytes_used = 510;
+        child.tombstones = 0;
+        root.merge_shard_ranges(vec![own, child.clone()]).unwrap();
+
+        let mut empty = local_shard_broker(&empty_handoff, &hash_config, "9", &child.name);
+        empty
+            .initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .ok();
+        let mut live = local_shard_broker(&reclaimed, &hash_config, "9", &child.name);
+        for i in 0..50 {
+            live.put_object(
+                &format!("obj-{i:03}"),
+                "1751500001.00000",
+                10,
+                "text/plain",
+                "e",
+                1,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        live.put_object(
+            "alpha",
+            "1751500001.00000",
+            10,
+            "text/plain",
+            "e",
+            0,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let before = find_compactible_shard_sequences(&mut root, 10, 75, 1, -1, true)
+            .unwrap();
+        assert!(
+            !before
+                .iter()
+                .any(|seq| seq.last().is_some_and(|r| r.name == root.path())),
+            "stale oc=51 must not shrink to root: {before:?}"
+        );
+
+        let n = refresh_root_child_stats_from_saio_devices(
+            &mut root,
+            &leader,
+            &hash_config,
+            None,
+        );
+        assert_eq!(n, 1, "peer oc=1 must land on leader, got {n}");
+        let after_ranges = root
+            .get_shard_ranges(&GetShardRangesArgs {
+                include_own: false,
+                include_deleted: false,
+                ..GetShardRangesArgs::default()
+            })
+            .unwrap();
+        let landed = after_ranges.iter().find(|r| r.name == child.name).unwrap();
+        assert_eq!(landed.object_count, 1, "{landed:?}");
+        assert_eq!(landed.bytes_used, 10, "{landed:?}");
+        assert_eq!(landed.tombstones, 0, "{landed:?}");
+        let after = find_compactible_shard_sequences(&mut root, 10, 75, 1, -1, true)
+            .unwrap();
+        assert!(
+            after
+                .iter()
+                .any(|seq| seq.last().is_some_and(|r| r.name == root.path())),
+            "oc=1 last shard must shrink to root: {after:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_live_child_usage_from_saio_does_not_merge() {
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-s2r-saio-live-usage-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let leader = dir.join("srv/1/node/sdb1");
+        let live_dev = dir.join("srv/2/node/sdb2");
+        let empty_handoff = dir.join("srv/3/node/sdb3");
+        for d in [&leader, &live_dev, &empty_handoff] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let account = "AUTH_test";
+        let container = "c";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = leader.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let epoch = "1751500010.00000";
+        let unsuffixed = hd.join(format!("{hsh}.db"));
+        let epoch_path = make_db_file_path(&unsuffixed, Some(epoch)).unwrap();
+        let mut root = ContainerBroker::new(&epoch_path, account, container);
+        root.initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        let mut own = root.get_own_shard_range(false).unwrap().unwrap();
+        own.epoch = Some(epoch.to_string());
+        own.state = shard_state::SHARDED;
+        let mut child = ShardRange::new(".shards_AUTH_test/c-1", epoch, "", "");
+        child.state = shard_state::ACTIVE;
+        child.object_count = 0;
+        child.bytes_used = 0;
+        root.merge_shard_ranges(vec![own, child.clone()]).unwrap();
+
+        let mut empty = local_shard_broker(&empty_handoff, &hash_config, "9", &child.name);
+        empty
+            .initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .ok();
+        let mut live = local_shard_broker(&live_dev, &hash_config, "9", &child.name);
+        for i in 0..50 {
+            live.put_object(
+                &format!("obj-{i:03}"),
+                "1751500001.00000",
+                3,
+                "text/plain",
+                "e",
+                0,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let got = live_child_usage_from_saio(&mut root, &leader, &hash_config, None);
+        assert_eq!(got, Some((50, 150)), "live usage must sum shard DBs");
+        let after = root
+            .get_shard_ranges(&GetShardRangesArgs {
+                include_own: false,
+                include_deleted: false,
+                ..GetShardRangesArgs::default()
+            })
+            .unwrap();
+        let landed = after.iter().find(|r| r.name == child.name).unwrap();
+        assert_eq!(landed.object_count, 0, "report-only must not merge: {landed:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_gone_empty_donor_unblocks_last_shard_shrink_to_root() {
+        // leftover10 L2785: first donor is SHRINKING on the root, its DB
+        // was unlinked, last remaining shard is ACTIVE Min-Max oc=1.
+        // process_shrinking_donors must SHRUNK+delete the empty donor so
+        // find_compactible can append own.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-s2r-gone-donor-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "c";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let unsuffixed = hd.join(format!("{hsh}.db"));
+        let epoch = "1751500010.00000";
+        let epoch_path = make_db_file_path(&unsuffixed, Some(epoch)).unwrap();
+        let mut root = ContainerBroker::new(&epoch_path, account, container);
+        root.initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        let mut own = root.get_own_shard_range(false).unwrap().unwrap();
+        own.epoch = Some(epoch.to_string());
+        own.state = shard_state::SHARDED;
+        let mut gone = ShardRange::new(".shards_AUTH_test/c-0", epoch, "", "m");
+        gone.state = shard_state::SHRINKING;
+        gone.object_count = 0;
+        gone.tombstones = 0;
+        let mut last = ShardRange::new(".shards_AUTH_test/c-1", epoch, "", "");
+        last.state = shard_state::ACTIVE;
+        last.object_count = 1;
+        last.tombstones = 0;
+        root.merge_shard_ranges(vec![own, gone.clone(), last.clone()])
+            .unwrap();
+        assert_eq!(root.get_db_state().unwrap(), DbState::Sharded);
+
+        let before = find_compactible_shard_sequences(&mut root, 10, 75, 1, -1, true)
+            .unwrap();
+        let before_has_own = before.iter().any(|seq| {
+            seq.last().is_some_and(|r| r.name == root.path())
+        });
+        assert!(
+            !before_has_own,
+            "stale SHRINKING sibling must block shrink-to-root: {before:?}"
+        );
+
+        let n = process_shrinking_donors(&mut root, &device, &hash_config, "0", None)
+            .unwrap();
+        assert_eq!(n, 1, "empty gone donor must be marked SHRUNK, got {n}");
+
+        let after_ranges = root
+            .get_shard_ranges(&GetShardRangesArgs {
+                include_own: false,
+                include_deleted: false,
+                ..GetShardRangesArgs::default()
+            })
+            .unwrap();
+        assert_eq!(
+            after_ranges.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec![last.name.as_str()],
+            "{after_ranges:?}"
+        );
+
+        let mut sequences = find_compactible_shard_sequences(&mut root, 10, 75, 1, -1, true)
+            .unwrap();
+        assert!(
+            sequences.iter().any(|seq| seq.last().is_some_and(|r| r.name == root.path())),
+            "last shard must now shrink to root: {sequences:?}"
+        );
+        process_compactible_shard_sequences(&mut root, &mut sequences).unwrap();
+        let live = root
+            .get_shard_ranges(&GetShardRangesArgs {
+                include_own: false,
+                include_deleted: false,
+                ..GetShardRangesArgs::default()
+            })
+            .unwrap();
+        let last_after = live.iter().find(|r| r.name == last.name).expect("{live:?}");
+        assert_eq!(last_after.state, shard_state::SHRINKING, "{last_after:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_gone_nonempty_donor_is_not_marked_shrunk() {
+        // Multi-node: objects still live on a remote donor replica.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-s2r-gone-nonempty-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "c";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let unsuffixed = hd.join(format!("{hsh}.db"));
+        let epoch = "1751500010.00000";
+        let epoch_path = make_db_file_path(&unsuffixed, Some(epoch)).unwrap();
+        let mut root = ContainerBroker::new(&epoch_path, account, container);
+        root.initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        let mut own = root.get_own_shard_range(false).unwrap().unwrap();
+        own.epoch = Some(epoch.to_string());
+        own.state = shard_state::SHARDED;
+        let mut gone = ShardRange::new(".shards_AUTH_test/c-0", epoch, "", "m");
+        gone.state = shard_state::SHRINKING;
+        gone.object_count = 4;
+        let mut last = ShardRange::new(".shards_AUTH_test/c-1", epoch, "m", "");
+        last.state = shard_state::ACTIVE;
+        last.object_count = 50;
+        root.merge_shard_ranges(vec![own, gone.clone(), last]).unwrap();
+
+        let n = process_shrinking_donors(&mut root, &device, &hash_config, "0", None)
+            .unwrap();
+        assert_eq!(n, 0, "non-empty missing donor must stay SHRINKING, got {n}");
+        let still = root
+            .get_shard_ranges(&GetShardRangesArgs {
+                include_own: false,
+                include_deleted: false,
+                ..GetShardRangesArgs::default()
+            })
+            .unwrap();
+        let d = still.iter().find(|r| r.name == gone.name).expect("{still:?}");
+        assert_eq!(d.state, shard_state::SHRINKING, "{d:?}");
+        assert_eq!(d.deleted, 0, "{d:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -7882,5 +11117,45 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_ephemeral_empty_shard_broker_max_utf8_container_fits_namemax() {
+        // leftover10 L3068: MoreUTF8 max-length names must still produce
+        // a real shard.db so the last ACTIVE follower cleave can finish.
+        let prefix = "container-utf8-äêìòûሴ-";
+        let mut cont = prefix.to_string();
+        while cont.len() < 256 {
+            cont.push('x');
+        }
+        let name = format!(
+            ".shards_AUTH_test/{cont}-8bbfa091456442c48bce17bae68e9369-1787943184.44531"
+        );
+        let mut sr = ShardRange::new(&name, "1751500000.00000", "obj-0099", "");
+        sr.state = shard_state::ACTIVE;
+        let b = ephemeral_empty_shard_broker(&sr);
+        let db = b.db_file();
+        assert!(
+            db.exists(),
+            "ephemeral shard.db missing at {}",
+            db.display()
+        );
+        let component = db
+            .parent()
+            .and_then(|p| p.file_name())
+            .unwrap()
+            .to_string_lossy();
+        assert!(
+            component.as_bytes().len() <= 255,
+            "tmpdir component {} bytes: {component}",
+            component.as_bytes().len()
+        );
+        assert!(
+            !component.contains("container-utf8"),
+            "tmpdir must not embed the UTF-8 container name: {component}"
+        );
+        if let Some(dir) = db.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }

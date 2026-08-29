@@ -114,6 +114,7 @@ fn container_config(devices: &std::path::Path, hash_suffix: &str) -> ContainerSe
         policies: vec![(0, "Policy-0".to_string())],
         default_policy_index: 0,
         fixed_created_at: Some("1751500000.00000".to_string()),
+        recon_cache_path: PathBuf::from("/var/cache/swift"),
     }
 }
 
@@ -196,6 +197,7 @@ fn test_container_put_updates_account_server() {
         hash_config: hash_cfg(),
         policies: vec![(0, "Policy-0".to_string())],
         fixed_created_at: Some("1751500000.00000".to_string()),
+        recon_cache_path: PathBuf::from("/var/cache/swift"),
     };
     std::thread::spawn(move || swift_account_server::serve(acct_listener, acct_config));
 

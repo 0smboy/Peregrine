@@ -68,6 +68,18 @@ impl From<std::io::Error> for DbError {
     }
 }
 
+/// SQLite `SQLITE_READONLY_DBMOVED` (extended 1032) or any Readonly.
+/// The cached connection's path was replaced (rsync/complete_rsync) while
+/// still open; the next write must reopen `current_db_file()`.
+pub fn is_readonly_dbmoved(err: &DbError) -> bool {
+    match err {
+        DbError::Sqlite(rusqlite::Error::SqliteFailure(e, _)) => {
+            e.extended_code == 1032 || e.code == rusqlite::ErrorCode::ReadOnly
+        }
+        _ => false,
+    }
+}
+
 /// Port of `swift.common.db.chexor`: XOR the 128-bit md5 of
 /// `"<name>-<timestamp>"` into the running hex hash.
 pub fn chexor(old: &str, name: &str, timestamp: &str) -> Result<String, DbError> {

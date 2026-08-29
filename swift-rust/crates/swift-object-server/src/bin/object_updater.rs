@@ -153,6 +153,17 @@ fn main() {
         statsd.update_stats("successes", ok as i64);
         statsd.update_stats("failures", fail as i64);
         statsd.update_stats("unlinks", unlink as i64);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/g6-updater.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "pass devices={devices} successes={ok} failures={fail} unlinks={unlink} errors={errors} redirects={redirects}"
+            );
+        }
         let update = daemonutil::updater_recon_update(
             &pass_stats,
             sweep_start.elapsed(),

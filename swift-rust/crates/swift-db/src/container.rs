@@ -579,15 +579,7 @@ impl ContainerBroker {
             .map(|t| t.normal());
         let db_epoch_normal = db_epoch.parse::<Timestamp>().ok().map(|t| t.normal());
         if db_epoch_normal != own_epoch_normal {
-            // A newer-timestamp merge can drop own.epoch onto an epoch file
-            // (shrink-to-root compactible). If own is already an acceptor,
-            // the filename epoch is authoritative: HEAD must not report
-            // unsharded with object_count 1 (probe test_shrinking L2088).
-            // A SHARDING own still mismatches so the first cleave starts.
-            let acceptor = !crate::shard::CLEAVING_STATES.contains(&own.state);
-            if !(acceptor && own_epoch_normal.is_none() && db_epoch_normal.is_some()) {
-                return Ok(DbState::Unsharded);
-            }
+            return Ok(DbState::Unsharded);
         }
         if !self.has_other_shard_ranges()? {
             return Ok(DbState::Collapsed);
@@ -852,6 +844,11 @@ impl ContainerBroker {
             ctype_timestamp: None,
             meta_timestamp: None,
         };
+        // L4095: PUTs sit in `.db.pending`. merge_items alone writes the
+        // tombstone into sqlite and leaves those PUTs on disk. Python
+        // `is_deleted()` then `_commit_puts` and resurrects live rows
+        // (object_count=3, delete_timestamp stays 0). Drain pending first.
+        self.commit_pending()?;
         self.merge_items(vec![record])
     }
 
@@ -1285,6 +1282,19 @@ impl ContainerBroker {
         if ranges.is_empty() {
             return Ok(());
         }
+        match self.merge_shard_ranges_once(&ranges) {
+            Err(e) if crate::util::is_readonly_dbmoved(&e) => {
+                self.reload_db_files();
+                self.merge_shard_ranges_once(&ranges)
+            }
+            other => other,
+        }
+    }
+
+    fn merge_shard_ranges_once(
+        &mut self,
+        ranges: &[crate::shard::ShardRange],
+    ) -> Result<(), DbError> {
         let conn = self.conn()?;
         // fetch existing rows for the incoming names
         let names: Vec<String> = ranges.iter().map(|r| r.name.clone()).collect();
@@ -1303,7 +1313,7 @@ impl ContainerBroker {
                 existing.insert(sr.name.clone(), sr);
             }
         }
-        let (to_add, to_delete) = crate::shard::sift_shard_ranges(ranges, &existing);
+        let (to_add, to_delete) = crate::shard::sift_shard_ranges(ranges.to_vec(), &existing);
 
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<(), DbError> {
@@ -1564,19 +1574,20 @@ impl ContainerBroker {
             return Ok((Vec::new(), false));
         }
 
-        // Python: the last found range is capped at own.upper (a shard of a
-        // shard must not extend to namespace MAX).
-        let own_upper = self
-            .get_own_shard_range(false)?
-            .map(|o| o.upper)
-            .unwrap_or_default();
+        // Python find_shard_ranges: scan starts at own.lower (not MIN) and
+        // the last found range is capped at own.upper. A shard of a shard
+        // (repair_shard L3752) must emit 6-8 / 6-9, not MinBound leftover
+        // FOUND that then stay listed on the root.
+        let own = self.get_own_shard_range(false)?;
+        let own_lower = own.as_ref().map(|o| o.lower.clone()).unwrap_or_default();
+        let own_upper = own.as_ref().map(|o| o.upper.clone()).unwrap_or_default();
         let past_own = |upper: &str| {
             !own_upper.is_empty() && (upper.is_empty() || upper > own_upper.as_str())
         };
 
         let mut found = Vec::new();
         let mut progress: i64 = 0;
-        let mut last_upper = String::new(); // namespace MIN
+        let mut last_upper = own_lower;
         let mut index = 0usize;
         loop {
             let next_upper = if progress + shard_size + minimum_shard_size > object_count {
@@ -1987,6 +1998,69 @@ mod tests {
     }
 
     #[test]
+    fn test_sharding_required_while_sharding() {
+        // container/replicator.py:321-330: SHARDING handoff must not be
+        // deleted so cleaving can finish (probe L3034).
+        let dir = std::env::temp_dir().join(format!("swift-shard-req-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut b = shard_broker(&dir, 0);
+        assert!(!b.sharding_required().unwrap());
+        let epoch = "1751500099.00000";
+        b.enable_sharding(epoch).unwrap();
+        let mut s1 = crate::shard::ShardRange::new(".shards_AUTH_test/c-0", epoch, "", "m");
+        s1.state = crate::shard::state::ACTIVE;
+        let mut s2 = crate::shard::ShardRange::new(".shards_AUTH_test/c-1", epoch, "m", "");
+        s2.state = crate::shard::state::ACTIVE;
+        b.merge_shard_ranges(vec![s1, s2]).unwrap();
+        assert!(b.set_sharding_state().unwrap());
+        assert_eq!(b.get_db_state().unwrap(), DbState::Sharding);
+        assert!(b.sharding_required().unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_sharding_required_unsharded_with_replicated_sharded_own() {
+        // Probe L2972: unsharded handoff learns a SHARDED own + children.
+        // Filename has no epoch so get_db_state is Unsharded; own is not
+        // CLEAVING so sharding_initiated is false. Still must keep the
+        // handoff so the sharder can cleave.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-shard-req-unsharded-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut b = shard_broker(&dir, 4);
+        let epoch = "1751500099.00000";
+        let mut own = b.get_own_shard_range(false).unwrap().unwrap();
+        own.state = crate::shard::state::SHARDED;
+        own.epoch = Some(epoch.to_string());
+        let mut s1 = crate::shard::ShardRange::new(".shards_AUTH_test/c-0", epoch, "", "m");
+        s1.state = crate::shard::state::ACTIVE;
+        let mut s2 = crate::shard::ShardRange::new(".shards_AUTH_test/c-1", epoch, "m", "");
+        s2.state = crate::shard::state::ACTIVE;
+        b.merge_shard_ranges(vec![own, s1, s2]).unwrap();
+        assert_eq!(b.get_db_state().unwrap(), DbState::Unsharded);
+        // SHARDED is in CLEAVING_STATES, so initiated is true when the
+        // broker knows account/container. keep_handoff used to open with
+        // empty path, synthesize an ACTIVE own, and miss this.
+        assert!(b.sharding_initiated().unwrap());
+        assert!(
+            b.sharding_required().unwrap(),
+            "unsharded + other ranges must keep the handoff (L2972)"
+        );
+        // Same predicate after forgetting account/container — the production
+        // keep_handoff bug.
+        let path = b.db_file().to_path_buf();
+        let mut blind = ContainerBroker::new(&path, "", "");
+        assert_eq!(blind.get_db_state().unwrap(), DbState::Unsharded);
+        assert!(
+            blind.sharding_required().unwrap(),
+            "keep_handoff must not depend on constructor account/container"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn test_empty_uses_shard_usage_on_sharded_root() {
         // Probe test_sharded_delete: Python DELETE 409s while shards still
         // hold objects. policy_stat on the SHARDED root is 0.
@@ -2011,6 +2085,7 @@ mod tests {
             "SHARDED root still exists via epoch file even if <hash>.db is gone"
         );
         assert!(b.sharding_initiated().unwrap());
+        assert!(!b.sharding_required().unwrap(), "SHARDED is not required");
         assert_eq!(b.get_shard_usage().unwrap(), (0, 100));
         assert!(
             !b.empty().unwrap(),
@@ -2049,11 +2124,9 @@ mod tests {
     }
 
     #[test]
-
-    #[test]
-    fn test_get_db_state_acceptor_without_own_epoch_is_collapsed() {
-        // Probe L2088: epoch file + wiped own.epoch + no other ranges +
-        // alpha still in the live table. Must be collapsed, not unsharded.
+    fn test_merge_newer_own_without_epoch_stays_collapsed() {
+        // Probe L2088: a newer no-epoch own must not make get_db_state()
+        // Unsharded. merge_shards keeps the existing epoch.
         let dir = std::env::temp_dir().join(format!(
             "swift-db-l2088-{}",
             std::process::id()
@@ -2079,9 +2152,18 @@ mod tests {
         )
         .unwrap();
         let mut own = root.get_own_shard_range(false).unwrap().unwrap();
-        own.epoch = None;
-        own.state = crate::shard::state::ACTIVE;
+        own.epoch = Some(epoch.to_string());
+        own.state = crate::shard::state::SHARDED;
         root.merge_shard_ranges(vec![own]).unwrap();
+        assert_eq!(root.get_db_state().unwrap(), DbState::Collapsed);
+
+        let mut wiped = root.get_own_shard_range(true).unwrap().unwrap();
+        wiped.timestamp = "1751500099.00000".into();
+        wiped.epoch = None;
+        wiped.state = crate::shard::state::ACTIVE;
+        root.merge_shard_ranges(vec![wiped]).unwrap();
+        let kept = root.get_own_shard_range(true).unwrap().unwrap();
+        assert_eq!(kept.epoch.as_deref(), Some(epoch));
         assert_eq!(root.get_db_state().unwrap(), DbState::Collapsed);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -2197,6 +2279,50 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_object_commits_pending_puts_first() {
+        // unsharded_deleted_root L4095: object-server DELETE returned Ok
+        // but Python is_deleted() still saw 3 live rows because PUT
+        // records were still in `.db.pending`.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-w255-pending-then-delete-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut b = shard_broker(&dir, 0);
+        for name in ["obj-0000", "obj-0001", "obj-0002"] {
+            b.put_object(name, "1751500001.00000", 0, "text/plain", "e", 0, 0, None, None)
+                .unwrap();
+        }
+        let pending = b.pending_file();
+        assert!(
+            pending.exists() && pending.metadata().unwrap().len() > 0,
+            "PUTs must still be pending before DELETE"
+        );
+        for name in ["obj-0000", "obj-0001", "obj-0002"] {
+            b.delete_object(name, "1751500099.00000", 0).unwrap();
+        }
+        let pending_len = pending.metadata().map(|m| m.len()).unwrap_or(0);
+        assert_eq!(pending_len, 0, "DELETE must drain PUT pending, len={pending_len}");
+        let info = b.get_info().unwrap();
+        let count = info
+            .iter()
+            .find(|(k, _)| k == "object_count")
+            .map(|(_, v)| match v {
+                crate::DbValue::Int(i) => *i,
+                crate::DbValue::Text(s) => s.parse().unwrap_or(-1),
+                _ => -1,
+            })
+            .unwrap_or(-1);
+        assert_eq!(count, 0, "tombstones must win; object_count={count}");
+        b.delete_db("1751500100.00000").unwrap();
+        assert!(
+            b.is_deleted().unwrap(),
+            "empty + delete_timestamp must be deleted"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn test_find_shard_ranges_caps_last_upper_at_own() {
         // Nested sharding: a shard's last sub-range must end at own.upper,
         // not namespace MAX (probe assert_shard_ranges_contiguous last_upper).
@@ -2233,6 +2359,53 @@ mod tests {
         assert!(
             found.iter().all(|f| f.upper != "" || f.lower == "m"),
             "no sub-range may use namespace MAX: {found:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_find_shard_ranges_starts_at_own_lower() {
+        // repair_shard L3752: find_and_replace on shard (obj-0006, obj-0014]
+        // must not emit MinBound leftover FOUND.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-find-own-lower-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut b = shard_broker(&dir, 0);
+        for i in 7..=14 {
+            b.put_object(
+                &format!("obj-{i:04}"),
+                "1751500001.00000",
+                1,
+                "text/plain",
+                "etag",
+                0,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        let ts = "1751500010.00000";
+        let mut own = crate::shard::ShardRange::new(&b.path(), ts, "obj-0006", "obj-0014");
+        own.state = crate::shard::state::SHARDING;
+        own.epoch = Some(ts.into());
+        b.merge_shard_ranges(vec![own]).unwrap();
+        let (found, done) = b.find_shard_ranges(3, 1).unwrap();
+        assert!(done);
+        assert!(!found.is_empty(), "{found:?}");
+        assert_eq!(
+            found[0].lower, "obj-0006",
+            "first sub-shard must start at own.lower, not MIN: {found:?}"
+        );
+        assert_eq!(
+            found.last().unwrap().upper, "obj-0014",
+            "{found:?}"
+        );
+        assert!(
+            found.iter().all(|f| f.lower != ""),
+            "no leftover MinBound FOUND: {found:?}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -2629,6 +2802,45 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn test_update_metadata_recovers_from_replaced_db_inode() {
+        // complete_rsync replaces <hash>_<epoch>.db at the same path.
+        // A cached rusqlite Connection then fails writes with
+        // SQLITE_READONLY_DBMOVED (1032). Reload + retry must succeed.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-dbmoved-{}-{}",
+            std::process::id(),
+            Timestamp::now().raw()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("hash.db");
+        let mut broker = ContainerBroker::new(&db, "AUTH_test", "c");
+        broker
+            .initialize("1751500001.00000", 0, "1751500001.00000", "id")
+            .unwrap();
+        broker
+            .update_metadata(&vec![(
+                "X-Container-Meta-A".into(),
+                ("1".into(), "1751500002.00000".into()),
+            )])
+            .unwrap();
+        // Replace the inode while the broker still holds the old fd.
+        let tmp = dir.join("hash.db.replaced");
+        std::fs::copy(&db, &tmp).unwrap();
+        std::fs::remove_file(&db).unwrap();
+        std::fs::rename(&tmp, &db).unwrap();
+        broker
+            .update_metadata(&vec![(
+                "X-Container-Meta-B".into(),
+                ("2".into(), "1751500003.00000".into()),
+            )])
+            .unwrap();
+        let md = broker.metadata().unwrap();
+        let b = md.iter().find(|(k, _)| k == "X-Container-Meta-B").map(|(_, (v, _))| v.as_str());
+        assert_eq!(b, Some("2"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 /// Arguments to [`ContainerBroker::get_shard_ranges`], mirroring the Python
@@ -2647,6 +2859,41 @@ pub struct GetShardRangesArgs {
     /// Python `fill_gaps`: for `states=listing` / `states=updating`, insert a
     /// copy of the own range covering (last_found.upper, own.upper].
     pub fill_gaps: bool,
+}
+
+/// Python `container.replicator.check_merge_own_shard_range`
+/// (Launchpad 1980451 / probe L4352): if this broker already has an own
+/// range *with an epoch*, drop an incoming own range *without* an epoch
+/// so a newer reset ACTIVE cannot overwrite a local SHARDED own.
+pub fn check_merge_own_shard_range(
+    shards: Vec<crate::shard::ShardRange>,
+    broker: &mut ContainerBroker,
+) -> Result<Vec<crate::shard::ShardRange>, DbError> {
+    // REPLICATE URLs are /device/part/hash; callers may open the broker
+    // with empty account/container. `get_own_shard_range` then looks up
+    // name="/" and returns a default no-epoch ACTIVE, which disabled the
+    // filter and let a newer reset own overwrite SHARDED (probe L4352).
+    let _ = broker.hydrate_account_container();
+    let local = broker.get_shard_ranges(&GetShardRangesArgs {
+        include_own: true,
+        include_deleted: true,
+        ..GetShardRangesArgs::default()
+    })?;
+    let epoched: std::collections::HashSet<String> = local
+        .iter()
+        .filter(|r| r.epoch.as_deref().is_some_and(|e| !e.is_empty()))
+        .map(|r| r.name.clone())
+        .collect();
+    if epoched.is_empty() {
+        return Ok(shards);
+    }
+    Ok(shards
+        .into_iter()
+        .filter(|s| {
+            let incoming_empty = s.epoch.as_deref().map(str::is_empty).unwrap_or(true);
+            !(incoming_empty && epoched.contains(&s.name))
+        })
+        .collect())
 }
 
 /// Minimal percent-decode for the Quoted-Root sysmeta (utf-8 lossy).
@@ -2722,7 +2969,13 @@ impl ContainerBroker {
         &mut self,
         updates: &crate::broker::BrokerMetadata,
     ) -> Result<(), DbError> {
-        crate::broker::update_metadata(self.conn()?, "container", updates)
+        match crate::broker::update_metadata(self.conn()?, "container", updates) {
+            Err(e) if crate::util::is_readonly_dbmoved(&e) => {
+                self.reload_db_files();
+                crate::broker::update_metadata(self.conn()?, "container", updates)
+            }
+            other => other,
+        }
     }
 
     /// `DatabaseBroker.delete_db` with the container whitelist.
@@ -3089,6 +3342,26 @@ impl ContainerBroker {
             self.has_other_shard_ranges()
         } else {
             Ok(false)
+        }
+    }
+
+    /// Python `sharding_required`: SHARDING, or UNSHARDED after cleaving
+    /// has been initiated. A handoff in this state must not be deleted
+    /// (`cleanup_post_replicate`, container/replicator.py:321-330) so
+    /// cleaving can finish (probe L3034).
+    ///
+    /// Also keep an UNSHARDED handoff that already learned *other* shard
+    /// ranges even when `own` is SHARDED (replicated from a finished
+    /// primary). Python `sharding_initiated` is false in that case, but
+    /// object usync is skipped; treating skip-as-success then rmtree'd
+    /// the DB before the sharder could cleave (probe L2972).
+    pub fn sharding_required(&mut self) -> Result<bool, DbError> {
+        match self.get_db_state()? {
+            DbState::Sharding => Ok(true),
+            DbState::Unsharded => {
+                Ok(self.sharding_initiated()? || self.has_other_shard_ranges()?)
+            }
+            _ => Ok(false),
         }
     }
 

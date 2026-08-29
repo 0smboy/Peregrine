@@ -37,6 +37,12 @@ pub struct DbAuditReport {
 }
 
 /// Find every `<hash>.db` under `<device>/<datadir>/<part>/<suffix>/<hash>/`.
+
+/// Swift container/account hash dirs are MD5 hex (32 chars).
+fn is_db_hash_dir(name: &str) -> bool {
+    name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 pub fn db_locations(device_path: &Path, datadir: &str) -> Vec<PathBuf> {
     let root = device_path.join(datadir);
     let mut out = Vec::new();
@@ -55,6 +61,14 @@ pub fn db_locations(device_path: &Path, datadir: &str) -> Vec<PathBuf> {
                 continue;
             };
             for hash in hashes.flatten() {
+                // Python `audit_location_generator` only yields 32-hex
+                // hash dirs. `{hash}.tmp` is a renamed-aside replica
+                // (deleted_child L4484–L4541) and must not be processed.
+                let hash_name = hash.file_name();
+                let hash_name = hash_name.to_string_lossy();
+                if !is_db_hash_dir(&hash_name) {
+                    continue;
+                }
                 let Ok(files) = std::fs::read_dir(hash.path()) else {
                     continue;
                 };
@@ -190,6 +204,32 @@ mod tests {
         let multi = audit_dbs_on_devices(&dir, false, "container");
         assert_eq!(multi.passed, 1);
         assert_eq!(multi.failed, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_db_locations_skips_renamed_hash_tmp() {
+        // deleted_child L4484: sharder/replicator must not see `{hash}.tmp`.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-hash-tmp-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("sda1");
+        let hsh = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let live = device.join("containers/0").join(&hsh[29..]).join(hsh);
+        std::fs::create_dir_all(&live).unwrap();
+        let live_db = live.join(format!("{hsh}.db"));
+        std::fs::write(&live_db, b"live").unwrap();
+        let aside = device
+            .join("containers/0")
+            .join(&hsh[29..])
+            .join(format!("{hsh}.tmp"));
+        std::fs::create_dir_all(&aside).unwrap();
+        let aside_db = aside.join(format!("{hsh}.db"));
+        std::fs::write(&aside_db, b"aside").unwrap();
+        let found = db_locations(&device, "containers");
+        assert_eq!(found, vec![live_db], "{found:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

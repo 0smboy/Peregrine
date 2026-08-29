@@ -117,6 +117,7 @@ fn main() {
         policies,
         default_policy_index,
         fixed_created_at: None,
+        recon_cache_path: get("recon_cache_path", "/var/cache/swift").into(),
     };
 
     // eventlet parity: `workers` × `max_clients` becomes one bounded thread

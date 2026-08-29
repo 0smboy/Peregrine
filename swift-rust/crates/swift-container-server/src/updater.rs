@@ -32,6 +32,8 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
 
+use swift_core::config::SwiftConfig;
+use swift_core::hashing::HashPathConfig;
 use swift_db::{db_locations, ContainerBroker, DbError};
 use swift_ring::Ring;
 
@@ -240,6 +242,15 @@ pub fn process_container(
     if !broker.is_root_container().unwrap_or(true) {
         stat.object_count = 0;
         stat.bytes_used = 0;
+    } else if let Some((oc, bu)) = sharded_root_live_usage(broker) {
+        if oc > stat.object_count {
+            eprintln!(
+                "G6_UPDATER_SAIO_FILL {}/{} oc {}->{oc} bu {}->{bu}",
+                stat.account, stat.container, stat.object_count, stat.bytes_used
+            );
+            stat.object_count = oc;
+            stat.bytes_used = bu;
+        }
     }
     if !stat.needs_report() {
         stats.no_changes += 1;
@@ -272,6 +283,46 @@ pub fn process_container(
         stats.failures += 1;
         Ok(ContainerOutcome::Failed)
     }
+}
+
+fn hash_config_for_saio() -> Option<HashPathConfig> {
+    let candidates = [
+        std::env::var("SWIFT_CONF").ok(),
+        Some("/etc/g6-rust/swift.conf".to_string()),
+        Some("/etc/swift/swift.conf".to_string()),
+    ];
+    for p in candidates.into_iter().flatten() {
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let Ok(conf) = SwiftConfig::parse_lenient(&text, &[], false) else {
+            continue;
+        };
+        if let Ok(h) = HashPathConfig::from_swift_conf(&conf) {
+            return Some(h);
+        }
+    }
+    None
+}
+
+fn device_from_broker_db(broker: &ContainerBroker) -> Option<std::path::PathBuf> {
+    // <device>/containers/<part>/<suffix>/<hash>/<file>
+    Some(
+        broker
+            .db_file()
+            .parent()?
+            .parent()?
+            .parent()?
+            .parent()?
+            .parent()?
+            .to_path_buf(),
+    )
+}
+
+fn sharded_root_live_usage(broker: &mut ContainerBroker) -> Option<(i64, i64)> {
+    let device = device_from_broker_db(broker)?;
+    let hash_config = hash_config_for_saio()?;
+    crate::sharder::live_child_usage_from_saio(broker, &device, &hash_config, None)
 }
 
 /// One full sweep of a device's container DBs.
@@ -321,7 +372,7 @@ mod tests {
     }
 
     struct FakeAccount {
-        calls: Mutex<Vec<(u64, String)>>,
+        calls: Mutex<Vec<(u64, String, i64, i64)>>,
         status: u16,
     }
     impl AccountNodeClient for FakeAccount {
@@ -331,12 +382,14 @@ mod tests {
             _part: u32,
             account: &str,
             container: &str,
-            _s: &ContainerStat,
+            s: &ContainerStat,
         ) -> ReportStatus {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((node.id, format!("/{account}/{container}")));
+            self.calls.lock().unwrap().push((
+                node.id,
+                format!("/{account}/{container}"),
+                s.object_count,
+                s.bytes_used,
+            ));
             self.status
         }
     }

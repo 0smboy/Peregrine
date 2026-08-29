@@ -344,6 +344,20 @@ fn load_object_ring(policy_index: i64) -> Option<Ring> {
     Some(Ring::new(data, hash))
 }
 
+fn head_object_request(
+    host: &str,
+    path: &str,
+    policy_index: i64,
+) -> String {
+    // X-Backend-Open-Expired: an object past X-Delete-At still has a data
+    // file. Probe test_expirer_object_split_brain L110 requires that name
+    // to stay in the listing until the expirer reaps it. A plain HEAD 404s
+    // and would look like a user DELETE.
+    format!(
+        "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nX-Backend-Storage-Policy-Index: {policy_index}\r\nX-Backend-Open-Expired: true\r\nX-Backend-Replication: true\r\nConnection: close\r\n\r\n"
+    )
+}
+
 fn head_object_status(
     dev: &RingDevice,
     part: u32,
@@ -365,9 +379,7 @@ fn head_object_status(
         url_encode(container),
         url_encode(name)
     );
-    let req = format!(
-        "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nX-Backend-Storage-Policy-Index: {policy_index}\r\nConnection: close\r\n\r\n"
-    );
+    let req = head_object_request(&host, &path, policy_index);
     conn.write_all(req.as_bytes()).ok()?;
     let mut raw = Vec::new();
     conn.read_to_end(&mut raw).ok()?;
@@ -379,8 +391,9 @@ fn head_object_status(
     Some(status)
 }
 
-/// `Some(true)` = every object replica 404/410; `Some(false)` = at least one
-/// 2xx; `None` = could not tell (leave the name alone).
+/// `Some(true)` = every object replica is a tombstone / never existed
+/// (404/410 even with open-expired); `Some(false)` = at least one data
+/// file remains (including X-Delete-At expiry); `None` = could not tell.
 fn object_is_gone(
     ring: &Ring,
     policy_index: i64,
@@ -883,11 +896,20 @@ pub fn replicate_container_db_role(
         .get("shard_max_row")
         .and_then(|v| v.as_i64())
         .unwrap_or(-1);
-    if shard_max_row >= 0 || remote_state == "sharding" || remote_state == "sharded" {
-        if let Err(e) =
-            fetch_and_merge_remote_shard_ranges(local, peer_host, peer_device, partition, hsh)
-        {
-            eprintln!("db-replicator: fetch shard ranges hsh={hsh} err={e}");
+    // Python `_choose_replication_mode`: `'shard_max_row' in rinfo` is
+    // enough — the key is present even when the value is -1 on a fresh
+    // unsharded peer. Requiring `>= 0` skipped the push onto an empty
+    // new primary, so it kept 0 shard ranges (probe L2966).
+    let remote_speaks_shards = remote_info.get("shard_max_row").is_some()
+        || remote_state == "sharding"
+        || remote_state == "sharded";
+    if remote_speaks_shards {
+        if shard_max_row >= 0 || remote_state == "sharding" || remote_state == "sharded" {
+            if let Err(e) = fetch_and_merge_remote_shard_ranges(
+                local, peer_host, peer_device, partition, hsh,
+            ) {
+                eprintln!("db-replicator: fetch shard ranges hsh={hsh} err={e}");
+            }
         }
         if let Err(e) =
             sync_shard_ranges_to_peer(local, local_id, peer_host, peer_device, partition, hsh)
@@ -903,8 +925,13 @@ pub fn replicate_container_db_role(
     // (`get_objects()` on the epoch file stays empty). Python's small-db
     // path usyncs; aborting rsync_then_merge is not enough when
     // `max_row < per_diff`.
-    if local.sharding_initiated().unwrap_or(false) {
-        eprintln!("db-replicator: skip object usync (local sharding) hsh={hsh}");
+    if local.sharding_initiated().unwrap_or(false)
+        || local.has_other_shard_ranges().unwrap_or(false)
+    {
+        // Python `_choose_replication_mode`: once the handoff has learned
+        // shard ranges it waits for cleaving instead of rsync_then_merge
+        // (probe L2964: new primary stays at 0 objects).
+        eprintln!("db-replicator: skip object usync (local shard ranges) hsh={hsh}");
         return Ok(ReplicateOutcome {
             diffs: 0,
             rows_pushed: 0,
@@ -1058,7 +1085,10 @@ fn fetch_and_merge_remote_shard_ranges(
         }
     }
     if !ranges.is_empty() {
-        local.merge_shard_ranges(ranges)?;
+        let ranges = crate::container::check_merge_own_shard_range(ranges, local)?;
+        if !ranges.is_empty() {
+            local.merge_shard_ranges(ranges)?;
+        }
     }
     Ok(())
 }
@@ -1752,6 +1782,23 @@ mod tests {
             false,
             false
         ));
+    }
+
+    #[test]
+    fn test_head_object_request_opens_expired() {
+        let req = head_object_request("127.0.0.1:16210", "/sdb1/1/a/c/o", 0);
+        assert!(
+            req.contains("X-Backend-Open-Expired: true"),
+            "{req}"
+        );
+        assert!(
+            req.contains("X-Backend-Replication: true"),
+            "{req}"
+        );
+        assert!(
+            req.contains("X-Backend-Storage-Policy-Index: 0"),
+            "{req}"
+        );
     }
 
     #[test]

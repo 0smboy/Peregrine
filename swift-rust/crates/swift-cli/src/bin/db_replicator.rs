@@ -42,7 +42,7 @@ use swift_core::statsd::StatsdClient;
 use swift_core::timestamp::{decode_timestamps, Timestamp};
 use swift_db::{
     replicate_account_db, replicate_completion_rpc, replicate_container_db_role,
-    replicator_run_once as run_once, rsync_db, rsync_would_recreate_retiring, AccountBroker,
+    replicator_run_once as run_once, rsync_db, AccountBroker,
     ContainerBroker, DbError, DbPartition, DbReplicateClient, DbState, DbValue, ObjectRecord,
     RsyncTransport,
 };
@@ -145,7 +145,16 @@ impl DbRsync {
         let rel = format!("{peer_device}/tmp/{stage_name}");
         match &self.dest {
             DbRsyncDest::Local { peer_map, port_of } => {
-                let port = port_of.get(peer_host).copied()?;
+                // Probe rings bind 127.0.0.1:16211, 127.0.0.2:16221, ...
+                // port_of only keyed 127.0.0.1:{port}, so a lookup on the
+                // ring host string missed every non-.1 primary and the
+                // handoff never staged a DB (probe L2938 / L3024).
+                let port = port_of.get(peer_host).copied().or_else(|| {
+                    peer_host
+                        .rsplit_once(':')
+                        .and_then(|(_, p)| p.parse().ok())
+                        .filter(|p| peer_map.contains_key(p))
+                })?;
                 let root = peer_map.get(&port)?;
                 Some((format!("{}/{rel}", root.display()), None))
             }
@@ -167,6 +176,7 @@ impl DbRsync {
 impl RsyncTransport for DbRsync {
     fn rsync(&self, local_db: &Path, peer_host: &str, peer_device: &str, stage_name: &str) -> bool {
         let Some((dest, ssh)) = self.rsync_dest(peer_host, peer_device, stage_name) else {
+            eprintln!("db-replicator: rsync dest missing peer={peer_host} device={peer_device}");
             return false;
         };
         let mut cmd = std::process::Command::new("rsync");
@@ -174,8 +184,12 @@ impl RsyncTransport for DbRsync {
         if let Some(opts) = ssh {
             cmd.arg("-e").arg(opts);
         }
-        cmd.arg(local_db).arg(dest);
-        matches!(cmd.status(), Ok(s) if s.success())
+        cmd.arg(local_db).arg(&dest);
+        let ok = matches!(cmd.status(), Ok(s) if s.success());
+        if !ok {
+            eprintln!("db-replicator: rsync failed peer={peer_host} dest={dest}");
+        }
+        ok
     }
 
     fn complete(
@@ -370,6 +384,36 @@ fn info_text(info: &[(String, DbValue)], key: &str) -> Option<String> {
 }
 
 impl DbReplicateClient for DbClient {
+    fn keep_handoff(&self, db: &DbPartition) -> bool {
+        if self.server != ServerType::Container {
+            return false;
+        }
+        // Must read account/container from container_stat. A blank path
+        // synthesizes an ACTIVE own, so sharding_initiated() is false even
+        // when the on-disk own is SHARDED (probe L2972).
+        let mut probe = ContainerBroker::new(&db.path, "", "");
+        let info = match probe.get_info() {
+            Ok(v) => v,
+            Err(_) => return probe.sharding_required().unwrap_or(false),
+        };
+        let account = info
+            .iter()
+            .find(|(k, _)| k == "account")
+            .and_then(|(_, v)| v.as_text())
+            .unwrap_or_default();
+        let container = info
+            .iter()
+            .find(|(k, _)| k == "container")
+            .and_then(|(_, v)| v.as_text())
+            .unwrap_or_default();
+        let mut broker = if account.is_empty() {
+            probe
+        } else {
+            ContainerBroker::new(&db.path, &account, &container)
+        };
+        broker.sharding_required().unwrap_or(false)
+    }
+
     fn db_max_row(&self, db: &DbPartition) -> i64 {
         match self.server {
             ServerType::Container => {
@@ -423,59 +467,36 @@ impl DbReplicateClient for DbClient {
                     // peer's tmp dir and have it adopted (complete_rsync,
                     // db_replicator.py:553-557)
                     Ok(outcome) if outcome.needs_rsync => {
-                        if rsync_would_recreate_retiring(&db.path) {
-                            // complete_rsync dest is always <hsh>.db. Do not
-                            // stage an epoch file under that name (probe L1347).
-                            // Still push shard-range rows so nested UPDATE_ROOT
-                            // that missed a down replica is repaired (L1306).
-                            let _ = swift_db::sync_shard_ranges_to_peer(
-                                &mut broker,
-                                &local_id,
-                                &peer_host,
-                                &peer.device,
-                                &partition,
-                                &db.hash,
-                            );
-                            true
-                        } else {
-                            rsync_db(
-                                &db.path,
-                                &local_id,
-                                &peer_host,
-                                &peer.device,
-                                &partition,
-                                &db.hash,
-                                "complete_rsync",
-                                &self.rsync,
-                            )
-                        }
+                        // Dest basename keeps any epoch suffix
+                        // (`rsync_dest_db_name`). Skipping complete_rsync
+                        // here left empty primaries without a hash dir
+                        // (probe L3024 / L2938). L1347 is enforced on the
+                        // receive side, not by refusing to stage.
+                        rsync_db(
+                            &db.path,
+                            &local_id,
+                            &peer_host,
+                            &peer.device,
+                            &partition,
+                            &db.hash,
+                            "complete_rsync",
+                            &self.rsync,
+                        )
                     }
                     // usync can't converge the peer: stage the DB and have
                     // the peer merge its own rows into it before adopting
                     // (rsync_then_merge, db_replicator.py:579-591)
                     Ok(outcome) if outcome.usync_incomplete => {
-                        if rsync_would_recreate_retiring(&db.path) {
-                            let _ = swift_db::sync_shard_ranges_to_peer(
-                                &mut broker,
-                                &local_id,
-                                &peer_host,
-                                &peer.device,
-                                &partition,
-                                &db.hash,
-                            );
-                            true
-                        } else {
-                            rsync_db(
-                                &db.path,
-                                &local_id,
-                                &peer_host,
-                                &peer.device,
-                                &partition,
-                                &db.hash,
-                                "rsync_then_merge",
-                                &self.rsync,
-                            )
-                        }
+                        rsync_db(
+                            &db.path,
+                            &local_id,
+                            &peer_host,
+                            &peer.device,
+                            &partition,
+                            &db.hash,
+                            "rsync_then_merge",
+                            &self.rsync,
+                        )
                     }
                     Ok(_) => true,
                     Err(e) => {
@@ -919,6 +940,30 @@ mod tests {
         assert!(ssh.is_none());
         // a peer missing from the map has no destination
         assert!(rsync.rsync_dest("127.0.0.1:9999", "sdb1", "x").is_none());
+    }
+
+    #[test]
+    fn test_rsync_dest_local_matches_ring_ip_by_port() {
+        // G6 probe ring: 127.0.0.1:16211 .. 127.0.0.4:16241. Lookup must
+        // not require the host to be 127.0.0.1.
+        let peer_map: HashMap<u32, PathBuf> = [
+            (16211u32, PathBuf::from("/srv/1/node")),
+            (16231u32, PathBuf::from("/srv/3/node")),
+        ]
+        .into_iter()
+        .collect();
+        let rsync = DbRsync {
+            dest: DbRsyncDest::Local {
+                peer_map,
+                port_of: HashMap::new(),
+            },
+        };
+        let (dest, ssh) = rsync
+            .rsync_dest("127.0.0.3:16231", "sdb3", "handoff-id")
+            .unwrap();
+        assert_eq!(dest, "/srv/3/node/sdb3/tmp/handoff-id");
+        assert!(ssh.is_none());
+        assert!(rsync.rsync_dest("127.0.0.2:16221", "sdb2", "x").is_none());
     }
 
     #[test]
