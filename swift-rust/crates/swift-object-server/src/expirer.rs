@@ -35,6 +35,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use swift_core::timestamp::Timestamp;
 use swift_http::split_path;
 use swift_ring::Ring;
 
@@ -76,9 +77,9 @@ pub fn build_task_obj(delete_at: i64, account: &str, container: &str, obj: &str)
 
 /// `parse_task_obj`: split `"<ts>-<account>/<container>/<object>"` back into
 /// its parts. Returns `None` on a malformed name.
-pub fn parse_task_obj(task_obj: &str) -> Option<(i64, String, String, String)> {
+pub fn parse_task_obj(task_obj: &str) -> Option<(Timestamp, String, String, String)> {
     let (timestamp, target_path) = task_obj.split_once('-')?;
-    let delete_at = ts_seconds(timestamp)?;
+    let delete_at = timestamp.parse::<Timestamp>().ok()?;
     let parts = split_path(&format!("/{target_path}"), 3, 3, true).ok()?;
     let account = parts[0].clone()?;
     let container = parts[1].clone()?;
@@ -120,13 +121,6 @@ pub fn is_expected_task_container(task_container_int: i64, divisor: i64, per_div
     divisor - r <= per_divisor
 }
 
-/// Parse the integer-seconds value of a Swift timestamp string.
-fn ts_seconds(ts: &str) -> Option<i64> {
-    let head = ts.split('_').next().unwrap_or("0");
-    // integer or float form; truncate toward the second like Timestamp
-    head.parse::<f64>().ok().map(|f| f as i64)
-}
-
 /// A due expiry task.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskInfo {
@@ -136,7 +130,11 @@ pub struct TaskInfo {
     pub target_account: String,
     pub target_container: String,
     pub target_object: String,
-    pub delete_timestamp: i64,
+    /// Exact Swift task timestamp. Async SLO deletion uses a five-decimal
+    /// timestamp that must survive parsing; truncating it can make the
+    /// backend DELETE older than the segment PUT and turn a 409 into a
+    /// falsely successful dequeue.
+    pub delete_timestamp: Timestamp,
     pub is_async_delete: bool,
 }
 
@@ -159,7 +157,7 @@ pub fn iter_due_tasks(
     task_account: &str,
     task_container: &str,
     objects: &[(String, String)],
-    now: i64,
+    now: Timestamp,
 ) -> Vec<TaskInfo> {
     let mut out = Vec::new();
     for (name, content_type) in objects {
@@ -217,7 +215,7 @@ pub struct ExpirerStats {
 /// are seconds. Returns whether the queue entry was popped.
 pub fn process_task(
     task: &TaskInfo,
-    now: i64,
+    now: Timestamp,
     reclaim_age: i64,
     client: &dyn ExpiryClient,
     stats: &mut ExpirerStats,
@@ -231,7 +229,10 @@ pub fn process_task(
         DeleteResult::Stale => {
             // Retry later unless the task is older than the reclaim age, in
             // which case the real object is presumed gone for good.
-            if task.delete_timestamp <= now - reclaim_age {
+            let reclaim_cutoff = now
+                .raw()
+                .saturating_sub(reclaim_age.saturating_mul(100_000));
+            if task.delete_timestamp.raw() <= reclaim_cutoff {
                 let popped = client.pop_queue(task);
                 stats.objects += 1;
                 popped
@@ -278,7 +279,7 @@ fn http_body(buf: &[u8]) -> &[u8] {
 }
 
 fn delete_actual_object_via_proxy(proxy_host: &str, task: &TaskInfo) -> DeleteResult {
-    let ts = normalize_delete_at_timestamp(task.delete_timestamp);
+    let ts = task.delete_timestamp.normal();
     let path = format!(
         "/v1/{}/{}/{}",
         pe(&task.target_account),
@@ -544,7 +545,7 @@ impl ExpiryClient for HttpExpiryClient<'_> {
         ) else {
             return DeleteResult::Error;
         };
-        let ts = normalize_delete_at_timestamp(task.delete_timestamp);
+        let ts = task.delete_timestamp.normal();
         let mut saw_success = false;
         let mut saw_stale = false;
         let mut saw_error = false;
@@ -619,7 +620,7 @@ pub fn run_once(
     account_ring: &Ring,
     container_ring: &Ring,
     object_ring: &Ring,
-    now: i64,
+    now: Timestamp,
     reclaim_age: i64,
 ) -> ExpirerStats {
     let client = HttpExpiryClient {
@@ -637,7 +638,7 @@ pub fn run_once_via_proxy(
     account_ring: &Ring,
     container_ring: &Ring,
     proxy_host: &str,
-    now: i64,
+    now: Timestamp,
     reclaim_age: i64,
 ) -> ExpirerStats {
     let client = ProxyExpiryClient {
@@ -650,7 +651,7 @@ pub fn run_once_via_proxy(
 fn run_once_with_client(
     account_ring: &Ring,
     container_ring: &Ring,
-    now: i64,
+    now: Timestamp,
     reclaim_age: i64,
     client: &dyn ExpiryClient,
 ) -> ExpirerStats {
@@ -663,7 +664,7 @@ fn run_once_with_client(
         let Ok(c_int) = cname.parse::<i64>() else {
             continue;
         };
-        if c_int > now {
+        if c_int.saturating_mul(100_000) > now.raw() {
             break;
         }
         // Zero-padded form used by the enqueue path.
@@ -715,7 +716,7 @@ mod tests {
             target_account: "AUTH_test".into(),
             target_container: "c".into(),
             target_object: "o/deep".into(),
-            delete_timestamp: 1_751_500_000,
+            delete_timestamp: Timestamp::from_secs(1_751_500_000.0).unwrap(),
             is_async_delete,
         }
     }
@@ -723,9 +724,8 @@ mod tests {
     fn serve_proxy_status(status: &str) -> (String, std::thread::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let host = listener.local_addr().unwrap().to_string();
-        let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        );
+        let response =
+            format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
@@ -749,9 +749,12 @@ mod tests {
             request.starts_with("DELETE /v1/AUTH_test/c/o%2Fdeep HTTP/1.1\r\n"),
             "{request}"
         );
-        assert!(request.contains("X-Timestamp: 1751500000\r\n"), "{request}");
         assert!(
-            request.contains("X-If-Delete-At: 1751500000\r\n"),
+            request.contains("X-Timestamp: 1751500000.00000\r\n"),
+            "{request}"
+        );
+        assert!(
+            request.contains("X-If-Delete-At: 1751500000.00000\r\n"),
             "{request}"
         );
         assert!(
@@ -787,11 +790,38 @@ mod tests {
     }
 
     #[test]
+    fn test_async_delete_preserves_high_precision_task_timestamp() {
+        let task_object = "1788003752.62601-AUTH_test/segments/segment_1".to_string();
+        let (delete_timestamp, target_account, target_container, target_object) =
+            parse_task_obj(&task_object).unwrap();
+        let task = TaskInfo {
+            task_account: ".expiring_objects".into(),
+            task_container: "1787961514".into(),
+            task_object,
+            target_account,
+            target_container,
+            target_object,
+            delete_timestamp,
+            is_async_delete: true,
+        };
+        let (host, request) = serve_proxy_status("204 No Content");
+        assert_eq!(
+            delete_actual_object_via_proxy(&host, &task),
+            DeleteResult::Deleted
+        );
+        let request = request.join().unwrap();
+        assert!(
+            request.contains("X-Timestamp: 1788003752.62601\r\n"),
+            "high-precision SLO timestamp was not preserved: {request}"
+        );
+    }
+
+    #[test]
     fn test_build_and_parse_roundtrip() {
         let name = build_task_obj(1751500000, "AUTH_test", "c", "o/deep");
         assert_eq!(name, "1751500000-AUTH_test/c/o/deep");
         let (ts, a, c, o) = parse_task_obj(&name).unwrap();
-        assert_eq!(ts, 1751500000);
+        assert_eq!(ts, Timestamp::from_secs(1_751_500_000.0).unwrap());
         assert_eq!(a, "AUTH_test");
         assert_eq!(c, "c");
         assert_eq!(o, "o/deep", "object keeps its slashes");
@@ -834,18 +864,42 @@ mod tests {
 
     #[test]
     fn test_iter_due_stops_at_future() {
-        let now = 1751500000;
+        let now_secs = 1_751_500_000;
+        let now = Timestamp::from_secs(now_secs as f64).unwrap();
         let objs = vec![
-            (build_task_obj(now - 100, "a", "c", "past1"), String::new()),
-            (build_task_obj(now, "a", "c", "now"), String::new()),
-            (build_task_obj(now + 100, "a", "c", "future"), String::new()),
-            (build_task_obj(now + 200, "a", "c", "later"), String::new()),
+            (
+                build_task_obj(now_secs - 100, "a", "c", "past1"),
+                String::new(),
+            ),
+            (build_task_obj(now_secs, "a", "c", "now"), String::new()),
+            (
+                build_task_obj(now_secs + 100, "a", "c", "future"),
+                String::new(),
+            ),
+            (
+                build_task_obj(now_secs + 200, "a", "c", "later"),
+                String::new(),
+            ),
         ];
         let due = iter_due_tasks(".expiring_objects", "0000000000", &objs, now);
         // the two <= now are due; iteration stops at the first future task
         assert_eq!(due.len(), 2);
         assert_eq!(due[0].target_object, "past1");
         assert_eq!(due[1].target_object, "now");
+    }
+
+    #[test]
+    fn test_iter_due_uses_subsecond_current_time() {
+        let objects = vec![(
+            "1788004660.25140-AUTH_test/segments/segment_1".to_string(),
+            ASYNC_DELETE_TYPE.to_string(),
+        )];
+        let before = Timestamp::from_secs(1_788_004_660.20).unwrap();
+        let after = Timestamp::from_secs(1_788_004_660.30).unwrap();
+        assert!(iter_due_tasks(".expiring_objects", "1787961505", &objects, before).is_empty());
+        let due = iter_due_tasks(".expiring_objects", "1787961505", &objects, after);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].delete_timestamp.normal(), "1788004660.25140");
     }
 
     struct FakeExpiry {
@@ -864,8 +918,12 @@ mod tests {
 
     #[test]
     fn test_process_deletes_then_pops() {
-        let now = 1751500000;
-        let objs = vec![(build_task_obj(now - 10, "AUTH_x", "c", "o"), String::new())];
+        let now_secs = 1_751_500_000;
+        let now = Timestamp::from_secs(now_secs as f64).unwrap();
+        let objs = vec![(
+            build_task_obj(now_secs - 10, "AUTH_x", "c", "o"),
+            String::new(),
+        )];
         let due = iter_due_tasks(".expiring_objects", "0000000000", &objs, now);
         let client = FakeExpiry {
             delete_result: DeleteResult::Deleted,
@@ -880,7 +938,8 @@ mod tests {
 
     #[test]
     fn test_stale_recent_retained_old_popped() {
-        let now = 1751500000;
+        let now_secs = 1_751_500_000;
+        let now = Timestamp::from_secs(now_secs as f64).unwrap();
         let reclaim = 604800;
         let client = FakeExpiry {
             delete_result: DeleteResult::Stale,
@@ -894,7 +953,7 @@ mod tests {
             target_account: "a".into(),
             target_container: "c".into(),
             target_object: "o".into(),
-            delete_timestamp: now - 10,
+            delete_timestamp: Timestamp::from_secs((now_secs - 10) as f64).unwrap(),
             is_async_delete: false,
         };
         let mut stats = ExpirerStats::default();
@@ -903,7 +962,7 @@ mod tests {
 
         // old stale -> popped
         let old = TaskInfo {
-            delete_timestamp: now - reclaim - 1,
+            delete_timestamp: Timestamp::from_secs((now_secs - reclaim - 1) as f64).unwrap(),
             task_object: "t2".into(),
             ..recent.clone()
         };

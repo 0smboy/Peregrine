@@ -30,12 +30,11 @@ use swift_core::obslog::{LogLevel, Logger};
 use swift_core::statsd::StatsdClient;
 use swift_ring::{Ring, RingData};
 
-fn parse_conf_file(path: &str) -> SwiftConfig {
-    let content = std::fs::read_to_string(path).unwrap_or_default();
-    SwiftConfig::parse_lenient(&content, &[], false).unwrap_or_else(|e| {
-        eprintln!("could not parse {path}: {e}");
-        std::process::exit(1);
-    })
+fn parse_conf_file(path: &str) -> Result<SwiftConfig, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|error| format!("could not read {path}: {error}"))?;
+    SwiftConfig::parse_lenient(&content, &[], false)
+        .map_err(|error| format!("could not parse {path}: {error}"))
 }
 
 fn main() {
@@ -43,7 +42,10 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "/etc/swift/container-server.conf".to_string());
     let run_once_only = std::env::args().nth(2).as_deref() == Some("once");
-    let conf = parse_conf_file(&conf_path);
+    let conf = parse_conf_file(&conf_path).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
     let get = |section: &str, key: &str, default: &str| -> String {
         conf.get(section, key)
             .ok()
@@ -75,7 +77,10 @@ fn main() {
 
     let swift_conf_path =
         std::env::var("SWIFT_CONF").unwrap_or_else(|_| "/etc/swift/swift.conf".to_string());
-    let swift_conf = parse_conf_file(&swift_conf_path);
+    let swift_conf = parse_conf_file(&swift_conf_path).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
     let hash_config = HashPathConfig::from_swift_conf(&swift_conf).unwrap_or_else(|e| {
         logger.error(&format!("bad swift.conf hash config: {e}"));
         std::process::exit(1);
@@ -138,5 +143,21 @@ fn main() {
                 "could not reload {ring_path}: {e}; reusing previous ring"
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_config_is_an_error() {
+        let missing = std::env::temp_dir().join(format!(
+            "swift-container-updater-missing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        let error = parse_conf_file(missing.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("could not read"), "{error}");
     }
 }

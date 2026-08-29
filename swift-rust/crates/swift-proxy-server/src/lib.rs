@@ -48,6 +48,22 @@ use swift_ring::Ring;
 
 mod async_fanout;
 
+// Swift's modern object-expirer queue uses one hidden account and spreads a
+// divisor window over the preceding 100 container names by object hash. Keep
+// these beside the proxy routing code: the proxy and object server must agree
+// on the exact task-container name or expiry updates become orphaned.
+const EXPIRER_ACCOUNT_NAME: &str = ".expiring_objects";
+const EXPIRER_CONTAINER_DIVISOR: i64 = 86_400;
+const EXPIRER_CONTAINERS_PER_DIVISOR: i64 = 100;
+
+fn expirer_container_for_object_hash(delete_at: i64, object_hash: &str) -> String {
+    let bucket = delete_at.div_euclid(EXPIRER_CONTAINER_DIVISOR) * EXPIRER_CONTAINER_DIVISOR;
+    let offset = u128::from_str_radix(object_hash, 16)
+        .unwrap_or(0)
+        .rem_euclid(EXPIRER_CONTAINERS_PER_DIVISOR as u128) as i64;
+    format!("{:010}", bucket.saturating_sub(offset))
+}
+
 /// An owned backend node (device ip/port/name), so node lists can move
 /// across the fan-out threads. The Rust `PartNode`/`HandoffNode` borrow
 /// their device from the ring.
@@ -414,6 +430,18 @@ impl InfoCache {
         self.memcache_delete(&mkey);
         let state_key = Self::memcache_key_container_db_state(key);
         self.memcache_delete(&state_key);
+    }
+
+    /// Clear mutable container metadata while retaining independently proven
+    /// root sharding state. A container POST cannot unshard a root. Python
+    /// clears `container/<account>/<container>` here but deliberately does not
+    /// purge the updating-shard cache, so retaining this routing proof matches
+    /// its contract. PUT/DELETE still use [`Self::clear_container`] because a
+    /// delete/recreate can invalidate both metadata and shard topology.
+    fn clear_container_metadata(&self, key: &str) {
+        self.containers.lock().unwrap().remove(key);
+        let mkey = Self::memcache_key_container(key);
+        self.memcache_delete(&mkey);
     }
 
     /// A fresh cached account info, or `None`.
@@ -1717,16 +1745,90 @@ impl ProxyApp {
         }
     }
 
+    /// Python `BaseObjectController._backend_requests` delete-at side channel.
+    /// It deliberately walks the object slots in reverse order so ordinary
+    /// container updates and expirer-queue updates are spread across different
+    /// object replicas. A quorum object write must still carry a quorum of
+    /// expiry updates.
+    fn stamp_delete_at_update_headers(
+        per_node: &mut [HeaderKeyDict],
+        delete_at_container: &str,
+        delete_at_part: u32,
+        delete_at_primaries: &[Node],
+    ) {
+        if per_node.is_empty() || delete_at_primaries.is_empty() {
+            return;
+        }
+        let rc = delete_at_primaries.len();
+        let ro = per_node.len();
+        let qc = quorum_size(rc as f64) as usize;
+        let qo = quorum_size(ro as f64) as usize;
+        let n_updates_needed = Self::num_container_updates(rc, qc, ro, qo);
+        for i in 0..n_updates_needed {
+            let index = ro - 1 - (i % ro);
+            let headers = &mut per_node[index];
+            let node = &delete_at_primaries[i % rc];
+            headers.set("X-Delete-At-Container", delete_at_container);
+            headers.set("X-Delete-At-Partition", delete_at_part);
+            let host = format!("{}:{}", node.ip, node.port);
+            headers.set(
+                "X-Delete-At-Host",
+                csv_append(headers.get("X-Delete-At-Host"), &host),
+            );
+            headers.set(
+                "X-Delete-At-Device",
+                csv_append(headers.get("X-Delete-At-Device"), &node.device),
+            );
+        }
+    }
+
+    fn stamp_expirer_update_headers(
+        &self,
+        per_node: &mut [HeaderKeyDict],
+        base: &HeaderKeyDict,
+        account: &str,
+        container: &str,
+        object: &str,
+    ) {
+        let Some(delete_at) = base
+            .get("X-Delete-At")
+            .and_then(parse_int_like)
+            .map(|value| value as i64)
+        else {
+            return;
+        };
+        let Ok(object_hash) = self.container_ring.hash_path_config().hash_path(
+            account,
+            Some(container),
+            Some(object),
+        ) else {
+            return;
+        };
+        let task_container = expirer_container_for_object_hash(delete_at, &object_hash);
+        let Ok((part, _)) =
+            self.container_ring
+                .get_nodes(EXPIRER_ACCOUNT_NAME, Some(&task_container), None)
+        else {
+            return;
+        };
+        let primaries = Self::part_nodes(&self.container_ring, part);
+        Self::stamp_delete_at_update_headers(per_node, &task_container, part, &primaries);
+    }
+
     fn object_container_update_headers(
         &self,
         base: &HeaderKeyDict,
         container_part: u32,
         node_number: usize,
+        account: &str,
+        container: &str,
+        object: &str,
     ) -> Vec<HeaderKeyDict> {
         let n = node_number.max(1);
         let mut per_node = vec![base.clone(); n];
         let primaries = Self::part_nodes(&self.container_ring, container_part);
         Self::stamp_container_update_headers(&mut per_node, container_part, &primaries);
+        self.stamp_expirer_update_headers(&mut per_node, base, account, container, object);
         per_node
     }
 
@@ -2837,13 +2939,26 @@ impl ProxyApp {
         let account = segs[2].to_string();
         let container = segs.get(3).map(|s| s.to_string()).filter(|s| !s.is_empty());
         let object = segs.get(4).map(|s| s.to_string()).filter(|s| !s.is_empty());
+        // Python's ContainerController.UPDATE is @private: it is not in the
+        // public Allow set and is reachable only when trusted middleware sets
+        // X-Backend-Allow-Private-Methods after gatekeeper has stripped any
+        // client-supplied X-Backend-* headers. SLO async delete depends on
+        // this route to enqueue records in .expiring_objects.
+        let private_container_update = req.method == "UPDATE"
+            && container.is_some()
+            && object.is_none()
+            && req
+                .headers
+                .get("X-Backend-Allow-Private-Methods")
+                .is_some_and(config_true_value);
         // Python validates the controller's public methods before invoking
         // auth or any handler. This also guarantees that an unsupported CORS
         // method cannot trigger metadata lookup or receive CORS headers.
         let allowed = self.allowed_methods(container.is_some());
-        if !allowed
-            .split(", ")
-            .any(|method| method == req.method.as_str())
+        if !private_container_update
+            && !allowed
+                .split(", ")
+                .any(|method| method == req.method.as_str())
         {
             return method_not_allowed(allowed);
         }
@@ -2867,6 +2982,13 @@ impl ProxyApp {
             .is_some()
         {
             return Response::new(204);
+        }
+        if private_container_update {
+            return self.container_update(
+                &mut req,
+                &account,
+                container.as_deref().expect("private UPDATE has container"),
+            );
         }
         if req.method == "OPTIONS" {
             return self.options_response(&req, &account, container.as_deref());
@@ -2944,6 +3066,14 @@ impl ProxyApp {
             return text_response(412, "Bad URL");
         }
         let v1 = segs.len() >= 3 && segs[0].is_empty() && segs[1] == "v1" && !segs[2].is_empty();
+        let private_container_update = v1
+            && areq.method == "UPDATE"
+            && segs.get(3).is_some_and(|segment| !segment.is_empty())
+            && !segs.get(4).is_some_and(|segment| !segment.is_empty())
+            && areq
+                .headers
+                .get("X-Backend-Allow-Private-Methods")
+                .is_some_and(config_true_value);
         let object_put = areq.method == "PUT"
             && segs.len() >= 5
             && v1
@@ -3066,7 +3196,7 @@ impl ProxyApp {
         let get_head_post_delete =
             v1 && matches!(areq.method.as_str(), "GET" | "HEAD" | "POST" | "DELETE");
         let account_or_container_put = v1 && areq.method == "PUT" && segs.len() < 5;
-        if get_head_post_delete || account_or_container_put {
+        if get_head_post_delete || account_or_container_put || private_container_update {
             let mut req = Request {
                 method: areq.method.clone(),
                 path: areq.path.clone(),
@@ -3084,9 +3214,10 @@ impl ProxyApp {
             let container = segs.get(3).map(|s| s.to_string()).filter(|s| !s.is_empty());
             let object = segs.get(4).map(|s| s.to_string()).filter(|s| !s.is_empty());
             let allowed = self.allowed_methods(container.is_some());
-            if !allowed
-                .split(", ")
-                .any(|method| method == req.method.as_str())
+            if !private_container_update
+                && !allowed
+                    .split(", ")
+                    .any(|method| method == req.method.as_str())
             {
                 return method_not_allowed(allowed);
             }
@@ -3103,7 +3234,7 @@ impl ProxyApp {
             {
                 return Response::new(204);
             }
-            if matches!(req.method.as_str(), "POST" | "PUT") {
+            if matches!(req.method.as_str(), "POST" | "PUT" | "UPDATE") {
                 let body = match areq.body.materialize(swift_http::MAX_CONTROL_BODY).await {
                     Ok(bytes) => swift_http::Body::Buffered(bytes),
                     Err(e) if swift_http::body_too_large(&e) => {
@@ -3141,6 +3272,10 @@ impl ProxyApp {
                         is_reseller_request(&req),
                         self.container_post_async(req, &account, &c).await,
                     )
+                }
+                ("UPDATE", Some(c), None) if private_container_update => {
+                    let c = c.to_string();
+                    self.container_update_async(req, &account, &c).await
                 }
                 ("GET" | "HEAD", None, _) => finish_account_resp(
                     swift_owner,
@@ -3409,7 +3544,14 @@ impl ProxyApp {
             .get_part_nodes(object_part)
             .map(|n| n.len())
             .unwrap_or(1);
-        let per_node = self.object_container_update_headers(&base, container_part, node_number);
+        let per_node = self.object_container_update_headers(
+            &base,
+            container_part,
+            node_number,
+            account,
+            container,
+            object,
+        );
         let object_nodes = self.iter_nodes(object_ring, object_part);
         let mut resp = self
             .stream_put_async(
@@ -3515,6 +3657,59 @@ impl ProxyApp {
             }
             _ => method_not_allowed(self.allowed_methods(false)),
         }
+    }
+
+    /// Python `ContainerController.UPDATE`: trusted bulk merge of object
+    /// records into a container DB. This is a private middleware/internal-
+    /// client contract, not a public Swift verb. The caller has already
+    /// passed the private-method and authorization gates in [`Self::handle`].
+    fn container_update(
+        self: &Arc<Self>,
+        req: &mut Request,
+        account: &str,
+        container: &str,
+    ) -> Response {
+        let Some(policy_index) = req
+            .headers
+            .get("X-Backend-Storage-Policy-Index")
+            .and_then(|value| value.parse::<i64>().ok())
+        else {
+            return text_response(400, "Missing or invalid X-Backend-Storage-Policy-Index");
+        };
+        let body = match req.body.materialize(swift_http::MAX_CONTROL_BODY) {
+            Ok(bytes) => bytes.to_vec(),
+            Err(error) if swift_http::body_too_large(&error) => {
+                return Response::error(413, "Your request is too large.")
+            }
+            Err(_) => return swob_response(499),
+        };
+        let Ok((part, _)) = self
+            .container_ring
+            .get_nodes(account, Some(container), None)
+        else {
+            return swob_response(503);
+        };
+        let mut headers = self.backend_headers(req, true, "container");
+        headers.set("X-Backend-Storage-Policy-Index", policy_index);
+        if !headers.contains_key("X-Timestamp") {
+            headers.set("X-Timestamp", Timestamp::now().internal());
+        }
+        let node_count = self
+            .container_ring
+            .get_part_nodes(part)
+            .map(|nodes| nodes.len())
+            .unwrap_or(1);
+        let per_node = (0..node_count).map(|_| headers.clone()).collect();
+        self.make_requests(
+            self.iter_nodes(&self.container_ring, part),
+            node_count,
+            part,
+            "UPDATE",
+            &format!("/{}/{}", percent_encode(account), percent_encode(container)),
+            &req.query_string,
+            per_node,
+            body,
+        )
     }
 
     fn container_request(
@@ -3680,13 +3875,14 @@ impl ProxyApp {
                     matches!(req.method.as_str(), "PUT" | "DELETE"),
                 );
                 let cont_nodes = self.iter_nodes(&self.container_ring, container_part);
-                // _clear_container_info_cache: POST and DELETE clear the
-                // cached container info BEFORE the backend fan-out
-                // (container.py:707-708,725-726); PUT clears AFTER
-                // (container.py:679-683). Either way the next object
-                // request re-HEADs and sees the post-write state.
+                // _clear_container_info_cache: POST and DELETE clear mutable
+                // container info before fan-out; PUT clears after. Preserve
+                // the independent updating-route proof across POST, matching
+                // Python's decision not to purge its updating-shard cache.
                 let cache_key = format!("{account}/{container}");
-                if req.method != "PUT" {
+                if req.method == "POST" {
+                    self.info_cache.clear_container_metadata(&cache_key);
+                } else if req.method == "DELETE" {
                     self.info_cache.clear_container(&cache_key);
                 }
                 let resp = self.make_requests(
@@ -3753,12 +3949,7 @@ impl ProxyApp {
     /// container-info TTL expires, so the initial `unsharded` value would
     /// otherwise be stamped into async_pending files after the container
     /// nodes are deliberately stopped.
-    fn remember_proven_container_db_state(
-        &self,
-        account: &str,
-        container: &str,
-        state: &str,
-    ) {
+    fn remember_proven_container_db_state(&self, account: &str, container: &str, state: &str) {
         let cache_key = format!("{account}/{container}");
         self.info_cache.set_container_db_state(
             &cache_key,
@@ -3845,15 +4036,18 @@ impl ProxyApp {
 
     /// Python obj.py: object PUT/DELETE carry `X-Container-Root-Db-State` so
     /// a failed container update still pickles `db_state` into async_pending.
-    fn stamp_root_db_state(&self, account: &str, container: &str, headers: &mut HeaderKeyDict) {
+    fn effective_root_db_state(&self, account: &str, container: &str, fallback: &str) -> String {
         let cache_key = format!("{account}/{container}");
-        if let Some(state) = self.info_cache.get_container_db_state(&cache_key) {
-            headers.set("X-Container-Root-Db-State", state);
-            return;
-        }
+        self.info_cache
+            .get_container_db_state(&cache_key)
+            .unwrap_or_else(|| fallback.to_string())
+    }
+
+    fn stamp_root_db_state(&self, account: &str, container: &str, headers: &mut HeaderKeyDict) {
+        let fallback = self.container_info(account, container);
         headers.set(
             "X-Container-Root-Db-State",
-            self.container_info(account, container).root_db_state(),
+            self.effective_root_db_state(account, container, fallback.root_db_state()),
         );
     }
 
@@ -4032,7 +4226,8 @@ impl ProxyApp {
         // Marker windows may select 1–2 ranges; settled-ness is a property of
         // the whole container (probe L692 reverse+limit).
         let all_ranges: Vec<&serde_json::Value> = arr.iter().collect();
-        if state == "sharded" || listing_ranges_prove_sharded(&all_ranges) {
+        let root_path = format!("{account}/{container}");
+        if state == "sharded" || listing_ranges_prove_sharded(&all_ranges, &root_path) {
             self.remember_proven_container_db_state(account, container, "sharded");
         }
         let empty_wins = listing_ranges_are_settled_active(&all_ranges);
@@ -4431,15 +4626,15 @@ impl ProxyApp {
             // Walk every replica and keep the most cleaved view. get_or_head
             // X-Newest can still return a SHARDING primary (same created_at);
             // 4 ACTIVE on the under-populated node must win (L1509).
-            if let Some(arr) = prefer_most_progressed_listing_arrays(
-                &self.fetch_json_arrays_nonempty(
+            if let Some(arr) =
+                prefer_most_progressed_listing_arrays(&self.fetch_json_arrays_nonempty(
                     &nodes,
                     part,
                     path,
                     "states=listing&format=json",
                     shard_headers,
-                ),
-            ) {
+                ))
+            {
                 if !arr.is_empty() {
                     return Some(arr);
                 }
@@ -4460,29 +4655,27 @@ impl ProxyApp {
         // 1) Prefer the topology reported by the most replicas.  On a tie,
         // keep the longest progressed view so a lagging 1-range replica does
         // not hide CLEAVED children (probe test_sharding_listing L631).
-        if let Some(arr) = prefer_quorum_consistent_listing_arrays(
-            &self.fetch_json_arrays_nonempty(
+        if let Some(arr) =
+            prefer_quorum_consistent_listing_arrays(&self.fetch_json_arrays_nonempty(
                 &nodes,
                 part,
                 path,
                 "states=listing&format=json",
                 shard_headers,
-            ),
-        ) {
+            ))
+        {
             if !arr.is_empty() {
                 return Some(arr);
             }
         }
         // 2) Broader: no state filter; prefer listing-state rows, else all.
-        let broad = prefer_quorum_consistent_listing_arrays(
-            &self.fetch_json_arrays_nonempty(
-                &nodes,
-                part,
-                path,
-                "format=json",
-                shard_headers,
-            ),
-        )?;
+        let broad = prefer_quorum_consistent_listing_arrays(&self.fetch_json_arrays_nonempty(
+            &nodes,
+            part,
+            path,
+            "format=json",
+            shard_headers,
+        ))?;
         Some(prefer_listing_state_ranges(&broad))
     }
 
@@ -5170,6 +5363,13 @@ impl ProxyApp {
                 if req.method == "PUT" {
                     apply_content_type_guess(req);
                 }
+                if req.method == "POST" {
+                    if let Err(resp) =
+                        apply_check_delete_headers(req, Timestamp::now().as_secs_f64())
+                    {
+                        return resp;
+                    }
+                }
                 // Enforce the metadata constraints (name/value length, count,
                 // overall size) on writes, as Python's proxy does via
                 // check_metadata — the object server does not, so without this
@@ -5224,8 +5424,14 @@ impl ProxyApp {
                     .get_part_nodes(object_part)
                     .map(|n| n.len())
                     .unwrap_or(1);
-                let per_node =
-                    self.object_container_update_headers(&base, container_part, node_number);
+                let per_node = self.object_container_update_headers(
+                    &base,
+                    container_part,
+                    node_number,
+                    account,
+                    container,
+                    object,
+                );
                 if req.method == "POST" {
                     // Object POST takes its own path with the mixed-result
                     // handoff fallback (obj.py:912-962); PUT/DELETE keep the
@@ -6644,6 +6850,11 @@ pub(crate) fn include_shrink_to_root_residual(
     s == "sharded" || s == "collapsed"
 }
 
+pub(crate) fn cached_state_allows_shard_update(db_state: &str) -> bool {
+    let state = db_state.to_ascii_lowercase();
+    state == "sharded" || state == "sharding"
+}
+
 /// Root retiring rows. Skip when a SHRINKING donor is nested under an
 /// expanded acceptor (probe L1985): shard DBs already have the live names
 /// and the retiring DB still lists DELETE'd first-shard objects.
@@ -7108,7 +7319,10 @@ pub(crate) fn listing_ranges_are_settled_active(selected: &[&serde_json::Value])
 /// namespace partition. Unlike `listing_ranges_are_settled_active`, this does
 /// not accept SHRINKING ranges; it is safe to use as evidence that object
 /// updates should carry root `db_state=sharded`.
-pub(crate) fn listing_ranges_prove_sharded(selected: &[&serde_json::Value]) -> bool {
+pub(crate) fn listing_ranges_prove_sharded(
+    selected: &[&serde_json::Value],
+    root_path: &str,
+) -> bool {
     if selected.is_empty() {
         return false;
     }
@@ -7117,6 +7331,19 @@ pub(crate) fn listing_ranges_prove_sharded(selected: &[&serde_json::Value]) -> b
         if sr.get("state").and_then(|v| v.as_i64()) != Some(40)
             || sr.get("deleted").and_then(|v| v.as_i64()).unwrap_or(0) != 0
         {
+            return false;
+        }
+        // An ordinary, unsharded container may expose its own ACTIVE
+        // MIN-to-MAX namespace row. That is not evidence that object updates
+        // belong in a shard. Accept only actual shard-container rows and
+        // explicitly reject the root's self range; otherwise a normal listing
+        // poisons the root-db-state cache and the next DELETE leaves a stale
+        // container row (object-expirer outdated-404/412 regression).
+        let name = sr.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let Some((range_account, _)) = name.split_once('/') else {
+            return false;
+        };
+        if name == root_path || !range_account.starts_with(".shards_") {
             return false;
         }
         bounds.push((
@@ -7555,9 +7782,11 @@ fn csv_append(existing: Option<&str>, item: &str) -> String {
     }
 }
 
-/// Python `_backend_requests` `set_container_update`: send both the
-/// unquoted path and `X-Backend-Quoted-Container-Path` so object-servers
-/// update the nested shard, not the root (probe L1435).
+/// Python `_backend_requests` `set_container_update`: send the percent-encoded
+/// shard location in `X-Backend-Quoted-Container-Path` so object-servers update
+/// the nested shard, not the root (probe L1435). Do not also send the legacy
+/// raw header: shard paths may contain NUL, CR, or LF and therefore cannot be
+/// represented safely as an HTTP/1.1 header value.
 pub(crate) fn stamp_shard_container_path(
     headers: &mut HeaderKeyDict,
     upd_account: &str,
@@ -7572,14 +7801,6 @@ pub(crate) fn stamp_shard_container_path(
     let quoted = percent_encode_path(&path);
     headers.set("X-Backend-Quoted-Container-Path", &quoted);
     headers.set("X-Backend-Allow-Reserved-Names", "true");
-    // HTTP/1.1 forbids CR/LF in header values. FunkyNames shard container
-    // names include `\n`; sending the raw path 400s the object PUT.
-    if path.bytes().any(|b| matches!(b, b'\r' | b'\n')) {
-        headers.set("X-Backend-Container-Path", &quoted);
-        headers.set("X-Backend-Location-Is-Quoted", "true");
-    } else {
-        headers.set("X-Backend-Container-Path", &path);
-    }
 }
 
 pub(crate) fn percent_encode(s: &str) -> String {
@@ -8715,6 +8936,11 @@ mod info_cache_tests {
         assert_eq!(unchanged.db_state, "unsharded");
         assert_eq!(unchanged.policy_index, 7);
         assert_eq!(unchanged.read_acl.as_deref(), Some("r"));
+        assert_eq!(
+            app.effective_root_db_state("AUTH_test", "c", unchanged.root_db_state()),
+            "sharded",
+            "shard routing must use the same proven state as async-pending stamping"
+        );
         let mut headers = HeaderKeyDict::new();
         app.stamp_root_db_state("AUTH_test", "c", &mut headers);
         assert_eq!(
@@ -8738,10 +8964,7 @@ mod info_cache_tests {
         );
         let mut headers = HeaderKeyDict::new();
         app.stamp_root_db_state("AUTH_test", "c", &mut headers);
-        assert_eq!(
-            headers.get("X-Container-Root-Db-State"),
-            Some("sharded")
-        );
+        assert_eq!(headers.get("X-Container-Root-Db-State"), Some("sharded"));
     }
 
     #[test]
@@ -8758,7 +8981,7 @@ mod info_cache_tests {
         std::thread::sleep(Duration::from_millis(30));
         assert!(cache.get_container("a/c").is_none());
         assert!(cache.containers.lock().unwrap().is_empty());
-        // clear_info_cache (container PUT/POST/DELETE) drops a live entry
+        // A full clear drops metadata and the independent route proof.
         cache.set_container("a/c".to_string(), info(5), 60.0);
         cache.set_container_db_state("a/c", "sharded", 60.0);
         cache.clear_container("a/c");
@@ -8774,6 +8997,21 @@ mod info_cache_tests {
         std::thread::sleep(Duration::from_millis(30));
         assert!(cache.get_container("a/x").is_none());
         assert_eq!(cache.get_container("a/c").unwrap().policy_index, 7);
+    }
+
+    #[test]
+    fn test_container_metadata_clear_preserves_proven_route_state() {
+        let cache = InfoCache::new();
+        cache.set_container("a/c".to_string(), info(5), 60.0);
+        cache.set_container_db_state("a/c", "sharded", 60.0);
+
+        cache.clear_container_metadata("a/c");
+
+        assert!(cache.get_container("a/c").is_none());
+        assert_eq!(
+            cache.get_container_db_state("a/c").as_deref(),
+            Some("sharded")
+        );
     }
 
     #[test]
@@ -10277,13 +10515,12 @@ mod shard_listing_fanout_tests {
         listing_has_full_active_cover, listing_ranges_are_settled_active,
         listing_ranges_prove_sharded, listing_resp_timestamp, lowest_shard_usage,
         merge_listings_newest_covering, merge_sharded_object_listings,
-        merge_sharded_object_listings_dir, pick_updating_shard_name,
-        prefer_listing_state_ranges, prefer_longest_nonempty_arrays,
-        prefer_most_progressed_listing_arrays, prefer_quorum_consistent_listing_arrays,
-        select_listing_shard_ranges, shard_usage_from_ranges, should_fanout_sharded_listing,
+        merge_sharded_object_listings_dir, pick_updating_shard_name, prefer_listing_state_ranges,
+        prefer_longest_nonempty_arrays, prefer_most_progressed_listing_arrays,
+        prefer_quorum_consistent_listing_arrays, select_listing_shard_ranges,
+        shard_usage_from_ranges, should_fanout_sharded_listing,
         should_fold_root_objects_without_ranges, should_probe_sharded_listing,
-        stamp_shard_container_path, updating_shard_query, ListingFeed,
-        SHARD_LISTING_STATE_NUMS,
+        stamp_shard_container_path, updating_shard_query, ListingFeed, SHARD_LISTING_STATE_NUMS,
     };
     use swift_http::HeaderKeyDict;
 
@@ -10787,13 +11024,14 @@ mod shard_listing_fanout_tests {
             serde_json::json!({"name": "s2", "lower": "obj-0099", "upper": "obj-0149", "state": 40, "timestamp": "1751500001.00000"}),
             serde_json::json!({"name": "s3", "lower": "obj-0149", "upper": "", "state": 40, "timestamp": "1751500001.00000"}),
         ];
-        let got = prefer_most_progressed_listing_arrays(&[
-            cleaved.clone(),
-            cleaved,
-            active.clone(),
-        ])
-        .unwrap();
-        assert_eq!(got.iter().filter(|sr| sr["state"] == 40).count(), 4, "{got:?}");
+        let got =
+            prefer_most_progressed_listing_arrays(&[cleaved.clone(), cleaved, active.clone()])
+                .unwrap();
+        assert_eq!(
+            got.iter().filter(|sr| sr["state"] == 40).count(),
+            4,
+            "{got:?}"
+        );
     }
 
     #[test]
@@ -10813,12 +11051,8 @@ mod shard_listing_fanout_tests {
             serde_json::json!({"name": "s2", "lower": "obj-0099", "upper": "obj-0149", "state": 40, "timestamp": "1751500099.00000"}),
             serde_json::json!({"name": "s3", "lower": "obj-0149", "upper": "", "state": 40, "timestamp": "1751500099.00000"}),
         ];
-        let got = prefer_quorum_consistent_listing_arrays(&[
-            cleaved.clone(),
-            cleaved,
-            active,
-        ])
-        .unwrap();
+        let got =
+            prefer_quorum_consistent_listing_arrays(&[cleaved.clone(), cleaved, active]).unwrap();
         assert_eq!(
             got.iter().filter(|sr| sr["state"] == 40).count(),
             0,
@@ -10880,12 +11114,8 @@ mod shard_listing_fanout_tests {
             }),
             acceptor,
         ];
-        let got = prefer_quorum_consistent_listing_arrays(&[
-            settled.clone(),
-            stale,
-            settled,
-        ])
-        .unwrap();
+        let got =
+            prefer_quorum_consistent_listing_arrays(&[settled.clone(), stale, settled]).unwrap();
         assert_eq!(got.len(), 1, "L2044 quorum must beat longer stale view");
         assert_eq!(got[0]["name"], ".shards/a/acceptor");
     }
@@ -10921,7 +11151,7 @@ mod shard_listing_fanout_tests {
     }
 
     #[test]
-    fn stamp_shard_path_encodes_newline_in_headers() {
+    fn stamp_shard_path_only_sends_quoted_location_for_newline() {
         let mut h = HeaderKeyDict::new();
         stamp_shard_container_path(
             &mut h,
@@ -10930,14 +11160,29 @@ mod shard_listing_fanout_tests {
             "AUTH_test",
             "c\n%Ff",
         );
-        let raw = h.get("X-Backend-Container-Path").unwrap_or("");
-        assert!(
-            !raw.contains('\n') && !raw.contains('\r'),
-            "HTTP header must not carry CR/LF: {raw:?}"
-        );
         let quoted = h.get("X-Backend-Quoted-Container-Path").unwrap_or("");
         assert!(quoted.contains("%0A"), "{quoted}");
-        assert_eq!(h.get("X-Backend-Location-Is-Quoted"), Some("true"));
+        assert_eq!(h.get("X-Backend-Container-Path"), None);
+        assert_eq!(h.get("X-Backend-Location-Is-Quoted"), None);
+    }
+
+    #[test]
+    fn stamp_versions_shard_path_percent_encodes_nul_without_raw_header() {
+        let mut h = HeaderKeyDict::new();
+        stamp_shard_container_path(
+            &mut h,
+            ".shards_AUTH_test",
+            "versions\0bucket-123",
+            "AUTH_test",
+            "versions",
+        );
+        assert_eq!(
+            h.get("X-Backend-Quoted-Container-Path"),
+            Some(".shards_AUTH_test/versions%00bucket-123")
+        );
+        assert_eq!(h.get("X-Backend-Allow-Reserved-Names"), Some("true"));
+        assert_eq!(h.get("X-Backend-Container-Path"), None);
+        assert_eq!(h.get("X-Backend-Location-Is-Quoted"), None);
     }
 
     #[test]
@@ -11276,30 +11521,34 @@ mod shard_listing_fanout_tests {
 
     #[test]
     fn settled_active_two_range_first_gen_and_nested() {
-        let a = sr_state(".shards/a", "", "m", 40);
-        let b = sr_state(".shards/b", "m", "", 40);
+        let a = sr_state(".shards_AUTH_test/a", "", "m", 40);
+        let b = sr_state(".shards_AUTH_test/b", "m", "", 40);
         // probe test_shrinking L1925: two ACTIVE first-gen shards.
         assert!(listing_ranges_are_settled_active(&[&a, &b]));
-        assert!(listing_ranges_prove_sharded(&[&b, &a]));
-        let r0 = sr_state(".shards/r0", "", "g", 40);
-        let r1 = sr_state(".shards/r1", "g", "m", 40);
-        let r2 = sr_state(".shards/r2", "m", "t", 40);
-        let r3 = sr_state(".shards/r3", "t", "", 40);
+        assert!(listing_ranges_prove_sharded(&[&b, &a], "AUTH_test/c"));
+        let r0 = sr_state(".shards_AUTH_test/r0", "", "g", 40);
+        let r1 = sr_state(".shards_AUTH_test/r1", "g", "m", 40);
+        let r2 = sr_state(".shards_AUTH_test/r2", "m", "t", 40);
+        let r3 = sr_state(".shards_AUTH_test/r3", "t", "", 40);
         assert!(listing_ranges_are_settled_active(&[&r0, &r1, &r2, &r3]));
-        assert!(listing_ranges_prove_sharded(&[&r0, &r1, &r2, &r3]));
-        let cleaved = sr_state(".shards/cl", "", "g", 30);
+        assert!(listing_ranges_prove_sharded(
+            &[&r0, &r1, &r2, &r3],
+            "AUTH_test/c"
+        ));
+        let cleaved = sr_state(".shards_AUTH_test/cl", "", "g", 30);
         assert!(!listing_ranges_are_settled_active(&[
             &cleaved, &r1, &r2, &r3
         ]));
-        assert!(!listing_ranges_prove_sharded(&[
-            &cleaved, &r1, &r2, &r3
-        ]));
+        assert!(!listing_ranges_prove_sharded(
+            &[&cleaved, &r1, &r2, &r3],
+            "AUTH_test/c"
+        ));
         // Probe L2068: last remaining shard shrinking into root.
-        let shrinking = sr_state(".shards/last", "", "", 50);
+        let shrinking = sr_state(".shards_AUTH_test/last", "", "", 50);
         assert!(listing_ranges_are_settled_active(&[&shrinking]));
-        assert!(!listing_ranges_prove_sharded(&[&shrinking]));
-        let shrinking_lo = sr_state(".shards/d0", "", "m", 50);
-        let acc = sr_state(".shards/a0", "", "", 40);
+        assert!(!listing_ranges_prove_sharded(&[&shrinking], "AUTH_test/c"));
+        let shrinking_lo = sr_state(".shards_AUTH_test/d0", "", "m", 50);
+        let acc = sr_state(".shards_AUTH_test/a0", "", "", 40);
         assert!(
             listing_has_full_active_cover(&[&shrinking_lo, &acc]),
             "expanded acceptor is MIN–MAX ACTIVE"
@@ -11309,17 +11558,26 @@ mod shard_listing_fanout_tests {
             "L1985 nested shrinking under expanded acceptor must majority-vote, not union handoffs"
         );
         // Overlapping donor + children, even if all ACTIVE: L1321 must union.
-        let donor = sr_state(".shards/donor", "", "obj-0049", 40);
-        let sub0 = sr_state(".shards/s0", "", "beta049", 40);
-        let sub1 = sr_state(".shards/s1", "beta049", "obj-0049", 40);
+        let donor = sr_state(".shards_AUTH_test/donor", "", "obj-0049", 40);
+        let sub0 = sr_state(".shards_AUTH_test/s0", "", "beta049", 40);
+        let sub1 = sr_state(".shards_AUTH_test/s1", "beta049", "obj-0049", 40);
         assert!(!listing_ranges_are_settled_active(&[
             &donor, &sub0, &sub1, &r3
         ]));
-        assert!(!listing_ranges_prove_sharded(&[
-            &donor, &sub0, &sub1, &r3
-        ]));
+        assert!(!listing_ranges_prove_sharded(
+            &[&donor, &sub0, &sub1, &r3],
+            "AUTH_test/c"
+        ));
         assert!(!listing_ranges_are_settled_active(&[]));
-        assert!(!listing_ranges_prove_sharded(&[]));
+        assert!(!listing_ranges_prove_sharded(&[], "AUTH_test/c"));
+
+        // A self range spans the complete namespace even for an ordinary
+        // root. It must never upgrade the cached DB state to `sharded`.
+        let ordinary_root = sr_state("AUTH_test/c", "", "", 40);
+        assert!(!listing_ranges_prove_sharded(
+            &[&ordinary_root],
+            "AUTH_test/c"
+        ));
     }
 
     #[test]
@@ -11476,6 +11734,31 @@ mod account_update_headers_tests {
         assert_eq!(per_node[0].get("X-Container-Device"), Some("sda,sdd"));
         assert_eq!(per_node[1].get("X-Container-Device"), Some("sdb"));
         assert_eq!(per_node[2].get("X-Container-Device"), Some("sdc"));
+    }
+
+    #[test]
+    fn expirer_container_matches_hash_sharded_python_bucket() {
+        assert_eq!(
+            expirer_container_for_object_hash(1_788_001_562, "0000000000000000000000000000001c"),
+            "1787961572"
+        );
+    }
+
+    #[test]
+    fn delete_at_updates_are_reverse_distributed_across_object_slots() {
+        let mut per_node = vec![HeaderKeyDict::new(); 3];
+        let primaries = vec![node("sda", 1000), node("sdb", 1001), node("sdc", 1002)];
+        ProxyApp::stamp_delete_at_update_headers(&mut per_node, "1787961572", 643, &primaries);
+        assert_eq!(per_node[2].get("X-Delete-At-Host"), Some("10.0.0.1:1000"));
+        assert_eq!(per_node[2].get("X-Delete-At-Device"), Some("sda"));
+        assert_eq!(per_node[1].get("X-Delete-At-Host"), Some("10.0.0.1:1001"));
+        assert_eq!(per_node[1].get("X-Delete-At-Device"), Some("sdb"));
+        assert_eq!(per_node[0].get("X-Delete-At-Host"), Some("10.0.0.1:1002"));
+        assert_eq!(per_node[0].get("X-Delete-At-Device"), Some("sdc"));
+        for headers in &per_node {
+            assert_eq!(headers.get("X-Delete-At-Container"), Some("1787961572"));
+            assert_eq!(headers.get("X-Delete-At-Partition"), Some("643"));
+        }
     }
 
     #[test]

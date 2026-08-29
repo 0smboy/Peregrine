@@ -175,6 +175,56 @@ fn query_param(query: &str, name: &str) -> Option<String> {
         .map(|(_, value)| value)
 }
 
+fn modern_versions_listing_query(req: &Request) -> Result<String, Response> {
+    let marker = req.param("marker");
+    let version_marker = req.param("version_marker");
+    if marker.is_none() && version_marker.is_some() {
+        return Err(modern_bad_request("version_marker param requires marker"));
+    }
+
+    let mut query = vec!["format=json".to_string()];
+    if let Some(prefix) = req.param("prefix") {
+        if prefix.contains('\0') {
+            return Err(modern_bad_request("invalid prefix param"));
+        }
+        query.push(format!("prefix={}", quote_path(&format!("\0{prefix}"))));
+    }
+
+    if let Some(marker) = marker {
+        if marker.contains('\0') {
+            return Err(modern_bad_request("invalid marker param"));
+        }
+        let marker = match version_marker.as_deref() {
+            None => format!("\0{marker}\0:"),
+            Some("null") => format!("\0{marker}\0"),
+            Some(raw) => {
+                let version = raw
+                    .parse::<Timestamp>()
+                    .map_err(|_| modern_bad_request("invalid version_marker param"))?;
+                modern_versions_object_name(&marker, version)
+                    .ok_or_else(|| modern_bad_request("invalid marker param"))?
+            }
+        };
+        query.push(format!("marker={}", quote_path(&marker)));
+    }
+
+    if let Some(delimiter) = req.param("delimiter") {
+        if delimiter
+            .chars()
+            .any(|ch| ch == '\0' || ch == '.' || ch.is_ascii_digit())
+        {
+            return Err(modern_bad_request("invalid delimiter param"));
+        }
+        query.push(format!("delimiter={}", quote_path(&delimiter)));
+    }
+    for name in ["limit", "reverse"] {
+        if let Some(value) = req.param(name) {
+            query.push(format!("{name}={}", quote_path(&value)));
+        }
+    }
+    Ok(query.join("&"))
+}
+
 fn decoded_header_path(value: &str) -> String {
     String::from_utf8_lossy(&percent_decode_bytes(value.as_bytes())).into_owned()
 }
@@ -1595,9 +1645,13 @@ impl VersionedWrites {
             }
         }
 
+        let hidden_query = match modern_versions_listing_query(&req) {
+            Ok(query) => query,
+            Err(resp) => return resp,
+        };
         let hidden_path = format!("/{version}/{account}/{hidden}");
         let mut hidden_get =
-            Self::modern_internal_request("GET", hidden_path, "format=json", &req.headers);
+            Self::modern_internal_request("GET", hidden_path, &hidden_query, &req.headers);
         hidden_get
             .headers
             .set("X-Backend-Allow-Reserved-Names", "true");
@@ -1607,6 +1661,7 @@ impl VersionedWrites {
             .get("X-Container-Bytes-Used")
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
+        let hidden_missing = hidden_resp.status == 404;
         let hidden_listing = if (200..300).contains(&hidden_resp.status) {
             let body = std::mem::replace(&mut hidden_resp.body, Body::empty());
             match body.collect_async().await {
@@ -1615,7 +1670,7 @@ impl VersionedWrites {
                 }
                 Err(_) => Vec::new(),
             }
-        } else if hidden_resp.status == 404 {
+        } else if hidden_missing {
             Vec::new()
         } else {
             return hidden_resp;
@@ -1685,20 +1740,23 @@ impl VersionedWrites {
             versions.push(item);
         }
 
-        // A current symlink may outlive a missing/corrupt hidden listing.
-        // Preserve its visible version as Python's broken-listing fallback.
-        for (_target, (object, version_id, mut item)) in current {
-            if let Some(map) = item.as_object_mut() {
-                map.insert("name".to_string(), serde_json::Value::String(object));
-                map.insert(
-                    "version_id".to_string(),
-                    serde_json::Value::String(version_id.internal()),
-                );
-                map.insert("is_latest".to_string(), serde_json::Value::Bool(true));
-                map.remove("version_symlink");
-                map.remove("symlink_path");
+        // Match Python's externally visible contract: a successful hidden
+        // listing is authoritative even when sharding makes it partial. Only
+        // restore current symlinks when the hidden container itself is absent.
+        if hidden_missing {
+            for (_target, (object, version_id, mut item)) in current {
+                if let Some(map) = item.as_object_mut() {
+                    map.insert("name".to_string(), serde_json::Value::String(object));
+                    map.insert(
+                        "version_id".to_string(),
+                        serde_json::Value::String(version_id.internal()),
+                    );
+                    map.insert("is_latest".to_string(), serde_json::Value::Bool(true));
+                    map.remove("version_symlink");
+                    map.remove("symlink_path");
+                }
+                versions.push(item);
             }
-            versions.push(item);
         }
 
         versions.extend(null_versions);
@@ -2736,6 +2794,234 @@ mod tests {
             .filter_map(|item| item["version_id"].as_str())
             .collect();
         assert_eq!(version_ids.len(), 2, "{listing:?}");
+    }
+
+    #[tokio::test]
+    async fn test_modern_versions_listing_does_not_restore_unlisted_current_symlink() {
+        let hidden = modern_versions_container("c");
+        let listed_version: Timestamp = "1787770000.00000".parse().unwrap();
+        let unlisted_version: Timestamp = "1787770001.00000".parse().unwrap();
+        let listed_name = modern_versions_object_name("listed", listed_version).unwrap();
+        let unlisted_name = modern_versions_object_name("unlisted", unlisted_version).unwrap();
+        let primary_body = serde_json::to_vec(&vec![
+            serde_json::json!({
+                "name": "listed",
+                "bytes": 5,
+                "hash": "listed-etag",
+                "content_type": "text/plain",
+                "last_modified": "2026-08-27T00:00:00.000000",
+                "symlink_path": format!(
+                    "/v1/AUTH_test/{}/{}",
+                    quote_path(&hidden),
+                    quote_path(&listed_name)
+                ),
+                "symlink_etag": "listed-etag",
+                "symlink_bytes": 5
+            }),
+            serde_json::json!({
+                "name": "unlisted",
+                "bytes": 8,
+                "hash": "unlisted-etag",
+                "content_type": "text/plain",
+                "last_modified": "2026-08-27T00:00:01.000000",
+                "symlink_path": format!(
+                    "/v1/AUTH_test/{}/{}",
+                    quote_path(&hidden),
+                    quote_path(&unlisted_name)
+                ),
+                "symlink_etag": "unlisted-etag",
+                "symlink_bytes": 8
+            }),
+        ])
+        .unwrap();
+        let hidden_body = serde_json::to_vec(&vec![serde_json::json!({
+            "name": listed_name,
+            "bytes": 5,
+            "hash": "listed-etag",
+            "content_type": "text/plain",
+            "last_modified": "2026-08-27T00:00:00.000000"
+        })])
+        .unwrap();
+
+        let call_count = Arc::new(AtomicU64::new(0));
+        let call_count2 = Arc::clone(&call_count);
+        let next: AsyncNextFn = Arc::new(move |_req: Request| {
+            let call_count = Arc::clone(&call_count2);
+            let primary_body = primary_body.clone();
+            let hidden_body = hidden_body.clone();
+            Box::pin(async move {
+                match call_count.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        let mut resp = Response::with_body(200, primary_body);
+                        resp.headers
+                            .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
+                        resp
+                    }
+                    1 => Response::with_body(200, hidden_body),
+                    n => panic!("unexpected listing subrequest {n}"),
+                }
+            })
+        });
+
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let mut request = req("GET", "/v1/AUTH_test/c");
+        request.query_string = "versions".to_string();
+        request.body = Body::empty();
+        let mut resp = vw.reassemble_async(request, next).await;
+        assert_eq!(resp.status, 200);
+        let body = resp.body.materialize(MAX_CONTROL_BODY).unwrap();
+        let listing: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listing.len(), 1, "{listing:?}");
+        assert_eq!(listing[0]["name"], "listed", "{listing:?}");
+    }
+
+    #[tokio::test]
+    async fn test_modern_versions_listing_restores_current_symlink_when_hidden_is_missing() {
+        let hidden = modern_versions_container("c");
+        let version: Timestamp = "1787770001.00000".parse().unwrap();
+        let version_name = modern_versions_object_name("o", version).unwrap();
+        let primary_body = serde_json::to_vec(&vec![serde_json::json!({
+            "name": "o",
+            "bytes": 8,
+            "hash": "etag",
+            "content_type": "text/plain",
+            "last_modified": "2026-08-27T00:00:01.000000",
+            "symlink_path": format!(
+                "/v1/AUTH_test/{}/{}",
+                quote_path(&hidden),
+                quote_path(&version_name)
+            ),
+            "symlink_etag": "etag",
+            "symlink_bytes": 8
+        })])
+        .unwrap();
+
+        let call_count = Arc::new(AtomicU64::new(0));
+        let call_count2 = Arc::clone(&call_count);
+        let next: AsyncNextFn = Arc::new(move |_req: Request| {
+            let call_count = Arc::clone(&call_count2);
+            let primary_body = primary_body.clone();
+            Box::pin(async move {
+                match call_count.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        let mut resp = Response::with_body(200, primary_body);
+                        resp.headers
+                            .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
+                        resp
+                    }
+                    1 => Response::new(404),
+                    n => panic!("unexpected listing subrequest {n}"),
+                }
+            })
+        });
+
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let mut request = req("GET", "/v1/AUTH_test/c");
+        request.query_string = "versions".to_string();
+        request.body = Body::empty();
+        let mut resp = vw.reassemble_async(request, next).await;
+        assert_eq!(resp.status, 200);
+        let body = resp.body.materialize(MAX_CONTROL_BODY).unwrap();
+        let listing: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listing.len(), 1, "{listing:?}");
+        assert_eq!(listing[0]["name"], "o", "{listing:?}");
+        assert_eq!(listing[0]["version_id"], version.internal(), "{listing:?}");
+        assert_eq!(listing[0]["is_latest"], true, "{listing:?}");
+    }
+
+    #[tokio::test]
+    async fn test_modern_versions_listing_translates_version_marker() {
+        let marker: Timestamp = "1787770000.00000".parse().unwrap();
+        let older: Timestamp = "1787769999.00000".parse().unwrap();
+        let expected_hidden_marker = modern_versions_object_name("o", marker).unwrap();
+        let older_name = modern_versions_object_name("o", older).unwrap();
+        let hidden_body = serde_json::to_vec(&vec![serde_json::json!({
+            "name": older_name,
+            "bytes": 5,
+            "hash": "older-etag",
+            "content_type": "text/plain",
+            "last_modified": "2026-08-26T23:59:59.000000"
+        })])
+        .unwrap();
+
+        let call_count = Arc::new(AtomicU64::new(0));
+        let call_count2 = Arc::clone(&call_count);
+        let next: AsyncNextFn = Arc::new(move |req: Request| {
+            let call_count = Arc::clone(&call_count2);
+            let hidden_body = hidden_body.clone();
+            let expected_hidden_marker = expected_hidden_marker.clone();
+            Box::pin(async move {
+                match call_count.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        let mut resp = Response::with_body(200, b"[]".to_vec());
+                        resp.headers
+                            .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
+                        resp
+                    }
+                    1 => {
+                        assert_eq!(req.method, "GET");
+                        assert_eq!(req.path, "/v1/AUTH_test/\0versions\0c");
+                        let params: HashMap<String, String> =
+                            parse_query(&req.query_string).into_iter().collect();
+                        assert_eq!(params.get("format").map(String::as_str), Some("json"));
+                        assert_eq!(
+                            params.get("marker").map(String::as_str),
+                            Some(expected_hidden_marker.as_str())
+                        );
+                        assert!(!params.contains_key("version_marker"));
+                        Response::with_body(200, hidden_body)
+                    }
+                    n => panic!("unexpected listing subrequest {n}"),
+                }
+            })
+        });
+
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let mut request = req("GET", "/v1/AUTH_test/c");
+        request.query_string = "marker=o&version_marker=1787770000.00000&versions=".to_string();
+        request.body = Body::empty();
+        let mut resp = vw.reassemble_async(request, next).await;
+        assert_eq!(resp.status, 200);
+        let body = resp.body.materialize(MAX_CONTROL_BODY).unwrap();
+        let listing: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listing.len(), 1, "{listing:?}");
+        assert_eq!(listing[0]["name"], "o");
+        assert_eq!(listing[0]["version_id"], older.internal());
+    }
+
+    #[test]
+    fn test_modern_versions_listing_query_matches_python_marker_semantics() {
+        let build = |query: &str| {
+            let mut request = req("GET", "/v1/AUTH_test/c");
+            request.query_string = query.to_string();
+            modern_versions_listing_query(&request)
+        };
+        let params = |query: String| -> HashMap<String, String> {
+            parse_query(&query).into_iter().collect()
+        };
+
+        let marker_only = params(build("marker=o&versions=").unwrap());
+        assert_eq!(
+            marker_only.get("marker").map(String::as_str),
+            Some("\0o\0:")
+        );
+
+        let null_marker = params(build("marker=o&version_marker=null&versions=").unwrap());
+        assert_eq!(null_marker.get("marker").map(String::as_str), Some("\0o\0"));
+
+        let forwarded =
+            params(build("prefix=obj&delimiter=-&limit=17&reverse=true&versions=").unwrap());
+        assert_eq!(forwarded.get("prefix").map(String::as_str), Some("\0obj"));
+        assert_eq!(forwarded.get("delimiter").map(String::as_str), Some("-"));
+        assert_eq!(forwarded.get("limit").map(String::as_str), Some("17"));
+        assert_eq!(forwarded.get("reverse").map(String::as_str), Some("true"));
+
+        let response = build("version_marker=1787770000.00000&versions=").unwrap_err();
+        assert_eq!(response.status, 400);
+        let response = build("marker=o&version_marker=invalid&versions=").unwrap_err();
+        assert_eq!(response.status, 400);
+        let response = build("delimiter=1&versions=").unwrap_err();
+        assert_eq!(response.status, 400);
     }
 
     #[tokio::test]

@@ -959,10 +959,26 @@ pub fn cleave_shard_range(
                 .and_then(|(_, v)| v.as_i64())
                 .unwrap_or(0)
         };
-        range.object_count = get("object_count");
-        range.bytes_used = get("bytes_used");
+        let object_count = get("object_count");
+        let bytes_used = get("bytes_used");
+        // Advance only one normal-timestamp tick past the FOUND estimate.
+        // ShardRange metadata is a Python `NormalTimestamp`, so an internal
+        // offset (`_<hex>`) is not wire-compatible. Using wall
+        // clock time here can make this stale first-cleave snapshot newer
+        // than an authoritative shard report processed earlier in the same
+        // device sweep (for example, 50 objects overwriting a later 51 after
+        // misplaced-object movement). One 10-microsecond tick is enough to
+        // make the copied byte count win over the original estimate, while
+        // every real later shard report still wins by normal timestamp.
+        let meta_timestamp = range
+            .meta_timestamp
+            .parse::<swift_core::timestamp::Timestamp>()
+            .ok()
+            .and_then(|timestamp| timestamp.apply_delta(1).ok())
+            .map(|timestamp| timestamp.normal())
+            .unwrap_or_else(|| swift_core::timestamp::Timestamp::now().normal());
+        range.update_meta(object_count, bytes_used, &meta_timestamp);
         range.state = shard_state::CLEAVED;
-        range.meta_timestamp = range.timestamp.clone();
         shard.merge_shard_ranges(vec![range.clone()])?;
     }
     source.merge_shard_ranges(vec![range.clone()])?;
@@ -4098,6 +4114,57 @@ mod tests {
         // every object accounted for across the shards
         let total: i64 = ranges.iter().map(|r| r.object_count).sum();
         assert_eq!(total, 10, "{ranges:?}");
+        let total_bytes: i64 = ranges.iter().map(|r| r.bytes_used).sum();
+        assert_eq!(total_bytes, 10, "in-memory cleave stats: {ranges:?}");
+        let persisted = source
+            .get_shard_ranges(&GetShardRangesArgs {
+                include_own: false,
+                ..GetShardRangesArgs::default()
+            })
+            .unwrap();
+        let persisted_bytes: i64 = persisted.iter().map(|r| r.bytes_used).sum();
+        assert_eq!(
+            persisted_bytes, 10,
+            "root DB must persist cleaved shard bytes: {persisted:?}"
+        );
+        assert!(
+            persisted.iter().all(|range| {
+                let meta = range
+                    .meta_timestamp
+                    .parse::<swift_core::timestamp::Timestamp>()
+                    .unwrap();
+                let created = range
+                    .timestamp
+                    .parse::<swift_core::timestamp::Timestamp>()
+                    .unwrap();
+                !range.meta_timestamp.contains('_')
+                    && meta.offset() == 0
+                    && meta.raw() == created.raw() + 1
+            }),
+            "first-cleave metadata must be a one-tick NormalTimestamp: {persisted:?}"
+        );
+        // A shard may report a newer live count before another root replica
+        // finishes its first cleave. Replaying the stale cleave snapshot must
+        // not overwrite that authoritative report.
+        let mut authoritative = persisted[0].clone();
+        authoritative.update_meta(4, 4, "1751500011.00000");
+        source
+            .merge_shard_ranges(vec![authoritative.clone()])
+            .unwrap();
+        source
+            .merge_shard_ranges(vec![ranges[0].clone()])
+            .unwrap();
+        let after_replay = source
+            .get_shard_ranges(&GetShardRangesArgs {
+                include_own: false,
+                ..GetShardRangesArgs::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|range| range.name == authoritative.name)
+            .unwrap();
+        assert_eq!(after_replay.object_count, 4, "{after_replay:?}");
+        assert_eq!(after_replay.bytes_used, 4, "{after_replay:?}");
         // the first shard (upper o0002) got exactly its 3 objects
         assert_eq!(ranges[0].object_count, 3);
 
@@ -4961,9 +5028,11 @@ mod tests {
     }
 
     #[test]
-    fn test_maybe_start_sharding_heals_collapsed_root_without_siblings() {
+    fn test_maybe_start_sharding_preserves_collapsed_root_without_siblings() {
         // Probe L2088 after the last donor is SHRUNK: no other ranges,
-        // epoch file, own.epoch wiped, object_count 1. Must become collapsed.
+        // epoch file, own.epoch wiped, object_count 1. get_db_state already
+        // recognizes the collapsed root; maybe_start_sharding must not restart
+        // it or create another epoch.
         let hash_config = HashPathConfig::new("", "changeme").unwrap();
         let dir = std::env::temp_dir().join(format!(
             "swift-s2r-heal-collapsed-{}",
@@ -5001,7 +5070,7 @@ mod tests {
         own.epoch = None;
         own.state = shard_state::ACTIVE;
         root.merge_shard_ranges(vec![own]).unwrap();
-        assert_eq!(root.get_db_state().unwrap(), DbState::Unsharded);
+        assert_eq!(root.get_db_state().unwrap(), DbState::Collapsed);
 
         let opts = SharderRunOpts {
             cleave_batch_size: 10,
@@ -5016,15 +5085,16 @@ mod tests {
         assert_eq!(
             root.get_db_state().unwrap(),
             DbState::Collapsed,
-            "L2088: empty-others heal must collapse"
+            "L2088: empty-others root must remain collapsed"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn test_maybe_start_sharding_heals_wiped_own_epoch() {
+    fn test_maybe_start_sharding_restores_wiped_own_epoch() {
         // Compactible/merge can persist own without epoch onto an epoch file.
-        // get_db_state() is then Unsharded even though object_count is 1.
+        // get_db_state() recognizes the sibling-backed root as Sharded; the
+        // repair still has to restore own.epoch from the DB filename.
         let hash_config = HashPathConfig::new("", "changeme").unwrap();
         let dir = std::env::temp_dir().join(format!(
             "swift-s2r-heal-epoch-{}",
@@ -5064,7 +5134,7 @@ mod tests {
         let mut sibling = ShardRange::new(".shards_AUTH_test/c-1", epoch, "m", "");
         sibling.state = shard_state::ACTIVE;
         root.merge_shard_ranges(vec![own, sibling]).unwrap();
-        assert_eq!(root.get_db_state().unwrap(), DbState::Unsharded);
+        assert_eq!(root.get_db_state().unwrap(), DbState::Sharded);
 
         let opts = SharderRunOpts {
             cleave_batch_size: 10,

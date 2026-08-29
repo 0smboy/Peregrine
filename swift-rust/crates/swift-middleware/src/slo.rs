@@ -2232,7 +2232,7 @@ impl Slo {
             .map(config_true_value)
             .unwrap_or(false)
         {
-            return next(req).await;
+            return self.handle_async_delete_async(req, next).await;
         }
         let parts = match split_path(&req.path, 4, 4, true) {
             Ok(p) => p,
@@ -2314,6 +2314,186 @@ impl Slo {
         let mut out = Response::with_body(200, summary.to_string().into_bytes());
         out.headers.set("Content-Type", "application/json");
         out
+    }
+
+    async fn handle_async_delete_async(&self, req: Request, next: AsyncNextFn) -> Response {
+        let parts = match split_path(&req.path, 4, 4, true) {
+            Ok(p) => p,
+            Err(_) => return Response::error(400, "Invalid path"),
+        };
+        let version = parts[0].clone().unwrap_or_default();
+        let account = parts[1].clone().unwrap_or_default();
+        let container = parts[2].clone().unwrap_or_default();
+        let object = parts[3].clone().unwrap_or_default();
+
+        let mut get = req.clone_head();
+        get.method = "GET".to_string();
+        get.query_string = "multipart-manifest=get".to_string();
+        get.headers.remove("Content-Length");
+        ignore_range(&mut get.headers, SLO_HEADER);
+        let mut mresp = next(get).await;
+        if mresp.status == 404 {
+            return Response::error(404, "SLO manifest not found");
+        }
+        if mresp.status == 401 {
+            return Response::error(401, "401 Unauthorized");
+        }
+        if !(200..300).contains(&mresp.status) {
+            return Response::error(500, "Unable to load SLO manifest or segment.");
+        }
+        let is_slo = mresp
+            .headers
+            .get(SLO_HEADER)
+            .map(config_true_value)
+            .unwrap_or(false);
+        if !is_slo {
+            return Response::error(400, "Not an SLO manifest");
+        }
+        let body = match std::mem::replace(&mut mresp.body, Body::empty())
+            .collect_async()
+            .await
+        {
+            Ok(b) => b,
+            Err(_) => return Response::error(500, "Unable to load SLO manifest"),
+        };
+        let Some(root_segs) = parse_stored_manifest(&body) else {
+            return Response::error(500, "Unable to load SLO manifest");
+        };
+
+        let segments: Vec<&StoredSeg> = root_segs
+            .iter()
+            .filter(|s| s.data_b64.is_none() && !s.name.is_empty())
+            .collect();
+
+        if segments.is_empty() {
+            return next(req).await;
+        }
+
+        if segments.iter().any(|s| s.sub_slo) {
+            return Response::error(400, "No segments may be large objects.");
+        }
+
+        let mut seg_containers: Vec<String> = Vec::new();
+        let mut seg_objects: Vec<String> = Vec::new();
+        for seg in &segments {
+            let path = if seg.name.starts_with('/') {
+                seg.name.clone()
+            } else {
+                format!("/{}", seg.name)
+            };
+            match split_path(&path, 2, 2, true) {
+                Ok(p) => {
+                    let c = p[0].clone().unwrap_or_default();
+                    let o = p[1].clone().unwrap_or_default();
+                    if c.is_empty() || o.is_empty() {
+                        return Response::error(400, "Invalid segment path in manifest");
+                    }
+                    seg_containers.push(c);
+                    seg_objects.push(o);
+                }
+                Err(_) => return Response::error(400, "Invalid segment path in manifest"),
+            }
+        }
+        let mut unique_containers: Vec<String> = seg_containers.clone();
+        unique_containers.sort();
+        unique_containers.dedup();
+        if unique_containers.len() > 1 {
+            let csv = unique_containers
+                .iter()
+                .map(|c| format!("\"{c}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Response::error(
+                400,
+                &format!("All segments must be in one container. Found segments in {csv}"),
+            );
+        }
+        let segment_container = unique_containers
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| container.clone());
+
+        if let Some(denied) = probe_async_delete_write_acl_async(
+            &next,
+            req.clone_head(),
+            &version,
+            &account,
+            &container,
+            &segment_container,
+        )
+        .await
+        {
+            return denied;
+        }
+
+        let ts = Timestamp::now();
+        let delete_at_secs = ts.as_secs_f64();
+        let t_delete_at = normalize_delete_at_timestamp(delete_at_secs, true);
+        let created_at = ts.internal();
+        let jobs: Vec<serde_json::Value> = seg_objects
+            .iter()
+            .map(|obj| {
+                serde_json::json!({
+                    "content_type": ASYNC_DELETE_TYPE,
+                    "created_at": created_at,
+                    "deleted": 0,
+                    "etag": MD5_OF_EMPTY_STRING,
+                    "name": format!(
+                        "{t_delete_at}-{account}/{segment_container}/{obj}"
+                    ),
+                    "size": 0,
+                    "storage_policy_index": 0,
+                })
+            })
+            .collect();
+        let expirer_cont = expirer_task_container(
+            delete_at_secs as i64,
+            &self.hash_config,
+            &account,
+            &container,
+            &object,
+        );
+        let jobs_body = serde_json::to_vec(&jobs).unwrap_or_default();
+        let mut enqueue = req.clone_head();
+        enqueue.method = "UPDATE".to_string();
+        enqueue.path = format!("/v1/{EXPIRER_ACCOUNT}/{expirer_cont}");
+        enqueue.headers.set("Content-Type", "application/json");
+        enqueue
+            .headers
+            .set("Content-Length", jobs_body.len().to_string());
+        enqueue.headers.set("X-Backend-Storage-Policy-Index", "0");
+        enqueue
+            .headers
+            .set("X-Backend-Allow-Private-Methods", "True");
+        enqueue
+            .headers
+            .set("X-Backend-Allow-Reserved-Names", "true");
+        enqueue
+            .headers
+            .set("X-Backend-Authorize-Override", "true");
+        enqueue.body = jobs_body.into();
+        let enq_path = enqueue.path.clone();
+        let enq_resp = next(enqueue).await;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/g6-slo-async.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "slo_async_delete segs={} unique_c={} enq_status={} enq_path={} manifest={}",
+                segments.len(),
+                segment_container,
+                enq_resp.status,
+                enq_path,
+                object
+            );
+        }
+        if !(200..300).contains(&enq_resp.status) {
+            return Response::error(503, "Failed to enqueue expiration entries");
+        }
+        next(req).await
     }
 
     fn handle_async_delete(&self, req: Request, next: &NextFn) -> Response {
@@ -2472,6 +2652,12 @@ impl Slo {
         enqueue
             .headers
             .set("X-Backend-Allow-Private-Methods", "True");
+        enqueue
+            .headers
+            .set("X-Backend-Allow-Reserved-Names", "true");
+        enqueue
+            .headers
+            .set("X-Backend-Authorize-Override", "true");
         enqueue.body = jobs_body.into();
         let enq_resp = next(enqueue);
         if !(200..300).contains(&enq_resp.status) {
@@ -3271,6 +3457,67 @@ fn probe_async_delete_write_acl(
     }
     if segment_container != manifest_container {
         if let Some(r) = probe_one(segment_container) {
+            return Some(r);
+        }
+    }
+    None
+}
+
+async fn probe_async_delete_write_acl_async(
+    next: &AsyncNextFn,
+    req: Request,
+    version: &str,
+    account: &str,
+    manifest_container: &str,
+    segment_container: &str,
+) -> Option<Response> {
+    async fn probe_one(
+        next: &AsyncNextFn,
+        mut probe: Request,
+        version: &str,
+        account: &str,
+        container: &str,
+    ) -> Option<Response> {
+        probe.method = "HEAD".to_string();
+        probe.path = format!("/{version}/{account}/{container}");
+        probe.query_string.clear();
+        probe.headers.remove("Content-Length");
+        probe.body = Body::empty();
+        let pr = next(probe).await;
+        if pr.status == 401 || pr.status == 403 {
+            Some(Response::error(
+                pr.status,
+                if pr.status == 401 {
+                    "401 Unauthorized"
+                } else {
+                    "403 Forbidden"
+                },
+            ))
+        } else {
+            None
+        }
+    }
+    if let Some(r) = probe_one(
+        next,
+        req.clone_head(),
+        version,
+        account,
+        manifest_container,
+    )
+    .await
+    {
+        return Some(r);
+    }
+    if segment_container != manifest_container {
+        if let Some(r) = probe_one(
+            next,
+            req,
+            version,
+            account,
+            segment_container,
+        )
+        .await
+        {
             return Some(r);
         }
     }
@@ -4232,6 +4479,68 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn test_multipart_delete_async_hyper_path_enqueues() {
+        use std::sync::{Arc as SArc, Mutex};
+        let calls: SArc<Mutex<Vec<(String, String)>>> = SArc::new(Mutex::new(Vec::new()));
+        let c2 = calls.clone();
+        let manifest_json = serde_json::to_vec(&serde_json::json!([
+            {"name": "/c/s1", "bytes": 3, "hash": "h1"},
+            {"name": "/c/s2", "bytes": 3, "hash": "h2"},
+        ]))
+        .unwrap();
+        let be: AsyncNextFn = Arc::new(move |req: Request| {
+            let c2 = c2.clone();
+            let manifest_json = manifest_json.clone();
+            Box::pin(async move {
+                c2.lock()
+                    .unwrap()
+                    .push((req.method.clone(), req.path.clone()));
+                if req.method == "GET" {
+                    let mut r = Response::with_body(200, manifest_json);
+                    r.headers.set("X-Static-Large-Object", "True");
+                    return r;
+                }
+                if req.method == "HEAD" {
+                    return Response::new(204);
+                }
+                if req.method == "UPDATE" && req.path.starts_with("/v1/.expiring_objects/") {
+                    return Response::new(204);
+                }
+                if req.method == "DELETE" {
+                    return Response::new(204);
+                }
+                Response::new(404)
+            })
+        });
+        let req = Request {
+            method: "DELETE".into(),
+            path: "/v1/a/c/manifest".into(),
+            query_string: "multipart-manifest=delete&async=true".into(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let resp = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Slo::new().handle_request_async(req, be));
+        assert_eq!(resp.status, 204, "{resp:?}");
+        let paths = calls.lock().unwrap().clone();
+        assert!(
+            paths
+                .iter()
+                .any(|(m, p)| m == "UPDATE" && p.starts_with("/v1/.expiring_objects/")),
+            "Hyper async-delete must UPDATE expirer queue: {paths:?}"
+        );
+        assert!(
+            !paths
+                .iter()
+                .any(|(m, p)| m == "DELETE" && p.ends_with("/c/s1")),
+            "segments must not be deleted synchronously: {paths:?}"
+        );
     }
 
     #[test]

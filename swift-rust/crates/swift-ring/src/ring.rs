@@ -393,6 +393,11 @@ impl Ring {
         &self.data
     }
 
+    /// Cluster hash-path config used by `get_part` / `get_nodes`.
+    pub fn hash_path_config(&self) -> &HashPathConfig {
+        &self.hash_config
+    }
+
     pub fn replica_count(&self) -> f64 {
         self.data.replica_count()
     }

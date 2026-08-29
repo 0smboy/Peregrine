@@ -18,12 +18,12 @@
 //! `X-If-Delete-At`). Reads account/container/object rings from SWIFT_DIR.
 
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use swift_core::config::SwiftConfig;
 use swift_core::hashing::HashPathConfig;
 use swift_core::obslog::{LogLevel, Logger};
 use swift_core::statsd::StatsdClient;
+use swift_core::timestamp::Timestamp;
 use swift_object_server::daemonutil;
 use swift_object_server::expirer::{recon_update, run_once, run_once_via_proxy};
 use swift_ring::{Ring, RingData};
@@ -87,15 +87,12 @@ fn main() {
     let reclaim_age: i64 = get("object-expirer", "reclaim_age", "604800")
         .parse()
         .unwrap_or(604800);
-    let internal_client_host = parse_internal_client_host(&get(
-        "object-expirer",
-        "internal_client_url",
-        "",
-    ))
-    .unwrap_or_else(|e| {
-        eprintln!("invalid object-expirer internal client endpoint: {e}");
-        std::process::exit(1);
-    });
+    let internal_client_host =
+        parse_internal_client_host(&get("object-expirer", "internal_client_url", ""))
+            .unwrap_or_else(|e| {
+                eprintln!("invalid object-expirer internal client endpoint: {e}");
+                std::process::exit(1);
+            });
     let log_name = get("object-expirer", "log_name", "object-expirer");
     let log_level = get("object-expirer", "log_level", "INFO")
         .parse::<LogLevel>()
@@ -138,10 +135,10 @@ fn main() {
     ));
     loop {
         let sweep_start = std::time::Instant::now();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        // Async SLO delete jobs use five-decimal timestamps. Keep the current
+        // time at Swift's native precision too; whole-second `now` defers a
+        // job created earlier in the same second until the next pass.
+        let now = Timestamp::now();
         let stats = if let Some(host) = internal_client_host.as_deref() {
             run_once_via_proxy(&account_ring, &container_ring, host, now, reclaim_age)
         } else {

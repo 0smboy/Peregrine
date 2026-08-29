@@ -1127,6 +1127,12 @@ impl ProxyApp {
         container: &str,
         object: &str,
     ) -> Option<(String, String)> {
+        let info = self.container_info_async(account, container).await;
+        let db_state = self.effective_root_db_state(account, container, info.root_db_state());
+        if !super::cached_state_allows_shard_update(&db_state) {
+            return None;
+        }
+
         let Ok((part, _)) = self
             .container_ring
             .get_nodes(account, Some(container), None)
@@ -1975,6 +1981,9 @@ impl ProxyApp {
         container: &str,
         object: &str,
     ) -> Response {
+        if let Err(resp) = super::apply_check_delete_headers(req, Timestamp::now().as_secs_f64()) {
+            return resp;
+        }
         let header_policy: Option<i64> = req
             .headers
             .get("X-Backend-Storage-Policy-Index")
@@ -2023,7 +2032,14 @@ impl ProxyApp {
             .get_part_nodes(object_part)
             .map(|n| n.len())
             .unwrap_or(1);
-        let per_node = self.object_container_update_headers(&base, container_part, node_number);
+        let per_node = self.object_container_update_headers(
+            &base,
+            container_part,
+            node_number,
+            account,
+            container,
+            object,
+        );
         self.post_object_async(
             object_ring,
             object_part,
@@ -2253,7 +2269,10 @@ impl ProxyApp {
             .unwrap_or("")
             .to_ascii_lowercase();
         let is_head = req.method == "HEAD";
-        if record_type != "shard" && !req.query_string.contains("states=") {
+        if record_type != "object"
+            && record_type != "shard"
+            && !req.query_string.contains("states=")
+        {
             if let Some(mut fan) = self
                 .maybe_sharded_container_listing_async(req.clone_head(), account, container)
                 .await
@@ -2413,7 +2432,7 @@ impl ProxyApp {
             .unwrap_or(1);
         let per_node: Vec<HeaderKeyDict> = (0..node_number).map(|_| base.clone()).collect();
         let cache_key = format!("{account}/{container}");
-        self.info_cache.clear_container(&cache_key);
+        self.info_cache.clear_container_metadata(&cache_key);
         let cont_nodes = self.iter_nodes(&self.container_ring, container_part);
         let path = format!("/{}/{}", percent_encode(account), percent_encode(container));
         let method = req.method.clone();
@@ -2426,6 +2445,60 @@ impl ProxyApp {
             &path,
             &query,
             per_node,
+        )
+        .await
+    }
+
+    /// Async counterpart of Python's private `ContainerController.UPDATE`.
+    /// The public/private method gate and authorization override are enforced
+    /// by `ProxyApp::handle_async`; this function only performs the bounded
+    /// container-ring fan-out of the supplied JSON merge body.
+    pub(crate) async fn container_update_async(
+        self: &Arc<Self>,
+        mut req: swift_http::Request,
+        account: &str,
+        container: &str,
+    ) -> Response {
+        let Some(policy_index) = req
+            .headers
+            .get("X-Backend-Storage-Policy-Index")
+            .and_then(|value| value.parse::<i64>().ok())
+        else {
+            return Response::error(400, "Missing or invalid X-Backend-Storage-Policy-Index");
+        };
+        let body = match req.body.materialize(swift_http::MAX_CONTROL_BODY) {
+            Ok(bytes) => bytes.to_vec(),
+            Err(error) if swift_http::body_too_large(&error) => {
+                return Response::error(413, "Your request is too large.")
+            }
+            Err(_) => return swob_response(499),
+        };
+        let Ok((part, _)) = self
+            .container_ring
+            .get_nodes(account, Some(container), None)
+        else {
+            return swob_response(503);
+        };
+        let mut headers = self.backend_headers(&req, true, "container");
+        headers.set("X-Backend-Storage-Policy-Index", policy_index);
+        if !headers.contains_key("X-Timestamp") {
+            headers.set("X-Timestamp", Timestamp::now().internal());
+        }
+        let node_count = self
+            .container_ring
+            .get_part_nodes(part)
+            .map(|nodes| nodes.len())
+            .unwrap_or(1);
+        let per_node = (0..node_count).map(|_| headers.clone()).collect();
+        self.make_requests_async(
+            self.iter_nodes(&self.container_ring, part),
+            node_count,
+            part,
+            "UPDATE",
+            &format!("/{}/{}", percent_encode(account), percent_encode(container)),
+            &req.query_string,
+            per_node,
+            body,
         )
         .await
     }
@@ -2721,13 +2794,7 @@ impl ProxyApp {
         }
         let broad = super::prefer_quorum_consistent_listing_arrays(
             &self
-                .fetch_json_arrays_nonempty_async(
-                    &nodes,
-                    part,
-                    path,
-                    "format=json",
-                    shard_headers,
-                )
+                .fetch_json_arrays_nonempty_async(&nodes, part, path, "format=json", shard_headers)
                 .await,
         )?;
         Some(super::prefer_listing_state_ranges(&broad))
@@ -2778,6 +2845,18 @@ impl ProxyApp {
             .await?;
         if !(200..300).contains(&head.status) {
             return None;
+        }
+        // The root container's current policy selects which object rows a
+        // shard container returns. Preserve an explicit trusted backend
+        // override, otherwise forward the policy learned from root HEAD.
+        if !listing_headers.contains_key("X-Backend-Storage-Policy-Index") {
+            if let Some(policy_index) = head
+                .headers
+                .get("X-Backend-Storage-Policy-Index")
+                .map(str::to_string)
+            {
+                listing_headers.set("X-Backend-Storage-Policy-Index", policy_index);
+            }
         }
         // Python HEAD uses root `get_shard_usage` (ACTIVE/SHARDING/SHRINKING
         // range stats). Max of replica HEAD counts is wrong on the way down:
@@ -2942,7 +3021,8 @@ impl ProxyApp {
         let selected =
             super::select_listing_shard_ranges(&arr, &marker, &end_marker, &prefix, reverse);
         let all_ranges: Vec<&serde_json::Value> = arr.iter().collect();
-        if state == "sharded" || super::listing_ranges_prove_sharded(&all_ranges) {
+        let root_path = format!("{account}/{container}");
+        if state == "sharded" || super::listing_ranges_prove_sharded(&all_ranges, &root_path) {
             self.remember_proven_container_db_state(account, container, "sharded");
         }
         let empty_wins = super::listing_ranges_are_settled_active(&all_ranges);
@@ -3182,7 +3262,14 @@ impl ProxyApp {
             .get_part_nodes(object_part)
             .map(|n| n.len())
             .unwrap_or(1);
-        let per_node = self.object_container_update_headers(&base, container_part, node_number);
+        let per_node = self.object_container_update_headers(
+            &base,
+            container_part,
+            node_number,
+            account,
+            container,
+            object,
+        );
         let object_nodes = self.iter_nodes(object_ring, object_part);
         let path = format!(
             "/{}/{}/{}",
@@ -4628,7 +4715,7 @@ mod tests {
                 let first = line.lines().next().unwrap_or("");
                 if first.starts_with("HEAD ") {
                     let _ = stream
-                        .write_all(b"HTTP/1.1 200 OK\r\nX-Backend-Sharding-State: sharded\r\nX-Container-Object-Count: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .write_all(b"HTTP/1.1 200 OK\r\nX-Backend-Sharding-State: sharded\r\nX-Backend-Storage-Policy-Index: 1\r\nX-Container-Object-Count: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                         .await;
                 } else if first.contains("states=listing") {
                     let body = br#"[{"name":"AUTH_test/shardc","lower":"","upper":"","state":30}]"#;
@@ -4639,7 +4726,12 @@ mod tests {
                     let _ = stream.write_all(hdr.as_bytes()).await;
                     let _ = stream.write_all(body).await;
                 } else {
-                    let body: &[u8] = if first.contains("reverse=on") {
+                    let policy_one = line.lines().any(|value| {
+                        value.eq_ignore_ascii_case("X-Backend-Storage-Policy-Index: 1")
+                    });
+                    let body: &[u8] = if !policy_one {
+                        br#"[]"#
+                    } else if first.contains("reverse=on") {
                         br#"[{"name":"obj-b"},{"name":"obj-a"}]"#
                     } else {
                         br#"[{"name":"obj-a"},{"name":"obj-b"}]"#
@@ -4707,6 +4799,67 @@ mod tests {
             Some("0"),
             "HEAD keeps root count, not listing length"
         );
+        h.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sharded_listing_async_preserves_explicit_backend_policy() {
+        let (port, h) = spawn_sharded_listing_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let app = StdArc::new(ProxyApp::new(
+            ring_on_port(port),
+            ring_on_port(port),
+            ProxyConfig {
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                ..ProxyConfig::default()
+            },
+        ));
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Storage-Policy-Index", "0");
+        let req = swift_http::Request {
+            method: "GET".into(),
+            path: "/v1/AUTH_test/c".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        };
+        let resp = app
+            .maybe_sharded_container_listing_async(req, "AUTH_test", "c")
+            .await
+            .expect("sharded fan-out");
+        let body = resp.body.collect_async().await.expect("listing body");
+        let listing: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(listing, serde_json::json!([]));
+        h.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn container_get_async_explicit_object_bypasses_shard_fanout() {
+        let (port, h) = spawn_sharded_listing_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let app = StdArc::new(ProxyApp::new(
+            ring_on_port(port),
+            ring_on_port(port),
+            ProxyConfig {
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                ..ProxyConfig::default()
+            },
+        ));
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Record-Type", "object");
+        let req = swift_http::Request {
+            method: "GET".into(),
+            path: "/v1/AUTH_test/c".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        };
+        let resp = app.container_get_head_async(req, "AUTH_test", "c").await;
+        let body = resp.body.collect_async().await.expect("listing body");
+        let listing: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(listing, serde_json::json!([]));
         h.abort();
     }
 

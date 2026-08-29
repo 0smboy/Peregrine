@@ -283,7 +283,13 @@ pub fn run_once(
     let mut stats = ContainerUpdaterStats::default();
     for db in db_locations(device, "containers") {
         let mut broker = ContainerBroker::new(&db, "", "");
-        let _ = process_container(&mut broker, account_ring, client, &mut stats);
+        if let Err(error) = process_container(&mut broker, account_ring, client, &mut stats) {
+            stats.failures += 1;
+            eprintln!(
+                "container-updater failed db={} error={error}",
+                db.display()
+            );
+        }
     }
     stats
 }
@@ -321,7 +327,7 @@ mod tests {
     }
 
     struct FakeAccount {
-        calls: Mutex<Vec<(u64, String)>>,
+        calls: Mutex<Vec<(u64, String, i64, i64)>>,
         status: u16,
     }
     impl AccountNodeClient for FakeAccount {
@@ -331,12 +337,14 @@ mod tests {
             _part: u32,
             account: &str,
             container: &str,
-            _s: &ContainerStat,
+            stat: &ContainerStat,
         ) -> ReportStatus {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((node.id, format!("/{account}/{container}")));
+            self.calls.lock().unwrap().push((
+                node.id,
+                format!("/{account}/{container}"),
+                stat.object_count,
+                stat.bytes_used,
+            ));
             self.status
         }
     }
@@ -463,6 +471,102 @@ mod tests {
         assert_eq!(out, ContainerOutcome::Reported);
         assert_eq!(client.calls.lock().unwrap().len(), 3);
         assert_eq!(stats.successes, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_sharded_root_reports_aggregate_shard_usage() {
+        // Probe test_sharded_account_updates: after cleave, the root is a
+        // SHARDED epoch DB. policy_stat is zero, but its two ACTIVE child
+        // ranges are authoritative account usage and must report 100 objects.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-cupd-sharded-root-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("sda1");
+        let hash = "0000000000000000000000000000abcf";
+        let hash_dir = device.join(format!("containers/0/bcf/{hash}"));
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        let unsuffixed = hash_dir.join(format!("{hash}.db"));
+        let epoch = "1751500010.00000";
+        let epoch_path = swift_db::make_db_file_path(&unsuffixed, Some(epoch)).unwrap();
+        let mut broker = ContainerBroker::new(&epoch_path, "AUTH_test", "c");
+        broker
+            .initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+
+        let mut own = broker.get_own_shard_range(false).unwrap().unwrap();
+        own.epoch = Some(epoch.to_string());
+        own.state = swift_db::shard_state::SHARDED;
+        let mut first =
+            swift_db::ShardRange::new(".shards_AUTH_test/c-0", epoch, "", "m");
+        first.state = swift_db::shard_state::ACTIVE;
+        first.object_count = 50;
+        first.bytes_used = 150;
+        let mut second =
+            swift_db::ShardRange::new(".shards_AUTH_test/c-1", epoch, "m", "");
+        second.state = swift_db::shard_state::ACTIVE;
+        second.object_count = 50;
+        second.bytes_used = 150;
+        broker
+            .merge_shard_ranges(vec![own, first, second])
+            .unwrap();
+        assert_eq!(
+            broker.get_db_state().unwrap(),
+            swift_db::DbState::Sharded
+        );
+
+        let client = FakeAccount {
+            calls: Mutex::new(Vec::new()),
+            status: 204,
+        };
+        let mut stats = ContainerUpdaterStats::default();
+        let outcome = process_container(&mut broker, &ring3(), &client, &mut stats).unwrap();
+
+        assert_eq!(outcome, ContainerOutcome::Reported);
+        assert_eq!(stats.successes, 1);
+        let calls = client.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert!(
+            calls
+                .iter()
+                .all(|(_, _, object_count, bytes_used)| (*object_count, *bytes_used) == (100, 300)),
+            "account reports must use aggregate shard usage: {calls:?}"
+        );
+        drop(calls);
+        let info = broker.get_info().unwrap();
+        let reported = info
+            .iter()
+            .find(|(name, _)| name == "reported_object_count")
+            .and_then(|(_, value)| value.as_i64());
+        assert_eq!(reported, Some(100));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_run_once_counts_unreadable_database_as_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-cupd-invalid-db-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("sda1");
+        let hash = "0000000000000000000000000000bad0";
+        let hash_dir = device.join(format!("containers/0/ad0/{hash}"));
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        std::fs::write(hash_dir.join(format!("{hash}.db")), b"not sqlite").unwrap();
+        let client = FakeAccount {
+            calls: Mutex::new(Vec::new()),
+            status: 204,
+        };
+
+        let stats = run_once(&device, &ring3(), &client);
+
+        assert_eq!(stats.failures, 1);
+        assert_eq!(stats.successes, 0);
+        assert_eq!(stats.no_changes, 0);
+        assert!(client.calls.lock().unwrap().is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
