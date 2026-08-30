@@ -3327,11 +3327,14 @@ fn broker_live_counts(broker: &mut ContainerBroker) -> Option<(i64, i64, i64)> {
 
 /// Refresh a root's child range stats from existing SAIO shard DBs.
 ///
-/// Walk every SAIO `/srv/N/node` device, ignore empty handoff DBs (oc=0),
-/// and merge the lowest *positive* live row count onto the root row. This is
-/// deliberately read-only with respect to child DBs: tombstone reclamation is
-/// owned by the shard's own sharder configuration. Reclaiming here would make
-/// an unreclaimed shard appear compactible and shrink it prematurely.
+/// Walk every SAIO `/srv/N/node` device and ignore empty handoff DBs (oc=0).
+/// Select the lowest positive object count, but conservatively retain the
+/// highest tombstone count (and bytes used) reported by replicas at that same
+/// object count. A replica that happens to be reclaimed first must not make an
+/// unreclaimed peer appear compactible and shrink it prematurely.
+///
+/// This is deliberately read-only with respect to child DBs: tombstone
+/// reclamation is owned by the shard's own sharder configuration.
 fn refresh_root_child_stats_from_saio_devices(
     broker: &mut ContainerBroker,
     local_device: &Path,
@@ -3370,7 +3373,7 @@ fn refresh_root_child_stats_from_saio_devices(
         if stored_rows <= 0 {
             continue;
         }
-        let mut best: Option<(i64, i64, i64, i64)> = None;
+        let mut best: Option<(i64, i64, i64)> = None;
         for b in &mut brokers {
             let Some((oc, bu, tombs)) = broker_live_counts(b) else {
                 continue;
@@ -3379,15 +3382,21 @@ fn refresh_root_child_stats_from_saio_devices(
             if oc <= 0 {
                 continue;
             }
-            let rows = oc + tombs;
-            best = match best {
-                Some((cur_rows, _, _, _)) if rows >= cur_rows => best,
-                _ => Some((rows, oc, bu, tombs)),
-            };
+            match best {
+                None => best = Some((oc, bu, tombs)),
+                Some((cur_oc, _, _)) if oc < cur_oc => {
+                    best = Some((oc, bu, tombs));
+                }
+                Some((cur_oc, cur_bu, cur_tombs)) if oc == cur_oc => {
+                    best = Some((cur_oc, cur_bu.max(bu), cur_tombs.max(tombs)));
+                }
+                _ => {}
+            }
         }
-        let Some((rows, oc, bu, tombs)) = best else {
+        let Some((oc, bu, tombs)) = best else {
             continue;
         };
+        let rows = oc + tombs;
         // Never raise a root range from this lowest-positive heuristic. Allow
         // an equal object_count with fewer tombstones so an explicit reclaim
         // performed by the shard sharder can make row_count compactible.
@@ -10783,9 +10792,11 @@ mod tests {
     #[test]
     fn test_refresh_saio_peer_requires_explicit_reclaim_before_shrink_to_root() {
         // The root on /srv/1 still lists oc=51. A shard replica on /srv/3 has
-        // one live row plus 50 tombstones, and an empty handoff exists on
-        // /srv/2. Refresh must publish the tombstones without reclaiming them;
-        // only an explicit shard reclaim may unblock shrink-to-root.
+        // one live row plus 50 tombstones, an empty handoff exists on /srv/2,
+        // and an early-reclaimed replica on /srv/4 has the same one live row
+        // but no tombstones. Refresh must preserve the conservative tombstone
+        // count across equally-current replicas; only an explicit reclaim of
+        // every live replica may unblock shrink-to-root.
         let hash_config = HashPathConfig::new("", "changeme").unwrap();
         let dir = std::env::temp_dir().join(format!(
             "swift-s2r-saio-oc1-{}",
@@ -10795,7 +10806,8 @@ mod tests {
         let leader = dir.join("srv/1/node/sdb1");
         let empty_handoff = dir.join("srv/2/node/sdb2");
         let reclaimed = dir.join("srv/3/node/sdb3");
-        for d in [&leader, &empty_handoff, &reclaimed] {
+        let early_reclaimed = dir.join("srv/4/node/sdb4");
+        for d in [&leader, &empty_handoff, &reclaimed, &early_reclaimed] {
             std::fs::create_dir_all(d).unwrap();
         }
         let account = "AUTH_test";
@@ -10853,6 +10865,21 @@ mod tests {
             None,
         )
         .unwrap();
+        let mut early =
+            local_shard_broker(&early_reclaimed, &hash_config, "9", &child.name);
+        early
+            .put_object(
+                "alpha",
+                "1751500001.00000",
+                10,
+                "text/plain",
+                "e",
+                0,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
 
         let before = find_compactible_shard_sequences(&mut root, 10, 75, 1, -1, true)
             .unwrap();
