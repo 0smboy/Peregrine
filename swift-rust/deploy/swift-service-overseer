@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env -S --default-signal=HUP,INT,QUIT /bin/bash
 # Swift-manager-compatible overseer for Rust Swift service workers.
 #
 # Lifecycle contract:
