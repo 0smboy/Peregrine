@@ -226,6 +226,12 @@ pub fn process_container(
     client: &dyn AccountNodeClient,
     stats: &mut ContainerUpdaterStats,
 ) -> Result<ContainerOutcome, DbError> {
+    // Updater sweeps discover DBs by filename and intentionally construct the
+    // broker without URL identity.  Hydrate before get_info(): sharded-state
+    // detection looks up the broker's own shard range by account/container,
+    // so an anonymous epoch DB otherwise appears unsharded and reports zero
+    // objects to the account (probe test_sharded_account_updates).
+    broker.hydrate_account_container()?;
     let info = broker.get_info()?;
     let mut stat = match ContainerStat::from_info(&info) {
         Some(s) => s,
@@ -568,15 +574,19 @@ mod tests {
             swift_db::DbState::Sharded
         );
 
+        // Exercise the production sweep path: run_once discovers the epoch DB
+        // and opens it as ContainerBroker::new(&db, "", "").  A direct call
+        // with AUTH_test/c would hide the identity-hydration regression.
+        drop(broker);
         let client = FakeAccount {
             calls: Mutex::new(Vec::new()),
             status: 204,
         };
-        let mut stats = ContainerUpdaterStats::default();
-        let outcome = process_container(&mut broker, &ring3(), &client, &mut stats).unwrap();
+        let stats = run_once(&device, &ring3(), &client);
 
-        assert_eq!(outcome, ContainerOutcome::Reported);
         assert_eq!(stats.successes, 1);
+        assert_eq!(stats.failures, 0);
+        assert_eq!(stats.no_changes, 0);
         let calls = client.calls.lock().unwrap();
         assert_eq!(calls.len(), 3);
         assert!(
@@ -586,6 +596,7 @@ mod tests {
             "account reports must use aggregate shard usage: {calls:?}"
         );
         drop(calls);
+        let mut broker = ContainerBroker::new(&epoch_path, "AUTH_test", "c");
         let info = broker.get_info().unwrap();
         let reported = info
             .iter()
