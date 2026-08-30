@@ -130,6 +130,32 @@ fn info_i64(broker: &mut ContainerBroker, key: &str) -> i64 {
         .unwrap_or(0)
 }
 
+/// Python `broker.root_account` / `root_container`. A shard container stores
+/// the user-facing root in sysmeta; falling back to its own identity creates
+/// malformed nested names that cannot be recognized as children later.
+fn root_account_container(broker: &mut ContainerBroker) -> Option<(String, String)> {
+    if broker.is_root_container().ok()? {
+        return None;
+    }
+    let metadata = broker.metadata().ok()?;
+    let get = |name: &str| {
+        metadata
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, (value, _))| value.clone())
+            .filter(|value| !value.is_empty())
+    };
+    let root = get("X-Container-Sysmeta-Shard-Quoted-Root")
+        .map(|value| swift_http::unquote(&value))
+        .or_else(|| get("X-Container-Sysmeta-Shard-Root"))?;
+    let root = root.trim_start_matches('/');
+    let (account, container) = root.split_once('/')?;
+    if account.is_empty() || container.is_empty() {
+        return None;
+    }
+    Some((account.to_string(), container.to_string()))
+}
+
 fn info_text(broker: &mut ContainerBroker, key: &str) -> String {
     broker
         .get_info()
@@ -458,12 +484,14 @@ fn cmd_find_and_replace(
     }
 
     let epoch = Timestamp::now().internal();
-    let shards_account = shards_account_name(&account);
+    let (root_account, root_container) = root_account_container(&mut broker)
+        .unwrap_or_else(|| (account.clone(), container.clone()));
+    let shards_account = shards_account_name(&root_account);
     let mut ranges = Vec::with_capacity(found.len());
     for f in &found {
         let name = make_shard_name(
             &shards_account,
-            &container,
+            &root_container,
             &container,
             &epoch,
             f.index as u64,
@@ -1565,6 +1593,55 @@ mod tests {
             .unwrap();
         assert!(!ranges.is_empty());
         assert!(sharding_enabled(&mut check));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn find_and_replace_preserves_true_root_in_nested_shard_names() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-manage-shards-nested-{}-{}",
+            std::process::id(),
+            Timestamp::now().raw()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let parent = "root-with-dash-parent-shard";
+        let mut broker = ContainerBroker::new(&dir.join("nested.db"), ".shards_AUTH_test", parent);
+        broker
+            .initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        broker
+            .update_metadata(&vec![(
+                "X-Container-Sysmeta-Shard-Quoted-Root".into(),
+                ("AUTH_test/root-with-dash".into(), "1751500001.00000".into()),
+            )])
+            .unwrap();
+        for i in 0..10 {
+            broker
+                .put_object(
+                    &format!("o{i:04}"),
+                    &format!("17515000{:02}.00000", i + 2),
+                    1,
+                    "text/plain",
+                    "etag",
+                    0,
+                    0,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(cmd_find_and_replace(&mut broker, 3, 1, false, true), EXIT_OK);
+        let ranges = broker
+            .get_shard_ranges(&GetShardRangesArgs::default())
+            .unwrap();
+        assert!(!ranges.is_empty());
+        for range in ranges {
+            let (root, parent_hash) = parse_shard_name(&range.name).unwrap();
+            assert_eq!(root, "root-with-dash");
+            assert_eq!(parent_hash, hash_container_name(parent));
+            assert!(range.name.starts_with(".shards_AUTH_test/"));
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
