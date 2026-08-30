@@ -2965,6 +2965,116 @@ mod tests {
         server.join().unwrap().unwrap();
     }
 
+    struct DelayedBodyEcho {
+        started: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    }
+
+    impl AsyncService for DelayedBodyEcho {
+        fn call(
+            &self,
+            mut request: AsyncRequest,
+        ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+            let started = self.started.lock().unwrap().take();
+            Box::pin(async move {
+                if let Some(started) = started {
+                    let _ = started.send(());
+                }
+                match request.body.materialize(1024).await {
+                    Ok(body) => Response::with_body(200, body),
+                    Err(error) => Response::error(500, &error.to_string()),
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn graceful_shutdown_drains_delayed_body_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let config = ServerConfig {
+            worker_threads: 2,
+            shutdown: Some(Arc::clone(&shutdown)),
+            shutdown_deadline_secs: 2,
+            ..ServerConfig::default()
+        };
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let service: Arc<dyn AsyncService> = Arc::new(DelayedBodyEcho {
+            started: std::sync::Mutex::new(Some(started_tx)),
+        });
+        let server = std::thread::spawn(move || {
+            serve_forever_multi_service(vec![listener], service, config)
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .write_all(b"PUT / HTTP/1.1\r\nContent-Length: 4\r\n\r\n")
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server accepted the request head");
+
+        shutdown.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(50));
+        client.write_all(b"test").unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+
+        assert_eq!(status(&response), 200);
+        assert_eq!(response_body(&response), b"test");
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn graceful_shutdown_keeps_first_request_on_accepted_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let metrics = ConcurrencyMetrics::new();
+        let config = ServerConfig {
+            worker_threads: 2,
+            shutdown: Some(Arc::clone(&shutdown)),
+            shutdown_deadline_secs: 2,
+            metrics: Some(metrics.clone()),
+            ..ServerConfig::default()
+        };
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let service: Arc<dyn AsyncService> = Arc::new(DelayedBodyEcho {
+            started: std::sync::Mutex::new(Some(started_tx)),
+        });
+        let server = std::thread::spawn(move || {
+            serve_forever_multi_service(vec![listener], service, config)
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let accepted_deadline = Instant::now() + Duration::from_secs(2);
+        while metrics.snapshot().runtime_tasks == 0 {
+            assert!(Instant::now() < accepted_deadline, "connection was not accepted");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        shutdown.store(true, Ordering::SeqCst);
+        client
+            .write_all(b"PUT / HTTP/1.1\r\nContent-Length: 4\r\n\r\n")
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first request on accepted socket survived shutdown");
+        client.write_all(b"test").unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+
+        assert_eq!(status(&response), 200);
+        assert_eq!(response_body(&response), b"test");
+        server.join().unwrap().unwrap();
+    }
+
     #[test]
     fn install_sigterm_flag_flips_on_signal() {
         let flag = install_sigterm_flag();

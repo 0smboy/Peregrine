@@ -162,6 +162,7 @@ pub async fn serve_http1_connection(
         .metrics
         .clone()
         .unwrap_or_else(ConcurrencyMetrics::new);
+    let requests = Arc::new(AtomicUsize::new(0));
     let in_flight = Arc::new(AtomicUsize::new(0));
     let conn_shields = Arc::new(AtomicUsize::new(0));
     let svc = HyperToSwift {
@@ -169,7 +170,7 @@ pub async fn serve_http1_connection(
         config: config.clone(),
         admission,
         peer_ip,
-        requests: Arc::new(AtomicUsize::new(0)),
+        requests: Arc::clone(&requests),
         in_flight: Arc::clone(&in_flight),
         shutdown: Arc::clone(&shutdown),
         metrics: metrics.clone(),
@@ -197,8 +198,8 @@ pub async fn serve_http1_connection(
     let conn = builder.serve_connection(io, svc).with_upgrades();
     tokio::pin!(conn);
     let mut shutting = false;
+    let mut graceful_requested = false;
     let mut drain = None::<ShutdownDeadline>;
-    let mut saw_conn_shield = false;
     ConcurrencyMetrics::with_conn_shields(Arc::clone(&conn_shields), async {
         loop {
             tokio::select! {
@@ -207,6 +208,15 @@ pub async fn serve_http1_connection(
                 }
                 _ = crate::server::wait_shutdown(&config, &shutdown), if !shutting => {
                     shutting = true;
+                    // Hyper owns the HTTP/1.1 request boundary. Ask it to
+                    // stop keep-alive only after the request whose head was
+                    // already accepted has completed. Looking merely at the
+                    // service in-flight counter races with Hyper parsing the
+                    // accepted head and drops a delayed-body PUT on reload.
+                    if requests.load(Ordering::SeqCst) > 0 {
+                        conn.as_mut().graceful_shutdown();
+                        graceful_requested = true;
+                    }
                     let secs = if config.shutdown_deadline_secs > 0 {
                         config.shutdown_deadline_secs
                     } else {
@@ -215,33 +225,25 @@ pub async fn serve_http1_connection(
                     drain = Some(ShutdownDeadline::from_timeout(Duration::from_secs(secs)));
                 }
                 _ = tokio::time::sleep(Duration::from_millis(5)), if shutting => {
+                    if !graceful_requested && requests.load(Ordering::SeqCst) > 0 {
+                        conn.as_mut().graceful_shutdown();
+                        graceful_requested = true;
+                    }
                     let inflight = in_flight.load(Ordering::SeqCst);
                     let conn_commits = conn_shields.load(Ordering::SeqCst);
                     let global_commits = metrics.snapshot().commit_shield_active;
-                    if conn_commits > 0 {
-                        saw_conn_shield = true;
-                    }
                     metrics.set_shutdown_waiting_requests(inflight);
                     metrics.set_shutdown_waiting_commits(global_commits as usize);
-                    if inflight == 0 && conn_commits == 0 {
+                    if drain.as_ref().is_some_and(|d| d.is_expired()) {
+                        metrics.record_timeout(DeadlineKind::Shutdown);
+                        if inflight > 0 || conn_commits > 0 {
+                            metrics.record_cancellation(CancelReason::Shutdown);
+                        }
+                        // HTTP is now forced off. Global durability shields
+                        // are still joined by the accept loop after every
+                        // connection task has returned.
                         return Ok(());
                     }
-                    // After DurabilityBarrier::complete the global/conn
-                    // counters drop, but the HTTP task still has to write
-                    // 201. Dropping the connection in that window is the
-                    // cancellable-request path, and it loses the response.
-                    // Drain this connection until inflight==0 or the
-                    // ShutdownDeadline forces HTTP off (L7: shields are
-                    // never aborted).
-                    if conn_commits > 0 || saw_conn_shield {
-                        if drain.as_ref().is_some_and(|d| d.is_expired()) {
-                            metrics.record_timeout(DeadlineKind::Shutdown);
-                            return Ok(());
-                        }
-                        continue;
-                    }
-                    metrics.record_cancellation(CancelReason::Shutdown);
-                    return Ok(());
                 }
             }
         }
@@ -1632,7 +1634,12 @@ impl Service<HyperRequest<Incoming>> for HyperToSwift {
         let shutdown = Arc::clone(&self.shutdown);
         let metrics = self.metrics.clone();
         Box::pin(async move {
-            if shutdown.load(Ordering::SeqCst) {
+            let n = requests.fetch_add(1, Ordering::SeqCst);
+            // The first request belongs to this already-accepted socket even
+            // when its head and the shutdown signal cross in the scheduler.
+            // Once one request has run, graceful_shutdown owns the keep-alive
+            // boundary; reject only a raced later request.
+            if n > 0 && shutdown.load(Ordering::SeqCst) {
                 metrics.set_graceful_shutdown_requests(
                     metrics.snapshot().runtime_tasks.max(1),
                 );
@@ -1646,7 +1653,6 @@ impl Service<HyperRequest<Incoming>> for HyperToSwift {
             }
             in_flight.fetch_add(1, Ordering::SeqCst);
             let _inflight = InFlight(in_flight);
-            let n = requests.fetch_add(1, Ordering::SeqCst);
             let _req_permit = match admission.try_acquire_request(TrafficClass::Foreground) {
                 Ok(p) => p,
                 Err(_) => return Ok(error_hyper(503, "Service Unavailable", false)),
