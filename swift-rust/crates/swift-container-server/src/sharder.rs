@@ -74,8 +74,8 @@ use std::path::{Path, PathBuf};
 
 use swift_core::hashing::HashPathConfig;
 use swift_db::{
-    db_locations, get_db_files, make_db_file_path, make_shard_name, parse_db_filename,
-    remove_replicated_handoff_db,
+    db_locations, get_db_files, hash_container_name, make_db_file_path, make_shard_name,
+    parse_db_filename, remove_replicated_handoff_db,
     replicate_container_db, shard_state, shards_account_name, ContainerBroker, DbError, DbState,
     find_overlapping_ranges, GetShardRangesArgs, ObjectRecord, ShardRange,
 };
@@ -2022,6 +2022,97 @@ fn fetch_shard_ranges_from_root_states(
     out
 }
 
+#[derive(Debug)]
+struct ParsedShardName<'a> {
+    root_container: &'a str,
+    parent_container_hash: &'a str,
+}
+
+/// Parse the two name components needed by Python `ShardRange.is_child_of`.
+/// Root own-ranges (`AUTH_a/container`) deliberately do not parse here.
+fn parse_shard_name(name: &str) -> Option<ParsedShardName<'_>> {
+    let (_, container) = name.split_once('/')?;
+    let mut parts = container.rsplitn(4, '-');
+    let index = parts.next()?;
+    let timestamp = parts.next()?;
+    let parent_container_hash = parts.next()?;
+    let root_container = parts.next()?;
+    if root_container.is_empty()
+        || parent_container_hash.is_empty()
+        || timestamp.is_empty()
+        || index.parse::<u64>().is_err()
+    {
+        return None;
+    }
+    Some(ParsedShardName {
+        root_container,
+        parent_container_hash,
+    })
+}
+
+fn shard_container_name(name: &str) -> Option<&str> {
+    name.split_once('/').map(|(_, container)| container)
+}
+
+/// Python `ShardRange.is_child_of`, scoped to the shard names exchanged by a
+/// single root container. The account prefix may differ (`AUTH_*` versus
+/// `.shards_AUTH_*`), just as in Python.
+fn shard_range_is_child_of(child: &ShardRange, parent: &ShardRange) -> bool {
+    let Some(child_name) = parse_shard_name(&child.name) else {
+        return false;
+    };
+    let Some(parent_container) = shard_container_name(&parent.name) else {
+        return false;
+    };
+    let parent_root = parse_shard_name(&parent.name)
+        .map(|parsed| parsed.root_container)
+        .unwrap_or(parent_container);
+    child_name.root_container == parent_root
+        && child_name.parent_container_hash == hash_container_name(parent_container)
+}
+
+/// Best-effort Python `ShardRange.find_ancestors`: walk the directly
+/// discoverable parent chain and always include the root when it is present.
+fn shard_range_ancestor_names(
+    own: &ShardRange,
+    ranges: &[ShardRange],
+) -> std::collections::HashSet<String> {
+    let Some(own_parsed) = parse_shard_name(&own.name) else {
+        return std::collections::HashSet::new();
+    };
+    let root_container = own_parsed.root_container.to_string();
+    let mut ancestors = std::collections::HashSet::new();
+    let mut current = own;
+    loop {
+        let Some(parent) = ranges.iter().find(|candidate| {
+            candidate.name != current.name
+                && !ancestors.contains(&candidate.name)
+                && shard_range_is_child_of(current, candidate)
+        }) else {
+            break;
+        };
+        ancestors.insert(parent.name.clone());
+        current = parent;
+    }
+    if let Some(root) = ranges.iter().find(|candidate| {
+        shard_container_name(&candidate.name) == Some(root_container.as_str())
+    }) {
+        ancestors.insert(root.name.clone());
+    }
+    ancestors
+}
+
+fn shard_range_root_name<'a>(
+    own: &ShardRange,
+    ranges: &'a [ShardRange],
+) -> Option<&'a str> {
+    let root_container = parse_shard_name(&own.name)?.root_container;
+    ranges
+        .iter()
+        .find(|candidate| shard_container_name(&candidate.name) == Some(root_container))
+        .map(|candidate| candidate.name.as_str())
+}
+
 /// Python `_merge_shard_ranges_from_root` (probe L1245): own range by name
 /// plus namespace children. Newest-wins is `merge_shard_ranges`.
 fn merge_shard_ranges_from_root(
@@ -2060,8 +2151,19 @@ fn merge_shard_ranges_from_root(
         let _ = broker.merge_shard_ranges(children);
     }
     if cleaving_own && (!sharded || shrinking_own) {
+        // Python filters every identifiable ancestor (including the root)
+        // before considering acceptors. A shrinking shard may add back only
+        // the ACTIVE root, which is the explicit shrink-to-root case.
+        let ancestor_names = shard_range_ancestor_names(&own, fetched);
+        let root_name = shard_range_root_name(&own, fetched);
         let mut acceptors = Vec::new();
         for sr in others {
+            let active_root_acceptor = shrinking_own
+                && sr.state == shard_state::ACTIVE
+                && root_name == Some(sr.name.as_str());
+            if ancestor_names.contains(&sr.name) && !active_root_acceptor {
+                continue;
+            }
             if swift_db::CLEAVING_STATES.contains(&sr.state) && sr.deleted == 0 {
                 continue;
             }
@@ -5429,12 +5531,21 @@ mod tests {
     use swift_db::RsyncTransport;
 
     fn container_broker(dir: &std::path::Path, name: &str, n: usize) -> ContainerBroker {
+        container_broker_with_account(dir, "AUTH_test", name, n)
+    }
+
+    fn container_broker_with_account(
+        dir: &std::path::Path,
+        account: &str,
+        name: &str,
+        n: usize,
+    ) -> ContainerBroker {
         let h = format!("{:0>32}", name.replace(['/', '.'], ""));
         let h = &h[h.len() - 32..];
         let hd = dir.join(format!("c/0/{}/{h}", &h[h.len() - 3..]));
         std::fs::create_dir_all(&hd).unwrap();
         let db = hd.join(format!("{h}.db"));
-        let mut b = ContainerBroker::new(&db, "AUTH_test", name);
+        let mut b = ContainerBroker::new(&db, account, name);
         b.initialize("1751500000.00000", 0, "1751500000.00000", "id")
             .unwrap();
         for i in 0..n {
@@ -7631,6 +7742,101 @@ mod tests {
             !names.contains(&".shards_AUTH_test/c-z"),
             "non-overlapping sibling must not merge: {names:?}"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_merge_from_root_shrinking_excludes_sharded_ancestors() {
+        // Python excludes parent/root ancestors from acceptors. In particular,
+        // a SHARDED root must not be written into the donor shard DB.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharder-shrink-ancestors-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ts = "1751500010.00000";
+        let parent_name = make_shard_name(".shards_AUTH_test", "rootc", "rootc", ts, 0);
+        let parent_container = shard_container_name(&parent_name).unwrap();
+        let own_name = make_shard_name(
+            ".shards_AUTH_test",
+            "rootc",
+            parent_container,
+            "1751500020.00000",
+            0,
+        );
+        let own_container = shard_container_name(&own_name).unwrap();
+        let mut shard =
+            container_broker_with_account(&dir, ".shards_AUTH_test", own_container, 0);
+        let mut own = ShardRange::new(&own_name, ts, "c", "g");
+        own.state = shard_state::ACTIVE;
+        ensure_shard_root_sysmeta(&mut shard, "AUTH_test", "rootc", &own);
+
+        let mut from_root = own.clone();
+        from_root.state = shard_state::SHRINKING;
+        from_root.state_timestamp = "1751500099.00000".into();
+        let mut parent = ShardRange::new(&parent_name, ts, "a", "m");
+        parent.state = shard_state::SHARDED;
+        let mut root = ShardRange::new("AUTH_test/rootc", ts, "", "");
+        root.state = shard_state::SHARDED;
+        let acceptor_name = make_shard_name(
+            ".shards_AUTH_test",
+            "rootc",
+            "rootc",
+            "1751500030.00000",
+            1,
+        );
+        let mut acceptor = ShardRange::new(&acceptor_name, ts, "a", "e");
+        acceptor.state = shard_state::ACTIVE;
+
+        merge_shard_ranges_from_root(
+            &mut shard,
+            &[from_root, parent.clone(), root.clone(), acceptor.clone()],
+            &own,
+        );
+        let names: Vec<_> = shard
+            .get_shard_ranges(&GetShardRangesArgs::default())
+            .unwrap()
+            .into_iter()
+            .map(|range| range.name)
+            .collect();
+        assert!(names.contains(&acceptor.name), "{names:?}");
+        assert!(!names.contains(&parent.name), "{names:?}");
+        assert!(!names.contains(&root.name), "{names:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_merge_from_root_shrinking_allows_active_root_acceptor() {
+        // The one ancestor exception in Python: a shrinking shard may learn
+        // an ACTIVE root so that the final donor can shrink back to root.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharder-shrink-root-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ts = "1751500010.00000";
+        let own_name = make_shard_name(".shards_AUTH_test", "rootc", "rootc", ts, 0);
+        let own_container = shard_container_name(&own_name).unwrap();
+        let mut shard =
+            container_broker_with_account(&dir, ".shards_AUTH_test", own_container, 0);
+        let mut own = ShardRange::new(&own_name, ts, "c", "g");
+        own.state = shard_state::ACTIVE;
+        ensure_shard_root_sysmeta(&mut shard, "AUTH_test", "rootc", &own);
+
+        let mut from_root = own.clone();
+        from_root.state = shard_state::SHRINKING;
+        from_root.state_timestamp = "1751500099.00000".into();
+        let mut root = ShardRange::new("AUTH_test/rootc", ts, "", "");
+        root.state = shard_state::ACTIVE;
+
+        merge_shard_ranges_from_root(&mut shard, &[from_root, root.clone()], &own);
+        let names: Vec<_> = shard
+            .get_shard_ranges(&GetShardRangesArgs::default())
+            .unwrap()
+            .into_iter()
+            .map(|range| range.name)
+            .collect();
+        assert!(names.contains(&root.name), "{names:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
