@@ -3067,11 +3067,13 @@ fn broker_live_counts(broker: &mut ContainerBroker) -> Option<(i64, i64, i64)> {
     Some((oc, bu, tombs))
 }
 
-/// leftover10 L2780: the leader root still lists the last shard as oc=51
-/// after Python reclaim lowered a replica that is not on this leader and
-/// not among the current ring HEAD primaries. Walk every SAIO `/srv/N/node`
-/// device, ignore empty handoff DBs (oc=0), and merge the lowest *positive*
-/// live count onto the root row.
+/// Refresh a root's child range stats from existing SAIO shard DBs.
+///
+/// Walk every SAIO `/srv/N/node` device, ignore empty handoff DBs (oc=0),
+/// and merge the lowest *positive* live row count onto the root row. This is
+/// deliberately read-only with respect to child DBs: tombstone reclamation is
+/// owned by the shard's own sharder configuration. Reclaiming here would make
+/// an unreclaimed shard appear compactible and shrink it prematurely.
 fn refresh_root_child_stats_from_saio_devices(
     broker: &mut ContainerBroker,
     local_device: &Path,
@@ -3110,35 +3112,12 @@ fn refresh_root_child_stats_from_saio_devices(
         if stored_rows <= 0 {
             continue;
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
         let mut best: Option<(i64, i64, i64, i64)> = None;
         for b in &mut brokers {
-            let Some((oc, _bu, tombs)) = broker_live_counts(b) else {
-                continue;
-            };
-            // Empty handoff leftovers are not the reclaim replica.
-            if oc <= 0 {
-                continue;
-            }
-            // leftover10 L2777 ran Python reclaim_age=0 on the shard
-            // partition, but the replica the leader can see still has the
-            // post-delete tombs. Reclaim them here (age=now) before the
-            // compactible row_count check.
-            if tombs > 0 {
-                let n = b.reclaim(now, now).unwrap_or(0);
-                if n > 0 {
-                    eprintln!(
-                        "G6_REFRESH_SAIO_RECLAIM name={} tombs={tombs} reclaimed={n}",
-                        sr.name
-                    );
-                }
-            }
             let Some((oc, bu, tombs)) = broker_live_counts(b) else {
                 continue;
             };
+            // Empty handoff leftovers are not authoritative child replicas.
             if oc <= 0 {
                 continue;
             }
@@ -3151,13 +3130,10 @@ fn refresh_root_child_stats_from_saio_devices(
         let Some((rows, oc, bu, tombs)) = best else {
             continue;
         };
-        // Apply only a strictly lower positive object_count. Empty
-        // handoffs were already skipped. Post-reclaim tombs must land
-        // so row_count can drop below shrink_threshold.
-        if oc >= sr.object_count && rows >= stored_rows {
-            continue;
-        }
-        if oc >= sr.object_count {
+        // Never raise a root range from this lowest-positive heuristic. Allow
+        // an equal object_count with fewer tombstones so an explicit reclaim
+        // performed by the shard sharder can make row_count compactible.
+        if oc > sr.object_count || (oc == sr.object_count && rows >= stored_rows) {
             continue;
         }
         let old_oc = sr.object_count;
@@ -10190,10 +10166,11 @@ mod tests {
     }
 
     #[test]
-    fn test_refresh_saio_peer_oc1_unblocks_last_shard_shrink_to_root() {
-        // leftover10 L2780: leader root on /srv/1 still lists oc=51.
-        // Python reclaim landed on /srv/3 (not a ring primary, not the
-        // leader). An empty handoff on /srv/2 must not become 0.
+    fn test_refresh_saio_peer_requires_explicit_reclaim_before_shrink_to_root() {
+        // The root on /srv/1 still lists oc=51. A shard replica on /srv/3 has
+        // one live row plus 50 tombstones, and an empty handoff exists on
+        // /srv/2. Refresh must publish the tombstones without reclaiming them;
+        // only an explicit shard reclaim may unblock shrink-to-root.
         let hash_config = HashPathConfig::new("", "changeme").unwrap();
         let dir = std::env::temp_dir().join(format!(
             "swift-s2r-saio-oc1-{}",
@@ -10239,7 +10216,7 @@ mod tests {
             live.put_object(
                 &format!("obj-{i:03}"),
                 "1751500001.00000",
-                10,
+                0,
                 "text/plain",
                 "e",
                 1,
@@ -10277,7 +10254,43 @@ mod tests {
             &hash_config,
             None,
         );
-        assert_eq!(n, 1, "peer oc=1 must land on leader, got {n}");
+        assert_eq!(n, 1, "peer stats must land on leader, got {n}");
+        let before_reclaim_ranges = root
+            .get_shard_ranges(&GetShardRangesArgs {
+                include_own: false,
+                include_deleted: false,
+                ..GetShardRangesArgs::default()
+            })
+            .unwrap();
+        let landed = before_reclaim_ranges
+            .iter()
+            .find(|r| r.name == child.name)
+            .unwrap();
+        assert_eq!(landed.object_count, 1, "{landed:?}");
+        assert_eq!(landed.bytes_used, 10, "{landed:?}");
+        assert_eq!(landed.tombstones, 50, "{landed:?}");
+        let blocked = find_compactible_shard_sequences(&mut root, 10, 75, 1, -1, true)
+            .unwrap();
+        assert!(
+            !blocked
+                .iter()
+                .any(|seq| seq.last().is_some_and(|r| r.name == root.path())),
+            "unreclaimed tombstones must block shrink-to-root: {blocked:?}"
+        );
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        assert_eq!(live.reclaim(now, now).unwrap(), 50);
+        assert_eq!(live.tombstone_count().unwrap(), 0);
+        let n = refresh_root_child_stats_from_saio_devices(
+            &mut root,
+            &leader,
+            &hash_config,
+            None,
+        );
+        assert_eq!(n, 1, "explicit reclaim must refresh row_count, got {n}");
         let after_ranges = root
             .get_shard_ranges(&GetShardRangesArgs {
                 include_own: false,
