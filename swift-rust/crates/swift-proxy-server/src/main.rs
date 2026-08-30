@@ -139,6 +139,11 @@ fn main() {
         logger.error(&format!("bad swift.conf storage policies: {e}"));
         std::process::exit(1);
     });
+    let constraints = swift_core::constraints::Constraints::from_swift_conf(&swift_conf)
+        .unwrap_or_else(|e| {
+            logger.error(&format!("bad swift.conf constraints: {e}"));
+            std::process::exit(1);
+        });
 
     // Storage policies from swift.conf: EC schemes (by index) and the
     // name→index table for resolving container X-Storage-Policy.
@@ -363,6 +368,10 @@ fn main() {
         max_active_requests: options.max_active_requests,
         ..Default::default()
     };
+    apply_swift_http_constraints(&mut server_config, &constraints).unwrap_or_else(|error| {
+        logger.error(&error);
+        std::process::exit(1);
+    });
     if let Some(workers) = options.workers {
         server_config.worker_threads = workers;
     }
@@ -2239,6 +2248,33 @@ fn resolve_swift_conf_path(conf: &SwiftConfig) -> String {
         .unwrap_or_else(|| format!("{}/swift.conf", resolve_swift_dir(conf)))
 }
 
+fn apply_swift_http_constraints(
+    config: &mut swift_http::ServerConfig,
+    constraints: &swift_core::constraints::Constraints,
+) -> Result<(), String> {
+    let max_request_line = usize::try_from(constraints.max_request_line)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            format!(
+                "swift-constraints max_request_line must be positive, got {}",
+                constraints.max_request_line
+            )
+        })?;
+    let max_header_size = usize::try_from(constraints.max_header_size)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            format!(
+                "swift-constraints max_header_size must be positive, got {}",
+                constraints.max_header_size
+            )
+        })?;
+    config.max_request_line_bytes = max_request_line;
+    config.max_header_line_bytes = max_header_size;
+    Ok(())
+}
+
 /// Build proxy `container_sync` middleware from `[filter:container_sync]`.
 fn build_container_sync(
     conf: &SwiftConfig,
@@ -3301,6 +3337,25 @@ fn build_tempauth(
 mod startup_policy_tests {
     use super::*;
     use swift_ring::RingDevice;
+
+    #[test]
+    fn swift_constraints_drive_http_parser_limits() {
+        let mut config = swift_http::ServerConfig::default();
+        let constraints = swift_core::constraints::Constraints {
+            max_header_size: 8191,
+            max_request_line: 8100,
+            ..Default::default()
+        };
+        apply_swift_http_constraints(&mut config, &constraints).unwrap();
+        assert_eq!(config.max_header_line_bytes, 8191);
+        assert_eq!(config.max_request_line_bytes, 8100);
+
+        let invalid = swift_core::constraints::Constraints {
+            max_header_size: 0,
+            ..Default::default()
+        };
+        assert!(apply_swift_http_constraints(&mut config, &invalid).is_err());
+    }
 
     #[test]
     fn swift_dir_comes_from_proxy_conf_not_etc_swift_default() {

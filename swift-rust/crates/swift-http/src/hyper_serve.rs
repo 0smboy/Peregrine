@@ -117,6 +117,9 @@ pub async fn serve_http1_connection(
         )
         .await?
     };
+    if let Some((status, message)) = request_head_limit_error(&more, &config) {
+        return write_handoff_error(&mut stream, status, message).await;
+    }
     if request_line_is_ssync(&more) {
         return serve_ssync_handoff(
             stream,
@@ -397,6 +400,39 @@ fn request_line_precondition(buf: &[u8]) -> Option<&'static str> {
     let path = target.split(|&b| b == b'?').next().unwrap_or(target);
     if !decoded_path_is_utf8(path) {
         return Some("Invalid UTF8 or contains NULL");
+    }
+    None
+}
+
+fn request_head_limit_error(
+    buf: &[u8],
+    config: &ServerConfig,
+) -> Option<(u16, &'static str)> {
+    let head_end = buf
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+        .unwrap_or(buf.len());
+    let mut lines = buf[..head_end].split_inclusive(|byte| *byte == b'\n');
+    let request_line = lines.next().unwrap_or_default();
+    // Python's eventlet limits are exclusive: a request/header line whose
+    // wire length is exactly the configured maximum is already too large.
+    if request_line.len() >= config.max_request_line_bytes {
+        return Some((414, "Request URI Too Long"));
+    }
+
+    let mut header_bytes = 0usize;
+    for line in lines {
+        if line == b"\r\n" || line == b"\n" {
+            break;
+        }
+        if line.len() >= config.max_header_line_bytes {
+            return Some((400, "Header Line Too Long"));
+        }
+        header_bytes = header_bytes.saturating_add(line.len());
+        if header_bytes > config.max_header_bytes {
+            return Some((400, "Request Headers Too Large"));
+        }
     }
     None
 }
@@ -1998,6 +2034,41 @@ mod tests {
         );
         assert_eq!(
             request_line_precondition(b"GET /info HTTP/1.1\r\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn request_head_limits_are_exclusive_and_cover_each_header_line() {
+        let config = ServerConfig {
+            max_request_line_bytes: 16,
+            max_header_line_bytes: 8,
+            max_header_bytes: 64,
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            request_head_limit_error(b"GET / HTTP/1.1\r\nX: 1\r\n\r\n", &config),
+            Some((414, "Request URI Too Long"))
+        );
+        let config = ServerConfig {
+            max_request_line_bytes: 32,
+            max_header_line_bytes: 8,
+            max_header_bytes: 64,
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            request_head_limit_error(b"GET /x HTTP/1.0\r\nX: 123\r\n\r\n", &config),
+            Some((400, "Header Line Too Long"))
+        );
+
+        let config = ServerConfig {
+            max_request_line_bytes: 17,
+            max_header_line_bytes: 9,
+            max_header_bytes: 64,
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            request_head_limit_error(b"GET / HTTP/1.1\r\nX: 123\r\n\r\n", &config),
             None
         );
     }
