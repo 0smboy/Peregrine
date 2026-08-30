@@ -21,12 +21,14 @@
 //! walks every container DB on a device, and when the live stats differ from
 //! the reported ones (or the put/delete timestamps advanced) it PUTs a report
 //! to the container's account replicas (via the account ring); on a majority
-//! success it stamps `reported_*` so the next sweep sees no change.
+//! success it stamps `reported_*` so the next sweep sees no change. If every
+//! account replica returns 404, the container DB is quarantined as an orphan,
+//! matching Python Swift's `no account replicas exist` recovery behavior.
 //!
 //! Non-root (shard) containers have their object/byte stats zeroed before
 //! reporting (via `broker.is_root_container()`) so they don't double-count
-//! into the account. Deferred: account suppression on repeated failure,
-//! `quarantine('no account replicas')` on all-404, and recon/timing.
+//! into the account. Deferred: account suppression on repeated failure and
+//! recon/timing.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -270,10 +272,13 @@ pub fn process_container(
         }
     };
     let mut successes = 0usize;
+    let mut stub_404s = 0usize;
     for node in &nodes {
         let status = client.report(node.dev, part, &stat.account, &stat.container, &stat);
         if (200..300).contains(&status) {
             successes += 1;
+        } else if status == 404 {
+            stub_404s += 1;
         }
     }
     if successes >= majority(nodes.len()) {
@@ -285,6 +290,12 @@ pub fn process_container(
         )?;
         stats.successes += 1;
         Ok(ContainerOutcome::Reported)
+    } else if stub_404s == nodes.len() {
+        swift_db::quarantine_db(broker.db_file(), "containers").map_err(|error| {
+            DbError::Connection(format!("quarantine orphan container: {error}"))
+        })?;
+        stats.failures += 1;
+        Ok(ContainerOutcome::Failed)
     } else {
         stats.failures += 1;
         Ok(ContainerOutcome::Failed)
@@ -481,6 +492,36 @@ mod tests {
         // still needs report next time (reported_* untouched)
         let stat = ContainerStat::from_info(&broker.get_info().unwrap()).unwrap();
         assert!(stat.needs_report());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_all_account_replicas_404_quarantines_orphan_container() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-cupd-orphan-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("sda1");
+        let mut broker = make_container(&device, "AUTH_orphan", "c");
+        let db_path = broker.db_file().to_path_buf();
+        let client = FakeAccount {
+            calls: Mutex::new(Vec::new()),
+            status: 404,
+        };
+        let mut stats = ContainerUpdaterStats::default();
+
+        let out = process_container(&mut broker, &ring3(), &client, &mut stats).unwrap();
+
+        assert_eq!(out, ContainerOutcome::Failed);
+        assert_eq!(stats.failures, 1);
+        assert_eq!(client.calls.lock().unwrap().len(), 3);
+        assert!(!db_path.exists());
+        assert!(!db_path.parent().unwrap().exists());
+        assert!(device
+            .join("quarantined/containers/0000000000000000000000000000abcd")
+            .join("0000000000000000000000000000abcd.db")
+            .exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
