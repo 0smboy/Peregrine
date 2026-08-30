@@ -62,6 +62,7 @@ pub use worm_native_gate::{
 };
 
 use swift_core::config::{config_true_value, FallocateReserve};
+use swift_core::constraints::{AUTO_CREATE_ACCOUNT_PREFIX, RESERVED_STR};
 use swift_core::hashing::HashPathConfig;
 use swift_core::pickle::{self, Value as PickleValue};
 use swift_core::timestamp::{normalize_delete_at_timestamp, Timestamp};
@@ -82,6 +83,48 @@ use swift_runtime::{
 use crate::ssync::{MissingOffer, SsyncEvent, SsyncParser, SsyncSubrequest};
 
 pub const MAX_FILE_SIZE: i64 = 5_368_709_122;
+const MISPLACED_OBJECTS_ACCOUNT: &str = ".misplaced_objects";
+
+fn validate_internal_name(name: &str, type_: &str) -> Result<(), Response> {
+    if name.contains(RESERVED_STR) && !name.starts_with(RESERVED_STR) {
+        return Err(plain_response(
+            400,
+            &format!("Invalid reserved-namespace {type_}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Storage-server half of Python `validate_internal_obj`.
+///
+/// Gatekeeper decides whether a client may use the reserved byte at all. The
+/// object server still enforces namespace pairing: a reserved container only
+/// contains reserved objects, and a user container only contains user
+/// objects. Auto-created system accounts are the upstream exception because
+/// reconciler queue object names intentionally embed source paths.
+fn validate_internal_obj(account: &str, container: &str, obj: &str) -> Result<(), Response> {
+    validate_internal_name(account, "account")?;
+    validate_internal_name(container, "container")?;
+    if !obj.is_empty()
+        && !account.starts_with(AUTO_CREATE_ACCOUNT_PREFIX)
+        && account != MISPLACED_OBJECTS_ACCOUNT
+    {
+        validate_internal_name(obj, "object")?;
+        if container.starts_with(RESERVED_STR) && !obj.starts_with(RESERVED_STR) {
+            return Err(plain_response(
+                400,
+                "Invalid user-namespace object in reserved-namespace container",
+            ));
+        }
+        if obj.starts_with(RESERVED_STR) && !container.starts_with(RESERVED_STR) {
+            return Err(plain_response(
+                400,
+                "Invalid reserved-namespace object in user-namespace container",
+            ));
+        }
+    }
+    Ok(())
+}
 
 fn put_is_mime(headers: &HeaderKeyDict) -> bool {
     use swift_core::config::config_true_value;
@@ -2200,6 +2243,7 @@ impl ObjectServer {
         let account = segs[2].clone().unwrap_or_default();
         let container = segs[3].clone().unwrap_or_default();
         let obj = segs[4].clone().unwrap_or_default();
+        validate_internal_obj(&account, &container, &obj)?;
         Ok((drive, part, account, container, obj, policy_index, policy))
     }
 
@@ -2495,12 +2539,6 @@ impl ObjectServer {
     }
 
     pub fn handle(&self, mut req: Request) -> Response {
-        // Reject object names carrying a NUL byte before dispatch, as the
-        // proxy does with `check_utf8`. Matches the functional-test contract
-        // of 412 "Invalid UTF8 or contains NULL".
-        if req.path.contains('\u{0}') {
-            return plain_response(412, "Invalid UTF8 or contains NULL");
-        }
         if let Some(resp) = self.recon_response(&req) {
             return resp;
         }
@@ -5330,6 +5368,32 @@ mod delete_header_tests {
             headers: h,
             body: Body::empty(),
         }
+    }
+
+    #[test]
+    fn internal_reserved_object_names_require_matching_container_namespace() {
+        assert!(validate_internal_obj("AUTH_test", "\0reserved", "\0object").is_ok());
+        assert!(validate_internal_obj("AUTH_test", "user", "object").is_ok());
+
+        let user_in_reserved =
+            validate_internal_obj("AUTH_test", "\0reserved", "object").unwrap_err();
+        assert_eq!(user_in_reserved.status, 400);
+        let reserved_in_user =
+            validate_internal_obj("AUTH_test", "user", "\0object").unwrap_err();
+        assert_eq!(reserved_in_user.status, 400);
+    }
+
+    #[test]
+    fn internal_reserved_object_names_reject_embedded_marker_but_allow_system_queue() {
+        let embedded =
+            validate_internal_obj("AUTH_test", "user", "bad\0object").unwrap_err();
+        assert_eq!(embedded.status, 400);
+        assert!(validate_internal_obj(
+            ".misplaced_objects",
+            "3600",
+            "AUTH_test\0container\0object",
+        )
+        .is_ok());
     }
 
     #[test]
