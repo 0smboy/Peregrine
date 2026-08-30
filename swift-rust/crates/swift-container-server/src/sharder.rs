@@ -496,6 +496,20 @@ fn shard_cleave_replication_holds(
     first_cleave && replica_count > 0 && python_successes < default_shard_quorum(replica_count)
 }
 
+const SHARD_CLEAVE_REPLICATION_MAX_ATTEMPTS: usize = 3;
+
+/// A first cleave can race peer shard creation from another local sharder.
+/// Retry only while durability is below Python's quorum, and keep the bound
+/// small so a genuinely unavailable replica set still fails closed.
+fn shard_cleave_replication_retry_needed(
+    attempts_completed: usize,
+    python_successes: usize,
+    replica_count: usize,
+) -> bool {
+    attempts_completed < SHARD_CLEAVE_REPLICATION_MAX_ATTEMPTS
+        && shard_cleave_replication_holds(true, python_successes, replica_count)
+}
+
 
 /// Build ordered primary [`ShardReplicaNode`]s from ring device fields
 /// (`ip`, `port`, `device`). Preserves ring primary order so HTTP create
@@ -2971,7 +2985,10 @@ pub fn process_sharding_container_detailed_with_ring(
             }
             continue;
         }
-        let peer = replicate_broker_to_ring_peers_detailed(
+        let first_cleave = created_before.contains(&sr.name)
+            && sr.state >= shard_state::CLEAVED
+            && !empty_new_names.iter().any(|n| n == &sr.name);
+        let mut peer = replicate_broker_to_ring_peers_detailed(
             &mut shard,
             hash_config,
             ring,
@@ -2980,10 +2997,51 @@ pub fn process_sharding_container_detailed_with_ring(
             true,
         );
         replicate_errors += peer.errors;
-        if created_before.contains(&sr.name)
-            && sr.state >= shard_state::CLEAVED
-            && !empty_new_names.iter().any(|n| n == &sr.name)
+        let mut replication_attempt = 1usize;
+        while first_cleave
+            && shard_cleave_replication_retry_needed(
+                replication_attempt,
+                peer.python_successes(),
+                peer.replica_count,
+            )
         {
+            let delay_ms = 50 * replication_attempt as u64;
+            eprintln!(
+                "G6_CLEAVE_REPLICATE_RETRY shard={} attempt={} successes={} replicas={} errors={} delay_ms={}",
+                sr.name,
+                replication_attempt + 1,
+                peer.python_successes(),
+                peer.replica_count,
+                peer.errors,
+                delay_ms,
+            );
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let retry = replicate_broker_to_ring_peers_detailed(
+                &mut shard,
+                hash_config,
+                ring,
+                &local_device,
+                devices_root.as_deref(),
+                true,
+            );
+            replicate_errors += retry.errors;
+            replication_attempt += 1;
+            if retry.python_successes() > peer.python_successes()
+                || (retry.python_successes() == peer.python_successes()
+                    && retry.errors < peer.errors)
+            {
+                peer = retry;
+            }
+        }
+        if first_cleave {
+            eprintln!(
+                "G6_CLEAVE_REPLICATE_RESULT shard={} attempts={} successes={} replicas={} errors={}",
+                sr.name,
+                replication_attempt,
+                peer.python_successes(),
+                peer.replica_count,
+                peer.errors,
+            );
             new_cleave_reps.push((
                 sr.name.clone(),
                 peer.python_successes(),
@@ -4564,12 +4622,34 @@ fn replicate_broker_to_ring_peers_detailed(
                     None => !outcome.needs_rsync && !outcome.usync_incomplete,
                 };
                 if !ok {
+                    eprintln!(
+                        "G6_PEER_RSYNC_ERR account={} container={} local_device={} peer={} peer_device={} part={} op={}",
+                        account,
+                        container,
+                        local_device,
+                        host,
+                        n.dev.device,
+                        part,
+                        op,
+                    );
                     errors += 1;
                 } else {
                     remote_successes += 1;
                 }
             }
-            Err(_) => errors += 1,
+            Err(e) => {
+                eprintln!(
+                    "G6_PEER_REPLICATE_ERR account={} container={} local_device={} peer={} peer_device={} part={} err={:?}",
+                    account,
+                    container,
+                    local_device,
+                    host,
+                    n.dev.device,
+                    part,
+                    e,
+                );
+                errors += 1;
+            }
         }
     }
     let max_row_after = broker.get_max_row().ok().map(|v| v.unwrap_or(-1));
@@ -10081,6 +10161,21 @@ mod tests {
         assert!(!shard_cleave_replication_holds(false, 0, 3));
         // no ring
         assert!(!shard_cleave_replication_holds(true, 0, 0));
+    }
+
+    #[test]
+    fn test_shard_cleave_replication_retry_is_bounded_and_fail_closed() {
+        // A transient first-cleave miss gets two retries.
+        assert!(shard_cleave_replication_retry_needed(1, 1, 3));
+        assert!(shard_cleave_replication_retry_needed(2, 1, 3));
+        // The third failed attempt is final; do not loop forever or pretend
+        // that one durable copy satisfies a three-replica quorum.
+        assert!(!shard_cleave_replication_retry_needed(3, 1, 3));
+        assert!(shard_cleave_replication_holds(true, 1, 3));
+        // Reaching quorum immediately suppresses retries.
+        assert!(!shard_cleave_replication_retry_needed(1, 2, 3));
+        // The no-ring local test path never needs a network retry.
+        assert!(!shard_cleave_replication_retry_needed(1, 0, 0));
     }
 
 
