@@ -149,43 +149,227 @@ def run_g7load(args, timeout=180):
     return obj
 
 
-def classify(case, raw, spec):
+HEALTH_KINDS = {
+    "idle_keepalive",
+    "slowloris",
+    "slow_put",
+    "slow_get",
+    "churn",
+    "blackhole",
+    "quorum",
+    "overload",
+    "fsync_stall",
+    "sqlite_stall",
+    "backend_connect_timeout",
+}
+
+
+def _expected_target(case, raw):
+    if case.get("target") is not None:
+        return case["target"]
+    if case.get("n") is not None:
+        return case["n"]
+    return raw.get("target")
+
+
+def _is_2xx(value):
+    return isinstance(value, int) and 200 <= value < 300
+
+
+def _failed(out, reason, verdict="FAIL"):
+    out["verdict"] = verdict
+    out["reason"] = reason
+    return out
+
+
+def _require_equal(out, raw, field, expected):
+    if field not in raw:
+        return _failed(out, f"missing proof field: {field}")
+    if raw[field] != expected:
+        return _failed(out, f"{field} {raw[field]!r} != {expected!r}")
+    return None
+
+
+def _require_2xx(out, raw, field):
+    if field not in raw:
+        return _failed(out, f"missing proof field: {field}")
+    if not _is_2xx(raw[field]):
+        return _failed(out, f"{field} {raw[field]!r} is not 2xx")
+    return None
+
+
+def classify(case, raw, spec, *, calibration=False):
+    """Classify one result from affirmative evidence only.
+
+    Missing counters, response status, injection hits, cleanup proof, or
+    steady-state proof are failures.  A process exit or a script reaching the
+    end is never evidence that a G7 behavior passed.
+    """
     bounds = spec["bounds"]
-    target = case.get("target")
+    kind = case.get("kind")
+    target = _expected_target(case, raw)
     opened = raw.get("opened")
     out = {
         "name": case.get("_name"),
-        "kind": case.get("kind"),
+        "kind": kind,
         "target": target,
         "opened": opened,
         "raw": raw,
     }
-    if target is not None and opened is not None and opened < target:
-        out["verdict"] = "ENVIRONMENT BLOCKED"
-        out["reason"] = f"opened {opened} < target {target}"
-        return out
-    p99 = raw.get("health_p99_ms")
-    if p99 is not None and p99 > bounds["health_head_p99_ms"] and case.get("kind") not in (
-        "fsync_stall",
-        "sqlite_stall",
-    ):
-        # stall cases allow health during stall as long as it *responds*; p99 bound still applies per OBJECTIVE
-        if case.get("kind") not in ("fsync_stall", "sqlite_stall"):
-            out["verdict"] = "FAIL"
-            out["reason"] = f"health p99 {p99} > {bounds['health_head_p99_ms']} ms"
-            return out
-    if p99 is not None and p99 > bounds["health_head_p99_ms"]:
-        out["verdict"] = "FAIL"
-        out["reason"] = f"health p99 {p99} > {bounds['health_head_p99_ms']} ms"
-        return out
-    if raw.get("_rc") not in (0, None) and target is not None:
-        out["verdict"] = "FAIL"
-        out["reason"] = f"g7load rc={raw.get('_rc')}"
-        return out
+
     if raw.get("error"):
-        out["verdict"] = "FAIL"
-        out["reason"] = str(raw["error"])
-        return out
+        return _failed(out, str(raw["error"]))
+    if raw.get("parse_error"):
+        return _failed(out, "load generator emitted no valid JSON result")
+    if target is None:
+        return _failed(out, "missing expected target")
+    if opened is None:
+        return _failed(out, "missing proof field: opened")
+    if opened < target:
+        return _failed(out, f"opened {opened} < target {target}", "ENVIRONMENT BLOCKED")
+    if opened > target:
+        return _failed(out, f"opened {opened} > target {target}")
+    if raw.get("_rc") not in (0, None):
+        return _failed(out, f"g7load rc={raw.get('_rc')}")
+
+    if calibration:
+        check = _require_equal(out, raw, "http_ok", target)
+        if check:
+            return check
+        return _failed(out, "dummy opened==target and http_ok==target", "PASS")
+
+    if raw.get("verdict_hint") == "NOT RUN":
+        return _failed(out, str(raw.get("not_run_reason") or "required fault was not injected"), "NOT RUN")
+
+    if kind in HEALTH_KINDS:
+        for field in ("health_p99_ms", "health_samples", "health_ok"):
+            if field not in raw:
+                return _failed(out, f"missing proof field: {field}")
+        if raw["health_samples"] <= 0:
+            return _failed(out, "health_samples must be > 0")
+        if raw["health_ok"] != raw["health_samples"]:
+            return _failed(out, f"health_ok {raw['health_ok']} != health_samples {raw['health_samples']}")
+        if raw["health_p99_ms"] > bounds["health_head_p99_ms"]:
+            return _failed(out, f"health p99 {raw['health_p99_ms']} > {bounds['health_head_p99_ms']} ms")
+
+    if raw.get("scheduler_lag_p99_ms") is None:
+        return _failed(out, "missing proof field: scheduler_lag_p99_ms")
+    if raw["scheduler_lag_p99_ms"] > bounds["scheduler_lag_p99_ms"]:
+        return _failed(out, f"scheduler lag p99 {raw['scheduler_lag_p99_ms']} > {bounds['scheduler_lag_p99_ms']} ms")
+    if raw.get("scheduler_lag_p999_ms") is None:
+        return _failed(out, "missing proof field: scheduler_lag_p999_ms")
+    if raw["scheduler_lag_p999_ms"] > bounds["scheduler_lag_p999_ms"]:
+        return _failed(out, f"scheduler lag p999 {raw['scheduler_lag_p999_ms']} > {bounds['scheduler_lag_p999_ms']} ms")
+    steady = raw.get("steady_return")
+    if not isinstance(steady, dict) or steady.get("ok") is not True:
+        return _failed(out, f"steady-state return not proved: {steady!r}")
+
+    if kind == "idle_keepalive":
+        for field, expected in (("http_ok", target), ("failed", 0)):
+            check = _require_equal(out, raw, field, expected)
+            if check:
+                return check
+    elif kind == "slowloris":
+        check = _require_equal(out, raw, "failed", 0)
+        if check:
+            return check
+    elif kind == "slow_put":
+        for field, expected in (("responses", target), ("http_2xx", target), ("failed", 0)):
+            check = _require_equal(out, raw, field, expected)
+            if check:
+                return check
+    elif kind == "slow_get":
+        check = _require_2xx(out, raw, "seed_status")
+        if check:
+            return check
+        for field, expected in (("responses", target), ("http_2xx", target), ("completed", target), ("failed", 0)):
+            check = _require_equal(out, raw, field, expected)
+            if check:
+                return check
+    elif kind == "churn":
+        cycles = raw.get("cycle_results")
+        if not isinstance(cycles, list) or len(cycles) != case.get("cycles"):
+            return _failed(out, "missing complete per-cycle churn evidence")
+        for index, cycle in enumerate(cycles):
+            if cycle.get("_rc") != 0 or cycle.get("opened") != target or cycle.get("http_ok") != target:
+                return _failed(out, f"churn cycle {index} did not open and serve target")
+    elif kind in ("blackhole", "quorum", "backend_connect_timeout"):
+        if raw.get("fault_armed") is not True or raw.get("fault_hits", 0) <= 0:
+            return _failed(out, "network fault was not proved on the exercised path")
+        if kind == "blackhole":
+            check = _require_2xx(out, raw, "put_status")
+            if check:
+                return check
+        elif kind == "quorum":
+            check = _require_equal(out, raw, "ok_2xx", case.get("put_n"))
+            if check:
+                return check
+        elif raw.get("timeout_observed") is not True:
+            return _failed(out, "backend connection timeout was not observed")
+    elif kind == "overload":
+        responses = raw.get("http_2xx", 0) + raw.get("http_503", 0)
+        if raw.get("responses") != target or responses != target:
+            return _failed(out, "overload responses were not fully classified as 2xx or 503")
+        if raw.get("http_503", 0) <= 0:
+            return _failed(out, "bounded overload did not produce an explicit 503")
+    elif kind == "cancel":
+        check = _require_equal(out, raw, "tmp_count", bounds["orphan_temp"])
+        if check:
+            return check
+        check = _require_equal(out, raw, "committed_objects", 0)
+        if check:
+            return check
+    elif kind == "sigterm_put":
+        for field in ("term_sent", "restart_ok", "partial_absent"):
+            if raw.get(field) is not True:
+                return _failed(out, f"{field} was not proved")
+    elif kind == "sigterm_barrier":
+        for field in ("barrier_observed", "term_during_barrier", "restart_ok"):
+            if raw.get(field) is not True:
+                return _failed(out, f"{field} was not proved")
+        check = _require_2xx(out, raw, "put_status")
+        if check:
+            return check
+        check = _require_2xx(out, raw, "get_after")
+        if check:
+            return check
+        check = _require_equal(out, raw, "len", raw.get("expected_len"))
+        if check:
+            return check
+    elif kind == "fd_exhaust":
+        if raw.get("fault_armed") is not True or raw.get("fd_pressure_observed") is not True:
+            return _failed(out, "fd exhaustion was not armed and observed")
+        if raw.get("recovered") is not True:
+            return _failed(out, "service recovery after fd exhaustion was not proved")
+    elif kind in ("enospc", "eio"):
+        if raw.get("fault_armed") is not True or raw.get("fault_hits", 0) <= 0:
+            return _failed(out, f"{kind} was not injected on an object write")
+        status = raw.get("put_status")
+        if not isinstance(status, int) or status < 400:
+            return _failed(out, f"injected {kind} PUT unexpectedly succeeded: {status!r}")
+        check = _require_equal(out, raw, "tmp_count", bounds["orphan_temp"])
+        if check:
+            return check
+        check = _require_2xx(out, raw, "recovery_put_status")
+        if check:
+            return check
+    elif kind == "partial_write":
+        if raw.get("expect_not_2xx") is not True:
+            return _failed(out, f"partial PUT became visible with status {raw.get('get_status')!r}")
+        check = _require_equal(out, raw, "tmp_count", bounds["orphan_temp"])
+        if check:
+            return check
+    elif kind in ("fsync_stall", "sqlite_stall"):
+        if raw.get("fault_armed") is not True or raw.get("fault_hits", 0) <= 0:
+            return _failed(out, f"{kind} injection was not observed")
+        check = _require_2xx(out, raw, "operation_status")
+        if check:
+            return check
+        if raw.get("operation_ms", 0) < case.get("stall_secs", 0) * 1000:
+            return _failed(out, f"{kind} operation did not cross the injected stall")
+    else:
+        return _failed(out, f"no evidence contract for kind {kind}")
+
     out["verdict"] = "PASS"
     return out
 
@@ -557,7 +741,12 @@ def dummy_calibrate(spec):
             ],
             timeout=180,
         )
-        rec = classify({"_name": f"dummy_{n}", "kind": "idle_keepalive", "target": n}, raw, spec)
+        rec = classify(
+            {"_name": f"dummy_{n}", "kind": "idle_keepalive", "target": n},
+            raw,
+            spec,
+            calibration=True,
+        )
         # Dummy is not the SUT: opened==target is the only calibration gate.
         if rec.get("opened") == n:
             rec["verdict"] = "PASS"
