@@ -112,6 +112,22 @@ fn md5_hex(data: &[u8]) -> String {
     format!("{:x}", Md5::digest(data))
 }
 
+fn committed_data_file(devices: &Path) -> PathBuf {
+    let mut data_file = None;
+    let mut stack = vec![devices.join("sda1")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "data") {
+                data_file = Some(path);
+            }
+        }
+    }
+    data_file.expect("a committed .data file")
+}
+
 #[test]
 fn streamed_put_commits_exactly_the_streamed_bytes_and_etag() {
     let devices = TestDevices::new("put");
@@ -182,19 +198,7 @@ fn head_serves_metadata_without_reading_a_corrupt_data_file() {
 
     // Corrupt the stored data file's CONTENTS without touching its size
     // or xattrs: a HEAD must still answer 200 from metadata alone.
-    let mut data_file = None;
-    let mut stack = vec![devices.path().join("sda1")];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "data") {
-                data_file = Some(path);
-            }
-        }
-    }
-    let data_file = data_file.expect("a committed .data file");
+    let data_file = committed_data_file(devices.path());
     // Flip bytes in place (same length) via read-modify-write.
     let mut contents = std::fs::read(&data_file).unwrap();
     for b in contents.iter_mut() {
@@ -219,6 +223,47 @@ fn head_serves_metadata_without_reading_a_corrupt_data_file() {
     assert!(head.body.is_definitely_empty());
     // The file was not quarantined by the HEAD.
     assert!(data_file.exists());
+}
+
+#[test]
+fn complete_stream_quarantines_bad_etag_before_consumer_drop() {
+    use swift_diskfile::{
+        read_metadata, write_metadata, MetaValue, DEFAULT_XATTR_SIZE,
+    };
+
+    let devices = TestDevices::new("quarantine-before-drop");
+    let server = server(devices.path());
+    let payload = pattern(64 * 1024);
+    assert_eq!(
+        server
+            .handle(request("PUT", "1", payload.clone().into()))
+            .status,
+        201
+    );
+    let data_file = committed_data_file(devices.path());
+    let mut metadata = read_metadata(&data_file).unwrap();
+    let (_, etag) = metadata
+        .iter_mut()
+        .find(|(key, _)| matches!(key, MetaValue::Str(name) if name == "ETag"))
+        .expect("stored object ETag metadata");
+    *etag = MetaValue::Str("badetag".into());
+    write_metadata(&data_file, &metadata, DEFAULT_XATTR_SIZE).unwrap();
+
+    let resp = server.handle(request("GET", "1", Body::empty()));
+    assert_eq!(resp.status, 200);
+    let (mut reader, length) = resp.body.into_reader();
+    assert_eq!(length, Some(payload.len() as u64));
+    let mut got = vec![0; payload.len()];
+    reader.read_exact(&mut got).unwrap();
+    assert_eq!(got, payload);
+
+    // Keep `reader` alive here. The quarantine must be the side effect of
+    // reading the final byte, not a later Drop that can race the next request.
+    assert!(
+        !data_file.exists(),
+        "bad ETag remained readable until response-reader drop"
+    );
+    assert_eq!(server.handle(request("GET", "1", Body::empty())).status, 404);
 }
 
 #[test]

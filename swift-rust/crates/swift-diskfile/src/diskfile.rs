@@ -1151,6 +1151,17 @@ impl Read for DiskFileStreamReader {
             return Ok(0);
         };
         let n = reader.read(buf)?;
+        if n > 0 && reader.bytes_read == reader.obj_size {
+            // The data file was stat-checked against obj_size at open, so
+            // reaching the declared length means the complete object has
+            // been consumed. Verify before yielding the final response chunk:
+            // Hyper may stop polling as soon as Content-Length bytes arrive,
+            // and a following request must already observe the quarantine.
+            // ETag mismatch remains a post-stream side effect; the bytes just
+            // read are still returned, matching Python's reader contract.
+            let _ = self.inner.take().unwrap().close();
+            return Ok(n);
+        }
         if n == 0 && !buf.is_empty() {
             // EOF: run the close-time verification exactly once. A short
             // file cannot satisfy the declared Content-Length, so surface
