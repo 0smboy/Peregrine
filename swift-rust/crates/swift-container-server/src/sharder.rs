@@ -485,29 +485,74 @@ pub fn default_shard_quorum(replica_count: usize) -> usize {
     ((replica_count / 2) + 1).max(1)
 }
 
-/// Python `_cleave_shard_broker` first-cleave hold: `responses.count(True)
-/// < shard_replication_quorum`. `replica_count == 0` means no ring (local
-/// leftover10 path) and must not hold.
+/// Required durable copies before a cleave may advance its cursor.
+///
+/// Python uses `shard_replication_quorum` for a newly-created shard and
+/// `existing_shard_replication_quorum` for an existing acceptor. Rust's
+/// shrink path additionally sends object rows to the acceptor primaries and
+/// its listing reader may use any first successful primary. Require every
+/// acceptor primary during a shrink so a completed donor cannot expose a
+/// partial namespace on an otherwise healthy replica.
+///
+/// `replica_count == 0` means no ring (the local leftover10 path) and must
+/// never hold.
+fn shard_cleave_required_successes(
+    first_cleave: bool,
+    shrinking_cleave: bool,
+    replica_count: usize,
+) -> usize {
+    if replica_count == 0 {
+        0
+    } else if shrinking_cleave {
+        replica_count
+    } else if first_cleave {
+        default_shard_quorum(replica_count)
+    } else {
+        0
+    }
+}
+
 fn shard_cleave_replication_holds(
     first_cleave: bool,
+    shrinking_cleave: bool,
     python_successes: usize,
     replica_count: usize,
 ) -> bool {
-    first_cleave && replica_count > 0 && python_successes < default_shard_quorum(replica_count)
+    let required =
+        shard_cleave_required_successes(first_cleave, shrinking_cleave, replica_count);
+    required > 0 && python_successes < required
 }
 
 const SHARD_CLEAVE_REPLICATION_MAX_ATTEMPTS: usize = 3;
 
-/// A first cleave can race peer shard creation from another local sharder.
-/// Retry only while durability is below Python's quorum, and keep the bound
-/// small so a genuinely unavailable replica set still fails closed.
+#[derive(Debug, Clone)]
+struct CleaveDurabilityOutcome {
+    name: String,
+    first_cleave: bool,
+    shrinking_cleave: bool,
+    object_update_ok: bool,
+    python_successes: usize,
+    replica_count: usize,
+}
+
+/// A first cleave can race peer shard creation from another local sharder;
+/// shrinking replicas can similarly race while all donor replicas merge into
+/// one acceptor. Retry only while durability is below the operation's target,
+/// and keep the bound small so an unavailable replica set still fails closed.
 fn shard_cleave_replication_retry_needed(
+    first_cleave: bool,
+    shrinking_cleave: bool,
     attempts_completed: usize,
     python_successes: usize,
     replica_count: usize,
 ) -> bool {
     attempts_completed < SHARD_CLEAVE_REPLICATION_MAX_ATTEMPTS
-        && shard_cleave_replication_holds(true, python_successes, replica_count)
+        && shard_cleave_replication_holds(
+            first_cleave,
+            shrinking_cleave,
+            python_successes,
+            replica_count,
+        )
 }
 
 
@@ -1803,6 +1848,45 @@ fn update_objects_on_primaries(
     }
 }
 
+/// Retrying wrapper for shrink-time object merges. Multiple donor replicas
+/// may update the same acceptor concurrently; a transient SQLite/replicator
+/// conflict must not be treated as a durable acceptor update. The operation
+/// is idempotent because container object rows are timestamp-merged.
+fn update_objects_on_primaries_with_retry(
+    ring: &swift_ring::Ring,
+    shard_name: &str,
+    records: &[ObjectRecord],
+    require_all: bool,
+    max_attempts: usize,
+) -> Result<(), String> {
+    let attempts = max_attempts.max(1);
+    let mut last_error = None;
+    for attempt in 1..=attempts {
+        match update_objects_on_primaries(ring, shard_name, records, require_all) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if attempt == attempts {
+                    last_error = Some(error);
+                    break;
+                }
+                let delay_ms = 50 * attempt as u64;
+                eprintln!(
+                    "G6_UPDATE_OBJECTS_RETRY shard={} attempt={} err={} delay_ms={}",
+                    shard_name,
+                    attempt + 1,
+                    error,
+                    delay_ms,
+                );
+                last_error = Some(error);
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        format!("UPDATE objects onto {shard_name} primaries was not attempted")
+    }))
+}
+
 fn object_records_update_json(records: &[ObjectRecord]) -> Vec<u8> {
     let arr: Vec<serde_json::Value> = records
         .iter()
@@ -2840,6 +2924,8 @@ pub fn process_sharding_container_detailed_with_ring(
         .map(|r| r.name.clone())
         .collect();
     let pre_cleave_cursor = ctx.cursor.clone();
+    let pre_cleave_ranges_done = ctx.ranges_done;
+    let pre_cleave_ranges_todo = ctx.ranges_todo;
     let empty_new_names = cleave(
         broker,
         &mut ranges,
@@ -2853,7 +2939,7 @@ pub fn process_sharding_container_detailed_with_ring(
     // Python `_cleave_shard_broker` `_replicate_object`: push the cleaved
     // shard DB onto that shard's ring primaries. Also push leftover CREATED
     // DBs so `replicators.once()` can fill a primary that missed Auto-Create.
-    let mut new_cleave_reps: Vec<(String, usize, usize)> = Vec::new();
+    let mut cleave_durability: Vec<CleaveDurabilityOutcome> = Vec::new();
     let own_shrinking = broker
         .get_own_shard_range(true)
         .ok()
@@ -2925,28 +3011,53 @@ pub fn process_sharding_container_detailed_with_ring(
         // shards during node-0/1's first batch populates them too early
         // (listing-w155 L1509 expected 101, got 200). UPDATE only the
         // objects already merged into a CLEAVED/ACTIVE local shard.
+        let mut object_update_ok = true;
         if let Some(ring) = ring {
             if sr.state >= shard_state::CLEAVED && !skip_leftover_object_update {
-                if let Ok(records) = shard.object_records_in_range(&sr.lower, &sr.upper) {
-                    if !records.is_empty() {
-                        let require_all = range_name_is_root(
-                            sr, &account, &container, &root_acct, &root_cont,
-                        ) && own_shrinking;
-                        match update_objects_on_primaries(ring, &sr.name, &records, require_all) {
+                match shard.object_records_in_range(&sr.lower, &sr.upper) {
+                    Ok(records) if !records.is_empty() => {
+                        let result = if own_shrinking {
+                            update_objects_on_primaries_with_retry(
+                                ring,
+                                &sr.name,
+                                &records,
+                                true,
+                                SHARD_CLEAVE_REPLICATION_MAX_ATTEMPTS,
+                            )
+                        } else {
+                            update_objects_on_primaries(ring, &sr.name, &records, false)
+                        };
+                        match result {
                             Ok(()) => eprintln!(
                                 "G6_UPDATE_OBJECTS shard={} n={} state={} ok",
                                 sr.name,
                                 records.len(),
                                 sr.state
                             ),
-                            Err(e) => eprintln!(
-                                "G6_UPDATE_OBJECTS shard={} n={} state={} err={}",
-                                sr.name,
-                                records.len(),
-                                sr.state,
-                                e
-                            ),
+                            Err(e) => {
+                                object_update_ok = false;
+                                eprintln!(
+                                    "G6_UPDATE_OBJECTS shard={} n={} state={} err={}",
+                                    sr.name,
+                                    records.len(),
+                                    sr.state,
+                                    e
+                                );
+                            }
                         }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        if own_shrinking {
+                            object_update_ok = false;
+                        }
+                        eprintln!(
+                            "G6_UPDATE_OBJECTS_READ shard={} state={} shrinking={} err={}",
+                            sr.name,
+                            sr.state,
+                            own_shrinking,
+                            error,
+                        );
                     }
                 }
             }
@@ -2983,6 +3094,14 @@ pub fn process_sharding_container_detailed_with_ring(
                     );
                 }
             }
+            cleave_durability.push(CleaveDurabilityOutcome {
+                name: sr.name.clone(),
+                first_cleave: false,
+                shrinking_cleave: true,
+                object_update_ok,
+                python_successes: 0,
+                replica_count: 0,
+            });
             continue;
         }
         let first_cleave = created_before.contains(&sr.name)
@@ -2998,8 +3117,10 @@ pub fn process_sharding_container_detailed_with_ring(
         );
         replicate_errors += peer.errors;
         let mut replication_attempt = 1usize;
-        while first_cleave
+        while (first_cleave || own_shrinking)
             && shard_cleave_replication_retry_needed(
+                first_cleave,
+                own_shrinking,
                 replication_attempt,
                 peer.python_successes(),
                 peer.replica_count,
@@ -3016,6 +3137,11 @@ pub fn process_sharding_container_detailed_with_ring(
                 delay_ms,
             );
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            // A concurrent complete_rsync can replace an epoch inode while
+            // this pass still holds the old SQLite handle (extended code
+            // SQLITE_READONLY_DBMOVED/1032). Re-open the current DB before
+            // retrying instead of repeatedly failing on the stale inode.
+            shard.reload_db_files();
             let retry = replicate_broker_to_ring_peers_detailed(
                 &mut shard,
                 hash_config,
@@ -3033,29 +3159,42 @@ pub fn process_sharding_container_detailed_with_ring(
                 peer = retry;
             }
         }
-        if first_cleave {
+        if first_cleave || own_shrinking {
             eprintln!(
-                "G6_CLEAVE_REPLICATE_RESULT shard={} attempts={} successes={} replicas={} errors={}",
+                "G6_CLEAVE_REPLICATE_RESULT shard={} first={} shrinking={} attempts={} successes={} replicas={} errors={} object_update_ok={}",
                 sr.name,
+                first_cleave,
+                own_shrinking,
                 replication_attempt,
                 peer.python_successes(),
                 peer.replica_count,
                 peer.errors,
+                object_update_ok,
             );
-            new_cleave_reps.push((
-                sr.name.clone(),
-                peer.python_successes(),
-                peer.replica_count,
-            ));
+            cleave_durability.push(CleaveDurabilityOutcome {
+                name: sr.name.clone(),
+                first_cleave,
+                shrinking_cleave: own_shrinking,
+                object_update_ok,
+                python_successes: peer.python_successes(),
+                replica_count: peer.replica_count,
+            });
         }
     }
     // Python `_cleave_shard_broker`: first-cleave `_replicate_object`
     // successes < shard_replication_quorum is CLEAVE_FAILED. Do not
     // advertise SHARDED (probe L2390). No ring = local leftover10 path.
     if ring.is_some() {
-        if let Some(fail_name) = new_cleave_reps.iter().find_map(|(name, succ, nrep)| {
-            if shard_cleave_replication_holds(true, *succ, *nrep) {
-                Some(name.clone())
+        if let Some(fail_name) = cleave_durability.iter().find_map(|outcome| {
+            if outcome.first_cleave
+                && shard_cleave_replication_holds(
+                    true,
+                    false,
+                    outcome.python_successes,
+                    outcome.replica_count,
+                )
+            {
+                Some(outcome.name.clone())
             } else {
                 None
             }
@@ -3096,6 +3235,36 @@ pub fn process_sharding_container_detailed_with_ring(
                     ctx.ranges_done = 0;
                 }
             }
+        }
+
+        // A shrinking donor must not unlink its retiring DB while an acceptor
+        // primary is missing either the merged object rows or the replicated
+        // shard DB. Unlike first-cleave failure, the acceptor is already
+        // ACTIVE and must not be reverted to CREATED. Restore only the
+        // cleaving context so the next pass idempotently retries the same
+        // acceptor while the donor remains a recoverable source.
+        if let Some(failed) = cleave_durability.iter().find(|outcome| {
+            outcome.shrinking_cleave
+                && (!outcome.object_update_ok
+                    || shard_cleave_replication_holds(
+                        false,
+                        true,
+                        outcome.python_successes,
+                        outcome.replica_count,
+                    ))
+        }) {
+            eprintln!(
+                "G6_SHRINK_REPLICATION_HOLD account={account} container={container} fail={} object_update_ok={} successes={} replicas={} cursor={:?}",
+                failed.name,
+                failed.object_update_ok,
+                failed.python_successes,
+                failed.replica_count,
+                pre_cleave_cursor,
+            );
+            ctx.cleaving_done = false;
+            ctx.cursor = pre_cleave_cursor.clone();
+            ctx.ranges_done = pre_cleave_ranges_done;
+            ctx.ranges_todo = pre_cleave_ranges_todo;
         }
     }
     // Python `_cleave` returns `misplaced_done and cleaving_done`. The
@@ -10162,29 +10331,38 @@ mod tests {
     #[test]
     fn test_shard_cleave_replication_holds_matches_python_quorum() {
         // 3 replicas, quorum 2. Local-only (1) must hold (probe L2390).
-        assert!(shard_cleave_replication_holds(true, 1, 3));
-        assert!(shard_cleave_replication_holds(true, 0, 3));
-        assert!(!shard_cleave_replication_holds(true, 2, 3));
-        assert!(!shard_cleave_replication_holds(true, 3, 3));
+        assert!(shard_cleave_replication_holds(true, false, 1, 3));
+        assert!(shard_cleave_replication_holds(true, false, 0, 3));
+        assert!(!shard_cleave_replication_holds(true, false, 2, 3));
+        assert!(!shard_cleave_replication_holds(true, false, 3, 3));
         // already-CLEAVED re-replicate must not hold leftover10
-        assert!(!shard_cleave_replication_holds(false, 0, 3));
+        assert!(!shard_cleave_replication_holds(false, false, 0, 3));
+        // Shrinking into an existing acceptor must reach every primary before
+        // a first-success listing can safely observe the completed donor.
+        assert!(shard_cleave_replication_holds(false, true, 2, 3));
+        assert!(!shard_cleave_replication_holds(false, true, 3, 3));
         // no ring
-        assert!(!shard_cleave_replication_holds(true, 0, 0));
+        assert!(!shard_cleave_replication_holds(true, false, 0, 0));
+        assert!(!shard_cleave_replication_holds(false, true, 0, 0));
     }
 
     #[test]
     fn test_shard_cleave_replication_retry_is_bounded_and_fail_closed() {
         // A transient first-cleave miss gets two retries.
-        assert!(shard_cleave_replication_retry_needed(1, 1, 3));
-        assert!(shard_cleave_replication_retry_needed(2, 1, 3));
+        assert!(shard_cleave_replication_retry_needed(false, true, 1, 2, 3));
+        assert!(shard_cleave_replication_retry_needed(false, true, 2, 2, 3));
         // The third failed attempt is final; do not loop forever or pretend
-        // that one durable copy satisfies a three-replica quorum.
-        assert!(!shard_cleave_replication_retry_needed(3, 1, 3));
-        assert!(shard_cleave_replication_holds(true, 1, 3));
+        // that a partial acceptor set is safe after donor completion.
+        assert!(!shard_cleave_replication_retry_needed(false, true, 3, 2, 3));
+        assert!(shard_cleave_replication_holds(false, true, 2, 3));
+        // First cleave still follows Python's quorum rather than all replicas.
+        assert!(shard_cleave_replication_retry_needed(true, false, 1, 1, 3));
+        assert!(!shard_cleave_replication_retry_needed(true, false, 1, 2, 3));
         // Reaching quorum immediately suppresses retries.
-        assert!(!shard_cleave_replication_retry_needed(1, 2, 3));
+        assert!(!shard_cleave_replication_retry_needed(false, true, 1, 3, 3));
         // The no-ring local test path never needs a network retry.
-        assert!(!shard_cleave_replication_retry_needed(1, 0, 0));
+        assert!(!shard_cleave_replication_retry_needed(true, false, 1, 0, 0));
+        assert!(!shard_cleave_replication_retry_needed(false, true, 1, 0, 0));
     }
 
 
