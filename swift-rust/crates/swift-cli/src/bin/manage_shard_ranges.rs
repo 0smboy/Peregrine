@@ -24,7 +24,7 @@
 //! `repair` (gaps/overlaps report + optional `--force` apply).
 //!
 //! **Still deferred:** interactive prompts (use `--force` / `--yes`), full
-//! Python path-ranking repair (parent/child age filters, multi-path rank),
+//! Python path-ranking repair (age filters, multi-path rank),
 //! full shrink/expand object migration by the sharder after compact marks
 //! donors (lab marks SHRINKING; daemon residual).
 //!
@@ -37,8 +37,8 @@ use std::process;
 
 use swift_core::timestamp::Timestamp;
 use swift_db::{
-    find_namespace_gaps, find_overlapping_ranges, make_shard_name, shard_state,
-    shards_account_name, ContainerBroker, DbState, GetShardRangesArgs, ShardRange,
+    find_namespace_gaps, find_overlapping_ranges, hash_container_name, make_shard_name,
+    shard_state, shards_account_name, ContainerBroker, DbState, GetShardRangesArgs, ShardRange,
 };
 
 const EXIT_OK: i32 = 0;
@@ -1157,6 +1157,53 @@ fn repair_gaps(broker: &mut ContainerBroker, ranges: &[ShardRange], force: bool)
     }
 }
 
+/// Parse the relationship-bearing parts of a Python `ShardName`.
+///
+/// Shard containers are named
+/// `<account>/<root>-<parent-md5>-<timestamp>-<index>`. Splitting from the
+/// right is required because a root container may itself contain `-`.
+fn parse_shard_name(name: &str) -> Option<(&str, &str)> {
+    let (_, container) = name.split_once('/')?;
+    let mut parts = container.rsplitn(4, '-');
+    parts.next()?.parse::<i64>().ok()?;
+    parts.next()?.parse::<Timestamp>().ok()?;
+    let parent_hash = parts.next()?;
+    let root = parts.next()?;
+    Some((root, parent_hash))
+}
+
+fn shard_container(name: &str) -> Option<&str> {
+    name.split_once('/').map(|(_, container)| container)
+}
+
+/// Python `ShardRange.is_child_of`, intentionally scoped to ranges in the
+/// same user-facing account (the shard-account prefix is configurable).
+fn is_child_of(child: &ShardRange, parent: &ShardRange) -> bool {
+    let Some((child_root, child_parent_hash)) = parse_shard_name(&child.name) else {
+        return false;
+    };
+    let Some(parent_container) = shard_container(&parent.name) else {
+        return false;
+    };
+    let parent_root = parse_shard_name(&parent.name)
+        .map(|(root, _)| root)
+        .unwrap_or(parent_container);
+    child_root == parent_root && child_parent_hash == hash_container_name(parent_container)
+}
+
+fn remove_parent_child_donors(
+    acceptors: &[ShardRange],
+    donors: &mut Vec<ShardRange>,
+) -> usize {
+    let before = donors.len();
+    donors.retain(|donor| {
+        !acceptors
+            .iter()
+            .any(|acceptor| is_child_of(acceptor, donor) || is_child_of(donor, acceptor))
+    });
+    before - donors.len()
+}
+
 fn repair_overlaps(broker: &mut ContainerBroker, ranges: &[ShardRange], force: bool) -> i32 {
     if ranges
         .iter()
@@ -1185,19 +1232,31 @@ fn repair_overlaps(broker: &mut ContainerBroker, ranges: &[ShardRange], force: b
         return EXIT_ERROR;
     }
     let acceptor_path = &ranked[0];
+    let acceptors = acceptor_path.clone();
     let acceptor_names: std::collections::HashSet<&str> =
         acceptor_path.iter().map(|sr| sr.name.as_str()).collect();
-    let donors: Vec<ShardRange> = ranges
+    let mut donors: Vec<ShardRange> = ranges
         .iter()
         .filter(|r| !acceptor_names.contains(r.name.as_str()))
         .cloned()
         .collect();
-    let acceptors = acceptor_path.clone();
     if donors.is_empty() {
         println!(
             "Found one complete sequence of {} shard ranges and no overlapping shard ranges.",
             acceptor_path.len()
         );
+        println!("No repairs necessary.");
+        return EXIT_OK;
+    }
+
+    let parent_child_donors = remove_parent_child_donors(&acceptors, &mut donors);
+    if parent_child_donors > 0 {
+        println!(
+            "{} donor shards ignored due to parent-child relationship checks",
+            parent_child_donors
+        );
+    }
+    if donors.is_empty() {
         println!("No repairs necessary.");
         return EXIT_OK;
     }
@@ -1571,6 +1630,46 @@ mod tests {
         assert_eq!(ranked[0].len(), 2);
         assert_eq!(ranked[0][0].name, ".shards_AUTH_test/c-alt0");
         assert_eq!(ranked[0][1].name, ".shards_AUTH_test/c-alt1");
+    }
+
+    #[test]
+    fn parent_child_donors_are_excluded_from_overlap_repair() {
+        let ts = "1751500010.00000";
+        let parent_name = make_shard_name(
+            ".shards_AUTH_test",
+            "root-with-dash",
+            "root-with-dash",
+            ts,
+            0,
+        );
+        let parent_container = shard_container(&parent_name).unwrap().to_string();
+        let child_name = make_shard_name(
+            ".shards_AUTH_test",
+            "root-with-dash",
+            &parent_container,
+            "1751500020.00000",
+            1,
+        );
+        let parent = ShardRange::new(&parent_name, ts, "", "m");
+        let child = ShardRange::new(&child_name, "1751500020.00000", "", "m");
+        let unrelated = ShardRange::new(
+            &make_shard_name(
+                ".shards_AUTH_test",
+                "root-with-dash",
+                "another-parent",
+                "1751500030.00000",
+                2,
+            ),
+            "1751500030.00000",
+            "",
+            "m",
+        );
+
+        assert!(is_child_of(&child, &parent));
+        assert!(!is_child_of(&unrelated, &parent));
+        let mut donors = vec![child, unrelated.clone()];
+        assert_eq!(remove_parent_child_donors(&[parent], &mut donors), 1);
+        assert_eq!(donors, vec![unrelated]);
     }
 
     #[test]
