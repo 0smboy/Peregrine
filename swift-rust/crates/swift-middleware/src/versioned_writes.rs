@@ -604,12 +604,6 @@ impl VersionedWrites {
             .get(CLIENT_VERSIONS_ENABLED)
             .map(config_true_value);
         let enabling = requested == Some(true);
-        let configured = cinfo
-            .headers
-            .get(SYSMETA_OBJECT_VERSIONS_CONTAINER)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-
         if enabling
             && cinfo
                 .headers
@@ -651,7 +645,11 @@ impl VersionedWrites {
             ));
         }
 
-        let hidden = configured.unwrap_or_else(|| modern_versions_container(container));
+        // Python Swift always derives the hidden container from the primary
+        // container name when enabling versioning.  Reusing the already
+        // quoted sysmeta value here would quote `%00` a second time on a
+        // re-enable and persist `%2500versions%2500...`.
+        let hidden = modern_versions_container(container);
         let hidden_path = format!("/{version}/{account}/{hidden}");
         let policy_index = cinfo
             .headers
@@ -671,7 +669,7 @@ impl VersionedWrites {
         &self,
         req: &mut Request,
         source_sync_configured: bool,
-        configured: Option<String>,
+        _configured: Option<String>,
         legacy_configured: bool,
         policy_index: Option<String>,
         version: &str,
@@ -710,7 +708,11 @@ impl VersionedWrites {
             ));
         }
 
-        let hidden = configured.unwrap_or_else(|| modern_versions_container(container));
+        // See the synchronous path above: the configured value came from a
+        // response header and is percent-quoted.  Enabling is deterministic,
+        // so rebuild the reserved name from the primary container instead of
+        // double-quoting old sysmeta on re-enable.
+        let hidden = modern_versions_container(container);
         let hidden_path = format!("/{version}/{account}/{hidden}");
         let create = hidden_container_put(&hidden_path, policy_index.as_deref());
         let created = next(create).await;
@@ -2466,6 +2468,94 @@ mod tests {
                 .any(|(method, path)| { method == "PUT" && path == "/v1/AUTH_test/\0versions\0c" }),
             "{calls:?}"
         );
+    }
+
+    #[test]
+    fn test_modern_object_versioning_reenable_does_not_double_quote_hidden_container() {
+        let call_count = Arc::new(AtomicU64::new(0));
+        let call_count2 = Arc::clone(&call_count);
+        let app: NextFn = Arc::new(move |r: Request| {
+            match call_count2.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    assert_eq!(r.method, "HEAD");
+                    let mut resp = Response::new(204);
+                    resp.headers
+                        .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
+                    resp
+                }
+                1 => {
+                    assert_eq!(r.method, "PUT");
+                    assert_eq!(r.path, "/v1/AUTH_test/\0versions\0c");
+                    Response::new(201)
+                }
+                2 => {
+                    assert_eq!(r.method, "POST");
+                    assert_eq!(
+                        r.headers.get(SYSMETA_OBJECT_VERSIONS_CONTAINER),
+                        Some("%00versions%00c")
+                    );
+                    let mut resp = Response::new(204);
+                    resp.headers
+                        .set(SYSMETA_OBJECT_VERSIONS_ENABLED, "True");
+                    resp.headers
+                        .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
+                    resp
+                }
+                n => panic!("unexpected re-enable subrequest {n}"),
+            }
+        });
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let mut request = req("POST", "/v1/AUTH_test/c");
+        request.headers.set(CLIENT_VERSIONS_ENABLED, "true");
+        let resp = vw.handle(request, &app);
+        assert_eq!(resp.status, 204);
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_modern_object_versioning_async_reenable_does_not_double_quote_hidden_container()
+    {
+        let call_count = Arc::new(AtomicU64::new(0));
+        let call_count2 = Arc::clone(&call_count);
+        let next: AsyncNextFn = Arc::new(move |r: Request| {
+            let call_count = Arc::clone(&call_count2);
+            Box::pin(async move {
+                match call_count.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        assert_eq!(r.method, "HEAD");
+                        let mut resp = Response::new(204);
+                        resp.headers
+                            .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
+                        resp
+                    }
+                    1 => {
+                        assert_eq!(r.method, "PUT");
+                        assert_eq!(r.path, "/v1/AUTH_test/\0versions\0c");
+                        Response::new(201)
+                    }
+                    2 => {
+                        assert_eq!(r.method, "POST");
+                        assert_eq!(
+                            r.headers.get(SYSMETA_OBJECT_VERSIONS_CONTAINER),
+                            Some("%00versions%00c")
+                        );
+                        let mut resp = Response::new(204);
+                        resp.headers
+                            .set(SYSMETA_OBJECT_VERSIONS_ENABLED, "True");
+                        resp.headers
+                            .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
+                        resp
+                    }
+                    n => panic!("unexpected async re-enable subrequest {n}"),
+                }
+            })
+        });
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let mut request = req("POST", "/v1/AUTH_test/c");
+        request.headers.set(CLIENT_VERSIONS_ENABLED, "true");
+        let resp = vw.handle_request_async(request, next).await;
+        assert_eq!(resp.status, 204);
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
     }
 
     #[test]
