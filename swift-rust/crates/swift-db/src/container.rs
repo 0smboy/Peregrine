@@ -579,15 +579,11 @@ impl ContainerBroker {
             .map(|t| t.normal());
         let db_epoch_normal = db_epoch.parse::<Timestamp>().ok().map(|t| t.normal());
         if db_epoch_normal != own_epoch_normal {
-            // A newer-timestamp merge can drop own.epoch onto an epoch file
-            // while compacting the final shrinking donor into the root.  The
-            // filename remains authoritative once own is an acceptor; a
-            // cleaving own must still report Unsharded so the first cleave can
-            // establish the matching epoch.
-            let acceptor = !crate::shard::CLEAVING_STATES.contains(&own.state);
-            if !(acceptor && own_epoch_normal.is_none() && db_epoch_normal.is_some()) {
-                return Ok(DbState::Unsharded);
-            }
+            // Python ContainerBroker.get_db_state is strict here: an epoch
+            // filename is not enough to prove that this own shard range owns
+            // that epoch.  Rust-specific merge paths preserve a valid existing
+            // epoch instead of weakening this state invariant.
+            return Ok(DbState::Unsharded);
         }
         if !self.has_other_shard_ranges()? {
             return Ok(DbState::Collapsed);
@@ -2173,6 +2169,32 @@ mod tests {
         let kept = root.get_own_shard_range(true).unwrap().unwrap();
         assert_eq!(kept.epoch.as_deref(), Some(epoch));
         assert_eq!(root.get_db_state().unwrap(), DbState::Collapsed);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_get_db_state_epoch_mismatch_is_unsharded_for_acceptor() {
+        // Match Python ContainerBroker.get_db_state exactly.  An ACTIVE own
+        // without an epoch must not let an epoch filename manufacture a
+        // Collapsed/Sharded state; replication depends on this distinction.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-db-epoch-mismatch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let unsuffixed = dir.join("hash.db");
+        let epoch = "1751500010.00000";
+        let epoch_path = make_db_file_path(&unsuffixed, Some(epoch)).unwrap();
+        let mut broker = ContainerBroker::new(&epoch_path, "AUTH_test", "c");
+        broker
+            .initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        let mut own = broker.get_own_shard_range(false).unwrap().unwrap();
+        own.state = crate::shard::state::ACTIVE;
+        own.epoch = None;
+        broker.merge_shard_ranges(vec![own]).unwrap();
+        assert_eq!(broker.get_db_state().unwrap(), DbState::Unsharded);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
