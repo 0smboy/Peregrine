@@ -765,14 +765,22 @@ pub fn replicate_container_db(
     )
 }
 
-fn peer_supports_shard_ranges(remote_info: &serde_json::Value, remote_state: &str) -> bool {
-    // Python `_choose_replication_mode` treats the presence of
-    // `shard_max_row` as the capability signal, including -1 on a fresh
-    // unsharded peer. Requiring a non-negative value suppresses the initial
-    // shard-range push to an empty new primary.
+fn peer_supports_shard_range_push(remote_info: &serde_json::Value) -> bool {
+    // Python `_choose_replication_mode` uses field presence as the capability
+    // signal, including `-1` on a fresh peer: we may push our ranges to it.
     remote_info.get("shard_max_row").is_some()
-        || remote_state == "sharding"
-        || remote_state == "sharded"
+}
+
+fn peer_has_shard_ranges_to_fetch(remote_info: &serde_json::Value) -> bool {
+    // Python `_handle_sync_response` deliberately uses a stricter predicate:
+    // only fetch when the peer reports a non-negative shard high-water mark.
+    // Fetching from a fresh `-1` peer can merge its own range into a primary,
+    // make `sharding_initiated()` spuriously true, and suppress object usync.
+    remote_info
+        .get("shard_max_row")
+        .and_then(json_i64)
+        .map(|max_row| max_row >= 0)
+        .unwrap_or(false)
 }
 
 /// Python defers object replication only after this broker has initiated
@@ -904,20 +912,23 @@ pub fn replicate_container_db_role(
     }
     point = new_point;
 
-    // Python `_handle_sync_response`: the presence of `shard_max_row`
-    // advertises shard-range support, including -1 on a fresh peer. Also
-    // synchronize when the peer is already sharding/sharded (probe L2321:
-    // third replica must copy ranges, not object rows).
+    // Python has two distinct gates here. `_handle_sync_response` fetches
+    // remote ranges only when `shard_max_row >= 0`; `_choose_replication_mode`
+    // pushes local ranges whenever that field is present, including `-1` on a
+    // fresh peer. Collapsing these predicates mutates a primary with the fresh
+    // peer's own range before `sharding_initiated()` is evaluated.
     let remote_state = remote_info
         .get("db_state")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if peer_supports_shard_ranges(&remote_info, remote_state) {
+    if peer_has_shard_ranges_to_fetch(&remote_info) {
         if let Err(e) =
             fetch_and_merge_remote_shard_ranges(local, peer_host, peer_device, partition, hsh)
         {
             eprintln!("db-replicator: fetch shard ranges hsh={hsh} err={e}");
         }
+    }
+    if peer_supports_shard_range_push(&remote_info) {
         if let Err(e) =
             sync_shard_ranges_to_peer(local, local_id, peer_host, peer_device, partition, hsh)
         {
@@ -1281,17 +1292,18 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
-    fn fresh_peer_with_negative_shard_max_row_supports_shard_ranges() {
+    fn shard_range_fetch_and_push_gates_match_python() {
         let fresh = serde_json::json!({"shard_max_row": -1});
-        assert!(peer_supports_shard_ranges(&fresh, "unsharded"));
-        assert!(peer_supports_shard_ranges(
-            &serde_json::json!({}),
-            "sharding"
-        ));
-        assert!(!peer_supports_shard_ranges(
-            &serde_json::json!({}),
-            "unsharded"
-        ));
+        assert!(peer_supports_shard_range_push(&fresh));
+        assert!(!peer_has_shard_ranges_to_fetch(&fresh));
+
+        let populated = serde_json::json!({"shard_max_row": 0});
+        assert!(peer_supports_shard_range_push(&populated));
+        assert!(peer_has_shard_ranges_to_fetch(&populated));
+
+        let old_peer = serde_json::json!({"db_state": "sharding"});
+        assert!(!peer_supports_shard_range_push(&old_peer));
+        assert!(!peer_has_shard_ranges_to_fetch(&old_peer));
     }
 
     struct FakeRsync {
