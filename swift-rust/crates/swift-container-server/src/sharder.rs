@@ -2141,7 +2141,7 @@ fn merge_shard_ranges_from_root(
     for sr in fetched {
         if sr.name == own.name {
             continue;
-        } else if own.includes_range(sr) {
+        } else if shard_range_is_child_of(sr, &own) {
             children.push(sr.clone());
         } else {
             others.push(sr.clone());
@@ -7668,9 +7668,12 @@ mod tests {
         // plus three sub-shards. Audit merge must land all of that.
         let dir = std::env::temp_dir().join(format!("swift-sharder-audit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut shard = container_broker(&dir, "c-0", 0);
         let ts = "1751500010.00000";
-        let mut own = ShardRange::new("AUTH_test/c-0", ts, "", "m");
+        let own_name = make_shard_name(".shards_AUTH_test", "rootc", "rootc", ts, 0);
+        let own_container = shard_container_name(&own_name).unwrap();
+        let mut shard =
+            container_broker_with_account(&dir, ".shards_AUTH_test", own_container, 0);
+        let mut own = ShardRange::new(&own_name, ts, "", "m");
         own.state = shard_state::ACTIVE;
         own.object_count = 150;
         ensure_shard_root_sysmeta(&mut shard, "AUTH_test", "rootc", &own);
@@ -7683,11 +7686,32 @@ mod tests {
         from_root.state = shard_state::SHARDING;
         from_root.state_timestamp = "1751500099.00000".into();
         from_root.epoch = Some("1751500099.00000".into());
-        let mut c0 = ShardRange::new(".shards_AUTH_test/c-0-0", ts, "", "g");
+        let c0_name = make_shard_name(
+            ".shards_AUTH_test",
+            "rootc",
+            own_container,
+            "1751500020.00000",
+            0,
+        );
+        let mut c0 = ShardRange::new(&c0_name, ts, "", "g");
         c0.state = shard_state::CLEAVED;
-        let mut c1 = ShardRange::new(".shards_AUTH_test/c-0-1", ts, "g", "m");
+        let c1_name = make_shard_name(
+            ".shards_AUTH_test",
+            "rootc",
+            own_container,
+            "1751500020.00000",
+            1,
+        );
+        let mut c1 = ShardRange::new(&c1_name, ts, "g", "m");
         c1.state = shard_state::CLEAVED;
-        let mut sibling = ShardRange::new(".shards_AUTH_test/c-1", ts, "m", "");
+        let sibling_name = make_shard_name(
+            ".shards_AUTH_test",
+            "rootc",
+            "rootc",
+            "1751500030.00000",
+            1,
+        );
+        let mut sibling = ShardRange::new(&sibling_name, ts, "m", "");
         sibling.state = shard_state::ACTIVE;
         merge_shard_ranges_from_root(&mut shard, &[from_root, c0, c1, sibling], &own);
         let got_own = shard.get_own_shard_range(true).unwrap().unwrap();
@@ -7696,10 +7720,10 @@ mod tests {
             .get_shard_ranges(&GetShardRangesArgs::default())
             .unwrap();
         let names: Vec<_> = others.iter().map(|r| r.name.as_str()).collect();
-        assert!(names.contains(&".shards_AUTH_test/c-0-0"), "{names:?}");
-        assert!(names.contains(&".shards_AUTH_test/c-0-1"), "{names:?}");
+        assert!(names.contains(&c0_name.as_str()), "{names:?}");
+        assert!(names.contains(&c1_name.as_str()), "{names:?}");
         assert!(
-            !names.contains(&".shards_AUTH_test/c-1"),
+            !names.contains(&sibling_name.as_str()),
             "sibling must not merge into this shard: {names:?}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -7767,7 +7791,9 @@ mod tests {
         let own_container = shard_container_name(&own_name).unwrap();
         let mut shard =
             container_broker_with_account(&dir, ".shards_AUTH_test", own_container, 0);
-        let mut own = ShardRange::new(&own_name, ts, "c", "g");
+        // The first post-shrink acceptor expands to the whole namespace. A
+        // bounds-based child check therefore misclassifies the root itself.
+        let mut own = ShardRange::new(&own_name, ts, "", "");
         own.state = shard_state::ACTIVE;
         ensure_shard_root_sysmeta(&mut shard, "AUTH_test", "rootc", &own);
 
@@ -7819,7 +7845,7 @@ mod tests {
         let own_container = shard_container_name(&own_name).unwrap();
         let mut shard =
             container_broker_with_account(&dir, ".shards_AUTH_test", own_container, 0);
-        let mut own = ShardRange::new(&own_name, ts, "c", "g");
+        let mut own = ShardRange::new(&own_name, ts, "", "");
         own.state = shard_state::ACTIVE;
         ensure_shard_root_sysmeta(&mut shard, "AUTH_test", "rootc", &own);
 
