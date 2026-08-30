@@ -6757,9 +6757,9 @@ mod tests {
     #[test]
     fn test_maybe_start_sharding_preserves_collapsed_root_without_siblings() {
         // Probe L2088 after the last donor is SHRUNK: no other ranges,
-        // epoch file, own.epoch wiped, object_count 1. get_db_state already
-        // recognizes the collapsed root; maybe_start_sharding must not restart
-        // it or create another epoch.
+        // epoch file, own.epoch wiped, object_count 1. Strict get_db_state
+        // reports Unsharded until maybe_start_sharding restores the filename
+        // epoch; that repair must not restart cleaving or create another DB.
         let hash_config = HashPathConfig::new("", "changeme").unwrap();
         let dir = std::env::temp_dir().join(format!(
             "swift-s2r-heal-collapsed-{}",
@@ -6797,7 +6797,7 @@ mod tests {
         own.epoch = None;
         own.state = shard_state::ACTIVE;
         root.merge_shard_ranges(vec![own]).unwrap();
-        assert_eq!(root.get_db_state().unwrap(), DbState::Collapsed);
+        assert_eq!(root.get_db_state().unwrap(), DbState::Unsharded);
 
         let opts = SharderRunOpts {
             cleave_batch_size: 10,
@@ -6820,8 +6820,8 @@ mod tests {
     #[test]
     fn test_maybe_start_sharding_restores_wiped_own_epoch() {
         // Compactible/merge can persist own without epoch onto an epoch file.
-        // get_db_state() recognizes the sibling-backed root as Sharded; the
-        // repair still has to restore own.epoch from the DB filename.
+        // Strict get_db_state() reports Unsharded while own.epoch is absent;
+        // the repair restores it from the DB filename and recovers Sharded.
         let hash_config = HashPathConfig::new("", "changeme").unwrap();
         let dir = std::env::temp_dir().join(format!(
             "swift-s2r-heal-epoch-{}",
@@ -6861,7 +6861,7 @@ mod tests {
         let mut sibling = ShardRange::new(".shards_AUTH_test/c-1", epoch, "m", "");
         sibling.state = shard_state::ACTIVE;
         root.merge_shard_ranges(vec![own, sibling]).unwrap();
-        assert_eq!(root.get_db_state().unwrap(), DbState::Sharded);
+        assert_eq!(root.get_db_state().unwrap(), DbState::Unsharded);
 
         let opts = SharderRunOpts {
             cleave_batch_size: 10,
