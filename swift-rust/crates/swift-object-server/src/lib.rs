@@ -3776,10 +3776,18 @@ impl ObjectServer {
                         Ok(r) => r,
                         Err(resp) => return resp,
                     };
-                    Body::from_reader(
-                        Box::new(reader.range_window(start, stop)),
-                        Some(stop - start),
-                    )
+                    // Python verifies a ranged read when it starts at zero
+                    // and reaches EOF. This is observably important for a
+                    // range that extends past the object: after normalisation
+                    // it is a complete read and must quarantine a bad ETag
+                    // before the next request. Partial ranges remain
+                    // unverified, matching BaseDiskFileReader.close().
+                    let reader: Box<dyn Read + Send> = if start == 0 && stop == obj_size {
+                        Box::new(reader.into_stream())
+                    } else {
+                        Box::new(reader.range_window(start, stop))
+                    };
+                    Body::from_reader(reader, Some(stop - start))
                 } else {
                     Body::empty()
                 };

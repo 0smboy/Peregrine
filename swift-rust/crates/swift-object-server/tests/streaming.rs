@@ -294,6 +294,45 @@ fn single_range_get_streams_the_window() {
 }
 
 #[test]
+fn full_covering_range_quarantines_bad_etag() {
+    use swift_diskfile::{
+        read_metadata, write_metadata, MetaValue, DEFAULT_XATTR_SIZE,
+    };
+
+    let devices = TestDevices::new("range-full-quarantine");
+    let server = server(devices.path());
+    let payload = b"RANGE".to_vec();
+    assert_eq!(
+        server
+            .handle(request("PUT", "1", payload.clone().into()))
+            .status,
+        201
+    );
+    let data_file = committed_data_file(devices.path());
+    let mut metadata = read_metadata(&data_file).unwrap();
+    let (_, etag) = metadata
+        .iter_mut()
+        .find(|(key, _)| matches!(key, MetaValue::Str(name) if name == "ETag"))
+        .expect("stored object ETag metadata");
+    *etag = MetaValue::Str("badetag".into());
+    write_metadata(&data_file, &metadata, DEFAULT_XATTR_SIZE).unwrap();
+
+    // The requested end extends past EOF, so the normalized range covers the
+    // complete object. Swift serves the bytes as 206 and quarantines at the
+    // stream boundary; a following request must already observe the 404.
+    let mut req = request("GET", "1", Body::empty());
+    req.headers.set("Range", "bytes=0-11");
+    let mut resp = server.handle(req);
+    assert_eq!(resp.status, 206);
+    assert_eq!(resp.body.materialize(u64::MAX).unwrap(), payload);
+    assert!(
+        !data_file.exists(),
+        "full-covering range left a bad ETag object readable"
+    );
+    assert_eq!(server.handle(request("GET", "1", Body::empty())).status, 404);
+}
+
+#[test]
 fn unsatisfiable_range_preserves_object_content_type() {
     let devices = TestDevices::new("range416");
     let server = server(devices.path());
