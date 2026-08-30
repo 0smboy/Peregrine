@@ -430,6 +430,15 @@ fn ascii_header_name_byte(byte: u8) -> bool {
         )
 }
 
+/// Python Swift permits the reserved-name marker in `X-Symlink-Target` so a
+/// user may create a dynamic symlink that points at an internal reserved
+/// object. Keep this compatibility exception narrower than the generic HTTP
+/// field-value parser: NUL remains forbidden in every other request header,
+/// and CR/LF are always rejected.
+fn header_allows_reserved_nul(name: &str) -> bool {
+    name.eq_ignore_ascii_case("X-Symlink-Target")
+}
+
 /// Accept only Swift's metadata-name extension to HTTP field-name syntax.
 /// The prefix stays ASCII and the suffix must be valid UTF-8 with no control,
 /// whitespace, or colon characters. Other malformed field names remain
@@ -705,7 +714,9 @@ fn parse_swift_utf8_head(
             })?
         };
         let raw_value = trim_ascii_bytes(&line[colon + 1..]);
-        if raw_value.iter().any(|byte| matches!(byte, b'\0' | b'\r' | b'\n')) {
+        if raw_value.iter().any(|byte| matches!(byte, b'\r' | b'\n'))
+            || (raw_value.contains(&b'\0') && !header_allows_reserved_nul(name))
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "invalid header value",
@@ -1974,5 +1985,37 @@ mod tests {
             request_line_precondition(b"GET /info HTTP/1.1\r\n"),
             None
         );
+    }
+
+    #[test]
+    fn swift_utf8_head_allows_reserved_nul_only_in_symlink_target() {
+        let (_, _, _, headers) = parse_swift_utf8_head(
+            b"PUT /v1/AUTH_test/c/link HTTP/1.1\r\n\
+              X-Symlink-Target: \0reserved-container/\0reserved-object\r\n\
+              Content-Length: 0\r\n\r\n",
+            32,
+        )
+        .expect("reserved symlink target must reach Swift middleware");
+        assert_eq!(
+            headers.get("X-Symlink-Target"),
+            Some("\0reserved-container/\0reserved-object")
+        );
+
+        let ordinary_nul = parse_swift_utf8_head(
+            b"PUT /v1/AUTH_test/c/o HTTP/1.1\r\n\
+              X-Object-Meta-Unsafe: value\0suffix\r\n\r\n",
+            32,
+        );
+        assert_eq!(
+            ordinary_nul.unwrap_err().to_string(),
+            "invalid header value"
+        );
+
+        let symlink_cr = parse_swift_utf8_head(
+            b"PUT /v1/AUTH_test/c/link HTTP/1.1\r\n\
+              X-Symlink-Target: container/object\runsafe\r\n\r\n",
+            32,
+        );
+        assert_eq!(symlink_cr.unwrap_err().to_string(), "invalid header value");
     }
 }
