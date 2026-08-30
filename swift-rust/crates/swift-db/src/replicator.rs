@@ -186,18 +186,16 @@ pub fn usync_start_point(
     }
 }
 
-/// Tombstone rows must win over live rows on the peer. Bump `created_at`
-/// to now so merge_items cannot keep leftover objects (probe L1435).
+/// Preserve the row timestamp exactly during usync.
+///
+/// `created_at` is part of the container DB hash and may encode independent
+/// data/content-type/metadata timestamps. Re-stamping a tombstone on every
+/// send makes replicas diverge forever and violates Python's `_usync_db`,
+/// which forwards broker rows unchanged. A real delete already has a newer
+/// data timestamp than the object it deletes; synthetic tombstones get their
+/// timestamp once when they are constructed.
 fn usync_created_at(rec: &crate::ObjectRecord) -> String {
-    if rec.deleted != 1 {
-        return rec.created_at.clone();
-    }
-    let now = Timestamp::now().internal();
-    if rec.created_at.as_str() >= now.as_str() {
-        rec.created_at.clone()
-    } else {
-        now
-    }
+    rec.created_at.clone()
 }
 
 fn url_encode(s: &str) -> String {
@@ -1936,8 +1934,7 @@ mod tests {
             ctype_timestamp: None,
             meta_timestamp: None,
         };
-        let bumped = usync_created_at(&tomb);
-        assert!(bumped.as_str() > "1751500001.00000", "{bumped}");
+        assert_eq!(usync_created_at(&tomb), "1751500001.00000");
     }
 
     #[test]
