@@ -21,11 +21,10 @@
 //!
 //! Deliberate deviations from Python, tracked for the object-server
 //! milestone: no `O_TMPFILE`/`linkat` fast path (always mkstemp-style),
-//! no `fallocate`/free-space reserve check, no splice/zero-copy, no
-//! partition-power-increase relinking.
+//! no `fallocate`/free-space reserve check and no splice/zero-copy.
 
 use std::io::{Read, Write};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -42,6 +41,7 @@ use crate::metadata::{
 };
 use crate::naming::{make_ec_ondisk_filename, make_ondisk_filename, PolicyKind};
 use crate::ondisk::{get_ondisk_files, FragPref, OndiskFiles};
+use crate::relinker::partition_for_hash;
 
 /// System metadata keys owned by the `.data` file that a fast-POST can
 /// never change (`RESERVED_DATAFILE_META` + `DATAFILE_SYSTEM_META`).
@@ -146,6 +146,7 @@ pub struct DiskFile {
     frag_index: Option<i64>,
     frag_prefs: Option<Vec<FragPref>>,
     open_expired: bool,
+    next_part_power: Option<u32>,
     hash_config: Option<HashPathConfig>,
     cfg: DiskFileConfig,
     state: Option<OpenState>,
@@ -183,6 +184,7 @@ impl DiskFile {
             frag_index: None,
             frag_prefs: None,
             open_expired: false,
+            next_part_power: None,
             hash_config: Some(hash_config.clone()),
             cfg,
             state: None,
@@ -208,6 +210,7 @@ impl DiskFile {
             frag_index: None,
             frag_prefs: None,
             open_expired: false,
+            next_part_power: None,
             hash_config: Some(hash_config.clone()),
             cfg,
             state: None,
@@ -232,6 +235,16 @@ impl DiskFile {
 
     pub fn with_open_expired(mut self, open_expired: bool) -> Self {
         self.open_expired = open_expired;
+        self
+    }
+
+    /// Carry the object ring's `next_part_power` into every disk mutation.
+    /// During a partition-power increase Python Swift hard-links each newly
+    /// written data/meta/tombstone file into both the current and next
+    /// partition layouts so the object remains addressable across the ring
+    /// switch.
+    pub fn with_next_part_power(mut self, next_part_power: Option<u32>) -> Self {
+        self.next_part_power = next_part_power;
         self
     }
 
@@ -608,6 +621,9 @@ impl DiskFile {
         let (file, tmppath) = mkstemp(&self.tmpdir)?;
         Ok(DiskFileWriter {
             datadir: self.datadir.clone(),
+            next_datadir: self
+                .next_part_power
+                .and_then(|power| next_part_datadir(&self.datadir, power)),
             cfg: self.cfg.clone(),
             policy: self.policy,
             name,
@@ -709,12 +725,62 @@ fn mkstemp(dir: &Path) -> Result<(std::fs::File, PathBuf), DiskFileError> {
     )))
 }
 
+/// Return the hash directory for the same object at `next_part_power`.
+/// `datadir` has the stable Swift layout
+/// `<devices>/<device>/objects[-N]/<part>/<suffix>/<hash>`.
+fn next_part_datadir(datadir: &Path, next_part_power: u32) -> Option<PathBuf> {
+    let hash = datadir.file_name()?.to_str()?;
+    let suffix = datadir.parent()?.file_name()?;
+    let data_dir = datadir.parent()?.parent()?.parent()?;
+    let next_part = partition_for_hash(hash, next_part_power)?;
+    let next = data_dir.join(next_part.to_string()).join(suffix).join(hash);
+    (next != datadir).then_some(next)
+}
+
+/// Python `relink_paths`: create the next-layout hard link, accepting an
+/// existing destination only when it is already the same inode. The original
+/// durable path remains authoritative if this best-effort compatibility link
+/// fails, matching Python's object-server write semantics.
+fn relink_next_path(
+    target_path: &Path,
+    next_datadir: Option<&Path>,
+    fsync: bool,
+) -> Result<(), DiskFileError> {
+    let Some(next_datadir) = next_datadir else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(next_datadir)?;
+    let filename = target_path
+        .file_name()
+        .ok_or_else(|| DiskFileError::InvalidFilename("target has no filename".into()))?;
+    let next_target = next_datadir.join(filename);
+    match std::fs::hard_link(target_path, &next_target) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let source = std::fs::metadata(target_path)?;
+            let destination = std::fs::metadata(&next_target)?;
+            if source.dev() != destination.dev() || source.ino() != destination.ino() {
+                return Err(DiskFileError::Io(error));
+            }
+        }
+        Err(error) => return Err(DiskFileError::Io(error)),
+    }
+    if let Some(suffix_dir) = next_datadir.parent() {
+        invalidate_hash(suffix_dir)?;
+    }
+    if fsync {
+        std::fs::File::open(next_datadir)?.sync_all()?;
+    }
+    Ok(())
+}
+
 /// The Rust `BaseDiskFileWriter` (+ repl/EC `put`/`commit` overrides).
 ///
 /// Owned (`'static`, `Send`) so a finite `write` can run on
 /// [`swift_runtime::StorageExecutor`] without borrowing the HTTP task.
 pub struct DiskFileWriter {
     datadir: PathBuf,
+    next_datadir: Option<PathBuf>,
     cfg: DiskFileConfig,
     policy: PolicyKind,
     name: String,
@@ -769,6 +835,7 @@ impl DiskFileWriter {
             file,
             tmppath,
             datadir: self.datadir.clone(),
+            next_datadir: self.next_datadir.clone(),
             name: self.name.clone(),
             extension: self.extension.clone(),
             fsync_on_close: self.cfg.fsync_on_close,
@@ -870,9 +937,22 @@ impl DiskFileWriter {
         }
         let tmppath = self.tmppath.as_ref().unwrap();
         renamer(tmppath, &target_path, self.cfg.fsync_on_close)?;
+        if let Err(error) = relink_next_path(
+            &target_path,
+            self.next_datadir.as_deref(),
+            self.cfg.fsync_on_close,
+        ) {
+            eprintln!(
+                "diskfile: partition-power relink {} failed: {error}",
+                target_path.display()
+            );
+        }
         self.put_succeeded = true;
         if cleanup {
             let _ = cleanup_ondisk_files(&self.datadir, self.policy, &self.cfg.cleanup);
+            if let Some(next_datadir) = &self.next_datadir {
+                let _ = cleanup_ondisk_files(next_datadir, self.policy, &self.cfg.cleanup);
+            }
         }
         Ok(())
     }
@@ -895,7 +975,20 @@ impl DiskFileWriter {
         match std::fs::rename(&data_file_path, &durable_data_file_path) {
             Ok(()) => {
                 std::fs::File::open(&self.datadir)?.sync_all()?;
+                if let Some(next_datadir) = &self.next_datadir {
+                    let next_data =
+                        next_datadir.join(make_ec_ondisk_filename(timestamp, fi, false)?);
+                    let next_durable =
+                        next_datadir.join(make_ec_ondisk_filename(timestamp, fi, true)?);
+                    if next_data.exists() {
+                        std::fs::rename(&next_data, &next_durable)?;
+                        std::fs::File::open(next_datadir)?.sync_all()?;
+                    }
+                }
                 let _ = cleanup_ondisk_files(&self.datadir, self.policy, &self.cfg.cleanup);
+                if let Some(next_datadir) = &self.next_datadir {
+                    let _ = cleanup_ondisk_files(next_datadir, self.policy, &self.cfg.cleanup);
+                }
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -954,6 +1047,7 @@ pub struct DurablePut {
     file: std::fs::File,
     tmppath: PathBuf,
     datadir: PathBuf,
+    next_datadir: Option<PathBuf>,
     name: String,
     extension: String,
     fsync_on_close: bool,
@@ -1003,7 +1097,9 @@ impl DurablePut {
             // durable EC name (`ts#N#d.data`) in one step. The two-phase
             // writer path still uses put() (`ts#N.data`) then commit().
             Some(fi) => make_ec_ondisk_filename(&timestamp, fi, make_durable)?,
-            None => make_ondisk_filename(&timestamp, Some(&self.extension), ctype_timestamp.as_ref()),
+            None => {
+                make_ondisk_filename(&timestamp, Some(&self.extension), ctype_timestamp.as_ref())
+            }
         };
         meta_set(&mut metadata, "name", MetaValue::Str(self.name.clone()));
         let target_path = self.datadir.join(&filename);
@@ -1015,12 +1111,25 @@ impl DurablePut {
             invalidate_hash(suffix_dir)?;
         }
         renamer(&self.tmppath, &target_path, self.fsync_on_close)?;
+        if let Err(error) = relink_next_path(
+            &target_path,
+            self.next_datadir.as_deref(),
+            self.fsync_on_close,
+        ) {
+            eprintln!(
+                "diskfile: partition-power relink {} failed: {error}",
+                target_path.display()
+            );
+        }
         self.committed = true;
         // A non-durable fragment must remain alongside the older durable set;
         // cleanup here would discard precisely the state the reconstructor is
         // meant to observe and propagate.
         if make_durable {
             let _ = cleanup_ondisk_files(&self.datadir, self.policy, &self.cleanup);
+            if let Some(next_datadir) = &self.next_datadir {
+                let _ = cleanup_ondisk_files(next_datadir, self.policy, &self.cleanup);
+            }
         }
         Ok(())
     }
@@ -1214,5 +1323,45 @@ impl Read for DiskFileRangeReader {
         let n = self.fp.read_at(&mut buf[..cap], self.pos)?;
         self.pos += n as u64;
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod part_power_tests {
+    use super::*;
+
+    #[test]
+    fn next_part_power_relinks_same_inode() {
+        let root = std::env::temp_dir().join(format!(
+            "swift-ppi-write-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let hash = "ffffffff00000000000000000000aabc";
+        let datadir = root
+            .join("sdb1")
+            .join("objects")
+            .join("0")
+            .join("abc")
+            .join(hash);
+        std::fs::create_dir_all(&datadir).unwrap();
+        let current = datadir.join("1751500000.00000.data");
+        std::fs::write(&current, b"partition-power").unwrap();
+
+        let next = next_part_datadir(&datadir, 7).expect("next partition differs");
+        relink_next_path(&current, Some(&next), false).unwrap();
+        let linked = next.join(current.file_name().unwrap());
+        assert_eq!(std::fs::read(&linked).unwrap(), b"partition-power");
+        let current_stat = std::fs::metadata(&current).unwrap();
+        let linked_stat = std::fs::metadata(&linked).unwrap();
+        assert_eq!(current_stat.dev(), linked_stat.dev());
+        assert_eq!(current_stat.ino(), linked_stat.ino());
+
+        // The same write/relink retry is idempotent only for that inode.
+        relink_next_path(&current, Some(&next), false).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

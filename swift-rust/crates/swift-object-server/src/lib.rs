@@ -1244,6 +1244,15 @@ fn fallocate_reserve_breached(free: u64, size: u64, reserve: &FallocateReserve) 
     }
 }
 
+/// The proxy stamps the object ring's pending partition power on every
+/// backend object request.  DiskFile consumes it only for mutations, where
+/// Python Swift keeps the current and next layouts linked to the same inode.
+fn backend_next_part_power(req: &Request) -> Option<u32> {
+    req.headers
+        .get("X-Backend-Next-Part-Power")
+        .and_then(|raw| raw.trim().parse().ok())
+}
+
 impl ObjectServer {
     pub fn new(config: ObjectServerConfig) -> Self {
         ObjectServer {
@@ -1644,7 +1653,7 @@ impl ObjectServer {
             &obj,
             (policy_index, policy),
         ) {
-            Ok(df) => df,
+            Ok(df) => df.with_next_part_power(backend_next_part_power(&req)),
             Err(e) => return plain_response(500, &e.to_string()),
         };
         let mut writer = match self
@@ -2768,7 +2777,7 @@ impl ObjectServer {
             &obj,
             (policy_index, policy),
         ) {
-            Ok(df) => df,
+            Ok(df) => df.with_next_part_power(backend_next_part_power(req)),
             Err(e) => return plain_response(500, &e.to_string()),
         };
 
@@ -3111,7 +3120,7 @@ impl ObjectServer {
             &obj,
             (policy_index, policy),
         ) {
-            Ok(df) => df,
+            Ok(df) => df.with_next_part_power(backend_next_part_power(req)),
             Err(e) => return plain_response(500, &e.to_string()),
         };
         // Python object-server POST constructs its DiskFile with
@@ -3606,7 +3615,7 @@ impl ObjectServer {
                 obj,
                 (policy_index, policy),
             ) {
-                Ok(df) => df,
+                Ok(df) => df.with_next_part_power(backend_next_part_power(req)),
                 Err(e) => return (plain_response(500, &e.to_string()), false),
             };
             if let Err(e) = fresh.delete(&req_timestamp) {

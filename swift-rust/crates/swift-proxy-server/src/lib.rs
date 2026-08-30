@@ -1470,6 +1470,15 @@ fn copy_backend_control_headers(req: &Request, headers: &mut HeaderKeyDict) {
     }
 }
 
+/// During a partition-power increase every object backend request carries the
+/// ring transition to the object server.  The storage layer uses it for
+/// mutation dual-linking; read requests carry it for wire parity with Python.
+fn stamp_next_part_power(headers: &mut HeaderKeyDict, object_ring: &Ring) {
+    if let Some(next_part_power) = object_ring.next_part_power() {
+        headers.set("X-Backend-Next-Part-Power", next_part_power);
+    }
+}
+
 /// Preserve a trusted Swift-internal timestamp (including its offset) when
 /// generating object backend requests. Public pipelines remove or shunt the
 /// client form in gatekeeper; internal clients such as container-reconciler
@@ -3526,6 +3535,7 @@ impl ProxyApp {
         let put_ts = object_write_timestamp(req);
         base.set("X-Timestamp", put_ts.internal());
         base.set("X-Backend-Storage-Policy-Index", policy_index);
+        stamp_next_part_power(&mut base, object_ring);
         self.stamp_root_db_state(&account, &container, &mut base);
         base.set(
             "Content-Type",
@@ -5325,6 +5335,7 @@ impl ProxyApp {
                 // without this, non-default-policy objects 404 (the object
                 // server would default to policy 0's objects/ tree).
                 headers.set("X-Backend-Storage-Policy-Index", policy_index);
+                stamp_next_part_power(&mut headers, object_ring);
                 // Read headers the object server evaluates itself: Range (206
                 // slicing) and the conditional set. (The EC path deliberately
                 // does NOT forward Range — fragments must be fetched whole.)
@@ -5402,6 +5413,7 @@ impl ProxyApp {
                 // the GET note above) — an EC DELETE landing in objects/ would
                 // 404 and leave the fragments orphaned.
                 base.set("X-Backend-Storage-Policy-Index", policy_index);
+                stamp_next_part_power(&mut base, object_ring);
                 self.stamp_root_db_state(account, container, &mut base);
                 if req.method == "PUT" {
                     base.set(
@@ -5585,6 +5597,7 @@ impl ProxyApp {
         base.set("X-Timestamp", &ts);
         base.set("Content-Type", &content_type);
         base.set("X-Backend-Storage-Policy-Index", policy_index);
+        stamp_next_part_power(&mut base, object_ring);
         self.stamp_root_db_state(account, container, &mut base);
         let mut per_node = Vec::with_capacity(n);
         for i in 0..n {
@@ -5834,6 +5847,7 @@ impl ProxyApp {
         let is_head = req.method == "HEAD";
         let mut headers = self.backend_headers(req, false, "object");
         headers.set("X-Backend-Storage-Policy-Index", policy_index);
+        stamp_next_part_power(&mut headers, object_ring);
         self.forward_open_expired(req, &mut headers);
         let nodes = self.iter_nodes(object_ring, object_part);
 
@@ -8579,6 +8593,39 @@ mod policy_ring_tests {
         };
         let data = RingData::from_parts(vec![Some(dev)], 32, vec![vec![0]]);
         Ring::new(data, HashPathConfig::new("", "changeme").unwrap())
+    }
+
+    #[test]
+    fn object_backend_headers_carry_ring_next_part_power() {
+        let mut transitioning_data = RingData::from_parts(
+            vec![Some(RingDevice {
+                id: 1,
+                region: 1,
+                zone: 1,
+                ip: "10.0.0.1".into(),
+                port: 6200,
+                replication_ip: None,
+                replication_port: None,
+                device: "sda".into(),
+                weight: 1.0,
+                meta: String::new(),
+                extra: Default::default(),
+            })],
+            32,
+            vec![vec![0]],
+        );
+        transitioning_data.next_part_power = Some(7);
+        let transitioning = Ring::new(
+            transitioning_data,
+            HashPathConfig::new("", "changeme").unwrap(),
+        );
+        let mut headers = HeaderKeyDict::new();
+        stamp_next_part_power(&mut headers, &transitioning);
+        assert_eq!(headers.get("X-Backend-Next-Part-Power"), Some("7"));
+
+        let mut stable_headers = HeaderKeyDict::new();
+        stamp_next_part_power(&mut stable_headers, &ring(2));
+        assert!(!stable_headers.contains_key("X-Backend-Next-Part-Power"));
     }
 
     #[test]

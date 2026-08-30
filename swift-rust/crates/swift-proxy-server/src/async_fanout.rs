@@ -1235,6 +1235,7 @@ impl ProxyApp {
         );
         let mut headers = self.backend_headers(req, false, "object");
         headers.set("X-Backend-Storage-Policy-Index", policy_index);
+        super::stamp_next_part_power(&mut headers, object_ring);
         for h in [
             "Range",
             "If-Match",
@@ -1296,6 +1297,7 @@ impl ProxyApp {
             let is_head = req.method == "HEAD";
             let mut headers = self.backend_headers(req, false, "object");
             headers.set("X-Backend-Storage-Policy-Index", policy_index);
+            super::stamp_next_part_power(&mut headers, object_ring);
             // Never forward client Range or If-* to fragment archives: those
             // files are EC-sized and carry fragment etags, not the original
             // object. Range and conditionals are applied after decode against
@@ -1778,6 +1780,7 @@ impl ProxyApp {
         base.set("X-Timestamp", &ts);
         base.set("Content-Type", &content_type);
         base.set("X-Backend-Storage-Policy-Index", policy_index);
+        super::stamp_next_part_power(&mut base, object_ring);
         self.stamp_root_db_state(account, container, &mut base);
         let mut per_node = Vec::with_capacity(n);
         for i in 0..n {
@@ -2020,6 +2023,7 @@ impl ProxyApp {
         let mut base = self.backend_headers(req, true, "object");
         base.set("X-Timestamp", super::object_write_timestamp(req).internal());
         base.set("X-Backend-Storage-Policy-Index", policy_index);
+        super::stamp_next_part_power(&mut base, object_ring);
         self.stamp_root_db_state(account, container, &mut base);
         super::stamp_shard_container_path(
             &mut base,
@@ -3250,6 +3254,7 @@ impl ProxyApp {
         let mut base = self.backend_headers(req, true, "object");
         base.set("X-Timestamp", super::object_write_timestamp(req).internal());
         base.set("X-Backend-Storage-Policy-Index", policy_index);
+        super::stamp_next_part_power(&mut base, object_ring);
         self.stamp_root_db_state(account, container, &mut base);
         super::stamp_shard_container_path(
             &mut base,
