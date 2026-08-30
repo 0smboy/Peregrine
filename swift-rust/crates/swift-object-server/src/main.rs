@@ -18,14 +18,14 @@
 
 use std::sync::Arc;
 
-use swift_core::config::{config_fallocate_value, SwiftConfig};
+use swift_core::config::{config_fallocate_value, config_true_value, SwiftConfig};
 use swift_core::hashing::HashPathConfig;
 use swift_core::obslog::{LogLevel, Logger};
 use swift_core::statsd::StatsdClient;
 use swift_core::storage_policy::parse_storage_policies;
 use swift_diskfile::{DiskFileConfig, PolicyKind};
 use swift_object_server::servers_per_port::{
-    bind_acceptors, child_bind_port_from_env, default_swift_dir, effective_concurrency,
+    bind_acceptors_with_reuse, child_bind_port_from_env, default_swift_dir, effective_concurrency,
     listen_ports, maybe_supervise_port_workers, ConcurrencyInputs,
 };
 use swift_object_server::{
@@ -238,10 +238,8 @@ fn main() {
 
     // Children always bind one acceptor; REUSEPORT when spp>1 (siblings share port).
     let n_per_port = 1usize;
-    let reuse_port = matches!(
-        get("reuse_port", "false").to_lowercase().as_str(),
-        "true" | "1" | "yes" | "on" | "t" | "y"
-    ) || (servers_per_port > 1 && child_bind_port_from_env().is_some());
+    let reuse_port = config_true_value(&get("reuse_port", "false"))
+        || (servers_per_port > 1 && child_bind_port_from_env().is_some());
 
     // Child process: size the local pool as one acceptor; parent already exited.
     let eff_spp = if child_bind_port_from_env().is_some() {
@@ -270,13 +268,14 @@ fn main() {
         ..Default::default()
     };
 
-    let listeners = bind_acceptors(&bind_ip, &ports, n_per_port).unwrap_or_else(|e| {
-        logger.error(&format!(
-            "could not bind {bind_ip} ports={ports:?} n_per_port={n_per_port} \
+    let listeners = bind_acceptors_with_reuse(&bind_ip, &ports, n_per_port, reuse_port)
+        .unwrap_or_else(|e| {
+            logger.error(&format!(
+                "could not bind {bind_ip} ports={ports:?} n_per_port={n_per_port} \
              reuse_port={reuse_port}: {e}"
-        ));
-        std::process::exit(1);
-    });
+            ));
+            std::process::exit(1);
+        });
     for (i, lis) in listeners.iter().enumerate() {
         let addr = lis
             .local_addr()

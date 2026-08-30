@@ -1,0 +1,188 @@
+#!/bin/bash
+# Swift-manager-compatible overseer for Rust Swift service workers.
+#
+# Lifecycle contract:
+#   TERM/INT  stop all workers;
+#   HUP       detach one draining old worker and let Manager start a new parent;
+#   USR1      start a replacement under this parent, then drain the old worker;
+#   child USR1 drains in Rust and is replaced when it exits.
+set -euo pipefail
+
+export SWIFT_DIR=${SWIFT_DIR:-/etc/swift}
+export SWIFT_CONF=${SWIFT_CONF:-$SWIFT_DIR/swift.conf}
+
+name=$(basename "$0")
+overseer_env=${SWIFT_RUST_OVERSEER_ENV:-$SWIFT_DIR/swift-rust-overseer.env}
+if [[ -r "$overseer_env" ]]; then
+  # Root-owned deployment input; lets package and isolated-lab layouts share
+  # this exact overseer implementation without editing the script itself.
+  source "$overseer_env"
+fi
+bin_dir=${SWIFT_RUST_BIN_DIR:-/usr/local/bin}
+bin=$bin_dir/$name
+log_dir=${SWIFT_RUST_LOG_DIR:-/var/log/swift-rust}
+log=$log_dir/${name}.manager.log
+mkdir -p "$log_dir"
+
+if [[ ! -x "$bin" ]]; then
+  echo "missing $bin" >&2
+  exit 1
+fi
+
+run_once=0
+for arg in "$@"; do
+  if [[ "$arg" == "once" ]]; then
+    run_once=1
+  fi
+done
+
+if [[ "$run_once" == 1 ]]; then
+  status=0
+  "$bin" "$@" >>"$log" 2>&1 || status=$?
+  exit "$status"
+fi
+
+worker=""
+stopping=0
+conf=${1:-}
+
+worker_ready() {
+  local candidate=$1
+  local bind_ip=""
+  local bind_port=""
+
+  # In a seamless overlap the old worker already makes the port connectable,
+  # so first prove that the candidate survived its bind/startup path.
+  sleep 0.35
+  kill -0 "$candidate" 2>/dev/null || return 1
+
+  case "$name" in
+    swift-proxy-server|swift-account-server|swift-container-server|swift-object-server)
+      if [[ -n "$conf" && -f "$conf" ]]; then
+        bind_ip=$(awk -F= '/^[[:space:]]*bind_ip[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$conf")
+        bind_port=$(awk -F= '/^[[:space:]]*bind_port[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$conf")
+      fi
+      ;;
+  esac
+
+  if [[ -z "$bind_port" ]]; then
+    return 0
+  fi
+  local ip=${bind_ip:-127.0.0.1}
+  [[ "$ip" == "0.0.0.0" ]] && ip=127.0.0.1
+  for _ in $(seq 1 100); do
+    kill -0 "$candidate" 2>/dev/null || return 1
+    if bash -c "echo >/dev/tcp/${ip}/${bind_port}" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+spawn_worker() {
+  local candidate
+  "$bin" "$@" >>"$log" 2>&1 &
+  candidate=$!
+  if ! worker_ready "$candidate"; then
+    kill -TERM "$candidate" 2>/dev/null || true
+    wait "$candidate" 2>/dev/null || true
+    echo "overseer: $name candidate $candidate failed readiness" >>"$log"
+    return 1
+  fi
+  worker=$candidate
+  echo "overseer: $name active worker $worker" >>"$log"
+}
+
+stop_all() {
+  trap - TERM INT HUP USR1
+  stopping=1
+  local pid
+  local pids=()
+  while read -r pid; do
+    [[ -n "$pid" ]] && pids+=("$pid")
+  done < <(jobs -pr)
+  for pid in "${pids[@]}"; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for _ in $(seq 1 100); do
+    local live=0
+    for pid in "${pids[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        live=1
+      fi
+    done
+    [[ "$live" == 0 ]] && break
+    sleep 0.1
+  done
+  for pid in "${pids[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+  done
+  exit 0
+}
+
+old_reload() {
+  # Manager.reload() starts a new overseer only after this PID disappears.
+  # Leave the current worker reparented and draining its accepted connection.
+  trap - HUP
+  local old=$worker
+  worker=""
+  if [[ -n "$old" ]] && kill -0 "$old" 2>/dev/null; then
+    kill -TERM "$old" 2>/dev/null || true
+    disown "$old" 2>/dev/null || true
+    echo "overseer: $name old reload detached draining worker $old" >>"$log"
+  fi
+  exit 0
+}
+
+seamless_reload() {
+  local old=$worker
+  if [[ -z "$old" ]] || ! kill -0 "$old" 2>/dev/null; then
+    return
+  fi
+  if spawn_worker "$@"; then
+    local replacement=$worker
+    kill -TERM "$old" 2>/dev/null || true
+    echo "overseer: $name seamless old=$old new=$replacement" >>"$log"
+  else
+    worker=$old
+    echo "overseer: $name seamless replacement failed; keeping $old" >>"$log"
+  fi
+}
+
+trap stop_all TERM INT
+trap old_reload HUP
+trap 'seamless_reload "$@"' USR1
+
+spawn_worker "$@"
+
+# Manager.start waits for this pipe to close. Keep the overseer alive after
+# readiness, but move its own output onto the service log first.
+exec 1>>"$log"
+exec 2>>"$log"
+
+while [[ "$stopping" == 0 ]]; do
+  finished=""
+  status=0
+  if wait -n -p finished; then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ -z "${finished:-}" ]]; then
+    # A trap interrupted wait; the trap already updated worker state.
+    continue
+  fi
+  echo "overseer: $name reaped worker $finished status=$status"
+  if [[ "$finished" == "$worker" && "$stopping" == 0 ]]; then
+    worker=""
+    sleep 0.1
+    until spawn_worker "$@"; do
+      sleep 1
+    done
+    echo "overseer: $name respawned worker $worker"
+  fi
+done

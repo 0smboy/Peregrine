@@ -22,7 +22,7 @@
 //! Operational behavior: logs through syslog (stderr fallback) at `log_level`,
 //! emits statsd request metrics when `log_statsd_host` is set, exports one
 //! OTLP trace span per client request when `trace_endpoint` is set, drains
-//! and exits cleanly on SIGTERM/SIGINT, and hot-reloads any ring whose file
+//! and exits cleanly on SIGTERM/SIGINT/SIGUSR1, and hot-reloads any ring whose file
 //! mtime changes (checked every 15s) without restarting.
 
 use std::sync::{Arc, RwLock};
@@ -235,7 +235,8 @@ fn main() {
     // pool size remains `worker_threads` / ServerConfig inside each process.
     // This is OS prefork — not eventlet/greenlet concurrency.
     let process_workers = process_workers_from_conf(&conf);
-    let listener = std::net::TcpListener::bind(&bind).unwrap_or_else(|e| {
+    let reuse_port = config_true_value(&get("reuse_port", "false"));
+    let listener = swift_http::bind_listener(&bind, reuse_port).unwrap_or_else(|e| {
         logger.error(&format!("could not bind {bind}: {e}"));
         std::process::exit(1);
     });
@@ -269,7 +270,9 @@ fn main() {
             "swift-proxy-server process_workers={process_workers} (prefork workers)"
         ));
     }
-    logger.info(&format!("swift-proxy-server listening on {bind}"));
+    logger.info(&format!(
+        "swift-proxy-server listening on {bind} reuse_port={reuse_port}"
+    ));
 
     spawn_ring_reload_thread(builder, Arc::clone(&app), Arc::clone(&logger));
 

@@ -216,8 +216,20 @@ pub fn bind_acceptors(
     ports: &[u16],
     servers_per_port: usize,
 ) -> std::io::Result<Vec<std::net::TcpListener>> {
+    bind_acceptors_with_reuse(bind_ip, ports, servers_per_port, false)
+}
+
+/// Bind acceptors with an explicit reload overlap. `servers_per_port > 1`
+/// already requires `SO_REUSEPORT`; `force_reuse` extends the same socket
+/// contract to the old/new worker overlap during seamless reload.
+pub fn bind_acceptors_with_reuse(
+    bind_ip: &str,
+    ports: &[u16],
+    servers_per_port: usize,
+    force_reuse: bool,
+) -> std::io::Result<Vec<std::net::TcpListener>> {
     let n = servers_per_port.max(1);
-    let reuse = n > 1;
+    let reuse = force_reuse || n > 1;
     let mut out = Vec::with_capacity(ports.len().saturating_mul(n));
     for &port in ports {
         for _ in 0..n {
@@ -532,6 +544,17 @@ mod tests {
         drop(probe);
         let listeners = bind_acceptors("127.0.0.1", &[port], 2).expect("bind");
         assert_eq!(listeners.len(), 2);
+    }
+
+    #[test]
+    fn bind_acceptors_force_reuse_allows_reload_overlap() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let old = bind_acceptors_with_reuse("127.0.0.1", &[port], 1, true).expect("old");
+        let new = bind_acceptors_with_reuse("127.0.0.1", &[port], 1, true).expect("new");
+        assert_eq!(old.len(), 1);
+        assert_eq!(new.len(), 1);
     }
 
     #[test]

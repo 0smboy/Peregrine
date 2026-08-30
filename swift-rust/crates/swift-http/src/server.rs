@@ -448,16 +448,19 @@ extern "C" fn record_shutdown_signal(_signal: libc::c_int) {
     }
 }
 
-/// Register a SIGTERM + SIGINT handler that flips a shared shutdown flag,
-/// and return that flag. Give the same flag to [`ServerConfig::shutdown`]
-/// so the daemon finishes in-flight requests and exits cleanly on signal.
-/// Safe to call more than once; every call returns the same flag.
+/// Register the process-lifecycle signals that ask a Swift worker to stop
+/// accepting and drain in-flight requests. `SIGUSR1` is the Swift manager's
+/// child/seamless-reload signal; treating it as an immediate Unix default
+/// exit corrupts in-flight PUTs and leaves the overseer with no drain window.
+/// Give the returned flag to [`ServerConfig::shutdown`]. Safe to call more
+/// than once; every call returns the same flag.
 pub fn install_sigterm_flag() -> Arc<AtomicBool> {
     let flag = SIGNAL_SHUTDOWN_FLAG.get_or_init(|| Arc::new(AtomicBool::new(false)));
     let handler = record_shutdown_signal as extern "C" fn(libc::c_int);
     unsafe {
         libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
         libc::signal(libc::SIGINT, handler as libc::sighandler_t);
+        libc::signal(libc::SIGUSR1, handler as libc::sighandler_t);
     }
     Arc::clone(flag)
 }
