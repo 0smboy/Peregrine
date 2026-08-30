@@ -506,8 +506,17 @@ fn request_needs_swift_utf8_handoff(buf: &[u8]) -> bool {
         .skip(1)
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
         .take_while(|line| !line.is_empty())
-        .filter_map(|line| line.iter().position(|&byte| byte == b':').map(|pos| &line[..pos]))
-        .any(|name| swift_utf8_metadata_name(trim_ascii_bytes(name)).is_some())
+        .filter_map(|line| {
+            line.iter()
+                .position(|&byte| byte == b':')
+                .map(|pos| (&line[..pos], &line[pos + 1..]))
+        })
+        .any(|(name, value)| {
+            let name = trim_ascii_bytes(name);
+            swift_utf8_metadata_name(name).is_some()
+                || (name.eq_ignore_ascii_case(b"X-Symlink-Target")
+                    && trim_ascii_bytes(value).contains(&b'\0'))
+        })
 }
 
 fn fresh_trans_id() -> String {
@@ -1989,10 +1998,12 @@ mod tests {
 
     #[test]
     fn swift_utf8_head_allows_reserved_nul_only_in_symlink_target() {
-        let (_, _, _, headers) = parse_swift_utf8_head(
-            b"PUT /v1/AUTH_test/c/link HTTP/1.1\r\n\
+        let symlink_request = b"PUT /v1/AUTH_test/c/link HTTP/1.1\r\n\
               X-Symlink-Target: \0reserved-container/\0reserved-object\r\n\
-              Content-Length: 0\r\n\r\n",
+              Content-Length: 0\r\n\r\n";
+        assert!(request_needs_swift_utf8_handoff(symlink_request));
+        let (_, _, _, headers) = parse_swift_utf8_head(
+            symlink_request,
             32,
         )
         .expect("reserved symlink target must reach Swift middleware");
@@ -2006,6 +2017,10 @@ mod tests {
               X-Object-Meta-Unsafe: value\0suffix\r\n\r\n",
             32,
         );
+        assert!(!request_needs_swift_utf8_handoff(
+            b"PUT /v1/AUTH_test/c/o HTTP/1.1\r\n\
+              X-Object-Meta-Unsafe: value\0suffix\r\n\r\n"
+        ));
         assert_eq!(
             ordinary_nul.unwrap_err().to_string(),
             "invalid header value"
