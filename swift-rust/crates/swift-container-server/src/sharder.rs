@@ -4038,6 +4038,14 @@ pub fn move_misplaced_from_live(
     let dest_ranges = misplaced_dest_ranges(source, ring);
     let source_path = source.path();
     let root_path = root_account_container(source).map(|(acct, cont)| format!("{acct}/{cont}"));
+    // A live row that is still inside this broker's own updating namespace is
+    // not misplaced.  This matters during shrink-to-root: the root own range
+    // is ACTIVE before the final donor disappears, while a stale ACTIVE donor
+    // may still be present on one replica.  Routing by the stale child first
+    // sends the row back to the donor and recreates divergent shard replicas.
+    let own_updating_range = source.get_own_shard_range(true)?.filter(|own| {
+        own.deleted == 0 && is_shard_update_state(own.state)
+    });
     // Python fill_gaps appends the root own range (often SHARDED). That
     // range is a valid dest after shrink-to-root (probe L2798). Do not
     // synthesize an ACTIVE MIN-MAX fallback for uncovered names: a
@@ -4075,6 +4083,12 @@ pub fn move_misplaced_from_live(
     let mut moved = 0usize;
     for rec in records {
         let name = rec.name.clone();
+        if own_updating_range
+            .as_ref()
+            .is_some_and(|own| range_contains_object_name(own, &name))
+        {
+            continue;
+        }
         let owner_from_ranges = dest_ranges.iter().find(|r| {
             r.deleted == 0
                 && range_contains_object_name(r, &name)
@@ -9364,6 +9378,85 @@ mod tests {
                 .iter()
                 .any(|(n, d, e)| n == "alpha" && *d == 0 && e == "misplaced"),
             "acceptor must have live alpha, got {dest_names:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_move_misplaced_keeps_active_root_own_row_during_shrink_to_root() {
+        // Probe test_shrinking L2075: after the last donor moves alpha into
+        // the root, one root replica may still list that donor as ACTIVE.
+        // The root own ACTIVE range is authoritative for the row; sending it
+        // back to the stale donor produced replica counts [1, 0, 1].
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-shrink-root-own-row-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "rootc";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = device.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let unsuffixed = hd.join(format!("{hsh}.db"));
+        let epoch = "1751500010.00000";
+        let epoch_path = make_db_file_path(&unsuffixed, Some(epoch)).unwrap();
+        let mut root = ContainerBroker::new(&epoch_path, account, container);
+        root.initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+
+        let mut own = root.get_own_shard_range(false).unwrap().unwrap();
+        own.epoch = Some(epoch.into());
+        own.state = shard_state::ACTIVE;
+        own.timestamp = epoch.into();
+        own.state_timestamp = epoch.into();
+        let mut stale_donor = ShardRange::new(
+            ".shards_AUTH_test/rootc-stale",
+            epoch,
+            "",
+            "",
+        );
+        stale_donor.state = shard_state::ACTIVE;
+        root.merge_shard_ranges(vec![own, stale_donor.clone()])
+            .unwrap();
+        root.put_object(
+            "alpha-1",
+            "1751500020.00000",
+            1,
+            "text/plain",
+            "e",
+            0,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(root.get_db_state().unwrap(), DbState::Sharded);
+
+        let moved = move_misplaced_from_live(&mut root, &device, &hash_config, "0", None)
+            .unwrap();
+        assert_eq!(moved, 0, "ACTIVE root own range must keep alpha");
+        let root_names = root
+            .object_records_in_range("", "")
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.deleted == 0)
+            .map(|r| r.name)
+            .collect::<Vec<_>>();
+        assert_eq!(root_names, vec!["alpha-1".to_string()]);
+        let mut donor = local_shard_broker(&device, &hash_config, "0", &stale_donor.name);
+        assert!(
+            donor.object_records_in_range("", "").unwrap().is_empty(),
+            "stale donor must not regain alpha"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
