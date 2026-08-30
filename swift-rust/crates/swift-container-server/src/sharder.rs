@@ -75,7 +75,7 @@ use std::path::{Path, PathBuf};
 use swift_core::hashing::HashPathConfig;
 use swift_db::{
     db_locations, get_db_files, hash_container_name, make_db_file_path, make_shard_name,
-    parse_db_filename, remove_replicated_handoff_db,
+    merge_shards, parse_db_filename, remove_replicated_handoff_db,
     replicate_container_db, shard_state, shards_account_name, ContainerBroker, DbError, DbState,
     find_overlapping_ranges, GetShardRangesArgs, ObjectRecord, ShardRange,
 };
@@ -2113,6 +2113,88 @@ fn shard_range_root_name<'a>(
         .map(|candidate| candidate.name.as_str())
 }
 
+/// Python `combine_shard_ranges`: fold fetched rows over the broker's rows,
+/// retain the newest state for each name, then remove deleted ranges before
+/// validating namespace geometry.
+fn combine_newest_live_shard_ranges(
+    fetched: &[ShardRange],
+    existing: Vec<ShardRange>,
+) -> Vec<ShardRange> {
+    let mut by_name = std::collections::BTreeMap::new();
+    for range in existing {
+        by_name.insert(range.name.clone(), range);
+    }
+    for mut range in fetched.iter().cloned() {
+        let name = range.name.clone();
+        if merge_shards(&mut range, by_name.get(&name)) {
+            by_name.insert(name, range);
+        }
+    }
+    by_name
+        .into_values()
+        .filter(|range| range.deleted == 0)
+        .collect()
+}
+
+/// Equivalent to Python's overlap and `find_paths_with_gaps(..., own)` gate
+/// for the non-overlapping range sets accepted by a shard audit.
+fn ranges_form_complete_path_through_own(own: &ShardRange, ranges: &[ShardRange]) -> bool {
+    if !find_overlapping_ranges(ranges).is_empty() {
+        return false;
+    }
+    let mut relevant: Vec<&ShardRange> = ranges
+        .iter()
+        .filter(|range| range.overlaps(own) || range.includes_range(own))
+        .collect();
+    relevant.sort_by(|a, b| {
+        ShardRange::lower_cmp(&a.lower, &b.lower)
+            .then_with(|| ShardRange::upper_cmp(&a.upper, &b.upper))
+    });
+
+    let reaches_own_upper = |upper: &str| {
+        upper.is_empty() || (!own.upper.is_empty() && upper >= own.upper.as_str())
+    };
+    let mut cursor: Option<String> = None;
+    for range in relevant {
+        match cursor.as_deref() {
+            None => {
+                if ShardRange::lower_cmp(&range.lower, &own.lower)
+                    == std::cmp::Ordering::Greater
+                {
+                    return false;
+                }
+                // This range ends at or before the start of `own` and cannot
+                // begin the path. Empty upper is MAX, never before the start.
+                if !own.lower.is_empty()
+                    && !range.upper.is_empty()
+                    && range.upper <= own.lower
+                {
+                    continue;
+                }
+                if reaches_own_upper(&range.upper) {
+                    return true;
+                }
+                cursor = Some(range.upper.clone());
+            }
+            Some(current) => {
+                if current.is_empty() {
+                    return true;
+                }
+                if range.lower.as_str() > current {
+                    return false;
+                }
+                if range.upper.is_empty() || range.upper.as_str() > current {
+                    if reaches_own_upper(&range.upper) {
+                        return true;
+                    }
+                    cursor = Some(range.upper.clone());
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Python `_merge_shard_ranges_from_root` (probe L1245): own range by name
 /// plus namespace children. Newest-wins is `merge_shard_ranges`.
 fn merge_shard_ranges_from_root(
@@ -2156,7 +2238,7 @@ fn merge_shard_ranges_from_root(
         // the ACTIVE root, which is the explicit shrink-to-root case.
         let ancestor_names = shard_range_ancestor_names(&own, fetched);
         let root_name = shard_range_root_name(&own, fetched);
-        let mut acceptors = Vec::new();
+        let mut filtered_others = Vec::new();
         for sr in others {
             let active_root_acceptor = shrinking_own
                 && sr.state == shard_state::ACTIVE
@@ -2167,20 +2249,36 @@ fn merge_shard_ranges_from_root(
             if swift_db::CLEAVING_STATES.contains(&sr.state) && sr.deleted == 0 {
                 continue;
             }
-            // repair_root 0.* vs 1.*: a shrinking donor often straddles two
-            // acceptors. Python merges every overlapping non-cleaving other.
-            // Full-cover-only dropped both (W235 L3514: 5 ranges, expected 3).
-            let keep = if shrinking_own {
-                sr.overlaps(&own) || sr.includes_range(&own)
-            } else {
-                sr.includes_range(&own)
-            };
-            if keep {
-                acceptors.push(sr);
-            }
+            filtered_others.push(sr);
         }
-        if !acceptors.is_empty() {
-            let _ = broker.merge_shard_ranges(acceptors);
+        if shrinking_own {
+            // repair_root 0.* vs 1.*: a shrinking donor often straddles two
+            // acceptors. Preserve the already-proven overlap selection here.
+            let acceptors: Vec<_> = filtered_others
+                .into_iter()
+                .filter(|sr| sr.overlaps(&own) || sr.includes_range(&own))
+                .collect();
+            if !acceptors.is_empty() {
+                let _ = broker.merge_shard_ranges(acceptors);
+            }
+        } else if !filtered_others.is_empty() {
+            // A deleted direct child may have been replaced by grandchildren.
+            // No single grandchild includes the parent's whole namespace;
+            // Python accepts the set only when it combines with existing
+            // children into one gap-free, overlap-free path through `own`.
+            // The root's marker/end-marker query excludes a sibling that only
+            // touches `own.upper`; keep that boundary invariant here as well.
+            let filtered_others: Vec<_> = filtered_others
+                .into_iter()
+                .filter(|sr| sr.overlaps(&own) || sr.includes_range(&own))
+                .collect();
+            let existing = broker
+                .get_shard_ranges(&GetShardRangesArgs::default())
+                .unwrap_or_default();
+            let combined = combine_newest_live_shard_ranges(&filtered_others, existing);
+            if ranges_form_complete_path_through_own(&own, &combined) {
+                let _ = broker.merge_shard_ranges(filtered_others);
+            }
         }
     }
 }
@@ -6726,6 +6824,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
     fn test_replicated_sharded_own_reuses_active_ranges() {
         // Probe test_replication_to_sharded_container L2323: the third node
         // has an UNSHARDED local DB, but replication supplied a SHARDED own
@@ -7739,6 +7838,102 @@ mod tests {
         assert!(
             !names.contains(&sibling_name.as_str()),
             "sibling must not merge into this shard: {names:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_merge_from_root_repairs_deleted_child_with_grandchildren_path() {
+        // Probe test_manage_shard_ranges_deleted_child_and_parent_gap: this
+        // stale parent replica still has two direct children. Root deleted the
+        // first child and replaced its namespace with two grandchildren. The
+        // three live ranges form one complete path through the parent, even
+        // though neither grandchild is a direct child of this broker.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharder-parent-gap-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ts = "1751500010.00000";
+        let parent_name = make_shard_name(".shards_AUTH_test", "rootc", "rootc", ts, 0);
+        let parent_container = shard_container_name(&parent_name).unwrap();
+        let mut parent =
+            container_broker_with_account(&dir, ".shards_AUTH_test", parent_container, 0);
+        let mut own = ShardRange::new(&parent_name, ts, "", "obj-0009");
+        own.state = shard_state::ACTIVE;
+        ensure_shard_root_sysmeta(&mut parent, "AUTH_test", "rootc", &own);
+
+        let child_epoch = "1751500020.00000";
+        let child0_name = make_shard_name(
+            ".shards_AUTH_test",
+            "rootc",
+            parent_container,
+            child_epoch,
+            0,
+        );
+        let child1_name = make_shard_name(
+            ".shards_AUTH_test",
+            "rootc",
+            parent_container,
+            child_epoch,
+            1,
+        );
+        let mut stale_child0 = ShardRange::new(&child0_name, child_epoch, "", "obj-0004");
+        stale_child0.state = shard_state::CREATED;
+        let mut child1 = ShardRange::new(&child1_name, child_epoch, "obj-0004", "obj-0009");
+        child1.state = shard_state::ACTIVE;
+        parent
+            .merge_shard_ranges(vec![stale_child0.clone(), child1.clone()])
+            .unwrap();
+
+        let mut from_root = own.clone();
+        from_root.state = shard_state::SHARDED;
+        from_root.state_timestamp = "1751500090.00000".into();
+        let mut deleted_child0 = stale_child0;
+        deleted_child0.timestamp = "1751500080.00000".into();
+        deleted_child0.meta_timestamp = "1751500080.00000".into();
+        deleted_child0.state_timestamp = "1751500080.00000".into();
+        deleted_child0.state = shard_state::SHARDED;
+        deleted_child0.deleted = 1;
+
+        let child0_container = shard_container_name(&child0_name).unwrap();
+        let grand_epoch = "1751500030.00000";
+        let grand0_name = make_shard_name(
+            ".shards_AUTH_test",
+            "rootc",
+            child0_container,
+            grand_epoch,
+            0,
+        );
+        let grand1_name = make_shard_name(
+            ".shards_AUTH_test",
+            "rootc",
+            child0_container,
+            grand_epoch,
+            1,
+        );
+        let mut grand0 = ShardRange::new(&grand0_name, grand_epoch, "", "obj-0002");
+        grand0.state = shard_state::ACTIVE;
+        let mut grand1 =
+            ShardRange::new(&grand1_name, grand_epoch, "obj-0002", "obj-0004");
+        grand1.state = shard_state::ACTIVE;
+
+        merge_shard_ranges_from_root(
+            &mut parent,
+            &[from_root, deleted_child0, child1, grand0, grand1],
+            &own,
+        );
+        let got = parent
+            .get_shard_ranges(&GetShardRangesArgs::default())
+            .unwrap();
+        let names: Vec<_> = got.iter().map(|range| range.name.as_str()).collect();
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert!(names.contains(&grand0_name.as_str()), "{got:?}");
+        assert!(names.contains(&grand1_name.as_str()), "{got:?}");
+        assert!(names.contains(&child1_name.as_str()), "{got:?}");
+        assert_eq!(
+            parent.get_own_shard_range(true).unwrap().unwrap().state,
+            shard_state::SHARDED
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
