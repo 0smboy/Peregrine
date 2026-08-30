@@ -8,9 +8,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import select
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -48,7 +51,16 @@ def parse_recon(text: str) -> dict:
         parts = line.split()
         if len(parts) >= 2:
             try:
-                out[parts[0].split("{", 1)[0]] = float(parts[-1])
+                token = parts[0]
+                name = token.split("{", 1)[0]
+                value = float(parts[-1])
+                labels = dict(re.findall(r'(\w+)="([^"]+)"', token))
+                if labels:
+                    suffix = "_".join(labels[key] for key in sorted(labels))
+                    out[f"{name}_{suffix}"] = value
+                    out[name] = out.get(name, 0.0) + value
+                else:
+                    out[name] = value
             except ValueError:
                 pass
     return out
@@ -87,20 +99,199 @@ def sample_recon(spec, n=5, pause=0.05):
     return snaps
 
 
+class ReconObserver:
+    """Sample proxy concurrency metrics while a workload is actually active."""
+
+    def __init__(self, spec, interval=0.05):
+        self.spec = spec
+        self.interval = interval
+        self.samples = []
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, name="g7-recon-observer", daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self):
+        host, port = self.spec["target"]["host"], self.spec["target"]["port"]
+        path = self.spec["target"]["recon_path"]
+        while not self._stop.is_set():
+            t0 = time.monotonic()
+            try:
+                st, body, ms = http(host, port, "GET", path, timeout=2.0)
+                if st == 200:
+                    sample = parse_recon(body.decode("utf-8", "replace"))
+                    sample["_http_ms"] = ms
+                    sample["_monotonic"] = t0
+                else:
+                    sample = {"error": f"recon status {st}", "_monotonic": t0}
+            except Exception as exc:
+                sample = {"error": str(exc), "_monotonic": t0}
+            self.samples.append(sample)
+            self._stop.wait(self.interval)
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+        return list(self.samples)
+
+
+def percentile(values, fraction):
+    values = sorted(values)
+    if not values:
+        return None
+    return values[int((len(values) - 1) * fraction)]
+
+
+def valid_recon(samples):
+    return [sample for sample in samples if isinstance(sample, dict) and "error" not in sample]
+
+
+STEADY_GAUGES = (
+    "connections_open",
+    "connections_idle",
+    "requests_active",
+    "runtime_tasks",
+    "backend_requests_inflight",
+    "backend_queue_depth",
+    "device_ops_active",
+    "device_queue_depth",
+    "db_ops_active",
+    "db_queue_depth",
+    "process_threads",
+    "open_fds",
+)
+
+
+def wait_for_steady(spec, before, timeout=60.0):
+    baseline_samples = valid_recon(before)
+    if not baseline_samples:
+        return {"ok": False, "reason": "no valid baseline recon sample", "samples": []}
+    baseline = baseline_samples[-1]
+    bounds = spec["bounds"]
+    pct = bounds["steady_return_max_of_pct"] / 100.0
+    absolute = bounds["steady_return_abs"]
+    deadline = time.monotonic() + timeout
+    all_samples = []
+    last_violations = ["not sampled"]
+    while time.monotonic() < deadline:
+        batch = sample_recon(spec, n=3, pause=0.1)
+        all_samples.extend(batch)
+        valid = valid_recon(batch)
+        if valid:
+            last = valid[-1]
+            violations = []
+            for metric in STEADY_GAUGES:
+                if metric not in baseline or metric not in last:
+                    violations.append(f"missing {metric}")
+                    continue
+                allowance = max(float(absolute), abs(float(baseline[metric])) * pct)
+                if float(last[metric]) > float(baseline[metric]) + allowance:
+                    violations.append(
+                        f"{metric}={last[metric]} baseline={baseline[metric]} allowance={allowance}"
+                    )
+            for metric, limit_name in (
+                ("commit_shield_active", "stuck_commit"),
+                ("shutdown_waiting_commits", "stuck_commit"),
+                ("shutdown_waiting_requests", "stuck_commit"),
+            ):
+                if metric not in last:
+                    violations.append(f"missing {metric}")
+                elif float(last[metric]) > float(bounds[limit_name]):
+                    violations.append(f"{metric}={last[metric]} > {bounds[limit_name]}")
+            if not violations:
+                return {
+                    "ok": True,
+                    "baseline": baseline,
+                    "last": last,
+                    "samples": all_samples,
+                    "elapsed_s": timeout - max(0.0, deadline - time.monotonic()),
+                }
+            last_violations = violations
+        time.sleep(0.5)
+    return {
+        "ok": False,
+        "reason": "; ".join(last_violations),
+        "baseline": baseline,
+        "samples": all_samples,
+        "elapsed_s": timeout,
+    }
+
+
+def recon_evidence(before, during, after):
+    valid_before = valid_recon(before)
+    valid_during = valid_recon(during)
+    valid_after = valid_recon(after)
+    all_valid = [*valid_before, *valid_during, *valid_after]
+    lags_ms = [sample["runtime_scheduler_lag"] / 1_000_000.0 for sample in valid_during if "runtime_scheduler_lag" in sample]
+    baseline = valid_before[-1] if valid_before else {}
+
+    def peak(metric, default=0.0):
+        values = [float(sample[metric]) for sample in all_valid if metric in sample]
+        return max(values) if values else default
+
+    blocking_peak = peak("blocking_threads_storage") + peak("blocking_threads_db")
+    process_peak = peak("process_threads")
+    process_baseline = float(baseline.get("process_threads", 0.0))
+    runtime_workers = peak("runtime_worker_threads")
+    network_wait_baseline = float(baseline.get("blocking_network_wait_total", 0.0))
+    network_wait_peak = peak("blocking_network_wait_total", network_wait_baseline)
+    return {
+        "recon_samples": len(valid_during),
+        "recon_errors": len(during) - len(valid_during),
+        "scheduler_lag_p99_ms": percentile(lags_ms, 0.99),
+        "scheduler_lag_p999_ms": percentile(lags_ms, 0.999),
+        "blocking_network_wait_delta": max(0.0, network_wait_peak - network_wait_baseline),
+        "process_threads_baseline": process_baseline,
+        "process_threads_peak": process_peak,
+        "blocking_threads_peak": blocking_peak,
+        "runtime_worker_threads": runtime_workers,
+        "thread_growth_within_bound": process_peak <= process_baseline + max(16.0, blocking_peak),
+        "storage_threads_within_bound": peak("blocking_threads_storage") <= max(1.0, runtime_workers),
+        "recon_peak": {
+            metric: peak(metric)
+            for metric in (
+                "connections_open",
+                "connections_idle",
+                "requests_active",
+                "runtime_tasks",
+                "request_body_buffer_bytes",
+                "response_body_buffer_bytes",
+                "backend_requests_inflight",
+                "backend_queue_depth",
+                "device_ops_active",
+                "device_queue_depth",
+                "db_ops_active",
+                "db_queue_depth",
+                "commit_shield_active",
+                "open_fds",
+            )
+        },
+    }
+
+
 def health_p99(spec, n=40):
     host, port = spec["target"]["host"], spec["target"]["port"]
     path = spec["target"]["health_path"]
     xs = []
+    ok = 0
     for _ in range(n):
         try:
             st, _, ms = http(host, port, "HEAD", path, timeout=2.0)
-            xs.append(ms if st and st < 500 else 2000.0)
+            if st == 200:
+                ok += 1
+                xs.append(ms)
+            else:
+                xs.append(2000.0)
         except Exception:
             xs.append(2000.0)
         time.sleep(0.02)
     xs.sort()
     p99 = xs[int((len(xs) - 1) * 0.99)] if xs else 2000.0
-    return {"n": len(xs), "p50_ms": xs[len(xs) // 2] if xs else None, "p99_ms": p99}
+    return {"n": len(xs), "ok": ok, "p50_ms": xs[len(xs) // 2] if xs else None, "p99_ms": p99}
 
 
 def auth_token(spec):
@@ -260,6 +451,14 @@ def classify(case, raw, spec, *, calibration=False):
         return _failed(out, "missing proof field: scheduler_lag_p999_ms")
     if raw["scheduler_lag_p999_ms"] > bounds["scheduler_lag_p999_ms"]:
         return _failed(out, f"scheduler lag p999 {raw['scheduler_lag_p999_ms']} > {bounds['scheduler_lag_p999_ms']} ms")
+    if raw.get("recon_samples", 0) < 3:
+        return _failed(out, f"insufficient in-workload recon samples: {raw.get('recon_samples')!r}")
+    if raw.get("blocking_network_wait_delta") != 0:
+        return _failed(out, f"blocking network wait delta is {raw.get('blocking_network_wait_delta')!r}")
+    if raw.get("thread_growth_within_bound") is not True:
+        return _failed(out, "process thread growth was not proved bounded")
+    if raw.get("storage_threads_within_bound") is not True:
+        return _failed(out, "storage blocking threads exceeded the observed runtime bound")
     steady = raw.get("steady_return")
     if not isinstance(steady, dict) or steady.get("ok") is not True:
         return _failed(out, f"steady-state return not proved: {steady!r}")
@@ -423,10 +622,153 @@ def put_object(spec, token, container, name, body: bytes):
     )
 
 
+def run_slow_get(spec, token, case):
+    """Hold all slow readers concurrently; never drain sockets serially."""
+    host, port = spec["target"]["host"], spec["target"]["port"]
+    target = case["target"]
+    seed_status, _, _ = put_object(
+        spec,
+        token,
+        "g7get",
+        "blob",
+        b"Y" * case["object_bytes"],
+    )
+    states = {}
+    opened = 0
+    for index in range(target):
+        sock = socket.socket()
+        try:
+            sock.settimeout(5)
+            sock.bind((spec["loadgen"]["source_ips"][index % len(spec["loadgen"]["source_ips"])], 0))
+            sock.connect((host, port))
+            sock.sendall(
+                (
+                    f"GET /v1/{spec['auth']['account']}/g7get/blob HTTP/1.1\r\n"
+                    f"Host: {host}\r\nX-Auth-Token: {token}\r\n"
+                    "Connection: keep-alive\r\n\r\n"
+                ).encode()
+            )
+            sock.setblocking(False)
+            states[sock] = {
+                "header": bytearray(),
+                "status": None,
+                "expected": None,
+                "body": 0,
+                "next_read": 0.0,
+            }
+            opened += 1
+        except Exception:
+            sock.close()
+
+    header_deadline = time.monotonic() + 30.0
+    while states and time.monotonic() < header_deadline:
+        pending = [sock for sock, state in states.items() if state["status"] is None]
+        if not pending:
+            break
+        ready, _, _ = select.select(pending, [], [], 0.2)
+        for sock in ready:
+            state = states[sock]
+            try:
+                chunk = sock.recv(4096)
+            except BlockingIOError:
+                continue
+            except OSError:
+                chunk = b""
+            if not chunk:
+                sock.close()
+                del states[sock]
+                continue
+            state["header"].extend(chunk)
+            marker = state["header"].find(b"\r\n\r\n")
+            if marker < 0:
+                if len(state["header"]) > 65536:
+                    sock.close()
+                    del states[sock]
+                continue
+            head = bytes(state["header"][:marker])
+            body = bytes(state["header"][marker + 4 :])
+            lines = head.split(b"\r\n")
+            try:
+                state["status"] = int(lines[0].split()[1])
+            except (IndexError, ValueError):
+                state["status"] = 0
+            for line in lines[1:]:
+                if line.lower().startswith(b"content-length:"):
+                    try:
+                        state["expected"] = int(line.split(b":", 1)[1].strip())
+                    except ValueError:
+                        state["expected"] = None
+            state["body"] = len(body)
+            state["header"] = bytearray()
+            state["next_read"] = time.monotonic() + case["read_pause_ms"] / 1000.0
+
+    responses = sum(1 for state in states.values() if state["status"] is not None)
+    http_2xx = sum(1 for state in states.values() if _is_2xx(state["status"]))
+    hp = health_p99(spec, n=40)
+
+    completed = 0
+    read_pause = case["read_pause_ms"] / 1000.0
+    # 1 KiB per pause, plus a bounded setup margin.
+    max_drain = case["object_bytes"] / 1024.0 * read_pause + 60.0
+    drain_deadline = time.monotonic() + max_drain
+    while states and time.monotonic() < drain_deadline:
+        now = time.monotonic()
+        for sock, state in list(states.items()):
+            if (
+                _is_2xx(state["status"])
+                and state["expected"] == case["object_bytes"]
+                and state["body"] >= state["expected"]
+            ):
+                completed += 1
+                sock.close()
+                del states[sock]
+        if not states:
+            break
+        eligible = [sock for sock, state in states.items() if state["status"] is not None and state["next_read"] <= now]
+        if not eligible:
+            time.sleep(0.02)
+            continue
+        ready, _, _ = select.select(eligible, [], [], 0.2)
+        for sock in ready:
+            state = states.get(sock)
+            if state is None:
+                continue
+            try:
+                chunk = sock.recv(1024)
+            except BlockingIOError:
+                continue
+            except OSError:
+                chunk = b""
+            if chunk:
+                state["body"] += len(chunk)
+                state["next_read"] = time.monotonic() + read_pause
+            else:
+                sock.close()
+                del states[sock]
+    for sock in list(states):
+        sock.close()
+
+    return {
+        "case": "slow_get",
+        "target": target,
+        "opened": opened,
+        "seed_status": seed_status,
+        "responses": responses,
+        "http_2xx": http_2xx,
+        "completed": completed,
+        "failed": target - completed,
+        "read_chunk_bytes": 1024,
+        "health_p99_ms": hp["p99_ms"],
+        "health_samples": hp["n"],
+        "health_ok": hp["ok"],
+    }
+
+
 def run_case(name, case, spec, token):
     kind = case["kind"]
     host, port = spec["target"]["host"], spec["target"]["port"]
     before = sample_recon(spec, n=3)
+    observer = ReconObserver(spec).start()
     raw = {}
     if kind == "idle_keepalive":
         raw = run_g7load(
@@ -473,39 +815,7 @@ def run_case(name, case, spec, token):
             timeout=300,
         )
     elif kind == "slow_get":
-        # seed one object then open N GETs that pause
-        put_object(spec, token, "g7get", "blob", b"Y" * case["object_bytes"])
-        n = case["target"]
-        opened = 0
-        socks = []
-        tlat = []
-        for i in range(n):
-            s = socket.socket()
-            try:
-                s.settimeout(5)
-                s.bind((spec["loadgen"]["source_ips"][i % 3], 0))
-                s.connect((host, port))
-                s.sendall(
-                    f"GET /v1/{spec['auth']['account']}/g7get/blob HTTP/1.1\r\nHost: {host}\r\nX-Auth-Token: {token}\r\nConnection: keep-alive\r\n\r\n".encode()
-                )
-                opened += 1
-                socks.append(s)
-            except Exception:
-                s.close()
-        hp = health_p99(spec, n=30)
-        # drain slowly
-        for s in socks:
-            try:
-                s.settimeout(1)
-                while True:
-                    chunk = s.recv(1024)
-                    if not chunk:
-                        break
-                    time.sleep(case["read_pause_ms"] / 1000.0)
-            except Exception:
-                pass
-            s.close()
-        raw = {"case": "slow_get", "target": n, "opened": opened, "health_p99_ms": hp["p99_ms"]}
+        raw = run_slow_get(spec, token, case)
     elif kind == "churn":
         opened_min = None
         last = {}
@@ -534,6 +844,8 @@ def run_case(name, case, spec, token):
                 "opened": 1,
                 "put_status": st,
                 "health_p99_ms": hp["p99_ms"],
+                "health_samples": hp["n"],
+                "health_ok": hp["ok"],
             }
         finally:
             ssh(f"iptables -w -D OUTPUT -p tcp -d {case['drop_backend'].split(':')[0]} --dport {case['drop_backend'].split(':')[1]} -j DROP")
@@ -547,7 +859,15 @@ def run_case(name, case, spec, token):
                 if st and 200 <= st < 300:
                     ok += 1
             hp = health_p99(spec, n=20)
-            raw = {"case": "quorum", "target": case["put_n"], "opened": case["put_n"], "ok_2xx": ok, "health_p99_ms": hp["p99_ms"]}
+            raw = {
+                "case": "quorum",
+                "target": case["put_n"],
+                "opened": case["put_n"],
+                "ok_2xx": ok,
+                "health_p99_ms": hp["p99_ms"],
+                "health_samples": hp["n"],
+                "health_ok": hp["ok"],
+            }
         finally:
             ssh(f"iptables -w -D OUTPUT -p tcp -d {be.split(':')[0]} --dport {be.split(':')[1]} -j DROP")
     elif kind == "overload":
@@ -668,6 +988,8 @@ def run_case(name, case, spec, token):
         try:
             hp = health_p99(spec, n=20)
             raw["health_p99_ms"] = hp["p99_ms"]
+            raw["health_samples"] = hp["n"]
+            raw["health_ok"] = hp["ok"]
         finally:
             ssh("iptables -w -D OUTPUT -p tcp -d 127.0.0.9 -j DROP || true")
     elif kind == "fsync_stall":
@@ -690,6 +1012,8 @@ def run_case(name, case, spec, token):
             "put_status": st,
             "put_ms": ms,
             "health_p99_ms": hp["p99_ms"],
+            "health_samples": hp["n"],
+            "health_ok": hp["ok"],
             "elapsed_s": time.monotonic() - t0,
         }
         ssh("pid=$(cat /var/run/g6-rust/object-1.pid); kill -TERM $pid || true; sleep 1; "
@@ -705,16 +1029,28 @@ def run_case(name, case, spec, token):
         )
         time.sleep(1)
         hp = health_p99(spec, n=case.get("health_samples", 40))
-        raw = {"case": "sqlite_stall", "target": 1, "opened": 1, "health_p99_ms": hp["p99_ms"]}
+        raw = {
+            "case": "sqlite_stall",
+            "target": 1,
+            "opened": 1,
+            "health_p99_ms": hp["p99_ms"],
+            "health_samples": hp["n"],
+            "health_ok": hp["ok"],
+        }
         ssh("pid=$(cat /var/run/g6-rust/container-1.pid); kill -TERM $pid || true; sleep 1; "
             "nohup /root/work/g6-rust-bin/swift-container-server /etc/g6-rust/container-server/1.conf "
             ">>/var/log/g6-rust/container-1.log 2>&1 & echo $! >/var/run/g6-rust/container-1.pid")
     else:
         raw = {"error": f"unknown kind {kind}", "target": case.get("target"), "opened": 0}
 
-    after = sample_recon(spec, n=3)
+    during = observer.stop()
+    steady = wait_for_steady(spec, before)
+    after = steady.pop("samples", [])
     raw["recon_before"] = before
+    raw["recon_during"] = during
     raw["recon_after"] = after
+    raw["steady_return"] = steady
+    raw.update(recon_evidence(before, during, after))
     case = dict(case)
     case["_name"] = name
     result = classify(case, raw, spec)

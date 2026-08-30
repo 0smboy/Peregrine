@@ -31,6 +31,10 @@ def raw_base(target=1, *, health=False):
         "opened": target,
         "scheduler_lag_p99_ms": 1.0,
         "scheduler_lag_p999_ms": 2.0,
+        "recon_samples": 20,
+        "blocking_network_wait_delta": 0,
+        "thread_growth_within_bound": True,
+        "storage_threads_within_bound": True,
         "steady_return": {"ok": True},
     }
     if health:
@@ -139,6 +143,48 @@ class G7FailClosedClassification(unittest.TestCase):
         raw = {"opened": 10, "http_ok": 10, "_rc": 0}
         result = g7.classify(case, raw, SPEC, calibration=True)
         self.assertEqual(result["verdict"], "PASS")
+
+
+class G7ReconEvidence(unittest.TestCase):
+    def test_labeled_metrics_keep_domain_identity_and_total(self):
+        parsed = g7.parse_recon(
+            'blocking_threads{domain="storage"} 3\n'
+            'blocking_threads{domain="db"} 2\n'
+            'spawn_blocking_total{domain="other"} 7\n'
+        )
+        self.assertEqual(parsed["blocking_threads_storage"], 3)
+        self.assertEqual(parsed["blocking_threads_db"], 2)
+        self.assertEqual(parsed["blocking_threads"], 5)
+        self.assertEqual(parsed["spawn_blocking_total_other"], 7)
+
+    def test_recon_evidence_converts_scheduler_nanoseconds_to_ms(self):
+        before = [
+            {
+                "runtime_scheduler_lag": 1_000_000,
+                "process_threads": 10,
+                "runtime_worker_threads": 4,
+                "blocking_threads_storage": 0,
+                "blocking_threads_db": 0,
+                "blocking_network_wait_total": 0,
+            }
+        ]
+        during = [
+            {
+                "runtime_scheduler_lag": lag,
+                "process_threads": 12,
+                "runtime_worker_threads": 4,
+                "blocking_threads_storage": 1,
+                "blocking_threads_db": 1,
+                "blocking_network_wait_total": 0,
+            }
+            for lag in (1_000_000, 2_000_000, 3_000_000)
+        ]
+        evidence = g7.recon_evidence(before, during, during[-1:])
+        self.assertEqual(evidence["recon_samples"], 3)
+        self.assertEqual(evidence["scheduler_lag_p99_ms"], 2.0)
+        self.assertEqual(evidence["scheduler_lag_p999_ms"], 2.0)
+        self.assertTrue(evidence["thread_growth_within_bound"])
+        self.assertEqual(evidence["blocking_network_wait_delta"], 0)
 
 
 if __name__ == "__main__":

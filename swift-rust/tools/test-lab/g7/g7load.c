@@ -478,8 +478,8 @@ static int run_slowloris(int argc, char **argv) {
     qsort(samp.ms, (size_t)samp.n, sizeof(double), cmp_double);
     double p99 = samp.n ? samp.ms[(int)((samp.n - 1) * 0.99)] : 0;
     printf("{\"case\":\"slowloris\",\"target\":%d,\"opened\":%d,\"failed\":%d,"
-           "\"health_p99_ms\":%.3f,\"health_samples\":%d}\n",
-           target, opened, target - opened, p99, samp.n);
+           "\"health_p99_ms\":%.3f,\"health_samples\":%d,\"health_ok\":%d}\n",
+           target, opened, target - opened, p99, samp.n, samp.ok);
     for (int i = 0; i < opened; i++) close(fds[i]);
     free(fds);
     free(samp.ms);
@@ -531,15 +531,17 @@ static int run_slowput(int argc, char **argv) {
                 path, i, host, body, token);
         fds[opened++] = fd;
     }
-    /* drip at rate_bps (frozen 1024). 64-byte slices keep syscall count finite
-     * without changing the 1 KiB/s / 64 KiB body acceptance numbers. */
-    int chunk = 64;
+    /* Preserve the frozen 1 KiB/s drip with 64-byte slices.  The overload
+     * case uses a larger slice so 4k x 1 MiB does not become 65m syscalls. */
+    int chunk = rate >= 65536 ? 16384 : 64;
     if (chunk > body) chunk = body;
     int delay_us = rate > 0 ? (int)(1000000.0 * chunk / rate) : 1000;
     if (delay_us < 200) delay_us = 200;
     int sent = 0;
-    char payload[64];
-    memset(payload, 'X', sizeof(payload));
+    char *payload = malloc((size_t)chunk);
+    unsigned char *send_error = calloc((size_t)target, 1);
+    if (!payload || !send_error) return 1;
+    memset(payload, 'X', (size_t)chunk);
     struct sampler samp = {.run = 1, .go = 1, .port = port, .n = 200, .ok = 0};
     strncpy(samp.host, host, sizeof(samp.host) - 1);
     samp.ms = calloc(200, sizeof(double));
@@ -549,7 +551,9 @@ static int run_slowput(int argc, char **argv) {
         int nthis = chunk;
         if (sent + nthis > body) nthis = body - sent;
         for (int i = 0; i < opened; i++) {
-            if (write(fds[i], payload, nthis) < 0) { /* keep going */ }
+            if (send_error[i]) continue;
+            ssize_t written = write(fds[i], payload, (size_t)nthis);
+            if (written != nthis) send_error[i] = 1;
         }
         sent += nthis;
         usleep((useconds_t)delay_us);
@@ -558,13 +562,31 @@ static int run_slowput(int argc, char **argv) {
     pthread_join(th, NULL);
     qsort(samp.ms, (size_t)samp.n, sizeof(double), cmp_double);
     double p99 = samp.n ? samp.ms[(int)((samp.n - 1) * 0.99)] : 0;
-    printf("{\"case\":\"slow_put\",\"target\":%d,\"opened\":%d,\"failed\":%d,"
-           "\"body_bytes\":%d,\"health_p99_ms\":%.3f,\"health_samples\":%d}\n",
-           target, opened, target - opened, body, p99, samp.n);
+    int responses = 0, http_2xx = 0, http_503 = 0;
+    for (int i = 0; i < opened; i++) {
+        struct timeval tv = {.tv_sec = 30, .tv_usec = 0};
+        setsockopt(fds[i], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        char response[1024];
+        ssize_t nread = read(fds[i], response, sizeof(response) - 1);
+        if (nread <= 0) continue;
+        response[nread] = 0;
+        int status = 0;
+        if (sscanf(response, "HTTP/%*s %d", &status) != 1) continue;
+        responses++;
+        if (status >= 200 && status < 300) http_2xx++;
+        if (status == 503) http_503++;
+    }
+    int failed = target - responses;
+    printf("{\"case\":\"slow_put\",\"target\":%d,\"opened\":%d,\"responses\":%d,"
+           "\"http_2xx\":%d,\"http_503\":%d,\"failed\":%d,\"body_bytes\":%d,"
+           "\"health_p99_ms\":%.3f,\"health_samples\":%d,\"health_ok\":%d}\n",
+           target, opened, responses, http_2xx, http_503, failed, body, p99, samp.n, samp.ok);
     for (int i = 0; i < opened; i++) close(fds[i]);
     free(fds);
+    free(payload);
+    free(send_error);
     free(samp.ms);
-    return opened == target ? 0 : 3;
+    return opened == target && responses == target ? 0 : 3;
 }
 
 int main(int argc, char **argv) {
