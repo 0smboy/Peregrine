@@ -138,10 +138,12 @@ fn test_server_round_trip() {
     std::thread::spawn(move || serve_forever(listener, handler));
 
     let mut conn = std::net::TcpStream::connect(addr).unwrap();
-    // two pipelined keep-alive requests, the second with a body
+    // Two ordinary Hyper-lane keep-alive requests, the second with a body.
+    // Non-ASCII Swift paths deliberately use the one-request compatibility
+    // lane and have separate wire coverage in gate5_python_wire.
     conn.write_all(
-        b"GET /v1/a/%E4%B8%AD?marker=x HTTP/1.1\r\nX-Test: hi\r\n\r\n\
-          PUT /v1/a/c/o HTTP/1.1\r\nContent-Length: 5\r\nX-Test: two\r\n\r\nhello",
+        b"GET /v1/a/c?marker=x HTTP/1.1\r\nHost: localhost\r\nX-Test: hi\r\n\r\n\
+          PUT /v1/a/c/o HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nX-Test: two\r\n\r\nhello",
     )
     .unwrap();
     let mut buf = Vec::new();
@@ -161,7 +163,7 @@ fn test_server_round_trip() {
     let text = String::from_utf8_lossy(&buf);
     assert!(text.contains("HTTP/1.1 200 OK"), "{text}");
     assert!(text.contains("X-Echo: hi"), "{text}");
-    assert!(text.contains("GET /v1/a/中 q=marker=x"), "{text}");
+    assert!(text.contains("GET /v1/a/c q=marker=x"), "{text}");
     assert!(text.contains("PUT /v1/a/c/o"), "{text}");
     assert!(text.contains("body=hello"), "{text}");
 }

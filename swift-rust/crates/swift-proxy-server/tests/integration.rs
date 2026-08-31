@@ -241,6 +241,7 @@ fn test_proxy_end_to_end_account_and_container() {
         hash_config: hash_cfg(),
         policies: vec![(0, "Policy-0".to_string())],
         default_policy_index: 0,
+        recon_cache_path: tmp.join("recon"),
         fixed_created_at: None,
     };
     std::thread::spawn(move || swift_container_server::serve(cont_listener, cont_config));
@@ -331,6 +332,7 @@ fn test_container_put_does_not_mutate_when_account_autocreate_fails() {
         hash_config: hash_cfg(),
         policies: vec![(0, "Policy-0".to_string())],
         default_policy_index: 0,
+        recon_cache_path: tmp.join("recon"),
         fixed_created_at: None,
     };
     std::thread::spawn(move || swift_container_server::serve(cont_listener, cont_config));
@@ -497,6 +499,7 @@ fn test_container_put_succeeds_when_one_account_replica_404s() {
         hash_config: hash_cfg(),
         policies: vec![(0, "Policy-0".to_string())],
         default_policy_index: 0,
+        recon_cache_path: tmp.join("recon"),
         fixed_created_at: None,
     };
     std::thread::spawn(move || swift_container_server::serve(cont_listener, cont_config));
@@ -580,6 +583,7 @@ fn test_proxy_object_round_trip() {
         hash_config: hash_cfg(),
         policies: vec![(0, "Policy-0".to_string())],
         default_policy_index: 0,
+        recon_cache_path: tmp.join("recon"),
         fixed_created_at: None,
     };
     std::thread::spawn(move || swift_container_server::serve(cont_listener, cont_config));
@@ -975,6 +979,7 @@ fn test_post_mixed_results_falls_back_to_handoff() {
         hash_config: hash_cfg(),
         policies: vec![(0, "Policy-0".to_string())],
         default_policy_index: 0,
+        recon_cache_path: cont_tmp.join("recon"),
         fixed_created_at: None,
     };
     std::thread::spawn(move || swift_container_server::serve(cont_listener, cont_config));
@@ -1130,6 +1135,7 @@ fn test_tempauth_end_to_end() {
                 hash_config: hash_cfg(),
                 policies: vec![(0, "Policy-0".to_string())],
                 default_policy_index: 0,
+                recon_cache_path: tmp2.join("recon"),
                 fixed_created_at: None,
             },
         )
