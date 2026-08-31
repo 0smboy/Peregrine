@@ -326,14 +326,13 @@ impl Default for ServerConfig {
     }
 }
 
-/// Bind `addr` (`ip:port`) as a `TcpListener`, optionally with `SO_REUSEPORT`
-/// so multiple acceptors can share the port (L4).
+/// Bind `addr` (`ip:port`) as a `TcpListener` with `SO_REUSEADDR`, optionally
+/// adding `SO_REUSEPORT` so multiple acceptors can share the port (L4).
+///
+/// `SO_REUSEADDR` is unconditional: a graceful restart must be able to bind
+/// while accepted sockets from the previous process are still in `TIME_WAIT`.
 pub fn bind_listener(addr: &str, reuse_port: bool) -> std::io::Result<TcpListener> {
     use std::os::fd::FromRawFd;
-
-    if !reuse_port {
-        return TcpListener::bind(addr);
-    }
 
     let sock_addr: SocketAddr = addr
         .parse()
@@ -374,9 +373,11 @@ pub fn bind_listener(addr: &str, reuse_port: bool) -> std::io::Result<TcpListene
         unsafe { libc::close(fd) };
         return Err(e);
     }
-    if let Err(e) = set_bool_sockopt(fd, libc::SO_REUSEPORT) {
-        unsafe { libc::close(fd) };
-        return Err(e);
+    if reuse_port {
+        if let Err(e) = set_bool_sockopt(fd, libc::SO_REUSEPORT) {
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
     }
     let bind_rc = unsafe {
         match sock_addr {
@@ -2288,6 +2289,30 @@ mod tests {
     use super::*;
     use crate::body::body_too_large;
     use std::net::Shutdown;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn bind_listener_always_enables_reuseaddr() {
+        let listener = bind_listener("127.0.0.1:0", false).unwrap();
+        let mut enabled: libc::c_int = 0;
+        let mut len = std::mem::size_of_val(&enabled) as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &mut enabled as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "getsockopt(SO_REUSEADDR) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(enabled, 1);
+    }
 
     #[test]
     fn production_engine_is_hyper_http1() {
