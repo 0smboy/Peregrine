@@ -82,7 +82,8 @@ fn preflight_blocks_missing_keepalived_interface() {
     assert!(transport.actions.iter().any(|action| matches!(
         action,
         TransportAction::Run { command, .. }
-            if command.contains("ip link show -- eth9")
+            if command.contains("test -d /sys/class/net/eth9")
+                && command.contains("ip -o link show dev eth9")
     )));
 }
 
