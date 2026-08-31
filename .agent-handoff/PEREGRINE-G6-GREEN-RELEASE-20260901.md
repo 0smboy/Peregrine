@@ -109,12 +109,18 @@ routes and indexed 36 documentation pages.
 
 - Production alias: `https://peregrine-docs-ochre.vercel.app`
 - Immutable deployment:
-  `https://peregrine-docs-ggdwbzq6y-0smboys-projects.vercel.app`
-- Vercel deployment ID: `dpl_2nDLtTmhwvNC7zCYNwAtrkHpV6iw`
+  `https://peregrine-docs-m4cos7vlw-0smboys-projects.vercel.app`
+- Vercel deployment ID: `dpl_FrkoA3xVBt1k4j2cG5eQp6GW81ka`
 
 Live Markdown endpoints for status, releases, validation gates, concurrency,
 and welcome were fetched after deployment. They preserve the required claim:
 G6 is GREEN, G7 is NOT ACCEPTED, G8 is BLOCKED, and production remains NO-GO.
+
+A final browser audit found and corrected two stale workspace-size labels: the
+home page said 17 crates and the root README said 15, while the accepted
+`Cargo.toml` has 16 workspace members. Desktop (1440 px) and mobile (390 px)
+checks show no horizontal overflow, no hidden content, and no console warning
+or error on the home and current-status pages.
 
 ## Swift1-Swift4 workspace cleanup
 
