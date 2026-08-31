@@ -229,6 +229,21 @@ fn decoded_header_path(value: &str) -> String {
     String::from_utf8_lossy(&percent_decode_bytes(value.as_bytes())).into_owned()
 }
 
+fn validated_modern_post_target(location: &str, account: &str, hidden: &str) -> Option<String> {
+    let decoded = decoded_header_path(location);
+    // Pre-authorized internal requests may only target an origin-relative
+    // Swift path.  Reject absolute and scheme-relative redirects before path
+    // parsing so a backend 307 cannot become an internal open redirect.
+    if !decoded.starts_with('/') || decoded.starts_with("//") {
+        return None;
+    }
+    let parts = split_path(&decoded, 4, 4, true).ok()?;
+    if parts[1].as_deref() != Some(account) || parts[2].as_deref() != Some(hidden) {
+        return None;
+    }
+    Some(decoded)
+}
+
 fn empty_async_request(req: Request) -> AsyncRequest {
     AsyncRequest {
         method: req.method,
@@ -1280,6 +1295,37 @@ impl VersionedWrites {
                 "PUT" => Response::error(501, "PUT version-id is not implemented"),
                 _ => next(req).await,
             }
+        } else if req.method == "POST" && configured.is_some() {
+            // Python object_versioning.handle_post sends the public POST first.
+            // Symlink middleware returns 307 for the current-version marker;
+            // only that trusted version symlink may redirect metadata to the
+            // reserved hidden object.  Build the eventual request before the
+            // public call consumes `req`, and never follow an arbitrary 307.
+            let hidden = configured.unwrap();
+            let source_headers = req.headers.clone();
+            let resp = next(req).await;
+            if resp.status != 307
+                || !resp
+                    .headers
+                    .get(SYSMETA_OBJECT_VERSIONS_SYMLINK)
+                    .is_some_and(config_true_value)
+            {
+                return resp;
+            }
+            let Some(location) = resp.headers.get("Location") else {
+                return resp;
+            };
+            let Some(target_path) = validated_modern_post_target(location, &account, &hidden)
+            else {
+                return resp;
+            };
+
+            let mut post = Self::modern_internal_request("POST", target_path, "", &source_headers);
+            // Python copies non-expiry POST metadata to the eventual request.
+            post.headers.remove("X-Delete-At");
+            post.headers.remove("X-Delete-After");
+            post.headers.set("X-Backend-Allow-Reserved-Names", "true");
+            next(empty_async_request(post)).await
         } else if req.method == "DELETE" && configured.is_some() && is_enabled {
             let hidden = configured.unwrap();
             let hidden_path = format!("/{version}/{account}/{hidden}");
@@ -2078,6 +2124,9 @@ impl Middleware for VersionedWrites {
         if req.method == "DELETE" {
             return true;
         }
+        if req.method == "POST" {
+            return true;
+        }
         query_param(&req.query_string, "version-id").is_some_and(|value| !value.is_empty())
             && matches!(req.method.as_str(), "GET" | "HEAD" | "PUT" | "POST")
     }
@@ -2211,6 +2260,49 @@ mod tests {
         let n2 = versions_object_name(&long, "1751500000.00000").unwrap();
         assert!(n2.starts_with("010"), "{n2}");
         assert_eq!(versions_object_prefix("obj"), "003obj/");
+    }
+
+    #[test]
+    fn test_modern_post_target_is_origin_relative_and_version_container_scoped() {
+        assert_eq!(
+            validated_modern_post_target(
+                "/v1/AUTH_test/%00versions%00c/%00o%008211892386.68781",
+                "AUTH_test",
+                "\0versions\0c",
+            )
+            .as_deref(),
+            Some("/v1/AUTH_test/\0versions\0c/\0o\08211892386.68781")
+        );
+        assert!(validated_modern_post_target(
+            "/v1/AUTH_other/%00versions%00c/%00o%008211892386.68781",
+            "AUTH_test",
+            "\0versions\0c",
+        )
+        .is_none());
+        assert!(validated_modern_post_target(
+            "/v1/AUTH_test/%00versions%00other/%00o%008211892386.68781",
+            "AUTH_test",
+            "\0versions\0c",
+        )
+        .is_none());
+        assert!(validated_modern_post_target(
+            "https://example.test/v1/AUTH_test/%00versions%00c/o",
+            "AUTH_test",
+            "\0versions\0c",
+        )
+        .is_none());
+        assert!(validated_modern_post_target(
+            "//example.test/v1/AUTH_test/%00versions%00c/o",
+            "AUTH_test",
+            "\0versions\0c",
+        )
+        .is_none());
+        assert!(validated_modern_post_target(
+            "/v1/AUTH_test/%00versions%00c",
+            "AUTH_test",
+            "\0versions\0c",
+        )
+        .is_none());
     }
 
     fn req(method: &str, path: &str) -> Request {
@@ -2738,6 +2830,152 @@ mod tests {
             Some("true")
         );
         assert_eq!(archive.3.get("X-Backend-Authorize-Override"), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn test_modern_post_follows_its_version_symlink_with_reserved_capability() {
+        type Call = (String, String, HeaderKeyDict);
+        let calls: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = Arc::clone(&calls);
+        let next: StreamingAsyncNextFn = Arc::new(move |req: AsyncRequest| {
+            let calls = Arc::clone(&calls2);
+            Box::pin(async move {
+                calls.lock().unwrap().push((
+                    req.method.clone(),
+                    req.path.clone(),
+                    req.headers.clone(),
+                ));
+                if req.headers.contains_key(AUTHORIZE_ONLY_HEADER) {
+                    return Response::new(204);
+                }
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(SYSMETA_OBJECT_VERSIONS_ENABLED, "True");
+                    resp.headers
+                        .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
+                    return resp;
+                }
+                if req.method == "POST" && req.path == "/v1/AUTH_test/c/o" {
+                    let mut resp = Response::new(307);
+                    resp.headers.set(
+                        "Location",
+                        "/v1/AUTH_test/%00versions%00c/%00o%008211892386.68781",
+                    );
+                    resp.headers.set(SYSMETA_OBJECT_VERSIONS_SYMLINK, "true");
+                    return resp;
+                }
+                if req.method == "POST"
+                    && req.path == "/v1/AUTH_test/\0versions\0c/\0o\08211892386.68781"
+                {
+                    assert_eq!(
+                        req.headers.get("X-Backend-Allow-Reserved-Names"),
+                        Some("true")
+                    );
+                    assert_eq!(
+                        req.headers.get("X-Backend-Authorize-Override"),
+                        Some("true")
+                    );
+                    assert_eq!(req.headers.get("X-Backend-Source"), Some("OV"));
+                    assert_eq!(req.headers.get("X-Object-Meta-Fruit"), Some("Tomato"));
+                    assert!(!req.headers.contains_key("X-Delete-After"));
+                    assert_eq!(req.body.content_length(), Some(0));
+                    return Response::new(202);
+                }
+                panic!(
+                    "unexpected modern POST subrequest {} {}",
+                    req.method, req.path
+                );
+            })
+        });
+
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let mut route_probe = req("POST", "/v1/AUTH_test/c/o");
+        route_probe.body = Body::empty();
+        assert!(vw.streams_request(&route_probe));
+
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Object-Meta-Fruit", "Tomato");
+        headers.set("X-Delete-After", "60");
+        let request = AsyncRequest {
+            method: "POST".to_string(),
+            path: "/v1/AUTH_test/c/o".to_string(),
+            query_string: String::new(),
+            headers,
+            body: IncomingBody::from_bytes(Vec::new(), MAX_CONTROL_BODY),
+        };
+        let resp = vw.handle_streaming_request(request, next).await;
+        assert_eq!(resp.status, 202, "calls={:?}", calls.lock().unwrap());
+        assert_eq!(calls.lock().unwrap().len(), 4);
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, _, _)| method == "POST")
+                .count(),
+            3,
+            "authorization probe, public POST, then trusted hidden POST"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_modern_post_does_not_follow_untrusted_redirect() {
+        let calls: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = Arc::clone(&calls);
+        let next: StreamingAsyncNextFn = Arc::new(move |req: AsyncRequest| {
+            let calls = Arc::clone(&calls2);
+            Box::pin(async move {
+                calls
+                    .lock()
+                    .unwrap()
+                    .push((req.method.clone(), req.path.clone()));
+                if req.headers.contains_key(AUTHORIZE_ONLY_HEADER) {
+                    return Response::new(204);
+                }
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(SYSMETA_OBJECT_VERSIONS_ENABLED, "True");
+                    resp.headers
+                        .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
+                    return resp;
+                }
+                if req.method == "POST" && req.path == "/v1/AUTH_test/c/o" {
+                    let mut resp = Response::new(307);
+                    resp.headers.set(
+                        "Location",
+                        "/v1/AUTH_test/%00versions%00other/%00o%008211892386.68781",
+                    );
+                    resp.headers.set(SYSMETA_OBJECT_VERSIONS_SYMLINK, "true");
+                    return resp;
+                }
+                panic!(
+                    "untrusted redirect must not be followed: {} {}",
+                    req.method, req.path
+                );
+            })
+        });
+
+        let request = AsyncRequest {
+            method: "POST".to_string(),
+            path: "/v1/AUTH_test/c/o".to_string(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: IncomingBody::from_bytes(Vec::new(), MAX_CONTROL_BODY),
+        };
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let resp = vw.handle_streaming_request(request, next).await;
+        assert_eq!(resp.status, 307);
+        assert_eq!(calls.lock().unwrap().len(), 3);
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, _)| method == "POST")
+                .count(),
+            2,
+            "authorization probe and public POST only"
+        );
     }
 
     #[tokio::test]

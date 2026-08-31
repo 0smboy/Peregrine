@@ -1465,11 +1465,14 @@ impl ProxyApp {
             .max()
             .cloned();
         let Some(chosen_timestamp) = chosen_timestamp else {
-            return if saw_404 && buckets.is_empty() {
-                swob_response(404)
-            } else {
-                swob_response(503)
-            };
+            let has_reconstructable_nondurable_bucket = buckets
+                .values()
+                .any(|bucket| bucket.sources.len() >= required);
+            return swob_response(ec_no_durable_status(
+                has_reconstructable_nondurable_bucket,
+                saw_404,
+                buckets.is_empty(),
+            ));
         };
         let chosen = buckets
             .remove(&chosen_timestamp)
@@ -3471,6 +3474,24 @@ fn ec_sources_sufficient(is_head: bool, available: usize, ndata: usize) -> bool 
     available >= if is_head { 1 } else { ndata }
 }
 
+/// Match Python's EC GET classification when no durable generation can be
+/// selected.  A reconstructable generation made entirely from non-durable
+/// fragments is a known-missing object (404), not a backend availability
+/// failure.  Incomplete fragment sets remain 503 even when another backend
+/// returned 404: they do not prove that reconstruction was possible.
+#[cfg(feature = "ec")]
+fn ec_no_durable_status(
+    has_reconstructable_nondurable_bucket: bool,
+    saw_404: bool,
+    buckets_empty: bool,
+) -> u16 {
+    if has_reconstructable_nondurable_bucket || (saw_404 && buckets_empty) {
+        404
+    } else {
+        503
+    }
+}
+
 /// Encode Python `ECGetResponseCollection._get_frag_prefs`. Each later
 /// request names the data generations already observed and excludes fragment
 /// indexes already held for that generation. An empty collection deliberately
@@ -3895,6 +3916,41 @@ mod tests {
         assert!(!ec_sources_sufficient(true, 0, 4));
         assert!(!ec_sources_sufficient(false, 1, 4));
         assert!(ec_sources_sufficient(false, 4, 4));
+    }
+
+    #[cfg(feature = "ec")]
+    #[test]
+    fn ec_no_durable_generation_distinguishes_missing_from_unavailable() {
+        assert_eq!(
+            ec_no_durable_status(true, false, false),
+            404,
+            "a reconstructable but entirely non-durable generation is missing"
+        );
+        assert_eq!(
+            ec_no_durable_status(true, true, false),
+            404,
+            "an explicit 404 does not change a reconstructable non-durable generation"
+        );
+        assert_eq!(
+            ec_no_durable_status(false, true, true),
+            404,
+            "an empty response collection with an explicit 404 is missing"
+        );
+        assert_eq!(
+            ec_no_durable_status(false, true, false),
+            503,
+            "an incomplete fragment bucket is still unavailable"
+        );
+        assert_eq!(
+            ec_no_durable_status(false, false, true),
+            503,
+            "transport failures without a 404 are unavailable"
+        );
+        assert_eq!(
+            ec_no_durable_status(false, false, false),
+            503,
+            "an incomplete bucket without a 404 is unavailable"
+        );
     }
 
     #[cfg(feature = "ec")]

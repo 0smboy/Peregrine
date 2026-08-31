@@ -3203,34 +3203,27 @@ impl ObjectServer {
         {
             return resp;
         }
-        let content_length = orig
-            .get_metadata()
-            .ok()
-            .and_then(|m| meta_get(m, "Content-Length"))
+        let orig_metadata = match orig.get_metadata() {
+            Ok(metadata) => metadata.clone(),
+            Err(e) => return plain_response(500, &e.to_string()),
+        };
+        let content_length = meta_get(&orig_metadata, "Content-Length")
             .unwrap_or("0")
             .to_string();
-        let etag = orig
-            .get_metadata()
-            .ok()
-            .and_then(|m| meta_get(m, "ETag"))
+        let etag = meta_get(&orig_metadata, "ETag")
             .unwrap_or("")
             .to_string();
-        let orig_sysmeta: Vec<(String, String)> = orig
-            .get_metadata()
-            .ok()
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(k, v)| match (k, v) {
-                        (MetaValue::Str(key), MetaValue::Str(value))
-                            if key.to_ascii_lowercase().starts_with("x-object-sysmeta-") =>
-                        {
-                            Some((key.clone(), value.clone()))
-                        }
-                        _ => None,
-                    })
-                    .collect()
+        let orig_sysmeta: Vec<(String, String)> = orig_metadata
+            .iter()
+            .filter_map(|(k, v)| match (k, v) {
+                (MetaValue::Str(key), MetaValue::Str(value))
+                    if key.to_ascii_lowercase().starts_with("x-object-sysmeta-") =>
+                {
+                    Some((key.clone(), value.clone()))
+                }
+                _ => None,
             })
-            .unwrap_or_default();
+            .collect();
         let data_timestamp = orig
             .data_timestamp()
             .unwrap_or_else(|_| "0".parse().unwrap());
@@ -3397,6 +3390,25 @@ impl ObjectServer {
         );
         update.set("x-meta-timestamp", &meta_timestamp);
         update.set("x-etag", &etag);
+        // Python object-server POST restores whole-object listing metadata
+        // for EC fragments.  The datafile's Content-Length/ETag describe the
+        // fragment archive, while container rows must continue to describe
+        // the original object.  Generic persisted container-update overrides
+        // are applied after this EC compatibility override, matching
+        // server.py `_check_container_override` ordering.
+        if let Some(value) = meta_get(&orig_metadata, "X-Object-Sysmeta-Ec-Content-Length") {
+            update.set("x-size", value);
+        }
+        if let Some(value) = meta_get(&orig_metadata, "X-Object-Sysmeta-Ec-Etag") {
+            update.set("x-etag", value);
+        }
+        let mut persisted_headers = HeaderKeyDict::new();
+        for (key, value) in &orig_metadata {
+            if let (MetaValue::Str(key), MetaValue::Str(value)) = (key, value) {
+                persisted_headers.set(key, value);
+            }
+        }
+        apply_container_override(&mut update, &persisted_headers, &[]);
         self.container_update(
             "PUT",
             &drive,
@@ -6802,6 +6814,134 @@ mod fallocate_reserve_tests {
             Some("c2/obj"),
             "POST must echo symlink sysmeta so the proxy can 307"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ec_post_container_update_uses_whole_object_size_and_etag() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-post-ec-listing-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = ObjectServer::new(ObjectServerConfig {
+            devices: dir.clone(),
+            mount_check: false,
+            hash_config: HashPathConfig::new(Vec::new(), b"post-ec-tests".to_vec()).unwrap(),
+            diskfile: DiskFileConfig::default(),
+            policies: std::collections::HashMap::from([(
+                2,
+                PolicyKind::Ec {
+                    n_unique_fragments: Some(6),
+                },
+            )]),
+            container_update_timeout: std::time::Duration::from_millis(10),
+            container_update_mode: ContainerUpdateMode::Async,
+        });
+
+        let fragment = vec![b'f'; 82];
+        let mut put_h = HeaderKeyDict::new();
+        put_h.set("X-Timestamp", "4001");
+        put_h.set("Content-Type", "application/octet-stream");
+        put_h.set("Content-Length", fragment.len());
+        put_h.set("X-Backend-Storage-Policy-Index", "2");
+        put_h.set("X-Object-Sysmeta-Ec-Frag-Index", "0");
+        put_h.set("X-Object-Sysmeta-Ec-Etag", "whole-object-etag");
+        put_h.set("X-Object-Sysmeta-Ec-Content-Length", "5");
+        let put = server.handle(Request {
+            method: "PUT".into(),
+            path: "/sda1/0/AUTH_test/c/o".into(),
+            query_string: String::new(),
+            headers: put_h,
+            body: fragment.clone().into(),
+        });
+        assert_eq!(put.status, 201, "{}", put.reason);
+
+        let mut post_h = HeaderKeyDict::new();
+        post_h.set("X-Timestamp", "4002");
+        post_h.set("X-Backend-Storage-Policy-Index", "2");
+        post_h.set("X-Object-Meta-Fruit", "Tomato");
+        let post = server.handle(Request {
+            method: "POST".into(),
+            path: "/sda1/0/AUTH_test/c/o".into(),
+            query_string: String::new(),
+            headers: post_h,
+            body: Body::empty(),
+        });
+        assert_eq!(post.status, 202, "{}", post.reason);
+
+        let mut stats = UpdaterStats::default();
+        let pending = iter_async_pendings(&dir.join("sda1"), &mut stats);
+        let update = pending
+            .iter()
+            .find(|update| update.account == "AUTH_test" && update.obj == "o")
+            .expect("POST must leave a container async update");
+        let header = |name: &str| {
+            update
+                .headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(header("x-size"), Some("5"));
+        assert_eq!(header("x-etag"), Some("whole-object-etag"));
+
+        // Persisted generic container-update overrides must win after the EC
+        // whole-object fallback, matching Python's prefix ordering.
+        let mut override_put_h = HeaderKeyDict::new();
+        override_put_h.set("X-Timestamp", "5001");
+        override_put_h.set("Content-Type", "application/octet-stream");
+        override_put_h.set("Content-Length", fragment.len());
+        override_put_h.set("X-Backend-Storage-Policy-Index", "2");
+        override_put_h.set("X-Object-Sysmeta-Ec-Frag-Index", "1");
+        override_put_h.set("X-Object-Sysmeta-Ec-Etag", "unexpected-ec-etag");
+        override_put_h.set("X-Object-Sysmeta-Ec-Content-Length", "99");
+        override_put_h.set(
+            "X-Object-Sysmeta-Container-Update-Override-Size",
+            "7",
+        );
+        override_put_h.set(
+            "X-Object-Sysmeta-Container-Update-Override-Etag",
+            "override-etag",
+        );
+        let override_put = server.handle(Request {
+            method: "PUT".into(),
+            path: "/sda1/0/AUTH_test/c/o-override".into(),
+            query_string: String::new(),
+            headers: override_put_h,
+            body: fragment.into(),
+        });
+        assert_eq!(override_put.status, 201, "{}", override_put.reason);
+
+        let mut override_post_h = HeaderKeyDict::new();
+        override_post_h.set("X-Timestamp", "5002");
+        override_post_h.set("X-Backend-Storage-Policy-Index", "2");
+        let override_post = server.handle(Request {
+            method: "POST".into(),
+            path: "/sda1/0/AUTH_test/c/o-override".into(),
+            query_string: String::new(),
+            headers: override_post_h,
+            body: Body::empty(),
+        });
+        assert_eq!(override_post.status, 202, "{}", override_post.reason);
+
+        let mut override_stats = UpdaterStats::default();
+        let override_pending = iter_async_pendings(&dir.join("sda1"), &mut override_stats);
+        let override_update = override_pending
+            .iter()
+            .find(|update| update.account == "AUTH_test" && update.obj == "o-override")
+            .expect("override POST must leave a container async update");
+        let override_header = |name: &str| {
+            override_update
+                .headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(override_header("x-size"), Some("7"));
+        assert_eq!(override_header("x-etag"), Some("override-etag"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
