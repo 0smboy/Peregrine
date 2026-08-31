@@ -2391,6 +2391,28 @@ mod tests {
         &response[split + 4..]
     }
 
+    fn read_one_http_response(stream: &mut TcpStream) -> Vec<u8> {
+        let mut response = Vec::new();
+        let mut byte = [0u8; 1];
+        while !response.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            response.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&response);
+        let content_length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("Content-Length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; content_length];
+        stream.read_exact(&mut body).unwrap();
+        response.extend_from_slice(&body);
+        response
+    }
+
     #[test]
     fn defaults_are_finite_and_keep_swifts_object_size_limit() {
         let config = ServerConfig::default();
@@ -3035,6 +3057,34 @@ mod tests {
         }
     }
 
+    struct SecondRequestDelayedBodyEcho {
+        calls: AtomicUsize,
+        second_started: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    }
+
+    impl AsyncService for SecondRequestDelayedBodyEcho {
+        fn call(
+            &self,
+            mut request: AsyncRequest,
+        ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let second_started = if call == 1 {
+                self.second_started.lock().unwrap().take()
+            } else {
+                None
+            };
+            Box::pin(async move {
+                if let Some(second_started) = second_started {
+                    let _ = second_started.send(());
+                }
+                match request.body.materialize(1024).await {
+                    Ok(body) => Response::with_body(200, body),
+                    Err(error) => Response::error(500, &error.to_string()),
+                }
+            })
+        }
+    }
+
     #[test]
     fn graceful_shutdown_drains_delayed_body_request() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3120,6 +3170,57 @@ mod tests {
 
         assert_eq!(status(&response), 200);
         assert_eq!(response_body(&response), b"test");
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn graceful_shutdown_drains_raced_second_request_on_keepalive() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let config = ServerConfig {
+            worker_threads: 2,
+            shutdown: Some(Arc::clone(&shutdown)),
+            shutdown_deadline_secs: 2,
+            ..ServerConfig::default()
+        };
+        let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+        let service: Arc<dyn AsyncService> = Arc::new(SecondRequestDelayedBodyEcho {
+            calls: AtomicUsize::new(0),
+            second_started: std::sync::Mutex::new(Some(second_started_tx)),
+        });
+        let server = std::thread::spawn(move || {
+            serve_forever_multi_service(vec![listener], service, config)
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .write_all(b"PUT /sanity HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+        let first = read_one_http_response(&mut client);
+        assert_eq!(status(&first), 200);
+
+        // Hyper has completed one request on this persistent connection and
+        // has started reading the next head, but Service::call cannot run
+        // until the terminator arrives. This is the deterministic form of
+        // Python Swift's old-reload race.
+        client
+            .write_all(b"PUT /across-reload HTTP/1.1\r\nContent-Length: 4\r\n")
+            .unwrap();
+        shutdown.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(50));
+        client.write_all(b"\r\n").unwrap();
+        second_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("raced second request head must survive graceful shutdown");
+        client.write_all(b"test").unwrap();
+        let second = read_one_http_response(&mut client);
+
+        assert_eq!(status(&second), 200);
+        assert_eq!(response_body(&second), b"test");
         server.join().unwrap().unwrap();
     }
 
