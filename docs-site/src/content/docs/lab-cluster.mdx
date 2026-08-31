@@ -5,7 +5,19 @@ sidebar:
   order: 23
 ---
 
-The development lab is a four-node Contabo HA cluster used to prove Peregrine
+<Aside type="caution" title="Isolation is part of the gate">
+This four-node Contabo topology is the **lab**, not a production rollout. As
+of 2026-08-31 the G6-accepted Rust Swift source is
+`17adf0bfa78b30b2a7eed9f39836e0d63c715d2c`. Formal W068 replication and W069
+EC lanes merge exactly once in W070: 179/179 identities, zero unexpected result,
+and no leaked isolated listener or process. G6 is GREEN; G7 is not accepted.
+It is not declared deployed from this page. Do not restart or replace production
+`:8080`, the VIP, HAProxy, Keepalived, rings, Swift data, or active binaries
+while G7 evidence is being prepared or collected.
+</Aside>
+
+The development lab is a four-node Contabo HA cluster used to prove the Rust
+Swift family
 end-to-end — the same environment described under [Testing](/testing) §4. The
 previous Azure PAYG topology (`10.42.*` + ILB) is **retired**. Full cutover
 notes live in the monorepo under `tools/CONTABO-CLUSTER.md`.

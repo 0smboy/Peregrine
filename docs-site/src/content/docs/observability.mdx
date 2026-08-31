@@ -1,0 +1,69 @@
+---
+title: Observability
+description: Logs, metrics, recon endpoints, provenance, alerting, and the evidence needed to distinguish a healthy node from an accepted release.
+sidebar:
+  order: 21
+---
+
+Observability has two jobs: operate a cluster safely and prove which code path
+was exercised. “The request returned 200” is insufficient for either job.
+
+## Signals by layer
+
+| Layer | Primary evidence | Questions answered |
+|---|---|---|
+| process | PID, `/proc/$pid/exe`, full artifact SHA, start time, unit status | which binary is actually running? |
+| HTTP runtime | connection/request admission, event-loop lag, timeout/cancel reason, native/legacy dispatch counters | did the route use the intended execution path? |
+| blocking domains | active/queued/rejected storage and DB jobs, per-device admission | is blocking work bounded and isolated? |
+| Swift service | access/error logs, `/recon/*`, ring/policy identity, updater/replicator/reconstructor passes | is the data plane converging? |
+| node | CPU, memory/RSS, file descriptors, disk latency/space/inodes, network errors | is the host a bottleneck or failure source? |
+| client | exact status/header/body, latency distribution, bytes and integrity | what did a real client observe? |
+
+## Provenance first
+
+Every formal run records source commit, lockfile/compiler/features, build
+command, artifact SHA, live executable SHA, configuration/ring hashes, test
+identity manifest, route, and start/end time. Capture before and after hashes
+for protected production listeners so a lab run can prove it did not replace
+them.
+
+## Concurrency endpoint
+
+The candidate exposes a concurrency snapshot under recon. Use it to verify
+route-level native async dispatch, forbidden legacy/block-in-place activity,
+connection/request admission, traffic classes, buffer peaks, deadlines,
+cancellation, and bounded blocking domains. Compare counter deltas around one
+named canary; do not infer behavior from the presence of a metric name.
+
+## Logs
+
+Access logs need transaction ID, method, sanitized path/account context,
+status, bytes, duration, and relevant backend timing without secrets. Runtime
+logs should make admission rejection, deadline expiry, cancellation, task join
+failure, durability-barrier outcome, and graceful-shutdown forcing explicit.
+
+Never log authorization headers, S3 signatures, TempURL signatures, token-file
+contents, or hash prefix/suffix values.
+
+## Alerts
+
+At minimum alert on:
+
+- service/process absence and unexpected binary identity;
+- event-loop lag or health-check p99 breach;
+- sustained admission rejection or saturated blocking queues;
+- storage/DB error rate and queue age;
+- disk space, inode, mount, XFS/xattr, and latency thresholds;
+- replication/reconstruction/auditor/updater pass staleness;
+- quarantine growth, async-pending growth, or repair debt;
+- unexpected restart, forced shutdown, or durability ambiguity.
+
+An alert rule being installed is not proof that notification delivery works.
+Test the receiver path and record the result.
+
+## UNKNOWN is a valid state
+
+Health aggregation must report `UNKNOWN` when a source cannot be queried. Host
+scrape liveness, Swift unit health, backend health, and API integrity are
+different signals; do not substitute one for another. See [Operations](/operations)
+and [Recovery](/recovery).

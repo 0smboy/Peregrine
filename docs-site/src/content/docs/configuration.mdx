@@ -1,123 +1,162 @@
 ---
 title: Configuration reference
-description: Fail-closed configuration semantics, worker model, the honored proxy and s3api knobs, and what is deliberately unsupported.
+description: Fail-closed INI loading, the async HTTP worker model, independent concurrency budgets, middleware configuration, and unsupported settings.
 sidebar:
-  order: 19
+  order: 8
 ---
 
-Peregrine reads standard Swift INI configuration (`proxy-server.conf`,
-`swift.conf`, per-service confs) so a Python cluster's files carry over. The
-semantics differ in one deliberate way: **malformed configuration refuses to
-start instead of silently defaulting.**
+Peregrine reads Swift-style INI files (`swift.conf`, `proxy-server.conf`, and
+per-service configuration). Reusing a file does not imply that every Python
+option has the same meaning. Treat startup validation and the effective
+configuration as part of a deployment gate.
 
-Canonical knob-by-knob table (73 rows, generated from the parser):
-[`docs/fairness-lab/CONFIG-PARITY.md`](https://github.com/0smboy/Peregrine/blob/main/docs/fairness-lab/CONFIG-PARITY.md).
-
-## Fail-closed startup
-
-Where Python's Paste/ConfigParser stack coerces or ignores bad values, the
-Rust proxy treats them as fatal load errors:
-
-| Surface | Fail-closed behavior |
-|---------|----------------------|
-| Unknown pipeline filter names | refuse to start — there is no dynamic plugin loader to hand them to |
-| `[filter:account_freeze] frozen_accounts` empty or comma-only | hard error; an accidentally-empty freeze list must not load as "freeze nothing" |
-| `[filter:ratelimit]` numeric options (`account_ratelimit`, `max_sleep_time_seconds`, `log_sleep_time_seconds`, tiers) | malformed numbers abort construction instead of applying defaults |
-| container-sync realms conf | strict parse: duplicate sections/options and malformed lines are load errors, so a typo cannot silently overwrite a realm secret |
-| `[filter:copy] yield_frequency` | strict integer; negative values clamp to 0 |
-| Storage policies / rings / hash prefix | parse errors exit(1) before any socket is bound |
-
-<Aside type="note" title="Why">
-A proxy that starts with a half-understood security or rate-limit config is
-worse than one that refuses to start. The 2026-08-14 lab incident
-([incidents](/incidents)) traces to a request-routing hole of exactly this
-family.
+<Aside type="caution" title="Candidate documentation">
+The async server semantics on this page describe candidate commit
+`17adf0bfa78b30b2a7eed9f39836e0d63c715d2c`. They have source and isolated-lab
+evidence, and G6 is GREEN; G7 is not accepted. They are not a production
+acceptance claim.
 </Aside>
 
-## Worker model
+## Startup rules
 
-`workers` does **not** mean what it means in Python, and iso-config
-comparisons must account for it:
+The loader fails closed when continuing would create an ambiguous security,
+routing, or storage state.
 
-- Python: `workers` = eventlet prefork **process** count.
-- Rust: `workers × max_clients` → a **thread** pool clamped to 128 per
-  process.
-- `servers_per_port ≥ 1` (object) restores Python-parity process isolation:
-  ring ports are discovered and one OS process is supervised per
-  (port, worker). Details:
-  [`docs/fairness-lab/WORKERS-SEMANTICS.md`](https://github.com/0smboy/Peregrine/blob/main/docs/fairness-lab/WORKERS-SEMANTICS.md).
+| Input | Result |
+|---|---|
+| unknown pipeline filter | startup failure; there is no dynamic Paste plugin loader |
+| `server_runtime=legacy`, `sync`, `blocking`, or `eventlet` | startup failure; production serve is async HTTP/1.1 only |
+| invalid storage policy, ring, or hash configuration | exit before binding a service socket |
+| malformed numeric filter option | filter construction fails instead of silently selecting another value |
+| duplicate or malformed container-sync realm entry | configuration error |
+| empty `account_freeze.frozen_accounts` | configuration error |
 
-The Contabo lab object servers listen per-device on `:6211/:6212` via
-`servers_per_port` — the conf's nominal `6210` is the base, not the bound
-port. Recon and the ops kit use `/recon/stage`.
+Some ordinary HTTP-server values retain a documented compatibility default
+when absent or unusable. Do not generalize that behavior to policy, pipeline,
+or security settings.
+
+## Process, runtime, connection, and request limits
+
+The production path is Hyper HTTP/1.1 on a Tokio multi-thread runtime. An idle
+keep-alive connection is a pending task on the reactor; it does not reserve one
+OS thread.
+
+The candidate does **not yet map the historical knobs uniformly across all four
+servers**. Capacity review must be service-specific:
+
+| Service | Current candidate mapping |
+|---|---|
+| proxy | numeric `workers` directly selects Tokio runtime threads; unset, `auto`, or `0` uses CPU count × 16 clamped to 16–128. `process_workers` controls OS prefork. `max_connections` and `max_active_requests` are explicit independent admissions; `max_clients` is the legacy request default and also contributes to the connection queue. |
+| account / container | numeric `workers > 0` is still adapted as `workers × max_clients`, clamped to 128 Tokio threads; `max_clients` also sizes the connection queue. With no numeric workers, the shared CPU-scaled runtime default applies. These mains do not yet expose the proxy's independent process/connection/request knobs. |
+| object | with `servers_per_port = 0`, numeric `workers > 0` is likewise `workers × max_clients`, clamped to 128; with `servers_per_port > 0`, one OS child is supervised per port/worker slot, `workers` is ignored, and each child maps `max_clients` to its capped runtime pool and queue. |
+
+All of these paths use async Hyper/Tokio serving; the legacy sizing formula
+does not mean one thread per idle connection. It does mean that the configuration
+surface has not completed the independent-budget model across every service.
+Treat this as an explicit G3/G7 sizing and observability item, not as a solved
+capacity contract.
+
+Proxy-specific settings:
+
+| Setting | Meaning | Default or fallback |
+|---|---|---|
+| `workers` | proxy Tokio runtime worker threads | CPU count × 16, clamped to 16–128, when unset/non-numeric/`0` |
+| `process_workers` | proxy OS prefork process count | 1 |
+| `worker_model=process` or `prefork` | treats numeric proxy `workers` as the process count | explicit compatibility mode |
+| `worker_model=eventlet` | proxy-only historical alias for OS prefork sizing; it does **not** create greenlets | explicit compatibility mode |
+| `max_connections` | proxy accepted-connection admission cap | `0` derives from runtime threads plus connection queue |
+| `max_active_requests` | proxy in-flight request cap | `max_clients` |
+| `max_clients` | legacy proxy request default and connection-queue input | 1024 |
+| `client_timeout` | socket inactivity timeout, in seconds | 60 |
+| `reuse_port` | listener `SO_REUSEPORT` | false |
+
+The architectural target is still independent connection admission, active
+requests, traffic classes, storage jobs, database jobs, and memory. Do not use a
+single thread-count calculation as fleet capacity.
+
+```ini
+[app:proxy-server]
+server_runtime = async
+workers = auto
+process_workers = 1
+max_connections = 131072
+max_active_requests = 2048
+client_timeout = 60
+```
+
+The values above illustrate the shape only; they are not fleet sizing advice.
+Admission limits must be derived from measured file-descriptor, memory, CPU,
+device, and backend budgets. See [Concurrency runtime](/concurrency).
+
+## Request and upload bounds
+
+The HTTP layer also carries finite protocol and lifetime bounds: request-line,
+header-line/count/total-size limits, `head_deadline`, maximum requests per
+connection, progress-aware body-idle timeout, total upload lifetime, client
+write timeout, and graceful-shutdown deadline. A progress timeout refreshes
+when bytes arrive; an upload lifetime does not.
+
+Do not disable both kinds of upload deadline. Slow progress and an indefinitely
+long upload are separate failure modes.
 
 ## `[app:proxy-server]`
 
-| Knob | Default | Notes |
-|------|---------|-------|
-| `account_autocreate` | `false` | when `true`, a container PUT on a missing account creates the account first — and **fails closed with `503`** if that autocreate fails, then re-checks visibility (`404` if still unobservable) before any container fan-out |
-| `allow_account_management` | off | account PUT/DELETE require it, as in Python |
-| `workers` / `max_clients` | see above | thread-pool sizing |
-| node/ring paths, policies | Swift-standard | per-policy rings; `ec` feature required for EC policies |
+| Setting | Behavior |
+|---|---|
+| `account_autocreate` | when enabled, container creation first creates and then rechecks a missing account; inability to make it visible fails closed |
+| `allow_account_management` | gates account PUT and DELETE |
+| `workers`, `process_workers`, `worker_model` | proxy execution topology described above |
+| `max_connections`, `max_active_requests`, `max_clients` | proxy connection/request admission described above |
+| ring/policy paths | Swift ring and storage-policy inputs; EC policies require Linux and the `ec` build |
+| `pipeline_strict` | rejects pipeline/configuration issues instead of silently accepting them |
 
-Production posture on the lab fleet (perf-lever program, CLOSED,
-`tools/test-results/contabo-deploy-20260801/perf-levers/SUMMARY.json`):
+## `[filter:s3api]`, `[filter:s3token]`, and auth filters
 
-```ini
-workers = 16
-container_update_mode = sync
-container_update_timeout = 1.0
-fsync_on_close = true
-reuse_port = false
-```
+| Setting | Meaning |
+|---|---|
+| `location` | region returned by GetBucketLocation |
+| `storage_domain` / `storage_domains` | virtual-host bucket domains |
+| `dns_compliant_bucket_names` | bucket-name validation policy |
+| `allowable_clock_skew` | SigV2/SigV4 timestamp rejection window |
+| `enable_extended_subresources` | enables the extended subresource group |
+| `anonymous_account` | maps unsigned S3-shaped GET/HEAD to one Swift account; container ACLs still authorize the read |
+| `reseller_prefix` | account prefix used by s3token/Keystone mapping |
 
-## `[filter:s3api]` and friends
+Credentials and secret-handling guidance is in [Authentication](/authentication).
 
-| Knob | Meaning |
-|------|---------|
-| `location` | the region answered by GetBucketLocation |
-| `storage_domain` (or `storage_domains`) | virtual-host–style bucket domains; Python spells it singular |
-| `dns_compliant_bucket_names` | bucket-name strictness for create/validate |
-| `allowable_clock_skew` | SigV4/SigV2 time window — a real rejection (`403 RequestTimeTooSkewed`) since the F1 generation, not a dead knob |
-| `enable_extended_subresources` | gates the extended subresource set |
-| `anonymous_account` | when set, unsigned S3-shaped GET/HEAD map to this Swift account (no auth override) so container `.r:*` ACLs can serve public reads; unset = off |
-| `[filter:s3token] reseller_prefix` | EC2-credential → Keystone path |
+## Account freeze
 
-## `[filter:account_freeze]`
-
-Deny-all for named Swift accounts, used to fence incident accounts:
+The account-freeze filter denies every method for explicitly named accounts,
+including the S3 dispatch path.
 
 ```ini
 [filter:account_freeze]
 use = egg:swift#account_freeze
-frozen_accounts = AUTH_test
+frozen_accounts = AUTH_example
 ```
 
-Every method on a frozen account answers `403` with a body that cannot be
-mistaken for success. S3 dispatch honors the same list. An empty list is a
-startup error, and the S3-side denial is covered by the 2026-08-14
-`s3api-frozen-accounts` lab run.
+An empty list is rejected. Keep incident-specific account names and evidence
+out of reusable examples.
 
 ## Middleware pipeline
 
-Implemented filters are listed in the [parity matrix](/parity#middleware).
-Pipeline names resolve to the Rust implementations; memcache/recon aliases
-ride NamedPassthrough slots; unknown names fail closed. There is **no**
-`use = egg:…` dynamic code loading — third-party Paste plugins are
-deliberately unsupported.
+Configured names resolve only to compiled Rust filters or documented named
+passthrough slots. Peregrine does not load arbitrary Python/Paste code from
+`use = egg:...`. Unknown names fail closed. A matched name is not sufficient
+proof of semantic parity; check [Compatibility boundaries](/parity) and the
+official-suite evidence for that path.
 
-## Deliberately unsupported knobs
+## Known unsupported or changed options
 
-High-signal rows from CONFIG-PARITY (the parser sees and ignores nothing —
-these are documented as unsupported):
+| Service | Option or behavior | Status |
+|---|---|---|
+| object | `eventlet_tpool_num_threads` | eventlet-specific; unsupported |
+| object | `use_splice` | not an eventlet compatibility path |
+| container | legacy `allow_versions` | use configured versioned-writes/S3 versioning paths where validated |
+| proxy | arbitrary Paste plugins | unsupported; no dynamic loader |
+| all | `server_runtime=legacy` | removed; hard startup error |
 
-| Service | Knob | Why |
-|---------|------|-----|
-| object | `use_splice`, `eventlet_tpool_num_threads` | eventlet-specific I/O model; the Rust server does not emulate it |
-| object | `conn_timeout`, `node_timeout`, `replication_server` | not parsed at the object layer |
-| account | `databases_per_node` | not parsed |
-| container | `allow_versions` | legacy versioning; use `versioned_writes` / S3 versioning |
-| proxy | arbitrary Paste `pipeline` entries | no dynamic loader, fail closed |
-
-If a knob you rely on is not in CONFIG-PARITY as parsed, assume it is
-ignored and verify before rollout.
+If a required key is neither documented nor exercised by a source-level or
+live test, treat it as unverified. Run `swift-deploy audit`, configuration
+validation, a non-mutating preflight, and the relevant compatibility gate
+before rollout.

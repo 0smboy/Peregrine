@@ -2,10 +2,18 @@
 title: Operations
 description: Health, replication and reconstruction, the node-down HA drill, and EC self-heal.
 sidebar:
-  order: 21
+  order: 20
 ---
 
-## Current fleet state
+<Aside type="caution" title="Dated fleet record">
+The fleet paragraph below records the 2026-08-18 Guard deployment. It is not
+the current candidate state and does not authorize a rollout. The `17adf0b`
+line is G6 GREEN but remains isolated from production; G7 is NOT
+ACCEPTED. Read
+[Current status](/status-2026-08-31) first.
+</Aside>
+
+## Historical fleet state — 2026-08-18
 
 As of 2026-08-18: proxies 4/4 + VIP run the **Guard** generation
 (`3d0138d5…`), object servers are the 2026-08-18 BUG-1 build
@@ -69,19 +77,19 @@ the object expirer. Only `swift-account-reaper` remains frozen — see
 
 <Aside type="caution" title="Reconciling mixed EC state by hand">
 A deleted EC object can leave stale data fragments alongside newer tombstones on
-different devices — a state the reconstructor may loop on. The tombstone is
-authoritative (newer): remove only the stale `#<idx>#d.data` fragments, keep the
-`.ts` tombstones, and never touch a live object in the same partition. Revert
-errors clear on the next pass.
+different devices, a state the reconstructor may loop on. Do not delete a
+fragment as a first response. Capture timestamps, policy, partition, fragment
+indexes, durable markers, tombstones, and peer state; establish the authoritative
+timestamp; then follow the evidence-preserving [recovery procedure](/recovery).
 </Aside>
 
 ## EC self-heal
 
-The reconstructor heals a lost fragment quickly. In the production pass, deleting
-fragment `#2` of a live object left the degraded read serving correct data
+In the historical 2026-08-18 fleet drill, deleting fragment `#2` of a live
+object left the degraded read serving correct data
 (2+1 tolerates one loss), and the reconstructor **rebuilt the exact fragment on
-its owner node within ≤15 s** — all three fragments back at the original
-timestamp.
+its owner node within ≤15 s**, with all three fragments back at the original
+timestamp. This dated canary is not a current G6 or G7 acceptance result.
 
 ## Node-down HA drill
 
@@ -108,9 +116,10 @@ POST /lab/api/node/up     {"node":"swift2"}
 </Step>
 </Steps>
 
-**Result (production pass):** with one node fully down, replication **and**
-erasure coding each served **100% of reads and writes** — EC writes surviving
-via handoffs.
+**Historical 2026-08-18 result:** with one node fully down, replication and
+erasure coding each served 100% of that drill's reads and writes, with EC writes
+surviving via handoffs. This is a bounded dated result, not a current G7 pass or
+an availability SLO.
 
 <Aside type="note" title="Tokens on node-down">
 tempauth tokens cached on a downed node's memcached go invalid, so a client

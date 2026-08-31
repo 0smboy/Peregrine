@@ -5,6 +5,13 @@ sidebar:
   order: 17
 ---
 
+<Aside type="caution" title="Historical S3 scoreboard">
+The 49/8 record on this page is a dated 2026-08-18 dual-oracle result. It is not
+the current G5 result and it does not accept the `17adf0b` release line. Current
+gate truth: G6 GREEN, G7 NOT ACCEPTED, production readiness NO-GO. See
+[Current status](/status-2026-08-31).
+</Aside>
+
 Peregrine's S3 claims are not self-graded. Every scored run sends the same
 request to **two live backends** and compares what a client would see:
 
@@ -49,8 +56,9 @@ failed == missing == skipped == cleanup_failed == 0
 executed == required == 57
 ```
 
-Anything else is reported as the FAIL it is. The current standing is
-**49/8 — not GREEN**, and the stance stays `IMPLEMENTED_SUBSET_ONLY`.
+Anything else is reported as the FAIL it is. The dated 2026-08-18 standing was
+**49/8 — not GREEN**, and the stance stays `IMPLEMENTED_SUBSET_ONLY` until a
+current official G5 run closes its own contract.
 
 A **second scoreboard**, `tools/strict-s3-supplement.py` (PR #8), scores
 the seven Rust-ahead extras against AWS semantics (live r3: **7/7 PASS**)
@@ -74,9 +82,9 @@ Python header patches on the oracle. Full narrative:
 | post-SIZE (ListVersions `Size`) | Size | 57/57/42/15/0 | 0 |
 | post-PY-XML-CT | Size | **57/57/49/8/0** | 0 |
 | post-GATE (proxy-side fixes, S3 surface unchanged) | Gate | **57/57/49/8/0** | **0** |
-| **post-GUARD (current; 405 + CAS live, fail set unchanged)** | Guard | **57/57/49/8/0** | **0** |
+| **post-GUARD (historical 2026-08-18; 405 + CAS live, fail set unchanged)** | Guard | **57/57/49/8/0** | **0** |
 
-Current report: `strict-s3-dual-20260818-postguard.json`, SHA-256
+Historical report: `strict-s3-dual-20260818-postguard.json`, SHA-256
 `52588c824c37b34338eeb2e40bcf8dc38c5d8df6ce4056738e55e3ac975ce7c9`;
 failing-case set identical to post-GATE
 (`strict-s3-dual-20260817-postgate.json`, SHA-256

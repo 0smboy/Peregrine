@@ -1,9 +1,16 @@
 ---
 title: Performance
-description: Measured throughput and latency, the accept-loop fix that made the rewrite faster than Python, and the write-concurrency optimization.
+description: Historical route-labelled throughput and latency evidence, superseded fairness boundaries, and the work still required for G8.
 sidebar:
-  order: 23
+  order: 25
 ---
+
+<Aside type="danger" title="Historical measurements only">
+No number on this page is a current G8 result. The `17adf0b…` line closes G6,
+but G7 is not accepted and the other ordered prerequisites are not all closed,
+so formal performance acceptance is blocked. Keep
+the route/noise labels attached to every number.
+</Aside>
 
 All numbers below are from a four-node Contabo HA lab against Python OpenStack
 Swift 2.35.0. Evidence pack:
@@ -85,7 +92,7 @@ write concurrency:
 | object workers | 4 KB PUT/s | p50 | p99 |
 |---------------:|-----------:|----:|----:|
 | 2 (historical baseline) | 194 | 187 ms | 2028 ms |
-| **16 (current deployed floor)** | **344** | **113 ms** | **784 ms** |
+| **16 (historical deployed floor for this run)** | **344** | **113 ms** | **784 ms** |
 | 64 | 350 | 115 ms | 1288 ms |
 
 **Shipped:** worker floor **16**, lock-free `crossbeam` MPMC accept queue
@@ -104,7 +111,7 @@ second-order deltas limited).
 | L2 `fsync_on_close=false` | **DROP** | ~+4.9% (&lt;10% gate) |
 | L4 `SO_REUSEPORT` | **DROP** | ~0.84×; no gain on single-acceptor pool |
 | L3a multi-container | **ops guidance** | c4/c1 ≈1.19× @128; sharding (L3b) deferred |
-| L5 tokio | **ADR only** | not required while SAIO Rust 1 KB PUT @c32 ≫ Python |
+| L5 tokio | **historical decision at the time** | the later candidate now implements Hyper/Tokio async serve; it still requires G3/G7/G8 acceptance |
 
 **Production knobs after the program (restored / kept):**
 

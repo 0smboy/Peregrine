@@ -1,0 +1,67 @@
+---
+title: Contributing and development
+description: Source-of-truth rules, safe branches, Rust checks, documentation checks, evidence handling, and review expectations.
+sidebar:
+  order: 32
+---
+
+Peregrine changes are reviewed as behavior plus evidence. A large diff with no
+reproducible proof is incomplete; a green local test with no source provenance
+is not a release result.
+
+## Work safely
+
+- start from the canonical repository and record branch/base commit;
+- preserve dirty trees and incident evidence; never reset or clean work you do
+  not own;
+- isolate builds and tests from production listeners and data;
+- keep one behavior change per reviewable commit where practical;
+- add characterization before changing a compatibility edge;
+- distinguish source, unit, Linux/SAIO, live-lab, and production evidence.
+
+## Rust checks
+
+Run the narrow test for the changed component first, then the relevant
+workspace checks. EC requires Linux, liberasurecode, and matching features.
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --exclude swift-ec
+```
+
+Use `--locked` for release/candidate builds. Record the toolchain, target,
+features, and final artifact hashes.
+
+## Documentation checks
+
+From `docs-site/`:
+
+```sh
+npm run lint:docs
+npm run typecheck
+npm run build
+```
+
+The build must produce indexed pages, `/llms.txt`, Markdown alternates,
+robots, and OG routes. Check internal and external links, sidebar order, and
+every changed page in a browser. Documentation claims must match source and
+current gate evidence.
+
+## Review checklist
+
+1. What exact contract changes?
+2. What is the Python/AWS or format oracle?
+3. Which negative, timeout, cancellation, and retry cases are covered?
+4. Are queues, buffers, and tasks bounded?
+5. Could a blocking call reach a network runtime thread?
+6. Does failure leave durability or database state ambiguous?
+7. What full gate must rerun after the canary?
+8. Are compatibility and release claims scoped accurately?
+
+## Commit and release discipline
+
+Do not force a candidate onto `main`, create a production tag, or publish a
+release until the authorized acceptance contract is met. Preserve exact commit
+SHAs and immutable evidence paths in the dated status/release record. See
+[G0-G8 validation](/validation-gates) and [Upgrade and rollback](/upgrades).

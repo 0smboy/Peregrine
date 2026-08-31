@@ -1,23 +1,33 @@
 ---
-title: Production contract
-description: Written subset for in-scope Keystone projects — 49/8 acceptance, in-scope S3, extras kept. Stance IMPLEMENTED_SUBSET_ONLY.
+title: Production contract (historical)
+description: Historical implemented-subset contract, retained for scope and rollback context; it is not a current go-live approval.
 sidebar:
   order: 18.5
 audience: human
 ---
 
-This page is the one-page contract for the implemented S3 / Swift subset
+<Aside type="caution" title="Historical scope; current production verdict is NO-GO">
+This page preserves the 2026-08-18 implemented-subset contract and rollback
+context. It is not a current production approval. On 2026-08-31, W068
+replication and W069 EC merge in strict scorer W070 for **G6 GREEN** on source
+`17adf0bfa78b30b2a7eed9f39836e0d63c715d2c`. G7 is **NOT ACCEPTED**, G8 is
+blocked, and the current production verdict remains NO-GO. See
+[Current status](/status-2026-08-31).
+</Aside>
+
+This page is the historical one-page contract for the implemented S3 / Swift subset
 on this fleet. The isolation unit is a **Keystone project** (historical
 “tenant”), not a single invented customer name. Stance:
 **IMPLEMENTED_SUBSET_ONLY**. It is not a drop-in for every S3 client, and
 it is not a Swift twin.
 
 <Aside type="caution" title="Lab contract, not a production go-live">
-Live proxies and the VIP run Guard (`3d0138d5…`,
-[releases](/releases)). Stance remains **IMPLEMENTED_SUBSET_ONLY**.
-49/8 is the acceptance pass, not GREEN. Gate `671bcbaf…` is the
-rollback copy on each node. Live object servers are the 2026-08-18
-BUG-1 build (`471e8b73…`).
+In the historical 2026-08-18 record, proxies and the VIP ran Guard
+(`3d0138d5…`, [releases](/releases)). The dated stance was
+**IMPLEMENTED_SUBSET_ONLY**. The 49/8 score was that contract's acceptance
+result, not a current GREEN gate. Gate `671bcbaf…` was the recorded rollback
+copy on each node, and object servers used the dated BUG-1 build
+(`471e8b73…`).
 </Aside>
 
 Scoreboard evidence: post-GUARD
@@ -49,7 +59,7 @@ project。
 | Stance | `IMPLEMENTED_SUBSET_ONLY` |
 | Frozen 57-case scoreboard | **49/8 is the acceptance pass** (`rc=1` is expected) |
 | 57/57 zero-fail runner | not a go-live condition |
-| Live now (2026-08-18) | Guard `3d0138d5…` ×4 + VIP; object `471e8b73…` ×4 |
+| Recorded live state (2026-08-18) | Guard `3d0138d5…` ×4 + VIP; object `471e8b73…` ×4 |
 | Binds the VIP | yes, on the Guard generation |
 | Isolation unit | Keystone **project** (Swift account `AUTH_<project_id>`) |
 | In-scope projects | operator-listed project IDs (may be several). No mandatory customer name. Lab leftovers `AUTH_dev` / `AUTH_test` / `AUTH_lab` are out of scope. |

@@ -1,0 +1,70 @@
+---
+title: Failure recovery
+description: Triage, quarantine, replication and EC repair, database recovery, protected commits, and evidence-safe rollback boundaries.
+sidebar:
+  order: 24
+---
+
+Recovery starts by preserving evidence and narrowing the fault domain. Do not
+turn a repair attempt into a second incident.
+
+## First response
+
+1. freeze mutation and record the exact time, route, affected account/policy,
+   nodes, PIDs, executable hashes, configuration/ring hashes, and symptoms;
+2. distinguish control-plane, proxy, storage-server, database, disk, network,
+   and background-daemon failure;
+3. protect the production listener and current binaries;
+4. copy logs and small metadata evidence before restarting or repairing;
+5. choose the smallest reversible action and define its rollback.
+
+Do not reset/clean a dirty source tree, delete quarantines, remove fragments,
+or rebuild rings as a first diagnostic step.
+
+## Replication repair
+
+For replicated policies, establish the newest authoritative data or tombstone
+before touching a suffix. Inspect timestamps, hashes, handoffs, async-pending
+updates, and replicator logs. A successful client GET does not prove every
+replica is converged.
+
+## EC repair
+
+For EC, record policy, partition, fragment index, durable state, and timestamp
+set. A direct fragment 404 may mean wrong routing, missing placement, a
+nondurable archive, or failed reconstruction; it is not automatically a safe
+absence. Reconstruct only from a coherent `ndata` set and verify the rebuilt
+fragment at the expected index.
+
+The historical W015 reconciler-offset failure was an acceptance blocker, not
+an operator instruction to delete data. W019 and W020 closed the intermediate
+EC diagnosis; final W068/W069/W070 evidence now closes G6 on `17adf0b`.
+
+## Database and sharding recovery
+
+Account/container databases can be replicated, sharded, cleaved, retiring, or
+reconciled. Capture broker metadata, shard ranges, DB epoch/retiring files,
+reconciler rows, and listing behavior before changing them. Never “fix” a
+listing by translating a backend 404 into an empty success.
+
+## Interrupted PUT and durability
+
+Before the durability barrier, disconnect or cancellation must abandon the
+temporary write and leave no committed object. Once the commit transition
+begins, the shielded operation must reach an unambiguous outcome even if the
+HTTP future is dropped. Verify both object visibility and temporary-file state.
+
+## Rollback
+
+Binary rollback is node-by-node and uses a previously hashed artifact. Restore
+the matching configuration and feature set, restart only the intended units,
+then verify health, exact executable hash, CRUD/read-back, and background-daemon
+progress. Do not roll back on-disk formats or rings casually; format migration
+needs its own reversible plan.
+
+## Exit criteria
+
+Recovery is complete only when the root cause is understood, integrity is
+verified, deferred repair queues converge, monitoring is stable, and the
+temporary mitigations and evidence are documented. A quiet alert dashboard by
+itself is not closure.

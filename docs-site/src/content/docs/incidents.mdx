@@ -2,9 +2,15 @@
 title: Incidents & freezes
 description: The AUTH_test routing incident, the frozen daemon set, leftover-resource policy, and the standing hard boundaries.
 sidebar:
-  order: 28
+  order: 30
 audience: human
 ---
+
+<Aside type="note" title="Historical evidence">
+Incidents are retained as immutable operational lessons. They are not current
+fleet status. Read [Current status](/status-2026-08-31) before acting on a PID,
+binary generation, daemon freeze, or rollback reference below.
+</Aside>
 
 Production credibility comes from what a project writes down about its
 failures. These are Peregrine's, with their current containment state.
@@ -21,7 +27,7 @@ invalid bucket names into Swift-native requests against the internal
 routing; empty-key writes answered honestly) and the fix was carried
 forward — superseded, not reverted — by the Wave-2 → Size generations that
 are dual-oracle verified live. The account itself is fenced by the
-`account_freeze` middleware ([configuration](/configuration#filteraccount_freeze)),
+`account_freeze` middleware ([configuration](/configuration#account-freeze)),
 verified S3-side by the 2026-08-14 `s3api-frozen-accounts` run.
 
 **Standing decisions.**

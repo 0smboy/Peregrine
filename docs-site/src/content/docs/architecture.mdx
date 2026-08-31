@@ -9,6 +9,11 @@ Peregrine is five cooperating programs organized into three planes: a **data
 plane** that stores and serves objects, a **control plane** that deploys and
 operates the cluster, and a **test plane** that proves it under load and fault.
 
+The current gate state is kept separately in the [2026-08-31 status
+snapshot](/status-2026-08-31). Architecture descriptions are not evidence that
+the current release line has passed G3, G7, or production acceptance. G6 is
+tracked separately and is GREEN on the dated W070 record.
+
 ## The design constraint: format fidelity
 
 Each implemented Swift format is treated as a compatibility contract.
@@ -29,7 +34,7 @@ interchangeability. The strict parity matrix controls rollout claims.
 
 ## The data plane — swift-rust
 
-A 15-crate workspace mirroring Swift's module boundaries. The path a request
+A 16-crate workspace mirroring Swift's module boundaries. The path a request
 travels: **client → proxy → object / container / account servers →
 container-update side channel → container server**. Object bodies stream end to
 end through 64 KB buffers, so a multi-GB PUT/GET never materializes in memory.
@@ -38,13 +43,14 @@ end through 64 KB buffers, so a multi-GB PUT/GET never materializes in memory.
 |-------|----------------|-------|
 | `swift-core` | `swift.common.*` | timestamps, ring hashing, storage-policy parsing, pickle, config, statsd/syslog/recon, constraints |
 | `swift-ring` | `swift.common.ring` | ring load/build, `get_nodes`, handoffs, per-policy rings |
-| `swift-http` | swob + WSGI | swob primitives, a threaded HTTP/1.1 server, streaming bodies, multipart-MIME |
+| `swift-http` | swob + WSGI serving semantics | Hyper/Tokio HTTP/1.1, `IncomingBody`, streaming bodies, multipart-MIME, and native async socket hand-offs |
+| `swift-runtime` | Eventlet concurrency semantics, not Eventlet implementation | admission budgets, deadlines, bounded blocking domains, storage/DB executors, structured task scopes, and durability barriers |
 | `swift-diskfile` | `swift.obj.diskfile` | on-disk object format, DiskFile lifecycle, EC fragment naming |
 | `swift-db` | account/container backends | SQLite backends, broker, sharding |
 | `swift-{account,container,object}-server` | the servers | REST + REPLICATE + the consistency daemons |
 | `swift-proxy-server` | `swift.proxy.*` | node iteration, quorum, controllers, EC controller |
 | `swift-middleware` | `swift.common.middleware.*` | tempauth, copy, SLO/DLO, versioned_writes, quotas, … |
-| `swift-crypto` / `swift-memcache` / `swift-s3api` | the proto crates | AES-256-CTR, memcache client, S3 SigV4 |
+| `swift-crypto` / `swift-memcache` / `swift-s3api` | supporting data-plane crates | AES-256-CTR, memcache client, S3 signing and request translation |
 | `swift-cli` | `swift-*` scripts | ring-builder, recon, get-nodes, info tools, ring-sim |
 | `swift-ec` | pyeclib / liberasurecode | the erasure-coding codec (Linux, `ec` feature) |
 
@@ -90,3 +96,22 @@ live interop evidence are claimable as byte-compatible.
 implementation, not against Peregrine's own expectations.
 </Step>
 </Steps>
+
+## Concurrency contract
+
+Source `17adf0b` contains the Hyper/Tokio serve path, `AsyncService` /
+`IncomingBody`, native async SSYNC and object-MIME hand-offs, and the dedicated
+`swift-runtime` crate. The older Phase-0 ADR that says the async serve path is
+unimplemented is historical baseline material, not the current code state.
+
+Streaming request and response bodies use bounded buffers, and fan-out/quorum
+work is explicit in the proxy controllers. A migrated route must not hide a
+synchronous `handle()` call, `block_in_place`, or an unbounded blocking wait
+inside the async executor.
+
+G3 is therefore route-specific: counters and runtime observation must show the
+declared async path was exercised. Reload/signal preservation and the G7 load
+harness are implementation and test infrastructure; they do not become a G7
+pass until the ordered concurrency/fault evidence is captured. W070 closes G6,
+but implementation in a clean candidate is not production acceptance: G3
+remains route-specific and G7 is not accepted.

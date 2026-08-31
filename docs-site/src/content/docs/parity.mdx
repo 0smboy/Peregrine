@@ -2,9 +2,16 @@
 title: Rust vs Python parity
 description: Honest feature matrix — partial counts as not implemented. What Peregrine/swift-rust can claim against OpenStack Swift.
 sidebar:
-  order: 15
+  order: 16
 audience: human
 ---
+
+<Aside type="caution" title="Matrix scope">
+Rows below describe implemented or historically evidenced surfaces; they are
+not a production certificate for the `17adf0b` release line. G6 is GREEN, G7
+is not accepted, and production readiness is NO-GO. Partial, unit-only, and lab-only
+entries remain weaker than complete gate acceptance.
+</Aside>
 
 This page is the public, **strict** comparison of Peregrine `swift-rust` to
 upstream OpenStack Swift. **Partial implementation is treated as not
@@ -13,10 +20,10 @@ implemented.** Product and fairness claims must stay inside what is green here.
 Canonical long form in-repo:
 [`docs/fairness-lab/RUST-VS-PYTHON-PARITY.md`](https://github.com/0smboy/Peregrine/blob/main/docs/fairness-lab/RUST-VS-PYTHON-PARITY.md).
 
-**As of 2026-08-18 · Contabo lab · not PRODUCTION-GO-LIVE.**
+**Historical snapshot: 2026-08-18 · Contabo lab · not PRODUCTION-GO-LIVE.**
 Claim: **IMPLEMENTED_SUBSET_ONLY**. Dual-oracle 57-case last run
 (post-GUARD, identical failing set to post-GATE / post-PY-XML-CT) `49/8` (`rc=1`).
-Guard (`3d0138d5…`) is live on the VIP. Rust extras Python 2.33 does not
+Guard (`3d0138d5…`) was the recorded VIP generation for that run. Rust extras Python 2.33 does not
 implement (object-ACL write, tagging/CORS mutate, RestoreObject) stay
 implemented and are **not** forced to 501; the second scoreboard scores
 them 7/7 against AWS semantics. Remaining 8 on the frozen runner =
@@ -38,7 +45,8 @@ live on [Releases](/releases).
 | Runtime-wired IAM and physical cold-tier routing | **Not implemented** (strict) |
 | Arbitrary third-party Paste plugin loading | **Not implemented**; unknown filters fail closed |
 | process_workers prefork | **Implemented** |
-| eventlet/greenlet serving semantics | **Not implemented**; helper module is not runtime-wired |
+| eventlet/greenlet serving semantics | **Not implemented by design**; candidate uses native Hyper/Tokio async serving instead |
+| native async HTTP/1.1 serving | **Implemented in candidate; acceptance open** (G3/G7 proof required) |
 | Multi-primary auto-shrink | **Not implemented**; disabled by default |
 | Multi-cluster sync / operator PEM / KMIP | **Not implemented** |
 
@@ -101,7 +109,8 @@ live on [Releases](/releases).
 | container-sync daemon (same-cluster) | yes | yes |
 | Multi-cluster container-sync realm soak | yes | **no** |
 | process_workers prefork | yes | yes |
-| eventlet/greenlet serving semantics | yes | **no** (isolated helper module only) |
+| eventlet/greenlet serving semantics | yes | **no** (native async model instead; not an Eventlet clone) |
+| native async HTTP/1.1 serve | no | candidate yes; G3/G7 acceptance open |
 | Operator VIP TLS PEM go-live | yes | **no** (script GREEN; Contabo self-signed LAB) |
 | Full ansible Python role twin | yes | partial (v3 subset) |
 

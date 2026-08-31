@@ -1,58 +1,99 @@
 ---
 title: cosbench-rs
-description: A Rust rewrite of Intel's COSBench core — an S3/Swift load generator with prepare/main/cleanup workloads, hash-integrity checks, and JSON/CSV reports.
+description: A Rust object-storage load generator for mock, S3, and Swift targets with validated YAML workloads and JSON, CSV, timeline, and HTML reports.
 sidebar:
   order: 12
 ---
 
-`cosbench-rs` is a Rust rewrite of the [intel-cloud/cosbench](https://github.com/intel-cloud/cosbench)
-core engine: a load generator for object stores. It drives **mock**, **S3**
-(multipart, range GET, path-style), and **Swift** targets, with Keystone v3 or
-v1 tempauth.
+`cosbench-rs` is a Rust implementation of the core COSBench workload model. It
+supports mock, S3, and Swift storage, staged concurrency, mixed operation
+ratios, integrity checks, multipart thresholds, and machine-readable reports.
 
-## Workload model
-
-A workload is a YAML document with staged operations. Stages run in order;
-within a stage, workers run concurrently for a fixed op count or duration.
-
-```yaml
-name: prod-mixed
-auth:
-  type: temp_auth
-  url: http://10.0.0.10:8085/auth/v1.0
-  user: test:tester
-  key: REPLACE_FROM_OPERATOR_SECRET
-storage:
-  type: swift
-  endpoint: http://10.0.0.10:8085/v1/AUTH_test   # Contabo Keepalived VIP
-  timeout_ms: 120000
-stages:
-  - { name: init,    kind: init,    workers: 4,  total_ops: 4,    operations: [{ type: create_container, ratio: 100 }], objects: {...} }
-  - { name: prepare, kind: prepare, workers: 32, total_ops: 2000, operations: [{ type: write, ratio: 100 }],           objects: {...} }
-  - { name: main,    kind: main,    workers: 64, runtime_secs: 90, operations: [{ type: read, ratio: 80 }, { type: write, ratio: 20 }], objects: {...} }
-  - { name: cleanup, kind: cleanup, workers: 32, total_ops: 2000, operations: [{ type: delete, ratio: 100 }],          objects: {...} }
-```
-
-<Aside type="tip" title="Endpoint override">
-Leave `storage.endpoint` empty to use the storage URL returned by auth. On the
-Contabo lab, pin the Keepalived VIP `http://10.0.0.10:8085/v1/AUTH_test` (or a
-node HAProxy) so runs do not depend on whatever auth returns.
-</Aside>
-
-## Run
+## Install and verify
 
 ```sh
-cargo build --release -p cosbench-cli
-./target/release/cosbench-rs run -c examples/swift-tempauth.yaml --report-dir reports
-./target/release/cosbench-rs import-xml -i examples/sample-cosbench.xml -o /tmp/w.yaml
-./target/release/cosbench-rs serve --bind 0.0.0.0:8080     # control plane + dashboard
+cd cosbench-rs
+cargo build --release --locked
+./target/release/cosbench-rs --help
+./target/release/cosbench-rs validate -c examples/swift-tempauth.yaml
 ```
 
-## Reports
+## Workload schema
 
-Each run emits JSON and CSV: per-stage `ops_ok` / `ops_fail`, throughput
-(ops/s and MB/s), and latency percentiles (p50 / p95 / p99). In the production
-pass a 90-second mixed run reached **240,120 ops at 0 failures, 2,667 ops/s,
-167 MiB/s, p50 9.6 ms / p99 127 ms** — see [Performance](/performance).
+Top-level fields are `name`, optional `description`, optional
+`sample_interval_secs`, `storage`, optional `auth`, and `stages`.
 
-For automation over cosbench-rs, use [autocos](/autocos).
+Storage types:
+
+- `mock`: optional simulated `latency_us`;
+- `s3`: endpoint, region, access/secret keys, path-style choice, timeout, and
+  multipart threshold/part size;
+- `swift`: storage endpoint, timeout, and optional static token.
+
+Auth types are `none`, `temp_auth`, and `keystone_v3`. For Swift, an empty
+storage endpoint uses the URL returned by authentication.
+
+```yaml
+name: swift-roundtrip
+description: prepare, mixed read/write, then cleanup
+sample_interval_secs: 1
+auth:
+  type: temp_auth
+  url: http://127.0.0.1:8080/auth/v1.0
+  user: test:tester
+  key: REPLACE_FROM_SECRET_STORE
+storage:
+  type: swift
+  endpoint: ""
+  timeout_ms: 60000
+stages:
+  - name: main
+    kind: main
+    workers: 8
+    runtime_secs: 30
+    operations:
+      - { type: read, ratio: 70 }
+      - { type: write, ratio: 30 }
+    objects:
+      cprefix: bench-
+      containers: { start: 1, end: 4 }
+      oprefix: object-
+      objects: { start: 1, end: 1000 }
+      size: 65536
+      hash_check: true
+```
+
+Each stage needs workers greater than zero, at least one operation with a
+nonzero total ratio, and either `runtime_secs` or `total_ops`. Write operations
+need a nonzero `size` or `size_max`. `sequential: true` makes object selection
+deterministic for prepare/cleanup-style stages.
+
+## Commands
+
+```sh
+cosbench-rs validate -c workload.yaml
+cosbench-rs run -c workload.yaml --report-dir reports
+cosbench-rs report -i reports --output reports/report.html
+cosbench-rs import-xml -i legacy.xml -o workload.yaml
+cosbench-rs serve --bind 127.0.0.1:19088
+```
+
+`run` writes JSON, CSV, and per-stage timeline CSV files when `--report-dir` is
+set. The HTML report is self-contained. Preserve the workload file and raw JSON
+beside derived CSV/HTML output.
+
+## Control server
+
+`serve` provides `/api/health`, `/api/workloads`, `/api/workloads/{id}`, and
+`/runs/{id}`. Submitted work runs asynchronously in the process. The server's
+CORS layer is permissive; bind it to loopback or a protected benchmark network
+and do not place storage credentials in browser-visible shared workloads.
+
+## Fair measurement
+
+Separate prepare, measured main, and cleanup stages. Confirm the prepared
+population before interpreting read success. Record route, client placement,
+host contention, connection/concurrency settings, object distribution, errors,
+and p50/p95/p99. Route-labelled historical results are on
+[Performance](/performance); G8 requirements are on
+[G0-G8 validation](/validation-gates).

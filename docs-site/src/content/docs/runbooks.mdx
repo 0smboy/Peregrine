@@ -2,8 +2,15 @@
 title: Runbooks
 description: The slim rolling proxy upgrade, drain hygiene, rollback, post-change gates, and the publish checklist — as actually executed on the fleet.
 sidebar:
-  order: 26
+  order: 28
 ---
+
+<Aside type="danger" title="Historical recipes require revalidation">
+These runbooks record procedures executed on earlier fleet generations. Do not
+apply them to the `17adf0b…` line or production without current authorization,
+exact binary/config/ring provenance, and a verified rollback. G6 is GREEN and
+G7 is NOT ACCEPTED; this page does not authorize production mutation.
+</Aside>
 
 Operational recipes as they are actually executed on the four-node lab
 fleet. Canonical ops source in-repo:

@@ -1,0 +1,83 @@
+---
+title: Swift API guide
+description: The native Swift REST surface, request semantics, streaming behavior, middleware boundaries, and how to validate compatibility.
+sidebar:
+  order: 6
+---
+
+The Swift REST API is the native data-plane contract. Peregrine targets the
+implemented and tested subset of OpenStack Swift semantics; it does not claim
+unqualified API compatibility.
+
+## Resource model
+
+```text
+/v1/<account>
+/v1/<account>/<container>
+/v1/<account>/<container>/<object...>
+```
+
+Object names may contain `/`; they remain object-key bytes rather than host
+filesystem paths. Account and container listings are paginated and may be
+affected by sharding, tombstones, policy reconciliation, and eventual updater
+work.
+
+## Core operations
+
+| Resource | Common methods | Important semantics |
+|---|---|---|
+| account | HEAD, GET; PUT/DELETE when management is enabled | metadata, container listing, reseller/admin policy |
+| container | PUT, HEAD, GET, POST, DELETE | ACLs, metadata, listing formats, storage policy, sharding |
+| object | PUT, GET, HEAD, POST, DELETE, COPY | ETag, ranges, conditionals, expiry, metadata, versioning, streaming |
+
+Success codes are operation-specific. Tests must compare exact status, required
+headers, body shape, and follow-up visibility rather than reducing a response to
+“2xx”.
+
+## Streaming request and response bodies
+
+The candidate async path accepts a lazy `IncomingBody`; object-sized content is
+not supposed to be materialized at the HTTP boundary. Content-Length and
+chunked framing are bounded by object-size, body-idle, and upload-lifetime
+limits. A client disconnect before commit must not publish an object.
+
+For large-object and EC paths, verify both stream behavior and final object
+integrity. A memory-flat unit test is useful but does not replace a live request
+that proves the selected binary and middleware route.
+
+## Conditional and integrity behavior
+
+- PUT ETags are validated and a mismatch is rejected.
+- client-facing ETag formatting is normalized to Swift semantics.
+- range and conditional requests must preserve status and relevant headers.
+- object metadata is bounded and validated before storage.
+- delete markers and tombstones participate in listing and versioning order;
+  a 404 is not interchangeable with an empty successful result.
+
+## Middleware-dependent surfaces
+
+TempURL, FormPost, SLO/DLO, bulk operations, symlink, versioned writes,
+encryption, static web, quotas, and S3 are pipeline features. A compiled module
+or recognized pipeline name does not prove the whole semantic surface. Validate
+the configured pipeline and the official functional/probe identities that use
+it.
+
+## Storage policies
+
+Replication and EC policies share the REST shape but not the backend write,
+read, repair, or durability path. EC requires a Linux build with the `ec`
+feature and matching liberasurecode support. A replication-only result must not
+be reported as the complete API gate.
+
+## Compatibility proof
+
+Use four evidence levels:
+
+1. source and unit characterization;
+2. official Swift functional tests against the exact configured pipeline;
+3. official probe tests with frozen Python-oracle identities;
+4. live failure, concurrency, and soak gates against exact binary hashes.
+
+The current acceptance state is on [Status](/status-2026-08-31). The complete
+gate contract is [G0-G8 validation](/validation-gates), and detailed feature
+boundaries are in [Compatibility](/parity).

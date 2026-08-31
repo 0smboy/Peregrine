@@ -1,0 +1,153 @@
+---
+title: Current status — 2026-08-31
+description: The dated Rust Swift release snapshot, gate truth, provenance rules, and safe boundary for the next verification run.
+sidebar:
+  order: 1
+audience: human
+---
+
+This is the current release snapshot for the **Rust Swift family** only:
+`swift-rust`, `swift-console`, `swift-deploy-rs`, `cosbench-rs`, and
+`autocos`. `swiftfuse` is deliberately outside this page and this release.
+
+<Aside type="caution" title="G6 is green; production is not approved">
+The strict frozen-179 G6 gate is **GREEN** on Rust Swift source
+`17adf0bfa78b30b2a7eed9f39836e0d63c715d2c`: formal replication W068 covers
+147 identities, formal EC W069 covers 32, and fail-closed scorer W070 reports
+zero missing, extra, duplicate, overlap, failure, error, unexpected result, or
+unexpected skip. G7 is **NOT ACCEPTED**, G8 is blocked, and no production
+promotion follows from this result.
+</Aside>
+
+## What changed in the last two weeks
+
+The release line has moved through a concentrated compatibility and gate-repair
+window. The source records are the commits, not a chat transcript or an
+aggregate test count.
+
+| Date | Commit | Recorded change |
+|------|--------|-----------------|
+| 2026-08-17–20 | [`e8ce550`..`e65d26a`](https://github.com/0smboy/Peregrine/commits/main/) | Full-workspace CI and EC coverage were made mandatory; S3 control paths, WORM/CAS, streaming bodies, and Ceph `s3-tests` compatibility were tightened. |
+| 2026-08-22 | [`c93a6ca`](https://github.com/0smboy/Peregrine/commit/c93a6ca) | Native-async S3 GET/HEAD/List/MPU and versioned streaming PUT became the active G3/G4 work line. |
+| 2026-08-23–24 | [`520ebf6`](https://github.com/0smboy/Peregrine/commit/520ebf6), [`7d71b9d`](https://github.com/0smboy/Peregrine/commit/7d71b9d) | Hyper body draining and the G7 load-test harness were added; G7 remains a harness, not an acceptance result. |
+| 2026-08-26–27 | [`4dc10c0`](https://github.com/0smboy/Peregrine/commit/4dc10c0), [`fda3691`](https://github.com/0smboy/Peregrine/commit/fda3691) | Native async multiphase object PUT, reconciler paths, expirer routing, and sharder leader behavior were repaired. |
+| 2026-08-29–30 | [`0d5c816`](https://github.com/0smboy/Peregrine/commit/0d5c816)..[`b6e36bf`](https://github.com/0smboy/Peregrine/commit/b6e36bf) | G6 sharding, replication, object, versioning, reload, and HTTP-boundary fixes were integrated; G7 evidence was made fail-closed. |
+| 2026-08-31 | [`64446f1`](https://github.com/0smboy/Peregrine/commit/64446f1d5870ea88835506a2581039fe407c9604) | G6 EC POST/nondurable and runner lifecycle were repaired. W019 passes 1/1 and W020 is 32/32 GREEN; same-candidate replication W021 is running. |
+| 2026-08-31 | `17adf0b` | Eight follow-up fixes close isolated sharder routing and timestamp behavior, cancellation and release service entries, reload/fixture isolation, listener rebind, and the raced keep-alive request during graceful shutdown. Two 100-attempt reload canaries pass before the formal frozen-179 rerun. |
+
+The G6-accepted Rust Swift source line is identified by the full commit
+`17adf0bfa78b30b2a7eed9f39836e0d63c715d2c`. The frozen comparison oracle is
+identified by SHA-256
+`f277baa81ccb6d62f38621b1f04b012f03c0ed4eb683fdac9bb7fe263c98e591`.
+
+The earlier `64446f1` bundle and Drive folder remain immutable historical
+candidate evidence; they are not the accepted W070 artifact. Release
+publication, auxiliary-component builds, and the refreshed Drive manifest are
+tracked on [Releases](/releases) and must not rewrite the historical bundle.
+
+## Gate truth
+
+The gates are ordered. A later gate cannot be called green from a partial lane,
+a canary, or a reduced unexpected count.
+
+| Gate | Contract | Current state |
+|------|----------|---------------|
+| G0 | Source, lockfile, compiler/features, artifact, and running PID agree. | **GREEN for the G6 claim:** W070 pins source `17adf0b`, artifact/wrapper/provenance manifests, both runners, and actual `/proc/$pid/exe` paths. This is not production provenance. |
+| G1 | Professional Linux environment and four-node lab roles are known. | **GREEN for isolated G6:** build and test roles are recorded, the test listener is isolated, and the production listener is guarded. G7/G8 require their own clean-mode preflight. |
+| G2 | Reproducible Linux build with the required EC feature and captured artifact digest. | **GREEN for the G6 artifact:** the clean offline locked v9 EC package and all binary/wrapper manifests are pinned. |
+| G3 | Every migrated route is genuinely async and has route-specific runtime proof. | Open until the candidate's route matrix and runtime evidence are attached. |
+| G4 | Official Swift functional suite matches the Python oracle. | Historical evidence exists; not a current candidate acceptance claim. |
+| G5 | Official S3 compatibility suite and its known-failure policy are matched. | Historical evidence exists; not a current candidate acceptance claim. |
+| G6-R | Frozen replication identities and accounting are exact on the accepted candidate. | **GREEN: W068**, 147 identities, 143 pass plus 4 Python-matching expected skips, no failure or error. |
+| G6-EC | Frozen EC identities and accounting are exact on the candidate. | **GREEN: W069**, 32/32 pass, no failure, error, or skip. |
+| G6 | Same-candidate replication plus EC identities, with no unexpected result. | **GREEN: W070**, exact 179/179 partition and outcome match; all strict invariants true and violations empty. |
+| G7 | Concurrency, reload, fault, and bounded-runtime evidence on the accepted G6 candidate. | **NOT ACCEPTED**; harness and scenario audit precedes any formal run. |
+| G8 | Performance and soak on the accepted G0–G7 candidate. | **BLOCKED** until every prerequisite gate, including G7, is accepted. |
+
+## Evidence hierarchy
+
+Use the strongest matching layer for each claim:
+
+1. **Source provenance:** exact commit, `Cargo.lock`, Rust version, feature
+   flags, build command, artifact SHA, and matching `/proc/$pid/exe`.
+2. **Unit/golden:** format and serialization checks. Useful, but not live proof.
+3. **Linux/SAIO:** a reproducible single-node or isolated-stack result. Useful,
+   but not four-node or production proof.
+4. **Live lab:** route-specific probes and official suites on the Contabo lab.
+5. **Production:** HA/VIP behavior only after the earlier gates are closed and
+   a dated, authorized rollout records the exact binary identity.
+
+The local frozen-lane records include the exact oracle SHA and lane manifest;
+the 147 replication identities and 32 EC identities must be merged exactly once.
+Never turn `147/147` replication accounting into a `179/179` G6 claim.
+
+The final Swift1 records are:
+
+- `/var/log/g6-ec/probe-ec-w068-formal-replication147-17adf0b-v28` — 147
+  identities, 143 pass plus 4 expected skips, 0 failure/error;
+- `/var/log/g6-ec/probe-ec-w069-formal-ec32-17adf0b-v28` — 32/32 pass,
+  0 failure/error/skip;
+- `/var/log/g6-ec/g6-score-w070-17adf0b-v9` — strict merged verdict `GREEN`,
+  179 identities, missing/extra/duplicate/overlap/unexpected all zero.
+
+W070's `score.json` SHA-256 is
+`f1b88427636cb25a3a6fe40e6da269577457061e182dfc75555bc33c922c592c`.
+Its merged ledger SHA-256 is
+`44a003859ab60792c52f47a164b3bf7031b57d560f3fdf092d314ced2067c84e`;
+`violations.txt` is empty. Both lanes pin the same source, artifact, wrapper,
+overseer, runner, frozen input, and actual process executables. Before/after
+hashes are stable, no isolated listener/process remains, and production
+`:8080` still resolves to SHA-256
+`ab5cb95c5c3973db8336e4940711fba18ce3cabaae62e13da0865c07ad31622b`.
+
+## Concurrency boundary
+
+The request path is client → proxy → storage server → update side channel. Body
+streams stay bounded; the async Hyper/Tokio path must not hide a synchronous
+`handle()` or a `block_in_place` on a migrated route. G3 therefore requires
+route-specific counters and runtime observation, not just a successful unit
+test. The reload and keep-alive fixes through `17adf0b` close the G6
+reload-induced probe failures. Their 100-attempt canaries are inputs to G7,
+not a G7 verdict.
+
+The test plane is intentionally separate: `cosbench-rs` produces repeatable
+S3/Swift load and reports, `autocos` owns lifecycle and cleanup, and the
+`swift-console` Lab drives bounded fault scenarios. None of these tools may be
+used to bypass the G6 ordering rule.
+
+## Four-node lab vs production
+
+The Contabo lab is `swift1`–`swift4`, with client traffic through the lab
+Keepalived/HAProxy path (`10.0.0.10:8085`) and Rust SAIO/diagnostic paths kept
+separate. The lab is where G0–G8 evidence is collected. It is not permission
+to alter the production listener.
+
+Production isolation is explicit: do not restart or replace production
+`:8080`, VIP, HAProxy, Keepalived, rings, Swift data, or active binaries while
+the G6 candidate is being built or compared. A lab result remains lab evidence
+until a separately authorized rollout records PID, executable SHA, health,
+oracle comparison, and rollback readiness.
+
+## Remaining blockers and rollback boundary
+
+- G3 still requires route-specific proof for every migrated async path.
+- G4 and G5 require accepted current-candidate official-suite records rather
+  than historical compatibility summaries.
+- G7 must run its concurrency, reload, cancellation, durability, resource-
+  bound, and fault matrix without reducing scenarios or weakening thresholds.
+- G8 remains blocked until the ordered prerequisites are accepted.
+- G6 GREEN is storage-semantics evidence; it is not permission to advertise a
+  drop-in Swift replacement or production readiness.
+
+Rollback is a release operation, not a test shortcut. Preserve the currently
+deployed production executable and its recorded digest; any future rollout
+must keep a verified prior binary and an exact, node-by-node rollback recipe.
+No rollback action is authorized by this document.
+
+## Inspect the source and records
+
+- [Peregrine source](https://github.com/0smboy/Peregrine)
+- [Architecture](/architecture)
+- [Testing and verification](/testing)
+- [Lab cluster](/lab-cluster)
+- [Releases and live binaries](/releases)

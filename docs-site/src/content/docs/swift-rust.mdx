@@ -1,13 +1,23 @@
 ---
 title: swift-rust
-description: The 15-crate storage engine, with compatibility claims scoped to tested OpenStack Swift paths.
+description: The 16-crate storage engine, with compatibility claims scoped to tested OpenStack Swift paths.
 sidebar:
   order: 10
 ---
 
+<Aside type="caution" title="G6 is accepted; production is not">
+The G6-accepted Rust Swift source is
+`17adf0bfa78b30b2a7eed9f39836e0d63c715d2c`. W068 replication plus W069 EC
+merge exactly once in W070 for a strict 179/179 GREEN result. G7 is not
+accepted and the complete production gate chain remains open.
+These implementation notes do not imply a production-ready Swift
+replacement.
+</Aside>
+
 `swift-rust` is the storage engine: the proxy, object, container and account
 servers, every consistency daemon, erasure coding, the ring, the SQLite
-backends, and the middleware pipeline: a 15-crate Rust workspace. It targets a
+backends, the middleware pipeline, and a bounded concurrency runtime: a
+16-crate Rust workspace. It targets a
 *strangler* migration model, but only formats and paths with explicit golden or
 live evidence are claimable as compatible. It is not a general production
 drop-in replacement.
@@ -17,8 +27,15 @@ drop-in replacement.
 A client request travels **client → proxy → object / container / account
 servers → container-update side channel → container server**. The proxy fans
 out to backends and picks a quorum best-response. Object bodies stream end to
-end through 64 KB buffers — a 1 GB object moves with a single-digit-MB peak-RSS
-delta across all servers.
+end through bounded chunks instead of being deliberately accumulated as one
+request-sized allocation. Exact peak-RSS and large-object limits remain G7/G8
+measurements; this page does not turn the streaming design into a memory claim.
+
+The network path is implemented with Hyper/Tokio. `swift-runtime` keeps
+admission control, deadlines, traffic classes, bounded blocking work,
+storage/DB execution, structured cancellation, and durability barriers behind
+one infrastructure boundary. The isolated W070 result accepts G6 storage
+semantics; it is not a G3, G7, G8, or production verdict.
 
 ## What's implemented
 
@@ -77,13 +94,19 @@ The workspace builds the daemon/CLI set: `swift-{proxy,object,container,account}
 ## Server configuration
 
 Servers read `SWIFT_DIR` (rings + `swift.conf`) and take a conf file argument.
-Key object-server tunables:
+The candidate still has service-specific compatibility mappings:
 
-| Key | Meaning |
+| Service | Worker/admission behavior |
 |-----|---------|
-| `bind_ip` / `bind_port` | listen address |
-| `devices` / `mount_check` | device root; require mounts |
-| `workers` | HTTP worker threads (raise from a low default for write concurrency — see [Performance](/performance)) |
+| proxy | numeric `workers` directly selects Tokio runtime threads; `process_workers`, `max_connections`, and `max_active_requests` are separate proxy knobs |
+| account / container | numeric `workers` still maps through `workers × max_clients`, capped at 128 runtime threads; `max_clients` sizes the queue |
+| object | the same product mapping applies without `servers_per_port`; port-worker mode supervises OS children and maps `max_clients` per child |
+
+The latter mappings are compatibility debt, not Eventlet or one-thread-per-idle-
+connection behavior. The target remains independent finite budgets, but G3/G7
+must prove the actual wiring and capacity of each service. See
+[Configuration](/configuration) and [Concurrency runtime](/concurrency) before
+sizing a service.
 
 <Aside type="note">
 The default build excludes `swift-ec` so it links anywhere. macOS cannot link

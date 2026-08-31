@@ -1,0 +1,83 @@
+---
+title: Authentication and credentials
+description: TempAuth, Keystone, S3 signatures, console sessions, deploy tokens, and the rules for keeping credentials out of evidence and source control.
+sidebar:
+  order: 5
+---
+
+Peregrine exposes several independent trust boundaries. A token that is valid
+for the Swift data plane is not automatically valid for the deployment or
+console control planes.
+
+## Trust boundaries
+
+| Surface | Authentication | Scope |
+|---|---|---|
+| Swift REST | TempAuth v1 token or configured Keystone/authtoken path | account, container, and object operations |
+| S3 | SigV4/SigV2 credentials; optional s3token mapping to Keystone | S3 request and mapped Swift account |
+| swift-console | server-side Swift login session cookie | Files and permitted console pages |
+| swift-deploy-rs UI/API | HTTP Basic user plus token-file secret | plan, validate, preflight, apply, and workspace operations |
+| monitoring backends | credentials held by swift-console | server-side metrics/log queries; never exposed to the browser |
+| node operations | configured SSH identity and strict host-key policy | explicitly gated lab/deploy actions |
+
+## TempAuth
+
+The v1 flow sends `X-Auth-User` and `X-Auth-Key` to `/auth/v1.0` and receives
+`X-Auth-Token` plus `X-Storage-Url`. Use the returned storage URL unless the
+test contract explicitly pins a route.
+
+```sh
+curl -si \
+  -H 'X-Auth-User: test:tester' \
+  -H 'X-Auth-Key: REPLACE_FROM_SECRET_STORE' \
+  http://127.0.0.1:8080/auth/v1.0
+```
+
+Sample SAIO credentials are lab-only. Do not carry them into a routed or shared
+environment.
+
+## Keystone and S3 token mapping
+
+The configured `authtoken`, `keystoneauth`, and `s3token` filters determine
+identity mapping. For S3, signature validation and the EC2-credential-to-
+Keystone exchange are separate steps. Keep the reseller prefix and project
+mapping consistent across middleware, rings, and test credentials.
+
+An S3 request can be cryptographically valid and still be unauthorized by
+Swift ACLs. Preserve both checks in compatibility tests.
+
+## Anonymous reads
+
+`s3api.anonymous_account` is off unless configured. When enabled, only unsigned
+S3-shaped GET/HEAD requests are mapped to that Swift account; ordinary
+container ACLs still decide whether the object is public. This is not a general
+authentication bypass.
+
+## Console sessions
+
+`swift-console` exchanges the submitted Swift credentials server-side, creates
+a bounded-idle session, and proxies privileged backends with server-side
+credentials. Bind it to loopback or a trusted management network and put TLS
+and an access-control boundary in front of it. Lab mutation, account admin, and
+load-test surfaces are separately disabled by default.
+
+## Deploy control token
+
+`swift-deploy ui --auth-token-file <path>` reads the HTTP Basic password from a
+file. The console keeps the username and token-file path in its configuration;
+the secret itself stays outside JSON, the repository, and browser responses.
+Only `/healthz` is public.
+
+## Credential handling rules
+
+- keep passwords, S3 secrets, hash prefix/suffix, TempURL keys, TLS private
+  keys, and deploy tokens out of Git and generated reports;
+- use owner-readable token files or an operating-system secret store;
+- redact authorization headers and query signatures from access logs;
+- make evidence reproducible with endpoint role, account label, binary SHA,
+  and credential source, not the credential value;
+- rotate a secret after accidental logging or inclusion in an artifact;
+- never reuse SAIO defaults on a network-reachable deployment.
+
+See [Security](/security) for hardening and [Configuration](/configuration) for
+the relevant filter settings.

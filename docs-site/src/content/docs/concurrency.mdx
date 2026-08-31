@@ -1,0 +1,115 @@
+---
+title: Concurrency runtime
+description: How Peregrine separates async network waits from bounded filesystem and database work, applies backpressure, and proves each serving path.
+sidebar:
+  order: 3
+---
+
+Peregrine does not reimplement Eventlet. Source `17adf0b…` serves HTTP/1.1
+with Hyper on Tokio and places blocking durability and database work behind
+finite executors. This is an execution-model change, not a claim that blocking
+syscalls became asynchronous.
+
+<Aside type="danger" title="Implementation is ahead of acceptance">
+The candidate contains the async serve path, `IncomingBody`, native async
+service dispatch, async SSYNC/object-MIME handoffs, and `swift-runtime`.
+G3 and G7 remain open. G6 is GREEN through the exact W070 frozen-179 ledger;
+that storage-semantics result does not replace route-specific G3 proof or the
+G7 concurrency/fault matrix. Source presence is not production acceptance.
+</Aside>
+
+## Execution domains
+
+| Domain | Runs here | Must not run here |
+|---|---|---|
+| network runtime | accept, HTTP parsing, keep-alive, timers, socket streaming, backend orchestration | `fsync`, SQLite, flock/xattr, blocking FFI, erasure coding, compression |
+| storage executor | bounded POSIX and durability jobs, with per-device admission | unbounded request fan-out |
+| database executor | bounded SQLite work | network waiting or detached tasks |
+| traffic-class budgets | foreground, replication, reconstruction, auditor admission | one global semaphore that lets one class starve all others |
+
+An idle keep-alive is a pending future. It does not occupy one worker thread.
+Filesystem and database calls remain blocking operations; isolating them keeps
+the reactor responsive and makes their queue depth explicit.
+
+## The runtime contract
+
+`swift-runtime` provides the substrate used by servers and middleware:
+
+- independent connection and request permits;
+- independent foreground, replication, reconstruction, and auditor budgets;
+- finite `BlockingDomain`, `StorageExecutor`, and `DbExecutor` queues;
+- per-device I/O permits;
+- structured task scopes and cancellation tokens;
+- header, keep-alive, body-idle, upload-lifetime, backend, replication, client
+  write, and shutdown deadlines;
+- backpressure windows and quorum-aware fan-out;
+- durability barriers that shield a commit transition from an abandoned HTTP
+  future;
+- concurrency metrics without request-specific high-cardinality labels.
+
+The runtime crate does not serve HTTP and does not wrap an entire synchronous
+request handler. The service layer must use its boundaries deliberately.
+
+## HTTP request path
+
+```text
+listener
+  -> Hyper HTTP/1.1 connection task
+  -> independent connection admission
+  -> independent request/traffic-class admission
+  -> AsyncService + IncomingBody
+  -> async backend fan-out
+  -> bounded storage/DB jobs where required
+  -> streamed response
+```
+
+`server_runtime=legacy`, `sync`, `blocking`, or `eventlet` is rejected at
+startup. The synchronous `handle_connection` path remains for focused unit
+tests; it is not the production accept loop. A legacy adapter still exists for
+explicitly characterized paths, so G3 must prove real requests do not enter it.
+
+## Streaming and cancellation
+
+`IncomingBody` consumes request frames lazily and enforces the Swift object-size
+limit. A body-idle deadline refreshes only when data arrives; an upload-lifetime
+deadline is absolute. Request cancellation must stop downstream work unless a
+durability transition has begun.
+
+For object PUT, successful completion must mean that the commit state is
+unambiguous. Client disconnect, timeout, and task cancellation before commit
+must not publish a partial object. Once the protected durability barrier starts,
+dropping the HTTP future must not silently abandon the commit.
+
+## Backpressure and overload
+
+Every queue and buffer needs a finite bound. At overload, admission fails or
+waits within a deadline and pressure propagates toward the producer. Growing
+memory is not an overload strategy. Connection, request, storage-device, DB,
+backend fan-out, and body-buffer limits are measured independently.
+
+## What must be measured
+
+`/recon/concurrency` and the runtime snapshot are used to prove which path a
+request actually took. A production-grade run records at least:
+
+| Evidence | Why it matters |
+|---|---|
+| binary path, `/proc/exe`, full SHA-256 | distinguishes candidate, stale lab, and production processes |
+| `native_async`, legacy sync, `block_in_place`, blocking-submit counters | proves routing rather than inferring it from source |
+| live/accepted/rejected connections and active requests | proves independent admission |
+| blocking/storage/DB queue depth and saturation | detects reactor leakage and hidden overload |
+| body-buffer current/peak and cancellation reason | detects materialization and cancellation bugs |
+| traffic-class active/rejected counts | detects starvation |
+| event-loop lag and health p99 during idle/slow-client load | validates responsiveness |
+
+Metrics names in source are not evidence by themselves. The counter must change
+on a real request of the claimed class, and forbidden counters must remain flat.
+
+## Historical ADR boundary
+
+The older Phase-0 concurrency ADRs under `docs/architecture/` correctly describe
+the original synchronous, bounded-thread server and the decision not to copy
+Eventlet. Their statement that async serve is unimplemented is now historical.
+Use those documents for design rationale, not current runtime status. The
+candidate source and this page describe the new implementation; the
+[G0-G8 gates](/validation-gates) describe what remains unaccepted.

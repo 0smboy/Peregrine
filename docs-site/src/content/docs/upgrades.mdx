@@ -1,0 +1,63 @@
+---
+title: Upgrade and rollback
+description: A gated, node-by-node workflow for candidate promotion, configuration changes, migrations, and exact rollback.
+sidebar:
+  order: 24.5
+---
+
+Peregrine does not deploy “latest”. It promotes a named artifact whose source,
+features, configuration, tests, and rollback copy are all known.
+
+## Promotion prerequisites
+
+- required G0-G8 gates are green for the intended claim;
+- source commit, `Cargo.lock`, compiler, target, feature set, and artifact SHA
+  are recorded;
+- configuration, rings, policies, middleware pipeline, and secrets are
+  validated separately;
+- the prior binary and configuration are backed up and hashed;
+- health, read-back, daemon-progress, and rollback commands are prepared;
+- the change window explicitly authorizes production mutation.
+
+The `17adf0b` line closes G6 but does not meet production prerequisites: G3,
+current-candidate G4/G5 acceptance, G7, and G8 remain open or blocked.
+
+## Node-by-node sequence
+
+1. drain or remove one non-owner node from client traffic where the topology
+   supports it;
+2. capture before-state and exact live executable hashes;
+3. install the already-built artifact without rebuilding on the node;
+4. restart only the intended units;
+5. verify PID/executable hash, `/healthcheck`, CRUD/read-back, policy paths,
+   background daemons, and error/concurrency metrics;
+6. hold long enough to expose delayed failures;
+7. repeat, keeping the VIP/leader owner last;
+8. perform the full post-roll compatibility and health gate.
+
+Do not combine a binary, ring, policy, middleware, firewall, and storage-layout
+change into one unreviewable action.
+
+## Configuration changes
+
+Validate the effective configuration with the candidate binary before the
+roll. Pay special attention to pipeline order, auth mapping, process/runtime
+worker semantics, connection/request limits, deadlines, policy/ring paths, and
+unsupported Python options.
+
+## Rollback trigger and procedure
+
+Define measurable triggers before starting: integrity mismatch, unexpected
+compatibility result, elevated 5xx, event-loop lag, admission collapse,
+background convergence failure, or inability to prove the running artifact.
+Rollback uses the preserved prior artifact and config, in reverse rollout
+order, with the same before/after verification.
+
+Never use `git checkout`, a local rebuild, or an unverified cache as a
+production rollback artifact.
+
+## After the roll
+
+Record every node's final PID and SHA, route-level health, acceptance run IDs,
+monitoring window, and the still-available rollback copy. Update the dated
+[release record](/releases); do not rewrite historical evidence.

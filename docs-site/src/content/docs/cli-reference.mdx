@@ -1,0 +1,85 @@
+---
+title: CLI reference
+description: Verified command surfaces for swift-deploy-rs, cosbench-rs, and autocos, with safe examples and output boundaries.
+sidebar:
+  order: 15
+---
+
+This reference follows the Clap definitions in the G6-accepted `17adf0b…`
+source line. Run
+`<binary> --help` on the exact built artifact before automation; help output is
+the executable contract.
+
+## `swift-deploy`
+
+| Command | Important options | Contact hosts? |
+|---|---|---:|
+| `audit` | `--bundle`, `--json` | no |
+| `validate` | `--inventory`, `--json` | no |
+| `plan` | `--bundle`, `--inventory`, `--playbook`, `--output`, `--json` | no |
+| `preflight` | `--inventory`, optional `--bundle`, `--known-hosts`, `--allow-password`, `--json` | yes, read-only |
+| `apply` | bundle/inventory/plan, exact `--confirm-digest`, host keys, explicit safety grants, `--json` | yes, mutating |
+| `modules` | `--json` | no |
+| `ui` | bind/port, bundle/inventory/playbook/plan, host keys, token file, workspace root | serves control API |
+
+`apply` safety grants are independent:
+
+```text
+--allow-disk-wipe
+--allow-firewall
+--allow-ssh-reconfigure
+--allow-host-reconfigure
+--allow-password
+```
+
+Omit a grant unless the sealed plan requires and the change window authorizes
+that exact capability.
+
+```sh
+swift-deploy audit --bundle bundle
+swift-deploy validate --inventory inventories/lab/hosts
+swift-deploy plan --bundle bundle --inventory inventories/lab/hosts \
+  --playbook bundle/swift.yml --output swift-plan.json
+swift-deploy apply --bundle bundle --inventory inventories/lab/hosts \
+  --plan swift-plan.json --confirm-digest '<exact digest>'
+```
+
+## `cosbench-rs`
+
+| Command | Options |
+|---|---|
+| `run` | `-c/--config`, optional `--report-dir` |
+| `validate` | `-c/--config` |
+| `import-xml` | `-i/--input`, `-o/--output` |
+| `report` | `-i/--input`, `-o/--output` (default `report.html`) |
+| `serve` | `--bind` (default `0.0.0.0:8080`) |
+
+```sh
+cosbench-rs validate -c examples/swift-tempauth.yaml
+cosbench-rs run -c examples/swift-tempauth.yaml --report-dir reports
+cosbench-rs report -i reports --output reports/report.html
+```
+
+The control server exposes `/api/health`, `/api/workloads`,
+`/api/workloads/{id}`, and `/runs/{id}`. Its CORS policy is permissive in
+source; bind or firewall it as a lab service, not a public control plane.
+
+## `autocos`
+
+Global option: `-v/--verbose`.
+
+| Command | Options |
+|---|---|
+| `run <target>` | `--start-task`, `--rerun-task`, `--collect`, `--prepare-worker`, `--object-count`, `--container-count`, `--runtime`, `--backend`, `--cosbench-url` |
+| `list [mode]` | use `fool` to list the suite namespace |
+| `remove <target>` | `-f/--fool` selects the suite directory |
+| `collect` | optional `--out` |
+
+Backends are `cosbench-rs` (default), `swift`, `java`, or `mock`. With the
+default backend, `ST_AUTH` selects Swift. Swift credentials are exactly
+`ST_AUTH`, `ST_USER`, and `ST_KEY` (lowercase variants also work). S3 uses
+`accesskey`, `secretkey`, and `endpoint` (uppercase variants also work), with
+`~/.s3cfg` fallback.
+
+`ST_ENDPOINT` is not part of the current credential loader and must not be
+documented as an active override.

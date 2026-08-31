@@ -2,7 +2,7 @@
 title: Philosophy
 description: Why Peregrine is built the way it is — format fidelity, no runtime Python, sealed deploys, and the Python oracle.
 sidebar:
-  order: 30
+  order: 33
 ---
 
 Peregrine makes a few deliberate bets. They explain why it looks the way it does
@@ -10,12 +10,12 @@ and where its guarantees come from.
 
 ## Format fidelity over everything
 
-A rewrite that reproduces Swift's formats exactly interoperates with the
-existing fleet and can be rolled out one node at a time. So every serialized
-format — the ring, the SQLite databases, the diskfile layout, pickled hashes,
-crypto metadata, HMAC signatures, EC fragment archives — is treated as a
-compatibility contract, not an implementation detail. This constraint drives
-everything else.
+Reproducing an accepted Swift format exactly can enable mixed-version
+interoperation and node-by-node rollout. Therefore each implemented serialized
+format — the ring, SQLite databases, diskfile layout, pickled hashes, crypto
+metadata, HMAC signatures, and EC fragment archives — is treated as a
+compatibility contract, not an implementation detail. Compatibility is claimed
+only where the matching oracle evidence exists.
 
 ## The oracle is Python, not ourselves
 
@@ -34,7 +34,8 @@ Ansible or Python at runtime.
 
 ## Sealed, reversible operations
 
-Anything that changes the cluster is bounded and reversible:
+Cluster-changing tools are designed around bounded, reviewable, reversible
+actions:
 
 <Steps>
 <Step>
@@ -44,9 +45,9 @@ capabilities (disk wipe, firewall, SSH reconfig) each require separate
 authorization.
 </Step>
 <Step>
-**Lab mutations are journaled.** Every fault the console injects records its
-undo *before* acting and auto-reverts on a TTL, so an experiment always heals —
-even if the operator walks away.
+**Guarded Lab mutations are journaled.** Supported fault actions record an
+undo before acting and use a TTL sweeper. Operators still verify recovery; a
+journal is not proof that every external failure healed.
 </Step>
 </Steps>
 
@@ -59,7 +60,8 @@ what the result happens to be.
 
 ## Streaming, bounded memory
 
-The object data path streams end to end through fixed buffers. A multi-GB PUT or
-GET never materializes in memory; peak RSS stays flat regardless of object size.
-That is a correctness property as much as a performance one — it is what lets a
-node serve large objects under load without being OOM-killed.
+The candidate object path is designed to stream through bounded buffers rather
+than materialize object-sized bodies. G3 proves that each route actually uses
+the native path; G7 measures buffer/RSS bounds under large bodies, slow clients,
+cancellation, and overload. Bounded memory is a correctness gate, not an
+architectural slogan.

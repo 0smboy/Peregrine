@@ -1,65 +1,93 @@
 ---
 title: swift-deploy-rs
-description: A bounded, Python-free deployer that runs the upstream Swift Ansible v3 plan natively — sealed plans, per-action authorization, and an embedded control console.
+description: A Rust-native, fail-closed executor for a pinned Swift Ansible v3 bundle, with sealed plans, preflight checks, and independent safety grants.
 sidebar:
   order: 11
 ---
 
-`swift-deploy-rs` is a bounded, Rust-native deployment executor for OpenStack
-Swift. It keeps the upstream playbooks, roles, templates and file assets, but at
-runtime depends on **no Python, no Ansible, and no `ansible-playbook`**. Unknown
-modules, unknown task syntax, and a modified plan all fail closed.
+`swift-deploy-rs` converts a supported, pinned Swift Ansible v3 bundle and
+inventory into a deterministic plan, seals its inputs, and executes the
+approved plan over OpenSSH. It does not run Python or `ansible-playbook` at
+runtime. It is a bounded compatibility layer, not a general Ansible engine.
 
-## What it does
+## Safety model
 
-<Steps>
-<Step>
-Parses the INI inventory, host/group vars, ranges, `children`, and Swift's
-security/ring config generation.
-</Step>
-<Step>
-Expands plays, roles, static includes, blocks, loops, handlers, `register`,
-`delegate` and `run_once` into a **deterministic JSON plan**.
-</Step>
-<Step>
-**Seals the plan with SHA-256.** Before `apply`, it re-verifies the plan,
-bundle, inventory and exact digests — a plan that changed after sealing will not
-apply.
-</Step>
-<Step>
-Applies over strict OpenSSH (host-key checking on by default; inventory
-passwords refused by default). Disk wipes, firewall changes, and SSH
-reconfiguration each require **separate authorization**.
-</Step>
-</Steps>
+```text
+bundle + inventory + playbook
+  -> audit + validate
+  -> deterministic JSON plan
+  -> plan digest + bundle fingerprint + inventory fingerprint
+  -> read-only preflight
+  -> exact digest confirmation
+  -> independent capability grants
+  -> apply
+```
 
-## Scope
+Unknown modules or syntax, changed plan/bundle/inventory inputs, failed
+preflight, missing capability grants, and host-key errors stop execution.
+Password authentication is rejected unless explicitly allowed.
 
-Targets the `swift_ansible_v3` (2023-07-25) source commit: 57 task/handler YAML
-files, 413 leaf tasks, and 28 execution modules are audited and covered. A
-`bundle_audit` proves the selected bundle is fully covered and the audit
-fingerprint is stable.
-
-## Control console
-
-The same binary embeds a reactive web control console (no Node.js, no external
-frontend). Its API — `/api/plan`, `/api/validate`, `/api/preflight`,
-`/api/apply`, `/api/state`, `/api/workspace/*`, `/rings/` — is token-guarded;
-only `/healthz` is public. The [swift-console](/swift-console) Deploy surface is
-a front end over this API.
-
-## Build & run
+## Command workflow
 
 ```sh
 cd swift-deploy-rs
-cargo build --release
-cargo test --workspace        # includes the bundle audit
-./target/release/swift-deploy ui --bind 127.0.0.1 --port 8789 \
-  --auth-token-file /etc/swift-deploy/ui-token
+cargo build --release --locked
+
+./target/release/swift-deploy audit --bundle bundle
+./target/release/swift-deploy validate \
+  --inventory bundle/config_sample/swift_hosts
+./target/release/swift-deploy plan \
+  --bundle bundle \
+  --inventory bundle/config_sample/swift_hosts \
+  --playbook bundle/swift.yml \
+  --output swift-plan.json
+./target/release/swift-deploy preflight \
+  --bundle bundle \
+  --inventory bundle/config_sample/swift_hosts \
+  --known-hosts /etc/swift-deploy/known_hosts
 ```
 
-<Aside type="caution" title="Authorization is deliberate">
-The three destructive capabilities — disk erase, firewall, SSH reconfig — are
-each gated behind their own authorization flag. That is by design: a deployer
-that can silently wipe disks is a footgun.
-</Aside>
+Review the plan and required capabilities. `apply` must receive its exact
+digest via `--confirm-digest`. Grant only the capabilities it needs:
+`--allow-disk-wipe`, `--allow-firewall`, `--allow-ssh-reconfigure`, and
+`--allow-host-reconfigure` are separate switches.
+
+## Supported scope
+
+The bundle audit counts task files, executable leaf tasks, modules, parse
+errors, and unsupported modules, then produces a stable fingerprint. The
+documented historical scope is the pinned `swift_ansible_v3` bundle, not every
+upstream branch or arbitrary third-party role. Run `swift-deploy modules` and
+`swift-deploy audit` against the exact candidate bundle instead of relying on
+an old count.
+
+## Preflight
+
+Preflight is remote but read-only. It checks the supported operating-system,
+network/repository reachability, disk/mount conditions, SSH trust, and, for a
+Rust-stack inventory, the controller-side payload. Passing preflight does not
+authorize mutation.
+
+## Control UI
+
+```sh
+./target/release/swift-deploy ui \
+  --bind 127.0.0.1 --port 8788 \
+  --bundle bundle \
+  --inventory bundle/config_sample/swift_hosts \
+  --playbook bundle/swift.yml \
+  --auth-token-file /etc/swift-deploy/ui-token \
+  --workspace-root /var/lib/swift-deploy/projects
+```
+
+Only `/healthz` is public. Plan, validation, preflight, apply, state, workspace,
+and ring operations are token-protected. Keep the service on loopback or a
+dedicated management plane. `swift-console` can proxy this UI without exposing
+the token to the browser.
+
+## Verification and rollback
+
+Run `cargo fmt --all --check`, clippy, all-feature tests, and the bundle audit.
+Before apply, preserve the prior binaries/configuration and a node-by-node
+rollback plan. The deployer can enforce input identity and capability gates; it
+cannot make an unsafe topology or unreviewed plan safe.

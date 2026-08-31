@@ -1,0 +1,62 @@
+---
+title: Known limitations
+description: Current compatibility, validation, deployment, and operational limits that must remain visible until evidence closes them.
+sidebar:
+  order: 9
+---
+
+This page is the safe planning boundary, not a backlog disguised as a release
+note. If a required capability is missing or not accepted here, treat the
+deployment as blocked for that use case.
+
+## Acceptance state
+
+- G6 is **GREEN** on source `17adf0b`: W068 replication 147 plus W069 EC 32
+  merge exactly once in W070, with all strict invariants true.
+- The historical W015 failure and the W019/W020 intermediate proofs remain
+  diagnostic history; they are superseded for gate status by W070.
+- G7 is **NOT ACCEPTED** and G8 is blocked.
+- Production readiness is **NO-GO**. The G6-accepted artifact is not a
+  production binary and production `:8080` remains on `ab5cb95c…`.
+- The candidate artifact bundle carries auxiliary component source, but the
+  offline pass did not build new Linux binaries for swift-console,
+  swift-deploy-rs, cosbench-rs, or autocos because the cache lacked `axum`.
+
+## Compatibility limits
+
+| Area | Limit |
+|---|---|
+| Swift API | implemented/tested subset only; not every standard filter or edge case is accepted |
+| Paste pipeline | no arbitrary Python or third-party dynamic plugin loading |
+| S3 | the historical 57-case dual-oracle is not GREEN; official s3api/s3tests gates remain distinct |
+| EC | Linux + liberasurecode + `ec` build required; W069 and W070 prove the frozen EC lane and exact merged-179 G6 result for `17adf0b` |
+| sharding/reconciliation | frozen probe semantics are G6-accepted; broader production behavior remains subject to later gates and rollout evidence |
+| multi-cluster container sync | no production soak claim |
+| multi-primary automatic shrink | not a production-accepted product path |
+| physical cold tier and local IAM helpers | library/helper presence is not a wired production feature claim |
+
+## Runtime limits
+
+The candidate contains async serve and bounded runtime primitives, but G3 must
+still prove every relevant request class avoids legacy sync/block-in-place
+fallbacks, and G7 must test idle connections, slow bodies, cancellation,
+fairness, bounded memory, shutdown, and durability under load.
+
+## Deployment limits
+
+`swift-deploy-rs` implements a bounded audited subset of the pinned Swift
+Ansible v3 bundle. Unknown syntax/modules fail closed. It is not a promise that
+every upstream Ansible role, arbitrary inventory, distribution, or operator
+overlay is supported.
+
+## Performance limits
+
+Published measurements are historical, route-labelled evidence. No current
+number is a formal G8 production result. Same-host, HAProxy, noisy-host, and
+direct-proxy measurements answer different questions and must not be merged.
+
+## Documentation rule
+
+The [current status page](/status-2026-08-31) overrides older dated narratives.
+Historical pages remain useful as incident and design evidence, but they do not
+promote the current candidate.

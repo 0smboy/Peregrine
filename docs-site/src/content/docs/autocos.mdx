@@ -1,53 +1,86 @@
 ---
 title: autocos
-description: Benchmark automation over cosbench-rs — submit workloads, watch progress, list, collect and archive results.
+description: Repeatable benchmark lifecycle automation over cosbench-rs, Swift, Java COSBench, or mock backends.
 sidebar:
   order: 13
 ---
 
-`autocos` turns a task name like `64KB_write_100` into a complete benchmark
-run: workload generation, submission, progress, collection, and an Excel
-report. It drives benchmarks through [cosbench-rs](/cosbench-rs) by default
-(or a Java COSBench controller), storing state under `~/.autocos/`.
+`autocos` converts a task name such as `64KB_write_100` into workload
+generation, execution, progress tracking, result retention, and CSV/XLSX
+reporting. Its state is isolated under `~/.autocos/` (`config`, `result`,
+`fool`, and `lib`).
 
-## Commands
-
-| Command | Purpose |
-|---------|---------|
-| `run <target>` | run the `fool` suite or a single task like `64KB_write_100` |
-| `list` | list finished tasks |
-| `remove` | remove a result by wid, or clear `fool` results |
-| `collect` | collect results into a CSV report |
-
-A task name is `<size>_<op>_<workers>` — `4KB_read_128`, `1MB_write_32`,
-`16MB_read_8`. The `fool` suite runs a fixed size × op × concurrency ladder.
-
-## Targets
-
-`autocos` auto-selects the Swift target when the classic swiftclient environment is
-set:
+## Install
 
 ```sh
-export ST_AUTH=http://10.0.0.10:8085/auth/v1.0
-export ST_USER=test:tester
-export ST_KEY=<tempauth-key>
-export ST_ENDPOINT=http://10.0.0.10:8085/v1/AUTH_test   # pin storage URL
-autocos run 64KB_write_64 --object-count 400 --container-count 4 --runtime 25
-autocos list
-autocos collect
+cd autocos
+cargo build --release --locked
+install -m 0755 target/release/autocos /usr/local/bin/autocos
+autocos --help
 ```
 
-<Aside type="note" title="ST_ENDPOINT">
-`ST_ENDPOINT` pins the storage base to a specific address instead of following
-the storage URL auth returns. On Contabo prefer the Keepalived VIP
-`10.0.0.10:8085` (or a node HAProxy `10.0.0.N:8085`).
-</Aside>
+## Task names and suites
+
+A single task is `<size>_<read|write>_<workers>`, for example
+`4KB_read_128` or `16MB_write_8`. `fool` is the built-in size × operation ×
+concurrency suite. Override counts and runtime explicitly so the report can be
+reproduced.
+
+```sh
+autocos run 64KB_write_64 \
+  --prepare-worker 16 \
+  --object-count 400 \
+  --container-count 4 \
+  --runtime 25
+autocos run fool --start-task 1MB_read_32
+autocos run fool --rerun-task 16MB_write_8
+```
 
 ## Backends
 
-`--backend cosbench-rs` (default; auto-Swift when `ST_AUTH` is set),
-`swift` (tempauth), `java` (a Java COSBench controller), or `mock`.
+| Backend | Credentials or controller | Notes |
+|---|---|---|
+| `cosbench-rs` | S3 env/`~/.s3cfg`, or Swift env | default; selects Swift when `ST_AUTH` is present |
+| `swift` | `ST_AUTH`, `ST_USER`, `ST_KEY` | direct TempAuth path |
+| `java` | `--cosbench-url` | Java COSBench controller |
+| `mock` | none | driver and reporting checks only |
 
-In the production pass, a six-task sweep (4 KB / 1 MB / 16 MB × read / write)
-completed with **0 failures**; reads reached 4,180 ops/s (4 KB), 1,346 MB/s
-(1 MB) and 1,920 MB/s (16 MB). See [Performance](/performance).
+Swift example:
+
+```sh
+export ST_AUTH=http://127.0.0.1:8080/auth/v1.0
+export ST_USER=test:tester
+export ST_KEY='REPLACE_FROM_SECRET_STORE'
+autocos run 64KB_read_32 --backend swift --runtime 30
+```
+
+The current loader does not implement `ST_ENDPOINT`. The backend follows the
+storage URL returned by TempAuth. If a benchmark contract needs a fixed route,
+configure that route in the underlying cosbench-rs workload or the auth/LB
+environment and record it in the run manifest.
+
+S3 uses `accesskey`, `secretkey`, and `endpoint` (uppercase spellings are also
+accepted), or `access_key`, `secret_key`, and `host_base` from `~/.s3cfg`.
+
+## Result lifecycle
+
+| Command | Behavior |
+|---|---|
+| `list [fool]` | list completed normal or suite runs |
+| `remove <wid>` | remove a normal result |
+| `remove -f <wid>` | remove one result from the suite namespace |
+| `collect [--out PATH]` | build the normal CSV report |
+| `run fool --collect` | collect the suite without rerunning it |
+
+Collection emits a CSV and the suite/report path can generate a formatted XLSX
+with throughput, bandwidth, and latency charts. Keep raw per-run results with
+the report; a spreadsheet alone loses provenance and error samples.
+
+## Production-grade use
+
+Benchmark only a named route and immutable binary set. Record object size,
+workers, duration/op count, prepare population, cleanup outcome, client host,
+network path, CPU/memory limits, background traffic, rings/policies, and all
+error/latency distributions. A historical zero-failure run is not acceptance
+of the current candidate; see [Performance](/performance) and
+[G0-G8 validation](/validation-gates).

@@ -2,12 +2,19 @@
 title: Security
 description: Access control, supply chain, the unsafe surface, and hardening notes.
 sidebar:
-  order: 24
+  order: 29
 ---
 
-## Access control
+<Aside type="caution" title="Evidence boundary">
+The checks below are historical or source-level unless they name a current
+candidate run. They do not close G4-G8 or establish production readiness.
+Current state: G6 GREEN, G7 NOT ACCEPTED, overall production readiness NO-GO.
+</Aside>
 
-Verified live against the cluster:
+## Historical access-control checks
+
+The table records a bounded earlier lab run and must be rerun on the accepted
+candidate and configured pipeline:
 
 | Check | Result |
 |-------|--------|
@@ -19,9 +26,10 @@ Verified live against the cluster:
 | ETag integrity on PUT | `422` on md5 mismatch (after the fix below) |
 | Metadata length | `400` over the 256-char limit (after the fix below) |
 
-## Supply chain & unsafe
+## Supply chain and `unsafe`
 
-- **`cargo audit`** — 0 vulnerabilities across a lean 73-crate dependency tree.
+- Run `cargo audit` against the exact current lockfiles and archive the output;
+  an older zero-vulnerability count expires as advisories and dependencies move.
 - **`unsafe`** — a small, reviewed surface: FFI (the erasure-coding codec) and
   syscall wrappers (`getifaddrs`, `flock`, xattr). No transmutes or ambient
   global-state hacks.
@@ -57,8 +65,22 @@ the client (`normalize_etag`), so the client sees the bare md5.
 ## Hardening notes
 
 <Aside type="caution">
-- `swift.conf` ships world-readable (`0644`) but holds the hash prefix/suffix —
-  `chmod 0640`.
+- `swift.conf` contains the hash prefix/suffix; restrict it to the service
+  account/group (for example `0640`) and verify ownership.
 - TempURL / formpost / crypto / s3api middleware are **not** in the default
   proxy pipeline; enable them deliberately if a deployment needs those features.
 </Aside>
+
+## Runtime and control-plane hardening
+
+- bind `swift-console`, `swift-deploy ui`, and `cosbench-rs serve` to loopback
+  or a dedicated management network;
+- place TLS and operator authentication at the management ingress;
+- keep deploy tokens, Swift/S3 credentials, TLS keys, TempURL keys, and hash
+  secrets outside Git and reports;
+- use strict SSH host keys and avoid `--allow-password` unless a reviewed plan
+  requires it;
+- authorize disk, firewall, SSH, and host reconfiguration independently;
+- cap file descriptors, memory, request sizes, upload lifetimes, connections,
+  active requests, and blocking queues;
+- verify logs redact auth tokens and signature-bearing query strings.

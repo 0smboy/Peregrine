@@ -1,13 +1,32 @@
 ---
 title: Testing & verification
-description: Four levels of verification, from golden-fixture unit tests to production-grade load and live HA drills on a four-node cluster.
+description: Verification layers, ordered G0-G8 gates, and the current G6/G7 boundary for the Rust Swift family.
 sidebar:
   order: 22
 ---
 
-Peregrine is verified at five levels, and a change is only done when CI is
-green, the functional suite matches the Python oracle, and — for anything on
-the data path — the behavior is confirmed live on the cluster.
+<Aside type="caution" title="Current gate boundary — 2026-08-31">
+The historical examples on this page do not constitute acceptance of the
+current release line. Formal W068 replication plus W069 EC merge exactly once
+in fail-closed scorer W070: **G6 GREEN, 179/179, zero unexpected result**.
+G7 is **NOT ACCEPTED** and production readiness remains NO-GO. The accepted
+Rust Swift source is `17adf0bfa78b30b2a7eed9f39836e0d63c715d2c`; see [Current
+status](/status-2026-08-31) for the dated record and evidence paths.
+</Aside>
+
+Peregrine is verified in ordered layers. A change is only accepted when the
+required layer is green and its provenance is recorded; a unit result, a
+single-node SAIO result, or a partial canary cannot close a later gate.
+
+## Gate order and exact accounting
+
+G0 provenance → G1 Linux environment → G2 reproducible build → G3 route-level
+async proof → G4 official Swift functional parity → G5 official S3 parity →
+G6 storage/probe semantics → G7 concurrency and fault behavior → G8 performance
+and soak. The accepted G6 record has two explicit formal lanes: **147
+replication identities in W068** and **32 EC identities in W069**. W070 merges
+them against the frozen oracle exactly once; the replication lane is never
+promoted by itself. This closes G6 and opens G7, but does not close G7.
 
 ## 0. CI — every push, the full suite
 
@@ -75,7 +94,7 @@ Against the four-node Contabo HA lab (VIP `10.0.0.10:8085` — see
 The S3 surface has its own scored gate: the frozen 57-case runner sends
 identical requests to the live Rust fleet and a stock Python Swift 2.33
 oracle and compares what a client sees. Methodology, the GREEN contract, and
-the current 49/8 scoreboard: [Dual-oracle verification](/dual-oracle).
+the historical 49/8 scoreboard: [Dual-oracle verification](/dual-oracle).
 
 ## Recent delivery — cold + Contabo S3
 

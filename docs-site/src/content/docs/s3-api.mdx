@@ -2,8 +2,15 @@
 title: S3 API reference
 description: The implemented S3 surface — authentication, bucket and object operations, multipart, versioning, object lock, errors, and the Rust-ahead extras.
 sidebar:
-  order: 16
+  order: 7
 ---
+
+<Aside type="caution" title="Capability page, not current acceptance">
+This page combines implemented surfaces and dated evidence. Candidate
+`17adf0b…` has not passed the complete G3-G8 chain. G6 is GREEN, G7 is not
+accepted, and production readiness is NO-GO. Check [Current status](/status-2026-08-31)
+and [Known limitations](/known-limitations) before relying on a row below.
+</Aside>
 
 This page documents the S3 surface Peregrine's `swift-s3api` middleware
 actually implements, at the behavior level a client sees. Scope discipline:
@@ -12,12 +19,13 @@ Swift 2.33 s3api oracle by the [strict dual-oracle harness](/dual-oracle)
 (49/8 as of 2026-08-16, `docs/fairness-lab/S3-ALIGN-20260815.md`). It is not
 "full S3", and it is not a production compatibility promise.
 
-<Aside type="caution" title="Claim boundary">
-The live lab binary is the Guard generation
-(`3d0138d5…`, [releases](/releases)). Account-root 405 and version-index
-CAS are on the VIP. Anything not listed here — or listed as an
+<Aside type="caution" title="Historical claim boundary">
+The dated dual-oracle evidence used the Guard generation
+(`3d0138d5…`, [releases](/releases)); account-root 405 and version-index
+CAS were verified on that VIP path. Anything not listed here — or listed as an
 unsupported subresource — answers `501 NotImplemented` rather than
-pretending. Partial counts as not implemented.
+pretending. Partial counts as not implemented. This is not current-candidate
+acceptance.
 </Aside>
 
 ## Authentication

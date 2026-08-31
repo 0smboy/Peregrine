@@ -10,6 +10,10 @@ sidebar:
 Node.js, no external frontend — HTML/CSS/JS are served directly and pages render
 without a client-side framework.
 
+The console is an operator surface, not evidence that the storage engine has
+passed every gate. G6 is GREEN on `17adf0b`; G7 is NOT ACCEPTED and the overall
+production decision remains NO-GO.
+
 ## Surfaces
 
 <CardGrid>
@@ -48,9 +52,10 @@ POST /lab/api/node/down       # {node, ttl_secs?} — stop a node's swift servic
 POST /lab/api/node/up         # {node|journal_id} — restart early, before the TTL
 ```
 
-<Aside type="note" title="Verified">
-In the production pass the drill took a node fully down while replication and
-erasure coding both served **100% of reads and writes** on the survivors — see
+<Aside type="note" title="Historical lab evidence">
+In the dated 2026-08-18 fleet drill, one node was taken fully down while the
+bounded replication and erasure-coding workload completed on the survivors.
+That canary is not a current G7 result or an availability SLO. See
 [Operations](/operations).
 </Aside>
 
@@ -61,6 +66,10 @@ cd swift-console
 cargo build --release
 ./target/release/swift-console conf/config.json
 ```
+
+Startup fails if the JSON cannot be read/parsed or the deploy token file cannot
+be read. `/healthz` is the unauthenticated liveness endpoint. Default bind is
+`127.0.0.1:9000`.
 
 `config.json` sets the bind address, the Swift proxy base and auth endpoint, the
 deploy upstream + token file, the metrics/logs upstreams, the account roster,
@@ -78,12 +87,23 @@ balancer, not to be exposed directly.
 |-----|---------|
 | `bind` | listen address (default loopback) |
 | `swift_base` / `auth_url` | the Swift proxy and its `/auth/v1.0` |
-| `deploy_upstream` / `deploy_token_file` | the swift-deploy-rs control API |
+| `deploy_upstream` / `deploy_user` / `deploy_token_file` | the swift-deploy-rs control API and server-side Basic credential source |
 | `metrics_url` / `logs_url` | metrics + log backends |
+| `session_idle_hours` / `max_upload_bytes` / `tempurl_default_secs` | session, body, and generated-URL limits |
+| `accounts` | allowed tenant/user roster and roles |
+| `proxy_nodes` / `proxy_conf` / `proxy_service` / `proxy_port` | account-admin target set and service metadata |
+| `account_admin` | enables proxy config edits/restarts; default false |
+| `test_enabled` / `autocos_bin` / `autocos_home` | real benchmark surface and its runner; default disabled |
 | `lab_enabled` / `lab_mutations` | enable the Lab surface / allow guarded mutations |
 | `cluster_nodes` | node roster (name + storage/replication/public IPs, devices) |
+| `swift_dir` / `node_root` | ring/config and device roots used by inspection tools |
+| `ringsim_bin` / `getnodes_bin` / `objinfo_bin` | external inspection helper paths |
 | `shadow_peer_base` / `shadow_peer_auth` / `shadow_peer_label` | optional second Swift endpoint for Shadow dual-mode (same tempauth user/key as the console login) |
 | `shadow_root` | on-disk corpus + mutation log directory |
+
+Account administration, real benchmark execution, lab pages, and lab mutations
+are separate controls. Leave them off unless the management host, credentials,
+node list, and undo behavior have been reviewed.
 
 ## Monitor: what “在线节点” means
 

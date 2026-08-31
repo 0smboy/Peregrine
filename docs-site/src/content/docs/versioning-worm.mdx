@@ -5,6 +5,12 @@ sidebar:
   order: 18
 ---
 
+<Aside type="caution" title="Feature semantics, not release acceptance">
+The semantics and dated evidence below do not promote the current candidate.
+G6 is GREEN, G7 is NOT ACCEPTED, and production readiness is NO-GO. Validate each
+required versioning/WORM/cold route on the accepted binary and policy.
+</Aside>
+
 User-facing semantics of the three S3 data-protection surfaces, with their
 exact verification level. Everything here is dual-oracle or unit covered;
 nothing here upgrades the [claim boundary](/parity).
@@ -65,8 +71,8 @@ Archived versions are real Swift objects, not magic:
   resurrect an orphan copy.
 
 <Aside type="caution" title="Scope">
-On the **live fleet** (Guard generation) the version-index CAS is
-**cross-proxy**: every committed index generation is fenced by an immutable
+In the historical **Guard-generation fleet evidence**, the version-index CAS
+was **cross-proxy**: every committed index generation was fenced by an immutable
 `index.g<N>.json` object created with `If-None-Match: *`, so two proxies can
 never both apply the same generation
 (`docs/fairness-lab/VERSION-CAS-DESIGN-20260817.md`). Wave-2 object already
@@ -106,8 +112,8 @@ GOVERNANCE yields to a permitted bypass, COMPLIANCE never does. An unhealthy
 node clock additionally denies COMPLIANCE claims (new or existing) rather
 than trusting a broken clock. On `main` that signal is wired through
 `worm_clock_max_offset_ms` (default `0` = off, historical `clock_ok=true`).
-Live Guard keeps the knob at `0`; no fail-closed chrony check until it is
-set `>0`.
+The historical Guard configuration kept the knob at `0`; no fail-closed
+chrony check existed until an operator set it above zero.
 
 <Aside type="caution" title="Not a compliance product">
 Sysmeta travels below the gatekeeper (clients cannot forge

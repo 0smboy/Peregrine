@@ -1,16 +1,42 @@
 ---
-title: Releases & live binaries
-description: The proxy binary genealogy, what each generation closed, the object-server state, and the git branch discipline.
+title: Releases & binary history
+description: The dated Rust Swift release record, candidate provenance, gate truth, and rollback discipline.
 sidebar:
   order: 27
 ---
+
+<Aside type="caution" title="Read the current snapshot first">
+The historical binary genealogy below records the 2026-08-18 Guard roll; it is
+not the current G6 artifact and it does not mean production is ready. The
+current Rust Swift status is [dated 2026-08-31](/status-2026-08-31): source
+`17adf0b` is strict G6 GREEN through formal W068 replication, W069 EC, and W070
+merged-179 scoring. G7 is not accepted and production readiness remains NO-GO.
+</Aside>
 
 The fleet does not run "latest main"; it runs **named binary generations**
 with recorded SHA-256s, and the docs state which one is live. If a node
 disagrees with this page, reconcile before touching anything
 ([health checklist](/runbooks#health-checklist-first-hour-of-any-shift)).
 
-## Proxy generations
+## Current candidate publication state
+
+| Item | Verified state on 2026-08-31 |
+|---|---|
+| remote | `https://github.com/0smboy/Peregrine.git` |
+| accepted Rust Swift source | `17adf0bfa78b30b2a7eed9f39836e0d63c715d2c` |
+| G6 evidence | W068 + W069 + W070, exact frozen 179 and zero unexpected result |
+| publication | this page is updated again with the canonical integration commit and release tag before deployment |
+| Rust Swift artifact | v9 EC package and full binary/wrapper manifests pinned by W070 |
+| auxiliary Linux binaries | source included; not rebuilt in the offline pass because the cache lacked `axum` |
+| production `:8080` | all four nodes remained on `ab5cb95c…` |
+
+The earlier append-only artifact folder is
+`gdrive:Peregrine/Peregrine-G6-candidate-20260831-64446f1/` (10 objects,
+29,319,934 bytes at verification). It preserves the superseded `64446f1`
+candidate and must not be overwritten by the `17adf0b` release bundle. Upload
+is artifact preservation, not a release or production promotion.
+
+## Historical proxy generations
 
 Each generation was built once on the lab build node, rolled 1→4→3→2 (VIP
 owner last), verified by SHA + health, then scored by one
@@ -33,16 +59,16 @@ Guard rolled 1→4→3→2 (VIP owner last), post-roll dual-oracle
 failing-case set identical to post-GATE** (`50f0c860…`). The frozen 57
 surface did not regress. Supplement Section B moved **0/3 → 3/3**.
 
-Object servers fleet-wide are the 2026-08-18 BUG-1 build
+Object servers fleet-wide were the 2026-08-18 BUG-1 build
 (`471e8b73340178c0…`, source `5992932`). Wave-2 `e1d4f1cc…` remains the
 rollback copy on each node.
 
-## Code tip vs live binary
+## Code tip vs historical live binary
 
 `main` is deliberately allowed to be ahead of the fleet, and the difference
 is tracked here rather than blurred:
 
-- Live proxy = Guard generation (built 2026-08-18 from `main` @
+- Historical live proxy record = Guard generation (built 2026-08-18 from `main` @
   `5992932`; artifact SHA-256
   `3d0138d5e9970a5e39e22616c7bd4e3850f207ff8046f749aef0998164a9bcda`).
   Gate `671bcbaf…` remains the rollback copy on each node.
@@ -50,15 +76,15 @@ is tracked here rather than blurred:
   `codex/hotfix-s3cmd-mb-live-8663-20260814`, into `main` with a verified
   resolution: the S3 layer was kept **byte-identical to main** (the hotfix's
   s3api rework was superseded by the F1→Size generations, which are
-  dual-oracle verified live), while the proxy-side improvements were
-  adopted and are now live in Gate.
+  dual-oracle verified in that historical roll), while the proxy-side
+  improvements were adopted in Gate.
 - CI (`e78469a`): every push and pull request now runs the full workspace
   suite plus the EC slice on GitHub Actions; fmt/clippy debt is surfaced as
   report boards. The CI work also pinned liberasurecode ≥ 1.6.5 after
   reproducing a real upstream concurrency segfault
   ([lab notes](/lab-cluster#install-checklist)).
 
-### Live on Guard (2026-08-18 proxy roll)
+### Recorded on Guard (2026-08-18 proxy roll)
 
 - **Cross-proxy version-index CAS** (PR #3): generation-fence create-only
   commit; Wave-2 object already enforces `If-None-Match: *`.
@@ -68,7 +94,7 @@ is tracked here rather than blurred:
   `AUTH_dev` stayed active (`delete_timestamp=0`) after the signed
   `DELETE /` probe.
 
-### Live on the 2026-08-18 object roll
+### Recorded on the 2026-08-18 object roll
 
 - **BUG-1 native-gate metadata POST** (PR #7): tagging-only / restore-only
   / transition-only sysmeta POST on a locked object is allowed. Mixed
@@ -90,7 +116,7 @@ is tracked here rather than blurred:
   vs AWS; account-root negatives **3/3** on live Guard
   (`strict-s3-supplement-20260818-postguard.json`, SHA-256 `7ef42b96…`).
 
-## Git branches
+## Git branches and candidate provenance
 
 Product repo: `github.com/0smboy/Peregrine`.
 
@@ -109,7 +135,7 @@ working tree outside the product repo is never a merge source.
 
 ## Provenance strings
 
-Every scored run names both binaries, e.g.
+Every scored run must name both binaries, e.g.
 `peregrine@size+sha256:69d22629…` vs
 `python-swift@2.33.0+s3api+object_versioning+xml-ct@10.0.0.3:8090` — reports
 without provenance are not evidence.

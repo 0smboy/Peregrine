@@ -2,14 +2,25 @@
 title: Deploy
 description: A one-command single-host cluster, a real multi-node deployment, and rolling binary upgrades.
 sidebar:
-  order: 20
+  order: 19
 ---
+
+<Aside type="danger" title="Do not deploy the current candidate">
+The procedures below describe the product surfaces; they do not authorize a
+production roll. The `17adf0b…` line has G6 GREEN and G7 NOT ACCEPTED. Use
+[Upgrade and rollback](/upgrades) and the dated status before any mutation.
+</Aside>
 
 ## Single-host (SAIO)
 
 `swift-rust/deploy/` stands up a 4-node single-host cluster (a 3× replication
 policy and an EC-4-2 policy) from prebuilt binaries — no compiler, no dependency
 install.
+
+Use this only on a disposable, isolated host after confirming its listeners,
+devices, service names, and data roots are unused. Do not run the bootstrap or
+the fragment-loss demo on `swift1`–`swift4`, an existing `:8080`, or any device
+that contains retained data.
 
 <Steps>
 <Step>
@@ -33,7 +44,7 @@ Operate.
 
 ```sh
 bash smoke.sh                       # re-run the end-to-end check
-bash ec-heal-demo.sh                # delete an EC fragment; watch it heal
+bash ec-heal-demo.sh                # destructive: scratch SAIO data only
 systemctl status swift-rust-saio    # the cluster service
 ```
 </Step>
@@ -52,16 +63,24 @@ rsync-over-ssh mode. Two paths:
 
 ## Rolling binary upgrade
 
-Because every format is byte-compatible, a new build drops onto one node at a
-time. The pattern used in production:
+Only formats and paths accepted by the compatibility gates may be used for a
+mixed-version roll. Promote one prebuilt, hashed artifact one node at a time;
+do not rebuild independently on each node. The commands below are an outline,
+not an authorization or complete rollback plan:
 
 <Steps>
 <Step>
-Back up the current binaries on the node.
+Record and back up the exact current binaries and configuration on the node.
 
 ```sh
-mkdir -p /usr/local/bin/backup-$(date +%F-%H%M%S)
-cp -a /usr/local/bin/swift-*-server /usr/local/bin/backup-*/
+PEREGRINE_ROLLBACK_DIR="/var/lib/peregrine-rollback/$(date +%F-%H%M%S)"
+sudo install -d -m 0755 "$PEREGRINE_ROLLBACK_DIR"
+sudo cp -a /usr/local/bin/swift-proxy-server \
+  /usr/local/bin/swift-object-server \
+  /usr/local/bin/swift-container-server \
+  /usr/local/bin/swift-account-server \
+  "$PEREGRINE_ROLLBACK_DIR/"
+sha256sum "$PEREGRINE_ROLLBACK_DIR"/*
 ```
 </Step>
 <Step>
@@ -73,13 +92,17 @@ systemctl restart swift-object swift-container swift-account swift-proxy
 ```
 </Step>
 <Step>
-Verify health, then move to the next node.
+Verify the new executable SHA, health, CRUD/read-back, policy paths, and daemon
+progress, then hold and move to the next node only if the gate remains clean.
 
 ```sh
 curl -s -o /dev/null -w '%{http_code}\n' http://<node>:8080/healthcheck   # 200
 ```
 </Step>
 </Steps>
+
+The complete prerequisites, stop conditions, and rollback evidence are in
+[Upgrade and rollback](/upgrades).
 
 <Aside type="tip" title="Contabo VIP">
 The lab fronts proxies with Keepalived VIP `10.0.0.10:8085` (HAProxy on each

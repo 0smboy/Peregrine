@@ -1,0 +1,85 @@
+---
+title: G0-G8 validation gates
+description: The ordered production-acceptance contract, required evidence, stop conditions, and current red boundary.
+sidebar:
+  order: 26
+---
+
+G0-G8 is an ordered acceptance program. A failure matrix, canary, reduced
+unexpected count, or partial lane is evidence, not completion. Close every
+gate that can be closed; mark a gate blocked with an exact cause when it cannot.
+
+<Aside type="danger" title="Current boundary">
+G6 is GREEN on source `17adf0b`: W068 covers all 147 replication identities,
+W069 covers all 32 EC identities, and W070 merges the frozen 179 exactly once
+with zero unexpected result and every invariant true. G7 is NOT ACCEPTED, G8
+is BLOCKED, and production readiness is NO-GO.
+</Aside>
+
+## Gate contract
+
+| Gate | Must prove | Minimum evidence | Opens next gate when |
+|---|---|---|---|
+| G0 | one immutable source/build/test identity | commit, clean/recorded tree, lockfile, toolchain, features, artifact SHA, live `/proc/exe` SHA, manifest | every identity agrees |
+| G1 | suitable and isolated test environment | host roles, topology, CPU/memory/disk/network budgets, listener/process census, production-isolation guard | required lab roles are known and protected |
+| G2 | reproducible Linux artifacts and equivalent configuration semantics | clean offline/locked build, dependency/EC proof, binary hashes, policy/ring/pipeline manifests | both implementations and routes are intentional |
+| G3 | native async route behavior | real request per route, counter deltas, no forbidden sync/block-in-place delta, bounded body/queue evidence | every required route is proven |
+| G4 | official Swift API compatibility | frozen `test/functional` identity list and exact Python-vs-Rust result diff | unexpected test names = 0 |
+| G5 | official S3 compatibility | Swift `test/s3api`, pinned Ceph `s3-tests`, capability/known-failure policy, exact-name diff | unexpected test names = 0 |
+| G6 | storage and failure semantics | official probe tests, frozen 179 ledger, 147 replication + 32 EC identities merged once | unexpected identities = 0 with exact accounting |
+| G7 | concurrency and fault behavior | idle/slow-client, backpressure, fairness, cancellation, reload, shutdown, durability, failure injection, bounded memory | every scenario meets explicit thresholds |
+| G8 | fair performance and long soak | clean route-labelled A/B, repeated statistics, 24-hour soak, integrity and resource trend | preset thresholds pass with no hidden exclusions |
+
+## Evidence rules
+
+- compare test names/identities, not aggregate counts;
+- freeze collection lists before scoring;
+- record skips, deselections, xfails, errors, timeouts, and collection failure;
+- do not turn an environment failure into PASS;
+- do not change assertions or known-failure classification during a scored run;
+- preserve raw logs, manifests, summaries, and before/after hashes;
+- a canary validates one hypothesis; rerun the complete frozen lane afterward;
+- a later gate never repairs or replaces an earlier red gate.
+
+## Test modes and host use
+
+Compatibility, concurrency, and performance are separate modes. A host carrying
+uncontrolled production traffic may still provide carefully labelled feedback
+for a compatibility canary, but it cannot produce a valid concurrency or
+performance acceptance result. The four Swift hosts may be used efficiently by
+assigning fixed roles; they are not permission to run destructive suites in
+parallel against shared state.
+
+Parallelize source analysis, builds, unit tests, and isolated non-overlapping
+canaries. Serialize any run that shares rings, databases, devices, daemon
+state, ports, or frozen test namespaces.
+
+## G6 exact accounting
+
+The Python oracle manifest SHA-256 is
+`f277baa81ccb6d62f38621b1f04b012f03c0ed4eb683fdac9bb7fe263c98e591`.
+The replication lane covers 147 identities. The EC lane covers 32. They must be
+from the same immutable candidate and merged exactly once into the 179 ledger.
+
+Final accepted records on Swift1:
+
+- W068 formal replication: 147 identities, 143 pass plus 4 expected Python-
+  matching skips, zero failure/error;
+- W069 formal EC: 32/32 pass, zero failure/error/skip;
+- W070 strict scorer: verdict GREEN, 179/179, missing/extra/duplicate/overlap/
+  unexpected/unexpected-skip all zero, every invariant true;
+- W070 score SHA-256
+  `f1b88427636cb25a3a6fe40e6da269577457061e182dfc75555bc33c922c592c`;
+- W070 merged ledger SHA-256
+  `44a003859ab60792c52f47a164b3bf7031b57d560f3fdf092d314ced2067c84e`.
+
+The source, artifact, wrappers, overseer, runners, frozen input, and actual
+process executables are pinned. Before/after hashes are stable, violations are
+empty, isolated listeners/processes are gone, and production `:8080` remains
+`ab5cb95c…`. The next valid action is G7, not another reduced G6 rerun.
+
+## Claim vocabulary
+
+Use `PASS`, `FAIL`, `RED`, `BLOCKED`, `NOT STARTED`, and `INVALID` literally.
+Reserve `GREEN` for a gate whose complete contract and evidence have passed.
+The dated [Current status](/status-2026-08-31) is the authoritative snapshot.

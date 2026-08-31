@@ -8,7 +8,7 @@ const nimbusConfig = defineNimbusConfig({
   site: "https://peregrine-docs-ochre.vercel.app",
   title: "Peregrine",
   description:
-    "A production object-storage platform: a Rust rewrite of OpenStack Swift, byte-compatible on the wire and on disk, with its deployer, load generator, benchmark automation, and web console.",
+    "A Rust-first object-storage engineering platform: scoped Swift compatibility, bounded deployment tooling, load generation, benchmark automation, and a web console. Current production readiness is documented explicitly.",
   locale: "en",
   github: "https://github.com/0smboy/Peregrine",
   socialImageAlt: "Peregrine documentation",
@@ -21,6 +21,10 @@ export default defineConfig({
   // Astro 7's Vite 8 bundler).
   vite: {
     plugins: [tailwindcss()],
+    // Keep generated dependency metadata inside this checkout. CI, sparse
+    // review worktrees, and read-only dependency stores must not mutate a
+    // shared node_modules tree.
+    cacheDir: ".vite-cache",
   },
   // Hover-prefetch link targets so full-page navigations feel instant without
   // a client-side router.
