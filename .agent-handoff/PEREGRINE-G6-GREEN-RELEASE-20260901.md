@@ -11,8 +11,11 @@ Production verdict: **NO-GO** (`G7 NOT ACCEPTED`, `G8 BLOCKED`)
 - Accepted Rust Swift source: `17adf0bfa78b30b2a7eed9f39836e0d63c715d2c`
 - Canonical integration and auxiliary build commit:
   `7883bbb1d021277390215e18afeb414b5b612339`
+- Final release commit: `b7062862ab348d17116a3338f0f11b20e29ea722`
 - Release tag: `g6-green-20260831`
 - Release class: GitHub **pre-release**, lab validation only
+- GitHub release:
+  `https://github.com/0smboy/Peregrine/releases/tag/g6-green-20260831`
 - Drive archive:
   `gdrive:Peregrine/Peregrine-G6-green-20260831-7883bbb/`
 
@@ -35,6 +38,20 @@ commit is byte-for-byte identical to the accepted source subtree:
 
 Original records remain on Swift1 under `/var/log/g6-ec/` and are copied to
 the Drive archive without changing the source directories.
+
+Drive verification completed directly from the Linux nodes, without routing
+artifacts through the Mac:
+
+| Drive subtree | Objects | Bytes | `rclone check --checksum` |
+|---|---:|---:|---|
+| Release files | 10 | 139,861,122 | 0 differences |
+| W068/W069/W070 evidence | 69 | 6,195,655 | 0 differences in all three evidence checks |
+
+The older
+`gdrive:Peregrine/Peregrine-G6-candidate-20260831-64446f1/` archive remains
+immutable. Rclone warned that its shared Google Drive client ID is being
+retired during 2026; replacing it with a dedicated client ID is a maintenance
+item, not a failure of this verified upload.
 
 ## Auxiliary Linux verification
 
@@ -84,10 +101,69 @@ Lockfile SHA-256 values:
 - A lab pre-release is not a production rollout or a drop-in compatibility
   declaration.
 
+## Documentation publication
+
+The expanded 36-page documentation source passed type checking, the project
+documentation linter, the claim audit, and a production build. Vercel built 38
+routes and indexed 36 documentation pages.
+
+- Production alias: `https://peregrine-docs-ochre.vercel.app`
+- Immutable deployment:
+  `https://peregrine-docs-ggdwbzq6y-0smboys-projects.vercel.app`
+- Vercel deployment ID: `dpl_2nDLtTmhwvNC7zCYNwAtrkHpV6iw`
+
+Live Markdown endpoints for status, releases, validation gates, concurrency,
+and welcome were fetched after deployment. They preserve the required claim:
+G6 is GREEN, G7 is NOT ACCEPTED, G8 is BLOCKED, and production remains NO-GO.
+
+## Swift1-Swift4 workspace cleanup
+
+Only process-unreferenced, fully rebuildable Cargo `target` directories were
+removed. Before deletion, every candidate passed an exact mount-point check and
+a `/proc` scan covering cwd, executable, file descriptors, and mapped files;
+there were no Cargo/rustc processes and both hosts returned
+`REF_COUNT_FLAG=0`.
+
+| Host | Removed | Reclaimed bytes | Root filesystem after cleanup |
+|---|---:|---:|---:|
+| Swift1 | 6 Cargo caches | 6,844,724,712 | 83% used, 7,513,640,960 bytes available |
+| Swift2 | 4 Cargo caches | 9,989,777,230 | 67% used, 14,579,867,648 bytes available |
+
+Removed from Swift1:
+
+- `/root/work/swift-rust/target`
+- `/root/work/swift-console/target`
+- `/root/work/swift-deploy-rs/target`
+- `/root/work/swift-deploy-rs-phase1/target`
+- `/root/work/cosbench-rs/target`
+- `/root/work/autocos/target`
+
+Removed from Swift2:
+
+- `/root/work/peregrine-aux-release-target`
+- `/root/work/g6-ec-b6e36bf-target`
+- `/root/work/codex-g6-build-20260826/swift-rust/target`
+- `/root/work/g6-ctx-build/swift-rust/target`
+
+These cache contents are not recoverable in place, but are reproducible from
+the preserved source and lockfiles. The current v9 build cache
+`/root/work/g6-17adf0b-v9-target` was deliberately retained for G7 work. No
+historical source tree, release artifact, G6 binary, test evidence, production
+path, or swiftfuse path was removed.
+
+Stable navigation links now identify the retained mainline material:
+
+- Swift1 `/root/work/PEREGRINE-G6-BIN-CURRENT`
+- Swift1 `/root/work/PEREGRINE-G6-W070-CURRENT`
+- Swift2 `/root/work/PEREGRINE-RELEASE-SOURCE-CURRENT`
+- Swift2 `/root/work/PEREGRINE-RELEASE-ARTIFACTS-CURRENT`
+
 ## Production and rollback boundary
 
 Production `:8080` remained on SHA-256
 `ab5cb95c5c3973db8336e4940711fba18ce3cabaae62e13da0865c07ad31622b`.
+This exact SHA was re-read from the executable behind the live `:8080`
+listener on Swift1, Swift2, Swift3, and Swift4 after cleanup.
 No VIP, HAProxy, Keepalived, production binary, ring, configuration, or Swift
 data was changed. Any future rollout requires a separate authorization,
 node-by-node executable provenance, health verification, and a tested rollback.
