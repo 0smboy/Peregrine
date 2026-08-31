@@ -630,48 +630,52 @@ async fn accept_loop_async(
         let live = Arc::clone(&live);
         let mut sd_rx = sd_rx.clone();
         acceptors.spawn(async move {
+            let spawn_connection = |stream: tokio::net::TcpStream| {
+                match admission.try_acquire_connection() {
+                    Ok(permit) => {
+                        let service = Arc::clone(&service);
+                        let config = config.clone();
+                        let shutdown = Arc::clone(&shutdown);
+                        let admission = admission.clone();
+                        let metrics = metrics.clone();
+                        let live = Arc::clone(&live);
+                        live.fetch_add(1, Ordering::SeqCst);
+                        metrics.runtime_tasks_inc();
+                        let scheduled = Instant::now();
+                        tokio::spawn(async move {
+                            let _live = LiveGuard(live);
+                            metrics.observe_scheduler_lag(scheduled.elapsed());
+                            let _task = RuntimeTaskGuard(Some(metrics.clone()));
+                            let _permit = permit;
+                            let connection_result = metrics
+                                .bind(handle_connection_async(
+                                    stream, service, config, shutdown, admission,
+                                ))
+                                .await;
+                            if let Err(error) = connection_result {
+                                eprintln!(
+                                    "G6_DIAG swift-http stage=connection-error error={error}"
+                                );
+                            }
+                        });
+                    }
+                    Err(_) => {
+                        // Never block accept on a 503 write.
+                        tokio::spawn(async move {
+                            crate::hyper_serve::reject_overloaded(stream).await;
+                        });
+                    }
+                }
+            };
             loop {
                 tokio::select! {
-                    _ = wait_watch(&mut sd_rx) => break,
+                    biased;
+                    _ = wait_watch(&mut sd_rx) => {
+                        break;
+                    },
                     acc = listener.accept() => {
                         match acc {
-                            Ok((stream, _)) => {
-                                match admission.try_acquire_connection() {
-                                    Ok(permit) => {
-                                        let service = Arc::clone(&service);
-                                        let config = config.clone();
-                                        let shutdown = Arc::clone(&shutdown);
-                                        let admission = admission.clone();
-                                        let metrics = metrics.clone();
-                                        let live = Arc::clone(&live);
-                                        live.fetch_add(1, Ordering::SeqCst);
-                                        metrics.runtime_tasks_inc();
-                                        let scheduled = Instant::now();
-                                        tokio::spawn(async move {
-                                            let _live = LiveGuard(live);
-                                            metrics.observe_scheduler_lag(scheduled.elapsed());
-                                            let _task = RuntimeTaskGuard(Some(metrics.clone()));
-                                            let _permit = permit;
-                                            let connection_result = metrics
-                                                .bind(handle_connection_async(
-                                                    stream, service, config, shutdown, admission,
-                                                ))
-                                                .await;
-                                            if let Err(error) = connection_result {
-                                                eprintln!(
-                                                    "G6_DIAG swift-http stage=connection-error error={error}"
-                                                );
-                                            }
-                                        });
-                                    }
-                                    Err(_) => {
-                                        // Never block accept on a 503 write.
-                                        tokio::spawn(async move {
-                                            crate::hyper_serve::reject_overloaded(stream).await;
-                                        });
-                                    }
-                                }
-                            }
+                            Ok((stream, _)) => spawn_connection(stream),
                             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                             Err(e) if matches!(e.raw_os_error(), Some(23) | Some(24)) => {
@@ -681,6 +685,25 @@ async fn accept_loop_async(
                             Err(e) => return Err(e),
                         }
                     }
+                }
+            }
+
+            // A TCP handshake and request head may already be in the kernel
+            // accept backlog when shutdown wins the select. Convert back to
+            // the nonblocking std listener so accept() performs the syscall
+            // immediately instead of waiting for Tokio reactor readiness;
+            // drain only what is queued, then drop the listener.
+            let listener = listener.into_std()?;
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(true)?;
+                        spawn_connection(tokio::net::TcpStream::from_std(stream)?);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) if matches!(e.raw_os_error(), Some(23) | Some(24)) => break,
+                    Err(e) => return Err(e),
                 }
             }
             Ok(())
@@ -3066,6 +3089,49 @@ mod tests {
         started_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("first request on accepted socket survived shutdown");
+        client.write_all(b"test").unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+
+        assert_eq!(status(&response), 200);
+        assert_eq!(response_body(&response), b"test");
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn graceful_shutdown_drains_request_already_in_accept_backlog() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let config = ServerConfig {
+            worker_threads: 2,
+            shutdown: Some(Arc::clone(&shutdown)),
+            shutdown_deadline_secs: 2,
+            ..ServerConfig::default()
+        };
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let service: Arc<dyn AsyncService> = Arc::new(DelayedBodyEcho {
+            started: std::sync::Mutex::new(Some(started_tx)),
+        });
+
+        // Complete the TCP handshake and queue the request head before the
+        // runtime gets a chance to accept it. This is the old-reload race:
+        // the manager's shutdown signal and Hyper's first accept cross.
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .write_all(b"PUT / HTTP/1.1\r\nContent-Length: 4\r\n\r\n")
+            .unwrap();
+        shutdown.store(true, Ordering::SeqCst);
+
+        let server = std::thread::spawn(move || {
+            serve_forever_multi_service(vec![listener], service, config)
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("request queued before shutdown must be accepted and drained");
         client.write_all(b"test").unwrap();
         let mut response = Vec::new();
         client.read_to_end(&mut response).unwrap();
