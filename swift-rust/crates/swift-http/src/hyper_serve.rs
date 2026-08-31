@@ -167,6 +167,13 @@ pub async fn serve_http1_connection(
         .unwrap_or_else(ConcurrencyMetrics::new);
     let requests = Arc::new(AtomicUsize::new(0));
     let in_flight = Arc::new(AtomicUsize::new(0));
+    let read_only_in_flight = Arc::new(AtomicUsize::new(0));
+    // A shutdown can race with a request head that is already being read on
+    // an established keep-alive connection but has not reached Service::call
+    // yet. Preserve exactly one such request per accepted connection. The
+    // allowance is finite, and Hyper graceful shutdown closes the connection
+    // as soon as that request becomes visible as in-flight.
+    let shutdown_raced_request_admitted = Arc::new(AtomicBool::new(false));
     let conn_shields = Arc::new(AtomicUsize::new(0));
     let svc = HyperToSwift {
         inner: service,
@@ -175,6 +182,8 @@ pub async fn serve_http1_connection(
         peer_ip,
         requests: Arc::clone(&requests),
         in_flight: Arc::clone(&in_flight),
+        read_only_in_flight: Arc::clone(&read_only_in_flight),
+        shutdown_raced_request_admitted: Arc::clone(&shutdown_raced_request_admitted),
         shutdown: Arc::clone(&shutdown),
         metrics: metrics.clone(),
     };
@@ -211,12 +220,12 @@ pub async fn serve_http1_connection(
                 }
                 _ = crate::server::wait_shutdown(&config, &shutdown), if !shutting => {
                     shutting = true;
-                    // Hyper owns the HTTP/1.1 request boundary. Ask it to
-                    // stop keep-alive only after the request whose head was
-                    // already accepted has completed. Looking merely at the
-                    // service in-flight counter races with Hyper parsing the
-                    // accepted head and drops a delayed-body PUT on reload.
-                    if requests.load(Ordering::SeqCst) > 0 {
+                    // A historical request count does not mean this socket is
+                    // idle: Hyper may be parsing the next head. Stop at the
+                    // boundary only when a request is currently in-flight.
+                    // Otherwise wait for one bounded raced request or the
+                    // shutdown deadline.
+                    if in_flight.load(Ordering::SeqCst) > 0 {
                         conn.as_mut().graceful_shutdown();
                         graceful_requested = true;
                     }
@@ -228,15 +237,28 @@ pub async fn serve_http1_connection(
                     drain = Some(ShutdownDeadline::from_timeout(Duration::from_secs(secs)));
                 }
                 _ = tokio::time::sleep(Duration::from_millis(5)), if shutting => {
-                    if !graceful_requested && requests.load(Ordering::SeqCst) > 0 {
+                    if !graceful_requested
+                        && (in_flight.load(Ordering::SeqCst) > 0
+                            || shutdown_raced_request_admitted.load(Ordering::SeqCst))
+                    {
                         conn.as_mut().graceful_shutdown();
                         graceful_requested = true;
                     }
                     let inflight = in_flight.load(Ordering::SeqCst);
+                    let read_only = read_only_in_flight.load(Ordering::SeqCst);
                     let conn_commits = conn_shields.load(Ordering::SeqCst);
                     let global_commits = metrics.snapshot().commit_shield_active;
                     metrics.set_shutdown_waiting_requests(inflight);
                     metrics.set_shutdown_waiting_commits(global_commits as usize);
+                    // Accepted mutating requests get the bounded graceful
+                    // drain used by reload and delayed-body PUT. Read-only
+                    // work cannot cross a durability barrier, so keeping a
+                    // parked GET alive until ShutdownDeadline only delays
+                    // termination and defeats structured cancellation.
+                    if read_only > 0 && conn_commits == 0 {
+                        metrics.record_cancellation(CancelReason::Shutdown);
+                        return Ok(());
+                    }
                     if drain.as_ref().is_some_and(|d| d.is_expired()) {
                         metrics.record_timeout(DeadlineKind::Shutdown);
                         if inflight > 0 || conn_commits > 0 {
@@ -1651,6 +1673,8 @@ struct HyperToSwift {
     peer_ip: Option<String>,
     requests: Arc<AtomicUsize>,
     in_flight: Arc<AtomicUsize>,
+    read_only_in_flight: Arc<AtomicUsize>,
+    shutdown_raced_request_admitted: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     metrics: ConcurrencyMetrics,
 }
@@ -1667,15 +1691,20 @@ impl Service<HyperRequest<Incoming>> for HyperToSwift {
         let peer_ip = self.peer_ip.clone();
         let requests = Arc::clone(&self.requests);
         let in_flight = Arc::clone(&self.in_flight);
+        let read_only_in_flight = Arc::clone(&self.read_only_in_flight);
+        let shutdown_raced_request_admitted = Arc::clone(&self.shutdown_raced_request_admitted);
         let shutdown = Arc::clone(&self.shutdown);
         let metrics = self.metrics.clone();
         Box::pin(async move {
             let n = requests.fetch_add(1, Ordering::SeqCst);
-            // The first request belongs to this already-accepted socket even
-            // when its head and the shutdown signal cross in the scheduler.
-            // Once one request has run, graceful_shutdown owns the keep-alive
-            // boundary; reject only a raced later request.
-            if n > 0 && shutdown.load(Ordering::SeqCst) {
+            // A request whose head is already in an established connection's
+            // parser can reach this call just after the signal flag flips.
+            // Admit exactly one such raced request per connection, regardless
+            // of whether it is the first request or follows completed
+            // keep-alive traffic. Later post-shutdown requests fail closed.
+            if shutdown.load(Ordering::SeqCst)
+                && shutdown_raced_request_admitted.swap(true, Ordering::SeqCst)
+            {
                 metrics.set_graceful_shutdown_requests(
                     metrics.snapshot().runtime_tasks.max(1),
                 );
@@ -1706,6 +1735,20 @@ impl Service<HyperRequest<Incoming>> for HyperToSwift {
                 }
             }
             let method = parts.method.as_str().to_string();
+            struct ReadOnlyInFlight(Option<Arc<AtomicUsize>>);
+            impl Drop for ReadOnlyInFlight {
+                fn drop(&mut self) {
+                    if let Some(counter) = self.0.as_ref() {
+                        counter.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+            }
+            let _read_only = if matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+                read_only_in_flight.fetch_add(1, Ordering::SeqCst);
+                ReadOnlyInFlight(Some(read_only_in_flight))
+            } else {
+                ReadOnlyInFlight(None)
+            };
             let path = unquote(parts.uri.path());
             let query_string = parts.uri.query().unwrap_or("").to_string();
             let head_request = method == "HEAD";

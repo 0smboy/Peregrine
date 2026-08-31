@@ -326,14 +326,13 @@ impl Default for ServerConfig {
     }
 }
 
-/// Bind `addr` (`ip:port`) as a `TcpListener`, optionally with `SO_REUSEPORT`
-/// so multiple acceptors can share the port (L4).
+/// Bind `addr` (`ip:port`) as a `TcpListener` with `SO_REUSEADDR`, optionally
+/// adding `SO_REUSEPORT` so multiple acceptors can share the port (L4).
+///
+/// `SO_REUSEADDR` is unconditional: a graceful restart must be able to bind
+/// while accepted sockets from the previous process are still in `TIME_WAIT`.
 pub fn bind_listener(addr: &str, reuse_port: bool) -> std::io::Result<TcpListener> {
     use std::os::fd::FromRawFd;
-
-    if !reuse_port {
-        return TcpListener::bind(addr);
-    }
 
     let sock_addr: SocketAddr = addr
         .parse()
@@ -374,9 +373,11 @@ pub fn bind_listener(addr: &str, reuse_port: bool) -> std::io::Result<TcpListene
         unsafe { libc::close(fd) };
         return Err(e);
     }
-    if let Err(e) = set_bool_sockopt(fd, libc::SO_REUSEPORT) {
-        unsafe { libc::close(fd) };
-        return Err(e);
+    if reuse_port {
+        if let Err(e) = set_bool_sockopt(fd, libc::SO_REUSEPORT) {
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
     }
     let bind_rc = unsafe {
         match sock_addr {
@@ -630,48 +631,52 @@ async fn accept_loop_async(
         let live = Arc::clone(&live);
         let mut sd_rx = sd_rx.clone();
         acceptors.spawn(async move {
+            let spawn_connection = |stream: tokio::net::TcpStream| {
+                match admission.try_acquire_connection() {
+                    Ok(permit) => {
+                        let service = Arc::clone(&service);
+                        let config = config.clone();
+                        let shutdown = Arc::clone(&shutdown);
+                        let admission = admission.clone();
+                        let metrics = metrics.clone();
+                        let live = Arc::clone(&live);
+                        live.fetch_add(1, Ordering::SeqCst);
+                        metrics.runtime_tasks_inc();
+                        let scheduled = Instant::now();
+                        tokio::spawn(async move {
+                            let _live = LiveGuard(live);
+                            metrics.observe_scheduler_lag(scheduled.elapsed());
+                            let _task = RuntimeTaskGuard(Some(metrics.clone()));
+                            let _permit = permit;
+                            let connection_result = metrics
+                                .bind(handle_connection_async(
+                                    stream, service, config, shutdown, admission,
+                                ))
+                                .await;
+                            if let Err(error) = connection_result {
+                                eprintln!(
+                                    "G6_DIAG swift-http stage=connection-error error={error}"
+                                );
+                            }
+                        });
+                    }
+                    Err(_) => {
+                        // Never block accept on a 503 write.
+                        tokio::spawn(async move {
+                            crate::hyper_serve::reject_overloaded(stream).await;
+                        });
+                    }
+                }
+            };
             loop {
                 tokio::select! {
-                    _ = wait_watch(&mut sd_rx) => break,
+                    biased;
+                    _ = wait_watch(&mut sd_rx) => {
+                        break;
+                    },
                     acc = listener.accept() => {
                         match acc {
-                            Ok((stream, _)) => {
-                                match admission.try_acquire_connection() {
-                                    Ok(permit) => {
-                                        let service = Arc::clone(&service);
-                                        let config = config.clone();
-                                        let shutdown = Arc::clone(&shutdown);
-                                        let admission = admission.clone();
-                                        let metrics = metrics.clone();
-                                        let live = Arc::clone(&live);
-                                        live.fetch_add(1, Ordering::SeqCst);
-                                        metrics.runtime_tasks_inc();
-                                        let scheduled = Instant::now();
-                                        tokio::spawn(async move {
-                                            let _live = LiveGuard(live);
-                                            metrics.observe_scheduler_lag(scheduled.elapsed());
-                                            let _task = RuntimeTaskGuard(Some(metrics.clone()));
-                                            let _permit = permit;
-                                            let connection_result = metrics
-                                                .bind(handle_connection_async(
-                                                    stream, service, config, shutdown, admission,
-                                                ))
-                                                .await;
-                                            if let Err(error) = connection_result {
-                                                eprintln!(
-                                                    "G6_DIAG swift-http stage=connection-error error={error}"
-                                                );
-                                            }
-                                        });
-                                    }
-                                    Err(_) => {
-                                        // Never block accept on a 503 write.
-                                        tokio::spawn(async move {
-                                            crate::hyper_serve::reject_overloaded(stream).await;
-                                        });
-                                    }
-                                }
-                            }
+                            Ok((stream, _)) => spawn_connection(stream),
                             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                             Err(e) if matches!(e.raw_os_error(), Some(23) | Some(24)) => {
@@ -681,6 +686,25 @@ async fn accept_loop_async(
                             Err(e) => return Err(e),
                         }
                     }
+                }
+            }
+
+            // A TCP handshake and request head may already be in the kernel
+            // accept backlog when shutdown wins the select. Convert back to
+            // the nonblocking std listener so accept() performs the syscall
+            // immediately instead of waiting for Tokio reactor readiness;
+            // drain only what is queued, then drop the listener.
+            let listener = listener.into_std()?;
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(true)?;
+                        spawn_connection(tokio::net::TcpStream::from_std(stream)?);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) if matches!(e.raw_os_error(), Some(23) | Some(24)) => break,
+                    Err(e) => return Err(e),
                 }
             }
             Ok(())
@@ -2265,6 +2289,30 @@ mod tests {
     use super::*;
     use crate::body::body_too_large;
     use std::net::Shutdown;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn bind_listener_always_enables_reuseaddr() {
+        let listener = bind_listener("127.0.0.1:0", false).unwrap();
+        let mut enabled: libc::c_int = 0;
+        let mut len = std::mem::size_of_val(&enabled) as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &mut enabled as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "getsockopt(SO_REUSEADDR) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(enabled, 1);
+    }
 
     #[test]
     fn production_engine_is_hyper_http1() {
@@ -2341,6 +2389,28 @@ mod tests {
             .position(|window| window == b"\r\n\r\n")
             .unwrap();
         &response[split + 4..]
+    }
+
+    fn read_one_http_response(stream: &mut TcpStream) -> Vec<u8> {
+        let mut response = Vec::new();
+        let mut byte = [0u8; 1];
+        while !response.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            response.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&response);
+        let content_length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("Content-Length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; content_length];
+        stream.read_exact(&mut body).unwrap();
+        response.extend_from_slice(&body);
+        response
     }
 
     #[test]
@@ -2987,6 +3057,34 @@ mod tests {
         }
     }
 
+    struct SecondRequestDelayedBodyEcho {
+        calls: AtomicUsize,
+        second_started: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    }
+
+    impl AsyncService for SecondRequestDelayedBodyEcho {
+        fn call(
+            &self,
+            mut request: AsyncRequest,
+        ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let second_started = if call == 1 {
+                self.second_started.lock().unwrap().take()
+            } else {
+                None
+            };
+            Box::pin(async move {
+                if let Some(second_started) = second_started {
+                    let _ = second_started.send(());
+                }
+                match request.body.materialize(1024).await {
+                    Ok(body) => Response::with_body(200, body),
+                    Err(error) => Response::error(500, &error.to_string()),
+                }
+            })
+        }
+    }
+
     #[test]
     fn graceful_shutdown_drains_delayed_body_request() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3066,6 +3164,100 @@ mod tests {
         started_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("first request on accepted socket survived shutdown");
+        client.write_all(b"test").unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+
+        assert_eq!(status(&response), 200);
+        assert_eq!(response_body(&response), b"test");
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn graceful_shutdown_drains_raced_second_request_on_keepalive() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let config = ServerConfig {
+            worker_threads: 2,
+            shutdown: Some(Arc::clone(&shutdown)),
+            shutdown_deadline_secs: 2,
+            ..ServerConfig::default()
+        };
+        let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+        let service: Arc<dyn AsyncService> = Arc::new(SecondRequestDelayedBodyEcho {
+            calls: AtomicUsize::new(0),
+            second_started: std::sync::Mutex::new(Some(second_started_tx)),
+        });
+        let server = std::thread::spawn(move || {
+            serve_forever_multi_service(vec![listener], service, config)
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .write_all(b"PUT /sanity HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+        let first = read_one_http_response(&mut client);
+        assert_eq!(status(&first), 200);
+
+        // Hyper has completed one request on this persistent connection and
+        // has started reading the next head, but Service::call cannot run
+        // until the terminator arrives. This is the deterministic form of
+        // Python Swift's old-reload race.
+        client
+            .write_all(b"PUT /across-reload HTTP/1.1\r\nContent-Length: 4\r\n")
+            .unwrap();
+        shutdown.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(50));
+        client.write_all(b"\r\n").unwrap();
+        second_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("raced second request head must survive graceful shutdown");
+        client.write_all(b"test").unwrap();
+        let second = read_one_http_response(&mut client);
+
+        assert_eq!(status(&second), 200);
+        assert_eq!(response_body(&second), b"test");
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn graceful_shutdown_drains_request_already_in_accept_backlog() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let config = ServerConfig {
+            worker_threads: 2,
+            shutdown: Some(Arc::clone(&shutdown)),
+            shutdown_deadline_secs: 2,
+            ..ServerConfig::default()
+        };
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let service: Arc<dyn AsyncService> = Arc::new(DelayedBodyEcho {
+            started: std::sync::Mutex::new(Some(started_tx)),
+        });
+
+        // Complete the TCP handshake and queue the request head before the
+        // runtime gets a chance to accept it. This is the old-reload race:
+        // the manager's shutdown signal and Hyper's first accept cross.
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .write_all(b"PUT / HTTP/1.1\r\nContent-Length: 4\r\n\r\n")
+            .unwrap();
+        shutdown.store(true, Ordering::SeqCst);
+
+        let server = std::thread::spawn(move || {
+            serve_forever_multi_service(vec![listener], service, config)
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("request queued before shutdown must be accepted and drained");
         client.write_all(b"test").unwrap();
         let mut response = Vec::new();
         client.read_to_end(&mut response).unwrap();

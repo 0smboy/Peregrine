@@ -70,3 +70,15 @@ path = "src/bin/manage_shard_ranges.rs"
 [[bin]]
 name = "swift-db-replicator"
 path = "src/bin/db_replicator.rs"
+
+# Python Swift and the systemd units invoke the DB replicator through these
+# service-specific executable names.  db_replicator.rs intentionally selects
+# account versus container mode from argv[0], so both names must be real build
+# artifacts rather than deployment-time assumptions.
+[[bin]]
+name = "swift-account-replicator"
+path = "src/bin/db_replicator.rs"
+
+[[bin]]
+name = "swift-container-replicator"
+path = "src/bin/db_replicator.rs"

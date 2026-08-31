@@ -54,6 +54,13 @@ pub fn spawn_server(worker_threads: usize, handler: Handler) -> Server {
     let config = ServerConfig {
         worker_threads,
         connection_queue: 32,
+        // Occupancy tests deliberately hold up to 1,000 connections while
+        // probing one more request.  Keep the runtime at two workers, but make
+        // the independent connection/request budget explicit so the test
+        // measures scheduler starvation rather than the admission controller's
+        // expected 503 response at worker_threads + connection_queue.
+        max_connections: 2_048,
+        max_active_requests: 2_048,
         client_timeout_secs: 2,
         head_deadline_secs: 2,
         max_requests_per_connection: 32,

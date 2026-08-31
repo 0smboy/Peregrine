@@ -1049,22 +1049,22 @@ pub fn cleave_shard_range(
         };
         let object_count = get("object_count");
         let bytes_used = get("bytes_used");
-        // Advance only one normal-timestamp tick past the FOUND estimate.
-        // ShardRange metadata is a Python `NormalTimestamp`, so an internal
-        // offset (`_<hex>`) is not wire-compatible. Using wall
-        // clock time here can make this stale first-cleave snapshot newer
-        // than an authoritative shard report processed earlier in the same
-        // device sweep (for example, 50 objects overwriting a later 51 after
-        // misplaced-object movement). One 10-microsecond tick is enough to
-        // make the copied byte count win over the original estimate, while
-        // every real later shard report still wins by normal timestamp.
+        // Python `ShardRange.update_meta()` uses `NormalTimestamp.now()` for
+        // every first-cleave observation. A deterministic `old + 1 tick`
+        // makes all replicas publish the same meta timestamp; if an empty
+        // replica reports 0 while a populated replica reports N, merge order
+        // then decides the root's count (probe unsharded-deleted-root).
+        // Keep the wire-compatible NormalTimestamp and clamp it strictly past
+        // the prior value if the local wall clock ever moves backwards.
+        let now = swift_core::timestamp::Timestamp::now();
         let meta_timestamp = range
             .meta_timestamp
             .parse::<swift_core::timestamp::Timestamp>()
             .ok()
-            .and_then(|timestamp| timestamp.apply_delta(1).ok())
-            .map(|timestamp| timestamp.normal())
-            .unwrap_or_else(|| swift_core::timestamp::Timestamp::now().normal());
+            .filter(|previous| now <= *previous)
+            .and_then(|previous| previous.apply_delta(1).ok())
+            .unwrap_or(now)
+            .normal();
         range.update_meta(object_count, bytes_used, &meta_timestamp);
         range.state = shard_state::CLEAVED;
         shard.merge_shard_ranges(vec![range.clone()])?;
@@ -1345,24 +1345,26 @@ fn shard_ranges_json(ranges: &[ShardRange]) -> Vec<u8> {
     serde_json::to_vec(&arr).unwrap_or_else(|_| b"[]".to_vec())
 }
 
-/// G6 SAIO: device `sdb2` for `127.0.0.2` lives under `/srv/2/node`, not
-/// under the local sharder’s `/srv/1/node`.
+/// SAIO: a device for `127.0.0.N` lives under the matching numbered root,
+/// while preserving the configured devices-directory name.  For example,
+/// `/srv/1/node/sdb1` maps to `/srv/2/node`, and the isolated G6 layout
+/// `/srv/1/g6-ec/sdb1` maps to `/srv/2/g6-ec`.
 fn peer_devices_root(local_device: &Path, peer_ip: &str) -> std::path::PathBuf {
-    // G6 SAIO layout: `/srv/<n>/node/<device>`. `parent()` of the device is
-    // `/srv/<n>/node`, so the loopback octet maps at `/srv/<octet>/node`.
+    // Only recognize the explicit numbered SAIO shape
+    // `<base>/<local-octet>/<devices-dir>/<device>`.  A normal production
+    // root such as `/srv/node/<device>` has no numeric site component and
+    // deliberately falls back to its local devices directory.
     let node_dir = local_device.parent();
-    let is_node = node_dir
-        .and_then(|p| p.file_name())
-        .is_some_and(|n| n == "node");
-    if is_node {
-        if let (Some(n_dir), Some(octet)) = (
-            node_dir.and_then(|p| p.parent()),
-            peer_ip.strip_prefix("127.0.0."),
-        ) {
-            if !octet.is_empty() && octet.bytes().all(|c| c.is_ascii_digit()) {
-                if let Some(srv) = n_dir.parent() {
-                    return srv.join(octet).join("node");
-                }
+    if let (Some(devices_dir), Some(site_dir), Some(peer_octet)) = (
+        node_dir.and_then(|p| p.file_name()),
+        node_dir.and_then(|p| p.parent()),
+        peer_ip.strip_prefix("127.0.0."),
+    ) {
+        let local_octet = site_dir.file_name().and_then(|n| n.to_str());
+        let numeric = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+        if local_octet.is_some_and(numeric) && numeric(peer_octet) {
+            if let Some(base) = site_dir.parent() {
+                return base.join(peer_octet).join(devices_dir);
             }
         }
     }
@@ -5970,6 +5972,7 @@ mod tests {
             let _ = b.initialize("1751500010.00000", 0, "1751500010.00000", "sid");
             b
         };
+        let cleave_started = swift_core::timestamp::Timestamp::now();
         let mut ctx = CleavingContext::default();
         cleave(&mut source, &mut ranges, &mut shard_for, &mut ctx, 10).unwrap();
 
@@ -6004,15 +6007,40 @@ mod tests {
                     .unwrap();
                 !range.meta_timestamp.contains('_')
                     && meta.offset() == 0
-                    && meta.raw() == created.raw() + 1
+                    && meta > created
+                    && meta >= cleave_started
             }),
-            "first-cleave metadata must be a one-tick NormalTimestamp: {persisted:?}"
+            "first-cleave metadata must be a fresh NormalTimestamp: {persisted:?}"
         );
+        // W035: an empty replica had already persisted count=0 at the old
+        // deterministic +1 tick. A populated first-cleave report must carry a
+        // later timestamp so newest-wins cannot keep the empty count.
+        let mut lagging = persisted[0].clone();
+        lagging.object_count = 0;
+        lagging.bytes_used = 0;
+        lagging.meta_timestamp = lagging
+            .timestamp
+            .parse::<swift_core::timestamp::Timestamp>()
+            .unwrap()
+            .apply_delta(1)
+            .unwrap()
+            .normal();
+        let mut populated = persisted[0].clone();
+        assert!(merge_shards(&mut populated, Some(&lagging)));
+        assert_eq!(populated.object_count, persisted[0].object_count);
+        assert_eq!(populated.bytes_used, persisted[0].bytes_used);
         // A shard may report a newer live count before another root replica
         // finishes its first cleave. Replaying the stale cleave snapshot must
         // not overwrite that authoritative report.
         let mut authoritative = persisted[0].clone();
-        authoritative.update_meta(4, 4, "1751500011.00000");
+        let authoritative_timestamp = authoritative
+            .meta_timestamp
+            .parse::<swift_core::timestamp::Timestamp>()
+            .unwrap()
+            .apply_delta(1)
+            .unwrap()
+            .normal();
+        authoritative.update_meta(4, 4, &authoritative_timestamp);
         source
             .merge_shard_ranges(vec![authoritative.clone()])
             .unwrap();
@@ -9351,6 +9379,16 @@ mod tests {
         assert_eq!(
             peer_devices_root(local, "127.0.0.4"),
             std::path::PathBuf::from("/srv/4/node")
+        );
+        let isolated = std::path::Path::new("/srv/1/g6-ec/sdb1");
+        assert_eq!(
+            peer_devices_root(isolated, "127.0.0.2"),
+            std::path::PathBuf::from("/srv/2/g6-ec")
+        );
+        let production = std::path::Path::new("/srv/node/sdb1");
+        assert_eq!(
+            peer_devices_root(production, "127.0.0.2"),
+            std::path::PathBuf::from("/srv/node")
         );
         assert_eq!(
             peer_devices_root(local, "10.0.0.9"),

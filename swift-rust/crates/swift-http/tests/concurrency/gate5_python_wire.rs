@@ -36,7 +36,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -665,11 +665,15 @@ fn transact_rest(s: &mut TcpStream) -> Vec<u8> {
     buf
 }
 
+static NEXT_OBJECT_SERVER_DIR: AtomicU64 = AtomicU64::new(0);
+
 fn spawn_object_server() -> (harness::Server, PathBuf) {
+    let instance = NEXT_OBJECT_SERVER_DIR.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "gate5-obj-{}-{}",
+        "gate5-obj-{}-{}-{}",
         std::process::id(),
-        line!()
+        line!(),
+        instance,
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("sda1")).unwrap();
