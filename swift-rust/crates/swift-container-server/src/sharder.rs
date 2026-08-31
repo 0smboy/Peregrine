@@ -1049,22 +1049,22 @@ pub fn cleave_shard_range(
         };
         let object_count = get("object_count");
         let bytes_used = get("bytes_used");
-        // Advance only one normal-timestamp tick past the FOUND estimate.
-        // ShardRange metadata is a Python `NormalTimestamp`, so an internal
-        // offset (`_<hex>`) is not wire-compatible. Using wall
-        // clock time here can make this stale first-cleave snapshot newer
-        // than an authoritative shard report processed earlier in the same
-        // device sweep (for example, 50 objects overwriting a later 51 after
-        // misplaced-object movement). One 10-microsecond tick is enough to
-        // make the copied byte count win over the original estimate, while
-        // every real later shard report still wins by normal timestamp.
+        // Python `ShardRange.update_meta()` uses `NormalTimestamp.now()` for
+        // every first-cleave observation. A deterministic `old + 1 tick`
+        // makes all replicas publish the same meta timestamp; if an empty
+        // replica reports 0 while a populated replica reports N, merge order
+        // then decides the root's count (probe unsharded-deleted-root).
+        // Keep the wire-compatible NormalTimestamp and clamp it strictly past
+        // the prior value if the local wall clock ever moves backwards.
+        let now = swift_core::timestamp::Timestamp::now();
         let meta_timestamp = range
             .meta_timestamp
             .parse::<swift_core::timestamp::Timestamp>()
             .ok()
-            .and_then(|timestamp| timestamp.apply_delta(1).ok())
-            .map(|timestamp| timestamp.normal())
-            .unwrap_or_else(|| swift_core::timestamp::Timestamp::now().normal());
+            .filter(|previous| now <= *previous)
+            .and_then(|previous| previous.apply_delta(1).ok())
+            .unwrap_or(now)
+            .normal();
         range.update_meta(object_count, bytes_used, &meta_timestamp);
         range.state = shard_state::CLEAVED;
         shard.merge_shard_ranges(vec![range.clone()])?;
@@ -5972,6 +5972,7 @@ mod tests {
             let _ = b.initialize("1751500010.00000", 0, "1751500010.00000", "sid");
             b
         };
+        let cleave_started = swift_core::timestamp::Timestamp::now();
         let mut ctx = CleavingContext::default();
         cleave(&mut source, &mut ranges, &mut shard_for, &mut ctx, 10).unwrap();
 
@@ -6006,15 +6007,40 @@ mod tests {
                     .unwrap();
                 !range.meta_timestamp.contains('_')
                     && meta.offset() == 0
-                    && meta.raw() == created.raw() + 1
+                    && meta > created
+                    && meta >= cleave_started
             }),
-            "first-cleave metadata must be a one-tick NormalTimestamp: {persisted:?}"
+            "first-cleave metadata must be a fresh NormalTimestamp: {persisted:?}"
         );
+        // W035: an empty replica had already persisted count=0 at the old
+        // deterministic +1 tick. A populated first-cleave report must carry a
+        // later timestamp so newest-wins cannot keep the empty count.
+        let mut lagging = persisted[0].clone();
+        lagging.object_count = 0;
+        lagging.bytes_used = 0;
+        lagging.meta_timestamp = lagging
+            .timestamp
+            .parse::<swift_core::timestamp::Timestamp>()
+            .unwrap()
+            .apply_delta(1)
+            .unwrap()
+            .normal();
+        let mut populated = persisted[0].clone();
+        assert!(merge_shards(&mut populated, Some(&lagging)));
+        assert_eq!(populated.object_count, persisted[0].object_count);
+        assert_eq!(populated.bytes_used, persisted[0].bytes_used);
         // A shard may report a newer live count before another root replica
         // finishes its first cleave. Replaying the stale cleave snapshot must
         // not overwrite that authoritative report.
         let mut authoritative = persisted[0].clone();
-        authoritative.update_meta(4, 4, "1751500011.00000");
+        let authoritative_timestamp = authoritative
+            .meta_timestamp
+            .parse::<swift_core::timestamp::Timestamp>()
+            .unwrap()
+            .apply_delta(1)
+            .unwrap()
+            .normal();
+        authoritative.update_meta(4, 4, &authoritative_timestamp);
         source
             .merge_shard_ranges(vec![authoritative.clone()])
             .unwrap();
