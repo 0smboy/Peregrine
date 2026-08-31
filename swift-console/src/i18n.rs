@@ -346,7 +346,6 @@ pub fn t(l: &str, key: &'static str) -> &'static str {
             "Tools that explain the cluster rather than operate it: what the ring would do, \
              what a policy would cost, why one object behaved the way it did."
         },
-        "lab.soon" => if zh { "尚未构建" } else { "not built yet" },
         "lab.reachable" => if zh { "个节点可达" } else { "nodes reachable" },
         "lab.slowest" => if zh { "最慢" } else { "slowest" },
         "lab.nonodes" => if zh {

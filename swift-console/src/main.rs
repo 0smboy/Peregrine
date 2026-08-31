@@ -39,6 +39,24 @@ use axum::Router;
 use serde::Deserialize;
 use std::sync::Arc;
 
+const DEFAULT_CONFIG_PATH: &str = "/etc/swift-console/config.json";
+
+#[derive(Debug, PartialEq, Eq)]
+enum StartupAction {
+    Serve(String),
+    Help,
+    Version,
+}
+
+fn startup_action(argument: Option<String>) -> StartupAction {
+    match argument.as_deref() {
+        Some("-h" | "--help") => StartupAction::Help,
+        Some("-V" | "--version") => StartupAction::Version,
+        Some(path) => StartupAction::Serve(path.to_owned()),
+        None => StartupAction::Serve(DEFAULT_CONFIG_PATH.to_owned()),
+    }
+}
+
 #[derive(Deserialize, Clone)]
 pub struct AccountEntry {
     pub tenant: String,
@@ -212,9 +230,17 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() {
-    let cfg_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "/etc/swift-console/config.json".into());
+    let cfg_path = match startup_action(std::env::args().nth(1)) {
+        StartupAction::Help => {
+            println!("swift-console {}\n\nUsage: swift-console [CONFIG_PATH]", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        StartupAction::Version => {
+            println!("swift-console {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        StartupAction::Serve(path) => path,
+    };
     let raw = std::fs::read_to_string(&cfg_path)
         .unwrap_or_else(|e| panic!("cannot read config {cfg_path}: {e}"));
     let cfg: Config =
@@ -415,4 +441,36 @@ async fn main() {
         .unwrap_or_else(|e| panic!("cannot bind {bind}: {e}"));
     eprintln!("swift-console {} listening on {}", pages::VERSION, bind);
     axum::serve(listener, app).await.expect("server");
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{DEFAULT_CONFIG_PATH, StartupAction, startup_action};
+
+    #[test]
+    fn defaults_to_the_system_config() {
+        assert_eq!(
+            startup_action(None),
+            StartupAction::Serve(DEFAULT_CONFIG_PATH.to_owned())
+        );
+    }
+
+    #[test]
+    fn accepts_an_explicit_config_path() {
+        assert_eq!(
+            startup_action(Some("/tmp/console.json".to_owned())),
+            StartupAction::Serve("/tmp/console.json".to_owned())
+        );
+    }
+
+    #[test]
+    fn recognizes_help_and_version_without_reading_a_config() {
+        assert_eq!(startup_action(Some("--help".to_owned())), StartupAction::Help);
+        assert_eq!(startup_action(Some("-h".to_owned())), StartupAction::Help);
+        assert_eq!(
+            startup_action(Some("--version".to_owned())),
+            StartupAction::Version
+        );
+        assert_eq!(startup_action(Some("-V".to_owned())), StartupAction::Version);
+    }
 }
