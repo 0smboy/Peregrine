@@ -21,7 +21,7 @@ Source in [`docs-site/`](docs-site/).
 
 | Directory | What it is | Language | Status |
 |-----------|-----------|----------|--------|
-| [`swift-rust/`](swift-rust/) | The storage engine: proxy, object, container, account servers, consistency daemons, erasure coding, the ring, SQLite backends, and middleware. A 15-crate workspace. | Rust | Advanced core paths with unit and four-node lab evidence; strict residuals remain. |
+| [`swift-rust/`](swift-rust/) | The storage engine: proxy, object, container, account servers, consistency daemons, erasure coding, the ring, SQLite backends, and middleware. A 16-crate workspace. | Rust | Advanced core paths with unit and four-node lab evidence; strict residuals remain. |
 | [`swift-deploy-rs/`](swift-deploy-rs/) | A bounded, Python-free deployer. Executes the upstream Swift Ansible v3 plan natively — no Ansible, no `ansible-playbook` — with sealed, re-verified plans and per-action authorization for destructive steps. Ships its own web control console. | Rust | Covers v3's 57 task/handler files, 413 leaf tasks, 28 modules. |
 | [`cosbench-rs/`](cosbench-rs/) | A Rust rewrite of Intel's COSBench core: an S3/Swift load generator with prepare/main/cleanup workloads, hash-integrity checks, and JSON/CSV reports. | Rust | mock / S3 / Swift drivers, Keystone v3. |
 | [`autocos/`](autocos/) | Benchmark automation over `cosbench-rs`: submit workloads, track progress, list, collect, and archive results. | Rust | `run` / `list` / `remove` / `collect`. |
@@ -110,7 +110,7 @@ A one-command single-host cluster (SAIO) lives in
 
 ```
 Peregrine/
-├── swift-rust/         the storage engine (15-crate Rust workspace)
+├── swift-rust/         the storage engine (16-crate Rust workspace)
 ├── swift-deploy-rs/    Python-free native deployer + control console
 ├── cosbench-rs/        COSBench-compatible S3/Swift load generator
 ├── autocos/            benchmark automation over cosbench-rs
