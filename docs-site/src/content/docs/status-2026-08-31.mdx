@@ -32,8 +32,9 @@ aggregate test count.
 | 2026-08-23–24 | [`520ebf6`](https://github.com/0smboy/Peregrine/commit/520ebf6), [`7d71b9d`](https://github.com/0smboy/Peregrine/commit/7d71b9d) | Hyper body draining and the G7 load-test harness were added; G7 remains a harness, not an acceptance result. |
 | 2026-08-26–27 | [`4dc10c0`](https://github.com/0smboy/Peregrine/commit/4dc10c0), [`fda3691`](https://github.com/0smboy/Peregrine/commit/fda3691) | Native async multiphase object PUT, reconciler paths, expirer routing, and sharder leader behavior were repaired. |
 | 2026-08-29–30 | [`0d5c816`](https://github.com/0smboy/Peregrine/commit/0d5c816)..[`b6e36bf`](https://github.com/0smboy/Peregrine/commit/b6e36bf) | G6 sharding, replication, object, versioning, reload, and HTTP-boundary fixes were integrated; G7 evidence was made fail-closed. |
-| 2026-08-31 | [`64446f1`](https://github.com/0smboy/Peregrine/commit/64446f1d5870ea88835506a2581039fe407c9604) | G6 EC POST/nondurable and runner lifecycle were repaired. W019 passes 1/1 and W020 is 32/32 GREEN; same-candidate replication W021 is running. |
-| 2026-08-31 | `17adf0b` | Eight follow-up fixes close isolated sharder routing and timestamp behavior, cancellation and release service entries, reload/fixture isolation, listener rebind, and the raced keep-alive request during graceful shutdown. Two 100-attempt reload canaries pass before the formal frozen-179 rerun. |
+| 2026-08-31 | [`64446f1`](https://github.com/0smboy/Peregrine/commit/64446f1d5870ea88835506a2581039fe407c9604) | G6 EC POST/nondurable and runner lifecycle were repaired. W019/W020/W021 were an intermediate checkpoint, later superseded by the accepted W068/W069/W070 sequence. |
+| 2026-08-31 | [`17adf0b`](https://github.com/0smboy/Peregrine/commit/17adf0bfa78b30b2a7eed9f39836e0d63c715d2c) | Eight follow-up fixes close isolated sharder routing and timestamp behavior, cancellation and release service entries, reload/fixture isolation, listener rebind, and the raced keep-alive request during graceful shutdown. Two 100-attempt reload canaries pass before the formal frozen-179 rerun. |
+| 2026-09-01 | [`g6-green-20260831`](https://github.com/0smboy/Peregrine/releases/tag/g6-green-20260831) | The accepted Rust Swift source, full documentation audit, rebuilt auxiliary Linux tools, and checksummed evidence are published as a lab pre-release. G7 remains not accepted and production remains NO-GO. |
 
 The G6-accepted Rust Swift source line is identified by the full commit
 `17adf0bfa78b30b2a7eed9f39836e0d63c715d2c`. The frozen comparison oracle is
@@ -41,9 +42,9 @@ identified by SHA-256
 `f277baa81ccb6d62f38621b1f04b012f03c0ed4eb683fdac9bb7fe263c98e591`.
 
 The earlier `64446f1` bundle and Drive folder remain immutable historical
-candidate evidence; they are not the accepted W070 artifact. Release
-publication, auxiliary-component builds, and the refreshed Drive manifest are
-tracked on [Releases](/releases) and must not rewrite the historical bundle.
+candidate evidence; they are not the accepted W070 artifact. The published
+lab pre-release and refreshed Drive archive are tracked on
+[Releases](/releases) and do not rewrite that historical bundle.
 
 ## Gate truth
 

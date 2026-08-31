@@ -18,16 +18,18 @@ with recorded SHA-256s, and the docs state which one is live. If a node
 disagrees with this page, reconcile before touching anything
 ([health checklist](/runbooks#health-checklist-first-hour-of-any-shift)).
 
-## Current candidate publication state
+## Current lab pre-release publication state
 
 | Item | Verified state on 2026-08-31 |
 |---|---|
 | remote | `https://github.com/0smboy/Peregrine.git` |
 | accepted Rust Swift source | `17adf0bfa78b30b2a7eed9f39836e0d63c715d2c` |
+| canonical integration and auxiliary build commit | `7883bbb1d021277390215e18afeb414b5b612339` |
 | G6 evidence | W068 + W069 + W070, exact frozen 179 and zero unexpected result |
-| publication | this page is updated again with the canonical integration commit and release tag before deployment |
-| Rust Swift artifact | v9 EC package and full binary/wrapper manifests pinned by W070 |
-| auxiliary Linux binaries | source included; not rebuilt in the offline pass because the cache lacked `axum` |
+| publication | [`g6-green-20260831`](https://github.com/0smboy/Peregrine/releases/tag/g6-green-20260831), explicitly a lab pre-release rather than production approval |
+| Rust Swift artifact | v9 EC package, SHA-256 `5eb07c38ec1a37bd21d3a7afe744e37374f54bb3a92e352204df018aec293398` |
+| auxiliary Linux binaries | Swift Console 180/180, Swift Deploy 79/79, Cosbench-RS 33/33, and Autocos 4/4; all locked release builds completed on Swift2 |
+| Drive archive | `gdrive:Peregrine/Peregrine-G6-green-20260831-7883bbb/`, separate from the immutable `64446f1` archive |
 | production `:8080` | all four nodes remained on `ab5cb95c…` |
 
 The earlier append-only artifact folder is
@@ -35,6 +37,13 @@ The earlier append-only artifact folder is
 29,319,934 bytes at verification). It preserves the superseded `64446f1`
 candidate and must not be overwritten by the `17adf0b` release bundle. Upload
 is artifact preservation, not a release or production promotion.
+
+The new Drive folder contains the two Linux release archives, per-file
+checksums, and the complete W068/W069/W070 evidence directories. The auxiliary
+archive SHA-256 is
+`6b5212b262057b7d361cb04f822a3878a53273f57674aecc4079439e1637ce5a`.
+Publishing this tag makes a reproducible lab candidate available; it does not
+close G3, G4, G5, G7, or G8 and does not authorize a fleet rollout.
 
 ## Historical proxy generations
 
