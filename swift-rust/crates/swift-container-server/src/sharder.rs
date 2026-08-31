@@ -1345,24 +1345,26 @@ fn shard_ranges_json(ranges: &[ShardRange]) -> Vec<u8> {
     serde_json::to_vec(&arr).unwrap_or_else(|_| b"[]".to_vec())
 }
 
-/// G6 SAIO: device `sdb2` for `127.0.0.2` lives under `/srv/2/node`, not
-/// under the local sharder’s `/srv/1/node`.
+/// SAIO: a device for `127.0.0.N` lives under the matching numbered root,
+/// while preserving the configured devices-directory name.  For example,
+/// `/srv/1/node/sdb1` maps to `/srv/2/node`, and the isolated G6 layout
+/// `/srv/1/g6-ec/sdb1` maps to `/srv/2/g6-ec`.
 fn peer_devices_root(local_device: &Path, peer_ip: &str) -> std::path::PathBuf {
-    // G6 SAIO layout: `/srv/<n>/node/<device>`. `parent()` of the device is
-    // `/srv/<n>/node`, so the loopback octet maps at `/srv/<octet>/node`.
+    // Only recognize the explicit numbered SAIO shape
+    // `<base>/<local-octet>/<devices-dir>/<device>`.  A normal production
+    // root such as `/srv/node/<device>` has no numeric site component and
+    // deliberately falls back to its local devices directory.
     let node_dir = local_device.parent();
-    let is_node = node_dir
-        .and_then(|p| p.file_name())
-        .is_some_and(|n| n == "node");
-    if is_node {
-        if let (Some(n_dir), Some(octet)) = (
-            node_dir.and_then(|p| p.parent()),
-            peer_ip.strip_prefix("127.0.0."),
-        ) {
-            if !octet.is_empty() && octet.bytes().all(|c| c.is_ascii_digit()) {
-                if let Some(srv) = n_dir.parent() {
-                    return srv.join(octet).join("node");
-                }
+    if let (Some(devices_dir), Some(site_dir), Some(peer_octet)) = (
+        node_dir.and_then(|p| p.file_name()),
+        node_dir.and_then(|p| p.parent()),
+        peer_ip.strip_prefix("127.0.0."),
+    ) {
+        let local_octet = site_dir.file_name().and_then(|n| n.to_str());
+        let numeric = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+        if local_octet.is_some_and(numeric) && numeric(peer_octet) {
+            if let Some(base) = site_dir.parent() {
+                return base.join(peer_octet).join(devices_dir);
             }
         }
     }
@@ -9351,6 +9353,16 @@ mod tests {
         assert_eq!(
             peer_devices_root(local, "127.0.0.4"),
             std::path::PathBuf::from("/srv/4/node")
+        );
+        let isolated = std::path::Path::new("/srv/1/g6-ec/sdb1");
+        assert_eq!(
+            peer_devices_root(isolated, "127.0.0.2"),
+            std::path::PathBuf::from("/srv/2/g6-ec")
+        );
+        let production = std::path::Path::new("/srv/node/sdb1");
+        assert_eq!(
+            peer_devices_root(production, "127.0.0.2"),
+            std::path::PathBuf::from("/srv/node")
         );
         assert_eq!(
             peer_devices_root(local, "10.0.0.9"),
