@@ -3240,8 +3240,38 @@ impl S3Api {
         }
 
         if is_mpu_part {
+            let pn = part_number.unwrap();
+            if pn < 1 {
+                return finish(s3_error_response("InvalidArgument", Some("partNumber"), &[]));
+            }
+            let uid = upload_id.as_deref().unwrap();
+            let (st, _) =
+                match head_container_streaming(&cred, &bucket, &next, &self.container_heads).await
+                {
+                    Ok(v) => v,
+                    Err(resp) => return finish(resp),
+                };
+            if st == 404 {
+                return finish(s3_error_response(
+                    "NoSuchBucket",
+                    None,
+                    &[("BucketName", &bucket)],
+                ));
+            }
+            if !(200..300).contains(&st) {
+                return finish(map_swift_error(st, Some(&bucket), None));
+            }
             let segs = segments_container(&bucket);
-            let part_name = part_object_name(&key, upload_id.as_deref().unwrap(), part_number.unwrap());
+            match control_head_object_streaming(&cred, &segs, &upload_marker_name(&key, uid), &next)
+                .await
+            {
+                Ok(ObjectHead::Present(_)) => {}
+                Ok(ObjectHead::Missing) => {
+                    return finish(s3_error_response("NoSuchUpload", None, &[]));
+                }
+                Err(resp) => return finish(resp),
+            }
+            let part_name = part_object_name(&key, uid, pn);
             let swift = AsyncRequest {
                 method: "PUT".into(),
                 path: s3_to_swift_path(&cred.account, Some(&segs), Some(&part_name)),
@@ -7879,6 +7909,11 @@ async fn handle_mpu_part_async(
         return map_swift_error(bucket_resp.status, Some(bucket), None);
     }
     let segs = segments_container(bucket);
+    match control_head_object_async(cred, &segs, &upload_marker_name(key, upload_id), next).await {
+        Ok(ObjectHead::Present(_)) => {}
+        Ok(ObjectHead::Missing) => return s3_error_response("NoSuchUpload", None, &[]),
+        Err(resp) => return resp,
+    }
     let part_name = part_object_name(key, upload_id, part_number);
     let mut put = req;
     put.method = "PUT".into();
@@ -7957,6 +7992,11 @@ async fn handle_mpu_part_copy_async(
         return map_swift_error(dest_resp.status, Some(bucket), None);
     }
     let segs = segments_container(bucket);
+    match control_head_object_async(cred, &segs, &upload_marker_name(key, upload_id), next).await {
+        Ok(ObjectHead::Present(_)) => {}
+        Ok(ObjectHead::Missing) => return s3_error_response("NoSuchUpload", None, &[]),
+        Err(resp) => return resp,
+    }
     let part_name = part_object_name(key, upload_id, part_number);
     let mut put = make_swift_req(
         "PUT",
@@ -13425,6 +13465,14 @@ mod tests {
         let areq = async_from_signed(req, b"part".to_vec());
         let next: StreamingAsyncNextFn = Arc::new(move |areq| {
             Box::pin(async move {
+                if areq.method == "HEAD" && areq.path == "/v1/AUTH_test/mybucket" {
+                    return Response::new(204);
+                }
+                if areq.method == "HEAD"
+                    && areq.path == "/v1/AUTH_test/mybucket+segments/obj/uid1"
+                {
+                    return Response::new(200);
+                }
                 assert_eq!(areq.method, "PUT");
                 assert_eq!(
                     areq.path,
