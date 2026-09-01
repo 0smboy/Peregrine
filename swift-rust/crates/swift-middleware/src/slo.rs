@@ -99,6 +99,30 @@ const ASYNC_DELETE_TYPE: &str = "application/async-deleted";
 /// md5 of empty string — etag on zero-byte async-delete task records.
 const MD5_OF_EMPTY_STRING: &str = "d41d8cd98f00b204e9800998ecf8427e";
 
+
+fn version_id_query(req: &Request) -> Option<String> {
+    let value = req.param("version-id")?;
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn manifest_get_query(req: &Request) -> String {
+    match version_id_query(req) {
+        Some(vid) => format!("multipart-manifest=get&version-id={vid}"),
+        None => "multipart-manifest=get".to_string(),
+    }
+}
+
+fn manifest_object_delete_query(req: &Request) -> String {
+    match version_id_query(req) {
+        Some(vid) => format!("version-id={vid}"),
+        None => String::new(),
+    }
+}
+
 fn slo_override(req: &Request) -> bool {
     config_true_value(req.headers.get("X-Backend-Slo-Override").unwrap_or(""))
 }
@@ -2117,9 +2141,10 @@ impl Slo {
         let manifest_name = format!("/{container}/{object}");
 
         // Fetch stored manifest (raw GET with multipart-manifest=get).
+        // Keep version-id: Python slo.py copies the client QUERY_STRING.
         let mut get = req.clone_head();
         get.method = "GET".to_string();
-        get.query_string = "multipart-manifest=get".to_string();
+        get.query_string = manifest_get_query(&req);
         get.headers.remove("Content-Length");
         ignore_range(&mut get.headers, SLO_HEADER);
         let mut mresp = next(get);
@@ -2212,8 +2237,15 @@ impl Slo {
             let mut del = req.clone_head();
             del.method = "DELETE".to_string();
             del.path = delete_path;
-            del.query_string = String::new();
+            del.query_string = if name == &format!("/{container}/{object}")
+                || name.ends_with(&format!("/{container}/{object}"))
+            {
+                manifest_object_delete_query(&req)
+            } else {
+                String::new()
+            };
             del.headers.remove("Content-Length");
+            del.headers.set("X-Backend-Slo-Override", "true");
             let resp = next(del);
             match resp.status {
                 s if (200..300).contains(&s) => number_deleted += 1,
@@ -2272,7 +2304,7 @@ impl Slo {
         let manifest_name = format!("/{container}/{object}");
         let mut get = req.clone_head();
         get.method = "GET".to_string();
-        get.query_string = "multipart-manifest=get".to_string();
+        get.query_string = manifest_get_query(&req);
         get.headers.remove("Content-Length");
         ignore_range(&mut get.headers, SLO_HEADER);
         let mut mresp = next(get).await;
@@ -2315,8 +2347,15 @@ impl Slo {
             let mut del = req.clone_head();
             del.method = "DELETE".to_string();
             del.path = delete_path;
-            del.query_string = String::new();
+            del.query_string = if name == &format!("/{container}/{object}")
+                || name.ends_with(&format!("/{container}/{object}"))
+            {
+                manifest_object_delete_query(&req)
+            } else {
+                String::new()
+            };
             del.headers.remove("Content-Length");
+            del.headers.set("X-Backend-Slo-Override", "true");
             let resp = next(del).await;
             match resp.status {
                 s if (200..300).contains(&s) => number_deleted += 1,

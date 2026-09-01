@@ -2964,9 +2964,9 @@ impl Middleware for VersionedWrites {
         let is_object = matches!(split_path(&req.path, 4, 4, true), Ok(parts)
             if parts[2].as_deref().is_some_and(|container| !container.is_empty())
                 && parts[3].as_deref().is_some_and(|object| !object.is_empty()));
-        let version_id_get_head = is_object
+        let version_id_object = is_object
             && self.allow_object_versioning
-            && matches!(req.method.as_str(), "GET" | "HEAD")
+            && matches!(req.method.as_str(), "GET" | "HEAD" | "DELETE")
             && query_param(&req.query_string, "version-id").is_some_and(|value| !value.is_empty());
         // COPY source GET is intercept next(), not Hyper streaming.
         (is_object
@@ -2974,7 +2974,7 @@ impl Middleware for VersionedWrites {
             && !put_has_version_id(&req.query_string)
             && !req.headers.contains_key("X-Copy-From")
             && (self.allow_object_versioning || self.allow_versioned_writes != Some(false)))
-            || version_id_get_head
+            || version_id_object
     }
 
     fn intercepts_response(&self) -> bool {
@@ -3042,7 +3042,7 @@ impl Middleware for VersionedWrites {
             }
             if is_object
                 && self.allow_object_versioning
-                && matches!(req.method.as_str(), "GET" | "HEAD")
+                && matches!(req.method.as_str(), "GET" | "HEAD" | "DELETE")
                 && query_param(&req.query_string, "version-id").is_some_and(|v| !v.is_empty())
             {
                 let streaming_next = streaming_next_from_async(next);
