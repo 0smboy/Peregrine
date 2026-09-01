@@ -1475,6 +1475,145 @@ impl VersionedWrites {
         marker
     }
 
+    /// Python `ObjectContext.handle_put_version`: zero-byte PUT ?version-id=
+    /// HEADs the hidden archive and repoints the public versions-symlink.
+    /// Does not copy-current and does not write a new hidden object.
+    async fn handle_put_version_streaming(
+        &self,
+        mut req: AsyncRequest,
+        next: StreamingAsyncNextFn,
+        version: &str,
+        account: &str,
+        hidden: &str,
+        archive_name: &str,
+        archive_path: String,
+        requested: Timestamp,
+    ) -> Response {
+        let max_body = req.body.max_body_bytes();
+        let declared = req.body.content_length().or_else(|| {
+            req.headers
+                .get("Content-Length")
+                .and_then(|value| value.parse::<u64>().ok())
+        });
+        let has_body = match declared {
+            Some(0) => false,
+            Some(_) => true,
+            None => match req.body.materialize(max_body).await {
+                Ok(bytes) => !bytes.is_empty(),
+                Err(_) => true,
+            },
+        };
+        if has_body {
+            return modern_bad_request("PUT version-id requests require a zero byte body");
+        }
+
+        let mut archive_head =
+            Self::modern_internal_request("HEAD", archive_path, "symlink=get", &req.headers);
+        archive_head
+            .headers
+            .set("X-Backend-Allow-Reserved-Names", "true");
+        let head_resp = next(empty_async_request(archive_head)).await;
+        if head_resp.status == 404 {
+            let hidden_path = format!("/{version}/{account}/{hidden}");
+            let mut hidden_head =
+                Self::modern_internal_request("HEAD", hidden_path, "", &req.headers);
+            hidden_head
+                .headers
+                .set("X-Backend-Allow-Reserved-Names", "true");
+            let hidden_info = next(empty_async_request(hidden_head)).await;
+            if (200..300).contains(&hidden_info.status) {
+                return Response::error(404, "The specified version does not exist");
+            }
+            return Response::error(
+                500,
+                "The versions container does not exist. You may want to re-enable object versioning.",
+            );
+        }
+        if !(200..300).contains(&head_resp.status) {
+            return head_resp;
+        }
+
+        let target_etag = head_resp
+            .headers
+            .get("ETag")
+            .map(|value| value.trim_matches('"').to_string())
+            .unwrap_or_default();
+        let target_bytes = head_resp
+            .headers
+            .get("Content-Length")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let content_type = head_resp
+            .headers
+            .get("Content-Type")
+            .unwrap_or("application/octet-stream")
+            .split(';')
+            .next()
+            .unwrap_or("application/octet-stream")
+            .trim()
+            .to_string();
+
+        let mut marker_timestamp = req
+            .headers
+            .get("X-Timestamp")
+            .or_else(|| req.headers.get("X-Backend-Inbound-X-Timestamp"))
+            .and_then(|value| value.parse::<Timestamp>().ok())
+            .unwrap_or_else(Timestamp::now);
+        if marker_timestamp.increment_offset(1).is_err() {
+            return Response::error(500, "Object version timestamp overflow");
+        }
+        let quoted_target = format!("{}/{}", quote_path(hidden), quote_path(archive_name));
+        let mut marker_headers = req.headers;
+        for name in [
+            "ETag",
+            "Transfer-Encoding",
+            "X-If-Delete-At",
+            "X-Object-Manifest",
+            "X-Static-Large-Object",
+            "X-Object-Sysmeta-Slo-Etag",
+            "X-Object-Sysmeta-Slo-Size",
+        ] {
+            marker_headers.remove(name);
+        }
+        // Same 5e2d84a marker contract as ordinary versioned PUT.
+        marker_headers.remove("X-Symlink-Target-Account");
+        marker_headers.set("X-Symlink-Target", &quoted_target);
+        marker_headers.set("Content-Length", "0");
+        marker_headers.set("Content-Type", content_type);
+        marker_headers.set("X-Timestamp", marker_timestamp.internal());
+        marker_headers.set("X-Backend-Authorize-Override", "true");
+        marker_headers.set("X-Backend-Source", "OV");
+        marker_headers.set("X-Backend-Allow-Reserved-Names", "true");
+        marker_headers.set(SYSMETA_SYMLINK_TARGET, &quoted_target);
+        marker_headers.set(SYSMETA_SYMLINK_TARGET_ETAG, &target_etag);
+        marker_headers.set(SYSMETA_SYMLINK_TARGET_BYTES, target_bytes.to_string());
+        marker_headers.set(SYSMETA_OBJECT_VERSIONS_SYMLINK, "true");
+        marker_headers.set(SYSMETA_SYMLOOP_EXTEND, "true");
+        marker_headers.set(SYSMETA_ALLOW_RESERVED_NAMES, "true");
+        marker_headers.set(
+            SYSMETA_CONTAINER_UPDATE_OVERRIDE_ETAG,
+            format!(
+                "{MD5_OF_EMPTY_STRING}; symlink_target={quoted_target}; symlink_target_etag={target_etag}; symlink_target_bytes={target_bytes}"
+            ),
+        );
+        req.query_string.clear();
+        let mut marker = next(AsyncRequest {
+            method: "PUT".to_string(),
+            path: req.path,
+            query_string: String::new(),
+            headers: marker_headers,
+            body: IncomingBody::from_bytes(Vec::new(), max_body),
+        })
+        .await;
+        if (200..300).contains(&marker.status) {
+            marker.headers.set("ETag", target_etag);
+            marker
+                .headers
+                .set("X-Object-Version-Id", requested.internal());
+        }
+        marker
+    }
+
     async fn handle_modern_object_streaming(
         &self,
         mut req: AsyncRequest,
@@ -1639,7 +1778,19 @@ impl VersionedWrites {
                     resp.headers.set("X-Object-Current-Version-Id", current_id);
                     resp
                 }
-                "PUT" => Response::error(501, "PUT version-id is not implemented"),
+                "PUT" => {
+                    self.handle_put_version_streaming(
+                        req,
+                        next,
+                        &version,
+                        &account,
+                        &hidden,
+                        &archive_name,
+                        archive_path,
+                        parsed,
+                    )
+                    .await
+                }
                 _ => next(req).await,
             }
         } else if req.method == "POST" && configured.is_some() {

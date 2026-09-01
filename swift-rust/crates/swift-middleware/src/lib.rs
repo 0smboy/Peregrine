@@ -69,6 +69,8 @@ mod staticweb;
 mod symlink;
 mod tempauth;
 mod tempurl;
+#[cfg(test)]
+mod version_id_put_post;
 mod versioned_writes;
 mod xprofile;
 
