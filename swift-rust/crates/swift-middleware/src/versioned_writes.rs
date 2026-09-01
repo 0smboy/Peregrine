@@ -2014,6 +2014,98 @@ fn quote_path(s: &str) -> String {
     out
 }
 
+fn public_version_path(api_version: &str, account: &str, container: &str, object: &str) -> String {
+    format!(
+        "/{}/{}/{}/{}",
+        quote_path(api_version),
+        quote_path(account),
+        quote_path(container),
+        quote_path(object),
+    )
+}
+
+fn public_symlink_target(container: &str, object: &str) -> String {
+    format!("{}/{}", quote_path(container), quote_path(object))
+}
+
+/// Python `object_versioning.handle_request` rewrites symlink-follow headers
+/// so clients never see the reserved versions container. Hidden
+/// `Content-Location` / `X-Symlink-Target` become the public object path
+/// plus `?version-id=`.
+fn rewrite_hidden_version_client_headers(
+    req: &Request,
+    mut resp: Response,
+    api_version: &str,
+    account: &str,
+    container: &str,
+    object: &str,
+) -> Response {
+    if !matches!(req.method.as_str(), "GET" | "HEAD") {
+        return resp;
+    }
+    if query_param(&req.query_string, "version-id").is_some_and(|value| !value.is_empty()) {
+        return resp;
+    }
+    if api_version.is_empty() || account.is_empty() || container.is_empty() || object.is_empty() {
+        return resp;
+    }
+
+    let expected_hidden = modern_versions_container(container);
+
+    if let Some(loc) = resp.headers.get("Content-Location") {
+        let decoded = decoded_header_path(loc);
+        if let Ok(parts) = split_path(&decoded, 4, 4, true) {
+            if parts[1].as_deref() == Some(account)
+                && parts[2].as_deref() == Some(expected_hidden.as_str())
+            {
+                if let Some((_name, version)) = parts[3]
+                    .as_deref()
+                    .and_then(split_modern_versions_object_name)
+                {
+                    let version_id = version.internal();
+                    resp.headers.set("X-Object-Version-Id", version_id.clone());
+                    resp.headers.set(
+                        "Content-Location",
+                        format!(
+                            "{}?version-id={version_id}",
+                            public_version_path(api_version, account, container, object)
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(target) = resp.headers.get("X-Symlink-Target") {
+        let decoded = decoded_header_path(target);
+        let with_slash = if decoded.starts_with('/') {
+            decoded
+        } else {
+            format!("/{decoded}")
+        };
+        if let Ok(parts) = split_path(&with_slash, 2, 2, true) {
+            if parts[0].as_deref() == Some(expected_hidden.as_str()) {
+                if let Some((_name, version)) = parts[1]
+                    .as_deref()
+                    .and_then(split_modern_versions_object_name)
+                {
+                    let version_id = version.internal();
+                    resp.headers.set("X-Object-Version-Id", version_id.clone());
+                    resp.headers.set(
+                        "X-Symlink-Target",
+                        format!(
+                            "{}?version-id={version_id}",
+                            public_symlink_target(container, object)
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    resp
+}
+
 struct ListingItem {
     name: String,
     content_type: String,
@@ -2072,9 +2164,19 @@ impl Middleware for VersionedWrites {
             Ok(p) => p,
             Err(_) => return resp,
         };
+        let version = parts[0].clone().unwrap_or_default();
+        let account = parts[1].clone().unwrap_or_default();
         let container = parts[2].clone().unwrap_or_default();
         let object = parts[3].clone().unwrap_or_default();
-        if container.is_empty() || !object.is_empty() {
+        if !object.is_empty() {
+            if self.allow_object_versioning {
+                return rewrite_hidden_version_client_headers(
+                    req, resp, &version, &account, &container, &object,
+                );
+            }
+            return resp;
+        }
+        if container.is_empty() {
             return resp;
         }
         if matches!(req.method.as_str(), "PUT" | "POST" | "GET" | "HEAD") {
@@ -2486,6 +2588,91 @@ mod tests {
     }
 
     #[test]
+    fn test_finish_rewrites_hidden_content_location_to_version_id_query() {
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let version: Timestamp = "1788249092.75587".parse().unwrap();
+        let hidden = modern_versions_container("c");
+        let archive = modern_versions_object_name("o", version).unwrap();
+        let mut resp = Response::new(200);
+        resp.headers.set(
+            "Content-Location",
+            format!(
+                "/v1/AUTH_test/{}/{}",
+                quote_path(&hidden),
+                quote_path(&archive)
+            ),
+        );
+        let out = vw.finish(&req("HEAD", "/v1/AUTH_test/c/o"), resp);
+        let version_id = version.internal();
+        let expected = format!("/v1/AUTH_test/c/o?version-id={version_id}");
+        assert_eq!(out.headers.get("Content-Location"), Some(expected.as_str()));
+        assert_eq!(
+            out.headers.get("X-Object-Version-Id"),
+            Some(version_id.as_str())
+        );
+    }
+
+    #[test]
+    fn test_finish_rewrites_hidden_symlink_target_to_version_id_query() {
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let version: Timestamp = "1788249092.75587".parse().unwrap();
+        let hidden = modern_versions_container("c");
+        let archive = modern_versions_object_name("o", version).unwrap();
+        let mut resp = Response::new(200);
+        resp.headers.set(
+            "X-Symlink-Target",
+            format!("{}/{}", quote_path(&hidden), quote_path(&archive)),
+        );
+        let mut request = req("GET", "/v1/AUTH_test/c/o");
+        request.query_string = "symlink=get".to_string();
+        let out = vw.finish(&request, resp);
+        let version_id = version.internal();
+        let expected = format!("c/o?version-id={version_id}");
+        assert_eq!(out.headers.get("X-Symlink-Target"), Some(expected.as_str()));
+        assert_eq!(
+            out.headers.get("X-Object-Version-Id"),
+            Some(version_id.as_str())
+        );
+    }
+
+    #[test]
+    fn test_finish_leaves_foreign_content_location_alone() {
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let mut resp = Response::new(200);
+        resp.headers
+            .set("Content-Location", "/v1/AUTH_test/other/obj");
+        let out = vw.finish(&req("GET", "/v1/AUTH_test/c/o"), resp);
+        assert_eq!(
+            out.headers.get("Content-Location"),
+            Some("/v1/AUTH_test/other/obj")
+        );
+        assert!(out.headers.get("X-Object-Version-Id").is_none());
+    }
+
+    #[test]
+    fn test_finish_does_not_rewrite_version_id_request_content_location() {
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let version: Timestamp = "1788249092.75587".parse().unwrap();
+        let hidden = modern_versions_container("c");
+        let archive = modern_versions_object_name("o", version).unwrap();
+        let mut resp = Response::new(200);
+        let hidden_loc = format!(
+            "/v1/AUTH_test/{}/{}",
+            quote_path(&hidden),
+            quote_path(&archive)
+        );
+        resp.headers.set("Content-Location", &hidden_loc);
+        let mut request = req("GET", "/v1/AUTH_test/c/o");
+        request.query_string = format!("version-id={}", version.internal());
+        let out = vw.finish(&request, resp);
+        assert_eq!(
+            out.headers.get("Content-Location"),
+            Some(hidden_loc.as_str())
+        );
+        assert!(out.headers.get("X-Object-Version-Id").is_none());
+    }
+
+    #[test]
     fn test_prepare_rewrites_versions_location_to_sysmeta() {
         let vw = VersionedWrites::new();
         let mut r = req("POST", "/v1/AUTH_test/c");
@@ -2566,36 +2753,36 @@ mod tests {
     fn test_modern_object_versioning_reenable_does_not_double_quote_hidden_container() {
         let call_count = Arc::new(AtomicU64::new(0));
         let call_count2 = Arc::clone(&call_count);
-        let app: NextFn = Arc::new(move |r: Request| {
-            match call_count2.fetch_add(1, Ordering::SeqCst) {
-                0 => {
-                    assert_eq!(r.method, "HEAD");
-                    let mut resp = Response::new(204);
-                    resp.headers
-                        .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
-                    resp
-                }
-                1 => {
-                    assert_eq!(r.method, "PUT");
-                    assert_eq!(r.path, "/v1/AUTH_test/\0versions\0c");
-                    Response::new(201)
-                }
-                2 => {
-                    assert_eq!(r.method, "POST");
-                    assert_eq!(
-                        r.headers.get(SYSMETA_OBJECT_VERSIONS_CONTAINER),
-                        Some("%00versions%00c")
-                    );
-                    let mut resp = Response::new(204);
-                    resp.headers
-                        .set(SYSMETA_OBJECT_VERSIONS_ENABLED, "True");
-                    resp.headers
-                        .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
-                    resp
-                }
-                n => panic!("unexpected re-enable subrequest {n}"),
-            }
-        });
+        let app: NextFn =
+            Arc::new(
+                move |r: Request| match call_count2.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        assert_eq!(r.method, "HEAD");
+                        let mut resp = Response::new(204);
+                        resp.headers
+                            .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
+                        resp
+                    }
+                    1 => {
+                        assert_eq!(r.method, "PUT");
+                        assert_eq!(r.path, "/v1/AUTH_test/\0versions\0c");
+                        Response::new(201)
+                    }
+                    2 => {
+                        assert_eq!(r.method, "POST");
+                        assert_eq!(
+                            r.headers.get(SYSMETA_OBJECT_VERSIONS_CONTAINER),
+                            Some("%00versions%00c")
+                        );
+                        let mut resp = Response::new(204);
+                        resp.headers.set(SYSMETA_OBJECT_VERSIONS_ENABLED, "True");
+                        resp.headers
+                            .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
+                        resp
+                    }
+                    n => panic!("unexpected re-enable subrequest {n}"),
+                },
+            );
         let vw = VersionedWrites::new().with_object_versioning(true);
         let mut request = req("POST", "/v1/AUTH_test/c");
         request.headers.set(CLIENT_VERSIONS_ENABLED, "true");
@@ -2605,8 +2792,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_modern_object_versioning_async_reenable_does_not_double_quote_hidden_container()
-    {
+    async fn test_modern_object_versioning_async_reenable_does_not_double_quote_hidden_container() {
         let call_count = Arc::new(AtomicU64::new(0));
         let call_count2 = Arc::clone(&call_count);
         let next: AsyncNextFn = Arc::new(move |r: Request| {
@@ -2632,8 +2818,7 @@ mod tests {
                             Some("%00versions%00c")
                         );
                         let mut resp = Response::new(204);
-                        resp.headers
-                            .set(SYSMETA_OBJECT_VERSIONS_ENABLED, "True");
+                        resp.headers.set(SYSMETA_OBJECT_VERSIONS_ENABLED, "True");
                         resp.headers
                             .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
                         resp
