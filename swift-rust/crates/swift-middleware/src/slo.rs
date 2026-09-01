@@ -99,7 +99,6 @@ const ASYNC_DELETE_TYPE: &str = "application/async-deleted";
 /// md5 of empty string — etag on zero-byte async-delete task records.
 const MD5_OF_EMPTY_STRING: &str = "d41d8cd98f00b204e9800998ecf8427e";
 
-
 fn version_id_query(req: &Request) -> Option<String> {
     let value = req.param("version-id")?;
     if value.is_empty() {
@@ -2185,7 +2184,7 @@ impl Slo {
                 let mut sub = req.clone_head();
                 sub.method = "GET".to_string();
                 sub.path = path;
-                sub.query_string = "multipart-manifest=get".to_string();
+                sub.query_string = manifest_get_query(&req);
                 sub.headers.remove("Content-Length");
                 ignore_range(&mut sub.headers, SLO_HEADER);
                 let mut sresp = next(sub);
@@ -2394,7 +2393,7 @@ impl Slo {
 
         let mut get = req.clone_head();
         get.method = "GET".to_string();
-        get.query_string = "multipart-manifest=get".to_string();
+        get.query_string = manifest_get_query(&req);
         get.headers.remove("Content-Length");
         ignore_range(&mut get.headers, SLO_HEADER);
         let mut mresp = next(get).await;
@@ -2573,7 +2572,7 @@ impl Slo {
         // Load SLO segments (top-level only; nested expansion is rejected).
         let mut get = req.clone_head();
         get.method = "GET".to_string();
-        get.query_string = "multipart-manifest=get".to_string();
+        get.query_string = manifest_get_query(&req);
         get.headers.remove("Content-Length");
         ignore_range(&mut get.headers, SLO_HEADER);
         let mut mresp = next(get);
@@ -4029,18 +4028,30 @@ mod tests {
         let mut manifest_head = Response::with_body(200, manifest_json.clone());
         manifest_head.headers.set("X-Static-Large-Object", "True");
         manifest_head.headers.set("Content-Type", "text/plain");
-        manifest_head.headers.set("Last-Modified", "Tue, 01 Sep 2026 00:00:00 GMT");
+        manifest_head
+            .headers
+            .set("Last-Modified", "Tue, 01 Sep 2026 00:00:00 GMT");
         manifest_head.headers.set("Etag", &json_etag);
         let mut manifest_get = Response::with_body(200, manifest_json);
         manifest_get.headers.set("X-Static-Large-Object", "True");
         manifest_get.headers.set("Content-Type", "text/plain");
-        manifest_get.headers.set("Last-Modified", "Tue, 01 Sep 2026 00:00:00 GMT");
+        manifest_get
+            .headers
+            .set("Last-Modified", "Tue, 01 Sep 2026 00:00:00 GMT");
         manifest_get.headers.set("Etag", &json_etag);
         let be = backend(vec![
             ("HEAD", "/v1/a/c/manifest", manifest_head),
             ("GET", "/v1/a/c/manifest", manifest_get),
-            ("GET", "/v1/a/c/s1", Response::with_body(200, b"one".to_vec())),
-            ("GET", "/v1/a/c/s2", Response::with_body(200, b"two".to_vec())),
+            (
+                "GET",
+                "/v1/a/c/s1",
+                Response::with_body(200, b"one".to_vec()),
+            ),
+            (
+                "GET",
+                "/v1/a/c/s2",
+                Response::with_body(200, b"two".to_vec()),
+            ),
         ]);
         let mut req = slo_get("/v1/a/c/manifest", None);
         req.method = "HEAD".into();
@@ -4510,6 +4521,182 @@ mod tests {
         assert!(paths.iter().any(|p| p == "/v1/a/c/manifest"), "{paths:?}");
         // manifest last
         assert_eq!(paths.last().map(String::as_str), Some("/v1/a/c/manifest"));
+    }
+
+    #[test]
+    fn test_multipart_delete_keeps_version_id_on_manifest_only() {
+        // Official TestSloWithVersioning::test_slo_manifest_version:
+        // DELETE ?multipart-manifest=delete&version-id=v1 must load and
+        // remove that historical manifest, not DELETE the current object
+        // (which would write a delete-marker and grow the version count).
+        use std::sync::{Arc as SArc, Mutex};
+        let gets: SArc<Mutex<Vec<String>>> = SArc::new(Mutex::new(Vec::new()));
+        let deleted: SArc<Mutex<Vec<(String, String)>>> = SArc::new(Mutex::new(Vec::new()));
+        let g2 = gets.clone();
+        let d2 = deleted.clone();
+        let v1_json = serde_json::to_vec(&serde_json::json!([
+            {"name": "/c/old", "bytes": 3, "hash": "h-old"},
+        ]))
+        .unwrap();
+        let current_json = serde_json::to_vec(&serde_json::json!([
+            {"name": "/c/new", "bytes": 3, "hash": "h-new"},
+        ]))
+        .unwrap();
+        let be: NextFn = Arc::new(move |req: Request| {
+            if req.method == "GET" && req.path == "/v1/a/c/manifest" {
+                g2.lock().unwrap().push(req.query_string.clone());
+                let body = if req.param("version-id").as_deref() == Some("v1") {
+                    v1_json.clone()
+                } else {
+                    current_json.clone()
+                };
+                let mut r = Response::with_body(200, body);
+                r.headers.set("X-Static-Large-Object", "True");
+                return r;
+            }
+            if req.method == "DELETE" {
+                d2.lock()
+                    .unwrap()
+                    .push((req.path.clone(), req.query_string.clone()));
+                return Response::new(204);
+            }
+            Response::new(404)
+        });
+        let req = Request {
+            method: "DELETE".into(),
+            path: "/v1/a/c/manifest".into(),
+            query_string: "multipart-manifest=delete&version-id=v1".into(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let mut resp = Slo::new().handle(req, &be);
+        assert_eq!(resp.status, 200);
+        let body = body_of(&mut resp);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["Number Deleted"], 2, "{v}");
+        let gets = gets.lock().unwrap().clone();
+        assert!(
+            gets.iter()
+                .any(|q| q.contains("multipart-manifest=get") && q.contains("version-id=v1")),
+            "manifest GET must keep version-id: {gets:?}"
+        );
+        let paths = deleted.lock().unwrap().clone();
+        assert!(
+            paths
+                .iter()
+                .any(|(p, q)| p.ends_with("/c/old") && q.is_empty()),
+            "historical segment must be deleted without version-id: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|(p, _)| p.ends_with("/c/new")),
+            "must not delete current SLO segments: {paths:?}"
+        );
+        let manifest_deletes: Vec<_> = paths
+            .iter()
+            .filter(|(p, _)| p == "/v1/a/c/manifest")
+            .cloned()
+            .collect();
+        assert_eq!(manifest_deletes.len(), 1, "{paths:?}");
+        assert_eq!(
+            manifest_deletes[0].1, "version-id=v1",
+            "manifest DELETE must be version-aware, not a current delete: {paths:?}"
+        );
+        assert!(
+            !manifest_deletes[0].1.contains("multipart-manifest=delete"),
+            "subrequest must not re-enter SLO delete: {paths:?}"
+        );
+        assert_eq!(
+            paths.last().map(|(p, _)| p.as_str()),
+            Some("/v1/a/c/manifest")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multipart_delete_async_keeps_version_id_on_manifest_only() {
+        use std::sync::{Arc as SArc, Mutex};
+        let gets: SArc<Mutex<Vec<String>>> = SArc::new(Mutex::new(Vec::new()));
+        let deleted: SArc<Mutex<Vec<(String, String)>>> = SArc::new(Mutex::new(Vec::new()));
+        let g2 = gets.clone();
+        let d2 = deleted.clone();
+        let v1_json = serde_json::to_vec(&serde_json::json!([
+            {"name": "/c/old", "bytes": 3, "hash": "h-old"},
+        ]))
+        .unwrap();
+        let current_json = serde_json::to_vec(&serde_json::json!([
+            {"name": "/c/new", "bytes": 3, "hash": "h-new"},
+        ]))
+        .unwrap();
+        let next: crate::AsyncNextFn = Arc::new(move |req: Request| {
+            let g2 = g2.clone();
+            let d2 = d2.clone();
+            let v1_json = v1_json.clone();
+            let current_json = current_json.clone();
+            Box::pin(async move {
+                if req.method == "GET" && req.path == "/v1/a/c/manifest" {
+                    g2.lock().unwrap().push(req.query_string.clone());
+                    let body = if req.param("version-id").as_deref() == Some("v1") {
+                        v1_json
+                    } else {
+                        current_json
+                    };
+                    let mut r = Response::with_body(200, body);
+                    r.headers.set("X-Static-Large-Object", "True");
+                    return r;
+                }
+                if req.method == "DELETE" {
+                    d2.lock()
+                        .unwrap()
+                        .push((req.path.clone(), req.query_string.clone()));
+                    return Response::new(204);
+                }
+                Response::new(404)
+            })
+        });
+        let req = Request {
+            method: "DELETE".into(),
+            path: "/v1/a/c/manifest".into(),
+            query_string: "multipart-manifest=delete&version-id=v1".into(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let mut resp = Slo::new().handle_request_async(req, next).await;
+        assert_eq!(resp.status, 200);
+        let body = match std::mem::replace(&mut resp.body, Body::empty())
+            .collect_async()
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => panic!("body: {e}"),
+        };
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["Number Deleted"], 2, "{v}");
+        let gets = gets.lock().unwrap().clone();
+        assert!(
+            gets.iter()
+                .any(|q| q.contains("multipart-manifest=get") && q.contains("version-id=v1")),
+            "Hyper manifest GET must keep version-id: {gets:?}"
+        );
+        let paths = deleted.lock().unwrap().clone();
+        assert!(
+            paths
+                .iter()
+                .any(|(p, q)| p.ends_with("/c/old") && q.is_empty()),
+            "historical segment must be deleted without version-id: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|(p, _)| p.ends_with("/c/new")),
+            "must not delete current SLO segments: {paths:?}"
+        );
+        let manifest_deletes: Vec<_> = paths
+            .iter()
+            .filter(|(p, _)| p == "/v1/a/c/manifest")
+            .cloned()
+            .collect();
+        assert_eq!(manifest_deletes.len(), 1, "{paths:?}");
+        assert_eq!(
+            manifest_deletes[0].1, "version-id=v1",
+            "Hyper manifest DELETE must keep version-id: {paths:?}"
+        );
     }
 
     #[test]
