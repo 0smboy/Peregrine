@@ -930,6 +930,7 @@ fn parse_part_number(req: &Request) -> Result<Option<usize>, Response> {
 
 fn part_unsatisfiable(
     orig: &Request,
+    inner: &Response,
     etag: &str,
     json_etag: Option<&str>,
     total: i64,
@@ -949,10 +950,22 @@ fn part_unsatisfiable(
         r.headers.set(MANIFEST_ETAG_HEADER, j);
     }
     r.headers.set("X-Parts-Count", nseg.to_string());
+    // Python `_return_slo_response` builds 416 on top of the inner SLO
+    // headers. Functional `File.info()` requires Content-Type and
+    // Last-Modified even on HEAD 416.
+    let mut from_inner = inner.headers.clone();
+    strip_swift_bytes_content_type(&mut from_inner);
+    if let Some(ct) = from_inner.get("Content-Type") {
+        r.headers.set("Content-Type", ct);
+    } else if orig.method != "HEAD" {
+        r.headers.set("Content-Type", "text/plain; charset=utf-8");
+    }
+    if let Some(lm) = inner.headers.get("Last-Modified") {
+        r.headers.set("Last-Modified", lm);
+    }
     if orig.method == "HEAD" {
         r.headers.set("Content-Length", "0");
     } else {
-        r.headers.set("Content-Type", "text/plain; charset=utf-8");
         r.headers.set("Content-Length", msg.len());
     }
     r
@@ -1408,6 +1421,7 @@ impl Slo {
             if part_num.is_some() {
                 return part_unsatisfiable(
                     &orig,
+                    &resp,
                     &etag,
                     json_etag.as_deref(),
                     total_len.max(0),
@@ -1693,6 +1707,7 @@ impl Slo {
             if part_num.is_some() {
                 return part_unsatisfiable(
                     &orig,
+                    &resp,
                     &etag,
                     json_etag.as_deref(),
                     total_len.max(0),
@@ -3964,6 +3979,43 @@ mod tests {
             body.windows(3).any(|w| w == b"two"),
             "empty/missing second range: {body:?}"
         );
+    }
+
+    #[test]
+    fn test_slo_head_unsatisfiable_part_keeps_manifest_type_headers() {
+        // Python File.info() on HEAD ?part-number= out of range requires
+        // Content-Type and Last-Modified from the inner SLO object.
+        let manifest_json = two_segment_manifest_json();
+        let json_etag = manifest_etag(&manifest_json);
+        let mut manifest_head = Response::with_body(200, manifest_json.clone());
+        manifest_head.headers.set("X-Static-Large-Object", "True");
+        manifest_head.headers.set("Content-Type", "text/plain");
+        manifest_head.headers.set("Last-Modified", "Tue, 01 Sep 2026 00:00:00 GMT");
+        manifest_head.headers.set("Etag", &json_etag);
+        let mut manifest_get = Response::with_body(200, manifest_json);
+        manifest_get.headers.set("X-Static-Large-Object", "True");
+        manifest_get.headers.set("Content-Type", "text/plain");
+        manifest_get.headers.set("Last-Modified", "Tue, 01 Sep 2026 00:00:00 GMT");
+        manifest_get.headers.set("Etag", &json_etag);
+        let be = backend(vec![
+            ("HEAD", "/v1/a/c/manifest", manifest_head),
+            ("GET", "/v1/a/c/manifest", manifest_get),
+            ("GET", "/v1/a/c/s1", Response::with_body(200, b"one".to_vec())),
+            ("GET", "/v1/a/c/s2", Response::with_body(200, b"two".to_vec())),
+        ]);
+        let mut req = slo_get("/v1/a/c/manifest", None);
+        req.method = "HEAD".into();
+        req.query_string = "part-number=3".into();
+        let resp = Slo::new().handle(req, &be);
+        assert_eq!(resp.status, 416);
+        assert_eq!(resp.headers.get("X-Parts-Count"), Some("2"));
+        assert_eq!(resp.headers.get("Content-Range"), Some("bytes */6"));
+        assert_eq!(resp.headers.get("Content-Type"), Some("text/plain"));
+        assert_eq!(
+            resp.headers.get("Last-Modified"),
+            Some("Tue, 01 Sep 2026 00:00:00 GMT")
+        );
+        assert_eq!(resp.headers.get("Content-Length"), Some("0"));
     }
 
     #[test]
