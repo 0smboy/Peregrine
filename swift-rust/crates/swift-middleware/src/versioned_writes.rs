@@ -168,6 +168,68 @@ fn split_modern_versions_object_name(name: &str) -> Option<(String, Timestamp)> 
     Some((object.to_string(), version))
 }
 
+/// Python `split_reserved_name(name)[0]`. Versions-container delimiter
+/// subdirs are `\0del-` (no second reserved char). Requiring `split_once('\0')`
+/// dropped delete-marker prefixes from `?versions&delimiter=`.
+fn split_reserved_name_first(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix('\0')?;
+    rest.split('\0').next().filter(|part| !part.is_empty())
+}
+
+/// Leftover `hash` params after the etag (Python `parse_header`).
+fn listing_hash_params(hash: &str) -> String {
+    hash.split(';')
+        .skip(1)
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Python `ContainerContext` listing translation for a versions-symlink:
+/// `bytes` from `symlink_bytes`, `hash` from `symlink_etag` plus leftover
+/// params (`slo_etag`) so SLO listing rewrite can promote `slo_etag`.
+fn apply_version_symlink_listing(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    version: &str,
+    account: &str,
+    container: &str,
+    version_id: Timestamp,
+    wants_versions: bool,
+) {
+    if let Some(bytes) = map.remove("symlink_bytes") {
+        map.insert("bytes".to_string(), bytes);
+    }
+    let leftover = map
+        .get("hash")
+        .and_then(|value| value.as_str())
+        .map(listing_hash_params)
+        .unwrap_or_default();
+    if let Some(etag) = map.remove("symlink_etag") {
+        let etag = match etag {
+            serde_json::Value::String(value) => value,
+            other => other.to_string(),
+        };
+        let hash = if leftover.is_empty() {
+            etag
+        } else {
+            format!("{etag}; {leftover}")
+        };
+        map.insert("hash".to_string(), serde_json::Value::String(hash));
+    }
+    map.insert("version_symlink".to_string(), serde_json::Value::Bool(true));
+    if !wants_versions {
+        map.insert(
+            "symlink_path".to_string(),
+            serde_json::Value::String(format!(
+                "/{version}/{account}/{container}/{}?version-id={}",
+                quote_path(map.get("name").and_then(|v| v.as_str()).unwrap_or("")),
+                version_id.internal()
+            )),
+        );
+    }
+}
+
 fn query_param(query: &str, name: &str) -> Option<String> {
     parse_query(query)
         .into_iter()
@@ -2194,9 +2256,46 @@ impl VersionedWrites {
         self.finish(&req, primary)
     }
 
+    async fn add_hidden_container_bytes(
+        headers: swift_http::HeaderKeyDict,
+        primary: &mut Response,
+        version: &str,
+        account: &str,
+        hidden: &str,
+        next: AsyncNextFn,
+    ) {
+        let hidden_path = format!("/{version}/{account}/{hidden}");
+        let mut hidden_head =
+            Self::modern_internal_request("HEAD", hidden_path, "", &headers);
+        hidden_head
+            .headers
+            .set("X-Backend-Allow-Reserved-Names", "true");
+        let hidden_resp = next(hidden_head).await;
+        if !(200..300).contains(&hidden_resp.status) {
+            return;
+        }
+        let ver_bytes = hidden_resp
+            .headers
+            .get("X-Container-Bytes-Used")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let primary_bytes = primary
+            .headers
+            .get("X-Container-Bytes-Used")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        primary.headers.set(
+            "X-Container-Bytes-Used",
+            primary_bytes.saturating_add(ver_bytes).to_string(),
+        );
+    }
+
     async fn rewrite_modern_container_response(&self, req: Request, next: AsyncNextFn) -> Response {
         let mut primary = next(req.clone_head()).await;
-        if req.method != "GET" || !(200..300).contains(&primary.status) {
+        if !(200..300).contains(&primary.status) {
+            return self.finish(&req, primary);
+        }
+        if !matches!(req.method.as_str(), "GET" | "HEAD") {
             return self.finish(&req, primary);
         }
         let parts = match split_path(&req.path, 3, 3, false) {
@@ -2215,7 +2314,29 @@ impl VersionedWrites {
             .get(SYSMETA_OBJECT_VERSIONS_CONTAINER)
             .filter(|value| !value.is_empty())
             .map(decoded_header_path);
-        let hidden = configured.unwrap_or_else(|| modern_versions_container(&container));
+        let hidden = configured
+            .clone()
+            .unwrap_or_else(|| modern_versions_container(&container));
+        let wants_versions_early = req.param("versions").is_some();
+        // Python ContainerContext HEADs the versions container on every
+        // successful primary GET/HEAD and adds X-Container-Bytes-Used.
+        // `?versions` GET already reads the hidden listing below.
+        if req.method == "HEAD" || (req.method == "GET" && !wants_versions_early) {
+            if let Some(ref hidden_name) = configured {
+                Self::add_hidden_container_bytes(
+                    req.headers.clone(),
+                    &mut primary,
+                    &version,
+                    &account,
+                    hidden_name,
+                    next.clone(),
+                )
+                .await;
+            }
+        }
+        if req.method == "HEAD" {
+            return self.finish(&req, primary);
+        }
         let taken = std::mem::replace(&mut primary.body, Body::empty());
         let primary_body = match taken.collect_async().await {
             Ok(body) => body,
@@ -2243,23 +2364,14 @@ impl VersionedWrites {
             let Some(map) = item.as_object_mut() else {
                 continue;
             };
-            if let Some(bytes) = map.remove("symlink_bytes") {
-                map.insert("bytes".to_string(), bytes);
-            }
-            if let Some(etag) = map.remove("symlink_etag") {
-                map.insert("hash".to_string(), etag);
-            }
-            map.insert("version_symlink".to_string(), serde_json::Value::Bool(true));
-            if !wants_versions {
-                map.insert(
-                    "symlink_path".to_string(),
-                    serde_json::Value::String(format!(
-                        "/{version}/{account}/{container}/{}?version-id={}",
-                        quote_path(map.get("name").and_then(|v| v.as_str()).unwrap_or("")),
-                        version_id.internal()
-                    )),
-                );
-            }
+            apply_version_symlink_listing(
+                map,
+                &version,
+                &account,
+                &container,
+                version_id,
+                wants_versions,
+            );
         }
 
         if !wants_versions {
@@ -2353,11 +2465,14 @@ impl VersionedWrites {
             else {
                 if let Some(raw_subdir) = item.get("subdir").and_then(|value| value.as_str()) {
                     let decoded = decoded_header_path(raw_subdir);
-                    if let Some((object, _)) = decoded
-                        .strip_prefix('\0')
-                        .and_then(|value| value.split_once('\0'))
-                    {
-                        subdirs.push(serde_json::json!({"subdir": object}));
+                    if let Some(object) = split_reserved_name_first(&decoded) {
+                        let already = subdirs.iter().any(|existing| {
+                            existing.get("subdir").and_then(|value| value.as_str())
+                                == Some(object)
+                        });
+                        if !already {
+                            subdirs.push(serde_json::json!({"subdir": object}));
+                        }
                     }
                 }
                 continue;
@@ -2927,12 +3042,12 @@ impl Middleware for VersionedWrites {
                 return self.rewrite_modern_account_response(req, next).await;
             }
 
-            let is_container_get = req.method == "GET"
+            let is_container = matches!(req.method.as_str(), "GET" | "HEAD")
                 && matches!(split_path(&req.path, 3, 3, false), Ok(parts)
                     if parts[2]
                         .as_deref()
                         .is_some_and(|container| !container.is_empty()));
-            if is_container_get {
+            if is_container {
                 return self.rewrite_modern_container_response(req, next).await;
             }
 
@@ -5247,5 +5362,158 @@ mod tests {
                 .any(|(m, p, _)| m == "DELETE" && p == "/v1/AUTH_test/c/obj"),
             "original delete missing: {calls:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_ordinary_listing_keeps_slo_etag_on_version_symlink() {
+        let hidden = modern_versions_container("c");
+        let version: Timestamp = "1787770001.00000".parse().unwrap();
+        let version_name = modern_versions_object_name("my-slo-manifest", version).unwrap();
+        let primary_body = serde_json::to_vec(&vec![serde_json::json!({
+            "name": "my-slo-manifest",
+            "bytes": 0,
+            "hash": "387d1ab7d89eda2162bcf8e502667c86; slo_etag=71e938d37c1d06dc634dd24660255a88",
+            "content_type": "application/octet-stream",
+            "last_modified": "2026-08-27T00:00:01.000000",
+            "symlink_path": format!(
+                "/v1/AUTH_test/{}/{}",
+                quote_path(&hidden),
+                quote_path(&version_name)
+            ),
+            "symlink_etag": "387d1ab7d89eda2162bcf8e502667c86",
+            "symlink_bytes": 1048576
+        })])
+        .unwrap();
+
+        let next: AsyncNextFn = Arc::new(move |req: Request| {
+            let primary_body = primary_body.clone();
+            Box::pin(async move {
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/\0versions\0c" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set("X-Container-Bytes-Used", "1048576");
+                    return resp;
+                }
+                let mut resp = Response::with_body(200, primary_body);
+                resp.headers
+                    .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
+                resp.headers.set("X-Container-Bytes-Used", "0");
+                resp
+            })
+        });
+
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let mut request = req("GET", "/v1/AUTH_test/c");
+        request.query_string = "format=json".to_string();
+        request.body = Body::empty();
+        let mut resp = vw.reassemble_async(request, next).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("X-Container-Bytes-Used"), Some("1048576"));
+        let body = resp.body.materialize(MAX_CONTROL_BODY).unwrap();
+        let listing: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listing.len(), 1, "{listing:?}");
+        assert_eq!(listing[0]["bytes"], 1048576, "{listing:?}");
+        assert_eq!(listing[0]["version_symlink"], true, "{listing:?}");
+        assert_eq!(
+            listing[0]["hash"].as_str(),
+            Some("387d1ab7d89eda2162bcf8e502667c86; slo_etag=71e938d37c1d06dc634dd24660255a88"),
+            "{listing:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_versions_listing_delimiter_includes_delete_marker_prefix() {
+        let hidden_body = serde_json::to_vec(&vec![
+            serde_json::json!({"subdir": "\0del-"}),
+            serde_json::json!({"subdir": "\0test-"}),
+        ])
+        .unwrap();
+        let primary_body = serde_json::to_vec(&vec![
+            serde_json::json!({"subdir": "off-"}),
+            serde_json::json!({"name": "test", "bytes": 5, "hash": "h",
+                "content_type": "text/plain", "last_modified": "2026-08-27T00:00:00.000000"}),
+            serde_json::json!({"subdir": "test-"}),
+        ])
+        .unwrap();
+
+        let call_count = Arc::new(AtomicU64::new(0));
+        let call_count2 = Arc::clone(&call_count);
+        let next: AsyncNextFn = Arc::new(move |req: Request| {
+            let call_count = Arc::clone(&call_count2);
+            let primary_body = primary_body.clone();
+            let hidden_body = hidden_body.clone();
+            Box::pin(async move {
+                match call_count.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        assert_eq!(req.method, "GET");
+                        let mut resp = Response::with_body(200, primary_body);
+                        resp.headers
+                            .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
+                        resp
+                    }
+                    1 => {
+                        assert_eq!(req.method, "GET");
+                        assert!(req.query_string.contains("delimiter=-"), "{}", req.query_string);
+                        Response::with_body(200, hidden_body)
+                    }
+                    n => panic!("unexpected listing subrequest {n} {} {}", req.method, req.path),
+                }
+            })
+        });
+
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let mut request = req("GET", "/v1/AUTH_test/c");
+        request.query_string = "versions=&delimiter=-&format=json".to_string();
+        request.body = Body::empty();
+        let mut resp = vw.reassemble_async(request, next).await;
+        assert_eq!(resp.status, 200);
+        let body = resp.body.materialize(MAX_CONTROL_BODY).unwrap();
+        let listing: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let names: Vec<&str> = listing
+            .iter()
+            .filter_map(|item| item.get("name").or_else(|| item.get("subdir")))
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert_eq!(names, ["del-", "off-", "test", "test-"], "{listing:?}");
+    }
+
+    #[tokio::test]
+    async fn test_container_head_adds_hidden_bytes_used() {
+        let next: AsyncNextFn = Arc::new(|req: Request| {
+            Box::pin(async move {
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers
+                        .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
+                    resp.headers.set("X-Container-Bytes-Used", "13");
+                    resp.headers.set("X-Container-Object-Count", "2");
+                    return resp;
+                }
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/\0versions\0c" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set("X-Container-Bytes-Used", "32");
+                    return resp;
+                }
+                panic!("unexpected {} {}", req.method, req.path);
+            })
+        });
+
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let mut request = req("HEAD", "/v1/AUTH_test/c");
+        request.body = Body::empty();
+        let resp = vw.reassemble_async(request, next).await;
+        assert_eq!(resp.status, 204);
+        assert_eq!(resp.headers.get("X-Container-Bytes-Used"), Some("45"));
+        assert_eq!(resp.headers.get("X-Container-Object-Count"), Some("2"));
+    }
+
+    #[test]
+    fn test_split_reserved_name_first_delimiter_prefix() {
+        assert_eq!(split_reserved_name_first("\0del-"), Some("del-"));
+        assert_eq!(split_reserved_name_first("\0test-"), Some("test-"));
+        assert_eq!(
+            split_reserved_name_first(&format!("\0test\0{}", "0000000001.00000")),
+            Some("test"),
+        );
+        assert_eq!(split_reserved_name_first("del-"), None);
     }
 }
