@@ -4525,6 +4525,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_modern_version_id_head_follows_archived_symlink_without_symlink_get() {
+        // assert_previous_version.initialize() is HEAD ?version-id= (no
+        // symlink=get) and stores content_type from that response.
+        type Call = (String, String, String);
+        let calls: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = Arc::clone(&calls);
+        let next: StreamingAsyncNextFn = Arc::new(move |req: AsyncRequest| {
+            let calls = Arc::clone(&calls2);
+            Box::pin(async move {
+                calls.lock().unwrap().push((
+                    req.method.clone(),
+                    req.path.clone(),
+                    req.query_string.clone(),
+                ));
+                if req.headers.contains_key(AUTHORIZE_ONLY_HEADER) {
+                    return Response::new(204);
+                }
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(SYSMETA_OBJECT_VERSIONS_ENABLED, "True");
+                    resp.headers
+                        .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
+                    return resp;
+                }
+                if req.method == "HEAD" && req.path.starts_with("/v1/AUTH_test/\0versions\0c/") {
+                    let mut resp = Response::new(200);
+                    if query_param(&req.query_string, "symlink").as_deref() == Some("get") {
+                        resp.headers.set("Content-Type", "application/symlink");
+                    } else {
+                        resp.headers.set("Content-Type", "text/jibberish01");
+                    }
+                    return resp;
+                }
+                Response::new(404)
+            })
+        });
+
+        let request = AsyncRequest {
+            method: "HEAD".to_string(),
+            path: "/v1/AUTH_test/c/symlink".to_string(),
+            query_string: "version-id=1787766177.51067".to_string(),
+            headers: HeaderKeyDict::new(),
+            body: IncomingBody::from_bytes(Vec::new(), 1024),
+        };
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let resp = vw.handle_streaming_request(request, next).await;
+        assert_eq!(resp.status, 200, "calls={:?}", calls.lock().unwrap());
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("text/jibberish01"),
+            "HEAD ?version-id= must follow the archived user-symlink"
+        );
+        let calls = calls.lock().unwrap();
+        let archive = calls
+            .iter()
+            .find(|(method, path, _)| {
+                method == "HEAD" && path.starts_with("/v1/AUTH_test/\0versions\0c/")
+            })
+            .expect("version-id archive HEAD");
+        assert!(
+            !archive.2.contains("symlink=get"),
+            "HEAD ?version-id= must not force symlink=get: {}",
+            archive.2
+        );
+    }
+
+    #[tokio::test]
     async fn test_modern_post_follows_its_version_symlink_with_reserved_capability() {
         type Call = (String, String, HeaderKeyDict);
         let calls: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
