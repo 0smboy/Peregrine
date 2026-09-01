@@ -345,6 +345,39 @@ struct VersionCfg {
 
 /// Build an internal subrequest that carries the caller's auth and bypasses
 /// TempAuth re-checks (`make_pre_authed_request` stand-in).
+fn put_has_version_id(query: &str) -> bool {
+    query_param(query, "version-id").is_some_and(|value| !value.is_empty())
+}
+
+/// Python `_get_source_object`: GET `?symlink=get` with X-Newest only.
+/// Do not clone the incoming PUT's X-Symlink-Target / body headers onto the
+/// GET — that makes symlink middleware follow the *new* target (or the
+/// stored target) and archives md5(target) instead of md5('').
+fn legacy_source_get(path: &str, from: &swift_http::HeaderKeyDict) -> Request {
+    let mut get = Request {
+        method: "GET".to_string(),
+        path: path.to_string(),
+        query_string: "symlink=get".to_string(),
+        headers: swift_http::HeaderKeyDict::new(),
+        body: Body::empty(),
+    };
+    for name in [
+        "X-Auth-Token",
+        "X-Backend-Remote-User",
+        "Referer",
+        "X-Trans-Id",
+        "X-Timestamp",
+    ] {
+        if let Some(value) = from.get(name) {
+            get.headers.set(name, value);
+        }
+    }
+    get.headers.set("X-Newest", "True");
+    get.headers.set("X-Backend-Authorize-Override", "true");
+    get.headers.set("X-Backend-Source", "VW");
+    get
+}
+
 fn pre_authed(method: &str, path: &str, from: &Request) -> Request {
     let mut sub = from.clone_head();
     sub.method = method.to_string();
@@ -993,14 +1026,7 @@ impl VersionedWrites {
         source_headers: &swift_http::HeaderKeyDict,
         next: &StreamingAsyncNextFn,
     ) -> Result<(), Response> {
-        let mut get = Self::modern_internal_request(
-            "GET",
-            original_path.to_string(),
-            "symlink=get",
-            source_headers,
-        );
-        get.headers.set("X-Newest", "True");
-        get.headers.set("X-Backend-Source", "VW");
+        let get = legacy_source_get(original_path, source_headers);
         let current = next(empty_async_request(get)).await;
         if current.status == 404 {
             return Ok(());
@@ -1033,6 +1059,10 @@ impl VersionedWrites {
         if let Some(length) = content_length {
             archive_headers.set("Content-Length", length.to_string());
         }
+        // Object ETag must be md5 of the archived bytes. A followed GET
+        // would copy the target ETag; drop it so the object server hashes
+        // the (symlink) body.
+        archive_headers.remove("ETag");
         let copied = next(AsyncRequest {
             method: "PUT".to_string(),
             path: format!("/{version}/{account}/{versions_cont}/{vers_name}"),
@@ -1059,8 +1089,7 @@ impl VersionedWrites {
         next: &StreamingAsyncNextFn,
     ) -> Option<String> {
         let get_path = format!("/{version}/{account}/{versions_cont}/{prev_obj_name}");
-        let mut get = Self::modern_internal_request("GET", get_path.clone(), "", source_headers);
-        get.headers.set("X-Backend-Source", "VW");
+        let get = legacy_source_get(&get_path, source_headers);
         let current = next(empty_async_request(get)).await;
         if current.status == 404 {
             return None;
@@ -2737,7 +2766,7 @@ impl Middleware for VersionedWrites {
                 && parts[3].as_deref().is_some_and(|object| !object.is_empty()));
         is_object
             && req.method == "PUT"
-            && req.query_string.is_empty()
+            && !put_has_version_id(&req.query_string)
             && !req.headers.contains_key("X-Copy-From")
             && (self.allow_object_versioning || self.allow_versioned_writes != Some(false))
     }
@@ -2755,7 +2784,7 @@ impl Middleware for VersionedWrites {
         }
         let ordinary_put = req.method == "PUT"
             && !req.headers.contains_key("X-Copy-From")
-            && req.query_string.is_empty();
+            && !put_has_version_id(&req.query_string);
         // Legacy X-Versions-Location PUTs must stream: G3 Hyper never
         // calls sync handle_put, so copy-current would otherwise be skipped.
         if ordinary_put
@@ -2782,7 +2811,7 @@ impl Middleware for VersionedWrites {
         next: StreamingAsyncNextFn,
     ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
         Box::pin(async move {
-            if req.method == "PUT" && req.query_string.is_empty() {
+            if req.method == "PUT" && !put_has_version_id(&req.query_string) {
                 self.handle_modern_put_streaming(req, next).await
             } else {
                 self.handle_modern_object_streaming(req, next).await
@@ -2799,7 +2828,7 @@ impl Middleware for VersionedWrites {
             let is_object = matches!(split_path(&req.path, 4, 4, true), Ok(parts)
                 if parts[2].as_deref().is_some_and(|container| !container.is_empty())
                     && parts[3].as_deref().is_some_and(|object| !object.is_empty()));
-            if is_object && req.method == "PUT" && req.query_string.is_empty() {
+            if is_object && req.method == "PUT" && !put_has_version_id(&req.query_string) {
                 let streaming_next = streaming_next_from_async(next);
                 return self
                     .handle_modern_put_streaming(buffered_to_async(req), streaming_next)
@@ -3135,6 +3164,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_streaming_legacy_overwrite_symlink_archives_empty_body() {
+        // GET ?symlink=get must archive the 0-byte link, not the target
+        // body (md5('aaaaa')).
+        type Call = (String, String, String, Vec<u8>, Option<String>);
+        let calls: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = Arc::clone(&calls);
+        let next: StreamingAsyncNextFn = Arc::new(move |mut req: AsyncRequest| {
+            let calls = Arc::clone(&calls2);
+            Box::pin(async move {
+                let body = req.body.materialize(u64::MAX).await.unwrap();
+                calls.lock().unwrap().push((
+                    req.method.clone(),
+                    req.path.clone(),
+                    req.query_string.clone(),
+                    body,
+                    req.headers.get("X-Symlink-Target").map(str::to_string),
+                ));
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(SYSMETA_VERSIONS_LOC, "versions");
+                    resp.headers.set(SYSMETA_VERSIONS_MODE, "stack");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_test/c/obj" {
+                    if req.query_string.contains("symlink=get") {
+                        let mut resp = Response::with_body(200, Vec::new());
+                        resp.headers.set("X-Timestamp", "1751500000.00000");
+                        resp.headers.set("Content-Type", "application/symlink");
+                        resp.headers.set("Content-Length", "0");
+                        resp.headers.set("ETag", "d41d8cd98f00b204e9800998ecf8427e");
+                        resp.headers.set("X-Symlink-Target", "c/tgt_a");
+                        return resp;
+                    }
+                    let mut resp = Response::with_body(200, b"aaaaa".to_vec());
+                    resp.headers.set("ETag", "594f803b380a41396ed63dca39503542");
+                    resp.headers.set("Content-Length", "5");
+                    return resp;
+                }
+                Response::new(201)
+            })
+        });
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Length", "0");
+        headers.set("X-Symlink-Target", "c/tgt_b");
+        let req = AsyncRequest {
+            method: "PUT".to_string(),
+            path: "/v1/AUTH_test/c/obj".to_string(),
+            query_string: String::new(),
+            headers,
+            body: IncomingBody::from_bytes(Vec::new(), 1024),
+        };
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let resp = vw.handle_streaming_request(req, next).await;
+        assert_eq!(resp.status, 201);
+        let calls = calls.lock().unwrap();
+        let get = calls
+            .iter()
+            .find(|(m, p, _, _, _)| m == "GET" && p == "/v1/AUTH_test/c/obj")
+            .expect("GET current");
+        assert!(
+            get.2.contains("symlink=get"),
+            "copy-current must GET ?symlink=get: {calls:?}"
+        );
+        assert!(
+            get.4.is_none(),
+            "GET must not carry the new PUT X-Symlink-Target: {calls:?}"
+        );
+        let archive = calls
+            .iter()
+            .find(|(m, p, _, _, _)| m == "PUT" && p.contains("/versions/"))
+            .expect("archive PUT");
+        assert_eq!(
+            archive.3, b"",
+            "archived symlink body must be empty: {calls:?}"
+        );
+        assert_eq!(
+            archive.4.as_deref(),
+            Some("c/tgt_a"),
+            "archive must keep the old symlink target: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_streaming_legacy_overwrite_archives_current() {
         let (calls, next) = streaming_legacy_backend(true);
         let vw = VersionedWrites::new().with_object_versioning(true);
@@ -3211,6 +3323,13 @@ mod tests {
     fn test_copy_dest_put_intercepts_on_dispatch_remaining() {
         let vw = VersionedWrites::new().with_object_versioning(true);
         assert!(vw.intercepts_request(&copy_dest_put()));
+        let mut leftover = copy_dest_put();
+        leftover.query_string = "symlink=get".to_string();
+        assert!(
+            vw.intercepts_request(&leftover),
+            "COPY dest PUT leftover ?symlink=get must still copy-current"
+        );
+        assert!(vw.streams_request(&leftover));
         let mut x_copy = copy_dest_put();
         x_copy.headers.set("X-Copy-From", "/src/srcobj");
         assert!(
@@ -3219,6 +3338,25 @@ mod tests {
         );
         let copy_method = req("COPY", "/v1/AUTH_test/src/srcobj");
         assert!(!vw.intercepts_request(&copy_method));
+    }
+
+    #[tokio::test]
+    async fn test_copy_dest_put_with_symlink_query_archives_current() {
+        let (calls, next) = intercept_legacy_backend(true);
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let mut dest = copy_dest_put();
+        dest.query_string = "symlink=get".to_string();
+        dest.headers.set("X-Symlink-Target", "c/target-object");
+        dest.body = Body::Buffered(Vec::new());
+        let resp = vw.handle_request_async(dest, next).await;
+        assert_eq!(resp.status, 201);
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p, _)| m == "PUT" && p.starts_with("/v1/AUTH_test/versions/003obj/")),
+            "COPY dest PUT ?symlink=get must archive current: {calls:?}"
+        );
     }
 
     #[tokio::test]
