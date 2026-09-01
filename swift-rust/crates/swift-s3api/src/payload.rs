@@ -196,6 +196,25 @@ fn missing_md5_or_checksum_response() -> Response {
     s3_error_response("InvalidRequest", Some(MISSING_MD5_OR_CHECKSUM_MSG), &[])
 }
 
+/// Python `UploadsController.POST` pops Content-MD5 / ETag before writing the
+/// empty upload marker. `check_md5` is not called on Initiate.
+fn is_initiate_multipart(req: &Request) -> bool {
+    if req.method != "POST" {
+        return false;
+    }
+    let params = req.params();
+    params.iter().any(|(k, _)| k == "uploads")
+        && !params.iter().any(|(k, _)| k == "uploadId")
+}
+
+fn is_multi_delete_post(req: &Request) -> bool {
+    req.method == "POST" && req.params().iter().any(|(k, _)| k == "delete")
+}
+
+/// Python `MultiObjectDeleteController`:
+/// `min(2 * max_multi_delete_objects * MAX_OBJECT_NAME_LENGTH, 10 MiB)`.
+const MAX_MULTI_DELETE_BODY: u64 = 2 * 1000 * 1024;
+
 /// Python `s3request._validate_sha256` + HashingInput + check_md5 for a
 /// materialized request. `v4_header_auth` is SigV4 *header* (not query).
 pub fn validate_s3_payload(req: &mut Request, v4_header_auth: bool) -> Option<Response> {
@@ -222,9 +241,25 @@ pub fn validate_s3_payload(req: &mut Request, v4_header_auth: bool) -> Option<Re
     if let Some(resp) = require_md5_for_multi_delete(req) {
         return Some(resp);
     }
-    let body = match req.body.materialize(MAX_CONTROL_BODY) {
+    if is_multi_delete_post(req) {
+        let cl = header_ci(req, "content-length")
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| req.body.content_length());
+        if cl.is_some_and(|n| n > MAX_MULTI_DELETE_BODY) {
+            return Some(s3_error_response("MalformedXML", None, &[]));
+        }
+    }
+    let cap = if is_multi_delete_post(req) {
+        MAX_MULTI_DELETE_BODY
+    } else {
+        MAX_CONTROL_BODY
+    };
+    let body = match req.body.materialize(cap) {
         Ok(b) => b.to_vec(),
         Err(_) => {
+            if is_multi_delete_post(req) {
+                return Some(s3_error_response("MalformedXML", None, &[]));
+            }
             return Some(s3_error_response("IncompleteBody", None, &[]));
         }
     };
@@ -244,15 +279,20 @@ pub fn validate_s3_payload(req: &mut Request, v4_header_auth: bool) -> Option<Re
             return Some(resp);
         }
     }
+    // Python `S3Request.check_md5` is invoked by Complete MPU and MultiDelete
+    // only. Initiate Multipart Upload (`POST ?uploads`) accepts a Content-MD5
+    // header (format-checked above) and then drops it.
     if let Some(raw) = content_md5_raw(req) {
-        let got = md5(&body);
-        if let Some(want) = decode_content_md5(raw) {
-            if got.as_slice() != want.as_slice() {
-                let expected_hex = req.method == "PUT";
-                return Some(bad_digest_response(raw, expected_hex));
-            }
-            if req.method == "PUT" {
-                req.headers.set("ETag", hex_encode(&want));
+        if !is_initiate_multipart(req) {
+            let got = md5(&body);
+            if let Some(want) = decode_content_md5(raw) {
+                if got.as_slice() != want.as_slice() {
+                    let expected_hex = req.method == "PUT";
+                    return Some(bad_digest_response(raw, expected_hex));
+                }
+                if req.method == "PUT" {
+                    req.headers.set("ETag", hex_encode(&want));
+                }
             }
         }
     }
@@ -931,6 +971,51 @@ mod tests {
     }
 
     #[test]
+    fn initiate_multipart_content_md5_is_not_checked_against_empty_body() {
+        let mut req = empty_put();
+        req.method = "POST".into();
+        req.path = "/bucket/obj".into();
+        req.query_string = "uploads".into();
+        // Official test_object_multi_upload: base64(16 x 0x61) on Initiate.
+        req.headers.set("Content-MD5", "YWFhYWFhYWFhYWFhYWFhYQ==");
+        req.body = Body::Buffered(Vec::new());
+        assert!(
+            validate_s3_payload(&mut req, false).is_none(),
+            "Initiate MPU must not BadDigest on unrelated Content-MD5"
+        );
+    }
+
+    fn complete_multipart_content_md5_mismatch_is_bad_digest_base64() {
+        let mut req = empty_put();
+        req.method = "POST".into();
+        req.path = "/bucket/obj".into();
+        req.query_string = "uploadId=abc".into();
+        req.headers.set("Content-MD5", "YWFhYWFhYWFhYWFhYWFhYQ==");
+        req.body = Body::Buffered(b"<CompleteMultipartUpload/>".to_vec());
+        let resp = validate_s3_payload(&mut req, false).unwrap();
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>BadDigest</Code>"), "{body}");
+        assert!(
+            body.contains("<ExpectedDigest>YWFhYWFhYWFhYWFhYWFhYQ==</ExpectedDigest>"),
+            "{body}"
+        );
+    }
+
+    fn multi_delete_content_length_over_python_cap_is_malformed_xml() {
+        let mut req = empty_put();
+        req.method = "POST".into();
+        req.path = "/bucket".into();
+        req.query_string = "delete".into();
+        req.headers.set("Content-MD5", &base64_encode(&md5(b"x")));
+        req.headers.set("Content-Length", "3000000");
+        req.body = Body::Buffered(b"x".to_vec());
+        let resp = validate_s3_payload(&mut req, false).unwrap();
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>MalformedXML</Code>"), "{body}");
+    }
+
     fn malformed_content_md5_is_invalid_digest() {
         let mut req = empty_put();
         req.headers.set("content-md5", "invalid");

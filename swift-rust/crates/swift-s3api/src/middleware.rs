@@ -1104,6 +1104,41 @@ fn reject_unsupported_put_conditionals(req: &Request) -> Option<Response> {
     None
 }
 
+/// Python `etree.XMLParser(resolve_entities=False)`: DTD/ENTITY is XMLSyntaxError
+/// → MalformedXML 400. Do not expand entities.
+fn xml_has_unsafe_dtd(body: &[u8]) -> bool {
+    let upper = String::from_utf8_lossy(body).to_ascii_uppercase();
+    upper.contains("<!DOCTYPE") || upper.contains("<!ENTITY")
+}
+
+/// Python `MAX_PUT_BUCKET_BODY_SIZE`.
+const MAX_PUT_BUCKET_BODY_SIZE: u64 = 10240;
+
+/// Python `BucketController.PUT`: non-empty CreateBucketConfiguration body is
+/// parsed. Official XXE fixture (`<!DOCTYPE` + `&xxe;`) is 400 and must not
+/// create the bucket. LocationConstraint matching is not enforced here so a
+/// RegionOne body keeps passing when `S3Api.location` is the default.
+fn validate_create_bucket_xml(req: &mut Request) -> Option<Response> {
+    let body = match req.body.materialize(MAX_CONTROL_BODY) {
+        Ok(b) => b.to_vec(),
+        Err(_) => return Some(s3_error_response("MalformedXML", None, &[])),
+    };
+    if body.len() as u64 > MAX_PUT_BUCKET_BODY_SIZE {
+        return Some(s3_error_response("MalformedXML", None, &[]));
+    }
+    if body.iter().all(|b| b.is_ascii_whitespace()) {
+        return None;
+    }
+    if xml_has_unsafe_dtd(&body) {
+        return Some(s3_error_response("MalformedXML", None, &[]));
+    }
+    let text = String::from_utf8_lossy(&body);
+    if text.contains('<') && !text.contains("CreateBucketConfiguration") {
+        return Some(s3_error_response("MalformedXML", None, &[]));
+    }
+    None
+}
+
 fn validate_delete_headers(req: &Request) -> Option<Response> {
     if let Some(v) = req.headers.get("X-Delete-At") {
         match v.parse::<i64>() {
@@ -3530,6 +3565,40 @@ impl S3Api {
                 return s3_error_response("KeyTooLongError", None, &[]);
             }
         }
+        if req.method == "PUT" {
+            if let Some(resp) = reject_unknown_storage_class(&req) {
+                return resp;
+            }
+            if key.is_some() {
+                if let Some(resp) = reject_unsupported_put_conditionals(&req) {
+                    return resp;
+                }
+            }
+            if key.is_none() && bucket.is_some() {
+                let bucket_sub = params.iter().any(|(k, _)| {
+                    matches!(
+                        k.as_str(),
+                        "acl"
+                            | "cors"
+                            | "lifecycle"
+                            | "logging"
+                            | "notification"
+                            | "object-lock"
+                            | "policy"
+                            | "tagging"
+                            | "versioning"
+                            | "website"
+                            | "encryption"
+                            | "publicAccessBlock"
+                    )
+                });
+                if !bucket_sub {
+                    if let Some(resp) = validate_create_bucket_xml(&mut req) {
+                        return resp;
+                    }
+                }
+            }
+        }
         if let Some(resp) = put_object_missing_content_length(&req, key.as_deref()) {
             return resp;
         }
@@ -3623,6 +3692,23 @@ impl S3Api {
             if let (Some(b), Some(k)) = (bucket.as_deref(), key.as_deref()) {
                 return handle_mpu_init_async(req, &cred, b, k, self, &next).await;
             }
+        }
+        if has_uploads && req.method == "GET" && bucket.is_some() && key.is_none() {
+            return handle_list_multipart_uploads_async(
+                &cred,
+                bucket.as_deref().unwrap(),
+                &params,
+                self,
+                &next,
+            )
+            .await;
+        }
+        if has_uploads && bucket.is_some() && key.is_none() {
+            return s3_error_response(
+                "MethodNotAllowed",
+                Some("ListMultipartUploads requires GET"),
+                &[],
+            );
         }
         if let Some(uid) = upload_id.as_deref() {
             if let (Some(b), Some(k)) = (bucket.as_deref(), key.as_deref()) {
@@ -3849,6 +3935,15 @@ impl S3Api {
                 }
                 _ => {}
             }
+        }
+        if req.method == "DELETE" && bucket.is_some() && key.is_none() {
+            return handle_delete_bucket_async(
+                &cred,
+                bucket.as_deref().unwrap(),
+                self,
+                &next,
+            )
+            .await;
         }
         self.forward_s3_async(req, cred, bucket, key, params, next)
             .await
@@ -7277,6 +7372,9 @@ async fn handle_mpu_init_async(
     if let Err(resp) = apply_request_object_lock_headers(&mut req.headers) {
         return resp;
     }
+    // Python UploadsController.POST: pop Etag / Content-Md5 before empty marker PUT.
+    req.headers.remove("ETag");
+    req.headers.remove("Content-MD5");
 
     let segs = segments_container(bucket);
     let mut put_c = make_swift_req("PUT", &s3_to_swift_path(&cred.account, Some(&segs), None));
@@ -7344,15 +7442,18 @@ async fn handle_mpu_complete_async(
         Ok(b) => b,
         Err(_) => return s3_error_response("IncompleteBody", None, &[]),
     };
+    // Python `_get_upload_info` before XML parse. Official XXE complete uses
+    // Key=key against an upload created as Key=test → 404 NoSuchUpload, not
+    // InvalidPartNumber 416 from `&xxe;` in PartNumber.
+    let upload_info = match get_mpu_upload_info_async(cred, bucket, key, upload_id, next).await {
+        Ok(info) => info,
+        Err(resp) => return resp,
+    };
     let parts = match parse_complete_body(&body) {
         Ok(p) => p,
         Err(code) => return s3_error_response(&code, None, &[]),
     };
     let segs = segments_container(bucket);
-    let upload_info = match get_mpu_upload_info_async(cred, bucket, key, upload_id, next).await {
-        Ok(info) => info,
-        Err(resp) => return resp,
-    };
     let s3_etag = aws_multipart_etag(parts.iter().map(|(_, e)| e.as_str()));
     if let Some(resp) = complete_mpu_already_uploaded(
         upload_info.headers.get(SYS_S3API_ETAG),
@@ -11937,15 +12038,15 @@ fn handle_mpu_complete(
         Ok(b) => b,
         Err(_) => return s3_error_response("IncompleteBody", None, &[]),
     };
+    let upload_info = match get_mpu_upload_info(cred, bucket, key, upload_id, next) {
+        Ok(info) => info,
+        Err(resp) => return resp,
+    };
     let parts = match parse_complete_body(&body) {
         Ok(p) => p,
         Err(code) => return s3_error_response(&code, None, &[]),
     };
     let segs = segments_container(bucket);
-    let upload_info = match get_mpu_upload_info(cred, bucket, key, upload_id, next) {
-        Ok(info) => info,
-        Err(resp) => return resp,
-    };
     let s3_etag = aws_multipart_etag(parts.iter().map(|(_, e)| e.as_str()));
     if let Some(resp) = complete_mpu_already_uploaded(
         upload_info.headers.get(SYS_S3API_ETAG),
@@ -12300,6 +12401,209 @@ fn handle_list_multipart_uploads(
             &owner_for(cred).id,
         ),
     )
+}
+
+async fn handle_list_multipart_uploads_async(
+    cred: &S3Credential,
+    bucket: &str,
+    params: &[(String, String)],
+    api: &S3Api,
+    next: &AsyncNextFn,
+) -> Response {
+    if let Err(resp) = require_bucket_async(cred, bucket, next, &api.container_heads).await {
+        return resp;
+    }
+    let prefix = params
+        .iter()
+        .find(|(k, _)| k == "prefix")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let key_marker = params
+        .iter()
+        .find(|(k, _)| k == "key-marker")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let upload_id_marker = params
+        .iter()
+        .find(|(k, _)| k == "upload-id-marker")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let max_uploads: u32 = params
+        .iter()
+        .find(|(k, _)| k == "max-uploads")
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(1000)
+        .clamp(1, 1000);
+
+    let segs = segments_container(bucket);
+    let mut list = make_swift_req("GET", &s3_to_swift_path(&cred.account, Some(&segs), None));
+    let mut qs = String::from("format=json");
+    if !prefix.is_empty() {
+        qs.push_str(&format!("&prefix={}", encode_query(prefix)));
+    }
+    list.query_string = qs;
+    list.headers.set("Accept", "application/json");
+    stamp_auth(&mut list, cred);
+    let resp = async_call(next, list).await;
+    if resp.status == 404 {
+        return xml_response(
+            200,
+            list_multipart_uploads_xml(
+                bucket,
+                prefix,
+                key_marker,
+                upload_id_marker,
+                max_uploads,
+                false,
+                &[],
+                &owner_for(cred).id,
+            ),
+        );
+    }
+    if !(200..300).contains(&resp.status) {
+        return map_swift_error(resp.status, Some(bucket), None);
+    }
+    let body = match body_bytes(resp.body).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Array(vec![]));
+    let mut uploads = Vec::new();
+    if let Some(arr) = parsed.as_array() {
+        for item in arr {
+            let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some((key, uid)) = parse_upload_marker_name(name) else {
+                continue;
+            };
+            if !prefix.is_empty() && !key.starts_with(prefix) {
+                continue;
+            }
+            if !key_marker.is_empty() {
+                if key.as_str() < key_marker {
+                    continue;
+                }
+                if key.as_str() == key_marker
+                    && !upload_id_marker.is_empty()
+                    && uid.as_str() <= upload_id_marker
+                {
+                    continue;
+                }
+            }
+            let lm = item
+                .get("last_modified")
+                .and_then(|v| v.as_str())
+                .unwrap_or("1970-01-01T00:00:00.000000");
+            uploads.push(ListedUpload {
+                key,
+                upload_id: uid,
+                initiated: swift_ts_to_s3(lm),
+            });
+        }
+    }
+    uploads.sort_by(|a, b| (&a.key, &a.upload_id).cmp(&(&b.key, &b.upload_id)));
+    let truncated = uploads.len() as u32 > max_uploads;
+    uploads.truncate(max_uploads as usize);
+    xml_response(
+        200,
+        list_multipart_uploads_xml(
+            bucket,
+            prefix,
+            key_marker,
+            upload_id_marker,
+            max_uploads,
+            truncated,
+            &uploads,
+            &owner_for(cred).id,
+        ),
+    )
+}
+
+/// Python `BucketController.DELETE` + `_delete_segments_bucket`.
+/// Incomplete MPU lives in `{bucket}+segments`. Official `reset()` lists
+/// uploads then `delete_bucket`; a leftover marker must not 409 an empty
+/// primary, and ListMultipartUploads must see those markers.
+async fn handle_delete_bucket_async(
+    cred: &S3Credential,
+    bucket: &str,
+    _api: &S3Api,
+    next: &AsyncNextFn,
+) -> Response {
+    let mut head = make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+    stamp_auth(&mut head, cred);
+    let head_resp = async_call(next, head).await;
+    if head_resp.status == 404 {
+        return s3_error_response("NoSuchBucket", None, &[("BucketName", bucket)]);
+    }
+    if !(200..300).contains(&head_resp.status) {
+        return map_swift_error(head_resp.status, Some(bucket), None);
+    }
+    let count = head_resp
+        .headers
+        .get("X-Container-Object-Count")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    if count > 0 {
+        return s3_error_response("BucketNotEmpty", None, &[]);
+    }
+    let segs = segments_container(bucket);
+    let mut marker = String::new();
+    loop {
+        let mut list = make_swift_req("GET", &s3_to_swift_path(&cred.account, Some(&segs), None));
+        let mut qs = String::from("format=json");
+        if !marker.is_empty() {
+            qs.push_str(&format!("&marker={}", encode_query(&marker)));
+        }
+        list.query_string = qs;
+        list.headers.set("Accept", "application/json");
+        stamp_auth(&mut list, cred);
+        let listed = async_call(next, list).await;
+        if listed.status == 404 {
+            break;
+        }
+        if !(200..300).contains(&listed.status) {
+            break;
+        }
+        let Ok(body) = body_bytes(listed.body).await else {
+            break;
+        };
+        let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Array(vec![]));
+        let Some(arr) = parsed.as_array() else {
+            break;
+        };
+        if arr.is_empty() {
+            break;
+        }
+        let mut last = None;
+        for item in arr {
+            let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            last = Some(name.to_string());
+            let mut del = make_swift_req(
+                "DELETE",
+                &s3_to_swift_path(&cred.account, Some(&segs), Some(name)),
+            );
+            stamp_auth(&mut del, cred);
+            let _ = async_call(next, del).await;
+        }
+        match last {
+            Some(name) if name != marker => marker = name,
+            _ => break,
+        }
+    }
+    let mut del_c = make_swift_req("DELETE", &s3_to_swift_path(&cred.account, Some(&segs), None));
+    stamp_auth(&mut del_c, cred);
+    let _ = async_call(next, del_c).await;
+    let mut del = make_swift_req("DELETE", &s3_to_swift_path(&cred.account, Some(bucket), None));
+    stamp_auth(&mut del, cred);
+    let resp = async_call(next, del).await;
+    if (200..300).contains(&resp.status) {
+        translate_bucket_success("DELETE", resp, Some(bucket))
+    } else {
+        map_swift_error(resp.status, Some(bucket), None)
+    }
 }
 
 fn handle_mpu_list_parts(
@@ -13681,6 +13985,353 @@ mod tests {
         });
         let abort_resp = block_on_s3(api.handle_s3_async(abort, abort_next));
         assert_eq!(abort_resp.status, 204, "mpu abort");
+    }
+
+    #[test]
+    fn handle_s3_async_initiate_mpu_ignores_unrelated_content_md5() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("POST", "/mybucket/obj1", "uploads");
+        req.headers.set("Content-MD5", "YWFhYWFhYWFhYWFhYWFhYQ==");
+        let req = sign_request(req, "testing");
+        let next = async_ok(|r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            if r.method == "PUT" {
+                assert!(
+                    r.headers.get("Content-MD5").is_none() && r.headers.get("content-md5").is_none(),
+                    "initiate must not forward Content-MD5 onto the marker PUT"
+                );
+                return Response::new(201);
+            }
+            Response::new(404)
+        });
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 200, "initiate with unrelated Content-MD5");
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("InitiateMultipartUploadResult"), "{body}");
+        assert!(!body.contains("BadDigest"), "{body}");
+    }
+
+    #[test]
+    fn handle_s3_async_complete_mpu_bad_content_md5_is_bad_digest() {
+        let api = S3Api::new(cred_map());
+        let xml = b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>p1</ETag></Part></CompleteMultipartUpload>";
+        let mut req = base_s3_req("POST", "/mybucket/obj", "uploadId=abc");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.headers.set("Content-MD5", "YWFhYWFhYWFhYWFhYWFhYQ==");
+        req.body = Body::from(xml.to_vec());
+        let req = sign_request(req, "testing");
+        let next = async_ok(|_| panic!("complete BadDigest must not reach backend"));
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>BadDigest</Code>"), "{body}");
+        assert!(
+            body.contains("<ExpectedDigest>YWFhYWFhYWFhYWFhYWFhYQ==</ExpectedDigest>"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn handle_s3_async_put_if_match_is_501() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket/obj", "");
+        req.headers.set("If-Match", "*");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.body = Body::from(b"abcdefghij".to_vec());
+        let req = sign_request(req, "testing");
+        let next = async_ok(|_| panic!("If-Match PUT must not reach Swift"));
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 501);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>NotImplemented</Code>"), "{body}");
+    }
+
+    #[test]
+    fn handle_s3_async_put_if_none_match_nonstar_is_501() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket/obj", "");
+        req.headers.set("If-None-Match", "asdf");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.body = Body::from(b"abcdefghij".to_vec());
+        let req = sign_request(req, "testing");
+        let next = async_ok(|_| panic!("If-None-Match:asdf PUT must not reach Swift"));
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 501);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>NotImplemented</Code>"), "{body}");
+    }
+
+    #[test]
+    fn handle_s3_async_put_if_none_match_star_is_200() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket/obj", "");
+        req.headers.set("If-None-Match", "*");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.body = Body::from(b"abcdefghij".to_vec());
+        let req = sign_request(req, "testing");
+        let next = async_ok(|r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            assert_eq!(r.path, "/v1/AUTH_test/mybucket/obj");
+            let mut resp = Response::new(201);
+            resp.headers.set("ETag", "abc123");
+            resp
+        });
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn handle_s3_async_put_weird_metadata_keeps_eventlet_token_chars() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket/obj", "");
+        for c in "!#$%&'(*+-.^`|~".chars() {
+            req.headers.set(&format!("x-amz-meta-{c}"), c.to_string());
+        }
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.body = Body::from(b"abcdefghij".to_vec());
+        let req = sign_request(req, "testing");
+        let next = async_ok(|r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            for c in "!#$%&'(*+-.^`|~".chars() {
+                let name = format!("X-Object-Meta-{c}");
+                assert_eq!(r.headers.get(&name), Some(c.to_string()).as_deref(), "{name}");
+            }
+            let mut resp = Response::new(201);
+            resp.headers.set("ETag", "abc123");
+            resp
+        });
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn handle_s3_async_v2_presigned_expires_past_i32_is_403_invalid_date() {
+        let api = S3Api::new(cred_map());
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Host", "localhost");
+        let req = Request {
+            method: "GET".into(),
+            path: "/test-bucket".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        };
+        let req = sign_v2_query(req, "test:tester", "testing", 1 << 31);
+        let next = async_ok(|_| panic!("invalid V2 Expires must not be served"));
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>AccessDenied</Code>"), "{body}");
+        assert!(
+            body.contains("Invalid date (should be seconds since epoch)"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn handle_s3_async_v4_presigned_negative_expires_is_400() {
+        let api = S3Api::new(cred_map());
+        let now = unix_now();
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Host", "localhost");
+        let req = Request {
+            method: "GET".into(),
+            path: "/test-bucket".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        };
+        let req = sign_v4_query(req, "test:tester", "testing", now, -1);
+        let next = async_ok(|_| panic!("negative X-Amz-Expires must not be served"));
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(
+            body.contains("<Code>AuthorizationQueryParametersError</Code>"),
+            "{body}"
+        );
+        assert!(body.contains("X-Amz-Expires must be non-negative"), "{body}");
+    }
+
+    #[test]
+    fn handle_s3_async_v4_presigned_expires_over_week_is_400() {
+        let api = S3Api::new(cred_map());
+        let now = unix_now();
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Host", "localhost");
+        let req = Request {
+            method: "GET".into(),
+            path: "/test-bucket".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        };
+        let req = sign_v4_query(req, "test:tester", "testing", now, 604801);
+        let next = async_ok(|_| panic!("X-Amz-Expires>604800 must not be served"));
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(
+            body.contains("<Code>AuthorizationQueryParametersError</Code>"),
+            "{body}"
+        );
+        assert!(body.contains("604800"), "{body}");
+    }
+
+    #[test]
+    fn handle_s3_async_xxe_create_bucket_is_400() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/xxe-bucket", "");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.body = Body::from(
+            br#"<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/swift/swift.conf"> ]>
+<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <LocationConstraint>&xxe;</LocationConstraint>
+</CreateBucketConfiguration>"#
+                .to_vec(),
+        );
+        let req = sign_request(req, "testing");
+        let next = async_ok(|_| panic!("XXE create_bucket must not create a container"));
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>MalformedXML</Code>"), "{body}");
+        assert!(!body.contains("[swift-hash]"), "{body}");
+        assert!(!body.contains("xxe"), "{body}");
+    }
+
+    #[test]
+    fn handle_s3_async_xxe_complete_mpu_wrong_key_is_404() {
+        let api = S3Api::new(cred_map());
+        let init = sign_request(base_s3_req("POST", "/mybucket/test", "uploads"), "testing");
+        let init_next = async_ok(|r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            if r.method == "PUT" {
+                return Response::new(201);
+            }
+            Response::new(404)
+        });
+        let init_resp = block_on_s3(api.handle_s3_async(init, init_next));
+        assert_eq!(init_resp.status, 200);
+        let init_body = String::from_utf8(init_resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        let upload_id = init_body
+            .split("<UploadId>")
+            .nth(1)
+            .and_then(|s| s.split("</UploadId>").next())
+            .unwrap()
+            .to_string();
+        let mut complete = base_s3_req(
+            "POST",
+            "/mybucket/key",
+            &format!("uploadId={upload_id}"),
+        );
+        complete
+            .headers
+            .set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        complete.body = Body::from(
+            br#"<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/swift/swift.conf"> ]>
+<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+   <Part>
+      <ETag>"abc"</ETag>
+      <PartNumber>&xxe;</PartNumber>
+   </Part>
+</CompleteMultipartUpload>"#
+                .to_vec(),
+        );
+        let complete = sign_request(complete, "testing");
+        let complete_next = async_ok(|r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            if r.method == "HEAD" {
+                return Response::new(404);
+            }
+            panic!("XXE complete must 404 NoSuchUpload before XML part parse: {}", r.path);
+        });
+        let resp = block_on_s3(api.handle_s3_async(complete, complete_next));
+        assert_eq!(resp.status, 404, "got {}", resp.status);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>NoSuchUpload</Code>"), "{body}");
+        assert!(!body.contains("[swift-hash]"), "{body}");
+        assert_ne!(resp.status, 416);
+    }
+
+    #[test]
+    fn handle_s3_async_list_multipart_uploads_lists_segments_markers() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/mybucket", "uploads"), "testing");
+        let next = async_ok(|r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            assert_eq!(r.path, "/v1/AUTH_test/mybucket+segments");
+            let mut resp = Response::new(200);
+            resp.body = Body::from(
+                br#"[{"name":"obj1/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","hash":"x","bytes":6,"last_modified":"2026-08-22T00:00:00.000000"}]"#
+                    .to_vec(),
+            );
+            resp
+        });
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("ListMultipartUploadsResult"), "{body}");
+        assert!(body.contains("<Key>obj1</Key>"), "{body}");
+        assert!(!body.contains("ListBucketResult"), "{body}");
+    }
+
+    #[test]
+    fn handle_s3_async_delete_empty_bucket_cleans_segments() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("DELETE", "/mybucket", ""), "testing");
+        let next = async_ok(|r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                let mut resp = Response::new(204);
+                resp.headers.set("X-Container-Object-Count", "0");
+                return resp;
+            }
+            if r.method == "GET" && r.path == "/v1/AUTH_test/mybucket+segments" {
+                let mut resp = Response::new(200);
+                resp.body = Body::from(
+                    br#"[{"name":"obj1/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","hash":"x","bytes":6,"last_modified":"2026-08-22T00:00:00.000000"}]"#
+                        .to_vec(),
+                );
+                return resp;
+            }
+            if r.method == "DELETE" && r.path.starts_with("/v1/AUTH_test/mybucket+segments") {
+                return Response::new(204);
+            }
+            if r.method == "DELETE" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            panic!("unexpected {} {}", r.method, r.path);
+        });
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 204);
+    }
+
+    #[test]
+    fn handle_s3_async_multi_delete_oversize_is_malformed_xml() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("POST", "/mybucket", "delete");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.headers.set("Content-MD5", "YWFhYWFhYWFhYWFhYWFhYQ==");
+        req.headers.set("Content-Length", "3000000");
+        req.body = Body::from(b"<Delete><Object><Key>a</Key></Object></Delete>".to_vec());
+        let req = sign_request(req, "testing");
+        let next = async_ok(|_| panic!("oversize multi-delete must not reach Swift"));
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>MalformedXML</Code>"), "{body}");
     }
 
     #[test]
@@ -17200,7 +17851,7 @@ mod tests {
         let req = Request {
             method: "GET".into(),
             path: "/mybucket/obj".into(),
-            query_string: "AWSAccessKeyId=test%3Atester&Expires=9999999999&Signature=abc".into(),
+            query_string: "AWSAccessKeyId=test%3Atester&Expires=2000000000&Signature=abc".into(),
             headers,
             body: Body::empty(),
         };

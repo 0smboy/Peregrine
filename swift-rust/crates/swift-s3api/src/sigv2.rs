@@ -397,6 +397,12 @@ pub fn check_sigv2_time(
             if exp < now_unix {
                 return Err(SigAuthError::AccessDenied);
             }
+            // Python: Expires >= 2^31 is AccessDenied "Invalid date (should
+            // be seconds since epoch)" — official test_expiration_limits V2
+            // uses expires_in=2**32.
+            if exp >= (1 << 31) {
+                return Err(SigAuthError::AccessDeniedInvalidExpires);
+            }
         }
         return Ok(());
     }
@@ -614,6 +620,26 @@ mod tests {
     }
 
     #[test]
+    fn query_auth_expires_past_i32_is_invalid_date() {
+        let mut req = aws_vector_req();
+        req.path = "/johnsmith/photos/puppy.jpg".into();
+        let exp: i64 = 1 << 31;
+        let auth = SigV2Auth {
+            access_key: ACCESS.into(),
+            signature: String::new(),
+            query_auth: true,
+            expires: Some(exp),
+        };
+        let sts = string_to_sign_v2(&req, &auth);
+        let sig = compute_signature_v2(SECRET, &sts);
+        req.query_string = format!("AWSAccessKeyId={ACCESS}&Expires={exp}&Signature={sig}");
+        assert_eq!(
+            verify_sigv2(ACCESS, SECRET, &req, Some(1_700_000_000), None),
+            Err(SigAuthError::AccessDeniedInvalidExpires)
+        );
+        assert_sig_error_xml_matches_normalize(SigAuthError::AccessDeniedInvalidExpires, 403);
+    }
+
     fn query_auth_expired_fails() {
         let mut req = aws_vector_req();
         req.path = "/johnsmith/photos/puppy.jpg".into();

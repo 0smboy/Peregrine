@@ -49,8 +49,12 @@ pub enum SigAuthError {
     RequestTimeTooSkewed,
     /// Query auth past `X-Amz-Expires` / `Expires` (not a bad HMAC).
     AccessDenied,
+    /// SigV2 query `Expires >= 2^31` (Python `_validate_expire_param`).
+    AccessDeniedInvalidExpires,
     /// Header auth with empty/missing Date and x-amz-date (Python s3request).
     InvalidDate,
+    /// SigV4 query `X-Amz-Expires` range/type (Python `_validate_expire_param`).
+    AuthorizationQueryParametersError(&'static str),
 }
 
 impl SigAuthError {
@@ -58,7 +62,10 @@ impl SigAuthError {
         match self {
             Self::SignatureDoesNotMatch => "SignatureDoesNotMatch",
             Self::RequestTimeTooSkewed => "RequestTimeTooSkewed",
-            Self::AccessDenied | Self::InvalidDate => "AccessDenied",
+            Self::AccessDenied | Self::AccessDeniedInvalidExpires | Self::InvalidDate => {
+                "AccessDenied"
+            }
+            Self::AuthorizationQueryParametersError(_) => "AuthorizationQueryParametersError",
         }
     }
 
@@ -66,9 +73,13 @@ impl SigAuthError {
     pub fn s3_message(self) -> Option<&'static str> {
         match self {
             Self::AccessDenied => Some("Request has expired"),
+            Self::AccessDeniedInvalidExpires => {
+                Some("Invalid date (should be seconds since epoch)")
+            }
             Self::InvalidDate => {
                 Some("AWS authentication requires a valid Date or x-amz-date header")
             }
+            Self::AuthorizationQueryParametersError(msg) => Some(msg),
             Self::SignatureDoesNotMatch | Self::RequestTimeTooSkewed => None,
         }
     }
@@ -332,12 +343,27 @@ pub fn check_sigv4_time(
     let query_auth = parse_sigv4_auth(req).is_some_and(|a| a.query_auth);
     if query_auth {
         if let Some(exp_s) = req.param("X-Amz-Expires") {
+            // Python s3request._validate_expire_param (V4).
             match exp_s.parse::<i64>() {
-                Ok(expires) if expires <= 0 => return Err(SigAuthError::AccessDenied),
+                Err(_) => {
+                    return Err(SigAuthError::AuthorizationQueryParametersError(
+                        "X-Amz-Expires should be a number",
+                    ));
+                }
+                Ok(expires) if expires < 0 => {
+                    return Err(SigAuthError::AuthorizationQueryParametersError(
+                        "X-Amz-Expires must be non-negative",
+                    ));
+                }
+                Ok(expires) if expires > 604800 => {
+                    return Err(SigAuthError::AuthorizationQueryParametersError(
+                        "X-Amz-Expires must be less than a week (in seconds);                          that is, the given X-Amz-Expires must be less than                          604800 seconds",
+                    ));
+                }
                 Ok(expires) if signing_ts.saturating_add(expires) <= now_unix => {
                     return Err(SigAuthError::AccessDenied);
                 }
-                _ => {}
+                Ok(_) => {}
             }
         }
     }
@@ -845,6 +871,40 @@ mod tests {
     }
 
     #[test]
+    fn query_expires_negative_is_authorization_query_parameters_error() {
+        let mut req = query_auth_request();
+        req.query_string = req
+            .query_string
+            .replace("X-Amz-Expires=86400", "X-Amz-Expires=-1");
+        let signed = parse_amz_date("20130524T000000Z").unwrap();
+        match check_sigv4_time(&req, signed, 900) {
+            Err(SigAuthError::AuthorizationQueryParametersError(msg)) => {
+                assert!(msg.contains("non-negative"), "{msg}");
+            }
+            other => panic!("expected query-param error, got {other:?}"),
+        }
+        assert_sig_error_xml_matches_normalize(
+            SigAuthError::AuthorizationQueryParametersError(
+                "X-Amz-Expires must be non-negative",
+            ),
+            400,
+        );
+    }
+
+    fn query_expires_over_week_is_authorization_query_parameters_error() {
+        let mut req = query_auth_request();
+        req.query_string = req
+            .query_string
+            .replace("X-Amz-Expires=86400", "X-Amz-Expires=604801");
+        let signed = parse_amz_date("20130524T000000Z").unwrap();
+        match check_sigv4_time(&req, signed, 900) {
+            Err(SigAuthError::AuthorizationQueryParametersError(msg)) => {
+                assert!(msg.contains("604800"), "{msg}");
+            }
+            other => panic!("expected query-param error, got {other:?}"),
+        }
+    }
+
     fn query_expires_zero_is_access_denied_even_in_the_same_second() {
         let mut req = query_auth_request();
         req.query_string = req
