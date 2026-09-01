@@ -325,7 +325,10 @@ impl Body {
         rx: &mut tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
     ) -> Option<Result<Vec<u8>, std::io::Error>> {
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| rx.blocking_recv())
+            return Some(Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "Body::Channel must be drained with collect_async on the Tokio runtime",
+            )));
         } else {
             rx.blocking_recv()
         }
@@ -591,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_materialize_on_multi_thread_runtime_does_not_panic() {
+    fn channel_on_tokio_runtime_uses_collect_async_not_block_in_place() {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -603,7 +606,13 @@ mod tests {
             tx.try_send(Ok(b"xyz".to_vec())).unwrap();
             drop(tx);
             let mut body = Body::from_channel(rx, Some(3), scope);
-            let got = body.materialize(u64::MAX).expect("materialize");
+            let err = body.materialize(u64::MAX).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+            let (tx2, rx2) = tokio::sync::mpsc::channel(4);
+            tx2.try_send(Ok(b"xyz".to_vec())).unwrap();
+            drop(tx2);
+            let body2 = Body::from_channel(rx2, Some(3), swift_runtime::TaskScope::bounded(1));
+            let got = body2.collect_async().await.expect("collect_async");
             assert_eq!(got, b"xyz");
         });
     }
