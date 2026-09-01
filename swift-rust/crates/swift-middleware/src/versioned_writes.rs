@@ -2585,6 +2585,31 @@ fn public_symlink_target(container: &str, object: &str) -> String {
     format!("{}/{}", quote_path(container), quote_path(object))
 }
 
+/// Python SLO part-number responses keep the version-id from the inner
+/// versioned GET. Outbound SLO reassemble builds a new 206 and can drop
+/// `X-Object-Version-Id`. Re-stamp from the client query after that.
+fn stamp_version_id_from_query(req: &Request, mut resp: Response) -> Response {
+    if !matches!(req.method.as_str(), "GET" | "HEAD") {
+        return resp;
+    }
+    let Some(raw) = query_param(&req.query_string, "version-id") else {
+        return resp;
+    };
+    if raw.is_empty() {
+        return resp;
+    }
+    if raw == "null" {
+        if resp.headers.get("X-Object-Version-Id").is_none() {
+            resp.headers.set("X-Object-Version-Id", "null");
+        }
+        return resp;
+    }
+    if let Ok(ts) = raw.parse::<Timestamp>() {
+        resp.headers.set("X-Object-Version-Id", ts.internal());
+    }
+    resp
+}
+
 /// Python `object_versioning.handle_request` rewrites symlink-follow headers
 /// so clients never see the reserved versions container. Hidden
 /// `Content-Location` / `X-Symlink-Target` become the public object path
@@ -2726,12 +2751,14 @@ impl Middleware for VersionedWrites {
         let container = parts[2].clone().unwrap_or_default();
         let object = parts[3].clone().unwrap_or_default();
         if !object.is_empty() {
-            if self.allow_object_versioning {
-                return rewrite_hidden_version_client_headers(
+            let resp = if self.allow_object_versioning {
+                rewrite_hidden_version_client_headers(
                     req, resp, &version, &account, &container, &object,
-                );
-            }
-            return resp;
+                )
+            } else {
+                resp
+            };
+            return stamp_version_id_from_query(req, resp);
         }
         if container.is_empty() {
             return resp;
@@ -3699,6 +3726,23 @@ mod tests {
     }
 
     #[test]
+    fn test_finish_restamps_version_id_on_slo_part_number_response() {
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let mut req = req("GET", "/v1/AUTH_test/c/o");
+        req.query_string = "part-number=1&version-id=1787766177.51067".to_string();
+        let mut resp = Response::new(206);
+        resp.headers.set("X-Parts-Count", "2");
+        resp.headers.set("Content-Range", "bytes 0-2/6");
+        let out = vw.finish(&req, resp);
+        assert_eq!(
+            out.headers.get("X-Object-Version-Id"),
+            Some("1787766177.51067"),
+            "SLO part-number 206 must still advertise the requested version-id"
+        );
+        assert_eq!(out.headers.get("X-Parts-Count"), Some("2"));
+    }
+
+    #[test]
     fn test_finish_rewrites_hidden_content_location_to_version_id_query() {
         let vw = VersionedWrites::new().with_object_versioning(true);
         let version: Timestamp = "1788249092.75587".parse().unwrap();
@@ -3780,7 +3824,11 @@ mod tests {
             out.headers.get("Content-Location"),
             Some(hidden_loc.as_str())
         );
-        assert!(out.headers.get("X-Object-Version-Id").is_none());
+        let version_id = version.internal();
+        assert_eq!(
+            out.headers.get("X-Object-Version-Id"),
+            Some(version_id.as_str())
+        );
     }
 
     #[test]

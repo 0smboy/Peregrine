@@ -8045,7 +8045,19 @@ async fn dispatch_streaming_remaining(
             let next = remaining_streaming_next(Arc::clone(&filters), j + 1, Arc::clone(&app));
             let mut resp = filters[j].handle_streaming_request(req, next).await;
             buffer_manifest_channel(&mut resp).await;
-            return apply_outbound_filters(filters, start, j, app, head, resp).await;
+            resp = apply_outbound_filters(
+                Arc::clone(&filters),
+                start,
+                j,
+                Arc::clone(&app),
+                head.clone_head(),
+                resp,
+            )
+            .await;
+            // Streaming intercepts skip this filter in apply_outbound_filters
+            // (end=j). SLO part-number reassemble can drop X-Object-Version-Id;
+            // versioned_writes::finish restamps it from the client query.
+            return filters[j].finish(&head, resp);
         }
 
         if filters[j].intercepts_request(&head) {
