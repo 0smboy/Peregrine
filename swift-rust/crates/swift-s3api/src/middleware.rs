@@ -898,6 +898,44 @@ fn is_s3_streaming_object_put(
     bucket.is_some() && key.is_some()
 }
 
+/// Initiate Multipart Upload: `POST` with `uploads` and no `uploadId`.
+/// Python `UploadsController.POST` pops ETag/Content-Md5 and never calls
+/// `check_md5`. Official `test_object_multi_upload` sends
+/// `Content-MD5: YWFhYWFhYWFhYWFhYWFhYQ==` (base64 of 16 `a`s).
+fn is_initiate_multipart_upload(req: &Request) -> bool {
+    if req.method != "POST" {
+        return false;
+    }
+    let params = req.params();
+    params.iter().any(|(k, _)| k == "uploads")
+        && !params.iter().any(|(k, _)| k == "uploadId")
+}
+
+/// Python `MultiObjectDeleteController.xml(min(2*1000*1024, 10MiB))`.
+/// Header-only so `streams_request` can skip the 64 MiB intercept.
+const MAX_MULTI_DELETE_BODY: u64 = 2 * 1000 * 1024;
+
+fn is_oversize_multi_delete(req: &Request) -> bool {
+    if req.method != "POST" {
+        return false;
+    }
+    if !req.params().iter().any(|(k, _)| k == "delete") {
+        return false;
+    }
+    let cl = req
+        .headers
+        .get("Content-Length")
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| req.body.content_length());
+    cl.is_some_and(|n| n > MAX_MULTI_DELETE_BODY)
+}
+
+fn oversize_multi_delete_response() -> Response {
+    let mut resp = s3_error_response("MalformedXML", None, &[]);
+    resp.headers.set("Connection", "close");
+    resp
+}
+
 /// Paths that are never unsigned S3 (Swift v1 / auth / info / health).
 fn is_swift_native_path(path: &str) -> bool {
     path == "/info"
@@ -2857,6 +2895,12 @@ impl Middleware for S3Api {
     }
 
     fn streams_request(&self, req: &Request) -> bool {
+        // Official multi-delete error case posts ~97 MiB XML. Intercept
+        // materialize(MAX_CONTROL_BODY=64MiB) then Hyper drain → BrokenPipe.
+        // Stream so we can 400 MalformedXML from Content-Length alone.
+        if is_oversize_multi_delete(req) {
+            return true;
+        }
         parse_sigv4_auth(req).is_some()
             && is_s3_streaming_object_put(
                 req,
@@ -2870,7 +2914,20 @@ impl Middleware for S3Api {
         req: AsyncRequest,
         next: StreamingAsyncNextFn,
     ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
-        Box::pin(async move { self.put_object_streaming(req, next).await })
+        Box::pin(async move {
+            let method = req.method.clone();
+            let head = Request {
+                method: req.method.clone(),
+                path: req.path.clone(),
+                query_string: req.query_string.clone(),
+                headers: req.headers.clone(),
+                body: Body::empty(),
+            };
+            if is_oversize_multi_delete(&head) {
+                return finish_s3_response(&method, oversize_multi_delete_response());
+            }
+            self.put_object_streaming(req, next).await
+        })
     }
 
     fn handle_request_async(
@@ -3452,6 +3509,19 @@ impl S3Api {
             Err(resp) => return finish(resp),
         };
         let v4_header = crate::payload::is_v4_header_auth(&req);
+        // Format-check Content-MD5 first (Python S3Request still InvalidDigest
+        // on Initiate). Then drop ETag/Content-MD5 so POST ?uploads cannot
+        // BadDigest against the empty initiate body.
+        if let Some(resp) = crate::payload::invalid_content_md5_response(&req) {
+            return finish(resp);
+        }
+        if is_initiate_multipart_upload(&req) {
+            req.headers.remove("ETag");
+            req.headers.remove("Content-MD5");
+        }
+        if is_oversize_multi_delete(&req) {
+            return finish(oversize_multi_delete_response());
+        }
         if let Some(resp) = crate::payload::validate_s3_payload(&mut req, v4_header) {
             return finish(resp);
         }
@@ -11338,6 +11408,9 @@ fn handle_mpu_init(
     if let Err(resp) = apply_request_object_lock_headers(&mut req.headers) {
         return resp;
     }
+    // Python UploadsController.POST: pop Etag / Content-Md5 before empty marker PUT.
+    req.headers.remove("ETag");
+    req.headers.remove("Content-MD5");
 
     let segs = segments_container(bucket);
     // Ensure segments container exists.
@@ -14011,6 +14084,204 @@ mod tests {
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
         assert!(body.contains("InitiateMultipartUploadResult"), "{body}");
         assert!(!body.contains("BadDigest"), "{body}");
+    }
+
+    #[test]
+    fn handle_s3_async_initiate_mpu_is_intercept_not_streaming() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("POST", "/mybucket/obj1", "uploads");
+        req.headers.set("Content-MD5", "YWFhYWFhYWFhYWFhYWFhYQ==");
+        let req = sign_request(req, "testing");
+        assert!(
+            !api.streams_request(&req),
+            "Initiate MPU must stay on handle_s3_async, not PutObject streaming"
+        );
+        assert!(api.intercepts_request(&req));
+    }
+
+    #[test]
+    fn handle_s3_async_initiate_mpu_malformed_content_md5_is_invalid_digest() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("POST", "/mybucket/obj1", "uploads");
+        req.headers.set("Content-MD5", "not-a-md5");
+        let req = sign_request(req, "testing");
+        let next = async_ok(|_| panic!("malformed Content-MD5 must not reach backend"));
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>InvalidDigest</Code>"), "{body}");
+        assert!(!body.contains("BadDigest"), "{body}");
+    }
+
+    #[test]
+    fn handle_s3_async_initiate_mpu_ignores_etag_nonsense() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("POST", "/mybucket/obj3", "uploads");
+        req.headers.set("ETag", "nonsense");
+        let req = sign_request(req, "testing");
+        let next = async_ok(|r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            if r.method == "PUT" {
+                assert!(
+                    r.headers.get("ETag").is_none(),
+                    "initiate must not forward client ETag onto the marker PUT"
+                );
+                return Response::new(201);
+            }
+            Response::new(404)
+        });
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 200, "initiate with ETag: nonsense");
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("InitiateMultipartUploadResult"), "{body}");
+    }
+
+    #[test]
+    fn handle_s3_async_initiate_leftover_mpu_is_abortable() {
+        let api = S3Api::new(cred_map());
+        let mut init = base_s3_req("POST", "/mybucket/obj1", "uploads");
+        init.headers.set("Content-MD5", "YWFhYWFhYWFhYWFhYWFhYQ==");
+        let init = sign_request(init, "testing");
+        let init_next = async_ok(|r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            if r.method == "PUT" {
+                return Response::new(201);
+            }
+            Response::new(404)
+        });
+        let init_resp = block_on_s3(api.handle_s3_async(init, init_next));
+        assert_eq!(init_resp.status, 200);
+        let init_body = String::from_utf8(init_resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        let upload_id = init_body
+            .split("<UploadId>")
+            .nth(1)
+            .and_then(|s| s.split("</UploadId>").next())
+            .unwrap()
+            .to_string();
+
+        let list = sign_request(base_s3_req("GET", "/mybucket", "uploads"), "testing");
+        let marker_name = upload_marker_name("obj1", &upload_id);
+        let list_next = async_ok(move |r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            if r.method == "GET" && r.path == "/v1/AUTH_test/mybucket+segments" {
+                let mut resp = Response::new(200);
+                resp.body = Body::from(
+                    format!(
+                        r#"[{{"name":"{marker_name}","hash":"x","bytes":6,"last_modified":"2026-08-22T00:00:00.000000"}}]"#
+                    )
+                    .into_bytes(),
+                );
+                return resp;
+            }
+            panic!("unexpected {} {}", r.method, r.path);
+        });
+        let list_resp = block_on_s3(api.handle_s3_async(list, list_next));
+        assert_eq!(list_resp.status, 200);
+        let list_body = String::from_utf8(list_resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(list_body.contains("<Key>obj1</Key>"), "{list_body}");
+        assert!(list_body.contains(&upload_id), "{list_body}");
+
+        let abort = sign_request(
+            base_s3_req(
+                "DELETE",
+                "/mybucket/obj1",
+                &format!("uploadId={upload_id}"),
+            ),
+            "testing",
+        );
+        let abort_next = async_ok(|r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            if r.method == "HEAD" && r.path.contains("+segments") {
+                return Response::new(200);
+            }
+            if r.method == "GET" && r.path.contains("+segments") {
+                let mut resp = Response::new(200);
+                resp.body = Body::from(b"[]".to_vec());
+                return resp;
+            }
+            if r.method == "DELETE" {
+                return Response::new(204);
+            }
+            Response::new(404)
+        });
+        let abort_resp = block_on_s3(api.handle_s3_async(abort, abort_next));
+        assert_eq!(abort_resp.status, 204, "leftover MPU abort");
+    }
+
+    #[test]
+    fn handle_s3_async_put_if_modified_since_is_501() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket/obj", "");
+        req.headers
+            .set("If-Modified-Since", "Sat, 27 Jun 2015 00:00:00 GMT");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.body = Body::from(b"abcdefghij".to_vec());
+        let req = sign_request(req, "testing");
+        let next = async_ok(|_| panic!("If-Modified-Since PUT must not reach Swift"));
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 501);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>NotImplemented</Code>"), "{body}");
+    }
+
+    #[test]
+    fn handle_s3_async_put_if_unmodified_since_is_501() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket/obj", "");
+        req.headers
+            .set("If-Unmodified-Since", "Sat, 27 Jun 2015 00:00:00 GMT");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.body = Body::from(b"abcdefghij".to_vec());
+        let req = sign_request(req, "testing");
+        let next = async_ok(|_| panic!("If-Unmodified-Since PUT must not reach Swift"));
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 501);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>NotImplemented</Code>"), "{body}");
+    }
+
+    #[test]
+    fn put_object_streaming_if_match_is_501() {
+        let api = S3Api::new(cred_map());
+        let mut req = unsigned_signed_put("/mybucket/obj", "");
+        req.headers.set("If-Match", "*");
+        let areq = async_from_signed(req, b"abcdefghij".to_vec());
+        let next: StreamingAsyncNextFn =
+            Arc::new(|_| panic!("streaming If-Match PUT must not reach Swift"));
+        let resp = block_on_s3(api.put_object_streaming(areq, next));
+        assert_eq!(resp.status, 501);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>NotImplemented</Code>"), "{body}");
+    }
+
+    #[test]
+    fn oversize_multi_delete_streams_and_is_malformed_xml() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("POST", "/mybucket", "delete");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.headers.set("Content-MD5", "YWFhYWFhYWFhYWFhYWFhYQ==");
+        req.headers.set("Content-Length", "3000000");
+        let req = sign_request(req, "testing");
+        assert!(
+            api.streams_request(&req),
+            "oversize POST ?delete must skip 64MiB intercept materialize"
+        );
+        assert!(!api.intercepts_request(&req));
+        let areq = async_from_signed(req, b"<Delete></Delete>".to_vec());
+        let next: StreamingAsyncNextFn =
+            Arc::new(|_| panic!("oversize multi-delete must not reach backend"));
+        let resp = block_on_s3(api.handle_streaming_request(areq, next));
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>MalformedXML</Code>"), "{body}");
     }
 
     #[test]
