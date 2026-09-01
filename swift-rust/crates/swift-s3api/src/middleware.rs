@@ -1076,6 +1076,63 @@ fn strip_s3_only_headers(headers: &mut HeaderKeyDict) {
     }
 }
 
+
+fn tchar_meta_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Hyper object-server rejects non-token `X-Object-Meta-*` names. Encode
+/// Eventlet-lenient suffix bytes as `!HH` so the backend PUT is valid HTTP/1.
+fn encode_backend_meta_rest(rest: &str) -> String {
+    let mut out = String::new();
+    for byte in rest.bytes() {
+        if tchar_meta_byte(byte) {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("!{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn decode_backend_meta_rest(rest: &str) -> String {
+    let bytes = rest.as_bytes();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'!' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            if let Some(hex) = hex {
+                if let Ok(value) = u8::from_str_radix(hex, 16) {
+                    out.push(char::from(value));
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 fn map_amz_meta(req: &mut Request) {
     // x-amz-meta-* → X-Object-Meta-*
     let pairs: Vec<(String, String)> = req
@@ -1084,8 +1141,12 @@ fn map_amz_meta(req: &mut Request) {
         .filter_map(|(k, v)| {
             let lower = k.to_ascii_lowercase();
             lower.strip_prefix("x-amz-meta-").and_then(|rest| {
-                s3_meta_name_allowed(rest)
-                    .then(|| (format!("X-Object-Meta-{rest}"), v.to_string()))
+                s3_meta_name_allowed(rest).then(|| {
+                    (
+                        format!("X-Object-Meta-{}", encode_backend_meta_rest(rest)),
+                        v.to_string(),
+                    )
+                })
             })
         })
         .collect();
@@ -1697,7 +1758,10 @@ fn translate_swift_to_s3_object_headers(resp: &mut Response) {
             if rest.starts_with("s3-") || rest == "s3api-etag" {
                 continue;
             }
-            let amz = format!("x-amz-meta-{}", rest.replace("=5f", "_"));
+            let amz = format!(
+                "x-amz-meta-{}",
+                decode_backend_meta_rest(&rest.replace("=5f", "_"))
+            );
             resp.headers.remove(&k);
             resp.headers.set(&amz, &v);
         } else if lower == "x-object-version-id" {
@@ -14492,7 +14556,7 @@ mod tests {
                 return Response::new(204);
             }
             for c in "!#$%&'(*+-.^`|~".chars() {
-                let name = format!("X-Object-Meta-{c}");
+                let name = format!("X-Object-Meta-{}", encode_backend_meta_rest(&c.to_string()));
                 assert_eq!(r.headers.get(&name), Some(c.to_string()).as_deref(), "{name}");
             }
             let mut resp = Response::new(201);
