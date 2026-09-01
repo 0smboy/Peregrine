@@ -1047,6 +1047,219 @@ impl VersionedWrites {
         Ok(())
     }
 
+    async fn restore_data_streaming(
+        &self,
+        version: &str,
+        account: &str,
+        container: &str,
+        object: &str,
+        versions_cont: &str,
+        prev_obj_name: &str,
+        source_headers: &swift_http::HeaderKeyDict,
+        next: &StreamingAsyncNextFn,
+    ) -> Option<String> {
+        let get_path = format!("/{version}/{account}/{versions_cont}/{prev_obj_name}");
+        let mut get = Self::modern_internal_request("GET", get_path.clone(), "", source_headers);
+        get.headers.set("X-Backend-Source", "VW");
+        let current = next(empty_async_request(get)).await;
+        if current.status == 404 {
+            return None;
+        }
+        if !(200..300).contains(&current.status) {
+            return None;
+        }
+        let content_length = current
+            .headers
+            .get("Content-Length")
+            .and_then(|value| value.parse::<u64>().ok())
+            .or_else(|| current.body.content_length());
+        let max_body = content_length.unwrap_or(u64::MAX);
+        let body = response_body_as_incoming(current.body, max_body).ok()?;
+        let mut put_headers = current.headers;
+        put_headers.remove("X-Timestamp");
+        put_headers.remove("X-Backend-Timestamp");
+        put_headers.remove("Transfer-Encoding");
+        put_headers.set("X-Backend-Authorize-Override", "true");
+        put_headers.set("X-Backend-Source", "VW");
+        if let Some(length) = content_length {
+            put_headers.set("Content-Length", length.to_string());
+        }
+        let put_path = format!("/{version}/{account}/{container}/{object}");
+        let copied = next(AsyncRequest {
+            method: "PUT".to_string(),
+            path: put_path,
+            query_string: String::new(),
+            headers: put_headers,
+            body,
+        })
+        .await;
+        if !(200..300).contains(&copied.status) {
+            return None;
+        }
+        Some(get_path)
+    }
+
+    async fn handle_delete_stack_streaming(
+        &self,
+        mut req: AsyncRequest,
+        version: &str,
+        account: &str,
+        container: &str,
+        object: &str,
+        versions_cont: &str,
+        next: StreamingAsyncNextFn,
+    ) -> Response {
+        let prefix = versions_object_prefix(object);
+        let list_query = format!("prefix={}&reverse=on&format=json", quote_path(&prefix));
+        let mut list = Self::modern_internal_request(
+            "GET",
+            format!("/{version}/{account}/{versions_cont}"),
+            &list_query,
+            &req.headers,
+        );
+        list.headers.set("X-Backend-Source", "VW");
+        let mut list_resp = next(empty_async_request(list)).await;
+        if list_resp.status == 404 {
+            return next(req).await;
+        }
+        if !(200..300).contains(&list_resp.status) {
+            return list_resp;
+        }
+        let listing = match std::mem::replace(&mut list_resp.body, Body::empty())
+            .collect_async()
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(_) => return Response::error(500, "Internal Error"),
+        };
+        let items = parse_listing_json(&listing);
+        if items.is_empty() {
+            return next(req).await;
+        }
+
+        let mut idx = 0;
+        while idx < items.len() {
+            let item_name = items[idx].name.clone();
+            let item_ct = items[idx].content_type.clone();
+            idx += 1;
+            if item_ct == DELETE_MARKER_CONTENT_TYPE {
+                let mut head =
+                    Self::modern_internal_request("HEAD", req.path.clone(), "", &req.headers);
+                head.headers.set("X-Newest", "True");
+                head.headers.set("X-Backend-Source", "VW");
+                let hresp = next(empty_async_request(head)).await;
+                if hresp.status != 404 {
+                    if !(200..300).contains(&hresp.status) {
+                        return hresp;
+                    }
+                    break;
+                }
+                while idx < items.len() {
+                    let restore_name = items[idx].name.clone();
+                    let restore_ct = items[idx].content_type.clone();
+                    idx += 1;
+                    if restore_ct == DELETE_MARKER_CONTENT_TYPE {
+                        break;
+                    }
+                    if let Some(path) = self
+                        .restore_data_streaming(
+                            version,
+                            account,
+                            container,
+                            object,
+                            versions_cont,
+                            &restore_name,
+                            &req.headers,
+                            &next,
+                        )
+                        .await
+                    {
+                        let del = Self::modern_internal_request("DELETE", path, "", &req.headers);
+                        let del_resp = next(empty_async_request(del)).await;
+                        if del_resp.status != 404 && !(200..300).contains(&del_resp.status) {
+                            return del_resp;
+                        }
+                        break;
+                    }
+                }
+                req.method = "DELETE".to_string();
+                req.path = format!("/{version}/{account}/{versions_cont}/{item_name}");
+                req.query_string.clear();
+                req.headers.remove("X-If-Delete-At");
+                req.headers.set("X-Backend-Authorize-Override", "true");
+                req.headers.set("X-Backend-Source", "VW");
+                return next(req).await;
+            } else if let Some(restored_path) = self
+                .restore_data_streaming(
+                    version,
+                    account,
+                    container,
+                    object,
+                    versions_cont,
+                    &item_name,
+                    &req.headers,
+                    &next,
+                )
+                .await
+            {
+                req.method = "DELETE".to_string();
+                req.path = restored_path;
+                req.query_string.clear();
+                req.headers.remove("X-If-Delete-At");
+                req.headers.set("X-Backend-Authorize-Override", "true");
+                req.headers.set("X-Backend-Source", "VW");
+                return next(req).await;
+            }
+        }
+        req.headers.remove("X-If-Delete-At");
+        next(req).await
+    }
+
+    async fn handle_delete_history_streaming(
+        &self,
+        mut req: AsyncRequest,
+        version: &str,
+        account: &str,
+        object: &str,
+        versions_cont: &str,
+        next: StreamingAsyncNextFn,
+    ) -> Response {
+        if let Err(resp) = self
+            .copy_current_legacy_streaming(
+                version,
+                account,
+                object,
+                versions_cont,
+                &req.path,
+                &req.headers,
+                &next,
+            )
+            .await
+        {
+            return resp;
+        }
+        let marker_name = versions_object_name(object, &Timestamp::now().internal())
+            .unwrap_or_else(|| format!("{}marker", versions_object_prefix(object)));
+        let mut marker = Self::modern_internal_request(
+            "PUT",
+            format!("/{version}/{account}/{versions_cont}/{marker_name}"),
+            "",
+            &req.headers,
+        );
+        marker.headers.set("X-Backend-Source", "VW");
+        marker
+            .headers
+            .set("Content-Type", DELETE_MARKER_CONTENT_TYPE);
+        marker.headers.set("Content-Length", "0");
+        let marker_resp = next(empty_async_request(marker)).await;
+        if !(200..300).contains(&marker_resp.status) {
+            return marker_resp;
+        }
+        req.headers.remove("X-If-Delete-At");
+        req.headers.set("X-Backend-Authorize-Override", "true");
+        next(req).await
+    }
+
     async fn handle_modern_put_streaming(
         &self,
         req: AsyncRequest,
@@ -1541,6 +1754,36 @@ impl VersionedWrites {
                     .set("X-Backend-Content-Type", DELETE_MARKER_CONTENT_TYPE);
             }
             resp
+        } else if req.method == "DELETE" {
+            // Hyper streams DELETE when object_versioning is on. Legacy
+            // X-Versions-Location / X-History-Location must not fall through
+            // to a bare current-object DELETE.
+            if let Some(cfg) = self.read_version_cfg(&cinfo) {
+                if cfg.mode == "history" {
+                    return self
+                        .handle_delete_history_streaming(
+                            req,
+                            &version,
+                            &account,
+                            &object,
+                            &cfg.location,
+                            next,
+                        )
+                        .await;
+                }
+                return self
+                    .handle_delete_stack_streaming(
+                        req,
+                        &version,
+                        &account,
+                        &container,
+                        &object,
+                        &cfg.location,
+                        next,
+                    )
+                    .await;
+            }
+            next(req).await
         } else {
             next(req).await
         }
@@ -2926,6 +3169,210 @@ mod tests {
                 .iter()
                 .any(|(m, p)| m == "DELETE" && p.contains("/versions/003obj/")),
             "{calls:?}"
+        );
+    }
+
+    fn streaming_delete_req() -> AsyncRequest {
+        AsyncRequest {
+            method: "DELETE".to_string(),
+            path: "/v1/AUTH_test/c/obj".to_string(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: IncomingBody::from_bytes(Vec::new(), 1024),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_streaming_legacy_delete_stack_restores_archive() {
+        type Call = (String, String, String, Vec<u8>);
+        let calls: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = Arc::clone(&calls);
+        let archive_name = "003obj/1751500000.00000";
+        let next: StreamingAsyncNextFn = Arc::new(move |mut req: AsyncRequest| {
+            let calls = Arc::clone(&calls2);
+            let archive_name = archive_name.to_string();
+            Box::pin(async move {
+                let body = req.body.materialize(u64::MAX).await.unwrap();
+                calls.lock().unwrap().push((
+                    req.method.clone(),
+                    req.path.clone(),
+                    req.query_string.clone(),
+                    body.clone(),
+                ));
+                if req.headers.contains_key(AUTHORIZE_ONLY_HEADER) {
+                    return Response::new(204);
+                }
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(SYSMETA_VERSIONS_LOC, "versions");
+                    resp.headers.set(SYSMETA_VERSIONS_MODE, "stack");
+                    return resp;
+                }
+                if req.method == "GET"
+                    && req.path == "/v1/AUTH_test/versions"
+                    && req.query_string.contains("prefix=")
+                {
+                    let listing = format!(
+                        r#"[{{"name":"{archive_name}","content_type":"text/plain","bytes":5}}]"#
+                    );
+                    return Response::with_body(200, listing.into_bytes());
+                }
+                if req.method == "GET" && req.path.contains("/versions/003obj/") {
+                    let mut resp = Response::with_body(200, b"ccccc".to_vec());
+                    resp.headers.set("Content-Type", "text/jibberish02");
+                    resp.headers.set("Content-Length", "5");
+                    return resp;
+                }
+                if req.method == "PUT" && req.path == "/v1/AUTH_test/c/obj" {
+                    return Response::new(201);
+                }
+                if req.method == "DELETE" {
+                    return Response::new(204);
+                }
+                Response::new(200)
+            })
+        });
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let resp = vw
+            .handle_streaming_request(streaming_delete_req(), next)
+            .await;
+        assert_eq!(resp.status, 204);
+        let calls = calls.lock().unwrap();
+        let restore = calls
+            .iter()
+            .find(|(m, p, _, _)| m == "PUT" && p == "/v1/AUTH_test/c/obj");
+        assert!(
+            restore.is_some(),
+            "must restore current from archive: {calls:?}"
+        );
+        assert_eq!(restore.unwrap().3, b"ccccc", "restored body: {calls:?}");
+        assert!(
+            calls.iter().any(
+                |(m, p, _, _)| m == "DELETE" && p.starts_with("/v1/AUTH_test/versions/003obj/")
+            ),
+            "must DELETE the popped archive: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_legacy_delete_empty_versions_passthrough() {
+        type Call = (String, String);
+        let calls: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = Arc::clone(&calls);
+        let next: StreamingAsyncNextFn = Arc::new(move |mut req: AsyncRequest| {
+            let calls = Arc::clone(&calls2);
+            Box::pin(async move {
+                let _ = req.body.materialize(u64::MAX).await.unwrap();
+                calls
+                    .lock()
+                    .unwrap()
+                    .push((req.method.clone(), req.path.clone()));
+                if req.headers.contains_key(AUTHORIZE_ONLY_HEADER) {
+                    return Response::new(204);
+                }
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(SYSMETA_VERSIONS_LOC, "versions");
+                    resp.headers.set(SYSMETA_VERSIONS_MODE, "stack");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_test/versions" {
+                    return Response::with_body(200, b"[]".to_vec());
+                }
+                if req.method == "DELETE" {
+                    return Response::new(204);
+                }
+                Response::new(200)
+            })
+        });
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let resp = vw
+            .handle_streaming_request(streaming_delete_req(), next)
+            .await;
+        assert_eq!(resp.status, 204);
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p)| m == "DELETE" && p == "/v1/AUTH_test/c/obj"),
+            "empty archive list must DELETE current: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|(m, p)| !(m == "PUT" && p == "/v1/AUTH_test/c/obj")),
+            "empty archive list must not restore: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|(m, p)| !(m == "DELETE" && p.contains("/versions/"))),
+            "empty archive list must not DELETE archive: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_legacy_delete_history_archives_and_marker() {
+        type Call = (String, String, String);
+        let calls: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = Arc::clone(&calls);
+        let next: StreamingAsyncNextFn = Arc::new(move |mut req: AsyncRequest| {
+            let calls = Arc::clone(&calls2);
+            Box::pin(async move {
+                let _ = req.body.materialize(u64::MAX).await.unwrap();
+                calls.lock().unwrap().push((
+                    req.method.clone(),
+                    req.path.clone(),
+                    req.headers.get("Content-Type").unwrap_or("").to_string(),
+                ));
+                if req.headers.contains_key(AUTHORIZE_ONLY_HEADER) {
+                    return Response::new(204);
+                }
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(SYSMETA_VERSIONS_LOC, "versions");
+                    resp.headers.set(SYSMETA_VERSIONS_MODE, "history");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_test/c/obj" {
+                    let mut resp = Response::with_body(200, b"cur".to_vec());
+                    resp.headers.set("X-Timestamp", "1751500000.00000");
+                    resp.headers.set("Content-Type", "text/plain");
+                    resp.headers.set("Content-Length", "3");
+                    return resp;
+                }
+                if req.method == "PUT" {
+                    return Response::new(201);
+                }
+                if req.method == "DELETE" {
+                    return Response::new(204);
+                }
+                Response::new(200)
+            })
+        });
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let resp = vw
+            .handle_streaming_request(streaming_delete_req(), next)
+            .await;
+        assert_eq!(resp.status, 204);
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p, _)| m == "PUT" && p.contains("/versions/003obj/")),
+            "history DELETE must archive current: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(m, _, ct)| m == "PUT" && ct == DELETE_MARKER_CONTENT_TYPE),
+            "history DELETE must write marker: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p, _)| m == "DELETE" && p == "/v1/AUTH_test/c/obj"),
+            "history DELETE must delete current: {calls:?}"
         );
     }
 
