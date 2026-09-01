@@ -1582,6 +1582,7 @@ impl VersionedWrites {
         marker_headers.set("X-Backend-Authorize-Override", "true");
         marker_headers.set("X-Backend-Source", "OV");
         marker_headers.set("X-Backend-Allow-Reserved-Names", "true");
+        marker_headers.set("X-Backend-Symlink-Override", "true");
         marker_headers.set(SYSMETA_SYMLINK_TARGET, &quoted_target);
         marker_headers.set(SYSMETA_SYMLINK_TARGET_ETAG, &listing_etag);
         marker_headers.set(SYSMETA_SYMLINK_TARGET_BYTES, target_bytes.to_string());
@@ -1721,6 +1722,7 @@ impl VersionedWrites {
         marker_headers.set("X-Backend-Authorize-Override", "true");
         marker_headers.set("X-Backend-Source", "OV");
         marker_headers.set("X-Backend-Allow-Reserved-Names", "true");
+        marker_headers.set("X-Backend-Symlink-Override", "true");
         marker_headers.set(SYSMETA_SYMLINK_TARGET, &quoted_target);
         marker_headers.set(SYSMETA_SYMLINK_TARGET_ETAG, &target_etag);
         marker_headers.set(SYSMETA_SYMLINK_TARGET_BYTES, target_bytes.to_string());
