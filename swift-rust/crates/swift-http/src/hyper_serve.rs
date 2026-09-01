@@ -801,22 +801,20 @@ fn parse_swift_utf8_head(
         let raw_name = trim_ascii_bytes(&line[..colon]);
         let name = if raw_name.is_ascii() {
             if raw_name.is_empty() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "invalid header name",
-                ));
+                continue;
             }
             if raw_name.iter().copied().all(ascii_header_name_byte) {
                 std::str::from_utf8(raw_name).unwrap()
+            } else if let Some(name) = swift_s3_lenient_meta_name(raw_name) {
+                name
             } else {
-                swift_s3_lenient_meta_name(raw_name).ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid header name")
-                })?
+                // Eventlet drops illegal field names instead of 400ing the PUT.
+                continue;
             }
+        } else if let Some(name) = swift_utf8_metadata_name(raw_name) {
+            name
         } else {
-            swift_utf8_metadata_name(raw_name).ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid header name")
-            })?
+            continue;
         };
         let raw_value = trim_ascii_bytes(&line[colon + 1..]);
         if raw_value.iter().any(|byte| matches!(byte, b'\r' | b'\n'))
