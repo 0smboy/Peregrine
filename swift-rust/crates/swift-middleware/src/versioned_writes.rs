@@ -254,6 +254,46 @@ fn empty_async_request(req: Request) -> AsyncRequest {
     }
 }
 
+fn buffered_to_async(req: Request) -> AsyncRequest {
+    let max_body = req.body.content_length().unwrap_or(MAX_CONTROL_BODY).max(1);
+    let bytes = match req.body {
+        Body::Buffered(bytes) => bytes,
+        _ => Vec::new(),
+    };
+    let max_body = max_body.max(bytes.len() as u64).max(1);
+    AsyncRequest {
+        method: req.method,
+        path: req.path,
+        query_string: req.query_string,
+        headers: req.headers,
+        body: IncomingBody::from_bytes(bytes, max_body),
+    }
+}
+
+/// `dispatch_remaining` (COPY dest PUT) only honors `intercepts_request`,
+/// not `streams_request`. Wrap the buffered inner next so the streaming
+/// PUT handler can still copy-current.
+fn streaming_next_from_async(next: AsyncNextFn) -> StreamingAsyncNextFn {
+    Arc::new(move |mut req: AsyncRequest| {
+        let next = Arc::clone(&next);
+        Box::pin(async move {
+            let max_body = req.body.max_body_bytes();
+            let bytes = match req.body.materialize(max_body).await {
+                Ok(bytes) => bytes,
+                Err(_) => return Response::error(499, "Client Disconnect"),
+            };
+            next(Request {
+                method: req.method,
+                path: req.path,
+                query_string: req.query_string,
+                headers: req.headers,
+                body: Body::Buffered(bytes),
+            })
+            .await
+        })
+    })
+}
+
 struct ByteCounterTransform {
     bytes: Arc<AtomicU64>,
 }
@@ -2288,13 +2328,24 @@ impl Middleware for VersionedWrites {
     }
 
     fn intercepts_request(&self, req: &Request) -> bool {
-        if !self.allow_object_versioning
-            || !matches!(req.method.as_str(), "PUT" | "POST")
-            || !req.headers.contains_key(CLIENT_VERSIONS_ENABLED)
+        if self.allow_object_versioning
+            && matches!(req.method.as_str(), "PUT" | "POST")
+            && req.headers.contains_key(CLIENT_VERSIONS_ENABLED)
+            && matches!(split_path(&req.path, 3, 3, true), Ok(parts) if parts[2].as_deref().is_some_and(|container| !container.is_empty()))
         {
-            return false;
+            return true;
         }
-        matches!(split_path(&req.path, 3, 3, true), Ok(parts) if parts[2].as_deref().is_some_and(|container| !container.is_empty()))
+        // COPY dest PUT is rewritten by `copy` then dispatched through
+        // `dispatch_remaining`, which never consults `streams_request`.
+        // Intercept the dest PUT so legacy copy-current still runs.
+        let is_object = matches!(split_path(&req.path, 4, 4, true), Ok(parts)
+            if parts[2].as_deref().is_some_and(|container| !container.is_empty())
+                && parts[3].as_deref().is_some_and(|object| !object.is_empty()));
+        is_object
+            && req.method == "PUT"
+            && req.query_string.is_empty()
+            && !req.headers.contains_key("X-Copy-From")
+            && (self.allow_object_versioning || self.allow_versioned_writes != Some(false))
     }
 
     fn intercepts_response(&self) -> bool {
@@ -2351,6 +2402,15 @@ impl Middleware for VersionedWrites {
         next: AsyncNextFn,
     ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
         Box::pin(async move {
+            let is_object = matches!(split_path(&req.path, 4, 4, true), Ok(parts)
+                if parts[2].as_deref().is_some_and(|container| !container.is_empty())
+                    && parts[3].as_deref().is_some_and(|object| !object.is_empty()));
+            if is_object && req.method == "PUT" && req.query_string.is_empty() {
+                let streaming_next = streaming_next_from_async(next);
+                return self
+                    .handle_modern_put_streaming(buffered_to_async(req), streaming_next)
+                    .await;
+            }
             self.handle_object_versioning_container_async(req, next)
                 .await
         })
@@ -2700,6 +2760,108 @@ mod tests {
                 .iter()
                 .any(|(m, p, _)| m == "PUT" && p == "/v1/AUTH_test/c/obj"),
             "client PUT must proceed: {calls:?}"
+        );
+    }
+
+    fn intercept_legacy_backend(
+        current_exists: bool,
+    ) -> (Arc<Mutex<Vec<(String, String, String)>>>, AsyncNextFn) {
+        type Call = (String, String, String);
+        let calls: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = Arc::clone(&calls);
+        let next: AsyncNextFn = Arc::new(move |r: Request| {
+            let calls = Arc::clone(&calls2);
+            Box::pin(async move {
+                calls.lock().unwrap().push((
+                    r.method.clone(),
+                    r.path.clone(),
+                    r.query_string.clone(),
+                ));
+                if r.method == "HEAD" && r.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(SYSMETA_VERSIONS_LOC, "versions");
+                    resp.headers.set(SYSMETA_VERSIONS_MODE, "stack");
+                    return resp;
+                }
+                if r.method == "GET" && r.path == "/v1/AUTH_test/c/obj" {
+                    if current_exists {
+                        let mut resp = Response::with_body(200, b"ccccc".to_vec());
+                        resp.headers.set("X-Timestamp", "1751500001.00000");
+                        resp.headers.set("Content-Type", "text/jibberish02");
+                        resp.headers.set("Content-Length", "5");
+                        return resp;
+                    }
+                    return Response::new(404);
+                }
+                Response::new(201)
+            })
+        });
+        (calls, next)
+    }
+
+    fn copy_dest_put() -> Request {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Length", "5");
+        headers.set("Content-Type", "text/jibberish04");
+        headers.set("X-Copied-From", "src/srcobj");
+        Request {
+            method: "PUT".to_string(),
+            path: "/v1/AUTH_test/c/obj".to_string(),
+            query_string: String::new(),
+            headers,
+            body: Body::Buffered(b"ddddd".to_vec()),
+        }
+    }
+
+    #[test]
+    fn test_copy_dest_put_intercepts_on_dispatch_remaining() {
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        assert!(vw.intercepts_request(&copy_dest_put()));
+        let mut x_copy = copy_dest_put();
+        x_copy.headers.set("X-Copy-From", "/src/srcobj");
+        assert!(
+            !vw.intercepts_request(&x_copy),
+            "copy middleware must own X-Copy-From"
+        );
+        let copy_method = req("COPY", "/v1/AUTH_test/src/srcobj");
+        assert!(!vw.intercepts_request(&copy_method));
+    }
+
+    #[tokio::test]
+    async fn test_copy_dest_put_archives_current_via_handle_request_async() {
+        // Hyper COPY: copy.rs pops X-Copy-From and next()s a dest PUT through
+        // dispatch_remaining, which never calls handle_streaming_request.
+        let (calls, next) = intercept_legacy_backend(true);
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let resp = vw.handle_request_async(copy_dest_put(), next).await;
+        assert_eq!(resp.status, 201);
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p, _)| m == "PUT" && p.starts_with("/v1/AUTH_test/versions/003obj/")),
+            "COPY dest must archive current: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p, _)| m == "PUT" && p == "/v1/AUTH_test/c/obj"),
+            "dest PUT must proceed: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_copy_dest_put_first_object_does_not_archive() {
+        let (calls, next) = intercept_legacy_backend(false);
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let resp = vw.handle_request_async(copy_dest_put(), next).await;
+        assert_eq!(resp.status, 201);
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .all(|(m, p, _)| !(m == "PUT" && p.contains("/versions/"))),
+            "first COPY dest must not archive: {calls:?}"
         );
     }
 
