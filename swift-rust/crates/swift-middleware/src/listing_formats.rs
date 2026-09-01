@@ -181,15 +181,19 @@ impl Middleware for ListingFormats {
             add_vary_accept(&mut resp.headers);
         }
 
-        // Only reformat a JSON body; otherwise (staticweb, etc.) pass through.
-        if resp_content_type != "application/json" {
-            return resp;
-        }
-
+        // HEAD 204 from the container/account servers is `text/plain` with no
+        // body. Python listing_formats still stamps the negotiated type
+        // (`format=json` → application/json). Do that before the JSON-body
+        // guard or official test_GET_HEAD_content_type fails on HEAD.
         if method == "HEAD" {
             resp.headers
                 .set("Content-Type", format!("{out_content_type}; charset=utf-8"));
             resp.headers.set("Content-Length", 0);
+            return resp;
+        }
+
+        // Only reformat a JSON body; otherwise (staticweb, etc.) pass through.
+        if resp_content_type != "application/json" {
             return resp;
         }
 
@@ -1189,6 +1193,22 @@ mod tests {
             json_backend(b"[]")
         });
         assert_eq!(body_bytes(&resp), b"[]");
+    }
+
+    #[test]
+    fn test_head_format_json_when_backend_head_is_plain_204() {
+        let resp = call(req("HEAD", "/v1/a/c", "format=json"), move |_| {
+            let mut r = Response::new(204);
+            r.headers.set("Content-Type", "text/plain; charset=utf-8");
+            r.headers.set("Content-Length", 0);
+            r
+        });
+        assert_eq!(resp.status, 204);
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("application/json; charset=utf-8")
+        );
+        assert_eq!(resp.headers.get("Content-Length"), Some("0"));
     }
 
     #[test]
