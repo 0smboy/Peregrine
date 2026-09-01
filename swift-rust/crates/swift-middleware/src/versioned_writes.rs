@@ -957,7 +957,7 @@ impl VersionedWrites {
             .prepare_object_versioning_container_async(
                 &mut req,
                 source_sync_configured,
-                configured,
+                configured.clone(),
                 legacy_configured,
                 policy_index,
                 &version,
@@ -969,7 +969,66 @@ impl VersionedWrites {
         {
             return resp;
         }
+        // Python ContainerContext.handle_delete: HEAD hidden, 409 if it still
+        // has versions, else DELETE hidden, then DELETE the user container.
+        if req.method == "DELETE" {
+            if let Err(resp) = self
+                .delete_hidden_versions_container_if_empty_async(
+                    req.headers.clone(),
+                    &version,
+                    &account,
+                    &container,
+                    configured.as_deref(),
+                    next.clone(),
+                )
+                .await
+            {
+                return resp;
+            }
+        }
         self.expose_object_versioning_on_response(next(req).await)
+    }
+
+    /// Python: delete the reserved versions container only after it is empty.
+    async fn delete_hidden_versions_container_if_empty_async(
+        &self,
+        headers: swift_http::HeaderKeyDict,
+        version: &str,
+        account: &str,
+        container: &str,
+        configured: Option<&str>,
+        next: AsyncNextFn,
+    ) -> Result<(), Response> {
+        if configured.is_none() {
+            return Ok(());
+        }
+        let hidden = modern_versions_container(container);
+        let hidden_path = format!("/{version}/{account}/{hidden}");
+        let head = Self::modern_internal_request("HEAD", hidden_path.clone(), "", &headers);
+        let vresp = next(head).await;
+        if (200..300).contains(&vresp.status) {
+            let count = vresp
+                .headers
+                .get("X-Container-Object-Count")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            if count > 0 {
+                let mut resp = Response::error(
+                    409,
+                    "Delete all versions before deleting container.",
+                );
+                resp.headers.set("Content-Type", "text/plain");
+                return Err(resp);
+            }
+            let del = Self::modern_internal_request("DELETE", hidden_path, "", &headers);
+            let dresp = next(del).await;
+            if !(200..300).contains(&dresp.status) && dresp.status != 404 {
+                return Err(Response::error(500, "Error deleting versioned container"));
+            }
+        } else if vresp.status != 404 {
+            return Err(Response::error(500, "Error deleting versioned container"));
+        }
+        Ok(())
     }
 
     fn modern_internal_request(
@@ -2225,17 +2284,11 @@ impl VersionedWrites {
             );
         }
 
-        // An orphan hidden container represents storage still charged to the
-        // account. Surface it under the logical primary name with no current
-        // objects, matching Python Swift's recovery signal.
-        for (logical_name, mut hidden) in hidden_by_primary {
-            let Some(map) = hidden.as_object_mut() else {
-                continue;
-            };
-            map.insert("name".to_string(), serde_json::Value::String(logical_name));
-            map.insert("count".to_string(), serde_json::Value::from(0_u64));
-            visible.push(hidden);
-        }
+        // Do not resurrect a deleted primary container from an orphan hidden
+        // versions container. Python deletes the hidden container as part of
+        // user-container DELETE; leftover hidden rows must not reappear as
+        // public account listing names (test_account_list_containers).
+        let _orphans = hidden_by_primary;
 
         visible.sort_by(|left, right| {
             left.get("name")
@@ -2955,6 +3008,17 @@ impl Middleware for VersionedWrites {
             && matches!(req.method.as_str(), "PUT" | "POST")
             && req.headers.contains_key(CLIENT_VERSIONS_ENABLED)
             && matches!(split_path(&req.path, 3, 3, true), Ok(parts) if parts[2].as_deref().is_some_and(|container| !container.is_empty()))
+        {
+            return true;
+        }
+        // Python ContainerContext.handle_delete runs on every user-container
+        // DELETE so the hidden versions container is removed. dispatch_remaining
+        // only honors intercepts_request; streaming is object-only.
+        if self.allow_object_versioning
+            && req.method == "DELETE"
+            && matches!(split_path(&req.path, 3, 4, true), Ok(parts)
+                if parts[2].as_deref().is_some_and(|container| !container.is_empty())
+                    && parts.get(3).and_then(|part| part.as_deref()).unwrap_or("").is_empty())
         {
             return true;
         }
@@ -4114,6 +4178,75 @@ mod tests {
                 .any(|(method, path)| { method == "PUT" && path == "/v1/AUTH_test/\0versions\0c" }),
             "{calls:?}"
         );
+    }
+
+    #[test]
+    fn test_modern_container_delete_intercepts_request() {
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        assert!(vw.intercepts_request(&req("DELETE", "/v1/AUTH_test/c")));
+        assert!(!vw.intercepts_request(&req("DELETE", "/v1/AUTH_test/c/obj")));
+        assert!(!VersionedWrites::new().intercepts_request(&req("DELETE", "/v1/AUTH_test/c")));
+    }
+
+    #[tokio::test]
+    async fn test_modern_container_delete_removes_empty_hidden_container() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let app: AsyncNextFn = Arc::new(move |r: Request| {
+            log2.lock()
+                .unwrap()
+                .push((r.method.clone(), r.path.clone()));
+            let mut resp = Response::new(204);
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/c" {
+                resp.headers.set(
+                    SYSMETA_OBJECT_VERSIONS_CONTAINER,
+                    quote_path(&modern_versions_container("c")),
+                );
+                resp.headers.set(SYSMETA_OBJECT_VERSIONS_ENABLED, "True");
+                return Box::pin(async move { resp });
+            }
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/\0versions\0c" {
+                resp.headers.set("X-Container-Object-Count", "0");
+                return Box::pin(async move { resp });
+            }
+            Box::pin(async move { resp })
+        });
+        let r = req("DELETE", "/v1/AUTH_test/c");
+        let resp = vw.handle_request_async(r, app).await;
+        assert_eq!(resp.status, 204, "{resp:?}");
+        let calls = log.lock().unwrap().clone();
+        assert!(
+            calls.iter().any(|(m, p)| m == "DELETE" && p == "/v1/AUTH_test/\0versions\0c"),
+            "must DELETE hidden versions container: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|(m, p)| m == "DELETE" && p == "/v1/AUTH_test/c"),
+            "must DELETE user container: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_modern_container_delete_conflict_when_hidden_not_empty() {
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let app: AsyncNextFn = Arc::new(move |r: Request| {
+            let mut resp = Response::new(204);
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/c" {
+                resp.headers.set(
+                    SYSMETA_OBJECT_VERSIONS_CONTAINER,
+                    quote_path(&modern_versions_container("c")),
+                );
+                return Box::pin(async move { resp });
+            }
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/\0versions\0c" {
+                resp.headers.set("X-Container-Object-Count", "3");
+                return Box::pin(async move { resp });
+            }
+            panic!("must not DELETE while hidden versions remain: {} {}", r.method, r.path);
+        });
+        let r = req("DELETE", "/v1/AUTH_test/c");
+        let resp = vw.handle_request_async(r, app).await;
+        assert_eq!(resp.status, 409);
     }
 
     #[test]
