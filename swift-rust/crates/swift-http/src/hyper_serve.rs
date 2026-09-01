@@ -31,7 +31,7 @@ use http_body::Frame;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::Service;
-use hyper::header::HeaderValue;
+use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Request as HyperRequest, Response as HyperResponse, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -587,6 +587,13 @@ fn request_target_has_non_ascii_path(buf: &[u8]) -> bool {
     false
 }
 
+fn header_is_s3_authorization(name: &[u8], value: &[u8]) -> bool {
+    // SigV2 `AWS ...` and SigV4 `AWS4-HMAC-SHA256 ...`. TempAuth tokens
+    // are not AWS-prefixed and must stay on the Hyper keep-alive path.
+    name.eq_ignore_ascii_case(b"Authorization")
+        && trim_ascii_bytes(value).starts_with(b"AWS")
+}
+
 fn request_needs_swift_utf8_handoff(buf: &[u8]) -> bool {
     if request_target_has_non_ascii_path(buf) {
         return true;
@@ -605,6 +612,7 @@ fn request_needs_swift_utf8_handoff(buf: &[u8]) -> bool {
             let name = trim_ascii_bytes(name);
             swift_utf8_metadata_name(name).is_some()
                 || swift_s3_lenient_meta_name(name).is_some()
+                || header_is_s3_authorization(name, value)
                 || (name.eq_ignore_ascii_case(b"X-Symlink-Target")
                     && trim_ascii_bytes(value).contains(&b'\0'))
         })
@@ -1893,7 +1901,15 @@ fn to_hyper_response(
         let Ok(hv) = HeaderValue::from_bytes(value.as_bytes()) else {
             continue;
         };
-        builder = builder.header(name, hv);
+        // Invalid field-names (`x-amz-meta-(`) must not poison the Hyper
+        // builder: that previously collapsed the response to 14-byte
+        // "Internal Error" (official test_put_object_weird_metadata HEAD).
+        // Eventlet-lenient S3 names are emitted on the utf8-compat write
+        // path instead (S3-signed Authorization → handoff).
+        let Ok(hn) = HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        builder = builder.header(hn, hv);
     }
     // HTTP/1.1 keep-alive is the default; TestFile.testGetResponseHeaders
     // treats an unsolicited `Connection: keep-alive` as unexpected.
@@ -2085,6 +2101,24 @@ mod tests {
     }
 
     #[test]
+    fn to_hyper_response_skips_invalid_s3_meta_name_without_internal_error() {
+        let mut resp = Response::with_body(200, b"abcdefghij".to_vec());
+        resp.headers.set("ETag", "abc");
+        resp.headers.set("x-amz-meta-!", "!");
+        resp.headers.set("x-amz-meta-(", "(");
+        let hyper = to_hyper_response(resp, false, true, None);
+        assert_eq!(hyper.status(), StatusCode::OK);
+        assert_eq!(hyper.headers().get("etag").unwrap().as_bytes(), b"abc");
+        assert_eq!(
+            hyper.headers().get("x-amz-meta-!").unwrap().as_bytes(),
+            b"!"
+        );
+        assert!(hyper.headers().get("x-amz-meta-(").is_none());
+        let cl = hyper.headers().get("content-length").map(|v| v.as_bytes());
+        assert_ne!(cl, Some(&b"14"[..]));
+    }
+
+    #[test]
     fn to_hyper_response_connection_only_when_client_asked() {
         let resp = Response::new(200);
         let hyper = to_hyper_response(resp, true, true, Some("keep-alive"));
@@ -2167,6 +2201,10 @@ mod tests {
         assert!(request_needs_swift_utf8_handoff(symlink_request));
         let weird = b"PUT /v1/AUTH_test/c/o HTTP/1.1\r\nX-Amz-Meta-(: (\r\n\r\n";
         assert!(request_needs_swift_utf8_handoff(weird));
+        let s3_head = b"HEAD /bucket/object HTTP/1.1\r\nAuthorization: AWS test:tester:sig\r\n\r\n";
+        assert!(request_needs_swift_utf8_handoff(s3_head));
+        let tempauth = b"GET /v1/AUTH_test/c/o HTTP/1.1\r\nX-Auth-Token: AUTH_tk\r\n\r\n";
+        assert!(!request_needs_swift_utf8_handoff(tempauth));
         assert_eq!(
             swift_s3_lenient_meta_name(b"x-amz-meta-("),
             Some("x-amz-meta-(")
