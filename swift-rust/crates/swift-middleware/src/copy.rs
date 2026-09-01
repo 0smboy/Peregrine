@@ -194,6 +194,30 @@ fn set_multipart_manifest_param(query: &str, value: Option<&str>) -> String {
         .join("&")
 }
 
+
+/// Python `copy.py` sink_req drops `version-id` so the destination PUT is
+/// not a version-aware operation (restore-old-as-latest is PUT ?version-id
+/// on the object itself, not COPY). `symlink=get` is a source-GET
+/// instruction. Leaving `version-id` on dest PUT hits
+/// `handle_put_version_streaming` and repoints a versions-symlink instead of
+/// writing a new version that carries the copied object's Content-Type.
+fn strip_sink_source_params(query: &str) -> String {
+    if query.is_empty() {
+        return String::new();
+    }
+    query
+        .split('&')
+        .filter(|pair| {
+            if pair.is_empty() {
+                return false;
+            }
+            let key = pair.split_once('=').map(|(k, _)| k).unwrap_or(pair);
+            !key.eq_ignore_ascii_case("version-id") && !key.eq_ignore_ascii_case("symlink")
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
 impl Copy {
     /// Run the GET-source / PUT-dest sequence for a request already shaped as
     /// a PUT carrying `X-Copy-From` (+ optional `X-Copy-From-Account`).
@@ -319,6 +343,7 @@ impl Copy {
         put_headers.set("X-Copied-From-Account", src_account.clone());
 
         req.method = "PUT".to_string();
+        req.query_string = strip_sink_source_params(&req.query_string);
         req.headers = put_headers;
         req.body = Body::from_reader(source_reader, source_len);
         let mut resp = next(req);
@@ -465,6 +490,7 @@ impl Copy {
         put_headers.set("X-Copied-From", format!("{src_container}/{src_object}"));
         put_headers.set("X-Copied-From-Account", src_account.clone());
         req.method = "PUT".to_string();
+        req.query_string = strip_sink_source_params(&req.query_string);
         req.headers = put_headers;
         req.body = Body::Buffered(bytes);
         let mut resp = next(req).await;
@@ -687,6 +713,114 @@ mod tests {
             Some("tgtc/tgto")
         );
     }
+
+
+    #[test]
+    fn test_strip_sink_source_params_drops_version_id_and_symlink() {
+        assert_eq!(
+            strip_sink_source_params("version-id=1787766177.51067&symlink=get"),
+            ""
+        );
+        assert_eq!(
+            strip_sink_source_params("symlink=get&version-id=1.0&multipart-manifest=put"),
+            "multipart-manifest=put"
+        );
+        assert_eq!(strip_sink_source_params(""), "");
+        assert_eq!(strip_sink_source_params("format=json"), "format=json");
+    }
+
+    #[test]
+    fn test_copy_version_id_stays_on_source_get_not_dest_put() {
+        // COPY ?version-id=&symlink=get must GET the archive link itself and
+        // PUT dest as a new object (Python copy.py deletes version-id on sink).
+        // Dest PUT keeping version-id would repoint a versions-symlink
+        // (Content-Type application/symlink) instead of the copied object.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let app: NextFn = Arc::new(move |mut r: Request| {
+            let is_get = r.method == "GET";
+            r.body.materialize(u64::MAX).unwrap();
+            log2.lock().unwrap().push(r);
+            if is_get {
+                let mut resp = Response::with_body(200, Vec::new());
+                resp.headers.set("Content-Type", "application/symlink");
+                resp.headers.set("X-Symlink-Target", "c/tgt");
+                resp
+            } else {
+                Response::new(201)
+            }
+        });
+        let mut r = req(
+            "COPY",
+            "/v1/AUTH_test/c/symlink",
+            &[("Destination", "/c/symlink")],
+        );
+        r.query_string = "version-id=1787766177.51067&symlink=get".to_string();
+        let resp = Copy::new().handle(r, &app);
+        assert_eq!(resp.status, 201);
+        let calls = log.lock().unwrap();
+        let source_get = calls.iter().find(|c| c.method == "GET").unwrap();
+        assert!(
+            source_get.query_string.contains("version-id=1787766177.51067"),
+            "source GET must keep version-id: {}",
+            source_get.query_string
+        );
+        assert!(
+            source_get.query_string.contains("symlink=get"),
+            "source GET must keep symlink=get: {}",
+            source_get.query_string
+        );
+        let dest_put = calls.iter().find(|c| c.method == "PUT").unwrap();
+        assert!(
+            !dest_put.query_string.contains("version-id"),
+            "dest PUT must not carry version-id: {}",
+            dest_put.query_string
+        );
+        assert!(
+            !dest_put.query_string.contains("symlink="),
+            "dest PUT must not carry symlink=: {}",
+            dest_put.query_string
+        );
+        assert_eq!(dest_put.headers.get("X-Symlink-Target"), Some("c/tgt"));
+        assert_eq!(
+            dest_put.headers.get("Content-Type"),
+            Some("application/symlink"),
+            "dest PUT must carry the copied object Content-Type, not a versions-symlink marker"
+        );
+    }
+
+    #[test]
+    fn test_put_x_copy_from_version_id_stripped_from_dest() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let app: NextFn = Arc::new(move |mut r: Request| {
+            let is_get = r.method == "GET";
+            r.body.materialize(u64::MAX).unwrap();
+            log2.lock().unwrap().push(r);
+            if is_get {
+                let mut resp = Response::with_body(200, b"payload".to_vec());
+                resp.headers.set("Content-Type", "text/jibberish01");
+                resp
+            } else {
+                Response::new(201)
+            }
+        });
+        let mut r = req(
+            "PUT",
+            "/v1/AUTH_test/dstc/dsto",
+            &[("X-Copy-From", "/srcc/srco")],
+        );
+        r.query_string = "version-id=1234567890.12345".to_string();
+        let resp = Copy::new().handle(r, &app);
+        assert_eq!(resp.status, 201);
+        let calls = log.lock().unwrap();
+        let source_get = calls.iter().find(|c| c.method == "GET").unwrap();
+        assert_eq!(source_get.query_string, "version-id=1234567890.12345");
+        let dest_put = calls.iter().find(|c| c.method == "PUT").unwrap();
+        assert_eq!(dest_put.query_string, "");
+        assert_eq!(dest_put.headers.get("Content-Type"), Some("text/jibberish01"));
+    }
+
 
     #[test]
     fn test_copy_method_keeps_percent_encoded_slash_in_object_name() {
