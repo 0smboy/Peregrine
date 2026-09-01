@@ -1517,7 +1517,13 @@ fn s3_to_swift_query(params: &[(String, String)], for_container_list: bool) -> S
             | "lifecycle"
             | "object-lock"
             | "legal-hold"
-            | "retention" => {}
+            | "retention"
+            | "response-cache-control"
+            | "response-content-disposition"
+            | "response-content-encoding"
+            | "response-content-language"
+            | "response-content-type"
+            | "response-expires" => {}
             _ => {}
         }
     }
@@ -6485,6 +6491,13 @@ fn s3_query_needs_legacy_dispatch(params: &[(String, String)]) -> bool {
         "key-marker",
         "version-id-marker",
         "max-directory-buckets",
+        // AWS GET/HEAD response header overrides (not unimplemented subresources).
+        "response-cache-control",
+        "response-content-disposition",
+        "response-content-encoding",
+        "response-content-language",
+        "response-content-type",
+        "response-expires",
     ];
     params.iter().any(|(k, _)| {
         if k.eq_ignore_ascii_case("AWSAccessKeyId")
@@ -13149,6 +13162,67 @@ mod tests {
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
         assert_eq!(body, "hello-get");
         assert_eq!(resp.headers.get("ETag"), Some("\"abc123\""));
+    }
+
+    #[test]
+    fn handle_s3_async_get_object_response_header_overrides() {
+        let api = S3Api::new(cred_map());
+        let cases = [
+            (
+                "response-content-type=text/plain",
+                "Content-Type",
+                "text/plain",
+            ),
+            ("response-content-language=en", "Content-Language", "en"),
+            ("response-cache-control=private", "Cache-Control", "private"),
+            (
+                "response-content-disposition=inline",
+                "Content-Disposition",
+                "inline",
+            ),
+            ("response-content-encoding=gzip", "Content-Encoding", "gzip"),
+            ("response-expires=0", "Expires", "0"),
+        ];
+        for (query, header, want) in cases {
+            let req = sign_request(base_s3_req("GET", "/mybucket/obj", query), "testing");
+            let q = query.to_string();
+            let next = async_ok(move |r| {
+                if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                    return Response::new(204);
+                }
+                assert_eq!(r.path, "/v1/AUTH_test/mybucket/obj", "{q}");
+                assert!(
+                    !r.query_string.contains("response-"),
+                    "response-* must not be forwarded to Swift ({q}): {}",
+                    r.query_string
+                );
+                let mut resp = Response::new(200);
+                resp.body = Body::from(b"hello-get".to_vec());
+                resp.headers.set("ETag", "abc123");
+                resp.headers.set("Content-Type", "application/octet-stream");
+                resp.headers.set("Content-Length", "9");
+                resp
+            });
+            let resp = block_on_s3(api.handle_s3_async(req, next));
+            assert_eq!(resp.status, 200, "{query} got {}", resp.status);
+            assert_ne!(resp.status, 501, "{query} must not 501");
+            assert_eq!(resp.headers.get(header), Some(want), "{query}");
+            assert_eq!(resp.headers.get("Accept-Ranges"), Some("bytes"), "{query}");
+        }
+    }
+
+    #[test]
+    fn handle_s3_async_unknown_query_still_501() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(
+            base_s3_req("GET", "/mybucket/obj", "not-a-real-subresource=1"),
+            "testing",
+        );
+        let next = async_ok(|_| panic!("unknown query must not reach Swift"));
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 501);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>NotImplemented</Code>"), "{body}");
     }
 
     #[test]
