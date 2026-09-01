@@ -357,7 +357,7 @@ pub fn check_sigv4_time(
                 }
                 Ok(expires) if expires > 604800 => {
                     return Err(SigAuthError::AuthorizationQueryParametersError(
-                        "X-Amz-Expires must be less than a week (in seconds);                          that is, the given X-Amz-Expires must be less than                          604800 seconds",
+                        "X-Amz-Expires must be less than a week (in seconds); that is, the given X-Amz-Expires must be less than 604800 seconds",
                     ));
                 }
                 Ok(expires) if signing_ts.saturating_add(expires) <= now_unix => {

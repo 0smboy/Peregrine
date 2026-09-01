@@ -2911,7 +2911,7 @@ impl Middleware for S3Api {
 
     fn handle_streaming_request(
         &self,
-        req: AsyncRequest,
+        mut req: AsyncRequest,
         next: StreamingAsyncNextFn,
     ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
         Box::pin(async move {
@@ -2924,6 +2924,19 @@ impl Middleware for S3Api {
                 body: Body::empty(),
             };
             if is_oversize_multi_delete(&head) {
+                // Dropping an unread Hyper body RSTs a still-writing client
+                // (official test_delete_multi_objects_error ~97 MiB → BrokenPipe).
+                // Discard chunks so the 400 MalformedXML can be read.
+                let mut seen = 0u64;
+                const DRAIN: u64 = 128 * 1024 * 1024;
+                while seen < DRAIN {
+                    match req.body.next_chunk().await {
+                        Ok(Some(chunk)) if !chunk.is_empty() => {
+                            seen = seen.saturating_add(chunk.len() as u64);
+                        }
+                        _ => break,
+                    }
+                }
                 return finish_s3_response(&method, oversize_multi_delete_response());
             }
             self.put_object_streaming(req, next).await
@@ -6655,6 +6668,76 @@ async fn body_bytes(body: Body) -> Result<Vec<u8>, Response> {
     })
 }
 
+/// Paginated `format=json` container listing. Drain via [`body_bytes`] so a
+/// Channel listing is not `into_vec`'d on the Tokio runtime (WouldBlock →
+/// empty ListVersions / ListMultipartUploads → official reset 409).
+async fn list_container_json_async(
+    cred: &S3Credential,
+    container: &str,
+    prefix: Option<&str>,
+    next: &AsyncNextFn,
+) -> Result<Vec<Value>, Response> {
+    let mut marker = String::new();
+    let mut out = Vec::new();
+    for _ in 0..256 {
+        let mut list = make_swift_req(
+            "GET",
+            &s3_to_swift_path(&cred.account, Some(container), None),
+        );
+        let mut qs = String::from("format=json");
+        if let Some(prefix) = prefix {
+            if !prefix.is_empty() {
+                qs.push_str("&prefix=");
+                qs.push_str(&encode_query(prefix));
+            }
+        }
+        if !marker.is_empty() {
+            qs.push_str("&marker=");
+            qs.push_str(&encode_query(&marker));
+        }
+        list.query_string = qs;
+        list.headers.set("Accept", "application/json");
+        stamp_auth(&mut list, cred);
+        let resp = async_call(next, list).await;
+        if resp.status == 404 {
+            return Ok(out);
+        }
+        if !(200..300).contains(&resp.status) {
+            return Err(map_swift_error(resp.status, Some(container), None));
+        }
+        let body = body_bytes(resp.body).await?;
+        let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Array(vec![]));
+        let Some(arr) = parsed.as_array() else {
+            break;
+        };
+        if arr.is_empty() {
+            break;
+        }
+        let mut last = None;
+        let mut added = 0usize;
+        for item in arr {
+            if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                // Swift listings are strictly after the marker. Skip repeats so a
+                // non-advancing mock/backend cannot duplicate rows.
+                if !marker.is_empty() && name <= marker.as_str() {
+                    continue;
+                }
+                last = Some(name.to_string());
+            }
+            out.push(item.clone());
+            added += 1;
+        }
+        if added == 0 {
+            break;
+        }
+        match last {
+            Some(name) if name != marker => marker = name,
+            _ => break,
+        }
+    }
+    Ok(out)
+}
+
 fn async_next_as_blocking(_next: AsyncNextFn) -> NextFn {
     Arc::new(move |_req| {
         Response::error(
@@ -7739,28 +7822,19 @@ async fn handle_mpu_abort_async(
         Err(resp) => return resp,
     }
     let prefix = format!("{key}/{upload_id}/");
-    let mut list = make_swift_req("GET", &s3_to_swift_path(&cred.account, Some(&segs), None));
-    list.query_string = format!("format=json&prefix={}", encode_query(&prefix));
-    list.headers.set("Accept", "application/json");
-    stamp_auth(&mut list, cred);
-    let listed = async_call(next, list).await;
-    if (200..300).contains(&listed.status) {
-        if let Ok(body) = body_bytes(listed.body).await {
-            let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Array(vec![]));
-            if let Some(arr) = parsed.as_array() {
-                for item in arr {
-                    let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
-                        continue;
-                    };
-                    let mut del_part = make_swift_req(
-                        "DELETE",
-                        &s3_to_swift_path(&cred.account, Some(&segs), Some(name)),
-                    );
-                    stamp_auth(&mut del_part, cred);
-                    let _ = async_call(next, del_part).await;
-                }
-            }
-        }
+    let items = list_container_json_async(cred, &segs, Some(&prefix), next)
+        .await
+        .unwrap_or_default();
+    for item in items {
+        let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let mut del_part = make_swift_req(
+            "DELETE",
+            &s3_to_swift_path(&cred.account, Some(&segs), Some(name)),
+        );
+        stamp_auth(&mut del_part, cred);
+        let _ = async_call(next, del_part).await;
     }
     let mut del = make_swift_req(
         "DELETE",
@@ -10344,7 +10418,11 @@ async fn handle_list_versions_async(
         .map(|(_, v)| v.as_str());
 
     let mut indexes = load_version_indexes_async(cred, bucket, next).await;
-    let current = list_current_objects_for_versions_async(cred, bucket, prefix, next).await;
+    let current = match list_current_objects_for_versions_async(cred, bucket, prefix, next).await
+    {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
     merge_unindexed_current_objects(&mut indexes, &current);
 
     if indexes.is_empty() {
@@ -10430,24 +10508,12 @@ fn handle_list_versions(
 
 async fn load_version_indexes_async(cred: &S3Credential, bucket: &str, next: &AsyncNextFn) -> Vec<VersionIndex> {
     let vc = versions_container(bucket);
-    let mut list = make_swift_req("GET", &s3_to_swift_path(&cred.account, Some(&vc), None));
-    list.query_string = "format=json".into();
-    list.headers.set("Accept", "application/json");
-    stamp_auth(&mut list, cred);
-    let resp = async_call(next, list).await;
-    if resp.status == 404 || !(200..300).contains(&resp.status) {
-        return Vec::new();
-    }
-    let body = match resp.body.into_vec(MAX_CONTROL_BODY) {
-        Ok(b) => b,
+    let items = match list_container_json_async(cred, &vc, None, next).await {
+        Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Array(vec![]));
     let mut indexes: Vec<VersionIndex> = Vec::new();
-    let Some(arr) = parsed.as_array() else {
-        return indexes;
-    };
-    for item in arr {
+    for item in items {
         let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
             continue;
         };
@@ -10463,7 +10529,9 @@ async fn load_version_indexes_async(cred: &S3Credential, bucket: &str, next: &As
         if !(200..300).contains(&g.status) {
             continue;
         }
-        let b = g.body.into_vec(MAX_CONTROL_BODY).unwrap_or_default();
+        let Ok(b) = body_bytes(g.body).await else {
+            continue;
+        };
         if let Some(idx) = VersionIndex::from_json(&b) {
             indexes.push(idx);
         }
@@ -10529,30 +10597,11 @@ async fn list_current_objects_for_versions_async(
     bucket: &str,
     prefix: &str,
     next: &AsyncNextFn,
-) -> Vec<(String, String, i64, String)> {
-    let mut list = make_swift_req("GET", &s3_to_swift_path(&cred.account, Some(bucket), None));
-    let mut qs = String::from("format=json");
-    if !prefix.is_empty() {
-        qs.push_str("&prefix=");
-        qs.push_str(&encode_query(prefix));
-    }
-    list.query_string = qs;
-    list.headers.set("Accept", "application/json");
-    stamp_auth(&mut list, cred);
-    let resp = async_call(next, list).await;
-    if !(200..300).contains(&resp.status) {
-        return Vec::new();
-    }
-    let body = match resp.body.into_vec(MAX_CONTROL_BODY) {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
-    };
-    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Array(vec![]));
+) -> Result<Vec<(String, String, i64, String)>, Response> {
+    let prefix_opt = if prefix.is_empty() { None } else { Some(prefix) };
+    let items = list_container_json_async(cred, bucket, prefix_opt, next).await?;
     let mut out = Vec::new();
-    let Some(arr) = parsed.as_array() else {
-        return out;
-    };
-    for item in arr {
+    for item in items {
         if item.get("subdir").is_some() {
             continue;
         }
@@ -10579,7 +10628,7 @@ async fn list_current_objects_for_versions_async(
             last_modified.to_string(),
         ));
     }
-    out
+    Ok(out)
 }
 
 
@@ -12509,71 +12558,42 @@ async fn handle_list_multipart_uploads_async(
         .clamp(1, 1000);
 
     let segs = segments_container(bucket);
-    let mut list = make_swift_req("GET", &s3_to_swift_path(&cred.account, Some(&segs), None));
-    let mut qs = String::from("format=json");
-    if !prefix.is_empty() {
-        qs.push_str(&format!("&prefix={}", encode_query(prefix)));
-    }
-    list.query_string = qs;
-    list.headers.set("Accept", "application/json");
-    stamp_auth(&mut list, cred);
-    let resp = async_call(next, list).await;
-    if resp.status == 404 {
-        return xml_response(
-            200,
-            list_multipart_uploads_xml(
-                bucket,
-                prefix,
-                key_marker,
-                upload_id_marker,
-                max_uploads,
-                false,
-                &[],
-                &owner_for(cred).id,
-            ),
-        );
-    }
-    if !(200..300).contains(&resp.status) {
-        return map_swift_error(resp.status, Some(bucket), None);
-    }
-    let body = match body_bytes(resp.body).await {
-        Ok(b) => b,
+    let prefix_opt = if prefix.is_empty() { None } else { Some(prefix) };
+    let items = match list_container_json_async(cred, &segs, prefix_opt, next).await {
+        Ok(v) => v,
         Err(resp) => return resp,
     };
-    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Array(vec![]));
     let mut uploads = Vec::new();
-    if let Some(arr) = parsed.as_array() {
-        for item in arr {
-            let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let Some((key, uid)) = parse_upload_marker_name(name) else {
-                continue;
-            };
-            if !prefix.is_empty() && !key.starts_with(prefix) {
-                continue;
-            }
-            if !key_marker.is_empty() {
-                if key.as_str() < key_marker {
-                    continue;
-                }
-                if key.as_str() == key_marker
-                    && !upload_id_marker.is_empty()
-                    && uid.as_str() <= upload_id_marker
-                {
-                    continue;
-                }
-            }
-            let lm = item
-                .get("last_modified")
-                .and_then(|v| v.as_str())
-                .unwrap_or("1970-01-01T00:00:00.000000");
-            uploads.push(ListedUpload {
-                key,
-                upload_id: uid,
-                initiated: swift_ts_to_s3(lm),
-            });
+    for item in items {
+        let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some((key, uid)) = parse_upload_marker_name(name) else {
+            continue;
+        };
+        if !prefix.is_empty() && !key.starts_with(prefix) {
+            continue;
         }
+        if !key_marker.is_empty() {
+            if key.as_str() < key_marker {
+                continue;
+            }
+            if key.as_str() == key_marker
+                && !upload_id_marker.is_empty()
+                && uid.as_str() <= upload_id_marker
+            {
+                continue;
+            }
+        }
+        let lm = item
+            .get("last_modified")
+            .and_then(|v| v.as_str())
+            .unwrap_or("1970-01-01T00:00:00.000000");
+        uploads.push(ListedUpload {
+            key,
+            upload_id: uid,
+            initiated: swift_ts_to_s3(lm),
+        });
     }
     uploads.sort_by(|a, b| (&a.key, &a.upload_id).cmp(&(&b.key, &b.upload_id)));
     let truncated = uploads.len() as u32 > max_uploads;
@@ -12621,49 +12641,17 @@ async fn handle_delete_bucket_async(
         return s3_error_response("BucketNotEmpty", None, &[]);
     }
     let segs = segments_container(bucket);
-    let mut marker = String::new();
-    loop {
-        let mut list = make_swift_req("GET", &s3_to_swift_path(&cred.account, Some(&segs), None));
-        let mut qs = String::from("format=json");
-        if !marker.is_empty() {
-            qs.push_str(&format!("&marker={}", encode_query(&marker)));
-        }
-        list.query_string = qs;
-        list.headers.set("Accept", "application/json");
-        stamp_auth(&mut list, cred);
-        let listed = async_call(next, list).await;
-        if listed.status == 404 {
-            break;
-        }
-        if !(200..300).contains(&listed.status) {
-            break;
-        }
-        let Ok(body) = body_bytes(listed.body).await else {
-            break;
-        };
-        let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Array(vec![]));
-        let Some(arr) = parsed.as_array() else {
-            break;
-        };
-        if arr.is_empty() {
-            break;
-        }
-        let mut last = None;
-        for item in arr {
+    if let Ok(items) = list_container_json_async(cred, &segs, None, next).await {
+        for item in items {
             let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
                 continue;
             };
-            last = Some(name.to_string());
             let mut del = make_swift_req(
                 "DELETE",
                 &s3_to_swift_path(&cred.account, Some(&segs), Some(name)),
             );
             stamp_auth(&mut del, cred);
             let _ = async_call(next, del).await;
-        }
-        match last {
-            Some(name) if name != marker => marker = name,
-            _ => break,
         }
     }
     let mut del_c = make_swift_req("DELETE", &s3_to_swift_path(&cred.account, Some(&segs), None));
@@ -14453,6 +14441,10 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("604800"), "{body}");
+        assert!(
+            body.contains("X-Amz-Expires must be less than 604800 seconds"),
+            "{body}"
+        );
     }
 
     #[test]
@@ -14587,6 +14579,195 @@ mod tests {
         });
         let resp = block_on_s3(api.handle_s3_async(req, next));
         assert_eq!(resp.status, 204);
+    }
+
+    #[test]
+    fn handle_s3_async_list_versions_unversioned_emits_null() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/mybucket", "versions"), "testing");
+        let next = async_ok(|r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            if r.method == "GET" && r.path == "/v1/AUTH_test/mybucket+versions" {
+                return Response::new(404);
+            }
+            assert_eq!(r.method, "GET");
+            assert_eq!(r.path, "/v1/AUTH_test/mybucket");
+            assert!(r.query_string.contains("format=json"), "{}", r.query_string);
+            if r.query_string.contains("marker=") {
+                let mut resp = Response::new(200);
+                resp.body = Body::from(b"[]".to_vec());
+                return resp;
+            }
+            let mut resp = Response::new(200);
+            resp.body = Body::from(
+                br#"[{"name":"obj1\u2603","hash":"abc","bytes":3,"last_modified":"2026-08-22T00:00:00.000000"},{"name":"foo","hash":"def","bytes":1,"last_modified":"2026-08-22T00:00:00.000000"}]"#
+                    .to_vec(),
+            );
+            resp
+        });
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("ListVersionsResult"), "{body}");
+        assert!(body.contains("<Key>foo</Key>"), "{body}");
+        assert!(body.contains("<Key>obj1\u{2603}</Key>"), "{body}");
+        assert!(body.contains("<VersionId>null</VersionId>"), "{body}");
+        assert!(!body.contains("ListBucketResult"), "{body}");
+        assert_eq!(body.matches("<Version>").count(), 2, "{body}");
+    }
+
+    #[test]
+    fn handle_s3_async_delete_null_version_unversioned_then_delete_bucket() {
+        let api = S3Api::new(cred_map());
+        let deleted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let deleted_c = deleted.clone();
+        let del = sign_request(
+            base_s3_req("DELETE", "/mybucket/foo", "versionId=null"),
+            "testing",
+        );
+        let next = async_ok(move |r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                let mut resp = Response::new(204);
+                resp.headers.set("X-Container-Object-Count", "1");
+                return resp;
+            }
+            if r.method == "DELETE" {
+                deleted_c.lock().unwrap().push(r.path.clone());
+                return Response::new(204);
+            }
+            Response::new(404)
+        });
+        let resp = block_on_s3(api.handle_s3_async(del, next));
+        assert_eq!(resp.status, 204, "delete null version");
+        assert!(
+            deleted.lock().unwrap().iter().any(|p| p == "/v1/AUTH_test/mybucket/foo"),
+            "unversioned DELETE ?versionId=null must DELETE the current object: {:?}",
+            deleted.lock().unwrap()
+        );
+
+        let deleted2 = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let deleted2c = deleted2.clone();
+        let req = sign_request(base_s3_req("DELETE", "/mybucket", ""), "testing");
+        let next = async_ok(move |r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                let mut resp = Response::new(204);
+                resp.headers.set("X-Container-Object-Count", "0");
+                return resp;
+            }
+            if r.method == "GET" && r.path == "/v1/AUTH_test/mybucket+segments" {
+                let mut resp = Response::new(200);
+                resp.body = Body::from(
+                    br#"[{"name":"obj1/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","hash":"x","bytes":6,"last_modified":"2026-08-22T00:00:00.000000"}]"#
+                        .to_vec(),
+                );
+                return resp;
+            }
+            if r.method == "DELETE" {
+                deleted2c.lock().unwrap().push(r.path.clone());
+                return Response::new(204);
+            }
+            panic!("unexpected {} {}", r.method, r.path);
+        });
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 204);
+        let got = deleted2.lock().unwrap().clone();
+        assert!(
+            got.iter().any(|p| p.contains("+segments/obj1/")),
+            "delete_bucket must wipe leftover MPU markers: {got:?}"
+        );
+        assert!(
+            got.iter().any(|p| p == "/v1/AUTH_test/mybucket+segments"),
+            "delete_bucket must DELETE +segments container: {got:?}"
+        );
+        assert!(
+            got.iter().any(|p| p == "/v1/AUTH_test/mybucket"),
+            "delete_bucket must DELETE the primary container: {got:?}"
+        );
+    }
+
+    #[test]
+    fn handle_s3_async_abort_deletes_marker_and_parts() {
+        let api = S3Api::new(cred_map());
+        let uid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let deleted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let deleted_c = deleted.clone();
+        let abort = sign_request(
+            base_s3_req("DELETE", "/mybucket/obj1", &format!("uploadId={uid}")),
+            "testing",
+        );
+        let next = async_ok(move |r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            if r.method == "HEAD" && r.path.contains("+segments") {
+                return Response::new(200);
+            }
+            if r.method == "GET" && r.path == "/v1/AUTH_test/mybucket+segments" {
+                let mut resp = Response::new(200);
+                resp.body = Body::from(
+                    format!(
+                        r#"[{{"name":"obj1/{uid}/00000001","hash":"p1","bytes":8,"last_modified":"2026-08-22T00:00:00.000000"}}]"#
+                    )
+                    .into_bytes(),
+                );
+                return resp;
+            }
+            if r.method == "DELETE" {
+                deleted_c.lock().unwrap().push(r.path.clone());
+                return Response::new(204);
+            }
+            panic!("unexpected {} {}", r.method, r.path);
+        });
+        let resp = block_on_s3(api.handle_s3_async(abort, next));
+        assert_eq!(resp.status, 204);
+        let got = deleted.lock().unwrap().clone();
+        assert!(
+            got.iter().any(|p| p.ends_with(&format!("/obj1/{uid}/00000001"))),
+            "abort must DELETE parts: {got:?}"
+        );
+        assert!(
+            got.iter().any(|p| p.ends_with(&format!("/obj1/{uid}")) && !p.contains("/00000001")),
+            "abort must DELETE the upload marker: {got:?}"
+        );
+    }
+
+    #[test]
+    fn handle_s3_async_list_multipart_paginates_past_parts() {
+        let api = S3Api::new(cred_map());
+        let req = sign_request(base_s3_req("GET", "/mybucket", "uploads"), "testing");
+        let pages = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pages_c = pages.clone();
+        let next = async_ok(move |r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            assert_eq!(r.path, "/v1/AUTH_test/mybucket+segments");
+            let n = pages_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut resp = Response::new(200);
+            if n == 0 {
+                resp.body = Body::from(
+                    br#"[{"name":"aaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/00000001","hash":"p","bytes":1,"last_modified":"2026-08-22T00:00:00.000000"}]"#
+                        .to_vec(),
+                );
+            } else if n == 1 {
+                resp.body = Body::from(
+                    br#"[{"name":"obj1/cccccccccccccccccccccccccccccccc","hash":"x","bytes":6,"last_modified":"2026-08-22T00:00:00.000000"}]"#
+                        .to_vec(),
+                );
+            } else {
+                resp.body = Body::from(b"[]".to_vec());
+            }
+            resp
+        });
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("ListMultipartUploadsResult"), "{body}");
+        assert!(body.contains("<Key>obj1</Key>"), "{body}");
+        assert!(body.contains("<UploadId>cccccccccccccccccccccccccccccccc</UploadId>"), "{body}");
+        assert!(pages.load(std::sync::atomic::Ordering::SeqCst) >= 2, "must page past leftover parts");
     }
 
     #[test]
