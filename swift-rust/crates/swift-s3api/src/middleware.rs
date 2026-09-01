@@ -8227,9 +8227,7 @@ async fn load_version_index_snapshot_async(
             .get("ETag")
             .map(vers_bare_etag)
             .filter(|s| !s.is_empty());
-        let body = resp.body.into_vec(MAX_CONTROL_BODY).map_err(|_| {
-            s3_error_response("InternalError", Some("version index is too large"), &[])
-        })?;
+        let body = body_bytes(resp.body).await?;
         let index = VersionIndex::from_json(&body)
             .filter(|index| index.key == key)
             .ok_or_else(|| {
@@ -8337,9 +8335,7 @@ async fn adopt_newer_generation_fences_async(
         if !(200..300).contains(&resp.status) {
             return Err(map_swift_error(resp.status, Some(&vc), Some(&fname)));
         }
-        let body = resp.body.into_vec(MAX_CONTROL_BODY).map_err(|_| {
-            s3_error_response("InternalError", Some("version index is too large"), &[])
-        })?;
+        let body = body_bytes(resp.body).await?;
         let index = VersionIndex::from_json(&body)
             .filter(|index| index.key == key && index.generation == next_gen)
             .ok_or_else(|| {
