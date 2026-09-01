@@ -1454,7 +1454,25 @@ impl VersionedWrites {
             .get("ETag")
             .map(|value| value.trim_matches('"').to_string())
             .unwrap_or_default();
-        let target_bytes = declared_length.unwrap_or_else(|| counter.load(Ordering::Relaxed));
+        // Python `_put_symlink_to_version`: marker TGT_BYTES is slo_size when
+        // the archived object is an SLO, not the manifest JSON length. Listing
+        // then uses symlink_bytes; SLO promotes slo_etag from hash params.
+        let slo_size = req
+            .headers
+            .get("X-Object-Sysmeta-Slo-Size")
+            .and_then(|value| value.parse::<u64>().ok());
+        let slo_etag = req
+            .headers
+            .get("X-Object-Sysmeta-Slo-Etag")
+            .map(|value| value.trim_matches('"').to_string())
+            .filter(|value| !value.is_empty());
+        let target_bytes = slo_size.unwrap_or_else(|| {
+            declared_length.unwrap_or_else(|| counter.load(Ordering::Relaxed))
+        });
+        let listing_etag = match slo_etag {
+            Some(slo) => format!("{target_etag}; slo_etag={slo}"),
+            None => target_etag.clone(),
+        };
         let content_type = req
             .headers
             .get("Content-Type")
@@ -1494,7 +1512,7 @@ impl VersionedWrites {
         marker_headers.set("X-Backend-Source", "OV");
         marker_headers.set("X-Backend-Allow-Reserved-Names", "true");
         marker_headers.set(SYSMETA_SYMLINK_TARGET, &quoted_target);
-        marker_headers.set(SYSMETA_SYMLINK_TARGET_ETAG, &target_etag);
+        marker_headers.set(SYSMETA_SYMLINK_TARGET_ETAG, &listing_etag);
         marker_headers.set(SYSMETA_SYMLINK_TARGET_BYTES, target_bytes.to_string());
         marker_headers.set(SYSMETA_OBJECT_VERSIONS_SYMLINK, "true");
         marker_headers.set(SYSMETA_SYMLOOP_EXTEND, "true");
@@ -1502,7 +1520,7 @@ impl VersionedWrites {
         marker_headers.set(
             SYSMETA_CONTAINER_UPDATE_OVERRIDE_ETAG,
             format!(
-                "{MD5_OF_EMPTY_STRING}; symlink_target={quoted_target}; symlink_target_etag={target_etag}; symlink_target_bytes={target_bytes}"
+                "{MD5_OF_EMPTY_STRING}; symlink_target={quoted_target}; symlink_target_etag={listing_etag}; symlink_target_bytes={target_bytes}"
             ),
         );
         let mut marker = next(AsyncRequest {
@@ -3001,6 +3019,25 @@ mod tests {
     }
 
     #[test]
+    fn test_query_without_param_keeps_symlink_get() {
+        assert_eq!(
+            query_without_param("version-id=1787766177.51067&symlink=get", "version-id"),
+            "symlink=get"
+        );
+        assert_eq!(
+            query_without_param("version-id=1787766177.51067", "version-id"),
+            ""
+        );
+        assert_eq!(
+            query_without_param(
+                "symlink=get&version-id=1.0&multipart-manifest=get",
+                "version-id"
+            ),
+            "symlink=get&multipart-manifest=get"
+        );
+    }
+
+    #[test]
     fn test_modern_post_target_is_origin_relative_and_version_container_scoped() {
         assert_eq!(
             validated_modern_post_target(
@@ -4375,6 +4412,115 @@ mod tests {
         assert!(
             !archive.2.contains("version-id="),
             "archive HEAD must drop version-id: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_modern_version_id_get_follows_archived_symlink_unless_symlink_get() {
+        // assert_previous_version GETs ?version-id= and expects the target
+        // body/type. info(version-id, symlink=get) must not follow.
+        // next() is symlink sitting after versioned_writes (18080 pipeline).
+        type Call = (String, String, String);
+        let calls: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = Arc::clone(&calls);
+        let next: StreamingAsyncNextFn = Arc::new(move |req: AsyncRequest| {
+            let calls = Arc::clone(&calls2);
+            Box::pin(async move {
+                calls.lock().unwrap().push((
+                    req.method.clone(),
+                    req.path.clone(),
+                    req.query_string.clone(),
+                ));
+                if req.headers.contains_key(AUTHORIZE_ONLY_HEADER) {
+                    return Response::new(204);
+                }
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(SYSMETA_OBJECT_VERSIONS_ENABLED, "True");
+                    resp.headers
+                        .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
+                    return resp;
+                }
+                if matches!(req.method.as_str(), "GET" | "HEAD")
+                    && req.path.starts_with("/v1/AUTH_test/\0versions\0c/")
+                {
+                    if query_param(&req.query_string, "symlink").as_deref() == Some("get") {
+                        let mut resp = Response::new(200);
+                        resp.headers.set("Content-Type", "application/symlink");
+                        resp.headers.set(SYSMETA_SYMLINK_TARGET, "c/tgt");
+                        return resp;
+                    }
+                    let mut resp = Response::with_body(200, b"target object data".to_vec());
+                    resp.headers.set("Content-Type", "text/jibberish01");
+                    return resp;
+                }
+                Response::new(404)
+            })
+        });
+
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let follow = AsyncRequest {
+            method: "GET".to_string(),
+            path: "/v1/AUTH_test/c/symlink".to_string(),
+            query_string: "version-id=1787766177.51067".to_string(),
+            headers: HeaderKeyDict::new(),
+            body: IncomingBody::from_bytes(Vec::new(), 1024),
+        };
+        let mut followed = vw
+            .handle_streaming_request(follow, Arc::clone(&next))
+            .await;
+        assert_eq!(
+            followed.status,
+            200,
+            "follow GET: {:?}",
+            calls.lock().unwrap()
+        );
+        assert_eq!(
+            followed.headers.get("Content-Type"),
+            Some("text/jibberish01")
+        );
+        assert_eq!(
+            followed.body.materialize(1024).unwrap().as_ref(),
+            b"target object data"
+        );
+
+        let no_follow = AsyncRequest {
+            method: "GET".to_string(),
+            path: "/v1/AUTH_test/c/symlink".to_string(),
+            query_string: "version-id=1787766177.51067&symlink=get".to_string(),
+            headers: HeaderKeyDict::new(),
+            body: IncomingBody::from_bytes(Vec::new(), 1024),
+        };
+        let mut link = vw.handle_streaming_request(no_follow, next).await;
+        assert_eq!(
+            link.status,
+            200,
+            "symlink=get GET: {:?}",
+            calls.lock().unwrap()
+        );
+        assert_eq!(
+            link.headers.get("Content-Type"),
+            Some("application/symlink"),
+            "GET ?version-id=&symlink=get must return the archived user-symlink"
+        );
+        assert_eq!(link.body.materialize(1024).unwrap().as_ref(), b"");
+
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|(method, path, qs)| {
+                method == "GET"
+                    && path.starts_with("/v1/AUTH_test/\0versions\0c/")
+                    && !qs.contains("symlink=get")
+            }),
+            "follow archive GET missing: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|(method, path, qs)| {
+                method == "GET"
+                    && path.starts_with("/v1/AUTH_test/\0versions\0c/")
+                    && qs.contains("symlink=get")
+            }),
+            "symlink=get archive GET missing: {calls:?}"
         );
     }
 
