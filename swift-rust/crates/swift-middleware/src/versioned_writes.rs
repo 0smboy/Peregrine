@@ -205,15 +205,18 @@ fn apply_version_symlink_listing(
         .and_then(|value| value.as_str())
         .map(listing_hash_params)
         .unwrap_or_default();
+    let slo_param = leftover.split(';').map(str::trim).find_map(|part| {
+        part.strip_prefix("slo_etag=")
+            .map(|value| value.to_string())
+    });
     if let Some(etag) = map.remove("symlink_etag") {
         let etag = match etag {
             serde_json::Value::String(value) => value,
             other => other.to_string(),
         };
-        let hash = if leftover.is_empty() {
-            etag
-        } else {
-            format!("{etag}; {leftover}")
+        let hash = match slo_param {
+            Some(slo) => format!("{etag}; slo_etag={slo}"),
+            None => etag,
         };
         map.insert("hash".to_string(), serde_json::Value::String(hash));
     }
@@ -1490,6 +1493,9 @@ impl VersionedWrites {
         archive_headers.set("X-Timestamp", put_timestamp.internal());
         archive_headers.set("X-Backend-Authorize-Override", "true");
         archive_headers.set("X-Backend-Allow-Reserved-Names", "true");
+        // Re-storing an already-created user-symlink (COPY dest / copy-current)
+        // must not re-HEAD-validate X-Symlink-Target-Etag (412).
+        archive_headers.set("X-Backend-Symlink-Override", "true");
         if let Some(length) = declared_length {
             archive_headers.set("Content-Length", length.to_string());
             archive_headers.remove("Transfer-Encoding");
@@ -1535,7 +1541,6 @@ impl VersionedWrites {
         // (apply_version_symlink_listing), not TGT_ETAG. Stuffing slo_etag
         // into TGT_ETAG 409s symlink follow (archive ETag is manifest md5).
         let listing_etag = target_etag.clone();
-        let _ = slo_etag;
         let content_type = req
             .headers
             .get("Content-Type")
@@ -1583,12 +1588,13 @@ impl VersionedWrites {
         marker_headers.set(SYSMETA_OBJECT_VERSIONS_SYMLINK, "true");
         marker_headers.set(SYSMETA_SYMLOOP_EXTEND, "true");
         marker_headers.set(SYSMETA_ALLOW_RESERVED_NAMES, "true");
-        marker_headers.set(
-            SYSMETA_CONTAINER_UPDATE_OVERRIDE_ETAG,
-            format!(
-                "{MD5_OF_EMPTY_STRING}; symlink_target={quoted_target}; symlink_target_etag={listing_etag}; symlink_target_bytes={target_bytes}"
-            ),
+        let mut override_etag = format!(
+            "{MD5_OF_EMPTY_STRING}; symlink_target={quoted_target}; symlink_target_etag={listing_etag}; symlink_target_bytes={target_bytes}"
         );
+        if let Some(slo) = slo_etag.as_deref() {
+            override_etag.push_str(&format!("; slo_etag={slo}"));
+        }
+        marker_headers.set(SYSMETA_CONTAINER_UPDATE_OVERRIDE_ETAG, override_etag);
         let mut marker = next(AsyncRequest {
             method: "PUT".to_string(),
             path: req.path,
