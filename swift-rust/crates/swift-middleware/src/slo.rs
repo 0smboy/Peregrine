@@ -540,6 +540,32 @@ fn first_segment_failure(status: u16) -> Response {
     }
 }
 
+async fn collect_ranged_leaves_async(
+    orig: Request,
+    version: String,
+    account: String,
+    leaves: Vec<LeafSeg>,
+    next: crate::AsyncNextFn,
+) -> Result<Vec<u8>, Response> {
+    let mut out = Vec::new();
+    for leaf in leaves {
+        if let Some(raw) = leaf.raw_data {
+            out.extend_from_slice(&raw);
+            continue;
+        }
+        let path = format!("/{version}/{account}{}", leaf.name);
+        let response = next(slo_subreq(&orig, path, leaf.range.as_deref())).await;
+        if !(200..300).contains(&response.status) {
+            return Err(first_segment_failure(response.status));
+        }
+        match response.body.collect_async().await {
+            Ok(bytes) => out.extend(bytes),
+            Err(_) => return Err(Response::error(500, "Error reading SLO segment")),
+        }
+    }
+    Ok(out)
+}
+
 /// Fetch the first object-backed leaf before the client response is
 /// committed. Python Swift's `SegmentedIterable::validate_first_segment`
 /// does the same: a missing first segment is a visible 409, while a failure
@@ -1437,12 +1463,11 @@ impl Slo {
             );
             let len = (last_excl - first) as i64;
             let body = if is_get {
-                let first_response = match prefetch_first_leaf(
-                    &orig, &version, &account, &ranged, next,
-                ) {
-                    Ok(response) => response,
-                    Err(error) => return error,
-                };
+                let first_response =
+                    match prefetch_first_leaf(&orig, &version, &account, &ranged, next) {
+                        Ok(response) => response,
+                        Err(error) => return error,
+                    };
                 Self::leaf_stream_body(
                     orig.clone_head(),
                     version.clone(),
@@ -1469,12 +1494,11 @@ impl Slo {
                         Ok(l) => l,
                         Err(err) => return err,
                     };
-                    let first_response = match prefetch_first_leaf(
-                        &orig, &version, &account, &ranged, next,
-                    ) {
-                        Ok(response) => response,
-                        Err(error) => return error,
-                    };
+                    let first_response =
+                        match prefetch_first_leaf(&orig, &version, &account, &ranged, next) {
+                            Ok(response) => response,
+                            Err(error) => return error,
+                        };
                     let mut b = Self::leaf_stream_body(
                         orig.clone_head(),
                         version.clone(),
@@ -1484,11 +1508,10 @@ impl Slo {
                         first_response,
                         last_excl - first,
                     );
-                    pieces.push(
-                        b.materialize(u64::MAX)
-                            .map(|s| s.to_vec())
-                            .unwrap_or_default(),
-                    );
+                    pieces.push(match b.materialize(u64::MAX) {
+                        Ok(bytes) => bytes.to_vec(),
+                        Err(_) => return Response::error(500, "Error reading SLO segment"),
+                    });
                 }
             }
             let mp =
@@ -1497,11 +1520,11 @@ impl Slo {
             let len = mp.len() as i64;
             (206u16, mp.into(), len)
         } else if is_get {
-            let first_response =
-                match prefetch_first_leaf(&orig, &version, &account, &leaves, next) {
-                    Ok(response) => response,
-                    Err(error) => return error,
-                };
+            let first_response = match prefetch_first_leaf(&orig, &version, &account, &leaves, next)
+            {
+                Ok(response) => response,
+                Err(error) => return error,
+            };
             let body = Self::leaf_stream_body(
                 orig.clone_head(),
                 version.clone(),
@@ -1770,32 +1793,21 @@ impl Slo {
                         Ok(l) => l,
                         Err(err) => return err,
                     };
-                    let first_response = match prefetch_first_leaf_async(
-                        orig.clone_head(),
-                        version.clone(),
-                        account.clone(),
-                        ranged.first().cloned(),
-                        next.clone(),
-                    )
-                    .await
-                    {
-                        Ok(response) => response,
-                        Err(error) => return error,
-                    };
-                    let mut b = leaf_stream_channel(
+                    // Channel bodies cannot use materialize() on a Tokio
+                    // worker (WouldBlock → empty parts). Drain with collect_async.
+                    let piece = match collect_ranged_leaves_async(
                         orig.clone_head(),
                         version.clone(),
                         account.clone(),
                         ranged,
                         next.clone(),
-                        first_response,
-                        last_excl - first,
-                    );
-                    pieces.push(
-                        b.materialize(u64::MAX)
-                            .map(|s| s.to_vec())
-                            .unwrap_or_default(),
-                    );
+                    )
+                    .await
+                    {
+                        Ok(bytes) => bytes,
+                        Err(error) => return error,
+                    };
+                    pieces.push(piece);
                 }
             }
             let mp =
@@ -2468,9 +2480,7 @@ impl Slo {
         enqueue
             .headers
             .set("X-Backend-Allow-Reserved-Names", "true");
-        enqueue
-            .headers
-            .set("X-Backend-Authorize-Override", "true");
+        enqueue.headers.set("X-Backend-Authorize-Override", "true");
         enqueue.body = jobs_body.into();
         let enq_path = enqueue.path.clone();
         let enq_resp = next(enqueue).await;
@@ -2655,9 +2665,7 @@ impl Slo {
         enqueue
             .headers
             .set("X-Backend-Allow-Reserved-Names", "true");
-        enqueue
-            .headers
-            .set("X-Backend-Authorize-Override", "true");
+        enqueue.headers.set("X-Backend-Authorize-Override", "true");
         enqueue.body = jobs_body.into();
         let enq_resp = next(enqueue);
         if !(200..300).contains(&enq_resp.status) {
@@ -3497,27 +3505,11 @@ async fn probe_async_delete_write_acl_async(
             None
         }
     }
-    if let Some(r) = probe_one(
-        next,
-        req.clone_head(),
-        version,
-        account,
-        manifest_container,
-    )
-    .await
-    {
+    if let Some(r) = probe_one(next, req.clone_head(), version, account, manifest_container).await {
         return Some(r);
     }
     if segment_container != manifest_container {
-        if let Some(r) = probe_one(
-            next,
-            req,
-            version,
-            account,
-            segment_container,
-        )
-        .await
-        {
+        if let Some(r) = probe_one(next, req, version, account, segment_container).await {
             return Some(r);
         }
     }
@@ -3917,6 +3909,75 @@ mod tests {
             .await;
 
         assert_eq!(resp.status, 409);
+    }
+
+    #[test]
+    fn test_slo_multi_range_get_assembles_nonempty_parts() {
+        // Functional test_slo_multi_ranged_get: two ranges across segments.
+        // "onetwo" bytes=0-2,3-5 -> "one" and "two".
+        let be = slo_manifest_backend();
+        let mut resp = Slo::new().handle(slo_get("/v1/a/c/manifest", Some("bytes=0-2,3-5")), &be);
+        assert_eq!(resp.status, 206);
+        let ctype = resp.headers.get("Content-Type").unwrap_or("");
+        assert!(
+            ctype.starts_with("multipart/byteranges"),
+            "content-type={ctype:?}"
+        );
+        let body = body_of(&mut resp);
+        assert!(
+            body.windows(3).any(|w| w == b"one"),
+            "missing first range payload: {body:?}"
+        );
+        assert!(
+            body.windows(3).any(|w| w == b"two"),
+            "missing second range payload: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slo_async_multi_range_get_does_not_drop_channel_body() {
+        // Hyper path used materialize() on Body::Channel, which returns
+        // WouldBlock on a Tokio worker; unwrap_or_default made empty parts.
+        let sync = slo_manifest_backend();
+        let next: crate::AsyncNextFn = Arc::new(move |request| {
+            let sync = Arc::clone(&sync);
+            Box::pin(async move { sync(request) })
+        });
+        let resp = Slo::new()
+            .reassemble_async(slo_get("/v1/a/c/manifest", Some("bytes=0-2,3-5")), next)
+            .await;
+        assert_eq!(resp.status, 206);
+        let ctype = resp.headers.get("Content-Type").unwrap_or("");
+        assert!(
+            ctype.starts_with("multipart/byteranges"),
+            "content-type={ctype:?}"
+        );
+        let body = match resp.body.collect_async().await {
+            Ok(bytes) => bytes,
+            Err(err) => panic!("collect_async failed: {err}"),
+        };
+        assert!(
+            body.windows(3).any(|w| w == b"one"),
+            "empty/missing first range: {body:?}"
+        );
+        assert!(
+            body.windows(3).any(|w| w == b"two"),
+            "empty/missing second range: {body:?}"
+        );
+    }
+
+    #[test]
+    fn test_slo_part_number_with_version_id_query_is_not_400() {
+        // parse_part_number must ignore sibling query params. A 400 on
+        // GET/HEAD ?part-number=&version-id= is versioned_writes, not SLO.
+        let be = slo_manifest_backend();
+        let mut req = slo_get("/v1/a/c/manifest", None);
+        req.query_string = "part-number=1&version-id=1787766177.51067".into();
+        let mut resp = Slo::new().handle(req, &be);
+        assert_eq!(resp.status, 206, "SLO itself must not 400 this query");
+        assert_eq!(body_of(&mut resp), b"one");
+        assert_eq!(resp.headers.get("X-Parts-Count"), Some("2"));
+        assert_eq!(resp.headers.get("Content-Range"), Some("bytes 0-2/6"));
     }
 
     #[test]
