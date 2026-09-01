@@ -8701,7 +8701,9 @@ async fn archive_current_version_async(
         put.headers.set(SYS_DELETE_MARKER, "false");
     }
     put.headers.set("If-None-Match", "*");
-    put.body = got.body;
+    let data = body_bytes(got.body).await?;
+    put.headers.set("Content-Length", data.len().to_string());
+    put.body = Body::from(data);
     stamp_auth(&mut put, cred);
     let stored = async_call(next, put).await;
     // 412 on If-None-Match:* means a prior attempt already archived this
@@ -8907,7 +8909,9 @@ async fn promote_archived_version_async(
     copy_version_payload_headers(&archived.headers, &mut put.headers);
     put.headers.set(SYS_VERSION_ID, version_id);
     put.headers.set(SYS_OBJECT_KEY, key);
-    put.body = archived.body;
+    let data = body_bytes(archived.body).await?;
+    put.headers.set("Content-Length", data.len().to_string());
+    put.body = Body::from(data);
     stamp_auth(&mut put, cred);
     let stored = async_call(next, put).await;
     if !swift_write_applied(stored.status) {
