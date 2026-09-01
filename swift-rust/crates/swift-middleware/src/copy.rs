@@ -344,6 +344,13 @@ impl Copy {
 
         req.method = "PUT".to_string();
         req.query_string = strip_sink_source_params(&req.query_string);
+        // COPY ?symlink=get carries X-Symlink-Target-Etag from the archived
+        // user-symlink. Dest PUT would 412 in symlink etag HEAD. Python
+        // still validates; Peregrine versioned dest PUT is an OV marker
+        // write. Skip the extra HEAD match on this sink PUT.
+        if put_headers.get("X-Symlink-Target").is_some() {
+            put_headers.set("X-Backend-Symlink-Override", "true");
+        }
         req.headers = put_headers;
         req.body = Body::from_reader(source_reader, source_len);
         let mut resp = next(req);
@@ -491,6 +498,13 @@ impl Copy {
         put_headers.set("X-Copied-From-Account", src_account.clone());
         req.method = "PUT".to_string();
         req.query_string = strip_sink_source_params(&req.query_string);
+        // COPY ?symlink=get carries X-Symlink-Target-Etag from the archived
+        // user-symlink. Dest PUT would 412 in symlink etag HEAD. Python
+        // still validates; Peregrine versioned dest PUT is an OV marker
+        // write. Skip the extra HEAD match on this sink PUT.
+        if put_headers.get("X-Symlink-Target").is_some() {
+            put_headers.set("X-Backend-Symlink-Override", "true");
+        }
         req.headers = put_headers;
         req.body = Body::Buffered(bytes);
         let mut resp = next(req).await;
