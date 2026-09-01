@@ -33,8 +33,10 @@
 //!   q-value negotiation and its `406 Not Acceptable` / `400 Invalid Accept
 //!   header` error responses are not reproduced.
 //! - The `swift.format_listing` opt-out env flag and the WSGI
-//!   `call_application` plumbing have no analog in this buffered pipeline;
-//!   the filter always formats.
+//!   `call_application` plumbing have no analog in this buffered pipeline.
+//!   Python `object_versioning._list_versions` sets that flag so `?versions`
+//!   listings stay JSON; this filter skips reformatting when the `versions`
+//!   query param is present (same client-visible contract).
 //! - `filter_reserved` still drops entries carrying the reserved byte but
 //!   does not emit the warning log lines (the pipeline has no logger).
 //! - The oversize guard measures the buffered response body rather than the
@@ -133,6 +135,10 @@ impl Middleware for ListingFormats {
         let params = req.params();
         let can_vary = req.headers.get(LISTING_CAN_VARY).is_some()
             || !params.iter().any(|(k, _)| k == "format");
+        // Python object_versioning._list_versions sets
+        // `swift.format_listing = False` so `?versions` stays JSON.
+        let skip_format_listing =
+            cont.is_some() && params.iter().any(|(k, _)| k == "versions");
         let allow_reserved = req
             .headers
             .get("X-Backend-Allow-Reserved-Names")
@@ -140,6 +146,10 @@ impl Middleware for ListingFormats {
         req.query_string = force_format_json(&params);
 
         let mut resp = next(req);
+
+        if skip_format_listing {
+            return resp;
+        }
 
         // 200/204 only; anything else passes through untouched.
         if resp.status != 200 && resp.status != 204 {
@@ -1189,6 +1199,40 @@ mod tests {
         assert_eq!(
             resp.headers.get("X-Seen-Query"),
             Some("prefix=a%2Fb&limit=5&format=json")
+        );
+    }
+
+    #[test]
+    fn test_versions_query_stays_json_without_format() {
+        // Python object_versioning._list_versions opts listing_formats out.
+        // GET ?versions (no format=) must remain application/json, not names+\n.
+        let body = br#"[{"bytes": 5, "content_type": "text/plain", "hash": "h", "is_latest": true, "last_modified": "2026-09-01T00:00:00.000000", "name": "obj1", "version_id": "1788248172.69139"}]"#;
+        for query in ["versions", "versions=None", "versions="] {
+            let resp = call(req("GET", "/v1/a/c", query), {
+                let body = body;
+                move |_| json_backend(body)
+            });
+            assert_eq!(resp.status, 200, "query={query}");
+            assert_eq!(body_bytes(&resp), body, "query={query}");
+            let ct = resp.headers.get("Content-Type").unwrap_or("");
+            assert!(
+                ct.starts_with("application/json"),
+                "query={query} content-type={ct:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_versions_empty_listing_stays_json_array() {
+        // Empty text listings collapse to 204; versions listings must stay `[]`.
+        let resp = call(req("GET", "/v1/a/c", "versions"), move |_| {
+            json_backend(b"[]")
+        });
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_bytes(&resp), b"[]");
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("application/json; charset=utf-8")
         );
     }
 
