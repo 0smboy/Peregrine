@@ -7864,6 +7864,20 @@ async fn handle_mpu_part_async(
         )
         .await;
     }
+    // Python MultipartController.PUT: a missing user bucket is NoSuchBucket,
+    // not NoSuchKey from a 404 on `{bucket}+segments`.
+    let mut bucket_head = make_swift_req(
+        "HEAD",
+        &s3_to_swift_path(&cred.account, Some(bucket), None),
+    );
+    stamp_auth(&mut bucket_head, cred);
+    let bucket_resp = async_call(next, bucket_head).await;
+    if bucket_resp.status == 404 {
+        return s3_error_response("NoSuchBucket", None, &[("BucketName", bucket)]);
+    }
+    if !(200..300).contains(&bucket_resp.status) {
+        return map_swift_error(bucket_resp.status, Some(bucket), None);
+    }
     let segs = segments_container(bucket);
     let part_name = part_object_name(key, upload_id, part_number);
     let mut put = req;
@@ -7929,6 +7943,18 @@ async fn handle_mpu_part_copy_async(
                 ],
             );
         }
+    }
+    let mut dest_head = make_swift_req(
+        "HEAD",
+        &s3_to_swift_path(&cred.account, Some(bucket), None),
+    );
+    stamp_auth(&mut dest_head, cred);
+    let dest_resp = async_call(next, dest_head).await;
+    if dest_resp.status == 404 {
+        return s3_error_response("NoSuchBucket", None, &[("BucketName", bucket)]);
+    }
+    if !(200..300).contains(&dest_resp.status) {
+        return map_swift_error(dest_resp.status, Some(bucket), None);
     }
     let segs = segments_container(bucket);
     let part_name = part_object_name(key, upload_id, part_number);
@@ -13738,6 +13764,45 @@ mod tests {
             body.contains("The requested resource is not implemented"),
             "{body}"
         );
+    }
+
+    #[test]
+    fn handle_s3_async_upload_part_missing_bucket_is_nosuchbucket() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/nothing/obj", "partNumber=1&uploadId=uid1");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        let req = sign_request(req, "testing");
+        let next = async_ok(|r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/nothing" {
+                return Response::new(404);
+            }
+            panic!("missing bucket must not PUT segments: {} {}", r.method, r.path);
+        });
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 404);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>NoSuchBucket</Code>"), "{body}");
+        assert!(!body.contains("<Code>NoSuchKey</Code>"), "{body}");
+    }
+
+    #[test]
+    fn handle_s3_async_upload_part_copy_missing_bucket_is_nosuchbucket() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/nothing/obj", "partNumber=1&uploadId=uid1");
+        req.headers.set("X-Amz-Copy-Source", "/src/src");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        let req = sign_request(req, "testing");
+        let next = async_ok(|r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/nothing" {
+                return Response::new(404);
+            }
+            panic!("missing dest bucket must not copy part: {} {}", r.method, r.path);
+        });
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 404);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>NoSuchBucket</Code>"), "{body}");
+        assert!(!body.contains("<Code>NoSuchKey</Code>"), "{body}");
     }
 
     #[test]
