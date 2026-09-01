@@ -1093,6 +1093,11 @@ impl VersionedWrites {
         ] {
             marker_headers.remove(name);
         }
+        // Python `_put_symlink_to_version` overwrites X-Symlink-Target with the
+        // hidden archive path and pops X-Symlink-Target-Account. Do not pop
+        // client X-Symlink-Target-Etag (static user-symlinks still HEAD-validate).
+        marker_headers.remove("X-Symlink-Target-Account");
+        marker_headers.set("X-Symlink-Target", &quoted_target);
         marker_headers.set("Content-Length", "0");
         marker_headers.set("Content-Type", content_type);
         marker_headers.set("X-Timestamp", marker_timestamp.internal());
@@ -2951,6 +2956,105 @@ mod tests {
             .3
             .get(SYSMETA_SYMLINK_TARGET)
             .is_some_and(|value| value.starts_with("%00versions%00c/%00o%00")));
+    }
+
+    #[tokio::test]
+    async fn test_modern_streaming_put_overwrites_client_symlink_target_on_marker() {
+        type Call = (String, String, String, HeaderKeyDict, Vec<u8>);
+        let calls: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = Arc::clone(&calls);
+        let next: StreamingAsyncNextFn = Arc::new(move |mut req: AsyncRequest| {
+            let calls = Arc::clone(&calls2);
+            Box::pin(async move {
+                let body = req.body.materialize(u64::MAX).await.unwrap();
+                calls.lock().unwrap().push((
+                    req.method.clone(),
+                    req.path.clone(),
+                    req.query_string.clone(),
+                    req.headers.clone(),
+                    body,
+                ));
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(SYSMETA_OBJECT_VERSIONS_ENABLED, "True");
+                    resp.headers
+                        .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
+                    return resp;
+                }
+                if req.method == "PUT"
+                    && req.path == "/v1/AUTH_test/c/o"
+                    && req.headers.contains_key(AUTHORIZE_ONLY_HEADER)
+                {
+                    return Response::new(204);
+                }
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/\0versions\0c" {
+                    return Response::new(204);
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_test/c/o" {
+                    return Response::new(404);
+                }
+                if req.method == "PUT" && req.path.starts_with("/v1/AUTH_test/\0versions\0c/\0o\0")
+                {
+                    let mut resp = Response::new(201);
+                    resp.headers.set("ETag", "d41d8cd98f00b204e9800998ecf8427e");
+                    return resp;
+                }
+                Response::new(201)
+            })
+        });
+
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Length", "0");
+        headers.set("Content-Type", "application/octet-stream");
+        headers.set("X-Timestamp", "1787770000.00000");
+        headers.set("X-Symlink-Target", "c/tgt");
+        headers.set("X-Symlink-Target-Account", "other");
+        headers.set("X-Symlink-Target-Etag", "abc123");
+        let req = AsyncRequest {
+            method: "PUT".to_string(),
+            path: "/v1/AUTH_test/c/o".to_string(),
+            query_string: String::new(),
+            headers,
+            body: IncomingBody::from_bytes(Vec::new(), 1024),
+        };
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let resp = vw.handle_streaming_request(req, next).await;
+        assert_eq!(resp.status, 201);
+
+        let calls = calls.lock().unwrap();
+        let archive = calls
+            .iter()
+            .find(|(method, path, _, _, _)| {
+                method == "PUT" && path.starts_with("/v1/AUTH_test/\0versions\0c/\0o\0")
+            })
+            .expect("hidden version PUT");
+        assert_eq!(archive.3.get("X-Symlink-Target"), Some("c/tgt"));
+        let marker = calls
+            .iter()
+            .find(|(method, path, _, headers, _)| {
+                method == "PUT"
+                    && path == "/v1/AUTH_test/c/o"
+                    && headers.contains_key(SYSMETA_OBJECT_VERSIONS_SYMLINK)
+            })
+            .expect("primary symlink PUT");
+        assert_eq!(marker.4, b"");
+        assert!(
+            marker
+                .3
+                .get("X-Symlink-Target")
+                .is_some_and(|value| value.starts_with("%00versions%00c/%00o%00")),
+            "marker X-Symlink-Target={:?}",
+            marker.3.get("X-Symlink-Target")
+        );
+        assert_ne!(marker.3.get("X-Symlink-Target"), Some("c/tgt"));
+        assert!(marker.3.get("X-Symlink-Target-Account").is_none());
+        assert_eq!(marker.3.get("X-Symlink-Target-Etag"), Some("abc123"));
+        assert!(marker
+            .3
+            .get(SYSMETA_SYMLINK_TARGET)
+            .is_some_and(|value| value.starts_with("%00versions%00c/%00o%00")));
+        assert_eq!(marker.3.get(SYSMETA_SYMLOOP_EXTEND), Some("true"));
+        assert_eq!(marker.3.get(SYSMETA_ALLOW_RESERVED_NAMES), Some("true"));
     }
 
     #[tokio::test]
