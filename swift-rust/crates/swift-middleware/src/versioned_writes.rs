@@ -937,6 +937,76 @@ impl VersionedWrites {
         Ok(())
     }
 
+    /// Legacy `X-Versions-Location` / `X-History-Location` copy-current.
+    ///
+    /// Python `_copy_current` skips the archive PUT when GET current is 404
+    /// (first write). Modern `X-Versions-Enabled` still archives the first
+    /// PUT into the hidden `%00versions%00` container; this helper must not
+    /// be used for that path.
+    async fn copy_current_legacy_streaming(
+        &self,
+        version: &str,
+        account: &str,
+        object: &str,
+        versions_cont: &str,
+        original_path: &str,
+        source_headers: &swift_http::HeaderKeyDict,
+        next: &StreamingAsyncNextFn,
+    ) -> Result<(), Response> {
+        let mut get = Self::modern_internal_request(
+            "GET",
+            original_path.to_string(),
+            "symlink=get",
+            source_headers,
+        );
+        get.headers.set("X-Newest", "True");
+        get.headers.set("X-Backend-Source", "VW");
+        let current = next(empty_async_request(get)).await;
+        if current.status == 404 {
+            return Ok(());
+        }
+        if !(200..300).contains(&current.status) {
+            return Err(current);
+        }
+        let ts_source = current
+            .headers
+            .get("X-Timestamp")
+            .or_else(|| current.headers.get("X-Backend-Timestamp"))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "0".to_string());
+        let Some(vers_name) = versions_object_name(object, &ts_source) else {
+            return Ok(());
+        };
+        let content_length = current
+            .headers
+            .get("Content-Length")
+            .and_then(|value| value.parse::<u64>().ok())
+            .or_else(|| current.body.content_length());
+        let max_body = content_length.unwrap_or(u64::MAX);
+        let body = response_body_as_incoming(current.body, max_body)?;
+        let mut archive_headers = current.headers;
+        archive_headers.remove("X-Timestamp");
+        archive_headers.remove("X-Backend-Timestamp");
+        archive_headers.remove("Transfer-Encoding");
+        archive_headers.set("X-Backend-Authorize-Override", "true");
+        archive_headers.set("X-Backend-Source", "VW");
+        if let Some(length) = content_length {
+            archive_headers.set("Content-Length", length.to_string());
+        }
+        let copied = next(AsyncRequest {
+            method: "PUT".to_string(),
+            path: format!("/{version}/{account}/{versions_cont}/{vers_name}"),
+            query_string: String::new(),
+            headers: archive_headers,
+            body,
+        })
+        .await;
+        if !(200..300).contains(&copied.status) {
+            return Err(copied);
+        }
+        Ok(())
+    }
+
     async fn handle_modern_put_streaming(
         &self,
         req: AsyncRequest,
@@ -964,6 +1034,25 @@ impl VersionedWrites {
             .filter(|value| !value.is_empty())
             .map(decoded_header_path);
         if !modern_enabled(&cinfo.headers) || configured.is_none() {
+            // Hyper never calls sync `handle_put`. Legacy stack/history
+            // copy-current has to run here. First PUT: GET current 404
+            // → pass through, do not archive.
+            if let Some(cfg) = self.read_version_cfg(&cinfo) {
+                if let Err(resp) = self
+                    .copy_current_legacy_streaming(
+                        &version,
+                        &account,
+                        &object,
+                        &cfg.location,
+                        &req.path,
+                        &req.headers,
+                        &next,
+                    )
+                    .await
+                {
+                    return resp;
+                }
+            }
             return next(req).await;
         }
         let hidden = configured.unwrap();
@@ -2213,20 +2302,24 @@ impl Middleware for VersionedWrites {
     }
 
     fn streams_request(&self, req: &Request) -> bool {
-        if !self.allow_object_versioning {
-            return false;
-        }
         let is_object = matches!(split_path(&req.path, 4, 4, true), Ok(parts)
             if parts[2].as_deref().is_some_and(|container| !container.is_empty())
                 && parts[3].as_deref().is_some_and(|object| !object.is_empty()));
         if !is_object {
             return false;
         }
-        if req.method == "PUT"
+        let ordinary_put = req.method == "PUT"
             && !req.headers.contains_key("X-Copy-From")
-            && req.query_string.is_empty()
+            && req.query_string.is_empty();
+        // Legacy X-Versions-Location PUTs must stream: G3 Hyper never
+        // calls sync handle_put, so copy-current would otherwise be skipped.
+        if ordinary_put
+            && (self.allow_object_versioning || self.allow_versioned_writes != Some(false))
         {
             return true;
+        }
+        if !self.allow_object_versioning {
+            return false;
         }
         if req.method == "DELETE" {
             return true;
@@ -2493,6 +2586,121 @@ mod tests {
         assert!(calls
             .iter()
             .all(|(_, p)| !p.contains("/versions/") || p.ends_with("/versions")));
+    }
+
+    fn streaming_legacy_backend(
+        current_exists: bool,
+    ) -> (
+        Arc<Mutex<Vec<(String, String, String)>>>,
+        StreamingAsyncNextFn,
+    ) {
+        type Call = (String, String, String);
+        let calls: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = Arc::clone(&calls);
+        let next: StreamingAsyncNextFn = Arc::new(move |mut req: AsyncRequest| {
+            let calls = Arc::clone(&calls2);
+            Box::pin(async move {
+                let _body = req.body.materialize(u64::MAX).await.unwrap();
+                calls.lock().unwrap().push((
+                    req.method.clone(),
+                    req.path.clone(),
+                    req.query_string.clone(),
+                ));
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(SYSMETA_VERSIONS_LOC, "versions");
+                    resp.headers.set(SYSMETA_VERSIONS_MODE, "stack");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_test/c/obj" {
+                    if current_exists {
+                        let mut resp = Response::with_body(200, b"aaaaa".to_vec());
+                        resp.headers.set("X-Timestamp", "1751500000.00000");
+                        resp.headers.set("Content-Type", "text/jibberish01");
+                        resp.headers.set("Content-Length", "5");
+                        return resp;
+                    }
+                    return Response::new(404);
+                }
+                Response::new(201)
+            })
+        });
+        (calls, next)
+    }
+
+    fn streaming_legacy_put() -> AsyncRequest {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Length", "5");
+        headers.set("Content-Type", "text/jibberish01");
+        AsyncRequest {
+            method: "PUT".to_string(),
+            path: "/v1/AUTH_test/c/obj".to_string(),
+            query_string: String::new(),
+            headers,
+            body: IncomingBody::from_bytes(b"aaaaa".to_vec(), 1024),
+        }
+    }
+
+    #[test]
+    fn test_legacy_first_put_streams_on_hyper_path() {
+        let vw = VersionedWrites::new();
+        assert!(vw.streams_request(&req("PUT", "/v1/AUTH_test/c/obj")));
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        assert!(vw.streams_request(&req("PUT", "/v1/AUTH_test/c/obj")));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_legacy_first_put_does_not_archive() {
+        // Python `_copy_current`: GET current 404 → skip archive PUT.
+        // X-Versions-Location versions container stays empty until overwrite.
+        let (calls, next) = streaming_legacy_backend(false);
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let resp = vw
+            .handle_streaming_request(streaming_legacy_put(), next)
+            .await;
+        assert_eq!(resp.status, 201);
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p, _)| m == "PUT" && p == "/v1/AUTH_test/c/obj"),
+            "client PUT must proceed: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|(m, p, _)| !(m == "PUT" && p.contains("/versions/"))),
+            "first PUT must not archive: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|(m, p, q)| m == "GET"
+                && p == "/v1/AUTH_test/c/obj"
+                && q.contains("symlink=get")),
+            "missing current must be probed: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_legacy_overwrite_archives_current() {
+        let (calls, next) = streaming_legacy_backend(true);
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let resp = vw
+            .handle_streaming_request(streaming_legacy_put(), next)
+            .await;
+        assert_eq!(resp.status, 201);
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p, _)| m == "PUT" && p.starts_with("/v1/AUTH_test/versions/003obj/")),
+            "overwrite must archive: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p, _)| m == "PUT" && p == "/v1/AUTH_test/c/obj"),
+            "client PUT must proceed: {calls:?}"
+        );
     }
 
     #[test]
