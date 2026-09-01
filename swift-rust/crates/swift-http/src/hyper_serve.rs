@@ -499,6 +499,36 @@ fn header_allows_reserved_nul(name: &str) -> bool {
     name.eq_ignore_ascii_case("X-Symlink-Target")
 }
 
+
+/// Eventlet/WSGI accepts `x-amz-meta-*` / `x-object-meta-*` field names whose
+/// suffix is not an RFC 7230 token (official test_put_object_weird_metadata).
+/// Colon, controls and whitespace stay forbidden. s3api still drops the
+/// Python-dropped token set; this only lets the request reach s3api.
+fn swift_s3_lenient_meta_name(raw: &[u8]) -> Option<&str> {
+    if !raw.is_ascii() {
+        return None;
+    }
+    let name = std::str::from_utf8(raw).ok()?;
+    let lower = name.to_ascii_lowercase();
+    let prefix = ["x-amz-meta-", "x-object-meta-"]
+        .into_iter()
+        .find(|prefix| lower.starts_with(prefix))?;
+    if name.len() == prefix.len() {
+        return None;
+    }
+    if raw.iter().copied().all(ascii_header_name_byte) {
+        return None;
+    }
+    if name
+        .as_bytes()
+        .iter()
+        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace() || *byte == b':')
+    {
+        return None;
+    }
+    Some(name)
+}
+
 /// Accept only Swift's metadata-name extension to HTTP field-name syntax.
 /// The prefix stays ASCII and the suffix must be valid UTF-8 with no control,
 /// whitespace, or colon characters. Other malformed field names remain
@@ -574,6 +604,7 @@ fn request_needs_swift_utf8_handoff(buf: &[u8]) -> bool {
         .any(|(name, value)| {
             let name = trim_ascii_bytes(name);
             swift_utf8_metadata_name(name).is_some()
+                || swift_s3_lenient_meta_name(name).is_some()
                 || (name.eq_ignore_ascii_case(b"X-Symlink-Target")
                     && trim_ascii_bytes(value).contains(&b'\0'))
         })
@@ -769,14 +800,19 @@ fn parse_swift_utf8_head(
         };
         let raw_name = trim_ascii_bytes(&line[..colon]);
         let name = if raw_name.is_ascii() {
-            if raw_name.is_empty() || !raw_name.iter().copied().all(ascii_header_name_byte) {
+            if raw_name.is_empty() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "invalid header name",
                 ));
             }
-            // Safe because of is_ascii above.
-            std::str::from_utf8(raw_name).unwrap()
+            if raw_name.iter().copied().all(ascii_header_name_byte) {
+                std::str::from_utf8(raw_name).unwrap()
+            } else {
+                swift_s3_lenient_meta_name(raw_name).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid header name")
+                })?
+            }
         } else {
             swift_utf8_metadata_name(raw_name).ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid header name")
@@ -1547,6 +1583,7 @@ async fn write_swift_compat_response(
         }
         let valid_name = if name.is_ascii() {
             name.as_bytes().iter().copied().all(ascii_header_name_byte)
+                || swift_s3_lenient_meta_name(name.as_bytes()).is_some()
         } else {
             swift_utf8_metadata_name(name.as_bytes()).is_some()
         };
@@ -2122,6 +2159,13 @@ mod tests {
               X-Symlink-Target: \0reserved-container/\0reserved-object\r\n\
               Content-Length: 0\r\n\r\n";
         assert!(request_needs_swift_utf8_handoff(symlink_request));
+        let weird = b"PUT /v1/AUTH_test/c/o HTTP/1.1\r\nX-Amz-Meta-(: (\r\n\r\n";
+        assert!(request_needs_swift_utf8_handoff(weird));
+        assert_eq!(
+            swift_s3_lenient_meta_name(b"x-amz-meta-("),
+            Some("x-amz-meta-(")
+        );
+
         let (_, _, _, headers) = parse_swift_utf8_head(
             symlink_request,
             32,
