@@ -1790,7 +1790,15 @@ impl Service<HyperRequest<Incoming>> for HyperToSwift {
             let query_string = parts.uri.query().unwrap_or("").to_string();
             let head_request = method == "HEAD";
             let client_connection = headers.get("Connection").map(str::to_string);
-            let close_after = n + 1 >= config.max_requests_per_connection.max(1);
+            // Keep-alive Hyper cannot parse Eventlet-lenient S3 meta names
+            // (`x-amz-meta-(`). Close after each signed S3 request so the
+            // next PUT is a new TCP connection and the first-head UTF-8
+            // compatibility lane can accept those names.
+            let s3_signed = headers.get("Authorization").is_some_and(|value| {
+                value.starts_with("AWS") || value.starts_with("AWS4-HMAC-SHA256")
+            });
+            let close_after =
+                s3_signed || n + 1 >= config.max_requests_per_connection.max(1);
             if matches!(method.as_str(), "GET" | "HEAD") && path == "/recon/concurrency" {
                 let body = metrics.render();
                 return Ok(to_hyper_response(
