@@ -3240,10 +3240,18 @@ impl S3Api {
         }
 
         if is_mpu_part {
-            let pn = part_number.unwrap();
-            if pn < 1 {
-                return finish(s3_error_response("InvalidArgument", Some("partNumber"), &[]));
-            }
+            let raw_pn = params
+                .iter()
+                .find(|(k, _)| k == "partNumber")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("");
+            let pn = raw_pn
+                .parse::<u32>()
+                .ok()
+                .filter(|n| (1..=10000).contains(n));
+            let Some(pn) = pn else {
+                return finish(invalid_mpu_part_number(raw_pn));
+            };
             let uid = upload_id.as_deref().unwrap();
             let (st, _) =
                 match head_container_streaming(&cred, &bucket, &next, &self.container_heads).await
@@ -3832,13 +3840,17 @@ impl S3Api {
                     return handle_mpu_abort_async(&cred, b, k, uid, self, &next).await;
                 }
                 if req.method == "PUT" && part_number {
-                    let pn = params
+                    let raw_pn = params
                         .iter()
                         .find(|(n, _)| n == "partNumber")
-                        .and_then(|(_, v)| v.parse::<u32>().ok())
-                        .filter(|n| *n >= 1);
+                        .map(|(_, v)| v.as_str())
+                        .unwrap_or("");
+                    let pn = raw_pn
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|n| (1..=10000).contains(n));
                     let Some(pn) = pn else {
-                        return s3_error_response("InvalidArgument", Some("partNumber"), &[]);
+                        return invalid_mpu_part_number(raw_pn);
                     };
                     return handle_mpu_part_async(&cred, b, k, uid, pn, req, &next).await;
                 }
@@ -7875,6 +7887,15 @@ async fn handle_mpu_abort_async(
     let mut resp = delete_object_response();
     resp.headers.set("Content-Type", "text/html; charset=UTF-8");
     resp
+}
+
+
+fn invalid_mpu_part_number(raw: &str) -> Response {
+    s3_error_response(
+        "InvalidArgument",
+        Some("Part number must be an integer between 1 and 10000, inclusive"),
+        &[("ArgumentName", "partNumber"), ("ArgumentValue", raw)],
+    )
 }
 
 async fn handle_mpu_part_async(
