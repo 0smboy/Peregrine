@@ -1531,10 +1531,11 @@ impl VersionedWrites {
         let target_bytes = slo_size.unwrap_or_else(|| {
             declared_length.unwrap_or_else(|| counter.load(Ordering::Relaxed))
         });
-        let listing_etag = match slo_etag {
-            Some(slo) => format!("{target_etag}; slo_etag={slo}"),
-            None => target_etag.clone(),
-        };
+        // Listing slo_etag is leftover hash params on the marker
+        // (apply_version_symlink_listing), not TGT_ETAG. Stuffing slo_etag
+        // into TGT_ETAG 409s symlink follow (archive ETag is manifest md5).
+        let listing_etag = target_etag.clone();
+        let _ = slo_etag;
         let content_type = req
             .headers
             .get("Content-Type")
@@ -1567,6 +1568,9 @@ impl VersionedWrites {
         // client X-Symlink-Target-Etag (static user-symlinks still HEAD-validate).
         marker_headers.remove("X-Symlink-Target-Account");
         marker_headers.set("X-Symlink-Target", &quoted_target);
+        // COPY ?symlink=get copies X-Symlink-Target-Etag of the *user* target.
+        // Marker target is the hidden archive; leaving the client etag 412s.
+        marker_headers.set("X-Symlink-Target-Etag", &target_etag);
         marker_headers.set("Content-Length", "0");
         marker_headers.set("Content-Type", content_type);
         marker_headers.set("X-Timestamp", marker_timestamp.internal());
@@ -4382,7 +4386,11 @@ mod tests {
         );
         assert_ne!(marker.3.get("X-Symlink-Target"), Some("c/tgt"));
         assert!(marker.3.get("X-Symlink-Target-Account").is_none());
-        assert_eq!(marker.3.get("X-Symlink-Target-Etag"), Some("abc123"));
+        assert_ne!(
+            marker.3.get("X-Symlink-Target-Etag"),
+            Some("abc123"),
+            "marker must not keep the user-target etag (COPY 412)"
+        );
         assert!(marker
             .3
             .get(SYSMETA_SYMLINK_TARGET)
