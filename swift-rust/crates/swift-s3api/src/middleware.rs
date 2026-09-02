@@ -2512,6 +2512,13 @@ fn existing_json_owner(headers: &HeaderKeyDict, meta: &str, fallback: &str) -> S
     fallback.to_string()
 }
 
+fn object_acl_copy_from(container: &str, key: &str) -> String {
+    format!(
+        "/{}",
+        percent_encode_except_slash(&format!("{container}/{key}"))
+    )
+}
+
 fn stamp_resolved_put_acl(
     s3_acl: bool,
     headers: &mut HeaderKeyDict,
@@ -7027,28 +7034,55 @@ async fn handle_acl_async(
 ) -> Response {
     if let Some(obj) = key {
         // Object ACL: JSON grants and/or canned name in object sysmeta.
+        // Python S3AclController.PUT cannot POST sysmeta; copy-self PUT
+        // writes ACL into the datafile. GET-after-POST overlays datafile
+        // sysmeta on top of .meta, so a POST ACL is invisible.
+        let version_id = req
+            .params()
+            .iter()
+            .find(|(k, _)| k == "versionId")
+            .map(|(_, v)| v.clone());
         match req.method.as_str() {
             "GET" | "HEAD" => {
-                let mut head = make_swift_req(
-                    "HEAD",
-                    &s3_to_swift_path(&cred.account, Some(bucket), Some(obj)),
-                );
-                stamp_auth(&mut head, cred);
-                let resp = async_call(next, head).await;
-                if !(200..300).contains(&resp.status) {
-                    return map_swift_error(resp.status, Some(bucket), Some(obj));
-                }
-                xml_ok(object_acl_xml_from_headers(&owner.id, &resp.headers))
+                let target = match resolve_object_version_async(
+                    cred,
+                    bucket,
+                    obj,
+                    version_id.as_deref(),
+                    next,
+                )
+                .await
+                {
+                    Ok(Some(t)) => t,
+                    Ok(None) => return missing_object_version_response(obj, version_id.as_deref()),
+                    Err(resp) => return resp,
+                };
+                xml_ok(object_acl_xml_from_headers(&owner.id, &target.head.headers))
             }
             "PUT" => {
                 let body = match req.body.take().into_vec(MAX_CONTROL_BODY) {
                     Ok(b) => b,
                     Err(_) => return s3_error_response("InvalidRequest", None, &[]),
                 };
+                let target = match resolve_object_version_async(
+                    cred,
+                    bucket,
+                    obj,
+                    version_id.as_deref(),
+                    next,
+                )
+                .await
+                {
+                    Ok(Some(t)) => t,
+                    Ok(None) => return missing_object_version_response(obj, version_id.as_deref()),
+                    Err(resp) => return resp,
+                };
+                let persist_owner =
+                    existing_json_owner(&target.head.headers, S3_OBJECT_ACL_JSON_META, &owner.id);
                 let input = match resolve_acl_put_input(
                     &req.headers,
                     if body.is_empty() { None } else { Some(&body) },
-                    &owner.id,
+                    &persist_owner,
                 ) {
                     Ok(AclPutInput::None) => AclPutInput::Canned("private".into()),
                     Ok(i) => i,
@@ -7060,25 +7094,30 @@ async fn handle_acl_async(
                 let cresp = async_call(next, chead).await;
                 let bucket_owner =
                     existing_json_owner(&cresp.headers, S3_BUCKET_ACL_JSON_META, &owner.id);
-                let mut post = make_swift_req(
-                    "POST",
-                    &s3_to_swift_path(&cred.account, Some(bucket), Some(obj)),
+                let mut put = make_swift_req(
+                    "PUT",
+                    &s3_to_swift_path(&cred.account, Some(&target.container), Some(&target.key)),
                 );
-                apply_object_acl_put(&mut post.headers, &input, &owner.id, false);
+                apply_object_acl_put(&mut put.headers, &input, &persist_owner, true);
                 if let AclPutInput::Canned(c) = &input {
                     restamp_object_bucket_owner_canned(
-                        &mut post.headers,
+                        &mut put.headers,
                         c,
-                        &owner.id,
+                        &persist_owner,
                         &bucket_owner,
                     );
                 }
-                stamp_auth(&mut post, cred);
-                let resp = async_call(next, post).await;
+                put.headers.set(
+                    "X-Copy-From",
+                    object_acl_copy_from(&target.container, &target.key),
+                );
+                put.headers.set("Content-Length", "0");
+                stamp_auth(&mut put, cred);
+                let resp = async_call(next, put).await;
                 if (200..300).contains(&resp.status) {
                     Response::new(200)
                 } else {
-                    map_swift_error(resp.status, Some(bucket), Some(obj))
+                    map_swift_error(resp.status, Some(&target.container), Some(&target.key))
                 }
             }
             _ => s3_error_response("MethodNotAllowed", None, &[]),
@@ -7154,28 +7193,43 @@ fn handle_acl(
 ) -> Response {
     if let Some(obj) = key {
         // Object ACL: JSON grants and/or canned name in object sysmeta.
+        // Copy-self PUT: see handle_acl_async. POST cannot persist object sysmeta.
+        let version_id = req
+            .params()
+            .iter()
+            .find(|(k, _)| k == "versionId")
+            .map(|(_, v)| v.clone());
         match req.method.as_str() {
             "GET" | "HEAD" => {
-                let mut head = make_swift_req(
-                    "HEAD",
-                    &s3_to_swift_path(&cred.account, Some(bucket), Some(obj)),
-                );
-                stamp_auth(&mut head, cred);
-                let resp = next(head);
-                if !(200..300).contains(&resp.status) {
-                    return map_swift_error(resp.status, Some(bucket), Some(obj));
-                }
-                xml_ok(object_acl_xml_from_headers(&owner.id, &resp.headers))
+                let target =
+                    match resolve_object_version(cred, bucket, obj, version_id.as_deref(), next) {
+                        Ok(Some(t)) => t,
+                        Ok(None) => {
+                            return missing_object_version_response(obj, version_id.as_deref())
+                        }
+                        Err(resp) => return resp,
+                    };
+                xml_ok(object_acl_xml_from_headers(&owner.id, &target.head.headers))
             }
             "PUT" => {
                 let body = match req.body.take().into_vec(MAX_CONTROL_BODY) {
                     Ok(b) => b,
                     Err(_) => return s3_error_response("InvalidRequest", None, &[]),
                 };
+                let target =
+                    match resolve_object_version(cred, bucket, obj, version_id.as_deref(), next) {
+                        Ok(Some(t)) => t,
+                        Ok(None) => {
+                            return missing_object_version_response(obj, version_id.as_deref())
+                        }
+                        Err(resp) => return resp,
+                    };
+                let persist_owner =
+                    existing_json_owner(&target.head.headers, S3_OBJECT_ACL_JSON_META, &owner.id);
                 let input = match resolve_acl_put_input(
                     &req.headers,
                     if body.is_empty() { None } else { Some(&body) },
-                    &owner.id,
+                    &persist_owner,
                 ) {
                     Ok(AclPutInput::None) => AclPutInput::Canned("private".into()),
                     Ok(i) => i,
@@ -7184,17 +7238,36 @@ fn handle_acl(
                     }
                     Err(_) => return s3_error_response("MalformedACLError", None, &[]),
                 };
-                let mut post = make_swift_req(
-                    "POST",
-                    &s3_to_swift_path(&cred.account, Some(bucket), Some(obj)),
+                let mut chead =
+                    make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+                stamp_auth(&mut chead, cred);
+                let cresp = next(chead);
+                let bucket_owner =
+                    existing_json_owner(&cresp.headers, S3_BUCKET_ACL_JSON_META, &owner.id);
+                let mut put = make_swift_req(
+                    "PUT",
+                    &s3_to_swift_path(&cred.account, Some(&target.container), Some(&target.key)),
                 );
-                apply_object_acl_put(&mut post.headers, &input, &owner.id, false);
-                stamp_auth(&mut post, cred);
-                let resp = next(post);
+                apply_object_acl_put(&mut put.headers, &input, &persist_owner, true);
+                if let AclPutInput::Canned(c) = &input {
+                    restamp_object_bucket_owner_canned(
+                        &mut put.headers,
+                        c,
+                        &persist_owner,
+                        &bucket_owner,
+                    );
+                }
+                put.headers.set(
+                    "X-Copy-From",
+                    object_acl_copy_from(&target.container, &target.key),
+                );
+                put.headers.set("Content-Length", "0");
+                stamp_auth(&mut put, cred);
+                let resp = next(put);
                 if (200..300).contains(&resp.status) {
                     Response::new(200)
                 } else {
-                    map_swift_error(resp.status, Some(bucket), Some(obj))
+                    map_swift_error(resp.status, Some(&target.container), Some(&target.key))
                 }
             }
             _ => s3_error_response("MethodNotAllowed", None, &[]),
