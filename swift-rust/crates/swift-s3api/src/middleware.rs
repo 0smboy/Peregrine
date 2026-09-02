@@ -120,7 +120,7 @@ use crate::acl_cors::{
     cors_xml_from_swift_headers, decode_acl_json, grants_allow_anonymous_read,
     object_acl_denies_read, object_acl_denies_write, object_acl_xml_from_headers,
     object_canned_allows_anonymous_read, parse_cors_configuration, resolve_acl_put_input, xml_ok,
-    AclPutInput, S3_OBJECT_ACL_JSON_META, S3_OBJECT_ACL_META,
+    AclPutInput, S3_BUCKET_ACL_JSON_META, S3_OBJECT_ACL_JSON_META, S3_OBJECT_ACL_META,
 };
 use crate::aws_chunked::{
     cleanup_content_encoding, decode_aws_chunked, is_aws_chunked_request, is_ecdsa_streaming,
@@ -2405,6 +2405,17 @@ fn deny_if_bucket_acl_blocks_write(
     } else {
         None
     }
+}
+
+fn existing_json_owner(headers: &HeaderKeyDict, meta: &str, fallback: &str) -> String {
+    if let Some(raw) = headers.get(meta) {
+        if let Some(policy) = decode_acl_json(raw) {
+            if !policy.owner_id.is_empty() {
+                return policy.owner_id;
+            }
+        }
+    }
+    fallback.to_string()
 }
 
 fn stamp_resolved_put_acl(
@@ -6442,10 +6453,16 @@ async fn handle_acl_async(
                     Ok(b) => b,
                     Err(_) => return s3_error_response("InvalidRequest", None, &[]),
                 };
+                let mut head =
+                    make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+                stamp_auth(&mut head, cred);
+                let existing = async_call(next, head).await;
+                let persist_owner =
+                    existing_json_owner(&existing.headers, S3_BUCKET_ACL_JSON_META, &owner.id);
                 let input = match resolve_acl_put_input(
                     &req.headers,
                     if body.is_empty() { None } else { Some(&body) },
-                    &owner.id,
+                    &persist_owner,
                 ) {
                     Ok(AclPutInput::None) => AclPutInput::Canned("private".into()),
                     Ok(i) => i,
@@ -6453,7 +6470,7 @@ async fn handle_acl_async(
                 };
                 let mut post =
                     make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
-                apply_bucket_acl_put(&mut post.headers, &input, &owner.id, true);
+                apply_bucket_acl_put(&mut post.headers, &input, &persist_owner, true);
                 stamp_auth(&mut post, cred);
                 let resp = async_call(next, post).await;
                 if (200..300).contains(&resp.status) {
@@ -6540,10 +6557,16 @@ fn handle_acl(
                     Ok(b) => b,
                     Err(_) => return s3_error_response("InvalidRequest", None, &[]),
                 };
+                let mut head =
+                    make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+                stamp_auth(&mut head, cred);
+                let existing = next(head);
+                let persist_owner =
+                    existing_json_owner(&existing.headers, S3_BUCKET_ACL_JSON_META, &owner.id);
                 let input = match resolve_acl_put_input(
                     &req.headers,
                     if body.is_empty() { None } else { Some(&body) },
-                    &owner.id,
+                    &persist_owner,
                 ) {
                     Ok(AclPutInput::None) => AclPutInput::Canned("private".into()),
                     Ok(i) => i,
@@ -6551,7 +6574,7 @@ fn handle_acl(
                 };
                 let mut post =
                     make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
-                apply_bucket_acl_put(&mut post.headers, &input, &owner.id, true);
+                apply_bucket_acl_put(&mut post.headers, &input, &persist_owner, true);
                 stamp_auth(&mut post, cred);
                 let resp = next(post);
                 if (200..300).contains(&resp.status) {
