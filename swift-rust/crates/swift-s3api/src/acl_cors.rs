@@ -407,6 +407,41 @@ pub fn access_control_policy_xml(policy: &AccessControlPolicy) -> Vec<u8> {
 }
 
 /// Parse AccessControlPolicy XML body into structured grants.
+/// lxml `XMLParser(resolve_entities=False)`: element `.text` is character
+/// data before an unresolved entity child. Named amp/lt/gt/quot/apos still
+/// decode. Unknown/external `&xxe;` is dropped, never expanded from disk.
+fn xml_text_no_ext_entities(raw: &str) -> String {
+    let mut out = String::new();
+    let mut rest = raw;
+    while !rest.is_empty() {
+        match rest.find('&') {
+            None => {
+                out.push_str(rest);
+                break;
+            }
+            Some(amp) => {
+                out.push_str(&rest[..amp]);
+                rest = &rest[amp..];
+                let Some(semi) = rest.find(';') else {
+                    out.push_str(rest);
+                    break;
+                };
+                let name = &rest[1..semi];
+                match name {
+                    "amp" => out.push('&'),
+                    "lt" => out.push('<'),
+                    "gt" => out.push('>'),
+                    "quot" => out.push('"'),
+                    "apos" => out.push('\u{27}'),
+                    _ => {}
+                }
+                rest = &rest[semi + 1..];
+            }
+        }
+    }
+    out
+}
+
 pub fn parse_acp_xml(body: &[u8]) -> Result<AccessControlPolicy, String> {
     let text = std::str::from_utf8(body).map_err(|_| "MalformedACLError".to_string())?;
     if !text.contains("AccessControlPolicy") {
@@ -421,8 +456,11 @@ pub fn parse_acp_xml(body: &[u8]) -> Result<AccessControlPolicy, String> {
                 .map(|e| rest[..e + "</Owner>".len()].to_string())
         })
         .unwrap_or_default();
-    let owner_id = first_tag_text(&owner_section, "ID").unwrap_or_default();
-    let owner_display_name = first_tag_text(&owner_section, "DisplayName");
+    let owner_id =
+        xml_text_no_ext_entities(&first_tag_text(&owner_section, "ID").unwrap_or_default());
+    let owner_display_name = first_tag_text(&owner_section, "DisplayName")
+        .map(|s| xml_text_no_ext_entities(&s))
+        .filter(|s| !s.is_empty());
 
     let mut grants = Vec::new();
     let mut rest = text;
@@ -443,15 +481,23 @@ pub fn parse_acp_xml(body: &[u8]) -> Result<AccessControlPolicy, String> {
             return Err("MalformedACLError".into());
         };
 
-        let grantee = if let Some(id) = first_tag_text(grant_body, "ID") {
+        let grantee = if let Some(id_raw) = first_tag_text(grant_body, "ID") {
+            let id = xml_text_no_ext_entities(&id_raw);
+            // Python `encode_acl` stores only the user id string; GET ACP
+            // DisplayName is that id. Keeping the XML DisplayName (`name`
+            // before `&xxe;`) fails official test_put_bucket_acl XXE.
             Grantee::Id {
-                display_name: first_tag_text(grant_body, "DisplayName"),
+                display_name: Some(id.clone()),
                 id,
             }
         } else if let Some(uri) = first_tag_text(grant_body, "URI") {
-            Grantee::Uri { uri }
+            Grantee::Uri {
+                uri: xml_text_no_ext_entities(&uri),
+            }
         } else if let Some(email) = first_tag_text(grant_body, "EmailAddress") {
-            Grantee::Email { email }
+            Grantee::Email {
+                email: xml_text_no_ext_entities(&email),
+            }
         } else {
             return Err("MalformedACLError".into());
         };
@@ -2290,6 +2336,39 @@ mod tests {
         );
         assert!(is_known_canned_acl("bucket-owner-read"));
         assert!(!is_known_canned_acl("public-ready"));
+    }
+
+    #[test]
+    fn parse_acp_xml_drops_unresolved_xxe_entity() {
+        let xml = br#"<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/swift/swift.conf"> ]>
+<AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+<Owner>
+    <DisplayName>test:tester</DisplayName>
+    <ID>test:tester</ID>
+</Owner>
+<AccessControlList>
+    <Grant>
+        <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser">
+            <DisplayName>name&xxe;</DisplayName>
+            <ID>id&xxe;</ID>
+        </Grantee>
+        <Permission>WRITE</Permission>
+    </Grant>
+</AccessControlList>
+</AccessControlPolicy>"#;
+        let policy = parse_acp_xml(xml).expect("ACP with unresolved XXE must parse");
+        assert_eq!(policy.owner_id, "test:tester");
+        assert_eq!(policy.grants.len(), 1);
+        assert_eq!(policy.grants[0].permission, "WRITE");
+        match &policy.grants[0].grantee {
+            Grantee::Id { id, display_name } => {
+                assert_eq!(id, "id");
+                assert_eq!(display_name.as_deref(), Some("id"));
+                assert!(!id.contains("xxe"));
+                assert!(!id.contains("swift-hash"));
+            }
+            other => panic!("expected CanonicalUser, got {other:?}"),
+        }
     }
 
     #[test]
