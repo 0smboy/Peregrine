@@ -1611,6 +1611,17 @@ impl Slo {
         let orig = req.clone_head();
         strip_conditionals(&mut req.headers);
         let mut resp = next(req).await;
+        // S3 path rewrite happens after the outer prepare(); the first
+        // backend GET may still be a ranged manifest (206 / 283 bytes).
+        // Refetch the whole JSON so Range applies to assembled size.
+        if resp.status == 206 && orig.headers.get("Range").is_some() {
+            let mut retry = orig.clone_head();
+            retry.headers.remove("Range");
+            retry.headers.remove("range");
+            ignore_range(&mut retry.headers, SLO_HEADER);
+            strip_conditionals(&mut retry.headers);
+            resp = next(retry).await;
+        }
 
         let is_slo = resp
             .headers
