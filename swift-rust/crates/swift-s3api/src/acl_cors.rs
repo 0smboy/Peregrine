@@ -1149,17 +1149,17 @@ pub fn policy_from_canned(owner_id: &str, canned: &str) -> AccessControlPolicy {
         "public-read" => AccessControlPolicy {
             owner_id: owner_id.to_string(),
             owner_display_name: Some(owner_id.to_string()),
-            grants: vec![owner_grant, all_users_read],
+            grants: vec![all_users_read, owner_grant],
         },
         "public-read-write" => AccessControlPolicy {
             owner_id: owner_id.to_string(),
             owner_display_name: Some(owner_id.to_string()),
-            grants: vec![owner_grant, all_users_read, all_users_write],
+            grants: vec![all_users_read, all_users_write, owner_grant],
         },
         "authenticated-read" => AccessControlPolicy {
             owner_id: owner_id.to_string(),
             owner_display_name: Some(owner_id.to_string()),
-            grants: vec![owner_grant, auth_read],
+            grants: vec![auth_read, owner_grant],
         },
         _ => AccessControlPolicy::private(owner_id),
     }

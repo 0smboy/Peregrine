@@ -321,7 +321,7 @@ impl DiskFile {
         let datafile_metadata = self.read_and_validate(XattrSource::File(&fp), &data_file)?;
         let data_timestamp = parse_ts(meta_get(&datafile_metadata, "X-Timestamp"));
 
-        let mut metadata = Metadata::new();
+        let mut metadata;
         let mut metafile_metadata: Option<Metadata> = None;
         if let Some(meta_file) = &ondisk.meta_file {
             let mut mf_meta = self.read_and_validate(XattrSource::Path(meta_file), meta_file)?;
@@ -330,21 +330,11 @@ impl DiskFile {
                     self.merge_content_type_metadata(ctype_file, &mut mf_meta, data_timestamp)?;
                 }
             }
-            let sys_metadata: Metadata = datafile_metadata
-                .iter()
-                .filter(|(k, _)| match k {
-                    MetaValue::Str(s) => {
-                        let lower = s.to_ascii_lowercase();
-                        RESERVED_DATAFILE_META.contains(&lower.as_str())
-                            || DATAFILE_SYSTEM_META.contains(&lower.as_str())
-                            || is_object_sys_meta(s)
-                    }
-                    _ => false,
-                })
-                .cloned()
-                .collect();
+            // Python DiskFile: start from the datafile, then overlay the
+            // newest .meta (user meta *and* sysmeta). Datafile-only sysmeta
+            // remains; POST ?acl / tagging sysmeta in .meta must win.
+            metadata = datafile_metadata.clone();
             meta_update(&mut metadata, &mf_meta);
-            meta_update(&mut metadata, &sys_metadata);
             // the diskfile writer added 'name' to the metafile; drop it
             // from the metafile view
             meta_remove(&mut mf_meta, "name");

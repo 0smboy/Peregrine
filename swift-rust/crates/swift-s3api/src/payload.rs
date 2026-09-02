@@ -72,7 +72,10 @@ fn header_ci<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
 }
 
 fn content_md5_raw(req: &Request) -> Option<&str> {
-    header_strip(header_ci(req, "content-md5")?)
+    // Present empty Content-MD5 must stay Some("") so InvalidDigest fires.
+    // header_strip("") is None and would skip the check.
+    let raw = header_ci(req, "content-md5")?;
+    Some(header_strip(raw).unwrap_or(""))
 }
 
 /// Standard base64 decode; `None` on alphabet/padding errors.
