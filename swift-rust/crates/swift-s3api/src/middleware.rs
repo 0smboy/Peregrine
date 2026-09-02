@@ -5654,6 +5654,7 @@ fn control_head_object(
         "HEAD",
         &s3_to_swift_path(&cred.account, Some(container), Some(key)),
     );
+    head.headers.set("X-Newest", "true");
     stamp_auth(&mut head, cred);
     let resp = next(head);
     if (200..300).contains(&resp.status) {
@@ -7084,6 +7085,7 @@ async fn control_head_object_streaming(
         "HEAD",
         &s3_to_swift_path(&cred.account, Some(container), Some(key)),
     );
+    head.headers.set("X-Newest", "true");
     stamp_auth(&mut head, cred);
     let resp = next(request_to_streaming(head)).await;
     if (200..300).contains(&resp.status) {
@@ -7315,6 +7317,7 @@ async fn control_head_object_async(
         "HEAD",
         &s3_to_swift_path(&cred.account, Some(container), Some(key)),
     );
+    head.headers.set("X-Newest", "true");
     stamp_auth(&mut head, cred);
     let resp = async_call(next, head).await;
     if (200..300).contains(&resp.status) {
