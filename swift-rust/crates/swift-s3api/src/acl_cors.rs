@@ -224,6 +224,20 @@ pub fn is_supported_canned_acl(canned: &str) -> bool {
     )
 }
 
+/// Names in Python `canned_acl_grantees`. Unknown → InvalidArgument.
+pub fn is_known_canned_acl(canned: &str) -> bool {
+    matches!(
+        canned,
+        "private"
+            | "public-read"
+            | "public-read-write"
+            | "authenticated-read"
+            | "bucket-owner-read"
+            | "bucket-owner-full-control"
+            | "log-delivery-write"
+    )
+}
+
 /// Infer canned ACL XML from Swift `X-Container-Read` / `X-Container-Write`.
 pub fn acl_xml_from_swift_headers(
     owner_id: &str,
@@ -1168,6 +1182,9 @@ pub fn resolve_acl_put_input(
 ) -> Result<AclPutInput, String> {
     if let Some(canned) = headers.get("X-Amz-Acl") {
         // Canned wins even if grant headers / body present.
+        if !is_known_canned_acl(canned) {
+            return Err("InvalidArgument".into());
+        }
         return Ok(AclPutInput::Canned(canned.to_string()));
     }
 
@@ -1213,6 +1230,16 @@ pub fn apply_object_acl_input(headers: &mut HeaderKeyDict, input: &AclPutInput) 
 
 /// Canned ACL → structured policy (Python `canned_acl_grantees`).
 pub fn policy_from_canned(owner_id: &str, canned: &str) -> AccessControlPolicy {
+    policy_from_canned_owners(owner_id, owner_id, canned)
+}
+
+/// Python `canned_acl_grantees(bucket_owner, object_owner)`.
+pub fn policy_from_canned_owners(
+    object_owner: &str,
+    bucket_owner: &str,
+    canned: &str,
+) -> AccessControlPolicy {
+    let owner_id = object_owner;
     let owner_grant = Grant {
         grantee: Grantee::Id {
             id: owner_id.to_string(),
@@ -1254,17 +1281,71 @@ pub fn policy_from_canned(owner_id: &str, canned: &str) -> AccessControlPolicy {
             owner_display_name: Some(owner_id.to_string()),
             grants: vec![auth_read, owner_grant],
         },
+        "bucket-owner-read" => {
+            let bucket_read = Grant {
+                grantee: Grantee::Id {
+                    id: bucket_owner.to_string(),
+                    display_name: Some(bucket_owner.to_string()),
+                },
+                permission: "READ".into(),
+            };
+            AccessControlPolicy {
+                owner_id: owner_id.to_string(),
+                owner_display_name: Some(owner_id.to_string()),
+                grants: vec![bucket_read, owner_grant],
+            }
+        }
+        "bucket-owner-full-control" => {
+            let bucket_fc = Grant {
+                grantee: Grantee::Id {
+                    id: bucket_owner.to_string(),
+                    display_name: Some(bucket_owner.to_string()),
+                },
+                permission: "FULL_CONTROL".into(),
+            };
+            AccessControlPolicy {
+                owner_id: owner_id.to_string(),
+                owner_display_name: Some(owner_id.to_string()),
+                grants: vec![owner_grant, bucket_fc],
+            }
+        }
         _ => AccessControlPolicy::private(owner_id),
     }
 }
 
 fn stamp_object_canned_with_json(headers: &mut HeaderKeyDict, canned: &str, owner_id: &str) {
+    stamp_object_canned_with_json_owners(headers, canned, owner_id, owner_id);
+}
+
+fn stamp_object_canned_with_json_owners(
+    headers: &mut HeaderKeyDict,
+    canned: &str,
+    object_owner: &str,
+    bucket_owner: &str,
+) {
     let name = normalize_object_canned_acl(canned);
     headers.set(S3_OBJECT_ACL_META, name);
     headers.set(
         S3_OBJECT_ACL_JSON_META,
-        encode_acl_json(&policy_from_canned(owner_id, canned)),
+        encode_acl_json(&policy_from_canned_owners(
+            object_owner,
+            bucket_owner,
+            canned,
+        )),
     );
+}
+
+/// After container HEAD, rewrite bucket-owner-* object JSON using the
+/// bucket owner id (Python `canned_acl_grantees(bucket_owner, object_owner)`).
+pub fn restamp_object_bucket_owner_canned(
+    headers: &mut HeaderKeyDict,
+    canned: &str,
+    object_owner: &str,
+    bucket_owner: &str,
+) {
+    if matches!(canned, "bucket-owner-read" | "bucket-owner-full-control") {
+        stamp_object_canned_with_json_owners(headers, canned, object_owner, bucket_owner);
+    }
 }
 
 fn stamp_bucket_canned_with_json(headers: &mut HeaderKeyDict, canned: &str, owner_id: &str) {
@@ -2197,5 +2278,33 @@ mod tests {
         );
         assert!(bucket_acl_denies_write_acp(&h, "test:tester2", "AUTH_test"));
         assert!(!bucket_acl_denies_write_acp(&h, "test:tester", "AUTH_test"));
+    }
+
+    #[test]
+    fn unknown_canned_acl_is_invalid_argument() {
+        let mut h = HeaderKeyDict::new();
+        h.set("X-Amz-Acl", "public-ready");
+        assert_eq!(
+            resolve_acl_put_input(&h, None, "test:tester").unwrap_err(),
+            "InvalidArgument"
+        );
+        assert!(is_known_canned_acl("bucket-owner-read"));
+        assert!(!is_known_canned_acl("public-ready"));
+    }
+
+    #[test]
+    fn bucket_owner_read_policy_has_two_grants() {
+        let p = policy_from_canned_owners("alt", "main", "bucket-owner-read");
+        assert_eq!(p.grants.len(), 2);
+        assert_eq!(p.grants[0].permission, "READ");
+        assert_eq!(p.grants[1].permission, "FULL_CONTROL");
+        match &p.grants[0].grantee {
+            Grantee::Id { id, .. } => assert_eq!(id, "main"),
+            _ => panic!("expected id"),
+        }
+        match &p.grants[1].grantee {
+            Grantee::Id { id, .. } => assert_eq!(id, "alt"),
+            _ => panic!("expected id"),
+        }
     }
 }

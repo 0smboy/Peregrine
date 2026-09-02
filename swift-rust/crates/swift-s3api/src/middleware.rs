@@ -120,8 +120,8 @@ use crate::acl_cors::{
     clear_cors_swift_headers, cors_config_to_swift_headers, cors_xml_from_swift_headers,
     decode_acl_json, grants_allow_anonymous_read, object_acl_denies_read, object_acl_denies_write,
     object_acl_xml_from_headers, object_canned_allows_anonymous_read, parse_cors_configuration,
-    resolve_acl_put_input, xml_ok, AclPutInput, S3_BUCKET_ACL_JSON_META, S3_OBJECT_ACL_JSON_META,
-    S3_OBJECT_ACL_META,
+    resolve_acl_put_input, restamp_object_bucket_owner_canned, xml_ok, AclPutInput,
+    S3_BUCKET_ACL_JSON_META, S3_OBJECT_ACL_JSON_META, S3_OBJECT_ACL_META,
 };
 use crate::aws_chunked::{
     cleanup_content_encoding, decode_aws_chunked, is_aws_chunked_request, is_ecdsa_streaming,
@@ -3306,6 +3306,11 @@ impl S3Api {
         {
             return finish(resp);
         }
+        let canned_acl = head
+            .headers
+            .get("X-Amz-Acl")
+            .or_else(|| head.headers.get("x-amz-acl"))
+            .map(|s| s.to_string());
         if let Err(resp) = apply_request_object_lock_headers(&mut head.headers) {
             return finish(resp);
         }
@@ -3447,6 +3452,16 @@ impl S3Api {
         }
         if let Some(denied) = deny_if_bucket_acl_blocks_write(self.s3_acl, &cred, &hdrs) {
             return finish(denied);
+        }
+        if let Some(canned) = canned_acl.as_deref() {
+            let bucket_owner =
+                existing_json_owner(&hdrs, S3_BUCKET_ACL_JSON_META, &cred.access_key);
+            restamp_object_bucket_owner_canned(
+                &mut head.headers,
+                canned,
+                &cred.access_key,
+                &bucket_owner,
+            );
         }
         let vstatus = versioning_status_from_headers(&hdrs).ok().flatten();
         if bucket_versioning_mode(vstatus.as_deref()).is_some() {
@@ -6426,13 +6441,27 @@ async fn handle_acl_async(
                 ) {
                     Ok(AclPutInput::None) => AclPutInput::Canned("private".into()),
                     Ok(i) => i,
-                    Err(_) => return s3_error_response("MalformedACLError", None, &[]),
+                    Err(_) => return s3_error_response("InvalidArgument", None, &[]),
                 };
+                let mut chead =
+                    make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
+                stamp_auth(&mut chead, cred);
+                let cresp = async_call(next, chead).await;
+                let bucket_owner =
+                    existing_json_owner(&cresp.headers, S3_BUCKET_ACL_JSON_META, &owner.id);
                 let mut post = make_swift_req(
                     "POST",
                     &s3_to_swift_path(&cred.account, Some(bucket), Some(obj)),
                 );
                 apply_object_acl_put(&mut post.headers, &input, &owner.id, false);
+                if let AclPutInput::Canned(c) = &input {
+                    restamp_object_bucket_owner_canned(
+                        &mut post.headers,
+                        c,
+                        &owner.id,
+                        &bucket_owner,
+                    );
+                }
                 stamp_auth(&mut post, cred);
                 let resp = async_call(next, post).await;
                 if (200..300).contains(&resp.status) {
@@ -6479,6 +6508,9 @@ async fn handle_acl_async(
                 ) {
                     Ok(AclPutInput::None) => AclPutInput::Canned("private".into()),
                     Ok(i) => i,
+                    Err(e) if e == "InvalidArgument" => {
+                        return s3_error_response("InvalidArgument", None, &[])
+                    }
                     Err(_) => return s3_error_response("MalformedACLError", None, &[]),
                 };
                 let mut post =
@@ -6536,6 +6568,9 @@ fn handle_acl(
                 ) {
                     Ok(AclPutInput::None) => AclPutInput::Canned("private".into()),
                     Ok(i) => i,
+                    Err(e) if e == "InvalidArgument" => {
+                        return s3_error_response("InvalidArgument", None, &[])
+                    }
                     Err(_) => return s3_error_response("MalformedACLError", None, &[]),
                 };
                 let mut post = make_swift_req(
@@ -6589,6 +6624,9 @@ fn handle_acl(
                 ) {
                     Ok(AclPutInput::None) => AclPutInput::Canned("private".into()),
                     Ok(i) => i,
+                    Err(e) if e == "InvalidArgument" => {
+                        return s3_error_response("InvalidArgument", None, &[])
+                    }
                     Err(_) => return s3_error_response("MalformedACLError", None, &[]),
                 };
                 let mut post =

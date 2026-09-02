@@ -298,7 +298,26 @@ pub fn validate_s3_payload(req: &mut Request, v4_header_auth: bool) -> Option<Re
 }
 
 /// Header-only checks for the streaming PUT path (body hashed incrementally).
+/// Python `_validate_headers`: Content-Length present and negative/non-int
+/// is InvalidArgument 400.
+fn invalid_content_length_header(req: &Request) -> Option<Response> {
+    let raw = header_ci(req, "content-length")?;
+    match raw.parse::<i64>() {
+        Ok(n) if n < 0 => {}
+        Ok(_) => return None,
+        Err(_) => {}
+    }
+    Some(s3_error_response(
+        "InvalidArgument",
+        Some("Content-Length"),
+        &[("ArgumentName", "Content-Length"), ("ArgumentValue", raw)],
+    ))
+}
+
 pub fn validate_s3_payload_headers(req: &Request, v4_header_auth: bool) -> Option<Response> {
+    if let Some(resp) = invalid_content_length_header(req) {
+        return Some(resp);
+    }
     if let Some(resp) = validate_sha256_header(req, v4_header_auth) {
         return Some(resp);
     }
@@ -935,6 +954,24 @@ mod tests {
     use super::*;
     use crate::crypto::md5_hex;
     use swift_http::{Body, HeaderKeyDict, Request};
+
+    #[test]
+    fn negative_content_length_is_invalid_argument() {
+        let mut req = empty_put();
+        req.headers.set("Content-Length", "-1");
+        let resp = invalid_content_length_header(&req).expect("err");
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert_eq!(resp.status, 400);
+        assert!(body.contains("InvalidArgument"), "{body}");
+    }
+
+    #[test]
+    fn empty_content_length_is_invalid_argument() {
+        let mut req = empty_put();
+        req.headers.set("Content-Length", "");
+        let resp = invalid_content_length_header(&req).expect("err");
+        assert_eq!(resp.status, 400);
+    }
 
     fn empty_put() -> Request {
         let mut headers = HeaderKeyDict::new();
