@@ -115,11 +115,12 @@ use swift_middleware::{
 };
 
 use crate::acl_cors::{
-    apply_bucket_acl_input, apply_object_acl_input, bucket_acl_xml_from_headers,
-    clear_cors_swift_headers, cors_config_to_swift_headers, cors_xml_from_swift_headers,
-    decode_acl_json, grants_allow_anonymous_read, object_acl_denies_read, object_acl_denies_write,
-    object_acl_xml_from_headers, object_canned_allows_anonymous_read, parse_cors_configuration,
-    resolve_acl_put_input, xml_ok, AclPutInput, S3_OBJECT_ACL_JSON_META, S3_OBJECT_ACL_META,
+    apply_bucket_acl_put, apply_object_acl_put, bucket_acl_denies_read, bucket_acl_denies_write,
+    bucket_acl_xml_from_headers, clear_cors_swift_headers, cors_config_to_swift_headers,
+    cors_xml_from_swift_headers, decode_acl_json, grants_allow_anonymous_read,
+    object_acl_denies_read, object_acl_denies_write, object_acl_xml_from_headers,
+    object_canned_allows_anonymous_read, parse_cors_configuration, resolve_acl_put_input, xml_ok,
+    AclPutInput, S3_OBJECT_ACL_JSON_META, S3_OBJECT_ACL_META,
 };
 use crate::aws_chunked::{
     cleanup_content_encoding, decode_aws_chunked, is_aws_chunked_request, is_ecdsa_streaming,
@@ -262,6 +263,9 @@ pub struct S3Api {
     /// Short-TTL container HEAD cache. Sequential PUTs to one unversioned
     /// bucket were paying 3–4 identical container HEADs each (~700ms/object).
     container_heads: ContainerHeadCache,
+    /// Python `[filter:s3api] s3_acl`. Default false. When true, object/bucket
+    /// PUT stamps default-private JSON grants and GET/HEAD/list enforce them.
+    pub s3_acl: bool,
 }
 
 struct CachedContainerHead {
@@ -352,6 +356,7 @@ impl S3Api {
             frozen_accounts: HashSet::new(),
             worm_clock: Arc::new(ClockHealth::disabled()),
             container_heads: ContainerHeadCache::new(),
+            s3_acl: false,
         }
     }
 
@@ -415,6 +420,11 @@ impl S3Api {
 
     pub fn with_extended_subresources(mut self, enabled: bool) -> Self {
         self.extended_subresources = enabled;
+        self
+    }
+
+    pub fn with_s3_acl(mut self, enabled: bool) -> Self {
+        self.s3_acl = enabled;
         self
     }
 
@@ -2373,6 +2383,49 @@ fn deny_if_object_acl_blocks_write(
     }
 }
 
+fn deny_if_bucket_acl_blocks_read(
+    s3_acl: bool,
+    cred: &S3Credential,
+    headers: &HeaderKeyDict,
+) -> Option<Response> {
+    if s3_acl && bucket_acl_denies_read(headers, &cred.access_key, &cred.account) {
+        Some(s3_error_response("AccessDenied", None, &[]))
+    } else {
+        None
+    }
+}
+
+fn deny_if_bucket_acl_blocks_write(
+    s3_acl: bool,
+    cred: &S3Credential,
+    headers: &HeaderKeyDict,
+) -> Option<Response> {
+    if s3_acl && bucket_acl_denies_write(headers, &cred.access_key, &cred.account) {
+        Some(s3_error_response("AccessDenied", None, &[]))
+    } else {
+        None
+    }
+}
+
+fn stamp_resolved_put_acl(
+    s3_acl: bool,
+    headers: &mut HeaderKeyDict,
+    owner_id: &str,
+    is_object: bool,
+) -> Result<(), Response> {
+    match resolve_acl_put_input(headers, None, owner_id) {
+        Ok(input) => {
+            if is_object {
+                apply_object_acl_put(headers, &input, owner_id, s3_acl);
+            } else {
+                apply_bucket_acl_put(headers, &input, owner_id, s3_acl);
+            }
+            Ok(())
+        }
+        Err(_) => Err(s3_error_response("InvalidArgument", None, &[])),
+    }
+}
+
 /// S3 GET/HEAD of a cold object (due transition / successful lab archive).
 fn invalid_object_state_response() -> Response {
     s3_error_response(
@@ -3236,13 +3289,10 @@ impl S3Api {
 
         map_amz_meta(&mut head);
         persist_s3_object_headers(&mut head);
-        match resolve_acl_put_input(&head.headers, None, &cred.access_key) {
-            Ok(input) => {
-                if !matches!(input, AclPutInput::None) {
-                    apply_object_acl_input(&mut head.headers, &input);
-                }
-            }
-            Err(_) => return finish(s3_error_response("InvalidArgument", None, &[])),
+        if let Err(resp) =
+            stamp_resolved_put_acl(self.s3_acl, &mut head.headers, &cred.access_key, true)
+        {
+            return finish(resp);
         }
         if let Err(resp) = apply_request_object_lock_headers(&mut head.headers) {
             return finish(resp);
@@ -4130,16 +4180,15 @@ impl S3Api {
         if let Some(resp) = apply_copy_source(&mut swift_req) {
             return resp;
         }
-        match resolve_acl_put_input(&swift_req.headers, None, &owner.id) {
-            Ok(input) if !matches!(input, AclPutInput::None) => {
-                if key.is_some() {
-                    apply_object_acl_input(&mut swift_req.headers, &input);
-                } else {
-                    apply_bucket_acl_input(&mut swift_req.headers, &input);
-                }
+        if method == "PUT" {
+            if let Err(resp) = stamp_resolved_put_acl(
+                self.s3_acl,
+                &mut swift_req.headers,
+                &owner.id,
+                key.is_some(),
+            ) {
+                return resp;
             }
-            Ok(_) => {}
-            Err(_) => return s3_error_response("InvalidArgument", None, &[]),
         }
         strip_s3_only_headers(&mut swift_req.headers);
         stamp_auth(&mut swift_req, &cred);
@@ -4161,6 +4210,19 @@ impl S3Api {
             swift_req.headers.remove("If-Modified-Since");
             swift_req.headers.remove("If-Match");
             swift_req.headers.remove("If-None-Match");
+        }
+        if self.s3_acl && method == "PUT" {
+            if let (Some(b), Some(_)) = (bucket.as_deref(), key.as_deref()) {
+                match require_bucket_async(&cred, b, &next, &self.container_heads).await {
+                    Ok(headers) => {
+                        if let Some(denied) = deny_if_bucket_acl_blocks_write(true, &cred, &headers)
+                        {
+                            return denied;
+                        }
+                    }
+                    Err(resp) => return resp,
+                }
+            }
         }
         let resp = if method == "DELETE" && key.is_some() {
             let retry = swift_req.clone_head();
@@ -4186,6 +4248,11 @@ impl S3Api {
         }
         if key.is_none() && bucket.is_some() {
             if method == "GET" && (200..300).contains(&resp.status) {
+                if let Some(denied) =
+                    deny_if_bucket_acl_blocks_read(self.s3_acl, &cred, &resp.headers)
+                {
+                    return denied;
+                }
                 let body = match resp.body.collect_async().await {
                     Ok(b) => b,
                     Err(_) => {
@@ -4882,18 +4949,14 @@ impl S3Api {
         }
         // ACL: canned x-amz-acl wins; else x-amz-grant-* (body empty on object PUT).
         // ACP XML body is handled on PUT ?acl via handle_acl.
-        match resolve_acl_put_input(&swift_req.headers, None, &owner.id) {
-            Ok(input) => {
-                if !matches!(input, AclPutInput::None) {
-                    if key.is_some() {
-                        apply_object_acl_input(&mut swift_req.headers, &input);
-                    } else {
-                        apply_bucket_acl_input(&mut swift_req.headers, &input);
-                    }
-                }
-            }
-            Err(_) => {
-                return s3_error_response("InvalidArgument", None, &[]);
+        if method == "PUT" {
+            if let Err(resp) = stamp_resolved_put_acl(
+                self.s3_acl,
+                &mut swift_req.headers,
+                &owner.id,
+                key.is_some(),
+            ) {
+                return resp;
             }
         }
         // Explicit x-amz-object-lock-* → sysmeta (before strip removes x-amz-*).
@@ -4969,6 +5032,22 @@ impl S3Api {
             }
         }
 
+        if self.s3_acl && method == "PUT" {
+            if let (Some(b), Some(_)) = (bucket.as_deref(), key.as_deref()) {
+                match require_bucket(&cred, b, next, &self.container_heads) {
+                    Ok(headers) => {
+                        if let Some(denied) = deny_if_bucket_acl_blocks_write(true, &cred, &headers)
+                        {
+                            return denied;
+                        }
+                    }
+                    Err(resp) => return resp,
+                }
+            } else if method == "PUT" && key.is_none() {
+                // CreateBucket: JSON stamped via apply_bucket_acl_put.
+            }
+        }
+
         let stamped_delete_at = swift_req.headers.get("X-Delete-At").map(str::to_string);
         // HTTP date conditions are second-precision. Forwarding them to Swift
         // compares against sub-second X-Timestamp and 412s the official
@@ -5018,6 +5097,11 @@ impl S3Api {
 
         if key.is_none() && bucket.is_some() {
             if method == "GET" && (200..300).contains(&resp.status) {
+                if let Some(denied) =
+                    deny_if_bucket_acl_blocks_read(self.s3_acl, &cred, &resp.headers)
+                {
+                    return denied;
+                }
                 let body = match resp.body.into_vec(MAX_CONTROL_BODY) {
                     Ok(b) => b,
                     Err(_) => {
@@ -6320,7 +6404,7 @@ async fn handle_acl_async(
                     "POST",
                     &s3_to_swift_path(&cred.account, Some(bucket), Some(obj)),
                 );
-                apply_object_acl_input(&mut post.headers, &input);
+                apply_object_acl_put(&mut post.headers, &input, &owner.id, false);
                 stamp_auth(&mut post, cred);
                 let resp = async_call(next, post).await;
                 if (200..300).contains(&resp.status) {
@@ -6359,7 +6443,7 @@ async fn handle_acl_async(
                 };
                 let mut post =
                     make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
-                apply_bucket_acl_input(&mut post.headers, &input);
+                apply_bucket_acl_put(&mut post.headers, &input, &owner.id, true);
                 stamp_auth(&mut post, cred);
                 let resp = async_call(next, post).await;
                 if (200..300).contains(&resp.status) {
@@ -6418,7 +6502,7 @@ fn handle_acl(
                     "POST",
                     &s3_to_swift_path(&cred.account, Some(bucket), Some(obj)),
                 );
-                apply_object_acl_input(&mut post.headers, &input);
+                apply_object_acl_put(&mut post.headers, &input, &owner.id, false);
                 stamp_auth(&mut post, cred);
                 let resp = next(post);
                 if (200..300).contains(&resp.status) {
@@ -6457,7 +6541,7 @@ fn handle_acl(
                 };
                 let mut post =
                     make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
-                apply_bucket_acl_input(&mut post.headers, &input);
+                apply_bucket_acl_put(&mut post.headers, &input, &owner.id, true);
                 stamp_auth(&mut post, cred);
                 let resp = next(post);
                 if (200..300).contains(&resp.status) {
@@ -7566,10 +7650,9 @@ async fn handle_mpu_init_async(
 
     map_amz_meta(&mut req);
     match resolve_acl_put_input(&req.headers, None, &owner_for(cred).id) {
-        Ok(input) if !matches!(input, AclPutInput::None) => {
-            apply_object_acl_input(&mut req.headers, &input);
+        Ok(input) => {
+            apply_object_acl_put(&mut req.headers, &input, &owner_for(cred).id, api.s3_acl);
         }
-        Ok(_) => {}
         Err(_) => return s3_error_response("InvalidArgument", None, &[]),
     }
     if let Err(resp) = apply_request_object_lock_headers(&mut req.headers) {
@@ -9693,10 +9776,9 @@ fn handle_versioned_put_once(
         return resp;
     }
     match resolve_acl_put_input(&req.headers, None, &cred.access_key) {
-        Ok(input) if !matches!(input, AclPutInput::None) => {
-            apply_object_acl_input(&mut req.headers, &input);
+        Ok(input) => {
+            apply_object_acl_put(&mut req.headers, &input, &cred.access_key, api.s3_acl);
         }
-        Ok(_) => {}
         Err(_) => return s3_error_response("InvalidArgument", None, &[]),
     }
     if let Err(resp) = apply_request_object_lock_headers(&mut req.headers) {
@@ -11507,10 +11589,9 @@ fn handle_mpu_init(
 
     map_amz_meta(&mut req);
     match resolve_acl_put_input(&req.headers, None, &owner_for(cred).id) {
-        Ok(input) if !matches!(input, AclPutInput::None) => {
-            apply_object_acl_input(&mut req.headers, &input);
+        Ok(input) => {
+            apply_object_acl_put(&mut req.headers, &input, &owner_for(cred).id, api.s3_acl);
         }
-        Ok(_) => {}
         Err(_) => return s3_error_response("InvalidArgument", None, &[]),
     }
     if let Err(resp) = apply_request_object_lock_headers(&mut req.headers) {

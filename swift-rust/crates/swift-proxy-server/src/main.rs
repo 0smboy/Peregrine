@@ -3052,12 +3052,24 @@ fn build_s3api(conf: &SwiftConfig) -> Result<Option<swift_s3api::S3Api>, String>
     };
     let anonymous_account = anon_cfg.or(anon_inferred);
 
+    let s3_acl = conf
+        .get("filter:s3api", "s3_acl")
+        .ok()
+        .flatten()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on" | "t" | "y"
+            )
+        })
+        .unwrap_or(false);
     let mut api = swift_s3api::S3Api::new(creds)
         .with_location(location)
         .with_dns_compliant(dns)
         .with_storage_domains(storage_domains)
         .with_allowable_clock_skew(allowable_clock_skew)
         .with_extended_subresources(extended_subresources)
+        .with_s3_acl(s3_acl)
         .with_reseller_prefix(s3_reseller);
     if let Some(account) = anonymous_account {
         api = api.with_anonymous_account(account);

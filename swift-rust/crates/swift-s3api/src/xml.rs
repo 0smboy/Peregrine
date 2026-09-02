@@ -30,6 +30,9 @@
 /// The S3 API XML namespace used on success-response roots.
 pub const XMLNS_S3: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
+/// XML Schema instance namespace (Python `XMLNS_XSI` in s3api/etree.py).
+pub const XMLNS_XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
+
 /// An XML element node: either a leaf carrying optional text, or a branch
 /// carrying child elements. Mixed content (text + children) is not produced
 /// by any S3 shape, so text is ignored once children are present.
@@ -38,6 +41,10 @@ pub struct Element {
     tag: String,
     text: Option<String>,
     children: Vec<Element>,
+    /// Attribute names/values in insertion order (`xsi:type`, …).
+    attrs: Vec<(String, String)>,
+    /// Prefixed namespace declarations (`xsi` → XMLNS_XSI).
+    ns_decls: Vec<(String, String)>,
 }
 
 impl Element {
@@ -47,6 +54,8 @@ impl Element {
             tag: tag.into(),
             text: None,
             children: Vec::new(),
+            attrs: Vec::new(),
+            ns_decls: Vec::new(),
         }
     }
 
@@ -56,6 +65,8 @@ impl Element {
             tag: tag.into(),
             text: Some(text.into()),
             children: Vec::new(),
+            attrs: Vec::new(),
+            ns_decls: Vec::new(),
         }
     }
 
@@ -68,6 +79,18 @@ impl Element {
     /// Append a leaf `<tag>text</tag>` child and return `self` for chaining.
     pub fn with_leaf(self, tag: impl Into<String>, text: impl Into<String>) -> Element {
         self.with(Element::leaf(tag, text))
+    }
+
+    /// Declare `xmlns:{prefix}="{uri}"` on this element.
+    pub fn with_xmlns(mut self, prefix: impl Into<String>, uri: impl Into<String>) -> Element {
+        self.ns_decls.push((prefix.into(), uri.into()));
+        self
+    }
+
+    /// Set an attribute (`name="value"`).
+    pub fn with_attr(mut self, name: impl Into<String>, value: impl Into<String>) -> Element {
+        self.attrs.push((name.into(), value.into()));
+        self
     }
 
     /// Append an already-built child in place.
@@ -86,6 +109,20 @@ impl Element {
         if let Some(ns) = ns {
             out.push_str(" xmlns=\"");
             escape_attr(out, ns);
+            out.push('"');
+        }
+        for (prefix, uri) in &self.ns_decls {
+            out.push_str(" xmlns:");
+            out.push_str(prefix);
+            out.push_str("=\"");
+            escape_attr(out, uri);
+            out.push('"');
+        }
+        for (name, value) in &self.attrs {
+            out.push(' ');
+            out.push_str(name);
+            out.push_str("=\"");
+            escape_attr(out, value);
             out.push('"');
         }
         if self.children.is_empty() {
@@ -186,5 +223,21 @@ mod tests {
             String::from_utf8(e.to_xml(false)).unwrap(),
             "<?xml version='1.0' encoding='UTF-8'?>\n<Empty/>"
         );
+    }
+
+    #[test]
+    fn test_grantee_xsi_type_canonical_user() {
+        let e = Element::new("Grantee")
+            .with_xmlns("xsi", XMLNS_XSI)
+            .with_attr("xsi:type", "CanonicalUser")
+            .with_leaf("ID", "test:tester")
+            .with_leaf("DisplayName", "test:tester");
+        let got = String::from_utf8(e.to_xml(false)).unwrap();
+        assert!(
+            got.contains("xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\""),
+            "{got}"
+        );
+        assert!(got.contains("xsi:type=\"CanonicalUser\""), "{got}");
+        assert!(got.contains("<ID>test:tester</ID>"), "{got}");
     }
 }

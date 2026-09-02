@@ -60,7 +60,7 @@
 //!   See [`object_canned_allows_anonymous_read`] / [`grants_allow_anonymous_read`].
 //! * CORS `ExposeHeader` / `ID` fields not persisted in the compact encoding.
 
-use crate::xml::Element;
+use crate::xml::{Element, XMLNS_XSI};
 use serde_json::{json, Value};
 use swift_http::{HeaderKeyDict, Response};
 
@@ -92,19 +92,38 @@ pub const S3_BUCKET_ACL_JSON_META: &str = "X-Container-Meta-S3-Acl-Json";
 // ACL
 // ---------------------------------------------------------------------------
 
+fn grantee_canonical_user(id: &str, display_name: &str) -> Element {
+    // Python s3api/subresource.py User.elem(): xmlns:xsi + xsi:type=CanonicalUser.
+    Element::new("Grantee")
+        .with_xmlns("xsi", XMLNS_XSI)
+        .with_attr("xsi:type", "CanonicalUser")
+        .with_leaf("ID", id)
+        .with_leaf("DisplayName", display_name)
+}
+
+fn grantee_group(uri: &str) -> Element {
+    Element::new("Grantee")
+        .with_xmlns("xsi", XMLNS_XSI)
+        .with_attr("xsi:type", "Group")
+        .with_leaf("URI", uri)
+}
+
+fn grantee_email(email: &str) -> Element {
+    Element::new("Grantee")
+        .with_xmlns("xsi", XMLNS_XSI)
+        .with_attr("xsi:type", "AmazonCustomerByEmail")
+        .with_leaf("EmailAddress", email)
+}
+
 fn owner_grant(owner_id: &str) -> Element {
     Element::new("Grant")
-        .with(
-            Element::new("Grantee")
-                .with_leaf("ID", owner_id)
-                .with_leaf("DisplayName", owner_id),
-        )
+        .with(grantee_canonical_user(owner_id, owner_id))
         .with_leaf("Permission", "FULL_CONTROL")
 }
 
 fn group_grant(uri: &str, permission: &str) -> Element {
     Element::new("Grant")
-        .with(Element::new("Grantee").with_leaf("URI", uri))
+        .with(grantee_group(uri))
         .with_leaf("Permission", permission)
 }
 
@@ -340,18 +359,11 @@ fn first_tag_text(text: &str, tag: &str) -> Option<String> {
 fn grant_element(g: &Grant) -> Element {
     let grantee_el = match &g.grantee {
         Grantee::Id { id, display_name } => {
-            let mut el = Element::new("Grantee").with_leaf("ID", id.as_str());
-            if let Some(dn) = display_name {
-                el = el.with_leaf("DisplayName", dn.as_str());
-            } else {
-                el = el.with_leaf("DisplayName", id.as_str());
-            }
-            el
+            let dn = display_name.as_deref().unwrap_or(id.as_str());
+            grantee_canonical_user(id, dn)
         }
-        Grantee::Uri { uri } => Element::new("Grantee").with_leaf("URI", uri.as_str()),
-        Grantee::Email { email } => {
-            Element::new("Grantee").with_leaf("EmailAddress", email.as_str())
-        }
+        Grantee::Uri { uri } => grantee_group(uri),
+        Grantee::Email { email } => grantee_email(email),
     };
     Element::new("Grant")
         .with(grantee_el)
@@ -947,6 +959,102 @@ pub fn object_acl_denies_write(
     )
 }
 
+fn policy_from_bucket_headers(headers: &HeaderKeyDict) -> Option<AccessControlPolicy> {
+    let raw = headers.get(S3_BUCKET_ACL_JSON_META)?;
+    if raw.is_empty() {
+        return None;
+    }
+    let policy = decode_acl_json(raw)?;
+    if policy.grants.is_empty() {
+        return None;
+    }
+    Some(policy)
+}
+
+/// Bucket READ (ListObjects / HEAD bucket) from stored JSON grants.
+pub fn bucket_grants_allow_read(
+    headers: &HeaderKeyDict,
+    principal_access_key: &str,
+    principal_account: &str,
+) -> Option<bool> {
+    let policy = policy_from_bucket_headers(headers)?;
+    if principal_matches(&policy.owner_id, principal_access_key, principal_account) {
+        return Some(true);
+    }
+    for g in &policy.grants {
+        if !permission_allows_object_read(&g.permission) {
+            continue;
+        }
+        match &g.grantee {
+            Grantee::Id { id, .. } => {
+                if principal_matches(id, principal_access_key, principal_account) {
+                    return Some(true);
+                }
+            }
+            Grantee::Uri { uri } => {
+                if uri == ALL_USERS || uri == AUTH_USERS {
+                    return Some(true);
+                }
+            }
+            Grantee::Email { .. } => {}
+        }
+    }
+    Some(false)
+}
+
+/// Bucket WRITE (PUT/DELETE object, PUT bucket ACL) from stored JSON grants.
+pub fn bucket_grants_allow_write(
+    headers: &HeaderKeyDict,
+    principal_access_key: &str,
+    principal_account: &str,
+) -> Option<bool> {
+    let policy = policy_from_bucket_headers(headers)?;
+    if principal_matches(&policy.owner_id, principal_access_key, principal_account) {
+        return Some(true);
+    }
+    for g in &policy.grants {
+        if !permission_allows_object_write(&g.permission) {
+            continue;
+        }
+        match &g.grantee {
+            Grantee::Id { id, .. } => {
+                if principal_matches(id, principal_access_key, principal_account) {
+                    return Some(true);
+                }
+            }
+            Grantee::Uri { uri } => {
+                if uri == ALL_USERS || uri == AUTH_USERS {
+                    return Some(true);
+                }
+            }
+            Grantee::Email { .. } => {}
+        }
+    }
+    Some(false)
+}
+
+pub fn bucket_acl_denies_read(
+    headers: &HeaderKeyDict,
+    principal_access_key: &str,
+    principal_account: &str,
+) -> bool {
+    matches!(
+        bucket_grants_allow_read(headers, principal_access_key, principal_account),
+        Some(false)
+    )
+}
+
+pub fn bucket_acl_denies_write(
+    headers: &HeaderKeyDict,
+    principal_access_key: &str,
+    principal_account: &str,
+) -> bool {
+    matches!(
+        bucket_grants_allow_write(headers, principal_access_key, principal_account),
+        Some(false)
+    )
+}
+
 /// Resolved ACL input for PUT object/bucket (canned takes precedence).
 #[derive(Debug, Clone)]
 pub enum AclPutInput {
@@ -1007,6 +1115,119 @@ pub fn apply_object_acl_input(headers: &mut HeaderKeyDict, input: &AclPutInput) 
         AclPutInput::Canned(c) => apply_object_canned_acl(headers, c),
         AclPutInput::Policy(p) => apply_object_acl_policy(headers, p),
         AclPutInput::None => {}
+    }
+}
+
+/// Canned ACL → structured policy (Python `canned_acl_grantees`).
+pub fn policy_from_canned(owner_id: &str, canned: &str) -> AccessControlPolicy {
+    let owner_grant = Grant {
+        grantee: Grantee::Id {
+            id: owner_id.to_string(),
+            display_name: Some(owner_id.to_string()),
+        },
+        permission: "FULL_CONTROL".into(),
+    };
+    let all_users_read = Grant {
+        grantee: Grantee::Uri {
+            uri: ALL_USERS.to_string(),
+        },
+        permission: "READ".into(),
+    };
+    let all_users_write = Grant {
+        grantee: Grantee::Uri {
+            uri: ALL_USERS.to_string(),
+        },
+        permission: "WRITE".into(),
+    };
+    let auth_read = Grant {
+        grantee: Grantee::Uri {
+            uri: AUTH_USERS.to_string(),
+        },
+        permission: "READ".into(),
+    };
+    match canned.trim() {
+        "public-read" => AccessControlPolicy {
+            owner_id: owner_id.to_string(),
+            owner_display_name: Some(owner_id.to_string()),
+            grants: vec![owner_grant, all_users_read],
+        },
+        "public-read-write" => AccessControlPolicy {
+            owner_id: owner_id.to_string(),
+            owner_display_name: Some(owner_id.to_string()),
+            grants: vec![owner_grant, all_users_read, all_users_write],
+        },
+        "authenticated-read" => AccessControlPolicy {
+            owner_id: owner_id.to_string(),
+            owner_display_name: Some(owner_id.to_string()),
+            grants: vec![owner_grant, auth_read],
+        },
+        _ => AccessControlPolicy::private(owner_id),
+    }
+}
+
+fn stamp_object_canned_with_json(headers: &mut HeaderKeyDict, canned: &str, owner_id: &str) {
+    let name = normalize_object_canned_acl(canned);
+    headers.set(S3_OBJECT_ACL_META, name);
+    headers.set(
+        S3_OBJECT_ACL_JSON_META,
+        encode_acl_json(&policy_from_canned(owner_id, canned)),
+    );
+}
+
+fn stamp_bucket_canned_with_json(headers: &mut HeaderKeyDict, canned: &str, owner_id: &str) {
+    apply_canned_acl(headers, canned);
+    headers.set(
+        S3_BUCKET_ACL_JSON_META,
+        encode_acl_json(&policy_from_canned(owner_id, canned)),
+    );
+}
+
+/// Object PUT ACL with Python `s3_acl` default-private stamping.
+///
+/// When `default_private` is true (live `[filter:s3api] s3_acl = true`), a
+/// missing canned/grant/ACP body becomes canned `private` **and** JSON grants
+/// so GET/HEAD deny helpers can 403 non-owners. When false, `None` is a no-op
+/// (historical non-s3_acl path).
+pub fn apply_object_acl_put(
+    headers: &mut HeaderKeyDict,
+    input: &AclPutInput,
+    owner_id: &str,
+    default_private: bool,
+) {
+    let resolved = match input {
+        AclPutInput::None if default_private => AclPutInput::Canned("private".into()),
+        other => other.clone(),
+    };
+    match &resolved {
+        AclPutInput::None => {}
+        AclPutInput::Canned(c) => stamp_object_canned_with_json(headers, c, owner_id),
+        AclPutInput::Policy(p) => apply_object_acl_policy(headers, p),
+    }
+}
+
+/// Bucket PUT ACL. `None` already maps to canned private container headers;
+/// with `default_private` also persist JSON grants for same-account alt-user
+/// enforcement (TempAuth Swift-owner override bypasses container ACL).
+pub fn apply_bucket_acl_put(
+    headers: &mut HeaderKeyDict,
+    input: &AclPutInput,
+    owner_id: &str,
+    default_private: bool,
+) {
+    let resolved = match input {
+        AclPutInput::None if default_private => AclPutInput::Canned("private".into()),
+        other => other.clone(),
+    };
+    match &resolved {
+        AclPutInput::None => apply_canned_acl(headers, "private"),
+        AclPutInput::Canned(c) => {
+            if default_private || !c.is_empty() {
+                stamp_bucket_canned_with_json(headers, c, owner_id);
+            } else {
+                apply_canned_acl(headers, c);
+            }
+        }
+        AclPutInput::Policy(p) => apply_bucket_acl_policy(headers, p),
     }
 }
 
@@ -1831,5 +2052,42 @@ mod tests {
             object_grants_allow_read(&h3, "friend-ak", "AUTH_friend"),
             Some(false)
         );
+    }
+    #[test]
+    fn private_acl_xml_emits_xsi_type_canonical_user() {
+        let xml = String::from_utf8(private_acl_xml("test:tester")).unwrap();
+        assert!(xml.contains("xsi:type=\"CanonicalUser\""), "{xml}");
+        assert!(
+            xml.contains("xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\""),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn apply_object_acl_put_default_private_stamps_json() {
+        let mut h = HeaderKeyDict::new();
+        apply_object_acl_put(&mut h, &AclPutInput::None, "test:tester", true);
+        assert_eq!(h.get(S3_OBJECT_ACL_META), Some("private"));
+        let raw = h.get(S3_OBJECT_ACL_JSON_META).expect("json");
+        assert!(!raw.is_empty(), "{raw}");
+        assert!(object_acl_denies_read(&h, "test:tester2", "AUTH_test"));
+        assert!(!object_acl_denies_read(&h, "test:tester", "AUTH_test"));
+    }
+
+    #[test]
+    fn apply_object_acl_put_none_without_flag_is_noop() {
+        let mut h = HeaderKeyDict::new();
+        apply_object_acl_put(&mut h, &AclPutInput::None, "test:tester", false);
+        assert!(h.get(S3_OBJECT_ACL_JSON_META).unwrap_or("").is_empty());
+        assert!(!object_acl_denies_read(&h, "test:tester2", "AUTH_test"));
+    }
+
+    #[test]
+    fn apply_bucket_acl_put_default_private_denies_alt() {
+        let mut h = HeaderKeyDict::new();
+        apply_bucket_acl_put(&mut h, &AclPutInput::None, "test:tester", true);
+        assert!(bucket_acl_denies_read(&h, "test:tester2", "AUTH_test"));
+        assert!(!bucket_acl_denies_read(&h, "test:tester", "AUTH_test"));
+        assert!(bucket_acl_denies_write(&h, "test:tester2", "AUTH_test"));
     }
 }
