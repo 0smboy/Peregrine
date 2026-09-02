@@ -232,6 +232,15 @@ pub fn amz_date(req: &Request) -> Option<String> {
         .map(str::to_string)
 }
 
+/// SigV4 string-to-sign line 2 is always `YYYYMMDDThhmmssZ` (Python
+/// `signing_timestamp.amz_date_format`), even when the wire header is
+/// IMF-fixdate / `Date: … -0000` and `X-Amz-Date` is absent.
+pub fn signing_amz_date(req: &Request) -> Option<String> {
+    let raw = amz_date(req)?;
+    let ts = parse_amz_date(&raw).or_else(|| parse_http_date(&raw))?;
+    Some(format_amz_date(ts))
+}
+
 /// Parse `YYYYMMDDThhmmssZ` to unix seconds. Experimental; not AWS-complete.
 pub fn parse_amz_date(s: &str) -> Option<i64> {
     let s = s.trim();
@@ -529,7 +538,7 @@ pub fn payload_hash(req: &Request) -> String {
 /// `/v3/s3tokens` (Python `s3api.auth_details['string_to_sign']`).
 pub fn string_to_sign_for_request(req: &Request) -> Option<String> {
     let auth = parse_sigv4_auth(req)?;
-    let date = amz_date(req)?;
+    let date = signing_amz_date(req)?;
     let hts = headers_to_sign(&req.headers, &auth.signed_headers)?;
     let cr = canonical_request(
         &req.method,
@@ -568,9 +577,12 @@ pub fn verify_sigv4(
     if let Some(now) = now_unix {
         check_sigv4_time(req, now, allowable_clock_skew.unwrap_or(u64::MAX))?;
     }
-    let date = match amz_date(req) {
+    let date = match signing_amz_date(req) {
         Some(d) => d,
         None => {
+            if amz_date(req).is_some() {
+                return Err(SigAuthError::InvalidDate);
+            }
             if auth.query_auth {
                 return Err(SigAuthError::SignatureDoesNotMatch);
             }
@@ -819,6 +831,51 @@ mod tests {
             SigAuthError::InvalidDate.s3_message(),
             Some("AWS authentication requires a valid Date or x-amz-date header")
         );
+    }
+
+    #[test]
+    fn test_verify_sigv4_date_header_rfc1123_minus_zero() {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Host", "examplebucket.s3.amazonaws.com");
+        headers.set("Date", "Fri, 24 May 2013 00:00:00 -0000");
+        headers.set(
+            "x-amz-content-sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        );
+        let scope = CredentialScope {
+            date: "20130524".into(),
+            region: "us-east-1".into(),
+            service: "s3".into(),
+            terminal: "aws4_request".into(),
+        };
+        let hts = headers_to_sign(
+            &headers,
+            &["date".into(), "host".into(), "x-amz-content-sha256".into()],
+        )
+        .unwrap();
+        let cr = canonical_request(
+            "GET",
+            "/test.txt",
+            "",
+            &hts,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        );
+        let sig = compute_signature(SECRET, &scope, "20130524T000000Z", &cr);
+        headers.set(
+            "Authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential={ACCESS}/20130524/us-east-1/s3/aws4_request, SignedHeaders=date;host;x-amz-content-sha256, Signature={sig}"
+            ),
+        );
+        let req = Request {
+            method: "GET".into(),
+            path: "/test.txt".into(),
+            query_string: String::new(),
+            headers,
+            body: swift_http::Body::empty(),
+        };
+        assert_eq!(signing_amz_date(&req).as_deref(), Some("20130524T000000Z"));
+        assert_eq!(verify_sigv4(ACCESS, SECRET, &req, None, None), Ok(()));
     }
 
     #[test]
