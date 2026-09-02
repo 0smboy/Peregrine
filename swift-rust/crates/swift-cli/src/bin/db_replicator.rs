@@ -42,9 +42,8 @@ use swift_core::statsd::StatsdClient;
 use swift_core::timestamp::{decode_timestamps, Timestamp};
 use swift_db::{
     replicate_account_db, replicate_completion_rpc, replicate_container_db_role,
-    replicator_run_once as run_once, rsync_db, AccountBroker,
-    ContainerBroker, DbError, DbPartition, DbReplicateClient, DbState, DbValue, ObjectRecord,
-    RsyncTransport,
+    replicator_run_once as run_once, rsync_db, AccountBroker, ContainerBroker, DbError,
+    DbPartition, DbReplicateClient, DbState, DbValue, ObjectRecord, RsyncTransport,
 };
 use swift_ring::{Ring, RingData, RingDevice};
 
@@ -379,10 +378,12 @@ impl DbClient {
 }
 
 fn info_text(info: &[(String, DbValue)], key: &str) -> Option<String> {
-    info.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
-        DbValue::Text(s) if !s.is_empty() => Some(s.clone()),
-        _ => None,
-    })
+    info.iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| match v {
+            DbValue::Text(s) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        })
 }
 
 impl DbReplicateClient for DbClient {
@@ -489,18 +490,16 @@ impl DbReplicateClient for DbClient {
                     // usync can't converge the peer: stage the DB and have
                     // the peer merge its own rows into it before adopting
                     // (rsync_then_merge, db_replicator.py:579-591)
-                    Ok(outcome) if outcome.usync_incomplete => {
-                        rsync_db(
-                            &db.path,
-                            &local_id,
-                            &peer_host,
-                            &peer.device,
-                            &partition,
-                            &db.hash,
-                            "rsync_then_merge",
-                            &self.rsync,
-                        )
-                    }
+                    Ok(outcome) if outcome.usync_incomplete => rsync_db(
+                        &db.path,
+                        &local_id,
+                        &peer_host,
+                        &peer.device,
+                        &partition,
+                        &db.hash,
+                        "rsync_then_merge",
+                        &self.rsync,
+                    ),
                     Ok(_) => true,
                     Err(e) => {
                         eprintln!("db-replicator: container push to {peer_host} failed: {e}");
@@ -966,9 +965,7 @@ mod tests {
             .unwrap();
         assert_eq!(dest, "/srv/3/node/sdb3/tmp/handoff-id");
         assert!(ssh.is_none());
-        assert!(rsync
-            .rsync_dest("127.0.0.2:16221", "sdb2", "x")
-            .is_none());
+        assert!(rsync.rsync_dest("127.0.0.2:16221", "sdb2", "x").is_none());
     }
 
     #[test]

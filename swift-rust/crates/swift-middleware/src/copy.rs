@@ -194,7 +194,6 @@ fn set_multipart_manifest_param(query: &str, value: Option<&str>) -> String {
         .join("&")
 }
 
-
 /// Python `copy.py` sink_req drops `version-id` so the destination PUT is
 /// not a version-aware operation (restore-old-as-latest is PUT ?version-id
 /// on the object itself, not COPY). `symlink=get` is a source-GET
@@ -510,8 +509,7 @@ impl Copy {
         let mut resp = next(req).await;
         resp.headers
             .set("X-Copied-From", format!("{src_container}/{src_object}"));
-        resp.headers
-            .set("X-Copied-From-Account", src_account);
+        resp.headers.set("X-Copied-From-Account", src_account);
         resp
     }
 }
@@ -681,10 +679,7 @@ mod tests {
         assert_eq!(resp.status, 201);
         let calls = log.lock().unwrap();
         let dest_put = calls.iter().find(|c| c.method == "PUT").unwrap();
-        assert_eq!(
-            dest_put.headers.get("X-Symlink-Target"),
-            Some("tgtc/tgto")
-        );
+        assert_eq!(dest_put.headers.get("X-Symlink-Target"), Some("tgtc/tgto"));
     }
 
     #[test]
@@ -722,12 +717,8 @@ mod tests {
             "source GET must keep ?symlink=get"
         );
         let dest_put = calls.iter().find(|c| c.method == "PUT").unwrap();
-        assert_eq!(
-            dest_put.headers.get("X-Symlink-Target"),
-            Some("tgtc/tgto")
-        );
+        assert_eq!(dest_put.headers.get("X-Symlink-Target"), Some("tgtc/tgto"));
     }
-
 
     #[test]
     fn test_strip_sink_source_params_drops_version_id_and_symlink() {
@@ -775,7 +766,9 @@ mod tests {
         let calls = log.lock().unwrap();
         let source_get = calls.iter().find(|c| c.method == "GET").unwrap();
         assert!(
-            source_get.query_string.contains("version-id=1787766177.51067"),
+            source_get
+                .query_string
+                .contains("version-id=1787766177.51067"),
             "source GET must keep version-id: {}",
             source_get.query_string
         );
@@ -832,9 +825,11 @@ mod tests {
         assert_eq!(source_get.query_string, "version-id=1234567890.12345");
         let dest_put = calls.iter().find(|c| c.method == "PUT").unwrap();
         assert_eq!(dest_put.query_string, "");
-        assert_eq!(dest_put.headers.get("Content-Type"), Some("text/jibberish01"));
+        assert_eq!(
+            dest_put.headers.get("Content-Type"),
+            Some("text/jibberish01")
+        );
     }
-
 
     #[test]
     fn test_copy_method_keeps_percent_encoded_slash_in_object_name() {
@@ -851,8 +846,7 @@ mod tests {
         assert_eq!(resp.status, 201);
         let calls = log.lock().unwrap();
         assert_eq!(
-            calls[0].path,
-            "/v1/AUTH_test/srcc/dealde%2Fl04 011e%204c8df/flash.png",
+            calls[0].path, "/v1/AUTH_test/srcc/dealde%2Fl04 011e%204c8df/flash.png",
             "GET source must keep literal %2F and the real slash"
         );
         assert_eq!(calls[1].path, "/v1/AUTH_test/dstc/dsto");

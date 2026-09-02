@@ -542,26 +542,14 @@ mod tests {
     #[test]
     fn object_lock_action_mapping_is_additive() {
         assert_eq!(
-            IamService::s3_object_lock_actions(
-                "PUT",
-                Some("retention"),
-                false,
-                false,
-                true,
-            ),
+            IamService::s3_object_lock_actions("PUT", Some("retention"), false, false, true,),
             vec![
                 S3_ACTION_PUT_OBJECT_RETENTION,
                 S3_ACTION_BYPASS_GOVERNANCE_RETENTION,
             ]
         );
         assert_eq!(
-            IamService::s3_object_lock_actions(
-                "PUT",
-                Some("legal-hold"),
-                false,
-                false,
-                false,
-            ),
+            IamService::s3_object_lock_actions("PUT", Some("legal-hold"), false, false, false,),
             vec![S3_ACTION_PUT_OBJECT_LEGAL_HOLD]
         );
         assert_eq!(

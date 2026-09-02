@@ -210,10 +210,7 @@ mod tests {
     #[test]
     fn test_db_locations_skips_renamed_hash_tmp() {
         // deleted_child L4484: sharder/replicator must not see `{hash}.tmp`.
-        let dir = std::env::temp_dir().join(format!(
-            "swift-hash-tmp-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("swift-hash-tmp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let device = dir.join("sda1");
         let hsh = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

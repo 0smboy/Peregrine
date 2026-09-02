@@ -346,10 +346,7 @@ mod tests {
         // SHARDING dirs have <hash>.db + <hash>_<epoch>.db. Python walks
         // broker.db_file (freshest). Two entries would rsync the epoch
         // file onto the peer as <hash>.db (probe L1347).
-        let dir = std::env::temp_dir().join(format!(
-            "swift-repl-dedup-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("swift-repl-dedup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let device = dir.join("sda1");
         let hash = make_db(&device, 0);
@@ -415,10 +412,8 @@ mod tests {
 
     #[test]
     fn test_run_once_removes_handoff_after_all_peers_ok() {
-        let dir = std::env::temp_dir().join(format!(
-            "swift-repl-handoff-rm-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("swift-repl-handoff-rm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let device = dir.join("sda1");
         let hash = make_db(&device, 0);
@@ -476,10 +471,8 @@ mod tests {
 
     #[test]
     fn test_run_once_keeps_handoff_when_a_peer_fails() {
-        let dir = std::env::temp_dir().join(format!(
-            "swift-repl-handoff-keep-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("swift-repl-handoff-keep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let device = dir.join("sda1");
         let hash = make_db(&device, 0);
@@ -497,10 +490,8 @@ mod tests {
 
     #[test]
     fn test_run_once_keeps_primary_db() {
-        let dir = std::env::temp_dir().join(format!(
-            "swift-repl-primary-keep-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("swift-repl-primary-keep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let device = dir.join("sda1");
         let hash = make_db(&device, 0);
@@ -527,10 +518,7 @@ mod tests {
     fn test_run_once_wrong_partition_replicates_to_ring_part_then_rmtree() {
         // Python `_replicate_object`: bpart != on-disk partition → push to
         // the correct partition's primaries, then delete the misplaced copy.
-        let dir = std::env::temp_dir().join(format!(
-            "swift-repl-wrongpart-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("swift-repl-wrongpart-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let device = dir.join("sda1");
         let hash = make_db(&device, 0);

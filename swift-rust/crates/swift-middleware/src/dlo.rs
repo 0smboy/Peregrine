@@ -1277,10 +1277,7 @@ mod tests {
         let dlo = DynamicLargeObject::new();
         let mut req = get_req("/v1/a/c/manifest", Some("bytes=100-200"));
         assert!(matches!(dlo.prepare(&mut req), crate::MwPrep::Continue));
-        assert_eq!(
-            req.headers.get(IGNORE_RANGE_HDR),
-            Some(X_OBJECT_MANIFEST)
-        );
+        assert_eq!(req.headers.get(IGNORE_RANGE_HDR), Some(X_OBJECT_MANIFEST));
         // Raw-manifest GET must still honour Range on the stored object.
         let mut raw = get_req("/v1/a/c/manifest", Some("bytes=0-0"));
         raw.query_string = "multipart-manifest=get".into();
@@ -1406,7 +1403,10 @@ mod tests {
             Box::pin(async move { sync(r) })
         });
         let unsat = dlo
-            .reassemble_async(get_req("/v1/a/c/manifest", Some("bytes=100-200")), next.clone())
+            .reassemble_async(
+                get_req("/v1/a/c/manifest", Some("bytes=100-200")),
+                next.clone(),
+            )
             .await;
         assert_eq!(unsat.status, 416, "{}", unsat.reason);
         let mut ranged = dlo

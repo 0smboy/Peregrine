@@ -424,9 +424,10 @@ fn header_date_missing(req: &Request) -> bool {
         .or_else(|| req.headers.get("date"))
         .map(|v| v.trim().is_empty())
         .unwrap_or(true);
-    let amz_empty = !req.headers.iter().any(|(k, v)| {
-        k.eq_ignore_ascii_case("x-amz-date") && !v.trim().is_empty()
-    });
+    let amz_empty = !req
+        .headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("x-amz-date") && !v.trim().is_empty());
     date_empty && amz_empty
 }
 

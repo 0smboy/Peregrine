@@ -326,13 +326,7 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
     // (the footers' overrides), not the fragment archive's. Check this before
     // staging a newer non-durable generation: Python still emits a container
     // update for that internal PUT, while object GET durability is independent.
-    let (status, _, listing) = http(
-        proxy_addr,
-        "GET",
-        "/v1/AUTH_ec/ecbox?format=json",
-        &[],
-        b"",
-    );
+    let (status, _, listing) = http(proxy_addr, "GET", "/v1/AUTH_ec/ecbox?format=json", &[], b"");
     assert_eq!(status, 200, "container listing");
     let entries: serde_json::Value = serde_json::from_slice(&listing).unwrap();
     let entry = entries
@@ -365,10 +359,7 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
     assert_eq!(status, 201, "non-durable EC object PUT");
     let mut nondurable = 0;
     for d in &obj_dirs {
-        nondurable += find_files(d, &|n| {
-            n.ends_with(".data") && !n.ends_with("#d.data")
-        })
-        .len();
+        nondurable += find_files(d, &|n| n.ends_with(".data") && !n.ends_with("#d.data")).len();
     }
     assert_eq!(
         nondurable, N,

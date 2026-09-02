@@ -78,12 +78,10 @@ impl BackpressureWindow {
                     limit: self.limit,
                 });
             }
-            match self.pending.compare_exchange_weak(
-                cur,
-                next,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
+            match self
+                .pending
+                .compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
                 Ok(_) => return Ok(()),
                 Err(actual) => cur = actual,
             }
@@ -94,12 +92,10 @@ impl BackpressureWindow {
         let mut cur = self.pending.load(Ordering::SeqCst);
         loop {
             let next = cur.saturating_sub(n);
-            match self.pending.compare_exchange_weak(
-                cur,
-                next,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
+            match self
+                .pending
+                .compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
                 Ok(_) => return,
                 Err(actual) => cur = actual,
             }

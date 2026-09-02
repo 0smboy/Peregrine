@@ -324,10 +324,7 @@ fn percent_decode(input: &str) -> String {
 }
 
 fn ensure_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
-    if !headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case(name))
-    {
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name)) {
         headers.push((name.to_string(), value.to_string()));
     }
 }
@@ -414,11 +411,7 @@ impl UpdaterStats {
 
     fn track_update_failure(&mut self, update: &AsyncUpdate) {
         if let Ok(timestamp) = update.timestamp.parse::<Timestamp>() {
-            self.track_failure(
-                &update.account,
-                &update.container,
-                timestamp.as_secs_f64(),
-            );
+            self.track_failure(&update.account, &update.container, timestamp.as_secs_f64());
         }
     }
 
@@ -434,11 +427,7 @@ impl UpdaterStats {
         self.errors += other.errors;
         self.redirects += other.redirects;
         for failure in other.failed_updates {
-            self.track_failure(
-                &failure.account,
-                &failure.container,
-                failure.timestamp,
-            );
+            self.track_failure(&failure.account, &failure.container, failure.timestamp);
         }
     }
 }
@@ -488,7 +477,9 @@ pub fn process_update(
         stats.successes += 1;
         stats.unlinks += 1;
         Ok(UpdateOutcome::Unlinked)
-    } else if let Some(dest) = redirects.iter().find_map(|loc| redirect_container_path(loc))
+    } else if let Some(dest) = redirects
+        .iter()
+        .find_map(|loc| redirect_container_path(loc))
     {
         // Python: erase successes, persist container_path, retry once.
         match update.repickle_redirect(&dest) {
@@ -539,8 +530,7 @@ pub fn process_update_following_redirects(
             retry.container_path = Some(dest);
             retry.successes.clear();
             let (acct, cont) = retry.ring_account_container();
-            let Ok((retry_part, retry_nodes)) =
-                container_ring.get_nodes(acct, Some(cont), None)
+            let Ok((retry_part, retry_nodes)) = container_ring.get_nodes(acct, Some(cont), None)
             else {
                 stats.errors += 1;
                 return Ok(UpdateOutcome::Failed);
@@ -679,9 +669,7 @@ pub fn run_once_with_concurrency_and_tracker(
     if concurrency == 1 {
         for update in updates {
             let (acct, cont) = update.ring_account_container();
-            let Ok((part, nodes)) =
-                container_ring.get_nodes(acct, Some(cont), None)
-            else {
+            let Ok((part, nodes)) = container_ring.get_nodes(acct, Some(cont), None) else {
                 stats.errors += 1;
                 continue;
             };
@@ -709,9 +697,7 @@ pub fn run_once_with_concurrency_and_tracker(
                 let stats = &stats;
                 scope.spawn(move || {
                     let (acct, cont) = update.ring_account_container();
-                    let Ok((part, nodes)) =
-                        container_ring.get_nodes(acct, Some(cont), None)
-                    else {
+                    let Ok((part, nodes)) = container_ring.get_nodes(acct, Some(cont), None) else {
                         stats.lock().unwrap().errors += 1;
                         return;
                     };
@@ -994,7 +980,11 @@ X-Backend-Redirect-Timestamp: 1.00000\r\n\r\n";
         let ap = dir.join("async_pending/abc");
         std::fs::create_dir_all(&ap).unwrap();
         let file = ap.join("00000000000000000000000000000abc-1751500000.00000");
-        std::fs::write(&file, make_async_pickle("PUT", "AUTH_test", "root", "alpha")).unwrap();
+        std::fs::write(
+            &file,
+            make_async_pickle("PUT", "AUTH_test", "root", "alpha"),
+        )
+        .unwrap();
         let mut stats = UpdaterStats::default();
         let updates = iter_async_pendings(&dir, &mut stats);
         let client = FakeClient {

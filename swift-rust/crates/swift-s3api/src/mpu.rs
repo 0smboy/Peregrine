@@ -498,7 +498,13 @@ mod tests {
             "owner",
         ))
         .unwrap();
-        assert!(xml2.contains("<NextKeyMarker>obj3</NextKeyMarker>"), "{xml2}");
-        assert!(xml2.contains("<NextUploadIdMarker>u2</NextUploadIdMarker>"), "{xml2}");
+        assert!(
+            xml2.contains("<NextKeyMarker>obj3</NextKeyMarker>"),
+            "{xml2}"
+        );
+        assert!(
+            xml2.contains("<NextUploadIdMarker>u2</NextUploadIdMarker>"),
+            "{xml2}"
+        );
     }
 }

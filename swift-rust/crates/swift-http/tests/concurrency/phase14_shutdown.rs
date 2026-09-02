@@ -28,10 +28,7 @@ use swift_runtime::{
     StorageExecutorConfig,
 };
 
-fn spawn_metrics(
-    metrics: ConcurrencyMetrics,
-    handler: Handler,
-) -> harness::Server {
+fn spawn_metrics(metrics: ConcurrencyMetrics, handler: Handler) -> harness::Server {
     spawn_metrics_cfg(metrics, handler, |_| {})
 }
 
@@ -183,10 +180,15 @@ fn cancellable_inflight_is_cancelled_when_not_in_commit_shield() {
     while !parked.load(Ordering::SeqCst) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(5));
     }
-    assert!(parked.load(Ordering::SeqCst), "yielding handler never started");
+    assert!(
+        parked.load(Ordering::SeqCst),
+        "yielding handler never started"
+    );
     let before = Instant::now();
     server.shutdown.store(true, Ordering::SeqCst);
-    let (status, _) = rx.recv_timeout(Duration::from_secs(2)).unwrap_or((0, Duration::ZERO));
+    let (status, _) = rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or((0, Duration::ZERO));
     let after = before.elapsed();
     assert!(
         !finished.load(Ordering::SeqCst),
@@ -336,11 +338,8 @@ async fn commit_shield_survives_shutdown_and_gauges_are_readable() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_deadline_forces_http_without_ambiguous_commit() {
-    let dir = std::env::temp_dir().join(format!(
-        "phase14-force-{}-{}",
-        std::process::id(),
-        line!()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("phase14-force-{}-{}", std::process::id(), line!()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("sda1")).unwrap();
     let entered = Arc::new(AtomicBool::new(false));
@@ -383,7 +382,10 @@ async fn shutdown_deadline_forces_http_without_ambiguous_commit() {
     while !entered.load(Ordering::SeqCst) && Instant::now() < entered_deadline {
         thread::sleep(Duration::from_millis(5));
     }
-    assert!(entered.load(Ordering::SeqCst), "PUT never entered commit stall");
+    assert!(
+        entered.load(Ordering::SeqCst),
+        "PUT never entered commit stall"
+    );
     shutdown.store(true, Ordering::SeqCst);
     let forced_at = Instant::now();
     let put_status = put_rx.recv_timeout(Duration::from_secs(12)).unwrap_or(0);

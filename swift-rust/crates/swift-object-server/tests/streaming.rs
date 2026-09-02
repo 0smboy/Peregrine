@@ -227,9 +227,7 @@ fn head_serves_metadata_without_reading_a_corrupt_data_file() {
 
 #[test]
 fn complete_stream_quarantines_bad_etag_before_consumer_drop() {
-    use swift_diskfile::{
-        read_metadata, write_metadata, MetaValue, DEFAULT_XATTR_SIZE,
-    };
+    use swift_diskfile::{read_metadata, write_metadata, MetaValue, DEFAULT_XATTR_SIZE};
 
     let devices = TestDevices::new("quarantine-before-drop");
     let server = server(devices.path());
@@ -263,7 +261,10 @@ fn complete_stream_quarantines_bad_etag_before_consumer_drop() {
         !data_file.exists(),
         "bad ETag remained readable until response-reader drop"
     );
-    assert_eq!(server.handle(request("GET", "1", Body::empty())).status, 404);
+    assert_eq!(
+        server.handle(request("GET", "1", Body::empty())).status,
+        404
+    );
 }
 
 #[test]
@@ -295,9 +296,7 @@ fn single_range_get_streams_the_window() {
 
 #[test]
 fn full_covering_range_quarantines_bad_etag() {
-    use swift_diskfile::{
-        read_metadata, write_metadata, MetaValue, DEFAULT_XATTR_SIZE,
-    };
+    use swift_diskfile::{read_metadata, write_metadata, MetaValue, DEFAULT_XATTR_SIZE};
 
     let devices = TestDevices::new("range-full-quarantine");
     let server = server(devices.path());
@@ -329,7 +328,10 @@ fn full_covering_range_quarantines_bad_etag() {
         !data_file.exists(),
         "full-covering range left a bad ETag object readable"
     );
-    assert_eq!(server.handle(request("GET", "1", Body::empty())).status, 404);
+    assert_eq!(
+        server.handle(request("GET", "1", Body::empty())).status,
+        404
+    );
 }
 
 #[test]

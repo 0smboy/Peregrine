@@ -184,12 +184,7 @@ mod tests {
         stats.track_failure("AUTH_first", "c", 1_700_000_080.0);
         stats.track_failure("AUTH_middle", "c", 1_700_000_080.0);
         stats.track_failure("AUTH_evicted", "c", 1_700_000_095.0);
-        let update = updater_recon_update(
-            &stats,
-            Duration::from_secs(7),
-            1_700_000_100.0,
-            2,
-        );
+        let update = updater_recon_update(&stats, Duration::from_secs(7), 1_700_000_100.0, 2);
         assert_eq!(update["object_updater_sweep"].as_f64().unwrap(), 7.0);
         assert_eq!(
             update["object_updater_last"].as_f64().unwrap(),
@@ -203,8 +198,8 @@ mod tests {
             update["object_updater_stats"]["failures_account_container_count"],
             3
         );
-        let oldest = &update["object_updater_stats"]
-            ["failures_oldest_timestamp_account_containers"];
+        let oldest =
+            &update["object_updater_stats"]["failures_oldest_timestamp_account_containers"];
         assert_eq!(oldest["oldest_count"], 2);
         assert_eq!(oldest["oldest_entries"][0]["account"], "AUTH_first");
         assert_eq!(oldest["oldest_entries"][0]["timestamp"], 1_700_000_070.0);

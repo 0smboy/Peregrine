@@ -206,11 +206,7 @@ mod tests {
         // quotes the request-line; quoting here double-encodes and listing
         // then returns object2-%D8%AA instead of object2-ت.
         assert_eq!(
-            s3_to_swift_path(
-                "AUTH_test",
-                Some("b"),
-                Some("object name with %-sign 🙂")
-            ),
+            s3_to_swift_path("AUTH_test", Some("b"), Some("object name with %-sign 🙂")),
             "/v1/AUTH_test/b/object name with %-sign 🙂"
         );
     }

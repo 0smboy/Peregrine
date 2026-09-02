@@ -80,7 +80,9 @@ fn parse_iso_like_to_epoch(value: &str) -> Option<i64> {
     let h: i64 = tparts.next()?.parse().ok()?;
     let mi: i64 = tparts.next()?.parse().ok()?;
     let se: i64 = tparts.next()?.parse().ok()?;
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&da) || !(0..=23).contains(&h)
+    if !(1..=12).contains(&mo)
+        || !(1..=31).contains(&da)
+        || !(0..=23).contains(&h)
         || !(0..=59).contains(&mi)
         || se > 60
     {
@@ -114,7 +116,9 @@ fn fractional_part_nonzero(value: &str) -> bool {
     let Some((_, rest)) = value.split_once('.') else {
         return false;
     };
-    rest.chars().take_while(|c| c.is_ascii_digit()).any(|c| c != '0')
+    rest.chars()
+        .take_while(|c| c.is_ascii_digit())
+        .any(|c| c != '0')
 }
 
 fn parse_iso_like_to_epoch_ceil(value: &str) -> Option<i64> {
@@ -577,7 +581,8 @@ impl ListBucketResult {
             elem.push(object_element(obj, enc));
         }
         for prefix in &self.common_prefixes {
-            let cp = Element::new("CommonPrefixes").with_leaf("Prefix", maybe_uri_encode(enc, prefix));
+            let cp =
+                Element::new("CommonPrefixes").with_leaf("Prefix", maybe_uri_encode(enc, prefix));
             elem.push(cp);
         }
         elem.to_xml(true)
@@ -635,7 +640,8 @@ impl ListBucketResultV2 {
             elem.push(object_element(obj, enc));
         }
         for prefix in &self.common_prefixes {
-            let cp = Element::new("CommonPrefixes").with_leaf("Prefix", maybe_uri_encode(enc, prefix));
+            let cp =
+                Element::new("CommonPrefixes").with_leaf("Prefix", maybe_uri_encode(enc, prefix));
             elem.push(cp);
         }
         elem.to_xml(true)
@@ -1401,9 +1407,11 @@ mod tests {
             "2013-05-24T00:00:00.000Z"
         );
         assert_eq!(s3_xml_timestamp("not-a-date"), "1970-01-01T00:00:00.000Z");
-        let http_copy =
-            String::from_utf8(copy_object_result_xml("Fri, 24 May 2013 00:00:00 GMT", "ff"))
-                .unwrap();
+        let http_copy = String::from_utf8(copy_object_result_xml(
+            "Fri, 24 May 2013 00:00:00 GMT",
+            "ff",
+        ))
+        .unwrap();
         assert!(http_copy.contains("<LastModified>2013-05-24T00:00:00.000Z</LastModified>"));
         assert!(!http_copy.contains("Fri, 24 May"));
     }
@@ -1438,9 +1446,6 @@ mod tests {
         );
         assert_eq!(parse_select_star(b"SELECT _1 FROM S3Object"), None);
         assert_eq!(parse_select_star(b"SELECT * FROM S3Object WHERE a=1"), None);
-        assert_eq!(
-            apply_select_limit(b"a\nb\nc\n", 2),
-            b"a\nb\n".to_vec()
-        );
+        assert_eq!(apply_select_limit(b"a\nb\nc\n", 2), b"a\nb\n".to_vec());
     }
 }

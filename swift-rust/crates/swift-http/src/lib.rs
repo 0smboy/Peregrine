@@ -53,10 +53,10 @@ pub use request::{
     percent_decode_bytes, reason_phrase, split_path, unquote, Request, Response,
 };
 pub use server::{
-    bind_listener, install_sigterm_flag, serve_forever, serve_forever_multi,
-    serve_forever_multi_service, serve_forever_with_config, set_listen_backlog, AccessLog,
-    AsyncRequest, AsyncService, BodyTransform, Handler, IncomingBody, LegacyService, ServerConfig,
-    PRODUCTION_HTTP1_ENGINE, reject_legacy_server_runtime,
+    bind_listener, install_sigterm_flag, reject_legacy_server_runtime, serve_forever,
+    serve_forever_multi, serve_forever_multi_service, serve_forever_with_config,
+    set_listen_backlog, AccessLog, AsyncRequest, AsyncService, BodyTransform, Handler,
+    IncomingBody, LegacyService, ServerConfig, PRODUCTION_HTTP1_ENGINE,
 };
 pub use thread_concurrency::{
     compute_concurrency, cooperative_yield, green_sleep, should_yield_heartbeat, yield_count,

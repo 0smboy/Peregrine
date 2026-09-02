@@ -23,11 +23,7 @@ use swift_runtime::{DeviceIoLimits, StorageExecutor, StorageExecutorConfig};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fsync_storm_does_not_starve_a_health_get() {
-    let dir = std::env::temp_dir().join(format!(
-        "fsync-storm-{}-{}",
-        std::process::id(),
-        line!()
-    ));
+    let dir = std::env::temp_dir().join(format!("fsync-storm-{}-{}", std::process::id(), line!()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("sda1")).unwrap();
 

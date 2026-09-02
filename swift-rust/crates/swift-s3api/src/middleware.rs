@@ -111,7 +111,7 @@ use swift_http::{
     Response, MAX_CONTROL_BODY,
 };
 use swift_middleware::{
-    AsyncNextFn, Middleware, NextFn, StreamingAsyncNextFn, S3TokenClient, S3TokenResult,
+    AsyncNextFn, Middleware, NextFn, S3TokenClient, S3TokenResult, StreamingAsyncNextFn,
 };
 
 use crate::acl_cors::{
@@ -178,9 +178,8 @@ use crate::response::{
     delete_object_response, delete_result_xml, get_object_attributes_xml, list_all_my_buckets_xml,
     list_directory_buckets_xml, object_torrent_bytes, policy_status_xml, put_object_response,
     s3_error_response, s3_xml_timestamp, s3_xml_timestamp_ceil, select_star_event_stream,
-    unix_secs_to_s3_iso,
-    xml_response, BucketInfo, DeleteError, DeletedObject, ListBucketResult, ListBucketResultV2,
-    Owner, S3Object,
+    unix_secs_to_s3_iso, xml_response, BucketInfo, DeleteError, DeletedObject, ListBucketResult,
+    ListBucketResultV2, Owner, S3Object,
 };
 use crate::select::{apply_select_plan, parse_select_expression};
 use crate::sigv2::{
@@ -730,10 +729,7 @@ fn wrap_aws_chunked_streaming(
         None
     };
     let xform = AwsChunkedTransform::new(decoded_len, sig_ctx, slot);
-    let inner = std::mem::replace(
-        &mut areq.body,
-        IncomingBody::from_bytes(Vec::new(), 1),
-    );
+    let inner = std::mem::replace(&mut areq.body, IncomingBody::from_bytes(Vec::new(), 1));
     areq.body = inner.with_transform(Box::new(xform), decoded_len);
     if let Some(n) = decoded_len {
         head.headers.set("Content-Length", n.to_string());
@@ -907,8 +903,7 @@ fn is_initiate_multipart_upload(req: &Request) -> bool {
         return false;
     }
     let params = req.params();
-    params.iter().any(|(k, _)| k == "uploads")
-        && !params.iter().any(|(k, _)| k == "uploadId")
+    params.iter().any(|(k, _)| k == "uploads") && !params.iter().any(|(k, _)| k == "uploadId")
 }
 
 /// Python `MultiObjectDeleteController.xml(min(2*1000*1024, 10MiB))`.
@@ -1075,7 +1070,6 @@ fn strip_s3_only_headers(headers: &mut HeaderKeyDict) {
         headers.remove(&k);
     }
 }
-
 
 fn tchar_meta_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
@@ -1446,7 +1440,8 @@ fn apply_copy_source(req: &mut Request) -> Option<Response> {
         _ => return Some(s3_error_response("InvalidArgument", None, &[])),
     }
     let decoded = percent_decode_component(path);
-    req.headers.set("X-Copy-From", percent_encode_except_slash(&decoded));
+    req.headers
+        .set("X-Copy-From", percent_encode_except_slash(&decoded));
     req.body = Body::empty();
     req.headers.remove("Content-Length");
     None
@@ -1549,7 +1544,10 @@ fn parse_list_max_keys(params: &[(String, String)]) -> Result<u32, Response> {
                 return Err(s3_error_response(
                     "InvalidArgument",
                     Some("max-keys"),
-                    &[("ArgumentName", "max-keys"), ("ArgumentValue", raw.as_str())],
+                    &[
+                        ("ArgumentName", "max-keys"),
+                        ("ArgumentValue", raw.as_str()),
+                    ],
                 ));
             }
         }
@@ -1574,11 +1572,12 @@ async fn rewrite_copy_source_version_async(
     let Some(version_id) = version_id else {
         return None;
     };
-    let target = match resolve_object_version_async(cred, &bucket, &key, Some(&version_id), next).await {
-        Ok(Some(t)) => t,
-        Ok(None) => return Some(missing_object_version_response(&key, Some(&version_id))),
-        Err(resp) => return Some(resp),
-    };
+    let target =
+        match resolve_object_version_async(cred, &bucket, &key, Some(&version_id), next).await {
+            Ok(Some(t)) => t,
+            Ok(None) => return Some(missing_object_version_response(&key, Some(&version_id))),
+            Err(resp) => return Some(resp),
+        };
     if is_delete_marker_header(target.head.headers.get(SYS_DELETE_MARKER)) {
         return Some(nosuchkey_delete_marker(&key, Some(&version_id)));
     }
@@ -1592,8 +1591,6 @@ async fn rewrite_copy_source_version_async(
     );
     None
 }
-
-
 
 fn rewrite_copy_source_version(
     req: &mut Request,
@@ -1918,7 +1915,11 @@ fn rewrite_listing_s3_etags(
         if item.get("subdir").is_some() {
             continue;
         }
-        let Some(name) = item.get("name").and_then(|v| v.as_str()).map(str::to_string) else {
+        let Some(name) = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
             continue;
         };
         let hash = item
@@ -2185,7 +2186,10 @@ fn translate_object_success(method: &str, mut resp: Response, is_copy: bool) -> 
     match method {
         "PUT" if is_copy => {
             let etag = resp.headers.get("ETag").map(bare_etag).unwrap_or_default();
-            xml_response(200, copy_object_result_xml(&copy_xml_last_modified(&resp), &etag))
+            xml_response(
+                200,
+                copy_object_result_xml(&copy_xml_last_modified(&resp), &etag),
+            )
         }
         "PUT" => {
             let etag = resp.headers.get("ETag").map(bare_etag).unwrap_or_default();
@@ -2227,11 +2231,7 @@ fn apply_response_overrides(resp: &mut Response, params: &[(String, String)]) {
 }
 
 fn range_content_length(spec: &str, total: u64) -> Option<u64> {
-    let spec = spec
-        .split(',')
-        .next()?
-        .trim()
-        .strip_prefix("bytes=")?;
+    let spec = spec.split(',').next()?.trim().strip_prefix("bytes=")?;
     if let Some(n) = spec.strip_prefix('-') {
         let n: u64 = n.parse().ok()?;
         return Some(n.min(total));
@@ -3220,9 +3220,7 @@ impl S3Api {
                 }
             }
         }
-        if let Some(denied) =
-            iam_action_check(&self.iam, &cred, "s3:PutObject", &bucket, &key)
-        {
+        if let Some(denied) = iam_action_check(&self.iam, &cred, "s3:PutObject", &bucket, &key) {
             return finish(denied);
         }
         let params = head.params();
@@ -3317,12 +3315,17 @@ impl S3Api {
                 return finish(invalid_mpu_part_number(raw_pn));
             };
             let uid = upload_id.as_deref().unwrap();
-            let (st, _) =
-                match head_container_streaming(&cred, &bucket, &next, &self.container_heads).await
-                {
-                    Ok(v) => v,
-                    Err(resp) => return finish(resp),
-                };
+            let (st, _) = match head_container_streaming(
+                &cred,
+                &bucket,
+                &next,
+                &self.container_heads,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(resp) => return finish(resp),
+            };
             if st == 404 {
                 return finish(s3_error_response(
                     "NoSuchBucket",
@@ -3352,18 +3355,10 @@ impl S3Api {
                 body: areq.body,
             };
             let resp = next(swift).await;
-            if let Some(resp) = payload_err
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .take()
-            {
+            if let Some(resp) = payload_err.lock().unwrap_or_else(|p| p.into_inner()).take() {
                 return finish(resp);
             }
-            if let Some(e) = chunk_err
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .take()
-            {
+            if let Some(e) = chunk_err.lock().unwrap_or_else(|p| p.into_inner()).take() {
                 return finish(aws_chunked_error_to_response(e));
             }
             return if (200..300).contains(&resp.status) {
@@ -3384,21 +3379,9 @@ impl S3Api {
         let vstatus = versioning_status_from_headers(&hdrs).ok().flatten();
         if bucket_versioning_mode(vstatus.as_deref()).is_some() {
             let resp = self
-                .put_object_versioned_streaming(
-                    areq,
-                    next,
-                    method.clone(),
-                    head,
-                    cred,
-                    bucket,
-                    key,
-                )
+                .put_object_versioned_streaming(areq, next, method.clone(), head, cred, bucket, key)
                 .await;
-            if let Some(err) = payload_err
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .take()
-            {
+            if let Some(err) = payload_err.lock().unwrap_or_else(|p| p.into_inner()).take() {
                 return finish(err);
             }
             return resp;
@@ -3442,8 +3425,7 @@ impl S3Api {
                     {
                         return finish(blocked);
                     }
-                    if let Some(blocked) =
-                        deny_if_object_acl_blocks_write(&cred, &existing.headers)
+                    if let Some(blocked) = deny_if_object_acl_blocks_write(&cred, &existing.headers)
                     {
                         return finish(blocked);
                     }
@@ -3461,18 +3443,10 @@ impl S3Api {
             body: areq.body,
         };
         let resp = next(swift).await;
-        if let Some(err) = payload_err
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-        {
+        if let Some(err) = payload_err.lock().unwrap_or_else(|p| p.into_inner()).take() {
             return finish(err);
         }
-        if let Some(e) = chunk_err
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-        {
+        if let Some(e) = chunk_err.lock().unwrap_or_else(|p| p.into_inner()).take() {
             return finish(aws_chunked_error_to_response(e));
         }
         if (200..300).contains(&resp.status) {
@@ -3508,11 +3482,10 @@ impl S3Api {
         if !is_safe_version_id(&vid) {
             return finish(unsafe_version_id_error());
         }
-        let snap =
-            match load_version_index_snapshot_streaming(&cred, &bucket, &key, &next).await {
-                Ok(s) => s,
-                Err(resp) => return finish(resp),
-            };
+        let snap = match load_version_index_snapshot_streaming(&cred, &bucket, &key, &next).await {
+            Ok(s) => s,
+            Err(resp) => return finish(resp),
+        };
         let expect = expect_generation(&snap);
         let mut idx = snap.index.clone();
         match control_head_object_streaming(&cred, &bucket, &key, &next).await {
@@ -3522,7 +3495,12 @@ impl S3Api {
                     return finish(blocked);
                 }
                 if let Err(resp) = maybe_archive_current_for_write_streaming(
-                    &cred, &bucket, &key, &cur.headers, &mut idx, &next,
+                    &cred,
+                    &bucket,
+                    &key,
+                    &cur.headers,
+                    &mut idx,
+                    &next,
                 )
                 .await
                 {
@@ -3554,11 +3532,7 @@ impl S3Api {
                 Some(&key),
             ));
         }
-        let etag = resp
-            .headers
-            .get("ETag")
-            .map(bare_etag)
-            .unwrap_or_default();
+        let etag = resp.headers.get("ETag").map(bare_etag).unwrap_or_default();
         let lm = resp
             .headers
             .get("Last-Modified")
@@ -3667,8 +3641,8 @@ impl S3Api {
             }
             return Ok(cred);
         }
-        let auth = parse_sigv4_auth(req)
-            .ok_or_else(|| s3_error_response("AccessDenied", None, &[]))?;
+        let auth =
+            parse_sigv4_auth(req).ok_or_else(|| s3_error_response("AccessDenied", None, &[]))?;
         let (cred, keystone_verified) = self
             .resolve_credential(&auth, req)
             .ok_or_else(|| s3_error_response("InvalidAccessKeyId", None, &[]))?;
@@ -3919,10 +3893,8 @@ impl S3Api {
                     return handle_mpu_part_async(&cred, b, k, uid, pn, req, &next).await;
                 }
                 if req.method == "GET" {
-                    return handle_mpu_list_parts_async(
-                        &cred, b, k, uid, &params, self, &next,
-                    )
-                    .await;
+                    return handle_mpu_list_parts_async(&cred, b, k, uid, &params, self, &next)
+                        .await;
                 }
             }
         }
@@ -3990,13 +3962,7 @@ impl S3Api {
             return handle_lifecycle_async(req, &cred, bucket.as_deref().unwrap(), &next).await;
         }
         if has_object_lock && bucket.is_some() && key.is_none() {
-            return handle_object_lock_async(
-                req,
-                &cred,
-                bucket.as_deref().unwrap(),
-                &next,
-            )
-            .await;
+            return handle_object_lock_async(req, &cred, bucket.as_deref().unwrap(), &next).await;
         }
         if key.is_none() && bucket.is_some() {
             if let Some(cfg) = stored_bucket_config(&params) {
@@ -4018,13 +3984,8 @@ impl S3Api {
                         .iter()
                         .find(|(k, _)| k == "versionId")
                         .map(|(_, v)| v.as_str());
-                    match probe_bucket_versioning_async(
-                        &cred,
-                        b,
-                        &next,
-                        &self.container_heads,
-                    )
-                    .await
+                    match probe_bucket_versioning_async(&cred, b, &next, &self.container_heads)
+                        .await
                     {
                         Ok(Some(_)) => {
                             return handle_versioned_get_head_async(
@@ -4053,13 +4014,8 @@ impl S3Api {
                     }
                 }
                 "DELETE" => {
-                    match probe_bucket_versioning_async(
-                        &cred,
-                        b,
-                        &next,
-                        &self.container_heads,
-                    )
-                    .await
+                    match probe_bucket_versioning_async(&cred, b, &next, &self.container_heads)
+                        .await
                     {
                         Ok(Some(_)) => {
                             let vid = params
@@ -4067,9 +4023,9 @@ impl S3Api {
                                 .find(|(k, _)| k == "versionId")
                                 .map(|(_, v)| v.as_str());
                             let bypass_requested = bypass_governance_requested(
-                                req.headers
-                                    .get(HDR_BYPASS_GOVERNANCE)
-                                    .or_else(|| req.headers.get("X-Amz-Bypass-Governance-Retention")),
+                                req.headers.get(HDR_BYPASS_GOVERNANCE).or_else(|| {
+                                    req.headers.get("X-Amz-Bypass-Governance-Retention")
+                                }),
                             );
                             let bypass = match governance_bypass_context(
                                 &self.iam,
@@ -4098,13 +4054,8 @@ impl S3Api {
                     }
                 }
                 "PUT" => {
-                    match probe_bucket_versioning_async(
-                        &cred,
-                        b,
-                        &next,
-                        &self.container_heads,
-                    )
-                    .await
+                    match probe_bucket_versioning_async(&cred, b, &next, &self.container_heads)
+                        .await
                     {
                         Ok(Some(_)) => {
                             return handle_versioned_object_put_async(
@@ -4126,13 +4077,8 @@ impl S3Api {
             }
         }
         if req.method == "DELETE" && bucket.is_some() && key.is_none() {
-            return handle_delete_bucket_async(
-                &cred,
-                bucket.as_deref().unwrap(),
-                self,
-                &next,
-            )
-            .await;
+            return handle_delete_bucket_async(&cred, bucket.as_deref().unwrap(), self, &next)
+                .await;
         }
         self.forward_s3_async(req, cred, bucket, key, params, next)
             .await
@@ -4232,7 +4178,9 @@ impl S3Api {
         if bucket.is_none() && method == "GET" && (200..300).contains(&resp.status) {
             let body = match resp.body.collect_async().await {
                 Ok(b) => b,
-                Err(_) => return s3_error_response("InternalError", Some("listing too large"), &[]),
+                Err(_) => {
+                    return s3_error_response("InternalError", Some("listing too large"), &[])
+                }
             };
             return translate_list_buckets(&body, &owner);
         }
@@ -4854,9 +4802,7 @@ impl S3Api {
                     Err(resp) => return resp,
                 };
                 if method == "PUT" {
-                    if let Ok((st, hdrs)) =
-                        head_container(&cred, &b, next, &self.container_heads)
-                    {
+                    if let Ok((st, hdrs)) = head_container(&cred, &b, next, &self.container_heads) {
                         skip_object_precheck = (st == 404 || (200..300).contains(&st))
                             && !container_requires_object_precheck(&hdrs);
                     }
@@ -4963,10 +4909,7 @@ impl S3Api {
         // Skip on PUT when the (already probed) container has no lock:
         // new keys 404 that HEAD every time, and S3 only allows object
         // lock on a lock-enabled bucket. DELETE still HEADs.
-        if key.is_some()
-            && matches!(method.as_str(), "DELETE" | "PUT")
-            && !skip_object_precheck
-        {
+        if key.is_some() && matches!(method.as_str(), "DELETE" | "PUT") && !skip_object_precheck {
             match control_head_object(
                 &cred,
                 bucket.as_deref().unwrap(),
@@ -5511,7 +5454,6 @@ async fn worm_check_object_async(
 /// HEAD object; if structured ACP grants deny WRITE, AccessDenied.
 /// Missing object (404) → no denial (create path).
 
-
 fn worm_check_object(
     cred: &S3Credential,
     bucket: &str,
@@ -5541,8 +5483,6 @@ async fn acl_write_check_object_async(
         Err(resp) => Some(resp),
     }
 }
-
-
 
 fn acl_write_check_object(
     cred: &S3Credential,
@@ -6076,10 +6016,11 @@ async fn handle_multi_delete_async(
         Ok(value) => value,
         Err(_) => return s3_error_response("InvalidArgument", None, &[]),
     };
-    let versioning_mode = match probe_bucket_versioning_async(cred, bucket, next, &api.container_heads).await {
-        Ok(status) => bucket_versioning_mode(status.as_deref()),
-        Err(resp) => return resp,
-    };
+    let versioning_mode =
+        match probe_bucket_versioning_async(cred, bucket, next, &api.container_heads).await {
+            Ok(status) => bucket_versioning_mode(status.as_deref()),
+            Err(resp) => return resp,
+        };
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
     for object in &parsed.objects {
@@ -6139,11 +6080,16 @@ async fn handle_multi_delete_async(
                 clock_ok,
                 bypass,
                 next,
-            ).await
+            )
+            .await
         } else {
-            if let Some(blocked) = worm_check_object_async(cred, bucket, key, clock_ok, bypass, next).await {
+            if let Some(blocked) =
+                worm_check_object_async(cred, bucket, key, clock_ok, bypass, next).await
+            {
                 blocked
-            } else if let Some(blocked) = acl_write_check_object_async(cred, bucket, key, next).await {
+            } else if let Some(blocked) =
+                acl_write_check_object_async(cred, bucket, key, next).await
+            {
                 blocked
             } else {
                 let mut del = make_swift_req(
@@ -6188,8 +6134,6 @@ async fn handle_multi_delete_async(
     let deleted_out = if parsed.quiet { Vec::new() } else { deleted };
     xml_response(200, delete_result_xml(&deleted_out, &errors))
 }
-
-
 
 fn handle_multi_delete(
     req: Request,
@@ -6433,8 +6377,6 @@ async fn handle_acl_async(
     }
 }
 
-
-
 fn handle_acl(
     mut req: Request,
     cred: &S3Credential,
@@ -6533,7 +6475,12 @@ fn handle_acl(
     }
 }
 
-async fn handle_cors_async(req: Request, cred: &S3Credential, bucket: &str, next: &AsyncNextFn) -> Response {
+async fn handle_cors_async(
+    req: Request,
+    cred: &S3Credential,
+    bucket: &str,
+    next: &AsyncNextFn,
+) -> Response {
     match req.method.as_str() {
         "GET" | "HEAD" => {
             let mut head =
@@ -6576,8 +6523,6 @@ async fn handle_cors_async(req: Request, cred: &S3Credential, bucket: &str, next
         _ => s3_error_response("MethodNotAllowed", None, &[]),
     }
 }
-
-
 
 fn handle_cors(req: Request, cred: &S3Credential, bucket: &str, next: &NextFn) -> Response {
     match req.method.as_str() {
@@ -6769,9 +6714,9 @@ async fn async_call(next: &AsyncNextFn, req: Request) -> Response {
 }
 
 async fn body_bytes(body: Body) -> Result<Vec<u8>, Response> {
-    body.collect_async().await.map_err(|_| {
-        s3_error_response("InternalError", Some("response body is too large"), &[])
-    })
+    body.collect_async()
+        .await
+        .map_err(|_| s3_error_response("InternalError", Some("response body is too large"), &[]))
 }
 
 /// Paginated `format=json` container listing. Drain via [`body_bytes`] so a
@@ -7015,9 +6960,7 @@ async fn load_version_index_async(
     let body = body_bytes(resp.body).await?;
     VersionIndex::from_json(&body)
         .filter(|index| index.key == key)
-        .ok_or_else(|| {
-            s3_error_response("InternalError", Some("version index is invalid"), &[])
-        })
+        .ok_or_else(|| s3_error_response("InternalError", Some("version index is invalid"), &[]))
 }
 
 async fn resolve_object_version_async(
@@ -7434,10 +7377,7 @@ async fn maybe_archive_current_for_write_streaming(
     next: &StreamingAsyncNextFn,
 ) -> Result<(), Response> {
     let old_vid = current_object_version_id(headers)?;
-    let old_etag = headers
-        .get("ETag")
-        .map(vers_bare_etag)
-        .unwrap_or_default();
+    let old_etag = headers.get("ETag").map(vers_bare_etag).unwrap_or_default();
     let old_size = headers
         .get("Content-Length")
         .and_then(|v| v.parse().ok())
@@ -7474,7 +7414,11 @@ async fn rewrite_listing_s3_etags_async(
         if item.get("subdir").is_some() {
             continue;
         }
-        let Some(name) = item.get("name").and_then(|v| v.as_str()).map(str::to_string) else {
+        let Some(name) = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
             continue;
         };
         let hash = item
@@ -7745,11 +7689,7 @@ async fn handle_mpu_complete_async(
         if !(200..300).contains(&resp.status) {
             return s3_error_response("InvalidPart", None, &[]);
         }
-        let stored = resp
-            .headers
-            .get("ETag")
-            .map(bare_etag)
-            .unwrap_or_default();
+        let stored = resp.headers.get("ETag").map(bare_etag).unwrap_or_default();
         if !etag.is_empty() && !stored.is_empty() && stored != bare_etag(etag) {
             return s3_error_response("InvalidPart", None, &[]);
         }
@@ -7811,12 +7751,11 @@ async fn handle_mpu_complete_async(
         }
     }
 
-    let versioning_mode = match probe_bucket_versioning_async(cred, bucket, next, &api.container_heads)
-        .await
-    {
-        Ok(status) => bucket_versioning_mode(status.as_deref()),
-        Err(resp) => return resp,
-    };
+    let versioning_mode =
+        match probe_bucket_versioning_async(cred, bucket, next, &api.container_heads).await {
+            Ok(status) => bucket_versioning_mode(status.as_deref()),
+            Err(resp) => return resp,
+        };
     if versioning_mode.is_some() {
         return complete_mpu_versioned_async(
             put,
@@ -7835,8 +7774,7 @@ async fn handle_mpu_complete_async(
     }
     match control_head_object_async(cred, bucket, key, next).await {
         Ok(ObjectHead::Present(existing)) => {
-            if let Some(blocked) =
-                worm_guard(&existing.headers, api.worm_clock.clock_ok(), bypass)
+            if let Some(blocked) = worm_guard(&existing.headers, api.worm_clock.clock_ok(), bypass)
             {
                 return blocked;
             }
@@ -7878,10 +7816,7 @@ async fn handle_mpu_complete_async(
             .unwrap_or_else(|| "multipart".into())
     });
     let version_id = resp.headers.get(HDR_VERSION_ID).map(str::to_string);
-    let mut out = xml_response(
-        200,
-        complete_multipart_xml(bucket, key, &etag, &location),
-    );
+    let mut out = xml_response(200, complete_multipart_xml(bucket, key, &etag, &location));
     if let Some(version_id) = version_id {
         out.headers.set(HDR_VERSION_ID, version_id);
     }
@@ -7953,7 +7888,6 @@ async fn handle_mpu_abort_async(
     resp
 }
 
-
 fn invalid_mpu_part_number(raw: &str) -> Response {
     s3_error_response(
         "InvalidArgument",
@@ -7974,17 +7908,13 @@ async fn handle_mpu_part_async(
     if req.headers.get("X-Amz-Copy-Source").is_some()
         || req.headers.get("x-amz-copy-source").is_some()
     {
-        return handle_mpu_part_copy_async(
-            cred, bucket, key, upload_id, part_number, req, next,
-        )
-        .await;
+        return handle_mpu_part_copy_async(cred, bucket, key, upload_id, part_number, req, next)
+            .await;
     }
     // Python MultipartController.PUT: a missing user bucket is NoSuchBucket,
     // not NoSuchKey from a 404 on `{bucket}+segments`.
-    let mut bucket_head = make_swift_req(
-        "HEAD",
-        &s3_to_swift_path(&cred.account, Some(bucket), None),
-    );
+    let mut bucket_head =
+        make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
     stamp_auth(&mut bucket_head, cred);
     let bucket_resp = async_call(next, bucket_head).await;
     if bucket_resp.status == 404 {
@@ -8064,10 +7994,8 @@ async fn handle_mpu_part_copy_async(
             );
         }
     }
-    let mut dest_head = make_swift_req(
-        "HEAD",
-        &s3_to_swift_path(&cred.account, Some(bucket), None),
-    );
+    let mut dest_head =
+        make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
     stamp_auth(&mut dest_head, cred);
     let dest_resp = async_call(next, dest_head).await;
     if dest_resp.status == 404 {
@@ -8251,11 +8179,11 @@ async fn handle_versioned_object_put_async(
                     .get(HDR_BYPASS_GOVERNANCE)
                     .or_else(|| req.headers.get("X-Amz-Bypass-Governance-Retention")),
             );
-            let bypass = match governance_bypass_context(&api.iam, &cred, bucket, key, bypass_requested)
-            {
-                Ok(context) => context,
-                Err(resp) => return resp,
-            };
+            let bypass =
+                match governance_bypass_context(&api.iam, &cred, bucket, key, bypass_requested) {
+                    Ok(context) => context,
+                    Err(resp) => return resp,
+                };
             if let Err(resp) = maybe_archive_current_for_write_async(
                 &cred,
                 bucket,
@@ -8330,9 +8258,7 @@ async fn handle_versioned_object_put_async(
     ) {
         return resp;
     }
-    if let Err(resp) =
-        cas_save_version_index_async(&cred, bucket, key, &snap, &idx, &next).await
-    {
+    if let Err(resp) = cas_save_version_index_async(&cred, bucket, key, &snap, &idx, &next).await {
         return resp;
     }
     out.headers.set(HDR_VERSION_ID, vid);
@@ -8432,7 +8358,6 @@ async fn complete_mpu_versioned_async(
     out
 }
 
-
 fn head_container(
     cred: &S3Credential,
     bucket: &str,
@@ -8512,8 +8437,6 @@ async fn ensure_versions_container_async(
     }
 }
 
-
-
 fn ensure_versions_container(
     cred: &S3Credential,
     bucket: &str,
@@ -8579,7 +8502,6 @@ async fn drop_missing_version_index_row_async(
 }
 
 /// Same three-arm check as [`VersionIndex::apply_if_match`].
-
 
 fn drop_missing_version_index_row(
     cred: &S3Credential,
@@ -8707,7 +8629,6 @@ async fn load_version_index_snapshot_async(
 /// walk fails closed on a corrupt fence (committing over unreadable history
 /// could fork it) and on [`MAX_GENERATION_PROBES`].
 
-
 fn load_version_index_snapshot(
     cred: &S3Credential,
     bucket: &str,
@@ -8813,7 +8734,6 @@ async fn adopt_newer_generation_fences_async(
 /// adopted. Failure is not fatal: the fences already carry the committed
 /// history and the next loader repeats the walk.
 
-
 fn adopt_newer_generation_fences(
     cred: &S3Credential,
     bucket: &str,
@@ -8892,8 +8812,6 @@ async fn heal_version_index_mirror_async(
             .filter(|s| !s.is_empty());
     }
 }
-
-
 
 fn heal_version_index_mirror(
     cred: &S3Credential,
@@ -9022,8 +8940,6 @@ async fn cas_save_version_index_async(
         Err(map_swift_error(resp.status, Some(&vc), Some(&iname)))
     }
 }
-
-
 
 fn cas_save_version_index(
     cred: &S3Credential,
@@ -9175,8 +9091,6 @@ async fn archive_current_version_async(
     }
 }
 
-
-
 fn archive_current_version(
     cred: &S3Credential,
     bucket: &str,
@@ -9253,8 +9167,6 @@ async fn archived_null_replacement_required_async(
     }
 }
 
-
-
 fn archived_null_replacement_required(
     cred: &S3Credential,
     bucket: &str,
@@ -9306,8 +9218,6 @@ async fn delete_archived_version_copy_async(
         Err(map_swift_error(deleted.status, Some(&vc), Some(&aname)))
     }
 }
-
-
 
 fn delete_archived_version_copy(
     cred: &S3Credential,
@@ -9381,8 +9291,6 @@ async fn promote_archived_version_async(
     // a version that had already been removed.
     delete_archived_version_copy_async(cred, bucket, key, version_id, next).await
 }
-
-
 
 fn promote_archived_version(
     cred: &S3Credential,
@@ -9501,10 +9409,7 @@ async fn maybe_archive_current_for_write_async(
     next: &AsyncNextFn,
 ) -> Result<(), Response> {
     let old_vid = current_object_version_id(headers)?;
-    let old_etag = headers
-        .get("ETag")
-        .map(vers_bare_etag)
-        .unwrap_or_default();
+    let old_etag = headers.get("ETag").map(vers_bare_etag).unwrap_or_default();
     let old_size = headers
         .get("Content-Length")
         .and_then(|v| v.parse().ok())
@@ -9533,9 +9438,6 @@ async fn maybe_archive_current_for_write_async(
     }
     Ok(())
 }
-
-
-
 
 fn maybe_archive_current_for_write(
     cred: &S3Credential,
@@ -9584,7 +9486,6 @@ fn maybe_archive_current_for_write(
     }
     Ok(())
 }
-
 
 fn commit_new_version_record(
     idx: &mut VersionIndex,
@@ -9706,9 +9607,7 @@ fn handle_versioned_put(
         }
         return resp;
     }
-    last.unwrap_or_else(|| {
-        s3_error_response("InternalError", Some("versioned put conflict"), &[])
-    })
+    last.unwrap_or_else(|| s3_error_response("InternalError", Some("versioned put conflict"), &[]))
 }
 
 fn handle_versioned_put_once(
@@ -9821,7 +9720,8 @@ fn handle_versioned_put_once(
     ) {
         return err;
     }
-    if let Err(resp) = apply_bucket_default_retention(&mut req, cred, bucket, next, &api.container_heads)
+    if let Err(resp) =
+        apply_bucket_default_retention(&mut req, cred, bucket, next, &api.container_heads)
     {
         return resp;
     }
@@ -10041,7 +9941,8 @@ async fn handle_versioned_delete_async(
             clock_ok,
             bypass,
             next,
-        ).await;
+        )
+        .await;
         if attempt + 1 < MAX_ATTEMPTS && versioned_write_retryable(&resp) {
             last = Some(resp);
             continue;
@@ -10052,8 +9953,6 @@ async fn handle_versioned_delete_async(
         s3_error_response("InternalError", Some("versioned delete conflict"), &[])
     })
 }
-
-
 
 fn handle_versioned_delete(
     cred: &S3Credential,
@@ -10107,7 +10006,8 @@ async fn handle_versioned_delete_once_async(
             Ok(None) => {
                 // Data-plane copy is already gone. Still drop a leftover
                 // index row so ListVersions cannot keep a ghost version.
-                if let Err(resp) = drop_missing_version_index_row_async(cred, bucket, key, vid, next).await
+                if let Err(resp) =
+                    drop_missing_version_index_row_async(cred, bucket, key, vid, next).await
                 {
                     return resp;
                 }
@@ -10134,8 +10034,7 @@ async fn handle_versioned_delete_once_async(
         // numbered vid whose index persist failed after the data-plane
         // PUT) have no index row. CAS-remove would 500 "lost update" and
         // leave the object (the Ceph s3-tests nuke poison).
-        if target_is_current && snap.index.find(vid).is_none()
-        {
+        if target_is_current && snap.index.find(vid).is_none() {
             let mut del = make_swift_req("DELETE", &cur_path);
             stamp_object_write_precondition(&mut del.headers, Some(&target.head));
             stamp_auth(&mut del, cred);
@@ -10172,7 +10071,9 @@ async fn handle_versioned_delete_once_async(
                 if !is_safe_version_id(next_version) {
                     return unsafe_version_id_error();
                 }
-                if let Err(resp) = promote_archived_version_async(cred, bucket, key, next_version, next).await {
+                if let Err(resp) =
+                    promote_archived_version_async(cred, bucket, key, next_version, next).await
+                {
                     return resp;
                 }
             } else {
@@ -10200,7 +10101,8 @@ async fn handle_versioned_delete_once_async(
         }
 
         idx.generation = idx.generation.saturating_add(1);
-        if let Err(resp) = cas_save_version_index_async(cred, bucket, key, &snap, &idx, next).await {
+        if let Err(resp) = cas_save_version_index_async(cred, bucket, key, &snap, &idx, next).await
+        {
             return resp;
         }
         let mut r = delete_object_response();
@@ -10233,7 +10135,9 @@ async fn handle_versioned_delete_once_async(
     let overwrite_null = fixed_delete_marker_id == Some(NULL_VERSION_ID)
         && VersioningStatus::Suspended.suspended_put_overwrites_null();
     let archived_null_exists = if overwrite_null {
-        match archived_null_replacement_required_async(cred, bucket, key, clock_ok, bypass, next).await {
+        match archived_null_replacement_required_async(cred, bucket, key, clock_ok, bypass, next)
+            .await
+        {
             Ok(exists) => exists,
             Err(resp) => return resp,
         }
@@ -10252,7 +10156,9 @@ async fn handle_versioned_delete_once_async(
             bypass,
             &mut idx,
             next,
-        ).await {
+        )
+        .await
+        {
             return resp;
         }
     }
@@ -10277,7 +10183,9 @@ async fn handle_versioned_delete_once_async(
         return backend_write_not_applied(resp.status, Some(bucket), Some(key));
     }
     if archived_null_exists {
-        if let Err(resp) = delete_archived_version_copy_async(cred, bucket, key, NULL_VERSION_ID, next).await {
+        if let Err(resp) =
+            delete_archived_version_copy_async(cred, bucket, key, NULL_VERSION_ID, next).await
+        {
             return resp;
         }
     }
@@ -10312,8 +10220,6 @@ async fn handle_versioned_delete_once_async(
     r
 }
 
-
-
 fn handle_versioned_delete_once(
     cred: &S3Credential,
     bucket: &str,
@@ -10332,8 +10238,7 @@ fn handle_versioned_delete_once(
             Ok(None) => {
                 // Data-plane copy is already gone. Still drop a leftover
                 // index row so ListVersions cannot keep a ghost version.
-                if let Err(resp) = drop_missing_version_index_row(cred, bucket, key, vid, next)
-                {
+                if let Err(resp) = drop_missing_version_index_row(cred, bucket, key, vid, next) {
                     return resp;
                 }
                 let mut r = delete_object_response();
@@ -10359,8 +10264,7 @@ fn handle_versioned_delete_once(
         // numbered vid whose index persist failed after the data-plane
         // PUT) have no index row. CAS-remove would 500 "lost update" and
         // leave the object (the Ceph s3-tests nuke poison).
-        if target_is_current && snap.index.find(vid).is_none()
-        {
+        if target_is_current && snap.index.find(vid).is_none() {
             let mut del = make_swift_req("DELETE", &cur_path);
             stamp_object_write_precondition(&mut del.headers, Some(&target.head));
             stamp_auth(&mut del, cred);
@@ -10569,8 +10473,7 @@ async fn handle_list_versions_async(
         .map(|(_, v)| v.as_str());
 
     let mut indexes = load_version_indexes_async(cred, bucket, next).await;
-    let current = match list_current_objects_for_versions_async(cred, bucket, prefix, next).await
-    {
+    let current = match list_current_objects_for_versions_async(cred, bucket, prefix, next).await {
         Ok(c) => c,
         Err(resp) => return resp,
     };
@@ -10597,8 +10500,6 @@ async fn handle_list_versions_async(
         &indexes,
     ))
 }
-
-
 
 fn handle_list_versions(
     cred: &S3Credential,
@@ -10657,7 +10558,11 @@ fn handle_list_versions(
     ))
 }
 
-async fn load_version_indexes_async(cred: &S3Credential, bucket: &str, next: &AsyncNextFn) -> Vec<VersionIndex> {
+async fn load_version_indexes_async(
+    cred: &S3Credential,
+    bucket: &str,
+    next: &AsyncNextFn,
+) -> Vec<VersionIndex> {
     let vc = versions_container(bucket);
     let items = match list_container_json_async(cred, &vc, None, next).await {
         Ok(v) => v,
@@ -10694,7 +10599,6 @@ async fn load_version_indexes_async(cred: &S3Credential, bucket: &str, next: &As
 ///
 /// Never-versioned objects live only here. Enabled keys already have an
 /// index and are skipped by [`merge_unindexed_current_objects`].
-
 
 fn load_version_indexes(cred: &S3Credential, bucket: &str, next: &NextFn) -> Vec<VersionIndex> {
     let vc = versions_container(bucket);
@@ -10749,7 +10653,11 @@ async fn list_current_objects_for_versions_async(
     prefix: &str,
     next: &AsyncNextFn,
 ) -> Result<Vec<(String, String, i64, String)>, Response> {
-    let prefix_opt = if prefix.is_empty() { None } else { Some(prefix) };
+    let prefix_opt = if prefix.is_empty() {
+        None
+    } else {
+        Some(prefix)
+    };
     let items = list_container_json_async(cred, bucket, prefix_opt, next).await?;
     let mut out = Vec::new();
     for item in items {
@@ -10781,8 +10689,6 @@ async fn list_current_objects_for_versions_async(
     }
     Ok(out)
 }
-
-
 
 fn list_current_objects_for_versions(
     cred: &S3Credential,
@@ -10948,8 +10854,6 @@ async fn handle_tagging_async(
     }
 }
 
-
-
 fn handle_tagging(
     req: Request,
     cred: &S3Credential,
@@ -11056,7 +10960,12 @@ fn handle_tagging(
     }
 }
 
-async fn handle_lifecycle_async(req: Request, cred: &S3Credential, bucket: &str, next: &AsyncNextFn) -> Response {
+async fn handle_lifecycle_async(
+    req: Request,
+    cred: &S3Credential,
+    bucket: &str,
+    next: &AsyncNextFn,
+) -> Response {
     match req.method.as_str() {
         "GET" | "HEAD" => {
             let mut head =
@@ -11107,7 +11016,6 @@ async fn handle_lifecycle_async(req: Request, cred: &S3Credential, bucket: &str,
 }
 
 /// Parse `<Days>` from a RestoreRequest XML body (default 1 if absent/empty).
-
 
 fn handle_lifecycle(req: Request, cred: &S3Credential, bucket: &str, next: &NextFn) -> Response {
     match req.method.as_str() {
@@ -11861,8 +11769,6 @@ async fn handle_stored_bucket_config_async(
     }
 }
 
-
-
 fn handle_stored_bucket_config(
     req: Request,
     cred: &S3Credential,
@@ -12005,8 +11911,6 @@ async fn handle_object_stored_blob_async(
         _ => s3_error_response("MethodNotAllowed", None, &[]),
     }
 }
-
-
 
 fn handle_object_stored_blob(
     req: Request,
@@ -12235,8 +12139,6 @@ async fn handle_object_attributes_async(
     }
 }
 
-
-
 fn handle_object_attributes(
     req: Request,
     cred: &S3Credential,
@@ -12353,11 +12255,7 @@ fn handle_mpu_complete(
         if !(200..300).contains(&resp.status) {
             return s3_error_response("InvalidPart", None, &[]);
         }
-        let stored = resp
-            .headers
-            .get("ETag")
-            .map(bare_etag)
-            .unwrap_or_default();
+        let stored = resp.headers.get("ETag").map(bare_etag).unwrap_or_default();
         if !etag.is_empty() && !stored.is_empty() && stored != bare_etag(etag) {
             return s3_error_response("InvalidPart", None, &[]);
         }
@@ -12474,23 +12372,14 @@ fn handle_mpu_complete(
             .unwrap_or_else(|| "multipart".into())
     });
     let version_id = resp.headers.get(HDR_VERSION_ID).map(str::to_string);
-    let mut out = xml_response(
-        200,
-        complete_multipart_xml(bucket, key, &etag, &location),
-    );
+    let mut out = xml_response(200, complete_multipart_xml(bucket, key, &etag, &location));
     if let Some(version_id) = version_id {
         out.headers.set(HDR_VERSION_ID, version_id);
     }
     out
 }
 
-fn delete_mpu_marker(
-    cred: &S3Credential,
-    bucket: &str,
-    key: &str,
-    upload_id: &str,
-    next: &NextFn,
-) {
+fn delete_mpu_marker(cred: &S3Credential, bucket: &str, key: &str, upload_id: &str, next: &NextFn) {
     let segs = segments_container(bucket);
     let marker = upload_marker_name(key, upload_id);
     let mut del = make_swift_req(
@@ -12709,7 +12598,11 @@ async fn handle_list_multipart_uploads_async(
         .clamp(1, 1000);
 
     let segs = segments_container(bucket);
-    let prefix_opt = if prefix.is_empty() { None } else { Some(prefix) };
+    let prefix_opt = if prefix.is_empty() {
+        None
+    } else {
+        Some(prefix)
+    };
     let items = match list_container_json_async(cred, &segs, prefix_opt, next).await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -12805,10 +12698,16 @@ async fn handle_delete_bucket_async(
             let _ = async_call(next, del).await;
         }
     }
-    let mut del_c = make_swift_req("DELETE", &s3_to_swift_path(&cred.account, Some(&segs), None));
+    let mut del_c = make_swift_req(
+        "DELETE",
+        &s3_to_swift_path(&cred.account, Some(&segs), None),
+    );
     stamp_auth(&mut del_c, cred);
     let _ = async_call(next, del_c).await;
-    let mut del = make_swift_req("DELETE", &s3_to_swift_path(&cred.account, Some(bucket), None));
+    let mut del = make_swift_req(
+        "DELETE",
+        &s3_to_swift_path(&cred.account, Some(bucket), None),
+    );
     stamp_auth(&mut del, cred);
     let resp = async_call(next, del).await;
     if (200..300).contains(&resp.status) {
@@ -13455,10 +13354,8 @@ mod tests {
     fn aws_chunked_put_is_streaming() {
         let api = S3Api::new(cred_map());
         let mut req = unsigned_signed_put("/mybucket/obj", "");
-        req.headers.set(
-            "x-amz-content-sha256",
-            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
-        );
+        req.headers
+            .set("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
         req.headers.set("x-amz-decoded-content-length", "10");
         req.headers.set("Content-Encoding", "aws-chunked");
         assert!(
@@ -13553,8 +13450,7 @@ mod tests {
                 if areq.method == "HEAD" && areq.path == "/v1/AUTH_test/mybucket" {
                     return Response::new(204);
                 }
-                if areq.method == "HEAD"
-                    && areq.path == "/v1/AUTH_test/mybucket+segments/obj/uid1"
+                if areq.method == "HEAD" && areq.path == "/v1/AUTH_test/mybucket+segments/obj/uid1"
                 {
                     return Response::new(200);
                 }
@@ -13660,12 +13556,13 @@ mod tests {
             })
         });
         let resp = block_on_s3(api.put_object_streaming(areq, next));
-        assert_eq!(resp.status, 403, "bad chunk-signature must fail closed: {}", resp.status);
-        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
-        assert!(
-            body.contains("SignatureDoesNotMatch"),
-            "{body}"
+        assert_eq!(
+            resp.status, 403,
+            "bad chunk-signature must fail closed: {}",
+            resp.status
         );
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("SignatureDoesNotMatch"), "{body}");
         assert!(
             !saw_complete.load(std::sync::atomic::Ordering::SeqCst),
             "backend PUT must not see a complete authenticated body"
@@ -13765,7 +13662,10 @@ mod tests {
         }
         let got = etags.lock().unwrap().clone();
         assert_eq!(got.len(), 2);
-        assert_ne!(got[0], got[1], "retry must replace bytes, not fork a version");
+        assert_ne!(
+            got[0], got[1],
+            "retry must replace bytes, not fork a version"
+        );
     }
 
     fn async_ok(f: impl Fn(Request) -> Response + Send + Sync + 'static) -> AsyncNextFn {
@@ -13909,7 +13809,10 @@ mod tests {
             if r.method == "HEAD" && r.path == "/v1/AUTH_test/nothing" {
                 return Response::new(404);
             }
-            panic!("missing bucket must not PUT segments: {} {}", r.method, r.path);
+            panic!(
+                "missing bucket must not PUT segments: {} {}",
+                r.method, r.path
+            );
         });
         let resp = block_on_s3(api.handle_s3_async(req, next));
         assert_eq!(resp.status, 404);
@@ -13929,7 +13832,10 @@ mod tests {
             if r.method == "HEAD" && r.path == "/v1/AUTH_test/nothing" {
                 return Response::new(404);
             }
-            panic!("missing dest bucket must not copy part: {} {}", r.method, r.path);
+            panic!(
+                "missing dest bucket must not copy part: {} {}",
+                r.method, r.path
+            );
         });
         let resp = block_on_s3(api.handle_s3_async(req, next));
         assert_eq!(resp.status, 404);
@@ -14044,8 +13950,10 @@ mod tests {
             resp.body = Body::from(b"hello-get".to_vec());
             resp.headers.set("ETag", "abc123");
             resp.headers.set("Content-Length", "9");
-            resp.headers
-                .set("X-Object-Sysmeta-S3-Cache-Control", "private, some-extension");
+            resp.headers.set(
+                "X-Object-Sysmeta-S3-Cache-Control",
+                "private, some-extension",
+            );
             resp.headers
                 .set("X-Object-Sysmeta-S3-Expires", "a valid HTTP-date timestamp");
             resp.headers
@@ -14153,7 +14061,10 @@ mod tests {
     #[test]
     fn handle_s3_async_mpu_init_complete_abort() {
         let api = S3Api::new(cred_map());
-        let init = sign_request(base_s3_req("POST", "/mybucket/big/obj", "uploads"), "testing");
+        let init = sign_request(
+            base_s3_req("POST", "/mybucket/big/obj", "uploads"),
+            "testing",
+        );
         let init_next = async_ok(|r| {
             if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
                 return Response::new(204);
@@ -14166,7 +14077,10 @@ mod tests {
         let init_resp = block_on_s3(api.handle_s3_async(init, init_next));
         assert_eq!(init_resp.status, 200, "mpu init");
         let init_body = String::from_utf8(init_resp.body.into_vec(u64::MAX).unwrap()).unwrap();
-        assert!(init_body.contains("InitiateMultipartUploadResult"), "{init_body}");
+        assert!(
+            init_body.contains("InitiateMultipartUploadResult"),
+            "{init_body}"
+        );
         let upload_id = init_body
             .split("<UploadId>")
             .nth(1)
@@ -14187,7 +14101,10 @@ mod tests {
             .set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         complete.body = Body::from(complete_xml.into_bytes());
         let complete = sign_request(complete, "testing");
-        let marker = format!("/v1/AUTH_test/mybucket+segments/{}", upload_marker_name("big/obj", &upload_id));
+        let marker = format!(
+            "/v1/AUTH_test/mybucket+segments/{}",
+            upload_marker_name("big/obj", &upload_id)
+        );
         let part = format!(
             "/v1/AUTH_test/mybucket+segments/{}",
             part_object_name("big/obj", &upload_id, 1)
@@ -14258,7 +14175,8 @@ mod tests {
             }
             if r.method == "PUT" {
                 assert!(
-                    r.headers.get("Content-MD5").is_none() && r.headers.get("content-md5").is_none(),
+                    r.headers.get("Content-MD5").is_none()
+                        && r.headers.get("content-md5").is_none(),
                     "initiate must not forward Content-MD5 onto the marker PUT"
                 );
                 return Response::new(201);
@@ -14374,11 +14292,7 @@ mod tests {
         assert!(list_body.contains(&upload_id), "{list_body}");
 
         let abort = sign_request(
-            base_s3_req(
-                "DELETE",
-                "/mybucket/obj1",
-                &format!("uploadId={upload_id}"),
-            ),
+            base_s3_req("DELETE", "/mybucket/obj1", &format!("uploadId={upload_id}")),
             "testing",
         );
         let abort_next = async_ok(|r| {
@@ -14557,7 +14471,11 @@ mod tests {
             }
             for c in "!#$%&'(*+-.^`|~".chars() {
                 let name = format!("X-Object-Meta-{}", encode_backend_meta_rest(&c.to_string()));
-                assert_eq!(r.headers.get(&name), Some(c.to_string()).as_deref(), "{name}");
+                assert_eq!(
+                    r.headers.get(&name),
+                    Some(c.to_string()).as_deref(),
+                    "{name}"
+                );
             }
             let mut resp = Response::new(201);
             resp.headers.set("ETag", "abc123");
@@ -14613,7 +14531,10 @@ mod tests {
             body.contains("<Code>AuthorizationQueryParametersError</Code>"),
             "{body}"
         );
-        assert!(body.contains("X-Amz-Expires must be non-negative"), "{body}");
+        assert!(
+            body.contains("X-Amz-Expires must be non-negative"),
+            "{body}"
+        );
     }
 
     #[test]
@@ -14689,11 +14610,7 @@ mod tests {
             .and_then(|s| s.split("</UploadId>").next())
             .unwrap()
             .to_string();
-        let mut complete = base_s3_req(
-            "POST",
-            "/mybucket/key",
-            &format!("uploadId={upload_id}"),
-        );
+        let mut complete = base_s3_req("POST", "/mybucket/key", &format!("uploadId={upload_id}"));
         complete
             .headers
             .set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
@@ -14715,7 +14632,10 @@ mod tests {
             if r.method == "HEAD" {
                 return Response::new(404);
             }
-            panic!("XXE complete must 404 NoSuchUpload before XML part parse: {}", r.path);
+            panic!(
+                "XXE complete must 404 NoSuchUpload before XML part parse: {}",
+                r.path
+            );
         });
         let resp = block_on_s3(api.handle_s3_async(complete, complete_next));
         assert_eq!(resp.status, 404, "got {}", resp.status);
@@ -14840,7 +14760,11 @@ mod tests {
         let resp = block_on_s3(api.handle_s3_async(del, next));
         assert_eq!(resp.status, 204, "delete null version");
         assert!(
-            deleted.lock().unwrap().iter().any(|p| p == "/v1/AUTH_test/mybucket/foo"),
+            deleted
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p == "/v1/AUTH_test/mybucket/foo"),
             "unversioned DELETE ?versionId=null must DELETE the current object: {:?}",
             deleted.lock().unwrap()
         );
@@ -14922,11 +14846,13 @@ mod tests {
         assert_eq!(resp.status, 204);
         let got = deleted.lock().unwrap().clone();
         assert!(
-            got.iter().any(|p| p.ends_with(&format!("/obj1/{uid}/00000001"))),
+            got.iter()
+                .any(|p| p.ends_with(&format!("/obj1/{uid}/00000001"))),
             "abort must DELETE parts: {got:?}"
         );
         assert!(
-            got.iter().any(|p| p.ends_with(&format!("/obj1/{uid}")) && !p.contains("/00000001")),
+            got.iter()
+                .any(|p| p.ends_with(&format!("/obj1/{uid}")) && !p.contains("/00000001")),
             "abort must DELETE the upload marker: {got:?}"
         );
     }
@@ -14964,8 +14890,14 @@ mod tests {
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
         assert!(body.contains("ListMultipartUploadsResult"), "{body}");
         assert!(body.contains("<Key>obj1</Key>"), "{body}");
-        assert!(body.contains("<UploadId>cccccccccccccccccccccccccccccccc</UploadId>"), "{body}");
-        assert!(pages.load(std::sync::atomic::Ordering::SeqCst) >= 2, "must page past leftover parts");
+        assert!(
+            body.contains("<UploadId>cccccccccccccccccccccccccccccccc</UploadId>"),
+            "{body}"
+        );
+        assert!(
+            pages.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "must page past leftover parts"
+        );
     }
 
     #[test]
@@ -15012,7 +14944,8 @@ mod tests {
                 if areq.method == "PUT" {
                     let mut resp = Response::new(201);
                     resp.headers.set("ETag", "v1etag");
-                    resp.headers.set("Last-Modified", "Sat, 22 Aug 2026 00:00:00 GMT");
+                    resp.headers
+                        .set("Last-Modified", "Sat, 22 Aug 2026 00:00:00 GMT");
                     return resp;
                 }
                 Response::new(404)
@@ -15350,7 +15283,10 @@ mod tests {
         let resp = api.handle(req, &next);
         assert_eq!(resp.status, 200);
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
-        assert!(body.contains("<ContinuationToken>baz</ContinuationToken>"), "{body}");
+        assert!(
+            body.contains("<ContinuationToken>baz</ContinuationToken>"),
+            "{body}"
+        );
         assert!(body.contains("<StartAfter>bar</StartAfter>"), "{body}");
         assert!(body.contains("<Key>foo</Key>"), "{body}");
         assert!(body.contains("<Key>quxx</Key>"), "{body}");
@@ -15434,7 +15370,10 @@ mod tests {
             body.contains("<Size>5242880</Size>"),
             "assembled size, not manifest: {body}"
         );
-        assert!(!body.contains("<Size>137</Size>"), "manifest size leaked: {body}");
+        assert!(
+            !body.contains("<Size>137</Size>"),
+            "manifest size leaked: {body}"
+        );
     }
 
     #[test]
@@ -15709,7 +15648,8 @@ mod tests {
                 assert_eq!(r.path, "/v1/AUTH_test/mybucket/src.bin");
                 assert!(r.headers.get("X-Copy-From").is_none());
                 let mut resp = Response::new(200);
-                resp.headers.set("ETag", "\"65d79814053817eae59f7c7cee98d3f8-1\"");
+                resp.headers
+                    .set("ETag", "\"65d79814053817eae59f7c7cee98d3f8-1\"");
                 resp.headers.set("Content-Length", "3");
                 resp.body = Body::from(b"abc".to_vec());
                 return resp;
@@ -15735,7 +15675,10 @@ mod tests {
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
         assert!(body.contains("<CopyPartResult"), "{body}");
         assert!(body.contains("partcopy1"), "{body}");
-        assert!(!body.contains("65d79814053817eae59f7c7cee98d3f8-1"), "{body}");
+        assert!(
+            !body.contains("65d79814053817eae59f7c7cee98d3f8-1"),
+            "{body}"
+        );
         assert!(!body.contains("<CopyObjectResult>"), "{body}");
     }
 
@@ -15760,7 +15703,8 @@ mod tests {
             req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
             let req = sign_request(req, "testing");
             let label = bad.to_string();
-            let next: NextFn = Arc::new(move |_| panic!("bad CopySourceRange {label} must not GET"));
+            let next: NextFn =
+                Arc::new(move |_| panic!("bad CopySourceRange {label} must not GET"));
             let resp = api.handle(req, &next);
             assert_eq!(resp.status, 400, "{bad}");
             let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
@@ -15792,7 +15736,8 @@ mod tests {
             "7372632e62696e", old_vid
         );
         let index_path = "/v1/AUTH_test/mybucket+versions/7372632e62696e/index.json";
-        let fence_path = "/v1/AUTH_test/mybucket+versions/7372632e62696e/index.g00000000000000000001.json";
+        let fence_path =
+            "/v1/AUTH_test/mybucket+versions/7372632e62696e/index.g00000000000000000001.json";
         let index_body = format!(
             r#"{{"key":"src.bin","versions":[{{"version_id":"{old_vid}","is_delete_marker":false,"is_latest":false,"last_modified":"2026-01-01T00:00:00.000Z","etag":"old","size":8}}]}}"#
         );
@@ -15909,14 +15854,10 @@ mod tests {
         let del = base_s3_req("DELETE", "/mybucket/obj", &format!("versionId={vid}"));
         let resp = api.handle(sign_request(del, "testing"), &next);
         assert_eq!(
-            resp.status, 204,
+            resp.status,
+            204,
             "unindexed current must delete, not lost-update 500: {}",
-            String::from_utf8_lossy(
-                &resp
-                    .body
-                    .into_vec(u64::MAX)
-                    .unwrap_or_default()
-            )
+            String::from_utf8_lossy(&resp.body.into_vec(u64::MAX).unwrap_or_default())
         );
     }
 
@@ -15957,11 +15898,7 @@ mod tests {
         p1.body = Body::from(b"v1".to_vec());
         let r1 = api.handle(sign_request(p1, "testing"), &inner);
         assert_eq!(r1.status, 200);
-        let vid1 = r1
-            .headers
-            .get("x-amz-version-id")
-            .expect("v1")
-            .to_string();
+        let vid1 = r1.headers.get("x-amz-version-id").expect("v1").to_string();
         let mut p2 = base_s3_req("PUT", "/mybucket/obj", "");
         p2.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         p2.body = Body::from(b"v2".to_vec());
@@ -15983,8 +15920,8 @@ mod tests {
             sign_request(base_s3_req("GET", "/mybucket", "versions"), "testing"),
             &next,
         );
-        let body = String::from_utf8(list.body.into_vec(u64::MAX).unwrap_or_default())
-            .unwrap_or_default();
+        let body =
+            String::from_utf8(list.body.into_vec(u64::MAX).unwrap_or_default()).unwrap_or_default();
         assert!(
             !body.contains(&vid1),
             "ghost version stayed in listing: {body}"
@@ -16060,7 +15997,10 @@ mod tests {
         let mut seed = base_s3_req("PUT", "/mybucket/obj", "");
         seed.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         seed.body = Body::from(b"v1".to_vec());
-        assert_eq!(api.handle(sign_request(seed, "testing"), &inner).status, 200);
+        assert_eq!(
+            api.handle(sign_request(seed, "testing"), &inner).status,
+            200
+        );
 
         let object_puts = Arc::new(std::sync::Mutex::new(0u32));
         let object_puts_c = object_puts.clone();
@@ -16591,7 +16531,11 @@ mod tests {
     fn abort_multipart_missing_marker_is_nosuchupload() {
         let api = S3Api::new(cred_map());
         let req = sign_request(
-            base_s3_req("DELETE", "/mybucket/obj", "uploadId=ffffffffffffffffffffffffffffffff"),
+            base_s3_req(
+                "DELETE",
+                "/mybucket/obj",
+                "uploadId=ffffffffffffffffffffffffffffffff",
+            ),
             "testing",
         );
         let next: NextFn = Arc::new(|r| {
@@ -16667,7 +16611,9 @@ mod tests {
                     || r.path
                         .starts_with("/v1/AUTH_test/mybucket+segments/big/obj/")
             );
-            if r.path.starts_with("/v1/AUTH_test/mybucket+segments/big/obj/") {
+            if r.path
+                .starts_with("/v1/AUTH_test/mybucket+segments/big/obj/")
+            {
                 assert_eq!(
                     r.headers.get("X-Object-Sysmeta-S3-Content-Language"),
                     Some("en-US")
@@ -16796,7 +16742,10 @@ mod tests {
             stamped_override.lock().unwrap().as_deref(),
             Some("b4b77f5320cfe9ce9c0c70c35e84d511-2")
         );
-        assert_eq!(stamped_uid.lock().unwrap().as_deref(), Some(upload_id.as_str()));
+        assert_eq!(
+            stamped_uid.lock().unwrap().as_deref(),
+            Some(upload_id.as_str())
+        );
     }
 
     fn complete_two_part_xml() -> Vec<u8> {
@@ -16826,7 +16775,8 @@ mod tests {
             if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
                 return Response::new(204);
             }
-            if r.method == "HEAD" && r.path == format!("/v1/AUTH_test/mybucket+segments/big/obj/{uid}")
+            if r.method == "HEAD"
+                && r.path == format!("/v1/AUTH_test/mybucket+segments/big/obj/{uid}")
             {
                 return Response::new(404);
             }
@@ -16847,7 +16797,10 @@ mod tests {
         assert_eq!(resp.status, 200);
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
         assert!(body.contains("CompleteMultipartUploadResult"), "{body}");
-        assert!(body.contains("\"b4b77f5320cfe9ce9c0c70c35e84d511-2\""), "{body}");
+        assert!(
+            body.contains("\"b4b77f5320cfe9ce9c0c70c35e84d511-2\""),
+            "{body}"
+        );
         assert_eq!(puts.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
@@ -16900,7 +16853,8 @@ mod tests {
             if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
                 return Response::new(204);
             }
-            if r.method == "HEAD" && r.path == format!("/v1/AUTH_test/mybucket+segments/big/obj/{uid}")
+            if r.method == "HEAD"
+                && r.path == format!("/v1/AUTH_test/mybucket+segments/big/obj/{uid}")
             {
                 return Response::new(404);
             }
@@ -18412,7 +18366,10 @@ mod tests {
         let body = b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
         let mut headers = HeaderKeyDict::new();
         headers.set("Host", "localhost");
-        headers.set("content-md5", crate::sigv2::base64_encode(&crate::crypto::md5(b"")));
+        headers.set(
+            "content-md5",
+            crate::sigv2::base64_encode(&crate::crypto::md5(b"")),
+        );
         headers.set("Content-Length", body.len().to_string());
         let req = Request {
             method: "PUT".into(),
@@ -18456,7 +18413,10 @@ mod tests {
         let resp = api.handle(req, &next);
         assert_eq!(resp.status, 400, "status");
         let xml = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
-        assert!(xml.contains("<Code>XAmzContentSHA256Mismatch</Code>"), "{xml}");
+        assert!(
+            xml.contains("<Code>XAmzContentSHA256Mismatch</Code>"),
+            "{xml}"
+        );
         assert!(
             xml.contains("<ClientComputedContentSHA256>e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855</ClientComputedContentSHA256>"),
             "{xml}"
@@ -18485,11 +18445,11 @@ mod tests {
         let resp = api.handle(req, &next);
         assert_eq!(resp.status, 400, "status");
         let xml = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
-        assert!(xml.contains("<Code>XAmzContentSHA256Mismatch</Code>"), "{xml}");
         assert!(
-            xml.contains("STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+            xml.contains("<Code>XAmzContentSHA256Mismatch</Code>"),
             "{xml}"
         );
+        assert!(xml.contains("STREAMING-UNSIGNED-PAYLOAD-TRAILER"), "{xml}");
         assert!(!xml.contains("IncompleteBody"), "{xml}");
     }
 
@@ -19855,7 +19815,10 @@ mod tests {
         let status = g.status;
         let body = String::from_utf8(g.body.into_vec(u64::MAX).unwrap()).unwrap();
         assert_eq!(status, 404, "{body}");
-        assert!(body.contains("NoSuchKey") || body.contains("NoSuchVersion"), "{body}");
+        assert!(
+            body.contains("NoSuchKey") || body.contains("NoSuchVersion"),
+            "{body}"
+        );
     }
 
     #[test]
@@ -19874,7 +19837,8 @@ mod tests {
         let r = block_on_s3_multi(api.handle_s3_async(put, next.clone()));
         let st = r.status;
         let vid = r.headers.get("x-amz-version-id").map(str::to_string);
-        let rbody = String::from_utf8(r.body.into_vec(u64::MAX).unwrap_or_default()).unwrap_or_default();
+        let rbody =
+            String::from_utf8(r.body.into_vec(u64::MAX).unwrap_or_default()).unwrap_or_default();
         assert_eq!(st, 200, "sigv2 versioned PUT status={st} body={rbody}");
         assert!(vid.as_deref().is_some_and(|v| v != "null"), "got {vid:?}");
         let get = sign_request_v2(
@@ -19885,7 +19849,10 @@ mod tests {
         let g = block_on_s3_multi(api.handle_s3_async(get, next));
         assert_eq!(g.status, 404);
         let body = String::from_utf8(g.body.into_vec(u64::MAX).unwrap()).unwrap();
-        assert!(body.contains("NoSuchKey") || body.contains("NoSuchVersion"), "{body}");
+        assert!(
+            body.contains("NoSuchKey") || body.contains("NoSuchVersion"),
+            "{body}"
+        );
     }
 
     #[test]

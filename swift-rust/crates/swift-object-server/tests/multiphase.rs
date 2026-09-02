@@ -222,10 +222,7 @@ fn sync_multiphase_put(
     let boundary = "sync-two-phase-boundary";
     let mut decoded = phase1(boundary, data, footer_json);
     decoded.extend_from_slice(commit_doc);
-    let mut body = swift_http::Body::from_reader(
-        Box::new(std::io::Cursor::new(decoded)),
-        None,
-    );
+    let mut body = swift_http::Body::from_reader(Box::new(std::io::Cursor::new(decoded)), None);
     body.attach_interim(swift_http::InterimResponder::new(Some(Box::new(
         CaptureWriter(captured),
     ))));
@@ -295,7 +292,10 @@ fn async_mime_put(
     client.write_all(TERMINATOR).unwrap();
     let mut rest = String::new();
     client.read_to_string(&mut rest).unwrap();
-    assert!(!rest.is_empty(), "server closed without a final response after {first:?}");
+    assert!(
+        !rest.is_empty(),
+        "server closed without a final response after {first:?}"
+    );
     (status_of(&rest), rest)
 }
 
@@ -321,8 +321,15 @@ fn sync_compatibility_handler_keeps_two_phase_commit_contract() {
             .unwrap_or_else(|poisoned| poisoned.into_inner()),
     )
     .into_owned();
-    assert_eq!(interim.matches("HTTP/1.1 100 Continue").count(), 2, "{interim}");
-    assert!(interim.contains("X-Obj-Multiphase-Commit: yes"), "{interim}");
+    assert_eq!(
+        interim.matches("HTTP/1.1 100 Continue").count(),
+        2,
+        "{interim}"
+    );
+    assert!(
+        interim.contains("X-Obj-Multiphase-Commit: yes"),
+        "{interim}"
+    );
     assert!(interim.contains("X-Obj-Metadata-Footer: yes"), "{interim}");
 
     let bad_doc = b"X-Document: not a commit\r\n\r\nnope\r\n--sync-two-phase-boundary--";
@@ -511,13 +518,8 @@ fn native_async_multiphase_accepts_opaque_commit_body_and_drains_extra_docs() {
         "{{\"Etag\": \"{}\", \"X-Object-Sysmeta-Ec-Frag-Index\": \"4\"}}",
         md5_hex(data)
     );
-    let mut client = begin_native_multiphase(
-        address,
-        "/sda1/0/a/c/opaque",
-        boundary,
-        data,
-        &footers,
-    );
+    let mut client =
+        begin_native_multiphase(address, "/sda1/0/a/c/opaque", boundary, data, &footers);
     let commit_and_junk = format!(
         "X-Document: put commit\r\n\r\ncommit_confirmation\r\n\
          --{boundary}\r\nX-Document: extra\r\n\r\njunk\r\n--{boundary}--"
@@ -548,16 +550,9 @@ fn native_async_multiphase_invalid_commit_header_is_500_and_not_durable() {
         "{{\"Etag\": \"{}\", \"X-Object-Sysmeta-Ec-Frag-Index\": \"5\"}}",
         md5_hex(data)
     );
-    let mut client = begin_native_multiphase(
-        address,
-        "/sda1/0/a/c/invalid",
-        boundary,
-        data,
-        &footers,
-    );
-    let invalid = format!(
-        "X-Document: not a commit\r\n\r\nnope\r\n--{boundary}--"
-    );
+    let mut client =
+        begin_native_multiphase(address, "/sda1/0/a/c/invalid", boundary, data, &footers);
+    let invalid = format!("X-Document: not a commit\r\n\r\nnope\r\n--{boundary}--");
     client.write_all(&chunked(invalid.as_bytes())).unwrap();
     client.write_all(TERMINATOR).unwrap();
     let mut final_response = String::new();
@@ -609,9 +604,8 @@ fn native_async_multiphase_without_metadata_footer_matches_replication_contract(
     client.write_all(TERMINATOR).unwrap();
     assert_eq!(status_of(&read_interim(&mut client)), 100);
 
-    let opaque_commit = format!(
-        "X-Document: put commit\r\n\r\ncommit_confirmation\r\n--{boundary}--"
-    );
+    let opaque_commit =
+        format!("X-Document: put commit\r\n\r\ncommit_confirmation\r\n--{boundary}--");
     client
         .write_all(&chunked(opaque_commit.as_bytes()))
         .unwrap();
@@ -622,10 +616,8 @@ fn native_async_multiphase_without_metadata_footer_matches_replication_contract(
 
     let mut get = TcpStream::connect(address).unwrap();
     get.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    get.write_all(
-        b"GET /sda1/0/a/c/no-footer HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
-    )
-    .unwrap();
+    get.write_all(b"GET /sda1/0/a/c/no-footer HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        .unwrap();
     let mut response = Vec::new();
     get.read_to_end(&mut response).unwrap();
     assert!(
@@ -653,9 +645,7 @@ fn native_async_complete_commit_doc_then_disconnect_remains_durable() {
         data,
         &footers,
     );
-    let commit_doc = format!(
-        "X-Document: put commit\r\n\r\ncommit_confirmation\r\n--{boundary}--"
-    );
+    let commit_doc = format!("X-Document: put commit\r\n\r\ncommit_confirmation\r\n--{boundary}--");
     client.write_all(&chunked(commit_doc.as_bytes())).unwrap();
     client.shutdown(Shutdown::Write).unwrap();
     let mut final_response = String::new();

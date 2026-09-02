@@ -688,8 +688,10 @@ mod tests {
         let indexes = [idx_c, idx_a, idx_b];
 
         // Flat stream after sort: a2, a1, b2, b1, c1  (5 entries)
-        let page1 =
-            String::from_utf8(list_versions_result_xml("bucket", "", "", "", 2, "", &indexes)).unwrap();
+        let page1 = String::from_utf8(list_versions_result_xml(
+            "bucket", "", "", "", 2, "", &indexes,
+        ))
+        .unwrap();
         assert!(page1.contains("<IsTruncated>true</IsTruncated>"));
         assert_eq!(tag_text(&page1, "NextKeyMarker").as_deref(), Some("a"));
         assert_eq!(
@@ -735,8 +737,10 @@ mod tests {
         assert!(page3.contains("<VersionId>c1</VersionId>"));
 
         // Cut mid-key: max-keys=1 on key a → only a2, Next=(a,a2)
-        let mid =
-            String::from_utf8(list_versions_result_xml("bucket", "", "", "", 1, "", &indexes)).unwrap();
+        let mid = String::from_utf8(list_versions_result_xml(
+            "bucket", "", "", "", 1, "", &indexes,
+        ))
+        .unwrap();
         assert!(mid.contains("<IsTruncated>true</IsTruncated>"));
         assert_eq!(tag_text(&mid, "NextKeyMarker").as_deref(), Some("a"));
         assert_eq!(tag_text(&mid, "NextVersionIdMarker").as_deref(), Some("a2"));
@@ -776,8 +780,10 @@ mod tests {
         assert_eq!(count_tag(&xml, "Version"), 2);
 
         // Prefix + max-keys truncation still emits Next* among filtered set
-        let page =
-            String::from_utf8(list_versions_result_xml("b", "logs/", "", "", 1, "", &indexes)).unwrap();
+        let page = String::from_utf8(list_versions_result_xml(
+            "b", "logs/", "", "", 1, "", &indexes,
+        ))
+        .unwrap();
         assert!(page.contains("<IsTruncated>true</IsTruncated>"));
         assert_eq!(
             tag_text(&page, "NextKeyMarker").as_deref(),
@@ -828,8 +834,10 @@ mod tests {
         assert_eq!(indexes[1].key, "foo");
         assert_eq!(indexes[1].versions[0].version_id, NULL_VERSION_ID);
         assert!(indexes[1].versions[0].is_latest);
-        let xml =
-            String::from_utf8(list_versions_result_xml("b", "", "", "", 1000, "", &indexes)).unwrap();
+        let xml = String::from_utf8(list_versions_result_xml(
+            "b", "", "", "", 1000, "", &indexes,
+        ))
+        .unwrap();
         assert!(xml.contains("<Key>foo</Key>"));
         assert!(xml.contains("<VersionId>null</VersionId>"));
         assert_eq!(xml.matches("<Version>").count(), 2);
@@ -851,7 +859,8 @@ mod tests {
         let mut hollow = VersionIndex::new("k");
         hollow.versions = vec![];
         let hollow_xml =
-            String::from_utf8(list_versions_result_xml("b", "", "", "", 10, "", &[hollow])).unwrap();
+            String::from_utf8(list_versions_result_xml("b", "", "", "", 10, "", &[hollow]))
+                .unwrap();
         assert!(hollow_xml.contains("<IsTruncated>false</IsTruncated>"));
         assert!(!hollow_xml.contains("<Version>"));
         assert_eq!(count_tag(&hollow_xml, "Version"), 0);

@@ -353,10 +353,7 @@ pub fn run_once(
         let mut broker = ContainerBroker::new(&db, "", "");
         if let Err(error) = process_container(&mut broker, account_ring, client, &mut stats) {
             stats.failures += 1;
-            eprintln!(
-                "container-updater failed db={} error={error}",
-                db.display()
-            );
+            eprintln!("container-updater failed db={} error={error}", db.display());
         }
     }
     stats
@@ -497,10 +494,7 @@ mod tests {
 
     #[test]
     fn test_all_account_replicas_404_quarantines_orphan_container() {
-        let dir = std::env::temp_dir().join(format!(
-            "swift-cupd-orphan-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("swift-cupd-orphan-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let device = dir.join("sda1");
         let mut broker = make_container(&device, "AUTH_orphan", "c");
@@ -531,10 +525,8 @@ mod tests {
         // zero, but their object/byte totals still have to be reported to the
         // reserved account so the expirer can discover the queue.  This is
         // the behavior of Python's ContainerUpdater.process_container().
-        let dir = std::env::temp_dir().join(format!(
-            "swift-cupd-autocreate-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("swift-cupd-autocreate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let device = dir.join("sda1");
         let h = "0000000000000000000000000000abce";
@@ -542,9 +534,7 @@ mod tests {
         std::fs::create_dir_all(&hd).unwrap();
         let db = hd.join(format!("{h}.db"));
         let mut broker = ContainerBroker::new(&db, "\0expiring_objects", "1751500000");
-        broker
-            .initialize("0", 0, "1751500000.00000", "id")
-            .unwrap();
+        broker.initialize("0", 0, "1751500000.00000", "id").unwrap();
         broker
             .put_object(
                 "1751500000-AUTH_test/c/o",
@@ -577,10 +567,8 @@ mod tests {
         // Probe test_sharded_account_updates: after cleave, the root is a
         // SHARDED epoch DB. policy_stat is zero, but its two ACTIVE child
         // ranges are authoritative account usage and must report 100 objects.
-        let dir = std::env::temp_dir().join(format!(
-            "swift-cupd-sharded-root-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("swift-cupd-sharded-root-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let device = dir.join("sda1");
         let hash = "0000000000000000000000000000abcf";
@@ -597,23 +585,16 @@ mod tests {
         let mut own = broker.get_own_shard_range(false).unwrap().unwrap();
         own.epoch = Some(epoch.to_string());
         own.state = swift_db::shard_state::SHARDED;
-        let mut first =
-            swift_db::ShardRange::new(".shards_AUTH_test/c-0", epoch, "", "m");
+        let mut first = swift_db::ShardRange::new(".shards_AUTH_test/c-0", epoch, "", "m");
         first.state = swift_db::shard_state::ACTIVE;
         first.object_count = 50;
         first.bytes_used = 150;
-        let mut second =
-            swift_db::ShardRange::new(".shards_AUTH_test/c-1", epoch, "m", "");
+        let mut second = swift_db::ShardRange::new(".shards_AUTH_test/c-1", epoch, "m", "");
         second.state = swift_db::shard_state::ACTIVE;
         second.object_count = 50;
         second.bytes_used = 150;
-        broker
-            .merge_shard_ranges(vec![own, first, second])
-            .unwrap();
-        assert_eq!(
-            broker.get_db_state().unwrap(),
-            swift_db::DbState::Sharded
-        );
+        broker.merge_shard_ranges(vec![own, first, second]).unwrap();
+        assert_eq!(broker.get_db_state().unwrap(), swift_db::DbState::Sharded);
 
         // Exercise the production sweep path: run_once discovers the epoch DB
         // and opens it as ContainerBroker::new(&db, "", "").  A direct call
@@ -649,10 +630,8 @@ mod tests {
 
     #[test]
     fn test_run_once_counts_unreadable_database_as_failure() {
-        let dir = std::env::temp_dir().join(format!(
-            "swift-cupd-invalid-db-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("swift-cupd-invalid-db-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let device = dir.join("sda1");
         let hash = "0000000000000000000000000000bad0";

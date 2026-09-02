@@ -153,9 +153,7 @@ pub fn apply_versioning_meta(headers: &mut HeaderKeyDict, status: &str) {
 /// Protected sysmeta always wins when present. A malformed sysmeta value is an
 /// error and never falls back to the legacy public-meta value. Legacy metadata
 /// is accepted only when sysmeta is absent, and is validated just as strictly.
-pub fn versioning_status_from_headers(
-    headers: &HeaderKeyDict,
-) -> Result<Option<String>, String> {
+pub fn versioning_status_from_headers(headers: &HeaderKeyDict) -> Result<Option<String>, String> {
     if let Some(status) = headers.get(S3_VERSIONING_META) {
         return validate_stored_versioning_status(status).map(Some);
     }
@@ -339,9 +337,7 @@ pub fn apply_object_lock_meta(headers: &mut HeaderKeyDict, body: &[u8]) {
 ///
 /// This is a strict API: corrupt persisted security metadata is returned as an
 /// error rather than being confused with an unconfigured bucket.
-pub fn object_lock_xml_from_headers(
-    headers: &HeaderKeyDict,
-) -> Result<Option<Vec<u8>>, String> {
+pub fn object_lock_xml_from_headers(headers: &HeaderKeyDict) -> Result<Option<Vec<u8>>, String> {
     validated_object_lock_xml_from_headers(headers)
 }
 
@@ -513,7 +509,8 @@ pub const STORED_BUCKET_CONFIGS: &[StoredBucketConfig] = &[
         query: "requestPayment",
         header: "X-Container-Sysmeta-S3-Cfg-RequestPayment",
         missing_code: None,
-        empty_xml: b"<RequestPaymentConfiguration><Payer>BucketOwner</Payer></RequestPaymentConfiguration>",
+        empty_xml:
+            b"<RequestPaymentConfiguration><Payer>BucketOwner</Payer></RequestPaymentConfiguration>",
     },
     StoredBucketConfig {
         query: "accelerate",
@@ -614,7 +611,11 @@ pub fn stored_bucket_config(params: &[(String, String)]) -> Option<&'static Stor
         .find(|cfg| params.iter().any(|(k, _)| k == cfg.query))
 }
 
-pub fn apply_stored_bucket_config(headers: &mut HeaderKeyDict, cfg: &StoredBucketConfig, body: &[u8]) {
+pub fn apply_stored_bucket_config(
+    headers: &mut HeaderKeyDict,
+    cfg: &StoredBucketConfig,
+    body: &[u8],
+) {
     headers.set(cfg.header, encode_meta_blob(body));
 }
 
@@ -866,10 +867,7 @@ mod tests {
 </ObjectLockConfiguration>"#;
         let mut source = HeaderKeyDict::new();
         source.set(S3_VERSIONING_LEGACY_META, "Enabled");
-        source.set(
-            S3_OBJECT_LOCK_LEGACY_META,
-            encode_meta_blob(lock_body),
-        );
+        source.set(S3_OBJECT_LOCK_LEGACY_META, encode_meta_blob(lock_body));
         let mut target = HeaderKeyDict::new();
         target.set(S3_VERSIONING_LEGACY_META, "Suspended");
         target.set(S3_OBJECT_LOCK_LEGACY_META, "stale");
@@ -890,10 +888,7 @@ mod tests {
         let mut untouched_target = HeaderKeyDict::new();
         untouched_target.set(S3_VERSIONING_LEGACY_META, "keep-until-error");
         assert_eq!(
-            apply_legacy_bucket_security_sysmeta_migration(
-                &poisoned_source,
-                &mut untouched_target,
-            ),
+            apply_legacy_bucket_security_sysmeta_migration(&poisoned_source, &mut untouched_target,),
             Err("InvalidVersioningMetadata".to_string())
         );
         assert_eq!(
@@ -905,8 +900,10 @@ mod tests {
 
     #[test]
     fn empty_list_versions_shape() {
-        let xml = String::from_utf8(empty_list_versions_result_xml("mybucket", "", "", "", 1000, None))
-            .unwrap();
+        let xml = String::from_utf8(empty_list_versions_result_xml(
+            "mybucket", "", "", "", 1000, None,
+        ))
+        .unwrap();
         assert!(xml.contains("ListVersionsResult"));
         assert!(xml.contains("<Name>mybucket</Name>"));
         assert!(xml.contains("<IsTruncated>false</IsTruncated>"));

@@ -20,9 +20,7 @@ use swift_core::hashing::HashPathConfig;
 use swift_diskfile::{DiskFileConfig, PolicyKind};
 use swift_http::ServerConfig;
 use swift_object_server::{serve_with_config, ObjectServer, ObjectServerConfig};
-use swift_runtime::{
-    ConcurrencyMetrics, DeviceIoLimits, StorageExecutor, StorageExecutorConfig,
-};
+use swift_runtime::{ConcurrencyMetrics, DeviceIoLimits, StorageExecutor, StorageExecutorConfig};
 
 /// AGENTS.md §29 soak program length.
 const SOAK_PROGRAM_SECS: u64 = 24 * 60 * 60;
@@ -53,10 +51,7 @@ fn soak_secs() -> u64 {
         .unwrap_or(30)
 }
 
-fn object_server(
-    dir: &std::path::Path,
-    stall: Arc<dyn Fn() + Send + Sync>,
-) -> ObjectServer {
+fn object_server(dir: &std::path::Path, stall: Arc<dyn Fn() + Send + Sync>) -> ObjectServer {
     let exec = StorageExecutor::new(
         StorageExecutorConfig::new(1, 8, DeviceIoLimits::new(8, 8, 8, 8, 8)).unwrap(),
     )
@@ -79,7 +74,10 @@ fn spawn_object(
     stall: Arc<dyn Fn() + Send + Sync>,
     metrics: ConcurrencyMetrics,
     shutdown: Arc<AtomicBool>,
-) -> (std::net::SocketAddr, thread::JoinHandle<std::io::Result<()>>) {
+) -> (
+    std::net::SocketAddr,
+    thread::JoinHandle<std::io::Result<()>>,
+) {
     let server = object_server(dir, stall);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -138,9 +136,8 @@ fn put(addr: std::net::SocketAddr, name: &str, ts: u64, body: &[u8]) -> u16 {
 }
 
 fn get_obj(addr: std::net::SocketAddr, name: &str) -> u16 {
-    let req = format!(
-        "GET /sda1/0/AUTH_test/c/{name} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
-    );
+    let req =
+        format!("GET /sda1/0/AUTH_test/c/{name} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
     transact(addr, req.as_bytes(), Duration::from_secs(4)).0
 }
 
@@ -200,11 +197,8 @@ async fn mixed_workload_soak_on_shipped_hyper_object_server() {
             "developer soak must not silently equal G8 duration without PEREGRINE_CLAIM_G8=1"
         );
     }
-    let dir = std::env::temp_dir().join(format!(
-        "peregrine-soak-{}-{}",
-        std::process::id(),
-        line!()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("peregrine-soak-{}-{}", std::process::id(), line!()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("sda1")).unwrap();
 
@@ -225,7 +219,12 @@ async fn mixed_workload_soak_on_shipped_hyper_object_server() {
 
     let metrics = ConcurrencyMetrics::new();
     let shutdown = Arc::new(AtomicBool::new(false));
-    let (mut addr, mut join) = spawn_object(&dir, Arc::clone(&stall), metrics.clone(), Arc::clone(&shutdown));
+    let (mut addr, mut join) = spawn_object(
+        &dir,
+        Arc::clone(&stall),
+        metrics.clone(),
+        Arc::clone(&shutdown),
+    );
 
     let saw_backend_fail = Arc::new(AtomicBool::new(false));
     let saw_slow = Arc::new(AtomicBool::new(false));
@@ -384,10 +383,7 @@ async fn mixed_workload_soak_on_shipped_hyper_object_server() {
                 break;
             }
         }
-        assert!(
-            !mono,
-            "RSS grew on every sample (monotonic leak): {rss:?}"
-        );
+        assert!(!mono, "RSS grew on every sample (monotonic leak): {rss:?}");
     }
 
     shutdown.store(true, Ordering::SeqCst);

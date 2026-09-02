@@ -479,17 +479,39 @@ fn test_replicate_tombstones_zero_peer_object_count() {
     for i in 0..50 {
         let name = format!("o{i:03}");
         local
-            .put_object(&name, "1751500001.00000", 1, "text/plain", "e", 0, 0, None, None)
+            .put_object(
+                &name,
+                "1751500001.00000",
+                1,
+                "text/plain",
+                "e",
+                0,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         remote
-            .put_object(&name, "1751500001.00000", 1, "text/plain", "e", 0, 0, None, None)
+            .put_object(
+                &name,
+                "1751500001.00000",
+                1,
+                "text/plain",
+                "e",
+                0,
+                0,
+                None,
+                None,
+            )
             .unwrap();
     }
     local.commit_pending().unwrap();
     remote.commit_pending().unwrap();
     // Peer already received our live rows (sync point == pre-delete max_row).
     let pre = local.get_max_row().unwrap().unwrap_or(-1);
-    remote.merge_syncs(&[(pre, "src-db-id".to_string())], true).unwrap();
+    remote
+        .merge_syncs(&[(pre, "src-db-id".to_string())], true)
+        .unwrap();
     assert_eq!(info_count(&mut local), 50);
     assert_eq!(info_count(&mut remote), 50);
 

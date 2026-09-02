@@ -342,11 +342,7 @@ fn load_object_ring(policy_index: i64) -> Option<Ring> {
     Some(Ring::new(data, hash))
 }
 
-fn head_object_request(
-    host: &str,
-    path: &str,
-    policy_index: i64,
-) -> String {
+fn head_object_request(host: &str, path: &str, policy_index: i64) -> String {
     // X-Backend-Open-Expired: an object past X-Delete-At still has a data
     // file. Probe test_expirer_object_split_brain L110 requires that name
     // to stay in the listing until the expirer reaps it. A plain HEAD 404s
@@ -1655,12 +1651,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let mut shard = crate::shard::ShardRange::new(
-            ".shards_a/c-0",
-            "0000000003.00000",
-            "",
-            "",
-        );
+        let mut shard = crate::shard::ShardRange::new(".shards_a/c-0", "0000000003.00000", "", "");
         shard.state = crate::shard::state::ACTIVE;
         broker.merge_shard_ranges(vec![shard]).unwrap();
         assert!(broker.has_other_shard_ranges().unwrap());
@@ -1889,18 +1880,9 @@ mod tests {
     #[test]
     fn test_head_object_request_opens_expired() {
         let req = head_object_request("127.0.0.1:16210", "/sdb1/1/a/c/o", 0);
-        assert!(
-            req.contains("X-Backend-Open-Expired: true"),
-            "{req}"
-        );
-        assert!(
-            req.contains("X-Backend-Replication: true"),
-            "{req}"
-        );
-        assert!(
-            req.contains("X-Backend-Storage-Policy-Index: 0"),
-            "{req}"
-        );
+        assert!(req.contains("X-Backend-Open-Expired: true"), "{req}");
+        assert!(req.contains("X-Backend-Replication: true"), "{req}");
+        assert!(req.contains("X-Backend-Storage-Policy-Index: 0"), "{req}");
     }
 
     #[test]

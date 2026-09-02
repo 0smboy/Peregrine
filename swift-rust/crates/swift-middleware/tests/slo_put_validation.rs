@@ -492,9 +492,7 @@ async fn async_put_reuses_head_for_duplicate_ranged_paths() {
         body: body.into(),
     };
 
-    let mut response = Slo::new()
-        .handle_request_async(request, backend)
-        .await;
+    let mut response = Slo::new().handle_request_async(request, backend).await;
     response.body.materialize(u64::MAX).unwrap();
     assert_eq!(response.status, 201, "{}", body_string(&response));
     let captured = writes.lock().unwrap().clone();
@@ -527,7 +525,8 @@ fn typo_etag_key_is_rejected_as_extraneous() {
 /// forces `application/json; charset=utf-8` on the stored listing.
 #[tokio::test]
 async fn async_manifest_get_sets_json_content_type() {
-    let stored = serde_json::to_vec(&json!([{"name": "/c/segment", "bytes": 3, "hash": "abc"}])).unwrap();
+    let stored =
+        serde_json::to_vec(&json!([{"name": "/c/segment", "bytes": 3, "hash": "abc"}])).unwrap();
     let backend: AsyncNextFn = Arc::new(move |request: Request| {
         let stored = stored.clone();
         Box::pin(async move {
@@ -564,7 +563,8 @@ fn container_listing_splits_slo_etag_from_hash() {
     let backend_body = listing.clone();
     let backend: NextFn = Arc::new(move |_r: Request| {
         let mut resp = Response::with_body(200, backend_body.clone());
-        resp.headers.set("Content-Type", "application/json; charset=utf-8");
+        resp.headers
+            .set("Content-Type", "application/json; charset=utf-8");
         resp
     });
     let req = Request {
@@ -579,7 +579,8 @@ fn container_listing_splits_slo_etag_from_hash() {
     let v: Value = serde_json::from_slice(match &resp.body {
         swift_http::Body::Buffered(b) => b,
         _ => panic!("expected buffered"),
-    }).unwrap();
+    })
+    .unwrap();
     assert_eq!(v[0]["hash"], "deadbeef");
     assert_eq!(v[0]["slo_etag"], "\"slohash\"");
     assert_eq!(v[1]["subdir"], "p/");
@@ -616,13 +617,15 @@ async fn async_heartbeat_put_is_202_chunked() {
                 let _ = request.body.materialize(u64::MAX);
                 let mut r = Response::new(201);
                 r.headers.set("Etag", "\"slo\"");
-                r.headers.set("Last-Modified", "Mon, 01 Jan 2020 00:00:00 GMT");
+                r.headers
+                    .set("Last-Modified", "Mon, 01 Jan 2020 00:00:00 GMT");
                 return r;
             }
             Response::new(404)
         })
     });
-    let body = serde_json::to_vec(&json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}])).unwrap();
+    let body =
+        serde_json::to_vec(&json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}])).unwrap();
     let mut headers = HeaderKeyDict::new();
     headers.set("Content-Type", "application/json");
     headers.set("Content-Length", body.len().to_string());
@@ -647,7 +650,8 @@ async fn async_heartbeat_put_is_202_chunked() {
 #[test]
 fn if_none_match_not_star_is_400() {
     let backend: NextFn = Arc::new(|_r: Request| Response::new(500));
-    let body = serde_json::to_vec(&json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}])).unwrap();
+    let body =
+        serde_json::to_vec(&json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}])).unwrap();
     let mut headers = HeaderKeyDict::new();
     headers.set("If-None-Match", "\"not-star\"");
     let req = Request {
@@ -685,7 +689,8 @@ async fn if_none_match_star_does_not_412_segment_heads() {
             Response::new(404)
         })
     });
-    let body = serde_json::to_vec(&json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}])).unwrap();
+    let body =
+        serde_json::to_vec(&json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}])).unwrap();
     let mut headers = HeaderKeyDict::new();
     headers.set("If-None-Match", "*");
     headers.set("Content-Length", body.len().to_string());
@@ -759,7 +764,8 @@ async fn heartbeat_bad_etag_json_uses_webob_422_body() {
             Response::new(201)
         })
     });
-    let body = serde_json::to_vec(&json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}])).unwrap();
+    let body =
+        serde_json::to_vec(&json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}])).unwrap();
     let mut headers = HeaderKeyDict::new();
     headers.set("Accept", "application/json");
     headers.set("Etag", "bad etag");
@@ -873,7 +879,8 @@ async fn head_part_number_refetches_manifest() {
 
 #[tokio::test]
 async fn part_number_out_of_range_is_plain_416() {
-    let stored = serde_json::to_vec(&json!([{"name": "/c/s1", "bytes": 3, "hash": "aaa"}])).unwrap();
+    let stored =
+        serde_json::to_vec(&json!([{"name": "/c/s1", "bytes": 3, "hash": "aaa"}])).unwrap();
     let backend: AsyncNextFn = Arc::new(move |request: Request| {
         let stored = stored.clone();
         Box::pin(async move {
@@ -897,7 +904,10 @@ async fn part_number_out_of_range_is_plain_416() {
     let mut resp = Slo::new().reassemble_async(request, backend).await;
     assert_eq!(resp.status, 416);
     let body = resp.body.materialize(u64::MAX).unwrap();
-    assert_eq!(body, b"The requested part number is not satisfiable".as_slice());
+    assert_eq!(
+        body,
+        b"The requested part number is not satisfiable".as_slice()
+    );
     assert_eq!(resp.headers.get("X-Parts-Count"), Some("1"));
     assert_eq!(resp.headers.get("Content-Range"), Some("bytes */3"));
 }

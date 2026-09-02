@@ -238,9 +238,7 @@ impl EtagQuoter {
             .headers
             .remove("X-Backend-Container-Rfc-Compliant-Etags");
         let account_status = resp.headers.remove("X-Backend-Account-Info-Status");
-        let account_flag = resp
-            .headers
-            .remove("X-Backend-Account-Rfc-Compliant-Etags");
+        let account_flag = resp.headers.remove("X-Backend-Account-Rfc-Compliant-Etags");
         let Some(cs) = container_status else {
             return self.enable_by_default;
         };

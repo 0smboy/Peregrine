@@ -45,9 +45,7 @@ use std::collections::HashMap;
 
 use swift_core::hashing::HashPathConfig;
 use swift_diskfile::{DiskFileConfig, PolicyKind};
-use swift_http::server::{
-    serve_forever_multi_service, AsyncRequest, AsyncService, ServerConfig,
-};
+use swift_http::server::{serve_forever_multi_service, AsyncRequest, AsyncService, ServerConfig};
 use swift_http::{
     conditional_response_status, title_case, HeaderKeyDict, Range, Request, Response,
     PRODUCTION_HTTP1_ENGINE,
@@ -57,10 +55,7 @@ use swift_object_server::{serve_with_config, ObjectServer, ObjectServerConfig};
 struct ReadBodyThen201;
 
 impl AsyncService for ReadBodyThen201 {
-    fn call(
-        &self,
-        mut req: AsyncRequest,
-    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+    fn call(&self, mut req: AsyncRequest) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
         Box::pin(async move {
             // First body read == Python first `wsgi.input` read.
             let _ = req.body.next_chunk().await;
@@ -96,10 +91,7 @@ impl AsyncService for EtagService {
 struct SwiftUtf8MetadataEcho;
 
 impl AsyncService for SwiftUtf8MetadataEcho {
-    fn call(
-        &self,
-        mut req: AsyncRequest,
-    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+    fn call(&self, mut req: AsyncRequest) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
         Box::pin(async move {
             assert_eq!(req.method, "PUT");
             assert_eq!(req.path, "/v1/a/c/o-è");
@@ -309,7 +301,10 @@ fn three_keepalive_expect_continue_at_two_workers() {
         text.starts_with("HTTP/1.1 100 Continue"),
         "Gate 5 occupancy: {text:?} after {elapsed:?}"
     );
-    assert!(elapsed < Duration::from_millis(400), "100 Continue took {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_millis(400),
+        "100 Continue took {elapsed:?}"
+    );
 }
 
 #[test]
@@ -533,8 +528,8 @@ fn swift_src_root() -> PathBuf {
 
 fn spawn_eventlet() -> EventletServer {
     let root = swift_src_root();
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/concurrency/eventlet_swift_wsgi.py");
+    let script =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/concurrency/eventlet_swift_wsgi.py");
     let mut child = Command::new("python3")
         .arg(&script)
         .env("PYTHONPATH", &root)
@@ -601,10 +596,7 @@ fn transact(addr: std::net::SocketAddr, req: &[u8]) -> Vec<u8> {
 struct ProtocolPutService;
 
 impl AsyncService for ProtocolPutService {
-    fn call(
-        &self,
-        mut req: AsyncRequest,
-    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+    fn call(&self, mut req: AsyncRequest) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
         Box::pin(async move {
             while let Ok(Some(_)) = req.body.next_chunk().await {}
             let mut r = Response::new(201);
@@ -622,7 +614,8 @@ fn dual_feed_eventlet_swift_http_protocol_vs_hyper() {
     let expect_put = b"PUT /v1/a/c/o HTTP/1.1\r\nHost: 127.0.0.1\r\nExpect: 100-continue\r\nContent-Length: 4\r\nConnection: close\r\n\r\n";
     let py_100 = {
         let mut s = TcpStream::connect_timeout(&py.addr, Duration::from_secs(2)).unwrap();
-        s.set_read_timeout(Some(Duration::from_millis(800))).unwrap();
+        s.set_read_timeout(Some(Duration::from_millis(800)))
+            .unwrap();
         s.write_all(expect_put).unwrap();
         s.flush().unwrap();
         let head = read_until_double_crlf(&mut s).unwrap();
@@ -632,7 +625,8 @@ fn dual_feed_eventlet_swift_http_protocol_vs_hyper() {
     };
     let rust_100 = {
         let mut s = TcpStream::connect_timeout(&rust.addr, Duration::from_secs(2)).unwrap();
-        s.set_read_timeout(Some(Duration::from_millis(800))).unwrap();
+        s.set_read_timeout(Some(Duration::from_millis(800)))
+            .unwrap();
         s.write_all(expect_put).unwrap();
         s.flush().unwrap();
         let head = read_until_double_crlf(&mut s).unwrap();
@@ -653,7 +647,11 @@ fn dual_feed_eventlet_swift_http_protocol_vs_hyper() {
     let py_ch = first_line(&transact(py.addr, chunked));
     let rust_ch = first_line(&transact(rust.addr, chunked));
     assert!(py_ch.contains("201"), "Eventlet chunked {py_ch:?}");
-    assert_eq!(py_ch.split_whitespace().nth(1), rust_ch.split_whitespace().nth(1), "chunked status Eventlet={py_ch:?} Hyper={rust_ch:?}");
+    assert_eq!(
+        py_ch.split_whitespace().nth(1),
+        rust_ch.split_whitespace().nth(1),
+        "chunked status Eventlet={py_ch:?} Hyper={rust_ch:?}"
+    );
     // COPY/DELETE/SSYNC object verbs are not protocol stubs. See
     // `shipped_object_delete_is_204_tombstone`, `shipped_object_ssync_accept_no_commit`,
     // and proxy `hyper_serve_copy_is_get_then_put_on_shipped_proxy`.
@@ -742,7 +740,8 @@ fn shipped_object_ssync_accept_no_commit() {
     // obj/server.py:1406-1415 X-Backend-Accept-No-Commit; sender getresponse
     // after headers (ssync_sender.py:264-272).
     let (server, dir) = spawn_object_server();
-    let body = b":MISSING_CHECK: START\r\n:MISSING_CHECK: END\r\n:UPDATES: START\r\n:UPDATES: END\r\n";
+    let body =
+        b":MISSING_CHECK: START\r\n:MISSING_CHECK: END\r\n:UPDATES: START\r\n:UPDATES: END\r\n";
     let mut req = format!(
         "SSYNC /sda1/0 HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -751,7 +750,10 @@ fn shipped_object_ssync_accept_no_commit() {
     req.extend_from_slice(body);
     let resp = transact(server.addr, &req);
     let text = String::from_utf8_lossy(&resp);
-    assert!(text.contains("200"), "SSYNC status obj/server.py:1406-1415 {text:?}");
+    assert!(
+        text.contains("200"),
+        "SSYNC status obj/server.py:1406-1415 {text:?}"
+    );
     assert!(
         text.to_ascii_lowercase()
             .contains("x-backend-accept-no-commit: true"),

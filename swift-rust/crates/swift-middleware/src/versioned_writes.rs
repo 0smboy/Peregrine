@@ -1024,10 +1024,8 @@ impl VersionedWrites {
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(0);
             if count > 0 {
-                let mut resp = Response::error(
-                    409,
-                    "Delete all versions before deleting container.",
-                );
+                let mut resp =
+                    Response::error(409, "Delete all versions before deleting container.");
                 resp.headers.set("Content-Type", "text/plain");
                 return Err(resp);
             }
@@ -1605,9 +1603,8 @@ impl VersionedWrites {
             .get("X-Object-Sysmeta-Slo-Etag")
             .map(|value| value.trim_matches('"').to_string())
             .filter(|value| !value.is_empty());
-        let target_bytes = slo_size.unwrap_or_else(|| {
-            declared_length.unwrap_or_else(|| counter.load(Ordering::Relaxed))
-        });
+        let target_bytes = slo_size
+            .unwrap_or_else(|| declared_length.unwrap_or_else(|| counter.load(Ordering::Relaxed)));
         // Listing slo_etag is leftover hash params on the marker
         // (apply_version_symlink_listing), not TGT_ETAG. Stuffing slo_etag
         // into TGT_ETAG 409s symlink follow (archive ETag is manifest md5).
@@ -1659,12 +1656,7 @@ impl VersionedWrites {
                 let href = next(empty_async_request(head)).await;
                 if (200..300).contains(&href.status) {
                     if let Some(ct) = href.headers.get("Content-Type") {
-                        content_type = ct
-                            .split(';')
-                            .next()
-                            .unwrap_or(ct)
-                            .trim()
-                            .to_string();
+                        content_type = ct.split(';').next().unwrap_or(ct).trim().to_string();
                     }
                 }
             }
@@ -2424,8 +2416,7 @@ impl VersionedWrites {
         next: AsyncNextFn,
     ) {
         let hidden_path = format!("/{version}/{account}/{hidden}");
-        let mut hidden_head =
-            Self::modern_internal_request("HEAD", hidden_path, "", &headers);
+        let mut hidden_head = Self::modern_internal_request("HEAD", hidden_path, "", &headers);
         hidden_head
             .headers
             .set("X-Backend-Allow-Reserved-Names", "true");
@@ -2626,8 +2617,7 @@ impl VersionedWrites {
                     let decoded = reserved_listing_name(raw_subdir);
                     if let Some(object) = split_reserved_name_first(&decoded) {
                         let already = subdirs.iter().any(|existing| {
-                            existing.get("subdir").and_then(|value| value.as_str())
-                                == Some(object)
+                            existing.get("subdir").and_then(|value| value.as_str()) == Some(object)
                         });
                         if !already {
                             subdirs.push(serde_json::json!({"subdir": object}));
@@ -4223,10 +4213,9 @@ mod tests {
     fn test_read_version_cfg_decodes_quoted_utf8_location() {
         let vw = VersionedWrites::new();
         let mut cinfo = Response::new(204);
-        cinfo.headers.set(
-            "X-Versions-Location",
-            "%EF%84%8F%ED%88%8D-versions",
-        );
+        cinfo
+            .headers
+            .set("X-Versions-Location", "%EF%84%8F%ED%88%8D-versions");
         let cfg = vw.read_version_cfg(&cinfo).expect("legacy cfg");
         assert_eq!(cfg.mode, "stack");
         assert_ne!(cfg.location, "%EF%84%8F%ED%88%8D-versions");
@@ -4356,11 +4345,15 @@ mod tests {
         assert_eq!(resp.status, 204, "{resp:?}");
         let calls = log.lock().unwrap().clone();
         assert!(
-            calls.iter().any(|(m, p)| m == "DELETE" && p == "/v1/AUTH_test/\0versions\0c"),
+            calls
+                .iter()
+                .any(|(m, p)| m == "DELETE" && p == "/v1/AUTH_test/\0versions\0c"),
             "must DELETE hidden versions container: {calls:?}"
         );
         assert!(
-            calls.iter().any(|(m, p)| m == "DELETE" && p == "/v1/AUTH_test/c"),
+            calls
+                .iter()
+                .any(|(m, p)| m == "DELETE" && p == "/v1/AUTH_test/c"),
             "must DELETE user container: {calls:?}"
         );
     }
@@ -4381,7 +4374,10 @@ mod tests {
                 resp.headers.set("X-Container-Object-Count", "3");
                 return Box::pin(async move { resp });
             }
-            panic!("must not DELETE while hidden versions remain: {} {}", r.method, r.path);
+            panic!(
+                "must not DELETE while hidden versions remain: {} {}",
+                r.method, r.path
+            );
         });
         let r = req("DELETE", "/v1/AUTH_test/c");
         let resp = vw.handle_request_async(r, app).await;
@@ -4890,9 +4886,7 @@ mod tests {
             headers: HeaderKeyDict::new(),
             body: IncomingBody::from_bytes(Vec::new(), 1024),
         };
-        let mut followed = vw
-            .handle_streaming_request(follow, Arc::clone(&next))
-            .await;
+        let mut followed = vw.handle_streaming_request(follow, Arc::clone(&next)).await;
         assert_eq!(
             followed.status,
             200,
@@ -5761,10 +5755,17 @@ mod tests {
                     }
                     1 => {
                         assert_eq!(req.method, "GET");
-                        assert!(req.query_string.contains("delimiter=-"), "{}", req.query_string);
+                        assert!(
+                            req.query_string.contains("delimiter=-"),
+                            "{}",
+                            req.query_string
+                        );
                         Response::with_body(200, hidden_body)
                     }
-                    n => panic!("unexpected listing subrequest {n} {} {}", req.method, req.path),
+                    n => panic!(
+                        "unexpected listing subrequest {n} {} {}",
+                        req.method, req.path
+                    ),
                 }
             })
         });

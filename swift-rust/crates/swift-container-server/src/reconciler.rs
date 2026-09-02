@@ -633,8 +633,8 @@ fn cmp_policy_info(info: ContainerPolicyInfo, remote: ContainerPolicyInfo) -> i8
         return timestamp_cmp(remote.status_changed_at, info.status_changed_at);
     }
 
-    let recreated = info.put_timestamp > info.delete_timestamp
-        && info.delete_timestamp > Timestamp::zero();
+    let recreated =
+        info.put_timestamp > info.delete_timestamp && info.delete_timestamp > Timestamp::zero();
     let remote_recreated = remote.put_timestamp > remote.delete_timestamp
         && remote.delete_timestamp > Timestamp::zero();
     if recreated || remote_recreated {
@@ -875,10 +875,7 @@ impl ReconcileClient for HttpReconcileClient<'_> {
             return false;
         };
         put_headers.push(("X-Timestamp".to_string(), put_timestamp));
-        put_headers.push((
-            "X-Backend-Storage-Policy-Index".to_string(),
-            to_pi.clone(),
-        ));
+        put_headers.push(("X-Backend-Storage-Policy-Index".to_string(), to_pi.clone()));
         put_headers.push((
             "X-Backend-Allow-Reserved-Names".to_string(),
             "true".to_string(),
@@ -889,13 +886,8 @@ impl ReconcileClient for HttpReconcileClient<'_> {
         ));
         put_headers.push(("ETag".to_string(), etag));
 
-        let Some((put_status, _)) = raw_request(
-            self.proxy_host,
-            "PUT",
-            &path,
-            &put_headers,
-            &body,
-        ) else {
+        let Some((put_status, _)) = raw_request(self.proxy_host, "PUT", &path, &put_headers, &body)
+        else {
             return false;
         };
         if !(200..300).contains(&put_status) {
@@ -1039,13 +1031,11 @@ pub fn run_once(
             if !should_process_entry(hash_config, &record.entry, processes, process) {
                 continue;
             }
-            let Some(current_pi) =
-                container_policy_index(
-                    container_ring,
-                    &record.entry.account,
-                    &record.entry.container,
-                )
-            else {
+            let Some(current_pi) = container_policy_index(
+                container_ring,
+                &record.entry.account,
+                &record.entry.container,
+            ) else {
                 stats.errors += 1;
                 continue;
             };
@@ -1233,10 +1223,7 @@ mod tests {
             self.move_ok
         }
         fn pop_queue(&self, record: &QueueRecord) -> bool {
-            self.popped
-                .lock()
-                .unwrap()
-                .push(record.entry.obj.clone());
+            self.popped.lock().unwrap().push(record.entry.obj.clone());
             true
         }
     }

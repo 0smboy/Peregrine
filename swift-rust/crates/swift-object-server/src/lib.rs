@@ -1314,9 +1314,7 @@ impl ObjectServer {
         if let Some(m) = ConcurrencyMetrics::current() {
             m.attach_storage(self.storage().clone());
         }
-        if areq.path == "/recon/updater/object"
-            && matches!(areq.method.as_str(), "GET" | "HEAD")
-        {
+        if areq.path == "/recon/updater/object" && matches!(areq.method.as_str(), "GET" | "HEAD") {
             let req = Request {
                 method: areq.method,
                 path: areq.path,
@@ -2540,7 +2538,11 @@ impl ObjectServer {
         let content_length = body.len();
         let mut resp = Response::with_body(
             200,
-            if req.method == "HEAD" { Vec::new() } else { body },
+            if req.method == "HEAD" {
+                Vec::new()
+            } else {
+                body
+            },
         );
         resp.headers.set("Content-Type", "application/json");
         resp.headers.set("Content-Length", content_length);
@@ -3210,9 +3212,7 @@ impl ObjectServer {
         let content_length = meta_get(&orig_metadata, "Content-Length")
             .unwrap_or("0")
             .to_string();
-        let etag = meta_get(&orig_metadata, "ETag")
-            .unwrap_or("")
-            .to_string();
+        let etag = meta_get(&orig_metadata, "ETag").unwrap_or("").to_string();
         let orig_sysmeta: Vec<(String, String)> = orig_metadata
             .iter()
             .filter_map(|(k, v)| match (k, v) {
@@ -5407,15 +5407,13 @@ mod delete_header_tests {
         let user_in_reserved =
             validate_internal_obj("AUTH_test", "\0reserved", "object").unwrap_err();
         assert_eq!(user_in_reserved.status, 400);
-        let reserved_in_user =
-            validate_internal_obj("AUTH_test", "user", "\0object").unwrap_err();
+        let reserved_in_user = validate_internal_obj("AUTH_test", "user", "\0object").unwrap_err();
         assert_eq!(reserved_in_user.status, 400);
     }
 
     #[test]
     fn internal_reserved_object_names_reject_embedded_marker_but_allow_system_queue() {
-        let embedded =
-            validate_internal_obj("AUTH_test", "user", "bad\0object").unwrap_err();
+        let embedded = validate_internal_obj("AUTH_test", "user", "bad\0object").unwrap_err();
         assert_eq!(embedded.status, 400);
         assert!(validate_internal_obj(
             ".misplaced_objects",
@@ -5594,15 +5592,17 @@ mod fallocate_reserve_tests {
             br#"{"object_updater_sweep": 1.5, "object_updater_stats": {"failures_account_container_count": 2}, "object_updater_last": 1700000000.0, "unrelated": true}"#,
         )
         .unwrap();
-        let server = tiny_server(&dir, FallocateReserve::Bytes(1))
-            .with_recon_cache_path(cache.clone());
-        let resp = server.handle_async(AsyncRequest {
-            method: "GET".into(),
-            path: "/recon/updater/object".into(),
-            query_string: String::new(),
-            headers: HeaderKeyDict::new(),
-            body: swift_http::IncomingBody::from_bytes(Vec::new(), 0),
-        }).await;
+        let server =
+            tiny_server(&dir, FallocateReserve::Bytes(1)).with_recon_cache_path(cache.clone());
+        let resp = server
+            .handle_async(AsyncRequest {
+                method: "GET".into(),
+                path: "/recon/updater/object".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), 0),
+            })
+            .await;
         assert_eq!(resp.status, 200, "{}", resp.reason);
         assert_eq!(resp.headers.get("Content-Type"), Some("application/json"));
         let body = resp.body.collect_async().await.unwrap();
@@ -6898,10 +6898,7 @@ mod fallocate_reserve_tests {
         override_put_h.set("X-Object-Sysmeta-Ec-Frag-Index", "1");
         override_put_h.set("X-Object-Sysmeta-Ec-Etag", "unexpected-ec-etag");
         override_put_h.set("X-Object-Sysmeta-Ec-Content-Length", "99");
-        override_put_h.set(
-            "X-Object-Sysmeta-Container-Update-Override-Size",
-            "7",
-        );
+        override_put_h.set("X-Object-Sysmeta-Container-Update-Override-Size", "7");
         override_put_h.set(
             "X-Object-Sysmeta-Container-Update-Override-Etag",
             "override-etag",
@@ -6991,7 +6988,10 @@ mod fallocate_reserve_tests {
             EXPIRER_CONTAINER_DIVISOR,
             EXPIRER_CONTAINER_PER_DIVISOR,
         );
-        assert_ne!(task_container, "9999936000", "test must exercise a non-zero shard offset");
+        assert_ne!(
+            task_container, "9999936000",
+            "test must exercise a non-zero shard offset"
+        );
         post_h.set("X-Delete-At-Container", &task_container);
         let post = server.handle(Request {
             method: "POST".into(),
@@ -7018,9 +7018,10 @@ mod fallocate_reserve_tests {
                 .map(|(_, value)| value.as_str()),
             Some("text/plain;swift_expirer_bytes=24")
         );
-        assert!(expiry.headers.iter().any(|(key, _)| {
-            key.eq_ignore_ascii_case("x-content-type-timestamp")
-        }));
+        assert!(expiry
+            .headers
+            .iter()
+            .any(|(key, _)| { key.eq_ignore_ascii_case("x-content-type-timestamp") }));
 
         let mut clear_h = HeaderKeyDict::new();
         clear_h.set("X-Timestamp", "4003");

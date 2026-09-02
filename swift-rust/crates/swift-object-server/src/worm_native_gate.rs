@@ -376,7 +376,11 @@ fn parse_retain_until(s: &str) -> Option<i64> {
                 return None;
             }
             let offset = (off_h as i64) * 3_600 + (off_m as i64) * 60;
-            if *sign == b'+' { offset } else { -offset }
+            if *sign == b'+' {
+                offset
+            } else {
+                -offset
+            }
         }
         _ => return None,
     };

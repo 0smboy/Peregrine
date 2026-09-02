@@ -971,18 +971,14 @@ pub fn build_part_jobs(
                 .map(|s| s.nparity + 1)
                 .unwrap_or(part_nodes.len())
                 .min(part_nodes.len());
-            let sync_to = tombstone_sample_indices(
-                part_nodes.len(),
-                nsample,
-                partition,
-                local_dev_id,
-            )
-                .into_iter()
-                .map(|index| {
-                    let node = &part_nodes[index];
-                    ssync_node(node.dev, node.index as i64)
-                })
-                .collect();
+            let sync_to =
+                tombstone_sample_indices(part_nodes.len(), nsample, partition, local_dev_id)
+                    .into_iter()
+                    .map(|index| {
+                        let node = &part_nodes[index];
+                        ssync_node(node.dev, node.index as i64)
+                    })
+                    .collect();
             jobs.push(EcPartJob {
                 job_type: EcJobType::Revert,
                 frag_index: None,
@@ -999,8 +995,7 @@ pub fn build_part_jobs(
     jobs
 }
 
-static TOMBSTONE_SAMPLE_NONCE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static TOMBSTONE_SAMPLE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -1584,10 +1579,18 @@ mod suffix_sync_tests {
     #[test]
     fn tombstone_sample_changes_subset_without_duplicates() {
         let first = sample_indices(6, 3, 7);
-        assert_eq!(first, sample_indices(6, 3, 7), "seeded sample must be reproducible");
+        assert_eq!(
+            first,
+            sample_indices(6, 3, 7),
+            "seeded sample must be reproducible"
+        );
         assert_eq!(first.len(), 3);
         assert_eq!(
-            first.iter().copied().collect::<std::collections::BTreeSet<_>>().len(),
+            first
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
             3,
             "sample is without replacement"
         );
@@ -1603,9 +1606,15 @@ mod suffix_sync_tests {
             subsets.len() > 1,
             "reconstructor retries must not keep choosing the same primaries"
         );
-        let seen: std::collections::BTreeSet<usize> =
-            subsets.iter().flat_map(|subset| subset.iter().copied()).collect();
-        assert_eq!(seen, (0..6).collect(), "retry samples must reach every primary");
+        let seen: std::collections::BTreeSet<usize> = subsets
+            .iter()
+            .flat_map(|subset| subset.iter().copied())
+            .collect();
+        assert_eq!(
+            seen,
+            (0..6).collect(),
+            "retry samples must reach every primary"
+        );
 
         let mut all = sample_indices(4, 4, 11);
         all.sort_unstable();
@@ -2267,9 +2276,7 @@ mod tests {
         let request = server.join().unwrap();
         let request = String::from_utf8(request).unwrap();
         assert!(
-            request.starts_with(
-                "GET /sda1/17/AUTH_test/c-%C3%A8/o-%C3%A8/child HTTP/1.1\r\n"
-            ),
+            request.starts_with("GET /sda1/17/AUTH_test/c-%C3%A8/o-%C3%A8/child HTTP/1.1\r\n"),
             "UTF-8 Swift path segments must be percent-encoded: {request:?}"
         );
         assert!(

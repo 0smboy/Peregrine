@@ -797,8 +797,6 @@ pub(crate) async fn wait_shutdown(config: &ServerConfig, flag: &AtomicBool) {
     wait_flag(flag).await;
 }
 
-
-
 /// Buffered async read half. Leftover from a request body can be prepended
 /// so the next keep-alive head parse sees the next request, not a hole.
 #[allow(dead_code)]
@@ -855,10 +853,7 @@ impl AsyncRead for ConnRead {
 
 #[allow(dead_code)]
 impl AsyncBufRead for ConnRead {
-    fn poll_fill_buf(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<&[u8]>> {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<&[u8]>> {
         let this = self.get_mut();
         if this.pos < this.buf.len() {
             return Poll::Ready(Ok(&this.buf[this.pos..]));
@@ -930,7 +925,10 @@ pub(crate) struct AsyncInterimCommand {
 
 enum IncomingInner {
     Hyper(hyper::body::Incoming),
-    Memory { data: Vec<u8>, pos: usize },
+    Memory {
+        data: Vec<u8>,
+        pos: usize,
+    },
     Channel {
         rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
         _scope: Option<swift_runtime::TaskScope>,
@@ -1138,7 +1136,7 @@ impl IncomingBody {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "body idle timeout",
-                    ))
+                    ));
                 }
             }
         } else {
@@ -1353,7 +1351,11 @@ async fn read_head_async(
         if empty {
             break;
         }
-        if acc.len() > config.max_header_bytes.saturating_add(config.max_request_line_bytes) {
+        if acc.len()
+            > config
+                .max_header_bytes
+                .saturating_add(config.max_request_line_bytes)
+        {
             return Err(ProtocolError::Http(400, "request headers too large"));
         }
     }
@@ -3153,7 +3155,10 @@ mod tests {
             .unwrap();
         let accepted_deadline = Instant::now() + Duration::from_secs(2);
         while metrics.snapshot().runtime_tasks == 0 {
-            assert!(Instant::now() < accepted_deadline, "connection was not accepted");
+            assert!(
+                Instant::now() < accepted_deadline,
+                "connection was not accepted"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
 

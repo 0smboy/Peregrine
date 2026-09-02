@@ -723,13 +723,7 @@ mod tests {
     #[test]
     fn test_verify_sigv4_rejects_wrong_secret() {
         assert_eq!(
-            verify_sigv4(
-                ACCESS,
-                "not-the-secret",
-                &header_auth_request(),
-                None,
-                None
-            ),
+            verify_sigv4(ACCESS, "not-the-secret", &header_auth_request(), None, None),
             Err(SigAuthError::SignatureDoesNotMatch)
         );
     }
@@ -884,9 +878,7 @@ mod tests {
             other => panic!("expected query-param error, got {other:?}"),
         }
         assert_sig_error_xml_matches_normalize(
-            SigAuthError::AuthorizationQueryParametersError(
-                "X-Amz-Expires must be non-negative",
-            ),
+            SigAuthError::AuthorizationQueryParametersError("X-Amz-Expires must be non-negative"),
             400,
         );
     }

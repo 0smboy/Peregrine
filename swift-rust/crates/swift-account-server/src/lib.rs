@@ -36,9 +36,7 @@ use swift_core::timestamp::Timestamp;
 use swift_db::{
     AccountBroker, BrokerMetadata, ContainerRecord, DbError, DbValue, ListContainersArgs,
 };
-use swift_http::{
-    split_path, AsyncRequest, AsyncService, Body, HeaderKeyDict, Request, Response,
-};
+use swift_http::{split_path, AsyncRequest, AsyncService, Body, HeaderKeyDict, Request, Response};
 use swift_runtime::{ConcurrencyMetrics, DbExecutor, DbExecutorConfig};
 
 pub const ACCOUNT_LISTING_LIMIT: i64 = 10000;

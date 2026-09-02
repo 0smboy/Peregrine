@@ -50,12 +50,10 @@ pub use deadline::{
     ClientWriteDeadline, DeadlineBudget, DeadlineKind, HeaderDeadline, KeepAliveIdleDeadline,
     ReplicationDeadline, ShutdownDeadline, UploadLifetimeDeadline,
 };
-pub use fanout::{
-    BackpressureWindow, FanoutError, FanoutGroup, QuorumTracker, SharedWindow,
-};
+pub use fanout::{BackpressureWindow, FanoutError, FanoutGroup, QuorumTracker, SharedWindow};
 pub use metrics::{
     text_has_forbidden_labels, CancelReason, ConcurrencyMetrics, ConcurrencySnapshot,
-    REQUIRED_METRIC_NAMES, RuntimeTaskGuard,
+    RuntimeTaskGuard, REQUIRED_METRIC_NAMES,
 };
 pub use scope::{
     CancellationToken, ScopeJoinError, ScopedTask, SpawnError, TaskCancelled, TaskScope,

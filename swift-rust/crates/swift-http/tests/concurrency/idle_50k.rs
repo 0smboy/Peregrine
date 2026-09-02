@@ -90,9 +90,7 @@ fn idle_50000_keepalives_or_capture_unavailability() {
         }
     }
     if let Some(msg) = unavailable {
-        panic!(
-            "ENVIRONMENT BLOCKED: idle-50k target={TARGET} opened={opened}: {msg}"
-        );
+        panic!("ENVIRONMENT BLOCKED: idle-50k target={TARGET} opened={opened}: {msg}");
     }
     assert_eq!(
         opened, TARGET,

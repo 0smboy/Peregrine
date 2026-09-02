@@ -1087,9 +1087,7 @@ pub fn process_container_db(
     let md = broker.metadata().unwrap_or_default();
     let versions_enabled = md
         .iter()
-        .find(|(key, _)| {
-            key.eq_ignore_ascii_case("X-Container-Sysmeta-Versions-Enabled")
-        })
+        .find(|(key, _)| key.eq_ignore_ascii_case("X-Container-Sysmeta-Versions-Enabled"))
         .map(|(_, (value, _))| value.as_str())
         .unwrap_or("");
     // Python object-versioning and container-sync deliberately do not share
@@ -1665,11 +1663,15 @@ cluster_c1 = http://127.0.0.1:8080/v1/
             etag: "etag".into(),
         };
         assert_eq!(
-            row.ts_data().map(|timestamp| timestamp.internal()).as_deref(),
+            row.ts_data()
+                .map(|timestamp| timestamp.internal())
+                .as_deref(),
             Some("1787757710.91367")
         );
         assert_eq!(
-            row.ts_meta().map(|timestamp| timestamp.internal()).as_deref(),
+            row.ts_meta()
+                .map(|timestamp| timestamp.internal())
+                .as_deref(),
             Some("1787757711.06714")
         );
     }
@@ -1824,17 +1826,7 @@ cluster_c1 = http://127.0.0.1:8080/v1/
             ])
             .unwrap();
         broker
-            .put_object(
-                "o1",
-                ts,
-                3,
-                "text/plain",
-                "abc",
-                0,
-                0,
-                None,
-                None,
-            )
+            .put_object("o1", ts, 3, "text/plain", "abc", 0, 0, None, None)
             .unwrap();
 
         let client = FakeSync {

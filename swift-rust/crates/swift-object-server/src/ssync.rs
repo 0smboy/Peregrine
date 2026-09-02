@@ -576,10 +576,7 @@ fn is_swift_metadata_header_name(name: &str) -> bool {
         "x-object-transient-sysmeta-",
     ];
     let lower = name.to_ascii_lowercase();
-    let Some(prefix) = PREFIXES
-        .iter()
-        .find(|prefix| lower.starts_with(**prefix))
-    else {
+    let Some(prefix) = PREFIXES.iter().find(|prefix| lower.starts_with(**prefix)) else {
         return false;
     };
     let suffix = &name[prefix.len()..];

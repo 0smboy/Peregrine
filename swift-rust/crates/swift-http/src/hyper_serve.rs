@@ -29,9 +29,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body::Frame;
 use hyper::body::Incoming;
+use hyper::header::{HeaderName, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::Service;
-use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Request as HyperRequest, Response as HyperResponse, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -42,12 +42,10 @@ use swift_runtime::{
 };
 
 use crate::body::Body;
-use crate::headers::HeaderKeyDict;
 use crate::dates::http_date;
+use crate::headers::HeaderKeyDict;
 use crate::request::{decoded_path_is_utf8, reason_phrase, unquote, Response};
-use crate::server::{
-    AsyncInterimCommand, AsyncRequest, AsyncService, IncomingBody, ServerConfig,
-};
+use crate::server::{AsyncInterimCommand, AsyncRequest, AsyncService, IncomingBody, ServerConfig};
 
 /// Decode a Hyper header value the way WSGI/Swift does: UTF-8 when the
 /// octets are valid UTF-8 (Python `str_to_wsgi` puts UTF-8 on the wire),
@@ -108,51 +106,25 @@ pub async fn serve_http1_connection(
         // example, the peek can end in CR and the next packet begin with LF).
         // Starting a fresh buffer here loses that prefix and waits until the
         // header deadline even though a complete head is already on the wire.
-        read_until_marker_with_prefix(
-            &mut stream,
-            peeked,
-            b"\r\n\r\n",
-            max_head,
-            head_deadline,
-        )
-        .await?
+        read_until_marker_with_prefix(&mut stream, peeked, b"\r\n\r\n", max_head, head_deadline)
+            .await?
     };
     if let Some((status, message)) = request_head_limit_error(&more, &config) {
         return write_handoff_error(&mut stream, status, message).await;
     }
     if request_line_is_ssync(&more) {
-        return serve_ssync_handoff(
-            stream,
-            more,
-            service,
-            config,
-            shutdown,
-            admission,
-            peer_ip,
-        )
-        .await;
+        return serve_ssync_handoff(stream, more, service, config, shutdown, admission, peer_ip)
+            .await;
     }
     if service.supports_object_mime_interim() && request_is_object_mime_continue_put(&more) {
         return serve_object_mime_handoff(
-            stream,
-            more,
-            service,
-            config,
-            shutdown,
-            admission,
-            peer_ip,
+            stream, more, service, config, shutdown, admission, peer_ip,
         )
         .await;
     }
     if request_needs_swift_utf8_handoff(&more) {
         return serve_swift_utf8_handoff(
-            stream,
-            more,
-            service,
-            config,
-            shutdown,
-            admission,
-            peer_ip,
+            stream, more, service, config, shutdown, admission, peer_ip,
         )
         .await;
     }
@@ -338,7 +310,10 @@ impl AsyncWrite for PrefixedIo {
 }
 
 fn request_line_is_ssync(buf: &[u8]) -> bool {
-    let line = buf.split(|&b| b == b'\r' || b == b'\n').next().unwrap_or(buf);
+    let line = buf
+        .split(|&b| b == b'\r' || b == b'\n')
+        .next()
+        .unwrap_or(buf);
     line.len() >= 6 && line[..6].eq_ignore_ascii_case(b"SSYNC ")
 }
 
@@ -399,7 +374,10 @@ fn request_is_object_mime_continue_put(buf: &[u8]) -> bool {
 /// Hyper rejects a space in the request-target (`GET /info asdf`) as 404 and
 /// lossy-unquote hides invalid UTF-8 as 400; catch both on the peeked line.
 fn request_line_precondition(buf: &[u8]) -> Option<&'static str> {
-    let line = buf.split(|&b| b == b'\r' || b == b'\n').next().unwrap_or(buf);
+    let line = buf
+        .split(|&b| b == b'\r' || b == b'\n')
+        .next()
+        .unwrap_or(buf);
     if request_line_is_ssync(line) {
         return None;
     }
@@ -426,10 +404,7 @@ fn request_line_precondition(buf: &[u8]) -> Option<&'static str> {
     None
 }
 
-fn request_head_limit_error(
-    buf: &[u8],
-    config: &ServerConfig,
-) -> Option<(u16, &'static str)> {
+fn request_head_limit_error(buf: &[u8], config: &ServerConfig) -> Option<(u16, &'static str)> {
     let head_end = buf
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -499,7 +474,6 @@ fn header_allows_reserved_nul(name: &str) -> bool {
     name.eq_ignore_ascii_case("X-Symlink-Target")
 }
 
-
 /// Eventlet/WSGI accepts `x-amz-meta-*` / `x-object-meta-*` field names whose
 /// suffix is not an RFC 7230 token (official test_put_object_weird_metadata).
 /// Colon, controls and whitespace stay forbidden. s3api still drops the
@@ -547,9 +521,9 @@ fn swift_utf8_metadata_name(raw: &[u8]) -> Option<&str> {
     .into_iter()
     .find(|prefix| lower.starts_with(prefix))?;
     if name.len() == prefix.len()
-        || name
-            .chars()
-            .any(|character| character == ':' || character.is_control() || character.is_whitespace())
+        || name.chars().any(|character| {
+            character == ':' || character.is_control() || character.is_whitespace()
+        })
     {
         return None;
     }
@@ -557,7 +531,10 @@ fn swift_utf8_metadata_name(raw: &[u8]) -> Option<&str> {
 }
 
 fn request_target_has_non_ascii_path(buf: &[u8]) -> bool {
-    let line = buf.split(|&byte| byte == b'\r' || byte == b'\n').next().unwrap_or(buf);
+    let line = buf
+        .split(|&byte| byte == b'\r' || byte == b'\n')
+        .next()
+        .unwrap_or(buf);
     let Some(target) = line.split(|&byte| byte == b' ').nth(1) else {
         return false;
     };
@@ -590,8 +567,7 @@ fn request_target_has_non_ascii_path(buf: &[u8]) -> bool {
 fn header_is_s3_authorization(name: &[u8], value: &[u8]) -> bool {
     // SigV2 `AWS ...` and SigV4 `AWS4-HMAC-SHA256 ...`. TempAuth tokens
     // are not AWS-prefixed and must stay on the Hyper keep-alive path.
-    name.eq_ignore_ascii_case(b"Authorization")
-        && trim_ascii_bytes(value).starts_with(b"AWS")
+    name.eq_ignore_ascii_case(b"Authorization") && trim_ascii_bytes(value).starts_with(b"AWS")
 }
 
 fn request_needs_swift_utf8_handoff(buf: &[u8]) -> bool {
@@ -728,12 +704,9 @@ fn split_head_body(buf: Vec<u8>) -> (Vec<u8>, Vec<u8>) {
     }
 }
 
-fn parse_ssync_head(
-    head: &[u8],
-) -> std::io::Result<(String, String, String, HeaderKeyDict)> {
-    let text = std::str::from_utf8(head).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-    })?;
+fn parse_ssync_head(head: &[u8]) -> std::io::Result<(String, String, String, HeaderKeyDict)> {
+    let text = std::str::from_utf8(head)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     let mut lines = text.split("\r\n");
     let reqline = lines.next().unwrap_or("");
     let mut sp = reqline.splitn(3, ' ');
@@ -839,12 +812,7 @@ fn parse_swift_utf8_head(
         };
         headers.set(name, value);
     }
-    Ok((
-        method.to_string(),
-        unquote(path_raw),
-        query_string,
-        headers,
-    ))
+    Ok((method.to_string(), unquote(path_raw), query_string, headers))
 }
 
 fn te_is_chunked(headers: &HeaderKeyDict) -> bool {
@@ -958,12 +926,8 @@ async fn serve_object_mime_handoff(
             config.max_body_bytes,
         ))
         .map_err(|error| std::io::Error::other(error.to_string()))?;
-    let mut body = IncomingBody::from_channel(
-        body_rx,
-        None,
-        Some(scope.clone()),
-        config.max_body_bytes,
-    );
+    let mut body =
+        IncomingBody::from_channel(body_rx, None, Some(scope.clone()), config.max_body_bytes);
     body.attach_async_interim(interim_tx);
     let idle_secs = if config.body_idle_timeout_secs > 0 {
         config.body_idle_timeout_secs
@@ -1133,13 +1097,15 @@ async fn serve_swift_utf8_handoff(
         }
     };
     let (head, leftover) = split_head_body(peeked);
-    let (method, path, query_string, mut headers) =
-        match parse_swift_utf8_head(&head, config.max_header_count) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                eprintln!("G6_DIAG utf8-compat stage=parse-error error={error}");
-                let body = b"Bad Request";
-                stream
+    let (method, path, query_string, mut headers) = match parse_swift_utf8_head(
+        &head,
+        config.max_header_count,
+    ) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("G6_DIAG utf8-compat stage=parse-error error={error}");
+            let body = b"Bad Request";
+            stream
                     .write_all(
                         format!(
                             "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1148,11 +1114,11 @@ async fn serve_swift_utf8_handoff(
                         .as_bytes(),
                     )
                     .await?;
-                stream.write_all(body).await?;
-                stream.flush().await?;
-                return Ok(());
-            }
-        };
+            stream.write_all(body).await?;
+            stream.flush().await?;
+            return Ok(());
+        }
+    };
     if let Some(ref ip) = peer_ip {
         if !headers.contains_key("X-Backend-Remote-Addr") {
             headers.set("X-Backend-Remote-Addr", ip);
@@ -1190,15 +1156,8 @@ async fn serve_swift_utf8_handoff(
     let max_body = config.max_body_bytes;
     let body_scope = scope.clone();
     let _ = body_scope.spawn(async move {
-        pump_swift_compat_request_body(
-            leftover,
-            read_half,
-            tx,
-            chunked,
-            content_length,
-            max_body,
-        )
-        .await;
+        pump_swift_compat_request_body(leftover, read_half, tx, chunked, content_length, max_body)
+            .await;
     });
     let mut body = IncomingBody::from_channel(rx, content_length, Some(scope), max_body);
     let idle_secs = if config.body_idle_timeout_secs > 0 {
@@ -1207,7 +1166,9 @@ async fn serve_swift_utf8_handoff(
         config.client_timeout_secs
     };
     if idle_secs > 0 {
-        body.set_body_idle(BodyIdleDeadline::from_timeout(Duration::from_secs(idle_secs)));
+        body.set_body_idle(BodyIdleDeadline::from_timeout(Duration::from_secs(
+            idle_secs,
+        )));
     }
     if config.max_upload_time_secs > 0 {
         body.set_upload_lifetime(UploadLifetimeDeadline::from_timeout(Duration::from_secs(
@@ -1294,7 +1255,8 @@ async fn serve_ssync_handoff(
         reject_overloaded(stream).await;
         return Ok(());
     }
-    let _req_permit = match admission.try_acquire_request(TrafficClass::Replication)
+    let _req_permit = match admission
+        .try_acquire_request(TrafficClass::Replication)
         .or_else(|_| admission.try_acquire_request(TrafficClass::Foreground))
     {
         Ok(p) => p,
@@ -1328,12 +1290,14 @@ async fn serve_ssync_handoff(
         config.client_timeout_secs
     };
     if idle_secs > 0 {
-        body.set_body_idle(BodyIdleDeadline::from_timeout(Duration::from_secs(idle_secs)));
+        body.set_body_idle(BodyIdleDeadline::from_timeout(Duration::from_secs(
+            idle_secs,
+        )));
     }
     if config.max_upload_time_secs > 0 {
-        body.set_upload_lifetime(UploadLifetimeDeadline::from_timeout(
-            Duration::from_secs(config.max_upload_time_secs),
-        ));
+        body.set_upload_lifetime(UploadLifetimeDeadline::from_timeout(Duration::from_secs(
+            config.max_upload_time_secs,
+        )));
     }
     let trans_id = {
         if let Some(id) = headers.get("X-Trans-Id").filter(|s| !s.is_empty()) {
@@ -1479,9 +1443,8 @@ async fn pump_chunked(
             .split(';')
             .next()
             .unwrap_or("");
-        let size = usize::from_str_radix(hex, 16).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size")
-        })?;
+        let size = usize::from_str_radix(hex, 16)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size"))?;
         if size == 0 {
             let _ = src.read_line().await;
             return Ok(());
@@ -1725,7 +1688,8 @@ struct HyperToSwift {
 impl Service<HyperRequest<Incoming>> for HyperToSwift {
     type Response = HyperResponse<SwiftHttpBody>;
     type Error = Infallible;
-    type Future = Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future =
+        Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn call(&self, mut req: HyperRequest<Incoming>) -> Self::Future {
         let inner = Arc::clone(&self.inner);
@@ -1748,9 +1712,7 @@ impl Service<HyperRequest<Incoming>> for HyperToSwift {
             if shutdown.load(Ordering::SeqCst)
                 && shutdown_raced_request_admitted.swap(true, Ordering::SeqCst)
             {
-                metrics.set_graceful_shutdown_requests(
-                    metrics.snapshot().runtime_tasks.max(1),
-                );
+                metrics.set_graceful_shutdown_requests(metrics.snapshot().runtime_tasks.max(1));
                 return Ok(error_hyper(503, "Service Unavailable", false));
             }
             struct InFlight(Arc<AtomicUsize>);
@@ -1803,8 +1765,7 @@ impl Service<HyperRequest<Incoming>> for HyperToSwift {
             let s3_signed = headers.get("Authorization").is_some_and(|value| {
                 value.starts_with("AWS") || value.starts_with("AWS4-HMAC-SHA256")
             });
-            let close_after =
-                s3_signed || n + 1 >= config.max_requests_per_connection.max(1);
+            let close_after = s3_signed || n + 1 >= config.max_requests_per_connection.max(1);
             if matches!(method.as_str(), "GET" | "HEAD") && path == "/recon/concurrency" {
                 let body = metrics.render();
                 return Ok(to_hyper_response(
@@ -1832,7 +1793,9 @@ impl Service<HyperRequest<Incoming>> for HyperToSwift {
                 config.client_timeout_secs
             };
             if idle_secs > 0 {
-                body.set_body_idle(BodyIdleDeadline::from_timeout(Duration::from_secs(idle_secs)));
+                body.set_body_idle(BodyIdleDeadline::from_timeout(Duration::from_secs(
+                    idle_secs,
+                )));
             }
             if config.max_upload_time_secs > 0 {
                 body.set_upload_lifetime(UploadLifetimeDeadline::from_timeout(
@@ -1871,8 +1834,7 @@ fn to_hyper_response(
     if response.reason.contains(['\r', '\n']) {
         response.reason = reason_phrase(response.status).to_string();
     }
-    let status =
-        StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     if response.headers.get("Content-Length").is_none() {
         if let Some(n) = response.body.content_length() {
             response.headers.set("Content-Length", n);
@@ -1887,8 +1849,7 @@ fn to_hyper_response(
     }
     let mut builder = HyperResponse::builder().status(status);
     for (name, value) in response.headers.iter() {
-        if name.eq_ignore_ascii_case("Connection")
-            || name.eq_ignore_ascii_case("Transfer-Encoding")
+        if name.eq_ignore_ascii_case("Connection") || name.eq_ignore_ascii_case("Transfer-Encoding")
         {
             continue;
         }
@@ -1928,9 +1889,7 @@ fn to_hyper_response(
         SwiftHttpBody::from_swift(response.body.take())
     };
     builder.body(body).unwrap_or_else(|_| {
-        HyperResponse::new(SwiftHttpBody::from_bytes(
-            b"Internal Error".to_vec(),
-        ))
+        HyperResponse::new(SwiftHttpBody::from_bytes(b"Internal Error".to_vec()))
     })
 }
 
@@ -2152,10 +2111,7 @@ mod tests {
             request_line_precondition(b"GET /v1/AUTH_test/%00reserved HTTP/1.1\r\n"),
             None
         );
-        assert_eq!(
-            request_line_precondition(b"GET /info HTTP/1.1\r\n"),
-            None
-        );
+        assert_eq!(request_line_precondition(b"GET /info HTTP/1.1\r\n"), None);
     }
 
     #[test]
@@ -2210,11 +2166,8 @@ mod tests {
             Some("x-amz-meta-(")
         );
 
-        let (_, _, _, headers) = parse_swift_utf8_head(
-            symlink_request,
-            32,
-        )
-        .expect("reserved symlink target must reach Swift middleware");
+        let (_, _, _, headers) = parse_swift_utf8_head(symlink_request, 32)
+            .expect("reserved symlink target must reach Swift middleware");
         assert_eq!(
             headers.get("X-Symlink-Target"),
             Some("\0reserved-container/\0reserved-object")

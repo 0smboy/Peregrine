@@ -103,8 +103,8 @@ fn main() {
     );
 
     let swift_dir = std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string());
-    let swift_conf_path = std::env::var("SWIFT_CONF")
-        .unwrap_or_else(|_| format!("{swift_dir}/swift.conf"));
+    let swift_conf_path =
+        std::env::var("SWIFT_CONF").unwrap_or_else(|_| format!("{swift_dir}/swift.conf"));
     let swift_conf = parse_conf_file(&swift_conf_path);
     let hash_config = HashPathConfig::from_swift_conf(&swift_conf).unwrap_or_else(|e| {
         logger.error(&format!("bad swift.conf hash config: {e}"));

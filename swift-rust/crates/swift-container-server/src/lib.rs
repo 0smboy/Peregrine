@@ -541,7 +541,6 @@ impl ContainerServer {
         })
     }
 
-
     /// Python recon middleware: GET `/recon/<check>` never uses obj_path.
     /// Isolated G6 container-server.conf pipelines `healthcheck recon
     /// container-server`, but this binary ignores the pipeline, so `/recon/*`
@@ -1610,7 +1609,8 @@ impl ContainerServer {
             })
         });
         let include_own = states_raw.as_deref().is_some_and(|csv| {
-            csv.split(',').any(|p| p.trim().eq_ignore_ascii_case("auditing"))
+            csv.split(',')
+                .any(|p| p.trim().eq_ignore_ascii_case("auditing"))
         });
         let states = match states_raw {
             Some(csv) => {
@@ -2655,7 +2655,10 @@ mod shard_format_tests {
         let arr = body.as_array().expect("namespace listing is a JSON array");
         assert_eq!(arr.len(), 1, "includes returns the covering namespace");
         assert_eq!(arr[0]["name"], ".shards_AUTH_test/c-1");
-        assert!(arr[0].get("object_count").is_none(), "namespace omits full fields");
+        assert!(
+            arr[0].get("object_count").is_none(),
+            "namespace omits full fields"
+        );
 
         // Override-Shard-Name-Filter=sharded on a SHARDED db ignores includes.
         broker
@@ -2677,12 +2680,8 @@ mod shard_format_tests {
             headers,
             body: Vec::new().into(),
         };
-        let resp = test_server().get_shard(
-            &req,
-            &mut broker,
-            HeaderKeyDict::new(),
-            "application/json",
-        );
+        let resp =
+            test_server().get_shard(&req, &mut broker, HeaderKeyDict::new(), "application/json");
         let override_hdr = resp.headers.get("X-Backend-Override-Shard-Name-Filter");
         let body: serde_json::Value =
             serde_json::from_slice(&resp.body.into_vec(1024 * 1024).unwrap()).unwrap();
@@ -2728,5 +2727,4 @@ mod shard_format_tests {
         assert!(v.get("sharding_stats").is_some());
         let _ = std::fs::remove_dir_all(&srv.config.recon_cache_path);
     }
-
 }

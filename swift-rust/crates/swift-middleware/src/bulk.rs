@@ -28,9 +28,9 @@ use std::io::{Cursor, Read};
 use flate2::read::GzDecoder;
 use tar::Archive;
 
-use swift_core::constraints::MAX_FILE_SIZE;
 use std::future::Future;
 use std::pin::Pin;
+use swift_core::constraints::MAX_FILE_SIZE;
 
 use swift_http::{split_path, Body, HeaderKeyDict, Request, Response};
 
@@ -517,13 +517,10 @@ fn negotiate_bulk_format(accept: Option<&str>) -> &'static str {
         t == "application/xml" || t == "text/xml"
     }) {
         "application/xml"
-    } else if a.split(',').any(|part| {
-        part.split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            == "text/plain"
-    }) {
+    } else if a
+        .split(',')
+        .any(|part| part.split(';').next().unwrap_or("").trim() == "text/plain")
+    {
         "text/plain"
     } else {
         "application/json"
@@ -732,8 +729,14 @@ mod tests {
         assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
         let body = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap());
         assert!(body.contains("<delete>"), "{body}");
-        assert!(body.contains("<number_deleted>1</number_deleted>"), "{body}");
-        assert!(body.contains("<response_status>200 OK</response_status>"), "{body}");
+        assert!(
+            body.contains("<number_deleted>1</number_deleted>"),
+            "{body}"
+        );
+        assert!(
+            body.contains("<response_status>200 OK</response_status>"),
+            "{body}"
+        );
     }
 
     #[test]

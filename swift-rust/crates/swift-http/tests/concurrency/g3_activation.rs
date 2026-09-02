@@ -147,7 +147,10 @@ fn legacy_handler_path_increments_legacy_not_native() {
     let (status, body) = get_path(server.addr, "/recon/concurrency");
     assert_eq!(status, 200, "{body}");
     assert!(body.contains("legacy_sync_handler_requests_total"));
-    assert!(body.contains("native_async_requests_total 0") || body.contains("native_async_requests_total 0\n"));
+    assert!(
+        body.contains("native_async_requests_total 0")
+            || body.contains("native_async_requests_total 0\n")
+    );
 }
 
 #[test]

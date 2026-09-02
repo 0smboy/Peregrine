@@ -16,8 +16,12 @@ use std::time::{Duration, Instant};
 use swift_http::server::{serve_forever_with_config, ServerConfig};
 
 fn probe_once(stream: &mut TcpStream) -> String {
-    stream.set_read_timeout(Some(Duration::from_millis(400))).ok();
-    stream.set_write_timeout(Some(Duration::from_millis(400))).ok();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(400)))
+        .ok();
+    stream
+        .set_write_timeout(Some(Duration::from_millis(400)))
+        .ok();
     if stream
         .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n")
         .is_err()
