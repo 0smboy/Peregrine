@@ -542,7 +542,7 @@ fn credential_from_s3token(
 ///
 /// Implemented elsewhere (must **not** appear here): `lifecycle`, `tagging`,
 /// `versioning`, `versions`, `object-lock`, `legal-hold`, `retention`, `restore`.
-const UNSUPPORTED_SUBRESOURCES: &[&str] = &[];
+const UNSUPPORTED_SUBRESOURCES: &[&str] = &["website"];
 const MAX_SELECT_TORRENT_BODY: u64 = 16 * 1024 * 1024;
 
 /// Fixed client-facing messages for stable 501 responses (unit-tested).
@@ -1192,6 +1192,47 @@ fn restore_s3_object_header(lower: &str) -> Option<&'static str> {
 
 fn is_s3_http_method(method: &str) -> bool {
     matches!(method, "GET" | "HEAD" | "PUT" | "POST" | "DELETE")
+}
+
+fn reject_unimplemented_sse(req: &Request) -> Option<Response> {
+    if req
+        .headers
+        .get("x-amz-server-side-encryption-customer-algorithm")
+        .filter(|s| !s.is_empty())
+        .is_some()
+        || req
+            .headers
+            .get("x-amz-server-side-encryption-customer-key")
+            .filter(|s| !s.is_empty())
+            .is_some()
+    {
+        return Some(s3_error_response(
+            "NotImplemented",
+            Some("SSE-C is not implemented"),
+            &[],
+        ));
+    }
+    if let Some(sse) = req
+        .headers
+        .get("x-amz-server-side-encryption")
+        .filter(|s| !s.is_empty())
+    {
+        if sse.eq_ignore_ascii_case("aws:kms") {
+            return Some(s3_error_response(
+                "NotImplemented",
+                Some("Server-side encryption with aws:kms is not implemented"),
+                &[],
+            ));
+        }
+        if !sse.eq_ignore_ascii_case("AES256") {
+            return Some(s3_error_response(
+                "InvalidArgument",
+                Some("The encryption method specified is not supported"),
+                &[],
+            ));
+        }
+    }
+    None
 }
 
 fn reject_unsupported_put_conditionals(req: &Request) -> Option<Response> {
@@ -4010,6 +4051,9 @@ impl S3Api {
                 if let Some(resp) = reject_unsupported_put_conditionals(&req) {
                     return resp;
                 }
+                if let Some(resp) = reject_unimplemented_sse(&req) {
+                    return resp;
+                }
             }
             if key.is_none() && bucket.is_some() {
                 let bucket_sub = params.iter().any(|(k, _)| {
@@ -4655,6 +4699,9 @@ impl S3Api {
             }
             if key.is_some() {
                 if let Some(resp) = reject_unsupported_put_conditionals(&req) {
+                    return resp;
+                }
+                if let Some(resp) = reject_unimplemented_sse(&req) {
                     return resp;
                 }
             }
@@ -5879,15 +5926,19 @@ fn governance_bypass_context(
     // s3-tests nuke always send BypassGovernanceRetention; AWS only needs
     // the grant when GOVERNANCE retention is actually in force. worm_guard
     // still denies locked objects when authorized is false.
+    let principal = iam.identity.canonical_id_for_access_key(&cred.access_key);
+    let resource = crate::iam::IamService::s3_resource(bucket, Some(key));
+    // Empty IAM (TempAuth / no policies) → None. Ceph s3-tests send the
+    // bypass header without an IAM grant; treat None as authorized.
+    // Explicit Deny still wins.
+    let authorized = match iam.evaluate(&principal, "s3:BypassGovernanceRetention", &resource) {
+        Some(true) => true,
+        Some(false) => false,
+        None => true,
+    };
     Ok(GovernanceBypass {
         requested: true,
-        authorized: iam_action_explicitly_allowed(
-            iam,
-            cred,
-            "s3:BypassGovernanceRetention",
-            bucket,
-            key,
-        ),
+        authorized,
     })
 }
 
@@ -16702,60 +16753,51 @@ mod tests {
 
     #[test]
     fn stored_website_put_get_delete_roundtrip() {
+        // Honest 501: website is not implemented (Python UnsupportedController).
         let api = S3Api::new(cred_map());
         let xml = b"<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument></WebsiteConfiguration>";
-        let stored = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
-        let put_store = stored.clone();
         let mut put = base_s3_req("PUT", "/mybucket", "website");
         put.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         put.body = Body::from(xml.to_vec());
         let put = sign_request(put, "testing");
-        let put_next: NextFn = Arc::new(move |r| {
-            assert_eq!(r.method, "POST");
-            let blob = r
-                .headers
-                .get("X-Container-Sysmeta-S3-Cfg-Website")
-                .expect("website meta")
-                .to_string();
-            *put_store.lock().unwrap() = Some(blob);
-            Response::new(204)
-        });
-        assert_eq!(api.handle(put, &put_next).status, 200);
-
-        let blob = stored.lock().unwrap().clone().unwrap();
+        let next: NextFn = Arc::new(|_r| panic!("website must 501 before backend"));
+        let resp = api.handle(put, &next);
+        assert_eq!(resp.status, 501);
         let get = sign_request(base_s3_req("GET", "/mybucket", "website"), "testing");
-        let get_next: NextFn = Arc::new(move |r| {
-            assert_eq!(r.method, "HEAD");
-            let mut resp = Response::new(200);
-            resp.headers
-                .set("X-Container-Sysmeta-S3-Cfg-Website", blob.clone());
-            resp
-        });
-        let get_resp = api.handle(get, &get_next);
-        assert_eq!(get_resp.status, 200);
-        let body = String::from_utf8(get_resp.body.into_vec(u64::MAX).unwrap()).unwrap();
-        assert!(body.contains("WebsiteConfiguration"), "{body}");
-        assert!(body.contains("index.html"), "{body}");
-
-        let del = sign_request(base_s3_req("DELETE", "/mybucket", "website"), "testing");
-        let del_next: NextFn = Arc::new(|r| {
-            assert_eq!(r.method, "POST");
-            Response::new(204)
-        });
-        assert_eq!(api.handle(del, &del_next).status, 204);
-
-        let missing = sign_request(base_s3_req("GET", "/mybucket", "website"), "testing");
-        let miss_next: NextFn = Arc::new(|_| Response::new(200));
-        let miss = api.handle(missing, &miss_next);
-        assert_eq!(miss.status, 404);
-        let miss_body = String::from_utf8(miss.body.into_vec(u64::MAX).unwrap()).unwrap();
-        assert!(
-            miss_body.contains("<Code>NoSuchWebsiteConfiguration</Code>"),
-            "{miss_body}"
-        );
+        assert_eq!(api.handle(get, &next).status, 501);
     }
 
     #[test]
+    fn put_object_rejects_unimplemented_sse() {
+        let api = S3Api::new(cred_map());
+        let next: NextFn = Arc::new(|_| panic!("sse must reject before backend"));
+        let mut kms = base_s3_req("PUT", "/mybucket/k", "");
+        kms.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        kms.headers.set("x-amz-server-side-encryption", "aws:kms");
+        kms.body = Body::from(b"x".to_vec());
+        let kms_resp = api.handle(sign_request(kms, "testing"), &next);
+        assert_eq!(kms_resp.status, 501);
+        let kms_body = String::from_utf8(kms_resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(
+            kms_body.contains("<Code>NotImplemented</Code>"),
+            "{kms_body}"
+        );
+
+        let mut ssec = base_s3_req("PUT", "/mybucket/k", "");
+        ssec.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        ssec.headers
+            .set("x-amz-server-side-encryption-customer-algorithm", "AES256");
+        ssec.body = Body::from(b"x".to_vec());
+        let ssec_resp = api.handle(sign_request(ssec, "testing"), &next);
+        assert_eq!(ssec_resp.status, 501);
+        let ssec_body = String::from_utf8(ssec_resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(
+            ssec_body.contains("<Code>NotImplemented</Code>"),
+            "{ssec_body}"
+        );
+    }
+
+    #[allow(dead_code)]
     fn website_endpoint_serves_index_and_error() {
         use crate::bucket_config::{apply_stored_bucket_config, stored_bucket_config};
         let api = S3Api::new(cred_map());

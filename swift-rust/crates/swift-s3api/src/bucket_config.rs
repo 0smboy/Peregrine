@@ -296,6 +296,27 @@ pub fn validate_lifecycle_xml(body: &[u8]) -> Result<(), String> {
     if !text.contains("LifecycleConfiguration") {
         return Err("MalformedXML".into());
     }
+    // Python RNG: Rule/Status is exactly Enabled|Disabled (case-sensitive).
+    let mut rest = text;
+    while let Some(start) = rest.find("<Rule") {
+        let after = &rest[start..];
+        let end = after
+            .find("</Rule>")
+            .ok_or_else(|| "MalformedXML".to_string())?;
+        let rule = &after[..end];
+        rest = &after[end + 7..];
+        let Some(s0) = rule.find("<Status>") else {
+            return Err("MalformedXML".into());
+        };
+        let after_status = &rule[s0 + 8..];
+        let Some(s1) = after_status.find("</Status>") else {
+            return Err("MalformedXML".into());
+        };
+        let status = after_status[..s1].trim();
+        if status != "Enabled" && status != "Disabled" {
+            return Err("MalformedXML".into());
+        }
+    }
     Ok(())
 }
 
@@ -758,6 +779,10 @@ mod tests {
   </Rule>
 </LifecycleConfiguration>"#;
         validate_lifecycle_xml(body).unwrap();
+        let bad = br#"<LifecycleConfiguration><Rule><ID>x</ID><Status>invalid</Status></Rule></LifecycleConfiguration>"#;
+        assert!(validate_lifecycle_xml(bad).is_err());
+        let lower = br#"<LifecycleConfiguration><Rule><Status>enabled</Status></Rule></LifecycleConfiguration>"#;
+        assert!(validate_lifecycle_xml(lower).is_err());
         let mut h = HeaderKeyDict::new();
         apply_lifecycle_meta(&mut h, body);
         let got = lifecycle_xml_from_headers(&h).unwrap();

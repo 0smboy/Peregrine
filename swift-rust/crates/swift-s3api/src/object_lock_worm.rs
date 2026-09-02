@@ -512,7 +512,12 @@ pub fn evaluate_retention_update_with_clock(
             }
         }
         ObjectLockMode::Governance => {
-            if requested.retain_until_unix < old.retain_until_unix && !bypass.effective() {
+            // Any change that is not a pure GOVERNANCE extension (shorten
+            // OR mode switch to COMPLIANCE) needs bypass. AWS/Ceph
+            // test_object_lock_changing_mode_from_governance_with_bypass.
+            let mode_change = requested.mode != ObjectLockMode::Governance;
+            let shorten = requested.retain_until_unix < old.retain_until_unix;
+            if (mode_change || shorten) && !bypass.effective() {
                 RetentionUpdateDecision::Deny(RetentionUpdateDenyReason::GovernanceBypassRequired)
             } else {
                 RetentionUpdateDecision::Allow
@@ -1283,13 +1288,20 @@ mod tests {
             now,
             true
         ));
-        // Upgrade to COMPLIANCE (same or later date) → allow.
-        assert!(!worm_blocks_retention_put(
+        // Upgrade to COMPLIANCE requires bypass (Ceph governance-with-bypass).
+        assert!(worm_blocks_retention_put(
             &h,
             "COMPLIANCE",
             "2030-01-01T00:00:00Z",
             now,
             false
+        ));
+        assert!(!worm_blocks_retention_put(
+            &h,
+            "COMPLIANCE",
+            "2030-01-01T00:00:00Z",
+            now,
+            true
         ));
     }
 
