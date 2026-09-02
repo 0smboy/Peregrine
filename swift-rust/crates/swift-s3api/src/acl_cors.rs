@@ -1092,6 +1092,51 @@ pub fn bucket_grants_allow_read_acp(
     Some(false)
 }
 
+fn permission_allows_write_acp(permission: &str) -> bool {
+    matches!(permission, "WRITE_ACP" | "FULL_CONTROL")
+}
+
+pub fn bucket_grants_allow_write_acp(
+    headers: &HeaderKeyDict,
+    principal_access_key: &str,
+    principal_account: &str,
+) -> Option<bool> {
+    let policy = policy_from_bucket_headers(headers)?;
+    if principal_matches(&policy.owner_id, principal_access_key, principal_account) {
+        return Some(true);
+    }
+    for g in &policy.grants {
+        if !permission_allows_write_acp(&g.permission) {
+            continue;
+        }
+        match &g.grantee {
+            Grantee::Id { id, .. } => {
+                if principal_matches(id, principal_access_key, principal_account) {
+                    return Some(true);
+                }
+            }
+            Grantee::Uri { uri } => {
+                if uri == ALL_USERS || uri == AUTH_USERS {
+                    return Some(true);
+                }
+            }
+            Grantee::Email { .. } => {}
+        }
+    }
+    Some(false)
+}
+
+pub fn bucket_acl_denies_write_acp(
+    headers: &HeaderKeyDict,
+    principal_access_key: &str,
+    principal_account: &str,
+) -> bool {
+    matches!(
+        bucket_grants_allow_write_acp(headers, principal_access_key, principal_account),
+        Some(false)
+    )
+}
+
 pub fn bucket_acl_denies_read_acp(
     headers: &HeaderKeyDict,
     principal_access_key: &str,
@@ -2137,5 +2182,20 @@ mod tests {
         assert!(bucket_acl_denies_read(&h, "test:tester2", "AUTH_test"));
         assert!(!bucket_acl_denies_read(&h, "test:tester", "AUTH_test"));
         assert!(bucket_acl_denies_write(&h, "test:tester2", "AUTH_test"));
+        assert!(bucket_acl_denies_write_acp(&h, "test:tester2", "AUTH_test"));
+        assert!(!bucket_acl_denies_write_acp(&h, "test:tester", "AUTH_test"));
+    }
+
+    #[test]
+    fn public_read_bucket_acl_denies_alt_write_acp() {
+        let mut h = HeaderKeyDict::new();
+        apply_bucket_acl_put(
+            &mut h,
+            &AclPutInput::Canned("public-read".into()),
+            "test:tester",
+            true,
+        );
+        assert!(bucket_acl_denies_write_acp(&h, "test:tester2", "AUTH_test"));
+        assert!(!bucket_acl_denies_write_acp(&h, "test:tester", "AUTH_test"));
     }
 }

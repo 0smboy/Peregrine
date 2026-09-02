@@ -116,9 +116,9 @@ use swift_middleware::{
 
 use crate::acl_cors::{
     apply_bucket_acl_put, apply_object_acl_put, bucket_acl_denies_read, bucket_acl_denies_read_acp,
-    bucket_acl_denies_write, bucket_acl_xml_from_headers, clear_cors_swift_headers,
-    cors_config_to_swift_headers, cors_xml_from_swift_headers, decode_acl_json,
-    grants_allow_anonymous_read, object_acl_denies_read, object_acl_denies_write,
+    bucket_acl_denies_write, bucket_acl_denies_write_acp, bucket_acl_xml_from_headers,
+    clear_cors_swift_headers, cors_config_to_swift_headers, cors_xml_from_swift_headers,
+    decode_acl_json, grants_allow_anonymous_read, object_acl_denies_read, object_acl_denies_write,
     object_acl_xml_from_headers, object_canned_allows_anonymous_read, parse_cors_configuration,
     resolve_acl_put_input, xml_ok, AclPutInput, S3_BUCKET_ACL_JSON_META, S3_OBJECT_ACL_JSON_META,
     S3_OBJECT_ACL_META,
@@ -6469,6 +6469,9 @@ async fn handle_acl_async(
                 let existing = async_call(next, head).await;
                 let persist_owner =
                     existing_json_owner(&existing.headers, S3_BUCKET_ACL_JSON_META, &owner.id);
+                if bucket_acl_denies_write_acp(&existing.headers, &cred.access_key, &cred.account) {
+                    return s3_error_response("AccessDenied", None, &[]);
+                }
                 let input = match resolve_acl_put_input(
                     &req.headers,
                     if body.is_empty() { None } else { Some(&body) },
@@ -6576,6 +6579,9 @@ fn handle_acl(
                 let existing = next(head);
                 let persist_owner =
                     existing_json_owner(&existing.headers, S3_BUCKET_ACL_JSON_META, &owner.id);
+                if bucket_acl_denies_write_acp(&existing.headers, &cred.access_key, &cred.account) {
+                    return s3_error_response("AccessDenied", None, &[]);
+                }
                 let input = match resolve_acl_put_input(
                     &req.headers,
                     if body.is_empty() { None } else { Some(&body) },
