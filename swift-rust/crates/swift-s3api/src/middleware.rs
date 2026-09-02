@@ -3423,8 +3423,18 @@ impl S3Api {
                 Ok(v) => v,
                 Err(resp) => return finish(resp),
             };
-        if st != 404 && !(200..300).contains(&st) {
+        if st == 404 {
+            return finish(s3_error_response(
+                "NoSuchBucket",
+                None,
+                &[("BucketName", &bucket)],
+            ));
+        }
+        if !(200..300).contains(&st) {
             return finish(map_swift_error(st, Some(&bucket), None));
+        }
+        if let Some(denied) = deny_if_bucket_acl_blocks_write(self.s3_acl, &cred, &hdrs) {
+            return finish(denied);
         }
         let vstatus = versioning_status_from_headers(&hdrs).ok().flatten();
         if bucket_versioning_mode(vstatus.as_deref()).is_some() {
