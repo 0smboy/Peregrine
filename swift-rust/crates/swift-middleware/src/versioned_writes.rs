@@ -1616,9 +1616,15 @@ impl VersionedWrites {
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| target_etag.clone());
         let listing_etag = follow_etag.clone();
+        // Python `_put_symlink_to_version` uses the archive request
+        // Content-Type after symlink inherited the target type. Client
+        // staticlinks often omit Content-Type (`no_content_type`); the
+        // marker must still list as the target type.
         let content_type = req
             .headers
             .get("Content-Type")
+            .filter(|value| !value.is_empty())
+            .or_else(|| archived.headers.get("Content-Type"))
             .unwrap_or("application/octet-stream")
             .split(';')
             .next()
@@ -2793,6 +2799,10 @@ impl VersionedWrites {
         if !self.is_enabled(legacy) {
             return None;
         }
+        // HEAD/sysmeta expose Python `quote()` of UTF-8 names. Internal
+        // copy-current paths are already decoded; using the quoted value
+        // looks up a container named `%EF%84%...` and 404s the overwrite.
+        let location = decoded_header_path(&location);
         let location = location.split('/').next().unwrap_or(&location).to_string();
         Some(VersionCfg { location, mode })
     }
@@ -4114,6 +4124,29 @@ mod tests {
         assert_eq!(
             out.headers.get("X-Object-Version-Id"),
             Some(version_id.as_str())
+        );
+    }
+
+    #[test]
+    fn test_read_version_cfg_decodes_quoted_utf8_location() {
+        let vw = VersionedWrites::new();
+        let mut cinfo = Response::new(204);
+        cinfo.headers.set(
+            "X-Versions-Location",
+            "%EF%84%8F%ED%88%8D-versions",
+        );
+        let cfg = vw.read_version_cfg(&cinfo).expect("legacy cfg");
+        assert_eq!(cfg.mode, "stack");
+        assert_ne!(cfg.location, "%EF%84%8F%ED%88%8D-versions");
+        assert!(
+            cfg.location.ends_with("-versions"),
+            "decoded location {}",
+            cfg.location
+        );
+        assert!(
+            !cfg.location.contains('%'),
+            "must not keep percent-encoding: {}",
+            cfg.location
         );
     }
 

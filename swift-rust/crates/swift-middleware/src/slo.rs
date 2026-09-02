@@ -986,6 +986,11 @@ fn part_unsatisfiable(
     if let Some(lm) = inner.headers.get("Last-Modified") {
         r.headers.set("Last-Modified", lm);
     }
+    // Python `_return_slo_response` keeps inner X-Object-Version-Id on
+    // 416, including current-object `?part-number=` without version-id=.
+    if let Some(vid) = inner.headers.get("X-Object-Version-Id") {
+        r.headers.set("X-Object-Version-Id", vid);
+    }
     if orig.method == "HEAD" {
         r.headers.set("Content-Length", "0");
     } else {
@@ -4032,6 +4037,9 @@ mod tests {
             .headers
             .set("Last-Modified", "Tue, 01 Sep 2026 00:00:00 GMT");
         manifest_head.headers.set("Etag", &json_etag);
+        manifest_head
+            .headers
+            .set("X-Object-Version-Id", "1788310242.27709");
         let mut manifest_get = Response::with_body(200, manifest_json);
         manifest_get.headers.set("X-Static-Large-Object", "True");
         manifest_get.headers.set("Content-Type", "text/plain");
@@ -4039,6 +4047,9 @@ mod tests {
             .headers
             .set("Last-Modified", "Tue, 01 Sep 2026 00:00:00 GMT");
         manifest_get.headers.set("Etag", &json_etag);
+        manifest_get
+            .headers
+            .set("X-Object-Version-Id", "1788310242.27709");
         let be = backend(vec![
             ("HEAD", "/v1/a/c/manifest", manifest_head),
             ("GET", "/v1/a/c/manifest", manifest_get),
@@ -4066,6 +4077,10 @@ mod tests {
             Some("Tue, 01 Sep 2026 00:00:00 GMT")
         );
         assert_eq!(resp.headers.get("Content-Length"), Some("0"));
+        assert_eq!(
+            resp.headers.get("X-Object-Version-Id"),
+            Some("1788310242.27709")
+        );
     }
 
     #[test]
