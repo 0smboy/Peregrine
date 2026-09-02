@@ -53,8 +53,13 @@ pub const S3_BUCKET_TAGGING_META: &str = "X-Container-Sysmeta-S3-Tagging";
 /// Compact object TagSet encoding (sysmeta — off public `x-amz-meta-*`).
 pub const S3_OBJECT_TAGGING_META: &str = "X-Object-Sysmeta-S3-Tagging";
 
-/// Percent-encoded raw LifecycleConfiguration XML.
-pub const S3_LIFECYCLE_META: &str = "X-Container-Meta-S3-Lifecycle";
+/// Percent-encoded raw LifecycleConfiguration XML in protected sysmeta.
+/// User-meta (`X-Container-Meta-*`) is capped at 256 bytes by Swift; a
+/// real LifecycleConfiguration exceeds that after percent-encoding.
+pub const S3_LIFECYCLE_META: &str = "X-Container-Sysmeta-S3-Lifecycle";
+
+/// Historical public-meta lifecycle key. Read as fallback, never write.
+pub const S3_LIFECYCLE_LEGACY_META: &str = "X-Container-Meta-S3-Lifecycle";
 
 /// Percent-encoded raw ObjectLockConfiguration XML in protected sysmeta.
 pub const S3_OBJECT_LOCK_META: &str = "X-Container-Sysmeta-S3-Object-Lock";
@@ -320,19 +325,28 @@ pub fn validate_lifecycle_xml(body: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Store raw lifecycle XML (percent-encoded) on container meta.
+/// Store raw lifecycle XML (percent-encoded) on container sysmeta.
 pub fn apply_lifecycle_meta(headers: &mut HeaderKeyDict, body: &[u8]) {
+    headers.remove(S3_LIFECYCLE_LEGACY_META);
     headers.set(S3_LIFECYCLE_META, encode_meta_blob(body));
 }
 
 /// Clear lifecycle meta.
 pub fn clear_lifecycle_meta(headers: &mut HeaderKeyDict) {
+    headers.remove(S3_LIFECYCLE_LEGACY_META);
     headers.set(S3_LIFECYCLE_META, "");
 }
 
 /// Recover stored lifecycle XML bytes from headers.
 pub fn lifecycle_xml_from_headers(headers: &HeaderKeyDict) -> Option<Vec<u8>> {
-    let raw = headers.get(S3_LIFECYCLE_META).filter(|s| !s.is_empty())?;
+    let raw = headers
+        .get(S3_LIFECYCLE_META)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            headers
+                .get(S3_LIFECYCLE_LEGACY_META)
+                .filter(|s| !s.is_empty())
+        })?;
     decode_meta_blob(raw).ok()
 }
 

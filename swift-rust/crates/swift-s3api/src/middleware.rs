@@ -3312,6 +3312,9 @@ impl S3Api {
         if let Some(resp) = reject_unsupported_put_conditionals(&head) {
             return finish(resp);
         }
+        if let Some(resp) = reject_unimplemented_sse(&head) {
+            return finish(resp);
+        }
         let auth = match parse_sigv4_auth(&head) {
             Some(a) => a,
             None => return finish(s3_error_response("AccessDenied", None, &[])),
@@ -4237,6 +4240,8 @@ impl S3Api {
         let has_tagging = params.iter().any(|(k, _)| k == "tagging");
         let has_lifecycle = params.iter().any(|(k, _)| k == "lifecycle");
         let has_object_lock = params.iter().any(|(k, _)| k == "object-lock");
+        let has_retention = params.iter().any(|(k, _)| k == "retention");
+        let has_legal_hold = params.iter().any(|(k, _)| k == "legal-hold");
         if has_delete && req.method == "POST" && bucket.is_some() && key.is_none() {
             return handle_multi_delete_async(
                 req,
@@ -4285,6 +4290,47 @@ impl S3Api {
         }
         if has_object_lock && bucket.is_some() && key.is_none() {
             return handle_object_lock_async(req, &cred, bucket.as_deref().unwrap(), &next).await;
+        }
+        if has_retention {
+            if let (Some(b), Some(k)) = (bucket.as_deref(), key.as_deref()) {
+                let vid = params
+                    .iter()
+                    .find(|(n, _)| n == "versionId")
+                    .map(|(_, v)| v.as_str());
+                let bypass_requested = match parse_bypass_governance_header(
+                    req.headers
+                        .get(HDR_BYPASS_GOVERNANCE)
+                        .or_else(|| req.headers.get("X-Amz-Bypass-Governance-Retention")),
+                ) {
+                    Ok(value) => value,
+                    Err(_) => return s3_error_response("InvalidArgument", None, &[]),
+                };
+                let bypass =
+                    match governance_bypass_context(&self.iam, &cred, b, k, bypass_requested) {
+                        Ok(context) => context,
+                        Err(resp) => return resp,
+                    };
+                return handle_retention_async(
+                    req,
+                    &cred,
+                    b,
+                    k,
+                    vid,
+                    self.worm_clock.clock_ok(),
+                    bypass,
+                    &next,
+                )
+                .await;
+            }
+        }
+        if has_legal_hold {
+            if let (Some(b), Some(k)) = (bucket.as_deref(), key.as_deref()) {
+                let vid = params
+                    .iter()
+                    .find(|(n, _)| n == "versionId")
+                    .map(|(_, v)| v.as_str());
+                return handle_legal_hold_async(req, &cred, b, k, vid, &next).await;
+            }
         }
         if key.is_none() && bucket.is_some() {
             if let Some(cfg) = stored_bucket_config(&params) {
@@ -6272,6 +6318,63 @@ fn handle_legal_hold(
     }
 }
 
+async fn handle_legal_hold_async(
+    req: Request,
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    next: &AsyncNextFn,
+) -> Response {
+    let target = match resolve_object_version_async(cred, bucket, key, version_id, next).await {
+        Ok(Some(target)) => target,
+        Ok(None) => return missing_object_version_response(key, version_id),
+        Err(resp) => return resp,
+    };
+    let acl_denied = if req.method == "PUT" {
+        deny_if_object_acl_blocks_write(cred, &target.head.headers)
+    } else {
+        deny_if_object_acl_blocks_read(cred, &target.head.headers)
+    };
+    if let Some(denied) = acl_denied {
+        return denied;
+    }
+    match req.method.as_str() {
+        "GET" | "HEAD" => match object_version_lock_state(&target.head.headers) {
+            Ok(state) => xml_ok(legal_hold_xml(state.legal_hold_on)),
+            Err(_) => s3_error_response(
+                "InternalError",
+                Some("object lock metadata is invalid"),
+                &[],
+            ),
+        },
+        "PUT" => {
+            let body = match req.body.into_vec(MAX_CONTROL_BODY) {
+                Ok(b) => b,
+                Err(_) => return s3_error_response("IncompleteBody", None, &[]),
+            };
+            let on = match parse_legal_hold_body(&body) {
+                Ok(v) => v,
+                Err(_) => return s3_error_response("MalformedXML", None, &[]),
+            };
+            let mut post = make_swift_req(
+                "POST",
+                &s3_to_swift_path(&cred.account, Some(&target.container), Some(&target.key)),
+            );
+            post.headers
+                .set(SYS_LEGAL_HOLD, if on { "ON" } else { "OFF" });
+            stamp_auth(&mut post, cred);
+            let resp = async_call(next, post).await;
+            if (200..300).contains(&resp.status) {
+                Response::new(200)
+            } else {
+                map_swift_error(resp.status, Some(&target.container), Some(&target.key))
+            }
+        }
+        _ => s3_error_response("MethodNotAllowed", None, &[]),
+    }
+}
+
 fn handle_retention(
     req: Request,
     cred: &S3Credential,
@@ -6358,6 +6461,102 @@ fn handle_retention(
             post.headers.set(SYS_RETAIN_UNTIL, &requested.retain_until);
             stamp_auth(&mut post, cred);
             let resp = next(post);
+            if (200..300).contains(&resp.status) {
+                Response::new(200)
+            } else {
+                map_swift_error(resp.status, Some(&target.container), Some(&target.key))
+            }
+        }
+        _ => s3_error_response("MethodNotAllowed", None, &[]),
+    }
+}
+
+async fn handle_retention_async(
+    req: Request,
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    clock_ok: bool,
+    bypass: GovernanceBypass,
+    next: &AsyncNextFn,
+) -> Response {
+    let target = match resolve_object_version_async(cred, bucket, key, version_id, next).await {
+        Ok(Some(target)) => target,
+        Ok(None) => return missing_object_version_response(key, version_id),
+        Err(resp) => return resp,
+    };
+    let acl_denied = if req.method == "PUT" {
+        deny_if_object_acl_blocks_write(cred, &target.head.headers)
+    } else {
+        deny_if_object_acl_blocks_read(cred, &target.head.headers)
+    };
+    if let Some(denied) = acl_denied {
+        return denied;
+    }
+    match req.method.as_str() {
+        "GET" | "HEAD" => match object_version_lock_state(&target.head.headers) {
+            Ok(state) => match state.retention {
+                Some(retention) => xml_ok(retention_xml(
+                    retention.mode.as_str(),
+                    &retention.retain_until,
+                )),
+                None => s3_error_response(
+                    "InvalidRequest",
+                    Some("Object is missing retention configuration"),
+                    &[],
+                ),
+            },
+            Err(_) => s3_error_response(
+                "InternalError",
+                Some("object lock metadata is invalid"),
+                &[],
+            ),
+        },
+        "PUT" => {
+            let body = match req.body.into_vec(MAX_CONTROL_BODY) {
+                Ok(b) => b,
+                Err(_) => return s3_error_response("IncompleteBody", None, &[]),
+            };
+            let (mode, until) = match parse_retention_body(&body) {
+                Ok(v) => v,
+                Err(_) => return s3_error_response("MalformedXML", None, &[]),
+            };
+            let Some(requested) = parse_object_retention(&mode, &until) else {
+                return s3_error_response("MalformedXML", None, &[]);
+            };
+            match evaluate_retention_update_with_clock(
+                &target.head.headers,
+                &requested,
+                unix_now(),
+                clock_ok,
+                bypass,
+            ) {
+                RetentionUpdateDecision::Allow => {}
+                RetentionUpdateDecision::Deny(
+                    RetentionUpdateDenyReason::InvalidPersistedState(_),
+                ) => {
+                    return s3_error_response(
+                        "InternalError",
+                        Some("object lock metadata is invalid"),
+                        &[],
+                    )
+                }
+                RetentionUpdateDecision::Deny(RetentionUpdateDenyReason::InvalidRequest) => {
+                    return s3_error_response("InvalidRequest", None, &[])
+                }
+                RetentionUpdateDecision::Deny(_) => {
+                    return s3_error_response("AccessDenied", None, &[])
+                }
+            }
+            let mut post = make_swift_req(
+                "POST",
+                &s3_to_swift_path(&cred.account, Some(&target.container), Some(&target.key)),
+            );
+            post.headers.set(SYS_LOCK_MODE, requested.mode.as_str());
+            post.headers.set(SYS_RETAIN_UNTIL, &requested.retain_until);
+            stamp_auth(&mut post, cred);
+            let resp = async_call(next, post).await;
             if (200..300).contains(&resp.status) {
                 Response::new(200)
             } else {
@@ -15078,6 +15277,20 @@ mod tests {
         let areq = async_from_signed(req, b"abcdefghij".to_vec());
         let next: StreamingAsyncNextFn =
             Arc::new(|_| panic!("streaming If-Match PUT must not reach Swift"));
+        let resp = block_on_s3(api.put_object_streaming(areq, next));
+        assert_eq!(resp.status, 501);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>NotImplemented</Code>"), "{body}");
+    }
+
+    #[test]
+    fn put_object_streaming_rejects_unimplemented_sse() {
+        let api = S3Api::new(cred_map());
+        let mut req = unsigned_signed_put("/mybucket/obj", "");
+        req.headers.set("x-amz-server-side-encryption", "aws:kms");
+        let areq = async_from_signed(req, b"abcdefghij".to_vec());
+        let next: StreamingAsyncNextFn =
+            Arc::new(|_| panic!("streaming aws:kms PUT must not reach Swift"));
         let resp = block_on_s3(api.put_object_streaming(areq, next));
         assert_eq!(resp.status, 501);
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
