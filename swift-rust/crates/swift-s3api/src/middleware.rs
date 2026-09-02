@@ -3515,7 +3515,11 @@ impl S3Api {
             );
         }
         let vstatus = versioning_status_from_headers(&hdrs).ok().flatten();
-        if bucket_versioning_mode(vstatus.as_deref()).is_some() {
+        // Python Suspended PUT is a plain overwrite with no VersionId.
+        if matches!(
+            bucket_versioning_mode(vstatus.as_deref()),
+            Some(BucketVersioningMode::Enabled)
+        ) {
             let resp = self
                 .put_object_versioned_streaming(areq, next, method.clone(), head, cred, bucket, key)
                 .await;
