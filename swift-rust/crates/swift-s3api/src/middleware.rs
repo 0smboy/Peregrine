@@ -3611,7 +3611,7 @@ impl S3Api {
     /// sync `cas_save_version_index` path.
     async fn put_object_versioned_streaming(
         &self,
-        areq: AsyncRequest,
+        mut areq: AsyncRequest,
         next: StreamingAsyncNextFn,
         method: String,
         mut head: Request,
@@ -3620,89 +3620,199 @@ impl S3Api {
         key: String,
     ) -> Response {
         let finish = |resp: Response| finish_s3_response(&method, resp);
-        let vid = generate_version_id();
-        if !is_safe_version_id(&vid) {
-            return finish(unsafe_version_id_error());
-        }
-        let snap = match load_version_index_snapshot_streaming(&cred, &bucket, &key, &next).await {
-            Ok(s) => s,
-            Err(resp) => return finish(resp),
-        };
-        let expect = expect_generation(&snap);
-        let mut idx = snap.index.clone();
-        match control_head_object_streaming(&cred, &bucket, &key, &next).await {
-            Ok(ObjectHead::Missing) => {}
-            Ok(ObjectHead::Present(cur)) => {
-                if let Some(blocked) = deny_if_object_acl_blocks_write(&cred, &cur.headers) {
-                    return finish(blocked);
+        let client_conditional = client_sent_write_conditional(&head);
+        let mut buffered: Vec<u8> = Vec::new();
+        let mut replayable = true;
+        loop {
+            match areq.body.next_chunk().await {
+                Ok(Some(chunk)) if chunk.is_empty() => {}
+                Ok(Some(chunk)) => {
+                    if (buffered.len() as u64).saturating_add(chunk.len() as u64) > MAX_CONTROL_BODY
+                    {
+                        replayable = false;
+                    }
+                    buffered.extend_from_slice(&chunk);
+                    if !replayable {
+                        break;
+                    }
                 }
-                if let Err(resp) = maybe_archive_current_for_write_streaming(
-                    &cred,
-                    &bucket,
-                    &key,
-                    &cur.headers,
-                    &mut idx,
-                    &next,
-                )
-                .await
-                {
-                    return finish(resp);
+                Ok(None) => break,
+                Err(_) => {
+                    return finish(s3_error_response("IncompleteBody", None, &[]));
                 }
             }
-            Err(resp) => return finish(resp),
         }
-        head.headers.set(SYS_VERSION_ID, &vid);
-        head.headers.set(SYS_DELETE_MARKER, "false");
-        let request_size: i64 = head
-            .headers
-            .get("Content-Length")
-            .and_then(|v| v.parse().ok())
-            .filter(|&n| n >= 0)
-            .unwrap_or(0);
-        let swift = AsyncRequest {
-            method: "PUT".into(),
-            path: s3_to_swift_path(&cred.account, Some(&bucket), Some(&key)),
-            query_string: String::new(),
-            headers: head.headers,
-            body: areq.body,
-        };
-        let resp = next(swift).await;
-        if !swift_write_applied(resp.status) {
-            return finish(backend_write_not_applied(
-                resp.status,
-                Some(&bucket),
-                Some(&key),
-            ));
+        const MAX_ATTEMPTS: usize = 24;
+        let mut last: Option<Response> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            if !replayable && attempt > 0 {
+                break;
+            }
+            let vid = generate_version_id();
+            if !is_safe_version_id(&vid) {
+                return finish(unsafe_version_id_error());
+            }
+            let snap =
+                match load_version_index_snapshot_streaming(&cred, &bucket, &key, &next).await {
+                    Ok(s) => s,
+                    Err(resp) => return finish(resp),
+                };
+            let expect = expect_generation(&snap);
+            let mut idx = snap.index.clone();
+            let current = match control_head_object_streaming(&cred, &bucket, &key, &next).await {
+                Ok(ObjectHead::Missing) => None,
+                Ok(ObjectHead::Present(cur)) => {
+                    if let Some(blocked) = deny_if_object_acl_blocks_write(&cred, &cur.headers) {
+                        return finish(blocked);
+                    }
+                    if let Err(resp) = maybe_archive_current_for_write_streaming(
+                        &cred,
+                        &bucket,
+                        &key,
+                        &cur.headers,
+                        &mut idx,
+                        &next,
+                    )
+                    .await
+                    {
+                        return finish(resp);
+                    }
+                    Some(cur)
+                }
+                Err(resp) => return finish(resp),
+            };
+            let mut try_head = head.clone_head();
+            try_head.headers.set(SYS_VERSION_ID, &vid);
+            try_head.headers.set(SYS_DELETE_MARKER, "false");
+            stamp_object_write_precondition(&mut try_head.headers, current.as_ref());
+            let request_size: i64 = try_head
+                .headers
+                .get("Content-Length")
+                .and_then(|v| v.parse().ok())
+                .filter(|&n| n >= 0)
+                .unwrap_or(buffered.len() as i64);
+            let swift = AsyncRequest {
+                method: "PUT".into(),
+                path: s3_to_swift_path(&cred.account, Some(&bucket), Some(&key)),
+                query_string: String::new(),
+                headers: try_head.headers,
+                body: IncomingBody::from_bytes(buffered.clone(), MAX_CONTROL_BODY),
+            };
+            let resp = next(swift).await;
+            if !swift_write_applied(resp.status) {
+                let out = finish(backend_write_not_applied(
+                    resp.status,
+                    Some(&bucket),
+                    Some(&key),
+                ));
+                if !client_conditional
+                    && replayable
+                    && attempt + 1 < MAX_ATTEMPTS
+                    && versioned_write_retryable(&out)
+                {
+                    last = Some(out);
+                    continue;
+                }
+                return out;
+            }
+            let etag = resp.headers.get("ETag").map(bare_etag).unwrap_or_default();
+            let lm = resp
+                .headers
+                .get("Last-Modified")
+                .map(http_date_to_s3_approx)
+                .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
+            if let Err(resp) = commit_new_version_record(
+                &mut idx,
+                expect,
+                false,
+                VersionRecord {
+                    version_id: vid.clone(),
+                    is_delete_marker: false,
+                    is_latest: true,
+                    last_modified: lm.clone(),
+                    etag: etag.clone(),
+                    size: request_size,
+                },
+            ) {
+                let out = finish(resp);
+                if !client_conditional
+                    && replayable
+                    && attempt + 1 < MAX_ATTEMPTS
+                    && versioned_write_retryable(&out)
+                {
+                    last = Some(out);
+                    continue;
+                }
+                return out;
+            }
+            if let Err(resp) =
+                cas_save_version_index_streaming(&cred, &bucket, &key, &snap, &idx, &next).await
+            {
+                let rec = VersionRecord {
+                    version_id: vid.clone(),
+                    is_delete_marker: false,
+                    is_latest: true,
+                    last_modified: lm.clone(),
+                    etag: etag.clone(),
+                    size: request_size,
+                };
+                let mut persisted = false;
+                if !client_conditional && replayable {
+                    for _ in 0..MAX_ATTEMPTS {
+                        let snap2 = match load_version_index_snapshot_streaming(
+                            &cred, &bucket, &key, &next,
+                        )
+                        .await
+                        {
+                            Ok(s) => s,
+                            Err(_) => break,
+                        };
+                        let expect2 = expect_generation(&snap2);
+                        let mut idx2 = snap2.index.clone();
+                        if commit_new_version_record(&mut idx2, expect2, false, rec.clone())
+                            .is_err()
+                        {
+                            continue;
+                        }
+                        if cas_save_version_index_streaming(
+                            &cred, &bucket, &key, &snap2, &idx2, &next,
+                        )
+                        .await
+                        .is_ok()
+                        {
+                            persisted = true;
+                            break;
+                        }
+                    }
+                }
+                if !persisted {
+                    let out = finish(resp);
+                    if !client_conditional
+                        && replayable
+                        && attempt + 1 < MAX_ATTEMPTS
+                        && versioned_write_retryable(&out)
+                    {
+                        last = Some(out);
+                        continue;
+                    }
+                    return out;
+                }
+            }
+            let mut out = translate_object_success("PUT", resp, false);
+            out.headers.set(HDR_VERSION_ID, vid);
+            let can_retry = !client_conditional
+                && replayable
+                && attempt + 1 < MAX_ATTEMPTS
+                && versioned_write_retryable(&out);
+            if can_retry {
+                last = Some(out);
+                continue;
+            }
+            return finish(out);
         }
-        let etag = resp.headers.get("ETag").map(bare_etag).unwrap_or_default();
-        let lm = resp
-            .headers
-            .get("Last-Modified")
-            .map(http_date_to_s3_approx)
-            .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
-        if let Err(resp) = commit_new_version_record(
-            &mut idx,
-            expect,
-            false,
-            VersionRecord {
-                version_id: vid.clone(),
-                is_delete_marker: false,
-                is_latest: true,
-                last_modified: lm,
-                etag: etag.clone(),
-                size: request_size,
-            },
-        ) {
-            return finish(resp);
-        }
-        if let Err(resp) =
-            cas_save_version_index_streaming(&cred, &bucket, &key, &snap, &idx, &next).await
-        {
-            return finish(resp);
-        }
-        let mut out = translate_object_success("PUT", resp, false);
-        out.headers.set(HDR_VERSION_ID, vid);
-        finish(out)
+        finish(last.unwrap_or_else(|| {
+            s3_error_response("InternalError", Some("versioned put conflict"), &[])
+        }))
     }
 
     /// Native-async S3 control (GET/HEAD/List/DELETE/MPU/versioning). No
