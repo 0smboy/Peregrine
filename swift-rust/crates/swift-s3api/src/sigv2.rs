@@ -409,12 +409,16 @@ pub fn check_sigv2_time(
     if header_date_missing(req) {
         return Err(SigAuthError::InvalidDate);
     }
-    if let Some(ts) = signing_ts_v2_header(req) {
-        if ts.abs_diff(now_unix) > allowable_clock_skew {
-            return Err(SigAuthError::RequestTimeTooSkewed);
+    // Python `signing_timestamp`: unparseable or ts < 0 → AccessDenied
+    // (InvalidDate), not SignatureDoesNotMatch / RequestTimeTooSkewed.
+    match signing_ts_v2_header(req) {
+        None => Err(SigAuthError::InvalidDate),
+        Some(ts) if ts < 0 => Err(SigAuthError::InvalidDate),
+        Some(ts) if ts.abs_diff(now_unix) > allowable_clock_skew => {
+            Err(SigAuthError::RequestTimeTooSkewed)
         }
+        Some(_) => Ok(()),
     }
-    Ok(())
 }
 
 fn header_date_missing(req: &Request) -> bool {
@@ -664,6 +668,41 @@ mod tests {
             verify_sigv2(ACCESS, SECRET, &req, Some(200), None),
             Err(SigAuthError::AccessDenied)
         );
+    }
+
+    #[test]
+    fn verify_sigv2_unparseable_date_is_invalid_date() {
+        let mut req = aws_vector_req();
+        req.headers.set("Date", "Bad Date");
+        req.headers
+            .set("Authorization", format!("AWS {ACCESS}:abcd"));
+        assert_eq!(
+            verify_sigv2(ACCESS, SECRET, &req, Some(1_000_000), Some(900)),
+            Err(SigAuthError::InvalidDate)
+        );
+    }
+
+    #[test]
+    fn verify_sigv2_empty_date_is_invalid_date() {
+        let mut req = aws_vector_req();
+        req.headers.set("Date", "");
+        req.headers
+            .set("Authorization", format!("AWS {ACCESS}:abcd"));
+        assert_eq!(
+            verify_sigv2(ACCESS, SECRET, &req, Some(1_000_000), Some(900)),
+            Err(SigAuthError::InvalidDate)
+        );
+    }
+
+    #[test]
+    fn verify_sigv2_before_epoch_date_is_invalid_date() {
+        let mut req = aws_vector_req();
+        req.headers.set("Date", "Sun, 01 Jan 1950 00:00:00 +0000");
+        req.headers
+            .set("Authorization", format!("AWS {ACCESS}:abcd"));
+        let err = verify_sigv2(ACCESS, SECRET, &req, Some(1_000_000), Some(900));
+        assert_eq!(err, Err(SigAuthError::InvalidDate), "{err:?}");
+        assert_ne!(err, Err(SigAuthError::RequestTimeTooSkewed));
     }
 
     #[test]

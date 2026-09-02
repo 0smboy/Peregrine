@@ -215,6 +215,9 @@ const MAX_MULTI_DELETE_BODY: u64 = 2 * 1000 * 1024;
 /// Python `s3request._validate_sha256` + HashingInput + check_md5 for a
 /// materialized request. `v4_header_auth` is SigV4 *header* (not query).
 pub fn validate_s3_payload(req: &mut Request, v4_header_auth: bool) -> Option<Response> {
+    if let Some(resp) = invalid_content_length_header(req) {
+        return Some(resp);
+    }
     if let Some(resp) = validate_sha256_header(req, v4_header_auth) {
         return Some(resp);
     }
