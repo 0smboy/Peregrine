@@ -46,10 +46,17 @@ fn config(devices: &std::path::Path) -> ObjectServerConfig {
 }
 
 fn put(server: &ObjectServer, ts: &str, ctype: &str) {
+    put_with(server, ts, ctype, &[]);
+}
+
+fn put_with(server: &ObjectServer, ts: &str, ctype: &str, extra: &[(&str, &str)]) {
     let mut headers = HeaderKeyDict::new();
     headers.set("X-Timestamp", ts);
     headers.set("Content-Length", "5");
     headers.set("Content-Type", ctype);
+    for (k, v) in extra {
+        headers.set(k, v);
+    }
     let resp = server.handle(Request {
         method: "PUT".into(),
         path: "/sda1/0/AUTH_test/c/o".into(),
@@ -168,6 +175,41 @@ fn test_post_without_content_type_keeps_original_ctype_timestamp() {
     assert_eq!(header(&u, "x-content-type"), "text/plain");
     assert_eq!(header(&u, "x-content-type-timestamp"), T0);
     assert_eq!(header(&u, "x-size"), "5");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_post_replaces_user_meta_instead_of_merging() {
+    // Python DiskFile: after a .meta exists, GET metadata is .meta plus
+    // datafile reserved/system/sysmeta only. PUT Food then POST Color must
+    // drop Food (func TestObject::test_metadata / versioned_writes overwriting).
+    let dir = std::env::temp_dir().join(format!("swift-os-fastpost-replace-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let device = dir.join("sda1");
+    std::fs::create_dir_all(&device).unwrap();
+    let server = ObjectServer::new(config(&dir));
+
+    put_with(
+        &server,
+        T0,
+        "text/plain",
+        &[
+            ("X-Object-Meta-Color", "blUe"),
+            ("X-Object-Meta-Food", "PizZa"),
+        ],
+    );
+    let resp = post(&server, T2, &[("X-Object-Meta-Color", "oraNge")]);
+    assert_eq!(resp.status, 202);
+
+    let mut df = open_df(&device);
+    let o = df.open(None).unwrap();
+    let md = o.get_metadata().unwrap();
+    assert_eq!(meta(md, "X-Object-Meta-Color"), Some("oraNge"));
+    assert_eq!(
+        meta(md, "X-Object-Meta-Food"),
+        None,
+        "POST must replace user-meta, not merge leftover PUT keys: {md:?}"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

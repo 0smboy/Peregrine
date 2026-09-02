@@ -330,11 +330,28 @@ impl DiskFile {
                     self.merge_content_type_metadata(ctype_file, &mut mf_meta, data_timestamp)?;
                 }
             }
-            // Python DiskFile: start from the datafile, then overlay the
-            // newest .meta (user meta *and* sysmeta). Datafile-only sysmeta
-            // remains; POST ?acl / tagging sysmeta in .meta must win.
-            metadata = datafile_metadata.clone();
+            // Python DiskFile._construct_from_data_file: start empty, apply
+            // the newest .meta, then overlay only reserved / system / object
+            // sysmeta from the datafile. User-meta lives only in .meta after
+            // a fast-POST, so a later GET must not resurrect PUT-time
+            // X-Object-Meta-* keys the POST dropped (func test_metadata /
+            // versioned_writes test_overwriting).
+            let sys_metadata: Metadata = datafile_metadata
+                .iter()
+                .filter(|(k, _)| match k {
+                    MetaValue::Str(s) => {
+                        let lower = s.to_ascii_lowercase();
+                        RESERVED_DATAFILE_META.contains(&lower.as_str())
+                            || DATAFILE_SYSTEM_META.contains(&lower.as_str())
+                            || is_object_sys_meta(s)
+                    }
+                    _ => false,
+                })
+                .cloned()
+                .collect();
+            metadata = Metadata::new();
             meta_update(&mut metadata, &mf_meta);
+            meta_update(&mut metadata, &sys_metadata);
             // the diskfile writer added 'name' to the metafile; drop it
             // from the metafile view
             meta_remove(&mut mf_meta, "name");
