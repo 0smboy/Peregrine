@@ -190,9 +190,11 @@ pub fn apply_canned_acl(headers: &mut HeaderKeyDict, canned: &str) {
             headers.set("X-Container-Write", "");
         }
         "public-read-write" => {
-            // Python: Write=.r:* ; Read=.r:*,.rlistings
+            // Python: Write=.r:* ; Read=.r:*,.rlistings.
+            // Peregrine container POST rejects Write=.r:* as 400 (s3api maps
+            // that to InvalidRequest). s3_acl JSON still stores AllUsers WRITE.
             headers.set("X-Container-Read", ".r:*,.rlistings");
-            headers.set("X-Container-Write", ".r:*");
+            headers.set("X-Container-Write", "");
         }
         // Python maps these to private (no per-object ACL).
         "private" | "" | "bucket-owner-read" | "bucket-owner-full-control" => {
