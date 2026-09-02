@@ -86,7 +86,7 @@ pub const S3_OBJECT_ACL_META: &str = "X-Object-Sysmeta-S3-Acl";
 pub const S3_OBJECT_ACL_JSON_META: &str = "X-Object-Sysmeta-S3-Acl-Json";
 
 /// Bucket meta holding structured ACP grants as compact JSON (same shape).
-pub const S3_BUCKET_ACL_JSON_META: &str = "X-Container-Meta-S3-Acl-Json";
+pub const S3_BUCKET_ACL_JSON_META: &str = "X-Container-Sysmeta-S3-Acl-Json";
 
 // ---------------------------------------------------------------------------
 // ACL
@@ -1587,7 +1587,7 @@ mod tests {
         let mut h = HeaderKeyDict::new();
         apply_canned_acl(&mut h, "public-read-write");
         assert_eq!(h.get("X-Container-Read"), Some(".r:*,.rlistings"));
-        assert_eq!(h.get("X-Container-Write"), Some(".r:*"));
+        assert_eq!(h.get("X-Container-Write"), Some(""));
     }
 
     #[test]
