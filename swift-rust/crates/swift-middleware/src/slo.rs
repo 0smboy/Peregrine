@@ -1151,6 +1151,24 @@ fn heartbeat_error_body(status: u16) -> String {
     }
 }
 
+/// Pre-completed heartbeat payload with unknown Content-Length.
+///
+/// The UTF-8 compatibility write path (`write_swift_compat_response`)
+/// forbids `Body::Streamed`: it sends the 202 + `Transfer-Encoding:
+/// chunked` headers first, then errors on a blocking reader, so the
+/// client sees `chunked` without a body (`HTTPResponse.body` missing).
+/// ASCII tests take the Hyper `SwiftHttpBody::from_swift` path, which
+/// does convert Streamed → channel. Official `TestSloUTF8` uses the
+/// utf8-compat lane, so the async heartbeat response must already be a
+/// `Body::Channel` (one message, then EOF) with `content_length: None`
+/// to keep `resp.chunked is True`.
+fn complete_chunked_body(bytes: Vec<u8>) -> Body {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let _ = tx.try_send(Ok(bytes));
+    drop(tx);
+    Body::from_channel(rx, None, swift_runtime::TaskScope::bounded(1))
+}
+
 fn wrap_heartbeat_response(
     put_resp: Response,
     accept: Option<&str>,
@@ -1234,7 +1252,7 @@ fn wrap_heartbeat_response(
             "text/plain"
         },
     );
-    out.body = Body::from_reader(Box::new(std::io::Cursor::new(body)), None);
+    out.body = complete_chunked_body(body);
     out
 }
 
@@ -4436,14 +4454,56 @@ mod tests {
         };
         let mut resp = Slo::new().handle(put, &be);
         assert_eq!(resp.status, 202);
-        // Streamed body (no pre-declared Content-Length) — heartbeats can
-        // flush before validation finishes.
+        // Sync handle() still streams whitespace during HEADs.
         assert!(matches!(resp.body, Body::Streamed(_)));
         assert_eq!(resp.body.content_length(), None);
         let b = body_of(&mut resp);
         assert!(b.starts_with(b" "), "{b:?}");
         assert!(b.windows(4).any(|w| w == b"\r\n\r\n"));
         // Leading space + one per HEAD + separator + JSON with 201.
+        let text = String::from_utf8_lossy(&b);
+        assert!(text.contains("201 Created"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_put_async_uses_channel_not_streamed() {
+        let next: crate::AsyncNextFn = Arc::new(|req: Request| {
+            Box::pin(async move {
+                if req.method == "HEAD" {
+                    let mut r = Response::new(200);
+                    r.headers.set("Etag", "e");
+                    r.headers.set("Content-Length", "1");
+                    return r;
+                }
+                if req.method == "PUT" {
+                    return Response::new(201);
+                }
+                Response::new(404)
+            })
+        });
+        let manifest = serde_json::json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}]);
+        let body = serde_json::to_vec(&manifest).unwrap();
+        let put = Request {
+            method: "PUT".into(),
+            path: "/v1/a/c/manifest".into(),
+            query_string: "multipart-manifest=put&heartbeat=on".into(),
+            headers: HeaderKeyDict::new(),
+            body: body.into(),
+        };
+        let mut resp = Slo::new().handle_request_async(put, next).await;
+        assert_eq!(resp.status, 202);
+        assert!(
+            matches!(resp.body, Body::Channel(_)),
+            "utf8-compat lane forbids Streamed after 202 headers; got {:?}",
+            resp.body
+        );
+        assert_eq!(resp.body.content_length(), None);
+        let b = std::mem::replace(&mut resp.body, Body::empty())
+            .collect_async()
+            .await
+            .expect("channel body");
+        assert!(b.starts_with(b" "), "{b:?}");
+        assert!(b.windows(4).any(|w| w == b"\r\n\r\n"));
         let text = String::from_utf8_lossy(&b);
         assert!(text.contains("201 Created"), "{text}");
     }
