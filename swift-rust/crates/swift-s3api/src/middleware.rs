@@ -1412,6 +1412,57 @@ fn parse_copy_source_range(raw: &str) -> Result<(u64, u64), ()> {
     Ok((start, end))
 }
 
+fn copy_source_conditional_headers(req: &Request) -> Vec<(String, String)> {
+    const MAP: &[(&str, &str)] = &[
+        ("x-amz-copy-source-if-match", "If-Match"),
+        ("x-amz-copy-source-if-none-match", "If-None-Match"),
+        ("x-amz-copy-source-if-modified-since", "If-Modified-Since"),
+        (
+            "x-amz-copy-source-if-unmodified-since",
+            "If-Unmodified-Since",
+        ),
+    ];
+    let mut out = Vec::new();
+    for (src, dst) in MAP {
+        if let Some(v) = req
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(src))
+            .map(|(_, v)| v.to_string())
+        {
+            out.push(((*dst).to_string(), v));
+        }
+    }
+    out
+}
+
+/// Python `check_copy_source`: HEAD source with mapped `x-amz-copy-source-if-*`.
+/// 304/412 → PreconditionFailed.
+async fn check_copy_source_preconditions_async(
+    copy_source: String,
+    conds: Vec<(String, String)>,
+    cred: &S3Credential,
+    next: &AsyncNextFn,
+) -> Option<Response> {
+    if conds.is_empty() {
+        return None;
+    }
+    let (src_bucket, src_key, _vid) = parse_copy_source(&copy_source)?;
+    let mut head = make_swift_req(
+        "HEAD",
+        &s3_to_swift_path(&cred.account, Some(&src_bucket), Some(&src_key)),
+    );
+    for (k, v) in &conds {
+        head.headers.set(k, v);
+    }
+    stamp_auth(&mut head, cred);
+    let resp = async_call(next, head).await;
+    if resp.status == 304 || resp.status == 412 {
+        return Some(s3_error_response("PreconditionFailed", None, &[]));
+    }
+    None
+}
+
 fn apply_copy_source(req: &mut Request) -> Option<Response> {
     let src = req.headers.get("X-Amz-Copy-Source").map(str::to_string)?;
     let src = src.trim().trim_start_matches('/');
@@ -4213,6 +4264,23 @@ impl S3Api {
         }
         if let Some(resp) = rewrite_copy_source_version_async(&mut swift_req, &cred, &next).await {
             return resp;
+        }
+        {
+            let conds = copy_source_conditional_headers(&swift_req);
+            if !conds.is_empty() {
+                if let Some(raw) = swift_req
+                    .headers
+                    .get("X-Amz-Copy-Source")
+                    .or_else(|| swift_req.headers.get("x-amz-copy-source"))
+                    .map(|s| s.to_string())
+                {
+                    if let Some(resp) =
+                        check_copy_source_preconditions_async(raw, conds, &cred, &next).await
+                    {
+                        return resp;
+                    }
+                }
+            }
         }
         if let Some(resp) = apply_copy_source(&mut swift_req) {
             return resp;
