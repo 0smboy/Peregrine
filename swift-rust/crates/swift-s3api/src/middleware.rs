@@ -4362,6 +4362,7 @@ impl S3Api {
                                 key.as_deref().unwrap(),
                                 &method,
                                 version_id_q,
+                                req.headers.get("Range"),
                                 &next,
                             )
                             .await;
@@ -4373,6 +4374,7 @@ impl S3Api {
                                 key.as_deref().unwrap(),
                                 &method,
                                 version_id_q,
+                                req.headers.get("Range"),
                                 &next,
                             )
                             .await;
@@ -7695,6 +7697,7 @@ async fn handle_versioned_get_head_async(
     key: &str,
     method: &str,
     version_id_q: Option<&str>,
+    range: Option<&str>,
     next: &AsyncNextFn,
 ) -> Response {
     let target = match resolve_object_version_async(cred, bucket, key, version_id_q, next).await {
@@ -7716,6 +7719,9 @@ async fn handle_versioned_get_head_async(
             &s3_to_swift_path(&cred.account, Some(&target.container), Some(&target.key)),
         );
         stamp_auth(&mut get, cred);
+        if let Some(range) = range {
+            get.headers.set("Range", range);
+        }
         let resp = async_call(next, get).await;
         if !(200..300).contains(&resp.status) {
             return map_swift_error(resp.status, Some(&target.container), Some(&target.key));
@@ -7725,7 +7731,7 @@ async fn handle_versioned_get_head_async(
     if let Some(denied) = deny_if_object_acl_blocks_read(cred, &resp.headers) {
         return denied;
     }
-    let mut out = translate_object_get_head(method, resp, cred, &[], None);
+    let mut out = translate_object_get_head(method, resp, cred, &[], range);
     if (200..300).contains(&out.status) {
         if let Some(version_id) = response_version {
             out.headers.set(HDR_VERSION_ID, version_id);
@@ -10203,7 +10209,16 @@ fn handle_versioned_object(
         }
         "PUT" => s3_error_response("InvalidArgument", None, &[]),
         "GET" | "HEAD" => {
-            handle_versioned_get_head(cred, bucket, key, method, version_id_q, next, api)
+            handle_versioned_get_head(
+                cred,
+                bucket,
+                key,
+                method,
+                version_id_q,
+                req.headers.get("Range"),
+                next,
+                api,
+            )
         }
         "DELETE" => handle_versioned_delete(
             cred,
@@ -10668,6 +10683,7 @@ fn finish_versioned_get_head(
     persist_bucket: &str,
     persist_key: &str,
     version_id: Option<&str>,
+    range: Option<&str>,
     next: &NextFn,
     api: &S3Api,
 ) -> Response {
@@ -10687,7 +10703,7 @@ fn finish_versioned_get_head(
     ) {
         return err;
     }
-    let mut out = translate_object_get_head(method, resp, cred, &[], None);
+    let mut out = translate_object_get_head(method, resp, cred, &[], range);
     if (200..300).contains(&out.status) {
         if let Some(vid) = version_id {
             out.headers.set(HDR_VERSION_ID, vid);
@@ -10702,6 +10718,7 @@ fn handle_versioned_get_head(
     key: &str,
     method: &str,
     version_id_q: Option<&str>,
+    range: Option<&str>,
     next: &NextFn,
     api: &S3Api,
 ) -> Response {
@@ -10724,6 +10741,9 @@ fn handle_versioned_get_head(
             &s3_to_swift_path(&cred.account, Some(&target.container), Some(&target.key)),
         );
         stamp_auth(&mut get, cred);
+        if let Some(range) = range {
+            get.headers.set("Range", range);
+        }
         let resp = next(get);
         if !(200..300).contains(&resp.status) {
             return map_swift_error(resp.status, Some(&target.container), Some(&target.key));
@@ -10737,6 +10757,7 @@ fn handle_versioned_get_head(
         &target.container,
         &target.key,
         response_version.as_deref(),
+        range,
         next,
         api,
     );
