@@ -421,13 +421,14 @@ fn response_body_as_incoming(body: Body, max_body: u64) -> Result<IncomingBody, 
 /// Archive object name for a prior version.
 pub fn versions_object_name(object_name: &str, ts: &str) -> Option<String> {
     let internal = ts.parse::<Timestamp>().ok()?.internal();
-    let len = object_name.chars().count();
+    // Python `len(name.encode('utf8'))` is UTF-8 bytes, not Unicode scalars.
+    let len = object_name.len();
     Some(format!("{len:03x}{object_name}/{internal}"))
 }
 
 /// Listing prefix for an object's archives.
 pub fn versions_object_prefix(object_name: &str) -> String {
-    let len = object_name.chars().count();
+    let len = object_name.len();
     format!("{len:03x}{object_name}/")
 }
 
@@ -1912,6 +1913,39 @@ impl VersionedWrites {
                 return modern_bad_request("POST to a specific version is not allowed");
             }
             if requested == "null" {
+                let modern_null = is_enabled && configured.is_some();
+                if !modern_null {
+                    // Legacy X-Versions-Location: version-id=null is the current
+                    // object. DELETE restores the previous archive (stack) or
+                    // writes a history marker — not a bare current DELETE.
+                    if req.method == "DELETE" {
+                        if let Some(cfg) = self.read_version_cfg(&cinfo) {
+                            if cfg.mode == "history" {
+                                return self
+                                    .handle_delete_history_streaming(
+                                        req,
+                                        &version,
+                                        &account,
+                                        &object,
+                                        &cfg.location,
+                                        next,
+                                    )
+                                    .await;
+                            }
+                            return self
+                                .handle_delete_stack_streaming(
+                                    req,
+                                    &version,
+                                    &account,
+                                    &container,
+                                    &object,
+                                    &cfg.location,
+                                    next,
+                                )
+                                .await;
+                        }
+                    }
+                }
                 match req.method.as_str() {
                     "GET" | "HEAD" => {
                         let mut source = Self::modern_internal_request(
@@ -3287,6 +3321,12 @@ mod tests {
         let n2 = versions_object_name(&long, "1751500000.00000").unwrap();
         assert!(n2.starts_with("010"), "{n2}");
         assert_eq!(versions_object_prefix("obj"), "003obj/");
+        let utf8 = "\u{03a9}"; // U+03A9 OMEGA, UTF-8 length 2
+        let n3 = versions_object_name(utf8, "1751500000.00000").unwrap();
+        assert!(
+            n3.starts_with("002"),
+            "utf8 prefix must be byte length, got {n3}"
+        );
     }
 
     #[test]
