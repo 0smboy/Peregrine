@@ -115,12 +115,13 @@ use swift_middleware::{
 };
 
 use crate::acl_cors::{
-    apply_bucket_acl_put, apply_object_acl_put, bucket_acl_denies_read, bucket_acl_denies_write,
-    bucket_acl_xml_from_headers, clear_cors_swift_headers, cors_config_to_swift_headers,
-    cors_xml_from_swift_headers, decode_acl_json, grants_allow_anonymous_read,
-    object_acl_denies_read, object_acl_denies_write, object_acl_xml_from_headers,
-    object_canned_allows_anonymous_read, parse_cors_configuration, resolve_acl_put_input, xml_ok,
-    AclPutInput, S3_BUCKET_ACL_JSON_META, S3_OBJECT_ACL_JSON_META, S3_OBJECT_ACL_META,
+    apply_bucket_acl_put, apply_object_acl_put, bucket_acl_denies_read, bucket_acl_denies_read_acp,
+    bucket_acl_denies_write, bucket_acl_xml_from_headers, clear_cors_swift_headers,
+    cors_config_to_swift_headers, cors_xml_from_swift_headers, decode_acl_json,
+    grants_allow_anonymous_read, object_acl_denies_read, object_acl_denies_write,
+    object_acl_xml_from_headers, object_canned_allows_anonymous_read, parse_cors_configuration,
+    resolve_acl_put_input, xml_ok, AclPutInput, S3_BUCKET_ACL_JSON_META, S3_OBJECT_ACL_JSON_META,
+    S3_OBJECT_ACL_META,
 };
 use crate::aws_chunked::{
     cleanup_content_encoding, decode_aws_chunked, is_aws_chunked_request, is_ecdsa_streaming,
@@ -4268,11 +4269,14 @@ impl S3Api {
             return translate_list_buckets(&body, &owner);
         }
         if key.is_none() && bucket.is_some() {
-            if method == "GET" && (200..300).contains(&resp.status) {
+            if matches!(method.as_str(), "GET" | "HEAD") && (200..300).contains(&resp.status) {
                 if let Some(denied) =
                     deny_if_bucket_acl_blocks_read(self.s3_acl, &cred, &resp.headers)
                 {
                     return denied;
+                }
+                if method == "HEAD" {
+                    return translate_bucket_success(&method, resp, bucket.as_deref());
                 }
                 let body = match resp.body.collect_async().await {
                     Ok(b) => b,
@@ -5117,11 +5121,14 @@ impl S3Api {
         }
 
         if key.is_none() && bucket.is_some() {
-            if method == "GET" && (200..300).contains(&resp.status) {
+            if matches!(method.as_str(), "GET" | "HEAD") && (200..300).contains(&resp.status) {
                 if let Some(denied) =
                     deny_if_bucket_acl_blocks_read(self.s3_acl, &cred, &resp.headers)
                 {
                     return denied;
+                }
+                if method == "HEAD" {
+                    return translate_bucket_success(&method, resp, bucket.as_deref());
                 }
                 let body = match resp.body.into_vec(MAX_CONTROL_BODY) {
                     Ok(b) => b,
@@ -6446,6 +6453,9 @@ async fn handle_acl_async(
                 if !(200..300).contains(&resp.status) {
                     return map_swift_error(resp.status, Some(bucket), None);
                 }
+                if bucket_acl_denies_read_acp(&resp.headers, &cred.access_key, &cred.account) {
+                    return s3_error_response("AccessDenied", None, &[]);
+                }
                 xml_ok(bucket_acl_xml_from_headers(&owner.id, &resp.headers))
             }
             "PUT" => {
@@ -6549,6 +6559,9 @@ fn handle_acl(
                 let resp = next(head);
                 if !(200..300).contains(&resp.status) {
                     return map_swift_error(resp.status, Some(bucket), None);
+                }
+                if bucket_acl_denies_read_acp(&resp.headers, &cred.access_key, &cred.account) {
+                    return s3_error_response("AccessDenied", None, &[]);
                 }
                 xml_ok(bucket_acl_xml_from_headers(&owner.id, &resp.headers))
             }

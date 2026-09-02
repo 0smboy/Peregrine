@@ -1057,6 +1057,52 @@ pub fn bucket_acl_denies_write(
     )
 }
 
+fn permission_allows_read_acp(permission: &str) -> bool {
+    matches!(permission, "READ_ACP" | "FULL_CONTROL")
+}
+
+/// GET/HEAD ?acl requires READ_ACP / FULL_CONTROL / owner.
+pub fn bucket_grants_allow_read_acp(
+    headers: &HeaderKeyDict,
+    principal_access_key: &str,
+    principal_account: &str,
+) -> Option<bool> {
+    let policy = policy_from_bucket_headers(headers)?;
+    if principal_matches(&policy.owner_id, principal_access_key, principal_account) {
+        return Some(true);
+    }
+    for g in &policy.grants {
+        if !permission_allows_read_acp(&g.permission) {
+            continue;
+        }
+        match &g.grantee {
+            Grantee::Id { id, .. } => {
+                if principal_matches(id, principal_access_key, principal_account) {
+                    return Some(true);
+                }
+            }
+            Grantee::Uri { uri } => {
+                if uri == ALL_USERS || uri == AUTH_USERS {
+                    return Some(true);
+                }
+            }
+            Grantee::Email { .. } => {}
+        }
+    }
+    Some(false)
+}
+
+pub fn bucket_acl_denies_read_acp(
+    headers: &HeaderKeyDict,
+    principal_access_key: &str,
+    principal_account: &str,
+) -> bool {
+    matches!(
+        bucket_grants_allow_read_acp(headers, principal_access_key, principal_account),
+        Some(false)
+    )
+}
+
 /// Resolved ACL input for PUT object/bucket (canned takes precedence).
 #[derive(Debug, Clone)]
 pub enum AclPutInput {
