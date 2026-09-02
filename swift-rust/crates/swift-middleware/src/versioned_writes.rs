@@ -1616,21 +1616,50 @@ impl VersionedWrites {
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| target_etag.clone());
         let listing_etag = follow_etag.clone();
-        // Python `_put_symlink_to_version` uses the archive request
-        // Content-Type after symlink inherited the target type. Client
-        // staticlinks often omit Content-Type (`no_content_type`); the
-        // marker must still list as the target type.
-        let content_type = req
+        // Python symlink `_validate_etag_and_update_sysmeta` copies the
+        // target Content-Type when the client omitted it. VW runs *before*
+        // symlink and archives with X-Backend-Symlink-Override, so inherit
+        // here from a HEAD of X-Symlink-Target (test_versioned_staticlink).
+        let mut content_type = req
             .headers
             .get("Content-Type")
             .filter(|value| !value.is_empty())
-            .or_else(|| archived.headers.get("Content-Type"))
-            .unwrap_or("application/octet-stream")
+            .or_else(|| {
+                archived.headers.get("Content-Type").filter(|value| {
+                    !value.is_empty() && !value.to_ascii_lowercase().starts_with("text/html")
+                })
+            })
+            .unwrap_or("")
             .split(';')
             .next()
-            .unwrap_or("application/octet-stream")
+            .unwrap_or("")
             .trim()
             .to_string();
+        if content_type.is_empty() {
+            if let Some(tgt) = req.headers.get("X-Symlink-Target") {
+                let decoded = decoded_header_path(tgt);
+                let head_path = if decoded.starts_with('/') {
+                    format!("/{version}/{account}{decoded}")
+                } else {
+                    format!("/{version}/{account}/{decoded}")
+                };
+                let head = Self::modern_internal_request("HEAD", head_path, "", &req.headers);
+                let href = next(empty_async_request(head)).await;
+                if (200..300).contains(&href.status) {
+                    if let Some(ct) = href.headers.get("Content-Type") {
+                        content_type = ct
+                            .split(';')
+                            .next()
+                            .unwrap_or(ct)
+                            .trim()
+                            .to_string();
+                    }
+                }
+            }
+        }
+        if content_type.is_empty() {
+            content_type = "application/octet-stream".to_string();
+        }
 
         let mut marker_timestamp = put_timestamp;
         if marker_timestamp.increment_offset(1).is_err() {
