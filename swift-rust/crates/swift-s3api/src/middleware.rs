@@ -196,7 +196,7 @@ use crate::versioning_store::{
     archive_object_name, bare_etag as vers_bare_etag, collapse_version_indexes_latest,
     generate_version_id, index_generation_object_name, index_object_name, is_delete_marker_header,
     is_safe_version_id, key_hex, list_versions_result_xml, merge_archive_objects_into_index,
-    merge_unindexed_current_objects, parse_archive_object_name,
+    merge_unindexed_current_objects, parse_archive_object_name, retain_live_version_rows,
     version_index_keys_from_listing_names, versioning_status, versions_container, CasDenied,
     RemoveVersionError, VersionIndex, VersionRecord, VersioningStatus, HDR_DELETE_MARKER,
     HDR_VERSION_ID, INDEX_NAME, NULL_VERSION_ID, SYS_DELETE_MARKER, SYS_OBJECT_KEY, SYS_VERSION_ID,
@@ -7374,7 +7374,31 @@ async fn resolve_object_version_async(
                 head,
             }))
         }
-        (None, ObjectHead::Missing) => return Ok(None),
+        (None, ObjectHead::Missing) => {
+            let snap = load_version_index_snapshot_async(cred, bucket, key, next).await?;
+            let latest = snap
+                .index
+                .versions
+                .iter()
+                .find(|v| v.is_latest && !v.is_delete_marker)
+                .or_else(|| snap.index.versions.iter().find(|v| !v.is_delete_marker));
+            let Some(rec) = latest else {
+                return Ok(None);
+            };
+            if !is_safe_version_id(&rec.version_id) {
+                return Err(unsafe_version_id_error());
+            }
+            let container = versions_container(bucket);
+            let archived_key = archive_object_name(key, &rec.version_id);
+            return match control_head_object_async(cred, &container, &archived_key, next).await? {
+                ObjectHead::Present(head) => Ok(Some(ResolvedObjectVersion {
+                    container,
+                    key: archived_key,
+                    head,
+                })),
+                ObjectHead::Missing => Ok(None),
+            };
+        }
         (Some(NULL_VERSION_ID), ObjectHead::Present(head))
             if matches!(
                 head.headers.get(SYS_VERSION_ID),
@@ -10591,11 +10615,7 @@ async fn handle_versioned_delete_once_async(
         // leave the object (the Ceph s3-tests nuke poison).
         if snap.index.find(vid).is_none() {
             let mut del = make_swift_req("DELETE", &cur_path);
-            del.path = s3_to_swift_path(
-                &cred.account,
-                Some(&target.container),
-                Some(&target.key),
-            );
+            del.path = s3_to_swift_path(&cred.account, Some(&target.container), Some(&target.key));
             stamp_object_write_precondition(&mut del.headers, Some(&target.head));
             stamp_auth(&mut del, cred);
             let retry = del.clone_head();
@@ -10630,46 +10650,49 @@ async fn handle_versioned_delete_once_async(
             Err(RemoveVersionError::Missing) => return version_index_lost_update(),
         };
 
-        if target_is_current {
-            if let Some(next_version) = next_version.as_deref() {
-                if !is_safe_version_id(next_version) {
-                    return unsafe_version_id_error();
-                }
-                if let Err(resp) =
-                    promote_archived_version_async(cred, bucket, key, next_version, next).await
-                {
-                    if resp.status != 404 {
-                        return resp;
-                    }
+        let _ = next_version;
+        // Never promote another archive onto current. Promotion races
+        // concurrent DELETE-by-vid (Ceph clear) and resurrects Versions.
+        if let Err(resp) = delete_archived_version_copy_async(cred, bucket, key, vid, next).await {
+            return resp;
+        }
+        // Current slot may still hold this vid after the archive is gone.
+        // Only delete when SYS_VERSION_ID matches — never because resolve
+        // once thought this was current (that deletes a newer current).
+        for _ in 0..8 {
+            match control_head_object_async(cred, bucket, key, next).await {
+                Ok(ObjectHead::Present(head)) if head.headers.get(SYS_VERSION_ID) == Some(vid) => {
                     let mut del = make_swift_req("DELETE", &cur_path);
-                    stamp_object_write_precondition(&mut del.headers, Some(&target.head));
+                    stamp_object_write_precondition(&mut del.headers, Some(&head));
+                    stamp_auth(&mut del, cred);
+                    let resp = async_call(next, del).await;
+                    if swift_write_applied(resp.status) || resp.status == 404 {
+                        break;
+                    }
+                    if resp.status == 412 {
+                        continue;
+                    }
+                    return backend_write_not_applied(resp.status, Some(bucket), Some(key));
+                }
+                Ok(ObjectHead::Present(head))
+                    if target_is_current && head.headers.get(SYS_VERSION_ID).is_none() =>
+                {
+                    let mut del = make_swift_req("DELETE", &cur_path);
                     stamp_auth(&mut del, cred);
                     let resp = async_call(next, del).await;
                     if !swift_write_applied(resp.status) && resp.status != 404 {
                         return backend_write_not_applied(resp.status, Some(bucket), Some(key));
                     }
+                    break;
                 }
-            } else {
-                let mut del = make_swift_req("DELETE", &cur_path);
-                stamp_object_write_precondition(&mut del.headers, Some(&target.head));
-                stamp_auth(&mut del, cred);
-                let resp = async_call(next, del).await;
-                if !swift_write_applied(resp.status) && resp.status != 404 {
-                    return backend_write_not_applied(resp.status, Some(bucket), Some(key));
-                }
+                _ => break,
             }
-        } else {
-            let mut del = make_swift_req("DELETE", &cur_path);
-            del.path = s3_to_swift_path(&cred.account, Some(&target.container), Some(&target.key));
-            stamp_object_write_precondition(&mut del.headers, Some(&target.head));
-            stamp_auth(&mut del, cred);
-            let resp = async_call(next, del).await;
-            if !swift_write_applied(resp.status) && resp.status != 404 {
-                return backend_write_not_applied(
-                    resp.status,
-                    Some(&target.container),
-                    Some(&target.key),
-                );
+        }
+        if let Ok(ObjectHead::Present(head)) =
+            control_head_object_async(cred, bucket, key, next).await
+        {
+            if head.headers.get(SYS_VERSION_ID) == Some(vid) {
+                return s3_error_response("InternalError", Some("lost update"), &[]);
             }
         }
 
@@ -10839,11 +10862,7 @@ fn handle_versioned_delete_once(
         // leave the object (the Ceph s3-tests nuke poison).
         if snap.index.find(vid).is_none() {
             let mut del = make_swift_req("DELETE", &cur_path);
-            del.path = s3_to_swift_path(
-                &cred.account,
-                Some(&target.container),
-                Some(&target.key),
-            );
+            del.path = s3_to_swift_path(&cred.account, Some(&target.container), Some(&target.key));
             stamp_object_write_precondition(&mut del.headers, Some(&target.head));
             stamp_auth(&mut del, cred);
             let retry = del.clone_head();
@@ -11204,7 +11223,23 @@ async fn load_version_indexes_async(
             archives.push((vid, etag, size, lm));
         }
         merge_archive_objects_into_index(&mut idx, &archives);
-        indexes.push(idx);
+        let mut live: HashSet<String> = archives.iter().map(|(vid, _, _, _)| vid.clone()).collect();
+        if let Ok(ObjectHead::Present(head)) =
+            control_head_object_async(cred, bucket, &key, next).await
+        {
+            if let Some(vid) = head
+                .headers
+                .get(SYS_VERSION_ID)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+            {
+                live.insert(vid);
+            }
+        }
+        retain_live_version_rows(&mut idx, &live);
+        if !idx.versions.is_empty() {
+            indexes.push(idx);
+        }
     }
     collapse_version_indexes_latest(indexes)
 }

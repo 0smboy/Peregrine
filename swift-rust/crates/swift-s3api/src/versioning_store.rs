@@ -553,6 +553,20 @@ pub fn null_version_index(
 /// Fold archive objects (`{hex}/{vid}`) into a key's index when the JSON
 /// mirror/fence raced and dropped an acknowledged version. Listing then
 /// matches versions-container reality (Python object_versioning).
+/// Keep delete-markers and rows whose object bytes still exist
+/// (`live_vids` = archive vids ∪ current SYS_VERSION_ID).
+/// Concurrent DELETE can empty archives while a forked fence still
+/// lists the vid; ListVersions must not emit those ghosts.
+pub fn retain_live_version_rows(idx: &mut VersionIndex, live_vids: &HashSet<String>) {
+    idx.versions
+        .retain(|v| v.is_delete_marker || live_vids.contains(&v.version_id));
+    if !idx.versions.iter().any(|v| v.is_latest) {
+        if let Some(first) = idx.versions.first_mut() {
+            first.is_latest = true;
+        }
+    }
+}
+
 pub fn merge_archive_objects_into_index(
     idx: &mut VersionIndex,
     archives: &[(String, String, i64, String)],
@@ -1260,6 +1274,41 @@ mod tests {
         assert_eq!(idx.versions.len(), 2);
         assert!(idx.find("v2").is_some());
         assert!(idx.find("v1").unwrap().is_latest);
+    }
+
+    #[test]
+    fn retain_live_version_rows_drops_ghost_data_keeps_delete_marker() {
+        let mut idx = VersionIndex::new("k");
+        idx.push_latest(VersionRecord {
+            version_id: "live".into(),
+            is_delete_marker: false,
+            is_latest: true,
+            last_modified: "t".into(),
+            etag: "e".into(),
+            size: 1,
+        });
+        idx.versions.push(VersionRecord {
+            version_id: "ghost".into(),
+            is_delete_marker: false,
+            is_latest: false,
+            last_modified: "t".into(),
+            etag: "e".into(),
+            size: 1,
+        });
+        idx.versions.push(VersionRecord {
+            version_id: "dm".into(),
+            is_delete_marker: true,
+            is_latest: false,
+            last_modified: "t".into(),
+            etag: "".into(),
+            size: 0,
+        });
+        let mut live = HashSet::new();
+        live.insert("live".into());
+        retain_live_version_rows(&mut idx, &live);
+        assert!(idx.find("live").is_some());
+        assert!(idx.find("ghost").is_none());
+        assert!(idx.find("dm").is_some());
     }
 
     #[test]
