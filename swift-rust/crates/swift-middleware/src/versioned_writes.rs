@@ -1552,9 +1552,10 @@ impl VersionedWrites {
         archive_headers.set("X-Timestamp", put_timestamp.internal());
         archive_headers.set("X-Backend-Authorize-Override", "true");
         archive_headers.set("X-Backend-Allow-Reserved-Names", "true");
-        // Re-storing an already-created user-symlink (COPY dest / copy-current)
-        // must not re-HEAD-validate X-Symlink-Target-Etag (412).
-        archive_headers.set("X-Backend-Symlink-Override", "true");
+        // Do not set X-Backend-Symlink-Override on the *archive* PUT.
+        // Python lets symlink inherit target Content-Type onto the archived
+        // user-staticlink; versions listing reads that type. Override remains
+        // on the versions-symlink marker PUT below (COPY dest 412).
         if let Some(length) = declared_length {
             archive_headers.set("Content-Length", length.to_string());
             archive_headers.remove("Transfer-Encoding");
