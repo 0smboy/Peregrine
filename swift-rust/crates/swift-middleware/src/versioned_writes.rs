@@ -1599,7 +1599,23 @@ impl VersionedWrites {
         // Listing slo_etag is leftover hash params on the marker
         // (apply_version_symlink_listing), not TGT_ETAG. Stuffing slo_etag
         // into TGT_ETAG 409s symlink follow (archive ETag is manifest md5).
-        let listing_etag = target_etag.clone();
+        //
+        // Nested static user-symlink GET: hop 2 `found_etag` is the archived
+        // object's TGT_ETAG sysmeta (client X-Symlink-Target-Etag), not the
+        // zero-byte archive ETag. Marker TGT_ETAG must match that or symlink
+        // middleware 409s "X-Symlink-Target-Etag headers do not match".
+        // Marker PUT still sets X-Backend-Symlink-Override so COPY dest does
+        // not HEAD-validate the hidden archive against this etag (412).
+        let follow_etag = req
+            .headers
+            .get("X-Symlink-Target-Etag")
+            .or_else(|| req.headers.get(SYSMETA_SYMLINK_TARGET_ETAG))
+            .or_else(|| archived.headers.get(SYSMETA_SYMLINK_TARGET_ETAG))
+            .or_else(|| archived.headers.get("X-Symlink-Target-Etag"))
+            .map(|value| value.trim_matches('"').to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| target_etag.clone());
+        let listing_etag = follow_etag.clone();
         let content_type = req
             .headers
             .get("Content-Type")
@@ -1632,9 +1648,7 @@ impl VersionedWrites {
         // client X-Symlink-Target-Etag (static user-symlinks still HEAD-validate).
         marker_headers.remove("X-Symlink-Target-Account");
         marker_headers.set("X-Symlink-Target", &quoted_target);
-        // COPY ?symlink=get copies X-Symlink-Target-Etag of the *user* target.
-        // Marker target is the hidden archive; leaving the client etag 412s.
-        marker_headers.set("X-Symlink-Target-Etag", &target_etag);
+        marker_headers.set("X-Symlink-Target-Etag", &follow_etag);
         marker_headers.set("Content-Length", "0");
         marker_headers.set("Content-Type", content_type);
         marker_headers.set("X-Timestamp", marker_timestamp.internal());
@@ -4543,10 +4557,15 @@ mod tests {
         );
         assert_ne!(marker.3.get("X-Symlink-Target"), Some("c/tgt"));
         assert!(marker.3.get("X-Symlink-Target-Account").is_none());
-        assert_ne!(
+        assert_eq!(
             marker.3.get("X-Symlink-Target-Etag"),
             Some("abc123"),
-            "marker must not keep the user-target etag (COPY 412)"
+            "marker TGT_ETAG must equal archived static-symlink TGT_ETAG so GET follow matches"
+        );
+        assert_eq!(
+            marker.3.get("X-Backend-Symlink-Override"),
+            Some("true"),
+            "override skips HEAD-validate of hidden archive against the user-target etag"
         );
         assert!(marker
             .3
