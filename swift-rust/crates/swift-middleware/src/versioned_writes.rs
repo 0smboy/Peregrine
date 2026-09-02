@@ -312,6 +312,16 @@ fn decoded_header_path(value: &str) -> String {
     String::from_utf8_lossy(&percent_decode_bytes(value.as_bytes())).into_owned()
 }
 
+/// Hidden-container listing names may quote reserved NULs as `%00` without
+/// quoting other `%` bytes in the user object name (`%25ff`). Full percent-decode
+/// turns `%25ff` into `%ff` and version-id DELETE 404s, leaving versions behind.
+fn reserved_listing_name(raw: &str) -> String {
+    if raw.contains('\0') {
+        return raw.to_string();
+    }
+    raw.replace("%00", "\0")
+}
+
 fn validated_modern_post_target(location: &str, account: &str, hidden: &str) -> Option<String> {
     let decoded = decoded_header_path(location);
     // Pre-authorized internal requests may only target an origin-relative
@@ -2579,7 +2589,7 @@ impl VersionedWrites {
                 .map(str::to_string)
             else {
                 if let Some(raw_subdir) = item.get("subdir").and_then(|value| value.as_str()) {
-                    let decoded = decoded_header_path(raw_subdir);
+                    let decoded = reserved_listing_name(raw_subdir);
                     if let Some(object) = split_reserved_name_first(&decoded) {
                         let already = subdirs.iter().any(|existing| {
                             existing.get("subdir").and_then(|value| value.as_str())
@@ -2592,7 +2602,7 @@ impl VersionedWrites {
                 }
                 continue;
             };
-            let decoded_name = decoded_header_path(&raw_name);
+            let decoded_name = reserved_listing_name(&raw_name);
             let Some((object, version_id)) = split_modern_versions_object_name(&decoded_name)
             else {
                 continue;
@@ -4154,6 +4164,18 @@ mod tests {
         assert_eq!(
             out.headers.get("X-Object-Version-Id"),
             Some(version_id.as_str())
+        );
+    }
+
+    #[test]
+    fn test_reserved_listing_name_preserves_percent_twenty_five() {
+        assert_eq!(
+            super::reserved_listing_name("%00obj%25ff%001234"),
+            "\0obj%25ff\01234"
+        );
+        assert_eq!(
+            super::reserved_listing_name("\0obj%25ff\01234"),
+            "\0obj%25ff\01234"
         );
     }
 
