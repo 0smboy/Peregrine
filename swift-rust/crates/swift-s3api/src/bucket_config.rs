@@ -334,13 +334,52 @@ pub fn validate_lifecycle_xml(body: &[u8]) -> Result<(), String> {
                 return Err("MalformedXML".into());
             };
             let date = inner[..close].trim();
-            if !is_xsd_datetime(date) {
+            // AWS Lifecycle Date is ISO-8601 midnight UTC. Compact
+            // "20200101" is coerced by botocore to unix-seconds
+            // 1970-08-22T19:08:21Z, which is dateTime but not midnight.
+            if !is_lifecycle_date(date) {
                 return Err("MalformedXML".into());
             }
             rest_date = &inner[close + 7..];
         }
     }
     Ok(())
+}
+
+/// AWS S3 Lifecycle Date: xs:dateTime at midnight UTC.
+fn is_lifecycle_date(raw: &str) -> bool {
+    if !is_xsd_datetime(raw) {
+        return false;
+    }
+    let s = raw.trim();
+    let Some((_, time)) = s.split_once('T').or_else(|| s.split_once('t')) else {
+        return false;
+    };
+    let clock = time
+        .strip_suffix('Z')
+        .or_else(|| time.strip_suffix('z'))
+        .unwrap_or(time);
+    let clock = match clock.rfind(['+', '-']) {
+        Some(i) if i > 0 => &clock[..i],
+        _ => clock,
+    };
+    let mut tparts = clock.split(':');
+    let (Some(hh), Some(mm), Some(ss), None) =
+        (tparts.next(), tparts.next(), tparts.next(), tparts.next())
+    else {
+        return false;
+    };
+    if hh != "00" || mm != "00" {
+        return false;
+    }
+    let (sec, frac) = match ss.split_once('.') {
+        Some((a, b)) => (a, Some(b)),
+        None => (ss, None),
+    };
+    sec == "00"
+        && frac
+            .map(|f| !f.is_empty() && f.bytes().all(|b| b == b'0'))
+            .unwrap_or(true)
 }
 
 /// XSD dateTime as used by Python lxml RelaxNG `data type="dateTime"`.
@@ -863,6 +902,13 @@ mod tests {
         assert!(validate_lifecycle_xml(date_only).is_err());
         let ok_dt = br#"<LifecycleConfiguration><Rule><Status>Enabled</Status><Expiration><Date>2020-01-01T00:00:00Z</Date></Expiration></Rule></LifecycleConfiguration>"#;
         assert!(validate_lifecycle_xml(ok_dt).is_ok());
+        // boto3 Date='20200101' → unix-seconds dateTime, not midnight UTC.
+        let boto_compact = br#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>rule1</ID><Expiration><Date>1970-08-22T19:08:21Z</Date></Expiration><Prefix>test1/</Prefix><Status>Enabled</Status></Rule></LifecycleConfiguration>"#;
+        assert!(validate_lifecycle_xml(boto_compact).is_err());
+        let boto_trans = br#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>rule1</ID><Expiration><Date>2023-09-27T00:00:00Z</Date></Expiration><Transition><Date>1970-08-23T00:55:27Z</Date><StorageClass>GLACIER</StorageClass></Transition><Prefix>test1/</Prefix><Status>Enabled</Status></Rule></LifecycleConfiguration>"#;
+        assert!(validate_lifecycle_xml(boto_trans).is_err());
+        let not_midnight = br#"<LifecycleConfiguration><Rule><Status>Enabled</Status><Expiration><Date>2020-01-01T19:08:21Z</Date></Expiration></Rule></LifecycleConfiguration>"#;
+        assert!(validate_lifecycle_xml(not_midnight).is_err());
         let mut h = HeaderKeyDict::new();
         apply_lifecycle_meta(&mut h, body);
         let got = lifecycle_xml_from_headers(&h).unwrap();
