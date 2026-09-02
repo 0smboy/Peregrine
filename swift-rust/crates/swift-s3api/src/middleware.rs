@@ -6898,13 +6898,25 @@ fn request_to_streaming(req: Request) -> AsyncRequest {
         headers,
         body,
     } = req;
-    let bytes = body.into_vec(u64::MAX).unwrap_or_default();
+    // Channel GET bodies (version archive / COPY source) must not be
+    // into_vec'd on the Tokio runtime: WouldBlock becomes an empty PUT.
+    let incoming = match body {
+        Body::Buffered(v) => IncomingBody::from_bytes(v, MAX_CONTROL_BODY),
+        Body::Channel(ch) => {
+            let (rx, scope, cl) = ch.into_rx();
+            IncomingBody::from_channel(rx, cl, scope, u64::MAX)
+        }
+        Body::Streamed(s) => {
+            let bytes = Body::Streamed(s).into_vec(u64::MAX).unwrap_or_default();
+            IncomingBody::from_bytes(bytes, MAX_CONTROL_BODY)
+        }
+    };
     AsyncRequest {
         method,
         path,
         query_string,
         headers,
-        body: IncomingBody::from_bytes(bytes, MAX_CONTROL_BODY),
+        body: incoming,
     }
 }
 
