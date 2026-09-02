@@ -193,12 +193,13 @@ use crate::sigv4::{
     SigV4Auth,
 };
 use crate::versioning_store::{
-    archive_object_name, bare_etag as vers_bare_etag, generate_version_id,
-    index_generation_object_name, index_object_name, is_delete_marker_header, is_safe_version_id,
-    list_versions_result_xml, merge_unindexed_current_objects, versioning_status,
-    versions_container, CasDenied, RemoveVersionError, VersionIndex, VersionRecord,
-    VersioningStatus, HDR_DELETE_MARKER, HDR_VERSION_ID, INDEX_NAME, NULL_VERSION_ID,
-    SYS_DELETE_MARKER, SYS_OBJECT_KEY, SYS_VERSION_ID,
+    archive_object_name, bare_etag as vers_bare_etag, collapse_version_indexes_latest,
+    generate_version_id, index_generation_object_name, index_object_name, is_delete_marker_header,
+    is_safe_version_id, key_hex, list_versions_result_xml, merge_archive_objects_into_index,
+    merge_unindexed_current_objects, parse_archive_object_name,
+    version_index_keys_from_listing_names, versioning_status, versions_container, CasDenied,
+    RemoveVersionError, VersionIndex, VersionRecord, VersioningStatus, HDR_DELETE_MARKER,
+    HDR_VERSION_ID, INDEX_NAME, NULL_VERSION_ID, SYS_DELETE_MARKER, SYS_OBJECT_KEY, SYS_VERSION_ID,
 };
 use crate::website::{
     is_website_endpoint, parse_website_configuration, resolve_website_key, website_object_params,
@@ -629,7 +630,7 @@ fn decode_and_fix_aws_chunked(
         payload_hash.eq_ignore_ascii_case("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER");
 
     let sig_ctx = if want_hmac {
-        crate::sigv4::amz_date(req).map(|ad| ChunkSigContext {
+        crate::sigv4::signing_amz_date(req).map(|ad| ChunkSigContext {
             secret_key: cred.secret_key.clone(),
             date: auth.scope.date.clone(),
             region: auth.scope.region.clone(),
@@ -3721,6 +3722,27 @@ impl S3Api {
                 .get("Last-Modified")
                 .map(http_date_to_s3_approx)
                 .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
+            if let Err(resp) = store_version_archive_bytes_streaming(
+                &cred,
+                &bucket,
+                &key,
+                &vid,
+                buffered.clone(),
+                &next,
+            )
+            .await
+            {
+                let out = finish(resp);
+                if !client_conditional
+                    && replayable
+                    && attempt + 1 < MAX_ATTEMPTS
+                    && versioned_write_retryable(&out)
+                {
+                    last = Some(out);
+                    continue;
+                }
+                return out;
+            }
             if let Err(resp) = commit_new_version_record(
                 &mut idx,
                 expect,
@@ -3767,6 +3789,10 @@ impl S3Api {
                             Ok(s) => s,
                             Err(_) => break,
                         };
+                        if snap2.index.find(&rec.version_id).is_some() {
+                            persisted = true;
+                            break;
+                        }
                         let expect2 = expect_generation(&snap2);
                         let mut idx2 = snap2.index.clone();
                         if commit_new_version_record(&mut idx2, expect2, false, rec.clone())
@@ -5940,13 +5966,9 @@ fn resolve_object_version(
 
     let version_id = version_id.expect("version id was handled above");
 
-    // Hidden archive objects are implementation details, not an independent
-    // source of truth.  Require the version index record before owner-auth
-    // access so a failed archive/promotion cannot resurrect an orphan copy.
-    let index = load_version_index(cred, bucket, key, next)?;
-    if index.find(version_id).is_none() {
-        return Ok(None);
-    }
+    // Durable versions live as `{hex}/{vid}` archives. The JSON index can
+    // fork under concurrent PUT; ListVersions merges archives, so resolve
+    // must HEAD the archive even when the latest fence dropped the vid.
     if !is_safe_version_id(version_id) {
         return Err(unsafe_version_id_error());
     }
@@ -7375,10 +7397,6 @@ async fn resolve_object_version_async(
         _ => {}
     }
     let version_id = version_id.expect("version id was handled above");
-    let index = load_version_index_async(cred, bucket, key, next).await?;
-    if index.find(version_id).is_none() {
-        return Ok(None);
-    }
     if !is_safe_version_id(version_id) {
         return Err(unsafe_version_id_error());
     }
@@ -7602,6 +7620,62 @@ async fn adopt_newer_generation_fences_streaming(
     ))
 }
 
+struct HealMirrorDecision {
+    skip: bool,
+    keep_etag: Option<String>,
+    if_match: Option<String>,
+    if_none_match: bool,
+}
+
+/// Heal must never overwrite a newer `index.json` with a stale snapshot.
+fn decide_heal_mirror(
+    status: u16,
+    body: &[u8],
+    etag: Option<String>,
+    snap_generation: u64,
+) -> HealMirrorDecision {
+    if (200..300).contains(&status) {
+        if let Some(existing) = VersionIndex::from_json(body) {
+            if existing.generation >= snap_generation {
+                return HealMirrorDecision {
+                    skip: true,
+                    keep_etag: etag,
+                    if_match: None,
+                    if_none_match: false,
+                };
+            }
+        }
+        if let Some(e) = etag {
+            return HealMirrorDecision {
+                skip: false,
+                keep_etag: None,
+                if_match: Some(e),
+                if_none_match: false,
+            };
+        }
+        return HealMirrorDecision {
+            skip: true,
+            keep_etag: None,
+            if_match: None,
+            if_none_match: false,
+        };
+    }
+    if status == 404 {
+        return HealMirrorDecision {
+            skip: false,
+            keep_etag: None,
+            if_match: None,
+            if_none_match: true,
+        };
+    }
+    HealMirrorDecision {
+        skip: true,
+        keep_etag: None,
+        if_match: None,
+        if_none_match: false,
+    }
+}
+
 async fn heal_version_index_mirror_streaming(
     cred: &S3Credential,
     bucket: &str,
@@ -7611,14 +7685,40 @@ async fn heal_version_index_mirror_streaming(
 ) {
     let vc = versions_container(bucket);
     let iname = index_object_name(key);
+    let path = s3_to_swift_path(&cred.account, Some(&vc), Some(&iname));
+    let mut get = make_swift_req("GET", &path);
+    get.headers.set("X-Newest", "true");
+    stamp_auth(&mut get, cred);
+    let cur = streaming_call(next, get).await;
+    let etag = cur
+        .headers
+        .get("ETag")
+        .map(vers_bare_etag)
+        .filter(|s| !s.is_empty());
+    let status = cur.status;
+    let existing_body = if (200..300).contains(&status) {
+        body_bytes(cur.body).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let decision = decide_heal_mirror(status, &existing_body, etag, snap.index.generation);
+    if decision.skip {
+        if decision.keep_etag.is_some() {
+            snap.etag = decision.keep_etag;
+        }
+        return;
+    }
     let body = snap.index.to_json();
-    let mut put = make_swift_req(
-        "PUT",
-        &s3_to_swift_path(&cred.account, Some(&vc), Some(&iname)),
-    );
+    let mut put = make_swift_req("PUT", &path);
     put.headers.set("Content-Length", body.len().to_string());
     put.headers.set("Content-Type", "application/json");
     put.headers.set(SYS_OBJECT_KEY, key);
+    if let Some(e) = decision.if_match {
+        put.headers.set("If-Match", e);
+    }
+    if decision.if_none_match {
+        put.headers.set("If-None-Match", "*");
+    }
     put.body = Body::from(body);
     stamp_auth(&mut put, cred);
     let resp = streaming_call(next, put).await;
@@ -7689,6 +7789,43 @@ async fn cas_save_version_index_streaming(
         Err(version_index_persist_conflict())
     } else {
         Err(map_swift_error(resp.status, Some(&vc), Some(&iname)))
+    }
+}
+
+async fn store_version_archive_bytes_streaming(
+    cred: &S3Credential,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    bytes: Vec<u8>,
+    next: &StreamingAsyncNextFn,
+) -> Result<(), Response> {
+    ensure_versions_container_streaming(cred, bucket, next).await?;
+    let vc = versions_container(bucket);
+    let aname = archive_name_checked(key, version_id)?;
+    let mut put = make_swift_req(
+        "PUT",
+        &s3_to_swift_path(&cred.account, Some(&vc), Some(&aname)),
+    );
+    put.headers.set("Content-Length", bytes.len().to_string());
+    put.headers.set("Content-Type", "application/octet-stream");
+    put.headers.set(SYS_VERSION_ID, version_id);
+    put.headers.set(SYS_OBJECT_KEY, key);
+    put.headers.set(SYS_DELETE_MARKER, "false");
+    put.headers.set("If-None-Match", "*");
+    put.body = Body::from(bytes);
+    stamp_auth(&mut put, cred);
+    let stored = streaming_call(next, put).await;
+    if swift_write_applied(stored.status) || stored.status == 412 {
+        Ok(())
+    } else if stored.status == 202 {
+        Err(s3_error_response(
+            "InternalError",
+            Some("backend write was not applied"),
+            &[],
+        ))
+    } else {
+        Err(map_swift_error(stored.status, Some(&vc), Some(&aname)))
     }
 }
 
@@ -9160,14 +9297,40 @@ async fn heal_version_index_mirror_async(
 ) {
     let vc = versions_container(bucket);
     let iname = index_object_name(key);
+    let path = s3_to_swift_path(&cred.account, Some(&vc), Some(&iname));
+    let mut get = make_swift_req("GET", &path);
+    get.headers.set("X-Newest", "true");
+    stamp_auth(&mut get, cred);
+    let cur = async_call(next, get).await;
+    let etag = cur
+        .headers
+        .get("ETag")
+        .map(vers_bare_etag)
+        .filter(|s| !s.is_empty());
+    let status = cur.status;
+    let existing_body = if (200..300).contains(&status) {
+        body_bytes(cur.body).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let decision = decide_heal_mirror(status, &existing_body, etag, snap.index.generation);
+    if decision.skip {
+        if decision.keep_etag.is_some() {
+            snap.etag = decision.keep_etag;
+        }
+        return;
+    }
     let body = snap.index.to_json();
-    let mut put = make_swift_req(
-        "PUT",
-        &s3_to_swift_path(&cred.account, Some(&vc), Some(&iname)),
-    );
+    let mut put = make_swift_req("PUT", &path);
     put.headers.set("Content-Length", body.len().to_string());
     put.headers.set("Content-Type", "application/json");
     put.headers.set(SYS_OBJECT_KEY, key);
+    if let Some(e) = decision.if_match {
+        put.headers.set("If-Match", e);
+    }
+    if decision.if_none_match {
+        put.headers.set("If-None-Match", "*");
+    }
     put.body = Body::from(body);
     stamp_auth(&mut put, cred);
     let resp = async_call(next, put).await;
@@ -9189,14 +9352,40 @@ fn heal_version_index_mirror(
 ) {
     let vc = versions_container(bucket);
     let iname = index_object_name(key);
+    let path = s3_to_swift_path(&cred.account, Some(&vc), Some(&iname));
+    let mut get = make_swift_req("GET", &path);
+    get.headers.set("X-Newest", "true");
+    stamp_auth(&mut get, cred);
+    let cur = next(get);
+    let etag = cur
+        .headers
+        .get("ETag")
+        .map(vers_bare_etag)
+        .filter(|s| !s.is_empty());
+    let status = cur.status;
+    let existing_body = if (200..300).contains(&status) {
+        cur.body.into_vec(MAX_CONTROL_BODY).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let decision = decide_heal_mirror(status, &existing_body, etag, snap.index.generation);
+    if decision.skip {
+        if decision.keep_etag.is_some() {
+            snap.etag = decision.keep_etag;
+        }
+        return;
+    }
     let body = snap.index.to_json();
-    let mut put = make_swift_req(
-        "PUT",
-        &s3_to_swift_path(&cred.account, Some(&vc), Some(&iname)),
-    );
+    let mut put = make_swift_req("PUT", &path);
     put.headers.set("Content-Length", body.len().to_string());
     put.headers.set("Content-Type", "application/json");
     put.headers.set(SYS_OBJECT_KEY, key);
+    if let Some(e) = decision.if_match {
+        put.headers.set("If-Match", e);
+    }
+    if decision.if_none_match {
+        put.headers.set("If-None-Match", "*");
+    }
     put.body = Body::from(body);
     stamp_auth(&mut put, cred);
     let resp = next(put);
@@ -10400,8 +10589,13 @@ async fn handle_versioned_delete_once_async(
         // numbered vid whose index persist failed after the data-plane
         // PUT) have no index row. CAS-remove would 500 "lost update" and
         // leave the object (the Ceph s3-tests nuke poison).
-        if target_is_current && snap.index.find(vid).is_none() {
+        if snap.index.find(vid).is_none() {
             let mut del = make_swift_req("DELETE", &cur_path);
+            del.path = s3_to_swift_path(
+                &cred.account,
+                Some(&target.container),
+                Some(&target.key),
+            );
             stamp_object_write_precondition(&mut del.headers, Some(&target.head));
             stamp_auth(&mut del, cred);
             let retry = del.clone_head();
@@ -10416,7 +10610,11 @@ async fn handle_versioned_delete_once_async(
                 resp
             };
             if !swift_write_applied(resp.status) && resp.status != 404 {
-                return backend_write_not_applied(resp.status, Some(bucket), Some(key));
+                return backend_write_not_applied(
+                    resp.status,
+                    Some(&target.container),
+                    Some(&target.key),
+                );
             }
             let mut r = delete_object_response();
             r.headers.set(HDR_VERSION_ID, vid);
@@ -10440,7 +10638,16 @@ async fn handle_versioned_delete_once_async(
                 if let Err(resp) =
                     promote_archived_version_async(cred, bucket, key, next_version, next).await
                 {
-                    return resp;
+                    if resp.status != 404 {
+                        return resp;
+                    }
+                    let mut del = make_swift_req("DELETE", &cur_path);
+                    stamp_object_write_precondition(&mut del.headers, Some(&target.head));
+                    stamp_auth(&mut del, cred);
+                    let resp = async_call(next, del).await;
+                    if !swift_write_applied(resp.status) && resp.status != 404 {
+                        return backend_write_not_applied(resp.status, Some(bucket), Some(key));
+                    }
                 }
             } else {
                 let mut del = make_swift_req("DELETE", &cur_path);
@@ -10630,8 +10837,13 @@ fn handle_versioned_delete_once(
         // numbered vid whose index persist failed after the data-plane
         // PUT) have no index row. CAS-remove would 500 "lost update" and
         // leave the object (the Ceph s3-tests nuke poison).
-        if target_is_current && snap.index.find(vid).is_none() {
+        if snap.index.find(vid).is_none() {
             let mut del = make_swift_req("DELETE", &cur_path);
+            del.path = s3_to_swift_path(
+                &cred.account,
+                Some(&target.container),
+                Some(&target.key),
+            );
             stamp_object_write_precondition(&mut del.headers, Some(&target.head));
             stamp_auth(&mut del, cred);
             let retry = del.clone_head();
@@ -10646,7 +10858,11 @@ fn handle_versioned_delete_once(
                 resp
             };
             if !swift_write_applied(resp.status) && resp.status != 404 {
-                return backend_write_not_applied(resp.status, Some(bucket), Some(key));
+                return backend_write_not_applied(
+                    resp.status,
+                    Some(&target.container),
+                    Some(&target.key),
+                );
             }
             let mut r = delete_object_response();
             r.headers.set(HDR_VERSION_ID, vid);
@@ -10668,7 +10884,16 @@ fn handle_versioned_delete_once(
                     return unsafe_version_id_error();
                 }
                 if let Err(resp) = promote_archived_version(cred, bucket, key, next_version, next) {
-                    return resp;
+                    if resp.status != 404 {
+                        return resp;
+                    }
+                    let mut del = make_swift_req("DELETE", &cur_path);
+                    stamp_object_write_precondition(&mut del.headers, Some(&target.head));
+                    stamp_auth(&mut del, cred);
+                    let resp = next(del);
+                    if !swift_write_applied(resp.status) && resp.status != 404 {
+                        return backend_write_not_applied(resp.status, Some(bucket), Some(key));
+                    }
                 }
             } else {
                 let mut del = make_swift_req("DELETE", &cur_path);
@@ -10934,31 +11159,54 @@ async fn load_version_indexes_async(
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    let mut indexes: Vec<VersionIndex> = Vec::new();
-    for item in items {
-        let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if !(name.ends_with(INDEX_NAME) || name.ends_with("/index.json")) {
-            continue;
-        }
-        let mut get = make_swift_req(
-            "GET",
-            &s3_to_swift_path(&cred.account, Some(&vc), Some(name)),
-        );
-        stamp_auth(&mut get, cred);
-        let g = async_call(next, get).await;
-        if !(200..300).contains(&g.status) {
-            continue;
-        }
-        let Ok(b) = body_bytes(g.body).await else {
-            continue;
-        };
-        if let Some(idx) = VersionIndex::from_json(&b) {
-            indexes.push(idx);
+    let mut names: Vec<String> = Vec::new();
+    for item in &items {
+        if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+            names.push(name.to_string());
         }
     }
-    indexes
+    let mut indexes: Vec<VersionIndex> = Vec::new();
+    for key in version_index_keys_from_listing_names(&names) {
+        let mut idx = match load_version_index_snapshot_async(cred, bucket, &key, next).await {
+            Ok(snap) => snap.index,
+            Err(_) => continue,
+        };
+        let hex = key_hex(&key);
+        let mut archives: Vec<(String, String, i64, String)> = Vec::new();
+        for item in &items {
+            let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some((k, vid)) = parse_archive_object_name(name) else {
+                continue;
+            };
+            if k != key && !name.starts_with(&format!("{hex}/")) {
+                continue;
+            }
+            if k != key {
+                continue;
+            }
+            let etag = item
+                .get("hash")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let size = item
+                .get("bytes")
+                .and_then(|v| v.as_i64())
+                .or_else(|| item.get("bytes").and_then(|v| v.as_u64()).map(|n| n as i64))
+                .unwrap_or(0);
+            let lm = item
+                .get("last_modified")
+                .and_then(|v| v.as_str())
+                .unwrap_or("1970-01-01T00:00:00.000Z")
+                .to_string();
+            archives.push((vid, etag, size, lm));
+        }
+        merge_archive_objects_into_index(&mut idx, &archives);
+        indexes.push(idx);
+    }
+    collapse_version_indexes_latest(indexes)
 }
 
 /// Data-container listing used to synthesize `VersionId=null` rows.
@@ -10985,28 +11233,19 @@ fn load_version_indexes(cred: &S3Credential, bucket: &str, next: &NextFn) -> Vec
     let Some(arr) = parsed.as_array() else {
         return indexes;
     };
+    let mut names: Vec<String> = Vec::new();
     for item in arr {
-        let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if !(name.ends_with(INDEX_NAME) || name.ends_with("/index.json")) {
-            continue;
-        }
-        let mut get = make_swift_req(
-            "GET",
-            &s3_to_swift_path(&cred.account, Some(&vc), Some(name)),
-        );
-        stamp_auth(&mut get, cred);
-        let g = next(get);
-        if !(200..300).contains(&g.status) {
-            continue;
-        }
-        let b = g.body.into_vec(MAX_CONTROL_BODY).unwrap_or_default();
-        if let Some(idx) = VersionIndex::from_json(&b) {
-            indexes.push(idx);
+        if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+            names.push(name.to_string());
         }
     }
-    indexes
+    for key in version_index_keys_from_listing_names(&names) {
+        match load_version_index_snapshot(cred, bucket, &key, next) {
+            Ok(snap) => indexes.push(snap.index),
+            Err(_) => continue,
+        }
+    }
+    collapse_version_indexes_latest(indexes)
 }
 
 /// Data-container listing used to synthesize `VersionId=null` rows.

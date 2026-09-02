@@ -21,7 +21,7 @@ use crate::crypto::sha256_hex;
 use crate::response::s3_xml_timestamp;
 use crate::xml::Element;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -153,6 +153,126 @@ pub fn index_object_name(key: &str) -> String {
 /// compactor with its own safety proof (follow-up window).
 pub fn index_generation_object_name(key: &str, generation: u64) -> String {
     format!("{}/index.g{generation:020}.json", key_hex(key))
+}
+
+/// `{key_hex}/index.json` mirror or `{key_hex}/index.g{N:020}.json` fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionIndexObjectName {
+    Mirror { key_hex: String },
+    Fence { key_hex: String, generation: u64 },
+}
+
+pub fn parse_version_index_object_name(name: &str) -> Option<VersionIndexObjectName> {
+    let (enc, fname) = name.rsplit_once('/')?;
+    if enc.is_empty() {
+        return None;
+    }
+    if fname == INDEX_NAME {
+        return Some(VersionIndexObjectName::Mirror {
+            key_hex: enc.to_string(),
+        });
+    }
+    let rest = fname.strip_prefix("index.g")?.strip_suffix(".json")?;
+    if rest.len() != 20 || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let generation = rest.parse().ok()?;
+    Some(VersionIndexObjectName::Fence {
+        key_hex: enc.to_string(),
+        generation,
+    })
+}
+
+/// Object names ListVersions must GET: the highest generation fence per
+/// key, or the `index.json` mirror when no fence exists.
+///
+/// Concurrent PUTs commit the full snapshot into an immutable fence
+/// *before* the mirror. An unconditional heal can clobber a newer
+/// `index.json`. Listing the max fence is the source of truth.
+pub fn version_index_fetch_names(listing_names: &[String]) -> Vec<String> {
+    struct Best {
+        mirror: Option<String>,
+        fence_gen: u64,
+        fence: Option<String>,
+    }
+    let mut by_hex: HashMap<String, Best> = HashMap::new();
+    for name in listing_names {
+        match parse_version_index_object_name(name) {
+            Some(VersionIndexObjectName::Mirror { key_hex }) => {
+                by_hex
+                    .entry(key_hex)
+                    .or_insert(Best {
+                        mirror: None,
+                        fence_gen: 0,
+                        fence: None,
+                    })
+                    .mirror = Some(name.clone());
+            }
+            Some(VersionIndexObjectName::Fence {
+                key_hex,
+                generation,
+            }) => {
+                let e = by_hex.entry(key_hex).or_insert(Best {
+                    mirror: None,
+                    fence_gen: 0,
+                    fence: None,
+                });
+                if e.fence.is_none() || generation > e.fence_gen {
+                    e.fence_gen = generation;
+                    e.fence = Some(name.clone());
+                }
+            }
+            None => {}
+        }
+    }
+    let mut out = Vec::new();
+    for b in by_hex.into_values() {
+        if let Some(n) = b.fence {
+            out.push(n);
+        } else if let Some(n) = b.mirror {
+            out.push(n);
+        }
+    }
+    out
+}
+
+/// Object keys that have an index mirror or generation fence in a versions
+/// container listing. ListVersions snapshot-loads each key (GET + adopt
+/// fences with X-Newest) instead of trusting a stale listing of fence names.
+pub fn version_index_keys_from_listing_names(listing_names: &[String]) -> Vec<String> {
+    let mut keys: HashSet<String> = HashSet::new();
+    for name in listing_names {
+        if let Some((k, _)) = parse_archive_object_name(name) {
+            keys.insert(k);
+            continue;
+        }
+        let hex = match parse_version_index_object_name(name) {
+            Some(VersionIndexObjectName::Mirror { key_hex })
+            | Some(VersionIndexObjectName::Fence { key_hex, .. }) => key_hex,
+            None => continue,
+        };
+        if let Some(k) = key_from_hex(&hex) {
+            keys.insert(k);
+        }
+    }
+    keys.into_iter().collect()
+}
+
+/// Keep the highest-generation index per object key.
+pub fn collapse_version_indexes_latest(indexes: Vec<VersionIndex>) -> Vec<VersionIndex> {
+    let mut best: HashMap<String, VersionIndex> = HashMap::new();
+    for idx in indexes {
+        match best.get(&idx.key) {
+            Some(prev)
+                if prev.generation > idx.generation
+                    || (prev.generation == idx.generation
+                        && prev.versions.len() >= idx.versions.len()) => {}
+            _ => {
+                best.insert(idx.key.clone(), idx);
+            }
+        }
+    }
+    best.into_values().collect()
 }
 
 pub fn parse_archive_object_name(name: &str) -> Option<(String, String)> {
@@ -305,6 +425,7 @@ impl VersionIndex {
     }
 
     pub fn push_latest(&mut self, mut rec: VersionRecord) {
+        self.versions.retain(|v| v.version_id != rec.version_id);
         for v in &mut self.versions {
             v.is_latest = false;
         }
@@ -426,6 +547,28 @@ pub fn null_version_index(
             size,
         }],
         generation: 0,
+    }
+}
+
+/// Fold archive objects (`{hex}/{vid}`) into a key's index when the JSON
+/// mirror/fence raced and dropped an acknowledged version. Listing then
+/// matches versions-container reality (Python object_versioning).
+pub fn merge_archive_objects_into_index(
+    idx: &mut VersionIndex,
+    archives: &[(String, String, i64, String)],
+) {
+    for (vid, etag, size, last_modified) in archives {
+        if !is_safe_version_id(vid) || idx.find(vid).is_some() {
+            continue;
+        }
+        idx.versions.push(VersionRecord {
+            version_id: vid.clone(),
+            is_delete_marker: false,
+            is_latest: false,
+            last_modified: last_modified.clone(),
+            etag: etag.clone(),
+            size: *size,
+        });
     }
 }
 
@@ -998,14 +1141,125 @@ mod tests {
         // Fences are not archives and must never resolve as one.
         assert_eq!(parse_archive_object_name(&g1), None);
         assert_eq!(parse_archive_object_name(&gmax), None);
-        // Fences sort between hex archives and the mirror, and the
-        // ListVersions mirror filter (`ends_with("index.json")`) skips them.
+        // Fences do not share the mirror suffix; ListVersions must select
+        // them via [`parse_version_index_object_name`], not `ends_with`.
         assert!(!g1.ends_with(INDEX_NAME));
+        assert_eq!(
+            parse_version_index_object_name(&g1),
+            Some(VersionIndexObjectName::Fence {
+                key_hex: key_hex("obj"),
+                generation: 1,
+            })
+        );
         // A fence read back as a full index snapshot round-trips.
         let mut idx = VersionIndex::new("obj");
         idx.generation = 7;
         let parsed = VersionIndex::from_json(&idx.to_json()).unwrap();
         assert_eq!(parsed.generation, 7);
+    }
+
+    #[test]
+    fn version_index_fetch_names_prefers_max_fence_over_stale_mirror() {
+        let hex = key_hex("k");
+        let mirror = format!("{hex}/index.json");
+        let g3 = index_generation_object_name("k", 3);
+        let g8 = index_generation_object_name("k", 8);
+        let archive = format!("{hex}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let names = vec![
+            archive,
+            mirror.clone(),
+            g3.clone(),
+            g8.clone(),
+            format!("{}/index.json", key_hex("other")),
+        ];
+        let fetch = version_index_fetch_names(&names);
+        assert!(fetch.contains(&g8), "{fetch:?}");
+        assert!(!fetch.contains(&g3), "{fetch:?}");
+        assert!(!fetch.contains(&mirror), "{fetch:?}");
+        assert_eq!(fetch.len(), 2);
+    }
+
+    #[test]
+    fn collapse_version_indexes_latest_keeps_higher_generation() {
+        let mut a = VersionIndex::new("k");
+        a.generation = 3;
+        a.push_latest(VersionRecord {
+            version_id: "v3".into(),
+            is_delete_marker: false,
+            is_latest: true,
+            last_modified: "t".into(),
+            etag: "e".into(),
+            size: 1,
+        });
+        let mut b = VersionIndex::new("k");
+        b.generation = 8;
+        b.push_latest(VersionRecord {
+            version_id: "v8".into(),
+            is_delete_marker: false,
+            is_latest: true,
+            last_modified: "t".into(),
+            etag: "e".into(),
+            size: 1,
+        });
+        b.push_latest(VersionRecord {
+            version_id: "v7".into(),
+            is_delete_marker: false,
+            is_latest: true,
+            last_modified: "t".into(),
+            etag: "e".into(),
+            size: 1,
+        });
+        let out = collapse_version_indexes_latest(vec![a, b]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].generation, 8);
+        assert_eq!(out[0].versions.len(), 2);
+    }
+
+    #[test]
+    fn push_latest_replaces_duplicate_version_id() {
+        let mut idx = VersionIndex::new("k");
+        idx.push_latest(VersionRecord {
+            version_id: "v1".into(),
+            is_delete_marker: false,
+            is_latest: true,
+            last_modified: "t1".into(),
+            etag: "e1".into(),
+            size: 1,
+        });
+        idx.push_latest(VersionRecord {
+            version_id: "v1".into(),
+            is_delete_marker: false,
+            is_latest: true,
+            last_modified: "t2".into(),
+            etag: "e2".into(),
+            size: 2,
+        });
+        assert_eq!(idx.versions.len(), 1);
+        assert_eq!(idx.versions[0].etag, "e2");
+        assert!(idx.versions[0].is_latest);
+    }
+
+    #[test]
+    fn merge_archive_objects_adds_missing_vid_only() {
+        let mut idx = VersionIndex::new("k");
+        idx.push_latest(VersionRecord {
+            version_id: "v1".into(),
+            is_delete_marker: false,
+            is_latest: true,
+            last_modified: "t".into(),
+            etag: "e1".into(),
+            size: 1,
+        });
+        merge_archive_objects_into_index(
+            &mut idx,
+            &[
+                ("v1".into(), "e1".into(), 1, "t".into()),
+                ("v2".into(), "e2".into(), 2, "t".into()),
+            ],
+        );
+        assert_eq!(idx.versions.len(), 2);
+        assert!(idx.find("v2").is_some());
+        assert!(idx.find("v1").unwrap().is_latest);
     }
 
     #[test]
