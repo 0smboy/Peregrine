@@ -1612,9 +1612,17 @@ impl Slo {
         strip_conditionals(&mut req.headers);
         let mut resp = next(req).await;
         // S3 path rewrite happens after the outer prepare(); the first
-        // backend GET may still be a ranged manifest (206 / 283 bytes).
+        // backend GET may still be a ranged SLO *manifest* (206 of JSON).
         // Refetch the whole JSON so Range applies to assembled size.
-        if resp.status == 206 && orig.headers.get("Range").is_some() {
+        // Ordinary objects must keep 206: a blind retry without Range
+        // turns GET/COPY/CopyPart Range into a 200 full body
+        // (G4 Range cluster, G5-A test_get_object_range / MPU copy-part).
+        let first_is_slo = resp
+            .headers
+            .get(SLO_HEADER)
+            .map(config_true_value)
+            .unwrap_or(false);
+        if first_is_slo && resp.status == 206 && orig.headers.get("Range").is_some() {
             let mut retry = orig.clone_head();
             retry.headers.remove("Range");
             retry.headers.remove("range");
@@ -4150,6 +4158,113 @@ mod tests {
         let mut resp = Slo::new().handle(slo_get("/v1/a/c/plain", None), &be);
         assert_eq!(resp.status, 200);
         assert_eq!(body_of(&mut resp), b"hi");
+    }
+
+    #[tokio::test]
+    async fn test_async_non_slo_range_keeps_206_without_unranged_retry() {
+        // Hyper outbound next() returns the already-completed app GET.
+        // A 206 on a plain object must not be replaced by a second GET
+        // without Range (that was returning 200 + full body).
+        use std::sync::Mutex;
+        let log = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let log2 = log.clone();
+        let next: crate::AsyncNextFn = Arc::new(move |req: Request| {
+            let range = req.headers.get("Range").map(str::to_string);
+            log2.lock().unwrap().push((req.path.clone(), range.clone()));
+            let body = b"abcdefghij".to_vec();
+            let (status, slice, cr) = if let Some(rh) = range.as_deref() {
+                if let Ok(parsed) = Range::parse(rh) {
+                    if let Some(ranges) = parsed.ranges_for_length(Some(body.len() as u64)) {
+                        if ranges.len() == 1 {
+                            let (a, b) = ranges[0];
+                            let slice = body[a as usize..b as usize].to_vec();
+                            (
+                                206u16,
+                                slice,
+                                Some(format!("bytes {a}-{}/{n}", b - 1, n = body.len())),
+                            )
+                        } else {
+                            (200u16, body, None)
+                        }
+                    } else {
+                        (200u16, body, None)
+                    }
+                } else {
+                    (200u16, body, None)
+                }
+            } else {
+                (200u16, body, None)
+            };
+            let mut out = Response::with_body(status, slice);
+            if let Some(cr) = cr {
+                out.headers.set("Content-Range", cr);
+            }
+            out.headers.set("Content-Type", "application/octet-stream");
+            Box::pin(async move { out })
+        });
+        let resp = Slo::new()
+            .reassemble_async(slo_get("/v1/a/c/plain", Some("bytes=2-5")), next)
+            .await;
+        assert_eq!(resp.status, 206, "plain ranged GET must stay 206");
+        assert_eq!(resp.headers.get("Content-Range"), Some("bytes 2-5/10"));
+        let body = match resp.body.collect_async().await {
+            Ok(b) => b,
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(body, b"cdef");
+        let calls = log.lock().unwrap();
+        assert_eq!(calls.len(), 1, "must not retry without Range: {calls:?}");
+        assert_eq!(calls[0].1.as_deref(), Some("bytes=2-5"));
+    }
+
+    #[tokio::test]
+    async fn test_async_slo_ranged_manifest_206_still_refetches_json() {
+        // Captured first GET is 206 of truncated SLO JSON (ignore-range missed
+        // because S3 rewrote the path after prepare). Must refetch whole JSON.
+        use std::sync::Mutex;
+        let log = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let log2 = log.clone();
+        let manifest_json = two_segment_manifest_json();
+        let next: crate::AsyncNextFn = Arc::new(move |req: Request| {
+            let range = req.headers.get("Range").map(str::to_string);
+            if req.path == "/v1/a/c/manifest" {
+                log2.lock().unwrap().push(range.clone());
+                let mut manifest = Response::with_body(200, manifest_json.clone());
+                manifest.headers.set("X-Static-Large-Object", "True");
+                manifest.headers.set("Content-Type", "text/plain");
+                if range.is_some() {
+                    // Simulate object-server applying Range to the JSON file.
+                    let slice = manifest_json.get(..12).unwrap_or(&manifest_json).to_vec();
+                    let mut ranged = Response::with_body(206, slice);
+                    ranged.headers = manifest.headers.clone();
+                    ranged.headers.set("Content-Range", "bytes 0-11/99");
+                    return Box::pin(async move { ranged });
+                }
+                return Box::pin(async move { manifest });
+            }
+            let body = match req.path.as_str() {
+                "/v1/a/c/s1" => b"one".to_vec(),
+                "/v1/a/c/s2" => b"two".to_vec(),
+                _ => {
+                    return Box::pin(async { Response::new(404) });
+                }
+            };
+            Box::pin(async move { Response::with_body(200, body) })
+        });
+        let resp = Slo::new()
+            .reassemble_async(slo_get("/v1/a/c/manifest", Some("bytes=0-2")), next)
+            .await;
+        assert_eq!(resp.status, 206);
+        let body = match resp.body.collect_async().await {
+            Ok(b) => b,
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(body, b"one");
+        let calls = log.lock().unwrap();
+        assert!(
+            calls.iter().any(|r| r.is_none()),
+            "SLO 206 JSON must refetch without Range: {calls:?}"
+        );
     }
 
     #[test]
