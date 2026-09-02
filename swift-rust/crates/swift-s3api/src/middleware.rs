@@ -3073,10 +3073,48 @@ fn copy_xml_last_modified(resp: &Response) -> String {
     "1970-01-01T00:00:00.000Z".to_string()
 }
 
+/// Python `S3Request._bucket_put_accepted_error`: Swift 202 on CreateBucket
+/// is BucketAlreadyOwnedByYou when the s3api ACL owner is missing or is this
+/// user, else BucketAlreadyExists (same account, different access key).
+fn bucket_already_from_headers(cred: &S3Credential, headers: &HeaderKeyDict) -> Response {
+    let owner = existing_json_owner(headers, S3_BUCKET_ACL_JSON_META, "");
+    if owner.is_empty() || owner == cred.access_key {
+        s3_error_response("BucketAlreadyOwnedByYou", None, &[])
+    } else {
+        s3_error_response("BucketAlreadyExists", None, &[])
+    }
+}
+
+fn bucket_put_accepted_error(cred: &S3Credential, bucket: &str, next: &NextFn) -> Response {
+    let mut head = make_swift_req(
+        "HEAD",
+        &s3_to_swift_path(&cred.account, Some(bucket), None),
+    );
+    stamp_auth(&mut head, cred);
+    let resp = next(head);
+    bucket_already_from_headers(cred, &resp.headers)
+}
+
+async fn bucket_put_accepted_error_async(
+    cred: &S3Credential,
+    bucket: &str,
+    next: &AsyncNextFn,
+) -> Response {
+    let mut head = make_swift_req(
+        "HEAD",
+        &s3_to_swift_path(&cred.account, Some(bucket), None),
+    );
+    stamp_auth(&mut head, cred);
+    let resp = async_call(next, head).await;
+    bucket_already_from_headers(cred, &resp.headers)
+}
+
 fn translate_bucket_success(method: &str, resp: Response, bucket: Option<&str>) -> Response {
     match method {
         "PUT" => {
-            // Swift PUT existing container is 202 Accepted.
+            // Swift PUT existing container is 202 Accepted. Callers with a
+            // credential must use bucket_put_accepted_error* so s3_acl can
+            // distinguish OwnedByYou vs Exists.
             if resp.status == 202 {
                 return s3_error_response("BucketAlreadyOwnedByYou", None, &[]);
             }
@@ -4607,6 +4645,14 @@ impl S3Api {
                 return translate_list_objects(&body, b, &params, &owner);
             }
             if (200..300).contains(&resp.status) {
+                if method == "PUT" && resp.status == 202 {
+                    return bucket_put_accepted_error_async(
+                        &cred,
+                        bucket.as_deref().unwrap(),
+                        &next,
+                    )
+                    .await;
+                }
                 return translate_bucket_success(&method, resp, bucket.as_deref());
             }
             return map_swift_error(resp.status, bucket.as_deref(), None);
@@ -5462,6 +5508,9 @@ impl S3Api {
                 return translate_list_objects(&body, b, &params, &owner);
             }
             if (200..300).contains(&resp.status) {
+                if method == "PUT" && resp.status == 202 {
+                    return bucket_put_accepted_error(&cred, bucket.as_deref().unwrap(), next);
+                }
                 return translate_bucket_success(&method, resp, bucket.as_deref());
             }
             return map_swift_error(resp.status, bucket.as_deref(), None);
