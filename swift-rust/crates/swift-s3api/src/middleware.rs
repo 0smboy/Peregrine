@@ -9783,23 +9783,29 @@ async fn delete_archived_version_copy_async(
 ) -> Result<(), Response> {
     let vc = versions_container(bucket);
     let aname = archive_name_checked(key, version_id)?;
-    let mut del = make_swift_req(
-        "DELETE",
-        &s3_to_swift_path(&cred.account, Some(&vc), Some(&aname)),
-    );
-    stamp_auth(&mut del, cred);
-    let deleted = async_call(next, del).await;
-    if swift_write_applied(deleted.status) || deleted.status == 404 {
-        Ok(())
-    } else if deleted.status == 202 {
-        Err(s3_error_response(
-            "InternalError",
-            Some("backend write was not applied"),
-            &[],
-        ))
-    } else {
-        Err(map_swift_error(deleted.status, Some(&vc), Some(&aname)))
+    for _ in 0..8 {
+        let mut del = make_swift_req(
+            "DELETE",
+            &s3_to_swift_path(&cred.account, Some(&vc), Some(&aname)),
+        );
+        stamp_auth(&mut del, cred);
+        let deleted = async_call(next, del).await;
+        if !(swift_write_applied(deleted.status) || deleted.status == 404) {
+            if deleted.status == 202 {
+                return Err(s3_error_response(
+                    "InternalError",
+                    Some("backend write was not applied"),
+                    &[],
+                ));
+            }
+            return Err(map_swift_error(deleted.status, Some(&vc), Some(&aname)));
+        }
+        match control_head_object_async(cred, &vc, &aname, next).await? {
+            ObjectHead::Missing => return Ok(()),
+            ObjectHead::Present(_) => continue,
+        }
     }
+    Err(s3_error_response("InternalError", Some("lost update"), &[]))
 }
 
 fn delete_archived_version_copy(
@@ -10691,11 +10697,20 @@ async fn handle_versioned_delete_once_async(
                 _ => break,
             }
         }
+        // Last resort: current still is this vid after If-Match 412s.
+        // No If-Match — deleting the wrong generation of *this* vid is
+        // still correct; a newer current with a different SYS_VERSION_ID
+        // is left untouched.
         if let Ok(ObjectHead::Present(head)) =
             control_head_object_async(cred, bucket, key, next).await
         {
             if head.headers.get(SYS_VERSION_ID) == Some(vid) {
-                return s3_error_response("InternalError", Some("lost update"), &[]);
+                let mut del = make_swift_req("DELETE", &cur_path);
+                stamp_auth(&mut del, cred);
+                let resp = async_call(next, del).await;
+                if !swift_write_applied(resp.status) && resp.status != 404 {
+                    return backend_write_not_applied(resp.status, Some(bucket), Some(key));
+                }
             }
         }
 
@@ -11225,8 +11240,22 @@ async fn load_version_indexes_async(
                 .to_string();
             archives.push((vid, etag, size, lm));
         }
-        merge_archive_objects_into_index(&mut idx, &archives);
-        let mut live: HashSet<String> = archives.iter().map(|(vid, _, _, _)| vid.clone()).collect();
+        // Container listings lag object tombstones. A deleted archive still
+        // appears in +versions JSON until the updater; HEAD X-Newest is 404.
+        let mut live_archives: Vec<(String, String, i64, String)> = Vec::new();
+        for (vid, etag, size, lm) in archives {
+            let aname = archive_object_name(&key, &vid);
+            match control_head_object_async(cred, &vc, &aname, next).await {
+                Ok(ObjectHead::Present(_)) => live_archives.push((vid, etag, size, lm)),
+                Ok(ObjectHead::Missing) => {}
+                Err(_) => {}
+            }
+        }
+        merge_archive_objects_into_index(&mut idx, &live_archives);
+        let mut live: HashSet<String> = live_archives
+            .iter()
+            .map(|(vid, _, _, _)| vid.clone())
+            .collect();
         if let Ok(ObjectHead::Present(head)) =
             control_head_object_async(cred, bucket, &key, next).await
         {
