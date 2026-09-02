@@ -3112,6 +3112,24 @@ async fn bucket_put_accepted_error_async(
 
 /// Python `BucketAclHandler.PUT`: stamp ACL only after a 201. Capture the
 /// resolved policy before `strip_s3_only_headers` removes `x-amz-acl`.
+
+const CREATE_BUCKET_OBJECT_LOCK_XML: &[u8] = br#"<ObjectLockConfiguration>
+  <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+</ObjectLockConfiguration>"#;
+
+fn create_bucket_object_lock_enabled(headers: &HeaderKeyDict) -> bool {
+    headers
+        .get("x-amz-bucket-object-lock-enabled")
+        .or_else(|| headers.get("X-Amz-Bucket-Object-Lock-Enabled"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn create_bucket_acl_input(
     s3_acl: bool,
     headers: &HeaderKeyDict,
@@ -3157,6 +3175,7 @@ fn finish_create_bucket(
     put_resp: Response,
     acl_input: Option<AclPutInput>,
     s3_acl: bool,
+    enable_object_lock: bool,
     next: &NextFn,
 ) -> Response {
     if put_resp.status == 202 {
@@ -3165,6 +3184,18 @@ fn finish_create_bucket(
     if (200..300).contains(&put_resp.status) {
         if let Some(input) = acl_input.as_ref() {
             let post = post_create_bucket_acl(cred, bucket, input, s3_acl, next);
+            if !(200..300).contains(&post.status) {
+                return map_swift_error(post.status, Some(bucket), None);
+            }
+        }
+        if enable_object_lock {
+            let mut post =
+                make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
+            // PutObjectLockConfiguration enables versioning in the same POST.
+            apply_versioning_meta(&mut post.headers, "Enabled");
+            apply_object_lock_meta(&mut post.headers, CREATE_BUCKET_OBJECT_LOCK_XML);
+            stamp_auth(&mut post, cred);
+            let post = next(post);
             if !(200..300).contains(&post.status) {
                 return map_swift_error(post.status, Some(bucket), None);
             }
@@ -3180,6 +3211,7 @@ async fn finish_create_bucket_async(
     put_resp: Response,
     acl_input: Option<AclPutInput>,
     s3_acl: bool,
+    enable_object_lock: bool,
     next: &AsyncNextFn,
 ) -> Response {
     if put_resp.status == 202 {
@@ -3188,6 +3220,17 @@ async fn finish_create_bucket_async(
     if (200..300).contains(&put_resp.status) {
         if let Some(input) = acl_input.as_ref() {
             let post = post_create_bucket_acl_async(cred, bucket, input, s3_acl, next).await;
+            if !(200..300).contains(&post.status) {
+                return map_swift_error(post.status, Some(bucket), None);
+            }
+        }
+        if enable_object_lock {
+            let mut post =
+                make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
+            apply_versioning_meta(&mut post.headers, "Enabled");
+            apply_object_lock_meta(&mut post.headers, CREATE_BUCKET_OBJECT_LOCK_XML);
+            stamp_auth(&mut post, cred);
+            let post = async_call(next, post).await;
             if !(200..300).contains(&post.status) {
                 return map_swift_error(post.status, Some(bucket), None);
             }
@@ -4653,6 +4696,9 @@ impl S3Api {
         } else {
             None
         };
+        let create_bucket_lock = method == "PUT"
+            && key.is_none()
+            && create_bucket_object_lock_enabled(&swift_req.headers);
         if method == "PUT" && key.is_some() {
             if let Err(resp) =
                 stamp_resolved_put_acl(self.s3_acl, &mut swift_req.headers, &owner.id, true)
@@ -4747,6 +4793,7 @@ impl S3Api {
                         resp,
                         create_bucket_acl,
                         self.s3_acl,
+                        create_bucket_lock,
                         &next,
                     )
                     .await;
@@ -5446,6 +5493,9 @@ impl S3Api {
         } else {
             None
         };
+        let create_bucket_lock = method == "PUT"
+            && key.is_none()
+            && create_bucket_object_lock_enabled(&swift_req.headers);
         if method == "PUT" && key.is_some() {
             if let Err(resp) =
                 stamp_resolved_put_acl(self.s3_acl, &mut swift_req.headers, &owner.id, true)
@@ -5620,6 +5670,7 @@ impl S3Api {
                         resp,
                         create_bucket_acl,
                         self.s3_acl,
+                        create_bucket_lock,
                         next,
                     );
                 }

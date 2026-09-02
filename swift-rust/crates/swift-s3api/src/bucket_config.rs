@@ -321,8 +321,68 @@ pub fn validate_lifecycle_xml(body: &[u8]) -> Result<(), String> {
         if status != "Enabled" && status != "Disabled" {
             return Err("MalformedXML".into());
         }
+        // Python schema/lifecycle_configuration.rng: Date is xs:dateTime.
+        // Compact "20200101" / date-only "2023-09-27" must 400.
+        let mut rest_date = rule;
+        while let Some(ds) = rest_date.find("<Date") {
+            let after = &rest_date[ds..];
+            let Some(gt) = after.find('>') else {
+                return Err("MalformedXML".into());
+            };
+            let inner = &after[gt + 1..];
+            let Some(close) = inner.find("</Date>") else {
+                return Err("MalformedXML".into());
+            };
+            let date = inner[..close].trim();
+            if !is_xsd_datetime(date) {
+                return Err("MalformedXML".into());
+            }
+            rest_date = &inner[close + 7..];
+        }
     }
     Ok(())
+}
+
+/// XSD dateTime as used by Python lxml RelaxNG `data type="dateTime"`.
+fn is_xsd_datetime(raw: &str) -> bool {
+    let s = raw.trim();
+    let Some((date, time)) = s.split_once('T').or_else(|| s.split_once('t')) else {
+        return false;
+    };
+    let mut dparts = date.split('-');
+    let (Some(y), Some(m), Some(d), None) =
+        (dparts.next(), dparts.next(), dparts.next(), dparts.next())
+    else {
+        return false;
+    };
+    if y.len() < 4 || m.len() != 2 || d.len() != 2 {
+        return false;
+    }
+    if !y.bytes().all(|b| b.is_ascii_digit())
+        || !m.bytes().all(|b| b.is_ascii_digit())
+        || !d.bytes().all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    let clock = time
+        .strip_suffix('Z')
+        .or_else(|| time.strip_suffix('z'))
+        .unwrap_or(time);
+    let clock = match clock.rfind(['+', '-']) {
+        Some(i) if i > 0 => &clock[..i],
+        _ => clock,
+    };
+    let mut tparts = clock.split(':');
+    let (Some(hh), Some(mm), Some(ss), None) =
+        (tparts.next(), tparts.next(), tparts.next(), tparts.next())
+    else {
+        return false;
+    };
+    if hh.len() != 2 || mm.len() != 2 {
+        return false;
+    }
+    let sec = ss.split('.').next().unwrap_or(ss);
+    sec.len() >= 2 && sec.as_bytes()[..2].iter().all(|b| b.is_ascii_digit())
 }
 
 /// Store raw lifecycle XML (percent-encoded) on container sysmeta.
@@ -797,6 +857,12 @@ mod tests {
         assert!(validate_lifecycle_xml(bad).is_err());
         let lower = br#"<LifecycleConfiguration><Rule><Status>enabled</Status></Rule></LifecycleConfiguration>"#;
         assert!(validate_lifecycle_xml(lower).is_err());
+        let compact = br#"<LifecycleConfiguration><Rule><Status>Enabled</Status><Expiration><Date>20200101</Date></Expiration></Rule></LifecycleConfiguration>"#;
+        assert!(validate_lifecycle_xml(compact).is_err());
+        let date_only = br#"<LifecycleConfiguration><Rule><Status>Enabled</Status><Expiration><Date>2023-09-27</Date></Expiration></Rule></LifecycleConfiguration>"#;
+        assert!(validate_lifecycle_xml(date_only).is_err());
+        let ok_dt = br#"<LifecycleConfiguration><Rule><Status>Enabled</Status><Expiration><Date>2020-01-01T00:00:00Z</Date></Expiration></Rule></LifecycleConfiguration>"#;
+        assert!(validate_lifecycle_xml(ok_dt).is_ok());
         let mut h = HeaderKeyDict::new();
         apply_lifecycle_meta(&mut h, body);
         let got = lifecycle_xml_from_headers(&h).unwrap();

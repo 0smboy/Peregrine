@@ -3788,6 +3788,19 @@ impl ObjectServer {
                 resp.headers.set("ETag", format!("\"{etag}\""));
                 resp.headers.set("Last-Modified", http_date(x_ts.ceil()));
                 resp.headers.set("X-Timestamp", x_ts.normal());
+                // Python 416 keeps identifying headers so SLO/DLO can see
+                // X-Static-Large-Object and retry without Range.
+                for (k, v) in &metadata {
+                    if let (MetaValue::Str(key), MetaValue::Str(value)) = (k, v) {
+                        if is_sys_or_user_meta(key)
+                            || is_object_transient_sysmeta(key)
+                            || is_allowed_header(key)
+                            || key.eq_ignore_ascii_case("X-Delete-At")
+                        {
+                            resp.headers.set(key, value);
+                        }
+                    }
+                }
                 return resp;
             }
             Some(Some(ranges)) if ranges.len() == 1 => {

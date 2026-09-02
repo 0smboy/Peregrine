@@ -1622,7 +1622,15 @@ impl Slo {
             .get(SLO_HEADER)
             .map(config_true_value)
             .unwrap_or(false);
-        if first_is_slo && resp.status == 206 && orig.headers.get("Range").is_some() {
+        // Range against the physical JSON is unsatisfiable when the offset
+        // is past the manifest size (object-server 416, historically without
+        // the SLO header). Retry without Range so reassembly can apply the
+        // client Range to the assembled object. Ordinary non-SLO 206/416
+        // must stay as-is.
+        if first_is_slo
+            && orig.headers.get("Range").is_some()
+            && (resp.status == 206 || resp.status == 416)
+        {
             let mut retry = orig.clone_head();
             retry.headers.remove("Range");
             retry.headers.remove("range");
@@ -3639,7 +3647,8 @@ impl Middleware for Slo {
             || (req.method == "DELETE" && mpm.as_deref() == Some("delete"))
             || ((req.method == "GET" || req.method == "HEAD")
                 && (req.headers.contains_key("If-Match")
-                    || req.headers.contains_key("If-None-Match")))
+                    || req.headers.contains_key("If-None-Match")
+                    || req.headers.contains_key("Range")))
     }
 
     fn intercepts_response(&self) -> bool {
