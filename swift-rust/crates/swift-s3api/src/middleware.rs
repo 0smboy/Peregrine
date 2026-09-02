@@ -10873,27 +10873,56 @@ async fn handle_versioned_delete_once_async(
         // PUT) have no index row. CAS-remove would 500 "lost update" and
         // leave the object (the Ceph s3-tests nuke poison).
         if snap.index.find(vid).is_none() {
-            let mut del = make_swift_req("DELETE", &cur_path);
-            del.path = s3_to_swift_path(&cred.account, Some(&target.container), Some(&target.key));
-            stamp_object_write_precondition(&mut del.headers, Some(&target.head));
-            stamp_auth(&mut del, cred);
-            let retry = del.clone_head();
-            let resp = async_call(next, del).await;
-            let resp = if resp.status == 412 {
-                let mut retry = retry;
-                retry.query_string = "multipart-manifest=delete".into();
-                stamp_object_write_precondition(&mut retry.headers, Some(&target.head));
-                stamp_auth(&mut retry, cred);
-                async_call(next, retry).await
-            } else {
-                resp
-            };
-            if !swift_write_applied(resp.status) && resp.status != 404 {
-                return backend_write_not_applied(
-                    resp.status,
-                    Some(&target.container),
-                    Some(&target.key),
-                );
+            // Listed via archive merge after index persist lost the row.
+            // Deleting only whatever resolve() found leaves the other
+            // plane (usually the archive) for ListVersions to merge back.
+            if let Err(resp) =
+                delete_archived_version_copy_async(cred, bucket, key, vid, next).await
+            {
+                return resp;
+            }
+            for _ in 0..8 {
+                match control_head_object_async(cred, bucket, key, next).await {
+                    Ok(ObjectHead::Present(head))
+                        if head.headers.get(SYS_VERSION_ID) == Some(vid) =>
+                    {
+                        let mut del = make_swift_req("DELETE", &cur_path);
+                        stamp_object_write_precondition(&mut del.headers, Some(&head));
+                        stamp_auth(&mut del, cred);
+                        let resp = async_call(next, del).await;
+                        if swift_write_applied(resp.status) || resp.status == 404 {
+                            break;
+                        }
+                        if resp.status == 412 {
+                            continue;
+                        }
+                        return backend_write_not_applied(resp.status, Some(bucket), Some(key));
+                    }
+                    Ok(ObjectHead::Present(head))
+                        if target_is_current && head.headers.get(SYS_VERSION_ID).is_none() =>
+                    {
+                        let mut del = make_swift_req("DELETE", &cur_path);
+                        stamp_auth(&mut del, cred);
+                        let resp = async_call(next, del).await;
+                        if !swift_write_applied(resp.status) && resp.status != 404 {
+                            return backend_write_not_applied(resp.status, Some(bucket), Some(key));
+                        }
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            if let Ok(ObjectHead::Present(head)) =
+                control_head_object_async(cred, bucket, key, next).await
+            {
+                if head.headers.get(SYS_VERSION_ID) == Some(vid) {
+                    let mut del = make_swift_req("DELETE", &cur_path);
+                    stamp_auth(&mut del, cred);
+                    let resp = async_call(next, del).await;
+                    if !swift_write_applied(resp.status) && resp.status != 404 {
+                        return backend_write_not_applied(resp.status, Some(bucket), Some(key));
+                    }
+                }
             }
             let mut r = delete_object_response();
             r.headers.set(HDR_VERSION_ID, vid);
@@ -11129,27 +11158,22 @@ fn handle_versioned_delete_once(
         // PUT) have no index row. CAS-remove would 500 "lost update" and
         // leave the object (the Ceph s3-tests nuke poison).
         if snap.index.find(vid).is_none() {
-            let mut del = make_swift_req("DELETE", &cur_path);
-            del.path = s3_to_swift_path(&cred.account, Some(&target.container), Some(&target.key));
-            stamp_object_write_precondition(&mut del.headers, Some(&target.head));
-            stamp_auth(&mut del, cred);
-            let retry = del.clone_head();
-            let resp = next(del);
-            let resp = if resp.status == 412 {
-                let mut retry = retry;
-                retry.query_string = "multipart-manifest=delete".into();
-                stamp_object_write_precondition(&mut retry.headers, Some(&target.head));
-                stamp_auth(&mut retry, cred);
-                next(retry)
-            } else {
-                resp
-            };
-            if !swift_write_applied(resp.status) && resp.status != 404 {
-                return backend_write_not_applied(
-                    resp.status,
-                    Some(&target.container),
-                    Some(&target.key),
-                );
+            if let Err(resp) = delete_archived_version_copy(cred, bucket, key, vid, next) {
+                return resp;
+            }
+            let mut head = make_swift_req("HEAD", &cur_path);
+            stamp_auth(&mut head, cred);
+            let cur = next(head);
+            if (200..300).contains(&cur.status)
+                && (cur.headers.get(SYS_VERSION_ID) == Some(vid)
+                    || (target_is_current && cur.headers.get(SYS_VERSION_ID).is_none()))
+            {
+                let mut del = make_swift_req("DELETE", &cur_path);
+                stamp_auth(&mut del, cred);
+                let resp = next(del);
+                if !swift_write_applied(resp.status) && resp.status != 404 {
+                    return backend_write_not_applied(resp.status, Some(bucket), Some(key));
+                }
             }
             let mut r = delete_object_response();
             r.headers.set(HDR_VERSION_ID, vid);
