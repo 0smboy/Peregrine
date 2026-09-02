@@ -3086,10 +3086,7 @@ fn bucket_already_from_headers(cred: &S3Credential, headers: &HeaderKeyDict) -> 
 }
 
 fn bucket_put_accepted_error(cred: &S3Credential, bucket: &str, next: &NextFn) -> Response {
-    let mut head = make_swift_req(
-        "HEAD",
-        &s3_to_swift_path(&cred.account, Some(bucket), None),
-    );
+    let mut head = make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
     stamp_auth(&mut head, cred);
     let resp = next(head);
     bucket_already_from_headers(cred, &resp.headers)
@@ -3100,13 +3097,97 @@ async fn bucket_put_accepted_error_async(
     bucket: &str,
     next: &AsyncNextFn,
 ) -> Response {
-    let mut head = make_swift_req(
-        "HEAD",
-        &s3_to_swift_path(&cred.account, Some(bucket), None),
-    );
+    let mut head = make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
     stamp_auth(&mut head, cred);
     let resp = async_call(next, head).await;
     bucket_already_from_headers(cred, &resp.headers)
+}
+
+/// Python `BucketAclHandler.PUT`: stamp ACL only after a 201. Capture the
+/// resolved policy before `strip_s3_only_headers` removes `x-amz-acl`.
+fn create_bucket_acl_input(
+    s3_acl: bool,
+    headers: &HeaderKeyDict,
+    owner_id: &str,
+) -> Result<Option<AclPutInput>, Response> {
+    if !s3_acl {
+        return Ok(None);
+    }
+    resolve_acl_put_input(headers, None, owner_id)
+        .map(Some)
+        .map_err(|_| s3_error_response("InvalidArgument", None, &[]))
+}
+
+fn post_create_bucket_acl(
+    cred: &S3Credential,
+    bucket: &str,
+    input: &AclPutInput,
+    s3_acl: bool,
+    next: &NextFn,
+) -> Response {
+    let mut post = make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
+    apply_bucket_acl_put(&mut post.headers, input, &owner_for(cred).id, s3_acl);
+    stamp_auth(&mut post, cred);
+    next(post)
+}
+
+async fn post_create_bucket_acl_async(
+    cred: &S3Credential,
+    bucket: &str,
+    input: &AclPutInput,
+    s3_acl: bool,
+    next: &AsyncNextFn,
+) -> Response {
+    let mut post = make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
+    apply_bucket_acl_put(&mut post.headers, input, &owner_for(cred).id, s3_acl);
+    stamp_auth(&mut post, cred);
+    async_call(next, post).await
+}
+
+fn finish_create_bucket(
+    cred: &S3Credential,
+    bucket: &str,
+    put_resp: Response,
+    acl_input: Option<AclPutInput>,
+    s3_acl: bool,
+    next: &NextFn,
+) -> Response {
+    if put_resp.status == 202 {
+        return bucket_put_accepted_error(cred, bucket, next);
+    }
+    if (200..300).contains(&put_resp.status) {
+        if let Some(input) = acl_input.as_ref() {
+            let post = post_create_bucket_acl(cred, bucket, input, s3_acl, next);
+            if !(200..300).contains(&post.status) {
+                return map_swift_error(post.status, Some(bucket), None);
+            }
+        }
+        return translate_bucket_success("PUT", put_resp, Some(bucket));
+    }
+    map_swift_error(put_resp.status, Some(bucket), None)
+}
+
+async fn finish_create_bucket_async(
+    cred: &S3Credential,
+    bucket: &str,
+    put_resp: Response,
+    acl_input: Option<AclPutInput>,
+    s3_acl: bool,
+    next: &AsyncNextFn,
+) -> Response {
+    if put_resp.status == 202 {
+        return bucket_put_accepted_error_async(cred, bucket, next).await;
+    }
+    if (200..300).contains(&put_resp.status) {
+        if let Some(input) = acl_input.as_ref() {
+            let post = post_create_bucket_acl_async(cred, bucket, input, s3_acl, next).await;
+            if !(200..300).contains(&post.status) {
+                return map_swift_error(post.status, Some(bucket), None);
+            }
+        }
+        return translate_bucket_success("PUT", put_resp, Some(bucket));
+    }
+    map_swift_error(put_resp.status, Some(bucket), None)
 }
 
 fn translate_bucket_success(method: &str, resp: Response, bucket: Option<&str>) -> Response {
@@ -4555,13 +4636,20 @@ impl S3Api {
         if let Some(resp) = apply_copy_source(&mut swift_req) {
             return resp;
         }
-        if method == "PUT" {
-            if let Err(resp) = stamp_resolved_put_acl(
-                self.s3_acl,
-                &mut swift_req.headers,
-                &owner.id,
-                key.is_some(),
-            ) {
+        // Python BucketAclHandler.PUT: do not stamp ACL on the container PUT.
+        // A 202 must not overwrite the existing owner's policy.
+        let create_bucket_acl = if method == "PUT" && key.is_none() {
+            match create_bucket_acl_input(self.s3_acl, &swift_req.headers, &owner.id) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            }
+        } else {
+            None
+        };
+        if method == "PUT" && key.is_some() {
+            if let Err(resp) =
+                stamp_resolved_put_acl(self.s3_acl, &mut swift_req.headers, &owner.id, true)
+            {
                 return resp;
             }
         }
@@ -4645,10 +4733,13 @@ impl S3Api {
                 return translate_list_objects(&body, b, &params, &owner);
             }
             if (200..300).contains(&resp.status) {
-                if method == "PUT" && resp.status == 202 {
-                    return bucket_put_accepted_error_async(
+                if method == "PUT" {
+                    return finish_create_bucket_async(
                         &cred,
                         bucket.as_deref().unwrap(),
+                        resp,
+                        create_bucket_acl,
+                        self.s3_acl,
                         &next,
                     )
                     .await;
@@ -5338,13 +5429,20 @@ impl S3Api {
         }
         // ACL: canned x-amz-acl wins; else x-amz-grant-* (body empty on object PUT).
         // ACP XML body is handled on PUT ?acl via handle_acl.
-        if method == "PUT" {
-            if let Err(resp) = stamp_resolved_put_acl(
-                self.s3_acl,
-                &mut swift_req.headers,
-                &owner.id,
-                key.is_some(),
-            ) {
+        // CreateBucket: capture ACL, stamp it on POST after 201 (Python
+        // BucketAclHandler.PUT). Object PUT still stamps on the PUT.
+        let create_bucket_acl = if method == "PUT" && key.is_none() {
+            match create_bucket_acl_input(self.s3_acl, &swift_req.headers, &owner.id) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            }
+        } else {
+            None
+        };
+        if method == "PUT" && key.is_some() {
+            if let Err(resp) =
+                stamp_resolved_put_acl(self.s3_acl, &mut swift_req.headers, &owner.id, true)
+            {
                 return resp;
             }
         }
@@ -5508,8 +5606,15 @@ impl S3Api {
                 return translate_list_objects(&body, b, &params, &owner);
             }
             if (200..300).contains(&resp.status) {
-                if method == "PUT" && resp.status == 202 {
-                    return bucket_put_accepted_error(&cred, bucket.as_deref().unwrap(), next);
+                if method == "PUT" {
+                    return finish_create_bucket(
+                        &cred,
+                        bucket.as_deref().unwrap(),
+                        resp,
+                        create_bucket_acl,
+                        self.s3_acl,
+                        next,
+                    );
                 }
                 return translate_bucket_success(&method, resp, bucket.as_deref());
             }
@@ -10257,18 +10362,16 @@ fn handle_versioned_object(
             )
         }
         "PUT" => s3_error_response("InvalidArgument", None, &[]),
-        "GET" | "HEAD" => {
-            handle_versioned_get_head(
-                cred,
-                bucket,
-                key,
-                method,
-                version_id_q,
-                req.headers.get("Range"),
-                next,
-                api,
-            )
-        }
+        "GET" | "HEAD" => handle_versioned_get_head(
+            cred,
+            bucket,
+            key,
+            method,
+            version_id_q,
+            req.headers.get("Range"),
+            next,
+            api,
+        ),
         "DELETE" => handle_versioned_delete(
             cred,
             bucket,
@@ -16501,6 +16604,112 @@ mod tests {
         assert!(
             hops.iter().all(|(_, p)| p != "/v1/AUTH_test/newbucket/"),
             "object PUT path: {hops:?}"
+        );
+    }
+
+    #[test]
+    fn create_bucket_s3_acl_posts_acl_after_201() {
+        let api = S3Api::new(cred_map()).with_s3_acl(true);
+        let req = sign_request(base_s3_req("PUT", "/newbucket", ""), "testing");
+        let hops = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, bool)>::new()));
+        let hops_c = hops.clone();
+        let next: NextFn = Arc::new(move |r| {
+            let has_acl = r
+                .headers
+                .get(S3_BUCKET_ACL_JSON_META)
+                .is_some_and(|v| v.contains("test:tester"));
+            hops_c.lock().unwrap().push((r.method.clone(), has_acl));
+            match r.method.as_str() {
+                "PUT" => {
+                    assert!(
+                        r.headers.get(S3_BUCKET_ACL_JSON_META).is_none()
+                            || r.headers
+                                .get(S3_BUCKET_ACL_JSON_META)
+                                .is_some_and(|v| v.is_empty()),
+                        "CreateBucket PUT must not stamp ACL"
+                    );
+                    Response::new(201)
+                }
+                "POST" => {
+                    assert!(has_acl, "201 CreateBucket must POST ACL JSON");
+                    Response::new(204)
+                }
+                other => panic!("unexpected method {other}"),
+            }
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        let hops = hops.lock().unwrap().clone();
+        assert_eq!(
+            hops,
+            vec![("PUT".into(), false), ("POST".into(), true)],
+            "Python order is PUT then POST ACL: {hops:?}"
+        );
+    }
+
+    #[test]
+    fn create_bucket_s3_acl_202_other_user_is_already_exists() {
+        let api = S3Api::new(multi_cred_map()).with_s3_acl(true);
+        let req = sign_request(
+            base_s3_req_as("PUT", "/owned", "", "test:foreign"),
+            "foreign-secret",
+        );
+        let next: NextFn = Arc::new(|r| match r.method.as_str() {
+            "PUT" => {
+                assert!(
+                    r.headers.get(S3_BUCKET_ACL_JSON_META).is_none()
+                        || r.headers
+                            .get(S3_BUCKET_ACL_JSON_META)
+                            .is_some_and(|v| v.is_empty()),
+                    "202 CreateBucket must not overwrite ACL"
+                );
+                Response::new(202)
+            }
+            "HEAD" => {
+                let mut resp = Response::new(204);
+                resp.headers.set(
+                    S3_BUCKET_ACL_JSON_META,
+                    r#"{"Owner":"test:tester","Grant":[]}"#,
+                );
+                resp
+            }
+            other => panic!("unexpected method {other}"),
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 409);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(
+            body.contains("BucketAlreadyExists"),
+            "expected Exists for other key on same account, got {body}"
+        );
+        assert!(
+            !body.contains("BucketAlreadyOwnedByYou"),
+            "OwnedByYou is same-user only: {body}"
+        );
+    }
+
+    #[test]
+    fn create_bucket_s3_acl_202_same_user_is_owned_by_you() {
+        let api = S3Api::new(cred_map()).with_s3_acl(true);
+        let req = sign_request(base_s3_req("PUT", "/owned", ""), "testing");
+        let next: NextFn = Arc::new(|r| match r.method.as_str() {
+            "PUT" => Response::new(202),
+            "HEAD" => {
+                let mut resp = Response::new(204);
+                resp.headers.set(
+                    S3_BUCKET_ACL_JSON_META,
+                    r#"{"Owner":"test:tester","Grant":[]}"#,
+                );
+                resp
+            }
+            other => panic!("unexpected method {other}"),
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 409);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(
+            body.contains("BucketAlreadyOwnedByYou"),
+            "expected OwnedByYou for same user, got {body}"
         );
     }
 
