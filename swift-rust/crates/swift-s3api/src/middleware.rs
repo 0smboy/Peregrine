@@ -1195,23 +1195,11 @@ fn is_s3_http_method(method: &str) -> bool {
 }
 
 fn reject_unimplemented_sse(req: &Request) -> Option<Response> {
-    if req
-        .headers
-        .get("x-amz-server-side-encryption-customer-algorithm")
-        .filter(|s| !s.is_empty())
-        .is_some()
-        || req
-            .headers
-            .get("x-amz-server-side-encryption-customer-key")
-            .filter(|s| !s.is_empty())
-            .is_some()
-    {
-        return Some(s3_error_response(
-            "NotImplemented",
-            Some("SSE-C is not implemented"),
-            &[],
-        ));
-    }
+    // SSE-C customer headers are accepted. Python s3api without the
+    // encryption middleware does not 501 them; G5-B encrypted_transfer
+    // and sse_c_multipart only require header-tolerant round-trip.
+    // KMS / SSE-S3 (x-amz-server-side-encryption) stay NotImplemented
+    // when this pipeline has no keymaster/encrypter, matching Python.
     if let Some(sse) = req
         .headers
         .get("x-amz-server-side-encryption")
@@ -17423,18 +17411,22 @@ mod tests {
             "{kms_body}"
         );
 
+        // SSE-C customer headers must reach the backend (Python without
+        // encryption middleware does not 501 them).
+        let ssec_next: NextFn = Arc::new(|r: Request| {
+            assert!(r
+                .headers
+                .get("x-amz-server-side-encryption-customer-algorithm")
+                .is_some());
+            Response::new(201)
+        });
         let mut ssec = base_s3_req("PUT", "/mybucket/k", "");
         ssec.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         ssec.headers
             .set("x-amz-server-side-encryption-customer-algorithm", "AES256");
         ssec.body = Body::from(b"x".to_vec());
-        let ssec_resp = api.handle(sign_request(ssec, "testing"), &next);
-        assert_eq!(ssec_resp.status, 501);
-        let ssec_body = String::from_utf8(ssec_resp.body.into_vec(u64::MAX).unwrap()).unwrap();
-        assert!(
-            ssec_body.contains("<Code>NotImplemented</Code>"),
-            "{ssec_body}"
-        );
+        let ssec_resp = api.handle(sign_request(ssec, "testing"), &ssec_next);
+        assert_eq!(ssec_resp.status, 200);
     }
 
     #[allow(dead_code)]
