@@ -769,6 +769,9 @@ impl ContainerServer {
             let _ = swift_db::quarantine_db(db_file, "containers");
             return swob_response(404, None);
         }
+        if swift_db::is_lock_contention(e) {
+            return error_response(503, &e.to_string());
+        }
         error_response(500, &e.to_string())
     }
 
@@ -1883,7 +1886,7 @@ impl ContainerServer {
                 match broker.empty() {
                     Ok(false) => return swob_response(409, None),
                     Ok(true) => {}
-                    Err(e) => return error_response(500, &e.to_string()),
+                    Err(e) => return self.db_error_response(&e, broker.db_file()),
                 }
                 let put_ts_nonzero = broker
                     .get_info()
@@ -1898,7 +1901,7 @@ impl ContainerServer {
                     .unwrap_or(false);
                 let existed = put_ts_nonzero && !matches!(broker.is_deleted(), Ok(true));
                 if let Err(e) = broker.delete_db(&req_timestamp.internal()) {
-                    return error_response(500, &e.to_string());
+                    return self.db_error_response(&e, broker.db_file());
                 }
                 if !matches!(broker.is_deleted(), Ok(true)) {
                     return swob_response(409, None);

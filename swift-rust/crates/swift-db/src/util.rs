@@ -210,7 +210,14 @@ pub(crate) fn register_chexor(conn: &rusqlite::Connection) -> Result<(), DbError
 }
 
 /// `get_db_connection` pragmas for a normal (post-initialize) connection.
+///
+/// `busy_timeout(0)` disables SQLite's busy handler so `SQLITE_BUSY` /
+/// `SQLITE_LOCKED` returns immediately. Python's `GreenDBCursor` waits
+/// cooperatively up to `BROKER_TIMEOUT`; a Peregrine `DbExecutor` shard
+/// is a single blocking thread — waiting here pins every other DB that
+/// hashes to the same shard (G6 `test_locked_container_dbs`).
 pub(crate) fn configure_connection(conn: &rusqlite::Connection) -> Result<(), DbError> {
+    conn.busy_timeout(std::time::Duration::from_millis(0))?;
     conn.execute_batch(
         "PRAGMA synchronous = NORMAL;
          PRAGMA temp_store = MEMORY;
@@ -368,6 +375,23 @@ pub fn is_corruption_error(err: &DbError) -> bool {
     };
     let msg = e.to_string();
     msg.contains("malformed") || msg.contains("not a database")
+}
+
+/// True when the broker could not proceed because another connection
+/// holds the SQLite lock or the parent-directory flock timed out.
+/// HTTP handlers must answer 503 and release the `DbExecutor` shard.
+pub fn is_lock_contention(err: &DbError) -> bool {
+    match err {
+        DbError::LockTimeout(_) => true,
+        DbError::Sqlite(rusqlite::Error::SqliteFailure(e, msg)) => {
+            e.code == rusqlite::ErrorCode::DatabaseBusy
+                || e.code == rusqlite::ErrorCode::DatabaseLocked
+                || msg
+                    .as_deref()
+                    .is_some_and(|m| m.contains("database is locked") || m.contains("database is busy"))
+        }
+        _ => false,
+    }
 }
 
 /// Port of `DatabaseBroker.quarantine` + `get_device_path`
@@ -561,6 +585,50 @@ mod tests {
         assert!(!is_corruption_error(&other));
         let plain = DbError::Sqlite(rusqlite::Error::QueryReturnedNoRows);
         assert!(!is_corruption_error(&plain));
+        let busy = DbError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".to_string()),
+        ));
+        assert!(is_lock_contention(&busy));
+        assert!(!is_lock_contention(&plain));
+        assert!(is_lock_contention(&DbError::LockTimeout("/tmp/x".into())));
+    }
+
+    #[test]
+    fn test_busy_timeout_is_immediate() {
+        let dir = std::env::temp_dir().join(format!(
+            "peregrine-busy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (1);")
+                .unwrap();
+        }
+        let locker = rusqlite::Connection::open(&path).unwrap();
+        locker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let t0 = std::time::Instant::now();
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        let cfg = configure_connection(&reader);
+        let sel = reader.query_row("SELECT x FROM t", [], |r| r.get::<_, i64>(0));
+        let dt = t0.elapsed();
+        drop(locker);
+        let _ = std::fs::remove_dir_all(&dir);
+        match (cfg, sel) {
+            (Err(e), _) => assert!(is_lock_contention(&e), "{e}"),
+            (_, Err(e)) => assert!(is_lock_contention(&DbError::from(e)), "select err"),
+            (Ok(_), Ok(v)) => panic!("exclusive lock should surface SQLITE_BUSY, got {v:?}"),
+        }
+        assert!(
+            dt.as_millis() < 250,
+            "sqlite wait pinned the thread for {dt:?}"
+        );
     }
 
     #[test]
