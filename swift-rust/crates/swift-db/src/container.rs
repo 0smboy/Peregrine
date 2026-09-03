@@ -1182,23 +1182,32 @@ impl ContainerBroker {
         let state = self.get_db_state()?;
         match state {
             DbState::Sharding => {
+                let mut oc: i64 = 0;
+                let mut bu: i64 = 0;
                 if let Some(mut retiring) = self.retiring_broker() {
                     retiring.commit_pending()?;
-                    let (oc, bu) = {
-                        let conn = retiring.conn()?;
-                        let oc: i64 =
-                            conn.query_row("SELECT object_count FROM container_stat", [], |r| {
-                                r.get(0)
-                            })?;
-                        let bu: i64 =
-                            conn.query_row("SELECT bytes_used FROM container_stat", [], |r| {
-                                r.get(0)
-                            })?;
-                        (oc, bu)
-                    };
-                    set_info_i64(&mut out, "object_count", oc);
-                    set_info_i64(&mut out, "bytes_used", bu);
+                    let conn = retiring.conn()?;
+                    oc = conn.query_row("SELECT object_count FROM container_stat", [], |r| {
+                        r.get(0)
+                    })?;
+                    bu = conn.query_row("SELECT bytes_used FROM container_stat", [], |r| {
+                        r.get(0)
+                    })?;
                 }
+                // After the first cleaved ranges, retiring policy_stat can
+                // already be 0 while shard-range rows still hold live objects.
+                // HEAD must report that count so object-versioning DELETE
+                // returns 409 ("delete all versions") instead of 500.
+                if oc <= 0 {
+                    if let Ok((bytes, count)) = self.get_shard_usage() {
+                        if count > 0 {
+                            oc = count;
+                            bu = bytes;
+                        }
+                    }
+                }
+                set_info_i64(&mut out, "object_count", oc);
+                set_info_i64(&mut out, "bytes_used", bu);
             }
             DbState::Sharded if self.is_root_container()? => {
                 let (bytes, count) = self.get_shard_usage()?;

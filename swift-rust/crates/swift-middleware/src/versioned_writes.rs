@@ -1031,6 +1031,12 @@ impl VersionedWrites {
             }
             let del = Self::modern_internal_request("DELETE", hidden_path, "", &headers);
             let dresp = next(del).await;
+            if dresp.status == 409 {
+                let mut resp =
+                    Response::error(409, "Delete all versions before deleting container.");
+                resp.headers.set("Content-Type", "text/plain");
+                return Err(resp);
+            }
             if !(200..300).contains(&dresp.status) && dresp.status != 404 {
                 return Err(Response::error(500, "Error deleting versioned container"));
             }
