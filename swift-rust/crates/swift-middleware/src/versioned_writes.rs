@@ -2376,11 +2376,19 @@ impl VersionedWrites {
             );
         }
 
-        // Do not resurrect a deleted primary container from an orphan hidden
-        // versions container. Python deletes the hidden container as part of
-        // user-container DELETE; leftover hidden rows must not reappear as
-        // public account listing names (test_account_list_containers).
-        let _orphans = hidden_by_primary;
+        // Python AccountContext.list_containers: leftover hidden versions
+        // containers after a direct-deleted primary are surfaced under the
+        // user container name with count=0 so clients can see the orphan
+        // storage (probe test_account_listing). Names already merged into a
+        // live primary were popped above. Client DELETE of the user
+        // container still removes the hidden container.
+        for (key, mut item) in hidden_by_primary {
+            if let Some(map) = item.as_object_mut() {
+                map.insert("name".to_string(), serde_json::Value::String(key));
+                map.insert("count".to_string(), serde_json::json!(0));
+            }
+            visible.push(item);
+        }
 
         visible.sort_by(|left, right| {
             left.get("name")
@@ -5594,6 +5602,63 @@ mod tests {
         assert_eq!(listing[0]["name"], "c");
         assert_eq!(listing[0]["count"], 1);
         assert_eq!(listing[0]["bytes"], 11);
+    }
+
+    #[tokio::test]
+    async fn test_modern_account_listing_surfaces_orphan_hidden_container() {
+        // Python test_list_orphan_hidden_containers / probe
+        // test_account_listing: a hidden versions container with no live
+        // primary is rewritten to the user name with count=0.
+        let primary_body = serde_json::to_vec(&Vec::<serde_json::Value>::new()).unwrap();
+        let hidden_body = serde_json::to_vec(&vec![serde_json::json!({
+            "name": modern_versions_container("container1"),
+            "count": 3,
+            "bytes": 16,
+            "last_modified": "2026-09-04T00:00:00.000000"
+        })])
+        .unwrap();
+
+        let call_count = Arc::new(AtomicU64::new(0));
+        let call_count2 = Arc::clone(&call_count);
+        let next: AsyncNextFn = Arc::new(move |req: Request| {
+            let call_count = Arc::clone(&call_count2);
+            let primary_body = primary_body.clone();
+            let hidden_body = hidden_body.clone();
+            Box::pin(async move {
+                match call_count.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        let mut resp = Response::with_body(200, primary_body);
+                        resp.headers.set("X-Account-Container-Count", "1");
+                        resp.headers.set("X-Account-Object-Count", "3");
+                        resp.headers.set("X-Account-Bytes-Used", "16");
+                        resp
+                    }
+                    1 => {
+                        assert_eq!(
+                            req.headers.get("X-Backend-Allow-Reserved-Names"),
+                            Some("true")
+                        );
+                        Response::with_body(200, hidden_body)
+                    }
+                    n => panic!("unexpected account-listing subrequest {n}"),
+                }
+            })
+        });
+
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let mut request = req("GET", "/v1/AUTH_test");
+        request.body = Body::empty();
+        let mut resp = vw.reassemble_async(request, next).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("X-Account-Container-Count"), Some("1"));
+        assert_eq!(resp.headers.get("X-Account-Object-Count"), Some("3"));
+        assert_eq!(resp.headers.get("X-Account-Bytes-Used"), Some("16"));
+        let body = resp.body.materialize(MAX_CONTROL_BODY).unwrap();
+        let listing: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listing.len(), 1, "{listing:?}");
+        assert_eq!(listing[0]["name"], "container1");
+        assert_eq!(listing[0]["count"], 0);
+        assert_eq!(listing[0]["bytes"], 16);
     }
 
     #[test]
