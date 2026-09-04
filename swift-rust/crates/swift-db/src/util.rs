@@ -211,13 +211,60 @@ pub(crate) fn register_chexor(conn: &rusqlite::Connection) -> Result<(), DbError
 
 /// `get_db_connection` pragmas for a normal (post-initialize) connection.
 ///
-/// `busy_timeout(0)` disables SQLite's busy handler so `SQLITE_BUSY` /
-/// `SQLITE_LOCKED` returns immediately. Python's `GreenDBCursor` waits
-/// cooperatively up to `BROKER_TIMEOUT`; a Peregrine `DbExecutor` shard
-/// is a single blocking thread — waiting here pins every other DB that
-/// hashes to the same shard (G6 `test_locked_container_dbs`).
+/// HTTP servers use `busy_timeout(0)` so `SQLITE_BUSY` / `SQLITE_LOCKED`
+/// returns immediately. Python's `GreenDBCursor` waits cooperatively up to
+/// `BROKER_TIMEOUT`; a Peregrine `DbExecutor` shard is a single blocking
+/// thread, so waiting there pins every other DB that hashes to the same shard
+/// (G6 `test_locked_container_dbs`). Standalone maintenance daemons do not
+/// own an HTTP executor shard and retain a bounded 25-second wait.
+fn sqlite_busy_timeout_ms_for(program_name: &str, override_value: Option<&str>) -> u64 {
+    if let Some(value) = override_value {
+        match value.parse::<u64>() {
+            Ok(timeout_ms) => return timeout_ms,
+            Err(error) => {
+                eprintln!("swift-db: ignoring invalid PEREGRINE_SQLITE_BUSY_MS={value:?}: {error}")
+            }
+        }
+    }
+
+    let name = Path::new(program_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let daemon = [
+        "-replicator",
+        "-sharder",
+        "-updater",
+        "-reaper",
+        "-auditor",
+        "-reconciler",
+        "-reconstructor",
+    ]
+    .iter()
+    .any(|suffix| name.ends_with(suffix))
+        || matches!(name, "swift-manage-shard-ranges" | "swift-container-sync");
+    if daemon {
+        25_000
+    } else {
+        // HTTP servers: fail-fast so SQLITE_BUSY cannot pin a DbExecutor shard
+        // (G6 test_locked_container_dbs). Daemons above wait 25s like Python
+        // BROKER_TIMEOUT.
+        0
+    }
+}
+
+fn sqlite_busy_timeout_ms() -> u64 {
+    let program_name = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name.to_owned()))
+        .and_then(|name| name.into_string().ok())
+        .unwrap_or_default();
+    let override_value = std::env::var("PEREGRINE_SQLITE_BUSY_MS").ok();
+    sqlite_busy_timeout_ms_for(&program_name, override_value.as_deref())
+}
+
 pub(crate) fn configure_connection(conn: &rusqlite::Connection) -> Result<(), DbError> {
-    conn.busy_timeout(std::time::Duration::from_millis(0))?;
+    conn.busy_timeout(std::time::Duration::from_millis(sqlite_busy_timeout_ms()))?;
     conn.execute_batch(
         "PRAGMA synchronous = NORMAL;
          PRAGMA temp_store = MEMORY;
@@ -386,9 +433,9 @@ pub fn is_lock_contention(err: &DbError) -> bool {
         DbError::Sqlite(rusqlite::Error::SqliteFailure(e, msg)) => {
             e.code == rusqlite::ErrorCode::DatabaseBusy
                 || e.code == rusqlite::ErrorCode::DatabaseLocked
-                || msg
-                    .as_deref()
-                    .is_some_and(|m| m.contains("database is locked") || m.contains("database is busy"))
+                || msg.as_deref().is_some_and(|m| {
+                    m.contains("database is locked") || m.contains("database is busy")
+                })
         }
         _ => false,
     }
@@ -628,6 +675,39 @@ mod tests {
         assert!(
             dt.as_millis() < 250,
             "sqlite wait pinned the thread for {dt:?}"
+        );
+    }
+
+    #[test]
+    fn test_busy_timeout_policy_is_explicit_and_invalid_override_is_ignored() {
+        assert_eq!(
+            sqlite_busy_timeout_ms_for("swift-container-server", None),
+            0
+        );
+        assert_eq!(sqlite_busy_timeout_ms_for("swift-proxy-server", None), 0);
+        assert_eq!(
+            sqlite_busy_timeout_ms_for("/opt/bin/swift-container-sharder", None),
+            25_000
+        );
+        assert_eq!(
+            sqlite_busy_timeout_ms_for("swift-object-reconstructor", None),
+            25_000
+        );
+        assert_eq!(
+            sqlite_busy_timeout_ms_for("swift-manage-shard-ranges", None),
+            25_000
+        );
+        assert_eq!(
+            sqlite_busy_timeout_ms_for("swift-container-server", Some("321")),
+            321
+        );
+        assert_eq!(
+            sqlite_busy_timeout_ms_for("swift-container-sharder", Some("not-a-number")),
+            25_000
+        );
+        assert_eq!(
+            sqlite_busy_timeout_ms_for("swift-container-server", Some("not-a-number")),
+            0
         );
     }
 

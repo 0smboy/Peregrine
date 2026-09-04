@@ -60,11 +60,10 @@ fn main() {
     let interval: u64 = get("object-updater", "interval", "300")
         .parse()
         .unwrap_or(300);
-    // Python uses eventlet concurrency; default 10. Raise under L1b async mode
-    // so the pending backlog drains faster than it accumulates.
-    let concurrency: usize = get("object-updater", "concurrency", "10")
+    // Match Python swift.obj.updater.ObjectUpdater's default concurrency.
+    let concurrency: usize = get("object-updater", "concurrency", "8")
         .parse()
-        .unwrap_or(10)
+        .unwrap_or(8)
         .max(1);
     let tracker_max_entries: usize = get("object-updater", "async_tracker_max_entries", "100")
         .parse()

@@ -2596,6 +2596,56 @@ fn range_name_is_root(
     sr.name == this || sr.name == root
 }
 
+/// Retry one database operation after `complete_rsync` atomically replaced the
+/// broker's SQLite file while this process still held the old inode open.
+///
+/// This is deliberately narrower than a general SQLite retry: only
+/// `SQLITE_READONLY_DBMOVED` (extended code 1032, surfaced by
+/// [`swift_db::is_readonly_dbmoved`]) causes the cached connection to be
+/// dropped, and the operation is attempted at most one additional time.  The
+/// sharding pass is resumable through its persisted cleaving context, so this
+/// immediate retry is equivalent to the next daemon pass without hiding any
+/// other database or replication failure.
+fn retry_readonly_dbmoved_once<T>(
+    broker: &mut ContainerBroker,
+    mut operation: impl FnMut(&mut ContainerBroker) -> Result<T, DbError>,
+) -> Result<T, DbError> {
+    match operation(broker) {
+        Err(error) if swift_db::is_readonly_dbmoved(&error) => {
+            eprintln!("SHARDER_DBMOVED_RETRY broker={}", broker.path());
+            broker.reload_db_files();
+            operation(broker)
+        }
+        result => result,
+    }
+}
+
+/// Daemon entry point for one resumable sharding pass.  A concurrent
+/// `complete_rsync` may replace the broker DB between any two statements in
+/// the pass, so recovery belongs around the whole pass rather than around one
+/// particular write site.
+fn process_sharding_container_detailed_with_ring_recover_dbmoved(
+    broker: &mut ContainerBroker,
+    device: &Path,
+    hash_config: &HashPathConfig,
+    part: &str,
+    cleave_batch_size: usize,
+    replicator: &mut dyn ShardReplicator,
+    ring: Option<&swift_ring::Ring>,
+) -> Result<ProcessShardingOutcome, DbError> {
+    retry_readonly_dbmoved_once(broker, |broker| {
+        process_sharding_container_detailed_with_ring(
+            broker,
+            device,
+            hash_config,
+            part,
+            cleave_batch_size,
+            replicator,
+            ring,
+        )
+    })
+}
+
 pub fn process_sharding_container_detailed_with_ring(
     broker: &mut ContainerBroker,
     device: &Path,
@@ -5238,7 +5288,7 @@ fn run_once_with_opts_replicator_ring_and_node(
                     continue;
                 }
                 stats.sharding += 1;
-                match process_sharding_container_detailed_with_ring(
+                match process_sharding_container_detailed_with_ring_recover_dbmoved(
                     &mut broker,
                     device,
                     hash_config,
@@ -5318,7 +5368,7 @@ fn run_once_with_opts_replicator_ring_and_node(
                     }
                     let _ = broker.set_sharding_state();
                     stats.sharding += 1;
-                    match process_sharding_container_detailed_with_ring(
+                    match process_sharding_container_detailed_with_ring_recover_dbmoved(
                         &mut broker,
                         device,
                         hash_config,
@@ -5334,13 +5384,20 @@ fn run_once_with_opts_replicator_ring_and_node(
                                 stats.finished += 1;
                             }
                         }
-                        Err(_) => stats.failures += 1,
+                        Err(e) => {
+                            eprintln!(
+                                "G6_PROCESS_ERR phase=unsharded-shard device={} part={} err={e:?}",
+                                device.display(),
+                                part
+                            );
+                            stats.failures += 1;
+                        }
                     }
                 } else {
                     match maybe_start_sharding(&mut broker, opts) {
                         Ok(true) => {
                             stats.sharding += 1;
-                            match process_sharding_container_detailed_with_ring(
+                            match process_sharding_container_detailed_with_ring_recover_dbmoved(
                                 &mut broker,
                                 device,
                                 hash_config,
@@ -5356,11 +5413,25 @@ fn run_once_with_opts_replicator_ring_and_node(
                                         stats.finished += 1;
                                     }
                                 }
-                                Err(_) => stats.failures += 1,
+                                Err(e) => {
+                                    eprintln!(
+                                        "G6_PROCESS_ERR phase=unsharded-root-cleave device={} part={} err={e:?}",
+                                        device.display(),
+                                        part
+                                    );
+                                    stats.failures += 1;
+                                }
                             }
                         }
                         Ok(false) => stats.skipped += 1,
-                        Err(_) => stats.failures += 1,
+                        Err(e) => {
+                            eprintln!(
+                                "G6_PROCESS_ERR phase=unsharded-root-start device={} part={} err={e:?}",
+                                device.display(),
+                                part
+                            );
+                            stats.failures += 1;
+                        }
                     }
                 }
             }
@@ -5378,7 +5449,7 @@ fn run_once_with_opts_replicator_ring_and_node(
                             o.state == shard_state::SHRINKING || o.state == shard_state::SHRUNK
                         });
                 if own_shrinking && !broker.is_root_container().unwrap_or(true) {
-                    match process_sharding_container_detailed_with_ring(
+                    match process_sharding_container_detailed_with_ring_recover_dbmoved(
                         &mut broker,
                         device,
                         hash_config,
@@ -5875,6 +5946,75 @@ mod tests {
             .unwrap();
         }
         b
+    }
+
+    #[test]
+    fn test_retry_readonly_dbmoved_once_reopens_replaced_database() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharder-dbmoved-{}-{}",
+            std::process::id(),
+            swift_core::timestamp::Timestamp::now().raw()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("hash.db");
+        let mut broker = ContainerBroker::new(&db, "AUTH_test", "c");
+        broker
+            .initialize("1751500001.00000", 0, "1751500001.00000", "id")
+            .unwrap();
+
+        // Hold a connection to the original inode, then model
+        // replicator.complete_rsync's atomic database replacement.
+        broker.get_info().unwrap();
+        let replacement = dir.join("hash.db.replaced");
+        std::fs::copy(&db, &replacement).unwrap();
+        std::fs::remove_file(&db).unwrap();
+        std::fs::rename(&replacement, &db).unwrap();
+
+        let mut attempts = 0;
+        retry_readonly_dbmoved_once(&mut broker, |broker| {
+            attempts += 1;
+            // Unlike merge_shard_ranges/update_metadata, merge_timestamps
+            // intentionally has no method-local DBMOVED recovery.  This
+            // verifies the sharder pass boundary owns the recovery.
+            broker.merge_timestamps("1751500001.00000", "1751500002.00000", "1751500000.00000")
+        })
+        .unwrap();
+        assert_eq!(attempts, 2, "DBMOVED must retry exactly once");
+
+        let put_timestamp = broker
+            .get_info()
+            .unwrap()
+            .into_iter()
+            .find(|(key, _)| key == "put_timestamp")
+            .and_then(|(_, value)| value.as_text());
+        assert_eq!(put_timestamp.as_deref(), Some("1751500002.00000"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_retry_readonly_dbmoved_once_does_not_retry_other_errors() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharder-no-general-retry-{}-{}",
+            std::process::id(),
+            swift_core::timestamp::Timestamp::now().raw()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("hash.db");
+        let mut broker = ContainerBroker::new(&db, "AUTH_test", "c");
+        broker
+            .initialize("1751500001.00000", 0, "1751500001.00000", "id")
+            .unwrap();
+
+        let mut attempts = 0;
+        let result = retry_readonly_dbmoved_once(&mut broker, |_| {
+            attempts += 1;
+            Err::<(), DbError>(DbError::Connection("sentinel".into()))
+        });
+        assert!(matches!(result, Err(DbError::Connection(ref e)) if e == "sentinel"));
+        assert_eq!(attempts, 1, "non-DBMOVED errors must not be retried");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
