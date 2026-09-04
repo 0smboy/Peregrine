@@ -639,10 +639,11 @@ async fn async_heartbeat_put_is_202_chunked() {
     let mut resp = Slo::new().handle_request_async(request, backend).await;
     assert_eq!(resp.status, 202);
     assert_eq!(resp.body.content_length(), None);
-    let bytes = resp.body.materialize(u64::MAX).unwrap();
+    let body = std::mem::replace(&mut resp.body, swift_http::Body::empty());
+    let bytes = body.collect_async().await.unwrap();
     assert!(bytes.starts_with(b" "), "{bytes:?}");
     assert!(bytes.windows(4).any(|w| w == b"\r\n\r\n"));
-    let text = String::from_utf8_lossy(bytes);
+    let text = String::from_utf8_lossy(&bytes);
     assert!(text.contains("201 Created"), "{text}");
     assert!(text.contains("Etag"), "{text}");
 }
@@ -741,7 +742,9 @@ async fn heartbeat_missing_segment_lists_404_error() {
     };
     let mut resp = Slo::new().handle_request_async(request, backend).await;
     assert_eq!(resp.status, 202);
-    let text = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap());
+    let body = std::mem::replace(&mut resp.body, swift_http::Body::empty());
+    let bytes = body.collect_async().await.unwrap();
+    let text = String::from_utf8_lossy(&bytes);
     assert!(text.contains("Response Status: 400 Bad Request"), "{text}");
     assert!(text.contains("Response Body: Bad Request"), "{text}");
     assert!(
@@ -779,7 +782,9 @@ async fn heartbeat_bad_etag_json_uses_webob_422_body() {
     };
     let mut resp = Slo::new().handle_request_async(request, backend).await;
     assert_eq!(resp.status, 202);
-    let text = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap());
+    let body = std::mem::replace(&mut resp.body, swift_http::Body::empty());
+    let bytes = body.collect_async().await.unwrap();
+    let text = String::from_utf8_lossy(&bytes);
     let json_start = text.find('{').expect(&text);
     let v: Value = serde_json::from_str(&text[json_start..]).unwrap();
     assert_eq!(v["Response Status"], "422 Unprocessable Entity");
