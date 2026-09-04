@@ -243,9 +243,14 @@ pub fn error_status_and_message(code: &str) -> (u16, &'static str) {
             400,
             "The XML you provided was not well-formed or did not validate against our published schema",
         ),
+        "MalformedACLError" => (
+            400,
+            "The XML you provided was not well-formed or did not validate against our published schema.",
+        ),
         "MalformedPolicy" => (400, "The bucket policy is malformed."),
         "MethodNotAllowed" => (405, "The specified method is not allowed against this resource."),
         "MissingContentLength" => (411, "You must provide the Content-Length HTTP header."),
+        "MissingSecurityHeader" => (400, "Your request was missing a required header."),
         "NoSuchBucket" => (404, "The specified bucket does not exist."),
         "NoSuchKey" => (404, "The specified key does not exist."),
         "NoSuchLifecycleConfiguration" => (
@@ -297,6 +302,7 @@ pub fn error_status_and_message(code: &str) -> (u16, &'static str) {
         ),
         "SlowDown" => (503, "Please reduce your request rate."),
         "TooManyBuckets" => (400, "You have attempted to create more buckets than allowed."),
+        "UnexpectedContent" => (400, "This request does not support content."),
         _ => (400, "Bad Request"),
     }
 }

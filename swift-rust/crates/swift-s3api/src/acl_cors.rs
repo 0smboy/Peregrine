@@ -66,6 +66,13 @@ use swift_http::{HeaderKeyDict, Response};
 
 const ALL_USERS: &str = "http://acs.amazonaws.com/groups/global/AllUsers";
 const AUTH_USERS: &str = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers";
+const LOG_DELIVERY: &str = "http://acs.amazonaws.com/groups/s3/LogDelivery";
+const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+const XML_XMLNS: &str = "http://www.w3.org/XML/1998/namespace";
+const XMLNS_XMLNS: &str = "http://www.w3.org/2000/xmlns/";
+
+/// Python Swift's `ACL.max_xml_length` compatibility bound.
+pub const MAX_ACP_XML_BODY: u64 = 200 * 1024;
 
 /// S3 ACL permissions accepted in grant headers / ACP XML.
 pub const ACL_PERMISSIONS: &[&str] = &["FULL_CONTROL", "READ", "WRITE", "READ_ACP", "WRITE_ACP"];
@@ -368,10 +375,6 @@ fn normalize_permission(raw: &str) -> Option<String> {
     }
 }
 
-fn first_tag_text(text: &str, tag: &str) -> Option<String> {
-    extract_tag_values(text, tag).into_iter().next()
-}
-
 fn grant_element(g: &Grant) -> Element {
     let grantee_el = match &g.grantee {
         Grantee::Id { id, display_name } => {
@@ -406,111 +409,562 @@ pub fn access_control_policy_xml(policy: &AccessControlPolicy) -> Vec<u8> {
     root.to_xml(true)
 }
 
-/// Parse AccessControlPolicy XML body into structured grants.
-/// lxml `XMLParser(resolve_entities=False)`: element `.text` is character
-/// data before an unresolved entity child. Named amp/lt/gt/quot/apos still
-/// decode. Unknown/external `&xxe;` is dropped, never expanded from disk.
-fn xml_text_no_ext_entities(raw: &str) -> String {
+#[derive(Debug)]
+enum AcpXmlText {
+    Escaped(String),
+    Literal(String),
+}
+
+#[derive(Debug)]
+struct AcpXmlAttr {
+    namespace: Option<String>,
+    local: String,
+    value: String,
+}
+
+#[derive(Debug)]
+struct AcpXmlNode {
+    local: String,
+    attrs: Vec<AcpXmlAttr>,
+    children: Vec<AcpXmlNode>,
+    text: Vec<AcpXmlText>,
+}
+
+#[derive(Debug)]
+struct AcpXmlPending {
+    prefix: String,
+    local: String,
+    attrs: Vec<(String, String, String)>,
+}
+
+#[derive(Debug)]
+struct AcpXmlFrame {
+    open_prefix: String,
+    open_local: String,
+    namespaces: std::collections::HashMap<String, String>,
+    node: AcpXmlNode,
+}
+
+fn acp_malformed<T>() -> Result<T, String> {
+    Err("MalformedACLError".into())
+}
+
+fn is_xml_char(value: u32) -> bool {
+    matches!(
+        value,
+        0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF
+    )
+}
+
+/// Decode built-in/numeric references without ever expanding a custom DTD
+/// entity. With `stop_at_unresolved`, this matches lxml's
+/// `XMLParser(resolve_entities=False)` leaf `.text`: content after the first
+/// unresolved entity child is not part of `.text`.
+fn decode_acp_escaped(
+    raw: &str,
+    declared_entities: &std::collections::HashSet<String>,
+    stop_at_unresolved: bool,
+) -> Result<(String, bool), String> {
     let mut out = String::new();
     let mut rest = raw;
-    while !rest.is_empty() {
-        match rest.find('&') {
-            None => {
-                out.push_str(rest);
-                break;
-            }
-            Some(amp) => {
-                out.push_str(&rest[..amp]);
-                rest = &rest[amp..];
-                let Some(semi) = rest.find(';') else {
-                    out.push_str(rest);
-                    break;
-                };
-                let name = &rest[1..semi];
-                match name {
-                    "amp" => out.push('&'),
-                    "lt" => out.push('<'),
-                    "gt" => out.push('>'),
-                    "quot" => out.push('"'),
-                    "apos" => out.push('\u{27}'),
-                    _ => {}
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let entity = &rest[amp + 1..];
+        let Some(semi) = entity.find(';') else {
+            return acp_malformed();
+        };
+        let name = &entity[..semi];
+        match name {
+            "amp" => out.push('&'),
+            "lt" => out.push('<'),
+            "gt" => out.push('>'),
+            "quot" => out.push('"'),
+            "apos" => out.push('\u{27}'),
+            _ if name.starts_with("#x") => {
+                let value = u32::from_str_radix(&name[2..], 16)
+                    .map_err(|_| "MalformedACLError".to_string())?;
+                if !is_xml_char(value) {
+                    return acp_malformed();
                 }
-                rest = &rest[semi + 1..];
+                out.push(char::from_u32(value).ok_or_else(|| "MalformedACLError".to_string())?);
+            }
+            _ if name.starts_with('#') => {
+                let value = name[1..]
+                    .parse::<u32>()
+                    .map_err(|_| "MalformedACLError".to_string())?;
+                if !is_xml_char(value) {
+                    return acp_malformed();
+                }
+                out.push(char::from_u32(value).ok_or_else(|| "MalformedACLError".to_string())?);
+            }
+            _ if declared_entities.contains(name) && stop_at_unresolved => {
+                return Ok((out, true));
+            }
+            _ => return acp_malformed(),
+        }
+        rest = &entity[semi + 1..];
+    }
+    out.push_str(rest);
+    Ok((out, false))
+}
+
+fn decode_acp_attribute(raw: &str) -> Result<String, String> {
+    decode_acp_escaped(raw, &std::collections::HashSet::new(), false).map(|(value, _)| value)
+}
+
+fn start_acp_frame(
+    pending: AcpXmlPending,
+    inherited: Option<&std::collections::HashMap<String, String>>,
+) -> Result<AcpXmlFrame, String> {
+    let mut namespaces = inherited.cloned().unwrap_or_default();
+    namespaces
+        .entry("xml".into())
+        .or_insert_with(|| XML_XMLNS.into());
+    let mut declarations = std::collections::HashSet::new();
+    for (prefix, local, raw_value) in &pending.attrs {
+        let declared = if prefix.is_empty() && local == "xmlns" {
+            Some("")
+        } else if prefix == "xmlns" {
+            Some(local.as_str())
+        } else {
+            None
+        };
+        let Some(declared) = declared else {
+            continue;
+        };
+        if !declarations.insert(declared.to_string()) || declared == "xmlns" {
+            return acp_malformed();
+        }
+        let value = decode_acp_attribute(raw_value)?;
+        if value == XMLNS_XMLNS
+            || (declared == "xml" && value != XML_XMLNS)
+            || (declared != "xml" && value == XML_XMLNS)
+            || (!declared.is_empty() && value.is_empty())
+        {
+            return acp_malformed();
+        }
+        namespaces.insert(declared.to_string(), value);
+    }
+
+    if !pending.prefix.is_empty()
+        && namespaces.get(&pending.prefix).map(String::as_str) != Some(S3_XMLNS)
+    {
+        return acp_malformed();
+    }
+
+    let mut attrs = Vec::new();
+    let mut resolved = std::collections::HashSet::new();
+    for (prefix, local, raw_value) in &pending.attrs {
+        if (prefix.is_empty() && local == "xmlns") || prefix == "xmlns" {
+            continue;
+        }
+        let namespace = if prefix.is_empty() {
+            None
+        } else {
+            Some(
+                namespaces
+                    .get(prefix)
+                    .cloned()
+                    .ok_or_else(|| "MalformedACLError".to_string())?,
+            )
+        };
+        if !resolved.insert((namespace.clone(), local.clone())) {
+            return acp_malformed();
+        }
+        attrs.push(AcpXmlAttr {
+            namespace,
+            local: local.clone(),
+            value: decode_acp_attribute(raw_value)?,
+        });
+    }
+
+    Ok(AcpXmlFrame {
+        open_prefix: pending.prefix,
+        open_local: pending.local.clone(),
+        namespaces,
+        node: AcpXmlNode {
+            local: pending.local,
+            attrs,
+            children: Vec::new(),
+            text: Vec::new(),
+        },
+    })
+}
+
+fn parse_acp_xml_tree(
+    text: &str,
+) -> Result<(AcpXmlNode, std::collections::HashSet<String>), String> {
+    use xmlparser::{ElementEnd, Token, Tokenizer};
+
+    let mut stack: Vec<AcpXmlFrame> = Vec::new();
+    let mut pending: Option<AcpXmlPending> = None;
+    let mut root: Option<AcpXmlNode> = None;
+    let mut declared_entities = std::collections::HashSet::new();
+    let mut entity_name_bytes = 0usize;
+    let mut dtd_open = false;
+    let mut dtd_seen = false;
+    let mut node_count = 0usize;
+
+    for token in Tokenizer::from(text) {
+        match token.map_err(|_| "MalformedACLError".to_string())? {
+            Token::ElementStart { prefix, local, .. } => {
+                if pending.is_some() || dtd_open || (root.is_some() && stack.is_empty()) {
+                    return acp_malformed();
+                }
+                pending = Some(AcpXmlPending {
+                    prefix: prefix.as_str().to_string(),
+                    local: local.as_str().to_string(),
+                    attrs: Vec::new(),
+                });
+            }
+            Token::Attribute {
+                prefix,
+                local,
+                value,
+                ..
+            } => {
+                let Some(start) = pending.as_mut() else {
+                    return acp_malformed();
+                };
+                start.attrs.push((
+                    prefix.as_str().to_string(),
+                    local.as_str().to_string(),
+                    value.as_str().to_string(),
+                ));
+                if start.attrs.len() > 64 {
+                    return acp_malformed();
+                }
+            }
+            Token::ElementEnd { end, .. } => match end {
+                ElementEnd::Open | ElementEnd::Empty => {
+                    let start = pending
+                        .take()
+                        .ok_or_else(|| "MalformedACLError".to_string())?;
+                    let inherited = stack.last().map(|frame| &frame.namespaces);
+                    let frame = start_acp_frame(start, inherited)?;
+                    node_count += 1;
+                    if node_count > 4096 || stack.len() >= 256 {
+                        return acp_malformed();
+                    }
+                    if matches!(end, ElementEnd::Open) {
+                        stack.push(frame);
+                    } else if let Some(parent) = stack.last_mut() {
+                        parent.node.children.push(frame.node);
+                    } else if root.replace(frame.node).is_some() {
+                        return acp_malformed();
+                    }
+                }
+                ElementEnd::Close(prefix, local) => {
+                    if pending.is_some() {
+                        return acp_malformed();
+                    }
+                    let Some(frame) = stack.pop() else {
+                        return acp_malformed();
+                    };
+                    if frame.open_prefix != prefix.as_str() || frame.open_local != local.as_str() {
+                        return acp_malformed();
+                    }
+                    if let Some(parent) = stack.last_mut() {
+                        parent.node.children.push(frame.node);
+                    } else if root.replace(frame.node).is_some() {
+                        return acp_malformed();
+                    }
+                }
+            },
+            Token::Text { text } => {
+                if pending.is_some() {
+                    return acp_malformed();
+                }
+                if let Some(frame) = stack.last_mut() {
+                    frame
+                        .node
+                        .text
+                        .push(AcpXmlText::Escaped(text.as_str().to_string()));
+                } else if !text.as_str().trim().is_empty() {
+                    return acp_malformed();
+                }
+            }
+            Token::Cdata { text, .. } => {
+                if pending.is_some() {
+                    return acp_malformed();
+                }
+                if let Some(frame) = stack.last_mut() {
+                    frame
+                        .node
+                        .text
+                        .push(AcpXmlText::Literal(text.as_str().to_string()));
+                } else if !text.as_str().trim().is_empty() {
+                    return acp_malformed();
+                }
+            }
+            Token::DtdStart { .. } => {
+                if dtd_seen || dtd_open || root.is_some() || pending.is_some() || !stack.is_empty()
+                {
+                    return acp_malformed();
+                }
+                dtd_seen = true;
+                dtd_open = true;
+            }
+            Token::EmptyDtd { .. } => {
+                if dtd_seen || root.is_some() || pending.is_some() || !stack.is_empty() {
+                    return acp_malformed();
+                }
+                dtd_seen = true;
+            }
+            Token::EntityDeclaration { name, .. } => {
+                if !dtd_open || declared_entities.len() >= 64 {
+                    return acp_malformed();
+                }
+                entity_name_bytes = entity_name_bytes.saturating_add(name.as_str().len());
+                if entity_name_bytes > 4096 || !declared_entities.insert(name.as_str().to_string())
+                {
+                    return acp_malformed();
+                }
+            }
+            Token::DtdEnd { .. } => {
+                if !dtd_open {
+                    return acp_malformed();
+                }
+                dtd_open = false;
+            }
+            Token::Declaration { .. } => {
+                if root.is_some() || pending.is_some() || !stack.is_empty() || dtd_seen {
+                    return acp_malformed();
+                }
+            }
+            Token::ProcessingInstruction { .. } | Token::Comment { .. } => {
+                if pending.is_some() {
+                    return acp_malformed();
+                }
             }
         }
     }
-    out
+
+    if pending.is_some() || !stack.is_empty() || dtd_open {
+        return acp_malformed();
+    }
+    Ok((
+        root.ok_or_else(|| "MalformedACLError".to_string())?,
+        declared_entities,
+    ))
 }
 
-pub fn parse_acp_xml(body: &[u8]) -> Result<AccessControlPolicy, String> {
-    let text = std::str::from_utf8(body).map_err(|_| "MalformedACLError".to_string())?;
-    if !text.contains("AccessControlPolicy") {
-        return Err("MalformedACLError".into());
+fn acp_element_has_only_whitespace(
+    node: &AcpXmlNode,
+    declared_entities: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    for segment in &node.text {
+        let value = match segment {
+            AcpXmlText::Escaped(raw) => decode_acp_escaped(raw, declared_entities, false)?.0,
+            AcpXmlText::Literal(raw) => raw.clone(),
+        };
+        if !value.trim().is_empty() {
+            return acp_malformed();
+        }
     }
-    // Owner block (best-effort; default empty then filled by caller if needed).
-    let owner_section = text
-        .find("<Owner>")
-        .and_then(|s| {
-            let rest = &text[s..];
-            rest.find("</Owner>")
-                .map(|e| rest[..e + "</Owner>".len()].to_string())
-        })
-        .unwrap_or_default();
-    let owner_id =
-        xml_text_no_ext_entities(&first_tag_text(&owner_section, "ID").unwrap_or_default());
-    let owner_display_name = first_tag_text(&owner_section, "DisplayName")
-        .map(|s| xml_text_no_ext_entities(&s))
-        .filter(|s| !s.is_empty());
+    Ok(())
+}
 
-    let mut grants = Vec::new();
-    let mut rest = text;
-    let open = "<Grant>";
-    let close = "</Grant>";
-    while let Some(s) = rest.find(open) {
-        let start = s + open.len();
-        let Some(end_rel) = rest[start..].find(close) else {
-            break;
-        };
-        let grant_body = &rest[start..start + end_rel];
-        rest = &rest[start + end_rel + close.len()..];
+fn acp_leaf_text(
+    node: &AcpXmlNode,
+    declared_entities: &std::collections::HashSet<String>,
+) -> Result<String, String> {
+    if !node.attrs.is_empty() || !node.children.is_empty() {
+        return acp_malformed();
+    }
+    let mut out = String::new();
+    for segment in &node.text {
+        match segment {
+            AcpXmlText::Escaped(raw) => {
+                let (value, stopped) = decode_acp_escaped(raw, declared_entities, true)?;
+                out.push_str(&value);
+                if stopped {
+                    break;
+                }
+            }
+            AcpXmlText::Literal(raw) => out.push_str(raw),
+        }
+    }
+    Ok(out)
+}
 
-        let Some(perm_raw) = first_tag_text(grant_body, "Permission") else {
-            continue;
-        };
-        let Some(permission) = normalize_permission(&perm_raw) else {
-            return Err("MalformedACLError".into());
-        };
+fn acp_children<'a>(node: &'a AcpXmlNode, name: &str) -> Vec<&'a AcpXmlNode> {
+    node.children
+        .iter()
+        .filter(|child| child.local == name)
+        .collect()
+}
 
-        let grantee = if let Some(id_raw) = first_tag_text(grant_body, "ID") {
-            let id = xml_text_no_ext_entities(&id_raw);
-            // Python `encode_acl` stores only the user id string; GET ACP
-            // DisplayName is that id. Keeping the XML DisplayName (`name`
-            // before `&xxe;`) fails official test_put_bucket_acl XXE.
-            Grantee::Id {
+fn acp_owner(
+    node: &AcpXmlNode,
+    declared_entities: &std::collections::HashSet<String>,
+) -> Result<(String, Option<String>), String> {
+    if !node.attrs.is_empty()
+        || node
+            .children
+            .iter()
+            .any(|child| !matches!(child.local.as_str(), "ID" | "DisplayName"))
+    {
+        return acp_malformed();
+    }
+    acp_element_has_only_whitespace(node, declared_entities)?;
+    let ids = acp_children(node, "ID");
+    let names = acp_children(node, "DisplayName");
+    if ids.len() != 1 || names.len() > 1 {
+        return acp_malformed();
+    }
+    let id = acp_leaf_text(ids[0], declared_entities)?;
+    let display_name = names
+        .first()
+        .map(|name| acp_leaf_text(name, declared_entities))
+        .transpose()?;
+    Ok((id, display_name))
+}
+
+fn acp_grantee(
+    node: &AcpXmlNode,
+    declared_entities: &std::collections::HashSet<String>,
+) -> Result<Grantee, String> {
+    if node.attrs.len() != 1 {
+        return acp_malformed();
+    }
+    let kind = &node.attrs[0];
+    if kind.namespace.as_deref() != Some(XMLNS_XSI) || kind.local != "type" {
+        return acp_malformed();
+    }
+    acp_element_has_only_whitespace(node, declared_entities)?;
+    match kind.value.as_str() {
+        "CanonicalUser" => {
+            if node
+                .children
+                .iter()
+                .any(|child| !matches!(child.local.as_str(), "ID" | "DisplayName"))
+            {
+                return acp_malformed();
+            }
+            let ids = acp_children(node, "ID");
+            let names = acp_children(node, "DisplayName");
+            if ids.len() != 1 || names.len() > 1 {
+                return acp_malformed();
+            }
+            let id = acp_leaf_text(ids[0], declared_entities)?;
+            if let Some(name) = names.first() {
+                let _ = acp_leaf_text(name, declared_entities)?;
+            }
+            // Python's stored ACL encoding uses the canonical id for the
+            // display name, including the official unresolved-XXE case.
+            Ok(Grantee::Id {
                 display_name: Some(id.clone()),
                 id,
+            })
+        }
+        "Group" => {
+            if node.children.iter().any(|child| child.local != "URI") {
+                return acp_malformed();
             }
-        } else if let Some(uri) = first_tag_text(grant_body, "URI") {
-            Grantee::Uri {
-                uri: xml_text_no_ext_entities(&uri),
+            let uris = acp_children(node, "URI");
+            if uris.len() != 1 {
+                return acp_malformed();
             }
-        } else if let Some(email) = first_tag_text(grant_body, "EmailAddress") {
-            Grantee::Email {
-                email: xml_text_no_ext_entities(&email),
+            Ok(Grantee::Uri {
+                uri: acp_leaf_text(uris[0], declared_entities)?,
+            })
+        }
+        "AmazonCustomerByEmail" => {
+            if node
+                .children
+                .iter()
+                .any(|child| child.local != "EmailAddress")
+            {
+                return acp_malformed();
             }
-        } else {
-            return Err("MalformedACLError".into());
-        };
-        grants.push(Grant {
-            grantee,
-            permission,
-        });
+            let emails = acp_children(node, "EmailAddress");
+            if emails.len() != 1 {
+                return acp_malformed();
+            }
+            Ok(Grantee::Email {
+                email: acp_leaf_text(emails[0], declared_entities)?,
+            })
+        }
+        _ => acp_malformed(),
     }
+}
+
+fn acp_grant(
+    node: &AcpXmlNode,
+    declared_entities: &std::collections::HashSet<String>,
+) -> Result<Grant, String> {
+    if !node.attrs.is_empty()
+        || node
+            .children
+            .iter()
+            .any(|child| !matches!(child.local.as_str(), "Grantee" | "Permission"))
+    {
+        return acp_malformed();
+    }
+    acp_element_has_only_whitespace(node, declared_entities)?;
+    let grantees = acp_children(node, "Grantee");
+    let permissions = acp_children(node, "Permission");
+    if grantees.len() != 1 || permissions.len() != 1 {
+        return acp_malformed();
+    }
+    let permission = acp_leaf_text(permissions[0], declared_entities)?;
+    if !ACL_PERMISSIONS.contains(&permission.as_str()) {
+        return acp_malformed();
+    }
+    Ok(Grant {
+        grantee: acp_grantee(grantees[0], declared_entities)?,
+        permission,
+    })
+}
+
+fn policy_from_acp_tree(
+    root: &AcpXmlNode,
+    declared_entities: &std::collections::HashSet<String>,
+) -> Result<AccessControlPolicy, String> {
+    if root.local != "AccessControlPolicy"
+        || !root.attrs.is_empty()
+        || root
+            .children
+            .iter()
+            .any(|child| !matches!(child.local.as_str(), "Owner" | "AccessControlList"))
+    {
+        return acp_malformed();
+    }
+    acp_element_has_only_whitespace(root, declared_entities)?;
+    let owners = acp_children(root, "Owner");
+    let lists = acp_children(root, "AccessControlList");
+    if owners.len() != 1 || lists.len() != 1 {
+        return acp_malformed();
+    }
+    let list = lists[0];
+    if !list.attrs.is_empty() || list.children.iter().any(|child| child.local != "Grant") {
+        return acp_malformed();
+    }
+    acp_element_has_only_whitespace(list, declared_entities)?;
+    let (owner_id, owner_display_name) = acp_owner(owners[0], declared_entities)?;
+    let grants = list
+        .children
+        .iter()
+        .map(|grant| acp_grant(grant, declared_entities))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(AccessControlPolicy {
         owner_id,
         owner_display_name,
         grants,
     })
+}
+
+/// Parse and validate an AccessControlPolicy against Python Swift's RelaxNG
+/// shape. The parser is namespace-aware and deliberately never resolves DTD
+/// entities or reads SYSTEM/PUBLIC resources.
+pub fn parse_acp_xml(body: &[u8]) -> Result<AccessControlPolicy, String> {
+    if body.len() as u64 > MAX_ACP_XML_BODY {
+        return Err("MalformedXML".into());
+    }
+    let text = std::str::from_utf8(body).map_err(|_| "MalformedACLError".to_string())?;
+    let (root, declared_entities) = parse_acp_xml_tree(text)?;
+    policy_from_acp_tree(&root, &declared_entities)
 }
 
 /// Parse one grantee token from grant-header list form:
@@ -790,12 +1244,12 @@ fn principal_matches(id: &str, principal_access_key: &str, principal_account: &s
 /// object content (GET/HEAD).
 ///
 /// # Return values
-/// * `None` — missing/empty JSON grants: **no enforcement** (keep canned/Swift
-///   path; do not invent denials).
+/// * `None` — missing/empty JSON metadata: **no enforcement** (migration path;
+///   do not invent denials).
 /// * `Some(true)` — principal is owner, or holds READ/FULL_CONTROL (Id grantee
 ///   match on access_key/account, or AllUsers/AuthenticatedUsers URI for
 ///   **authenticated** callers that reach this check).
-/// * `Some(false)` — non-empty grants present and principal is not authorized.
+/// * `Some(false)` — stored policy is invalid, or principal is not authorized.
 ///
 /// # Residuals
 /// * EmailAddress grantees are **not** resolved (never match).
@@ -806,16 +1260,7 @@ pub fn object_grants_allow_read(
     principal_access_key: &str,
     principal_account: &str,
 ) -> Option<bool> {
-    let raw = headers
-        .get(S3_OBJECT_ACL_JSON_META)
-        .or_else(|| headers.get("X-Object-Meta-S3-Acl-Json"))?;
-    if raw.is_empty() {
-        return None;
-    }
-    let policy = decode_acl_json(raw)?;
-    if policy.grants.is_empty() {
-        return None;
-    }
+    let policy = policy_from_object_headers(headers)?;
 
     // Owner always allowed.
     if principal_matches(&policy.owner_id, principal_access_key, principal_account) {
@@ -856,21 +1301,8 @@ pub fn object_grants_allow_read_with_iam(
     principal_account: &str,
     iam: Option<&crate::iam::IdentityDirectory>,
 ) -> Option<bool> {
-    let raw = headers
-        .get(S3_OBJECT_ACL_JSON_META)
-        .or_else(|| headers.get("X-Object-Meta-S3-Acl-Json"))?;
-    if raw.is_empty() {
-        return None;
-    }
-    let policy = decode_acl_json(raw)?;
-    if policy.grants.is_empty() {
-        return None;
-    }
-    let owner = if policy.owner_id.is_empty() {
-        principal_account
-    } else {
-        policy.owner_id.as_str()
-    };
+    let policy = policy_from_object_headers(headers)?;
+    let owner = policy.owner_id.as_str();
     if principal_matches(owner, principal_access_key, principal_account) {
         return Some(true);
     }
@@ -936,21 +1368,8 @@ pub fn object_grants_allow_write_with_iam(
     principal_account: &str,
     iam: Option<&crate::iam::IdentityDirectory>,
 ) -> Option<bool> {
-    let raw = headers
-        .get(S3_OBJECT_ACL_JSON_META)
-        .or_else(|| headers.get("X-Object-Meta-S3-Acl-Json"))?;
-    if raw.is_empty() {
-        return None;
-    }
-    let policy = decode_acl_json(raw)?;
-    if policy.grants.is_empty() {
-        return None;
-    }
-    let owner = if policy.owner_id.is_empty() {
-        principal_account
-    } else {
-        policy.owner_id.as_str()
-    };
+    let policy = policy_from_object_headers(headers)?;
+    let owner = policy.owner_id.as_str();
     if principal_matches(owner, principal_access_key, principal_account) {
         return Some(true);
     }
@@ -995,10 +1414,11 @@ pub fn object_grants_allow_write_with_iam(
     Some(false)
 }
 
-/// True when object JSON ACL is present with non-empty grants and the
-/// principal is **denied** object READ (GET/HEAD → AccessDenied).
+/// True when object JSON ACL is present and the principal is **denied** object
+/// READ (GET/HEAD → AccessDenied).
 ///
-/// Missing/empty grants → `false` (no new denial).
+/// Missing metadata → `false` (migration path). Invalid metadata and a valid
+/// owner-only policy both fail closed for non-owners.
 pub fn object_acl_denies_read(
     headers: &HeaderKeyDict,
     principal_access_key: &str,
@@ -1026,11 +1446,14 @@ fn policy_from_bucket_headers(headers: &HeaderKeyDict) -> Option<AccessControlPo
     if raw.is_empty() {
         return None;
     }
-    let policy = decode_acl_json(raw)?;
-    if policy.grants.is_empty() {
-        return None;
+    match decode_acl_json(raw) {
+        Some(policy) if !policy.owner_id.is_empty() => Some(policy),
+        _ => Some(AccessControlPolicy {
+            owner_id: String::new(),
+            owner_display_name: None,
+            grants: Vec::new(),
+        }),
     }
-    Some(policy)
 }
 
 /// Bucket READ (ListObjects / HEAD bucket) from stored JSON grants.
@@ -1208,53 +1631,147 @@ pub fn bucket_acl_denies_read_acp(
     )
 }
 
-/// Resolved ACL input for PUT object/bucket (canned takes precedence).
+fn policy_from_object_headers(headers: &HeaderKeyDict) -> Option<AccessControlPolicy> {
+    let raw = headers
+        .get(S3_OBJECT_ACL_JSON_META)
+        .or_else(|| headers.get("X-Object-Meta-S3-Acl-Json"))?;
+    if raw.is_empty() {
+        return None;
+    }
+    match decode_acl_json(raw) {
+        Some(policy) if !policy.owner_id.is_empty() => Some(policy),
+        _ => Some(AccessControlPolicy {
+            owner_id: String::new(),
+            owner_display_name: None,
+            grants: Vec::new(),
+        }),
+    }
+}
+
+fn policy_allows_acp(
+    policy: &AccessControlPolicy,
+    principal_access_key: &str,
+    principal_account: &str,
+    permission_allows: fn(&str) -> bool,
+) -> bool {
+    if principal_matches(&policy.owner_id, principal_access_key, principal_account) {
+        return true;
+    }
+    policy.grants.iter().any(|grant| {
+        if !permission_allows(&grant.permission) {
+            return false;
+        }
+        match &grant.grantee {
+            Grantee::Id { id, .. } => {
+                principal_matches(id, principal_access_key, principal_account)
+            }
+            Grantee::Uri { uri } => uri == ALL_USERS || uri == AUTH_USERS,
+            Grantee::Email { .. } => false,
+        }
+    })
+}
+
+/// Object GET/HEAD `?acl` requires READ_ACP / FULL_CONTROL / owner.
+pub fn object_acl_denies_read_acp(
+    headers: &HeaderKeyDict,
+    principal_access_key: &str,
+    principal_account: &str,
+) -> bool {
+    matches!(
+        policy_from_object_headers(headers).map(|policy| policy_allows_acp(
+            &policy,
+            principal_access_key,
+            principal_account,
+            permission_allows_read_acp,
+        )),
+        Some(false)
+    )
+}
+
+/// Object PUT `?acl` requires WRITE_ACP / FULL_CONTROL / owner.
+pub fn object_acl_denies_write_acp(
+    headers: &HeaderKeyDict,
+    principal_access_key: &str,
+    principal_account: &str,
+) -> bool {
+    matches!(
+        policy_from_object_headers(headers).map(|policy| policy_allows_acp(
+            &policy,
+            principal_access_key,
+            principal_account,
+            permission_allows_write_acp,
+        )),
+        Some(false)
+    )
+}
+
+/// Resolved ACL input for PUT object/bucket.
 #[derive(Debug, Clone)]
 pub enum AclPutInput {
-    /// `x-amz-acl` canned name (wins over grants / body).
+    /// `x-amz-acl` canned name.
     Canned(String),
     /// Structured policy from grant headers and/or ACP body.
     Policy(AccessControlPolicy),
-    /// No ACL material; caller may default to private for `?acl` PUT.
+    /// No ACL material. Strict `?acl` PUT callers return MissingSecurityHeader.
     None,
 }
 
-/// Resolve ACL PUT input with AWS-like precedence: canned first, then grants,
-/// then ACP XML body.
+fn validate_acl_business_grants(grants: &[Grant]) -> Result<(), String> {
+    for grant in grants {
+        match &grant.grantee {
+            Grantee::Uri { uri }
+                if !matches!(uri.as_str(), ALL_USERS | AUTH_USERS | LOG_DELIVERY) =>
+            {
+                return Err("InvalidArgument".into());
+            }
+            Grantee::Email { .. } => return Err("NotImplemented".into()),
+            Grantee::Id { .. } | Grantee::Uri { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+/// Resolve ACL PUT input using Python Swift's exclusivity rules.
 pub fn resolve_acl_put_input(
     headers: &HeaderKeyDict,
     body: Option<&[u8]>,
     default_owner_id: &str,
 ) -> Result<AclPutInput, String> {
+    if body.is_some_and(|value| value.len() as u64 > MAX_ACP_XML_BODY) {
+        return Err("MalformedXML".into());
+    }
+    let has_grants = has_grant_headers(headers);
+    let body_nonempty = body.is_some_and(|value| !value.is_empty());
+
     if let Some(canned) = headers.get("X-Amz-Acl") {
-        // Canned wins even if grant headers / body present.
+        if has_grants {
+            return Err("InvalidRequest".into());
+        }
         if !is_known_canned_acl(canned) {
             return Err("InvalidArgument".into());
+        }
+        if body_nonempty {
+            return Err("UnexpectedContent".into());
         }
         return Ok(AclPutInput::Canned(canned.to_string()));
     }
 
     let mut grants = Vec::new();
-    if has_grant_headers(headers) {
+    if has_grants {
         grants.extend(parse_grant_headers(headers)?);
     }
 
-    let body_nonempty = body.is_some_and(|b| {
-        let t = std::str::from_utf8(b).unwrap_or("").trim();
-        !t.is_empty()
-    });
     if body_nonempty {
-        let mut policy = parse_acp_xml(body.unwrap())?;
-        if policy.owner_id.is_empty() {
-            policy.owner_id = default_owner_id.to_string();
+        if has_grants {
+            return Err("UnexpectedContent".into());
         }
-        // Merge grant-header grants into body policy (headers already forbid
-        // canned+grants; body+grants is unusual — append header grants).
-        policy.grants.extend(grants);
+        let policy = parse_acp_xml(body.unwrap())?;
+        validate_acl_business_grants(&policy.grants)?;
         return Ok(AclPutInput::Policy(policy));
     }
 
     if !grants.is_empty() {
+        validate_acl_business_grants(&grants)?;
         return Ok(AclPutInput::Policy(AccessControlPolicy {
             owner_id: default_owner_id.to_string(),
             owner_display_name: Some(default_owner_id.to_string()),
@@ -2005,27 +2522,27 @@ mod tests {
     #[test]
     fn acp_xml_roundtrip_structured_grants() {
         let body = br#"<?xml version="1.0" encoding="UTF-8"?>
-<AccessControlPolicy>
+<AccessControlPolicy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <Owner>
     <ID>owner1</ID>
     <DisplayName>owner1</DisplayName>
   </Owner>
   <AccessControlList>
     <Grant>
-      <Grantee>
+      <Grantee xsi:type="CanonicalUser">
         <ID>owner1</ID>
         <DisplayName>owner1</DisplayName>
       </Grantee>
       <Permission>FULL_CONTROL</Permission>
     </Grant>
     <Grant>
-      <Grantee>
+      <Grantee xsi:type="Group">
         <URI>http://acs.amazonaws.com/groups/global/AllUsers</URI>
       </Grantee>
       <Permission>READ</Permission>
     </Grant>
     <Grant>
-      <Grantee>
+      <Grantee xsi:type="Group">
         <URI>http://acs.amazonaws.com/groups/global/AllUsers</URI>
       </Grantee>
       <Permission>WRITE_ACP</Permission>
@@ -2102,15 +2619,15 @@ mod tests {
     #[test]
     fn object_acp_json_store_and_get_xml() {
         let policy = parse_acp_xml(
-            br#"<AccessControlPolicy>
+            br#"<AccessControlPolicy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <Owner><ID>o</ID><DisplayName>o</DisplayName></Owner>
   <AccessControlList>
     <Grant>
-      <Grantee><ID>o</ID></Grantee>
+      <Grantee xsi:type="CanonicalUser"><ID>o</ID></Grantee>
       <Permission>FULL_CONTROL</Permission>
     </Grant>
     <Grant>
-      <Grantee><URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee>
+      <Grantee xsi:type="Group"><URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee>
       <Permission>READ</Permission>
     </Grant>
   </AccessControlList>
@@ -2132,18 +2649,17 @@ mod tests {
     }
 
     #[test]
-    fn canned_takes_precedence_over_grant_headers() {
+    fn canned_and_grant_headers_are_invalid_request() {
         let mut h = HeaderKeyDict::new();
         h.set("x-amz-acl", "private");
         h.set(
             "x-amz-grant-read",
             "uri=\"http://acs.amazonaws.com/groups/global/AllUsers\"",
         );
-        let input = resolve_acl_put_input(&h, None, "owner").unwrap();
-        match input {
-            AclPutInput::Canned(c) => assert_eq!(c, "private"),
-            _ => panic!("expected canned"),
-        }
+        assert_eq!(
+            resolve_acl_put_input(&h, None, "owner").unwrap_err(),
+            "InvalidRequest"
+        );
     }
 
     #[test]
@@ -2185,12 +2701,12 @@ mod tests {
         assert_eq!(object_grants_allow_read(&empty, "foreign", "AUTH_x"), None);
         assert!(!object_acl_denies_read(&empty, "foreign", "AUTH_x"));
 
-        // Empty grants → no enforcement.
+        // A valid empty grant list is owner-only, not an enforcement bypass.
         let mut h_empty_grants = HeaderKeyDict::new();
         h_empty_grants.set(S3_OBJECT_ACL_JSON_META, r#"{"Owner":"owner","Grant":[]}"#);
         assert_eq!(
             object_grants_allow_read(&h_empty_grants, "foreign", "AUTH_x"),
-            None
+            Some(false)
         );
 
         // Private (owner FULL_CONTROL only): owner OK, foreign denied.
@@ -2327,6 +2843,42 @@ mod tests {
     }
 
     #[test]
+    fn empty_grant_policy_is_owner_only_and_corrupt_json_fails_closed() {
+        for (meta, is_object) in [
+            (S3_OBJECT_ACL_JSON_META, true),
+            (S3_BUCKET_ACL_JSON_META, false),
+        ] {
+            for raw in [r#"{"Owner":"test:tester","Grant":[]}"#, "{"] {
+                let mut h = HeaderKeyDict::new();
+                h.set(meta, raw);
+                let (owner_read_denied, foreign_read_denied, foreign_write_denied) = if is_object {
+                    (
+                        object_acl_denies_read(&h, "test:tester", "AUTH_test"),
+                        object_acl_denies_read(&h, "test:foreign", "AUTH_test"),
+                        object_acl_denies_write(&h, "test:foreign", "AUTH_test"),
+                    )
+                } else {
+                    (
+                        bucket_acl_denies_read(&h, "test:tester", "AUTH_test"),
+                        bucket_acl_denies_read(&h, "test:foreign", "AUTH_test"),
+                        bucket_acl_denies_write(&h, "test:foreign", "AUTH_test"),
+                    )
+                };
+                assert!(foreign_read_denied, "foreign read accepted: {meta} {raw}");
+                assert!(foreign_write_denied, "foreign write accepted: {meta} {raw}");
+                if raw != "{" {
+                    assert!(!owner_read_denied, "valid owner-only policy denied owner");
+                } else {
+                    assert!(
+                        owner_read_denied,
+                        "corrupt policy must deny even claimed owner"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn unknown_canned_acl_is_invalid_argument() {
         let mut h = HeaderKeyDict::new();
         h.set("X-Amz-Acl", "public-ready");
@@ -2369,6 +2921,108 @@ mod tests {
             }
             other => panic!("expected CanonicalUser, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_acp_xml_rejects_malformed_or_schema_incomplete_policies() {
+        for xml in [
+            "<AccessControlPolicy><Owner><ID>x</ID></Owner><AccessControlList>",
+            "<AccessControlPolicy><Owner><ID>x</ID></Owner></AccessControlList></AccessControlPolicy>",
+            "<AccessControlPolicy><Owner><ID>x</ID></Owner><AccessControlList/></AccessControlPolicy><AccessControlPolicy/>",
+            "<AccessControlPolicy><AccessControlList/></AccessControlPolicy>",
+            "<AccessControlPolicy><Owner><ID>x</ID></Owner></AccessControlPolicy>",
+            "<AccessControlPolicy><Owner><ID>x</ID></Owner><AccessControlList><Grant><Grantee><ID>x</ID></Grantee></Grant></AccessControlList></AccessControlPolicy>",
+        ] {
+            assert_eq!(
+                parse_acp_xml(xml.as_bytes()).unwrap_err(),
+                "MalformedACLError",
+                "unexpectedly accepted {xml}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_acp_xml_accepts_relaxng_interleave_and_namespace_aliases() {
+        let empty_reordered = br#"<AccessControlPolicy xmlns="urn:python-removes-default-namespaces"><AccessControlList/><Owner><DisplayName>owner</DisplayName><ID>owner</ID></Owner></AccessControlPolicy>"#;
+        let policy = parse_acp_xml(empty_reordered).unwrap();
+        assert_eq!(policy.owner_id, "owner");
+        assert_eq!(policy.owner_display_name.as_deref(), Some("owner"));
+        assert!(policy.grants.is_empty());
+
+        let aliased = br#"<s:AccessControlPolicy xmlns:s="http://s3.amazonaws.com/doc/2006-03-01/" xmlns:schema="http://www.w3.org/2001/XMLSchema-instance"><s:Owner><s:ID>owner&amp;&#49;</s:ID></s:Owner><s:AccessControlList><s:Grant><s:Permission>READ</s:Permission><s:Grantee schema:type="Group"><s:URI>http://acs.amazonaws.com/groups/global/AllUsers</s:URI></s:Grantee></s:Grant></s:AccessControlList></s:AccessControlPolicy>"#;
+        let policy = parse_acp_xml(aliased).unwrap();
+        assert_eq!(policy.owner_id, "owner&1");
+        assert_eq!(policy.grants.len(), 1);
+        assert_eq!(policy.grants[0].permission, "READ");
+        assert!(matches!(
+            &policy.grants[0].grantee,
+            Grantee::Uri { uri } if uri == ALL_USERS
+        ));
+    }
+
+    #[test]
+    fn parse_acp_xml_rejects_relaxng_shape_and_namespace_confusion() {
+        let invalid = [
+            "<Wrong><Owner><ID>x</ID></Owner><AccessControlList/></Wrong>",
+            "<AccessControlPolicy><Owner><ID>x</ID></Owner><Owner><ID>x</ID></Owner><AccessControlList/></AccessControlPolicy>",
+            "<AccessControlPolicy><Owner><ID>x</ID></Owner><AccessControlList/><AccessControlList/></AccessControlPolicy>",
+            "<AccessControlPolicy><Wrapper><Owner><ID>x</ID></Owner></Wrapper><AccessControlList/></AccessControlPolicy>",
+            "<AccessControlPolicy><Owner><ID>x</ID></Owner><AccessControlList/><Grant/></AccessControlPolicy>",
+            "<AccessControlPolicy><Owner><ID>x</ID><ID>y</ID></Owner><AccessControlList/></AccessControlPolicy>",
+            "<AccessControlPolicy><Owner extra='x'><ID>x</ID></Owner><AccessControlList/></AccessControlPolicy>",
+            "<AccessControlPolicy><Owner><ID>x</ID></Owner><AccessControlList><Grant><Permission>READ</Permission></Grant></AccessControlList></AccessControlPolicy>",
+            "<AccessControlPolicy><Owner><ID>x</ID></Owner><AccessControlList><Grant><Grantee xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:type='Group'><URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee></Grant></AccessControlList></AccessControlPolicy>",
+            "<AccessControlPolicy><Owner><ID>x</ID></Owner><AccessControlList><Grant><Grantee xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:type='CanonicalUser'><ID>x</ID><URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee><Permission>READ</Permission></Grant></AccessControlList></AccessControlPolicy>",
+            "<AccessControlPolicy><Owner><ID>x</ID></Owner><AccessControlList><Grant><Grantee type='CanonicalUser'><ID>x</ID></Grantee><Permission>READ</Permission></Grant></AccessControlList></AccessControlPolicy>",
+            "<AccessControlPolicy><Owner><ID>x</ID></Owner><AccessControlList><Grant><Grantee xmlns:xsi='urn:not-xsi' xsi:type='CanonicalUser'><ID>x</ID></Grantee><Permission>READ</Permission></Grant></AccessControlList></AccessControlPolicy>",
+            "<AccessControlPolicy><Owner><ID>x</ID></Owner><AccessControlList><Grant><Grantee xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:type='Unknown'><ID>x</ID></Grantee><Permission>READ</Permission></Grant></AccessControlList></AccessControlPolicy>",
+            "<AccessControlPolicy><Owner><ID>x</ID></Owner><AccessControlList><Grant><Grantee xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:type='Group'><ID>x</ID></Grantee><Permission>READ</Permission></Grant></AccessControlList></AccessControlPolicy>",
+            "<AccessControlPolicy><Owner><ID>x</ID></Owner><AccessControlList><Grant><Grantee xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:type='CanonicalUser'><ID>x</ID></Grantee><Permission>read</Permission></Grant></AccessControlList></AccessControlPolicy>",
+            "<AccessControlPolicy><Owner><ID>x</ID></Owner><AccessControlList><Grant><Grantee xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:type='CanonicalUser'><ID>x</ID></Grantee><Permission> READ </Permission></Grant></AccessControlList></AccessControlPolicy>",
+            "<bad:AccessControlPolicy xmlns:bad='urn:not-s3'><bad:Owner><bad:ID>x</bad:ID></bad:Owner><bad:AccessControlList/></bad:AccessControlPolicy>",
+            "<bad:AccessControlPolicy><bad:Owner><bad:ID>x</bad:ID></bad:Owner><bad:AccessControlList/></bad:AccessControlPolicy>",
+        ];
+        for xml in invalid {
+            assert_eq!(
+                parse_acp_xml(xml.as_bytes()).unwrap_err(),
+                "MalformedACLError",
+                "unexpectedly accepted {xml}"
+            );
+        }
+    }
+
+    #[test]
+    fn acl_input_conflicts_size_and_business_errors_match_python() {
+        let canonical = br#"<AccessControlPolicy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><Owner><ID>owner</ID></Owner><AccessControlList><Grant><Grantee xsi:type="CanonicalUser"><ID>owner</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>"#;
+
+        let mut canned = HeaderKeyDict::new();
+        canned.set("x-amz-acl", "private");
+        assert_eq!(
+            resolve_acl_put_input(&canned, Some(canonical), "owner").unwrap_err(),
+            "UnexpectedContent"
+        );
+
+        let mut grants = HeaderKeyDict::new();
+        grants.set("x-amz-grant-read", format!("uri={ALL_USERS}"));
+        assert_eq!(
+            resolve_acl_put_input(&grants, Some(canonical), "owner").unwrap_err(),
+            "UnexpectedContent"
+        );
+
+        let oversized = vec![b' '; MAX_ACP_XML_BODY as usize + 1];
+        assert_eq!(parse_acp_xml(&oversized).unwrap_err(), "MalformedXML");
+
+        let unknown_group = br#"<AccessControlPolicy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><Owner><ID>owner</ID></Owner><AccessControlList><Grant><Grantee xsi:type="Group"><URI>urn:not-an-s3-group</URI></Grantee><Permission>READ</Permission></Grant></AccessControlList></AccessControlPolicy>"#;
+        assert_eq!(
+            resolve_acl_put_input(&HeaderKeyDict::new(), Some(unknown_group), "owner").unwrap_err(),
+            "InvalidArgument"
+        );
+
+        let email = br#"<AccessControlPolicy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><Owner><ID>owner</ID></Owner><AccessControlList><Grant><Grantee xsi:type="AmazonCustomerByEmail"><EmailAddress>a@example.com</EmailAddress></Grantee><Permission>READ</Permission></Grant></AccessControlList></AccessControlPolicy>"#;
+        assert_eq!(
+            resolve_acl_put_input(&HeaderKeyDict::new(), Some(email), "owner").unwrap_err(),
+            "NotImplemented"
+        );
     }
 
     #[test]

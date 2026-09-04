@@ -115,12 +115,14 @@ use swift_middleware::{
 };
 
 use crate::acl_cors::{
-    apply_bucket_acl_put, apply_object_acl_put, bucket_acl_denies_read, bucket_acl_denies_read_acp,
-    bucket_acl_denies_write, bucket_acl_denies_write_acp, bucket_acl_xml_from_headers,
-    clear_cors_swift_headers, cors_config_to_swift_headers, cors_xml_from_swift_headers,
-    decode_acl_json, grants_allow_anonymous_read, object_acl_denies_read, object_acl_denies_write,
-    object_acl_xml_from_headers, object_canned_allows_anonymous_read, parse_cors_configuration,
-    resolve_acl_put_input, restamp_object_bucket_owner_canned, xml_ok, AclPutInput,
+    acl_xml_from_swift_headers, apply_bucket_acl_put, apply_object_acl_put, bucket_acl_denies_read,
+    bucket_acl_denies_read_acp, bucket_acl_denies_write, bucket_acl_denies_write_acp,
+    bucket_acl_xml_from_headers, clear_cors_swift_headers, cors_config_to_swift_headers,
+    cors_xml_from_swift_headers, decode_acl_json, grants_allow_anonymous_read,
+    object_acl_denies_read, object_acl_denies_read_acp, object_acl_denies_write,
+    object_acl_denies_write_acp, object_acl_xml_from_headers, object_canned_allows_anonymous_read,
+    parse_acp_xml, parse_cors_configuration, resolve_acl_put_input,
+    restamp_object_bucket_owner_canned, xml_ok, AclPutInput, Grantee, MAX_ACP_XML_BODY,
     S3_BUCKET_ACL_JSON_META, S3_OBJECT_ACL_JSON_META, S3_OBJECT_ACL_META,
 };
 use crate::aws_chunked::{
@@ -969,24 +971,32 @@ fn is_s3_unsigned_read_candidate(
     bucket.is_some()
 }
 
-/// Object ACL must not block AllUsers when Swift returned 200 via container ACL.
-fn object_acl_blocks_anonymous(headers: &HeaderKeyDict) -> bool {
+/// Return the exact fail-closed response for an anonymous object read.
+/// Corrupt persisted JSON is an internal state failure, not a client denial.
+fn object_acl_anonymous_denial(headers: &HeaderKeyDict) -> Option<Response> {
     if let Some(raw) = headers
         .get(S3_OBJECT_ACL_JSON_META)
         .or_else(|| headers.get("X-Object-Meta-S3-Acl-Json"))
     {
         return match decode_acl_json(raw) {
             Some(policy) if !policy.grants.is_empty() => {
-                !grants_allow_anonymous_read(&policy.grants)
+                (!grants_allow_anonymous_read(&policy.grants))
+                    .then(|| s3_error_response("AccessDenied", None, &[]))
             }
-            // Malformed / empty JSON ACL: fail closed (deny). Never allow.
-            _ => true,
+            Some(_) => Some(s3_error_response("AccessDenied", None, &[])),
+            None if raw.is_empty() => Some(s3_error_response("AccessDenied", None, &[])),
+            None => Some(s3_error_response(
+                "InternalError",
+                Some("stored ACL metadata is invalid"),
+                &[],
+            )),
         };
     }
     if let Some(canned) = headers.get(S3_OBJECT_ACL_META).filter(|s| !s.is_empty()) {
-        return !object_canned_allows_anonymous_read(Some(canned));
+        return (!object_canned_allows_anonymous_read(Some(canned)))
+            .then(|| s3_error_response("AccessDenied", None, &[]));
     }
-    false
+    None
 }
 
 fn first_unsupported_subresource(params: &[(String, String)]) -> Option<&str> {
@@ -1069,7 +1079,10 @@ fn reject_unknown_storage_class(req: &Request) -> Option<Response> {
 }
 
 fn strip_s3_only_headers(headers: &mut HeaderKeyDict) {
-    // AWS headers must not leak into the Swift backend as client meta.
+    // AWS headers, including SSE-C customer key material, must not leak into
+    // a Swift backend that has no encryption consumer. The no-encrypter
+    // compatibility profile accepts SSE-C on the S3 wire to match Python,
+    // but it does not claim encryption and never forwards the key.
     let keys: Vec<String> = headers
         .iter()
         .map(|(k, _)| k.to_string())
@@ -1081,6 +1094,55 @@ fn strip_s3_only_headers(headers: &mut HeaderKeyDict) {
     for k in keys {
         headers.remove(&k);
     }
+}
+
+/// ACL sysmeta is an internal authorization record, never client input.
+/// Remove it only at the authenticated S3 ingress, after signature/payload
+/// verification, so trusted subrequests created by this middleware may still
+/// carry the records they deliberately generated.
+fn strip_client_acl_sysmeta(headers: &mut HeaderKeyDict) {
+    headers.remove(S3_OBJECT_ACL_META);
+    headers.remove(S3_OBJECT_ACL_JSON_META);
+    headers.remove(S3_BUCKET_ACL_JSON_META);
+}
+
+/// Python's plain `S3Request.get_response()` always runs
+/// `handle_acl_header` when `s3_acl=false`.  It validates the canned ACL and
+/// translates the small legacy subset to Swift container ACL headers; it
+/// never writes structured S3 ACL sysmeta.
+fn apply_legacy_acl_header(headers: &mut HeaderKeyDict) -> Result<(), Response> {
+    let Some(acl) = headers.get("x-amz-acl").map(str::to_string) else {
+        return Ok(());
+    };
+    headers.remove("x-amz-acl");
+    match acl.as_str() {
+        "public-read" => {
+            headers.set("X-Container-Read", ".r:*,.rlistings");
+        }
+        "public-read-write" => {
+            headers.set("X-Container-Write", ".r:*");
+            headers.set("X-Container-Read", ".r:*,.rlistings");
+        }
+        "private" | "bucket-owner-read" | "bucket-owner-full-control" => {
+            headers.set("X-Container-Write", ".");
+            headers.set("X-Container-Read", ".");
+        }
+        "authenticated-read" | "log-delivery-write" => {
+            return Err(s3_error_response(
+                "NotImplemented",
+                Some("The requested resource is not implemented"),
+                &[],
+            ));
+        }
+        _ => {
+            return Err(s3_error_response(
+                "InvalidArgument",
+                Some("Invalid x-amz-acl value"),
+                &[("ArgumentName", "x-amz-acl"), ("ArgumentValue", &acl)],
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn tchar_meta_byte(byte: u8) -> bool {
@@ -1195,9 +1257,10 @@ fn is_s3_http_method(method: &str) -> bool {
 }
 
 fn reject_unimplemented_sse(req: &Request) -> Option<Response> {
-    // SSE-C customer headers are accepted. Python s3api without the
-    // encryption middleware does not 501 them; G5-B encrypted_transfer
-    // and sse_c_multipart only require header-tolerant round-trip.
+    // SSE-C customer headers are wire-compatible only. Python s3api without
+    // the encryption middleware does not 501 them, so the compatibility
+    // profile accepts the request but strips all key material before the
+    // backend. This is not SSE-C support and must not be advertised as such.
     // KMS / SSE-S3 (x-amz-server-side-encryption) stay NotImplemented
     // when this pipeline has no keymaster/encrypter, matching Python.
     if let Some(sse) = req
@@ -2360,10 +2423,11 @@ fn apply_head_range(resp: &mut Response, range: Option<&str>) {
 /// If object JSON ACL grants deny this principal READ, return AccessDenied.
 /// Missing/empty grants → `None` (no new denial).
 fn deny_if_object_acl_blocks_read(
+    s3_acl: bool,
     cred: &S3Credential,
     headers: &HeaderKeyDict,
 ) -> Option<Response> {
-    if object_acl_denies_read(headers, &cred.access_key, &cred.account) {
+    if s3_acl && object_acl_denies_read(headers, &cred.access_key, &cred.account) {
         Some(s3_error_response("AccessDenied", None, &[]))
     } else {
         None
@@ -2455,10 +2519,11 @@ fn apply_get_head_preconditions(
 }
 
 fn deny_if_object_acl_blocks_write(
+    s3_acl: bool,
     cred: &S3Credential,
     headers: &HeaderKeyDict,
 ) -> Option<Response> {
-    if object_acl_denies_write(headers, &cred.access_key, &cred.account) {
+    if s3_acl && object_acl_denies_write(headers, &cred.access_key, &cred.account) {
         Some(s3_error_response("AccessDenied", None, &[]))
     } else {
         None
@@ -2500,6 +2565,32 @@ fn existing_json_owner(headers: &HeaderKeyDict, meta: &str, fallback: &str) -> S
     fallback.to_string()
 }
 
+fn existing_acl_owner_for_update(
+    headers: &HeaderKeyDict,
+    meta: &str,
+    fallback: &str,
+    enforce_s3_acl: bool,
+) -> Result<String, Response> {
+    match headers.get(meta) {
+        Some(raw) if !raw.is_empty() => match decode_acl_json(raw) {
+            Some(policy) if !policy.owner_id.is_empty() => Ok(policy.owner_id),
+            Some(_) if enforce_s3_acl => Err(s3_error_response("AccessDenied", None, &[])),
+            None if enforce_s3_acl => Err(s3_error_response(
+                "InternalError",
+                Some("stored ACL metadata is invalid"),
+                &[],
+            )),
+            _ => Ok(fallback.to_string()),
+        },
+        _ if enforce_s3_acl => Err(s3_error_response("AccessDenied", None, &[])),
+        _ => Ok(fallback.to_string()),
+    }
+}
+
+fn acl_input_changes_owner(input: &AclPutInput, existing_owner: &str) -> bool {
+    matches!(input, AclPutInput::Policy(policy) if policy.owner_id != existing_owner)
+}
+
 fn object_acl_copy_from(container: &str, key: &str) -> String {
     format!(
         "/{}",
@@ -2513,6 +2604,16 @@ fn stamp_resolved_put_acl(
     owner_id: &str,
     is_object: bool,
 ) -> Result<(), Response> {
+    // Python selects the plain S3Request class when s3_acl=false.  That
+    // class neither synthesizes nor persists S3 ACL sysmeta on an ordinary
+    // data PUT; x-amz-acl is just an S3-only header and is stripped before
+    // the Swift subrequest.  Keeping old structured ACL JSON alive in this
+    // mode makes a later s3_acl=true deployment enforce policy that Python
+    // never wrote, and also lets the disabled feature affect MPU/versioned
+    // data paths.
+    if !s3_acl {
+        return Ok(());
+    }
     match resolve_acl_put_input(headers, None, owner_id) {
         Ok(input) => {
             if is_object {
@@ -2998,17 +3099,14 @@ fn maybe_archive_due_cold_on_put(
     }
 }
 
-/// GET/HEAD object success path with structured ACP grant enforcement.
+/// Translate a successful object GET/HEAD after the caller has applied the
+/// configured authorization policy.
 fn translate_object_get_head(
     method: &str,
     mut resp: Response,
-    cred: &S3Credential,
     params: &[(String, String)],
     range: Option<&str>,
 ) -> Response {
-    if let Some(denied) = deny_if_object_acl_blocks_read(cred, &resp.headers) {
-        return denied;
-    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -3394,6 +3492,7 @@ impl Middleware for S3Api {
             if let Some(resp) = crate::payload::validate_s3_payload(&mut req, false) {
                 return finish(resp);
             }
+            strip_client_acl_sysmeta(&mut req.headers);
             return finish(self.dispatch_authorized(req, cred, next));
         }
 
@@ -3440,6 +3539,7 @@ impl Middleware for S3Api {
             return finish(resp);
         }
 
+        strip_client_acl_sysmeta(&mut req.headers);
         finish(self.dispatch_authorized(req, cred, next))
     }
 }
@@ -3500,6 +3600,7 @@ impl S3Api {
         if let Some(resp) = crate::payload::validate_s3_payload_headers(&head, !auth.query_auth) {
             return finish(resp);
         }
+        strip_client_acl_sysmeta(&mut head.headers);
         let (bucket, key) = extract_bucket_and_key(
             &head,
             &self.storage_domains,
@@ -3542,6 +3643,11 @@ impl S3Api {
             return finish(denied);
         }
         let params = head.params();
+        if !self.s3_acl && !params.iter().any(|(name, _)| name == "acl") {
+            if let Err(resp) = apply_legacy_acl_header(&mut head.headers) {
+                return finish(resp);
+            }
+        }
         let upload_id = params
             .iter()
             .find(|(k, _)| k == "uploadId")
@@ -3769,7 +3875,8 @@ impl S3Api {
                     {
                         return finish(blocked);
                     }
-                    if let Some(blocked) = deny_if_object_acl_blocks_write(&cred, &existing.headers)
+                    if let Some(blocked) =
+                        deny_if_object_acl_blocks_write(self.s3_acl, &cred, &existing.headers)
                     {
                         return finish(blocked);
                     }
@@ -3864,7 +3971,9 @@ impl S3Api {
             let current = match control_head_object_streaming(&cred, &bucket, &key, &next).await {
                 Ok(ObjectHead::Missing) => None,
                 Ok(ObjectHead::Present(cur)) => {
-                    if let Some(blocked) = deny_if_object_acl_blocks_write(&cred, &cur.headers) {
+                    if let Some(blocked) =
+                        deny_if_object_acl_blocks_write(self.s3_acl, &cred, &cur.headers)
+                    {
                         return finish(blocked);
                     }
                     if let Err(resp) = maybe_archive_current_for_write_streaming(
@@ -4093,6 +4202,7 @@ impl S3Api {
         if let Some(resp) = crate::payload::validate_s3_payload(&mut req, v4_header) {
             return finish(resp);
         }
+        strip_client_acl_sysmeta(&mut req.headers);
         if let Some(denied) = self.frozen_account_denied(&cred.account, &req) {
             return finish(denied);
         }
@@ -4146,23 +4256,112 @@ impl S3Api {
         account: String,
         next: AsyncNextFn,
     ) -> Response {
+        if let Some(denied) = self.frozen_account_denied(&account, &req) {
+            return denied;
+        }
+        let params = req.params();
+        if let Some(sub) = first_unsupported_subresource(&params) {
+            return not_implemented_subresource(sub);
+        }
         let method = req.method.clone();
         let (bucket, key) =
             extract_bucket_and_key(&req, &self.storage_domains, self.dns_compliant_bucket_names);
         let Some(bucket) = bucket else {
             return next(req).await;
         };
-        let mut swift = req;
-        swift.path = s3_to_swift_path(&account, Some(&bucket), key.as_deref());
-        swift.query_string = s3_to_swift_query(&swift.params(), key.is_none());
-        strip_s3_only_headers(&mut swift.headers);
-        let resp = next(swift).await;
-        finish_s3_response(&method, resp)
+        if !validate_bucket_name(&bucket, self.dns_compliant_bucket_names) {
+            return s3_error_response("InvalidBucketName", None, &[("BucketName", &bucket)]);
+        }
+        let for_list = matches!(method.as_str(), "GET" | "HEAD") && key.is_none();
+        if let (Some(key), Some(version_id)) = (
+            key.as_deref(),
+            params
+                .iter()
+                .find(|(name, _)| name == "versionId")
+                .map(|(_, value)| value.as_str()),
+        ) {
+            if !valid_version_id(version_id) {
+                return s3_error_response("InvalidArgument", None, &[]);
+            }
+            return handle_anonymous_versioned_get_head_async(
+                self, &method, &account, &bucket, key, version_id, &next,
+            )
+            .await;
+        }
+        let mut swift_req = req;
+        swift_req.path = s3_to_swift_path(&account, Some(&bucket), key.as_deref());
+        if for_list && method == "GET" {
+            if let Err(resp) = parse_list_max_keys(&params) {
+                return resp;
+            }
+            swift_req.query_string = s3_to_swift_query(&params, true);
+            swift_req.headers.set("Accept", "application/json");
+        } else {
+            swift_req.query_string = s3_to_swift_query(&params, false);
+        }
+        strip_s3_only_headers(&mut swift_req.headers);
+        // Intentionally no stamp_auth: the Swift container ACL must be the
+        // first anonymous authorization boundary.
+        let resp = next(swift_req).await;
+        if key.is_none() {
+            if method == "GET" && (200..300).contains(&resp.status) {
+                let body = match resp.body.collect_async().await {
+                    Ok(body) => body,
+                    Err(_) => {
+                        return s3_error_response("InternalError", Some("listing too large"), &[])
+                    }
+                };
+                let owner = Owner {
+                    id: "anonymous".into(),
+                    display_name: "anonymous".into(),
+                };
+                let list_v2 = params
+                    .iter()
+                    .any(|(name, value)| name == "list-type" && value == "2");
+                if list_v2 {
+                    return translate_list_objects_v2(&body, &bucket, &params, &owner);
+                }
+                return translate_list_objects(&body, &bucket, &params, &owner);
+            }
+            if (200..300).contains(&resp.status) {
+                return translate_bucket_success(&method, resp, Some(&bucket));
+            }
+            return map_swift_error(resp.status, Some(&bucket), None);
+        }
+        if (200..300).contains(&resp.status) {
+            if self.s3_acl {
+                if let Some(denied) = object_acl_anonymous_denial(&resp.headers) {
+                    return denied;
+                }
+            }
+            let mut resp = resp;
+            // Meta/deny only: an anonymous request has no authority to POST
+            // a transition marker back to Swift.
+            maybe_stamp_due_cold_on_anonymous_get_head(
+                &mut resp,
+                &account,
+                &bucket,
+                key.as_deref().expect("object branch"),
+                &self.cold_map,
+            );
+            if let Some(denied) = deny_if_transition_blocks_get(&mut resp.headers, unix_now()) {
+                return denied;
+            }
+            if let Some(storage_class) = resp
+                .headers
+                .get("X-Object-Meta-S3-Storage-Class")
+                .map(str::to_string)
+            {
+                resp.headers.set("x-amz-storage-class", storage_class);
+            }
+            return translate_object_success(&method, resp, false);
+        }
+        map_swift_error(resp.status, Some(&bucket), key.as_deref())
     }
 
     async fn dispatch_legacy_blocking(
         &self,
-        req: Request,
+        mut req: Request,
         cred: S3Credential,
         next: AsyncNextFn,
     ) -> Response {
@@ -4186,6 +4385,11 @@ impl S3Api {
         if let Some(sub) = first_unsupported_subresource(&params) {
             return not_implemented_subresource(sub);
         }
+        if !self.s3_acl && !params.iter().any(|(name, _)| name == "acl") {
+            if let Err(resp) = apply_legacy_acl_header(&mut req.headers) {
+                return resp;
+            }
+        }
         if req.headers.get("X-Amz-Request-Route").is_some()
             || req.headers.get("x-amz-request-route").is_some()
         {
@@ -4193,6 +4397,15 @@ impl S3Api {
         }
         let (bucket, key) =
             extract_bucket_and_key(&req, &self.storage_domains, self.dns_compliant_bucket_names);
+        if parse_bypass_governance_header(
+            req.headers
+                .get(HDR_BYPASS_GOVERNANCE)
+                .or_else(|| req.headers.get("X-Amz-Bypass-Governance-Retention")),
+        )
+        .is_err()
+        {
+            return s3_error_response("InvalidArgument", None, &[]);
+        }
         if let Some(b) = &bucket {
             if !validate_bucket_name(b, self.dns_compliant_bucket_names) {
                 return s3_error_response("InvalidBucketName", None, &[("BucketName", b)]);
@@ -4418,6 +4631,7 @@ impl S3Api {
                 &owner,
                 bucket.as_deref().unwrap(),
                 key.as_deref(),
+                self.s3_acl,
                 &next,
             )
             .await;
@@ -4473,6 +4687,7 @@ impl S3Api {
                     b,
                     k,
                     vid,
+                    self.s3_acl,
                     self.worm_clock.clock_ok(),
                     bypass,
                     &next,
@@ -4486,7 +4701,7 @@ impl S3Api {
                     .iter()
                     .find(|(n, _)| n == "versionId")
                     .map(|(_, v)| v.as_str());
-                return handle_legal_hold_async(req, &cred, b, k, vid, &next).await;
+                return handle_legal_hold_async(req, &cred, b, k, vid, self.s3_acl, &next).await;
             }
         }
         if key.is_none() && bucket.is_some() {
@@ -4520,6 +4735,7 @@ impl S3Api {
                                 &method,
                                 version_id_q,
                                 req.headers.get("Range"),
+                                self.s3_acl,
                                 &next,
                             )
                             .await;
@@ -4532,6 +4748,7 @@ impl S3Api {
                                 &method,
                                 version_id_q,
                                 req.headers.get("Range"),
+                                self.s3_acl,
                                 &next,
                             )
                             .await;
@@ -4570,6 +4787,7 @@ impl S3Api {
                                 key.as_deref().unwrap(),
                                 vid,
                                 None,
+                                self.s3_acl,
                                 self.worm_clock.clock_ok(),
                                 bypass,
                                 &next,
@@ -4793,16 +5011,13 @@ impl S3Api {
         if key.is_some() {
             if (200..300).contains(&resp.status) {
                 if matches!(method.as_str(), "GET" | "HEAD") {
-                    if let Some(denied) = deny_if_object_acl_blocks_read(&cred, &resp.headers) {
+                    if let Some(denied) =
+                        deny_if_object_acl_blocks_read(self.s3_acl, &cred, &resp.headers)
+                    {
                         return denied;
                     }
-                    let resp = translate_object_get_head(
-                        &method,
-                        resp,
-                        &cred,
-                        &params,
-                        range_header.as_deref(),
-                    );
+                    let resp =
+                        translate_object_get_head(&method, resp, &params, range_header.as_deref());
                     return apply_get_head_preconditions(
                         resp,
                         &method,
@@ -4845,7 +5060,7 @@ impl S3Api {
 
     fn dispatch_authorized_inner(
         &self,
-        req: Request,
+        mut req: Request,
         cred: S3Credential,
         next: &NextFn,
     ) -> Response {
@@ -4861,6 +5076,11 @@ impl S3Api {
         let params = req.params();
         if let Some(sub) = first_unsupported_subresource(&params) {
             return not_implemented_subresource(sub);
+        }
+        if !self.s3_acl && !params.iter().any(|(name, _)| name == "acl") {
+            if let Err(resp) = apply_legacy_acl_header(&mut req.headers) {
+                return resp;
+            }
         }
         if req.headers.get("X-Amz-Request-Route").is_some()
             || req.headers.get("x-amz-request-route").is_some()
@@ -5088,6 +5308,7 @@ impl S3Api {
                 &owner,
                 bucket.as_deref().unwrap(),
                 key.as_deref(),
+                self.s3_acl,
                 next,
             );
         }
@@ -5245,6 +5466,7 @@ impl S3Api {
                 bucket.as_deref().unwrap(),
                 key.as_deref().unwrap(),
                 version_id_q.as_deref(),
+                self.s3_acl,
                 next,
             );
         }
@@ -5285,6 +5507,7 @@ impl S3Api {
                 bucket.as_deref().unwrap(),
                 key.as_deref().unwrap(),
                 version_id_q.as_deref(),
+                self.s3_acl,
                 worm_clock_ok,
                 retention_bypass,
                 next,
@@ -5299,6 +5522,7 @@ impl S3Api {
                 bucket.as_deref().unwrap(),
                 key.as_deref().unwrap(),
                 version_id_q.as_deref(),
+                self.s3_acl,
                 &self.cold_map,
                 self.cold_backend.as_ref(),
                 next,
@@ -5516,7 +5740,9 @@ impl S3Api {
                     if let Some(blocked) = worm_guard(&head.headers, worm_clock_ok, worm_bypass) {
                         return blocked;
                     }
-                    if let Some(blocked) = deny_if_object_acl_blocks_write(&cred, &head.headers) {
+                    if let Some(blocked) =
+                        deny_if_object_acl_blocks_write(self.s3_acl, &cred, &head.headers)
+                    {
                         return blocked;
                     }
                 }
@@ -5673,7 +5899,9 @@ impl S3Api {
                     let b = bucket.as_deref().unwrap();
                     let k = key.as_deref().unwrap();
                     let mut resp = resp;
-                    if let Some(denied) = deny_if_object_acl_blocks_read(&cred, &resp.headers) {
+                    if let Some(denied) =
+                        deny_if_object_acl_blocks_read(self.s3_acl, &cred, &resp.headers)
+                    {
                         return denied;
                     }
                     if let Some(err) = maybe_archive_due_cold_on_get_head(
@@ -5689,13 +5917,8 @@ impl S3Api {
                     ) {
                         return err;
                     }
-                    let resp = translate_object_get_head(
-                        &method,
-                        resp,
-                        &cred,
-                        &params,
-                        range_header.as_deref(),
-                    );
+                    let resp =
+                        translate_object_get_head(&method, resp, &params, range_header.as_deref());
                     return apply_get_head_preconditions(
                         resp,
                         &method,
@@ -5813,8 +6036,10 @@ impl S3Api {
             return map_swift_error(resp.status, Some(&bucket), None);
         }
         if (200..300).contains(&resp.status) {
-            if object_acl_blocks_anonymous(&resp.headers) {
-                return s3_error_response("AccessDenied", None, &[]);
+            if self.s3_acl {
+                if let Some(denied) = object_acl_anonymous_denial(&resp.headers) {
+                    return denied;
+                }
             }
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -5895,10 +6120,85 @@ fn handle_anonymous_versioned_get_head(
         }
         got
     };
-    if object_acl_blocks_anonymous(&resp.headers) {
-        return s3_error_response("AccessDenied", None, &[]);
+    if let Some(denied) = object_acl_anonymous_denial(&resp.headers) {
+        return denied;
     }
 
+    maybe_stamp_due_cold_on_anonymous_get_head(
+        &mut resp,
+        account,
+        &target.container,
+        &target.key,
+        &api.cold_map,
+    );
+    if let Some(denied) = deny_if_transition_blocks_get(&mut resp.headers, unix_now()) {
+        return denied;
+    }
+    let mut out = translate_object_success(method, resp, false);
+    if (200..300).contains(&out.status) {
+        out.headers.set(HDR_VERSION_ID, version_id);
+    }
+    out
+}
+
+async fn handle_anonymous_versioned_get_head_async(
+    api: &S3Api,
+    method: &str,
+    account: &str,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    next: &AsyncNextFn,
+) -> Response {
+    // First prove that Swift's public container ACL exposes the logical
+    // object namespace.  Only then use an internal identity to resolve the
+    // private versions container.  This preserves the two authorization
+    // boundaries from the synchronous implementation.
+    let public_probe = async_call(
+        next,
+        make_swift_req("HEAD", &s3_to_swift_path(account, Some(bucket), Some(key))),
+    )
+    .await;
+    if !((200..300).contains(&public_probe.status) || public_probe.status == 404) {
+        return map_swift_error(public_probe.status, Some(bucket), Some(key));
+    }
+
+    let internal = S3Credential {
+        access_key: "anonymous-internal-version-reader".into(),
+        secret_key: String::new(),
+        account: account.to_string(),
+        groups: vec![account.to_string()],
+        auth_token: None,
+    };
+    let target =
+        match resolve_object_version_async(&internal, bucket, key, Some(version_id), next).await {
+            Ok(Some(target)) => target,
+            Ok(None) => return missing_object_version_response(key, Some(version_id)),
+            Err(resp) => return resp,
+        };
+    if is_delete_marker_header(target.head.headers.get(SYS_DELETE_MARKER)) {
+        return nosuchkey_delete_marker(key, Some(version_id));
+    }
+
+    let mut resp = if method == "HEAD" {
+        target.head
+    } else {
+        let mut get = make_swift_req(
+            "GET",
+            &s3_to_swift_path(account, Some(&target.container), Some(&target.key)),
+        );
+        stamp_auth(&mut get, &internal);
+        let got = async_call(next, get).await;
+        if !(200..300).contains(&got.status) {
+            return map_swift_error(got.status, Some(&target.container), Some(&target.key));
+        }
+        got
+    };
+    if api.s3_acl {
+        if let Some(denied) = object_acl_anonymous_denial(&resp.headers) {
+            return denied;
+        }
+    }
     maybe_stamp_due_cold_on_anonymous_get_head(
         &mut resp,
         account,
@@ -6103,6 +6403,7 @@ fn worm_check_object(
 /// HEAD object; if structured ACP grants deny WRITE, AccessDenied.
 /// Missing object (404) → no denial (create path).
 async fn acl_write_check_object_async(
+    s3_acl: bool,
     cred: &S3Credential,
     bucket: &str,
     key: &str,
@@ -6110,12 +6411,15 @@ async fn acl_write_check_object_async(
 ) -> Option<Response> {
     match control_head_object_async(cred, bucket, key, next).await {
         Ok(ObjectHead::Missing) => None,
-        Ok(ObjectHead::Present(resp)) => deny_if_object_acl_blocks_write(cred, &resp.headers),
+        Ok(ObjectHead::Present(resp)) => {
+            deny_if_object_acl_blocks_write(s3_acl, cred, &resp.headers)
+        }
         Err(resp) => Some(resp),
     }
 }
 
 fn acl_write_check_object(
+    s3_acl: bool,
     cred: &S3Credential,
     bucket: &str,
     key: &str,
@@ -6123,7 +6427,9 @@ fn acl_write_check_object(
 ) -> Option<Response> {
     match control_head_object(cred, bucket, key, next) {
         Ok(ObjectHead::Missing) => None,
-        Ok(ObjectHead::Present(resp)) => deny_if_object_acl_blocks_write(cred, &resp.headers),
+        Ok(ObjectHead::Present(resp)) => {
+            deny_if_object_acl_blocks_write(s3_acl, cred, &resp.headers)
+        }
         Err(resp) => Some(resp),
     }
 }
@@ -6176,13 +6482,14 @@ fn governance_bypass_context(
     // still denies locked objects when authorized is false.
     let principal = iam.identity.canonical_id_for_access_key(&cred.access_key);
     let resource = crate::iam::IamService::s3_resource(bucket, Some(key));
-    // Empty IAM (TempAuth / no policies) → None. Ceph s3-tests send the
-    // bypass header without an IAM grant; treat None as authorized.
-    // Explicit Deny still wins.
+    // A bypass header is only effective with an explicit IAM Allow. An
+    // absent policy must not turn a client-controlled header into a
+    // governance-retention bypass. Unlocked objects still delete normally
+    // because worm_guard only consults this bit for GOVERNANCE locks.
     let authorized = match iam.evaluate(&principal, "s3:BypassGovernanceRetention", &resource) {
         Some(true) => true,
         Some(false) => false,
-        None => true,
+        None => false,
     };
     Ok(GovernanceBypass {
         requested: true,
@@ -6469,6 +6776,7 @@ fn handle_legal_hold(
     bucket: &str,
     key: &str,
     version_id: Option<&str>,
+    s3_acl: bool,
     next: &NextFn,
 ) -> Response {
     let target = match resolve_object_version(cred, bucket, key, version_id, next) {
@@ -6477,9 +6785,9 @@ fn handle_legal_hold(
         Err(resp) => return resp,
     };
     let acl_denied = if req.method == "PUT" {
-        deny_if_object_acl_blocks_write(cred, &target.head.headers)
+        deny_if_object_acl_blocks_write(s3_acl, cred, &target.head.headers)
     } else {
-        deny_if_object_acl_blocks_read(cred, &target.head.headers)
+        deny_if_object_acl_blocks_read(s3_acl, cred, &target.head.headers)
     };
     if let Some(denied) = acl_denied {
         return denied;
@@ -6526,6 +6834,7 @@ async fn handle_legal_hold_async(
     bucket: &str,
     key: &str,
     version_id: Option<&str>,
+    s3_acl: bool,
     next: &AsyncNextFn,
 ) -> Response {
     let target = match resolve_object_version_async(cred, bucket, key, version_id, next).await {
@@ -6534,9 +6843,9 @@ async fn handle_legal_hold_async(
         Err(resp) => return resp,
     };
     let acl_denied = if req.method == "PUT" {
-        deny_if_object_acl_blocks_write(cred, &target.head.headers)
+        deny_if_object_acl_blocks_write(s3_acl, cred, &target.head.headers)
     } else {
-        deny_if_object_acl_blocks_read(cred, &target.head.headers)
+        deny_if_object_acl_blocks_read(s3_acl, cred, &target.head.headers)
     };
     if let Some(denied) = acl_denied {
         return denied;
@@ -6583,6 +6892,7 @@ fn handle_retention(
     bucket: &str,
     key: &str,
     version_id: Option<&str>,
+    s3_acl: bool,
     clock_ok: bool,
     bypass: GovernanceBypass,
     next: &NextFn,
@@ -6593,9 +6903,9 @@ fn handle_retention(
         Err(resp) => return resp,
     };
     let acl_denied = if req.method == "PUT" {
-        deny_if_object_acl_blocks_write(cred, &target.head.headers)
+        deny_if_object_acl_blocks_write(s3_acl, cred, &target.head.headers)
     } else {
-        deny_if_object_acl_blocks_read(cred, &target.head.headers)
+        deny_if_object_acl_blocks_read(s3_acl, cred, &target.head.headers)
     };
     if let Some(denied) = acl_denied {
         return denied;
@@ -6679,6 +6989,7 @@ async fn handle_retention_async(
     bucket: &str,
     key: &str,
     version_id: Option<&str>,
+    s3_acl: bool,
     clock_ok: bool,
     bypass: GovernanceBypass,
     next: &AsyncNextFn,
@@ -6689,9 +7000,9 @@ async fn handle_retention_async(
         Err(resp) => return resp,
     };
     let acl_denied = if req.method == "PUT" {
-        deny_if_object_acl_blocks_write(cred, &target.head.headers)
+        deny_if_object_acl_blocks_write(s3_acl, cred, &target.head.headers)
     } else {
-        deny_if_object_acl_blocks_read(cred, &target.head.headers)
+        deny_if_object_acl_blocks_read(s3_acl, cred, &target.head.headers)
     };
     if let Some(denied) = acl_denied {
         return denied;
@@ -6861,6 +7172,7 @@ async fn handle_multi_delete_async(
                     }
                     _ => None,
                 },
+                api.s3_acl,
                 clock_ok,
                 bypass,
                 next,
@@ -6872,7 +7184,7 @@ async fn handle_multi_delete_async(
             {
                 blocked
             } else if let Some(blocked) =
-                acl_write_check_object_async(cred, bucket, key, next).await
+                acl_write_check_object_async(api.s3_acl, cred, bucket, key, next).await
             {
                 blocked
             } else {
@@ -7010,6 +7322,7 @@ fn handle_multi_delete(
                     }
                     _ => None,
                 },
+                api.s3_acl,
                 clock_ok,
                 bypass,
                 next,
@@ -7017,7 +7330,9 @@ fn handle_multi_delete(
         } else {
             if let Some(blocked) = worm_check_object(cred, bucket, key, clock_ok, bypass, next) {
                 blocked
-            } else if let Some(blocked) = acl_write_check_object(cred, bucket, key, next) {
+            } else if let Some(blocked) =
+                acl_write_check_object(api.s3_acl, cred, bucket, key, next)
+            {
                 blocked
             } else {
                 let mut del = make_swift_req(
@@ -7063,7 +7378,101 @@ fn handle_multi_delete(
     xml_response(200, delete_result_xml(&deleted_out, &errors))
 }
 
-async fn handle_acl_async(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LegacyBucketAcl {
+    Private,
+    PublicRead,
+    PublicReadWrite,
+    Unsupported,
+}
+
+fn legacy_bucket_acl_from_policy(body: &[u8]) -> Result<LegacyBucketAcl, Response> {
+    let policy =
+        parse_acp_xml(body).map_err(|_| s3_error_response("MalformedACLError", None, &[]))?;
+    let mut translated = None;
+    for grant in policy.grants {
+        translated = Some(match (&grant.grantee, grant.permission.as_str()) {
+            (Grantee::Id { .. }, "FULL_CONTROL")
+                if !matches!(
+                    translated,
+                    Some(LegacyBucketAcl::PublicRead | LegacyBucketAcl::PublicReadWrite)
+                ) =>
+            {
+                LegacyBucketAcl::Private
+            }
+            (Grantee::Uri { .. }, "READ")
+                if translated != Some(LegacyBucketAcl::PublicReadWrite) =>
+            {
+                LegacyBucketAcl::PublicRead
+            }
+            (Grantee::Uri { .. }, "WRITE") => LegacyBucketAcl::PublicReadWrite,
+            _ => LegacyBucketAcl::Unsupported,
+        });
+    }
+    match translated {
+        Some(LegacyBucketAcl::Private) => Ok(LegacyBucketAcl::Private),
+        Some(LegacyBucketAcl::PublicRead) => Ok(LegacyBucketAcl::PublicRead),
+        Some(LegacyBucketAcl::PublicReadWrite) => Ok(LegacyBucketAcl::PublicReadWrite),
+        Some(LegacyBucketAcl::Unsupported) | None => {
+            Err(s3_error_response("MalformedACLError", None, &[]))
+        }
+    }
+}
+
+fn legacy_bucket_acl_from_request(
+    headers: &HeaderKeyDict,
+    body: &[u8],
+) -> Result<LegacyBucketAcl, Response> {
+    let canned = headers.get("X-Amz-Acl");
+    let body_nonempty = !body.iter().all(u8::is_ascii_whitespace);
+    if canned.is_some() && body_nonempty {
+        return Err(s3_error_response("UnexpectedContent", None, &[]));
+    }
+    if let Some(canned) = canned {
+        return match canned {
+            "private" | "bucket-owner-read" | "bucket-owner-full-control" => {
+                Ok(LegacyBucketAcl::Private)
+            }
+            "public-read" => Ok(LegacyBucketAcl::PublicRead),
+            "public-read-write" => Ok(LegacyBucketAcl::PublicReadWrite),
+            "authenticated-read" | "log-delivery-write" => {
+                Err(s3_error_response("NotImplemented", None, &[]))
+            }
+            other => Err(s3_error_response(
+                "InvalidArgument",
+                None,
+                &[("ArgumentName", "x-amz-acl"), ("ArgumentValue", other)],
+            )),
+        };
+    }
+    if body_nonempty {
+        return legacy_bucket_acl_from_policy(body);
+    }
+    Err(s3_error_response(
+        "MissingSecurityHeader",
+        None,
+        &[("MissingHeaderName", "x-amz-acl")],
+    ))
+}
+
+fn stamp_legacy_bucket_acl(headers: &mut HeaderKeyDict, acl: LegacyBucketAcl) {
+    match acl {
+        LegacyBucketAcl::Private => {
+            headers.set("X-Container-Write", ".");
+            headers.set("X-Container-Read", ".");
+        }
+        LegacyBucketAcl::PublicRead => {
+            headers.set("X-Container-Read", ".r:*,.rlistings");
+        }
+        LegacyBucketAcl::PublicReadWrite => {
+            headers.set("X-Container-Write", ".r:*");
+            headers.set("X-Container-Read", ".r:*,.rlistings");
+        }
+        LegacyBucketAcl::Unsupported => unreachable!("unsupported legacy ACL is rejected"),
+    }
+}
+
+async fn handle_legacy_acl_async(
     mut req: Request,
     cred: &S3Credential,
     owner: &Owner,
@@ -7071,6 +7480,118 @@ async fn handle_acl_async(
     key: Option<&str>,
     next: &AsyncNextFn,
 ) -> Response {
+    match req.method.as_str() {
+        "GET" | "HEAD" => {
+            let mut head =
+                make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), key));
+            stamp_auth(&mut head, cred);
+            let resp = async_call(next, head).await;
+            if !(200..300).contains(&resp.status) {
+                return map_swift_error(resp.status, Some(bucket), key);
+            }
+            xml_ok(acl_xml_from_swift_headers(
+                &owner.id,
+                resp.headers.get("X-Container-Read"),
+                resp.headers.get("X-Container-Write"),
+            ))
+        }
+        "PUT" if key.is_some() => s3_error_response("NotImplemented", None, &[]),
+        "PUT" => {
+            let body = match req.body.take().into_vec(MAX_CONTROL_BODY) {
+                Ok(body) => body,
+                Err(_) => return s3_error_response("InvalidRequest", None, &[]),
+            };
+            let acl = match legacy_bucket_acl_from_request(&req.headers, &body) {
+                Ok(acl) => acl,
+                Err(resp) => return resp,
+            };
+            let mut post =
+                make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
+            stamp_legacy_bucket_acl(&mut post.headers, acl);
+            stamp_auth(&mut post, cred);
+            let resp = async_call(next, post).await;
+            if (200..300).contains(&resp.status) {
+                let mut out = Response::new(200);
+                out.headers.set("Location", bucket);
+                out
+            } else {
+                map_swift_error(resp.status, Some(bucket), None)
+            }
+        }
+        _ => s3_error_response("MethodNotAllowed", None, &[]),
+    }
+}
+
+fn handle_legacy_acl(
+    mut req: Request,
+    cred: &S3Credential,
+    owner: &Owner,
+    bucket: &str,
+    key: Option<&str>,
+    next: &NextFn,
+) -> Response {
+    match req.method.as_str() {
+        "GET" | "HEAD" => {
+            let mut head =
+                make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), key));
+            stamp_auth(&mut head, cred);
+            let resp = next(head);
+            if !(200..300).contains(&resp.status) {
+                return map_swift_error(resp.status, Some(bucket), key);
+            }
+            xml_ok(acl_xml_from_swift_headers(
+                &owner.id,
+                resp.headers.get("X-Container-Read"),
+                resp.headers.get("X-Container-Write"),
+            ))
+        }
+        "PUT" if key.is_some() => s3_error_response("NotImplemented", None, &[]),
+        "PUT" => {
+            let body = match req.body.take().into_vec(MAX_CONTROL_BODY) {
+                Ok(body) => body,
+                Err(_) => return s3_error_response("InvalidRequest", None, &[]),
+            };
+            let acl = match legacy_bucket_acl_from_request(&req.headers, &body) {
+                Ok(acl) => acl,
+                Err(resp) => return resp,
+            };
+            let mut post =
+                make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
+            stamp_legacy_bucket_acl(&mut post.headers, acl);
+            stamp_auth(&mut post, cred);
+            let resp = next(post);
+            if (200..300).contains(&resp.status) {
+                let mut out = Response::new(200);
+                out.headers.set("Location", bucket);
+                out
+            } else {
+                map_swift_error(resp.status, Some(bucket), None)
+            }
+        }
+        _ => s3_error_response("MethodNotAllowed", None, &[]),
+    }
+}
+
+fn acl_input_error_response(error: &str) -> Response {
+    match error {
+        "InvalidArgument" | "InvalidRequest" | "UnexpectedContent" | "NotImplemented"
+        | "MalformedXML" => s3_error_response(error, None, &[]),
+        _ => s3_error_response("MalformedACLError", None, &[]),
+    }
+}
+
+async fn handle_acl_async(
+    mut req: Request,
+    cred: &S3Credential,
+    owner: &Owner,
+    bucket: &str,
+    key: Option<&str>,
+    s3_acl: bool,
+    next: &AsyncNextFn,
+) -> Response {
+    if !s3_acl {
+        return handle_legacy_acl_async(req, cred, owner, bucket, key, next).await;
+    }
     if let Some(obj) = key {
         // Object ACL: JSON grants and/or canned name in object sysmeta.
         // Python S3AclController.PUT cannot POST sysmeta; copy-self PUT
@@ -7096,12 +7617,33 @@ async fn handle_acl_async(
                     Ok(None) => return missing_object_version_response(obj, version_id.as_deref()),
                     Err(resp) => return resp,
                 };
-                xml_ok(object_acl_xml_from_headers(&owner.id, &target.head.headers))
+                let persist_owner = match existing_acl_owner_for_update(
+                    &target.head.headers,
+                    S3_OBJECT_ACL_JSON_META,
+                    &owner.id,
+                    s3_acl,
+                ) {
+                    Ok(owner) => owner,
+                    Err(resp) => return resp,
+                };
+                if s3_acl
+                    && object_acl_denies_read_acp(
+                        &target.head.headers,
+                        &cred.access_key,
+                        &cred.account,
+                    )
+                {
+                    return s3_error_response("AccessDenied", None, &[]);
+                }
+                xml_ok(object_acl_xml_from_headers(
+                    &persist_owner,
+                    &target.head.headers,
+                ))
             }
             "PUT" => {
-                let body = match req.body.take().into_vec(MAX_CONTROL_BODY) {
+                let body = match req.body.take().into_vec(MAX_ACP_XML_BODY) {
                     Ok(b) => b,
-                    Err(_) => return s3_error_response("InvalidRequest", None, &[]),
+                    Err(_) => return s3_error_response("MalformedXML", None, &[]),
                 };
                 let target = match resolve_object_version_async(
                     cred,
@@ -7116,23 +7658,59 @@ async fn handle_acl_async(
                     Ok(None) => return missing_object_version_response(obj, version_id.as_deref()),
                     Err(resp) => return resp,
                 };
-                let persist_owner =
-                    existing_json_owner(&target.head.headers, S3_OBJECT_ACL_JSON_META, &owner.id);
+                let persist_owner = match existing_acl_owner_for_update(
+                    &target.head.headers,
+                    S3_OBJECT_ACL_JSON_META,
+                    &owner.id,
+                    s3_acl,
+                ) {
+                    Ok(owner) => owner,
+                    Err(resp) => return resp,
+                };
+                if s3_acl
+                    && object_acl_denies_write_acp(
+                        &target.head.headers,
+                        &cred.access_key,
+                        &cred.account,
+                    )
+                {
+                    return s3_error_response("AccessDenied", None, &[]);
+                }
                 let input = match resolve_acl_put_input(
                     &req.headers,
                     if body.is_empty() { None } else { Some(&body) },
                     &persist_owner,
                 ) {
-                    Ok(AclPutInput::None) => AclPutInput::Canned("private".into()),
+                    Ok(AclPutInput::None) => {
+                        return s3_error_response("MissingSecurityHeader", None, &[])
+                    }
                     Ok(i) => i,
-                    Err(_) => return s3_error_response("InvalidArgument", None, &[]),
+                    Err(error) => return acl_input_error_response(&error),
                 };
+                if s3_acl && acl_input_changes_owner(&input, &persist_owner) {
+                    return s3_error_response("AccessDenied", None, &[]);
+                }
                 let mut chead =
                     make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
                 stamp_auth(&mut chead, cred);
                 let cresp = async_call(next, chead).await;
-                let bucket_owner =
-                    existing_json_owner(&cresp.headers, S3_BUCKET_ACL_JSON_META, &owner.id);
+                if !(200..300).contains(&cresp.status) {
+                    return map_swift_error(cresp.status, Some(bucket), None);
+                }
+                let needs_bucket_owner = matches!(
+                    &input,
+                    AclPutInput::Canned(c)
+                        if c == "bucket-owner-read" || c == "bucket-owner-full-control"
+                );
+                let bucket_owner = match existing_acl_owner_for_update(
+                    &cresp.headers,
+                    S3_BUCKET_ACL_JSON_META,
+                    &owner.id,
+                    s3_acl && needs_bucket_owner,
+                ) {
+                    Ok(owner) => owner,
+                    Err(resp) => return resp,
+                };
                 let mut put = make_swift_req(
                     "PUT",
                     &s3_to_swift_path(&cred.account, Some(&target.container), Some(&target.key)),
@@ -7171,23 +7749,50 @@ async fn handle_acl_async(
                 if !(200..300).contains(&resp.status) {
                     return map_swift_error(resp.status, Some(bucket), None);
                 }
-                if bucket_acl_denies_read_acp(&resp.headers, &cred.access_key, &cred.account) {
+                let persist_owner = match existing_acl_owner_for_update(
+                    &resp.headers,
+                    S3_BUCKET_ACL_JSON_META,
+                    &owner.id,
+                    s3_acl,
+                ) {
+                    Ok(owner) => owner,
+                    Err(resp) => return resp,
+                };
+                if s3_acl
+                    && bucket_acl_denies_read_acp(&resp.headers, &cred.access_key, &cred.account)
+                {
                     return s3_error_response("AccessDenied", None, &[]);
                 }
-                xml_ok(bucket_acl_xml_from_headers(&owner.id, &resp.headers))
+                xml_ok(bucket_acl_xml_from_headers(&persist_owner, &resp.headers))
             }
             "PUT" => {
-                let body = match req.body.take().into_vec(MAX_CONTROL_BODY) {
+                let body = match req.body.take().into_vec(MAX_ACP_XML_BODY) {
                     Ok(b) => b,
-                    Err(_) => return s3_error_response("InvalidRequest", None, &[]),
+                    Err(_) => return s3_error_response("MalformedXML", None, &[]),
                 };
                 let mut head =
                     make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
                 stamp_auth(&mut head, cred);
                 let existing = async_call(next, head).await;
-                let persist_owner =
-                    existing_json_owner(&existing.headers, S3_BUCKET_ACL_JSON_META, &owner.id);
-                if bucket_acl_denies_write_acp(&existing.headers, &cred.access_key, &cred.account) {
+                if !(200..300).contains(&existing.status) {
+                    return map_swift_error(existing.status, Some(bucket), None);
+                }
+                let persist_owner = match existing_acl_owner_for_update(
+                    &existing.headers,
+                    S3_BUCKET_ACL_JSON_META,
+                    &owner.id,
+                    s3_acl,
+                ) {
+                    Ok(owner) => owner,
+                    Err(resp) => return resp,
+                };
+                if s3_acl
+                    && bucket_acl_denies_write_acp(
+                        &existing.headers,
+                        &cred.access_key,
+                        &cred.account,
+                    )
+                {
                     return s3_error_response("AccessDenied", None, &[]);
                 }
                 let input = match resolve_acl_put_input(
@@ -7195,13 +7800,15 @@ async fn handle_acl_async(
                     if body.is_empty() { None } else { Some(&body) },
                     &persist_owner,
                 ) {
-                    Ok(AclPutInput::None) => AclPutInput::Canned("private".into()),
-                    Ok(i) => i,
-                    Err(e) if e == "InvalidArgument" => {
-                        return s3_error_response("InvalidArgument", None, &[])
+                    Ok(AclPutInput::None) => {
+                        return s3_error_response("MissingSecurityHeader", None, &[])
                     }
-                    Err(_) => return s3_error_response("MalformedACLError", None, &[]),
+                    Ok(i) => i,
+                    Err(error) => return acl_input_error_response(&error),
                 };
+                if s3_acl && acl_input_changes_owner(&input, &persist_owner) {
+                    return s3_error_response("AccessDenied", None, &[]);
+                }
                 let mut post =
                     make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
                 apply_bucket_acl_put(&mut post.headers, &input, &persist_owner, true);
@@ -7228,8 +7835,12 @@ fn handle_acl(
     owner: &Owner,
     bucket: &str,
     key: Option<&str>,
+    s3_acl: bool,
     next: &NextFn,
 ) -> Response {
+    if !s3_acl {
+        return handle_legacy_acl(req, cred, owner, bucket, key, next);
+    }
     if let Some(obj) = key {
         // Object ACL: JSON grants and/or canned name in object sysmeta.
         // Copy-self PUT: see handle_acl_async. POST cannot persist object sysmeta.
@@ -7248,12 +7859,33 @@ fn handle_acl(
                         }
                         Err(resp) => return resp,
                     };
-                xml_ok(object_acl_xml_from_headers(&owner.id, &target.head.headers))
+                let persist_owner = match existing_acl_owner_for_update(
+                    &target.head.headers,
+                    S3_OBJECT_ACL_JSON_META,
+                    &owner.id,
+                    s3_acl,
+                ) {
+                    Ok(owner) => owner,
+                    Err(resp) => return resp,
+                };
+                if s3_acl
+                    && object_acl_denies_read_acp(
+                        &target.head.headers,
+                        &cred.access_key,
+                        &cred.account,
+                    )
+                {
+                    return s3_error_response("AccessDenied", None, &[]);
+                }
+                xml_ok(object_acl_xml_from_headers(
+                    &persist_owner,
+                    &target.head.headers,
+                ))
             }
             "PUT" => {
-                let body = match req.body.take().into_vec(MAX_CONTROL_BODY) {
+                let body = match req.body.take().into_vec(MAX_ACP_XML_BODY) {
                     Ok(b) => b,
-                    Err(_) => return s3_error_response("InvalidRequest", None, &[]),
+                    Err(_) => return s3_error_response("MalformedXML", None, &[]),
                 };
                 let target =
                     match resolve_object_version(cred, bucket, obj, version_id.as_deref(), next) {
@@ -7263,26 +7895,59 @@ fn handle_acl(
                         }
                         Err(resp) => return resp,
                     };
-                let persist_owner =
-                    existing_json_owner(&target.head.headers, S3_OBJECT_ACL_JSON_META, &owner.id);
+                let persist_owner = match existing_acl_owner_for_update(
+                    &target.head.headers,
+                    S3_OBJECT_ACL_JSON_META,
+                    &owner.id,
+                    s3_acl,
+                ) {
+                    Ok(owner) => owner,
+                    Err(resp) => return resp,
+                };
+                if s3_acl
+                    && object_acl_denies_write_acp(
+                        &target.head.headers,
+                        &cred.access_key,
+                        &cred.account,
+                    )
+                {
+                    return s3_error_response("AccessDenied", None, &[]);
+                }
                 let input = match resolve_acl_put_input(
                     &req.headers,
                     if body.is_empty() { None } else { Some(&body) },
                     &persist_owner,
                 ) {
-                    Ok(AclPutInput::None) => AclPutInput::Canned("private".into()),
-                    Ok(i) => i,
-                    Err(e) if e == "InvalidArgument" => {
-                        return s3_error_response("InvalidArgument", None, &[])
+                    Ok(AclPutInput::None) => {
+                        return s3_error_response("MissingSecurityHeader", None, &[])
                     }
-                    Err(_) => return s3_error_response("MalformedACLError", None, &[]),
+                    Ok(i) => i,
+                    Err(error) => return acl_input_error_response(&error),
                 };
+                if s3_acl && acl_input_changes_owner(&input, &persist_owner) {
+                    return s3_error_response("AccessDenied", None, &[]);
+                }
                 let mut chead =
                     make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
                 stamp_auth(&mut chead, cred);
                 let cresp = next(chead);
-                let bucket_owner =
-                    existing_json_owner(&cresp.headers, S3_BUCKET_ACL_JSON_META, &owner.id);
+                if !(200..300).contains(&cresp.status) {
+                    return map_swift_error(cresp.status, Some(bucket), None);
+                }
+                let needs_bucket_owner = matches!(
+                    &input,
+                    AclPutInput::Canned(c)
+                        if c == "bucket-owner-read" || c == "bucket-owner-full-control"
+                );
+                let bucket_owner = match existing_acl_owner_for_update(
+                    &cresp.headers,
+                    S3_BUCKET_ACL_JSON_META,
+                    &owner.id,
+                    s3_acl && needs_bucket_owner,
+                ) {
+                    Ok(owner) => owner,
+                    Err(resp) => return resp,
+                };
                 let mut put = make_swift_req(
                     "PUT",
                     &s3_to_swift_path(&cred.account, Some(&target.container), Some(&target.key)),
@@ -7321,23 +7986,50 @@ fn handle_acl(
                 if !(200..300).contains(&resp.status) {
                     return map_swift_error(resp.status, Some(bucket), None);
                 }
-                if bucket_acl_denies_read_acp(&resp.headers, &cred.access_key, &cred.account) {
+                let persist_owner = match existing_acl_owner_for_update(
+                    &resp.headers,
+                    S3_BUCKET_ACL_JSON_META,
+                    &owner.id,
+                    s3_acl,
+                ) {
+                    Ok(owner) => owner,
+                    Err(resp) => return resp,
+                };
+                if s3_acl
+                    && bucket_acl_denies_read_acp(&resp.headers, &cred.access_key, &cred.account)
+                {
                     return s3_error_response("AccessDenied", None, &[]);
                 }
-                xml_ok(bucket_acl_xml_from_headers(&owner.id, &resp.headers))
+                xml_ok(bucket_acl_xml_from_headers(&persist_owner, &resp.headers))
             }
             "PUT" => {
-                let body = match req.body.take().into_vec(MAX_CONTROL_BODY) {
+                let body = match req.body.take().into_vec(MAX_ACP_XML_BODY) {
                     Ok(b) => b,
-                    Err(_) => return s3_error_response("InvalidRequest", None, &[]),
+                    Err(_) => return s3_error_response("MalformedXML", None, &[]),
                 };
                 let mut head =
                     make_swift_req("HEAD", &s3_to_swift_path(&cred.account, Some(bucket), None));
                 stamp_auth(&mut head, cred);
                 let existing = next(head);
-                let persist_owner =
-                    existing_json_owner(&existing.headers, S3_BUCKET_ACL_JSON_META, &owner.id);
-                if bucket_acl_denies_write_acp(&existing.headers, &cred.access_key, &cred.account) {
+                if !(200..300).contains(&existing.status) {
+                    return map_swift_error(existing.status, Some(bucket), None);
+                }
+                let persist_owner = match existing_acl_owner_for_update(
+                    &existing.headers,
+                    S3_BUCKET_ACL_JSON_META,
+                    &owner.id,
+                    s3_acl,
+                ) {
+                    Ok(owner) => owner,
+                    Err(resp) => return resp,
+                };
+                if s3_acl
+                    && bucket_acl_denies_write_acp(
+                        &existing.headers,
+                        &cred.access_key,
+                        &cred.account,
+                    )
+                {
                     return s3_error_response("AccessDenied", None, &[]);
                 }
                 let input = match resolve_acl_put_input(
@@ -7345,13 +8037,15 @@ fn handle_acl(
                     if body.is_empty() { None } else { Some(&body) },
                     &persist_owner,
                 ) {
-                    Ok(AclPutInput::None) => AclPutInput::Canned("private".into()),
-                    Ok(i) => i,
-                    Err(e) if e == "InvalidArgument" => {
-                        return s3_error_response("InvalidArgument", None, &[])
+                    Ok(AclPutInput::None) => {
+                        return s3_error_response("MissingSecurityHeader", None, &[])
                     }
-                    Err(_) => return s3_error_response("MalformedACLError", None, &[]),
+                    Ok(i) => i,
+                    Err(error) => return acl_input_error_response(&error),
                 };
+                if s3_acl && acl_input_changes_owner(&input, &persist_owner) {
+                    return s3_error_response("AccessDenied", None, &[]);
+                }
                 let mut post =
                     make_swift_req("POST", &s3_to_swift_path(&cred.account, Some(bucket), None));
                 apply_bucket_acl_put(&mut post.headers, &input, &persist_owner, true);
@@ -7964,6 +8658,7 @@ async fn handle_versioned_get_head_async(
     method: &str,
     version_id_q: Option<&str>,
     range: Option<&str>,
+    s3_acl: bool,
     next: &AsyncNextFn,
 ) -> Response {
     let target = match resolve_object_version_async(cred, bucket, key, version_id_q, next).await {
@@ -7994,10 +8689,10 @@ async fn handle_versioned_get_head_async(
         }
         resp
     };
-    if let Some(denied) = deny_if_object_acl_blocks_read(cred, &resp.headers) {
+    if let Some(denied) = deny_if_object_acl_blocks_read(s3_acl, cred, &resp.headers) {
         return denied;
     }
-    let mut out = translate_object_get_head(method, resp, cred, &[], range);
+    let mut out = translate_object_get_head(method, resp, &[], range);
     if (200..300).contains(&out.status) {
         if let Some(version_id) = response_version {
             out.headers.set(HDR_VERSION_ID, version_id);
@@ -8619,11 +9314,10 @@ async fn handle_mpu_init_async(
     }
 
     map_amz_meta(&mut req);
-    match resolve_acl_put_input(&req.headers, None, &owner_for(cred).id) {
-        Ok(input) => {
-            apply_object_acl_put(&mut req.headers, &input, &owner_for(cred).id, api.s3_acl);
-        }
-        Err(_) => return s3_error_response("InvalidArgument", None, &[]),
+    if let Err(resp) =
+        stamp_resolved_put_acl(api.s3_acl, &mut req.headers, &owner_for(cred).id, true)
+    {
+        return resp;
     }
     if let Err(resp) = apply_request_object_lock_headers(&mut req.headers) {
         return resp;
@@ -8645,7 +9339,7 @@ async fn handle_mpu_init_async(
         "PUT",
         &s3_to_swift_path(&cred.account, Some(&segs), Some(&marker)),
     );
-    copy_mpu_object_headers(&req.headers, &mut put_m.headers);
+    copy_mpu_object_headers(&req.headers, &mut put_m.headers, api.s3_acl);
     persist_s3_object_headers(&mut put_m);
     put_m.body = Body::from(Vec::from(b"upload".as_slice()));
     put_m.headers.set("Content-Length", "6");
@@ -8766,7 +9460,7 @@ async fn handle_mpu_complete_async(
         "PUT",
         &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
     );
-    copy_mpu_object_headers(&upload_info.headers, &mut put.headers);
+    copy_mpu_object_headers(&upload_info.headers, &mut put.headers, api.s3_acl);
     persist_s3_object_headers(&mut put);
     put.headers.set(SYS_S3API_UPLOAD_ID, upload_id);
     if let Some(ref etag) = s3_etag {
@@ -8831,7 +9525,9 @@ async fn handle_mpu_complete_async(
             {
                 return blocked;
             }
-            if let Some(blocked) = deny_if_object_acl_blocks_write(cred, &existing.headers) {
+            if let Some(blocked) =
+                deny_if_object_acl_blocks_write(api.s3_acl, cred, &existing.headers)
+            {
                 return blocked;
             }
         }
@@ -9224,7 +9920,8 @@ async fn handle_versioned_object_put_async(
     match control_head_object_async(&cred, bucket, key, &next).await {
         Ok(ObjectHead::Missing) => {}
         Ok(ObjectHead::Present(cur)) => {
-            if let Some(blocked) = deny_if_object_acl_blocks_write(&cred, &cur.headers) {
+            if let Some(blocked) = deny_if_object_acl_blocks_write(api.s3_acl, &cred, &cur.headers)
+            {
                 return blocked;
             }
             let bypass_requested = bypass_governance_requested(
@@ -9339,7 +10036,7 @@ async fn complete_mpu_versioned_async(
     let mut idx = snap.index.clone();
     match control_head_object_async(cred, bucket, key, next).await {
         Ok(ObjectHead::Present(cur)) => {
-            if let Some(blocked) = deny_if_object_acl_blocks_write(cred, &cur.headers) {
+            if let Some(blocked) = deny_if_object_acl_blocks_write(api.s3_acl, cred, &cur.headers) {
                 return blocked;
             }
             if let Err(resp) = maybe_archive_current_for_write_async(
@@ -10252,6 +10949,7 @@ async fn archived_null_replacement_required_async(
     cred: &S3Credential,
     bucket: &str,
     key: &str,
+    s3_acl: bool,
     clock_ok: bool,
     bypass: GovernanceBypass,
     next: &AsyncNextFn,
@@ -10264,7 +10962,7 @@ async fn archived_null_replacement_required_async(
             if let Some(blocked) = worm_guard(&head.headers, clock_ok, bypass) {
                 return Err(blocked);
             }
-            if let Some(blocked) = deny_if_object_acl_blocks_write(cred, &head.headers) {
+            if let Some(blocked) = deny_if_object_acl_blocks_write(s3_acl, cred, &head.headers) {
                 return Err(blocked);
             }
             Ok(true)
@@ -10276,6 +10974,7 @@ fn archived_null_replacement_required(
     cred: &S3Credential,
     bucket: &str,
     key: &str,
+    s3_acl: bool,
     clock_ok: bool,
     bypass: GovernanceBypass,
     next: &NextFn,
@@ -10288,7 +10987,7 @@ fn archived_null_replacement_required(
             if let Some(blocked) = worm_guard(&head.headers, clock_ok, bypass) {
                 return Err(blocked);
             }
-            if let Some(blocked) = deny_if_object_acl_blocks_write(cred, &head.headers) {
+            if let Some(blocked) = deny_if_object_acl_blocks_write(s3_acl, cred, &head.headers) {
                 return Err(blocked);
             }
             Ok(true)
@@ -10495,6 +11194,7 @@ fn handle_versioned_object(
                 }
                 _ => None,
             },
+            api.s3_acl,
             api.worm_clock.clock_ok(),
             bypass,
             next,
@@ -10757,7 +11457,9 @@ fn handle_versioned_put_once(
     let overwrite_null = fixed_version_id == Some(NULL_VERSION_ID)
         && VersioningStatus::Suspended.suspended_put_overwrites_null();
     let archived_null_exists = if overwrite_null {
-        match archived_null_replacement_required(cred, bucket, key, clock_ok, bypass, next) {
+        match archived_null_replacement_required(
+            cred, bucket, key, api.s3_acl, clock_ok, bypass, next,
+        ) {
             Ok(exists) => exists,
             Err(resp) => return resp,
         }
@@ -10770,7 +11472,7 @@ fn handle_versioned_put_once(
     }
     let current_exists = (200..300).contains(&cur.status);
     if current_exists {
-        if let Some(blocked) = deny_if_object_acl_blocks_write(cred, &cur.headers) {
+        if let Some(blocked) = deny_if_object_acl_blocks_write(api.s3_acl, cred, &cur.headers) {
             return blocked;
         }
         if let Err(resp) = maybe_archive_current_for_write(
@@ -10810,11 +11512,9 @@ fn handle_versioned_put_once(
     if let Some(resp) = apply_copy_source(&mut req) {
         return resp;
     }
-    match resolve_acl_put_input(&req.headers, None, &cred.access_key) {
-        Ok(input) => {
-            apply_object_acl_put(&mut req.headers, &input, &cred.access_key, api.s3_acl);
-        }
-        Err(_) => return s3_error_response("InvalidArgument", None, &[]),
+    if let Err(resp) = stamp_resolved_put_acl(api.s3_acl, &mut req.headers, &cred.access_key, true)
+    {
+        return resp;
     }
     if let Err(resp) = apply_request_object_lock_headers(&mut req.headers) {
         return resp;
@@ -10951,7 +11651,7 @@ fn finish_versioned_get_head(
     next: &NextFn,
     api: &S3Api,
 ) -> Response {
-    if let Some(denied) = deny_if_object_acl_blocks_read(cred, &resp.headers) {
+    if let Some(denied) = deny_if_object_acl_blocks_read(api.s3_acl, cred, &resp.headers) {
         return denied;
     }
     if let Some(err) = maybe_archive_due_cold_on_get_head(
@@ -10967,7 +11667,7 @@ fn finish_versioned_get_head(
     ) {
         return err;
     }
-    let mut out = translate_object_get_head(method, resp, cred, &[], range);
+    let mut out = translate_object_get_head(method, resp, &[], range);
     if (200..300).contains(&out.status) {
         if let Some(vid) = version_id {
             out.headers.set(HDR_VERSION_ID, vid);
@@ -11048,6 +11748,7 @@ async fn handle_versioned_delete_async(
     key: &str,
     version_id_q: Option<&str>,
     fixed_delete_marker_id: Option<&str>,
+    s3_acl: bool,
     clock_ok: bool,
     bypass: GovernanceBypass,
     next: &AsyncNextFn,
@@ -11061,6 +11762,7 @@ async fn handle_versioned_delete_async(
             key,
             version_id_q,
             fixed_delete_marker_id,
+            s3_acl,
             clock_ok,
             bypass,
             next,
@@ -11083,6 +11785,7 @@ fn handle_versioned_delete(
     key: &str,
     version_id_q: Option<&str>,
     fixed_delete_marker_id: Option<&str>,
+    s3_acl: bool,
     clock_ok: bool,
     bypass: GovernanceBypass,
     next: &NextFn,
@@ -11096,6 +11799,7 @@ fn handle_versioned_delete(
             key,
             version_id_q,
             fixed_delete_marker_id,
+            s3_acl,
             clock_ok,
             bypass,
             next,
@@ -11117,6 +11821,7 @@ async fn handle_versioned_delete_once_async(
     key: &str,
     version_id_q: Option<&str>,
     fixed_delete_marker_id: Option<&str>,
+    s3_acl: bool,
     clock_ok: bool,
     bypass: GovernanceBypass,
     next: &AsyncNextFn,
@@ -11143,7 +11848,7 @@ async fn handle_versioned_delete_once_async(
         if let Some(blocked) = worm_guard(&target.head.headers, clock_ok, bypass) {
             return blocked;
         }
-        if let Some(blocked) = deny_if_object_acl_blocks_write(cred, &target.head.headers) {
+        if let Some(blocked) = deny_if_object_acl_blocks_write(s3_acl, cred, &target.head.headers) {
             return blocked;
         }
 
@@ -11306,15 +12011,17 @@ async fn handle_versioned_delete_once_async(
     }
     let current_exists = (200..300).contains(&cur.status);
     if current_exists {
-        if let Some(blocked) = deny_if_object_acl_blocks_write(cred, &cur.headers) {
+        if let Some(blocked) = deny_if_object_acl_blocks_write(s3_acl, cred, &cur.headers) {
             return blocked;
         }
     }
     let overwrite_null = fixed_delete_marker_id == Some(NULL_VERSION_ID)
         && VersioningStatus::Suspended.suspended_put_overwrites_null();
     let archived_null_exists = if overwrite_null {
-        match archived_null_replacement_required_async(cred, bucket, key, clock_ok, bypass, next)
-            .await
+        match archived_null_replacement_required_async(
+            cred, bucket, key, s3_acl, clock_ok, bypass, next,
+        )
+        .await
         {
             Ok(exists) => exists,
             Err(resp) => return resp,
@@ -11404,6 +12111,7 @@ fn handle_versioned_delete_once(
     key: &str,
     version_id_q: Option<&str>,
     fixed_delete_marker_id: Option<&str>,
+    s3_acl: bool,
     clock_ok: bool,
     bypass: GovernanceBypass,
     next: &NextFn,
@@ -11428,7 +12136,7 @@ fn handle_versioned_delete_once(
         if let Some(blocked) = worm_guard(&target.head.headers, clock_ok, bypass) {
             return blocked;
         }
-        if let Some(blocked) = deny_if_object_acl_blocks_write(cred, &target.head.headers) {
+        if let Some(blocked) = deny_if_object_acl_blocks_write(s3_acl, cred, &target.head.headers) {
             return blocked;
         }
 
@@ -11542,14 +12250,15 @@ fn handle_versioned_delete_once(
     }
     let current_exists = (200..300).contains(&cur.status);
     if current_exists {
-        if let Some(blocked) = deny_if_object_acl_blocks_write(cred, &cur.headers) {
+        if let Some(blocked) = deny_if_object_acl_blocks_write(s3_acl, cred, &cur.headers) {
             return blocked;
         }
     }
     let overwrite_null = fixed_delete_marker_id == Some(NULL_VERSION_ID)
         && VersioningStatus::Suspended.suspended_put_overwrites_null();
     let archived_null_exists = if overwrite_null {
-        match archived_null_replacement_required(cred, bucket, key, clock_ok, bypass, next) {
+        match archived_null_replacement_required(cred, bucket, key, s3_acl, clock_ok, bypass, next)
+        {
             Ok(exists) => exists,
             Err(resp) => return resp,
         }
@@ -12350,6 +13059,7 @@ fn handle_restore(
     bucket: &str,
     key: &str,
     version_id: Option<&str>,
+    s3_acl: bool,
     cold_map: &crate::cold_tier::ColdPolicyMap,
     cold_backend: Option<&Arc<dyn ColdBackend>>,
     next: &NextFn,
@@ -12361,9 +13071,9 @@ fn handle_restore(
         Err(resp) => return resp,
     };
     let acl_denied = if req.method == "POST" {
-        deny_if_object_acl_blocks_write(cred, &target.head.headers)
+        deny_if_object_acl_blocks_write(s3_acl, cred, &target.head.headers)
     } else {
-        deny_if_object_acl_blocks_read(cred, &target.head.headers)
+        deny_if_object_acl_blocks_read(s3_acl, cred, &target.head.headers)
     };
     if let Some(denied) = acl_denied {
         return denied;
@@ -12673,9 +13383,21 @@ async fn handle_object_lock_async(
     }
 }
 
-fn copy_mpu_object_headers(src: &HeaderKeyDict, dst: &mut HeaderKeyDict) {
+fn copy_mpu_object_headers(
+    src: &HeaderKeyDict,
+    dst: &mut HeaderKeyDict,
+    copy_structured_acl: bool,
+) {
     for (name, value) in src.iter() {
         let lower = name.to_ascii_lowercase();
+        if !copy_structured_acl
+            && matches!(
+                lower.as_str(),
+                "x-object-sysmeta-s3-acl" | "x-object-sysmeta-s3-acl-json"
+            )
+        {
+            continue;
+        }
         if lower.starts_with("x-object-meta-")
             || matches!(
                 lower.as_str(),
@@ -12737,11 +13459,10 @@ fn handle_mpu_init(
     }
 
     map_amz_meta(&mut req);
-    match resolve_acl_put_input(&req.headers, None, &owner_for(cred).id) {
-        Ok(input) => {
-            apply_object_acl_put(&mut req.headers, &input, &owner_for(cred).id, api.s3_acl);
-        }
-        Err(_) => return s3_error_response("InvalidArgument", None, &[]),
+    if let Err(resp) =
+        stamp_resolved_put_acl(api.s3_acl, &mut req.headers, &owner_for(cred).id, true)
+    {
+        return resp;
     }
     if let Err(resp) = apply_request_object_lock_headers(&mut req.headers) {
         return resp;
@@ -12764,7 +13485,7 @@ fn handle_mpu_init(
         "PUT",
         &s3_to_swift_path(&cred.account, Some(&segs), Some(&marker)),
     );
-    copy_mpu_object_headers(&req.headers, &mut put_m.headers);
+    copy_mpu_object_headers(&req.headers, &mut put_m.headers, api.s3_acl);
     persist_s3_object_headers(&mut put_m);
     put_m.body = Body::from(Vec::from(b"upload".as_slice()));
     put_m.headers.set("Content-Length", "6");
@@ -13511,7 +14232,7 @@ fn handle_mpu_complete(
         "PUT",
         &s3_to_swift_path(&cred.account, Some(bucket), Some(key)),
     );
-    copy_mpu_object_headers(&upload_info.headers, &mut put.headers);
+    copy_mpu_object_headers(&upload_info.headers, &mut put.headers, api.s3_acl);
     persist_s3_object_headers(&mut put);
     put.headers.set(SYS_S3API_UPLOAD_ID, upload_id);
     if let Some(ref etag) = s3_etag {
@@ -13575,7 +14296,7 @@ fn handle_mpu_complete(
         {
             return blocked;
         }
-        if let Some(blocked) = acl_write_check_object(cred, bucket, key, next) {
+        if let Some(blocked) = acl_write_check_object(api.s3_acl, cred, bucket, key, next) {
             return blocked;
         }
         if let Err(resp) = apply_request_object_lock_headers(&mut put.headers) {
@@ -14284,7 +15005,9 @@ mod tests {
 
     #[test]
     fn anonymous_get_private_object_acl_denied_even_if_backend_200() {
-        let api = S3Api::new(cred_map()).with_anonymous_account("AUTH_test");
+        let api = S3Api::new(cred_map())
+            .with_s3_acl(true)
+            .with_anonymous_account("AUTH_test");
         let req = Request {
             method: "GET".into(),
             path: "/pubbucket/secret".into(),
@@ -14307,7 +15030,9 @@ mod tests {
 
     #[test]
     fn anonymous_get_public_read_object_acl_allowed() {
-        let api = S3Api::new(cred_map()).with_anonymous_account("AUTH_test");
+        let api = S3Api::new(cred_map())
+            .with_s3_acl(true)
+            .with_anonymous_account("AUTH_test");
         let req = Request {
             method: "GET".into(),
             path: "/pubbucket/pub".into(),
@@ -14323,6 +15048,77 @@ mod tests {
         });
         let resp = api.handle(req, &next);
         assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn native_async_anonymous_object_acl_matrix_matches_sync() {
+        for method in ["GET", "HEAD"] {
+            for (stored_header, stored_value, expected) in [
+                (S3_OBJECT_ACL_META, "private", 403),
+                (S3_OBJECT_ACL_META, "public-read", 200),
+                (S3_OBJECT_ACL_JSON_META, "{", 500),
+                (S3_OBJECT_ACL_JSON_META, "", 403),
+            ] {
+                let api = S3Api::new(cred_map())
+                    .with_s3_acl(true)
+                    .with_anonymous_account("AUTH_test");
+                let req = Request {
+                    method: method.into(),
+                    path: "/pubbucket/object".into(),
+                    query_string: String::new(),
+                    headers: HeaderKeyDict::new(),
+                    body: Body::empty(),
+                };
+                let next = async_ok(move |req| {
+                    assert_eq!(req.path, "/v1/AUTH_test/pubbucket/object");
+                    assert!(req.headers.get("X-Backend-Authorize-Override").is_none());
+                    let mut resp = Response::new(200);
+                    resp.headers.set(stored_header, stored_value);
+                    resp.headers.set("ETag", "abc");
+                    resp.body = Body::from(b"anonymous-body".to_vec());
+                    resp
+                });
+                let resp = block_on_s3(api.handle_s3_async(req, next));
+                assert_eq!(
+                    resp.status, expected,
+                    "{method} {stored_header}={stored_value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_mode_ignores_stored_acl_for_sync_and_async_anonymous_reads() {
+        for asynchronous in [false, true] {
+            let api = S3Api::new(cred_map()).with_anonymous_account("AUTH_test");
+            let req = Request {
+                method: "GET".into(),
+                path: "/pubbucket/object".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: Body::empty(),
+            };
+            let backend: NextFn = Arc::new(|req: Request| {
+                assert_eq!(req.path, "/v1/AUTH_test/pubbucket/object");
+                let mut resp = Response::new(200);
+                resp.headers.set(S3_OBJECT_ACL_META, "private");
+                resp.headers.set(S3_OBJECT_ACL_JSON_META, "{");
+                resp.body = Body::from(b"legacy-public".to_vec());
+                resp
+            });
+            let resp = if asynchronous {
+                let backend_async = Arc::clone(&backend);
+                block_on_s3(api.handle_s3_async(req, async_ok(move |req| backend_async(req))))
+            } else {
+                api.handle(req, &backend)
+            };
+            assert_eq!(resp.status, 200, "asynchronous={asynchronous}");
+            assert_eq!(
+                resp.body.into_vec(u64::MAX).unwrap(),
+                b"legacy-public",
+                "asynchronous={asynchronous}"
+            );
+        }
     }
 
     #[test]
@@ -17411,22 +18207,94 @@ mod tests {
             "{kms_body}"
         );
 
-        // SSE-C customer headers must reach the backend (Python without
-        // encryption middleware does not 501 them).
+        // The no-encrypter profile matches Python's wire response, but key
+        // material must not reach a backend that cannot consume it. A 200
+        // here proves compatibility only, never encryption at rest.
         let ssec_next: NextFn = Arc::new(|r: Request| {
-            assert!(r
-                .headers
-                .get("x-amz-server-side-encryption-customer-algorithm")
-                .is_some());
+            if r.method == "HEAD" {
+                assert_eq!(r.path, "/v1/AUTH_test/mybucket");
+                return Response::new(204);
+            }
+            assert_eq!(r.method, "PUT");
+            for name in [
+                "x-amz-server-side-encryption-customer-algorithm",
+                "x-amz-server-side-encryption-customer-key",
+                "x-amz-server-side-encryption-customer-key-md5",
+                "x-amz-server-side-encryption-customer-unknown",
+            ] {
+                assert!(r.headers.get(name).is_none(), "leaked {name}");
+            }
             Response::new(201)
         });
         let mut ssec = base_s3_req("PUT", "/mybucket/k", "");
         ssec.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         ssec.headers
             .set("x-amz-server-side-encryption-customer-algorithm", "AES256");
+        ssec.headers.set(
+            "x-amz-server-side-encryption-customer-key",
+            "secret-key-material",
+        );
+        ssec.headers.set(
+            "x-amz-server-side-encryption-customer-key-md5",
+            "secret-key-md5",
+        );
+        ssec.headers.set(
+            "x-amz-server-side-encryption-customer-unknown",
+            "must-strip",
+        );
         ssec.body = Body::from(b"x".to_vec());
         let ssec_resp = api.handle(sign_request(ssec, "testing"), &ssec_next);
         assert_eq!(ssec_resp.status, 200);
+    }
+
+    #[test]
+    fn native_streaming_sse_c_compat_never_forwards_customer_key_material() {
+        let api = S3Api::new(cred_map());
+        let mut req = unsigned_signed_put("/mybucket/k", "");
+        for (name, value) in [
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            (
+                "x-amz-server-side-encryption-customer-key",
+                "secret-key-material",
+            ),
+            (
+                "x-amz-server-side-encryption-customer-key-md5",
+                "secret-key-md5",
+            ),
+            (
+                "x-amz-server-side-encryption-customer-unknown",
+                "must-strip",
+            ),
+        ] {
+            req.headers.set(name, value);
+        }
+        let areq = async_from_signed(req, b"plaintext-compat-body".to_vec());
+        let next: StreamingAsyncNextFn = Arc::new(|mut areq| {
+            Box::pin(async move {
+                if areq.method == "HEAD" {
+                    return Response::new(204);
+                }
+                assert_eq!(areq.method, "PUT");
+                for name in [
+                    "x-amz-server-side-encryption-customer-algorithm",
+                    "x-amz-server-side-encryption-customer-key",
+                    "x-amz-server-side-encryption-customer-key-md5",
+                    "x-amz-server-side-encryption-customer-unknown",
+                ] {
+                    assert!(areq.headers.get(name).is_none(), "leaked {name}");
+                }
+                let mut body = Vec::new();
+                while let Some(chunk) = areq.body.next_chunk().await.unwrap() {
+                    body.extend_from_slice(&chunk);
+                }
+                assert_eq!(body, b"plaintext-compat-body");
+                let mut resp = Response::new(201);
+                resp.headers.set("ETag", "compat-only");
+                resp
+            })
+        });
+        let resp = block_on_s3(api.put_object_streaming(areq, next));
+        assert_eq!(resp.status, 200);
     }
 
     #[allow(dead_code)]
@@ -18414,15 +19282,28 @@ mod tests {
 
     #[test]
     fn put_bucket_acl_public_read_write() {
-        let api = S3Api::new(cred_map());
+        let api = S3Api::new(cred_map()).with_s3_acl(true);
         let mut req = base_s3_req("PUT", "/mybucket", "acl");
         req.headers.set("x-amz-acl", "public-read-write");
         req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         let req = sign_request(req, "testing");
         let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                assert_eq!(r.path, "/v1/AUTH_test/mybucket");
+                let mut resp = Response::new(204);
+                resp.headers
+                    .set(S3_BUCKET_ACL_JSON_META, private_owner_acl_json());
+                return resp;
+            }
             assert_eq!(r.method, "POST");
             assert_eq!(r.headers.get("X-Container-Read"), Some(".r:*,.rlistings"));
-            assert_eq!(r.headers.get("X-Container-Write"), Some(".r:*"));
+            // Peregrine stores the AllUsers WRITE grant in structured
+            // sysmeta because the container server rejects `.r:*` writes.
+            assert_eq!(r.headers.get("X-Container-Write"), Some(""));
+            assert!(r
+                .headers
+                .get(S3_BUCKET_ACL_JSON_META)
+                .is_some_and(|v| v.contains("AllUsers") && v.contains("WRITE")));
             Response::new(204)
         });
         let resp = api.handle(req, &next);
@@ -18438,6 +19319,10 @@ mod tests {
         req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         let req = sign_request(req, "testing");
         let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                assert_eq!(r.path, "/v1/AUTH_test/mybucket");
+                return Response::new(204);
+            }
             assert_eq!(r.method, "POST");
             Response::new(204)
         });
@@ -18449,14 +19334,20 @@ mod tests {
 
     #[test]
     fn put_object_stores_canned_acl_sysmeta() {
-        let api = S3Api::new(cred_map());
+        let api = S3Api::new(cred_map()).with_s3_acl(true);
         let mut req = base_s3_req("PUT", "/mybucket/obj1", "");
         req.headers.set("x-amz-acl", "public-read");
         req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         req.body = Body::from(b"hi".to_vec());
         let req = sign_request(req, "testing");
         let next: NextFn = Arc::new(|r| {
-            if r.method == "HEAD" {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                let mut resp = Response::new(204);
+                resp.headers
+                    .set(S3_BUCKET_ACL_JSON_META, private_owner_acl_json());
+                return resp;
+            }
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket/obj1" {
                 return Response::new(404);
             }
             assert_eq!(r.method, "PUT");
@@ -18473,13 +19364,17 @@ mod tests {
 
     #[test]
     fn get_object_acl_from_sysmeta() {
-        let api = S3Api::new(cred_map());
+        let api = S3Api::new(cred_map()).with_s3_acl(true);
         let req = sign_request(base_s3_req("GET", "/mybucket/obj1", "acl"), "testing");
         let next: NextFn = Arc::new(|r| {
             assert_eq!(r.method, "HEAD");
             assert_eq!(r.path, "/v1/AUTH_test/mybucket/obj1");
             let mut resp = Response::new(200);
             resp.headers.set(S3_OBJECT_ACL_META, "public-read");
+            resp.headers.set(
+                S3_OBJECT_ACL_JSON_META,
+                r#"{"Owner":"test:tester","Grant":[{"Permission":"FULL_CONTROL","ID":"test:tester"},{"Permission":"READ","URI":"http://acs.amazonaws.com/groups/global/AllUsers"}]}"#,
+            );
             resp
         });
         let resp = api.handle(req, &next);
@@ -18503,24 +19398,34 @@ mod tests {
     }
 
     #[test]
-    fn put_object_acl_posts_sysmeta() {
-        let api = S3Api::new(cred_map());
+    fn put_object_acl_copy_self_puts_sysmeta() {
+        let api = S3Api::new(cred_map()).with_s3_acl(true);
         let mut req = base_s3_req("PUT", "/mybucket/obj1", "acl");
         req.headers.set("x-amz-acl", "private");
         req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         let req = sign_request(req, "testing");
         let next: NextFn = Arc::new(|r| {
-            assert_eq!(r.method, "POST");
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket/obj1" {
+                let mut resp = Response::new(200);
+                resp.headers
+                    .set(S3_OBJECT_ACL_JSON_META, private_owner_acl_json());
+                return resp;
+            }
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            assert_eq!(r.method, "PUT");
             assert_eq!(r.path, "/v1/AUTH_test/mybucket/obj1");
             assert_eq!(r.headers.get(S3_OBJECT_ACL_META), Some("private"));
-            Response::new(202)
+            assert_eq!(r.headers.get("X-Copy-From"), Some("/mybucket/obj1"));
+            Response::new(201)
         });
         assert_eq!(api.handle(req, &next).status, 200);
     }
 
     #[test]
     fn put_bucket_acl_grant_read_allusers_stamps_container_read() {
-        let api = S3Api::new(cred_map());
+        let api = S3Api::new(cred_map()).with_s3_acl(true);
         let mut req = base_s3_req("PUT", "/mybucket", "acl");
         req.headers.set(
             "x-amz-grant-read",
@@ -18529,11 +19434,18 @@ mod tests {
         req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         let req = sign_request(req, "testing");
         let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" {
+                assert_eq!(r.path, "/v1/AUTH_test/mybucket");
+                let mut resp = Response::new(204);
+                resp.headers
+                    .set(S3_BUCKET_ACL_JSON_META, private_owner_acl_json());
+                return resp;
+            }
             assert_eq!(r.method, "POST");
             assert_eq!(r.headers.get("X-Container-Read"), Some(".r:*,.rlistings"));
             assert!(r
                 .headers
-                .get("X-Container-Meta-S3-Acl-Json")
+                .get(S3_BUCKET_ACL_JSON_META)
                 .is_some_and(|v| v.contains("AllUsers")));
             Response::new(204)
         });
@@ -18542,17 +19454,17 @@ mod tests {
 
     #[test]
     fn put_object_acl_acp_body_stores_json_and_get_roundtrip() {
-        let api = S3Api::new(cred_map());
+        let api = S3Api::new(cred_map()).with_s3_acl(true);
         let acp = br#"<?xml version="1.0" encoding="UTF-8"?>
-<AccessControlPolicy>
+<AccessControlPolicy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <Owner><ID>test:tester</ID><DisplayName>test:tester</DisplayName></Owner>
   <AccessControlList>
     <Grant>
-      <Grantee><ID>test:tester</ID><DisplayName>test:tester</DisplayName></Grantee>
+      <Grantee xsi:type="CanonicalUser"><ID>test:tester</ID><DisplayName>test:tester</DisplayName></Grantee>
       <Permission>FULL_CONTROL</Permission>
     </Grant>
     <Grant>
-      <Grantee><URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee>
+      <Grantee xsi:type="Group"><URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee>
       <Permission>READ</Permission>
     </Grant>
   </AccessControlList>
@@ -18566,14 +19478,24 @@ mod tests {
         let stored = std::sync::Arc::new(std::sync::Mutex::new(None::<HeaderKeyDict>));
         let stored_c = stored.clone();
         let put_next: NextFn = Arc::new(move |r| {
-            assert_eq!(r.method, "POST");
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket/obj1" {
+                let mut resp = Response::new(200);
+                resp.headers
+                    .set(S3_OBJECT_ACL_JSON_META, private_owner_acl_json());
+                return resp;
+            }
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                return Response::new(204);
+            }
+            assert_eq!(r.method, "PUT");
+            assert_eq!(r.headers.get("X-Copy-From"), Some("/mybucket/obj1"));
             let json = r.headers.get(S3_OBJECT_ACL_JSON_META).unwrap_or("");
             assert!(
                 json.contains("AllUsers") && json.contains("FULL_CONTROL"),
                 "expected grant JSON, got {json}"
             );
             *stored_c.lock().unwrap() = Some(r.headers.clone());
-            Response::new(202)
+            Response::new(201)
         });
         assert_eq!(api.handle(put_req, &put_next).status, 200);
 
@@ -18597,15 +19519,15 @@ mod tests {
     #[test]
     fn put_bucket_acl_acp_body_roundtrip() {
         let api = S3Api::new(cred_map());
-        let acp = br#"<AccessControlPolicy>
-  <Owner><ID>owner</ID></Owner>
+        let acp = br#"<AccessControlPolicy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Owner><ID>test:tester</ID></Owner>
   <AccessControlList>
     <Grant>
-      <Grantee><ID>owner</ID></Grantee>
+      <Grantee xsi:type="CanonicalUser"><ID>test:tester</ID></Grantee>
       <Permission>FULL_CONTROL</Permission>
     </Grant>
     <Grant>
-      <Grantee><URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee>
+      <Grantee xsi:type="Group"><URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee>
       <Permission>WRITE</Permission>
     </Grant>
   </AccessControlList>
@@ -18619,6 +19541,11 @@ mod tests {
         let stored = std::sync::Arc::new(std::sync::Mutex::new(None::<HeaderKeyDict>));
         let stored_c = stored.clone();
         let put_next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" {
+                assert_eq!(r.path, "/v1/AUTH_test/mybucket");
+                return Response::new(204);
+            }
+            assert_eq!(r.method, "POST");
             assert_eq!(r.headers.get("X-Container-Write"), Some(".r:*"));
             *stored_c.lock().unwrap() = Some(r.headers.clone());
             Response::new(204)
@@ -18637,6 +19564,413 @@ mod tests {
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
         assert!(body.contains("<Permission>WRITE</Permission>"));
         assert!(body.contains("AllUsers"));
+    }
+
+    #[test]
+    fn put_bucket_acl_rejects_owner_change() {
+        let api = S3Api::new(multi_cred_map()).with_s3_acl(true);
+        let mut req = base_s3_req_as("PUT", "/mybucket", "acl", "test:foreign");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.body = Body::from(
+            br#"<AccessControlPolicy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><Owner><ID>test:foreign</ID></Owner><AccessControlList><Grant><Grantee xsi:type="CanonicalUser"><ID>test:foreign</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>"#
+                .to_vec(),
+        );
+        let req = sign_request(req, "foreign-secret");
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                let mut resp = Response::new(204);
+                resp.headers
+                    .set(S3_BUCKET_ACL_JSON_META, private_owner_acl_json());
+                return resp;
+            }
+            panic!("owner-changing ACL must not reach backend mutation");
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("AccessDenied"), "{body}");
+    }
+
+    #[test]
+    fn put_object_acl_rejects_owner_change() {
+        let api = S3Api::new(multi_cred_map()).with_s3_acl(true);
+        let mut req = base_s3_req_as("PUT", "/mybucket/obj1", "acl", "test:foreign");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.body = Body::from(
+            br#"<AccessControlPolicy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><Owner><ID>test:foreign</ID></Owner><AccessControlList><Grant><Grantee xsi:type="CanonicalUser"><ID>test:foreign</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>"#
+                .to_vec(),
+        );
+        let req = sign_request(req, "foreign-secret");
+        let next: NextFn = Arc::new(|r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket/obj1" {
+                let mut resp = Response::new(200);
+                resp.headers
+                    .set(S3_OBJECT_ACL_JSON_META, private_owner_acl_json());
+                return resp;
+            }
+            panic!("owner-changing ACL must not reach container HEAD or object PUT");
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("AccessDenied"), "{body}");
+    }
+
+    #[test]
+    fn strict_bucket_acl_missing_or_corrupt_owner_fails_closed() {
+        for (stored, expected) in [(None, 403), (Some("{"), 500)] {
+            let api = S3Api::new(cred_map()).with_s3_acl(true);
+            let mut req = base_s3_req("PUT", "/mybucket", "acl");
+            req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+            req.body = Body::from(
+                br#"<AccessControlPolicy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><Owner><ID>test:tester</ID></Owner><AccessControlList><Grant><Grantee xsi:type="CanonicalUser"><ID>test:tester</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>"#
+                    .to_vec(),
+            );
+            let req = sign_request(req, "testing");
+            let next: NextFn = Arc::new(move |r| {
+                assert_eq!(r.method, "HEAD");
+                let mut resp = Response::new(204);
+                if let Some(raw) = stored {
+                    resp.headers.set(S3_BUCKET_ACL_JSON_META, raw);
+                }
+                resp
+            });
+            let resp = api.handle(req, &next);
+            assert_eq!(resp.status, expected, "stored={stored:?}");
+        }
+    }
+
+    #[test]
+    fn non_s3_acl_mode_keeps_python_owner_check_disabled() {
+        let api = S3Api::new(cred_map());
+        let mut req = base_s3_req("PUT", "/mybucket", "acl");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.body = Body::from(
+            br#"<AccessControlPolicy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><Owner><ID>other-owner</ID></Owner><AccessControlList><Grant><Grantee xsi:type="CanonicalUser"><ID>other-owner</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>"#
+                .to_vec(),
+        );
+        let req = sign_request(req, "testing");
+        let mutated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mutated_c = mutated.clone();
+        let next: NextFn = Arc::new(move |r| {
+            if r.method == "HEAD" {
+                return Response::new(204);
+            }
+            assert_eq!(r.method, "POST");
+            mutated_c.store(true, std::sync::atomic::Ordering::SeqCst);
+            Response::new(204)
+        });
+        let resp = api.handle(req, &next);
+        assert_eq!(resp.status, 200);
+        assert!(mutated.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn legacy_acl_mode_matches_python_object_put_and_missing_bucket_input() {
+        for asynchronous in [false, true] {
+            let no_backend: NextFn = Arc::new(|req| {
+                panic!(
+                    "legacy ACL rejection must happen before backend: {} {}",
+                    req.method, req.path
+                )
+            });
+            let object_put = signed_acl_request(
+                "PUT",
+                "/mybucket/obj1",
+                "test:tester",
+                Some(owner_acl_body_with_grantee("test:tester")),
+            );
+            assert_s3_error_code(
+                run_acl_request(object_put, false, asynchronous, Arc::clone(&no_backend)),
+                501,
+                "NotImplemented",
+            );
+
+            let bucket_put = signed_acl_request("PUT", "/mybucket", "test:tester", None);
+            assert_s3_error_code(
+                run_acl_request(bucket_put, false, asynchronous, Arc::clone(&no_backend)),
+                400,
+                "MissingSecurityHeader",
+            );
+        }
+    }
+
+    #[test]
+    fn strict_acl_put_without_input_is_missing_security_header_sync_and_async() {
+        for asynchronous in [false, true] {
+            for object in [false, true] {
+                let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let next = strict_acl_backend(
+                    object,
+                    Some(private_owner_acl_json()),
+                    Arc::clone(&mutations),
+                );
+                let path = if object {
+                    "/mybucket/obj1"
+                } else {
+                    "/mybucket"
+                };
+                let req = signed_acl_request("PUT", path, "test:tester", None);
+                let resp = run_acl_request(req, true, asynchronous, next);
+                assert_s3_error_code(resp, 400, "MissingSecurityHeader");
+                assert_eq!(
+                    mutations.load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "missing ACL input must not mutate: async={asynchronous} object={object}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strict_acl_input_errors_are_exact_and_never_mutate_sync_or_async() {
+        let canonical = br#"<AccessControlPolicy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><Owner><ID>test:tester</ID></Owner><AccessControlList><Grant><Grantee xsi:type="CanonicalUser"><ID>test:tester</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>"#.to_vec();
+        let unknown_group = br#"<AccessControlPolicy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><Owner><ID>test:tester</ID></Owner><AccessControlList><Grant><Grantee xsi:type="Group"><URI>urn:not-an-s3-group</URI></Grantee><Permission>READ</Permission></Grant></AccessControlList></AccessControlPolicy>"#.to_vec();
+        let email = br#"<AccessControlPolicy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><Owner><ID>test:tester</ID></Owner><AccessControlList><Grant><Grantee xsi:type="AmazonCustomerByEmail"><EmailAddress>a@example.com</EmailAddress></Grantee><Permission>READ</Permission></Grant></AccessControlList></AccessControlPolicy>"#.to_vec();
+
+        for asynchronous in [false, true] {
+            for object in [false, true] {
+                for case in 0..6 {
+                    let path = if object {
+                        "/mybucket/obj1"
+                    } else {
+                        "/mybucket"
+                    };
+                    let mut req = base_s3_req_as("PUT", path, "acl", "test:tester");
+                    req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+                    let (status, code) = match case {
+                        0 => {
+                            req.headers.set("x-amz-acl", "private");
+                            req.headers.set(
+                                "x-amz-grant-read",
+                                "uri=http://acs.amazonaws.com/groups/global/AllUsers",
+                            );
+                            (400, "InvalidRequest")
+                        }
+                        1 => {
+                            req.headers.set("x-amz-acl", "private");
+                            req.body = Body::from(canonical.clone());
+                            (400, "UnexpectedContent")
+                        }
+                        2 => {
+                            req.headers.set(
+                                "x-amz-grant-read",
+                                "uri=http://acs.amazonaws.com/groups/global/AllUsers",
+                            );
+                            req.body = Body::from(canonical.clone());
+                            (400, "UnexpectedContent")
+                        }
+                        3 => {
+                            req.body = Body::from(unknown_group.clone());
+                            (400, "InvalidArgument")
+                        }
+                        4 => {
+                            req.body = Body::from(email.clone());
+                            (501, "NotImplemented")
+                        }
+                        5 => {
+                            req.body = Body::from(vec![b' '; MAX_ACP_XML_BODY as usize + 1]);
+                            (400, "MalformedXML")
+                        }
+                        _ => unreachable!(),
+                    };
+                    let req = sign_request(req, "testing");
+                    let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let next = strict_acl_backend(
+                        object,
+                        Some(private_owner_acl_json()),
+                        Arc::clone(&mutations),
+                    );
+                    let resp = run_acl_request(req, true, asynchronous, next);
+                    assert_s3_error_code(resp, status, code);
+                    assert_eq!(
+                        mutations.load(std::sync::atomic::Ordering::SeqCst),
+                        0,
+                        "ACL input error mutated backend: async={asynchronous} object={object} case={case}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_bucket_acl_xml_writes_only_swift_acl_headers() {
+        let body = br#"<AccessControlPolicy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><Owner><ID>test:tester</ID></Owner><AccessControlList><Grant><Grantee xsi:type="Group"><URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee><Permission>READ</Permission></Grant></AccessControlList></AccessControlPolicy>"#.to_vec();
+        for asynchronous in [false, true] {
+            let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mutations_c = mutations.clone();
+            let next: NextFn = Arc::new(move |req| {
+                assert_eq!(req.method, "POST");
+                assert_eq!(req.path, "/v1/AUTH_test/mybucket");
+                assert_eq!(req.headers.get("X-Container-Read"), Some(".r:*,.rlistings"));
+                assert!(req.headers.get(S3_BUCKET_ACL_JSON_META).is_none());
+                assert!(req.headers.get(S3_OBJECT_ACL_JSON_META).is_none());
+                mutations_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Response::new(204)
+            });
+            let req = signed_acl_request("PUT", "/mybucket", "test:tester", Some(body.clone()));
+            let resp = run_acl_request(req, false, asynchronous, next);
+            assert_eq!(resp.status, 200);
+            assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn legacy_canned_acl_translation_matches_python_sync_and_async() {
+        for asynchronous in [false, true] {
+            for (acl, expected_read, expected_write) in [
+                ("public-read", Some(".r:*,.rlistings"), None),
+                ("public-read-write", Some(".r:*,.rlistings"), Some(".r:*")),
+                ("private", Some("."), Some(".")),
+                ("bucket-owner-read", Some("."), Some(".")),
+                ("bucket-owner-full-control", Some("."), Some(".")),
+            ] {
+                let api = S3Api::new(cred_map());
+                let mut req = base_s3_req("PUT", "/legacy-bucket", "");
+                req.headers.set("x-amz-acl", acl);
+                let req = sign_request(req, "testing");
+                let next: NextFn = Arc::new(move |req| {
+                    assert_eq!(req.method, "PUT");
+                    assert_eq!(req.path, "/v1/AUTH_test/legacy-bucket");
+                    assert_eq!(req.headers.get("X-Container-Read"), expected_read);
+                    assert_eq!(req.headers.get("X-Container-Write"), expected_write);
+                    assert!(req.headers.get(S3_BUCKET_ACL_JSON_META).is_none());
+                    assert!(req.headers.get("x-amz-acl").is_none());
+                    Response::new(201)
+                });
+                let resp = run_s3_request(&api, req, asynchronous, next);
+                assert_eq!(resp.status, 200, "async={asynchronous} acl={acl}");
+            }
+
+            for (acl, status, code) in [
+                ("unknown-acl", 400, "InvalidArgument"),
+                ("authenticated-read", 501, "NotImplemented"),
+                ("log-delivery-write", 501, "NotImplemented"),
+            ] {
+                let api = S3Api::new(cred_map());
+                let mut req = base_s3_req("PUT", "/legacy-bucket", "");
+                req.headers.set("x-amz-acl", acl);
+                let req = sign_request(req, "testing");
+                let next: NextFn = Arc::new(|req| {
+                    panic!(
+                        "invalid legacy ACL must fail before backend: {} {}",
+                        req.method, req.path
+                    )
+                });
+                assert_s3_error_code(run_s3_request(&api, req, asynchronous, next), status, code);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_object_put_never_plants_structured_acl_sysmeta() {
+        for asynchronous in [false, true] {
+            let api = S3Api::new(cred_map());
+            let mut req = base_s3_req("PUT", "/mybucket/object", "");
+            req.headers.set("x-amz-acl", "public-read");
+            req.headers.set(S3_OBJECT_ACL_META, "public-read");
+            req.headers
+                .set(S3_OBJECT_ACL_JSON_META, private_owner_acl_json());
+            req.headers
+                .set(S3_BUCKET_ACL_JSON_META, private_owner_acl_json());
+            req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+            req.headers.set("Content-Length", "4");
+            req.body = Body::from(b"data".to_vec());
+            let req = sign_request(req, "testing");
+            let object_puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let object_puts_c = Arc::clone(&object_puts);
+            let next: NextFn = Arc::new(move |req| {
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/mybucket" {
+                    return Response::new(204);
+                }
+                if req.method == "PUT" && req.path == "/v1/AUTH_test/mybucket/object" {
+                    assert_eq!(req.headers.get("X-Container-Read"), Some(".r:*,.rlistings"));
+                    assert!(req.headers.get("x-amz-acl").is_none());
+                    assert!(req.headers.get(S3_OBJECT_ACL_META).is_none());
+                    assert!(req.headers.get(S3_OBJECT_ACL_JSON_META).is_none());
+                    assert!(req.headers.get(S3_BUCKET_ACL_JSON_META).is_none());
+                    object_puts_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return Response::new(201);
+                }
+                if req.method == "HEAD" && req.path.ends_with("/object") {
+                    return Response::new(404);
+                }
+                panic!("unexpected backend request: {} {}", req.method, req.path)
+            });
+            let resp = run_s3_request(&api, req, asynchronous, next);
+            assert_eq!(resp.status, 200, "asynchronous={asynchronous}");
+            assert_eq!(
+                object_puts.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "asynchronous={asynchronous}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_mode_ignores_stored_object_s3_acl_for_data_and_acl_reads() {
+        for asynchronous in [false, true] {
+            let data_req = sign_request(
+                base_s3_req_as("GET", "/mybucket/private-obj", "", "test:foreign"),
+                "foreign-secret",
+            );
+            let data_resp = run_acl_request(
+                data_req,
+                false,
+                asynchronous,
+                mock_object_with_acl_json(&private_owner_acl_json()),
+            );
+            assert_eq!(
+                data_resp.status, 200,
+                "s3_acl=false must not enforce stored object JSON"
+            );
+            assert_eq!(data_resp.body.into_vec(u64::MAX).unwrap(), b"ok");
+
+            let acl_next: NextFn = Arc::new(|req| {
+                assert_eq!(req.method, "HEAD");
+                assert_eq!(req.path, "/v1/AUTH_test/mybucket/private-obj");
+                let mut resp = Response::new(200);
+                resp.headers
+                    .set(S3_OBJECT_ACL_JSON_META, private_owner_acl_json());
+                resp.headers.set("X-Container-Read", ".r:*,.rlistings");
+                resp
+            });
+            let acl_req = signed_acl_request("GET", "/mybucket/private-obj", "test:foreign", None);
+            let acl_resp = run_acl_request(acl_req, false, asynchronous, acl_next);
+            assert_eq!(acl_resp.status, 200);
+            let xml = String::from_utf8(acl_resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+            assert!(xml.contains("test:foreign"), "{xml}");
+            assert!(xml.contains("AllUsers"), "{xml}");
+            assert!(
+                !xml.contains("test:tester"),
+                "stored S3 owner leaked: {xml}"
+            );
+        }
+    }
+
+    #[test]
+    fn async_bucket_acl_rejects_foreign_owner_takeover() {
+        let api = S3Api::new(multi_cred_map()).with_s3_acl(true);
+        let mut req = base_s3_req_as("PUT", "/mybucket", "acl", "test:foreign");
+        req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        req.body = Body::from(
+            br#"<AccessControlPolicy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><Owner><ID>test:foreign</ID></Owner><AccessControlList><Grant><Grantee xsi:type="CanonicalUser"><ID>test:foreign</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>"#
+                .to_vec(),
+        );
+        let req = sign_request(req, "foreign-secret");
+        let next = async_ok(|r| {
+            if r.method == "HEAD" && r.path == "/v1/AUTH_test/mybucket" {
+                let mut resp = Response::new(204);
+                resp.headers
+                    .set(S3_BUCKET_ACL_JSON_META, private_owner_acl_json());
+                return resp;
+            }
+            panic!("owner-changing async ACL must not reach backend mutation");
+        });
+        let resp = block_on_s3(api.handle_s3_async(req, next));
+        assert_eq!(resp.status, 403);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("AccessDenied"), "{body}");
     }
 
     /// Mock next for object GET/HEAD grant tests: versioning probe HEAD on
@@ -18673,9 +20007,297 @@ mod tests {
         r#"{"Owner":"test:tester","Grant":[{"Permission":"FULL_CONTROL","ID":"test:tester"},{"Permission":"READ","ID":"test:friend"}]}"#.into()
     }
 
+    fn acl_json_with_principal_permission(principal: &str, permission: &str) -> String {
+        format!(
+            r#"{{"Owner":"test:tester","Grant":[{{"Permission":"FULL_CONTROL","ID":"test:tester"}},{{"Permission":"{permission}","ID":"{principal}"}}]}}"#
+        )
+    }
+
+    fn owner_acl_body_with_grantee(grantee: &str) -> Vec<u8> {
+        format!(
+            r#"<AccessControlPolicy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><Owner><ID>test:tester</ID></Owner><AccessControlList><Grant><Grantee xsi:type="CanonicalUser"><ID>{grantee}</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>"#
+        )
+        .into_bytes()
+    }
+
+    fn credential_secret(access_key: &str) -> &'static str {
+        match access_key {
+            "test:tester" => "testing",
+            "test:foreign" => "foreign-secret",
+            "test:friend" => "friend-secret",
+            other => panic!("unknown test credential {other}"),
+        }
+    }
+
+    fn signed_acl_request(
+        method: &str,
+        path: &str,
+        access_key: &str,
+        body: Option<Vec<u8>>,
+    ) -> Request {
+        let mut req = base_s3_req_as(method, path, "acl", access_key);
+        if let Some(body) = body {
+            req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+            req.body = Body::from(body);
+        }
+        sign_request(req, credential_secret(access_key))
+    }
+
+    fn run_acl_request(req: Request, s3_acl: bool, asynchronous: bool, next: NextFn) -> Response {
+        let api = S3Api::new(multi_cred_map()).with_s3_acl(s3_acl);
+        run_s3_request(&api, req, asynchronous, next)
+    }
+
+    fn run_s3_request(api: &S3Api, req: Request, asynchronous: bool, next: NextFn) -> Response {
+        if asynchronous {
+            let next_c = Arc::clone(&next);
+            let async_next = async_ok(move |req| next_c(req));
+            block_on_s3(api.handle_s3_async(req, async_next))
+        } else {
+            api.handle(req, &next)
+        }
+    }
+
+    fn strict_acl_backend(
+        object: bool,
+        stored_acl: Option<String>,
+        mutations: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> NextFn {
+        Arc::new(move |req: Request| {
+            let is_object = req.path.ends_with("/mybucket/obj1");
+            let is_bucket = req.path.ends_with("/mybucket");
+            if req.method == "HEAD" && ((object && is_object) || (!object && is_bucket)) {
+                let mut resp = Response::new(if object { 200 } else { 204 });
+                if let Some(raw) = stored_acl.as_deref() {
+                    resp.headers.set(
+                        if object {
+                            S3_OBJECT_ACL_JSON_META
+                        } else {
+                            S3_BUCKET_ACL_JSON_META
+                        },
+                        raw,
+                    );
+                }
+                return resp;
+            }
+            if object && req.method == "HEAD" && is_bucket {
+                let mut resp = Response::new(204);
+                resp.headers
+                    .set(S3_BUCKET_ACL_JSON_META, private_owner_acl_json());
+                return resp;
+            }
+            if (object && req.method == "PUT" && is_object)
+                || (!object && req.method == "POST" && is_bucket)
+            {
+                mutations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Response::new(if object { 201 } else { 204 });
+            }
+            panic!(
+                "unexpected strict ACL backend request: {} {}",
+                req.method, req.path
+            );
+        })
+    }
+
+    fn assert_s3_error_code(resp: Response, status: u16, code: &str) {
+        assert_eq!(resp.status, status, "unexpected status for {code}");
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(
+            body.contains(&format!("<Code>{code}</Code>")),
+            "expected {code}, got {body}"
+        );
+    }
+
+    #[test]
+    fn strict_object_acl_acp_permission_matrix_sync_and_async() {
+        let cases = [
+            ("test:tester", None, true, true),
+            ("test:foreign", None, false, false),
+            ("test:friend", Some("READ_ACP"), true, false),
+            ("test:friend", Some("WRITE_ACP"), false, true),
+            ("test:friend", Some("READ"), false, false),
+            ("test:friend", Some("WRITE"), false, false),
+            ("test:friend", Some("FULL_CONTROL"), true, true),
+        ];
+        for asynchronous in [false, true] {
+            for (principal, permission, read_acp, write_acp) in cases {
+                let stored = permission
+                    .map(|p| acl_json_with_principal_permission(principal, p))
+                    .unwrap_or_else(private_owner_acl_json);
+                for method in ["GET", "HEAD"] {
+                    let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let next = strict_acl_backend(true, Some(stored.clone()), mutations.clone());
+                    let req = signed_acl_request(method, "/mybucket/obj1", principal, None);
+                    let resp = run_acl_request(req, true, asynchronous, next);
+                    assert_eq!(
+                        resp.status,
+                        if read_acp { 200 } else { 403 },
+                        "async={asynchronous} method={method} principal={principal} permission={permission:?}"
+                    );
+                    assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 0);
+                }
+
+                let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let next = strict_acl_backend(true, Some(stored), mutations.clone());
+                let req = signed_acl_request(
+                    "PUT",
+                    "/mybucket/obj1",
+                    principal,
+                    Some(owner_acl_body_with_grantee("test:tester")),
+                );
+                let resp = run_acl_request(req, true, asynchronous, next);
+                assert_eq!(
+                    resp.status,
+                    if write_acp { 200 } else { 403 },
+                    "async={asynchronous} method=PUT principal={principal} permission={permission:?}"
+                );
+                assert_eq!(
+                    mutations.load(std::sync::atomic::Ordering::SeqCst),
+                    usize::from(write_acp),
+                    "denied ACL PUT must not mutate the backend"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strict_bucket_acl_acp_permission_matrix_sync_and_async() {
+        let cases = [
+            ("test:tester", None, true, true),
+            ("test:foreign", None, false, false),
+            ("test:friend", Some("READ_ACP"), true, false),
+            ("test:friend", Some("WRITE_ACP"), false, true),
+            ("test:friend", Some("READ"), false, false),
+            ("test:friend", Some("WRITE"), false, false),
+            ("test:friend", Some("FULL_CONTROL"), true, true),
+        ];
+        for asynchronous in [false, true] {
+            for (principal, permission, read_acp, write_acp) in cases {
+                let stored = permission
+                    .map(|p| acl_json_with_principal_permission(principal, p))
+                    .unwrap_or_else(private_owner_acl_json);
+                for method in ["GET", "HEAD"] {
+                    let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let next = strict_acl_backend(false, Some(stored.clone()), mutations.clone());
+                    let req = signed_acl_request(method, "/mybucket", principal, None);
+                    let resp = run_acl_request(req, true, asynchronous, next);
+                    assert_eq!(
+                        resp.status,
+                        if read_acp { 200 } else { 403 },
+                        "async={asynchronous} method={method} principal={principal} permission={permission:?}"
+                    );
+                    if method == "HEAD" && !read_acp {
+                        assert!(resp.body.into_vec(u64::MAX).unwrap().is_empty());
+                    }
+                    assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 0);
+                }
+
+                let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let next = strict_acl_backend(false, Some(stored), mutations.clone());
+                let req = signed_acl_request(
+                    "PUT",
+                    "/mybucket",
+                    principal,
+                    Some(owner_acl_body_with_grantee("test:tester")),
+                );
+                let resp = run_acl_request(req, true, asynchronous, next);
+                assert_eq!(
+                    resp.status,
+                    if write_acp { 200 } else { 403 },
+                    "async={asynchronous} method=PUT principal={principal} permission={permission:?}"
+                );
+                assert_eq!(
+                    mutations.load(std::sync::atomic::Ordering::SeqCst),
+                    usize::from(write_acp),
+                    "denied bucket ACL PUT must not mutate the backend"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strict_object_acl_owner_preserving_foreign_grant_takeover_is_denied() {
+        for asynchronous in [false, true] {
+            let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let next = strict_acl_backend(true, Some(private_owner_acl_json()), mutations.clone());
+            let req = signed_acl_request(
+                "PUT",
+                "/mybucket/obj1",
+                "test:foreign",
+                Some(owner_acl_body_with_grantee("test:foreign")),
+            );
+            let resp = run_acl_request(req, true, asynchronous, next);
+            assert_s3_error_code(resp, 403, "AccessDenied");
+            assert_eq!(
+                mutations.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "owner-preserving takeover must not reach copy-self PUT"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_acl_missing_empty_corrupt_or_ownerless_metadata_fails_closed() {
+        let states = [
+            (None, 403, "AccessDenied"),
+            (Some(String::new()), 403, "AccessDenied"),
+            (Some("{".to_string()), 500, "InternalError"),
+            (
+                Some(
+                    r#"{"Owner":"","Grant":[{"Permission":"FULL_CONTROL","ID":"test:tester"}]}"#
+                        .to_string(),
+                ),
+                403,
+                "AccessDenied",
+            ),
+        ];
+        for asynchronous in [false, true] {
+            for object in [false, true] {
+                for method in ["GET", "PUT"] {
+                    for (stored, status, code) in states.clone() {
+                        let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                        let next = strict_acl_backend(object, stored.clone(), mutations.clone());
+                        let body =
+                            (method == "PUT").then(|| owner_acl_body_with_grantee("test:tester"));
+                        let path = if object {
+                            "/mybucket/obj1"
+                        } else {
+                            "/mybucket"
+                        };
+                        let req = signed_acl_request(method, path, "test:tester", body);
+                        let resp = run_acl_request(req, true, asynchronous, next);
+                        assert_s3_error_code(resp, status, code);
+                        assert_eq!(
+                            mutations.load(std::sync::atomic::Ordering::SeqCst),
+                            0,
+                            "invalid stored ACL must not mutate: async={asynchronous} object={object} method={method}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn strict_object_acl_malformed_acp_is_consistent_sync_and_async() {
+        for asynchronous in [false, true] {
+            let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let next = strict_acl_backend(true, Some(private_owner_acl_json()), mutations.clone());
+            let req = signed_acl_request(
+                "PUT",
+                "/mybucket/obj1",
+                "test:tester",
+                Some(b"<AccessControlPolicy><broken>".to_vec()),
+            );
+            let resp = run_acl_request(req, true, asynchronous, next);
+            assert_s3_error_code(resp, 400, "MalformedACLError");
+            assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+
     #[test]
     fn get_object_acl_grant_denies_foreign_principal() {
-        let api = S3Api::new(multi_cred_map());
+        let api = S3Api::new(multi_cred_map()).with_s3_acl(true);
         let next = mock_object_with_acl_json(&private_owner_acl_json());
         let req = sign_request(
             base_s3_req_as("GET", "/mybucket/private-obj", "", "test:foreign"),
@@ -18692,7 +20314,7 @@ mod tests {
 
     #[test]
     fn head_object_acl_grant_denies_foreign_principal() {
-        let api = S3Api::new(multi_cred_map());
+        let api = S3Api::new(multi_cred_map()).with_s3_acl(true);
         let next = mock_object_with_acl_json(&private_owner_acl_json());
         let req = sign_request(
             base_s3_req_as("HEAD", "/mybucket/private-obj", "", "test:foreign"),
@@ -18707,7 +20329,7 @@ mod tests {
 
     #[test]
     fn get_object_acl_grant_read_allows_principal() {
-        let api = S3Api::new(multi_cred_map());
+        let api = S3Api::new(multi_cred_map()).with_s3_acl(true);
         let next = mock_object_with_acl_json(&owner_plus_friend_read_acl_json());
         let req = sign_request(
             base_s3_req_as("GET", "/mybucket/private-obj", "", "test:friend"),
@@ -18721,7 +20343,7 @@ mod tests {
 
     #[test]
     fn get_object_acl_owner_always_allowed() {
-        let api = S3Api::new(multi_cred_map());
+        let api = S3Api::new(multi_cred_map()).with_s3_acl(true);
         let next = mock_object_with_acl_json(&private_owner_acl_json());
         let req = sign_request(
             base_s3_req_as("GET", "/mybucket/private-obj", "", "test:tester"),
@@ -18735,7 +20357,7 @@ mod tests {
     #[test]
     fn get_object_without_acl_json_not_denied() {
         // Missing structured grants → existing path (no new AccessDenied).
-        let api = S3Api::new(multi_cred_map());
+        let api = S3Api::new(multi_cred_map()).with_s3_acl(true);
         let next: NextFn = Arc::new(|r: Request| {
             if r.method == "HEAD" && r.path.ends_with("/mybucket") {
                 return Response::new(204);
@@ -21431,6 +23053,38 @@ mod tests {
     }
 
     #[test]
+    fn invalid_governance_bypass_is_rejected_before_every_mutating_dispatch() {
+        for asynchronous in [false, true] {
+            for (method, query) in [
+                ("PUT", ""),
+                ("DELETE", "versionId=0123456789abcdef0123456789abcdef"),
+                ("POST", "uploadId=u"),
+            ] {
+                let mut req =
+                    sign_request(base_s3_req(method, "/mybucket/locked", query), "testing");
+                req.headers
+                    .set(HDR_BYPASS_GOVERNANCE, "definitely-not-bool");
+                let no_backend: NextFn = Arc::new(|req| {
+                    panic!(
+                        "invalid bypass must fail before backend: {} {}",
+                        req.method, req.path
+                    )
+                });
+                let resp = if asynchronous {
+                    let next_c = Arc::clone(&no_backend);
+                    block_on_s3(
+                        S3Api::new(cred_map())
+                            .handle_s3_async(req, async_ok(move |req| next_c(req))),
+                    )
+                } else {
+                    S3Api::new(cred_map()).handle(req, &no_backend)
+                };
+                assert_s3_error_code(resp, 400, "InvalidArgument");
+            }
+        }
+    }
+
+    #[test]
     fn governance_bypass_header_allows_overwrite_put() {
         let api = api_with_worm_bypass_permission();
         let mut put = base_s3_req("PUT", "/mybucket/gov", "");
@@ -23203,12 +24857,17 @@ mod tests {
 
         let be = Arc::new(crate::cold_tier::MemoryColdBackend::default());
         let api = S3Api::new(cred_map())
+            .with_s3_acl(true)
             .with_anonymous_account("AUTH_test")
             .with_cold_map(crate::cold_tier::ColdPolicyMap::from_csv("GLACIER:2,HOT:0"))
             .with_cold_backend(be)
             .with_cold_delete_hot_after_archive(true);
 
-        for raw in ["{", "", r#"{"Owner":"x","Grant":[]}"#] {
+        for (raw, expected_status, expected_code) in [
+            ("{", 500, "InternalError"),
+            ("", 403, "AccessDenied"),
+            (r#"{"Owner":"x","Grant":[]}"#, 403, "AccessDenied"),
+        ] {
             let post_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let put_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let post_c = post_seen.clone();
@@ -23241,9 +24900,13 @@ mod tests {
                 body: Body::empty(),
             };
             let resp = api.handle(req, &next);
-            assert_eq!(resp.status, 403, "malformed ACL {raw:?} must deny");
+            let status = resp.status;
             let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
-            assert!(body.contains("AccessDenied"), "{raw:?} {body}");
+            assert_eq!(
+                status, expected_status,
+                "malformed ACL {raw:?} must fail closed: {body}"
+            );
+            assert!(body.contains(expected_code), "{raw:?} {body}");
             assert_eq!(
                 post_seen.load(std::sync::atomic::Ordering::SeqCst),
                 0,
@@ -23669,6 +25332,45 @@ mod tests {
             Arc::new(move |r: Request| be.handle(r))
         }
 
+        fn async_next_fn(self: &Arc<Self>) -> AsyncNextFn {
+            let be = self.clone();
+            Arc::new(move |r: Request| {
+                let be = be.clone();
+                Box::pin(async move { be.handle(r) })
+            })
+        }
+
+        fn streaming_next_fn(self: &Arc<Self>) -> StreamingAsyncNextFn {
+            let be = self.clone();
+            Arc::new(move |areq: AsyncRequest| {
+                let be = be.clone();
+                Box::pin(async move {
+                    let AsyncRequest {
+                        method,
+                        path,
+                        query_string,
+                        headers,
+                        mut body,
+                    } = areq;
+                    let mut buffered = Vec::new();
+                    loop {
+                        match body.next_chunk().await {
+                            Ok(Some(chunk)) => buffered.extend_from_slice(&chunk),
+                            Ok(None) => break,
+                            Err(_) => return Response::new(499),
+                        }
+                    }
+                    be.handle(Request {
+                        method,
+                        path,
+                        query_string,
+                        headers,
+                        body: Body::from(buffered),
+                    })
+                })
+            })
+        }
+
         fn gate_key(method: &str, path: &str) -> String {
             format!("{method} {path}")
         }
@@ -23729,6 +25431,17 @@ mod tests {
                 .collect()
         }
 
+        /// Applied immutable generation fences, in backend commit order.
+        fn fence_writes(&self) -> Vec<(String, VersionIndex)> {
+            self.index_commits
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(name, _)| name.contains("/index.g") && name.ends_with(".json"))
+                .cloned()
+                .collect()
+        }
+
         fn final_index(&self, container_path: &str, key: &str) -> VersionIndex {
             let path = format!("{container_path}/{}", index_object_name(key));
             let store = self.store.lock().unwrap();
@@ -23761,6 +25474,26 @@ mod tests {
             store
                 .get(object_path)
                 .and_then(|(h, _)| h.get(SYS_VERSION_ID).map(str::to_string))
+        }
+
+        fn version_body(
+            &self,
+            object_path: &str,
+            versions_container_path: &str,
+            key: &str,
+            version_id: &str,
+        ) -> Option<Vec<u8>> {
+            let store = self.store.lock().unwrap();
+            if let Some((headers, body)) = store.get(object_path) {
+                if headers.get(SYS_VERSION_ID) == Some(version_id) {
+                    return Some(body.clone());
+                }
+            }
+            let archive_path = format!(
+                "{versions_container_path}/{}",
+                archive_object_name(key, version_id)
+            );
+            store.get(&archive_path).map(|(_, body)| body.clone())
         }
 
         fn handle(&self, r: Request) -> Response {
@@ -23914,24 +25647,53 @@ mod tests {
     /// Invariants a cross-proxy backend CAS must uphold. Every violation is a
     /// silent lost update today.
     fn assert_version_index_invariants(
-        be: &SharedSwiftBackend,
+        be: &Arc<SharedSwiftBackend>,
         key: &str,
-        acked_puts: &[String],
+        acked_puts: &[(String, Vec<u8>)],
         acked_deletes: &[String],
     ) {
-        // (1) The backend must never have APPLIED two index writes that
-        //     claim the same generation with DIVERGENT content — that is
-        //     the definition of a lost update. (The mirror-heal path may
-        //     legally re-write a generation with byte-identical content,
-        //     and generations must never regress.)
-        let writes = be.mirror_writes();
-        let gens: Vec<u64> = writes.iter().map(|(g, _)| *g).collect();
-        for pair in gens.windows(2) {
-            assert!(
-                pair[1] >= pair[0],
-                "mirror generation regressed (lost update): {gens:?}"
+        // (1) The immutable fence chain is the authoritative commit order.
+        //     Every applied fence path is unique and generations are strictly
+        //     increasing. The legacy backend modeled here ignores PUT
+        //     If-Match, so an old writer may temporarily regress advisory
+        //     index.json; a real snapshot load must adopt the fence and heal.
+        let fences = be.fence_writes();
+        let fence_gens: Vec<u64> = fences.iter().map(|(_, index)| index.generation).collect();
+        assert_eq!(
+            fence_gens.first(),
+            Some(&1),
+            "generation fence chain must start at one: {fence_gens:?}"
+        );
+        for pair in fence_gens.windows(2) {
+            assert_eq!(
+                pair[1],
+                pair[0] + 1,
+                "generation fence chain is not contiguous: {fence_gens:?}"
             );
         }
+        for (path, index) in &fences {
+            let expected = format!(
+                "/v1/AUTH_test/mybucket+versions/{}",
+                index_generation_object_name(key, index.generation)
+            );
+            assert_eq!(
+                path, &expected,
+                "generation fence path does not encode its body key/generation"
+            );
+            assert_eq!(index.key, key, "generation fence body carries wrong key");
+        }
+        let unique_fence_paths: std::collections::HashSet<&str> =
+            fences.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(
+            unique_fence_paths.len(),
+            fences.len(),
+            "a create-only generation fence was applied more than once"
+        );
+
+        // Mirrors for one committed generation must be byte-identical to one
+        // another and to that generation's immutable fence. Physical mirror
+        // arrival order is not a commit order on the legacy backend.
+        let writes = be.mirror_writes();
         for (i, (gen_a, index_a)) in writes.iter().enumerate() {
             for (gen_b, index_b) in &writes[i + 1..] {
                 if gen_a == gen_b {
@@ -23953,9 +25715,31 @@ mod tests {
                     );
                 }
             }
+            let committed = fences
+                .iter()
+                .find(|(_, index)| index.generation == *gen_a)
+                .unwrap_or_else(|| panic!("mirror generation {gen_a} has no committed fence"));
+            assert_eq!(
+                &committed.1, index_a,
+                "mirror generation {gen_a} diverges from its immutable fence"
+            );
         }
 
-        let index = be.final_index("/v1/AUTH_test/mybucket+versions", key);
+        let cred = cred_map().remove("test:tester").expect("test credential");
+        let next = be.next_fn();
+        let snapshot = load_version_index_snapshot(&cred, "mybucket", key, &next)
+            .unwrap_or_else(|resp| panic!("authoritative index load failed: {}", resp.status));
+        let index = snapshot.index;
+        let healed = be.final_index("/v1/AUTH_test/mybucket+versions", key);
+        assert_eq!(
+            healed, index,
+            "snapshot load did not heal the advisory mirror to the fence head"
+        );
+        assert_eq!(
+            Some(&index.generation),
+            fence_gens.last(),
+            "authoritative snapshot did not reach the highest committed fence"
+        );
         let listed: Vec<&str> = index
             .versions
             .iter()
@@ -23964,7 +25748,7 @@ mod tests {
 
         // (2) Every version-id acknowledged 200 to a client survives in the
         //     committed index unless a later acknowledged delete removed it.
-        for vid in acked_puts {
+        for (vid, expected_body) in acked_puts {
             if acked_deletes.contains(vid) {
                 continue;
             }
@@ -23972,6 +25756,18 @@ mod tests {
                 listed.contains(&vid.as_str()),
                 "version {vid} was acknowledged 200 to the client but is \
                  missing from the committed index (lost update): {listed:?}"
+            );
+            let object_path = format!("/v1/AUTH_test/mybucket/{key}");
+            let stored_body = be
+                .version_body(&object_path, "/v1/AUTH_test/mybucket+versions", key, vid)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "version {vid} was acknowledged and indexed but has no current/archive data"
+                    )
+                });
+            assert_eq!(
+                &stored_body, expected_body,
+                "version {vid} was acknowledged but its stored bytes changed"
             );
         }
 
@@ -23996,7 +25792,7 @@ mod tests {
                 "archive object for version {vid} still exists although its \
                  delete was acknowledged"
             );
-            if acked_puts.contains(&vid) {
+            if acked_puts.iter().any(|(acked, _)| acked == &vid) {
                 assert!(
                     listed.contains(&vid.as_str()),
                     "archive object for acknowledged version {vid} exists but \
@@ -24011,7 +25807,7 @@ mod tests {
         //     behind — the same repairable state today's persist failures
         //     leave; the next successful write repair-inserts it.)
         if let Some(cur) = be.current_version_id(&format!("/v1/AUTH_test/mybucket/{key}")) {
-            if acked_puts.contains(&cur) {
+            if acked_puts.iter().any(|(acked, _)| acked == &cur) {
                 assert!(
                     listed.contains(&cur.as_str()),
                     "current object carries acknowledged version {cur} but \
@@ -24086,7 +25882,86 @@ mod tests {
         } else {
             Vec::new()
         };
-        assert_version_index_invariants(&be, "obj", &[v1, v2, va], &acked_deletes);
+        assert_version_index_invariants(
+            &be,
+            "obj",
+            &[
+                (v1, b"seed-1".to_vec()),
+                (v2, b"seed-2".to_vec()),
+                (va, b"concurrent-a".to_vec()),
+            ],
+            &acked_deletes,
+        );
+    }
+
+    /// Production-path counterpart of the deterministic CAS race above:
+    /// SigV4 PUT uses the native streaming ABI while exact-version DELETE
+    /// uses the async control path. Both must share the same generation-fence
+    /// ordering and acknowledged-effect guarantees.
+    #[test]
+    fn streaming_put_and_async_delete_share_version_index_cas() {
+        let be = SharedSwiftBackend::new("Enabled");
+        let seed_api = S3Api::new(cred_map());
+        let seed_next = be.next_fn();
+        let v1 = versioned_put_ok(&seed_api, &seed_next, "obj", b"seed-1");
+        let v2 = versioned_put_ok(&seed_api, &seed_next, "obj", b"seed-2");
+
+        let v1_archive = format!(
+            "/v1/AUTH_test/mybucket+versions/{}",
+            archive_object_name("obj", &v1)
+        );
+        be.hold("DELETE", &v1_archive);
+        let be_delete = be.clone();
+        let v1_delete = v1.clone();
+        let delete_thread = std::thread::spawn(move || {
+            let api = S3Api::new(cred_map());
+            let req = sign_request(
+                base_s3_req("DELETE", "/mybucket/obj", &format!("versionId={v1_delete}")),
+                "testing",
+            );
+            let resp = block_on_s3(api.handle_s3_async(req, be_delete.async_next_fn()));
+            let status = resp.status;
+            let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap_or_default())
+                .unwrap_or_default();
+            (status, body)
+        });
+        be.wait_arrival("DELETE", &v1_archive);
+
+        let stream_body = b"streaming-concurrent".to_vec();
+        let areq = async_from_signed(
+            unsigned_signed_put("/mybucket/obj", ""),
+            stream_body.clone(),
+        );
+        let stream_resp =
+            block_on_s3(S3Api::new(cred_map()).put_object_streaming(areq, be.streaming_next_fn()));
+        assert_eq!(stream_resp.status, 200, "native streaming PUT must win");
+        let streamed_version = stream_resp
+            .headers
+            .get(HDR_VERSION_ID)
+            .expect("streaming PUT 200 includes version id")
+            .to_string();
+
+        be.release("DELETE", &v1_archive);
+        let (delete_status, delete_body) = delete_thread.join().expect("async DELETE thread");
+        assert!(
+            delete_status == 204 || (delete_status == 500 && delete_body.contains("InternalError")),
+            "async DELETE conflict surface changed: status={delete_status} body={delete_body}"
+        );
+        let acked_deletes = if delete_status == 204 {
+            vec![v1.clone()]
+        } else {
+            Vec::new()
+        };
+        assert_version_index_invariants(
+            &be,
+            "obj",
+            &[
+                (v1, b"seed-1".to_vec()),
+                (v2, b"seed-2".to_vec()),
+                (streamed_version, stream_body),
+            ],
+            &acked_deletes,
+        );
     }
 
     /// N writers race versioned PUTs against exact-version deletes of
@@ -24103,44 +25978,41 @@ mod tests {
         const ROUNDS: usize = 6;
         let mut seeds = Vec::new();
         for i in 0..=ROUNDS {
-            seeds.push(versioned_put_ok(
-                &api,
-                &next,
-                "obj",
-                format!("seed-{i}").as_bytes(),
-            ));
+            let body = format!("seed-{i}").into_bytes();
+            let version_id = versioned_put_ok(&api, &next, "obj", &body);
+            seeds.push((version_id, body));
         }
 
-        let acked_puts: Arc<std::sync::Mutex<Vec<String>>> =
+        let acked_puts: Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>> =
             Arc::new(std::sync::Mutex::new(seeds.clone()));
         let acked_deletes: Arc<std::sync::Mutex<Vec<String>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        for (round, target) in seeds.iter().take(ROUNDS).enumerate() {
+        for (round, (target, _)) in seeds.iter().take(ROUNDS).enumerate() {
             let barrier = Arc::new(std::sync::Barrier::new(2));
 
             let be_put = be.clone();
             let barrier_put = barrier.clone();
-            let acked_puts_c = acked_puts.clone();
+            let put_payload = format!("round-{round}").into_bytes();
+            let put_payload_c = put_payload.clone();
             let put_thread = std::thread::spawn(move || {
                 let api = S3Api::new(cred_map());
                 let next = be_put.next_fn();
                 let mut req = base_s3_req("PUT", "/mybucket/obj", "");
                 req.headers.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
-                req.body = Body::from(format!("round-{round}").into_bytes());
+                req.body = Body::from(put_payload_c);
                 let req = sign_request(req, "testing");
                 barrier_put.wait();
                 let resp = api.handle(req, &next);
-                if resp.status == 200 {
-                    if let Some(vid) = resp.headers.get("x-amz-version-id") {
-                        acked_puts_c.lock().unwrap().push(vid.to_string());
-                    }
-                }
+                let status = resp.status;
+                let version_id = resp.headers.get("x-amz-version-id").map(str::to_string);
+                let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap_or_default())
+                    .unwrap_or_default();
+                (status, version_id, body)
             });
 
             let be_del = be.clone();
             let barrier_del = barrier.clone();
-            let acked_deletes_c = acked_deletes.clone();
             let target_c = target.clone();
             let del_thread = std::thread::spawn(move || {
                 let api = S3Api::new(cred_map());
@@ -24151,13 +26023,43 @@ mod tests {
                 );
                 barrier_del.wait();
                 let resp = api.handle(req, &next);
-                if resp.status == 204 {
-                    acked_deletes_c.lock().unwrap().push(target_c);
-                }
+                let status = resp.status;
+                let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap_or_default())
+                    .unwrap_or_default();
+                (status, body, target_c)
             });
 
-            put_thread.join().expect("PUT thread");
-            del_thread.join().expect("DELETE thread");
+            let (put_status, put_version_id, put_error) = put_thread.join().expect("PUT thread");
+            let (delete_status, delete_error, deleted_version_id) =
+                del_thread.join().expect("DELETE thread");
+
+            let mut winners = 0;
+            if put_status == 200 {
+                let version_id = put_version_id
+                    .unwrap_or_else(|| panic!("round {round} PUT 200 omitted x-amz-version-id"));
+                acked_puts.lock().unwrap().push((version_id, put_payload));
+                winners += 1;
+            } else {
+                assert!(
+                    put_status == 500 && put_error.contains("InternalError"),
+                    "round {round} PUT returned an invalid conflict surface: \
+                     status={put_status} body={put_error}"
+                );
+            }
+            if delete_status == 204 {
+                acked_deletes.lock().unwrap().push(deleted_version_id);
+                winners += 1;
+            } else {
+                assert!(
+                    delete_status == 500 && delete_error.contains("InternalError"),
+                    "round {round} DELETE returned an invalid conflict surface: \
+                     status={delete_status} body={delete_error}"
+                );
+            }
+            assert!(
+                winners > 0,
+                "round {round} returned conflicts to both writers without a winner"
+            );
         }
 
         let puts = acked_puts.lock().unwrap().clone();
@@ -24312,6 +26214,52 @@ mod tests {
         // commit mirrored generation 3.
         let gens: Vec<u64> = be.mirror_writes().iter().map(|(g, _)| *g).collect();
         assert_eq!(gens, vec![1, 2, 3]);
+    }
+
+    /// Deterministically model a legacy backend accepting an old healer after
+    /// a newer fence committed. A real snapshot load must ignore the regressed
+    /// mirror, adopt the immutable fence head, and repair index.json.
+    #[test]
+    fn regressed_legacy_mirror_is_repaired_from_fence_head() {
+        let be = SharedSwiftBackend::new("Enabled");
+        let api = S3Api::new(cred_map());
+        let next = be.next_fn();
+        let _v1 = versioned_put_ok(&api, &next, "obj", b"one");
+        let _v2 = versioned_put_ok(&api, &next, "obj", b"two");
+
+        let fences = be.fence_writes();
+        let generation_one = fences
+            .iter()
+            .find(|(_, index)| index.generation == 1)
+            .expect("generation-one fence")
+            .1
+            .clone();
+        let generation_two = fences
+            .iter()
+            .find(|(_, index)| index.generation == 2)
+            .expect("generation-two fence")
+            .1
+            .clone();
+        let mirror_path = format!(
+            "/v1/AUTH_test/mybucket+versions/{}",
+            index_object_name("obj")
+        );
+        let mut stale_headers = HeaderKeyDict::new();
+        stale_headers.set("ETag", "stale-generation-one");
+        be.store
+            .lock()
+            .unwrap()
+            .insert(mirror_path, (stale_headers, generation_one.to_json()));
+
+        let cred = cred_map().remove("test:tester").expect("test credential");
+        let snapshot = load_version_index_snapshot(&cred, "mybucket", "obj", &next)
+            .unwrap_or_else(|resp| panic!("authoritative load failed: {}", resp.status));
+        assert_eq!(snapshot.index, generation_two);
+        assert_eq!(
+            be.final_index("/v1/AUTH_test/mybucket+versions", "obj"),
+            generation_two,
+            "loader did not repair the deliberately regressed mirror"
+        );
     }
 
     /// Generation fences live in the `+versions` container but must never
