@@ -1027,6 +1027,13 @@ impl DiskFileWriter {
         match std::fs::rename(&data_file_path, &durable_data_file_path) {
             Ok(()) => {
                 std::fs::File::open(&self.datadir)?.sync_all()?;
+                if let Some(suffix_dir) = self.datadir.parent() {
+                    // `put()` invalidates for the initial non-durable publish,
+                    // but a hasher may consume that entry before this second
+                    // phase. The durable rename is a distinct visible state
+                    // transition and therefore needs its own invalidation.
+                    invalidate_hash(suffix_dir)?;
+                }
                 if let Some(next_datadir) = &self.next_datadir {
                     let next_data =
                         next_datadir.join(make_ec_ondisk_filename(timestamp, fi, false)?);
@@ -1035,6 +1042,9 @@ impl DiskFileWriter {
                     if next_data.exists() {
                         std::fs::rename(&next_data, &next_durable)?;
                         std::fs::File::open(next_datadir)?.sync_all()?;
+                        if let Some(next_suffix_dir) = next_datadir.parent() {
+                            invalidate_hash(next_suffix_dir)?;
+                        }
                     }
                 }
                 let _ = cleanup_ondisk_files(&self.datadir, self.policy, &self.cfg.cleanup);

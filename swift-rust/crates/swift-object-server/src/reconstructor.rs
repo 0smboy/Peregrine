@@ -1286,6 +1286,14 @@ pub fn get_suffixes_to_sync(
 /// means the partition is being handled, so give up fast.
 const REVERT_LOCK_TIMEOUT: f64 = 0.2;
 
+/// Foreground object mutations and maintenance purges share the same
+/// cross-process stripe. A revert already owns `.lock-replication`, so this
+/// is always acquired second; `DiskFile::purge` acquires the partition hash
+/// lock only after it, preserving replication -> object -> hash ordering.
+/// Reverts are maintenance work, so a busy object is left for the next pass
+/// instead of stalling the partition for the foreground 15-second budget.
+const OBJECT_MUTATION_LOCK_TIMEOUT: f64 = 0.2;
+
 /// Per-pass ssync-job stats.
 ///
 /// `last_error` exists because a bare `failures` counter is undiagnosable: a
@@ -1439,7 +1447,7 @@ pub fn process_part_job(
                 }
             }
             if !job.sync_to.is_empty() && synced_with >= job.sync_to.len() {
-                delete_reverted_objs(
+                match delete_reverted_objs(
                     devices,
                     hash_config,
                     cfg,
@@ -1447,8 +1455,13 @@ pub fn process_part_job(
                     policy,
                     job,
                     &reverted,
-                );
-                stats.reverts += 1;
+                ) {
+                    Ok(()) => stats.reverts += 1,
+                    Err(error) => {
+                        stats.failures += 1;
+                        stats.last_error = Some(error);
+                    }
+                }
             }
         }
     }
@@ -1466,7 +1479,7 @@ fn delete_reverted_objs(
     policy: PolicyKind,
     job: &EcPartJob,
     objects: &BTreeMap<String, ObjectTimestamps>,
-) {
+) -> Result<(), String> {
     let device_path = devices.join(&job.device);
     let mut suffixes_to_delete: BTreeSet<String> = BTreeSet::new();
     for (object_hash, timestamps) in objects {
@@ -1475,6 +1488,24 @@ fn delete_reverted_objs(
         }
         let suffix = object_hash[object_hash.len() - 3..].to_string();
         let hash_dir = job.path.join(&suffix).join(object_hash);
+        let df = DiskFile::from_hash_dir(
+            &device_path,
+            &hash_dir,
+            policy,
+            policy_index,
+            hash_config,
+            cfg.clone(),
+        );
+        let _mutation_guard = df
+            .acquire_mutation_lock(OBJECT_MUTATION_LOCK_TIMEOUT)
+            .map_err(|error| {
+                format!(
+                    "revert part {} could not lock object {object_hash}: {error}",
+                    job.partition
+                )
+            })?;
+        // Re-read only after acquiring the object stripe.  The initial SSYNC
+        // report may be stale by the time a busy foreground mutation drains.
         let filenames: Vec<String> = std::fs::read_dir(&hash_dir)
             .map(|entries| {
                 entries
@@ -1505,26 +1536,25 @@ fn delete_reverted_objs(
         } else {
             None
         };
-        let df = DiskFile::from_hash_dir(
-            &device_path,
-            &hash_dir,
-            policy,
-            policy_index,
-            hash_config,
-            cfg.clone(),
-        );
-        let _ = df.purge(
+        df.purge(
             &timestamps.ts_data,
             job.frag_index,
             nondurable_purge_delay,
             meta_timestamp.as_ref(),
-        );
+        )
+        .map_err(|error| {
+            format!(
+                "revert part {} could not purge object {object_hash}: {error}",
+                job.partition
+            )
+        })?;
         suffixes_to_delete.insert(suffix);
     }
     for suffix in suffixes_to_delete {
         // Python remove_directory: rmdir, ignoring ENOENT/ENOTEMPTY
         let _ = std::fs::remove_dir(job.path.join(suffix));
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2195,6 +2225,124 @@ mod suffix_sync_tests {
         assert_eq!(pusher.pushes.borrow().len(), 1);
         assert_eq!(stats.reverts, 1, "{stats:?}");
         assert_eq!(stats.failures, 0, "{stats:?}");
+        let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    #[test]
+    fn test_delete_reverted_waits_for_object_mutation_stripe() {
+        let devices = tmp_root("revert-object-lock");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let ts = now_ts();
+        let suffix = "abc";
+        let object_hash = format!("{:0>29}{suffix}", 2);
+        put_frag(&part_path, suffix, &ts, 2);
+        let hash_dir = part_path.join(suffix).join(&object_hash);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let df = DiskFile::from_hash_dir(
+            &devices.join("sda1"),
+            &hash_dir,
+            ec_kind(),
+            POLICY_INDEX,
+            &hc,
+            cfg.clone(),
+        );
+        let held = df
+            .acquire_mutation_lock(1.0)
+            .expect("test holds the object mutation stripe");
+        let job = EcPartJob {
+            job_type: EcJobType::Revert,
+            frag_index: Some(2),
+            suffixes: vec![suffix.to_string()],
+            sync_to: Vec::new(),
+            sync_handoffs: Vec::new(),
+            partition: 3,
+            path: part_path,
+            device: "sda1".to_string(),
+            primary_frag_index: None,
+        };
+        let timestamp = ts.parse().unwrap();
+        let objects = BTreeMap::from([(
+            object_hash,
+            ObjectTimestamps {
+                ts_data: timestamp,
+                ts_meta: None,
+                ts_ctype: None,
+                durable: Some(true),
+            },
+        )]);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        delete_reverted_objs(&devices, &hc, &cfg, POLICY_INDEX, ec_kind(), &job, &objects)
+            .expect("revert succeeds after the foreground lock is released");
+        releaser.join().unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(10),
+            "the purge must wait for the foreground mutation stripe"
+        );
+        assert!(
+            !hash_dir.exists(),
+            "the revert purges the exact generation after the stripe is released"
+        );
+        let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    #[test]
+    fn test_delete_reverted_busy_object_is_retryable_not_success() {
+        let devices = tmp_root("revert-object-busy");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let ts = now_ts();
+        let suffix = "abc";
+        let object_hash = format!("{:0>29}{suffix}", 2);
+        put_frag(&part_path, suffix, &ts, 2);
+        let hash_dir = part_path.join(suffix).join(&object_hash);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let df = DiskFile::from_hash_dir(
+            &devices.join("sda1"),
+            &hash_dir,
+            ec_kind(),
+            POLICY_INDEX,
+            &hc,
+            cfg.clone(),
+        );
+        let _held = df
+            .acquire_mutation_lock(1.0)
+            .expect("test holds the object mutation stripe");
+        let job = EcPartJob {
+            job_type: EcJobType::Revert,
+            frag_index: Some(2),
+            suffixes: vec![suffix.to_string()],
+            sync_to: Vec::new(),
+            sync_handoffs: Vec::new(),
+            partition: 3,
+            path: part_path,
+            device: "sda1".to_string(),
+            primary_frag_index: None,
+        };
+        let objects = BTreeMap::from([(
+            object_hash,
+            ObjectTimestamps {
+                ts_data: ts.parse().unwrap(),
+                ts_meta: None,
+                ts_ctype: None,
+                durable: Some(true),
+            },
+        )]);
+        let error =
+            delete_reverted_objs(&devices, &hc, &cfg, POLICY_INDEX, ec_kind(), &job, &objects)
+                .expect_err("a busy object must leave the revert for a later pass");
+        assert!(error.contains("could not lock object"), "{error}");
+        assert!(hash_dir.exists(), "a busy generation must remain intact");
         let _ = std::fs::remove_dir_all(&devices);
     }
 }

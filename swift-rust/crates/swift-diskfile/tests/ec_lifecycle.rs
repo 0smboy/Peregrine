@@ -76,17 +76,45 @@ fn test_ec_put_then_commit_becomes_durable_via_metadata_frag_index() {
         DiskFileConfig::default(),
     )
     .unwrap();
+    let datadir = df.datadir().to_path_buf();
+    let suffix = datadir
+        .parent()
+        .and_then(Path::file_name)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let invalidations = datadir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("hashes.invalid");
 
     let ts = "1751500001.00000";
     let mut writer = df.create(".data").unwrap();
     writer.write(b"hello").unwrap();
     // put() must persist the frag index (3) from the metadata so commit() works
     writer.put(ec_meta(ts, 3)).unwrap();
+    let invalidations_after_put = std::fs::read_to_string(&invalidations)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| *line == suffix)
+        .count();
     let tsp = ts.parse::<Timestamp>().unwrap();
     writer
         .commit(&tsp)
         .expect("commit must succeed and make the fragment durable");
     writer.close();
+    let invalidations_after_commit = std::fs::read_to_string(&invalidations)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| *line == suffix)
+        .count();
+    assert_eq!(
+        invalidations_after_commit,
+        invalidations_after_put + 1,
+        "the EC durable transition must invalidate the suffix independently"
+    );
 
     // the durable fragment file <ts>#3#d.data must now exist
     let datadir = find_hash_dir(&device);
